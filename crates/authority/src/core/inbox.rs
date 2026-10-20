@@ -1552,7 +1552,7 @@ impl Core {
                     decoded_op,
                     rid,
                     &constellation_meta::locks::LockTag::from_wire(&op.lock_tag),
-                    now.wall.0,
+                    now,
                 ),
                 Err(_) => Err(MetaError::Invalid("undecodable inbox op".into())),
             };

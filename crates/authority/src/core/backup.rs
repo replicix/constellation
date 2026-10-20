@@ -100,7 +100,9 @@
 //! out, the successor (which seals at that expiry) waited the whole bound
 //! on top of the lease. [`Core::beat_cap`] takes that back. Notation: H
 //! the predecessor, S the successor, `E_h` the expiry of the lease H holds
-//! at a decision (H's clock), `M` the expiry margin.
+//! at a decision (H's **honour** clock, plan 43 C7-H1: the lease object
+//! carries it, `Lease::holder_expires_ms`, with the id of that clock,
+//! `Lease::holder_clock`), `M` the expiry margin.
 //! 1. *Everything S waits out is capped by H's lease.* Strict answers only
 //!    while the lease is `usable` (expiry − now > M); read delegations
 //!    (`maybe_grant`), lock grants and renewals (`lock_cap_ms`), write
@@ -108,7 +110,12 @@
 //!    less M, their holders honour them from their own send less another
 //!    M, and what a delegate grants is capped by its own `until − M`. So
 //!    (with `2ρ·ttl ≤ 2M`) nothing H answered is honoured, in real time,
-//!    after H's clock reads `E_h`. Exception: under a continuation epoch's
+//!    after H's clock reads `E_h` — unless H's wall clock stepped forward
+//!    after it last wrote `E_h`: its honour clock then counts the step, the
+//!    beats' `sent` jump by it, and a grant made before the step outlives
+//!    the cap by the step until H's next renewal (C7-H1's open item R7,
+//!    closed in its commit 3 by stamping the beat and the body's end on the
+//!    wait clock). Exception: under a continuation epoch's
 //!    hold the lease has no expiry, and `lock_cap_ms` and `grant_cap_ms`
 //!    cap a grant by its ttl alone; the grants kept across the re-claim
 //!    (`epoch_tenure_resumed`) can then outlast the re-claimed lease (a
@@ -125,30 +132,34 @@
 //!    T.expires`; `X` also takes the highest expiry any beat named and the
 //!    highest guard. Exceptions: a restart of H within its epoch with a
 //!    shorter TTL (its earlier incarnation's grants are behind its restart
-//!    quarantine, which the guard names) and a backward step of H's wall
-//!    clock (C7-H1's hole, which breaks every honour-side check alike).
-//!    (The cap's own dependence on the holder's clock is step 3's.)
+//!    quarantine, which the guard names; and the honour end of that
+//!    incarnation is on another clock, kept apart by clock id). (The cap's
+//!    own dependence on the holder's clock is step 3's.)
 //!    Counting from the *last renewal S observed* instead would be unsafe:
 //!    H's other proofs of S3 liveness (segment runs and puts, a lease
 //!    read) are invisible to S, and H answers within `W` of any of them.
-//! 3. *The beat links the clocks.* A beat says H's clock read `sent` no
-//!    later than S's clock read `at` (its arrival stamp: `sent` < real
-//!    send < real arrival ≤ `at`). H's clock reaches `X` at most
-//!    `(X − sent)(1 + ρ)/(1 − ρ)` real ms after `sent`, S's runs at least
-//!    `1 − ρ` per real ms, so S's clock reading `at + (X − sent) + M` is
-//!    after H's clock passed `X` as long as `2ρ(X − sent) < M`: beats
-//!    sent within `250·M` of `X` only (`2ρ·250·M = M/2` at ρ = 1 000 ppm).
-//!    A difference on H's clock plus a stamp of S's: rate-only, no offset,
-//!    **provided H's clock does not step forward**: a forward step `J`
-//!    lowers every later beat's `at − sent` by `J` (and the minimum keeps
-//!    it for the 64 beats retained), which moves the cap early by `J`; it
-//!    is unsafe when `J > 3M + δ` (δ the beat's delay), with H beating on
-//!    past the step and sealed mid-lease. The same class as C7-H1: H's own
-//!    grant table judges expiry on its wall clock, so such a step breaks
-//!    exclusion with or without the cap (a forward step of 2.5 s broke it in
-//!    73 of 2 000 sim seeds with the cap and with it off alike); the cap
-//!    adds a dependency on it, which C7-H1/C7a remove by stamping `sent` on
-//!    the honour clock. Not detected here (plan 43 Appendix B row 27).
+//! 3. *The beat links the clocks.* A beat says H's honour clock read `sent`
+//!    no later than S's clock read `at` (its arrival stamp: `sent` < real
+//!    send < real arrival ≤ `at`). H's honour clock reaches `X` at most
+//!    `(X − sent)(1 + ρ)/(1 − ρ)` real ms after `sent` (it never
+//!    under-counts, so no more), S's runs at least `1 − ρ` per real ms, so
+//!    S's clock reading `at + (X − sent) + M` is after H's clock passed `X`
+//!    as long as `2ρ(X − sent) < M`: beats sent within `250·M` of `X` only
+//!    (`2ρ·250·M = M/2` at ρ = 1 000 ppm). A difference on H's clock plus a
+//!    stamp of S's: rate-only, no offset, and **no wall step of H**: the
+//!    honour clock ignores a backward step (the differences are unchanged),
+//!    and `sent`, the lease's end (written after the step) and the guard all
+//!    move together by a forward one. Every term is of one holder clock: S
+//!    keeps `lags`, `named_max` and `guard_max` per clock id (a restarted H is
+//!    a new process, a new clock; at most two ids), takes the latest
+//!    `X_c + min lag_c` over them, and puts the replaced lease's own honour
+//!    end in `X` of the id that wrote it (`holder_clock`), never its wall
+//!    expiry (a stamp of another clock). No beat of that clock: no cap. Open
+//!    item (plan 43 C7-H1): a forward step of H *between its last renewal
+//!    and the seal* moves `sent` by the step but not that lease's honour
+//!    end, so grants made before the step are capped by `X − sent`, early
+//!    by the step; the guard, mapped from the wall clock until the wait
+//!    commit, has the same property. Not detected here.
 //! 4. *The guard* is what H itself waits out and its lease does not cap:
 //!    its own takeover floor (which can outlast its lease), a released
 //!    takeover's lock grace, restart quarantines, subtree graces
@@ -163,11 +174,13 @@
 //!    none if the cap has passed when the marker lands. Each is sufficient
 //!    alone (the bound by the argument above, the cap by 1–4).
 //!
-//! Never the beat's *credit*, `min(at, sent + M)` (what the seal watch
-//! counts): `sent + M` is an instant of H's clock, and a successor whose
-//! clock runs ahead of H's by more than M would end its floor that much
-//! early (the sim's `fast-takeover-skewed-successor` is the control). And
-//! never the lease's expiry compared with S's clock. No beat, a beat of
+//! Never the beat's *credit*, `min(at, sent + M)`: `sent + M` is an instant
+//! of H's clock, and a successor whose clock runs ahead of H's by more than
+//! M would end its floor that much early (the sim's
+//! `fast-takeover-skewed-successor` is the control; since plan 43 C7-H1 the
+//! seal watch counts the plain arrival too, `sent` being a reading of H's
+//! honour clock, opaque here). And never the lease's expiry compared with S's
+//! clock. No beat, a beat of
 //! another holder or epoch, or none sent within `250·M` of `X`: the bound.
 //! The floor and the beats are in memory (plan 43 Appendix B rows 14 and
 //! 27): a successor that restarted waits the bound.
@@ -196,7 +209,7 @@
 use super::{Core, S3For, Timer};
 use crate::action::{Action, S3Op};
 use crate::event::{PeerMsg, S3Result};
-use crate::ids::{Epoch, Ms, NodeId, Now, OpId, Seq, TimerId};
+use crate::ids::{Epoch, HonourMs, Ms, NodeId, Now, OpId, Seq, TimerId};
 use crate::replica::Replica;
 use constellation_meta::{BackupRole, BackupTx};
 use constellation_store_s3::{AckPolicy, Lease};
@@ -229,16 +242,21 @@ const CANDIDATE_BACKOFF_MAX_MS: u64 = 60_000;
 /// The liveness rule of a tenure that may be taken over before its lease
 /// expires (the module doc): fresh at `at_ms` only within `window_ms`
 /// (`backup_takeover_ms`) of the send of the latest S3 request that
-/// proved the tenure (`last_s3_fresh_ms`); always fresh otherwise. One
+/// proved the tenure (`last_s3_fresh`); always fresh otherwise. One
 /// definition for the core ([`Core::renew_fresh`]: strict answers, new
 /// lock grants, renewals) and the FUSE side (`LeaseView::reads_locally`).
+///
+/// Plan 43 C7-H1: both stamps are on the holder's **honour** clock (the
+/// send of the proving request is the holder's own stamp bounding its own
+/// right to answer), so a backward wall step cannot keep a stale tenure
+/// "fresh" for the step's length.
 pub fn liveness_fresh(
     fast_tenure: bool,
-    at_ms: i64,
-    last_s3_fresh_ms: i64,
+    at: HonourMs,
+    last_s3_fresh: HonourMs,
     window_ms: i64,
 ) -> bool {
-    !fast_tenure || at_ms - last_s3_fresh_ms < window_ms
+    !fast_tenure || at.since(last_s3_fresh) < window_ms
 }
 
 /// Plan 41 L0: an owner's answer that extends a window (a lock grant's
@@ -247,7 +265,8 @@ pub fn liveness_fresh(
 /// not marked as granting: held until [`Core::renew_verdict`] says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FreshHold {
-    pub at: Ms,
+    /// The decision's reading on the honour clock (plan 43 C7-H1).
+    pub at: HonourMs,
     pub epoch: Epoch,
 }
 
@@ -355,8 +374,10 @@ pub(crate) struct AckState {
     last_reconfig_try: Ms,
     /// Send times of outstanding S3 requests, and the send time of the
     /// latest one that succeeded without revealing a deposition.
-    pub s3_sent: BTreeMap<OpId, Ms>,
-    pub last_s3_fresh: Ms,
+    /// On the honour clock (plan 43 C7-H1): the holder's stamp bounding
+    /// its own right to answer.
+    pub s3_sent: BTreeMap<OpId, HonourMs>,
+    pub last_s3_fresh: HonourMs,
     /// EWMA of this node's S3 request round trips (ms, 0 until the
     /// first): what a handoff's successor needs to claim the lease
     /// scales with it (`Core::begin_handoff_pause`).
@@ -365,10 +386,10 @@ pub(crate) struct AckState {
     marking: Option<OpId>,
     /// Plan 41 L0: the lease read that renewal answers held for stale
     /// liveness wait for (`Core::renew_probe`), and when it was sent.
-    renew_probe: Option<(OpId, Ms)>,
+    renew_probe: Option<(OpId, HonourMs)>,
     /// A held renewal answer decided at or before this is refused (the
     /// lease read sent then failed: nothing proves the tenure since).
-    renew_refuse_through: Ms,
+    renew_refuse_through: HonourMs,
     /// Delegation renewal answers held for liveness (`on_deleg_renew`),
     /// in the order they were made.
     pub(crate) renew_held_deleg: Vec<(FreshHold, NodeId, PeerMsg)>,
@@ -568,29 +589,69 @@ pub(crate) struct HolderBeats {
     /// The latest arrival of a beat at `epoch` (or of an append, handed
     /// over by the driver as an unnumbered one).
     heard_at: Ms,
-    /// The latest numbered beat: `(seq, sent, arrival)`.
-    pub(crate) last: Option<(u64, Ms, Ms)>,
-    /// The latest expiry of the holder's lease its beats at `epoch` named
-    /// (0: none heard): they stop there.
+    /// The latest numbered beat: `(seq, sent, arrival, clock)`; `sent` a
+    /// reading of the holder's honour clock `clock` (plan 43 C7-H1).
+    pub(crate) last: Option<(u64, i64, Ms, u64)>,
+    /// The latest expiry of the holder's lease its beats at `epoch` named,
+    /// on the lease body's **wall** clock (0: none heard): they stop there.
+    /// The seal watch's `known_expiry` (plan 43 Appendix B row 24).
     pub(crate) expires: Ms,
-    /// Plan 43 C7-F F-a: what the numbered beats of `epoch` say of where
-    /// the holder's lease ends on *this* node's clock, for the cap of a
-    /// fast takeover's floor ([`Core::beat_cap`]): `(sent, at − sent)` of
-    /// the latest [`BEAT_LAGS_KEPT`] beats, `at` being the arrival as this
-    /// node stamped it, never the credit the seal watch counts
-    /// (`min(at, sent + M)` is an instant of the holder's clock).
-    pub(crate) lags: std::collections::VecDeque<(Ms, i64)>,
-    /// The highest expiry and the highest guard those beats named (the
-    /// guard `i64::MAX`: unknown, the holder's takeover gate was pending,
-    /// which gives no cap for the epoch).
-    pub(crate) named_max: i64,
-    pub(crate) guard_max: i64,
+    /// Plan 43 C7-F F-a / C7-H1: what the numbered beats of `epoch` say of
+    /// where the holder's lease ends on *this* node's clock, for the cap of
+    /// a fast takeover's floor ([`Core::beat_cap`]), per clock id of the
+    /// holder (at most [`BEAT_CLOCKS_KEPT`], oldest first): a restarted
+    /// holder is a new process with a new honour clock, and values of two
+    /// clocks must never be mixed.
+    pub(crate) clocks: Vec<(u64, BeatClockAgg)>,
+    /// A beat at this epoch named the guard `i64::MAX`: the holder's
+    /// takeover gate was pending, what it waited out was not known, which
+    /// gives no cap for the whole epoch.
+    pub(crate) guard_unknown: bool,
     /// Beats that came late lately, `(arrival, ms late)`, oldest first:
     /// later than one interval after the previous one, as sent (the
     /// holder's process was held up) or as heard (held up on the way, or
     /// by this node's own runtime), by at least the lag threshold.
     late: std::collections::VecDeque<(Ms, i64)>,
 }
+
+impl HolderBeats {
+    /// The terms of the holder clock `clock`, started afresh when it is
+    /// new; past [`BEAT_CLOCKS_KEPT`] clocks the oldest goes.
+    fn clock_agg(&mut self, clock: u64) -> &mut BeatClockAgg {
+        let i = match self.clocks.iter().position(|(c, _)| *c == clock) {
+            Some(i) => i,
+            None => {
+                if self.clocks.len() >= BEAT_CLOCKS_KEPT {
+                    self.clocks.remove(0);
+                }
+                self.clocks.push((clock, BeatClockAgg::default()));
+                self.clocks.len() - 1
+            }
+        };
+        &mut self.clocks[i].1
+    }
+}
+
+/// What the numbered beats of one holder clock (one process of the holder)
+/// say, for [`Core::beat_cap`].
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BeatClockAgg {
+    /// `(sent, at − sent)` of the latest [`BEAT_LAGS_KEPT`] beats: `sent` a
+    /// reading of the holder's honour clock, `at` the arrival as this node
+    /// stamped it (never a credit), so `at − sent` places that clock on
+    /// this node's: a difference on the holder's clock (rate only, no
+    /// offset, no wall step: its honour clock follows a forward step in
+    /// `sent` and in every value it names alike, P4) plus a stamp of this
+    /// node's.
+    pub(crate) lags: std::collections::VecDeque<(i64, i64)>,
+    /// The highest lease end (honour) and the highest finite guard those
+    /// beats named, on that clock.
+    pub(crate) named_max: i64,
+    pub(crate) guard_max: i64,
+}
+
+/// How many holder clock ids a [`HolderBeats`] keeps terms for.
+const BEAT_CLOCKS_KEPT: usize = 2;
 
 /// How many beats' `(sent, at − sent)` a [`HolderBeats`] keeps for the cap
 /// of a fast takeover's floor (about 19 s of beats at the default
@@ -716,7 +777,7 @@ impl Core {
             && (self.lease.ack_policy() != AckPolicy::Local || !self.lease.backups().is_empty())
     }
 
-    pub fn last_s3_fresh(&self) -> Ms {
+    pub fn last_s3_fresh(&self) -> HonourMs {
         self.ack.last_s3_fresh
     }
 
@@ -839,7 +900,7 @@ impl Core {
         let Some(sent) = self.ack.s3_sent.remove(&op) else {
             return;
         };
-        let rtt = now.wall.since(sent).max(0) as u64;
+        let rtt = now.honour.since(sent).max(0) as u64;
         self.ack.s3_rtt_ms = if self.ack.s3_rtt_ms == 0 {
             rtt
         } else {
@@ -864,7 +925,7 @@ impl Core {
     /// only with fresh S3 liveness ([`Core::renew_fresh`]). `false`
     /// starts a probe.
     pub(crate) fn strict_answer_allowed(&mut self, now: Now, out: &mut Vec<Action>) -> bool {
-        if self.renew_fresh(now.wall) {
+        if self.renew_fresh(now.honour) {
             return true;
         }
         self.stats.stale_liveness_refusals += 1;
@@ -883,11 +944,11 @@ impl Core {
     /// an answer was *decided*: a liveness proof sent after it covers it
     /// too (the successor's marker came after the request that proved
     /// the tenure, so after the decision).
-    pub(crate) fn renew_fresh(&self, now: Ms) -> bool {
+    pub(crate) fn renew_fresh(&self, now: HonourMs) -> bool {
         liveness_fresh(
             self.fast_tenure(),
-            now.0,
-            self.ack.last_s3_fresh.0,
+            now,
+            self.ack.last_s3_fresh,
             self.cfg.backup_takeover_ms as i64,
         )
     }
@@ -910,11 +971,11 @@ impl Core {
     /// a marked tenure, as a new grant needs (`lock_serve`). `Some`: the
     /// answer is held ([`Core::renew_verdict`]) under this tag.
     pub(crate) fn renew_hold(&self, now: Now) -> Option<FreshHold> {
-        if self.renew_fresh(now.wall) && self.tenure_marked() {
+        if self.renew_fresh(now.honour) && self.tenure_marked() {
             return None;
         }
         Some(FreshHold {
-            at: now.wall,
+            at: now.honour,
             epoch: self.lease.epoch().unwrap_or(0),
         })
     }
@@ -932,7 +993,7 @@ impl Core {
             return FreshVerdict::Ready;
         }
         if h.at <= self.ack.renew_refuse_through
-            || now.wall.since(h.at) >= self.cfg.lock_ttl_ms as i64
+            || now.honour.since(h.at) >= self.cfg.lock_ttl_ms as i64
         {
             return FreshVerdict::Refuse;
         }
@@ -947,7 +1008,7 @@ impl Core {
             return;
         }
         if self.ack.renew_probe.is_none() && holds.iter().any(|h| !self.renew_fresh(h.at)) {
-            let sent = self.clk.wall;
+            let sent = self.clk.honour;
             let op = self.issue_s3(S3Op::LeaseGet, S3For::RenewProbe, out);
             self.ack.renew_probe = Some((op, sent));
             self.stats.renew_probes += 1;
@@ -1115,22 +1176,47 @@ impl Core {
             .beats
             .get(&prev.holder)
             .filter(|b| b.epoch == prev.epoch)?;
-        if b.guard_max == i64::MAX {
+        // No honour end of that tenure's holder (a body that predates its
+        // clock id, or a fenced one), or no beat of the clock that wrote it:
+        // `prev.holder_expires_ms` cannot be placed on any clock heard.
+        if b.guard_unknown || prev.holder_clock == 0 || prev.holder_expires_ms == 0 {
             return None;
         }
         let margin = self.cfg.expiry_margin_ms as i64;
-        let x = prev.expires_unix_ms.max(b.named_max).max(b.guard_max);
         let span = BEAT_CAP_SPAN_MARGINS.saturating_mul(margin);
-        let lag = b
-            .lags
-            .iter()
-            // A beat sent after `x` cannot be (they stop at the expiry):
-            // a clock that stepped, not evidence; left out, which only
-            // lengthens the floor.
-            .filter(|(sent, _)| (0..=span).contains(&x.saturating_sub(sent.0)))
-            .map(|(_, lag)| *lag)
-            .min()?;
-        Some(Ms(x.saturating_add(lag).saturating_add(margin)))
+        let mut cap: Option<i64> = None;
+        let mut named_clock_placed = false;
+        for (clock, agg) in &b.clocks {
+            let own = *clock == prev.holder_clock;
+            let x =
+                agg.named_max
+                    .max(agg.guard_max)
+                    .max(if own { prev.holder_expires_ms } else { 0 });
+            let lag = agg
+                .lags
+                .iter()
+                // A beat sent after `x` cannot be (they stop at the lease's
+                // end): not evidence; left out, which only lengthens the
+                // floor.
+                .filter(|(sent, _)| (0..=span).contains(&x.saturating_sub(*sent)))
+                .map(|(_, lag)| *lag)
+                .min();
+            match lag {
+                Some(lag) => {
+                    named_clock_placed |= own;
+                    let end = x.saturating_add(lag);
+                    cap = Some(cap.map_or(end, |c| c.max(end)));
+                }
+                // The clock that wrote the lease must be placed; an earlier
+                // incarnation's terms only add to the cap (the maximum).
+                None if own => return None,
+                None => {}
+            }
+        }
+        if !named_clock_placed {
+            return None;
+        }
+        Some(Ms(cap?.saturating_add(margin)))
     }
 
     /// Plan 43 C7-F F-a: what this node, as the holder, waits out that its
@@ -2583,34 +2669,27 @@ impl Core {
     /// tail those acknowledgements stand for. A dismissal that comes
     /// before the new candidacy's first append is harmless: the holder
     /// counts that candidacy's acknowledgements from zero.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_holder_alive(
         &mut self,
         from: NodeId,
         epoch: Epoch,
         candidacy: u64,
         listed: bool,
-        (at, seq, sent, expires, guard): (Ms, u64, Ms, Ms, Ms),
+        (at, expires): (Ms, Ms),
+        beat: (u64, u64, i64, i64, i64),
         replica: &dyn Replica,
     ) {
-        // A numbered beat is credited no later than its send plus the
-        // expiry margin (clocks within it): one held in a retransmit queue
-        // for seconds, arriving after the holder died, buys it nothing.
-        // This makes the seal watch depend on the holder's clock: within
-        // the margin it binds by at most the RTT; a holder clock behind by
-        // more than the margin would have every beat credited that much
-        // early, and a live holder sealed that much early. Clocks within
-        // the margin are what the lease already assumes (its expiry is
-        // judged on every node's clock); this is one more place it holds
-        // weight.
-        let at_credit = if seq != 0 && sent.0 != 0 {
-            at.min(sent.plus(self.cfg.expiry_margin_ms))
-        } else {
-            at
-        };
+        // Plan 43 C7-H1: the seal watch counts the arrival as this node
+        // stamped it. A numbered beat used to be credited no later than its
+        // send plus the expiry margin (`min(at, sent + M)`), which compared
+        // the holder's `sent` with this node's `at`; `sent` is now a reading
+        // of the holder's honour clock, opaque here (`note_beat` keeps it per
+        // clock id), so the credit is gone. What it bought was at most one
+        // margin of silence window for a beat held up in a retransmit queue.
         if listed {
-            self.note_beat(from, epoch, (at, at_credit), (seq, sent, expires, guard));
+            self.note_beat(from, epoch, at, expires, beat);
         }
-        let at = at_credit;
         let Some(role) = self.bk.role else {
             return;
         };
@@ -2657,40 +2736,50 @@ impl Core {
         &mut self,
         from: NodeId,
         epoch: Epoch,
-        (at, credit): (Ms, Ms),
-        (seq, sent, expires, guard): (u64, Ms, Ms, Ms),
+        at: Ms,
+        expires: Ms,
+        (seq, clock, sent, holder_expires, guard): (u64, u64, i64, i64, i64),
     ) {
         let interval = self.cfg.backup_heartbeat_ms as i64;
         let threshold = self.lag_threshold_ms();
         let own_lapsed = match self.bk.beats.get(&from).and_then(|b| b.last) {
-            Some((_, _, last_at)) => self.own_lapsed_between(last_at, at),
+            Some((_, _, last_at, _)) => self.own_lapsed_between(last_at, at),
             None => 0,
         };
         self.bk
             .beats
             .retain(|n, b| *n == from || at.since(b.heard_at) < LATE_BEATS_MEMORY_MS);
-        let Some(b) = self.beats_at(from, epoch, credit) else {
+        let Some(b) = self.beats_at(from, epoch, at) else {
             return;
         };
-        // The expiry a beat names, numbered or an arrival the driver
-        // handed over (the peer service notes it with the stamp, so it is
-        // as fresh as the stamp however far behind this node's steps are).
+        // The expiry a beat names (the lease body's wall expiry), numbered
+        // or an arrival the driver handed over (the peer service notes it
+        // with the stamp, so it is as fresh as the stamp however far behind
+        // this node's steps are).
         if expires.0 != 0 {
             b.expires = b.expires.max(expires);
         }
         if seq == 0 {
             return;
         }
-        if sent.0 != 0 {
-            if b.lags.len() >= BEAT_LAGS_KEPT {
-                b.lags.pop_front();
+        if sent != 0 {
+            if guard == i64::MAX {
+                b.guard_unknown = true;
             }
-            b.lags.push_back((sent, at.0.saturating_sub(sent.0)));
-            b.named_max = b.named_max.max(expires.0);
-            b.guard_max = b.guard_max.max(guard.0);
+            let agg = b.clock_agg(clock);
+            if agg.lags.len() >= BEAT_LAGS_KEPT {
+                agg.lags.pop_front();
+            }
+            agg.lags.push_back((sent, at.0.saturating_sub(sent)));
+            agg.named_max = agg.named_max.max(holder_expires);
+            if guard != i64::MAX {
+                agg.guard_max = agg.guard_max.max(guard);
+            }
         }
         match b.last {
-            Some((last_seq, last_sent, last_at)) if seq > last_seq => {
+            Some((last_seq, last_sent, last_at, last_clock))
+                if clock == last_clock && seq > last_seq =>
+            {
                 // Late against its own schedule: `steps` intervals after
                 // the previous one, as sent and as heard (a lost beat is
                 // not lateness; a stalled host makes the next one late).
@@ -2698,7 +2787,10 @@ impl Core {
                 // Not what this node's own lapses held up: those are
                 // discounted once, by `attentive_since`.
                 let heard_late = at.since(last_at) - steps * interval - own_lapsed;
-                let sent_late = sent.since(last_sent) - steps * interval;
+                // Two `sent` of one holder clock. A forward wall step of the
+                // holder moves its honour clock once, which shows as one
+                // late beat: liveness only (plan 43 C7-H1).
+                let sent_late = sent - last_sent - steps * interval;
                 let late = heard_late.max(sent_late);
                 if late >= threshold {
                     if b.late.len() >= LATE_BEATS_MAX {
@@ -2706,38 +2798,38 @@ impl Core {
                     }
                     b.late.push_back((at, late));
                 }
-                b.last = Some((seq, sent, at.max(last_at)));
+                b.last = Some((seq, sent, at.max(last_at), clock));
             }
-            // A restarted holder numbers from 1 again.
-            Some((last_seq, last_sent, _)) if seq < last_seq && sent > last_sent => {
-                b.last = Some((seq, sent, at));
+            // A restarted holder (a new process: a new clock id) numbers
+            // from 1 again.
+            Some((_, _, _, last_clock)) if clock != last_clock => {
+                b.last = Some((seq, sent, at, clock));
             }
             // Overtaken by a later beat (they go out concurrently).
             Some(_) => {}
-            None => b.last = Some((seq, sent, at)),
+            None => b.last = Some((seq, sent, at, clock)),
         }
     }
 
-    /// `from`'s [`HolderBeats`] at `epoch`, heard at `credit`: a new
-    /// tenure numbers on (the same beat task), or from 1 (a restarted
-    /// holder), so the entry starts afresh, though its late beats still
-    /// say how the host has been doing; `None`: `from` has since been
-    /// heard at a later epoch.
-    fn beats_at(&mut self, from: NodeId, epoch: Epoch, credit: Ms) -> Option<&mut HolderBeats> {
+    /// `from`'s [`HolderBeats`] at `epoch`, heard at `at`: a new tenure
+    /// numbers on (the same beat task), or from 1 (a restarted holder), so
+    /// the entry starts afresh, though its late beats still say how the
+    /// host has been doing; `None`: `from` has since been heard at a later
+    /// epoch.
+    fn beats_at(&mut self, from: NodeId, epoch: Epoch, at: Ms) -> Option<&mut HolderBeats> {
         let b = self.bk.beats.entry(from).or_default();
         if epoch < b.epoch {
             return None;
         }
         if epoch > b.epoch {
             b.epoch = epoch;
-            b.heard_at = credit;
+            b.heard_at = at;
             b.last = None;
             b.expires = Ms(0);
-            b.lags.clear();
-            b.named_max = 0;
-            b.guard_max = 0;
+            b.clocks.clear();
+            b.guard_unknown = false;
         }
-        b.heard_at = b.heard_at.max(credit);
+        b.heard_at = b.heard_at.max(at);
         Some(b)
     }
 

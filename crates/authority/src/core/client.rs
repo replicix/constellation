@@ -2065,7 +2065,7 @@ impl Core {
             let dirs = Core::dirs_of_keys(&super::holder::keys_of_op(&op), replica);
             self.place_note(self.cfg.node_id, dirs);
         }
-        let outcome = match replica.execute(&op, Some(rid), &tag, now.wall.0) {
+        let outcome = match replica.execute(&op, Some(rid), &tag, now) {
             Ok(records) => {
                 if policy == Policy::Client {
                     self.lease.touch(now);

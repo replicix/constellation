@@ -132,8 +132,9 @@ impl View {
             let _ = self.meta.session_wait(keys);
             return;
         }
-        let now = constellation_store_s3::lease::now_unix_ms();
-        if let Some((held, renew)) = deleg.valid(ino, now) {
+        // On the honour clock, the delegation's (plan 43 C7-H1).
+        let honour = constellation_platform::clock::protocol().honour();
+        if let Some((held, renew)) = deleg.valid(ino, honour) {
             deleg.count(|s| s.delegation_local += 1);
             if renew {
                 // In use and past half its life: renew in the background
@@ -219,20 +220,25 @@ impl View {
         &self,
         h: &SyncHandle,
         records: &[constellation_meta::LogRecord],
+        now: constellation_authority::Ms,
     ) {
         // (Called right after the op executed on this thread: the inodes
         // it changed that its records do not name are recalled too.)
-        self.recall_after_local_inos(h, constellation_meta::recall_inos_executed(records));
+        self.recall_after_local_inos(h, constellation_meta::recall_inos_executed(records), now);
     }
 
     /// [`Self::recall_after_local_write`] for writes that do not go
     /// through `execute_mutate` (the holder's own manifest commit).
-    pub(super) fn recall_after_local_inos(&self, h: &SyncHandle, inos: Vec<Ino>) {
-        let now = constellation_store_s3::lease::now_unix_ms();
+    pub(super) fn recall_after_local_inos(
+        &self,
+        h: &SyncHandle,
+        inos: Vec<Ino>,
+        now: constellation_authority::Ms,
+    ) {
         if self
             .meta
             .read_delegations()
-            .touching(&inos, None, now)
+            .touching(&inos, None, now.0)
             .is_empty()
         {
             return;
@@ -349,14 +355,20 @@ impl View {
         // refused as a lapsed grant is: `EIO`, and a close's content kept
         // aside (`flush_inode`).
         let tag = crate::locks::current_tag().map_err(|_| MutateFail::LockLapsed)?;
+        // One reading of the protocol clock for everything this op decides
+        // at its admission (the delegation's and the lease's honour window,
+        // the handoff pause, the token check, the activity stamp, the read
+        // delegations to recall): plan 43 C7-H1 §12. The re-check at the
+        // store's writer lock reads afresh (F1: judged at the write).
+        let now = crate::locks::now();
         // Plan 30 §M11: the delegate's own writes run here at local speed
         // (the sequencer's fast path, under a grant instead of the
         // lease); the core streams them from the journal. A write whose
         // `deps` this replica lacks, or whose grant is not honoured, goes
         // through the core, which parks it.
-        if let Some(admission) = h
-            .delegates
-            .admit_for(&self.meta, &constellation_meta::TouchSet::from_op(op))
+        if let Some(admission) =
+            h.delegates
+                .admit_for(&self.meta, &constellation_meta::TouchSet::from_op(op), now)
         {
             let gen = admission.gen;
             let session = self.meta.session();
@@ -375,7 +387,7 @@ impl View {
                     gen,
                     deps,
                     &tag,
-                    crate::locks::now_ms(),
+                    now,
                     Box::new(move || delegates.honours(gen)),
                 );
                 // Journaled (or refused): the admission ends here, before
@@ -420,7 +432,7 @@ impl View {
                         // there (harness `marker-order` under load).
                         session.note_stream(gen, idx);
                         h.delegates.note_executed();
-                        self.recall_after_local_write(h, &records);
+                        self.recall_after_local_write(h, &records, now.wall);
                         Ok(())
                     }
                     Err(e) => Err(mutate_fail(e)),
@@ -446,7 +458,7 @@ impl View {
         // Plan 30 §M3b: the fast path admits the op (counted in flight)
         // atomically with respect to a release's final flush + CAS — see
         // `lease.rs`'s module doc, "The releasing flag".
-        if let Some(admitted) = h.lease.admit() {
+        if let Some(admitted) = h.lease.admit_at(now) {
             constellation_vfs::watch::stage("local execute (meta)");
             // F1/F9: the lease is judged again once the op holds the
             // store's writer lock (and its fencing token with it): an op
@@ -459,7 +471,7 @@ impl View {
                 op,
                 Some(rid),
                 &tag,
-                crate::locks::now_ms(),
+                now,
                 Box::new(move || lease.usable()),
             );
             if matches!(result, Err(MetaError::NotAdmitted)) {
@@ -483,13 +495,13 @@ impl View {
                 .note_fast_path(constellation_meta::TouchSet::from_op(op));
             return match result {
                 Ok(records) => {
-                    h.lease.touch();
+                    h.lease.touch(now.wall);
                     if let Some(jseq) = jseq {
                         if let Some(outcome) = self.ack_when_durable(h, rid, op, &tag, jseq) {
                             return outcome;
                         }
                     }
-                    self.recall_after_local_write(h, &records);
+                    self.recall_after_local_write(h, &records, now.wall);
                     Ok(())
                 }
                 Err(e) => Err(mutate_fail(e)),

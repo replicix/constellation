@@ -85,7 +85,7 @@
 use crate::sync::SyncRequest;
 use anyhow::{bail, Result};
 use constellation_authority::{
-    LockAnswer, LockOutcome, LockRenewEntry, LockRenewResult, LockTestAnswer, LockTestOutcome,
+    LockAnswer, LockOutcome, LockRenewEntry, LockRenewResult, LockTestAnswer, LockTestOutcome, Now,
 };
 use constellation_fs_core::Ino;
 use constellation_meta::locks::{
@@ -168,25 +168,69 @@ pub fn close_wait() -> Duration {
     })
 }
 
-/// The clock grants are honoured by and fencing tokens are checked at
-/// (unix ms). Tests move it per thread ([`advance_test_clock`]) instead
-/// of sleeping past a grant.
-pub(crate) fn now_ms() -> i64 {
-    let now = constellation_store_s3::lease::now_unix_ms();
+/// The protocol clock's three readings of one instant (plan 43 C7-H1):
+/// grants are honoured on its honour clock, fencing tokens are minted from
+/// it on the wall clock and the wait for them to run out is on its wait
+/// clock. Tests move it per thread ([`advance_test_clock`],
+/// [`step_test_wall`]) instead of sleeping past a grant.
+pub(crate) fn now() -> Now {
+    let now = constellation_platform::clock::protocol().now();
     #[cfg(test)]
-    let now = now + TEST_CLOCK_OFFSET_MS.with(|c| c.get());
+    let now = TEST_CLOCK.with(|c| c.get().apply(now));
     now
+}
+
+/// Per-thread test offsets of the three readings.
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+struct TestClock {
+    wall: i64,
+    honour: i64,
+    wait: i64,
+}
+
+#[cfg(test)]
+impl TestClock {
+    fn apply(self, now: Now) -> Now {
+        Now {
+            wall: constellation_authority::Ms(now.wall.0 + self.wall),
+            honour: constellation_authority::HonourMs(now.honour.0 + self.honour),
+            wait: constellation_authority::WaitMs(now.wait.0 + self.wait),
+        }
+    }
 }
 
 #[cfg(test)]
 thread_local! {
-    static TEST_CLOCK_OFFSET_MS: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    static TEST_CLOCK: std::cell::Cell<TestClock> = std::cell::Cell::new(TestClock::default());
 }
 
-/// Move this thread's [`now_ms`] forward (tests only).
+/// Time passes on this thread's [`now`]: all three readings move forward
+/// (tests only; not a step).
 #[cfg(test)]
 pub(crate) fn advance_test_clock(ms: i64) {
-    TEST_CLOCK_OFFSET_MS.with(|c| c.set(c.get() + ms));
+    TEST_CLOCK.with(|c| {
+        let mut t = c.get();
+        t.wall += ms;
+        t.honour += ms;
+        t.wait += ms;
+        c.set(t);
+    });
+}
+
+/// A wall-clock step on this thread's [`now`] (tests only): the wall reading
+/// moves by `ms`; the honour reading follows a forward step and ignores a
+/// backward one (P4), the wait reading never moves.
+#[cfg(test)]
+pub(crate) fn step_test_wall(ms: i64) {
+    TEST_CLOCK.with(|c| {
+        let mut t = c.get();
+        t.wall += ms;
+        if ms > 0 {
+            t.honour += ms;
+        }
+        c.set(t);
+    });
 }
 
 /// The process of task `pid` (FUSE names a request by its thread),
@@ -444,7 +488,15 @@ impl ClusterLocks {
     /// Whether I/O on `ino` must be refused (`EIO`): local locks under a
     /// lapsed grant. One relaxed atomic load when no local lock exists.
     pub fn fenced(&self, ino: Ino) -> bool {
-        self.meta.locks().fenced(ino, now_ms())
+        let locks = self.meta.locks();
+        // The table's state before the clock: with no local lock on the
+        // node nothing is fenced, and the common case reads no clock at all
+        // (`view::lock_gate` says so; every read, write, setattr, create,
+        // close and fsync asks).
+        if locks.lockers_none() {
+            return false;
+        }
+        locks.fenced(ino, now())
     }
 
     /// Plan 30 §M14, the owner fence: whether an op by `pid` (FUSE: the
@@ -465,7 +517,7 @@ impl ClusterLocks {
         if locks.lockers_none() {
             return false;
         }
-        let now = now_ms();
+        let now = now();
         if !locks.owner_fence_armed(now) {
             return false;
         }
@@ -564,13 +616,19 @@ impl ClusterLocks {
             })
             .map(|l| l.0)
             .collect();
-        locks.owner_tag(&owners, now_ms())
+        locks.owner_tag(&owners, now())
     }
 
     /// Whether `ino`'s dirty data must be discarded rather than
     /// published (`Some(fenced)`; see `LockTables::take_discard`).
     pub fn take_discard(&self, ino: Ino) -> Option<bool> {
-        self.meta.locks().take_discard(ino, now_ms())
+        let locks = self.meta.locks();
+        // Nothing held, locked or tainted: nothing to discard, and no clock
+        // read (as `fenced`).
+        if locks.nothing_to_discard() {
+            return None;
+        }
+        locks.take_discard(ino, now())
     }
 
     /// Dirty data of `ino` was discarded: every open file description of
@@ -606,15 +664,11 @@ impl ClusterLocks {
         write: bool,
         going: impl Fn(u64) -> bool,
     ) -> Option<(u64, u64, bool, u32)> {
-        match self.meta.locks().local_test_going_last(
-            ino,
-            owner,
-            write,
-            start,
-            end,
-            now_ms(),
-            going,
-        ) {
+        match self
+            .meta
+            .locks()
+            .local_test_going_last(ino, owner, write, start, end, now(), going)
+        {
             LocalOutcome::Conflict(l) => Some((l.start, l.end.min(OFFSET_MAX), l.write, l.pid)),
             // (`local_test` never answers `Predecessor`: only a lock
             // waits for an earlier turn.)
@@ -644,7 +698,7 @@ impl ClusterLocks {
         if self
             .meta
             .locks()
-            .local_unlock(ino, owner, start, end, now_ms())
+            .local_unlock(ino, owner, start, end, now())
         {
             self.idle(ino);
         }
@@ -655,7 +709,7 @@ impl ClusterLocks {
     /// on the file). Returns whether no local lock is left on `ino`; the
     /// caller then calls [`Self::idle`] once the file's data is flushed.
     pub fn drop_owner(&self, ino: Ino, owner: u64) -> bool {
-        self.meta.locks().local_release_owner(ino, owner, now_ms())
+        self.meta.locks().local_release_owner(ino, owner, now())
     }
 
     /// [`Self::drop_owner`], also saying whether it dropped any lock:
@@ -663,7 +717,7 @@ impl ClusterLocks {
     pub fn drop_owner_dropped(&self, ino: Ino, owner: u64) -> (bool, bool) {
         self.meta
             .locks()
-            .local_release_owner_dropped(ino, owner, now_ms())
+            .local_release_owner_dropped(ino, owner, now())
     }
 
     /// No local lock is left on `ino`: if its grant was recalled, the
@@ -846,7 +900,7 @@ impl ClusterLocks {
     /// for that first lock — recalled, it would be renewed for ever and
     /// its waiters would wait for ever.
     fn settled(&self, ino: Ino, r: Result<(), Code>, asked: bool) -> Result<(), Code> {
-        if r.is_err() && asked && self.meta.locks().abandon_first_use(ino, now_ms()) {
+        if r.is_err() && asked && self.meta.locks().abandon_first_use(ino, now()) {
             self.idle(ino);
         }
         r
@@ -1140,7 +1194,7 @@ impl ClusterLocks {
         // the owner's queue instead of joining it again at the back.
         let started = std::time::Instant::now();
         loop {
-            let outcome = self.meta.locks().local_set(ino, lock, now_ms());
+            let outcome = self.meta.locks().local_set(ino, lock, now());
             if outcome == LocalOutcome::Predecessor && !predecessor_counted {
                 // Once per request, however often it looks again.
                 predecessor_counted = true;
@@ -1395,7 +1449,7 @@ impl Drop for TagScope {
             } else {
                 sent
             };
-            locks.meta.locks().tag_end(&last, in_doubt, now_ms());
+            locks.meta.locks().tag_end(&last, in_doubt, now());
         }
     }
 }
@@ -1442,7 +1496,7 @@ impl ClusterLocks {
         if tag.is_empty() {
             return TagScope::inert();
         }
-        self.meta.locks().tag_begin(&tag, now_ms());
+        self.meta.locks().tag_begin(&tag, now());
         TagScope::enter(ScopeState {
             locks: self.clone(),
             pid: None,
@@ -1485,7 +1539,7 @@ pub fn current_tag() -> Result<LockTag, Code> {
             .get_or_insert_with(|| {
                 let tag = st.locks.caller_tag(st.pid, st.lock_owner);
                 if let Ok(t) = &tag {
-                    st.locks.meta.locks().tag_begin(t, now_ms());
+                    st.locks.meta.locks().tag_begin(t, now());
                 }
                 tag
             })
@@ -1496,7 +1550,7 @@ pub fn current_tag() -> Result<LockTag, Code> {
             } else {
                 &st.sent
             };
-            let fresh = st.locks.meta.locks().refresh_tag(base, now_ms());
+            let fresh = st.locks.meta.locks().refresh_tag(base, now());
             st.sent = fresh.clone();
             fresh
         });
@@ -1532,7 +1586,7 @@ pub fn reissue_after_lapse() -> bool {
         if st.sent.is_empty() {
             return false;
         }
-        let now = now_ms();
+        let now = now();
         let locks = st.locks.meta.locks();
         let fresh = locks.refresh_tag(&st.sent, now);
         fresh != st.sent && locks.tag_honoured(&fresh, now)
@@ -1567,10 +1621,12 @@ pub fn note_tag_in_doubt(rid: Option<constellation_meta::Rid>) {
                 // window ends first: maybe another file's), until the
                 // grant's window as held now.
                 if let Some(h) = st.closes.and_then(|ino| table.held(ino)) {
+                    // Minted as a token is: the honour window on the wall
+                    // clock, now (plan 43 C7-H1, R8).
                     table.pin_in_doubt(
                         &LockTag(vec![constellation_meta::locks::LockToken {
                             grant: h.id,
-                            until_ms: h.until_ms,
+                            until_ms: now().wall_of_honour(h.until).0,
                         }]),
                         rid,
                     );
@@ -1634,7 +1690,7 @@ pub struct Publishing {
 impl Drop for Publishing {
     fn drop(&mut self) {
         if let Some((locks, grant)) = self.held.take() {
-            locks.meta.locks().publish_end(grant, now_ms());
+            locks.meta.locks().publish_end(grant, now());
         }
     }
 }

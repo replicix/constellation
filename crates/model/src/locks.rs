@@ -119,7 +119,7 @@
 //! is below the expiry) beats to the backup (`Beat(h)`), which records on
 //! its own clock the smallest `local(b) − local(h)` (the code's `at −
 //! sent`, never the credit), the highest expiry named and the highest
-//! guard (the root's own grace, the code's `Beat::guard_unix_ms`; the
+//! guard (the root's own grace, the code's `Beat::guard_ms`; the
 //! model's root has no takeover gate, so the unknown guard never arises
 //! here). The backup's fast takeover of that root and epoch ends its
 //! grace at `min(bound, X + lag + seq_margin)`, `X = max(old expiry,
@@ -127,6 +127,16 @@
 //! `cto.rs`. `beat_cap_from_named_expiry` is the naive variant (`X` =
 //! what the beats named), which must be found violating: a root that
 //! renews after its last beat.
+//!
+//! Plan 43 C7-H1: a wall-clock *step* of a node (a jump past `D` that
+//! stays) is outside this model, whose clocks move only within the
+//! modelled bound. The implementation does not rely on the model for it: a
+//! holder measures its windows (its lease, its grants, its delegations)
+//! on an honour clock that a backward step cannot move and a forward step
+//! only advances (so a window ends early, never late), and the code's beat
+//! carries that clock's readings with its id (`Beat::guard_ms` and the
+//! other values are of one holder clock); the simulator's `ClockStep`
+//! faults and the core's unit tests carry that evidence.
 //!
 //! # The property
 //!

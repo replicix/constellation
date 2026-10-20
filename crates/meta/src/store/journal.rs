@@ -98,7 +98,7 @@ impl Drop for PendingLocalOpGuard {
 }
 
 thread_local! {
-    static PENDING_LOCK_TAG: std::cell::RefCell<Option<(crate::locks::LockTag, i64)>> =
+    static PENDING_LOCK_TAG: std::cell::RefCell<Option<(crate::locks::LockTag, constellation_types::clock::Now)>> =
         const { std::cell::RefCell::new(None) };
     /// The tags [`PendingLockTag::check_at_write`] pinned on this thread
     /// (one per transaction of the op), unpinned by the guard's drop.
@@ -119,15 +119,15 @@ thread_local! {
 pub(crate) struct PendingLockTag;
 
 impl PendingLockTag {
-    /// `checked_ms`: the clock the check before the op read (the
+    /// `checked`: the clock the check before the op read (the
     /// write-time check's fallback while its table has no clock).
     pub(crate) fn set<'a>(
         tag: &crate::locks::LockTag,
-        checked_ms: i64,
+        checked: constellation_types::clock::Now,
         locks: &'a crate::locks::LockTables,
     ) -> PendingLockTagGuard<'a> {
         if !tag.is_empty() {
-            PENDING_LOCK_TAG.with(|c| *c.borrow_mut() = Some((tag.clone(), checked_ms)));
+            PENDING_LOCK_TAG.with(|c| *c.borrow_mut() = Some((tag.clone(), checked)));
         }
         PendingLockTagGuard { locks }
     }
@@ -148,7 +148,7 @@ impl PendingLockTag {
     /// (`LockTables::check_tag_at_write`). Nothing pending: nothing to do.
     pub(crate) fn check_at_write(locks: &crate::locks::LockTables) -> Result<(), MetaError> {
         let pending = PENDING_LOCK_TAG.with(|c| c.borrow().clone());
-        let Some((tag, checked_ms)) = pending else {
+        let Some((tag, checked)) = pending else {
             return Ok(());
         };
         #[cfg(any(test, feature = "test-util"))]
@@ -159,7 +159,7 @@ impl PendingLockTag {
             return Ok(());
         }
         locks
-            .check_tag_at_write(&tag, checked_ms)
+            .check_tag_at_write(&tag, checked)
             .map_err(|_| MetaError::LockLapsed)?;
         PINNED_LOCK_TAGS.with(|c| c.borrow_mut().push(tag));
         #[cfg(any(test, feature = "test-util"))]

@@ -89,6 +89,9 @@ pub struct CoreView {
     /// (epoch, expiry) it believes it holds and has not lost.
     pub claim: EpochClaimView,
     pub epoch_held: bool,
+    /// `(epoch, the lease's end on the node's honour clock)` of an S3 lease
+    /// this node holds (the end is 0 when its body is not this
+    /// incarnation's: unusable).
     pub s3_held: Option<(u64, i64)>,
     /// Plan 30 §M11.
     pub delegation: constellation_authority::core::DelegView,
@@ -432,7 +435,7 @@ impl NodeHandle {
         // the daemon's reads its wall clock.
         {
             let clock = clock.clone();
-            meta.locks().set_clock(Arc::new(move || clock.wall().0));
+            meta.locks().set_clock(Arc::new(move || clock.now()));
             meta.locks()
                 .set_tag_check_at_write_for_tests(env.tag_check_at_write);
             meta.locks().set_settle_for_tests(env.settle_tagged_writes);
@@ -717,7 +720,24 @@ struct Driver {
 }
 
 /// What the off-core heartbeat beats to: `(epoch, expiry, guard, targets)`.
-type Liveness = (u64, i64, i64, Vec<NodeId>);
+/// `(epoch, wall expiry, honour end, guard (wall), targets)`: what the beat
+/// thread reads (the daemon's `AliveTargets`, plan 43 C7-H1).
+type Liveness = (u64, i64, i64, i64, Vec<NodeId>);
+
+/// The daemon's `guard_on_honour`: a wall-clock guard mapped onto the honour
+/// clock at `now` (0 none, `i64::MAX` unknown).
+fn guard_on_honour(g_wall: i64, now: constellation_authority::Now) -> i64 {
+    if g_wall == i64::MAX {
+        return i64::MAX;
+    }
+    if g_wall <= 0 {
+        return 0;
+    }
+    now.honour
+        .0
+        .saturating_add(g_wall.saturating_sub(now.wall.0))
+        .max(1)
+}
 
 /// F1 in the simulation (`WriterLockHold`): a fast-path write that passed
 /// its fencing-token check and waits for the store's writer lock behind a
@@ -851,17 +871,33 @@ async fn beat_loop(
                 }
             }
         }
-        let Some((epoch, until_ms, guard, targets)) = shared.liveness.lock().unwrap().clone()
+        let Some((epoch, until_wall, until_honour, guard, targets)) =
+            shared.liveness.lock().unwrap().clone()
         else {
             continue;
         };
-        let at = clock.wall().0;
-        if at >= until_ms {
+        // One reading per beat (plan 43 C7-H1): the send stamp, the lease's
+        // end and the guard mapped onto it are all of this node's honour
+        // clock, with its id; the beats stop at the honour end.
+        let now = clock.now();
+        if now.honour.0 >= until_honour {
             continue;
         }
         seq += 1;
         for to in targets {
-            bus.send_beat((id, to), epoch, seq, (at, until_ms, guard));
+            bus.send_beat(
+                (id, to),
+                epoch,
+                seq,
+                super::bus::BeatStamps {
+                    clock: clock.id(),
+                    sent: now.honour.0,
+                    holder_expires: until_honour,
+                    guard: guard_on_honour(guard, now),
+                    expires: until_wall,
+                    echo: now.wall.0,
+                },
+            );
         }
     }
 }
@@ -884,7 +920,7 @@ async fn deleg_lane_loop(
 ) {
     use constellation_authority::deleg_lane::{due, with_granted_ttl, FREEZE_MIN_MS, LANE_REQ_BIT};
     let mut seq = 0u64;
-    let mut sent: HashMap<(u64, u64), constellation_authority::Ms> = HashMap::new();
+    let mut sent: HashMap<(u64, u64), constellation_authority::HonourMs> = HashMap::new();
     // When the previous tick expected this one (tokio's clock).
     let mut due_at: Option<tokio::time::Instant> = None;
     loop {
@@ -930,7 +966,7 @@ async fn deleg_lane_loop(
             }
         }
         sent.retain(|k, _| certs.iter().any(|c| (c.gen, c.round) == *k));
-        for c in due(&certs, now.wall, stuck_ms, SIM_HOLDER_STALL_MS, &sent) {
+        for c in due(&certs, now.honour, stuck_ms, SIM_HOLDER_STALL_MS, &sent) {
             seq += 1;
             let req = OpId(LANE_REQ_BIT | seq);
             if shared
@@ -940,13 +976,13 @@ async fn deleg_lane_loop(
                     round: c.round,
                     to: c.root,
                     req,
-                    sent: now.wall,
+                    sent: now.honour,
                 })
                 .is_err()
             {
                 return;
             }
-            sent.insert((c.gen, c.round), now.wall);
+            sent.insert((c.gen, c.round), now.honour);
             bus.send(
                 id,
                 c.root,
@@ -1118,15 +1154,18 @@ impl Driver {
                 if at.0 == 0 {
                     *at = now.wall;
                 }
-                if let (Some(margin), true) = (self.credit_margin, *seq != 0 && sent.0 != 0) {
-                    *at = (*at).min(constellation_authority::Ms(sent.0 + margin));
+                // The credited negative control: the arrival replaced by the
+                // credit the daemon no longer counts (it compares the
+                // holder's clock reading with this node's).
+                if let (Some(margin), true) = (self.credit_margin, *seq != 0 && *sent != 0) {
+                    *at = (*at).min(constellation_authority::Ms(*sent + margin));
                 }
                 // Answered as the daemon's P2P handler answers it, when
                 // this node gets to it: the holder hears the backup is
                 // alive (`Event::BackupAlive`, stamped with the beat's
                 // send time) and gives it the slow-backup grace.
                 if *listed && *seq != 0 {
-                    self.bus.answer_beat((self.id, *from), *sent);
+                    self.bus.answer_beat((self.id, *from), *seq);
                 }
             }
             let debug = tracing::enabled!(tracing::Level::DEBUG);
@@ -1471,9 +1510,11 @@ impl Driver {
                     listed: true,
                     at: now.wall,
                     seq: 0,
-                    sent: constellation_authority::Ms(0),
+                    clock: 0,
+                    sent: 0,
+                    holder_expires: 0,
+                    guard: 0,
                     expires: constellation_authority::Ms(expires),
-                    guard: constellation_authority::Ms(0),
                 });
             }
         }
@@ -1525,12 +1566,21 @@ impl Driver {
         view.epoch_held = lease.epoch_held();
         view.s3_held = match &lease.held {
             Some((l, _)) if !lease.lost && !lease.epoch_held() && l.holder == self.id => {
-                Some((l.epoch, l.expires_unix_ms))
+                // The lease's end on this node's honour clock, 0 when the
+                // body carries none of this incarnation's (`honour_until`).
+                Some((
+                    l.epoch,
+                    lease.honour_until(self.core.config()).map_or(0, |h| h.0),
+                ))
             }
             _ => None,
         };
+        let wall_expiry = match &lease.held {
+            Some((l, _)) => l.expires_unix_ms,
+            None => 0,
+        };
         let certs = self.core.deleg_renew_certs();
-        let liveness = view.s3_held.map(|(epoch, until)| {
+        let liveness = view.s3_held.map(|(epoch, until_honour)| {
             let targets = self.core.liveness_targets().into_iter().map(|(n, _)| n);
             let (base, protecting) = self.core.beat_guard_parts(&*self.meta);
             let guard = base.max(protecting);
@@ -1550,7 +1600,7 @@ impl Driver {
                 }
                 seen.2 = base;
             }
-            (epoch, until, guard, targets.collect())
+            (epoch, wall_expiry, until_honour, guard, targets.collect())
         });
         drop(view);
         *self.shared.liveness.lock().unwrap() = liveness;
@@ -1670,7 +1720,7 @@ impl Driver {
             }
         }
         let outcome = outcome_of(
-            constellation_meta::execute_tagged(&self.meta, op, Some(*rid), tag, now.wall.0),
+            constellation_meta::execute_tagged(&self.meta, op, Some(*rid), tag, now),
             epoch,
         );
         drop(admission);
@@ -1705,7 +1755,7 @@ impl Driver {
                     let _ = checked.send(HeldPhase::Checked);
                     go_rx.recv().unwrap_or(false)
                 })));
-                let r = constellation_meta::execute_tagged(&meta, &op, Some(rid), &tag, now.wall.0);
+                let r = constellation_meta::execute_tagged(&meta, &op, Some(rid), &tag, now);
                 constellation_meta::set_before_write_hook_for_tests(None);
                 let _ = phase_tx.send(HeldPhase::Done(
                     outcome_of(r, epoch),
@@ -1807,7 +1857,7 @@ impl Driver {
                     let _ = checked.send(HeldPhase::Checked);
                     go_rx.take().is_none_or(|rx| rx.recv().unwrap_or(false))
                 })));
-                let r = meta.delegate_execute(&op, Some(rid), gen, deps, &tag, now.wall.0);
+                let r = meta.delegate_execute(&op, Some(rid), gen, deps, &tag, now);
                 constellation_meta::write_check_hook::set(None);
                 let at = clock.elapsed_ms();
                 let _ = committed_tx.send(());

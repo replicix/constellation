@@ -208,6 +208,19 @@ same as for [read delegations](cto-modes.md#read-delegations):
 - `margin` is the lease's expiry margin (`min(1 s, lease TTL / 4)`), so
   the rule holds while clocks stay within half the margin of each other.
 
+What a node honours is measured on its **honour clock** (plan 43 C7-H1): a
+monotone reading that never under-counts real time and follows a forward
+wall-clock step but ignores a backward one. A node's held grants, its
+renewal points, the fences on its locks, the lease and the delegation it
+caps a grant by are all stamped and judged on it. A backward step of the
+node's wall clock therefore changes nothing: a grant lapses when its window
+ends, not later. A forward step ends the windows it covers at once: if it
+is larger than what is left of a held grant's window, the grant lapses and
+its owner is fenced (`EIO`) as for any lapse. That is the expected cost of
+a large forward step. The sequencer's own record of a grant is still
+measured on the wall clock; the matching change to a clock a step cannot
+move comes with the next commit of the item.
+
 A grant is renewed half-way through the window the node honours it for
 (`(ttl − margin) / 2` after the send: 9.5 s at the defaults), one
 `LockRenew` message per owning sequencer carrying every grant that is
@@ -490,7 +503,11 @@ written under it. So the check also happens where the write is recorded
   minting sequencer, the grant whose window ends first among those the
   owner's locks are under, as `(grant id, until)`. `until` is when this
   node stops honouring the grant (`sent + ttl − margin` of its latest
-  request or renewal), on its clock. Operations of processes that hold
+  request or renewal). The window lives on the node's honour clock; the
+  token carries it as a wall-clock time, minted when the mutation is built
+  (the wall clock now plus what is left of the honour window), because the
+  executor judges it on its own wall clock (so that comparison is still
+  bound by the clock offset, plan 43 C7b). Operations of processes that hold
   no lock carry nothing and are not checked. Which grants an operation
   is under is worked out at its first mutation (a close works it out
   before it drops the closer's locks); each mutation's `until` is taken

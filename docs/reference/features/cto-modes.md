@@ -273,6 +273,19 @@ reduces to the lease's own rule, `margin > 2 × drift`: at the defaults,
 clocks may differ from real time by up to ±500 ms. The Stateright model
 in `crates/model/src/cto.rs` checks the argument.
 
+What a node honours is measured on its **honour clock** (plan 43 C7-H1): a
+monotone reading that never under-counts real time and follows a forward
+wall-clock step but ignores a backward one. The delegate's window, a read
+delegation, the lease the holder answers strict reads under and the S3
+liveness proof a fast tenure's strict read needs are all stamped and judged
+on it. The operator-visible effect: a backward step of a node's wall clock
+changes nothing; a forward step ends its delegations and read delegations
+early, by the step (a strict read then goes to the sequencer again, and a
+delegate asks for a renewal), and ends its lease's usable window early (the
+lease is renewed at once, or is unusable for a moment). The sequencer's
+side of the rule is measured on the wall clock until the matching change
+to the wait clock lands.
+
 ### Without P2P
 
 There is no ReadIndex, no delegation and no recall. A strict open tails

@@ -47,10 +47,11 @@
 //!
 //! # The margins
 //!
-//! The delegate honours a grant until `sent + ttl − margin` (its clock,
-//! from when it sent the request), the sequencer outwaits it until
-//! `granted + ttl + margin` (its clock), and a grant's `ttl` is capped at
-//! `lease.expires − margin − now` — `margin` being the lease's own
+//! The delegate honours a grant until `sent + ttl − margin` (its honour
+//! clock, from when it sent the request: plan 43 C7-H1), the sequencer
+//! outwaits it until `granted + ttl + margin` (its clock), and a grant's
+//! `ttl` is capped at `lease.honour_end − margin − now` (the lease's end on
+//! the sequencer's honour clock) — `margin` being the lease's own
 //! `expiry_margin_ms` everywhere. `crates/model/src/cto.rs` has the
 //! argument (every condition reduces to the lease's own `margin > 2D`
 //! for clocks within `D` of real time) and the model that checks it.
@@ -73,7 +74,7 @@ use super::client::Phase as ClientPhase;
 use super::{Core, S3For, Timer};
 use crate::action::{Action, ControlOk, ReadAnswer, S3Op};
 use crate::event::{PeerMsg, ReadGrantMsg, ReadIndexOutcome, S3Result};
-use crate::ids::{Ms, NodeId, Now, OpId, Seq, TimerId};
+use crate::ids::{HonourMs, Ms, NodeId, Now, OpId, Seq, TimerId};
 use crate::replica::Replica;
 use constellation_fs_core::Ino;
 use constellation_meta::{
@@ -91,8 +92,9 @@ struct ReadReq {
     req: Option<OpId>,
     holder: NodeId,
     /// When the request was sent (the delegation's lifetime counts from
-    /// here) and the recall generation then.
-    sent_at: Ms,
+    /// here), on the honour clock (plan 43 C7-H1), and the recall
+    /// generation then.
+    sent_at: HonourMs,
     gen: u64,
     attempts: u32,
     redirected: bool,
@@ -395,10 +397,11 @@ impl Core {
         {
             return None;
         }
-        let (lease, _) = self.lease.held.as_ref()?;
+        self.lease.held.as_ref()?;
         let margin = self.cfg.expiry_margin_ms as i64;
-        // Never outlive the lease that backs the promise.
-        let cap = lease.expires_unix_ms - margin - now.wall.0;
+        // Never outlive the lease that backs the promise: on the honour
+        // clock (plan 43 C7-H1, R6); no honour end, no grant.
+        let cap = self.lease.honour_left_ms(now, &self.cfg)? - margin;
         let ttl = (self.cfg.read_delegation_ttl_ms as i64).min(cap);
         if ttl <= 0 {
             return None;
@@ -1680,7 +1683,7 @@ impl Core {
                 name,
                 req: None,
                 holder: 0,
-                sent_at: now.wall,
+                sent_at: now.honour,
                 gen: 0,
                 attempts: 0,
                 redirected: false,
@@ -1737,7 +1740,7 @@ impl Core {
         };
         r.req = Some(req);
         r.holder = holder;
-        r.sent_at = now.wall;
+        r.sent_at = now.honour;
         r.gen = replica.read_delegations().recall_gen();
         let msg = PeerMsg::ReadIndex {
             req,
@@ -1830,14 +1833,14 @@ impl Core {
                     let margin = self.cfg.expiry_margin_ms as i64;
                     let ttl = g.ttl_ms as i64;
                     let held = HeldDelegation {
-                        until_ms: r.sent_at.0 + ttl - margin,
+                        until: HonourMs(r.sent_at.0 + ttl - margin),
                         position,
                         epoch: g.epoch,
                         holder: from,
                         grant: g.id,
-                        renew_at_ms: r.sent_at.0 + ttl / 2,
+                        renew_at: HonourMs(r.sent_at.0 + ttl / 2),
                     };
-                    if held.until_ms > now.wall.0 {
+                    if held.until > now.honour {
                         delegated = replica.read_delegations().install(r.ino, held, r.gen);
                     }
                 }

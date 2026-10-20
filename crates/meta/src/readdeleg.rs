@@ -31,14 +31,20 @@
 //!
 //! # Time
 //!
-//! All times are unix milliseconds on this node's clock (the core's `now`,
-//! `now_unix_ms()` on FUSE threads). The holder records a grant as live
-//! until `granted_at + ttl + margin`; the delegate honours it only until
-//! `sent_at + ttl − margin`, measured from when it *sent* the request —
-//! both margins the lease's (`crates/model/src/cto.rs` has the argument
-//! and the model that checks it).
+//! Times are unix milliseconds on one of this node's clocks (plan 43
+//! C7-H1, `constellation_types::clock`): the delegate's [`HeldDelegation`]
+//! is stamped and judged on its **honour** clock (the core's `now.honour`,
+//! `protocol().now()` on FUSE threads: a backward wall step cannot extend
+//! it, a forward one ends it with the clock); the holder's grant table is
+//! still on the wall clock (the wait side, the next commit of C7-H1). The
+//! holder records a grant as live until `granted_at + ttl + margin`; the
+//! delegate honours it only until `sent_at + ttl − margin`, measured from
+//! when it *sent* the request — both margins the lease's
+//! (`crates/model/src/cto.rs` has the argument and the model that checks
+//! it).
 
 use crate::session::Position;
+use constellation_types::clock::HonourMs;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -137,16 +143,17 @@ impl RecallNeed {
 /// A delegation this node holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HeldDelegation {
-    /// Honoured while this node's clock is below this.
-    pub until_ms: i64,
+    /// Honoured while this node's honour clock is below this.
+    pub until: HonourMs,
     /// The position the replica must reach before a read under it.
     pub position: Position,
     pub epoch: u64,
     pub holder: u64,
     pub grant: u64,
     /// When the lease-backed TTL started (the request's send time): past
-    /// half its lifetime, a read under it renews it in the background.
-    pub renew_at_ms: i64,
+    /// half its lifetime, a read under it renews it in the background
+    /// (honour clock).
+    pub renew_at: HonourMs,
 }
 
 /// Counters for `status.cto` (plan 30 §M8's measurements).
@@ -191,7 +198,7 @@ struct Inner {
     /// overtook is not installed (see [`ReadDelegations::install`]).
     recall_gen: u64,
     /// Renewals in flight (one per ino).
-    renewing: HashMap<u64, i64>,
+    renewing: HashMap<u64, HonourMs>,
 }
 
 /// Both sides' tables (see the module doc).
@@ -391,24 +398,25 @@ impl ReadDelegations {
         self.stats.lock().unwrap().recalled += 1;
     }
 
-    /// The delegation on `ino`, if it is honoured at `now_ms`, and whether
-    /// it is due for a background renewal (claimed here: only the first
-    /// caller past the renewal point is told to renew).
-    pub fn valid(&self, ino: u64, now_ms: i64) -> Option<(HeldDelegation, bool)> {
+    /// The delegation on `ino`, if it is honoured at `now` (a reading of
+    /// this node's honour clock), and whether it is due for a background
+    /// renewal (claimed here: only the first caller past the renewal point
+    /// is told to renew).
+    pub fn valid(&self, ino: u64, now: HonourMs) -> Option<(HeldDelegation, bool)> {
         let mut g = self.inner.lock().unwrap();
         let held = *g.held.get(&ino)?;
-        if now_ms >= held.until_ms {
+        if now >= held.until {
             g.held.remove(&ino);
             return None;
         }
         let mut renew = false;
-        if now_ms >= held.renew_at_ms {
+        if now >= held.renew_at {
             let stale = g
                 .renewing
                 .get(&ino)
-                .is_none_or(|since| now_ms - since > 1_000);
+                .is_none_or(|since| now.since(*since) > 1_000);
             if stale {
-                g.renewing.insert(ino, now_ms);
+                g.renewing.insert(ino, now);
                 renew = true;
             }
         }
@@ -619,6 +627,7 @@ impl crate::store::Meta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use constellation_types::clock::HonourMs;
 
     #[test]
     fn a_create_recalls_its_parent_directory() {
@@ -678,12 +687,12 @@ mod tests {
 
     fn held(until: i64) -> HeldDelegation {
         HeldDelegation {
-            until_ms: until,
+            until: HonourMs(until),
             position: Position::ZERO,
             epoch: 1,
             holder: 1,
             grant: 1,
-            renew_at_ms: until - 100,
+            renew_at: HonourMs(until - 100),
         }
     }
 
@@ -693,10 +702,10 @@ mod tests {
         let gen = t.recall_gen();
         t.recall(Some(5));
         assert!(!t.install(5, held(1_000), gen));
-        assert!(t.valid(5, 0).is_none());
+        assert!(t.valid(5, HonourMs(0)).is_none());
         let gen = t.recall_gen();
         assert!(t.install(5, held(1_000), gen));
-        assert!(t.valid(5, 0).is_some());
+        assert!(t.valid(5, HonourMs(0)).is_some());
         assert_eq!(t.stats().delegations_raced, 1);
     }
 
@@ -705,10 +714,14 @@ mod tests {
         let t = ReadDelegations::default();
         let gen = t.recall_gen();
         t.install(5, held(1_000), gen);
-        assert_eq!(t.valid(5, 100).map(|(_, r)| r), Some(false));
-        assert_eq!(t.valid(5, 950).map(|(_, r)| r), Some(true));
-        assert_eq!(t.valid(5, 960).map(|(_, r)| r), Some(false), "claimed once");
-        assert!(t.valid(5, 1_000).is_none(), "expired");
+        assert_eq!(t.valid(5, HonourMs(100)).map(|(_, r)| r), Some(false));
+        assert_eq!(t.valid(5, HonourMs(950)).map(|(_, r)| r), Some(true));
+        assert_eq!(
+            t.valid(5, HonourMs(960)).map(|(_, r)| r),
+            Some(false),
+            "claimed once"
+        );
+        assert!(t.valid(5, HonourMs(1_000)).is_none(), "expired");
         assert_eq!(t.held_count(), 0);
     }
 
@@ -718,7 +731,7 @@ mod tests {
         let gen = t.recall_gen();
         t.install(5, held(1_000), gen);
         t.void_below_epoch(2);
-        assert!(t.valid(5, 0).is_none());
+        assert!(t.valid(5, HonourMs(0)).is_none());
     }
 
     /// The holder's own manifest commit (the FUSE flush, not

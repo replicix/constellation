@@ -4304,15 +4304,21 @@ backup the lease lists *then*, so after a seal it is not the successor, and
 `Holder` is) steps one node's WALL reading, and
 `FaultKind::PartitionLockerStepped { step_ms, dur_ms }` steps one locker and
 cuts that same locker off. Neither is in `gen_faults`. The core's `Now`
-carries the three readings, but until the commits of C7-H1 that move a site
-(2/4 honour, 3/4 wait, 4/4 liveness) every protocol decision still reads
-WALL, so a configuration below that targets a site fails here at the rate
-PROGRESS records (the fail-before of the commit that fixes it), and the
-no-step sweeps are identical to the commit before the clocks: `sweep_config`'s
-summary line, floors and fenced seeds, for every configuration in its table
-(the list is in PROGRESS). The configurations (`AUTHORITY_SIM_CONFIG=<name>`,
-`sweep_config`; not in `long_locks` or the CI tests until the commit that
-fixes each): `locks-root-step-forward` (the lock owner stepped forward 2.5 s,
+carries the three readings. The honour side landed in 2/4 (a holder's lease,
+lock grants, delegation, read delegations, liveness proof and heartbeat
+stamps read `now.honour`); the waiter's sites (3/4) and the liveness timers
+(4/4) still read WALL, so a configuration below that targets one of those
+fails here at the rate PROGRESS records (the fail-before of the commit that
+fixes it). Without a step the sweeps do not move from commit to commit:
+`sweep_config`'s summary line, floors and fenced seeds, for every
+configuration in its table (the list is in PROGRESS; the beat's arrival
+credit is the one deliberate exception of 2/4). Tests for the configurations
+the honour side fixes: `a_locker_stepped_back_stops_honouring_its_grant_on_time`,
+`a_holder_stepped_back_while_cut_off_stops_answering_on_time` and
+`a_reader_stepped_back_stops_serving_its_read_delegation_on_time` (12 seeds
+each, around the first seeds that failed before). The configurations
+(`AUTHORITY_SIM_CONFIG=<name>`, `sweep_config`; not in `long_locks` until the
+commit that fixes each): `locks-root-step-forward` (the lock owner stepped forward 2.5 s,
 twice, grants held across: it outwaits early), `locks-locker-step-back` (a
 locker stepped back 3 s and cut off: it honours its grant past the owner's
 outwait), `locks-holder-step-back-sealed` (the S3-cut holder, sealed, stepped

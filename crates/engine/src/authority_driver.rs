@@ -30,7 +30,7 @@ use anyhow::{Context, Result};
 use constellation_authority::action::ControlOk;
 use constellation_authority::core::JobKind;
 use constellation_authority::{
-    Action, CasFailure, ClientReply, Config, Control, Core, EpochState, Event, InboxView,
+    Action, CasFailure, ClientReply, Config, Control, Core, EpochState, Event, HonourMs, InboxView,
     LockAnswer, LockOutcome, LockRenewResult, LockTestAnswer, LockTestOutcome, Ms, NodeId, Now,
     OpId, PeerLink, PeerMsg, Policy, ReadAnswer, ReadGrantMsg, ReadIndexOutcome, S3Failure, S3Op,
     S3Result, ShipState, Stats, TimerId, TimerKind, UploadResult,
@@ -944,12 +944,19 @@ struct AliveTargets {
     listed: Vec<(NodeId, u64)>,
     /// Candidacies the holder dropped lately (`listed: false`).
     dismissed: Vec<(NodeId, u64)>,
-    /// The lease's expiry: no heartbeat at or past it.
+    /// The lease body's wall expiry, carried on every beat for the seal
+    /// watch (row 24, C7b).
     until_unix_ms: i64,
+    /// Plan 43 C7-H1: the end of the lease this holder honours, on its
+    /// honour clock (`LeaseState::honour_until`; 0: none): no heartbeat at
+    /// or past it (a backward wall step must not keep the holder beating
+    /// past the lease it can honour).
+    until_honour: i64,
     /// Plan 43 C7-F F-a: what this holder waits out that its lease does
-    /// not cap (`Core::beat_guard_unix_ms`), carried on every beat so a
-    /// successor that seals this holder can end its own floor with the
-    /// lease: 0 none, `i64::MAX` unknown.
+    /// not cap (`Core::beat_guard_unix_ms`, a wall value until the
+    /// wait-clock commit of C7-H1), mapped onto the honour clock at each
+    /// beat ([`guard_on_honour`]), so a successor that seals this holder
+    /// can end its own floor with the lease: 0 none, `i64::MAX` unknown.
     guard_unix_ms: i64,
 }
 
@@ -972,16 +979,17 @@ struct AliveBook {
 }
 
 impl AliveBook {
-    /// The targets for this refresh: `held` is the epoch, the expiry and
-    /// the guard of a lease this node holds (`None`: none, or only within
-    /// an open continuation epoch), `listed` its backups.
+    /// The targets for this refresh: `held` is the epoch, the wall expiry,
+    /// the honour end and the guard of a lease this node holds (`None`:
+    /// none, or only within an open continuation epoch), `listed` its
+    /// backups.
     fn update(
         &mut self,
         now_unix_ms: i64,
-        held: Option<(u64, i64, i64)>,
+        held: Option<(u64, i64, i64, i64)>,
         listed: Vec<(NodeId, u64)>,
     ) -> Option<AliveTargets> {
-        let Some((epoch, until_unix_ms, guard_unix_ms)) = held else {
+        let Some((epoch, until_unix_ms, until_honour, guard_unix_ms)) = held else {
             self.dismissed.clear();
             self.prev = None;
             return None;
@@ -1013,6 +1021,7 @@ impl AliveBook {
             listed,
             dismissed,
             until_unix_ms,
+            until_honour,
             guard_unix_ms,
         })
     }
@@ -1026,6 +1035,26 @@ impl AliveBook {
 /// a stopped driver or a cut link stops the heartbeat at once.
 fn holder_stall_ms() -> i64 {
     env_ms("CONSTELLATION_HOLDER_STALL_MS", 15_000).max(1) as i64
+}
+
+/// The guard `g_wall`, a wall-clock instant of this holder (what it waits
+/// out that its lease does not cap), as an instant of its honour clock at
+/// `now`: `honour + (g_wall − wall)`, the time left on the wall clock added
+/// to the honour reading, so a forward or backward wall step between the
+/// guard's stamping and this beat moves the guard with it (until the
+/// wait-clock commit of plan 43 C7-H1 stamps it on the clock it is waited
+/// out on). 0 stays 0 ("none"), `i64::MAX` stays `i64::MAX` ("unknown").
+fn guard_on_honour(g_wall: i64, now: Now) -> i64 {
+    if g_wall == i64::MAX {
+        return i64::MAX;
+    }
+    if g_wall <= 0 {
+        return 0;
+    }
+    now.honour
+        .0
+        .saturating_add(g_wall.saturating_sub(now.wall.0))
+        .max(1)
 }
 
 /// What one tick of [`holder_alive_loop`] does.
@@ -1052,14 +1081,17 @@ enum AliveTick {
 /// above sees, keeps beating and renewing while answering nobody.
 fn alive_tick(
     t: Option<&AliveTargets>,
-    now: i64,
+    (now, honour): (i64, HonourMs),
     (busy_since, runtime_stalled, echo_sent): (i64, i64, i64),
     stall: i64,
 ) -> AliveTick {
     let Some(t) = t else {
         return AliveTick::Idle;
     };
-    if now >= t.until_unix_ms {
+    // The lease ended for this holder on its honour clock (plan 43
+    // C7-H1); the stall stamps below are the driver's wake clock (wall
+    // until the liveness commit).
+    if honour.0 >= t.until_honour {
         return AliveTick::Idle;
     }
     if busy_since != 0 && now - busy_since > stall {
@@ -1148,7 +1180,11 @@ async fn holder_alive_loop(
         off_core.note_beat_due(woke_ms + due.saturating_duration_since(woke).as_millis() as i64);
         let targets = alive.lock().unwrap().clone();
         let busy = off_core.busy_since();
-        let now = now_unix_ms();
+        // One reading of the protocol clock per tick (plan 43 C7-H1): the
+        // beats' send stamp and what is mapped onto it, the lease's end,
+        // the lane's due times and the echo's answer stamp all come from it.
+        let clk = constellation_platform::clock::protocol().now();
+        let now = clk.wall.0;
         let runtime_stalled = off_core.runtime_stalled_ms(now);
         // One echo outstanding at a time, on the prompt lane (served
         // after the urgent one, ahead of the internal channel's backlog:
@@ -1162,7 +1198,12 @@ async fn holder_alive_loop(
             }
             echo = now;
         }
-        let tick = alive_tick(targets.as_ref(), now, (busy, runtime_stalled, echo), stall);
+        let tick = alive_tick(
+            targets.as_ref(),
+            (now, clk.honour),
+            (busy, runtime_stalled, echo),
+            stall,
+        );
         // Whether or not this node holds a lease: a driver stuck this
         // long is reported (with the thread's backtrace under
         // `CONSTELLATION_FUSE_STALL_BACKTRACE=1`).
@@ -1173,7 +1214,7 @@ async fn holder_alive_loop(
             (busy != 0 && now - busy > stall) || runtime_stalled > stall || now - echo > stall;
         // The delegation renewals the stuck core cannot send
         // ([`DelegLane`]); on any node with a delegation, holder or not.
-        for (root, payload) in lane.tick(&off_core, node_id, now, stuck_ms, stall) {
+        for (root, payload) in lane.tick(&off_core, node_id, clk.honour, stuck_ms, stall) {
             let peers = peers.clone();
             let off_core = off_core.clone();
             tokio::spawn(async move {
@@ -1234,7 +1275,9 @@ async fn holder_alive_loop(
             if crate::fault::p2p_denied(to) || !beat_slot(&mut pending.lock().unwrap(), to, cap) {
                 continue;
             }
-            let at = Ms(now_unix_ms());
+            // The tick's one reading: an earlier stamp than the send only
+            // lengthens `at − sent`, which lengthens the successor's cap.
+            let at = clk.wall;
             let payload = Payload::HolderAlive {
                 holder: node_id,
                 epoch: t.epoch,
@@ -1242,9 +1285,11 @@ async fn holder_alive_loop(
                 listed,
                 beat: constellation_net::Beat {
                     seq,
-                    sent_unix_ms: at.0,
+                    sent_ms: clk.honour.0,
                     expires_unix_ms: t.until_unix_ms,
-                    guard_unix_ms: t.guard_unix_ms,
+                    guard_ms: guard_on_honour(t.guard_unix_ms, clk),
+                    expires_ms: t.until_honour,
+                    clock: constellation_platform::clock::protocol().id(),
                 },
             };
             let peers = peers.clone();
@@ -1302,8 +1347,8 @@ async fn holder_alive_loop(
 struct DelegLane {
     on: bool,
     seq: u64,
-    /// The latest send per generation and stream round.
-    sent: HashMap<(u64, u64), Ms>,
+    /// The latest send per generation and stream round (honour clock).
+    sent: HashMap<(u64, u64), HonourMs>,
 }
 
 impl DelegLane {
@@ -1335,7 +1380,7 @@ impl DelegLane {
         &mut self,
         off_core: &OffCore,
         node_id: NodeId,
-        now: i64,
+        now: HonourMs,
         stuck_ms: i64,
         hung_ms: i64,
     ) -> Vec<(NodeId, Payload)> {
@@ -1371,12 +1416,11 @@ impl DelegLane {
         // driver dispatched since the certificate was made.
         let mut went_out = self.sent.clone();
         for (k, at) in off_core.renewals_dispatched.lock().unwrap().iter() {
-            let e = went_out.entry(*k).or_insert(Ms(*at));
-            *e = (*e).max(Ms(*at));
+            let e = went_out.entry(*k).or_insert(HonourMs(*at));
+            *e = (*e).max(HonourMs(*at));
         }
         let mut out = Vec::new();
-        for c in
-            constellation_authority::deleg_lane::due(&certs, Ms(now), stuck_ms, hung_ms, &went_out)
+        for c in constellation_authority::deleg_lane::due(&certs, now, stuck_ms, hung_ms, &went_out)
         {
             if crate::fault::p2p_denied(c.root) {
                 continue;
@@ -1389,14 +1433,14 @@ impl DelegLane {
                     round: c.round,
                     to: c.root,
                     req_id,
-                    sent: now,
+                    sent: now.0,
                 })
                 .is_ok()
             });
             if !registered {
                 continue;
             }
-            self.sent.insert((c.gen, c.round), Ms(now));
+            self.sent.insert((c.gen, c.round), now);
             out.push((
                 c.root,
                 Payload::DelegRenewOffCore {
@@ -1598,7 +1642,8 @@ pub struct OffCore {
     pub(crate) deleg_certs: Mutex<Vec<constellation_authority::DelegRenewCert>>,
     pub(crate) urgent: Mutex<Option<mpsc::UnboundedSender<SyncRequest>>>,
     /// When the driver dispatched the core's latest renewal of each
-    /// generation and round (unix ms), kept for the certificates' keys: a
+    /// generation and round (this node's honour clock, the certificates'
+    /// own: plan 43 C7-H1), kept for the certificates' keys: a
     /// renewal the core decided on may wait behind a blocking action of the
     /// same step, and the lane counts only what went out.
     pub(crate) renewals_dispatched: Mutex<HashMap<(u64, u64), i64>>,
@@ -1640,12 +1685,13 @@ impl OffCore {
         }
     }
 
-    /// The core's renewal of `(gen, round)` was dispatched at `at_unix_ms`.
-    pub(crate) fn note_renewal_dispatched(&self, gen: u64, round: u64, at_unix_ms: i64) {
+    /// The core's renewal of `(gen, round)` was dispatched at `at_honour_ms`
+    /// (a reading of the honour clock).
+    pub(crate) fn note_renewal_dispatched(&self, gen: u64, round: u64, at_honour_ms: i64) {
         self.renewals_dispatched
             .lock()
             .unwrap()
-            .insert((gen, round), at_unix_ms);
+            .insert((gen, round), at_honour_ms);
     }
 
     /// The heartbeat thread's next tick is due at `at_unix_ms`.
@@ -2309,9 +2355,11 @@ impl Driver {
                 listed: true,
                 at: Ms(at),
                 seq: 0,
-                sent: Ms(0),
+                clock: 0,
+                sent: 0,
+                holder_expires: 0,
+                guard: 0,
                 expires: Ms(expires),
-                guard: Ms(0),
             }));
         }
     }
@@ -2479,10 +2527,10 @@ impl Driver {
         let lease = self.core.lease();
         self.deps
             .view
-            .mirror(lease, now.wall, cfg, self.core.ack_gated());
+            .mirror(lease, now, cfg, self.core.ack_gated());
         self.deps
             .view
-            .set_liveness(self.core.fast_tenure(), self.core.last_s3_fresh().0);
+            .set_liveness(self.core.fast_tenure(), self.core.last_s3_fresh());
         self.deps.view.set_release_hold(
             self.core.takeover_floor_until_ms(),
             self.core.fast_gate_pending(),
@@ -2557,6 +2605,7 @@ impl Driver {
             Some((l, _)) if !lease.epoch_held() => Some((
                 l.epoch,
                 l.expires_unix_ms,
+                lease.honour_until(self.core.config()).map_or(0, |h| h.0),
                 self.core.beat_guard_unix_ms(&*self.deps.meta),
             )),
             _ => None,
@@ -2900,7 +2949,7 @@ impl Driver {
                 round,
                 to,
                 req: OpId(req_id),
-                sent: Ms(sent),
+                sent: HonourMs(sent),
             })),
             SyncRequest::PeerDelegRenew {
                 from,
@@ -3217,9 +3266,11 @@ impl Driver {
                 listed,
                 at: Ms(at_unix_ms),
                 seq: beat.seq,
-                sent: Ms(beat.sent_unix_ms),
+                clock: beat.clock,
+                sent: beat.sent_ms,
+                holder_expires: beat.expires_ms,
+                guard: beat.guard_ms,
                 expires: Ms(beat.expires_unix_ms),
-                guard: Ms(beat.guard_unix_ms),
             })),
             SyncRequest::PeerPromiseRequest {
                 requester,
@@ -3365,7 +3416,7 @@ impl Driver {
                         ino,
                         mode,
                         blocking,
-                        sent: constellation_authority::Ms(sent),
+                        sent: HonourMs(sent),
                         incarnation,
                         waited_ms,
                     },
@@ -3429,7 +3480,7 @@ impl Driver {
                 from,
                 msg: PeerMsg::LockGranted {
                     ino,
-                    sent: Ms(sent),
+                    sent: HonourMs(sent),
                     outcome,
                 },
             })),
@@ -3458,7 +3509,7 @@ impl Driver {
                     ino,
                     exclusive,
                     shared,
-                    upto: constellation_authority::Ms(upto),
+                    upto: HonourMs(upto),
                 },
             })),
             SyncRequest::PeerLockMirror {
@@ -4230,9 +4281,11 @@ impl Driver {
                 // Dispatched: the lane's next renewal is a period from
                 // here, not from when the core decided on this one (a
                 // blocking action earlier in the step may have delayed it).
-                self.deps
-                    .off_core
-                    .note_renewal_dispatched(gen, round, now_unix_ms());
+                self.deps.off_core.note_renewal_dispatched(
+                    gen,
+                    round,
+                    constellation_platform::clock::protocol().honour().0,
+                );
                 let payload = Payload::DelegRenew {
                     from: self.node_id,
                     req_id: req.0,
@@ -6468,7 +6521,7 @@ impl Standalone {
     /// Copy the core's lease state into `view`, as the daemon's driver
     /// does after every event (tests that need the fast path's gate).
     pub fn mirror(&self, view: &crate::lease::LeaseView) {
-        view.mirror(self.core.lease(), now().wall, self.core.config(), false);
+        view.mirror(self.core.lease(), now(), self.core.config(), false);
     }
 
     /// Run every queued event and pending IO to completion (no timers).
@@ -6841,7 +6894,7 @@ mod tests {
     fn the_alive_book_dismisses_dropped_candidacies_until_reselected() {
         use super::{AliveBook, DISMISS_FOR_MS};
         let mut book = AliveBook::default();
-        let held = Some((4, 100_000, 0));
+        let held = Some((4, 100_000, 100_000, 0));
         let t = book.update(1_000, held, vec![(2, 10), (3, 11)]).unwrap();
         assert_eq!(t.listed, vec![(2, 10), (3, 11)]);
         assert!(t.dismissed.is_empty());
@@ -6849,12 +6902,20 @@ mod tests {
         // change of it republishes them (the driver compares the targets).
         assert_eq!(t.guard_unix_ms, 0);
         let g = book
-            .update(1_050, Some((4, 100_000, i64::MAX)), vec![(2, 10), (3, 11)])
+            .update(
+                1_050,
+                Some((4, 100_000, 100_000, i64::MAX)),
+                vec![(2, 10), (3, 11)],
+            )
             .unwrap();
         assert_eq!(g.guard_unix_ms, i64::MAX, "unknown while a gate is pending");
         assert_ne!(g, t);
         let g2 = book
-            .update(1_060, Some((4, 100_000, 9_000)), vec![(2, 10), (3, 11)])
+            .update(
+                1_060,
+                Some((4, 100_000, 100_000, 9_000)),
+                vec![(2, 10), (3, 11)],
+            )
             .unwrap();
         assert_eq!(g2.guard_unix_ms, 9_000);
         assert_ne!(g2, g);
@@ -6887,7 +6948,7 @@ mod tests {
         // A new epoch forgets the old one's dismissals; no lease, all.
         book.update(20_200, held, Vec::new());
         let t = book
-            .update(20_300, Some((5, 100_000, 0)), Vec::new())
+            .update(20_300, Some((5, 100_000, 100_000, 0)), Vec::new())
             .unwrap();
         assert!(
             t.dismissed.is_empty(),
@@ -6903,26 +6964,40 @@ mod tests {
     #[test]
     fn the_holder_heartbeat_stops_with_the_lease_and_a_stuck_driver() {
         use super::{alive_tick, AliveTargets, AliveTick};
+        use constellation_authority::HonourMs;
         let t = AliveTargets {
             epoch: 4,
             listed: vec![(2, 10)],
             dismissed: vec![(3, 11)],
             until_unix_ms: 50_000,
+            until_honour: 50_000,
             guard_unix_ms: 0,
         };
-        assert_eq!(alive_tick(None, 1_000, (0, 0, 0), 15_000), AliveTick::Idle);
         assert_eq!(
-            alive_tick(Some(&t), 50_000, (0, 0, 0), 15_000),
+            alive_tick(None, (1_000, HonourMs(1_000)), (0, 0, 0), 15_000),
+            AliveTick::Idle
+        );
+        assert_eq!(
+            alive_tick(Some(&t), (50_000, HonourMs(50_000)), (0, 0, 0), 15_000),
             AliveTick::Idle
         );
         let beats = AliveTick::Beat(vec![(2, 10, true), (3, 11, false)]);
-        assert_eq!(alive_tick(Some(&t), 20_000, (0, 0, 0), 15_000), beats);
-        assert_eq!(alive_tick(Some(&t), 20_000, (10_000, 0, 0), 15_000), beats);
         assert_eq!(
-            alive_tick(Some(&t), 30_000, (10_000, 0, 0), 15_000),
+            alive_tick(Some(&t), (20_000, HonourMs(20_000)), (0, 0, 0), 15_000),
+            beats
+        );
+        assert_eq!(
+            alive_tick(Some(&t), (20_000, HonourMs(20_000)), (10_000, 0, 0), 15_000),
+            beats
+        );
+        assert_eq!(
+            alive_tick(Some(&t), (30_000, HonourMs(30_000)), (10_000, 0, 0), 15_000),
             AliveTick::Hung(20_000)
         );
-        assert_eq!(alive_tick(Some(&t), 30_000, (29_000, 0, 0), 15_000), beats);
+        assert_eq!(
+            alive_tick(Some(&t), (30_000, HonourMs(30_000)), (29_000, 0, 0), 15_000),
+            beats
+        );
     }
 
     /// The lag probe's view: a wake-up at least the threshold (an eighth
@@ -6934,6 +7009,7 @@ mod tests {
     #[test]
     fn the_lag_probe_reports_lapses_and_a_runtime_that_runs_nothing() {
         use super::{alive_tick, AliveTargets, AliveTick, OffCore};
+        use constellation_authority::HonourMs;
         let off = OffCore::new(5_000);
         assert_eq!(off.lapse(1_000), (0, 0));
         assert_eq!(off.runtime_stalled_ms(1_000), 0, "not started");
@@ -6952,23 +7028,24 @@ mod tests {
             listed: vec![(2, 1)],
             dismissed: Vec::new(),
             until_unix_ms: i64::MAX,
+            until_honour: i64::MAX,
             guard_unix_ms: 0,
         };
         assert_eq!(
-            alive_tick(Some(&t), 30_000, (0, 15_001, 0), 15_000),
+            alive_tick(Some(&t), (30_000, HonourMs(30_000)), (0, 15_001, 0), 15_000),
             AliveTick::Hung(15_001)
         );
         assert_eq!(
-            alive_tick(Some(&t), 30_000, (0, 14_000, 0), 15_000),
+            alive_tick(Some(&t), (30_000, HonourMs(30_000)), (0, 14_000, 0), 15_000),
             AliveTick::Beat(vec![(2, 1, true)])
         );
         // An echo the driver loop has not taken for the stall bound.
         assert_eq!(
-            alive_tick(Some(&t), 30_000, (0, 0, 14_000), 15_000),
+            alive_tick(Some(&t), (30_000, HonourMs(30_000)), (0, 0, 14_000), 15_000),
             AliveTick::Hung(16_000)
         );
         assert_eq!(
-            alive_tick(Some(&t), 30_000, (0, 0, 20_000), 15_000),
+            alive_tick(Some(&t), (30_000, HonourMs(30_000)), (0, 0, 20_000), 15_000),
             AliveTick::Beat(vec![(2, 1, true)])
         );
     }
@@ -6986,6 +7063,7 @@ mod tests {
             listed: Vec::new(),
             dismissed: Vec::new(),
             until_unix_ms: i64::MAX,
+            until_honour: i64::MAX,
             guard_unix_ms: 0,
         })));
         let probe = tokio::spawn(std::future::pending::<()>());
@@ -7081,7 +7159,7 @@ mod tests {
     fn the_delegation_lane_registers_then_sends_only_while_the_driver_is_stuck() {
         use super::{DelegLane, OffCore, Payload, SyncRequest};
         use constellation_authority::deleg_lane::{DELEG_LANE_STUCK_MS, LANE_REQ_BIT};
-        use constellation_authority::{DelegRenewCert, Ms};
+        use constellation_authority::{DelegRenewCert, HonourMs};
         let off = OffCore::new(5_000);
         let (tx, mut urgent) = tokio::sync::mpsc::unbounded_channel();
         *off.urgent.lock().unwrap() = Some(tx);
@@ -7089,7 +7167,7 @@ mod tests {
             gen: 7,
             root: 1,
             round: 3,
-            next_due: Ms(10_000),
+            next_due: HonourMs(10_000),
             period_ms: 2_500,
         }];
         let hung = 15_000;
@@ -7097,11 +7175,11 @@ mod tests {
         // The driver progresses, or is stuck for less than the minimum,
         // or past the hung bound: nothing, and nothing registered.
         for stuck in [0, DELEG_LANE_STUCK_MS - 1, hung + 1] {
-            assert!(lane.tick(&off, 3, 12_000, stuck, hung).is_empty());
+            assert!(lane.tick(&off, 3, HonourMs(12_000), stuck, hung).is_empty());
         }
         // Stuck for 2 s with the renewal due: one registration, then one
         // request with a lane id, the same id and stamp.
-        let sent = lane.tick(&off, 3, 12_000, 2_000, hung);
+        let sent = lane.tick(&off, 3, HonourMs(12_000), 2_000, hung);
         let reg = urgent.try_recv().expect("not registered");
         let (req_id, stamp) = match reg {
             SyncRequest::DelegRenewSentOffCore {
@@ -7131,10 +7209,10 @@ mod tests {
             other => panic!("{other:?}"),
         }
         // Not again within the period; again after it, with a new id.
-        assert!(lane.tick(&off, 3, 12_300, 2_300, hung).is_empty());
-        assert!(lane.tick(&off, 3, 14_499, 4_499, hung).is_empty());
+        assert!(lane.tick(&off, 3, HonourMs(12_300), 2_300, hung).is_empty());
+        assert!(lane.tick(&off, 3, HonourMs(14_499), 4_499, hung).is_empty());
         assert!(urgent.try_recv().is_err());
-        let sent = lane.tick(&off, 3, 14_500, 4_500, hung);
+        let sent = lane.tick(&off, 3, HonourMs(14_500), 4_500, hung);
         assert_eq!(sent.len(), 1);
         match urgent.try_recv().expect("not registered") {
             SyncRequest::DelegRenewSentOffCore {
@@ -7147,7 +7225,7 @@ mod tests {
         }
         // The core no longer publishes the generation: nothing.
         off.deleg_certs.lock().unwrap().clear();
-        assert!(lane.tick(&off, 3, 30_000, 2_000, hung).is_empty());
+        assert!(lane.tick(&off, 3, HonourMs(30_000), 2_000, hung).is_empty());
         assert!(urgent.try_recv().is_err());
         // Without a driver to register with (the urgent lane closed or
         // never set) a renewal is not sent.
@@ -7155,16 +7233,18 @@ mod tests {
             gen: 8,
             root: 1,
             round: 1,
-            next_due: Ms(0),
+            next_due: HonourMs(0),
             period_ms: 2_500,
         }];
         drop(urgent);
-        assert!(lane.tick(&off, 3, 30_000, 2_000, hung).is_empty());
+        assert!(lane.tick(&off, 3, HonourMs(30_000), 2_000, hung).is_empty());
         // Off: nothing at all.
         let (tx, mut urgent) = tokio::sync::mpsc::unbounded_channel();
         *off.urgent.lock().unwrap() = Some(tx);
         let mut off_lane = DelegLane::new(false);
-        assert!(off_lane.tick(&off, 3, 30_000, 2_000, hung).is_empty());
+        assert!(off_lane
+            .tick(&off, 3, HonourMs(30_000), 2_000, hung)
+            .is_empty());
         assert!(urgent.try_recv().is_err());
     }
 
@@ -7203,7 +7283,7 @@ mod tests {
     #[test]
     fn the_delegation_lane_follows_the_grant_the_root_named() {
         use super::{DelegLane, OffCore};
-        use constellation_authority::{DelegRenewCert, Ms};
+        use constellation_authority::{DelegRenewCert, HonourMs};
         let off = OffCore::new(5_000);
         let (tx, mut urgent) = tokio::sync::mpsc::unbounded_channel();
         *off.urgent.lock().unwrap() = Some(tx);
@@ -7212,25 +7292,31 @@ mod tests {
             gen: 7,
             root: 1,
             round: 3,
-            next_due: Ms(10_000),
+            next_due: HonourMs(10_000),
             period_ms: 2_500,
         }];
         let mut lane = DelegLane::new(true);
         // Stuck at 10_100: the lane renews (due), and the root's answer
         // granted 1_072 ms.
-        assert_eq!(lane.tick(&off, 3, 10_100, 1_000, 15_000).len(), 1);
+        assert_eq!(lane.tick(&off, 3, HonourMs(10_100), 1_000, 15_000).len(), 1);
         assert!(urgent.try_recv().is_ok());
         off.note_granted_ttl(1, 7, 3, 1_072);
         // The next one is due a quarter of the grant after the send
         // (268 ms), not 2_500 ms.
-        assert!(lane.tick(&off, 3, 10_300, 1_200, 15_000).is_empty());
-        assert_eq!(lane.tick(&off, 3, 10_368, 1_268, 15_000).len(), 1);
+        assert!(lane
+            .tick(&off, 3, HonourMs(10_300), 1_200, 15_000)
+            .is_empty());
+        assert_eq!(lane.tick(&off, 3, HonourMs(10_368), 1_268, 15_000).len(), 1);
         assert!(urgent.try_recv().is_ok());
         // A full grant afterwards puts the period back at the certificate's.
         off.note_granted_ttl(1, 7, 3, 10_000);
-        assert!(lane.tick(&off, 3, 10_700, 1_600, 15_000).is_empty());
-        assert!(lane.tick(&off, 3, 12_867, 3_700, 15_000).is_empty());
-        assert_eq!(lane.tick(&off, 3, 12_868, 3_700, 15_000).len(), 1);
+        assert!(lane
+            .tick(&off, 3, HonourMs(10_700), 1_600, 15_000)
+            .is_empty());
+        assert!(lane
+            .tick(&off, 3, HonourMs(12_867), 3_700, 15_000)
+            .is_empty());
+        assert_eq!(lane.tick(&off, 3, HonourMs(12_868), 3_700, 15_000).len(), 1);
     }
 
     /// A freeze of the heartbeat thread is handed to the core only if the
@@ -7301,12 +7387,12 @@ mod tests {
     #[test]
     fn the_delegation_lane_follows_only_the_roots_answers_down_to_a_floor() {
         use super::{DelegLane, OffCore};
-        use constellation_authority::{DelegRenewCert, Ms};
+        use constellation_authority::{DelegRenewCert, HonourMs};
         let cert = DelegRenewCert {
             gen: 7,
             root: 1,
             round: 3,
-            next_due: Ms(10_000),
+            next_due: HonourMs(10_000),
             period_ms: 2_500,
         };
         // An answer from node 2 (not the root of the certificate): ignored.
@@ -7315,15 +7401,19 @@ mod tests {
         *off.urgent.lock().unwrap() = Some(tx);
         *off.deleg_certs.lock().unwrap() = vec![cert.clone()];
         let mut lane = DelegLane::new(true);
-        assert_eq!(lane.tick(&off, 3, 10_100, 1_000, 15_000).len(), 1);
+        assert_eq!(lane.tick(&off, 3, HonourMs(10_100), 1_000, 15_000).len(), 1);
         assert!(urgent.try_recv().is_ok());
         off.note_granted_ttl(2, 7, 3, 1_072);
-        assert!(lane.tick(&off, 3, 10_400, 1_300, 15_000).is_empty());
+        assert!(lane
+            .tick(&off, 3, HonourMs(10_400), 1_300, 15_000)
+            .is_empty());
         // The root's: followed (268 ms), but a 600 ms grant is not followed
         // below the 250 ms floor.
         off.note_granted_ttl(1, 7, 3, 600);
-        assert!(lane.tick(&off, 3, 10_349, 1_249, 15_000).is_empty());
-        assert_eq!(lane.tick(&off, 3, 10_350, 1_250, 15_000).len(), 1);
+        assert!(lane
+            .tick(&off, 3, HonourMs(10_349), 1_249, 15_000)
+            .is_empty());
+        assert_eq!(lane.tick(&off, 3, HonourMs(10_350), 1_250, 15_000).len(), 1);
     }
 
     /// A renewal the core decided on but the driver has not dispatched (a
@@ -7334,7 +7424,7 @@ mod tests {
     #[test]
     fn the_delegation_lane_counts_only_renewals_that_went_out() {
         use super::{DelegLane, OffCore};
-        use constellation_authority::{DelegRenewCert, Ms};
+        use constellation_authority::{DelegRenewCert, HonourMs};
         let off = OffCore::new(5_000);
         let (tx, mut urgent) = tokio::sync::mpsc::unbounded_channel();
         *off.urgent.lock().unwrap() = Some(tx);
@@ -7344,19 +7434,21 @@ mod tests {
             gen: 7,
             root: 1,
             round: 3,
-            next_due: Ms(10_000),
+            next_due: HonourMs(10_000),
             period_ms: 2_500,
         }];
         let mut lane = DelegLane::new(true);
-        assert_eq!(lane.tick(&off, 3, 10_700, 700, 15_000).len(), 1);
+        assert_eq!(lane.tick(&off, 3, HonourMs(10_700), 700, 15_000).len(), 1);
         assert!(urgent.try_recv().is_ok());
         // Fresh lane (a new heartbeat thread, or the lane's book lost):
         // the core's renewal is dispatched at 10_900, the lane waits a
         // period from it, not from the decision.
         let mut lane = DelegLane::new(true);
         off.note_renewal_dispatched(7, 3, 10_900);
-        assert!(lane.tick(&off, 3, 13_399, 3_399, 15_000).is_empty());
-        assert_eq!(lane.tick(&off, 3, 13_400, 3_400, 15_000).len(), 1);
+        assert!(lane
+            .tick(&off, 3, HonourMs(13_399), 3_399, 15_000)
+            .is_empty());
+        assert_eq!(lane.tick(&off, 3, HonourMs(13_400), 3_400, 15_000).len(), 1);
         assert!(urgent.try_recv().is_ok());
     }
 
@@ -7804,6 +7896,7 @@ mod tests {
                 listed: vec![(2, 1)],
                 dismissed: Vec::new(),
                 until_unix_ms: i64::MAX,
+                until_honour: i64::MAX,
                 guard_unix_ms: 0,
             })));
             let (core_tx, _core_rx) = tokio::sync::mpsc::unbounded_channel();

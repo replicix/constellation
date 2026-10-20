@@ -1862,15 +1862,18 @@ impl Core {
                 listed,
                 at,
                 seq,
+                clock,
                 sent,
-                expires,
+                holder_expires,
                 guard,
+                expires,
             } => self.on_holder_alive(
                 from,
                 epoch,
                 candidacy,
                 listed,
-                (at, seq, sent, expires, guard),
+                (at, expires),
+                (seq, clock, sent, holder_expires, guard),
                 replica,
             ),
             Event::OwnLag { from, until } => self.on_own_lag(from, until),
@@ -1913,6 +1916,26 @@ impl Core {
     #[cfg(test)]
     pub(crate) fn timer_wall(&self, id: TimerId) -> Option<Ms> {
         self.timer_at(id).map(TimerAt::wall)
+    }
+
+    /// A pending timer's deadline as raw milliseconds, whichever clock it is
+    /// on (tests that do not step the clocks, where the three agree).
+    #[cfg(test)]
+    pub(crate) fn timer_ms(&self, id: TimerId) -> Option<Ms> {
+        Some(match self.timer_at(id)? {
+            TimerAt::Wall(at) => at,
+            TimerAt::Honour(at) => Ms(at.0),
+            TimerAt::Wait(at) => Ms(at.0),
+        })
+    }
+
+    /// A pending HONOUR timer's deadline (tests).
+    #[cfg(test)]
+    pub(crate) fn timer_honour(&self, id: TimerId) -> Option<HonourMs> {
+        match self.timer_at(id)? {
+            TimerAt::Honour(at) => Some(at),
+            other => panic!("not an honour timer: {other:?}"),
+        }
     }
 
     // ---- dispatch ----
@@ -2210,7 +2233,7 @@ impl Core {
                 exclusive,
                 shared,
                 upto,
-            } => self.on_lock_cancel(now.wall, from, ino, exclusive, shared, upto, replica, out),
+            } => self.on_lock_cancel(now, from, ino, exclusive, shared, upto, replica, out),
             PeerMsg::LockRecall { req, ino, grant } => {
                 self.on_lock_recall(now, from, req, ino, grant, replica, out)
             }
@@ -2907,15 +2930,15 @@ impl Core {
         id
     }
 
-    /// A timer at a WALL deadline: every timer in this commit (plan 43
-    /// C7-H1 1/4); 2/4 to 4/4 move each to the clock of its stamp.
+    /// A timer at a WALL deadline (plan 43 C7-H1): what is wall by its
+    /// stamp; the others are on the clock of theirs (`set_timer_honour`,
+    /// `set_timer_wait`).
     fn set_timer_wall(&mut self, at: Ms, timer: Timer, out: &mut Vec<Action>) -> TimerId {
         let remaining = at.since(self.clk.wall);
         self.arm_timer(TimerAt::Wall(at), remaining, timer, out)
     }
 
     /// A timer at a WAIT deadline: a wait-side or liveness stamp's end.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn set_timer_wait(&mut self, at: WaitMs, timer: Timer, out: &mut Vec<Action>) -> TimerId {
         let remaining = at.since(self.clk.wait);
         self.arm_timer(TimerAt::Wait(at), remaining, timer, out)
@@ -2925,7 +2948,6 @@ impl Core {
     /// tick, a delegation's lapse). It can fire late after a forward step
     /// or a suspend, which costs liveness only: every honour check is made
     /// where the right is used, not by the timer.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn set_timer_honour(&mut self, at: HonourMs, timer: Timer, out: &mut Vec<Action>) -> TimerId {
         let remaining = at.since(self.clk.honour);
         self.arm_timer(TimerAt::Honour(at), remaining, timer, out)
@@ -2947,7 +2969,7 @@ impl Core {
         self.s3.insert(op, purpose);
         // Plan 30 §M9: the *send* time bounds the S3 liveness a
         // successful result proves (see `backup::note_s3_liveness`).
-        self.ack.s3_sent.insert(op, self.clk.wall);
+        self.ack.s3_sent.insert(op, self.clk.honour);
         out.push(Action::S3 { op, req });
         op
     }

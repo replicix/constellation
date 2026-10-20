@@ -7022,6 +7022,48 @@ fn a_holder_ahead_of_its_successors_costs_no_exclusion() {
     assert!(t.backup_takeovers > 0, "nobody sealed: {t:?}");
 }
 
+/// Plan 43 C7-H1 (2/4): a locker whose wall clock stepped back 3 s while it
+/// was cut off honours its lock grant until the grant's end on its honour
+/// clock, which the step does not move: it stops when its owner's outwait
+/// lets another node have the lock. `locks-locker-step-back`: 479 of 2 000
+/// seeds failed before (the first at seeds 0, 4 and 5); the grant's window
+/// was a wall value then.
+#[test]
+fn a_locker_stepped_back_stops_honouring_its_grant_on_time() {
+    for seed in 0..12u64 {
+        run_seed(seed, locks_locker_step_back_config())
+            .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    }
+}
+
+/// Plan 43 C7-H1 (2/4): the holder cut off at 1.2 s and stepped back 8 s
+/// stops answering on its honour clock: the lock grants it makes and
+/// renews, its strict answers and its lease's use all end where its honour
+/// clock says, not 8 s later. `locks-holder-step-back-sealed`: 430 of 2 000
+/// seeds failed before (the first at seeds 0 and 6); one fails now (seed
+/// 1892: a stepped-back holder's wall expiry, which claimants read, is 8 s
+/// short: a node's clock offset beyond the margin, plan 43 C7b).
+#[test]
+fn a_holder_stepped_back_while_cut_off_stops_answering_on_time() {
+    for seed in 0..12u64 {
+        run_seed(seed, locks_holder_step_back_sealed_config())
+            .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    }
+}
+
+/// Plan 43 C7-H1 (2/4): a reader partitioned from its root, stepped back 3
+/// s, stops serving strict reads from its read delegation at the
+/// delegation's honour end, before the root's outwait ends. `strict-
+/// reader-step-back`: 91 of 2 000 seeds failed before (the first at 9, 40
+/// and 54).
+#[test]
+fn a_reader_stepped_back_stops_serving_its_read_delegation_on_time() {
+    for seed in 8..20u64 {
+        run_seed(seed, strict_reader_step_back_config())
+            .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    }
+}
+
 /// Plan 43 C7-F F-a (review F3): the strict side of the floor. A reader
 /// cut from the holder and its backup serves from its read delegation
 /// while the backup, having sealed the crashed holder, takes over: with the

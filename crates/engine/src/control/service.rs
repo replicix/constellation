@@ -566,16 +566,20 @@ impl EngineControl {
                     owners_fenced: l.owners_fenced,
                     owner_fenced_ops: l.owner_fenced_ops,
                     first_use_abandoned: l.first_use_abandoned,
-                    fenced_owners: t
-                        .fenced_owners_snapshot(constellation_store_s3::lease::now_unix_ms())
-                        .into_iter()
-                        .map(|f| api::FencedOwnerStatus {
-                            owner: f.owner,
-                            pid: f.pid,
-                            since_ms: f.since_ms,
-                            grant: f.grant.map(|g| (g.node, g.seq)),
-                        })
-                        .collect(),
+                    fenced_owners: {
+                        // Status is wall-clock time: the honour reading an
+                        // owner was fenced at, mapped through one reading.
+                        let now = crate::locks::now();
+                        t.fenced_owners_snapshot(now)
+                            .into_iter()
+                            .map(|f| api::FencedOwnerStatus {
+                                owner: f.owner,
+                                pid: f.pid,
+                                since_ms: now.wall_of_honour(f.since).0,
+                                grant: f.grant.map(|g| (g.node, g.seq)),
+                            })
+                            .collect()
+                    },
                     margin_ms: crate::lease::expiry_margin_ms().max(0) as u64,
                     held_grants: t.held_ids().into_iter().map(|g| (g.node, g.seq)).collect(),
                     tagged_ops: l.tagged_ops,

@@ -11,7 +11,7 @@
 //! stale and dropped instead of being misread as the answer to something
 //! else.
 
-use crate::ids::{Epoch, Ms, NodeId, OpId, Seq, TimerId};
+use crate::ids::{Epoch, HonourMs, Ms, NodeId, OpId, Seq, TimerId};
 use constellation_fs_core::Ino;
 use constellation_meta::locks::LockTag;
 use constellation_meta::{BackupTx, DelegateTx, MutateOp, MutateOutcome, OwnChunks, Position, Rid};
@@ -120,10 +120,16 @@ pub enum Event {
     /// heard at `at` — its arrival, which may be well before this node's
     /// core gets to it. `listed: false`: the holder dropped this node's
     /// `candidacy` (`PeerMsg::BackupAppend::candidacy`) from its backups.
-    /// `seq`, `sent` and `expires` are the beat's number, the holder's
-    /// clock when it sent it and the expiry of the lease it beats for
-    /// (`constellation_net::Beat`); `seq` 0: not a numbered beat (the
-    /// driver handing the latest arrival over, `Driver::hand_heard`).
+    /// `seq`, `sent`, `holder_expires` and `guard` are the beat's number,
+    /// the holder's honour clock when it sent it, the end of the lease it
+    /// beats for on that clock and what it waits out that its lease does
+    /// not cap, mapped onto it; `clock` is the id of that clock
+    /// (`constellation_net::Beat`; plan 43 C7-H1: values of one holder
+    /// clock, opaque on this node, never compared with its own readings:
+    /// `Core::beat_cap` keeps them per clock id). `expires` is the lease
+    /// body's wall expiry, which the seal watch reads. `seq` 0: not a
+    /// numbered beat (the driver handing the latest arrival over,
+    /// `Driver::hand_heard`).
     HolderAlive {
         from: NodeId,
         epoch: Epoch,
@@ -131,15 +137,17 @@ pub enum Event {
         listed: bool,
         at: Ms,
         seq: u64,
-        sent: Ms,
-        expires: Ms,
-        /// Plan 43 C7-F F-a: the latest instant on the holder's clock at
-        /// which grants it waits out but its lease does not cap may still
-        /// be honoured (its takeover floor, its lock and read
+        clock: u64,
+        sent: i64,
+        holder_expires: i64,
+        /// Plan 43 C7-F F-a: the latest instant on the holder's honour
+        /// clock at which grants it waits out but its lease does not cap
+        /// may still be honoured (its takeover floor, its lock and read
         /// quarantines, its subtree graces); 0: none, or an unnumbered
         /// arrival; `i64::MAX`: unknown (its takeover gate is pending),
         /// which disables the cap (`Core::beat_cap`).
-        guard: Ms,
+        guard: i64,
+        expires: Ms,
     },
     /// This node's own runtime was held up from `from` until `until` (its
     /// lag probe woke at least an eighth of `backup_takeover_ms` late; a
@@ -151,7 +159,7 @@ pub enum Event {
     OwnLag { from: Ms, until: Ms },
     /// The off-core delegation renewal lane (`crate::deleg_lane`) sent a
     /// renewal of `gen` (stream round `round`) to root `to` as request `req`
-    /// at `sent` (this node's clock, read before the send), because the
+    /// at `sent` (this node's honour clock, read before the send), because the
     /// core was stuck in a step. Sent on the urgent lane ahead of the
     /// answer, so the answer is known when it arrives
     /// ([`Core::on_deleg_renew_sent_off_core`]).
@@ -160,7 +168,7 @@ pub enum Event {
         round: u64,
         to: NodeId,
         req: OpId,
-        sent: Ms,
+        sent: HonourMs,
     },
     /// The off-core heartbeat thread did not run from `from` to `until`
     /// (this node's clock): the whole process was frozen, and nothing in it
@@ -761,10 +769,11 @@ pub enum PeerMsg {
         ino: Ino,
         mode: constellation_meta::locks::LockMode,
         blocking: bool,
-        /// The requester's clock when it sent: echoed in a `LockGranted`
-        /// push, so the grant's window never starts later than the
-        /// request it answers (a stale push after a pause found this).
-        sent: Ms,
+        /// The requester's honour clock when it sent (plan 43 C7-H1):
+        /// echoed in a `LockGranted` push, so the grant's window never
+        /// starts later than the request it answers (a stale push after a
+        /// pause found this). The owner never reads it as its own time.
+        sent: HonourMs,
         /// The requester's incarnation: the owner drops what an earlier
         /// one left queued (`LockState::incarnations`).
         incarnation: u32,
@@ -777,11 +786,11 @@ pub enum PeerMsg {
         outcome: LockOutcome,
     },
     /// Plan 30 §M14: a parked request answered `Waiting` gets its grant
-    /// pushed; `sent` echoes the requester's clock at its last send (the
-    /// grant's lifetime counts from there).
+    /// pushed; `sent` echoes the requester's honour clock at its last send
+    /// (the grant's lifetime counts from there).
     LockGranted {
         ino: Ino,
-        sent: Ms,
+        sent: HonourMs,
         outcome: LockOutcome,
     },
     /// The requester no longer waits for `ino` in the modes named: an ask
@@ -793,11 +802,12 @@ pub enum PeerMsg {
         ino: Ino,
         exclusive: bool,
         shared: bool,
-        /// The requester's clock when it decided: only waiters whose last
-        /// request was sent before it are dropped (a request of the node
+        /// The requester's honour clock when it decided: only waiters
+        /// whose last request was sent before it (`LockRequest::sent`, a
+        /// reading of the same clock) are dropped (a request of the node
         /// sent after the cancel, which a different stream may deliver
-        /// first, stays).
-        upto: Ms,
+        /// first, stays). Opaque to the owner.
+        upto: HonourMs,
     },
     /// Plan 30 §M14: the owner recalls `grant`; the holder acks receipt
     /// and releases (`LockReleased`) once no local lock is under it and

@@ -5,9 +5,9 @@
 //! on the node does not; the fence lifts with the owner's unlock.
 use super::durable_ack_tests::holder_fs;
 use super::*;
+use constellation_authority::HonourMs;
 use constellation_fs_core::types::ROOT_INO;
 use constellation_meta::locks::{GrantId, HeldGrant, LockMode};
-use constellation_store_s3::lease::now_unix_ms;
 use constellation_vfs::{
     Blocking, Fh, LockKind, LockOwner, LockRange, LockSpec, LockStatus, Name, OpCtx, OpKind,
     OpenOwner, Opened, RenameFlags, Vfs, VfsResult, WriteData,
@@ -177,16 +177,16 @@ impl Fenced {
 
     /// `pid` holds an exclusive `flock` on `ino` under a grant this node
     /// honours until `until_ms`.
-    fn lock(&self, ino: Ino, pid: u32, until_ms: i64) {
+    fn lock(&self, ino: Ino, pid: u32, until: HonourMs) {
         let t = self.meta.locks();
-        let now = now_unix_ms();
+        let now = crate::locks::now().honour;
         t.install_held(
             ino,
             HeldGrant {
                 id: GrantId { node: 9, seq: 1 },
                 mode: LockMode::Exclusive,
-                until_ms,
-                renew_at_ms: until_ms,
+                until,
+                renew_at: until,
                 owner: 9,
                 recalled: false,
                 position: constellation_meta::Position::ZERO,
@@ -194,7 +194,7 @@ impl Fenced {
                 releasing: false,
                 first_use: false,
                 idle_since_ms: None,
-                installed_ms: now,
+                installed: now,
             },
         );
         // Through the view, as FUSE asks: `pid` is the locking thread.
@@ -251,7 +251,7 @@ fn a_lapsed_owner_is_fenced_on_every_file_and_others_are_not() {
 
     let (turn, _) = f.create(&root, ROOT_INO, "turn.lock").unwrap();
     let (obj, oo) = f.create(&root, ROOT_INO, "tmp_obj").unwrap();
-    f.lock(turn.attr.ino, me, now_unix_ms() + 60_000);
+    f.lock(turn.attr.ino, me, crate::locks::now().honour.plus(60_000));
 
     // Under an honoured grant nothing is fenced.
     f.write(&OpCtx::new(OpKind::Write, &committer), obj.attr.ino, oo.fh)
@@ -325,7 +325,7 @@ fn a_grant_that_runs_out_fences_its_owner_without_any_event() {
     let committer = Caller::new(0, 0, Some(me));
     let root = Caller::root();
     let (turn, _) = f.create(&root, ROOT_INO, "turn.lock").unwrap();
-    f.lock(turn.attr.ino, me, now_unix_ms() + 300);
+    f.lock(turn.attr.ino, me, crate::locks::now().honour.plus(300));
     f.mkdir(&committer, "a").unwrap();
     // The grant's end passes on this thread's clock (no sleep: a loaded
     // host could stretch a real one past anything the test assumes).
@@ -379,7 +379,11 @@ fn a_lock_taken_by_a_non_main_thread_fences_its_whole_process_and_children() {
     // A process this one did not start.
     let other = Caller::new(0, 0, Some(std::os::unix::process::parent_id()));
 
-    f.lock(turn.attr.ino, locker, now_unix_ms() + 60_000);
+    f.lock(
+        turn.attr.ino,
+        locker,
+        crate::locks::now().honour.plus(60_000),
+    );
     let l = f.meta.locks().local_locks(turn.attr.ino)[0];
     assert_eq!(l.pid, me, "the lock names the locker's process");
     assert!(l.pid_start > 0, "and its start time");
@@ -432,21 +436,21 @@ fn a_recycled_pid_is_not_taken_for_the_fenced_owner() {
     let pid = stand_in.id();
     let (_, real_start) = crate::locks::process_of(pid);
     assert!(real_start > 0);
-    f.lock(turn.attr.ino, pid, now_unix_ms() + 60_000);
+    f.lock(turn.attr.ino, pid, crate::locks::now().honour.plus(60_000));
     let t = f.meta.locks();
     let mut l = t.local_locks(turn.attr.ino)[0];
     assert_eq!((l.pid, l.pid_start), (pid, real_start));
     // Re-recorded as taken by an earlier process with that pid.
-    t.local_release_owner(turn.attr.ino, TURN_OWNER, now_unix_ms());
+    t.local_release_owner(turn.attr.ino, TURN_OWNER, crate::locks::now());
     l.pid_start = real_start.saturating_sub(1);
     assert_eq!(
-        t.local_set(turn.attr.ino, l, now_unix_ms()),
+        t.local_set(turn.attr.ino, l, crate::locks::now()),
         constellation_meta::locks::LocalOutcome::Done
     );
     let id = t.held(turn.attr.ino).unwrap().id;
     assert!(t.lost(turn.attr.ino, id));
     let caller = Caller::new(0, 0, Some(pid));
-    assert_eq!(t.fenced_owners(now_unix_ms()).len(), 1);
+    assert_eq!(t.fenced_owners(crate::locks::now()).len(), 1);
     f.mkdir(&caller, "not-fenced").unwrap();
     stand_in.kill().unwrap();
     stand_in.wait().unwrap();
@@ -479,7 +483,7 @@ fn a_fenced_owners_fsync_reports_a_pending_discard_once() {
         })
         .map_err(|e| e.code())
     };
-    f.lock(turn.attr.ino, me, now_unix_ms() + 60_000);
+    f.lock(turn.attr.ino, me, crate::locks::now().honour.plus(60_000));
     // Data of `obj` was thrown away under an earlier lapse.
     f.meta.locks().note_discard(obj.attr.ino);
     let id = f.meta.locks().held(turn.attr.ino).unwrap().id;
@@ -508,7 +512,7 @@ fn a_cancelled_blocking_lock_wait_answers_intr_and_holds_nothing() {
     let root = Caller::root();
     let (file, _) = f.create(&root, ROOT_INO, "contended").unwrap();
     let ino = file.attr.ino;
-    f.lock(ino, me, now_unix_ms() + 60_000);
+    f.lock(ino, me, crate::locks::now().honour.plus(60_000));
     let cancel = constellation_vfs::CancelToken::new();
     let waiter = Caller::new(0, 0, Some(me));
     let wait = |cancel: &constellation_vfs::CancelToken| {
@@ -651,7 +655,7 @@ fn a_blocking_lock_wait_past_its_deadline_answers_timed_out_and_holds_nothing() 
     let root = Caller::root();
     let (file, _) = f.create(&root, ROOT_INO, "contended").unwrap();
     let ino = file.attr.ino;
-    f.lock(ino, me, now_unix_ms() + 60_000);
+    f.lock(ino, me, crate::locks::now().honour.plus(60_000));
     let waiter = Caller::new(0, 0, Some(me));
     let wait = |within: std::time::Duration| {
         let started = std::time::Instant::now();
@@ -757,27 +761,30 @@ fn the_lock_owners_mutations_carry_its_grant_and_nobody_elses_do() {
     let other = Caller::new(0, 0, Some(std::os::unix::process::parent_id()));
     let root = Caller::root();
     let (turn, _) = f.create(&root, ROOT_INO, "turn.lock").unwrap();
-    let until = now_unix_ms() + 60_000;
+    let until = crate::locks::now().honour.plus(60_000);
     f.lock(turn.attr.ino, me, until);
     let locks = f.fs.cluster_locks().unwrap().clone();
     let grant = GrantId { node: 9, seq: 1 };
     {
         let _scope = locks.tag_scope(Some(me), None);
         let tag = crate::locks::current_tag().unwrap();
-        assert_eq!(
-            tag.0,
-            vec![constellation_meta::locks::LockToken {
-                grant,
-                until_ms: until
-            }]
+        // The token: the honour window minted on the wall clock now.
+        assert_eq!(tag.0.len(), 1);
+        assert_eq!(tag.0[0].grant, grant);
+        assert!(
+            (tag.0[0].until_ms - crate::locks::now().wall_of_honour(until).0).abs() <= 5,
+            "{tag:?}"
         );
         assert_eq!(
-            f.meta.locks().release_blocked(grant, now_unix_ms()),
+            f.meta.locks().release_blocked(grant, crate::locks::now()),
             Some(None),
             "the op is in flight"
         );
     }
-    assert_eq!(f.meta.locks().release_blocked(grant, now_unix_ms()), None);
+    assert_eq!(
+        f.meta.locks().release_blocked(grant, crate::locks::now()),
+        None
+    );
     {
         let _scope = locks.tag_scope(other.pid, None);
         assert!(crate::locks::current_tag().unwrap().is_empty());
@@ -810,7 +817,7 @@ fn an_op_that_passed_the_fence_then_stalled_past_its_grant_is_refused() {
     let me = std::process::id();
     let root = Caller::root();
     let (turn, _) = f.create(&root, ROOT_INO, "turn.lock").unwrap();
-    f.lock(turn.attr.ino, me, now_unix_ms() + 300);
+    f.lock(turn.attr.ino, me, crate::locks::now().honour.plus(300));
     let locks = f.fs.cluster_locks().unwrap().clone();
     let _scope = locks.tag_scope(Some(me), None);
     assert!(!locks.owner_fenced(Some(me), None), "the fence passes");
@@ -841,22 +848,59 @@ fn an_op_that_passed_the_fence_then_stalled_past_its_grant_is_refused() {
 /// window, so a continuously renewed holder is not refused because its
 /// op was slow; once the grant is no longer honoured here the op keeps
 /// its old window and is refused where it lands.
+/// Plan 43 C7-H1 (2/4): a grant this node holds is honoured until its end on
+/// the honour clock, which a backward wall step does not move: its owner is
+/// fenced when the window ends, not 3 s later. Fails on the parent: the
+/// window was a wall value, compared with the stepped-back wall clock.
+#[test]
+fn a_held_grant_stepped_back_stays_fenced_on_time() {
+    let f = fenced_fs();
+    let me = std::process::id();
+    let (turn, _) = f.create(&Caller::root(), ROOT_INO, "turn.lock").unwrap();
+    f.lock(turn.attr.ino, me, crate::locks::now().honour.plus(300));
+    let locks = f.fs.cluster_locks().unwrap().clone();
+    assert!(!locks.fenced(turn.attr.ino));
+    crate::locks::step_test_wall(-3_000);
+    crate::locks::advance_test_clock(250);
+    assert!(!locks.fenced(turn.attr.ino), "inside the window");
+    crate::locks::advance_test_clock(100);
+    assert!(
+        locks.fenced(turn.attr.ino),
+        "honoured past its honour end because the wall clock stepped back"
+    );
+    // A forward step ends a window at once.
+    let f = fenced_fs();
+    let (turn, _) = f.create(&Caller::root(), ROOT_INO, "turn2.lock").unwrap();
+    f.lock(turn.attr.ino, me, crate::locks::now().honour.plus(60_000));
+    let locks = f.fs.cluster_locks().unwrap().clone();
+    assert!(!locks.fenced(turn.attr.ino));
+    crate::locks::step_test_wall(61_000);
+    assert!(locks.fenced(turn.attr.ino));
+}
+
 #[test]
 fn an_op_sent_after_a_renewal_carries_the_renewed_window() {
     let f = fenced_fs();
     let me = std::process::id();
     let root = Caller::root();
     let (turn, _) = f.create(&root, ROOT_INO, "turn.lock").unwrap();
-    let first = crate::locks::now_ms() + 300;
+    let first = crate::locks::now().honour.plus(300);
     f.lock(turn.attr.ino, me, first);
     let locks = f.fs.cluster_locks().unwrap().clone();
     let _scope = locks.tag_scope(Some(me), None);
     // Taken at the op's start (as `flush` and `release` do).
-    assert_eq!(crate::locks::current_tag().unwrap().0[0].until_ms, first);
+    // Minted on the wall clock from the honour window (plan 43 C7-H1, R8).
+    let minted = crate::locks::current_tag().unwrap().0[0].until_ms;
+    assert!(
+        (minted - crate::locks::now().wall_of_honour(first).0).abs() <= 5,
+        "{minted} for a window ending at {first:?}"
+    );
     // Renewed meanwhile, then the old window passes.
-    let renewed = crate::locks::now_ms() + 60_000;
+    // Inside the lease's own window (60 s): the fast path stays open here, so
+    // the refusal below is the token's, not a trip to the (absent) core.
+    let renewed = crate::locks::now().honour.plus(30_000);
     let mut h = f.meta.locks().held(turn.attr.ino).unwrap();
-    h.until_ms = renewed;
+    h.until = renewed;
     f.meta.locks().install_held(turn.attr.ino, h);
     crate::locks::advance_test_clock(400);
     let ino = f.meta.allocate_ino(ROOT_INO).unwrap();
@@ -872,7 +916,7 @@ fn an_op_sent_after_a_renewal_carries_the_renewed_window() {
     assert!(f.meta.lookup(ROOT_INO, "slow").unwrap().is_some());
     assert_eq!(f.meta.locks().stats().token_rejections, 0);
     // Past the renewed window too: refused.
-    crate::locks::advance_test_clock(61_000);
+    crate::locks::advance_test_clock(31_000);
     let ino = f.meta.allocate_ino(ROOT_INO).unwrap();
     assert_eq!(f.fs.mutate_op(ROOT_INO, create("late", ino)), Err(Code::Io));
     assert!(f.meta.lookup(ROOT_INO, "late").unwrap().is_none());
@@ -889,7 +933,7 @@ fn a_refused_op_is_reissued_only_under_a_renewed_honoured_grant() {
     let me = std::process::id();
     let root = Caller::root();
     let (turn, _) = f.create(&root, ROOT_INO, "turn.lock").unwrap();
-    f.lock(turn.attr.ino, me, crate::locks::now_ms() + 300);
+    f.lock(turn.attr.ino, me, crate::locks::now().honour.plus(300));
     let locks = f.fs.cluster_locks().unwrap().clone();
     let _scope = locks.tag_scope(Some(me), None);
     assert!(!crate::locks::reissue_after_lapse(), "nothing sent yet");
@@ -899,7 +943,7 @@ fn a_refused_op_is_reissued_only_under_a_renewed_honoured_grant() {
         "the window did not move"
     );
     let mut h = f.meta.locks().held(turn.attr.ino).unwrap();
-    h.until_ms = crate::locks::now_ms() + 5_000;
+    h.until = crate::locks::now().honour.plus(5_000);
     f.meta.locks().install_held(turn.attr.ino, h);
     assert!(crate::locks::reissue_after_lapse(), "renewed and honoured");
     // The re-sent op takes the renewed window: nothing left to re-issue.
@@ -922,7 +966,7 @@ fn a_commit_refused_for_an_ended_grant_becomes_a_conflict_copy() {
     let root = Caller::root();
     let (turn, _) = f.create(&root, ROOT_INO, "turn.lock").unwrap();
     let (file, opened) = f.create(&root, ROOT_INO, "data").unwrap();
-    f.lock(turn.attr.ino, me, crate::locks::now_ms() + 300);
+    f.lock(turn.attr.ino, me, crate::locks::now().honour.plus(300));
     let ino = file.attr.ino;
     let cx = OpCtx::new(OpKind::Write, &owner);
     assert_eq!(f.write(&cx, ino, opened.fh), Ok(6));
@@ -989,10 +1033,10 @@ fn a_refused_commits_eio_is_its_own_report_of_the_discard() {
     // The store's clock, `ahead` ms past this node's.
     let ahead = Arc::new(AtomicI64::new(0));
     let store_clock = ahead.clone();
-    f.meta
-        .locks()
-        .set_clock(Arc::new(move || now_unix_ms() + store_clock.load(Relaxed)));
-    f.lock(ino, me, now_unix_ms() + 60_000);
+    f.meta.locks().set_clock(Arc::new(move || {
+        crate::locks::now().plus(store_clock.load(Relaxed) as u64)
+    }));
+    f.lock(ino, me, crate::locks::now().honour.plus(60_000));
     let fsync = |caller: &Caller, fh: Fh| {
         Blocking::run(|r| {
             f.fs.fsync(
@@ -1100,7 +1144,7 @@ fn a_refused_commits_copy_stays_in_the_view_and_keeps_its_owner() {
     f.meta
         .setattr(file.attr.ino, Some(0o640), None, None, None, None, None)
         .unwrap();
-    f.lock(turn.attr.ino, me, crate::locks::now_ms() + 300);
+    f.lock(turn.attr.ino, me, crate::locks::now().honour.plus(300));
     let ino = file.attr.ino;
     let cx = OpCtx::new(OpKind::Write, &owner);
     assert_eq!(f.write(&cx, ino, opened.fh), Ok(6));
@@ -1146,8 +1190,8 @@ fn releasing_a_handle_drops_the_locks_taken_through_it() {
         HeldGrant {
             id: GrantId { node: 9, seq: 1 },
             mode: LockMode::Exclusive,
-            until_ms: i64::MAX,
-            renew_at_ms: i64::MAX,
+            until: HonourMs(i64::MAX),
+            renew_at: HonourMs(i64::MAX),
             owner: 9,
             recalled: false,
             position: constellation_meta::Position::ZERO,
@@ -1155,7 +1199,7 @@ fn releasing_a_handle_drops_the_locks_taken_through_it() {
             releasing: false,
             first_use: false,
             idle_since_ms: None,
-            installed_ms: now_unix_ms(),
+            installed: crate::locks::now().honour,
         },
     );
     // Two descriptions, each its own owner (the kernel names an OFD
@@ -1216,8 +1260,8 @@ fn a_late_release_spares_a_reused_owners_new_lock() {
         HeldGrant {
             id: GrantId { node: 9, seq: 1 },
             mode: LockMode::Exclusive,
-            until_ms: i64::MAX,
-            renew_at_ms: i64::MAX,
+            until: HonourMs(i64::MAX),
+            renew_at: HonourMs(i64::MAX),
             owner: 9,
             recalled: false,
             position: constellation_meta::Position::ZERO,
@@ -1225,7 +1269,7 @@ fn a_late_release_spares_a_reused_owners_new_lock() {
             releasing: false,
             first_use: false,
             idle_since_ms: None,
-            installed_ms: now_unix_ms(),
+            installed: crate::locks::now().honour,
         },
     );
     let lock = |fh: Fh| {
@@ -1290,8 +1334,8 @@ fn two_descriptions(f: &Fenced, caller: &Caller, name: &str) -> (Ino, Fh, Fh) {
         HeldGrant {
             id: GrantId { node: 9, seq: 1 },
             mode: LockMode::Exclusive,
-            until_ms: i64::MAX,
-            renew_at_ms: i64::MAX,
+            until: HonourMs(i64::MAX),
+            renew_at: HonourMs(i64::MAX),
             owner: 9,
             recalled: false,
             position: constellation_meta::Position::ZERO,
@@ -1299,7 +1343,7 @@ fn two_descriptions(f: &Fenced, caller: &Caller, name: &str) -> (Ino, Fh, Fh) {
             releasing: false,
             first_use: false,
             idle_since_ms: None,
-            installed_ms: now_unix_ms(),
+            installed: crate::locks::now().honour,
         },
     );
     (ino, a.fh, b.fh)
@@ -2201,7 +2245,7 @@ fn a_grant_lapsing_between_a_copys_steps_ends_it_short() {
 
     // The destination's own lock lapses: the lock fence.
     let (locked, lo) = f.create(&root, ROOT_INO, "locked").unwrap();
-    f.lock(locked.attr.ino, me, now_unix_ms() + 60_000);
+    f.lock(locked.attr.ino, me, crate::locks::now().honour.plus(60_000));
     let id = f.meta.locks().held(locked.attr.ino).unwrap().id;
     let (meta, ino) = (f.meta.clone(), locked.attr.ino);
     let hook = super::vfs_tests::BetweenSteps::set(move |_| {
@@ -2228,7 +2272,7 @@ fn a_grant_lapsing_between_a_copys_steps_ends_it_short() {
     .unwrap();
     let (turn, _) = f.create(&root, ROOT_INO, "turn.lock").unwrap();
     let (obj, oo) = f.create(&root, ROOT_INO, "obj").unwrap();
-    f.lock(turn.attr.ino, me, now_unix_ms() + 60_000);
+    f.lock(turn.attr.ino, me, crate::locks::now().honour.plus(60_000));
     let id = f.meta.locks().held(turn.attr.ino).unwrap().id;
     let (meta, ino) = (f.meta.clone(), turn.attr.ino);
     let hook = super::vfs_tests::BetweenSteps::set(move |_| {
@@ -2319,14 +2363,14 @@ fn script_core_waits(f: &mut Fenced, ino: Ino, script: Vec<Scripted>) -> Seen {
                     position: constellation_meta::Position::ZERO,
                 },
                 Scripted::Grant => {
-                    let now = now_unix_ms();
+                    let now = crate::locks::now().honour;
                     meta.locks().install_held(
                         ino,
                         HeldGrant {
                             id: GrantId { node: 9, seq: 1 },
                             mode: LockMode::Exclusive,
-                            until_ms: now + 60_000,
-                            renew_at_ms: now + 30_000,
+                            until: now.plus(60_000),
+                            renew_at: now.plus(30_000),
                             owner: 9,
                             recalled: false,
                             position: constellation_meta::Position::ZERO,
@@ -2334,7 +2378,7 @@ fn script_core_waits(f: &mut Fenced, ino: Ino, script: Vec<Scripted>) -> Seen {
                             releasing: false,
                             first_use: false,
                             idle_since_ms: None,
-                            installed_ms: now,
+                            installed: now,
                         },
                     );
                     constellation_authority::LockAnswer::Granted {

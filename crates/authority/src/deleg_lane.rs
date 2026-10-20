@@ -21,7 +21,7 @@
 //! grant and learns nothing about the delegate's stream or backup from it.
 
 use crate::core::DelegRenewCert;
-use crate::ids::Ms;
+use crate::ids::{HonourMs, Ms};
 use std::collections::HashMap;
 
 /// Request ids of the lane's renewals carry this bit; the core's are
@@ -69,7 +69,7 @@ pub fn with_granted_ttl(c: &DelegRenewCert, granted_ttl_ms: u64) -> DelegRenewCe
         .period_ms
         .min((granted_ttl_ms / 4).max(DELEG_LANE_PERIOD_MIN_MS as u64));
     let mut c = c.clone();
-    c.next_due = Ms(c.next_due.0 - c.period_ms as i64 + period as i64);
+    c.next_due = HonourMs(c.next_due.0 - c.period_ms as i64 + period as i64);
     c.period_ms = period;
     c
 }
@@ -165,7 +165,9 @@ pub fn freeze_explains(freezes: &[(Ms, Ms)], due: Ms, lapse_point: Ms) -> Option
         .max()
 }
 
-/// The certificates due at `now`, with the driver stuck for `stuck_ms`.
+/// The certificates due at `now` (the lane's reading of the honour clock:
+/// a certificate's `next_due` and the sends it keeps are the delegate's own
+/// stamps, plan 43 C7-H1), with the driver stuck for `stuck_ms`.
 ///
 /// Nothing unless the driver has been stuck for [`stuck_threshold_ms`] of
 /// the certificate's period and no longer than `hung_ms`: a driver that is
@@ -178,10 +180,10 @@ pub fn freeze_explains(freezes: &[(Ms, Ms)], due: Ms, lapse_point: Ms) -> Option
 /// the lane sent for the same generation and round (`sent`).
 pub fn due(
     certs: &[DelegRenewCert],
-    now: Ms,
+    now: HonourMs,
     stuck_ms: i64,
     hung_ms: i64,
-    sent: &HashMap<(u64, u64), Ms>,
+    sent: &HashMap<(u64, u64), HonourMs>,
 ) -> Vec<DelegRenewCert> {
     if stuck_ms < DELEG_LANE_STUCK_MIN_MS || stuck_ms > hung_ms {
         return Vec::new();
@@ -191,7 +193,7 @@ pub fn due(
         .filter(|c| {
             let lane = sent
                 .get(&(c.gen, c.round))
-                .map_or(Ms(0), |s| s.plus(c.period_ms));
+                .map_or(HonourMs(0), |s| s.plus(c.period_ms));
             stuck_ms >= stuck_threshold_ms(c.period_ms) && now >= c.next_due.max(lane)
         })
         .cloned()
@@ -207,7 +209,7 @@ mod tests {
             gen,
             root: 1,
             round,
-            next_due: Ms(next_due),
+            next_due: HonourMs(next_due),
             period_ms,
         }
     }
@@ -216,14 +218,21 @@ mod tests {
     fn nothing_while_the_driver_progresses_or_is_hung() {
         let certs = [cert(1, 7, 1_000, 2_500)];
         let none = HashMap::new();
-        assert!(due(&certs, Ms(9_000), 0, 15_000, &none).is_empty());
-        assert!(due(&certs, Ms(9_000), DELEG_LANE_STUCK_MS - 1, 15_000, &none).is_empty());
+        assert!(due(&certs, HonourMs(9_000), 0, 15_000, &none).is_empty());
+        assert!(due(
+            &certs,
+            HonourMs(9_000),
+            DELEG_LANE_STUCK_MS - 1,
+            15_000,
+            &none
+        )
+        .is_empty());
         assert_eq!(
-            due(&certs, Ms(9_000), DELEG_LANE_STUCK_MS, 15_000, &none).len(),
+            due(&certs, HonourMs(9_000), DELEG_LANE_STUCK_MS, 15_000, &none).len(),
             1
         );
-        assert_eq!(due(&certs, Ms(9_000), 15_000, 15_000, &none).len(), 1);
-        assert!(due(&certs, Ms(9_000), 15_001, 15_000, &none).is_empty());
+        assert_eq!(due(&certs, HonourMs(9_000), 15_000, 15_000, &none).len(), 1);
+        assert!(due(&certs, HonourMs(9_000), 15_001, 15_000, &none).is_empty());
     }
 
     #[test]
@@ -235,12 +244,12 @@ mod tests {
         assert_eq!(stuck_threshold_ms(10), DELEG_LANE_STUCK_MIN_MS);
         let certs = [cert(1, 7, 1_000, 540)];
         let none = HashMap::new();
-        assert!(due(&certs, Ms(9_000), 134, 15_000, &none).is_empty());
-        assert_eq!(due(&certs, Ms(9_000), 135, 15_000, &none).len(), 1);
+        assert!(due(&certs, HonourMs(9_000), 134, 15_000, &none).is_empty());
+        assert_eq!(due(&certs, HonourMs(9_000), 135, 15_000, &none).len(), 1);
         // Never below the floor, whatever the period.
         assert!(due(
             &certs,
-            Ms(9_000),
+            HonourMs(9_000),
             DELEG_LANE_STUCK_MIN_MS - 1,
             15_000,
             &none
@@ -252,8 +261,8 @@ mod tests {
     fn due_a_period_after_the_cores_latest_renewal() {
         let certs = [cert(1, 7, 4_000, 2_500)];
         let none = HashMap::new();
-        assert!(due(&certs, Ms(3_999), 2_000, 15_000, &none).is_empty());
-        assert_eq!(due(&certs, Ms(4_000), 2_000, 15_000, &none).len(), 1);
+        assert!(due(&certs, HonourMs(3_999), 2_000, 15_000, &none).is_empty());
+        assert_eq!(due(&certs, HonourMs(4_000), 2_000, 15_000, &none).len(), 1);
     }
 
     #[test]
@@ -263,26 +272,26 @@ mod tests {
         // The core's renewal, decided but not dispatched, is not in the
         // certificate: the lane renews. Once it is dispatched (here at
         // 4_100, the driver notes it), the next is a period after.
-        assert_eq!(due(&certs, Ms(4_050), 3_000, 15_000, &sent).len(), 1);
-        sent.insert((1, 7), Ms(4_100));
-        assert!(due(&certs, Ms(6_599), 3_000, 15_000, &sent).is_empty());
-        assert_eq!(due(&certs, Ms(6_600), 3_000, 15_000, &sent).len(), 1);
+        assert_eq!(due(&certs, HonourMs(4_050), 3_000, 15_000, &sent).len(), 1);
+        sent.insert((1, 7), HonourMs(4_100));
+        assert!(due(&certs, HonourMs(6_599), 3_000, 15_000, &sent).is_empty());
+        assert_eq!(due(&certs, HonourMs(6_600), 3_000, 15_000, &sent).len(), 1);
         // The book is by generation and round: another round's send says
         // nothing about this one's.
         let mut other = HashMap::new();
-        other.insert((1, 8), Ms(4_100));
-        other.insert((2, 7), Ms(4_100));
-        assert_eq!(due(&certs, Ms(4_200), 3_000, 15_000, &other).len(), 1);
+        other.insert((1, 8), HonourMs(4_100));
+        other.insert((2, 7), HonourMs(4_100));
+        assert_eq!(due(&certs, HonourMs(4_200), 3_000, 15_000, &other).len(), 1);
     }
 
     #[test]
     fn each_generation_on_its_own_clock() {
         let certs = [cert(1, 7, 4_000, 2_500), cert(2, 9, 8_000, 5_000)];
         let none = HashMap::new();
-        let due_now = due(&certs, Ms(5_000), 2_000, 15_000, &none);
+        let due_now = due(&certs, HonourMs(5_000), 2_000, 15_000, &none);
         assert_eq!(due_now.len(), 1);
         assert_eq!(due_now[0].gen, 1);
-        assert_eq!(due(&certs, Ms(8_000), 2_000, 15_000, &none).len(), 2);
+        assert_eq!(due(&certs, HonourMs(8_000), 2_000, 15_000, &none).len(), 2);
     }
 
     #[test]
@@ -290,7 +299,7 @@ mod tests {
         let c = cert(1, 7, 4_000, 2_500);
         // The last send was at 1_500; a grant of 1_072 ms: period 268.
         let d = with_granted_ttl(&c, 1_072);
-        assert_eq!((d.period_ms, d.next_due), (268, Ms(1_500 + 268)));
+        assert_eq!((d.period_ms, d.next_due), (268, HonourMs(1_500 + 268)));
         // A full grant leaves the certificate's period (10 s / 4 > 2.5 s).
         assert_eq!(with_granted_ttl(&c, 10_000), c);
         // Never below the floor.

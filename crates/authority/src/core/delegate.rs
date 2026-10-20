@@ -57,7 +57,7 @@ use super::backup::{FreshHold, FreshVerdict};
 use super::{Core, Timer};
 use crate::action::{Action, ControlOk};
 use crate::event::PeerMsg;
-use crate::ids::{Ms, NodeId, Now, OpId, TimerId};
+use crate::ids::{HonourMs, Ms, NodeId, Now, OpId, TimerId};
 use crate::replica::Replica;
 use constellation_fs_core::Ino;
 use constellation_meta::delegation::{Ownership, Range};
@@ -163,9 +163,9 @@ pub(crate) struct ParkedDeleg {
 pub(crate) struct DelegateState {
     pub dir: Ino,
     pub gen: u64,
-    /// Honoured while this node's clock is below this (`Ms(0)`: not
-    /// renewed yet).
-    pub until: Ms,
+    /// Honoured while this node's honour clock is below this (`HonourMs(0)`:
+    /// not renewed yet; plan 43 C7-H1).
+    pub until: HonourMs,
     pub stopped: bool,
     /// The stream's next attempt is not before this (a failed send backs
     /// off; the root unreachable must not mean a send per event).
@@ -179,28 +179,28 @@ pub(crate) struct DelegateState {
     pub streamed_through: u64,
     /// The batch in flight: its request id and last index.
     pub inflight: Option<(OpId, u64)>,
-    /// A renewal in flight: its request id and this node's clock when
-    /// it was sent.
-    pub renew: Option<(OpId, Ms)>,
+    /// A renewal in flight: its request id and this node's honour clock
+    /// when it was sent.
+    pub renew: Option<(OpId, HonourMs)>,
     pub renew_timer: Option<TimerId>,
     /// When this node installed the generation: a grant it never got
-    /// renewed lapses counting from here (`deleg_lapse_at`).
-    pub installed: Ms,
+    /// renewed lapses counting from here (`deleg_lapse_at`); honour clock.
+    pub installed: HonourMs,
     /// The latest renewal of this generation known to have gone out: one
     /// of the core's that was answered (its send time), or one registered
     /// from the off-core lane ([`Core::on_deleg_renew_sent_off_core`]);
-    /// `Ms(0)`: none yet. Not a renewal the core only decided on: the
+    /// `HonourMs(0)`: none yet. Not a renewal the core only decided on: the
     /// action that sends it may still wait behind a blocking one in the
     /// same step (the driver notes the dispatched ones, `OffCore`). The
     /// lane's next renewal is due a period after the later of the two.
-    pub last_renew_sent: Ms,
+    pub last_renew_sent: HonourMs,
     /// The send time of the latest renewal of this generation that was
     /// *answered* with a grant (the core's, or a lane's counted as a late
     /// answer): `Ms(0)`: none. The renewal after it falls due a period on,
     /// and that is the due time a loss is judged from
     /// ([`Core::deleg_loss_due`]); `last_renew_sent` also moves with the
     /// lane's unanswered registrations, which postpone only the lane.
-    pub answered_sent: Ms,
+    pub answered_sent: HonourMs,
     /// The period the core renews at (`on_deleg_renewed` arms its next
     /// timer so: a quarter of the ttl while the generation has lock
     /// grants out, else half); `0` before the first answer, when the
@@ -240,7 +240,9 @@ pub(crate) struct DelegateState {
     /// re-sent after `deleg_request_timeout_ms` (and a backoff), not
     /// waited for forever.
     pub inflight_at: Ms,
-    pub backup_inflight_at: Ms,
+    /// (The backup append's send, on the honour clock: a late answer is
+    /// kept as a [`LateReq`], whose `sent` is.)
+    pub backup_inflight_at: HonourMs,
     /// The stream round: this node's incarnation and a fresh id at the
     /// install and at every re-stream to a new root
     /// ([`Core::deleg_new_round`]). Every batch and renewal carries it and
@@ -275,8 +277,8 @@ struct LateReq {
     kind: ReqKind,
     /// The root or backup it went to.
     to: Option<NodeId>,
-    /// This node's clock at the send.
-    sent: Ms,
+    /// This node's honour clock at the send.
+    sent: HonourMs,
 }
 
 /// What the off-core renewal lane (`crate::deleg_lane`) needs to renew one
@@ -292,7 +294,7 @@ pub struct DelegRenewCert {
     /// When the next renewal is due: a period after the latest one known
     /// to have gone out and been answered or registered (the install,
     /// before the first). The driver adds the core's dispatched sends.
-    pub next_due: Ms,
+    pub next_due: HonourMs,
     pub period_ms: u64,
 }
 
@@ -399,7 +401,9 @@ pub(crate) struct DelegationState {
 /// Plan 30 §M11's view for `status`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DelegView {
-    /// `(dir, gen, until_ms, stopped, streamed_through, executed, parked)`.
+    /// `(dir, gen, until, stopped, streamed_through, executed, parked)`:
+    /// `until` a reading of this node's honour clock (plan 43 C7-H1; the
+    /// engine's `DelegView` judges it on that clock).
     pub mine: Vec<(Ino, u64, i64, bool, u64, u64, usize)>,
     /// `(dir, node, gen, cursor, until_ms, recall, ended)`.
     pub gens: Vec<(Ino, NodeId, u64, u64, i64, String, bool)>,
@@ -557,7 +561,7 @@ impl Core {
                 DelegateState {
                     dir: d.dir,
                     gen: d.gen,
-                    until: Ms(0),
+                    until: HonourMs(0),
                     // A takeover's strand left a hole in this stream
                     // (`Meta::strand_for_takeover`): it ends at what the
                     // log holds of it; nothing more executes here.
@@ -569,9 +573,9 @@ impl Core {
                     inflight: None,
                     renew: None,
                     renew_timer: None,
-                    installed: now.wall,
-                    last_renew_sent: Ms(0),
-                    answered_sent: Ms(0),
+                    installed: now.honour,
+                    last_renew_sent: HonourMs(0),
+                    answered_sent: HonourMs(0),
                     renew_period_ms: 0,
                     lapse_timer: None,
                     lapsed: false,
@@ -588,7 +592,7 @@ impl Core {
                     backup_after: None,
                     renew_backup: None,
                     inflight_at: Ms(0),
-                    backup_inflight_at: Ms(0),
+                    backup_inflight_at: HonourMs(0),
                     stream_round,
                     leaving: None,
                 },
@@ -596,7 +600,7 @@ impl Core {
             if d.designated {
                 // Honoured whatever the root says or the clock does
                 // (DESIGN.md §5.2: the designee writes while isolated).
-                self.dl.mine.get_mut(&d.gen).expect("present").until = Ms(i64::MAX / 2);
+                self.dl.mine.get_mut(&d.gen).expect("present").until = HonourMs(i64::MAX / 2);
             }
             self.deleg_renew_now(now, d.gen, out);
             self.arm_deleg_lapse(now, d.gen, out);
@@ -720,7 +724,7 @@ impl Core {
         // if one explains it. A recalled or refused generation (`stopped`),
         // and one already counted at its lapse (`lapsed`), are not.
         if self.dl.mine.get(&gen).is_some_and(|d| {
-            !d.lapsed && !d.stopped && !d.designated && now.wall >= self.deleg_lapse_at(d)
+            !d.lapsed && !d.stopped && !d.designated && now.honour >= self.deleg_lapse_at(d)
         }) {
             self.deleg_note_loss(gen, true);
         }
@@ -881,7 +885,7 @@ impl Core {
             .dl
             .mine
             .get(&gen)
-            .is_some_and(|d| now.wall < d.until || d.designated);
+            .is_some_and(|d| now.honour < d.until || d.designated);
         // The model's rule 1: the delegate waits for `deps` too.
         let reaches = replica.reaches(&deps);
         // Phase 2b (M8): the read delegations this delegate granted on
@@ -1049,7 +1053,7 @@ impl Core {
                 }
             }
         } else {
-            match replica.delegate_execute(op, Some(rid), gen, deps, tag, now.wall.0) {
+            match replica.delegate_execute(op, Some(rid), gen, deps, tag, now) {
                 Ok((records, idx)) => {
                     replica.remember_outcome(rid, &records);
                     if rid.node != self.cfg.node_id {
@@ -1306,7 +1310,7 @@ impl Core {
             self.stats.deleg_backup_appends += 1;
             let d = self.dl.mine.get_mut(&gen).expect("present");
             d.backup_inflight = Some((req, last));
-            d.backup_inflight_at = now.wall;
+            d.backup_inflight_at = now.honour;
             out.push(Action::Send {
                 to: backup,
                 msg: PeerMsg::DelegBackupAppend { req, gen, txs },
@@ -1722,7 +1726,7 @@ impl Core {
             if d.parked.is_empty() {
                 continue;
             }
-            let honoured = now.wall < d.until && !d.stopped;
+            let honoured = now.honour < d.until && !d.stopped;
             if !honoured {
                 continue;
             }
@@ -1839,14 +1843,14 @@ impl Core {
                 }
             }
             if let Some((req, _)) = d.backup_inflight {
-                if now.wall.since(d.backup_inflight_at) >= timeout {
+                if now.honour.since(d.backup_inflight_at) >= timeout {
                     late.push((req, d.backup, d.backup_inflight_at));
                     d.backup_inflight = None;
                     self.stats.deleg_stream_timeouts += 1;
                 }
             }
             if let Some((req, sent)) = d.renew {
-                if now.wall.since(sent) >= timeout {
+                if now.honour.since(sent) >= timeout {
                     late.push((req, root, sent));
                     d.renew = None;
                     if d.renew_timer.is_none() && !d.stopped {
@@ -1857,7 +1861,7 @@ impl Core {
         }
         self.dl
             .late
-            .retain(|_, l| now.wall.since(l.sent) < LATE_ANSWER_MS);
+            .retain(|_, l| now.honour.since(l.sent) < LATE_ANSWER_MS);
         for req in given_up {
             self.dl.by_req.remove(&req);
         }
@@ -2138,8 +2142,11 @@ impl Core {
                 if let Some(d) = self.dl.mine.get_mut(&gen) {
                     d.renew = None;
                     if d.renew_timer.is_none() {
-                        let t =
-                            self.set_timer_wall(now.wall.plus(retry), Timer::DelegRenew(gen), out);
+                        let t = self.set_timer_honour(
+                            now.honour.plus(retry),
+                            Timer::DelegRenew(gen),
+                            out,
+                        );
                         self.dl.mine.get_mut(&gen).expect("present").renew_timer = Some(t);
                     }
                 }
@@ -2212,8 +2219,8 @@ impl Core {
             );
             if let Some(d) = self.dl.mine.get_mut(&gen) {
                 if d.renew_timer.is_none() && !d.stopped {
-                    let t = self.set_timer_wall(
-                        now.wall.plus(self.cfg.delegation_stream_tick_ms.max(1)),
+                    let t = self.set_timer_honour(
+                        now.honour.plus(self.cfg.delegation_stream_tick_ms.max(1)),
                         Timer::DelegRenew(gen),
                         out,
                     );
@@ -2231,7 +2238,7 @@ impl Core {
         }
         let req = self.op_id();
         let d = self.dl.mine.get_mut(&gen).expect("present");
-        d.renew = Some((req, now.wall));
+        d.renew = Some((req, now.honour));
         if let Some(t) = d.renew_timer.take() {
             self.cancel_timer(t, out);
         }
@@ -2255,6 +2262,8 @@ impl Core {
                 round,
                 backup,
                 stream_head: 0,
+                // Row 9 (plan 43 Appendix B, C7b): the root compares it with
+                // its own clock; kept apart from the renewal's honour send.
                 stream_head_at: now.wall.0,
             },
         });
@@ -2361,7 +2370,7 @@ impl Core {
         // they may be live (the reply can be lost).
         // So does what is left of a lock grace here that covers it.
         let (locks, lock_carry, lock_grace_ms) = if ttl_ms > 0 {
-            let (locks, carry) = self.lock_take_handoff(Now::same(now.wall.0), gen);
+            let (locks, carry) = self.lock_take_handoff(now, gen);
             (
                 locks,
                 carry,
@@ -2461,11 +2470,11 @@ impl Core {
     /// delegate lapses first, by the request's one-way delay. A grant never renewed here
     /// (installed from the log, or re-adopted at a restart) lapses at
     /// the reclaim horizon from the install.
-    fn deleg_lapse_at(&self, d: &DelegateState) -> Ms {
+    fn deleg_lapse_at(&self, d: &DelegateState) -> HonourMs {
         let renewed = if d.until.0 > 0 {
             d.until.plus(2 * self.cfg.expiry_margin_ms)
         } else {
-            Ms(0)
+            HonourMs(0)
         };
         renewed.max(d.installed.plus(self.reclaim_horizon_ms()))
     }
@@ -2482,8 +2491,8 @@ impl Core {
         if d.designated || d.stopped || d.lapsed {
             return;
         }
-        let at = self.deleg_lapse_at(d).max(now.wall.plus(1));
-        let t = self.set_timer_wall(at, Timer::DelegLapse(gen), out);
+        let at = self.deleg_lapse_at(d).max(now.honour.plus(1));
+        let t = self.set_timer_honour(at, Timer::DelegLapse(gen), out);
         self.dl.mine.get_mut(&gen).expect("present").lapse_timer = Some(t);
     }
 
@@ -2518,7 +2527,7 @@ impl Core {
             return;
         }
         let d = self.dl.mine.get(&gen).expect("present");
-        if now.wall < d.until || now.wall < self.deleg_lapse_at(d) {
+        if now.honour < d.until || now.honour < self.deleg_lapse_at(d) {
             self.arm_deleg_lapse(now, gen, out);
             return;
         }
@@ -2558,8 +2567,8 @@ impl Core {
         if !d.lapsed || d.stopped || d.renew_timer.is_some() {
             return;
         }
-        let t = self.set_timer_wall(
-            now.wall.plus(self.deleg_request_timeout_ms()),
+        let t = self.set_timer_honour(
+            now.honour.plus(self.deleg_request_timeout_ms()),
             Timer::DelegRenew(gen),
             out,
         );
@@ -2613,7 +2622,7 @@ impl Core {
     /// period after the latest renewal known to have gone out (the install,
     /// before the first), the period the core renews at (the request
     /// timeout before the first answer).
-    fn deleg_next_renewal(d: &DelegateState, request_timeout_ms: u64) -> (Ms, u64) {
+    fn deleg_next_renewal(d: &DelegateState, request_timeout_ms: u64) -> (HonourMs, u64) {
         let period = if d.renew_period_ms > 0 {
             d.renew_period_ms
         } else {
@@ -2647,7 +2656,7 @@ impl Core {
     /// due: a period after the latest renewal *answered* (the install,
     /// before the first). Not [`Core::deleg_next_renewal`]'s, which the lane's
     /// unanswered registrations push out.
-    fn deleg_loss_due(d: &DelegateState, request_timeout_ms: u64) -> Ms {
+    fn deleg_loss_due(d: &DelegateState, request_timeout_ms: u64) -> HonourMs {
         let period = if d.renew_period_ms > 0 {
             d.renew_period_ms
         } else {
@@ -2686,7 +2695,14 @@ impl Core {
         self.stats.deleg_grants_lost += 1;
         let due = Self::deleg_loss_due(d, self.deleg_request_timeout_ms());
         let lapse_point = self.deleg_lapse_at(d);
-        if let Some(len) = crate::deleg_lane::freeze_explains(&self.dl.freezes, due, lapse_point) {
+        // The freezes are stamps of the driver's wake clock (wall until the
+        // liveness commit of plan 43 C7-H1): the honour stamps here are
+        // read on it through the last step's reading, for the statistic.
+        if let Some(len) = crate::deleg_lane::freeze_explains(
+            &self.dl.freezes,
+            self.clk.wall_of_honour(due),
+            self.clk.wall_of_honour(lapse_point),
+        ) {
             self.stats.deleg_lapses_frozen += 1;
             self.stats.deleg_last_freeze_ms = len as u64;
             self.stats.deleg_last_freeze_gen = gen;
@@ -2704,7 +2720,7 @@ impl Core {
                 .filter(|l| l.gen == gen && l.kind == ReqKind::Renew && l.to == root)
                 .map(|l| l.sent),
         );
-        let in_time = |sent: Ms| {
+        let in_time = |sent: HonourMs| {
             sent.0 <= due.0 + crate::deleg_lane::FREEZE_REACTION_MS
                 && sent.0 + horizon >= lapse_point.0
         };
@@ -2767,7 +2783,7 @@ impl Core {
         round: u64,
         to: NodeId,
         req: OpId,
-        sent: Ms,
+        sent: HonourMs,
     ) {
         if self.root_node() != Some(to) {
             return;
@@ -2799,7 +2815,7 @@ impl Core {
 
     /// Plan 30 §M14: this node's honoured end of generation `gen` as its
     /// delegate (`None`: not held, stopped, or never renewed).
-    pub(crate) fn deleg_mine_until(&self, gen: u64) -> Option<Ms> {
+    pub(crate) fn deleg_mine_until(&self, gen: u64) -> Option<HonourMs> {
         self.dl
             .mine
             .get(&gen)
@@ -2819,16 +2835,19 @@ impl Core {
 
     /// A grant never outlives the root lease's usable end (the cap).
     pub(crate) fn grant_cap_ms(&self, now: Now) -> u64 {
-        let Some((lease, _)) = &self.lease.held else {
+        if self.lease.held.is_none() {
             return 0;
-        };
+        }
         if self.lease.epoch_held() {
             let ttl = self.cfg.delegation_ttl_ms;
             self.ack.note_hold_grant(now.wall.0 + ttl as i64);
             return ttl;
         }
-        let end = lease.expires_unix_ms - self.cfg.expiry_margin_ms as i64;
-        (end - now.wall.0).max(0) as u64
+        // Plan 43 C7-H1 (R6): the lease's end on the honour clock; no
+        // honour end (a body of an earlier incarnation): no cap.
+        self.lease.honour_left_ms(now, &self.cfg).map_or(0, |left| {
+            (left - self.cfg.expiry_margin_ms as i64).max(0) as u64
+        })
     }
 
     /// The root's answer to a renewal. `false`: it is not from the root
@@ -2900,7 +2919,7 @@ impl Core {
             // renew refuses the renewal it sends on thawing, before the
             // lapse watch is handled: counted as a loss in a freeze too.
             self.stats.deleg_renewals_refused += 1;
-            let ran_out = !d.lapsed && now.wall >= self.deleg_lapse_at(d);
+            let ran_out = !d.lapsed && now.honour >= self.deleg_lapse_at(d);
             if ran_out {
                 // (The root answered: it cannot have been silent.)
                 self.deleg_note_loss(gen, false);
@@ -2923,7 +2942,7 @@ impl Core {
         }
         d.last_renew_sent = d.last_renew_sent.max(sent);
         d.answered_sent = d.answered_sent.max(sent);
-        if d.lapsed && now.wall < d.until {
+        if d.lapsed && now.honour < d.until {
             // The link came back before the root reclaimed: the grant is
             // honoured again.
             tracing::info!(
@@ -2941,7 +2960,7 @@ impl Core {
         } else {
             sent.plus(ttl_ms / 2)
         };
-        let t = self.set_timer_wall(at.max(now.wall.plus(1)), Timer::DelegRenew(gen), out);
+        let t = self.set_timer_honour(at.max(now.honour.plus(1)), Timer::DelegRenew(gen), out);
         {
             let d = self.dl.mine.get_mut(&gen).expect("present");
             d.renew_timer = Some(t);
@@ -2993,13 +3012,13 @@ impl Core {
         tracing::debug!(
             node = self.cfg.node_id,
             gen,
-            late_ms = now.wall.since(late.sent),
+            late_ms = now.honour.since(late.sent),
             "a late delegation renewal counted"
         );
         d.until = until;
         d.last_renew_sent = d.last_renew_sent.max(late.sent);
         d.answered_sent = d.answered_sent.max(late.sent);
-        if d.lapsed && now.wall < d.until {
+        if d.lapsed && now.honour < d.until {
             tracing::info!(
                 node = self.cfg.node_id,
                 gen,
@@ -3120,13 +3139,14 @@ impl Core {
         let keys = Self::read_keys(ino, name);
         let gen = self.my_generation_for(&keys, replica)?;
         let d = self.dl.mine.get(&gen)?;
-        if now.wall >= d.until {
+        if now.honour >= d.until {
             return None;
         }
         let epoch = super::DELEG_READ_EPOCH_BASE + gen;
         let grant = if self.cfg.read_delegations && from != self.cfg.node_id {
             let margin = self.cfg.expiry_margin_ms as i64;
-            let cap = d.until.0 - margin - now.wall.0;
+            // A delegate's read grant is capped by its own honour end.
+            let cap = d.until.since(now.honour) - margin;
             let ttl = (self.cfg.read_delegation_ttl_ms as i64).min(cap);
             if ttl > 0
                 && !self
@@ -3185,7 +3205,7 @@ impl Core {
                         .dl
                         .mine
                         .get(&d.gen)
-                        .is_some_and(|m| now.wall < m.until && !m.stopped);
+                        .is_some_and(|m| now.honour < m.until && !m.stopped);
                     honoured.then_some(d.node)
                 } else {
                     Some(d.node)
@@ -3600,6 +3620,7 @@ impl Core {
                 tracing::warn!(node = self.me(), gen, %error, "could not strand the root's speculation of an ended generation");
             }
         }
+        self.lock_note_replay_pins(now, replica);
         self.lease.touch(now);
         self.nudge(now, out);
         // Plan 30 §M14: grants handed to this generation and not handed

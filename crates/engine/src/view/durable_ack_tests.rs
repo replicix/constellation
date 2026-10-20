@@ -50,7 +50,7 @@ pub(super) fn holder_fs(
     let lease = state.granted_lease(Now::same(now.0), &cfg, None, false);
     state.adopt(Now::same(now.0), lease, tag, None);
     let view = Arc::new(crate::lease::LeaseView::default());
-    view.mirror(&state, now, &cfg, gated);
+    view.mirror(&state, Now::same(now.0), &cfg, gated);
     assert!(
         view.admit().is_some(),
         "the fast path is open to the holder"
@@ -527,14 +527,14 @@ fn a_lapsed_grants_discard_is_eio_once_on_every_descriptor_open_at_the_time() {
     };
     let (first, second) = (open(), open());
     // An exclusive grant, about to lapse without its release's flush.
-    let now = now_unix_ms();
+    let now = crate::locks::now().honour;
     meta.locks().install_held(
         file.ino,
         HeldGrant {
             id: GrantId { node: 1, seq: 1 },
             mode: LockMode::Exclusive,
-            until_ms: now + 300,
-            renew_at_ms: now + 150,
+            until: now.plus(300),
+            renew_at: now.plus(150),
             owner: 1,
             recalled: false,
             position: constellation_meta::Position::ZERO,
@@ -542,7 +542,7 @@ fn a_lapsed_grants_discard_is_eio_once_on_every_descriptor_open_at_the_time() {
             releasing: false,
             first_use: false,
             idle_since_ms: None,
-            installed_ms: now,
+            installed: now,
         },
     );
     Blocking::run(|r| {
@@ -913,7 +913,7 @@ fn a_lease_that_ran_out_before_the_write_sends_the_op_through_the_core() {
             constellation_meta::set_before_write_hook_for_tests(Some(Box::new(move || {
                 lease.mirror(
                     &LeaseState::default(),
-                    Ms(now_unix_ms()),
+                    Now::same(now_unix_ms()),
                     &Config::defaults(1, 1),
                     false,
                 );
@@ -974,7 +974,12 @@ fn mirror_deposed(fs: &View) {
     let mut state = LeaseState::default();
     state.mark_lost(2, 2, 1);
     let lease = &fs.sync.as_ref().unwrap().lease;
-    lease.mirror(&state, Ms(now_unix_ms()), &Config::defaults(1, 1), false);
+    lease.mirror(
+        &state,
+        Now::same(now_unix_ms()),
+        &Config::defaults(1, 1),
+        false,
+    );
     assert!(lease.is_lost());
     assert!(lease.admit().is_none(), "the fast path is closed");
 }

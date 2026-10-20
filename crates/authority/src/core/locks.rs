@@ -81,7 +81,7 @@ use super::backup::{FreshHold, FreshVerdict};
 use super::{Core, Timer};
 use crate::action::{Action, ControlOk, LockAnswer, LockTestAnswer, S3Op};
 use crate::event::{LockOutcome, LockRenewEntry, LockRenewResult, LockTestOutcome, PeerMsg};
-use crate::ids::{Ms, NodeId, Now, OpId, TimerId};
+use crate::ids::{HonourMs, Ms, NodeId, Now, OpId, TimerId, WaitMs};
 use crate::replica::Replica;
 use constellation_fs_core::Ino;
 use constellation_meta::locks::{Grant, GrantId, HeldGrant, Installed, LockMode};
@@ -98,8 +98,8 @@ struct LockOp {
     req: Option<OpId>,
     owner: NodeId,
     /// When the current request was sent (the grant's lifetime counts
-    /// from here).
-    sent_at: Ms,
+    /// from here), on this node's honour clock (plan 43 C7-H1).
+    sent_at: HonourMs,
     attempts: u32,
     /// When this node's op was created (the lock call reached the core):
     /// the S3-less deadline and the grant-time statistics count from here.
@@ -165,9 +165,12 @@ struct Waiter {
     /// The RPC to answer, or none (answered `Waiting`; the grant is
     /// pushed, or the next request re-attaches).
     req: Option<OpId>,
-    /// The requester's clock when it sent its request (echoed with a
-    /// push: the grant's window counts from there, never later).
-    sent: Ms,
+    /// The requester's honour clock when it sent its request (echoed with
+    /// a push: the grant's window counts from there, never later). Opaque
+    /// here: the owner never reads it as its own time, only echoes it
+    /// (and compares it with a `LockCancel`'s `upto`, a reading of the
+    /// same requester clock).
+    sent: HonourMs,
     /// This owner's clock when that request (the park, or the latest
     /// re-send) arrived: a grant served to a remote waiter is live from
     /// here, not from when it is served. The requester's window counts
@@ -210,7 +213,7 @@ struct Recalling {
 #[derive(Debug)]
 struct RenewInFlight {
     entries: Vec<(Ino, GrantId)>,
-    sent: Ms,
+    sent: HonourMs,
     timer: TimerId,
     /// The owner it went to.
     to: NodeId,
@@ -229,7 +232,7 @@ struct RenewInFlight {
 #[derive(Debug, Clone, Copy)]
 struct LateRenew {
     to: NodeId,
-    sent: Ms,
+    sent: HonourMs,
 }
 
 /// How long a late renewal answer is still used ([`LateRenew`]).
@@ -246,8 +249,8 @@ pub(crate) struct LockState {
     renews: BTreeMap<OpId, RenewInFlight>,
     late_renews: BTreeMap<OpId, LateRenew>,
     renew_timer: Option<TimerId>,
-    /// When `renew_timer` fires.
-    renew_at: Option<Ms>,
+    /// When `renew_timer` fires (honour clock).
+    renew_at: Option<HonourMs>,
     /// Delegate: generations whose renewal a lock renewal asked for
     /// (too little of the delegation left to extend the grant by much).
     deleg_renew_wanted: std::collections::BTreeSet<u64>,
@@ -282,7 +285,11 @@ pub(crate) struct LockState {
     /// that id instead of being dropped, so this node holds the id the
     /// owner recalls. Bounded (`DONE_REQS_KEPT`). With the inode, when
     /// that RPC was sent: the reply's window counts from it.
-    done_reqs: BTreeMap<OpId, (Ino, Ms)>,
+    done_reqs: BTreeMap<OpId, (Ino, HonourMs)>,
+    /// Plan 43 C7-H1 (R8): the end, on this node's wait clock, of each
+    /// token window of its own queued replays (by grant and wall end), for
+    /// the release that waits for them (`replay_blocks_release`).
+    replay_pins: BTreeMap<(GrantId, i64), WaitMs>,
     // ---- owner side ----
     waiters: Vec<Waiter>,
     next_waiter: u64,
@@ -722,8 +729,8 @@ impl Core {
             {
                 if d.node == self.cfg.node_id {
                     return match self.deleg_mine_until(d.gen) {
-                        Some(until) if now.wall < until => Route::Me {
-                            cap_ms: until.0 - self.lock_margin_ms() - now.wall.0,
+                        Some(until) if now.honour < until => Route::Me {
+                            cap_ms: until.since(now.honour) - self.lock_margin_ms(),
                             gen: d.gen,
                         },
                         // Recalled: the subtree's grants went back to the
@@ -762,7 +769,7 @@ impl Core {
         if renewal {
             if let Some(expires) = self.epoch_reclaim_expires(now) {
                 return Route::Me {
-                    cap_ms: expires - self.lock_margin_ms() - now.wall.0,
+                    cap_ms: expires.since(now.honour) - self.lock_margin_ms(),
                     gen: 0,
                 };
             }
@@ -831,15 +838,20 @@ impl Core {
     /// The root's grants never outlive its lease's usable end (under a
     /// continuation epoch the lease has no expiry; the ttl stands).
     pub(crate) fn lock_cap_ms(&self, now: Now) -> i64 {
-        let Some((lease, _)) = &self.lease.held else {
+        if self.lease.held.is_none() {
             return 0;
-        };
+        }
         if self.lease.epoch_held() {
             let ttl = self.lock_ttl_ms();
             self.ack.note_hold_grant(now.wall.0 + ttl);
             return ttl;
         }
-        lease.expires_unix_ms - self.lock_margin_ms() - now.wall.0
+        // Plan 43 C7-H1 (R6): the lease's end on the honour clock, not its
+        // wall expiry (a backward wall step must not lengthen a grant past
+        // what this holder honours of its lease); no honour end: no cap.
+        self.lease
+            .honour_left_ms(now, &self.cfg)
+            .map_or(0, |left| left - self.lock_margin_ms())
     }
 
     /// The latest end of a subtree grace on this tenure (an outwaited
@@ -895,7 +907,7 @@ impl Core {
         ino: Ino,
         mode: LockMode,
         blocking: bool,
-        sent: Ms,
+        sent: HonourMs,
         incarnation: u32,
         waited_ms: u64,
         replica: &dyn Replica,
@@ -1414,7 +1426,7 @@ impl Core {
         blocking: bool,
         req: Option<OpId>,
         op: Option<OpId>,
-        sent: Ms,
+        sent: HonourMs,
         waited_ms: u64,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -2588,6 +2600,14 @@ impl Core {
     /// When an application that has waited `waited_ms` began (by this
     /// owner's clock: a duration crosses nodes, never a time), at most as
     /// far back as a waiter is kept.
+    ///
+    /// Plan 43 C7-H1: a queue key, a liveness stamp (`Waiter::since`,
+    /// `LockOp::since`, `served`): not a holder's right, so not on the honour
+    /// clock. It moves to the wait clock with the other housekeeping stamps
+    /// (the later commits of the item); a step meanwhile reorders the queue
+    /// (fairness, never exclusion). The `LockCancel` and `LockRequest`
+    /// stamps (`sent`, `upto`) are the requester's honour readings, only
+    /// compared with each other.
     fn lock_waited_since(&self, now: Ms, waited_ms: u64) -> Ms {
         let cap = 4 * self.lock_ttl_ms();
         Ms(now.0 - (waited_ms.min(cap.max(0) as u64) as i64))
@@ -2602,7 +2622,7 @@ impl Core {
         mode: LockMode,
         req: Option<OpId>,
         op: Option<OpId>,
-        sent: Ms,
+        sent: HonourMs,
         waited_ms: u64,
         out: &mut Vec<Action>,
     ) {
@@ -2935,7 +2955,7 @@ impl Core {
         ino: Ino,
         req: Option<OpId>,
         op: Option<OpId>,
-        sent: Ms,
+        sent: HonourMs,
         outcome: LockOutcome,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -2943,9 +2963,10 @@ impl Core {
         if let Some(op) = op {
             // A local waiter: the owner's clock is this node's, so the
             // grant's window starts now (sim seed 90017: stamped from a
-            // request made seconds ago, it arrived lapsed).
+            // request made seconds ago, it arrived lapsed). On the honour
+            // clock, the holder's (plan 43 C7-H1).
             if let Some(o) = self.lk.ops.get_mut(&op) {
-                o.sent_at = now.wall;
+                o.sent_at = now.honour;
             }
             let me = self.cfg.node_id;
             self.lock_op_outcome(now, op, me, outcome, replica, out);
@@ -3129,17 +3150,17 @@ impl Core {
             results.push((e.ino, e.grant, r));
         }
         self.lock_answer(now, from, PeerMsg::LockRenewed { req, results }, out);
-        self.lock_renew_authority(now.wall, out);
+        self.lock_renew_authority(now, out);
     }
 
     /// Renewals answered short of authority ask for more of it: a
     /// delegate's renewal of its delegation, the root's of its lease.
-    fn lock_renew_authority(&mut self, now: Ms, out: &mut Vec<Action>) {
+    fn lock_renew_authority(&mut self, now: Now, out: &mut Vec<Action>) {
         for gen in std::mem::take(&mut self.lk.deleg_renew_wanted) {
-            self.deleg_renew_now(Now::same(now.0), gen, out);
+            self.deleg_renew_now(now, gen, out);
         }
         if std::mem::take(&mut self.lk.lease_renew_wanted) {
-            self.lease_renew_for_grants(Now::same(now.0), out);
+            self.lease_renew_for_grants(now, out);
         }
     }
 
@@ -3413,7 +3434,7 @@ impl Core {
                 blocking,
                 req: None,
                 owner: 0,
-                sent_at: now.wall,
+                sent_at: now.honour,
                 attempts: 0,
                 created: now.wall,
                 since,
@@ -3436,7 +3457,7 @@ impl Core {
         // seeds 90000/90004). A non-blocking request while local locks
         // still pin the recalled grant would block: say so.
         if let Some(h) = replica.locks().held(ino) {
-            if h.until_ms <= now.wall.0 {
+            if h.until <= now.honour {
                 // Lapsed: it is fenced already and cannot be renewed;
                 // drop it (the owner outwaits it) and ask afresh.
                 replica.locks().drop_held(ino, h.id);
@@ -3458,9 +3479,13 @@ impl Core {
             Route::Me { .. } => {
                 let me = self.cfg.node_id;
                 if let Some(o) = self.lk.ops.get_mut(&op) {
-                    o.sent_at = now.wall;
+                    o.sent_at = now.honour;
                     o.owner = me;
                 }
+                // Two readings of one step (plan 43 C7-H1): the honour
+                // clock for the requester's stamp this node echoes, the
+                // owner's record on its own (wall until the wait-side
+                // commit).
                 match self.lock_serve(
                     now,
                     me,
@@ -3469,7 +3494,7 @@ impl Core {
                     blocking,
                     None,
                     Some(op),
-                    now.wall,
+                    now.honour,
                     waited_ms,
                     replica,
                     out,
@@ -3493,7 +3518,7 @@ impl Core {
                 };
                 o.req = Some(req);
                 o.owner = n;
-                o.sent_at = now.wall;
+                o.sent_at = now.honour;
                 o.attempts += 1;
                 self.lk.by_req.insert(req, op);
                 self.set_timer_wall(
@@ -3508,7 +3533,7 @@ impl Core {
                         ino,
                         mode,
                         blocking,
-                        sent: now.wall,
+                        sent: now.honour,
                         incarnation: self.cfg.incarnation,
                         waited_ms,
                     },
@@ -3798,7 +3823,7 @@ impl Core {
         // past the owner's record of it — the owner outwaited it and
         // granted another node while this one still did I/O under it
         // (sim `locks-stall-step` seed 1934: two exclusive holders).
-        if sent.0 + ttl - margin <= now.wall.0 {
+        if sent.0 + ttl - margin <= now.honour.0 {
             return;
         }
         if cur.id == id {
@@ -3812,15 +3837,15 @@ impl Core {
             // after the push's install).
             replica
                 .locks()
-                .renewed(ino, id, id, mode, sent.0, ttl, margin, false);
+                .renewed(ino, id, id, mode, sent, ttl, margin, false);
             self.stats.lock_late_replies_installed += 1;
             return;
         }
         let held = HeldGrant {
             id,
             mode,
-            until_ms: sent.0 + ttl - margin,
-            renew_at_ms: constellation_meta::locks::renew_point(sent.0, ttl, margin),
+            until: HonourMs(sent.0 + ttl - margin),
+            renew_at: constellation_meta::locks::renew_point(sent, ttl, margin),
             owner: from,
             recalled: false,
             position,
@@ -3828,7 +3853,7 @@ impl Core {
             releasing: false,
             first_use: false,
             idle_since_ms: None,
-            installed_ms: now.wall.0,
+            installed: now.honour,
         };
         if matches!(
             replica.locks().install_held(ino, held),
@@ -3845,7 +3870,7 @@ impl Core {
         now: Now,
         from: NodeId,
         ino: Ino,
-        sent: Ms,
+        sent: HonourMs,
         outcome: LockOutcome,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -3875,7 +3900,7 @@ impl Core {
                 // waiter there is a ghost (an op another op's grant
                 // covered, or that left): say so, so that the owner does
                 // not hold its queue for it.
-                self.lock_send_cancel(now.wall, from, ino, true, true, out);
+                self.lock_send_cancel(now.honour, from, ino, true, true, out);
                 return;
             }
             for op in ops {
@@ -3948,7 +3973,7 @@ impl Core {
     /// for the ops queued in this node's own table.
     fn lock_wake_covered(
         &mut self,
-        now: Ms,
+        now: Now,
         ino: Ino,
         position: &Position,
         replica: &dyn Replica,
@@ -4007,7 +4032,7 @@ impl Core {
             let exclusive = exclusive && !left(LockMode::Exclusive);
             let shared = shared && !left(LockMode::Shared);
             if exclusive || shared {
-                self.lock_send_cancel(now, owner, ino, exclusive, shared, out);
+                self.lock_send_cancel(now.honour, owner, ino, exclusive, shared, out);
             }
         }
     }
@@ -4021,7 +4046,7 @@ impl Core {
     /// (`waited_ms`), which keeps their place in the queue.
     fn lock_resend_idle(
         &mut self,
-        now: Ms,
+        now: Now,
         ino: Ino,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -4034,16 +4059,17 @@ impl Core {
             .map(|(op, _)| *op)
             .collect();
         for op in ops {
-            self.lock_route_op(Now::same(now.0), op, replica, out);
+            self.lock_route_op(now, op, replica, out);
         }
     }
 
     /// Tell `owner` that no op of this node waits for `ino` in the modes
     /// named (`LockCancel`): its waiters of this node there that were last
-    /// sent before now are dropped.
+    /// sent before now are dropped (`now`: the requester's honour clock,
+    /// the clock of `LockRequest::sent`).
     fn lock_send_cancel(
         &mut self,
-        now: Ms,
+        now: HonourMs,
         owner: NodeId,
         ino: Ino,
         exclusive: bool,
@@ -4069,12 +4095,12 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_lock_cancel(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         ino: Ino,
         exclusive: bool,
         shared: bool,
-        upto: Ms,
+        upto: HonourMs,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -4096,12 +4122,7 @@ impl Core {
                         retry_ms: self.lock_resume_retry_ms(),
                         grace: false,
                     };
-                    self.lock_answer(
-                        Now::same(now.0),
-                        from,
-                        PeerMsg::LockReply { req, outcome },
-                        out,
-                    );
+                    self.lock_answer(now, from, PeerMsg::LockReply { req, outcome }, out);
                 }
                 dropped += 1;
             } else {
@@ -4118,7 +4139,7 @@ impl Core {
                 dropped,
                 "a node cancelled its waiters: nothing there waits for the lock any more"
             );
-            self.lock_serve_waiters(Now::same(now.0), ino, replica, out);
+            self.lock_serve_waiters(now, ino, replica, out);
         }
     }
 
@@ -4144,7 +4165,7 @@ impl Core {
                 position,
             } => {
                 let ttl = ttl_ms as i64;
-                if o.sent_at.0 + ttl - margin <= now.wall.0 + margin / 4 {
+                if o.sent_at.0 + ttl - margin <= now.honour.0 + margin / 4 {
                     // Lapsed on arrival (a request held longer than the
                     // window), or all but: ask again rather than install
                     // a fence. A grant whose window ends before a renewal
@@ -4162,8 +4183,8 @@ impl Core {
                 let held = HeldGrant {
                     id,
                     mode,
-                    until_ms: o.sent_at.0 + ttl - margin,
-                    renew_at_ms: constellation_meta::locks::renew_point(o.sent_at.0, ttl, margin),
+                    until: HonourMs(o.sent_at.0 + ttl - margin),
+                    renew_at: constellation_meta::locks::renew_point(o.sent_at, ttl, margin),
                     owner: from,
                     recalled: false,
                     position,
@@ -4171,7 +4192,7 @@ impl Core {
                     releasing: false,
                     first_use: false,
                     idle_since_ms: None,
-                    installed_ms: now.wall.0,
+                    installed: now.honour,
                 };
                 let ino = o.ino;
                 let waited = now.wall.since(o.created).max(0) as u64;
@@ -4189,16 +4210,16 @@ impl Core {
                 self.stats.lock_grant_ms_total += waited;
                 let b = (64 - waited.max(1).leading_zeros()).min(13) as usize;
                 self.stats.lock_grant_ms[b] += 1;
-                if held.renew_at_ms <= now.wall.0 {
+                if held.renew_at <= now.honour {
                     // Served late in its window (a push to a request
                     // parked a while): renew now, not at the next tick,
                     // which may come after the window.
                     if let Some(t) = self.lk.renew_timer.take() {
                         self.cancel_timer(t, out);
                     }
-                    let t = self.set_timer_wall(now.wall.plus(1), Timer::LockRenewTick, out);
+                    let t = self.set_timer_honour(now.honour.plus(1), Timer::LockRenewTick, out);
                     self.lk.renew_timer = Some(t);
-                    self.lk.renew_at = Some(now.wall.plus(1));
+                    self.lk.renew_at = Some(now.honour.plus(1));
                 } else {
                     self.lock_arm_renew_tick(now, replica, out);
                 }
@@ -4211,9 +4232,9 @@ impl Core {
                     // its local lock first (the grant covers it until the
                     // last local lock leaves), then `LockIdle` releases.
                     self.stats.lock_granted_recalled += 1;
-                    self.lock_resend_idle(now.wall, ino, replica, out);
+                    self.lock_resend_idle(now, ino, replica, out);
                 } else {
-                    self.lock_wake_covered(now.wall, ino, &position, replica, out);
+                    self.lock_wake_covered(now, ino, &position, replica, out);
                 }
             }
             LockOutcome::Waiting {
@@ -4361,9 +4382,13 @@ impl Core {
     /// under the cadence: a tick at the cadence alone came after it
     /// closed, and the grant lapsed under the application's lock.
     fn lock_arm_renew_tick(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
-        let mut at = now.wall.plus((self.cfg.lock_ttl_ms / 4).max(50));
-        if let Some(first) = replica.locks().next_renewal_ms(now.wall.0) {
-            at = at.min(Ms(first.max(now.wall.0 + 1)));
+        // The whole tick is on the honour clock (plan 43 C7-H1): its
+        // cadence, the grants' renewal points (honour stamps) and the
+        // relearn floor are durations and stamps of this holder's own
+        // windows.
+        let mut at = now.honour.plus((self.cfg.lock_ttl_ms / 4).max(50));
+        if let Some(first) = replica.locks().next_renewal(now) {
+            at = at.min(first.max(now.honour.plus(1)));
         }
         at = at.max(self.lock_relearn_floor(now));
         if let Some((t, armed)) = self.lk.renew_timer.zip(self.lk.renew_at) {
@@ -4372,7 +4397,7 @@ impl Core {
             }
             self.cancel_timer(t, out);
         }
-        let t = self.set_timer_wall(at, Timer::LockRenewTick, out);
+        let t = self.set_timer_honour(at, Timer::LockRenewTick, out);
         self.lk.renew_timer = Some(t);
         self.lk.renew_at = Some(at);
     }
@@ -4404,7 +4429,7 @@ impl Core {
         // A recalled grant whose first local lock never came (the
         // requester gave up, or is gone) stops being pinned by it: it is
         // released below, not renewed for ever under the waiters.
-        for ino in replica.locks().expire_first_use(now.wall.0) {
+        for ino in replica.locks().expire_first_use(now) {
             tracing::info!(
                 node = self.cfg.node_id,
                 ino,
@@ -4415,13 +4440,13 @@ impl Core {
         // renewed; a lapsed one is dropped (sim seed 90010: a grant that
         // answered an op it did not cover was neither used nor released).
         for (ino, h) in replica.locks().held_all() {
-            if h.until_ms <= now.wall.0 {
+            if h.until <= now.honour {
                 replica.locks().drop_held(ino, h.id);
             } else if h.recalled && !h.releasing && replica.locks().local_idle(ino) {
                 self.lock_release_begin(now, ino, replica, out);
             }
         }
-        let due = replica.locks().due_renewals(now.wall.0);
+        let due = replica.locks().due_renewals(now);
         if !due.is_empty() {
             tracing::debug!(
                 node = self.cfg.node_id,
@@ -4449,9 +4474,15 @@ impl Core {
                         self.lk.own_held.push((f, ino, h.id, r));
                         self.renew_kick(&[f], out);
                     } else {
-                        self.lock_apply_renew_result(now, me, ino, h.id, now.wall, r, replica, out);
+                        // Two readings of one step (plan 43 C7-H1): the
+                        // honour clock for the window this node honours,
+                        // the wall for the owner's record in
+                        // `lock_renew_one`.
+                        self.lock_apply_renew_result(
+                            now, me, ino, h.id, now.honour, r, replica, out,
+                        );
                     }
-                    self.lock_renew_authority(now.wall, out);
+                    self.lock_renew_authority(now, out);
                 }
                 Route::Node(n) if self.cfg.p2p && self.reaches(now, n) => {
                     by_owner.entry(n).or_default().push((ino, h));
@@ -4478,8 +4509,8 @@ impl Core {
         }
         for (to, entries) in by_owner {
             let req = self.op_id();
-            let timer = self.set_timer_wall(
-                now.wall.plus(self.cfg.forward_timeout_ms),
+            let timer = self.set_timer_honour(
+                now.honour.plus(self.cfg.forward_timeout_ms),
                 Timer::LockRenewTimeout(req),
                 out,
             );
@@ -4487,7 +4518,7 @@ impl Core {
                 req,
                 RenewInFlight {
                     entries: entries.iter().map(|(i, h)| (*i, h.id)).collect(),
-                    sent: now.wall,
+                    sent: now.honour,
                     timer,
                     to,
                 },
@@ -4532,11 +4563,11 @@ impl Core {
     /// request: an owner learned meanwhile otherwise (a push, a hint, a
     /// lock reply) is used at the next tick; the read's answer re-ticks at
     /// once.
-    fn lock_relearn_floor(&self, now: Now) -> Ms {
+    fn lock_relearn_floor(&self, now: Now) -> HonourMs {
         if self.lk.relearning {
-            now.wall.plus(self.lock_resume_retry_ms())
+            now.honour.plus(self.lock_resume_retry_ms())
         } else {
-            now.wall
+            now.honour
         }
     }
 
@@ -4604,9 +4635,9 @@ impl Core {
         if let Some(t) = self.lk.renew_timer.take() {
             self.cancel_timer(t, out);
         }
-        let t = self.set_timer_wall(now.wall.plus(1), Timer::LockRenewTick, out);
+        let t = self.set_timer_honour(now.honour.plus(1), Timer::LockRenewTick, out);
         self.lk.renew_timer = Some(t);
-        self.lk.renew_at = Some(now.wall.plus(1));
+        self.lk.renew_at = Some(now.honour.plus(1));
     }
 
     pub(crate) fn on_lock_renewed(
@@ -4647,7 +4678,7 @@ impl Core {
         from: NodeId,
         ino: Ino,
         id: GrantId,
-        sent: Ms,
+        sent: HonourMs,
         result: LockRenewResult,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -4664,7 +4695,7 @@ impl Core {
                     id,
                     now_id,
                     mode,
-                    sent.0,
+                    sent,
                     ttl_ms as i64,
                     self.lock_margin_ms(),
                     recalled,
@@ -4757,7 +4788,7 @@ impl Core {
         tracing::debug!(
             node = self.cfg.node_id,
             from,
-            late_ms = now.wall.since(late.sent),
+            late_ms = now.honour.since(late.sent),
             granted = granted.len(),
             "late lock renewals answered"
         );
@@ -4860,18 +4891,61 @@ impl Core {
         });
     }
 
-    /// Phase 2: the end of the latest token window naming `grant` among
-    /// this node's own queued replays (stranded ops not resolved yet), if
-    /// one is still open at `now`.
-    fn replay_blocks_release(grant: GrantId, now: Now, replica: &dyn Replica) -> Option<i64> {
-        let queued = replica.pending_replays().ok()?;
-        queued
+    /// Phase 2: the end, on this node's **wait** clock, of the latest
+    /// token window naming `grant` among this node's own queued replays
+    /// (stranded ops not resolved yet), if one is still open at `now`.
+    ///
+    /// The wait for a window to run out must not be shortened by a forward
+    /// wall step of this node, so the window's wall end is mapped onto the
+    /// wait clock once, when the op is queued ([`Self::lock_note_replay_pins`],
+    /// after each strand), not at each check (a conversion at the check is
+    /// the wall comparison again). A queue this process did not strand (a
+    /// restart) has no twin: it is taken when first seen here, which is the
+    /// wall comparison of that moment (plan 43 Appendix B row 14, C7a's
+    /// boot-id form).
+    fn replay_blocks_release(
+        &mut self,
+        grant: GrantId,
+        now: Now,
+        replica: &dyn Replica,
+    ) -> Option<WaitMs> {
+        self.lock_note_replay_pins(now, replica);
+        self.lk
+            .replay_pins
+            .iter()
+            .filter(|((g, _), until)| *g == grant && **until > now.wait)
+            .map(|(_, until)| *until)
+            .max()
+    }
+
+    /// Record, for every token of this node's own queued replays (stranded
+    /// ops not resolved yet) not recorded yet, the end of its window on
+    /// this node's wait clock (`replay_blocks_release`, plan 43 C7-H1 R8);
+    /// forget the windows that are over, and those of replays no longer
+    /// queued (resolved).
+    pub(crate) fn lock_note_replay_pins(&mut self, now: Now, replica: &dyn Replica) {
+        let Ok(queued) = replica.pending_replays() else {
+            self.lk.replay_pins.clear();
+            return;
+        };
+        let queued: std::collections::BTreeSet<(GrantId, i64)> = queued
             .iter()
             .filter(|q| q.refused.is_none() && !q.foreign)
             .flat_map(|q| q.lock_tag.0.iter())
-            .filter(|t| t.grant == grant && t.until_ms > now.wall.0)
-            .map(|t| t.until_ms)
-            .max()
+            .map(|t| (t.grant, t.until_ms))
+            .collect();
+        self.lk
+            .replay_pins
+            .retain(|key, until| queued.contains(key) && *until > now.wait);
+        for (grant, until_ms) in queued {
+            let until = now.wait_of_wall(Ms(until_ms));
+            if until > now.wait {
+                self.lk
+                    .replay_pins
+                    .entry((grant, until_ms))
+                    .or_insert(until);
+            }
+        }
     }
 
     /// F1: the ops that ended in doubt under `grant` whose outcome this
@@ -4976,13 +5050,10 @@ impl Core {
             // would let it land, at an executor that only checks the
             // window, after the next holder's writes. Waited for until it
             // is resolved or its token's window is over.
-            let blocked = replica
-                .locks()
-                .release_blocked(grant, now.wall.0)
-                .or_else(|| {
-                    Self::replay_blocks_release(grant, now, replica)
-                        .map(|until| Some(until.min(now.wall.0 + RELEASE_WAIT_POLL_MS)))
-                });
+            let blocked = replica.locks().release_blocked(grant, now).or_else(|| {
+                self.replay_blocks_release(grant, now, replica)
+                    .map(|until| Some(until.min(now.wait.plus(RELEASE_WAIT_POLL_MS as u64))))
+            });
             if let Some(until) = blocked {
                 tracing::debug!(
                     node = self.cfg.node_id,
@@ -4991,9 +5062,9 @@ impl Core {
                     ?until,
                     "a recalled grant's release waits for mutations tagged with it"
                 );
-                let at = until.unwrap_or(now.wall.0 + RELEASE_WAIT_POLL_MS);
-                let timer = self.set_timer_wall(
-                    Ms(at.max(now.wall.0 + 1)),
+                let at = until.unwrap_or(now.wait.plus(RELEASE_WAIT_POLL_MS as u64));
+                let timer = self.set_timer_wait(
+                    at.max(now.wait.plus(1)),
                     Timer::LockReleaseWait(ino, grant),
                     out,
                 );
@@ -5976,6 +6047,7 @@ impl Core {
             self.end_takeover_floor();
             self.lock_quarantine_dropped_tenure(now, replica);
             self.pr.closed_tenure.clear();
+            self.pr.closed_honour.clear();
             self.pr.closed_lease = None;
             let n = replica.locks().clear_grants();
             if n > 0 {

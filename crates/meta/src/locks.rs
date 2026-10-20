@@ -25,7 +25,15 @@
 //!
 //! # Time and safety
 //!
-//! All times are unix milliseconds on this node's clock. The sequencer
+//! Times are unix milliseconds on one of this node's clocks (plan 43
+//! C7-H1, `constellation_types::clock`): a grant this node *holds*
+//! ([`HeldGrant`]) is stamped and judged on its **honour** clock (never
+//! under-counts: a backward wall step cannot extend it); a fencing token
+//! that leaves the node is on the **wall** clock, minted from the honour
+//! window at that moment (`Now::wall_of_honour`), and the holder's own
+//! wait for a token to run out is a **wait**-clock copy taken when the pin
+//! is made ([`LockTables::tag_end`]). The sequencer's records are still on
+//! the wall clock (the wait side, the next commit of C7-H1). The sequencer
 //! records a grant as live until `granted + ttl + margin`; the node
 //! honours it until `sent + ttl − margin`, measured from when it *sent*
 //! the request or renewal — the read delegations' discipline
@@ -76,6 +84,7 @@
 //! are held under grants that are still honoured).
 
 use crate::session::Position;
+use constellation_types::clock::{HonourMs, Ms, Now, WaitMs};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -107,8 +116,8 @@ impl LockMode {
 /// held its lock, and the owner outwaited it and granted the lock to
 /// another node (the rounds harness scenario: two `git commit`s under one
 /// `flock` at once, git's `index.lock` stall on EC2).
-pub fn renew_point(sent_ms: i64, ttl_ms: i64, margin_ms: i64) -> i64 {
-    sent_ms + (ttl_ms - margin_ms).max(0) / 2
+pub fn renew_point(sent: HonourMs, ttl_ms: i64, margin_ms: i64) -> HonourMs {
+    HonourMs(sent.0 + (ttl_ms - margin_ms).max(0) / 2)
 }
 
 /// A grant's identity: minted by the sequencer that made it, kept
@@ -124,8 +133,12 @@ pub struct GrantId {
 /// Plan 30 §M14 phase 2, the **fencing token**: one grant a mutation was
 /// issued under, as its issuing node honoured it — the grant's id and
 /// the end of the window that node honoured it for (`sent + ttl −
-/// margin` of its latest request or renewal, on the issuing node's
-/// clock). See [`LockTag`].
+/// margin` of its latest request or renewal), on the **wall** clock:
+/// minted as `now.wall_of_honour(until)` from the issuing node's honour
+/// window at the moment the tag is built, so a backward wall step of the
+/// issuer only shortens it and the executor judges it on its own wall
+/// clock (plan 43 Appendix B row 6: offset-bound until C7b). See
+/// [`LockTag`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct LockToken {
     pub grant: GrantId,
@@ -285,17 +298,17 @@ pub enum Installed {
 pub struct HeldGrant {
     pub id: GrantId,
     pub mode: LockMode,
-    /// Honoured while this node's clock is below this.
-    pub until_ms: i64,
-    /// Renew from here (`sent + ttl/2`).
-    pub renew_at_ms: i64,
+    /// Honoured while this node's honour clock is below this.
+    pub until: HonourMs,
+    /// Renew from here (`sent + ttl/2`), on the same clock.
+    pub renew_at: HonourMs,
     /// Who granted it (renewals go to the current owner, not here).
     pub owner: u64,
     pub recalled: bool,
     /// The position the replica must reach before reading under it.
     pub position: Position,
-    /// A renewal is in flight (sent at this time).
-    pub renewing: Option<i64>,
+    /// A renewal is in flight (sent at this time, honour clock).
+    pub renewing: Option<HonourMs>,
     /// A release (flush, then `LockReleased`) is in flight.
     pub releasing: bool,
     /// Arrived already recalled (the recall overtook the reply): the
@@ -307,10 +320,10 @@ pub struct HeldGrant {
     /// was never used): an idle cache is released after a while so its
     /// renewals stop.
     pub idle_since_ms: Option<i64>,
-    /// When this node installed it (its clock): a recalled grant waiting
-    /// for its first local lock is renewed only for
+    /// When this node installed it (its honour clock): a recalled grant
+    /// waiting for its first local lock is renewed only for
     /// [`LockTables::first_use_budget_ms`] from here.
-    pub installed_ms: i64,
+    pub installed: HonourMs,
 }
 
 /// A kernel-facing lock of one local process.
@@ -526,9 +539,9 @@ struct Inner {
 }
 
 /// The clock a table reads for the write-time token check
-/// ([`LockTables::set_clock`]): the daemon's wall clock, or a
-/// simulation's node clock.
-pub type LockClock = std::sync::Arc<dyn Fn() -> i64 + Send + Sync>;
+/// ([`LockTables::set_clock`]): the daemon's protocol clock, or a
+/// simulation's node clock (all three readings of one instant).
+pub type LockClock = std::sync::Arc<dyn Fn() -> Now + Send + Sync>;
 
 /// See [`LockTables::set_release_wake`]: called with the inode whose
 /// held grant has no tagged mutation in flight any more.
@@ -547,13 +560,19 @@ struct Inflight {
     /// Not always among `active`: a close is tagged per minter with the
     /// grant whose window ends first, which may be another file's.
     publishing: u32,
-    pinned_until_ms: i64,
+    /// An op left in doubt may still execute somewhere until its token's
+    /// window is over: on this node's **wait** clock, taken from the
+    /// token's wall end when the pin is made ([`Inner::pin`]). The holder
+    /// waits until its token's executors would refuse it, never less: a
+    /// forward wall step must not end the wait early (plan 43 C7-H1, R8;
+    /// the wall-to-wait crossing is offset-bound, Appendix B row 6).
+    pinned_until: WaitMs,
 }
 
 impl Inflight {
-    /// Nothing left to wait for at `now_ms`: the entry can go.
-    fn over(&self, now_ms: i64) -> bool {
-        self.active == 0 && self.publishing == 0 && self.pinned_until_ms <= now_ms
+    /// Nothing left to wait for at `now`: the entry can go.
+    fn over(&self, now: Now) -> bool {
+        self.active == 0 && self.publishing == 0 && self.pinned_until <= now.wait
     }
 }
 
@@ -570,7 +589,9 @@ pub struct FencedOwner {
     /// across pid reuse (0: unknown; see [`LocalLock::pid_start`]).
     pub pid: u32,
     pub pid_start: u64,
-    pub since_ms: i64,
+    /// Since when (the end of the window it was honoured for, or when it
+    /// was captured), on this node's honour clock.
+    pub since: HonourMs,
     /// The grant whose end fenced it (the one its lock was under), when
     /// known: the fencing token named it on every op the owner issued
     /// under that lock.
@@ -609,14 +630,14 @@ impl Inner {
     /// an honoured shared grant is still held when another owner's
     /// exclusive lock on the same file lost its cover (the exclusive
     /// grant lapsed and a shared one came for another request).
-    fn capture(&mut self, ino: u64, now_ms: i64) {
+    fn capture(&mut self, ino: u64, now: HonourMs) {
         let Some(v) = self.local.get(&ino) else {
             return;
         };
         let cover = self
             .held
             .get(&ino)
-            .filter(|h| h.until_ms > now_ms)
+            .filter(|h| h.until > now)
             .map(|h| h.mode);
         // Fenced since the grant's window ended (from then on every op of
         // the owner is refused, whenever this capture runs), or now when
@@ -624,9 +645,9 @@ impl Inner {
         let since = self
             .held
             .get(&ino)
-            .map(|h| h.until_ms)
-            .filter(|until| *until <= now_ms)
-            .unwrap_or(now_ms);
+            .map(|h| h.until)
+            .filter(|until| *until <= now)
+            .unwrap_or(now);
         let grant = self
             .held
             .get(&ino)
@@ -642,7 +663,7 @@ impl Inner {
                     owner: l.owner,
                     pid: l.pid,
                     pid_start: l.pid_start,
-                    since_ms: since,
+                    since,
                     grant,
                 });
                 self.stats.owners_fenced += 1;
@@ -650,16 +671,16 @@ impl Inner {
         }
     }
 
-    /// Capture the owners of every inode that is fenced at `now_ms`.
-    fn capture_lapsed(&mut self, now_ms: i64) {
+    /// Capture the owners of every inode that is fenced at `now`.
+    fn capture_lapsed(&mut self, now: HonourMs) {
         let fenced: Vec<u64> = self
             .local
             .keys()
             .copied()
-            .filter(|ino| self.fenced_at(*ino, now_ms))
+            .filter(|ino| self.fenced_at(*ino, now))
             .collect();
         for ino in fenced {
-            self.capture(ino, now_ms);
+            self.capture(ino, now);
         }
     }
 
@@ -690,11 +711,23 @@ impl Inner {
 
     /// The table's clock now (see `LockTables::set_clock`), or
     /// `fallback` while none is set.
-    fn now_or(&self, fallback: i64) -> i64 {
+    fn now_or(&self, fallback: Now) -> Now {
         match &self.clock {
             Some(clock) => clock(),
             None => fallback,
         }
+    }
+
+    /// An op tagged with `until_wall` (a token's window end, wall clock)
+    /// may still execute somewhere until then: `grant` is not released
+    /// before that has passed *on this node's wait clock* (plan 43
+    /// C7-H1, R8). The wall end is mapped to wait now; between the
+    /// token's minting and the pin a forward wall step of this node would
+    /// shorten the remainder (row 6: offset-bound).
+    fn pin(&mut self, grant: GrantId, until_wall: i64, now: Now) {
+        let wait = now.wait_of_wall(Ms(until_wall));
+        let e = self.inflight.entry(grant).or_default();
+        e.pinned_until = e.pinned_until.max(wait);
     }
 
     /// A mutation tagged with `grant` ended in doubt: `rid` when known
@@ -766,7 +799,7 @@ impl Inner {
                 self.held
                     .get(ino)
                     .filter(|h| h.mode.covers(needed))
-                    .map_or(i64::MIN, |h| h.until_ms)
+                    .map_or(i64::MIN, |h| h.until.0)
             })
             .min()
             .unwrap_or(i64::MAX)
@@ -779,7 +812,7 @@ impl Inner {
     /// `locks-released-writes` seed 211727: the exclusive holder's next
     /// write went through under node 3's shared grant while node 1 held
     /// one too).
-    fn fenced_at(&self, ino: u64, now_ms: i64) -> bool {
+    fn fenced_at(&self, ino: u64, now: HonourMs) -> bool {
         let Some(v) = self.local.get(&ino).filter(|v| !v.is_empty()) else {
             return false;
         };
@@ -791,7 +824,7 @@ impl Inner {
         !self
             .held
             .get(&ino)
-            .is_some_and(|h| h.until_ms > now_ms && h.mode.covers(needed))
+            .is_some_and(|h| h.until > now && h.mode.covers(needed))
     }
 }
 
@@ -1164,12 +1197,12 @@ impl LockTables {
     /// confirmed it ([`Grant::confirmed_ms`]) is judged by that window
     /// (lock-fence-token review, round 2: an inbox op drained by a new
     /// holder that installed a stale mirror).
-    pub fn check_tag(&self, tag: &LockTag, now_ms: i64) -> Result<(), LockToken> {
+    pub fn check_tag(&self, tag: &LockTag, now: Now) -> Result<(), LockToken> {
         if tag.is_empty() {
             return Ok(());
         }
         let mut g = self.lock();
-        self.judge(&mut g, tag, now_ms)
+        self.judge(&mut g, tag, now)
     }
 
     /// F1, the token *at the write*: [`Self::check_tag`] on this table's
@@ -1189,16 +1222,17 @@ impl LockTables {
     /// in its transaction (or its commit was slow) is never followed by a
     /// next holder whose floor lacks it.
     ///
-    /// `checked_ms`: the clock the earlier check read, which this one
+    /// `checked`: the clock the earlier check read, which this one
     /// reads instead only while no clock is set (unit tests of a core
     /// with an explicit `now`).
-    pub fn check_tag_at_write(&self, tag: &LockTag, checked_ms: i64) -> Result<(), LockToken> {
+    pub fn check_tag_at_write(&self, tag: &LockTag, checked: Now) -> Result<(), LockToken> {
         if tag.is_empty() {
             return Ok(());
         }
         let mut g = self.lock();
-        let now_ms = g.now_or(checked_ms);
-        match self.judge(&mut g, tag, now_ms) {
+        let now = g.now_or(checked);
+        let now_ms = now.wall.0;
+        match self.judge(&mut g, tag, now) {
             Err(t) => {
                 g.stats.token_rejections_at_write += 1;
                 tracing::info!(
@@ -1264,7 +1298,10 @@ impl LockTables {
             return false;
         }
         let g = self.lock();
-        let now_ms = g.now_or(i64::MIN);
+        // Token windows and the table's records are on the wall clock here
+        // (the sequencer's side moves to the wait clock with the next
+        // commit of plan 43 C7-H1).
+        let now_ms = g.now_or(Now::same(i64::MIN)).wall.0;
         g.pins
             .iter()
             .any(|(id, (_, until))| match g.grants.get(id) {
@@ -1299,8 +1336,8 @@ impl LockTables {
         !self.no_settle.load(Ordering::Relaxed)
     }
 
-    /// The clock [`Self::check_tag_at_write`] reads (unix ms): the
-    /// daemon's wall clock, which its other lock decisions read too; a
+    /// The clock [`Self::check_tag_at_write`] reads: the daemon's
+    /// protocol clock, which its other lock decisions read too; a
     /// simulation's node clock. Unset (unit tests driving a core with an
     /// explicit `now`), the write-time check reads the clock the check
     /// before it read.
@@ -1309,7 +1346,7 @@ impl LockTables {
     }
 
     /// This table's clock now, if one is set ([`Self::set_clock`]).
-    pub fn clock_ms(&self) -> Option<i64> {
+    pub fn clock_now(&self) -> Option<Now> {
         self.lock().clock.as_ref().map(|c| c())
     }
 
@@ -1367,7 +1404,11 @@ impl LockTables {
 
     /// The token check itself (see [`Self::check_tag`]), under the
     /// table lock.
-    fn judge(&self, g: &mut Inner, tag: &LockTag, now_ms: i64) -> Result<(), LockToken> {
+    fn judge(&self, g: &mut Inner, tag: &LockTag, now: Now) -> Result<(), LockToken> {
+        // A token is judged on this node's wall clock against the minter's
+        // wall window (Appendix B row 6), and the table's records are wall
+        // too until the sequencer's side moves (C7-H1, next commit).
+        let now_ms = now.wall.0;
         if g.ended.len() > 256 {
             g.ended.retain(|_, keep| *keep > now_ms);
         }
@@ -1556,8 +1597,8 @@ impl LockTables {
         // Local locks under no honoured grant (it lapsed, or was dropped,
         // before this one came): their owners stay fenced until their
         // locks are gone, whatever this grant covers.
-        if g.fenced_at(ino, held.installed_ms) {
-            g.capture(ino, held.installed_ms);
+        if g.fenced_at(ino, held.installed) {
+            g.capture(ino, held.installed);
         }
         // Every grant gets the local lock it was asked for before a
         // recall can release it (sim seed 94033: an owner's own fresh
@@ -1567,8 +1608,8 @@ impl LockTables {
         held.first_use = true;
         if let Some(old) = g.held.get(&ino).copied().filter(|o| o.id == held.id) {
             held.mode = old.mode.max(held.mode);
-            held.until_ms = old.until_ms.max(held.until_ms);
-            held.renew_at_ms = old.renew_at_ms.max(held.renew_at_ms);
+            held.until = old.until.max(held.until);
+            held.renew_at = old.renew_at.max(held.renew_at);
             held.recalled |= old.recalled;
             held.releasing = old.releasing;
             held.idle_since_ms = old.idle_since_ms;
@@ -1588,12 +1629,12 @@ impl LockTables {
             // grant it would sit `first_use` until a local lock came, and
             // its release would name an id the owner no longer had (the
             // grant was outwaited then).
-            held.until_ms = old.until_ms.max(held.until_ms);
+            held.until = old.until.max(held.until);
             held.recalled |= old.recalled;
             held.releasing = old.releasing;
             held.first_use = old.first_use;
             held.idle_since_ms = old.idle_since_ms;
-            held.installed_ms = old.installed_ms;
+            held.installed = old.installed;
         }
         let recalled = held.recalled;
         g.last_held.insert(ino, held.id);
@@ -1739,7 +1780,7 @@ impl LockTables {
                 g.held.remove(&ino);
                 g.tombstone(id);
                 g.taint(ino);
-                g.capture(ino, h.until_ms);
+                g.capture(ino, h.until);
                 self.track(&g);
                 true
             }
@@ -1753,7 +1794,7 @@ impl LockTables {
         if let Some(h) = h {
             g.tombstone(h.id);
             g.taint(ino);
-            g.capture(ino, h.until_ms);
+            g.capture(ino, h.until);
         }
         self.track(&g);
         h
@@ -1777,18 +1818,18 @@ impl LockTables {
     /// gave up without taking the lock (its answer lost, a non-blocking
     /// request that lost the race) would otherwise keep the recalled grant
     /// renewed for ever, and the waiters behind it waiting for ever.
-    fn renewable(h: &HeldGrant, pinned: bool, now_ms: i64, budget_ms: i64) -> bool {
-        !h.recalled || pinned || (h.first_use && now_ms < h.installed_ms + budget_ms)
+    fn renewable(h: &HeldGrant, pinned: bool, now: HonourMs, budget_ms: i64) -> bool {
+        !h.recalled || pinned || (h.first_use && now < h.installed.plus(budget_ms.max(0) as u64))
     }
 
     /// The requester a grant was installed for gave up without taking its
     /// local lock: the grant no longer waits for that first use (a recall
     /// then releases it), and, free of local locks, it is idle from
-    /// `now_ms` (`CONSTELLATION_LOCK_CACHE_IDLE_MS` reclaims it — unused, it
+    /// `now` (`CONSTELLATION_LOCK_CACHE_IDLE_MS` reclaims it — unused, it
     /// would otherwise be renewed until a recall came). `true` if the
     /// grant is recalled and free of local locks — the caller lets the
     /// core release it.
-    pub fn abandon_first_use(&self, ino: u64, now_ms: i64) -> bool {
+    pub fn abandon_first_use(&self, ino: u64, now: Now) -> bool {
         let mut g = self.lock();
         let idle = g.local.get(&ino).is_none_or(|v| v.is_empty());
         let Some(h) = g.held.get_mut(&ino).filter(|h| h.first_use) else {
@@ -1796,7 +1837,9 @@ impl LockTables {
         };
         h.first_use = false;
         if idle && h.idle_since_ms.is_none() {
-            h.idle_since_ms = Some(now_ms);
+            // Idle time is a liveness stamp (the cache's idle release): it
+            // moves to the wait clock with the other housekeeping.
+            h.idle_since_ms = Some(now.wall.0);
         }
         let recalled = h.recalled;
         g.stats.first_use_abandoned += 1;
@@ -1806,7 +1849,7 @@ impl LockTables {
     /// Recalled grants whose first local lock never came within the
     /// first-use budget: no longer pinned (the renewal tick releases
     /// them). Returns their inodes.
-    pub fn expire_first_use(&self, now_ms: i64) -> Vec<u64> {
+    pub fn expire_first_use(&self, now: Now) -> Vec<u64> {
         let budget = self.first_use_budget_ms();
         let mut g = self.lock();
         let Inner {
@@ -1816,7 +1859,7 @@ impl LockTables {
         for (ino, h) in held.iter_mut() {
             if h.recalled
                 && h.first_use
-                && now_ms >= h.installed_ms + budget
+                && now.honour >= h.installed.plus(budget.max(0) as u64)
                 && local.get(ino).is_none_or(|v| v.is_empty())
             {
                 h.first_use = false;
@@ -1828,20 +1871,21 @@ impl LockTables {
     }
 
     /// Grants to renew: honoured, past `renew_at`, no renewal in flight,
-    /// [`Self::renewable`]. Marks them renewing at `now_ms`.
-    pub fn due_renewals(&self, now_ms: i64) -> Vec<(u64, HeldGrant)> {
+    /// [`Self::renewable`]. Marks them renewing at `now` (honour clock).
+    pub fn due_renewals(&self, now: Now) -> Vec<(u64, HeldGrant)> {
+        let now = now.honour;
         let budget = self.first_use_budget_ms();
         let mut g = self.lock();
         let mut due = Vec::new();
         let Inner { held, local, .. } = &mut *g;
         for (ino, h) in held.iter_mut() {
             let pinned = local.get(ino).is_some_and(|v| !v.is_empty());
-            if h.until_ms > now_ms
-                && now_ms >= h.renew_at_ms
+            if h.until > now
+                && now >= h.renew_at
                 && h.renewing.is_none()
-                && Self::renewable(h, pinned, now_ms, budget)
+                && Self::renewable(h, pinned, now, budget)
             {
-                h.renewing = Some(now_ms);
+                h.renewing = Some(now);
                 due.push((*ino, *h));
             }
         }
@@ -1854,22 +1898,21 @@ impl LockTables {
     /// grant that is not renewed (released, or recalled with nothing
     /// pinning it) has a renewal point in the past, and arming from it
     /// re-armed the tick every millisecond for as long as it stayed.
-    pub fn next_renewal_ms(&self, now_ms: i64) -> Option<i64> {
+    pub fn next_renewal(&self, now: Now) -> Option<HonourMs> {
+        let now = now.honour;
         let budget = self.first_use_budget_ms();
         let g = self.lock();
         g.held
             .iter()
             .filter(|(ino, h)| {
                 let pinned = g.local.get(ino).is_some_and(|v| !v.is_empty());
-                h.until_ms > now_ms
-                    && h.renewing.is_none()
-                    && Self::renewable(h, pinned, now_ms, budget)
+                h.until > now && h.renewing.is_none() && Self::renewable(h, pinned, now, budget)
             })
-            .map(|(_, h)| h.renew_at_ms)
+            .map(|(_, h)| h.renew_at)
             .min()
     }
 
-    /// A renewal of `id` sent at `sent_ms` was answered: the owner holds
+    /// A renewal of `id` sent at `sent` (honour clock) was answered: the owner holds
     /// `now_id` (the same, or a newer grant of this node whose reply was
     /// lost — adopted here, with its mode) in `mode`. Applied too when
     /// the grant held here already has `now_id`: a recall of the newer id
@@ -1889,7 +1932,7 @@ impl LockTables {
         id: GrantId,
         now_id: GrantId,
         mode: LockMode,
-        sent_ms: i64,
+        sent: HonourMs,
         ttl_ms: i64,
         margin_ms: i64,
         recalled: bool,
@@ -1901,8 +1944,8 @@ impl LockTables {
             .filter(|h| h.id == id || h.id == now_id)
         {
             h.renewing = None;
-            h.until_ms = h.until_ms.max(sent_ms + ttl_ms - margin_ms);
-            h.renew_at_ms = h.renew_at_ms.max(renew_point(sent_ms, ttl_ms, margin_ms));
+            h.until = h.until.max(HonourMs(sent.0 + ttl_ms - margin_ms));
+            h.renew_at = h.renew_at.max(renew_point(sent, ttl_ms, margin_ms));
             h.recalled |= recalled;
             if h.id != now_id {
                 h.id = now_id;
@@ -1930,7 +1973,7 @@ impl LockTables {
         let mut g = self.lock();
         let gone = matches!(g.held.get(&ino), Some(h) if h.id == id);
         if gone {
-            let since = g.held.remove(&ino).map_or(0, |h| h.until_ms);
+            let since = g.held.remove(&ino).map_or(HonourMs(0), |h| h.until);
             g.tombstone(id);
             g.taint(ino);
             g.capture(ino, since);
@@ -1941,58 +1984,65 @@ impl LockTables {
     }
 
     /// The honoured grant on `ino`, if any.
-    pub fn honoured(&self, ino: u64, now_ms: i64) -> Option<HeldGrant> {
+    pub fn honoured(&self, ino: u64, now: Now) -> Option<HeldGrant> {
         self.lock()
             .held
             .get(&ino)
             .copied()
-            .filter(|h| h.until_ms > now_ms)
+            .filter(|h| h.until > now.honour)
     }
 
     /// Whether I/O on `ino` must be refused: this node holds local locks
     /// on it and no honoured grant. One atomic load when no local lock
     /// exists anywhere.
-    pub fn fenced(&self, ino: u64, now_ms: i64) -> bool {
+    pub fn fenced(&self, ino: u64, now: Now) -> bool {
         if self.local_inos.load(Ordering::Relaxed) == 0 {
             return false;
         }
         let mut g = self.lock();
-        let fenced = g.fenced_at(ino, now_ms);
+        let fenced = g.fenced_at(ino, now.honour);
         if fenced {
             g.stats.fenced_io += 1;
-            g.capture(ino, now_ms);
+            g.capture(ino, now.honour);
             self.refence(&g);
         }
         fenced
     }
 
-    /// Whether any lock owner on this node may be fenced at `now_ms`
+    /// Whether any lock owner on this node may be fenced at `now`
     /// ([`Self::fenced_owners`] has something to say). One relaxed load
     /// with no local lock anywhere; two while every local lock is under
     /// a grant honoured until later.
-    pub fn owner_fence_armed(&self, now_ms: i64) -> bool {
+    pub fn owner_fence_armed(&self, now: Now) -> bool {
         self.local_inos.load(Ordering::Relaxed) != 0
-            && now_ms >= self.fence_from_ms.load(Ordering::Relaxed)
+            && now.honour.0 >= self.fence_from_ms.load(Ordering::Relaxed)
     }
 
-    /// The lock owners fenced on this node at `now_ms`: every owner of a
+    /// The lock owners fenced on this node at `now`: every owner of a
     /// local lock whose grant lapsed, was lost, or was replaced after a
     /// lapse — captured once and kept until that owner has no local lock
     /// left (unlock or close). The caller refuses every op such an owner
     /// (or its process) issues, on any file (`EIO`).
-    pub fn fenced_owners(&self, now_ms: i64) -> Vec<FencedOwner> {
-        if !self.owner_fence_armed(now_ms) {
+    pub fn fenced_owners(&self, now: Now) -> Vec<FencedOwner> {
+        if !self.owner_fence_armed(now) {
             return Vec::new();
         }
         let mut g = self.lock();
         // Only while an owner not fenced yet may have lapsed: an owner
         // that keeps its lock after the lapse costs the others' ops the
         // table lock, not a walk of every local lock.
-        if now_ms >= self.lapse_from_ms.load(Ordering::Relaxed) {
-            g.capture_lapsed(now_ms);
+        if now.honour.0 >= self.lapse_from_ms.load(Ordering::Relaxed) {
+            g.capture_lapsed(now.honour);
             self.refence(&g);
         }
         g.fenced_owners.values().copied().collect()
+    }
+
+    /// Whether nothing is held, locked or tainted on this node (two
+    /// relaxed loads): [`Self::take_discard`] has nothing to say, and the
+    /// caller reads no clock for it.
+    pub fn nothing_to_discard(&self) -> bool {
+        self.local_inos.load(Ordering::Relaxed) == 0 && self.tracked.load(Ordering::Relaxed) == 0
     }
 
     /// Whether no local lock exists on this node (one relaxed load: the
@@ -2026,7 +2076,7 @@ impl LockTables {
     /// [`LockTag`]). `Err` when one of their locks is under no honoured,
     /// covering grant: the owner is fenced (its op is refused, `EIO`).
     /// Empty when they hold no local lock.
-    pub fn owner_tag(&self, owners: &[u64], now_ms: i64) -> Result<LockTag, OwnerFenced> {
+    pub fn owner_tag(&self, owners: &[u64], now: Now) -> Result<LockTag, OwnerFenced> {
         if owners.is_empty() {
             return Ok(LockTag::NONE);
         }
@@ -2037,11 +2087,13 @@ impl LockTables {
                 let h = g
                     .held
                     .get(ino)
-                    .filter(|h| h.until_ms > now_ms && h.mode.covers(l.mode()))
+                    .filter(|h| h.until > now.honour && h.mode.covers(l.mode()))
                     .ok_or(OwnerFenced)?;
+                // Minted on the wall clock from the honour window, now
+                // (plan 43 C7-H1, R8).
                 let t = LockToken {
                     grant: h.id,
-                    until_ms: h.until_ms,
+                    until_ms: now.wall_of_honour(h.until).0,
                 };
                 let e = per_minter.entry(h.id.node).or_insert(t);
                 if t.until_ms < e.until_ms {
@@ -2054,7 +2106,7 @@ impl LockTables {
 
     /// A mutation tagged with `tag` is in flight from this node: none of
     /// its grants is released before [`Self::tag_end`].
-    pub fn tag_begin(&self, tag: &LockTag, now_ms: i64) {
+    pub fn tag_begin(&self, tag: &LockTag, now: Now) {
         if tag.is_empty() {
             return;
         }
@@ -2062,7 +2114,7 @@ impl LockTables {
         // An entry pinned by an op left in doubt goes once its pin is
         // over, whether or not a release ever asked about its grant (one
         // that lapsed instead stayed for ever).
-        g.inflight.retain(|_, e| !e.over(now_ms));
+        g.inflight.retain(|_, e| !e.over(now));
         g.stats.tagged_ops += 1;
         for t in &tag.0 {
             g.inflight.entry(t.grant).or_default().active += 1;
@@ -2073,7 +2125,7 @@ impl LockTables {
     /// it may still execute somewhere (a forward neither answered nor
     /// refused) — until its tokens' windows are over, after which every
     /// executor rejects it; the grants are not released before then.
-    pub fn tag_end(&self, tag: &LockTag, in_doubt: bool, now_ms: i64) {
+    pub fn tag_end(&self, tag: &LockTag, in_doubt: bool, now: Now) {
         if tag.is_empty() {
             return;
         }
@@ -2081,16 +2133,17 @@ impl LockTables {
         let mut g = self.lock();
         for t in &tag.0 {
             if in_doubt {
-                g.note_doubted(t.grant, now_ms, None);
+                g.note_doubted(t.grant, now.wall.0, None);
             }
-            let Some(e) = g.inflight.get_mut(&t.grant) else {
+            if !g.inflight.contains_key(&t.grant) {
                 continue;
-            };
-            e.active = e.active.saturating_sub(1);
-            if in_doubt {
-                e.pinned_until_ms = e.pinned_until_ms.max(t.until_ms);
             }
-            if e.over(now_ms) {
+            if in_doubt {
+                g.pin(t.grant, t.until_ms, now);
+            }
+            let e = g.inflight.get_mut(&t.grant).expect("checked");
+            e.active = e.active.saturating_sub(1);
+            if e.over(now) {
                 g.inflight.remove(&t.grant);
                 // A recalled grant's release may be waiting for this (an
                 // idle one's too: `idle_before` marks it recalled).
@@ -2125,11 +2178,10 @@ impl LockTables {
             return;
         }
         let mut g = self.lock();
-        let now_ms = g.now_or(0);
+        let now = g.now_or(Now::same(0));
         for t in &tag.0 {
-            let e = g.inflight.entry(t.grant).or_default();
-            e.pinned_until_ms = e.pinned_until_ms.max(t.until_ms);
-            g.note_doubted(t.grant, now_ms, rid);
+            g.pin(t.grant, t.until_ms, now);
+            g.note_doubted(t.grant, now.wall.0, rid);
         }
     }
 
@@ -2146,13 +2198,13 @@ impl LockTables {
     /// The publication [`Self::publish_begin`] announced is over. Like
     /// [`Self::tag_end`], wakes a recalled grant's release that waited
     /// for it, when nothing else holds the grant back.
-    pub fn publish_end(&self, grant: GrantId, now_ms: i64) {
+    pub fn publish_end(&self, grant: GrantId, now: Now) {
         let mut g = self.lock();
         let Some(e) = g.inflight.get_mut(&grant) else {
             return;
         };
         e.publishing = e.publishing.saturating_sub(1);
-        if !e.over(now_ms) {
+        if !e.over(now) {
             return;
         }
         g.inflight.remove(&grant);
@@ -2182,23 +2234,23 @@ impl LockTables {
     }
 
     /// Whether every grant `tag` names is held here and honoured at
-    /// `now_ms`.
-    pub fn tag_honoured(&self, tag: &LockTag, now_ms: i64) -> bool {
+    /// `now`.
+    pub fn tag_honoured(&self, tag: &LockTag, now: Now) -> bool {
         let g = self.lock();
         tag.0.iter().all(|t| {
             g.held
                 .values()
-                .any(|h| h.id == t.grant && h.until_ms > now_ms)
+                .any(|h| h.id == t.grant && h.until > now.honour)
         })
     }
 
     /// `tag` with each token's window brought up to date: a grant this
-    /// node still holds and honours at `now_ms` is named with the end of
+    /// node still holds and honours at `now` is named with the end of
     /// its current window (renewals move it), any other keeps the window
     /// it had. Phase 2 takes an op's token when it is sent, not when the
     /// op started: a close whose flush took long, or a retry, is not
     /// refused for the window its op set out with.
-    pub fn refresh_tag(&self, tag: &LockTag, now_ms: i64) -> LockTag {
+    pub fn refresh_tag(&self, tag: &LockTag, now: Now) -> LockTag {
         if tag.is_empty() {
             return LockTag::NONE;
         }
@@ -2210,8 +2262,10 @@ impl LockTables {
                     let until = g
                         .held
                         .values()
-                        .find(|h| h.id == t.grant && h.until_ms > now_ms)
-                        .map_or(t.until_ms, |h| h.until_ms.max(t.until_ms));
+                        .find(|h| h.id == t.grant && h.until > now.honour)
+                        .map_or(t.until_ms, |h| {
+                            now.wall_of_honour(h.until).0.max(t.until_ms)
+                        });
                     LockToken {
                         grant: t.grant,
                         until_ms: until,
@@ -2226,7 +2280,7 @@ impl LockTables {
     /// release ordering — a released grant's stale op must never land
     /// after the next holder's). `Some(t)`: not before `t` (in doubt
     /// only; `None` with ops in flight: when they are answered).
-    pub fn release_blocked(&self, grant: GrantId, now_ms: i64) -> Option<Option<i64>> {
+    pub fn release_blocked(&self, grant: GrantId, now: Now) -> Option<Option<WaitMs>> {
         let mut g = self.lock();
         let e = g.inflight.get(&grant).copied()?;
         // A close publishing the file may be tagged with another file's
@@ -2234,22 +2288,22 @@ impl LockTables {
         if e.active > 0 || e.publishing > 0 {
             return Some(None);
         }
-        if e.pinned_until_ms > now_ms {
-            return Some(Some(e.pinned_until_ms));
+        if e.pinned_until > now.wait {
+            return Some(Some(e.pinned_until));
         }
         g.inflight.remove(&grant);
         None
     }
 
-    /// The owners fenced at `now_ms`, for `status`: as
+    /// The owners fenced at `now`, for `status`: as
     /// [`Self::fenced_owners`] (a lapse no op has looked at yet is
     /// captured here too), but empty — with no capture — while no local
     /// lock exists.
-    pub fn fenced_owners_snapshot(&self, now_ms: i64) -> Vec<FencedOwner> {
+    pub fn fenced_owners_snapshot(&self, now: Now) -> Vec<FencedOwner> {
         if self.local_inos.load(Ordering::Relaxed) == 0 {
             return self.lock().fenced_owners.values().copied().collect();
         }
-        self.fenced_owners(now_ms)
+        self.fenced_owners(now)
     }
 
     /// An op of a fenced owner was refused (counted).
@@ -2268,22 +2322,22 @@ impl LockTables {
     /// would), which taints the inode; a taint is consumed (the caller
     /// discards). One relaxed load of two counters when this node holds
     /// no grant, no local lock and no taint.
-    pub fn take_discard(&self, ino: u64, now_ms: i64) -> Option<bool> {
+    pub fn take_discard(&self, ino: u64, now: Now) -> Option<bool> {
         if self.local_inos.load(Ordering::Relaxed) == 0 && self.tracked.load(Ordering::Relaxed) == 0
         {
             return None;
         }
         let mut g = self.lock();
-        let lapsed = g.held.get(&ino).copied().filter(|h| h.until_ms <= now_ms);
+        let lapsed = g.held.get(&ino).copied().filter(|h| h.until <= now.honour);
         if let Some(h) = lapsed {
             g.held.remove(&ino);
             g.tombstone(h.id);
             g.taint(ino);
         }
-        let fenced = g.fenced_at(ino, now_ms);
+        let fenced = g.fenced_at(ino, now.honour);
         if fenced {
             // Fenced since the dropped grant's window ended, not since now.
-            g.capture(ino, lapsed.map_or(now_ms, |h| h.until_ms));
+            g.capture(ino, lapsed.map_or(now.honour, |h| h.until));
         }
         let tainted = g.taint.remove(&ino);
         if fenced {
@@ -2369,9 +2423,9 @@ impl LockTables {
         write: bool,
         start: u64,
         end: u64,
-        now_ms: i64,
+        now: Now,
     ) -> LocalOutcome {
-        self.local_test_going_last(ino, owner, write, start, end, now_ms, |_| false)
+        self.local_test_going_last(ino, owner, write, start, end, now, |_| false)
     }
 
     /// [`Self::local_test`] that names a lock of an owner `going` names
@@ -2387,7 +2441,7 @@ impl LockTables {
         write: bool,
         start: u64,
         end: u64,
-        now_ms: i64,
+        now: Now,
         going: impl Fn(u64) -> bool,
     ) -> LocalOutcome {
         let need = if write {
@@ -2413,7 +2467,9 @@ impl LockTables {
             .get(&ino)
             .is_some_and(|v| v.iter().any(|l| l.owner == owner));
         let covered = g.held.get(&ino).is_some_and(|h| {
-            h.until_ms > now_ms && (!h.recalled || h.first_use || continuing) && h.mode.covers(need)
+            h.until > now.honour
+                && (!h.recalled || h.first_use || continuing)
+                && h.mode.covers(need)
         });
         if covered {
             LocalOutcome::Done
@@ -2426,7 +2482,7 @@ impl LockTables {
     /// owner's own overlapping ranges are replaced), or say what is in
     /// the way. The grant must cover the request and be honoured and
     /// not recalled; else `NeedGrant`.
-    pub fn local_set(&self, ino: u64, lock: LocalLock, now_ms: i64) -> LocalOutcome {
+    pub fn local_set(&self, ino: u64, lock: LocalLock, now: Now) -> LocalOutcome {
         let need = lock.mode();
         let mut g = self.lock();
         let conflict = g.local.get(&ino).and_then(|v| {
@@ -2451,7 +2507,9 @@ impl LockTables {
             .get(&ino)
             .is_some_and(|v| v.iter().any(|l| l.owner == lock.owner));
         let covered = g.held.get(&ino).is_some_and(|h| {
-            h.until_ms > now_ms && (!h.recalled || h.first_use || continuing) && h.mode.covers(need)
+            h.until > now.honour
+                && (!h.recalled || h.first_use || continuing)
+                && h.mode.covers(need)
         });
         if !covered {
             return LocalOutcome::NeedGrant(need);
@@ -2473,7 +2531,7 @@ impl LockTables {
             if id.is_some_and(|id| {
                 g.inflight
                     .get(&id)
-                    .is_some_and(|e| e.publishing > 0 || e.pinned_until_ms > now_ms)
+                    .is_some_and(|e| e.publishing > 0 || e.pinned_until > now.wait)
             }) {
                 // Counted once per request by the caller, which may ask
                 // again many times (`LockStats::predecessor_waits`).
@@ -2517,9 +2575,9 @@ impl LockTables {
 
     /// Remove `owner`'s locks within `[start, end]` (splitting as POSIX
     /// does). Returns whether `ino` has no local lock left.
-    pub fn local_unlock(&self, ino: u64, owner: u64, start: u64, end: u64, now_ms: i64) -> bool {
+    pub fn local_unlock(&self, ino: u64, owner: u64, start: u64, end: u64, now: Now) -> bool {
         let mut g = self.lock();
-        let fenced = g.fenced_at(ino, now_ms);
+        let fenced = g.fenced_at(ino, now.honour);
         let Some(v) = g.local.get_mut(&ino) else {
             return true;
         };
@@ -2530,7 +2588,7 @@ impl LockTables {
             g.local.remove(&ino);
             self.local_inos.fetch_sub(1, Ordering::Relaxed);
             if let Some(h) = g.held.get_mut(&ino) {
-                h.idle_since_ms = Some(now_ms);
+                h.idle_since_ms = Some(now.wall.0);
             }
         }
         if fenced && touched {
@@ -2546,15 +2604,15 @@ impl LockTables {
 
     /// Drop every lock of `owner` on `ino` (a close). Returns whether
     /// `ino` has no local lock left.
-    pub fn local_release_owner(&self, ino: u64, owner: u64, now_ms: i64) -> bool {
-        self.local_release_owner_dropped(ino, owner, now_ms).0
+    pub fn local_release_owner(&self, ino: u64, owner: u64, now: Now) -> bool {
+        self.local_release_owner_dropped(ino, owner, now).0
     }
 
     /// [`Self::local_release_owner`], also saying whether it dropped any
     /// lock: `(no local lock left, dropped)`.
-    pub fn local_release_owner_dropped(&self, ino: u64, owner: u64, now_ms: i64) -> (bool, bool) {
+    pub fn local_release_owner_dropped(&self, ino: u64, owner: u64, now: Now) -> (bool, bool) {
         let mut g = self.lock();
-        let fenced = g.fenced_at(ino, now_ms);
+        let fenced = g.fenced_at(ino, now.honour);
         let Some(v) = g.local.get_mut(&ino) else {
             return (true, false);
         };
@@ -2569,7 +2627,7 @@ impl LockTables {
             g.local.remove(&ino);
             self.local_inos.fetch_sub(1, Ordering::Relaxed);
             if let Some(h) = g.held.get_mut(&ino) {
-                h.idle_since_ms = Some(now_ms);
+                h.idle_since_ms = Some(now.wall.0);
             }
         }
         g.lift_if_unlocked(owner);
@@ -2687,19 +2745,19 @@ impl crate::Meta {
 
     /// Plan 30 §M14 phase 2: run `f` — a journaled write that is not a
     /// `MutateOp` execution (the holder's own manifest commit) — under the
-    /// fencing token `tag`, checked at `now_ms` as
+    /// fencing token `tag`, checked at `now` as
     /// [`crate::mutate::execute_tagged`] checks it, and recorded with the
     /// transaction's `journal_tx` row.
     pub fn with_lock_tag<T>(
         &self,
         tag: &LockTag,
-        now_ms: i64,
+        now: Now,
         f: impl FnOnce() -> Result<T, crate::MetaError>,
     ) -> Result<T, crate::MetaError> {
-        if self.locks.check_tag(tag, now_ms).is_err() {
+        if self.locks.check_tag(tag, now).is_err() {
             return Err(crate::MetaError::LockLapsed);
         }
-        let _tag = crate::store::journal::PendingLockTag::set(tag, now_ms, &self.locks);
+        let _tag = crate::store::journal::PendingLockTag::set(tag, now, &self.locks);
         let out = f()?;
         crate::mutate::note_landed(tag);
         Ok(out)
@@ -2714,8 +2772,8 @@ mod tests {
         HeldGrant {
             id: GrantId { node: 1, seq: 1 },
             mode,
-            until_ms: until,
-            renew_at_ms: until / 2,
+            until: HonourMs(until),
+            renew_at: HonourMs(until / 2),
             owner: 1,
             recalled: false,
             position: Position::ZERO,
@@ -2723,7 +2781,7 @@ mod tests {
             releasing: false,
             first_use: false,
             idle_since_ms: None,
-            installed_ms: 0,
+            installed: HonourMs(0),
         }
     }
 
@@ -2764,16 +2822,26 @@ mod tests {
     #[test]
     fn a_test_names_the_first_conflicting_lock_in_the_kernels_order() {
         let t = granted();
-        let test = |owner, start, end| match t.local_test(7, owner, true, start, end, 0) {
+        let test = |owner, start, end| match t.local_test(7, owner, true, start, end, Now::same(0))
+        {
             LocalOutcome::Conflict(l) => Some((l.owner, l.start, l.end)),
             _ => None,
         };
-        assert_eq!(t.local_set(7, lk(10, true, 58, 75), 0), LocalOutcome::Done);
-        assert_eq!(t.local_set(7, lk(10, true, 29, 38), 0), LocalOutcome::Done);
+        assert_eq!(
+            t.local_set(7, lk(10, true, 58, 75), Now::same(0)),
+            LocalOutcome::Done
+        );
+        assert_eq!(
+            t.local_set(7, lk(10, true, 29, 38), Now::same(0)),
+            LocalOutcome::Done
+        );
         assert_eq!(test(11, 1, u64::MAX), Some((10, 29, 38)));
         // Owners in the order they first locked the file, whatever their
         // ranges: owner 12's lower range comes after owner 10's.
-        assert_eq!(t.local_set(7, lk(12, true, 0, 9), 0), LocalOutcome::Done);
+        assert_eq!(
+            t.local_set(7, lk(12, true, 0, 9), Now::same(0)),
+            LocalOutcome::Done
+        );
         assert_eq!(test(11, 0, u64::MAX), Some((10, 29, 38)));
         assert_eq!(
             table(&t),
@@ -2783,19 +2851,34 @@ mod tests {
         // (lockdiff on the mount: B `W[26,43]`, A `W[58,69]`, B
         // `W[42,51]`, C tests `W[46,68]`: ext4 names B's 26+26).
         let u = granted();
-        assert_eq!(u.local_set(7, lk(20, true, 26, 43), 0), LocalOutcome::Done);
-        assert_eq!(u.local_set(7, lk(21, true, 58, 69), 0), LocalOutcome::Done);
-        assert_eq!(u.local_set(7, lk(20, true, 42, 51), 0), LocalOutcome::Done);
-        match u.local_test(7, 22, true, 46, 68, 0) {
+        assert_eq!(
+            u.local_set(7, lk(20, true, 26, 43), Now::same(0)),
+            LocalOutcome::Done
+        );
+        assert_eq!(
+            u.local_set(7, lk(21, true, 58, 69), Now::same(0)),
+            LocalOutcome::Done
+        );
+        assert_eq!(
+            u.local_set(7, lk(20, true, 42, 51), Now::same(0)),
+            LocalOutcome::Done
+        );
+        match u.local_test(7, 22, true, 46, 68, Now::same(0)) {
             LocalOutcome::Conflict(l) => assert_eq!((l.owner, l.start, l.end), (20, 26, 51)),
             other => panic!("{other:?}"),
         }
         // So does one of the other type over all of them.
-        assert_eq!(u.local_set(7, lk(20, false, 20, 55), 0), LocalOutcome::Done);
+        assert_eq!(
+            u.local_set(7, lk(20, false, 20, 55), Now::same(0)),
+            LocalOutcome::Done
+        );
         assert_eq!(table(&u), [(20, false, 20, 55), (21, true, 58, 69)]);
         // An owner that unlocked everything and locks again comes last.
-        t.local_unlock(7, 10, 0, u64::MAX, 0);
-        assert_eq!(t.local_set(7, lk(10, true, 20, 29), 0), LocalOutcome::Done);
+        t.local_unlock(7, 10, 0, u64::MAX, Now::same(0));
+        assert_eq!(
+            t.local_set(7, lk(10, true, 20, 29), Now::same(0)),
+            LocalOutcome::Done
+        );
         assert_eq!(test(11, 0, u64::MAX), Some((12, 0, 9)));
         assert_eq!(table(&t), [(12, true, 0, 9), (10, true, 20, 29)]);
     }
@@ -2809,7 +2892,7 @@ mod tests {
         let t = granted();
         let set = |write, start, end| {
             assert_eq!(
-                t.local_set(7, lk(10, write, start, end), 0),
+                t.local_set(7, lk(10, write, start, end), Now::same(0)),
                 LocalOutcome::Done
             )
         };
@@ -2824,7 +2907,7 @@ mod tests {
         set(true, 5, 9);
         assert_eq!(table(&t), [(10, true, 0, 19)]);
         // A partial unlock cuts it; filling the hole merges it again.
-        t.local_unlock(7, 10, 8, 11, 0);
+        t.local_unlock(7, 10, 8, 11, Now::same(0));
         assert_eq!(table(&t), [(10, true, 0, 7), (10, true, 12, 19)]);
         set(true, 8, 11);
         assert_eq!(table(&t), [(10, true, 0, 19)]);
@@ -2848,7 +2931,7 @@ mod tests {
             ]
         );
         // A test by another owner names the whole run in its way.
-        match t.local_test(7, 11, false, 40, 41, 0) {
+        match t.local_test(7, 11, false, 40, 41, Now::same(0)) {
             LocalOutcome::Conflict(l) => assert_eq!((l.start, l.end), (30, u64::MAX)),
             other => panic!("{other:?}"),
         }
@@ -2861,22 +2944,27 @@ mod tests {
     #[test]
     fn a_test_names_the_locks_of_owners_on_their_way_out_last() {
         let t = granted();
-        assert_eq!(t.local_set(7, lk(10, true, 48, 48), 0), LocalOutcome::Done);
         assert_eq!(
-            t.local_set(7, lk(12, false, 53, u64::MAX), 0),
+            t.local_set(7, lk(10, true, 48, 48), Now::same(0)),
+            LocalOutcome::Done
+        );
+        assert_eq!(
+            t.local_set(7, lk(12, false, 53, u64::MAX), Now::same(0)),
             LocalOutcome::Done
         );
         let test =
-            |going: u64| match t.local_test_going_last(7, 11, true, 43, 66, 0, |o| o == going) {
+            |going: u64| match t
+                .local_test_going_last(7, 11, true, 43, 66, Now::same(0), |o| o == going)
+            {
                 LocalOutcome::Conflict(l) => Some((l.owner, l.start, l.end)),
                 _ => None,
             };
         assert_eq!(test(0), Some((10, 48, 48)));
         assert_eq!(test(10), Some((12, 53, u64::MAX)));
         assert_eq!(test(12), Some((10, 48, 48)));
-        t.local_release_owner(7, 12, 0);
+        t.local_release_owner(7, 12, Now::same(0));
         assert_eq!(test(10), Some((10, 48, 48)));
-        t.local_release_owner(7, 10, 0);
+        t.local_release_owner(7, 10, Now::same(0));
         assert_eq!(test(10), None);
     }
 
@@ -2998,7 +3086,7 @@ mod tests {
                     grant: b,
                     until_ms: 300
                 }]),
-                150
+                Now::same(150)
             )
             .is_ok());
         let first = t.take_outwaited();
@@ -3041,8 +3129,11 @@ mod tests {
     fn an_exclusive_local_lock_under_a_shared_grant_is_fenced() {
         let t = LockTables::default();
         t.install_held(7, held(LockMode::Exclusive, 100));
-        assert_eq!(t.local_set(7, lk(1, true, 0, 10), 0), LocalOutcome::Done);
-        assert!(!t.fenced(7, 0));
+        assert_eq!(
+            t.local_set(7, lk(1, true, 0, 10), Now::same(0)),
+            LocalOutcome::Done
+        );
+        assert!(!t.fenced(7, Now::same(0)));
         // The exclusive grant is replaced by a shared one (another local
         // owner's request after the exclusive one lapsed).
         t.install_held(
@@ -3053,7 +3144,7 @@ mod tests {
             },
         );
         assert!(
-            t.fenced(7, 0),
+            t.fenced(7, Now::same(0)),
             "an exclusive local lock needs an exclusive grant"
         );
     }
@@ -3088,20 +3179,26 @@ mod tests {
     fn local_locks_need_a_covering_grant() {
         let t = LockTables::default();
         assert_eq!(
-            t.local_set(7, lk(1, true, 0, 10), 0),
+            t.local_set(7, lk(1, true, 0, 10), Now::same(0)),
             LocalOutcome::NeedGrant(LockMode::Exclusive)
         );
         t.install_held(7, held(LockMode::Shared, 100));
         assert_eq!(
-            t.local_set(7, lk(1, true, 0, 10), 0),
+            t.local_set(7, lk(1, true, 0, 10), Now::same(0)),
             LocalOutcome::NeedGrant(LockMode::Exclusive)
         );
-        assert_eq!(t.local_set(7, lk(1, false, 0, 10), 0), LocalOutcome::Done);
+        assert_eq!(
+            t.local_set(7, lk(1, false, 0, 10), Now::same(0)),
+            LocalOutcome::Done
+        );
         t.install_held(7, held(LockMode::Exclusive, 100));
-        assert_eq!(t.local_set(7, lk(1, true, 0, 10), 0), LocalOutcome::Done);
+        assert_eq!(
+            t.local_set(7, lk(1, true, 0, 10), Now::same(0)),
+            LocalOutcome::Done
+        );
         // A lapsed grant covers nothing.
         assert_eq!(
-            t.local_set(7, lk(1, true, 0, 10), 100),
+            t.local_set(7, lk(1, true, 0, 10), Now::same(100)),
             LocalOutcome::NeedGrant(LockMode::Exclusive)
         );
     }
@@ -3110,14 +3207,29 @@ mod tests {
     fn an_owners_touching_locks_of_one_type_merge() {
         let t = LockTables::default();
         t.install_held(7, held(LockMode::Exclusive, 100));
-        assert_eq!(t.local_set(7, lk(1, false, 4, 11), 0), LocalOutcome::Done);
-        assert_eq!(t.local_set(7, lk(1, false, 15, 18), 0), LocalOutcome::Done);
+        assert_eq!(
+            t.local_set(7, lk(1, false, 4, 11), Now::same(0)),
+            LocalOutcome::Done
+        );
+        assert_eq!(
+            t.local_set(7, lk(1, false, 15, 18), Now::same(0)),
+            LocalOutcome::Done
+        );
         // Overlapping one, touching the other: one lock 4..=27.
-        assert_eq!(t.local_set(7, lk(1, false, 12, 27), 0), LocalOutcome::Done);
+        assert_eq!(
+            t.local_set(7, lk(1, false, 12, 27), Now::same(0)),
+            LocalOutcome::Done
+        );
         assert_eq!(t.local_locks(7), [lk(1, false, 4, 27)]);
         // Another type, or another owner, does not merge.
-        assert_eq!(t.local_set(7, lk(1, true, 28, 30), 0), LocalOutcome::Done);
-        assert_eq!(t.local_set(7, lk(2, false, 31, 40), 0), LocalOutcome::Done);
+        assert_eq!(
+            t.local_set(7, lk(1, true, 28, 30), Now::same(0)),
+            LocalOutcome::Done
+        );
+        assert_eq!(
+            t.local_set(7, lk(2, false, 31, 40), Now::same(0)),
+            LocalOutcome::Done
+        );
         let mut v = t.local_locks(7);
         v.sort_by_key(|l| l.start);
         assert_eq!(
@@ -3130,7 +3242,10 @@ mod tests {
         );
         // A read lock over the owner's write lock replaces that part,
         // and merges with the read lock it now touches.
-        assert_eq!(t.local_set(7, lk(1, false, 28, 29), 0), LocalOutcome::Done);
+        assert_eq!(
+            t.local_set(7, lk(1, false, 28, 29), Now::same(0)),
+            LocalOutcome::Done
+        );
         let mut v = t.local_locks(7);
         v.sort_by_key(|l| l.start);
         assert_eq!(
@@ -3147,56 +3262,71 @@ mod tests {
     fn posix_ranges_split_and_conflict_by_owner() {
         let t = LockTables::default();
         t.install_held(7, held(LockMode::Exclusive, 100));
-        assert_eq!(t.local_set(7, lk(1, true, 0, 100), 0), LocalOutcome::Done);
         assert_eq!(
-            t.local_set(7, lk(2, false, 50, 60), 0),
+            t.local_set(7, lk(1, true, 0, 100), Now::same(0)),
+            LocalOutcome::Done
+        );
+        assert_eq!(
+            t.local_set(7, lk(2, false, 50, 60), Now::same(0)),
             LocalOutcome::Conflict(lk(1, true, 0, 100))
         );
         // Unlock the middle: two pieces remain.
-        assert!(!t.local_unlock(7, 1, 40, 60, 0));
+        assert!(!t.local_unlock(7, 1, 40, 60, Now::same(0)));
         let v = t.local_locks(7);
         assert_eq!(v, vec![lk(1, true, 0, 39), lk(1, true, 61, 100)]);
         // Now owner 2 fits in the hole; shared/shared overlap is fine.
-        assert_eq!(t.local_set(7, lk(2, false, 45, 55), 0), LocalOutcome::Done);
-        assert_eq!(t.local_set(7, lk(3, false, 45, 55), 0), LocalOutcome::Done);
-        assert!(!t.local_release_owner(7, 1, 0));
-        assert!(!t.local_release_owner(7, 2, 0));
-        assert!(t.local_release_owner(7, 3, 0));
+        assert_eq!(
+            t.local_set(7, lk(2, false, 45, 55), Now::same(0)),
+            LocalOutcome::Done
+        );
+        assert_eq!(
+            t.local_set(7, lk(3, false, 45, 55), Now::same(0)),
+            LocalOutcome::Done
+        );
+        assert!(!t.local_release_owner(7, 1, Now::same(0)));
+        assert!(!t.local_release_owner(7, 2, Now::same(0)));
+        assert!(t.local_release_owner(7, 3, Now::same(0)));
         assert!(t.local_idle(7));
     }
 
     #[test]
     fn fencing_is_free_without_local_locks_and_bites_after_lapse() {
         let t = LockTables::default();
-        assert!(!t.fenced(7, 0));
+        assert!(!t.fenced(7, Now::same(0)));
         t.install_held(7, held(LockMode::Exclusive, 100));
-        assert_eq!(t.local_set(7, lk(1, true, 0, 10), 0), LocalOutcome::Done);
-        assert!(!t.fenced(7, 50));
-        assert!(t.fenced(7, 100));
+        assert_eq!(
+            t.local_set(7, lk(1, true, 0, 10), Now::same(0)),
+            LocalOutcome::Done
+        );
+        assert!(!t.fenced(7, Now::same(50)));
+        assert!(t.fenced(7, Now::same(100)));
         // Another inode without local locks is not fenced.
-        assert!(!t.fenced(8, 100));
-        assert!(t.local_unlock(7, 1, 0, 10, 100));
-        assert!(!t.fenced(7, 100));
+        assert!(!t.fenced(8, Now::same(100)));
+        assert!(t.local_unlock(7, 1, 0, 10, Now::same(100)));
+        assert!(!t.fenced(7, Now::same(100)));
     }
 
     #[test]
     fn a_grant_that_ends_without_its_release_taints_the_dirty_data() {
         let t = LockTables::default();
         // Nothing held, locked or tainted: nothing to discard.
-        assert_eq!(t.take_discard(7, 0), None);
+        assert_eq!(t.take_discard(7, Now::same(0)), None);
         t.install_held(7, held(LockMode::Exclusive, 100));
-        assert_eq!(t.local_set(7, lk(1, true, 0, 10), 0), LocalOutcome::Done);
+        assert_eq!(
+            t.local_set(7, lk(1, true, 0, 10), Now::same(0)),
+            LocalOutcome::Done
+        );
         // Honoured: publish.
-        assert_eq!(t.take_discard(7, 50), None);
+        assert_eq!(t.take_discard(7, Now::same(50)), None);
         // Lapsed with the lock still held: fenced (discard, EIO even with
         // nothing dirty) — checked before the close drops the owner.
-        assert_eq!(t.take_discard(7, 100), Some(true));
+        assert_eq!(t.take_discard(7, Now::same(100)), Some(true));
         assert!(t.held(7).is_none(), "the lapsed grant is dropped");
         // The close drops the owner under the fence: tainted, so the
         // release that follows discards too — but owes no EIO of its own.
-        assert!(t.local_release_owner(7, 1, 100));
-        assert_eq!(t.take_discard(7, 100), Some(false));
-        assert_eq!(t.take_discard(7, 100), None);
+        assert!(t.local_release_owner(7, 1, Now::same(100)));
+        assert_eq!(t.take_discard(7, Now::same(100)), Some(false));
+        assert_eq!(t.take_discard(7, Now::same(100)), None);
 
         // An explicit unlock after the lapse, then the close.
         t.install_held(
@@ -3206,11 +3336,17 @@ mod tests {
                 ..held(LockMode::Exclusive, 200)
             },
         );
-        assert_eq!(t.local_set(8, lk(1, true, 0, 10), 150), LocalOutcome::Done);
-        assert!(t.local_unlock(8, 1, 0, 10, 250));
-        assert!(!t.fenced(8, 250), "the fence lifts with the last lock");
         assert_eq!(
-            t.take_discard(8, 250),
+            t.local_set(8, lk(1, true, 0, 10), Now::same(150)),
+            LocalOutcome::Done
+        );
+        assert!(t.local_unlock(8, 1, 0, 10, Now::same(250)));
+        assert!(
+            !t.fenced(8, Now::same(250)),
+            "the fence lifts with the last lock"
+        );
+        assert_eq!(
+            t.take_discard(8, Now::same(250)),
             Some(false),
             "but the data stays tainted"
         );
@@ -3224,10 +3360,13 @@ mod tests {
                 ..held(LockMode::Exclusive, 300)
             },
         );
-        assert_eq!(t.local_set(9, lk(1, true, 0, 10), 250), LocalOutcome::Done);
-        assert!(t.local_unlock(9, 1, 0, 10, 260));
-        assert_eq!(t.take_discard(9, 299), None);
-        assert_eq!(t.take_discard(9, 300), Some(false));
+        assert_eq!(
+            t.local_set(9, lk(1, true, 0, 10), Now::same(250)),
+            LocalOutcome::Done
+        );
+        assert!(t.local_unlock(9, 1, 0, 10, Now::same(260)));
+        assert_eq!(t.take_discard(9, Now::same(299)), None);
+        assert_eq!(t.take_discard(9, Now::same(300)), Some(false));
 
         // Lost at a renewal, or dropped lapsed by the tick: tainted.
         let id = GrantId { node: 1, seq: 5 };
@@ -3239,7 +3378,7 @@ mod tests {
             },
         );
         assert!(t.lost(10, id));
-        assert_eq!(t.take_discard(10, 0), Some(false));
+        assert_eq!(t.take_discard(10, Now::same(0)), Some(false));
         let id2 = GrantId { node: 1, seq: 4 };
         t.install_held(
             11,
@@ -3249,8 +3388,8 @@ mod tests {
             },
         );
         assert!(t.drop_held(11, id2));
-        assert_eq!(t.take_discard(11, 0), Some(false));
-        assert_eq!(t.take_discard(11, 0), None);
+        assert_eq!(t.take_discard(11, Now::same(0)), Some(false));
+        assert_eq!(t.take_discard(11, Now::same(0)), None);
     }
 
     fn lk_pid(owner: u64, pid: u32) -> LocalLock {
@@ -3271,7 +3410,10 @@ mod tests {
     #[test]
     fn a_lapsed_owner_is_fenced_until_its_locks_are_gone() {
         let t = LockTables::default();
-        assert!(!t.owner_fence_armed(0), "no local lock: one load");
+        assert!(
+            !t.owner_fence_armed(Now::same(0)),
+            "no local lock: one load"
+        );
         t.install_held(7, held(LockMode::Exclusive, 100));
         t.install_held(
             8,
@@ -3280,21 +3422,27 @@ mod tests {
                 ..held(LockMode::Exclusive, 1_000)
             },
         );
-        assert_eq!(t.local_set(7, lk_pid(1, 10), 0), LocalOutcome::Done);
-        assert_eq!(t.local_set(8, lk_pid(2, 20), 0), LocalOutcome::Done);
+        assert_eq!(
+            t.local_set(7, lk_pid(1, 10), Now::same(0)),
+            LocalOutcome::Done
+        );
+        assert_eq!(
+            t.local_set(8, lk_pid(2, 20), Now::same(0)),
+            LocalOutcome::Done
+        );
         // Both honoured: not armed (two loads), nobody fenced.
-        assert!(!t.owner_fence_armed(99));
-        assert!(t.fenced_owners(99).is_empty());
+        assert!(!t.owner_fence_armed(Now::same(99)));
+        assert!(t.fenced_owners(Now::same(99)).is_empty());
         // Ino 7's grant lapses: its owner is fenced, the other is not.
-        assert!(t.owner_fence_armed(100));
-        let f = t.fenced_owners(100);
+        assert!(t.owner_fence_armed(Now::same(100)));
+        let f = t.fenced_owners(Now::same(100));
         assert_eq!(
             f,
             vec![FencedOwner {
                 owner: 1,
                 pid: 10,
                 pid_start: 0,
-                since_ms: 100,
+                since: HonourMs(100),
                 grant: Some(GrantId { node: 1, seq: 1 }),
             }]
         );
@@ -3306,20 +3454,20 @@ mod tests {
             7,
             HeldGrant {
                 id: GrantId { node: 1, seq: 3 },
-                installed_ms: 150,
+                installed: HonourMs(150),
                 ..held(LockMode::Exclusive, 900)
             },
         );
-        assert!(!t.fenced(7, 150));
-        assert_eq!(t.fenced_owners(150).len(), 1);
+        assert!(!t.fenced(7, Now::same(150)));
+        assert_eq!(t.fenced_owners(Now::same(150)).len(), 1);
         // Owner 2's unlock elsewhere changes nothing for owner 1.
-        assert!(t.local_unlock(8, 2, 0, u64::MAX, 160));
-        assert_eq!(t.fenced_owners(160).len(), 1);
+        assert!(t.local_unlock(8, 2, 0, u64::MAX, Now::same(160)));
+        assert_eq!(t.fenced_owners(Now::same(160)).len(), 1);
         // Owner 1's unlock lifts it; with every remaining grant honoured
         // the fast path is back to "not armed".
-        assert!(t.local_unlock(7, 1, 0, u64::MAX, 170));
-        assert!(t.fenced_owners(170).is_empty());
-        assert!(!t.owner_fence_armed(170));
+        assert!(t.local_unlock(7, 1, 0, u64::MAX, Now::same(170)));
+        assert!(t.fenced_owners(Now::same(170)).is_empty());
+        assert!(!t.owner_fence_armed(Now::same(170)));
     }
 
     /// A grant that is lost (the owner forgot it), or dropped lapsed by
@@ -3329,18 +3477,27 @@ mod tests {
         let t = LockTables::default();
         let id = GrantId { node: 1, seq: 1 };
         t.install_held(7, held(LockMode::Exclusive, 10_000));
-        assert_eq!(t.local_set(7, lk_pid(1, 10), 0), LocalOutcome::Done);
         assert_eq!(
-            t.local_set(7, lk_pid(3, 10), 0),
+            t.local_set(7, lk_pid(1, 10), Now::same(0)),
+            LocalOutcome::Done
+        );
+        assert_eq!(
+            t.local_set(7, lk_pid(3, 10), Now::same(0)),
             LocalOutcome::Conflict(lk_pid(1, 10))
         );
         assert!(t.lost(7, id));
-        assert!(t.owner_fence_armed(1), "armed at once, not at the ttl");
-        assert_eq!(t.fenced_owners(1).len(), 1);
-        assert!(!t.local_release_owner(7, 9, 2), "another owner's close");
-        assert_eq!(t.fenced_owners(2).len(), 1);
-        assert!(t.local_release_owner(7, 1, 3));
-        assert!(t.fenced_owners(3).is_empty());
+        assert!(
+            t.owner_fence_armed(Now::same(1)),
+            "armed at once, not at the ttl"
+        );
+        assert_eq!(t.fenced_owners(Now::same(1)).len(), 1);
+        assert!(
+            !t.local_release_owner(7, 9, Now::same(2)),
+            "another owner's close"
+        );
+        assert_eq!(t.fenced_owners(Now::same(2)).len(), 1);
+        assert!(t.local_release_owner(7, 1, Now::same(3)));
+        assert!(t.fenced_owners(Now::same(3)).is_empty());
 
         let id2 = GrantId { node: 1, seq: 2 };
         t.install_held(
@@ -3357,12 +3514,15 @@ mod tests {
                     write: false,
                     ..lk_pid(4, 40)
                 },
-                0
+                Now::same(0)
             ),
             LocalOutcome::Done
         );
         assert!(t.drop_held(8, id2));
-        assert_eq!(t.fenced_owners(5).first().map(|f| f.pid), Some(40));
+        assert_eq!(
+            t.fenced_owners(Now::same(5)).first().map(|f| f.pid),
+            Some(40)
+        );
     }
 
     /// The carried review item: a recalled grant waiting for its first
@@ -3376,18 +3536,27 @@ mod tests {
         let id = GrantId { node: 1, seq: 1 };
         t.note_pending_recall(7, id);
         let mut h = held(LockMode::Exclusive, 10_000);
-        h.renew_at_ms = 100;
+        h.renew_at.0 = 100;
         assert_eq!(t.install_held(7, h), Installed::Ok { recalled: true });
         assert!(t.begin_release(7).is_none(), "pinned by its first use");
         // Inside the budget: renewed.
-        assert_eq!(t.next_renewal_ms(200), Some(100));
-        assert_eq!(t.due_renewals(200).len(), 1);
-        t.renewed(7, id, id, LockMode::Exclusive, 200, 10_000, 0, true);
+        assert_eq!(t.next_renewal(Now::same(200)), Some(HonourMs(100)));
+        assert_eq!(t.due_renewals(Now::same(200)).len(), 1);
+        t.renewed(
+            7,
+            id,
+            id,
+            LockMode::Exclusive,
+            HonourMs(200),
+            10_000,
+            0,
+            true,
+        );
         // Past it: not renewed, and the tick's sweep unpins it.
-        assert!(t.due_renewals(5_000).is_empty());
-        assert_eq!(t.next_renewal_ms(1_000), None);
-        assert!(t.expire_first_use(999).is_empty());
-        assert_eq!(t.expire_first_use(1_000), vec![7]);
+        assert!(t.due_renewals(Now::same(5_000)).is_empty());
+        assert_eq!(t.next_renewal(Now::same(1_000)), None);
+        assert!(t.expire_first_use(Now::same(999)).is_empty());
+        assert_eq!(t.expire_first_use(Now::same(1_000)), vec![7]);
         assert_eq!(t.stats().first_use_abandoned, 1);
         assert!(t.begin_release(7).is_some());
         assert!(t.end_release(7, id));
@@ -3405,8 +3574,11 @@ mod tests {
             ),
             Installed::Ok { recalled: true }
         );
-        assert!(t.abandon_first_use(8, 50), "recalled and idle: release it");
-        assert!(!t.abandon_first_use(8, 50), "once");
+        assert!(
+            t.abandon_first_use(8, Now::same(50)),
+            "recalled and idle: release it"
+        );
+        assert!(!t.abandon_first_use(8, Now::same(50)), "once");
         assert!(t.begin_release(8).is_some());
         // Not recalled: the grant stays cached, just no longer pinned.
         t.install_held(
@@ -3416,7 +3588,7 @@ mod tests {
                 ..held(LockMode::Exclusive, 10_000)
             },
         );
-        assert!(!t.abandon_first_use(9, 60));
+        assert!(!t.abandon_first_use(9, Now::same(60)));
         assert!(!t.held(9).unwrap().first_use);
         // ... and idle from the give-up: the idle sweep reclaims it.
         assert_eq!(t.held(9).unwrap().idle_since_ms, Some(60));
@@ -3429,16 +3601,19 @@ mod tests {
         let t = LockTables::default();
         let id = GrantId { node: 1, seq: 1 };
         t.install_held(7, held(LockMode::Exclusive, 100));
-        assert_eq!(t.local_set(7, lk(1, true, 0, 10), 0), LocalOutcome::Done);
-        assert!(t.local_unlock(7, 1, 0, 10, 10));
+        assert_eq!(
+            t.local_set(7, lk(1, true, 0, 10), Now::same(0)),
+            LocalOutcome::Done
+        );
+        assert!(t.local_unlock(7, 1, 0, 10, Now::same(10)));
         assert_eq!(t.recall_held(7, id), Some(false));
         assert!(t.begin_release(7).is_some());
         assert!(t.end_release(7, id));
-        assert_eq!(t.take_discard(7, 500), None);
+        assert_eq!(t.take_discard(7, Now::same(500)), None);
         assert_eq!(t.error_seq(7), 0);
         let seq = t.note_discard(7);
         assert_eq!(
-            t.take_discard(7, 500),
+            t.take_discard(7, Now::same(500)),
             None,
             "an error event is not a discard"
         );
@@ -3469,13 +3644,16 @@ mod tests {
         // The request it was granted for takes its one local lock first;
         // the release waits for that lock's unlock.
         assert!(t.begin_release(7).is_none());
-        assert_eq!(t.local_set(7, lk(1, true, 0, 10), 0), LocalOutcome::Done);
         assert_eq!(
-            t.local_set(7, lk(2, false, 20, 30), 0),
+            t.local_set(7, lk(1, true, 0, 10), Now::same(0)),
+            LocalOutcome::Done
+        );
+        assert_eq!(
+            t.local_set(7, lk(2, false, 20, 30), Now::same(0)),
             LocalOutcome::NeedGrant(LockMode::Shared)
         );
         assert!(t.begin_release(7).is_none());
-        assert!(t.local_unlock(7, 1, 0, 10, 0));
+        assert!(t.local_unlock(7, 1, 0, 10, Now::same(0)));
         assert!(t.begin_release(7).is_some());
         assert!(t.end_release(7, id));
         // Released: a reply for the same id that crosses the release is
@@ -3489,12 +3667,12 @@ mod tests {
     #[test]
     fn a_renewal_comes_inside_the_window() {
         // 5 s at a 1 s margin: honoured for 4 s, renewed at 2 s.
-        assert_eq!(renew_point(100, 5_000, 1_000), 2_100);
+        assert_eq!(renew_point(HonourMs(100), 5_000, 1_000), HonourMs(2_100));
         // A delegate's short grant: honoured for 1.076 s, renewed at 538 ms
         // (at `ttl/2` it would have been after the window closed).
-        assert_eq!(renew_point(0, 2_076, 1_000), 538);
+        assert_eq!(renew_point(HonourMs(0), 2_076, 1_000), HonourMs(538));
         for ttl in [1_000i64, 1_500, 2_000, 2_500, 5_000] {
-            assert!(renew_point(0, ttl, 1_000) <= (ttl - 1_000).max(0));
+            assert!(renew_point(HonourMs(0), ttl, 1_000) <= HonourMs((ttl - 1_000).max(0)));
         }
     }
 
@@ -3502,16 +3680,25 @@ mod tests {
     fn renewals_only_while_honoured() {
         let t = LockTables::default();
         let mut h = held(LockMode::Shared, 100);
-        h.renew_at_ms = 50;
+        h.renew_at.0 = 50;
         t.install_held(7, h);
-        assert!(t.due_renewals(40).is_empty());
-        assert_eq!(t.due_renewals(60).len(), 1);
+        assert!(t.due_renewals(Now::same(40)).is_empty());
+        assert_eq!(t.due_renewals(Now::same(60)).len(), 1);
         // In flight: not again.
-        assert!(t.due_renewals(70).is_empty());
-        t.renewed(7, h.id, h.id, LockMode::Shared, 60, 100, 10, false);
-        assert_eq!(t.held(7).unwrap().until_ms, 150);
+        assert!(t.due_renewals(Now::same(70)).is_empty());
+        t.renewed(
+            7,
+            h.id,
+            h.id,
+            LockMode::Shared,
+            HonourMs(60),
+            100,
+            10,
+            false,
+        );
+        assert_eq!(t.held(7).unwrap().until.0, 150);
         // Lapsed: never.
-        assert!(t.due_renewals(200).is_empty());
+        assert!(t.due_renewals(Now::same(200)).is_empty());
     }
 
     /// Sim `locks-blips-tight` seed 568: a renewal of id 1 is answered
@@ -3522,19 +3709,37 @@ mod tests {
     fn a_renewal_answered_under_the_id_a_recall_moved_to_extends_the_grant() {
         let t = LockTables::default();
         let mut h = held(LockMode::Exclusive, 100);
-        h.renew_at_ms = 50;
+        h.renew_at.0 = 50;
         t.install_held(7, h);
-        assert_eq!(t.due_renewals(60).len(), 1);
+        assert_eq!(t.due_renewals(Now::same(60)).len(), 1);
         let newer = GrantId { node: 1, seq: 2 };
         assert_eq!(t.recall_held(7, newer), Some(false));
         assert_eq!(t.held(7).unwrap().id, newer);
-        t.renewed(7, h.id, newer, LockMode::Exclusive, 60, 1_000, 10, false);
+        t.renewed(
+            7,
+            h.id,
+            newer,
+            LockMode::Exclusive,
+            HonourMs(60),
+            1_000,
+            10,
+            false,
+        );
         let now = t.held(7).unwrap();
-        assert_eq!((now.id, now.until_ms, now.recalled), (newer, 1_050, true));
+        assert_eq!((now.id, now.until.0, now.recalled), (newer, 1_050, true));
         assert!(now.renewing.is_none());
         let other = GrantId { node: 1, seq: 3 };
-        t.renewed(7, h.id, other, LockMode::Exclusive, 500, 1_000, 10, false);
-        assert_eq!(t.held(7).unwrap().until_ms, 1_050, "not this grant's");
+        t.renewed(
+            7,
+            h.id,
+            other,
+            LockMode::Exclusive,
+            HonourMs(500),
+            1_000,
+            10,
+            false,
+        );
+        assert_eq!(t.held(7).unwrap().until.0, 1_050, "not this grant's");
     }
 
     #[test]
@@ -3573,8 +3778,8 @@ mod idle_tests {
         let h = HeldGrant {
             id: GrantId { node: 1, seq: 1 },
             mode: LockMode::Exclusive,
-            until_ms: 1_000,
-            renew_at_ms: 500,
+            until: HonourMs(1_000),
+            renew_at: HonourMs(500),
             owner: 1,
             recalled: false,
             position: Position::ZERO,
@@ -3582,7 +3787,7 @@ mod idle_tests {
             releasing: false,
             first_use: false,
             idle_since_ms: None,
-            installed_ms: 0,
+            installed: HonourMs(0),
         };
         t.install_held(7, h);
         assert!(t.idle_before(100).is_empty(), "never used: not idle");
@@ -3594,8 +3799,8 @@ mod idle_tests {
             start: 0,
             end: 10,
         };
-        assert_eq!(t.local_set(7, l, 0), LocalOutcome::Done);
-        assert!(t.local_unlock(7, 1, 0, 10, 10));
+        assert_eq!(t.local_set(7, l, Now::same(0)), LocalOutcome::Done);
+        assert!(t.local_unlock(7, 1, 0, 10, Now::same(10)));
         assert!(t.idle_before(10).is_empty());
         assert_eq!(t.idle_before(11).len(), 1);
         assert!(t.held(7).unwrap().recalled);
@@ -3611,8 +3816,8 @@ mod supersede_tests {
         HeldGrant {
             id: GrantId { node: 1, seq },
             mode: LockMode::Exclusive,
-            until_ms: 5_000,
-            renew_at_ms: 2_500,
+            until: HonourMs(5_000),
+            renew_at: HonourMs(2_500),
             owner: 1,
             recalled: false,
             position: Position::ZERO,
@@ -3620,7 +3825,7 @@ mod supersede_tests {
             releasing: false,
             first_use: false,
             idle_since_ms: None,
-            installed_ms: 0,
+            installed: HonourMs(0),
         }
     }
 
@@ -3644,7 +3849,7 @@ mod supersede_tests {
     fn a_recall_by_a_newer_id_of_the_same_owner_adopts_it() {
         let t = LockTables::default();
         assert!(matches!(t.install_held(7, held(4)), Installed::Ok { .. }));
-        assert_eq!(t.local_set(7, lock(), 0), LocalOutcome::Done);
+        assert_eq!(t.local_set(7, lock(), Now::same(0)), LocalOutcome::Done);
         // Another owner's id, or an older one of ours: not this grant.
         assert!(t.recall_held(7, GrantId { node: 2, seq: 9 }).is_none());
         assert!(t.recall_held(7, GrantId { node: 1, seq: 3 }).is_none());
@@ -3664,11 +3869,11 @@ mod supersede_tests {
                     owner: 10,
                     ..lock()
                 },
-                0
+                Now::same(0)
             ),
             LocalOutcome::Conflict(_)
         ));
-        assert!(t.local_unlock(7, 9, 0, u64::MAX, 1));
+        assert!(t.local_unlock(7, 9, 0, u64::MAX, Now::same(1)));
         assert_eq!(
             t.begin_release(7).map(|h| h.id),
             Some(GrantId { node: 1, seq: 6 })
@@ -3684,8 +3889,8 @@ mod supersede_tests {
         let t = LockTables::default();
         assert!(matches!(t.install_held(7, held(4)), Installed::Ok { .. }));
         // The first use of the grant, then idle.
-        assert_eq!(t.local_set(7, lock(), 0), LocalOutcome::Done);
-        assert!(t.local_unlock(7, 9, 0, u64::MAX, 1));
+        assert_eq!(t.local_set(7, lock(), Now::same(0)), LocalOutcome::Done);
+        assert!(t.local_unlock(7, 9, 0, u64::MAX, Now::same(1)));
         // The recall of id 6 overtook the reply that carries 5.
         assert_eq!(t.recall_held(7, GrantId { node: 1, seq: 6 }), Some(false));
         let h = t.begin_release(7).expect("idle and recalled: released");
@@ -3708,10 +3913,10 @@ mod supersede_tests {
     fn a_newer_id_of_the_same_owner_merges_the_local_state() {
         let t = LockTables::default();
         assert!(matches!(t.install_held(7, held(4)), Installed::Ok { .. }));
-        assert_eq!(t.local_set(7, lock(), 0), LocalOutcome::Done);
+        assert_eq!(t.local_set(7, lock(), Now::same(0)), LocalOutcome::Done);
         assert_eq!(t.recall_held(7, GrantId { node: 1, seq: 4 }), Some(true));
         let newer = HeldGrant {
-            until_ms: 9_000,
+            until: HonourMs(9_000),
             ..held(5)
         };
         assert!(matches!(
@@ -3721,7 +3926,7 @@ mod supersede_tests {
         let h = t.held(7).unwrap();
         assert_eq!(h.id, GrantId { node: 1, seq: 5 });
         assert!(h.recalled && !h.first_use);
-        assert_eq!(h.until_ms, 9_000);
+        assert_eq!(h.until.0, 9_000);
         assert!(matches!(t.install_held(7, held(4)), Installed::Released));
         // A different owner's grant on the inode is a fresh one.
         let other = HeldGrant {
@@ -3742,8 +3947,8 @@ mod token_tests {
         HeldGrant {
             id: GrantId { node: 1, seq: 1 },
             mode,
-            until_ms: until,
-            renew_at_ms: until / 2,
+            until: HonourMs(until),
+            renew_at: HonourMs(until / 2),
             owner: 1,
             recalled: false,
             position: Position::ZERO,
@@ -3751,7 +3956,7 @@ mod token_tests {
             releasing: false,
             first_use: false,
             idle_since_ms: None,
-            installed_ms: 0,
+            installed: HonourMs(0),
         }
     }
 
@@ -3785,21 +3990,25 @@ mod token_tests {
             grant: id,
             until_ms: 500,
         }]);
-        assert_eq!(t.check_tag(&LockTag::NONE, i64::MAX), Ok(()));
-        assert_eq!(t.check_tag(&tag, 499), Ok(()));
-        assert_eq!(t.check_tag(&tag, 700), Ok(()), "live here: exact");
+        assert_eq!(t.check_tag(&LockTag::NONE, Now::same(i64::MAX)), Ok(()));
+        assert_eq!(t.check_tag(&tag, Now::same(499)), Ok(()));
+        assert_eq!(
+            t.check_tag(&tag, Now::same(700)),
+            Ok(()),
+            "live here: exact"
+        );
         // Moved away (a delegation): not ended; the window judges.
         let moved = t.take_where(|_| true);
         assert_eq!(moved.len(), 1);
-        assert_eq!(t.check_tag(&tag, 100), Ok(()));
+        assert_eq!(t.check_tag(&tag, Now::same(100)), Ok(()));
         assert!(
-            t.check_tag(&tag, 500).is_err(),
+            t.check_tag(&tag, Now::same(500)).is_err(),
             "unknown here, at the window: dead"
         );
         t.install(moved[0]);
         // Released: dead at once, whatever the window says.
         assert!(t.forget(id).is_some());
-        assert!(t.check_tag(&tag, 100).is_err());
+        assert!(t.check_tag(&tag, Now::same(100)).is_err());
         // Outwaited: the record expired (a conflicting request found it
         // so); a token whose window still runs is refused all the same,
         // through 257 other ends (the prune) and for the memory's span.
@@ -3813,10 +4022,13 @@ mod token_tests {
             let g = t.grant(1, 10 + k, 100 + k, LockMode::Shared, 2_100, 0);
             t.forget(g);
         }
-        assert!(t.check_tag(&late, 4_000).is_err(), "outwaited: remembered");
-        assert!(t.check_tag(&late, 4_999).is_err());
+        assert!(
+            t.check_tag(&late, Now::same(4_000)).is_err(),
+            "outwaited: remembered"
+        );
+        assert!(t.check_tag(&late, Now::same(4_999)).is_err());
         // Past `until + memory` only the window is left.
-        assert_eq!(t.check_tag(&late, 5_001), Ok(()));
+        assert_eq!(t.check_tag(&late, Now::same(5_001)), Ok(()));
         let s = t.stats();
         assert_eq!(s.token_rejections, 4);
     }
@@ -3846,19 +4058,29 @@ mod token_tests {
             grant: id,
             until_ms: 500,
         }]);
-        assert_eq!(t.check_tag(&old, 499), Ok(()));
-        assert!(t.check_tag(&old, 500).is_err(), "unconfirmed: the window");
+        assert_eq!(t.check_tag(&old, Now::same(499)), Ok(()));
+        assert!(
+            t.check_tag(&old, Now::same(500)).is_err(),
+            "unconfirmed: the window"
+        );
         assert_eq!(
             t.extend(id, 2, 12_000, 1_000),
             Some((LockMode::Exclusive, false))
         );
         assert_eq!(t.get(id).unwrap().confirmed_ms, 1_000);
-        assert!(t.check_tag(&old, 1_200).is_err(), "sent before the renewal");
+        assert!(
+            t.check_tag(&old, Now::same(1_200)).is_err(),
+            "sent before the renewal"
+        );
         let new = LockTag(vec![LockToken {
             grant: id,
             until_ms: 1_500,
         }]);
-        assert_eq!(t.check_tag(&new, 3_000), Ok(()), "confirmed: exact");
+        assert_eq!(
+            t.check_tag(&new, Now::same(3_000)),
+            Ok(()),
+            "confirmed: exact"
+        );
         // A later renewal never moves the confirmation forward.
         t.extend(id, 2, 13_000, 2_000);
         assert_eq!(t.get(id).unwrap().confirmed_ms, 1_000);
@@ -3879,18 +4101,18 @@ mod token_tests {
             grant: id,
             until_ms: 600,
         }]);
-        let fresh = t.refresh_tag(&old, 500);
+        let fresh = t.refresh_tag(&old, Now::same(500));
         assert_eq!(fresh.0[0].until_ms, 1_000);
-        assert!(t.tag_honoured(&fresh, 500));
+        assert!(t.tag_honoured(&fresh, Now::same(500)));
         // Past the held window: not honoured, nothing to refresh from.
-        assert_eq!(t.refresh_tag(&old, 1_000), old);
-        assert!(!t.tag_honoured(&old, 1_000));
+        assert_eq!(t.refresh_tag(&old, Now::same(1_000)), old);
+        assert!(!t.tag_honoured(&old, Now::same(1_000)));
         let other = LockTag(vec![LockToken {
             grant: GrantId { node: 1, seq: 9 },
             until_ms: 600,
         }]);
-        assert_eq!(t.refresh_tag(&other, 500), other);
-        assert!(!t.tag_honoured(&other, 500));
+        assert_eq!(t.refresh_tag(&other, Now::same(500)), other);
+        assert!(!t.tag_honoured(&other, Now::same(500)));
     }
 
     /// The release ordering's bookkeeping does not leak: an entry pinned
@@ -3905,8 +4127,8 @@ mod token_tests {
         t.set_release_wake(std::sync::Arc::new(move |ino| w.lock().unwrap().push(ino)));
         let lapsed = GrantId { node: 1, seq: 7 };
         let tag = |grant, until_ms| LockTag(vec![LockToken { grant, until_ms }]);
-        t.tag_begin(&tag(lapsed, 300), 0);
-        t.tag_end(&tag(lapsed, 300), true, 10);
+        t.tag_begin(&tag(lapsed, 300), Now::same(0));
+        t.tag_end(&tag(lapsed, 300), true, Now::same(10));
         assert_eq!(t.lock().inflight.len(), 1, "pinned");
         // Another grant's op, after the pin: the stale entry goes.
         t.install_held(
@@ -3917,10 +4139,10 @@ mod token_tests {
             },
         );
         let live = GrantId { node: 1, seq: 1 };
-        t.tag_begin(&tag(live, 900), 400);
+        t.tag_begin(&tag(live, 900), Now::same(400));
         assert_eq!(t.lock().inflight.len(), 1, "only the live grant's");
         assert!(woken.lock().unwrap().is_empty());
-        t.tag_end(&tag(live, 900), false, 410);
+        t.tag_end(&tag(live, 900), false, Now::same(410));
         assert_eq!(
             *woken.lock().unwrap(),
             vec![7],
@@ -3942,24 +4164,24 @@ mod token_tests {
         t.install_held(8, g(1, 2, LockMode::Exclusive, 600));
         t.install_held(9, g(3, 1, LockMode::Shared, 800));
         assert_eq!(
-            t.local_set(7, lk(10, true, 0, u64::MAX), 0),
+            t.local_set(7, lk(10, true, 0, u64::MAX), Now::same(0)),
             LocalOutcome::Done
         );
         assert_eq!(
-            t.local_set(8, lk(10, true, 0, u64::MAX), 0),
+            t.local_set(8, lk(10, true, 0, u64::MAX), Now::same(0)),
             LocalOutcome::Done
         );
         assert_eq!(
-            t.local_set(9, lk(10, false, 0, u64::MAX), 0),
+            t.local_set(9, lk(10, false, 0, u64::MAX), Now::same(0)),
             LocalOutcome::Done
         );
         assert_eq!(
-            t.local_set(7, lk(11, false, 0, 0), 0),
+            t.local_set(7, lk(11, false, 0, 0), Now::same(0)),
             LocalOutcome::Conflict(lk(10, true, 0, u64::MAX))
         );
-        assert_eq!(t.owner_tag(&[], 0), Ok(LockTag::NONE));
-        assert_eq!(t.owner_tag(&[12], 0), Ok(LockTag(Vec::new())));
-        let tag = t.owner_tag(&[10], 100).unwrap();
+        assert_eq!(t.owner_tag(&[], Now::same(0)), Ok(LockTag::NONE));
+        assert_eq!(t.owner_tag(&[12], Now::same(0)), Ok(LockTag(Vec::new())));
+        let tag = t.owner_tag(&[10], Now::same(100)).unwrap();
         assert_eq!(
             tag.0,
             vec![
@@ -3976,7 +4198,7 @@ mod token_tests {
         assert_eq!(tag.until_ms(), 600);
         assert_eq!(LockTag::from_wire(&tag.to_wire()), tag);
         // Past one grant's window: no tag (fenced).
-        assert_eq!(t.owner_tag(&[10], 600), Err(OwnerFenced));
+        assert_eq!(t.owner_tag(&[10], Now::same(600)), Err(OwnerFenced));
         let mut lockers = t.lockers();
         lockers.sort();
         assert_eq!(lockers, vec![(10, 1, 0)]);
@@ -3992,15 +4214,18 @@ mod token_tests {
             grant: id,
             until_ms: 500,
         }]);
-        assert_eq!(t.release_blocked(id, 0), None);
-        t.tag_begin(&tag, 0);
-        t.tag_begin(&tag, 0);
-        assert_eq!(t.release_blocked(id, 0), Some(None));
-        t.tag_end(&tag, false, 10);
-        assert_eq!(t.release_blocked(id, 10), Some(None));
-        t.tag_end(&tag, true, 20);
-        assert_eq!(t.release_blocked(id, 20), Some(Some(500)));
-        assert_eq!(t.release_blocked(id, 500), None);
+        assert_eq!(t.release_blocked(id, Now::same(0)), None);
+        t.tag_begin(&tag, Now::same(0));
+        t.tag_begin(&tag, Now::same(0));
+        assert_eq!(t.release_blocked(id, Now::same(0)), Some(None));
+        t.tag_end(&tag, false, Now::same(10));
+        assert_eq!(t.release_blocked(id, Now::same(10)), Some(None));
+        t.tag_end(&tag, true, Now::same(20));
+        assert_eq!(
+            t.release_blocked(id, Now::same(20)),
+            Some(Some(WaitMs(500)))
+        );
+        assert_eq!(t.release_blocked(id, Now::same(500)), None);
         assert_eq!(t.stats().tagged_ops, 2);
     }
 
@@ -4021,36 +4246,46 @@ mod token_tests {
             grant: id,
             until_ms: 500,
         }]);
-        assert_eq!(t.local_set(7, lk(10, true, 0, 9), 0), LocalOutcome::Done);
-        t.tag_begin(&tag, 0);
+        assert_eq!(
+            t.local_set(7, lk(10, true, 0, 9), Now::same(0)),
+            LocalOutcome::Done
+        );
+        t.tag_begin(&tag, Now::same(0));
         t.publish_begin(id);
         assert_eq!(
-            t.local_set(7, lk(11, false, 20, 29), 0),
+            t.local_set(7, lk(11, false, 20, 29), Now::same(0)),
             LocalOutcome::Done,
             "a lock beside the turn's"
         );
-        t.local_unlock(7, 11, 0, u64::MAX, 0);
-        t.local_unlock(7, 10, 0, u64::MAX, 10);
+        t.local_unlock(7, 11, 0, u64::MAX, Now::same(0));
+        t.local_unlock(7, 10, 0, u64::MAX, Now::same(10));
         assert_eq!(
-            t.local_set(7, lk(11, true, 0, 9), 10),
+            t.local_set(7, lk(11, true, 0, 9), Now::same(10)),
             LocalOutcome::Predecessor,
             "a close's publication in flight"
         );
-        t.publish_end(id, 12);
+        t.publish_end(id, Now::same(12));
         t.pin_in_doubt(&tag, None);
         assert_eq!(
-            t.local_set(7, lk(11, true, 0, 9), 15),
+            t.local_set(7, lk(11, true, 0, 9), Now::same(15)),
             LocalOutcome::Predecessor,
             "in doubt, before the op's answer and scope end"
         );
-        t.tag_end(&tag, true, 20);
+        t.tag_end(&tag, true, Now::same(20));
         assert_eq!(
-            t.local_set(7, lk(11, true, 0, 9), 499),
+            t.local_set(7, lk(11, true, 0, 9), Now::same(499)),
             LocalOutcome::Predecessor,
             "in doubt inside its window"
         );
-        assert_eq!(t.local_set(7, lk(11, true, 0, 9), 500), LocalOutcome::Done);
-        assert_eq!(t.release_blocked(id, 500), None, "nothing left behind");
+        assert_eq!(
+            t.local_set(7, lk(11, true, 0, 9), Now::same(500)),
+            LocalOutcome::Done
+        );
+        assert_eq!(
+            t.release_blocked(id, Now::same(500)),
+            None,
+            "nothing left behind"
+        );
     }
 
     /// A tagged op still waiting for its answer when its owner's turn ends
@@ -4068,17 +4303,24 @@ mod token_tests {
             grant: id,
             until_ms: 500,
         }]);
-        assert_eq!(t.local_set(7, lk(10, true, 0, 9), 0), LocalOutcome::Done);
-        t.tag_begin(&tag, 0);
-        t.local_unlock(7, 10, 0, u64::MAX, 10);
-        assert_eq!(t.release_blocked(id, 10), Some(None), "the release waits");
         assert_eq!(
-            t.local_set(7, lk(11, true, 0, 9), 10),
+            t.local_set(7, lk(10, true, 0, 9), Now::same(0)),
+            LocalOutcome::Done
+        );
+        t.tag_begin(&tag, Now::same(0));
+        t.local_unlock(7, 10, 0, u64::MAX, Now::same(10));
+        assert_eq!(
+            t.release_blocked(id, Now::same(10)),
+            Some(None),
+            "the release waits"
+        );
+        assert_eq!(
+            t.local_set(7, lk(11, true, 0, 9), Now::same(10)),
             LocalOutcome::Done,
             "the next turn does not"
         );
-        t.tag_end(&tag, false, 20);
-        assert_eq!(t.release_blocked(id, 20), None);
+        t.tag_end(&tag, false, Now::same(20));
+        assert_eq!(t.release_blocked(id, Now::same(20)), None);
     }
 
     /// The review nit: a shared lock under an honoured shared grant is not
@@ -4090,17 +4332,27 @@ mod token_tests {
     fn only_the_uncovered_owner_is_fenced_on_a_shared_grant() {
         let t = LockTables::default();
         t.install_held(7, held(LockMode::Exclusive, 200));
-        assert_eq!(t.local_set(7, lk(10, true, 0, 9), 0), LocalOutcome::Done);
-        assert_eq!(t.local_set(7, lk(11, false, 20, 29), 0), LocalOutcome::Done);
+        assert_eq!(
+            t.local_set(7, lk(10, true, 0, 9), Now::same(0)),
+            LocalOutcome::Done
+        );
+        assert_eq!(
+            t.local_set(7, lk(11, false, 20, 29), Now::same(0)),
+            LocalOutcome::Done
+        );
         t.install_held(
             7,
             HeldGrant {
                 id: GrantId { node: 1, seq: 2 },
-                installed_ms: 150,
+                installed: HonourMs(150),
                 ..held(LockMode::Shared, 300)
             },
         );
-        let fenced: Vec<u64> = t.fenced_owners(160).iter().map(|f| f.owner).collect();
+        let fenced: Vec<u64> = t
+            .fenced_owners(Now::same(160))
+            .iter()
+            .map(|f| f.owner)
+            .collect();
         assert_eq!(fenced, vec![10], "the shared owner keeps its lock");
     }
 
@@ -4133,15 +4385,19 @@ mod token_tests {
             let t = LockTables::default();
             t.install_held(7, held(LockMode::Exclusive, 100));
             assert_eq!(
-                t.local_set(7, lk(10, true, 0, u64::MAX), 0),
+                t.local_set(7, lk(10, true, 0, u64::MAX), Now::same(0)),
                 LocalOutcome::Done
             );
             match path {
-                0 => assert_eq!(t.take_discard(7, 5_000), Some(true)),
-                1 => assert!(t.fenced(7, 5_000)),
-                _ => assert_eq!(t.fenced_owners_snapshot(5_000).len(), 1),
+                0 => assert_eq!(t.take_discard(7, Now::same(5_000)), Some(true)),
+                1 => assert!(t.fenced(7, Now::same(5_000))),
+                _ => assert_eq!(t.fenced_owners_snapshot(Now::same(5_000)).len(), 1),
             }
-            let since: Vec<i64> = t.fenced_owners(5_000).iter().map(|f| f.since_ms).collect();
+            let since: Vec<i64> = t
+                .fenced_owners(Now::same(5_000))
+                .iter()
+                .map(|f| f.since.0)
+                .collect();
             assert_eq!(since, vec![100], "path {path}");
         }
     }

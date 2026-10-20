@@ -167,7 +167,7 @@
 //! minus the send: the code's `at − sent`, never the credit, which is an
 //! instant of the holder's clock), the highest expiry they named and the
 //! highest guard (the holder's own floor, if it has one: the code's
-//! `Beat::guard_unix_ms`; the model's holder has no takeover gate, so the
+//! `Beat::guard_ms`; the model's holder has no takeover gate, so the
 //! unknown guard never arises here). A takeover of the holder whose
 //! beats `b` heard (same holder and epoch) ends its floor at
 //! `min(bound, X + lag + seq_margin)`, `X = max(old expiry, named,

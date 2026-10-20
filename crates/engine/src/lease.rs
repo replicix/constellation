@@ -23,7 +23,8 @@
 //! (the next round ships it) rather than being stranded behind it.
 
 use constellation_authority::core::LeaseState;
-use constellation_authority::{Config, Ms};
+use constellation_authority::{Config, HonourMs, Ms, Now};
+use constellation_platform::clock::protocol;
 use constellation_store_s3::lease::now_unix_ms;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
@@ -64,8 +65,12 @@ pub fn idle_release_ms() -> u64 {
 /// control API.
 #[derive(Debug, Default)]
 pub struct LeaseView {
-    /// Unix ms until which this node holds the lease; 0 = not held.
-    valid_until_ms: AtomicI64,
+    /// The end of this node's own lease on its **honour** clock
+    /// (`ProtocolClock::honour`; plan 43 C7-H1, from the body's
+    /// `holder_expires_ms`: `LeaseState::honour_until`); 0 = not held, or
+    /// no honour end (a body of an earlier incarnation: not usable until
+    /// the next own CAS). Every judgement of it reads the same clock.
+    valid_until_honour: AtomicI64,
     holder: AtomicU64,
     epoch: AtomicU64,
     lost: AtomicBool,
@@ -90,11 +95,11 @@ pub struct LeaseView {
     /// journal row.
     ack_gated: AtomicBool,
     /// Plan 30 §M9: the tenure may be taken over before its lease
-    /// expires, and the send time (unix ms) of the latest S3 request that
-    /// proved this node still holds; a strict read on this node is local
-    /// only while that is within `fresh_window_ms`.
+    /// expires, and the send time (honour clock) of the latest S3 request
+    /// that proved this node still holds; a strict read on this node is
+    /// local only while that is within `fresh_window_ms`.
     fast_tenure: AtomicBool,
-    last_s3_fresh_ms: AtomicI64,
+    last_s3_fresh_honour: AtomicI64,
     fresh_window_ms: AtomicI64,
     /// Plan 43 C7-H2: where the takeover floor ends (unix ms; 0: none) and
     /// whether a fast takeover's gate is pending: releasing the lease now
@@ -128,7 +133,7 @@ impl Drop for AdmitGuard<'_> {
 impl LeaseView {
     /// Copy the core's lease state in (the driver, after every event).
     /// `ack_gated`: plan 30 §M9's durability gate is in force.
-    pub fn mirror(&self, lease: &LeaseState, now: Ms, cfg: &Config, ack_gated: bool) {
+    pub fn mirror(&self, lease: &LeaseState, now: Now, cfg: &Config, ack_gated: bool) {
         self.ack_gated.store(ack_gated, Ordering::Relaxed);
         self.fresh_window_ms
             .store(cfg.backup_takeover_ms as i64, Ordering::Relaxed);
@@ -141,8 +146,8 @@ impl LeaseView {
             self.holder.store(cfg.node_id, Ordering::Relaxed);
             self.epoch
                 .store(lease.epoch().unwrap_or(1), Ordering::Relaxed);
-            self.valid_until_ms
-                .store(now.0 + 365 * 24 * 3600 * 1000, Ordering::Relaxed);
+            self.valid_until_honour
+                .store(now.honour.plus(365 * 24 * 3600 * 1000).0, Ordering::Relaxed);
             self.epoch_held.store(true, Ordering::Release);
         } else {
             self.epoch_held.store(false, Ordering::Relaxed);
@@ -150,11 +155,13 @@ impl LeaseView {
                 Some((held, _)) if !lease.lost => {
                     self.holder.store(held.holder, Ordering::Relaxed);
                     self.epoch.store(held.epoch, Ordering::Relaxed);
-                    self.valid_until_ms
-                        .store(held.expires_unix_ms, Ordering::Release);
+                    self.valid_until_honour.store(
+                        lease.honour_until(cfg).map_or(0, |h| h.0),
+                        Ordering::Release,
+                    );
                 }
                 _ => {
-                    self.valid_until_ms.store(0, Ordering::Relaxed);
+                    self.valid_until_honour.store(0, Ordering::Relaxed);
                     if let Some(holder) = lease.cached_holder {
                         self.holder.store(holder, Ordering::Relaxed);
                     }
@@ -171,13 +178,19 @@ impl LeaseView {
     /// Usable right now, with enough margin to finish an op. Blind to the
     /// handoff pause (that is [`Self::open_for_new_mutation`]'s).
     pub fn usable(&self) -> bool {
+        self.usable_at(protocol().honour())
+    }
+
+    /// [`Self::usable`] at an honour reading already taken (one reading per
+    /// request, plan 43 C7-H1 §12).
+    pub fn usable_at(&self, honour: HonourMs) -> bool {
         if self.lost.load(Ordering::Relaxed) {
             return false;
         }
         if self.epoch_held.load(Ordering::Relaxed) {
             return true;
         }
-        self.valid_until_ms.load(Ordering::Relaxed) - now_unix_ms() > expiry_margin_ms()
+        self.valid_until_honour.load(Ordering::Relaxed) - honour.0 > expiry_margin_ms()
     }
 
     /// Plan 30 §M8: this node is the sequencer for reads — a usable
@@ -188,17 +201,24 @@ impl LeaseView {
     /// taken over before its lease expires, only with fresh S3 liveness;
     /// otherwise the read goes through the core, which probes first.
     pub fn reads_locally(&self) -> bool {
+        self.reads_locally_at(protocol().honour())
+    }
+
+    /// [`Self::reads_locally`] at an honour reading already taken: one
+    /// reading for the lease and the liveness check, both judged on the
+    /// honour clock (plan 43 C7-H1).
+    pub fn reads_locally_at(&self, honour: HonourMs) -> bool {
         if self.releasing.load(Ordering::SeqCst)
             || self.gate_pending.load(Ordering::SeqCst)
-            || !self.usable()
+            || !self.usable_at(honour)
         {
             return false;
         }
         // The core's rule (`Core::renew_fresh`), one definition.
         constellation_authority::core::liveness_fresh(
             self.fast_tenure.load(Ordering::Relaxed),
-            now_unix_ms(),
-            self.last_s3_fresh_ms.load(Ordering::Relaxed),
+            honour,
+            HonourMs(self.last_s3_fresh_honour.load(Ordering::Relaxed)),
             self.fresh_window_ms.load(Ordering::Relaxed),
         )
     }
@@ -219,26 +239,34 @@ impl LeaseView {
         (left > 0).then(|| ReleaseHold::Floor(std::time::Duration::from_millis(left as u64)))
     }
 
-    /// Plan 30 §M9: the driver mirrors the core's liveness bookkeeping.
-    pub fn set_liveness(&self, fast_tenure: bool, last_s3_fresh_ms: i64) {
+    /// Plan 30 §M9: the driver mirrors the core's liveness bookkeeping
+    /// (`last_s3_fresh` on the honour clock).
+    pub fn set_liveness(&self, fast_tenure: bool, last_s3_fresh: HonourMs) {
         self.fast_tenure.store(fast_tenure, Ordering::Relaxed);
-        self.last_s3_fresh_ms
-            .store(last_s3_fresh_ms, Ordering::Relaxed);
+        self.last_s3_fresh_honour
+            .store(last_s3_fresh.0, Ordering::Relaxed);
     }
 
     /// As [`Self::usable`], but also closed by the releasing flag, a
     /// pending takeover gate and the handoff pause.
     pub fn open_for_new_mutation(&self) -> bool {
+        self.open_for_new_mutation_at(protocol().now())
+    }
+
+    /// [`Self::open_for_new_mutation`] at a reading already taken: the
+    /// lease on its honour clock, the handoff pause on the wall clock
+    /// (liveness; the next commits of plan 43 C7-H1 move it).
+    pub fn open_for_new_mutation_at(&self, now: Now) -> bool {
         if self.releasing.load(Ordering::SeqCst) || self.gate_pending.load(Ordering::SeqCst) {
             return false;
         }
         if self.epoch_held.load(Ordering::Relaxed) {
-            return self.usable();
+            return self.usable_at(now.honour);
         }
-        if self.handoff_pause_until_ms.load(Ordering::Relaxed) > now_unix_ms() {
+        if self.handoff_pause_until_ms.load(Ordering::Relaxed) > now.wall.0 {
             return false;
         }
-        self.usable()
+        self.usable_at(now.honour)
     }
 
     /// Admit one new mutation, atomically with respect to a release (see
@@ -246,11 +274,17 @@ impl LeaseView {
     /// closed. Hold the guard across the mutation's metadata write, and
     /// no longer.
     pub fn admit(&self) -> Option<AdmitGuard<'_>> {
+        self.admit_at(protocol().now())
+    }
+
+    /// [`Self::admit`] at the request's one reading (`View`'s fast path
+    /// takes a single `Now` for everything it decides at admission).
+    pub fn admit_at(&self, now: Now) -> Option<AdmitGuard<'_>> {
         // Plan 30 §M9: under a durability gate the fast path still
         // executes here; its acknowledgement then waits for the core's
         // durable watermark (`View::ack_when_durable`).
         self.inflight.fetch_add(1, Ordering::SeqCst);
-        if self.open_for_new_mutation() {
+        if self.open_for_new_mutation_at(now) {
             Some(AdmitGuard(self))
         } else {
             self.inflight.fetch_sub(1, Ordering::SeqCst);
@@ -292,8 +326,8 @@ impl LeaseView {
 
     /// Record write activity; keeps the idle-release timer from firing
     /// under a running workload.
-    pub fn touch(&self) {
-        self.last_write_ms.store(now_unix_ms(), Ordering::Relaxed);
+    pub fn touch(&self, now: Ms) {
+        self.last_write_ms.store(now.0, Ordering::Relaxed);
         self.touches.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -308,8 +342,10 @@ impl LeaseView {
     }
 
     pub fn status(&self) -> constellation_control::proto::types::LeaseStatus {
-        let now = now_unix_ms();
-        let until = self.valid_until_ms.load(Ordering::Relaxed);
+        // On the honour clock, the one the lease is judged on (plan 43
+        // C7-H1): what is left is what this node will honour.
+        let now = protocol().honour().0;
+        let until = self.valid_until_honour.load(Ordering::Relaxed);
         constellation_control::proto::types::LeaseStatus {
             held: until > now,
             holder: self.holder.load(Ordering::Relaxed),
@@ -337,6 +373,60 @@ mod tests {
                 .await
                 .unwrap()
         })
+    }
+
+    /// Plan 43 C7-H1 (2/4): the view judges the lease the core mirrored, and
+    /// the liveness proof a strict read needs, on the honour clock: a
+    /// backward wall step of 3 s, a hundred milliseconds before either ends,
+    /// does not give it 3 s more (`step_test_wall` moves this thread's test
+    /// clock as a wall step does). Fails on the parent: both were wall
+    /// values compared with the stepped-back wall clock.
+    #[test]
+    fn usable_ends_at_the_honour_end_after_a_backward_step() {
+        let cfg = Config::defaults(7, 1);
+        let start = crate::locks::now();
+        let mut state = LeaseState::default();
+        let lease = state.granted_lease(start, &cfg, None, false);
+        state.adopt(start, lease, tag(), None);
+        let view = LeaseView::default();
+        view.mirror(&state, start, &cfg, false);
+        let margin = expiry_margin_ms();
+        let ttl = cfg.ttl_ms as i64;
+        crate::locks::advance_test_clock(ttl - margin - 100);
+        crate::locks::step_test_wall(-3_000);
+        let at = crate::locks::now();
+        assert!(view.usable_at(at.honour));
+        crate::locks::advance_test_clock(101);
+        let at = crate::locks::now();
+        assert!(
+            !view.usable_at(at.honour),
+            "usable past its honour end because the wall clock stepped back"
+        );
+        // What the parent judged: the wall expiry against the wall clock.
+        let wall_expiry = start.wall.0 + ttl;
+        assert!(wall_expiry - at.wall.0 > margin, "the old rule says usable");
+        // The liveness proof: fresh within the window of its send.
+        let view = LeaseView::default();
+        let renewed = crate::locks::now();
+        let mut state = LeaseState::default();
+        let lease = state.granted_lease(renewed, &cfg, None, false);
+        state.adopt(renewed, lease, tag(), None);
+        view.mirror(&state, renewed, &cfg, false);
+        let sent = renewed.honour;
+        view.set_liveness(true, sent);
+        let w = cfg.backup_takeover_ms as i64;
+        let waited = (crate::locks::now().honour.since(sent) + w - 100) as u64;
+        crate::locks::advance_test_clock(waited as i64);
+        crate::locks::step_test_wall(-3_000);
+        assert!(
+            view.reads_locally_at(crate::locks::now().honour),
+            "inside the window"
+        );
+        crate::locks::advance_test_clock(200);
+        assert!(
+            !view.reads_locally_at(crate::locks::now().honour),
+            "fresh past its window because the wall clock stepped back"
+        );
     }
 
     /// Plan 43 C7-H2: what holds back a release, as the upgrade's handover
@@ -372,25 +462,25 @@ mod tests {
         let now = Ms(now_unix_ms());
         let view = LeaseView::default();
         let mut state = LeaseState::default();
-        view.mirror(&state, now, &cfg, false);
+        view.mirror(&state, Now::same(now.0), &cfg, false);
         assert!(!view.usable());
         assert!(view.admit().is_none());
 
         let lease = state.granted_lease(Now::same(now.0), &cfg, None, false);
         state.adopt(Now::same(now.0), lease, tag(), None);
-        view.mirror(&state, now, &cfg, false);
+        view.mirror(&state, Now::same(now.0), &cfg, false);
         assert!(view.usable());
         assert!(view.open_for_new_mutation());
         assert_eq!(view.status().holder, 7);
 
         state.releasing = true;
-        view.mirror(&state, now, &cfg, false);
+        view.mirror(&state, Now::same(now.0), &cfg, false);
         assert!(view.usable());
         assert!(view.admit().is_none(), "releasing closes new mutations");
         state.releasing = false;
 
         state.begin_handoff_pause(Now::same(now.0), &cfg);
-        view.mirror(&state, now, &cfg, false);
+        view.mirror(&state, Now::same(now.0), &cfg, false);
         assert!(view.usable());
         assert!(!view.open_for_new_mutation(), "paused for a handoff");
         state.pause_until = Ms(0);
@@ -404,14 +494,14 @@ mod tests {
             backup_tail_epoch: None,
             shippable: false,
         });
-        view.mirror(&state, now, &cfg, false);
+        view.mirror(&state, Now::same(now.0), &cfg, false);
         assert!(view.gate_pending());
         assert!(view.admit().is_none());
         state.gate = None;
 
         state.released();
         state.adopt_epoch_hold(Now::same(now.0), 3);
-        view.mirror(&state, now, &cfg, false);
+        view.mirror(&state, Now::same(now.0), &cfg, false);
         assert!(view.usable() && view.open_for_new_mutation());
         assert_eq!(view.status().epoch, 3);
     }
@@ -426,7 +516,7 @@ mod tests {
         let mut state = LeaseState::default();
         let lease = state.granted_lease(Now::same(now.0), &cfg, None, false);
         state.adopt(Now::same(now.0), lease, tag(), None);
-        view.mirror(&state, now, &cfg, false);
+        view.mirror(&state, Now::same(now.0), &cfg, false);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_time()
@@ -460,7 +550,8 @@ mod tests {
 /// round trip, and the core streams it from the journal.
 #[derive(Debug, Default)]
 pub struct DelegateView {
-    /// `(dir, gen, honoured until unix ms, stopped)`.
+    /// `(dir, gen, honoured until, stopped)`: `until` on this node's honour
+    /// clock (plan 43 C7-H1).
     entries: std::sync::Mutex<Vec<(u64, u64, i64, bool)>>,
     /// Ops the FUSE fast path executed here as the delegate (the core's
     /// `deleg_executed` counts the ones that went through it).
@@ -526,8 +617,9 @@ impl DelegateView {
     /// admissions in flight, so it is not looked at.
     pub fn honours(&self, gen: u64) -> bool {
         // The clock the lock and fence decisions read (a unit test's
-        // `advance_test_clock` included), as the check at the write does.
-        let now = crate::locks::now_ms();
+        // `advance_test_clock` included), as the check at the write does:
+        // read afresh, F1 is "judged at the write".
+        let now = crate::locks::now().honour.0;
         self.entries
             .lock()
             .unwrap()
@@ -622,6 +714,7 @@ impl DelegateView {
         &self,
         meta: &constellation_meta::Meta,
         keys: &constellation_meta::TouchSet,
+        now: Now,
     ) -> Option<DelegateAdmission<'_>> {
         let g = self.entries.lock().unwrap();
         if g.is_empty() || self.gated.load(std::sync::atomic::Ordering::Relaxed) {
@@ -632,7 +725,7 @@ impl DelegateView {
         else {
             return None;
         };
-        let now = now_unix_ms();
+        let now = now.honour.0;
         // Counted before the check under the same lock a `stop` takes:
         // once `stop` returns, no new admission of that generation
         // exists and every earlier one is counted.

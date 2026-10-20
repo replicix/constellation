@@ -16,9 +16,12 @@
 //! - [`WaitMs`] is WAIT: monotone, never over-counts, ignores every wall
 //!   step. A waiter's stamps and liveness timers.
 //!
-//! The core's own code does not use the second and third yet: every site
-//! reads `now.wall` until the commits that convert them (plan 43 C7-H1,
-//! 2/4 to 4/4), so the plumbing changes no behaviour without a step.
+//! The holder's side (plan 43 C7-H1 2/4) reads `now.honour`: its lease
+//! (`LeaseState::honour_until`, from the body's `holder_expires_ms` and
+//! `holder_clock`), lock grants, delegation, read delegations, the S3
+//! liveness proof, the beat's stamps. The waiter's and the liveness timers'
+//! sites still read `now.wall` until the commits that convert them (3/4 and
+//! 4/4).
 
 /// A node id, as in `nodes/<id>` and `Lease::holder`.
 pub type NodeId = u64;

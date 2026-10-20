@@ -188,7 +188,9 @@ impl crate::locks::LockFlush for View {
                 .map(|h| {
                     constellation_meta::locks::LockTag(vec![constellation_meta::locks::LockToken {
                         grant,
-                        until_ms: h.until_ms,
+                        // Minted on the wall clock from the honour window,
+                        // now (plan 43 C7-H1, R8).
+                        until_ms: crate::locks::now().wall_of_honour(h.until).0,
                     }])
                 })
                 .unwrap_or_default();

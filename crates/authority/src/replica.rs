@@ -12,7 +12,7 @@
 //! The method set is exactly what the decision logic touches, and nothing
 //! else in `Meta` is reachable from the core.
 
-use crate::ids::{Epoch, NodeId, Seq};
+use crate::ids::{Epoch, NodeId, Now, Seq};
 use constellation_fs_core::Ino;
 use constellation_meta::delegation::{DelegationTable, Ownership};
 use constellation_meta::locks::LockTag;
@@ -38,13 +38,13 @@ pub trait Replica {
     /// Validate and journal `op` under `rid` (`execute_mutate`). Plan 30
     /// §M14 phase 2: refused with `MetaError::LockLapsed`, executing
     /// nothing, when a grant the fencing token `tag` names is no longer
-    /// live at `now_ms` (`execute_tagged`).
+    /// live at `now` (`execute_tagged`).
     fn execute(
         &self,
         op: &MutateOp,
         rid: Option<Rid>,
         tag: &LockTag,
-        now_ms: i64,
+        now: Now,
     ) -> Result<Vec<LogRecord>, MetaError>;
     /// The records a same-tenure execution of `rid` produced, if still
     /// held (`Meta::recent_outcome`).
@@ -92,7 +92,7 @@ pub trait Replica {
         op: &MutateOp,
         rid: Rid,
         tag: &LockTag,
-        now_ms: i64,
+        now: Now,
     ) -> Result<Vec<LogRecord>, MetaError>;
     /// Journal a refusal (`Refused { rid, code }`) with its position.
     fn journal_inbox_refusal(
@@ -232,7 +232,7 @@ pub trait Replica {
         gen: u64,
         deps: Position,
         tag: &LockTag,
-        now_ms: i64,
+        now: Now,
     ) -> Result<(Vec<LogRecord>, u64), MetaError>;
     /// The root appends a delegate's transaction with its origin
     /// (`Ok(false)`: the rid was completed already).
@@ -546,9 +546,9 @@ impl Replica for Meta {
         op: &MutateOp,
         rid: Option<Rid>,
         tag: &LockTag,
-        now_ms: i64,
+        now: Now,
     ) -> Result<Vec<LogRecord>, MetaError> {
-        execute_tagged(self, op, rid, tag, now_ms)
+        execute_tagged(self, op, rid, tag, now)
     }
 
     fn recent_outcome(&self, rid: Rid) -> Option<Vec<LogRecord>> {
@@ -623,10 +623,10 @@ impl Replica for Meta {
         op: &MutateOp,
         rid: Rid,
         tag: &LockTag,
-        now_ms: i64,
+        now: Now,
     ) -> Result<Vec<LogRecord>, MetaError> {
         let armed = Meta::pending_inbox_ack(self, ack);
-        let r = execute_tagged(self, op, Some(rid), tag, now_ms);
+        let r = execute_tagged(self, op, Some(rid), tag, now);
         drop(armed);
         r
     }
@@ -872,9 +872,9 @@ impl Replica for Meta {
         gen: u64,
         deps: Position,
         tag: &LockTag,
-        now_ms: i64,
+        now: Now,
     ) -> Result<(Vec<LogRecord>, u64), MetaError> {
-        let (records, idx) = Meta::delegate_execute(self, op, rid, gen, deps, tag, now_ms)?;
+        let (records, idx) = Meta::delegate_execute(self, op, rid, gen, deps, tag, now)?;
         self.session().note_stream(gen, idx);
         Ok((records, idx))
     }

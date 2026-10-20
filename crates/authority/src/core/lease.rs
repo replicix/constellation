@@ -8,7 +8,7 @@
 //! simulation's paused clock governs expiry end to end.
 
 use super::Config;
-use crate::ids::{Epoch, Ms, NodeId, Now};
+use crate::ids::{Epoch, HonourMs, Ms, NodeId, Now};
 use constellation_store_s3::lease::LEASE_VERSION;
 use constellation_store_s3::{AckPolicy, Lease, LeaseTag};
 
@@ -159,6 +159,30 @@ impl LeaseState {
         self.releasing = false;
     }
 
+    /// Plan 43 C7-H1 (R6): the end of this node's own lease on its
+    /// **honour** clock, from the body it holds (`Lease::holder_expires_ms`).
+    /// `Some` only for a body this process wrote (`holder == node_id`,
+    /// `holder_clock == cfg.clock_id`, an end set): the anchor travels in the
+    /// body, so every adoption of one needs no bookkeeping. A body of an
+    /// earlier incarnation of this node, or another node's, carries another
+    /// clock's reading and means nothing here: `None` is "not usable" and
+    /// "renew now" until this node's next own CAS writes fresh fields (a
+    /// restarted holder re-adopts through a claim CAS, which does). Every
+    /// decision on the lease's own window (`usable`, `holds_unexpired`,
+    /// `renew_due`, the grant and lock caps) reads this, never
+    /// `expires_unix_ms`: a backward wall step must not extend what the
+    /// holder honours, and a forward one ends it with the honour clock.
+    pub fn honour_until(&self, cfg: &Config) -> Option<HonourMs> {
+        let (lease, _) = self.held.as_ref()?;
+        honour_end_of(lease, cfg)
+    }
+
+    /// What is left of the held lease on the honour clock (`None`: no
+    /// honour end, see [`Self::honour_until`]; negative: lapsed).
+    pub fn honour_left_ms(&self, now: Now, cfg: &Config) -> Option<i64> {
+        self.honour_until(cfg).map(|h| h.since(now.honour))
+    }
+
     /// `LeaseView::usable`: held, not lost, and enough margin left.
     pub fn usable(&self, now: Now, cfg: &Config) -> bool {
         if self.lost {
@@ -167,13 +191,8 @@ impl LeaseState {
         if self.epoch_hold.is_some() {
             return true;
         }
-        match &self.held {
-            Some((lease, _)) => {
-                lease.expires_in_ms(now.wall.0) > cfg.expiry_margin_ms as i64
-                    && lease.holder == cfg.node_id
-            }
-            None => false,
-        }
+        self.honour_left_ms(now, cfg)
+            .is_some_and(|left| left > cfg.expiry_margin_ms as i64)
     }
 
     /// EC2 follow-up 3a: this node holds the lease and it has not
@@ -183,9 +202,7 @@ impl LeaseState {
     pub fn holds_unexpired(&self, now: Now, cfg: &Config) -> bool {
         !self.lost
             && self.epoch_hold.is_none()
-            && self.held.as_ref().is_some_and(|(lease, _)| {
-                lease.holder == cfg.node_id && lease.expires_in_ms(now.wall.0) > 0
-            })
+            && self.honour_left_ms(now, cfg).is_some_and(|left| left > 0)
     }
 
     /// `LeaseView::fenced`: a release in its final section, or the
@@ -419,7 +436,11 @@ impl LeaseState {
             partition: cfg.partition.clone(),
             holder: cfg.node_id,
             epoch,
+            // Plan 43 C7-H1 (R5): the wall end for everyone else, the
+            // honour end for this node alone, both from the send's reading.
             expires_unix_ms: now.wall.plus(cfg.ttl_ms).0,
+            holder_expires_ms: now.honour.plus(cfg.ttl_ms).0,
+            holder_clock: cfg.clock_id,
             released: false,
             wanted_by: Vec::new(),
             backups: Vec::new(),
@@ -466,6 +487,8 @@ impl LeaseState {
     pub fn renewed_lease(&self, now: Now, cfg: &Config, mine: &Lease) -> Lease {
         Lease {
             expires_unix_ms: now.wall.plus(cfg.ttl_ms).0,
+            holder_expires_ms: now.honour.plus(cfg.ttl_ms).0,
+            holder_clock: cfg.clock_id,
             released: false,
             ..mine.clone()
         }
@@ -564,6 +587,16 @@ impl LeaseState {
         self.last_seen = Some(lease.clone());
         self.last_seen_at = Some(now.wall);
     }
+}
+
+/// Plan 43 C7-H1 (R6): `lease`'s end on this node's honour clock when this
+/// process wrote it (see [`LeaseState::honour_until`]); `None` for any other
+/// body (another holder, another incarnation, a fenced or foreign one).
+pub(crate) fn honour_end_of(lease: &Lease, cfg: &Config) -> Option<HonourMs> {
+    (lease.holder == cfg.node_id
+        && lease.holder_clock == cfg.clock_id
+        && lease.holder_expires_ms != 0)
+        .then_some(HonourMs(lease.holder_expires_ms))
 }
 
 /// Plan 30 §M9: how long past a `Backup` lease's expiry a node that is not

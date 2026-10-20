@@ -2106,6 +2106,24 @@ step cannot move; four commits) and gets its own reviews:
   ask-again fix) turns a client-reported wait (measured on an `Instant`)
   into a WALL queue key, so a step on the owner reorders the queue
   (fairness, not exclusion): a wait-side site for commit 3.
+  *Commit 2 landed* (PROGRESS, "plan 43 C7-H1, commit 2 of 4"): the honour
+  half. The lease body carries `holder_expires_ms` and `holder_clock`; a
+  holder's lease, lock grants, delegation, read delegations, liveness proof
+  and beat stamps are on its honour clock; tokens are minted on the wall
+  clock from the honour window, with the holder's own release wait on a
+  wait-clock copy; the beat carries the holder's honour readings with its
+  clock id and the successor keeps them per id. `locks-locker-step-back` and
+  `strict-reader-step-back` went to 0 of 2 000, `locks-holder-step-back-
+  sealed` to 1 (a stepped-back node's wall expiry read by claimants: C7b).
+  **One finding for the next commits:** the honour clock does not close the
+  forward step of the *holder* in the beat cap (Appendix B row 27). It counts
+  a forward step as elapsed time, so after the step `sent` has jumped by `J`
+  while the end of a lease written before it has not: grants made before the
+  step are capped by `X − sent`, early by `J`. Closing it needs the pair
+  `(sent, X)` on a clock that ignores forward steps (the wait clock, with an
+  end stamped on it in the lease body) or the honour clock's cumulative jump
+  carried in the beat and the body; the simulator cannot reach it (the
+  failing seeds of `fast-takeover-holder-step-forward` have no seal).
   *Not in C7-H1:* rate (ρ), suspend in the sim, the models' clocks and
   boot-id horizons (C7a); every cross-node compare (C7b). The models have
   one clock per node and cannot express the split; C7a reworks them with

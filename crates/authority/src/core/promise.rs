@@ -50,7 +50,7 @@
 use super::{Core, S3For, Timer};
 use crate::action::{Action, S3Op};
 use crate::event::{Carrier, PeerMsg, S3Result};
-use crate::ids::{Epoch, NodeId, Now, OpId, TimerId};
+use crate::ids::{Epoch, HonourMs, NodeId, Now, OpId, TimerId};
 use crate::replica::Replica;
 use constellation_store_s3::heartbeat::{
     effective_slack, takeover_check, Promise, PromiseConfig, PROMISE_TTL_LEASE_DIVISOR,
@@ -231,6 +231,12 @@ pub(crate) struct PromiseState {
     /// landed. Empty whenever the grants were dropped
     /// (`lock_on_lease_gone`).
     pub closed_tenure: Vec<(NodeId, Epoch, i64)>,
+    /// Plan 43 C7-H1 (R10): the honour-clock end of each object of
+    /// `closed_tenure` that this process wrote (`Lease::holder_expires_ms`
+    /// under this node's clock id), by the same key. The key stays the
+    /// wall identity; what the tenure may still be honoured for is read
+    /// from here (a missing entry has no honour end: expired).
+    pub closed_honour: std::collections::BTreeMap<(NodeId, Epoch, i64), HonourMs>,
     /// The S3 lease object (and its tag) this node held at that close,
     /// while it is in `closed_tenure`: what it claims for a continuation
     /// epoch until the re-claim lands (`epoch_claim_view`), and holds
@@ -599,9 +605,9 @@ impl Core {
             .closed_tenure
             .iter()
             .filter(|(holder, epoch, _)| *holder == me && *epoch == l.epoch)
-            .map(|(_, _, expires)| *expires)
+            .map(|key| self.closed_honour_end(key))
             .min()?;
-        (earliest - now.wall.0 > self.cfg.expiry_margin_ms as i64).then_some((l, tag))
+        (earliest.since(now.honour) > self.cfg.expiry_margin_ms as i64).then_some((l, tag))
     }
 
     /// [`Self::epoch_closed_claim`] without its clock: the latest object
@@ -622,9 +628,14 @@ impl Core {
                     .contains(&(l.holder, l.epoch, l.expires_unix_ms))
         })?;
         let mut latest = l.clone();
-        for (holder, epoch, expires) in &self.pr.closed_tenure {
+        for key @ (holder, epoch, expires) in &self.pr.closed_tenure {
             if *holder == me && *epoch == l.epoch {
                 latest.expires_unix_ms = latest.expires_unix_ms.max(*expires);
+                // The honour end of the merged claim is the latest of the
+                // objects it merges, as its wall expiry is (plan 43 C7-H1).
+                if let Some(end) = self.pr.closed_honour.get(key) {
+                    latest.holder_expires_ms = latest.holder_expires_ms.max(end.0);
+                }
             }
         }
         Some((latest, tag.clone()))
@@ -689,6 +700,9 @@ impl Core {
                 if !tenure.contains(&it) {
                     tenure.push(it);
                 }
+                if let Some(end) = super::lease::honour_end_of(l, &self.cfg) {
+                    self.pr.closed_honour.insert(it, end);
+                }
                 object = self.lease.held.clone();
             }
             if self.lease.epoch_held() {
@@ -696,6 +710,31 @@ impl Core {
                     let c = (c.node, c.epoch, c.expires_unix_ms);
                     if !tenure.contains(&c) {
                         tenure.push(c);
+                    }
+                    // The carried lease is the claim of this tenure's objects
+                    // (`epoch_closed_latest`: the latest body with the
+                    // latest wall expiry among them): its honour end is the
+                    // latest of theirs, or that of the held or closed body
+                    // it names.
+                    if !self.pr.closed_honour.contains_key(&c) {
+                        let known = self
+                            .pr
+                            .closed_honour
+                            .iter()
+                            .filter(|(k, _)| k.0 == c.0 && k.1 == c.1)
+                            .map(|(_, end)| *end)
+                            .max();
+                        let body = self
+                            .lease
+                            .held
+                            .iter()
+                            .chain(self.pr.closed_lease.iter())
+                            .filter(|(l, _)| l.holder == c.0 && l.epoch == c.1)
+                            .filter_map(|(l, _)| super::lease::honour_end_of(l, &self.cfg))
+                            .max();
+                        if let Some(end) = known.max(body) {
+                            self.pr.closed_honour.insert(c, end);
+                        }
                     }
                 }
             }
@@ -705,6 +744,8 @@ impl Core {
             object.filter(|(l, _)| tenure.contains(&(l.holder, l.epoch, l.expires_unix_ms)));
         let added = tenure.len() > before;
         self.pr.closed_tenure = tenure;
+        let kept = &self.pr.closed_tenure;
+        self.pr.closed_honour.retain(|key, _| kept.contains(key));
         if !self.pr.closed_tenure.is_empty() {
             let grants = replica.locks().grants_len();
             if grants > 0 && added {
@@ -744,11 +785,13 @@ impl Core {
             );
             if !hold {
                 self.pr.closed_tenure.clear();
+                self.pr.closed_honour.clear();
                 self.pr.closed_lease = None;
             }
             return;
         }
         self.pr.closed_tenure.clear();
+        self.pr.closed_honour.clear();
         self.pr.closed_lease = None;
         // Their holders honour them until they lapse (a peer's, and this
         // node's own lockers'): nothing is granted over them meanwhile,
@@ -793,6 +836,9 @@ impl Core {
                 "a lease CAS of a kept tenure is in doubt: its object is the tenure's too"
             );
             self.pr.closed_tenure.push(s);
+            if let Some(end) = super::lease::honour_end_of(sent, &self.cfg) {
+                self.pr.closed_honour.insert(s, end);
+            }
         }
     }
 
@@ -819,11 +865,20 @@ impl Core {
         !self.lease.lost
             && self.lease.held.is_none()
             && !self.lease.epoch_held()
-            && self
-                .pr
-                .closed_tenure
-                .iter()
-                .any(|(_, _, expires)| *expires - self.cfg.expiry_margin_ms as i64 > now.wall.0)
+            && self.pr.closed_tenure.iter().any(|key| {
+                self.closed_honour_end(key).since(now.honour) > self.cfg.expiry_margin_ms as i64
+            })
+    }
+
+    /// Plan 43 C7-H1 (R10): the honour-clock end of one object of the
+    /// closed tenure; an object with none recorded (not written by this
+    /// process, or carried without its body) has already ended.
+    fn closed_honour_end(&self, key: &(NodeId, Epoch, i64)) -> HonourMs {
+        self.pr
+            .closed_honour
+            .get(key)
+            .copied()
+            .unwrap_or(HonourMs(0))
     }
 
     /// While the re-claim is pending, the end of the authority the close
@@ -834,7 +889,7 @@ impl Core {
     /// the epoch acquires nothing while it is open, anyone else only
     /// past the expiry. `None` with a hold handed over in the epoch among
     /// them (another node's lease object).
-    pub(crate) fn epoch_reclaim_expires(&self, now: Now) -> Option<i64> {
+    pub(crate) fn epoch_reclaim_expires(&self, now: Now) -> Option<HonourMs> {
         if !self.epoch_reclaim_pending(now)
             || self
                 .pr
@@ -847,7 +902,11 @@ impl Core {
         // The minimum over every entry, although the re-claim is pending
         // while any one is unexpired: an expired one makes the cap
         // negative, which the renewal refuses (`lock_renew_one`: `NotOwner`).
-        self.pr.closed_tenure.iter().map(|(_, _, e)| *e).min()
+        self.pr
+            .closed_tenure
+            .iter()
+            .map(|key| self.closed_honour_end(key))
+            .min()
     }
 
     /// This node lets its epoch hold go for good (a handoff, the close):

@@ -1244,7 +1244,11 @@ impl View {
             // `execute_mutate`; it recalls read delegations on the file
             // before the close returns, like every other local write.
             if let Some(h) = &self.sync {
-                self.recall_after_local_inos(h, vec![ino]);
+                self.recall_after_local_inos(
+                    h,
+                    vec![ino],
+                    constellation_authority::Ms(constellation_store_s3::lease::now_unix_ms()),
+                );
             }
         } else if let Err(errno) = self.commit_manifest_forwarded(
             ino,
@@ -1302,7 +1306,7 @@ impl View {
                 // fencing token too (checked here, recorded for a replay).
                 let tag = crate::locks::current_tag().map_err(|_| MutateFail::LockLapsed)?;
                 self.meta
-                    .with_lock_tag(&tag, crate::locks::now_ms(), || {
+                    .with_lock_tag(&tag, crate::locks::now(), || {
                         self.meta.set_manifest_dirty(
                             ino,
                             Some(&base.encode()),

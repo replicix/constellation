@@ -473,9 +473,12 @@ pub async fn sample_authority(cluster: Arc<Cluster>) {
             if v.epoch_held {
                 holds.push(id);
             }
-            if let Some((epoch, expires)) = v.s3_held {
+            if let Some((epoch, honour_end)) = v.s3_held {
                 let margin = (cluster.env.config)(id, 1).expiry_margin_ms as i64;
-                if node.clock.wall().0 < expires - margin {
+                // `LeaseView::usable`: the honour end against the node's
+                // honour clock (plan 43 C7-H1; the one checker that reads a
+                // node clock on purpose).
+                if honour_end != 0 && node.clock.honour().0 < honour_end - margin {
                     leases.push((id, epoch));
                 }
             }

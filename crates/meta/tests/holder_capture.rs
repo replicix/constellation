@@ -15,6 +15,7 @@ use constellation_meta::{
     execute_mutate, CloneSpec, LogRecord, Meta, MetaStore, MutateOp, PublishBasis, Rid,
     SetXattrMode, SnapshotRow, TouchSet,
 };
+use constellation_types::clock::Now;
 use std::collections::BTreeMap;
 
 fn rid(seq: u64) -> Rid {
@@ -581,7 +582,7 @@ fn a_segment_goes_under_a_delegates_stream_only_where_it_conflicts() {
                 gen,
                 Default::default(),
                 &Default::default(),
-                0,
+                Now::same(0),
             )
             .unwrap();
         delegate_records.extend(records);
@@ -1110,7 +1111,7 @@ fn a_tagged_row_stranded_past_its_lease_replays_with_its_token_and_is_refused() 
         uid: 0,
         gid: 0,
     };
-    execute_tagged(&meta, &op, Some(rid(1)), &tag, 1_000).unwrap();
+    execute_tagged(&meta, &op, Some(rid(1)), &tag, Now::same(1_000)).unwrap();
     meta.set_holder_epoch(0);
     let successor = vec![LogRecord::Create {
         parent: ROOT_INO,
@@ -1141,7 +1142,7 @@ fn a_tagged_row_stranded_past_its_lease_replays_with_its_token_and_is_refused() 
         &queued[0].op,
         Some(rid(1)),
         &queued[0].lock_tag,
-        6_000,
+        Now::same(6_000),
     );
     assert!(matches!(r, Err(MetaError::LockLapsed)), "{r:?}");
     assert!(next.lookup(ROOT_INO, "ref").unwrap().is_none());

@@ -766,29 +766,48 @@ pub enum Payload {
 
 /// One beat of the holder's off-core heartbeat ([`Payload::HolderAlive`]):
 /// `seq` numbers the beats (one per interval, from 1, per process),
-/// `sent_unix_ms` is the holder's clock when it sent this one, and
-/// `expires_unix_ms` the expiry of the lease it beats for (the beats stop
-/// there). A watcher tells from the first two whether beats it heard late
-/// were sent on time (held up on the way, or by its own runtime) or late
-/// (the holder's process itself was held up), and lengthens its silence
-/// window while either has happened lately; from the third, that silence
-/// at the expiry is the lease ending, and is not given that grace.
+/// `sent_ms` is the holder's **honour** clock when it sent this one
+/// (`ProtocolClock::honour`) and `clock` the id of that clock
+/// (`ProtocolClock::id`: a restarted holder is a new process with a new
+/// clock); `expires_unix_ms` is the expiry of the lease it beats for on the
+/// lease body's wall clock (the beats stop at the holder's honour end of it,
+/// `expires_ms`). A watcher tells from `seq` and `sent_ms` whether beats it
+/// heard late were sent on time (held up on the way, or by its own runtime)
+/// or late (the holder's process itself was held up), and lengthens its
+/// silence window while either has happened lately; from `expires_unix_ms`,
+/// that silence at the expiry is the lease ending, and is not given that
+/// grace.
 ///
-/// Plan 43 C7-F F-a: `guard_unix_ms` and `sent_unix_ms` also let the
-/// watcher, once it has taken the lease over, place the end of what the
-/// holder's grants could still be honoured on its own clock
-/// (`Core::beat_cap`): a difference on the holder's clock added to the
-/// beat's arrival stamp on the watcher's.
+/// Plan 43 C7-F F-a / C7-H1: `sent_ms`, `expires_ms` and `guard_ms` are
+/// readings of one clock of the holder, `clock`, and let the watcher, once it
+/// has taken the lease over, place the end of what the holder's grants could
+/// still be honoured on its own clock (`Core::beat_cap`): a difference on the
+/// holder's clock added to the beat's arrival stamp on the watcher's. The
+/// holder's honour clock follows a forward wall step and ignores a backward
+/// one, so that difference is not moved by a step. The wire fields keep their
+/// positions: the three that changed meaning are in place, the new ones
+/// are appended.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Beat {
     pub seq: u64,
-    pub sent_unix_ms: i64,
+    /// The holder's honour clock at send.
+    pub sent_ms: i64,
+    /// The lease body's wall expiry (`Lease::expires_unix_ms`): the seal
+    /// watch's `known_expiry` (plan 43 Appendix B row 24, C7b). Never mixed
+    /// with the honour values.
     pub expires_unix_ms: i64,
-    /// The latest instant on the holder's clock at which grants it waits
-    /// out but its lease does not cap may still be honoured: its takeover
-    /// floor, its lock and read quarantines, its subtree graces. 0: none;
-    /// `i64::MAX`: unknown (its takeover gate is pending).
-    pub guard_unix_ms: i64,
+    /// What the holder waits out that its lease does not cap (its takeover
+    /// floor, its lock and read quarantines, its subtree graces), as the
+    /// latest instant on the same honour clock at which grants it protects
+    /// may still be honoured. 0: none; `i64::MAX`: unknown (its takeover
+    /// gate is pending).
+    pub guard_ms: i64,
+    /// The end of the lease the holder honours, on the same honour clock
+    /// (`Lease::holder_expires_ms` of the lease it holds; 0: none).
+    pub expires_ms: i64,
+    /// `ProtocolClock::id` of the clock `sent_ms`, `guard_ms` and
+    /// `expires_ms` are on.
+    pub clock: u64,
 }
 
 /// Plan 30 §M14: `constellation_authority::LockOutcome` on the wire.
@@ -1438,18 +1457,22 @@ mod tests {
         );
     }
 
-    /// Plan 43 C7-F F-a: the beat's guard rides at the end of the struct
-    /// (the earlier fields keep their encoding) and survives signing and
-    /// framing, the unknown value (`i64::MAX`) included.
+    /// Plan 43 C7-F F-a / C7-H1: the beat's guard rides after the three
+    /// fields it was added to, and the honour end and the clock id append to
+    /// that (the earlier fields keep their positions in the encoding), and
+    /// all survive signing and framing, the unknown guard (`i64::MAX`)
+    /// included.
     #[test]
-    fn a_beat_carries_its_guard_at_the_end() {
+    fn a_beat_carries_its_guard_and_clock_at_the_end() {
         let k = key();
-        for guard_unix_ms in [0, 123_456_789, i64::MAX] {
+        for guard_ms in [0, 123_456_789, i64::MAX] {
             let beat = Beat {
                 seq: 7,
-                sent_unix_ms: 1_000,
+                sent_ms: 1_000,
                 expires_unix_ms: 7_000,
-                guard_unix_ms,
+                guard_ms,
+                expires_ms: 6_500,
+                clock: 9,
             };
             let payload = Payload::HolderAlive {
                 holder: 1,
@@ -1463,20 +1486,22 @@ mod tests {
             let back = Signed::decode(&frame[4..]).unwrap();
             assert_eq!(back.verify().unwrap().1, payload);
         }
-        // The first three fields are the encoding they had before the
-        // guard, the guard follows.
-        let head = postcard::to_stdvec(&(7u64, 1_000i64, 7_000i64)).unwrap();
+        // The first four fields keep their positions, the honour end and
+        // the clock id follow.
+        let head = postcard::to_stdvec(&(7u64, 1_000i64, 7_000i64, 42i64)).unwrap();
         let whole = postcard::to_stdvec(&Beat {
             seq: 7,
-            sent_unix_ms: 1_000,
+            sent_ms: 1_000,
             expires_unix_ms: 7_000,
-            guard_unix_ms: 42,
+            guard_ms: 42,
+            expires_ms: 6_500,
+            clock: 9,
         })
         .unwrap();
         assert!(whole.starts_with(&head));
         assert_eq!(
             whole[head.len()..],
-            postcard::to_stdvec(&42i64).unwrap()[..]
+            postcard::to_stdvec(&(6_500i64, 9u64)).unwrap()[..]
         );
     }
 

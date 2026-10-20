@@ -2327,7 +2327,7 @@ pub(crate) mod tests {
         let mut state = LeaseState::default();
         state.adopt_epoch_hold(Now::same(now.0), 3);
         let lease = Arc::new(LeaseView::default());
-        lease.mirror(&state, now, &cfg, false);
+        lease.mirror(&state, Now::same(now.0), &cfg, false);
         let (sync_tx, _sync_rx) = tokio::sync::mpsc::unbounded_channel();
         let host = EngineBatchHost {
             node_id: 2,

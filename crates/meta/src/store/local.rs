@@ -430,7 +430,7 @@ impl Meta {
     /// the generation's next stream index and the requester's `deps`.
     /// Returns the records and the index.
     ///
-    /// `tag`, `now_ms`: the op's fencing token, checked at `now_ms` on this
+    /// `tag`, `now`: the op's fencing token, checked at `now` on this
     /// node's clock ([`crate::mutate::execute_tagged`]).
     pub fn delegate_execute(
         &self,
@@ -439,10 +439,10 @@ impl Meta {
         gen: u64,
         deps: crate::session::Position,
         tag: &crate::locks::LockTag,
-        now_ms: i64,
+        now: constellation_types::clock::Now,
     ) -> Result<(Vec<LogRecord>, u64), MetaError> {
         let _d = journal::PendingDelegate::set(gen, None, deps);
-        let records = crate::mutate::execute_tagged(self, op, rid, tag, now_ms)?;
+        let records = crate::mutate::execute_tagged(self, op, rid, tag, now)?;
         let idx = self.delegate_idx(gen)?;
         Ok((records, idx))
     }
@@ -458,11 +458,11 @@ impl Meta {
         gen: u64,
         deps: crate::session::Position,
         tag: &crate::locks::LockTag,
-        now_ms: i64,
+        now: constellation_types::clock::Now,
         still_admitted: Box<dyn Fn() -> bool>,
     ) -> Result<(Vec<LogRecord>, u64), MetaError> {
         let _admission = journal::PendingAdmission::set(still_admitted);
-        self.delegate_execute(op, rid, gen, deps, tag, now_ms)
+        self.delegate_execute(op, rid, gen, deps, tag, now)
     }
 
     /// The highest stream index this node assigned under `gen` (0: none).
@@ -1422,6 +1422,7 @@ mod root_substitution_tests {
     use crate::rid::Rid;
     use crate::MetaStore;
     use constellation_fs_core::types::ROOT_INO;
+    use constellation_types::clock::Now;
 
     /// Plan 30 M5 round 3: a substituted (log-prefix) publish with the
     /// root directory behind an unshipped local transaction must publish
@@ -1516,7 +1517,7 @@ mod root_substitution_tests {
                     5,
                     Default::default(),
                     &tag,
-                    0,
+                    Now::same(0),
                 )
                 .unwrap();
             assert_eq!(idx, n);
@@ -1548,7 +1549,7 @@ mod root_substitution_tests {
                 gen,
                 Default::default(),
                 &tag,
-                0,
+                Now::same(0),
             );
             assert!(
                 matches!(refused, Err(MetaError::NotAdmitted)),
@@ -1565,7 +1566,7 @@ mod root_substitution_tests {
             11,
             Default::default(),
             &tag,
-            0,
+            Now::same(0),
         )
         .unwrap();
 
@@ -1579,7 +1580,7 @@ mod root_substitution_tests {
                 9,
                 Default::default(),
                 &tag,
-                0,
+                Now::same(0),
             )
             .unwrap();
         assert!(meta
@@ -1602,7 +1603,7 @@ mod root_substitution_tests {
             7,
             Default::default(),
             &tag,
-            0,
+            Now::same(0),
         );
         assert!(
             matches!(refused, Err(MetaError::NotAdmitted)),

@@ -1216,6 +1216,7 @@ impl Core {
             };
             match replica.strand_for_takeover(gate.epoch, &own_gens) {
                 Ok(stranded) => {
+                    self.lock_note_replay_pins(now, replica);
                     if stranded.any() {
                         tracing::warn!(
                             node = self.cfg.node_id,
@@ -1404,6 +1405,8 @@ impl Core {
                 .map_err(|e| e.to_string())?;
             rolled += stranded.locals as u64;
             self.stats.speculation_rolled_back += (stranded.shadows + stranded.hints) as u64;
+            let clk = self.clk;
+            self.lock_note_replay_pins(clk, replica);
         }
         if let Some(Job {
             what: What::Round { recover_rolled, .. },
@@ -1693,7 +1696,12 @@ impl Core {
                 Some((lease, _)) => {
                     self.ship.renew_now
                         || self.ship.renew_early_of == Some(lease.expires_unix_ms)
-                        || lease.expires_in_ms(now.wall.0) <= (self.cfg.ttl_ms / 2) as i64
+                        // C7-H1 (R6): on the honour clock; no honour end
+                        // (a body of an earlier incarnation) is due now.
+                        || self
+                            .lease
+                            .honour_left_ms(now, &self.cfg)
+                            .is_none_or(|left| left <= (self.cfg.ttl_ms / 2) as i64)
                 }
                 None => false,
             }
@@ -1710,7 +1718,9 @@ impl Core {
         if self.ship.renew_early_of == Some(lease.expires_unix_ms) {
             return None;
         }
-        let left = lease.expires_in_ms(now.wall.0) - (self.cfg.ttl_ms / 2) as i64;
+        // The honour remainder: a duration, armed as a wait-clock poll
+        // (`next_poll_ms`); no honour end is due already (`None`).
+        let left = self.lease.honour_left_ms(now, &self.cfg)? - (self.cfg.ttl_ms / 2) as i64;
         (left > 0).then_some(left as u64)
     }
 
@@ -1737,7 +1747,13 @@ impl Core {
             return;
         };
         let expires = lease.expires_unix_ms;
-        let gain = self.cfg.ttl_ms as i64 - lease.expires_in_ms(now.wall.0);
+        // Honour left (none: nothing left to count on, a full TTL to gain).
+        let left = self
+            .lease
+            .honour_left_ms(now, &self.cfg)
+            .unwrap_or(0)
+            .max(0);
+        let gain = self.cfg.ttl_ms as i64 - left;
         if self.ship.renew_early_of == Some(expires) || gain < self.cfg.expiry_margin_ms as i64 {
             return;
         }
@@ -3607,7 +3623,12 @@ impl Core {
                     Some((cur, tag))
                         if cur.holder == self.cfg.node_id && cur.epoch == mine.epoch =>
                     {
-                        if final_probe || cur.released || cur.is_expired(now.wall.0) {
+                        // C7-H1: expired on this node's honour clock; a body
+                        // that carries no honour end of this process is
+                        // treated as expired (only the tag was stale).
+                        let honour_over = super::lease::honour_end_of(&cur, &self.cfg)
+                            .is_none_or(|end| now.honour >= end);
+                        if final_probe || cur.released || honour_over {
                             // Only the tag was stale (a retried PUT landing
                             // twice): adopt it and carry on.
                             self.lease.renewed(now, cur, tag);

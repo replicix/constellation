@@ -27,8 +27,27 @@ use tokio::sync::mpsc;
 /// A node's tap on the messages it receives (see [`Bus::taps`]).
 pub type Tap = Arc<dyn Fn(NodeId, &PeerMsg) + Send + Sync>;
 
+/// What a beat of the holder's off-core heartbeat carries (plan 43 C7-H1):
+/// the holder's honour clock reading when it sent it (`sent`) and its id
+/// (`clock`), the end of its lease and its guard on that clock, the lease
+/// body's wall expiry (`expires`), and the holder's wall reading `echo`,
+/// which the daemon's holder keeps in the closure that waits for the answer
+/// (`Event::BackupAlive.at`): the bus keeps it here by `(holder, backup,
+/// seq)`.
+#[derive(Clone, Copy, Debug)]
+pub struct BeatStamps {
+    pub clock: u64,
+    pub sent: i64,
+    pub holder_expires: i64,
+    pub guard: i64,
+    pub expires: i64,
+    pub echo: i64,
+}
+
 pub struct Bus {
     rng: Mutex<StdRng>,
+    /// The holder's wall stamp of each beat in flight, for the answer.
+    beat_echo: Mutex<BTreeMap<(NodeId, NodeId, u64), i64>>,
     delay: (u64, u64),
     drop_p: f64,
     partitions: Mutex<HashSet<(NodeId, NodeId)>>,
@@ -77,6 +96,7 @@ impl Bus {
     pub fn new(seed: u64, delay: (u64, u64), drop_p: f64) -> Arc<Self> {
         Arc::new(Self {
             rng: Mutex::new(StdRng::seed_from_u64(seed ^ 0xb05_b05)),
+            beat_echo: Mutex::new(BTreeMap::new()),
             delay,
             drop_p,
             partitions: Mutex::new(HashSet::new()),
@@ -358,7 +378,7 @@ impl Bus {
         (from, to): (NodeId, NodeId),
         epoch: u64,
         seq: u64,
-        (sent, expires, guard): (i64, i64, i64),
+        stamps: BeatStamps,
     ) {
         *self.sent.lock().unwrap() += 1;
         if self.beats_lost.load(std::sync::atomic::Ordering::Relaxed) {
@@ -368,6 +388,14 @@ impl Bus {
         if !self.deliverable(from, to) {
             *self.dropped.lock().unwrap() += 1;
             return;
+        }
+        {
+            let mut echo = self.beat_echo.lock().unwrap();
+            echo.insert((from, to, seq), stamps.echo);
+            // Bounded: a beat that was never answered leaves its stamp.
+            while echo.len() > 4096 {
+                echo.pop_first();
+            }
         }
         let delay = self.delay();
         self.deliver_later(
@@ -380,9 +408,11 @@ impl Bus {
                 listed: true,
                 at: constellation_authority::Ms(0),
                 seq,
-                sent: constellation_authority::Ms(sent),
-                expires: constellation_authority::Ms(expires),
-                guard: constellation_authority::Ms(guard),
+                clock: stamps.clock,
+                sent: stamps.sent,
+                holder_expires: stamps.holder_expires,
+                guard: stamps.guard,
+                expires: constellation_authority::Ms(stamps.expires),
             },
         );
     }
@@ -390,16 +420,24 @@ impl Bus {
     /// `from`'s answer to a beat of `to`'s sent at `sent`
     /// (`Payload::HolderAliveAck` in the daemon): `Event::BackupAlive` at
     /// the holder. Lost like the beat when the link is.
-    pub fn answer_beat(
-        self: &Arc<Self>,
-        (from, to): (NodeId, NodeId),
-        sent: constellation_authority::Ms,
-    ) {
+    pub fn answer_beat(self: &Arc<Self>, (from, to): (NodeId, NodeId), seq: u64) {
         if !self.deliverable(from, to) {
             return;
         }
+        // The holder's own stamp of that beat (its wall reading: the core
+        // compares the echo with its own stamps).
+        let Some(sent) = self.beat_echo.lock().unwrap().remove(&(to, from, seq)) else {
+            return;
+        };
         let delay = self.delay();
-        self.deliver_later(to, delay, Event::BackupAlive { from, at: sent });
+        self.deliver_later(
+            to,
+            delay,
+            Event::BackupAlive {
+                from,
+                at: constellation_authority::Ms(sent),
+            },
+        );
     }
 
     fn deliver_later(self: &Arc<Self>, to: NodeId, delay: Duration, event: Event) {

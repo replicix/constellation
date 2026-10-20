@@ -979,7 +979,7 @@ impl Cluster {
         node.crash(&self.env.bus);
         // Plan 30 §M14: the process's lock state dies with it.
         self.locks.drop_node(id, self.env.clock.elapsed_ms());
-        super::locks::reset_node(&node.meta, &self.locks.inos(), node.clock.wall().0);
+        super::locks::reset_node(&node.meta, &self.locks.inos(), node.clock.now());
         node.meta.clone()
     }
 
@@ -1159,7 +1159,7 @@ async fn client_read(
     // the sequencer) — then the session wait at the answer's position.
     let mut floor = constellation_meta::Position::ZERO;
     if strict {
-        let now = handle.clock.wall().0;
+        let now = handle.clock.honour();
         let ask = |handle: &NodeHandle| {
             handle.control(constellation_authority::Control::ReadIndex {
                 ino: parent,
@@ -1213,7 +1213,7 @@ async fn client_read(
         present,
         timed_out,
         ?floor,
-        held = handle.meta.read_delegations().valid(parent, handle.clock.wall().0).is_some(),
+        held = handle.meta.read_delegations().valid(parent, handle.clock.honour()).is_some(),
         replays = handle.meta.pending_replays().map(|q| q.len()).unwrap_or(0),
         speculation = ?handle.meta.speculation_counts().ok(),
         "client read"

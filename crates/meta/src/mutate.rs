@@ -438,20 +438,26 @@ pub fn execute(
     op: &MutateOp,
     rid: Option<crate::rid::Rid>,
 ) -> Result<Vec<LogRecord>, MetaError> {
-    execute_tagged(meta, op, rid, &crate::locks::LockTag::NONE, 0)
+    execute_tagged(
+        meta,
+        op,
+        rid,
+        &crate::locks::LockTag::NONE,
+        constellation_types::clock::Now::same(0),
+    )
 }
 
 /// [`execute`] for an op issued under cluster-lock grants (plan 30 §M14
 /// phase 2, the fencing token): refused with [`MetaError::LockLapsed`],
 /// executing and journaling nothing, when a grant `tag` names is no
-/// longer live at `now_ms` on this executor's clock
+/// longer live at `now` on this executor's clock (its wall reading)
 /// ([`crate::locks::LockTables::check_tag`]). Every execution funnel —
 /// the holder's and a delegate's for a forwarded op, the lease path, a
 /// replay, the inbox drain, the FUSE fast paths — comes through here, so
 /// the check is where the write is recorded. The tag is recorded with the
 /// op's `journal_tx` row for a replay after a deposition.
 ///
-/// F1: `now_ms` is read before the op waits for the store's writer lock
+/// F1: `now` is read before the op waits for the store's writer lock
 /// (a FUSE thread behind a slow writer, a core step that took its `now`
 /// before it waited), so this check only refuses early. The one that
 /// counts runs again inside the op's transaction, with the writer lock
@@ -465,16 +471,16 @@ pub fn execute_tagged(
     op: &MutateOp,
     rid: Option<crate::rid::Rid>,
     tag: &crate::locks::LockTag,
-    now_ms: i64,
+    now: constellation_types::clock::Now,
 ) -> Result<Vec<LogRecord>, MetaError> {
-    if meta.locks().check_tag(tag, now_ms).is_err() {
+    if meta.locks().check_tag(tag, now).is_err() {
         return Err(MetaError::LockLapsed);
     }
     #[cfg(any(test, feature = "test-util"))]
     if !before_write::fire() {
         return Err(MetaError::NotAdmitted);
     }
-    let _tag = crate::store::journal::PendingLockTag::set(tag, now_ms, meta.locks());
+    let _tag = crate::store::journal::PendingLockTag::set(tag, now, meta.locks());
     let _pending = crate::store::journal::PendingCompletion::set(rid);
     // Plan 30 §M3b: the op's own journaled transaction records `(rid, op)`
     // in its `journal_tx` row (`store::local`), so a deposition can replay
@@ -530,11 +536,11 @@ pub fn execute_admitted(
     op: &MutateOp,
     rid: Option<crate::rid::Rid>,
     tag: &crate::locks::LockTag,
-    now_ms: i64,
+    now: constellation_types::clock::Now,
     still_admitted: Box<dyn Fn() -> bool>,
 ) -> Result<Vec<LogRecord>, MetaError> {
     let _admission = crate::store::journal::PendingAdmission::set(still_admitted);
-    execute_tagged(meta, op, rid, tag, now_ms)
+    execute_tagged(meta, op, rid, tag, now)
 }
 
 /// Tests only (`test-util`; the simulation's `WriterLockHold`, F1): a hook this thread
@@ -785,6 +791,7 @@ pub(crate) mod window_hook {
 mod tests {
     use super::*;
     use constellation_fs_core::types::ROOT_INO;
+    use constellation_types::clock::Now;
 
     fn rename_op(p: Ino, n: &str, np: Ino, nn: &str, noreplace: bool) -> MutateOp {
         MutateOp::Rename {
@@ -1562,7 +1569,7 @@ mod tests {
             &rename_op(ROOT_INO, "tmp", ROOT_INO, "ref", false),
             None,
             &tag,
-            1_000,
+            Now::same(1_000),
         );
         window_hook::set(None);
         assert!(
@@ -1588,7 +1595,7 @@ mod tests {
         let clock = Arc::new(AtomicI64::new(1_000));
         let c = clock.clone();
         m.locks()
-            .set_clock(Arc::new(move || c.load(Ordering::SeqCst)));
+            .set_clock(Arc::new(move || Now::same(c.load(Ordering::SeqCst))));
         m.create(ROOT_INO, "tmp", 0o644, 0, 0).unwrap();
         // Another sequencer's grant: judged by its window here.
         let tag = LockTag(vec![LockToken {
@@ -1606,7 +1613,7 @@ mod tests {
             &rename_op(ROOT_INO, "tmp", ROOT_INO, "ref", false),
             None,
             &tag,
-            1_000,
+            Now::same(1_000),
         );
         window_hook::set(None);
         assert!(matches!(r, Err(MetaError::LockLapsed)), "{r:?}");
@@ -1619,7 +1626,7 @@ mod tests {
             &rename_op(ROOT_INO, "tmp", ROOT_INO, "ref", false),
             None,
             &tag,
-            1_000,
+            Now::same(1_000),
         )
         .unwrap();
         assert!(!m.locks().unsettled_writes());
@@ -1670,7 +1677,7 @@ mod tests {
                     &rename_op(ROOT_INO, "tmp", ROOT_INO, "ref", false),
                     None,
                     &tag,
-                    1_000,
+                    Now::same(1_000),
                 );
                 write_check_hook::set(None);
                 r
@@ -1712,7 +1719,7 @@ mod tests {
             &rename_op(ROOT_INO, "ref", ROOT_INO, "ref2", false),
             None,
             &tag,
-            1_000,
+            Now::same(1_000),
         );
         assert!(matches!(r, Err(MetaError::LockLapsed)), "{r:?}");
     }
@@ -1740,7 +1747,7 @@ mod tests {
             &rename_op(ROOT_INO, "tmp", ROOT_INO, "ref", false),
             None,
             &crate::locks::LockTag::NONE,
-            0,
+            Now::same(0),
             Box::new(move || u.load(Ordering::SeqCst)),
         );
         window_hook::set(None);
@@ -1756,7 +1763,7 @@ mod tests {
             &rename_op(ROOT_INO, "tmp", ROOT_INO, "ref", false),
             None,
             &crate::locks::LockTag::NONE,
-            0,
+            Now::same(0),
             Box::new(move || u.load(Ordering::SeqCst)),
         )
         .unwrap();
@@ -1783,12 +1790,14 @@ mod tests {
         let clock = Arc::new(AtomicI64::new(1_000));
         let c = clock.clone();
         m.locks()
-            .set_clock(Arc::new(move || c.load(Ordering::SeqCst)));
+            .set_clock(Arc::new(move || Now::same(c.load(Ordering::SeqCst))));
         let foreign = LockTag(vec![LockToken {
             grant: GrantId { node: 9, seq: 1 },
             until_ms: 5_000,
         }]);
-        m.locks().check_tag_at_write(&foreign, 1_000).unwrap();
+        m.locks()
+            .check_tag_at_write(&foreign, Now::same(1_000))
+            .unwrap();
         assert!(!m.locks().unsettled_writes(), "inside its window");
         clock.store(5_000, Ordering::SeqCst);
         assert!(m.locks().unsettled_writes(), "past its window");
@@ -1801,7 +1810,9 @@ mod tests {
             grant: g,
             until_ms: 50_000,
         }]);
-        m.locks().check_tag_at_write(&own, 5_000).unwrap();
+        m.locks()
+            .check_tag_at_write(&own, Now::same(5_000))
+            .unwrap();
         assert!(!m.locks().unsettled_writes(), "live here");
         m.locks().forget(g);
         assert!(m.locks().unsettled_writes(), "ended here");

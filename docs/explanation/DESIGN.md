@@ -869,6 +869,22 @@ rule is safe while clocks drift apart by less than half the margin
 grantor never gives more than it has left, so a grant never outlives the
 lease it came from.
 
+The holder's side of that rule is measured on a local **honour clock**
+(plan 43 C7-H1, `constellation_types::clock`): a monotone reading that never
+under-counts real elapsed time (it counts time spent suspended, does not
+follow a slewed clock, and follows a *forward* wall-clock step while
+ignoring a backward one). A holder stamps what it sends and judges what it
+honours (its lease, its lock grants, its delegation, its read delegations,
+its right to answer strict reads) on that clock, so a wall-clock step on a
+holder never extends a window it honours: a backward step changes nothing,
+a forward step ends its windows early, by the step. Values that cross nodes
+or a restart stay wall-clock (a lease body's expiry, a fencing token's
+window, a persisted horizon) and keep the offset bound above; a token is
+minted on the wall clock from the honour window at the moment it is built.
+The grantor's and the waiter's side of the rule moves to a matching
+non-jumping **wait clock** in the next commit of the item; until then it is
+still wall-clock.
+
 All transitions between roots are explicit and persisted before they take
 effect. Heartbeats and silence now drive liveness decisions — a backup
 seals a silent holder, an `ack=s3` peer takes one over, a node publishes a

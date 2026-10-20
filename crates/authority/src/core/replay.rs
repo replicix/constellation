@@ -157,6 +157,7 @@ impl Core {
                     self.stats.speculation_rolled_back +=
                         (stranded.shadows + stranded.hints) as u64;
                     self.stats.local_rolled_back += stranded.locals as u64;
+                    self.lock_note_replay_pins(now, replica);
                     if stranded.any() {
                         replica.clear_streamed();
                     }
@@ -756,7 +757,7 @@ impl Core {
         // Plan 30 §M14 phase 2: with the op's fencing token — a replay
         // under a grant that has ended is refused (`LockLapsed`) and
         // becomes a conflict copy below, as any refusal does.
-        match replica.execute(&queued.op, Some(queued.rid), &queued.lock_tag, now.wall.0) {
+        match replica.execute(&queued.op, Some(queued.rid), &queued.lock_tag, now) {
             Ok(_) => {
                 tracing::info!(node = self.cfg.node_id, rid = ?queued.rid, "stranded op replayed locally");
                 self.stats.stranded_replayed += 1;

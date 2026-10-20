@@ -53,7 +53,9 @@ pub fn lease_ttl_ms() -> u64 {
 
 /// The protocol clock's WALL reading (unix ms): lease expiries, the
 /// values compared across nodes, written to S3, persisted or shown in
-/// status, and (until plan 43 C7-H1's later commits) the local windows.
+/// status. A holder's own windows are on its honour clock
+/// (`Lease::holder_expires_ms`; plan 43 C7-H1), a waiter's (until the
+/// commit that moves them) still on this one.
 ///
 /// It is `constellation_platform::clock::protocol().wall()`: `SystemTime`
 /// plus the testing-only fault offset and step (see that module for the
@@ -73,7 +75,26 @@ pub struct Lease {
     /// Monotonic per-partition counter, bumped on every holder change.
     /// Stamped into every log segment the holder ships (fencing).
     pub epoch: u64,
+    /// The end of this tenure's lease on the host's **wall** clock
+    /// (`wall_send + ttl`): what claimants, the seal watch, identity keys
+    /// and status read. Never stamped from the honour clock: after a
+    /// backward wall step the honour clock runs ahead of the wall for the
+    /// rest of the process, and every TTL claimant would wait that much
+    /// longer (plan 43 C7-H1, D3).
     pub expires_unix_ms: i64,
+    /// Plan 43 C7-H1: the holder's own end of this tenure's lease on its
+    /// honour clock (`ProtocolClock`), `holder_clock` naming that clock; 0:
+    /// none (never written by the holder, or fenced). Meaningful only to
+    /// the holder itself (a body it wrote in this process: it honours the
+    /// lease until this) and against its own heartbeats (`beat_cap`);
+    /// everyone else reads `expires_unix_ms`.
+    #[serde(default)]
+    pub holder_expires_ms: i64,
+    /// `ProtocolClock::id` of the clock `holder_expires_ms` is on (0: none).
+    /// A new process has a new id, so a body of an earlier incarnation (or
+    /// of another node) is not honoured until the holder's next own CAS.
+    #[serde(default)]
+    pub holder_clock: u64,
     /// Set by a clean unmount: the partition is immediately claimable,
     /// no TTL to wait out.
     pub released: bool,
@@ -151,6 +172,10 @@ impl Lease {
             holder,
             epoch,
             expires_unix_ms: now_unix_ms() + ttl_ms as i64,
+            // A singleton's lease (row 16) has no honour end: the holder
+            // fields stay 0.
+            holder_expires_ms: 0,
+            holder_clock: 0,
             released: false,
             wanted_by: Vec::new(),
             backups: Vec::new(),
@@ -179,6 +204,9 @@ impl Lease {
             // descends from one that was.
             epoch: self.epoch.saturating_add(1),
             expires_unix_ms: now_ms.min(self.expires_unix_ms),
+            // The fence ends the old tenure: no honour end remains.
+            holder_expires_ms: 0,
+            holder_clock: 0,
             released: false,
             wanted_by: Vec::new(),
             backups: Vec::new(),

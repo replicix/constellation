@@ -52917,3 +52917,210 @@ every job under `timeout --kill-after=30s`, none hit it:
   microbenchmark above.
 - `types`, `platform` and `store-s3` type-check for aarch64-apple-darwin and
   x86_64-pc-windows-gnu.
+
+## Plan 43 C7-H1, commit 2 of 4: a node honours its own rights on its honour clock
+
+The honour half of C7-H1 (plan 43 §7 C7, §11 Q19). A holder stamps what it
+sends and judges what it honours on its honour clock (`ProtocolClock::honour`:
+never under-counts; follows a forward wall step once, ignores a backward one),
+so a wall-clock step on a holder never extends a window it honours: a backward
+step changes nothing, a forward step ends the window early, by the step (the
+cost Q19 accepted). Cross-node and persisted values stay wall-clock. The
+waiter's and the liveness sites are 3/4 and 4/4.
+
+### What landed
+
+- The lease body (`store_s3::Lease`) gains `holder_expires_ms` and
+  `holder_clock` (serde default, appended): the holder's own end of the tenure
+  on its honour clock and the id of that clock. `expires_unix_ms` stays the
+  wall expiry claimants, the seal watch and identity keys read, never stamped
+  from the honour clock (a backward step would make every claimant wait the
+  step longer for the rest of the process). `granted_lease` and
+  `renewed_lease` write both from one `Now`; the fence for retirement clears
+  them. `LeaseState::honour_until(cfg)` returns the end only for a body this
+  process wrote (`holder == node_id`, `holder_clock == cfg.clock_id`, an end
+  set); every decision on the lease's own window (`usable`, `holds_unexpired`,
+  `renew_due`/`renew_due_in_ms`, `lock_cap_ms`, `grant_cap_ms`, `maybe_grant`,
+  the renew re-read, the closed tenure of an epoch's close) reads it. A body of
+  an earlier incarnation or another node is unusable and due for renewal until
+  this node's next CAS writes fresh fields.
+- Holder-side stamps on `HonourMs`: the S3 liveness proof (`s3_sent`,
+  `last_s3_fresh`, `liveness_fresh`, `FreshHold`, the renew probe), a lock
+  requester's `sent_at`, renewals in flight and late renewals, `renew_at`, the
+  renewal tick and its timeout (a honour timer), `done_reqs`; a delegate's
+  `until`, `installed`, `renew`, `last_renew_sent`, `answered_sent`, the lapse
+  watch and the renewal timer, `DelegRenewCert.next_due`, the off-core lane's
+  sends and `Event::DelegRenewSentOffCore`; a reader's `ReadReq.sent_at`.
+  `PeerMsg::LockRequest.sent`, `LockGranted.sent` and `LockCancel.upto` are the
+  requester's own honour readings, only echoed and compared with each other by
+  the owner. `DelegRenew.stream_head_at` stays wall (row 9), split from the
+  renewal's honour send.
+- Meta: `HeldGrant` (`until`, `renew_at`, `installed`) and `HeldDelegation`
+  (`until`, `renew_at`) are `HonourMs`; the holder-side `LockTables` methods and
+  the execution funnel (`execute_tagged`, `check_tag`, `check_tag_at_write`,
+  the `LockClock`) take a `Now`. A token (`LockToken.until_ms`) is minted on
+  the wall clock as `now.wall_of_honour(until)` when the tag is built; the
+  executor judges it on its wall clock (row 6, C7b). The holder's own wait for
+  a token to run out (`Inflight.pinned_until`, `release_blocked`) is a wait-clock
+  copy taken when the pin is made; a queued replay's windows get theirs when
+  the replay is queued (`LockState::replay_pins`, after each strand), so a
+  forward wall step cannot end the release's wait early. The owner's records
+  (`Grant.until_ms`, `confirmed_ms`) are still wall until 3/4.
+- The beat (row 27, holder half): `Beat { seq, sent_ms, expires_unix_ms,
+  guard_ms, expires_ms, clock }` (the first four keep their wire positions, the
+  last two are appended): `sent_ms`, `expires_ms` and `guard_ms` are readings of
+  the holder's honour clock, `clock` its id. The beat thread takes one `Now` per
+  tick, maps the (still wall) guard onto the honour clock at send, and stops
+  beating at the honour end. The successor keeps `lags`, `named_max` and
+  `guard_max` per holder clock id (at most two) and `beat_cap` takes the latest
+  `X_c + min lag_c` over them plus a margin, with the replaced lease's own
+  honour end in `X` of the id that wrote it; none if that clock was not heard.
+  The seal watch's arrival credit `min(at, sent + M)` is gone (`sent` is
+  another clock's reading): it counts the plain arrival.
+- Engine: `LeaseView` (`valid_until_honour`, `usable_at`, `reads_locally_at`,
+  `admit_at`, `set_liveness(.., HonourMs)`, status `expires_in_ms` on honour),
+  `DelegateView` (honour `until`), the read delegation check
+  (`ReadDelegations::valid(ino, HonourMs)`), `crate::locks::now() -> Now` (with
+  per-thread `advance_test_clock` and `step_test_wall` for tests).
+- The two clock-read costs the spec assigns here: `ClusterLocks::fenced` and
+  `take_discard` check for local lockers / held grants (one or two relaxed
+  loads) before reading any clock; a FUSE fast-path mutation takes one `Now`
+  at its admission and passes it to the admission, the token check, the
+  activity stamp and the read-delegation recall (six wall reads before); the
+  re-check at the store's writer lock reads afresh (F1).
+- Classified, not converted: `lock_waited_since`/`waited_ms` is a queue key
+  (wait side, commit 4: a step reorders the queue, never excludes); the
+  carry's two `left` measures (b41f472) are wait-side (commit 3);
+  `LockCancel`'s `sent`/`upto` are the requester's honour readings.
+
+### Tests
+
+Core (`core/tests.rs`, `honour_clock`, `locks`, `cto`, `beat_cap`): a backward
+step does not extend the lease honour; a forward step ends it; an earlier
+incarnation's body is not honoured; a lease written after a step carries both
+ends; a delegate stops at its `until`; a held lock grant lapses on time; a
+forward step ends it at once; a token is minted from the honour window; the
+lock and grant caps are the honour end; a read delegation is capped by it;
+liveness is not extended; the beat cap per holder clock id and at most two
+ids. Engine: `usable_ends_at_the_honour_end_after_a_backward_step`,
+`a_held_grant_stepped_back_stays_fenced_on_time`. Sim wrappers (12 seeds each):
+`a_locker_stepped_back_stops_honouring_its_grant_on_time`,
+`a_holder_stepped_back_while_cut_off_stops_answering_on_time`,
+`a_reader_stepped_back_stops_serving_its_read_delegation_on_time`. Fail-before:
+with the fix reverted in a scratch copy (the honour end compared as the wall
+expiry, the liveness and token stamps and the meta judgements on the wall
+reading) 11 of the 15 core and engine tests above fail (the other four are
+forward-step, API and per-clock-id tests with no wall-clock counterpart); the sim wrappers'
+seeds fail on the parent (locker 0, 4, 5; holder 0, 6; reader 9).
+
+### Fail-before and after (2 000 seeds)
+
+| configuration | parent | this commit | what is left |
+|---|---|---|---|
+| `locks-locker-step-back` | 479 | 0 | |
+| `strict-reader-step-back` | 91 | 0 | |
+| `locks-holder-step-back-sealed` (−8 s) | 430 | 1 (seed 1892) | a stepped-back node's wall expiry read by claimants: an offset beyond the margin, C7b |
+| `fast-takeover-holder-step-forward` | 18 | 18 (the same seeds) | the old root's own table (3/4); none of the failing seeds has a seal (no backup listed): the cap is not reached |
+| `locks-root-step-forward` | 1 821 | 1 821 | 3/4 |
+| `fast-takeover-successor-step-forward` | 21 | 21 | 3/4 |
+| `delegated-root-step-forward` | 4 | 4 | 3/4 |
+| `delegated-delegate-step-back` | 0 | 0 | covered by the core test |
+| `locks-root-step-back`, `locks-holder-step-forward` (controls) | 0, 0 | 0, 0 | |
+
+Sweeps, the parent against this tree (78 configurations, 2 000 seeds each,
+`long-backup` 500, the thread-mode ones included): every failing-seed list of
+the configurations without a step is identical, the negative controls
+(`locks-writer-hold-unchecked`, `*-credited`, `locks-writer-hold-delegated-
+unsettled`) fail on the same seeds. Counters differ in three classes, none of
+them a verdict:
+
+- The restart class (`locks-blips-tight-faults`: 11 482 against 11 487
+  takeovers, 77 702 against 77 668 installed rows): a restarted node's
+  earlier-incarnation lease body has no honour end of this process, so the
+  node is not usable and is renewed at once, where the parent honoured the
+  body's wall expiry (seed 67 checked: the two runs part at a restart).
+- The credit class (`strict-isolated-reader-skewed`: floors saved
+  5 294 738 against 5 298 566 ms, max floor 4 504 against 4 443 ms): the beat's
+  arrival credit `min(at, sent + M)` is gone, the floor counts the plain
+  arrival (spec D8); the `backup` thread-mode configurations (one more
+  sealed takeover in 1 414, floors unchanged) are real threads and not
+  repeatable seed by seed.
+- The step configurations' own counters (`delegated-delegate-step-back`: 902
+  against 872 takeovers): the honour clock moves which takeovers happen.
+
+### Unchanged on purpose
+
+- Every wait-side and liveness site reads `now.wall` and `set_timer_wall`:
+  the owner's records, graces, quarantines, the takeover floor, the beat's
+  arrival and `BackupAlive.at`, housekeeping stamps and timers (3/4, 4/4);
+  `lock_waited_since`, `Waiter.recv`, idle stamps, the handoff pause,
+  `last_write`.
+- The wall list: `Lease::expires_unix_ms`, identity keys (`closed_tenure`,
+  `given_up`, `released`, `owes_move`), `permit_allows`' `ack=s3` arm,
+  `is_claimable`, `classify`, `fast_prev`'s residual arm, promises, persisted
+  horizons, `stream_head_at`, barriers and the lock cut, the token's window,
+  `Grant.confirmed_ms`, status stamps.
+- Models: none (D5); the model's lock doc says a step is outside it.
+
+### Open
+
+- **The beat cap and a forward step of the holder.** The spec's argument
+  (R7) says a forward step moves `sent` and the honour end alike. It moves
+  `sent` (a later beat) but not the end of a lease written before the step, so
+  grants made before the step are capped by `X − sent`, early by the step,
+  until the next renewal: a forward step of the holder between its last
+  renewal and a seal. The honour clock cannot close it (it counts the step as
+  elapsed, real time did not pass). Closing it needs a clock that ignores
+  forward steps for this pair (the wait clock for `sent`, the guard and an end
+  stamped on it in the lease body) or the honour clock's cumulative jump carried
+  in the beat and the body (`X + (J_beat − J_write)`). Not detected by the
+  simulator: no seed of `fast-takeover-holder-step-forward` that fails
+  seals (above), and those that seal pass on the parent and here alike.
+  Documented in the backup module doc and `durability-and-failover.md`.
+- `locks-holder-step-back-sealed` seed 1892: see the table (C7b).
+
+### Harness and performance
+
+Harness (the box, daemons built from each tree; no load but the scenario):
+`lock-failover` with `clock:step:+3000:6000,clock:step:-3000:12000`
+(a step forward at 6 s, one back at 12 s) passes; the
+status block counts both steps (`honour_ahead_ms` 3 001 after the step back).
+`backup-failover` p50 1.492 s against 1.494 s on the parent;
+`s3-cut-holder-failover-with-locks` passes: takeover 13.59 s against 13.84 s,
+the cap saved 22 505 ms against 22 504 ms. `lock-failover` without a step: the
+contender is granted 0.5 to 0.7 ms after the unlock except in the run in which
+the successor's idle release races the locker's unlock, about 16 s: 4 of 13
+runs of this tree, 1 of 12 of the parent. The daemon logs of a kept run show
+that race (the successor releases its grace as the locker unlocks); the
+parent has the same outlier, the scenario's roles decide it, and the counts
+are within what 12 runs of a coin that flips on a few ms of scheduling give.
+Not claimed as a regression, not claimed as nothing.
+
+Performance: `make vfs-bench` parent against this tree, three runs each:
+every one of the 14 rows within 1.6 %, median delta -0.75 %. It does not
+exercise the mutation fast path or `fenced`; what the commit changes there is
+counted, not measured: a mutation takes two `Now` (two clock reads each) where it
+took six wall reads, and `fenced`/`take_discard` read no clock when the node
+has no local locker or held grant. Neither costs on the file systems of the
+host (ext4, xfs, btrfs, tmpfs), none being in the path.
+
+### Gates
+
+On the box (kernel 7.3, 16 cores; the work on `btrfs`, `/tmp` on tmpfs), every
+job under `timeout --kill-after=30s`, none hit it:
+
+- `cargo fmt --check`; `cargo clippy --workspace --all-targets -D warnings`
+  clean (again after the last test edit).
+- `cargo test --workspace --release --no-fail-fast` without `constellation-
+  model`: every target passed but the engine lib in the first run, in which
+  `an_op_sent_after_a_renewal_carries_the_renewed_window` hung. The test
+  moved the engine's per-thread test clock 61 s ahead, past the test lease's
+  60 s window, so the (now honour-clock) admission closed the fast path and the
+  op went to the test's core, which is never answered. A test bug, not a
+  product one: the window is now 30 s inside the lease. The engine lib three
+  times after: 815 passed, 0 failed, 9 ignored each.
+- `cargo test --release -p constellation-model -- --test-threads=2`: 167
+  passed, 0 failed (the default parallel run was killed for memory on this
+  30 GB box: the `cto` binary reached 29 GB; this commit changes comments only
+  in that crate).
+- The sweeps, harness runs and benchmarks above.
