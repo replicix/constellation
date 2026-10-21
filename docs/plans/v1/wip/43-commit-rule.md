@@ -3502,6 +3502,10 @@ to land before C0.
   until C3/C5: *recommended*.
   (l) C2a (the oracle fixes) may land before C1: *recommended* if C1's
   fail-before runs have not started.
+  **Answered 2026-10-22:** every recommendation taken. No version bumps
+  and no compatibility shims anywhere (work-in-progress code, nothing
+  installed): the inbox gains its field and a batch from an older binary is
+  simply not read.
 
 ### 11.1 Deferred (not in this plan)
 
