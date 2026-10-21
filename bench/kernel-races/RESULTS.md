@@ -196,3 +196,93 @@ mark is live.
 | rsync_n | warm | 61766 / 61766 | 1.00 |
 | deep_stat | cold | 12222 / 12222 | 1.04 |
 | deep_stat | warm | 0 / 0 | 1.00 |
+
+## F21 follow-up (review F2/F3/F4): marks that never expire
+
+`attrwatch.rs` dropped a mark a second after its reply was generated, which
+let race 2b through for a reply the kernel installs later (over io_uring the
+ring thread commits a reply on its next pass, after the requests it reaped
+with it; a task can wait for a CPU longer than a second). A mark now goes on
+evidence only: the task's next attribute or namespace request, a notice for
+the inode, the task's exit (`kill(tid, 0)` when a change finds the mark or a
+full table is swept); it is indexed by inode; the table is bounded (32 768
+marks of tasks with an id, as many for pid 0), and a full table writes the
+notice before the reply. Cost against `off`, ABBA (`auto, off, off, auto`),
+`entry` directory TTL, io_uring, release build, a **reduced tree of 12 201
+files** (a git repository, `a00`/`a01` of 5 242 entries, `src/` 4 000 files,
+`deep/` 2 000, a 1 000-target Makefile; the 55 052-file tree of the sections
+above was not rebuilt), fresh mount per sample; the host's other agents were
+running (load 5 to 9). Stores: `/mnt/fs-ext4`, `/mnt/fs-xfs`, `/mnt/fs-btrfs`
+and tmpfs. Namespace workloads: 2 blocks, so 4 samples per mode per cell;
+read-only: 3 blocks, 6 samples per mode per cell, cold and warm. New
+workloads: `cp_a_churn` and `mkdir_churn`, whose background task is a shell
+loop that spawns `stat` of the target and its two subtrees as fast as it can
+(a process, so a task id, per `stat`: the pruning cost with many short-lived
+processes).
+
+**Requests equal `off`**: over the 84 cells that are not churn the median
+difference is 0.00 %, the largest +0.65 % (`rm_rf` on tmpfs, 9 759 against
+9 644, where `off` alone ranges 9 644 to 10 281), the smallest -0.10 %. The 16
+read-only cells of every store send identical requests (+/- 2 of
+10 000 to 37 000). The churn workloads' requests vary by 5 to 10 % between
+runs of the same mode (the loop's `stat`s are requests, and a faster run
+spawns more); their GETATTR counts match (54 to 60 against 54 to 59), and
+the narrowed notice wrote none: each `stat` task is gone when the change
+finds its mark, so the mark is dropped by the exit probe. A single-task
+`untar`/`cp_a`/`rm_rf`/`mv_storm`/`mkdir_storm` wrote none (the shell that
+prepared the run has exited; the previous build wrote one); the polled
+`cp_a` wrote 6 to 10 per run (a live poller stats the target every 20 ms:
+one needless notice per change that finds its mark; the previous build, 1 to
+4). Wall time, block ratios `auto`/`off` (host noise included; the
+workloads' own CPU time moves with it): median 1.05 over the 32 namespace
+cells (0.87 to 1.24), 0.99 over the 64 read-only cells (0.83 to 1.21).
+
+| store | workload | requests off / auto | GETATTR off / auto | notices auto (per run) | wall auto/off (block ratio) |
+|---|---|---|---|---|---|
+| ext4 | untar | 36544 / 36546 | 8 / 10 | 0 (0-0) | 1.02 |
+| ext4 | cp_a | 73292 / 73288 | 24 / 23 | 0 (0-0) | 0.98 |
+| ext4 | rm_rf | 10062 / 10125 | 0 / 1 | 0 (0-0) | 1.09 |
+| ext4 | mv_storm | 26260 / 26251 | 44 / 43 | 0 (0-0) | 0.87 |
+| ext4 | mkdir_storm | 9004 / 9004 | 0 / 0 | 0 (0-0) | 1.05 |
+| ext4 | cp_a_poll | 73810 / 73840 | 64 / 66 | 8 (7-9) | 1.11 |
+| ext4 | cp_a_churn | 89510 / 89492 | 58 / 59 | 0 (0-0) | 0.97 |
+| ext4 | mkdir_churn | 10414 / 10535 | 2 / 2 | 0 (0-0) | 1.01 |
+| xfs | untar | 36536 / 36536 | 5 / 5 | 0 (0-0) | 1.22 |
+| xfs | cp_a | 73263 / 73264 | 14 / 14 | 0 (0-0) | 1.02 |
+| xfs | rm_rf | 10010 / 10053 | 0 / 1 | 0 (0-0) | 1.09 |
+| xfs | mv_storm | 26161 / 26217 | 44 / 44 | 0 (0-0) | 1.06 |
+| xfs | mkdir_storm | 9004 / 9004 | 0 / 0 | 0 (0-0) | 0.98 |
+| xfs | cp_a_poll | 73793 / 73777 | 61 / 62 | 8 (8-10) | 1.06 |
+| xfs | cp_a_churn | 88790 / 88422 | 56 / 57 | 0 (0-0) | 0.98 |
+| xfs | mkdir_churn | 10499 / 10444 | 2 / 2 | 0 (0-0) | 1.04 |
+| btrfs | untar | 36538 / 36538 | 6 / 6 | 0 (0-0) | 1.17 |
+| btrfs | cp_a | 73280 / 73288 | 20 / 22 | 0 (0-0) | 1.03 |
+| btrfs | rm_rf | 9880 / 9878 | 0 / 0 | 0 (0-0) | 1.21 |
+| btrfs | mv_storm | 26194 / 26226 | 43 / 44 | 0 (0-0) | 1.13 |
+| btrfs | mkdir_storm | 9004 / 9004 | 0 / 0 | 0 (0-0) | 0.95 |
+| btrfs | cp_a_poll | 73656 / 73680 | 58 / 58 | 8 (8-10) | 1.08 |
+| btrfs | cp_a_churn | 84632 / 86432 | 54 / 55 | 0 (0-0) | 0.99 |
+| btrfs | mkdir_churn | 10621 / 10670 | 2 / 2 | 0 (0-0) | 1.00 |
+| tmpfs | untar | 36536 / 36538 | 5 / 6 | 0 (0-0) | 1.24 |
+| tmpfs | cp_a | 73272 / 73280 | 17 / 19 | 0 (0-0) | 1.08 |
+| tmpfs | rm_rf | 9976 / 10040 | 0 / 1 | 0 (0-0) | 1.02 |
+| tmpfs | mv_storm | 26138 / 26216 | 44 / 44 | 0 (0-0) | 1.05 |
+| tmpfs | mkdir_storm | 9004 / 9004 | 0 / 0 | 0 (0-0) | 1.07 |
+| tmpfs | cp_a_poll | 73804 / 73730 | 60 / 62 | 8 (6-10) | 1.07 |
+| tmpfs | cp_a_churn | 88532 / 87874 | 56 / 56 | 0 (0-0) | 0.98 |
+| tmpfs | mkdir_churn | 10336 / 10539 | 2 / 2 | 0 (0-0) | 1.17 |
+
+Bookkeeping, `cargo test --release -p constellation-frontend-fuse --lib --
+--ignored --nocapture attrwatch::tests::cost` (a task's `arrive` plus reply,
+a change of another inode every 64th, per thread, 500 000 rounds; the box
+shared; the previous build, same test, back to back, two runs each):
+1 thread 112 / 111 ns (previous 112 / 112), 4 threads 342 / 342 ns (previous
+404 / 406), 8 threads 1 116 / 1 053 ns (previous 1 305 / 1 252). Equal at one
+thread, faster under contention (cache-line padded shards).
+
+Pruning: sweeping a full table of 32 768 marks of tasks that no longer exist
+takes 3 to 8 ms (about 0.1 to 0.25 us per mark: one `kill(2)` each, outside
+the shard locks; at most once per 100 ms, so below 8 % of a thread even
+with nothing to free); a change finding 10 000 marks of exited tasks on one
+inode drops them in 0.9 ms; 3 000 real `true` processes marked and reaped,
+then swept: 0.3 to 0.5 ms (the processes themselves took 550 ms).

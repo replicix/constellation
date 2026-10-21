@@ -2937,6 +2937,38 @@ fn noticed_inodes(notices: &[Reply]) -> Vec<u64> {
         .collect()
 }
 
+/// A task that exists (the attribute watch asks whether a mark's task still
+/// does): a sleeping child, whose pid the requests carry.
+struct Task(std::process::Child);
+
+impl Task {
+    fn spawn() -> Self {
+        Self(
+            std::process::Command::new("sleep")
+                .arg("120")
+                .spawn()
+                .expect("spawn a task"),
+        )
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+
+    /// The task exits (and is reaped: its id is gone).
+    fn exit(mut self) {
+        self.0.kill().expect("kill the task");
+        self.0.wait().expect("reap the task");
+    }
+}
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 const GETATTR_BODY: fn() -> Body = || Body::new().u32(0).u32(0).u64(0);
 const MKDIR_BODY: fn() -> Body = || Body::new().u32(0o755).u32(0o22).cstr("d");
 
@@ -2949,7 +2981,8 @@ fn bounded_mode_notices_only_where_a_reply_may_still_be_on_its_way() {
     mock.always_mkdir(Script::ok(entry(61, FileKind::Dir)));
     mock.always_getattr(Script::ok(attr(5, FileKind::Dir)));
     mock.always_lookup(Script::ok(entry(60, FileKind::File)));
-    let (reader, writer) = (1111, 2222);
+    let (reader_task, writer_task) = (Task::spawn(), Task::spawn());
+    let (reader, writer) = (reader_task.pid(), writer_task.pid());
     // Nothing in flight: no notice.
     let (n, r) = call_noticed_as(&mut k, writer, op::MKDIR, 5, &MKDIR_BODY());
     r.ok();
@@ -3009,14 +3042,90 @@ fn a_reply_generated_across_a_change_is_preceded_by_its_notice() {
         after: Duration::from_millis(300),
         result: Ok(attr(5, FileKind::Dir)),
     });
-    let held = k.send_as(op::GETATTR, 5, (1000, 100, 1111), &GETATTR_BODY().0);
+    let (reader, writer) = (Task::spawn(), Task::spawn());
+    let held = k.send_as(op::GETATTR, 5, (1000, 100, reader.pid()), &GETATTR_BODY().0);
     // The change completes while the attribute reply is still being made.
-    let (n, r) = call_noticed_as(&mut k, 2222, op::MKDIR, 5, &MKDIR_BODY());
+    let (n, r) = call_noticed_as(&mut k, writer.pid(), op::MKDIR, 5, &MKDIR_BODY());
     r.ok();
     assert!(n.is_empty(), "the change saw no reply yet: nothing marked");
     let (n, r) = collect_until(&mut k, held);
     r.ok();
     assert_eq!(noticed_inodes(&n), vec![5], "written by the late reply");
+    k.finish();
+}
+
+/// Plan 42 F21 (review F2): a reply the kernel installs more than a second
+/// after the daemon wrote it (a ring thread behind a slow handler, a task a
+/// throttled cgroup kept off its CPU) is still covered: a mark is dropped
+/// by evidence the reply was consumed, never by the clock. (Failed when
+/// marks expired a second after the reply was generated.)
+#[test]
+fn a_reply_stays_covered_however_late_its_task_installs_it() {
+    let (mut k, mock, _sink) = keep_cache_kernel();
+    mock.always_mkdir(Script::ok(entry(61, FileKind::Dir)));
+    mock.always_getattr(Script::ok(attr(5, FileKind::Dir)));
+    let (reader, writer) = (Task::spawn(), Task::spawn());
+    call_noticed_as(&mut k, reader.pid(), op::GETATTR, 5, &GETATTR_BODY())
+        .1
+        .ok();
+    std::thread::sleep(Duration::from_millis(1300));
+    let (n, r) = call_noticed_as(&mut k, writer.pid(), op::MKDIR, 5, &MKDIR_BODY());
+    r.ok();
+    assert_eq!(noticed_inodes(&n), vec![5], "the reader has sent nothing");
+    k.finish();
+}
+
+/// Plan 42 F21: a task that exited installs nothing, so its mark is no
+/// reason for a notice.
+#[test]
+fn an_exited_tasks_mark_is_not_noticed() {
+    let (mut k, mock, _sink) = keep_cache_kernel();
+    mock.always_mkdir(Script::ok(entry(61, FileKind::Dir)));
+    mock.always_getattr(Script::ok(attr(5, FileKind::Dir)));
+    let (reader, other, writer) = (Task::spawn(), Task::spawn(), Task::spawn());
+    call_noticed_as(&mut k, reader.pid(), op::GETATTR, 5, &GETATTR_BODY())
+        .1
+        .ok();
+    reader.exit();
+    let (n, r) = call_noticed_as(&mut k, writer.pid(), op::MKDIR, 5, &MKDIR_BODY());
+    r.ok();
+    assert!(n.is_empty(), "the task is gone: {:?}", noticed_inodes(&n));
+    // The same with one that is still there next to it.
+    let (gone, _) = (Task::spawn(), ());
+    call_noticed_as(&mut k, gone.pid(), op::GETATTR, 5, &GETATTR_BODY())
+        .1
+        .ok();
+    call_noticed_as(&mut k, other.pid(), op::GETATTR, 5, &GETATTR_BODY())
+        .1
+        .ok();
+    gone.exit();
+    let (n, r) = call_noticed_as(&mut k, writer.pid(), op::MKDIR, 5, &MKDIR_BODY());
+    r.ok();
+    assert_eq!(noticed_inodes(&n), vec![5], "the other task is alive");
+    k.finish();
+}
+
+/// Plan 42 F21: a request of a task outside the mount's pid namespace
+/// carries pid 0: nothing clears its reply, so its inode is noticed once
+/// by the next change, however much later, and then no more.
+#[test]
+fn a_reply_to_a_task_without_a_pid_is_noticed_once_by_the_next_change() {
+    let (mut k, mock, _sink) = keep_cache_kernel();
+    mock.always_mkdir(Script::ok(entry(61, FileKind::Dir)));
+    mock.always_getattr(Script::ok(attr(5, FileKind::Dir)));
+    let writer = Task::spawn();
+    for _ in 0..3 {
+        call_noticed_as(&mut k, 0, op::GETATTR, 5, &GETATTR_BODY())
+            .1
+            .ok();
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let (n, r) = call_noticed_as(&mut k, writer.pid(), op::MKDIR, 5, &MKDIR_BODY());
+    r.ok();
+    assert_eq!(noticed_inodes(&n), vec![5]);
+    let (n, r) = call_noticed_as(&mut k, writer.pid(), op::MKDIR, 5, &MKDIR_BODY());
+    r.ok();
+    assert!(n.is_empty(), "the notice discharged the replies");
     k.finish();
 }
 
@@ -3026,10 +3135,11 @@ fn a_reply_generated_before_the_change_began_is_not_noticed_twice() {
     let (mut k, mock, _sink) = keep_cache_kernel();
     mock.always_mkdir(Script::ok(entry(61, FileKind::Dir)));
     mock.always_getattr(Script::ok(attr(5, FileKind::Dir)));
-    call_noticed_as(&mut k, 2222, op::MKDIR, 5, &MKDIR_BODY())
+    let (reader, writer) = (Task::spawn(), Task::spawn());
+    call_noticed_as(&mut k, writer.pid(), op::MKDIR, 5, &MKDIR_BODY())
         .1
         .ok();
-    let (n, r) = call_noticed_as(&mut k, 1111, op::GETATTR, 5, &GETATTR_BODY());
+    let (n, r) = call_noticed_as(&mut k, reader.pid(), op::GETATTR, 5, &GETATTR_BODY());
     r.ok();
     assert!(
         n.is_empty(),

@@ -1396,8 +1396,10 @@ notification for the directories it changed and the inodes it moved,
 which makes the kernel reject a reply from before the change — for every
 operation under `--cto strict`, where it costs no request, and in bounded
 mode only for an inode an attribute reply may still be on its way to the
-kernel for (plan 42 F21: the notice invalidates the whole attribute mask,
-so each one costs the next path walk a `GETATTR`). (W3a) a
+kernel for, tracked until the task's next request, a notice for the inode
+or the task's exit, never by a clock (plan 42 F21: the notice invalidates
+the whole attribute mask, so each one costs the next path walk a
+`GETATTR`). (W3a) a
 directory's attributes get no kernel lifetime under `--cto strict`; in
 bounded mode the default is the view's TTL (plan 42 Q1, decided: `zero`
 there made warm `git status` 2.6 to 7.9 times and `make -q` 2.8 to 4.2
@@ -1408,7 +1410,8 @@ start, a table of releases); W1 is independent of the kernel.
 **Consequences**: reopen-heavy workloads read from the page cache instead
 of the daemon. Where W3b is on unconditionally (strict), each namespace operation
 writes one more 40-byte notification; narrowed, the tracking of attribute
-replies costs two lock round trips per attribute request. A write on a file whose pages are dropped constantly (every
+replies costs a few lock round trips per attribute request and a bounded
+table (a full one writes the notice instead). A write on a file whose pages are dropped constantly (every
 open dropping, a reader beside the writer) may wait for a repair; the one
 self-block, a repair waiting on the write's own last page, is answered
 after a short grace. Directory TTL 0 costs a `GETATTR` per directory

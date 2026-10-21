@@ -1262,8 +1262,9 @@ mod tests {
             };
             assert_eq!(config.dir_notice_mode(), mode, "{switch:?} strict={strict}");
             let t = PageCacheTable::new(config);
-            // Only the narrowed mode tracks attribute replies.
-            let a = t.attr_arrive(7);
+            // Only the narrowed mode tracks attribute replies (of a task
+            // that exists: a change drops the marks of gone ones).
+            let a = t.attr_arrive(std::process::id());
             assert_eq!(
                 t.attr_watch().replying(a, 1).is_some() || t.attr_watch().changed(&[1]).0 == [1],
                 mode == NoticeMode::Narrowed,

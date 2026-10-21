@@ -55744,6 +55744,43 @@ the change: the late reply writes the notice; the other path, a change
 finding a reply written but not installed, is covered by the wire and unit
 tests only).
 
+### F21 follow-up: marks that never expire (review F2, F3, F4)
+
+The review found the narrowed notice's one-second mark a load-dependent
+hole in 2b's closure (over io_uring the ring thread commits a reply on its
+next pass, behind every other request it reaped with it, and a task can
+wait for a CPU longer than a second), against the rule that under load
+only latency degrades. `attrwatch.rs` now drops a mark on evidence only:
+the task's next attribute or namespace request, a notice written for the
+inode, or the task's exit (`kill(tid, 0)` in the daemon's pid namespace
+when a change finds the mark, or in a sweep of a full table). Marks are
+indexed by inode (one hash lookup per changed inode), the table is bounded
+(32 768 marks of tasks with an id, as many for pid 0), and a full table
+writes the notice before the reply, which costs a `GETATTR` per reply and
+never a stale attribute. Plan 42 §5.3.1 and §5.9 R10 are rewritten: R10 is
+now only a reply the previous process wrote just before a `daemon
+--upgrade` handover (F3 of the review; the watch is per process; not
+mitigated). F4: pid 0 now keeps one mark per inode until a notice for it
+(a pid-0 poller costs one notice per change, not one per read), and the
+cost of many short-lived tasks is measured, below.
+
+Measured on the box (`bench/kernel-races/RESULTS.md`, "F21 follow-up"; a
+reduced tree of 12 201 files; ABBA, `auto` against `off`, `entry` TTL, ext4,
+xfs, btrfs and tmpfs): requests equal `off` (median 0.00 %, at most +0.65 %
+over 84 non-churn cells; the 64 read-only cells identical), notices 0 in
+every single-task namespace workload and in the process-churn ones (the
+`stat` tasks are gone when the change finds their marks), 6 to 10 per run
+beside a live 20 ms poller; sweeping a full table of 32 768 dead marks
+takes 3 to 8 ms, at most once per 100 ms; the bookkeeping's hot path is
+112 ns per request at one thread and no slower than before under
+contention. Tests: unit (a reply installed after more than a second is
+still covered, the bound, the full-table notice, the sweep and its rate,
+exited tasks, pid 0, index against task records under four threads, the
+probe) and wire tests with real task ids; the late-install, exited-task and
+pid-0 wire tests and the late-install unit test fail on `53fad43`.
+`kernel-race-dir-version` and `-rename-ctime` pass on both transports
+(`-dir-version-remote` and `-dir-nlink` too).
+
 ### Final-stack gates
 
 `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets
@@ -55821,8 +55858,9 @@ guarantee of the plan.
   change of the inode was recorded since, the reply writes the notice
   itself), or one answered to a task (the request's pid) that has sent no
   attribute or namespace request since (a mark, cleared by that request,
-  by the notice, or after a second; a namespace operation notices the
-  inodes it changed that have a live mark). Under `--cto strict` it is
+  by the notice, or by the task's exit, never by time — see the F2
+  follow-up below; a namespace operation notices the inodes it changed
+  that have a mark, found through an index by inode). Under `--cto strict` it is
   unconditional (the notice costs no request there). A single-threaded
   `untar` or `cp -a` sends one notice for 5 224 operations. Cost
   measured below (F21 results).
@@ -55920,8 +55958,10 @@ narrower overflow (the handles present when it was armed) would fix it.
   -q` 2.8 to 4.2 times slower on ext4, xfs, btrfs and tmpfs (plan 42
   §10, `bench/kernel-races/RESULTS.md`). The exposure is race 2a for
   directories (one transient `stat` result, never data); W3b (narrowed in
-  bounded mode, F21) closes 2b in both, except for a reply the kernel
-  installs more than a second after it was generated (plan 42 §5.9 R10).
+  bounded mode, F21) closes 2b in both, however late the kernel installs
+  a reply (marks are dropped on evidence, not by time); what is left is a
+  reply the previous process wrote just before a `daemon --upgrade`
+  handover (plan 42 §5.9 R10).
 - Q2–Q6 as decided in the plan: the in-flight-aware bound, 1 s
   (`CONSTELLATION_FUSE_WRITE_REPAIR_WAIT_MS`); one data notification per
   commit to the node's other views; Q4 not done; Q5 for upstream; Q6

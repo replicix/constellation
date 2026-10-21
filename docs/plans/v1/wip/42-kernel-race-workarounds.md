@@ -946,43 +946,68 @@ adapter tracks both:
 2. **Written, not installed.** A task installs a reply in the syscall
    that sent the request, before it can send another. The reply to task
    `t` (the request's `pid` is the thread id) for inode `i` is a mark
-   `t -> i`, until `t`'s next lookup, getattr, setattr or namespace
-   request arrives (it clears the mark), or one second has passed since
-   the reply was generated (a reply the kernel installs later than that
-   is outside the model, below), or a notice for `i` was written (it
-   rejects every earlier reply, so it discharges the marks it found — once
-   it is written, not before: a second change of `i` meanwhile still finds
-   them and writes its own notice before its reply). A namespace
-   operation finds the live marks of the inodes it changed and writes a
+   `t -> i`. **A mark is never dropped by time**; it goes on evidence that
+   its reply was consumed: (a) `t`'s next lookup, getattr, setattr or
+   namespace request arrives (it clears the mark); (b) a notice for `i`
+   was written (it rejects every earlier reply, so it discharges the marks
+   it found — once it is written, not before: a second change of `i`
+   meanwhile still finds them and writes its own notice before its reply);
+   (c) `t` has exited (a task that is gone installs nothing; a change that
+   finds a mark asks `kill(t, 0)` in the daemon's pid namespace, which is
+   the mount's, and drops the mark of a task that does not exist; `EPERM`
+   and a recycled id count as alive, the safe side). A namespace
+   operation finds the marks of the inodes it changed through an index by
+   inode (one hash lookup per changed inode, not a scan) and writes a
    notice for those only. Requests without a pid (outside the mount's pid
-   namespace) cannot be cleared; their marks live 50 ms.
+   namespace) have no task to clear or ask: one mark per inode stands for
+   "some such reply may be uninstalled" until a notice is written for the
+   inode (a pid-0 task that keeps reading a directory another task keeps
+   changing therefore costs one notice per change, as `on` would, but not
+   one per read).
+3. **No room.** The table is bounded (32 768 marks of tasks with an id
+   and 32 768 for pid 0, separately, a few MiB each): at most one mark per
+   live task id and one per inode for pid 0. A full table
+   first drops the marks of exited tasks (a sweep, at most every 100 ms,
+   so a table full of live marks is not scanned per reply); if it is still
+   full the reply **writes its notice at once, before the reply** (the
+   request was sent before the notice, so the kernel rejects exactly this
+   reply) and keeps no mark, and that notice also discharges the inode's
+   marks, which makes room: it costs a `GETATTR` per reply while the table
+   is full, never a stale attribute. A pid-0 reply of an inode that has a
+   pid-0 mark replaces it in place and needs no room, so re-reading a tree
+   the table is full of costs no notice.
 
 Each side records its fact, issues a full fence and reads the other's, so
 at least one of them sees the other (the same store-buffering argument as a
 Dekker lock). A reply that had read the new state is noticed needlessly,
-never the other way round. The marks are 16 mutex-guarded hash shards by
-task id, pruned when a shard holds 64, with one lock round trip on arrival
-and one on the reply; the ring is 256 changes.
+never the other way round. The marks are two maps over the same records,
+16 mutex-guarded hash shards each, by task (to clear) and by inode (to
+find): a mark goes into the task map first and out of it last, no
+operation holds both locks, and the index never holds a mark without a
+task record (tested under threads). The ring is 256 changes. The cost of
+never expiring is at most one needless notice per (idle task, inode): a
+task that read a directory and then did nothing that clears its mark
+(reads and writes of files do not) gets the directory noticed once by the
+next change, and the notice discharges it.
 
 Single-threaded `untar` and `cp -a` need no notice at all: the task's own
 `getattr` of the directory (on an expired attribute TTL) is followed at
 once by its next request, which clears the mark before the `create` that
 would have noticed. A concurrent `stat` of the directory by another task,
-the thing 2b is about, is noticed once and discharged. Counted:
-`dir_attr_notices` (written) and `dir_attr_notices_skipped` (changed inodes
-no reply was on its way for), per mount in `kernel_cache` and in the
-metrics.
+the thing 2b is about, is noticed once and discharged, however late the
+kernel installs the reply (the daemon slow to hand it over — over a ring
+the ring thread commits it on its next pass, after the other requests it
+reaped in the same pass were handled — or the task not scheduled between
+its wake-up and the install: throttling, a starved cgroup, a paused VM).
+Counted: `dir_attr_notices` (written) and `dir_attr_notices_skipped`
+(changed inodes no reply was on its way for), per mount in `kernel_cache`
+and in the metrics.
 
-What it does not cover: a reply the kernel installs more than a second
-after the daemon generated it (2b opens for that one reply). The second
-counts from the reply's generation, so it holds the daemon's delay in
-handing the reply over — over a ring (the default transport) the ring
-thread commits it on its next pass, after the other requests it reaped in
-the same pass were handled, so a slow handler there adds to it — as well
-as the task's between its wake-up and the install (scheduling: CPU
-bandwidth throttling, a starved cgroup or nice level, a paused VM). And
-`readdirplus` (not negotiated). The marks are bookkeeping of replies
-already written; they do not delay or reorder any reply.
+What it does not cover: `readdirplus` (not negotiated) and replies the old
+process wrote just before a `daemon --upgrade` handover (the watch lives in
+the per-process table; the new process cannot know them). The marks are
+bookkeeping of replies already written; they do not delay or reorder any
+reply.
 
 #### 5.3.2 W3a — 2a: directory attributes are never cached by the kernel
 
@@ -1263,7 +1288,7 @@ kernel).
 | R7 | `invalidate_inode_pages2` failing on a folio (dirty again after `launder_folio`, `EBUSY`), which the kernel ignores | that page survives a drop | today's exposure; S1 makes the next keep-cache decision drop again |
 | R8 | A row that returns to a recorded stamp (ABA): a commit through another view, a stranding rollback's before-image (deposition recovery, takeover), an uncommitted session | closed by §5.1.5's invalidations (S1), or S2 if one is dropped; residual only if a rollback path is added that does not report its records — the K2 test lists every `strand_*` entry point | — |
 | R9 | Race 2a for **directories** in bounded mode (`entry`, Q1): a `stat` racing another task's install of a refresh right after a change returns the old `st_nlink`, size or times once | one stale `stat` result of a directory, never data, never persistent (W3b closes the persistent variant) | not closed (the cost is §5.3.2's); closed under `--cto strict`, by `CONSTELLATION_FUSE_DIR_ATTR_TTL=zero`, and by patch 0002 |
-| R10 | Race 2b for a reply installed more than a second after the daemon generated it (the daemon slow to hand it over — over a ring, behind the other requests of the ring thread's pass — or the task not scheduled between its wake-up and the install), in bounded mode (F21) | the old `st_nlink` or `ctime` for the attribute TTL, once | needs a one-second gap exactly there, concurrent with a change of the inode; `CONSTELLATION_FUSE_DIR_CHANGE_NOTIFY=on` closes it at the cost F21 measured |
+| R10 | Race 2b for a reply the **previous process** wrote just before a `daemon --upgrade` handover and the kernel installs after the new process wrote its first change of that inode, in bounded mode (F21; the attribute watch lives in the per-process page-cache table, so the new process cannot know the reply). Was: a reply installed more than a second after generation, which the marks' one-second expiry let through under load; closed by dropping marks only on evidence (the task's next request, a notice for the inode, the task's exit; a full table notices at once) | the old `st_nlink` or `ctime` for the attribute TTL, once | needs a handover with a reply in flight to a task not yet scheduled, concurrent with a change of the inode; `CONSTELLATION_FUSE_DIR_CHANGE_NOTIFY=on` closes it at the cost F21 measured |
 
 ### 5.10 Rejected
 
@@ -1644,11 +1669,14 @@ decided on this measurement:
   decides whether the count needs to scale with writers.
 - **A misdetected fixed kernel** with W2 forced on (F10): latency only;
   the warn line names the setting.
-- **The narrowed notice's bookkeeping** (F21) costs two mutex round trips
-  per attribute request and one pass over the marks per namespace
-  operation; measured in PROGRESS against `off` on four backing stores. A
-  missed notice is a race-2b window, so its tests include the interleaving
-  of a reply against a change from two threads.
+- **The narrowed notice's bookkeeping** (F21) costs up to four mutex round
+  trips per attribute request (a task map and an inode index, one lookup
+  per changed inode on a namespace operation, none while no mark is held)
+  and a `kill(2)` probe per mark a change finds or a full table sweeps;
+  measured in PROGRESS against `off` on four backing stores. A missed
+  notice is a race-2b window, so its tests include the interleaving of a
+  reply against a change from two threads, a reply installed after more
+  than a second, an exited task, pid 0, and the bound.
 - **Plan 40 landing first**: its plus entries must apply A3 and §5.3's
   directory TTL; the review of whichever plan lands second checks it.
 - **Large folios** (FUSE gaining large-folio buffered writes): KF2's

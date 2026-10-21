@@ -107,8 +107,11 @@ to).
   is written only for an inode an attribute reply may still be on its way
   to the kernel for: a request being served across the change (its reply
   writes the notice itself), or a reply answered to a task that has sent
-  no request since, for up to a second (a task installs a reply before
-  its next request). An
+  no attribute or namespace request since and has not exited (a task
+  installs a reply before its next request; the mark is dropped on that
+  evidence, a notice for the inode or the task's exit, never by time, so
+  a reply installed late under load is covered; a full table of marks
+  writes the notice before the reply instead). An
   `untar` or `cp -a` in one task sends none; another task's `stat` of the
   directory is noticed once. Counted: `dir_attr_notices` written,
   `dir_attr_notices_skipped` not needed.
