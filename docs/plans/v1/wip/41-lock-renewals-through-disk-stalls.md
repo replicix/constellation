@@ -1343,6 +1343,18 @@ Resolved: **L0** is confirmed (model counterexample) and lands
 separately as an integrity fix, holding answers behind a probe; this
 plan verifies it (§7 L0).
 
+**Decided 2026-10-22 (maintainer), for the remaining scope** (the
+assessment and spec of what remains, written against the code of that day:
+the root answers delegation renewals only from its core, which the harness
+reports as `KNOWN-GAP root core stuck`): D3, the root-side lane confirms
+the root still holds its lease with an off-core S3 read, at most one per
+renewal round and only while the core is stuck (without it the lane does
+nothing for a root with a backup); D5, the lock lane stays always on and the
+root-side lane runs only while the core is stuck; D6, the node-side bound
+for held locks stays 120 s and the root-side lane is bounded at 15 s; D7,
+the fjall change (the journal's `write(2)` outside the single-writer lock)
+lands as its own vendored commit.
+
 ## 12. Exit criteria
 
 - [ ] L0 (landed separately) verified present: the renewal-only model
