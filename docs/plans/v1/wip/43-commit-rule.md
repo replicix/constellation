@@ -1027,20 +1027,34 @@ A node that stops sequencing for a group it is a member of keeps the
 rows it holds for that group until the archive carries them:
 
 - **A deposed holder** (C1): its gated unshipped rows of epoch `e`
-  move from `journal` to `backup_tail[(e, first)]` (same `BackupTx`
-  shape the backup role uses), with their before-images applied (the
-  replica returns to the archive prefix). It answers `SealTail` for `e`
-  from there. It drops rows `≤ through` when it applies the segment
-  whose `Tail { epoch: e, jseq: through }` origin covers them, and the
-  rest (uncommitted: the sealer did not hold them) when it applies the
-  successor's `TailFollows { prev_epoch: e, through }`. A marker of an
-  epoch above `e` that carries **no** `TailFollows { prev_epoch: e }`
-  drops `e`'s member copy too: after C1 a `Backup` lease's successor
-  always carries `TailFollows`, so such a marker is the TTL successor of
-  a `Local` lease, whose gated rows were Archive-class and never
-  acknowledged (their clients retry by rid). A member copy of an epoch
-  the operator abandoned (§5.8) becomes the lone-branch replay queue
-  (the only path by which it is re-executed).
+  move from `journal` to the member copy under `(e, first)` (a
+  keyspace of its own, `member_copy`: `backup_trim` and `backup_clear`
+  drop the `backup_tail` keyspace's older epochs on events unrelated to
+  it; C1 spec D5), with their before-images applied (the replica
+  returns to the archive prefix). It answers `SealTail` for `e` from
+  there. It drops a transaction when the archive carries its identity
+  (`TailOf { epoch: e, jseq: first }`, the re-shipped transaction's
+  first record, or `e`'s own segment), and the rest (uncommitted: the
+  sealer did not hold them) when it applies the successor's marker
+  `TailFollowsThrough { prev_epoch: e, through }` (C1 spec D10: both
+  are appended `LogRecord` variants; `TailFollows { prev_epoch }` stays
+  as it is). A marker of an epoch above `e` that carries no
+  `TailFollows*` for `e` drops `e`'s **Archive-class** rows only (never
+  acknowledged: their clients retry by rid); its RootGroup-class rows
+  wait for the archive to cover them. *Corrected by the C1 spec (D2,
+  2026-10-22):* the text here said such a marker drops the whole member
+  copy, on the premise that it can only be the TTL successor of a
+  `Local` lease whose gated rows were never acknowledged. A
+  seal-takeover successor is itself a `Local` tenure that holds its
+  predecessor's committed tail until the archive carries it; if it dies
+  before, its TTL successor (no fetch from a `Local` lease) would have
+  dropped the last copies. Hence the **inherited tail** (§7 C1): the
+  lease names the old group until the re-shipped rows are archived, and
+  a claimant of such a lease fetches it. A sealed backup and the
+  successor itself keep their copy of `e` as a member copy too, until
+  coverage. A member copy of an epoch the operator abandoned (§5.8)
+  becomes the lone-branch replay queue (the only path by which it is
+  re-executed).
 - **A deposed root** (C3): another generation's appended rows
   (`Local { gen != 0 }`) move to `backup_tail[DELEG_BACKUP_BASE + gen]`
   (the delegate-backup tail keyspace, `crates/meta/src/store/backup.rs:390-444`),
@@ -1092,8 +1106,10 @@ sequencer's ungated rows (and an operator's abandon). C5:
 
 `constellation repair abandon-group --epoch E` (and `--gen G`): run on
 the node that waits to claim (§5.2 item 5) or to end a generation whose
-group is unreachable. It journals `LogRecord::GroupAbandoned { epoch |
-gen, through_known }` and lets the claim or the generation end proceed;
+group is unreachable. It journals `LogRecord::GroupAbandoned { epoch,
+gen, through_known }` (one variant for both: `gen = 0` for the root
+group; C1 lands it with `gen`, aligned with the C2 spec) in the
+claimant's marker and lets the claim or the generation end proceed;
 every member copy of `E` (or `G`) that later reappears is moved to that
 node's lone-branch queue (replayed by rid, conflict copies on refusal:
 explicitly an operator's choice, counted in `status.ack.abandoned`).
@@ -1399,12 +1415,10 @@ own `(epoch, first)`, a new `BackupRole`-like marker
 `member_copy:{epoch}` in `local`); `abort_durable_parks` stops marking
 gated rows `unacked` (`readindex.rs:880-985`); `LiveEntry::stranded_by_epoch(epoch,
 tail_follows)` and `Shadow`/`Hint`'s `gated` (`spec.rs:146-282`);
-`MutateReply.committed` (`crates/authority/src/event.rs`); `JournalTx.tail_of`
-and `TailFollows { prev_epoch, through }` (`record.rs:245-253`,
-`jobs.rs:4242-4247`; the ship plan writes `tail_of` as an origin —
-until C3's `Origin` enum, as a second parallel vector
-`tail_origins: Vec<(u64, u64)>` in the envelope, folded into `Origin`
-by C3); `PeerMsg::SealTail`/`SealedTail` (`event.rs`; engine transport
+`MutateReply.committed` (`crates/authority/src/event.rs`); the tail identity and the marker's `through` (*as specified for the
+coder, Q22 (c): the appended records `TailOf { epoch, jseq }` and
+`TailFollowsThrough { prev_epoch, through }`, not `JournalTx.tail_of`,
+an envelope vector or an in-place `TailFollows` field*); `PeerMsg::SealTail`/`SealedTail` (`event.rs`; engine transport
 in `crates/engine/src/p2p.rs` and `authority_driver.rs` as a
 request/response like `DelegSeal`, timeout `backup_takeover_ms`); the
 claim path (`LeaseState::classify`, `crates/authority/src/core/lease.rs:306-394`:
@@ -1521,6 +1535,69 @@ file systems; `make perf-gate` green; `meta-bench` neutral;
 nothing to the seal path). The TTL path gains one round trip plus a
 synced seal at a member: reported in `holder-kill-rejoin` and
 `ack-s3-failover` against C0, within +10 % of their failover time.
+
+**Specified 2026-10-22** (the coder spec; the decisions that go
+beyond the text above, with what the maintainer must confirm in §11
+Q22):
+- **Four commits, in this order, each landable alone, after C2a** (Q21
+  (l)): C1-1 the root group's commit holds across a listing and a
+  removal (seed 892, and **seed 472** of `long-backup`, the same class on
+  current `main`: a restarted holder re-invites its old backup, which
+  discards its old-tenure tail just before the listing lands); C1-2 the
+  class at journal time (`JournalTx.class: RowClass` right after `idx`,
+  `gated()` per Q12) on C2a's carried class, `MutateReply.committed`, and
+  an oracle check of the core's class claim; C1-3 the tail fetch, the
+  inherited tail, the strict wait and `repair abandon-group`, a listed
+  backup sealing before it claims at expiry; C1-4 member copies,
+  committed shadows and streams, tail identity, the strict flags. Fable
+  review of C1-3 and C1-4.
+- **The listing fix (892, 472) is on the holder:** a backup counts only
+  from acknowledgements of appends that carried a configuration version
+  listing it; a `BackupAck.fresh` lets a discarded hold restart the
+  count. **A removal lands covered** (Q22 (a)): while a removal CAS is
+  out or in doubt, acknowledgements count only the staying set (an empty
+  one: the log) — otherwise rows acknowledged on the removed backup in
+  the CAS's flight rest on the holder alone under a `Local` version that
+  no TTL claimant fetches from, a loss once the replay is gone.
+- **A gated row whose own client is answered with the gate off is
+  re-tagged `Lone`** before the answer, so its strand behaviour matches
+  what its client was told (§5.1's "class fixed at journal time" governs
+  every wait; C2's `park_durable` makes a remote park wait for the
+  archive instead; C2's `Ungated` → `true` arm keeps this re-tag).
+- **The inherited tail** (Q22 (b)): `Lease.inherited_tail { epoch,
+  config_version, members, through }`, written by the claim that
+  re-ships a tail, cleared by the first lease CAS after the re-shipped
+  rows are in the log; a TTL claimant of such a lease fetches the tail
+  (§5.6's correction).
+- **Append-only in the bucket** (as C2's `RecallCut`): the tail identity
+  is an appended `LogRecord::TailOf { epoch, jseq }`, the first record of
+  a re-shipped transaction (no `SegmentEnvelope` field, no `BackupTx`
+  field; transitive by construction), and the marker's `through` is an
+  appended `TailFollowsThrough { prev_epoch, through }`; `TailFollows`
+  stays. This replaces the `tail_origins` envelope vector and the
+  in-place `TailFollows` field named above.
+- **The re-ship is the sealed tail's contiguous prefix** (`through`);
+  rows past a gap were never acknowledged.
+- **A self-sealed holder re-claims at `epoch + 1`**, re-shipping its own
+  member copy (the own-lease rule keeps the epoch).
+- **`SealTail` is accepted** for the held epoch and any
+  `config_version ≥` the member's own (a backup listed at `v` without an
+  append at `v` yet would otherwise refuse, and a claim wait with it alive).
+- **The TTL relaxation is deleted with the TTL claim without a tail:**
+  `check_failure_budget` still classifies (`double_faults`) but waives
+  nothing; `regression_backup_crash_classes`' double-fault seeds and
+  `a_backup_paused_while_its_holder_is_cut_from_s3_is_beyond_the_budget`
+  are rewritten to strict passes (or `waiting_for_group`).
+- New sim config **`backup-chain-ttl`** (the successor dies before its
+  re-shipped tail ships; the third node claims its `Local` lease) and
+  model test `a_chained_takeover_without_the_inherited_tail_loses_an_acked_write`:
+  the inherited tail's fail-before.
+- `strict_commit` stays off in the `strict_durability` configs until C2
+  (their `archive/*` answers are fresh tenures answering other nodes'
+  forwards, C2's rule); C1's tests assert "no `root-group/*`".
+- `bench/commit-rule/RESULTS.md` has no C0 baseline yet (C0's D4 was not
+  run): C1 measures its parent and itself on the same host, on four file
+  systems.
 
 **Exit criteria.** Every listed sim config green at the counts with the
 strict flags; the new config and variants green; the model tests; the
@@ -3115,6 +3192,8 @@ additionally fails on `non_lone_rollbacks > 0` (I5) from C1. New
 |---|---|---|---|
 | every `strict_durability` config (existing: `backup`, `ack-s3`, `backup-crash`, `ack-s3-crash`, `backup-departs`, `backup-partition`, `backup-strict`, `backup-hot`, `placement-hot`, `long-backup`, `long-acks3`) | C1 | transient rollbacks of acknowledged shadows/streamed rows at a seal; deposed holder's replays of committed rows | each test's range; `long-backup`×5000 |
 | `backup-group-cut-ttl` (+ `-holder-only`, `-backup-only`) | C1 | a TTL claimer of a `Backup` lease gets no tail; acknowledged rows replayed and copied | ×2000 each |
+| `backup-chain-ttl` | C1 | a seal-takeover successor dies before its re-shipped tail ships; the TTL claimant of its `Local` lease fetches nothing (inherited tail, §5.6's correction) | ×2000 |
+| `long-backup` seeds 472, 892 | C1 | a listing CAS counts acknowledgements given before the listing (a candidate's discarded tail) | pinned |
 | `long-delegated`, `long-delegated-backup`, `delegated-*` (existing) with `strict_commit` | C2 | a delegate without a backup acknowledges alone | ×2000–5000 (§7 C2) |
 | `long-delegated-late-answers` (existing) with all strict flags | C2, C3 | the same; late landings; copies in two queues | ×10000 (incl. the 9287/2945 regressions) |
 | `tloss-two-node` | C2 (I1), C3 (I2) | the 2026-10-16 loss shape | ×5000 |
@@ -3145,7 +3224,7 @@ delegated-holder-cut test); none is deleted.
 
 | Model | New property / knob | Violating test (knob off) | Clean test (design) | Milestone |
 |---|---|---|---|---|
-| `backup.rs` | `acked_never_rolled_back`; `commit_rule` | `today_a_deposed_holder_replays_committed_rows`, `a_ttl_claim_without_the_tail_fetch_rolls_back_an_acked_write` | `commit_rule_two_nodes_is_clean`, `commit_rule_three_nodes_is_clean` | C0 / C1 |
+| `backup.rs` | `acked_never_rolled_back`; `commit_rule`; `tail_fetch`, `inherited_tail` (C1) | `today_a_deposed_holder_replays_committed_rows`, `a_ttl_claim_without_the_tail_fetch_rolls_back_an_acked_write`, `a_chained_takeover_without_the_inherited_tail_loses_an_acked_write` | `commit_rule_two_nodes_is_clean`, `commit_rule_three_nodes_is_clean` | C0 / C1 |
 | `delegation.rs` | `acked_ops_are_never_replayed`; `ack_via_root` | `today_a_delegate_without_a_backup_acks_alone` | the four design configs renamed (§7 C2) | C0 / C2 |
 | `protocol.rs` | `eio_never_lands_late`; `abandon`; `Protocol::Commit` | `today_an_in_doubt_op_lands_after_its_eio` | `commit_protocol_is_clean` | C0 / C2 / C3 |
 | `flex.rs` | `hold_owner_never_deposed_except_by_retire` | (checks Q3's decision; a counterexample stops C0) | `full_rule_is_clean` with it | C0 |
@@ -3266,7 +3345,7 @@ not loosen the bar.
 The final list. Each says what it **blocks**; a question that the code
 answered is marked **decided** (the plan implements the decision; the
 maintainer may still overturn it). Blocking before C0: Q7, Q10a.
-Before C1: Q1, Q13. Before C2: Q2, Q4, Q9, Q14, Q15, Q16, Q21. Before C4:
+Before C1: Q1, Q13, Q22. Before C2: Q2, Q4, Q9, Q14, Q15, Q16, Q21. Before C4:
 Q6. Before C6: Q5. Before C7b: Q10b, Q10c. Before C7-F: Q17 (F-a),
 Q18 (F-b). Before C7-H1: Q19. Before C7a's commits 2–4: Q20.
 
@@ -3506,6 +3585,26 @@ to land before C0.
   and no compatibility shims anywhere (work-in-progress code, nothing
   installed): the inbox gains its field and a batch from an older binary is
   simply not read.
+
+- **Q22 — C1's coder-spec decisions (specified 2026-10-22).** *Blocks
+  C1.* (a) *A removal lands covered*: while a reconfiguration that
+  removes a backup is out or in doubt, acknowledgements count only the
+  staying backups (none: the log). Cost: during that CAS's flight (one S3
+  round trip, or until the doubt is settled) a holder left with no backup
+  acknowledges at the archive's pace instead of on the removed backup's
+  ack. Without it, rows acknowledged in that flight rest on the holder
+  alone once the removal lands, and after C1 nothing brings them back if
+  it dies. *Recommended: yes.* (b) *The inherited tail* (§5.6's
+  correction, §7 C1): a new lease field naming the old group until the
+  re-shipped tail is archived; a TTL claimant of such a lease fetches it.
+  No hot-path cost; one more reason for a claim to wait (G4's, unchanged
+  in kind). *Recommended: yes* (the alternative, the successor's gate
+  waiting for its tail to land, does not close the gap: the successor may
+  die after its marker). (c) *Append-only in the bucket*: `TailOf` and
+  `TailFollowsThrough` as appended records instead of an envelope vector
+  and an in-place `TailFollows` field (as Q21 (a) did for `RecallCut`):
+  *recommended*.
+  **Answered 2026-10-22:** (a), (b) and (c) taken.
 
 ### 11.1 Deferred (not in this plan)
 
