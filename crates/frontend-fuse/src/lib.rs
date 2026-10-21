@@ -19,18 +19,22 @@ mod adapter;
 mod dentries;
 mod fault;
 mod notify;
+pub mod pagecache;
 pub mod passthrough;
 pub mod refs;
 mod reply;
 mod session;
 pub mod stats;
 pub mod threads;
+pub mod workarounds;
 
+pub use adapter::KernelLink;
 pub use adapter::{FuseFs, KernelTuning};
 pub use constellation_vfs::FrontendCaps;
 pub use dentries::KernelEntries;
 pub use fuser::{NegotiatedInit, Transport};
 pub use notify::FuseNotifySink;
+pub use pagecache::{KeepCache, PageCacheCounts, PageCacheTable};
 pub use passthrough::{
     has_cap_sys_admin, InodeHandoff, PassthroughHandoff, PassthroughPolicy, PassthroughState,
     PassthroughStatus, PassthroughWish, PASSTHROUGH_ENV,
@@ -46,6 +50,7 @@ pub use session::{
 pub use stats::{
     FallbackReason, LockWaitCounter, RingHealthStats, SessionStats, TransportFallback,
 };
+pub use workarounds::Workarounds;
 
 /// Whether this build can serve FUSE-over-io_uring at all (the `io-uring`
 /// feature, on Linux): what `constellation daemon --fuse-transports`

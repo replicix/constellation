@@ -156,6 +156,7 @@ fn fuse_mount_status(stats: &constellation_frontend_fuse::SessionStats) -> api::
         forgets_partial: stats.forgets_partial(),
         forgets_unknown: stats.forgets_unknown(),
         forgets_underflow: stats.forgets_underflow(),
+        kernel_cache: kernel_cache_status(&stats.kernel_cache()),
         last_fallback: stats.last_fallback().map(|f| api::FuseFallback {
             from: f.from.name().to_string(),
             to: f.to.name().to_string(),
@@ -164,6 +165,19 @@ fn fuse_mount_status(stats: &constellation_frontend_fuse::SessionStats) -> api::
             at_unix_ms: f.at_unix_ms,
         }),
         ..Default::default()
+    }
+}
+
+/// Plan 42 §5.7: a session's kernel-cache counters, in the protocol's
+/// shape.
+fn kernel_cache_status(
+    c: &constellation_frontend_fuse::PageCacheCounts,
+) -> api::FuseKernelCacheStatus {
+    let by = |v: &[(&'static str, u64)]| v.iter().map(|(k, n)| (k.to_string(), *n)).collect();
+    api::FuseKernelCacheStatus {
+        keep_cache_opens: c.keep_cache_opens,
+        dropping_opens: by(&c.dropping_opens),
+        suspect_marks: by(&c.suspect_marks),
     }
 }
 

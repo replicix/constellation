@@ -25,6 +25,18 @@
 //! resuming host re-invalidates the data of every open file
 //! (`constellation-frontend-fuse`'s caller does, from the handle table).
 //!
+//! # What the page-cache table is told (plan 42 §5.1.3)
+//!
+//! Every data invalidation the sink writes marks the inode's pages as not
+//! current (S1, *before* the write: an open answered while the kernel is
+//! dropping them must not keep them), and every one it cannot deliver —
+//! refused by the closed gate, failed with anything but `ENOENT`, or
+//! dropped by the engine (`FrontendEvents::undelivered`) — marks them too
+//! (S2: pages have no lifetime, so a lost notification leaves them stale
+//! until an open drops them). The table is the session's
+//! ([`crate::PageCacheTable`]), handed to the gate with its notifier: a
+//! resumed session's gate marks the resumed session's table.
+//!
 //! # Only what the kernel can hold
 //!
 //! An entry invalidation (and a delete) takes the parent directory's
@@ -35,6 +47,7 @@
 //! could otherwise leave it parked on for good.
 
 use crate::dentries::KernelEntries;
+use crate::pagecache::{Mark, PageCacheTable};
 use constellation_vfs::{FrontendEvents, Invalidation};
 use fuser::{INodeNo, Notifier};
 use std::ffi::OsStr;
@@ -46,6 +59,8 @@ struct GateState {
     notifier: Option<Notifier>,
     /// What the kernel of the session written to can hold.
     entries: Arc<KernelEntries>,
+    /// What that session knows of its kernel's page cache.
+    pc: Arc<PageCacheTable>,
     open: bool,
     /// Writes under way right now.
     writing: u32,
@@ -59,11 +74,16 @@ pub(crate) struct NotifyGate {
 }
 
 impl NotifyGate {
-    pub(crate) fn new(notifier: Notifier, entries: Arc<KernelEntries>) -> Arc<Self> {
+    pub(crate) fn new(
+        notifier: Notifier,
+        entries: Arc<KernelEntries>,
+        pc: Arc<PageCacheTable>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(GateState {
                 notifier: Some(notifier),
                 entries,
+                pc,
                 open: true,
                 writing: 0,
             }),
@@ -72,15 +92,28 @@ impl NotifyGate {
     }
 
     /// The notifier to write with, and what its kernel can hold, counted
-    /// as a write under way; `None` while the gate is closed.
-    fn enter(&self) -> Option<(Notifier, Arc<KernelEntries>)> {
+    /// as a write under way; `Err` with the session's table while the
+    /// gate is closed (`None` once it is retired).
+    #[allow(clippy::type_complexity)]
+    fn enter(
+        &self,
+    ) -> Result<(Notifier, Arc<KernelEntries>, Arc<PageCacheTable>), Option<Arc<PageCacheTable>>>
+    {
         let mut st = self.state.lock().unwrap();
+        let pc = st.pc.clone();
         if !st.open {
-            return None;
+            return Err(Some(pc));
         }
-        let notifier = st.notifier.clone()?;
+        let Some(notifier) = st.notifier.clone() else {
+            return Err(None);
+        };
         st.writing += 1;
-        Some((notifier, st.entries.clone()))
+        Ok((notifier, st.entries.clone(), pc))
+    }
+
+    /// The session's page-cache table (whatever the gate's state).
+    pub(crate) fn page_cache(&self) -> Arc<PageCacheTable> {
+        self.state.lock().unwrap().pc.clone()
     }
 
     fn exit(&self) {
@@ -119,12 +152,17 @@ impl NotifyGate {
 
     /// Open the gate again, writing through `notifier` from now on when
     /// one is given (a resumed session's channel, with that session's
-    /// `entries`).
-    pub(crate) fn reopen(&self, session: Option<(Notifier, Arc<KernelEntries>)>) {
+    /// `entries` and page-cache table).
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn reopen(
+        &self,
+        session: Option<(Notifier, Arc<KernelEntries>, Arc<PageCacheTable>)>,
+    ) {
         let mut st = self.state.lock().unwrap();
-        if let Some((notifier, entries)) = session {
+        if let Some((notifier, entries, pc)) = session {
             st.notifier = Some(notifier);
             st.entries = entries;
+            st.pc = pc;
         }
         st.open = true;
     }
@@ -142,7 +180,16 @@ impl FuseNotifySink {
     /// ([`crate::FuseFs::kernel_entries`] of the session's filesystem).
     pub fn new(notifier: Notifier, entries: Arc<KernelEntries>) -> Self {
         Self {
-            gate: NotifyGate::new(notifier, entries),
+            gate: NotifyGate::new(notifier, entries, PageCacheTable::new(Default::default())),
+        }
+    }
+
+    /// A sink writing through `notifier` to the kernel of `link`'s
+    /// session ([`crate::FuseFs::kernel_link`]): what it writes and fails
+    /// to write is marked in that session's page-cache table.
+    pub fn linked(notifier: Notifier, link: &crate::KernelLink) -> Self {
+        Self {
+            gate: NotifyGate::new(notifier, link.entries.clone(), link.pc.clone()),
         }
     }
 
@@ -155,15 +202,40 @@ impl FuseNotifySink {
     }
 }
 
+/// The inode whose pages `inv` drops, if it drops pages.
+fn data_ino(inv: &Invalidation) -> Option<u64> {
+    match inv {
+        Invalidation::Data { ino, .. } | Invalidation::Fenced { ino } => Some(*ino),
+        _ => None,
+    }
+}
+
 impl FrontendEvents for FuseNotifySink {
     fn invalidate(&self, batch: &[Invalidation]) {
-        let Some((notifier, entries)) = self.gate.enter() else {
-            return;
+        let (notifier, entries, pc) = match self.gate.enter() {
+            Ok(entered) => entered,
+            Err(pc) => {
+                // Closed for a handover (or retired): nothing reaches the
+                // kernel, and its pages stay as they are (S2).
+                if let Some(pc) = pc {
+                    for ino in batch.iter().filter_map(data_ino) {
+                        pc.mark(ino, Mark::S2);
+                    }
+                }
+                return;
+            }
         };
         for inv in batch {
-            // ENOENT (nothing cached) is the common answer; every error
-            // only means there was nothing to drop.
-            let _ = match inv {
+            // Before the write: an open answered while the kernel drops
+            // the pages must not keep them (S1).
+            let data = data_ino(inv);
+            if let Some(ino) = data {
+                pc.mark(ino, Mark::S1);
+            }
+            // ENOENT (nothing cached) is the common answer; any other
+            // error leaves pages the kernel did not drop (S2), and for
+            // the rest only means there was nothing to drop.
+            let result = match inv {
                 Invalidation::Entry { parent, name }
                 | Invalidation::Deleted { parent, name, .. }
                     if !entries.may_be_cached(*parent, name.as_bytes()) =>
@@ -190,7 +262,21 @@ impl FrontendEvents for FuseNotifySink {
                 ),
                 _ => Ok(()),
             };
+            if let (Some(ino), Err(e)) = (data, &result) {
+                if e.raw_os_error() != Some(libc::ENOENT) {
+                    pc.mark(ino, Mark::S2);
+                }
+            }
         }
         self.gate.exit();
+    }
+
+    /// Plan 42 §5.1.3 (S2): the engine dropped `batch`; its pages were not
+    /// dropped either.
+    fn undelivered(&self, batch: &[Invalidation]) {
+        let pc = self.gate.page_cache();
+        for ino in batch.iter().filter_map(data_ino) {
+            pc.mark(ino, Mark::S2);
+        }
     }
 }

@@ -2447,3 +2447,202 @@ fn a_passthrough_handle_fsyncs_and_releases_its_own_handle_and_the_id_once() {
     assert_eq!(*fake.closed.lock().unwrap(), vec![40, 41]);
     k.finish();
 }
+
+// ------------------------------------------- plan 42: keep-cache (W1)
+
+/// `FOPEN_KEEP_CACHE` in `fuse_open_out.open_flags`.
+const FOPEN_KEEP_CACHE: u32 = 1 << 1;
+
+fn stamped(fh: u64, stamp: u128) -> Opened {
+    let mut o = Opened::new(Fh(fh));
+    o.cache = Some(constellation_vfs::CacheStamp(stamp));
+    o
+}
+
+/// A session whose notifications are written through a sink linked to
+/// its page-cache table, as a mounted session's are.
+fn keep_cache_kernel() -> (Kernel, MockVfs, FuseNotifySink) {
+    let mock = MockVfs::new();
+    let fs = FuseFs::new(
+        Arc::new(mock.clone()),
+        FrontendCaps::linux_fuse(false),
+        KernelTuning::for_workers(1),
+    );
+    let link = fs.kernel_link();
+    let (k, notifier) = Kernel::start_fs_notifying(fs, KERNEL_INIT_FLAGS, 0);
+    let sink = FuseNotifySink::linked(notifier, &link);
+    mock.always_release(Script::ok(()));
+    mock.always_flush(Script::ok(()));
+    (k, mock, sink)
+}
+
+fn open_flags_of(k: &mut Kernel, ino: u64) -> u32 {
+    let r = k.call(op::OPEN, ino, &Body::new().i32(libc::O_RDONLY).u32(0));
+    open_out(&r).1
+}
+
+/// A close: the `FLUSH` that carries the handle, then its `RELEASE`.
+fn release(k: &mut Kernel, ino: u64, fh: u64) {
+    k.call(op::FLUSH, ino, &Body::new().u64(fh).u32(0).u32(0).u64(0))
+        .ok();
+    release_unused(k, ino, fh);
+}
+
+/// A `RELEASE` with no request before it carrying the handle: what the
+/// kernel sends when it fails an open after the reply.
+fn release_unused(k: &mut Kernel, ino: u64, fh: u64) {
+    k.call(op::RELEASE, ino, &Body::new().u64(fh).i32(0).u32(0).u64(0))
+        .ok();
+}
+
+/// Plan 42 §5.1: an `OPEN` reply carries `FOPEN_KEEP_CACHE` exactly when
+/// the table says the pages are current — after a drop at the same stamp
+/// whose handle the kernel has used (its drop complete), with no mark
+/// since.
+#[test]
+fn an_open_keeps_the_pages_exactly_when_they_are_known_current() {
+    let (mut k, mock, sink) = keep_cache_kernel();
+    mock.on_open(Script::ok(stamped(8, 5)));
+    mock.always_open(Script::ok(stamped(9, 5)));
+    assert_eq!(open_flags_of(&mut k, 50) & FOPEN_KEEP_CACHE, 0, "no entry");
+    assert_eq!(
+        open_flags_of(&mut k, 50) & FOPEN_KEEP_CACHE,
+        0,
+        "the first open's drop may still be ahead"
+    );
+    release(&mut k, 50, 8);
+    release(&mut k, 50, 9);
+    assert_ne!(open_flags_of(&mut k, 50) & FOPEN_KEEP_CACHE, 0, "current");
+    release(&mut k, 50, 9);
+    // A handle released with no request ever carrying it: the kernel may
+    // have failed that open after the reply, without its drop.
+    mock.always_open(Script::ok(stamped(9, 7)));
+    assert_eq!(open_flags_of(&mut k, 50) & FOPEN_KEEP_CACHE, 0);
+    release_unused(&mut k, 50, 9);
+    assert_eq!(
+        open_flags_of(&mut k, 50) & FOPEN_KEEP_CACHE,
+        0,
+        "the unused handle's drop is as good as lost"
+    );
+    release(&mut k, 50, 9);
+    assert_ne!(open_flags_of(&mut k, 50) & FOPEN_KEEP_CACHE, 0);
+    // Another stamp: the content changed.
+    mock.always_open(Script::ok(stamped(9, 6)));
+    assert_eq!(open_flags_of(&mut k, 50) & FOPEN_KEEP_CACHE, 0);
+    release(&mut k, 50, 9);
+    assert_ne!(open_flags_of(&mut k, 50) & FOPEN_KEEP_CACHE, 0);
+    // No stamp: drop.
+    mock.always_open(Script::ok(Opened::new(Fh(9))));
+    assert_eq!(open_flags_of(&mut k, 50) & FOPEN_KEEP_CACHE, 0);
+    release(&mut k, 50, 9);
+    mock.always_open(Script::ok(stamped(9, 6)));
+    assert_eq!(
+        open_flags_of(&mut k, 50) & FOPEN_KEEP_CACHE,
+        0,
+        "the last drop recorded no stamp"
+    );
+    release(&mut k, 50, 9);
+    assert_ne!(open_flags_of(&mut k, 50) & FOPEN_KEEP_CACHE, 0);
+    drop(sink);
+    k.finish();
+}
+
+/// S1: a data invalidation the sink writes marks the inode before the
+/// notification reaches the kernel; the next open drops. S2: one the
+/// engine dropped does too. S3: a failed write does too.
+#[test]
+fn notifications_undelivered_ones_and_failed_writes_mark_the_pages() {
+    let (mut k, mock, sink) = keep_cache_kernel();
+    mock.always_open(Script::ok(stamped(9, 5)));
+    let current = |k: &mut Kernel| {
+        open_flags_of(k, 50);
+        release(k, 50, 9);
+    };
+    current(&mut k);
+    assert_ne!(open_flags_of(&mut k, 50) & FOPEN_KEEP_CACHE, 0);
+    release(&mut k, 50, 9);
+    // S1.
+    sink.invalidate(&[Invalidation::Data {
+        ino: 50,
+        range: None,
+    }]);
+    let n = k.recv();
+    assert_eq!((n.unique, n.error), (0, NOTIFY_INVAL_INODE));
+    assert_eq!(open_flags_of(&mut k, 50) & FOPEN_KEEP_CACHE, 0, "S1");
+    release(&mut k, 50, 9);
+    assert_ne!(open_flags_of(&mut k, 50) & FOPEN_KEEP_CACHE, 0);
+    release(&mut k, 50, 9);
+    // An attribute-only one marks nothing.
+    sink.invalidate(&[Invalidation::Attr { ino: 50 }]);
+    k.recv();
+    assert_ne!(open_flags_of(&mut k, 50) & FOPEN_KEEP_CACHE, 0);
+    release(&mut k, 50, 9);
+    // S2.
+    sink.undelivered(&[Invalidation::Data {
+        ino: 50,
+        range: None,
+    }]);
+    assert_eq!(open_flags_of(&mut k, 50) & FOPEN_KEEP_CACHE, 0, "S2");
+    release(&mut k, 50, 9);
+    // S3: an error, then a short count.
+    for script in [Script::fail(Code::Io), Script::ok(2)] {
+        current(&mut k);
+        mock.always_write(script);
+        let r = k.call(
+            op::WRITE,
+            50,
+            &Body::new()
+                .u64(9)
+                .u64(0)
+                .u32(5)
+                .u32(0)
+                .u64(0)
+                .i32(RW)
+                .u32(0)
+                .bytes(b"bytes"),
+        );
+        let _ = r;
+        assert_eq!(open_flags_of(&mut k, 50) & FOPEN_KEEP_CACHE, 0, "S3");
+        release(&mut k, 50, 9);
+    }
+    k.finish();
+}
+
+/// A truncating create never keeps; a passthrough answer never keeps.
+#[test]
+fn a_truncating_create_drops() {
+    let (mut k, mock, _sink) = keep_cache_kernel();
+    mock.always_create(Script::ok((entry(50, FileKind::File), stamped(9, 5))));
+    mock.always_open(Script::ok(stamped(9, 5)));
+    open_flags_of(&mut k, 50);
+    release(&mut k, 50, 9);
+    let r = k.call(
+        op::CREATE,
+        1,
+        &Body::new()
+            .i32(libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC)
+            .u32(0o644)
+            .u32(0o22)
+            .u32(0)
+            .cstr("f"),
+    );
+    let open_flags = r.u32_at(128 + 8);
+    assert_eq!(open_flags & FOPEN_KEEP_CACHE, 0, "O_TRUNC");
+    release(&mut k, 50, 9);
+    let r = k.call(
+        op::CREATE,
+        1,
+        &Body::new()
+            .i32(libc::O_RDWR | libc::O_CREAT)
+            .u32(0o644)
+            .u32(0o22)
+            .u32(0)
+            .cstr("f"),
+    );
+    assert_ne!(
+        r.u32_at(128 + 8) & FOPEN_KEEP_CACHE,
+        0,
+        "an existing file, current"
+    );
+    k.finish();
+}

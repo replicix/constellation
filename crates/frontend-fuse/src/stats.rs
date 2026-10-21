@@ -364,6 +364,9 @@ pub struct SessionStats {
     ring_health: RingHealthStats,
     /// Plan 40 R2: the kernel's lookup counts, read live.
     refs: Option<Arc<KernelRefs>>,
+    /// Plan 42: what the session knows of the kernel's page cache, and
+    /// the workarounds' counters, read live.
+    pc: Option<Arc<crate::PageCacheTable>>,
 }
 
 impl SessionStats {
@@ -429,6 +432,7 @@ impl SessionStats {
             lock_wait_downgrades: LockWaitCounter::default(),
             ring_health: RingHealthStats::default(),
             refs: None,
+            pc: None,
         }
     }
 
@@ -456,6 +460,18 @@ impl SessionStats {
     pub(crate) fn with_kernel_refs(mut self, refs: Arc<KernelRefs>) -> Self {
         self.refs = Some(refs);
         self
+    }
+
+    /// Report `pc`'s counters (the session's filesystem's table).
+    pub(crate) fn with_page_cache(mut self, pc: Arc<crate::PageCacheTable>) -> Self {
+        self.pc = Some(pc);
+        self
+    }
+
+    /// Plan 42: the kernel-cache workarounds' counters (all 0 for a
+    /// `SessionStats` built without a session).
+    pub fn kernel_cache(&self) -> crate::PageCacheCounts {
+        self.pc.as_ref().map(|pc| pc.counts()).unwrap_or_default()
     }
 
     /// Node ids the kernel holds at least one lookup of (plan 40 R2).

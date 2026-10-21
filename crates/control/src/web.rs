@@ -1310,6 +1310,50 @@ fn render_fuse(output: &mut String, fuse: &FuseStatus) {
             );
         }
     }
+    kernel_cache_metrics(output, fuse);
+}
+
+/// Plan 42 §5.7: the kernel-race workarounds' counters.
+fn kernel_cache_metrics(output: &mut String, fuse: &FuseStatus) {
+    use std::fmt::Write;
+    output.push_str(
+        "# HELP constellation_fuse_keep_cache_opens_total FUSE opens that kept the file's pages (FOPEN_KEEP_CACHE).\n\
+         # TYPE constellation_fuse_keep_cache_opens_total counter\n",
+    );
+    for m in &fuse.mounts {
+        let _ = writeln!(
+            output,
+            "constellation_fuse_keep_cache_opens_total{{mountpoint=\"{}\"}} {}",
+            label_value(&m.mountpoint),
+            m.kernel_cache.keep_cache_opens
+        );
+    }
+    output.push_str(
+        "# HELP constellation_fuse_dropping_opens_total FUSE opens that dropped the file's pages, by reason.\n\
+         # TYPE constellation_fuse_dropping_opens_total counter\n",
+    );
+    for m in &fuse.mounts {
+        for (reason, n) in &m.kernel_cache.dropping_opens {
+            let _ = writeln!(
+                output,
+                "constellation_fuse_dropping_opens_total{{mountpoint=\"{}\",reason=\"{reason}\"}} {n}",
+                label_value(&m.mountpoint),
+            );
+        }
+    }
+    output.push_str(
+        "# HELP constellation_fuse_suspect_marks_total Marks that a file's kernel pages may be stale, by mark (plan 42 S1-S5).\n\
+         # TYPE constellation_fuse_suspect_marks_total counter\n",
+    );
+    for m in &fuse.mounts {
+        for (mark, n) in &m.kernel_cache.suspect_marks {
+            let _ = writeln!(
+                output,
+                "constellation_fuse_suspect_marks_total{{mountpoint=\"{}\",mark=\"{mark}\"}} {n}",
+                label_value(&m.mountpoint),
+            );
+        }
+    }
 }
 
 async fn index() -> HttpResponse {

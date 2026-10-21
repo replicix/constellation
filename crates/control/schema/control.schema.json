@@ -2845,6 +2845,41 @@
       ],
       "type": "object"
     },
+    "FuseKernelCacheStatus": {
+      "description": "Plan 42 §5.7: what one mount's kernel-race workarounds did.",
+      "properties": {
+        "dropping_opens": {
+          "additionalProperties": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "description": "Opens that dropped the pages, by reason: `no_stamp` (the engine\nanswered none: strict, invalidation off, not a regular file, a\nnotification on its way), `stamp_changed`, `suspect` (a mark below),\n`no_entry` (nothing known of the inode's pages), `trunc` (a\ntruncating create), `off` (`CONSTELLATION_FUSE_KEEP_CACHE=off`),\n`drop_in_flight` (an earlier open's drop not known complete),\n`passthrough`.",
+          "type": "object"
+        },
+        "keep_cache_opens": {
+          "description": "Opens answered `FOPEN_KEEP_CACHE`: the kernel kept the file's\npages, known current (W1).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "suspect_marks": {
+          "additionalProperties": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "description": "Marks that a file's pages may be stale, by mark: `s1` (a data\ninvalidation written), `s2` (one not delivered), `s3` (a write\nanswered with an error or a short count), `s4` (a direct-I/O open),\n`s5` (the write-race bookkeeping could not rule a stale page out).",
+          "type": "object"
+        }
+      },
+      "required": [
+        "keep_cache_opens",
+        "dropping_opens",
+        "suspect_marks"
+      ],
+      "type": "object"
+    },
     "FuseMountStatus": {
       "description": "One mount of [`FuseStatus`].",
       "properties": {
@@ -2877,6 +2912,10 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "kernel_cache": {
+          "$ref": "#/$defs/FuseKernelCacheStatus",
+          "description": "Plan 42: the Linux FUSE kernel-race workarounds' counters."
         },
         "kernel_refs": {
           "description": "Inodes the kernel holds at least one lookup of, as the session\ncounts them (plan 40 R2: `constellation_fuse_kernel_refs`).",
@@ -2950,7 +2989,8 @@
         "forgets_final",
         "forgets_partial",
         "forgets_unknown",
-        "forgets_underflow"
+        "forgets_underflow",
+        "kernel_cache"
       ],
       "type": "object"
     },

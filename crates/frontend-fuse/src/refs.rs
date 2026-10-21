@@ -118,7 +118,7 @@ pub enum Forgot {
 /// The splitmix64 finalizer: shards take the low bits of a node id, so a
 /// shard's map needs a hash in which every bit depends on every other.
 #[derive(Default)]
-struct Mix(u64);
+pub(crate) struct Mix(u64);
 
 impl Hasher for Mix {
     fn finish(&self) -> u64 {

@@ -755,6 +755,29 @@ pub struct FuseMountStatus {
     /// `FORGET`s of more lookups than the session counted (a reply's count
     /// was lost): the inode is kept from the view (logged).
     pub forgets_underflow: u64,
+    /// Plan 42: the Linux FUSE kernel-race workarounds' counters.
+    pub kernel_cache: FuseKernelCacheStatus,
+}
+
+/// Plan 42 §5.7: what one mount's kernel-race workarounds did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FuseKernelCacheStatus {
+    /// Opens answered `FOPEN_KEEP_CACHE`: the kernel kept the file's
+    /// pages, known current (W1).
+    pub keep_cache_opens: u64,
+    /// Opens that dropped the pages, by reason: `no_stamp` (the engine
+    /// answered none: strict, invalidation off, not a regular file, a
+    /// notification on its way), `stamp_changed`, `suspect` (a mark below),
+    /// `no_entry` (nothing known of the inode's pages), `trunc` (a
+    /// truncating create), `off` (`CONSTELLATION_FUSE_KEEP_CACHE=off`),
+    /// `drop_in_flight` (an earlier open's drop not known complete),
+    /// `passthrough`.
+    pub dropping_opens: std::collections::BTreeMap<String, u64>,
+    /// Marks that a file's pages may be stale, by mark: `s1` (a data
+    /// invalidation written), `s2` (one not delivered), `s3` (a write
+    /// answered with an error or a short count), `s4` (a direct-I/O open),
+    /// `s5` (the write-race bookkeeping could not rule a stale page out).
+    pub suspect_marks: std::collections::BTreeMap<String, u64>,
 }
 
 /// Passthrough opens on one mount (plan 38 §3(c)): the kernel reading a

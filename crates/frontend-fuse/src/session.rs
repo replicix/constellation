@@ -300,6 +300,9 @@ pub struct TransportConfig {
     /// Plan 38 Z4b: the smallest zero-copy read
     /// ([`ZERO_COPY_MIN_READ_ENV`]).
     pub zero_copy_min_read: u32,
+    /// Plan 42: the kernel-race workarounds' settings
+    /// ([`crate::workarounds`]), read with the rest.
+    pub workarounds: crate::Workarounds,
 }
 
 impl Default for TransportConfig {
@@ -310,6 +313,7 @@ impl Default for TransportConfig {
             passthrough: PassthroughPolicy::platform_default(),
             uring_zero_copy: UringZeroCopy::default(),
             zero_copy_min_read: DEFAULT_ZERO_COPY_MIN_READ,
+            workarounds: crate::Workarounds::default(),
         }
     }
 }
@@ -396,12 +400,14 @@ impl TransportConfig {
             },
             None => PassthroughPolicy::platform_default(),
         };
+        let workarounds = crate::Workarounds::resolve_from(&var)?;
         Ok(Self {
             policy,
             uring_queue_depth: depth,
             passthrough,
             uring_zero_copy,
             zero_copy_min_read,
+            workarounds,
         })
     }
 
@@ -483,6 +489,8 @@ pub struct MountOptions {
     uring_zero_copy: UringZeroCopy,
     /// [`TransportConfig::zero_copy_min_read`].
     zero_copy_min_read: u32,
+    /// Plan 42: [`TransportConfig::workarounds`].
+    pub workarounds: crate::Workarounds,
 }
 
 impl MountOptions {
@@ -510,6 +518,7 @@ impl MountOptions {
             passthrough: cfg.passthrough,
             uring_zero_copy: cfg.uring_zero_copy,
             zero_copy_min_read: cfg.zero_copy_min_read,
+            workarounds: cfg.workarounds,
         }
     }
 
@@ -859,6 +868,9 @@ struct Shared {
     /// [`FuseHandoff::refs`]); a detach abandoned in place keeps it, the
     /// filesystem being the same.
     entries: Arc<KernelEntries>,
+    /// Plan 42 §5.1.2: what this connection's kernel holds in its page
+    /// cache, as the adapter knows it (the gate marks it too).
+    pc: Arc<crate::PageCacheTable>,
     deferred: Arc<Deferred>,
     /// Plan 38 Z3b: the session's passthrough state (its table crosses a
     /// handover in [`FuseHandoff::passthrough`]).
@@ -1015,10 +1027,12 @@ pub fn mount_source<V: Vfs>(
                 "a PreopenedFd session's options must be handover-capable"
             );
             let fs = FuseFs::new(view.clone(), caps.clone(), opts.tuning)
-                .with_passthrough(opts.passthrough_wish());
+                .with_passthrough(opts.passthrough_wish())
+                .with_workarounds(opts.workarounds);
             let deferred = fs.deferred().clone();
             let observer = fs.observer_slot();
             let entries = fs.kernel_entries().clone();
+            let pc = fs.page_cache().clone();
             let passthrough = fs.passthrough().clone();
             let zero_copy_reads = fs.zero_copy_reads().clone();
             let mut config = config;
@@ -1031,6 +1045,7 @@ pub fn mount_source<V: Vfs>(
                 deferred,
                 observer,
                 entries,
+                pc,
                 passthrough,
                 zero_copy_reads,
                 &caps,
@@ -1137,10 +1152,13 @@ fn mount_path<V: Vfs>(
     config: fuser::Config,
 ) -> std::io::Result<FuseSession<V>> {
     let declared = caps.clone();
-    let fs = FuseFs::new(view.clone(), caps, opts.tuning).with_passthrough(opts.passthrough_wish());
+    let fs = FuseFs::new(view.clone(), caps, opts.tuning)
+        .with_passthrough(opts.passthrough_wish())
+        .with_workarounds(opts.workarounds);
     let deferred = fs.deferred().clone();
     let observer = fs.observer_slot();
     let entries = fs.kernel_entries().clone();
+    let pc = fs.page_cache().clone();
     let passthrough = fs.passthrough().clone();
     let zero_copy_reads = fs.zero_copy_reads().clone();
     if privileged() {
@@ -1158,6 +1176,7 @@ fn mount_path<V: Vfs>(
             deferred,
             observer,
             entries,
+            pc,
             passthrough,
             zero_copy_reads,
             &declared,
@@ -1190,6 +1209,7 @@ fn mount_path<V: Vfs>(
         deferred,
         observer,
         entries,
+        pc,
         passthrough,
         zero_copy_reads,
         &declared,
@@ -1242,6 +1262,7 @@ impl<V: Vfs> FuseSession<V> {
         deferred: Arc<Deferred>,
         observer: Arc<OnceLock<Observer>>,
         entries: Arc<KernelEntries>,
+        pc: Arc<crate::PageCacheTable>,
         passthrough: Arc<PassthroughState>,
         zero_copy_reads: ZeroCopyCounter,
         caps: &FrontendCaps,
@@ -1288,10 +1309,11 @@ impl<V: Vfs> FuseSession<V> {
                 passthrough.clone(),
             )
             .with_kernel_refs(entries.refs().clone())
+            .with_page_cache(pc.clone())
             .with_zero_copy_reads(zero_copy_reads)
             .with_ring_health(RingHealthStats::of_session(&config, transport)),
         );
-        let gate = NotifyGate::new(session.notifier(), entries.clone());
+        let gate = NotifyGate::new(session.notifier(), entries.clone(), pc.clone());
         // The backing-id ioctls go to the connection; a duplicate of the
         // session's descriptor is the same connection, usable from any
         // worker and by `release` long after the open that registered
@@ -1337,6 +1359,7 @@ impl<V: Vfs> FuseSession<V> {
                 ending: std::sync::atomic::AtomicBool::new(false),
                 gate,
                 entries,
+                pc,
                 deferred,
                 passthrough,
                 pending: Mutex::new(Pending::default()),
@@ -1378,10 +1401,16 @@ impl<V: Vfs> FuseSession<V> {
         share_fd_without_a_device(&mut config);
         let mut caps = opts.with_workers(caps);
         let fs = FuseFs::new(view.clone(), caps.clone(), opts.tuning)
-            .with_passthrough(opts.passthrough_wish());
+            .with_passthrough(opts.passthrough_wish())
+            .with_workarounds(opts.workarounds);
         let deferred = fs.deferred().clone();
         let observer = fs.observer_slot();
         let entries = fs.kernel_entries().clone();
+        let pc = fs.page_cache().clone();
+        // Plan 42 §5.1.2: a resumed session's page-cache table starts empty
+        // (nothing it knows of the kernel's pages crosses the handover), and
+        // exists — attached to the gate below — before the first request is
+        // read, so the resume's re-invalidation and the first replies find it.
         // The kernel holds dentries the previous server handed out, and
         // the lookups its replies counted (before anything is read).
         entries.resumed();
@@ -1417,6 +1446,7 @@ impl<V: Vfs> FuseSession<V> {
             deferred,
             observer,
             entries,
+            pc,
             passthrough,
             zero_copy_reads,
             &caps,
@@ -1433,6 +1463,7 @@ impl<V: Vfs> FuseSession<V> {
             sink.gate().reopen(Some((
                 resumed.session.notifier(),
                 resumed.shared.entries.clone(),
+                resumed.shared.pc.clone(),
             )));
             Arc::get_mut(&mut resumed.shared)
                 .expect("a new session's state is not shared yet")
@@ -1599,9 +1630,11 @@ impl<V: Vfs> FuseSession<V> {
                         detached.init,
                     )?;
                     *shared.detacher.lock().unwrap() = Some(resumed.detacher()?);
-                    shared
-                        .gate
-                        .reopen(Some((resumed.notifier(), shared.entries.clone())));
+                    shared.gate.reopen(Some((
+                        resumed.notifier(),
+                        shared.entries.clone(),
+                        shared.pc.clone(),
+                    )));
                     session = resumed;
                     if let Some(reply) = reply {
                         let _ = reply.send(Err(why));

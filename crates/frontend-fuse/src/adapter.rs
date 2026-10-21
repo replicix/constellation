@@ -70,6 +70,7 @@
 //! of the caller may be the one to take, and must not end this wait.
 
 use crate::dentries::{KernelEntries, RenameGuard};
+use crate::pagecache::PageCacheTable;
 use crate::passthrough::{reason, BackingOps, PassthroughState, PassthroughWish, PreOpen};
 use crate::refs::{Forgot, KernelRefs};
 use crate::reply::{
@@ -152,6 +153,19 @@ pub struct FuseFs<V: Vfs> {
     /// Plan 38 Z4b: this session's zero-copy reads, counted by the read
     /// replies, reported by the session's stats.
     zero_copy_reads: ZeroCopyCounter,
+    /// Plan 42 §5.1.2: what this connection's kernel holds in its page
+    /// cache, as far as the adapter knows it — what lets an open keep a
+    /// file's pages (`crate::pagecache`).
+    pc: Arc<PageCacheTable>,
+}
+
+/// What a session's notification sink shares with its filesystem
+/// ([`FuseFs::kernel_link`], [`crate::FuseNotifySink::linked`]): the names
+/// the kernel can hold and what it holds in its page cache.
+#[derive(Clone)]
+pub struct KernelLink {
+    pub(crate) entries: Arc<KernelEntries>,
+    pub(crate) pc: Arc<PageCacheTable>,
 }
 
 impl<V: Vfs> FuseFs<V> {
@@ -168,6 +182,28 @@ impl<V: Vfs> FuseFs<V> {
             passthrough: PassthroughState::new(PassthroughWish::Off(reason::DISABLED)),
             entries: KernelEntries::new(),
             zero_copy_reads: ZeroCopyCounter::default(),
+            pc: PageCacheTable::new(Default::default()),
+        }
+    }
+
+    /// Plan 42: serve under these workaround settings (before the session
+    /// serves anything: the page-cache table starts over).
+    pub fn with_workarounds(mut self, w: crate::Workarounds) -> Self {
+        self.pc = PageCacheTable::new(w.page_cache());
+        self
+    }
+
+    /// This session's page-cache table (plan 42 §5.1.2).
+    pub fn page_cache(&self) -> &Arc<PageCacheTable> {
+        &self.pc
+    }
+
+    /// What a notification sink for this session shares with it
+    /// ([`crate::FuseNotifySink::linked`]).
+    pub fn kernel_link(&self) -> KernelLink {
+        KernelLink {
+            entries: self.entries.clone(),
+            pc: self.pc.clone(),
         }
     }
 
@@ -239,6 +275,7 @@ impl<V: Vfs> FuseFs<V> {
         let caller = caller(req);
         let op = self.obs().begin(OpKind::Fsync, ino.0);
         let _in = op.enter();
+        self.pc.handle_used(ino.0, fh.0);
         let unique = req.unique().0;
         let token = self.interrupts.register(unique, req.pid(), self.lossy());
         // Counted as a bounded deferral, like a cold read: a detach waits
@@ -316,6 +353,11 @@ impl<V: Vfs> FuseFs<V> {
 /// engine's eligibility rule refuses (plan 38 §3(c)).
 pub(crate) fn open_flags_write_intent(flags: OpenFlags) -> bool {
     flags.intersects(OpenFlags::WRITE | OpenFlags::TRUNC | OpenFlags::APPEND)
+}
+
+/// Whether a handle opened with `flags` can write (its access mode).
+pub(crate) fn open_flags_write_access(flags: OpenFlags) -> bool {
+    flags.contains(OpenFlags::WRITE)
 }
 
 /// The requests whose reply may come from another thread after the fuser
@@ -1135,6 +1177,9 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         let caller = caller(req);
         let op = self.obs().begin(OpKind::Getattr, ino.0);
         let _in = op.enter();
+        if let Some(fh) = fh {
+            self.pc.handle_used(ino.0, fh.0);
+        }
         self.vfs.getattr(
             &op.ctx(&caller),
             ino.0,
@@ -1173,6 +1218,9 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         };
         let op = self.obs().begin(OpKind::Setattr, ino.0);
         let _in = op.enter();
+        if let Some(fh) = fh {
+            self.pc.handle_used(ino.0, fh.0);
+        }
         self.vfs.setattr(
             &op.ctx(&caller),
             ino.0,
@@ -1298,6 +1346,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             pre: PreOpen::Unregistered,
             pt: self.passthrough.clone(),
             undo: self.undo(req, flags),
+            pc: self.pc.clone(),
         };
         let name_guard = self.entries.begin(parent.0, n.as_bytes());
         self.vfs.create(
@@ -1421,6 +1470,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             pre,
             pt: self.passthrough.clone(),
             undo: self.undo(req, flags),
+            pc: self.pc.clone(),
         };
         self.vfs.open(
             &op.ctx(&caller),
@@ -1445,6 +1495,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         let caller = caller(req);
         let op = self.obs().begin(OpKind::Read, ino.0);
         let _in = op.enter();
+        self.pc.handle_used(ino.0, fh.0);
         self.vfs.read(
             &op.ctx(&caller).with_lock_owner(lock_owner.map(|o| o.0)),
             ino.0,
@@ -1500,6 +1551,16 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         // that keeps the bytes past the call copies them into
         // `WriteData::Shared` itself.
         let flags = open_flags(flags.0);
+        self.pc.handle_used(ino.0, fh.0);
+        // Plan 42 K3: an open answered while this write is under way
+        // drops (S5 until K4's bookkeeping; `WriteReply` marks again).
+        self.pc.mark(ino.0, crate::pagecache::Mark::S5);
+        let reply = WriteReply {
+            reply,
+            ino: ino.0,
+            len: data.len() as u32,
+            pc: self.pc.clone(),
+        };
         if !flags.contains(OpenFlags::SYNC) {
             self.vfs.write(
                 &op.ctx(&caller).with_lock_owner(lock_owner.map(|o| o.0)),
@@ -1508,7 +1569,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
                 offset,
                 WriteData::Borrowed(data),
                 flags,
-                op.responder(self.parkable(req, WriteReply(reply))),
+                op.responder(self.parkable(req, reply)),
             );
             return;
         }
@@ -1519,7 +1580,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         let token = self.interrupts.register(unique, req.pid(), self.lossy());
         let reply = op.responder(
             self.deferred
-                .track_bounded(self.interrupts.guard(unique, WriteReply(reply))),
+                .track_bounded(self.interrupts.guard(unique, reply)),
         );
         self.vfs.write(
             &op.ctx(&caller)
@@ -1545,6 +1606,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         let caller = caller(req);
         let op = self.obs().begin(OpKind::Flush, ino.0);
         let _in = op.enter();
+        self.pc.handle_used(ino.0, fh.0);
         self.vfs.flush(
             &op.ctx(&caller),
             ino.0,
@@ -1613,7 +1675,15 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         // forget, more given back than was counted, and a node id never
         // counted — except the root, whose reference comes from the mount
         // and whose forget means nothing to the view.
-        match self.entries.refs().forgot(ino.0, nlookup) {
+        let forgot = self.entries.refs().forgot(ino.0, nlookup);
+        // Plan 42 §5.1.2: the kernel evicted the inode with its pages, or
+        // the count is in doubt — what the table knows of them goes (an
+        // `Unknown` node id has no entry: entries are made only by replies
+        // and requests for node ids a reply counted).
+        if matches!(forgot, Forgot::Last | Forgot::Underflow) {
+            self.pc.forget(ino.0);
+        }
+        match forgot {
             Forgot::Last => self.vfs.forget(ino.0),
             Forgot::Unknown if ino.0 == ROOT_INO => self.vfs.forget(ino.0),
             Forgot::Unknown => tracing::warn!(
@@ -1658,6 +1728,8 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         // included — before it sends `RELEASE`; the inode's backing id
         // goes with its last passthrough handle.
         self.passthrough.release(ino.0);
+        self.pc
+            .released(ino.0, fh.0, open_flags_write_access(open_flags(flags.0)));
         self.vfs.release(
             &op.ctx(&caller),
             ino.0,
@@ -1775,6 +1847,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         let caller = caller(req);
         let op = self.obs().begin(OpKind::Fallocate, ino.0);
         let _in = op.enter();
+        self.pc.handle_used(ino.0, fh.0);
         self.vfs.fallocate(
             &op.ctx(&caller),
             ino.0,
@@ -1809,6 +1882,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         };
         let caller = caller(req);
         let _in = op.enter();
+        self.pc.handle_used(ino.0, fh.0);
         self.vfs.seek(
             &op.ctx(&caller),
             ino.0,
@@ -1852,6 +1926,8 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         let caller = caller(req);
         let op = self.obs().begin(OpKind::CopyFileRange, ino_out.0);
         let _in = op.enter();
+        self.pc.handle_used(ino_in.0, fh_in.0);
+        self.pc.handle_used(ino_out.0, fh_out.0);
         let flags = if flags.bits() == 0 {
             CopyFlags::empty()
         } else {
@@ -1903,6 +1979,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         };
         let op = self.obs().begin(OpKind::LockTest, ino.0);
         let _in = op.enter();
+        self.pc.handle_used(ino.0, fh.0);
         self.vfs.lock_test(
             &op.ctx(&caller),
             ino.0,
@@ -1937,6 +2014,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         reply: ReplyEmpty,
     ) {
         let caller = caller(req);
+        self.pc.handle_used(ino.0, fh.0);
         let kind = match typ {
             F_UNLCK => {
                 let op = self.obs().begin(OpKind::LockRelease, ino.0);

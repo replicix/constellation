@@ -10,6 +10,7 @@
 //! started (`constellation_engine::locks::ClusterLocks::lock`).
 
 use crate::dentries::{EntryGuard, RenameGuard};
+use crate::pagecache::{Mark, OpenFacts, PageCacheTable};
 use crate::passthrough::{OpenAnswer, PassthroughState, PreOpen};
 use crate::stats::ZeroCopyCounter;
 use constellation_types::Code;
@@ -334,6 +335,44 @@ pub(crate) struct OpenCtx {
     pub pre: PreOpen,
     pub pt: Arc<PassthroughState>,
     pub undo: Undo,
+    /// Plan 42 §5.1.2: decides whether the reply keeps the pages, and
+    /// records the drop if it does not.
+    pub pc: Arc<PageCacheTable>,
+}
+
+impl OpenCtx {
+    /// Plan 42 §5.1: whether this open of `ino`, answered `fh` with
+    /// `stamp` and the `FOPEN_*` word `flags` (`passthrough`: with a
+    /// backing file), keeps the kernel's pages — decided and recorded
+    /// before the reply's bytes are written.
+    fn keeps(
+        &self,
+        ino: Ino,
+        fh: Fh,
+        stamp: Option<constellation_vfs::CacheStamp>,
+        flags: FopenFlags,
+        passthrough: bool,
+        create: bool,
+    ) -> bool {
+        self.pc.open_reply(OpenFacts {
+            ino,
+            fh: fh.0,
+            stamp,
+            plain: !passthrough,
+            direct_io: flags.contains(FopenFlags::FOPEN_DIRECT_IO),
+            create_trunc: create && self.flags.contains(OpenFlags::TRUNC),
+            write_access: crate::adapter::open_flags_write_access(self.flags),
+        })
+    }
+}
+
+/// `flags`, keeping the kernel's pages when `keep`.
+fn with_keep(flags: FopenFlags, keep: bool) -> FopenFlags {
+    if keep {
+        flags | FopenFlags::FOPEN_KEEP_CACHE
+    } else {
+        flags
+    }
 }
 
 /// The `FOPEN_*` word and backing id of an answer that is not a refusal.
@@ -373,10 +412,21 @@ impl Responder<Opened> for OpenReply {
                     // zero-copy reads (only a read-only one, on a session
                     // that negotiated them); passthrough, where the
                     // session gave it, wins above — the kernel then serves
-                    // the reads with no daemon involvement at all.
-                    Some((flags, None)) if o.zero_copy => reply.opened_zero_copy(fh, flags),
-                    Some((flags, None)) => reply.opened(fh, flags),
+                    // the reads with no daemon involvement at all. Plan 42
+                    // §5.1: either may keep the pages.
+                    Some((flags, None)) => {
+                        let keep = cx.keeps(cx.ino, o.fh, o.cache, flags, false, false);
+                        let flags = with_keep(flags, keep);
+                        if o.zero_copy {
+                            reply.opened_zero_copy(fh, flags)
+                        } else {
+                            reply.opened(fh, flags)
+                        }
+                    }
                     Some((flags, Some(id))) => {
+                        // Never keeps; recorded as a drop (and S4 for a
+                        // direct-I/O one).
+                        cx.keeps(cx.ino, o.fh, o.cache, flags, true, false);
                         // SAFETY: `id` is registered on this connection and
                         // stays so until the inode's last passthrough handle
                         // is released (`PassthroughState::release`), which
@@ -447,12 +497,15 @@ impl Responder<(Entry, Opened)> for CreateReply {
                 let generation = Generation(e.generation);
                 match fopen(answer) {
                     Some((flags, None)) => {
+                        let keep = cx.keeps(e.attr.ino, o.fh, o.cache, flags, false, true);
+                        let flags = with_keep(flags, keep);
                         // Counted before the bytes go, as an entry reply's.
                         name.hands_out(e.attr.ino);
                         reply.created(&e.attr.ttl, &attr, generation, fh, flags);
                         name.replied(e.attr.ttl);
                     }
                     Some((flags, Some(id))) => {
+                        cx.keeps(e.attr.ino, o.fh, o.cache, flags, true, true);
                         // SAFETY: as in `OpenReply`.
                         let backing = unsafe { reply.wrap_backing(id) };
                         name.hands_out(e.attr.ino);
@@ -488,20 +541,43 @@ impl Responder<(Entry, Opened)> for CreateReply {
     }
 }
 
-pub(crate) struct WriteReply(pub ReplyWrite);
+/// A write's reply. Plan 42 §5.1.3 (S3): a `WRITE` answered with an
+/// error or a short count leaves the kernel's folios holding bytes the
+/// daemon did not take (the kernel turns a short count into `EIO` and
+/// keeps the folios' contents, 1a061c554253), so the file's pages are no
+/// longer known current.
+pub(crate) struct WriteReply {
+    pub reply: ReplyWrite,
+    pub ino: Ino,
+    /// The bytes the request carried.
+    pub len: u32,
+    pub pc: Arc<PageCacheTable>,
+}
 
 impl Responder<u32> for WriteReply {
     fn done(self, r: VfsResult<u32>) {
+        // Until the write-race bookkeeping (plan 42 K4), a page a
+        // write-through write touched cannot be vouched for (race 1):
+        // the next open drops, as every open did before plan 42.
+        self.pc.mark(self.ino, Mark::S5);
         match r {
-            Ok(n) => self.0.written(n),
-            Err(e) => self.0.error(reply_code(e.code())),
+            Ok(n) => {
+                if n < self.len {
+                    self.pc.mark(self.ino, Mark::S3);
+                }
+                self.reply.written(n)
+            }
+            Err(e) => {
+                self.pc.mark(self.ino, Mark::S3);
+                self.reply.error(reply_code(e.code()))
+            }
         }
     }
 
     /// A parked op's reply holds one of its ring queue's lock-wait entries
     /// (plan 43 C7-F F-c).
     fn begin_wait(&mut self) -> constellation_vfs::WaitStart {
-        ring_wait(self.0.hold_for_wait())
+        ring_wait(self.reply.hold_for_wait())
     }
 }
 
