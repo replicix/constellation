@@ -9,6 +9,7 @@ Technical descriptions of how specific parts of Constellation work.
 - [Lease placement](features/lease-placement.md) — subtree placement by dominant writer, root-lease weighted-medoid cost, thresholds, placement status
 - [Delegations](features/delegations.md) — delegated sub-sequencers over one log: ownership, recall, placement, hash-range splits of hot directories
 - [Close-to-open modes](features/cto-modes.md) — positions and session guarantees, direct log streams, `--cto bounded|strict`, ReadIndex and read delegations
+- [Kernel cache coherence](features/kernel-cache-coherence.md) — what the Linux kernel caches for a mount, keep-cache across opens, the workarounds for three FUSE client races and their settings, what `status` reports
 - [Durability and failover](features/durability-and-failover.md) — acknowledgement layers, backups chosen by RTT, seal-based failover, `ack=s3`, `--fsync-mode`/`--write-mode`, flexible continuation epochs
 - [Cluster locks](features/cluster-locks.md) — cross-node `flock`/`fcntl` as leased grants, `EIO` fencing, `--locks cluster|local`
 - [Cooperative cache membership](features/cooperative-cache.md) — exact mirrors vs blooms, reconciliation protocol, false-positive accounting

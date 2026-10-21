@@ -757,6 +757,39 @@ pub struct FuseMountStatus {
     pub forgets_underflow: u64,
     /// Plan 42: the Linux FUSE kernel-race workarounds' counters.
     pub kernel_cache: FuseKernelCacheStatus,
+    /// Plan 42 §5.4: their settings, and what the kernel carries.
+    pub kernel_workarounds: FuseKernelWorkarounds,
+}
+
+/// Plan 42 §5.4: one mount's kernel-race workarounds — each setting as
+/// configured (`auto`, `on`/`off`, `zero`/`entry`) and whether it is in
+/// effect now — and the kernel's verdict on each fix.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FuseKernelWorkarounds {
+    /// `CONSTELLATION_FUSE_KEEP_CACHE` (W1).
+    pub keep_cache: String,
+    /// `CONSTELLATION_FUSE_WRITE_REPAIR` (W2), and whether it repairs.
+    pub write_repair: String,
+    pub write_repair_on: bool,
+    /// `CONSTELLATION_FUSE_DIR_ATTR_TTL` (W3a), and whether directories'
+    /// attributes get no kernel lifetime.
+    pub dir_attr_ttl: String,
+    pub dir_attr_ttl_zero: bool,
+    /// `CONSTELLATION_FUSE_DIR_CHANGE_NOTIFY` (W3b), and whether it writes.
+    pub dir_change_notify: String,
+    pub dir_change_notify_on: bool,
+    /// By fix (`write_through_writeback`, `attrs_valid_after_store`,
+    /// `dir_change_bumps_version`).
+    pub verdicts: std::collections::BTreeMap<String, FuseKernelVerdict>,
+}
+
+/// Whether the kernel carries one fix, and how that was decided.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FuseKernelVerdict {
+    /// `fixed`, `not_fixed` or `unknown`.
+    pub verdict: String,
+    /// `probe`, `table` or `override`.
+    pub source: String,
 }
 
 /// Plan 42 §5.7: what one mount's kernel-race workarounds did.

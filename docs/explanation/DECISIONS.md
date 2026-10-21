@@ -1362,3 +1362,64 @@ that check them ([TESTING.md](../how-to-guides/development/TESTING.md),
 "Commit-rule oracles"); PROGRESS, "Plan 43 C0 — The commit point, named and
 checked". Amends nothing yet; C1-C5 amend ADR-2, ADR-14, ADR-18, ADR-19,
 ADR-21, ADR-22, ADR-23 and ADR-25 as plan 43 §6 lists.
+
+## ADR-34: Kernel FUSE race workarounds
+
+**Context**: three races in the Linux kernel's FUSE client, reproduced on
+every distribution kernel from 5.10 to 7.3 by a draft patch series and on
+Constellation by the `kernel-race-*` scenarios: (1) a write-through
+`write(2)` unlocks its uptodate page before its `FUSE_WRITE` reaches the
+daemon, and a drop of the page in that window lets a read fetch the
+pre-write bytes, which the kernel then serves for an acknowledged write;
+(2a) the kernel marks cached attributes valid before it stores them, so a
+`stat` racing an install after a directory change copies the old values
+once; (2b) a reply generated before a directory change but processed after
+it cancels the change's invalidation for the attribute TTL. Until plan 42
+every open dropped a file's pages (no `FOPEN_KEEP_CACHE`), which made
+close-to-open hold for pages and repaired race 1 at the next open.
+
+**Decision**: (W1) an open keeps the file's pages exactly when they are
+known current: the engine answers the open with a stamp of the committed
+content, the last dropping open saw the same stamp and its drop is known
+complete, and nothing since could have made a page differ from what the
+view answers (a data notification written or lost, a failed or short
+write, a direct-I/O open, a read the race-1 bookkeeping cannot vouch for);
+never under `--cto strict`. The engine reports what changes content under
+a kernel without changing the stamp: an uncommitted session, a commit
+through another view, a stranding rollback. (W2) the frontend follows every
+drop it causes or can see coming and the pages reads fetched since; the
+write the kernel's own serialization identifies as the one that may have
+been in the window has those pages invalidated before it is answered, from
+a repair lane with a bound that runs only while the write is alone on the
+file. (W3b) every namespace reply is preceded by an attribute-only
+notification for the directories it changed and the inodes it moved,
+which makes the kernel reject a reply from before the change. (W3a) a
+directory's attributes get no kernel lifetime under `--cto strict`; in
+bounded mode the default is the view's TTL (plan 42 Q1, decided: `zero`
+there made warm `git status` 2.6 to 7.9 times and `make -q` 2.8 to 4.2
+times slower, so race 2a stays a documented transient exposure). Each workaround's `auto`
+follows its fix's verdict (an override, a probe on a private mount at
+start, a table of releases); W1 is independent of the kernel.
+
+**Consequences**: reopen-heavy workloads read from the page cache instead
+of the daemon. Each namespace operation writes one more 40-byte
+notification. A write on a file whose pages are dropped constantly (every
+open dropping, a reader beside the writer) may wait for a repair; the one
+self-block, a repair waiting on the write's own last page, is answered
+after a short grace. Directory TTL 0 costs a `GETATTR` per directory
+component of every path walk (`default_permissions`): 2–11 times the FUSE
+requests of stat-heavy walks, measured (hence `entry` in bounded mode). Residuals on an unfixed kernel:
+plan 42 §5.9 and [kernel cache coherence](../reference/features/kernel-cache-coherence.md).
+
+**Rejected**: the writeback cache (a durability and ordering model of its
+own); `FUSE_EXPLICIT_INVAL_DATA` (a remotely appended file would read
+zeros at the old end); a time-bounded record of notices (no kernel bound on
+the window); re-invalidating the whole written range from the handler (it
+deadlocks on the writer's own locked page) or after the reply (the
+writer's read-back wins the race); TTL 0 for files' attributes; repairing
+ambiguous reads; a wall-clock-only repair bound; holding the first
+post-change directory reply.
+
+**See**: [plan 42](../plans/v1/wip/42-kernel-race-workarounds.md);
+`crates/frontend-fuse/src/{pagecache,repair,kernel_fixes}.rs`,
+`crates/engine/src/view/kernel_cache.rs`; PROGRESS, "Plan 42".

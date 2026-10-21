@@ -18,6 +18,7 @@
 mod adapter;
 mod dentries;
 mod fault;
+pub mod kernel_fixes;
 mod notify;
 pub mod pagecache;
 pub mod passthrough;

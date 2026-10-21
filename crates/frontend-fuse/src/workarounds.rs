@@ -78,7 +78,7 @@ pub(crate) fn page_size() -> u64 {
     }
 }
 
-/// An `auto`/`on`/`off` setting: `auto` is on.
+/// An `auto`/`on`/`off` setting: `auto` follows the kernel's verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Switch {
     Auto,
@@ -112,7 +112,8 @@ pub struct Workarounds {
     pub keep_cache: KeepCache,
     /// The fault-only naive keep-cache of §7.2 (ignores S5).
     pub ignore_s5: bool,
-    /// W2's repair, plan 42 §5.2.3 (`auto`: on).
+    /// W2's repair, plan 42 §5.2.3 (`auto`: on unless the kernel keeps
+    /// write-through folios under writeback for the `WRITE`).
     pub write_repair: Switch,
     /// The repair's in-flight-aware bound.
     pub repair_wait: std::time::Duration,
@@ -125,7 +126,8 @@ pub struct Workarounds {
     pub unseen_drop: Option<std::time::Duration>,
     /// W3a, plan 42 §5.3.2.
     pub dir_attr_ttl: DirAttrTtl,
-    /// W3b, plan 42 §5.3.1 (`auto`: on).
+    /// W3b, plan 42 §5.3.1 (`auto`: on unless the kernel bumps a
+    /// directory's attribute version when it changes it).
     pub dir_change_notify: Switch,
 }
 
@@ -212,7 +214,8 @@ impl Workarounds {
     }
 
     /// What a session of a view (`strict`: it serves `--cto strict`)
-    /// works under.
+    /// works under. `auto` follows the kernel's verdicts as they are known
+    /// (`crate::kernel_fixes`).
     pub(crate) fn page_cache(&self, strict: bool) -> PageCacheConfig {
         PageCacheConfig {
             keep_cache: self.keep_cache,

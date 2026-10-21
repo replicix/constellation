@@ -571,8 +571,9 @@ pub struct PageCacheConfig {
     /// ignores S5 — the naive keep-cache plan 42 F1 guards against, for a
     /// scenario's fail-before only.
     pub ignore_s5: bool,
-    /// W2's repair (`CONSTELLATION_FUSE_WRITE_REPAIR`): `auto` is on;
-    /// off, every repair hit is an S5 instead.
+    /// W2's repair (`CONSTELLATION_FUSE_WRITE_REPAIR`): `auto` follows
+    /// the kernel's verdict ([`crate::kernel_fixes`]); off, every repair
+    /// hit is an S5 instead.
     pub write_repair: crate::Switch,
     /// W3b (`CONSTELLATION_FUSE_DIR_CHANGE_NOTIFY`), likewise.
     pub dir_change_notify: crate::Switch,
@@ -585,29 +586,91 @@ pub struct PageCacheConfig {
 impl PageCacheConfig {
     /// Whether W2 repairs now.
     pub fn repair_on(&self) -> bool {
-        on(self.write_repair)
+        on(
+            self.write_repair,
+            crate::kernel_fixes::KernelFix::WriteThroughWriteback,
+        )
     }
 
     /// Whether W3b writes its notices now.
     pub fn dir_notice_on(&self) -> bool {
-        on(self.dir_change_notify)
+        on(
+            self.dir_change_notify,
+            crate::kernel_fixes::KernelFix::DirChangeBumpsVersion,
+        )
     }
 
     /// Whether W3a gives directories' attributes no kernel lifetime now:
-    /// `auto` under strict; in bounded mode `auto` is pending plan 42 Q1
-    /// (`crate::DirAttrTtl::Auto`).
+    /// `auto` under strict, unless the kernel carries the fix; in bounded
+    /// mode `auto` is `entry` (plan 42 Q1, `crate::DirAttrTtl::Auto`).
     pub fn dir_attr_zero(&self) -> bool {
         match self.dir_attr_ttl {
             crate::DirAttrTtl::Zero => true,
             crate::DirAttrTtl::Entry => false,
-            crate::DirAttrTtl::Auto => self.strict,
+            crate::DirAttrTtl::Auto => {
+                self.strict
+                    && !crate::kernel_fixes::fixed(
+                        crate::kernel_fixes::KernelFix::AttrsValidAfterStore,
+                    )
+            }
+        }
+    }
+
+    /// What `node.status` reports of the workarounds (plan 42 §5.4).
+    pub fn status(&self) -> KernelWorkaroundsStatus {
+        use crate::kernel_fixes::{verdict, KernelFix, Source};
+        let overridden = |fix: KernelFix| match fix {
+            KernelFix::WriteThroughWriteback => self.write_repair != crate::Switch::Auto,
+            KernelFix::DirChangeBumpsVersion => self.dir_change_notify != crate::Switch::Auto,
+            KernelFix::AttrsValidAfterStore => self.dir_attr_ttl != crate::DirAttrTtl::Auto,
+        };
+        KernelWorkaroundsStatus {
+            keep_cache: self.keep_cache.as_str(),
+            write_repair: self.write_repair.as_str(),
+            write_repair_on: self.repair_on(),
+            dir_attr_ttl: self.dir_attr_ttl.as_str(),
+            dir_attr_ttl_zero: self.dir_attr_zero(),
+            dir_change_notify: self.dir_change_notify.as_str(),
+            dir_change_notify_on: self.dir_notice_on(),
+            verdicts: KernelFix::ALL
+                .iter()
+                .map(|&fix| {
+                    let (v, source) = verdict(fix);
+                    let source = if overridden(fix) {
+                        Source::Override
+                    } else {
+                        source
+                    };
+                    (fix.as_str(), v.as_str(), source.as_str())
+                })
+                .collect(),
         }
     }
 }
 
-/// A workaround's switch: `auto` is on.
-fn on(switch: crate::Switch) -> bool {
-    switch != crate::Switch::Off
+/// A snapshot of a session's workaround settings and the kernel's verdicts
+/// ([`PageCacheConfig::status`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KernelWorkaroundsStatus {
+    pub keep_cache: &'static str,
+    pub write_repair: &'static str,
+    pub write_repair_on: bool,
+    pub dir_attr_ttl: &'static str,
+    pub dir_attr_ttl_zero: bool,
+    pub dir_change_notify: &'static str,
+    pub dir_change_notify_on: bool,
+    /// `(fix, verdict, source)`.
+    pub verdicts: Vec<(&'static str, &'static str, &'static str)>,
+}
+
+/// A workaround's switch against its fix's verdict: `auto` is on unless
+/// the kernel is known to carry the fix.
+fn on(switch: crate::Switch, fix: crate::kernel_fixes::KernelFix) -> bool {
+    match switch {
+        crate::Switch::On => true,
+        crate::Switch::Off => false,
+        crate::Switch::Auto => !crate::kernel_fixes::fixed(fix),
+    }
 }
 
 impl Default for PageCacheConfig {

@@ -872,6 +872,10 @@ impl NodeRuntime {
         };
         let sink = session.notifier();
         events.set(Arc::new(sink.clone()));
+        // Plan 42 §5.4: which FUSE fixes this kernel carries, probed once
+        // per process (in the background; until it answers, `auto` keeps
+        // every workaround on).
+        constellation_frontend_fuse::kernel_fixes::start_probe();
         Ok(self.serve_session(
             session,
             fs,

@@ -1387,6 +1387,26 @@ fn kernel_cache_metrics(output: &mut String, fuse: &FuseStatus) {
             );
         }
     }
+    output.push_str(
+        "# HELP constellation_fuse_kernel_workaround Plan 42 kernel-race workarounds in effect on a FUSE mount (1) or not (0).\n\
+         # TYPE constellation_fuse_kernel_workaround gauge\n",
+    );
+    for m in &fuse.mounts {
+        let w = &m.kernel_workarounds;
+        for (name, on) in [
+            ("keep_cache", w.keep_cache != "off"),
+            ("write_repair", w.write_repair_on),
+            ("dir_attr_ttl_zero", w.dir_attr_ttl_zero),
+            ("dir_change_notify", w.dir_change_notify_on),
+        ] {
+            let _ = writeln!(
+                output,
+                "constellation_fuse_kernel_workaround{{mountpoint=\"{}\",workaround=\"{name}\"}} {}",
+                label_value(&m.mountpoint),
+                u8::from(on)
+            );
+        }
+    }
     for m in &fuse.mounts {
         for (mark, n) in &m.kernel_cache.suspect_marks {
             let _ = writeln!(

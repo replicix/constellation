@@ -157,6 +157,7 @@ fn fuse_mount_status(stats: &constellation_frontend_fuse::SessionStats) -> api::
         forgets_unknown: stats.forgets_unknown(),
         forgets_underflow: stats.forgets_underflow(),
         kernel_cache: kernel_cache_status(&stats.kernel_cache()),
+        kernel_workarounds: kernel_workarounds_status(&stats.kernel_workarounds()),
         last_fallback: stats.last_fallback().map(|f| api::FuseFallback {
             from: f.from.name().to_string(),
             to: f.to.name().to_string(),
@@ -187,6 +188,35 @@ fn kernel_cache_status(
         ambiguous_writes: c.ambiguous_writes,
         concurrent_writes: c.concurrent_writes,
         dir_attr_notices: c.dir_attr_notices,
+    }
+}
+
+/// Plan 42 §5.4: a session's workaround settings and the kernel's
+/// verdicts, in the protocol's shape.
+fn kernel_workarounds_status(
+    w: &constellation_frontend_fuse::pagecache::KernelWorkaroundsStatus,
+) -> api::FuseKernelWorkarounds {
+    api::FuseKernelWorkarounds {
+        keep_cache: w.keep_cache.to_string(),
+        write_repair: w.write_repair.to_string(),
+        write_repair_on: w.write_repair_on,
+        dir_attr_ttl: w.dir_attr_ttl.to_string(),
+        dir_attr_ttl_zero: w.dir_attr_ttl_zero,
+        dir_change_notify: w.dir_change_notify.to_string(),
+        dir_change_notify_on: w.dir_change_notify_on,
+        verdicts: w
+            .verdicts
+            .iter()
+            .map(|(fix, verdict, source)| {
+                (
+                    fix.to_string(),
+                    api::FuseKernelVerdict {
+                        verdict: verdict.to_string(),
+                        source: source.to_string(),
+                    },
+                )
+            })
+            .collect(),
     }
 }
 

@@ -468,6 +468,14 @@ impl SessionStats {
         self
     }
 
+    /// Plan 42 §5.4: the workarounds' settings and the kernel's verdicts.
+    pub fn kernel_workarounds(&self) -> crate::pagecache::KernelWorkaroundsStatus {
+        self.pc
+            .as_ref()
+            .map(|pc| pc.config().status())
+            .unwrap_or_default()
+    }
+
     /// Plan 42: the kernel-cache workarounds' counters (all 0 for a
     /// `SessionStats` built without a session).
     pub fn kernel_cache(&self) -> crate::PageCacheCounts {

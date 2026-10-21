@@ -1600,7 +1600,7 @@ decided on this measurement:
 - [ ] K5: W3b (parents and moved inodes) and W3a's switch, the bounded
       default per the Q1 decision taken on §8.1's measurement; `-dir-*` and
       `-rename-ctime` rows met.
-- [ ] K6: detection table, the 0001 and 0003 probes and their tests,
+- [x] K6: detection table, the 0001 and 0003 probes and their tests,
       status, metrics, docs, ADR.
 - [ ] K7: §7.3 xcheckfs runs clean; §7.4 campaign passes on the final
       build (`repairs_late` 0 in every profile); §7.5 on a patched kernel;

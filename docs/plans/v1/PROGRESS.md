@@ -55618,7 +55618,7 @@ are recorded per run).
 | Conditional keep-cache (K3) | landed | `crates/frontend-fuse/src/{pagecache,reply,notify,adapter,workarounds}.rs` |
 | Write-race repair (K4) | landed | `crates/frontend-fuse/src/{pagecache,repair,reply,adapter}.rs` |
 | Directory attributes (K5) | landed; bounded-mode default pending Q1 (`entry` meanwhile) | `crates/frontend-fuse/src/{reply,adapter,notify,workarounds}.rs`, `crates/vfs/src/vfs.rs` |
-| Detection, status, docs (K6) | — | |
+| Detection, status, docs (K6) | landed | `crates/frontend-fuse/src/kernel_fixes.rs`, `kernel_fixes/probe.rs`, `crates/control/src/proto/types.rs`, `docs/reference/features/kernel-cache-coherence.md`, `docs/explanation/DECISIONS.md` |
 | Campaigns, xcheckfs, benchmarks (K7) | — | |
 
 ### K1: base counts (fail-before)

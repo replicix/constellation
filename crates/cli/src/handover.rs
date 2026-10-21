@@ -845,6 +845,15 @@ fn exec_with_log(
     mut command: std::process::Command,
     after_freeze: impl FnOnce(),
 ) -> std::io::Error {
+    // Plan 42 §5.4: not while the kernel-fix probe holds a reply of its own
+    // mount (on a fixed kernel a thread of ours is in `D` until it is
+    // released, and the exec would wait for that thread forever). Its own
+    // waits end within seconds; past the bound the exec goes ahead.
+    if !constellation_frontend_fuse::kernel_fixes::wait_probe_done(std::time::Duration::from_secs(
+        15,
+    )) {
+        tracing::warn!("the FUSE kernel probe is still running; exec anyway");
+    }
     let mut log = before_exec(
         &mut command,
         crate::log_buffer::flush_process,

@@ -2941,6 +2941,72 @@
       ],
       "type": "object"
     },
+    "FuseKernelVerdict": {
+      "description": "Whether the kernel carries one fix, and how that was decided.",
+      "properties": {
+        "source": {
+          "description": "`probe`, `table` or `override`.",
+          "type": "string"
+        },
+        "verdict": {
+          "description": "`fixed`, `not_fixed` or `unknown`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "verdict",
+        "source"
+      ],
+      "type": "object"
+    },
+    "FuseKernelWorkarounds": {
+      "description": "Plan 42 §5.4: one mount's kernel-race workarounds — each setting as\nconfigured (`auto`, `on`/`off`, `zero`/`entry`) and whether it is in\neffect now — and the kernel's verdict on each fix.",
+      "properties": {
+        "dir_attr_ttl": {
+          "description": "`CONSTELLATION_FUSE_DIR_ATTR_TTL` (W3a), and whether directories'\nattributes get no kernel lifetime.",
+          "type": "string"
+        },
+        "dir_attr_ttl_zero": {
+          "type": "boolean"
+        },
+        "dir_change_notify": {
+          "description": "`CONSTELLATION_FUSE_DIR_CHANGE_NOTIFY` (W3b), and whether it writes.",
+          "type": "string"
+        },
+        "dir_change_notify_on": {
+          "type": "boolean"
+        },
+        "keep_cache": {
+          "description": "`CONSTELLATION_FUSE_KEEP_CACHE` (W1).",
+          "type": "string"
+        },
+        "verdicts": {
+          "additionalProperties": {
+            "$ref": "#/$defs/FuseKernelVerdict"
+          },
+          "description": "By fix (`write_through_writeback`, `attrs_valid_after_store`,\n`dir_change_bumps_version`).",
+          "type": "object"
+        },
+        "write_repair": {
+          "description": "`CONSTELLATION_FUSE_WRITE_REPAIR` (W2), and whether it repairs.",
+          "type": "string"
+        },
+        "write_repair_on": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "keep_cache",
+        "write_repair",
+        "write_repair_on",
+        "dir_attr_ttl",
+        "dir_attr_ttl_zero",
+        "dir_change_notify",
+        "dir_change_notify_on",
+        "verdicts"
+      ],
+      "type": "object"
+    },
     "FuseMountStatus": {
       "description": "One mount of [`FuseStatus`].",
       "properties": {
@@ -2983,6 +3049,10 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "kernel_workarounds": {
+          "$ref": "#/$defs/FuseKernelWorkarounds",
+          "description": "Plan 42 §5.4: their settings, and what the kernel carries."
         },
         "last_fallback": {
           "anyOf": [
@@ -3051,7 +3121,8 @@
         "forgets_partial",
         "forgets_unknown",
         "forgets_underflow",
-        "kernel_cache"
+        "kernel_cache",
+        "kernel_workarounds"
       ],
       "type": "object"
     },
