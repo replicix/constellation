@@ -1317,6 +1317,9 @@ fn redo_row_tx(
     undone: &HashSet<u64>,
 ) -> Result<(), MetaError> {
     if stranded.contains(&seq) {
+        // Plan 42 §5.1.5: the rows this entry wrote stay at their
+        // before-images (step 1 restored them; nothing redoes them).
+        meta.note_rolled_back(row.before.iter().map(|(key, _)| key.as_slice()));
         tx.remove(&meta.spec, seq_key(seq));
         if matches!(
             row.kind,
@@ -3186,6 +3189,7 @@ impl Meta {
         let (bytes, files) = staged.raw_delta();
         adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
         tx.commit()?;
+        self.report_rolled_back();
         staged.drain_into(self.usage_tracker());
         if !own_seqs.is_empty() {
             if let Some(&upto) = own_seqs.iter().max() {
@@ -3224,6 +3228,7 @@ impl Meta {
         let (bytes, files) = staged.raw_delta();
         adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
         tx.commit()?;
+        self.report_rolled_back();
         staged.drain_into(self.usage_tracker());
         Ok(stranded)
     }
@@ -3309,6 +3314,7 @@ impl Meta {
         let (bytes, files) = staged.raw_delta();
         adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
         tx.commit()?;
+        self.report_rolled_back();
         staged.drain_into(self.usage_tracker());
         Ok(stranded)
     }
@@ -3341,6 +3347,7 @@ impl Meta {
         let (bytes, files) = staged.raw_delta();
         adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
         tx.commit()?;
+        self.report_rolled_back();
         staged.drain_into(self.usage_tracker());
         Ok(stranded)
     }

@@ -5,15 +5,73 @@
 //! M3).
 
 use crate::error::MetaError;
-use crate::store::{ns, Meta};
+use crate::store::{atime, ns, Meta};
 use crate::TreeInode;
 use constellation_fs_core::types::ROOT_INO;
-use constellation_fs_core::Ino;
+use constellation_fs_core::{FileAttr, Ino};
 use constellation_mtree::keys;
-use constellation_mtree::record::Payload;
+use constellation_mtree::record::{InodeRecord, Kind, Payload};
 use fjall::Readable;
 
+/// Plan 42 §5.1.1: the content identity of a regular file's committed
+/// record — blake3 over its size, mtime, ctime and manifest as stored
+/// (the hash of a spilled manifest's blob, or the bytes of an inline
+/// one: no blob read), truncated to 128 bits. `None` for every other
+/// kind. Equal stamps mean the same committed content: every manifest,
+/// size or time change (a commit, a truncate, an apply of another node's
+/// write) moves at least one of the four, and a commit's `ctime` never
+/// goes back (`writes::commit_ctime`); what can return a row verbatim (a
+/// stranding rollback) reports itself ([`Meta::set_rollback_hook`]).
+pub fn content_stamp(rec: &InodeRecord) -> Option<u128> {
+    if rec.attrs.kind != Kind::File {
+        return None;
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(b"constellation content stamp v1");
+    h.update(&rec.attrs.size.to_le_bytes());
+    h.update(&rec.attrs.mtime_ns.to_le_bytes());
+    h.update(&rec.attrs.ctime_ns.to_le_bytes());
+    match &rec.manifest {
+        None => {
+            h.update(&[0]);
+        }
+        Some(Payload::Inline(bytes)) => {
+            h.update(&[1]);
+            h.update(&(bytes.len() as u64).to_le_bytes());
+            h.update(bytes);
+        }
+        Some(Payload::Spilled(hash)) => {
+            h.update(&[2]);
+            h.update(&hash.0);
+        }
+    }
+    let digest = h.finalize();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest.as_bytes()[..16]);
+    Some(u128::from_le_bytes(out))
+}
+
 impl Meta {
+    /// Plan 42 §5.1.1: [`crate::MetaStore::getattr`] and the inode's
+    /// [`content_stamp`] from one record read (an open needs both).
+    pub fn getattr_stamped(&self, ino: Ino) -> Result<Option<(FileAttr, Option<u128>)>, MetaError> {
+        let r = self.db.read_tx();
+        let Some(rec) = ns::get_inode_any(&r, &self.ns, &self.orphans, ino)? else {
+            return Ok(None);
+        };
+        let at = atime::get_atime(&r, &self.atime, ino)?;
+        Ok(Some((
+            ns::attrs_to_fileattr(ino, &rec.attrs, at),
+            content_stamp(&rec),
+        )))
+    }
+
+    /// The inode's [`content_stamp`] alone (`None` too for an inode this
+    /// replica does not hold).
+    pub fn content_stamp(&self, ino: Ino) -> Result<Option<u128>, MetaError> {
+        Ok(self.getattr_stamped(ino)?.and_then(|(_, stamp)| stamp))
+    }
+
     pub fn resolve_path(&self, path: &str) -> Result<Option<Ino>, MetaError> {
         let r = self.db.read_tx();
         let mut cur = ROOT_INO;

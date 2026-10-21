@@ -8,7 +8,10 @@
 //! incident behind it) calls [`FrontendEvents::invalidate`] from one
 //! dedicated notifier thread, never from an op, never while holding an
 //! engine lock, holds a notification back while an op on the same inode
-//! is in flight, and drops one older than the attribute TTL.
+//! is in flight, and drops one older than the attribute TTL — telling the
+//! frontend so ([`FrontendEvents::undelivered`], plan 42): a dropped data
+//! invalidation leaves pages, which have no TTL, stale until the next
+//! open that drops them.
 
 use crate::name::NameBuf;
 use crate::types::Ino;
@@ -46,4 +49,16 @@ pub trait FrontendEvents: Send + Sync + 'static {
     /// waiting on this call may ever be waited on by it. Failures (the
     /// usual one: nothing was cached) are the frontend's to ignore.
     fn invalidate(&self, batch: &[Invalidation]);
+
+    /// Plan 42 §5.1.3 (S2): `batch` was **not** delivered and never will
+    /// be — the engine dropped it (held back past its bound for a request
+    /// in flight on the inode). Entries and attributes the frontend's
+    /// kernel cached before the change have expired by then; pages have
+    /// no lifetime, so a frontend that keeps a file's pages across opens
+    /// must stop treating that file's pages as current. Called from the
+    /// same notifier thread as [`Self::invalidate`]. The default ignores
+    /// it (a frontend that keeps nothing across opens).
+    fn undelivered(&self, batch: &[Invalidation]) {
+        let _ = batch;
+    }
 }

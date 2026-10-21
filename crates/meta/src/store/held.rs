@@ -1258,6 +1258,7 @@ impl Meta {
         let (bytes, files) = staged.raw_delta();
         adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
         tx.commit()?;
+        self.report_rolled_back();
         staged.drain_into(self.usage_tracker());
         *self.held.lock().unwrap() = HeldSummary::default();
         tracing::warn!(

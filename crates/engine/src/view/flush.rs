@@ -778,7 +778,7 @@ impl View {
         // gone with it, as its error said).
         if ws.changed_nothing() {
             ws.staging.discard();
-            self.writes.retire(ino);
+            self.retire_writes(ino, Retired::NothingChanged);
             return Ok(false);
         }
         // Written, then unlinked while still open (here or on another
@@ -821,7 +821,7 @@ impl View {
         };
         match flushed {
             Ok(drain) => {
-                self.writes.retire(ino);
+                self.retire_writes(ino, Retired::Committed);
                 Ok(drain)
             }
             Err(FlushFail {
@@ -851,7 +851,7 @@ impl View {
                     }
                 }
                 ws.staging.discard();
-                self.writes.retire(ino);
+                self.retire_writes(ino, Retired::Uncommitted);
                 if kept {
                     tracing::warn!(
                         target: "constellation::locks",
@@ -869,7 +869,6 @@ impl View {
                 }
                 if let Some(l) = self.cluster_locks() {
                     l.note_discard(ino);
-                    l.invalidate(ino);
                 }
                 Err(errno)
             }
@@ -901,7 +900,7 @@ impl View {
                 Err(errno)
             }
             Err(FlushFail { errno, ws: None }) => {
-                self.writes.retire(ino);
+                self.retire_writes(ino, Retired::Uncommitted);
                 Err(errno)
             }
         }
@@ -944,6 +943,11 @@ impl View {
         let Some(mut ws) = ws else {
             return false;
         };
+        // Plan 42 §5.1.5: the kernel's pages hold what this session wrote,
+        // which the view will never answer now.
+        if !ws.changed_nothing() {
+            self.inflight.invalidate_uncommitted(ino);
+        }
         let enrolled: Vec<u64> = ws.enrolled.iter().copied().collect();
         for idx in enrolled {
             if let Err(error) = self.unseal(&mut ws, ino, idx) {

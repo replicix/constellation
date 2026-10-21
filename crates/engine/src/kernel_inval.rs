@@ -58,10 +58,17 @@
 //!   the request's queueing delay, not its service time.
 //! - **Dropped once older than the TTL.** A held-back notification only
 //!   matters for what the kernel cached *before* the apply that queued it,
-//!   and everything cached before then has expired one TTL later. So a
-//!   notification held back past `DEFER_MAX` is dropped, not sent — the
-//!   TTL bound has done its job, and sending it would only park this
-//!   thread behind a request for that request's whole service time.
+//!   and every entry and attribute cached before then has expired one TTL
+//!   later. So a notification held back past `DEFER_MAX` is dropped, not
+//!   sent — the TTL bound has done its job for those, and sending it would
+//!   only park this thread behind a request for that request's whole
+//!   service time. **Pages have no TTL** (plan 42 F3): a dropped *data*
+//!   notification leaves the file's pages as they were until the next
+//!   open that drops them. Before plan 42 every open dropped them, which
+//!   hid this; since an open may keep a file's pages
+//!   (`FOPEN_KEEP_CACHE`), the frontend is told of every drop
+//!   ([`FrontendEvents::undelivered`]) and stops treating that file's
+//!   pages as current, so its next open drops them.
 //!
 //! Why this matters beyond latency (EC2 campaign 6, finding B-1): a
 //! daemon `kill -9`ed while this thread was blocked inside such a write
@@ -141,8 +148,11 @@ use std::time::{Duration, Instant};
 
 /// How long a notification is held back for a request in flight on its
 /// inode before it is dropped as redundant: one lookup/attribute TTL
-/// (everything the kernel cached before the apply has expired by then)
-/// plus a margin for the apply-to-queue delay.
+/// (every entry and attribute the kernel cached before the apply has
+/// expired by then) plus a margin for the apply-to-queue delay. Not
+/// redundant for pages, which never expire (plan 42 F3): a dropped data
+/// notification is reported to the frontend
+/// ([`FrontendEvents::undelivered`]), whose next open then drops them.
 pub const DEFER_MAX: Duration = Duration::from_millis(crate::view::TTL.as_millis() as u64 + 500);
 
 /// The watchdog's period.
@@ -212,9 +222,23 @@ enum Msg {
     },
     Unregister(u64),
     Batch(Vec<Inval>),
+    /// Plan 42 §5.1.5 (Q3): a batch for every view but the one numbered
+    /// here — a commit through that view changed what the others' kernels
+    /// may hold, while its own kernel holds what it wrote.
+    BatchExcept(u64, Vec<Inval>),
     /// Plan 30 §M14: a batch someone waits for (`true` once sent, `false`
     /// when dropped).
     Waited(Vec<Inval>, mpsc::Sender<bool>),
+}
+
+impl Msg {
+    /// The batch this message queues, if it is one.
+    fn batch(&self) -> Option<&[Inval]> {
+        match self {
+            Msg::Batch(b) | Msg::BatchExcept(_, b) | Msg::Waited(b, _) => Some(b),
+            Msg::Register { .. } | Msg::Unregister(_) => None,
+        }
+    }
 }
 
 struct State {
@@ -229,6 +253,32 @@ struct State {
     /// seen an empty queue and nothing pending ([`KernelInvalidator::
     /// wait_idle`]). Cleared by every [`Shared::push`].
     idle: bool,
+    /// Plan 42 §5.1.1: data notifications not yet delivered, per replica
+    /// inode — queued, merged into a pending one, held back, or being
+    /// written. Raised by [`Shared::push`], lowered by the thread when one
+    /// coalesces into a notification already pending, once it has been
+    /// written to the last view's sink, and when it is dropped; never
+    /// lowered by a thread that panicked in a sink, so a stuck pipeline
+    /// leaves every later change pending ([`InFlight::data_pending`]).
+    data_pending: HashMap<Ino, u32>,
+}
+
+impl State {
+    fn data_pending_add(&mut self, ino: Ino, by: i64) {
+        let c = self.data_pending.entry(ino).or_insert(0);
+        *c = (*c as i64 + by).max(0) as u32;
+        if *c == 0 {
+            self.data_pending.remove(&ino);
+        }
+    }
+}
+
+/// The inode of a data notification (what [`State::data_pending`] counts).
+fn data_ino(inval: &Inval) -> Option<Ino> {
+    match inval {
+        Inval::Inode { ino, data: true } => Some(*ino),
+        _ => None,
+    }
 }
 
 /// Counters, for the log and the tests.
@@ -237,6 +287,12 @@ pub struct Stats {
     pub sent: AtomicU64,
     pub deferred: AtomicU64,
     pub dropped: AtomicU64,
+    /// Plan 42 §5.1.5: uncommitted-session invalidations pushed.
+    pub uncommitted: AtomicU64,
+    /// Plan 42 §5.1.5 (Q3): commits reported to the other views.
+    pub other_views: AtomicU64,
+    /// Plan 42 §5.1.5: rolled-back records' invalidations pushed.
+    pub rollbacks: AtomicU64,
 }
 
 struct Shared {
@@ -255,6 +311,11 @@ struct Shared {
 impl Shared {
     fn push(&self, msg: Msg) {
         let mut st = self.state.lock().unwrap();
+        if let Some(batch) = msg.batch() {
+            for ino in batch.iter().filter_map(data_ino) {
+                st.data_pending_add(ino, 1);
+            }
+        }
         st.queue.push(msg);
         st.idle = false;
         drop(st);
@@ -324,6 +385,7 @@ impl KernelInvalidator {
                 inflight: HashMap::new(),
                 gated: false,
                 idle: true,
+                data_pending: HashMap::new(),
             }),
             wake: Condvar::new(),
             idle: Condvar::new(),
@@ -410,8 +472,24 @@ impl KernelInvalidator {
         })
     }
 
-    #[cfg(test)]
-    fn stats(&self) -> &Stats {
+    /// Plan 42 §5.1.5: the hook for `Meta::set_rollback_hook` — what a
+    /// stranding pass rolled back from its before-images, invalidated in
+    /// every view as a foreign apply of the same records would have been
+    /// (the row returned to a value an earlier open may have seen, while
+    /// this node's kernels hold what the rolled-back transaction wrote).
+    pub fn rollback_hook(&self) -> constellation_meta::RollbackHook {
+        let shared = self.shared.clone();
+        Box::new(move |rows: &[constellation_meta::RolledBack]| {
+            let batch = rollback_invalidations(rows);
+            if !batch.is_empty() {
+                shared.stats.rollbacks.fetch_add(1, Ordering::Relaxed);
+                shared.push(Msg::Batch(batch));
+            }
+        })
+    }
+
+    /// The counters (the node's status reports them).
+    pub fn stats(&self) -> &Stats {
         &self.shared.stats
     }
 
@@ -446,6 +524,20 @@ impl InodeInvalidator {
     pub fn invalidate(&self, ino: Ino) {
         self.shared
             .push(Msg::Batch(vec![Inval::Inode { ino, data: true }]));
+    }
+
+    /// Plan 42 §5.1.5 (Q3): queue the invalidation of one file in every
+    /// view but `view` (the engine's view number) — a commit through
+    /// `view` changed it under the others' kernels.
+    pub fn invalidate_others(&self, view: u64, ino: Ino) {
+        self.shared
+            .stats
+            .other_views
+            .fetch_add(1, Ordering::Relaxed);
+        self.shared.push(Msg::BatchExcept(
+            view,
+            vec![Inval::Inode { ino, data: true }],
+        ));
     }
 
     /// `true` once sent; `false` on timeout, or when it was dropped for a
@@ -495,6 +587,56 @@ impl InFlight {
     #[cfg(test)]
     fn count(&self, ino: Ino) -> u32 {
         self.0.as_ref().map_or(0, |s| s.inflight_of(ino))
+    }
+
+    /// Whether the views' kernels are told of changes at all: an
+    /// invalidator runs (`CONSTELLATION_KERNEL_INVALIDATE` is not off).
+    /// Without one a frontend's kernel learns of nothing, and no open may
+    /// keep pages (plan 42 §5.1.1).
+    pub fn enabled(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// Plan 42 §5.1.1: whether a data notification for `ino` (replica
+    /// numbering) is queued, held back or being written. Always `true`
+    /// without an invalidator (nothing will ever tell the kernel), and
+    /// once the thread has gone (a sink panicked: nothing queued is ever
+    /// delivered).
+    pub fn data_pending(&self, ino: Ino) -> bool {
+        let Some(shared) = &self.0 else {
+            return true;
+        };
+        if shared.closed.load(Ordering::SeqCst) {
+            return true;
+        }
+        shared
+            .state
+            .lock()
+            .unwrap()
+            .data_pending
+            .get(&ino)
+            .is_some_and(|c| *c > 0)
+    }
+
+    /// Plan 42 §5.1.5: drop every view's pages of `ino` (replica
+    /// numbering) — a write session retired or dropped without becoming
+    /// the row, whose bytes a kernel holds. Not waited for: the caller
+    /// may be a FUSE request handler the notification queues behind.
+    pub fn invalidate_uncommitted(&self, ino: Ino) {
+        if let Some(shared) = &self.0 {
+            shared.stats.uncommitted.fetch_add(1, Ordering::Relaxed);
+            shared.push(Msg::Batch(vec![Inval::Inode { ino, data: true }]));
+        }
+    }
+
+    /// Plan 42 §5.1.5 (Q3): [`InodeInvalidator::invalidate_others`].
+    pub fn invalidate_others(&self, view: u64, ino: Ino) {
+        if let Some(shared) = &self.0 {
+            InodeInvalidator {
+                shared: shared.clone(),
+            }
+            .invalidate_others(view, ino);
+        }
     }
 }
 
@@ -601,6 +743,35 @@ fn invalidations(records: &[LogRecord]) -> Vec<Inval> {
     out.into_iter().collect()
 }
 
+/// What rolled-back namespace rows make stale (plan 42 §5.1.5): an
+/// inode's attributes and pages, a name and its directory's listing and
+/// attributes — what a foreign apply touching the same rows would have
+/// produced.
+fn rollback_invalidations(rows: &[constellation_meta::RolledBack]) -> Vec<Inval> {
+    let mut out = BTreeSet::new();
+    for row in rows {
+        match row {
+            constellation_meta::RolledBack::Inode(ino) => {
+                out.insert(Inval::Inode {
+                    ino: *ino,
+                    data: true,
+                });
+            }
+            constellation_meta::RolledBack::Dentry { parent, name } => {
+                out.insert(Inval::Entry {
+                    parent: *parent,
+                    name: name.clone(),
+                });
+                out.insert(Inval::Inode {
+                    ino: *parent,
+                    data: true,
+                });
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
 /// A replica inode as `view_root`'s view numbers it (`View::real_ino`'s
 /// inverse), or `None` when the view cannot see it.
 fn in_view(ino: Ino, view_root: Ino) -> Option<Ino> {
@@ -626,22 +797,46 @@ struct ViewSink {
 struct Pending {
     since: Instant,
     waiters: Vec<mpsc::Sender<bool>>,
+    /// The one view it is not for (`Msg::BatchExcept`); `None`: every
+    /// view. Merging widens it: one queued for every view, or for every
+    /// view but another, is sent to every view.
+    except: Option<u64>,
 }
 
+/// Merge `batch` into `pending` (`except`: the view it is not for). A data
+/// notification already pending absorbs the new one, which no longer
+/// counts as pending by itself ([`State::data_pending`]).
 fn merge(
+    st: &mut State,
     pending: &mut BTreeMap<Inval, Pending>,
     batch: Vec<Inval>,
     now: Instant,
     waiter: Option<mpsc::Sender<bool>>,
+    except: Option<u64>,
 ) {
     for inval in batch {
-        let p = pending.entry(inval).or_insert_with(|| Pending {
-            since: now,
-            waiters: Vec::new(),
-        });
-        p.since = now;
-        if let Some(w) = &waiter {
-            p.waiters.push(w.clone());
+        let data = data_ino(&inval);
+        match pending.entry(inval) {
+            std::collections::btree_map::Entry::Occupied(mut o) => {
+                if let Some(ino) = data {
+                    st.data_pending_add(ino, -1);
+                }
+                let p = o.get_mut();
+                p.since = now;
+                if p.except != except {
+                    p.except = None;
+                }
+                if let Some(w) = &waiter {
+                    p.waiters.push(w.clone());
+                }
+            }
+            std::collections::btree_map::Entry::Vacant(v) => {
+                v.insert(Pending {
+                    since: now,
+                    waiters: waiter.iter().cloned().collect(),
+                    except,
+                });
+            }
         }
     }
 }
@@ -677,7 +872,8 @@ fn run(shared: Arc<Shared>) {
                     return;
                 }
                 let now = Instant::now();
-                for msg in st.queue.drain(..) {
+                let queued = std::mem::take(&mut st.queue);
+                for msg in queued {
                     match msg {
                         Msg::Register {
                             id,
@@ -689,8 +885,13 @@ fn run(shared: Arc<Shared>) {
                             view_root,
                         }),
                         Msg::Unregister(id) => views.retain(|v| v.id != id),
-                        Msg::Batch(batch) => merge(&mut pending, batch, now, None),
-                        Msg::Waited(batch, done) => merge(&mut pending, batch, now, Some(done)),
+                        Msg::Batch(batch) => merge(&mut st, &mut pending, batch, now, None, None),
+                        Msg::BatchExcept(view, batch) => {
+                            merge(&mut st, &mut pending, batch, now, None, Some(view))
+                        }
+                        Msg::Waited(batch, done) => {
+                            merge(&mut st, &mut pending, batch, now, Some(done), None)
+                        }
                     }
                 }
                 to_send.clear();
@@ -739,8 +940,14 @@ fn run(shared: Arc<Shared>) {
                 continue;
             };
             *shared.busy.lock().unwrap() = Some((Instant::now(), inval.clone()));
-            send(&views, &inval);
+            send(&views, &inval, p.except);
             *shared.busy.lock().unwrap() = None;
+            // After the last view's sink returned: counted per view, a
+            // multi-view node would call it delivered while a later view's
+            // write is still to come.
+            if let Some(ino) = data_ino(&inval) {
+                shared.state.lock().unwrap().data_pending_add(ino, -1);
+            }
             shared.stats.sent.fetch_add(1, Ordering::Relaxed);
             for w in p.waiters {
                 let _ = w.send(true);
@@ -756,8 +963,15 @@ fn run(shared: Arc<Shared>) {
                 what = %inval,
                 held_back_for = ?shared.defer_max,
                 "kernel cache invalidation dropped: a request was in flight on its inode for \
-                 the whole TTL, so nothing the kernel cached before it is left to drop"
+                 the whole TTL, so no entry or attribute the kernel cached before it is left \
+                 to drop (its pages are: the frontend is told)"
             );
+            // Pages have no TTL (module doc): the frontend learns that
+            // this one never reached its kernel.
+            undelivered(&views, &inval, p.except);
+            if let Some(ino) = data_ino(&inval) {
+                shared.state.lock().unwrap().data_pending_add(ino, -1);
+            }
             for w in p.waiters {
                 let _ = w.send(false);
             }
@@ -768,13 +982,22 @@ fn run(shared: Arc<Shared>) {
     }
 }
 
-fn send(views: &[ViewSink], inval: &Inval) {
-    for view in views {
+fn send(views: &[ViewSink], inval: &Inval, except: Option<u64>) {
+    for view in views.iter().filter(|v| Some(v.id) != except) {
         // One notification per call, in the view's numbering. The sink
         // ignores failures: ENOENT (nothing cached) is the common answer,
         // and every error only means there was nothing to drop.
         if let Some(inv) = inval.for_view(view.view_root) {
             view.sink.invalidate(std::slice::from_ref(&inv));
+        }
+    }
+}
+
+/// Plan 42 §5.1.3 (S2): tell each view a notification for it was dropped.
+fn undelivered(views: &[ViewSink], inval: &Inval, except: Option<u64>) {
+    for view in views.iter().filter(|v| Some(v.id) != except) {
+        if let Some(inv) = inval.for_view(view.view_root) {
+            view.sink.undelivered(std::slice::from_ref(&inv));
         }
     }
 }
@@ -892,6 +1115,20 @@ mod tests {
                     }
                     Invalidation::Attr { ino } => format!("inode {ino} data=false"),
                     Invalidation::Data { ino, range: None } => format!("inode {ino} data=true"),
+                    other => panic!("not produced: {other:?}"),
+                };
+                self.got.lock().unwrap().push(line);
+            }
+        }
+
+        fn undelivered(&self, batch: &[Invalidation]) {
+            for inv in batch {
+                let line = match inv {
+                    Invalidation::Data { ino, range: None } => format!("undelivered {ino}"),
+                    Invalidation::Entry { parent, name } => format!(
+                        "undelivered entry {parent} {}",
+                        String::from_utf8_lossy(name.as_bytes())
+                    ),
                     other => panic!("not produced: {other:?}"),
                 };
                 self.got.lock().unwrap().push(line);
@@ -1086,7 +1323,11 @@ mod tests {
         assert!(!k.inodes().invalidate_and_wait(7, Duration::from_secs(5)));
         assert!(t.elapsed() >= Duration::from_millis(200));
         assert!(t.elapsed() < Duration::from_secs(4));
-        assert!(rec.got().is_empty());
+        // Not delivered; reported as such (plan 42: pages have no TTL).
+        assert_eq!(
+            rec.wait_for(1, Duration::from_secs(5)),
+            vec!["undelivered 7"]
+        );
         assert_eq!(k.stats().dropped.load(Ordering::Relaxed), 1);
         assert_eq!(k.stats().sent.load(Ordering::Relaxed), 0);
     }
@@ -1217,6 +1458,180 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         assert!(rec.got().is_empty());
         assert_eq!(k.stats().sent.load(Ordering::Relaxed), 1);
+    }
+
+    /// Plan 42 §5.1.1: a data notification counts as pending from its push
+    /// until the last view's sink returned — queued, held back for a
+    /// request in flight, blocked in a sink — and not after it was sent,
+    /// dropped, or merged into one already pending. (Checked to fail with
+    /// the decrement moved before the sink call: `pending while blocked`.)
+    #[test]
+    fn a_data_notification_is_pending_until_delivered_or_dropped() {
+        let k = KernelInvalidator::start_with(Duration::from_millis(300));
+        let rec = Recorder::blocking();
+        k.register(1, Arc::new(rec.clone()), ROOT_INO);
+        let inflight = k.inflight();
+        assert!(!inflight.data_pending(7));
+        // Held back for a request in flight.
+        let guard = inflight.enter(&[7]);
+        k.inodes().invalidate(7);
+        assert!(inflight.data_pending(7), "pending while held back");
+        assert!(!inflight.data_pending(8), "per inode");
+        drop(guard);
+        // Now blocked in the sink.
+        let start = Instant::now();
+        while k.stalled_for().is_none() && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(inflight.data_pending(7), "pending while blocked in a sink");
+        rec.release();
+        assert!(k.wait_idle(Duration::from_secs(5)));
+        assert!(!inflight.data_pending(7), "delivered");
+        // Fifty duplicates held back coalesce into one, counted once.
+        let guard = inflight.enter(&[7]);
+        for _ in 0..50 {
+            k.inodes().invalidate(7);
+        }
+        assert!(inflight.data_pending(7));
+        drop(guard);
+        assert!(k.wait_idle(Duration::from_secs(5)));
+        assert!(!inflight.data_pending(7), "after coalescing 50 duplicates");
+        // Dropped past the bound.
+        let _guard = inflight.enter(&[7]);
+        k.inodes().invalidate(7);
+        assert!(inflight.data_pending(7));
+        let start = Instant::now();
+        while k.stats().dropped.load(Ordering::Relaxed) == 0
+            && start.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!inflight.data_pending(7), "after the drop");
+        // Attribute-only invalidations are not data.
+        k.shared.push(Msg::Batch(vec![Inval::Inode {
+            ino: 9,
+            data: false,
+        }]));
+        assert!(!inflight.data_pending(9));
+    }
+
+    /// Plan 42 §5.1.3 (S2): a dropped data notification is reported to
+    /// every view it was for, once, in that view's numbering.
+    #[test]
+    fn a_dropped_notification_is_reported_undelivered_to_each_view() {
+        let (k, rec) = started(Duration::from_millis(200));
+        let sub = Recorder::default();
+        k.register(2, Arc::new(sub.clone()), 42);
+        let _guard = k.inflight().enter(&[42]);
+        k.inodes().invalidate(42);
+        assert_eq!(
+            rec.wait_for(1, Duration::from_secs(5)),
+            vec!["undelivered 42"]
+        );
+        assert_eq!(
+            sub.wait_for(1, Duration::from_secs(5)),
+            vec!["undelivered 1"],
+            "the subtree view's numbering"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(rec.got().len(), 1, "once");
+        assert_eq!(k.stats().sent.load(Ordering::Relaxed), 0);
+    }
+
+    /// A sink that panics ends the thread: everything queued after stays
+    /// pending for good, so no open keeps pages of a file changed since.
+    #[test]
+    fn a_panicking_sink_leaves_the_counter_up() {
+        struct Panics;
+        impl FrontendEvents for Panics {
+            fn invalidate(&self, _: &[Invalidation]) {
+                panic!("a sink that fails (expected by the test)");
+            }
+        }
+        let k = KernelInvalidator::start_with(DEFER_MAX);
+        k.register(1, Arc::new(Panics), ROOT_INO);
+        let inflight = k.inflight();
+        k.inodes().invalidate(7);
+        assert!(!k.wait_idle(Duration::from_secs(10)));
+        assert!(inflight.data_pending(7));
+        assert!(
+            inflight.data_pending(8),
+            "the thread is gone: nothing is delivered"
+        );
+    }
+
+    /// Plan 42 §5.1.5 (Q3): a commit through one view is told to every
+    /// other view, not to the committing one; merged with a plain
+    /// notification for the same file it reaches every view.
+    #[test]
+    fn a_commit_is_told_to_every_view_but_the_committing_one() {
+        let (k, rec) = started(DEFER_MAX);
+        let other = Recorder::default();
+        k.register(2, Arc::new(other.clone()), ROOT_INO);
+        k.inflight().invalidate_others(1, 7);
+        assert_eq!(
+            other.wait_for(1, Duration::from_secs(5)),
+            vec!["inode 7 data=true"]
+        );
+        assert!(k.wait_idle(Duration::from_secs(5)));
+        assert!(
+            rec.got().is_empty(),
+            "the committing view holds what it wrote"
+        );
+        // Held back, then merged with one for every view.
+        let guard = k.inflight().enter(&[7]);
+        k.inflight().invalidate_others(1, 7);
+        k.inodes().invalidate(7);
+        drop(guard);
+        assert_eq!(
+            rec.wait_for(1, Duration::from_secs(5)),
+            vec!["inode 7 data=true"]
+        );
+        assert_eq!(other.wait_for(2, Duration::from_secs(5)).len(), 2);
+        assert_eq!(k.stats().other_views.load(Ordering::Relaxed), 2);
+    }
+
+    /// Plan 42 §5.1.5: what a stranding pass restored becomes the
+    /// notifications a foreign apply of the same rows would have produced.
+    #[test]
+    fn rolled_back_rows_invalidate_what_they_touched() {
+        use constellation_meta::RolledBack;
+        let got = rollback_invalidations(&[
+            RolledBack::Inode(9),
+            RolledBack::Dentry {
+                parent: 5,
+                name: "m1".into(),
+            },
+        ]);
+        assert_eq!(
+            got,
+            vec![
+                Inval::Entry {
+                    parent: 5,
+                    name: "m1".into()
+                },
+                Inval::Inode { ino: 5, data: true },
+                Inval::Inode { ino: 9, data: true },
+            ]
+        );
+        let (k, rec) = started(DEFER_MAX);
+        (k.rollback_hook())(&[RolledBack::Inode(9)]);
+        assert_eq!(
+            rec.wait_for(1, Duration::from_secs(5)),
+            vec!["inode 9 data=true"]
+        );
+    }
+
+    /// Without an invalidator nothing reaches a kernel: every inode counts
+    /// as pending (no open may keep pages), and the uncommitted-session
+    /// event is a no-op.
+    #[test]
+    fn a_disabled_registry_reports_everything_pending() {
+        let inflight = InFlight::disabled();
+        assert!(!inflight.enabled());
+        assert!(inflight.data_pending(7));
+        inflight.invalidate_uncommitted(7);
+        inflight.invalidate_others(1, 7);
     }
 
     #[test]

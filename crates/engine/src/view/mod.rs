@@ -107,6 +107,7 @@ mod flush;
 mod frozen_manifests;
 mod handoff;
 mod io;
+mod kernel_cache;
 mod lock_gate;
 mod lock_handles;
 pub mod ops;
@@ -136,6 +137,8 @@ mod durable_ack_tests;
 #[cfg(test)]
 mod fsync_drain_tests;
 #[cfg(test)]
+mod kernel_cache_tests;
+#[cfg(test)]
 mod lookup_wait_tests;
 #[cfg(test)]
 mod memcache_tests;
@@ -157,6 +160,7 @@ mod vfs_tests;
 #[cfg(test)]
 mod zero_copy_tests;
 
+use kernel_cache::Retired;
 use passthrough::PassthroughHandle;
 use shards::*;
 pub(crate) use subtree_quota::is_internal_xattr;

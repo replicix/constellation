@@ -1148,6 +1148,7 @@ impl Vfs for View {
                     fh,
                     backing,
                     zero_copy,
+                    cache: self.frozen_stamp(ino),
                 }));
             } else {
                 r.done(self.ino_err(ino, Code::IsDir));
@@ -1156,15 +1157,14 @@ impl Vfs for View {
         }
         // Plan 30 §M8: under `--cto strict`, the close-to-open point.
         self.strict_read(ino, false, None, &[ReadKey::Ino(ino)]);
-        let attr = self.meta.getattr(ino).and_then(|attr| {
-            if attr.is_some() {
-                Ok(attr)
-            } else {
-                self.meta.scratch_getattr(ino)
-            }
+        // Plan 42 §5.1.1: the record read answers the cache stamp too
+        // (a node-local scratch file has none).
+        let attr = self.meta.getattr_stamped(ino).and_then(|attr| match attr {
+            Some(stamped) => Ok(Some(stamped)),
+            None => Ok(self.meta.scratch_getattr(ino)?.map(|attr| (attr, None))),
         });
         match attr {
-            Ok(Some(attr)) => {
+            Ok(Some((attr, stamp))) => {
                 *self.opens.lock().unwrap().entry(ino).or_insert(0) += 1;
                 self.note_writer_open(ino, flags);
                 // Plan 38 §3(c): a read-only open of a one-chunk file
@@ -1186,6 +1186,7 @@ impl Vfs for View {
                     fh,
                     backing,
                     zero_copy,
+                    cache: self.open_stamp(ino, stamp),
                 }))
             }
             Ok(None) => r.done(self.ino_err(ino, Code::NotFound)),
@@ -1220,13 +1221,19 @@ impl Vfs for View {
             tracing::warn!(parent, name = %name, ?took, ok = result.is_ok(), "slow FUSE create");
         }
         match result {
-            Ok((attr, _created)) => {
+            Ok((attr, created)) => {
                 *self.opens.lock().unwrap().entry(attr.ino).or_insert(0) += 1;
                 self.note_writer_open(attr.ino, flags);
-                r.done(Ok((
-                    self.entry_out(&attr),
-                    Opened::new(self.open_handle(attr.ino, flags)),
-                )))
+                let mut opened = Opened::new(self.open_handle(attr.ino, flags));
+                // Plan 42 §5.1.1: an existing file opened by a create has
+                // pages a kernel may keep; a new one has none (no stamp:
+                // its next open records one, and the create's path stays
+                // one record read short).
+                if !created {
+                    let stamp = self.meta.content_stamp(attr.ino).ok().flatten();
+                    opened.cache = self.open_stamp(attr.ino, stamp);
+                }
+                r.done(Ok((self.entry_out(&attr), opened)))
             }
             Err(e) => r.done(err(e)),
         }

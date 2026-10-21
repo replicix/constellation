@@ -55614,7 +55614,7 @@ are recorded per run).
 | Item | State | Where |
 |---|---|---|
 | Reproducers, fault points, scenarios; base counts (K1) | landed | `crates/harness/src/kernel_races.rs`, `scenarios/kernel_races.rs`, `crates/engine/src/fault.rs`, `crates/frontend-fuse/src/fault.rs` |
-| Cache stamp, pending data notifications, `undelivered` (K2) | — | |
+| Cache stamp, pending data notifications, `undelivered` (K2) | landed | `crates/vfs/src/{types,events}.rs`, `crates/meta/src/store/{reads,mod,spec,held}.rs`, `crates/engine/src/{kernel_inval,view/kernel_cache,view/ops,view/flush}.rs` |
 | Conditional keep-cache (K3) | — | |
 | Write-race repair (K4) | — | |
 | Directory attributes (K5) | — | |

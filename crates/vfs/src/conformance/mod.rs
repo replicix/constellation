@@ -139,6 +139,14 @@ pub struct Declared {
     /// (see the module doc: what sets the token on a Linux FUSE mount is
     /// the adapter's, not the target's).
     pub cancellable_waits: bool,
+    /// Plan 42 §5.1: the target models what a kernel's page cache of its
+    /// files may hold — an open answers a cache stamp (`Opened::cache`)
+    /// and content that changes under the kernel without a foreign change
+    /// is told as an invalidation. Default `false`: the contract does not
+    /// ask for it (`MockVfs` and `RefFs` model no page cache and answer no
+    /// stamp, which a frontend takes as "drop"); the cache-stamp tests
+    /// skip, naming `cache-stamps`. The engine declares `true`.
+    pub cache_stamps: bool,
 }
 
 impl Default for Declared {
@@ -146,6 +154,7 @@ impl Default for Declared {
         Self {
             rename_flags: true,
             cancellable_waits: true,
+            cache_stamps: false,
         }
     }
 }
@@ -329,6 +338,9 @@ pub(crate) fn must<T>(what: &str, r: crate::VfsResult<T>) -> T {
 pub(crate) fn joined<T>(r: std::thread::Result<T>) -> T {
     r.unwrap_or_else(|payload| std::panic::resume_unwind(payload))
 }
+
+/// The skip reason of a test that needs [`Declared::cache_stamps`].
+pub(crate) const CACHE_STAMPS_GAP: &str = "declared cache-stamps gap";
 
 /// Skip the test (`return skip!(...)`) with a reason.
 macro_rules! skip {
@@ -706,7 +718,11 @@ tests! {
         remote_unlink_and_rename_invalidate_names [PushInval],
         remote_write_invalidates_pages [PushInval],
         remote_setattr_invalidates_attributes [PushInval],
-        events_come_from_one_dedicated_thread [PushInval];
+        events_come_from_one_dedicated_thread [PushInval],
+        open_answers_the_same_stamp_for_unchanged_content [PushInval],
+        a_second_views_commit_changes_the_stamp [PushInval],
+        a_session_dropped_without_commit_invalidates [PushInval, KeepOpenUnlinked],
+        a_commit_through_another_view_invalidates_this_one [PushInval];
     Confinement / confinement:
         dotdot_at_the_view_root_is_the_root [],
         the_view_root_is_the_root_inode [],
@@ -892,17 +908,21 @@ mod tests {
         write_results_if_asked(&report, "reference-linux-fuse");
         report.assert_ok();
         // Everything applicable ran: the only skips are the ones that name
-        // a capability the frontend lacks (none, here).
+        // a capability the frontend lacks (none, here) — and the cache-stamp
+        // tests, which the reference target declares it does not model.
+        let skipped: Vec<_> = report
+            .skipped()
+            .iter()
+            .map(|t| (t.id(), &t.outcome))
+            .collect();
         assert!(
-            report.skipped().is_empty(),
-            "skipped on a frontend with every capability: {:?}",
-            report
-                .skipped()
-                .iter()
-                .map(|t| (t.id(), &t.outcome))
-                .collect::<Vec<_>>()
+            skipped.iter().all(|(_, o)| matches!(
+                o,
+                Outcome::Skipped(why) if why.contains(CACHE_STAMPS_GAP)
+            )),
+            "skipped on a frontend with every capability: {skipped:?}"
         );
-        assert_eq!(report.passed().len(), TESTS.len());
+        assert_eq!(report.passed().len() + skipped.len(), TESTS.len());
     }
 
     #[test]
@@ -912,7 +932,7 @@ mod tests {
         for t in report.skipped() {
             match &t.outcome {
                 Outcome::Skipped(why) => assert!(
-                    why.contains("ClusterLocks"),
+                    why.contains("ClusterLocks") || why.contains(CACHE_STAMPS_GAP),
                     "{} skipped for another reason: {why}",
                     t.id()
                 ),

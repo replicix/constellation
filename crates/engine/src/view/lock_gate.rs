@@ -506,9 +506,9 @@ impl View {
             ino,
             "discarded writes made under a lock grant this node no longer holds (EIO)"
         );
-        if let Some(l) = self.cluster_locks() {
-            l.invalidate(ino);
-        }
+        // The kernel's pages of the file, which hold the same bytes, are
+        // dropped by `drop_writes` (plan 42 §5.1.5), in every view and
+        // under `--locks local` too.
         true
     }
 }

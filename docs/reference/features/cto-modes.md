@@ -175,7 +175,13 @@ through exactly the tail code path, fencing included.
 
 Records applied from other nodes also push kernel entry and inode
 invalidations (`CONSTELLATION_KERNEL_INVALIDATE`), so the kernel's
-attribute cache does not add a second of staleness.
+attribute cache does not add a second of staleness. A notification
+that cannot be written for as long as a request on its inode is in
+flight (the lookup TTL plus a margin) is dropped: the entries and
+attributes it was for have expired by then, but a file's pages do not
+expire, so the frontend marks that file's pages as not current and its
+next open drops them (plan 42 F3; before plan 42 every open dropped
+them anyway).
 
 ### Strict reads: ReadIndex
 

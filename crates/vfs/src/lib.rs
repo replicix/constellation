@@ -53,10 +53,10 @@ pub use responder::{
     Blocking, BlockingWait, CollectDir, DirEntry, DirSink, FnResponder, Responder, WaitStart,
 };
 pub use types::{
-    Attr, CopyFlags, Durability, Entry, FallocateMode, Fh, FileKind, Ino, LockKind, LockOwner,
-    LockRange, LockSpec, LockStatus, OpenFlags, OpenOwner, Opened, PassthroughChunk, ReadData,
-    RenameFlags, SeekWhence, SetAttr, SetXattrFlags, SetXattrMode, StatFs, TimeSet, WriteData,
-    ZeroCopyRead, ZeroCopySource, COPY_MAX, ROOT_INO,
+    Attr, CacheStamp, CopyFlags, Durability, Entry, FallocateMode, Fh, FileKind, Ino, LockKind,
+    LockOwner, LockRange, LockSpec, LockStatus, OpenFlags, OpenOwner, Opened, PassthroughChunk,
+    ReadData, RenameFlags, SeekWhence, SetAttr, SetXattrFlags, SetXattrMode, StatFs, TimeSet,
+    WriteData, ZeroCopyRead, ZeroCopySource, COPY_MAX, ROOT_INO,
 };
 pub use vfs::Vfs;
 pub use watch::{OpWatch, WatchKey, Watched};

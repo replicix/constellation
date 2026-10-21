@@ -239,6 +239,9 @@ fn declared() -> Declared {
     Declared {
         rename_flags: true,
         cancellable_waits: true,
+        // Plan 42: opens answer cache stamps, and uncommitted sessions and
+        // other views' commits are told.
+        cache_stamps: true,
     }
 }
 

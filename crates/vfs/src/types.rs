@@ -128,18 +128,35 @@ pub struct Opened {
     /// `FOPEN_IO_URING_ZERO_COPY`). Which reads actually are zero-copy is
     /// decided per read; the rest of them come back as bytes.
     pub zero_copy: bool,
+    /// Plan 42 §5.1: the content identity of the inode as this open read
+    /// it. A frontend whose kernel keeps a file's pages across opens may
+    /// keep the pages it cached since a drop answered with the same
+    /// stamp, if nothing else it knows of says otherwise. `None`: drop
+    /// (always, for a frontend that caches nothing, which ignores it).
+    pub cache: Option<CacheStamp>,
 }
 
 impl Opened {
-    /// A handle answered the ordinary way (no backing file).
+    /// A handle answered the ordinary way (no backing file, no stamp).
     pub fn new(fh: Fh) -> Self {
         Self {
             fh,
             backing: None,
             zero_copy: false,
+            cache: None,
         }
     }
 }
+
+/// Plan 42 §5.1.1: what an open read of an inode's committed content — a
+/// 128-bit digest of its size, times and manifest identity, compared by
+/// equality only. Two opens that answer the same stamp read the same
+/// committed row; what a frontend's own kernel wrote since, and what may
+/// have changed without changing the row (a rollback, a session dropped
+/// uncommitted), the engine reports as data invalidations
+/// ([`crate::Invalidation::Data`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CacheStamp(pub u128);
 
 /// The one chunk file a passthrough-eligible open is allowed to be read
 /// from directly (plan 38 §3(c)): the whole of the file's committed

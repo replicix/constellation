@@ -1008,6 +1008,7 @@ fn a_zero_copy_read_is_one_read_fixed_and_the_same_bytes_on_every_leg() {
             fh: Fh(3),
             backing: None,
             zero_copy: true,
+            cache: None,
         }));
         mock.always_release(Script::ok(()));
         mock.always_flush(Script::ok(()));

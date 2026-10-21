@@ -2257,6 +2257,7 @@ fn backing(byte: u8) -> constellation_vfs::PassthroughChunk {
 
 fn opened_with(fh: u64, b: Option<constellation_vfs::PassthroughChunk>) -> Opened {
     Opened {
+        cache: None,
         fh: Fh(fh),
         backing: b,
         zero_copy: false,

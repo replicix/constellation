@@ -193,6 +193,12 @@ impl FrontendEvents for DeferredEvents {
             events.invalidate(batch);
         }
     }
+
+    fn undelivered(&self, batch: &[constellation_vfs::Invalidation]) {
+        if let Some(events) = self.0.get() {
+            events.undelivered(batch);
+        }
+    }
 }
 
 /// One open view, as [`Engine::views`] lists it.
@@ -1652,6 +1658,10 @@ impl Engine {
                 }
                 coop.note_foreign_records(records);
             }));
+            // Plan 42 §5.1.5: so does every row a stranding pass restores.
+            if let Some(k) = &kernel_inval {
+                meta.set_rollback_hook(k.rollback_hook());
+            }
         }
         // Plan 31 C8: the host's lifecycle, applied from now on.
         let lifecycle = crate::lifecycle::Lifecycle::new(

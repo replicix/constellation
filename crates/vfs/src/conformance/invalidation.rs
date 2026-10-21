@@ -8,7 +8,7 @@
 //! name change is an `Entry` or a `Deleted`, a page change a `Data` — and
 //! strict that it *is* told, in the recording view's own inode numbering.
 
-use super::{must, Env, Fx, RecordingEvents, TestResult};
+use super::{must, skip, Env, Fx, RecordingEvents, TestResult};
 use crate::events::Invalidation;
 use crate::types::Ino;
 use std::sync::Arc;
@@ -167,5 +167,129 @@ pub(super) fn events_come_from_one_dedicated_thread(env: &Env<'_>) -> TestResult
         !threads.contains(&std::thread::current().id()),
         "an event was delivered on the thread that ran the op"
     );
+    Ok(())
+}
+
+// ------------------------------------------------- plan 42: cache stamps
+
+/// Skip unless the target models a kernel page cache
+/// ([`super::Declared::cache_stamps`]).
+fn needs_cache_stamps(fx: &Fx) -> TestResult {
+    if !fx.declared.cache_stamps {
+        skip!(
+            "the target models no kernel page cache ({})",
+            super::CACHE_STAMPS_GAP
+        );
+    }
+    Ok(())
+}
+
+/// The stamp a read-only open of `f` answers (`Opened::cache`).
+fn stamp_of(c: &super::Client, f: Ino) -> Option<crate::types::CacheStamp> {
+    let o = must("open", c.open(f, crate::OpenFlags::READ));
+    let stamp = o.cache;
+    must("close", c.close(f, o.fh));
+    stamp
+}
+
+/// Plan 42 §5.1.1: a target that tells a frontend's cache of other
+/// nodes' changes answers an open with a cache stamp, the same one for
+/// as long as the file's content is unchanged.
+pub(super) fn open_answers_the_same_stamp_for_unchanged_content(env: &Env<'_>) -> TestResult {
+    let (fx, _other, _events) = pair(env)?;
+    needs_cache_stamps(&fx)?;
+    let a = fx.client();
+    let f = must("put f", a.put(a.root(), "f", b"content")).attr.ino;
+    fx.settle();
+    let s = stamp_of(&a, f);
+    assert!(
+        s.is_some(),
+        "a target with push invalidation answers a stamp"
+    );
+    assert_eq!(stamp_of(&a, f), s, "unchanged content, another stamp");
+    // Reads and attribute reads change nothing.
+    let _ = must("getattr", a.getattr(f));
+    let _ = must("slurp", a.slurp(f));
+    assert_eq!(stamp_of(&a, f), s, "a read changed the stamp");
+    Ok(())
+}
+
+/// Plan 42 §5.1.1: another node's commit changes the stamp this view's
+/// next open answers, once it has been delivered (`settle`: the change
+/// is applied and its notification is out, so nothing is pending).
+pub(super) fn a_second_views_commit_changes_the_stamp(env: &Env<'_>) -> TestResult {
+    let (fx, other, events) = pair(env)?;
+    needs_cache_stamps(&fx)?;
+    let (a, b) = (fx.client(), other.client());
+    let f = must("put f", b.put(b.root(), "f", b"before")).attr.ino;
+    fx.settle();
+    let before = stamp_of(&a, f);
+    assert!(before.is_some());
+    events.take();
+    let o = must("open", b.open_rw(f));
+    must("remote write", b.write(f, o.fh, 0, b"AFTER!"));
+    must("close", b.close(f, o.fh));
+    fx.settle();
+    let after = stamp_of(&a, f);
+    assert!(after.is_some(), "delivered: nothing pending, a stamp again");
+    assert_ne!(after, before, "the remote commit left the stamp");
+    assert!(told_data(&events.all(), f));
+    Ok(())
+}
+
+/// Plan 42 §5.1.5: a write session that ends without becoming the row —
+/// here written through a descriptor of a file unlinked meanwhile, whose
+/// last close drops it — is told to the frontend as a page invalidation:
+/// its kernel holds bytes the view will never answer.
+pub(super) fn a_session_dropped_without_commit_invalidates(env: &Env<'_>) -> TestResult {
+    let (fx, _other, events) = pair(env)?;
+    needs_cache_stamps(&fx)?;
+    let a = fx.client();
+    let f = must("put f", a.put(a.root(), "f", b"committed")).attr.ino;
+    let o = must("open", a.open_rw(f));
+    must("write", a.write(f, o.fh, 0, b"never published"));
+    must("unlink", a.unlink(a.root(), "f"));
+    fx.settle();
+    events.take();
+    must("close", a.close(f, o.fh));
+    // A frontend that reports the kernel's `FORGET`s keeps the orphan,
+    // session included, until its kernel lets go of it.
+    a.forget(f);
+    fx.settle();
+    let told = events.all();
+    assert!(
+        told_data(&told, f),
+        "the dropped session's pages were not invalidated: {told:?}"
+    );
+    Ok(())
+}
+
+/// Plan 42 §5.1.5 (Q3): a commit through another view of the same target
+/// (a second mount of one node) is told to this view: no foreign apply
+/// will report it, and this view's kernel may hold pages of the row it
+/// replaced.
+pub(super) fn a_commit_through_another_view_invalidates_this_one(env: &Env<'_>) -> TestResult {
+    let fx = env.fresh();
+    needs_cache_stamps(&fx)?;
+    let events = fx.events()?.clone();
+    let sub = fx.subtree("", false)?;
+    let (a, b) = (fx.client(), sub.client());
+    let f = must("put f", a.put(a.root(), "f", b"before")).attr.ino;
+    fx.settle();
+    let before = stamp_of(&a, f);
+    events.take();
+    let fb = must("lookup through the other view", b.lookup(b.root(), "f"))
+        .attr
+        .ino;
+    let o = must("open", b.open_rw(fb));
+    must("write", b.write(fb, o.fh, 0, b"AFTER!"));
+    must("close", b.close(fb, o.fh));
+    fx.settle();
+    let told = events.all();
+    assert!(
+        told_data(&told, f),
+        "the other view's commit was not told: {told:?}"
+    );
+    assert_ne!(stamp_of(&a, f), before, "the commit left the stamp");
     Ok(())
 }

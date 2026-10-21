@@ -663,6 +663,14 @@ pub struct Meta {
     /// they touched, so another node's write is visible without waiting
     /// out the attribute/entry TTL).
     foreign_apply_hook: std::sync::OnceLock<ForeignApplyHook>,
+    /// Plan 42 §5.1.5: told what every stranding pass rolled back
+    /// ([`Meta::set_rollback_hook`]), and what it has not been told yet.
+    rollback_hook: std::sync::OnceLock<RollbackHook>,
+    /// The rows noted and not reported yet, by the thread whose pass
+    /// noted them: a pass notes inside its transaction and reports after
+    /// its commit on the same thread, so another thread's report never
+    /// takes rows of a transaction that has not committed.
+    rolled_back: std::sync::Mutex<Vec<(std::thread::ThreadId, RolledBack)>>,
     /// Plan 32 §6.3: bumped (and the hook told) whenever a snapshot row
     /// may have appeared or gone, so the accounting index reconciles
     /// without polling the rows.
@@ -689,6 +697,20 @@ pub const VACUUM_MIN_ENTRIES: usize = 4096;
 /// See [`Meta::set_foreign_apply_hook`].
 pub type ForeignApplyHook = Box<dyn Fn(&[crate::record::LogRecord]) + Send + Sync>;
 
+/// See [`Meta::set_rollback_hook`].
+pub type RollbackHook = Box<dyn Fn(&[RolledBack]) + Send + Sync>;
+
+/// A namespace row a stranding pass restored from its before-image
+/// (plan 42 §5.1.5): an inode's record, or a directory entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RolledBack {
+    Inode(constellation_fs_core::Ino),
+    Dentry {
+        parent: constellation_fs_core::Ino,
+        name: String,
+    },
+}
+
 /// See [`Meta::set_snapshot_change_hook`].
 pub type SnapshotChangeHook = Arc<dyn Fn() + Send + Sync>;
 
@@ -698,6 +720,71 @@ impl Meta {
     /// second call is ignored.
     pub fn set_foreign_apply_hook(&self, hook: ForeignApplyHook) {
         let _ = self.foreign_apply_hook.set(hook);
+    }
+
+    /// Plan 42 §5.1.5: call `hook` with the namespace rows every stranding
+    /// pass restores from their before-images from now on (a deposed
+    /// holder's unshipped transactions, a takeover's or a recall's
+    /// stranded speculation, `repair drop-held`), after the pass has
+    /// committed. A rolled-back row returns to a value a frontend's kernel
+    /// may have seen before the transaction — content and times, `ctime`
+    /// included — while that kernel holds what the transaction wrote; no
+    /// foreign apply reports it. Set once; a second call is ignored.
+    pub fn set_rollback_hook(&self, hook: RollbackHook) {
+        let _ = self.rollback_hook.set(hook);
+    }
+
+    /// A stranding pass is restoring `before`'s keys (inside its
+    /// transaction): remembered until [`Self::report_rolled_back`].
+    pub(crate) fn note_rolled_back<'a>(&self, keys: impl IntoIterator<Item = &'a [u8]>) {
+        let me = std::thread::current().id();
+        let mut out = self.rolled_back.lock().unwrap();
+        for key in keys {
+            match constellation_mtree::keys::Key::parse(key) {
+                Ok(constellation_mtree::keys::Key::Inode { ino }) => {
+                    out.push((me, RolledBack::Inode(ino)))
+                }
+                Ok(constellation_mtree::keys::Key::Dentry { parent_ino, name }) => out.push((
+                    me,
+                    RolledBack::Dentry {
+                        parent: parent_ino,
+                        name: String::from_utf8_lossy(name).into_owned(),
+                    },
+                )),
+                // An xattr's or a reverse entry's row: its inode's record
+                // changes with it (ctime), which is listed on its own.
+                _ => {}
+            }
+        }
+    }
+
+    /// Tell the hook what this thread's stranding passes rolled back since
+    /// its last call — after their transactions committed. Only the
+    /// calling thread's rows: another thread's may belong to a transaction
+    /// still open, and reported now they would be delivered (and the
+    /// kernel's pages dropped and refetched) before the rollback is
+    /// visible. A pass that failed before its commit leaves its rows here,
+    /// reported with the thread's next one: an invalidation of something
+    /// that did not change costs a refetch, a missing one a stale page.
+    pub(crate) fn report_rolled_back(&self) {
+        let me = std::thread::current().id();
+        let rows: Vec<RolledBack> = {
+            let mut all = self.rolled_back.lock().unwrap();
+            if all.is_empty() {
+                return;
+            }
+            let (mine, others): (Vec<_>, Vec<_>) = std::mem::take(&mut *all)
+                .into_iter()
+                .partition(|(t, _)| *t == me);
+            *all = others;
+            mine.into_iter().map(|(_, r)| r).collect()
+        };
+        if rows.is_empty() {
+            return;
+        }
+        if let Some(hook) = self.rollback_hook.get() {
+            hook(&rows);
+        }
     }
 
     /// Plan 32 §6.3: call `hook` whenever a snapshot row may have been
@@ -733,6 +820,9 @@ impl Meta {
         if let Some(hook) = self.foreign_apply_hook.get() {
             hook(records);
         }
+        // The segment's own stranding (on this thread), should a path
+        // have missed it.
+        self.report_rolled_back();
     }
 
     /// Force every committed write to stable storage.
@@ -873,6 +963,8 @@ impl Meta {
             horizon_wait: std::sync::Mutex::new(std::collections::HashMap::new()),
             locks: crate::locks::LockTables::default(),
             foreign_apply_hook: std::sync::OnceLock::new(),
+            rollback_hook: std::sync::OnceLock::new(),
+            rolled_back: std::sync::Mutex::new(Vec::new()),
             snapshot_gen: AtomicU64::new(0),
             snapshot_hook: std::sync::RwLock::new(None),
             vacuum_baselines: Default::default(),
@@ -1823,6 +1915,42 @@ mod tests {
     use super::*;
     use crate::MetaStore;
     use constellation_fs_core::types::ROOT_INO;
+
+    /// Plan 42 §5.1.5: a pass's rolled-back rows are reported by the
+    /// thread that noted them, after its commit; another thread's report
+    /// (a foreign apply's, or another pass's) does not take them while the
+    /// noting transaction may still be open.
+    #[test]
+    fn rolled_back_rows_are_reported_by_the_noting_thread_only() {
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let seen: Arc<std::sync::Mutex<Vec<RolledBack>>> = Arc::default();
+        {
+            let seen = seen.clone();
+            meta.set_rollback_hook(Box::new(move |rows| {
+                seen.lock().unwrap().extend_from_slice(rows)
+            }));
+        }
+        let (noted_tx, noted_rx) = std::sync::mpsc::channel();
+        let (commit_tx, commit_rx) = std::sync::mpsc::channel::<()>();
+        let pass = {
+            let meta = meta.clone();
+            std::thread::spawn(move || {
+                let key = constellation_mtree::keys::inode(7);
+                meta.note_rolled_back([key.as_slice()]);
+                noted_tx.send(()).unwrap();
+                // ... the pass's transaction commits here ...
+                commit_rx.recv().unwrap();
+                meta.report_rolled_back();
+            })
+        };
+        noted_rx.recv().unwrap();
+        meta.note_foreign_applied(&[]);
+        meta.report_rolled_back();
+        assert!(seen.lock().unwrap().is_empty(), "not before its commit");
+        commit_tx.send(()).unwrap();
+        pass.join().unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![RolledBack::Inode(7)]);
+    }
 
     /// A truncate cuts the file's content, not just its size: the stored
     /// manifest's `file_len` drops to the new size and the chunks wholly
