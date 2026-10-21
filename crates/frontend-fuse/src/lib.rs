@@ -16,6 +16,7 @@
 //! `fuser`.
 
 mod adapter;
+mod attrwatch;
 mod dentries;
 mod fault;
 pub mod kernel_fixes;

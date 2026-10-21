@@ -541,6 +541,9 @@ pub struct PageCacheStats {
     /// W3b: attribute-only notifications for changed directories and moved
     /// inodes (`crate::reply`).
     pub(crate) dir_attr_notices: AtomicU64,
+    /// W3b, narrowed: changed inodes no reply was on its way for, so
+    /// without a notice.
+    pub(crate) dir_attr_notices_skipped: AtomicU64,
 }
 
 /// A snapshot of [`PageCacheStats`].
@@ -560,6 +563,7 @@ pub struct PageCacheCounts {
     pub ambiguous_writes: u64,
     pub concurrent_writes: u64,
     pub dir_attr_notices: u64,
+    pub dir_attr_notices_skipped: u64,
 }
 
 /// The settings the table works under (`CONSTELLATION_FUSE_KEEP_CACHE`,
@@ -592,12 +596,28 @@ impl PageCacheConfig {
         )
     }
 
+    /// Whether W3b writes notices now, and for which namespace operations
+    /// ([`NoticeMode`]).
+    pub fn dir_notice_mode(&self) -> NoticeMode {
+        match self.dir_change_notify {
+            crate::Switch::On => NoticeMode::Always,
+            crate::Switch::Off => NoticeMode::Off,
+            crate::Switch::Auto => {
+                if crate::kernel_fixes::fixed(crate::kernel_fixes::KernelFix::DirChangeBumpsVersion)
+                {
+                    NoticeMode::Off
+                } else if self.strict {
+                    NoticeMode::Always
+                } else {
+                    NoticeMode::Narrowed
+                }
+            }
+        }
+    }
+
     /// Whether W3b writes its notices now.
     pub fn dir_notice_on(&self) -> bool {
-        on(
-            self.dir_change_notify,
-            crate::kernel_fixes::KernelFix::DirChangeBumpsVersion,
-        )
+        self.dir_notice_mode() != NoticeMode::Off
     }
 
     /// Whether W3a gives directories' attributes no kernel lifetime now:
@@ -663,6 +683,23 @@ pub struct KernelWorkaroundsStatus {
     pub verdicts: Vec<(&'static str, &'static str, &'static str)>,
 }
 
+/// When W3b writes its notice for a namespace operation (plan 42 §5.3.1,
+/// F21).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeMode {
+    /// Never.
+    Off,
+    /// For every operation: `on`, and `auto` under `--cto strict`, where a
+    /// directory's attributes have no kernel lifetime anyway (W3a), so the
+    /// notice costs no request.
+    Always,
+    /// `auto` in bounded mode: only for an inode an attribute reply may
+    /// still be on its way to the kernel for (`crate::attrwatch`). The
+    /// notice invalidates the inode's whole attribute mask, so each one
+    /// costs the next path walk through a directory a `GETATTR`.
+    Narrowed,
+}
+
 /// A workaround's switch against its fix's verdict: `auto` is on unless
 /// the kernel is known to carry the fix.
 fn on(switch: crate::Switch, fix: crate::kernel_fixes::KernelFix) -> bool {
@@ -697,6 +734,8 @@ pub struct PageCacheTable {
     page_shift: u32,
     /// Sequence numbers of A2/A4 arms.
     next_arm: AtomicU64,
+    /// Plan 42 F21: attribute replies in flight, for W3b's narrowed notice.
+    watch: crate::attrwatch::AttrWatch,
 }
 
 impl std::fmt::Debug for PageCacheTable {
@@ -721,6 +760,7 @@ impl PageCacheTable {
             stats: PageCacheStats::default(),
             page_shift: page.trailing_zeros(),
             next_arm: AtomicU64::new(1),
+            watch: Default::default(),
         })
     }
 
@@ -1107,6 +1147,29 @@ impl PageCacheTable {
         self.stats.dir_attr_notices.fetch_add(1, Relaxed);
     }
 
+    /// `n` changed inodes W3b did not need a notice for.
+    pub(crate) fn count_dir_notices_skipped(&self, n: usize) {
+        self.stats
+            .dir_attr_notices_skipped
+            .fetch_add(n as u64, Relaxed);
+    }
+
+    /// Plan 42 F21: a request that carries attributes, or changes the
+    /// namespace, arrives from task `tid` (the attribute watch's
+    /// [`crate::attrwatch::AttrWatch::arrive`]; untracked unless W3b is
+    /// narrowed).
+    pub(crate) fn attr_arrive(&self, tid: u32) -> crate::attrwatch::Arrival {
+        if self.config().dir_notice_mode() == NoticeMode::Narrowed {
+            self.watch.arrive(tid)
+        } else {
+            crate::attrwatch::Arrival::untracked()
+        }
+    }
+
+    pub(crate) fn attr_watch(&self) -> &crate::attrwatch::AttrWatch {
+        &self.watch
+    }
+
     pub(crate) fn stats(&self) -> &PageCacheStats {
         &self.stats
     }
@@ -1124,6 +1187,7 @@ impl PageCacheTable {
             ambiguous_writes: get(&self.stats.ambiguous_writes),
             concurrent_writes: get(&self.stats.concurrent_writes),
             dir_attr_notices: get(&self.stats.dir_attr_notices),
+            dir_attr_notices_skipped: get(&self.stats.dir_attr_notices_skipped),
             keep_cache_opens: self.stats.keep_cache_opens.load(Relaxed),
             dropping_opens: DropReason::ALL
                 .iter()
@@ -1175,6 +1239,38 @@ mod tests {
     use super::*;
 
     const S: Option<CacheStamp> = Some(CacheStamp(7));
+
+    /// Plan 42 F21: `auto` writes W3b's notice for every operation under
+    /// `--cto strict` (unchanged by the narrowing) and narrowed in bounded
+    /// mode; `on` and `off` override both (the shipped table fixes
+    /// nothing).
+    #[test]
+    fn the_notice_mode_follows_the_switch_and_the_mode() {
+        use crate::Switch::{Auto, Off, On};
+        for (switch, strict, mode) in [
+            (Auto, true, NoticeMode::Always),
+            (Auto, false, NoticeMode::Narrowed),
+            (On, true, NoticeMode::Always),
+            (On, false, NoticeMode::Always),
+            (Off, true, NoticeMode::Off),
+            (Off, false, NoticeMode::Off),
+        ] {
+            let config = PageCacheConfig {
+                dir_change_notify: switch,
+                strict,
+                ..Default::default()
+            };
+            assert_eq!(config.dir_notice_mode(), mode, "{switch:?} strict={strict}");
+            let t = PageCacheTable::new(config);
+            // Only the narrowed mode tracks attribute replies.
+            let a = t.attr_arrive(7);
+            assert_eq!(
+                t.attr_watch().replying(a, 1).is_some() || t.attr_watch().changed(&[1]).0 == [1],
+                mode == NoticeMode::Narrowed,
+                "{switch:?} strict={strict}"
+            );
+        }
+    }
 
     fn facts(fh: u64, stamp: Option<CacheStamp>) -> OpenFacts {
         OpenFacts {

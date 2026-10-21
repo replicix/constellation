@@ -1376,6 +1376,11 @@ fn kernel_cache_metrics(output: &mut String, fuse: &FuseStatus) {
             "Attribute-only notifications for changed directories and moved inodes (plan 42 W3b).",
             |k| k.dir_attr_notices,
         ),
+        (
+            "constellation_fuse_dir_attr_notices_skipped_total",
+            "Changed inodes the narrowed W3b trigger wrote no notice for (plan 42 F21).",
+            |k| k.dir_attr_notices_skipped,
+        ),
     ] {
         let _ = writeln!(output, "# HELP {name} {help}\n# TYPE {name} counter");
         for m in &fuse.mounts {

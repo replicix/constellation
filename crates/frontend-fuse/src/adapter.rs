@@ -1237,6 +1237,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
                 pc: self.pc.clone(),
                 changed: None,
                 notice: self.notice(),
+                seen: self.pc.attr_arrive(req.pid()),
                 dir_zero: self.dir_zero(),
             }),
         );
@@ -1256,6 +1257,8 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             op.responder(AttrReply {
                 reply,
                 pc: self.pc.clone(),
+                notice: self.notice(),
+                seen: self.pc.attr_arrive(req.pid()),
                 dir_zero: self.dir_zero(),
             }),
         );
@@ -1304,6 +1307,8 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
                 AttrReply {
                     reply,
                     pc: self.pc.clone(),
+                    notice: self.notice(),
+                    seen: self.pc.attr_arrive(req.pid()),
                     dir_zero: self.dir_zero(),
                 },
             )),
@@ -1344,6 +1349,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
                     pc: self.pc.clone(),
                     changed: Some(parent.0),
                     notice: self.notice(),
+                    seen: self.pc.attr_arrive(req.pid()),
                     dir_zero: self.dir_zero(),
                 },
             )),
@@ -1381,6 +1387,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
                     pc: self.pc.clone(),
                     changed: Some(parent.0),
                     notice: self.notice(),
+                    seen: self.pc.attr_arrive(req.pid()),
                     dir_zero: self.dir_zero(),
                 },
             )),
@@ -1412,6 +1419,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
                     pc: self.pc.clone(),
                     changed: Some(newparent.0),
                     notice: self.notice(),
+                    seen: self.pc.attr_arrive(req.pid()),
                     dir_zero: self.dir_zero(),
                 },
             )),
@@ -1456,6 +1464,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
                     name: name_guard,
                     parent: parent.0,
                     notice: self.notice(),
+                    seen: self.pc.attr_arrive(req.pid()),
                 },
             )),
         );
@@ -1486,6 +1495,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
                     pc: self.pc.clone(),
                     changed: Some(parent.0),
                     notice: self.notice(),
+                    seen: self.pc.attr_arrive(req.pid()),
                     dir_zero: self.dir_zero(),
                 },
             )),
@@ -1496,6 +1506,8 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         let caller = caller(req);
         let op = self.obs().begin(OpKind::Unlink, parent.0);
         let _in = op.enter();
+        // The task's last reply is installed (plan 42 F21).
+        self.pc.attr_arrive(req.pid());
         self.vfs.unlink(
             &op.ctx(&caller),
             parent.0,
@@ -1515,6 +1527,8 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         let caller = caller(req);
         let op = self.obs().begin(OpKind::Rmdir, parent.0);
         let _in = op.enter();
+        // The task's last reply is installed (plan 42 F21).
+        self.pc.attr_arrive(req.pid());
         self.vfs.rmdir(
             &op.ctx(&caller),
             parent.0,
@@ -1543,6 +1557,8 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         let caller = caller(req);
         let op = self.obs().begin(OpKind::Rename, parent.0);
         let _in = op.enter();
+        // The task's last reply is installed (plan 42 F21).
+        self.pc.attr_arrive(req.pid());
         let flags = rename_flags(flags.bits());
         let names = RenameGuard::new(
             &self.entries,

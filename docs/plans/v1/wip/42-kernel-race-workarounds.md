@@ -58,14 +58,20 @@ keeps the three ideas and fixes each:
   repair lane with a bounded wait, never from a FUSE worker. The candidate
   write is identified by the kernel's own serialization (a write-through
   write holds the inode lock from copy to reply), not by a time bound.
-- **W3 — directory attributes** (§5.3): 2b is closed outright by an
-  attribute-only notification for the parent directory, written before the
-  reply of every local namespace operation (it bumps the kernel's
-  `attr_version`, so a reply generated before the change is rejected; the
-  moved inode of a `rename` too). 2a can be closed only by answering
-  directory attributes with an attribute TTL of 0 while keeping the 1 s
-  entry TTL, at a cost Appendix A measures as material; whether bounded
-  mode pays it is open (Q1, pending a quiet-host measurement, §8.1).
+- **W3 — directory attributes** (§5.3): 2b is closed by an attribute-only
+  notification for the parent directory (and the moved inode of a
+  `rename`), written before the reply of a local namespace operation (it
+  bumps the kernel's `attr_version`, so a reply generated before the
+  change is rejected). The notice invalidates the inode's whole attribute
+  mask and so costs the next path walk a `GETATTR` (F21); in bounded mode
+  it is therefore written only for an inode an attribute reply may still
+  be on its way to the kernel for (§5.3.1), and for every operation under
+  `--cto strict`, where it costs no request. 2a can be closed only by
+  answering directory attributes with an attribute TTL of 0 while keeping
+  the 1 s entry TTL, at a cost Appendix A and §8.1 measure as material
+  (warm `git status` 2.6 to 7.9 times slower): bounded mode does not pay
+  it (Q1, decided: option B), so 2a stays open there as a transient
+  one-`stat` exposure, closed under `--cto strict`.
 
 On kernels known to carry the fixes, W2 and W3 switch off by themselves
 (§5.4: a version table filled in once the patches land, plus manual
@@ -404,6 +410,19 @@ Each finding names the fix in §5.
   (`fuse_update_ctime`) without bumping its `attr_version`, so a reply for
   it generated before the rename caches the old ctime for the TTL. **Fix:**
   W3b notifies the moved inode(s) too (§5.3.1).
+
+- **F21 — W3b's notice costs a `GETATTR` per namespace operation, not
+  "one 40-byte write" (§5.3.1; found by §8's benchmarks).** The notice
+  invalidates the inode's whole attribute mask, mode included, so with
+  `default_permissions` the next path walk through a directory refetches
+  it; `untar` and `cp -a` of a 20 000-file tree sent 20 100 to 20 200
+  `GETATTR`s per phase against 100 to 1 600. **Fix:** under `--cto strict`
+  (no attribute lifetime, so no request) the notice stays unconditional; in
+  bounded mode it is written only for an inode an attribute reply may still
+  be on its way to the kernel for: one being generated across the change
+  (the reply notices itself) or one answered to a task that has sent
+  nothing since (a mark; §5.3.1). A first correction that turned the
+  notice off in bounded mode left 2b open there and was replaced.
 
 ## 5. Decisions and design
 
@@ -890,10 +909,80 @@ session still answers requests and must still protect them); after
 protect). The module docs of `kernel_inval` and `notify` record this
 exception and its argument.
 
-Cost: one `write(2)` on `/dev/fuse` of 40 bytes per namespace operation,
-in the operation's latency (measured in §8's untar and `rm -rf`
-benchmarks). Setting: `CONSTELLATION_FUSE_DIR_CHANGE_NOTIFY` (`auto` = on
-unless the kernel has `DirChangeBumpsVersion`; `on`; `off`).
+Cost, as first written: one `write(2)` on `/dev/fuse` of 40 bytes per
+namespace operation. **F21 found it dearer** (§8's `untar` and `cp -a` of
+a 20 000-file tree: 20 100 to 20 200 `GETATTR`s per phase where the base
+sent 100 to 1 600, on every backing store): the kernel's own
+`fuse_dir_changed` invalidates only the directory's times, size and link
+count, but `FUSE_NOTIFY_INVAL_INODE` invalidates the whole attribute mask,
+mode included, and with `default_permissions` the next path walk through
+the directory refetches it (`fuse_permission`). The notice is therefore
+written only where it does something (below), and unconditionally only
+where it is free.
+
+Setting: `CONSTELLATION_FUSE_DIR_CHANGE_NOTIFY`. `auto` is off on a kernel
+with `DirChangeBumpsVersion`; else **unconditional under `--cto strict`**
+(a directory's attributes have no kernel lifetime there, W3a, so the
+notice costs no request) and **narrowed in bounded mode**; `on` is
+unconditional in either mode (diagnosis, and the cost reference of §8);
+`off` writes none.
+
+##### The narrowed trigger (F21; `crates/frontend-fuse/src/attrwatch.rs`)
+
+The notice rejects a reply the kernel has not installed yet, and only
+that. A reply for inode `i` is not installed yet in two cases, and the
+adapter tracks both:
+
+1. **Being generated.** The request arrived before the change and the
+   reply is written after it. Every attribute-carrying request (`lookup`,
+   `getattr`, `setattr`, and the entry replies of `mkdir`, `mknod`,
+   `symlink`, `link`, `create`) takes the count of namespace changes when
+   it arrives. A namespace operation records the inodes it changed in a
+   ring and bumps the count after its change committed. When the request
+   replies for inode `i` and the count has moved, it looks `i` up in the
+   ring; if a change of `i` was recorded since it arrived (or the ring
+   overflowed), **the reply writes the notice itself** before it goes. The
+   common case, no change during any request, costs two atomic loads.
+2. **Written, not installed.** A task installs a reply in the syscall
+   that sent the request, before it can send another. The reply to task
+   `t` (the request's `pid` is the thread id) for inode `i` is a mark
+   `t -> i`, until `t`'s next lookup, getattr, setattr or namespace
+   request arrives (it clears the mark), or one second has passed since
+   the reply was generated (a reply the kernel installs later than that
+   is outside the model, below), or a notice for `i` was written (it
+   rejects every earlier reply, so it discharges the marks it found — once
+   it is written, not before: a second change of `i` meanwhile still finds
+   them and writes its own notice before its reply). A namespace
+   operation finds the live marks of the inodes it changed and writes a
+   notice for those only. Requests without a pid (outside the mount's pid
+   namespace) cannot be cleared; their marks live 50 ms.
+
+Each side records its fact, issues a full fence and reads the other's, so
+at least one of them sees the other (the same store-buffering argument as a
+Dekker lock). A reply that had read the new state is noticed needlessly,
+never the other way round. The marks are 16 mutex-guarded hash shards by
+task id, pruned when a shard holds 64, with one lock round trip on arrival
+and one on the reply; the ring is 256 changes.
+
+Single-threaded `untar` and `cp -a` need no notice at all: the task's own
+`getattr` of the directory (on an expired attribute TTL) is followed at
+once by its next request, which clears the mark before the `create` that
+would have noticed. A concurrent `stat` of the directory by another task,
+the thing 2b is about, is noticed once and discharged. Counted:
+`dir_attr_notices` (written) and `dir_attr_notices_skipped` (changed inodes
+no reply was on its way for), per mount in `kernel_cache` and in the
+metrics.
+
+What it does not cover: a reply the kernel installs more than a second
+after the daemon generated it (2b opens for that one reply). The second
+counts from the reply's generation, so it holds the daemon's delay in
+handing the reply over — over a ring (the default transport) the ring
+thread commits it on its next pass, after the other requests it reaped in
+the same pass were handled, so a slow handler there adds to it — as well
+as the task's between its wake-up and the install (scheduling: CPU
+bandwidth throttling, a starved cgroup or nice level, a paused VM). And
+`readdirplus` (not negotiated). The marks are bookkeeping of replies
+already written; they do not delay or reorder any reply.
 
 #### 5.3.2 W3a — 2a: directory attributes are never cached by the kernel
 
@@ -968,14 +1057,15 @@ What `auto` means in bounded mode was Q1 (decided below: option B):
   `entry` under option A, the balance tips to A.
 
 K5 implements both values and the switch; the default in bounded mode is
-written in only when Q1 is decided (before K5 lands).
+`entry` (Q1, decided below).
 
 **Q1 decided 2026-10-21 (maintainer): option B**, together with the
 review's finding F21 (W3b's notice had been turned off in bounded mode,
 because it invalidated the whole attribute mask and cost one `GETATTR` per
 namespace operation, which left 2b open as well): W3b stays on in bounded
-mode with F21's narrowed trigger (only the attributes the change moved, only
-where it closes 2b), its cost measured before K5 lands. 2a remains open in
+mode with F21's narrowed trigger (§5.3.1: only for an inode a reply may
+still be on its way for, instead of invalidating the whole attribute mask
+for every operation), its cost measured before K5 lands (PROGRESS). 2a remains open in
 bounded mode as the documented transient one-`stat` exposure; strict mode
 closes both. The measurement (§8.1, run without the quiet-host gate,
 strict `entry`/`zero` ABBA interleave, 8 samples per mode, real ext4, xfs
@@ -997,8 +1087,8 @@ unparseable value fails the mount, like `CONSTELLATION_FUSE_TRANSPORT`:
 | `CONSTELLATION_FUSE_KEEP_CACHE` | `auto`, `off` | W1. `auto`: §5.1 in bounded mode, never under strict. `off`: every open drops, as before this plan (diagnosis; W2 then arms at every open). Not tied to the kernel: keep-cache is a speed win with or without the fixes. |
 | `CONSTELLATION_FUSE_WRITE_REPAIR` | `auto`, `on`, `off` | W2's repair (§5.2.3). The recording and the suspect marks of §5.2.4 run whatever the value — W1 relies on them. `auto` = on unless the kernel is known to carry the race-1 fix; `off` on an unfixed kernel turns every repair hit into S5 (the next open drops; the writer's read-back may be stale). |
 | `CONSTELLATION_FUSE_WRITE_REPAIR_WAIT_MS` | `1000`, positive integer | the repair lane's bound (§5.2.3) |
-| `CONSTELLATION_FUSE_DIR_ATTR_TTL` | `auto`, `zero`, `entry` | W3a (§5.3.2); `auto` in bounded mode pending Q1 |
-| `CONSTELLATION_FUSE_DIR_CHANGE_NOTIFY` | `auto`, `on`, `off` | W3b (§5.3.1) |
+| `CONSTELLATION_FUSE_DIR_ATTR_TTL` | `auto`, `zero`, `entry` | W3a (§5.3.2); `auto`: `zero` under strict, `entry` in bounded mode (Q1) |
+| `CONSTELLATION_FUSE_DIR_CHANGE_NOTIFY` | `auto`, `on`, `off` | W3b (§5.3.1). `auto`: unconditional under strict, narrowed in bounded mode (F21), off on a kernel with the fix; `on`: unconditional |
 
 **Detection** (`crates/frontend-fuse/src/kernel_fixes.rs`, new). One table,
 the only place to edit when the patches land:
@@ -1172,6 +1262,8 @@ kernel).
 | R6 | Race 2a for **regular files** after a foreign change or a lock grant: one `stat` concurrent with another task's refresh returns pre-change attributes | one stale `stat` result (the cache ends right); a reader under a lock grant could see the pre-grant size once | not closed; the per-walk cost of TTL 0 for files is not justified (§5.10); closed by patch 0002 |
 | R7 | `invalidate_inode_pages2` failing on a folio (dirty again after `launder_folio`, `EBUSY`), which the kernel ignores | that page survives a drop | today's exposure; S1 makes the next keep-cache decision drop again |
 | R8 | A row that returns to a recorded stamp (ABA): a commit through another view, a stranding rollback's before-image (deposition recovery, takeover), an uncommitted session | closed by §5.1.5's invalidations (S1), or S2 if one is dropped; residual only if a rollback path is added that does not report its records — the K2 test lists every `strand_*` entry point | — |
+| R9 | Race 2a for **directories** in bounded mode (`entry`, Q1): a `stat` racing another task's install of a refresh right after a change returns the old `st_nlink`, size or times once | one stale `stat` result of a directory, never data, never persistent (W3b closes the persistent variant) | not closed (the cost is §5.3.2's); closed under `--cto strict`, by `CONSTELLATION_FUSE_DIR_ATTR_TTL=zero`, and by patch 0002 |
+| R10 | Race 2b for a reply installed more than a second after the daemon generated it (the daemon slow to hand it over — over a ring, behind the other requests of the ring thread's pass — or the task not scheduled between its wake-up and the install), in bounded mode (F21) | the old `st_nlink` or `ctime` for the attribute TTL, once | needs a one-second gap exactly there, concurrent with a change of the inode; `CONSTELLATION_FUSE_DIR_CHANGE_NOTIFY=on` closes it at the cost F21 measured |
 
 ### 5.10 Rejected
 
@@ -1357,7 +1449,12 @@ target directory between worktrees.
   contract, the engine, `MockVfs`, `RefFs`), the setting; unit test that
   each namespace reply is preceded by an attribute-only
   `NOTIFY_INVAL_INODE` for exactly its parents and moved inodes
-  (`tests/wire.rs`), and none on an error answer or for `lookup`.
+  (`tests/wire.rs`, with the setting `on`), and none on an error answer or
+  for `lookup`. The narrowed trigger of §5.3.1 (F21) is the bounded-mode
+  `auto`: wire tests that a change with nothing in flight writes none,
+  that a stat answered to another task is noticed once and discharged,
+  that the task's next request or its own change clears its mark, and that
+  a reply generated across a change writes the notice itself.
 - W3a: directory attribute TTL 0 in `EntryReply`/`AttrReply` (and plan
   40's plus entries if landed), the setting with both values (the bounded
   default as Q1 decides; `zero` under strict); wire test that a directory's
@@ -1499,7 +1596,7 @@ the base by more than the larger of 3 % and twice the base's spread.
 | database-style: one long-lived read-write handle, 4 KiB random reads and writes 50/50 over a 1 GiB file, 4 threads, 60 s | neutral (recording is always on here: one shard lookup per read and write; ambiguous hits only set S5) |
 | commit-heavy multi-view: two views, many small files written and closed in one | report the cost of Q3's one notification per commit |
 
-### 8.1 Quiet-host measurement for Q1 (to run before K5; a separate task)
+### 8.1 Quiet-host measurement for Q1 (run 2026-10-20 without the quiet-host gate; decided option B)
 
 The numbers of Appendix A.2 were taken on a host shared with other
 campaigns; their request counts stand, their wall times do not. Q1 is
@@ -1547,6 +1644,11 @@ decided on this measurement:
   decides whether the count needs to scale with writers.
 - **A misdetected fixed kernel** with W2 forced on (F10): latency only;
   the warn line names the setting.
+- **The narrowed notice's bookkeeping** (F21) costs two mutex round trips
+  per attribute request and one pass over the marks per namespace
+  operation; measured in PROGRESS against `off` on four backing stores. A
+  missed notice is a race-2b window, so its tests include the interleaving
+  of a reply against a change from two threads.
 - **Plan 40 landing first**: its plus entries must apply A3 and §5.3's
   directory TTL; the review of whichever plan lands second checks it.
 - **Large folios** (FUSE gaining large-folio buffered writes): KF2's
@@ -1556,17 +1658,15 @@ decided on this measurement:
 
 ## 10. Open questions and decisions
 
-- **Q1 (W3a in bounded mode) — open, pending §8.1.** Directory attribute
-  TTL 0 closes 2a and costs, on the measured tree, 2–11× the FUSE requests
-  of stat-heavy walks and, on the fastest of six runs on a shared host,
-  +14–53 % (`find`, `du`, `rsync -n`), about +100–160 % (`make -q`, `ls
-  -lR`, `git status`) and 3–15× for deep-path `stat` loops (§5.3.2,
-  Appendix A.2); no narrower variant is safe. Option A: `zero` in bounded
-  mode. Option B (the reviewer's recommendation): `entry` in bounded mode,
-  `zero` under strict including the lone sequencer, the trade-off in the
-  ADR; tipping to A if `git status` and `make -q` stay within +20 % on a
-  quiet host. The bounded default is marked "pending the quiet-host
-  measurement" until then; decide before K5 lands.
+- **Q1 (W3a in bounded mode) — decided 2026-10-21: option B.** `entry`
+  in bounded mode, `zero` under `--cto strict` including the lone
+  sequencer. §8.1's measurement (4 stores, ABBA, 8 samples per mode) put
+  warm `git status` at 2.6 to 7.9 times and warm `make -q` at 2.8 to 4.2
+  times the time under `zero`, 7 000 against 293 000 and 10 000 against
+  85 000 FUSE requests; the rule's +20 % was exceeded by 2 to 8 times in
+  every block. The trade-off is in the ADR; 2a stays a transient one-`stat`
+  exposure in bounded mode. Decided together with F21: W3b stays on in
+  bounded mode with the narrowed trigger of §5.3.1.
 - **Q2 — decided: the in-flight-aware bound** (§5.2.3), 1 s by default; the
   campaign may raise it to 2 s if L2's throttling shows the pre-queue part
   of the window above 1 s. Past the bound the write is answered and the
@@ -1597,9 +1697,9 @@ decided on this measurement:
 - [x] K3: W1 with S1–S4; its unit and wire tests; `kernel-race-open` meets its K3 column.
 - [x] K4: W2; `kernel-race-open`, `-open-repair*`, `-notify*`, `-unseen-drop`,
       `-strict`, `-handover` 0 as §7.2 states.
-- [ ] K5: W3b (parents and moved inodes) and W3a's switch, the bounded
-      default per the Q1 decision taken on §8.1's measurement; `-dir-*` and
-      `-rename-ctime` rows met.
+- [x] K5: W3b (parents and moved inodes; narrowed in bounded mode, F21)
+      and W3a's switch, the bounded default per the Q1 decision (`entry`);
+      `-dir-*` and `-rename-ctime` rows met.
 - [x] K6: detection table, the 0001 and 0003 probes and their tests,
       status, metrics, docs, ADR.
 - [ ] K7: §7.3 xcheckfs runs clean; §7.4 campaign passes on the final
@@ -1693,7 +1793,7 @@ host, plus the kernel round trip. Entry TTLs were unchanged, so `LOOKUP`
 counts did not move. A quiet-host re-measurement (and the same table on
 `dev_fuse`, and with the backing store on ext4, xfs and tmpfs, where this
 cost does not depend on the backing store but the baseline does) is
-§8.1, and Q1 waits for it.
+§8.1 (done: the ratios held on ext4, xfs, btrfs and tmpfs; Q1 is decided).
 
 ### A.3 Race baselines on `28fec6a`
 

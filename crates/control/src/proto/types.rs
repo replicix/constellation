@@ -838,6 +838,9 @@ pub struct FuseKernelCacheStatus {
     /// Attribute-only notifications written for changed directories and
     /// moved inodes (W3b).
     pub dir_attr_notices: u64,
+    /// Changed inodes the narrowed W3b trigger found no reply in flight
+    /// for, so wrote no notice for (plan 42 F21).
+    pub dir_attr_notices_skipped: u64,
 }
 
 /// Passthrough opens on one mount (plan 38 §3(c)): the kernel reading a

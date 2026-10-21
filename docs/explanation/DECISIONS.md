@@ -1391,9 +1391,13 @@ drop it causes or can see coming and the pages reads fetched since; the
 write the kernel's own serialization identifies as the one that may have
 been in the window has those pages invalidated before it is answered, from
 a repair lane with a bound that runs only while the write is alone on the
-file. (W3b) every namespace reply is preceded by an attribute-only
+file. (W3b) a namespace reply is preceded by an attribute-only
 notification for the directories it changed and the inodes it moved,
-which makes the kernel reject a reply from before the change. (W3a) a
+which makes the kernel reject a reply from before the change — for every
+operation under `--cto strict`, where it costs no request, and in bounded
+mode only for an inode an attribute reply may still be on its way to the
+kernel for (plan 42 F21: the notice invalidates the whole attribute mask,
+so each one costs the next path walk a `GETATTR`). (W3a) a
 directory's attributes get no kernel lifetime under `--cto strict`; in
 bounded mode the default is the view's TTL (plan 42 Q1, decided: `zero`
 there made warm `git status` 2.6 to 7.9 times and `make -q` 2.8 to 4.2
@@ -1402,8 +1406,9 @@ follows its fix's verdict (an override, a probe on a private mount at
 start, a table of releases); W1 is independent of the kernel.
 
 **Consequences**: reopen-heavy workloads read from the page cache instead
-of the daemon. Each namespace operation writes one more 40-byte
-notification. A write on a file whose pages are dropped constantly (every
+of the daemon. Where W3b is on unconditionally (strict), each namespace operation
+writes one more 40-byte notification; narrowed, the tracking of attribute
+replies costs two lock round trips per attribute request. A write on a file whose pages are dropped constantly (every
 open dropping, a reader beside the writer) may wait for a repair; the one
 self-block, a repair waiting on the write's own last page, is answered
 after a short grace. Directory TTL 0 costs a `GETATTR` per directory

@@ -2462,12 +2462,17 @@ fn stamped(fh: u64, stamp: u128) -> Opened {
 /// A session whose notifications are written through a sink linked to
 /// its page-cache table, as a mounted session's are.
 fn keep_cache_kernel() -> (Kernel, MockVfs, FuseNotifySink) {
+    kernel_with(Default::default())
+}
+
+fn kernel_with(w: constellation_frontend_fuse::Workarounds) -> (Kernel, MockVfs, FuseNotifySink) {
     let mock = MockVfs::new();
     let fs = FuseFs::new(
         Arc::new(mock.clone()),
         FrontendCaps::linux_fuse(false),
         KernelTuning::for_workers(1),
-    );
+    )
+    .with_workarounds(w);
     let link = fs.kernel_link();
     let (k, notifier) = Kernel::start_fs_notifying(fs, KERNEL_INIT_FLAGS, 0);
     let sink = FuseNotifySink::linked(notifier, &link);
@@ -2785,7 +2790,12 @@ fn an_ambiguous_read_marks_and_writeback_claims_nothing() {
 /// `lookup` and none on an error.
 #[test]
 fn namespace_replies_are_preceded_by_their_directories_attribute_notices() {
-    let (mut k, mock, _sink) = keep_cache_kernel();
+    // Forced on: every operation notices (bounded mode's `auto` only
+    // where a reply may be in flight, the tests below).
+    let (mut k, mock, _sink) = kernel_with(constellation_frontend_fuse::Workarounds {
+        dir_change_notify: constellation_frontend_fuse::Switch::On,
+        ..Default::default()
+    });
     mock.always_lookup(Script::ok(entry(60, FileKind::File)));
     mock.always_mkdir(Script::ok(entry(61, FileKind::Dir)));
     mock.always_mknod(Script::ok(entry(62, FileKind::Fifo)));
@@ -2890,6 +2900,161 @@ fn namespace_replies_are_preceded_by_their_directories_attribute_notices() {
     assert_eq!(r.errno(), libc::EEXIST);
     assert!(n.is_empty(), "nothing changed");
     k.finish();
+}
+
+/// A request as `pid`, and the notifications written before its reply.
+fn call_noticed_as(
+    k: &mut Kernel,
+    pid: u32,
+    opcode: u32,
+    nodeid: u64,
+    body: &Body,
+) -> (Vec<Reply>, Reply) {
+    let unique = k.send_as(opcode, nodeid, (1000, 100, pid), &body.0);
+    collect_until(k, unique)
+}
+
+fn collect_until(k: &mut Kernel, unique: u64) -> (Vec<Reply>, Reply) {
+    let mut notices = Vec::new();
+    loop {
+        let r = k.recv();
+        if r.unique == unique {
+            return (notices, r);
+        }
+        assert_eq!(r.unique, 0, "a reply for another request");
+        notices.push(r);
+    }
+}
+
+fn noticed_inodes(notices: &[Reply]) -> Vec<u64> {
+    notices
+        .iter()
+        .map(|n| {
+            let (ino, off, len) = inval_inode(n);
+            assert_eq!((off, len), (-1, 0), "attribute-only");
+            ino
+        })
+        .collect()
+}
+
+const GETATTR_BODY: fn() -> Body = || Body::new().u32(0).u32(0).u64(0);
+const MKDIR_BODY: fn() -> Body = || Body::new().u32(0o755).u32(0o22).cstr("d");
+
+/// Plan 42 F21: in bounded mode `auto` writes W3b's notice for an inode
+/// only where an attribute reply for it may still be on its way: one
+/// answered to a task that has sent nothing since.
+#[test]
+fn bounded_mode_notices_only_where_a_reply_may_still_be_on_its_way() {
+    let (mut k, mock, _sink) = keep_cache_kernel();
+    mock.always_mkdir(Script::ok(entry(61, FileKind::Dir)));
+    mock.always_getattr(Script::ok(attr(5, FileKind::Dir)));
+    mock.always_lookup(Script::ok(entry(60, FileKind::File)));
+    let (reader, writer) = (1111, 2222);
+    // Nothing in flight: no notice.
+    let (n, r) = call_noticed_as(&mut k, writer, op::MKDIR, 5, &MKDIR_BODY());
+    r.ok();
+    assert!(
+        n.is_empty(),
+        "nothing was in flight: {:?}",
+        noticed_inodes(&n)
+    );
+    // Another task's stat of the directory is answered, not yet followed
+    // by a request of its task: its install may be pending.
+    let (n, r) = call_noticed_as(&mut k, reader, op::GETATTR, 5, &GETATTR_BODY());
+    r.ok();
+    assert!(n.is_empty());
+    let (n, r) = call_noticed_as(&mut k, writer, op::MKDIR, 5, &MKDIR_BODY());
+    r.ok();
+    assert_eq!(noticed_inodes(&n), vec![5]);
+    // The notice rejects every earlier reply: discharged.
+    let (n, r) = call_noticed_as(&mut k, writer, op::MKDIR, 5, &MKDIR_BODY());
+    r.ok();
+    assert!(n.is_empty(), "discharged by the notice");
+    // The reader's next request installs its reply first.
+    call_noticed_as(&mut k, reader, op::GETATTR, 5, &GETATTR_BODY())
+        .1
+        .ok();
+    call_noticed_as(&mut k, reader, op::LOOKUP, 5, &Body::new().cstr("f"))
+        .1
+        .ok();
+    let (n, r) = call_noticed_as(&mut k, writer, op::MKDIR, 5, &MKDIR_BODY());
+    r.ok();
+    assert!(n.is_empty(), "the task sent a request since");
+    // The task that made the change installed its own reply before it
+    // sent the change.
+    call_noticed_as(&mut k, writer, op::GETATTR, 5, &GETATTR_BODY())
+        .1
+        .ok();
+    let (n, r) = call_noticed_as(&mut k, writer, op::MKDIR, 5, &MKDIR_BODY());
+    r.ok();
+    assert!(n.is_empty(), "the writer's own request clears its mark");
+    // A stat of another inode says nothing about this directory.
+    mock.always_getattr(Script::ok(attr(9, FileKind::File)));
+    call_noticed_as(&mut k, reader, op::GETATTR, 9, &GETATTR_BODY())
+        .1
+        .ok();
+    let (n, r) = call_noticed_as(&mut k, writer, op::MKDIR, 5, &MKDIR_BODY());
+    r.ok();
+    assert!(n.is_empty(), "another inode");
+    k.finish();
+}
+
+/// Plan 42 F21: a request being served when the change happens writes the
+/// notice itself, before its reply.
+#[test]
+fn a_reply_generated_across_a_change_is_preceded_by_its_notice() {
+    let (mut k, mock, _sink) = keep_cache_kernel();
+    mock.always_mkdir(Script::ok(entry(61, FileKind::Dir)));
+    mock.always_getattr(Script::Defer {
+        after: Duration::from_millis(300),
+        result: Ok(attr(5, FileKind::Dir)),
+    });
+    let held = k.send_as(op::GETATTR, 5, (1000, 100, 1111), &GETATTR_BODY().0);
+    // The change completes while the attribute reply is still being made.
+    let (n, r) = call_noticed_as(&mut k, 2222, op::MKDIR, 5, &MKDIR_BODY());
+    r.ok();
+    assert!(n.is_empty(), "the change saw no reply yet: nothing marked");
+    let (n, r) = collect_until(&mut k, held);
+    r.ok();
+    assert_eq!(noticed_inodes(&n), vec![5], "written by the late reply");
+    k.finish();
+}
+
+/// Plan 42 F21: a reply the change did not overlap writes none.
+#[test]
+fn a_reply_generated_before_the_change_began_is_not_noticed_twice() {
+    let (mut k, mock, _sink) = keep_cache_kernel();
+    mock.always_mkdir(Script::ok(entry(61, FileKind::Dir)));
+    mock.always_getattr(Script::ok(attr(5, FileKind::Dir)));
+    call_noticed_as(&mut k, 2222, op::MKDIR, 5, &MKDIR_BODY())
+        .1
+        .ok();
+    let (n, r) = call_noticed_as(&mut k, 1111, op::GETATTR, 5, &GETATTR_BODY());
+    r.ok();
+    assert!(
+        n.is_empty(),
+        "the change was over before the request arrived"
+    );
+    k.finish();
+}
+
+/// Plan 42 F21: `on` notices every operation, `off` none.
+#[test]
+fn the_switch_overrides_the_narrowed_trigger() {
+    for (setting, expect) in [
+        (constellation_frontend_fuse::Switch::On, vec![5]),
+        (constellation_frontend_fuse::Switch::Off, vec![]),
+    ] {
+        let (mut k, mock, _sink) = kernel_with(constellation_frontend_fuse::Workarounds {
+            dir_change_notify: setting,
+            ..Default::default()
+        });
+        mock.always_mkdir(Script::ok(entry(61, FileKind::Dir)));
+        let (n, r) = call_noticed(&mut k, op::MKDIR, 5, &MKDIR_BODY());
+        r.ok();
+        assert_eq!(noticed_inodes(&n), expect);
+        k.finish();
+    }
 }
 
 /// `fuse_entry_out`: `(entry_valid, attr_valid)` seconds.

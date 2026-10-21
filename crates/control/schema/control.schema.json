@@ -2866,6 +2866,12 @@
           "minimum": 0,
           "type": "integer"
         },
+        "dir_attr_notices_skipped": {
+          "description": "Changed inodes the narrowed W3b trigger found no reply in flight\nfor, so wrote no notice for (plan 42 F21).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "dropping_opens": {
           "additionalProperties": {
             "format": "uint64",
@@ -2937,7 +2943,8 @@
         "repair_wait_max_ms",
         "ambiguous_writes",
         "concurrent_writes",
-        "dir_attr_notices"
+        "dir_attr_notices",
+        "dir_attr_notices_skipped"
       ],
       "type": "object"
     },

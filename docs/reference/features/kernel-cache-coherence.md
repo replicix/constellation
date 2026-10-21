@@ -100,7 +100,18 @@ to).
   `st_nlink` is cached for the TTL. Every namespace reply is now preceded
   by an attribute-only notification for each directory it changed (and
   for the moved inodes of a rename, whose `ctime` changes), which makes
-  the kernel reject such a reply. One 40-byte write per operation.
+  the kernel reject such a reply. The notice invalidates the whole
+  attribute mask, so it costs the next path walk through the directory a
+  `GETATTR` (`default_permissions`); under `--cto strict` that is free
+  (directory attributes have no lifetime), and in bounded mode the notice
+  is written only for an inode an attribute reply may still be on its way
+  to the kernel for: a request being served across the change (its reply
+  writes the notice itself), or a reply answered to a task that has sent
+  no request since, for up to a second (a task installs a reply before
+  its next request). An
+  `untar` or `cp -a` in one task sends none; another task's `stat` of the
+  directory is noticed once. Counted: `dir_attr_notices` written,
+  `dir_attr_notices_skipped` not needed.
 - **2a**: a `stat` racing another task's install of fresh directory
   attributes can copy the old `st_nlink` once. Closed only by giving
   directories' attributes no kernel lifetime (TTL 0), which costs a
@@ -134,7 +145,7 @@ Keep-cache (W1) is independent of the kernel.
 | `CONSTELLATION_FUSE_WRITE_REPAIR` | `auto`, `on`, `off` | W2's repair (`off` on an unfixed kernel: hits mark the file suspect instead) |
 | `CONSTELLATION_FUSE_WRITE_REPAIR_WAIT_MS` | `1000` | W2's bound |
 | `CONSTELLATION_FUSE_DIR_ATTR_TTL` | `auto`, `zero`, `entry` | W3a (`auto`: `zero` under strict; `entry` in bounded mode, Q1) |
-| `CONSTELLATION_FUSE_DIR_CHANGE_NOTIFY` | `auto`, `on`, `off` | W3b |
+| `CONSTELLATION_FUSE_DIR_CHANGE_NOTIFY` | `auto`, `on`, `off` | W3b (`auto`: every operation under strict, narrowed in bounded mode; `on`: every operation) |
 | `CONSTELLATION_FUSE_KERNEL_PROBE` | `auto`, `off` | the probe of the kernel's fixes |
 
 Read once at start; an unparseable value fails the mount. The reference
@@ -154,7 +165,10 @@ On a kernel without the fixes:
   is marked suspect);
 - a direct-I/O write while another descriptor holds the file's pages;
 - race 2a for regular files after a foreign change (one `stat` result);
-- race 2a for directories in bounded mode while `entry` is the default.
+- race 2a for directories in bounded mode while `entry` is the default;
+- race 2b for a reply installed more than a second after the daemon
+  generated it (the daemon slow to hand it over, or the task not
+  scheduled for that long), in bounded mode.
 
 ## Troubleshooting
 

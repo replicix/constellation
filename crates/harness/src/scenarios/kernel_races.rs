@@ -152,6 +152,7 @@ const COUNTERS: &[&str] = &[
     "repair_wait_max_ms",
     "ambiguous_writes",
     "dir_attr_notices",
+    "dir_attr_notices_skipped",
 ];
 
 /// Every dropping open, whatever its reason.

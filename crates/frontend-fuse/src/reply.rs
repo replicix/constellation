@@ -9,6 +9,7 @@
 //! on every path, including a `lock-wait` thread that could not be
 //! started (`constellation_engine::locks::ClusterLocks::lock`).
 
+use crate::attrwatch::Arrival;
 use crate::dentries::{EntryGuard, RenameGuard};
 use crate::notify::NotifyGate;
 use crate::pagecache::{Claim, Mark, OpenFacts, PageCacheTable};
@@ -47,6 +48,11 @@ use std::time::{Duration, UNIX_EPOCH};
 /// from the replying thread (`NotifyGate::notifier_now` says why that is
 /// safe for an attribute-only one); errors mean the kernel holds no such
 /// inode, so nothing to protect.
+/// The notice invalidates the inode's whole attribute mask, so each costs
+/// the next path walk through a directory a `GETATTR` (plan 42 F21): under
+/// `--cto strict` every operation writes it (no attribute lifetime, no
+/// request), in bounded mode only for the inodes an attribute reply may
+/// still be on its way for (`crate::attrwatch`).
 #[derive(Clone)]
 pub(crate) struct DirNotice {
     pub gate: Arc<OnceLock<Arc<NotifyGate>>>,
@@ -54,26 +60,60 @@ pub(crate) struct DirNotice {
 }
 
 impl DirNotice {
+    /// `inos` were changed by the namespace operation being answered:
+    /// notices for those the mode calls for (module doc above; F21 for
+    /// the narrowed trigger).
     fn tell(&self, inos: &[Option<Ino>]) {
-        if !self.pc.config().dir_notice_on() {
+        use crate::pagecache::NoticeMode;
+        let mode = self.pc.config().dir_notice_mode();
+        if mode == NoticeMode::Off {
             return;
         }
         let Some(notifier) = self.gate.get().and_then(|g| g.notifier_now()) else {
             return;
         };
-        let mut told: [Ino; 4] = [0; 4];
+        let mut distinct: [Ino; 4] = [0; 4];
         let mut n = 0;
         for ino in inos.iter().flatten() {
-            if told[..n].contains(ino) {
+            if distinct[..n].contains(ino) {
                 continue;
             }
-            let _ = notifier.inval_inode(INodeNo(*ino), -1, 0);
-            self.pc.count_dir_notice();
-            if n < told.len() {
-                told[n] = *ino;
+            if n < distinct.len() {
+                distinct[n] = *ino;
                 n += 1;
             }
         }
+        if mode == NoticeMode::Always {
+            for ino in &distinct[..n] {
+                let _ = notifier.inval_inode(INodeNo(*ino), -1, 0);
+                self.pc.count_dir_notice();
+            }
+            return;
+        }
+        let (needed, marks) = self.pc.attr_watch().changed(&distinct[..n]);
+        self.pc.count_dir_notices_skipped(n - needed.len());
+        for ino in needed {
+            let _ = notifier.inval_inode(INodeNo(ino), -1, 0);
+            self.pc.count_dir_notice();
+        }
+        // Only now: until the notices are written, a concurrent change of
+        // these inodes must still find the marks (`attrwatch`).
+        self.pc.attr_watch().release(marks);
+    }
+
+    /// A reply carrying the attributes of `ino` is about to be written
+    /// (narrowed mode): if a namespace operation changed `ino` while its
+    /// request was being served, that operation did not see this reply
+    /// coming, so the notice is written here, before it.
+    fn replying(&self, seen: Arrival, ino: Ino) {
+        let Some(marks) = self.pc.attr_watch().replying(seen, ino) else {
+            return;
+        };
+        if let Some(notifier) = self.gate.get().and_then(|g| g.notifier_now()) {
+            let _ = notifier.inval_inode(INodeNo(ino), -1, 0);
+            self.pc.count_dir_notice();
+        }
+        self.pc.attr_watch().release(marks);
     }
 }
 
@@ -157,6 +197,8 @@ pub(crate) struct EntryReply {
     /// `lookup`), told before the reply.
     pub changed: Option<Ino>,
     pub notice: DirNotice,
+    /// Plan 42 F21: what the request saw when it arrived.
+    pub seen: Arrival,
     /// Plan 42 §5.3.2: a directory's attributes get no kernel lifetime.
     pub dir_zero: bool,
 }
@@ -169,6 +211,7 @@ impl Responder<Entry> for EntryReply {
             pc,
             changed,
             notice,
+            seen,
             dir_zero,
         } = self;
         match r {
@@ -179,6 +222,7 @@ impl Responder<Entry> for EntryReply {
                 if changed.is_some() {
                     notice.tell(&[changed]);
                 }
+                notice.replying(seen, e.attr.ino);
                 // Before the bytes go: the kernel may forget this lookup as
                 // soon as it has the reply, on another worker.
                 name.hands_out(e.attr.ino);
@@ -207,6 +251,10 @@ impl Responder<Entry> for EntryReply {
 pub(crate) struct AttrReply {
     pub reply: ReplyAttr,
     pub pc: Arc<PageCacheTable>,
+    /// Plan 42 F21: the narrowed W3b notice, and what the request saw when
+    /// it arrived.
+    pub notice: DirNotice,
+    pub seen: Arrival,
     /// Plan 42 §5.3.2: a directory's attributes get no kernel lifetime.
     pub dir_zero: bool,
 }
@@ -218,6 +266,7 @@ impl Responder<Attr> for AttrReply {
                 if a.kind == FileKind::File {
                     self.pc.size_seen(a.ino, a.size);
                 }
+                self.notice.replying(self.seen, a.ino);
                 self.reply
                     .attr(&attr_ttl(&a, self.dir_zero), &fuse_attr(&a))
             }
@@ -641,6 +690,8 @@ pub(crate) struct CreateReply {
     /// harmless).
     pub parent: Ino,
     pub notice: DirNotice,
+    /// Plan 42 F21: what the request saw when it arrived.
+    pub seen: Arrival,
     pub reply: ReplyCreate,
 }
 
@@ -652,6 +703,7 @@ impl Responder<(Entry, Opened)> for CreateReply {
             name,
             parent,
             notice,
+            seen,
         } = self;
         match r {
             Ok((e, o)) => {
@@ -681,6 +733,7 @@ impl Responder<(Entry, Opened)> for CreateReply {
                 if answer_is_ok(&answer) {
                     cx.pc.size_seen(e.attr.ino, e.attr.size);
                     notice.tell(&[Some(parent)]);
+                    notice.replying(seen, e.attr.ino);
                 }
                 match fopen(answer) {
                     Some((flags, None)) => {
