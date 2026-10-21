@@ -170,6 +170,7 @@ const NODES3: &str =
 const NODES4: &str =
     "runs four clients of one filesystem (the kind lane has two workers: a pool has two node-owned engine pods)";
 const CHAOS: &str = "drives local mounts with the constellation-chaos tool";
+const KERNEL_RACE: &str = "injects plan 42's kernel-race fault points (CONSTELLATION_FAULT_*) into a local daemon and reads its page-cache counters from node.status";
 const GIT: &str =
     "runs git in the client's mount namespace (the lane's pods run the driver image: no git)";
 
@@ -655,6 +656,39 @@ pub const SKIPPED: &[(&str, Skip)] = &[
     ("lifecycle-resume-rejoin", Skip::Local(&[LIFECYCLE, NODES3])),
     ("lifecycle-metered-uploads", Skip::Local(&[LIFECYCLE])),
     ("writeback-close-metered-nonowner", Skip::Local(&[LIFECYCLE, S3_FAULTS])),
+    ("kernel-race-open", Skip::Local(&[KERNEL_RACE])),
+    ("kernel-race-open-dev-fuse", Skip::Local(&[KERNEL_RACE, TRANSPORT])),
+    ("kernel-race-open-repair", Skip::Local(&[KERNEL_RACE])),
+    ("kernel-race-open-repair-dev-fuse", Skip::Local(&[KERNEL_RACE, TRANSPORT])),
+    ("kernel-race-open-repair-delay", Skip::Local(&[KERNEL_RACE])),
+    ("kernel-race-open-repair-delay-dev-fuse", Skip::Local(&[KERNEL_RACE, TRANSPORT])),
+    ("kernel-race-notify", Skip::Local(&[KERNEL_RACE])),
+    ("kernel-race-notify-dev-fuse", Skip::Local(&[KERNEL_RACE, TRANSPORT])),
+    ("kernel-race-notify-foreign", Skip::Local(&[KERNEL_RACE])),
+    ("kernel-race-notify-foreign-dev-fuse", Skip::Local(&[KERNEL_RACE, TRANSPORT])),
+    ("kernel-race-unseen-drop", Skip::Local(&[KERNEL_RACE])),
+    ("kernel-race-unseen-drop-dev-fuse", Skip::Local(&[KERNEL_RACE, TRANSPORT])),
+    ("kernel-race-cfr", Skip::Local(&[KERNEL_RACE])),
+    ("kernel-race-cfr-dev-fuse", Skip::Local(&[KERNEL_RACE, TRANSPORT])),
+    ("kernel-race-strict", Skip::Local(&[KERNEL_RACE, CTO_STRICT])),
+    ("kernel-race-strict-dev-fuse", Skip::Local(&[KERNEL_RACE, TRANSPORT, CTO_STRICT])),
+    ("kernel-race-handover", Skip::Local(&[KERNEL_RACE, UPGRADE])),
+    ("kernel-race-handover-keep", Skip::Local(&[KERNEL_RACE, UPGRADE])),
+    ("kernel-race-uncommitted", Skip::Local(&[KERNEL_RACE])),
+    ("kernel-race-uncommitted-local", Skip::Local(&[KERNEL_RACE])),
+    ("kernel-race-uncommitted-lapse", Skip::Local(&[KERNEL_RACE])),
+    ("kernel-race-discard-local", Skip::Local(&[KERNEL_RACE])),
+    ("kernel-race-other-view", Skip::Local(&[KERNEL_RACE])),
+    ("kernel-race-dir-nlink", Skip::Local(&[KERNEL_RACE])),
+    ("kernel-race-dir-nlink-dev-fuse", Skip::Local(&[KERNEL_RACE, TRANSPORT])),
+    ("kernel-race-dir-version", Skip::Local(&[KERNEL_RACE])),
+    ("kernel-race-dir-version-dev-fuse", Skip::Local(&[KERNEL_RACE, TRANSPORT])),
+    ("kernel-race-rename-ctime", Skip::Local(&[KERNEL_RACE])),
+    ("kernel-race-rename-ctime-dev-fuse", Skip::Local(&[KERNEL_RACE, TRANSPORT])),
+    ("kernel-race-dir-version-remote", Skip::Local(&[KERNEL_RACE])),
+    ("kernel-race-dir-version-remote-dev-fuse", Skip::Local(&[KERNEL_RACE, TRANSPORT])),
+    ("kernel-race-dir-ttl-strict-lone", Skip::Local(&[KERNEL_RACE, CTO_STRICT])),
+    ("kernel-race-dir-ttl-strict-lone-dev-fuse", Skip::Local(&[KERNEL_RACE, TRANSPORT, CTO_STRICT])),
 ];
 
 impl Skip {

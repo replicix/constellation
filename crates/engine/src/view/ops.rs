@@ -309,6 +309,11 @@ impl Vfs for View {
         self.session_wait(&[ReadKey::Ino(ino)]);
         match self.current_attr(ino) {
             Ok(Some(attr)) => {
+                // Plan 42 K1's fault point: a reply generated now and
+                // answered later (race 2b).
+                if let Some(delay) = crate::fault::getattr_delay(ino, attr.kind == InodeKind::Dir) {
+                    std::thread::sleep(delay);
+                }
                 let attr = if requested_ino == constellation_fs_core::types::ROOT_INO {
                     self.visible_attr(attr)
                 } else {
@@ -1323,6 +1328,10 @@ impl Vfs for View {
         admit!(self, cx, r, _admitted);
         let ino = enter!(self, ino, r);
         let _inflight = self.inflight.enter(&[ino]);
+        // Plan 42 K1's fault point: a slow server (race 1's window).
+        if let Some(delay) = crate::fault::view_write_delay() {
+            std::thread::sleep(delay);
+        }
         if View::is_synthetic(ino) {
             r.done(self.ino_err(ino, Code::ReadOnly));
             return;

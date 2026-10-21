@@ -803,7 +803,23 @@ impl View {
         constellation_vfs::watch::stage("flush: compose and commit");
         crate::locks::take_lapsed();
         REFUSED_COMMIT.with(|r| r.borrow_mut().take());
-        match self.flush_detached(ino, ws, force_through) {
+        // Plan 42 K1's fault point: a session dropped without becoming
+        // the row (F13).
+        let flushed = match crate::fault::commit_fault(|| self.path_below_view_root(ino)) {
+            Some(crate::fault::CommitFault::Fail) => Err(FlushFail {
+                errno: Code::Io,
+                ws: None,
+            }),
+            Some(crate::fault::CommitFault::Lapse) => {
+                crate::locks::note_lapsed();
+                Err(FlushFail {
+                    errno: Code::Io,
+                    ws: Some(Box::new(ws)),
+                })
+            }
+            None => self.flush_detached(ino, ws, force_through),
+        };
+        match flushed {
             Ok(drain) => {
                 self.writes.retire(ino);
                 Ok(drain)

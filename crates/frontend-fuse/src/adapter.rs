@@ -1476,6 +1476,11 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         lock_owner: Option<fuser::LockOwner>,
         reply: ReplyWrite,
     ) {
+        // Plan 42 K1's fault point: a worker preempted right after it read
+        // the request.
+        if let Some(delay) = crate::fault::write_delay() {
+            std::thread::sleep(delay);
+        }
         let caller = caller(req);
         let op = self.obs().begin(OpKind::Write, ino.0);
         let _in = op.enter();

@@ -1589,7 +1589,7 @@ decided on this measurement:
 
 ## 11. Exit criteria
 
-- [ ] K1: workloads, fault points, scenarios; base counts recorded in
+- [x] K1: workloads, fault points, scenarios; base counts recorded in
       PROGRESS, each meeting its threshold.
 - [ ] K2: stamp, pending counter, `undelivered`, §5.1.5's three events
       (uncommitted sessions, other views' commits, stranding rollbacks),

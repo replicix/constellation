@@ -17,6 +17,7 @@
 
 mod adapter;
 mod dentries;
+mod fault;
 mod notify;
 pub mod passthrough;
 pub mod refs;

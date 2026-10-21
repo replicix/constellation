@@ -55593,3 +55593,61 @@ The rest of the review (2026-10-21), no change needed:
 A reconfiguration *in flight* from a version that lists a backup already
 (adding a second one, `backups_max >= 2`) gates on the held set only. This
 is C6's add window.
+
+## Plan 42 — Kernel FUSE race workarounds
+
+Plan 42 (`docs/plans/v1/wip/42-kernel-race-workarounds.md`) makes the Linux
+FUSE frontend correct on today's kernels against three races in the
+kernel's FUSE client: a stale page after a write-through write (race 1),
+directory attributes marked valid before they are stored (2a), and a reply
+from before a directory change that cancels its invalidation (2b, and the
+renamed inode's `ctime`). W1 keeps a file's pages across opens when they
+are known current, W2 repairs the pages a read may have fetched under an
+in-flight write before that write is answered, W3 tells the kernel about
+every directory change before the reply (W3b) and can give directories'
+attributes no kernel lifetime (W3a). Kernel tested: Fedora's 7.3
+distribution kernel (16 cores, shared with other campaigns: load averages
+are recorded per run).
+
+### What landed
+
+| Item | State | Where |
+|---|---|---|
+| Reproducers, fault points, scenarios; base counts (K1) | landed | `crates/harness/src/kernel_races.rs`, `scenarios/kernel_races.rs`, `crates/engine/src/fault.rs`, `crates/frontend-fuse/src/fault.rs` |
+| Cache stamp, pending data notifications, `undelivered` (K2) | — | |
+| Conditional keep-cache (K3) | — | |
+| Write-race repair (K4) | — | |
+| Directory attributes (K5) | — | |
+| Detection, status, docs (K6) | — | |
+| Campaigns, xcheckfs, benchmarks (K7) | — | |
+
+### K1: base counts (fail-before)
+
+The K1 build (`80a4e3d` plus K1 only), 60 s per scenario (the `dir-*` rows
+20 rounds), seed 42, `uring` transport unless the name ends in
+`-dev-fuse`. Every race row meets its §7.2 base threshold.
+
+| Scenario | Base (uring / dev_fuse) | §7.2 threshold |
+|---|---|---|
+| `kernel-race-open` | stale 1007 / 369 | ≥ 100 |
+| `kernel-race-open-repair` | stale 996 / 334 | ≥ 100 |
+| `kernel-race-open-repair-delay` | stale 3281 / 1531 | ≥ 100 |
+| `kernel-race-notify` | stale 314 / 229 | ≥ 20 |
+| `kernel-race-notify-foreign` | stale 0 / 0 | 0 (guard) |
+| `kernel-race-unseen-drop` | stale 0 / 0, `stale_after_reopen` 0 | stale ≥ 1 — **not met**: on 7.3 `posix_fadvise` never drops a page a writer holds (finding F19, with K4) |
+| `kernel-race-cfr` | corrupt 0 / 0 (stale 734 / 296) | corrupt 0 (guard) |
+| `kernel-race-strict` | stale 1112 / 431 | ≥ 100 |
+| `kernel-race-handover` | stale 354 | ≥ 100 |
+| `kernel-race-handover-keep` | stale 362 | — |
+| `kernel-race-uncommitted`, `-uncommitted-local`, `-uncommitted-lapse`, `kernel-race-discard-local` | differing 0 (every open drops) | fail-before on the build without §5.1.5 (K2) |
+| `kernel-race-other-view` | stale 0 | 0 |
+| `kernel-race-dir-nlink` | mismatches 89 / 42 (control 0 / 0) | ≥ 20; control 0 |
+| `kernel-race-dir-version` | 19/20 and 19/20 (TTL auto, entry) / 20/20, 20/20 | 20/20 |
+| `kernel-race-rename-ctime` | 19/20 / 20/20 | 20/20 |
+| `kernel-race-dir-version-remote` | 0/20 / 0/20 | 0 (guard) |
+| `kernel-race-dir-ttl-strict-lone` | mismatches 79 / 56 | ≥ 20 |
+
+`dir-version` and `rename-ctime` miss 20/20 by one round on `uring`: a
+round whose own path walk refreshed the attributes first. The workloads
+work on `O_PATH` descriptors (no path walk) since a first version that
+walked the path showed 13–16/20.

@@ -3175,6 +3175,42 @@ and fetched again never served from the unlinked file); a frozen snapshot
 file's zero-copy reads are in `view::passthrough_tests`
 (`a_frozen_multi_chunk_file_reads_zero_copy`).
 
+## Linux FUSE client races (plan 42)
+
+Three races in the Linux kernel's FUSE client, reproduced through a real
+mount by `crates/harness/src/kernel_races.rs` (workloads written after the
+kernel patch package's reproducers — the patterns, not their GPL-2.0 code)
+and checked by the `kernel-race-*` scenarios
+(`crates/harness/src/scenarios/kernel_races.rs`). Each asserts what the
+workarounds leave (plan 42 §7.2's "after" column) and prints its counts as
+one `RESULT` line; a race scenario fails on a build without the workaround
+that closes it, which is its fail-before. Every race row runs on the
+transport ladder and again as `…-dev-fuse` (`io_uring_setup(2)` denied);
+the handover rows are `/dev/fuse` only (a ring cannot be handed over).
+
+| Scenario | Race | Workload, configuration | Passes when |
+|---|---|---|---|
+| `kernel-race-open` | 1 | writers `pwrite` half a page and read it back, readers fetch the other halves, a thread `open`/`close`s the file | 0 stale read-backs, some open kept the pages |
+| `kernel-race-open-repair` | 1 | the same, `CONSTELLATION_FUSE_KEEP_CACHE=off` | 0 stale, repairs > 0, none late |
+| `kernel-race-open-repair-delay` | 1 | the same, a worker delay before each `WRITE` (`CONSTELLATION_FAULT_FUSE_WRITE_DELAY_US=200`) | 0 stale, none late |
+| `kernel-race-notify` | 1 | two nodes taking an `flock` in turns (every grant writes a data notification), the writer node with the worker delay | 0 stale |
+| `kernel-race-notify-foreign` | guard | another node overwrites a second file the writer node reads | 0 stale, no repair after the workload's start-up (its own seven opens of the file at once may cost one) |
+| `kernel-race-unseen-drop` | 1 | drops the daemon cannot see: a `posix_fadvise(DONTNEED)` loop (which on Linux 7.3 never drops a page a writer holds, so it does not reproduce race 1 by itself) and the session's own unannounced data notifications (`CONSTELLATION_FAULT_UNSEEN_DROP_MS=2`); every stale read-back is re-read through a new descriptor | no stale page survives a reopen (stale reads themselves are allowed: plan 42 R1). With `CONSTELLATION_HARNESS_NAIVE_KEEP_CACHE=1` the mount ignores the S5 mark (the naive keep-cache) and the scenario must fail: its fail-before |
+| `kernel-race-cfr` | guard | `copy_file_range` of each written half beside the opener | 0 corrupt copies |
+| `kernel-race-strict` | 1 | `--cto strict` with the opener | 0 stale, no open kept pages |
+| `kernel-race-handover`, `-handover-keep` | 1 | the opener across two `daemon --upgrade`s, keep-cache off / on | 0 stale; with keep-cache the resumed session's first open drops |
+| `kernel-race-uncommitted`, `-uncommitted-local`, `-uncommitted-lapse`, `kernel-race-discard-local` | W1 | phases of writes, every second publication failed (`CONSTELLATION_FAULT_COMMIT_FAIL`, or `lapse:` as a lapsed-grant refusal), each phase followed by two one-descriptor writes (one publication each, so one of them fails with the kernel holding its page), `--locks cluster`/`local` | every reopened page agrees with what the view answers (`O_DIRECT`) |
+| `kernel-race-other-view` | W1 | a whole and a subtree mount of one node: one writes, the other reopens | 0 stale |
+| `kernel-race-dir-nlink` | 2a | `mkdir`/`rmdir` against `statx` of their directories, serialized by an application rwlock (8 threads; control: `AT_STATX_FORCE_SYNC`), `CONSTELLATION_FUSE_DIR_ATTR_TTL=zero` (bounded mode's default is `entry`, plan 42 Q1) | 0 `st_nlink` mismatches |
+| `kernel-race-dir-version` | 2b | a forced `statx` whose `GETATTR` the daemon holds 200 ms (`CONSTELLATION_FAULT_DIR_GETATTR_DELAY_MS`), a `mkdir` meanwhile, a plain `statx` after; with the directory TTL as configured and with it `entry` | 0 of 20 rounds stale |
+| `kernel-race-rename-ctime` | 2b | the same for a renamed file's `ctime` (`CONSTELLATION_FAULT_GETATTR_DELAY_INO`) | 0 of 20 |
+| `kernel-race-dir-version-remote` | guard | the `mkdir` made on another node | 0 of 20 |
+| `kernel-race-dir-ttl-strict-lone` | 2a | the `dir-nlink` workload on a lone `--cto strict` node (its kernel TTL is not 0) | 0 mismatches |
+
+`CONSTELLATION_HARNESS_KERNEL_RACE_SECS` shortens the 60 s runs while
+developing. The counters the scenarios read are `node.status`'s
+`fuse.mounts[].kernel_cache`; one a build does not report reads as 0.
+
 ## Cross-node `flock`/`fcntl` (plan 30 M14)
 
 `--locks cluster` (the default when P2P is on; `CONSTELLATION_LOCKS`)

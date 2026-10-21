@@ -12,6 +12,7 @@ pub mod hostlag;
 pub mod interop;
 pub mod interrupt;
 pub mod k8s;
+pub mod kernel_races;
 pub mod load;
 pub mod metabench;
 pub mod model;

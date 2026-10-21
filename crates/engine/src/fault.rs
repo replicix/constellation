@@ -107,6 +107,108 @@ pub fn p2p_denied(peer: u64) -> bool {
         .any(|id| id == peer)
 }
 
+/// A duration from `var` in `unit`s (`None`: unset, unparseable or 0).
+fn env_duration(var: &str, unit: fn(u64) -> std::time::Duration) -> Option<std::time::Duration> {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .map(unit)
+}
+
+/// Plan 42 K1: `CONSTELLATION_FAULT_VIEW_WRITE_DELAY_US=N`: `View::write`
+/// sleeps `N` µs after it registered the write in flight and before it
+/// applies it — a slow server, as the kernel patch package's slowed
+/// passthrough is, which widens race 1's window (the `WRITE`'s service
+/// time).
+pub fn view_write_delay() -> Option<std::time::Duration> {
+    static DELAY: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+    *DELAY.get_or_init(|| {
+        env_duration(
+            "CONSTELLATION_FAULT_VIEW_WRITE_DELAY_US",
+            std::time::Duration::from_micros,
+        )
+    })
+}
+
+/// Plan 42 K1: `CONSTELLATION_FAULT_DIR_GETATTR_DELAY_MS=N`:
+/// `View::getattr` of a directory sleeps `N` ms after it read the
+/// attributes and before it answers (the patch package's
+/// `PT_GETATTR_DELAY_US`): a reply generated before a change and
+/// processed after it, race 2b. With
+/// `CONSTELLATION_FAULT_GETATTR_DELAY_INO=<ino>` only that inode's
+/// `GETATTR` is held, a directory or not (the renamed file's `ctime`).
+/// `ino` and `is_dir` are the inode being answered, in the replica's
+/// numbering.
+pub fn getattr_delay(ino: u64, is_dir: bool) -> Option<std::time::Duration> {
+    static DELAY: OnceLock<(Option<std::time::Duration>, Option<u64>)> = OnceLock::new();
+    let (delay, only) = *DELAY.get_or_init(|| {
+        (
+            env_duration(
+                "CONSTELLATION_FAULT_DIR_GETATTR_DELAY_MS",
+                std::time::Duration::from_millis,
+            ),
+            std::env::var("CONSTELLATION_FAULT_GETATTR_DELAY_INO")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok()),
+        )
+    });
+    let delay = delay?;
+    match only {
+        Some(only) => (only == ino).then_some(delay),
+        None => is_dir.then_some(delay),
+    }
+}
+
+/// How [`commit_fault`] fails a commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitFault {
+    /// As a compose or commit failure that leaves nothing to retry
+    /// (`FlushFail { ws: None }`): the session is retired uncommitted.
+    Fail,
+    /// As the sequencer's refusal for a lapsed lock grant (the fencing
+    /// token): the session is discarded.
+    Lapse,
+}
+
+/// Plan 42 K1: `CONSTELLATION_FAULT_COMMIT_FAIL=[lapse:]<suffix>`: every
+/// second publication of a file whose path below the view's root ends
+/// with `<suffix>` fails before it reaches the sequencer — as a
+/// [`CommitFault::Fail`], or with `lapse:` as a [`CommitFault::Lapse`]
+/// — so a write session the kernel's pages hold is dropped without
+/// becoming the row (plan 42 F13). `path` is asked only when the fault
+/// is set.
+pub fn commit_fault(path: impl FnOnce() -> String) -> Option<CommitFault> {
+    static FAULT: OnceLock<Option<(CommitFault, String)>> = OnceLock::new();
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let (kind, suffix) = FAULT
+        .get_or_init(|| {
+            let v = std::env::var("CONSTELLATION_FAULT_COMMIT_FAIL").ok()?;
+            let v = v.trim();
+            if v.is_empty() {
+                return None;
+            }
+            Some(match v.strip_prefix("lapse:") {
+                Some(suffix) => (CommitFault::Lapse, suffix.to_string()),
+                None => (CommitFault::Fail, v.to_string()),
+            })
+        })
+        .as_ref()?;
+    if !path().ends_with(suffix.as_str()) {
+        return None;
+    }
+    let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let fail = n % 2 == 1;
+    if fail {
+        tracing::warn!(
+            ?kind,
+            suffix,
+            "fault: failing a publication (CONSTELLATION_FAULT_COMMIT_FAIL)"
+        );
+    }
+    fail.then_some(*kind)
+}
+
 /// `CONSTELLATION_FAULT_STEP_PAUSE_FILE=<path>`: once that file exists,
 /// the next authority-core step stops the whole daemon (`SIGSTOP` to its
 /// own pid) between `Core::handle` and the dispatch of the step's actions:
