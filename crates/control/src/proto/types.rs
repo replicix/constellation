@@ -659,11 +659,20 @@ pub struct ClockStatus {
     /// The last step, signed (ms); 0 when none was seen.
     pub last_step_ms: i64,
     /// How far the honour clock runs ahead of the wall clock (ms): what
-    /// forward steps and wall slewing added. Never negative.
+    /// forward steps and wall slewing added, and the rate budget (plan 43
+    /// C7a: the honour clock runs fast by `rate_budget_ppm` of the uptime,
+    /// 86 s a day at 1 000 ppm). Never negative.
     pub honour_ahead_ms: i64,
     /// How far the wait clock runs behind the wall clock (ms; negative if
-    /// it is ahead): what steps and wall slewing left between them.
+    /// it is ahead): what steps and wall slewing left between them, and the
+    /// rate budget (the wait clock runs slow by `rate_budget_ppm` of the
+    /// uptime).
     pub wait_behind_ms: i64,
+    /// Plan 43 C7a: the bound on this node's oscillator rate error the
+    /// protocol clocks budget, in ppm: 1 000 on Linux, Android, macOS and
+    /// iOS (an unslewed rate source), 2 000 elsewhere
+    /// (`CONSTELLATION_CLOCK_RATE_BUDGET_PPM` overrides it, for testing).
+    pub rate_budget_ppm: u32,
 }
 
 /// Plan 38 §5's `fuse` section: what each FUSE mount's connection is

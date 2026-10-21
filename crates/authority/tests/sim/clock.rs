@@ -286,6 +286,9 @@ pub struct Clock {
     /// the map from a WAIT value back to the runtime's `Instant` it is read
     /// at.
     created: (i64, i128),
+    /// The clock's rate budget (`SimConfig::rate_budget_ppm`): WAIT runs
+    /// slow by it, which `instant_at_wait` inverts.
+    budget_ppm: u32,
 }
 
 impl Clock {
@@ -323,6 +326,7 @@ impl Clock {
             state,
             boot_id,
             created,
+            budget_ppm,
         }
     }
 
@@ -380,12 +384,21 @@ impl Clock {
     /// The earliest runtime `Instant` at which this clock's WAIT reads
     /// `wait` or more: relative timers count to it (`SetTimer { after_ms }`
     /// from the step's reading). It inverts the node's oscillator (its rate
-    /// and the suspends already announced), so a timer armed across a
-    /// suspend ends after the node resumes. (Once the clocks are scaled by
-    /// the budget, commit 2 inverts that scaling here too.)
+    /// and the suspends already announced) and, from plan 43 C7a's commit 2,
+    /// the budget's scaling of WAIT (`1/(1 + rho)` of the raw clock's
+    /// elapsed time: the raw clock must have run `d (1 + rho)` ms, and one
+    /// ms more for the fixed point's rounding), so a timer armed across a
+    /// suspend ends after the node resumes, and one on a fast oscillator
+    /// ends when its WAIT says. A budget of 0 is the raw clock itself.
     pub fn instant_at_wait(&self, wait: WaitMs) -> tokio::time::Instant {
         let (wait0, raw0) = self.created;
-        let target = raw0 + (wait.0 as i128 - wait0 as i128) * MS_NS;
+        let d = wait.0 as i128 - wait0 as i128;
+        let raw_ms = if self.budget_ppm == 0 || d <= 0 {
+            d
+        } else {
+            (d * (PPM + self.budget_ppm as i128) + PPM - 1) / PPM + 1
+        };
+        let target = raw0 + raw_ms * MS_NS;
         let now = self.base.elapsed().as_nanos() as i128;
         let t = self.state.osc.lock().unwrap().true_of_raw(target, now);
         self.base + std::time::Duration::from_nanos(t.max(0) as u64)

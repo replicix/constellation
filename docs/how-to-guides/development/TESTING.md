@@ -3523,7 +3523,7 @@ scenario spawns; an item is a preset or `kind[:arg...][@node]`:
 | `net:<netem args...>`, `net:flap` (`net-lan`, `net-wan`, `net-lossy`, `net-flap`) | `tc netem` on `lo` for the daemon's own UDP (P2P) ports, found from `/proc/<pid>/fd`: a `prio` root with one netem band per node; flap drops everything 2 s in 10 |
 | `clock:<±ms>`, `clock:spread:<ms>` (`clock-skew`) | `CONSTELLATION_FAULT_CLOCK_OFFSET_MS` on the protocol clock (`store_s3::lease::now_unix_ms`, which leases, grants, tokens and the core's `now` read), within ±500 ms |
 | `clock:step:<±ms>:<at_ms>[@node]` | at `<at_ms>` after the daemon spawned, its protocol wall clock steps by `<ms>` (`CONSTELLATION_FAULT_CLOCK_STEP_FILE`, plan 43 C7-H1; the item's `@node` is its last `@`, so the plan's `clock:step:<ms>@<s>` form is not used). Only the wall reading moves (stepping the host clock would move every container's): the honour clock follows a forward step once, a backward one and the wait clock move nothing. The file holds the node's **cumulative** step, written whole by a rename; a daemon polls it every 100 ms on a thread of its own and writes `<file>.applied` once the step is in force, which the harness waits for. Steps are not capped at ±500 ms (constant offsets are), they are kept across a restart of the daemon (armed once per node: the restarted daemon starts stepped and the step is not applied again), and `status.clock` counts them (`steps_forward`, `steps_backward`, `stepped_ms_total`, `last_step_ms`, `honour_ahead_ms`, `wait_behind_ms`). The harness keeps each node's step history; the log checkers read a daemon's `at_ms` with the offset **and the steps in force at the log line's time** removed, and `campaign_load`'s stale-generation watch adds the node's step to its skew term |
-| `clock:rate:<±ppm>[:unbudgeted][@node]` | the daemon's boot, raw and monotonic clocks run at `1 + ppm/1e6` of the host's rate from its start, its wall does not (`CONSTELLATION_FAULT_CLOCK_RATE_PPM`, read once by `platform::clock::protocol()`; plan 43 C7a): an oscillator off by `ppm` under a disciplined wall. Unless `:unbudgeted` the node's rate budget is raised to cover it (`CONSTELLATION_CLOCK_RATE_BUDGET_PPM = max(1000, |ppm|)`: each node budgets its own oscillator); both values are refused from 500 000 ppm, the engine logs them once at start-up. The budget is carried into `Config::clock_rate_budget_ppm` and the clock from C7a's first commit; the readings use it from its second, so until then the item skews the daemon's elapsed clocks with no budget behind them (the unbudgeted run) |
+| `clock:rate:<±ppm>[:unbudgeted][@node]` | the daemon's boot, raw and monotonic clocks run at `1 + ppm/1e6` of the host's rate from its start, its wall does not (`CONSTELLATION_FAULT_CLOCK_RATE_PPM`, read once by `platform::clock::protocol()`; plan 43 C7a): an oscillator off by `ppm` under a disciplined wall. Unless `:unbudgeted` the node's rate budget is raised to cover it (`CONSTELLATION_CLOCK_RATE_BUDGET_PPM = max(1000, |ppm|)`: each node budgets its own oscillator); both values are refused from 500 000 ppm, the engine logs them once at start-up. The budget is carried into `Config::clock_rate_budget_ppm` and the clock (C7a): WAIT counts `1/(1+ρ)` of the skewed raw clock and HONOUR `1/(1−ρ)` of it, the timers sleep `ρ` longer, and the beat cap's span is `M/(4ρ)`; `:unbudgeted` is the stress run (the oscillator beyond what the clocks budget). `status.clock.rate_budget_ppm` shows it, and the harness prints it with the step counters |
 
 `cpu` and `net` need root (`sudo -n`; the run fails at its start without
 it, and without `tc`/stress-ng for the items that need them). Per-daemon
@@ -4409,19 +4409,24 @@ node and restarts it on a new boot (elapsed clocks from 0, a new
 step_ms }` the same without the new boot, and `CrashSuccessorInFloor
 { restart_ms, after_marker }` kills the first fast successor in its floor (or
 between its claim and its marker). `SimConfig::rate_budget_ppm` is carried to
-`Config::clock_rate_budget_ppm` and the node's `ProtocolClock`, which does
-not read it yet (C7a's second commit). A `SetTimer` counts to the node's wait
-clock reaching the step's reading plus `after_ms`: the sim inverts the
-oscillator (`Clock::instant_at_wait`) and checks again when the sleep ends,
-so a timer armed across a suspend fires after the resume. Without a fault
+`Config::clock_rate_budget_ppm` and the node's `ProtocolClock`, which scales
+its readings by it (C7a's second commit: WAIT runs slow and HONOUR fast by the
+budget; the beat cap's span is `M/(4ρ)`; budget 0, the default until the sim's
+default mix gets rates, reads exactly as before). A `SetTimer` counts to the
+node's wait clock reaching the step's reading plus `after_ms`: the sim inverts
+the budget's scaling and the oscillator (`Clock::instant_at_wait`) and checks
+again when the sleep ends, so a timer armed across a suspend fires after the
+resume. Without a fault
 the sources are the paused clock's whole milliseconds as before, and the
 sweeps do not move (the identity sweeps are in PROGRESS).
 `AUTHORITY_SIM_RATES=1:-250000,2:250000` (and `AUTHORITY_SIM_BUDGET`) set
 the rates of any configuration under `sweep_config`, for tuning one.
 The configurations (`AUTHORITY_SIM_CONFIG=<name>`, `sweep_config`; the
-fail-before counts are in PROGRESS; not in `long_locks` or the CI tests
-until the commit that fixes each, except the controls): rate, fixed by
-C7a's second commit: `locks-root-rate-fast` (and `-rate-skew`, the same
+fail-before counts are in PROGRESS; the ones a later commit fixes are not in
+`long_locks` or the CI tests until it lands, except the controls): rate, fixed
+by C7a's second commit (clean now, pinned in four tests, `a_fast_*` and
+`a_cap_from_a_slow_holders_beats_does_not_end_the_floor_early`, and in
+`long_locks`): `locks-root-rate-fast` (and `-rate-skew`, the same
 rate set by a fault; the lock owner 8 % fast outwaits a cut locker early),
 `fast-takeover-successor-rate-fast`, `fast-takeover-holder-rate-fast`,
 `strict-reader-rate-fast`, `delegated-root-rate-fast` (clean: see PROGRESS);
@@ -4441,7 +4446,8 @@ with no clock fault (see PROGRESS).
 Unit tests: `a_simulated_rate_moves_the_elapsed_clocks_and_not_the_wall`,
 `a_simulated_suspend_stops_wait_and_not_honour_or_the_wall`,
 `a_simulated_reboot_changes_the_boot_id_and_restarts_the_elapsed_clocks`,
-`a_simulated_timer_inverts_the_rate_and_a_plain_clock_is_the_paused_one`.
+`a_simulated_timer_inverts_the_rate_and_a_plain_clock_is_the_paused_one`,
+`a_simulated_timer_inverts_the_budget_scaling` (commit 2).
 
 Every
 run checks close-to-open across nodes (`tests/sim/cto.rs`: a read

@@ -54711,3 +54711,155 @@ unsettled-control seeds updated to 745, 1081, 1282, 2045, 2369), meta 292,
 net 124, vfs 47, frontend-fuse 76, engine 822, control 146 (the schema
 re-blessed), the harness library and the model (62 passed, `--test-threads=2`; the 195 M-state lost-mirror check
 `#[ignore]`d, run by hand).
+
+## Plan 43 C7a, commit 2 of 6: the rate budget in the clocks
+
+C7a (plan 43 §7 C7, §11 Q20) puts the oscillator's rate bound ρ in the
+clocks instead of at the ~60 margin sites (D1). This is its second commit: the
+two elapsed readings pay each node's budget, the beat cap's span comes from it,
+the timers stretch by it, and the five rate configurations of commit 1 go to
+zero. Nothing is persisted differently (commit 3), and a budget of 0 reads
+exactly as C7-H1's clocks did.
+
+### What landed
+
+- `types/clock.rs`: `ProtocolClock` scales RAW's elapsed time, fixed point
+  (`2^40`-fraction multipliers computed at creation, one `u128` multiply per
+  reading): WAIT = `wall0 + floor(e_raw / (1 + ρ))`, `e_h = ceil(e_raw / (1 − ρ))
+  + S` for HONOUR. For any oscillator within the budget `Δwait ≤ Δreal` and
+  `Δhonour ≥ Δreal` (to the millisecond), whatever the span, so every
+  holder/waiter pair is safe with the margin it already has; `M` is left as
+  transit and rounding slack. The step detector and WALL are not scaled. A
+  budget above 499 999 ppm is clamped (`MAX_RATE_BUDGET_PPM`; the platform
+  refuses it earlier). `sleep_ms_for_wait(after_ms)` = `ceil(after_ms ·
+  (1e6 + ρ)/1e6)`. The module doc says it all, including P5b (long uptime:
+  HONOUR ahead of and WAIT behind WALL by ρ·uptime, 86 s a day at 1 000 ppm,
+  nothing compares them across processes; a forward step raises `J` only by
+  what exceeds that lead).
+- `core/backup.rs`: the beat cap's span filter is `Core::beat_cap_span_ms()` =
+  `M·1e6/(4ρ)` (250 margins at 1 000 ppm; `i64::MAX` at ρ = 0) instead of the
+  constant 250: exact under the budget for a beat sent after the renewal that
+  set `X`, and for earlier beats the error `2ρ·(renew − sent)` stays under
+  `M/2`; the module doc's step 3 is rewritten from that.
+- Engine: the driver's `SetTimer` and the standalone runner sleep
+  `sleep_ms_for_wait(after_ms)` (the wait clock runs slow by ρ; one wake-up
+  and re-arm per timer spared; honour timers fire about `2ρ·after` later,
+  liveness only). `status.clock.rate_budget_ppm` (control schema regenerated;
+  the two drift fields' docs say they grow with the budget), and the harness
+  prints it with the step counters.
+- Simulator: `Clock::instant_at_wait` inverts the budget's scaling as well as
+  the oscillator and suspends (`d·(1 + ρ)` raw ms and one more for the fixed
+  point's rounding; budget 0 unchanged), so a timer fires when its node's
+  WAIT says. `locks-root-rate-fast`, `fast-takeover-successor-rate-fast`,
+  `fast-takeover-holder-rate-fast` are pinned in `long_locks`, the five rate
+  configurations as `a_fast_*` tests over seeds around their first failures.
+- Docs: DESIGN §5 (the rate budget in the clocks; §9's clock-skew row),
+  cto-modes "Clocks and margins", cluster-locks (the margin rule), ARBITER-
+  STUDY §7 ("clock envelope"), TESTING (sim and the `clock:rate:` row), plan 43
+  (commit note, Appendix B rows 1, 4, 5, 7, 8, 12, 13, 15, 21, 22, 27).
+
+### Tests, with their fail-before
+
+Fail-before is on b8fe40c (the parent), by the mutant that is the parent's
+behaviour where a test cannot be compiled against it:
+
+- types: `honour_never_undercounts_and_wait_never_overcounts_within_the_budget`
+  (2 000 histories of 2 000 readings; rates per segment of 40 readings drawn
+  from ±ρ with the extremes half the time, suspends, boot/mono slewed ±8.3 %
+  together, the wall slewed and stepped; the same histories on a clock with no
+  budget violate both: the assertion that it *does* is in the test),
+  `the_rate_budget_scales_the_readings` (WAIT 99 900 ms and HONOUR 100 100 ms
+  for 100 s of RAW at 1 000 ppm), `sleep_ms_for_wait_reaches_the_deadline`,
+  `a_zero_budget_reads_exactly_as_before` (5 000 random readings equal to the
+  C7-H1 formula; the identity the sweeps rely on). Mutant "the readings and the
+  sleep ignore the budget" (the parent): the first three fail, the identity
+  test passes.
+- core: `the_beat_cap_span_follows_the_rate_budget` (1 000 ppm: 250·M; 100 000:
+  2.5·M; none: unlimited; a beat 3·M before `X` is used at 1 000 and not at
+  100 000). Mutant "the span is the constant 250·M" (the parent) fails it.
+- sim: `a_simulated_timer_inverts_the_budget_scaling` (a timer's instant for
+  the budgets and rates {0, ±1 000 ppm, 8 %, 10 %, 30 %}; WAIT reads the target
+  there, and the instant is where the scaling puts it to 3 ms). Mutant "the
+  inverse ignores the budget" fails it. The four `a_fast_*` pinned tests fail on
+  the parent at the seeds in the table below (every pinned set contains
+  failing seeds).
+
+### The configurations, 2 000 seeds each (`sweep_config`, sim binary of b8fe40c against this tree)
+
+| Configuration | b8fe40c | this tree | fresh range 2000..4000 |
+|---|---|---|---|
+| `locks-root-rate-fast` | 1 364 | 0 | 0 |
+| `locks-root-rate-skew` | 1 356 | 0 | 0 |
+| `fast-takeover-successor-rate-fast` | 1 984 | 0 | 0 |
+| `fast-takeover-holder-rate-fast` | 224 | 0 | 0 |
+| `strict-reader-rate-fast` | 613 | 0 | 0 |
+| `delegated-root-rate-fast` (300) | 0 | 0 | |
+| `locks-rate-within-budget` (control) | 0 | 0 | |
+
+The restart configurations stay as they were (commit 3 fixes four of them, commit 4
+the fifth): `locks-root-restart-step-forward` 1 144 (1 143 in commit 1's run: a
+counter that varies by one between runs of the same binary), `locks-root-step-
+forward-then-restart` 774, `locks-root-reboot-step-forward` 1 144,
+`strict-holder-restart-step-forward` 212, `fast-takeover-successor-restart-
+before-marker` 57.
+
+### Identity: every configuration without a rate, a suspend or a reboot
+
+`sweep_config`, the sim binary of b8fe40c against this tree, 137 specs at 2 000 seeds
+(the 78 of C7-H1's list, step configurations and the beats-on-a-thread variants
+included, and every `locks-*`; the 44 others of commit 1's table at 300, `long-*`
+at 100 to 500; the controls and clean configurations of commit 1): the summary
+line (failing seeds and every counter), `SWEEP-FLOORS` and the fenced seeds are
+**identical for 134**. The other three differ by what varies between runs of the
+parent itself (commit 1 recorded the first two; the parent against the parent
+here): `flex-tight` (takeovers 1 148 or 1 149, remote chunks 746 or 747),
+`locks-unlinked-delegated-hcrash-backup` (answered from the stream 4 771 or
+4 772; equal in the second run of the parent), `fast-takeover-capped-grants`
+(the fenced-seed list: two runs of the parent differ in 8 seeds of 1 997, six
+against this tree; no seed's counts differ). The failing configurations (the
+negative controls `locks-writer-hold-unchecked` 1 991, `-unaware` and `-credited`
+ones, `locks-holder-step-back-sealed` 1) fail the same seeds. No configuration
+has a beat sent more than 125 s before the end it counts to (the sim's leases
+are 6 to 30 s), so the span filter's unlimited bound at ρ = 0 (the sim's default
+budget) changes nothing there.
+
+
+### Verification
+
+On the build box (release unless noted, `-j 4`, one job at a time, `TMPDIR` on tmpfs):
+
+- `cargo fmt --all -- --check` (the box's rustfmt), `cargo clippy --workspace --all-targets
+  -- -D warnings`: clean.
+- `cargo test --release`: `constellation-control` 146 (the schema regenerated with
+  `CONSTELLATION_BLESS=1`; `schema_file_is_current` passes), `-platform` 59 + 1 ignored,
+  `-types` 37 + 1 ignored (+ 8 properties), `-meta --lib` 269 (+ 2 ignored),
+  `-authority --lib` 516 (+ 2 ignored), `--test sim` 212 (+ 12 ignored: the parent's
+  208 and the five new tests), `-engine --lib` 817 (+ 9 ignored), `-harness` 149. The
+  model crate is untouched by this commit; its whole suite
+  (`--test-threads=2`, alone, 26 GB free) passes on the commit-3 tree (below).
+- Clock reads, the one hot path this touches (a `ProtocolClock::now()` is on every FUSE
+  `LeaseView::usable`): `reading_cost` (an ignored timing test in `types`, over sources
+  that cost nothing: four atomic loads), b8fe40c -> this tree, three rounds of
+  5 M reads, two repeats: `now()` 29.1 -> 29.9 ns, `honour()` 27.5 -> 27.9,
+  `wait()` 18.6 -> 19.0 (+0.4 to +0.9 ns: one `u128` multiply per elapsed term);
+  over the host's vDSO reads (four `clock_gettime`, about 80 ns) that is about 1 %.
+  **Not run**: `make vfs-bench` and `harness meta-bench` on ext4, xfs, btrfs and tmpfs
+  (the spec's perf gate): the change touches no file system path and the multiply
+  is the only cost; the maintainer decides whether the 1 % is worth the matrix.
+- Harness, once (the commit-3 build, which contains this commit; `lock-failover` and
+  `backup-failover`, seed 42, the daemons' elapsed clocks skewed with the
+  `clock:rate:` item): no load, `clock:rate:+800@a,clock:rate:-800@b` and
+  `clock:rate:+50000@a` (the node's budget raised to cover it): all PASSED, 0 locker
+  `EIO`, 120 contender refusals across the failover, backup-failover time p50 1.49 s,
+  1.50 s and 1.48 s.
+
+Rebased onto 4987b00 (F-c, the lapsed lock holder parks): the same gates on the rebased
+tree (fmt, clippy -D warnings, then the control, platform, types, meta, authority lib and
+sim suite, engine and harness tests) pass; the counts of the tree with commit 3 are in its
+entry (306, 528 and 219 for meta, authority lib and the sim suite). The five rate configurations on 4987b00
+-> this tree, 2 000 seeds: locks-root-rate-fast 1 364 -> 0, fast-takeover-successor-rate-fast
+1 984 -> 0, fast-takeover-holder-rate-fast 224 -> 0, strict-reader-rate-fast 613 -> 0. The
+restart configurations are unchanged by this commit (4987b00: 1 140, 794, 1 139, 212, 55).
+The identity sweeps above were run on b8fe40c and its successor; on 4987b00 they were
+started (the 92 two-thousand-seed specs, parent, this tree and commit 3) and could not be
+completed: the build box became unreachable during them.

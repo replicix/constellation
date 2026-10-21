@@ -31647,6 +31647,48 @@ mod beat_cap {
         assert_eq!(h.core.beat_cap(&prev), None, "unlisted");
     }
 
+    /// Plan 43 C7a: the span within which a beat sent before the renewal
+    /// that set `X` is evidence is `M/(4ρ)` of the node's rate budget (the
+    /// rate error `2ρ·span` stays under `M/2`): 250·M at 1 000 ppm, 2.5·M
+    /// at 100 000 ppm, no limit with no budget. A beat 3·M before `X` is
+    /// used at 1 000 ppm and not at 100 000. Fails on the parent: the span
+    /// was the constant 250·M whatever the budget, so the beat is used at
+    /// 100 000 ppm too.
+    #[test]
+    fn the_beat_cap_span_follows_the_rate_budget() {
+        let m = margin(&successor());
+        for (ppm, span) in [
+            (1_000u32, 250 * m),
+            (2_000, 125 * m),
+            (100_000, m * 10 / 4),
+            (300_000, m * 10 / 12),
+        ] {
+            let mut h = successor();
+            h.core.cfg.clock_rate_budget_ppm = ppm;
+            assert_eq!(h.core.beat_cap_span_ms(), span, "{ppm} ppm");
+        }
+        let mut h = successor();
+        h.core.cfg.clock_rate_budget_ppm = 0;
+        assert_eq!(h.core.beat_cap_span_ms(), i64::MAX);
+        // The beat: sent 3·M before X, 100 ms of lag; a later one, 400 ms
+        // before X with a larger lag, is the fallback.
+        let cap_at = |ppm: u32, with_recent: bool| {
+            let mut h = successor();
+            h.core.cfg.clock_rate_budget_ppm = ppm;
+            let x = h.now.0 + 5_000;
+            beat(&mut h, 1, (x - 3 * m, x - 3 * m + 100), x, 0);
+            if with_recent {
+                beat(&mut h, 2, (x - 400, x - 400 + 900), x, 0);
+            }
+            h.core.beat_cap(&predecessor(x)).map(|c| c.0 - x - m)
+        };
+        assert_eq!(cap_at(1_000, false), Some(100), "used within the span");
+        assert_eq!(cap_at(0, false), Some(100), "no budget, no limit");
+        assert_eq!(cap_at(100_000, false), None, "3·M is beyond 2.5·M");
+        assert_eq!(cap_at(100_000, true), Some(900), "the recent beat");
+        assert_eq!(cap_at(1_000, true), Some(100), "the smallest lag in span");
+    }
+
     /// Beats sent longer than `250·M` before the instant the cap counts
     /// to are no evidence of the clocks' rates: a beat that old with a
     /// (suspiciously) small lag does not set the cap; the recent ones do.

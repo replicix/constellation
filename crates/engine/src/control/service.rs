@@ -854,6 +854,7 @@ impl EngineControl {
                     last_step_ms: steps.last_step.map_or(0, |(_, delta)| delta),
                     honour_ahead_ms: now.honour.0 - now.wall.0,
                     wait_behind_ms: now.wall.0 - now.wait.0,
+                    rate_budget_ppm: constellation_platform::clock::protocol().rate_budget_ppm(),
                 }
             },
             log: log_status(&self.log_buffer.stats()),

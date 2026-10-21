@@ -2549,15 +2549,15 @@ fn holder_restart_step_forward_readopt_config() -> SimConfig {
 }
 
 /// Plan 43 C7a: the simulated clock model. A rate moves a node's boot, raw
-/// and monotonic clocks and not its wall; the budget is carried and read
-/// by nothing yet. A node at +50 000 ppm for a second reads 1 050 ms on
-/// WAIT and HONOUR and 1 000 ms on the wall; set to -100 000 ppm it reads
-/// 900 ms for the next second.
+/// and monotonic clocks and not its wall (here with no budget, which reads
+/// the oscillator as it is). A node at +50 000 ppm for a second reads
+/// 1 050 ms on WAIT and HONOUR and 1 000 ms on the wall; set to -100 000
+/// ppm it reads 900 ms for the next second.
 #[tokio::test(start_paused = true)]
 async fn a_simulated_rate_moves_the_elapsed_clocks_and_not_the_wall() {
     let truth = sim::clock::Clock::start();
     let state = sim::clock::NodeClockState::new(2, 50_000, false);
-    let node = truth.for_node(0, state.clone(), (2 << 32) | 1, 1_000);
+    let node = truth.for_node(0, state.clone(), (2 << 32) | 1, 0);
     let n0 = node.now();
     tokio::time::advance(std::time::Duration::from_millis(1_000)).await;
     let n1 = node.now();
@@ -2576,7 +2576,7 @@ async fn a_simulated_rate_moves_the_elapsed_clocks_and_not_the_wall() {
     assert!(n2.honour.0 >= n2.wall.0);
     assert_eq!(state.ppm_at(truth.elapsed_ns()), -100_000);
     // The rate is the host's: a new incarnation reads it too.
-    let reborn = truth.for_node(0, state.clone(), (2 << 32) | 2, 1_000);
+    let reborn = truth.for_node(0, state.clone(), (2 << 32) | 2, 0);
     let (r0, t0) = (reborn.now(), truth.elapsed_ms());
     tokio::time::advance(std::time::Duration::from_millis(1_000)).await;
     let r1 = reborn.now();
@@ -2672,6 +2672,61 @@ async fn a_simulated_timer_inverts_the_rate_and_a_plain_clock_is_the_paused_one(
     assert_eq!(p.wait.0, base_ms + 1_000);
     assert_eq!(p.honour.0, p.wait.0);
     assert_eq!(p.wall.0, base_ms + 1_000);
+}
+
+/// Plan 43 C7a (commit 2): a budgeted clock's WAIT runs slow and its HONOUR
+/// fast by the budget, and a timer's instant inverts both the rate and that
+/// scaling: whatever the oscillator (within the budget or not), the node's
+/// WAIT reads the target at the instant, and it is not early by more than
+/// the millisecond of the fixed point's rounding. (With a budget of 0 the
+/// instant is the raw clock's, as before.)
+#[tokio::test(start_paused = true)]
+async fn a_simulated_timer_inverts_the_budget_scaling() {
+    let truth = sim::clock::Clock::start();
+    for (rate, budget) in [
+        (0i64, 1_000u32),
+        (1_000, 1_000),
+        (-1_000, 1_000),
+        (80_000, 80_000),
+        (100_000, 100_000),
+        (0, 300_000),
+    ] {
+        let state = sim::clock::NodeClockState::new(2, rate, false);
+        let node = truth.for_node(0, state, (2 << 32) | 1, budget);
+        tokio::time::advance(std::time::Duration::from_millis(777)).await;
+        for after in [1u64, 1_000, 20_000] {
+            let target = node.now().wait.plus(after);
+            let due = node.instant_at_wait(target);
+            let t0 = tokio::time::Instant::now();
+            tokio::time::sleep_until(due).await;
+            assert!(
+                node.wait() >= target,
+                "rate {rate} budget {budget} after {after}: WAIT {} < {}",
+                node.wait().0,
+                target.0
+            );
+            // The instant is where the scaling puts it, give or take the
+            // rounding.
+            let late = (due - t0).as_secs_f64() * 1_000.0;
+            let exact = after as f64 * (1e6 + budget as f64) / (1e6 + rate as f64);
+            assert!(
+                (late - exact).abs() <= 3.0,
+                "rate {rate} budget {budget} after {after}: {late} {exact}"
+            );
+        }
+    }
+    // HONOUR and WAIT of a node on an exact oscillator.
+    let node = truth.for_node(
+        0,
+        sim::clock::NodeClockState::new(3, 0, false),
+        (3 << 32) | 1,
+        1_000,
+    );
+    let n0 = node.now();
+    tokio::time::advance(std::time::Duration::from_millis(100_000)).await;
+    let n1 = node.now();
+    assert_eq!(n1.wait.0 - n0.wait.0, 99_900);
+    assert_eq!(n1.honour.0 - n0.honour.0, 100_100);
 }
 
 /// Runs the seeds on up to 8 threads (the backup ranges are a few
@@ -8371,6 +8426,61 @@ fn a_cut_holder_stepped_forward_does_not_cap_its_successors_floor_early() {
     }
 }
 
+/// Plan 43 C7a (2/6): a lock owner whose oscillator runs 8 % fast, under a
+/// rate budget of 80 000 ppm, outwaits a cut locker on its wait clock, which
+/// counts `1/1.08` of the raw clock: not before the locker's grant ended.
+/// `locks-root-rate-fast` (and `-rate-skew`, the same rate set by a fault
+/// at 1 s): 1 364 and 1 356 of 2 000 seeds failed before (the first at 0, 1
+/// and 4: two exclusive lockers for about half a second).
+#[test]
+fn a_fast_lock_owner_does_not_outwait_a_cut_locker_early() {
+    for seed in 0..12u64 {
+        run_seed(seed, locks_root_rate_fast_config())
+            .unwrap_or_else(|e| panic!("rate-fast seed {seed}: {e}"));
+        run_seed(seed, locks_root_rate_skew_config())
+            .unwrap_or_else(|e| panic!("rate-skew seed {seed}: {e}"));
+    }
+}
+
+/// Plan 43 C7a (2/6): a successor whose oscillator is 30 % fast keeps its
+/// takeover floor for the predecessor's last lock grant: the floor counts
+/// on its wait clock, `1/1.3` of what the raw clock says.
+/// `fast-takeover-successor-rate-fast`: 1 984 of 2 000 seeds failed before
+/// (the first at 0, 1 and 2).
+#[test]
+fn a_fast_successor_keeps_its_takeover_floor() {
+    for seed in 0..12u64 {
+        run_seed(seed, fast_takeover_successor_rate_fast_config())
+            .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    }
+}
+
+/// Plan 43 C7a (2/6): the beat cap, counted from a slow holder's wait clock
+/// onto a fast backup's, is early only for beats sent before the renewal
+/// that set the lease's end (the holder 25 % slow, its backup 25 % fast); the
+/// span filter (`M/(4ρ)`, from the budget) leaves those out, so the floor is not capped early.
+/// `fast-takeover-holder-rate-fast`: 224 of 2 000 seeds failed before (the
+/// first at 24, 27 and 44).
+#[test]
+fn a_cap_from_a_slow_holders_beats_does_not_end_the_floor_early() {
+    for seed in [23u64, 24, 25, 26, 27, 28, 43, 44, 45] {
+        run_seed(seed, fast_takeover_holder_rate_fast_config())
+            .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    }
+}
+
+/// Plan 43 C7a (2/6): a holder whose oscillator is 20 % fast outwaits an
+/// isolated reader's read delegation on its wait clock, as long as the
+/// reader honours it. `strict-reader-rate-fast`: 613 of 2 000 seeds failed
+/// before (the first at 3, 4 and 16: a stale strict read).
+#[test]
+fn a_fast_holder_does_not_outwait_a_read_delegation_early() {
+    for seed in [2u64, 3, 4, 5, 6, 15, 16, 17] {
+        run_seed(seed, strict_reader_rate_fast_config())
+            .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    }
+}
+
 /// Plan 43 C7-F F-a (review F3): the strict side of the floor. A reader
 /// cut from the holder and its backup serves from its read delegation
 /// while the backup, having sealed the crashed holder, takes over: with the
@@ -9662,6 +9772,27 @@ fn long_locks() {
         "strict-isolated-reader-holder-step-forward",
         strict_isolated_reader_holder_step_forward_config(),
         217_000..217_000 + n,
+    );
+    // Plan 43 C7a (2/6): oscillators off by their budget.
+    run_m14(
+        "locks-root-rate-fast",
+        locks_root_rate_fast_config(),
+        218_000..218_000 + n,
+    );
+    run_m14(
+        "fast-takeover-successor-rate-fast",
+        fast_takeover_successor_rate_fast_config(),
+        219_000..219_000 + n,
+    );
+    run_m14(
+        "fast-takeover-holder-rate-fast",
+        fast_takeover_holder_rate_fast_config(),
+        220_000..220_000 + n,
+    );
+    run_m14(
+        "locks-rate-within-budget",
+        locks_rate_within_budget_config(),
+        221_000..221_000 + n,
     );
     run_m14("locks-faults", locks_faults_config(), 195_000..195_000 + n);
     run_m14("locks-pause", locks_pause_config(), 197_000..197_000 + n);

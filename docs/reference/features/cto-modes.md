@@ -270,8 +270,14 @@ clock, measured from when it sent the request. The sequencer treats it
 as live until `granted + ttl + margin` on its own clock. `margin` is the
 lease's expiry margin, `min(1 s, lease TTL / 4)`. Every condition
 reduces to the lease's own rule, `margin > 2 × drift`: at the defaults,
-clocks may differ from real time by up to ±500 ms. The Stateright model
-in `crates/model/src/cto.rs` checks the argument.
+clocks may differ from each other by up to ±500 ms (that is the
+cross-node part; plan 43 C7b replaces it). A clock's *rate* is a separate
+bound that each node pays by itself (plan 43 C7a): its oscillator is
+budgeted at 1 000 ppm (0.1 %), and the honour and wait readings below run
+fast and slow by that budget, so a window measured on one node is exact for
+any oscillator within it, with the margin left as transit slack. The
+Stateright model in `crates/model/src/cto.rs` checks the argument, rate
+included.
 
 What a node honours is measured on its **honour clock** (plan 43 C7-H1): a
 monotone reading that never under-counts real time and follows a forward
@@ -289,7 +295,10 @@ clock**: a monotone reading that never over-counts and ignores every wall
 step, so a forward step of the sequencer's wall clock does not end a
 recall's wait early and a backward one does not lengthen it. A quarantine
 persisted across a restart is written as a wall value and read back as time
-left on the new process's wait clock.
+left on the new process's wait clock. (The two readings differ from the
+wall clock by the rate budget as the node stays up, 86 s a day at 0.1 %;
+`constellation status` shows it as `clock.honour_ahead_ms` and
+`clock.wait_behind_ms`, with the budget in `clock.rate_budget_ppm`.)
 
 ### Without P2P
 

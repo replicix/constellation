@@ -1096,9 +1096,12 @@ step 4 closes the "Not covered" gap of the 2026-10-16 fix for good.
   own disk or waits for S3. Offline designation is the correct tool for
   the laptop; `ack=s3` for the paranoid; Layer A with a visible branch
   for everyone else. No protocol removes this choice.
-- **Clock envelope.** ±500 ms at the default margins. A quorum log
-  would not relax it (lock windows and read leases still need it); a
-  hybrid logical clock already stamps records.
+- **Clock envelope.** Rate: at most 0.1 % per node for every local window
+  (plan 43 C7a: the honour and wait readings carry the budget, so a window
+  measured on one node is exact for any oscillator within it). Offset: ±500
+  ms at the default margins for every compare between nodes, until C7b. A
+  quorum log would not relax it (lock windows and read leases still need
+  it); a hybrid logical clock already stamps records.
 - **Kernel and store.** The plan 42 races, FUSE `FORGET` semantics, the
   `execve` close window, fjall stalls: unaffected by anything above and
   the majority of the fixes this month.

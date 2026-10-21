@@ -914,6 +914,22 @@ never ends a wait early and a backward one never lengthens it. A holder's
 heartbeat names its lease's end on that clock too, so a successor's cap on its
 floor is a difference on a clock no wall step moves.
 
+Both readings pay for the node's oscillator (plan 43 C7a). A crystal runs fast
+or slow by tens of ppm; each node budgets its own, `ρ`, at 1 000 ppm (0.1 %)
+by default, 2 000 where the rate source is slewed by the host's time service.
+The wait clock counts `1/(1 + ρ)` of the unslewed elapsed time and the honour
+clock `1/(1 − ρ)` of it, so for any oscillator within the budget the wait clock
+never advances more, and the honour clock never less, than real time, whatever
+the span. Every holder/waiter pair is then safe with the margin it already has:
+`margin ≥ 2ρ·T + transit`, with the `2ρ·T` paid by the readings and the margin
+left as slack for transit, processing and rounding. No site adds a drift term.
+The price is that the two clocks drift from the wall clock by `ρ` of the
+uptime (86 s a day at 1 000 ppm), which nothing compares across nodes or
+processes, and that a timer sleeps `ρ` longer than it counts. A heartbeat's
+cap on a successor's floor is the one place that still needs `ρ` explicitly:
+a beat sent before the renewal that set the lease's end is used only within
+`margin/(4ρ)` of that end (250 margins at the default).
+
 Liveness is on the wait clock as well: every timer, a client op's deadlines
 (the forward and acquire timeouts, the S3-less bound, the inbox deadline), the
 age of a queue or a retry, the idle and dwell times that release a lease, and
@@ -1514,7 +1530,7 @@ and a blocking one keeps retrying.
 | forward times out (holder slow or gone) | same-rid retries, then the inbox (no P2P path) or the lease path; resolved exactly once; `EIO` at the client deadline (2 × TTL), never a re-execution |
 | holder deposed (it lost the lease while alive) | it rolls its unshipped journal back and replays it by rid through the new holder; only true overlaps become conflict copies |
 | P2P down, S3 up | everything works through the lease path and the S3 inbox, minus backups, delegations, strict ReadIndex, cluster locks and fast takeover |
-| clock skew | lease, delegation, read-delegation and lock timing all assume `margin > 2 × drift` (±500 ms at the defaults); correctness otherwise relies on CAS ordering, never wall clocks; steps: none (C7-H1: holders measure on the honour clock, waiters on the wait clock) |
+| clock skew | rate: each node's oscillator within its budget (0.1 % by default, C7a: paid by the honour and wait readings, so every local window is exact); offsets: lease, delegation, read-delegation and lock timing across nodes assume `margin > 2 × drift` (±500 ms at the defaults; C7b replaces them); correctness otherwise relies on CAS ordering, never wall clocks; steps: none (C7-H1: holders measure on the honour clock, waiters on the wait clock) |
 | cache disk full | evict clean → throttle → ENOSPC (reads still stream uncached) |
 | logical quota exceeded | ENOSPC on write/truncate/fallocate growth (best-effort; see above) |
 | DB disk full | read-only mode + flush-to-recover; alarms in status/UI |

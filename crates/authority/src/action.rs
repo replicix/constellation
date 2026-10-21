@@ -38,7 +38,10 @@ pub enum Action {
     /// Fire `Event::Timer { id }` `after_ms` from now (plan 43 C7-H1: a
     /// duration, so the driver sleeps it on the monotonic clock and a wall
     /// step moves nothing; the core computed it from the clock the
-    /// deadline is on). Setting an id that is already pending moves it.
+    /// deadline is on; plan 43 C7a: a duration of that clock, which runs
+    /// slow by the node's rate budget, so the driver stretches the sleep by
+    /// it and the handler re-checks anyway). Setting an id that is already
+    /// pending moves it.
     SetTimer {
         id: TimerId,
         after_ms: u64,

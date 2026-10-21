@@ -3592,7 +3592,13 @@ impl Driver {
                     } else {
                         self.int_tx.clone()
                     };
-                    // From the step's reading (`now_at`), not from here.
+                    // From the step's reading (`now_at`), not from here, and
+                    // stretched by the clock's rate budget: the wait clock
+                    // the core counts `after_ms` on runs slow by it, so a
+                    // sleep of `after_ms` would end before it advanced that
+                    // much and the handler would re-arm for the rest.
+                    let after_ms =
+                        constellation_platform::clock::protocol().sleep_ms_for_wait(after_ms);
                     let delay =
                         Duration::from_millis(after_ms).saturating_sub(self.now_at.elapsed());
                     tokio::spawn(async move {
@@ -6737,6 +6743,8 @@ impl Standalone {
                     self.controls.insert(op, result);
                 }
                 Action::SetTimer { id, after_ms, .. } => {
+                    let after_ms =
+                        constellation_platform::clock::protocol().sleep_ms_for_wait(after_ms);
                     if u128::from(after_ms) <= self.now_at.elapsed().as_millis() {
                         self.due.push_back(id);
                     }

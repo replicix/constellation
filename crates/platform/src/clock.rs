@@ -12,12 +12,12 @@
 //! plus the time suspended, `boot - mono`: the two must be slewed together
 //! (or neither slewed) so that a slew cancels in their difference.
 //!
-//! | OS | boot (counts suspend) | raw (rate source) | mono (does not count suspend) |
-//! |---|---|---|---|
-//! | Linux, Android | `CLOCK_BOOTTIME` | `CLOCK_MONOTONIC_RAW` (never slewed) | `CLOCK_MONOTONIC` (slewed with BOOTTIME) |
-//! | macOS, iOS | `CLOCK_MONOTONIC_RAW` (counts sleep: `mach_continuous_time`) | `CLOCK_UPTIME_RAW` | `CLOCK_UPTIME_RAW` (neither is slewed) |
-//! | FreeBSD | `CLOCK_MONOTONIC` | `CLOCK_UPTIME` | `CLOCK_UPTIME` |
-//! | Windows, others | one `std::time::Instant` for all three | | |
+//! | OS | boot (counts suspend) | raw (rate source) | mono (does not count suspend) | rate budget |
+//! |---|---|---|---|---|
+//! | Linux, Android | `CLOCK_BOOTTIME` | `CLOCK_MONOTONIC_RAW` (never slewed) | `CLOCK_MONOTONIC` (slewed with BOOTTIME) | 1 000 ppm |
+//! | macOS, iOS | `CLOCK_MONOTONIC_RAW` (counts sleep: `mach_continuous_time`) | `CLOCK_UPTIME_RAW` | `CLOCK_UPTIME_RAW` (neither is slewed) | 1 000 ppm |
+//! | FreeBSD | `CLOCK_MONOTONIC` | `CLOCK_UPTIME` | `CLOCK_UPTIME` | 2 000 ppm (slewed) |
+//! | Windows, others | one `std::time::Instant` for all three | | | 2 000 ppm |
 //!
 //! FreeBSD's `CLOCK_MONOTONIC` and `CLOCK_UPTIME` are the same clock as far
 //! as is known (from the man page; not run on a FreeBSD host): no suspend is
@@ -63,8 +63,8 @@
 //! never slewed (Linux, Android, macOS, iOS), 2 000 elsewhere (FreeBSD's
 //! slewed `CLOCK_UPTIME`, the `Instant` fallback).
 //! `CONSTELLATION_CLOCK_RATE_BUDGET_PPM=<ppm>` overrides it (testing only;
-//! refused from 500 000 ppm). Commit 1 of C7a hands it to the clock and the
-//! core's configuration; no reading uses it yet.
+//! refused from 500 000 ppm). The protocol clock scales its readings by it
+//! and the core reads it for the beat cap's span.
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, OnceLock};

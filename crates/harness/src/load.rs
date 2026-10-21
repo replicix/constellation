@@ -19,7 +19,7 @@
 //! | `net:<netem args...>` / `net:flap[:<netem args...>]` | `tc netem` on the daemon's own P2P (UDP) ports on `lo`; flap: loss 100 % for 2 s every 10 s |
 //! | `clock:<±ms>` / `clock:spread:<ms>` | `CONSTELLATION_FAULT_CLOCK_OFFSET_MS` (within ±500 ms); spread alternates `+ms`, `-ms` across nodes |
 //! | `clock:step:<±ms>:<at_ms>[@node]` | at `<at_ms>` after the daemon spawned, the daemon's protocol wall clock steps by `<ms>` (`CONSTELLATION_FAULT_CLOCK_STEP_FILE`; plan 43 C7-H1): the honour clock follows a forward step, a backward one and the wait clock move nothing; the steps are cumulative per node, armed once per node and kept across a daemon restart (a restarted daemon starts stepped; the step is not applied again) |
-//! | `clock:rate:<±ppm>[:unbudgeted][@node]` | the daemon's boot, raw and monotonic clocks run at `1 + ppm/1e6` of the host's rate from its start, its wall does not (`CONSTELLATION_FAULT_CLOCK_RATE_PPM`; plan 43 C7a): an oscillator off by `ppm` under a disciplined wall. Unless `:unbudgeted`, the node's rate budget is raised to cover it (`CONSTELLATION_CLOCK_RATE_BUDGET_PPM = max(1000, |ppm|)`; each node budgets its own oscillator); `|ppm| < 500000`. The budget is carried from C7a's first commit and read by the clocks from its second |
+//! | `clock:rate:<±ppm>[:unbudgeted][@node]` | the daemon's boot, raw and monotonic clocks run at `1 + ppm/1e6` of the host's rate from its start, its wall does not (`CONSTELLATION_FAULT_CLOCK_RATE_PPM`; plan 43 C7a): an oscillator off by `ppm` under a disciplined wall. Unless `:unbudgeted`, the node's rate budget is raised to cover it (`CONSTELLATION_CLOCK_RATE_BUDGET_PPM = max(1000, |ppm|)`; each node budgets its own oscillator); `|ppm| < 500000`. The clocks scale WAIT by `1/(1+ρ)` and HONOUR by `1/(1−ρ)` of it (C7a); `:unbudgeted` is the stress run, an oscillator beyond the budget |
 //!
 //! `<dur>` is milliseconds or a protocol boundary with an optional offset
 //! (`lock-lapse+500`, `takeover-300`, `lease-ttl+1000`: see
@@ -856,7 +856,7 @@ fn check_step_counted(d: &Daemon, delta_ms: i64) -> Result<()> {
         if n("steps_forward") >= fwd && n("steps_backward") >= bwd {
             eprintln!(
                 "    load: {} (pid {}) wall clock stepped by {delta_ms} ms: status.clock steps_forward {} \
-                 steps_backward {} stepped_ms_total {} last_step_ms {} honour_ahead_ms {} wait_behind_ms {}",
+                 steps_backward {} stepped_ms_total {} last_step_ms {} honour_ahead_ms {} wait_behind_ms {} rate_budget_ppm {}",
                 d.node,
                 d.pid,
                 n("steps_forward"),
@@ -865,6 +865,7 @@ fn check_step_counted(d: &Daemon, delta_ms: i64) -> Result<()> {
                 clock["last_step_ms"].as_i64().unwrap_or(0),
                 clock["honour_ahead_ms"].as_i64().unwrap_or(0),
                 clock["wait_behind_ms"].as_i64().unwrap_or(0),
+                clock["rate_budget_ppm"].as_u64().unwrap_or(0),
             );
             return Ok(());
         }

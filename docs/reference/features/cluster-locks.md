@@ -208,6 +208,11 @@ same as for [read delegations](cto-modes.md#read-delegations):
   own clock;
 - `margin` is the lease's expiry margin (`min(1 s, lease TTL / 4)`), so
   the rule holds while clocks stay within half the margin of each other.
+  That is the offset between nodes. A clock's *rate* is paid by the clock
+  itself (plan 43 C7a): each node's honour and wait readings carry its
+  oscillator budget (0.1 % by default), so `margin ≥ 2ρ·T + transit` holds
+  with the `2ρ·T` (40 ms on a 20 s grant) already in the readings and the
+  margin left as slack for transit and rounding.
 
 What a node honours is measured on its **honour clock** (plan 43 C7-H1): a
 monotone reading that never under-counts real time and follows a forward

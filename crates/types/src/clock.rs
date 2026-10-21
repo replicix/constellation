@@ -13,17 +13,18 @@
 //! (`CLOCK_BOOTTIME`, which counts suspend), the raw clock
 //! (`CLOCK_MONOTONIC_RAW`, which is never slewed) and the monotonic clock
 //! (`CLOCK_MONOTONIC`, which NTP slews). On every read it takes one
-//! sample and computes
+//! sample and computes, with `rho` the node's oscillator rate budget (plan
+//! 43 C7a; 1 000 ppm by default, see "The rate budget")
 //!
 //! ```text
-//! e_raw = raw - raw0                       // real elapsed (unslewed)
+//! e_raw = raw - raw0                       // elapsed on the oscillator (unslewed)
 //! S     = running max of (boot - mono) - (boot0 - mono0)   // time suspended
-//! e_h   = e_raw + S
+//! e_h   = ceil(e_raw / (1 - rho)) + S      // runs fast by rho
 //! gap   = wall - wall0 - e_h               // how far wall is ahead of e_h
 //! J     = running max of gap, at least 0
 //! HONOUR = wall0 + e_h + J
 //!
-//! WAIT  = wall0 + e_raw
+//! WAIT  = wall0 + floor(e_raw / (1 + rho)) // runs slow by rho
 //!
 //! WALL  = wall                             // as the host reports it
 //! ```
@@ -65,14 +66,22 @@
 //!   not smaller: WAIT is a pure function of monotone sources, and `jump`
 //!   is read with `Acquire` after any earlier `AcqRel` `fetch_max`.
 //! - **P2, HONOUR never under-counts.** For readings `h1` before `h2`,
-//!   `h2 - h1` is at least the real elapsed time, up to the oscillator's
-//!   error (C7a's rho): it is RAW's delta (not slewed) plus the suspend
-//!   term `S` and `J`, which only add (per interval, whatever the clocks'
-//!   absolute values: `S` is a difference of two clocks slewed together).
-//!   So `sent + ttl - margin` on HONOUR is never later in real time than
-//!   the same window measured in real time.
-//! - **P3, WAIT never over-counts.** `w2 - w1` is RAW's delta: at most the
-//!   real elapsed time, up to rho, and not slewed. It does not count
+//!   `h2 - h1` is at least the real elapsed time, **exactly, for any
+//!   oscillator within the budget** (C7a): it is RAW's delta scaled by
+//!   `1/(1 - rho)` (so `>= real * (1 - rho)/(1 - rho)`, to the millisecond)
+//!   plus the suspend term `S` and `J`, which only add (per interval,
+//!   whatever the clocks' absolute values: `S` is a difference of two
+//!   clocks slewed together). So `sent + ttl - margin` on HONOUR is never
+//!   later in real time than the same window measured in real time: the
+//!   margin is slack for transit and rounding, not for the oscillator.
+//!   The exception is an interval that spans a suspend: `S` is the kernel's
+//!   own account of the time asleep, outside the budget, and a host that
+//!   times a suspend with a persistent clock of whole seconds (the x86 CMOS
+//!   RTC, where no clock source runs through suspend) can count it short by
+//!   up to about a second; the margin absorbs that, not transit as well.
+//! - **P3, WAIT never over-counts.** `w2 - w1` is RAW's delta scaled by
+//!   `1/(1 + rho)`: at most the real elapsed time, exactly for any
+//!   oscillator within the budget, and not slewed. It does not count
 //!   suspend, which is conservative for a wait.
 //! - **P4, steps.** A backward WALL step changes neither HONOUR nor WAIT.
 //!   A forward step of `D` advances HONOUR by `D` once, at the first read
@@ -81,10 +90,45 @@
 //!   HONOUR: `gap` returns to a value `jump` has already seen.
 //! - **P5, order.** `HONOUR >= WALL` always (`J >= gap`) and
 //!   `HONOUR >= WAIT` always. WAIT and WALL are not ordered after a step.
+//! - **P5b, long uptime.** The budget is paid whether the oscillator uses it
+//!   or not: HONOUR runs ahead of WALL by `rho` of the uptime and WAIT behind
+//!   it (86 s a day at 1 000 ppm). Nothing compares them with each other or
+//!   across processes or nodes (P6); the four conversions of [`Now`] map
+//!   remaining durations and stay correct. `status.clock`'s `honour_ahead_ms`
+//!   and `wait_behind_ms` grow with it. A forward wall step after uptime `U`
+//!   raises `J` only by the part of the step beyond the lead that `rho * U`
+//!   has already given HONOUR (P4's "advances HONOUR by `D`" is exact only
+//!   while HONOUR is level with WALL).
 //! - **P6, no common origin across incarnations.** A new process starts
 //!   all three at WALL. HONOUR or WAIT values from another process, or
 //!   another node, mean nothing on this one; [`ProtocolClock::id`] names
 //!   the clock a stamp belongs to.
+//!
+//! # The rate budget (plan 43 C7a)
+//!
+//! The oscillator behind RAW is not exact: a crystal is 20 to 100 ppm off,
+//! a hot or failing one more. Each node budgets its own oscillator (`rho`,
+//! [`ProtocolClock::rate_budget_ppm`]; per node, nothing needs two nodes to
+//! agree on it) and the readings pay it, once, here, instead of at every
+//! margin: WAIT counts `1/(1 + rho)` of RAW's elapsed time and HONOUR
+//! `1/(1 - rho)` of it. For any oscillator whose rate error is at most
+//! `rho`, WAIT then never advances more, and HONOUR never less, than real
+//! time, whatever the span, which makes every holder/waiter pair safe with
+//! the margin it already has (the plan's `margin >= 2 rho T + transit`, the
+//! `2 rho T` paid by the readings; the margin is left as transit, processing
+//! and rounding slack). `0` reads exactly as C7-H1's clock did. The step
+//! detector and WALL are not scaled.
+//!
+//! RAW is never slewed, which is why it is the source: a slewed source
+//! could not be budgeted with 1 000 ppm (a time daemon slews up to 83 333
+//! ppm). The scaling is fixed point (`2^40`-fraction multipliers computed
+//! at creation: one `u128` multiply per reading).
+//!
+//! A timer of `after_ms` of WAIT, slept on the runtime's monotonic clock,
+//! ends before WAIT advanced by that much (WAIT runs slow):
+//! [`ProtocolClock::sleep_ms_for_wait`] stretches the sleep so that it does
+//! not, for an oscillator that is exact; a slow one wakes the handler early
+//! and the handler re-arms for the rest.
 //!
 //! # Read order
 //!
@@ -113,6 +157,22 @@ use std::sync::{Arc, Mutex};
 /// A wall-clock difference this large between two samples is counted as a
 /// step (`StepStats`).
 pub const STEP_DETECT_MS: i64 = 100;
+
+/// The largest rate budget a clock takes, ppm (the platform refuses the same
+/// bound): a larger one is clamped, so the scale `1/(1 - rho)` stays finite.
+pub const MAX_RATE_BUDGET_PPM: u32 = 499_999;
+
+/// The fixed-point fraction of the readings' scale (see the module doc).
+const SCALE_SHIFT: u32 = 40;
+
+/// WAIT's and HONOUR's multipliers for `budget_ppm`: `floor(2^40 * 1e6 /
+/// (1e6 + rho))` and `ceil(2^40 * 1e6 / (1e6 - rho))`.
+fn scale_muls(budget_ppm: u32) -> (u64, u64) {
+    let (one, ppm, rho) = (1u128 << SCALE_SHIFT, 1_000_000u128, budget_ppm as u128);
+    let wait = one * ppm / (ppm + rho);
+    let honour = (one * ppm).div_ceil(ppm - rho);
+    (wait as u64, honour as u64)
+}
 
 macro_rules! clock_ms {
     ($(#[$meta:meta])* $name:ident) => {
@@ -295,9 +355,13 @@ pub struct StepStats {
 pub struct ProtocolClock {
     sources: Arc<dyn ClockSources>,
     id: u64,
-    /// The oscillator's rate budget, ppm (plan 43 C7a). Stored here by
-    /// commit 1 of C7a; the readings do not use it yet.
+    /// The oscillator's rate budget, ppm (plan 43 C7a; clamped to
+    /// [`MAX_RATE_BUDGET_PPM`]).
     budget_ppm: u32,
+    /// `floor(2^40 / (1 + rho))` and `ceil(2^40 / (1 - rho))`: WAIT's and
+    /// HONOUR's scale on RAW's elapsed time (`2^40` each for budget 0).
+    wait_mul: u64,
+    honour_mul: u64,
     wall0: i64,
     boot0: u64,
     raw0: u64,
@@ -323,6 +387,17 @@ impl std::fmt::Debug for ProtocolClock {
     }
 }
 
+/// `ns * mul / 2^40`, rounded up when `up`, saturating.
+fn scaled_ns(ns: u64, mul: u64, up: bool) -> u64 {
+    let p = ns as u128 * mul as u128;
+    let p = if up {
+        p + ((1u128 << SCALE_SHIFT) - 1)
+    } else {
+        p
+    };
+    (p >> SCALE_SHIFT).min(u64::MAX as u128) as u64
+}
+
 fn ns_to_ms(ns: u64) -> i64 {
     (ns / 1_000_000).min(i64::MAX as u64) as i64
 }
@@ -340,10 +415,14 @@ impl ProtocolClock {
     /// `id` must be non-zero: 0 means "no clock" in stamps that carry one.
     pub fn with_id(sources: Arc<dyn ClockSources>, id: u64, budget_ppm: u32) -> Self {
         assert_ne!(id, 0, "a protocol clock id is never 0");
+        let budget_ppm = budget_ppm.min(MAX_RATE_BUDGET_PPM);
+        let (wait_mul, honour_mul) = scale_muls(budget_ppm);
         let s = sources.read();
         Self {
             id,
             budget_ppm,
+            wait_mul,
+            honour_mul,
             wall0: s.wall_ms,
             boot0: s.boot_ns,
             raw0: s.raw_ns,
@@ -368,6 +447,19 @@ impl ProtocolClock {
     /// The oscillator rate budget this clock was built with, ppm.
     pub fn rate_budget_ppm(&self) -> u32 {
         self.budget_ppm
+    }
+
+    /// How long to sleep, on a clock that runs at the oscillator's rate (the
+    /// runtime's monotonic one), for WAIT to advance by `after_ms`:
+    /// `ceil(after_ms * (1e6 + rho) / 1e6)`. A timer slept for `after_ms`
+    /// would end before WAIT (which runs slow by `rho`) had advanced that
+    /// much, and its handler would re-check and sleep again; this is that
+    /// second sleep spared. An oscillator slower than real time still wakes
+    /// the handler early, which re-arms for the rest.
+    pub fn sleep_ms_for_wait(&self, after_ms: u64) -> u64 {
+        let stretched =
+            (after_ms as u128 * (1_000_000 + self.budget_ppm as u128)).div_ceil(1_000_000);
+        stretched.min(u64::MAX as u128) as u64
     }
 
     /// All three readings from one sample.
@@ -413,7 +505,12 @@ impl ProtocolClock {
         } else {
             seen_s
         };
-        let e_h = ns_to_ms(raw.saturating_sub(self.raw0)).saturating_add(susp);
+        let e_h = ns_to_ms(scaled_ns(
+            raw.saturating_sub(self.raw0),
+            self.honour_mul,
+            true,
+        ))
+        .saturating_add(susp);
         let gap = wall.saturating_sub(self.wall0).saturating_sub(e_h);
         let seen = self.jump.load(Ordering::Acquire);
         let jump = if gap > seen {
@@ -425,10 +522,11 @@ impl ProtocolClock {
     }
 
     fn wait_of(&self, raw: u64) -> WaitMs {
-        WaitMs(
-            self.wall0
-                .saturating_add(ns_to_ms(raw.saturating_sub(self.raw0))),
-        )
+        WaitMs(self.wall0.saturating_add(ns_to_ms(scaled_ns(
+            raw.saturating_sub(self.raw0),
+            self.wait_mul,
+            false,
+        ))))
     }
 
     fn skew_of(&self, wall: i64, boot: u64) -> i64 {
@@ -923,11 +1021,11 @@ mod tests {
         assert_ne!(a.id(), b.id());
     }
 
-    /// Expectation: the rate budget is kept as given and, in this commit,
-    /// changes no reading: a budgeted clock reads exactly as an unbudgeted
-    /// one (plan 43 C7a commit 1; the readings use it from commit 2).
+    /// Expectation: the rate budget is kept as given (up to the clamp) and
+    /// scales the readings: a budgeted clock's WAIT runs slow and its HONOUR
+    /// fast by the budget, an unbudgeted one's read RAW as it is.
     #[test]
-    fn the_rate_budget_is_stored_and_not_yet_read() {
+    fn the_rate_budget_scales_the_readings() {
         let (s, c) = stub();
         assert_eq!(c.rate_budget_ppm(), 0);
         let budgeted = ProtocolClock::with_id(s.clone(), 8, 1_000);
@@ -936,12 +1034,253 @@ mod tests {
             ProtocolClock::new(s.clone(), 2_000).rate_budget_ppm(),
             2_000
         );
+        assert_eq!(
+            ProtocolClock::new(s.clone(), 9_000_000).rate_budget_ppm(),
+            MAX_RATE_BUDGET_PPM
+        );
         let (a, b) = (c.now(), budgeted.now());
-        tick(&s, 5_000);
+        tick(&s, 100_000);
         let (a2, b2) = (c.now(), budgeted.now());
-        assert_eq!(a2.wait.0 - a.wait.0, b2.wait.0 - b.wait.0);
-        assert_eq!(a2.honour.0 - a.honour.0, b2.honour.0 - b.honour.0);
+        assert_eq!(a2.wait.0 - a.wait.0, 100_000);
+        assert_eq!(a2.honour.0 - a.honour.0, 100_000);
+        // 100 s of RAW: 99 900.09 ms of WAIT, 100 100.1 ms of HONOUR.
+        assert_eq!(b2.wait.0 - b.wait.0, 99_900);
+        assert_eq!(b2.honour.0 - b.honour.0, 100_100);
         assert_eq!(s.boot_id(), 0);
+    }
+
+    /// Expectation: budget 0 reads exactly as C7-H1's clock did (the formula
+    /// of the module doc without `rho`), over random samples, steps and
+    /// suspends: the identity the simulator's sweeps rely on.
+    #[test]
+    fn a_zero_budget_reads_exactly_as_before() {
+        let (s, c) = stub();
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let (wall0, raw0) = (START, 7_000 * MS as i128);
+        let diff0 = (5_000 - 9_000) as i128;
+        let (mut susp_max, mut jump) = (0i128, 0i128);
+        for _ in 0..5_000 {
+            let real = rnd(40_000_000_000); // ns
+            let susp = if rnd(8) == 0 { rnd(30_000) } else { 0 };
+            s.raw.fetch_add(real, Ordering::SeqCst);
+            s.mono.fetch_add(real, Ordering::SeqCst);
+            s.boot.fetch_add(real + susp * MS, Ordering::SeqCst);
+            s.wall
+                .fetch_add((real / MS) as i64 + susp as i64, Ordering::SeqCst);
+            if rnd(6) == 0 {
+                step(&s, rnd(20_000) as i64 - 8_000);
+            }
+            let n = c.now();
+            let r = s.read();
+            let e_raw_ms = (r.raw_ns as i128 - raw0) / MS as i128;
+            let diff = (r.boot_ns as i128 - r.mono_ns as i128) / MS as i128;
+            susp_max = susp_max.max(diff - diff0);
+            let e_h = e_raw_ms + susp_max;
+            jump = jump.max(r.wall_ms as i128 - wall0 as i128 - e_h);
+            assert_eq!(n.wait.0 as i128, wall0 as i128 + e_raw_ms);
+            assert_eq!(n.honour.0 as i128, wall0 as i128 + e_h + jump);
+        }
+    }
+
+    /// Real time and an oscillator that runs at `1 + r` of it (one rate per
+    /// segment), over a stub: `advance` moves every source as the host's
+    /// would, and reports the real time that passed.
+    struct Osc {
+        s: Arc<Stub>,
+        rate_ppm: i64,
+    }
+
+    impl Osc {
+        /// `real` ms of real time, then `susp` ms of suspend (RAW and MONO
+        /// stand still, BOOT and WALL go on), BOOT and MONO slewed by
+        /// `slew_ppm` and the WALL by `wall_slew_ppm` over the first (as a
+        /// time daemon does).
+        fn advance(&self, real: u64, susp: u64, slew_ppm: i64, wall_slew_ppm: i64) {
+            let osc = |ms: u64, ppm: i64| (ms as i128 * (1_000_000 + ppm as i128)) as u64;
+            let raw = osc(real, self.rate_ppm); // ns
+            let slewed = |ms: u64| osc(ms, slew_ppm);
+            self.s
+                .boot
+                .fetch_add(slewed(real) + susp * MS, Ordering::SeqCst);
+            self.s.mono.fetch_add(slewed(real), Ordering::SeqCst);
+            self.s.raw.fetch_add(raw, Ordering::SeqCst);
+            self.s.wall.fetch_add(
+                (real as i128 * (1_000_000 + wall_slew_ppm as i128) / 1_000_000) as i64
+                    + susp as i64,
+                Ordering::SeqCst,
+            );
+        }
+    }
+
+    /// One random history, over an oscillator within 1 000 ppm of real
+    /// time, on a clock budgeted `budget` ppm: every pair of
+    /// consecutive readings is checked. Returns how many intervals had
+    /// HONOUR short of the real elapsed time and how many had WAIT beyond
+    /// it (a millisecond of rounding allowed).
+    fn violations(seed: u64, budget: u32) -> (usize, usize, usize) {
+        // The oscillator is always within 1 000 ppm; the clock's budget varies.
+        const RHO: i64 = 1_000;
+        let s = Arc::new(Stub::default());
+        s.wall.store(START, Ordering::SeqCst);
+        s.boot.store(5_000 * MS, Ordering::SeqCst);
+        s.raw.store(7_000 * MS, Ordering::SeqCst);
+        s.mono.store(9_000 * MS, Ordering::SeqCst);
+        let c = ProtocolClock::with_id(s.clone(), 7, budget);
+        let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut rnd = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let mut osc = Osc {
+            s: s.clone(),
+            rate_ppm: 0,
+        };
+        let (mut honour_short, mut wait_over, mut checked) = (0, 0, 0);
+        let mut prev = c.now();
+        for i in 0..2_000 {
+            if i % 40 == 0 {
+                // A new segment: the extremes of the budget half the time.
+                let b = RHO;
+                osc.rate_ppm = match rnd(4) {
+                    0 => -b,
+                    1 => b,
+                    _ => rnd(2 * b as u64 + 1) as i64 - b,
+                };
+            }
+            let real = 1 + rnd(5_000);
+            let susp = if rnd(12) == 0 { rnd(60_000) } else { 0 };
+            // The slews of boot+mono and of the wall: up to 8.3 %.
+            let slew = rnd(166_001) as i64 - 83_000;
+            let wall_slew = rnd(166_001) as i64 - 83_000;
+            osc.advance(real, susp, slew, wall_slew);
+            if rnd(20) == 0 {
+                step(&s, rnd(20_000) as i64 - 10_000);
+            }
+            let now = c.now();
+            // The real time that passed (suspend counts for HONOUR).
+            let (dh, dw) = (now.honour.since(prev.honour), now.wait.since(prev.wait));
+            checked += 1;
+            if dh + 1 < (real + susp) as i64 {
+                honour_short += 1;
+            }
+            if dw > real as i64 + 1 {
+                wait_over += 1;
+            }
+            prev = now;
+        }
+        (honour_short, wait_over, checked)
+    }
+
+    /// Expectation (P2, P3, plan 43 C7a): for an oscillator anywhere within
+    /// the budget (a rate per segment of 40 readings, the extremes often),
+    /// with suspends, boot and mono slewed together up to 8.3 %, the wall
+    /// slewed and stepped, no pair of consecutive readings has HONOUR short
+    /// of the real elapsed time or WAIT beyond it (a millisecond of
+    /// rounding). Fail-before: the same histories on a clock with no budget
+    /// (C7-H1's readings) violate both, so the test is not vacuous.
+    #[test]
+    fn honour_never_undercounts_and_wait_never_overcounts_within_the_budget() {
+        let (mut short0, mut over0) = (0, 0);
+        for seed in 1..=2_000u64 {
+            let (short, over, n) = violations(seed, 1_000);
+            assert_eq!(n, 2_000);
+            assert_eq!((short, over), (0, 0), "seed {seed}");
+            if seed <= 100 {
+                let (s0, o0, _) = violations(seed, 0);
+                short0 += s0;
+                over0 += o0;
+            }
+        }
+        assert!(
+            short0 > 0 && over0 > 0,
+            "the unbudgeted clock should violate: honour short {short0}, wait over {over0}"
+        );
+    }
+
+    /// Expectation: `sleep_ms_for_wait(after)` of real time advances WAIT
+    /// by `after` ms or more on an oscillator that runs true or fast (a
+    /// slow one wakes the handler early, which re-arms), and costs the
+    /// stretch only: `after * (1 + rho)` rounded up.
+    #[test]
+    fn sleep_ms_for_wait_reaches_the_deadline() {
+        for budget in [0u32, 1_000, 2_000, 80_000] {
+            for rate in [0i64, budget as i64 / 2, budget as i64] {
+                for after in [1u64, 999, 20_000, 60_000] {
+                    let s = Arc::new(Stub::default());
+                    s.wall.store(START, Ordering::SeqCst);
+                    let c = ProtocolClock::with_id(s.clone(), 7, budget);
+                    let osc = Osc {
+                        s: s.clone(),
+                        rate_ppm: rate,
+                    };
+                    let before = c.wait();
+                    // The sleep's real time, with a ms of timer granularity.
+                    osc.advance(c.sleep_ms_for_wait(after), 0, 0, 0);
+                    let got = c.wait().since(before);
+                    assert!(
+                        got + 1 >= after as i64,
+                        "budget {budget} rate {rate} after {after}: WAIT advanced {got}"
+                    );
+                    if rate == budget as i64 && after >= 20_000 {
+                        assert!(got >= after as i64, "{budget} {after}: {got}");
+                    }
+                }
+            }
+        }
+        let c = ProtocolClock::with_id(Arc::new(Stub::default()), 7, 1_000);
+        assert_eq!(c.sleep_ms_for_wait(0), 0);
+        assert_eq!(c.sleep_ms_for_wait(20_000), 20_020);
+        assert_eq!(c.sleep_ms_for_wait(1), 2);
+        assert_eq!(c.sleep_ms_for_wait(u64::MAX), u64::MAX);
+        let zero = ProtocolClock::with_id(Arc::new(Stub::default()), 7, 0);
+        assert_eq!(zero.sleep_ms_for_wait(12_345), 12_345);
+    }
+
+    /// Timing, not an assertion (`cargo test --release -p constellation-types
+    /// reading_cost -- --ignored --nocapture`): what one reading costs over
+    /// sources that cost nothing (four atomic loads), so the scaling's cost
+    /// (one `u128` multiply per elapsed term) can be compared between trees.
+    #[test]
+    #[ignore = "timing"]
+    fn reading_cost() {
+        let (s, _) = stub();
+        let c = ProtocolClock::with_id(s.clone(), 9, 1_000);
+        let n = 5_000_000u32;
+        for round in 0..3 {
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                tick(&s, 1);
+                std::hint::black_box(c.now());
+            }
+            let now = t.elapsed();
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                tick(&s, 1);
+                std::hint::black_box(c.honour());
+            }
+            let honour = t.elapsed();
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                tick(&s, 1);
+                std::hint::black_box(c.wait());
+            }
+            let wait = t.elapsed();
+            let per = |d: std::time::Duration| d.as_nanos() as f64 / n as f64;
+            eprintln!(
+                "round {round}: now() {:.1} ns, honour() {:.1} ns, wait() {:.1} ns",
+                per(now),
+                per(honour),
+                per(wait)
+            );
+        }
     }
 
     /// Expectation: a thread descheduled between the wall read and the

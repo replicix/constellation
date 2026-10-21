@@ -105,8 +105,9 @@ pub struct Config {
     /// Plan 43 C7a: the bound on this node's oscillator rate error, in ppm
     /// (the protocol clock's `rate_budget_ppm`; 0: none budgeted). The
     /// engine sets it from the process's clock, the simulation from
-    /// `SimConfig::rate_budget_ppm`. Commit 1 of C7a only carries it; the
-    /// beat cap's span and the status read it from commit 2.
+    /// `SimConfig::rate_budget_ppm`. The clock itself scales its readings
+    /// by it; the core reads it for the beat cap's span
+    /// ([`Core::beat_cap_span_ms`]).
     pub clock_rate_budget_ppm: u32,
     pub partition: String,
     /// `LeaseMode::SingleWriter`: no `If-Match`; takeover from another

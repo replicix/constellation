@@ -139,20 +139,27 @@
 //!    read) are invisible to S, and H answers within `W` of any of them.
 //! 3. *The beat links the clocks.* A beat says H's wait clock read `sent`
 //!    no later than S's clock read `at` (its arrival stamp, on S's wait
-//!    clock: `sent` < real send < real arrival ≤ `at`). The holder's
-//!    obligations (its own grants) end in real time no later than
-//!    `(X − sent)(1 + ρ)/(1 − ρ)` real ms after `sent` — H's wait clock
-//!    never over-counts, so it takes at least that long to read `X` — and
-//!    S's wait clock runs at least `1 − ρ` per real ms, so S's clock reading
-//!    `at + (X − sent) + M` is after H's grants ended as long as
-//!    `2ρ(X − sent) < M`: beats sent within `250·M` of `X` only
-//!    (`2ρ·250·M = M/2` at ρ = 1 000 ppm). A difference on H's clock plus a
-//!    stamp of S's: rate-only, no offset, and **no wall step of H in either
-//!    direction**: the wait clock ignores both, so `sent`, the lease's end
-//!    (`Lease::holder_wait_ms`, written at each renewal) and the guard stay
-//!    consistent however H's wall clock moved between its last renewal and
-//!    the seal. Every term is of one holder clock: S
-//!    keeps `lags`, `named_max` and `guard_max` per clock id (a restarted H is
+//!    clock: `sent` < real send < real arrival ≤ `at`). Each node's wait
+//!    clock advances at most real time (P3: the rate budget `ρ` is in the
+//!    readings, per node), which makes the cap exact for a beat sent *after*
+//!    the renewal that set `X`: H's windows end at most `ttl` real ms after
+//!    that renewal, the real interval renewal → `sent` is at least
+//!    `sent − renew` on H's wait clock, so they end at most `X − sent` real
+//!    ms after `sent`, and S's wait clock cannot read `at + (X − sent) + M`
+//!    sooner. For a beat sent *before* that renewal `X − sent` is
+//!    `(renew − sent) + ttl`, and H's wait clock may have under-counted that
+//!    past interval `sent → renew` by up to `2ρ·(renew − sent)` (it
+//!    advances at `(1 − ρ)/(1 + ρ)` of real at the slowest): the cap can be
+//!    early by that much, so such a beat is used only within `M/(4ρ)` of
+//!    `X` (`2ρ·span ≤ M/2`:
+//!    [`Core::beat_cap_span_ms`]; `250·M` at the defaults, no limit at
+//!    ρ = 0).
+//!    A difference on H's clock plus a stamp of S's: rate-only, no offset,
+//!    and **no wall step of H in either direction**: the wait clock ignores
+//!    both, so `sent`, the lease's end (`Lease::holder_wait_ms`, written at
+//!    each renewal) and the guard stay consistent however H's wall clock
+//!    moved between its last renewal and the seal. Every term is of one
+//!    holder clock: S keeps `lags`, `named_max` and `guard_max` per clock id (a restarted H is
 //!    a new process, a new clock; at most two ids), takes the latest
 //!    `X_c + min lag_c` over them, and puts the replaced lease's own wait-clock
 //!    end in `X` of the id that wrote it (`holder_clock`), never its wall
@@ -182,7 +189,7 @@
 //! seal watch counts the plain arrival too, `sent` being a reading of H's
 //! wait clock, opaque here). And never the lease's expiry compared with S's
 //! clock. No beat, a beat of
-//! another holder or epoch, or none sent within `250·M` of `X`: the bound.
+//! another holder or epoch, or none sent within `M/(4ρ)` of `X`: the bound.
 //! The floor and the beats are in memory (plan 43 Appendix B rows 14 and
 //! 27): a successor that restarted waits the bound.
 //!
@@ -676,10 +683,6 @@ const BEAT_CLOCKS_KEPT: usize = 2;
 /// of a fast takeover's floor (about 19 s of beats at the default
 /// interval; the cap needs only the recent ones).
 const BEAT_LAGS_KEPT: usize = 64;
-
-/// How many expiry margins before the instant a cap counts to a beat may
-/// have been sent to be used for it (`2ρ·250·M ≤ M/2` at ρ = 1 000 ppm).
-const BEAT_CAP_SPAN_MARGINS: i64 = 250;
 
 /// How many early `StreamAhead` batches a subscriber keeps.
 const AHEAD_WAITING_MAX: usize = 32;
@@ -1214,14 +1217,30 @@ impl Core {
         self.ack.pending_cap = cap.filter(|_| prev.granted_delegations);
     }
 
+    /// How far before `X` (the end a beat cap counts from) a beat may have
+    /// been sent to be used for the cap, ms (plan 43 C7a): `M·1e6/(4ρ)` for
+    /// the node's rate budget `ρ` in ppm, so that the error `2ρ·(X − sent)`
+    /// of a beat sent before the renewal that set `X` stays under `M/2`
+    /// (the module doc, step 3). 250·M at the default budget; no limit when
+    /// the budget is 0.
+    pub(crate) fn beat_cap_span_ms(&self) -> i64 {
+        let rho = self.cfg.clock_rate_budget_ppm as i64;
+        if rho == 0 {
+            return i64::MAX;
+        }
+        let margin = self.cfg.expiry_margin_ms as i128;
+        (margin * 1_000_000 / (4 * rho as i128)).min(i64::MAX as i128) as i64
+    }
+
     /// Plan 43 C7-F F-a: where the lease of `prev`'s tenure ends on this
     /// node's wait clock, as that tenure's beats at `prev.epoch` placed it,
     /// plus one expiry margin (see the module doc, "The delegation horizon
     /// across a fast failover"): `X + min(at − sent) + M`, with `X` the
     /// latest of the replaced lease's end (`Lease::holder_wait_ms`), the
     /// ends the beats named and the guards they named, all on the holder's
-    /// **wait** clock, over the beats sent within `250·M` of `X` (so the
-    /// rate error `2ρ·(X − sent)` stays under `M/2`). `None`: no beat of
+    /// **wait** clock, over the beats sent within [`Core::beat_cap_span_ms`]
+    /// of `X` (so the rate error `2ρ·(X − sent)` of a beat sent before the
+    /// renewal that set `X` stays under `M/2`). `None`: no beat of
     /// that tenure heard, none that recent, or one named an unknown guard
     /// (the holder's own takeover gate was pending: what it waited out was
     /// not known yet).
@@ -1244,7 +1263,7 @@ impl Core {
             return None;
         }
         let margin = self.cfg.expiry_margin_ms as i64;
-        let span = BEAT_CAP_SPAN_MARGINS.saturating_mul(margin);
+        let span = self.beat_cap_span_ms();
         let mut cap: Option<i64> = None;
         let mut named_clock_placed = false;
         for (clock, agg) in &b.clocks {

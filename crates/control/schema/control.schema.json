@@ -751,13 +751,19 @@
           "type": "integer"
         },
         "honour_ahead_ms": {
-          "description": "How far the honour clock runs ahead of the wall clock (ms): what\nforward steps and wall slewing added. Never negative.",
+          "description": "How far the honour clock runs ahead of the wall clock (ms): what\nforward steps and wall slewing added, and the rate budget (plan 43\nC7a: the honour clock runs fast by `rate_budget_ppm` of the uptime,\n86 s a day at 1 000 ppm). Never negative.",
           "format": "int64",
           "type": "integer"
         },
         "last_step_ms": {
           "description": "The last step, signed (ms); 0 when none was seen.",
           "format": "int64",
+          "type": "integer"
+        },
+        "rate_budget_ppm": {
+          "description": "Plan 43 C7a: the bound on this node's oscillator rate error the\nprotocol clocks budget, in ppm: 1 000 on Linux, Android, macOS and\niOS (an unslewed rate source), 2 000 elsewhere\n(`CONSTELLATION_CLOCK_RATE_BUDGET_PPM` overrides it, for testing).",
+          "format": "uint32",
+          "minimum": 0,
           "type": "integer"
         },
         "rejected_stamps": {
@@ -790,7 +796,7 @@
           "type": "integer"
         },
         "wait_behind_ms": {
-          "description": "How far the wait clock runs behind the wall clock (ms; negative if\nit is ahead): what steps and wall slewing left between them.",
+          "description": "How far the wait clock runs behind the wall clock (ms; negative if\nit is ahead): what steps and wall slewing left between them, and the\nrate budget (the wait clock runs slow by `rate_budget_ppm` of the\nuptime).",
           "format": "int64",
           "type": "integer"
         }
@@ -804,7 +810,8 @@
         "stepped_ms_total",
         "last_step_ms",
         "honour_ahead_ms",
-        "wait_behind_ms"
+        "wait_behind_ms",
+        "rate_budget_ppm"
       ],
       "type": "object"
     },
