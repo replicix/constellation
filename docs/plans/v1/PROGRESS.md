@@ -55617,9 +55617,10 @@ are recorded per run).
 | Cache stamp, pending data notifications, `undelivered` (K2) | landed | `crates/vfs/src/{types,events}.rs`, `crates/meta/src/store/{reads,mod,spec,held}.rs`, `crates/engine/src/{kernel_inval,view/kernel_cache,view/ops,view/flush}.rs` |
 | Conditional keep-cache (K3) | landed | `crates/frontend-fuse/src/{pagecache,reply,notify,adapter,workarounds}.rs` |
 | Write-race repair (K4) | landed | `crates/frontend-fuse/src/{pagecache,repair,reply,adapter}.rs` |
-| Directory attributes (K5) | landed; bounded-mode default pending Q1 (`entry` meanwhile) | `crates/frontend-fuse/src/{reply,adapter,notify,workarounds}.rs`, `crates/vfs/src/vfs.rs` |
+| Directory attributes (K5) | landed; bounded-mode default `entry` (Q1 decided: option B) | `crates/frontend-fuse/src/{reply,adapter,notify,workarounds}.rs`, `crates/vfs/src/vfs.rs` |
 | Detection, status, docs (K6) | landed | `crates/frontend-fuse/src/kernel_fixes.rs`, `kernel_fixes/probe.rs`, `crates/control/src/proto/types.rs`, `docs/reference/features/kernel-cache-coherence.md`, `docs/explanation/DECISIONS.md` |
-| Campaigns, xcheckfs, benchmarks (K7) | — | |
+| W3b's notice narrowed in bounded mode (F21) | landed (replaces an interim "off in bounded mode") | `crates/frontend-fuse/src/{attrwatch,reply,pagecache}.rs` |
+| Campaigns, xcheckfs, benchmarks (K7) | partly: §7.4 reduced, §7.3 shorter than planned, §8 request counts only, §7.5 not run; §8.1 run (Q1 decided), F21's cost measured | `bench/kernel-races/RESULTS.md` |
 
 ### K1: base counts (fail-before)
 
@@ -55651,3 +55652,395 @@ The K1 build (`80a4e3d` plus K1 only), 60 s per scenario (the `dir-*` rows
 round whose own path walk refreshed the attributes first. The workloads
 work on `O_PATH` descriptors (no path walk) since a first version that
 walked the path showed 13–16/20.
+
+### Results: base against final
+
+The final build (the plan's commits on `origin/main` `516f82e`), 60 s per
+race row, seed 42, on the same host (1-minute load average 45–130 during
+the run: other campaigns shared it). Base: the K1 table above.
+
+| Scenario | Base (uring / dev_fuse) | Final (uring / dev_fuse) |
+|---|---|---|
+| `kernel-race-open` | stale 1007 / 369 | stale 0 / 0; `keep_cache_opens` 160 048 / 549 398 |
+| `kernel-race-open-repair` | stale 996 / 334 | stale 0 / 0; repairs 2359 / 2288, `repairs_late` 0 / 0 (released on the tail page: 369 / 433) |
+| `kernel-race-open-repair-delay` | stale 3281 / 1531 | stale 0 / 0; repairs 1469 / 1320, late 0 / 0 |
+| `kernel-race-notify` | stale 314 / 229 | stale 0 / 0; repairs 339 / 299, late 0 / 0 |
+| `kernel-race-notify-foreign` | stale 0 / 0 | stale 0 / 0; no repair after the start-up |
+| `kernel-race-unseen-drop` | stale 0 / 0 (`fadvise` alone, F19) | `stale_after_reopen` 0 / 0 (stale reads 66 / 0, allowed: R1) |
+| `kernel-race-unseen-drop`, naive keep-cache (ignores S5) | — | **fail-before**: `stale_after_reopen` 57 (of 111) / 1 (of 3) |
+| `kernel-race-cfr` | corrupt 0 / 0 | corrupt 0 / 0, stale 0 / 0 |
+| `kernel-race-strict` | stale 1112 / 431 | stale 0 / 0; no open kept pages |
+| `kernel-race-handover` | stale 354 | stale 0 |
+| `kernel-race-handover-keep` | stale 362 | stale 0; an open drops after each resume, `keep_cache_opens` 134 501 |
+| `kernel-race-uncommitted`, `-local`, `-lapse`, `kernel-race-discard-local` | differing 0 (every open drops) | differing 0; **fail-before** with the uncommitted-session invalidation removed from the final build: 30 / 30 / 30 / 30 (one per failed publication) |
+| `kernel-race-other-view` | stale 0 | stale 0, `keep_cache_opens` 200 |
+| `kernel-race-dir-nlink` (`zero`) | mismatches 89 / 42 | 0 / 0 |
+| `kernel-race-dir-version` (TTL `auto`=`entry`, and `entry`; W3b forced on) | 19, 19 / 20, 20 of 20 | 0, 0 / 0, 0 of 20 |
+| `kernel-race-rename-ctime` (W3b forced on) | 19 / 20 of 20 | 0 / 0 |
+| `kernel-race-dir-version-remote` | 0 / 0 | 0 / 0 |
+| `kernel-race-dir-ttl-strict-lone` | mismatches 79 / 56 | 0 / 0 |
+
+`repairs_late` was 0 in every run since F18's correction (31 runs before
+the rebase, 33 after it). The worst case for W2 is what it costs: with
+every open dropping and a reader beside the writers
+(`kernel-race-open-repair`), each write that may have raced a drop waits
+for its repair, and the run's writes fell from about 1.5 million to
+about 35 000 per minute (`uring`; on a host 5–10 times as loaded as the
+base run's). With keep-cache on (the default) the same workload's opens
+keep the pages and repairs are rare (`kernel-race-open`: 0 / 2).
+
+After F21's commit, on its build (deadlines scaled for the host's load):
+`kernel-race-dir-version` (both TTLs, both transports), `-rename-ctime`
+(both transports), `-dir-ttl-strict-lone`, `-dir-version-remote`,
+`-dir-nlink`, `-open`, `-open-repair`: passed, 0 stale.
+
+### Re-run on the final stack (`4987b00` plus the plan's commits, Linux 7.3)
+
+All 33 `kernel-race-*` rows, 60 s each, seed 42, both transports, one
+at a time on the build box (1-minute load 5 to 15 from other work). The
+base is `4987b00` plus K1 only (the scenarios and fault points). W3b was
+`auto`, i.e. narrowed (F21), in every `dir-*` and `rename-ctime` row.
+
+| Scenario | Base (uring / dev_fuse) | Final (uring / dev_fuse) |
+|---|---|---|
+| `kernel-race-open` | stale 875 / 325 | stale 0 / 0; `keep_cache_opens` 1 721 115 / 2 552 642 |
+| `kernel-race-open-repair` | stale 919 / 301 | stale 0 / 0; repairs 4564 / 4583, `repairs_late` 0 / 0 |
+| `kernel-race-open-repair-delay` | stale 3908 / 1917 | stale 0 / 0; repairs 3232 / 2271, late 0 / 0 |
+| `kernel-race-notify` | stale 899 / 633 | stale 0 / 0; repairs 963 / 912, late 0 / 0 |
+| `kernel-race-notify-foreign` | stale 0 / 0 | stale 0 / 0 |
+| `kernel-race-unseen-drop` | stale 0 / 0 | `stale_after_reopen` 0 / 0 (stale reads 17 / 7, allowed: R1) |
+| `kernel-race-unseen-drop`, naive keep-cache (`CONSTELLATION_HARNESS_NAIVE_KEEP_CACHE=1`) | — | **fail-before**: `stale_after_reopen` 23 / 2, rc 1 |
+| `kernel-race-cfr` | corrupt 0 / 0 | corrupt 0 / 0, stale 0 / 0 |
+| `kernel-race-strict` | stale 1396 / 438 | stale 0 / 0; no open kept pages |
+| `kernel-race-handover`, `-handover-keep` | stale 386, 355 | stale 0, 0 |
+| `kernel-race-uncommitted`, `-local`, `-lapse`, `kernel-race-discard-local`, `kernel-race-other-view` | differing 0 (every open drops here) | differing 0 |
+| `kernel-race-dir-nlink` (`zero`) | mismatches 239 / 103 | 0 / 0 |
+| `kernel-race-dir-version` (TTL `auto` and `entry`) | 17, 19 / 20, 20 of 20 | 0, 0 / 0, 0 of 20; notices 20, skipped 40 |
+| `kernel-race-rename-ctime` | 18 / 20 of 20 | 0 / 0; notices 20, skipped 38 |
+| `kernel-race-dir-version-remote` | 0 / 0 | 0 / 0 |
+| `kernel-race-dir-ttl-strict-lone` | mismatches 253 / 129 | 0 / 0 |
+
+The base fails exactly the rows the plan says it must (rc 1); the final
+build passes all 33 and the naive keep-cache fails its row. The
+uncommitted-session rows' fail-before is K2's event removed (K2 commit
+message), as before.
+
+### F21 results: the narrowed notice against none (`CONSTELLATION_FUSE_DIR_CHANGE_NOTIFY=off`)
+
+ABBA-interleaved on ext4, xfs and btrfs partitions and tmpfs, directory TTL
+`entry`, a tree of 55 052 files, a fresh mount per sample; `bench/kernel-races/RESULTS.md`
+has the method and every cell. Requests are `node.status` `vfs_ops`; the
+narrowed notice sends the same as `off` (median +0.01 %, at most +0.4 %,
+within 100 requests), where a notice for every operation (`on`) adds one
+`GETATTR` per namespace operation (+5 000 in `untar`, `cp -a`, `rm -rf`;
++9 600 in 20 008 renames; +6 000 in 6 002 `mkdir`/`rmdir`). Wall
+ratios `auto`/`off` (median over the cells, host noise included): 1.01
+on the namespace workloads (24 cells, 0.69 to 1.16), 1.02 on the
+read-only ones (ext4, 16 cells, 0.97 to 1.12); an earlier build of the
+same code, without the live-mark shortcut, 1.06 (21 cells) and 1.00 (64
+cells over all four stores). The 2b scenarios above pass with 20 notices
+written and 38 to 40 skipped (they hold the `GETATTR` in the daemon across
+the change: the late reply writes the notice; the other path, a change
+finding a reply written but not installed, is covered by the wire and unit
+tests only).
+
+### Final-stack gates
+
+`cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets
+-- -D warnings` clean; `cargo test --workspace` excluding the model, release:
+3491 passed, 0 failed, 43 ignored (frontend-fuse, meta, cli, engine,
+control included); the model's tests (`--test-threads=2`): 203 passed, 0
+failed. The F21 tests fail on mutants: a reply that never writes its own
+notice (`a_reply_generated_across_a_change_is_preceded_by_its_notice`), a
+change that never finds a mark
+(`bounded_mode_notices_only_where_a_reply_may_still_be_on_its_way`), and
+marks never cleared by the task's next request (the two `attrwatch` unit
+tests). pjdfstest and the §7.3/§7.4 campaigns were not re-run on this
+stack.
+
+### Found implementing: where the plan was wrong, and what landed instead
+
+Each was stopped at, written down and corrected as below; none weakens a
+guarantee of the plan.
+
+- **F17 — two opens of one inode at once.** The kernel drops the pages
+  in the opener's context after reading the reply, at a time the daemon
+  does not see; a second open answered meanwhile with the same stamp
+  would keep, and its caller could read the very pages the first open is
+  about to drop (the stale ones that made it drop). Rule 4 of §5.1.2:
+  keep only once the last dropping open's drop is known complete — at
+  the first request carrying its handle (the kernel installs the
+  descriptor only after `fuse_finish_open`'s drop), its `RELEASE`, or
+  for overflow arms when no handle is left (`drop_in_flight` reason).
+- **F18 — the repair blocks on the writer's own page far more often
+  than §5.2.3 says.** Not only after an unseen drop: any drop between a
+  recorded read and the writer's copy of a *partial* page makes the
+  writer create that page not uptodate and hold its lock until the
+  reply, and the repair's invalidation of it waits for that lock — a
+  cycle the 1 s bound broke, so `kernel-race-open-repair` showed
+  `repairs_late` in most runs. Corrections: the request's last page is
+  invalidated last and on its own; while the lane is blocked on it alone
+  (`ops_in_flight` 0) for 100 ms the write is answered, the inode marked
+  S5 (`repairs_released`), and the repair completes after the reply
+  (the page holds the write's own bytes, not uptodate, never served);
+  and a completed whole-file drop (an open's, or a whole-file data
+  notification's) supersedes the reads recorded before it was announced
+  (they fetched folios it removed), which removes most hits. Since then
+  `repairs_late` is 0 in every run.
+- **F19 — memory reclaim, `fadvise(DONTNEED)` and `drop_caches` do not
+  drop a page a writer holds** on 7.3 (`mapping_evict_folio` skips a
+  folio with an elevated reference count, and the writer holds its
+  request's folios until the reply), so `kernel-race-unseen-drop`'s base
+  row (stale ≥ 1) is unattainable with `fadvise`. The scenario adds a
+  test-only drop the bookkeeping cannot see
+  (`CONSTELLATION_FAULT_UNSEEN_DROP_MS`: unannounced data notifications
+  of every written file), which does reproduce race 1; its fail-before
+  is the naive keep-cache (`CONSTELLATION_HARNESS_NAIVE_KEEP_CACHE=1`,
+  which ignores S5): 57 stale pages survived a reopen (111 stale reads)
+  on `uring`, 1 of 3 on `dev_fuse`; without the knob 0.
+- **F20 — a repair written in time arms nothing.** If A4 armed like any
+  drop, the next write after every repair would be a repair candidate,
+  chaining repairs; while the repaired write's reply is held no other
+  write-through write can have copied (inode lock) and the write is
+  already applied, so a repair completed before the reply completes no
+  arm. A late repair (after the bound) arms as before.
+- **F21 — W3b's notice costs a `GETATTR` per namespace operation**, not
+  "one 40-byte write" (§5.3.1, found by §8's benchmarks: `untar` and
+  `cp -a` of a 20 000-file tree sent 20 100–20 200 `GETATTR`s per phase
+  where the base sent 100–1 600, on every backing store). The kernel's
+  `fuse_dir_changed` invalidates only a directory's times, size and link
+  count; `FUSE_NOTIFY_INVAL_INODE` invalidates its whole attribute mask,
+  mode included, and with `default_permissions` the next path walk
+  through the directory refetches it (`fuse_permission`). A first
+  correction turned the notice off in bounded mode, which left 2b open
+  there; the maintainer decided (2026-10-21, with Q1) that it stays on
+  with a narrowed trigger, and that is what landed (a commit of its own,
+  `attrwatch.rs`): the notice is written for an inode only when a reply
+  carrying its attributes may still be uninstalled — one being generated
+  (the request took the namespace-change count when it arrived; if a
+  change of the inode was recorded since, the reply writes the notice
+  itself), or one answered to a task (the request's pid) that has sent no
+  attribute or namespace request since (a mark, cleared by that request,
+  by the notice, or after a second; a namespace operation notices the
+  inodes it changed that have a live mark). Under `--cto strict` it is
+  unconditional (the notice costs no request there). A single-threaded
+  `untar` or `cp -a` sends one notice for 5 224 operations. Cost
+  measured below (F21 results).
+- **The stamp covers mtime and ctime**, so an mtime-only `SETATTR`
+  changes it (K2's test list expected "unchanged"): its next open drops
+  once. A cost, never a stale page; the test pins the actual behaviour.
+- **Hook points (K2).** Q3's other-view invalidation is pushed where a
+  publication retires committed (`publish_inode`), which every one of
+  the three commit paths reaches (they are called only from
+  `flush_detached`); the stranding rollback is reported by a hook on
+  `Meta`, fed from `redo_row_tx`'s stranded branch (the before-image
+  keys) and fired after each pass commits — every `strand_*` pass and
+  `drop_held` included — rather than `Stranded` carrying records through
+  the authority's callers; the engine's `InFlight` carries the
+  invalidator instead of a new `FsDependencies` field. The plan's
+  conformance cases `strict_opens_answer_no_stamp` and
+  `a_foreign_change_is_pending_until_delivered` are engine unit tests
+  (`view::kernel_cache_tests`): the kit's targets have neither a strict
+  mode nor a second node.
+- **No stamp for a create of a new file or a scratch file**: the first
+  reopen of a new file drops once more (perf only).
+- **The kernel-fix probes run on a private in-memory FUSE mount** of
+  their own (`kernel_fixes::probe`), not a hidden file of a view: no
+  view state, no scratch path, nothing replicated, and the probe mount
+  has every workaround off so it cannot mask the races.
+- **`Renamed { moved, exchanged }` are `Option`s**: the engine reads
+  them by a lookup before the rename; a target that does not know answers
+  none (the frontend then tells only the parents).
+- **`kernel-race-dir-nlink` and `-dir-ttl-strict-lone` run with
+  `CONSTELLATION_FUSE_DIR_ATTR_TTL=zero`**: they test what W3a closes,
+  whatever the bounded default (`entry`, Q1) is.
+- **`kernel-race-handover-keep`**: the resumed session's table is seeded
+  with the handles the kernel still holds (§5.6), so the first open after
+  a resume drops for reason `suspect`, not `no_entry`; the scenario
+  checks that some open drops after each resume.
+- **`kernel-race-notify-foreign`**: `repairs` is per mount, and the
+  workload's own start (seven descriptors of the file opened at once,
+  each a drop the next may overlap) can cost a repair of that file; the
+  guard is "no repair after the start" (sampled at 3 s).
+- **K3 alone** would keep pages race 1 left stale beyond the next open
+  (S5 comes with K4). The K3 commit therefore marks S5 on every `WRITE`
+  (arrival and reply), which K4 replaces; K3's §7.2 column was not run
+  on its own commit (K4's build meets it: `keep_cache_opens` > 0, stale
+  0).
+
+### Review
+
+An independent review of the implementation and of the deviations above
+against the kernel source found no interleaving in which W1, W2 or W3b
+serve a stale page the base would not, except one, and two weaknesses;
+all three are fixed:
+
+- **H1**: the watchdog's answer at the bound marked S5 only when the
+  blocked notification later returned, so an open in between could keep
+  a page the repair had not dropped yet. Now marked before the reply
+  (`repair::tests::a_job_past_its_bound_is_answered_with_s5_already_set`,
+  fails with the mark moved back).
+- **M1**: a write's registration was made inside `WriteReply::done`, so
+  a reply dropped unanswered (a panic below) left a pending write and an
+  in-flight count behind: no integrity hole (every later claim marked
+  S5), but no repair of that inode again. Made where the request
+  arrives.
+- **M2**: under host load the 0001 probe could answer `Fixed` for a
+  notification thread that had simply not run, and the 0003 probe for a
+  held reply whose 1 s TTL expired before the read-back. `Fixed` now
+  needs the notification thread blocked in the kernel (`D`) at the
+  deadline, and the probe directory's attributes carry a 60 s TTL
+  (a read-back later than 30 s is `Unknown`).
+
+Open from the review (perf or doc only): the RELEASE of a failed
+`fuse_finish_open` completes an A1 arm for a drop that did not run
+(unreachable through the adapter's passthrough answers; documented);
+the rename's moved inode is read by a lookup before the rename, so a
+concurrent rename on another node can make the notice name the wrong
+inode (attribute-only); a `Plain`-only hit on the last page still takes
+the tail path; an entry created by a write or a drop counts its first
+size reply as a drop; a redo of a non-stranded row is assumed to restore
+identical content (not pinned by a test).
+
+Open, found in the last runs (keep-cache effectiveness, never a stale
+page): more than four dropping opens of one file outstanding at once
+(its first use by many threads, on a loaded host) leave an overflow arm
+that completes only when no handle of the file is left, so while a
+descriptor stays open every later open drops, as before plan 42
+(`kernel-race-open` on the F21 build: 10 kept opens of 12 056,
+`drop_in_flight` 11 729, where the run before it kept 160 048). A
+narrower overflow (the handles present when it was armed) would fix it.
+
+### Decisions
+
+- **Q1 (W3a in bounded mode): decided 2026-10-21, option B.** Both values
+  are implemented behind `CONSTELLATION_FUSE_DIR_ATTR_TTL`; `auto` is
+  `zero` under `--cto strict` (a lone sequencer included) and `entry` in
+  bounded mode: `zero` made warm `git status` 2.6 to 7.9 times and `make
+  -q` 2.8 to 4.2 times slower on ext4, xfs, btrfs and tmpfs (plan 42
+  §10, `bench/kernel-races/RESULTS.md`). The exposure is race 2a for
+  directories (one transient `stat` result, never data); W3b (narrowed in
+  bounded mode, F21) closes 2b in both, except for a reply the kernel
+  installs more than a second after it was generated (plan 42 §5.9 R10).
+- Q2–Q6 as decided in the plan: the in-flight-aware bound, 1 s
+  (`CONSTELLATION_FUSE_WRITE_REPAIR_WAIT_MS`); one data notification per
+  commit to the node's other views; Q4 not done; Q5 for upstream; Q6
+  probes for 0001 and 0003.
+
+### Proposed DESIGN text (CONVENTIONS rule 5, not applied)
+
+- §12 "Enabled by the FUSE API", the writeback-cache item becomes:
+  "**`FOPEN_KEEP_CACHE` across opens** (no writeback cache): an open
+  keeps the kernel's pages when it finds the file's committed content
+  unchanged since the kernel last dropped them and nothing since could
+  have left a page the view would not answer (plan 42); warm reopens
+  read at page-cache speed. The writeback cache stays a design of its
+  own (durability, `close`/`fsync`, mtime ownership)."
+- §6, kernel invalidation: "A namespace reply is preceded by an
+  attribute-only invalidation of the directories it changed and the
+  inodes it moved (Linux races 2b; in bounded mode only where an
+  attribute reply may still be on its way to the kernel, plan 42 F21); a
+  directory's attributes have no kernel lifetime under `--cto strict`."
+
+### Not run
+
+- **§7.5, a kernel with the fixes**: the test host has no `/dev/kvm` and
+  no QEMU, so the patch package's VM harness cannot run there. The
+  probes' `Fixed` path has therefore not run on a fixed kernel (the
+  table's parser and the verdict precedence are unit-tested); on the
+  unpatched 7.3 kernel both probes answer `not_fixed` (`source: probe`,
+  about 20 ms after the first mount).
+- **§8.1's quiet-host gate**: the measurement was run without it (co-tenant load 8 to 90), as ABBA interleaved samples; see RESULTS.md.
+
+### Campaigns, xcheckfs, benchmarks (K7)
+
+`bench/kernel-races/RESULTS.md` has the tables. In short:
+
+- **§7.4 (reduced)**: the six rows the plan names, both transports, one
+  seed, under CPU starvation (`hogs`), a half-CPU cgroup, 50 ms pauses
+  every 300 ms and memory pressure (the harness's
+  `CONSTELLATION_HARNESS_LOAD` injectors): 48 of 48 runs passed (three
+L1 runs first failed to start their daemon within 120 s and passed
+with the harness's deadlines scaled), `repairs_late` 0 in every one. Not run: ten seeds
+  per cell, the plan's 75 % memory hog (25 %: the host was shared).
+- **§7.3 xcheckfs** (ext4 primary, the final build before the review's
+  fixes as secondary, write-through and write-back; the stress lane with
+  an opener thread, and the race workloads through the lockstep mount
+  and directly on the Constellation mount. Results: no data mismatch attributed
+  to the secondary in any lane on the final build (base: 1 per mode);
+  the race-1 workload run directly on the mount: 0 stale reads on the
+  final build against 2446 / 640 on the base. Directory `st_nlink`
+  mismatches remain on the final build (17 direct, 4 + 1 through
+  xcheckfs; base 6–21 and 1–4): race 2a, open in bounded mode while
+  W3a's default is `entry` (Q1, decided); that build still had W3b on
+  for every operation, so 2b was closed there (the narrowed notice was
+  not part of those runs).
+  Also seen, not investigated: `mtime` mismatches of 1.2–6.4 s in the
+  stress lane (final 4 and 3, base 0 and 1), on a host whose metadata
+  commits took up to 17 s; and the final build's runs did far fewer
+  operations in the same time (the host's disk, both builds collapsed
+  alike when run side by side). Not run: 30 minutes per lane, xcheckfs
+  at its current head (its own stat-past-the-cache change would mask
+  the nlink race).
+- **§8**: reopen-read — passes 2 and 3 send no `READ` at all (10 000 on
+  the base) on every backing store; open latency and the multi-view
+  commit workload: request counts unchanged; untar and `cp -a`: F21
+  (fixed); fio and wall times: not conclusive on the saturated host
+  (indicative only). §8's acceptance ("no regression beyond noise on
+  every backing store") is **not established**: it needs §8.1's quiet
+  host.
+- **§7.5**: not run (no `/dev/kvm`, no QEMU).
+
+### Gates
+
+On the test host, `origin/main` `b4fe2e6` plus the plan's commits:
+
+- `cargo fmt --all -- --check` clean and `cargo clippy --workspace
+  --all-targets -- -D warnings` clean on each commit.
+- `cargo test --workspace --no-fail-fast` on the last: 3133 passed, 0
+  failed, 55 ignored (on `516f82e` before F21's commit: 3108, 0, 55).
+  An earlier full run under heavier load
+  failed `umount_drain` (2) and `addr_churn` (2), which pass on their
+  own (twice and once) and do not involve this plan's code; it also
+  failed three of this plan's own (the k8s lane's scenario list, and the
+  reference target running the cache-stamp conformance cases), fixed in
+  K1 and K2 (`Declared::cache_stamps`).
+- Conformance kit (`constellation-vfs --features conformance`, and the
+  engine target): green; the engine runs the four cache-stamp cases.
+- pjdfstest: 8798/8798 on `uring` and on `dev_fuse` (final build before
+  the review's fixes, run as root on the host with the suite image's
+  pjdfstest).
+- `tests/smoke.sh`, local backend and S3 (the harness's S3 emulator):
+  passed.
+- Harness: the 33 `kernel-race-*` rows (L0, above). The existing FUSE,
+  cache and lock rows (a selection of 41, of which 8 need root and ran separately: `baseline`, `two-clients-shared`,
+  `p2p-invalidation`, `cold-cache`, `kill9-remount`, `git-workflow`,
+  xattr/truncate/fallocate/append/create races, `git-under-flock*`,
+  `flock-cross-node`, the lock fence/release/lapse rows,
+  `fuse-inval-storm`, `cto-strict`, `cto-bounded`, `cto-strict-root`,
+  `visibility-after-burst`, `session-handover-idle`,
+  `upgrade-under-load`, `transport-cluster-locks-auto`,
+  `transport-lock-wait-budget`, `subtree-confinement`, `scratch-publish`,
+  `snapshot-mount`, `sqlite-two-nodes`, `stress-ng-fs`, `chaos-ci`):
+  passed, except one `cto-strict` run (one strict read answered degraded
+  under load; it passed twice on the final build afterwards, and twice
+  on the base). The eight `passthrough-*` and four `zero-copy-*` rows,
+  run as root: passed. Not run: the full `harness run` catalogue.
+
+### Exit criteria (plan 42 §11)
+
+- [x] K1, with `kernel-race-unseen-drop`'s base row not met (F19)
+- [x] K2
+- [x] K3 (its §7.2 column met by K4's build; the K3 commit carries an
+  interim S5 rule)
+- [x] K4
+- [x] K5: landed; bounded default of W3a `entry` (Q1), W3b narrowed in
+  bounded mode (F21)
+- [x] K6
+- [ ] K7: §7.4 reduced (one seed), §7.3 shorter and with nlink
+  mismatches left (2a in bounded mode), §7.5 not run, §8 not established
+  on wall times (request counts only; the F21 cost has its own ABBA
+  measurement)
+- [ ] Every CONVENTIONS gate: fmt, clippy, workspace tests, conformance,
+  pjdfstest 8798/8798, smoke, `stress-ng-fs` green; the full `harness
+  run` catalogue not run
