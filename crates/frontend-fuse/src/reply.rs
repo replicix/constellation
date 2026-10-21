@@ -102,6 +102,12 @@ impl Responder<Entry> for EntryReply {
             Err(e) => name.failed(|| reply.error(reply_code(e.code()))),
         }
     }
+
+    /// A parked op's reply holds one of its ring queue's lock-wait entries
+    /// (plan 43 C7-F F-c).
+    fn begin_wait(&mut self) -> constellation_vfs::WaitStart {
+        ring_wait(self.reply.hold_for_wait())
+    }
 }
 
 pub(crate) struct AttrReply(pub ReplyAttr);
@@ -112,6 +118,12 @@ impl Responder<Attr> for AttrReply {
             Ok(a) => self.0.attr(&a.ttl, &fuse_attr(&a)),
             Err(e) => self.0.error(reply_code(e.code())),
         }
+    }
+
+    /// A parked op's reply holds one of its ring queue's lock-wait entries
+    /// (plan 43 C7-F F-c).
+    fn begin_wait(&mut self) -> constellation_vfs::WaitStart {
+        ring_wait(self.0.hold_for_wait())
     }
 }
 
@@ -210,12 +222,18 @@ impl Responder<ReadData> for ReadReply {
             _ => self.reply.gather(data.segments()),
         }
     }
+
+    /// A parked read's reply holds one of its ring queue's lock-wait
+    /// entries (plan 43 C7-F F-c).
+    fn begin_wait(&mut self) -> constellation_vfs::WaitStart {
+        ring_wait(self.reply.hold_for_wait())
+    }
 }
 
 /// Plan 43 C7-F F-c review: whether a reply type can reserve one of its
 /// ring queue's `depth - 1` lock-wait entries when its op waits
-/// (`fuser::ReplyEmpty::hold_for_wait`; the vendored fuser has it on
-/// `ReplyEmpty` only). A parked op whose reply cannot is refused over a ring
+/// (`hold_for_wait`, which the vendored fuser has on every reply type a
+/// parked op answers with). A parked op whose reply cannot is refused over a ring
 /// (`adapter::Parkable`): holding its entry outside the budget let parked
 /// reads and writes fill a CPU's queue and stall every request on it.
 pub(crate) trait RingBudget {
@@ -231,12 +249,22 @@ macro_rules! ring_budget {
 ring_budget! {
     EmptyReply => true,
     RenameReply => true,
-    AttrReply => false,
-    EntryReply => false,
-    CreateReply => false,
-    OpenReply => false,
-    ReadReply => false,
-    WriteReply => false,
+    AttrReply => true,
+    EntryReply => true,
+    CreateReply => true,
+    OpenReply => true,
+    ReadReply => true,
+    WriteReply => true,
+}
+
+/// What a reply that waits over a ring answers to `begin_wait`: one of its
+/// queue's lock-wait entries taken (`hold_for_wait`), or none left.
+fn ring_wait(held: bool) -> constellation_vfs::WaitStart {
+    if held {
+        constellation_vfs::WaitStart::Held(None)
+    } else {
+        constellation_vfs::WaitStart::Refused
+    }
 }
 
 pub(crate) struct EmptyReply(pub ReplyEmpty);
@@ -253,11 +281,7 @@ impl Responder<()> for EmptyReply {
     /// queue's `depth - 1` that lock waits may hold
     /// ([`fuser::ReplyEmpty::hold_for_wait`]).
     fn begin_wait(&mut self) -> constellation_vfs::WaitStart {
-        if self.0.hold_for_wait() {
-            constellation_vfs::WaitStart::Held(None)
-        } else {
-            constellation_vfs::WaitStart::Refused
-        }
+        ring_wait(self.0.hold_for_wait())
     }
 }
 
@@ -292,11 +316,7 @@ impl Responder<()> for RenameReply {
     /// As [`EmptyReply`]'s: a parked rename holds one of the queue's
     /// lock-wait entries over a ring.
     fn begin_wait(&mut self) -> constellation_vfs::WaitStart {
-        if self.reply.hold_for_wait() {
-            constellation_vfs::WaitStart::Held(None)
-        } else {
-            constellation_vfs::WaitStart::Refused
-        }
+        ring_wait(self.reply.hold_for_wait())
     }
 }
 
@@ -380,6 +400,12 @@ impl Responder<Opened> for OpenReply {
             }
         }
     }
+
+    /// A parked op's reply holds one of its ring queue's lock-wait entries
+    /// (plan 43 C7-F F-c).
+    fn begin_wait(&mut self) -> constellation_vfs::WaitStart {
+        ring_wait(self.reply.hold_for_wait())
+    }
 }
 
 pub(crate) struct CreateReply {
@@ -454,6 +480,12 @@ impl Responder<(Entry, Opened)> for CreateReply {
             Err(e) => name.failed(|| reply.error(reply_code(e.code()))),
         }
     }
+
+    /// A parked op's reply holds one of its ring queue's lock-wait entries
+    /// (plan 43 C7-F F-c).
+    fn begin_wait(&mut self) -> constellation_vfs::WaitStart {
+        ring_wait(self.reply.hold_for_wait())
+    }
 }
 
 pub(crate) struct WriteReply(pub ReplyWrite);
@@ -464,6 +496,12 @@ impl Responder<u32> for WriteReply {
             Ok(n) => self.0.written(n),
             Err(e) => self.0.error(reply_code(e.code())),
         }
+    }
+
+    /// A parked op's reply holds one of its ring queue's lock-wait entries
+    /// (plan 43 C7-F F-c).
+    fn begin_wait(&mut self) -> constellation_vfs::WaitStart {
+        ring_wait(self.0.hold_for_wait())
     }
 }
 
