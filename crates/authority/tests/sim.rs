@@ -416,6 +416,7 @@ fn replay_seed() {
         Ok("locks-unlinked-delegated-hcrash-backup") => locks_unlinked_hcrash_config(true),
         Ok("locks-unlinked-delegated-dcrash") => locks_unlinked_dcrash_config(true),
         Ok("locks-unlinked-delegated-dcrash-nb") => locks_unlinked_dcrash_config(false),
+        Ok("locks-unlinked-delegated-dcrash-pause") => locks_unlinked_dcrash_pause_config(),
         Ok("locks-unlinked-delegated-random") => locks_unlinked_random_config(false),
         Ok("locks-unlinked-delegated-dbackup-random") => locks_unlinked_random_config(true),
         Ok("locks-unlinked-delegated-blips") => locks_unlinked_blips_config(),
@@ -4602,6 +4603,7 @@ fn sweep_config() {
         "locks-unlinked-delegated-hcrash-backup" => locks_unlinked_hcrash_config(true),
         "locks-unlinked-delegated-dcrash" => locks_unlinked_dcrash_config(true),
         "locks-unlinked-delegated-dcrash-nb" => locks_unlinked_dcrash_config(false),
+        "locks-unlinked-delegated-dcrash-pause" => locks_unlinked_dcrash_pause_config(),
         "locks-unlinked-delegated-random" => locks_unlinked_random_config(false),
         "locks-unlinked-delegated-dbackup-random" => locks_unlinked_random_config(true),
         "locks-unlinked-delegated-blips" => locks_unlinked_blips_config(),
@@ -9497,6 +9499,29 @@ fn locks_unlinked_dcrash_config(backup: bool) -> SimConfig {
     }
 }
 
+/// [`locks_unlinked_dcrash_config`] (with backups) after a pause of the
+/// root holder (node 1) at 0.559 s for 1.3 s: node 2 seals and takes the
+/// lease and crashes at once, and node 1 wakes still believing it is the
+/// root, appends a batch of delegate node 3's stream to its journal, then
+/// learns it is deposed and rebuilds. Dropping those rows left the
+/// generation's log index where the append had raised it, so when node 1
+/// took the root over again it inherited the generation past the rows it
+/// no longer had, and the delegate's re-stream skipped them.
+fn locks_unlinked_dcrash_pause_config() -> SimConfig {
+    let mut c = locks_unlinked_dcrash_config(true);
+    c.faults.insert(
+        0,
+        ScheduledFault {
+            at_ms: 559,
+            kind: FaultKind::Pause {
+                node: 1,
+                for_ms: 1_300,
+            },
+        },
+    );
+    c
+}
+
 /// The CI's two random faults, with or without delegate backups.
 fn locks_unlinked_random_config(backup: bool) -> SimConfig {
     let base = locks_unlinked_delegated_config();
@@ -9672,6 +9697,28 @@ fn regression_locks_unlinked_delegated_dbackup_random_seed_5681() {
         panic!(
             "locks-unlinked-delegated-dbackup-random seed 5681: {e}\n  replay with \
              AUTHORITY_SIM_CONFIG=locks-unlinked-delegated-dbackup-random"
+        )
+    });
+}
+
+/// `locks-unlinked-delegated-dcrash-pause` seed 558: the root holder was
+/// paused while node 2 (its backup, `d1`'s delegate) took the lease and
+/// crashed; woken
+/// and deposed, the old root had appended a batch of generation 2 (7..9)
+/// and a row of generation 1 (7) to its journal. The rebuild dropped them
+/// but left the generations' log indexes at 9 and 7, so retaking the root
+/// at epoch 3 it inherited the generations at those cursors and the
+/// delegate's re-stream skipped the rows: an unlink of `d2/f1` took effect
+/// in the log while the spec refused it there (`ENOENT`). Now a row that
+/// leaves the journal unshipped takes the index back below it
+/// (`local::retract_log_idx_tx` from `spec::strand_local_tx`), both in the
+/// store and in the session's stream, and the cursor is 6.
+#[test]
+fn regression_locks_unlinked_delegated_dcrash_pause_seed_558() {
+    run_seed(558, locks_unlinked_dcrash_pause_config()).unwrap_or_else(|e| {
+        panic!(
+            "locks-unlinked-delegated-dcrash-pause seed 558: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=locks-unlinked-delegated-dcrash-pause"
         )
     });
 }

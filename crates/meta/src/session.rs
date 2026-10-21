@@ -982,6 +982,20 @@ impl SessionState {
         self.cv.notify_all();
     }
 
+    /// The inverse of [`Self::note_stream`] for a root's journal append
+    /// that left the journal unshipped (a deposed root's rebuild, a
+    /// recall strand): stream `gen` goes back to `to`. Only lowered, and
+    /// only from what the store counted (`local::retract_log_idx_tx`);
+    /// no wake-up, lowering satisfies no wait.
+    pub fn retract_stream(&self, gen: u64, to: u64) {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(cur) = g.streams.get_mut(&gen) {
+            if *cur > to {
+                *cur = to;
+            }
+        }
+    }
+
     /// Plan 30 §M11: generation `gen` ended at `cut` (a `Recall` record
     /// applied): every dependency on it past the cut is void. The
     /// watermark is lowered to the cut; from here on a wait on the stream

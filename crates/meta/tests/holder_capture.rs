@@ -939,6 +939,144 @@ fn a_rebuild_keeps_the_outcomes_the_rebuilt_log_carries() {
     );
 }
 
+/// A root's appends of a delegate's stream count in the generation's log
+/// index (`log_stream_idx`, the session's stream) only while they are in
+/// its journal (`locks-unlinked-delegated-dcrash-pause` seed 558: a
+/// deposed root rebuilt, took the root over again and inherited the
+/// generation at a cursor past rows it had dropped, so they never
+/// reached the log). A rebuild that drops them takes both back below
+/// them — but not below what a segment carried, and a delegate's own
+/// rows were never counted there, so stranding them leaves both alone.
+#[test]
+fn a_rebuild_takes_back_the_stream_index_of_a_delegate_row_it_drops() {
+    use constellation_types::Code;
+    let gen = 5;
+    let delegate_rid = |seq| Rid {
+        node: 2,
+        incarnation: 1,
+        seq,
+    };
+    let create = LogRecord::Create {
+        parent: ROOT_INO,
+        name: "m".into(),
+        ino: (2 << 40) | 1,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        time_ns: 5,
+    };
+    let refused = LogRecord::Refused {
+        rid: delegate_rid(2),
+        code: Code::NotFound,
+    };
+    // The appends, as the authority's wrappers note them in the session.
+    let append = |meta: &Meta| {
+        assert!(meta
+            .apply_delegate_tx(
+                std::slice::from_ref(&create),
+                Some(delegate_rid(1)),
+                gen,
+                1,
+                constellation_meta::Position::ZERO
+            )
+            .unwrap());
+        meta.session().note_stream(gen, 1);
+        assert!(meta
+            .apply_delegate_tx(
+                std::slice::from_ref(&refused),
+                Some(delegate_rid(2)),
+                gen,
+                2,
+                constellation_meta::Position::ZERO
+            )
+            .unwrap());
+        meta.session().note_stream(gen, 2);
+    };
+
+    // Both appended, none shipped: a rebuild drops both.
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    append(&meta);
+    assert_eq!(meta.log_stream_idx(gen).unwrap(), 2);
+    assert_eq!(meta.session().stream_applied(gen), 2);
+    meta.set_holder_epoch(0);
+    meta.replace_ns_from_rebuilt(&Meta::open_in_memory().unwrap(), &Default::default())
+        .unwrap();
+    assert_eq!(meta.journal_len().unwrap(), 0);
+    assert_eq!(meta.log_stream_idx(gen).unwrap(), 0);
+    assert_eq!(meta.session().stream_applied(gen), 0);
+
+    // A segment carried index 1 first: only index 2 is taken back.
+    let meta = Meta::open_in_memory().unwrap();
+    let carried = [
+        create.clone(),
+        LogRecord::Completed {
+            rid: delegate_rid(1),
+        },
+    ];
+    meta.apply_segment_rows(
+        1,
+        1,
+        0,
+        &[1, 2],
+        &[(gen, 1), (gen, 1)],
+        &carried,
+        &TouchSet::default(),
+    )
+    .unwrap();
+    meta.session().note_stream(gen, 1);
+    meta.set_holder_epoch(2);
+    assert!(meta
+        .apply_delegate_tx(
+            std::slice::from_ref(&refused),
+            Some(delegate_rid(2)),
+            gen,
+            2,
+            constellation_meta::Position::ZERO
+        )
+        .unwrap());
+    meta.session().note_stream(gen, 2);
+    assert_eq!(meta.log_stream_idx(gen).unwrap(), 2);
+    meta.set_holder_epoch(0);
+    meta.replace_ns_from_rebuilt(&Meta::open_in_memory().unwrap(), &Default::default())
+        .unwrap();
+    assert_eq!(meta.journal_len().unwrap(), 0);
+    assert_eq!(meta.log_stream_idx(gen).unwrap(), 1);
+    assert_eq!(meta.session().stream_applied(gen), 1);
+
+    // A delegate's own rows were never counted: stranding them (a
+    // takeover's strand) leaves the index and the session as they were.
+    let meta = Meta::open_in_memory().unwrap();
+    let own = 7;
+    for (seq, name, ino) in [(1, "a", (3 << 40) | 1), (2, "b", (3 << 40) | 2)] {
+        let op = MutateOp::Create {
+            parent: ROOT_INO,
+            name: name.into(),
+            ino,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let (_, idx) = meta
+            .delegate_execute(
+                &op,
+                Some(rid(seq)),
+                own,
+                Default::default(),
+                &Default::default(),
+                Now::same(0),
+            )
+            .unwrap();
+        meta.session().note_stream(own, idx);
+    }
+    assert_eq!(meta.log_stream_idx(own).unwrap(), 0);
+    assert_eq!(meta.session().stream_applied(own), 2);
+    let stranded = meta.strand_for_takeover(2, &[own]).unwrap();
+    assert_eq!(stranded.locals, 2);
+    assert_eq!(meta.log_stream_idx(own).unwrap(), 0);
+    assert_eq!(meta.session().stream_applied(own), 2);
+}
+
 /// A one-chunk manifest of `len` bytes whose chunk hashes `tag`.
 fn one_chunk_manifest(tag: &[u8], len: u64) -> Vec<u8> {
     use constellation_fs_core::{ChunkHash, Manifest};

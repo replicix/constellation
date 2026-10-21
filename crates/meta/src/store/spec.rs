@@ -972,6 +972,23 @@ fn strand_local_tx(
     };
     let deps = stranded_local_deps(&*tx, meta, first, undone)?;
     let rows = local::journal_records(&*tx, meta, first, row.last)?;
+    // A delegate's row this root appended raised the generation's log
+    // index (`apply_delegate_tx`, `apply_adopted_records_from`; the
+    // session's stream with it). The row now leaves the journal without
+    // a segment carrying it (a deposed root's rebuild, a recall strand),
+    // so the log does not hold it: the next root that inherits the
+    // generation from this replica (`delegate.rs`: cursor =
+    // `log_stream_idx`) or a re-stream from here must start below it, or
+    // the row never reaches the log (locks-unlinked-delegated-dcrash-
+    // pause seed 558, pinned: the rebuilt, re-elected root skipped rows
+    // 7..9 of generation 2). A delegate's own row was never counted
+    // there and is left alone. Whatever order a generation's rows strand
+    // in, the lowest of them sets the index. As `forget_recent` below, the
+    // session side is in memory: a failed commit leaves it lower than the
+    // store, which only makes a wait, never an early execution.
+    if local::retract_log_idx_tx(tx, &meta.local, row.gen, row.idx)? {
+        meta.session.retract_stream(row.gen, row.idx - 1);
+    }
     for (seq, _) in &rows {
         tx.remove(&meta.journal_ks, seq.to_be_bytes().to_vec());
     }

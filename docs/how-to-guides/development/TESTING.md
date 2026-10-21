@@ -3353,7 +3353,13 @@ grants were dropped (`SWEEP-LATE-HANDBACK`); `locks-unlinked-delegated-partition
 seed 7455 (two exclusive holders after such an answer revived a lapsed
 grant) and seeds that take that path are pinned in
 `regression_locks_unlinked_delegated_partition_late_recall_answer`
-(unlinked-exclusion-7455). Load review F1, the token at the write, has
+(unlinked-exclusion-7455). `locks-unlinked-delegated-dcrash-pause` (sweep
+and replay) is `-dcrash` with the root holder paused at 0.559 s for 1.3 s,
+so that it wakes deposed after a delegate's batch reached its journal,
+rebuilds, and takes the root over again; seed 558 is pinned
+(`regression_locks_unlinked_delegated_dcrash_pause_seed_558`: the rows the
+rebuild dropped stayed counted in the generation's index, and the new root
+inherited the generation past them). Load review F1, the token at the write, has
 two faults of its own. `StallStep` makes a node's next step take its
 `now`, then wait, then decide with it. `WriterLockHold` makes the lease
 holder's next tagged fast-path write pass its check, then wait for the

@@ -1622,7 +1622,9 @@ fn deleg_idx_key(gen: u64) -> String {
 /// `local` kv: the highest index of generation `gen` this replica holds
 /// *from the log* (appended in the root's journal here, or applied from
 /// a segment) — never a shadow's (phase 2b: a successor root's cursor,
-/// a delegate's re-stream start).
+/// a delegate's re-stream start). A row appended here counts only while
+/// it is in the journal: one that leaves it unshipped takes the index
+/// back below it ([`retract_log_idx_tx`], from `spec::strand_local_tx`).
 pub(crate) fn deleg_log_idx_key(gen: u64) -> String {
     format!("deleg_log_idx:{gen}")
 }
@@ -1661,6 +1663,33 @@ pub(crate) fn bump_log_idx_tx(
         kv_set_tx(tx, local, &key, &idx.to_string());
     }
     Ok(())
+}
+
+/// Take the persisted log index of `gen` back below `idx`: the row at
+/// `idx` was appended in this root's journal (`bump_log_idx_tx` counted
+/// it) and now leaves the journal without a segment carrying it. Lowered
+/// only when the index counted that row (`idx` at or below it); true
+/// when it did. A row a segment carried retired with the segment's own
+/// bump, so every journal row of `gen` sits above what the log holds,
+/// and a delegate's own rows were never counted here at all.
+pub(crate) fn retract_log_idx_tx(
+    tx: &mut SingleWriterWriteTx,
+    local: &SingleWriterTxKeyspace,
+    gen: u64,
+    idx: u64,
+) -> Result<bool, MetaError> {
+    if gen == 0 || idx == 0 {
+        return Ok(false);
+    }
+    let key = deleg_log_idx_key(gen);
+    let cur = kv_get_tx(tx, local, &key)?
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    if cur < idx {
+        return Ok(false);
+    }
+    kv_set_tx(tx, local, &key, &(idx - 1).to_string());
+    Ok(true)
 }
 
 /// Plan 30 §M11: one transaction of a delegate's stream.

@@ -536,6 +536,11 @@ designations create no delegation.
   stopped delegate that answers a recall at the log's index of the
   stream, and the next root ends it there. A generation the successor inherits is learned when its takeover gate
   opens, whichever round that is in.
+  A deposed root's appends of a delegate's stream that never shipped are
+  not the log's: when they leave its journal (the rebuild, a strand) the
+  index it holds of the generation goes back below them, so if it takes
+  the root over again it inherits the generation at the log's index and
+  the delegate re-streams them.
 - While any generation is live, the root does not release its lease when
   idle and declines a cooperative handoff.
 
