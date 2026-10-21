@@ -3671,6 +3671,7 @@ to land before C0.
   *recommended, optional*. (D11) No change to what a sealed holder admits
   (the traced violations are TTL claims): *recommended*. (D12) The token's
   receipt on the executor's honour clock: *recommended*.
+  **Answered 2026-10-22:** every recommendation taken.
 
 - **Q22 — C1's coder-spec decisions (specified 2026-10-22).** *Blocks
   C1.* (a) *A removal lands covered*: while a reconfiguration that
