@@ -2734,6 +2734,70 @@ first part of C7a, landed early):
   The observation rule's cold-claim wait (a full TTL from the first
   read) is a knowing latency cost: §10 gate G6.
 
+  *Specified 2026-10-22* (the coder spec is kept with the reviews; the
+  decisions are §11 Q23).
+  - *The evidence moved.* On f27d3d1 the pinned seeds of
+    `fast_takeover_skewed_successor_known_gaps` (5570, 11942, 202261) and
+    `locks-holder-step-back-sealed` (818, 1289, 1892, 4045, 6988) pass: C7a
+    and F-c moved the trajectories, not the class. Re-measured:
+    `fast-takeover-skewed-successor` fails 3 of 30 000 (1716, 1987, 14761,
+    the second failover), `locks-holder-step-back-sealed` 1 of 10 000 (6275),
+    `fast-takeover-skewed-holder` with both cuts 9 of 2 000. Every one traced
+    is row 2: a node whose clock is ahead of the holder's (or a holder
+    stepped back) reads a live lease's wall expiry as past and claims it **by
+    TTL**, with no floor (seed 1716: the backup ahead first seals the live
+    holder early, row 24, the holder goes on under `Local`, and a third node
+    ahead takes that lease by TTL and grants inside the holder's section). A
+    targeted configuration (nodes 2 and 3 eight seconds ahead, node 2 cut
+    from the holder so that it reads the lease) fails 49 of 300; `locks-skew`
+    at `clock_skew_ms` 60 000 fails 3 of 300 with no fault; a backup eight
+    seconds ahead seals a live holder 189 times in 300 fault-free seeds (an
+    availability storm, row 24). The strict oracle misses the two-holder
+    window: C7b adds a direct oracle (a TTL claim landing while the
+    predecessor's honour window is open in true time).
+  - *The lease.* A claimant judges a lease by its own observation of the
+    holder's renewal key `(holder, epoch, holder_clock, holder_wait_ms,
+    released)`: claimable once a read still shows the key one body `ttl_ms`
+    on its wait clock after the first read that showed it (`ttl`, not
+    `ttl·(1 + 2ρ)`: ρ is in the readings since C7a), released or fenced
+    (`retired` names the holder) at once; the CAS names the latest ETag. A
+    `wanted_by` edit, a mark or a reconfiguration does not restart the watch.
+    The same observation serves rows 11 (the `ack=s3` permit), 23 (the
+    released-takeover grace ends `lock_ttl + 2M` after the first sight of the
+    release), 25, 26 (`fast_prev` by the permit alone) and 28, and every
+    routing compare. The body gains `ttl_ms`.
+  - *The seal watch* (row 24) keeps the holder's lease end re-anchored on the
+    backup's wait clock (a beat's arrival plus the end minus `sent`, an
+    append's receipt plus the time left the holder names); the wall expiry
+    leaves the beat and the append.
+  - *Promises* (row 3) are anchored to the claimed key: a P2P reply counts
+    for a request sent after the taker's observation passed; an S3 heartbeat
+    counts if it names the key, written when the promiser's own observation
+    of it passed. With the observation rule no epoch carrying that key can
+    form after such evidence, so no clock is compared across nodes; the
+    `heartbeat/ask-<taker>` objects are not needed.
+  - *Tokens* (rows 6, 29, 31): phase 1 (Q10b) with the receipt on the
+    executor's **honour** clock (it honours the token; the text above said
+    wait); `confirmed` on the holder's own clock (its renewal's `sent`);
+    tokens on the inbox and replay paths judged exactly or refused (Q23 D4).
+  - *The cut and barriers* (rows 9, 30): barriers cross nodes as durations;
+    a head's as-of is the root's own send time of the reply the delegate
+    echoes (renewal k after reply k − 1 does not hold today: a timeout and the
+    off-core lane break it). After C4.
+  - *Also:* a pad of 1 s per detected suspend on the honour clock (the C7a
+    review's caveat: the kernel's sleep accounting may be a second short);
+    the models' claim rule by observation (`cto`, `locks`) and anchored
+    promises (`flex`); offsets of up to two TTLs in the sim's default mix;
+    the harness's ±500 ms cap lifted and its stale-generation checker made
+    offset-free; the ADR "Clocks: rate, not offset".
+  - *Nine commits:* (1) the sim's evidence, the oracle, counters, the known
+    gaps re-pinned; (2) the models; (3) the lease observation rule (fable
+    review); (4) the seal watch; (5) anchored promises (fable review); (6)
+    tokens (fable review); (7) the suspend pad; (8) the cut and barriers,
+    after C4 (fable review); (9) the default mix, harness, campaign, docs.
+    1, 2 and 7 land on their own; 3 needs 1; 4 and 5 need 3; 6 needs 1; 8
+    needs C4 and 6; 9 needs 3–6.
+
 ### C7-F — The floor's cost, taken back (follow-ups of C7-H2; decided 2026-10-18)
 
 The maintainer accepted C7-H2's full floor (§10 gate G5, Q10a) and asked
@@ -3346,7 +3410,7 @@ The final list. Each says what it **blocks**; a question that the code
 answered is marked **decided** (the plan implements the decision; the
 maintainer may still overturn it). Blocking before C0: Q7, Q10a.
 Before C1: Q1, Q13, Q22. Before C2: Q2, Q4, Q9, Q14, Q15, Q16, Q21. Before C4:
-Q6. Before C6: Q5. Before C7b: Q10b, Q10c. Before C7-F: Q17 (F-a),
+Q6. Before C6: Q5. Before C7b: Q10b, Q10c, Q23. Before C7-F: Q17 (F-a),
 Q18 (F-b). Before C7-H1: Q19. Before C7a's commits 2–4: Q20.
 
 **Answered by the maintainer (2026-10-17): every recommendation below
@@ -3585,6 +3649,28 @@ to land before C0.
   and no compatibility shims anywhere (work-in-progress code, nothing
   installed): the inbox gains its field and a batch from an older binary is
   simply not read.
+- **Q23 — C7b's design (specified 2026-10-22).** *Blocks C7b.*
+  (D1) *Order:* commits 1–7 now, before C1 (rows 2 and 6 are measured
+  safety holes; commit 3 meets C1 only in the text of `classify`), commit 9
+  after them, commit 8 (rows 9, 30) after C4, instead of all of C7b after
+  C4: *recommended*. (D2) Rows 9/30 after C4 (recommended) or now on
+  today's structures (about twice the work). (D3) The observation waits
+  `ttl` on the wait clock, not `ttl·(1 + 2ρ)`: *recommended*. (D4) Tagged
+  ops on the inbox and replay paths, which have no transit bound: judged
+  exactly or refused (recommended, once C7b's counters show those paths
+  judge by window about never outside fault configurations), or the
+  absolute check kept there, documented as offset-dependent. (D5) "Fenced"
+  derived from `retired` naming the holder, no new field: *recommended*.
+  (D6) `lock_ttl + 2M ≤ ttl` validated at configuration (a TTL successor of
+  a tenure that inherited a grace arms no floor): *recommended*. (D7) S3
+  promises name the claimed key, no `ask-<taker>` objects: *recommended*.
+  (D8) The promiser's join gate kept, from its receipt or observation on
+  its wait clock, though the argument no longer needs it: *recommended*.
+  (D9) The suspend pad on every platform: *recommended*. (D10) Peer offset
+  estimates in status, with a WARN beyond `M/2`, nothing deciding on them:
+  *recommended, optional*. (D11) No change to what a sealed holder admits
+  (the traced violations are TTL claims): *recommended*. (D12) The token's
+  receipt on the executor's honour clock: *recommended*.
 
 - **Q22 — C1's coder-spec decisions (specified 2026-10-22).** *Blocks
   C1.* (a) *A removal lands covered*: while a reconfiguration that
