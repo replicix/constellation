@@ -1595,7 +1595,7 @@ decided on this measurement:
       (uncommitted sessions, other views' commits, stranding rollbacks),
       unit and conformance tests green; F3's comment and docs corrected.
 - [x] K3: W1 with S1–S4; its unit and wire tests; `kernel-race-open` meets its K3 column.
-- [ ] K4: W2; `kernel-race-open`, `-open-repair*`, `-notify*`, `-unseen-drop`,
+- [x] K4: W2; `kernel-race-open`, `-open-repair*`, `-notify*`, `-unseen-drop`,
       `-strict`, `-handover` 0 as §7.2 states.
 - [ ] K5: W3b (parents and moved inodes) and W3a's switch, the bounded
       default per the Q1 decision taken on §8.1's measurement; `-dir-*` and

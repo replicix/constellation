@@ -2646,3 +2646,117 @@ fn a_truncating_create_drops() {
     );
     k.finish();
 }
+
+// ------------------------------------------- plan 42: write repair (W2)
+
+fn page() -> u64 {
+    // SAFETY: sysconf has no preconditions.
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+}
+
+fn read_req(k: &mut Kernel, ino: u64, fh: u64, off: u64, size: u32) -> Reply {
+    k.call(
+        op::READ,
+        ino,
+        &Body::new()
+            .u64(fh)
+            .u64(off)
+            .u32(size)
+            .u32(0)
+            .u64(0)
+            .i32(RW)
+            .u32(0),
+    )
+}
+
+fn write_send(k: &mut Kernel, ino: u64, fh: u64, off: u64, data: &[u8], write_flags: u32) -> u64 {
+    k.send(
+        op::WRITE,
+        ino,
+        &Body::new()
+            .u64(fh)
+            .u64(off)
+            .u32(data.len() as u32)
+            .u32(write_flags)
+            .u64(0)
+            .i32(RW)
+            .u32(0)
+            .bytes(data)
+            .0,
+    )
+}
+
+/// `fuse_notify_inval_inode_out`: `(ino, offset, len)`.
+fn inval_inode(n: &Reply) -> (u64, i64, i64) {
+    assert_eq!((n.unique, n.error), (0, NOTIFY_INVAL_INODE));
+    (n.u64_at(0), n.u64_at(8) as i64, n.u64_at(16) as i64)
+}
+
+/// Plan 42 §5.2.5, deterministically: an `OPEN` reply arms the inode (it
+/// drops the pages), a `READ` of page 3 after it is recorded, and a
+/// `WRITE` covering pages 3–4 is answered only after a
+/// `NOTIFY_INVAL_INODE` for page 3 — and nothing for page 4, which no
+/// read fetched.
+#[test]
+fn a_write_after_a_known_drop_is_answered_after_the_pages_reads_fetched_are_dropped() {
+    let (mut k, mock, _sink) = keep_cache_kernel();
+    let p = page();
+    mock.always_open(Script::ok(stamped(9, 5)));
+    mock.always_read(Script::ok(ReadData::from_vec(vec![0; p as usize])));
+    mock.always_write(Script::ok((2 * p) as u32));
+    open_flags_of(&mut k, 50);
+    read_req(&mut k, 50, 9, 3 * p, p as u32).ok();
+    let unique = write_send(&mut k, 50, 9, 3 * p, &vec![7; 2 * p as usize], 0);
+    let n = k.recv();
+    assert_eq!(
+        inval_inode(&n),
+        (50, (3 * p) as i64, p as i64),
+        "page 3 only"
+    );
+    let r = k.recv();
+    assert_eq!(r.unique, unique, "then the write's reply");
+    assert_eq!(r.u32_at(0), (2 * p) as u32);
+    assert!(
+        k.recv_within(Duration::from_millis(300)).is_none(),
+        "nothing for page 4"
+    );
+    // The claim cleared the records and the arm: the next write of page
+    // 3 repairs nothing.
+    let unique = write_send(&mut k, 50, 9, 3 * p, &vec![8; 2 * p as usize], 0);
+    assert_eq!(k.recv().unique, unique, "answered at once");
+    k.finish();
+}
+
+/// A read with no drop known since the last claim is ambiguous: the
+/// write is answered at once and the next open drops the pages (S5); a
+/// page writeback `WRITE` (`FUSE_WRITE_CACHE`) is never claimed.
+#[test]
+fn an_ambiguous_read_marks_and_writeback_claims_nothing() {
+    let (mut k, mock, _sink) = keep_cache_kernel();
+    let p = page();
+    mock.always_open(Script::ok(stamped(9, 5)));
+    mock.always_read(Script::ok(ReadData::from_vec(vec![0; p as usize])));
+    mock.always_write(Script::ok(p as u32));
+    let r = k.call(op::OPEN, 50, &Body::new().i32(RW).u32(0));
+    let _ = open_out(&r);
+    read_req(&mut k, 50, 9, 0, p as u32).ok(); // completes the open's drop
+    let unique = write_send(&mut k, 50, 9, 0, &vec![1; p as usize], 0);
+    // Armed (the open's drop) and read: repaired.
+    assert_eq!(inval_inode(&k.recv()).1, 0);
+    assert_eq!(k.recv().unique, unique);
+    // Now no drop is known: a read is Plain, its hit only marks.
+    read_req(&mut k, 50, 9, 0, p as u32).ok();
+    let unique = write_send(&mut k, 50, 9, 0, &vec![2; p as usize], 0);
+    assert_eq!(k.recv().unique, unique, "answered at once, no repair");
+    // Writeback: not claimed, even with a read recorded and an arm.
+    read_req(&mut k, 50, 9, 0, p as u32).ok();
+    let unique = write_send(&mut k, 50, 9, 0, &vec![3; p as usize], 1);
+    assert_eq!(k.recv().unique, unique);
+    release(&mut k, 50, 9);
+    assert_eq!(
+        open_flags_of(&mut k, 50) & FOPEN_KEEP_CACHE,
+        0,
+        "the ambiguous hit marked the pages"
+    );
+    k.finish();
+}

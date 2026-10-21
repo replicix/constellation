@@ -32,11 +32,17 @@
 //!    the very stale pages that made the first one drop (plan 42 F17,
 //!    found implementing §5.1). The drop is known complete at the first
 //!    request that carries the dropping open's file handle: the kernel
-//!    installs the descriptor only after `fuse_finish_open`'s drop;
+//!    installs the descriptor only after `fuse_finish_open`'s drop. (Its
+//!    `RELEASE` completes it too. The one exception: when
+//!    `fuse_finish_open` fails, `fuse_open` releases the handle and skips
+//!    the drop, so the entry records a drop that did not run — reachable
+//!    only through an io-mode conflict, which the passthrough answers
+//!    never create: `PassthroughState::on_open_reply`);
 //! 5. the open is not a `create` carrying `O_TRUNC` (an `open(O_TRUNC)`
-//!    reaches the daemon as a `SETATTR size=0` first: the adapter does not
-//!    negotiate `FUSE_ATOMIC_O_TRUNC`, and the kernel follows that reply
-//!    with its own drop), its answer is a plain one (a passthrough open's
+//!    reaches the daemon as an `OPEN` and then a `SETATTR size=0` carrying
+//!    the new handle — the adapter does not negotiate
+//!    `FUSE_ATOMIC_O_TRUNC` — after the open's own drop, and the kernel
+//!    truncates the pages itself), its answer is a plain one (a passthrough open's
 //!    reads never reach the page cache's daemon side), and
 //!    `CONSTELLATION_FUSE_KEEP_CACHE` is not `off`.
 //!
@@ -66,10 +72,73 @@
 //! - **S4** an open answered `FOPEN_DIRECT_IO` (a read-write passthrough
 //!   open): its writes bypass the page cache other handles hold;
 //! - **S5** the write-race bookkeeping could not rule out a stale page, or
-//!   a repair was late or skipped (plan 42 K4); until that bookkeeping
-//!   lands, every `WRITE`, when it arrives and when it is answered.
+//!   a repair was late or skipped (`crate::repair`).
 //!
 //! A dropping open clears the mark; nothing else does.
+//!
+//! # Write-race bookkeeping (W2, plan 42 §5.2)
+//!
+//! Race 1: a write-through `write(2)` copies into an uptodate folio and
+//! unlocks it before its `FUSE_WRITE` reaches the daemon; a drop of the
+//! file's pages in that window lets a read fetch the page from the daemon
+//! before the write is applied, and the kernel then serves the pre-write
+//! bytes for an acknowledged write. The table follows every drop the
+//! adapter causes or can see coming and every read made while one may
+//! have happened, so that the write in the window can be identified — by
+//! the kernel's own serialization, not a clock — and the pages those reads
+//! fetched invalidated before that write is answered (`crate::repair`).
+//!
+//! - **Arming.** An inode is *armed* while a drop of its pages has been
+//!   announced and no write has been claimed since that drop was known to
+//!   be complete: `!arms.is_empty() || drop_done`. Each drop adds an
+//!   [`Arm`] *before* the reply or notification that causes it: A1 an
+//!   open answered without `FOPEN_KEEP_CACHE` (complete at the first
+//!   request carrying its handle: the kernel installs the descriptor
+//!   only after `fuse_finish_open`'s drop); A2 a data notification
+//!   (complete when the sink's write returns: the kernel drops inside
+//!   it); A3 an attribute-bearing reply for a regular file whose size
+//!   differs from the size last handed to the kernel (complete at once:
+//!   nothing tells the daemon when the requester installs the reply; for
+//!   a truncating `SETATTR` the kernel drops under `inode_lock`, so no
+//!   write-through write can be in flight across it); A4 a repair.
+//! - **Recording.** A `WRITE` without `FUSE_WRITE_CACHE` (a write-through
+//!   one; page writeback keeps its folios under writeback for the round
+//!   trip, so nothing drops them) is registered as pending. A `READ` of an
+//!   inode that is armed, has a write pending or a handle with write
+//!   access records its page range, `Pending` (a write was pending),
+//!   `Armed`, or `Plain`, before the engine reads the data, under the
+//!   shard lock the claim takes: a read is either recorded before the
+//!   claim or reads after the claimed write was applied.
+//! - **Claim.** When a registered write is answered (after the engine
+//!   applied it), the reads recorded on its pages are its *hits*:
+//!   `Pending`/`Armed` ones are repaired before the reply, `Plain` ones
+//!   (a read-modify-write of a cold page, or a drop the daemon cannot see)
+//!   mark the inode S5, the records are cleared and so is `drop_done`.
+//!
+//! Three facts a later reader would otherwise "fix":
+//!
+//! - **A claim clears every record, also of pages it does not cover.**
+//!   Any later write of such a page is copied after this claim's reply
+//!   (one write-through write per inode at a time: `fuse_cache_write_iter`
+//!   holds `inode_lock` from the copy to the reply), and a read in flight
+//!   on a page blocks a writer's `__filemap_get_folio(FGP_WRITEBEGIN)` on
+//!   it, so a recorded read's fetch always precedes any later copy into
+//!   the same page.
+//! - **A multi-request `write(2)`** (larger than `max_write`) is several
+//!   successive candidates, each filled after the previous one's reply
+//!   and claimed in turn: one is pending at a time.
+//! - **A request the kernel aborts** (a fatal signal) after a worker read
+//!   it is still answered by the daemon (the kernel waits for its answer
+//!   once the request left its pending list), so a claim always comes; a
+//!   connection abort ends the session and its table.
+//!
+//! What the bookkeeping cannot see — a drop by reclaim, `fadvise`,
+//! `drop_caches` — leaves at most a `Plain` hit, so S5: the next open
+//! drops, today's bound. (Measured on Linux 7.3: those paths do not drop
+//! a folio the writer holds a reference on — `mapping_evict_folio` skips
+//! one with an elevated count — and the writer holds its request's
+//! folios until the reply, so they did not reproduce race 1; the
+//! invalidations of `invalidate_inode_pages2` do.)
 //!
 //! # Lifetime
 //!
@@ -211,10 +280,130 @@ impl Mark {
 /// A drop of an inode's pages announced and not yet known complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Arm {
-    /// A1: an open answered without `FOPEN_KEEP_CACHE`, by its handle.
-    Open(u64),
+    /// A1: an open answered without `FOPEN_KEEP_CACHE`, by its handle,
+    /// and the read generation it was announced at.
+    Open { fh: u64, gen: u64 },
     /// A1 past [`MAX_OPEN_ARMS`]: complete when no handle is left.
     OpenOverflow,
+    /// A2: a data notification being written (its sequence number), and,
+    /// for one of the whole file, the read generation it was announced at.
+    Notify { seq: u64, gen: Option<u64> },
+    /// A4: a repair being written.
+    Repair(u64),
+}
+
+impl Arm {
+    /// The read generation a whole-file drop was announced at: once it is
+    /// complete, every read recorded before it fetched a folio that drop
+    /// removed (`invalidate_inode_pages2` waits for a folio a read is
+    /// filling, and drops it), so those records rule nothing in any more.
+    fn supersedes(&self) -> Option<u64> {
+        match self {
+            Arm::Open { gen, .. } => Some(*gen),
+            Arm::Notify { gen, .. } => *gen,
+            Arm::OpenOverflow | Arm::Repair(_) => None,
+        }
+    }
+}
+
+/// What a recorded read may have fetched (the stronger wins a merge).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ReadKind {
+    /// No drop known, no write pending: a read-modify-write, or a drop
+    /// the daemon cannot see.
+    Plain,
+    /// After a known drop.
+    Armed,
+    /// While a write was pending.
+    Pending,
+}
+
+/// The pages of reads recorded since the last claim: at most
+/// [`ReadSet::MAX`] disjoint ranges of page indices `[start, end)`, each
+/// with its kind and the read generation it was recorded at.
+/// Overlapping or adjacent ranges merge (the stronger kind and the later
+/// generation win); past the bound the two closest ranges merge — a wider
+/// range repairs more, never less, and a later generation keeps a record
+/// longer, never shorter.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct ReadSet(Vec<(u64, u64, ReadKind, u64)>);
+
+impl ReadSet {
+    const MAX: usize = 16;
+
+    pub(crate) fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    pub(crate) fn add(&mut self, start: u64, end: u64, kind: ReadKind, gen: u64) {
+        if start >= end {
+            return;
+        }
+        let (mut start, mut end, mut kind, mut gen) = (start, end, kind, gen);
+        // Absorb every range that touches the new one.
+        self.0.retain(|&(s, e, k, g)| {
+            if s <= end && start <= e {
+                start = start.min(s);
+                end = end.max(e);
+                kind = kind.max(k);
+                gen = gen.max(g);
+                false
+            } else {
+                true
+            }
+        });
+        let at = self.0.partition_point(|&(s, _, _, _)| s < start);
+        self.0.insert(at, (start, end, kind, gen));
+        while self.0.len() > Self::MAX {
+            // The two closest neighbours.
+            let i = (0..self.0.len() - 1)
+                .min_by_key(|&i| self.0[i + 1].0 - self.0[i].1)
+                .expect("at least two ranges");
+            let (s, _, k1, g1) = self.0[i];
+            let (_, e, k2, g2) = self.0.remove(i + 1);
+            self.0[i] = (s, e, k1.max(k2), g1.max(g2));
+        }
+    }
+
+    /// Forget the records made before read generation `gen` (a whole-file
+    /// drop announced at `gen` has completed: [`Arm::supersedes`]).
+    pub(crate) fn supersede(&mut self, gen: u64) {
+        self.0.retain(|&(_, _, _, g)| g >= gen);
+    }
+
+    /// The parts of the recorded ranges inside `[start, end)`.
+    pub(crate) fn hits(&self, start: u64, end: u64) -> Vec<(u64, u64, ReadKind)> {
+        self.0
+            .iter()
+            .filter(|&&(s, e, _, _)| s < end && start < e)
+            .map(|&(s, e, k, _)| (s.max(start), e.min(end), k))
+            .collect()
+    }
+}
+
+/// A registered write in progress: `(unique, first page, end page)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PendingWrite {
+    pub(crate) unique: u64,
+}
+
+/// What a claim asks of the write's reply ([`PageCacheTable::claim`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Claim {
+    /// Answer it now.
+    Reply,
+    /// Invalidate these page ranges first (`crate::repair`), and then
+    /// `tail`, the write's last page when the write does not cover it
+    /// whole: that page may be the writer's own folio, which a write-through
+    /// writer keeps locked until its reply when the copy left it not
+    /// uptodate — then the repair waits for the reply it holds, and the
+    /// page is not stale (a read can neither fill a folio the writer has
+    /// locked nor be sent while it is) — `crate::repair` answers the write
+    /// early on that one page.
+    Repair {
+        ranges: Vec<(u64, u64)>,
+        tail: Option<u64>,
+    },
 }
 
 /// What the table knows of one inode's pages.
@@ -231,6 +420,22 @@ pub(crate) struct PcEntry {
     /// access.
     pub(crate) handles: u32,
     pub(crate) write_handles: u32,
+    /// W2: a drop completed and no write has been claimed since.
+    pub(crate) drop_done: bool,
+    /// W2: registered (write-through) writes in progress.
+    pub(crate) pending: Vec<PendingWrite>,
+    /// W2: the pages reads fetched since the last claim.
+    pub(crate) reads: ReadSet,
+    /// W2: the size last handed to the kernel (A3).
+    pub(crate) last_size: Option<u64>,
+    /// W2: bumped at every whole-file drop announced (A1, A2): what a
+    /// read is recorded at, and what a completed drop supersedes.
+    pub(crate) read_gen: u64,
+    /// W2: requests on the inode in progress whose answer a repair may be
+    /// waiting for (`READ`s, `WRITE`s; a write handed to the repair lane
+    /// no longer counts): the repair's clock runs only while there are
+    /// none (`crate::repair`).
+    pub(crate) ops_in_flight: u32,
 }
 
 impl PcEntry {
@@ -244,7 +449,52 @@ impl PcEntry {
     fn open_arms(&self) -> bool {
         self.arms
             .iter()
-            .any(|a| matches!(a, Arm::Open(_) | Arm::OpenOverflow))
+            .any(|a| matches!(a, Arm::Open { .. } | Arm::OpenOverflow))
+    }
+
+    /// Nothing an entry created by a drop alone would lose: no handle, no
+    /// arm, no request, no record, no stamp and no size handed to the
+    /// kernel (an entry with `last_size` leaves at FORGET). An open of the
+    /// inode drops with or without it (`dropped_at` is `None`).
+    fn idle(&self) -> bool {
+        self.handles == 0
+            && self.write_handles == 0
+            && self.arms.is_empty()
+            && self.pending.is_empty()
+            && self.reads.0.is_empty()
+            && self.ops_in_flight == 0
+            && self.dropped_at.is_none()
+            && self.marks == 0
+            && self.last_size.is_none()
+    }
+
+    /// A whole-file drop is announced: the generation it supersedes once
+    /// complete.
+    fn announce(&mut self) -> u64 {
+        self.read_gen += 1;
+        self.read_gen
+    }
+
+    /// W2: a drop announced, or completed with no claim since.
+    fn armed(&self) -> bool {
+        !self.arms.is_empty() || self.drop_done
+    }
+
+    /// Complete the first live arm `is` matches: the kernel has finished
+    /// that drop. A whole-file drop also supersedes the reads recorded
+    /// before it was announced.
+    fn complete(&mut self, is: impl Fn(&Arm) -> bool) -> bool {
+        match self.arms.iter().position(is) {
+            Some(i) => {
+                let arm = self.arms.swap_remove(i);
+                self.drop_done = true;
+                if let Some(gen) = arm.supersedes() {
+                    self.reads.supersede(gen);
+                }
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -269,6 +519,25 @@ pub struct PageCacheStats {
     pub(crate) keep_cache_opens: AtomicU64,
     pub(crate) dropping_opens: [AtomicU64; 8],
     pub(crate) suspect_marks: [AtomicU64; 5],
+    /// W2: writes whose reply waited for a repair, and the pages they
+    /// invalidated.
+    pub(crate) repairs: AtomicU64,
+    pub(crate) repair_pages: AtomicU64,
+    /// W2: repairs that came too late (the reply had been answered at the
+    /// bound) or were skipped (the gate was closed).
+    pub(crate) repairs_late: AtomicU64,
+    /// W2: the time repaired writes' replies waited, in all, and the
+    /// longest.
+    pub(crate) repair_wait_ms: AtomicU64,
+    pub(crate) repair_wait_max_ms: AtomicU64,
+    /// W2: repairs whose write was answered early, blocked on its own
+    /// last page (`crate::repair`'s `TAIL_GRACE`).
+    pub(crate) repairs_released: AtomicU64,
+    /// W2: claims with a `Plain` hit (S5 instead of a repair).
+    pub(crate) ambiguous_writes: AtomicU64,
+    /// W2: claims while another registered write was pending (not
+    /// expected: one write-through write per inode at a time).
+    pub(crate) concurrent_writes: AtomicU64,
 }
 
 /// A snapshot of [`PageCacheStats`].
@@ -279,6 +548,14 @@ pub struct PageCacheCounts {
     pub dropping_opens: Vec<(&'static str, u64)>,
     /// By [`Mark::as_str`].
     pub suspect_marks: Vec<(&'static str, u64)>,
+    pub repairs: u64,
+    pub repair_pages: u64,
+    pub repairs_late: u64,
+    pub repairs_released: u64,
+    pub repair_wait_ms: u64,
+    pub repair_wait_max_ms: u64,
+    pub ambiguous_writes: u64,
+    pub concurrent_writes: u64,
 }
 
 /// The settings the table works under (`CONSTELLATION_FUSE_KEEP_CACHE`,
@@ -290,6 +567,21 @@ pub struct PageCacheConfig {
     /// ignores S5 — the naive keep-cache plan 42 F1 guards against, for a
     /// scenario's fail-before only.
     pub ignore_s5: bool,
+    /// W2's repair (`CONSTELLATION_FUSE_WRITE_REPAIR`): `auto` is on;
+    /// off, every repair hit is an S5 instead.
+    pub write_repair: crate::Switch,
+}
+
+impl PageCacheConfig {
+    /// Whether W2 repairs now.
+    pub fn repair_on(&self) -> bool {
+        on(self.write_repair)
+    }
+}
+
+/// A workaround's switch: `auto` is on.
+fn on(switch: crate::Switch) -> bool {
+    switch != crate::Switch::Off
 }
 
 impl Default for PageCacheConfig {
@@ -297,6 +589,7 @@ impl Default for PageCacheConfig {
         Self {
             keep_cache: KeepCache::Auto,
             ignore_s5: false,
+            write_repair: crate::Switch::Auto,
         }
     }
 }
@@ -306,14 +599,18 @@ type Shard = Mutex<HashMap<Ino, PcEntry, BuildHasherDefault<Mix>>>;
 /// One session's [`PcEntry`]s (see the module doc).
 pub struct PageCacheTable {
     shards: Box<[Shard]>,
-    config: PageCacheConfig,
+    config: std::sync::RwLock<PageCacheConfig>,
     stats: PageCacheStats,
+    /// `log2` of the kernel's page size.
+    page_shift: u32,
+    /// Sequence numbers of A2/A4 arms.
+    next_arm: AtomicU64,
 }
 
 impl std::fmt::Debug for PageCacheTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PageCacheTable")
-            .field("config", &self.config)
+            .field("config", &self.config())
             .field("counts", &self.counts())
             .finish()
     }
@@ -321,15 +618,33 @@ impl std::fmt::Debug for PageCacheTable {
 
 impl PageCacheTable {
     pub fn new(config: PageCacheConfig) -> std::sync::Arc<Self> {
+        Self::with_page_size(config, crate::workarounds::page_size())
+    }
+
+    /// [`Self::new`] for a kernel page of `page` bytes (a power of two).
+    pub(crate) fn with_page_size(config: PageCacheConfig, page: u64) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             shards: (0..SHARDS).map(|_| Mutex::default()).collect(),
-            config,
+            config: std::sync::RwLock::new(config),
             stats: PageCacheStats::default(),
+            page_shift: page.trailing_zeros(),
+            next_arm: AtomicU64::new(1),
         })
     }
 
     pub fn config(&self) -> PageCacheConfig {
-        self.config
+        *self.config.read().unwrap()
+    }
+
+    /// The kernel's page size.
+    pub(crate) fn page_size(&self) -> u64 {
+        1 << self.page_shift
+    }
+
+    /// The pages `[off, off + len)` covers.
+    fn pages(&self, off: u64, len: u64) -> (u64, u64) {
+        let p = self.page_size();
+        (off >> self.page_shift, off.saturating_add(len).div_ceil(p))
     }
 
     fn shard(&self, ino: Ino) -> &Shard {
@@ -341,12 +656,9 @@ impl PageCacheTable {
     pub(crate) fn open_reply(&self, o: OpenFacts) -> bool {
         let mut shard = self.shard(o.ino).lock().unwrap();
         let entry = shard.get(&o.ino);
-        let ignored = if self.config.ignore_s5 {
-            Mark::S5.bit()
-        } else {
-            0
-        };
-        let verdict = if self.config.keep_cache == KeepCache::Off {
+        let config = self.config();
+        let ignored = if config.ignore_s5 { Mark::S5.bit() } else { 0 };
+        let verdict = if config.keep_cache == KeepCache::Off {
             Err(DropReason::Off)
         } else if !o.plain {
             Err(DropReason::Passthrough)
@@ -376,9 +688,14 @@ impl PageCacheTable {
                 self.stats.dropping_opens[reason as usize].fetch_add(1, Relaxed);
                 e.dropped_at = o.stamp;
                 e.marks = 0;
-                let opens = e.arms.iter().filter(|a| matches!(a, Arm::Open(_))).count();
+                let opens = e
+                    .arms
+                    .iter()
+                    .filter(|a| matches!(a, Arm::Open { .. }))
+                    .count();
                 if opens < MAX_OPEN_ARMS {
-                    e.arms.push(Arm::Open(o.fh));
+                    let gen = e.announce();
+                    e.arms.push(Arm::Open { fh: o.fh, gen });
                 } else if !e.arms.contains(&Arm::OpenOverflow) {
                     e.arms.push(Arm::OpenOverflow);
                 }
@@ -408,9 +725,7 @@ impl PageCacheTable {
     pub(crate) fn handle_used(&self, ino: Ino, fh: u64) {
         let mut shard = self.shard(ino).lock().unwrap();
         if let Some(e) = shard.get_mut(&ino) {
-            if let Some(i) = e.arms.iter().position(|a| *a == Arm::Open(fh)) {
-                e.arms.swap_remove(i);
-            }
+            e.complete(|a| matches!(a, Arm::Open { fh: f, .. } if *f == fh));
         }
     }
 
@@ -424,8 +739,7 @@ impl PageCacheTable {
             // backing-open error, an iomode clash) and then releases the
             // handle without the drop the reply asked for, so the drop is
             // as good as lost (S2): the open's reply cleared the marks.
-            if let Some(i) = e.arms.iter().position(|a| *a == Arm::Open(fh)) {
-                e.arms.swap_remove(i);
+            if e.complete(|a| matches!(a, Arm::Open { fh: f, .. } if *f == fh)) {
                 e.marks |= Mark::S2.bit();
                 self.stats.suspect_marks[Mark::S2.index()].fetch_add(1, Relaxed);
             }
@@ -434,7 +748,7 @@ impl PageCacheTable {
                 e.write_handles = e.write_handles.saturating_sub(1);
             }
             if e.handles == 0 {
-                e.arms.retain(|a| *a != Arm::OpenOverflow);
+                e.complete(|a| *a == Arm::OpenOverflow);
             }
         }
     }
@@ -445,9 +759,273 @@ impl PageCacheTable {
         self.shard(ino).lock().unwrap().remove(&ino);
     }
 
+    /// A resumed session's handles (plan 42 §5.1.2): `ino` has `handles`
+    /// open, `writers` of them with write access, from before the
+    /// handover. Seeded before the session reads its first request.
+    pub(crate) fn seed_handles(&self, ino: Ino, handles: u32, writers: u32) {
+        let mut shard = self.shard(ino).lock().unwrap();
+        let e = shard.entry(ino).or_default();
+        e.handles += handles;
+        e.write_handles += writers;
+    }
+
+    /// A2/A4: a drop of `ino`'s pages is about to be written (a data
+    /// notification — `whole`: of every page —, a repair): the inode is
+    /// armed until it returns ([`Self::drop_written`]). Creates the entry.
+    pub(crate) fn arm_drop(&self, ino: Ino, repair: bool, whole: bool) -> u64 {
+        let seq = self.next_arm.fetch_add(1, Relaxed);
+        let mut shard = self.shard(ino).lock().unwrap();
+        // Created when absent, so that an open answered while this drop is
+        // still to be written inherits its arm; removed again when the drop
+        // is written if nothing else came of it (`drop_written`), since the
+        // engine names every inode a log record touched, most never looked
+        // up by this kernel, and only a FORGET would remove it otherwise.
+        let e = shard.entry(ino).or_default();
+        let arm = if repair {
+            Arm::Repair(seq)
+        } else {
+            let gen = whole.then(|| e.announce());
+            Arm::Notify { seq, gen }
+        };
+        e.arms.push(arm);
+        seq
+    }
+
+    /// The drop armed as `seq` has been written: the kernel has finished
+    /// it.
+    pub(crate) fn drop_written(&self, ino: Ino, seq: u64) {
+        let mut shard = self.shard(ino).lock().unwrap();
+        if let Some(e) = shard.get_mut(&ino) {
+            e.complete(|a| {
+                matches!(a, Arm::Notify { seq: s, .. } if *s == seq) || *a == Arm::Repair(seq)
+            });
+            if e.idle() {
+                shard.remove(&ino);
+            }
+        }
+    }
+
+    /// A4 written while its write's reply was still held: no write of the
+    /// inode can have been in the window since (the held write is the
+    /// only one between copy and reply, and the engine has applied it), so
+    /// the drop arms nothing past it. A repair that comes late — after the
+    /// watchdog answered the write — is completed with
+    /// [`Self::drop_written`] instead: the next write may have overlapped
+    /// it.
+    pub(crate) fn repair_written_in_time(&self, ino: Ino, seq: u64) {
+        let mut shard = self.shard(ino).lock().unwrap();
+        if let Some(e) = shard.get_mut(&ino) {
+            if let Some(i) = e.arms.iter().position(|a| *a == Arm::Repair(seq)) {
+                e.arms.swap_remove(i);
+            }
+        }
+    }
+
+    /// A3: an attribute-bearing reply hands the kernel `size` for regular
+    /// file `ino`; a size other than the last one handed makes the
+    /// requester drop the file's pages when it installs the reply
+    /// (`fuse_change_attributes_i`), at a time the daemon does not see:
+    /// the drop is taken as complete at once (module doc). An inode
+    /// without an entry has no pages this session knows of.
+    pub(crate) fn size_seen(&self, ino: Ino, size: u64) {
+        let mut shard = self.shard(ino).lock().unwrap();
+        if let Some(e) = shard.get_mut(&ino) {
+            if e.last_size != Some(size) {
+                e.last_size = Some(size);
+                e.drop_done = true;
+            }
+        }
+    }
+
+    /// A `READ` of `[off, off + len)` reached the adapter: recorded if the
+    /// inode is armed, has a write pending or a handle that can write, and
+    /// counted in flight while the entry exists (`true`: call
+    /// [`Self::op_done`] when it is answered).
+    pub(crate) fn read_begin(&self, ino: Ino, off: u64, len: u64) -> bool {
+        let mut shard = self.shard(ino).lock().unwrap();
+        let Some(e) = shard.get_mut(&ino) else {
+            return false;
+        };
+        e.ops_in_flight += 1;
+        let kind = if !e.pending.is_empty() {
+            Some(ReadKind::Pending)
+        } else if e.armed() {
+            Some(ReadKind::Armed)
+        } else if e.write_handles > 0 {
+            Some(ReadKind::Plain)
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            let (start, end) = self.pages(off, len);
+            e.reads.add(start, end, kind, e.read_gen);
+        }
+        true
+    }
+
+    /// A request counted in flight was answered (or handed to the repair
+    /// lane, for a write).
+    pub(crate) fn op_done(&self, ino: Ino) {
+        let mut shard = self.shard(ino).lock().unwrap();
+        if let Some(e) = shard.get_mut(&ino) {
+            e.ops_in_flight = e.ops_in_flight.saturating_sub(1);
+        }
+    }
+
+    /// Requests on `ino` in progress whose answer a repair may wait for.
+    pub(crate) fn ops_in_flight(&self, ino: Ino) -> u32 {
+        self.shard(ino)
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .map_or(0, |e| e.ops_in_flight)
+    }
+
+    /// A `WRITE` reached the adapter, counted in flight; a write-through
+    /// one (`!writeback`) is registered as the inode's candidate (module
+    /// doc). Creates the entry for a write-through one; `true`: counted
+    /// (call [`Self::op_done`]).
+    pub(crate) fn write_begin(&self, ino: Ino, unique: u64, writeback: bool) -> bool {
+        let mut shard = self.shard(ino).lock().unwrap();
+        let e = if writeback {
+            match shard.get_mut(&ino) {
+                Some(e) => e,
+                None => return false,
+            }
+        } else {
+            let e = shard.entry(ino).or_default();
+            e.pending.push(PendingWrite { unique });
+            e
+        };
+        e.ops_in_flight += 1;
+        true
+    }
+
+    /// Claim the registered write `unique` of `[off, off + len)` as it is
+    /// answered `ok` (module doc): what its reply must wait for.
+    pub(crate) fn claim(&self, ino: Ino, unique: u64, off: u64, len: u64, ok: bool) -> Claim {
+        let mut shard = self.shard(ino).lock().unwrap();
+        let Some(e) = shard.get_mut(&ino) else {
+            return Claim::Reply;
+        };
+        let Some(i) = e.pending.iter().position(|w| w.unique == unique) else {
+            // Not registered: a writeback write (its folios are under
+            // writeback for the round trip), or one the table forgot.
+            return Claim::Reply;
+        };
+        e.pending.swap_remove(i);
+        if !e.pending.is_empty() {
+            // Not expected (one write-through write per inode at a time):
+            // the records stay for the other write's claim, and nothing
+            // can be ruled out for this one.
+            e.marks |= Mark::S5.bit();
+            drop(shard);
+            self.stats.suspect_marks[Mark::S5.index()].fetch_add(1, Relaxed);
+            if self.stats.concurrent_writes.fetch_add(1, Relaxed) == 0 {
+                tracing::warn!(
+                    ino,
+                    "two write-through WRITEs of one inode in progress at once; its pages are \
+                     taken as not current (logged once)"
+                );
+            }
+            return Claim::Reply;
+        }
+        let (start, end) = self.pages(off, len);
+        // Clears every record, also of pages it does not cover (module
+        // doc): a later write of those pages is copied after this reply.
+        let hits = e.reads.hits(start, end);
+        e.reads.clear();
+        e.drop_done = false;
+        if !ok {
+            return Claim::Reply;
+        }
+        e.last_size = Some(e.last_size.unwrap_or(0).max(off.saturating_add(len)));
+        let plain = hits.iter().any(|h| h.2 == ReadKind::Plain);
+        let repair: Vec<(u64, u64)> = hits
+            .iter()
+            .filter(|h| h.2 != ReadKind::Plain)
+            .map(|h| (h.0, h.1))
+            .collect();
+        let write_repair = self.config().repair_on();
+        if plain || (!repair.is_empty() && !write_repair) {
+            e.marks |= Mark::S5.bit();
+        }
+        drop(shard);
+        if plain {
+            self.stats.ambiguous_writes.fetch_add(1, Relaxed);
+        }
+        if plain || (!repair.is_empty() && !write_repair) {
+            self.stats.suspect_marks[Mark::S5.index()].fetch_add(1, Relaxed);
+        }
+        if repair.is_empty() || !write_repair {
+            return Claim::Reply;
+        }
+        // The page the writer may hold locked (KF2): the last of its
+        // request, when the write does not cover it whole. (A read sent
+        // while the write was registered cannot have hit a page the writer
+        // holds locked — the reader waits for the lock first — but records
+        // merge, so the kind of a hit says nothing about one page.)
+        let end_byte = off.saturating_add(len);
+        let last = end_byte.saturating_sub(1) >> self.page_shift;
+        let partial = !end_byte.is_multiple_of(self.page_size()) || off > last << self.page_shift;
+        let tail = (partial && hits.iter().any(|h| h.0 <= last && last < h.1)).then_some(last);
+        let ranges = merge(repair)
+            .into_iter()
+            .flat_map(|(s, e)| match tail {
+                Some(t) if s <= t && t < e => vec![(s, t), (t + 1, e)],
+                _ => vec![(s, e)],
+            })
+            .filter(|(s, e)| s < e)
+            .collect();
+        Claim::Repair { ranges, tail }
+    }
+
+    /// A registered write whose reply was dropped unanswered (fuser then
+    /// answers `EIO`): no claim will come, so its registration goes, and
+    /// nothing can be ruled out for its pages (S5).
+    pub(crate) fn abandon(&self, ino: Ino, unique: u64) {
+        let mut shard = self.shard(ino).lock().unwrap();
+        if let Some(e) = shard.get_mut(&ino) {
+            if let Some(i) = e.pending.iter().position(|w| w.unique == unique) {
+                e.pending.swap_remove(i);
+                e.marks |= Mark::S5.bit();
+                drop(shard);
+                self.stats.suspect_marks[Mark::S5.index()].fetch_add(1, Relaxed);
+            }
+        }
+    }
+
+    /// Inodes with a handle that can write (the unseen-drop fault).
+    pub(crate) fn writable_inodes(&self) -> Vec<Ino> {
+        self.shards
+            .iter()
+            .flat_map(|s| {
+                s.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, e)| e.write_handles > 0)
+                    .map(|(ino, _)| *ino)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    pub(crate) fn stats(&self) -> &PageCacheStats {
+        &self.stats
+    }
+
     /// The counters.
     pub fn counts(&self) -> PageCacheCounts {
+        let get = |a: &AtomicU64| a.load(Relaxed);
         PageCacheCounts {
+            repairs: get(&self.stats.repairs),
+            repair_pages: get(&self.stats.repair_pages),
+            repairs_late: get(&self.stats.repairs_late),
+            repairs_released: get(&self.stats.repairs_released),
+            repair_wait_ms: get(&self.stats.repair_wait_ms),
+            repair_wait_max_ms: get(&self.stats.repair_wait_max_ms),
+            ambiguous_writes: get(&self.stats.ambiguous_writes),
+            concurrent_writes: get(&self.stats.concurrent_writes),
             keep_cache_opens: self.stats.keep_cache_opens.load(Relaxed),
             dropping_opens: DropReason::ALL
                 .iter()
@@ -479,6 +1057,19 @@ impl PageCacheTable {
     pub(crate) fn with_entry<T>(&self, ino: Ino, f: impl FnOnce(Option<&PcEntry>) -> T) -> T {
         f(self.shard(ino).lock().unwrap().get(&ino))
     }
+}
+
+/// Page ranges sorted and merged where they touch.
+fn merge(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    ranges.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (s, e) in ranges {
+        match out.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => out.push((s, e)),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -578,7 +1169,7 @@ mod tests {
             let e = e.unwrap();
             assert!(!e.suspect());
             assert_eq!(e.dropped_at, S);
-            assert_eq!(e.arms, vec![Arm::Open(2)]);
+            assert!(matches!(e.arms[..], [Arm::Open { fh: 2, .. }]));
         });
         // A close: its FLUSH carries the handle, then the RELEASE.
         t.handle_used(42, 2);
@@ -648,6 +1239,317 @@ mod tests {
         assert!(t.open_reply(facts(2, S)), "S5 ignored");
         t.mark(42, Mark::S1);
         assert!(!t.open_reply(facts(3, S)), "S1 is not");
+    }
+
+    const P: u64 = 4096;
+
+    fn table() -> std::sync::Arc<PageCacheTable> {
+        PageCacheTable::with_page_size(PageCacheConfig::default(), P)
+    }
+
+    #[test]
+    fn a_read_set_merges_keeps_the_stronger_kind_and_stays_bounded() {
+        let mut r = ReadSet::default();
+        r.add(3, 5, ReadKind::Plain, 1);
+        r.add(5, 6, ReadKind::Armed, 0);
+        assert_eq!(
+            r.0,
+            vec![(3, 6, ReadKind::Armed, 1)],
+            "adjacent: merged, stronger kind, later generation"
+        );
+        r.add(10, 11, ReadKind::Pending, 2);
+        r.add(4, 4, ReadKind::Pending, 2);
+        assert_eq!(r.0.len(), 2, "an empty range adds nothing");
+        assert_eq!(
+            r.hits(5, 11),
+            vec![(5, 6, ReadKind::Armed), (10, 11, ReadKind::Pending)]
+        );
+        assert!(r.hits(6, 10).is_empty());
+        let mut r = ReadSet::default();
+        for i in 0..40 {
+            r.add(i * 10, i * 10 + 1, ReadKind::Plain, 0);
+        }
+        assert!(r.0.len() <= ReadSet::MAX);
+        // Every page recorded is still covered.
+        for i in 0..40 {
+            assert_eq!(r.hits(i * 10, i * 10 + 1).len(), 1, "page {}", i * 10);
+        }
+    }
+
+    /// An inode with a write handle and no drop: a read is `Plain`; after
+    /// an announced drop it is `Armed`; while a write is pending,
+    /// `Pending`. Without a handle that can write, no drop and no write,
+    /// nothing is recorded.
+    #[test]
+    fn reads_are_recorded_with_what_may_have_happened() {
+        let t = table();
+        assert!(!t.read_begin(42, 0, P), "no entry: not even counted");
+        assert!(!t.open_reply(facts(1, S)));
+        t.handle_used(42, 1); // the open's drop is complete: armed
+        assert!(t.read_begin(42, 3 * P, P));
+        t.with_entry(42, |e| {
+            assert_eq!(e.unwrap().reads.0, vec![(3, 4, ReadKind::Armed, 1)])
+        });
+        assert!(t.write_begin(42, 7, false));
+        assert!(t.read_begin(42, 9 * P, 10));
+        t.with_entry(42, |e| {
+            assert!(e.unwrap().reads.0.contains(&(9, 10, ReadKind::Pending, 1)));
+        });
+        t.claim(42, 7, 0, P, true);
+        // Not armed, nothing pending, no handle that can write.
+        assert!(t.read_begin(42, 5 * P, P));
+        t.with_entry(42, |e| assert!(e.unwrap().reads.0.is_empty()));
+        t.seed_handles(42, 1, 1);
+        assert!(t.read_begin(42, 5 * P, P));
+        t.with_entry(42, |e| {
+            assert_eq!(e.unwrap().reads.0, vec![(5, 6, ReadKind::Plain, 1)])
+        });
+        for _ in 0..5 {
+            t.op_done(42);
+        }
+        assert_eq!(t.ops_in_flight(42), 0);
+    }
+
+    /// The claim (§5.2.3): `Armed`/`Pending` hits are repaired, `Plain`
+    /// ones mark S5; every record is cleared, also outside the write; a
+    /// write never registered (page writeback) claims nothing; a failed
+    /// write clears and repairs nothing. (Checked to fail with the Plain
+    /// rule and the clear each removed.)
+    #[test]
+    fn a_claim_repairs_what_a_known_drop_may_have_fetched() {
+        let t = table();
+        t.open_reply(OpenFacts {
+            write_access: true,
+            ..facts(1, S)
+        });
+        t.handle_used(42, 1); // the drop is complete: armed
+        t.read_begin(42, 3 * P, P);
+        t.read_begin(42, 20 * P, P);
+        assert!(t.write_begin(42, 7, false));
+        assert_eq!(
+            t.claim(42, 7, 3 * P, 2 * P, true),
+            Claim::Repair {
+                ranges: vec![(3, 4)],
+                tail: None
+            },
+            "page 3 only: page 4 was never read (and the write covers it whole)"
+        );
+        t.with_entry(42, |e| {
+            let e = e.unwrap();
+            assert!(e.reads.0.is_empty(), "page 20's record goes too");
+            assert!(!e.drop_done);
+            assert_eq!(e.last_size, Some(5 * P));
+        });
+        // Not armed any more: a read is Plain, and its hit only marks.
+        t.read_begin(42, 3 * P, P);
+        assert!(t.write_begin(42, 8, false));
+        assert_eq!(t.claim(42, 8, 3 * P, P, true), Claim::Reply);
+        t.with_entry(42, |e| assert_ne!(e.unwrap().marks & Mark::S5.bit(), 0));
+        assert_eq!(t.counts().ambiguous_writes, 1);
+        // Page writeback is never registered, never claimed.
+        assert!(t.write_begin(42, 9, true));
+        assert_eq!(t.claim(42, 9, 0, P, true), Claim::Reply);
+        // A failed write repairs nothing and clears the records.
+        let seq = t.arm_drop(42, false, false);
+        t.drop_written(42, seq);
+        t.read_begin(42, 0, P);
+        assert!(t.write_begin(42, 10, false));
+        assert_eq!(t.claim(42, 10, 0, P, false), Claim::Reply);
+        t.with_entry(42, |e| assert!(e.unwrap().reads.0.is_empty()));
+    }
+
+    /// A RELEASE of a handle no request ever carried: the kernel may have
+    /// failed the open after the reply, skipping its drop, so the next open
+    /// at the same stamp drops; a used handle's release marks nothing.
+    #[test]
+    fn a_release_of_an_unused_dropping_handle_marks_the_drop_lost() {
+        let t = current();
+        assert!(
+            !t.open_reply(facts(2, Some(CacheStamp(8)))),
+            "stamp moved: drop"
+        );
+        t.released(42, 2, false);
+        t.with_entry(42, |e| assert_ne!(e.unwrap().marks & Mark::S2.bit(), 0));
+        assert!(
+            !t.open_reply(facts(3, Some(CacheStamp(8)))),
+            "its drop may not have run"
+        );
+        t.handle_used(42, 3);
+        t.released(42, 3, false);
+        assert!(
+            t.open_reply(facts(4, Some(CacheStamp(8)))),
+            "a used handle's drop ran"
+        );
+    }
+
+    /// A drop of an inode the table holds no entry for (a data
+    /// notification for an inode this kernel never opened) leaves no entry
+    /// once written; an open answered while it is still to be written
+    /// inherits its arm and keeps the entry.
+    #[test]
+    fn a_written_drop_of_an_unknown_inode_leaves_no_entry() {
+        let t = table();
+        let seq = t.arm_drop(7, false, true);
+        t.with_entry(7, |e| assert!(e.unwrap().armed()));
+        t.drop_written(7, seq);
+        let seq = t.arm_drop(8, true, false);
+        t.drop_written(8, seq);
+        assert_eq!(t.entries(), 0, "a FORGET never comes for these");
+        // Armed, then opened before the drop is written: the entry stays.
+        let seq = t.arm_drop(42, false, true);
+        t.open_reply(facts(1, S));
+        t.drop_written(42, seq);
+        t.with_entry(42, |e| assert!(e.unwrap().handles == 1));
+    }
+
+    /// A write that ends inside a page a read hit: that page is the
+    /// repair's last, on its own; a write that covers its last page whole
+    /// has none.
+    #[test]
+    fn the_writers_possibly_locked_last_page_is_repaired_last() {
+        let t = table();
+        t.open_reply(facts(1, S));
+        t.handle_used(42, 1);
+        t.read_begin(42, 0, 4 * P);
+        t.write_begin(42, 1, false);
+        assert_eq!(
+            t.claim(42, 1, P, 2 * P + 10, true),
+            Claim::Repair {
+                ranges: vec![(1, 3)],
+                tail: Some(3)
+            }
+        );
+        let seq = t.arm_drop(42, false, true);
+        t.drop_written(42, seq);
+        t.read_begin(42, 0, 4 * P);
+        t.write_begin(42, 2, false);
+        assert_eq!(
+            t.claim(42, 2, P, 3 * P, true),
+            Claim::Repair {
+                ranges: vec![(1, 4)],
+                tail: None
+            },
+            "the write covers its last page whole"
+        );
+    }
+
+    /// A completed whole-file drop supersedes the reads recorded before it
+    /// was announced (their folios are gone), not those after: the
+    /// writer's own tail folio, re-created after such a drop and locked
+    /// until its reply, is then not repaired — a repair of it would wait
+    /// for that very reply. (Checked to fail with the supersession
+    /// removed: the claim repairs page 3.)
+    #[test]
+    fn a_completed_drop_supersedes_the_reads_before_it() {
+        let t = table();
+        t.open_reply(OpenFacts {
+            write_access: true,
+            ..facts(1, S)
+        });
+        t.handle_used(42, 1);
+        t.read_begin(42, 3 * P, P);
+        // Another open's drop (the content changed), announced, then
+        // complete.
+        assert!(!t.open_reply(facts(2, Some(CacheStamp(8)))));
+        t.read_begin(42, 7 * P, P); // between announcement and completion
+        t.handle_used(42, 2);
+        t.with_entry(42, |e| {
+            let pages: Vec<u64> = e.unwrap().reads.0.iter().map(|r| r.0).collect();
+            assert_eq!(pages, vec![7], "page 3's record went with the drop");
+        });
+        t.write_begin(42, 9, false);
+        assert_eq!(
+            t.claim(42, 9, 3 * P, 5 * P, true),
+            Claim::Repair {
+                ranges: vec![(7, 8)],
+                tail: None
+            }
+        );
+        // A partial notification supersedes nothing.
+        t.read_begin(42, 3 * P, P);
+        let seq = t.arm_drop(42, false, false);
+        t.drop_written(42, seq);
+        t.with_entry(42, |e| assert_eq!(e.unwrap().reads.0.len(), 1));
+    }
+
+    /// Two registered writes at once (not expected): the records stay for
+    /// the other's claim, and the inode is marked.
+    #[test]
+    fn a_claim_beside_another_pending_write_keeps_the_records() {
+        let t = table();
+        t.open_reply(OpenFacts {
+            write_access: true,
+            ..facts(1, S)
+        });
+        t.handle_used(42, 1);
+        t.write_begin(42, 1, false);
+        t.read_begin(42, 0, P);
+        t.write_begin(42, 2, false);
+        assert_eq!(t.claim(42, 1, 0, P, true), Claim::Reply);
+        t.with_entry(42, |e| {
+            let e = e.unwrap();
+            assert!(!e.reads.0.is_empty());
+            assert_ne!(e.marks & Mark::S5.bit(), 0);
+        });
+        assert_eq!(
+            t.claim(42, 2, 0, P, true),
+            Claim::Repair {
+                ranges: vec![(0, 1)],
+                tail: None
+            },
+            "the other write's claim repairs"
+        );
+    }
+
+    /// W2 off (a kernel with the fix): a repair hit marks S5 instead.
+    #[test]
+    fn with_the_repair_off_a_hit_marks_instead() {
+        let t = PageCacheTable::with_page_size(
+            PageCacheConfig {
+                write_repair: crate::Switch::Off,
+                ..Default::default()
+            },
+            P,
+        );
+        t.open_reply(facts(1, S));
+        t.handle_used(42, 1);
+        t.read_begin(42, 0, P);
+        t.write_begin(42, 1, false);
+        assert_eq!(t.claim(42, 1, 0, P, true), Claim::Reply);
+        t.with_entry(42, |e| assert_ne!(e.unwrap().marks & Mark::S5.bit(), 0));
+    }
+
+    /// A3: a size other than the last one handed arms; an inode without
+    /// an entry is not created.
+    #[test]
+    fn a_size_change_in_a_reply_arms() {
+        let t = table();
+        t.size_seen(42, 10);
+        assert_eq!(t.entries(), 0);
+        t.open_reply(facts(1, S));
+        t.with_entry(42, |e| assert!(!e.unwrap().drop_done));
+        t.size_seen(42, 10);
+        t.with_entry(42, |e| assert!(e.unwrap().drop_done, "unknown size: armed"));
+        t.write_begin(42, 1, false);
+        t.claim(42, 1, 0, 10, true);
+        t.size_seen(42, 10);
+        t.with_entry(42, |e| assert!(!e.unwrap().drop_done, "the same size"));
+        t.size_seen(42, 11);
+        t.with_entry(42, |e| assert!(e.unwrap().drop_done));
+    }
+
+    /// A write whose reply was dropped unanswered gives its registration
+    /// up and marks the inode.
+    #[test]
+    fn an_abandoned_write_is_unregistered_and_marked() {
+        let t = table();
+        t.write_begin(42, 1, false);
+        t.abandon(42, 1);
+        t.with_entry(42, |e| {
+            let e = e.unwrap();
+            assert!(e.pending.is_empty());
+            assert_ne!(e.marks & Mark::S5.bit(), 0);
+        });
     }
 
     #[test]

@@ -73,6 +73,7 @@ use crate::dentries::{KernelEntries, RenameGuard};
 use crate::pagecache::PageCacheTable;
 use crate::passthrough::{reason, BackingOps, PassthroughState, PassthroughWish, PreOpen};
 use crate::refs::{Forgot, KernelRefs};
+use crate::repair::RepairLane;
 use crate::reply::{
     AttrReply, BytesReply, CopyReply, CreateReply, DirReply, EmptyReply, EntryReply, LockReply,
     LseekReply, OpenCtx, OpenReply, ReadReply, RenameReply, StatfsReply, Undo, WriteReply,
@@ -157,6 +158,11 @@ pub struct FuseFs<V: Vfs> {
     /// cache, as far as the adapter knows it — what lets an open keep a
     /// file's pages (`crate::pagecache`).
     pc: Arc<PageCacheTable>,
+    /// Plan 42 §5.2.3: the session's write-repair lane, and the gate it
+    /// writes through (set when the session's notifier exists:
+    /// `FuseSession::new`, or [`crate::FuseNotifySink::linked`]).
+    lane: Arc<RepairLane>,
+    gate: Arc<OnceLock<Arc<crate::notify::NotifyGate>>>,
 }
 
 /// What a session's notification sink shares with its filesystem
@@ -166,6 +172,7 @@ pub struct FuseFs<V: Vfs> {
 pub struct KernelLink {
     pub(crate) entries: Arc<KernelEntries>,
     pub(crate) pc: Arc<PageCacheTable>,
+    pub(crate) gate: Arc<OnceLock<Arc<crate::notify::NotifyGate>>>,
 }
 
 impl<V: Vfs> FuseFs<V> {
@@ -183,14 +190,36 @@ impl<V: Vfs> FuseFs<V> {
             entries: KernelEntries::new(),
             zero_copy_reads: ZeroCopyCounter::default(),
             pc: PageCacheTable::new(Default::default()),
+            lane: RepairLane::new(
+                PageCacheTable::new(Default::default()),
+                Arc::default(),
+                Arc::default(),
+                crate::repair::DEFAULT_WAIT,
+            ),
+            gate: Arc::default(),
         }
+        .with_workarounds(crate::Workarounds::default())
     }
 
     /// Plan 42: serve under these workaround settings (before the session
-    /// serves anything: the page-cache table starts over).
+    /// serves anything: the page-cache table and the repair lane start
+    /// over).
     pub fn with_workarounds(mut self, w: crate::Workarounds) -> Self {
         self.pc = PageCacheTable::new(w.page_cache());
+        self.gate = Arc::default();
+        self.lane = RepairLane::new(
+            self.pc.clone(),
+            self.gate.clone(),
+            self.deferred.clone(),
+            w.repair_wait,
+        );
         self
+    }
+
+    /// Where the session puts its notification gate once it exists (the
+    /// repair lane writes through it).
+    pub(crate) fn gate_slot(&self) -> Arc<OnceLock<Arc<crate::notify::NotifyGate>>> {
+        self.gate.clone()
     }
 
     /// This session's page-cache table (plan 42 §5.1.2).
@@ -204,6 +233,7 @@ impl<V: Vfs> FuseFs<V> {
         KernelLink {
             entries: self.entries.clone(),
             pc: self.pc.clone(),
+            gate: self.gate.clone(),
         }
     }
 
@@ -375,6 +405,8 @@ pub(crate) fn open_flags_write_access(flags: OpenFlags) -> bool {
 ///   bounded time instead of refusing up front, and refuses if one is
 ///   still unanswered then (an `fsync` waiting for S3 — before plan 39 the
 ///   same `fsync` held its worker, and the detach waited for the worker).
+///   Plan 42: so are the writes whose reply waits for a write-race repair
+///   (`crate::repair`), answered by the repair lane within its bound.
 ///
 /// Every other op answers inline, on the worker, before it reads again, so
 /// stopping the workers drains those by itself.
@@ -421,6 +453,14 @@ impl Deferred {
 
     fn track_bounded<R>(self: &Arc<Self>, reply: R) -> Tracked<R> {
         self.track_as(reply, true)
+    }
+
+    /// Count one bounded deferral until the returned hold drops (a reply
+    /// the repair lane writes).
+    pub(crate) fn hold_bounded(self: &Arc<Self>) -> BoundedHold {
+        self.bounded
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        BoundedHold(self.clone())
     }
 
     fn track_as<R>(self: &Arc<Self>, reply: R, bounded: bool) -> Tracked<R> {
@@ -498,6 +538,17 @@ impl<T, R: constellation_vfs::Responder<T>> constellation_vfs::Responder<T> for 
             Parkable::Park(_, true) => constellation_vfs::WaitStart::Refused,
             Parkable::Park(reply, false) => constellation_vfs::Responder::<T>::begin_wait(reply),
         }
+    }
+}
+
+/// One bounded deferral counted until dropped ([`Deferred::hold_bounded`]).
+pub(crate) struct BoundedHold(Arc<Deferred>);
+
+impl Drop for BoundedHold {
+    fn drop(&mut self) {
+        self.0
+            .bounded
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -1169,6 +1220,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             op.responder(EntryReply {
                 reply,
                 name: name_guard,
+                pc: self.pc.clone(),
             }),
         );
     }
@@ -1184,7 +1236,10 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             &op.ctx(&caller),
             ino.0,
             fh.map(|fh| Fh(fh.0)),
-            op.responder(AttrReply(reply)),
+            op.responder(AttrReply {
+                reply,
+                pc: self.pc.clone(),
+            }),
         );
     }
 
@@ -1226,7 +1281,10 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             ino.0,
             fh.map(|fh| Fh(fh.0)),
             &set,
-            op.responder(self.parkable(req, AttrReply(reply))),
+            op.responder(self.parkable(req, AttrReply {
+                reply,
+                pc: self.pc.clone(),
+            })),
         );
     }
 
@@ -1256,13 +1314,11 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             parent.0,
             name(n),
             mode,
-            op.responder(self.parkable(
-                req,
-                EntryReply {
-                    reply,
-                    name: name_guard,
-                },
-            )),
+            op.responder(self.parkable(req, EntryReply {
+                reply,
+                name: name_guard,
+                pc: self.pc.clone(),
+            })),
         );
     }
 
@@ -1289,13 +1345,11 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             name(n),
             mode,
             rdev,
-            op.responder(self.parkable(
-                req,
-                EntryReply {
-                    reply,
-                    name: name_guard,
-                },
-            )),
+            op.responder(self.parkable(req, EntryReply {
+                reply,
+                name: name_guard,
+                pc: self.pc.clone(),
+            })),
         );
     }
 
@@ -1316,13 +1370,11 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             ino.0,
             newparent.0,
             name(newname),
-            op.responder(self.parkable(
-                req,
-                EntryReply {
-                    reply,
-                    name: name_guard,
-                },
-            )),
+            op.responder(self.parkable(req, EntryReply {
+                reply,
+                name: name_guard,
+                pc: self.pc.clone(),
+            })),
         );
     }
 
@@ -1384,13 +1436,11 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             parent.0,
             name(link_name),
             target.as_os_str().as_bytes(),
-            op.responder(self.parkable(
-                req,
-                EntryReply {
-                    reply,
-                    name: name_guard,
-                },
-            )),
+            op.responder(self.parkable(req, EntryReply {
+                reply,
+                name: name_guard,
+                pc: self.pc.clone(),
+            })),
         );
     }
 
@@ -1496,6 +1546,11 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         let op = self.obs().begin(OpKind::Read, ino.0);
         let _in = op.enter();
         self.pc.handle_used(ino.0, fh.0);
+        // Plan 42 §5.2.2: recorded before the engine reads the data.
+        let counted = self
+            .pc
+            .read_begin(ino.0, offset, u64::from(size))
+            .then(|| crate::reply::InFlightOp::new(&self.pc, ino.0));
         self.vfs.read(
             &op.ctx(&caller).with_lock_owner(lock_owner.map(|o| o.0)),
             ino.0,
@@ -1504,14 +1559,12 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             size,
             // A cold read may be answered from the engine's completion
             // pool: counted until it is, for a detach to drain.
-            op.responder(self.deferred.track_bounded(self.parkable(
-                req,
-                ReadReply {
-                    reply,
-                    size,
-                    zero_copy: self.zero_copy_reads.clone(),
-                },
-            ))),
+            op.responder(self.deferred.track_bounded(self.parkable(req, ReadReply {
+                reply,
+                size,
+                zero_copy: self.zero_copy_reads.clone(),
+                _counted: counted,
+            }))),
         );
     }
 
@@ -1522,7 +1575,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         fh: FileHandle,
         offset: u64,
         data: &[u8],
-        _write_flags: WriteFlags,
+        write_flags: WriteFlags,
         flags: fuser::OpenFlags,
         lock_owner: Option<fuser::LockOwner>,
         reply: ReplyWrite,
@@ -1535,11 +1588,13 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         let caller = caller(req);
         let op = self.obs().begin(OpKind::Write, ino.0);
         let _in = op.enter();
-        // `_write_flags`: a `FUSE_WRITE_CACHE` write is a page's writeback,
+        // `write_flags`: a `FUSE_WRITE_CACHE` write is a page's writeback,
         // here (no writeback cache) a shared `mmap` store's, maybe from
         // before a `utimensat` that reached us first. It stamps mtime like
         // any write: nothing tells a store made before the set from one
-        // made after it (DESIGN §3 "File times", xcheckfs finding 11).
+        // made after it (DESIGN §3 "File times", xcheckfs finding 11). Plan
+        // 42 §5.2.2: only a write without it is a write-through one, whose
+        // folios race 1 can drop under it.
         //
         // Borrowed from wherever fuser received the request: the worker's
         // `/dev/fuse` buffer, or, over io_uring, the ring entry's own payload
@@ -1552,14 +1607,16 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         // `WriteData::Shared` itself.
         let flags = open_flags(flags.0);
         self.pc.handle_used(ino.0, fh.0);
-        // Plan 42 K3: an open answered while this write is under way
-        // drops (S5 until K4's bookkeeping; `WriteReply` marks again).
-        self.pc.mark(ino.0, crate::pagecache::Mark::S5);
+        let unique = req.unique().0;
+        let writeback = write_flags.contains(WriteFlags::FUSE_WRITE_CACHE);
+        let counted = self.pc.write_begin(ino.0, unique, writeback);
         let reply = WriteReply {
             reply,
             ino: ino.0,
+            offset,
             len: data.len() as u32,
-            pc: self.pc.clone(),
+            lane: self.lane.clone(),
+            reg: crate::reply::WriteReg::new(&self.pc, ino.0, unique, counted),
         };
         if !flags.contains(OpenFlags::SYNC) {
             self.vfs.write(
@@ -1576,7 +1633,6 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         // Plan 39 §3.3: an `O_SYNC`/`O_DSYNC` write waits for durability
         // like an `fsync` — on the engine's `fsync` pool, so a bounded
         // deferral, and ended by its caller's death.
-        let unique = req.unique().0;
         let token = self.interrupts.register(unique, req.pid(), self.lossy());
         let reply = op.responder(
             self.deferred

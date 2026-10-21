@@ -1033,6 +1033,7 @@ pub fn mount_source<V: Vfs>(
             let observer = fs.observer_slot();
             let entries = fs.kernel_entries().clone();
             let pc = fs.page_cache().clone();
+            let gate_slot = fs.gate_slot();
             let passthrough = fs.passthrough().clone();
             let zero_copy_reads = fs.zero_copy_reads().clone();
             let mut config = config;
@@ -1046,6 +1047,7 @@ pub fn mount_source<V: Vfs>(
                 observer,
                 entries,
                 pc,
+                gate_slot,
                 passthrough,
                 zero_copy_reads,
                 &caps,
@@ -1056,6 +1058,7 @@ pub fn mount_source<V: Vfs>(
                 config,
                 None,
                 true,
+                None,
                 None,
             )
         }
@@ -1159,6 +1162,7 @@ fn mount_path<V: Vfs>(
     let observer = fs.observer_slot();
     let entries = fs.kernel_entries().clone();
     let pc = fs.page_cache().clone();
+    let gate_slot = fs.gate_slot();
     let passthrough = fs.passthrough().clone();
     let zero_copy_reads = fs.zero_copy_reads().clone();
     if privileged() {
@@ -1177,6 +1181,7 @@ fn mount_path<V: Vfs>(
             observer,
             entries,
             pc,
+            gate_slot,
             passthrough,
             zero_copy_reads,
             &declared,
@@ -1187,6 +1192,7 @@ fn mount_path<V: Vfs>(
             config,
             Some(mountpoint.to_path_buf()),
             false,
+            None,
             None,
         );
     }
@@ -1210,6 +1216,7 @@ fn mount_path<V: Vfs>(
         observer,
         entries,
         pc,
+        gate_slot,
         passthrough,
         zero_copy_reads,
         &declared,
@@ -1221,6 +1228,7 @@ fn mount_path<V: Vfs>(
         Some(mountpoint.to_path_buf()),
         false,
         Some(unmounter),
+        None,
     )
 }
 
@@ -1263,6 +1271,7 @@ impl<V: Vfs> FuseSession<V> {
         observer: Arc<OnceLock<Observer>>,
         entries: Arc<KernelEntries>,
         pc: Arc<crate::PageCacheTable>,
+        gate_slot: Arc<OnceLock<Arc<NotifyGate>>>,
         passthrough: Arc<PassthroughState>,
         zero_copy_reads: ZeroCopyCounter,
         caps: &FrontendCaps,
@@ -1274,6 +1283,7 @@ impl<V: Vfs> FuseSession<V> {
         mountpoint: Option<PathBuf>,
         foreign: bool,
         fuser_unmounter: Option<fuser::SessionUnmounter>,
+        reuse_gate: Option<Arc<NotifyGate>>,
     ) -> std::io::Result<Self> {
         // A ring session is not detachable: the kernel can neither hand
         // its queues to another process nor route its requests back to
@@ -1313,7 +1323,21 @@ impl<V: Vfs> FuseSession<V> {
             .with_zero_copy_reads(zero_copy_reads)
             .with_ring_health(RingHealthStats::of_session(&config, transport)),
         );
-        let gate = NotifyGate::new(session.notifier(), entries.clone(), pc.clone());
+        // A gate to reuse (an in-process resume after an aborted handover:
+        // the engine already holds its sink) writes to this session's
+        // channel, kernel and table from now on.
+        let gate = match reuse_gate {
+            Some(gate) => {
+                gate.reopen(Some((session.notifier(), entries.clone(), pc.clone())));
+                gate
+            }
+            None => NotifyGate::new(session.notifier(), entries.clone(), pc.clone()),
+        };
+        // Plan 42 §5.2.3: the repair lane writes through it, from now on.
+        let _ = gate_slot.set(gate.clone());
+        if let Some(every) = opts.workarounds.unseen_drop {
+            spawn_unseen_drops(Arc::downgrade(&gate), pc.clone(), every);
+        }
         // The backing-id ioctls go to the connection; a duplicate of the
         // session's descriptor is the same connection, usable from any
         // worker and by `release` long after the open that registered
@@ -1407,6 +1431,7 @@ impl<V: Vfs> FuseSession<V> {
         let observer = fs.observer_slot();
         let entries = fs.kernel_entries().clone();
         let pc = fs.page_cache().clone();
+        let gate_slot = fs.gate_slot();
         // Plan 42 §5.1.2: a resumed session's page-cache table starts empty
         // (nothing it knows of the kernel's pages crosses the handover), and
         // exists — attached to the gate below — before the first request is
@@ -1441,12 +1466,13 @@ impl<V: Vfs> FuseSession<V> {
             config.clone(),
             handoff.init,
         )?;
-        let mut resumed = FuseSession::new(
+        let resumed = FuseSession::new(
             session,
             deferred,
             observer,
             entries,
             pc,
+            gate_slot,
             passthrough,
             zero_copy_reads,
             &caps,
@@ -1458,18 +1484,20 @@ impl<V: Vfs> FuseSession<V> {
             handoff.mountpoint,
             handoff.foreign,
             None,
+            sink.map(|sink| sink.gate().clone()),
         )?;
-        if let Some(sink) = sink {
-            sink.gate().reopen(Some((
-                resumed.session.notifier(),
-                resumed.shared.entries.clone(),
-                resumed.shared.pc.clone(),
-            )));
-            Arc::get_mut(&mut resumed.shared)
-                .expect("a new session's state is not shared yet")
-                .gate = sink.gate().clone();
-        }
         Ok(resumed)
+    }
+
+    /// Plan 42 §5.1.2: the handles a resumed session's kernel holds from
+    /// before the handover, per inode in the view's numbering — `(inode,
+    /// open handles, handles with write access)` — so that reads through a
+    /// handle opened before the upgrade are recorded as they were. Call
+    /// before [`Self::run`].
+    pub fn seed_handles(&self, handles: impl IntoIterator<Item = (u64, u32, u32)>) {
+        for (ino, open, writers) in handles {
+            self.shared.pc.seed_handles(ino, open, writers);
+        }
     }
 
     /// What this session's `FUSE_INIT` agreed.
@@ -1689,6 +1717,37 @@ fn sync_view<V: Vfs>(vfs: &V) -> Result<(), DetachError> {
     let caller = Caller::new(0, 0, None);
     Blocking::run(|r| vfs.sync_view(&OpCtx::new(OpKind::SyncView, &caller), r))
         .map_err(|e| refused(e.code(), "publishing the view's pending writes failed"))
+}
+
+/// Plan 42 §7.2's test-only unseen drop (`Workarounds::unseen_drop`):
+/// every `every`, the pages of every file the table knows open for
+/// writing are dropped through the gate with no arm and no mark. Ends
+/// with the gate.
+fn spawn_unseen_drops(
+    gate: std::sync::Weak<NotifyGate>,
+    pc: Arc<crate::PageCacheTable>,
+    every: Duration,
+) {
+    let spawned = std::thread::Builder::new()
+        .name("fuse-unseen-drop".into())
+        .spawn(move || loop {
+            std::thread::sleep(every);
+            let Some(gate) = gate.upgrade() else {
+                return;
+            };
+            let notifier = match gate.enter() {
+                Ok((notifier, _, _)) => notifier,
+                Err(Some(_)) => continue,
+                Err(None) => return,
+            };
+            for ino in pc.writable_inodes() {
+                let _ = notifier.inval_inode(fuser::INodeNo(ino), 0, 0);
+            }
+            gate.exit();
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "could not start the unseen-drop fault thread");
+    }
 }
 
 /// Unmounts or detaches a [`FuseSession`] from another thread.

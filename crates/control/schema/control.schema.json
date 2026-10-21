@@ -2848,6 +2848,18 @@
     "FuseKernelCacheStatus": {
       "description": "Plan 42 §5.7: what one mount's kernel-race workarounds did.",
       "properties": {
+        "ambiguous_writes": {
+          "description": "Write claims with an ambiguous hit (a read since the last claim with\nno drop known): marked `s5` instead of repaired.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "concurrent_writes": {
+          "description": "Claims while another write-through write of the file was pending\n(not expected; logged once).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "dropping_opens": {
           "additionalProperties": {
             "format": "uint64",
@@ -2859,6 +2871,40 @@
         },
         "keep_cache_opens": {
           "description": "Opens answered `FOPEN_KEEP_CACHE`: the kernel kept the file's\npages, known current (W1).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "repair_pages": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "repair_wait_max_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "repair_wait_ms": {
+          "description": "How long repaired writes' replies waited, in all and at most (ms).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "repairs": {
+          "description": "Writes whose reply waited for a write-race repair (W2), and the\npages those repairs invalidated.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "repairs_late": {
+          "description": "Repairs that came after their write had been answered at the\nbound, or could not be made (the handover gate was closed): each\nmarks the file `s5`. Nonzero on a kernel without the race-1 fix\nmeans a notification blocked on the writer's own folio; with the\nfix, a forced `CONSTELLATION_FUSE_WRITE_REPAIR=on`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "repairs_released": {
+          "description": "Repairs whose write was answered early because the repair blocked\non the write's own last page with nothing else of the file in\nflight (the page the writer keeps locked until its reply, which no\nread can have made stale); marked `s5` all the same.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -2876,7 +2922,15 @@
       "required": [
         "keep_cache_opens",
         "dropping_opens",
-        "suspect_marks"
+        "suspect_marks",
+        "repairs",
+        "repair_pages",
+        "repairs_late",
+        "repairs_released",
+        "repair_wait_ms",
+        "repair_wait_max_ms",
+        "ambiguous_writes",
+        "concurrent_writes"
       ],
       "type": "object"
     },

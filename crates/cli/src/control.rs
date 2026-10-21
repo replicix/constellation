@@ -178,6 +178,14 @@ fn kernel_cache_status(
         keep_cache_opens: c.keep_cache_opens,
         dropping_opens: by(&c.dropping_opens),
         suspect_marks: by(&c.suspect_marks),
+        repairs: c.repairs,
+        repair_pages: c.repair_pages,
+        repairs_late: c.repairs_late,
+        repairs_released: c.repairs_released,
+        repair_wait_ms: c.repair_wait_ms,
+        repair_wait_max_ms: c.repair_wait_max_ms,
+        ambiguous_writes: c.ambiguous_writes,
+        concurrent_writes: c.concurrent_writes,
     }
 }
 

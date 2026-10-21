@@ -14,6 +14,54 @@ pub const KEEP_CACHE_ENV: &str = "CONSTELLATION_FUSE_KEEP_CACHE";
 /// `CONSTELLATION_FAULT_KEEP_CACHE_IGNORE_SUSPECT=1` (test-only).
 pub const IGNORE_SUSPECT_FAULT_ENV: &str = "CONSTELLATION_FAULT_KEEP_CACHE_IGNORE_SUSPECT";
 
+/// `CONSTELLATION_FUSE_WRITE_REPAIR`: `auto` (default), `on` or `off`.
+pub const WRITE_REPAIR_ENV: &str = "CONSTELLATION_FUSE_WRITE_REPAIR";
+
+/// `CONSTELLATION_FUSE_WRITE_REPAIR_WAIT_MS`: the repair's bound.
+pub const WRITE_REPAIR_WAIT_ENV: &str = "CONSTELLATION_FUSE_WRITE_REPAIR_WAIT_MS";
+
+/// `CONSTELLATION_FAULT_UNSEEN_DROP_MS=N` (test-only): see
+/// [`Workarounds::unseen_drop`].
+pub const UNSEEN_DROP_FAULT_ENV: &str = "CONSTELLATION_FAULT_UNSEEN_DROP_MS";
+
+/// The kernel's page size.
+pub(crate) fn page_size() -> u64 {
+    // SAFETY: sysconf has no preconditions.
+    let p = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if p > 0 && (p as u64).is_power_of_two() {
+        p as u64
+    } else {
+        4096
+    }
+}
+
+/// An `auto`/`on`/`off` setting: `auto` is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Switch {
+    Auto,
+    On,
+    Off,
+}
+
+impl Switch {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => Some(Self::Auto),
+            "on" => Some(Self::On),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
 /// The workarounds' settings (module doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Workarounds {
@@ -21,6 +69,17 @@ pub struct Workarounds {
     pub keep_cache: KeepCache,
     /// The fault-only naive keep-cache of §7.2 (ignores S5).
     pub ignore_s5: bool,
+    /// W2's repair, plan 42 §5.2.3 (`auto`: on).
+    pub write_repair: Switch,
+    /// The repair's in-flight-aware bound.
+    pub repair_wait: std::time::Duration,
+    /// Test-only: every this often, the session drops the pages of every
+    /// file open for writing with a data notification nothing announces —
+    /// no arm, no mark — as memory reclaim would if it could drop a folio
+    /// a writer holds (it cannot: `crate::pagecache`'s module doc). The
+    /// drop the write-race bookkeeping cannot see, for the
+    /// `kernel-race-unseen-drop` scenario.
+    pub unseen_drop: Option<std::time::Duration>,
 }
 
 impl Default for Workarounds {
@@ -28,6 +87,9 @@ impl Default for Workarounds {
         Self {
             keep_cache: KeepCache::Auto,
             ignore_s5: false,
+            write_repair: Switch::Auto,
+            repair_wait: crate::repair::DEFAULT_WAIT,
+            unseen_drop: None,
         }
     }
 }
@@ -52,9 +114,38 @@ impl Workarounds {
                  vouch for (a fault-injection knob; never set it on a real filesystem)"
             );
         }
+        let write_repair = match get(WRITE_REPAIR_ENV) {
+            Some(raw) => Switch::parse(&raw)
+                .ok_or_else(|| format!("{WRITE_REPAIR_ENV}={raw}: expected auto, on or off"))?,
+            None => Switch::Auto,
+        };
+        let repair_wait = match get(WRITE_REPAIR_WAIT_ENV) {
+            Some(raw) => std::time::Duration::from_millis(
+                raw.parse::<u64>()
+                    .ok()
+                    .filter(|ms| *ms > 0)
+                    .ok_or_else(|| {
+                        format!("{WRITE_REPAIR_WAIT_ENV}={raw}: expected a positive number of ms")
+                    })?,
+            ),
+            None => crate::repair::DEFAULT_WAIT,
+        };
+        let unseen_drop = get(UNSEEN_DROP_FAULT_ENV)
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(std::time::Duration::from_millis);
+        if unseen_drop.is_some() {
+            tracing::warn!(
+                "{UNSEEN_DROP_FAULT_ENV}: the session drops written files' pages unannounced \
+                 (a fault-injection knob; never set it on a real filesystem)"
+            );
+        }
         Ok(Self {
             keep_cache,
             ignore_s5,
+            write_repair,
+            repair_wait,
+            unseen_drop,
         })
     }
 
@@ -63,6 +154,7 @@ impl Workarounds {
         PageCacheConfig {
             keep_cache: self.keep_cache,
             ignore_s5: self.ignore_s5,
+            write_repair: self.write_repair,
         }
     }
 }

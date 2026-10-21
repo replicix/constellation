@@ -778,6 +778,30 @@ pub struct FuseKernelCacheStatus {
     /// answered with an error or a short count), `s4` (a direct-I/O open),
     /// `s5` (the write-race bookkeeping could not rule a stale page out).
     pub suspect_marks: std::collections::BTreeMap<String, u64>,
+    /// Writes whose reply waited for a write-race repair (W2), and the
+    /// pages those repairs invalidated.
+    pub repairs: u64,
+    pub repair_pages: u64,
+    /// Repairs that came after their write had been answered at the
+    /// bound, or could not be made (the handover gate was closed): each
+    /// marks the file `s5`. Nonzero on a kernel without the race-1 fix
+    /// means a notification blocked on the writer's own folio; with the
+    /// fix, a forced `CONSTELLATION_FUSE_WRITE_REPAIR=on`.
+    pub repairs_late: u64,
+    /// Repairs whose write was answered early because the repair blocked
+    /// on the write's own last page with nothing else of the file in
+    /// flight (the page the writer keeps locked until its reply, which no
+    /// read can have made stale); marked `s5` all the same.
+    pub repairs_released: u64,
+    /// How long repaired writes' replies waited, in all and at most (ms).
+    pub repair_wait_ms: u64,
+    pub repair_wait_max_ms: u64,
+    /// Write claims with an ambiguous hit (a read since the last claim with
+    /// no drop known): marked `s5` instead of repaired.
+    pub ambiguous_writes: u64,
+    /// Claims while another write-through write of the file was pending
+    /// (not expected; logged once).
+    pub concurrent_writes: u64,
 }
 
 /// Passthrough opens on one mount (plan 38 §3(c)): the kernel reading a

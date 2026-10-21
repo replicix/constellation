@@ -107,6 +107,18 @@ impl HandleTableSnapshot {
     pub fn open_inos(&self) -> impl Iterator<Item = Ino> + '_ {
         self.opens.iter().map(|(ino, _)| *ino)
     }
+
+    /// Plan 42 §5.1.2: `(inode, open handles, write-intent handles)` per
+    /// open inode, for a resumed frontend's page-cache table (a
+    /// write-intent handle — write, truncate, append — counts as one that
+    /// can write).
+    pub fn page_cache_seed(&self) -> Vec<(Ino, u32, u32)> {
+        let writers: std::collections::HashMap<Ino, u32> = self.writers.iter().copied().collect();
+        self.opens
+            .iter()
+            .map(|&(ino, n)| (ino, n, writers.get(&ino).copied().unwrap_or(0)))
+            .collect()
+    }
 }
 
 /// Everything a host needs to reopen a view in the next process

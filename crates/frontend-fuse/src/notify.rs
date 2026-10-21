@@ -95,7 +95,7 @@ impl NotifyGate {
     /// as a write under way; `Err` with the session's table while the
     /// gate is closed (`None` once it is retired).
     #[allow(clippy::type_complexity)]
-    fn enter(
+    pub(crate) fn enter(
         &self,
     ) -> Result<(Notifier, Arc<KernelEntries>, Arc<PageCacheTable>), Option<Arc<PageCacheTable>>>
     {
@@ -116,7 +116,7 @@ impl NotifyGate {
         self.state.lock().unwrap().pc.clone()
     }
 
-    fn exit(&self) {
+    pub(crate) fn exit(&self) {
         let mut st = self.state.lock().unwrap();
         st.writing -= 1;
         if st.writing == 0 {
@@ -188,9 +188,10 @@ impl FuseNotifySink {
     /// session ([`crate::FuseFs::kernel_link`]): what it writes and fails
     /// to write is marked in that session's page-cache table.
     pub fn linked(notifier: Notifier, link: &crate::KernelLink) -> Self {
-        Self {
-            gate: NotifyGate::new(notifier, link.entries.clone(), link.pc.clone()),
-        }
+        let gate = NotifyGate::new(notifier, link.entries.clone(), link.pc.clone());
+        // The session's repair lane writes through it too.
+        let _ = link.gate.set(gate.clone());
+        Self { gate }
     }
 
     pub(crate) fn gated(gate: Arc<NotifyGate>) -> Self {
@@ -227,11 +228,18 @@ impl FrontendEvents for FuseNotifySink {
         };
         for inv in batch {
             // Before the write: an open answered while the kernel drops
-            // the pages must not keep them (S1).
+            // the pages must not keep them (S1), and the drop is armed
+            // for the write-race bookkeeping until the write returns
+            // (A2: the kernel drops inside it).
             let data = data_ino(inv);
-            if let Some(ino) = data {
+            let whole = matches!(
+                inv,
+                Invalidation::Data { range: None, .. } | Invalidation::Fenced { .. }
+            );
+            let arm = data.map(|ino| {
                 pc.mark(ino, Mark::S1);
-            }
+                (ino, pc.arm_drop(ino, false, whole))
+            });
             // ENOENT (nothing cached) is the common answer; any other
             // error leaves pages the kernel did not drop (S2), and for
             // the rest only means there was nothing to drop.
@@ -266,6 +274,9 @@ impl FrontendEvents for FuseNotifySink {
                 if e.raw_os_error() != Some(libc::ENOENT) {
                     pc.mark(ino, Mark::S2);
                 }
+            }
+            if let Some((ino, seq)) = arm {
+                pc.drop_written(ino, seq);
             }
         }
         self.gate.exit();

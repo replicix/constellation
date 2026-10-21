@@ -22,6 +22,7 @@ mod notify;
 pub mod pagecache;
 pub mod passthrough;
 pub mod refs;
+mod repair;
 mod reply;
 mod session;
 pub mod stats;
@@ -50,7 +51,7 @@ pub use session::{
 pub use stats::{
     FallbackReason, LockWaitCounter, RingHealthStats, SessionStats, TransportFallback,
 };
-pub use workarounds::Workarounds;
+pub use workarounds::{Switch, Workarounds};
 
 /// Whether this build can serve FUSE-over-io_uring at all (the `io-uring`
 /// feature, on Linux): what `constellation daemon --fuse-transports`

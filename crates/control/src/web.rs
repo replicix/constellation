@@ -1345,6 +1345,43 @@ fn kernel_cache_metrics(output: &mut String, fuse: &FuseStatus) {
         "# HELP constellation_fuse_suspect_marks_total Marks that a file's kernel pages may be stale, by mark (plan 42 S1-S5).\n\
          # TYPE constellation_fuse_suspect_marks_total counter\n",
     );
+    for (name, help, get) in [
+        (
+            "constellation_fuse_write_repairs_total",
+            "Writes whose reply waited for a write-race repair (plan 42 W2).",
+            (|k: &crate::proto::types::FuseKernelCacheStatus| k.repairs) as fn(&_) -> u64,
+        ),
+        (
+            "constellation_fuse_write_repair_pages_total",
+            "Pages write-race repairs invalidated.",
+            |k| k.repair_pages,
+        ),
+        (
+            "constellation_fuse_write_repairs_late_total",
+            "Write-race repairs finished after their write was answered at the bound, or skipped.",
+            |k| k.repairs_late,
+        ),
+        (
+            "constellation_fuse_write_repair_wait_ms_total",
+            "Milliseconds repaired writes' replies waited.",
+            |k| k.repair_wait_ms,
+        ),
+        (
+            "constellation_fuse_ambiguous_writes_total",
+            "Write claims with an ambiguous read hit, marked instead of repaired.",
+            |k| k.ambiguous_writes,
+        ),
+    ] {
+        let _ = writeln!(output, "# HELP {name} {help}\n# TYPE {name} counter");
+        for m in &fuse.mounts {
+            let _ = writeln!(
+                output,
+                "{name}{{mountpoint=\"{}\"}} {}",
+                label_value(&m.mountpoint),
+                get(&m.kernel_cache)
+            );
+        }
+    }
     for m in &fuse.mounts {
         for (mark, n) in &m.kernel_cache.suspect_marks {
             let _ = writeln!(

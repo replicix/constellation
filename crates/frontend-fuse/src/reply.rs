@@ -10,8 +10,9 @@
 //! started (`constellation_engine::locks::ClusterLocks::lock`).
 
 use crate::dentries::{EntryGuard, RenameGuard};
-use crate::pagecache::{Mark, OpenFacts, PageCacheTable};
+use crate::pagecache::{Claim, Mark, OpenFacts, PageCacheTable};
 use crate::passthrough::{OpenAnswer, PassthroughState, PreOpen};
+use crate::repair::RepairLane;
 use crate::stats::ZeroCopyCounter;
 use constellation_types::Code;
 use constellation_vfs::{
@@ -87,13 +88,18 @@ pub(crate) struct EntryReply {
     // EIO.
     pub name: EntryGuard,
     pub reply: ReplyEntry,
+    /// Plan 42 §5.2.1 (A3): the size a file's reply hands the kernel.
+    pub pc: Arc<PageCacheTable>,
 }
 
 impl Responder<Entry> for EntryReply {
     fn done(self, r: VfsResult<Entry>) {
-        let EntryReply { reply, name } = self;
+        let EntryReply { name, reply, pc } = self;
         match r {
             Ok(e) => {
+                if e.attr.kind == FileKind::File {
+                    pc.size_seen(e.attr.ino, e.attr.size);
+                }
                 // Before the bytes go: the kernel may forget this lookup as
                 // soon as it has the reply, on another worker.
                 name.hands_out(e.attr.ino);
@@ -111,20 +117,31 @@ impl Responder<Entry> for EntryReply {
     }
 }
 
-pub(crate) struct AttrReply(pub ReplyAttr);
+/// An attribute reply (`GETATTR`, `SETATTR`). Plan 42 §5.2.1 (A3): a
+/// size other than the one last handed to the kernel makes the requester
+/// drop the file's pages when it installs the reply.
+pub(crate) struct AttrReply {
+    pub reply: ReplyAttr,
+    pub pc: Arc<PageCacheTable>,
+}
 
 impl Responder<Attr> for AttrReply {
     fn done(self, r: VfsResult<Attr>) {
         match r {
-            Ok(a) => self.0.attr(&a.ttl, &fuse_attr(&a)),
-            Err(e) => self.0.error(reply_code(e.code())),
+            Ok(a) => {
+                if a.kind == FileKind::File {
+                    self.pc.size_seen(a.ino, a.size);
+                }
+                self.reply.attr(&a.ttl, &fuse_attr(&a))
+            }
+            Err(e) => self.reply.error(reply_code(e.code())),
         }
     }
 
     /// A parked op's reply holds one of its ring queue's lock-wait entries
     /// (plan 43 C7-F F-c).
     fn begin_wait(&mut self) -> constellation_vfs::WaitStart {
-        ring_wait(self.0.hold_for_wait())
+        ring_wait(self.reply.hold_for_wait())
     }
 }
 
@@ -171,6 +188,31 @@ pub(crate) struct ReadReply {
     pub reply: ReplyData,
     pub size: u32,
     pub zero_copy: ZeroCopyCounter,
+    /// Plan 42 §5.2.3: counted in flight on its inode until answered.
+    pub _counted: Option<InFlightOp>,
+}
+
+/// A request counted in flight on an inode
+/// ([`PageCacheTable::read_begin`]/`write_begin`) until this drops —
+/// after its reply was written, on every path.
+pub(crate) struct InFlightOp {
+    pc: Arc<PageCacheTable>,
+    ino: Ino,
+}
+
+impl InFlightOp {
+    pub(crate) fn new(pc: &Arc<PageCacheTable>, ino: Ino) -> Self {
+        Self {
+            pc: pc.clone(),
+            ino,
+        }
+    }
+}
+
+impl Drop for InFlightOp {
+    fn drop(&mut self) {
+        self.pc.op_done(self.ino);
+    }
 }
 
 /// A zero-copy read's chunk file, for `read_fixed` (which wants an owned
@@ -375,6 +417,10 @@ fn with_keep(flags: FopenFlags, keep: bool) -> FopenFlags {
     }
 }
 
+fn answer_is_ok(answer: &OpenAnswer) -> bool {
+    !matches!(answer, OpenAnswer::Refuse(_))
+}
+
 /// The `FOPEN_*` word and backing id of an answer that is not a refusal.
 fn fopen(answer: OpenAnswer) -> Option<(FopenFlags, Option<u32>)> {
     match answer {
@@ -495,6 +541,10 @@ impl Responder<(Entry, Opened)> for CreateReply {
                 let fh = FileHandle(o.fh.0);
                 let attr = fuse_attr(&e.attr);
                 let generation = Generation(e.generation);
+                // A3 (plan 42 §5.2.1); a refused open below hands nothing.
+                if answer_is_ok(&answer) {
+                    cx.pc.size_seen(e.attr.ino, e.attr.size);
+                }
                 match fopen(answer) {
                     Some((flags, None)) => {
                         let keep = cx.keeps(e.attr.ino, o.fh, o.cache, flags, false, true);
@@ -546,31 +596,83 @@ impl Responder<(Entry, Opened)> for CreateReply {
 /// daemon did not take (the kernel turns a short count into `EIO` and
 /// keeps the folios' contents, 1a061c554253), so the file's pages are no
 /// longer known current.
+///
+/// Plan 42 §5.2.3: a write-through write's claim — the reads recorded on
+/// its pages — decides whether its reply waits for a repair, which the
+/// session's repair lane makes and then answers (`crate::repair`); the
+/// worker does not wait.
 pub(crate) struct WriteReply {
     pub reply: ReplyWrite,
     pub ino: Ino,
+    pub offset: u64,
     /// The bytes the request carried.
     pub len: u32,
-    pub pc: Arc<PageCacheTable>,
+    pub lane: Arc<RepairLane>,
+    /// The write's registration and in-flight count, taken when the
+    /// request arrived (`PageCacheTable::write_begin`).
+    pub reg: WriteReg,
+}
+
+/// A write's registration, given up if its reply is dropped unanswered
+/// (`PageCacheTable::abandon`: a responder dropped without `done`, which
+/// fuser answers `EIO`), and its in-flight count, which ends with it.
+/// Made by the adapter before the request is handed on, so every way the
+/// reply can end passes through it.
+pub(crate) struct WriteReg {
+    pc: Arc<PageCacheTable>,
+    unique: u64,
+    ino: Ino,
+    claimed: bool,
+    /// Dropped with the registration: after the reply, or at the hand-off.
+    _counted: Option<InFlightOp>,
+}
+
+impl WriteReg {
+    /// `counted`: what `PageCacheTable::write_begin` answered.
+    pub(crate) fn new(pc: &Arc<PageCacheTable>, ino: Ino, unique: u64, counted: bool) -> Self {
+        Self {
+            pc: pc.clone(),
+            unique,
+            ino,
+            claimed: false,
+            _counted: counted.then(|| InFlightOp::new(pc, ino)),
+        }
+    }
+}
+
+impl Drop for WriteReg {
+    fn drop(&mut self) {
+        if !self.claimed {
+            self.pc.abandon(self.ino, self.unique);
+        }
+    }
 }
 
 impl Responder<u32> for WriteReply {
     fn done(self, r: VfsResult<u32>) {
-        // Until the write-race bookkeeping (plan 42 K4), a page a
-        // write-through write touched cannot be vouched for (race 1):
-        // the next open drops, as every open did before plan 42.
-        self.pc.mark(self.ino, Mark::S5);
-        match r {
-            Ok(n) => {
-                if n < self.len {
-                    self.pc.mark(self.ino, Mark::S3);
-                }
-                self.reply.written(n)
+        let WriteReply {
+            reply,
+            ino,
+            offset,
+            len,
+            lane,
+            mut reg,
+        } = self;
+        let ok = matches!(r, Ok(n) if n >= len);
+        if !ok {
+            reg.pc.mark(ino, Mark::S3);
+        }
+        reg.claimed = true;
+        let claim = reg.pc.claim(ino, reg.unique, offset, u64::from(len), ok);
+        match (claim, r) {
+            (Claim::Repair { ranges, tail }, Ok(n)) => {
+                // Handed to the lane: no longer in flight here (the
+                // repair's clock runs only while nothing else is).
+                drop(reg);
+                lane.submit(ino, ranges, tail, Box::new(move || reply.written(n)));
             }
-            Err(e) => {
-                self.pc.mark(self.ino, Mark::S3);
-                self.reply.error(reply_code(e.code()))
-            }
+            (_, Ok(n)) => reply.written(n),
+            (_, Err(e)) => reply.error(reply_code(e.code())),
         }
     }
 
@@ -754,6 +856,29 @@ impl Responder<()> for DirReply {
 mod tests {
     use super::*;
     use constellation_types::Rdev;
+
+    /// A write's reply dropped without an answer (fuser then answers
+    /// `EIO`) gives its registration up: the pending write goes, the inode
+    /// is marked S5 and its in-flight count returns to 0 — else every later
+    /// claim of the inode would see a concurrent write and the repair clock
+    /// would never run again. (The registration used to be made inside
+    /// `done`, so a dropped reply left both behind.)
+    #[test]
+    fn a_write_reply_dropped_unanswered_gives_its_registration_up() {
+        let pc = PageCacheTable::with_page_size(Default::default(), 4096);
+        let counted = pc.write_begin(7, 11, false);
+        assert!(counted);
+        let reg = WriteReg::new(&pc, 7, 11, counted);
+        assert_eq!(pc.ops_in_flight(7), 1);
+        pc.with_entry(7, |e| assert_eq!(e.unwrap().pending.len(), 1));
+        drop(reg);
+        assert_eq!(pc.ops_in_flight(7), 0);
+        pc.with_entry(7, |e| {
+            let e = e.unwrap();
+            assert!(e.pending.is_empty());
+            assert_ne!(e.marks, 0, "S5");
+        });
+    }
 
     /// The FUSE boundary answers every errno the adapter produced before
     /// plan 31 with exactly the same number: each code the workspace uses

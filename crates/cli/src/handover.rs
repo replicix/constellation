@@ -1564,6 +1564,9 @@ pub(crate) fn resume_mount(node: &Arc<NodeRuntime>, m: MountHandoff) -> Result<M
     let caps = constellation_frontend_fuse::caps(engine.locks_cluster() && !m.read_only);
     let events = constellation_engine::DeferredEvents::new();
     let open: Vec<constellation_vfs::Ino> = m.view.handles.open_inos().collect();
+    // Plan 42 §5.1.2: the handles the kernel holds from before the
+    // handover, seeded into the resumed session's (empty) page-cache table.
+    let held = m.view.handles.page_cache_seed();
     let (qos, confine_links) = (m.view.spec.qos, m.view.spec.confine_links);
     let view =
         engine.open_view_resumed(m.view.spec, m.view.handles, caps.clone(), events.clone())?;
@@ -1595,6 +1598,15 @@ pub(crate) fn resume_mount(node: &Arc<NodeRuntime>, m: MountHandoff) -> Result<M
             return Err(e).context("resuming the FUSE session");
         }
     };
+    let root_ino = view.view_root();
+    session.seed_handles(held.into_iter().map(|(ino, open, writers)| {
+        let ino = if ino == root_ino {
+            constellation_vfs::ROOT_INO
+        } else {
+            ino
+        };
+        (ino, open, writers)
+    }));
     let sink = session.notifier();
     events.set(Arc::new(sink.clone()));
     let root = view.view_root();
