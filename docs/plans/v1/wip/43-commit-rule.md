@@ -2760,7 +2760,11 @@ successor whose clock is ahead got no quarantine").
   began since would otherwise stand in a version a sealer may replace as it
   lands; so does one whose outcome is not known (an answer lost: it may
   have landed) until a lease version is next adopted from S3
-  (`LeaseState::reconfig_doubt`). The mark of the release (`issue_release`)
+  (`LeaseState::reconfig_doubt`). The same doubt gates acknowledgements
+  (`durable_jseq`): every node such a CAS lists may seal the tenure, so an
+  acknowledgement rests on each of them (or the log) as well as on the
+  held version's rule; a held `Local` tenure acknowledges nothing on its
+  disk alone meanwhile. The mark of the release (`issue_release`)
   and the lock part of the
   predicate share one function, so they cannot drift; read terms are not
   part of the release (read delegations are recalled before a release).

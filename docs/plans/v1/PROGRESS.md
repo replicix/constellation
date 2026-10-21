@@ -55415,3 +55415,181 @@ L3 adds floors only where a duty was live at the first listing
 noise); (b) removes the second floor of `double-seal-after-the-grace` and
 about 1 to 2 % of those of `locks-failover-backup` (-26 of 2038) and its
 `-writes` twin (1979 -> 1932); nothing else moves by more than noise.
+
+## Fix: a reconfiguration in doubt gates acknowledgements and liveness as the version it may have written (plan 43 C7-F F-a0) (2026-10-20)
+
+Found by the F-a0 follow-up review ("noticed, not verified"), confirmed here.
+
+### The problem
+
+A `Local` holder brings a candidate up and lists it with a reconfiguration CAS.
+Sometimes that CAS fails with its outcome unknown: a timeout, after which it
+may have landed. The holder then keeps its `Local` version, while S3 may list
+the candidate. The review's `reconfig_doubt` held the lock answers in that
+window. Two other paths still ran as `Local`:
+
+- **Acknowledgements.** `durable_jseq` gates a `Local` tenure on the log only
+  while a candidate exists or a peer in budget is eligible. Suppose the
+  candidate is then cut off and nobody else is in budget (two nodes, or every
+  other peer far away):
+  - the holder acknowledges on its disk alone, and the fast path opens;
+  - the candidate, listed in S3, seals the holder after its silence window
+    and takes over with only its tail and the log (`on_takeover_get`,
+    `apply_backup_tail`);
+  - the holder's lease CASes time out, so it learns of the takeover late;
+  - its acknowledged ops come back only by rollback and replay, and only if
+    it survives and the replay does not conflict.
+- **Liveness.** `renew_fresh` covers strict reads, new grants and renewals,
+  and the FUSE side's `reads_locally` uses the same rule. Both treat a
+  `Local` tenure as always fresh. A sealer's floor covers only a fast
+  tenure's liveness window. The review's hold applies only to an unmarked
+  body, and a strict-read tenure is marked. So strict reads were answered on
+  the `Local` lease's word after the successor may have taken over.
+
+### The fix
+
+- `LeaseState::reconfig_doubt` becomes `Option<ReconfigDoubt>`, a summary of
+  every reconfiguration in doubt since the held version was adopted. Retries
+  are conditioned on the same version, so any one of them may be the one that
+  landed. It records:
+  - `unmarked_sealable`: the lock side, as before (`reconfig_in_doubt`);
+  - `backups`: every node one of them lists.
+
+  It is cleared by `renewed` and `adopt`, as before.
+- `durable_jseq` takes the minimum of two terms: the held version's rule
+  (`durable_jseq_held`), and `backed_through` over the doubted backups (the
+  log counts too). The candidate's acknowledgements alone are not enough
+  either: if the CAS did not land, an unlisted candidate voids its tail once
+  the holder is gone. Under a held `Local` lease the result is to wait for
+  the log.
+- `Core::may_be_taken_over_early` (fast, or a doubted backup listed) replaces
+  `fast_tenure` in three places:
+  - `renew_fresh`;
+  - `renew_kick`'s early return (its probe now runs for a marked doubt too);
+  - the engine driver's `set_liveness`.
+
+  `fast_tenure` keeps meaning the held version.
+
+Behaviour changes only while a reconfiguration's outcome is unknown, and it
+errs toward waiting: for the log, or for fresh S3 liveness.
+
+### Tests
+
+Core:
+
+- `a_reconfig_in_doubt_acknowledges_nothing_on_this_disk_alone` fails on the
+  previous tree ("acknowledged on this disk alone while S3 may list node 2").
+  It also checks that the candidate's acknowledgement alone is not enough, and
+  that either settlement restores the adopted version's gate.
+- `a_reconfig_in_doubt_answers_strict_reads_only_with_fresh_liveness` fails
+  on the previous tree: the strict read is answered.
+
+Sim:
+
+- `backup-reconfig-doubt`: two nodes, node 1 the holder.
+  - Node 1's second lease PUT is applied, then times out, and its later lease
+    PUTs time out unapplied for 5 s.
+  - The two nodes are cut apart at 1.2 s for 3 s.
+  - On every seed node 2 seals node 1 and takes over.
+  - Before the fix, 481 of seeds 0..500 have root-group or lone answers that
+    no class covers (I1: "listed backup 2's tail lacks the row"). After it,
+    none: the only I1 left is the `archive/*` baseline.
+- Pinned by
+  `a_reconfig_in_doubt_acknowledges_nothing_its_listed_candidate_lacks`
+  (seeds 0..20; it fails on the previous tree at seed 0).
+- Sim support: `When::From` and `FaultKind::S3RuleFor` (a rule for a bounded
+  time).
+
+### Verification
+
+On the box, every job under `timeout --kill-after=30s` with `-j 4`:
+
+- `cargo fmt --all -- --check` and
+  `clippy -p constellation-authority -p constellation-engine --all-targets -D warnings`:
+  clean.
+- `cargo test --release -p constellation-authority`: lib 524, meta_repro 4,
+  sim 205.
+- `-p constellation-engine --lib`: 817.
+
+Regression sweeps, seeds 0..1000, the previous tree against the ack-side fix:
+identical failing sets and oracle totals for the following configurations:
+
+- `backup`, `backup-crash`, `backup-crash-slow`, `backup-partition`,
+  `backup-departs`;
+- `delegated-holder-cut`, `backup-strict`, `acks3-crash`;
+- `locks-s3-cut-holder-alive`;
+- `locks-failover-backup` and `backup-two`: at most 5 of more than 30 000
+  answers move between the archive and root-group classes, with the same
+  violations. `locks-failover-backup` matches the previous tree exactly on the
+  final tree.
+
+With the liveness change added, the final tree, seeds 0..1000, gives the same
+oracle totals and takeover and floor counts as the ack-side fix for
+`backup-strict`, `locks-s3-cut-holder-alive`, `locks-failover-backup`,
+`backup-crash-slow` and `backup-two`. `backup-reconfig-doubt` over seeds 0..500
+gives I1 = 734, all of them `archive/*`, and 500 seal takeovers.
+
+On 4987b00, after L3/L4 and (b), with the first listing still out counted
+too: `cargo test --release -p constellation-authority` lib 540,
+`meta_repro` 4, sim 213; `-p constellation-engine --lib` 823; fmt and
+`clippy --workspace --all-targets -D warnings` clean; the model suite
+unchanged. Every `locks-*`, `double-seal-*` and `backup*` configuration
+(87), seeds 0..2000, against 4987b00: the failing sets as in the L3/L4
+entry above; `backup-reconfig-doubt`'s seeds with `root-group/*` or
+`lone/*` I1 go from 1926 to 0 of 2000, every seed sealed and taken over on
+both trees. Seals and floors move only where the earlier entries say, and
+by a few seeds' noise elsewhere (`backup-strict` 2456 -> 2436 seals, 1656
+-> 1657 floors).
+
+### The first listing still out (review, 2026-10-21)
+
+The same holds while the reconfiguration that lists the first backup is
+still out, before its answer: it may have landed already, and the S3
+client's retry budget lets the answer take up to 30 s. The candidate gate
+does not cover it: `backup_timeouts` drops a candidate that is cut off
+whatever CAS lists it, and with nobody else in budget the held `Local`
+rule acknowledged on this disk alone (and answered strict reads without
+liveness) for the rest of the CAS's flight. `doubted_backups` therefore
+also counts the backups of a reconfiguration out from a held version that
+lists none. Pinned by `a_reconfig_still_out_acknowledges_nothing_on_this_disk_alone`
+(fails without it: "acknowledged on this disk alone while the CAS listing
+node 2 is out"; it also checks that strict reads need fresh liveness
+meanwhile). With the candidate connected nothing changes (the held rule
+waits for the log already).
+
+The rest of the review (2026-10-21), no change needed:
+
+- **When the doubt is settled.** Only by a version adopted from S3: a lease
+  CAS of this node's that lands on the held version (a renewal, the mark,
+  the inherited mark's clear, the reconfiguration's own retry), or a
+  re-read after a conflict (or after a release or a clear in doubt), which
+  adopts what S3 holds. `renew_kick`'s probe (a `LeaseGet` showing this
+  node's lease) proves liveness and settles nothing. Like F1, the inherited
+  mark's clear and the release in doubt, it takes a CAS whose answer was
+  lost to have settled by the time a later CAS on the same tag, or a later
+  read, is answered (a retried PUT that had landed answers `Conflict`, and
+  the re-read adopts it).
+- **Liveness.** No acknowledgement waits for good: `backed_through` counts
+  the log, so a doubted backup that is gone costs a wait for the next ship;
+  the doubt ends at the next adopted version (the reconfiguration's retry
+  at the next heartbeat while a candidate is wanted, else the renewal at
+  half the TTL). Only a holder cut from S3 stops acknowledging until S3
+  answers or the lease ends, which a doubted backup's seal would end anyway.
+  Strict reads under stale liveness answer `Busy` and start the probe.
+- **C7-H2's floor and F-a's cap.** The floor counts the predecessor's
+  liveness window from the sealer's marker: a doubted `Local` holder now
+  answers within it. The holder cannot renew its doubted version without
+  settling the doubt, so the expiry it honours is the doubted version's
+  (`E_h <= X`, F-a's premise); its beats go to the candidate
+  (`backup_candidacies`), consistent with that.
+- **F-c.** The lock mirrors, the final one included, go to the held
+  version's backups: a doubted backup that seals gets none, installs no
+  settled table and refuses the parked holders' late renewals (`Lost`, then
+  `EIO`). Availability only: an unmarked doubt holds every lock answer, a
+  marked one arms the full grace.
+
+### Not fixed here
+
+A reconfiguration *in flight* from a version that lists a backup already
+(adding a second one, `backups_max >= 2`) gates on the held set only. This
+is C6's add window.

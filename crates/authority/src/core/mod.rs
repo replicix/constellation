@@ -82,7 +82,7 @@ pub use delegate::{DelegKind, DelegRenewCert, DelegView, RecallPhase};
 pub const DELEG_READ_EPOCH_BASE: u64 = 1 << 48;
 pub use inbox::InboxView;
 pub use jobs::JobKind;
-pub use lease::{backup_claim_grace_ms, LeaseState, PendingGate, Plan};
+pub use lease::{backup_claim_grace_ms, LeaseState, PendingGate, Plan, ReconfigDoubt};
 pub use locks::LockView;
 pub use mode::AuthorityMode;
 pub use promise::{lease_may_carry, resolve_epoch_claims, EpochClaimView};

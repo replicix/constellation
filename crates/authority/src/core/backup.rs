@@ -870,6 +870,16 @@ impl Core {
             && (self.lease.ack_policy() != AckPolicy::Local || !self.lease.backups().is_empty())
     }
 
+    /// Whether this tenure may be taken over before its lease expires as
+    /// far as this node knows: it is fast, or a reconfiguration CAS whose
+    /// outcome is not known (in doubt, or still out) may have listed a
+    /// backup that seals it (`doubted_backups`, plan 43 C7-F F-a0). Its
+    /// strict reads, new grants and renewals need fresh S3 liveness
+    /// (`renew_fresh`, and the FUSE side's `LeaseView::reads_locally`).
+    pub fn may_be_taken_over_early(&self) -> bool {
+        self.fast_tenure() || self.doubted_backups().next().is_some()
+    }
+
     pub fn last_s3_fresh(&self) -> HonourMs {
         self.ack.last_s3_fresh
     }
@@ -899,40 +909,62 @@ impl Core {
         match self.lease.ack_policy() {
             AckPolicy::S3 => self.ack.shipped_through,
             AckPolicy::Local | AckPolicy::Backup => {
-                let committed = self.lease.backups();
-                if committed.is_empty() {
-                    // While a backup could be had — a candidate is being
-                    // brought up, or a peer in budget is eligible —
-                    // nothing is acknowledged under `Local`: such an
-                    // acknowledgement would rest on nobody's disk but
-                    // ours, and the candidate could not take over (it is
-                    // not listed). The wait ends with the CAS that lists
-                    // it, or once no peer is in budget after all (today's
-                    // behaviour).
-                    //
-                    // Not yet known counts as could-be (backup-crash-slow
-                    // seed 603322): the ops queued behind an acquisition
-                    // run in the acquisition's own event, before the
-                    // tenure's first selection pass, and were
-                    // acknowledged at once on this disk alone.
-                    let unassessed = self.ack.eligible.is_none() && self.backups_possible();
-                    return if self.ack.candidate.is_some()
-                        || self.ack.eligible == Some(true)
-                        || unassessed
-                    {
-                        self.ack.shipped_through
-                    } else {
-                        u64::MAX
-                    };
+                // Plan 43 C7-F F-a0: a reconfiguration whose outcome is not
+                // known (in doubt, or the first listing still out) may have
+                // listed backups this node does not hold listed
+                // (`doubted_backups`). One of them that seals this
+                // tenure takes over with its tail and the log, nothing
+                // else: an acknowledgement rests on each of them as on a
+                // committed backup — and on the held version's rule too,
+                // for the CAS may not have landed (a candidate the lease
+                // does not list voids its tail when the holder is gone).
+                // Under a held `Local` lease this ends acknowledging on
+                // this disk alone until the lease is next adopted from S3
+                // (a `LeasePut` timeout, then the candidate cut off and
+                // nobody else in budget: the listed candidate sealed and
+                // took over without what was acknowledged meanwhile).
+                let held = self.durable_jseq_held();
+                if self.doubted_backups().next().is_none() {
+                    return held;
                 }
-                committed
-                    .iter()
-                    .map(|b| self.ack.peers.get(b).map(|p| p.acked).unwrap_or(0))
-                    .min()
-                    .unwrap_or(0)
-                    .max(self.ack.shipped_through)
+                held.min(self.backed_through(self.doubted_backups()))
             }
         }
+    }
+
+    /// `durable_jseq` under the held version's `Local` or `Backup` policy.
+    fn durable_jseq_held(&self) -> u64 {
+        let committed = self.lease.backups();
+        if committed.is_empty() {
+            // While a backup could be had — a candidate is being brought
+            // up, or a peer in budget is eligible — nothing is acknowledged
+            // under `Local`: such an acknowledgement would rest on nobody's
+            // disk but ours, and the candidate could not take over (it is
+            // not listed). The wait ends with the CAS that lists it, or
+            // once no peer is in budget after all (today's behaviour).
+            //
+            // Not yet known counts as could-be (backup-crash-slow seed
+            // 603322): the ops queued behind an acquisition run in the
+            // acquisition's own event, before the tenure's first selection
+            // pass, and were acknowledged at once on this disk alone.
+            let unassessed = self.ack.eligible.is_none() && self.backups_possible();
+            return if self.ack.candidate.is_some() || self.ack.eligible == Some(true) || unassessed
+            {
+                self.ack.shipped_through
+            } else {
+                u64::MAX
+            };
+        }
+        self.backed_through(committed.iter().copied())
+    }
+
+    /// The journal seq every one of `backups` holds, or the log does.
+    fn backed_through(&self, backups: impl Iterator<Item = NodeId>) -> u64 {
+        backups
+            .map(|b| self.ack.peers.get(&b).map(|p| p.acked).unwrap_or(0))
+            .min()
+            .unwrap_or(0)
+            .max(self.ack.shipped_through)
     }
 
     /// Whether journal seq `jseq` is durable now: on every committed
@@ -1029,7 +1061,8 @@ impl Core {
 
     /// The liveness rule of the module doc, side-effect free: a tenure
     /// that cannot be taken over before its lease expires (`Local`, no
-    /// backup, or a continuation epoch's hold) is always fresh; any other
+    /// backup and none listed by a reconfiguration in doubt or out, or a
+    /// continuation epoch's hold) is always fresh; any other
     /// only within `backup_takeover_ms` of the send of an S3 request that
     /// succeeded without revealing a deposition (`last_s3_fresh`). What a
     /// strict read, a new lock grant and (plan 41 L0) a renewal of a lock
@@ -1039,7 +1072,7 @@ impl Core {
     /// the tenure, so after the decision).
     pub(crate) fn renew_fresh(&self, now: HonourMs) -> bool {
         liveness_fresh(
-            self.fast_tenure(),
+            self.may_be_taken_over_early(),
             now,
             self.ack.last_s3_fresh,
             self.cfg.backup_takeover_ms as i64,
@@ -1091,7 +1124,45 @@ impl Core {
     /// (`LeaseState::reconfig_doubt`): to a sealer the tenure may be
     /// sealable and unmarked while this node still holds it `Local`.
     pub(crate) fn reconfig_in_doubt(&self) -> bool {
-        self.lease.reconfig_doubt && self.lease.held.is_some()
+        self.lease.held.is_some()
+            && self
+                .lease
+                .reconfig_doubt
+                .as_ref()
+                .is_some_and(|d| d.unmarked_sealable)
+    }
+
+    /// Plan 43 C7-F F-a0 (the ack side of `reconfig_in_doubt`): the nodes
+    /// a reconfiguration CAS whose outcome is unknown may have listed in
+    /// S3 as this tenure's backups (`LeaseState::reconfig_doubt`). Any of
+    /// them may seal this tenure and take over with its own tail.
+    ///
+    /// A reconfiguration still out that lists the first backup counts
+    /// too: it may have landed already, and its answer may take up to the
+    /// S3 client's retry budget (30 s). The candidate it lists may be
+    /// dropped meanwhile (cut off: `backup_timeouts`), and with nobody
+    /// else in budget the held `Local` version's rule would acknowledge on
+    /// this disk alone while S3 may list that candidate. (A
+    /// reconfiguration out from a version that lists backups already gates
+    /// on those: a second one's add window is C6's.)
+    fn doubted_backups(&self) -> impl Iterator<Item = NodeId> + '_ {
+        let none: &[NodeId] = &[];
+        let (doubt, out) = match &self.lease.held {
+            None => (none, none),
+            Some((held, tag)) => (
+                self.lease
+                    .reconfig_doubt
+                    .as_ref()
+                    .map_or(none, |d| d.backups.as_slice()),
+                match &self.ack.reconfig {
+                    Some(r) if held.backups.is_empty() && r.tag == *tag => {
+                        r.lease.backups.as_slice()
+                    }
+                    _ => none,
+                },
+            ),
+        };
+        doubt.iter().chain(out).copied()
     }
 
     /// Plan 41 L0: an owner extending a window it promised (a lock grant
@@ -1132,9 +1203,11 @@ impl Core {
     /// for those whose liveness is stale, and mark the tenure if it is
     /// not. Nothing for a tenure that cannot be taken over early.
     pub(crate) fn renew_kick(&mut self, holds: &[FreshHold], out: &mut Vec<Action>) {
-        // (A reconfiguration in doubt: the mark CAS settles it, landing on
-        // the version held or conflicting with the one that replaced it.)
-        if (!self.fast_tenure() && !self.reconfig_in_doubt()) || self.lease.lost {
+        // (A reconfiguration in doubt may have made the tenure fast: the
+        // probe proves its liveness as a fast one's; unmarked, the mark CAS
+        // settles it, landing on the version held or conflicting with the
+        // one that replaced it.)
+        if !self.may_be_taken_over_early() || self.lease.lost {
             return;
         }
         if self.ack.renew_probe.is_none() && holds.iter().any(|h| !self.renew_fresh(h.at)) {
@@ -2411,15 +2484,20 @@ impl Core {
             }
             _ => {
                 // Plan 43 C7-F F-a0 L3: an answer lost may hide a CAS that
-                // landed: S3 may hold the sealable, unmarked version while
-                // this node holds the one it replaced. Nothing is answered
-                // unheld until the lease is next adopted from S3
-                // (`reconfig_in_doubt`).
-                if lease_fast(&r.lease)
-                    && !r.lease.granted_delegations
-                    && self.lease.held.as_ref().is_some_and(|(_, t)| *t == r.tag)
-                {
-                    self.lease.reconfig_doubt = true;
+                // landed: S3 may hold this version while this node holds
+                // the one it replaced, until the lease is next adopted from
+                // S3. Sealable and unmarked, nothing is answered unheld
+                // meanwhile (`reconfig_in_doubt`); and whatever it lists
+                // may seal this tenure, so acknowledgements rest on those
+                // nodes too (`durable_jseq`).
+                if self.lease.held.as_ref().is_some_and(|(_, t)| *t == r.tag) {
+                    let d = self.lease.reconfig_doubt.get_or_insert_default();
+                    d.unmarked_sealable |= lease_fast(&r.lease) && !r.lease.granted_delegations;
+                    for b in &r.lease.backups {
+                        if !d.backups.contains(b) {
+                            d.backups.push(*b);
+                        }
+                    }
                 }
                 tracing::warn!(
                     node = self.cfg.node_id,

@@ -93,6 +93,9 @@ pub enum FaultKind {
     JoinFresh,
     /// Scripted S3 error codes from now on (M4's `faulty.rs` idea).
     S3Rule(Rule),
+    /// Scripted S3 error codes for `for_ms`: then every rule on the same
+    /// node, operation and pattern is dropped (`Bucket::unscript`).
+    S3RuleFor { rule: Rule, for_ms: u64 },
     /// Plan 30 §M9: kill the holder's first listed backup (as the lease
     /// object names it); restart it after `restart_ms`.
     CrashBackup { restart_ms: Option<u64> },
@@ -2133,6 +2136,13 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
         FaultKind::S3Rule(rule) => {
             note(format!("t={} S3 rule {rule:?}", fault.at_ms));
             cluster.env.bucket.script(rule);
+        }
+        FaultKind::S3RuleFor { rule, for_ms } => {
+            note(format!("t={} S3 rule for {for_ms}ms {rule:?}", fault.at_ms));
+            let (node, op, pattern) = (rule.node, rule.op, rule.pattern.clone());
+            cluster.env.bucket.script(rule);
+            tokio::time::sleep(Duration::from_millis(for_ms)).await;
+            cluster.env.bucket.unscript(node, op, &pattern);
         }
         FaultKind::JoinFresh => {
             let id = cluster.ids().into_iter().max().unwrap_or(0) + 1;

@@ -6764,6 +6764,52 @@ mod cto {
         }
     }
 
+    /// Plan 43 C7-F F-a0 (the read side of a reconfiguration in doubt): a
+    /// `Local` holder whose reconfiguration CAS listing node 2 failed with
+    /// its outcome unknown may be sealed by node 2 before its lease
+    /// expires, so it answers a strict read only with fresh S3 liveness, as
+    /// a fast tenure does — not on the `Local` lease's word (the sealer's
+    /// floor covers a fast tenure's liveness window, not a lease's length).
+    /// Settled `Local`, it answers again.
+    #[test]
+    fn a_reconfig_in_doubt_answers_strict_reads_only_with_fresh_liveness() {
+        let (mut h, ino) = holder_with_file();
+        assert!(matches!(
+            ask(&mut h, 2, 1, ino),
+            ReadIndexOutcome::Ok { .. }
+        ));
+        let held = h.core.lease.held.clone().unwrap().0;
+        let mut out = Vec::new();
+        h.core.issue_reconfig(h.clk(), vec![2], &h.meta, &mut out);
+        let op = s3_ops(&out)
+            .into_iter()
+            .find(|(_, r)| matches!(r, S3Op::LeaseSwap { .. }))
+            .map(|(op, _)| op)
+            .unwrap_or_else(|| panic!("no reconfiguration CAS: {out:?}"));
+        h.advance(10);
+        h.step(Event::S3 {
+            op,
+            result: S3Result::LeasePut(Err(CasFailure::Failed("timed out".into()))),
+        });
+        assert!(
+            !h.core.fast_tenure(),
+            "the node holds its Local lease still"
+        );
+        h.advance(h.core.cfg.backup_takeover_ms + 100);
+        let refused = h.core.stats.stale_liveness_refusals;
+        assert!(
+            matches!(ask(&mut h, 2, 2, ino), ReadIndexOutcome::Busy),
+            "answered with the reconfiguration in doubt and no fresh liveness"
+        );
+        assert_eq!(h.core.stats.stale_liveness_refusals, refused + 1);
+        // A renewal of the `Local` version lands: the CAS did not.
+        h.core.lease.renewed(h.clk(), held, tag());
+        assert!(matches!(
+            ask(&mut h, 2, 3, ino),
+            ReadIndexOutcome::Ok { .. }
+        ));
+    }
+
     fn grant_of(outcome: &ReadIndexOutcome) -> ReadGrantMsg {
         match outcome {
             ReadIndexOutcome::Ok { grant: Some(g), .. } => *g,
@@ -10763,6 +10809,146 @@ mod backup_crash {
         h.core.ack.eligible = None;
         h.core.cfg.backup_rtt_budget_ms = 0;
         assert_eq!(h.core.ack_need(&pos), None);
+    }
+
+    /// Plan 43 C7-F F-a0 (the ack side of the review's F1): a `Local`
+    /// holder's reconfiguration CAS that lists its candidate fails with
+    /// its outcome unknown — it may have landed. The candidate is then cut
+    /// off and nobody else is in budget: today's `Local` would acknowledge
+    /// on this disk alone, while S3 may list the candidate, which seals the
+    /// holder and takes over with its tail and the log, without those
+    /// rows. Until the lease is next adopted from S3 an acknowledgement
+    /// rests on the log, as under a listed backup that is gone; and not on
+    /// the candidate's acknowledgements alone either (if the CAS did not
+    /// land, the unlisted candidate voids its tail once the holder is
+    /// gone). Settled either way, the gate is the adopted version's.
+    #[test]
+    fn a_reconfig_in_doubt_acknowledges_nothing_on_this_disk_alone() {
+        let pos = |jseq| constellation_meta::Position {
+            seq: 0,
+            pending: Some(constellation_meta::JournalPos { epoch: 1, jseq }),
+            streams: Default::default(),
+        };
+        let peer = |h: &Harness, acked| crate::core::backup::BackupPeer {
+            candidacy: 1,
+            alive_at: w(h.now),
+            short_since_progress: false,
+            short_since: w(h.now),
+            unreachable: false,
+            answers_beats: false,
+            acked,
+            sent_through: acked,
+            inflight: Default::default(),
+            last_sent: w(h.now),
+            last_progress: w(h.now),
+            committed: false,
+        };
+        // Node 2, a caught-up candidate, then the CAS that lists it, lost.
+        let in_doubt = || {
+            let mut h = Harness::new(1);
+            h.hold(1, None);
+            let held = h.core.lease.held.clone().unwrap().0;
+            let mut out = Vec::new();
+            h.core.issue_reconfig(h.clk(), vec![2], &h.meta, &mut out);
+            let op = find_s3(&out, |r| matches!(r, S3Op::LeaseSwap { .. }));
+            let listed = match s3_ops(&out).into_iter().find(|(o, _)| *o == op) {
+                Some((_, S3Op::LeaseSwap { lease, .. })) => lease.clone(),
+                _ => unreachable!(),
+            };
+            assert_eq!(listed.backups, vec![2]);
+            h.advance(10);
+            h.step(Event::S3 {
+                op,
+                result: S3Result::LeasePut(Err(CasFailure::Failed("timed out".into()))),
+            });
+            assert_eq!(h.core.lease.ack_policy(), AckPolicy::Local);
+            assert!(
+                !h.core.fast_tenure(),
+                "the node holds its Local lease still"
+            );
+            (h, held, listed)
+        };
+        let alone = |h: &mut Harness| {
+            h.core.ack.candidate = None;
+            h.core.ack.peers.remove(&2);
+            h.core.ack.eligible = Some(false);
+        };
+
+        let (mut h, _, _) = in_doubt();
+        // The candidate holds row 5: not enough (it may be unlisted).
+        h.core.ack.candidate = Some(2);
+        h.core.ack.peers.insert(2, peer(&h, 5));
+        assert_eq!(h.core.ack_need(&pos(5)), Some(5));
+        // Cut off, nobody else in budget: still not on this disk alone.
+        alone(&mut h);
+        assert_eq!(
+            h.core.ack_need(&pos(5)),
+            Some(5),
+            "acknowledged on this disk alone while S3 may list node 2"
+        );
+        // The log holds it: acknowledged.
+        h.core.note_shipped(&[5], 4);
+        assert_eq!(h.core.ack_need(&pos(5)), None);
+
+        // Settled by a renewal that lands: the CAS did not land, and the
+        // tenure is the `Local` one it was (nobody in budget: no gate).
+        let (mut h, held, _) = in_doubt();
+        h.core.lease.renewed(h.clk(), held, tag());
+        alone(&mut h);
+        assert_eq!(h.core.ack_need(&pos(5)), None);
+
+        // Settled by a re-read that finds the version that landed: node 2
+        // is a committed backup, gone.
+        let (mut h, _, listed) = in_doubt();
+        h.core.lease.renewed(h.clk(), listed, tag());
+        alone(&mut h);
+        assert!(h.core.fast_tenure());
+        assert_eq!(h.core.ack_need(&pos(5)), Some(5));
+    }
+
+    /// Plan 43 C7-F F-a0: the reconfiguration that lists the first backup,
+    /// still out (it may have landed; its answer may take the S3 client's
+    /// retry budget), and its candidate cut off with nobody else in
+    /// budget: nothing is acknowledged on this disk alone, and strict
+    /// reads need fresh liveness, as in doubt.
+    #[test]
+    fn a_reconfig_still_out_acknowledges_nothing_on_this_disk_alone() {
+        let pos = |jseq| constellation_meta::Position {
+            seq: 0,
+            pending: Some(constellation_meta::JournalPos { epoch: 1, jseq }),
+            streams: Default::default(),
+        };
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        assert!(!h.core.may_be_taken_over_early());
+        let mut out = Vec::new();
+        h.core.issue_reconfig(h.clk(), vec![2], &h.meta, &mut out);
+        let op = find_s3(&out, |r| matches!(r, S3Op::LeaseSwap { .. }));
+        assert_eq!(h.core.lease.ack_policy(), AckPolicy::Local);
+        // The candidate dropped (`backup_timeouts`), nobody in budget.
+        h.core.ack.candidate = None;
+        h.core.ack.peers.remove(&2);
+        h.core.ack.eligible = Some(false);
+        assert_eq!(
+            h.core.ack_need(&pos(5)),
+            Some(5),
+            "acknowledged on this disk alone while the CAS listing node 2 is out"
+        );
+        assert!(h.core.may_be_taken_over_early());
+        h.advance(h.core.cfg.backup_takeover_ms + 1);
+        assert!(
+            !h.core.renew_fresh(h.clk().honour),
+            "fresh without S3 liveness while the CAS listing node 2 is out"
+        );
+        h.core.note_shipped(&[5], 4);
+        assert_eq!(h.core.ack_need(&pos(5)), None);
+        // It landed: node 2 is a committed backup (gone), the tenure fast.
+        h.step(Event::S3 {
+            op,
+            result: S3Result::LeasePut(Ok(tag())),
+        });
+        assert!(h.core.fast_tenure());
+        assert_eq!(h.core.ack_need(&pos(6)), Some(6));
     }
 
     /// backup-crash-slow seeds 603631 (the takeover CAS applied, then

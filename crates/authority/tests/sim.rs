@@ -297,6 +297,7 @@ fn replay_seed() {
         Ok("acks3-crash") => ack_s3_crash_config(),
         Ok("backup-departs") => backup_departs_config(),
         Ok("backup-partition") => backup_partition_config(),
+        Ok("backup-reconfig-doubt") => backup_reconfig_doubt_config(),
         Ok("long-backup") => long_backup_config(),
         Ok("backup-runtime-lag") => backup_runtime_lag_config(),
         Ok("backup-lag-at-expiry") => backup_lag_at_expiry_config(false),
@@ -1566,6 +1567,49 @@ fn backup_departs_config() -> SimConfig {
                 restart_ms: Some(4_000),
             },
         }],
+        ..backup_config()
+    }
+}
+
+/// Plan 43 C7-F F-a0 (the ack side of the review's F1): two nodes, node 1
+/// the holder (node 2's clients start late). Node 1's second lease CAS —
+/// the reconfiguration that lists its caught-up candidate, node 2, after
+/// its claim — lands in S3 with its answer lost (applied, then timed out),
+/// and its lease CASes after it time out unapplied for 5 s, so no adoption
+/// settles the doubt (its lease reads and the log still work). Then the
+/// two are cut apart (S3 stays reachable to both). Node 1 drops the
+/// candidate and nobody else is in budget: as a `Local` tenure it would
+/// acknowledge its clients' writes on its disk alone while S3 lists node
+/// 2, which seals it and takes over without those rows (I1 at the answer:
+/// `root-group/…` uncommitted; the durability check at the end).
+fn backup_reconfig_doubt_config() -> SimConfig {
+    let lease_put = |when, fault| Rule::new(Some(1), OpKind::Put, "leases/", when, fault);
+    SimConfig {
+        nodes: 2,
+        ops_per_client: 12,
+        random_faults: 0,
+        client_plan: vec![(2, 6_000, 4)],
+        faults: vec![
+            ScheduledFault {
+                at_ms: 0,
+                kind: FaultKind::S3Rule(lease_put(When::Nth(2), Fault::AppliedThenTimeout)),
+            },
+            ScheduledFault {
+                at_ms: 0,
+                kind: FaultKind::S3RuleFor {
+                    rule: lease_put(When::From(3), Fault::Timeout),
+                    for_ms: 5_000,
+                },
+            },
+            ScheduledFault {
+                at_ms: 1_200,
+                kind: FaultKind::Partition {
+                    a: 1,
+                    b: 2,
+                    for_ms: 3_000,
+                },
+            },
+        ],
         ..backup_config()
     }
 }
@@ -4403,6 +4447,7 @@ fn sweep_config() {
         "far" | "backup-far" => far_config(),
         "backup-departs" => backup_departs_config(),
         "backup-partition" => backup_partition_config(),
+        "backup-reconfig-doubt" => backup_reconfig_doubt_config(),
         "backup-two" => backup_two_config(),
         "backup-strict" => backup_strict_config(),
         "backup-strict-inbox-off" => backup_strict_inbox_off_config(),
@@ -10374,6 +10419,36 @@ fn c0_i1_finds_lone_answers_to_remote_requesters() {
         );
     }
     assert!(found > 0);
+}
+
+/// Plan 43 C7-F F-a0 (the ack side of the review's F1): a `Local` holder
+/// whose reconfiguration CAS listing its candidate landed with its answer
+/// lost (`backup-reconfig-doubt`) acknowledges nothing on its disk alone
+/// once the candidate is cut off: every seed's candidate, listed in S3,
+/// seals it and takes over. Without `durable_jseq`'s doubted backups 481
+/// of seeds 0..500 (all of these but 17) answer under `root-group` or
+/// `lone` with no class covering the answer (I1: the listed candidate's
+/// tail lacks the row); none with them.
+#[test]
+fn a_reconfig_in_doubt_acknowledges_nothing_its_listed_candidate_lacks() {
+    let mut sealed = 0usize;
+    for seed in 0..20 {
+        let r = c0_run(
+            "backup-reconfig-doubt",
+            seed,
+            backup_reconfig_doubt_config(),
+        );
+        for (k, n) in &r.uncommitted_acks {
+            assert!(
+                k.starts_with("archive/"),
+                "backup-reconfig-doubt seed {seed}: an answer expected under {k} was \
+                 uncommitted ({n}): {:?}",
+                r.oracle_examples
+            );
+        }
+        sealed += usize::from(r.stats.values().any(|s| s.backup_takeovers > 0));
+    }
+    assert_eq!(sealed, 20, "the listed candidate did not always take over");
 }
 
 /// I2 (b): a rid queued on two nodes — a deposed holder's queue and the

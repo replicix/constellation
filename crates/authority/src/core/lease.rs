@@ -119,13 +119,27 @@ pub struct LeaseState {
     /// Plan 31 C8: a forward-only (or suspended) node gives the lease back
     /// once idle, whether or not anyone asked for it (`wants_handoff`).
     pub release_when_idle: bool,
-    /// Plan 43 C7-F F-a0 L3: a reconfiguration CAS that would have made the
-    /// tenure sealable without marking it failed with its outcome unknown
-    /// (an answer lost: it may have landed) while this version was held: S3
-    /// may hold the sealable one, so the tenure counts as unmarked
-    /// (`Core::reconfig_in_doubt`) until a version is next adopted from S3
-    /// (`renewed`: a renewal, a re-read, a mark CAS; `adopt`).
-    pub reconfig_doubt: bool,
+    /// Plan 43 C7-F F-a0 L3: reconfiguration CASes that failed with their
+    /// outcome unknown (an answer lost: each may have landed) while this
+    /// version was held: S3 may hold one of them instead. Until a version
+    /// is next adopted from S3 (`renewed`: a renewal, a re-read, a mark
+    /// CAS; `adopt`), which settles the question.
+    pub reconfig_doubt: Option<ReconfigDoubt>,
+}
+
+/// What the reconfigurations in doubt (`LeaseState::reconfig_doubt`) may
+/// have put in S3, summed over every one since the held version was
+/// adopted (a retry conditioned on the same version may land instead of
+/// an earlier one).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReconfigDoubt {
+    /// One of them makes the tenure sealable without marking it: the
+    /// tenure counts as unmarked (`Core::reconfig_in_doubt`).
+    pub unmarked_sealable: bool,
+    /// Every node one of them lists as a backup: any of them may seal
+    /// this tenure with its tail, so an acknowledgement rests on each as
+    /// on a committed backup (`Core::durable_jseq`).
+    pub backups: Vec<NodeId>,
 }
 
 impl LeaseState {
@@ -543,7 +557,7 @@ impl LeaseState {
         self.last_seen = Some(lease.clone());
         self.cached_holder = Some(lease.holder);
         self.held = Some((lease, tag));
-        self.reconfig_doubt = false;
+        self.reconfig_doubt = None;
     }
 
     /// `LeaseKeeper::apply_renew`'s `Renewed` arm.
@@ -565,7 +579,7 @@ impl LeaseState {
         }
         self.last_seen = Some(lease.clone());
         self.held = Some((lease, tag));
-        self.reconfig_doubt = false;
+        self.reconfig_doubt = None;
     }
 
     /// `LeaseKeeper::mark_lost`.

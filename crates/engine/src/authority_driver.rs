@@ -2527,9 +2527,10 @@ impl Driver {
         self.deps
             .view
             .mirror(lease, now, cfg, self.core.ack_gated());
-        self.deps
-            .view
-            .set_liveness(self.core.fast_tenure(), self.core.last_s3_fresh());
+        self.deps.view.set_liveness(
+            self.core.may_be_taken_over_early(),
+            self.core.last_s3_fresh(),
+        );
         self.deps.view.set_release_hold(
             self.core.takeover_floor_until(),
             self.core.fast_gate_pending(),

@@ -60,6 +60,8 @@ pub struct Rule {
 #[derive(Debug, Clone, Copy)]
 pub enum When {
     Nth(usize),
+    /// The n-th matching call and every later one.
+    From(usize),
     Random(f64),
 }
 
@@ -244,6 +246,15 @@ impl Bucket {
         self.rules.lock().unwrap().push(rule);
     }
 
+    /// Drop every scripted rule on `op` calls on paths containing
+    /// `pattern` from `node` (`FaultKind::S3RuleFor`).
+    pub fn unscript(&self, node: Option<u64>, op: OpKind, pattern: &str) {
+        self.rules
+            .lock()
+            .unwrap()
+            .retain(|r| !(r.node == node && r.op == op && r.pattern == pattern));
+    }
+
     /// Cut or heal one node's path to the bucket.
     pub fn set_cut(&self, node: u64, cut: bool) {
         let mut set = self.cut.lock().unwrap();
@@ -298,6 +309,7 @@ impl Bucket {
             }
             let fires = match rule.when {
                 When::Nth(k) => rule.seen == k,
+                When::From(k) => rule.seen >= k,
                 When::Random(p) => self.rng.lock().unwrap().random_bool(p),
             };
             if fires {

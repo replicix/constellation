@@ -172,7 +172,16 @@ the other finds that outcome and does not run again.
 removed by a lease CAS that bumps `config_version`. Until that CAS
 lands, waiting acknowledgements still need it. A new backup is first
 streamed the unshipped journal, and is CASed into the lease only once
-it has caught up.
+it has caught up. A reconfiguration CAS whose answer is lost (a timeout:
+it may have landed) leaves the holder unsure which version S3 holds:
+until it next adopts one from S3 (a renewal, a re-read), an
+acknowledgement satisfies both — the held version's rule, and every node
+the CAS lists (or the log). A holder whose held lease is `Local` then
+acknowledges nothing on its own disk alone: a candidate the CAS may have
+listed can seal it and take over with only its tail and the log. The same
+holds while the CAS that lists a `Local` holder's first backup is still
+out (its answer can take the S3 client's retry budget, and the candidate
+may be dropped meanwhile).
 
 ### Seal-based failover
 
