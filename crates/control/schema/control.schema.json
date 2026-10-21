@@ -2860,6 +2860,12 @@
           "minimum": 0,
           "type": "integer"
         },
+        "dir_attr_notices": {
+          "description": "Attribute-only notifications written for changed directories and\nmoved inodes (W3b).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "dropping_opens": {
           "additionalProperties": {
             "format": "uint64",
@@ -2930,7 +2936,8 @@
         "repair_wait_ms",
         "repair_wait_max_ms",
         "ambiguous_writes",
-        "concurrent_writes"
+        "concurrent_writes",
+        "dir_attr_notices"
       ],
       "type": "object"
     },

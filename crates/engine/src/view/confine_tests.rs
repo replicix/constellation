@@ -93,7 +93,7 @@ fn rename(v: &View, parent: Ino, name: &str, new_parent: Ino, new_name: &str) ->
             new_parent,
             Name::new(new_name),
             RenameFlags::empty(),
-            r,
+            constellation_vfs::Unit(r),
         )
     })
 }

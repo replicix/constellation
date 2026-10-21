@@ -163,6 +163,10 @@ impl Vfs for View {
         }
     }
 
+    fn strict_cto(&self) -> bool {
+        self.sync.as_ref().is_some_and(|h| h.cto_strict)
+    }
+
     fn lookup<R: Responder<Entry>>(&self, cx: &OpCtx<'_>, parent: Ino, name: &Name, r: R) {
         let _w = self.watch.enter("lookup", parent);
         admit!(self, cx, r, _admitted);
@@ -851,7 +855,7 @@ impl Vfs for View {
         }
     }
 
-    fn rename<R: Responder<()>>(
+    fn rename<R: Responder<Renamed>>(
         &self,
         cx: &OpCtx<'_>,
         parent: Ino,
@@ -861,7 +865,7 @@ impl Vfs for View {
         flags: RenameFlags,
         mut r: R,
     ) {
-        park_gate!(self, cx, r, (), self.gate_owner(), [
+        park_gate!(self, cx, r, Renamed, self.gate_owner(), [
             let name_owned = name.to_buf();
             let new_name_owned = new_name.to_buf();
         ], |v, c, r2| {
@@ -928,8 +932,18 @@ impl Vfs for View {
                     }
                 }
             }
+            // Plan 42 §5.3.1: the inode moved, for the frontend's kernel.
+            let moved = self
+                .meta
+                .scratch_lookup(parent, &name)
+                .ok()
+                .flatten()
+                .map(|a| self.out_ino(a.ino));
             return match self.meta.scratch_rename(parent, &name, newparent, &newname) {
-                Ok(()) => r.done(Ok(())),
+                Ok(()) => r.done(Ok(Renamed {
+                    moved,
+                    exchanged: None,
+                })),
                 Err(error) => r.done(err(error.code())),
             };
         }
@@ -1013,7 +1027,10 @@ impl Vfs for View {
                         self.reap_after_unlink(attr.ino);
                     }
                     match self.meta.scratch_unlink(parent, &name) {
-                        Ok(()) => r.done(Ok(())),
+                        Ok(()) => r.done(Ok(Renamed {
+                            moved: Some(self.out_ino(attr.ino)),
+                            exchanged: None,
+                        })),
                         Err(error) => r.done(err(error.code())),
                     }
                 }
@@ -1043,6 +1060,26 @@ impl Vfs for View {
                 return;
             }
         }
+        // Plan 42 §5.3.1: the inode(s) the rename moves, read before it
+        // (the kernel holds both directories' locks across the rename, so
+        // this node's own changes cannot interleave; another node's could,
+        // and then the frontend tells an inode that did not move, which
+        // costs one attribute refresh).
+        let moved = self
+            .meta
+            .lookup(parent, &name)
+            .ok()
+            .flatten()
+            .map(|a| a.ino);
+        let exchanged = if exchange {
+            self.meta
+                .lookup(newparent, &newname)
+                .ok()
+                .flatten()
+                .map(|a| a.ino)
+        } else {
+            None
+        };
         // The target the rename replaces, if any.
         let replaced = if exchange {
             None
@@ -1077,7 +1114,10 @@ impl Vfs for View {
                 if let Some(attr) = replaced {
                     self.reap_after_unlink(attr.ino);
                 }
-                r.done(Ok(()))
+                r.done(Ok(Renamed {
+                    moved: moved.map(|ino| self.out_ino(ino)),
+                    exchanged: exchanged.map(|ino| self.out_ino(ino)),
+                }))
             }
             Err(e) => {
                 if let Some(attr) = replaced {

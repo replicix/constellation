@@ -148,6 +148,18 @@ impl Opened {
     }
 }
 
+/// A rename's answer (plan 42 §5.3.1): the inode(s) it moved, in the
+/// view's numbering — a frontend whose kernel caches the moved inode's
+/// attributes must tell its kernel their `ctime` changed. `None`: the
+/// target does not know (the frontend then tells nothing for it).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Renamed {
+    /// The inode that had the old name.
+    pub moved: Option<Ino>,
+    /// `RENAME_EXCHANGE`: the inode that had the new name.
+    pub exchanged: Option<Ino>,
+}
+
 /// Plan 42 §5.1.1: what an open read of an inode's committed content — a
 /// 128-bit digest of its size, times and manifest identity, compared by
 /// equality only. Two opens that answer the same stamp read the same

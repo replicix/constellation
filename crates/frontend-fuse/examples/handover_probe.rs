@@ -284,7 +284,7 @@ impl Vfs for ProbeVfs {
         unsupported(r);
     }
 
-    fn rename<R: Responder<()>>(
+    fn rename<R: Responder<constellation_vfs::Renamed>>(
         &self,
         _cx: &OpCtx<'_>,
         _parent: Ino,

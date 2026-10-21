@@ -538,6 +538,9 @@ pub struct PageCacheStats {
     /// W2: claims while another registered write was pending (not
     /// expected: one write-through write per inode at a time).
     pub(crate) concurrent_writes: AtomicU64,
+    /// W3b: attribute-only notifications for changed directories and moved
+    /// inodes (`crate::reply`).
+    pub(crate) dir_attr_notices: AtomicU64,
 }
 
 /// A snapshot of [`PageCacheStats`].
@@ -556,6 +559,7 @@ pub struct PageCacheCounts {
     pub repair_wait_max_ms: u64,
     pub ambiguous_writes: u64,
     pub concurrent_writes: u64,
+    pub dir_attr_notices: u64,
 }
 
 /// The settings the table works under (`CONSTELLATION_FUSE_KEEP_CACHE`,
@@ -570,12 +574,34 @@ pub struct PageCacheConfig {
     /// W2's repair (`CONSTELLATION_FUSE_WRITE_REPAIR`): `auto` is on;
     /// off, every repair hit is an S5 instead.
     pub write_repair: crate::Switch,
+    /// W3b (`CONSTELLATION_FUSE_DIR_CHANGE_NOTIFY`), likewise.
+    pub dir_change_notify: crate::Switch,
+    /// W3a (`CONSTELLATION_FUSE_DIR_ATTR_TTL`), and whether the view
+    /// serves `--cto strict` (what `auto` follows).
+    pub dir_attr_ttl: crate::DirAttrTtl,
+    pub strict: bool,
 }
 
 impl PageCacheConfig {
     /// Whether W2 repairs now.
     pub fn repair_on(&self) -> bool {
         on(self.write_repair)
+    }
+
+    /// Whether W3b writes its notices now.
+    pub fn dir_notice_on(&self) -> bool {
+        on(self.dir_change_notify)
+    }
+
+    /// Whether W3a gives directories' attributes no kernel lifetime now:
+    /// `auto` under strict; in bounded mode `auto` is pending plan 42 Q1
+    /// (`crate::DirAttrTtl::Auto`).
+    pub fn dir_attr_zero(&self) -> bool {
+        match self.dir_attr_ttl {
+            crate::DirAttrTtl::Zero => true,
+            crate::DirAttrTtl::Entry => false,
+            crate::DirAttrTtl::Auto => self.strict,
+        }
     }
 }
 
@@ -590,6 +616,9 @@ impl Default for PageCacheConfig {
             keep_cache: KeepCache::Auto,
             ignore_s5: false,
             write_repair: crate::Switch::Auto,
+            dir_change_notify: crate::Switch::Auto,
+            dir_attr_ttl: crate::DirAttrTtl::Auto,
+            strict: false,
         }
     }
 }
@@ -1010,6 +1039,11 @@ impl PageCacheTable {
             .collect()
     }
 
+    /// One W3b notification written.
+    pub(crate) fn count_dir_notice(&self) {
+        self.stats.dir_attr_notices.fetch_add(1, Relaxed);
+    }
+
     pub(crate) fn stats(&self) -> &PageCacheStats {
         &self.stats
     }
@@ -1026,6 +1060,7 @@ impl PageCacheTable {
             repair_wait_max_ms: get(&self.stats.repair_wait_max_ms),
             ambiguous_writes: get(&self.stats.ambiguous_writes),
             concurrent_writes: get(&self.stats.concurrent_writes),
+            dir_attr_notices: get(&self.stats.dir_attr_notices),
             keep_cache_opens: self.stats.keep_cache_opens.load(Relaxed),
             dropping_opens: DropReason::ALL
                 .iter()

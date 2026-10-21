@@ -302,7 +302,7 @@ impl<V: Vfs> DynVfs for V {
             new_parent,
             Name::new(new_name),
             flags,
-            Probe::new(done),
+            crate::responder::Unit(Probe::new(done)),
         );
     }
 

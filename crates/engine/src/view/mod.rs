@@ -183,7 +183,7 @@ use constellation_store_s3::{ChunkStore, CompressionSetting, DecodePriority};
 use constellation_types::Code;
 use constellation_vfs::{
     Attr, Caller, Durability, Entry, FallocateMode, FileKind, FrontendCaps, OpWatch, OpenFlags,
-    OpenUnlinked, PassthroughChunk, PolicyStack, ReadData, SeekWhence,
+    OpenUnlinked, PassthroughChunk, PolicyStack, ReadData, Renamed, SeekWhence,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek};
@@ -1112,6 +1112,15 @@ impl View {
     /// kernel invalidation renumbers it).
     pub fn view_root(&self) -> Ino {
         self.view_root
+    }
+
+    /// `ino` (replica numbering) as the frontend numbers it.
+    pub(crate) fn out_ino(&self, ino: Ino) -> Ino {
+        if ino == self.view_root {
+            constellation_fs_core::types::ROOT_INO
+        } else {
+            ino
+        }
     }
 
     pub(crate) fn real_ino(&self, ino: Ino) -> Ino {

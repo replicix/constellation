@@ -503,7 +503,7 @@ fn entry_invalidations_are_written_only_for_names_the_kernel_may_hold() {
     let mut short = entry(43, FileKind::Dir);
     short.attr.ttl = Duration::from_millis(100);
     mock.always_mkdir(Script::ok(short));
-    mock.always_rename(Script::ok(()));
+    mock.always_rename(Script::ok(constellation_vfs::Renamed::default()));
     let fs = FuseFs::new(
         Arc::new(mock.clone()),
         FrontendCaps::linux_fuse(false),
@@ -818,7 +818,7 @@ fn the_namespace_ops_carry_their_names_and_modes() {
 #[test]
 fn rename_carries_its_flags_decoded() {
     let (mut k, mock) = plain();
-    mock.always_rename(Script::ok(()));
+    mock.always_rename(Script::ok(constellation_vfs::Renamed::default()));
     k.call(op::RENAME, 1, &Body::new().u64(2).cstr("a").cstr("b"))
         .ok();
     assert_eq!(
@@ -2608,6 +2608,20 @@ fn notifications_undelivered_ones_and_failed_writes_mark_the_pages() {
     k.finish();
 }
 
+/// A request and its reply, and the notifications written before it.
+fn call_noticed(k: &mut Kernel, opcode: u32, nodeid: u64, body: &Body) -> (Vec<Reply>, Reply) {
+    let unique = k.send(opcode, nodeid, &body.0);
+    let mut notices = Vec::new();
+    loop {
+        let r = k.recv();
+        if r.unique == unique {
+            return (notices, r);
+        }
+        assert_eq!(r.unique, 0, "a reply for another request");
+        notices.push(r);
+    }
+}
+
 /// A truncating create never keeps; a passthrough answer never keeps.
 #[test]
 fn a_truncating_create_drops() {
@@ -2616,7 +2630,8 @@ fn a_truncating_create_drops() {
     mock.always_open(Script::ok(stamped(9, 5)));
     open_flags_of(&mut k, 50);
     release(&mut k, 50, 9);
-    let r = k.call(
+    let (_, r) = call_noticed(
+        &mut k,
         op::CREATE,
         1,
         &Body::new()
@@ -2629,7 +2644,8 @@ fn a_truncating_create_drops() {
     let open_flags = r.u32_at(128 + 8);
     assert_eq!(open_flags & FOPEN_KEEP_CACHE, 0, "O_TRUNC");
     release(&mut k, 50, 9);
-    let r = k.call(
+    let (_, r) = call_noticed(
+        &mut k,
         op::CREATE,
         1,
         &Body::new()
@@ -2759,4 +2775,158 @@ fn an_ambiguous_read_marks_and_writeback_claims_nothing() {
         "the ambiguous hit marked the pages"
     );
     k.finish();
+}
+
+// ------------------------------------------- plan 42: directories (W3)
+
+/// Plan 42 §5.3.1 (W3b): every namespace reply is preceded by an
+/// attribute-only `NOTIFY_INVAL_INODE` (offset -1) for exactly the
+/// directories it changed and the inodes a rename moved; none for a
+/// `lookup` and none on an error.
+#[test]
+fn namespace_replies_are_preceded_by_their_directories_attribute_notices() {
+    let (mut k, mock, _sink) = keep_cache_kernel();
+    mock.always_lookup(Script::ok(entry(60, FileKind::File)));
+    mock.always_mkdir(Script::ok(entry(61, FileKind::Dir)));
+    mock.always_mknod(Script::ok(entry(62, FileKind::Fifo)));
+    mock.always_symlink(Script::ok(entry(63, FileKind::Symlink)));
+    mock.always_link(Script::ok(entry(60, FileKind::File)));
+    mock.always_unlink(Script::ok(()));
+    mock.always_rmdir(Script::ok(()));
+    mock.always_create(Script::ok((entry(64, FileKind::File), stamped(9, 1))));
+    let attr_only = |notices: &[Reply]| -> Vec<u64> {
+        notices
+            .iter()
+            .map(|n| {
+                let (ino, off, len) = inval_inode(n);
+                assert_eq!((off, len), (-1, 0), "attribute-only");
+                ino
+            })
+            .collect()
+    };
+    let (n, r) = call_noticed(&mut k, op::LOOKUP, 5, &Body::new().cstr("f"));
+    r.ok();
+    assert!(n.is_empty(), "a lookup changes nothing");
+    let (n, r) = call_noticed(
+        &mut k,
+        op::MKDIR,
+        5,
+        &Body::new().u32(0o755).u32(0o22).cstr("d"),
+    );
+    r.ok();
+    assert_eq!(attr_only(&n), vec![5]);
+    let (n, r) = call_noticed(
+        &mut k,
+        op::MKNOD,
+        5,
+        &Body::new().u32(0o010_644).u32(0).u32(0o22).u32(0).cstr("p"),
+    );
+    r.ok();
+    assert_eq!(attr_only(&n), vec![5]);
+    let (n, r) = call_noticed(&mut k, op::SYMLINK, 5, &Body::new().cstr("l").cstr("t"));
+    r.ok();
+    assert_eq!(attr_only(&n), vec![5]);
+    // `FUSE_LINK`: the node id is the new parent, the body the inode.
+    let (n, r) = call_noticed(&mut k, op::LINK, 7, &Body::new().u64(60).cstr("h"));
+    r.ok();
+    assert_eq!(attr_only(&n), vec![7], "link: the new parent");
+    let (n, r) = call_noticed(&mut k, op::UNLINK, 5, &Body::new().cstr("f"));
+    r.ok();
+    assert_eq!(attr_only(&n), vec![5]);
+    let (n, r) = call_noticed(&mut k, op::RMDIR, 5, &Body::new().cstr("d"));
+    r.ok();
+    assert_eq!(attr_only(&n), vec![5]);
+    let (n, r) = call_noticed(
+        &mut k,
+        op::CREATE,
+        5,
+        &Body::new()
+            .i32(RW | libc::O_CREAT)
+            .u32(0o644)
+            .u32(0o22)
+            .u32(0)
+            .cstr("c"),
+    );
+    r.ok();
+    assert_eq!(attr_only(&n), vec![5]);
+    // A rename: both parents (once if equal) and the moved inode(s).
+    mock.always_rename(Script::ok(constellation_vfs::Renamed {
+        moved: Some(60),
+        exchanged: None,
+    }));
+    let (n, r) = call_noticed(
+        &mut k,
+        op::RENAME,
+        5,
+        &Body::new().u64(6).cstr("f").cstr("g"),
+    );
+    r.ok();
+    assert_eq!(attr_only(&n), vec![5, 6, 60]);
+    mock.always_rename(Script::ok(constellation_vfs::Renamed {
+        moved: Some(60),
+        exchanged: Some(61),
+    }));
+    let (n, r) = call_noticed(
+        &mut k,
+        op::RENAME2,
+        5,
+        &Body::new()
+            .u64(5)
+            .u32(libc::RENAME_EXCHANGE)
+            .u32(0)
+            .cstr("f")
+            .cstr("g"),
+    );
+    r.ok();
+    assert_eq!(attr_only(&n), vec![5, 60, 61], "the same parent once");
+    // An error: nothing.
+    mock.always_mkdir(Script::fail(Code::Exists));
+    let (n, r) = call_noticed(
+        &mut k,
+        op::MKDIR,
+        5,
+        &Body::new().u32(0o755).u32(0o22).cstr("d"),
+    );
+    assert_eq!(r.errno(), libc::EEXIST);
+    assert!(n.is_empty(), "nothing changed");
+    k.finish();
+}
+
+/// `fuse_entry_out`: `(entry_valid, attr_valid)` seconds.
+fn entry_valid(r: &Reply) -> (u64, u64) {
+    (r.u64_at(16), r.u64_at(24))
+}
+
+/// Plan 42 §5.3.2 (W3a): with `zero`, a directory's entry carries
+/// attribute validity 0 and keeps its entry validity, a file's both; a
+/// directory's `GETATTR` reply validity is 0. With `entry`, the view's
+/// TTL for both.
+#[test]
+fn a_directorys_attributes_get_no_kernel_lifetime_under_zero() {
+    for (ttl, dir_attr) in [
+        (constellation_frontend_fuse::DirAttrTtl::Zero, 0),
+        (constellation_frontend_fuse::DirAttrTtl::Entry, 3),
+    ] {
+        let mock = MockVfs::new();
+        let fs = FuseFs::new(
+            Arc::new(mock.clone()),
+            FrontendCaps::linux_fuse(false),
+            KernelTuning::for_workers(1),
+        )
+        .with_workarounds(constellation_frontend_fuse::Workarounds {
+            dir_attr_ttl: ttl,
+            ..Default::default()
+        });
+        let mut k = Kernel::start_fs(fs, KERNEL_INIT_FLAGS, 0);
+        mock.always_lookup(Script::ok(entry(61, FileKind::Dir)));
+        let r = k.call(op::LOOKUP, 5, &Body::new().cstr("d"));
+        assert_eq!(entry_valid(&r), (3, dir_attr), "{ttl:?}: a directory");
+        mock.always_lookup(Script::ok(entry(60, FileKind::File)));
+        let r = k.call(op::LOOKUP, 5, &Body::new().cstr("f"));
+        assert_eq!(entry_valid(&r), (3, 3), "{ttl:?}: a file");
+        mock.always_getattr(Script::ok(attr(61, FileKind::Dir)));
+        let r = k.call(op::GETATTR, 61, &Body::new().u32(0).u32(0).u64(0));
+        assert_eq!(r.u64_at(0), dir_attr, "{ttl:?}: attr_valid");
+        k.finish();
+    }
 }

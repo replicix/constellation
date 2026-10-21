@@ -51,7 +51,7 @@ pub use session::{
 pub use stats::{
     FallbackReason, LockWaitCounter, RingHealthStats, SessionStats, TransportFallback,
 };
-pub use workarounds::{Switch, Workarounds};
+pub use workarounds::{DirAttrTtl, Switch, Workarounds};
 
 /// Whether this build can serve FUSE-over-io_uring at all (the `io-uring`
 /// feature, on Linux): what `constellation daemon --fuse-transports`

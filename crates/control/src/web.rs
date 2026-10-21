@@ -1371,6 +1371,11 @@ fn kernel_cache_metrics(output: &mut String, fuse: &FuseStatus) {
             "Write claims with an ambiguous read hit, marked instead of repaired.",
             |k| k.ambiguous_writes,
         ),
+        (
+            "constellation_fuse_dir_attr_notices_total",
+            "Attribute-only notifications for changed directories and moved inodes (plan 42 W3b).",
+            |k| k.dir_attr_notices,
+        ),
     ] {
         let _ = writeln!(output, "# HELP {name} {help}\n# TYPE {name} counter");
         for m in &fuse.mounts {

@@ -111,6 +111,25 @@ impl NotifyGate {
         Ok((notifier, st.entries.clone(), pc))
     }
 
+    /// Plan 42 §5.3.1: the notifier for an attribute-only notification,
+    /// whatever the gate's state (`None` once retired). Such a
+    /// notification takes no sleeping lock in the kernel —
+    /// `fuse_notify_inval_inode` takes `fc->killsb` for reading (written
+    /// only while the mount is torn down, by `fuse_mount_remove` briefly
+    /// and by `fuse_conn_destroy` across `fuse_abort_conn` +
+    /// `fuse_wait_aborted`, which end every request, the one being
+    /// answered included, without the daemon: bounded by the abort, not a
+    /// cycle), and `fuse_reverse_inval_inode` with `offset < 0` only
+    /// `fi->lock`, a spinlock; `fuse_ilookup` waits at most for an inode
+    /// being created or freed, and the reference it drops is not the last
+    /// (the operation holds the parent) — so a replying worker may write
+    /// one, and a detaching session, which still answers requests, still
+    /// protects them. The exception to `kernel_inval`'s first rule, and the
+    /// argument for it.
+    pub(crate) fn notifier_now(&self) -> Option<Notifier> {
+        self.state.lock().unwrap().notifier.clone()
+    }
+
     /// The session's page-cache table (whatever the gate's state).
     pub(crate) fn page_cache(&self) -> Arc<PageCacheTable> {
         self.state.lock().unwrap().pc.clone()

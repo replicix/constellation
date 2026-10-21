@@ -21,8 +21,8 @@ use constellation_control::proto::{ControlError, ErrorKind};
 use constellation_types::Code;
 use constellation_vfs::{
     Attr, Blocking, Caller, CollectDir, Durability, Entry, Fh, FileKind, LockOwner, Name, Observer,
-    OpCtx, OpKind, OpenFlags, OpenOwner, RenameFlags, SetAttr, SetXattrFlags, Timed, Vfs, VfsError,
-    VfsResult, XattrName, NO_TRANSPORT, ROOT_INO,
+    OpCtx, OpKind, OpenFlags, OpenOwner, RenameFlags, SetAttr, SetXattrFlags, Timed, Unit, Vfs,
+    VfsError, VfsResult, XattrName, NO_TRANSPORT, ROOT_INO,
 };
 use std::sync::Arc;
 
@@ -362,7 +362,7 @@ impl ControlVfs {
         };
         self.op(OpKind::Rename, p1, |cx, r| {
             self.view
-                .rename(cx, p1, Name::new(n1), p2, Name::new(n2), flags, r)
+                .rename(cx, p1, Name::new(n1), p2, Name::new(n2), flags, Unit(r))
         })
         .map_err(|e| vfs_err(from, e))
     }

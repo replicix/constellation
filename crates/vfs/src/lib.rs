@@ -50,13 +50,13 @@ pub use name::{Name, NameBuf, XattrName, XattrNameBuf};
 pub use observe::{ObservedOp, Observer, ViewIdentity};
 pub use policy::{IdentityMap, NamePolicy, PolicyStack, XattrPolicy, NAME_MAX};
 pub use responder::{
-    Blocking, BlockingWait, CollectDir, DirEntry, DirSink, FnResponder, Responder, WaitStart,
+    Blocking, BlockingWait, CollectDir, DirEntry, DirSink, FnResponder, Responder, Unit, WaitStart,
 };
 pub use types::{
     Attr, CacheStamp, CopyFlags, Durability, Entry, FallocateMode, Fh, FileKind, Ino, LockKind,
     LockOwner, LockRange, LockSpec, LockStatus, OpenFlags, OpenOwner, Opened, PassthroughChunk,
-    ReadData, RenameFlags, SeekWhence, SetAttr, SetXattrFlags, SetXattrMode, StatFs, TimeSet,
-    WriteData, ZeroCopyRead, ZeroCopySource, COPY_MAX, ROOT_INO,
+    ReadData, RenameFlags, Renamed, SeekWhence, SetAttr, SetXattrFlags, SetXattrMode, StatFs,
+    TimeSet, WriteData, ZeroCopyRead, ZeroCopySource, COPY_MAX, ROOT_INO,
 };
 pub use vfs::Vfs;
 pub use watch::{OpWatch, WatchKey, Watched};

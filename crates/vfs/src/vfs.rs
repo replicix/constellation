@@ -6,7 +6,7 @@ use crate::observe::ViewIdentity;
 use crate::responder::{DirSink, Responder};
 use crate::types::{
     Attr, CopyFlags, Durability, Entry, FallocateMode, Fh, Ino, LockOwner, LockRange, LockSpec,
-    LockStatus, OpenFlags, OpenOwner, Opened, ReadData, RenameFlags, SeekWhence, SetAttr,
+    LockStatus, OpenFlags, OpenOwner, Opened, ReadData, RenameFlags, Renamed, SeekWhence, SetAttr,
     SetXattrFlags, StatFs, WriteData,
 };
 use constellation_types::Rdev;
@@ -163,8 +163,10 @@ pub trait Vfs: Send + Sync + 'static {
 
     fn rmdir<R: Responder<()>>(&self, cx: &OpCtx<'_>, parent: Ino, name: &Name, r: R);
 
+    /// Rename (or, with `RENAME_EXCHANGE`, swap) a name. The answer names
+    /// the inode(s) moved ([`Renamed`]).
     #[allow(clippy::too_many_arguments)]
-    fn rename<R: Responder<()>>(
+    fn rename<R: Responder<Renamed>>(
         &self,
         cx: &OpCtx<'_>,
         parent: Ino,
@@ -174,6 +176,13 @@ pub trait Vfs: Send + Sync + 'static {
         flags: RenameFlags,
         r: R,
     );
+
+    /// Whether this view serves `--cto strict` (plan 30 §M8): a frontend
+    /// that caches attributes applies its strict rules (plan 42 §5.3.2: no
+    /// kernel lifetime for a directory's attributes). Default: no.
+    fn strict_cto(&self) -> bool {
+        false
+    }
 
     /// Open an existing inode.
     ///

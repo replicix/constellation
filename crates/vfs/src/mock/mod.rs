@@ -42,7 +42,7 @@ use crate::name::{Name, NameBuf, XattrName, XattrNameBuf};
 use crate::responder::{DirEntry, DirSink, Responder};
 use crate::types::{
     Attr, CopyFlags, Durability, Entry, FallocateMode, Fh, Ino, LockOwner, LockRange, LockSpec,
-    LockStatus, OpenFlags, OpenOwner, Opened, ReadData, RenameFlags, SeekWhence, SetAttr,
+    LockStatus, OpenFlags, OpenOwner, Opened, ReadData, RenameFlags, Renamed, SeekWhence, SetAttr,
     SetXattrFlags, StatFs, WriteData,
 };
 use crate::vfs::Vfs;
@@ -405,7 +405,7 @@ scripts! {
     link: Entry => on_link, always_link;
     unlink: () => on_unlink, always_unlink;
     rmdir: () => on_rmdir, always_rmdir;
-    rename: () => on_rename, always_rename;
+    rename: Renamed => on_rename, always_rename;
     open: Opened => on_open, always_open;
     create: (Entry, Opened) => on_create, always_create;
     read: ReadData => on_read, always_read;
@@ -952,7 +952,7 @@ impl Vfs for MockVfs {
         self.run(call, |s| &s.rmdir, r, |v| v.rmdir(parent, name));
     }
 
-    fn rename<R: Responder<()>>(
+    fn rename<R: Responder<Renamed>>(
         &self,
         cx: &OpCtx<'_>,
         parent: Ino,
@@ -976,7 +976,11 @@ impl Vfs for MockVfs {
             call,
             |s| &s.rename,
             r,
-            |v| v.rename(parent, name, new_parent, new_name, flags),
+            // The reference does not say what it moved.
+            |v| {
+                v.rename(parent, name, new_parent, new_name, flags)
+                    .map(|()| Renamed::default())
+            },
         );
     }
 

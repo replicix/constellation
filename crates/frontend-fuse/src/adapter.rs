@@ -75,9 +75,9 @@ use crate::passthrough::{reason, BackingOps, PassthroughState, PassthroughWish, 
 use crate::refs::{Forgot, KernelRefs};
 use crate::repair::RepairLane;
 use crate::reply::{
-    AttrReply, BytesReply, CopyReply, CreateReply, DirReply, EmptyReply, EntryReply, LockReply,
-    LseekReply, OpenCtx, OpenReply, ReadReply, RenameReply, StatfsReply, Undo, WriteReply,
-    XattrListReply, XattrReply, F_RDLCK, F_UNLCK, F_WRLCK,
+    AttrReply, BytesReply, CopyReply, CreateReply, DirChangeReply, DirNotice, DirReply, EmptyReply,
+    EntryReply, LockReply, LseekReply, OpenCtx, OpenReply, ReadReply, RenameReply, StatfsReply,
+    Undo, WriteReply, XattrListReply, XattrReply, F_RDLCK, F_UNLCK, F_WRLCK,
 };
 use crate::stats::ZeroCopyCounter;
 use constellation_types::{Code, Rdev};
@@ -205,7 +205,7 @@ impl<V: Vfs> FuseFs<V> {
     /// serves anything: the page-cache table and the repair lane start
     /// over).
     pub fn with_workarounds(mut self, w: crate::Workarounds) -> Self {
-        self.pc = PageCacheTable::new(w.page_cache());
+        self.pc = PageCacheTable::new(w.page_cache(self.vfs.strict_cto()));
         self.gate = Arc::default();
         self.lane = RepairLane::new(
             self.pc.clone(),
@@ -214,6 +214,20 @@ impl<V: Vfs> FuseFs<V> {
             w.repair_wait,
         );
         self
+    }
+
+    /// Plan 42 §5.3.1: what a namespace reply tells the kernel through.
+    fn notice(&self) -> DirNotice {
+        DirNotice {
+            gate: self.gate.clone(),
+            pc: self.pc.clone(),
+        }
+    }
+
+    /// Plan 42 §5.3.2: whether a directory's attributes get no kernel
+    /// lifetime on this view.
+    fn dir_zero(&self) -> bool {
+        self.pc.config().dir_attr_zero()
     }
 
     /// Where the session puts its notification gate once it exists (the
@@ -1221,6 +1235,9 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
                 reply,
                 name: name_guard,
                 pc: self.pc.clone(),
+                changed: None,
+                notice: self.notice(),
+                dir_zero: self.dir_zero(),
             }),
         );
     }
@@ -1239,6 +1256,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             op.responder(AttrReply {
                 reply,
                 pc: self.pc.clone(),
+                dir_zero: self.dir_zero(),
             }),
         );
     }
@@ -1281,10 +1299,14 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             ino.0,
             fh.map(|fh| Fh(fh.0)),
             &set,
-            op.responder(self.parkable(req, AttrReply {
-                reply,
-                pc: self.pc.clone(),
-            })),
+            op.responder(self.parkable(
+                req,
+                AttrReply {
+                    reply,
+                    pc: self.pc.clone(),
+                    dir_zero: self.dir_zero(),
+                },
+            )),
         );
     }
 
@@ -1314,11 +1336,17 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             parent.0,
             name(n),
             mode,
-            op.responder(self.parkable(req, EntryReply {
-                reply,
-                name: name_guard,
-                pc: self.pc.clone(),
-            })),
+            op.responder(self.parkable(
+                req,
+                EntryReply {
+                    reply,
+                    name: name_guard,
+                    pc: self.pc.clone(),
+                    changed: Some(parent.0),
+                    notice: self.notice(),
+                    dir_zero: self.dir_zero(),
+                },
+            )),
         );
     }
 
@@ -1345,11 +1373,17 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             name(n),
             mode,
             rdev,
-            op.responder(self.parkable(req, EntryReply {
-                reply,
-                name: name_guard,
-                pc: self.pc.clone(),
-            })),
+            op.responder(self.parkable(
+                req,
+                EntryReply {
+                    reply,
+                    name: name_guard,
+                    pc: self.pc.clone(),
+                    changed: Some(parent.0),
+                    notice: self.notice(),
+                    dir_zero: self.dir_zero(),
+                },
+            )),
         );
     }
 
@@ -1370,11 +1404,17 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             ino.0,
             newparent.0,
             name(newname),
-            op.responder(self.parkable(req, EntryReply {
-                reply,
-                name: name_guard,
-                pc: self.pc.clone(),
-            })),
+            op.responder(self.parkable(
+                req,
+                EntryReply {
+                    reply,
+                    name: name_guard,
+                    pc: self.pc.clone(),
+                    changed: Some(newparent.0),
+                    notice: self.notice(),
+                    dir_zero: self.dir_zero(),
+                },
+            )),
         );
     }
 
@@ -1414,6 +1454,8 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
                     reply,
                     cx,
                     name: name_guard,
+                    parent: parent.0,
+                    notice: self.notice(),
                 },
             )),
         );
@@ -1436,11 +1478,17 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             parent.0,
             name(link_name),
             target.as_os_str().as_bytes(),
-            op.responder(self.parkable(req, EntryReply {
-                reply,
-                name: name_guard,
-                pc: self.pc.clone(),
-            })),
+            op.responder(self.parkable(
+                req,
+                EntryReply {
+                    reply,
+                    name: name_guard,
+                    pc: self.pc.clone(),
+                    changed: Some(parent.0),
+                    notice: self.notice(),
+                    dir_zero: self.dir_zero(),
+                },
+            )),
         );
     }
 
@@ -1452,7 +1500,14 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             &op.ctx(&caller),
             parent.0,
             name(n),
-            op.responder(self.parkable(req, EmptyReply(reply))),
+            op.responder(self.parkable(
+                req,
+                DirChangeReply {
+                    reply,
+                    parent: parent.0,
+                    notice: self.notice(),
+                },
+            )),
         );
     }
 
@@ -1464,7 +1519,14 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             &op.ctx(&caller),
             parent.0,
             name(n),
-            op.responder(self.parkable(req, EmptyReply(reply))),
+            op.responder(self.parkable(
+                req,
+                DirChangeReply {
+                    reply,
+                    parent: parent.0,
+                    notice: self.notice(),
+                },
+            )),
         );
     }
 
@@ -1500,6 +1562,8 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
                     reply,
                     names,
                     exchange: flags.contains(RenameFlags::EXCHANGE),
+                    parents: (parent.0, newparent.0),
+                    notice: self.notice(),
                 },
             )),
         );
@@ -1559,12 +1623,15 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             size,
             // A cold read may be answered from the engine's completion
             // pool: counted until it is, for a detach to drain.
-            op.responder(self.deferred.track_bounded(self.parkable(req, ReadReply {
-                reply,
-                size,
-                zero_copy: self.zero_copy_reads.clone(),
-                _counted: counted,
-            }))),
+            op.responder(self.deferred.track_bounded(self.parkable(
+                req,
+                ReadReply {
+                    reply,
+                    size,
+                    zero_copy: self.zero_copy_reads.clone(),
+                    _counted: counted,
+                },
+            ))),
         );
     }
 

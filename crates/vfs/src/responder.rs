@@ -67,6 +67,17 @@ pub enum WaitStart {
     Refused,
 }
 
+/// A responder of `T` that answers `R`, a responder of `()`: for a caller
+/// that does not need what an op's answer carries (a rename's moved
+/// inodes, say).
+pub struct Unit<R>(pub R);
+
+impl<T, R: Responder<()>> Responder<T> for Unit<R> {
+    fn done(self, result: VfsResult<T>) {
+        self.0.done(result.map(|_| ()))
+    }
+}
+
 /// A responder that hands the result to a thread parked on a
 /// [`BlockingWait`]. For synchronous callers — tests, a frontend site not
 /// yet converted to real deferral — not how a kernel frontend answers.

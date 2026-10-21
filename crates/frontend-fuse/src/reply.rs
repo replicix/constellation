@@ -10,6 +10,7 @@
 //! started (`constellation_engine::locks::ClusterLocks::lock`).
 
 use crate::dentries::{EntryGuard, RenameGuard};
+use crate::notify::NotifyGate;
 use crate::pagecache::{Claim, Mark, OpenFacts, PageCacheTable};
 use crate::passthrough::{OpenAnswer, PassthroughState, PreOpen};
 use crate::repair::RepairLane;
@@ -27,8 +28,70 @@ use fuser::{
 use std::ffi::OsStr;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, UNIX_EPOCH};
+
+/// Plan 42 §5.3.1 (W3b): before a namespace operation's reply is written,
+/// an attribute-only `FUSE_NOTIFY_INVAL_INODE` for every directory it
+/// changed and every inode it moved. The kernel's `fuse_dir_changed`
+/// invalidates the parent's attributes after the reply without bumping
+/// its `attr_version`, so a `GETATTR`/`LOOKUP`/`READDIRPLUS` reply the
+/// daemon generated before the change but the kernel processes after it
+/// passes the version check, stores the old attributes and clears the
+/// invalidation — the old `st_nlink` cached for the attribute TTL (race
+/// 2b); `fuse_rename_common` does the same to the moved inode's `ctime`.
+/// The notification sets the inode's `attr_version` to a fresh value
+/// (`fuse_reverse_inval_inode`), above the snapshot every such request
+/// took before it was sent, so their replies are rejected whenever they
+/// arrive; a request sent after it is answered after the change. Written
+/// from the replying thread (`NotifyGate::notifier_now` says why that is
+/// safe for an attribute-only one); errors mean the kernel holds no such
+/// inode, so nothing to protect.
+#[derive(Clone)]
+pub(crate) struct DirNotice {
+    pub gate: Arc<OnceLock<Arc<NotifyGate>>>,
+    pub pc: Arc<PageCacheTable>,
+}
+
+impl DirNotice {
+    fn tell(&self, inos: &[Option<Ino>]) {
+        if !self.pc.config().dir_notice_on() {
+            return;
+        }
+        let Some(notifier) = self.gate.get().and_then(|g| g.notifier_now()) else {
+            return;
+        };
+        let mut told: [Ino; 4] = [0; 4];
+        let mut n = 0;
+        for ino in inos.iter().flatten() {
+            if told[..n].contains(ino) {
+                continue;
+            }
+            let _ = notifier.inval_inode(INodeNo(*ino), -1, 0);
+            self.pc.count_dir_notice();
+            if n < told.len() {
+                told[n] = *ino;
+                n += 1;
+            }
+        }
+    }
+}
+
+/// Plan 42 §5.3.2 (W3a): a directory's attributes are answered with an
+/// attribute TTL of 0 and the entry's TTL kept (`zero`), so the kernel
+/// never answers a directory's `stat` from a cache an install may be
+/// half-way through updating (race 2a: `fuse_change_attributes_common`
+/// clears the invalidation and sets `i_time` before it stores the fields,
+/// and `fuse_update_get_attr` reads both without `fi->lock`); with an
+/// attribute TTL of 0 `i_time` is 0 and every reader refreshes. `false`:
+/// the view's TTL, as before plan 42.
+fn attr_ttl(attr: &Attr, dir_zero: bool) -> Duration {
+    if dir_zero && attr.kind == FileKind::Dir {
+        Duration::ZERO
+    } else {
+        attr.ttl
+    }
+}
 
 /// The Linux FUSE boundary (plan 31 §7): the one place a portable [`Code`]
 /// becomes the kernel's errno number. Everything below the reply carries
@@ -90,20 +153,41 @@ pub(crate) struct EntryReply {
     pub reply: ReplyEntry,
     /// Plan 42 §5.2.1 (A3): the size a file's reply hands the kernel.
     pub pc: Arc<PageCacheTable>,
+    /// Plan 42 §5.3.1: the directory the operation changed (`None` for a
+    /// `lookup`), told before the reply.
+    pub changed: Option<Ino>,
+    pub notice: DirNotice,
+    /// Plan 42 §5.3.2: a directory's attributes get no kernel lifetime.
+    pub dir_zero: bool,
 }
 
 impl Responder<Entry> for EntryReply {
     fn done(self, r: VfsResult<Entry>) {
-        let EntryReply { name, reply, pc } = self;
+        let EntryReply {
+            name,
+            reply,
+            pc,
+            changed,
+            notice,
+            dir_zero,
+        } = self;
         match r {
             Ok(e) => {
                 if e.attr.kind == FileKind::File {
                     pc.size_seen(e.attr.ino, e.attr.size);
                 }
+                if changed.is_some() {
+                    notice.tell(&[changed]);
+                }
                 // Before the bytes go: the kernel may forget this lookup as
                 // soon as it has the reply, on another worker.
                 name.hands_out(e.attr.ino);
-                reply.entry(&e.attr.ttl, &fuse_attr(&e.attr), Generation(e.generation));
+                reply.entry_with_ttls(
+                    &attr_ttl(&e.attr, dir_zero),
+                    &e.attr.ttl,
+                    &fuse_attr(&e.attr),
+                    Generation(e.generation),
+                );
                 name.replied(e.attr.ttl);
             }
             Err(e) => name.failed(|| reply.error(reply_code(e.code()))),
@@ -123,6 +207,8 @@ impl Responder<Entry> for EntryReply {
 pub(crate) struct AttrReply {
     pub reply: ReplyAttr,
     pub pc: Arc<PageCacheTable>,
+    /// Plan 42 §5.3.2: a directory's attributes get no kernel lifetime.
+    pub dir_zero: bool,
 }
 
 impl Responder<Attr> for AttrReply {
@@ -132,7 +218,8 @@ impl Responder<Attr> for AttrReply {
                 if a.kind == FileKind::File {
                     self.pc.size_seen(a.ino, a.size);
                 }
-                self.reply.attr(&a.ttl, &fuse_attr(&a))
+                self.reply
+                    .attr(&attr_ttl(&a, self.dir_zero), &fuse_attr(&a))
             }
             Err(e) => self.reply.error(reply_code(e.code())),
         }
@@ -291,6 +378,7 @@ macro_rules! ring_budget {
 
 ring_budget! {
     EmptyReply => true,
+    DirChangeReply => true,
     RenameReply => true,
     AttrReply => true,
     EntryReply => true,
@@ -311,6 +399,31 @@ fn ring_wait(held: bool) -> constellation_vfs::WaitStart {
 }
 
 pub(crate) struct EmptyReply(pub ReplyEmpty);
+
+/// `unlink`/`rmdir`'s reply, and the directory it changed (plan 42
+/// §5.3.1), told before the reply.
+pub(crate) struct DirChangeReply {
+    pub reply: ReplyEmpty,
+    pub parent: Ino,
+    pub notice: DirNotice,
+}
+
+impl Responder<()> for DirChangeReply {
+    fn done(self, r: VfsResult<()>) {
+        match r {
+            Ok(()) => {
+                self.notice.tell(&[Some(self.parent)]);
+                self.reply.ok()
+            }
+            Err(e) => self.reply.error(reply_code(e.code())),
+        }
+    }
+
+    /// As [`EmptyReply`]'s.
+    fn begin_wait(&mut self) -> constellation_vfs::WaitStart {
+        ring_wait(self.reply.hold_for_wait())
+    }
+}
 
 impl Responder<()> for EmptyReply {
     fn done(self, r: VfsResult<()>) {
@@ -336,13 +449,23 @@ pub(crate) struct RenameReply {
     // EIO.
     pub names: RenameGuard,
     pub exchange: bool,
+    /// Plan 42 §5.3.1: the two directories, told before the reply with
+    /// the inode(s) the rename moved.
+    pub parents: (Ino, Ino),
+    pub notice: DirNotice,
     pub reply: ReplyEmpty,
 }
 
-impl Responder<()> for RenameReply {
-    fn done(self, r: VfsResult<()>) {
+impl Responder<constellation_vfs::Renamed> for RenameReply {
+    fn done(self, r: VfsResult<constellation_vfs::Renamed>) {
         match r {
-            Ok(()) => {
+            Ok(moved) => {
+                self.notice.tell(&[
+                    Some(self.parents.0),
+                    Some(self.parents.1),
+                    moved.moved,
+                    moved.exchanged,
+                ]);
                 self.reply.ok();
                 self.names.renamed(self.exchange);
             }
@@ -512,12 +635,24 @@ pub(crate) struct CreateReply {
     pub name: EntryGuard,
     /// `ino` is learnt from the reply; `pre` is always `Unregistered`.
     pub cx: OpenCtx,
+    /// Plan 42 §5.3.1: the directory the create changed, told before the
+    /// reply (also when it opened an existing file: the kernel runs
+    /// `fuse_dir_changed` only for a new entry, and the notice is
+    /// harmless).
+    pub parent: Ino,
+    pub notice: DirNotice,
     pub reply: ReplyCreate,
 }
 
 impl Responder<(Entry, Opened)> for CreateReply {
     fn done(self, r: VfsResult<(Entry, Opened)>) {
-        let CreateReply { reply, cx, name } = self;
+        let CreateReply {
+            reply,
+            cx,
+            name,
+            parent,
+            notice,
+        } = self;
         match r {
             Ok((e, o)) => {
                 // A create can open an existing inode (no `O_EXCL`), and
@@ -541,9 +676,11 @@ impl Responder<(Entry, Opened)> for CreateReply {
                 let fh = FileHandle(o.fh.0);
                 let attr = fuse_attr(&e.attr);
                 let generation = Generation(e.generation);
-                // A3 (plan 42 §5.2.1); a refused open below hands nothing.
+                // A3 (plan 42 §5.2.1) and W3b (§5.3.1); a refused open
+                // below hands nothing and changed nothing the kernel knows.
                 if answer_is_ok(&answer) {
                     cx.pc.size_seen(e.attr.ino, e.attr.size);
+                    notice.tell(&[Some(parent)]);
                 }
                 match fopen(answer) {
                     Some((flags, None)) => {

@@ -112,7 +112,7 @@ impl Fenced {
                 ROOT_INO,
                 Name::new(to),
                 RenameFlags::empty(),
-                r,
+                constellation_vfs::Unit(r),
             )
         })
     }

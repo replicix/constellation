@@ -186,6 +186,7 @@ fn kernel_cache_status(
         repair_wait_max_ms: c.repair_wait_max_ms,
         ambiguous_writes: c.ambiguous_writes,
         concurrent_writes: c.concurrent_writes,
+        dir_attr_notices: c.dir_attr_notices,
     }
 }
 

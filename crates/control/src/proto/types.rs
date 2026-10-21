@@ -802,6 +802,9 @@ pub struct FuseKernelCacheStatus {
     /// Claims while another write-through write of the file was pending
     /// (not expected; logged once).
     pub concurrent_writes: u64,
+    /// Attribute-only notifications written for changed directories and
+    /// moved inodes (W3b).
+    pub dir_attr_notices: u64,
 }
 
 /// Passthrough opens on one mount (plan 38 §3(c)): the kernel reading a
