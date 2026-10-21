@@ -19947,8 +19947,12 @@ mod locks {
     #[test]
     fn a_restart_quarantine_marks_the_first_backup_listing() {
         let mut h = Harness::new(1);
-        h.meta.note_lock_grant_horizon(h.now.0 + 4_000).unwrap();
-        let until = h.meta.load_lock_quarantine(h.clk());
+        h.meta
+            .note_lock_grant_horizon(WaitMs(h.now.0 + 4_000), h.clk())
+            .unwrap();
+        let until = h
+            .meta
+            .load_lock_quarantine(h.clk(), h.core.cfg.lock_horizon_span_ms());
         assert!(until.is_some(), "no quarantine from the persisted horizon");
         let now = h.now;
         h.core.locks_start(Now::same(now.0), &h.meta);
