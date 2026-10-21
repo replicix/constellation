@@ -501,6 +501,19 @@ pub enum AckClass {
 `ParkedWhat::Reply`/`Finish` and on the immediate reply path) so the
 sim can record it, and is counted per class in `status.ack.classes`.
 
+"Within the budget" (the table's "in budget", "lone") means: a peer whose
+link is connected, whose RTT is at most `backup_rtt_budget_ms`, and which
+has been up for `backup_stable_ms` — the backup candidate rule
+(`Core::backup_candidates`). A fresh node is lone for its first
+`backup_stable_ms` though a peer is physically near; its own clients'
+answers in that window are `Lone`, a remote's wait for the archive. The
+core's `lone` and the simulation's oracle use the same rule (C0 review;
+C2 coder spec D10). The class is decided per row at journal time and
+never re-decided for that row: a delegate that turns lone after
+journaling a `DelegGroup` row still waits for that row's group, and a
+root that turns lone with a `RootGroup` row parked for a remote answers
+it from the archive.
+
 ### 5.2 C1: a backup-acknowledged row is committed
 
 Today a row acknowledged under `Backup` is committed in fact
@@ -665,14 +678,21 @@ fast-path answer) are C2's.
    `DurableWait::Ungated` therefore answers OK **iff the node is lone or
    holds an epoch** (class Lone or NonStealable; the session learns both
    from `set_durable`); any other `Ungated` is an invariant violation
-   (`debug_assert!`, counted in `ack.ungated_unexpected`, answered by
-   resubmitting in doubt). It must never wait for the archive in an
+   (counted in `ack.ungated_unexpected`, answered by resubmitting in
+   doubt; no `debug_assert!`: the gate also goes off at a release or
+   handoff after the fast-path write, which is reachable — C2 coder spec
+   D5). It must never wait for the archive in an
    epoch: S3 is unreachable there by definition, and that wait is the
    plan 30 §M10 regression the comment in `durable_jseq` records.
 5. **Settling an op before `EIO` (`Abandon`).** New
    `MutateOp::Abandon {}` (executed by rid only) and portable
    `Code::Abandoned` (`crates/types/src/errno.rs`, a new wire number;
-   `EIO` at the FUSE boundary): the executor answers `r`'s outcome if
+   `EIO` at the FUSE boundary) — *as specified for the coder (C2 spec
+   D2, §11 Q21): no new `Code`; the refusal is `Refused { rid, code:
+   ABANDONED_CODE }` with `ABANDONED_CODE = Code::Canceled` (as
+   `LAPSED_CODE = Code::NoLock`), the answer a new
+   `MutateOutcome::Abandoned` the engine maps to `EIO`, and `Abandon` is
+   the `settle` flag of Q15*: the executor answers `r`'s outcome if
    `completed` has one; otherwise journals `Refused { rid: r, code:
    Abandoned }` and answers it. `on_client_deadline`
    (`client.rs:2463-2518`) no longer calls `finish_in_doubt` directly:
@@ -717,6 +737,11 @@ fast-path answer) are C2's.
      flag; the rest of this plan writes `Abandon` for either.
    - `Code::Abandoned`: check `crates/types/src/errno.rs`'s portable
      table for a reserved hole before appending a new wire number.
+     *Checked (2026-10-22): there is none (wires 1..=63 contiguous), and a
+     new code needs its own Linux and Darwin errno
+     (`crates/types/tests/properties.rs` round-trips every code), so it
+     could not be `EIO` at the FUSE boundary through the table: hence the
+     sentinel above.*
 6. **Stranded unacknowledged ops of a delegation are dropped, not
    replayed.** At a `Recall` (`stranded_by_recall`,
    `spec.rs:275-283`), a delegate's rows past the cut are uncommitted
@@ -739,7 +764,12 @@ fast-path answer) are C2's.
    `status.delegation.gens[].waiting_for_group`) until a member answers
    or `constellation repair abandon-group --gen G`.
    The end is journaled as `LogRecord::Recall { dir, gen, through: u64 }`
-   (`record.rs:243`, field added): `through` is the root's cursor at the
+   (`record.rs:243`, field added) — *as specified for the coder (C2 spec
+   D1): a new variant `LogRecord::RecallCut { dir, gen, through }`
+   appended after the last one; `Recall { dir, gen }` stays decodable and
+   keeps its inferred cut for logs written before C2 (records are postcard,
+   not self-describing: a field added to `Recall` would make every
+   existing log carrying one undecodable)* — `through` is the root's cursor at the
    end (`end_generation`, `delegate.rs:3164-3238`). Every replica's void
    cut is `through` (`replay.rs:782-826`: `void_stream(gen, through)`,
    `note_void_cut(gen, through)`; `session.rs` `seed_generations`), not
@@ -747,6 +777,19 @@ fast-path answer) are C2's.
    becomes a cache of the log. The generation counter stays the root's
    (`next_deleg_gen` floored by `max_gen`, both from the log). (Moved
    here from C4 so that C3 can rely on it; the review's H4.)
+   *Coder-spec refinements (2026-10-22, §11 Q21):* the end **waits (Q1)
+   for one member of the latest `DelegGroup` version** to answer its seal
+   and for that member's sealed tail to be drained to its end (today
+   `on_deleg_sealed` ends the generation even when its drain stopped at a
+   gap or a missing dependency); backups named only by older records are
+   sealed best effort, once, without waiting (with the union rule of item
+   1 and `removal_safe`, every row acknowledged under an older version is
+   at or below the cursor or on the later version's members; waiting on a
+   removed — usually dead — backup would block the end forever). The
+   delegate learns a group version only from its replica's delegation
+   table (the log, or the committed pre-S3 stream), never from a message,
+   and while a change it requested is not yet applied an acknowledgement
+   needs the members of both versions.
 8. **The delegate's fast path keeps the root's shape.** Today
    `deleg_fast_path_gated` *closes* the delegate's fast path whenever it
    has a backup (ops go through the core and park, `delegate.rs:411`),
@@ -1496,6 +1539,18 @@ parked copy of the same rid. The application saw a refusal for an op
 that took effect. The simulation's oracle counts the lone delegate's
 refusal as tentative (no backup); C2's rule removes the answer itself.
 
+*Measured (2026-10-22, `f27d3d1`, the coder spec's §14):* with
+`9ff33bb`'s exception removed, `regression_delegated_long_delegation_rolled_back_refusals_are_tentative`
+fails (seed 11: rid `(3,1,19)` refused `EEXIST` but completed once in the
+log); `delegated-long-delegation` 0..300 (flags off) counts 44 688
+uncommitted answers (archive 31 111, deleg-group 13 577) in 300 seeds, I2
+82 copies (80 seeds), I4 33 late landings (31 seeds), I5 163 non-lone
+rollbacks (153 seeds); under `+commit` every seed fails.
+
+*Coder spec* (decisions D1–D11, maintainer items
+§11 Q21, commit split C2a–C2h). Where it and this section differ, the
+spec's decisions are the ones recorded here and in §5.3.
+
 **Code** (§5.3): `Recall.through` and the recorded void cut (§5.3
 item 7: `record.rs:243`, `end_generation` `delegate.rs:3164-3238`,
 `replay.rs:782-826`, `session.rs` `void_stream`, `note_void_cut`,
@@ -1550,6 +1605,7 @@ its cut.
   `delegated-backup`×2000, `delegated-crash`×2000,
   `delegated-partition`×2000, `delegated-root-crash`×2000,
   `delegated-root-gone`×2000, `delegated-delegate-restart`×2000,
+  `delegated-long-delegation`×2000 (and `-prod`×2000),
   `delegated-two-gens-root-crash`×2000, `delegated-holder-cut`×2000,
   `shared_dir_*` ×500 each, `far_config`×1000, `long-sessions`×2000,
   `flex-crash`×2000 — **fail before** (uncommitted DelegGroup answers,
@@ -1575,6 +1631,22 @@ its cut.
   with `backup_rtt_budget_ms` large enough for the root only, i.e. the
   delegate's only in-budget peer is the root): I1 fails before (Layer A
   delegate acks), passes after. ×2000.
+- `regression_delegated_long_delegation_rolled_back_refusals_are_tentative`
+  is renamed `regression_delegated_long_delegation_no_refusal_for_an_op_that_lands`
+  with `9ff33bb`'s tentative exception removed from `note_rollbacks`
+  (seeds 11, 86, 200; fails before, passes after) and the seeds run with
+  `strict_commit`. New `delegated-long-delegation-prod` (the production
+  deadline ratio, `strict_settle`; the regression config keeps its 12 s
+  deadline, whose settle window ends before a 20 s generation is
+  outwaited: those `EIO`s are unsettled and counted).
+- The I1 oracle's two weaknesses (C0 review) are fixed first (C2a):
+  an answer's outcome must match the transaction that commits it
+  (`Completed` for OK, `Refused` with the same code for a refusal); a
+  client answer the core marks `Relayed { from }` is verified against a
+  judged answer of `from`, every other answer is judged (the
+  "same kind already sent" heuristic goes). Six oracle unit tests fail on
+  the C0 oracle. And the oracle reads the `DelegGroup` record in the
+  answerer's store, not the delegate's append target.
 - Core tests: `a_delegate_without_a_recorded_backup_waits_for_the_roots_append`,
   `a_delegate_counts_a_backup_only_after_its_deleg_group_record`,
   `a_removed_backup_is_needed_until_the_record_without_it_is_applied`,
@@ -3183,8 +3255,9 @@ not loosen the bar.
   C7b at least, as complex changes.
 - **No backcompat, no version bumps**: every wire, record and row change
   is in place (`MutateReply.committed`, `SealTail`/`SealedTail`,
-  `DelegGroup`, `Recall.through`, the lock records, `Origin`,
-  `JournalTx.{gated, tail_of}`, `Code::Abandoned`, the `Abandon`
+  `DelegGroup`, `Recall.through` (as the appended `RecallCut`), the lock records, `Origin`,
+  `JournalTx.{gated, tail_of}`, `Code::Abandoned` (as the `ABANDONED_CODE`
+  sentinel and `MutateOutcome::Abandoned`), the `Abandon`
   request (Q15), `GroupAbandoned`, C7's lease body and token fields); a
   mixed-version cluster is unsupported, as always.
 
@@ -3193,7 +3266,7 @@ not loosen the bar.
 The final list. Each says what it **blocks**; a question that the code
 answered is marked **decided** (the plan implements the decision; the
 maintainer may still overturn it). Blocking before C0: Q7, Q10a.
-Before C1: Q1, Q13. Before C2: Q2, Q4, Q9, Q14, Q15, Q16. Before C4:
+Before C1: Q1, Q13. Before C2: Q2, Q4, Q9, Q14, Q15, Q16, Q21. Before C4:
 Q6. Before C6: Q5. Before C7b: Q10b, Q10c. Before C7-F: Q17 (F-a),
 Q18 (F-b). Before C7-H1: Q19. Before C7a's commits 2–4: Q20.
 
@@ -3395,6 +3468,40 @@ to land before C0.
   (and `replay_from` setting it) is not a clock item: *recommended* in C0,
   where "applied, unfenced" gets one meaning for every reader.
   **Answered 2026-10-20:** every recommendation taken.
+
+- **Q21 — C2's coder-spec decisions (specified 2026-10-22).** *Blocks
+  C2* (the C2 coder spec, §13.3, has the detail).
+  (a) The generation's cut as an appended `RecallCut` record, `Recall`
+  kept readable with its inferred cut: *recommended* (append-only).
+  (b) `ABANDONED_CODE = Code::Canceled` and `MutateOutcome::Abandoned`
+  instead of a new `Code`: *recommended* (no errno hole; a new code needs
+  unique native errnos).
+  (c) The end of a generation waits for a member of the latest
+  `DelegGroup` version only; older named backups are sealed best effort:
+  *recommended* (Q14's belt without a permanent block).
+  (d) The delegate learns its group only from its table, with the union
+  of the applied and the requested version while a change is pending:
+  *recommended*.
+  (e) The inbox's `settle` flag as a trailing `InboxOp` field,
+  `INBOX_VERSION` unchanged (a batch from the previous binary fails to
+  decode and is skipped and counted), rather than a bump to 4 or no inbox
+  settle: *recommended*, if the drain skips an undecodable batch.
+  (f) No `debug_assert!` on an unexpected `Ungated`: *recommended*.
+  (g) Three holes found reading the code, fixed in C2: a dedup answer
+  (delegate, `settled_outcome`) waits for its row's commit; a delegate
+  stream park counts the archive by the log index, never by "the row left
+  my journal" (a dropped row also left it); a seal drain must reach the
+  sealed tail's end before the generation ends: *recommended*.
+  (h) The 200 ms stability window stated in §5.1, no new core wait:
+  *recommended*.
+  (i) `delegated-long-delegation` keeps its 12 s deadline; strict settle
+  on a `-prod` variant: *recommended*.
+  (j) `settle_window_ms = acquire_deadline_ms / 4`, derived, no env knob:
+  *recommended*.
+  (k) The requester's ungated-shadow path kept, counted (must be 0),
+  until C3/C5: *recommended*.
+  (l) C2a (the oracle fixes) may land before C1: *recommended* if C1's
+  fail-before runs have not started.
 
 ### 11.1 Deferred (not in this plan)
 
