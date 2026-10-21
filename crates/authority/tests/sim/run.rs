@@ -928,6 +928,9 @@ pub struct Cluster {
     pub budget_exceeded: Mutex<Vec<String>>,
     /// When each node taken down by a fault is back (simulated unix ms).
     pub down: Mutex<BTreeMap<NodeId, i64>>,
+    /// When each node a fault cut from S3 reaches it again (simulated
+    /// unix ms): a live copy that cannot put its rows in the log.
+    pub s3_cut: Mutex<BTreeMap<NodeId, i64>>,
     /// What a backup that is back needs, past its silence window, to
     /// claim the lease: a lease read, a tail and the CAS (four S3 round
     /// trips at the configured worst latency).
@@ -971,9 +974,39 @@ impl Cluster {
         if !self.ids().contains(&node) {
             return;
         }
-        let now = self.env.clock.wall().0;
         let back = back.unwrap_or(i64::MAX);
         self.down.lock().unwrap().insert(node, back);
+        self.check_failure_budget(node, "taken down", at_ms).await;
+    }
+
+    /// `node` is cut from S3 until `until` (simulated unix ms): alive, but
+    /// a copy that can put nothing in the log — the second failure when
+    /// the other copy is taken down meanwhile, as one taken down is
+    /// (backup-lag-at-expiry seeds 5, 275, 277 with a `Pause` of the
+    /// backup: the holder cut for 9 s, its backup sealed and then paused
+    /// past the claim grace; the next holder claimed by TTL, and the
+    /// rows both held came back only as replays by rid).
+    pub async fn note_s3_cut(&self, node: NodeId, until: i64, at_ms: u64) {
+        if !self.ids().contains(&node) {
+            return;
+        }
+        self.s3_cut.lock().unwrap().insert(node, until);
+        self.check_failure_budget(node, "cut from S3", at_ms).await;
+    }
+
+    /// A cut of `node` ended: the bucket's cut is one flag, so this heals
+    /// any overlapping cut of it too.
+    pub fn note_s3_healed(&self, node: NodeId) {
+        let now = self.env.clock.wall().0;
+        self.s3_cut.lock().unwrap().insert(node, now);
+    }
+
+    /// See [`Cluster::note_takedown`]: `node` just failed (`what`); record
+    /// the run as beyond the budget if every copy of the rows it shares is
+    /// now unable to put them in the log until past the point others may
+    /// claim the lease.
+    async fn check_failure_budget(&self, node: NodeId, what: &str, at_ms: u64) {
+        let now = self.env.clock.wall().0;
         let Some(lease) = read_lease(&self.env.bucket).await else {
             return;
         };
@@ -1009,35 +1042,47 @@ impl Cluster {
             return;
         }
         let ids = self.ids();
-        let back_at = |id: NodeId| -> i64 {
+        // When `id` is back up, and when it reaches S3 again.
+        let back_at = |id: NodeId| -> (i64, i64) {
             if !ids.contains(&id) {
-                return i64::MAX;
+                return (i64::MAX, i64::MAX);
             }
             let down = self.down.lock().unwrap().get(&id).copied();
+            let cut = self.s3_cut.lock().unwrap().get(&id).copied();
             let n = self.get(id);
-            match down {
+            let up = match down {
                 Some(b) if b > now => b,
                 _ if !n.alive() => i64::MAX,
                 _ => now,
-            }
+            };
+            (up, cut.filter(|c| *c > now).unwrap_or(now))
         };
-        // One failure is within the budget: only a takedown while every
-        // other copy is already down can exceed it.
-        if copies.iter().any(|c| *c != node && back_at(*c) <= now) {
+        // One failure is within the budget: only a failure while every
+        // other copy is already down (or cut from S3) can exceed it.
+        if copies.iter().any(|c| {
+            let (up, s3) = back_at(*c);
+            *c != node && up.max(s3) <= now
+        }) {
             return;
         }
         // A backup that is back must still hear nothing from the holder
         // for `backup_takeover_ms` before it may seal (its only evidence
-        // of the holder's death); the lease's own holder re-adopts it.
+        // of the holder's death); the lease's own holder re-adopts it. A
+        // backup that is up and only lost S3 may have heard that silence
+        // all along: it is counted as claiming once it reaches S3 again
+        // (the earliest it could, so a cut never overstates its absence).
         let seal_ms = (self.env.config)(node, 0).backup_takeover_ms as i64 + self.claim_ms;
         let first_back = copies
             .iter()
             .map(|c| {
-                let b = back_at(*c);
+                let (up, s3) = back_at(*c);
                 if *c == lease.holder {
-                    b
+                    up.max(s3)
+                } else if up > now || s3 <= now {
+                    up.saturating_add(seal_ms)
+                        .max(s3.saturating_add(self.claim_ms))
                 } else {
-                    b.saturating_add(seal_ms)
+                    s3.saturating_add(self.claim_ms)
                 }
             })
             .min()
@@ -1054,7 +1099,7 @@ impl Cluster {
         };
         if first_back > claimable_by_others {
             self.budget_exceeded.lock().unwrap().push(format!(
-                "t={at_ms} node {node} taken down; the copies {copies:?} of holder {}'s acknowledged rows are all down until {} ms past the point others may claim its lease",
+                "t={at_ms} node {node} {what}; the copies {copies:?} of holder {}'s acknowledged rows are all down until {} ms past the point others may claim its lease",
                 lease.holder,
                 first_back.saturating_sub(claimable_by_others)
             ));
@@ -1983,9 +2028,14 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 "t={} cut S3 for node {node} for {for_ms}ms",
                 fault.at_ms
             ));
+            let now = cluster.env.clock.wall().0;
+            cluster
+                .note_s3_cut(node, now + for_ms as i64, fault.at_ms)
+                .await;
             cluster.env.bucket.set_cut(node, true);
             tokio::time::sleep(Duration::from_millis(for_ms)).await;
             cluster.env.bucket.set_cut(node, false);
+            cluster.note_s3_healed(node);
         }
         FaultKind::RuntimeLag {
             who,
@@ -2183,9 +2233,14 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 "t={} cut S3 for holder {} for {for_ms}ms",
                 fault.at_ms, lease.holder
             ));
+            let now = cluster.env.clock.wall().0;
+            cluster
+                .note_s3_cut(lease.holder, now + for_ms as i64, fault.at_ms)
+                .await;
             cluster.env.bucket.set_cut(lease.holder, true);
             tokio::time::sleep(Duration::from_millis(for_ms)).await;
             cluster.env.bucket.set_cut(lease.holder, false);
+            cluster.note_s3_healed(lease.holder);
         }
         FaultKind::ClockStep { who, ms } => {
             let Some(node) = resolve_step_of(&cluster, who, fault.at_ms, "clock step", &note).await
@@ -2843,6 +2898,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         longest_submit_ms: Default::default(),
         budget_exceeded: Mutex::new(Vec::new()),
         down: Mutex::new(BTreeMap::new()),
+        s3_cut: Mutex::new(BTreeMap::new()),
         claim_ms: 4 * cfg.s3_latency.1 as i64,
         epochs: Mutex::new(Vec::new()),
         epochs_continued: Mutex::new(0),

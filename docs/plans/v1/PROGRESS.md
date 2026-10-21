@@ -56084,3 +56084,92 @@ On the test host, `origin/main` `b4fe2e6` plus the plan's commits:
 - [ ] Every CONVENTIONS gate: fmt, clippy, workspace tests, conformance,
   pjdfstest 8798/8798, smoke, `stress-ng-fs` green; the full `harness
   run` catalogue not run
+
+## Sim: a copy cut from S3 counts against one backup's failure budget (plan 43 C7a, 2026-10-21)
+
+Found while adding C7a's default clock-fault mix: `backup-lag-at-expiry`
+(seed 277), `backup-lag-at-expiry-beats-lost` (5, 275, 277, and its
+`-timers-first` twin) and `backup-lag-in-margin-cut` (277) failed with
+"[directory ] rid R1 returned before rid R2 was invoked but follows it in
+the log" once a node was frozen for 0.3–3 s on top of their faults. A
+plain `Pause` of the same node at the same time reproduces it on main, so
+it is not about clocks.
+
+### Not a product bug: two failures
+
+The configurations cut the holder from S3 at 1.1 s for 9 s. It cannot
+renew, so its lease lapses at about 6.1 s, and its backup must seal and
+claim within the claim grace. In every failing run the paused node is
+that backup. Seed 5 with `+pause1@7363:2416`:
+
+- 2117 ms: the holder acknowledges rid (2,1,48) with the backup's ack. The
+  row is held by the holder's journal and the backup's tail, nowhere else.
+- 7333 ms: the backup, its runtime lag over, seals epoch 1.
+- 7363–9779 ms: the backup is paused, before its claim.
+- 8303 ms: the third node claims the lapsed lease by TTL (expiry plus the
+  2 s grace), from a log without the tail.
+- The holder's rows come back only as its replays by rid, after the new
+  holder's ops: the reported order violation.
+
+The holder cut from S3 and its backup stopped are two failures, beyond
+what one backup promises. The sim's budget (`Cluster::note_takedown`)
+did not see it: it treated a live holder as a copy that could still put
+its rows in the log, even while cut from S3.
+
+### The change (sim only)
+
+- `Cluster::note_s3_cut`: `CutS3` and `CutS3Holder` record when the node
+  reaches S3 again and run the same budget check as a takedown, which
+  now treats a copy as unavailable until it is both up and reconnected. A
+  backup that is up and only lost S3 is counted as claiming four S3 round
+  trips (`claim_ms`) after the cut ends, without a silence window: the
+  earliest it could, so a cut never overstates its absence. The bucket's
+  cut is one flag per node, so a heal ends every overlapping cut, and so
+  does the record. Cuts inside the epoch outages (`sim/epochs.rs`) are not
+  counted: there, cut members commit through the epoch.
+- The relaxation is the existing one: strict durability is waived for
+  that run, so its rolled-back acknowledged ops are tentative (they need
+  not land, nor keep real-time order: the violation above); every other
+  check stays.
+- `+pause<node>@<at_ms>:<for_ms>` replay variant (TESTING.md).
+- Test `a_backup_paused_while_its_holder_is_cut_from_s3_is_beyond_the_budget`:
+  six pinned pauses of the backup must pass with a recorded overrun
+  (fails before: seed 5 is the order violation). Three pauses of the
+  third node or the cut holder itself must record nothing.
+
+### Evidence
+
+- A pause grid on main (nodes 1–3, start 5–10 s every 0.5 s, 0.3/1/2/3 s;
+  the five configurations, seeds 5, 275, 277; 1,980 runs): 39 failures,
+  all pausing the cut holder's backup. With the change: 0 failures, each
+  of the 39 recording one overrun.
+- The other order (the backup paused from 0.5–1 s for 6–9 s, so the
+  holder's cut is the second failure; three configurations, six seeds,
+  324 runs): no failures before or after; after, 88 runs record an
+  overrun from the cut's own check. As with takedowns, an overrun is
+  recorded whether or not a row was then at risk.
+- Base against the change, 36 sweep configurations (the backup, ack=s3,
+  lag, crash, lock-failover, double-seal and S3-cut-holder families;
+  2000 seeds each, 500 for `long-backup`, `long-acks3`,
+  `delegated-holder-cut`, `long-delegated-backup`):
+  - Failing sets: unchanged (all empty).
+  - Seeds whose strict durability the budget waives (`SWEEP-BUDGET`):
+    unchanged except one new seed, `double-seal-inside-the-grace` 1652.
+    There holder 1 is cut from S3, its backup 2 seals and takes over with
+    the tail and no backup of its own, and is then cut itself until past
+    its lease: the class of 609380 ("two failures within one backup's
+    budget", above). Its verdict and fingerprint are unchanged.
+  - Per-seed run fingerprints: identical, except seed 64 of
+    `backup-strict`, `backup-strict-inbox-off` and `backup-crash-slow`,
+    and seed 192 of `backup-crash-slow`. Those seeds are nondeterministic
+    on main itself: repeated runs of the base binary give two
+    fingerprints (seed 64: 26 or 27 log segments).
+
+### Consequences
+
+- Plan 43 C7a commit 6 can give these configurations the clock-fault mix
+  again, so far as the mix's suspends and pauses go. Its other faults
+  were not checked here.
+- Plan 43 C1 deletes the TTL claim without the tail and this relaxation
+  with it: then these pinned seeds must pass strictly (the third node
+  waits for the group).

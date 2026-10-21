@@ -3258,6 +3258,80 @@ fn a_backup_lapsing_at_its_holders_expiry_still_claims_in_time() {
     }
 }
 
+/// The lag-at-expiry configurations with a `Pause` of the cut holder's
+/// backup on top (plan 43 C7a's clock-fault mix found them as a suspend:
+/// seeds 5, 275 and 277): the backup seals, or is about to, and stands
+/// still past the claim grace; the third node claims the lapsed lease by
+/// TTL from a log without the tail, and the rows both copies held come
+/// back as the deposed holder's replays by rid, after ops invoked later
+/// ("returned before ... but follows it in the log"). Two failures — the
+/// holder cut from S3 and its backup stopped — are beyond one backup's
+/// budget: the run records them (`Cluster::note_s3_cut`) and waives strict
+/// durability, so the acknowledged ops rolled back are tentative (they
+/// need not be in the log, nor in real-time order); every other check
+/// stays. Before, the cut holder counted as a live
+/// copy and these runs failed. The same pause of the holder itself or of
+/// the third node is no second failure: nothing is recorded. (Plan 43 C1
+/// deletes the TTL claim without the tail and this relaxation with it:
+/// then these seeds must pass strictly.)
+#[test]
+fn a_backup_paused_while_its_holder_is_cut_from_s3_is_beyond_the_budget() {
+    let configs = |label: &str| match label {
+        "backup-lag-at-expiry" => backup_lag_at_expiry_config(false),
+        "backup-lag-at-expiry-timers-first" => timers_first(backup_lag_at_expiry_config(false)),
+        "backup-lag-at-expiry-beats-lost" => backup_lag_at_expiry_config(true),
+        "backup-lag-at-expiry-beats-lost-timers-first" => {
+            timers_first(backup_lag_at_expiry_config(true))
+        }
+        "backup-lag-in-margin-cut" => backup_lag_in_margin_cut_config(),
+        other => panic!("unknown configuration {other}"),
+    };
+    // (configuration, seed, the pause, whether it is a second failure)
+    let cases: [(&str, u64, &str, bool); 9] = [
+        (
+            "backup-lag-at-expiry-beats-lost",
+            5,
+            "pause1@7363:2416",
+            true,
+        ),
+        ("backup-lag-at-expiry", 275, "pause1@6500:2000", true),
+        ("backup-lag-at-expiry", 277, "pause2@7000:3000", true),
+        (
+            "backup-lag-at-expiry-timers-first",
+            275,
+            "pause1@5500:3000",
+            true,
+        ),
+        (
+            "backup-lag-at-expiry-beats-lost-timers-first",
+            5,
+            "pause1@7000:2000",
+            true,
+        ),
+        ("backup-lag-in-margin-cut", 277, "pause2@7500:3000", true),
+        // The third node; the cut holder itself.
+        (
+            "backup-lag-at-expiry-beats-lost",
+            5,
+            "pause3@7363:2416",
+            false,
+        ),
+        ("backup-lag-at-expiry", 277, "pause3@7000:3000", false),
+        ("backup-lag-at-expiry", 277, "pause1@7000:3000", false),
+    ];
+    for (label, seed, pause, second) in cases {
+        let r = run_seed(seed, config_variant(configs(label), pause)).unwrap_or_else(|e| {
+            panic!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}+{pause}")
+        });
+        assert_eq!(
+            !r.durability_budget_exceeded.is_empty(),
+            second,
+            "{label} seed {seed} +{pause}: {:?}",
+            r.durability_budget_exceeded
+        );
+    }
+}
+
 /// 2026-10-16 `snapsched` under host load: the holder's runtime is held
 /// up across a renewal (2.3-2.6 s from 6.0 s; the lease here is 6 s, its
 /// margin 0.5 s and the renewal due 3 s before the expiry), so the expiry
@@ -4714,6 +4788,13 @@ fn sweep_config() {
             let result = run_seed(seed, config(&label));
             if fingerprint_on {
                 eprintln!("SWEEP-FP {label} seed {seed}: {}", fingerprint(&result));
+                // The runs whose strict durability the failure budget
+                // waived (`Cluster::note_takedown`).
+                if let Ok(r) = &result {
+                    if !r.durability_budget_exceeded.is_empty() {
+                        eprintln!("SWEEP-BUDGET {label} seed {seed}");
+                    }
+                }
             }
             match result {
                 Ok(report) if core_stall_check(&label, &report).is_err() => {
@@ -7649,6 +7730,24 @@ fn config_variant(cfg: SimConfig, variant: &str) -> SimConfig {
             rebuild_stub: true,
             ..cfg
         },
+        // `pause<node>@<at_ms>:<for_ms>`: one more scheduled `Pause`.
+        other if other.starts_with("pause") => {
+            let parse = || -> Option<ScheduledFault> {
+                let (node, rest) = other["pause".len()..].split_once('@')?;
+                let (at, for_ms) = rest.split_once(':')?;
+                Some(ScheduledFault {
+                    at_ms: at.parse().ok()?,
+                    kind: FaultKind::Pause {
+                        node: node.parse().ok()?,
+                        for_ms: for_ms.parse().ok()?,
+                    },
+                })
+            };
+            let fault = parse().unwrap_or_else(|| panic!("bad variant +{other}"));
+            let mut faults = cfg.faults.clone();
+            faults.push(fault);
+            SimConfig { faults, ..cfg }
+        }
         other => panic!("unknown configuration variant +{other}"),
     }
 }

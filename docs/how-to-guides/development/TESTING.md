@@ -3316,7 +3316,10 @@ ttl): `locks-delegated-production-ttl`, `-heavy` (nine ops on one file) and the
 same two at the root (`locks-production-ttl`, `-heavy`; the sim's 6 s lease caps
 the root's grants too). A `+` after any config's label applies variants:
 `+nomove` (no rename across subtrees: a delegation's move restamps its grants to
-a full lock ttl) and `+solo` (one lock client per node). `sweep_config` prints
+a full lock ttl), `+solo` (one lock client per node) and
+`+pause<node>@<at_ms>:<for_ms>` (one more scheduled `Pause` of that node, for
+replaying a seed with a freeze on top, e.g.
+`backup-lag-at-expiry-beats-lost+pause1@7363:2416`). `sweep_config` prints
 per config the distribution of each seed's longest wait and longest handoff gap
 (the idle time after the last conflicting section, `max_handoff_gap_ms`, none
 for a lock's first acquisition) with the overtakes, the asks and the seeds in
@@ -4653,7 +4656,9 @@ counts; `AUTHORITY_SIM_ORACLE_DEBUG=1` prints each I1 violation as judged.
 `AUTHORITY_SIM_FINGERPRINT=1` prints `SWEEP-FP` per seed, a hash of what the
 run did over the fields that predate the oracles: two trees give the same
 fingerprint seed by seed when the oracles' plumbing changed no schedule (the
-identity sweep).
+identity sweep). With it, `SWEEP-BUDGET` names each seed whose strict
+durability the one-backup failure budget waived (`Cluster::note_takedown`,
+`note_s3_cut`).
 
 **The sim's rebuild.** `Action::RebuildReplica` (a deposed holder's recovery
 when its journal rows were not captured, or a replica the log was pruned past)

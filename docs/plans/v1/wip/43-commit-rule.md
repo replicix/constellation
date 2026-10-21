@@ -1379,7 +1379,12 @@ claiming at expiry without a seal, go through a new job phase
 transient rollback of committed shadows and streamed entries at a seal
 takeover; the "a double fault: the tail is lost" TTL claim of a `Backup`
 lease (`lease.rs:345-356`'s comment and the sim's corresponding
-`budget_exceeded` relaxation for this case).
+`budget_exceeded` relaxation for this case). That relaxation also counts
+a copy cut from S3 as a failure (`Cluster::note_s3_cut`, added
+2026-10-21): `a_backup_paused_while_its_holder_is_cut_from_s3_is_beyond_the_budget`
+pins the lag-at-expiry seeds whose backup is paused while its holder is
+cut, and C1 turns them into strict passes (the third node waits for the
+group instead of claiming without the tail).
 
 **Fail-before tests.**
 - Sim, `strict_durability` now fails on `non_lone_rollbacks > 0` and
