@@ -951,8 +951,7 @@ Setting: `CONSTELLATION_FUSE_DIR_ATTR_TTL` = `auto`, `zero`, `entry`
 (`entry`: the entry TTL, as before this plan — 2a stays open, 2b stays
 closed by W3b). Under `--cto strict` (TTL 0 already, except a lone
 sequencer's `lone_kernel_ttl`, F8) `auto` is `zero` in either option below.
-What `auto` means in bounded mode is **Q1, open — pending the quiet-host
-measurement of §8.1**:
+What `auto` means in bounded mode was Q1 (decided below: option B):
 
 - **Option A — `zero`** (2a closed in bounded mode, until the table or the
   probe finds `AttrsValidAfterStore`): pays the cost above on every
@@ -970,6 +969,21 @@ measurement of §8.1**:
 
 K5 implements both values and the switch; the default in bounded mode is
 written in only when Q1 is decided (before K5 lands).
+
+**Q1 decided 2026-10-21 (maintainer): option B**, together with the
+review's finding F21 (W3b's notice had been turned off in bounded mode,
+because it invalidated the whole attribute mask and cost one `GETATTR` per
+namespace operation, which left 2b open as well): W3b stays on in bounded
+mode with F21's narrowed trigger (only the attributes the change moved, only
+where it closes 2b), its cost measured before K5 lands. 2a remains open in
+bounded mode as the documented transient one-`stat` exposure; strict mode
+closes both. The measurement (§8.1, run without the quiet-host gate,
+strict `entry`/`zero` ABBA interleave, 8 samples per mode, real ext4, xfs
+and btrfs partitions and tmpfs on the build box under co-tenant load):
+warm `git status` under `zero` is 6.2× (ext4), 5.7× (xfs), 2.6× (btrfs)
+and 7.9× (tmpfs) of `entry`, warm `make -q` 3.2×, 2.8×, 4.2× and 3.0×;
+requests 7k → 293k and 10k → 85k. The margin over the +20 % rule is 2–8×
+in every block.
 
 ### 5.4 Settings and kernels with the fixes
 
