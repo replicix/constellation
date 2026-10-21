@@ -21,9 +21,11 @@
 //!   ttl − node_margin`, measured from when it *sent* the request.
 //! - **Renew.** A node holding a grant renews it (`Renew` → `RenewAck`,
 //!   the same `sent`-based measurement) while it still honours it; a
-//!   lapsed grant is lost, never renewed late. An owner that does not
-//!   know the grant answers `Lost`, except during its *grace* (below),
-//!   when it installs it: that is a reclaim. The acknowledgement carries
+//!   lapsed grant is lost, never reclaimed in a grace (the checker found
+//!   that one: a lapsed grant is asked for back *late*, below, or lost).
+//!   An owner that does not know the grant answers `Lost`, except during
+//!   its *grace* (below), when it installs a renewal of a grant still
+//!   honoured: that is a reclaim. The acknowledgement carries
 //!   the grant's recalled flag, so a lost recall is repaired by the next
 //!   renewal.
 //! - **Cached re-locks.** A node keeps its grant after its application
@@ -154,6 +156,58 @@
 //! code's beat carries the holder's wait-clock readings with its clock id
 //! (`Beat::guard_ms` and the other values are of one holder clock).
 //!
+//! # Plan 43 C7-F F-c: a lapsed grant asked for back (`late_reclaim`)
+//!
+//! A holder whose grant lapsed (it could not renew across an owner's
+//! failover: the old root cannot renew without fresh S3 liveness, the
+//! successor exists only at the old lease's end) used to lose it and fence
+//! its application's I/O (`EIO`). The code now *parks* that I/O and asks
+//! for the same grant back with a **late** renewal (`LateRenew`, at most
+//! `max_late` times; `Io` is not enabled while the grant is not honoured,
+//! which is the park). The checker's earlier counterexample stands: an
+//! owner that does not know the grant must not install it as a reclaim,
+//! because the old owner may have outwaited it and granted another node,
+//! and the successor knew neither. What the owner needs is *continuity*: no
+//! grant conflicting with the lapsed one was issued anywhere since it was
+//! issued. It proves it from records it keeps:
+//!
+//! - `Grant::settled`: continuity, as long as the record (or its memory)
+//!   stays in this table. A mint is settled (it is made only where no
+//!   grace or floor holds the inode, so every earlier grant was issued
+//!   before it); a reclaim in a grace, a reinstated copy and a non-final
+//!   mirror's record are not; a move keeps what it was (the sender gave
+//!   the grant up as it sent it); a re-sent copy installed by a delegate is
+//!   not.
+//! - `lapsed`: the owner's memory of the settled records it dropped by an
+//!   outwait (not a release), **superseded** by every change that could
+//!   let another node act on the inode: a conflicting grant (or any
+//!   record of the same node: it was granted afresh), a move, a deposition.
+//!   (`late_lapsed_unsuperseded` is the naive variant: violation.)
+//! - the old root's **final mirror** (`FinalMirror`, `final_for`): when it
+//!   can no longer add a record under its lease (the lease not usable) it
+//!   sends its backup its whole table, expired records and memory included,
+//!   names the lease body (`Key`), and adds nothing under that lease from
+//!   then on (`final_sent`, enforced in `owner_until`). A fast successor
+//!   whose takeover replaced exactly that lease body (`Mirrored::final_for`
+//!   equal to the replaced `Reg`) knows the table is all the old root ever
+//!   granted under it and keeps `settled`; any other mirror (older: a later
+//!   one may have been lost; a renewed lease: another key) is installed
+//!   unsettled and its memory dropped (`late_admit_nonfinal` is the naive
+//!   variant: violation, `trusting_a_non_final_mirror_violates`).
+//!
+//! A late renewal is then answered by looking the grant up *before* anything
+//! drops the expired records: a settled record of that id (live, or expired
+//! and not dropped) is extended; else its memory is reinstated; else `Lost`
+//! — never the grace's reclaim, grace or no grace
+//! (`late_admit_unknown`: violation, the recorded counterexample). The
+//! holder resumes under the usual rule, `sent + ttl − node_margin` of the
+//! late renewal, and the owner's record covers `now + ttl + seq_margin`.
+//! Checked clean with the new action added to the existing configurations
+//! (`late-lone`, `late-failover`, a lost mirror, a TTL takeover,
+//! delegation moves), with the saw-bits `late_admitted`, `late_from_lapsed`,
+//! `final_sent`, `final_installed`, `late_io` and `late_at_successor`
+//! witnessed (non-vacuous).
+//!
 //! # The property
 //!
 //! `mutual_exclusion` (always): a node never performs I/O under a grant
@@ -199,6 +253,10 @@
 //! | `Handoff` delivered / dropped | `lock_install_moved` (`deleg_mine_until`, `moved_seen`, `install_if_consistent`) |
 //! | reinstated copies | `lock_on_generation_ended` from `end_generation` (`core/delegate.rs`) |
 //! | `Mirror` | `BackupAppend { locks }` (a snapshot rides the next append) |
+//! | `LateRenew` | `LockTables::lapse_tick` → `Timer::LockRenewTick` → `LockRenewEntry { late: true }`; the owner: `Core::lock_renew_one` → `LockTables::admit_late` |
+//! | `lapsed` memory, `supersede` | `Inner::lapsed`, `Inner::supersede` (every path that adds or strengthens a record, takes an inode out of the table or clears it) |
+//! | `FinalMirror`, `final_for` | `Core::lock_final_step` (`Timer::LockFinal`), `PeerMsg::LockMirror { final_for }`; the successor: `Core::lock_install_mirror` against `LockState::takeover_prev` |
+//! | `Io` not enabled while lapsed | the lapsing grant's fences answer `Fence::Parked`; `View::park_op` |
 //! | `carry_of` (`carry` on `Handoff`/`DelegRecalled`) | `lock_take_handoff` and `lock_hand_back` measure what is left of every grant (`DelegRenewed::lock_carry`, `LockHandback::carry`): `MoveStamp::CarryAll`; `MoveStamp::Restamp` is the rule before |
 //! | `stamp_moved` | `lock_install_moved` (`carried_until`; `install_keeping_later` at the root); `restamp` for every other grant |
 //! | `Grant::proven` | not read by the code: it carries every grant (`CarryAll`; `CarryUnproven` is the narrower rule the sim measured, see PROGRESS) |
@@ -400,6 +458,26 @@ pub struct LockModel {
     /// ticks before the end `X` the cap counts to are used. `None`: no
     /// filter.
     pub beat_span: Option<i16>,
+    // ---- plan 43 C7-F F-c ----
+    /// A holder whose grant lapsed asks for it back (`LateRenew`, at most
+    /// `max_late` times) and the owner admits it where it can prove
+    /// nothing conflicting was granted since: a `settled` record in its
+    /// table, or a memory of one (`lapsed`), superseded by every
+    /// conflicting grant; the old root's last snapshot (`FinalMirror`)
+    /// makes its table the successor's. See "Plan 43 C7-F F-c" above.
+    pub late_reclaim: bool,
+    pub max_late: u8,
+    /// Naive (a): a late renewal of a grant the owner does not know is
+    /// answered by the grace's reclaim. Must violate (the counterexample
+    /// recorded before F-c).
+    pub late_admit_unknown: bool,
+    /// Naive (b): a successor trusts a mirror that is not the old root's
+    /// final one (its records' `settled` and its lapsed memory as sent).
+    /// Must violate.
+    pub late_admit_nonfinal: bool,
+    /// Naive (c): the lapsed memory is not superseded by a conflicting
+    /// grant. Must violate.
+    pub late_lapsed_unsuperseded: bool,
 }
 
 impl LockModel {
@@ -459,6 +537,11 @@ impl LockModel {
             step_node: None,
             step_dir: 0,
             beat_span: None,
+            late_reclaim: false,
+            max_late: 1,
+            late_admit_unknown: false,
+            late_admit_nonfinal: false,
+            late_lapsed_unsuperseded: false,
         }
     }
 
@@ -523,6 +606,12 @@ pub struct Grant {
     /// Its record was carried, not restamped, at a move (ghost; marked
     /// only under a carrying `move_stamp`).
     pub carried: bool,
+    /// Plan 43 C7-F F-c (`late_reclaim`; else always `false`): no grant
+    /// conflicting with it was issued anywhere since it was issued, as
+    /// long as it (or its lapsed memory) stays in this table. A mint is
+    /// settled; a reclaim in a grace, a reinstated copy and a non-final
+    /// mirror's record are not; a move keeps what it was.
+    pub settled: bool,
 }
 
 /// Owner side: a blocking request waiting for recalls.
@@ -547,6 +636,8 @@ pub struct Cache {
     pub renew_at: i16,
     pub id: u8,
     pub recalled: bool,
+    /// Resumed by a late renewal after its window ended (ghost).
+    pub late: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -608,13 +699,41 @@ pub struct Node {
     /// Delegate side: the moved ids it installed (each once).
     pub moved_seen: Vec<u8>,
     /// Backup side: the mirrored table and its version.
-    pub mirror: (u8, Vec<Grant>),
+    pub mirror: Mirrored,
     /// Root side: the mirror version counter.
     pub mirror_ver: u8,
     /// Backup side (`beat_cap`): what it heard of one root's beats
     /// `(holder, epoch, lag, named, guard)`: the smallest arrival minus
     /// send, the highest expiry and guard named (0: none).
     pub heard: Option<(u8, u8, i16, i16, i16)>,
+    // ---- plan 43 C7-F F-c ----
+    /// Owner side: settled records that expired here and that nothing
+    /// conflicting has superseded since (the memory of a lapsed grant).
+    pub lapsed: Vec<Grant>,
+    /// Old root side: the lease `(holder, epoch, expires)` whose final
+    /// mirror was sent; while it is the lease held, nothing is added.
+    pub final_for: Option<Key>,
+    /// Holder side: late renewals sent.
+    pub late: u8,
+    /// Owner side: the table came from a final mirror (ghost).
+    pub from_final: bool,
+}
+
+/// A lease body's identity as the code compares it: `(holder, epoch,
+/// expires_w)` — the lease's end on the holder's wait clock (`Reg::expires_w`,
+/// the third of `Node::lease`) — stands for `(holder_clock, holder_wait_ms,
+/// epoch)`.
+pub type Key = (u8, u8, i16);
+
+/// What a backup holds of the root's table.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Mirrored {
+    pub ver: u8,
+    pub table: Vec<Grant>,
+    /// The old root's lapsed memory and expired records (final only).
+    pub lapsed: Vec<Grant>,
+    /// The lease whose last snapshot this is, if it is.
+    pub final_for: Option<Key>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -649,6 +768,8 @@ pub enum Msg {
         id: u8,
         mode: Mode,
         sent: i16,
+        /// Plan 43 C7-F F-c: sent for a grant whose window ended.
+        late: bool,
     },
     RenewAck {
         to: u8,
@@ -663,6 +784,8 @@ pub enum Msg {
         to: u8,
         ver: u8,
         table: Vec<Grant>,
+        lapsed: Vec<Grant>,
+        final_for: Option<Key>,
     },
     /// Root → delegate: a granting renewal reply of generation `gen`,
     /// carrying the moved table (`first`: the first one of the
@@ -727,6 +850,20 @@ pub const SAW_CARRIED_RECALLING: u32 = 1 << 19;
 pub const SAW_CARRIED_OUTWAITED: u32 = 1 << 20;
 /// Carried over two moves (the sim's seed 15: delegate → root → delegate).
 pub const SAW_CARRIED_TWICE: u32 = 1 << 21;
+/// A late renewal admitted.
+pub const SAW_LATE_ADMITTED: u32 = 1 << 22;
+/// ... from the lapsed memory (the record had been dropped).
+pub const SAW_LATE_FROM_LAPSED: u32 = 1 << 23;
+/// An old root's final mirror sent.
+pub const SAW_FINAL_SENT: u32 = 1 << 24;
+/// A successor installed a final mirror.
+pub const SAW_FINAL_INSTALLED: u32 = 1 << 25;
+/// I/O performed under a grant resumed by a late renewal.
+pub const SAW_LATE_IO: u32 = 1 << 26;
+/// A late renewal admitted by a successor from a final mirror.
+pub const SAW_LATE_AT_SUCCESSOR: u32 = 1 << 27;
+/// A late renewal refused (`Lost`).
+pub const SAW_LATE_REFUSED: u32 = 1 << 28;
 
 /// A beat the backup heard: `(holder, epoch, sent, lag)`.
 pub type BeatLag = (u8, u8, i16, i16);
@@ -809,7 +946,7 @@ impl State {
     fn owner_until_for(&self, cfg: &LockModel, i: usize, renewal: bool) -> Option<i16> {
         match self.owner {
             Owner::Root => {
-                if !self.believes_root(cfg, i) {
+                if !self.believes_root(cfg, i) || self.final_sent(cfg, i) {
                     return None;
                 }
                 if cfg.backup != NONE
@@ -882,8 +1019,26 @@ impl State {
         (self.honour(cfg, i) < c.until).then_some(c)
     }
 
+    /// The identity of the lease node `i` holds, as `final_for` names it.
+    fn lease_key(&self, i: usize) -> Option<Key> {
+        self.nodes[i].lease.map(|(e, _, w)| (i as u8, e, w))
+    }
+
+    /// Plan 43 C7-F F-c: node `i` sent its final mirror for the lease it
+    /// still holds: it adds nothing under it (enforced, not derived).
+    fn final_sent(&self, cfg: &LockModel, i: usize) -> bool {
+        cfg.late_reclaim
+            && self.nodes[i].final_for.is_some()
+            && self.nodes[i].final_for == self.lease_key(i)
+    }
+
     fn mirror_push(&mut self, cfg: &LockModel, h: usize) {
         if cfg.backup == NONE || !cfg.replicate || cfg.backup as usize == h {
+            return;
+        }
+        // After the final one the backup holds the last word: a later
+        // (removal-only) push would replace it by a non-final snapshot.
+        if self.final_sent(cfg, h) {
             return;
         }
         self.nodes[h].mirror_ver = self.nodes[h].mirror_ver.wrapping_add(1);
@@ -893,7 +1048,43 @@ impl State {
             to: cfg.backup,
             ver,
             table,
+            lapsed: Vec::new(),
+            final_for: None,
         });
+    }
+
+    /// Owner `h` forgets its expired records, the settled ones into the
+    /// lapsed memory (`LockTables::drop_expired`).
+    fn drop_expired(&mut self, cfg: &LockModel, h: usize) {
+        let now = self.wait(cfg, h);
+        let table = std::mem::take(&mut self.nodes[h].table);
+        let (live, dead): (Vec<Grant>, Vec<Grant>) = table.into_iter().partition(|g| g.until > now);
+        self.nodes[h].table = live;
+        if cfg.late_reclaim {
+            for g in dead {
+                if g.settled {
+                    self.remember(h, g);
+                }
+            }
+        }
+    }
+
+    fn remember(&mut self, h: usize, g: Grant) {
+        self.nodes[h].lapsed.retain(|e| e.id != g.id);
+        self.nodes[h].lapsed.push(g);
+        self.nodes[h].lapsed.sort();
+    }
+
+    /// A record of `node` in `mode` enters `h`'s table (any way): the
+    /// lapsed memories it could let another node act against, and any of
+    /// the same node, are superseded (`LockTables::supersede`).
+    fn supersede(&mut self, cfg: &LockModel, h: usize, node: u8, mode: Mode) {
+        if !cfg.late_reclaim || cfg.late_lapsed_unsuperseded {
+            return;
+        }
+        self.nodes[h]
+            .lapsed
+            .retain(|e| e.node != node && !e.mode.conflicts(mode));
     }
 
     /// Issue a grant at owner `h` to `node`, live from `base` (the
@@ -920,8 +1111,12 @@ impl State {
             recalled: false,
             proven: false,
             carried: false,
+            // A mint: every predecessor grant was issued before it (no
+            // grace or floor holds the inode here).
+            settled: cfg.late_reclaim,
         });
         self.nodes[h].table.sort();
+        self.supersede(cfg, h, node, mode);
         self.issued.push((id, node, mode));
         self.mirror_push(cfg, h);
         id
@@ -949,7 +1144,7 @@ impl State {
         base: i16,
     ) -> bool {
         let now = self.wait(cfg, h);
-        self.nodes[h].table.retain(|g| g.until > now);
+        self.drop_expired(cfg, h);
         if self.nodes[h].floor.is_some_and(|f| now < f) {
             return false;
         }
@@ -1048,6 +1243,7 @@ impl State {
     /// The owner `h` stops being one: its table and parks are gone.
     fn depose_owner(&mut self, h: usize) {
         self.nodes[h].table.clear();
+        self.nodes[h].lapsed.clear();
         self.nodes[h].parks.clear();
         self.nodes[h].floor = None;
     }
@@ -1084,7 +1280,11 @@ impl State {
                     g.node == h.node || (cfg.copies_check_conflicts && g.mode.conflicts(h.mode))
                 })
             {
-                self.nodes[r].table.push(h);
+                self.supersede(cfg, r, h.node, h.mode);
+                self.nodes[r].table.push(Grant {
+                    settled: false,
+                    ..h
+                });
                 self.saw |= SAW_REINSTATED;
             }
         }
@@ -1224,6 +1424,11 @@ pub enum Action {
     Beat(u8),
     /// `delayed_io`: node `i`'s admitted write lands at the owner.
     Land(u8),
+    /// Plan 43 C7-F F-c: node `i` asks for its lapsed grant back.
+    LateRenew(u8),
+    /// Plan 43 C7-F F-c: the old root `h` sends its final mirror (its
+    /// lease is no longer usable: it adds nothing under it from here).
+    FinalMirror(u8),
 }
 
 impl Model for LockModel {
@@ -1279,9 +1484,13 @@ impl LockModel {
                 handed: Vec::new(),
                 handoff_sent: false,
                 moved_seen: Vec::new(),
-                mirror: (0, Vec::new()),
+                mirror: Mirrored::default(),
                 mirror_ver: 0,
                 heard: None,
+                lapsed: Vec::new(),
+                final_for: None,
+                late: 0,
+                from_final: false,
             })
             .collect();
         let h = self.initial_holder as usize;
@@ -1348,7 +1557,10 @@ impl LockModel {
             }
         }
         let anyone_wants = (0..n).any(|i| {
-            matches!(s.nodes[i].op, NodeOp::Locking { .. })
+            // Plan 43 C7-F F-c: an application holding a lock is waiting
+            // for its grant to be re-established: a takeover matters.
+            (self.late_reclaim && s.nodes[i].held.is_some())
+                || matches!(s.nodes[i].op, NodeOp::Locking { .. })
                 || (s.nodes[i].op == NodeOp::Idle
                     && matches!(
                         self.scripts[i].get(s.nodes[i].pc as usize),
@@ -1408,6 +1620,18 @@ impl LockModel {
                     }
                 }
             }
+            if self.late_reclaim
+                && self.replicate
+                && self.backup != NONE
+                && self.backup != iu
+                && node.lease.is_some()
+                && !s.believes_root(self, i)
+                && !s.final_sent(self, i)
+                && s.reg.holder == iu
+                && s.lease_key(i) == Some((s.reg.holder, s.reg.epoch, s.reg.expires_w))
+            {
+                actions.push(Action::FinalMirror(iu));
+            }
             let ttl_claimable = self.ttl_takeover && now_wall >= s.reg.expires;
             let fast = self.backup == iu && s.reg.holder != iu;
             let released = self.released_takeover && s.reg.released;
@@ -1457,6 +1681,22 @@ impl LockModel {
                 });
                 if !in_flight && renew_ready {
                     actions.push(Action::Renew(iu));
+                }
+            }
+            // Plan 43 C7-F F-c: a lapsed grant is asked for back, once the
+            // owner can be reached (the application's I/O waits meanwhile:
+            // `Io` is not enabled while the grant is not honoured).
+            if self.late_reclaim
+                && node.late < self.max_late
+                && node.cache.is_some_and(|c| now_h >= c.until)
+                && renew_ready
+            {
+                let in_flight = s.net.iter().any(|m| {
+                    matches!(m, Msg::Renew { from, .. } if *from == iu)
+                        || matches!(m, Msg::RenewAck { to, .. } if *to == iu)
+                });
+                if !in_flight {
+                    actions.push(Action::LateRenew(iu));
                 }
             }
             match node.op {
@@ -1555,6 +1795,8 @@ impl LockModel {
                 s.nodes[i].lease = Some((epoch, now_h + self.lease_ttl, now + self.lease_ttl));
                 s.nodes[i].last_probe = now_h;
                 s.nodes[i].parks.clear();
+                s.nodes[i].lapsed.clear();
+                s.nodes[i].from_final = false;
                 s.nodes[i].floor = None;
                 // The delegation, if any, is inherited as is (M11): the
                 // delegate keeps owning `X` under the new root.
@@ -1575,9 +1817,27 @@ impl LockModel {
                     }
                 } else if fast {
                     s.saw |= SAW_FAST_TAKEOVER;
-                    let mirrored = std::mem::take(&mut s.nodes[i].mirror).1;
+                    let m = std::mem::take(&mut s.nodes[i].mirror);
+                    let mirrored = m.table;
                     if !mirrored.is_empty() {
                         s.saw |= SAW_MIRROR_USED;
+                    }
+                    // Plan 43 C7-F F-c: the old root's *final* mirror (the
+                    // table as of the end of its authority under the lease
+                    // this takeover replaced) is the whole of what it
+                    // granted: its records keep what they were (settled or
+                    // not) and its lapsed memory comes along. Any other
+                    // mirror may have missed a later grant: unsettled, no
+                    // memory.
+                    let is_final = self.late_reclaim
+                        && m.final_for == Some((prev.holder, prev.epoch, prev.expires_w));
+                    let trusted = is_final || (self.late_reclaim && self.late_admit_nonfinal);
+                    if is_final {
+                        s.saw |= SAW_FINAL_INSTALLED;
+                    }
+                    s.nodes[i].from_final = is_final;
+                    if trusted {
+                        s.nodes[i].lapsed = m.lapsed;
                     }
                     // Restamped, whatever the move stamp: the mirror is
                     // not frozen (the old root renewed after the
@@ -1588,9 +1848,16 @@ impl LockModel {
                         .map(|g| Grant {
                             until: restamp,
                             carried: false,
+                            settled: g.settled && trusted,
                             ..g
                         })
                         .collect();
+                    // The lapsed memory a mirrored live record supersedes.
+                    let held: Vec<(u8, Mode)> =
+                        s.nodes[i].table.iter().map(|g| (g.node, g.mode)).collect();
+                    for (n, md) in held {
+                        s.supersede(self, i, n, md);
+                    }
                     if self.grace {
                         let bound =
                             now + self.takeover_window + self.lock_ttl + 2 * self.seq_margin;
@@ -1703,6 +1970,9 @@ impl LockModel {
                         let held = s.nodes[i].held?;
                         let c = s.nodes[i].cache;
                         let mine = c.map(|c| c.id).unwrap_or(0);
+                        if c.is_some_and(|c| c.late) {
+                            s.saw |= SAW_LATE_IO;
+                        }
                         if let Some((later, _, _)) = s.issued.iter().find(|(id, node, m)| {
                             *id > mine && *node != i as u8 && m.conflicts(held)
                         }) {
@@ -1764,6 +2034,49 @@ impl LockModel {
                     id: c.id,
                     mode: c.mode,
                     sent,
+                    late: false,
+                });
+            }
+            Action::LateRenew(i) => {
+                let i = i as usize;
+                let c = s.nodes[i].cache?;
+                let to = s.renew_target(self, i);
+                s.nodes[i].late += 1;
+                let sent = s.honour(self, i);
+                s.send(Msg::Renew {
+                    from: i as u8,
+                    to,
+                    id: c.id,
+                    mode: c.mode,
+                    sent,
+                    late: true,
+                });
+            }
+            Action::FinalMirror(h) => {
+                let h = h as usize;
+                let key = s.lease_key(h)?;
+                let now = s.wait(self, h);
+                s.nodes[h].final_for = Some(key);
+                s.nodes[h].mirror_ver = s.nodes[h].mirror_ver.wrapping_add(1);
+                let ver = s.nodes[h].mirror_ver;
+                let mut table = Vec::new();
+                let mut lapsed = s.nodes[h].lapsed.clone();
+                for g in s.nodes[h].table.iter() {
+                    if g.until > now {
+                        table.push(*g);
+                    } else {
+                        lapsed.push(*g);
+                    }
+                }
+                lapsed.sort();
+                lapsed.dedup();
+                s.saw |= SAW_FINAL_SENT;
+                s.send(Msg::Mirror {
+                    to: self.backup,
+                    ver,
+                    table,
+                    lapsed,
+                    final_for: Some(key),
                 });
             }
             Action::FloorPassed(h) => {
@@ -1787,6 +2100,9 @@ impl LockModel {
                     if g.carried {
                         s.saw |= SAW_CARRIED_OUTWAITED;
                     }
+                    if self.late_reclaim && g.settled {
+                        s.remember(h, g);
+                    }
                     s.grant_done(self, h, g.id);
                 }
             }
@@ -1796,6 +2112,7 @@ impl LockModel {
                 s.moves += 1;
                 s.saw |= SAW_MOVE;
                 let table = std::mem::take(&mut s.nodes[r].table);
+                s.nodes[r].lapsed.clear();
                 s.nodes[r].parks.clear();
                 s.nodes[r].dgen = Some(s.wait(self, r) + self.deleg_ttl + self.seq_margin);
                 s.owner = Owner::Delegate(d as u8);
@@ -1862,9 +2179,11 @@ impl LockModel {
                 s.nodes[d as usize].dtenure = None;
                 s.nodes[d as usize].dmine = None;
                 s.nodes[d as usize].table.clear();
+                s.nodes[d as usize].lapsed.clear();
                 s.nodes[d as usize].parks.clear();
                 s.owner = Owner::Root;
                 s.nodes[r].table.clear();
+                s.nodes[r].lapsed.clear();
                 s.reinstate_handed(self, r, &[]);
                 // The delegate's own grants were capped by its tenure,
                 // but the grants *moved* to it at the delegation carry
@@ -1990,6 +2309,21 @@ impl LockModel {
             Property::sometimes("carried_twice", |_, s: &State| {
                 s.saw & SAW_CARRIED_TWICE != 0
             }),
+            Property::sometimes("late_admitted", |_, s: &State| {
+                s.saw & SAW_LATE_ADMITTED != 0
+            }),
+            Property::sometimes("late_from_lapsed", |_, s: &State| {
+                s.saw & SAW_LATE_FROM_LAPSED != 0
+            }),
+            Property::sometimes("final_sent", |_, s: &State| s.saw & SAW_FINAL_SENT != 0),
+            Property::sometimes("final_installed", |_, s: &State| {
+                s.saw & SAW_FINAL_INSTALLED != 0
+            }),
+            Property::sometimes("late_io", |_, s: &State| s.saw & SAW_LATE_IO != 0),
+            Property::sometimes("late_at_successor", |_, s: &State| {
+                s.saw & SAW_LATE_AT_SUCCESSOR != 0
+            }),
+            Property::sometimes("late_refused", |_, s: &State| s.saw & SAW_LATE_REFUSED != 0),
         ]
     }
 }
@@ -2066,6 +2400,7 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
                 renew_at: sent + ttl / 2,
                 id,
                 recalled,
+                late: false,
             });
             s.nodes[i].held = Some(mode);
             s.nodes[i].cached = owner;
@@ -2102,6 +2437,8 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
         }
         Msg::Released { to, id, .. } => {
             let h = to as usize;
+            // A release forgets the grant for good, its lapsed memory too.
+            s.nodes[h].lapsed.retain(|g| g.id != id);
             if s.nodes[h].table.iter().any(|g| g.id == id) {
                 s.saw |= SAW_RECALL_RELEASED;
                 s.grant_done(cfg, h, id);
@@ -2113,6 +2450,7 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
             id,
             mode,
             sent,
+            late,
         } => {
             let h = to as usize;
             let answering = if cfg.cached_owner { to } else { NONE };
@@ -2127,8 +2465,84 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
                 return;
             };
             let now = s.wait(cfg, h);
-            s.nodes[h].table.retain(|g| g.until > now);
             let ttl = s.ttl_at(cfg, h, until);
+            if late && cfg.late_reclaim {
+                // Plan 43 C7-F F-c. Looked up before anything drops the
+                // expired records: a settled record of that id (live, or
+                // expired and not dropped yet) is extended; else its
+                // lapsed memory is reinstated; anything else is refused
+                // (never the grace's reclaim: an unknown or unsettled
+                // grant may have been outwaited and granted over).
+                if ttl <= 0 {
+                    return;
+                }
+                let present = s.nodes[h]
+                    .table
+                    .iter()
+                    .position(|g| g.id == id && g.node == from && g.mode.covers(mode) && g.settled);
+                let remembered = s.nodes[h]
+                    .lapsed
+                    .iter()
+                    .position(|g| g.id == id && g.node == from && g.mode.covers(mode) && g.settled);
+                let waiting = s.nodes[h].parks.iter().any(|p| p.mode.conflicts(mode));
+                let outcome = if let Some(k) = present {
+                    let g = &mut s.nodes[h].table[k];
+                    g.until = g.until.max(now + ttl + cfg.seq_margin);
+                    g.proven |= cfg.marks();
+                    s.saw |= SAW_LATE_ADMITTED;
+                    RenewOutcome::Ok(ttl, s.nodes[h].table[k].recalled)
+                } else if let Some(k) = remembered {
+                    let mut g = s.nodes[h].lapsed.remove(k);
+                    g.until = now + ttl + cfg.seq_margin;
+                    g.recalled = waiting;
+                    g.proven |= cfg.marks();
+                    s.nodes[h].table.push(g);
+                    s.nodes[h].table.sort();
+                    s.mirror_push(cfg, h);
+                    s.saw |= SAW_LATE_ADMITTED | SAW_LATE_FROM_LAPSED;
+                    RenewOutcome::Ok(ttl, waiting)
+                } else if cfg.late_admit_unknown
+                    && !s.nodes[h].table.iter().any(|g| g.id == id)
+                    && s.nodes[h].floor.is_some_and(|f| now < f)
+                    && !s.nodes[h]
+                        .table
+                        .iter()
+                        .any(|g| g.until > now && g.node != from && g.mode.conflicts(mode))
+                {
+                    // The naive late reclaim: the grace's reclaim branch.
+                    s.nodes[h].table.retain(|g| g.node != from);
+                    s.nodes[h].table.push(Grant {
+                        node: from,
+                        mode,
+                        until: now + ttl + cfg.seq_margin,
+                        id,
+                        recalled: false,
+                        proven: cfg.marks(),
+                        carried: false,
+                        settled: false,
+                    });
+                    s.nodes[h].table.sort();
+                    s.mirror_push(cfg, h);
+                    s.saw |= SAW_LATE_ADMITTED | SAW_RECLAIM;
+                    RenewOutcome::Ok(ttl, false)
+                } else {
+                    s.saw |= SAW_LATE_REFUSED;
+                    RenewOutcome::Lost
+                };
+                if matches!(outcome, RenewOutcome::Ok(..)) && s.nodes[h].from_final {
+                    s.saw |= SAW_LATE_AT_SUCCESSOR;
+                }
+                s.drop_expired(cfg, h);
+                s.send(Msg::RenewAck {
+                    to: from,
+                    from: answering,
+                    id,
+                    sent,
+                    outcome,
+                });
+                return;
+            }
+            s.drop_expired(cfg, h);
             let known = s.nodes[h]
                 .table
                 .iter()
@@ -2150,8 +2564,10 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
                     .any(|g| g.node != from && g.mode.conflicts(mode))
                 && ttl > 0
             {
-                // A reclaim during the grace period.
+                // A reclaim during the grace period (not settled: nothing
+                // proves what was granted between the old grant and now).
                 s.nodes[h].table.retain(|g| g.node != from);
+                s.supersede(cfg, h, from, mode);
                 s.nodes[h].table.push(Grant {
                     node: from,
                     mode,
@@ -2160,6 +2576,7 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
                     recalled: false,
                     proven: cfg.marks(),
                     carried: false,
+                    settled: false,
                 });
                 s.nodes[h].table.sort();
                 s.mirror_push(cfg, h);
@@ -2197,10 +2614,12 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
             match outcome {
                 RenewOutcome::Ok(ttl, recalled) => {
                     s.nodes[i].cached = owner;
+                    let lapsed = cfg.late_reclaim && s.honour(cfg, i) >= c.until;
                     s.nodes[i].cache = Some(Cache {
                         until: c.until.max(sent + ttl - cfg.node_margin),
                         renew_at: c.renew_at.max(sent + ttl / 2),
                         recalled: c.recalled || recalled,
+                        late: c.late || lapsed,
                         ..c
                     });
                     if recalled && s.nodes[i].held.is_none() {
@@ -2218,10 +2637,21 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
                 }
             }
         }
-        Msg::Mirror { to, ver, table } => {
+        Msg::Mirror {
+            to,
+            ver,
+            table,
+            lapsed,
+            final_for,
+        } => {
             let b = to as usize;
-            if ver > s.nodes[b].mirror.0 {
-                s.nodes[b].mirror = (ver, table);
+            if ver > s.nodes[b].mirror.ver {
+                s.nodes[b].mirror = Mirrored {
+                    ver,
+                    table,
+                    lapsed,
+                    final_for,
+                };
             }
         }
         Msg::Handoff {
@@ -2259,6 +2689,13 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
                 }) {
                     continue;
                 }
+                // A re-sent copy is installed unsettled (it may be older than
+                // what the delegate saw); the first handoff is the move.
+                let g = Grant {
+                    settled: g.settled && first,
+                    ..g
+                };
+                s.supersede(cfg, d, g.node, g.mode);
                 s.nodes[d].table.push(g);
                 s.nodes[d].table.sort();
                 s.saw |= saw;
@@ -2275,6 +2712,7 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
             s.nodes[d].dtenure = None;
             s.nodes[d].parks.clear();
             let table = std::mem::take(&mut s.nodes[d].table);
+            s.nodes[d].lapsed.clear();
             let table = if cfg.move_state { table } else { Vec::new() };
             let carry = s.carry_of(cfg, d, &table);
             s.send(Msg::DelegRecalled {

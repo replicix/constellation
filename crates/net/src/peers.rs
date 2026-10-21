@@ -1956,8 +1956,9 @@ async fn handle_stream<S: PeerService>(
                 ver,
                 grants,
                 floor,
+                final_for,
             } => {
-                service.lock_mirror(from, ver, grants, floor);
+                service.lock_mirror(from, ver, grants, floor, final_for);
                 Some(Payload::Ok { req_id: 0 })
             }
             Payload::PingS3 { .. } => Some(Payload::Pong {

@@ -79,6 +79,9 @@ pub struct Bus {
     /// Every off-core heartbeat beat is lost (`SimConfig::beats_lost`: the
     /// liveness lane broken while the data lane works).
     beats_lost: std::sync::atomic::AtomicBool,
+    /// Plan 43 C7-F F-c (`SimConfig::lock_mirror_drop`): the probability
+    /// that a `LockMirror` is lost, whatever the link.
+    mirror_drop: Mutex<(f64, Option<tokio::time::Instant>)>,
 }
 
 /// M7: the stream faults (probabilities per frame).
@@ -114,7 +117,28 @@ impl Bus {
             stream_faults_injected: Mutex::new(0),
             rtts: Mutex::new(HashMap::new()),
             beats_lost: std::sync::atomic::AtomicBool::new(false),
+            mirror_drop: Mutex::new((0.0, None)),
         })
+    }
+
+    /// Lock mirrors are lost with probability `p` from `from_ms` after now
+    /// on.
+    pub fn set_mirror_drop(&self, p: f64, from_ms: u64) {
+        *self.mirror_drop.lock().unwrap() = (
+            p,
+            Some(tokio::time::Instant::now() + Duration::from_millis(from_ms)),
+        );
+    }
+
+    /// Whether the scripted loss takes this message (a `LockMirror`; a
+    /// draw only when the loss is on, so no other configuration's stream
+    /// moves).
+    fn mirror_lost(&self, msg: &PeerMsg) -> bool {
+        let (p, from) = *self.mirror_drop.lock().unwrap();
+        p > 0.0
+            && matches!(msg, PeerMsg::LockMirror { .. })
+            && from.is_some_and(|f| tokio::time::Instant::now() >= f)
+            && self.rng.lock().unwrap().random_bool(p)
     }
 
     /// Plan 30 §M9: what the directory reports as the RTT from `a` to
@@ -251,7 +275,7 @@ impl Bus {
                 delay += Duration::from_millis(extra);
             }
         }
-        let deliverable = self.deliverable(from, to);
+        let deliverable = self.deliverable(from, to) && !self.mirror_lost(&msg);
         let req: Option<OpId> = msg.requests();
         let bus = self.clone();
         tokio::spawn(async move {

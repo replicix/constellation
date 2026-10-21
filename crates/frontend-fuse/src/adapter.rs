@@ -256,6 +256,31 @@ impl<V: Vfs> FuseFs<V> {
         );
     }
 
+    /// `reply` as the op's responder: wrapped to park when the view says an
+    /// op may (see [`Parkable`]).
+    fn parkable<R: crate::reply::RingBudget>(&self, req: &Request, reply: R) -> Parkable<R> {
+        if self.vfs.parking() {
+            let lossy = self.lossy();
+            Parkable::Park(
+                self.deferred
+                    .track_when_waiting(self.interrupts.guard_when_waiting(
+                        req.unique().0,
+                        req.pid(),
+                        lossy,
+                        reply,
+                    )),
+                // Over a ring a waiting request holds its queue entry: only a
+                // reply that can take one of the queue's `depth - 1` lock-wait
+                // entries may park (review of F-c: a parked read or write
+                // held its entry outside that budget, and enough of them
+                // stalled every request of the CPU's queue — F-b's F2).
+                lossy && !R::RING_BUDGETED,
+            )
+        } else {
+            Parkable::Plain(reply)
+        }
+    }
+
     /// The session's observer. A filesystem served without a
     /// [`crate::FuseSession`] (the wire tests drive one over a socket
     /// pair) never has its slot filled and counts as `/dev/fuse`, which
@@ -397,6 +422,41 @@ pub(crate) fn track_for_test<R: constellation_vfs::Responder<()>>(
     reply: R,
 ) -> impl constellation_vfs::Responder<()> {
     deferred.track(reply)
+}
+
+/// Plan 43 C7-F F-c: an op's responder that may *park* — wait, without
+/// holding a worker, for the verdict on its caller's lapsed lock grant, then
+/// run again — is wrapped, while the view says one may
+/// ([`constellation_vfs::Vfs::parking`]: a node that holds no grant, local
+/// lock or taint never pays for it), as the lock requests that wait are: counted
+/// in [`Deferred`] and registered interruptible, both from the moment the
+/// op says it waits (`Responder::begin_wait`), so that a signal ends the park
+/// with `EINTR` and a detach sees it.
+///
+/// `Park(_, true)`: the session is a ring and the reply type cannot reserve
+/// a lock-wait entry of its queue ([`crate::reply::RingBudget`]): the park
+/// is refused (`EIO` at once, counted `lapse_park_refused_ring`, as before
+/// F-c) rather than holding an entry outside the budget.
+enum Parkable<R> {
+    Plain(R),
+    Park(Tracked<Interruptible<R>>, bool),
+}
+
+impl<T, R: constellation_vfs::Responder<T>> constellation_vfs::Responder<T> for Parkable<R> {
+    fn done(self, result: constellation_vfs::VfsResult<T>) {
+        match self {
+            Parkable::Plain(reply) => reply.done(result),
+            Parkable::Park(reply, _) => reply.done(result),
+        }
+    }
+
+    fn begin_wait(&mut self) -> constellation_vfs::WaitStart {
+        match self {
+            Parkable::Plain(reply) => constellation_vfs::Responder::<T>::begin_wait(reply),
+            Parkable::Park(_, true) => constellation_vfs::WaitStart::Refused,
+            Parkable::Park(reply, false) => constellation_vfs::Responder::<T>::begin_wait(reply),
+        }
+    }
 }
 
 /// A responder counted in [`Deferred`] until it has answered (or was
@@ -1118,7 +1178,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             ino.0,
             fh.map(|fh| Fh(fh.0)),
             &set,
-            op.responder(AttrReply(reply)),
+            op.responder(self.parkable(req, AttrReply(reply))),
         );
     }
 
@@ -1148,10 +1208,13 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             parent.0,
             name(n),
             mode,
-            op.responder(EntryReply {
-                reply,
-                name: name_guard,
-            }),
+            op.responder(self.parkable(
+                req,
+                EntryReply {
+                    reply,
+                    name: name_guard,
+                },
+            )),
         );
     }
 
@@ -1178,10 +1241,13 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             name(n),
             mode,
             rdev,
-            op.responder(EntryReply {
-                reply,
-                name: name_guard,
-            }),
+            op.responder(self.parkable(
+                req,
+                EntryReply {
+                    reply,
+                    name: name_guard,
+                },
+            )),
         );
     }
 
@@ -1202,10 +1268,13 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             ino.0,
             newparent.0,
             name(newname),
-            op.responder(EntryReply {
-                reply,
-                name: name_guard,
-            }),
+            op.responder(self.parkable(
+                req,
+                EntryReply {
+                    reply,
+                    name: name_guard,
+                },
+            )),
         );
     }
 
@@ -1238,11 +1307,14 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             mode,
             flags,
             OpenOwner::NONE,
-            op.responder(CreateReply {
-                reply,
-                cx,
-                name: name_guard,
-            }),
+            op.responder(self.parkable(
+                req,
+                CreateReply {
+                    reply,
+                    cx,
+                    name: name_guard,
+                },
+            )),
         );
     }
 
@@ -1263,10 +1335,13 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             parent.0,
             name(link_name),
             target.as_os_str().as_bytes(),
-            op.responder(EntryReply {
-                reply,
-                name: name_guard,
-            }),
+            op.responder(self.parkable(
+                req,
+                EntryReply {
+                    reply,
+                    name: name_guard,
+                },
+            )),
         );
     }
 
@@ -1278,7 +1353,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             &op.ctx(&caller),
             parent.0,
             name(n),
-            op.responder(EmptyReply(reply)),
+            op.responder(self.parkable(req, EmptyReply(reply))),
         );
     }
 
@@ -1290,7 +1365,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             &op.ctx(&caller),
             parent.0,
             name(n),
-            op.responder(EmptyReply(reply)),
+            op.responder(self.parkable(req, EmptyReply(reply))),
         );
     }
 
@@ -1320,11 +1395,14 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             newparent.0,
             name(newname),
             flags,
-            op.responder(RenameReply {
-                reply,
-                names,
-                exchange: flags.contains(RenameFlags::EXCHANGE),
-            }),
+            op.responder(self.parkable(
+                req,
+                RenameReply {
+                    reply,
+                    names,
+                    exchange: flags.contains(RenameFlags::EXCHANGE),
+                },
+            )),
         );
     }
 
@@ -1349,7 +1427,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             ino.0,
             flags,
             OpenOwner::NONE,
-            op.responder(OpenReply { reply, cx }),
+            op.responder(self.parkable(req, OpenReply { reply, cx })),
         );
     }
 
@@ -1375,11 +1453,14 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             size,
             // A cold read may be answered from the engine's completion
             // pool: counted until it is, for a detach to drain.
-            op.responder(self.deferred.track_bounded(ReadReply {
-                reply,
-                size,
-                zero_copy: self.zero_copy_reads.clone(),
-            })),
+            op.responder(self.deferred.track_bounded(self.parkable(
+                req,
+                ReadReply {
+                    reply,
+                    size,
+                    zero_copy: self.zero_copy_reads.clone(),
+                },
+            ))),
         );
     }
 
@@ -1422,7 +1503,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
                 offset,
                 WriteData::Borrowed(data),
                 flags,
-                op.responder(WriteReply(reply)),
+                op.responder(self.parkable(req, WriteReply(reply))),
             );
             return;
         }
@@ -1464,7 +1545,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             ino.0,
             Fh(fh.0),
             LockOwner(lock_owner.0),
-            op.responder(EmptyReply(reply)),
+            op.responder(self.parkable(req, EmptyReply(reply))),
         );
     }
 
@@ -1578,7 +1659,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             Fh(fh.0),
             open_flags(flags.0),
             lock_owner.map(|owner| LockOwner(owner.0)),
-            op.responder(EmptyReply(reply)),
+            op.responder(self.parkable(req, EmptyReply(reply))),
         );
     }
 
@@ -1696,7 +1777,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             offset,
             length,
             fallocate_mode(mode),
-            op.responder(EmptyReply(reply)),
+            op.responder(self.parkable(req, EmptyReply(reply))),
         );
     }
 
@@ -1943,6 +2024,60 @@ mod tests {
     static DYING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     fn probe(pid: u32) -> bool {
         pid == 66 && DYING.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Plan 43 C7-F F-c: an op's responder wrapped to park
+    /// ([`Parkable::Park`], the view saying an op may) registers its
+    /// request interruptible and counts it only when the op says it waits;
+    /// an unwrapped one never does. A signal ends the park.
+    #[test]
+    fn a_parkable_responder_registers_and_counts_only_when_it_waits() {
+        use constellation_vfs::{FnResponder, Responder, WaitStart};
+        let i = Arc::new(Interrupts::default());
+        let d = Arc::new(Deferred::default());
+        let reply = || FnResponder::<(), _>::new(|_| {});
+        let registered = |i: &Arc<Interrupts>| i.state.lock().unwrap().waiting.len();
+        let mut plain = Parkable::Plain(reply());
+        assert!(matches!(
+            Responder::<()>::begin_wait(&mut plain),
+            WaitStart::Held(None)
+        ));
+        plain.done(Ok(()));
+        assert_eq!((d.count(), registered(&i)), (0, 0));
+        let wrapped = || {
+            Parkable::Park(
+                d.track_when_waiting(i.guard_when_waiting(11, 5, false, reply())),
+                false,
+            )
+        };
+        let r = wrapped();
+        assert_eq!(
+            (d.count(), registered(&i)),
+            (0, 0),
+            "answered at once: nothing"
+        );
+        r.done(Ok(()));
+        let mut r = wrapped();
+        let WaitStart::Held(Some(token)) = Responder::<()>::begin_wait(&mut r) else {
+            panic!("a park registers its token");
+        };
+        assert_eq!((d.count(), registered(&i)), (1, 1));
+        i.interrupt(11);
+        assert!(token.is_cancelled(), "a signal ends a park");
+        r.done(Ok(()));
+        assert_eq!((d.count(), registered(&i)), (0, 0));
+        // Over a ring, a reply type with no lock-wait budget is refused: it
+        // registers nothing, counts nothing, and is answered at once.
+        let mut r = Parkable::Park(
+            d.track_when_waiting(i.guard_when_waiting(12, 5, true, reply())),
+            true,
+        );
+        assert!(matches!(
+            Responder::<()>::begin_wait(&mut r),
+            WaitStart::Refused
+        ));
+        assert_eq!((d.count(), registered(&i)), (0, 0));
+        r.done(Ok(()));
     }
 
     /// Plan 43 F-b review F3: a non-blocking lock request is registered

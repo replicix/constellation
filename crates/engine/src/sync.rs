@@ -602,6 +602,7 @@ pub enum SyncRequest {
         ver: u64,
         grants: Vec<constellation_meta::locks::GrantWire>,
         floor: constellation_meta::Position,
+        final_for: Option<constellation_authority::LeaseKey>,
     },
     /// Final flush + release on unmount; the core stops afterwards.
     Shutdown {

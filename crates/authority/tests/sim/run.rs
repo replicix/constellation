@@ -276,6 +276,12 @@ pub struct SimConfig {
     pub s3_latency: (u64, u64),
     pub p2p_delay: (u64, u64),
     pub p2p_drop: f64,
+    /// Plan 43 C7-F F-c: the probability that a lock mirror (any, the old
+    /// root's final one included) is lost, whatever the link: the
+    /// successor then often holds an older table than the old root's last.
+    pub lock_mirror_drop: f64,
+    /// ... from this many ms into the run on (the mirrors before arrive).
+    pub lock_mirror_drop_from_ms: u64,
     /// Random faults drawn from the seed, in addition to `faults`.
     pub random_faults: usize,
     pub faults: Vec<ScheduledFault>,
@@ -698,6 +704,8 @@ impl Default for SimConfig {
             s3_latency: (5, 40),
             p2p_delay: (1, 15),
             p2p_drop: 0.0,
+            lock_mirror_drop: 0.0,
+            lock_mirror_drop_from_ms: 0,
             random_faults: 2,
             faults: Vec::new(),
             settle_ms: 90_000,
@@ -2776,6 +2784,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let bus = Bus::new(seed, cfg.p2p_delay, cfg.p2p_drop);
     bus.set_stream_faults(cfg.stream_faults.clone());
     bus.set_beats_lost(cfg.beats_lost);
+    bus.set_mirror_drop(cfg.lock_mirror_drop, cfg.lock_mirror_drop_from_ms);
     bus.set_deleg_answer_delay(cfg.deleg_answer_delay);
     let commits: Arc<Mutex<Vec<CommitRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let in_doubt: super::node::InDoubtLog = Arc::new(Mutex::new(Vec::new()));

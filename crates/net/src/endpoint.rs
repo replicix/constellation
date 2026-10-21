@@ -1448,7 +1448,15 @@ pub trait PeerService: Send + Sync + 'static {
     /// Plan 30 §M14, one way: a holder released a grant.
     fn lock_released(&self, _from: u64, _ino: u64, _grant: (u64, u64), _position: &[u8]) {}
     /// Plan 30 §M14, one way: the holder's grant table, for a backup.
-    fn lock_mirror(&self, _from: u64, _ver: u64, _grants: Vec<u8>, _floor: Vec<u8>) {}
+    fn lock_mirror(
+        &self,
+        _from: u64,
+        _ver: u64,
+        _grants: Vec<u8>,
+        _floor: Vec<u8>,
+        _final_for: Option<(u64, u64, i64, u64)>,
+    ) {
+    }
     /// Holder offered us this lease (placement). Default ignores it.
     fn lease_offered(&self, _part: String, _epoch: u64) {}
     /// A peer gossiped its RTT vector. Default ignores it.

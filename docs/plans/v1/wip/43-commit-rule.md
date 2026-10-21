@@ -2864,6 +2864,26 @@ successor whose clock is ahead got no quarantine").
   (admitted while nothing conflicting was granted since, by the mirrored
   table); F-b's deferred wait is the machinery a parked owner's I/O can
   reuse.
+  *Status (2026-10-20): landed* (PROGRESS "Fix: a lapsed lock holder parks
+  instead of failing (plan 43 C7-F F-c)"). The first candidate, with the
+  reclaim rule made exact: a holder whose grant lapsed while it pins local
+  locks or writes keeps it as *lapsing* (nothing captured or tainted), its
+  fenced I/O parks on F-b's `lock-wait` pool (no frontend worker; `EINTR` on
+  a signal; `EIO` where it cannot be held or the owner refuses) and a late
+  renewal is sent every `lock_poll_ms`; the owner admits it only from a
+  *settled* record or its memory of a lapsed one (`LockTables::admit_late`),
+  never as a grace's reclaim; the old root sends a **final mirror** of its
+  lease when it can add nothing more under it, and a fast successor whose
+  takeover replaced that very lease trusts it (`settled` kept, lapsed
+  memory installed), any other mirror not. The model has the rule and three
+  must-violate variants (`late_admit_unknown`, `late_admit_nonfinal`,
+  `late_lapsed_unsuperseded`); the sim two configurations
+  (`locks-s3-cut-holder-lapse`, `locks-late-stale-mirror`, with a naive
+  successor as the negative control). Not done (the spec's residuals): a
+  grant reclaimed in a grace that lapses later still fences, `ack=s3`
+  successors (no mirror), a TTL or released takeover, a predecessor that
+  died, locks in delegated subtrees whose delegate's authority lapsed with
+  the root's.
 
 F-a changes the floor's argument by one step (the floor ends at the
 earlier of the bound and the cap, each sufficient on its own); F-b and

@@ -44,7 +44,7 @@ pub use core::{
     EpochClaimView, EpochState, InboxView, LockView, ShipState, Stats,
 };
 pub use event::{
-    Carrier, CasFailure, Control, Event, LockOutcome, LockRenewEntry, LockRenewResult,
+    Carrier, CasFailure, Control, Event, LeaseKey, LockOutcome, LockRenewEntry, LockRenewResult,
     LockTestOutcome, PeerLink, PeerMsg, Policy, ReadGrantMsg, ReadIndexOutcome, S3Failure,
     S3Result, UploadResult,
 };

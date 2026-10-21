@@ -39,6 +39,18 @@
 //! - [`Core::on_lock_renew`]: extend, or *reclaim* an unknown grant
 //!   during a grace period, else `Lost`. The acknowledgement carries the
 //!   recalled flag, so a lost recall is repaired by the next renewal.
+//!   A **late** renewal (`LockRenewEntry::late`, plan 43 C7-F F-c: the
+//!   holder's window ended while the grant pins local locks or writes) is
+//!   never a reclaim: it is admitted only from a record the table can
+//!   prove continuous since the grant was made (`LockTables::admit_late`),
+//!   else `Lost`.
+//! - The old root's **final mirror** (plan 43 C7-F F-c,
+//!   [`Core::lock_final_step`]): when its lease is no longer usable it
+//!   sends its backups its whole table, names the lease body, and adds
+//!   nothing under that lease from then on; a fast successor whose
+//!   takeover replaced exactly that body installs the records settled and
+//!   its lapsed memory ([`Core::lock_install_mirror`]); any other mirror
+//!   only unsettled.
 //! - The table follows the subtree: handed to a delegate with its first
 //!   granting `DelegRenewed`, back with `DelegRecalled`. The root keeps
 //!   its copy of what it handed ([`LockState::handed`]): every granting
@@ -70,8 +82,12 @@
 //!   under this one), `WouldBlock`, or `Unavailable` (no P2P path: the
 //!   inbox is not a lock path, see PROGRESS.md).
 //! - Renewals ride `Timer::LockRenewTick` while any grant is held,
-//!   grouped by owner; a lapsed grant is never renewed (the FUSE thread
-//!   fences I/O under it: `EIO`).
+//!   grouped by owner. A lapsed grant is not renewed as one; if it pins
+//!   local locks or writes it is *lapsing* and asked for back with late
+//!   renewals every `lock_poll_ms` until the owner admits or refuses it or
+//!   `lock_owner_wait_max_ms` passes (the FUSE thread parks the I/O
+//!   meanwhile); one that pins nothing is dropped (the FUSE thread fences
+//!   I/O under it: `EIO`).
 //! - A recall of a grant with local locks under it is honoured when the
 //!   last one leaves (`Control::LockIdle`); one without waits for the
 //!   flush of the file's dirty data (`Action::LockFlush` →
@@ -80,7 +96,9 @@
 use super::backup::{FreshHold, FreshVerdict};
 use super::{Core, Timer};
 use crate::action::{Action, ControlOk, LockAnswer, LockTestAnswer, S3Op};
-use crate::event::{LockOutcome, LockRenewEntry, LockRenewResult, LockTestOutcome, PeerMsg};
+use crate::event::{
+    LeaseKey, LockOutcome, LockRenewEntry, LockRenewResult, LockTestOutcome, PeerMsg,
+};
 use crate::ids::{HonourMs, Ms, NodeId, Now, OpId, TimerId, WaitMs};
 use crate::replica::Replica;
 use constellation_fs_core::Ino;
@@ -352,8 +370,20 @@ pub(crate) struct LockState {
     pub(crate) grace: Vec<(Ino, WaitMs)>,
     pub(crate) mirror_dirty: bool,
     mirror_ver: u64,
-    /// This node as a backup: the holder's last mirror.
-    bk_mirror: Option<(u64, Vec<GrantWire>)>,
+    /// This node as a backup: the holder's last mirror, and the lease it
+    /// names when it is that lease's *final* one (plan 43 C7-F F-c).
+    bk_mirror: Option<(u64, Vec<GrantWire>, Option<LeaseKey>)>,
+    /// Old root, plan 43 C7-F F-c: the lease (`lock_lease_key`) whose
+    /// final mirror this node sent: while it is the lease held, nothing is
+    /// added to the table (`lock_final_blocks`).
+    final_for: Option<LeaseKey>,
+    /// The timer that brings the final mirror about (the lease's usable
+    /// end), or re-sends it, and when it fires (honour clock).
+    pub(crate) final_timer: Option<(TimerId, HonourMs)>,
+    /// Successor, plan 43 C7-F F-c: the lease body this node's fast
+    /// takeover replaced (`Core::note_fast_takeover`), which the mirror's
+    /// final key must equal for its records to be trusted.
+    pub(crate) takeover_prev: Option<LeaseKey>,
     /// Root: grants to hand to a delegate with its first renewal.
     handoff: BTreeMap<u64, Vec<Grant>>,
     /// Root: the grants handed to a generation, as this root recorded
@@ -799,7 +829,10 @@ impl Core {
                 return Route::Node(d.node);
             }
         }
-        if self.lease.usable(now, &self.cfg) && (renewal || !self.lease.fenced()) {
+        if self.lease.usable(now, &self.cfg)
+            && (renewal || !self.lease.fenced())
+            && !self.lock_final_blocks()
+        {
             return Route::Me {
                 cap_ms: self.lock_cap_ms(now),
                 gen: 0,
@@ -1378,7 +1411,7 @@ impl Core {
         self.lk.horizon_held = keep;
         for id in dropped {
             if let Some(g) = replica.locks().get(id) {
-                self.lock_grant_done(now, id, g.ino, replica, out);
+                self.lock_grant_done(now, id, g.ino, false, replica, out);
             }
         }
         self.lock_horizon_write(now, out);
@@ -1944,9 +1977,24 @@ impl Core {
                         }
                     }
                 }
-                replica
+                // A mint is *settled* (`Grant::settled`, plan 43 C7-F F-c):
+                // made only where no grace, floor or barrier holds the
+                // inode, so that every grant before it was issued before
+                // it. (The callers check the grace first; the tenure floor
+                // and the barrier above.)
+                debug_assert!(
+                    !self.lock_grace_active(now, ino, replica),
+                    "a lock grant minted inside a grace"
+                );
+                let new = replica
                     .locks()
-                    .grant(self.cfg.node_id, from, ino, mode, until, gen)
+                    .grant(self.cfg.node_id, from, ino, mode, until, gen);
+                // A live record of the node replaced: the same grant under a
+                // new id (a late renewal of the old one is the new one's).
+                if let Some(old) = own {
+                    replica.locks().note_continues(&old, new);
+                }
+                new
             }
         };
         // A barrier its own outwaited record left ends with this grant
@@ -3082,7 +3130,7 @@ impl Core {
             .is_some_and(|g| g.node == from && g.ino == ino)
         {
             self.stats.lock_recalls_released += 1;
-            self.lock_grant_done(now, grant, ino, replica, out);
+            self.lock_grant_done(now, grant, ino, false, replica, out);
             return;
         }
         // The node released an id this owner has since replaced: a
@@ -3104,7 +3152,7 @@ impl Core {
                 self.stats.lock_released_superseded += 1;
                 if from == self.cfg.node_id {
                     self.stats.lock_recalls_released += 1;
-                    self.lock_grant_done(now, g.id, ino, replica, out);
+                    self.lock_grant_done(now, g.id, ino, false, replica, out);
                 } else {
                     self.lock_recall(now, g, replica, out);
                 }
@@ -3176,18 +3224,25 @@ impl Core {
             ino = g.ino,
             "a lock grant's recall went unanswered; outwaited it (TTL + margin)"
         );
-        self.lock_grant_done(now, id, g.ino, replica, out);
+        self.lock_grant_done(now, id, g.ino, true, replica, out);
     }
 
+    /// `outwaited`: the grant's holder never released it (plan 43 C7-F F-c:
+    /// a settled record is then remembered as lapsed).
     fn lock_grant_done(
         &mut self,
         now: Now,
         id: GrantId,
         ino: Ino,
+        outwaited: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        replica.locks().forget(id);
+        if outwaited {
+            replica.locks().forget_outwaited(id);
+        } else {
+            replica.locks().forget(id);
+        }
         self.lk.unproven.remove(&id);
         self.lk.mirror_dirty = true;
         if let Some(r) = self.lk.recalls.remove(&id) {
@@ -3211,7 +3266,7 @@ impl Core {
     ) {
         let mut results = Vec::with_capacity(entries.len());
         for e in entries {
-            let r = self.lock_renew_one(now, from, e.ino, e.grant, e.mode, replica);
+            let r = self.lock_renew_one(now, from, e.ino, e.grant, e.mode, e.late, replica);
             results.push((e.ino, e.grant, r));
         }
         self.lock_answer(now, from, PeerMsg::LockRenewed { req, results }, out);
@@ -3229,6 +3284,17 @@ impl Core {
         }
     }
 
+    /// `late`: plan 43 C7-F F-c, a renewal of a grant whose window its holder
+    /// no longer honours. Admitted only from a record of that id that is
+    /// *settled* here (present, live or expired and not dropped yet) or its
+    /// lapsed memory ([`constellation_meta::locks::LockTables::admit_late`]):
+    /// the proof that nothing conflicting was granted since. Never the
+    /// grace's reclaim (the model's counterexample: an old owner that had
+    /// outwaited the grant and granted another node, a successor that knew
+    /// neither), never the newer-own-grant fallback (a grant minted
+    /// afresh after the old one lapsed does not continue it), and looked up
+    /// before anything calls `conflicting`, which drops the expired records.
+    #[allow(clippy::too_many_arguments)]
     fn lock_renew_one(
         &mut self,
         now: Now,
@@ -3236,6 +3302,7 @@ impl Core {
         ino: Ino,
         id: GrantId,
         mode: LockMode,
+        late: bool,
         replica: &dyn Replica,
     ) -> LockRenewResult {
         // Renewed: the grant is in use (`LockState::served`).
@@ -3287,6 +3354,58 @@ impl Core {
             self.lk.lease_renew_wanted = true;
         }
         let until = now.wait.plus((ttl + self.lock_margin_ms()).max(0) as u64);
+        if late {
+            if self.lock_final_blocks() {
+                // The final mirror of this lease went: nothing is added
+                // under it, and a late admission is an add.
+                self.stats.lock_late_refused += 1;
+                return LockRenewResult::NotOwner { owner: 0 };
+            }
+            let waiter = self
+                .lk
+                .waiters
+                .iter()
+                .any(|w| w.ino == ino && w.node != from && w.mode.conflicts(mode));
+            return match replica
+                .locks()
+                .admit_late(id, from, mode, until, waiter, now)
+            {
+                Some(a) => {
+                    if from != self.cfg.node_id {
+                        self.lock_need_horizon(until, until.plus((ttl / 4).max(0) as u64));
+                    }
+                    if hold.is_some() {
+                        self.lk.fresh_need = hold;
+                    }
+                    self.lk.unproven.remove(&a.id);
+                    self.lk.mirror_dirty = true;
+                    self.stats.lock_late_admitted += 1;
+                    tracing::info!(
+                        node = self.cfg.node_id,
+                        from,
+                        ino,
+                        from_memory = a.from_memory,
+                        "admitted a late lock renewal: nothing conflicting was granted since"
+                    );
+                    LockRenewResult::Ok {
+                        ttl_ms: ttl as u64,
+                        recalled: a.recalled,
+                        id: a.id,
+                        mode: a.mode,
+                    }
+                }
+                None => {
+                    self.stats.lock_late_refused += 1;
+                    tracing::info!(
+                        node = self.cfg.node_id,
+                        from,
+                        ino,
+                        "refused a late lock renewal: the grant's continuity is not proven"
+                    );
+                    LockRenewResult::Lost
+                }
+            };
+        }
         // The grant renewed: that id, or this node's newer grant here (a
         // reply that never arrived replaced it: renew that one and say so
         // — sim seed 90013 fenced a healthy node otherwise). Only a record
@@ -3354,6 +3473,8 @@ impl Core {
                 self.lk.fresh_need = hold;
             }
             // Its holder's renewal: confirmed from now on.
+            // Not settled: nothing proves what was granted between the
+            // grant it names and now (`Grant::settled`).
             replica.locks().install(Grant {
                 id,
                 node: from,
@@ -3363,6 +3484,7 @@ impl Core {
                 recalled: false,
                 gen,
                 confirmed_ms: now.wall.0,
+                settled: false,
             });
             self.stats.lock_reclaimed += 1;
             self.lk.mirror_dirty = true;
@@ -3532,7 +3654,13 @@ impl Core {
         // seeds 90000/90004). A non-blocking request while local locks
         // still pin the recalled grant would block: say so.
         if let Some(h) = replica.locks().held(ino) {
-            if h.until <= now.honour {
+            if h.until <= now.honour && replica.locks().lapse_pending(ino, now) {
+                // Plan 43 C7-F F-c: lapsing — its late renewal is asked
+                // for; a fresh grant would replace it and fence its owners.
+                // Look again shortly.
+                self.set_timer_wait(now.wait.plus(10), Timer::LockRetry(op), out);
+                return;
+            } else if h.until <= now.honour {
                 // Lapsed: it is fenced already and cannot be renewed;
                 // drop it (the owner outwaits it) and ask afresh.
                 replica.locks().drop_held(ino, h.id);
@@ -3913,7 +4041,7 @@ impl Core {
             // after the push's install).
             replica
                 .locks()
-                .renewed(ino, id, id, mode, sent, ttl, margin, false);
+                .renewed(ino, id, id, mode, sent, ttl, margin, false, now);
             self.stats.lock_late_replies_installed += 1;
             // The grant has a new renewal point and no renewal in flight
             // (`renewed` clears it): the tick must come by then. Armed at
@@ -3937,6 +4065,8 @@ impl Core {
             first_use: false,
             idle_since: None,
             installed: now.honour,
+            lapsing: None,
+            written: false,
         };
         if matches!(
             replica.locks().install_held(ino, held),
@@ -4278,6 +4408,8 @@ impl Core {
                     first_use: false,
                     idle_since: None,
                     installed: now.honour,
+                    lapsing: None,
+                    written: false,
                 };
                 let ino = o.ino;
                 let waited = now.wait.since(o.created).max(0) as u64;
@@ -4478,6 +4610,11 @@ impl Core {
         if let Some(first) = replica.locks().next_renewal(now) {
             at = at.min(first.max(now.honour.plus(1)));
         }
+        // Plan 43 C7-F F-c: a lapsing grant asks for its late renewal again
+        // until it is answered or gives up, at the owner-poll cadence.
+        if replica.locks().lapsing_any() {
+            at = at.min(now.honour.plus(self.cfg.lock_poll_ms().clamp(1, 1_000)));
+        }
         at = at.max(self.lock_relearn_floor(now));
         if let Some((t, armed)) = self.lk.renew_timer.zip(self.lk.renew_at) {
             if armed <= at {
@@ -4526,15 +4663,26 @@ impl Core {
         }
         // A recalled grant with no local lock under it is released, not
         // renewed; a lapsed one is dropped (sim seed 90010: a grant that
-        // answered an op it did not cover was neither used nor released).
+        // answered an op it did not cover was neither used nor released) —
+        // unless it pins local locks or writes: plan 43 C7-F F-c, it is
+        // then *lapsing*, its I/O waits and a late renewal is asked for
+        // (below), until the owner admits or refuses it or the park's bound
+        // passes (`LockTables::lapse_tick`).
+        let lapse = replica.locks().lapse_tick(now);
+        self.stats.lock_lapse_parks_gave_up += lapse.gave_up as u64;
         for (ino, h) in replica.locks().held_all() {
-            if h.until <= now.honour {
-                replica.locks().drop_held(ino, h.id);
-            } else if h.recalled && !h.releasing && replica.locks().local_idle(ino) {
+            if h.until > now.honour && h.recalled && !h.releasing && replica.locks().local_idle(ino)
+            {
                 self.lock_release_begin(now, ino, replica, out);
             }
         }
-        let due = replica.locks().due_renewals(now);
+        let mut due: Vec<(Ino, HeldGrant, bool)> = replica
+            .locks()
+            .due_renewals(now)
+            .into_iter()
+            .map(|(ino, h)| (ino, h, false))
+            .collect();
+        due.extend(lapse.late.into_iter().map(|(ino, h)| (ino, h, true)));
         if !due.is_empty() {
             tracing::debug!(
                 node = self.cfg.node_id,
@@ -4543,8 +4691,8 @@ impl Core {
                 "lock renewals due"
             );
         }
-        let mut by_owner: BTreeMap<NodeId, Vec<(Ino, HeldGrant)>> = BTreeMap::new();
-        for (ino, h) in due {
+        let mut by_owner: BTreeMap<NodeId, Vec<(Ino, HeldGrant, bool)>> = BTreeMap::new();
+        for (ino, h, late) in due {
             // Routed as a peer's renewal is (`lock_renew_one`): a lease
             // whose gate is pending serves renewals. Its own lockers'
             // found no owner and spun until their grants lapsed under
@@ -4552,7 +4700,7 @@ impl Core {
             match self.lock_route_for(now, ino, replica, true) {
                 Route::Me { .. } => {
                     let me = self.cfg.node_id;
-                    let r = self.lock_renew_one(now, me, ino, h.id, h.mode, replica);
+                    let r = self.lock_renew_one(now, me, ino, h.id, h.mode, late, replica);
                     if let Some(f) = self.lk.fresh_need.take() {
                         // Plan 41 L0: the tenure's liveness is stale; the
                         // grant stays `renewing` (not due again) until the
@@ -4573,7 +4721,7 @@ impl Core {
                     self.lock_renew_authority(now, out);
                 }
                 Route::Node(n) if self.cfg.p2p && self.reaches(now, n) => {
-                    by_owner.entry(n).or_default().push((ino, h));
+                    by_owner.entry(n).or_default().push((ino, h, late));
                 }
                 route => {
                     // The owner is unreachable or unknown (a failover: the
@@ -4605,7 +4753,7 @@ impl Core {
             self.lk.renews.insert(
                 req,
                 RenewInFlight {
-                    entries: entries.iter().map(|(i, h)| (*i, h.id)).collect(),
+                    entries: entries.iter().map(|(i, h, _)| (*i, h.id)).collect(),
                     sent: now.honour,
                     timer,
                     to,
@@ -4623,10 +4771,11 @@ impl Core {
                     req,
                     entries: entries
                         .into_iter()
-                        .map(|(ino, h)| LockRenewEntry {
+                        .map(|(ino, h, late)| LockRenewEntry {
                             ino,
                             grant: h.id,
                             mode: h.mode,
+                            late,
                         })
                         .collect(),
                 },
@@ -4787,6 +4936,7 @@ impl Core {
                     ttl_ms as i64,
                     self.lock_margin_ms(),
                     recalled,
+                    now,
                 );
                 self.stats.lock_renewals += 1;
                 if recalled {
@@ -4794,13 +4944,19 @@ impl Core {
                 }
             }
             LockRenewResult::Lost => {
-                if replica.locks().lost(ino, id) {
+                if replica.locks().lost(ino, id, now) {
                     self.stats.lock_lost += 1;
                     tracing::warn!(
                         node = self.cfg.node_id,
                         ino,
                         "lock grant lost (the owner does not know it); I/O under local locks is fenced"
                     );
+                } else {
+                    // The answer is for an id this node no longer holds (a
+                    // recall made it adopt a newer one): the grant held now
+                    // is asked about again (a lapsing one, by its late
+                    // renewal at the next tick).
+                    replica.locks().renewal_failed(ino, id);
                 }
             }
             LockRenewResult::NotOwner { owner } => {
@@ -5243,12 +5399,13 @@ impl Core {
         ver: u64,
         grants: Vec<GrantWire>,
         floor: Position,
+        final_for: Option<LeaseKey>,
     ) {
         if self.root_node() != Some(from) {
             return;
         }
-        if self.lk.bk_mirror.as_ref().is_none_or(|(v, _)| ver > *v) {
-            self.lk.bk_mirror = Some((ver, grants));
+        if self.lk.bk_mirror.as_ref().is_none_or(|(v, _, _)| ver > *v) {
+            self.lk.bk_mirror = Some((ver, grants, final_for));
             // Floors only grow: joined across mirrors.
             self.lk.bk_floor = constellation_meta::locks::floor_join(&self.lk.bk_floor, &floor);
         }
@@ -5256,25 +5413,61 @@ impl Core {
 
     /// A fast takeover (this node was the backup): the mirror is this
     /// tenure's table, restamped; M9's floor covers what it misses.
+    ///
+    /// Plan 43 C7-F F-c: a mirror is *trusted* only if it is the old root's
+    /// **final** one — it names the very lease body this takeover replaced
+    /// (`LockState::takeover_prev`), so the old root added nothing under
+    /// that lease after it (`lock_final_step`). Its records then keep their
+    /// `settled` flag and the ones it had expired become this table's lapsed
+    /// memory (a late renewal of one is admitted, until a conflicting grant
+    /// supersedes it). Any other mirror may have missed a later grant the
+    /// old root made after outwaiting a record it lists: its records are
+    /// installed unsettled, its lapsed ones dropped, and a late renewal of
+    /// either is refused. A mirror that arrives after the takeover is
+    /// ignored (the sender is no longer the root).
     pub(crate) fn lock_install_mirror(&mut self, now: Now, replica: &dyn Replica) {
         let floor = std::mem::take(&mut self.lk.bk_floor);
         self.lock_note_dir_floor(constellation_fs_core::types::ROOT_INO, &floor);
-        let Some((_, grants)) = self.lk.bk_mirror.take() else {
+        let prev = self.lk.takeover_prev.take();
+        let Some((_, grants, final_for)) = self.lk.bk_mirror.take() else {
             return;
         };
+        let trusted =
+            (final_for.is_some() && final_for == prev) || self.cfg.lock_trust_nonfinal_mirror;
+        if final_for.is_some() {
+            if trusted {
+                self.stats.lock_mirror_final_installed += 1;
+            } else {
+                self.stats.lock_mirror_final_mismatch += 1;
+            }
+        }
         let until = self.restamp(now);
         let n = grants.len();
+        let mut lapsed = Vec::new();
         for g in grants {
             // Unconfirmed: the mirror is asynchronous, and the previous
             // holder may have ended a grant it still lists (released, or
             // outwaited, and granted to another node since).
             // The mirror's own end (the previous holder's wall stamp) is
             // never read: the record is restamped on this node's wait clock.
-            replica.locks().install(Grant {
+            let grant = Grant {
                 recalled: false,
                 confirmed_ms: Grant::UNCONFIRMED,
+                settled: trusted && g.settled,
                 ..g.into_grant(until)
-            });
+            };
+            if g.lapsed {
+                // An expired record is no grant: nobody is blocked by it.
+                if trusted {
+                    lapsed.push(grant);
+                }
+                continue;
+            }
+            replica.locks().install(grant);
+        }
+        // After the live ones, which supersede what they conflict with.
+        for g in lapsed {
+            replica.locks().install_lapsed(g);
         }
         if n > 0 {
             tracing::info!(
@@ -5485,6 +5678,9 @@ impl Core {
         leaving: Vec<GrantWire>,
         replica: &dyn Replica,
     ) {
+        if self.lock_final_blocks() {
+            return;
+        }
         let until = self.restamp(now);
         let mut n = 0;
         for g in leaving {
@@ -5538,6 +5734,9 @@ impl Core {
     /// ([`Core::lock_install_leaving`]). Nor are they handed to the
     /// delegate after this: it no longer serves the inode.
     pub(crate) fn lock_take_back_left(&mut self, now: Now, gen: u64, replica: &dyn Replica) {
+        if self.lock_final_blocks() {
+            return;
+        }
         let left = |g: &Grant| {
             matches!(
                 replica.resolve_ownership(&Self::read_keys(g.ino, None)),
@@ -5563,6 +5762,7 @@ impl Core {
             let g = Grant {
                 gen: 0,
                 confirmed_ms: Grant::UNCONFIRMED,
+                settled: false,
                 ..g
             };
             if g.until > now.wait
@@ -5679,6 +5879,13 @@ impl Core {
     /// on the same inode, or a conflicting one, is newer and stays (see
     /// `LockTables::install_if_consistent`).
     pub(crate) fn lock_on_generation_ended(&mut self, now: Now, gen: u64, replica: &dyn Replica) {
+        if self.lock_final_blocks() {
+            // Plan 43 C7-F F-c: nothing is added under a lease whose final
+            // mirror went (the copies are not a grant of this table).
+            self.lk.handoff.remove(&gen);
+            self.lk.handed.remove(&gen);
+            return;
+        }
         let mut back = self.lk.handoff.remove(&gen).unwrap_or_default();
         back.extend(self.lk.handed.remove(&gen).unwrap_or_default());
         let mut n = 0;
@@ -5688,6 +5895,7 @@ impl Core {
             let g = Grant {
                 gen: 0,
                 confirmed_ms: Grant::UNCONFIRMED,
+                settled: false,
                 ..g
             };
             if g.until > now.wait && replica.locks().install_if_consistent(g, now.wait) {
@@ -5825,8 +6033,16 @@ impl Core {
             }
             return;
         }
+        if gen == 0 && self.lock_final_blocks() {
+            return;
+        }
         let restamp = self.restamp(now);
         let mut n = 0;
+        // Plan 43 C7-F F-c: the batch that starts a generation's service
+        // here is the move itself (its grants keep what they were); a later
+        // one may be a re-send installed after this delegate served: not
+        // settled (`Grant::settled`).
+        let first = gen == 0 || self.lk.moved_seen.get(&gen).is_none_or(|s| s.is_empty());
         for g in grants {
             let left = carry.iter().find(|(id, _)| *id == g.id).map(|(_, l)| *l);
             let until = left.map_or(restamp, |l| self.carried_until(now, l));
@@ -5835,10 +6051,11 @@ impl Core {
             // may not say yet (a handoff arrives with the renewal that
             // installs the generation; sim seed 196252 tagged it 0 and
             // lost it at the next recall).
-            let g = Grant {
+            let mut g = Grant {
                 gen,
                 ..g.into_grant(until)
             };
+            g.settled &= first;
             if gen == 0 {
                 if left.is_some() {
                     replica.locks().install_keeping_later(g);
@@ -6114,6 +6331,10 @@ impl Core {
         if !self.cfg.locks {
             return;
         }
+        // Plan 43 C7-F F-c: how long a lapsing grant parks its I/O.
+        replica
+            .locks()
+            .set_lapse_park_ms(self.cfg.lock_owner_wait_max_ms() as i64);
         if let Some(until) = replica.load_lock_quarantine(now) {
             tracing::info!(
                 node = self.cfg.node_id,
@@ -6217,6 +6438,106 @@ impl Core {
         }
     }
 
+    // ------------------------------------------------------------ the final mirror
+
+    /// The lease body this node holds as its own (`LeaseKey`): what the
+    /// final mirror names and a fast takeover's replaced body is compared
+    /// with.
+    pub(crate) fn lock_lease_key(&self) -> Option<LeaseKey> {
+        let (l, _) = self.lease.held.as_ref()?;
+        (l.holder == self.cfg.node_id
+            && l.holder_clock == self.cfg.clock_id
+            && l.holder_wait_ms != 0)
+            .then_some((l.holder, l.holder_clock, l.holder_wait_ms, l.epoch))
+    }
+
+    /// The final mirror of the lease this node holds went: while it is the
+    /// lease held, nothing is added to this table (enforced, not derived:
+    /// a mint, a reclaim, a late admission, a move-in, an upgrade). A
+    /// renewal of the lease (another body, another key) lifts it.
+    pub(crate) fn lock_final_blocks(&self) -> bool {
+        self.lk.final_for.is_some() && self.lk.final_for == self.lock_lease_key()
+    }
+
+    /// Plan 43 C7-F F-c, the old root's last word. When this node can no
+    /// longer add a record under its current lease — the lease not usable
+    /// on the honour clock, and no continuation epoch's re-claim route
+    /// (`lock_route_for` answers `Route::Me` for nothing) — it sends its
+    /// backups its whole table as the **final** mirror of that lease:
+    /// every record present (those expired on its wait clock marked
+    /// `lapsed`) and its lapsed memory, each with its `settled` flag, and
+    /// adds nothing under the lease from then on. The asynchronous mirror
+    /// cannot say whether a later one was missed; this one can: a
+    /// successor whose takeover replaced exactly this lease body knows the
+    /// table below is all this node ever granted under it
+    /// (`lock_install_mirror`). Sent at the usable end (a timer armed for
+    /// it) and re-sent at each backup heartbeat until the lease ends, to
+    /// survive a lost message (the same version: idempotent there).
+    pub(crate) fn lock_final_step(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+        from_timer: bool,
+    ) {
+        if !self.cfg.locks {
+            return;
+        }
+        let Some(key) = self.lock_lease_key() else {
+            return;
+        };
+        // Runs after every event: nothing is allocated until a mirror goes.
+        if self.lease.backups().is_empty() || self.lease.epoch_held() {
+            return;
+        }
+        let adds_open =
+            self.lease.usable(now, &self.cfg) || self.epoch_reclaim_expires(now).is_some();
+        if adds_open {
+            // Wake at the usable end.
+            if let Some(end) = self.lease.honour_until(&self.cfg) {
+                let at = end.minus(self.cfg.expiry_margin_ms);
+                if self.lk.final_timer.is_none_or(|(_, armed)| armed != at) {
+                    if let Some((t, _)) = self.lk.final_timer.take() {
+                        self.cancel_timer(t, out);
+                    }
+                    let t =
+                        self.set_timer_honour(at.max(now.honour.plus(1)), Timer::LockFinal, out);
+                    self.lk.final_timer = Some((t, at));
+                }
+            }
+            return;
+        }
+        let first = self.lk.final_for != Some(key);
+        if first {
+            self.lk.final_for = Some(key);
+            self.lk.mirror_ver += 1;
+            self.stats.lock_mirror_final_sent += 1;
+        }
+        // Re-sent each heartbeat until the lease's own end.
+        let left = self.lease.honour_left_ms(now, &self.cfg).unwrap_or(0);
+        if self.lk.final_timer.is_none() && left > 0 {
+            let at = now.honour.plus(self.cfg.backup_heartbeat_ms.max(1));
+            let t = self.set_timer_honour(at, Timer::LockFinal, out);
+            self.lk.final_timer = Some((t, at));
+        }
+        if !first && !from_timer {
+            return;
+        }
+        let grants = replica.locks().final_snapshot(now);
+        let floor = self.lk.floor_all;
+        for b in self.lease.backups().to_vec() {
+            out.push(Action::Send {
+                to: b,
+                msg: PeerMsg::LockMirror {
+                    ver: self.lk.mirror_ver,
+                    grants: grants.clone(),
+                    floor,
+                    final_for: Some(key),
+                },
+            });
+        }
+    }
+
     // ------------------------------------------------------------ after every event
 
     pub(crate) fn locks_after_event(
@@ -6245,10 +6566,11 @@ impl Core {
             self.lk.mirror_dirty = true;
         }
         self.lock_take_outwaited(now, replica);
+        self.lock_final_step(now, replica, out, false);
         if self.lk.mirror_dirty {
             self.lk.mirror_dirty = false;
             let backups = self.lease.backups();
-            if !backups.is_empty() && self.root_usable(now) {
+            if !backups.is_empty() && self.root_usable(now) && !self.lock_final_blocks() {
                 self.lk.mirror_ver += 1;
                 let grants: Vec<GrantWire> = replica
                     .locks()
@@ -6264,6 +6586,7 @@ impl Core {
                             ver: self.lk.mirror_ver,
                             grants: grants.clone(),
                             floor,
+                            final_for: None,
                         },
                     });
                 }

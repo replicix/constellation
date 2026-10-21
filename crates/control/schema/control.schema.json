@@ -4300,6 +4300,63 @@
           "minimum": 0,
           "type": "integer"
         },
+        "lapse_park_gave_up": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lapse_park_interrupted": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lapse_park_ms_max": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lapse_park_refused_pool": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lapse_park_refused_ring": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lapse_parked_ops": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lapse_parks": {
+          "description": "Plan 43 C7-F F-c, node side: grants whose window ended while they\npinned local locks or writes (the I/O they fence waited instead of\nfailing), and how those parks ended: renewed late by the owner\n(`resumed`: nothing was lost), refused (`refused`: `EIO`, as\nbefore), or past `lock_owner_wait_max_ms` with no answer\n(`gave_up`). The longest park (ms), and the ops that waited for one\n(`parked_ops`; `interrupted`: ended by their caller's signal,\n`EINTR`; `refused_ring`/`refused_pool`: could not be held, `EIO`).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lapse_parks_refused": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lapse_parks_resumed": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "late_admitted": {
+          "description": "Plan 43 C7-F F-c, owner side: late renewals admitted (a settled\nrecord or its lapsed memory proved no conflicting grant was issued\nsince) and refused.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "late_refused": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "local_conflicts": {
           "format": "uint64",
           "minimum": 0,
@@ -4318,6 +4375,22 @@
         },
         "margin_ms": {
           "description": "The bounded clock-skew margin the lease and lock machinery assume\n(ms): a grant's holder honours it `margin` less than its owner\nrecords it, and a fence that came `2 × margin` before another\nnode's grant came first.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mirror_final_installed": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mirror_final_mismatch": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mirror_final_sent": {
+          "description": "Plan 43 C7-F F-c: the old root's final lock mirrors sent, and as a\nsuccessor, the fast takeovers whose mirror was the final one of the\nlease replaced (its records installed settled) and those whose\nfinal mirror named another lease.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -4568,6 +4641,20 @@
         "token_rejections_at_write",
         "settle_waits",
         "doubt_lapses",
+        "lapse_parks",
+        "lapse_parks_resumed",
+        "lapse_parks_refused",
+        "lapse_park_gave_up",
+        "lapse_park_ms_max",
+        "lapse_parked_ops",
+        "lapse_park_interrupted",
+        "lapse_park_refused_ring",
+        "lapse_park_refused_pool",
+        "late_admitted",
+        "late_refused",
+        "mirror_final_sent",
+        "mirror_final_installed",
+        "mirror_final_mismatch",
         "requeued_in_place",
         "released_superseded",
         "peers_unreachable",

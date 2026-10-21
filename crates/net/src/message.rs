@@ -642,6 +642,9 @@ pub enum Payload {
         grants: Vec<u8>,
         /// Postcard of every lock floor the holder knows, joined.
         floor: Vec<u8>,
+        /// Plan 43 C7-F F-c (appended): the final mirror of the lease
+        /// `(holder, holder_clock, holder_wait_ms, epoch)` names.
+        final_for: Option<(u64, u64, i64, u64)>,
     },
     /// `getlk`: is a conflicting grant held elsewhere? Answered by
     /// [`Payload::LockTestReply`].
@@ -840,6 +843,8 @@ pub struct LockRenewWire {
     pub ino: u64,
     pub grant: (u64, u64),
     pub exclusive: bool,
+    /// Plan 43 C7-F F-c: a late renewal (appended).
+    pub late: bool,
 }
 
 /// Plan 30 §M14: `constellation_authority::LockRenewResult` on the wire.

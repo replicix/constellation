@@ -243,7 +243,7 @@ impl View {
         // lapse between two.
         if self
             .cluster_locks()
-            .is_some_and(|l| l.owner_fenced(caller.pid, caller.lock_owner))
+            .is_some_and(|l| self.lock_owner_fenced_for(l, caller.pid, caller.lock_owner, None))
         {
             return Err((dst, Code::Io));
         }
@@ -273,7 +273,7 @@ impl View {
                 buf
             }
         };
-        self.lock_discard_tainted(dst);
+        self.lock_discard_tainted_for_write(dst);
         let n = self
             .do_write(dst, pos_out, bytes)
             .map_err(|code| (dst, code))?;

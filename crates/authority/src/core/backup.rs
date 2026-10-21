@@ -1199,6 +1199,14 @@ impl Core {
     /// predecessor's own heartbeat places it on this node's clock
     /// ([`Core::beat_cap`]), which ends the wait earlier when it is.
     pub(crate) fn note_fast_takeover(&mut self, prev: &Lease, cap: Option<WaitMs>) {
+        // Plan 43 C7-F F-c: the lease body replaced, for the old root's
+        // final lock mirror to be recognised (`lock_install_mirror`).
+        self.lk.takeover_prev = Some((
+            prev.holder,
+            prev.holder_clock,
+            prev.holder_wait_ms,
+            prev.epoch,
+        ));
         // Plan 41 L0: a predecessor's generations are outwaited the
         // takeover window longer (`DelegationState::inherit_slack_ms`).
         self.dl.inherit_slack_ms = self.cfg.backup_takeover_ms;

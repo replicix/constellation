@@ -3008,6 +3008,11 @@ impl Core {
                 && p.holder != self.cfg.node_id
         });
         self.dl.inherit_slack_ms = 0;
+        // Plan 43 C7-F F-c: the lease body a fast takeover replaced is this
+        // takeover's alone; a value left by an earlier takeover whose gate
+        // never installed the mirror must not let a later, non-fast one
+        // trust a final mirror (`lock_install_mirror`).
+        self.lk.takeover_prev = None;
         if let Some(p) = prev.as_ref().filter(|_| fast_prev) {
             let cap = self.beat_cap(p);
             self.note_fast_takeover(p, cap);

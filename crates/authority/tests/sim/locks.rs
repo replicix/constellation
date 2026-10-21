@@ -32,7 +32,7 @@ use super::node::NodeHandle;
 use super::run::Cluster;
 use constellation_authority::action::{ControlOk, LockAnswer};
 use constellation_authority::{Control, NodeId};
-use constellation_meta::locks::{LocalLock, LocalOutcome, LockMode};
+use constellation_meta::locks::{Fence, LocalLock, LocalOutcome, LockMode};
 use constellation_meta::{Meta, ReadKey};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::Ordering;
@@ -132,7 +132,23 @@ pub struct LockCounters {
     /// exclusive ones). The ask-again rule's measure: a stale push, an
     /// outwait or a 9.5 s re-send shows here.
     pub max_handoff_gap_ms: u64,
+    /// Plan 43 C7-F F-c: I/O steps (a client's first, or a later one) that
+    /// found their grant lapsing and *parked* (waited for the owner's
+    /// verdict, as the engine's parked ops do) instead of being refused;
+    /// those that resumed (the owner admitted a late renewal), and those
+    /// refused in the end (`EIO`, as a lapse always was). Lock requests
+    /// that waited for a lapsing grant's verdict (`LocalOutcome::Parked`).
+    pub parked_ios: u64,
+    pub resumed_ios: u64,
+    pub park_refused_ios: u64,
+    pub parked_requests: u64,
+    /// The longest park (simulated ms).
+    pub max_park_ms: u64,
 }
+
+/// A park that has not ended within this much simulated time fails the seed:
+/// the engine's bound (`lock_owner_wait_max_ms`) plus slack.
+pub const PARK_CAP_SLACK_MS: u64 = 15_000;
 
 /// See [`LockCounters::overtaken`]: `2 × (ttl + margin)` of the sim's
 /// default lock configuration.
@@ -203,6 +219,10 @@ struct GhostInner {
     /// Per inode, when the last critical section ended `(any, exclusive)`
     /// ([`LockCounters::max_handoff_gap_ms`]).
     section_ends: BTreeMap<u64, (u64, u64)>,
+    /// Plan 43 C7-F F-c: per inode, every grant a client was told of
+    /// `(node, mode, simulated ms)`: what a parked client that resumes is
+    /// checked against (`check_resume`).
+    grants_seen: BTreeMap<u64, Vec<(NodeId, LockMode, u64)>>,
 }
 
 /// The mutual-exclusion ghost and the lock clients' counters.
@@ -580,6 +600,67 @@ impl LockGhost {
         });
     }
 
+    /// A client of `node` was told it holds a grant in `mode` on `ino`.
+    pub fn grant_seen(&self, ino: u64, node: NodeId, mode: LockMode, at_ms: u64) {
+        self.with(|g| {
+            g.grants_seen
+                .entry(ino)
+                .or_default()
+                .push((node, mode, at_ms))
+        });
+    }
+
+    /// Plan 43 C7-F F-c: `thread` on `node` parked at `from_ms` (its grant
+    /// lapsed: it performs no I/O while parked, so it left its critical
+    /// section then) and resumes at `to_ms`, the owner having admitted a late
+    /// renewal of the same grant. Safe only if nobody was granted a
+    /// conflicting lock meanwhile: the property of the model, in the sim's
+    /// terms (a grant another node's client was told of in between, or a
+    /// holder in a conflicting section now).
+    pub fn check_resume(
+        &self,
+        ino: u64,
+        node: NodeId,
+        thread: u64,
+        mode: LockMode,
+        from_ms: u64,
+        to_ms: u64,
+    ) {
+        self.note(
+            to_ms,
+            format!(
+                "node {node} t{thread} resumes {mode:?} on {ino:#x} (parked since t={from_ms})"
+            ),
+        );
+        self.with(|g| {
+            let seed = g.seed;
+            let mut found = Vec::new();
+            if let Some(v) = g.grants_seen.get(&ino) {
+                for (n, m, at) in v {
+                    if *n != node && m.conflicts(mode) && *at > from_ms && *at <= to_ms {
+                        found.push(format!(
+                            "seed {seed}: ino {ino:#x}: node {node} (t{thread}, {mode:?}) resumed at \
+                             t={to_ms} after a late renewal, although node {n} had been granted \
+                             {m:?} at t={at}, inside its park (since t={from_ms})"
+                        ));
+                    }
+                }
+            }
+            if let Some(v) = g.in_io.get(&ino) {
+                for e in v {
+                    if e.node != node && e.mode.conflicts(mode) {
+                        found.push(format!(
+                            "seed {seed}: ino {ino:#x}: node {node} (t{thread}, {mode:?}) resumed at \
+                             t={to_ms} while node {} (t{}, {:?}) is in I/O since t={}",
+                            e.node, e.thread, e.mode, e.since_ms
+                        ));
+                    }
+                }
+            }
+            g.violations.extend(found);
+        });
+    }
+
     pub fn leave(&self, ino: u64, node: NodeId, thread: u64, at_ms: u64, why: &str) {
         self.note(
             at_ms,
@@ -881,6 +962,14 @@ pub async fn client_lock(
         let now = h.clock.now();
         match h.meta.locks().local_set(ino, lock, now) {
             LocalOutcome::Done => break,
+            // Plan 43 C7-F F-c: the grant held is lapsing and its owner has
+            // not said yet: the request waits for the verdict (the engine's
+            // `LocalOutcome::Parked`), it does not ask for a fresh grant.
+            LocalOutcome::Parked => {
+                ghost.count(|c| c.parked_requests += 1);
+                after_grant = false;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
             LocalOutcome::Conflict(_) | LocalOutcome::Predecessor => {
                 ghost.count(|c| c.local_conflicts += 1);
                 after_grant = false;
@@ -957,6 +1046,7 @@ pub async fn client_lock(
                 match answer {
                     Ok(ControlOk::Lock(LockAnswer::Granted { position })) => {
                         ghost.count(|c| c.granted += 1);
+                        ghost.grant_seen(ino, node, mode, clock.elapsed_ms());
                         ghost.note(
                             clock.elapsed_ms(),
                             format!("node {node} t{thread} granted {mode:?} on {ino:#x}"),
@@ -1049,22 +1139,77 @@ pub async fn client_lock(
     let mut entered = false;
     let mut fenced = false;
     let mut wrote = false;
+    // A re-entry after a park does not read the previous holder's turn again.
+    let mut resumed_once = false;
     for _ in 0..step.ios {
-        let Some(h) = same(&cluster, node, inc) else {
-            if entered {
-                ghost.leave(ino, node, thread, clock.elapsed_ms(), "node died");
+        // Plan 43 C7-F F-c: a grant that is lapsing parks the client (it
+        // performs no I/O, so it leaves its critical section at the park's
+        // start) until the owner admits a late renewal (it re-enters, after
+        // the resume check) or refuses it (fenced, as a lapse always was).
+        let mut park_start: Option<u64> = None;
+        let (h, ino_fenced, owner_fenced) = loop {
+            let Some(h) = same(&cluster, node, inc) else {
+                if entered {
+                    ghost.leave(ino, node, thread, clock.elapsed_ms(), "node died");
+                }
+                ghost.count(|c| c.abandoned += 1);
+                return;
+            };
+            let now = h.clock.now();
+            let ino_fence = h.meta.locks().fenced(ino, now);
+            let owner_fenced = h
+                .meta
+                .locks()
+                .fenced_owners(now)
+                .iter()
+                .any(|f| f.owner == thread);
+            let parked = !ignore_fence
+                && !owner_fenced
+                && ino_fence != Fence::Fenced
+                && (ino_fence == Fence::Parked
+                    || h.meta
+                        .locks()
+                        .parked_owners(now)
+                        .iter()
+                        .any(|f| f.owner == thread));
+            if !parked {
+                if let Some(since) = park_start {
+                    let end = clock.elapsed_ms();
+                    ghost.count(|c| c.max_park_ms = c.max_park_ms.max(end - since));
+                    if ino_fence == Fence::Ok && !owner_fenced {
+                        ghost.count(|c| c.resumed_ios += 1);
+                        ghost.check_resume(ino, node, thread, step.mode, since, end);
+                        resumed_once = true;
+                    } else {
+                        ghost.count(|c| c.park_refused_ios += 1);
+                    }
+                }
+                break (h, ino_fence == Fence::Fenced, owner_fenced);
             }
-            ghost.count(|c| c.abandoned += 1);
-            return;
+            let started = *park_start.get_or_insert_with(|| clock.elapsed_ms());
+            if started == clock.elapsed_ms() {
+                ghost.count(|c| c.parked_ios += 1);
+                if entered {
+                    ghost.leave(ino, node, thread, started, "parked");
+                    entered = false;
+                } else {
+                    ghost.note(
+                        started,
+                        format!("node {node} t{thread} parked on {ino:#x} before any I/O"),
+                    );
+                }
+            }
+            let cap = (cluster.env.config)(node, inc).lock_owner_wait_max_ms() + PARK_CAP_SLACK_MS;
+            if clock.elapsed_ms() > started + cap {
+                failures.lock().unwrap().push(format!(
+                    "lock client t{thread} on node {node}: parked on {ino:#x} since t={started} \
+                     past the bound ({cap} ms); held: {:?}",
+                    h.meta.locks().held(ino)
+                ));
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         };
-        let now = h.clock.now();
-        let ino_fenced = h.meta.locks().fenced(ino, now);
-        let owner_fenced = h
-            .meta
-            .locks()
-            .fenced_owners(now)
-            .iter()
-            .any(|f| f.owner == thread);
         if (ino_fenced || owner_fenced) && !ignore_fence {
             ghost.count(|c| {
                 c.fenced_ios += 1;
@@ -1085,7 +1230,7 @@ pub async fn client_lock(
         }
         if !entered {
             ghost.enter(ino, node, thread, step.mode, clock.elapsed_ms());
-            if fresh_grant && !wrote {
+            if fresh_grant && !wrote && !resumed_once {
                 let own_epoch = h.view().s3_held.map(|(e, _, _)| e);
                 ghost.check_visible(ino, node, clock.elapsed_ms(), &h.meta, own_epoch);
                 let data = ghost.data_ino(step.file, ino);
@@ -1161,8 +1306,10 @@ pub async fn client_lock(
                     match tokio::time::timeout(Duration::from_millis(5), &mut rx).await {
                         Ok(r) => break Some(r),
                         Err(_) => {
-                            let lapsed = same(&cluster, node, inc)
-                                .is_none_or(|h| h.meta.locks().fenced(ino, h.clock.now()));
+                            let lapsed = same(&cluster, node, inc).is_none_or(|h| {
+                                h.meta.locks().fenced(ino, h.clock.now())
+                                    != constellation_meta::locks::Fence::Ok
+                            });
                             lapsed_once |= lapsed;
                             if lapsed && entered {
                                 ghost.leave(

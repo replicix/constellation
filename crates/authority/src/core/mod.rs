@@ -366,6 +366,12 @@ pub struct Config {
     /// the owning sequencer. Off: the kernel keeps locks node-local and
     /// nothing here runs.
     pub locks: bool,
+    /// Tests only (the simulator's negative control, never set by the
+    /// daemon): a fast successor trusts any lock mirror like the old root's
+    /// final one — its records settled as sent, its lapsed ones kept —
+    /// which admits a late renewal of a grant the old root had outwaited and
+    /// granted over (`Core::lock_install_mirror`).
+    pub lock_trust_nonfinal_mirror: bool,
     /// `CONSTELLATION_LOCK_TTL_MS` (default 20000): a lock grant's ttl;
     /// the margin is the lease's (`expiry_margin_ms`). Long, because a
     /// holder that stalls past it loses the lock under the application
@@ -567,6 +573,7 @@ impl Config {
             delegation: true,
             delegation_ttl_ms: 5_000,
             locks: true,
+            lock_trust_nonfinal_mirror: false,
             lock_ttl_ms: 20_000,
             lock_cache_idle_ms: 30_000,
             delegation_stream_rows: 256,
@@ -1049,6 +1056,19 @@ pub struct Stats {
     /// F1: recalled grants left to their owner's outwait instead of
     /// released (a mutation tagged with them ended in doubt).
     pub lock_doubt_lapses: u64,
+    // ---- plan 43 C7-F F-c ----
+    /// Owner: late renewals admitted (a settled record, or its lapsed
+    /// memory) and refused (`Lost`: not proven).
+    pub lock_late_admitted: u64,
+    pub lock_late_refused: u64,
+    /// Old root: final mirrors begun (one per lease). Successor: fast
+    /// takeovers whose mirror was the final one of the lease replaced
+    /// (installed settled), and ones whose final mirror named another.
+    pub lock_mirror_final_sent: u64,
+    pub lock_mirror_final_installed: u64,
+    pub lock_mirror_final_mismatch: u64,
+    /// Holder: lapsing grants that gave up at the park's bound.
+    pub lock_lapse_parks_gave_up: u64,
     pub lock_idle_released: u64,
     pub lock_released_replies: u64,
     // ---- M9: backups, seals, `ack=s3` ----
@@ -1344,6 +1364,9 @@ enum Timer {
     /// Plan 43 F-b: the earliest end of a lock grace
     /// (`Core::lock_arm_grace_end`).
     LockGraceEnd,
+    /// Plan 43 C7-F F-c: the final lock mirror is due or re-sent
+    /// (`Core::lock_final_step`).
+    LockFinal,
     LockRenewTimeout(OpId),
     LockTestTimeout(OpId),
     /// M14 phase 2: re-check whether `(ino, grant)`'s release may go
@@ -1396,6 +1419,7 @@ impl Timer {
             Timer::LockReleaseWait(..) => TimerKind::LockReleaseWait,
             Timer::LockWaiterTick => TimerKind::LockWaiterTick,
             Timer::LockGraceEnd => TimerKind::LockGraceEnd,
+            Timer::LockFinal => TimerKind::LockFinal,
             Timer::LockRenewTimeout(_) => TimerKind::LockRenewTimeout,
             Timer::LockTestTimeout(_) => TimerKind::LockTestTimeout,
             Timer::DelegRenew(_) => TimerKind::DelegRenew,
@@ -2229,9 +2253,12 @@ impl Core {
             PeerMsg::LockRenewed { req, results } => {
                 self.on_lock_renewed(now, from, req, results, replica, out)
             }
-            PeerMsg::LockMirror { ver, grants, floor } => {
-                self.on_lock_mirror(from, ver, grants, floor)
-            }
+            PeerMsg::LockMirror {
+                ver,
+                grants,
+                floor,
+                final_for,
+            } => self.on_lock_mirror(from, ver, grants, floor, final_for),
             PeerMsg::LockTest { req, ino, mode } => {
                 self.on_lock_test(now, from, req, ino, mode, replica, out)
             }
@@ -2404,6 +2431,10 @@ impl Core {
             }
             Timer::LockWaiterTick => self.on_lock_waiter_tick(now, replica, out),
             Timer::LockGraceEnd => self.on_lock_grace_end(now, replica, out),
+            Timer::LockFinal => {
+                self.lk.final_timer = None;
+                self.lock_final_step(now, replica, out, true)
+            }
             Timer::LockRenewTimeout(req) => self.on_lock_renew_timeout(req, replica, out),
             Timer::LockTestTimeout(req) => self.on_lock_test_timeout(req, out),
             Timer::DelegStream => self.on_deleg_stream_timer(now, replica, out),

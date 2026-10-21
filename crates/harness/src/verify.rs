@@ -961,6 +961,10 @@ pub struct Evidence {
     /// queue's lock-wait budget was spent; `grace_wait_refused_pool`: no
     /// `lock-wait` thread): none may.
     pub grace_refused: HashMap<String, u64>,
+    /// Per node, the ops parked behind a lapsing lock grant that could not
+    /// be held (`locks.lapse_park_refused_ring`/`_pool`, plan 43 C7-F F-c:
+    /// no ring entry, no thread) and were answered `EIO` at once: none may.
+    pub park_refused: HashMap<String, u64>,
     pub acquire_deadline: Duration,
     /// Allow an `EIO` in doubt past the deadline
     /// (`CONSTELLATION_HARNESS_ALLOW_IN_DOUBT=1`, triage runs only).
@@ -982,6 +986,7 @@ impl Evidence {
         let mut fenced_io = HashMap::new();
         let mut grace_gave_up = HashMap::new();
         let mut grace_refused = HashMap::new();
+        let mut park_refused = HashMap::new();
         for c in clients {
             let status = c.control_status().ok();
             let n = status
@@ -1002,11 +1007,20 @@ impl Evidence {
                 })
                 .unwrap_or(0);
             *grace_refused.entry(c.name.clone()).or_insert(0) += r;
+            let p = status
+                .as_ref()
+                .map(|s| {
+                    s["locks"]["lapse_park_refused_ring"].as_u64().unwrap_or(0)
+                        + s["locks"]["lapse_park_refused_pool"].as_u64().unwrap_or(0)
+                })
+                .unwrap_or(0);
+            *park_refused.entry(c.name.clone()).or_insert(0) += p;
         }
         Evidence {
             fenced_io,
             grace_gave_up,
             grace_refused,
+            park_refused,
             acquire_deadline,
             allow_in_doubt: std::env::var("CONSTELLATION_HARNESS_ALLOW_IN_DOUBT")
                 .is_ok_and(|v| v.trim() == "1"),
@@ -1127,6 +1141,17 @@ impl ErrnoLog {
                  owner's grace and failed EAGAIN as before it existed (the ring queue's \
                  lock-wait budget was spent, or no lock-wait thread could start): \
                  [grace-wait-refused]"
+            ));
+        }
+        let mut parks: Vec<(&String, &u64)> =
+            ev.park_refused.iter().filter(|(_, n)| **n > 0).collect();
+        parks.sort();
+        for (node, n) in parks {
+            *rep.counts.entry("lapse-park-refused").or_insert(0) += *n as usize;
+            rep.bugs.push(format!(
+                "{node}: {n} op(s) parked behind a lapsing lock grant could not be held and \
+                 failed EIO at once (the ring queue's lock-wait budget was spent, or no \
+                 lock-wait thread could start): [lapse-park-refused]"
             ));
         }
         rep
@@ -2795,6 +2820,7 @@ mod tests {
             fenced_io: [("a".to_string(), 1)].into(),
             grace_gave_up: HashMap::new(),
             grace_refused: HashMap::new(),
+            park_refused: HashMap::new(),
             acquire_deadline: Duration::from_secs(120),
             allow_in_doubt: false,
         };
@@ -2828,6 +2854,16 @@ mod tests {
         assert_eq!(rep.counts["grace-wait-refused"], 1);
         assert!(
             rep.bugs.iter().any(|b| b.starts_with("c: 1 non-blocking")),
+            "{:?}",
+            rep.bugs
+        );
+        // And an op parked behind a lapsing grant that could not be held.
+        ev.grace_refused.clear();
+        ev.park_refused.insert("d".to_string(), 3);
+        let rep = log.judge(&ev);
+        assert_eq!(rep.counts["lapse-park-refused"], 3);
+        assert!(
+            rep.bugs.iter().any(|b| b.starts_with("d: 3 op(s) parked")),
             "{:?}",
             rep.bugs
         );

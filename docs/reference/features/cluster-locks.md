@@ -15,6 +15,7 @@ between nodes safely. It is on by default whenever P2P is on.
   - [Grants and local locks](#grants-and-local-locks)
   - [Close and release](#close-and-release)
   - [Leases, renewal and fencing](#leases-renewal-and-fencing)
+  - [A lapsed grant is asked for back](#a-lapsed-grant-is-asked-for-back)
   - [The fencing token](#the-fencing-token)
   - [Conflicts, recalls and blocking waits](#conflicts-recalls-and-blocking-waits)
   - [Waiting for a grace](#waiting-for-a-grace)
@@ -237,8 +238,11 @@ short grant is renewed inside its window too — re-armed whenever a held
 grant's renewal point moves, a late reply's included (sim
 `locks-delegated-production-ttl-heavy` seed 3850: a 2.1 s grant
 extended by the reply to a request its push had answered, with the
-tick still at the 5 s cadence, lapsed under its I/O). A grant is renewed only
-while it is still honoured; a lapsed grant is never renewed. A recalled
+tick still at the 5 s cadence, lapsed under its I/O). A grant is renewed
+while it is still honoured; a lapsed grant is never *reclaimed* (its owner
+cannot tell what it granted since), but one that pins local locks or writes
+is asked for back
+([below](#a-lapsed-grant-is-asked-for-back)). A recalled
 grant is renewed while something still pins it: local locks under it,
 or the one local lock it was granted for and has not served yet. That
 first lock is taken only after the grant's floor is reached (up to the
@@ -414,7 +418,9 @@ either.) The sequencer then outwaits the grant (its own too: the
 record lives until `ttl + margin` from its send, while the lapsed grant
 itself is dropped at the node's first renewal tick after the stall) and
 may give the lock to another node while the application on the first
-node still holds its `flock`. That node is **fenced**:
+node still holds its `flock`. That node is **fenced** — unless the owner can prove nobody else was
+granted the lock since, in which case its I/O only waited
+([below](#a-lapsed-grant-is-asked-for-back)):
 
 - **On the locked file**, `read`, `write`, `flush`, `fsync`, `fallocate`
   and truncating `setattr` fail with `EIO`, for every process on the
@@ -497,6 +503,99 @@ cached pages of the file are dropped with them:
 
 Publishing that data later would overwrite what the next holder wrote
 under its own grant.
+
+### A lapsed grant is asked for back
+
+Plan 43 C7-F F-c. A grant can lapse without anyone having taken its lock:
+the node that sequences it is cut from S3 and cannot renew (it answers a
+renewal only with fresh S3 liveness), and its successor, a backup that seals
+the cut holder at the end of its lease, exists only after the grants it made
+have lapsed (a 20 s lease: the locker's grant lapses about 9.5 s after the
+cut, the successor takes over at about 13.6 s; no owner could honour the grant
+across that gap without breaking the cap on which the successor's grace
+rests). Failing every I/O of the lock's owner with `EIO` from the lapse
+(25 of 50 reads of the harness's in-process locker at the 20 s lease, 175 of
+200 at the 60 s one) is an error caused by a fault, not a fact about the
+lock. So a grant that lapses while it **pins** something — local locks
+under it, or a write made under it that may not be published yet — is
+**lapsing**, not lapsed:
+
+- Nothing is captured or tainted for it. The I/O that would be fenced —
+  on the locked file, the lock owner's ops on any file, the publication
+  points (`close`, `fsync`, a recalled grant's flush), a write's discard of
+  an older taint, and a new lock request on the file — **waits** instead:
+  the op is parked on the engine's `lock-wait` pool (it holds no frontend
+  worker and no ring offload thread; a parked op asked again from the start
+  once the verdict is in: every fence precedes an op's first effect), and
+  answers as if it had been issued then. A signal (FUSE `INTERRUPT`) ends
+  the wait with `EINTR`: the kernel waits uninterruptibly for the answer to
+  a request it sent, so a wait that could not be interrupted would leave its
+  process unkillable for as long as the park lasts. (A caught signal now
+  gives `EINTR` from `read`/`write` during a park instead of `EIO`.)
+- The holder sends a **late renewal** of the same grant, routed like any
+  renewal (the lease is read when the owner is not known), every
+  `lock_poll_ms` (at most a second) until it is answered.
+- The owner **admits** it only where it can prove that no grant conflicting
+  with it was issued since the grant was made, by any owner: a grant it
+  made is *settled* (a mint is made only where no grace, floor or barrier
+  holds the inode, so every grant before it was issued before it; a move
+  keeps what it was), and a settled record stays *provable* as long as it
+  is in the owner's table, expired or not, or — dropped by an outwait, not a
+  release — in a bounded memory of lapsed records, which every change that
+  could let another node act on the inode forgets (a conflicting grant, a
+  newer grant of the same node, the inode leaving the table, a deposition).
+  The model (`crates/model/src/locks.rs`, "Plan 43 C7-F F-c") has the
+  argument and the three naive variants it found violating: a late
+  reclaim of a grant the owner does not know inside a grace (it may have
+  outwaited it and granted another node, which a successor never heard of),
+  a successor that trusts a mirror that is not the old root's last, and a
+  memory not forgotten by a conflicting grant. Anything else is refused
+  (`Lost`), grace or no grace.
+- A successor knows the old root's table only through the asynchronous
+  mirror, which cannot tell it whether it missed a later one. So the old
+  root's last mirror is made exact: when its lease is no longer usable
+  (the end of the window in which it may add a record) it sends its
+  backups its whole table as the **final mirror** of that lease, naming the
+  lease body, re-sends it every backup heartbeat until the lease ends,
+  and adds nothing under that lease from then on (it answers `NotOwner`:
+  no grant, no renewal, no late admission, no move-in; a renewed lease is
+  another body and serves again). A fast successor whose takeover replaced
+  exactly that body installs the records with their flags and keeps the
+  lapsed ones as its memory; any other mirror (no final one, another
+  body, a renewed lease) is installed unsettled as before and a late
+  renewal of its records is refused. A final mirror that arrives after the
+  takeover is ignored.
+- Admitted, the grant is honoured again from the late renewal's send
+  (`sent + ttl − margin`, the usual rule); the parked I/O runs. Refused, the
+  owner is fenced as a lapse always did it, from the end of the grant's
+  window. No answer within `lock_owner_wait_max_ms` of the lapse (112.5 s at
+  the defaults, the bound of every wait across a failover): the same.
+  A late `Ok` after that is ignored for the fence (the owners captured stay
+  fenced) and the grant is released normally. An op in flight when the
+  grant lapsed, which its executor refused as lapsed, is sent again under a
+  fresh token once the grant is honoured again.
+- A recall of a lapsing grant marks it recalled, and it is released after
+  the verdict; a new local lock request on the file waits for the verdict
+  (it must not replace the lapsing grant, which would fence its owners); an
+  unlock is allowed, and the grant stays lapsing while a write under it may
+  be unpublished, else it is dropped. The hint that a write was made under
+  the grant (`written`) stays set until the grant ends, even after a publish:
+  a grant that wrote once is parked for, not dropped, whenever it lapses
+  (a late renewal costs a message, an unneeded drop costs data).
+
+What the application sees: a lock held through an owner's failover costs
+latency, not an error, and no data is discarded — **if** the owner can prove
+nothing was granted over it. It sees `EIO` as before when the owner refuses
+(another node was, or may have been, granted the lock; there is no final
+mirror: `ack=s3` without backups, a TTL takeover, a predecessor that died, a
+mirror that was cut off; the grant was reclaimed in a grace, which is not
+settled), and when nobody answers in time. The same applies to a lapse
+without a failover (a holder or its link stalled past its window): the owner
+still has the record unless it granted the inode to another node since.
+Residuals: a grant reclaimed in a grace that lapses later still fences; a
+lock in a subtree whose delegate's authority lapsed with the root's; and a
+lock whose owner is a successor that did not take over the old root's
+lease (a TTL or released takeover): there is nobody that can prove it.
 
 ### The fencing token
 
@@ -1176,8 +1275,11 @@ owner has replaced it.
 - **TTL takeover** (the holder crashed and had no backup): the new
   holder starts with an empty lock table. Every grant of the old tenure
   was capped by the old lease, so it has already lapsed on its node,
-  which is fenced until its application unlocks and locks again. There
-  is nothing to reclaim.
+  which is fenced until its application unlocks and locks again (its
+  holder asks for the grant back and is refused: the new holder has no
+  table that could prove nothing was granted since, and there is no final
+  mirror of a lease that was never given up). There is nothing to
+  reclaim.
 - **Fast takeover** (a sealed backup, or `ack=s3`; see [Durability and
   failover](durability-and-failover.md)): the new holder waits out a
   grace period before it grants anything new, and accepts renewals of
@@ -1209,8 +1311,17 @@ owner has replaced it.
   is computed with the read delegation TTL alone, so a long lock TTL does
   not stall writes after a takeover. The holder also mirrors its lock
   table to its backups asynchronously (`LockMirror`), and a fast
-  successor installs the last mirror. The mirror is only an availability
-  aid; the grace is what keeps locks exclusive. Until the grace ends, a
+  successor installs the last mirror. For new grants and reclaims the
+  mirror is only an availability aid; the grace is what keeps locks
+  exclusive. What the mirror adds, when it is the old holder's **final**
+  one (sent when its lease stopped being usable, naming that lease body,
+  and the takeover replaced exactly that body), is *proof*: the old holder
+  added nothing under that lease afterwards, so a grant of its table that
+  lapsed is asked for back by its holder and admitted without having been
+  granted over ([A lapsed grant is asked for
+  back](#a-lapsed-grant-is-asked-for-back)); from any other mirror the
+  successor installs the records as before and refuses such a late
+  renewal. Until the grace ends, a
   non-blocking request for a lock nothing conflicts with waits for it
   (see [Waiting for a grace](#waiting-for-a-grace)) instead of failing
   `EAGAIN`; a blocking one is parked, and served at the grace's end.
@@ -1610,7 +1721,17 @@ for both roles:
   `tagged_ops` (mutations that carried a fencing token),
   `release_waits` (releases held back for one) and `predecessor_waits`
   (lock requests of new local turns held back for an earlier turn's
-  close publication or mutation in doubt, once per request);
+  close publication or mutation in doubt, once per request),
+  and, plan 43 C7-F F-c, `lapse_parks` (grants whose window ended while
+  they pinned local locks or writes: the I/O they fence waited),
+  `lapse_parks_resumed` (the owner admitted a late renewal: nothing was
+  lost), `lapse_parks_refused` (the owner refused: `EIO` as before),
+  `lapse_park_gave_up` (no verdict within `lock_owner_wait_max_ms`),
+  `lapse_park_ms_max` (the longest park), `lapse_parked_ops` (ops that
+  waited), `lapse_park_interrupted` (ended by their caller's signal,
+  `EINTR`), `lapse_park_refused_ring` and `lapse_park_refused_pool` (ops
+  that could not be held, for want of a ring queue entry or a thread, and
+  failed `EIO` at once; 0 in every load campaign);
 - sequencer side: `grants_table`, `grants_made`, `recalls_sent`,
   `recalls_released`, `recalls_expired`, `reclaimed`, `waiters_parked`,
   `grace_refusals`, `grace_wait_answers`, `not_yet_answers` and
@@ -1634,7 +1755,12 @@ for both roles:
   another op of the node), `cancels_sent` (node side: `LockCancel`s sent),
   `cancelled` (owner side: waiters a cancel dropped),
   `requests_in_flight`, `waiters`, `recalls_in_flight`,
-  `token_rejections` (operations refused for a dead fencing token).
+  `token_rejections` (operations refused for a dead fencing token),
+  `late_admitted` and `late_refused` (late renewals admitted, and
+  refused as unproven), `mirror_final_sent` (final mirrors this node began
+  as an old root) and `mirror_final_installed` / `mirror_final_mismatch`
+  (as a successor: fast takeovers whose mirror was the final one of the
+  lease replaced, and ones whose final mirror named another lease).
 
 These counters are not exported to `/metrics` or shown in the web UI.
 
@@ -1642,9 +1768,19 @@ These counters are not exported to `/metrics` or shown in the web UI.
 
 ### I/O fails with `EIO` on a locked file, or on any file while a lock is held
 
-The node's grant lapsed: `fenced_io` rises on the locked file,
-`owner_fenced_ops` on the lock owner's operations elsewhere, and `lost`
-counts the grants. An operation that was already on its way when the
+The node's grant lapsed and its owner did not give it back: `fenced_io`
+rises on the locked file, `owner_fenced_ops` on the lock owner's
+operations elsewhere, and `lost` counts the grants. Since plan 43 C7-F
+F-c a lapse alone is no longer this: while the owner has not answered the
+holder's late renewal (`lapse_parks` rises, then `lapse_parks_resumed`)
+the I/O only waits, and it fails `EIO` when the owner refused
+(`lapse_parks_refused`: another node may have been granted the lock, or the
+owner cannot prove otherwise, e.g. after a TTL takeover or with no final
+mirror) or when no verdict came within `lock_owner_wait_max_ms`
+(`lapse_park_gave_up`). An op that waits for a verdict for seconds is a
+`lapse_park_ms_max` of that length; a process stuck in `read` or `write`
+on a locked file during a failover is parked, not hung (a signal ends it
+with `EINTR`). An operation that was already on its way when the
 grant lapsed is refused by its sequencer instead: `token_rejections`
 rises there, and the daemon logs "the lock grant it was issued under is
 no longer live". The usual cause is a stall of the node, or a

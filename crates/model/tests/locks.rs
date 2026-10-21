@@ -39,6 +39,27 @@ fn run_within(label: &str, model: &LockModel, cap: (usize, Duration)) -> impl Ch
     checker
 }
 
+/// As `run_within`, depth-first: exhaustive too, with a stack for a
+/// frontier instead of a queue of whole states (a breadth-first run of
+/// the F-c configurations holds tens of gigabytes), but counterexamples
+/// are not shortest.
+fn run_within_dfs(
+    label: &str,
+    model: &LockModel,
+    cap: (usize, Duration),
+) -> impl Checker<LockModel> {
+    let started = Instant::now();
+    let checker = model
+        .clone()
+        .checker()
+        .target_state_count(cap.0)
+        .timeout(cap.1)
+        .spawn_dfs()
+        .join();
+    report(label, &checker, started);
+    checker
+}
+
 fn run_dfs(label: &str, model: &LockModel) -> impl Checker<LockModel> {
     let started = Instant::now();
     let checker = model
@@ -110,6 +131,30 @@ fn assert_clean_within(
     cap: (usize, Duration),
 ) {
     let checker = run_within(label, model, cap);
+    check_clean(label, model, sometimes, cap, checker);
+}
+
+fn assert_clean_dfs(label: &str, model: &LockModel, sometimes: &[&'static str]) {
+    assert_clean_dfs_within(label, model, sometimes, CAP);
+}
+
+fn assert_clean_dfs_within(
+    label: &str,
+    model: &LockModel,
+    sometimes: &[&'static str],
+    cap: (usize, Duration),
+) {
+    let checker = run_within_dfs(label, model, cap);
+    check_clean(label, model, sometimes, cap, checker);
+}
+
+fn check_clean(
+    label: &str,
+    _model: &LockModel,
+    sometimes: &[&'static str],
+    cap: (usize, Duration),
+    checker: impl Checker<LockModel>,
+) {
     assert!(
         checker.is_done() && checker.state_count() < cap.0,
         "{label}: expected exhaustive exploration within budget"
@@ -1317,6 +1362,303 @@ fn deep_fast_takeover_under_drift() {
     };
     let checker = run("deep", &m);
     assert!(checker.discovery("mutual_exclusion").is_none());
+}
+
+// ---- plan 43 C7-F F-c: a lapsed grant is asked for back ----
+
+/// Node 1 locks and does I/O twice (its grant can lapse between them);
+/// node 2 contends at the same owner.
+fn late_scripts() -> Vec<Vec<Op>> {
+    vec![vec![], vec![Lock(X), Io, Io], vec![Lock(X), Io]]
+}
+
+/// The clean base: a lapse at a live owner, no failover.
+fn late_lone(scripts: Vec<Vec<Op>>) -> LockModel {
+    LockModel {
+        late_reclaim: true,
+        lease_ttl: 8,
+        lock_ttl: 3,
+        max_drops: 1,
+        max_tick: 8,
+        ..LockModel::design(scripts)
+    }
+}
+
+#[test]
+fn late_reclaim_at_a_live_owner_is_clean() {
+    assert_clean_dfs(
+        "late-lone",
+        &late_lone(late_scripts()),
+        &["late_admitted", "late_io", "late_refused"],
+    );
+}
+
+/// Node 1 locks and does I/O; node 2 (the backup) only asks for the lock:
+/// what matters is whether it is *issued*.
+fn late_issuers() -> Vec<Vec<Op>> {
+    vec![vec![], vec![Lock(X), Io], vec![Lock(X)]]
+}
+
+/// A fast takeover of the root whose table the successor takes from the
+/// old root's final mirror: the lapsed grant is admitted there.
+fn late_failover(max_tick: u8, max_drops: u8) -> LockModel {
+    LockModel {
+        late_reclaim: true,
+        backup: 2,
+        replicate: true,
+        grace: true,
+        lease_ttl: 5,
+        lock_ttl: 3,
+        max_drops,
+        max_tick,
+        max_renews: 0,
+        ..LockModel::design(late_issuers())
+    }
+}
+
+#[test]
+fn late_reclaim_across_a_fast_takeover_is_clean() {
+    assert_clean_dfs(
+        "late-failover",
+        &late_failover(5, 0),
+        &[
+            "final_sent",
+            "final_installed",
+            "late_at_successor",
+            "late_io",
+        ],
+    );
+}
+
+// The three naive variants, each found violating (the first is the
+// counterexample the model recorded before F-c: "a late reclaim of a lapsed
+// grant during a successor's grace": the old owner had outwaited the grant
+// and granted another node, which the successor does not know).
+
+/// (a) A late renewal of a grant the successor does not know is answered by
+/// the grace's reclaim: node 1's grant lapsed and was outwaited at the old
+/// root, which granted node 2 (the backup) before the takeover; the
+/// successor has no table, reclaims node 1's grant, and node 1's I/O lands
+/// after node 2's grant was issued.
+#[test]
+fn a_late_reclaim_of_an_unknown_grant_in_a_grace_violates() {
+    let m = LockModel {
+        late_reclaim: true,
+        late_admit_unknown: true,
+        backup: 2,
+        replicate: false,
+        grace: true,
+        lease_ttl: 6,
+        lock_ttl: 3,
+        max_drops: 0,
+        max_tick: 6,
+        max_renews: 0,
+        ..LockModel::design(vec![vec![], vec![Lock(X), Io], vec![Lock(X)]])
+    };
+    assert_violates_soon("late-unknown-in-grace", &m);
+}
+
+/// The same under the design: the unknown grant is refused (`Lost`), clean.
+#[test]
+fn a_late_renewal_of_an_unknown_grant_is_refused_even_in_a_grace() {
+    let m = LockModel {
+        late_admit_unknown: false,
+        ..LockModel {
+            late_reclaim: true,
+            backup: 2,
+            replicate: false,
+            grace: true,
+            lease_ttl: 5,
+            lock_ttl: 3,
+            max_drops: 0,
+            max_tick: 5,
+            max_renews: 0,
+            ..LockModel::design(vec![vec![], vec![Lock(X), Io], vec![Lock(X)]])
+        }
+    };
+    assert_clean_dfs("late-unknown-refused", &m, &["late_refused"]);
+}
+
+/// (b) The successor trusts a mirror that is not the old root's final one.
+/// As a trace (the checker's search for it exceeds the budget): the backup
+/// (node 2) holds the mirror that shows node 1's settled grant; the old
+/// root (node 0) outwaits that grant and grants node 2, its later mirrors
+/// still in flight when node 2 takes the lease over. Returns the state after
+/// node 1's late renewal was answered.
+fn late_after_a_stale_mirror(naive: bool) -> (LockModel, State) {
+    let m = LockModel {
+        late_reclaim: true,
+        late_admit_nonfinal: naive,
+        backup: 2,
+        replicate: true,
+        grace: true,
+        lease_ttl: 6,
+        lock_ttl: 3,
+        max_drops: 0,
+        max_tick: 6,
+        max_renews: 0,
+        ..LockModel::design(vec![vec![], vec![Lock(X), Io], vec![Lock(X)]])
+    };
+    let mut s = m.init_states().remove(0);
+    s = step(&m, &s, Action::Start(1));
+    s = deliver(&m, &s, |x| matches!(x, Msg::LockReq { .. }));
+    s = deliver(&m, &s, |x| matches!(x, Msg::LockReply { .. }));
+    // The first mirror (node 1's grant), the only one that arrives.
+    s = deliver(&m, &s, |x| matches!(x, Msg::Mirror { ver: 1, .. }));
+    for _ in 0..4 {
+        s = step(&m, &s, Action::Tick);
+    }
+    // Node 1's window ended at 2; the owner's record, at 4, is outwaited.
+    s = step(&m, &s, Action::Expire(0));
+    s = step(&m, &s, Action::Probe(0));
+    s = step(&m, &s, Action::Start(2));
+    s = deliver(&m, &s, |x| matches!(x, Msg::LockReq { .. }));
+    s = deliver(&m, &s, |x| matches!(x, Msg::LockReply { .. }));
+    assert_eq!(s.issued.len(), 2, "node 2 was granted");
+    s = step(&m, &s, Action::Takeover(2));
+    s = step(&m, &s, Action::LateRenew(1));
+    s = deliver(&m, &s, |x| matches!(x, Msg::Renew { .. }));
+    s = deliver(&m, &s, |x| matches!(x, Msg::RenewAck { .. }));
+    (m, s)
+}
+
+#[test]
+fn trusting_a_non_final_mirror_violates() {
+    let (m, mut s) = late_after_a_stale_mirror(true);
+    assert!(s.nodes[1].cache.is_some(), "the late renewal was admitted");
+    s = step(&m, &s, Action::Start(1));
+    println!(
+        "non-final mirror: mutual exclusion violated: {:?}",
+        s.violation
+    );
+    assert!(s.violation.is_some(), "node 1 acted after node 2's grant");
+}
+
+/// The design: the stale mirror's record is unsettled at the successor, so
+/// the late renewal is refused and node 1 never acts.
+#[test]
+fn a_late_renewal_after_a_non_final_mirror_is_refused() {
+    let (m, s) = late_after_a_stale_mirror(false);
+    assert!(s.nodes[1].cache.is_none(), "refused: Lost");
+    let mut enabled = Vec::new();
+    m.actions(&s, &mut enabled);
+    assert!(
+        !enabled.contains(&Action::Start(1)),
+        "node 1 has no grant to do I/O under"
+    );
+    assert!(s.violation.is_none());
+}
+
+/// (c) The lapsed memory is not superseded by a conflicting grant: node 1's
+/// lapsed grant is remembered, node 2 is granted over it, and node 1's late
+/// renewal is admitted beside node 2's live grant.
+#[test]
+fn a_lapsed_memory_not_superseded_by_a_conflicting_grant_violates() {
+    let m = LockModel {
+        late_lapsed_unsuperseded: true,
+        ..late_lone(vec![vec![], vec![Lock(X), Io], vec![Lock(X)]])
+    };
+    assert_violates("late-unsuperseded", &m);
+}
+
+/// The late action composes with the rest of the design: a lost message
+/// between the old root and its backup (the successor falls back to the
+/// unsettled mirror), a TTL takeover (nothing carries over), and the
+/// delegation moves (which hand settled records over in one piece).
+/// 195M states (49M unique), about 2 minutes in release: run nightly.
+#[test]
+#[ignore]
+fn late_reclaim_with_a_lost_mirror_is_clean() {
+    assert_clean_dfs_within(
+        "late-failover-drop",
+        &late_failover(5, 1),
+        &["late_refused"],
+        (200_000_000, Duration::from_secs(400)),
+    );
+}
+
+#[test]
+fn late_reclaim_across_a_ttl_takeover_is_clean() {
+    let m = LockModel {
+        late_reclaim: true,
+        ttl_takeover: true,
+        lease_ttl: 3,
+        lock_ttl: 6,
+        max_drops: 0,
+        max_tick: 7,
+        max_renews: 0,
+        ..LockModel::design(contend())
+    };
+    assert_clean_dfs("late-ttl-takeover", &m, &["ttl_takeover"]);
+}
+
+#[test]
+fn late_reclaim_across_delegation_moves_is_clean() {
+    let m = LockModel {
+        late_reclaim: true,
+        delegate: 2,
+        max_moves: 1,
+        max_drops: 0,
+        max_tick: 5,
+        max_renews: 0,
+        ..LockModel::design(late_issuers())
+    };
+    assert_clean_dfs("late-moves", &m, &["moved"]);
+}
+
+/// Plan 43 C7a × C7-F F-c (review): the late reclaim across a fast takeover
+/// on the split clocks, the old root's oscillator slow by a quarter within
+/// the budget (its honour reading of its lease, the final mirror's moment,
+/// and its table's wait reading drift apart; the key the successor compares
+/// is the lease's wait-clock end, `Reg::expires_w`): clean, and the final
+/// mirror is still sent, installed and the late I/O witnessed.
+#[test]
+fn late_reclaim_across_a_fast_takeover_is_clean_on_rated_split_clocks() {
+    let m = LockModel {
+        rate_period: 4,
+        max_rate: 1,
+        init_rates: Some(vec![-1, 0, 0]),
+        rate_budget: 1,
+        clock_split: true,
+        ..late_failover(5, 0)
+    };
+    assert_clean_dfs(
+        "late-failover-rated",
+        &m,
+        &["final_sent", "final_installed", "late_io"],
+    );
+}
+
+/// The same with the locker stepped back once on the split clocks (its
+/// honour reading ignores it): clean.
+#[test]
+fn late_reclaim_at_a_live_owner_is_clean_with_a_locker_step_on_split_clocks() {
+    let m = LockModel {
+        clock_split: true,
+        max_offset: 1,
+        max_jumps: 1,
+        step_node: Some(1),
+        step_dir: -1,
+        max_drops: 0,
+        ..late_lone(late_scripts())
+    };
+    assert_clean_dfs("late-lone-step", &m, &["late_admitted", "late_io"]);
+}
+
+/// The base without any of them, the same scripts: clean, and the late
+/// renewal is witnessed admitted (the saw-bits: non-vacuity).
+#[test]
+fn the_lapsed_memory_is_superseded_by_a_conflicting_grant() {
+    assert_clean_dfs(
+        "late-superseded",
+        &late_lone(vec![vec![], vec![Lock(X), Io], vec![Lock(X)]]),
+        &[
+            "late_admitted",
+            "late_from_lapsed",
+            "late_io",
+            "late_refused",
+        ],
+    );
 }
 
 #[test]

@@ -7,7 +7,7 @@ use super::durable_ack_tests::holder_fs;
 use super::*;
 use constellation_authority::HonourMs;
 use constellation_fs_core::types::ROOT_INO;
-use constellation_meta::locks::{GrantId, HeldGrant, LockMode};
+use constellation_meta::locks::{Fence, GrantId, HeldGrant, LockMode};
 use constellation_vfs::{
     Blocking, Fh, LockKind, LockOwner, LockRange, LockSpec, LockStatus, Name, OpCtx, OpKind,
     OpenOwner, Opened, RenameFlags, Vfs, VfsResult, WriteData,
@@ -195,6 +195,8 @@ impl Fenced {
                 first_use: false,
                 idle_since: None,
                 installed: now,
+                lapsing: None,
+                written: false,
             },
         );
         // Through the view, as FUSE asks: `pid` is the locking thread.
@@ -260,7 +262,7 @@ fn a_lapsed_owner_is_fenced_on_every_file_and_others_are_not() {
 
     // The grant is lost (a stall past the ttl: the owner outwaited it).
     let id = f.meta.locks().held(turn.attr.ino).unwrap().id;
-    assert!(f.meta.locks().lost(turn.attr.ino, id));
+    assert!(f.meta.locks().lost(turn.attr.ino, id, crate::locks::now()));
 
     // The committer's writes and namespace ops on *other* files: EIO.
     assert_eq!(
@@ -388,7 +390,7 @@ fn a_lock_taken_by_a_non_main_thread_fences_its_whole_process_and_children() {
     assert_eq!(l.pid, me, "the lock names the locker's process");
     assert!(l.pid_start > 0, "and its start time");
     let id = f.meta.locks().held(turn.attr.ino).unwrap().id;
-    assert!(f.meta.locks().lost(turn.attr.ino, id));
+    assert!(f.meta.locks().lost(turn.attr.ino, id, crate::locks::now()));
 
     for (who, pid) in [
         ("the locking thread", locker),
@@ -448,7 +450,7 @@ fn a_recycled_pid_is_not_taken_for_the_fenced_owner() {
         constellation_meta::locks::LocalOutcome::Done
     );
     let id = t.held(turn.attr.ino).unwrap().id;
-    assert!(t.lost(turn.attr.ino, id));
+    assert!(t.lost(turn.attr.ino, id, crate::locks::now()));
     let caller = Caller::new(0, 0, Some(pid));
     assert_eq!(t.fenced_owners(crate::locks::now()).len(), 1);
     f.mkdir(&caller, "not-fenced").unwrap();
@@ -487,7 +489,7 @@ fn a_fenced_owners_fsync_reports_a_pending_discard_once() {
     // Data of `obj` was thrown away under an earlier lapse.
     f.meta.locks().note_discard(obj.attr.ino);
     let id = f.meta.locks().held(turn.attr.ino).unwrap().id;
-    assert!(f.meta.locks().lost(turn.attr.ino, id));
+    assert!(f.meta.locks().lost(turn.attr.ino, id, crate::locks::now()));
 
     assert_eq!(fsync(&committer, mine.fh), Err(Code::Io), "fenced");
     f.unlock(&committer, turn.attr.ino).unwrap();
@@ -820,7 +822,11 @@ fn an_op_that_passed_the_fence_then_stalled_past_its_grant_is_refused() {
     f.lock(turn.attr.ino, me, crate::locks::now().honour.plus(300));
     let locks = f.fs.cluster_locks().unwrap().clone();
     let _scope = locks.tag_scope(Some(me), None);
-    assert!(!locks.owner_fenced(Some(me), None), "the fence passes");
+    assert_eq!(
+        locks.owner_fenced(Some(me), None),
+        Fence::Ok,
+        "the fence passes"
+    );
     let tag = crate::locks::current_tag().unwrap();
     assert_eq!(tag.0.len(), 1);
     // The stall: the grant's window ends before the op executes.
@@ -859,13 +865,14 @@ fn a_held_grant_stepped_back_stays_fenced_on_time() {
     let (turn, _) = f.create(&Caller::root(), ROOT_INO, "turn.lock").unwrap();
     f.lock(turn.attr.ino, me, crate::locks::now().honour.plus(300));
     let locks = f.fs.cluster_locks().unwrap().clone();
-    assert!(!locks.fenced(turn.attr.ino));
+    assert_eq!(locks.fenced(turn.attr.ino), Fence::Ok);
     crate::locks::step_test_wall(-3_000);
     crate::locks::advance_test_clock(250);
-    assert!(!locks.fenced(turn.attr.ino), "inside the window");
+    assert_eq!(locks.fenced(turn.attr.ino), Fence::Ok, "inside the window");
     crate::locks::advance_test_clock(100);
-    assert!(
+    assert_eq!(
         locks.fenced(turn.attr.ino),
+        Fence::Fenced,
         "honoured past its honour end because the wall clock stepped back"
     );
     // A forward step ends a window at once.
@@ -873,9 +880,9 @@ fn a_held_grant_stepped_back_stays_fenced_on_time() {
     let (turn, _) = f.create(&Caller::root(), ROOT_INO, "turn2.lock").unwrap();
     f.lock(turn.attr.ino, me, crate::locks::now().honour.plus(60_000));
     let locks = f.fs.cluster_locks().unwrap().clone();
-    assert!(!locks.fenced(turn.attr.ino));
+    assert_eq!(locks.fenced(turn.attr.ino), Fence::Ok);
     crate::locks::step_test_wall(61_000);
-    assert!(locks.fenced(turn.attr.ino));
+    assert_eq!(locks.fenced(turn.attr.ino), Fence::Fenced);
 }
 
 #[test]
@@ -1200,6 +1207,8 @@ fn releasing_a_handle_drops_the_locks_taken_through_it() {
             first_use: false,
             idle_since: None,
             installed: crate::locks::now().honour,
+            lapsing: None,
+            written: false,
         },
     );
     // Two descriptions, each its own owner (the kernel names an OFD
@@ -1270,6 +1279,8 @@ fn a_late_release_spares_a_reused_owners_new_lock() {
             first_use: false,
             idle_since: None,
             installed: crate::locks::now().honour,
+            lapsing: None,
+            written: false,
         },
     );
     let lock = |fh: Fh| {
@@ -1344,6 +1355,8 @@ fn two_descriptions(f: &Fenced, caller: &Caller, name: &str) -> (Ino, Fh, Fh) {
             first_use: false,
             idle_since: None,
             installed: crate::locks::now().honour,
+            lapsing: None,
+            written: false,
         },
     );
     (ino, a.fh, b.fh)
@@ -2249,7 +2262,7 @@ fn a_grant_lapsing_between_a_copys_steps_ends_it_short() {
     let id = f.meta.locks().held(locked.attr.ino).unwrap().id;
     let (meta, ino) = (f.meta.clone(), locked.attr.ino);
     let hook = super::vfs_tests::BetweenSteps::set(move |_| {
-        assert!(meta.locks().lost(ino, id));
+        assert!(meta.locks().lost(ino, id, crate::locks::now()));
     });
     assert_eq!(copy(&other, locked.attr.ino, lo.fh).unwrap(), 10);
     drop(hook);
@@ -2276,7 +2289,7 @@ fn a_grant_lapsing_between_a_copys_steps_ends_it_short() {
     let id = f.meta.locks().held(turn.attr.ino).unwrap().id;
     let (meta, ino) = (f.meta.clone(), turn.attr.ino);
     let hook = super::vfs_tests::BetweenSteps::set(move |_| {
-        assert!(meta.locks().lost(ino, id));
+        assert!(meta.locks().lost(ino, id, crate::locks::now()));
     });
     let n = Blocking::run(|r| {
         f.fs.copy_file_range(
@@ -2379,6 +2392,8 @@ fn script_core_waits(f: &mut Fenced, ino: Ino, script: Vec<Scripted>) -> Seen {
                             first_use: false,
                             idle_since: None,
                             installed: now,
+                            lapsing: None,
+                            written: false,
                         },
                     );
                     constellation_authority::LockAnswer::Granted {
@@ -2838,4 +2853,300 @@ fn a_run_of_polling_hints_backs_off_and_a_graces_remainder_is_followed() {
     // too, never lengthened past what the run had.
     let mut poll = None;
     assert_eq!(locks.next_wait(&mut poll, ms(20)), ms(20));
+}
+
+// ---- plan 43 C7-F F-c: a lapsed lock owner's I/O waits for its grant's
+// verdict, without holding the calling thread ----
+
+/// What a read answered, and on which thread.
+struct ReadReports(
+    std::sync::mpsc::Sender<ReadAnswer>,
+    Option<(
+        constellation_vfs::CancelToken,
+        Arc<std::sync::atomic::AtomicUsize>,
+    )>,
+    bool,
+);
+
+impl constellation_vfs::Responder<constellation_vfs::ReadData> for ReadReports {
+    fn done(self, result: VfsResult<constellation_vfs::ReadData>) {
+        let _ = self.0.send((
+            result.map(|d| d.segments().concat()).map_err(|e| e.code()),
+            std::thread::current().name().map(String::from),
+        ));
+    }
+
+    fn begin_wait(&mut self) -> constellation_vfs::WaitStart {
+        if self.2 {
+            return constellation_vfs::WaitStart::Refused;
+        }
+        match &self.1 {
+            Some((token, n)) => {
+                n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                constellation_vfs::WaitStart::Held(Some(token.clone()))
+            }
+            None => constellation_vfs::WaitStart::Held(None),
+        }
+    }
+}
+
+type ReadAnswer = (Result<Vec<u8>, Code>, Option<String>);
+
+/// A view bound to its engine's completion machinery (`View::bind`), a
+/// file `obj` with six bytes in it, and the committer's lock on `turn.lock`
+/// under a grant honoured for `window_ms`; the table parks lapses.
+struct Parking {
+    fs: Arc<View>,
+    meta: Arc<Meta>,
+    committer: Caller,
+    turn: Ino,
+    obj: Ino,
+    fh: Fh,
+    _keep: (
+        tempfile::TempDir,
+        tokio::sync::mpsc::UnboundedReceiver<SyncRequest>,
+        tokio::sync::mpsc::UnboundedReceiver<SyncRequest>,
+    ),
+}
+
+fn parking(window_ms: u64) -> Parking {
+    parking_with(window_ms, true)
+}
+
+fn parking_with(window_ms: u64, deferrable: bool) -> Parking {
+    let mut f = fenced_fs();
+    if !deferrable {
+        f.fs.caps.deferrable = constellation_vfs::OpKindSet::EMPTY;
+    }
+    f.meta.locks().set_lapse_park_ms(60_000);
+    let me = std::process::id();
+    let root = Caller::root();
+    let (turn, _) = f.create(&root, ROOT_INO, "turn.lock").unwrap();
+    let (obj, oo) = f.create(&root, ROOT_INO, "obj").unwrap();
+    let committer = Caller::new(0, 0, Some(me));
+    f.write(&OpCtx::new(OpKind::Write, &committer), obj.attr.ino, oo.fh)
+        .unwrap();
+    f.lock(
+        turn.attr.ino,
+        me,
+        crate::locks::now().honour.plus(window_ms),
+    );
+    let Fenced {
+        fs,
+        meta,
+        _dir,
+        _core,
+        _locks_core,
+    } = f;
+    let fs = Arc::new(fs);
+    fs.bind();
+    Parking {
+        fs,
+        meta,
+        committer,
+        turn: turn.attr.ino,
+        obj: obj.attr.ino,
+        fh: oo.fh,
+        _keep: (_dir, _core, _locks_core),
+    }
+}
+
+impl Parking {
+    /// A read of `obj` by the committer; the answer comes through the channel.
+    fn read(
+        &self,
+        reg: Option<(
+            constellation_vfs::CancelToken,
+            Arc<std::sync::atomic::AtomicUsize>,
+        )>,
+        refuse: bool,
+    ) -> std::sync::mpsc::Receiver<ReadAnswer> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cx = OpCtx::new(OpKind::Read, &self.committer);
+        self.fs
+            .read(&cx, self.obj, self.fh, 0, 6, ReadReports(tx, reg, refuse));
+        rx
+    }
+
+    /// The owner admits a late renewal of the committer's grant.
+    fn resume(&self) {
+        let id = self.meta.locks().held(self.turn).unwrap().id;
+        let now = crate::locks::now();
+        self.meta.locks().renewed(
+            self.turn,
+            id,
+            id,
+            LockMode::Exclusive,
+            now.honour,
+            60_000,
+            1_000,
+            false,
+            now,
+        );
+    }
+
+    fn lapse(&self) {
+        // The window (a few hundred ms) ends.
+        let until = self.meta.locks().held(self.turn).unwrap().until;
+        while crate::locks::now().honour < until {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
+/// The fix's end to end through the `Vfs` trait. The committer's grant
+/// lapsed with its `flock` held: its read does not fail `EIO` (as it did) and
+/// does not hold the calling thread — the call returns at once — it is
+/// answered, from the `lock-wait` pool, once the owner has admitted the late
+/// renewal, with the data; nothing was captured or tainted meanwhile.
+#[test]
+fn a_lapsed_owners_read_waits_for_the_verdict_and_runs_after_the_admission() {
+    let p = parking(300);
+    p.lapse();
+    let rx = p.read(None, false);
+    let first = rx.recv_timeout(SECOND / 5);
+    assert!(
+        first.is_err(),
+        "the call returned and the read is parked, not answered (before F-c: EIO at once): {first:?}"
+    );
+    let s = p.meta.locks().stats();
+    assert_eq!((s.lapse_parks, s.lapse_parked_ops, s.fenced_io), (1, 1, 0));
+    assert!(p.meta.locks().fenced_owners(crate::locks::now()).is_empty());
+    p.resume();
+    let (result, thread, _) = rx
+        .recv_timeout(5 * SECOND)
+        .map(|(a, b)| (a, b, ()))
+        .expect("answered");
+    assert_eq!(result, Ok(b"object".to_vec()));
+    assert_eq!(thread.as_deref(), Some("lock-wait"));
+    let s = p.meta.locks().stats();
+    assert_eq!((s.lapse_parks_resumed, s.lapse_parks_refused), (1, 0));
+    // No grant is lapsing now: the next read is inline, one relaxed load.
+    assert!(!p.meta.locks().lapsing_any());
+    let rx = p.read(None, false);
+    assert_eq!(rx.try_recv().expect("inline").0, Ok(b"object".to_vec()));
+}
+
+/// The owner refused: the parked read fails `EIO` as before — from the
+/// moment the refusal arrives, and the owner is fenced since the lapse.
+#[test]
+fn a_parked_read_fails_eio_when_the_owner_refuses() {
+    let p = parking(300);
+    p.lapse();
+    let rx = p.read(None, false);
+    assert!(rx.recv_timeout(SECOND / 5).is_err());
+    let id = p.meta.locks().held(p.turn).unwrap().id;
+    assert!(p.meta.locks().lost(p.turn, id, crate::locks::now()));
+    let (result, _) = rx.recv_timeout(5 * SECOND).expect("answered");
+    assert_eq!(result, Err(Code::Io));
+    assert_eq!(p.meta.locks().stats().lapse_parks_refused, 1);
+}
+
+/// A signal ends the op's park, `EINTR` (a FUSE request cannot be left to
+/// the kernel's uninterruptible wait for up to the park's bound); the
+/// grant's park goes on for the others.
+#[test]
+fn a_signal_ends_a_parked_read_with_eintr_and_the_park_goes_on() {
+    let p = parking(300);
+    p.lapse();
+    let token = constellation_vfs::CancelToken::new();
+    let registered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rx = p.read(Some((token.clone(), registered.clone())), false);
+    assert_eq!(registered.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(rx.recv_timeout(SECOND / 5).is_err());
+    token.cancel();
+    let (result, _) = rx.recv_timeout(5 * SECOND).expect("answered");
+    assert_eq!(result, Err(Code::Intr));
+    assert_eq!(p.meta.locks().stats().lapse_park_interrupted, 1);
+    assert!(p.meta.locks().lapsing(p.turn), "the grant's park goes on");
+    // Another reader is still parked, and resumes.
+    let other = p.read(None, false);
+    assert!(other.recv_timeout(SECOND / 5).is_err());
+    p.resume();
+    assert_eq!(
+        other.recv_timeout(5 * SECOND).expect("answered").0,
+        Ok(b"object".to_vec())
+    );
+}
+
+/// A frontend that cannot hold one more waiting request (a ring queue's
+/// lock-wait budget is spent): `EIO` at once, counted apart, as before F-c;
+/// and no pool thread: the same.
+#[test]
+fn a_park_the_frontend_or_the_pool_cannot_hold_is_eio_at_once_and_counted() {
+    let p = parking(300);
+    p.lapse();
+    let rx = p.read(None, true);
+    assert_eq!(rx.try_recv().expect("answered at once").0, Err(Code::Io));
+    assert_eq!(p.meta.locks().stats().lapse_park_refused_ring, 1);
+    let locks = p.fs.cluster_locks().expect("cluster locks").clone();
+    locks.waits.fail_spawn(true);
+    let rx = p.read(None, false);
+    assert_eq!(rx.try_recv().expect("answered at once").0, Err(Code::Io));
+    assert_eq!(p.meta.locks().stats().lapse_park_refused_pool, 1);
+}
+
+/// A write parks too, its data copied then (never on the hot path), and
+/// lands after the admission.
+#[test]
+fn a_parked_write_lands_after_the_admission() {
+    let p = parking(300);
+    p.lapse();
+    let (tx, rx) = std::sync::mpsc::channel();
+    struct W(std::sync::mpsc::Sender<Result<u32, Code>>);
+    impl constellation_vfs::Responder<u32> for W {
+        fn done(self, r: VfsResult<u32>) {
+            let _ = self.0.send(r.map_err(|e| e.code()));
+        }
+    }
+    let data = b"rewritten".to_vec();
+    p.fs.write(
+        &OpCtx::new(OpKind::Write, &p.committer),
+        p.obj,
+        p.fh,
+        0,
+        WriteData::Borrowed(&data),
+        OpenFlags::WRITE,
+        W(tx),
+    );
+    drop(data);
+    assert!(rx.recv_timeout(SECOND / 5).is_err(), "parked");
+    p.resume();
+    assert_eq!(rx.recv_timeout(5 * SECOND).unwrap(), Ok(9));
+    let got = p.read(None, false).recv_timeout(5 * SECOND).unwrap().0;
+    assert_eq!(got, Ok(b"rewrit".to_vec()));
+}
+
+/// A frontend that cannot answer from another thread waits in the call, as
+/// F-b's lock waits do: the read is answered on the calling thread, once the
+/// verdict is in (here from another thread, 150 ms after the call began).
+#[test]
+fn a_frontend_that_cannot_defer_waits_in_the_call_for_the_verdict() {
+    let p = parking_with(300, false);
+    p.lapse();
+    let meta = p.meta.clone();
+    let turn = p.turn;
+    let renewer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let id = meta.locks().held(turn).unwrap().id;
+        let now = crate::locks::now();
+        meta.locks().renewed(
+            turn,
+            id,
+            id,
+            LockMode::Exclusive,
+            now.honour,
+            60_000,
+            1_000,
+            false,
+            now,
+        );
+    });
+    let started = std::time::Instant::now();
+    let rx = p.read(None, false);
+    let (result, thread) = rx.try_recv().expect("answered before the call returned");
+    assert_eq!(result, Ok(b"object".to_vec()));
+    assert_ne!(thread.as_deref(), Some("lock-wait"));
+    assert!(started.elapsed() >= std::time::Duration::from_millis(100));
+    renewer.join().unwrap();
 }

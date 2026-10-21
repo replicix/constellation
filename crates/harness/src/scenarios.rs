@@ -1361,7 +1361,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "lock-holder-partitioned",
-        desc: "plan 30 M14: B holds LOCK_EX and is cut from the owner: its writes under the lock get EIO once its grant lapses; C, waiting, is granted only after the owner outwaited B's grant (ttl + margin) and never before B was fenced; after the heal B locks again",
+        desc: "plan 30 M14: B holds LOCK_EX and is cut from the owner: its write under the lock waits once its grant lapses (plan 43 F-c); C, waiting, is granted only after the owner outwaited B's grant (ttl + margin), while B's write still waits and none of B's writes is acknowledged after it; after the heal B's late renewal is refused and the write answers EIO; B locks again",
         requires: &[],
         caps: &[Cap::ClusterLocks],
         run: m14::lock_holder_partitioned,
@@ -1424,14 +1424,14 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "fence-token-at-write",
-        desc: "load campaign 5.3 (F1): on a lone node, a rename under a flock'ed grant passes its token check, waits 10 s for the store's writer lock while the daemon is frozen past the grant's window, and must answer EIO (the token is checked again at the write); the next holder's ref is what the file holds, also after a remount; fsck is clean",
+        desc: "load campaign 5.3 (F1): on a lone node, a rename under a flock'ed grant passes its token check, waits 10 s for the store's writer lock while the daemon is frozen past the grant's window, and must not land under the ended grant: EIO, or (plan 43 F-c) OK from a fresh token after the node's own late renewal was admitted (counted in the status); the next holder's ref is what the file holds, also after a remount; fsck is clean",
         requires: &[],
         caps: &[Cap::ClusterLocks],
         run: m14::fence_token_at_write,
     },
     Scenario {
         name: "lock-lapse-lone-node",
-        desc: "plan 30 M14: a lone node (write-back) frozen past a lock grant's window while the lock's owner process has fsynced one write under it and left a second dirty, and creates, links, symlinks and renames from other threads: every op answers OK or EIO and the tree holds exactly what answered OK, the write and the close after the lapse answer EIO, the file holds exactly the fsynced write (the dirty one is discarded), the fence lifts with the lock; after a remount the tree, the file and every fsync-acknowledged write are there; fsck is clean",
+        desc: "plan 30 M14: a lone node (write-back) frozen past a lock grant's window while the lock's owner process has fsynced one write under it and left a second dirty, and creates, links, symlinks and renames from other threads: every op answers OK or EIO and the tree holds exactly what answered OK, the write and the close after the lapse answer OK (plan 43 F-c: the node asks itself for its grant back and the I/O it held up runs: no op EIO, the file holds the writes in order, parks resumed, nothing fenced); after a remount the tree, the file and every fsync-acknowledged write are there; fsck is clean",
         requires: &[],
         caps: &[Cap::ClusterLocks],
         run: m14::lock_lapse_lone_node,

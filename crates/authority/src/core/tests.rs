@@ -11641,6 +11641,7 @@ mod locks {
                         ino,
                         grant,
                         mode: X,
+                        late: false,
                     }],
                 },
             });
@@ -11684,6 +11685,7 @@ mod locks {
             recalled: false,
             gen: 7,
             confirmed_ms: constellation_meta::locks::Grant::MINTED,
+            settled: false,
         };
         // The delegate's batch with the unlink row (index 1), carrying
         // `leaving`.
@@ -12012,6 +12014,7 @@ mod locks {
                     ino: f,
                     grant: id,
                     mode: X,
+                    late: false,
                 }],
             },
         });
@@ -12160,6 +12163,7 @@ mod locks {
                 recalled: false,
                 gen: 0,
                 confirmed_ms: constellation_meta::locks::Grant::UNCONFIRMED,
+                settled: false,
             };
         let live = grant(1, 4, f, h.now.0 + 5_000);
         h.meta.locks().install(live);
@@ -12256,6 +12260,8 @@ mod locks {
             recalled: false,
             gen: 7,
             confirmed_ms: constellation_meta::locks::Grant::UNCONFIRMED,
+            settled: false,
+            lapsed: false,
         };
         h.step(Event::Peer {
             from: 3,
@@ -12331,6 +12337,8 @@ mod locks {
             recalled: false,
             gen: 7,
             confirmed_ms: constellation_meta::locks::Grant::UNCONFIRMED,
+            settled: false,
+            lapsed: false,
         };
         h.step(Event::Peer {
             from: 3,
@@ -14001,6 +14009,7 @@ mod locks {
                         ino,
                         grant: g2,
                         mode: X,
+                        late: false,
                     }],
                 },
             });
@@ -14083,6 +14092,7 @@ mod locks {
                     ino,
                     grant,
                     mode: X,
+                    late: false,
                 }],
             },
         })
@@ -14467,6 +14477,7 @@ mod locks {
                 ver: 1,
                 grants: Vec::new(),
                 floor: mirrored,
+                final_for: None,
             },
         });
         h2.hold(2, None);
@@ -16009,6 +16020,7 @@ mod locks {
                     ino,
                     grant: g2,
                     mode: S,
+                    late: false,
                 }],
             },
         });
@@ -17145,6 +17157,7 @@ mod locks {
                     ino,
                     grant: g2,
                     mode: X,
+                    late: false,
                 }],
             },
         });
@@ -17185,6 +17198,7 @@ mod locks {
                     ino,
                     grant: ghost,
                     mode: S,
+                    late: false,
                 }],
             },
         });
@@ -17210,6 +17224,7 @@ mod locks {
                     ino: ino2,
                     grant: ghost,
                     mode: X,
+                    late: false,
                 }],
             },
         });
@@ -17353,6 +17368,7 @@ mod locks {
                     ino,
                     grant: g2,
                     mode: X,
+                    late: false,
                 }],
             },
         });
@@ -17377,6 +17393,7 @@ mod locks {
                     ino: ino2,
                     grant: ghost,
                     mode: S,
+                    late: false,
                 }],
             },
         });
@@ -18166,6 +18183,7 @@ mod locks {
                             ino: f,
                             grant: GrantId { node: 3, seq: 1 },
                             mode: X,
+                            late: false,
                         }],
                     },
                 });
@@ -19358,6 +19376,7 @@ mod locks {
             recalled: false,
             gen: 0,
             confirmed_ms: constellation_meta::locks::Grant::UNCONFIRMED,
+            settled: false,
         });
         assert!(h.core.lock_duty_live(h.clk(), &h.meta));
         h.core.lock_on_delegated(7, &h.meta);
@@ -20330,6 +20349,7 @@ mod locks {
                     ino: peer_ino,
                     grant: peer_grant,
                     mode: X,
+                    late: false,
                 }],
             },
         });
@@ -20377,6 +20397,7 @@ mod locks {
                         ino: peer_ino,
                         grant: peer_grant,
                         mode: X,
+                        late: false,
                     }],
                 },
             });
@@ -21512,6 +21533,7 @@ mod locks {
                     ino,
                     grant: g2,
                     mode: X,
+                    late: false,
                 }],
             },
         });
@@ -22302,6 +22324,7 @@ mod locks {
                     ino: peer_ino,
                     grant: peer_grant,
                     mode: X,
+                    late: false,
                 }],
             },
         });
@@ -22484,8 +22507,11 @@ mod locks {
                     recalled: false,
                     gen: 0,
                     confirmed_ms: constellation_meta::locks::Grant::MINTED,
+                    settled: false,
+                    lapsed: false,
                 }],
                 floor: Position::ZERO,
+                final_for: None,
             },
         });
         // Node 1 dies; node 4 takes over after the window.
@@ -22516,6 +22542,7 @@ mod locks {
                     ino,
                     grant: g2,
                     mode: X,
+                    late: false,
                 }],
             },
         });
@@ -22559,7 +22586,6 @@ mod locks {
     /// is lost, or reclaimed in its own mode during a grace.
     #[test]
     fn a_renewal_is_never_answered_with_a_weaker_record() {
-        use constellation_meta::locks::Grant;
         for same_id in [false, true] {
             let (mut h, ino) = holder_with_file();
             let held = GrantId { node: 1, seq: 8 };
@@ -22569,7 +22595,7 @@ mod locks {
                 GrantId { node: 1, seq: 5 }
             };
             let install_stale = |h: &Harness| {
-                h.meta.locks().install(Grant {
+                h.meta.locks().install(constellation_meta::locks::Grant {
                     id: stale,
                     node: 2,
                     ino,
@@ -22578,6 +22604,7 @@ mod locks {
                     recalled: false,
                     gen: 0,
                     confirmed_ms: h.now.0,
+                    settled: false,
                 })
             };
             install_stale(&h);
@@ -22590,6 +22617,7 @@ mod locks {
                             ino,
                             grant: held,
                             mode: X,
+                            late: false,
                         }],
                     },
                 });
@@ -22834,6 +22862,7 @@ mod locks {
                     ino,
                     grant,
                     mode: X,
+                    late: false,
                 }],
             },
         })
@@ -23600,6 +23629,7 @@ mod locks {
                     ino: f,
                     grant: g,
                     mode: X,
+                    late: false,
                 }],
             },
         });
@@ -23644,6 +23674,8 @@ mod locks {
                 recalled: false,
                 gen: 7,
                 confirmed_ms: constellation_meta::locks::Grant::UNCONFIRMED,
+                settled: false,
+                lapsed: false,
             }],
             carry: carry.map(|l| (id, l)).into_iter().collect(),
             floor: Position::ZERO,
@@ -23667,6 +23699,7 @@ mod locks {
             recalled: false,
             gen: 0,
             confirmed_ms: constellation_meta::locks::Grant::UNCONFIRMED,
+            settled: false,
         });
         let g = GrantId { node: 3, seq: 9 };
         let back = handback_of(g, f, r.now.0 + 500, Some(500));
@@ -23785,6 +23818,7 @@ mod locks {
                     ino: df,
                     grant: g,
                     mode: X,
+                    late: false,
                 }],
             },
         });
@@ -24145,6 +24179,498 @@ mod locks {
             h.meta.load_lock_quarantine(restarted),
             Some(WaitMs(9 + left))
         );
+    }
+
+    // ---- plan 43 C7-F F-c: a lapsed grant is asked for back ----
+
+    /// What the owner answered the renewal of `grant` with.
+    fn renew_result(out: &[Action]) -> LockRenewResult {
+        let [(_, PeerMsg::LockRenewed { results, .. })] = sends(out).as_slice() else {
+            panic!("expected one LockRenewed: {out:?}")
+        };
+        results[0].2
+    }
+
+    fn renew_from(
+        h: &mut Harness,
+        from: NodeId,
+        req: u64,
+        ino: Ino,
+        grant: GrantId,
+        late: bool,
+    ) -> LockRenewResult {
+        let out = h.step(Event::Peer {
+            from,
+            msg: PeerMsg::LockRenew {
+                req: OpId(req),
+                entries: vec![LockRenewEntry {
+                    ino,
+                    grant,
+                    mode: X,
+                    late,
+                }],
+            },
+        });
+        renew_result(&out)
+    }
+
+    /// A holder (node 1) whose lease is long, with node 2's exclusive
+    /// grant `g2` made and its record's end long past.
+    fn lapsed_grant_of_node_2() -> (Harness, Ino, GrantId) {
+        let (mut h, ino) = holder_with_file();
+        h.set_lease_end(Ms(h.now.0 + 1_000_000));
+        let out = request(&mut h, 2, 7, ino, X, false);
+        let (g2, ttl) = granted(&lock_replies(&out)[0].2);
+        h.advance(ttl + h.core.lock_margin_ms() as u64 + 500);
+        (h, ino, g2)
+    }
+
+    /// The grant's record is still in the owner's table, expired and not
+    /// dropped: a late renewal extends it (settled: a mint). Before F-c a
+    /// holder never sent one: it dropped the lapsed grant at its tick.
+    #[test]
+    fn a_late_renewal_of_a_settled_record_still_in_the_table_is_admitted() {
+        let (mut h, ino, g2) = lapsed_grant_of_node_2();
+        let r = renew_from(&mut h, 2, 20, ino, g2, true);
+        assert!(
+            matches!(r, LockRenewResult::Ok { id, .. } if id == g2),
+            "{r:?}"
+        );
+        assert_eq!(h.core.stats.lock_late_admitted, 1);
+        assert_eq!(h.core.stats.lock_late_refused, 0);
+    }
+
+    /// Dropped by an outwait (another node's request found it expired) and
+    /// nothing granted since: the memory admits it, the record is live
+    /// again — and another node's request is recalled against it.
+    #[test]
+    fn a_late_renewal_of_a_record_dropped_by_an_outwait_is_admitted_from_its_memory() {
+        let (mut h, ino, g2) = lapsed_grant_of_node_2();
+        h.meta.locks().conflicting(ino, 3, X, h.clk().wait);
+        assert!(h.meta.locks().get(g2).is_none() && h.meta.locks().lapsed_len() == 1);
+        let r = renew_from(&mut h, 2, 20, ino, g2, true);
+        assert!(
+            matches!(r, LockRenewResult::Ok { id, .. } if id == g2),
+            "{r:?}"
+        );
+        assert!(h
+            .meta
+            .locks()
+            .get(g2)
+            .is_some_and(|g| g.until > h.clk().wait));
+        let out = request(&mut h, 3, 21, ino, X, true);
+        assert_eq!(recalls(&out).len(), 1, "node 2 holds it again: {out:?}");
+    }
+
+    /// Granted to another node since: the memory is superseded, the late
+    /// renewal is refused (`Lost`), however it asks. (The parent refuses this
+    /// too: it never admitted a late one.)
+    #[test]
+    fn a_late_renewal_after_a_conflicting_grant_is_refused() {
+        let (mut h, ino, g2) = lapsed_grant_of_node_2();
+        let out = request(&mut h, 3, 21, ino, X, false);
+        let (g3, _) = granted(&lock_replies(&out)[0].2);
+        assert!(matches!(
+            renew_from(&mut h, 2, 20, ino, g2, true),
+            LockRenewResult::Lost
+        ));
+        assert_eq!(h.core.stats.lock_late_refused, 1);
+        assert!(h.meta.locks().get(g3).is_some(), "node 3's grant untouched");
+    }
+
+    /// The owner re-affirmed the grant under a new id while it was live (a
+    /// second request of the node); the holder, which adopted the new id by a
+    /// recall, asks late for the old one: it is the new one's renewal, `Ok`
+    /// under the new id. (A grant made afresh after the old one was
+    /// outwaited is not: `a_late_renewal_after_a_conflicting_grant_is_refused`
+    /// for another node's, the meta test for the same node's.)
+    #[test]
+    fn a_late_renewal_of_an_id_the_owner_replaced_while_it_was_live_is_the_new_ones() {
+        let (mut h, ino) = holder_with_file();
+        h.set_lease_end(Ms(h.now.0 + 1_000_000));
+        let out = request(&mut h, 2, 7, ino, X, false);
+        let (g2, ttl) = granted(&lock_replies(&out)[0].2);
+        h.advance(100);
+        let out = request(&mut h, 2, 8, ino, X, false);
+        let (g2b, _) = granted(&lock_replies(&out)[0].2);
+        assert_ne!(g2, g2b, "re-affirmed under a new id");
+        h.advance(ttl + h.core.lock_margin_ms() as u64 + 500);
+        let r = renew_from(&mut h, 2, 20, ino, g2, true);
+        assert!(
+            matches!(r, LockRenewResult::Ok { id, .. } if id == g2b),
+            "{r:?}"
+        );
+    }
+
+    /// The model's counterexample: a late renewal of a grant this owner does
+    /// not know inside a grace is **not** a reclaim (the old owner may have
+    /// outwaited it and granted another node, which this one never heard of):
+    /// `Lost`. An ordinary renewal of the same grant still is one (the
+    /// holder honoured it throughout, which is what the grace is for).
+    #[test]
+    fn a_late_renewal_of_an_unknown_grant_inside_a_grace_is_refused() {
+        let (mut h, ino) = holder_with_file();
+        h.set_lease_end(Ms(h.now.0 + 1_000_000));
+        let until = h.clk().wait.plus(30_000);
+        h.core.lk.grace.push((ROOT_INO, until));
+        let unknown = GrantId { node: 7, seq: 5 };
+        assert!(matches!(
+            renew_from(&mut h, 2, 20, ino, unknown, true),
+            LockRenewResult::Lost
+        ));
+        assert!(h.meta.locks().get(unknown).is_none());
+        assert!(matches!(
+            renew_from(&mut h, 2, 21, ino, unknown, false),
+            LockRenewResult::Ok { .. }
+        ));
+        assert_eq!(h.core.stats.lock_reclaimed, 1);
+        // The reclaimed record is not settled: nothing proves what was
+        // granted between it and the grace.
+        assert!(!h.meta.locks().get(unknown).unwrap().settled);
+    }
+
+    /// The successor of a fast takeover: a mirror is installed settled only
+    /// if it is the old root's final one of the very lease this takeover
+    /// replaced (the key matches); any other keeps its records unsettled and
+    /// drops its lapsed ones, so a late renewal of either is refused.
+    #[test]
+    fn a_successor_trusts_only_the_final_mirror_of_the_lease_it_replaced() {
+        let key = (1, 1, 9_999, 1);
+        let wire = |seq: u64, node: u64, lapsed: bool| constellation_meta::locks::GrantWire {
+            id: GrantId { node: 1, seq },
+            node,
+            ino: 0,
+            mode: X,
+            until_ms: 0,
+            recalled: false,
+            gen: 0,
+            confirmed_ms: constellation_meta::locks::Grant::MINTED,
+            settled: true,
+            lapsed,
+        };
+        for (label, final_for, prev, trusted) in [
+            (
+                "the final mirror of the replaced lease",
+                Some(key),
+                Some(key),
+                true,
+            ),
+            (
+                "a final mirror of another lease body",
+                Some((1, 1, 9_000, 1)),
+                Some(key),
+                false,
+            ),
+            ("a mirror that is not final", None, Some(key), false),
+        ] {
+            let mut h = Harness::new(2);
+            let op = h.create("f");
+            constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+            let MutateOp::Create { ino, .. } = op else {
+                unreachable!()
+            };
+            h.core.lease.cached_holder = Some(1);
+            let mut live = wire(1, 3, false);
+            let mut gone = wire(2, 4, true);
+            live.ino = ino;
+            gone.ino = ino + 1;
+            h.step(Event::Peer {
+                from: 1,
+                msg: PeerMsg::LockMirror {
+                    ver: 1,
+                    grants: vec![live, gone],
+                    floor: Position::ZERO,
+                    final_for,
+                },
+            });
+            h.hold(2, None);
+            h.core.lk.takeover_prev = prev;
+            let now = h.clk();
+            h.core.lock_install_mirror(now, &h.meta);
+            let g = h.meta.locks().get(live.id).expect("installed");
+            assert_eq!(g.settled, trusted, "{label}");
+            assert_eq!(h.meta.locks().lapsed_len(), usize::from(trusted), "{label}");
+            assert_eq!(
+                h.core.stats.lock_mirror_final_installed,
+                u64::from(trusted),
+                "{label}"
+            );
+            assert_eq!(
+                h.core.stats.lock_mirror_final_mismatch,
+                u64::from(final_for.is_some() && !trusted),
+                "{label}"
+            );
+        }
+    }
+
+    /// A late renewal at that successor: admitted for a record or a memory
+    /// of the final mirror, refused for one of a mirror that was not final.
+    #[test]
+    fn a_late_renewal_at_a_successor_follows_its_mirror() {
+        let key = (1, 1, 9_999, 1);
+        for (final_for, expect_ok) in [(Some(key), true), (None, false)] {
+            let mut h = Harness::new(2);
+            let op = h.create("f");
+            constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+            let MutateOp::Create { ino, .. } = op else {
+                unreachable!()
+            };
+            h.core.lease.cached_holder = Some(1);
+            let id = GrantId { node: 1, seq: 4 };
+            let wire = constellation_meta::locks::GrantWire {
+                id,
+                node: 3,
+                ino,
+                mode: X,
+                until_ms: 0,
+                recalled: false,
+                gen: 0,
+                confirmed_ms: constellation_meta::locks::Grant::MINTED,
+                settled: true,
+                lapsed: final_for.is_some(),
+            };
+            h.step(Event::Peer {
+                from: 1,
+                msg: PeerMsg::LockMirror {
+                    ver: 1,
+                    grants: vec![wire],
+                    floor: Position::ZERO,
+                    final_for,
+                },
+            });
+            h.hold(2, None);
+            h.set_lease_end(Ms(h.now.0 + 1_000_000));
+            h.core.lk.takeover_prev = Some(key);
+            let now = h.clk();
+            h.core.lock_install_mirror(now, &h.meta);
+            let r = renew_from(&mut h, 3, 30, ino, id, true);
+            assert_eq!(
+                matches!(r, LockRenewResult::Ok { .. }),
+                expect_ok,
+                "{final_for:?}: {r:?}"
+            );
+        }
+    }
+
+    /// The old root's last word: when its lease is no longer usable it sends
+    /// its backups its whole table as the final mirror of that lease (a timer
+    /// at the usable end brings it about), names the lease, and adds nothing
+    /// under it from then on; it is re-sent each heartbeat until the lease
+    /// ends.
+    #[test]
+    fn the_old_root_sends_a_final_mirror_at_its_usable_end_and_adds_nothing_after() {
+        let (mut h, ino) = holder_with_file();
+        {
+            let lease = &mut h.core.lease.held.as_mut().unwrap().0;
+            lease.backups = vec![2];
+            lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+        }
+        let key = h.core.lock_lease_key().expect("holds its lease");
+        let g3 = h
+            .meta
+            .locks()
+            .grant(1, 3, ino, X, h.clk().wait.plus(20_000), 0);
+        let finals = |out: &[Action]| -> Vec<(
+            NodeId,
+            Vec<constellation_meta::locks::GrantWire>,
+            Option<crate::event::LeaseKey>,
+        )> {
+            sends(out)
+                .into_iter()
+                .filter_map(|(to, m)| match m {
+                    PeerMsg::LockMirror {
+                        grants, final_for, ..
+                    } if final_for.is_some() => Some((to, grants.clone(), *final_for)),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Any event: the timer at the usable end is armed by it.
+        let out = request(&mut h, 4, 7, ino, S, false);
+        assert!(finals(&out).is_empty(), "not yet: the lease is usable");
+        let tick = timers(&out, TimerKind::LockFinal);
+        assert_eq!(tick.len(), 1, "a timer at the usable end: {out:?}");
+        let at = h.core.timer_ms(tick[0]).unwrap();
+        // The usable end: the lease's end less the expiry margin.
+        assert_eq!(at.0, h.now.0 + 10_000 - h.core.cfg.expiry_margin_ms as i64);
+        h.now = at;
+        let out_final = h.step(Event::Timer { id: tick[0] });
+        let sent = finals(&out_final);
+        let [(2, grants, Some(k))] = sent.as_slice() else {
+            panic!("expected one final mirror to the backup: {out_final:?}")
+        };
+        assert_eq!(*k, key);
+        assert!(
+            grants.iter().any(|w| w.id == g3 && w.settled && !w.lapsed),
+            "{grants:?}"
+        );
+        assert_eq!(h.core.stats.lock_mirror_final_sent, 1);
+        assert!(h.core.lock_final_blocks());
+        // Nothing is added under the lease any more: no grant is made here
+        // (the route is not this node's), and a late renewal is refused.
+        let out = request(&mut h, 4, 8, ino, S, false);
+        assert!(
+            !lock_replies(&out)
+                .iter()
+                .any(|(_, _, o)| matches!(o, LockOutcome::Granted { .. })),
+            "{out:?}"
+        );
+        assert!(!matches!(
+            renew_from(&mut h, 3, 9, ino, g3, true),
+            LockRenewResult::Ok { .. }
+        ));
+        // Re-sent at the backup heartbeat, the same version.
+        let resend = timers(&out_final, TimerKind::LockFinal);
+        assert_eq!(resend.len(), 1, "{out_final:?}");
+        h.now = h.core.timer_ms(resend[0]).unwrap();
+        let again = h.step(Event::Timer { id: resend[0] });
+        assert_eq!(finals(&again).len(), 1, "{again:?}");
+        assert_eq!(h.core.stats.lock_mirror_final_sent, 1, "one begun, re-sent");
+    }
+
+    /// The holder side. A grant whose window ended while a local lock is
+    /// under it is *lapsing*: the tick sends a late renewal (not a plain one,
+    /// not at the lapse's drop as before), the fence waits — nothing is
+    /// captured or tainted — and the owner's `Ok` resumes it.
+    #[test]
+    fn a_lapsed_grant_under_a_local_lock_asks_for_a_late_renewal_and_resumes() {
+        let mut r = requester();
+        let sent = r.honour();
+        let req = lock_control(&mut r, 50, 42, true);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: grant_msg(1),
+            },
+        });
+        assert!(matches!(lock_answer(&out, 50), LockAnswer::Granted { .. }));
+        let tick = timer_of(&out, TimerKind::LockRenewTick);
+        let ll = LocalLock {
+            owner: 9,
+            pid: 0,
+            pid_start: 0,
+            write: true,
+            start: 0,
+            end: u64::MAX,
+        };
+        assert_eq!(
+            r.meta.locks().local_set(42, ll, r.clk()),
+            constellation_meta::locks::LocalOutcome::Done
+        );
+        // The window ended at `sent + 4000` (ttl 5000, margin 1000).
+        r.now = Ms(sent.plus(4_100).0);
+        let out = r.step(Event::Timer { id: tick });
+        let late: Vec<_> = sends(&out)
+            .into_iter()
+            .filter_map(|(to, m)| match m {
+                PeerMsg::LockRenew { req, entries } if to == 1 => Some((*req, entries.clone())),
+                _ => None,
+            })
+            .collect();
+        let [(req, entries)] = late.as_slice() else {
+            panic!("expected one renewal to the owner: {out:?}")
+        };
+        assert!(entries.iter().all(|e| e.late), "{entries:?}");
+        assert_eq!(
+            r.meta.locks().fenced(42, r.clk()),
+            constellation_meta::locks::Fence::Parked
+        );
+        assert!(r.meta.locks().fenced_owners(r.clk()).is_empty());
+        // The owner admits it.
+        let sent_at = r.honour();
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockRenewed {
+                req: *req,
+                results: vec![(
+                    42,
+                    GrantId { node: 1, seq: 1 },
+                    LockRenewResult::Ok {
+                        ttl_ms: 5_000,
+                        recalled: false,
+                        id: GrantId { node: 1, seq: 1 },
+                        mode: X,
+                    },
+                )],
+            },
+        });
+        let _ = out;
+        let held = r.meta.locks().held(42).unwrap();
+        assert!(held.lapsing.is_none());
+        assert!(held.until > sent_at, "honoured again");
+        assert_eq!(
+            r.meta.locks().fenced(42, r.clk()),
+            constellation_meta::locks::Fence::Ok
+        );
+        assert_eq!(r.meta.locks().stats().lapse_parks_resumed, 1);
+    }
+
+    /// The same, refused (`Lost`): fenced as a lapse always was, from the
+    /// lapse; and no verdict within `lock_owner_wait_max_ms`: the same, counted.
+    #[test]
+    fn a_refused_or_unanswered_late_renewal_fences_as_before() {
+        for refused in [true, false] {
+            let mut r = requester();
+            let sent = r.honour();
+            let req = lock_control(&mut r, 50, 42, true);
+            let out = r.step(Event::Peer {
+                from: 1,
+                msg: PeerMsg::LockReply {
+                    req,
+                    outcome: grant_msg(1),
+                },
+            });
+            let tick = timer_of(&out, TimerKind::LockRenewTick);
+            let ll = LocalLock {
+                owner: 9,
+                pid: 0,
+                pid_start: 0,
+                write: true,
+                start: 0,
+                end: u64::MAX,
+            };
+            r.meta.locks().local_set(42, ll, r.clk());
+            r.now = Ms(sent.plus(4_100).0);
+            let out = r.step(Event::Timer { id: tick });
+            let req = sends(&out)
+                .into_iter()
+                .find_map(|(_, m)| match m {
+                    PeerMsg::LockRenew { req, .. } => Some(*req),
+                    _ => None,
+                })
+                .expect("a late renewal");
+            if refused {
+                r.step(Event::Peer {
+                    from: 1,
+                    msg: PeerMsg::LockRenewed {
+                        req,
+                        results: vec![(42, GrantId { node: 1, seq: 1 }, LockRenewResult::Lost)],
+                    },
+                });
+                assert_eq!(r.meta.locks().stats().lapse_parks_refused, 1);
+            } else {
+                // Past the bound, the tick gives up.
+                let bound = r.core.cfg.lock_owner_wait_max_ms();
+                r.now = Ms(r.now.0 + bound as i64 + 1);
+                let mut tick = timers(&out, TimerKind::LockRenewTick);
+                let id = tick.pop().expect("re-armed");
+                r.step(Event::Timer { id });
+                assert_eq!(r.meta.locks().stats().lapse_park_gave_up, 1);
+            }
+            assert_eq!(
+                r.meta.locks().fenced(42, r.clk()),
+                constellation_meta::locks::Fence::Fenced
+            );
+            let since: Vec<i64> = r
+                .meta
+                .locks()
+                .fenced_owners(r.clk())
+                .iter()
+                .map(|f| f.since.0)
+                .collect();
+            assert_eq!(since, vec![sent.0 + 4_000], "refused: {refused}");
+        }
     }
 }
 
@@ -27940,6 +28466,8 @@ fn a_root_change_mid_stream_drops_the_old_rounds_answers() {
                 recalled: false,
                 gen: 0,
                 confirmed_ms: constellation_meta::locks::Grant::MINTED,
+                settled: false,
+                lapsed: false,
             }],
             lock_grace_ms: 0,
             lock_floor: Default::default(),

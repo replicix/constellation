@@ -39,6 +39,20 @@ use constellation_types::Rdev;
 /// always has, and the handle is carried for the handle table a session
 /// handover exports (plan 31 §6.11).
 pub trait Vfs: Send + Sync + 'static {
+    /// Whether an op of this view may have to *park* (plan 43 C7-F F-c): a
+    /// lock owner's I/O waits, without holding the frontend's thread, for
+    /// the verdict on its lapsed grant, and then runs again from the start.
+    /// A frontend asks once per op (in the engine: one relaxed load while the
+    /// node holds no lock, a wait-clock read and three loads while it does;
+    /// `true` only near a held grant's end or while one is lapsing) and, when
+    /// it is `true`, wraps the op's responder so that `begin_wait` can
+    /// register the wait for the caller's signal and count it
+    /// ([`Responder::begin_wait`]); a responder it did not wrap parks
+    /// uninterruptibly (up to the bound). `false` by default.
+    fn parking(&self) -> bool {
+        false
+    }
+
     /// Who this view is, for the frontend's metrics and tracing spans
     /// ([`crate::Observer`]): its number and its allowlisted metric
     /// label. Anonymous by default (a mock, a test double).

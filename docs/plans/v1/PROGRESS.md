@@ -54454,3 +54454,260 @@ On the build box (release, `-j 4`, `TMPDIR` on tmpfs):
 - `--test sim`: 208 passed, 12 ignored. `cargo fmt --all -- --check` and
   `cargo clippy -p constellation-authority --all-targets -- -D warnings`
   clean.
+
+## Fix: a lapsed lock holder parks instead of failing (plan 43 C7-F F-c)
+
+A lock grant whose owner cannot renew it across a failover lapses on its
+holder: the old root is cut from S3 and answers a renewal only with fresh S3
+liveness, and its successor exists only at the old lease's end, so no owner
+can honour the grant across the gap. Until now the holder dropped the grant
+and fenced every I/O of the lock's owner with `EIO` from the lapse, whether
+or not anyone else had been granted the lock. The harness's in-process locker
+(`s3-cut-holder-failover-with-locks`, `CONSTELLATION_HARNESS_LOCKER_IN_PROCESS=1`)
+saw 25 of 50 reads fail at the 20 s lease and 175 of 200 at the 60 s one (27 of
+52 and 33 of 60 in the runs below). That is an error caused by a fault, not a
+fact about the lock. F-c makes a lapse cost latency where the owner can prove
+nothing conflicting was granted since, and keeps the fence where it cannot.
+
+### What landed
+
+- **Holder (meta, engine, vfs, frontend-fuse).** A grant that lapses while it
+  pins local locks or a write that may not be published is *lapsing*
+  (`HeldGrant::lapsing`), not lapsed: nothing is captured or tainted. The
+  fences return a tri-state (`Fence::{Ok, Parked, Fenced}`,
+  `Discard::{Publish, Discard, Parked}`, `LocalOutcome::Parked`), and the I/O
+  that would be fenced waits: the op is parked on F-b's `lock-wait` pool (no
+  frontend worker, no ring offload thread; `ParkTask`, polled every 20 ms) and
+  asked again from the start when the verdict is in, because every fence
+  precedes an op's first effect. A signal ends the wait with `EINTR` (the
+  kernel waits uninterruptibly for the answer to a request it sent, so an op
+  that could not be interrupted would leave its process unkillable for as long
+  as the park lasts); an op that cannot be held (`begin_wait` refused by the
+  ring or the pool) answers `EIO`, counted
+  (`lapse_park_refused_ring`/`_pool`). The sites that cannot park (a frontend
+  that does not defer replies, in-flight tag capture, a reissue) wait inline,
+  bounded. `late` renewals go out every `lock_poll_ms` (at most a second) from
+  the renewal tick; the bound is `lock_owner_wait_max_ms`; refusal or no answer
+  is the fence as before, from the end of the grant's window. `Vfs::parking()`
+  (default false) lets a frontend wrap an op's responder only while the node
+  holds a grant, a lock or a taint.
+- **Owner (authority core).** `Grant::settled`: a mint is settled (it is made
+  only where no grace, floor or barrier holds the inode, so every earlier
+  grant was issued before it); a reclaim in a grace, a reinstated copy and a
+  non-final mirror's record are not; a move keeps what it was. `admit_late`
+  looks the grant up before anything drops expired records: a settled record
+  (live, or expired and not dropped) is extended, else the owner's *memory of
+  lapsed records* (bounded, kept for settled records dropped by an outwait, not
+  a release) reinstates it, else `Lost`: never the grace's reclaim branch. The
+  memory is superseded by every change that could let another node act on the
+  inode (a conflicting grant, a newer grant of the same node, a move, the inode
+  leaving the table, a deposition: one `supersede`). The old root's **final
+  mirror**: when its lease is no longer usable it sends its backups its whole
+  table (expired records and memory included) naming the lease body, re-sends
+  it with each backup heartbeat, and adds nothing under that lease afterwards
+  (`lock_final_blocks`: mint, reclaim, late admission, move-in, upgrade). A
+  fast successor trusts a mirror only when its `final_for` equals the lease
+  body it replaced (`takeover_prev`); any other mirror is installed unsettled
+  as before. Wire changes append only: `LockRenewEntry.late`,
+  `GrantWire.{settled, lapsed}`, `LockMirror.final_for`.
+- **Model.** `LockModel` gains `late_reclaim`, `max_late`, and the naive
+  variants `late_admit_unknown`, `late_admit_nonfinal`,
+  `late_lapsed_unsuperseded` (each must violate), the actions `LateRenew` and
+  `FinalMirror` and the saw-bits `SAW_LATE_*`, `SAW_FINAL_*` (non-vacuity).
+  The first design (reclaim an unknown late grant inside a grace) is the
+  counterexample the checker found (`a_late_reclaim_of_an_unknown_grant_in_a_grace_violates`:
+  the old owner may have outwaited it and granted another node, which the
+  successor never heard of).
+- **Status and harness.** Control status gains `lapse_parks`, `_resumed`,
+  `_refused`, `lapse_park_gave_up`, `lapse_park_ms_max`, `lapse_parked_ops`,
+  `lapse_park_interrupted`, `lapse_park_refused_ring/_pool`, `late_admitted`,
+  `late_refused`, `mirror_final_sent/_installed/_mismatch` (the control schema
+  is re-blessed). The in-process mode of `s3-cut-holder-failover-with-locks` now
+  fails on any read error and prints the parks per node and the longest read;
+  `verify.rs` has the errno class `lapse-park-refused`.
+- **Simulator.** Two configurations: `locks-s3-cut-holder-lapse` (the holder
+  cut from S3 for a lapse, the lock holder alive) and `locks-late-stale-mirror`
+  (p2p mirror loss from 1 s, the locker partitioned at 11 s, the holder cut at
+  4 s) with `locks-late-stale-mirror-naive` (a successor that trusts any
+  mirror) as the negative control. The simulated client parks and resumes
+  (`SWEEP-PARKS`), and `a_late_renewal_against_a_stale_mirror_is_refused_and_the_naive_successor_violates`
+  pins seeds 34, 51, 106, 163, 203, 318, 336 and 363.
+
+### Deviations and limits
+
+- The spec's fallback to "this node's newer own grant" for a late renewal is
+  replaced by a `continues` map, kept for ids replaced while still live: a
+  late renewal of a replaced id is admitted as its successor
+  (`locks-pause` seed 1364 parked for the whole bound without it: a renewal
+  of an older id answered `Lost` left `renewing` set, so the lapsing grant was
+  never asked again). `renewal_failed` accepts an older id of the same node.
+- A push of a *different* id over a lapsing grant is a refusal (the holder
+  cannot tell a re-affirmation from a fresh grant); the same id resumes.
+- `HeldGrant::written` stays set until the grant ends: a grant that wrote once
+  is parked for, not dropped, whenever it lapses (a late renewal costs a
+  message, an unneeded drop costs data).
+- fuser's `hold_for_wait` exists only on `ReplyEmpty` (a pinned git
+  dependency): parks of other reply types over a ring hold their entry outside
+  the depth-1 budget. Non-gated sites wait inline and have no `EINTR`.
+- Residuals as in the spec: a grant reclaimed in a grace that lapses later
+  still fences, `ack=s3` successors (no mirror), a TTL or released takeover, a
+  predecessor that died, locks in delegated subtrees whose delegate's authority
+  lapsed with the root's.
+- Four harness scenarios encoded the old rule and changed with it (below):
+  `lock-lapse-lone-node`, `fence-token-at-write`, `lock-holder-partitioned`,
+  `lock-contention-paused-holder`. The new expectations of three fail on the
+  parent; `fence-token-at-write` accepts both outcomes (see below).
+
+### Tests and fail-before
+
+- New unit tests: meta 23, authority core 10, engine 6, frontend-fuse 1,
+  model 11, sim 2. Written against the parent's behaviour and run on the
+  parent (a scratch copy with each assertion as the fix has it): meta 2 of 2,
+  core 4 of 4 and engine 1 of 1 fail there (a lapsed grant is captured at the
+  first look; a record dropped by an outwait is `Lost` late; an unknown grant
+  late in a grace is reclaimed; no late renewal at the tick; no final mirror at
+  the usable end; a lapsed owner's read answers `EIO`), and pass here. The model
+  has no parent equivalent (new options); its pass criterion is the three naive
+  variants violating and the design clean, with the saw-bits witnessed.
+- Model, release: `late-lone` 33.1 M states (11.1 M unique), about 22 s;
+  `late-failover` (lease 5, tick 5) 26.1 M / 7.56 M; delegation moves 6.8 M /
+  2.59 M; a TTL takeover 1.9 M; a lost mirror 195 M / 49 M (about 2 min,
+  `#[ignore]`); the superseded memory clean 19.7 M / 6.56 M and its naive twin
+  violating at 29.7 M / 10 M.
+
+### Sweeps (2 000 seeds each, parent 5f3a0e8 against this tree, 60 configurations)
+
+Every `locks-*`, `fast-takeover-*` and `double-seal-inside-the-grace`
+configuration, and the nine beat configurations again under
+`AUTHORITY_SIM_BEATS=thread`. Failing seeds are unchanged everywhere except
+one: `locks-holder-step-back-sealed` seed 1289 (below). The negative controls
+still fail (`locks-writer-hold-unchecked` 1 973 parent, 1 443 here;
+`locks-writer-hold-delegated-unsettled` 2 and 1, seed 1282 failing here and not
+there; `fast-takeover-skewed-successor-credited` 1 and 1) and
+`locks-late-stale-mirror-naive` fails 88 of 2 000 seeds (the 8 pinned among
+them) where `locks-late-stale-mirror` fails none on either tree. Fenced I/O
+(client ops refused `EIO`) over the sweeps:
+
+| configuration | parent | here |
+|---|---|---|
+| `locks-writer-hold` | 7 822 | 2 700 |
+| `locks-root-step-forward` | 2 350 | 0 |
+| `locks-holder-step-forward` | 2 140 | 0 |
+| `locks-stall-step-delegated` | 2 505 | 181 |
+| `locks-stall-step` | 1 897 | 671 |
+| `locks-s3-cut-holder-lapse` (new) | 2 631 | 742 |
+| `locks-s3-cut-holder-alive` | 834 | 230 |
+| `locks-delegated-partition` | 3 717 | 2 439 |
+| `locks-partition` | 3 317 | 2 861 |
+| `locks-late-stale-mirror` (new) | 4 116 | 4 113 |
+| all 59 comparable configurations together | 51 919 | 34 148 |
+
+The longest lock acquisitions grow where a lock is parked for the owner's
+verdict instead of failed (`locks-partition` maximum 20.9 s to 24.3 s,
+`locks-delegated-partition` 25.3 s to 27.3 s); `locks-pause` is back at its
+parent's maximum (11.1 s; 42.6 s before the `continues` fix).
+
+`locks-holder-step-back-sealed` seed 1289 fails here (mutual exclusion on the
+old holder's own grant: its stepped-back clock keeps a grant honoured while a
+successor, which took the lease at its wall expiry and found no quarantine in
+its wall-stamped horizon, grants the same inode). No late renewal, final mirror
+or grace reclaim is on the path (every renewal on it is `late: false`), and
+the class is C7b's (a stepped-back node's wall expiry read by claimants, seed
+1892 on b752452): the parent fails the same configuration at seed 4045 (the
+same signature) over seeds 2 000 to 8 000, this tree at 6 988, one failure in
+6 000 seeds each. F-c only moved which seed reaches it (a parked op instead of
+a fenced one changes a trajectory from t = 2.3 s on).
+
+### Harness
+
+Daemons built from each tree, the box idle but for the scenario, seed 42
+(`s3-cut-holder-failover-with-locks`, the in-process locker unless noted):
+
+| run | reads | failed | longest read | first write / lock after the takeover |
+|---|---|---|---|---|
+| parent, 20 s lease | 52 | 27 (`EIO`) | 4.0 s | +14.74 s / +14.83 s |
+| here, 20 s lease | 51 | 0 | 4.4 s | +14.77 s / +14.84 s |
+| parent, 60 s lease | 60 | 33 | 4.0 s | +54.64 s / +54.61 s |
+| here, 60 s lease | 50 | 0 | 36.2 s | +54.66 s / +54.62 s |
+| parent, child locker | 51 | 0 | 4.0 s | +14.75 s / +14.83 s |
+| here, child locker | 51 | 0 | 4.0 s | +14.75 s / +14.83 s |
+
+Here, the 20 s lease: the reader's node parks once (resumed, longest park
+2.0 s); the old root admits two late renewals and sends one final mirror, the
+successor installs it; the 60 s lease: one park of 35.8 s, 69 late renewals
+admitted by the old root while its lease was usable. Passing here:
+`lock-failover`, `flock-cross-node`, `lock-grace-wait`, `git-under-flock-b2b`
+(232 s), `git-under-flock-causal` (242 s), `lock-fence-at-close`,
+`lock-stall-lone-node`, `lock-contention-stalled-owner`,
+`lock-holder-killed-contention`, `lock-contention-delegated`,
+`lock-release-at-close`, `lock-grant-dead-generation`, `load-probe`,
+`transport-lock-grace-queue`. `transport-lock-grace` fails here two runs of
+three with an `open` from the pinned CPU taking 8.0 s, and fails on the parent
+the same way (7.996 s, one run): not this change. The four scenarios whose
+expectation was the old rule, rewritten (each new version passes here):
+
+- `lock-lapse-lone-node`: after a freeze past the window the node asks itself
+  for its grant back; no op answers `EIO` (create 146, link 145, rename 147,
+  symlink 146, write 149, all OK), the write and the close after the lapse
+  answer OK, the file holds the writes in order, parks resumed, nothing fenced.
+  Parent: the write answers `EIO`.
+- `fence-token-at-write`: A's rename, refused as lapsed at the writer lock,
+  is sent again under a fresh token once the node's own late renewal is
+  admitted and answers OK (the status shows the admission and the resume); B
+  renames after A's unlock and `refs/main` holds B's. F1 is still caught: an OK
+  with no late renewal behind it fails the scenario. The new version accepts
+  `EIO` too (whether the node's own outwait or its late renewal comes first at
+  the thaw is the order of two overdue events), so it does not fail on the
+  parent; the old version failed here on the OK.
+- `lock-holder-partitioned`: B's write under the lock waits once its grant
+  lapses; C is granted 4.0 s after the cut with B's write still waiting and no
+  write of B acknowledged after the grant; after the heal B's late renewal is
+  refused (the owner granted the file to C) and the write answers `EIO` 1.0 s
+  later. Parent: B's write failed 2.0 s before C was granted.
+- `lock-contention-paused-holder`: a freeze past the window up to the outwait
+  (`lock-lapse+500`) now answers OK with one late renewal admitted and one park
+  resumed (28 ms after the thaw), required of the `lock-lapse+500` rounds; an
+  outwaited grant (`lock-outwait+500`) still answers `EIO` (fenced 6 to 9 ops,
+  outwaited 1, nothing admitted); the count is exact (81 acknowledged
+  increments). Parent: the first `lock-lapse+500` round answers `EIO` (fenced 2, nothing admitted).
+
+### Performance
+
+`lock-latency` (release), parent against this tree, ABBA, eight pairs per file
+system, the harness pinned to CPUs 0-7, the box at a load of 6 to 8 from
+other work; p50 in µs (the medians over the pairs; ranges in the logs):
+
+| p50 (µs), parent -> here | tmpfs | ext4 | xfs | btrfs |
+|---|---|---|---|---|
+| first lock from a non-sequencer | 266.1 -> 251.4 | 251.9 -> 243.8 | 250.0 -> 238.5 | 253.5 -> 255.3 |
+| cached re-lock | 25.2 -> 25.0 | 25.4 -> 25.7 | 25.2 -> 25.0 | 25.1 -> 24.7 |
+| the sequencer's own lock | 25.2 -> 24.2 | 24.7 -> 24.2 | 24.1 -> 24.0 | 24.2 -> 24.3 |
+| contended handoff | 1602.7 -> 1552.0 | 1513.4 -> 1541.2 | 1549.1 -> 1547.7 | 1542.1 -> 1529.2 |
+| lone node, `flock` pair, cluster | 24.3 -> 24.1 | 24.4 -> 24.4 | 24.0 -> 23.9 | 24.2 -> 24.1 |
+| lone node, write under a lock, cluster | 14.2 -> 14.4 | 14.4 -> 14.6 | 14.7 -> 14.8 | 15.3 -> 15.8 |
+| lone node, write, `--locks local` | 13.8 -> 13.6 | 13.9 -> 14.0 | 14.0 -> 14.0 | 14.7 -> 14.8 |
+
+The first measurement found what the table now hides: a write under a held
+lock paid +0.7 µs (5 to 6 % on all four file systems) because every op looked
+at the table three times (the owner fence, the inode fence, the pending
+discard) and read the protocol clock (four host clocks) three times to do it.
+The gates now look only while a grant is lapsing or ends within 50 ms
+(`LockTables::may_park`): two relaxed loads and one wait-clock reading
+(`may_park_est`, with the honour reading estimated from it, exact to within a
+forward step or a suspend, which the renewal tick catches within a poll
+interval), and the frontend wraps no responder, so no clock, until a grant is
+within that window; `take_discard` re-counts the table only when it changed
+something. What is left is 0.15 to 0.2 µs (1 %) on tmpfs, ext4 and xfs and
+0.45 µs (3 %) on btrfs, whose ranges overlap, on a write issued under a held
+cluster lock; nothing with no lock held, no lock op, and the no-lock write
+(`--locks local`) is within noise.
+
+### Gates
+
+On the box, every job under `timeout --kill-after=30s`: `cargo fmt --all
+--check`; `cargo clippy --workspace --all-targets -- -D warnings` clean;
+`cargo test --release` for authority (lib 512, sim 181 with the pinned
+unsettled-control seeds updated to 745, 1081, 1282, 2045, 2369), meta 292,
+net 124, vfs 47, frontend-fuse 76, engine 822, control 146 (the schema
+re-blessed), the harness library and the model (62 passed, `--test-threads=2`; the 195 M-state lost-mirror check
+`#[ignore]`d, run by hand).

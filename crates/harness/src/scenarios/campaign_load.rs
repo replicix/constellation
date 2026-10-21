@@ -9,8 +9,12 @@
 //!   the holder is frozen across each lock boundary
 //!   ([`crate::timings::Timings::boundaries`]): the count is exact, an op
 //!   after the thaw answers `EIO` only when its grant was fenced, and
-//!   always when the freeze outlasted the window the holder honours
-//!   (`lock-lapse` and past) or the owner outwaited the grant.
+//!   always when the owner outwaited the grant (it granted the lock to a
+//!   contender). Plan 43 C7-F F-c: a freeze that outlasted only the window
+//!   the holder honours (`lock-lapse` up to the outwait) does not fence it
+//!   any more: the op waits for the owner's verdict on the late renewal of
+//!   the grant, and answers `OK` when the owner admitted it (counted at the
+//!   owner and at the holder); it was `EIO` before.
 //! - `lock-contention-stalled-owner`: the same counter, with the owner's
 //!   (the root's) store stalled 5/12/20 s while every node contends,
 //!   finding F1's interleaving in the real daemon: exact count, the
@@ -302,9 +306,11 @@ pub(super) fn lock_contention_paused_holder(_seed: u64) -> Result<()> {
                     Ok(()) => acked += 1,
                     Err(fail) => bail!("b's increment under a fresh grant: {fail:?}"),
                 }
-                let (fenced0, expired0) = (
+                let (fenced0, expired0, admitted0, resumed0) = (
                     crate::verify::fenced_ops(&locks(b)?),
                     n(&locks(&clients[0])?, "recalls_expired"),
+                    n(&locks(&clients[0])?, "late_admitted"),
+                    n(&locks(b)?, "lapse_parks_resumed"),
                 );
                 b.pause()?;
                 std::thread::sleep(*d);
@@ -314,9 +320,11 @@ pub(super) fn lock_contention_paused_holder(_seed: u64) -> Result<()> {
                 // SAFETY: as above.
                 unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
                 drop(f);
-                let (fenced, expired) = (
+                let (fenced, expired, admitted, resumed) = (
                     crate::verify::fenced_ops(&locks(b)?),
                     n(&locks(&clients[0])?, "recalls_expired"),
+                    n(&locks(&clients[0])?, "late_admitted"),
+                    n(&locks(b)?, "lapse_parks_resumed"),
                 );
                 let eio = match &after {
                     Ok(()) => {
@@ -330,26 +338,49 @@ pub(super) fn lock_contention_paused_holder(_seed: u64) -> Result<()> {
                         fail.eio()
                     }
                 };
-                // Past the window the holder honours (`ttl - margin` from
-                // its last renewal, which came at most `(ttl - margin) / 2`
-                // before the freeze), the grant lapsed on b's own clock: its
-                // I/O on the file fails until it unlocks, whatever the owner
-                // did meanwhile (engine `locks.rs`, NFSv4's rule).
-                if *d >= lapse_window {
-                    anyhow::ensure!(
-                        eio,
-                        "{what} round {round}: b's grant lapsed at least {:?} before the thaw, yet \
-                         its increment after the thaw answered {after:?}: a lapsed grant honoured",
-                        d.saturating_sub(lapse_window)
-                    );
-                }
                 let outwaited = expired > expired0;
                 eprintln!(
-                    "    {NAME}: {what} ({d:?}) round {round}: after the thaw {after:?}; fenced \
-                     +{} outwaited +{}",
+                    "    {NAME}: {what} ({d:?}) round {round}: after the thaw {after:?} \
+                     ({:?}); fenced +{} outwaited +{} late admitted +{} parks resumed +{}",
+                    thawed.elapsed(),
                     fenced - fenced0,
-                    expired - expired0
+                    expired - expired0,
+                    admitted - admitted0,
+                    resumed - resumed0
                 );
+                // Past the window the holder honours (`ttl - margin` from
+                // its last renewal, which came at most `(ttl - margin) / 2`
+                // before the freeze), the grant lapsed on b's own clock and
+                // its I/O waits for the owner's verdict (plan 43 C7-F F-c;
+                // it failed until the unlock before): `OK` only when the
+                // owner admitted the late renewal, `EIO` when it did not.
+                // `lock-lapse+500` is the case F-c turns: past the window,
+                // before the owner outwaits the grant: it must be asked for
+                // back and admitted, and the op answers OK.
+                if what == "lock-lapse+500" {
+                    anyhow::ensure!(
+                        !eio && admitted > admitted0 && resumed > resumed0,
+                        "{what} round {round}: b's grant lapsed {:?} before the thaw and the owner \
+                         had not outwaited it, yet the op after the thaw answered {after:?} (late \
+                         admitted +{}, parks resumed +{}): the lapse should cost a wait, not an \
+                         error",
+                        d.saturating_sub(lapse_window),
+                        admitted - admitted0,
+                        resumed - resumed0
+                    );
+                }
+                if *d >= lapse_window && !eio {
+                    anyhow::ensure!(
+                        admitted > admitted0 && resumed > resumed0 && !outwaited,
+                        "{what} round {round}: b's grant lapsed at least {:?} before the thaw, yet \
+                         its increment after the thaw answered {after:?} with no late renewal \
+                         admitted by the owner (admitted +{}, resumed +{}, outwaited {outwaited}): \
+                         a lapsed grant honoured",
+                        d.saturating_sub(lapse_window),
+                        admitted - admitted0,
+                        resumed - resumed0
+                    );
+                }
                 // An outwaited grant always fences its old holder; an EIO
                 // is always a fence.
                 anyhow::ensure!(

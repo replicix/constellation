@@ -1916,7 +1916,10 @@ fn waits_for_renewals(kind: TimerKind) -> bool {
 fn prompt_timer(kind: TimerKind) -> bool {
     matches!(
         kind,
-        TimerKind::DelegRenew | TimerKind::DelegLapse | TimerKind::LockRenewTick
+        TimerKind::DelegRenew
+            | TimerKind::DelegLapse
+            | TimerKind::LockRenewTick
+            | TimerKind::LockFinal
     )
 }
 
@@ -3514,9 +3517,15 @@ impl Driver {
                 ver,
                 grants,
                 floor,
+                final_for,
             } => Some(Internal::Event(Event::Peer {
                 from,
-                msg: PeerMsg::LockMirror { ver, grants, floor },
+                msg: PeerMsg::LockMirror {
+                    ver,
+                    grants,
+                    floor,
+                    final_for,
+                },
             })),
             SyncRequest::Shutdown { reply } => {
                 control(Control::Shutdown, ControlReply::Done(reply))
@@ -4120,12 +4129,18 @@ impl Driver {
                 };
                 self.one_way(to, payload);
             }
-            PeerMsg::LockMirror { ver, grants, floor } => {
+            PeerMsg::LockMirror {
+                ver,
+                grants,
+                floor,
+                final_for,
+            } => {
                 let payload = Payload::LockMirror {
                     from: self.node_id,
                     ver,
                     grants: crate::locks::grants_wire(&grants),
                     floor: crate::locks::floor_wire(&floor),
+                    final_for,
                 };
                 self.one_way(to, payload);
             }

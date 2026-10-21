@@ -1655,6 +1655,35 @@ pub struct LockStatus {
     /// instead of releasing them (a mutation tagged with them ended in
     /// doubt and was not resolved yet).
     pub doubt_lapses: u64,
+    /// Plan 43 C7-F F-c, node side: grants whose window ended while they
+    /// pinned local locks or writes (the I/O they fence waited instead of
+    /// failing), and how those parks ended: renewed late by the owner
+    /// (`resumed`: nothing was lost), refused (`refused`: `EIO`, as
+    /// before), or past `lock_owner_wait_max_ms` with no answer
+    /// (`gave_up`). The longest park (ms), and the ops that waited for one
+    /// (`parked_ops`; `interrupted`: ended by their caller's signal,
+    /// `EINTR`; `refused_ring`/`refused_pool`: could not be held, `EIO`).
+    pub lapse_parks: u64,
+    pub lapse_parks_resumed: u64,
+    pub lapse_parks_refused: u64,
+    pub lapse_park_gave_up: u64,
+    pub lapse_park_ms_max: u64,
+    pub lapse_parked_ops: u64,
+    pub lapse_park_interrupted: u64,
+    pub lapse_park_refused_ring: u64,
+    pub lapse_park_refused_pool: u64,
+    /// Plan 43 C7-F F-c, owner side: late renewals admitted (a settled
+    /// record or its lapsed memory proved no conflicting grant was issued
+    /// since) and refused.
+    pub late_admitted: u64,
+    pub late_refused: u64,
+    /// Plan 43 C7-F F-c: the old root's final lock mirrors sent, and as a
+    /// successor, the fast takeovers whose mirror was the final one of the
+    /// lease replaced (its records installed settled) and those whose
+    /// final mirror named another lease.
+    pub mirror_final_sent: u64,
+    pub mirror_final_installed: u64,
+    pub mirror_final_mismatch: u64,
     /// Waiters re-parked at their old queue position after a grant to
     /// them went unused, and releases that named a grant id this owner
     /// had replaced (both ended a grant that was otherwise outwaited).

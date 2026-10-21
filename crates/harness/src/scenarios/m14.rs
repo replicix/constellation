@@ -424,10 +424,16 @@ fn sqlite_query(db: &Path, sql: &str) -> Result<String> {
 // ------------------------------------------------------------------ lock-holder-partitioned
 
 /// Three nodes; B holds an exclusive lock and is cut off from the owner
-/// (P2P denied both ways): its renewals fail, its writes under the lock
-/// get `EIO` once its grant lapses, and C — waiting for the lock — is
-/// granted only after the owner outwaited B's grant (ttl + margin), never
-/// before B was fenced.
+/// (P2P denied both ways): its renewals fail and C — waiting for the lock
+/// — is granted only after the owner outwaited B's grant (ttl + margin).
+/// Plan 43 C7-F F-c: B's write under the lock does not fail when the grant
+/// lapses, it **waits** (the owner cannot be reached to ask for the grant
+/// back), and C is granted while it waits: B does no I/O under the lock
+/// from the lapse on, which is the exclusion (no write of B is acknowledged
+/// after C's grant). After the heal B's late renewal reaches the owner,
+/// which granted the file to C meanwhile and so refuses it: the waiting
+/// write answers `EIO` within seconds, and B locks again. (Before F-c the
+/// write answered `EIO` at the lapse.)
 pub fn lock_holder_partitioned(_seed: u64) -> Result<()> {
     const NAME: &str = "lock-holder-partitioned";
     const LOCK_TTL_MS: u64 = 3_000;
@@ -476,37 +482,71 @@ pub fn lock_holder_partitioned(_seed: u64) -> Result<()> {
                 Ok(())
             }
         });
-        // B keeps writing under its lock: EIO once fenced.
-        let mut first_eio = None;
+        // B keeps writing under its lock, from a thread of its own: the
+        // write that finds its grant lapsed waits, so the loop stops
+        // there. Each write is logged with the time it was answered.
+        type BWrite = (Instant, std::result::Result<(), Option<Code>>);
+        let writes: Arc<std::sync::Mutex<Vec<BWrite>>> = Arc::default();
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = std::thread::spawn({
+            let (writes, stop) = (writes.clone(), stop.clone());
+            move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let r = write_at(&mut wb, 0, b"B2").map_err(|e| Code::from_os_error(&e));
+                    let failed = r.is_err();
+                    writes.lock().unwrap().push((Instant::now(), r));
+                    if failed {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                wb
+            }
+        });
         // Liveness, not latency: a starved host may take longer, the
         // hang bound decides "never".
         let deadline = Instant::now()
             + Duration::from_millis(LOCK_TTL_MS * 3 + 5_000).max(crate::verify::hang_bound());
-        while Instant::now() < deadline {
-            match write_at(&mut wb, 0, b"B2") {
-                Ok(()) => {}
-                Err(e) if Code::from_os_error(&e) == Some(Code::Io) => {
-                    first_eio.get_or_insert(Instant::now());
-                }
-                Err(e) => bail!("B's write under its lock: {e}"),
+        let granted = loop {
+            if let Some(g) = *granted_at.lock().unwrap() {
+                break g;
             }
-            if first_eio.is_some() && granted_at.lock().unwrap().is_some() {
-                break;
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "C was never granted the lock within the deadline"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // C holds the lock for 500 ms: B's write is still waiting through it.
+        std::thread::sleep(Duration::from_millis(400));
+        let answered = writes.lock().unwrap().len();
+        std::thread::sleep(Duration::from_millis(100));
+        {
+            let w = writes.lock().unwrap();
+            anyhow::ensure!(
+                w.len() == answered,
+                "B's write was answered while C held the lock: {:?}",
+                w.last()
+            );
+            // The exclusion: none of B's writes was acknowledged after C's
+            // grant, and none failed before it (it waits, it is not fenced).
+            if let Some((t, r)) = w.iter().find(|(t, r)| r.is_err() && *t < granted) {
+                bail!(
+                    "B's write failed {:?} before C was granted ({r:?}): it should wait for the \
+                     owner's verdict",
+                    granted - *t
+                );
             }
-            std::thread::sleep(Duration::from_millis(50));
+            anyhow::ensure!(
+                w.iter().all(|(t, r)| r.is_err() || *t <= granted),
+                "a write of B was acknowledged after C was granted the lock"
+            );
         }
-        let fenced = first_eio.context("B was never fenced (no EIO) within the deadline")?;
-        let granted = granted_at
-            .lock()
-            .unwrap()
-            .context("C was never granted the lock within the deadline")?;
         eprintln!(
-            "    {NAME}: B fenced (EIO) {:?} after the cut; C granted {:?} after the cut",
-            fenced - cut,
+            "    {NAME}: C granted {:?} after the cut with B's write waiting ({answered} B writes \
+             answered before)",
             granted - cut
         );
-        // Exclusion and the protocol's lower bound: exact.
-        anyhow::ensure!(fenced <= granted, "C was granted before B was fenced");
         anyhow::ensure!(
             granted - cut >= Duration::from_millis(LOCK_TTL_MS / 2),
             "C granted too early: {:?}",
@@ -515,10 +555,35 @@ pub fn lock_holder_partitioned(_seed: u64) -> Result<()> {
         waiter.join().expect("waiter")?;
         // The upper bound is latency: ttl + margin, plus host slack.
         let late = (cut, granted - cut);
-        // Heal; B's application unlocks (its grant is long gone), and can
-        // lock again.
+        // Heal: B's late renewal reaches the owner, which granted the file
+        // to C since, and refuses it: the waiting write answers `EIO`.
         let _ = std::fs::remove_file(super::m9::c_deny_path(root.path(), &a.name));
         let _ = std::fs::remove_file(super::m9::c_deny_path(root.path(), &b.name));
+        let healed = Instant::now();
+        let fenced = loop {
+            if let Some((t, r)) = writes.lock().unwrap().get(answered) {
+                match r {
+                    Err(Some(Code::Io)) => break *t,
+                    other => bail!("B's waiting write answered {other:?}, expected EIO"),
+                }
+            }
+            anyhow::ensure!(
+                healed.elapsed() < Duration::from_secs(20),
+                "B's waiting write was not answered within 20 s of the heal"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        eprintln!(
+            "    {NAME}: B's write answered EIO {:?} after the heal ({:?} after the cut)",
+            fenced - healed,
+            fenced - cut
+        );
+        stop.store(true, Ordering::Relaxed);
+        let mut wb = writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("B's writer panicked"))?;
+        // B's application unlocks (its grant is long gone), and can lock
+        // again.
         held.release();
         let again = hold_flock(b.mnt.join("f"), libc::LOCK_EX, Duration::from_secs(30))?;
         eprintln!(
@@ -1244,7 +1309,13 @@ type Seen = Vec<(Duration, Duration, std::result::Result<(), Code>)>;
 /// margin), and the status counters must show the cap at work
 /// (`ack_floor_capped` or `ack_floor_capped_out`).
 /// `CONSTELLATION_HARNESS_LOCKER_IN_PROCESS=1` holds the lock in the
-/// harness process instead, the control: the reader then sees the fence.
+/// harness process instead: the reader is then the lock owner itself, whose
+/// grant lapses across the failover (the owner is cut from S3, its successor
+/// exists only at the lease's end). Plan 43 C7-F F-c: its reads wait (park)
+/// for the verdict on a late renewal of the same grant instead of failing
+/// `EIO` (25 of 50 reads at the 20 s lease, 175 of 200 at the 60 s one,
+/// before): the scenario fails on any read error here too, and prints the
+/// parks the nodes counted and the longest read.
 pub fn s3_cut_holder_failover_with_locks(_seed: u64) -> Result<()> {
     const NAME: &str = "s3-cut-holder-failover-with-locks";
     // `CONSTELLATION_HARNESS_LEASE_TTL_MS`: the production lease (60000)
@@ -1467,7 +1538,53 @@ pub fn s3_cut_holder_failover_with_locks(_seed: u64) -> Result<()> {
             }
         );
         let bad_write = !codes(&writes).is_empty();
-        let bad_read = !in_process && !codes(&reads).is_empty();
+        let bad_read = !codes(&reads).is_empty();
+        let longest_read = reads
+            .iter()
+            .max_by_key(|(s, r, _)| *r - *s)
+            .map(|(s, r, _)| (rel(*s), *r - *s));
+        eprintln!(
+            "    {NAME}: reads: {} reads, {} failed; longest read (start, took) {longest_read:?}; \
+             reads that took over a second: {}",
+            reads.len(),
+            reads.iter().filter(|(_, _, r)| r.is_err()).count(),
+            reads
+                .iter()
+                .filter(|(s, r, _)| *r - *s > Duration::from_secs(1))
+                .count()
+        );
+        // Plan 43 C7-F F-c: the nodes' parks, per node: grants that lapsed
+        // under a lock or a write (`parks`), resumed by a late renewal,
+        // refused, given up at the bound; ops that waited, ended by a signal
+        // or refused for want of a ring entry or a thread; the longest park;
+        // late renewals admitted and refused (the owners); final mirrors
+        // sent, and installed by a successor.
+        let parks: Vec<_> = clients
+            .iter()
+            .filter_map(|c| locks_of(c).ok().map(|l| (c.name.clone(), l)))
+            .map(|(n, l)| {
+                let g = |k: &str| l[k].as_u64().unwrap_or(0);
+                (
+                    n,
+                    [
+                        ("parks", g("lapse_parks")),
+                        ("resumed", g("lapse_parks_resumed")),
+                        ("refused", g("lapse_parks_refused")),
+                        ("gave_up", g("lapse_park_gave_up")),
+                        ("parked_ops", g("lapse_parked_ops")),
+                        ("interrupted", g("lapse_park_interrupted")),
+                        ("refused_ring", g("lapse_park_refused_ring")),
+                        ("refused_pool", g("lapse_park_refused_pool")),
+                        ("ms_max", g("lapse_park_ms_max")),
+                        ("late_admitted", g("late_admitted")),
+                        ("late_refused", g("late_refused")),
+                        ("final_sent", g("mirror_final_sent")),
+                        ("final_installed", g("mirror_final_installed")),
+                    ],
+                )
+            })
+            .collect();
+        eprintln!("    {NAME}: parks {parks:?}");
         let bad_grab = !codes(&grabs).is_empty();
         let longest_grab = grabs
             .iter()
@@ -2414,20 +2531,26 @@ fn lone_worker(
 /// (`EIO`), and a rename whose source an earlier refused rename never made
 /// answered `ENOENT`.
 ///
-/// That is the fence working as documented (cluster-locks.md, "Leases,
-/// renewal and fencing"); what this pins is what the application sees on
-/// a lone node: one process holds an `fcntl` lock, writes under it and
+/// That was the fence working as documented (cluster-locks.md, "Leases,
+/// renewal and fencing"), and what this pins is what the application sees
+/// on a lone node: one process holds an `fcntl` lock, writes under it and
 /// `fsync`s (published under an honoured grant), while its threads
 /// create, link, symlink and rename; it writes the file again right
-/// before the daemon is frozen past the grant's window and thawed. Every
-/// op answers `OK` or `EIO`, and the tree holds exactly what answered
-/// `OK` — an op in flight across the stall either applied and answered
-/// `OK` or applied nothing; none is half-applied or reported wrongly. The
-/// write after the lapse and the close under the fence answer `EIO`, the
-/// file holds exactly what was `fsync`ed (the dirty write under the
-/// lapsed grant is discarded, never published), the fence lifts with the
-/// lock; after a remount the tree, the locked file and every write a
-/// later `fsync` acknowledged are there, and fsck finds nothing.
+/// before the daemon is frozen past the grant's window and thawed.
+///
+/// Plan 43 C7-F F-c: nothing could have been granted elsewhere (the node
+/// sequences its own grants and still has the record), so after the thaw
+/// the grant is asked for back from the node itself and admitted, and what
+/// the freeze held up runs: after a freeze every op answers `OK` (none
+/// `EIO`), the write after the lapse and the close answer `OK`, the file
+/// holds the writes in order (the dirty one is published, not discarded),
+/// the status counts the parks resumed and no op fenced. (Before F-c the
+/// write and the close answered `EIO` and the file held what was
+/// `fsync`ed.) A store stall (`lock-stall-lone-node`) may or may not lapse
+/// the grant, and either way every op answers `OK` or `EIO` and the tree
+/// holds exactly what answered `OK`; after a remount the tree, the locked
+/// file and every write a later `fsync` acknowledged are there, and fsck
+/// finds nothing.
 pub fn lock_lapse_lone_node(_seed: u64) -> Result<()> {
     const NAME: &str = "lock-lapse-lone-node";
     const LOCK_TTL_MS: u64 = 3_000;
@@ -2545,11 +2668,15 @@ pub fn lock_stall_lone_node(_seed: u64) -> Result<()> {
 /// `rename(refs/tmp-a, refs/main)` passes the check, then its write holds
 /// for 10 s (the store-stall hook, armed for `A`'s task only), during
 /// which the daemon is frozen 6 s — past the 3 s grant's window. Then `A`
-/// resumes: its rename must answer `EIO` (ADR-25: an operation admitted
-/// before a lapse and delayed past it never lands), `B` takes the lock
-/// once `A` lets go and renames its own ref, and `refs/main` holds `B`'s,
-/// also after a remount; fsck finds nothing. Before F1's fix (a re-check
-/// under the writer lock) `A`'s rename answers OK.
+/// resumes: its rename must not land under the ended grant (ADR-25: an
+/// operation admitted before a lapse and delayed past it never lands on
+/// it). Plan 43 C7-F F-c: it answers `EIO` (refused) or, the grant having
+/// been asked for back from the node itself and admitted, `OK` from a
+/// fresh token (the status shows the late renewal admitted and the park
+/// resumed); `B` takes the lock once `A` lets go and renames its own ref,
+/// and `refs/main` holds `B`'s, also after a remount; fsck finds nothing.
+/// Before F1's fix (a re-check under the writer lock) `A`'s rename answers
+/// OK with no late renewal behind it.
 pub fn fence_token_at_write(_seed: u64) -> Result<()> {
     const NAME: &str = "fence-token-at-write";
     const LOCK_TTL_MS: u64 = 3_000;
@@ -2666,11 +2793,30 @@ pub fn fence_token_at_write(_seed: u64) -> Result<()> {
         );
         match &ra {
             Err(e) if Code::from_os_error(e) == Some(Code::Io) => {}
-            Ok(()) => bail!(
-                "F1: A's rename passed its fencing-token check, waited {took:?} for the writer \
-                 lock past its grant's end, and answered OK: a write under an ended grant landed"
-            ),
-            Err(e) => bail!("A's rename answered {e}, expected EIO (fenced)"),
+            // Plan 43 C7-F F-c: the rename was refused as lapsed at the
+            // writer lock, and sent again under a fresh token once the
+            // node's own late renewal was admitted: it landed under a grant
+            // the owner proved nobody else was given, and B (queued behind
+            // A's lock) renames after it. F1 is a rename that lands past
+            // the end of a grant nobody renewed.
+            Ok(()) => {
+                let l = locks_of(&c)?;
+                // F1's own evidence first: the token check at the write
+                // refused the rename's first send (its window had ended);
+                // only a re-send under the admitted grant may land. The
+                // late-renewal counters alone are this node's whole history
+                // and would pass with F1's re-check gone.
+                anyhow::ensure!(
+                    l["token_rejections_at_write"].as_u64().unwrap_or(0) > 0
+                        && l["late_admitted"].as_u64().unwrap_or(0) > 0
+                        && l["lapse_parks_resumed"].as_u64().unwrap_or(0) > 0,
+                    "F1: A's rename passed its fencing-token check, waited {took:?} for the writer \
+                     lock past its grant's end, and answered OK without the write-time token check \
+                     refusing it and the grant having been asked for back and admitted: a write \
+                     under an ended grant landed; locks {l}"
+                );
+            }
+            Err(e) => bail!("A's rename answered {e}, expected EIO (fenced) or OK (re-admitted)"),
         }
         rb.context("B's rename under its own grant")?;
         anyhow::ensure!(
@@ -2888,13 +3034,19 @@ fn lock_lapse_lone_run(name: &str, c: &Client, stall: LoneStall) -> Result<LoneE
     let fence = locks_of(c)?;
     let freeze = matches!(stall, LoneStall::Freeze(_));
     let after_eio = after.as_ref().err().and_then(Code::from_os_error) == Some(Code::Io);
-    // A freeze past the window lapses the grant by construction; a store
-    // stall may not (only OK or EIO are right then).
+    // A freeze past the window lapses the grant by construction, and the
+    // node asks itself for it back (plan 43 C7-F F-c): the write waited
+    // for that and answers OK. A store stall may not lapse it, or the
+    // verdict may come late (only OK or EIO are right then).
     anyhow::ensure!(
-        after_eio || (!freeze && after.is_ok()),
-        "the write after the {} answered {after:?}, expected EIO{}; locks: {fence}",
+        if freeze {
+            after.is_ok()
+        } else {
+            after_eio || after.is_ok()
+        },
+        "the write after the {} answered {after:?}, expected {}; locks: {fence}",
         if freeze { "freeze" } else { "store stall" },
-        if freeze { "" } else { " or OK" }
+        if freeze { "OK" } else { "OK or EIO" }
     );
     // The close drops the POSIX lock; the fence is checked before.
     let fd = std::os::unix::io::IntoRawFd::into_raw_fd(lf);
@@ -2929,11 +3081,19 @@ fn lock_lapse_lone_run(name: &str, c: &Client, stall: LoneStall) -> Result<LoneE
     eprintln!("    {name}: {}; locks {fence}", summary.join(", "));
     let fenced_ops = fence["owner_fenced_ops"].as_u64().unwrap_or(0);
     if let LoneStall::Freeze(frozen) = &stall {
+        let resumed = fence["lapse_parks_resumed"].as_u64().unwrap_or(0);
         anyhow::ensure!(
-            fenced_ops > 0,
-            "the daemon was frozen {frozen:?} past a {}-ms lock window and fenced nothing: {fence}",
+            resumed > 0 && fenced_ops == 0,
+            "the daemon was frozen {frozen:?} past a {}-ms lock window: expected the grant asked \
+             for back and its parked I/O resumed (lapse_parks_resumed > 0) with nothing fenced: \
+             {fence}",
             fence["margin_ms"]
         );
+        for (what, v) in &outcomes {
+            if let Some((n, r)) = v.iter().find(|(_, r)| r.is_err()) {
+                bail!("{what} {n} answered {r:?} after a freeze: the I/O should have waited");
+            }
+        }
     } else {
         eprintln!(
             "    {name}: the grant {} during the store stall ({fenced_ops} fenced ops)",

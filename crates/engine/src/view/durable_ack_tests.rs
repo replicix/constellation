@@ -543,6 +543,8 @@ fn a_lapsed_grants_discard_is_eio_once_on_every_descriptor_open_at_the_time() {
             first_use: false,
             idle_since: None,
             installed: now,
+            lapsing: None,
+            written: false,
         },
     );
     Blocking::run(|r| {

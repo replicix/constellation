@@ -277,6 +277,9 @@ pub enum TimerKind {
     LockWaiterTick,
     /// Plan 43 F-b: a lock grace ends; the parked waiters are served.
     LockGraceEnd,
+    /// Plan 43 C7-F F-c: the old root's final lock mirror is due (its
+    /// lease's usable end), or re-sent.
+    LockFinal,
     LockRenewTimeout,
     LockTestTimeout,
     /// M14 phase 2: a recalled grant's release waits for the mutations

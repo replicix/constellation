@@ -1075,7 +1075,14 @@ impl constellation_net::PeerService for P2pBridge {
         });
     }
 
-    fn lock_mirror(&self, from: u64, ver: u64, grants: Vec<u8>, floor: Vec<u8>) {
+    fn lock_mirror(
+        &self,
+        from: u64,
+        ver: u64,
+        grants: Vec<u8>,
+        floor: Vec<u8>,
+        final_for: Option<(u64, u64, i64, u64)>,
+    ) {
         if crate::fault::p2p_denied(from) {
             return;
         }
@@ -1084,6 +1091,7 @@ impl constellation_net::PeerService for P2pBridge {
             ver,
             grants: crate::locks::grants_of(&grants),
             floor: crate::locks::floor_of(&floor),
+            final_for,
         });
     }
 

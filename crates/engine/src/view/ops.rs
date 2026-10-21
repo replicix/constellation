@@ -97,6 +97,29 @@ macro_rules! admit {
     };
 }
 
+/// Plan 43 C7-F F-c: an op that finds its caller's lock grant lapsing waits
+/// for the owner's verdict *without a frontend thread*: where the checks
+/// below it (the fences, the publication points) would see a lapsing grant,
+/// the op is parked (`View::park_op`) and asked again from the start once
+/// the verdict is in. `$r` is given back (`Err`) when it cannot be held, and
+/// the op goes on: its fences then wait inline, bounded. One relaxed load
+/// while no grant is lapsing.
+macro_rules! park_gate {
+    ($self:expr, $cx:expr, $r:ident, $t:ty, $gate:expr, [$($prep:tt)*], |$v:ident, $c:ident, $r2:ident| $redo:expr) => {
+        if $self.lock_parking() {
+            let gate = $gate;
+            if $self.lock_would_park($cx, &gate) {
+                // Owned copies of what the op borrows: only on this path.
+                $($prep)*
+                match $self.park_op::<$t, _>($cx, gate, $r, move |$v, $c, $r2| $redo) {
+                    Ok(()) => return,
+                    Err(back) => $r = back,
+                }
+            }
+        }
+    };
+}
+
 /// A `setattr` time: the engine's clock for "now" (plan 30 §M12: the
 /// node's HLC, never below a stamp it applied, like every other timestamp
 /// a mutation writes).
@@ -115,6 +138,10 @@ fn err<T>(code: Code) -> Result<T, VfsError> {
 const XATTR_VALUE_MAX: usize = 64 * 1024;
 
 impl Vfs for View {
+    fn parking(&self) -> bool {
+        self.lock_may_wrap()
+    }
+
     fn handover_blockers(&self) -> Vec<String> {
         View::handover_blockers(self)
     }
@@ -307,10 +334,15 @@ impl Vfs for View {
         &self,
         cx: &OpCtx<'_>,
         ino: Ino,
-        _fh: Option<Fh>,
+        fh_of_setattr: Option<Fh>,
         set: &SetAttr,
-        r: R,
+        mut r: R,
     ) {
+        park_gate!(self, cx, r, Attr, self.gate_setattr(ino, set.size.is_some()), [
+            let set_owned = set.clone();
+        ], |v, c, r2| {
+            <View as Vfs>::setattr(v, c, ino, fh_of_setattr, &set_owned, r2)
+        });
         let _w = self.watch.enter("setattr", ino);
         admit!(self, cx, r, _admitted);
         let ino = enter!(self, ino, r);
@@ -385,7 +417,7 @@ impl Vfs for View {
                 r.done(self.ino_err(ino, Code::Io));
                 return;
             }
-            self.lock_discard_tainted(ino);
+            self.lock_discard_tainted_for_write(ino);
             if let Err(error) = self.truncate(ino, new_size) {
                 r.done(self.ino_err(ino, error));
                 return;
@@ -486,8 +518,13 @@ impl Vfs for View {
         name: &Name,
         mode: u32,
         rdev: constellation_types::Rdev,
-        r: R,
+        mut r: R,
     ) {
+        park_gate!(self, cx, r, Entry, self.gate_owner(), [
+            let name_owned = name.to_buf();
+        ], |v, c, r2| {
+            <View as Vfs>::mknod(v, c, parent, &name_owned, mode, rdev, r2)
+        });
         let _w = self.watch.enter("mknod", parent);
         admit!(self, cx, r, _admitted);
         let parent = enter!(self, parent, r);
@@ -548,8 +585,13 @@ impl Vfs for View {
         parent: Ino,
         name: &Name,
         mode: u32,
-        r: R,
+        mut r: R,
     ) {
+        park_gate!(self, cx, r, Entry, self.gate_owner(), [
+            let name_owned = name.to_buf();
+        ], |v, c, r2| {
+            <View as Vfs>::mkdir(v, c, parent, &name_owned, mode, r2)
+        });
         let _w = self.watch.enter("mkdir", parent);
         admit!(self, cx, r, _admitted);
         let parent = enter!(self, parent, r);
@@ -592,8 +634,14 @@ impl Vfs for View {
         parent: Ino,
         name: &Name,
         target: &[u8],
-        r: R,
+        mut r: R,
     ) {
+        park_gate!(self, cx, r, Entry, self.gate_owner(), [
+            let name_owned = name.to_buf();
+            let target_owned = target.to_vec();
+        ], |v, c, r2| {
+            <View as Vfs>::symlink(v, c, parent, &name_owned, &target_owned, r2)
+        });
         let _w = self.watch.enter("symlink", parent);
         admit!(self, cx, r, _admitted);
         let parent = enter!(self, parent, r);
@@ -630,8 +678,13 @@ impl Vfs for View {
         ino: Ino,
         new_parent: Ino,
         new_name: &Name,
-        r: R,
+        mut r: R,
     ) {
+        park_gate!(self, cx, r, Entry, self.gate_owner(), [
+            let name_owned = new_name.to_buf();
+        ], |v, c, r2| {
+            <View as Vfs>::link(v, c, ino, new_parent, &name_owned, r2)
+        });
         let _w = self.watch.enter("link", ino);
         admit!(self, cx, r, _admitted);
         let ino = enter!(self, ino, r);
@@ -662,7 +715,12 @@ impl Vfs for View {
         }
     }
 
-    fn unlink<R: Responder<()>>(&self, cx: &OpCtx<'_>, parent: Ino, name: &Name, r: R) {
+    fn unlink<R: Responder<()>>(&self, cx: &OpCtx<'_>, parent: Ino, name: &Name, mut r: R) {
+        park_gate!(self, cx, r, (), self.gate_owner(), [
+            let name_owned = name.to_buf();
+        ], |v, c, r2| {
+            <View as Vfs>::unlink(v, c, parent, &name_owned, r2)
+        });
         let _w = self.watch.enter("unlink", parent);
         admit!(self, cx, r, _admitted);
         let parent = enter!(self, parent, r);
@@ -721,7 +779,12 @@ impl Vfs for View {
         }
     }
 
-    fn rmdir<R: Responder<()>>(&self, cx: &OpCtx<'_>, parent: Ino, name: &Name, r: R) {
+    fn rmdir<R: Responder<()>>(&self, cx: &OpCtx<'_>, parent: Ino, name: &Name, mut r: R) {
+        park_gate!(self, cx, r, (), self.gate_owner(), [
+            let name_owned = name.to_buf();
+        ], |v, c, r2| {
+            <View as Vfs>::rmdir(v, c, parent, &name_owned, r2)
+        });
         let _w = self.watch.enter("rmdir", parent);
         admit!(self, cx, r, _admitted);
         let parent = enter!(self, parent, r);
@@ -791,8 +854,14 @@ impl Vfs for View {
         new_parent: Ino,
         new_name: &Name,
         flags: RenameFlags,
-        r: R,
+        mut r: R,
     ) {
+        park_gate!(self, cx, r, (), self.gate_owner(), [
+            let name_owned = name.to_buf();
+            let new_name_owned = new_name.to_buf();
+        ], |v, c, r2| {
+            <View as Vfs>::rename(v, c, parent, &name_owned, new_parent, &new_name_owned, flags, r2)
+        });
         let _w = self.watch.enter("rename", parent);
         admit!(self, cx, r, _admitted);
         // renameat2(2): `EINVAL` for a flag the filesystem does not
@@ -1019,9 +1088,22 @@ impl Vfs for View {
         cx: &OpCtx<'_>,
         ino: Ino,
         flags: OpenFlags,
-        _owner: OpenOwner,
-        r: R,
+        owner_of_open: OpenOwner,
+        mut r: R,
     ) {
+        park_gate!(
+            self,
+            cx,
+            r,
+            Opened,
+            if flags.intersects(OpenFlags::WRITE | OpenFlags::TRUNC) {
+                self.gate_owner()
+            } else {
+                super::lock_gate::ParkGate::default()
+            },
+            [],
+            |v, c, r2| { <View as Vfs>::open(v, c, ino, flags, owner_of_open, r2) }
+        );
         let _w = self.watch.enter("open", ino);
         admit!(self, cx, r, _admitted);
         // Plan 30 §M14: opening for writing is a write (a read-only open
@@ -1113,9 +1195,14 @@ impl Vfs for View {
         name: &Name,
         mode: u32,
         flags: OpenFlags,
-        _owner: OpenOwner,
-        r: R,
+        owner_of_create: OpenOwner,
+        mut r: R,
     ) {
+        park_gate!(self, cx, r, (Entry, Opened), self.gate_owner(), [
+            let name_owned = name.to_buf();
+        ], |v, c, r2| {
+            <View as Vfs>::create(v, c, parent, &name_owned, mode, flags, owner_of_create, r2)
+        });
         let _w = self.watch.enter("create", parent);
         admit!(self, cx, r, _admitted);
         let parent = enter!(self, parent, r);
@@ -1147,8 +1234,17 @@ impl Vfs for View {
         fh: Fh,
         off: u64,
         len: u32,
-        r: R,
+        mut r: R,
     ) {
+        park_gate!(
+            self,
+            cx,
+            r,
+            ReadData,
+            self.gate_io(ino, true, false),
+            [],
+            |v, c, r2| { <View as Vfs>::read(v, c, ino, fh, off, len, r2) }
+        );
         let _w = self.watch.enter("read", ino);
         admit!(self, cx, r, _admitted);
         let ino = enter!(self, ino, r);
@@ -1216,8 +1312,13 @@ impl Vfs for View {
         off: u64,
         data: WriteData<'_>,
         flags: OpenFlags,
-        r: R,
+        mut r: R,
     ) {
+        park_gate!(self, cx, r, u32, self.gate_io(ino, true, true), [
+            let owned = bytes::Bytes::copy_from_slice(data.as_slice());
+        ], |v, c, r2| {
+            <View as Vfs>::write(v, c, ino, fh, off, WriteData::Shared(owned), flags, r2)
+        });
         let _w = self.watch.enter("write", ino);
         admit!(self, cx, r, _admitted);
         let ino = enter!(self, ino, r);
@@ -1238,7 +1339,7 @@ impl Vfs for View {
             r.done(self.ino_err(ino, Code::Io));
             return;
         }
-        self.lock_discard_tainted(ino);
+        self.lock_discard_tainted_for_write(ino);
         let n = match self.do_write(ino, off, data.as_slice()) {
             Ok(n) if flags.contains(OpenFlags::SYNC) => n,
             Ok(n) => return r.done(Ok(n)),
@@ -1277,7 +1378,23 @@ impl Vfs for View {
         });
     }
 
-    fn flush<R: Responder<()>>(&self, cx: &OpCtx<'_>, ino: Ino, fh: Fh, owner: LockOwner, r: R) {
+    fn flush<R: Responder<()>>(
+        &self,
+        cx: &OpCtx<'_>,
+        ino: Ino,
+        fh: Fh,
+        owner: LockOwner,
+        mut r: R,
+    ) {
+        park_gate!(
+            self,
+            cx,
+            r,
+            (),
+            self.gate_publish(ino, false),
+            [],
+            |v, c, r2| { <View as Vfs>::flush(v, c, ino, fh, owner, r2) }
+        );
         let _w = self.watch.enter("flush", ino);
         let ino = enter!(self, ino, r);
         // Plan 30 §M14 phase 2: the close publishes under the locks its
@@ -1370,8 +1487,17 @@ impl Vfs for View {
         fh: Fh,
         flags: OpenFlags,
         owner: Option<LockOwner>,
-        r: R,
+        mut r: R,
     ) {
+        park_gate!(
+            self,
+            cx,
+            r,
+            (),
+            self.gate_publish(ino, false),
+            [],
+            |v, c, r2| { <View as Vfs>::release(v, c, ino, fh, flags, owner, r2) }
+        );
         // The description ends with this call however it answers (an
         // `enter!` refusal included): nothing addresses it any more.
         let publishes = self.handles.writes(fh);
@@ -1525,7 +1651,23 @@ impl Vfs for View {
         }
     }
 
-    fn fsync<R: Responder<()>>(&self, cx: &OpCtx<'_>, ino: Ino, fh: Fh, level: Durability, r: R) {
+    fn fsync<R: Responder<()>>(
+        &self,
+        cx: &OpCtx<'_>,
+        ino: Ino,
+        fh: Fh,
+        level: Durability,
+        mut r: R,
+    ) {
+        park_gate!(
+            self,
+            cx,
+            r,
+            (),
+            self.gate_publish(ino, true),
+            [],
+            |v, c, r2| { <View as Vfs>::fsync(v, c, ino, fh, level, r2) }
+        );
         let _w = self.watch.enter("fsync", ino);
         admit!(self, cx, r, _admitted, owner_fence_checked_later);
         let ino = enter!(self, ino, r);
@@ -1711,12 +1853,21 @@ impl Vfs for View {
         &self,
         cx: &OpCtx<'_>,
         ino: Ino,
-        _fh: Fh,
+        fh_of_fallocate: Fh,
         off: u64,
         len: u64,
         mode: FallocateMode,
-        r: R,
+        mut r: R,
     ) {
+        park_gate!(
+            self,
+            cx,
+            r,
+            (),
+            self.gate_io(ino, true, true),
+            [],
+            |v, c, r2| { <View as Vfs>::fallocate(v, c, ino, fh_of_fallocate, off, len, mode, r2) }
+        );
         let _w = self.watch.enter("fallocate", ino);
         admit!(self, cx, r, _admitted);
         // Plan 31 §6.2: absent from a frontend that does not declare it.
@@ -1740,7 +1891,7 @@ impl Vfs for View {
             r.done(self.ino_err(ino, Code::Io));
             return;
         }
-        self.lock_discard_tainted(ino);
+        self.lock_discard_tainted_for_write(ino);
         if len == 0 {
             r.done(self.ino_err(ino, Code::Invalid));
             return;
@@ -1786,8 +1937,21 @@ impl Vfs for View {
         off_out: u64,
         len: u64,
         flags: CopyFlags,
-        r: R,
+        mut r: R,
     ) {
+        park_gate!(
+            self,
+            cx,
+            r,
+            u64,
+            self.gate_copy(ino_in, ino_out),
+            [],
+            |v, c, r2| {
+                <View as Vfs>::copy_file_range(
+                    v, c, ino_in, fh_in, off_in, ino_out, fh_out, off_out, len, flags, r2,
+                )
+            }
+        );
         // A write of the destination (`copy`'s module doc): the owner
         // fence and the fencing token are the op's, as a write's.
         let _w = self.watch.enter("copy_file_range", ino_out);

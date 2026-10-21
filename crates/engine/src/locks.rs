@@ -89,7 +89,7 @@ use constellation_authority::{
 };
 use constellation_fs_core::Ino;
 use constellation_meta::locks::{
-    GrantId, GrantWire, LocalLock, LocalOutcome, LockMode, LockTag, OwnerFenced,
+    Discard, Fence, GrantId, GrantWire, LocalLock, LocalOutcome, LockMode, LockTag, OwnerFenced,
 };
 use constellation_meta::{JournalPos, Meta, Position, ReadKey};
 use constellation_net::{LockOutcomeWire, LockRenewResultWire, LockRenewWire, LockTestOutcomeWire};
@@ -178,6 +178,15 @@ pub(crate) fn now() -> Now {
     #[cfg(test)]
     let now = TEST_CLOCK.with(|c| c.get().apply(now));
     now
+}
+
+/// The wait reading alone: one host clock, where [`now`] reads four (the
+/// park gates' hot path, [`constellation_meta::locks::LockTables::may_park_est`]).
+pub(crate) fn wait_now() -> constellation_authority::WaitMs {
+    let wait = constellation_platform::clock::protocol().wait();
+    #[cfg(test)]
+    let wait = constellation_authority::WaitMs(wait.0 + TEST_CLOCK.with(|c| c.get().wait));
+    wait
 }
 
 /// Per-thread test offsets of the three readings.
@@ -432,9 +441,42 @@ pub struct WaitPool {
 #[derive(Default)]
 struct PoolState {
     tasks: Vec<WaitTask>,
+    /// Plan 43 C7-F F-c: ops parked behind a lapsing grant.
+    parks: Vec<ParkTask>,
     workers: usize,
     idle: usize,
 }
+
+/// How a parked op's wait ended ([`ClusterLocks::park_deferred`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkEnd {
+    /// The verdict is in (or the park's bound passed): the op asks again
+    /// from the start, and what it finds then is final.
+    Resolved,
+    /// The caller's signal ended the wait: `EINTR`.
+    Interrupted,
+    /// No `lock-wait` thread could be started: `EIO`, counted
+    /// (`lapse_park_refused_pool`).
+    NoThread,
+}
+
+/// An op parked behind a lapsing grant: polled until `ready`.
+struct ParkTask {
+    id: u64,
+    started: std::time::Instant,
+    due: std::time::Instant,
+    cancel: Option<CancelToken>,
+    op: Option<constellation_vfs::watch::Current>,
+    ready: Box<dyn Fn() -> bool + Send>,
+    done: Box<dyn FnOnce(ParkEnd) + Send>,
+}
+
+/// How often a parked op looks at its grant's verdict.
+const PARK_POLL: Duration = Duration::from_millis(20);
+
+/// How long past the lapse's own bound a parked op waits for the table to
+/// give up before it asks again regardless.
+const PARK_BOUND_SLACK: Duration = Duration::from_secs(5);
 
 impl WaitPool {
     /// Threads running now.
@@ -487,14 +529,18 @@ const LINEAGE_CACHE_MAX: usize = 4096;
 impl ClusterLocks {
     /// Whether I/O on `ino` must be refused (`EIO`): local locks under a
     /// lapsed grant. One relaxed atomic load when no local lock exists.
-    pub fn fenced(&self, ino: Ino) -> bool {
+    ///
+    /// Plan 43 C7-F F-c: [`Fence::Parked`] while the grant is lapsing: the
+    /// op waits for the owner's verdict ([`View::lock_fenced`] and the park
+    /// gate, `view::lock_gate`).
+    pub fn fenced(&self, ino: Ino) -> Fence {
         let locks = self.meta.locks();
         // The table's state before the clock: with no local lock on the
         // node nothing is fenced, and the common case reads no clock at all
         // (`view::lock_gate` says so; every read, write, setattr, create,
         // close and fsync asks).
         if locks.lockers_none() {
-            return false;
+            return Fence::Ok;
         }
         locks.fenced(ino, now())
     }
@@ -510,38 +556,47 @@ impl ClusterLocks {
     /// file, never a write's). Other processes on the node are never
     /// fenced. One or two relaxed atomic loads while no owner can be
     /// fenced.
-    pub fn owner_fenced(&self, pid: Option<u32>, lock_owner: Option<u64>) -> bool {
+    ///
+    /// Plan 43 C7-F F-c: an owner whose locks are under a grant that is
+    /// *lapsing* (not captured) is [`Fence::Parked`]: its op waits for the
+    /// owner's verdict on the late renewal; an owner already fenced stays
+    /// fenced.
+    pub fn owner_fenced(&self, pid: Option<u32>, lock_owner: Option<u64>) -> Fence {
         let locks = self.meta.locks();
         // The table's state before the clock: `local_inos` first, so the
         // no-lock fast path reads no clock at all.
         if locks.lockers_none() {
-            return false;
+            return Fence::Ok;
         }
         let now = now();
         if !locks.owner_fence_armed(now) {
-            return false;
+            return Fence::Ok;
         }
-        let fenced = locks.fenced_owners(now);
-        if fenced.is_empty() {
-            return false;
-        }
-        let hit = lock_owner.is_some_and(|o| fenced.iter().any(|f| f.owner == o))
-            || pid.is_some_and(|pid| {
-                let owners: Vec<(u32, u64)> = fenced
-                    .iter()
-                    .filter(|f| f.pid > 1)
-                    .map(|f| (f.pid, f.pid_start))
-                    .collect();
-                !owners.is_empty()
-                    && self
-                        .ancestry(pid, &self.locker_procs())
+        let matches = |list: &[constellation_meta::locks::FencedOwner]| {
+            lock_owner.is_some_and(|o| list.iter().any(|f| f.owner == o))
+                || pid.is_some_and(|pid| {
+                    let owners: Vec<(u32, u64)> = list
                         .iter()
-                        .any(|p| owners.iter().any(|o| same_process(*o, *p)))
-            });
-        if hit {
+                        .filter(|f| f.pid > 1)
+                        .map(|f| (f.pid, f.pid_start))
+                        .collect();
+                    !owners.is_empty()
+                        && self
+                            .ancestry(pid, &self.locker_procs())
+                            .iter()
+                            .any(|p| owners.iter().any(|o| same_process(*o, *p)))
+                })
+        };
+        let fenced = locks.fenced_owners(now);
+        if !fenced.is_empty() && matches(&fenced) {
             locks.note_owner_fenced_op();
+            return Fence::Fenced;
         }
-        hit
+        let parked = locks.parked_owners(now);
+        if !parked.is_empty() && matches(&parked) {
+            return Fence::Parked;
+        }
+        Fence::Ok
     }
 
     /// The processes holding local locks, for [`Self::ancestry`]'s cache.
@@ -621,14 +676,14 @@ impl ClusterLocks {
 
     /// Whether `ino`'s dirty data must be discarded rather than
     /// published (`Some(fenced)`; see `LockTables::take_discard`).
-    pub fn take_discard(&self, ino: Ino) -> Option<bool> {
+    pub fn take_discard(&self, ino: Ino, write: bool) -> Discard {
         let locks = self.meta.locks();
         // Nothing held, locked or tainted: nothing to discard, and no clock
         // read (as `fenced`).
         if locks.nothing_to_discard() {
-            return None;
+            return Discard::Publish;
         }
-        locks.take_discard(ino, now())
+        locks.take_discard(ino, now(), write)
     }
 
     /// Dirty data of `ino` was discarded: every open file description of
@@ -672,7 +727,7 @@ impl ClusterLocks {
             LocalOutcome::Conflict(l) => Some((l.start, l.end.min(OFFSET_MAX), l.write, l.pid)),
             // (`local_test` never answers `Predecessor`: only a lock
             // waits for an earlier turn.)
-            LocalOutcome::Done | LocalOutcome::Predecessor => None,
+            LocalOutcome::Done | LocalOutcome::Predecessor | LocalOutcome::Parked => None,
             LocalOutcome::NeedGrant(mode) => {
                 constellation_vfs::watch::stage("lock test (core reply)");
                 let (reply, answer) = tokio::sync::oneshot::channel();
@@ -1098,6 +1153,24 @@ impl ClusterLocks {
             let now = std::time::Instant::now();
             let mut ready = None;
             let mut next = None::<std::time::Instant>;
+            let mut ready_park = None;
+            for (i, p) in st.parks.iter().enumerate() {
+                if p.due <= now || p.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+                    ready_park = Some(i);
+                    break;
+                }
+                next = Some(next.map_or(p.due, |n| n.min(p.due)));
+            }
+            if let Some(i) = ready_park {
+                let task = st.parks.swap_remove(i);
+                drop(st);
+                let again = self.advance_park(task);
+                st = self.waits.state.lock().unwrap();
+                if let Some(task) = again {
+                    st.parks.push(task);
+                }
+                continue;
+            }
             for (i, t) in st.tasks.iter().enumerate() {
                 if t.due <= now
                     || t.cancel.as_ref().is_some_and(CancelToken::is_cancelled)
@@ -1120,7 +1193,7 @@ impl ClusterLocks {
             }
             // Nothing due: look again when the first is, at the latest a
             // slice from now (the cancellations), or end when idle.
-            let idle = st.tasks.is_empty();
+            let idle = st.tasks.is_empty() && st.parks.is_empty();
             let wait = match next {
                 Some(next) => (next - now).min(WAIT_SLICE),
                 None => WAIT_POOL_IDLE,
@@ -1129,7 +1202,7 @@ impl ClusterLocks {
             let (guard, timeout) = self.waits.wake.wait_timeout(st, wait).unwrap();
             st = guard;
             st.idle -= 1;
-            if idle && timeout.timed_out() && st.tasks.is_empty() {
+            if idle && timeout.timed_out() && st.tasks.is_empty() && st.parks.is_empty() {
                 st.workers -= 1;
                 return;
             }
@@ -1173,6 +1246,118 @@ impl ClusterLocks {
         None
     }
 
+    /// Plan 43 C7-F F-c: park an op behind a lapsing grant, on the
+    /// [`WaitPool`] (never a frontend worker nor an offload thread): `ready`
+    /// is polled until it says the verdict is in, the caller's `cancel`
+    /// ends the wait (`ParkEnd::Interrupted`), or the bound passes — the
+    /// lapse's own (`lock_owner_wait_max_ms`, which the table gives up
+    /// at) plus a little: `ParkEnd::Resolved` either way, and `done` asks
+    /// again, finding the grant resolved or fenced. `done` runs on a pool
+    /// thread (or, with none to start, on this one with
+    /// `ParkEnd::NoThread`).
+    pub fn park_deferred(
+        self: &Arc<Self>,
+        cancel: Option<CancelToken>,
+        ready: impl Fn() -> bool + Send + 'static,
+        done: impl FnOnce(ParkEnd) + Send + 'static,
+    ) {
+        let id = self
+            .waits
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let task = ParkTask {
+            id,
+            started: std::time::Instant::now(),
+            due: std::time::Instant::now() + PARK_POLL,
+            cancel,
+            op: constellation_vfs::watch::current(),
+            ready: Box::new(ready),
+            done: Box::new(done),
+        };
+        let mut st = self.waits.state.lock().unwrap();
+        st.parks.push(task);
+        if st.idle > 0 {
+            self.waits.wake.notify_one();
+            return;
+        }
+        if st.workers >= WAIT_POOL_THREADS {
+            // Every thread is at work; one of them comes to it.
+            return;
+        }
+        st.workers += 1;
+        drop(st);
+        let this = self.clone();
+        #[cfg(test)]
+        let fail = self
+            .waits
+            .fail_spawn
+            .load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let fail = false;
+        let spawned = if fail {
+            Err(std::io::Error::other("no thread (test)"))
+        } else {
+            std::thread::Builder::new()
+                .name("lock-wait".into())
+                .spawn(move || this.pool_worker())
+        };
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "could not start a lock-wait thread");
+            let mut st = self.waits.state.lock().unwrap();
+            st.workers -= 1;
+            if st.workers > 0 {
+                return;
+            }
+            let task = st
+                .parks
+                .iter()
+                .position(|t| t.id == id)
+                .map(|i| st.parks.swap_remove(i));
+            drop(st);
+            if let Some(task) = task {
+                self.meta
+                    .locks()
+                    .with_stats(|s| s.lapse_park_refused_pool += 1);
+                (task.done)(ParkEnd::NoThread);
+            }
+        }
+    }
+
+    /// One step of a parked op that is due or cancelled: its end (`None`),
+    /// or the task to wait again.
+    fn advance_park(&self, mut task: ParkTask) -> Option<ParkTask> {
+        if let Some(op) = &task.op {
+            op.adopt();
+        }
+        let end = if task.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+            self.meta
+                .locks()
+                .with_stats(|s| s.lapse_park_interrupted += 1);
+            Some(ParkEnd::Interrupted)
+        } else if task.started.elapsed() >= self.owner_wait_max + PARK_BOUND_SLACK || (task.ready)()
+        {
+            Some(ParkEnd::Resolved)
+        } else {
+            None
+        };
+        match end {
+            Some(end) => {
+                (task.done)(end);
+                if let Some(op) = &task.op {
+                    op.release();
+                }
+                None
+            }
+            None => {
+                task.due = std::time::Instant::now() + PARK_POLL;
+                if let Some(op) = &task.op {
+                    op.release();
+                }
+                Some(task)
+            }
+        }
+    }
+
     fn set_inner(
         &self,
         ino: Ino,
@@ -1202,6 +1387,18 @@ impl ClusterLocks {
             }
             match outcome {
                 LocalOutcome::Done => return Ok(Step::Done),
+                // Plan 43 C7-F F-c: the grant held is lapsing and its
+                // owner has not said yet: wait for the verdict (a
+                // non-blocking request from the wait pool, like one that
+                // waits for a grace), never ask for a fresh grant that
+                // would replace it and fence its owners.
+                LocalOutcome::Parked => {
+                    if !sleep {
+                        return Ok(Step::Wait(PARK_POLL));
+                    }
+                    interrupt.check()?;
+                    std::thread::sleep(LOCAL_POLL);
+                }
                 LocalOutcome::Predecessor
                     if !sleep
                         && *deadline
@@ -1537,7 +1734,22 @@ pub fn current_tag() -> Result<LockTag, Code> {
         let tag = st
             .tag
             .get_or_insert_with(|| {
-                let tag = st.locks.caller_tag(st.pid, st.lock_owner);
+                let mut tag = st.locks.caller_tag(st.pid, st.lock_owner);
+                // Plan 43 C7-F F-c: a caller whose grant is lapsing (not
+                // fenced yet) waits, here, for its owner's verdict: an op
+                // the park gate could not hold (it passed the gate before
+                // the grant lapsed) is then neither refused nor lost.
+                if tag.is_err() {
+                    let started = std::time::Instant::now();
+                    let bound = st.locks.owner_wait_max + PARK_BOUND_SLACK;
+                    while tag.is_err()
+                        && started.elapsed() < bound
+                        && st.locks.owner_fenced(st.pid, st.lock_owner) == Fence::Parked
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                        tag = st.locks.caller_tag(st.pid, st.lock_owner);
+                    }
+                }
                 if let Ok(t) = &tag {
                     st.locks.meta.locks().tag_begin(t, now());
                 }
@@ -1586,8 +1798,17 @@ pub fn reissue_after_lapse() -> bool {
         if st.sent.is_empty() {
             return false;
         }
-        let now = now();
         let locks = st.locks.meta.locks();
+        // Plan 43 C7-F F-c: a grant this mutation was issued under that is
+        // lapsing is waited for (its owner admits or refuses a late
+        // renewal): the op sent under its old window, which the executor
+        // refused as lapsed, goes again under the renewed one.
+        let started = std::time::Instant::now();
+        let bound = st.locks.owner_wait_max + PARK_BOUND_SLACK;
+        while locks.tag_lapsing(&st.sent, now()) && started.elapsed() < bound {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let now = now();
         let fresh = locks.refresh_tag(&st.sent, now);
         fresh != st.sent && locks.tag_honoured(&fresh, now)
     })
@@ -1867,6 +2088,7 @@ pub fn renew_entries_wire(entries: &[LockRenewEntry]) -> Vec<LockRenewWire> {
             ino: e.ino,
             grant: grant_wire(e.grant),
             exclusive: exclusive(e.mode),
+            late: e.late,
         })
         .collect()
 }
@@ -1878,6 +2100,7 @@ pub fn renew_entries_of(entries: Vec<LockRenewWire>) -> Vec<LockRenewEntry> {
             ino: e.ino,
             grant: grant_of(e.grant),
             mode: mode_of(e.exclusive),
+            late: e.late,
         })
         .collect()
 }
@@ -2055,6 +2278,7 @@ mod tests {
             ino: 5,
             grant: GrantId { node: 1, seq: 2 },
             mode: LockMode::Shared,
+            late: true,
         }];
         assert_eq!(renew_entries_of(renew_entries_wire(&entries)), entries);
         let results = vec![
@@ -2095,6 +2319,8 @@ mod tests {
             recalled: false,
             gen: 0,
             confirmed_ms: constellation_meta::locks::Grant::UNCONFIRMED,
+            settled: true,
+            lapsed: true,
         }];
         assert_eq!(grants_of(&grants_wire(&grants)), grants);
         assert!(grants_of(&[]).is_empty());

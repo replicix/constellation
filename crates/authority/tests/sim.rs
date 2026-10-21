@@ -383,6 +383,9 @@ fn replay_seed() {
         }
         Ok("fast-takeover-skewed-holder") => fast_takeover_skewed_holder_config(),
         Ok("locks-s3-cut-holder-alive") => locks_s3_cut_holder_alive_config(),
+        Ok("locks-s3-cut-holder-lapse") => locks_s3_cut_holder_lapse_config(),
+        Ok("locks-late-stale-mirror") => locks_late_stale_mirror_config(),
+        Ok("locks-late-stale-mirror-naive") => locks_late_stale_mirror_naive_config(),
         Ok("strict-isolated-reader") => strict_isolated_reader_config(),
         Ok("strict-isolated-reader-beats") => strict_isolated_reader_beats_config(),
         Ok("strict-isolated-reader-skewed") => strict_isolated_reader_skewed_config(),
@@ -4390,6 +4393,9 @@ fn sweep_config() {
         }
         "fast-takeover-skewed-holder" => fast_takeover_skewed_holder_config(),
         "locks-s3-cut-holder-alive" => locks_s3_cut_holder_alive_config(),
+        "locks-s3-cut-holder-lapse" => locks_s3_cut_holder_lapse_config(),
+        "locks-late-stale-mirror" => locks_late_stale_mirror_config(),
+        "locks-late-stale-mirror-naive" => locks_late_stale_mirror_naive_config(),
         "strict-isolated-reader" => strict_isolated_reader_config(),
         "strict-isolated-reader-beats" => strict_isolated_reader_beats_config(),
         "strict-isolated-reader-skewed" => strict_isolated_reader_skewed_config(),
@@ -4543,6 +4549,13 @@ fn sweep_config() {
         std::sync::atomic::AtomicU64::new(0),
     ]);
     let fenced_seeds = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    // Plan 43 C7-F F-c (`SWEEP-PARKS`): [I/O steps parked, resumed, refused
+    // after a park, lock requests parked, late renewals admitted, refused,
+    // final mirrors begun, installed by a successor, mismatched, ms of the
+    // longest park], and the seeds with a resume.
+    let parks: std::sync::Arc<[std::sync::atomic::AtomicU64; 10]> =
+        std::sync::Arc::new(Default::default());
+    let park_seeds = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     // Plan 43 C7-F: [takeovers, takeovers by a seal, floors armed, floors
     // the cap shortened, takeovers whose cap had passed, ms saved by the
     // cap], over the run's nodes, and the length of every floor armed.
@@ -4577,6 +4590,7 @@ fn sweep_config() {
         let epoch_streamed = epoch_streamed.clone();
         let chunks = chunks.clone();
         let (fenced, fenced_seeds) = (fenced.clone(), fenced_seeds.clone());
+        let (parks, park_seeds) = (parks.clone(), park_seeds.clone());
         let (floors, floor_ms) = (floors.clone(), floor_ms.clone());
         let guard_rises = guard_rises.clone();
         let guard_base_rises = guard_base_rises.clone();
@@ -4676,6 +4690,34 @@ fn sweep_config() {
                             ios: report.locks.ios,
                         });
                     }
+                    {
+                        let l = &report.locks;
+                        let sum = |f: fn(&constellation_authority::Stats) -> u64| -> u64 {
+                            report.stats.values().map(f).sum()
+                        };
+                        parks[0].fetch_add(l.parked_ios, ord);
+                        parks[1].fetch_add(l.resumed_ios, ord);
+                        parks[2].fetch_add(l.park_refused_ios, ord);
+                        parks[3].fetch_add(l.parked_requests, ord);
+                        parks[4].fetch_add(sum(|s| s.lock_late_admitted), ord);
+                        parks[5].fetch_add(sum(|s| s.lock_late_refused), ord);
+                        parks[6].fetch_add(sum(|s| s.lock_mirror_final_sent), ord);
+                        parks[7].fetch_add(sum(|s| s.lock_mirror_final_installed), ord);
+                        parks[8].fetch_add(sum(|s| s.lock_mirror_final_mismatch), ord);
+                        parks[9].fetch_max(l.max_park_ms, ord);
+                        if l.parked_ios + l.parked_requests > 0 {
+                            park_seeds.lock().unwrap().push(seed);
+                            eprintln!(
+                                "SWEEP-PARK {label} seed {seed}: {} I/O steps parked, {} resumed, \
+                                 {} refused; {} lock requests parked; longest park {} ms",
+                                l.parked_ios,
+                                l.resumed_ios,
+                                l.park_refused_ios,
+                                l.parked_requests,
+                                l.max_park_ms
+                            );
+                        }
+                    }
                     fenced[0].fetch_add(report.locks.fenced_ios, ord);
                     fenced[1].fetch_add(lost, ord);
                     if report.locks.fenced_ios > 0 || lost > 0 {
@@ -4725,6 +4767,26 @@ fn sweep_config() {
         },
     );
     let ord = std::sync::atomic::Ordering::Relaxed;
+    {
+        let mut seeds = park_seeds.lock().unwrap().clone();
+        seeds.sort_unstable();
+        eprintln!(
+            "SWEEP-PARKS {label}: I/O steps parked {}, resumed {}, refused after a park {}, lock \
+             requests parked {}; late renewals admitted {}, refused {}; final mirrors begun {}, \
+             installed {}, mismatched {}; longest park {} ms; {} seeds with a park",
+            parks[0].load(ord),
+            parks[1].load(ord),
+            parks[2].load(ord),
+            parks[3].load(ord),
+            parks[4].load(ord),
+            parks[5].load(ord),
+            parks[6].load(ord),
+            parks[7].load(ord),
+            parks[8].load(ord),
+            parks[9].load(ord),
+            seeds.len(),
+        );
+    }
     let mut lengths = floor_ms.lock().unwrap().clone();
     lengths.sort_unstable();
     let pct = |p: usize| {
@@ -6713,6 +6775,64 @@ fn locks_s3_cut_holder_alive_config() -> SimConfig {
     }
 }
 
+/// Plan 43 C7-F F-c: `locks-s3-cut-holder-alive` with long critical
+/// sections (10 to 30 steps of 40 to 160 ms: seconds), so that the clients'
+/// grants lapse inside them across the gap between the old root's last
+/// renewal and its successor's existence. Before F-c the lock owner's I/O
+/// was refused (`EIO`) from the lapse; now it waits (parks) and resumes when
+/// the old root, or the successor from the old root's final mirror, admits a
+/// late renewal of the same grant — nothing conflicting was granted since —
+/// and only a grant that was granted over (or cannot be proved) is refused.
+fn locks_s3_cut_holder_lapse_config() -> SimConfig {
+    SimConfig {
+        lock_ios: (10, 30),
+        lock_io_ms: (40, 160),
+        ..locks_s3_cut_holder_alive_config()
+    }
+}
+
+/// Plan 43 C7-F F-c: the old root is cut from S3 for a while (alive, as
+/// `locks-s3-cut-holder-lapse`), a locker is cut from everyone before that
+/// (its grant lapses, the old root outwaits it and grants the lock to
+/// another node), and every lock mirror after the first second is lost (the
+/// final one's re-sends included): the backup seals with an older mirror
+/// than the old root's last table, in which the outwaited grant is still
+/// listed and the grant that replaced it is not. A
+/// late renewal of it must be refused there (it is not the final mirror):
+/// 0 violations. The same run with the successor trusting such a mirror
+/// (`Config::lock_trust_nonfinal_mirror`) is the negative control
+/// (`locks-late-stale-mirror-naive`: violations).
+fn locks_late_stale_mirror_config() -> SimConfig {
+    SimConfig {
+        lock_mirror_drop: 1.0,
+        lock_mirror_drop_from_ms: 1_000,
+        faults: vec![
+            ScheduledFault {
+                at_ms: 300,
+                kind: FaultKind::PartitionLocker { for_ms: 11_000 },
+            },
+            ScheduledFault {
+                at_ms: 4_000,
+                kind: FaultKind::CutS3Holder { for_ms: 9_000 },
+            },
+        ],
+        lock_ios: (10, 30),
+        lock_io_ms: (40, 160),
+        ..locks_s3_cut_holder_alive_config()
+    }
+}
+
+fn locks_late_stale_mirror_naive_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(|id, inc| {
+            let mut c = sim::run::backup_core_config(id, inc);
+            c.lock_trust_nonfinal_mirror = true;
+            c
+        }),
+        ..locks_late_stale_mirror_config()
+    }
+}
+
 /// Nodes stop (their events queue, their clients keep running) while
 /// their clients wait for or hold locks: renewals stall, grants lapse
 /// under critical sections, and replies and pushes are handled late —
@@ -7493,6 +7613,11 @@ impl M14Totals {
         c.late_unacked_turns += l.late_unacked_turns;
         c.token_refused += l.token_refused;
         c.overtaken += l.overtaken;
+        c.parked_ios += l.parked_ios;
+        c.resumed_ios += l.resumed_ios;
+        c.park_refused_ios += l.park_refused_ios;
+        c.parked_requests += l.parked_requests;
+        c.max_park_ms = c.max_park_ms.max(l.max_park_ms);
         for s in r.stats.values() {
             self.grants += s.lock_grants;
             self.requests += s.lock_requests;
@@ -8133,6 +8258,84 @@ fn a_lock_owner_stepped_forward_does_not_outwait_a_grant_early() {
     }
 }
 
+/// Plan 43 C7-F F-c: a lock owner whose grant lapses across the gap between
+/// the old root's last renewal and its successor's existence waits (its
+/// I/O parks) and resumes when the old root, or the successor from the old
+/// root's final mirror, admits a late renewal of the same grant. Before
+/// F-c every one of those I/Os was refused (`EIO`): 127 of them in the first
+/// 300 seeds of `locks-s3-cut-holder-alive`, 35 after (the grants that were
+/// granted over, or cannot be proved); `locks-s3-cut-holder-lapse` has the
+/// longer sections. No mutual-exclusion violation, whatever the park did.
+#[test]
+fn a_lapsed_locker_resumes_when_the_owner_admits_a_late_renewal() {
+    for (label, config) in [
+        (
+            "locks-s3-cut-holder-alive",
+            locks_s3_cut_holder_alive_config(),
+        ),
+        (
+            "locks-s3-cut-holder-lapse",
+            locks_s3_cut_holder_lapse_config(),
+        ),
+    ] {
+        let (mut parked, mut resumed, mut refused, mut fenced, mut installed) = (0, 0, 0, 0, 0);
+        for seed in 0..60u64 {
+            let report = run_seed(seed, config.clone()).unwrap_or_else(|e| {
+                panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
+            });
+            parked += report.locks.parked_ios;
+            resumed += report.locks.resumed_ios;
+            refused += report.locks.park_refused_ios;
+            fenced += report.locks.fenced_ios;
+            installed += report
+                .stats
+                .values()
+                .map(|s| s.lock_mirror_final_installed)
+                .sum::<u64>();
+        }
+        assert!(
+            resumed > 0,
+            "{label}: no parked I/O ever resumed: {parked} parked"
+        );
+        assert!(
+            resumed > refused,
+            "{label}: more refused ({refused}) than resumed ({resumed})"
+        );
+        assert!(
+            fenced >= refused,
+            "{label}: a refused park fences ({fenced} fenced, {refused} refused)"
+        );
+        assert!(
+            installed > 10,
+            "{label}: few final mirrors installed: {installed}"
+        );
+    }
+}
+
+/// Plan 43 C7-F F-c: the successor of a fast takeover trusts only the old
+/// root's *final* mirror. Every lock mirror after the first second is lost,
+/// a locker is cut from everyone (its grant lapses and is outwaited, the
+/// old root grants the lock to another node) and the old root is cut from
+/// S3 until its backup seals: the successor's mirror lists the outwaited
+/// grant but not the grant over it, and a late renewal of it must be
+/// refused. `locks-late-stale-mirror`: 0 violations in 2 000 seeds; the same
+/// run with a successor that trusts such a mirror
+/// (`Config::lock_trust_nonfinal_mirror`; `-naive`) violates mutual
+/// exclusion — in 8 of the first 500 seeds, which are pinned.
+#[test]
+fn a_late_renewal_against_a_stale_mirror_is_refused_and_the_naive_successor_violates() {
+    for seed in [34u64, 51, 106, 163, 203, 318, 336, 363] {
+        run_seed(seed, locks_late_stale_mirror_config())
+            .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        let e = run_seed(seed, locks_late_stale_mirror_naive_config())
+            .expect_err("a successor trusting a stale mirror never violated: no control");
+        assert!(
+            e.contains("mutual exclusion violated") && e.contains("after a late renewal"),
+            "seed {seed}: {e}"
+        );
+    }
+}
+
 /// Plan 43 C7-H1 (3/4): a successor stepped forward inside its takeover
 /// floor keeps the floor on its wait clock. `fast-takeover-successor-step-
 /// forward`: 21 of 2 000 seeds failed before (the first at 0, 39 and 231).
@@ -8632,10 +8835,12 @@ fn locks_writer_hold_delegated_settles_before_the_head() {
 /// and the write landed in the next holder's critical section (found by a
 /// 3000-seed sweep of `locks-writer-hold-delegated-unsettled`: 4 seeds
 /// with the ask-again traffic, which changed the earlier trajectories).
-/// Each passes with the settle.
+/// Each passes with the settle. Plan 43 C7-F F-c moved the trajectories (a
+/// parked op instead of a fenced one): of these four only 745 and 1081 failed
+/// on the parent in 0..2000 and here only 1282 does, so 1282 joins the list.
 #[test]
 fn locks_writer_hold_delegated_without_the_settle_is_caught() {
-    let seeds = [745, 1081, 2045, 2369];
+    let seeds = [745, 1081, 1282, 2045, 2369];
     let mut caught = 0;
     for seed in seeds {
         if let Err(e) = run_seed(seed, locks_writer_hold_delegated_unsettled_config()) {

@@ -212,6 +212,33 @@ impl Responder<ReadData> for ReadReply {
     }
 }
 
+/// Plan 43 C7-F F-c review: whether a reply type can reserve one of its
+/// ring queue's `depth - 1` lock-wait entries when its op waits
+/// (`fuser::ReplyEmpty::hold_for_wait`; the vendored fuser has it on
+/// `ReplyEmpty` only). A parked op whose reply cannot is refused over a ring
+/// (`adapter::Parkable`): holding its entry outside the budget let parked
+/// reads and writes fill a CPU's queue and stall every request on it.
+pub(crate) trait RingBudget {
+    const RING_BUDGETED: bool;
+}
+
+macro_rules! ring_budget {
+    ($($t:ty => $b:expr),* $(,)?) => {
+        $(impl RingBudget for $t { const RING_BUDGETED: bool = $b; })*
+    };
+}
+
+ring_budget! {
+    EmptyReply => true,
+    RenameReply => true,
+    AttrReply => false,
+    EntryReply => false,
+    CreateReply => false,
+    OpenReply => false,
+    ReadReply => false,
+    WriteReply => false,
+}
+
 pub(crate) struct EmptyReply(pub ReplyEmpty);
 
 impl Responder<()> for EmptyReply {
@@ -259,6 +286,16 @@ impl Responder<()> for RenameReply {
                 drop(names);
                 reply.error(reply_code(e.code()));
             }
+        }
+    }
+
+    /// As [`EmptyReply`]'s: a parked rename holds one of the queue's
+    /// lock-wait entries over a ring.
+    fn begin_wait(&mut self) -> constellation_vfs::WaitStart {
+        if self.reply.hold_for_wait() {
+            constellation_vfs::WaitStart::Held(None)
+        } else {
+            constellation_vfs::WaitStart::Refused
         }
     }
 }

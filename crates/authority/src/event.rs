@@ -850,6 +850,10 @@ pub enum PeerMsg {
         /// Every lock floor the holder knows, joined: a fast successor
         /// puts it under the whole namespace.
         floor: constellation_meta::Position,
+        /// Plan 43 C7-F F-c: `Some(key)`: the **final** mirror of the lease
+        /// `key` names — the whole table as of the moment its holder could
+        /// no longer add a record under it (`Core::lock_final_step`).
+        final_for: Option<LeaseKey>,
     },
     /// Plan 30 §M14: `getlk` — whether another node holds a conflicting
     /// grant.
@@ -1068,7 +1072,18 @@ pub struct LockRenewEntry {
     pub ino: Ino,
     pub grant: constellation_meta::locks::GrantId,
     pub mode: constellation_meta::locks::LockMode,
+    /// Plan 43 C7-F F-c: a **late** renewal, sent for a grant whose window
+    /// its holder no longer honours (it pins local locks or unpublished
+    /// writes and asks to have the same grant back). The owner admits it
+    /// only where it can prove no conflicting grant was issued since
+    /// (`LockTables::admit_late`), never as a reclaim.
+    pub late: bool,
 }
+
+/// Plan 43 C7-F F-c: the identity of a lease body as a final mirror and a
+/// fast takeover compare it: `(holder, holder_clock, holder_wait_ms,
+/// epoch)`. Equal means the very lease the old root held at its end.
+pub type LeaseKey = (u64, u64, i64, u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockRenewResult {
