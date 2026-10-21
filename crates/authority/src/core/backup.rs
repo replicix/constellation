@@ -229,6 +229,11 @@ const RECONFIG_ATTEMPTS: u32 = 3;
 /// How often the holder's backup bookkeeping (selection, timeouts,
 /// promotion) runs between ticks.
 const HOUSEKEEPING_MS: i64 = 50;
+
+/// Plan 43 C7-F F-a0 (b): the least time between two attempts to clear an
+/// inherited mark (or two reads that settle one): a failed CAS is not
+/// retried on every event.
+const CLEAR_RETRY_MS: i64 = 1_000;
 /// The longest a holder's [`PeerMsg::BackupHold`] holds this node's seal
 /// watch, whatever it asks.
 pub const BACKUP_HOLD_MAX_MS: u64 = 30_000;
@@ -420,6 +425,26 @@ pub(crate) struct AckState {
     pub s3_rtt_ms: u64,
     /// The `MarkGranting` CAS in flight.
     marking: Option<OpId>,
+    /// Plan 43 C7-F F-a0 (b): the lease's mark is one the tenure inherited
+    /// (its claim CAS, the mark `acquire_won` or the reconfiguration wrote
+    /// for a duty it stood on), and none of it is for something this
+    /// tenure itself granted or answered (`mark_own`): the mark may be
+    /// cleared once nothing it stands on is live
+    /// (`Core::maybe_clear_inherited_mark`). Both are reset with the tenure.
+    pub(crate) mark_inherited: bool,
+    /// The tenure itself marked (a grant or an answer's gate:
+    /// `ensure_granting_marked`), or its lease was marked at its claim by
+    /// `strict_mounts` or the carry of its own earlier lease: permanent.
+    pub(crate) mark_own: bool,
+    /// The `ClearMark` CAS (or the re-read that settles it) in flight.
+    pub(crate) unmarking: Option<OpId>,
+    /// A `ClearMark` CAS whose outcome is not known (in doubt, or its
+    /// re-read failed): the lease is read before anything is answered,
+    /// granted or marked, whatever the in-memory mark says.
+    pub(crate) unmark_unsettled: bool,
+    /// The last attempt to clear the mark (a failed one is not retried on
+    /// every event).
+    last_clear_try: WaitMs,
     /// Plan 41 L0: the lease read that renewal answers held for stale
     /// liveness wait for (`Core::renew_probe`), and when it was sent.
     renew_probe: Option<(OpId, HonourMs)>,
@@ -1034,7 +1059,15 @@ impl Core {
     /// until it settles; then the tenure is fast and marks itself
     /// (`renew_kick`), or is `Local` still. Nor while such a CAS's outcome
     /// is not known (`reconfig_in_doubt`).
+    ///
+    /// Plan 43 C7-F F-a0 (b): nor while the mark is being cleared
+    /// (`Core::maybe_clear_inherited_mark`), or its clearing is not known
+    /// to have failed: a lease that is unmarked in S3 and marked here would
+    /// let an answer stand in a version nobody waits out.
     pub(crate) fn tenure_marked(&self) -> bool {
+        if self.ack.unmarking.is_some() || self.ack.unmark_unsettled {
+            return false;
+        }
         if self
             .ack
             .reconfig
@@ -1159,7 +1192,11 @@ impl Core {
 
     /// Plan 30 §M9: a tenure that serves strict reads says so in the
     /// lease first (one CAS per tenure). `true` when it already does.
+    ///
+    /// Plan 43 C7-F F-a0 (b): a mark made for what the tenure answers
+    /// itself is its own for good (`mark_own`): never cleared.
     pub(crate) fn ensure_granting_marked(&mut self, out: &mut Vec<Action>) -> bool {
+        self.ack.mark_own = true;
         self.ensure_marked(out)
     }
 
@@ -1167,6 +1204,7 @@ impl Core {
     /// (inherited from a predecessor, left by its own earlier tenure, or
     /// admitted into a `Local` one), not for something it grants itself.
     pub(crate) fn ensure_marked_inherited(&mut self, out: &mut Vec<Action>) -> bool {
+        self.ack.mark_inherited = true;
         self.ensure_marked(out)
     }
 
@@ -1174,14 +1212,25 @@ impl Core {
         let Some((lease, tag)) = self.lease.held.clone() else {
             return false;
         };
+        // The mark is being cleared (or the clear's outcome is not known):
+        // the in-memory mark says nothing about the object, and nothing is
+        // granted or answered until the CAS is settled.
+        if self.ack.unmarking.is_some() || self.ack.unmark_unsettled {
+            return false;
+        }
         if lease.granted_delegations {
             return true;
         }
         // A reconfiguration CAS out replaces the version this mark would
         // replace (the lease CAS gate below is the job slot's only): the
         // mark follows once it settles (`renew_after_event`, the next
-        // grant).
-        if self.ack.reconfig.is_none() && self.ack.marking.is_none() && !self.lease_cas_in_flight()
+        // grant). The same while the mark is being cleared (a mark CAS
+        // before its outcome is known could undo it, or be undone).
+        if self.ack.reconfig.is_none()
+            && self.ack.marking.is_none()
+            && self.ack.unmarking.is_none()
+            && !self.ack.unmark_unsettled
+            && !self.lease_cas_in_flight()
         {
             let op = self.issue_s3(
                 S3Op::LeaseSwap {
@@ -1245,6 +1294,168 @@ impl Core {
             S3Result::LeaseGet(Ok(None)) => {
                 self.deposed(now, 0, 0, mine.epoch, replica, out);
             }
+            _ => {}
+        }
+    }
+
+    // ------------------------------------------------ clearing a mark
+
+    /// Plan 43 C7-F F-a0 (b): a mark this tenure inherited (not one it made
+    /// for its own grants and answers: `mark_own`) is cleared by CAS once
+    /// nothing it stands on is live, so a seal of the tenure costs nothing
+    /// even if it never granted, and a chain of seals stops paying a floor
+    /// each. Only when all of it holds: `strict_mounts` marks for good; the
+    /// held lease is marked, is not being released, lost or gated and is no
+    /// continuation epoch's hold; no floor is pending or running and no
+    /// duty is live ([`Core::tenure_duty_live`]: no grant record at all,
+    /// live or expired, no grace or quarantine, no read grant); no
+    /// delegation is out (its generations' grants and the read grants a
+    /// delegate gave); no answer is held; and no lease CAS or lease read of
+    /// the tenure's is out.
+    ///
+    /// Safe because nothing is live at the decision and nothing is answered
+    /// while the CAS is out (`tenure_marked`, `ensure_marked`: renewals,
+    /// reclaims, grants and strict reads wait). Once it lands the tenure is
+    /// a fresh unmarked fast tenure, which any grant or renewal first marks
+    /// again (`ensure_granting_marked`, `renew_kick`) — the state a taker of
+    /// an unmarked released lease already starts from. A seal racing the
+    /// clear only over-waits (it replaces the marked version), or replaces
+    /// the unmarked one and finds nothing live. A clear that fails or whose
+    /// outcome is not known is settled by a lease read before the tenure
+    /// answers anything (`unmark_unsettled`): the in-memory mark is never
+    /// true while S3 may hold the unmarked version.
+    pub(crate) fn maybe_clear_inherited_mark(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some((lease, tag)) = self.lease.held.clone().filter(|_| !self.lease.lost) else {
+            self.ack.unmarking = None;
+            self.ack.unmark_unsettled = false;
+            return;
+        };
+        if self.ack.unmark_unsettled {
+            // The lease is read again, whatever else is in flight: nothing
+            // is answered until it says what the mark is.
+            if self.ack.unmarking.is_none()
+                && now.wait.since(self.ack.last_clear_try) >= CLEAR_RETRY_MS
+            {
+                self.ack.last_clear_try = now.wait;
+                let op = self.issue_s3(S3Op::LeaseGet, S3For::ClearMarkReread, out);
+                self.ack.unmarking = Some(op);
+            }
+            return;
+        }
+        if !self.ack.mark_inherited
+            || self.ack.mark_own
+            || self.ack.unmarking.is_some()
+            || !lease.granted_delegations
+            || self.cfg.strict_mounts
+            || now.wait.since(self.ack.last_clear_try) < CLEAR_RETRY_MS
+        {
+            return;
+        }
+        if self.lease.releasing
+            || self.lease.epoch_held()
+            || self.lease.gate.is_some()
+            || self.ack.pending_floor
+            || self.ack.floor_until > now.wait
+            || self.ack.marking.is_some()
+            || self.ack.reconfig.is_some()
+            || self.ack.renew_probe.is_some()
+            || self.lock_answers_held()
+            || !self.ack.renew_held_deleg.is_empty()
+            || self.lease_cas_in_flight()
+            || self.tenure_duty_live(now, replica)
+            || !replica.delegation_table().is_empty()
+        {
+            return;
+        }
+        self.ack.last_clear_try = now.wait;
+        tracing::info!(
+            node = self.cfg.node_id,
+            epoch = lease.epoch,
+            "nothing the inherited mark stands on is live any more: clearing it"
+        );
+        let op = self.issue_s3(
+            S3Op::LeaseSwap {
+                lease: lease.without_granted_delegations(),
+                tag,
+            },
+            S3For::ClearMark,
+            out,
+        );
+        self.ack.unmarking = Some(op);
+        self.stats.mark_clears += 1;
+    }
+
+    pub(crate) fn on_clear_mark_put(
+        &mut self,
+        now: Now,
+        op: OpId,
+        result: S3Result,
+        out: &mut Vec<Action>,
+    ) {
+        if self.ack.unmarking != Some(op) {
+            return;
+        }
+        self.ack.unmarking = None;
+        match result {
+            S3Result::LeasePut(Ok(tag)) => {
+                if let Some((lease, _)) = self.lease.held.clone() {
+                    self.lease
+                        .renewed(now, lease.without_granted_delegations(), tag);
+                }
+                self.ack.mark_inherited = false;
+            }
+            // A conflict, a failure, an answer lost: the object may be
+            // either version. The lease is read before anything else.
+            _ => {
+                self.ack.unmark_unsettled = true;
+                let op = self.issue_s3(S3Op::LeaseGet, S3For::ClearMarkReread, out);
+                self.ack.unmarking = Some(op);
+            }
+        }
+    }
+
+    pub(crate) fn on_clear_mark_reread(
+        &mut self,
+        now: Now,
+        op: OpId,
+        result: S3Result,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if self.ack.unmarking != Some(op) {
+            return;
+        }
+        self.ack.unmarking = None;
+        let Some((mine, _)) = self.lease.held.clone() else {
+            self.ack.unmark_unsettled = false;
+            return;
+        };
+        match result {
+            S3Result::LeaseGet(Ok(Some((cur, tag))))
+                if cur.holder == self.cfg.node_id && cur.epoch == mine.epoch =>
+            {
+                // Whichever mark it has: the clear landed or it did not.
+                if !cur.granted_delegations {
+                    self.ack.mark_inherited = false;
+                }
+                self.lease.renewed(now, cur, tag);
+                self.ack.unmark_unsettled = false;
+                self.reconcile_peers_with_lease();
+            }
+            S3Result::LeaseGet(Ok(Some((cur, _)))) => {
+                self.ack.unmark_unsettled = false;
+                self.deposed(now, cur.holder, cur.epoch, mine.epoch, replica, out);
+            }
+            S3Result::LeaseGet(Ok(None)) => {
+                self.ack.unmark_unsettled = false;
+                self.deposed(now, 0, 0, mine.epoch, replica, out);
+            }
+            // Still unknown: read again at the next housekeeping.
             _ => {}
         }
     }
@@ -1436,6 +1647,11 @@ impl Core {
         self.ack.pending_floor = false;
         self.ack.pending_cap = None;
         self.ack.floor_until = WaitMs(0);
+        // The marks belong to the tenure that ended.
+        self.ack.mark_inherited = false;
+        self.ack.mark_own = false;
+        self.ack.unmarking = None;
+        self.ack.unmark_unsettled = false;
     }
 
     /// The takeover's marker landed at `now`.
@@ -1624,6 +1840,9 @@ impl Core {
                 self.backup_promote(now, replica, out);
             }
         }
+        // Plan 43 C7-F F-a0 (b): an inherited mark nothing stands on any
+        // more is cleared (a few flag reads unless the tenure has one).
+        self.maybe_clear_inherited_mark(now, replica, out);
         if let Some(backups) = self.ack.reconfig_wanted.take() {
             self.issue_reconfig(now, backups, replica, out);
         }
@@ -2068,6 +2287,8 @@ impl Core {
             return;
         }
         if self.lease_cas_in_flight()
+            || self.ack.unmarking.is_some()
+            || self.ack.unmark_unsettled
             || now.wait.since(self.ack.last_reconfig_try)
                 < (self.cfg.backup_heartbeat_ms as i64).max(1)
         {
@@ -2153,6 +2374,17 @@ impl Core {
                     config_version = r.lease.config_version,
                     "backup set reconfigured"
                 );
+                // A mark this reconfiguration wrote for a duty the tenure
+                // stood on is inherited (its own, if the lease was marked
+                // already, stays its own).
+                let was_marked = self
+                    .lease
+                    .held
+                    .as_ref()
+                    .is_some_and(|(l, _)| l.granted_delegations);
+                if r.marks && !was_marked {
+                    self.ack.mark_inherited = true;
+                }
                 self.lease.renewed(now, r.lease, tag);
                 // The catch-all (L3): a duty that arose with the CAS out
                 // and the tenure now sealable but unmarked (a duty that

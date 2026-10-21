@@ -2959,7 +2959,19 @@ impl Core {
             } => (Some(prev), takeover, marker),
             _ => (None, false, false),
         };
+        // Plan 43 C7-F F-a0 (b): whose mark the claim carries. The lease
+        // this node had held is carried (`granted_lease`'s `own`) or
+        // `strict_mounts` marks for good: the tenure's own. A mark written
+        // for a duty (`acquire_cas`) is inherited, and may be cleared once
+        // nothing is live.
+        let own_carry = prev
+            .as_ref()
+            .is_some_and(|p| p.holder == self.cfg.node_id && !p.released && p.granted_delegations);
         let lease = sent;
+        self.ack.mark_own = lease.granted_delegations && (self.cfg.strict_mounts || own_carry);
+        self.ack.mark_inherited = lease.granted_delegations && !self.ack.mark_own;
+        self.ack.unmarking = None;
+        self.ack.unmark_unsettled = false;
         let epoch = lease.epoch;
         // Plan 30 §M9: this node's own lease at the epoch of a takeover
         // CAS whose outcome was unknown is that takeover having landed:

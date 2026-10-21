@@ -582,9 +582,18 @@ hold. While that
 reconfiguration is out, lock renewals and reclaims are held; they go once the lease is marked.
 A tenure with nothing of the kind live at its first listing (the start-up
 and handoff case) stays unmarked, so a seal of it still waits for nothing.
-(What remains: a mark a tenure inherits stays for its life, so a seal of it
-arms a floor even if it never granted anything, and a chain of seals
-keeps paying one.)
+
+A mark inherited or written for a duty does not outlive it. Once the
+tenure's floor has passed and nothing it stood on is live (no grant record,
+live or expired, no grace or quarantine, no read grant, no delegation, no
+answer held) and the tenure has granted and answered nothing itself, its
+housekeeping clears the mark by CAS, so a seal of it arms no floor and a
+chain of seals stops paying one each. Marks the tenure made for its own
+grants and answers, and `strict_mounts`', are not cleared. Nothing is
+granted, renewed or served while the clear is out, a clear whose outcome is
+unknown is read back before anything is answered, and the next grant or
+renewal marks again before it is answered, so a seal racing the clear only
+over-waits (it replaced the marked version) or finds nothing live.
 
 The cost: a takeover in the last seconds of the old lease waits the whole
 bound where it used to wait only until the expiry, unless the old holder

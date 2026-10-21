@@ -375,6 +375,7 @@ fn replay_seed() {
         Ok("locks-long-grants-seal") => locks_long_grants_seal_config(),
         Ok("fast-takeover-skewed-successor") => fast_takeover_skewed_successor_config(),
         Ok("double-seal-inside-the-grace") => double_seal_inside_the_grace_config(),
+        Ok("double-seal-after-the-grace") => double_seal_after_the_grace_config(),
         Ok("locks-restart-reclaim-seal") => locks_restart_reclaim_seal_config(),
         Ok("fast-takeover-skewed-successor-nobeats") => {
             fast_takeover_skewed_successor_nobeats_config()
@@ -4448,6 +4449,7 @@ fn sweep_config() {
         "locks-long-grants-seal" => locks_long_grants_seal_config(),
         "fast-takeover-skewed-successor" => fast_takeover_skewed_successor_config(),
         "double-seal-inside-the-grace" => double_seal_inside_the_grace_config(),
+        "double-seal-after-the-grace" => double_seal_after_the_grace_config(),
         "locks-restart-reclaim-seal" => locks_restart_reclaim_seal_config(),
         "fast-takeover-skewed-successor-nobeats" => fast_takeover_skewed_successor_nobeats_config(),
         "fast-takeover-skewed-successor-credited" => {
@@ -6791,6 +6793,54 @@ fn double_seal_inside_the_grace_config() -> SimConfig {
     }
 }
 
+/// Plan 43 C7-F F-a0 (b): `double-seal-inside-the-grace`'s two seals, the
+/// second one past the first successor's floor, and nothing granted in
+/// between. The first successor inherited its lease's mark from its
+/// predecessor and served no lock request or strict read since (only node
+/// 3 locks, once, before the first cut), so once its floor (the lock TTL
+/// plus the takeover window and the margins, from its marker) has passed
+/// and nothing is live (not even the record of node 3's cached grant) it
+/// clears the mark; its own seal, at 12.5 s, then
+/// arms no floor. Before the clear it armed a second one for a tenure that
+/// had nothing to protect.
+fn double_seal_after_the_grace_config() -> SimConfig {
+    let cut = |at_ms| {
+        [
+            ScheduledFault {
+                at_ms,
+                kind: FaultKind::CutS3Holder { for_ms: 6_000 },
+            },
+            ScheduledFault {
+                at_ms,
+                kind: FaultKind::PartitionBackup { for_ms: 6_000 },
+            },
+        ]
+    };
+    SimConfig {
+        // The cached grant is let go 0.3 s after its unlock (the sim's 15 s
+        // would leave its record in the tables for the whole run, and a
+        // record, live or not, keeps the mark).
+        core: std::sync::Arc::new(|id, inc| {
+            let mut c = sim::run::backup_core_config(id, inc);
+            c.inbox = false;
+            c.lock_ttl_ms = 5_000;
+            c.lock_cache_idle_ms = 300;
+            c
+        }),
+        clients_per_node: 1,
+        ops_per_client: 4,
+        lock_files: 1,
+        lock_ratio: 1.0,
+        lock_shared_ratio: 0.0,
+        lock_ios: (2, 4),
+        lock_io_ms: (20, 60),
+        lock_nodes: vec![3],
+        client_plan: vec![(3, 0, 1)],
+        faults: cut(2_000).into_iter().chain(cut(12_500)).collect(),
+        ..double_seal_inside_the_grace_config()
+    }
+}
+
 /// Plan 43 C7-F F-a0 L3a/L3c: node 3 holds a lock under node 1's tenure
 /// when node 1 shuts down gracefully (it releases its lease, marked: a
 /// grant is live) and restarts. Nodes 2 and 3 cannot reach S3 meanwhile,
@@ -7692,6 +7742,9 @@ struct M14Totals {
     grace_periods: u64,
     idle_released: u64,
     backup_takeovers: u64,
+    /// Plan 43 C7-F F-a0 (b): floors armed, inherited marks cleared.
+    ack_floor_waits: u64,
+    mark_clears: u64,
     unavailable: u64,
     wait_ms_total: u64,
     max_simulated_ms: u64,
@@ -7777,6 +7830,8 @@ impl M14Totals {
             self.grace_periods += s.lock_grace_periods;
             self.idle_released += s.lock_idle_released;
             self.backup_takeovers += s.backup_takeovers;
+            self.ack_floor_waits += s.ack_floor_waits;
+            self.mark_clears += s.mark_clears;
             self.unavailable += s.lock_unavailable;
             self.wait_ms_total += s.lock_wait_ms_total;
             self.renew_held += s.renew_held;
@@ -8262,6 +8317,28 @@ fn a_sealer_of_a_reclaimed_lease_waits_out_the_grants_that_lease_waited_out() {
     );
 }
 
+/// Plan 43 C7-F F-a0 (b): the first successor of `double-seal-after-the-grace`
+/// serves nothing after its floor and clears the mark it inherited, so the
+/// seal after the second cut (12.5 s) arms no second floor. On the L3 tree
+/// each of the two seals arms one (two floors a seed).
+#[test]
+fn a_second_seal_after_the_grace_arms_no_second_floor() {
+    let t = run_m14(
+        "double-seal-after-the-grace",
+        double_seal_after_the_grace_config(),
+        0..60,
+    );
+    assert!(
+        t.backup_takeovers >= 100,
+        "the backups rarely took over: {t:?}"
+    );
+    assert!(t.mark_clears >= 50, "the mark was rarely cleared: {t:?}");
+    assert!(
+        t.ack_floor_waits * 10 <= t.backup_takeovers * 6,
+        "a floor for the second seal as well: {t:?}"
+    );
+}
+
 /// Plan 43 C7-F F-a: the same configuration with the cap counted from the
 /// beats' *credit* (the holder's clock: `min(at, sent + M)`) instead of
 /// their arrival must split: the holder's clock is 4 s behind its
@@ -8270,7 +8347,12 @@ fn a_sealer_of_a_reclaimed_lease_waits_out_the_grants_that_lease_waited_out() {
 /// of the real cap mean something: 1 of the 2 000 seeds 193000..195000 and
 /// 7 of the 8 000 seeds 195000..203000 fail (three pinned here), and these
 /// three pass with the real cap. (The ask-again traffic changed the
-/// trajectories: the earlier pins, 194557 and 194714, no longer fail.) The
+/// trajectories: the earlier pins, 194557 and 194714, no longer fail; nor
+/// do 197625 and 200749 since plan 43 C7-F F-a0 (b): the credited cap ends
+/// the first successor's floor early, it clears the mark it inherited, and
+/// the CAS it then needs, then the mark CAS before its first grant, delay
+/// that grant past the old grant's window: 7 of the 10 000 seeds
+/// 193000..203000 still fail.) The
 /// real cap is not clean over every range: it violates at the *second*
 /// failover (about 15 s, a clock beyond the envelope), a different and
 /// older failure (`fast_takeover_skewed_successor_known_gaps`), so the
@@ -8278,7 +8360,7 @@ fn a_sealer_of_a_reclaimed_lease_waits_out_the_grants_that_lease_waited_out() {
 /// floor window, where the cap ends the floor early.
 #[test]
 fn a_credited_arrival_cap_splits() {
-    for seed in [193_262, 197_625, 198_196] {
+    for seed in [193_262, 198_196, 198_507] {
         let e = run_seed(seed, fast_takeover_skewed_successor_credited_config())
             .expect_err("a cap counted from the credit never failed: no control");
         assert!(e.contains("mutual exclusion violated"), "seed {seed}: {e}");

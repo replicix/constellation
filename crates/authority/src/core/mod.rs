@@ -1140,6 +1140,8 @@ pub struct Stats {
     /// Successor: takeovers that had to wait out the predecessor's
     /// delegation horizon before acknowledging mutations.
     pub ack_floor_waits: u64,
+    /// Plan 43 C7-F F-a0 (b): inherited marks cleared (CAS issued).
+    pub mark_clears: u64,
     /// Plan 43 C7-F F-a: floors the predecessor's beats shortened
     /// (`ack_floor_capped`, by `ack_floor_cap_saved_ms` in all against the
     /// bound), and takeovers whose cap had passed by the time the marker
@@ -1320,6 +1322,11 @@ pub(crate) enum S3For {
     /// (`Lease::granted_delegations`), and its re-read after a conflict.
     MarkGranting,
     MarkGrantingReread,
+    /// Plan 43 C7-F F-a0 (b): the holder clearing the mark it inherited
+    /// once nothing it stands on is live, and the re-read that settles a
+    /// clear whose outcome is not known.
+    ClearMark,
+    ClearMarkReread,
     /// M10: a takeover's heartbeat read, and a promise PUT (the slack it
     /// advertises).
     Heartbeats,
@@ -2365,6 +2372,8 @@ impl Core {
             S3For::TakeoverGet => self.on_takeover_get(now, result, replica, out),
             S3For::MarkGranting => self.on_mark_granting_put(now, result, replica, out),
             S3For::MarkGrantingReread => self.on_mark_granting_reread(now, result, replica, out),
+            S3For::ClearMark => self.on_clear_mark_put(now, op, result, out),
+            S3For::ClearMarkReread => self.on_clear_mark_reread(now, op, result, replica, out),
             S3For::Heartbeats => self.on_heartbeats(now, result, replica, out),
             S3For::HeartbeatPut(slack) => self.on_heartbeat_put(slack, result),
             S3For::PromiseWatch => {
@@ -2783,6 +2792,10 @@ impl Core {
                 {
                     self.pr.hold_ended = None;
                 }
+                // The tenure continues under the lease it held: whoever
+                // wrote its mark is not known here, so it is its own.
+                self.ack.mark_own = lease.granted_delegations;
+                self.ack.mark_inherited = false;
                 self.lease.adopt(now, lease, tag, None);
                 self.stats.epoch_closed_leases_reheld += 1;
             }

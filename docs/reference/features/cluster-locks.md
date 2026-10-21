@@ -294,9 +294,31 @@ whose tenure left lock grants (or a grace) behind (the release marks its
 lease exactly then, whatever the released lease said before; grants moved
 toward a delegate count): both wait out grants of the tenure before, and a
 successor of theirs, sealed in before they granted anything, must wait out
-the same grants. A mark inherited this way stays for the tenure's life. A successor with no such mark in its lease would arm no grace, and
+the same grants. A successor with no such mark in its lease would arm no grace, and
 a lock the first holder's tenure granted without the mirror seeing it could
 be granted over.
+
+A mark of this kind (inherited, or written for a duty the tenure stood on
+when it became sealable: below) does not outlive what it stands on. Once the
+tenure's floor has passed and nothing is live (no grant record at all, live
+or expired; no grace or quarantine, lock or read; no read grant; no
+delegation; no answer held), and the tenure has itself granted and answered
+nothing since its claim, its housekeeping clears the mark by CAS: a seal of
+it then arms no floor, and a chain of seals stops paying one each. Only
+inherited marks are cleared: a mark the tenure made for its own grants
+(`ensure_granting_marked`), or `strict_mounts`', is not (a bursty workload
+would pay a mark CAS on its first grant after each idle period and a clear CAS
+per idle period). While the clear is out no lock is granted, no renewal or
+reclaim answered and no strict read served, and the tenure marks nothing: a
+clear whose outcome is not known (a lost answer, a conflict) is settled by a
+lease read first, and the tenure adopts whatever mark the object holds. Once
+it landed the tenure is a fresh unmarked fast tenure: any grant or renewal
+marks the lease again first, as for the taker of an unmarked released lease.
+A seal racing the clear only over-waits (it replaced the marked version) or
+replaces the unmarked one and finds nothing live. A grant record that stays in
+the table (a holder that died with its grant cached, and nothing conflicts with
+it to purge it) keeps the mark: a lock the holder let go (idle release,
+recall) is gone from the table, and the clear follows it.
 
 A tenure marks its lease from the moment it can be sealed whenever it then
 waits out, or answered, something a sealer must wait out too: lock grants

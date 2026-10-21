@@ -6276,6 +6276,12 @@ impl Core {
                 || self.lk.grace.iter().any(|(_, u)| *u > now.wait))
     }
 
+    /// A lock answer (a grant, a renewal, a reclaim) is held for the
+    /// tenure's liveness, its mark or a horizon write.
+    pub(crate) fn lock_answers_held(&self) -> bool {
+        !self.lk.horizon_held.is_empty() || !self.lk.own_held.is_empty()
+    }
+
     /// What a release leaves behind, exactly: [`Core::lock_duty_live`], or
     /// any grant record at all, an expired one too (a renewal is still
     /// served while a release is under way, or by a tenure whose record

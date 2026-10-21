@@ -55281,3 +55281,137 @@ On the box (16 cores, `/tmp` on tmpfs), every job under `timeout
   `locks-root-reboot-step-forward` (C7a's fail-before) 1139 -> 1140 (seed
   435, the same reboot-with-a-forward-step violation) and F-c's negative
   control `locks-late-stale-mirror-naive` 88 -> 94 (all mutual exclusion).
+
+## Fix: an inherited mark is cleared once nothing it stands on is live (plan 43 C7-F F-a0 (b)) (2026-10-20)
+
+Follow-up (b) of F-a0 (review M1), on top of L3/L4 above. Decision D1
+(2026-10-20): inherited marks only.
+
+### The inherited mark outlives its floor
+
+A tenure that takes over a marked lease is marked for its life (the claim
+CAS writes it; the reconfiguration and `acquire_won` may too), so its own
+sealer arms a floor even if the tenure never granted anything, and a chain of
+seals pays 8.5 s / 23.5 s at the defaults each time for nothing. Only the
+release chain was cut (a released lease's mark is exactly
+`lock_duty_standing`).
+
+### The clear
+
+`Core::maybe_clear_inherited_mark`, in the holder's housekeeping
+(`backup_after_event`, for every holding tenure: an `ack=s3` holder does not
+run the bookkeeping branch), issues a dedicated CAS (`S3For::ClearMark`; the
+body is the held lease with `Lease::without_granted_delegations`) only when
+all hold: the mark is inherited and not own (`ack.mark_inherited &&
+!ack.mark_own`; own: any call of `ensure_granting_marked`, i.e. a grant, a
+request's gate, a strict read, a held answer's kick, `strict_mounts`, or the
+carry of the node's own earlier lease; inherited: the claim CAS's
+`inherits_duty`, the `acquire_won` re-mark, the reconfiguration's mark), the
+lease is marked, not lost, releasing, gated or an epoch's hold, no floor is
+pending or running, `tenure_duty_live` is false (no grant record at all,
+live or expired: 97e806b's revival rule; no grace or quarantine; no read
+grant), the delegation table is empty (conservative: the floor's `deleg` term
+and delegate-given read grants), no answer is held, and no mark, reconfiguration,
+lease read or lease CAS is out. At most once a second (`CLEAR_RETRY_MS`).
+
+In flight (`ack.unmarking`): `tenure_marked` is false (renewals and reclaims
+are held) and `ensure_marked` issues nothing and returns false whatever the
+in-memory mark says (lock grants and strict reads wait; the mark CAS and a
+reconfiguration are postponed). Ok: the tenure adopts the unmarked body and
+`mark_inherited` is cleared; the next grant or renewal marks again through the
+normal gates. Conflict or any other failure, in doubt included: the lease is
+read (`ack.unmark_unsettled`, `S3For::ClearMarkReread`); a lease that is still
+ours is adopted whichever mark it holds, one that is not means `deposed`; a
+failed read is retried at the next housekeeping and answers stay held. Never
+is the in-memory mark true while S3 may hold the unmarked version.
+
+*Safety argument.* At the decision `t0` nothing is live: every inherited grant
+has lapsed (the floor has ended on this node's wait clock), every quarantine
+and grace has passed, there are no records and no read grants, and the tenure
+answered nothing of its own. Nothing new is answered from `t0` until the CAS
+settles (the holds above). Once it lands the tenure is exactly a fresh
+unmarked fast tenure, which any grant or renewal first marks again: the state
+97e806b already treats as safe for the taker of an unmarked release. A seal
+racing the clear replaces the still-marked version and over-waits, or replaces
+the unmarked one and finds nothing live.
+
+*Limit.* A record that stays in the table (its holder died with the grant
+cached and nothing conflicts with it to purge it) keeps the mark; a grant its
+holder lets go (idle release after `lock_cache_idle_ms`, a recall) leaves the
+table at once. This is the price of the revival rule, and what the sim
+configuration below shortens (`lock_cache_idle_ms` 0.3 s).
+
+### Tests
+
+Core, each failing on the L3 tree: `an_inherited_mark_is_cleared_once_the_floor_has_passed_and_nothing_is_live`
+(seal a marked P0, land the marker, step past `floor_until`: the clearing CAS
+goes out; landed, a sealer of the lease arms no floor, one of the marked lease
+before it armed one), `a_grant_during_the_clear_cas_waits_and_re_marks` (a
+lock request with the clear out is `Busy` and issues no mark; after it lands
+the next request marks, then is granted), `a_clear_in_doubt_rereads_before_any_grant`
+(a failed answer: a lease read, nothing granted or marked meanwhile; whether it
+shows the cleared or the marked lease the tenure adopts it).
+`an_inherited_mark_stays_while_anything_it_stands_on_is_live` guards the
+negatives, one at a time, on a plain and a fast tenure: a live grant, an
+expired record, a live read grant, a read quarantine, a lock quarantine, a
+delegation, a grant of its own, `strict_mounts`, a held answer, a floor not
+passed; with the controls clearing. Sim: `double-seal-after-the-grace`
+(`double-seal-inside-the-grace` with the cuts at 2 s and 12.5 s, only node 3
+locking, once, its cached grant released 0.3 s after its unlock): 4000 floors
+armed in 2000 seeds before, 2000 after; pinned by
+`a_second_seal_after_the_grace_arms_no_second_floor`.
+
+### Verification
+
+On the box, every job under `timeout --kill-after=30s`, `-j 4`:
+
+- `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D
+  warnings`: clean.
+- `cargo test --release -p constellation-authority`: lib 524, sim 182. The four
+  core tests fail on the L3 tree (no clearing CAS; run there with the tests
+  alone). The sim pin counts `Stats::mark_clears`, which does not exist before
+  this change; on the L3 tree the configuration arms 4000 floors in 2000
+  seeds, the pin's bound is under 0.6 per seal. `cargo test --release -p
+  constellation-engine --lib`: 816; `-p constellation-store-s3`: 233; `-p
+  constellation-meta --lib`: 269. The model crate is untouched (its suites ran
+  with L3/L4). One sim pin moved: `a_credited_arrival_cap_splits` (see below).
+- The negative control `a_credited_arrival_cap_splits` lost two of its three
+  pins (seeds 197625 and 200749 of `fast-takeover-skewed-successor-credited`
+  no longer fail; 7 of the 10 000 seeds 193000..203000 still do, against 9): the
+  credited cap ends the first successor's floor early, the successor then
+  clears the mark it inherited (seed 197625: at t=3059), and the CAS that
+  takes, then the mark CAS its first grant needs, delay that grant past the old
+  grant's window, where the violation was at t=3062. It is re-pinned to 193262,
+  198196 and 198507, which still violate inside the first failover's floor window
+  and pass with the real cap. Strict-read configurations
+  (`strict-isolated-reader`, `-beats`, `-skewed`, `backup-strict`,
+  `fast-takeover-skewed-successor`, 1000 seeds): identical failing sets (none)
+  and floors against the L3 tree.
+- Every `locks-*` configuration and `double-seal-*`, seeds 0..2000, this tree
+  against the L3 tree: identical failing sets except
+  `locks-holder-step-back-sealed` seed 818, which no longer fails (the known
+  C7b-class failure of a stepped-back holder's wall expiry, reached through a
+  trajectory the clear shifts, not fixed by it). Rebased onto d62f077 and
+  re-run there against d62f077 itself: the same, besides
+  `locks-restart-reclaim-seal`'s 56 seeds.
+
+### The floor-cost table
+
+Seals -> floors armed over seeds 0..2000, `4a0fb20` / after L3 / after (b):
+
+| configuration | 4a0fb20 | L3 | (b) |
+|---|---|---|---|
+| `backup` | 1103 -> 0 | 1103 -> 0 | 1103 -> 0 |
+| `backup-crash` | 2018 -> 0 | 2018 -> 0 | 2018 -> 0 |
+| `backup-strict-inbox-off` | 2207 -> 1994 | 2207 -> 1993 | 2203 -> 1993 |
+| `locks-failover-backup` | 2028 -> 1993 | 2031 -> 1994 | 2038 -> 1968 |
+| `locks-failover-backup-renew` | 2003 -> 2000 | 2003 -> 2000 | 2003 -> 2000 |
+| `locks-s3-cut-holder-alive` | 2002 -> 1852 | 2003 -> 1855 | 2005 -> 1855 |
+| `double-seal-inside-the-grace` | 4029 -> 3999 | 4026 -> 3999 | 4026 -> 3999 |
+| `double-seal-after-the-grace` | 4000 -> 4000 | 4000 -> 4000 | 4000 -> 2000 |
+
+L3 adds floors only where a duty was live at the first listing
+(`locks-restart-reclaim-seal`: 69 -> 2000 of 1944 -> 2000; the rest within
+noise); (b) removes the second floor of `double-seal-after-the-grace` and
+about 1 to 2 % of those of `locks-failover-backup` (-26 of 2038) and its
+`-writes` twin (1979 -> 1932); nothing else moves by more than noise.

@@ -2699,7 +2699,42 @@ successor whose clock is ahead got no quarantine").
   inherited marks only; a mark a tenure made for its own grants is not
   cleared (the cost of a bursty workload paying a mark CAS on its first
   grant after each idle period, and a clear CAS per idle period, is not
-  taken until the floor-cost table shows it matters). Not yet implemented.
+  taken until the floor-cost table shows it matters). *Landed
+  (2026-10-20)*: `Core::maybe_clear_inherited_mark`, in the holder's
+  housekeeping, issues a dedicated CAS (`S3For::ClearMark`;
+  `Lease::without_granted_delegations`) only when the mark is inherited and
+  not own (`ack.mark_inherited && !ack.mark_own`: own for a grant or answer
+  gate, `strict_mounts`, or the carry of an own lease; inherited for the
+  claim CAS's `inherits_duty`, the `acquire_won` re-mark and the
+  reconfiguration's mark), the lease is marked, not lost, releasing, gated
+  or an epoch's hold, no floor is pending or running, `tenure_duty_live` is
+  false (no grant record at all: a record that expired but is still in the
+  table can be revived by a renewal), the delegation table is empty, no
+  answer is held and no mark, reconfiguration or lease read is out. While
+  it is out (`ack.unmarking`) `tenure_marked` is false and
+  `ensure_granting_marked` issues nothing, so renewals and reclaims are
+  held and lock grants and strict reads wait; a clear in doubt
+  (`unmark_unsettled`: a conflict, a failure, a lost answer) is read back
+  before anything is answered and the tenure adopts whichever mark the
+  object holds, deposed if it is no longer ours. *Safety argument.* At the
+  decision nothing is live: every inherited grant has lapsed (the floor has
+  ended on this node's wait clock), every quarantine and grace has passed,
+  there are no records and no read grants, and the tenure answered nothing
+  of its own. From then until the CAS settles nothing is answered. Once it
+  lands the tenure is a fresh unmarked fast tenure, the state 97e806b
+  already treats as safe for the taker of an unmarked release, which any
+  grant or renewal marks first. A seal racing the clear only over-waits (it
+  replaces the still-marked version) or replaces the unmarked one and
+  finds nothing live. Fail-before (core, each on the L3 tree):
+  `an_inherited_mark_is_cleared_once_the_floor_has_passed_and_nothing_is_live`,
+  `a_grant_during_the_clear_cas_waits_and_re_marks` and
+  `a_clear_in_doubt_rereads_before_any_grant`
+  (`an_inherited_mark_stays_while_anything_it_stands_on_is_live` guards the
+  negatives); sim `double-seal-after-the-grace`. *Limit:* a record that
+  stays in the table (the node holding the grant died with it cached, and
+  no conflicting request purges it) keeps the mark: the clear needs an empty
+  table, the revival rule's price; a grant released by its holder (idle
+  release after `lock_cache_idle_ms`, a recall) leaves the table at once.
   (L3) *Duties no claim CAS marks* — *landed (2026-10-20)*: a node
   re-claiming its own released lease with a live quarantine
   (`lock_quarantine_dropped_tenure`; `granted_lease`'s `own` excludes

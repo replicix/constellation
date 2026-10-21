@@ -20008,6 +20008,299 @@ mod locks {
         assert!(!unmarked.granted_delegations, "nothing live: marked");
     }
 
+    /// Node 2's tenure after it sealed marked P0 (node 1): its claim lease
+    /// is marked from its first CAS, its takeover floor has started (the
+    /// marker landed), and it has served nothing. `ack_s3`: the tenure is
+    /// fast from its claim.
+    fn sealed_tenure(ack_s3: bool) -> Harness {
+        let mut h = Harness::new(2);
+        h.core.cfg.ack_s3 = ack_s3;
+        let mut p0 = backup_lease_of(1, 1, h.now.0 + 5_000, vec![2]);
+        p0.granted_delegations = true;
+        let claimed = claim_over(&mut h, &p0, true);
+        assert!(claimed.granted_delegations && h.core.ack.pending_floor);
+        let mut out = Vec::new();
+        h.core.note_marker_landed(h.clk(), &h.meta, &mut out);
+        assert!(h.core.in_takeover_floor(h.clk()));
+        h.core.lease.gate = None;
+        h
+    }
+
+    /// Past the floor (`past_floor`) or just after it started, with the
+    /// lease still long: one event for the tenure's housekeeping; the CAS
+    /// that clears its mark, if one went out.
+    fn clearing_cas(h: &mut Harness, past_floor: bool) -> Option<(OpId, Lease)> {
+        if past_floor {
+            h.now = Ms(h.core.takeover_floor_until().0 + 1);
+        } else {
+            h.advance(10);
+        }
+        let (end, wait_end) = (h.now.0 + 60_000, h.clk().wait.0 + 60_000);
+        let (l, _) = h.core.lease.held.as_mut().unwrap();
+        l.expires_unix_ms = end;
+        l.holder_expires_ms = end;
+        l.holder_wait_ms = wait_end;
+        let out = h.step(Event::Roster {
+            write_eligible: vec![1, 2, 3],
+        });
+        lease_swaps(&out)
+            .into_iter()
+            .find(|(_, l)| !l.granted_delegations && !l.released && l.holder == 2)
+    }
+
+    /// Plan 43 C7-F F-a0 (b): the mark a tenure inherited from its
+    /// predecessor outlives the floor that justified it, and its own sealer
+    /// keeps arming a floor for a tenure that never granted anything (a
+    /// chain of seals pays one each, 8.5 s at the defaults). Once the floor
+    /// has passed and nothing is live, the tenure clears it by CAS; a seal of
+    /// the lease that results arms none, one of the marked lease before it
+    /// armed one.
+    #[test]
+    fn an_inherited_mark_is_cleared_once_the_floor_has_passed_and_nothing_is_live() {
+        let mut h = sealed_tenure(false);
+        let marked = h.core.lease.held.as_ref().unwrap().0.clone();
+        // A sealer of the marked lease arms a floor: what the clear is for.
+        let listing =
+            |l: &Lease| l.reconfigured(vec![3], constellation_store_s3::AckPolicy::Backup);
+        let mut sealer = Harness::new(3);
+        claim_over(&mut sealer, &listing(&marked), true);
+        assert!(sealer.core.ack.pending_floor, "the marked lease armed none");
+        let (op, cleared) = clearing_cas(&mut h, true)
+            .expect("no CAS cleared the inherited mark once the floor had passed");
+        assert!(cleared.backups.is_empty() && cleared.epoch == marked.epoch);
+        assert!(
+            h.core.lease.held.as_ref().unwrap().0.granted_delegations,
+            "unmarked in memory before the CAS landed"
+        );
+        h.advance(20);
+        h.step(Event::S3 {
+            op,
+            result: S3Result::LeasePut(Ok(tag())),
+        });
+        assert!(!h.core.lease.held.as_ref().unwrap().0.granted_delegations);
+        // Once: nothing more goes out.
+        h.advance(1_500);
+        assert!(clearing_cas(&mut h, false).is_none());
+        // A sealer of the unmarked lease arms no floor.
+        let mut sealer = Harness::new(3);
+        claim_over(&mut sealer, &listing(&cleared), true);
+        assert!(
+            !sealer.core.ack.pending_floor,
+            "the cleared lease armed one"
+        );
+    }
+
+    /// A lock grant record in node 2's table, live until `until` (wait clock).
+    fn install_grant(h: &Harness, until: i64) {
+        let f = h.meta.allocate_ino(ROOT_INO).unwrap();
+        h.meta.locks().install(constellation_meta::locks::Grant {
+            id: GrantId { node: 2, seq: 1 },
+            node: 4,
+            ino: f,
+            mode: X,
+            until: WaitMs(until),
+            recalled: false,
+            gen: 0,
+            confirmed_ms: constellation_meta::locks::Grant::UNCONFIRMED,
+            settled: false,
+        });
+    }
+
+    /// Each thing that must keep the mark, one at a time: it is cleared in
+    /// none of them. (`fast`: the case needs a tenure that can be taken
+    /// over early, which holds answers.)
+    #[test]
+    fn an_inherited_mark_stays_while_anything_it_stands_on_is_live() {
+        type Case = (&'static str, bool, fn(&mut Harness));
+        let cases: Vec<Case> = vec![
+            ("a live grant in the lock table", false, |h| {
+                install_grant(h, h.clk().wait.0 + 120_000)
+            }),
+            ("an expired record still in the table", false, |h| {
+                install_grant(h, h.clk().wait.0 - 1)
+            }),
+            ("a live read grant", false, |h| {
+                h.meta
+                    .read_delegations()
+                    .grant(4, 7, WaitMs(h.clk().wait.0 + 120_000));
+            }),
+            ("a read quarantine", false, |h| {
+                h.meta
+                    .read_delegations()
+                    .set_quarantine(WaitMs(h.clk().wait.0 + 120_000));
+            }),
+            ("a lock quarantine", false, |h| {
+                h.meta
+                    .locks()
+                    .set_quarantine(WaitMs(h.clk().wait.0 + 120_000));
+            }),
+            ("a delegation", false, |h| {
+                delegated_file(&h.meta);
+            }),
+            ("a grant of its own (the mark is its own)", false, |h| {
+                let mut out = Vec::new();
+                h.core.ensure_granting_marked(&mut out);
+            }),
+            ("strict mounts (a mark for good)", false, |h| {
+                h.core.cfg.strict_mounts = true;
+            }),
+            ("a held answer", true, |h| {
+                let at = h.honour();
+                let epoch = h.core.lease.epoch().unwrap();
+                h.core.ack.renew_held_deleg.push((
+                    super::super::backup::FreshHold { at, epoch },
+                    4,
+                    PeerMsg::LeaseRequest {
+                        req: OpId(1),
+                        epoch_applied: None,
+                    },
+                ));
+            }),
+        ];
+        for (what, fast, setup) in cases {
+            let mut h = sealed_tenure(fast);
+            setup(&mut h);
+            let cas = clearing_cas(&mut h, true);
+            assert!(cas.is_none(), "the mark was cleared with {what}: {cas:?}");
+        }
+        // The floor not passed yet.
+        let mut h = sealed_tenure(false);
+        assert!(
+            clearing_cas(&mut h, false).is_none(),
+            "cleared inside the floor"
+        );
+        // The controls: the same tenures, nothing live, past the floor.
+        for fast in [false, true] {
+            let mut h = sealed_tenure(fast);
+            assert!(
+                clearing_cas(&mut h, true).is_some(),
+                "not cleared (fast: {fast})"
+            );
+        }
+    }
+
+    /// While the clear is out nothing is granted or answered: a lock
+    /// request meets a tenure that is not marked and may not mark itself
+    /// until the CAS settles (the node that sealed an unmarked one finds
+    /// nothing live, one that sealed the marked one over-waits; a grant now
+    /// would stand in neither). Once it landed, the next request marks the
+    /// lease again, before the grant.
+    #[test]
+    fn a_grant_during_the_clear_cas_waits_and_re_marks() {
+        let mut h = sealed_tenure(false);
+        let op = h.create("f");
+        let MutateOp::Create { ino, .. } = op else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        let (clear_op, _) = clearing_cas(&mut h, true).expect("no clear");
+        h.advance(10);
+        let out = request(&mut h, 3, 8, ino, X, true);
+        let rs = lock_replies(&out);
+        assert!(
+            matches!(rs.as_slice(), [(3, OpId(8), LockOutcome::Busy)]),
+            "answered while the clear is out: {out:?}"
+        );
+        assert!(
+            lease_swaps(&out).is_empty(),
+            "a mark CAS beside the clear: {out:?}"
+        );
+        h.advance(10);
+        h.step(Event::S3 {
+            op: clear_op,
+            result: S3Result::LeasePut(Ok(tag())),
+        });
+        h.advance(10);
+        let out = request(&mut h, 3, 9, ino, X, true);
+        let rs = lock_replies(&out);
+        assert!(
+            matches!(rs.as_slice(), [(3, OpId(9), LockOutcome::Busy)]),
+            "granted before the lease was marked again: {out:?}"
+        );
+        let (mark_op, marked) = lease_swaps(&out)
+            .into_iter()
+            .find(|(_, l)| l.granted_delegations)
+            .unwrap_or_else(|| panic!("no mark CAS before the grant: {out:?}"));
+        assert!(!marked.released && marked.holder == 2);
+        h.advance(10);
+        h.step(Event::S3 {
+            op: mark_op,
+            result: S3Result::LeasePut(Ok(tag())),
+        });
+        h.advance(10);
+        let out = request(&mut h, 3, 10, ino, X, true);
+        let rs = lock_replies(&out);
+        assert!(
+            matches!(rs.as_slice(), [(3, OpId(10), LockOutcome::Granted { .. })]),
+            "{out:?}"
+        );
+    }
+
+    /// A clear whose outcome is not known (the answer lost, a conflict) is
+    /// settled by a lease read before the tenure answers anything: the
+    /// object may hold the unmarked version while the tenure thinks it is
+    /// marked. It adopts what the read finds, whichever mark that is.
+    #[test]
+    fn a_clear_in_doubt_rereads_before_any_grant() {
+        for landed in [true, false] {
+            let mut h = sealed_tenure(false);
+            let op = h.create("f");
+            let MutateOp::Create { ino, .. } = op else {
+                unreachable!()
+            };
+            constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+            let (clear_op, cleared) = clearing_cas(&mut h, true).expect("no clear");
+            let marked = h.core.lease.held.as_ref().unwrap().0.clone();
+            h.advance(10);
+            let out = h.step(Event::S3 {
+                op: clear_op,
+                result: S3Result::LeasePut(Err(crate::event::CasFailure::Failed(
+                    "timed out".into(),
+                ))),
+            });
+            let reread = s3_ops(&out)
+                .into_iter()
+                .find_map(|(op, r)| matches!(r, S3Op::LeaseGet).then_some(op))
+                .unwrap_or_else(|| panic!("no lease read after a clear in doubt: {out:?}"));
+            // Nothing is granted, nothing marked, while the object is
+            // unknown.
+            h.advance(10);
+            let out = request(&mut h, 3, 8, ino, X, true);
+            let rs = lock_replies(&out);
+            assert!(
+                matches!(rs.as_slice(), [(3, OpId(8), LockOutcome::Busy)]),
+                "answered with the mark unknown: {out:?}"
+            );
+            assert!(lease_swaps(&out).is_empty(), "{out:?}");
+            // The read says what the object holds.
+            let seen = if landed { cleared } else { marked };
+            h.advance(10);
+            h.step(Event::S3 {
+                op: reread,
+                result: S3Result::LeaseGet(Ok(Some((seen, tag())))),
+            });
+            assert_eq!(
+                h.core.lease.held.as_ref().unwrap().0.granted_delegations,
+                !landed
+            );
+            h.advance(10);
+            let out = request(&mut h, 3, 9, ino, X, true);
+            let rs = lock_replies(&out);
+            // Unmarked: the request marks first; marked: it is granted.
+            if landed {
+                assert!(
+                    lease_swaps(&out).iter().any(|(_, l)| l.granted_delegations),
+                    "{out:?}"
+                );
+            } else {
+                assert!(
+                    matches!(rs.as_slice(), [(3, OpId(9), LockOutcome::Granted { .. })]),
+                    "{out:?}"
+                );
+            }
+        }
+    }
+
     /// The lock-exclusion review's follow-up: a recalled grant whose
     /// first local lock never comes (the requester gave up: its answer
     /// lost, a non-blocking request that lost a race) is renewed only

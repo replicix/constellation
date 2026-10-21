@@ -254,6 +254,17 @@ impl Lease {
         }
     }
 
+    /// Plan 43 C7-F F-a0 (b): this lease with its mark cleared
+    /// (`config_version` bumped): its tenure stands on no duty any more
+    /// (`Core::maybe_clear_inherited_mark`).
+    pub fn without_granted_delegations(&self) -> Self {
+        Self {
+            granted_delegations: false,
+            config_version: self.config_version + 1,
+            ..self.clone()
+        }
+    }
+
     /// This lease released, its `granted_delegations` set to exactly
     /// `granting` (not carried over from the tenure: a released lease says
     /// what its tenure leaves behind, not what the tenures before it did;

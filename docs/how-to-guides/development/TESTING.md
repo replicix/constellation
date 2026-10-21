@@ -4328,7 +4328,14 @@ listed, and node 1, which takes no lock request, is cut and sealed by that
 backup while node 3 still honours the grant; node 2's late request must be
 refused. `a_sealer_of_a_reclaimed_lease_waits_out_the_grants_that_lease_waited_out`
 fails without the mark the reconfiguration writes (56 of seeds 0..2000, 5 of
-the first 100). Plan 43 C7-F F-a, the floor's cap by the old holder's
+the first 100). Plan 43 C7-F F-a0 (b): `double-seal-after-the-grace`
+(`double-seal-inside-the-grace` with the first cut at 2 s and the second at
+12.5 s, past the first successor's 7 s floor, no lock request at the
+successor in between, and node 3's cached grant released 0.3 s after its
+unlock: a grant record, live or not, keeps the mark): the successor clears
+the mark it inherited, so its own seal arms no floor
+(`SWEEP-FLOORS`: two floors per seed before, one after;
+`a_second_seal_after_the_grace_arms_no_second_floor`). Plan 43 C7-F F-a, the floor's cap by the old holder's
 heartbeat: `SimConfig::holder_beats` (the daemon's off-core beat; most
 older configurations model none, so their floors are the bound and the cap
 is inert: `AUTHORITY_SIM_BEATS=thread` on `sweep_config` runs any of them
