@@ -85,8 +85,12 @@ pub enum Event {
     },
     /// Plan 30 §M14: `Action::PersistLockHorizon { until }` finished:
     /// `durable` is the horizon now on disk (at least `until`), `None`
-    /// if the write failed.
-    LockHorizonPersisted { until: i64, durable: Option<i64> },
+    /// if the write failed; both are on this node's wait clock (plan 43
+    /// C7a: internal, never serialised).
+    LockHorizonPersisted {
+        until: WaitMs,
+        durable: Option<WaitMs>,
+    },
     /// The membership poll read the write-eligible roster (M13's inbox
     /// polls it; M9 picks backups from it).
     Roster { write_eligible: Vec<NodeId> },

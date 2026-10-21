@@ -344,18 +344,26 @@ impl LeaseState {
             // against this node; it never holds it again.
             return Plan::Refused("retired by an admin leave (the lease is fenced against us)");
         }
-        if prev.holder == cfg.node_id && !prev.released && !prev.is_expired(now.wall.0) {
-            if self.held.is_some() {
+        if prev.holder == cfg.node_id && !prev.released {
+            if self.held.is_some() && !prev.is_expired(now.wall.0) {
                 return Plan::Held;
             }
-            // Our own live lease that we do not track: a restart, or a CAS
-            // whose reply was lost. M4: gated like a takeover.
-            return Plan::Claim {
-                prev,
-                tag,
-                takeover: true,
-                marker: true,
-            };
+            if self.held.is_none() {
+                // Our own lease that we do not track: a restart, or a CAS
+                // whose reply was lost. M4: gated like a takeover (the
+                // tail to head, the epoch marker, the strand and replay),
+                // **whatever the wall clock says of its expiry** (plan 43
+                // C7a: plan 30's rule had no expiry condition; the port
+                // narrowed it to a lease the wall read as live, and a
+                // forward step of the wall, or a restart after the expiry,
+                // re-claimed without the gate).
+                return Plan::Claim {
+                    prev,
+                    tag,
+                    takeover: true,
+                    marker: true,
+                };
+            }
         }
         let permitted = self.permit_allows(now, cfg, &prev, sealed_epoch);
         if !prev.is_claimable(now.wall.0) && !permitted {
@@ -714,6 +722,61 @@ mod tests {
         assert_eq!(lost.lost_floor, 5);
     }
 
+    /// Plan 43 C7a (M4's own-lease arm): an own unreleased lease this node
+    /// does not track is re-adopted through the gate (tail to head, epoch
+    /// marker, strand and replay) **whatever its wall clock says of the
+    /// lease's expiry**: plan 30's rule had no expiry condition, the sans-IO
+    /// port narrowed it to a lease the wall read as live, and a forward step
+    /// of the wall (or a restart after the expiry) re-claimed it without the
+    /// gate. A tracked lease is `Held` while live, as before; one the wall
+    /// reads as expired while tracked takes the generic path, as before.
+    /// Fails before: `takeover: false, marker: false` for the expired one.
+    #[test]
+    fn a_restarted_holder_readopts_its_own_lease_through_the_gate_whatever_its_wall_clock_says() {
+        let cfg = cfg();
+        let st = LeaseState::default();
+        let t0 = Now::same(1_000_000);
+        let mine = st.granted_lease(t0, &cfg, None, false);
+        for step in [-3_600_000i64, 0, 5_000, cfg.ttl_ms as i64 + 1, 3_600_000] {
+            // The wall now: `step` from the grant (past `expires_unix_ms`
+            // for the larger ones); the three clocks otherwise agree.
+            let now = Now::same(t0.wall.0 + step);
+            match st.classify(now, &cfg, Some((mine.clone(), tag())), 0) {
+                Plan::Claim {
+                    takeover: true,
+                    marker: true,
+                    ..
+                } => {}
+                other => panic!("step {step}: {other:?}"),
+            }
+        }
+        // Released: nothing to be gated by (a takeover without a marker for a
+        // foreign release; an own released lease is the generic claim).
+        let released = mine.clone().released();
+        let now = Now::same(t0.wall.0 + 3_600_000);
+        assert!(matches!(
+            st.classify(now, &cfg, Some((released, tag())), 0),
+            Plan::Claim { marker: false, .. }
+        ));
+        // Tracked: held while live; once the wall reads it as expired the
+        // generic path (a plain claim) is what it always was.
+        let mut holding = st.clone();
+        holding.adopt(t0, mine.clone(), tag(), None);
+        assert_eq!(
+            holding.classify(t0, &cfg, Some((mine.clone(), tag())), 0),
+            Plan::Held
+        );
+        let late = Now::same(t0.wall.0 + cfg.ttl_ms as i64 + 1);
+        assert!(matches!(
+            holding.classify(late, &cfg, Some((mine, tag())), 0),
+            Plan::Claim {
+                takeover: false,
+                marker: false,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn the_view_gates_match_lease_view() {
         let cfg = cfg();
@@ -807,6 +870,7 @@ mod tests {
             wall: Ms(t0.wall.0 + wall_step + ms as i64),
             honour: HonourMs(t0.honour.0 + honour_step + ms as i64),
             wait: WaitMs(t0.wait.0 + ms as i64),
+            boot: t0.boot,
         };
         assert!(
             !st.wants_handoff(stepped(60_000, 60_000, 1_500), &cfg),

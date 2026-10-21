@@ -231,9 +231,13 @@ holder still honours its window, and a backward one does not make a waiter
 wait longer. The same holds for what an owner waits out otherwise: a
 restart's or a takeover's quarantine, a grace on a subtree, an outwaited
 delegation, a successor's takeover floor. What is persisted across a restart
-(the grant horizon) is written as a wall value and read back as time left on
-the new process's wait clock. A fencing token's window stays a wall value, so
-the executor's check of it keeps the offset bound.
+(the grant horizon) is written as a boot stamp (plan 43 C7a: its wall end, the
+span ahead of the write, the boot id and the raw clock's end) and read back as
+time left on the new process's wait clock: on the raw clock when the node
+restarts on the same boot, so no step of the wall clock, up or down, while the
+node was running or down changes it, and as the whole recorded span after a
+reboot. A fencing token's window stays a wall value, so the executor's check of
+it keeps the offset bound.
 
 A grant is renewed half-way through the window the node honours it for
 (`(ttl − margin) / 2` after the send: 9.5 s at the defaults), one
@@ -1345,7 +1349,13 @@ owner has replaced it.
   waiting for it (`status` `locks.horizon_held`, `horizon_writes`). A
   write that fails refuses what it held (a grant `Busy`, a renewal
   `NotOwner`). Nothing is answered before its window is on disk, so a
-  restart never waits out less than a peer was told.
+  restart never waits out less than a peer was told. A restart after a
+  reboot (another boot id) cannot read the time left on the raw clock and
+  waits the span the horizon was written with (up to a lock's TTL, its margin,
+  a quarter TTL and a second: 27 s at the defaults) before the first lock
+  grant, but only if grants were live when the node stopped: a graceful
+  shutdown deletes a horizon that has already passed, so an idle node's
+  reboot waits for nothing.
 - **An S3 blip** (a [continuation
   epoch](durability-and-failover.md#flexible-continuation-epochs)
   carrying the holder's lease): the grants stand. Inside the epoch the

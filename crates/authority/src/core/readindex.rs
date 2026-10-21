@@ -242,7 +242,7 @@ impl Core {
         if !self.cfg.read_delegations {
             return;
         }
-        if let Some(until) = replica.load_grant_quarantine(now) {
+        if let Some(until) = replica.load_grant_quarantine(now, self.cfg.read_horizon_span_ms()) {
             tracing::info!(
                 node = self.cfg.node_id,
                 wait_ms = until.since(now.wait),
@@ -408,9 +408,9 @@ impl Core {
             return None;
         }
         // The grant's record runs on this node's wait clock; the restart
-        // horizon is persisted as a wall value (plan 43 C7-H1, R9).
+        // horizon is persisted as a boot stamp of it (plan 43 C7a).
         let until = now.wait.plus((ttl + margin) as u64);
-        if !replica.note_grant_horizon(now.wall_of_wait(until).0) {
+        if !replica.note_grant_horizon(until, now) {
             return None;
         }
         let id = replica.read_delegations().grant(to, ino, until);

@@ -5,7 +5,7 @@ use crate::error::MetaError;
 use crate::store::{kv_get_tx, kv_set_tx, ns, EpochRow, Meta};
 use constellation_fs_core::{ChunkHash, Ino};
 use constellation_mtree::record::{InodeRecord, Payload};
-use constellation_types::clock::{Ms, Now};
+use constellation_types::clock::{Ms, Now, WaitMs};
 use fjall::{Readable, SingleWriterTxKeyspace, SingleWriterWriteTx};
 use std::collections::HashSet;
 
@@ -700,14 +700,43 @@ impl Meta {
 
     // ------------------------------------------- plan 30 §M10: promises
 
-    /// The last heartbeat promise this node *issued*
-    /// (`no_epoch_until_unix_ms`, persisted before its PUT; 0: none).
+    /// The last heartbeat promise this node *issued*, as the wall value it
+    /// published (`no_epoch_until_unix_ms`, persisted before its PUT; 0:
+    /// none): token 0 of the persisted stamp, or the whole value an older
+    /// build wrote.
     pub fn promise_issued(&self) -> Result<i64, MetaError> {
         Ok(self
             .kv_get(PROMISE_ISSUED)?
-            .and_then(|v| v.parse().ok())
+            .and_then(|v| {
+                v.split_whitespace()
+                    .next()
+                    .and_then(|t| t.parse::<i64>().ok())
+            })
             .unwrap_or(0))
     }
+
+    /// At start, before any promise is issued or any join considered: the
+    /// last promise the previous process issued, on this process's wait
+    /// clock, from its persisted boot stamp (plan 43 C7a: from the raw
+    /// clock on the same boot, the recorded span on another boot, and
+    /// `default_span_ms`, the longest a promise lives, for a value an
+    /// older build wrote). Never lowers what is known. `None`: nothing
+    /// issued, or nothing left of it.
+    pub fn load_promise_issued(&self, now: Now, default_span_ms: i64) -> Option<WaitMs> {
+        let stored = self.kv_get(PROMISE_ISSUED).ok().flatten()?;
+        let stamp = crate::store::horizon::parse_stamp(&stored, default_span_ms);
+        let end = now.wait_of_stamp(&stamp);
+        let mut twin = self.promise_issued_wait.lock().unwrap();
+        // Known, even when nothing is left: the gate then has no wait.
+        let known = (*twin).unwrap_or(WaitMs(0)).max(end.unwrap_or(now.wait));
+        *twin = Some(known);
+        end
+    }
+
+    /// The span a promise left by an unknown writer is waited out for when
+    /// nothing loaded it at start (tests; the daemon and the simulation
+    /// load it with their promise TTL).
+    const PROMISE_FALLBACK_SPAN_MS: i64 = 60_000;
 
     /// Persist a new promise before publishing it. Refused (`Ok(false)`,
     /// nothing written) while a continuation-epoch join holds the gate
@@ -716,23 +745,28 @@ impl Meta {
     /// takes the same (single) writer lock, so a promise can never be
     /// issued between a join's check and its gate.
     ///
-    /// `now`: the promise's end is also kept on this node's wait clock
-    /// (plan 43 C7-H1, R9), where the join gate waits it out.
+    /// `until_unix_ms` is the promise as published (a wall value, row 3's
+    /// cross-node compare); `now` maps it onto this node's wait clock, where
+    /// the join gate waits it out, and stamps it with the boot (plan 43
+    /// C7a): the persisted value is `<wall> <span> <boot> <raw_until>`
+    /// ([`crate::store::horizon`]).
     pub fn promise_issue(&self, until_unix_ms: i64, now: Now) -> Result<bool, MetaError> {
+        self.ensure_promise_loaded(now);
         let mut tx = self.db.write_tx();
         if kv_get_tx(&tx, &self.local, PROMISE_JOINING)?.as_deref() == Some("1") {
             return Ok(false);
         }
-        let issued: i64 = kv_get_tx(&tx, &self.local, PROMISE_ISSUED)?
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        let extends = until_unix_ms > issued;
+        let end = now.wait_of_wall(Ms(until_unix_ms));
+        let known = *self.promise_issued_wait.lock().unwrap();
+        let extends = known.is_none_or(|known| end > known);
         if extends {
+            let mut stamp = now.stamp_of_wait(end);
+            stamp.wall = Ms(until_unix_ms);
             kv_set_tx(
                 &mut tx,
                 &self.local,
                 PROMISE_ISSUED,
-                &until_unix_ms.to_string(),
+                &crate::store::horizon::format_stamp(&stamp),
             );
         }
         tx.commit()?;
@@ -741,34 +775,39 @@ impl Meta {
         // the time it promised, which a taker counted on.
         if extends {
             self.sync()?;
-            *self.promise_issued_wait.lock().unwrap() =
-                Some((until_unix_ms, now.wait_of_wall(Ms(until_unix_ms))));
+            *self.promise_issued_wait.lock().unwrap() = Some(end);
         }
         Ok(true)
     }
 
+    /// The promise of an earlier process, if nothing has loaded it yet.
+    fn ensure_promise_loaded(&self, now: Now) {
+        if self.promise_issued_wait.lock().unwrap().is_none() {
+            self.load_promise_issued(now, Self::PROMISE_FALLBACK_SPAN_MS);
+        }
+    }
+
     /// A continuation-epoch join: allowed only once the last issued
-    /// promise has expired in this node's clock, and from then on no
+    /// promise has run out on this node's wait clock, and from then on no
     /// promise is issued until [`Meta::promise_join_end`]. Idempotent while
     /// the gate is held.
     ///
-    /// Plan 43 C7-H1 (R9): a wait, so it is measured on the wait clock when
-    /// this process issued the promise (a forward wall step cannot let the
-    /// promiser join early). A promise of an earlier process, persisted as a
-    /// wall value, is read on the wall clock (a step while the process was
-    /// down still shifts it: row 14, C7a's boot-id form).
+    /// Plan 43 C7a: a wait, so it is measured on the wait clock whoever
+    /// issued the promise: this process (its end is in memory) or an earlier
+    /// one (loaded from its boot stamp: a forward step of the wall clock
+    /// while this node was up or down cannot let the promiser join early,
+    /// Appendix B row 14).
     pub fn promise_join_begin(&self, now: Now) -> Result<bool, MetaError> {
+        self.ensure_promise_loaded(now);
         let mut tx = self.db.write_tx();
         if kv_get_tx(&tx, &self.local, PROMISE_JOINING)?.as_deref() == Some("1") {
             return Ok(true);
         }
-        let issued: i64 = kv_get_tx(&tx, &self.local, PROMISE_ISSUED)?
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        let early = match *self.promise_issued_wait.lock().unwrap() {
-            Some((value, end)) if value == issued => now.wait < end,
-            _ => now.wall.0 < issued,
-        };
+        let early = self
+            .promise_issued_wait
+            .lock()
+            .unwrap()
+            .is_some_and(|end| now.wait < end);
         if early {
             return Ok(false);
         }

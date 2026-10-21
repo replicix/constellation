@@ -2442,6 +2442,19 @@ impl Engine {
         // instead of polling a timer of a runtime that is gone.
         self.tree_nodes.close();
         flush.context("final log flush")?;
+        // The core is done: a persisted restart horizon of grants made (the
+        // read-grant and lock-grant keys) that has passed is cleared, so the
+        // next start -- on another boot, the horizons' stamps would be waited
+        // out by their span -- waits for nothing it does not owe (plan 43
+        // C7a). One that has not passed stays. The last promise's stamp is
+        // kept (its token 0 is the published promise): a reboot waits its
+        // span before a continuation-epoch join.
+        if let Err(error) = self
+            .meta
+            .clear_passed_horizons(constellation_platform::clock::protocol().now())
+        {
+            tracing::warn!(%error, "clearing the passed restart horizons failed");
+        }
         // No view is left to hold an orphan open: withdraw the claim now
         // rather than let its TTL run out (unless a handover carries the
         // views on).

@@ -4434,11 +4434,14 @@ their controls `locks-partition-long-grants`, `fast-takeover-long-grants`,
 `fast-takeover-capped-grants`, `strict-isolated-reader-long` and
 `locks-rate-within-budget`; suspend, clean on the parent (the mutant
 without `S` and `J` is what fails): `locks-locker-suspend`,
-`strict-holder-suspend`; restart horizons, fixed by the third commit:
+`strict-holder-suspend`; restart horizons, fixed by the third commit (boot
+stamps; clean now, pinned in four sim tests and in `long_locks`):
 `locks-root-restart-step-forward`, `locks-root-step-forward-then-restart`,
 `locks-root-reboot-step-forward`, `strict-holder-restart-step-forward`,
 `flex-promiser-restart-step-forward` (clean), `holder-restart-step-forward-
-readopt` (clean) and the cost control `locks-root-reboot`; the persisted
+readopt` (clean: M4's own-lease arm, always gated) and the cost control
+`locks-root-reboot` (its first lock grant after the reboot waits the span, see
+PROGRESS); the persisted
 floor, fixed by the fourth: `fast-takeover-successor-restart-before-marker`,
 `fast-takeover-successor-restart-in-floor` (clean) and its strict variant.
 `delegated-long-delegation` is not a control: it fails on 5 of 100 seeds
@@ -4448,6 +4451,17 @@ Unit tests: `a_simulated_rate_moves_the_elapsed_clocks_and_not_the_wall`,
 `a_simulated_reboot_changes_the_boot_id_and_restarts_the_elapsed_clocks`,
 `a_simulated_timer_inverts_the_rate_and_a_plain_clock_is_the_paused_one`,
 `a_simulated_timer_inverts_the_budget_scaling` (commit 2).
+The boot stamps of the persisted horizons (C7a's third commit) are tested
+where they live: `constellation_types::clock` (`a_stamp_*`,
+`stamps_map_through_the_budget`), `meta::store::horizon` (the text form: old
+values, extra tokens, garbage), `meta::readdeleg::boot_stamped_horizon_tests`
+(a forward step while down and after the last write, a reboot, an old-format
+value, a write never lowering the loaded quarantine, a graceful shutdown
+clearing a passed horizon and keeping a live one) and `meta::store::backup`
+(the promise's join gate after a restart and a forward step). The harness's
+`CONSTELLATION_FAULT_BOOT_ID=<hex>` overrides the daemon's boot id (a reboot
+without rebooting; the engine logs it once). `Meta::clear_passed_horizons`
+runs at a graceful shutdown, after the core's final flush.
 
 Every
 run checks close-to-open across nodes (`tests/sim/cto.rs`: a read

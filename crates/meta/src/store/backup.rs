@@ -775,7 +775,7 @@ mod tests {
 #[cfg(test)]
 mod durability_tests {
     use crate::store::Meta;
-    use constellation_types::clock::Now;
+    use constellation_types::clock::{BootNow, HonourMs, Ms, Now, WaitMs};
 
     /// M16: every write whose safety rests on being remembered across a
     /// power loss is synced before the caller acts on it — and a no-op
@@ -808,7 +808,8 @@ mod durability_tests {
         assert_eq!(synced(n), 1, "a delegate backup's seal");
 
         let n = meta.sync_count();
-        meta.note_grant_horizon(50_000).unwrap();
+        meta.note_grant_horizon(WaitMs(50_000), Now::same(0))
+            .unwrap();
         assert_eq!(synced(n), 1, "the read-grant horizon");
 
         let base = std::collections::BTreeMap::new();
@@ -831,12 +832,12 @@ mod durability_tests {
     /// persisted wall value.
     #[test]
     fn the_join_gate_waits_the_promise_out_on_the_wait_clock() {
-        use constellation_types::clock::{HonourMs, Ms, WaitMs};
         let meta = Meta::open_in_memory().unwrap();
         let at = |wall: i64, wait: i64| Now {
             wall: Ms(wall),
             honour: HonourMs(wall),
             wait: WaitMs(wait),
+            ..Now::same(0)
         };
         // Issued at wall 1_000 / wait 5_000 for 10 s.
         assert!(meta.promise_issue(11_000, at(1_000, 5_000)).unwrap());
@@ -845,5 +846,100 @@ mod durability_tests {
         assert!(!meta.promise_join_begin(at(10_000, 6_000)).unwrap());
         assert!(!meta.promise_join_begin(at(10_000, 14_999)).unwrap());
         assert!(meta.promise_join_begin(at(10_000, 15_000)).unwrap());
+    }
+
+    /// A reading on `boot`, the raw clock at `raw` ms since boot, the wait
+    /// clock at `wait`, the wall at `wall`.
+    fn at(boot: u64, raw: i64, wait: i64, wall: i64) -> Now {
+        Now {
+            wall: Ms(wall),
+            honour: HonourMs(wall),
+            wait: WaitMs(wait),
+            boot: BootNow {
+                id: boot,
+                raw_ms: raw,
+                budget_ppm: 0,
+            },
+        }
+    }
+
+    /// Plan 43 C7a (fail-before: the wall fallback of `promise_join_begin`):
+    /// a promiser that restarts on the same boot waits its last promise out
+    /// on the raw clock, whatever the wall clock did meanwhile. The promise
+    /// is issued at raw 100 000 for 15 s; the process restarts at raw 103 000
+    /// with the wall 1 h on: the gate holds for 12 s more, not for nothing.
+    /// On the parent a restart read the persisted wall value against the
+    /// stepped wall and joined at once.
+    #[test]
+    fn the_promise_join_waits_its_stamp_after_a_restart_and_a_forward_step() {
+        const WALL: i64 = 1_780_000_000_000;
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let meta = Meta::open(dir.path()).unwrap();
+            let t0 = at(7, 100_000, 5_000, WALL);
+            assert!(meta.promise_issue(WALL + 15_000, t0).unwrap());
+            assert_eq!(meta.promise_issued().unwrap(), WALL + 15_000);
+            // The persisted value carries the boot: the wall form first.
+            let stored = meta.kv_get("epoch_promise_issued_ms").unwrap().unwrap();
+            assert!(
+                stored.starts_with(&format!("{} 15000 ", WALL + 15_000)),
+                "{stored}"
+            );
+        }
+        let restarted = |boot: u64, raw: i64, wait: i64, wall_step: i64| {
+            let meta = Meta::open(dir.path()).unwrap();
+            let now = at(boot, raw, wait, WALL + (raw - 100_000) + wall_step);
+            // Loaded at start, as the core does.
+            meta.load_promise_issued(now, 16_000);
+            (meta, now)
+        };
+        // Same boot, the wall stepped forward 1 h while the node was down.
+        let (meta, now) = restarted(7, 103_000, 400, 3_600_000);
+        assert_eq!(
+            meta.promise_issued().unwrap(),
+            WALL + 15_000,
+            "token 0 is the wall"
+        );
+        assert!(
+            !meta.promise_join_begin(now).unwrap(),
+            "12 s of the promise are left"
+        );
+        assert!(!meta.promise_join_begin(now.plus(11_999)).unwrap());
+        assert!(meta.promise_join_begin(now.plus(12_000)).unwrap());
+        drop(meta);
+        // Another boot: the whole span from the start, a wall that stepped
+        // back or forward changes nothing.
+        for step in [-3_600_000, 3_600_000] {
+            let dir_check = Meta::open(dir.path()).unwrap();
+            dir_check.promise_join_end().unwrap();
+            drop(dir_check);
+            let (meta, now) = restarted(8, 2_000, 400, step);
+            assert!(
+                !meta.promise_join_begin(now.plus(14_999)).unwrap(),
+                "{step}"
+            );
+            assert!(meta.promise_join_begin(now.plus(15_000)).unwrap(), "{step}");
+            meta.promise_join_end().unwrap();
+        }
+    }
+
+    /// Expectation: a promise an older build persisted (the wall value
+    /// alone) is waited out as the caller's default span from the start,
+    /// not as a wall value: here the wall says it is long past.
+    #[test]
+    fn an_old_format_promise_waits_the_default_span() {
+        const WALL: i64 = 1_780_000_000_000;
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let meta = Meta::open(dir.path()).unwrap();
+            meta.kv_set("epoch_promise_issued_ms", &(WALL - 3_600_000).to_string())
+                .unwrap();
+        }
+        let meta = Meta::open(dir.path()).unwrap();
+        let now = at(7, 100_000, 400, WALL);
+        assert_eq!(meta.promise_issued().unwrap(), WALL - 3_600_000);
+        assert_eq!(meta.load_promise_issued(now, 16_000), Some(WaitMs(16_400)));
+        assert!(!meta.promise_join_begin(now.plus(15_999)).unwrap());
+        assert!(meta.promise_join_begin(now.plus(16_000)).unwrap());
     }
 }

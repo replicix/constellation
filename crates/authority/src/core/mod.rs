@@ -430,6 +430,31 @@ impl Config {
             + self.s3_less_deadline_ms
     }
 
+    /// Plan 43 C7a: the longest a persisted read-grant horizon leads the
+    /// write that makes it, ms: a read delegation's TTL, the margin the owner
+    /// outwaits it by, and the second the write rounds up by. What a horizon
+    /// an older build wrote (which carries no span) is waited out for at
+    /// start; a span beyond twice it is waited out up to
+    /// `meta::store::horizon::MAX_SPAN_MS` (a longer TTL before the restart
+    /// is legitimate; only a corrupt value is cut).
+    pub fn read_horizon_span_ms(&self) -> i64 {
+        (self.read_delegation_ttl_ms + self.expiry_margin_ms + 1_000) as i64
+    }
+
+    /// The same for the lock-grant horizon: the longest grant (a lock's TTL,
+    /// or a delegation's, which a delegation carry can install as a lock
+    /// grant), its margin, the quarter TTL a renewal's write rounds up by and
+    /// the second the write rounds up by.
+    pub fn lock_horizon_span_ms(&self) -> i64 {
+        let ttl = self.lock_ttl_ms.max(self.delegation_ttl_ms);
+        (ttl + ttl / 4 + self.expiry_margin_ms + 1_000) as i64
+    }
+
+    /// The same for the last promise this node issued.
+    pub fn promise_horizon_span_ms(&self) -> i64 {
+        (self.promise_ttl_ms + 1_000) as i64
+    }
+
     /// The one bound of every wait a non-blocking lock request takes for an
     /// owner that cannot grant yet, from the request's start (plan 43 F-b):
     /// a grace, a tenure's floor, a stale or an unreachable owner. A stale

@@ -519,17 +519,16 @@ pub(crate) struct LockState {
     /// seed 7: a 7.6 s sync blocked the core 12 s, and another node's
     /// grant lapsed meanwhile).
     ///
-    /// Plan 43 C7-H1 (R9): the horizons here are on this node's **wait**
-    /// clock, where the owner waits its grants out. What is persisted is
-    /// the wall value (`now.wall_of_wait` of the horizon when the write is
-    /// asked, `Action::PersistLockHorizon`), which survives a restart; the
-    /// durable horizon is converted back when the write lands
-    /// (`now.wait_of_wall`), so each comparison here is wait with wait.
+    /// Plan 43 C7a: the horizons here are on this node's **wait** clock,
+    /// where the owner waits its grants out, and so is the write
+    /// (`Action::PersistLockHorizon { until }`, the event's `durable`): what
+    /// crosses a restart is the boot stamp the store makes of it, never
+    /// seen here, so each comparison is wait with wait.
     horizon_durable: WaitMs,
     /// The write in flight, if any (one at a time: later needs coalesce
     /// into the next one, which carries the highest): the horizon asked
-    /// for and the wall value that was sent (the event names it).
-    horizon_writing: Option<(WaitMs, i64)>,
+    /// for (the event names it).
+    horizon_writing: Option<WaitMs>,
     /// The highest horizon asked for (rounded up), written next.
     horizon_want: WaitMs,
     /// What the answer being built needs durable (`lock_need_horizon`),
@@ -1289,18 +1288,15 @@ impl Core {
             since: now.wait,
             order_only,
         });
-        self.lock_horizon_write(now, out);
+        self.lock_horizon_write(out);
     }
 
-    fn lock_horizon_write(&mut self, now: Now, out: &mut Vec<Action>) {
+    fn lock_horizon_write(&mut self, out: &mut Vec<Action>) {
         if self.lk.horizon_writing.is_some() || self.lk.horizon_want <= self.lk.horizon_durable {
             return;
         }
-        let want = self.lk.horizon_want;
-        // What crosses a restart is the wall clock (R9): the wait-clock
-        // horizon mapped by its remaining duration now.
-        let until = now.wall_of_wait(want).0;
-        self.lk.horizon_writing = Some((want, until));
+        let until = self.lk.horizon_want;
+        self.lk.horizon_writing = Some(until);
         self.stats.lock_horizon_writes += 1;
         out.push(Action::PersistLockHorizon { until });
     }
@@ -1314,23 +1310,16 @@ impl Core {
     pub(crate) fn on_lock_horizon_persisted(
         &mut self,
         now: Now,
-        until: i64,
-        durable: Option<i64>,
+        until: WaitMs,
+        durable: Option<WaitMs>,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        if self
-            .lk
-            .horizon_writing
-            .is_some_and(|(_, sent)| sent == until)
-        {
+        if self.lk.horizon_writing == Some(until) {
             self.lk.horizon_writing = None;
         }
         let failed = match durable {
             Some(d) => {
-                // The persisted (wall) horizon, as time left on the wait
-                // clock now: a step since the write is absorbed (R9).
-                let d = now.wait_of_wall(Ms(d));
                 self.lk.horizon_durable = self.lk.horizon_durable.max(d);
                 false
             }
@@ -1414,7 +1403,7 @@ impl Core {
                 self.lock_grant_done(now, id, g.ino, false, replica, out);
             }
         }
-        self.lock_horizon_write(now, out);
+        self.lock_horizon_write(out);
     }
 
     /// Plan 41 L0, after every event: the renewal answers held for the
@@ -6335,7 +6324,7 @@ impl Core {
         replica
             .locks()
             .set_lapse_park_ms(self.cfg.lock_owner_wait_max_ms() as i64);
-        if let Some(until) = replica.load_lock_quarantine(now) {
+        if let Some(until) = replica.load_lock_quarantine(now, self.cfg.lock_horizon_span_ms()) {
             tracing::info!(
                 node = self.cfg.node_id,
                 wait_ms = until.since(now.wait),

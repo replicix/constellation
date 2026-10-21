@@ -54863,3 +54863,231 @@ restart configurations are unchanged by this commit (4987b00: 1 140, 794, 1 139,
 The identity sweeps above were run on b8fe40c and its successor; on 4987b00 they were
 started (the 92 two-thousand-seed specs, parent, this tree and commit 3) and could not be
 completed: the build box became unreachable during them.
+
+## Plan 43 C7a, commit 3 of 6: boot-stamped restart horizons, M4's own-lease arm gated again
+
+Appendix B row 14. C7-H1 wrote the restart horizons (read grants, lock grants,
+the promise's `issued`) as wall values and read them back onto the wait clock,
+so a forward step of the wall while the node was down, or while it was up after
+the last write followed by a restart, shortened the quarantine by the step. A
+deadline persisted across a restart is now written with the boot it was
+measured on.
+
+### What landed
+
+- The rule (Q20; D3, D3b, D4): **same boot** (an id that is not 0 and equal):
+  the time left is read on `CLOCK_MONOTONIC_RAW` since boot (the wait clock's
+  source: never slewed, not counting suspend, so conservative), immune to every
+  step of the wall. **Another boot, an unknown one, or a value with no boot**:
+  the recorded `span` (how far ahead of the write the deadline was) from this
+  process's start. No wall term on the same boot; no re-persist on a counted
+  forward jump (a same-boot restart reads the raw clock, a reboot the span).
+- `types/clock.rs`: `Now` carries `boot: BootNow { id, raw_ms, budget_ppm }`
+  (24 bytes more; `Now::same` keeps an unknown boot, `Now::same_on_boot` for
+  tests), `BootStamp { wall, span_ms, boot_id, raw_until_ms }`,
+  `Now::stamp_of_wait` (the span; the raw end `ceil(span (1e6 + ρ)/1e6)` past
+  now, the raw reading unscaled so a budget changed between restarts on one boot
+  stays right) and `Now::wait_of_stamp` (same boot: the raw time left mapped
+  through the budget, never more than the span; otherwise the span; `None`:
+  nothing left). `ProtocolClock::now` fills it from the sample's raw clock and
+  the sources' `boot_id` (read once at creation).
+- `platform/clock.rs`: `boot_id()` (read once): the first 16 hex digits of
+  `/proc/sys/kernel/random/boot_id` on Linux and Android, `kern.boottime` in
+  µs on macOS, iOS and FreeBSD (moved when the wall is set: then it looks like
+  another boot, the span is waited, conservative), 0 elsewhere;
+  `CONSTELLATION_FAULT_BOOT_ID=<hex>` overrides it (the harness's reboot; the
+  engine logs it once). The rate-fault sources scale the readings since boot
+  rather than from the first sample, so a daemon restarted on the same boot
+  under a rate fault reads the same clock.
+- The persisted value (`meta::store::horizon`): `<wall_until_ms> <span_ms>
+  <boot_id as 16 hex digits> <raw_until_ms>`, the KV keys unchanged. **Append-
+  only**: readers ignore tokens they do not know, writers write every token they
+  know, future fields go at the end. Token 0 is what an older build wrote and what
+  status and logs show. A bare number (an older build's value), a value whose
+  tokens 1 to 3 do not parse, or garbage has no boot and waits the caller's
+  default span (the configured longest lead of that horizon: `Config::
+  {read,lock,promise}_horizon_span_ms`; the lock's includes the quarter TTL a
+  renewal's write rounds up by, which the spec's formula left out); a span beyond
+  twice the default is kept up to an hour (`horizon::MAX_SPAN_MS`: a previous
+  process with a longer TTL wrote it legitimately, and clamping it to this
+  process's default would wait out less than a peer may honour), and only a
+  corrupt one beyond that is cut. The cost of that rule is that the first
+  restart after an upgrade, and every ungraceful restart of an idle node
+  until it next shuts down gracefully, waits the default span once (about 7 s
+  for reads and 27 s for locks at the defaults) instead of nothing.
+- `Meta::{note_grant_horizon, note_lock_grant_horizon}(until: WaitMs, now)`,
+  `load_*_quarantine(now, default_span)`: a write is made only for a horizon
+  beyond what is known (what the previous process left, loaded at start, and
+  what this one wrote, kept per key in memory), rounded up a second as before, so
+  it never lowers what the stored value required. `Meta::clear_passed_horizons`
+  runs at a graceful shutdown (the engine's `drain_for_shutdown`, after the
+  core's final flush): a horizon that has passed on the wait clock is deleted
+  durably, so an idle node's reboot waits for nothing; a live one, or one this
+  process neither loaded nor wrote, stays.
+- `Action::PersistLockHorizon { until: WaitMs }` and `Event::
+  LockHorizonPersisted { until, durable: Option<WaitMs> }` (internal, never
+  serialised); the core's wall↔wait conversions of the horizon (R9's caveat)
+  are gone, the driver and the simulator call `note_lock_grant_horizon(until,
+  now)` with a fresh `Now`.
+- The promise's `issued` (`epoch_promise_issued_ms`): `promise_issue` writes the
+  stamp of the wait end `wait_of_wall(until)` at the same `now` (token 0 is the
+  published wall value, `promise_issued()` unchanged); `Meta::load_promise_issued`
+  (called by the core's `promise_start`) puts the previous process's promise on
+  this clock, `promise_join_begin` waits it out there. The wall fallback
+  (`now.wall < issued`) is gone.
+- `core/lease.rs`: M4's own-lease arm. Traced: plan 30 M4 (33adc8e,
+  `LeaseKeeper::readopts`) gated every re-adoption of the node's own unreleased
+  lease it does not track with no expiry condition; the sans-IO port (617499b)
+  put the arm under `!prev.is_expired(now.wall)`, so an own lease the wall read
+  as expired fell to the generic claim (no tail, no marker, no strand-and-
+  replay). The arm is `held.is_none()` again, and a tracked lease is `Held` while
+  the wall reads it live, as before. Callers with an own lease as `prev`
+  (`acquire_won`'s `fast_prev`, `inherits_duty`, `promise_check_needed`) already
+  exclude `holder == node_id`.
+- Docs: DESIGN §5, cto-modes, cluster-locks (a reboot's lock quarantine),
+  durability-and-failover (the persisted horizons), TESTING (the new tests, the
+  configurations, `CONSTELLATION_FAULT_BOOT_ID`), plan 43 (Appendix B row 14,
+  the commit note).
+
+### Tests, with their fail-before
+
+On b8fe40c the tests are written against the new API; where the parent's form
+differs the failing value is stated (checked on the parent's code in a scratch copy
+on the build box):
+
+- types: `a_stamp_round_trips_on_one_boot`, `a_stamp_of_another_boot_waits_its_span`,
+  `a_stamp_ignores_wall_steps_on_one_boot` (the wall stepped ±1 h between the write
+  and the read; the wall form moves by the whole step, asserted beside it),
+  `a_stamp_never_waits_more_than_its_span`, `stamps_map_through_the_budget`. Mutant
+  "a stamp is never read on the raw clock" fails three of them.
+- platform: `the_boot_id_is_the_uuids_head_and_stable`.
+- `meta::store::horizon` (the text form, new): `a_stamp_round_trips_as_text`,
+  `old_values_extra_tokens_and_garbage_read_conservatively` (`"123"`, the full
+  value, extra trailing tokens, each unparsable token, garbage: this is the
+  append-only test: an older build's value still reads) and `a_corrupt_span_is_clamped`.
+- meta (`readdeleg.rs`, each against a second `Meta` over the first one's directory;
+  the equivalents on the parent's wall API, run in a scratch copy of b8fe40c on the
+  build box, fail as stated): `a_lock_horizon_survives_a_forward_step_while_down`
+  (write at raw 100 000 for 21 500 ms, restart at raw 103 000 with the wall 10 s
+  on: 18 500 ms left; the parent reads 8 500), `a_lock_horizon_survives_a_forward_
+  step_after_the_last_write` (the same through a step while up, after the last
+  write; same assertion, same failure on the parent), `a_read_horizon_after_a_
+  reboot_waits_its_span` (the parent finds nothing left when the new boot's wall is
+  2.5 h on and panics on the missing quarantine), `an_old_format_horizon_waits_the_
+  default_span` (the parent reads the bare wall number, long past, and waits
+  nothing), `a_horizon_write_never_lowers_the_loaded_quarantine` (holds on the
+  parent too, which compared with the stored value; the regression for the
+  in-memory form: the mutant that ignores the known horizon fails it),
+  `a_graceful_shutdown_clears_a_passed_horizon` and `..._keeps_a_live_horizon`
+  (new behaviour: the mutant that clears nothing fails both).
+- meta (`store/backup.rs`): `the_promise_join_waits_its_stamp_after_a_restart_and_a_
+  forward_step` (the parent joins at once on the stepped wall: its wall fallback)
+  and `an_old_format_promise_waits_the_default_span`.
+- core: `the_restart_quarantine_is_the_boot_stamp` compiles against the parent and
+  **fails there**: a holder restarted on the same boot with the wall an hour on read
+  its horizon against the stepped wall, found it passed and granted node 3 the lock
+  node 2 still honoured; `a_restarted_holder_readopts_its_own_lease_through_the_gate_
+  whatever_its_wall_clock_says` (M4's arm: the mutant that is the parent's arm fails
+  it with `takeover: false`); `the_persisted_horizon_is_a_boot_stamp_of_the_wait_
+  deadline` replaces `..._written_as_wall_and_loaded_as_wait` (the action carries the
+  wait deadline; the stored stamp is checked token by token). The harness of the core
+  tests now reads one boot for all its incarnations (its raw clock is its wait clock),
+  so every existing restart test keeps its numbers.
+- sim: `a_restarted_root_keeps_its_lock_horizon_across_a_forward_step`, `a_rebooted_
+  root_waits_its_lock_horizon_out_as_a_span`, `a_restarted_holder_keeps_its_read_
+  horizon_across_a_forward_step` (seeds around the first failures of the parent),
+  `a_holder_restarted_past_its_lease_readopts_it_through_the_gate`; the four
+  configurations of the table below are in `long_locks`.
+
+### The configurations, 2 000 seeds each
+
+2 000 seeds (`sweep_config`, the sim binary of b8fe40c against this tree) and a fresh
+range 2000..4000 (this tree):
+
+| Configuration | b8fe40c | this tree | fresh range |
+|---|---|---|---|
+| `locks-root-restart-step-forward` | 1 144 (commit 1's run: 1 143) | 0 | 0 |
+| `locks-root-step-forward-then-restart` | 774 | 0 | 0 |
+| `locks-root-reboot-step-forward` | 1 144 (1 143) | 0 | 0 |
+| `strict-holder-restart-step-forward` | 212 | 0 | 0 |
+| `fast-takeover-successor-restart-before-marker` | 57 | **57** | |
+| `locks-root-reboot` (the cost control) | 0 | 0 | 0 |
+| `holder-restart-step-forward-readopt`, `flex-promiser-restart-step-forward`, `fast-takeover-successor-restart-in-floor` (and `-strict`) | 0 | 0 | |
+
+`fast-takeover-successor-restart-before-marker` is not this commit's: the restarted
+successor re-adopts its own *live* lease (the arm already gated it), and the floor it
+forgot was never persisted; commit 4 (the floor through the KV) fixes it. M4's arm
+changes nothing the sim can reach: `holder-restart-step-forward-readopt` is clean on
+the parent (the restart quarantine covers it), the core test pins the rule.
+
+The reboot's cost, `locks-root-reboot` (a root rebooted 300 ms, no step; 2 000
+seeds, b8fe40c -> this tree): the restarted owner cannot subtract the time since
+its last horizon write after a reboot, so it waits the span it was written with
+(about 3 s at the sim's 1.5 s grants, 27 s at the production defaults for a renewed
+grant, 22 s for a plain one): longest acquisition per seed p50/p90/p99/max 8 032/
+11 249/15 373/22 474 ms -> 9 429/12 492/16 644/23 794, longest handoff gap p50/p90
+2 597/3 262 -> 3 501/3 703 ms, locks acquired 41 683 -> 41 465 (-0.5 %), lock I/Os
+fenced 1 509 -> 2 114 (grants that lapsed under the longer wait), no failure.
+
+### Identity: every configuration without a rate, a suspend or a reboot
+
+The same 137 specs, b8fe40c against this tree: the failing seeds of every
+configuration are identical (the nine negative controls fail the same counts). The
+summary line, floors and fenced seeds are identical for 96; 41 differ, and all of
+them through one change, **M4's own-lease arm** (the spec expects it): the node
+re-adopts its own unreleased lease, which its wall reads as expired, through the gate
+(tail to head, epoch marker) instead of the generic claim, so `takeovers` (every
+gated claim) rises where a node re-acquires its own expired lease after a crash,
+a lapse or an epoch (`locks-failover` 569 -> 2 008, `flex` 326 -> 630, `flex-crash`
+188 -> 447, `locks-blips-tight` 13 884 -> 14 236, `backup` 1 412 -> 1 417 ...;
+`holder-restart-step-forward-readopt` 2 -> 2 002, by construction) and the counters
+that follow from a shifted event by a few units (answered from the stream,
+installed from an epoch's stream, remote chunks enrolled; `locks-partition`
+overtakes 7 -> 10 in 2 000 seeds). The cost is a tail before such a claim:
+`locks-failover` longest acquisition p50 6 600 -> 6 587 ms, p99 10 535 -> 10 426,
+`locks-partition` p90 12 271 -> 12 318, `locks-blips-tight` p99 13 705 -> 14 209:
+tens of milliseconds to half a second at the tail. **Proof that it is the arm and
+nothing else:** the same tree with the arm reverted to the parent's (a scratch
+build) over the 41 configurations that differed: identical to b8fe40c for 38; the
+three others are `flex-tight` and `fast-takeover-capped-grants` (the parent's own
+noise, above) and `locks-root-reboot` (the reboot's cost, above). So the stamps and the
+loads of the persisted horizons are behaviour-neutral where nothing is stepped
+or rebooted.
+
+
+### Verification
+
+On the build box (release unless noted, `-j 4`; the sweeps running meanwhile were paused while the
+other jobs ran):
+
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`:
+  clean.
+- `cargo test --release`: `constellation-control` 146, `-platform` 60 (+ 1 ignored), `-types`
+  42 (+ 1 ignored) + 8 properties, `-meta --lib` 281 (+ 2 ignored), `-authority --lib` 518
+  (+ 2 ignored), `--test sim` 216 (+ 12 ignored: the 212 of commit 2 and the four pinned
+  tests), `-engine --lib` 817 (+ 9 ignored), `-harness` 149; the model crate's whole suite,
+  `--test-threads=2`, alone (26 GB free): backup 9, cto 32, delegation 21, flex_epochs 22,
+  holder_side 4, hotdir 9, inbox 9, locks 62, positions 9, today_bugs 9, lib 5 passed,
+  the ignored ones unchanged: every verdict as before.
+- Harness, once on this build (`lock-failover`, `backup-failover`, seed 42): no load,
+  `clock:rate:+800@a,clock:rate:-800@b`, `clock:rate:+50000@a`: all PASSED, 0 locker `EIO`,
+  120 contender refusals, backup-failover p50 1.49 s, 1.50 s, 1.48 s. (They exercise the
+  restart path only through the daemons' start-up load of the horizons, with nothing
+  granted: the harness's reboot item and the `lock-owner-reboot` scenario are commit 6.)
+- Clock reads over sources that cost nothing, b8fe40c -> commit 2 -> this tree: `now()`
+  29.1 -> 29.9 -> 30.9 ns (the extra 1 ns is the 24 bytes of `Now::boot`), `honour()`
+  27.5 -> 27.9 -> 28.0, `wait()` 18.6 -> 19.0 -> 19.0. The full file-system perf gate was not
+  run (see commit 2).
+
+Rebased onto 4987b00 (F-c): the gates were rerun on the rebased tree: fmt, clippy -D warnings,
+control 146, platform 60, types 42 + 8, meta lib 306, authority lib 528, sim suite 219, engine lib
+823, harness 149, the whole model suite (`--test-threads=2`: lib 5, backup 9, cto 32, delegation
+21, flex_epochs 22, holder_side 4, hotdir 9, inbox 9, locks 74, positions 9, today_bugs 9) passed.
+2 000 seeds on 4987b00 -> this tree: locks-root-restart-step-forward 1 140 -> 0,
+locks-root-step-forward-then-restart 794 -> 0, locks-root-reboot-step-forward 1 139 -> 0,
+strict-holder-restart-step-forward 212 -> 0, the five rate configurations 0, and
+fast-takeover-successor-restart-before-marker 55 -> 55 (commit 4), locks-root-reboot 0.
+The one conflict was `locks_start` (F-c's `set_lapse_park_ms` next to the new
+`load_lock_quarantine(now, span)`); F-c's test code needed `..Now::same(0)` for the new `boot` field.
+The identity sweeps of this entry are those of the b8fe40c tree; the rerun on 4987b00 was
+not completed (the build box became unreachable).

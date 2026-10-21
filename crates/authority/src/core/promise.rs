@@ -264,6 +264,9 @@ pub(crate) struct Check {
 impl Core {
     pub(crate) fn promise_start(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         self.pr.issued = replica.promise_issued();
+        // The promise the previous process issued, on this clock, for the
+        // join gate (plan 43 C7a).
+        replica.load_promise_issued(now, self.cfg.promise_horizon_span_ms());
         self.pr.restored_hold = replica.epoch_hold_persisted();
         self.pr.persisted_hold = self.pr.restored_hold;
         self.pr.hold_ended = replica.epoch_hold_ended();

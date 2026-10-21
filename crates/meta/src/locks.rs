@@ -5545,6 +5545,7 @@ mod token_tests {
             wall: Ms(0),
             honour: HonourMs(2_000),
             wait: WaitMs(0),
+            ..Now::same(0)
         });
         assert!(ahead(5_000 - 2_000 - WRAP_LOOKAHEAD_MS));
         // Lapsing: open whatever the clock says.

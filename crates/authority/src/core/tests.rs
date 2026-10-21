@@ -97,7 +97,7 @@ impl Harness {
                     writes <= 16,
                     "the lock horizon write never covers what it was asked for"
                 );
-                let durable = self.meta.note_lock_grant_horizon(until).ok();
+                let durable = self.meta.note_lock_grant_horizon(until, self.clk()).ok();
                 let more = self.core.handle(
                     self.clk(),
                     Event::LockHorizonPersisted { until, durable },
@@ -121,6 +121,14 @@ impl Harness {
             wall: self.now,
             honour: self.honour(),
             wait: WaitMs(self.now.0 + self.wait_off),
+            // One boot for every incarnation of the harness: its raw clock
+            // is its wait clock (no rate, no budget), so a "restart" reads
+            // a persisted horizon as time left on it.
+            boot: constellation_types::clock::BootNow {
+                id: 1,
+                raw_ms: self.now.0 + self.wait_off,
+                budget_ppm: 0,
+            },
         }
     }
 
@@ -297,6 +305,7 @@ fn timers_are_relative_to_the_step_reading() {
         wall: Ms(1_000_000),
         honour: HonourMs(5_000_000),
         wait: WaitMs(9_000_000),
+        boot: Now::same(0).boot,
     };
     let mut out = Vec::new();
     core.start(now, &meta, &mut out);
@@ -7084,7 +7093,9 @@ mod cto {
     fn a_restart_quarantines_acks_until_the_grant_horizon() {
         let (h0, ino) = holder_with_file();
         let now = h0.now;
-        h0.meta.note_grant_horizon(now.0 + 3_000).unwrap();
+        h0.meta
+            .note_grant_horizon(WaitMs(now.0 + 3_000), h0.clk())
+            .unwrap();
         let meta = h0.meta;
         let mut core = Core::new(h0.core.cfg.clone());
         let mut out = Vec::new();
@@ -13932,7 +13943,11 @@ mod locks {
             lock_answer(&out, op)
         };
         assert!(matches!(lock(&mut h, 5, ino), LockAnswer::Granted { .. }));
-        assert_eq!(h.meta.load_lock_quarantine(h.clk()), None);
+        assert_eq!(
+            h.meta
+                .load_lock_quarantine(h.clk(), h.core.cfg.lock_horizon_span_ms()),
+            None
+        );
         let restart = |h: Harness| {
             let mut core = Core::new(h.core.cfg.clone());
             core.start(h.clk(), &h.meta, &mut Vec::new());
@@ -13994,7 +14009,11 @@ mod locks {
         let (mut h, ino) = holder_with_file();
         let out = request(&mut h, 2, 7, ino, X, false);
         let (g2, _) = granted(&lock_replies(&out)[0].2);
-        let granted_horizon = h.meta.load_lock_quarantine(h.clk()).unwrap().0;
+        let granted_horizon = h
+            .meta
+            .load_lock_quarantine(h.clk(), h.core.cfg.lock_horizon_span_ms())
+            .unwrap()
+            .0;
         let ttl = h.core.lock_ttl_ms();
         let mut renewed_until = 0;
         // Renew every half TTL until the grant's own horizon is long gone.
@@ -14052,7 +14071,11 @@ mod locks {
             ),
             "still inside the renewed window: {out:?}"
         );
-        let horizon = h.meta.load_lock_quarantine(h.clk()).unwrap().0;
+        let horizon = h
+            .meta
+            .load_lock_quarantine(h.clk(), h.core.cfg.lock_horizon_span_ms())
+            .unwrap()
+            .0;
         assert!(horizon >= renewed_until, "{horizon} < {renewed_until}");
         h.now = Ms(horizon + 1);
         let out = request(&mut h, 3, 32, ino, X, false);
@@ -14065,7 +14088,60 @@ mod locks {
         );
     }
 
-    fn horizon_writes(out: &[Action]) -> Vec<i64> {
+    /// Plan 43 C7a (Appendix B row 14): a holder restarted on the same boot
+    /// with its wall clock an hour on grants no lock to another node until the
+    /// horizon it persisted has passed on the raw clock: the quarantine is the
+    /// boot stamp, not the wall value, which the step would have put in the
+    /// past. Fails on the parent: its restarted core read the horizon against
+    /// the stepped wall, found it passed, and granted node 3 the lock node 2
+    /// still honoured.
+    #[test]
+    fn the_restart_quarantine_is_the_boot_stamp() {
+        let (mut h, ino) = holder_with_file();
+        let out = request(&mut h, 2, 7, ino, X, false);
+        let (g2, _) = granted(&lock_replies(&out)[0].2);
+        let end = h.meta.locks().get(g2).unwrap().until;
+        // The node stops and comes back 100 ms later on the same boot, its
+        // wall 1 h on (a step while it was down).
+        let mut h = Harness {
+            core: Core::new(h.core.cfg.clone()),
+            meta: h.meta,
+            now: h.now.plus(100),
+            honour_off: 0,
+            wait_off: 0,
+            manual_horizon: false,
+        };
+        h.step_wall(3_600_000);
+        h.core.start(h.clk(), &h.meta, &mut Vec::new());
+        let horizon = h.meta.locks().quarantine_until();
+        assert!(horizon >= end, "{horizon:?} < {end:?}");
+        assert!(
+            horizon.since(h.clk().wait) > 0,
+            "nothing left of the horizon"
+        );
+        h.hold(2, None);
+        let out = request(&mut h, 3, 30, ino, X, false);
+        assert!(
+            matches!(
+                lock_replies(&out).as_slice(),
+                [(3, OpId(30), LockOutcome::WouldBlock)]
+            ),
+            "{out:?}"
+        );
+        // Past it on the raw clock: granted.
+        h.now = Ms(horizon.0 + 1 - h.wait_off);
+        h.hold(2, None);
+        let out = request(&mut h, 3, 31, ino, X, false);
+        assert!(
+            matches!(
+                lock_replies(&out).as_slice(),
+                [(3, OpId(31), LockOutcome::Granted { .. })]
+            ),
+            "{out:?}"
+        );
+    }
+
+    fn horizon_writes(out: &[Action]) -> Vec<WaitMs> {
         out.iter()
             .filter_map(|a| match a {
                 Action::PersistLockHorizon { until } => Some(*until),
@@ -14129,7 +14205,7 @@ mod locks {
             .locks()
             .own_grant(ino, 2, h.clk().wait)
             .expect("in the table");
-        assert!(first[0] >= g2.until.0);
+        assert!(first[0] >= g2.until);
         // The core keeps stepping: node 3's refusal needs no horizon.
         h.advance(2_000);
         let out = request(&mut h, 3, 8, ino, X, false);
@@ -14155,8 +14231,8 @@ mod locks {
             .expect("granted");
         // The first write lands: node 2's answer only (node 4's window
         // runs past it), and the next write carries node 4's.
-        let durable = h.meta.note_lock_grant_horizon(first[0]).unwrap();
-        assert!(durable < g4.until.0, "the test needs a second write");
+        let durable = h.meta.note_lock_grant_horizon(first[0], h.clk()).unwrap();
+        assert!(durable < g4.until, "the test needs a second write");
         let out = h.step(Event::LockHorizonPersisted {
             until: first[0],
             durable: Some(durable),
@@ -14168,8 +14244,8 @@ mod locks {
         assert_eq!(granted(o).0, g2.id);
         let second = horizon_writes(&out);
         assert_eq!(second.len(), 1, "{out:?}");
-        assert!(second[0] >= g4.until.0);
-        let durable = h.meta.note_lock_grant_horizon(second[0]).unwrap();
+        assert!(second[0] >= g4.until);
+        let durable = h.meta.note_lock_grant_horizon(second[0], h.clk()).unwrap();
         let out = h.step(Event::LockHorizonPersisted {
             until: second[0],
             durable: Some(durable),
@@ -14214,11 +14290,15 @@ mod locks {
         assert_eq!(pending.len(), 1, "{out:?}");
         // Crash before the write lands: the restart waits out the window
         // node 2 was told of.
-        let horizon = h.meta.load_lock_quarantine(h.clk()).expect("quarantined").0;
+        let horizon = h
+            .meta
+            .load_lock_quarantine(h.clk(), h.core.cfg.lock_horizon_span_ms())
+            .expect("quarantined")
+            .0;
         assert!(horizon >= answered, "{horizon} < {answered}");
         // The write lands: the renewal is answered, and a restart from
         // here waits out the renewed window.
-        let durable = h.meta.note_lock_grant_horizon(pending[0]).unwrap();
+        let durable = h.meta.note_lock_grant_horizon(pending[0], h.clk()).unwrap();
         let out = h.step(Event::LockHorizonPersisted {
             until: pending[0],
             durable: Some(durable),
@@ -14232,7 +14312,11 @@ mod locks {
         );
         let renewed_until = h.meta.locks().get(g2).unwrap().until.0;
         assert!(renewed_until > answered);
-        let horizon = h.meta.load_lock_quarantine(h.clk()).expect("quarantined").0;
+        let horizon = h
+            .meta
+            .load_lock_quarantine(h.clk(), h.core.cfg.lock_horizon_span_ms())
+            .expect("quarantined")
+            .0;
         assert!(horizon >= renewed_until, "{horizon} < {renewed_until}");
     }
 
@@ -15336,8 +15420,14 @@ mod locks {
             unreachable!()
         };
         constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
-        h.meta.note_lock_grant_horizon(h.now.0 + 3_000).unwrap();
-        let until = h.meta.load_lock_quarantine(h.clk()).expect("quarantined").0;
+        h.meta
+            .note_lock_grant_horizon(WaitMs(h.now.0 + 3_000), h.clk())
+            .unwrap();
+        let until = h
+            .meta
+            .load_lock_quarantine(h.clk(), h.core.cfg.lock_horizon_span_ms())
+            .expect("quarantined")
+            .0;
         let now = h.now;
         h.core.locks_start(Now::same(now.0), &h.meta);
         let mut out = Vec::new();
@@ -17513,8 +17603,14 @@ mod locks {
             unreachable!()
         };
         constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
-        h.meta.note_lock_grant_horizon(h.now.0 + 3_000).unwrap();
-        let until = h.meta.load_lock_quarantine(h.clk()).expect("quarantined").0;
+        h.meta
+            .note_lock_grant_horizon(WaitMs(h.now.0 + 3_000), h.clk())
+            .unwrap();
+        let until = h
+            .meta
+            .load_lock_quarantine(h.clk(), h.core.cfg.lock_horizon_span_ms())
+            .expect("quarantined")
+            .0;
         let now = h.now;
         h.core.locks_start(Now::same(now.0), &h.meta);
         let mut out = Vec::new();
@@ -22349,7 +22445,7 @@ mod locks {
         h.core.start(Now::same(now.0), &h.meta, &mut Vec::new());
         let horizon = h
             .meta
-            .load_lock_quarantine(h.clk())
+            .load_lock_quarantine(h.clk(), h.core.cfg.lock_horizon_span_ms())
             .expect("quarantined by the renewal")
             .0;
         assert!(horizon >= record, "{horizon} < {record}");
@@ -24137,11 +24233,12 @@ mod locks {
         assert!(h.core.stats.lock_grace_periods > before, "never outwaited");
     }
 
-    /// The restart horizon is persisted as a wall value (it must outlive the
-    /// process) from the wait-clock deadline, and read back as time left on
-    /// the new process's wait clock (R9).
+    /// The restart horizon is persisted as a boot stamp (plan 43 C7a) of the
+    /// wait-clock deadline, and read back as time left on the new process's
+    /// wait clock: from the raw clock on the same boot, the recorded span
+    /// after another.
     #[test]
-    fn the_persisted_horizon_is_written_as_wall_and_loaded_as_wait() {
+    fn the_persisted_horizon_is_a_boot_stamp_of_the_wait_deadline() {
         let (mut h, ino) = holder_with_file();
         uncap(&mut h);
         h.wait_off = -50_000;
@@ -24152,32 +24249,62 @@ mod locks {
             .own_grant(ino, 2, h.clk().wait)
             .expect("granted")
             .until;
-        let written: Vec<i64> = out
+        let written: Vec<WaitMs> = out
             .iter()
             .filter_map(|a| match a {
                 Action::PersistLockHorizon { until } => Some(*until),
                 _ => None,
             })
             .collect();
-        assert_eq!(written, vec![h.clk().wall_of_wait(until_wait).0]);
+        assert_eq!(written, vec![until_wait]);
         assert!(
             lock_replies(&out)
                 .iter()
                 .any(|(_, _, o)| matches!(o, LockOutcome::Granted { .. })),
             "the answer waited for a horizon that was durable: {out:?}"
         );
-        // A new process: its clocks restart elsewhere; what is left of the
-        // horizon (the write is rounded up by a second) is kept as a
-        // duration.
+        // The stored value: the wall end, then the span (the write is
+        // rounded up by a second), the boot and the raw end.
         let left = until_wait.since(h.clk().wait) + 1_000;
+        let stored = h.meta.kv_get("lock_grant_horizon_ms").unwrap().unwrap();
+        let stamp = constellation_meta::store::horizon::parse_stamp(
+            &stored,
+            h.core.cfg.lock_horizon_span_ms(),
+        );
+        assert_eq!(stamp.wall, h.clk().wall_of_wait(until_wait.plus(1_000)));
+        assert_eq!((stamp.span_ms, stamp.boot_id), (left, 1));
+        assert_eq!(stamp.raw_until_ms, h.clk().boot.raw_ms + left);
+        // A new process on another boot, its clocks started elsewhere: the
+        // span, as a duration.
         let restarted = Now {
             wall: h.clk().wall,
             honour: HonourMs(7),
             wait: WaitMs(9),
+            boot: constellation_types::clock::BootNow {
+                id: 2,
+                raw_ms: 3,
+                budget_ppm: 0,
+            },
+        };
+        let span = h.core.cfg.lock_horizon_span_ms();
+        assert_eq!(
+            h.meta.load_lock_quarantine(restarted, span),
+            Some(WaitMs(9 + left))
+        );
+        // On the same boot, 400 ms later by the raw clock: 400 ms less,
+        // whatever the wall says.
+        let same_boot = Now {
+            boot: constellation_types::clock::BootNow {
+                id: 1,
+                raw_ms: h.clk().boot.raw_ms + 400,
+                budget_ppm: 0,
+            },
+            wall: Ms(h.clk().wall.0 + 3_600_000),
+            ..restarted
         };
         assert_eq!(
-            h.meta.load_lock_quarantine(restarted),
-            Some(WaitMs(9 + left))
+            h.meta.load_lock_quarantine(same_boot, span),
+            Some(WaitMs(9 + left - 400))
         );
     }
 

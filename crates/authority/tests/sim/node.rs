@@ -2310,7 +2310,10 @@ impl Driver {
                     // keep free), answered as an event: the answers it
                     // holds go out one event later, behind whatever
                     // arrives meanwhile.
-                    let durable = self.meta.note_lock_grant_horizon(until).ok();
+                    let durable = self
+                        .meta
+                        .note_lock_grant_horizon(until, self.clock.now())
+                        .ok();
                     let _ = self.tx.send(Event::LockHorizonPersisted { until, durable });
                 }
                 Action::EpochClose | Action::EpochFlushed => {

@@ -3840,7 +3840,7 @@ impl Driver {
                     let tx = self.int_tx.clone();
                     let meta = self.deps.meta.clone();
                     tokio::task::spawn_blocking(move || {
-                        let durable = match meta.note_lock_grant_horizon(until) {
+                        let durable = match meta.note_lock_grant_horizon(until, now()) {
                             Ok(d) => Some(d),
                             Err(error) => {
                                 tracing::warn!(

@@ -8517,6 +8517,63 @@ fn a_reader_cut_off_inside_the_takeover_floor_misses_no_acknowledged_write() {
     }
 }
 
+/// Plan 43 C7a (3/6): the root restarted on the same boot with its wall
+/// stepped 3 s forward while it was down, or while it was up after its last
+/// horizon write, reads its lock horizon on the raw clock (a boot stamp), so
+/// it grants nothing over a grant still honoured. `locks-root-restart-step-
+/// forward`: 1 143 of 2 000 seeds failed before (the first at 0, 1 and 2),
+/// `locks-root-step-forward-then-restart` 774 (3, 4 and 6).
+#[test]
+fn a_restarted_root_keeps_its_lock_horizon_across_a_forward_step() {
+    for seed in 0..12u64 {
+        run_seed(seed, locks_root_restart_step_forward_config())
+            .unwrap_or_else(|e| panic!("restart seed {seed}: {e}"));
+        run_seed(seed, locks_root_step_forward_then_restart_config())
+            .unwrap_or_else(|e| panic!("step-then-restart seed {seed}: {e}"));
+    }
+}
+
+/// Plan 43 C7a (3/6): the same across a reboot (a new boot id: the horizon
+/// is waited out as the span it was written with, whatever the new boot's
+/// raw clock says). `locks-root-reboot-step-forward`: 1 143 of 2 000 seeds
+/// failed before (the first at 0, 1 and 2); the cost control `locks-root-
+/// reboot` (no step) is clean before and after.
+#[test]
+fn a_rebooted_root_waits_its_lock_horizon_out_as_a_span() {
+    for seed in 0..12u64 {
+        run_seed(seed, locks_root_reboot_step_forward_config())
+            .unwrap_or_else(|e| panic!("reboot-step seed {seed}: {e}"));
+        run_seed(seed, locks_root_reboot_config())
+            .unwrap_or_else(|e| panic!("reboot seed {seed}: {e}"));
+    }
+}
+
+/// Plan 43 C7a (3/6): a holder restarted with its wall stepped 7 s forward
+/// reads its read-grant horizon on the raw clock: it does not acknowledge a
+/// write while a reader still serves from its read delegation.
+/// `strict-holder-restart-step-forward`: 212 of 2 000 seeds failed before
+/// (the first at 9, 40 and 47: a stale strict read).
+#[test]
+fn a_restarted_holder_keeps_its_read_horizon_across_a_forward_step() {
+    for seed in [8u64, 9, 10, 39, 40, 41, 46, 47, 48] {
+        run_seed(seed, strict_holder_restart_step_forward_config())
+            .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    }
+}
+
+/// Plan 43 C7a (3/6, M4): an own lease the restarted holder's wall reads as
+/// expired is re-adopted through the gate like a live one (the tail, the
+/// marker, the strand and replay): `holder-restart-step-forward-readopt` was
+/// clean on the parent too (the restart quarantine covers it); a regression
+/// configuration for the rule the core test pins.
+#[test]
+fn a_holder_restarted_past_its_lease_readopts_it_through_the_gate() {
+    for seed in 0..12u64 {
+        run_seed(seed, holder_restart_step_forward_readopt_config())
+            .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    }
+}
+
 /// Plan 43 C7-F F-a (review F3): the credited-arrival control on the
 /// strict side, where the window it needs is wide: with the successor's
 /// clock 4 s ahead, a cap counted from the beats' credit ends the floor
@@ -9825,6 +9882,27 @@ fn long_locks() {
         "locks-failover-backup-writes",
         with_lock_writes(locks_failover_backup_config(), ""),
         202_000..202_000 + n,
+    );
+    // Plan 43 C7a (3/6): restart horizons read on the boot they were written on.
+    run_m14(
+        "locks-root-restart-step-forward",
+        locks_root_restart_step_forward_config(),
+        222_000..222_000 + n,
+    );
+    run_m14(
+        "locks-root-step-forward-then-restart",
+        locks_root_step_forward_then_restart_config(),
+        223_000..223_000 + n,
+    );
+    run_m14(
+        "locks-root-reboot-step-forward",
+        locks_root_reboot_step_forward_config(),
+        224_000..224_000 + n,
+    );
+    run_m14(
+        "locks-root-reboot",
+        locks_root_reboot_config(),
+        225_000..225_000 + n,
     );
 }
 

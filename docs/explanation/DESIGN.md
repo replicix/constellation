@@ -903,8 +903,9 @@ its right to answer strict reads) on that clock, so a wall-clock step on a
 holder never extends a window it honours: a backward step changes nothing,
 a forward step ends its windows early, by the step. Values that cross nodes
 or a restart stay wall-clock (a lease body's expiry, a fencing token's
-window, a persisted horizon) and keep the offset bound above; a token is
-minted on the wall clock from the honour window at the moment it is built.
+window) and keep the offset bound above; a token is minted on the wall clock
+from the honour window at the moment it is built. A horizon persisted across a
+restart is not read on the wall clock at all (plan 43 C7a): see below.
 A grantor or a waiter measures what it waits out (an owner's record of a
 grant, a root's outwait of a delegation, a read-delegation grant, the
 quarantines and graces after a restart or a takeover, a successor's floor,
@@ -913,6 +914,21 @@ reading that never over-counts and ignores every wall step, so a forward step
 never ends a wait early and a backward one never lengthens it. A holder's
 heartbeat names its lease's end on that clock too, so a successor's cap on its
 floor is a difference on a clock no wall step moves.
+
+A deadline that must outlive the process (the latest end of any read or lock
+grant this node made, the last heartbeat promise) is persisted with the boot it
+was measured on (plan 43 C7a, Appendix B row 14): its end on the wall clock
+(for status), how far ahead of the write it was (its span), the boot id and the
+raw clock's reading at which it ends. A restart on the same boot reads the time
+left on the raw clock since boot (never stepped, never slewed, not counting
+suspend, so conservative), so a wall step while the node was down, or while it
+was up after the last write, moves nothing; a restart after a reboot, of a
+value from an older build or of one with no boot waits the whole span from the
+process's start. A graceful shutdown deletes a horizon that has already passed,
+so an idle node's reboot waits for nothing; an ungraceful stop leaves it, and a
+reboot after it waits up to the span (about a lock's TTL before the first lock
+grant, about a read delegation's before the first acknowledgement as a
+re-adopting holder).
 
 Both readings pay for the node's oscillator (plan 43 C7a). A crystal runs fast
 or slow by tens of ppm; each node budgets its own, `ρ`, at 1 000 ppm (0.1 %)

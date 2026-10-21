@@ -399,21 +399,27 @@ pub trait Replica {
     /// link's ancestors), for a subtree grace.
     fn is_under(&self, ino: Ino, dir: Ino) -> bool;
     /// Persist, before answering a grant, that grants may be live until
-    /// `until_ms` (the restart quarantine's horizon). `false`: it could not
+    /// `until` (the restart quarantine's horizon, on this node's wait
+    /// clock; stored as a boot stamp: plan 43 C7a). `false`: it could not
     /// be persisted, and the grant must not be made.
-    fn note_grant_horizon(&self, until_ms: i64) -> bool;
+    fn note_grant_horizon(&self, until: WaitMs, now: Now) -> bool;
     /// M16: the inodes whose read delegations an op not yet executed must
     /// recall (`Meta::recall_inos_of_op_now`: an unlink's or rename's
     /// victims included).
     fn recall_inos_of_op(&self, op: &MutateOp) -> Vec<Ino>;
     /// At start: the previous incarnation's grants may be live until the
-    /// returned time (this node's wait clock, converted from the persisted
-    /// wall horizon); the table is quarantined until then.
-    fn load_grant_quarantine(&self, now: Now) -> Option<WaitMs>;
+    /// returned time (this node's wait clock, read from the persisted boot
+    /// stamp: the raw clock on the same boot, the recorded span otherwise,
+    /// `default_span_ms` for a value without one); the table is quarantined
+    /// until then.
+    fn load_grant_quarantine(&self, now: Now, default_span_ms: i64) -> Option<WaitMs>;
     /// At start: the previous incarnation's lock grants may be live until
-    /// the returned time (this node's wait clock); no new lock grant until
-    /// then.
-    fn load_lock_quarantine(&self, now: Now) -> Option<WaitMs>;
+    /// the returned time (this node's wait clock, as above); no new lock
+    /// grant until then.
+    fn load_lock_quarantine(&self, now: Now, default_span_ms: i64) -> Option<WaitMs>;
+    /// At start: the previous incarnation's last promise, on this node's
+    /// wait clock (`Meta::load_promise_issued`), for the join gate.
+    fn load_promise_issued(&self, now: Now, default_span_ms: i64) -> Option<WaitMs>;
     /// Whether the unshipped journal touched what a ReadIndex for `ino`
     /// (a directory's entries with `dir`; the entry `name` → `child`)
     /// reads.
@@ -1119,8 +1125,8 @@ impl Replica for Meta {
         false
     }
 
-    fn note_grant_horizon(&self, until_ms: i64) -> bool {
-        match Meta::note_grant_horizon(self, until_ms) {
+    fn note_grant_horizon(&self, until: WaitMs, now: Now) -> bool {
+        match Meta::note_grant_horizon(self, until, now) {
             Ok(()) => true,
             Err(error) => {
                 tracing::warn!(%error, "persisting the read-grant horizon failed; not granting");
@@ -1129,12 +1135,16 @@ impl Replica for Meta {
         }
     }
 
-    fn load_grant_quarantine(&self, now: Now) -> Option<WaitMs> {
-        Meta::load_grant_quarantine(self, now)
+    fn load_grant_quarantine(&self, now: Now, default_span_ms: i64) -> Option<WaitMs> {
+        Meta::load_grant_quarantine(self, now, default_span_ms)
     }
 
-    fn load_lock_quarantine(&self, now: Now) -> Option<WaitMs> {
-        Meta::load_lock_quarantine(self, now)
+    fn load_lock_quarantine(&self, now: Now, default_span_ms: i64) -> Option<WaitMs> {
+        Meta::load_lock_quarantine(self, now, default_span_ms)
+    }
+
+    fn load_promise_issued(&self, now: Now, default_span_ms: i64) -> Option<WaitMs> {
+        Meta::load_promise_issued(self, now, default_span_ms)
     }
 
     fn recall_inos_of_op(&self, op: &MutateOp) -> Vec<Ino> {

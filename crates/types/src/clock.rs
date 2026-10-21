@@ -222,12 +222,53 @@ clock_ms! {
     WaitMs
 }
 
-/// The three readings of one instant on one node, taken from one sample.
+/// The boot-scoped elapsed reading of one sample (plan 43 C7a): what a
+/// deadline persisted across a restart is stamped with ([`BootStamp`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BootNow {
+    /// This boot ([`ClockSources::boot_id`]; 0: unknown, which no stamp
+    /// matches).
+    pub id: u64,
+    /// The raw clock since boot, ms, **unscaled** (the clock's budget is
+    /// applied only where a WAIT duration is mapped onto it and back).
+    pub raw_ms: i64,
+    /// The clock's rate budget, ppm: the map between a WAIT duration and
+    /// raw ms.
+    pub budget_ppm: u32,
+}
+
+/// The three readings of one instant on one node, taken from one sample,
+/// and the boot reading a persisted deadline is stamped with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Now {
     pub wall: Ms,
     pub honour: HonourMs,
     pub wait: WaitMs,
+    pub boot: BootNow,
+}
+
+/// A deadline as persisted (plan 43 C7a, Appendix B row 14): written with
+/// the boot it was measured on, so that a restart on the same boot reads the
+/// time left on the raw clock (no wall step while the node was up or down
+/// can move it) and a restart on another boot, or from a value that carries
+/// no boot, waits the recorded `span`. See [`Now::stamp_of_wait`] and
+/// [`Now::wait_of_stamp`]; the text form lives with the stores that persist
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BootStamp {
+    /// The deadline on the wall clock at the write (what status and logs
+    /// show; token 0 of the persisted value, and the only token an older
+    /// build wrote).
+    pub wall: Ms,
+    /// How far ahead of the write the deadline was, in WAIT ms: all that is
+    /// left of it, at most, wherever and whenever the process that reads it
+    /// starts.
+    pub span_ms: i64,
+    /// The boot of the write (0: none).
+    pub boot_id: u64,
+    /// The raw clock reading (since boot, ms, unscaled) at which the
+    /// deadline ends.
+    pub raw_until_ms: i64,
 }
 
 /// `at` mapped through a remaining duration: `base + (at - source_now)`,
@@ -247,19 +288,34 @@ impl Now {
     /// All three readings equal: tests, and any caller with a single
     /// reading and no steps.
     pub fn same(ms: i64) -> Now {
+        Self::same_on_boot(ms, 0)
+    }
+
+    /// [`Now::same`] on a boot named `boot_id` (0: unknown), the raw clock
+    /// reading `ms` and no budget: for tests of the persisted deadlines.
+    pub fn same_on_boot(ms: i64, boot_id: u64) -> Now {
         Now {
             wall: Ms(ms),
             honour: HonourMs(ms),
             wait: WaitMs(ms),
+            boot: BootNow {
+                id: boot_id,
+                raw_ms: ms,
+                budget_ppm: 0,
+            },
         }
     }
 
-    /// Advance all three by `ms` (time passing; no step).
+    /// Advance all of them by `ms` (time passing; no step).
     pub fn plus(self, ms: u64) -> Now {
         Now {
             wall: self.wall.plus(ms),
             honour: self.honour.plus(ms),
             wait: self.wait.plus(ms),
+            boot: BootNow {
+                raw_ms: self.boot.raw_ms.saturating_add(ms as i64),
+                ..self.boot
+            },
         }
     }
 
@@ -281,6 +337,45 @@ impl Now {
     /// start, a peer's absolute taken as a local wait; rows 6, 14).
     pub fn wait_of_wall(&self, at: Ms) -> WaitMs {
         WaitMs(map_remaining(at.0, self.wall.0, self.wait.0))
+    }
+
+    /// A WAIT deadline as a persisted stamp: `span = at - wait` (at least
+    /// 0, in WAIT ms), the raw reading at which it ends (`span` mapped
+    /// through the budget onto the raw clock: `ceil(span (1e6 + rho)/1e6)`
+    /// past now; the raw reading is floored to the ms, so the end is early by
+    /// less than 1 ms) and the wall value `wall_of_wait(at)`.
+    pub fn stamp_of_wait(&self, at: WaitMs) -> BootStamp {
+        let span = at.0.saturating_sub(self.wait.0).max(0);
+        let raw = (span as i128 * (1_000_000 + self.boot.budget_ppm as i128) + 999_999) / 1_000_000;
+        BootStamp {
+            wall: self.wall_of_wait(at),
+            span_ms: span,
+            boot_id: self.boot.id,
+            raw_until_ms: self
+                .boot
+                .raw_ms
+                .saturating_add(raw.min(i64::MAX as i128) as i64),
+        }
+    }
+
+    /// A persisted stamp as a WAIT deadline in this process. On the boot it
+    /// was written on (ids equal, not 0): the time left on the raw clock,
+    /// `ceil((raw_until - raw) 1e6 / (1e6 + rho))`, never more than the
+    /// recorded span. On another boot, an unknown one, or a stamp with none:
+    /// the whole span from now (only time has passed since the write, so no
+    /// more than that is left, and a step of the wall clock changes
+    /// nothing). `None`: nothing left.
+    pub fn wait_of_stamp(&self, s: &BootStamp) -> Option<WaitMs> {
+        let same_boot = s.boot_id != 0 && s.boot_id == self.boot.id;
+        let left = if same_boot {
+            let raw = (s.raw_until_ms as i128 - self.boot.raw_ms as i128).max(0);
+            let wait = (raw * 1_000_000 + 1_000_000 + self.boot.budget_ppm as i128 - 1)
+                / (1_000_000 + self.boot.budget_ppm as i128);
+            wait.min(s.span_ms.max(0) as i128) as i64
+        } else {
+            s.span_ms
+        };
+        (left > 0).then(|| self.wait.plus(left as u64))
     }
 
     /// A HONOUR deadline as a WAIT value: the time left on a holder's
@@ -318,8 +413,8 @@ pub trait ClockSources: Send + Sync {
     /// This boot's identity (plan 43 C7a: what a deadline persisted across
     /// a restart is stamped with, so that a restart on the same boot reads
     /// it on the raw clock and one after a reboot waits the recorded
-    /// span). 0: unknown, which no stamp matches. Nothing reads it before
-    /// C7a's boot-stamped horizons; the simulator models it for them.
+    /// span). 0: unknown, which no stamp matches. The raw clock must be
+    /// absolute (since this boot) wherever the id is not 0.
     fn boot_id(&self) -> u64 {
         0
     }
@@ -355,6 +450,8 @@ pub struct StepStats {
 pub struct ProtocolClock {
     sources: Arc<dyn ClockSources>,
     id: u64,
+    /// The sources' boot id, read once ([`ClockSources::boot_id`]).
+    boot_id: u64,
     /// The oscillator's rate budget, ppm (plan 43 C7a; clamped to
     /// [`MAX_RATE_BUDGET_PPM`]).
     budget_ppm: u32,
@@ -417,9 +514,11 @@ impl ProtocolClock {
         assert_ne!(id, 0, "a protocol clock id is never 0");
         let budget_ppm = budget_ppm.min(MAX_RATE_BUDGET_PPM);
         let (wait_mul, honour_mul) = scale_muls(budget_ppm);
+        let boot_id = sources.boot_id();
         let s = sources.read();
         Self {
             id,
+            boot_id,
             budget_ppm,
             wait_mul,
             honour_mul,
@@ -470,6 +569,11 @@ impl ProtocolClock {
             wall: Ms(s.wall_ms),
             honour: self.honour_of(s.wall_ms, s.boot_ns, s.mono_ns, s.raw_ns),
             wait: self.wait_of(s.raw_ns),
+            boot: BootNow {
+                id: self.boot_id,
+                raw_ms: ns_to_ms(s.raw_ns),
+                budget_ppm: self.budget_ppm,
+            },
         }
     }
 
@@ -648,9 +752,11 @@ mod tests {
     #[test]
     fn the_readings_start_at_wall_and_follow_time() {
         let (s, c) = stub();
-        assert_eq!(c.now(), Now::same(START));
+        let readings = |n: Now| (n.wall.0, n.honour.0, n.wait.0);
+        assert_eq!(readings(c.now()), (START, START, START));
         tick(&s, 1_234);
-        assert_eq!(c.now(), Now::same(START + 1_234));
+        let (w, h, t) = (START + 1_234, START + 1_234, START + 1_234);
+        assert_eq!(readings(c.now()), (w, h, t));
         assert_eq!(c.step_stats(), StepStats::default());
     }
 
@@ -968,6 +1074,7 @@ mod tests {
             wall: Ms(1_000_000),
             honour: HonourMs(5_000_000),
             wait: WaitMs(3_000_000),
+            ..Now::same(0)
         };
         assert_eq!(now.wall_of_wait(WaitMs(3_000_250)), Ms(1_000_250));
         assert_eq!(now.wall_of_honour(HonourMs(5_000_250)), Ms(1_000_250));
@@ -1003,6 +1110,7 @@ mod tests {
     fn now_helpers_and_newtype_arithmetic() {
         let n = Now::same(100).plus(50);
         assert_eq!(n, Now::same(150));
+        assert_eq!(Now::same_on_boot(7, 9).boot.id, 9);
         assert_eq!(Ms(i64::MAX).plus(5), Ms(i64::MAX));
         assert_eq!(WaitMs(i64::MIN).minus(5), WaitMs(i64::MIN));
         assert_eq!(HonourMs(10).since(HonourMs(30)), -20);
@@ -1281,6 +1389,163 @@ mod tests {
                 per(wait)
             );
         }
+    }
+
+    /// A reading on boot `id`, the raw clock at `raw` ms since boot, the wait
+    /// clock at `wait` (the wall far from both, so that nothing reads it by
+    /// accident), the clock budgeted `ppm`.
+    fn at(id: u64, raw: i64, wait: i64, ppm: u32) -> Now {
+        Now {
+            wall: Ms(1_000_000_000 + wait),
+            honour: HonourMs(wait),
+            wait: WaitMs(wait),
+            boot: BootNow {
+                id,
+                raw_ms: raw,
+                budget_ppm: ppm,
+            },
+        }
+    }
+
+    /// Expectation (plan 43 C7a, Appendix B row 14): a deadline stamped on
+    /// a boot and read back on the same boot, by a process that started
+    /// later, ends where it did, whatever the wait clock of the new process
+    /// says: the time left is read on the raw clock.
+    #[test]
+    fn a_stamp_round_trips_on_one_boot() {
+        // The writer: 20 s ahead, at raw 100 000 ms since boot.
+        let w = at(5, 100_000, 7_000, 0);
+        let stamp = w.stamp_of_wait(WaitMs(27_000));
+        assert_eq!(stamp.span_ms, 20_000);
+        assert_eq!((stamp.boot_id, stamp.raw_until_ms), (5, 120_000));
+        assert_eq!(stamp.wall, w.wall_of_wait(WaitMs(27_000)));
+        // The same process, 5 s on: 15 s left.
+        let r = at(5, 105_000, 12_000, 0);
+        assert_eq!(r.wait_of_stamp(&stamp), Some(WaitMs(27_000)));
+        // A restarted process, 12 s on: its wait clock starts anywhere.
+        let r = at(5, 112_000, 900_000, 0);
+        assert_eq!(r.wait_of_stamp(&stamp), Some(WaitMs(908_000)));
+        // Passed: nothing left.
+        assert_eq!(at(5, 120_000, 1, 0).wait_of_stamp(&stamp), None);
+        assert_eq!(at(5, 999_999, 1, 0).wait_of_stamp(&stamp), None);
+        // A deadline already past when stamped has no span.
+        assert_eq!(w.stamp_of_wait(WaitMs(6_000)).span_ms, 0);
+        assert_eq!(w.wait_of_stamp(&w.stamp_of_wait(WaitMs(6_000))), None);
+    }
+
+    /// Expectation: another boot (or an unknown one, on either side) waits
+    /// the recorded span from the process's start, however late the raw
+    /// clock of the new boot says it is.
+    #[test]
+    fn a_stamp_of_another_boot_waits_its_span() {
+        let stamp = at(5, 100_000, 7_000, 0).stamp_of_wait(WaitMs(27_000));
+        // Rebooted: raw restarted near 0; the span, whole.
+        assert_eq!(
+            at(6, 3_000, 500, 0).wait_of_stamp(&stamp),
+            Some(WaitMs(20_500))
+        );
+        // Rebooted, and the new boot's raw is past the old one's: the
+        // same, not "passed".
+        assert_eq!(
+            at(6, 900_000, 500, 0).wait_of_stamp(&stamp),
+            Some(WaitMs(20_500))
+        );
+        // This process does not know its boot, or the stamp has none.
+        assert_eq!(
+            at(0, 112_000, 500, 0).wait_of_stamp(&stamp),
+            Some(WaitMs(20_500))
+        );
+        let unstamped = BootStamp {
+            boot_id: 0,
+            ..stamp
+        };
+        assert_eq!(
+            at(5, 112_000, 500, 0).wait_of_stamp(&unstamped),
+            Some(WaitMs(20_500))
+        );
+        // Both unknown: no match either.
+        assert_eq!(
+            at(0, 112_000, 500, 0).wait_of_stamp(&unstamped),
+            Some(WaitMs(20_500))
+        );
+    }
+
+    /// Expectation (the fail-before of the wall form): a step of the wall
+    /// clock in either direction between the write and the read, while the
+    /// node was up or down, moves neither the stamp nor its reading on the
+    /// same boot; the wall form (`wait_of_wall` of the persisted value)
+    /// moves by the whole step.
+    #[test]
+    fn a_stamp_ignores_wall_steps_on_one_boot() {
+        let w = at(5, 100_000, 7_000, 0);
+        let stamp = w.stamp_of_wait(WaitMs(27_000));
+        for step in [-3_600_000i64, -1, 0, 1, 3_600_000] {
+            let mut r = at(5, 108_000, 800_000, 0);
+            // 8 s of real time passed, and the wall moved by `step` too.
+            r.wall = Ms(w.wall.0 + 8_000 + step);
+            assert_eq!(r.wait_of_stamp(&stamp), Some(WaitMs(812_000)), "{step}");
+            // The wall form reads `stamp.wall` against this reading's wall.
+            let wall_form = r.wait_of_wall(stamp.wall);
+            assert_eq!(wall_form.0 - r.wait.0, 12_000 - step);
+        }
+    }
+
+    /// Expectation: a stamp never waits more than its recorded span, whatever
+    /// the raw clocks say (a raw clock that went back on one boot, or a
+    /// corrupt `raw_until`).
+    #[test]
+    fn a_stamp_never_waits_more_than_its_span() {
+        let stamp = at(5, 100_000, 7_000, 0).stamp_of_wait(WaitMs(27_000));
+        // The raw clock reads earlier than at the write.
+        assert_eq!(
+            at(5, 40_000, 100, 0).wait_of_stamp(&stamp),
+            Some(WaitMs(20_100))
+        );
+        let corrupt = BootStamp {
+            raw_until_ms: i64::MAX,
+            ..stamp
+        };
+        assert_eq!(
+            at(5, 100_000, 100, 0).wait_of_stamp(&corrupt),
+            Some(WaitMs(20_100))
+        );
+        // A negative span is nothing.
+        let negative = BootStamp {
+            span_ms: -5,
+            ..stamp
+        };
+        assert_eq!(at(5, 100_000, 100, 0).wait_of_stamp(&negative), None);
+        assert_eq!(at(6, 100_000, 100, 0).wait_of_stamp(&negative), None);
+    }
+
+    /// Expectation: a stamp maps a WAIT duration onto the raw clock and
+    /// back through the budget (WAIT runs slow, so a span of 20 000 WAIT ms
+    /// ends 20 020 raw ms on), and the budget in force when it is read may
+    /// differ from the one it was written under (the raw reading is
+    /// unscaled).
+    #[test]
+    fn stamps_map_through_the_budget() {
+        let w = at(5, 100_000, 7_000, 1_000);
+        let stamp = w.stamp_of_wait(WaitMs(27_000));
+        assert_eq!(stamp.raw_until_ms, 120_020);
+        // 10 010 raw ms later: 10 000 WAIT ms left.
+        assert_eq!(
+            at(5, 110_010, 50, 1_000).wait_of_stamp(&stamp),
+            Some(WaitMs(10_050))
+        );
+        // Read by a clock with no budget: the raw ms are the left time,
+        // capped at the span.
+        assert_eq!(
+            at(5, 110_010, 50, 0).wait_of_stamp(&stamp),
+            Some(WaitMs(10_060))
+        );
+        // Written with none and read with a budget: the budget shortens the
+        // left time as WAIT counts it, never lengthens it.
+        let plain = at(5, 100_000, 7_000, 0).stamp_of_wait(WaitMs(27_000));
+        let left = at(5, 110_000, 50, 2_000).wait_of_stamp(&plain).unwrap().0 - 50;
+        assert!((9_980..=10_000).contains(&left), "{left}");
+        // The round-up: a span of 1 ms maps to 2 raw ms at 1 000 ppm.
+        assert_eq!(w.stamp_of_wait(WaitMs(7_001)).raw_until_ms, 100_002);
     }
 
     /// Expectation: a thread descheduled between the wall read and the

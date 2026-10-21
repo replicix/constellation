@@ -90,7 +90,11 @@ node acts on it:
   its membership, the hold) whenever it changes;
 - a backup's seal (and a delegate backup's), before the backup refuses
   an append, starts its takeover, or acknowledges the seal;
-- the read-grant horizon a restarted holder quarantines on.
+- the read-grant and lock-grant horizons a restarted holder quarantines on,
+  written as boot stamps (plan 43 C7a): the end on the wall clock, the span
+  ahead of the write, the boot id and the raw clock's end, so that a restart
+  on the same boot reads the time left on the raw clock and one after a reboot
+  waits the span.
 
 So a power loss can make a node forget work, never a promise it made.
 

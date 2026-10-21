@@ -45,7 +45,7 @@
 //! it).
 
 use crate::session::Position;
-use constellation_types::clock::{HonourMs, Ms, Now, WaitMs};
+use constellation_types::clock::{HonourMs, Now, WaitMs};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -532,78 +532,134 @@ impl crate::store::Meta {
         &self.read_delegations
     }
 
-    /// Persist that grants may be live until `until_ms`, before the grant
-    /// that needs it is answered: a holder that restarts inside its own
-    /// live lease re-adopts it under the same epoch, so its delegates
-    /// learn nothing, and the restarted holder has lost its (in-memory)
-    /// table. It waits this horizon out before acknowledging any mutation
-    /// ([`Self::load_grant_quarantine`]). Written at most once per second
-    /// of horizon growth.
-    pub fn note_grant_horizon(&self, until_ms: i64) -> Result<(), crate::MetaError> {
-        self.note_horizon(KV_READ_GRANT_HORIZON, until_ms)
+    /// Persist that grants may be live until `until` (on this process's wait
+    /// clock), before the grant that needs it is answered: a holder that
+    /// restarts inside its own live lease re-adopts it under the same
+    /// epoch, so its delegates learn nothing, and the restarted holder has
+    /// lost its (in-memory) table. It waits this horizon out before
+    /// acknowledging any mutation ([`Self::load_grant_quarantine`]). Written
+    /// at most once per second of horizon growth, as a boot stamp
+    /// ([`crate::store::horizon`]).
+    pub fn note_grant_horizon(&self, until: WaitMs, now: Now) -> Result<(), crate::MetaError> {
+        self.note_horizon(KV_READ_GRANT_HORIZON, until, now)
             .map(|_| ())
     }
 
     /// [`Self::note_grant_horizon`] for a lock grant (and a renewal): a
     /// holder that restarts inside its lease grants no lock until it has
     /// passed ([`Self::load_lock_quarantine`]); acknowledgements do not
-    /// wait for it. Returns the horizon now durable (≥ `until_ms`). Called
-    /// off the authority core (`Action::PersistLockHorizon`): the sync can
-    /// take seconds on a loaded disk.
-    pub fn note_lock_grant_horizon(&self, until_ms: i64) -> Result<i64, crate::MetaError> {
-        self.note_horizon(KV_LOCK_GRANT_HORIZON, until_ms)
+    /// wait for it. Returns the horizon now durable (≥ `until`, on the wait
+    /// clock). Called off the authority core
+    /// (`Action::PersistLockHorizon`): the sync can take seconds on a loaded
+    /// disk.
+    pub fn note_lock_grant_horizon(
+        &self,
+        until: WaitMs,
+        now: Now,
+    ) -> Result<WaitMs, crate::MetaError> {
+        self.note_horizon(KV_LOCK_GRANT_HORIZON, until, now)
     }
 
-    fn note_horizon(&self, key: &str, until_ms: i64) -> Result<i64, crate::MetaError> {
-        let stored = self
-            .kv_get(key)?
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(0);
-        if until_ms > stored {
-            // Round up so continuous granting writes about once a second.
-            let value = until_ms + 1_000;
-            // M16: synced — a holder that forgot it on a power loss would
-            // acknowledge writes behind grants still honoured elsewhere.
-            self.kv_set_durable(key, &value.to_string())?;
-            return Ok(value);
+    /// Covers `until` with a stamped write unless what is already known
+    /// (what the previous process left, loaded at start, and what this one
+    /// wrote) covers it. The write is for `until` rounded up a second, and
+    /// since it is made only for an `until` beyond the known horizon it never
+    /// lowers what the stored value required (a crash right after it must
+    /// not forget the previous boot's obligation).
+    fn note_horizon(
+        &self,
+        key: &'static str,
+        until: WaitMs,
+        now: Now,
+    ) -> Result<WaitMs, crate::MetaError> {
+        let known = self
+            .horizon_wait
+            .lock()
+            .unwrap()
+            .get(key)
+            .copied()
+            .unwrap_or(WaitMs(0));
+        if until <= known {
+            return Ok(known);
         }
-        Ok(stored)
+        // Round up so continuous granting writes about once a second.
+        let value = until.plus(1_000);
+        // M16: synced — a holder that forgot it on a power loss would
+        // acknowledge writes behind grants still honoured elsewhere.
+        self.kv_set_durable(
+            key,
+            &crate::store::horizon::format_stamp(&now.stamp_of_wait(value)),
+        )?;
+        let mut known = self.horizon_wait.lock().unwrap();
+        let slot = known.entry(key).or_insert(WaitMs(0));
+        *slot = (*slot).max(value);
+        Ok(value)
     }
 
-    /// At start: grants the previous incarnation made may still be live
-    /// until the persisted horizon (wall clock: it crossed a restart);
-    /// quarantine until then, measured from now on this node's wait clock
-    /// (`Now::wait_of_wall`: plan 43 C7-H1, R9). A step while the process
-    /// was down still shifts it (Appendix B row 14, C7a's boot-id form).
-    pub fn load_grant_quarantine(&self, now: Now) -> Option<WaitMs> {
-        let until = self
-            .kv_get(KV_READ_GRANT_HORIZON)
-            .ok()
-            .flatten()
-            .and_then(|v| v.parse::<i64>().ok())
-            .map(Ms)?;
-        (until > now.wall).then(|| {
-            let until = now.wait_of_wall(until);
-            self.read_delegations.set_quarantine(until);
-            until
-        })
+    /// At start: grants the previous incarnation made may still be honoured
+    /// until the persisted horizon; quarantine until then, on this node's
+    /// wait clock: from the raw clock when it was written on this boot (a
+    /// step of the wall clock, up or down, while the node was up or down
+    /// moves nothing), the recorded span from now otherwise (another boot, or
+    /// a value an older build wrote: `default_span_ms`, the longest a read
+    /// delegation outlives its grant, plus the margin and a second). `None`:
+    /// nothing was granted, or nothing is left of it.
+    pub fn load_grant_quarantine(&self, now: Now, default_span_ms: i64) -> Option<WaitMs> {
+        let until = self.load_horizon(KV_READ_GRANT_HORIZON, now, default_span_ms)?;
+        self.read_delegations.set_quarantine(until);
+        Some(until)
     }
 
     /// At start: lock grants the previous incarnation made may still be
     /// honoured until the persisted lock horizon; no new lock grant until
-    /// then.
-    pub fn load_lock_quarantine(&self, now: Now) -> Option<WaitMs> {
-        let until = self
-            .kv_get(KV_LOCK_GRANT_HORIZON)
-            .ok()
-            .flatten()
-            .and_then(|v| v.parse::<i64>().ok())
-            .map(Ms)?;
-        (until > now.wall).then(|| {
-            let until = now.wait_of_wall(until);
-            self.locks.set_quarantine(until);
-            until
-        })
+    /// then (see [`Self::load_grant_quarantine`]; `default_span_ms` is the
+    /// longest a lock or a delegation carried into a lock outlives its
+    /// grant, plus the margin and a second).
+    pub fn load_lock_quarantine(&self, now: Now, default_span_ms: i64) -> Option<WaitMs> {
+        let until = self.load_horizon(KV_LOCK_GRANT_HORIZON, now, default_span_ms)?;
+        self.locks.set_quarantine(until);
+        Some(until)
+    }
+
+    fn load_horizon(&self, key: &'static str, now: Now, default_span_ms: i64) -> Option<WaitMs> {
+        let stored = self.kv_get(key).ok().flatten()?;
+        let stamp = crate::store::horizon::parse_stamp(&stored, default_span_ms);
+        let until = now.wait_of_stamp(&stamp);
+        // A horizon that has passed is known (to a graceful shutdown) to
+        // have passed.
+        let mut known = self.horizon_wait.lock().unwrap();
+        let slot = known.entry(key).or_insert(WaitMs(0));
+        *slot = (*slot).max(until.unwrap_or(now.wait));
+        until
+    }
+
+    /// At a graceful shutdown, after the core's final flush: a persisted
+    /// horizon that has passed on this process's wait clock is deleted (a
+    /// durable write), so that the next start, which could be a reboot,
+    /// waits for nothing it does not owe: an idle node's restart is not
+    /// delayed by a horizon that lapsed long ago. One that has not passed
+    /// stays. Never from a crash path (nothing runs there), and never for a
+    /// key this process neither loaded nor wrote (its stored value is not
+    /// known to have passed).
+    pub fn clear_passed_horizons(&self, now: Now) -> Result<(), crate::MetaError> {
+        let mut cleared = false;
+        for key in [KV_READ_GRANT_HORIZON, KV_LOCK_GRANT_HORIZON] {
+            let passed = self
+                .horizon_wait
+                .lock()
+                .unwrap()
+                .get(key)
+                .is_some_and(|until| now.wait >= *until);
+            if passed {
+                self.kv_del(key)?;
+                self.horizon_wait.lock().unwrap().remove(key);
+                cleared = true;
+            }
+        }
+        if cleared {
+            self.sync()?;
+        }
+        Ok(())
     }
 
     /// Whether this node's *unshipped* journal touched `ino` (its record;
@@ -765,15 +821,19 @@ mod tests {
     #[test]
     fn the_grant_horizon_persists_and_quarantines() {
         let meta = crate::store::Meta::open_in_memory().unwrap();
-        assert_eq!(meta.load_grant_quarantine(Now::same(0)), None);
-        meta.note_grant_horizon(5_000).unwrap();
-        meta.note_grant_horizon(5_500).unwrap();
+        // One boot throughout (raw clock = wait clock = the numbers).
+        let at = |ms: i64| Now::same_on_boot(ms, 1);
+        assert_eq!(meta.load_grant_quarantine(at(0), 7_500), None);
+        meta.note_grant_horizon(WaitMs(5_000), at(0)).unwrap();
+        meta.note_grant_horizon(WaitMs(5_500), at(0)).unwrap();
+        // The horizon is 6 000 (the write is rounded up a second): 5 000 ms
+        // left at 1 000.
         assert_eq!(
-            meta.load_grant_quarantine(Now::same(1_000)),
+            meta.load_grant_quarantine(at(1_000), 7_500),
             Some(WaitMs(6_000))
         );
         assert_eq!(meta.read_delegations().quarantine_until(), WaitMs(6_000));
-        assert_eq!(meta.load_grant_quarantine(Now::same(7_000)), None);
+        assert_eq!(meta.load_grant_quarantine(at(7_000), 7_500), None);
     }
 
     /// Lock grants keep a horizon of their own: it quarantines new lock
@@ -781,18 +841,287 @@ mod tests {
     #[test]
     fn the_lock_grant_horizon_is_kept_apart() {
         let meta = crate::store::Meta::open_in_memory().unwrap();
-        assert_eq!(meta.load_lock_quarantine(Now::same(0)), None);
+        let at = |ms: i64| Now::same_on_boot(ms, 1);
+        assert_eq!(meta.load_lock_quarantine(at(0), 27_500), None);
         // The horizon now durable: the write's (rounded up), then the
         // stored one for a lower ask.
-        assert_eq!(meta.note_lock_grant_horizon(21_000).unwrap(), 22_000);
-        assert_eq!(meta.note_lock_grant_horizon(21_500).unwrap(), 22_000);
-        assert_eq!(meta.load_grant_quarantine(Now::same(1_000)), None);
+        assert_eq!(
+            meta.note_lock_grant_horizon(WaitMs(21_000), at(0)).unwrap(),
+            WaitMs(22_000)
+        );
+        assert_eq!(
+            meta.note_lock_grant_horizon(WaitMs(21_500), at(0)).unwrap(),
+            WaitMs(22_000)
+        );
+        assert_eq!(meta.load_grant_quarantine(at(1_000), 7_500), None);
         assert_eq!(meta.read_delegations().quarantine_until(), WaitMs(0));
         assert_eq!(
-            meta.load_lock_quarantine(Now::same(1_000)),
+            meta.load_lock_quarantine(at(1_000), 27_500),
             Some(WaitMs(22_000))
         );
         assert_eq!(meta.locks().quarantine_until(), WaitMs(22_000));
-        assert_eq!(meta.load_lock_quarantine(Now::same(23_000)), None);
+        assert_eq!(meta.load_lock_quarantine(at(23_000), 27_500), None);
+    }
+}
+
+/// Plan 43 C7a: the restart horizons are boot stamps, read on the raw clock
+/// on the boot they were written on and as their recorded span after
+/// another, whatever the wall clock did meanwhile (Appendix B row 14). Each
+/// "restart" is a second `Meta` over the first one's directory.
+#[cfg(test)]
+mod boot_stamped_horizon_tests {
+    use super::*;
+    use crate::store::Meta;
+    use constellation_types::clock::{BootNow, Ms};
+
+    /// A reading on `boot`, the raw clock at `raw` ms since boot, the wait
+    /// clock at `wait` and the wall at `wall`.
+    fn at(boot: u64, raw: i64, wait: i64, wall: i64) -> Now {
+        Now {
+            wall: Ms(wall),
+            honour: HonourMs(wall),
+            wait: WaitMs(wait),
+            boot: BootNow {
+                id: boot,
+                raw_ms: raw,
+                budget_ppm: 0,
+            },
+        }
+    }
+
+    const WALL: i64 = 1_780_000_000_000;
+    /// The lock horizon's default span (what an older build's value waits).
+    const LOCK_SPAN: i64 = 27_500;
+    const READ_SPAN: i64 = 7_500;
+
+    /// The previous process: boot 7, raw 100 000 ms since boot, wait clock
+    /// 5 000, grants out until wait 25 500 (lock) and 10 500 (read). The
+    /// writes round up a second. Returns the directory kept for the restart.
+    fn first_process() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = Meta::open(dir.path()).unwrap();
+        let now = at(7, 100_000, 5_000, WALL);
+        assert_eq!(
+            meta.note_lock_grant_horizon(WaitMs(25_500), now).unwrap(),
+            WaitMs(26_500)
+        );
+        meta.note_grant_horizon(WaitMs(10_500), now).unwrap();
+        dir
+    }
+
+    /// Expectation (fail-before: the wall form): the lock horizon is not
+    /// moved by a forward step of the wall clock while the node was down, on
+    /// the same boot. The previous process wrote 21 500 ms ahead at raw 100
+    /// 000; the new one starts at raw 103 000 (3 s later) with the wall
+    /// stepped 10 s on: 18 500 ms are left. On the parent the horizon was a
+    /// wall value read back against the stepped wall: 8 500.
+    #[test]
+    fn a_lock_horizon_survives_a_forward_step_while_down() {
+        let dir = first_process();
+        let meta = Meta::open(dir.path()).unwrap();
+        let now = at(7, 103_000, 400, WALL + 3_000 + 10_000);
+        let until = meta.load_lock_quarantine(now, LOCK_SPAN).unwrap();
+        assert_eq!(until.since(now.wait), 18_500);
+        assert_eq!(meta.locks().quarantine_until(), until);
+        // A step backward does not stretch it either.
+        let meta2 = {
+            drop(meta);
+            Meta::open(dir.path()).unwrap()
+        };
+        let now = at(7, 103_000, 400, WALL + 3_000 - 3_600_000);
+        assert_eq!(
+            meta2
+                .load_lock_quarantine(now, LOCK_SPAN)
+                .unwrap()
+                .since(now.wait),
+            18_500
+        );
+    }
+
+    /// Expectation (fail-before: the wall form): a forward step while the
+    /// node is *up*, after the last write, then a restart: the same, the
+    /// horizon is read on the raw clock. The previous process went on for 2
+    /// s after its write (a step of +10 s, covered by no new write), crashed
+    /// at raw 102 500 and the next started at raw 103 000.
+    #[test]
+    fn a_lock_horizon_survives_a_forward_step_after_the_last_write() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let meta = Meta::open(dir.path()).unwrap();
+            let t0 = at(7, 100_000, 5_000, WALL);
+            let durable = meta.note_lock_grant_horizon(WaitMs(25_500), t0).unwrap();
+            // 2 s on, the wall stepped +10 s: a renewal inside the horizon
+            // asks for less than is durable and writes nothing.
+            let t1 = at(7, 102_000, 7_000, WALL + 2_000 + 10_000);
+            let n = meta.sync_count();
+            assert_eq!(
+                meta.note_lock_grant_horizon(WaitMs(24_000), t1).unwrap(),
+                durable
+            );
+            assert_eq!(meta.sync_count(), n);
+        }
+        let meta = Meta::open(dir.path()).unwrap();
+        let now = at(7, 103_000, 400, WALL + 3_000 + 10_000);
+        let until = meta.load_lock_quarantine(now, LOCK_SPAN).unwrap();
+        // Written at raw 100 000 for 21 500 ms ahead: 18 500 are left at
+        // raw 103 000.
+        assert_eq!(until.since(now.wait), 18_500);
+    }
+
+    /// Expectation: after a reboot (another boot id) the horizon is the
+    /// whole recorded span from the start of the process, whether the raw
+    /// clock of the new boot reads less or more than the old one's and the
+    /// wall has stepped back or on.
+    #[test]
+    fn a_read_horizon_after_a_reboot_waits_its_span() {
+        for (raw, wall) in [(3_000, WALL - 5_000), (900_000, WALL + 9_000_000)] {
+            let dir = first_process();
+            let meta = Meta::open(dir.path()).unwrap();
+            let now = at(8, raw, 50, wall);
+            // The read grant's horizon was written for wait 11 500 (10 500 and
+            // the second), 6 500 ms ahead of 5 000: that span.
+            let until = meta.load_grant_quarantine(now, READ_SPAN).unwrap();
+            assert_eq!(until.since(now.wait), 6_500, "raw {raw}");
+            assert_eq!(meta.read_delegations().quarantine_until(), until);
+            // The lock horizon: its span, 21 500.
+            let locks = meta.load_lock_quarantine(now, LOCK_SPAN).unwrap();
+            assert_eq!(locks.since(now.wait), 21_500);
+        }
+        // A process that does not know its boot waits the span too.
+        let dir = first_process();
+        let meta = Meta::open(dir.path()).unwrap();
+        let now = at(0, 103_000, 50, WALL);
+        assert_eq!(
+            meta.load_grant_quarantine(now, READ_SPAN)
+                .unwrap()
+                .since(now.wait),
+            6_500
+        );
+    }
+
+    /// Expectation: a value an older build wrote (the wall end alone,
+    /// however far in the past the wall says it is) waits the caller's
+    /// default span; garbage the same; neither is trusted for a boot.
+    #[test]
+    fn an_old_format_horizon_waits_the_default_span() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let meta = Meta::open(dir.path()).unwrap();
+            meta.kv_set(KV_LOCK_GRANT_HORIZON, "1700000000000").unwrap();
+            meta.kv_set(KV_READ_GRANT_HORIZON, "soon").unwrap();
+        }
+        let meta = Meta::open(dir.path()).unwrap();
+        let now = at(7, 103_000, 400, WALL);
+        assert_eq!(
+            meta.load_lock_quarantine(now, LOCK_SPAN)
+                .unwrap()
+                .since(now.wait),
+            LOCK_SPAN
+        );
+        assert_eq!(
+            meta.load_grant_quarantine(now, READ_SPAN)
+                .unwrap()
+                .since(now.wait),
+            READ_SPAN
+        );
+    }
+
+    /// Expectation (pitfall 6): a write never lowers what the stored value
+    /// required. The restarted process loads 18 500 ms of lock horizon; a
+    /// grant that needs less asks for nothing to be written (the stored
+    /// stamp is untouched); one that needs more writes a stamp covering it,
+    /// and a second restart reads the later of the two.
+    #[test]
+    fn a_horizon_write_never_lowers_the_loaded_quarantine() {
+        let dir = first_process();
+        let stored = Meta::open(dir.path())
+            .unwrap()
+            .kv_get(KV_LOCK_GRANT_HORIZON)
+            .unwrap();
+        let meta = Meta::open(dir.path()).unwrap();
+        let now = at(7, 103_000, 400, WALL + 3_000);
+        let loaded = meta.load_lock_quarantine(now, LOCK_SPAN).unwrap();
+        assert_eq!(loaded.0, 400 + 18_500);
+        // A grant ending before it: nothing written, the answer is the
+        // loaded horizon.
+        let n = meta.sync_count();
+        let t1 = at(7, 104_000, 1_400, WALL + 4_000);
+        assert_eq!(
+            meta.note_lock_grant_horizon(WaitMs(1_400 + 5_000), t1)
+                .unwrap(),
+            loaded
+        );
+        assert_eq!(meta.sync_count(), n);
+        assert_eq!(meta.kv_get(KV_LOCK_GRANT_HORIZON).unwrap(), stored);
+        // One beyond it: written (rounded up), covering it.
+        let want = WaitMs(loaded.0 + 4_000);
+        let durable = meta.note_lock_grant_horizon(want, t1).unwrap();
+        assert_eq!(durable, want.plus(1_000));
+        drop(meta);
+        // A crash now and a restart 2 s on: the later horizon.
+        let meta = Meta::open(dir.path()).unwrap();
+        let t2 = at(7, 106_000, 100, WALL + 6_000);
+        let until = meta.load_lock_quarantine(t2, LOCK_SPAN).unwrap();
+        // Written at raw 104 000 for `durable - 1 400` ahead.
+        assert_eq!(until.since(t2.wait), durable.since(t1.wait) - 2_000);
+        // (The loaded horizon alone would have had 15 500 left by then.)
+        assert!(until.since(t2.wait) > 15_500);
+    }
+
+    /// Expectation (D3b): a graceful shutdown deletes a horizon that has
+    /// passed on the wait clock, so that the next start (a reboot) waits for
+    /// nothing; one still live stays and is read as before.
+    #[test]
+    fn a_graceful_shutdown_clears_a_passed_horizon() {
+        let dir = first_process();
+        let meta = Meta::open(dir.path()).unwrap();
+        // Loaded here (so known), and live at 1 s: nothing to clear yet.
+        let t = |ms: i64| at(7, 100_000 + ms, 5_000 + ms, WALL + ms);
+        meta.load_lock_quarantine(t(0), LOCK_SPAN);
+        meta.load_grant_quarantine(t(0), READ_SPAN);
+        meta.clear_passed_horizons(t(1_000)).unwrap();
+        assert!(meta.kv_get(KV_LOCK_GRANT_HORIZON).unwrap().is_some());
+        assert!(meta.kv_get(KV_READ_GRANT_HORIZON).unwrap().is_some());
+        // Past the lock horizon (21 500 after its write) and the read one:
+        // both go, durably.
+        let n = meta.sync_count();
+        meta.clear_passed_horizons(t(30_000)).unwrap();
+        assert_eq!(meta.kv_get(KV_LOCK_GRANT_HORIZON).unwrap(), None);
+        assert_eq!(meta.kv_get(KV_READ_GRANT_HORIZON).unwrap(), None);
+        assert!(meta.sync_count() > n);
+        drop(meta);
+        // After a reboot: nothing to wait for.
+        let meta = Meta::open(dir.path()).unwrap();
+        let after = at(9, 1_000, 10, WALL + 3_600_000);
+        assert_eq!(meta.load_lock_quarantine(after, LOCK_SPAN), None);
+        assert_eq!(meta.load_grant_quarantine(after, READ_SPAN), None);
+    }
+
+    /// Expectation: only a horizon that has passed is cleared: a live lock
+    /// horizon stays (a node that stops gracefully with grants out still
+    /// owes its successor the wait), as does one this process never loaded
+    /// or wrote.
+    #[test]
+    fn a_graceful_shutdown_keeps_a_live_horizon() {
+        let dir = first_process();
+        let meta = Meta::open(dir.path()).unwrap();
+        let t = |ms: i64| at(7, 100_000 + ms, 5_000 + ms, WALL + ms);
+        // Never loaded in this process: not known to have passed.
+        meta.clear_passed_horizons(t(60_000)).unwrap();
+        assert!(meta.kv_get(KV_LOCK_GRANT_HORIZON).unwrap().is_some());
+        assert!(meta.kv_get(KV_READ_GRANT_HORIZON).unwrap().is_some());
+        // Written in this process, 21 500 ms ahead: live at 20 000, gone at
+        // 21 500.
+        let w = at(7, 200_000, 10_000, WALL + 100_000);
+        let durable = meta.note_lock_grant_horizon(WaitMs(30_500), w).unwrap();
+        assert_eq!(durable, WaitMs(31_500));
+        meta.clear_passed_horizons(at(7, 220_000, 30_000, WALL))
+            .unwrap();
+        assert!(meta.kv_get(KV_LOCK_GRANT_HORIZON).unwrap().is_some());
+        meta.clear_passed_horizons(at(7, 221_500, 31_500, WALL))
+            .unwrap();
+        assert_eq!(meta.kv_get(KV_LOCK_GRANT_HORIZON).unwrap(), None);
+        // The read horizon was never loaded here either: stays.
+        assert!(meta.kv_get(KV_READ_GRANT_HORIZON).unwrap().is_some());
     }
 }

@@ -205,6 +205,7 @@ impl TestClock {
             wall: constellation_authority::Ms(now.wall.0 + self.wall),
             honour: constellation_authority::HonourMs(now.honour.0 + self.honour),
             wait: constellation_authority::WaitMs(now.wait.0 + self.wait),
+            boot: now.boot,
         }
     }
 }

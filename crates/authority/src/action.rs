@@ -17,7 +17,7 @@
 //! wait on, because a round is just core state advanced by events.
 
 use crate::event::PeerMsg;
-use crate::ids::{Epoch, NodeId, OpId, Seq, TimerId};
+use crate::ids::{Epoch, NodeId, OpId, Seq, TimerId, WaitMs};
 use constellation_fs_core::Ino;
 use constellation_meta::{MutateOp, MutateOutcome, Rid};
 use constellation_store_s3::heartbeat::Promise;
@@ -126,8 +126,10 @@ pub enum Action {
     /// (`Meta::note_lock_grant_horizon`, a durable write) off the core,
     /// then report `Event::LockHorizonPersisted`. The grant and renewal
     /// answers that need it are held until then; at most one is in
-    /// flight.
-    PersistLockHorizon { until: i64 },
+    /// flight. Plan 43 C7a: `until` is on this node's wait clock (the
+    /// action is internal, never serialised); the store stamps it with the
+    /// boot.
+    PersistLockHorizon { until: WaitMs },
     /// A sync round finished (`failed` says how), for the driver's spool
     /// counters, pin refresh and continuation-epoch bookkeeping.
     RoundDone { failed: Option<String> },

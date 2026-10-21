@@ -2517,6 +2517,24 @@ first part of C7a, landed early):
     five rate configurations are clean at 2 000 seeds and a fresh range
     (fail-before counts above); `long_locks` has them; the identity sweeps
     (every no-rate configuration) are unchanged.
+  - *Commit 3 landed (2026-10-20; PROGRESS "Plan 43 C7a, commit 3 of 6"):*
+    the persisted horizons (read grants, lock grants, the promise's `issued`)
+    are boot stamps: `<wall> <span> <boot id> <raw until>`, append-only (a
+    reader ignores tokens it does not know; a bare number, an older build's
+    value, waits the caller's default span). `Now` carries `boot` (`id`, the
+    raw clock since boot, the budget); a restart on the same boot reads the
+    time left on `CLOCK_MONOTONIC_RAW` (never stepped, slewed or counting
+    suspend, which is conservative for a wait), so no step of the wall, up or
+    down, while the node was down or after the last write, moves it; another
+    boot waits the recorded span. A write never lowers what the previous
+    process left (`Meta` keeps the loaded quarantine), a graceful shutdown
+    deletes a passed horizon (so an idle node's reboot waits for nothing),
+    `Action::PersistLockHorizon`/`Event::LockHorizonPersisted` carry `WaitMs`
+    (the core's wall-to-wait conversions are gone), and M4's own-lease arm is
+    gated again whatever the wall says of the lease's expiry. No re-persist
+    on a counted forward jump (D4). The restart configurations are clean at
+    2 000 seeds and a fresh range (fail-before counts above);
+    `fast-takeover-successor-restart-before-marker` is the floor's, commit 4.
   - *Commit 5 landed (2026-10-20; PROGRESS "Plan 43 C7a, commit 5 of 6"):*
     `crates/model/src/clk.rs` (a node's oscillator with a rate, and its wall,
     honour and wait readings), per-node rate, `rate_budget`, `clock_split`,
@@ -3465,7 +3483,7 @@ L = liveness only.
 | 11 | `ack=s3` fast takeover timing — `core/lease.rs:296` | holder's renewal stamp vs taker's W | W↔W | L (the slot CAS fences) | ETag unchanged for `backup_takeover_ms` |
 | 12 | Holder liveness (plan 41 L0) — `liveness_fresh`, `note_s3_liveness`, `strict_answer_allowed`, `LeaseView::reads_locally` | own send stamp vs own clock | W | **S on a backward step > 1.5 s** | honour clock (C7-H1 first) **C7-H1 landed** (the local half); **rate half: C7a landed** (commit 2: ρ is in the honour and wait readings) |
 | 13 | Backup seal watch, holder heartbeat, `OffCore::core_responsive`, `note_holder_heard` | own arrival stamps vs own clock | W | L | wait clock (C7-H1) **C7-H1 landed** (the local half); **rate half: C7a landed** (commit 2: ρ is in the honour and wait readings) |
-| 14 | Restart horizons — `KV_READ_GRANT_HORIZON`/`KV_LOCK_GRANT_HORIZON`, `load_*_quarantine` | own earlier W vs own later W across a restart | W (persisted) | **S on a forward step across the restart** | `(boot_id, BOOTTIME until)`, else the full horizon (C7a; C7-H1 writes them as wall and reads them back onto the wait clock, so only a step while the node is down, or a forward step while it is up after the last write followed by a restart, remains). The promise's `issued` (`promise.rs:366-378`, the KV `epoch_promise_issued_ms`, judged by `promise_join_begin`) is the same kind of horizon. Also: a successor's takeover floor (C7-H2) is not persisted at all (`set_quarantine` in memory), so a successor that restarts inside it, or whose upgrade handover gives up its release, forgets it: persist it under these keys |
+| 14 | Restart horizons — `KV_READ_GRANT_HORIZON`/`KV_LOCK_GRANT_HORIZON`, `load_*_quarantine` | own earlier W vs own later W across a restart | W (persisted) | **S on a forward step across the restart** | **C7a landed (commit 3):** a boot stamp `<wall> <span> <boot id> <raw until>`, read on `CLOCK_MONOTONIC_RAW` on the same boot and as the full span on another (or unknown, or an older value: the default span); a graceful shutdown deletes a passed horizon; the promise's `issued` likewise; the takeover floor is commit 4. (The text before it: `(boot_id, BOOTTIME until)`, else the full horizon (C7a; C7-H1 writes them as wall and reads them back onto the wait clock, so only a step while the node is down, or a forward step while it is up after the last write followed by a restart, remains). The promise's `issued` (`promise.rs:366-378`, the KV `epoch_promise_issued_ms`, judged by `promise_join_begin`) is the same kind of horizon. Also: a successor's takeover floor (C7-H2) is not persisted at all (`set_quarantine` in memory), so a successor that restarts inside it, or whose upgrade handover gives up its release, forgets it: persist it under these keys.) |
 | 15 | Epoch claim views — `epoch_closed_claim`, `epoch_reclaim_pending`, `resolve_epoch_claims` | own lease stamp vs own clock; resolution by epoch | W | L | clock change only; **rate half: C7a landed** (commit 2) |
 | 16 | Singleton leases (`_snapsched`, GC) — `singleton.rs`, `snapsched.rs` | holder: own; claimant: holder's W vs own W | W↔W | L (the CAS on the holder's ETag is the safety) | observation rule if wanted; not required |
 | 17 | GC — `gc.rs:407` `last_modified ≤ now − horizon` (7 d), completion retention, `mtree_gc.rs:653`; holds' `expires_unix_ms` | S3 `Last-Modified` vs W; hold writer's W vs GC's W | S3↔W, W↔W | S only at offsets of days (or the hold slack) | **stays** (documented tolerance) |

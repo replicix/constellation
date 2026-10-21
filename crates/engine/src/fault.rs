@@ -275,8 +275,9 @@ pub fn start_runtime_hog_file(node: u64) {
 /// every container's. Also logs the constant `CONSTELLATION_FAULT_CLOCK_
 /// OFFSET_MS` once (the platform crate has no logger). Started once per
 /// process from the authority driver; a no-op without these variables (the
-/// constant offset, `CONSTELLATION_FAULT_CLOCK_RATE_PPM` and
-/// `CONSTELLATION_CLOCK_RATE_BUDGET_PPM` are logged once too: plan 43 C7a). (The
+/// constant offset, `CONSTELLATION_FAULT_CLOCK_RATE_PPM`,
+/// `CONSTELLATION_CLOCK_RATE_BUDGET_PPM` and `CONSTELLATION_FAULT_BOOT_ID` are
+/// logged once too: plan 43 C7a). (The
 /// step already in the file when the daemon starts is applied earlier, by
 /// `platform::clock::protocol()` before its first reading: this poller only
 /// follows later changes.)
@@ -297,6 +298,12 @@ pub fn start_clock_faults() {
         tracing::warn!(
             rate_ppm = rate,
             "fault injection: the protocol clock's elapsed sources run at a skewed rate (testing only)"
+        );
+    }
+    if std::env::var_os("CONSTELLATION_FAULT_BOOT_ID").is_some() {
+        tracing::warn!(
+            boot_id = constellation_platform::clock::boot_id(),
+            "fault injection: the boot id is overridden (testing only)"
         );
     }
     if std::env::var_os("CONSTELLATION_CLOCK_RATE_BUDGET_PPM").is_some() {

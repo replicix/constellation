@@ -100,6 +100,7 @@ pub(crate) mod atime;
 pub mod backup;
 mod bootstrap;
 pub(crate) mod gate;
+pub mod horizon;
 pub use gate::{
     fault_caller_scope, gate_totals, priority_writes, FaultCallerScope, GateTotals, PriorityStats,
 };
@@ -638,14 +639,22 @@ pub struct Meta {
     pub(crate) session: crate::session::SessionState,
     /// Plan 30 §M8: read delegations, both sides (`crate::readdeleg`).
     pub(crate) read_delegations: crate::readdeleg::ReadDelegations,
-    /// Plan 43 C7-H1 (R9): the last promise this process issued, as the
-    /// persisted wall value and its end on this node's wait clock
-    /// (`Meta::promise_issue`), for the join gate
-    /// ([`Meta::promise_join_begin`]): a promiser waits its promise out on a
-    /// clock a wall step cannot move. Empty after a restart: the gate then
-    /// reads the persisted value on the wall clock (Appendix B row 14).
-    pub(crate) promise_issued_wait:
-        std::sync::Mutex<Option<(i64, constellation_types::clock::WaitMs)>>,
+    /// Plan 43 C7a: the end, on this process's wait clock, of the last
+    /// promise this process issued or loaded from its persisted stamp
+    /// ([`Meta::promise_issue`], [`Meta::load_promise_issued`]), for the join
+    /// gate ([`Meta::promise_join_begin`]): a promiser waits its promise out
+    /// on a clock a wall step cannot move. `None`: not loaded yet (the first
+    /// use loads it from the persisted stamp).
+    pub(crate) promise_issued_wait: std::sync::Mutex<Option<constellation_types::clock::WaitMs>>,
+    /// Plan 43 C7a: the persisted horizons of this process (the read-grant
+    /// and lock-grant keys) as far as they are known, on its wait clock: the
+    /// latest of what the previous process left (loaded at start) and what
+    /// this one wrote. A write never lowers what the stored value required,
+    /// and a graceful shutdown clears a horizon that has passed
+    /// ([`Meta::clear_passed_horizons`]).
+    pub(crate) horizon_wait: std::sync::Mutex<
+        std::collections::HashMap<&'static str, constellation_types::clock::WaitMs>,
+    >,
     /// Plan 30 §M14: lock grants (sequencer side), grants held and local
     /// locks (node side) (`crate::locks`).
     pub(crate) locks: crate::locks::LockTables,
@@ -861,6 +870,7 @@ impl Meta {
             session: crate::session::SessionState::default(),
             read_delegations: crate::readdeleg::ReadDelegations::default(),
             promise_issued_wait: std::sync::Mutex::new(None),
+            horizon_wait: std::sync::Mutex::new(std::collections::HashMap::new()),
             locks: crate::locks::LockTables::default(),
             foreign_apply_hook: std::sync::OnceLock::new(),
             snapshot_gen: AtomicU64::new(0),

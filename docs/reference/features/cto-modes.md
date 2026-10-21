@@ -294,8 +294,12 @@ the takeover floor, a delegation it outwaits) is measured on its **wait
 clock**: a monotone reading that never over-counts and ignores every wall
 step, so a forward step of the sequencer's wall clock does not end a
 recall's wait early and a backward one does not lengthen it. A quarantine
-persisted across a restart is written as a wall value and read back as time
-left on the new process's wait clock. (The two readings differ from the
+persisted across a restart is written as a boot stamp (plan 43 C7a) and read
+back as time left on the new process's wait clock: on the raw clock after a
+restart on the same boot, so a step of the wall clock does not move it, and as
+the recorded span after a reboot (up to a read delegation's TTL, the margin and
+a second before a re-adopting holder acknowledges anything, if grants were live
+when it stopped; a graceful shutdown deletes a horizon that has passed). (The two readings differ from the
 wall clock by the rate budget as the node stays up, 86 s a day at 0.1 %;
 `constellation status` shows it as `clock.honour_ahead_ms` and
 `clock.wait_behind_ms`, with the budget in `clock.rate_budget_ppm`.)

@@ -50,8 +50,9 @@
 //!   `clock:step:<ms>:<at_ms>[@node]` load item) and by engine tests.
 //! - `CONSTELLATION_FAULT_CLOCK_RATE_PPM=<signed ppm>` (plan 43 C7a, the
 //!   harness's `clock:rate:<ppm>[@node]` item): the host's boot, raw and
-//!   monotonic clocks run at `1 + ppm/1e6` of their real rate, read once
-//!   from the process start; the wall does not (a host whose time service
+//!   monotonic clocks run at `1 + ppm/1e6` of their real rate (their
+//!   readings since boot are scaled, so a restart on the same boot reads the
+//!   same clock); the wall does not (a host whose time service
 //!   disciplines the wall while its oscillator is off). Values of 500 000
 //!   ppm and beyond are refused (no fault). The engine logs it once at
 //!   start-up.
@@ -65,6 +66,21 @@
 //! `CONSTELLATION_CLOCK_RATE_BUDGET_PPM=<ppm>` overrides it (testing only;
 //! refused from 500 000 ppm). The protocol clock scales its readings by it
 //! and the core reads it for the beat cap's span.
+//!
+//! # The boot id
+//!
+//! [`boot_id`] names this boot (plan 43 C7a): a deadline persisted across a
+//! restart is stamped with it, so a restart on the same boot reads the time
+//! left on the raw clock (never stepped, never slewed) and one on another
+//! boot waits the recorded span. Linux and Android: the first 16 hex digits
+//! of `/proc/sys/kernel/random/boot_id`, mixed with the process's time
+//! namespace offsets when it has any (a namespace offsets the raw clock). macOS, iOS and FreeBSD:
+//! `kern.boottime` in microseconds (the kernel moves it when the wall clock
+//! is set, which then looks like another boot: a stamp is waited out by its
+//! span, which is conservative). Elsewhere 0, which no stamp matches (every
+//! restart waits the span; the `Instant` fallback's raw clock is not since
+//! boot anyway). `CONSTELLATION_FAULT_BOOT_ID=<hex>` overrides it (testing
+//! only: the harness's reboot).
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -115,6 +131,109 @@ fn parse_rate_fault(v: Option<&str>) -> i64 {
     v.and_then(|v| v.trim().parse::<i64>().ok())
         .filter(|ppm| ppm.abs() < MAX_RATE_PPM)
         .unwrap_or(0)
+}
+
+/// This boot's identity (never 0 on a host that has one; 0: unknown), read
+/// once. See the module doc.
+pub fn boot_id() -> u64 {
+    static ID: OnceLock<u64> = OnceLock::new();
+    *ID.get_or_init(|| {
+        parse_fault_boot_id(std::env::var("CONSTELLATION_FAULT_BOOT_ID").ok().as_deref())
+            .unwrap_or_else(host_boot_id)
+    })
+}
+
+/// `CONSTELLATION_FAULT_BOOT_ID`: a non-zero hex number of up to 16 digits.
+fn parse_fault_boot_id(v: Option<&str>) -> Option<u64> {
+    v.and_then(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
+        .filter(|id| *id != 0)
+}
+
+/// The first 16 hex digits of a boot UUID as a number, never 0.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn boot_id_of_uuid(uuid: &str) -> u64 {
+    let digits: String = uuid
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .take(16)
+        .collect();
+    u64::from_str_radix(&digits, 16).map_or(0, |id| id.max(1))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn host_boot_id() -> u64 {
+    let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map_or(0, |uuid| boot_id_of_uuid(&uuid));
+    with_time_namespace(
+        id,
+        std::fs::read_to_string("/proc/self/timens_offsets")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The boot id of a process in a time namespace (Linux 5.6+): the namespace
+/// offsets the raw clock (`CLOCK_MONOTONIC_RAW` moves with
+/// `CLOCK_MONOTONIC`), so two processes of one boot in namespaces with
+/// different offsets do not read one raw clock, and a stamp written in one
+/// must not be read on the raw clock in the other. Non-zero offsets are
+/// mixed into the id (another namespace then reads as another boot: the
+/// span is waited, which is conservative); none, or no namespace support,
+/// leaves it as it is. 0 (unknown) stays 0.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn with_time_namespace(id: u64, offsets: Option<&str>) -> u64 {
+    let Some(offsets) = offsets else {
+        return id;
+    };
+    let nonzero = offsets
+        .split_whitespace()
+        .any(|t| t.parse::<i64>().is_ok_and(|n| n != 0));
+    if id == 0 || !nonzero {
+        return id;
+    }
+    // FNV-1a over the offsets' text.
+    let hash = offsets.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    (id ^ hash).max(1)
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+fn host_boot_id() -> u64 {
+    let mut tv = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    let mut len = std::mem::size_of::<libc::timeval>();
+    // SAFETY: `tv` is a writable timeval of `len` bytes and the name is
+    // NUL-terminated.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.boottime".as_ptr(),
+            (&mut tv as *mut libc::timeval).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len != std::mem::size_of::<libc::timeval>() {
+        return 0;
+    }
+    (tv.tv_sec as u64)
+        .wrapping_mul(1_000_000)
+        .wrapping_add(tv.tv_usec as u64)
+        .max(1)
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd"
+)))]
+fn host_boot_id() -> u64 {
+    0
 }
 
 /// Rates (and budgets) of this many ppm or more are refused.
@@ -283,31 +402,27 @@ impl ClockSources for HostSources {
     fn mono_ns(&self) -> u64 {
         elapsed::mono_ns()
     }
+    fn boot_id(&self) -> u64 {
+        boot_id()
+    }
 }
 
 /// The host's sources with a rate fault: boot, raw and monotonic run at
-/// `1 + ppm/1e6` of the host's rate, counted from the first reading of each
-/// (the wall is the host's, unchanged).
+/// `1 + ppm/1e6` of the host's rate (the wall is the host's, unchanged). The
+/// scaling is of the absolute reading, since boot, so that a restarted
+/// daemon on the same boot reads the same skewed clock (a deadline stamped
+/// with the boot id and the raw reading means the same to both).
 struct SkewedSources {
     ppm: i64,
-    boot0: u64,
-    raw0: u64,
-    mono0: u64,
 }
 
 impl SkewedSources {
     fn new(ppm: i64) -> Self {
-        Self {
-            ppm,
-            boot0: elapsed::boot_ns(),
-            raw0: elapsed::raw_ns(),
-            mono0: elapsed::mono_ns(),
-        }
+        Self { ppm }
     }
 
-    fn skew(&self, base: u64, now: u64) -> u64 {
-        let d = now.saturating_sub(base) as i128;
-        (base as i128 + d * (1_000_000 + self.ppm as i128) / 1_000_000).max(0) as u64
+    fn skew(&self, now: u64) -> u64 {
+        (now as i128 * (1_000_000 + self.ppm as i128) / 1_000_000).max(0) as u64
     }
 }
 
@@ -316,13 +431,16 @@ impl ClockSources for SkewedSources {
         wall_ms()
     }
     fn boot_ns(&self) -> u64 {
-        self.skew(self.boot0, elapsed::boot_ns())
+        self.skew(elapsed::boot_ns())
     }
     fn raw_ns(&self) -> u64 {
-        self.skew(self.raw0, elapsed::raw_ns())
+        self.skew(elapsed::raw_ns())
     }
     fn mono_ns(&self) -> u64 {
-        self.skew(self.mono0, elapsed::mono_ns())
+        self.skew(elapsed::mono_ns())
+    }
+    fn boot_id(&self) -> u64 {
+        boot_id()
     }
 }
 
@@ -522,6 +640,42 @@ mod tests {
             (f1.wall_ms - f0.wall_ms) as f64 * 1e6 < real * 1.05 + 10e6,
             "the wall is not skewed"
         );
+    }
+
+    /// Expectation: a boot UUID's first 16 hex digits are the id (never 0),
+    /// the fault hook takes a non-zero hex number, and the host's own id is
+    /// stable within a process (and, on Linux, not 0).
+    #[test]
+    fn the_boot_id_is_the_uuids_head_and_stable() {
+        assert_eq!(
+            boot_id_of_uuid("0123abcd-4567-89ef-0123-456789abcdef\n"),
+            0x0123_abcd_4567_89ef
+        );
+        assert_eq!(boot_id_of_uuid("00000000-0000-0000-0000-000000000000"), 1);
+        assert_eq!(boot_id_of_uuid("zz"), 0);
+        assert_eq!(parse_fault_boot_id(Some("ab12\n")), Some(0xab12));
+        assert_eq!(parse_fault_boot_id(Some("0x7")), Some(7));
+        for bad in ["", "0", "xyz", "fffffffffffffffff"] {
+            assert_eq!(parse_fault_boot_id(Some(bad)), None, "{bad:?}");
+        }
+        assert_eq!(parse_fault_boot_id(None), None);
+        // A time namespace with offsets is another raw clock: another id.
+        let none = "monotonic           0         0\nboottime            0         0\n";
+        let offset = "monotonic        3600         0\nboottime            0         0\n";
+        assert_eq!(with_time_namespace(42, None), 42);
+        assert_eq!(with_time_namespace(42, Some(none)), 42);
+        assert_ne!(with_time_namespace(42, Some(offset)), 42);
+        assert_ne!(with_time_namespace(42, Some(offset)), 0);
+        assert_eq!(
+            with_time_namespace(42, Some(offset)),
+            with_time_namespace(42, Some(offset))
+        );
+        assert_eq!(with_time_namespace(0, Some(offset)), 0);
+        assert_eq!(boot_id(), boot_id());
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert_ne!(boot_id(), 0);
+        assert_eq!(HostSources::new().boot_id(), boot_id());
+        assert_eq!(protocol().now().boot.id, boot_id());
     }
 
     /// Expectation: `protocol()` is one instance.
