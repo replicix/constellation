@@ -362,6 +362,18 @@ impl ReadDelegations {
         self.live_grants.load(Ordering::Relaxed)
     }
 
+    /// Whether any grant is still honoured at `now` (wait clock): counted
+    /// from the table, which `live_grants` is not (it is refreshed when
+    /// the table changes, so it keeps counting grants that lapsed since).
+    pub fn has_live_grant(&self, now: WaitMs) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .grants
+            .values()
+            .any(|g| g.until > now)
+    }
+
     // ---- delegate side ----
 
     /// The recall generation to record when sending a ReadIndex.

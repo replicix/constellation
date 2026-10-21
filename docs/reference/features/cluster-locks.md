@@ -298,6 +298,33 @@ the same grants. A mark inherited this way stays for the tenure's life. A succes
 a lock the first holder's tenure granted without the mirror seeing it could
 be granted over.
 
+A tenure marks its lease from the moment it can be sealed whenever it then
+waits out, or answered, something a sealer must wait out too: lock grants
+(live, moved toward a delegate, or a record a renewal can revive), a subtree
+grace or a quarantine, a live write delegation, a takeover floor still to
+be armed or running, read grants or a read quarantine, what it granted under
+a continuation epoch's hold. A claim CAS writes an unmarked lease unless it inherits a
+predecessor's duty, and the duties it does not cover are real: a node that
+re-claims its *own* released lease waits out the grants it let go (their
+records are dropped, so no backup listed later is ever sent them), a
+restart's quarantine runs over the lease the node re-adopts, the reclaims a
+`Local` tenure admits are never mirrored to a backup added after them, and
+grants an epoch's close kept stand under the re-adopted lease's own mark. A
+tenure becomes sealable in two places, and marks in both when such a duty is
+live: its claim CAS under `ack=s3` (a lease that says `ack=s3` is sealable
+from its first write), and the reconfiguration that lists its first backup
+(`issue_reconfig`; its retry against a fresher lease re-evaluates, and the
+landing marks if a duty arose with the CAS out). While a reconfiguration that makes
+the tenure sealable without marking it is out, the tenure answers no
+lock renewal or reclaim and issues no mark (`Core::tenure_marked`,
+`ensure_granting_marked`): a reclaim under a grace that began since would
+stand in a version a sealer may replace as the CAS lands (and while such a
+CAS's outcome is not known, until the lease is next read or written); the
+answers go
+once it settles and the lease is marked. Nothing is marked for a tenure
+with nothing of the kind live at its first backup listing (a start-up's or a
+handoff's), so a seal of it still waits for nothing.
+
 A delegate's grants are capped by what is left of its own delegation,
 so it keeps that authority topped up: while it has grants out it renews
 the delegation at a quarter of its TTL, a lock renewal that finds less

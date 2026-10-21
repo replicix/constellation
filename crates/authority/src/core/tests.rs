@@ -19652,6 +19652,362 @@ mod locks {
             .any(|(_, r)| matches!(r, S3Op::LeaseSwap { .. })));
     }
 
+    /// The lease bodies the lease CASes in `out` write, with their ops.
+    fn lease_swaps(out: &[Action]) -> Vec<(OpId, Lease)> {
+        s3_ops(out)
+            .into_iter()
+            .filter_map(|(op, r)| match r {
+                S3Op::LeaseSwap { lease, .. } => Some((op, lease.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The lease CAS in `out` that lists backup 2 (a reconfiguration).
+    fn reconfig_cas(out: &[Action]) -> (OpId, Lease) {
+        lease_swaps(out)
+            .into_iter()
+            .find(|(_, l)| l.backups == vec![2])
+            .unwrap_or_else(|| panic!("no reconfiguration CAS: {out:?}"))
+    }
+
+    /// Node 1's tenure (`Local`, its lease unmarked) re-claims its own
+    /// released lease: it granted node 2 a lock, which is still live when
+    /// it lets go (`grant_left`) or has been released by then. Returns the
+    /// harness, holding the claimed lease, and that lease.
+    fn own_reclaim_after_a_release(grant_left: bool) -> (Harness, Lease) {
+        let (mut h, ino) = holder_with_file();
+        let out = request(&mut h, 2, 7, ino, X, true);
+        let (grant, _) = granted(&lock_replies(&out)[0].2);
+        if !grant_left {
+            h.advance(10);
+            h.step(Event::Peer {
+                from: 2,
+                msg: PeerMsg::LockReleased {
+                    ino,
+                    grant,
+                    position: constellation_meta::Position::ZERO,
+                },
+            });
+        }
+        let mut out = Vec::new();
+        h.core.issue_release(h.clk(), &h.meta, &mut out);
+        let released = lease_swaps(&out)
+            .into_iter()
+            .map(|(_, l)| l)
+            .find(|l| l.released)
+            .unwrap_or_else(|| panic!("no release CAS: {out:?}"));
+        // The release landed: the tenure is over (its grants dropped, a
+        // quarantine up to the last of them), and the same node claims
+        // the lease again, no takeover.
+        h.core.lease.released();
+        h.core.lock_on_lease_gone(h.clk(), &h.meta, &mut out);
+        h.advance(100);
+        let claimed = claim_over(&mut h, &released, false);
+        assert_eq!((claimed.holder, claimed.released), (1, false));
+        (h, claimed)
+    }
+
+    /// Plan 43 C7-F F-a0 L3a: a node that re-claims its own released lease
+    /// writes it unmarked (the claim is no takeover, and the carried mark
+    /// of a re-adopted lease excludes a released one), though it waits out
+    /// the grants it let go (`lock_quarantine_dropped_tenure`) and, those
+    /// records dropped, no backup it lists later could be sent them. The
+    /// lease must say so from the reconfiguration that lists its first
+    /// backup: a sealer of it then arms a takeover floor. Without a
+    /// grant left behind the reconfiguration leaves it unmarked (a
+    /// start-up's handoff costs the next seal nothing).
+    #[test]
+    fn a_reclaim_of_its_own_released_lease_with_live_grants_is_marked_when_it_lists_a_backup() {
+        let (mut h, claimed) = own_reclaim_after_a_release(true);
+        assert!(
+            !claimed.granted_delegations,
+            "a claim CAS marks nothing here"
+        );
+        assert!(
+            h.core.lock_duty_live(h.clk(), &h.meta),
+            "the dropped tenure's grants are waited out"
+        );
+        assert_eq!(h.meta.locks().grants_len(), 0, "and no longer in the table");
+        let mut out = Vec::new();
+        h.core.issue_reconfig(h.clk(), vec![2], &h.meta, &mut out);
+        let (_, listed) = reconfig_cas(&out);
+        assert!(
+            listed.granted_delegations,
+            "the lease that lists its first backup says its tenure waits out grants: {listed:?}"
+        );
+        // A sealer of it arms the floor.
+        let mut sealer = Harness::new(2);
+        claim_over(&mut sealer, &listed, true);
+        assert!(sealer.core.ack.pending_floor, "the sealer armed no floor");
+        // Nothing live: nothing to mark (M1's cost does not come back).
+        let (mut h, claimed) = own_reclaim_after_a_release(false);
+        assert!(!claimed.granted_delegations);
+        assert!(!h.core.lock_duty_live(h.clk(), &h.meta));
+        let mut out = Vec::new();
+        h.core.issue_reconfig(h.clk(), vec![2], &h.meta, &mut out);
+        let (_, listed) = reconfig_cas(&out);
+        assert!(!listed.granted_delegations, "marked with nothing live");
+        let mut sealer = Harness::new(2);
+        claim_over(&mut sealer, &listed, true);
+        assert!(!sealer.core.ack.pending_floor);
+    }
+
+    /// Plan 43 C7-F F-a0 L3b: a restart's quarantine (the persisted grant
+    /// horizon: the previous incarnation's grants may be honoured until
+    /// then) over a lease the restarted node re-adopts unmarked (a tenure
+    /// whose only grants were reclaims): the first backup listing marks
+    /// it.
+    #[test]
+    fn a_restart_quarantine_marks_the_first_backup_listing() {
+        let mut h = Harness::new(1);
+        h.meta.note_lock_grant_horizon(h.now.0 + 4_000).unwrap();
+        let until = h.meta.load_lock_quarantine(h.clk());
+        assert!(until.is_some(), "no quarantine from the persisted horizon");
+        let now = h.now;
+        h.core.locks_start(Now::same(now.0), &h.meta);
+        let prev = lease_of(1, 1, h.now.0 + 5_000);
+        let claimed = claim_over(&mut h, &prev, false);
+        assert!(
+            !claimed.granted_delegations,
+            "the re-adopted lease is unmarked"
+        );
+        assert!(h.core.lock_duty_live(h.clk(), &h.meta));
+        let mut out = Vec::new();
+        h.core.issue_reconfig(h.clk(), vec![2], &h.meta, &mut out);
+        let (_, listed) = reconfig_cas(&out);
+        assert!(listed.granted_delegations, "{listed:?}");
+        // The quarantine over, nothing is left: unmarked.
+        let mut h = Harness::new(1);
+        let prev = lease_of(1, 1, h.now.0 + 5_000);
+        claim_over(&mut h, &prev, false);
+        let mut out = Vec::new();
+        h.core.issue_reconfig(h.clk(), vec![2], &h.meta, &mut out);
+        assert!(!reconfig_cas(&out).1.granted_delegations);
+    }
+
+    /// Plan 43 C7-F F-a0 L3c: a reclaim a `Local` tenure admits under a
+    /// grace (a renewal for a grant it does not know, on `on_lock_renew`,
+    /// where `renew_hold` holds nothing for a tenure nobody can take over
+    /// early) is a record in its table that nothing mirrors to a backup
+    /// listed later. The grace is over by the listing, the grant is not:
+    /// the lease that lists the backup says so.
+    #[test]
+    fn a_reclaim_admitted_into_a_local_tenure_marks_the_first_backup_listing() {
+        let (mut h, ino) = holder_with_file();
+        h.core.lease.held.as_mut().unwrap().0.granted_delegations = false;
+        let now = h.now.0;
+        h.core.lk.grace.push((ROOT_INO, WaitMs(now + 1_000)));
+        let out = renew(&mut h, 5, 20, ino, GrantId { node: 5, seq: 9 });
+        let results = renewed(&out, 5).expect("no answer");
+        assert!(
+            matches!(results.as_slice(), [LockRenewResult::Ok { .. }]),
+            "the reclaim was not admitted under the grace: {results:?}"
+        );
+        h.advance(1_500);
+        assert!(h.core.lk.grace.iter().all(|(_, u)| u.0 <= h.now.0));
+        assert_eq!(h.meta.locks().grants_len(), 1);
+        assert!(
+            h.core.lock_duty_live(h.clk(), &h.meta),
+            "the reclaimed grant is live"
+        );
+        let mut out = Vec::new();
+        h.core.issue_reconfig(h.clk(), vec![2], &h.meta, &mut out);
+        let (_, listed) = reconfig_cas(&out);
+        assert!(listed.granted_delegations, "{listed:?}");
+    }
+
+    /// Plan 43 C7-F F-a0 L3d: the grants an epoch's close keeps stand when
+    /// the node's re-claim continues the tenure (`epoch_tenure_resumed`),
+    /// under the lease it re-adopts with its own mark: unmarked here, and
+    /// the grants are no record of a mirror either. The first backup
+    /// listing marks it.
+    #[test]
+    fn grants_kept_at_an_epoch_close_mark_the_first_backup_listing() {
+        let (mut h, ino) = holder_with_file();
+        let out = request(&mut h, 2, 7, ino, X, true);
+        granted(&lock_replies(&out)[0].2);
+        h.core.lease.held.as_mut().unwrap().0.granted_delegations = false;
+        let before = h.core.lease.held.as_ref().unwrap().0.clone();
+        let mut out = Vec::new();
+        h.core.epoch_close_release(h.clk(), &h.meta, &mut out);
+        assert_eq!(h.meta.locks().grants_len(), 1, "the close keeps the grants");
+        h.advance(100);
+        let claimed = claim_over(&mut h, &before, false);
+        assert!(!claimed.granted_delegations);
+        assert_eq!(h.meta.locks().grants_len(), 1, "the tenure continues");
+        let mut out = Vec::new();
+        h.core.issue_reconfig(h.clk(), vec![2], &h.meta, &mut out);
+        let (_, listed) = reconfig_cas(&out);
+        assert!(listed.granted_delegations, "{listed:?}");
+    }
+
+    /// Plan 43 C7-F F-a0 L3: a duty can arise in a tenure that is still
+    /// `Local` while the reconfiguration CAS that lists its first backup
+    /// is out (it was issued with nothing live, so it does not mark): a
+    /// reclaim under a subtree grace that began since. Answered at once,
+    /// its record stands in the table and in a lease a sealer may replace
+    /// as the CAS lands. The tenure holds that answer
+    /// (`Core::tenure_marked`) until the reconfiguration settles and its
+    /// lease is marked.
+    #[test]
+    fn a_reclaim_during_a_reconfig_in_flight_is_held_until_marked() {
+        let (mut h, ino) = holder_with_file();
+        h.core.lease.held.as_mut().unwrap().0.granted_delegations = false;
+        let mut out = Vec::new();
+        h.core.issue_reconfig(h.clk(), vec![2], &h.meta, &mut out);
+        let (reconfig_op, listed) = reconfig_cas(&out);
+        assert!(!listed.granted_delegations, "nothing was live at the issue");
+        // A grace begins (an outwaited delegate's) and node 5 reclaims.
+        let now = h.now.0;
+        h.core.lk.grace.push((ROOT_INO, WaitMs(now + 3_000)));
+        h.advance(10);
+        let out = renew(&mut h, 5, 20, ino, GrantId { node: 5, seq: 9 });
+        assert!(
+            renewed(&out, 5).is_none(),
+            "answered while the reconfiguration is out: {out:?}"
+        );
+        // It lands: the tenure is sealable with a duty live, unmarked.
+        h.advance(10);
+        let out = h.step(Event::S3 {
+            op: reconfig_op,
+            result: S3Result::LeasePut(Ok(tag())),
+        });
+        assert!(h.core.fast_tenure());
+        assert!(
+            renewed(&out, 5).is_none(),
+            "answered before the lease is marked: {out:?}"
+        );
+        let (mark_op, marked) = lease_swaps(&out)
+            .into_iter()
+            .find(|(_, l)| l.granted_delegations && l.backups == vec![2])
+            .unwrap_or_else(|| panic!("no mark CAS after the reconfiguration: {out:?}"));
+        assert!(!marked.released);
+        h.advance(10);
+        let out = h.step(Event::S3 {
+            op: mark_op,
+            result: S3Result::LeasePut(Ok(tag())),
+        });
+        let results = renewed(&out, 5).unwrap_or_else(|| panic!("never answered: {out:?}"));
+        assert!(
+            matches!(results.as_slice(), [LockRenewResult::Ok { .. }]),
+            "{results:?}"
+        );
+    }
+
+    /// Plan 43 C7-F F-a0 L3 (review): a reconfiguration CAS that lists the
+    /// first backup unmarked and fails with its outcome unknown may have
+    /// landed: S3 may hold the sealable, unmarked version while the node
+    /// still holds its `Local` one. A reclaim under a grace that begins
+    /// then is held until a lease CAS settles which (here the mark CAS,
+    /// conflicting with the version that landed; the re-read adopts it and
+    /// the tenure marks it), not answered as a `Local` tenure's.
+    #[test]
+    fn a_reclaim_after_a_reconfig_in_doubt_is_held_until_the_lease_is_settled() {
+        let (mut h, ino) = holder_with_file();
+        h.core.lease.held.as_mut().unwrap().0.granted_delegations = false;
+        let mut out = Vec::new();
+        h.core.issue_reconfig(h.clk(), vec![2], &h.meta, &mut out);
+        let (reconfig_op, listed) = reconfig_cas(&out);
+        assert!(!listed.granted_delegations, "nothing was live at the issue");
+        h.advance(10);
+        h.step(Event::S3 {
+            op: reconfig_op,
+            result: S3Result::LeasePut(Err(CasFailure::Failed("timed out".into()))),
+        });
+        assert!(
+            !h.core.fast_tenure(),
+            "the node holds its Local lease still"
+        );
+        let now = h.now.0;
+        h.core.lk.grace.push((ROOT_INO, WaitMs(now + 3_000)));
+        h.advance(10);
+        let out = renew(&mut h, 5, 20, ino, GrantId { node: 5, seq: 9 });
+        assert!(
+            renewed(&out, 5).is_none(),
+            "answered with the reconfiguration in doubt: {out:?}"
+        );
+        let (mark_op, _) = lease_swaps(&out)
+            .into_iter()
+            .find(|(_, l)| l.granted_delegations)
+            .unwrap_or_else(|| panic!("no lease CAS settles the doubt: {out:?}"));
+        h.advance(10);
+        let out = h.step(Event::S3 {
+            op: mark_op,
+            result: S3Result::LeasePut(Err(CasFailure::Conflict)),
+        });
+        let reread = s3_ops(&out)
+            .into_iter()
+            .find(|(_, r)| matches!(r, S3Op::LeaseGet))
+            .map(|(op, _)| op)
+            .unwrap_or_else(|| panic!("no re-read after the conflict: {out:?}"));
+        h.advance(10);
+        let out = h.step(Event::S3 {
+            op: reread,
+            result: S3Result::LeaseGet(Ok(Some((listed.clone(), tag())))),
+        });
+        assert!(h.core.fast_tenure(), "the reconfiguration had landed");
+        assert!(
+            renewed(&out, 5).is_none(),
+            "answered before the lease is marked: {out:?}"
+        );
+        let (mark_op, _) = lease_swaps(&out)
+            .into_iter()
+            .find(|(_, l)| l.granted_delegations && l.backups == vec![2])
+            .unwrap_or_else(|| panic!("no mark CAS of the sealable lease: {out:?}"));
+        h.advance(10);
+        let out = h.step(Event::S3 {
+            op: mark_op,
+            result: S3Result::LeasePut(Ok(tag())),
+        });
+        let results = renewed(&out, 5).unwrap_or_else(|| panic!("never answered: {out:?}"));
+        assert!(
+            matches!(results.as_slice(), [LockRenewResult::Ok { .. }]),
+            "{results:?}"
+        );
+    }
+
+    /// Plan 43 C7-F F-a0 L3 (review): the delegation renewals a `Local`
+    /// tenure answers are held for nothing (`renew_hold`), and a live write
+    /// delegation's delegate may serve strict reads whatever the tenure
+    /// served: what a marked tenure's sealer waits out
+    /// (`note_marker_landed`'s `deleg` term). The reconfiguration that
+    /// lists the first backup marks the lease while the delegation table is
+    /// not empty.
+    #[test]
+    fn a_live_delegation_marks_the_first_backup_listing() {
+        let (mut h, _) = holder_with_file();
+        h.core.lease.held.as_mut().unwrap().0.granted_delegations = false;
+        delegated_file(&h.meta);
+        assert!(!h.meta.delegation_table().is_empty());
+        let mut out = Vec::new();
+        h.core.issue_reconfig(h.clk(), vec![2], &h.meta, &mut out);
+        let (_, listed) = reconfig_cas(&out);
+        assert!(listed.granted_delegations, "{listed:?}");
+    }
+
+    /// Plan 43 C7-F F-a0 L3: a claim that is sealable from its CAS
+    /// (`ack=s3`) writes its lease marked when the tenure stands on a duty
+    /// then (a restart's quarantine here), and unmarked when none is live.
+    #[test]
+    fn an_ack_s3_claim_with_a_duty_live_is_marked_from_its_first_cas() {
+        let claim = |duty: bool| {
+            let mut h = Harness::new(2);
+            h.core.cfg.ack_s3 = true;
+            if duty {
+                h.meta.locks().set_quarantine(WaitMs(h.now.0 + 3_000));
+            }
+            let prev = lease_of(1, 1, h.now.0 - 1);
+            claim_over(&mut h, &prev, false)
+        };
+        let marked = claim(true);
+        assert_eq!(marked.ack_policy, constellation_store_s3::AckPolicy::S3);
+        assert!(marked.granted_delegations, "a duty live: unmarked");
+        let unmarked = claim(false);
+        assert_eq!(unmarked.ack_policy, constellation_store_s3::AckPolicy::S3);
+        assert!(!unmarked.granted_delegations, "nothing live: marked");
+    }
+
     /// The lock-exclusion review's follow-up: a recalled grant whose
     /// first local lock never comes (the requester gave up: its answer
     /// lost, a non-blocking request that lost a race) is renewed only

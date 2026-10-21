@@ -2259,8 +2259,7 @@ impl Core {
         // (`acquire_won`). An idle release and a handoff wait for an empty
         // table; an operator's flush or stop, or a continuation epoch's
         // flush (which waits for no live grant only), may leave one.
-        let duty = self.lock_duty_live(now, replica)
-            || (self.cfg.locks && replica.locks().grants_len() > 0);
+        let duty = self.lock_duty_standing(now, replica);
         // Unmarked, nothing may be left behind after all: no renewal is
         // served until the CAS is settled (`release_unmarked_in_flight`).
         self.lk.release_unmarked = !duty;
@@ -2828,7 +2827,7 @@ impl Core {
                     self.issue_tail(out);
                     return;
                 }
-                self.acquire_cas(now, plan, out);
+                self.acquire_cas(now, plan, replica, out);
             }
         }
     }
@@ -2892,7 +2891,7 @@ impl Core {
         true
     }
 
-    fn acquire_cas(&mut self, now: Now, plan: Plan, out: &mut Vec<Action>) {
+    fn acquire_cas(&mut self, now: Now, plan: Plan, replica: &dyn Replica, out: &mut Vec<Action>) {
         let Plan::Claim { prev, tag, .. } = &plan else {
             return;
         };
@@ -2906,13 +2905,22 @@ impl Core {
         // the predecessor's clock.)
         let takeover_of = prev.holder != 0 && prev.holder != self.cfg.node_id;
         let permitted = self.lease.takeover_permit == Some((prev.epoch, prev.holder));
-        let inherits_duty = takeover_of
+        // Plan 43 C7-F F-a0 L3: a claim that is sealable from its first
+        // CAS (`ack=s3`: `granted_lease`) says so for every duty the tenure
+        // stands on at that moment, whatever its source: its own released
+        // lease re-claimed over the grants it let go (the quarantine
+        // `lock_on_lease_gone` set), a restart's quarantine, grants an
+        // epoch's close kept. A tenure that becomes sealable later marks
+        // at the reconfiguration that lists its first backup
+        // (`issue_reconfig`).
+        let inherits_duty = (takeover_of
             && prev.granted_delegations
             && if prev.released {
                 self.cfg.locks
             } else {
                 permitted
-            };
+            })
+            || (self.cfg.ack_s3 && self.tenure_duty_live(now, replica));
         let lease = self
             .lease
             .granted_lease(now, &self.cfg, Some(prev), inherits_duty);
@@ -3096,8 +3104,13 @@ impl Core {
         // node's clock) armed the floor above for a lease written
         // unmarked: mark it now, one CAS before the tenure serves anything
         // (after the gate has left `Phase::Cas`, which would hold it back).
-        if self.ack.pending_floor {
-            self.ensure_granting_marked(out);
+        //
+        // The same for a tenure that is sealable and unmarked while a duty
+        // is live whatever its source (L3's catch-all; `tenure_duty_live`):
+        // a claim CAS that could not know (the duty arose in between), or a
+        // lease the in-doubt re-read adopted.
+        if self.ack.pending_floor || (self.fast_tenure() && self.tenure_duty_live(now, replica)) {
+            self.ensure_marked_inherited(out);
         }
     }
 
@@ -4187,7 +4200,7 @@ impl Core {
                 if self.acquire_overtaken_by_epoch(now, replica, out) {
                     return;
                 }
-                self.acquire_cas(now, plan, out);
+                self.acquire_cas(now, plan, replica, out);
             }
             TailThen::CatchUp => {
                 // Plan 30 §M2: reach the departing holder's head before

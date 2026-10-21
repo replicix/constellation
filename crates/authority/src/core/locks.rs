@@ -6276,6 +6276,51 @@ impl Core {
                 || self.lk.grace.iter().any(|(_, u)| *u > now.wait))
     }
 
+    /// What a release leaves behind, exactly: [`Core::lock_duty_live`], or
+    /// any grant record at all, an expired one too (a renewal is still
+    /// served while a release is under way, or by a tenure whose record
+    /// the table still holds, and extends a known record, expired or not:
+    /// `LockTables::extend`). The one definition of the release's mark
+    /// (`issue_release`) and of the lock part of [`Core::tenure_duty_live`],
+    /// so the two cannot drift.
+    pub(crate) fn lock_duty_standing(&self, now: Now, replica: &dyn Replica) -> bool {
+        self.lock_duty_live(now, replica) || (self.cfg.locks && replica.locks().grants_len() > 0)
+    }
+
+    /// Plan 43 C7-F F-a0 L3: this tenure waits out, or answered, something
+    /// a sealer of it must wait out too: lock grants (live, moved toward a
+    /// delegate, or a record a renewal can revive), a subtree grace or a
+    /// quarantine, a takeover floor still to be armed or running, read
+    /// grants or a read quarantine, and what it granted under a
+    /// continuation epoch's hold. The lease says so
+    /// (`Lease::granted_delegations`) from the moment the tenure can be
+    /// sealed (`Core::fast_tenure`): its claim CAS under `ack=s3`, or the
+    /// reconfiguration that lists its first backup. A sealer arms its
+    /// takeover floor only for a lease so marked (`note_fast_takeover`),
+    /// and a claim CAS writes an unmarked lease unless it inherits a
+    /// predecessor's duty (`acquire_cas`): a node that re-claims its own
+    /// released lease, a restart's quarantine and the reclaims a `Local`
+    /// tenure admits (nothing mirrors them to a backup listed later) all
+    /// leave a duty no claim CAS marked. So do the delegation renewals a
+    /// `Local` tenure answers (`renew_hold` holds nothing there): a live
+    /// write delegation's delegate may serve strict reads (and lock grants)
+    /// whatever this tenure served, which the floor's `deleg` term waits
+    /// out (`note_marker_landed`); counted as that term counts it, by a
+    /// non-empty delegation table.
+    pub(crate) fn tenure_duty_live(&self, now: Now, replica: &dyn Replica) -> bool {
+        self.lock_duty_standing(now, replica)
+            || !replica.delegation_table().is_empty()
+            || self.ack.pending_floor
+            || self.in_takeover_floor(now)
+            || replica.read_delegations().quarantine_until() > now.wait
+            || replica.read_delegations().has_live_grant(now.wait)
+            || WaitMs(
+                self.ack
+                    .hold_grant_until
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ) > now.wait
+    }
+
     /// The tenure ends and its grant table is dropped (`lock_on_lease_gone`
     /// without a close that keeps it): grants still live there may be
     /// honoured by their holders until they lapse, and so may grants a

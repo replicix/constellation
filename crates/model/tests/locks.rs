@@ -532,7 +532,10 @@ fn fast_takeover_with_grace_and_mirror_is_clean() {
 }
 
 /// Without probe freshness the deposed root (its own lease is long)
-/// grants itself after the successor's grace, which grants node 1.
+/// grants itself after the successor's grace, which grants node 1. (The
+/// old root has granted before, so its lease is marked and it needs no CAS
+/// to answer: a root that never granted is fenced by its first mark CAS,
+/// which finds the lease replaced.)
 #[test]
 fn fast_takeover_without_the_probe_violates() {
     let m = LockModel {
@@ -540,6 +543,7 @@ fn fast_takeover_without_the_probe_violates() {
         replicate: false,
         grace: true,
         probe_freshness: false,
+        marked_start: true,
         lease_ttl: 30,
         lock_ttl: 3,
         max_drops: 0,
@@ -1661,6 +1665,114 @@ fn the_lapsed_memory_is_superseded_by_a_conflicting_grant() {
     );
 }
 
+// ---- plan 43 C7-F F-a0: the lease's mark ----
+//
+// A successor arms its grace (a fast takeover) or waits out the grants of
+// the tenure it takes over (a released lease) only if the lease it replaced
+// is marked: `Lease::granted_delegations`. A tenure marks when it grants,
+// when a release leaves something behind, and — the inherited marks — when
+// it takes over a tenure it waits out the grants of, or re-claims its own
+// released lease over grants it let go. Each pair is a counterexample of a
+// design without one of them, and the exhaustive clean run with it.
+
+/// Node 2 holds `X` under root 0 (node 0 never locks); node 1 asks for it
+/// later. Root 0's backup is 1, root 1's is 2: the chain of a double seal.
+fn double_seal(inherit_mark: bool) -> LockModel {
+    LockModel {
+        backup_of: vec![1, 2, NONE],
+        inherit_mark,
+        max_epoch: 2,
+        max_drops: 0,
+        max_renews: 0,
+        max_tick: 3,
+        ..LockModel::design(vec![vec![], vec![Lock(X), Io], vec![Lock(X), Io]])
+    }
+}
+
+/// The second seal inside the first's grace: root 0 granted, its backup 1
+/// took over (the mirror may lack the grant, the grace covers it) and
+/// granted nothing yet, so its lease says nothing; its own backup 2 seals
+/// it, and, finding no mark, arms no grace: node 2 grants node 1 the lock
+/// while node 2 honours the grant root 0 made it.
+#[test]
+fn a_tenure_sealed_inside_its_grace_leaves_no_grace_without_the_inherited_mark() {
+    assert_violates("double-seal-unmarked", &double_seal(false));
+}
+
+#[test]
+fn a_tenure_that_inherits_a_grace_marks_its_lease_and_the_double_seal_is_clean() {
+    assert_clean(
+        "double-seal-marked",
+        &double_seal(true),
+        &["double_takeover", "fast_takeover"],
+    );
+}
+
+/// The chain of releases: root 0 shuts down with node 1's grant live, node
+/// 2 takes the released lease over (a grace), and node 2's own backup 1
+/// seals it before it has granted. A release that marks nothing leaves its
+/// taker no grace at all.
+fn released_chain(release_mark_duty: bool) -> LockModel {
+    LockModel {
+        backup_of: vec![NONE, 2, 1],
+        released_takeover: true,
+        release_mark_duty,
+        max_epoch: 2,
+        max_drops: 0,
+        max_renews: 0,
+        max_tick: 3,
+        ..LockModel::design(vec![vec![], vec![Lock(X), Io], vec![Lock(X), Io]])
+    }
+}
+
+#[test]
+fn a_release_that_never_marks_leaves_its_taker_no_grace() {
+    assert_violates("released-chain-unmarked", &released_chain(false));
+}
+
+#[test]
+fn a_release_that_marks_what_it_leaves_and_the_inherited_mark_are_clean_along_a_chain() {
+    assert_clean(
+        "released-chain-marked",
+        &released_chain(true),
+        &["double_takeover", "released_takeover", "fast_takeover"],
+    );
+}
+
+/// Plan 43 C7-F F-a0 L3a: root 0 releases with node 1's grant live and
+/// re-claims its own released lease (no takeover: it inherits no mark and
+/// waits out the grants it dropped), its backup 2, listed from the
+/// re-claim on, then seals it. The re-claim's lease is unmarked unless the
+/// tenure marks it when it becomes sealable with a duty live: node 2 arms
+/// no grace, its mirror is fresh, and it grants itself the lock over node
+/// 1's grant.
+fn own_reclaim(mark_at_sealable: bool) -> LockModel {
+    LockModel {
+        backup_of: vec![2, NONE, NONE],
+        released_takeover: true,
+        mark_at_sealable,
+        max_epoch: 2,
+        max_drops: 0,
+        max_renews: 0,
+        max_tick: 3,
+        ..LockModel::design(vec![vec![], vec![Lock(X), Io], vec![Lock(X), Io]])
+    }
+}
+
+#[test]
+fn re_claiming_its_own_released_lease_unmarked_leaves_its_sealer_no_grace() {
+    assert_violates("own-reclaim-unmarked", &own_reclaim(false));
+}
+
+#[test]
+fn re_claiming_its_own_released_lease_marked_leaves_its_sealer_a_grace() {
+    assert_clean(
+        "own-reclaim-marked",
+        &own_reclaim(true),
+        &["double_takeover", "released_takeover", "fast_takeover"],
+    );
+}
+
 #[test]
 fn none_is_no_node() {
     assert_eq!(NONE, u8::MAX);
@@ -1821,6 +1933,11 @@ fn capped_by_beats(span: Option<i16>) -> LockModel {
         takeover_window: 2,
         max_drops: 0,
         max_tick: 40,
+        // The trace's root beats and renews but grants nothing before the
+        // takeover: it stands for a root that granted (the grace's case,
+        // the model before the mark). Unmarked, the takeover arms no grace
+        // and the trace has nothing to measure.
+        marked_start: true,
         ..LockModel::design(two_lockers())
     }
 }

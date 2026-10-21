@@ -55091,3 +55091,193 @@ The one conflict was `locks_start` (F-c's `set_lapse_park_ms` next to the new
 `load_lock_quarantine(now, span)`); F-c's test code needed `..Now::same(0)` for the new `boot` field.
 The identity sweeps of this entry are those of the b8fe40c tree; the rerun on 4987b00 was
 not completed (the build box became unreachable).
+
+## Fix: a tenure marks its lease when it becomes sealable with a duty live; the lock model has the mark (plan 43 C7-F F-a0 L3, L4) (2026-10-20)
+
+Follow-ups L3 and L4 of F-a0 (found by its review; plan 43 §7 C7-F). The
+mark is `Lease::granted_delegations`: a sealer or an `ack=s3` taker arms a
+takeover floor only if the lease it replaced says its tenure granted.
+
+### L3: duties no claim CAS marks
+
+F-a0 marked the claim CAS of a takeover that inherits a duty. Three kinds of
+duty stayed unmarked, all open to the same hole:
+
+- a node re-claiming its *own* released lease: no takeover, and
+  `granted_lease`'s `own` excludes released leases, so the claim is unmarked,
+  yet the node waits out the grants it let go
+  (`lock_quarantine_dropped_tenure`) and `clear_grants` has dropped their
+  records, so a backup listed later is never sent them;
+- a restart's quarantine over a lease the node re-adopts unmarked (a tenure
+  whose only grants were reclaims), and the grants an epoch's close kept,
+  which stand under the re-adopted lease's own mark;
+- the reclaims a `Local` tenure admits (`on_lock_renew`, where `renew_hold` is
+  `None` for a tenure nobody can take over early): installed unmarked, and the
+  lock mirror goes only to the backups listed when the table changed.
+
+Each becomes F-a0's hole when the tenure lists a backup, is cut from S3 and is
+sealed before its next mark CAS: the sealer arms no floor and grants over
+grants still honoured. (The fourth candidate, the grants kept at an epoch's
+close, needs no path of its own: the close writes no released lease, the
+re-claim is `own`, and it is sealable at the same two places.)
+
+A claim CAS writes `backups: []` and `Local` unless `ack=s3`
+(`granted_lease`), so a tenure is sealable (`fast_tenure`) in exactly two
+places: the claim CAS under `ack=s3`, and the reconfiguration that lists the
+first backup. Both now mark the lease when `Core::tenure_duty_live`: lock
+duty or any grant record, a live write delegation, a pending or running
+takeover floor, read grants or a read quarantine, grants made under an epoch's
+hold.
+
+- `acquire_cas` adds `ack_s3 && tenure_duty_live` to `inherits_duty`;
+  `acquire_won` re-marks when the floor is pending or a sealable unmarked
+  tenure has a duty live (one call, `ensure_marked_inherited`).
+- `issue_reconfig` marks the body that makes the tenure sealable when a duty
+  is live; its retry against a fresher lease re-evaluates (`Reconfig::marks`);
+  `on_reconfig_put` marks a sealable unmarked tenure whose duty arose with
+  the CAS out (the catch-all).
+- While a reconfiguration CAS that makes the tenure sealable without marking
+  it is out, `tenure_marked` is false (renewals and reclaims are held) and
+  `ensure_marked` issues nothing: a reclaim under a grace that began since
+  would stand in a version a sealer may replace as the CAS lands. The held
+  answers are re-kicked by `renew_after_event` once the CAS settles.
+- Review additions. A reconfiguration CAS that would make the tenure
+  sealable unmarked and fails with its outcome unknown (an answer lost) may
+  have landed: until a lease version is next adopted from S3
+  (`LeaseState::reconfig_doubt`, cleared by `renewed` and `adopt`) the
+  tenure counts as unmarked (`reconfig_in_doubt`: renewals and reclaims are
+  held, and `renew_kick`'s mark CAS settles it, landing on the version held
+  or conflicting with the landed one). And a non-empty delegation table is a
+  duty (`tenure_duty_live`), as the floor's `deleg` term counts it: the
+  delegation renewals a `Local` tenure answers are held for nothing, and a
+  delegate may serve strict reads whatever the tenure served. It shifts the
+  trajectories of the delegated configurations, so three pins moved, each to
+  a seed of the same configuration that shows the same thing:
+  `c0_i2_finds_a_rid_queued_twice`'s `delegated-holder-cut` 22 -> 3 (3
+  identity copies, `+identity` fails with I2), `c0_i4_finds_a_late_landing`'s
+  6 -> 15 (2 late landings, `+settle` fails with I4), and
+  `a_delegating_root_cut_from_s3_forms_no_epoch_and_fails_over` drops 1610
+  for 1612: its first answer after the crash now comes 1.2 s in, before the
+  seal, a measured "failover" that is no seal and floor (the parent shows the
+  same 1.1 to 1.2 s class at 1615 and 1628).
+- `issue_release`'s mark and the lock part of `tenure_duty_live` share
+  `lock_duty_standing`; the read terms stay out of the release (read
+  delegations are recalled before it). `ReadDelegations::has_live_grant`
+  counts the table (`live_grants` is refreshed only when it changes).
+
+*Safety argument.* A sealer's CAS replaces a version that lists it. Every such
+version was written by the reconfiguration or after it (renewals copy the
+mark), or sealable by the `ack=s3` claim. At those writes any live duty marks
+the version; while the write is out no new duty is answered unheld; after it
+every new grant or answer goes through the marking gates of a fast tenure;
+quarantines and floors start only at the claim (inherited and covered there)
+or at `note_marker_landed`, already marked. So a sealer never replaces an
+unmarked version while a duty is live. A tenure with nothing live at its first
+listing (a start-up, a handoff) stays unmarked: M1's cost does not come back.
+
+### L4: the lock model has the mark
+
+`Reg::marked` and `Node::marked` (a root that a backup may take over early
+marks its lease before it answers anything, by a CAS on the register that
+lands only if it still holds it; a deposed unmarked root is fenced; one whose
+own view is marked answers without a CAS), a release marks what its tenure
+leaves behind (`release_mark_duty`), a takeover inherits per `acquire_cas`
+(`inherit_mark`), the grace arms only on a marked lease, a node's own re-claim
+of its released lease waits out what it dropped (`Node::dropped`, kept on the
+node like the code's quarantine) and marks from that write when it stands on
+that floor (`mark_at_sealable`), a backup per holder (`backup_of`), a new
+tenure's backup starts with no mirror (`Msg::Mirror` carries its epoch).
+`marked_start` starts the initial holder marked: the existing counterexample
+`fast_takeover_without_the_probe_violates` rested on a deposed root's late
+grant, which an unmarked root's first mark CAS now fences; it starts marked
+(the root had granted before), which is the old model's root exactly, so it
+checks what it checked. (The naive beat cap's trace grants before the
+takeover, so its root is marked by then and the trace is unchanged.)
+
+### Tests
+
+Core, each failing on 4a0fb20 (`tests.rs`; each asserts a reconfiguration or
+claim body's mark, or that an answer waits): `a_reclaim_of_its_own_released_lease_with_live_grants_is_marked_when_it_lists_a_backup`
+(unmarked reconfiguration body; its twin with no grant left stays unmarked and
+its sealer arms no floor), `a_restart_quarantine_marks_the_first_backup_listing`,
+`a_reclaim_admitted_into_a_local_tenure_marks_the_first_backup_listing`,
+`grants_kept_at_an_epoch_close_mark_the_first_backup_listing`,
+`a_reclaim_during_a_reconfig_in_flight_is_held_until_marked` (answered with the
+CAS out), `an_ack_s3_claim_with_a_duty_live_is_marked_from_its_first_cas`; and,
+from the review, failing on this tree without the two additions:
+`a_reclaim_after_a_reconfig_in_doubt_is_held_until_the_lease_is_settled` and
+`a_live_delegation_marks_the_first_backup_listing`.
+Sim: `locks-restart-reclaim-seal` (`SimConfig::lock_nodes`: the others'
+clients take no lock) violates mutual exclusion in 56 of seeds 0..2000 on
+4a0fb20 (5 of the first 100: 5, 15, 52, 77, 96) and in none after; pinned by
+`a_sealer_of_a_reclaimed_lease_waits_out_the_grants_that_lease_waited_out`.
+Model, three violate/clean pairs (`tests/locks.rs`): the double seal inside a
+grace (`inherit_mark`), the released chain (`release_mark_duty`) and an own
+re-claim then sealed (`mark_at_sealable`); each clean run is exhaustive
+(1.6, 2.4 and 3.7 M states, 1.5 to 4 s) and sees a double takeover.
+
+### Verification
+
+On the box (16 cores, `/tmp` on tmpfs), every job under `timeout
+--kill-after=30s`, `-j 4`:
+
+- `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D
+  warnings`: clean.
+- `cargo test --release -p constellation-authority`: lib 520 passed, sim 181
+  (180 + the pin), meta_repro 4. The six core tests and the pin fail on
+  4a0fb20.
+- `cargo test --release -p constellation-model --test locks --test cto`
+  (`--test-threads=2`): 58 and 24 passed.
+- `cargo test --release -p constellation-engine --lib`: 816; `-p
+  constellation-store-s3`: 233; `-p constellation-meta --lib`: 269.
+- Every `locks-*` configuration and `double-seal-inside-the-grace`, seeds
+  0..2000, this tree against 4a0fb20: identical failing sets everywhere (the
+  controls `locks-writer-hold-unchecked` 1991 and
+  `locks-writer-hold-delegated-unsettled` 2, the known
+  `locks-holder-step-back-sealed` 818) except `locks-restart-reclaim-seal`:
+  56 -> 0. Floors armed and lock I/Os fenced move within a few seeds' noise
+  (`locks-failover-backup` 1993 -> 1994 floors of 2028 -> 2031 seals,
+  `locks-s3-cut-holder-alive` 1852 -> 1855 of 2002 -> 2003, `locks-restart-reclaim-seal`
+  69 -> 2000 of 1944 -> 2000: the new configuration's sealers wait). The `ack=s3`
+  configurations `acks3-crash`, `long-acks3`, `acks3-runtime-lag`, and
+  `backup-lag-at-expiry`, `backup-runtime-lag` (1000 seeds): identical, no
+  floor armed either side.
+- Rebased onto d62f077 (plan 43 C0, the meta rebuild fix, C7a commit 1)
+  with the review's additions (`reconfig_doubt`, the live-delegation duty):
+  clippy and the authority lib suite pass on this tree alone; with (b) on
+  top, `cargo test --release -p constellation-authority` (lib 527, sim 209,
+  the C0 pins included), the model's `locks` (58) and `cto` (24) and
+  `clippy --workspace --all-targets` pass, and every `locks-*` and
+  `double-seal-*` configuration (61, C7a's fail-before ones included) at
+  seeds 0..2000 fails exactly as d62f077 does (the two new configurations
+  ported onto it: `locks-restart-reclaim-seal` fails 56 seeds there, none
+  here) except `locks-holder-step-back-sealed` 818 (see the next entry).
+  The live-delegation duty adds floors where a delegation was live at the
+  first listing (`locks-unlinked-delegated-hcrash-backup` 1967 -> 2000 of
+  about 2290 seals); nothing else moves beyond noise.
+- Rebased onto 4987b00 (C7a commit 5's clock split and rate in the lock
+  model, the sim oracle's `note_rollbacks`, F-c's late reclaim): the lock
+  model merges both. What a release leaves (its grace) and what an own
+  re-claim waits out (`Node::dropped`) are on the WAIT reading, as the
+  table and graces they come from; `Msg::Mirror` carries the tenure's epoch
+  beside F-c's lapsed memory and `final_for`, and the final mirror goes to
+  the holder's own backup (`backup_for`). C7a's `beat_cap_rate_*` pair
+  starts its root marked (`marked_start`): the trace's root beats and
+  renews but grants nothing, and unmarked its takeover arms no grace to
+  measure. `cargo test -p constellation-model --release --test-threads=2`
+  on 4987b00 and on this stack: every test keeps its verdict (`locks` 74 ->
+  80 passed with the six new ones, 4 ignored; `cto` 32, `backup` 9,
+  `delegation` 21, `flex_epochs` 22, `positions` 9, `today_bugs` 9 and the
+  rest unchanged). With the next two commits: `cargo test --release -p
+  constellation-authority` lib 540, `meta_repro` 4, sim 213;
+  `-p constellation-engine --lib` 823; fmt and `clippy --workspace
+  --all-targets -D warnings` clean. This commit alone: fmt and clippy
+  clean, authority lib 533, sim 211; with (b): lib 537, sim 212.
+  Every `locks-*`, `double-seal-*` and `backup*` configuration (87), seeds
+  0..2000, against 4987b00 with the new configurations ported: the failing
+  sets are equal except `locks-restart-reclaim-seal` 56 -> 0,
+  `locks-holder-step-back-sealed` [818] -> none (as before), and two
+  trajectory moves inside configurations that fail by design:
+  `locks-root-reboot-step-forward` (C7a's fail-before) 1139 -> 1140 (seed
+  435, the same reboot-with-a-forward-step violation) and F-c's negative
+  control `locks-late-stale-mirror-naive` 88 -> 94 (all mutual exclusion).

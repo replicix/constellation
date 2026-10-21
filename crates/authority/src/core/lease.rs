@@ -119,6 +119,13 @@ pub struct LeaseState {
     /// Plan 31 C8: a forward-only (or suspended) node gives the lease back
     /// once idle, whether or not anyone asked for it (`wants_handoff`).
     pub release_when_idle: bool,
+    /// Plan 43 C7-F F-a0 L3: a reconfiguration CAS that would have made the
+    /// tenure sealable without marking it failed with its outcome unknown
+    /// (an answer lost: it may have landed) while this version was held: S3
+    /// may hold the sealable one, so the tenure counts as unmarked
+    /// (`Core::reconfig_in_doubt`) until a version is next adopted from S3
+    /// (`renewed`: a renewal, a re-read, a mark CAS; `adopt`).
+    pub reconfig_doubt: bool,
 }
 
 impl LeaseState {
@@ -536,6 +543,7 @@ impl LeaseState {
         self.last_seen = Some(lease.clone());
         self.cached_holder = Some(lease.holder);
         self.held = Some((lease, tag));
+        self.reconfig_doubt = false;
     }
 
     /// `LeaseKeeper::apply_renew`'s `Renewed` arm.
@@ -557,6 +565,7 @@ impl LeaseState {
         }
         self.last_seen = Some(lease.clone());
         self.held = Some((lease, tag));
+        self.reconfig_doubt = false;
     }
 
     /// `LeaseKeeper::mark_lost`.

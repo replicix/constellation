@@ -461,6 +461,11 @@ pub struct SimConfig {
     /// `ops_per_client` they would have (the draws stay the same), so one
     /// node can write early and another late.
     pub client_plan: Vec<(NodeId, u64, usize)>,
+    /// Plan 43 C7-F F-a0 L3: only the clients of these nodes take locks
+    /// (`lock_ratio`); empty: every node's do. A node whose clients take
+    /// none sends its tenure no lock request, which would mark its lease
+    /// (`ensure_granting_marked`) whatever the grace says.
+    pub lock_nodes: Vec<NodeId>,
     /// Every holder stays alive: a seal, a backup takeover or an
     /// `ack=s3` fast takeover fails the seed (the runtime-lag
     /// configurations: lag is latency, not death).
@@ -755,6 +760,7 @@ impl Default for SimConfig {
             holder_beats: HolderBeats::Off,
             reader_nodes: Vec::new(),
             client_plan: Vec::new(),
+            lock_nodes: Vec::new(),
             live_holder: false,
             beats_lost: false,
             timers_first_after_lag: false,
@@ -2917,7 +2923,11 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             let steps = with_writes(&mut write_rng, steps, cfg.chunk_writes);
             // Plan 30 §M14: locks from their own generator too.
             let mut lock_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0x10c5);
-            let mut steps = with_locks(&mut lock_rng, steps, &cfg);
+            let mut steps = if cfg.lock_nodes.is_empty() || cfg.lock_nodes.contains(&node) {
+                with_locks(&mut lock_rng, steps, &cfg)
+            } else {
+                steps
+            };
             if let Some((_, start, _)) = plan {
                 steps.insert(0, Step::Delay(*start));
             }

@@ -375,6 +375,7 @@ fn replay_seed() {
         Ok("locks-long-grants-seal") => locks_long_grants_seal_config(),
         Ok("fast-takeover-skewed-successor") => fast_takeover_skewed_successor_config(),
         Ok("double-seal-inside-the-grace") => double_seal_inside_the_grace_config(),
+        Ok("locks-restart-reclaim-seal") => locks_restart_reclaim_seal_config(),
         Ok("fast-takeover-skewed-successor-nobeats") => {
             fast_takeover_skewed_successor_nobeats_config()
         }
@@ -4257,7 +4258,12 @@ fn a_delegating_root_cut_from_s3_forms_no_epoch_and_fails_over() {
     let mut epochs = 0;
     let mut failovers = Vec::new();
     let mut executed = 0;
-    for seed in 1600..1612 {
+    // (Seed 1610 left the set with plan 43 C7-F F-a0's live-delegation mark
+    // (L3): its trajectory shifted, and the first mutation answered after
+    // the crash came 1.2 s in, before the seal (a failover the measure
+    // counts but no seal-and-floor one); the same 1.1 to 1.2 s class shows
+    // on the parent at 1615 and 1628. 1612 takes its place.)
+    for seed in (1600..1610).chain(1611..1613) {
         let report = run_seed(seed, delegated_holder_cut_config()).unwrap_or_else(|e| {
             panic!(
                 "delegated-holder-cut seed {seed}: {e}\n  replay with \
@@ -4442,6 +4448,7 @@ fn sweep_config() {
         "locks-long-grants-seal" => locks_long_grants_seal_config(),
         "fast-takeover-skewed-successor" => fast_takeover_skewed_successor_config(),
         "double-seal-inside-the-grace" => double_seal_inside_the_grace_config(),
+        "locks-restart-reclaim-seal" => locks_restart_reclaim_seal_config(),
         "fast-takeover-skewed-successor-nobeats" => fast_takeover_skewed_successor_nobeats_config(),
         "fast-takeover-skewed-successor-credited" => {
             fast_takeover_skewed_successor_credited_config()
@@ -6784,6 +6791,72 @@ fn double_seal_inside_the_grace_config() -> SimConfig {
     }
 }
 
+/// Plan 43 C7-F F-a0 L3a/L3c: node 3 holds a lock under node 1's tenure
+/// when node 1 shuts down gracefully (it releases its lease, marked: a
+/// grant is live) and restarts. Nodes 2 and 3 cannot reach S3 meanwhile,
+/// so node 1 re-claims its own released lease: no takeover, and the claim
+/// CAS writes it unmarked. Node 3's renewal is a reclaim under the
+/// quarantine (L3c), a record in node 1's table before its first backup is
+/// listed, so the lock mirror, sent when the table changes, never carries
+/// it to that backup. Node 1's clients take no locks (a lock request would
+/// mark the lease: `ensure_granting_marked`), so the lease stays unmarked
+/// until the reconfiguration that lists node 2, which must mark it. Node 1
+/// is then cut from S3 and from node 2, which seals it; node 2's own late
+/// request for the lock must be refused while node 3 still honours its
+/// grant: the sealer arms a floor only for a marked lease.
+fn locks_restart_reclaim_seal_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(|id, inc| {
+            let mut c = sim::run::backup_core_config(id, inc);
+            c.inbox = false;
+            c.lock_ttl_ms = 5_000;
+            c
+        }),
+        clients_per_node: 1,
+        ops_per_client: 2,
+        lock_files: 1,
+        lock_ratio: 1.0,
+        lock_shared_ratio: 0.0,
+        // Node 3's one critical section outlasts the whole sequence; node 1
+        // (the restarted holder) sends its tenure no lock request; node 2's
+        // late one is what the sealer must refuse.
+        lock_ios: (14, 20),
+        lock_io_ms: (250, 400),
+        lock_nodes: vec![2, 3],
+        client_plan: vec![(1, 2_700, 1), (2, 5_000, 1), (3, 0, 1)],
+        faults: vec![
+            // The others cannot claim the released lease meanwhile.
+            ScheduledFault {
+                at_ms: 1_100,
+                kind: FaultKind::CutS3 {
+                    node: 2,
+                    for_ms: 1_900,
+                },
+            },
+            ScheduledFault {
+                at_ms: 1_100,
+                kind: FaultKind::CutS3 {
+                    node: 3,
+                    for_ms: 1_900,
+                },
+            },
+            ScheduledFault {
+                at_ms: 1_200,
+                kind: FaultKind::ShutdownHolder { restart_ms: 200 },
+            },
+            ScheduledFault {
+                at_ms: 3_500,
+                kind: FaultKind::CutS3Holder { for_ms: 6_000 },
+            },
+            ScheduledFault {
+                at_ms: 3_500,
+                kind: FaultKind::PartitionBackup { for_ms: 6_000 },
+            },
+        ],
+        ..locks_failover_backup_renew_config()
+    }
+}
+
 /// Plan 43 C7-F F-a's negative control: `fast-takeover-skewed-successor`
 /// with every numbered beat's arrival stamp replaced by its credit
 /// (`SimConfig::beats_credited`), the instant `sent + M` of the holder's
@@ -8164,6 +8237,27 @@ fn a_second_seal_inside_the_grace_waits_out_the_first_holders_grants() {
     );
     assert!(
         t.backup_takeovers > 100,
+        "the backups rarely took over: {t:?}"
+    );
+}
+
+/// Plan 43 C7-F F-a0 L3: a backup that seals a holder whose lease was
+/// written unmarked (its re-claim of its own released lease) while that
+/// holder still waits out grants of its earlier tenure, one of them
+/// reclaimed before the backup was listed (the lock mirror never carried
+/// it), waits them out too: the reconfiguration that lists the backup marks
+/// the lease. On `4a0fb20` 5 of seeds 0..100 of `locks-restart-reclaim-seal`
+/// (5, 15, 52, 77, 96) show two nodes inside conflicting lock sections
+/// (56 of 0..2000).
+#[test]
+fn a_sealer_of_a_reclaimed_lease_waits_out_the_grants_that_lease_waited_out() {
+    let t = run_m14(
+        "locks-restart-reclaim-seal",
+        locks_restart_reclaim_seal_config(),
+        0..100,
+    );
+    assert!(
+        t.backup_takeovers > 90,
         "the backups rarely took over: {t:?}"
     );
 }
@@ -10287,7 +10381,9 @@ const I1_LONG_DELEGATED: &[u64] = &[0, 1, 2];
 /// `backup-crash`: `identity_copies`.
 const I2_BACKUP_CRASH: &[u64] = &[815, 858, 889, 892];
 /// `delegated-holder-cut`: `identity_copies`.
-const I2_DELEGATED_HOLDER_CUT: &[u64] = &[0, 4, 22];
+/// (22, whose trajectory plan 43 C7-F F-a0's live-delegation mark shifted to
+/// no copy, gave its place to 3: 3 copies, `+identity` fails with I2.)
+const I2_DELEGATED_HOLDER_CUT: &[u64] = &[0, 3, 4];
 /// `backup-crash`: `non_verbatim`.
 const I2C_BACKUP_CRASH: &[u64] = &[800, 802, 803];
 /// `backup`: `non_lone_rollbacks`.
@@ -10300,5 +10396,8 @@ type I4Seeds = (&'static str, fn() -> SimConfig, &'static [u64]);
 const I4_SEEDS: &[I4Seeds] = &[(
     "long-delegated-late-answers",
     long_delegated_late_answers_config,
-    &[1, 6, 8],
+    // (6, whose trajectory plan 43 C7-F F-a0's live-delegation mark shifted
+    // to no late landing, gave its place to 15: 2 late landings, `+settle`
+    // fails with I4.)
+    &[1, 8, 15],
 )];

@@ -3190,6 +3190,11 @@ Model: `cargo test -p constellation-model --release --test locks -- --nocapture`
 (`crates/model/src/locks.rs`; counterexamples for no fencing, a grant
 before expiry plus margin under drift, failover without grace, moves
 that lose state, an outwaited delegate without grace; the design clean).
+Plan 43 C7-F F-a0 L4: the register carries the lease's mark (`Reg::marked`),
+a backup per holder (`backup_of`) and the knobs `inherit_mark`,
+`release_mark_duty`, `mark_at_sealable`, each with a violating run and an
+exhaustive clean one: the double seal inside a grace, the released chain
+and a node's re-claim of its own released lease.
 The cto model (`crates/model/src/cto.rs`) also checks the takeover floor
 capped by the old holder's beats (plan 43 C7-F F-a): one representative run
 is in the default suite (`fast_takeover_with_beat_cap_is_clean`, 4 M states,
@@ -4314,7 +4319,16 @@ off, no strict mounts: the second seal comes while the first successor is
 still inside the floor it inherited and has granted nothing itself), whose
 `a_second_seal_inside_the_grace_waits_out_the_first_holders_grants` fails
 without the inherited mark (seed 548). `AUTHORITY_SIM_CONFIG=double-seal-inside-the-grace`
-replays it. Plan 43 C7-F F-a, the floor's cap by the old holder's
+replays it. Plan 43 C7-F F-a0 L3: `locks-restart-reclaim-seal`
+(`SimConfig::lock_nodes`: only those nodes' clients take locks): node 3 holds
+a lock when the holder shuts down gracefully and restarts; nodes 2 and 3 cannot reach
+S3 meanwhile, so node 1 re-claims its own released lease (unmarked: no
+takeover), node 3's renewal is a reclaim in its table before its backup is
+listed, and node 1, which takes no lock request, is cut and sealed by that
+backup while node 3 still honours the grant; node 2's late request must be
+refused. `a_sealer_of_a_reclaimed_lease_waits_out_the_grants_that_lease_waited_out`
+fails without the mark the reconfiguration writes (56 of seeds 0..2000, 5 of
+the first 100). Plan 43 C7-F F-a, the floor's cap by the old holder's
 heartbeat: `SimConfig::holder_beats` (the daemon's off-core beat; most
 older configurations model none, so their floors are the bound and the cap
 is inert: `AUTHORITY_SIM_BEATS=thread` on `sweep_config` runs any of them

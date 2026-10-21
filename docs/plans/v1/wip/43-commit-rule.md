@@ -2686,8 +2686,8 @@ successor whose clock is ahead got no quarantine").
   seeds violate mutual exclusion before, seed 548 among them; none after
   for that cause; PROGRESS has the counts and an unrelated late failure
   the configuration also meets).
-  *F-a0 follow-ups* (found by F-a0's review; not implemented, each its
-  own fail-before first). (b) *The inherited mark outlives its floor.* A
+  *F-a0 follow-ups* (found by F-a0's review; each its own fail-before
+  first). (b) *The inherited mark outlives its floor.* A
   tenure that takes over a marked lease is marked for its life, so its own
   sealer arms a floor even if the tenure never granted, and a chain of
   seals keeps paying 8.5 s / 23.5 s at the defaults for nothing; only the
@@ -2695,22 +2695,70 @@ successor whose clock is ahead got no quarantine").
   Clear an inherited mark by CAS once the floor has passed, `lock_duty_live`
   is false, no read or write delegation is live and the tenure made no
   grant of its own; `ensure_granting_marked` re-marks before the next
-  grant, so a racing seal at worst over-waits. (L3) *Duties no claim CAS
-  marks:* a node re-claiming its own released lease with a live quarantine
+  grant, so a racing seal at worst over-waits. Decision D1 (2026-10-20):
+  inherited marks only; a mark a tenure made for its own grants is not
+  cleared (the cost of a bursty workload paying a mark CAS on its first
+  grant after each idle period, and a clear CAS per idle period, is not
+  taken until the floor-cost table shows it matters). Not yet implemented.
+  (L3) *Duties no claim CAS marks* — *landed (2026-10-20)*: a node
+  re-claiming its own released lease with a live quarantine
   (`lock_quarantine_dropped_tenure`; `granted_lease`'s `own` excludes
   released leases), a restart quarantine over an unmarked previous lease,
   and reclaims admitted into a `Local` tenure (its renewals are not held,
   so the reclaimed grants install unmarked; the lock mirror goes only to
-  the backups listed when the table changed). Each becomes F-a0's hole if
-  that tenure lists a backup and is sealed before its next mark CAS. Mark
-  where the tenure becomes sealable: at the reconfiguration that adds a
-  backup (`issue_reconfig`, `backup.rs` about 1616) when `lock_duty_live ||
-  pending_floor || in_takeover_floor ||` read delegations are live, and at
-  the claim CAS for `ack_s3`. (L4) *The lock model has no mark:* its fast
-  takeover always arms the grace. Add `Reg::marked` (a root grant marks,
-  a release marks per `lock_duty_live`, a takeover inherits per
-  `acquire_cas`, the grace arms only on a marked `prev`) and a
-  violate/clean pair for the double seal and the released chain.
+  the backups listed when the table changed), and the grants an epoch's
+  close keeps (a re-claim continues the tenure under its own mark). Each
+  becomes F-a0's hole if that tenure lists a backup and is sealed before
+  its next mark CAS. A tenure is sealable (`fast_tenure`) in exactly two
+  places, since a claim CAS writes `backups: []` and `Local` unless
+  `ack=s3`: the claim CAS under `ack=s3`, and the reconfiguration that
+  lists the first backup (`issue_reconfig`, and its retry in
+  `on_reconfig_reread`). Both now mark the lease when
+  `Core::tenure_duty_live` (lock duty or any grant record, a live write
+  delegation, a pending or running takeover floor, read grants or a read
+  quarantine, grants made under an epoch's hold); `on_reconfig_put` and
+  `acquire_won` mark a sealable unmarked tenure whose duty arose in between
+  (the catch-all). A
+  reconfiguration CAS that makes the tenure sealable and does not mark it
+  holds lock renewals and reclaims, and the mark CAS, until it settles
+  (`tenure_marked`, `ensure_granting_marked`): a reclaim under a grace that
+  began since would otherwise stand in a version a sealer may replace as it
+  lands; so does one whose outcome is not known (an answer lost: it may
+  have landed) until a lease version is next adopted from S3
+  (`LeaseState::reconfig_doubt`). The mark of the release (`issue_release`)
+  and the lock part of the
+  predicate share one function, so they cannot drift; read terms are not
+  part of the release (read delegations are recalled before a release).
+  The fourth candidate, the grants an epoch's close keeps, needs no path
+  of its own: the close writes no released lease (the re-claim is
+  `own`, mark carried), the grants stand in the table, and the re-claim
+  is sealable at the same two places. *Safety argument.* A sealer's CAS
+  replaces a version that lists it. Every version that lists a backup was
+  written either by the reconfiguration or after it (renewals copy the
+  mark), or was written sealable by the `ack=s3` claim. At those writes any
+  live duty marks the version; while the write is out no new duty is
+  answered unheld; after it, every new grant or answer goes through the
+  marking gates of a fast tenure; quarantines and floors start only at the
+  claim (inherited and covered there) or at `note_marker_landed`, which is
+  already marked. So a sealer never replaces an unmarked version while a
+  duty is live. The cost: a tenure with nothing live at its first backup
+  listing (a start-up, a handoff) stays unmarked, so M1's cost does not
+  come back. Fail-before (core, each on 4a0fb20): the six tests named
+  `a_reclaim_of_its_own_released_lease_with_live_grants_is_marked_when_it_lists_a_backup`,
+  `a_restart_quarantine_marks_the_first_backup_listing`,
+  `a_reclaim_admitted_into_a_local_tenure_marks_the_first_backup_listing`,
+  `grants_kept_at_an_epoch_close_mark_the_first_backup_listing`,
+  `a_reclaim_during_a_reconfig_in_flight_is_held_until_marked` and
+  `an_ack_s3_claim_with_a_duty_live_is_marked_from_its_first_cas`; the sim
+  configuration `locks-restart-reclaim-seal` (56 of 2 000 seeds violate
+  mutual exclusion on 4a0fb20, none after); the model pairs below.
+  (L4) *The lock model has no mark* — *landed (2026-10-20)*: `Reg::marked`
+  (a root grant or a reclaim marks, a release marks per its table, grace
+  and handed copies, a takeover inherits per `acquire_cas`, the grace arms
+  only on a marked `prev`), `backup_of` (a backup per holder, for a double
+  seal) and the knobs `inherit_mark`, `release_mark_duty`, `mark_at_sealable`;
+  violate/clean pairs for the double seal, the released chain and the own
+  re-claim (`crates/model/tests/locks.rs`).
   *What it buys.* An S3-cut holder alive on P2P beats until its expiry,
   so its successor's floor ends about M after it reads the lease as
   expired: the scenario's first acknowledged write and first lock grant

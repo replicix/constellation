@@ -563,8 +563,26 @@ anything itself, found an unmarked lease and armed no floor, and the grants
 the first floor protected (those of the tenure before, which the lock
 mirror had not carried) were open to conflicting ones. A handoff that
 left nothing live behind releases an unmarked lease, however the tenure
-before it was marked: a seal of its taker waits for nothing. (What
-remains: a mark a tenure inherits stays for its life, so a seal of it
+before it was marked: a seal of its taker waits for nothing.
+
+A claim CAS cannot know every duty its tenure stands on. A node that
+re-claims its own released lease waits out the grants it let go (no
+takeover, so nothing inherited: the claim writes an unmarked lease, and the
+dropped grants are in no table to be mirrored to a backup listed later); a
+restarted node waits out its previous incarnation's grants; a `Local`
+tenure admits reclaims that no mirror carries to a backup added after them.
+Each is F-a0's hole once that tenure lists a backup, is cut from S3 and is
+sealed before its next mark CAS: the sealer arms no floor and grants over
+grants still honoured. A tenure therefore marks its lease when it becomes
+sealable with such a duty live: in the claim CAS under `ack=s3`, else in
+the reconfiguration CAS that lists its first backup, a duty being a live or
+revivable lock record, a live write delegation, a grace or quarantine, a
+floor, a read grant or read quarantine, or a grant made under an epoch's
+hold. While that
+reconfiguration is out, lock renewals and reclaims are held; they go once the lease is marked.
+A tenure with nothing of the kind live at its first listing (the start-up
+and handoff case) stays unmarked, so a seal of it still waits for nothing.
+(What remains: a mark a tenure inherits stays for its life, so a seal of it
 arms a floor even if it never granted anything, and a chain of seals
 keeps paying one.)
 

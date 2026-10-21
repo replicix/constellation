@@ -208,6 +208,43 @@
 //! `final_sent`, `final_installed`, `late_io` and `late_at_successor`
 //! witnessed (non-vacuous).
 //!
+//! # Plan 43 C7-F F-a0: the lease's mark
+//!
+//! A fast takeover arms its grace, and the taker of a released lease waits
+//! out the old tenure's grants, only if the lease it replaced is marked
+//! (`Reg::marked`, the code's `Lease::granted_delegations`):
+//!
+//! - **A root that a backup may take over early marks its lease before it
+//!   answers anything** (`root_may_answer`: `ensure_granting_marked`,
+//!   `renew_kick`): one CAS on the register, which lands only if the root
+//!   still holds the lease; a root that finds it replaced is deposed and
+//!   answers nothing. A root whose own view of its lease is marked answers
+//!   without one (`Node::marked`), within the probe window.
+//! - **A release marks exactly what the tenure leaves behind**
+//!   (`release_mark_duty`; `issue_release`): a record in its table, a
+//!   grace, copies of what it handed.
+//! - **A takeover inherits the mark** (`inherit_mark`; `acquire_cas`'s
+//!   `inherits_duty`): a fast one of a marked lease, or the taker (not the
+//!   releaser) of a marked released one, writes its register marked, so its
+//!   own successor waits too. Without it a tenure sealed inside its grace
+//!   before it granted leaves its successor no grace (the double seal).
+//! - **A node re-claiming its own released lease inherits nothing**: it
+//!   waits out the grants it dropped (`Node::dropped`, kept on the node
+//!   like the code's quarantine, which outlives the tenure, and of its WAIT
+//!   reading like the table and the grace it is taken from), and its lease
+//!   is marked from that write only if it stands on such a floor
+//!   (`mark_at_sealable`: L3, the claim CAS under `ack=s3`, else the
+//!   reconfiguration that lists the first backup; here the backup is there
+//!   from the start). Without it the sealer of that tenure arms no grace.
+//! - The grace of a takeover is armed only on a marked lease; the backup's
+//!   mirror is installed whatever the mark, and a new tenure's backup starts
+//!   with an empty one (the code keys a mirror by the epoch it backs).
+//!
+//! `backup_of` gives each holder its own backup (a double seal needs a
+//! chain); `marked_start` starts the initial holder marked (a root that
+//! granted before): a counterexample that rests on a deposed root's late
+//! grant needs it, an unmarked one is fenced by its first mark CAS.
+//!
 //! # The property
 //!
 //! `mutual_exclusion` (always): a node never performs I/O under a grant
@@ -249,6 +286,9 @@
 //! | `cached_owner` routing | `lock_route_for`'s `lease.cached_holder`; `NotOwner` → `lock_apply_renew_result` |
 //! | `Io` fenced | `View::lock_fence(ino)` → `EIO` |
 //! | `Takeover` grace | `note_marker_landed`'s floor, extended to lock grants; reclaims in `on_lock_renew` |
+//! | `Reg::marked`, `root_may_answer` | `Lease::granted_delegations`, `ensure_granting_marked`, `renew_kick`, `ensure_marked_inherited` |
+//! | `Release` mark | `issue_release`'s `lock_duty_standing` |
+//! | `Takeover` inherits the mark | `acquire_cas`'s `inherits_duty`; `mark_at_sealable`: `tenure_duty_live` at the claim CAS (`ack=s3`) and at `issue_reconfig` |
 //! | `Delegate`/`Recall` state | `DelegRenewed { locks }` (every granting renewal: `lock_take_handoff`) and `DelegRecalled { locks }` (`lock_install_returned`) |
 //! | `Handoff` delivered / dropped | `lock_install_moved` (`deleg_mine_until`, `moved_seen`, `install_if_consistent`) |
 //! | reinstated copies | `lock_on_generation_ended` from `end_generation` (`core/delegate.rs`) |
@@ -478,6 +518,36 @@ pub struct LockModel {
     /// Naive (c): the lapsed memory is not superseded by a conflicting
     /// grant. Must violate.
     pub late_lapsed_unsuperseded: bool,
+    // ---- plan 43 C7-F F-a0: the lease's mark ----
+    /// Each holder's backup, by node (the one that may take it over fast
+    /// and receives its table's mirror), `NONE` for none; empty: `backup`
+    /// for every holder (a node is never its own). A double seal needs a
+    /// backup per holder.
+    pub backup_of: Vec<u8>,
+    /// A takeover that waits out its predecessor's grants (a fast one of a
+    /// marked lease; a released one, by another node) writes its register
+    /// marked, so its own successor waits too (`acquire_cas`'s
+    /// `inherits_duty`). Off, a tenure sealed inside its floor before it
+    /// granted leaves its successor no floor.
+    pub inherit_mark: bool,
+    /// A release marks the register exactly when its tenure leaves
+    /// something behind (a grant record, a grace, copies of what it
+    /// handed): `issue_release`. Off, a release never marks.
+    pub release_mark_duty: bool,
+    /// A tenure that is sealable and stands on a duty no inherited mark
+    /// covers says so from the lease write that makes it sealable (L3: the
+    /// claim under `ack=s3`, else the reconfiguration that lists its first
+    /// backup). Modelled for the one such duty here: the floor a node
+    /// waits out when it re-claims its own released lease
+    /// (`lock_quarantine_dropped_tenure`; here the backup is there from
+    /// the start, so the sealable write is the re-claim). Off, the lease is
+    /// unmarked until the tenure grants, and its successor arms no floor.
+    pub mark_at_sealable: bool,
+    /// The initial holder has granted before: its lease is marked. (The
+    /// default is an unmarked lease, as a new tenure's: a deposed root that
+    /// never granted is fenced by its first mark CAS, so a counterexample
+    /// that rests on a deposed root's late grant needs this.)
+    pub marked_start: bool,
 }
 
 impl LockModel {
@@ -542,6 +612,33 @@ impl LockModel {
             late_admit_unknown: false,
             late_admit_nonfinal: false,
             late_lapsed_unsuperseded: false,
+            backup_of: Vec::new(),
+            inherit_mark: true,
+            release_mark_duty: true,
+            mark_at_sealable: true,
+            marked_start: false,
+        }
+    }
+
+    /// Whether a root `h` answers within a window of a probe and, from the
+    /// mark, only once its lease says so: every root when one `backup` is
+    /// configured (as before `backup_of`), else those with a backup of
+    /// their own.
+    fn fast_root(&self, h: usize) -> bool {
+        if self.backup_of.is_empty() {
+            self.backup != NONE
+        } else {
+            self.backup_for(h) != NONE
+        }
+    }
+
+    /// Holder `h`'s backup, or `NONE`.
+    fn backup_for(&self, h: usize) -> u8 {
+        let b = self.backup_of.get(h).copied().unwrap_or(self.backup);
+        if b as usize == h {
+            NONE
+        } else {
+            b
         }
     }
 
@@ -589,6 +686,11 @@ pub struct Reg {
     /// The holder released it (a graceful shutdown): any node may take
     /// it over at once.
     pub released: bool,
+    /// Plan 43 C7-F F-a0: the lease says its tenure granted, or leaves
+    /// something to wait out (`Lease::granted_delegations`): a successor
+    /// arms its grace (a fast takeover) or waits out the released tenure's
+    /// grants only for a lease so marked. Set by a grant at the root.
+    pub marked: bool,
 }
 
 /// Owner side: a node's grant on `X`.
@@ -702,6 +804,14 @@ pub struct Node {
     pub mirror: Mirrored,
     /// Root side: the mirror version counter.
     pub mirror_ver: u8,
+    /// This node's own view of its lease's mark (it wrote it, or read it at
+    /// its claim): a root with it answers without a CAS
+    /// ([`State::root_may_answer`]).
+    pub marked: bool,
+    /// The end of the grants this node's tenure dropped when it released
+    /// (0: none): what it waits out if it re-claims its own released lease
+    /// (`lock_quarantine_dropped_tenure`).
+    pub dropped: i16,
     /// Backup side (`beat_cap`): what it heard of one root's beats
     /// `(holder, epoch, lag, named, guard)`: the smallest arrival minus
     /// send, the highest expiry and guard named (0: none).
@@ -779,10 +889,12 @@ pub enum Msg {
         sent: i16,
         outcome: RenewOutcome,
     },
-    /// Root → backup: the table as of version `ver`.
+    /// Root → backup: the table as of version `ver`, of the tenure at
+    /// `epoch` (the code keys a mirror by the epoch it backs).
     Mirror {
         to: u8,
         ver: u8,
+        epoch: u8,
         table: Vec<Grant>,
         lapsed: Vec<Grant>,
         final_for: Option<Key>,
@@ -949,7 +1061,7 @@ impl State {
                 if !self.believes_root(cfg, i) || self.final_sent(cfg, i) {
                     return None;
                 }
-                if cfg.backup != NONE
+                if cfg.fast_root(i)
                     && cfg.probe_freshness
                     && (!renewal || cfg.renew_probe_freshness)
                     && self.honour(cfg, i) - self.nodes[i].last_probe >= cfg.takeover_window
@@ -1033,7 +1145,8 @@ impl State {
     }
 
     fn mirror_push(&mut self, cfg: &LockModel, h: usize) {
-        if cfg.backup == NONE || !cfg.replicate || cfg.backup as usize == h {
+        let to = cfg.backup_for(h);
+        if to == NONE || !cfg.replicate {
             return;
         }
         // After the final one the backup holds the last word: a later
@@ -1041,12 +1154,18 @@ impl State {
         if self.final_sent(cfg, h) {
             return;
         }
+        // The mirror is of the tenure at the epoch its root believes it
+        // holds (a deposed root's goes stale at the backup).
+        let Some((epoch, _, _)) = self.nodes[h].lease else {
+            return;
+        };
         self.nodes[h].mirror_ver = self.nodes[h].mirror_ver.wrapping_add(1);
         let ver = self.nodes[h].mirror_ver;
         let table = self.nodes[h].table.clone();
         self.send(Msg::Mirror {
-            to: cfg.backup,
+            to,
             ver,
+            epoch,
             table,
             lapsed: Vec::new(),
             final_for: None,
@@ -1085,6 +1204,33 @@ impl State {
         self.nodes[h]
             .lapsed
             .retain(|e| e.node != node && !e.mode.conflicts(mode));
+    }
+
+    /// Plan 43 C7-F F-a0: before a root that a backup may take over early
+    /// answers anything (a grant, a recall that serves one, a renewal, a
+    /// reclaim), its lease says so (`ensure_granting_marked`, `renew_kick`):
+    /// one CAS on the register, which lands only if this root still holds
+    /// the lease. A root that finds it replaced is deposed, and answers
+    /// nothing. `false`: it answers nothing now. (A deposed root whose own
+    /// view of its lease is already marked answers without a CAS, within
+    /// the probe window: the successor's grace covers it.)
+    fn root_may_answer(&mut self, cfg: &LockModel, h: usize) -> bool {
+        if self.owner != Owner::Root || !cfg.fast_root(h) || self.nodes[h].marked {
+            return true;
+        }
+        let Some((mine, _, _)) = self.nodes[h].lease else {
+            return false;
+        };
+        if self.reg.holder as usize == h && self.reg.epoch == mine && !self.reg.released {
+            self.reg.marked = true;
+            self.nodes[h].marked = true;
+            true
+        } else {
+            self.nodes[h].lease = None;
+            self.nodes[h].dgen = None;
+            self.depose_owner(h);
+            false
+        }
     }
 
     /// Issue a grant at owner `h` to `node`, live from `base` (the
@@ -1151,6 +1297,9 @@ impl State {
         let Some(until) = self.owner_until(cfg, h) else {
             return false;
         };
+        if !self.root_may_answer(cfg, h) {
+            return false;
+        }
         // A recalled grant of the requester's own: nothing until it is
         // released (the code's rule; re-affirming it lets the release
         // drop a grant with locks under it).
@@ -1486,6 +1635,8 @@ impl LockModel {
                 moved_seen: Vec::new(),
                 mirror: Mirrored::default(),
                 mirror_ver: 0,
+                marked: false,
+                dropped: 0,
                 heard: None,
                 lapsed: Vec::new(),
                 final_for: None,
@@ -1497,6 +1648,7 @@ impl LockModel {
         let expires = off[h] + self.lease_ttl;
         nodes[h].lease = Some((1, expires, expires));
         nodes[h].last_probe = off[h];
+        nodes[h].marked = self.marked_start;
         State {
             t: 0,
             clk: crate::clk::initial_clocks(off, rate),
@@ -1508,6 +1660,7 @@ impl LockModel {
                 expires,
                 expires_w: expires,
                 released: false,
+                marked: self.marked_start,
             },
             owner: Owner::Root,
             moves: 0,
@@ -1580,7 +1733,7 @@ impl LockModel {
                 if self.allow_renew {
                     actions.push(Action::RenewLease(iu));
                 }
-                if self.backup != NONE && now_h - node.last_probe >= self.takeover_window {
+                if self.fast_root(i) && now_h - node.last_probe >= self.takeover_window {
                     actions.push(Action::Probe(iu));
                 }
                 if self.delegate != NONE
@@ -1610,10 +1763,10 @@ impl LockModel {
                 {
                     actions.push(Action::RecallByTtl);
                 }
-            } else if node.lease.is_some() && self.backup != NONE && s.reg.holder != iu {
+            } else if node.lease.is_some() && self.fast_root(i) && s.reg.holder != iu {
                 actions.push(Action::Probe(iu));
             }
-            if self.beat_cap && self.backup != NONE && self.backup != iu {
+            if self.beat_cap && self.backup_for(i) != NONE {
                 if let Some((_, expires_h, _)) = node.lease {
                     if now_h < expires_h {
                         actions.push(Action::Beat(iu));
@@ -1622,8 +1775,7 @@ impl LockModel {
             }
             if self.late_reclaim
                 && self.replicate
-                && self.backup != NONE
-                && self.backup != iu
+                && self.backup_for(i) != NONE
                 && node.lease.is_some()
                 && !s.believes_root(self, i)
                 && !s.final_sent(self, i)
@@ -1633,7 +1785,7 @@ impl LockModel {
                 actions.push(Action::FinalMirror(iu));
             }
             let ttl_claimable = self.ttl_takeover && now_wall >= s.reg.expires;
-            let fast = self.backup == iu && s.reg.holder != iu;
+            let fast = s.reg.holder != iu && self.backup_for(s.reg.holder as usize) == iu;
             let released = self.released_takeover && s.reg.released;
             if (ttl_claimable || fast || released) && anyone_wants && s.reg.epoch <= self.max_epoch
             {
@@ -1782,15 +1934,30 @@ impl LockModel {
                 // here: a superset of the code's permit, so the backup's
                 // takeovers explore no path without the grace (the code's
                 // floor-less TTL path of a backup is the sim's).
-                let permitted = self.backup == i as u8 && prev.holder != i as u8;
+                let permitted =
+                    prev.holder != i as u8 && self.backup_for(prev.holder as usize) == i as u8;
                 let fast = permitted || now_wall < prev.expires;
                 let epoch = prev.epoch + 1;
+                // Plan 43 C7-F F-a0: the register of a takeover that waits
+                // out its predecessor's grants is marked from its first
+                // write (`acquire_cas`'s `inherits_duty`: a permitted
+                // takeover of a marked lease, or the taker, not the
+                // releaser, of a marked released one). A node's own
+                // re-claim of its released lease inherits nothing.
+                let inherits = self.inherit_mark
+                    && prev.marked
+                    && if prev.released {
+                        prev.holder != i as u8
+                    } else {
+                        fast
+                    };
                 s.reg = Reg {
                     holder: i as u8,
                     epoch,
                     expires: now_wall + self.lease_ttl,
                     expires_w: now + self.lease_ttl,
                     released: false,
+                    marked: inherits,
                 };
                 s.nodes[i].lease = Some((epoch, now_h + self.lease_ttl, now + self.lease_ttl));
                 s.nodes[i].last_probe = now_h;
@@ -1809,10 +1976,23 @@ impl LockModel {
                 if prev.released {
                     // The old root's grants may still be honoured (they
                     // were capped by a lease that has not expired), and
-                    // nobody knows them: a grace on everything.
+                    // nobody knows them: a grace on everything — when the
+                    // release says it left any (`acquire_won`; an
+                    // unmarked one left nothing to wait out). The node
+                    // that re-claims its own released lease waits out
+                    // what it dropped (`lock_quarantine_dropped_tenure`):
+                    // no takeover, whatever its mark.
                     s.saw |= SAW_RELEASED_TAKEOVER;
                     s.nodes[i].table.clear();
-                    if self.grace {
+                    if prev.holder == i as u8 {
+                        let end = s.nodes[i].dropped;
+                        s.nodes[i].floor = (end > now).then_some(end);
+                        // L3: a duty no inherited mark covers, said by the
+                        // lease from this node's first write.
+                        if self.mark_at_sealable && s.nodes[i].floor.is_some() {
+                            s.reg.marked = true;
+                        }
+                    } else if self.grace && prev.marked {
                         s.nodes[i].floor = Some(now + self.lock_ttl + self.seq_margin);
                     }
                 } else if fast {
@@ -1858,7 +2038,7 @@ impl LockModel {
                     for (n, md) in held {
                         s.supersede(self, i, n, md);
                     }
-                    if self.grace {
+                    if self.grace && prev.marked {
                         let bound =
                             now + self.takeover_window + self.lock_ttl + 2 * self.seq_margin;
                         // Plan 43 C7-F F-a: capped by the old root's beats
@@ -1907,10 +2087,19 @@ impl LockModel {
                     s.saw |= SAW_TTL_TAKEOVER;
                     s.nodes[i].table.clear();
                 }
+                s.nodes[i].marked = s.reg.marked;
+                // The new tenure's backup starts with no mirror of it: what
+                // an earlier tenure's mirror held is of another epoch (the
+                // code keys it by the epoch it backs), and a backup listed
+                // after the table last changed is never sent it.
+                let nb = self.backup_for(i);
+                if nb != NONE {
+                    s.nodes[nb as usize].mirror = Mirrored::default();
+                }
             }
             Action::Beat(h) => {
                 let h = h as usize;
-                let b = self.backup as usize;
+                let b = self.backup_for(h) as usize;
                 // Sent on the holder's wait clock, arriving on the backup's:
                 // `at - sent`, the code's lag; it names the holder's
                 // wait-clock end and its grace (also wait).
@@ -2055,6 +2244,7 @@ impl LockModel {
             Action::FinalMirror(h) => {
                 let h = h as usize;
                 let key = s.lease_key(h)?;
+                let to = self.backup_for(h);
                 let now = s.wait(self, h);
                 s.nodes[h].final_for = Some(key);
                 s.nodes[h].mirror_ver = s.nodes[h].mirror_ver.wrapping_add(1);
@@ -2072,8 +2262,9 @@ impl LockModel {
                 lapsed.dedup();
                 s.saw |= SAW_FINAL_SENT;
                 s.send(Msg::Mirror {
-                    to: self.backup,
+                    to,
                     ver,
+                    epoch: key.1,
                     table,
                     lapsed,
                     final_for: Some(key),
@@ -2197,6 +2388,23 @@ impl LockModel {
             }
             Action::Release(i) => {
                 let i = i as usize;
+                // Plan 43 C7-F F-a0 (`issue_release`): the release marks
+                // exactly what its tenure leaves behind — a record in the
+                // table (a lapsed one too: a renewal revives it), a grace,
+                // copies of what it handed — not the held lease's own mark.
+                let left = !s.nodes[i].table.is_empty()
+                    || s.nodes[i].floor.is_some_and(|f| f > s.wait(self, i))
+                    || !s.nodes[i].handed.is_empty();
+                // Kept on the node, not with the tenure: a quarantine
+                // outlives the tenure's own release, so a second release
+                // of an own re-claim still waits out the first one's grants.
+                let grants = s.nodes[i].table.iter().map(|g| g.until).max().unwrap_or(0);
+                s.nodes[i].dropped = s.nodes[i]
+                    .dropped
+                    .max(grants)
+                    .max(s.nodes[i].floor.unwrap_or(0));
+                s.reg.marked = self.release_mark_duty && left;
+                s.nodes[i].marked = false;
                 s.reg.released = true;
                 s.nodes[i].lease = None;
                 s.nodes[i].dgen = None;
@@ -2269,6 +2477,9 @@ impl LockModel {
                 s.saw & SAW_RECALL_EXPIRED != 0
             }),
             Property::sometimes("reclaimed", |_, s: &State| s.saw & SAW_RECLAIM != 0),
+            // Plan 43 C7-F F-a0: two takeovers (register epoch 3): the
+            // double seal, the released chain, an own re-claim and a seal.
+            Property::sometimes("double_takeover", |_, s: &State| s.reg.epoch >= 3),
             Property::sometimes("moved", |_, s: &State| s.saw & SAW_MOVE != 0),
             Property::sometimes("fast_takeover", |_, s: &State| {
                 s.saw & SAW_FAST_TAKEOVER != 0
@@ -2454,7 +2665,10 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
         } => {
             let h = to as usize;
             let answering = if cfg.cached_owner { to } else { NONE };
-            let Some(until) = s.owner_until_for(cfg, h, true) else {
+            let until = s
+                .owner_until_for(cfg, h, true)
+                .filter(|_| s.root_may_answer(cfg, h));
+            let Some(until) = until else {
                 s.send(Msg::RenewAck {
                     to: from,
                     from: answering,
@@ -2640,12 +2854,13 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
         Msg::Mirror {
             to,
             ver,
+            epoch,
             table,
             lapsed,
             final_for,
         } => {
             let b = to as usize;
-            if ver > s.nodes[b].mirror.ver {
+            if epoch == s.reg.epoch && ver > s.nodes[b].mirror.ver {
                 s.nodes[b].mirror = Mirrored {
                     ver,
                     table,

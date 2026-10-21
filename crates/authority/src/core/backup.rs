@@ -220,7 +220,7 @@ use crate::event::{PeerMsg, S3Result};
 use crate::ids::{Epoch, HonourMs, Ms, NodeId, Now, OpId, Seq, TimerId, WaitMs};
 use crate::replica::Replica;
 use constellation_meta::{BackupRole, BackupTx};
-use constellation_store_s3::{AckPolicy, Lease};
+use constellation_store_s3::{AckPolicy, Lease, LeaseTag};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// How many times a reconfiguration CAS is retried against a re-read
@@ -363,11 +363,24 @@ pub(crate) struct Inflight {
     pub last: u64,
 }
 
+/// Whether a tenure under this lease can be taken over before it expires
+/// (`Core::fast_tenure`, for a lease that is not held yet).
+fn lease_fast(lease: &Lease) -> bool {
+    lease.ack_policy != AckPolicy::Local || !lease.backups.is_empty()
+}
+
 /// A backup-set reconfiguration CAS in flight.
 #[derive(Debug, Clone)]
 pub(crate) struct Reconfig {
     lease: Lease,
     attempts: u32,
+    /// Plan 43 C7-F F-a0 L3: the lease marks itself at this
+    /// reconfiguration (the tenure becomes sealable with a duty live): a
+    /// retry against a fresher object marks too, whatever the duty is by
+    /// then.
+    marks: bool,
+    /// The version the CAS is conditioned on (`LeaseState::reconfig_doubt`).
+    tag: LeaseTag,
     /// The node being added or removed (for the counters).
     add: Option<NodeId>,
     remove: Option<NodeId>,
@@ -1012,13 +1025,40 @@ impl Core {
     /// or nobody can take it over before it expires: its successor waits
     /// out the grants and renewals it answered (`note_marker_landed`'s
     /// floor applies only to a marked tenure).
+    ///
+    /// Plan 43 C7-F F-a0 L3: not while a reconfiguration CAS is out that
+    /// makes the tenure sealable and does not mark it (its duty, if any,
+    /// was not live when it was issued): what the tenure answers now
+    /// (a reclaim under a grace that began since, a delegate's renewal)
+    /// would stand in a lease a sealer may replace as it lands. Held
+    /// until it settles; then the tenure is fast and marks itself
+    /// (`renew_kick`), or is `Local` still. Nor while such a CAS's outcome
+    /// is not known (`reconfig_in_doubt`).
     pub(crate) fn tenure_marked(&self) -> bool {
+        if self
+            .ack
+            .reconfig
+            .as_ref()
+            .is_some_and(|r| lease_fast(&r.lease) && !r.lease.granted_delegations)
+            || self.reconfig_in_doubt()
+        {
+            return false;
+        }
         !self.fast_tenure()
             || self
                 .lease
                 .held
                 .as_ref()
                 .is_some_and(|(l, _)| l.granted_delegations)
+    }
+
+    /// Plan 43 C7-F F-a0 L3: a reconfiguration CAS that would have made
+    /// the tenure sealable unmarked may have landed (its outcome is not
+    /// known) and no lease version has been adopted from S3 since
+    /// (`LeaseState::reconfig_doubt`): to a sealer the tenure may be
+    /// sealable and unmarked while this node still holds it `Local`.
+    pub(crate) fn reconfig_in_doubt(&self) -> bool {
+        self.lease.reconfig_doubt && self.lease.held.is_some()
     }
 
     /// Plan 41 L0: an owner extending a window it promised (a lock grant
@@ -1059,7 +1099,9 @@ impl Core {
     /// for those whose liveness is stale, and mark the tenure if it is
     /// not. Nothing for a tenure that cannot be taken over early.
     pub(crate) fn renew_kick(&mut self, holds: &[FreshHold], out: &mut Vec<Action>) {
-        if !self.fast_tenure() || self.lease.lost {
+        // (A reconfiguration in doubt: the mark CAS settles it, landing on
+        // the version held or conflicting with the one that replaced it.)
+        if (!self.fast_tenure() && !self.reconfig_in_doubt()) || self.lease.lost {
             return;
         }
         if self.ack.renew_probe.is_none() && holds.iter().any(|h| !self.renew_fresh(h.at)) {
@@ -1118,13 +1160,29 @@ impl Core {
     /// Plan 30 §M9: a tenure that serves strict reads says so in the
     /// lease first (one CAS per tenure). `true` when it already does.
     pub(crate) fn ensure_granting_marked(&mut self, out: &mut Vec<Action>) -> bool {
+        self.ensure_marked(out)
+    }
+
+    /// Plan 43 C7-F F-a0 L3: the mark for a duty the tenure stands on
+    /// (inherited from a predecessor, left by its own earlier tenure, or
+    /// admitted into a `Local` one), not for something it grants itself.
+    pub(crate) fn ensure_marked_inherited(&mut self, out: &mut Vec<Action>) -> bool {
+        self.ensure_marked(out)
+    }
+
+    fn ensure_marked(&mut self, out: &mut Vec<Action>) -> bool {
         let Some((lease, tag)) = self.lease.held.clone() else {
             return false;
         };
         if lease.granted_delegations {
             return true;
         }
-        if self.ack.marking.is_none() && !self.lease_cas_in_flight() {
+        // A reconfiguration CAS out replaces the version this mark would
+        // replace (the lease CAS gate below is the job slot's only): the
+        // mark follows once it settles (`renew_after_event`, the next
+        // grant).
+        if self.ack.reconfig.is_none() && self.ack.marking.is_none() && !self.lease_cas_in_flight()
+        {
             let op = self.issue_s3(
                 S3Op::LeaseSwap {
                     lease: lease.with_granted_delegations(),
@@ -1999,11 +2057,11 @@ impl Core {
         let _ = now;
     }
 
-    fn issue_reconfig(
+    pub(crate) fn issue_reconfig(
         &mut self,
         now: Now,
         backups: Vec<NodeId>,
-        _replica: &dyn Replica,
+        replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
         if self.ack.reconfig.is_some() {
@@ -2031,13 +2089,21 @@ impl Core {
         } else {
             AckPolicy::Backup
         };
-        let new = lease.reconfigured(backups.clone(), policy);
+        let mut new = lease.reconfigured(backups.clone(), policy);
+        // Plan 43 C7-F F-a0 L3: the tenure becomes sealable here (a lease
+        // that lists a backup, or says `ack=s3`): a duty it stands on now
+        // is in this version, which a sealer replaces
+        // (`Core::tenure_duty_live`).
+        let marks = lease_fast(&new) && self.tenure_duty_live(now, replica);
+        if marks {
+            new.granted_delegations = true;
+        }
         let add = backups.iter().find(|b| !lease.backups.contains(b)).copied();
         let remove = lease.backups.iter().find(|b| !backups.contains(b)).copied();
         self.issue_s3(
             S3Op::LeaseSwap {
                 lease: new.clone(),
-                tag,
+                tag: tag.clone(),
             },
             S3For::Reconfig,
             out,
@@ -2046,6 +2112,8 @@ impl Core {
         self.ack.reconfig = Some(Reconfig {
             lease: new,
             attempts: 1,
+            marks,
+            tag,
             add,
             remove,
         });
@@ -2086,6 +2154,12 @@ impl Core {
                     "backup set reconfigured"
                 );
                 self.lease.renewed(now, r.lease, tag);
+                // The catch-all (L3): a duty that arose with the CAS out
+                // and the tenure now sealable but unmarked (a duty that
+                // no answer path gates: the gates hold the answers).
+                if self.fast_tenure() && self.tenure_duty_live(now, replica) {
+                    self.ensure_marked_inherited(out);
+                }
                 self.ack.last_reconfig = now.wait;
                 if let Some(n) = r.add {
                     self.stats.backups_added += 1;
@@ -2104,6 +2178,17 @@ impl Core {
                 self.ack.reconfig = Some(r);
             }
             _ => {
+                // Plan 43 C7-F F-a0 L3: an answer lost may hide a CAS that
+                // landed: S3 may hold the sealable, unmarked version while
+                // this node holds the one it replaced. Nothing is answered
+                // unheld until the lease is next adopted from S3
+                // (`reconfig_in_doubt`).
+                if lease_fast(&r.lease)
+                    && !r.lease.granted_delegations
+                    && self.lease.held.as_ref().is_some_and(|(_, t)| *t == r.tag)
+                {
+                    self.lease.reconfig_doubt = true;
+                }
                 tracing::warn!(
                     node = self.cfg.node_id,
                     "backup reconfiguration CAS failed; retrying later"
@@ -2135,11 +2220,16 @@ impl Core {
                 // retry against the fresh object.
                 self.lease.renewed(now, cur.clone(), tag.clone());
                 if r.attempts < RECONFIG_ATTEMPTS {
-                    let new = cur.reconfigured(r.lease.backups.clone(), r.lease.ack_policy);
+                    let mut new = cur.reconfigured(r.lease.backups.clone(), r.lease.ack_policy);
+                    let marks =
+                        lease_fast(&new) && (r.marks || self.tenure_duty_live(now, replica));
+                    if marks {
+                        new.granted_delegations = true;
+                    }
                     self.issue_s3(
                         S3Op::LeaseSwap {
                             lease: new.clone(),
-                            tag,
+                            tag: tag.clone(),
                         },
                         S3For::Reconfig,
                         out,
@@ -2148,6 +2238,8 @@ impl Core {
                     self.ack.reconfig = Some(Reconfig {
                         lease: new,
                         attempts: r.attempts + 1,
+                        marks,
+                        tag,
                         ..r
                     });
                 } else {
