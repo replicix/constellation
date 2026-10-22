@@ -2714,24 +2714,31 @@ fn the_default_clock_mix_is_bounded_deterministic_and_leaves_explicit_clock_faul
         ..SimConfig::default()
     };
     assert!((0..50u64).all(|s| gen_clock_mix(&none, s, 5_000).0.is_empty()));
-    // Delegated directories: no reboot (a restart wedges the run, whatever the
-    // clocks: the mix does not stand for that bug), and the same draws
-    // otherwise.
+    // Delegated directories: the same draws, a reboot included (the
+    // opt-out that hid the delegate-restart wedge is gone with its fix);
+    // with locks taken too, no reboot (a root's restart leaves a lock
+    // waiter unanswered, whatever the clocks: the mix does not stand for
+    // that bug), and the same draws otherwise.
     let delegating = SimConfig {
         dirs: vec!["d1".into(), "d2".into()],
         ..SimConfig::default()
     };
+    let locking = SimConfig {
+        lock_files: 2,
+        ..delegating.clone()
+    };
+    let not_reboot = |f: &&ScheduledFault| !matches!(f.kind, FaultKind::RebootNode { .. });
     for seed in 0..200u64 {
         let (r0, f0) = gen_clock_mix(&cfg, seed, 5_000);
         let (r1, f1) = gen_clock_mix(&delegating, seed, 5_000);
+        let (r2, f2) = gen_clock_mix(&locking, seed, 5_000);
         assert_eq!(r0, r1);
-        assert!(!f1
-            .iter()
-            .any(|f| matches!(f.kind, FaultKind::RebootNode { .. })));
-        let not_reboot = |f: &&ScheduledFault| !matches!(f.kind, FaultKind::RebootNode { .. });
+        assert_eq!(r0, r2);
+        assert_eq!(format!("{f0:?}"), format!("{f1:?}"));
+        assert!(f2.iter().all(|f| not_reboot(&f)));
         assert_eq!(
             format!("{:?}", f0.iter().filter(not_reboot).collect::<Vec<_>>()),
-            format!("{:?}", f1.iter().collect::<Vec<_>>())
+            format!("{:?}", f2.iter().collect::<Vec<_>>())
         );
     }
     // Opt-outs and explicit injections: nothing drawn.
@@ -7973,6 +7980,26 @@ fn config_variant(cfg: SimConfig, variant: &str) -> SimConfig {
             faults.push(fault);
             SimConfig { faults, ..cfg }
         }
+        // `crash<node>@<at_ms>:<restart_ms>`: one more scheduled
+        // `CrashNode`, back with its journal after `restart_ms`.
+        other if other.starts_with("crash") => {
+            let parse = || -> Option<ScheduledFault> {
+                let (node, rest) = other["crash".len()..].split_once('@')?;
+                let (at, restart) = rest.split_once(':')?;
+                Some(ScheduledFault {
+                    at_ms: at.parse().ok()?,
+                    kind: FaultKind::CrashNode {
+                        node: node.parse().ok()?,
+                        restart_ms: Some(restart.parse().ok()?),
+                        keep_journal: true,
+                    },
+                })
+            };
+            let fault = parse().unwrap_or_else(|| panic!("bad variant +{other}"));
+            let mut faults = cfg.faults.clone();
+            faults.push(fault);
+            SimConfig { faults, ..cfg }
+        }
         other => panic!("unknown configuration variant +{other}"),
     }
 }
@@ -9892,6 +9919,29 @@ fn regression_locks_unlinked_delegated_dbackup_random_seeds_2477_2982() {
             panic!(
                 "locks-unlinked-delegated-dbackup-random seed {seed}: {e}\n  replay with \
                  AUTHORITY_SIM_CONFIG=locks-unlinked-delegated-dbackup-random"
+            )
+        });
+    }
+}
+
+/// The delegate-restart wedge (plan 43 C7a commit 6's finding 1): node 2,
+/// the delegate of `d1` and the root's backup, crashes while the root is
+/// cut from S3 and down, and is back 1.2 s later with rows of its
+/// generation the root never appended. It takes the root over (the
+/// strand replays them by rid as root rows), ends the generation, and
+/// hands the lease on; its client's next op, which depended on one of
+/// those rows, was `Held` by the next root (deps lost) and re-sent with
+/// the same deps forever: its own void cut was its stream head, not the
+/// log's. Unclocked: the seeds wedged before the fix.
+#[test]
+fn regression_a_delegate_backup_restarted_while_the_root_is_down_is_answered() {
+    let cfg = config_variant(delegated_holder_cut_config(), "crash2@2300:1200");
+    for seed in [36, 73] {
+        pinned::run_seed(seed, cfg.clone()).unwrap_or_else(|e| {
+            panic!(
+                "delegated-holder-cut+crash2@2300:1200 seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=delegated-holder-cut+crash2@2300:1200 \
+                 AUTHORITY_SIM_CLOCK_FAULTS=0 AUTHORITY_SIM_BUDGET=0"
             )
         });
     }

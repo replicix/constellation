@@ -11814,6 +11814,62 @@ mod locks {
         assert!(h.core.dl.mine[&7].stopped, "the gate left it running");
     }
 
+    /// The delegate-restart wedge (plan 43 C7a commit 6's finding 1): a
+    /// delegate that takes the root over with its predecessor's backup
+    /// tail has its own rows of the generation stranded (replayed by rid
+    /// as root rows); when it then ends the generation as the root, its
+    /// void cut is the log's (the cursor), as the `Recall` gives every
+    /// other replica: a dependency on a stranded row is lost here too.
+    /// With its own stream head as the cut, its client re-sent an op
+    /// depending on such a row with the same deps, and the next root
+    /// answered `Held` (deps lost) forever (`delegated-holder-cut` under
+    /// the clock mix: no op answered for 540 s).
+    #[test]
+    fn a_root_ending_a_generation_its_takeover_stranded_cuts_it_at_the_log() {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let (dir, _) = delegated_file(&h.meta);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        two_delegate_rows(&h, dir);
+        // The delegate holds its two rows (the core notes its own
+        // executions as the delegate); the log none of them.
+        crate::replica::Replica::note_stream(&h.meta, 7, 2);
+        assert_eq!(h.meta.log_stream_idx(7).unwrap(), 0);
+        h.hold(
+            2,
+            Some(PendingGate {
+                epoch: 2,
+                takeover: true,
+                marker_shipped: true,
+                drained: true,
+                fast_prev: false,
+                backup_tail_epoch: Some(1),
+                shippable: true,
+            }),
+        );
+        h.core.complete_gate(h.clk(), &h.meta, &mut out);
+        assert!(h.meta.delegate_stranded(7).unwrap());
+        // The root side: it inherits the generation it delegated to
+        // itself and ends it.
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(
+            h.core.dl.gens.get(&7).is_some_and(|g| g.ended),
+            "the generation was not ended"
+        );
+        let on_row = |i: u64| {
+            let mut deps = Position::ZERO;
+            assert!(deps.streams.raise(7, i));
+            deps
+        };
+        assert!(
+            crate::replica::Replica::deps_lost(&h.meta, &on_row(2)),
+            "a dependency on a stranded row of the generation is not lost at its own root"
+        );
+        assert!(!crate::replica::Replica::deps_lost(&h.meta, &on_row(0)));
+    }
+
     /// overload-cascade-2 (`stress-ng-fs-nodes`): a file locked through
     /// a delegate is unlinked under its lock (`stress-ng`'s lock
     /// stressors do). No subtree contains it any more, so by location its

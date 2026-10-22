@@ -2846,12 +2846,32 @@ first part of C7a, landed early):
     the campaign preset `clock-rate`. The sweeps under the mix are clean but for
     what it found that no clock fault causes (PROGRESS), each reproduced without
     one; one of them is open:
-    - **Open (liveness):** a node restarting in a cluster with delegated
-      directories while the holder is down wedges it: no op answered for 540 s
+    - *Fixed (liveness):* a node restarting in a cluster with delegated
+      directories while the holder is down wedged it: no op answered for 540 s
       (`delegated-holder-cut` seed 139, `locks-unlinked-delegated-hcrash-backup`
-      154, `locks-delegated` 2400; a plain crash and restart, no step, no new
-      boot). The mix draws no reboot where `dirs` are delegated until it is
-      fixed; the fix restores it.
+      154 on commit 6's trajectories; `delegated-holder-cut` 945 and 974 on main;
+      a plain crash and restart, or a suspend, of the delegate that is also the
+      root's backup). Its takeover stranded its
+      own rows of the generation, and as the root it then ended the generation
+      with its own stream head as the void cut, above the log's: an op of its
+      client depending on a stranded row was not lost to it and was lost to the
+      next root, `Held` and re-sent with the same deps forever.
+      `end_generation` now takes the cursor as the cut of a generation the
+      takeover stranded (PROGRESS). C2's `RecallCut.through` takes the same
+      rule; C3, which appends those rows instead of stranding them, removes
+      the case. The mix draws reboots where `dirs` are delegated again, except
+      where locks are taken too, for the next item.
+    - **Open (liveness):** the root restarting in a delegating cluster whose
+      clients take locks leaves a lock waiter unanswered for 60 s: nothing asks
+      for the lease again, the delegate owner's delegation lapses and its lock
+      answers name no owner (`NotOwner { 0 }`), the waiter relearns from a lease
+      that still names the restarted root (`locks-delegated` 222, 469, 784,
+      `-production-ttl` 1224, `-writes` 207 with the mix's reboot; a plain crash
+      and restart reproduces it: `locks-delegated+crash1@4507:620` seed 222;
+      commit 6's `locks-delegated` 2400, a 540 s wedge with no backups and so no
+      strand, does not reproduce on main's trajectories; this is what a reboot
+      there shows now). The mix draws no reboot where `dirs` are delegated and locks are taken
+      until it is fixed.
     - *Fixed:* a root paused 1.3 s and then a delegate crashed left a
       speculative row unsettled, no quiescence in 90 s
       (`locks-unlinked-delegated-dcrash` seed 2383; a plain `Pause` of 1 310 to

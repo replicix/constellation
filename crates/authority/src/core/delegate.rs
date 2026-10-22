@@ -3625,8 +3625,17 @@ impl Core {
         replica.void_stream(gen, cursor);
         // This root was the generation's delegate (inherited at a
         // takeover): its own rows past the cursor stay in its journal and
-        // ship after the `Recall`, so they are not lost.
-        let own = self.dl.mine.contains_key(&gen);
+        // ship after the `Recall`, so they are not lost. Unless its
+        // takeover stranded them (`strand_for_takeover`, a predecessor's
+        // backup tail to re-apply): then none of them stayed, they are
+        // replayed by rid as root rows, and the log's cut is the cursor,
+        // as every other replica reads it at the `Recall`. A cut above
+        // it here called a dependency on a stranded row present while
+        // the next root refused it as lost: the dependent op `Held`,
+        // re-sent with the same deps, forever (a delegate that restarted
+        // while the root was down, then took it over as its backup:
+        // `delegated-holder-cut` seed 139 under the clock mix).
+        let own = self.dl.mine.contains_key(&gen) && !replica.delegate_stranded(gen);
         replica.note_void_cut(
             gen,
             if own {

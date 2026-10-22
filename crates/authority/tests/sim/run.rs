@@ -330,8 +330,9 @@ pub struct SimConfig {
     /// until C7b), at most one suspend of 0.3 to 3 s (several nodes only) and
     /// at most one reboot of a node (restart in 0.3 to 3 s on a new boot,
     /// its wall stepped within the same bound meanwhile; none where
-    /// directories are delegated (`dirs`), which a node's restart wedges: a
-    /// liveness bug the mix found and does not stand for). A configuration
+    /// directories are delegated and locks are taken, which a root's
+    /// restart leaves unanswered: a liveness bug the mix found and does not
+    /// stand for). A configuration
     /// that injects clock faults, skew, offsets or rates of its own, or sets
     /// `live_holder` (no seal allowed), is left as it is, whatever this says;
     /// one that asserts exact timing sets `false`.
@@ -1975,18 +1976,19 @@ pub fn gen_clock_mix(
         });
     }
     // The draw is made whatever the cluster, so that the other draws of a
-    // seed do not depend on it. A node restarting in a delegating cluster
-    // while another is down wedges it (no op answered for 540 s, whatever the
-    // clocks: a plain crash and restart reproduces it, `delegated-holder-cut`
-    // seed 139, `locks-delegated` seed 2400; PROGRESS, plan 43 C7a commit 6),
-    // a liveness bug the mix found and does not stand for: no reboot where
-    // directories are delegated (`dirs`).
+    // seed do not depend on it. A root restarting in a delegating cluster
+    // whose clients take locks leaves a lock waiter unanswered for 60 s
+    // (nothing asks for the lease again: the delegate owner's delegation
+    // lapses and its lock answers name no owner; a plain crash and restart
+    // reproduces it, `locks-delegated+crash1@4507:620` seed 222; plan 43
+    // C7a): a liveness bug the mix found and does not stand for, so no
+    // reboot where directories are delegated and locks are taken.
     let reboot = rng.random_bool(0.5);
     let node = rng.random_range(1..=cfg.nodes);
     let step_ms = step(&mut rng, node);
     let restart_ms = rng.random_range(300..=3_000);
     let at_ms = at(&mut rng);
-    if reboot && cfg.dirs.is_empty() {
+    if reboot && (cfg.dirs.is_empty() || cfg.lock_files == 0) {
         out.push(ScheduledFault {
             at_ms,
             kind: FaultKind::RebootNode {

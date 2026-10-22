@@ -3319,7 +3319,9 @@ the root's grants too). A `+` after any config's label applies variants:
 a full lock ttl), `+solo` (one lock client per node) and
 `+pause<node>@<at_ms>:<for_ms>` (one more scheduled `Pause` of that node, for
 replaying a seed with a freeze on top, e.g.
-`backup-lag-at-expiry-beats-lost+pause1@7363:2416`). `sweep_config` prints
+`backup-lag-at-expiry-beats-lost+pause1@7363:2416`) and
+`+crash<node>@<at_ms>:<restart_ms>` (one more `CrashNode`, back with its journal,
+e.g. `delegated-holder-cut+crash2@2300:1200`). `sweep_config` prints
 per config the distribution of each seed's longest wait and longest handoff gap
 (the idle time after the last conflicting section, `max_handoff_gap_ms`, none
 for a lock's first acquisition) with the overtakes, the asks and the seeds in
@@ -4504,9 +4506,9 @@ move), a constant oscillator rate per node within `min(rate_budget_ppm,
 the cross-node compares take `M/2` until C7b), at most one suspend of 0.3 to 3
 s (a cluster only) and at most one reboot of a node (restart in 0.3 to 3 s on a
 new boot, its wall stepped meanwhile within the same bound; none where
-directories are delegated (`dirs`), where a node's restart wedges the run
-whatever the clocks, a liveness bug the mix found and does not stand for:
-PROGRESS). A configuration
+directories are delegated and locks are taken, where the root's restart leaves
+a lock waiter unanswered whatever the clocks, a liveness bug the mix found and
+does not stand for: plan 43 §7 C7a). A configuration
 that injects clock faults, skew, offsets or rates of its own (the C7-H1 and C7a
 configurations above) is left as it is; one that asserts exact timing or no
 seal sets `clock_faults: false` (`delegated-core-stall` and its variants,

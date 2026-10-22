@@ -56482,3 +56482,65 @@ effect in the log that the spec refused).
   configuration's runs change (test-only change, no code).
 - Verification: `cargo fmt --check`, `cargo clippy -p constellation-authority --test sim
   -- -D warnings`, the sim suite (release, 226 passed, 12 ignored).
+
+## Fix: a root ends a generation its takeover stranded at the log's cut (plan 43 C7a, commit 6's finding 1)
+
+**The wedge.** C7a's clock mix found, with a reboot, runs in delegating clusters where no
+op was answered for 540 simulated seconds (the sim's client cap): `delegated-holder-cut`
+seed 139, `locks-unlinked-delegated-hcrash-backup` 154 (on commit 6's trajectories; the
+rebase moved them). (`locks-delegated` 2400, reported with them, cannot be this
+mechanism: that configuration forms no backups, so nothing is stranded; it does not
+reproduce on main's trajectories, where a reboot in that configuration shows the lock
+finding below.) It is not
+a clock bug and not a restart bug as such. Node 2 is the delegate of `d1` and the root's
+backup. It has executed rows of its generation that the root never appended (the root is
+cut from S3 and then down). It takes the root over with the predecessor's backup tail, and
+the gate strands its own rows of the generation (`strand_for_takeover`, marked
+`deleg_stranded`): they replay by rid as root rows. Later, as the root, it ends the
+generation, and `end_generation` set the void cut to `cursor.max(stream_applied)` on the
+rule that a root that was the generation's delegate ships its own rows after the `Recall`.
+After a strand none of them stayed; the log's cut is the cursor, and every other replica
+reads it there at the `Recall`. So a client op of node 2 that depended on a stranded row
+was not lost to node 2 (`deps_lost` false, the op kept its deps) and was lost to the next
+root, which answered `Held`; the op was re-sent with the same deps every tick for good,
+and the ops behind it on the same keys stayed gated. A plain crash and restart of node 2
+(`delegated-holder-cut+crash2@2300:1200`: 32 of 2 000 seeds), or a suspend of it
+(`delegated-holder-cut` on main with the mix: seeds 945 and 974, no reboot at all),
+reproduces it.
+
+**The fix.** The cut of a generation the takeover stranded is the cursor
+(`own = mine.contains_key(gen) && !delegate_stranded(gen)`). History: the own-rows rule
+came with `5face1b` (2026-09-26), the strand mark with `96f4565`; `212b7ee` fixed the same
+disagreement for a deposed root's replay (seed 3585). Plan 43 C2's `RecallCut.through`
+is computed by the same rule; C3, which appends those rows instead of stranding them,
+removes the case. The mix draws reboots where directories are delegated again, except
+where locks are taken too (below). The sim gains `+crash<node>@<at_ms>:<restart_ms>`.
+
+**Found while restoring the reboot (open).** The root restarting in a delegating cluster
+whose clients take locks leaves a lock waiter unanswered for 60 s: nothing asks for the
+lease again, the delegate owner's delegation lapses and its lock answers name no owner
+(`NotOwner { 0 }`), the waiter keeps relearning from a lease that still names the restarted
+root, until a mutation's acquisition 60 s later (`locks-delegated` 222, 469, 784,
+`locks-delegated-production-ttl` 1224, `locks-delegated-writes` 207 with the mix's reboot,
+identical with and without the fix; a plain crash and restart reproduces it on main:
+`locks-delegated+crash1@4507:620` seed 222). Plan 43 §7 C7a tracks it; the mix draws no
+reboot where directories are delegated and locks are taken.
+
+**Tests (fail before).** Core `a_root_ending_a_generation_its_takeover_stranded_cuts_it_at_the_log`
+("a dependency on a stranded row of the generation is not lost at its own root"); sim
+`regression_a_delegate_backup_restarted_while_the_root_is_down_is_answered` (unclocked,
+seeds 36 and 73 of the crash variant: "a client op was never answered within 540s").
+
+**Evidence** (release, 6 threads, 2 000 seeds; failing sets):
+
+| configurations | before | after |
+|---|---|---|
+| `delegated-holder-cut` (main's mix) | [945, 974] | [] |
+| `delegated-holder-cut+crash2@2300:1200` (the mix, reboots drawn) | 32 seeds, all 540 s wedges | [] |
+| the 20 `delegated-*` and `locks-delegated*` sweep configurations, reboots drawn everywhere (before/after: the fix alone) | identical but `delegated-holder-cut` [945, 974] | `delegated-holder-cut` [] |
+| `delegated-holder-cut`, the five `locks-delegated*`, `locks-unlinked-delegated-hcrash-backup` (1 000), main vs this commit | identical but [945, 974] | — |
+
+With reboots drawn in the lock configurations, the fix changes nothing there: `locks-delegated`
+[222, 469, 784], `-production-ttl` [1224], `-writes` [207] before and after (the open lock
+finding); this commit keeps them unrebooted, so they sweep clean as on main.
+`delegated-core-stall-unlaned` fails every seed on both sides (its negative control).
