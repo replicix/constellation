@@ -44,8 +44,14 @@ feature, against the naive implementation it guards against).
   committed.
 - The standalone integrity fix "kernel lookup counts in the FUSE adapter"
   (this plan's R2, §4.4): must be committed before R5.
-- Coordinates with nothing else in flight. The only shared external
-  artefact is the `fuser` fork (a new, independent branch, §4.3).
+- Plan 42 (kernel FUSE race workarounds, K2–K6, F21, F2: committed). Its
+  attribute-reply rules apply to every plus entry (§4.7): A3's size arming
+  (`PageCacheTable::size_seen`), W3a's directory attribute TTL 0 (two TTLs
+  per entry, §4.3), and F21's attribute-reply marks with W3b's notice
+  (`crates/frontend-fuse/src/attrwatch.rs`), which this plan extends to
+  replies carrying many inodes (R6a).
+- The only shared external artefact is the `fuser` fork (a new,
+  independent branch, §4.3).
 
 ## 1. History: designed since phase 1, never served
 
@@ -337,8 +343,11 @@ one-branch-per-change rule), merged into `replicix`, adding
 `entry_valid`/`attr_valid` 0, zeroed `fuse_attr`, `d_ino = ino`,
 `d_type` from `kind`) and the `remaining_capacity()` backport, with unit
 tests for the encoding (fork `cargo test --lib`, with and without
-`--features io-uring`). One TTL for entry and attributes stays (constellation
-uses one for lookups too, `reply.rs:92`). Constellation's `Cargo.toml`
+`--features io-uring`). The branch also adds
+`ReplyDirectoryPlus::add_with_ttls(.., entry_ttl, attr_ttl, ..)`: plan 42
+W3a answers a directory's attributes with attribute TTL 0 and keeps the
+entry TTL (`ReplyEntry::entry_with_ttls` for lookups), and plus entries do
+the same; the low-level `DirEntryPlus::new` already takes both TTLs. Constellation's `Cargo.toml`
 `[patch]` rev moves to the new `replicix` merge.
 
 ### 4.4 Kernel references: the adapter counts lookups (R2, landed separately)
@@ -397,6 +406,17 @@ the intended ones; use whatever the fix landed with):
   corrected: the *frontend* keeps the lookup table, both partial forgets are
   named.
 
+**As landed (91591c6, 2026-10-14)**, R2 differs from the above in three
+points, kept by this plan: a `FORGET` of a node id never counted
+(`Unknown`, other than the root) is *kept*, not forwarded (a missed count
+is a bounded leak, never a reap), and a `FORGET` of more than was counted
+is a fourth outcome (`Underflow`, kept); `FUSE_BATCH_FORGET` stays fuser's
+default, which calls `forget` per node with its count (the fork does not
+export `ForgetOne`, so it cannot be overridden; the rule is the same); and
+an unreadable handoff rolls back to the image that wrote it
+(`roll_back_unread`) instead of being refused, so the first upgrade across
+an in-place handoff change is a rollback and then a remount.
+
 This plan adds one counting site: each plus entry handed with a node id
 (§4.7).
 
@@ -440,14 +460,18 @@ name-only entry. The page loop (names come from the listing,
    cannot occur. It costs one point read per name, reads the bytes the §P6
    encoding put there for this purpose, and never decodes attributes for
    names outside the page.
-4. **The entry** — `entry_out(&visible_attr(attr))` (`mod.rs:1196`): the
+4. **The entry** — `entry_out(&attr)` (as `lookup` answers: it applies
+   `visible_attr` only to `.`/`..`): the
    view's TTL, generation 0, and `note_reached` for confined views. A child
    that is the view root or `ROOT_INO` (impossible by construction) is
    emitted name-only defensively (K4: node id 1 is `-EIO`).
 
-Synthetic directories: each child's entry is `lookup_synthetic(dir, name)`
-(`crates/engine/src/view/synthetic.rs:220`), what a lookup answers there
-(snapshot mirrors: the frozen attributes; inactive nodes → name-only). The
+Synthetic directories: each child's entry is what a lookup answers there
+(snapshot mirrors: the frozen attributes; inactive nodes → name-only),
+built from the node `synthetic_entries` already returned and
+`synthetic_attr` — not by a per-name `lookup_synthetic`
+(`crates/engine/src/view/synthetic.rs:220`), which clones a mirror's frozen
+directory per call and would make a page O(n) per entry. The
 synthetic numbering already crosses a handover (`HandleTableSnapshot.
 synthetic`). `getattr`'s `dead_attr` fallback is not needed: a listed name is
 linked.
@@ -473,9 +497,15 @@ linked.
 - `DirPlusReply` (`reply.rs`, beside `DirReply`) implements `DirSink`:
   `add_entry(.., Some(e))` → `ReplyDirectoryPlus::add(ino, next, name,
   &e.attr.ttl, &fuse_attr(&e.attr), Generation(e.generation))` and, if it
-  fit, remembers `(ino, name, ttl)`; `None` (and plain `add`) →
+  fit, remembers `(ino, name, ttl)` — with `add_with_ttls(entry_ttl =
+  e.attr.ttl, attr_ttl = 0 for a directory under W3a)` (§4.3); before it
+  buffers the entry it records the F21 attribute-reply mark for the inode
+  (`attr_arrive` is taken when the request arrives) and writes W3b's
+  notice first if the mark calls for one (as `EntryReply` does); a pid-0
+  lister whose marks table is full gets that entry name-only; `None` (and plain `add`) →
   `add_name(ino, next, kind, name)`. **Accounting on success only:** in
-  `done(Ok)`, right before `reply.ok()`, it takes one kernel reference per
+  `done(Ok)`, right before `reply.ok()`, it arms A3 for each regular file
+  entry (`size_seen`), takes one kernel reference per
   remembered entry (`KernelRefs::took`) and records each name in
   `KernelEntries` (expiry now + TTL + `slack`); `done(Err)` accounts
   nothing (the contract guarantees no error after an entry was added,
@@ -548,7 +578,8 @@ already keyed `(parent, name)` (`crates/mtree/src/keys.rs`), so:
   full. No full read, no sort, no allocation of the listing: O(page). This
   applies to plain `READDIR` too (it fixes today's quadratic listing) and
   to scratch directories. New `Meta` read: `readdir_after(parent, after:
-  Option<&[u8]>, limit) -> Vec<DirEntry>` (plus a scratch twin), keeping
+  Option<&[u8]>, limit)` returning names as bytes (a non-UTF-8 name resumes
+  by its exact key; `Meta::readdir`'s names are lossy `String`s) (plus a scratch twin), keeping
   `require_dir`; `Meta::readdir` stays for its other callers.
 - **The cookie is a keyed hash of the name**: `dir_cookie(name) =
   (siphash13(k, name) >> 2) + 3` — the same `[3, 2^62 + 2]` range as today
@@ -559,7 +590,10 @@ already keyed `(parent, name)` (`crates/mtree/src/keys.rs`), so:
   maintainer, §9): under E2E from the master key (as the gossip seed is),
   otherwise from `FsMeta::gossip_secret`
   (`crates/store-s3/src/store.rs:88-104`), each with its own derivation
-  label (`readdir-cookie-v1`), so `meta.json` does not change. It is never
+  label (`readdir/cookie-v1`: under E2E the master-derived subkey
+  `dek("readdir/cookie-v1")`, the `/` keeping it apart from partition
+  names; otherwise `blake3::derive_key` over `gossip_secret`), so
+  `meta.json` does not change. It is never
   rotated: neither the master key nor `gossip_secret` changes for a
   filesystem's life (`fs passwd` only re-wraps the master, plan 24). There
   is no fallback: a non-E2E filesystem without a `gossip_secret` (created
@@ -646,6 +680,10 @@ already keyed `(parent, name)` (`crates/mtree/src/keys.rs`), so:
     id — it has no write session and no discard error events, so the
     per-handle checks (`lock_errors_reported`, `lock_publish_gate`) are
     skipped for a directory's stream id rather than failing it.
+    (As found when the coder spec was written: `Handles::take_error` and
+    `mark_seen` already ignore a handle the view never gave out, so a
+    stream id is treated as `Fh(0)` is today; what matters is that stream
+    ids never equal a file handle, which `DIR_FH_BIT` ensures.)
   - **Handover**: the open streams, each directory's page sequence and
     window, the pinned pages, and the stream-id counter cross with the
     view's handle table (`HandleTableSnapshot`,
@@ -1001,7 +1039,24 @@ Each milestone ends green on `cargo fmt`/`clippy -D warnings`/`cargo test
   why; if listing acceptance fails, the report says so and R3a/R3b are
   not shipped as is (never ship a regression, never loosen the bar).
 
-Order: R0, R1, R2 (verify), R3a, R3b, R4, R5, R6, R7, R8. R3a and R3b land
+- **R6a — attribute-reply marks of many inodes** (plan 42 F21). A task's
+  mark in `attrwatch` holds one inode and a new reply replaces it, so a
+  plus reply would leave only its last entry marked and W3b would miss the
+  notice for the others (race 2b). Marks become per task and reply with a
+  set of inodes; the bound counts inodes; a many-inode reply that finds
+  the table full is told so (its entry goes name-only) instead of writing
+  a notice per entry. Test: a reply marking three inodes of one task, a
+  change of the first gets its notice (fails with last-mark-wins).
+  Before R6.
+
+The coder spec places the conformance cases that need engine plus entries
+(`plus_entries_are_what_lookup_answers`, `a_plus_entry_is_a_reference`,
+`plus_of_a_subtree_view_stays_confined`) with R5 and
+`an_open_directory_resumes_after_its_deleted_names` with R3b: the engine
+target runs every kit case, and a case asserting only `Some` entries would
+be vacuous against an engine that ignores `plus`.
+
+Order: R0, R1, R2 (verify), R3a, R3b, R4, R5, R6a, R6, R7, R8. R3a and R3b land
 before any plus entry is served (plus pages need O(page) listings, and
 `fts`-style deletion must stay exact); R2 before R6.
 
@@ -1157,12 +1212,12 @@ Acceptance (R8, per host file system and kernel):
    bytes (≤ 10 B per listed name, never above the pin caps); with 10,000
    open directories within R0 + the caps; CPU per listed name for `ls -l`
    at most R0's.
-7. **Pins**: `rm -rf` of the 1M-entry directory under the
+6. **Pins**: `rm -rf` of the 1M-entry directory under the
    `readdir-huge-delete` pressure succeeds with zero `readdir_lost_cookies`;
    `releasedir` p99 under 1 ms; the handover with a pinned 1M-entry
    directory adds at most 1 s to the detach-to-serve gap (reported for
    10M).
-6. **Page cost**: per-page service time at 1M entries within 2× of that at
+7. **Page cost**: per-page service time at 1M entries within 2× of that at
    1k (O(page)); a cold resume at 10M is reported (one scan) and must not
    exceed the time of one R0 page at 10M.
 
@@ -1195,7 +1250,7 @@ Decide before the executor starts:
   measurements.
 - **Resolved — cookie key source** (§4.9): derived, never rotated — under
   E2E from the master key, otherwise from `gossip_secret`, each with its
-  own label (`readdir-cookie-v1`); no UUID fallback: a filesystem without a
+  own label (`readdir/cookie-v1`); no UUID fallback: a filesystem without a
   `gossip_secret` must be recreated. Accepted by the maintainer (no
   backwards compatibility).
 - **Resolved — `lookup`'s session wait drift**: the M6 table
@@ -1225,10 +1280,11 @@ Open, decided by measurement or later:
   handoff; bounded by the pin caps, measured in R8.
 - **`FOPEN_CACHE_DIR`** follow-up (§4.9, K10).
 - **Kernel attribute race**: plus installs attributes through the same
-  `fuse_change_attributes` path as `LOOKUP`/`GETATTR` (K9), so it is
-  exposed to, and fixed by, the proposed upstream kernel patch for the FUSE
-  attribute race; R8's xcheckfs runs must be compared with that race's
-  known findings, not counted as plus findings.
+  `fuse_change_attributes` path as `LOOKUP`/`GETATTR` (K9). Plan 42 now
+  works around races 2a/2b in tree (W3a, W3b, switched off per detected
+  kernel fix 0002/0003) and plus entries go through both (§4.7), so with
+  the workarounds on a stale plus attribute is a plus finding; R8's
+  xcheckfs runs record the W3a/W3b and kernel-fix settings they ran with.
 - **Over-count leak**: an entry reply the kernel never processes keeps its
   inode counted until the session ends (§4.4); bounded and never a reap.
 
