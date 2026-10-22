@@ -1496,7 +1496,7 @@ impl Core {
         self.lk.horizon_held = keep;
         for id in dropped {
             if let Some(g) = replica.locks().get(id) {
-                self.lock_grant_done(now, id, g.ino, false, replica, out);
+                self.lock_grant_done(now, id, g.ino, replica, out);
             }
         }
         self.lock_horizon_write(out);
@@ -3232,7 +3232,7 @@ impl Core {
             .is_some_and(|g| g.node == from && g.ino == ino)
         {
             self.stats.lock_recalls_released += 1;
-            self.lock_grant_done(now, grant, ino, false, replica, out);
+            self.lock_grant_done(now, grant, ino, replica, out);
             return;
         }
         // The node released an id this owner has since replaced: a
@@ -3254,7 +3254,7 @@ impl Core {
                 self.stats.lock_released_superseded += 1;
                 if from == self.cfg.node_id {
                     self.stats.lock_recalls_released += 1;
-                    self.lock_grant_done(now, g.id, ino, false, replica, out);
+                    self.lock_grant_done(now, g.id, ino, replica, out);
                 } else {
                     self.lock_recall(now, g, replica, out);
                 }
@@ -3280,25 +3280,33 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let Some(g) = replica.locks().get(id) else {
-            // Replaced or released meanwhile: whatever waited on it is
-            // served now (the sim found a waiter stranded here).
-            if let Some(r) = self.lk.recalls.remove(&id) {
-                if let Some(req) = r.req {
-                    self.lk.recall_by_req.remove(&req);
+        // Plan 41 L1: is the record expired, and gone if it is, in one step
+        // of the table, on the table's own clock. Another writer extends a
+        // record (the lock lane), so a read here and a forget below would
+        // forget a window renewed in between; and what this step goes on to
+        // do (floors, barriers) is decided on the record this call took out.
+        let g = match replica.locks().forget_outwaited_if_expired(id, now) {
+            Some(Ok(g)) => g,
+            Some(Err(until)) => {
+                // Renewed since: wait again.
+                let timer = self.set_timer_wait(until, Timer::LockGrantExpiry(id), out);
+                if let Some(r) = self.lk.recalls.get_mut(&id) {
+                    r.timer = timer;
                 }
-                self.lock_serve_waiters(now, r.ino, replica, out);
+                return;
             }
-            return;
+            None => {
+                // Replaced or released meanwhile: whatever waited on it is
+                // served now (the sim found a waiter stranded here).
+                if let Some(r) = self.lk.recalls.remove(&id) {
+                    if let Some(req) = r.req {
+                        self.lk.recall_by_req.remove(&req);
+                    }
+                    self.lock_serve_waiters(now, r.ino, replica, out);
+                }
+                return;
+            }
         };
-        if g.until > now.wait {
-            // Renewed since: wait again.
-            let timer = self.set_timer_wait(g.until, Timer::LockGrantExpiry(id), out);
-            if let Some(r) = self.lk.recalls.get_mut(&id) {
-                r.timer = timer;
-            }
-            return;
-        }
         self.stats.lock_recalls_expired += 1;
         // A grant served from the queue that its node never renewed nor
         // released: it went unused (the push was lost, or found no op).
@@ -3326,25 +3334,35 @@ impl Core {
             ino = g.ino,
             "a lock grant's recall went unanswered; outwaited it (TTL + margin)"
         );
-        self.lock_grant_done(now, id, g.ino, true, replica, out);
+        self.lock_grant_ended(now, id, g.ino, replica, out);
     }
 
-    /// `outwaited`: the grant's holder never released it (plan 43 C7-F F-c:
-    /// a settled record is then remembered as lapsed).
+    /// The grant was released or replaced: gone from the table, and what
+    /// waited on it is served.
     fn lock_grant_done(
         &mut self,
         now: Now,
         id: GrantId,
         ino: Ino,
-        outwaited: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        if outwaited {
-            replica.locks().forget_outwaited(id);
-        } else {
-            replica.locks().forget(id);
-        }
+        replica.locks().forget(id);
+        self.lock_grant_ended(now, id, ino, replica, out);
+    }
+
+    /// The rest of a grant's end, after its record left the table (by
+    /// [`LockTables::forget`] for a release, by
+    /// [`LockTables::forget_outwaited_if_expired`] for an outwait, which
+    /// remembers a settled record as lapsed, plan 43 C7-F F-c).
+    fn lock_grant_ended(
+        &mut self,
+        now: Now,
+        id: GrantId,
+        ino: Ino,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
         self.lk.unproven.remove(&id);
         self.lk.mirror_dirty = true;
         if let Some(r) = self.lk.recalls.remove(&id) {
@@ -3771,8 +3789,16 @@ impl Core {
                 return;
             } else if h.until <= now.honour {
                 // Lapsed: it is fenced already and cannot be renewed;
-                // drop it (the owner outwaits it) and ask afresh.
-                replica.locks().drop_held(ino, h.id);
+                // drop it (the owner outwaits it) and ask afresh. Plan 41
+                // L1: dropped only if its window is over *now*, in one step
+                // of the table: a window renewed since the look above (the
+                // lock lane's) stays, and so does a grant that began
+                // lapsing in between (another thread's look), whose park
+                // the renewal tick resolves. Either way: look again.
+                if !replica.locks().drop_held_if_lapsed(ino, h.id, now) {
+                    self.set_timer_wait(now.wait.plus(10), Timer::LockRetry(op), out);
+                    return;
+                }
             } else if h.recalled || h.releasing {
                 if !blocking && !replica.locks().local_idle(ino) {
                     self.stats.lock_would_block += 1;
@@ -4256,7 +4282,7 @@ impl Core {
             // after the push's install).
             replica
                 .locks()
-                .renewed(ino, id, id, mode, sent, ttl, margin, false, now);
+                .renewed(ino, id, id, mode, sent, ttl, margin, false, from, now);
             self.stats.lock_late_replies_installed += 1;
             // The grant has a new renewal point and no renewal in flight
             // (`renewed` clears it): the tick must come by then. Armed at
@@ -4282,6 +4308,7 @@ impl Core {
             installed: now.honour,
             lapsing: None,
             written: false,
+            route: Some(from),
         };
         if matches!(
             replica.locks().install_held(ino, held),
@@ -4625,6 +4652,7 @@ impl Core {
                     installed: now.honour,
                     lapsing: None,
                     written: false,
+                    route: Some(from),
                 };
                 let ino = o.ino;
                 let waited = now.wait.since(o.created).max(0) as u64;
@@ -5155,6 +5183,7 @@ impl Core {
                     ttl_ms as i64,
                     self.lock_margin_ms(),
                     recalled,
+                    from,
                     now,
                 );
                 self.stats.lock_renewals += 1;
@@ -5196,6 +5225,7 @@ impl Core {
                     self.lease.cached_holder = None;
                 }
                 self.lock_note_not_owner(from, ino, owner, replica);
+                replica.locks().clear_route(ino, id, from);
                 replica.locks().renewal_failed(ino, id);
             }
         }
@@ -5706,7 +5736,11 @@ impl Core {
         if self.lk.tenure_floor_due && self.lk.tenure_waiting.is_none() {
             self.lk.tenure_minted.insert(gen);
         }
-        let moved = replica.locks().take_where(|ino| {
+        // The predicate reads the store (an uncached read can take as long
+        // as a stalled device): it runs outside the tables' mutex, which
+        // every FUSE fence check and every renewal takes
+        // (`LockTables::take_where_outside`, plan 41 L1b).
+        let moved = replica.locks().take_where_outside(|ino| {
             let keys = Self::read_keys(ino, None);
             matches!(
                 replica.resolve_ownership(&keys),
@@ -5913,7 +5947,10 @@ impl Core {
             }
             if let Some(e) = replica.locks().get(g.id) {
                 if e.node == g.node && e.ino == g.ino && e.until < until {
-                    replica.locks().install(Grant { until, ..e });
+                    // Never sooner than the record's end *now* (plan 41
+                    // L1): `e` was read above, and the owner's own record
+                    // of this node may have been extended since.
+                    replica.locks().install_keeping_later(Grant { until, ..e });
                 }
                 continue;
             }
@@ -6347,7 +6384,7 @@ impl Core {
         self.lk.moved_seen.remove(&gen);
         let mut taken = replica.locks().take_by_gen(gen);
         let by_tag = taken.len();
-        taken.extend(replica.locks().take_where(|ino| {
+        taken.extend(replica.locks().take_where_outside(|ino| {
             let keys = Self::read_keys(ino, None);
             matches!(
                 replica.resolve_ownership(&keys),

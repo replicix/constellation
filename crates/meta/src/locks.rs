@@ -456,6 +456,12 @@ pub struct HeldGrant {
     /// Plan 43 C7-F F-c: a write-like op ran on the inode under this grant
     /// (a hint that unpublished data may be pinned by it).
     pub written: bool,
+    /// Plan 41 L1: the node that granted this grant or answered the last
+    /// renewal of it ([`LockTables::renewed`]) — where the next one goes
+    /// without the core routing it again (the lock lane's, at a remote
+    /// owner). Cleared when that node answered `NotOwner`
+    /// ([`LockTables::clear_route`]); `None`: not known, the core routes.
+    pub route: Option<u64>,
 }
 
 /// A held grant whose window ended while it pins something (see
@@ -1366,6 +1372,99 @@ pub struct LockTables {
     no_check_at_write: AtomicBool,
     /// Tests only: [`LockTables::set_settle_for_tests`].
     no_settle: AtomicBool,
+    /// Tests only: [`LockTables::set_gap_hook_for_tests`].
+    #[cfg(any(test, feature = "test-util"))]
+    gap_hook: Mutex<Option<GapHook>>,
+}
+
+/// See [`LockTables::set_gap_hook_for_tests`].
+#[cfg(any(test, feature = "test-util"))]
+pub type GapHook = std::sync::Arc<dyn Fn(&LockTables, &'static str) + Send + Sync>;
+
+/// The tables' mutex guard. In debug and test builds it counts the guards
+/// this thread holds ([`assert_no_guard`]): nothing under the tables' mutex
+/// may touch the store (plan 41 L1), because the mutex is every FUSE fence
+/// check's and, with the lane, every renewal's, and a store access can take
+/// as long as a stalled device. In release builds it is the plain guard.
+#[cfg(debug_assertions)]
+struct Guard<'a>(std::sync::MutexGuard<'a, Inner>);
+
+#[cfg(not(debug_assertions))]
+type Guard<'a> = std::sync::MutexGuard<'a, Inner>;
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static GUARDS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(debug_assertions)]
+impl std::ops::Deref for Guard<'_> {
+    type Target = Inner;
+    fn deref(&self) -> &Inner {
+        &self.0
+    }
+}
+
+#[cfg(debug_assertions)]
+impl std::ops::DerefMut for Guard<'_> {
+    fn deref_mut(&mut self) -> &mut Inner {
+        &mut self.0
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for Guard<'_> {
+    fn drop(&mut self) {
+        GUARDS.with(|n| n.set(n.get() - 1));
+    }
+}
+
+/// Debug and test builds: panics if this thread holds a [`LockTables`]
+/// guard. The store's transaction entry points ([`crate::store`]'s
+/// `GatedDb::write_tx` and `read_tx`) call it with `what` naming the entry:
+/// a store access under the tables' mutex is a bug (plan 41 L1b). Nothing in
+/// release builds.
+#[inline]
+pub(crate) fn assert_no_guard(what: &str) {
+    #[cfg(debug_assertions)]
+    GUARDS.with(|n| {
+        assert!(
+            n.get() == 0,
+            "{what} called while this thread holds the lock tables' mutex (plan 41 L1b: \
+             nothing under it may touch the store)"
+        )
+    });
+    #[cfg(not(debug_assertions))]
+    let _ = what;
+}
+
+/// The host clock (µs) at a token check that let an op through, when the
+/// evidence line ([`log_executed`]) is wanted at all — read inside the
+/// table's critical section, so it stamps the check; the line is written
+/// after the section.
+fn executed_stamp() -> Option<i64> {
+    tracing::enabled!(target: "constellation::token_exec", tracing::Level::DEBUG).then(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros() as i64)
+    })
+}
+
+/// Evidence for a harness (off by default): when each grant last let an op
+/// through here, on this node's clock — none may after another node got the
+/// lock. In the message, not as fields: a harness parses it from logs that
+/// style field names. `host_us` is the host clock at the check
+/// ([`executed_stamp`]), so a harness can tell which clock step (plan 43
+/// C7-H1) was in force for `at_ms` instead of guessing from the line's time.
+fn log_executed(tag: &LockTag, now_ms: i64, host_us: i64) {
+    for t in &tag.0 {
+        tracing::debug!(
+            target: "constellation::token_exec",
+            "tagged op executed minter={} seq={} at_ms={now_ms} host_us={host_us}",
+            t.grant.node,
+            t.grant.seq,
+        );
+    }
 }
 
 /// See `Inner::doubted`.
@@ -1413,8 +1512,15 @@ pub enum LocalOutcome {
 }
 
 impl LockTables {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> Guard<'_> {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(debug_assertions)]
+        {
+            GUARDS.with(|n| n.set(n.get() + 1));
+            Guard(g)
+        }
+        #[cfg(not(debug_assertions))]
+        g
     }
 
     /// After a change to `held` or `taint` (under the table lock).
@@ -1605,6 +1711,14 @@ impl LockTables {
 
     /// Make a grant; `me` is this sequencer's id (the grant's minter),
     /// `gen` the generation it is made under (0: the root).
+    ///
+    /// The record of `node` on `ino` it replaces (a re-affirmation, or an
+    /// expired one) is read here, in the same critical section: the new
+    /// record never ends sooner than it (plan 41 L1). A caller that read
+    /// the old record earlier and took the later end of the two itself
+    /// replaced a record a second writer had extended since (the lock lane
+    /// extends an owner's own records) with a shorter one, inside the
+    /// window its holder honours.
     pub fn grant(
         &self,
         me: u64,
@@ -1619,7 +1733,15 @@ impl LockTables {
             seq: self.next_seq.fetch_add(1, Ordering::Relaxed) + 1,
         };
         let mut g = self.lock();
-        g.grants.retain(|_, e| !(e.node == node && e.ino == ino));
+        let mut until = until;
+        g.grants.retain(|_, e| {
+            if e.node == node && e.ino == ino {
+                until = until.max(e.until);
+                false
+            } else {
+                true
+            }
+        });
         g.grants.insert(
             id,
             Grant {
@@ -1736,7 +1858,10 @@ impl LockTables {
     }
 
     pub fn get(&self, id: GrantId) -> Option<Grant> {
-        self.lock().grants.get(&id).copied()
+        let got = self.lock().grants.get(&id).copied();
+        #[cfg(any(test, feature = "test-util"))]
+        self.gap("get");
+        got
     }
 
     /// Whether this table ended `id` (released, or outwaited) and still
@@ -1760,6 +1885,30 @@ impl LockTables {
     ) -> Option<(LockMode, bool)> {
         let mut g = self.lock();
         let e = g.grants.get_mut(&id).filter(|e| e.node == node)?;
+        e.until = e.until.max(until);
+        e.confirmed_ms = e.confirmed_ms.min(now.wall.0);
+        Some((e.mode, e.recalled))
+    }
+
+    /// [`Self::extend`] for a record that is still live: `None` unless
+    /// `id` is a record of `node` that ends after *now* (this table's
+    /// clock, `fallback` while none is set; read inside the critical
+    /// section). A second writer's extension (the lock lane) must never
+    /// revive what the core may already have expired and outwaited, so
+    /// it extends only what is live at the instant it extends.
+    pub fn extend_live(
+        &self,
+        id: GrantId,
+        node: u64,
+        until: WaitMs,
+        fallback: Now,
+    ) -> Option<(LockMode, bool)> {
+        let mut g = self.lock();
+        let now = g.now_or(fallback);
+        let e = g
+            .grants
+            .get_mut(&id)
+            .filter(|e| e.node == node && e.until > now.wait)?;
         e.until = e.until.max(until);
         e.confirmed_ms = e.confirmed_ms.min(now.wall.0);
         Some((e.mode, e.recalled))
@@ -1806,6 +1955,39 @@ impl LockTables {
             }
         }
         gone
+    }
+
+    /// The expiry timer of grant `id` fired: if the record is still expired
+    /// *now*, end it as [`Self::forget_outwaited`] does and return it
+    /// (`Some(Ok)`); if it was extended meanwhile, leave it and say until
+    /// when (`Some(Err(until))`: arm the timer again); `None`: no such
+    /// record (released, replaced, or dropped as expired by a token check).
+    ///
+    /// One critical section, with `now` read inside it (this table's clock,
+    /// `fallback` while none is set): a second writer extending the record
+    /// (the lock lane, plan 41) either lands before it, and the record is
+    /// kept, or after it, and finds no record to extend. Reading the record
+    /// first and forgetting it by id later (what the core did) forgot a
+    /// record extended in between.
+    pub fn forget_outwaited_if_expired(
+        &self,
+        id: GrantId,
+        fallback: Now,
+    ) -> Option<Result<Grant, WaitMs>> {
+        #[cfg(any(test, feature = "test-util"))]
+        self.gap("forget_if_expired");
+        let mut g = self.lock();
+        let now = g.now_or(fallback);
+        let e = *g.grants.get(&id)?;
+        if e.until > now.wait {
+            return Some(Err(e.until));
+        }
+        g.grants.remove(&id);
+        g.note_ended(id, e.until);
+        if e.settled {
+            g.remember_lapsed(e);
+        }
+        Some(Ok(e))
     }
 
     /// `new` replaced `old` of the same node while `old` was live (see
@@ -2036,7 +2218,13 @@ impl LockTables {
             return Ok(());
         }
         let mut g = self.lock();
-        self.judge(&mut g, tag, now, true)
+        let verdict = self.judge(&mut g, tag, now, true);
+        let stamp = verdict.is_ok().then(executed_stamp).flatten();
+        drop(g);
+        if let Some(host_us) = stamp {
+            log_executed(tag, now.wall.0, host_us);
+        }
+        verdict
     }
 
     /// F1, the token *at the write*: [`Self::check_tag`] on this table's
@@ -2066,9 +2254,12 @@ impl LockTables {
         let mut g = self.lock();
         let now = g.now_or(checked);
         let now_ms = now.wall.0;
+        // Nothing is logged under the guard (plan 41 L1b): the verdict and
+        // the host stamp are taken inside it, the lines written after it.
         match self.judge(&mut g, tag, now, false) {
             Err(t) => {
                 g.stats.token_rejections_at_write += 1;
+                drop(g);
                 tracing::info!(
                     target: "constellation::locks",
                     minter = t.grant.node,
@@ -2086,6 +2277,11 @@ impl LockTables {
                     e.1 = e.1.max(t.until_ms);
                 }
                 self.pinned.fetch_add(tag.0.len(), Ordering::SeqCst);
+                let stamp = executed_stamp();
+                drop(g);
+                if let Some(host_us) = stamp {
+                    log_executed(tag, now_ms, host_us);
+                }
                 Ok(())
             }
         }
@@ -2168,6 +2364,33 @@ impl LockTables {
     /// See [`Self::set_settle_for_tests`].
     pub(crate) fn settles(&self) -> bool {
         !self.no_settle.load(Ordering::Relaxed)
+    }
+
+    /// Tests only: `hook(tables, point)` runs, on the calling thread and with no
+    /// table lock held, at the points where a two-step sequence of the core
+    /// has a gap another writer can use — after [`Self::get`] and
+    /// [`Self::held`] return, and before the atomic primitives
+    /// ([`Self::forget_outwaited_if_expired`],
+    /// [`Self::drop_held_if_lapsed`]) take the lock (`"get"`, `"held"`,
+    /// `"forget_if_expired"`, `"drop_held_if_lapsed"`). A test that lets a
+    /// second writer's extension land there fails the sequence that decides
+    /// on the earlier read and passes the primitive that reads inside its
+    /// critical section.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_gap_hook_for_tests(&self, hook: Option<GapHook>) {
+        *self.gap_hook.lock().unwrap_or_else(|e| e.into_inner()) = hook;
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    fn gap(&self, point: &'static str) {
+        let hook = self
+            .gap_hook
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook(self, point);
+        }
     }
 
     /// The clock [`Self::check_tag_at_write`] reads: the daemon's
@@ -2286,28 +2509,7 @@ impl LockTables {
                 g.stats.token_rejections += 1;
                 Err(t)
             }
-            None => {
-                // Evidence for a harness (off by default): when each grant
-                // last let an op through here, on this node's clock — none
-                // may after another node got the lock.
-                for t in &tag.0 {
-                    // In the message, not as fields: a harness parses it
-                    // from logs that style field names.
-                    tracing::debug!(
-                        target: "constellation::token_exec",
-                        "tagged op executed minter={} seq={} at_ms={now_ms} host_us={host_us}",
-                        t.grant.node,
-                        t.grant.seq,
-                        // The host clock at the check, so a harness can tell
-                        // which clock step (plan 43 C7-H1) was in force for
-                        // `at_ms` instead of guessing from the line's time.
-                        host_us = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |d| d.as_micros() as i64),
-                    );
-                }
-                Ok(())
-            }
+            None => Ok(()),
         }
     }
 
@@ -2342,7 +2544,64 @@ impl LockTables {
         taken
     }
 
+    /// Every grant record and every lapsed memory, as `(id, inode)`: the
+    /// snapshot [`Self::take_ids`] works from.
+    pub fn snapshot_inos(&self) -> Vec<(GrantId, u64)> {
+        let g = self.lock();
+        g.grants
+            .values()
+            .map(|e| (e.id, e.ino))
+            .chain(g.lapsed.values().flatten().map(|e| (e.id, e.ino)))
+            .collect()
+    }
+
+    /// Remove and return the grants among `ids` that are still here, and
+    /// forget the lapsed memories among them (as [`Self::take_where`] does
+    /// for the inodes it takes). A grant installed after the caller's
+    /// snapshot is not in `ids` and stays: the core's next event handles it,
+    /// as it would one installed a moment later.
+    pub fn take_ids(&self, ids: &std::collections::HashSet<GrantId>) -> Vec<Grant> {
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let mut g = self.lock();
+        let taken: Vec<Grant> = g
+            .grants
+            .values()
+            .filter(|e| ids.contains(&e.id))
+            .copied()
+            .collect();
+        for t in &taken {
+            g.grants.remove(&t.id);
+        }
+        g.supersede_where(|e| ids.contains(&e.id));
+        taken
+    }
+
+    /// [`Self::take_where`] for a predicate that is not store-free or not
+    /// cheap (it reads the store: `resolve_ownership`): the predicate runs
+    /// *outside* the table's mutex, once per inode of a snapshot
+    /// ([`Self::snapshot_inos`]), and [`Self::take_ids`] takes what it
+    /// chose. Nothing of the table is blocked for as long as the store
+    /// takes (plan 41 L1b; on a stalled device an uncached read blocked
+    /// every FUSE fence check and every renewal of the lane behind the
+    /// mutex).
+    pub fn take_where_outside(&self, under: impl Fn(u64) -> bool) -> Vec<Grant> {
+        let snapshot = self.snapshot_inos();
+        let mut verdict: std::collections::HashMap<u64, bool> = std::collections::HashMap::new();
+        let ids: std::collections::HashSet<GrantId> = snapshot
+            .into_iter()
+            .filter(|(_, ino)| *verdict.entry(*ino).or_insert_with(|| under(*ino)))
+            .map(|(id, _)| id)
+            .collect();
+        self.take_ids(&ids)
+    }
+
     /// Remove and return the grants whose inode satisfies `under`.
+    ///
+    /// `under` runs under the table's mutex: it must be store-free and
+    /// cheap. A predicate that reads the store goes through
+    /// [`Self::take_where_outside`].
     pub fn take_where(&self, under: impl Fn(u64) -> bool) -> Vec<Grant> {
         let mut g = self.lock();
         let taken: Vec<Grant> = g
@@ -2406,7 +2665,10 @@ impl LockTables {
     // ------------------------------------------------------ node: grants
 
     pub fn held(&self, ino: u64) -> Option<HeldGrant> {
-        self.lock().held.get(&ino).copied()
+        let got = self.lock().held.get(&ino).copied();
+        #[cfg(any(test, feature = "test-util"))]
+        self.gap("held");
+        got
     }
 
     pub fn held_all(&self) -> Vec<(u64, HeldGrant)> {
@@ -2680,6 +2942,36 @@ impl LockTables {
         }
     }
 
+    /// [`Self::drop_held`] for a window that is over *now*: one critical
+    /// section, `now` read inside it (this table's clock, `fallback` while
+    /// none is set). `true`: `id` is not held on `ino` any more (dropped
+    /// here, or already gone or replaced); `false`: it is held still — its
+    /// window was extended since the caller looked (a second writer's
+    /// renewal, plan 41), or it is *lapsing* (parked, resolved by the renewal
+    /// tick, [`Self::lapse_tick`]) — and nothing was changed: the caller
+    /// looks again later. Dropping by id after reading the window (what the
+    /// core did) dropped a window renewed in between.
+    pub fn drop_held_if_lapsed(&self, ino: u64, id: GrantId, fallback: Now) -> bool {
+        #[cfg(any(test, feature = "test-util"))]
+        self.gap("drop_held_if_lapsed");
+        let mut g = self.lock();
+        let now = g.now_or(fallback);
+        match g.held.get(&ino).copied() {
+            Some(h) if h.id == id => {
+                if h.until > now.honour || h.lapsing.is_some() {
+                    return false;
+                }
+                g.held.remove(&ino);
+                g.tombstone(id);
+                g.taint(ino);
+                g.capture(ino, h.until);
+                self.track(&g);
+                true
+            }
+            _ => true,
+        }
+    }
+
     pub fn drop_held_any(&self, ino: u64) -> Option<HeldGrant> {
         let mut g = self.lock();
         let h = g.held.remove(&ino);
@@ -2784,6 +3076,33 @@ impl LockTables {
         due
     }
 
+    /// [`Self::due_renewals`] for the lock lane (plan 41): a `renewing` mark
+    /// older than `stale_ms` (honour clock) counts as none — the renewal it
+    /// stood for is lost or still stuck behind a stalled core, and the lane
+    /// asks again — and a lapsing grant is never returned (a late renewal
+    /// is an *add*, the core's).
+    pub fn due_renewals_lane(&self, now: Now, stale_ms: i64) -> Vec<(u64, HeldGrant)> {
+        let now = now.honour;
+        let budget = self.first_use_budget_ms();
+        let mut g = self.lock();
+        let mut due = Vec::new();
+        let Inner { held, local, .. } = &mut *g;
+        for (ino, h) in held.iter_mut() {
+            let pinned = local.get(ino).is_some_and(|v| !v.is_empty());
+            let marked = h.renewing.is_some_and(|t| now.since(t) < stale_ms);
+            if h.until > now
+                && now >= h.renew_at
+                && !marked
+                && h.lapsing.is_none()
+                && Self::renewable(h, pinned, now, budget)
+            {
+                h.renewing = Some(now);
+                due.push((*ino, *h));
+            }
+        }
+        due
+    }
+
     /// The earliest renewal point among the grants [`Self::due_renewals`]
     /// would renew (honoured, no renewal in flight, renewable); `None`
     /// when there is none. The renewal tick is armed from this alone: a
@@ -2828,6 +3147,7 @@ impl LockTables {
         ttl_ms: i64,
         margin_ms: i64,
         recalled: bool,
+        from: u64,
         now: Now,
     ) {
         let mut g = self.lock();
@@ -2837,6 +3157,7 @@ impl LockTables {
             .filter(|h| h.id == id || h.id == now_id)
         {
             h.renewing = None;
+            h.route = Some(from);
             h.until = h.until.max(HonourMs(sent.0 + ttl_ms - margin_ms));
             h.renew_at = h.renew_at.max(renew_point(sent, ttl_ms, margin_ms));
             h.recalled |= recalled;
@@ -2866,6 +3187,93 @@ impl LockTables {
                     .max(now.wait.0.saturating_sub(l.at.0).max(0) as u64);
             }
             self.track(&g);
+        }
+    }
+
+    /// Renew this node's own grant `id` on `ino` (this node, `me`, is the
+    /// root's owner and the holder both): the owner record and the held
+    /// window in **one** critical section, with `now` read inside it (this
+    /// table's clock, `fallback` while none is set). The lock lane's
+    /// primitive (plan 41): a second writer to both, which never ends or
+    /// shortens anything and never adds a record.
+    ///
+    /// Renews only a grant the core itself would renew now: the owner
+    /// record is `me`'s, of the root (`gen == 0`), live on the wait clock,
+    /// and its mode covers the held grant's (a weaker record is not the
+    /// grant, `Core::lock_renew_one`); the held grant has this id, is
+    /// honoured, [`Self::renewable`], not lapsing, not being released.
+    /// `ttl = min(lock_ttl_ms, ttl_cap(now))` must be positive. The caller's
+    /// `ttl_cap` runs under the table's mutex: it reads a mirrored fact and
+    /// nothing slow. Then the owner record ends at `max(old, now.wait + ttl +
+    /// margin)` ([`Self::extend`]) and the held window as
+    /// [`Self::renewed`] extends it for a renewal sent at `now.honour`.
+    /// `true`: renewed; `false`: nothing changed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn renew_own(
+        &self,
+        ino: u64,
+        id: GrantId,
+        me: u64,
+        ttl_cap: impl FnOnce(Now) -> i64,
+        lock_ttl_ms: i64,
+        margin_ms: i64,
+        fallback: Now,
+    ) -> bool {
+        let budget = self.first_use_budget_ms();
+        let mut g = self.lock();
+        let now = g.now_or(fallback);
+        let pinned = g.local.get(&ino).is_some_and(|v| !v.is_empty());
+        let Some(h) = g.held.get(&ino).copied().filter(|h| h.id == id) else {
+            return false;
+        };
+        if h.until <= now.honour
+            || h.releasing
+            || h.lapsing.is_some()
+            || !Self::renewable(&h, pinned, now.honour, budget)
+        {
+            return false;
+        }
+        let ok = g
+            .grants
+            .get(&id)
+            .is_some_and(|e| e.node == me && e.gen == 0 && e.until > now.wait && e.mode >= h.mode);
+        if !ok {
+            return false;
+        }
+        let ttl = lock_ttl_ms.min(ttl_cap(now));
+        if ttl <= 0 {
+            return false;
+        }
+        let sent = now.honour;
+        let end = now.wait.plus((ttl + margin_ms).max(0) as u64);
+        let mut recalled = false;
+        if let Some(e) = g.grants.get_mut(&id) {
+            e.until = e.until.max(end);
+            e.confirmed_ms = e.confirmed_ms.min(now.wall.0);
+            recalled = e.recalled;
+        }
+        if let Some(h) = g.held.get_mut(&ino) {
+            h.renewing = None;
+            h.route = Some(me);
+            h.until = h.until.max(HonourMs(sent.0 + ttl - margin_ms));
+            h.renew_at = h.renew_at.max(renew_point(sent, ttl, margin_ms));
+            h.recalled |= recalled;
+        }
+        g.stats.renewals += 1;
+        self.track(&g);
+        true
+    }
+
+    /// `owner` answered a renewal of `id` on `ino` `NotOwner`: it is no
+    /// longer where renewals go ([`HeldGrant::route`]).
+    pub fn clear_route(&self, ino: u64, id: GrantId, owner: u64) {
+        let mut g = self.lock();
+        if let Some(h) = g
+            .held
+            .get_mut(&ino)
+            .filter(|h| h.id == id && h.route == Some(owner))
+        {
+            h.route = None;
         }
     }
 
@@ -2914,6 +3322,14 @@ impl LockTables {
     /// others that have no renewal in flight are returned, marked renewing
     /// at `now`, for a **late** renewal to the owner. `gave_up`: how many
     /// gave up now.
+    ///
+    /// One critical section (plan 41 L1): each window is read inside it and
+    /// ended or marked in it, so a second writer's extension (the lock lane)
+    /// lands before the tick looks, and the grant is honoured, or after the
+    /// tick has dropped or marked it, and the lane refuses a grant that is
+    /// not honoured ([`Self::renew_own`]). `now` is the caller's reading,
+    /// older than the table's when the step waited: that only makes fewer
+    /// windows look over, never more.
     pub fn lapse_tick(&self, now: Now) -> LapseTick {
         // The estimate's offset follows the clocks at every tick: `honour −
         // wait` grows with a suspend, a forward step and the oscillator's
@@ -3826,6 +4242,14 @@ impl crate::Meta {
         *self.db.wait_hook.lock().unwrap_or_else(|e| e.into_inner()) = hook;
     }
 
+    /// Tests only (`test-util`): `hook` runs on every thread about to open a
+    /// read transaction on this store, before it does — where a read that
+    /// went to a stalled device is parked.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_read_hook_for_tests(&self, hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
+        *self.db.read_hook.lock().unwrap_or_else(|e| e.into_inner()) = hook;
+    }
+
     pub fn settle_tagged_writes(&self) -> bool {
         if !self.locks.settles() || !self.locks.unsettled_writes() {
             return false;
@@ -3876,6 +4300,7 @@ mod tests {
             installed: HonourMs(0),
             lapsing: None,
             written: false,
+            route: None,
         }
     }
 
@@ -4679,6 +5104,7 @@ mod tests {
             10_000,
             0,
             true,
+            1,
             Now::same(0),
         );
         // Past it: not renewed, and the tick's sweep unpins it.
@@ -4824,6 +5250,7 @@ mod tests {
             100,
             10,
             false,
+            1,
             Now::same(0),
         );
         assert_eq!(t.held(7).unwrap().until.0, 150);
@@ -4854,6 +5281,7 @@ mod tests {
             1_000,
             10,
             false,
+            1,
             Now::same(0),
         );
         let now = t.held(7).unwrap();
@@ -4869,6 +5297,7 @@ mod tests {
             1_000,
             10,
             false,
+            1,
             Now::same(0),
         );
         assert_eq!(t.held(7).unwrap().until.0, 1_050, "not this grant's");
@@ -4924,6 +5353,7 @@ mod idle_tests {
             installed: HonourMs(0),
             lapsing: None,
             written: false,
+            route: None,
         };
         t.install_held(7, h);
         assert!(
@@ -4967,6 +5397,7 @@ mod supersede_tests {
             installed: HonourMs(0),
             lapsing: None,
             written: false,
+            route: None,
         }
     }
 
@@ -5100,6 +5531,7 @@ mod token_tests {
             installed: HonourMs(0),
             lapsing: None,
             written: false,
+            route: None,
         }
     }
 
@@ -5702,6 +6134,7 @@ mod token_tests {
             100,
             10,
             false,
+            1,
             Now::same(135),
         );
         assert!(!t.lapsing_any());
@@ -5732,6 +6165,7 @@ mod token_tests {
             100,
             10,
             false,
+            1,
             Now::same(300),
         );
         assert_eq!(t.fenced(7, Now::same(301)), Fence::Parked);
@@ -5823,6 +6257,7 @@ mod token_tests {
             100,
             10,
             false,
+            1,
             Now::same(112),
         );
         assert_eq!(t.take_discard(7, Now::same(113), true), Discard::Publish);
@@ -5889,6 +6324,7 @@ mod token_tests {
             100,
             10,
             true,
+            1,
             Now::same(112),
         );
         assert!(t.held(7).unwrap().recalled);
@@ -6341,5 +6777,526 @@ mod token_tests {
         mint(&new, 5, 8, LockMode::Exclusive, 900);
         new.install_lapsed(by(expired).into_grant(WaitMs(700)));
         assert_eq!(new.lapsed_len(), 0);
+    }
+}
+
+/// Plan 41 L1: the atomic window primitives and the tables' mutex kept free
+/// of the store.
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    const X: LockMode = LockMode::Exclusive;
+    const S: LockMode = LockMode::Shared;
+
+    fn at(ms: i64) -> Now {
+        Now::same(ms)
+    }
+
+    /// A settled record of `node` on `ino` in `mode` ending at `until`
+    /// (wait clock), minted by node 1, in the root's table.
+    fn mint(t: &LockTables, node: u64, ino: u64, mode: LockMode, until: i64) -> GrantId {
+        t.grant(1, node, ino, mode, WaitMs(until), 0)
+    }
+
+    fn held_of(id: GrantId, mode: LockMode, until: i64, renew_at: i64) -> HeldGrant {
+        HeldGrant {
+            id,
+            mode,
+            until: HonourMs(until),
+            renew_at: HonourMs(renew_at),
+            owner: 1,
+            recalled: false,
+            position: Position::ZERO,
+            renewing: None,
+            releasing: false,
+            first_use: false,
+            idle_since: None,
+            installed: HonourMs(0),
+            lapsing: None,
+            written: false,
+            route: None,
+        }
+    }
+
+    /// Run `once` the first time the table reaches one of `points`.
+    fn gap_once(
+        t: &LockTables,
+        points: &'static [&'static str],
+        once: impl Fn(&LockTables) + Send + Sync + 'static,
+    ) {
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        t.set_gap_hook_for_tests(Some(Arc::new(move |t, point| {
+            if points.contains(&point) && armed.swap(false, Ordering::SeqCst) {
+                once(t);
+            }
+        })));
+    }
+
+    #[test]
+    fn an_expired_record_is_forgotten_and_remembered_as_lapsed() {
+        let t = LockTables::default();
+        let id = mint(&t, 2, 7, X, 100);
+        let Some(Ok(g)) = t.forget_outwaited_if_expired(id, at(150)) else {
+            panic!("expired")
+        };
+        assert_eq!((g.id, g.until), (id, WaitMs(100)));
+        assert!(t.get(id).is_none() && t.was_ended(id));
+        assert!(t.lapsed_get(id).is_some(), "a settled record is remembered");
+        // Gone: nothing to forget.
+        assert!(t.forget_outwaited_if_expired(id, at(150)).is_none());
+    }
+
+    #[test]
+    fn a_live_record_is_kept_and_its_end_named() {
+        let t = LockTables::default();
+        let id = mint(&t, 2, 7, X, 100);
+        assert_eq!(
+            t.forget_outwaited_if_expired(id, at(99)),
+            Some(Err(WaitMs(100)))
+        );
+        assert!(t.get(id).is_some() && !t.was_ended(id));
+    }
+
+    #[test]
+    fn the_expiry_is_judged_on_the_tables_clock_inside_the_step() {
+        let t = LockTables::default();
+        let id = mint(&t, 2, 7, X, 100);
+        // The caller's reading is old; the table's clock is what counts.
+        t.set_clock(Arc::new(|| at(500)));
+        assert!(matches!(
+            t.forget_outwaited_if_expired(id, at(10)),
+            Some(Ok(_))
+        ));
+        let t = LockTables::default();
+        let id = mint(&t, 2, 7, X, 100);
+        t.set_clock(Arc::new(|| at(50)));
+        assert_eq!(
+            t.forget_outwaited_if_expired(id, at(500)),
+            Some(Err(WaitMs(100))),
+            "a set clock replaces the caller's reading"
+        );
+    }
+
+    /// The gap a two-step sequence has: an extension that lands after the
+    /// record was read and before the forget. The primitive reads inside its
+    /// critical section.
+    #[test]
+    fn an_extension_landing_before_the_check_keeps_the_record() {
+        let t = LockTables::default();
+        let id = mint(&t, 2, 7, X, 100);
+        gap_once(&t, &["forget_if_expired"], move |t| {
+            t.extend(id, 2, WaitMs(5_000), at(120)).unwrap();
+        });
+        assert_eq!(
+            t.forget_outwaited_if_expired(id, at(150)),
+            Some(Err(WaitMs(5_000)))
+        );
+        assert!(t.get(id).is_some());
+    }
+
+    #[test]
+    fn a_grant_never_ends_sooner_than_the_record_it_replaces() {
+        let t = LockTables::default();
+        let old = mint(&t, 2, 7, X, 100);
+        // The caller computed its end from an older reading of the record;
+        // the record has been extended since.
+        t.extend(old, 2, WaitMs(5_000), at(50)).unwrap();
+        let new = mint(&t, 2, 7, X, 900);
+        assert!(t.get(old).is_none());
+        assert_eq!(t.get(new).unwrap().until, WaitMs(5_000));
+        // A later end of its own stands; another node's record is not it.
+        let other = mint(&t, 3, 7, S, 80);
+        assert_eq!(t.get(other).unwrap().until, WaitMs(80));
+        let new = mint(&t, 2, 7, X, 9_000);
+        assert_eq!(t.get(new).unwrap().until, WaitMs(9_000));
+    }
+
+    #[test]
+    fn extend_live_extends_only_a_live_record_of_the_node() {
+        let t = LockTables::default();
+        let id = mint(&t, 2, 7, X, 100);
+        assert_eq!(t.extend_live(id, 2, WaitMs(300), at(50)), Some((X, false)));
+        assert_eq!(t.get(id).unwrap().until, WaitMs(300));
+        // Never shortens.
+        t.extend_live(id, 2, WaitMs(200), at(50)).unwrap();
+        assert_eq!(t.get(id).unwrap().until, WaitMs(300));
+        // Another node's id, an expired record: nothing.
+        assert!(t.extend_live(id, 3, WaitMs(900), at(50)).is_none());
+        assert!(t.extend_live(id, 2, WaitMs(900), at(300)).is_none());
+        assert_eq!(t.get(id).unwrap().until, WaitMs(300));
+        // The table's clock is the one read.
+        t.set_clock(Arc::new(|| at(400)));
+        assert!(t.extend_live(id, 2, WaitMs(900), at(50)).is_none());
+    }
+
+    #[test]
+    fn a_lapsed_window_is_dropped_and_its_id_is_dead() {
+        let t = LockTables::default();
+        let id = GrantId { node: 1, seq: 5 };
+        t.install_held(7, held_of(id, X, 100, 50));
+        assert!(t.drop_held_if_lapsed(7, id, at(150)));
+        assert!(t.held(7).is_none());
+        // Tombstoned: a reply that crosses the drop does not reinstall it.
+        assert_eq!(
+            t.install_held(7, held_of(id, X, 900, 450)),
+            Installed::Released
+        );
+    }
+
+    #[test]
+    fn a_window_renewed_before_the_drop_is_kept() {
+        let t = LockTables::default();
+        let id = GrantId { node: 1, seq: 5 };
+        t.install_held(7, held_of(id, X, 100, 50));
+        // The reader saw the window over; a renewal lands before the drop.
+        gap_once(&t, &["drop_held_if_lapsed"], move |t| {
+            t.renewed(7, id, id, X, HonourMs(140), 1_000, 100, false, 1, at(140));
+        });
+        assert!(!t.drop_held_if_lapsed(7, id, at(150)));
+        assert_eq!(t.held(7).unwrap().until, HonourMs(1_040));
+    }
+
+    /// A grant held on inode 7 whose window (ending at 100) is over and that
+    /// pins a write: lapsing at 150, parked for 5 s.
+    fn lapsing() -> (LockTables, GrantId) {
+        let t = LockTables::default();
+        t.set_lapse_park_ms(5_000);
+        let id = GrantId { node: 1, seq: 5 };
+        let mut h = held_of(id, X, 100, 50);
+        h.written = true;
+        t.install_held(7, h);
+        assert!(t.lapse_pending(7, at(150)));
+        (t, id)
+    }
+
+    #[test]
+    fn a_lapsing_grant_and_another_id_are_left_alone() {
+        let (t, id) = lapsing();
+        assert!(
+            !t.drop_held_if_lapsed(7, id, at(150)),
+            "parked, not dropped"
+        );
+        assert!(t.held(7).is_some());
+        // Not the grant held: nothing to drop, nothing held under that id.
+        let other = GrantId { node: 1, seq: 9 };
+        assert!(t.drop_held_if_lapsed(7, other, at(150)));
+        assert!(t.drop_held_if_lapsed(8, id, at(150)));
+        assert!(t.held(7).is_some());
+    }
+
+    #[test]
+    fn a_lanes_renewal_marks_are_stale_after_a_while_and_a_lapsing_grant_is_never_due() {
+        let t = LockTables::default();
+        let id = GrantId { node: 1, seq: 5 };
+        t.install_held(7, held_of(id, X, 10_000, 100));
+        assert_eq!(t.due_renewals_lane(at(200), 100).len(), 1);
+        // Marked at 200: not due again at 250 (fresh), due at 300 (stale).
+        assert!(t.due_renewals_lane(at(250), 100).is_empty());
+        assert_eq!(t.due_renewals_lane(at(300), 100).len(), 1);
+        assert_eq!(t.held(7).unwrap().renewing, Some(HonourMs(300)));
+        // The core's tick counts a mark of any age.
+        assert!(t.due_renewals(at(900)).is_empty());
+        // Lapsing: never (a late renewal is an add, the core's).
+        let (t, _) = lapsing();
+        assert!(t.due_renewals_lane(at(200), 0).is_empty());
+        // Nor with an open window, a state the table does not reach.
+        t.lock().held.get_mut(&7).unwrap().until = HonourMs(10_000);
+        assert!(t.due_renewals_lane(at(200), 0).is_empty());
+    }
+
+    /// An own grant: the owner's record (this node, 1, as the root) and the
+    /// held grant of the same id.
+    fn own(t: &LockTables, rec_until: i64, held_until: i64) -> GrantId {
+        let id = mint(t, 1, 7, X, rec_until);
+        t.install_held(7, held_of(id, X, held_until, 100));
+        id
+    }
+
+    #[test]
+    fn an_own_renewal_extends_the_record_and_the_window_together() {
+        let t = LockTables::default();
+        let id = own(&t, 800, 1_000);
+        assert!(t.renew_own(7, id, 1, |_| 5_000, 4_000, 100, at(600)));
+        let e = t.get(id).unwrap();
+        assert_eq!(e.until, WaitMs(600 + 4_000 + 100));
+        let h = t.held(7).unwrap();
+        assert_eq!(h.until, HonourMs(600 + 4_000 - 100));
+        assert_eq!(h.renew_at, renew_point(HonourMs(600), 4_000, 100));
+        assert_eq!((h.renewing, h.route), (None, Some(1)));
+        // The cap bounds the ttl; the window never shortens.
+        assert!(t.renew_own(7, id, 1, |_| 500, 4_000, 100, at(700)));
+        assert_eq!(t.held(7).unwrap().until, HonourMs(4_500));
+        assert_eq!(t.get(id).unwrap().until, WaitMs(4_700));
+    }
+
+    #[test]
+    fn an_own_renewal_is_refused_where_the_core_would_refuse() {
+        let refused = |what: &str, build: &dyn Fn(&LockTables) -> GrantId, cap: i64| {
+            let t = LockTables::default();
+            let id = build(&t);
+            let (rec, held) = (t.get(id), t.held(7));
+            assert!(
+                !t.renew_own(7, id, 1, |_| cap, 4_000, 100, at(600)),
+                "{what}"
+            );
+            assert_eq!((t.get(id), t.held(7)), (rec, held), "{what}: untouched");
+        };
+        refused("no cap left", &|t| own(t, 800, 1_000), 0);
+        refused("the window is over", &|t| own(t, 800, 500), 5_000);
+        refused("the record is over", &|t| own(t, 500, 1_000), 5_000);
+        refused(
+            "another node's record",
+            &|t| {
+                let id = mint(t, 2, 7, X, 800);
+                t.install_held(7, held_of(id, X, 1_000, 100));
+                id
+            },
+            5_000,
+        );
+        refused(
+            "a delegate's record",
+            &|t| {
+                let id = t.grant(1, 1, 7, X, WaitMs(800), 3);
+                t.install_held(7, held_of(id, X, 1_000, 100));
+                id
+            },
+            5_000,
+        );
+        refused(
+            "a weaker record than the grant held",
+            &|t| {
+                let id = mint(t, 1, 7, S, 800);
+                t.install_held(7, held_of(id, X, 1_000, 100));
+                id
+            },
+            5_000,
+        );
+        refused(
+            "no record",
+            &|t| {
+                let id = GrantId { node: 1, seq: 77 };
+                t.install_held(7, held_of(id, X, 1_000, 100));
+                id
+            },
+            5_000,
+        );
+        refused(
+            "being released",
+            &|t| {
+                let id = own(t, 800, 1_000);
+                t.lock().held.get_mut(&7).unwrap().releasing = true;
+                id
+            },
+            5_000,
+        );
+        refused(
+            "lapsing",
+            &|t| {
+                let id = own(t, 800, 1_000);
+                // Not a state the table reaches with an open window: set.
+                t.lock().held.get_mut(&7).unwrap().lapsing = Some(Lapsing {
+                    since: HonourMs(1),
+                    at: WaitMs(1),
+                    deadline: WaitMs(9_000),
+                });
+                id
+            },
+            5_000,
+        );
+        refused(
+            "recalled, nothing pins it",
+            &|t| {
+                let id = own(t, 800, 1_000);
+                t.recall_held(7, id).unwrap();
+                t.expire_first_use(at(60_000));
+                id
+            },
+            5_000,
+        );
+        // Another id on the inode.
+        let t = LockTables::default();
+        own(&t, 800, 1_000);
+        assert!(!t.renew_own(
+            7,
+            GrantId { node: 1, seq: 99 },
+            1,
+            |_| 5_000,
+            4_000,
+            100,
+            at(600)
+        ));
+    }
+
+    #[test]
+    fn an_own_renewal_reads_the_tables_clock_inside_the_step() {
+        let t = LockTables::default();
+        let id = own(&t, 800, 1_000);
+        t.set_clock(Arc::new(|| at(1_200)));
+        // The caller's reading (600) says live; the table's (1200) says the
+        // window is over.
+        assert!(!t.renew_own(7, id, 1, |_| 5_000, 4_000, 100, at(600)));
+    }
+
+    #[test]
+    fn a_renewal_records_who_answered_and_a_not_owner_clears_it() {
+        let t = LockTables::default();
+        let id = GrantId { node: 1, seq: 5 };
+        t.install_held(7, held_of(id, X, 1_000, 100));
+        t.renewed(7, id, id, X, HonourMs(200), 1_000, 100, false, 3, at(200));
+        assert_eq!(t.held(7).unwrap().route, Some(3));
+        // Another node's NotOwner does not clear it.
+        t.clear_route(7, id, 4);
+        assert_eq!(t.held(7).unwrap().route, Some(3));
+        t.clear_route(7, id, 3);
+        assert_eq!(t.held(7).unwrap().route, None);
+    }
+
+    #[test]
+    fn take_ids_takes_what_the_snapshot_named_and_forgets_its_memory() {
+        let t = LockTables::default();
+        let a = mint(&t, 2, 1, X, 1_000);
+        let b = mint(&t, 2, 2, S, 1_000);
+        let c = mint(&t, 2, 3, X, 1_000);
+        // A lapsed memory on inode 2 (another node's, settled).
+        let m = Grant {
+            id: GrantId { node: 1, seq: 90 },
+            node: 5,
+            ino: 2,
+            mode: S,
+            until: WaitMs(50),
+            recalled: false,
+            gen: 0,
+            confirmed_ms: Grant::MINTED,
+            settled: true,
+        };
+        t.install_lapsed(m);
+        assert_eq!(t.lapsed_len(), 1);
+        let snap = t.snapshot_inos();
+        assert_eq!(snap.len(), 4);
+        // After the snapshot: a grant of another node lands on inode 2.
+        let late = t.grant(1, 6, 2, S, WaitMs(2_000), 0);
+        let ids: std::collections::HashSet<GrantId> = snap
+            .iter()
+            .filter(|(_, ino)| *ino == 2)
+            .map(|(id, _)| *id)
+            .collect();
+        let taken = t.take_ids(&ids);
+        assert_eq!(taken.iter().map(|g| g.id).collect::<Vec<_>>(), vec![b]);
+        assert!(t.get(a).is_some() && t.get(c).is_some());
+        assert!(
+            t.get(late).is_some(),
+            "a grant added after the snapshot stays"
+        );
+        assert_eq!(t.lapsed_len(), 0, "the memory of the inode goes with it");
+        // Nothing named: nothing taken.
+        assert!(t.take_ids(&Default::default()).is_empty());
+    }
+
+    #[test]
+    fn the_predicate_runs_outside_the_tables_mutex_once_per_inode() {
+        let t = LockTables::default();
+        for node in [2, 3] {
+            mint(&t, node, 1, S, 1_000);
+        }
+        mint(&t, 2, 2, X, 1_000);
+        let calls = AtomicUsize::new(0);
+        let taken = t.take_where_outside(|ino| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            // Under the mutex this would deadlock (a std mutex is not
+            // reentrant) or trip the debug guard.
+            assert_eq!(t.grants_len(), 3);
+            ino == 1
+        });
+        assert_eq!(taken.len(), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "once per inode");
+        assert_eq!(t.grants_len(), 1);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "the lock tables' mutex")]
+    fn a_store_read_under_the_tables_mutex_is_caught() {
+        let meta = crate::Meta::open_in_memory().unwrap();
+        mint(meta.locks(), 2, 1, X, 1_000);
+        meta.locks().take_where(|_| {
+            let _ = meta.delegation_table();
+            true
+        });
+    }
+
+    #[test]
+    fn a_predicate_may_read_the_store_outside_the_mutex() {
+        let meta = crate::Meta::open_in_memory().unwrap();
+        mint(meta.locks(), 2, 1, X, 1_000);
+        let taken = meta.locks().take_where_outside(|_| {
+            let _ = meta.delegation_table();
+            true
+        });
+        assert_eq!(taken.len(), 1);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "the lock tables' mutex")]
+    fn a_store_write_under_the_tables_mutex_is_caught() {
+        let meta = crate::Meta::open_in_memory().unwrap();
+        mint(meta.locks(), 2, 1, X, 1_000);
+        meta.locks().take_where(|_| {
+            let _ = meta.next_delegation_gen(1);
+            true
+        });
+    }
+
+    /// The token check logs after the guard, so a log call that blocks (or a
+    /// subscriber that reads the table) cannot hold the tables.
+    #[test]
+    fn the_token_checks_log_outside_the_guard() {
+        use std::sync::Mutex as M;
+        struct Probe(Arc<M<Vec<bool>>>);
+        impl tracing::Subscriber for Probe {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {
+                // Debug builds: panics if the event is emitted under the
+                // tables' mutex (the guard count, [`assert_no_guard`]).
+                assert_no_guard("a log event");
+                self.0.lock().unwrap().push(true);
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        let t = Arc::new(LockTables::default());
+        let id = mint(&t, 2, 7, X, 10_000);
+        let tag = LockTag(vec![LockToken {
+            grant: id,
+            until_ms: 5_000,
+        }]);
+        let seen = Arc::new(M::new(Vec::new()));
+        let probe = Probe(seen.clone());
+        tracing::subscriber::with_default(probe, || {
+            t.check_tag(&tag, at(100)).unwrap();
+            t.check_tag_at_write(&tag, at(100)).unwrap();
+            t.unpin(&tag);
+            // A refusal logs too.
+            let dead = LockTag(vec![LockToken {
+                grant: GrantId { node: 1, seq: 999 },
+                until_ms: 50,
+            }]);
+            assert!(t.check_tag_at_write(&dead, at(100)).is_err());
+        });
+        assert!(
+            seen.lock().unwrap().len() >= 3,
+            "{:?}",
+            seen.lock().unwrap()
+        );
     }
 }

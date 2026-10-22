@@ -199,6 +199,7 @@ impl Fenced {
                 installed: now,
                 lapsing: None,
                 written: false,
+                route: None,
             },
         );
         // Through the view, as FUSE asks: `pid` is the locking thread.
@@ -1225,6 +1226,7 @@ fn releasing_a_handle_drops_the_locks_taken_through_it() {
             installed: crate::locks::now().honour,
             lapsing: None,
             written: false,
+            route: None,
         },
     );
     // Two descriptions, each its own owner (the kernel names an OFD
@@ -1297,6 +1299,7 @@ fn a_late_release_spares_a_reused_owners_new_lock() {
             installed: crate::locks::now().honour,
             lapsing: None,
             written: false,
+            route: None,
         },
     );
     let lock = |fh: Fh| {
@@ -1373,6 +1376,7 @@ fn two_descriptions(f: &Fenced, caller: &Caller, name: &str) -> (Ino, Fh, Fh) {
             installed: crate::locks::now().honour,
             lapsing: None,
             written: false,
+            route: None,
         },
     );
     (ino, a.fh, b.fh)
@@ -2430,6 +2434,7 @@ fn script_core_waits(f: &mut Fenced, ino: Ino, script: Vec<Scripted>) -> Seen {
                             installed: now,
                             lapsing: None,
                             written: false,
+                            route: None,
                         },
                     );
                     constellation_authority::LockAnswer::Granted { position }
@@ -3136,6 +3141,7 @@ impl Parking {
             60_000,
             1_000,
             false,
+            1,
             now,
         );
     }
@@ -3299,6 +3305,7 @@ fn a_frontend_that_cannot_defer_waits_in_the_call_for_the_verdict() {
             60_000,
             1_000,
             false,
+            1,
             now,
         );
     });
@@ -3652,6 +3659,7 @@ fn a_refused_inline_wait_at_a_publication_discards_nothing() {
         60_000,
         1_000,
         false,
+        1,
         now,
     );
     let gate = f.fs.lock_publish_gate(

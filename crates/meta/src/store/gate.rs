@@ -182,6 +182,9 @@ pub(crate) struct GatedDb {
     /// Tests only: [`crate::Meta::set_writer_wait_hook_for_tests`].
     #[cfg(any(test, feature = "test-util"))]
     pub(crate) wait_hook: Mutex<Option<WriterWaitHook>>,
+    /// Tests only: [`crate::Meta::set_read_hook_for_tests`].
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) read_hook: Mutex<Option<WriterWaitHook>>,
 }
 
 /// See [`crate::Meta::set_writer_wait_hook_for_tests`].
@@ -195,7 +198,29 @@ impl GatedDb {
             holder: Mutex::new(None),
             #[cfg(any(test, feature = "test-util"))]
             wait_hook: Mutex::new(None),
+            #[cfg(any(test, feature = "test-util"))]
+            read_hook: Mutex::new(None),
         }
+    }
+
+    /// A read transaction (a snapshot). Debug and test builds check that
+    /// this thread holds none of the lock tables' mutex (plan 41 L1b), and
+    /// tests may park every read ([`crate::Meta::set_read_hook_for_tests`]:
+    /// an uncached read on a stalled device).
+    pub(crate) fn read_tx(&self) -> fjall::Snapshot {
+        crate::locks::assert_no_guard("GatedDb::read_tx");
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            let hook = self
+                .read_hook
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        self.db.read_tx()
     }
 
     fn holder(&self) -> std::sync::MutexGuard<'_, Option<Holder>> {
@@ -210,6 +235,7 @@ impl GatedDb {
     #[track_caller]
     pub(crate) fn write_tx(&self) -> SingleWriterWriteTx<'_> {
         let at = Location::caller();
+        crate::locks::assert_no_guard("GatedDb::write_tx");
         #[cfg(any(test, feature = "test-util"))]
         {
             let hook = self

@@ -26338,6 +26338,187 @@ mod locks {
             assert_eq!(since, vec![sent.0 + 4_000], "refused: {refused}");
         }
     }
+
+    // ---- plan 41 L1: atomic window decisions, nothing slow under the mutex ----
+
+    /// Run `once` the first time the tables reach one of `points` (see
+    /// `LockTables::set_gap_hook_for_tests`): where a second writer's
+    /// extension lands in a gap between the core's read of a window and what
+    /// it decides on it.
+    fn gap_once(
+        h: &Harness,
+        points: &'static [&'static str],
+        once: impl Fn(&constellation_meta::locks::LockTables) + Send + Sync + 'static,
+    ) {
+        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        h.meta
+            .locks()
+            .set_gap_hook_for_tests(Some(std::sync::Arc::new(move |t, point| {
+                if points.contains(&point) && armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    once(t);
+                }
+            })));
+    }
+
+    /// Plan 41 L1: an owner's expiry timer finds the record extended — the
+    /// extension landed between the core's look and its decision, as a
+    /// second writer's (the lock lane's) can. The record ended on the
+    /// strength of a window read earlier than the extension: the holder, who
+    /// honours the extended window, was outwaited early, and the waiter
+    /// behind it was granted beside it.
+    #[test]
+    fn an_extension_landing_before_the_expiry_decision_is_not_outwaited() {
+        let (mut h, ino) = holder_with_file();
+        let t0 = h.now;
+        let out = request(&mut h, 2, 7, ino, X, true);
+        let (g2, _) = granted(&lock_replies(&out)[0].2);
+        h.now = t0.plus(100);
+        let out = request(&mut h, 3, 8, ino, X, true);
+        assert!(lock_replies(&out).is_empty(), "parked: {out:?}");
+        let expiry = timer_of(&out, TimerKind::LockGrantExpiry);
+        // Node 2's window is over at the timer; as it fires, a renewal of
+        // the record lands.
+        h.now = t0.plus(100 + 6_000);
+        let far = WaitMs(h.clk().wait.0 + 60_000);
+        let now = h.clk();
+        gap_once(&h, &["get", "forget_if_expired"], move |t| {
+            t.extend(g2, 2, far, now).expect("extended");
+        });
+        let out = h.step(Event::Timer { id: expiry });
+        h.meta.locks().set_gap_hook_for_tests(None);
+        assert_eq!(
+            h.core.stats.lock_recalls_expired, 0,
+            "outwaited a record extended meanwhile: {out:?}"
+        );
+        assert_eq!(h.meta.locks().get(g2).map(|g| g.until), Some(far));
+        assert!(
+            lock_replies(&out).is_empty(),
+            "node 3 was served beside node 2's live grant: {out:?}"
+        );
+        // Waits again, until the extended end.
+        let again = timer_of(&out, TimerKind::LockGrantExpiry);
+        assert_eq!(h.core.timer_ms(again), Some(Ms(far.0)));
+    }
+
+    /// Plan 41 L1: the node's own look at a held grant (an op wants the
+    /// inode) finds its window over, and a renewal lands before the drop.
+    /// The window is kept: dropped by id after the look, it was dropped
+    /// renewed, its I/O fenced and its owner (who outwaits a dropped grant)
+    /// answering the fresh request late.
+    #[test]
+    fn a_window_renewed_after_the_lapse_look_is_not_dropped() {
+        let mut r = requester();
+        let req = lock_control(&mut r, 50, 42, true);
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: grant_msg(2),
+            },
+        });
+        let held = r.meta.locks().held(42).expect("installed");
+        // The window ends; an op asks for the inode, and the grant is
+        // renewed just after the core read it.
+        r.now = Ms(held.until.0 + 10);
+        let now = r.clk();
+        gap_once(&r, &["held"], move |t| {
+            t.renewed(
+                42, held.id, held.id, X, now.honour, 5_000, 1_000, false, 1, now,
+            );
+        });
+        let out = r.step(Event::Control {
+            op: OpId(51),
+            req: Control::Lock {
+                ino: 42,
+                mode: X,
+                blocking: true,
+                waited_ms: 0,
+            },
+        });
+        r.meta.locks().set_gap_hook_for_tests(None);
+        let kept = r
+            .meta
+            .locks()
+            .held(42)
+            .expect("a renewed window was dropped");
+        assert_eq!(kept.id, held.id);
+        assert_eq!(kept.until.0, now.honour.0 + 5_000 - 1_000);
+        assert!(
+            sends(&out).is_empty(),
+            "asked for a grant beside the one it holds: {out:?}"
+        );
+        // The op looks again shortly, and is served from the grant.
+        assert!(!timers(&out, TimerKind::LockRetry).is_empty(), "{out:?}");
+    }
+
+    /// Plan 41 L1b: a delegation move takes the grants of the inodes a
+    /// delegated subtree owns, and finding them reads the store. A read that
+    /// is stuck on a stalled device must not hold the tables' mutex, which
+    /// every FUSE fence check and every renewal needs: another thread's
+    /// table calls return meanwhile.
+    #[test]
+    fn a_store_read_in_a_delegation_move_does_not_hold_the_tables() {
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::Duration;
+        for take_generation in [false, true] {
+            let mut h = Harness::new(1);
+            h.hold(1, None);
+            let until = WaitMs(h.clk().wait.0 + 60_000);
+            let mut ids = Vec::new();
+            for ino in 10..14 {
+                ids.push(h.meta.locks().grant(1, 2, ino, X, until, 0));
+            }
+            // Every store read parks until released.
+            let gate = Arc::new((Mutex::new(false), Condvar::new()));
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let g = gate.clone();
+            h.meta.set_read_hook_for_tests(Some(Arc::new(move || {
+                let _ = entered_tx.send(());
+                let (open, cv) = &*g;
+                let mut open = open.lock().unwrap();
+                while !*open {
+                    open = cv.wait(open).unwrap();
+                }
+            })));
+            let release = || {
+                let (open, cv) = &*gate;
+                *open.lock().unwrap() = true;
+                cv.notify_all();
+            };
+            let clk = h.clk();
+            let (core, meta) = (&mut h.core, &h.meta);
+            std::thread::scope(|s| {
+                s.spawn(move || {
+                    if take_generation {
+                        core.lock_take_generation(5, meta);
+                    } else {
+                        core.lock_on_delegated(5, meta);
+                    }
+                });
+                entered_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("the move reached the store");
+                // The move is inside a store read. Other threads use the
+                // tables.
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                let id = ids[0];
+                s.spawn(move || {
+                    let _ = meta.locks().get(id);
+                    let _ = meta.locks().held_count();
+                    let _ = meta.locks().extend(id, 2, until, clk);
+                    let _ = meta.locks().fenced_owners(clk);
+                    let _ = done_tx.send(());
+                });
+                let answered = done_rx.recv_timeout(Duration::from_millis(500));
+                release();
+                assert!(
+                    answered.is_ok(),
+                    "the tables were blocked behind a store read (take_generation: {take_generation})"
+                );
+            });
+        }
+    }
 }
 
 // ---- M16 fixes ----

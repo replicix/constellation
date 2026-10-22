@@ -57577,3 +57577,283 @@ re-adoption kept the subtree live where it had stalled before. Seed 1434 of
 refused at node 2 ("continuity is not proven"), 2 I/Os fenced, no violation. Gates:
 `clippy --workspace --all-targets -D warnings`, authority lib (590), `meta_repro` (4),
 sim suite (245 passed, 12 ignored).
+
+## Plan 41 L1: lock tables safe for two writers, nothing slow under their mutex (2026-10-22)
+
+### Finding
+
+Plan 41's lock lane (L2 to L4) will be a second writer of the lock tables:
+it extends the owner's own records and the held windows while the core is
+stuck in a store write. Two writers are safe for *extensions* (`extend` and
+`renewed` take the `max`), not for a core decision that ends or shortens a
+window on a value it read earlier. Two such sequences existed, and two
+critical sections of the tables' mutex did store I/O:
+
+- `on_lock_grant_expiry` read the record (`get`), compared its `until` with
+  the step's `now`, and much later forgot it by id (`forget_outwaited`): a
+  renewal landing in between was forgotten with the record, and the holder,
+  who honours the extended window, was outwaited early.
+- `lock_route_op` read the held grant (`held`), saw its window over and
+  dropped it by id (`drop_held`): a renewed window was dropped, its I/O
+  fenced.
+- `lock_try_grant` took the later end of the record it replaces from an
+  earlier `own_grant` read, and `grant` then replaced the record: an own
+  record the lane had extended in between was shortened.
+- `lock_install_leaving` read a record, and replaced it with `install` if it
+  ended before the restamped end: the same, for a record extended after the
+  read.
+- `take_where` runs its predicate under the mutex. `lock_on_delegated` and
+  `lock_take_generation` pass predicates that read the store
+  (`resolve_ownership` reads the delegation table): on a stalled device
+  every FUSE fence check and every lane call waited behind the mutex for an
+  uncached read.
+- `check_tag_at_write` logged at `info`, and `judge` at `debug`, while
+  holding the guard.
+
+### What landed
+
+| Item | Where |
+|---|---|
+| `forget_outwaited_if_expired(id, fallback) -> Option<Result<Grant, WaitMs>>`: check, forget and the lapsed memory in one critical section, `now` read inside it; `on_lock_grant_expiry` uses it (the rest of the step, floors and barriers, runs on the returned record; `lock_grant_ended` is the shared tail of an end) | `crates/meta/src/locks.rs`, `core/locks.rs` |
+| `drop_held_if_lapsed(ino, id, fallback) -> bool` (`true`: `id` is not held any more; `false`: still held, extended or lapsing, nothing changed); `lock_route_op` uses it and looks again in 10 ms on `false`. `lapse_tick` confirmed atomic (documented) | same |
+| `grant` keeps the later end of the same-node record it replaces, inside the call; `lock_install_leaving` extends with `install_keeping_later` | same |
+| `extend_live`, `renew_own`, `due_renewals_lane`, `HeldGrant.route` (set by `renewed`, which takes the answering node; cleared by `clear_route` on `NotOwner`; set at install from the granting node): the lane's primitives, not used by the core yet | `crates/meta/src/locks.rs`, `core/locks.rs` |
+| `snapshot_inos`, `take_ids`, `take_where_outside`: the snapshot of `(id, ino)` pairs under the guard, the predicate once per inode outside it, then the take of the ids still present (a grant installed after the snapshot stays: the core is the only adder, so a step cannot see one); `lock_on_delegated` and `lock_take_generation` use it; `take_where` stays for the store-free `deleg_drop_left` and says so | same |
+| No logging under the guard: `judge` returns the verdict, and the `info` and `debug` lines (the host stamp read inside the guard, only when the line is enabled) are written after it | `crates/meta/src/locks.rs` |
+| Debug guard: in debug and test builds the guard counts per thread, and `GatedDb::write_tx` and a new `GatedDb::read_tx` (every store read opens a snapshot through it) panic if the thread holds the tables' mutex; in release the guard is the plain `MutexGuard` | `crates/meta/src/locks.rs`, `store/gate.rs` |
+| Test seams: `LockTables::set_gap_hook_for_tests` (a hook at the gaps of a two-step sequence), `Meta::set_read_hook_for_tests` (parks every store read) | same |
+
+### The audit of the 116 `replica.locks()` sites
+
+`crates/authority/src/core` outside `tests.rs`: `locks.rs` 102 sites,
+`jobs.rs` 5, `promise.rs` 5, `backup.rs` 2, `holder.rs` 1, `delegate.rs` 1
+(116 `.locks()` lines; the `lock_final_blocks()` lines match the pattern and
+are not sites). The audit asks, per site, whether the core ends or shortens
+a window on the strength of a value it read earlier, and whether a window end
+computed from the step's `now` is stored with anything but a `max`.
+
+The classes and their safety arguments (the lane only ever extends: it
+renews a record that is live at its own reading, of this node, of the root,
+whose held grant is honoured, not lapsing and not being released; it never
+adds, removes or shortens):
+
+- **R-live**: a read that is not used to end a window by its `until`. What
+  is decided on it stays true if the window is extended meanwhile (a
+  conflict stays a conflict, a grant stays held), or the site re-reads where
+  it ends something.
+- **R-dead**: a read of "expired" or "none". It is stable: the lane extends
+  only records live at its reading (`extend_live`, `renew_own`), and the
+  step's `now` is never newer than the table's, so a record not live at the
+  step's `now` is not live later; nothing but the core adds a record.
+- **R-flag**: a read of something that is not a window (counts, modes, ids,
+  doubts, quarantine, the ended memory).
+- **M**: monotone: `max` of windows (`extend`, `renewed`, `install_held` of
+  the same id, `install_keeping_later`), flags, `fetch_max`, counters,
+  clearing a `renewing` mark (at worst a duplicate renewal).
+- **A**: atomic: a table call that reads the live value and decides in the
+  same critical section (`conflicting`, `first_conflicting`,
+  `install_if_consistent`, `lapse_tick`, `lapse_pending`, `due_renewals`,
+  `admit_late`, `take_outwaited`). The `now` a call takes is the step's,
+  older than the table's: that only makes fewer windows look over.
+- **E**: ends by the holder's or owner's own act (a release, a handoff, a
+  deposition, the owner's `Lost`, a recall's adoption), not by a window value
+  read earlier. The lane cannot race it: before it, an extension is
+  subsumed by the end; after it there is no record (`renew_own` needs it) or
+  the held grant is releasing (it refuses).
+- **C**: converted here (above).
+- **X**: replaces a record of the same node and inode with `install`; see
+  the list below.
+
+Remaining replacements (`install` over a record that may be live):
+
+1. `lock_renew_one`, a reclaim in a grace: reached only when no record of the
+   renewed id covers the holder's mode, so the record it replaces is a
+   *weaker* one of the same node. `renew_own` requires the record to cover
+   the held grant's mode (as `lock_renew_one` does), so the lane never
+   extends the record being replaced.
+2. `lock_install_mirror`, the fast takeover's mirror: installed in the step
+   that ends the takeover's gate, before the lane has a certificate for this
+   tenure (plan 41 L2: published by `refresh()` after the tenure's lease is
+   usable); the table holds no grants of this tenure before it.
+3. `lock_install_moved` without a carried end (`gen == 0`): a handback of
+   grants the root moved out at the delegation. Their records are gone from
+   its table since (`take_ids` returned them), so no live record of the node
+   on the inode exists to extend, and the lane renews nothing it does not
+   have.
+
+A handoff's capped window is not a shortening of a live record: the sender
+measures `left` from the record `take_ids` returns, in the step that takes
+it out of its table (one critical section), and extends nothing after; the
+receiver installs by `install_keeping_later` or `install_if_consistent`.
+
+`lock_renew_one`'s `extend` does not check liveness: an owner record past
+its end and not yet dropped is extended by a renewal that arrives late. That
+is the protocol as modeled (`admit_late` is the late path for lapsed
+holders) and unchanged; the lane uses `extend_live`.
+
+**The stale-`now` check.** Window ends the core computes from the step's
+`now`: `lock_renew_one`'s `until` (stored by `extend`: `max`; by `admit_late`
+and the grace reclaim: adds), `lock_try_grant`'s (stored by `grant`, which
+now takes the `max` with the record replaced), the restamps of
+`lock_install_mirror`, `lock_install_moved`, `lock_install_leaving` (adds,
+`install_keeping_later`, `install_if_consistent`, and the X list above), the
+held windows from the request's own `sent` (`renewed`, `install_held`: `max`
+for the same id). No other site stores such an end.
+
+### The 116 sites
+
+| Site | Function | Primitive | Class | Why it is safe |
+|---|---|---|---|---|
+| `backup.rs:1913` | `beat_guard_parts` | `quarantine_until` | R-flag | a `fetch_max` atomic, never lowered |
+| `backup.rs:2038` | `note_marker_landed` | `set_quarantine` | M | `fetch_max` |
+| `delegate.rs:3098` | `on_deleg_renewed` | `has_grants_of_gen` | R-flag | picks a log position; nothing ends |
+| `holder.rs:801` | `on_lease_request` | `grants_len` | R-dead | zero is stable: nothing adds a record but the core |
+| `jobs.rs:1935` | `round_ship` | `live_grants_len` | R-dead | a record not live at the step's `now` is not live later, and the lane extends only live ones |
+| `jobs.rs:2121` | `round_release` | `live_grants_len` | R-dead | a record not live at the step's `now` is not live later, and the lane extends only live ones |
+| `jobs.rs:2175` | `round_release` | `grants_len` | R-dead | zero is stable: nothing adds a record but the core |
+| `jobs.rs:3535` | `flush_continue` | `grants_len` | R-dead | zero is stable: nothing adds a record but the core |
+| `jobs.rs:3538` | `flush_continue` | `grants_len` | R-dead | zero is stable: nothing adds a record but the core |
+| `locks.rs:981` | `lock_quarantine_until` | `quarantine_until` | R-flag | a `fetch_max` atomic, never lowered |
+| `locks.rs:1416` | `lock_flush_held` | `get` | E | a held-back answer whose horizon write failed: its record is ended by that decision (the answer was never sent) |
+| `locks.rs:1459` | `renew_after_event` | `renewal_failed` | M | clears the mark |
+| `locks.rs:1466` | `renew_after_event` | `held_count` | R-flag | arms or skips the tick; a window only grows |
+| `locks.rs:1748` | `lock_conflict_refusal` | `conflicting` | A | drops expired records inside the call, by the live value and the step's `now` (never newer than the table's) |
+| `locks.rs:1770` | `lock_known_refusal` | `own_grant` | R-live | live at the step's `now`: an extension only prolongs it (an older `now` makes more records look live, the safe way) |
+| `locks.rs:1778` | `lock_known_refusal` | `conflicting` | A | drops expired by the live value inside the call |
+| `locks.rs:1859` | `lock_try_grant` | `own_grant` | R-live | its `until` is only a lower bound: `grant` keeps the later end itself |
+| `locks.rs:1873` | `lock_try_grant` | `conflicting` | A | drops expired records inside the call, by the live value and the step's `now` (never newer than the table's) |
+| `locks.rs:1993` | `lock_try_grant` | `grant` | C | the later end of the replaced record is taken inside `grant` |
+| `locks.rs:1998` | `lock_try_grant` | `note_continues` | M | bookkeeping of the replaced id |
+| `locks.rs:2262` | `lock_take_outwaited` | `take_outwaited` | A | drains what the tables' own atomic drops produced |
+| `locks.rs:2283` | `lock_own_outwait_barrier` | `tagged_unsettled` | R-flag | after the record left (`forget_outwaited_if_expired`) |
+| `locks.rs:2696` | `lock_recall` | `mark_recalled` | M | sets a flag |
+| `locks.rs:2927` | `lock_serve_waiters` | `locks()` | R-flag | presence of the unproven ids (`get`s in a `retain`) |
+| `locks.rs:3131` | `on_lock_released` | `get` | E | checks the record is this holder's, then the release ends it (`lock_grant_done`) |
+| `locks.rs:3153` | `on_lock_released` | `own_grant` | R-live | a newer own grant of the releaser: recalled or released, not shortened by a window read |
+| `locks.rs:3189` | `on_lock_grant_expiry` | `forget_outwaited_if_expired` | C | was `get` + compare + `forget_outwaited`: one call on the table's clock |
+| `locks.rs:3251` | `lock_grant_done` | `forget` | E | a release or a replaced id ends the record by decision |
+| `locks.rs:3391` | `lock_renew_one` | `admit_late` | A | one call; an add, never the lane's |
+| `locks.rs:3446` | `lock_renew_one` | `get` | R-live | ids and mode only; the window goes through `extend` (max) |
+| `locks.rs:3448` | `lock_renew_one` | `own_grant` | R-live | the newer own grant, by `until > now` |
+| `locks.rs:3470` | `lock_renew_one` | `extend` | M | `max` of the old and new end |
+| `locks.rs:3488` | `lock_renew_one` | `conflicting` | A | drops expired records inside the call, by the live value and the step's `now` (never newer than the table's) |
+| `locks.rs:3499` | `lock_renew_one` | `install` | X | a reclaim in a grace: replaces only a weaker same-node record, which the lane never renews (`renew_own` needs the record to cover the held mode) |
+| `locks.rs:3538` | `on_lock_test` | `first_conflicting` | A | drops expired records inside the call, by the live value |
+| `locks.rs:3569` | `on_lock_test_control` | `first_conflicting` | A | drops expired records inside the call, by the live value |
+| `locks.rs:3677` | `lock_route_op` | `held` | R-live | copy; the drop below goes through `drop_held_if_lapsed` |
+| `locks.rs:3678` | `lock_route_op` | `lapse_pending` | A | `observe` in one critical section; the step's older `now` makes fewer windows look over, never more |
+| `locks.rs:3692` | `lock_route_op` | `drop_held_if_lapsed` | C | was `held` + `drop_held`: one call on the table's clock |
+| `locks.rs:3697` | `lock_route_op` | `local_idle` | R-flag | local locks, not a window |
+| `locks.rs:4045` | `lock_late_reply` | `held` | R-live | the installed id is compared; the window goes through `renewed` (max) |
+| `locks.rs:4072` | `lock_late_reply` | `renewed` | M | `max` of the old and new window |
+| `locks.rs:4102` | `lock_late_reply` | `install_held` | M | a newer id the owner granted: replaces by id |
+| `locks.rs:4227` | `lock_wake_covered` | `held` | R-live | a copy; what is decided on it is checked again where it ends something (see the site) |
+| `locks.rs:4447` | `lock_op_outcome` | `install_held` | M | a fresh grant: same id merges by `max`, a newer id replaces and tombstones the old |
+| `locks.rs:4620` | `on_lock_request_failed` | `renewal_failed` | M | clears the `renewing` mark: at worst a duplicate renewal |
+| `locks.rs:4641` | `lock_arm_renew_tick` | `next_renewal` | R-flag | arms the tick from a lower bound; an extension only makes the tick early |
+| `locks.rs:4646` | `lock_arm_renew_tick` | `lapsing_any` | R-flag | one relaxed load |
+| `locks.rs:4679` | `on_lock_renew_tick` | `idle_before` | E | a release by `idle_since` |
+| `locks.rs:4688` | `on_lock_renew_tick` | `expire_first_use` | E | ends the first-use wait (renewability), not a window |
+| `locks.rs:4702` | `on_lock_renew_tick` | `lapse_tick` | A | confirmed atomic: each window is read and ended or marked inside the one call |
+| `locks.rs:4704` | `on_lock_renew_tick` | `held_all` | R-live | feeds a release of a recalled grant nothing pins (the core's decision) |
+| `locks.rs:4705` | `on_lock_renew_tick` | `local_idle` | R-flag | local locks, not a window |
+| `locks.rs:4711` | `on_lock_renew_tick` | `due_renewals` | A | marks `renewing` inside the call |
+| `locks.rs:4769` | `on_lock_renew_tick` | `renewal_failed` | M | clears the `renewing` mark: at worst a duplicate renewal |
+| `locks.rs:4815` | `on_lock_renew_tick` | `held_count` | R-flag | arms or skips the tick; a window only grows |
+| `locks.rs:4937` | `on_lock_renewed` | `held_count` | R-flag | arms or skips the tick; a window only grows |
+| `locks.rs:4961` | `lock_apply_renew_result` | `renewed` | M | `max`, from the request's own send |
+| `locks.rs:4979` | `lock_apply_renew_result` | `lost` | E | the owner's `Lost` |
+| `locks.rs:4991` | `lock_apply_renew_result` | `renewal_failed` | M | clears the mark |
+| `locks.rs:5012` | `lock_apply_renew_result` | `clear_route` | M | clears a hint |
+| `locks.rs:5013` | `lock_apply_renew_result` | `renewal_failed` | M | clears the mark |
+| `locks.rs:5027` | `on_lock_renew_timeout` | `renewal_failed` | M | clears the `renewing` mark: at worst a duplicate renewal |
+| `locks.rs:5076` | `lock_late_renewed` | `held_count` | R-flag | arms or skips the tick; a window only grows |
+| `locks.rs:5111` | `on_lock_recall` | `held` | R-live | a copy; what is decided on it is checked again where it ends something (see the site) |
+| `locks.rs:5113` | `on_lock_recall` | `released_last` | R-flag | release bookkeeping |
+| `locks.rs:5119` | `on_lock_recall` | `tombstone_unheld` | E | a grant not held: nothing to renew |
+| `locks.rs:5141` | `lock_recall_here` | `recall_held` | E | the owner's recall: adopts an id, changes no window |
+| `locks.rs:5154` | `lock_recall_here` | `note_pending_recall` | M | bookkeeping |
+| `locks.rs:5238` | `lock_resolve_doubts` | `doubt_of` | R-flag | doubts, not windows |
+| `locks.rs:5243` | `lock_resolve_doubts` | `resolve_doubt` | M | bookkeeping |
+| `locks.rs:5289` | `lock_release_begin` | `begin_release` | E | the node's own release; the lane refuses a releasing grant |
+| `locks.rs:5328` | `on_lock_flushed` | `held` | R-live | the id is compared |
+| `locks.rs:5334` | `on_lock_flushed` | `release_blocked` | R-live | a wait bound for the release; an extension only lengthens it |
+| `locks.rs:5353` | `on_lock_flushed` | `with_stats` | R-flag | a counter |
+| `locks.rs:5373` | `on_lock_flushed` | `was_doubted` | R-flag | decides drop-unreleased vs release |
+| `locks.rs:5375` | `on_lock_flushed` | `drop_unreleased` | E | the node gives the grant up (doubt), the owner outwaits it |
+| `locks.rs:5377` | `on_lock_flushed` | `end_release` | E | the release flush is done: the grant ends by the node's own decision |
+| `locks.rs:5387` | `on_lock_flushed` | `with_stats` | R-flag | a counter |
+| `locks.rs:5499` | `lock_install_mirror` | `install` | X | the takeover's mirror, installed in the step that ends the gate; the lane has no certificate for this tenure before it |
+| `locks.rs:5503` | `lock_install_mirror` | `install_lapsed` | M | adds a memory only, none beside a live record |
+| `locks.rs:5527` | `lock_on_delegated` | `take_where_outside` | C | snapshot, predicate outside the mutex, `take_ids` |
+| `locks.rs:5577` | `deleg_leaving_grants` | `grants_len` | R-dead | zero is stable: nothing adds a record but the core |
+| `locks.rs:5581` | `deleg_leaving_grants` | `grants_snapshot` | R-live | a filter copy for the batch |
+| `locks.rs:5613` | `deleg_leaving_barriers` | `expired` | R-dead | expired records stay expired (the lane extends only live ones) |
+| `locks.rs:5690` | `deleg_drop_left` | `take_where` | E | the predicate is `inos.contains`: store-free, stays under the guard |
+| `locks.rs:5729` | `lock_install_leaving` | `was_ended` | R-flag | a record never un-ends |
+| `locks.rs:5732` | `lock_install_leaving` | `get` | R-live | gates the extension; the extension is `install_keeping_later` |
+| `locks.rs:5737` | `lock_install_leaving` | `install_keeping_later` | C | was `install` after a read of the record |
+| `locks.rs:5745` | `lock_install_leaving` | `install_if_consistent` | A | adds only where nothing of the node or conflicting is, and drops expired records first, in the call |
+| `locks.rs:5809` | `lock_take_back_left` | `was_ended` | R-flag | the ended memory; a record never un-ends |
+| `locks.rs:5810` | `lock_take_back_left` | `install_if_consistent` | A | in the call |
+| `locks.rs:5941` | `lock_on_generation_ended` | `install_if_consistent` | A | adds only where nothing of the node or conflicting is, and drops expired records first, in the call |
+| `locks.rs:6101` | `lock_install_moved` | `install_keeping_later` | M | never shortens the record it replaces |
+| `locks.rs:6103` | `lock_install_moved` | `install` | X | a handback of grants the root moved out (records gone from its table since the delegation); no live record of the node on the inode to extend |
+| `locks.rs:6112` | `lock_install_moved` | `install_if_consistent` | A | adds only where nothing of the node or conflicting is, and drops expired records first, in the call |
+| `locks.rs:6149` | `lock_take_generation` | `take_by_gen` | E | the generation leaves whole |
+| `locks.rs:6151` | `lock_take_generation` | `take_where_outside` | C | snapshot, predicate outside the mutex, `take_ids` |
+| `locks.rs:6289` | `lock_on_released_takeover` | `set_quarantine` | M | `fetch_max` |
+| `locks.rs:6312` | `lock_duty_live` | `quarantine_until` | R-flag | a `fetch_max` atomic, never lowered |
+| `locks.rs:6314` | `lock_duty_live` | `grants_snapshot` | R-live | counts live records |
+| `locks.rs:6344` | `lock_duty_standing` | `grants_len` | R-dead | zero is stable: nothing adds a record but the core |
+| `locks.rs:6393` | `lock_quarantine_dropped_tenure` | `grants_snapshot` | R-live | a bound over the records' ends; an extension only lengthens the quarantine the next step sets |
+| `locks.rs:6402` | `lock_quarantine_dropped_tenure` | `set_quarantine` | M | `fetch_max` |
+| `locks.rs:6415` | `locks_start` | `seed_ids` | M | `fetch_max` |
+| `locks.rs:6420` | `locks_start` | `set_token_memory_ms` | M | configuration, at start |
+| `locks.rs:6427` | `locks_start` | `set_lapse_park_ms` | M | configuration, at start |
+| `locks.rs:6492` | `lock_on_lease_gone` | `clear_grants` | E | deposed: the table is not this node's |
+| `locks.rs:6636` | `lock_final_step` | `final_snapshot` | R-live | the deposed step's last mirror, a snapshot; a lane extending past it is excluded by plan 41 L2's `lock_final_blocks()` (no lane exists yet) |
+| `locks.rs:6675` | `locks_after_event` | `take_expired_dropped` | A | an atomic flag swap |
+| `locks.rs:6686` | `locks_after_event` | `grants_snapshot` | R-live | the mirror sent to the backups: a snapshot, resent on the next change |
+| `promise.rs:753` | `epoch_close_release` | `grants_len` | R-dead | zero is stable: nothing adds a record but the core |
+| `promise.rs:785` | `epoch_tenure_resumed` | `grants_len` | R-dead | zero is stable: nothing adds a record but the core |
+| `promise.rs:803` | `epoch_tenure_resumed` | `grants_snapshot` | R-live | a bound for the quarantine |
+| `promise.rs:808` | `epoch_tenure_resumed` | `clear_grants` | E | the epoch's resume restarts the table |
+| `promise.rs:810` | `epoch_tenure_resumed` | `set_quarantine` | M | `fetch_max` |
+
+(Generated by `audit_gen.py` from the tree's `.locks()` lines; `lock_final_blocks()` lines are not sites. Classes as above.)
+
+### Tests and gates
+
+- Fail-before, with the call sites switched back to the old sequences:
+  `an_extension_landing_before_the_expiry_decision_is_not_outwaited`,
+  `a_window_renewed_after_the_lapse_look_is_not_dropped` and
+  `a_store_read_in_a_delegation_move_does_not_hold_the_tables` (`core::tests`)
+  fail; with the new primitives they pass. `LockTables` unit tests
+  (`window_tests`, 21): every primitive, including the gap-hook version of
+  each race, the lane's refusals, `take_ids` against a grant installed after
+  the snapshot, the debug guard (a store read or write under the mutex
+  panics), and the token checks logging outside the guard.
+- fmt, `clippy --workspace --all-targets -D warnings`: clean. Tests (debug,
+  box): meta (lib and integration tests), engine, vfs, harness and authority lib: all pass on the final tree (in a loaded
+  full-suite run 5 engine `owner_fence_tests` parking tests and the harness
+  `kernel_races` test failed on a host at load 35 with the scratch directory
+  on disk; each passes alone, 54 of 54 and 1 of 1 on tmpfs). The
+  constellation-net `addr_churn` test (network namespaces) fails on this host
+  independently of the change. The authority `sim` integration tests were
+  not completed in debug or release under the host's load (the first
+  scheduler-bound ones, e.g. `a_panicking_node_fails_the_seed_promptly`'s
+  20 s bound, fail at load 30+); the sweeps below stand for them.
+- Sims, `locks-*` and `backup*` (86 configurations), change against base:
+  2000 seeds each on f27d3d1 (all the L1 and FJ code together), and again
+  400 seeds each on the rebased tree against its base. Failing sets
+  identical (the configurations that fail by design fail on the same seeds;
+  one seed, `backup-runtime-lag-unaware` 372, flipped between the sweeps and is
+  identical in isolation). Per-seed fingerprints: identical except seeds that
+  give two fingerprints on the base itself (nondeterministic on main; 1 to 3
+  per configuration at 2000 seeds, e.g. `backup-crash` 64,
+  `locks-failover-backup-writes` 64), and two seeds of
+  `locks-stall-step-delegated` (144 and 359) that are deterministic on both
+  sides and differ (both pass): that configuration stalls the core's step, whose
+  `now` is older than the table's clock, which is the case the in-guard
+  clock and the atomic primitives change. Not attributed to one of them.
