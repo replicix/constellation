@@ -56454,3 +56454,31 @@ configuration's run-to-run noise).
   not repeat in five reruns. Not run: pjdfstest, `holder-kill-rejoin`, `upgrade-under-load`,
   `s3-cut-holder-failover-with-locks`, `delegate-backup-handoff-failover`, the file-system
   perf matrix (nothing on the read path changed in this commit; commit 4's cost is above).
+
+## Plan 43 C7a, follow-up: the delegate-crash configuration with backups runs the mix
+
+C7a's commit 6 opted `locks-unlinked-delegated-dcrash` (delegate backups) out of the
+default clock-fault mix for its third finding (seed 2383: a speculative row never
+settled, no quiescence in 90 s). The finding was made on a tree before `b8686bf`, which
+fixed it: the deposed root had appended the delegate's batch, rebuilt and dropped it,
+and kept the generation's log index where the append had put it; root again, it
+inherited generation 2 past those rows and the delegate's re-stream skipped row 13, a
+refusal of node 2's forwarded rid. Nothing carried that row into the log, so node 3's
+`Local` speculation never retired (in seed 558 the skipped rows made an unlink take
+effect in the log that the spec refused).
+
+- `locks_unlinked_dcrash_config`: the opt-out removed (the mix runs with and without
+  backups). `locks_unlinked_dcrash_pause_config` keeps the mix off (an exact scenario,
+  as it ran before).
+- `regression_locks_unlinked_delegated_dcrash_pause_seed_558` runs seed 558 unclocked
+  (`pinned::run_seed`): with C7a's 1 000 ppm budget it took another trajectory and
+  passed with `b8686bf`'s meta change reverted, so the test had stopped guarding the
+  fix. It also runs seed 2383 with the budget set explicitly (the unsettled-speculation
+  form; it does not reproduce unbudgeted). Each part fails with `b8686bf`'s meta change
+  reverted and passes with it.
+- Sweeps (release, `sweep_config`, 6 threads), `locks-unlinked-delegated-dcrash` with
+  the mix: 0..2000 and 2000..4000, no failure (23 runs rebuild a deposed root); with
+  `b8686bf`'s meta change reverted, 2000..4000 fails [2383], 0..2000 none. No other
+  configuration's runs change (test-only change, no code).
+- Verification: `cargo fmt --check`, `cargo clippy -p constellation-authority --test sim
+  -- -D warnings`, the sim suite (release, 226 passed, 12 ignored).

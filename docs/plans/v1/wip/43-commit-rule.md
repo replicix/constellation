@@ -2845,18 +2845,20 @@ first part of C7a, landed early):
     restart and as a reboot, the count exact and the stand-still printed),
     the campaign preset `clock-rate`. The sweeps under the mix are clean but for
     what it found that no clock fault causes (PROGRESS), each reproduced without
-    one, and two of them open:
+    one; one of them is open:
     - **Open (liveness):** a node restarting in a cluster with delegated
       directories while the holder is down wedges it: no op answered for 540 s
       (`delegated-holder-cut` seed 139, `locks-unlinked-delegated-hcrash-backup`
       154, `locks-delegated` 2400; a plain crash and restart, no step, no new
       boot). The mix draws no reboot where `dirs` are delegated until it is
       fixed; the fix restores it.
-    - **Open (liveness):** a root paused 1.3 s and then a delegate crashed leaves
-      a speculative row unsettled, no quiescence in 90 s
+    - *Fixed:* a root paused 1.3 s and then a delegate crashed left a
+      speculative row unsettled, no quiescence in 90 s
       (`locks-unlinked-delegated-dcrash` seed 2383; a plain `Pause` of 1 310 to
-      1 329 ms). That configuration with delegate backups opts out of the mix
-      until it is fixed.
+      1 329 ms): a rebuilt, re-elected root inherited the generation past
+      rows its rebuild had dropped, so a delegate's refusal never reached the
+      log. `b8686bf` had fixed it already (the finding was made on a tree
+      before it); the configuration runs the mix with delegate backups again.
     - *Explained:* the directory real-time-order violation in the
       lag-at-expiry configurations with a node paused for seconds (seeds 5, 275,
       277) is the backup paused while its holder is cut from S3, a second

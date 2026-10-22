@@ -9731,14 +9731,6 @@ fn locks_unlinked_hcrash_config(backup: bool) -> SimConfig {
 fn locks_unlinked_dcrash_config(backup: bool) -> SimConfig {
     let base = locks_unlinked_delegated_config();
     SimConfig {
-        // Plan 43 C7a (commit 6): no default clock-fault mix with delegate
-        // backups. A pause or suspend of the root before the delegate's crash
-        // leaves node 3 a local speculative row that never settles (seed 2383 of
-        // `locks-unlinked-delegated-dcrash`: quiescence not reached; a plain
-        // Pause of the root reproduces it, for 1 308 + 2, 8, 13 or 21 ms), a
-        // latent bug the mix found and the clocks do not cause (PROGRESS, C7a
-        // commit 6).
-        clock_faults: !backup,
         core: if backup {
             std::sync::Arc::new(sim::run::deleg_backup_core_config)
         } else {
@@ -9763,9 +9755,13 @@ fn locks_unlinked_dcrash_config(backup: bool) -> SimConfig {
 /// learns it is deposed and rebuilds. Dropping those rows left the
 /// generation's log index where the append had raised it, so when node 1
 /// took the root over again it inherited the generation past the rows it
-/// no longer had, and the delegate's re-stream skipped them.
+/// no longer had, and the delegate's re-stream skipped them. An exact
+/// scenario (seed 2383 of `locks-unlinked-delegated-dcrash`, where the
+/// clock-fault mix found it, drew a 1.308 s suspend of node 1 at 0.559 s;
+/// this is a plain pause of about that length): no mix on top.
 fn locks_unlinked_dcrash_pause_config() -> SimConfig {
     let mut c = locks_unlinked_dcrash_config(true);
+    c.clock_faults = false;
     c.faults.insert(
         0,
         ScheduledFault {
@@ -9972,9 +9968,27 @@ fn regression_locks_unlinked_delegated_dbackup_random_seed_5681() {
 /// store and in the session's stream, and the cursor is 6.
 #[test]
 fn regression_locks_unlinked_delegated_dcrash_pause_seed_558() {
-    run_seed(558, locks_unlinked_dcrash_pause_config()).unwrap_or_else(|e| {
+    // Unclocked, as written: with C7a's rate budget on, seed 558 takes
+    // another trajectory and passes without the fix.
+    pinned::run_seed(558, locks_unlinked_dcrash_pause_config()).unwrap_or_else(|e| {
         panic!(
             "locks-unlinked-delegated-dcrash-pause seed 558: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=locks-unlinked-delegated-dcrash-pause"
+        )
+    });
+    // The same skip as the clock-fault mix found it (seed 2383 of
+    // `locks-unlinked-delegated-dcrash`): the skipped row is a delegate's
+    // refusal of a forwarded rid, so nothing in the log contradicts the
+    // spec, but node 3's `Local` speculation of it never retires and the
+    // cluster never quiesces. It needs the budgeted clock (1 000 ppm, set
+    // here, not taken from the default).
+    let cfg = SimConfig {
+        rate_budget_ppm: 1_000,
+        ..unclocked(locks_unlinked_dcrash_pause_config())
+    };
+    run_seed(2383, cfg).unwrap_or_else(|e| {
+        panic!(
+            "locks-unlinked-delegated-dcrash-pause seed 2383: {e}\n  replay with \
              AUTHORITY_SIM_CONFIG=locks-unlinked-delegated-dcrash-pause"
         )
     });
