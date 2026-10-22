@@ -24,8 +24,8 @@
 use super::{eventually, setup, ts};
 use crate::client::Client;
 use crate::kernel_races::{
-    dir_version, flock_turns, nlink_race, one_write, pc_prepare, pc_race, rename_ctime,
-    reopen_matches_view, Dropper, PcConfig, PcCounts,
+    dir_version, flock_turns, nlink_race, one_write, pc_prepare, pc_race, read_then_write,
+    rename_ctime, reopen_matches_view, Dropper, PcConfig, PcCounts, WriteShape,
 };
 use crate::s3env::{S3Env, BUCKET};
 use anyhow::{ensure, Context, Result};
@@ -868,3 +868,143 @@ twice!(
     dir_version_remote_dev_fuse,
     |n: &str, w| race_dir_version_remote(&name(n), w)
 );
+
+/// How long a daemon may take to exit after its unmount in
+/// [`race_probe_exit`]: far above a probe's own waits (about 2 s, at most
+/// 10 s), far below the harness's 600 s.
+const PROBE_EXIT_WITHIN: Duration = Duration::from_secs(30);
+
+/// Plan 42 §7.5: the daemon's exit while the kernel-fix probe holds a
+/// reply of its own mount. On a kernel with fix 0001 the probe's
+/// notification thread sits in `D` until a worker of the probe's mount
+/// answers the held `WRITE`; a daemon that exits in that window ends the
+/// workers first, and stays a zombie with two threads stuck in the kernel
+/// (the harness's 600 s wait, then an aborted connection). The unmount
+/// follows the mount after 0, 0.3, 1.2 and 2.5 s: before the probe's first
+/// hold, during it, during the notification's wait, and after the probe.
+/// A kernel without 0001 never blocks the probe, so the row passes there on
+/// any build (it is a guard); the fail-before needs a kernel with the fix.
+fn race_probe_exit(name: &str, wire: Wire) -> Result<()> {
+    let (_env, _root, mut c) = one_node(name, wire, &[], &[])?;
+    let r = (|| -> Result<()> {
+        let mut took = Vec::new();
+        for (round, delay_ms) in [0u64, 300, 1200, 2500].into_iter().enumerate() {
+            if round > 0 {
+                c.mount_view(None, &[])?;
+            }
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            let t = std::time::Instant::now();
+            let status = c.unmount_exit(PROBE_EXIT_WITHIN)?;
+            took.push(t.elapsed().as_millis());
+            ensure!(
+                status.success(),
+                "round {round}: the daemon exited with {status}"
+            );
+        }
+        result(name, &format!("rounds=4 exit_ms={took:?}"));
+        Ok(())
+    })();
+    let _ = c.unmount();
+    r
+}
+
+twice!(probe_exit, probe_exit_dev_fuse, |n: &str, w| {
+    race_probe_exit(&name(n), w)
+});
+
+/// The repair's bound in [`race_repair_stall`] (the default is 1 s).
+const STALL_BOUND_MS: u64 = 200;
+
+/// Plan 42 F10 and §7.5: W2 forced on shows what the probe says it costs.
+/// `CONSTELLATION_FUSE_WRITE_REPAIR=on` and `KEEP_CACHE=off`; once the
+/// kernel probe has answered, [`read_then_write`] runs twice, each round
+/// reading two pages and then writing:
+///
+/// - half a page (the write's tail page, which the repair leaves out): no
+///   stall on any kernel, no late repair;
+/// - both pages whole: a kernel with fix 0001 keeps the writer's own folios
+///   under writeback until the reply the repair lane holds, so every repair
+///   waits for the bound (`repairs_late` ≥ 1 per round, each write takes the
+///   bound); without the fix there is no wait.
+///
+/// Either way, no stale read-back.
+fn race_repair_stall(name: &str, wire: Wire) -> Result<()> {
+    let bound = STALL_BOUND_MS.to_string();
+    let (_env, _root, mut c) = one_node(
+        name,
+        wire,
+        &[
+            ("CONSTELLATION_FUSE_KEEP_CACHE", "off"),
+            ("CONSTELLATION_FUSE_WRITE_REPAIR", "on"),
+            ("CONSTELLATION_FUSE_WRITE_REPAIR_WAIT_MS", &bound),
+        ],
+        &[],
+    )?;
+    let r = (|| -> Result<()> {
+        // The probe answers a few seconds after the first mount. Its
+        // verdict is reported with the override's source while W2 is
+        // forced, so wait for `fixed` (the table's `not_fixed` is the
+        // answer before it) and take what stands after 20 s.
+        let mut verdict = String::from("unknown");
+        let _ = eventually("the kernel probe's answer", Duration::from_secs(20), || {
+            let m = mount_status(&c, None)?;
+            let v = &m["kernel_workarounds"]["verdicts"]["write_through_writeback"];
+            verdict = v["verdict"].as_str().unwrap_or("unknown").to_string();
+            ensure!(verdict == "fixed", "not yet: {verdict}");
+            Ok(())
+        });
+        let path = c.mnt.join("stall.dat");
+        pc_prepare(&path)?;
+        let half = read_then_write(&path, 30, WriteShape::HalfPage)?;
+        let m_half = mount_status(&c, None)?;
+        let two = read_then_write(&path, 30, WriteShape::TwoPages)?;
+        let m = mount_status(&c, None)?;
+        let late_half = counter(&m_half, "repairs_late");
+        let late_two = counter(&m, "repairs_late") - late_half;
+        result(
+            name,
+            &format!(
+                "verdict={verdict} bound_ms={STALL_BOUND_MS} half_page: {} repairs_late={late_half} two_pages: {} repairs_late={late_two} {}",
+                half.line(),
+                two.line(),
+                counters_line(&m)
+            ),
+        );
+        ensure!(
+            half.stale == 0 && two.stale == 0,
+            "{} + {} stale read-backs",
+            half.stale,
+            two.stale
+        );
+        ensure!(
+            late_half == 0,
+            "{late_half} repairs of a tail page ran into the bound"
+        );
+        let (p50, _) = two.p50_max();
+        let bound = u128::from(STALL_BOUND_MS);
+        match verdict.as_str() {
+            "fixed" => {
+                ensure!(
+                    late_two > 0 && p50 >= bound / 2,
+                    "kernel fix 0001 present but the repairs did not wait for their bound \
+                     (late {late_two}, median write {p50} ms)"
+                );
+            }
+            "not_fixed" => {
+                ensure!(
+                    late_two == 0 && p50 < bound / 2,
+                    "no kernel fix, yet repairs ran into their bound \
+                     (late {late_two}, median write {p50} ms)"
+                );
+            }
+            other => eprintln!("    {name}: probe verdict {other}: nothing asserted on the stall"),
+        }
+        Ok(())
+    })();
+    let _ = c.unmount();
+    r
+}
+
+twice!(repair_stall, repair_stall_dev_fuse, |n: &str, w| {
+    race_repair_stall(&name(n), w)
+});

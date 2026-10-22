@@ -689,6 +689,10 @@ pub const SKIPPED: &[(&str, Skip)] = &[
     ("kernel-race-dir-version-remote-dev-fuse", Skip::Local(&[KERNEL_RACE, TRANSPORT])),
     ("kernel-race-dir-ttl-strict-lone", Skip::Local(&[KERNEL_RACE, CTO_STRICT])),
     ("kernel-race-dir-ttl-strict-lone-dev-fuse", Skip::Local(&[KERNEL_RACE, TRANSPORT, CTO_STRICT])),
+    ("kernel-race-probe-exit", Skip::Local(&[KERNEL_RACE])),
+    ("kernel-race-probe-exit-dev-fuse", Skip::Local(&[KERNEL_RACE, TRANSPORT])),
+    ("kernel-race-repair-stall", Skip::Local(&[KERNEL_RACE])),
+    ("kernel-race-repair-stall-dev-fuse", Skip::Local(&[KERNEL_RACE, TRANSPORT])),
 ];
 
 impl Skip {

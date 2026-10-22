@@ -276,10 +276,10 @@ pub fn start_probe() {
 }
 
 /// Wait, at most `bound`, until no probe is running; `false` if one still
-/// is. Before an `exec` (a handover) or a deliberate exit: the probe holds
-/// a reply of its own mount on purpose, and a thread of this process may
-/// be in `D` until a timer of this process releases it (`probe`'s
-/// `RUNNING`).
+/// is. Before an `exec` (a handover): the probe holds a reply of its own
+/// mount on purpose, and a thread of this process may be in `D` until a
+/// worker of this process releases it (`probe`'s `RUNNING`). An exit does
+/// not wait for it: it aborts it (`probe::stop`, run `atexit`).
 pub fn wait_probe_done(bound: std::time::Duration) -> bool {
     probe::wait_done(bound)
 }

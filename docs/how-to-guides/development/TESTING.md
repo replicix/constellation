@@ -3206,6 +3206,7 @@ the handover rows are `/dev/fuse` only (a ring cannot be handed over).
 | `kernel-race-rename-ctime` | 2b | the same for a renamed file's `ctime` (`CONSTELLATION_FAULT_GETATTR_DELAY_INO`) | 0 of 20 |
 | `kernel-race-dir-version-remote` | guard | the `mkdir` made on another node | 0 of 20 |
 | `kernel-race-dir-ttl-strict-lone` | 2a | the `dir-nlink` workload on a lone `--cto strict` node (its kernel TTL is not 0) | 0 mismatches |
+| `kernel-race-probe-exit` | K6 | the daemon's unmount 0, 0.3, 1.2 and 2.5 s after its mount, while the kernel-fix probe may hold a reply of its own mount | the daemon exits within 30 s each time (on a kernel with fix 0001 an exit during the probe used to leave a zombie with two threads in `D`; a guard on kernels without it) |
 
 `CONSTELLATION_HARNESS_KERNEL_RACE_SECS` shortens the 60 s runs while
 developing. The counters the scenarios read are `node.status`'s

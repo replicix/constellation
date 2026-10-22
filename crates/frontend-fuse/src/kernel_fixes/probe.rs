@@ -14,6 +14,7 @@ use constellation_vfs::{
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once};
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,11 @@ const DIR: Ino = 3;
 /// How long a held reply waits for the probe's release at most (a probe
 /// thread that died must not wedge the probe mount).
 const HOLD_MAX: Duration = Duration::from_secs(5);
+
+/// An exit gives a running probe this long to end by itself before it is
+/// aborted, and then this long to unwind.
+const EXIT_GRACE: Duration = Duration::from_millis(200);
+const EXIT_UNWIND: Duration = Duration::from_secs(10);
 
 /// How long a notification may take to count as having waited for the
 /// held `WRITE`.
@@ -44,6 +50,8 @@ struct State {
     hold_getattr: bool,
     getattr_held: bool,
     release_getattr: bool,
+    /// [`abort`]: nothing is held from now on, and every wait ends.
+    aborted: bool,
 }
 
 /// The probe's filesystem (module doc).
@@ -94,7 +102,7 @@ impl ProbeVfs {
     fn wait_release(&self, released: impl Fn(&State) -> bool) {
         let deadline = Instant::now() + HOLD_MAX;
         let mut st = self.state.lock().unwrap();
-        while !released(&st) {
+        while !released(&st) && !st.aborted {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return;
@@ -114,7 +122,7 @@ impl ProbeVfs {
         let mut st = self.state.lock().unwrap();
         while !cond(&st) {
             let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
+            if left.is_zero() || st.aborted {
                 return false;
             }
             st = self.cv.wait_timeout(st, left).unwrap().0;
@@ -145,7 +153,7 @@ impl Vfs for ProbeVfs {
         let (attr, hold) = {
             let mut st = self.state.lock().unwrap();
             let attr = self.attr_of(&st, ino);
-            let hold = ino == DIR && st.hold_getattr;
+            let hold = ino == DIR && st.hold_getattr && !st.aborted;
             if hold {
                 st.hold_getattr = false;
                 st.getattr_held = true;
@@ -312,7 +320,7 @@ impl Vfs for ProbeVfs {
         let n = data.as_slice().len() as u32;
         let hold = {
             let mut st = self.state.lock().unwrap();
-            let hold = st.hold_write;
+            let hold = st.hold_write && !st.aborted;
             if hold {
                 st.hold_write = false;
                 st.write_held = true;
@@ -499,9 +507,48 @@ pub const PROBE_ENV: &str = "CONSTELLATION_FUSE_KERNEL_PROBE";
 /// sits in `D` until that reply is released by a timer of this process.
 /// An `exec` (a handover) or an exit in that window would wait for the
 /// `D` thread, which waits for a reply only the gone timer could send: a
-/// stuck process. Those paths wait for it first ([`wait_done`]).
+/// stuck process. A handover waits for it first ([`wait_done`]); an exit
+/// gives it a moment and then aborts it ([`stop`], run `atexit`).
 static RUNNING: Mutex<bool> = Mutex::new(false);
 static DONE: Condvar = Condvar::new();
+
+/// The running probe's filesystem, for [`abort`].
+static ACTIVE: Mutex<Option<Arc<ProbeVfs>>> = Mutex::new(None);
+/// [`abort`] was called: a probe that has not started does not, and one
+/// that has ends with `Unknown`.
+static ABORTED: AtomicBool = AtomicBool::new(false);
+
+/// Release whatever the probe holds, and hold nothing more: its held
+/// `WRITE` and `GETATTR` are answered at once, its waits end, its
+/// verdicts are `Unknown`. For the process's exit, while the mount's
+/// workers still run: the held `WRITE` is the one reply a thread of this
+/// process (the probe's notification) waits for in `D` on a kernel with
+/// fix 0001, so the exit would wait forever for a reply only a worker the
+/// exit itself ends could send (found by §7.5's run on a patched kernel).
+pub(crate) fn abort() {
+    ABORTED.store(true, Ordering::SeqCst);
+    let active = ACTIVE.lock().unwrap().clone();
+    if let Some(vfs) = active {
+        vfs.set(abort_state);
+    }
+}
+
+fn abort_state(st: &mut State) {
+    st.aborted = true;
+    st.release_write = true;
+    st.release_getattr = true;
+}
+
+/// For an exit: give a probe `grace` to end by itself, then [`abort`] it
+/// and wait for it to unwind (at most `unwind`); `false` if it is still
+/// running after that.
+pub(crate) fn stop(grace: Duration, unwind: Duration) -> bool {
+    if wait_done(grace) {
+        return true;
+    }
+    abort();
+    wait_done(unwind)
+}
 
 /// Wait until the probe is not running, at most `bound` (its own waits
 /// are bounded by `HOLD_MAX`); `false` if it still is.
@@ -522,6 +569,16 @@ pub(crate) fn start_once() {
             return;
         }
         *RUNNING.lock().unwrap() = true;
+        // An exit while the probe holds a reply must not wait for it
+        // (`abort`): `exit(3)` runs this on every `std::process::exit` and
+        // on a return from `main`.
+        extern "C" fn stop_at_exit() {
+            let _ = std::panic::catch_unwind(|| stop(EXIT_GRACE, EXIT_UNWIND));
+        }
+        // SAFETY: registers a handler that only touches this module's
+        // statics; a nonzero return (out of memory) costs the exit
+        // protection, not correctness.
+        unsafe { libc::atexit(stop_at_exit) };
         let spawned = std::thread::Builder::new()
             .name("fuse-kernel-probe".into())
             .spawn(|| {
@@ -570,6 +627,10 @@ fn run() -> (Verdict, Verdict) {
         }
     }
     let vfs = Arc::new(ProbeVfs::default());
+    *ACTIVE.lock().unwrap() = Some(vfs.clone());
+    if ABORTED.load(Ordering::SeqCst) {
+        vfs.set(abort_state);
+    }
     let mut cfg = crate::TransportConfig {
         policy: crate::TransportPolicy::DevFuse,
         ..Default::default()
@@ -594,6 +655,7 @@ fn run() -> (Verdict, Verdict) {
         Err(error) => {
             tracing::debug!(%error, "the FUSE kernel probe could not mount");
             let _ = std::fs::remove_dir(&dir);
+            *ACTIVE.lock().unwrap() = None;
             return (Verdict::Unknown, Verdict::Unknown);
         }
     };
@@ -606,6 +668,10 @@ fn run() -> (Verdict, Verdict) {
     let _ = control.unmount();
     let _ = served.join();
     let _ = std::fs::remove_dir(&dir);
+    *ACTIVE.lock().unwrap() = None;
+    if ABORTED.load(Ordering::SeqCst) {
+        return (Verdict::Unknown, Verdict::Unknown);
+    }
     (w, d)
 }
 
@@ -765,6 +831,37 @@ fn probe_dir(mnt: &Path, vfs: &Arc<ProbeVfs>) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An exit aborts a probe that holds a reply: the held wait ends at
+    /// once instead of at `HOLD_MAX`, nothing is held afterwards, and the
+    /// probe's own waits end. (Without this the held `WRITE` is the reply a
+    /// thread in `D` waits for when the process exits: a stuck process.)
+    #[test]
+    fn an_abort_releases_what_the_probe_holds() {
+        let vfs = Arc::new(ProbeVfs::default());
+        vfs.set(|st| st.hold_write = true);
+        let waiter = {
+            let vfs = vfs.clone();
+            std::thread::spawn(move || {
+                let t = Instant::now();
+                vfs.wait_release(|st| st.release_write);
+                t.elapsed()
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        vfs.set(abort_state);
+        let waited = waiter.join().unwrap();
+        assert!(
+            waited < Duration::from_secs(2),
+            "released by the abort, not by HOLD_MAX: {waited:?}"
+        );
+        // Nothing is held or waited for afterwards.
+        let t = Instant::now();
+        assert!(!vfs.wait_for(HOLD_MAX, |st| st.write_held));
+        vfs.wait_release(|st| st.release_getattr && !st.aborted);
+        assert!(t.elapsed() < Duration::from_secs(2));
+        assert!(vfs.state.lock().unwrap().aborted);
+    }
 
     /// A running thread, a sleeping one and one that does not exist are
     /// not "blocked in the kernel": under host load a notification thread

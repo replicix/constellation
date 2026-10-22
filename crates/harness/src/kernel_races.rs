@@ -821,3 +821,80 @@ mod tests {
         assert_eq!(n.mismatches, 0);
     }
 }
+
+/// What [`read_then_write`] saw.
+#[derive(Debug, Default, Clone)]
+pub struct StallCounts {
+    pub rounds: u64,
+    /// Read-backs that differed from what was written.
+    pub stale: u64,
+    /// Each write's latency, in order.
+    pub write_ms: Vec<u128>,
+}
+
+impl StallCounts {
+    /// `p50` and `max` of the write latencies, in ms.
+    pub fn p50_max(&self) -> (u128, u128) {
+        let mut v = self.write_ms.clone();
+        v.sort_unstable();
+        (
+            v.get(v.len() / 2).copied().unwrap_or(0),
+            v.last().copied().unwrap_or(0),
+        )
+    }
+
+    pub fn line(&self) -> String {
+        let (p50, max) = self.p50_max();
+        format!(
+            "rounds={} stale={} write_p50_ms={p50} write_max_ms={max}",
+            self.rounds, self.stale
+        )
+    }
+}
+
+/// What [`read_then_write`] writes after it read two whole pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteShape {
+    /// The first half of the first page: the page is the write's tail
+    /// (the page the writer may hold locked, which the repair leaves out,
+    /// plan 42 KF2), so no recorded page is left to repair.
+    HalfPage,
+    /// Both pages whole: neither is the tail, so the repair drops both —
+    /// the writer's own folios, which on a kernel with fix 0001 are under
+    /// writeback until the reply the repair lane holds (F10).
+    TwoPages,
+}
+
+/// The write-repair stall's workload (plan 42 F10, §7.5): per round two
+/// pages of `path` (a file [`pc_prepare`] made) are **read whole, then
+/// written** as `shape` says, on a descriptor opened for the round — an
+/// open without `FOPEN_KEEP_CACHE` arms the inode and the reads are
+/// recorded, so the write's claim finds its pages among the recorded reads.
+/// Rounds are serial, so nothing else of the inode is in flight and the
+/// repair's clock runs.
+pub fn read_then_write(path: &Path, rounds: u64, shape: WriteShape) -> Result<StallCounts> {
+    let p = page_size();
+    let mut c = StallCounts::default();
+    for round in 0..rounds {
+        let page = 2 * (round % (PAGES / 2));
+        let f = open_rw(path)?;
+        let mut whole = vec![0u8; 2 * p as usize];
+        f.read_exact_at(&mut whole, page * p)?;
+        let byte = (round as u8).wrapping_add(1).max(1);
+        let len = match shape {
+            WriteShape::HalfPage => (p / 2) as usize,
+            WriteShape::TwoPages => 2 * p as usize,
+        };
+        let data = vec![byte; len];
+        let t = Instant::now();
+        f.write_all_at(&data, page * p)?;
+        c.write_ms.push(t.elapsed().as_millis());
+        let mut back = vec![0u8; len];
+        f.read_exact_at(&mut back, page * p)?;
+        if back != data {
+            c.stale += 1;
+        }
+        c.rounds += 1;
+    }
+    Ok(c)
+}

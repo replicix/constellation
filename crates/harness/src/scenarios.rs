@@ -2109,6 +2109,34 @@ pub const SCENARIOS: &[Scenario] = &[
         caps: &[],
         run: kernel_races::dir_ttl_strict_lone_dev_fuse,
     },
+    Scenario {
+        name: "kernel-race-probe-exit",
+        desc: "plan 42 §7.5 — the daemon exits promptly when its unmount comes while the kernel-fix probe holds a reply (a kernel with fix 0001; a guard elsewhere)",
+        requires: &[],
+        caps: &[],
+        run: kernel_races::probe_exit,
+    },
+    Scenario {
+        name: "kernel-race-probe-exit-dev-fuse",
+        desc: "plan 42 §7.5 — kernel-race-probe-exit over /dev/fuse",
+        requires: &[],
+        caps: &[],
+        run: kernel_races::probe_exit_dev_fuse,
+    },
+    Scenario {
+        name: "kernel-race-repair-stall",
+        desc: "plan 42 F10 — W2 forced on: a read then a partial write of one page; with kernel fix 0001 every repair waits for its bound, without it none does",
+        requires: &[],
+        caps: &[],
+        run: kernel_races::repair_stall,
+    },
+    Scenario {
+        name: "kernel-race-repair-stall-dev-fuse",
+        desc: "plan 42 F10 — kernel-race-repair-stall over /dev/fuse",
+        requires: &[],
+        caps: &[],
+        run: kernel_races::repair_stall_dev_fuse,
+    },
 ];
 
 /// The host-load campaign's own scenarios (`tools/load-campaign`): run by
