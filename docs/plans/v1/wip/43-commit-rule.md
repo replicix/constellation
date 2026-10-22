@@ -827,6 +827,15 @@ seal path, `on_deleg_sealed`, before the end).
    ```
    (`Own` replaces `(0, 0)`). `JournalTx` gains `tail_of:
    Option<JournalPos>` (set in C1) and the ship plan maps it to `Tail`.
+   *As specified for the coder (C3 spec D1, §11 Q24 (a)): no envelope
+   change. A row's identity is the envelope's `rows` (own epoch) and
+   `origins` `(gen, idx)` (delegate rows) plus C1's appended `TailOf {
+   epoch, jseq }` record (re-shipped root rows, transitive); a
+   `Vec<Origin>` would make every existing segment undecodable (postcard)
+   and repeat `TailOf`. The root's append of a delegate's transaction
+   becomes verbatim instead (the streamed records exactly, in order;
+   apply tolerant and counted, `deleg_append_skipped`), which item 3's
+   overlap check and I2 (c) for `DelegGroup` answers need.*
 2. **The successor applies a sealed tail verbatim.** `apply_backup_tail`
    (`backup.rs:2364-2428`) appends each tail transaction to its journal
    with its records unchanged and `tail_of` set, and applies them
@@ -841,6 +850,18 @@ seal path, `on_deleg_sealed`, before the end).
    the archive cannot hold a committed row twice unless a bug made it,
    which I2's check catches) — the dedup-by-rid skip in
    `apply_backup_tail` becomes a `debug_assert!` plus a counted error.
+   *As specified for the coder (C3 spec D3, D4, §11 Q24 (c)):* the strand,
+   the tail and item 3's move and re-append are **one store transaction**
+   (`Meta::reship_at_takeover`): once moved and superseded rows are no
+   longer queued, the queue's read wait no longer hides the gap between a
+   rollback and its re-application. Inside it, every live entry of the
+   successor that the tail itself carries — its `Streamed` entries of the
+   predecessor's epoch (backups subscribe to the stream) and gated
+   shadows or hints whose rid a tail transaction completes or refuses —
+   is rolled back and dropped (*superseded*), never queued and never
+   counted as a rollback: that is what makes the successor's replica the
+   archive prefix the tail was built on once C1 stops gated entries from
+   stranding.
 3. **A delegate that takes the root over** (the two-node headline case:
    node a is the delegate of `d1` and the backup of root b; at a's seal
    takeover a's journal already holds its own rows `(g, 5)`, `(g, 6)`
@@ -867,7 +888,9 @@ seal path, `on_deleg_sealed`, before the end).
       acknowledged only once the root appended it, i.e. at or below the
       cursor the `Recall` recorded; with a recorded backup, the root
       drained that backup before ending `g`), and their clients retry by
-      rid;
+      rid — *except a `Lone`-class row (the delegate was lone when it
+      journaled it and answered its own client on its disk), which goes to
+      the lone-branch queue (C3 spec D5)*;
    4. end each still-live generation with `Recall { through }` (C2's
       item 7) covering the re-appended rows.
    Why step 3 applies cleanly on the post-tail replica (the ownership
@@ -902,14 +925,22 @@ seal path, `on_deleg_sealed`, before the end).
    in its own transaction, under a key of C3's own, and `begin_local`
    must refuse the delegate execution under an ended generation: the
    rule is that while a sequencer's gate is open none of its own paths
-   executes a mutation on the replica.
+   executes a mutation on the replica. *(C3 spec D7: the key is
+   `deleg_ended_at_gate:{gen}`, replacing `deleg_stranded:{gen}`, written
+   in the re-ship's one transaction; `begin_local`'s refusal and the
+   stopped-at-install rule read it; the hole and the holed recall answer
+   go.)*
 4. **A deposed root keeps another generation's rows as a member copy**
    (§5.6) instead of the `RebuildReplica` → `reset_for_rebuilt_ns_tx`
    → `Records` replays path. `recover_deposed` (`jobs.rs:1381-1410`)
    never emits `RebuildReplica` for captured journals;
    `reset_for_rebuilt_ns_tx` keeps only the uncaptured fallback
    (`CONSTELLATION_HOLDER_CAPTURE=0`), where it queues nothing for gated
-   rows.
+   rows. *(C3 spec D12, D13: the rebuild criterion is
+   `uncaptured_tx_count() > 0`, not `journal_len() > 0` — a deposed root
+   that is also a delegate keeps its own delegate rows, its live stream;
+   the uncaptured fallback keeps today's replay of a node's own delegate
+   rows, counted and documented.)*
 5. **Deleted with the paths**: `folded_into_later_manifest` and its two
    call sites (`replay.rs:75-99`, `:140-144`, `:533-537`),
    `rebase_on_truncate`, `truncate_base` in `QueuedReplay` (or the
@@ -923,6 +954,17 @@ seal path, `on_deleg_sealed`, before the end).
    (`client.rs:2547-2569`; the deposed journal no longer holds anything
    but the lone branch); the 2945 fix's `QueuedReplay.deps` (no deposed
    replay of a forwarded op exists).
+   *As specified for the coder (C3 spec D8–D11, §11 Q24 (e)–(h)): after
+   C3 every queue entry is a lone-branch row, so the fold, `as_folded` and
+   the conditional truncate are kept as the lone branch's replay shape (C5
+   renames them), and so is the fold's test (`deposed-reintegration` is
+   the lone branch); `QueuedReplay.deps` and its merge are kept (a lone
+   root's own-client row may depend on appended delegate rows that now
+   return by the member copy or the delegate's re-stream);
+   `settled_outcome`'s deposed-journal branch is kept for the window
+   between a deposition and its recovery; `Held` for lost deps is kept,
+   counted outside the lone branch (the sim fails on any), for C5 to
+   delete.*
 6. `TailFollows` stays as the seal record (Delos: the sealed loglet's
    suffix follows) with `through` (C1); its session effect (`owe`) is
    unchanged.
@@ -1064,7 +1106,16 @@ rows it holds for that group until the archive carries them:
   sends `DelegSeal` to the previous root(s) named by the archive's
   epoch markers since the generation's last appended index. Dropped when
   the log's `deleg_log_idx` passes them or the `Recall { through }`
-  lands.
+  lands. *As specified for the coder (C3 spec D6, §11 Q24 (d)): markers do
+  not name the previous holder, and a claim of a released lease ships
+  none, so the new root instead seals its claim's `prev.holder` when it
+  inherits such a generation (persisted per generation with any
+  predecessor still unheard, `deleg_prev_roots:{gen}`), appends what it
+  answers, and counts the set satisfied by each answer or by the
+  delegate's re-stream through a `stream_head` it reported to this root
+  (the delegate keeps every row until the log carries it). The
+  generation's end waits for it (Q1); `abandon-group --gen` escapes. A
+  previous root's answer never ends the generation nor re-delegates.*
 - `status.ack.member_copies` lists `(kind, epoch|gen, rows, oldest_ms)`.
 
 This answers the paused seeds' design question: a deposed root neither
@@ -1833,7 +1884,15 @@ its own rows as generation rows before its `Recall`
 generations (`recover_deposed`, `jobs.rs:1381-1410`; `backup.rs`
 `DELEG_BACKUP_BASE`); `DelegSeal` to previous roots for an inherited
 generation without a recorded backup (`on_deleg_expiry`,
-`delegate.rs:3010-3117`); the deletions below.
+`delegate.rs:3010-3117`); the deletions below. *The coder spec
+(`c3-spec`, five commits: the verbatim root append, the verbatim tail in
+one transaction, the delegate taking the root over, the deposed root's
+member copy and the predecessor seal, then the assertions, model, strict
+flags and docs) narrows this per §11 Q24: no `Origin` in the envelope;
+the fold, the conditional truncate, `QueuedReplay.deps`, `settled_outcome`'s
+branch and `Held` stay (lone branch); new sim config
+`delegated-root-deposed-delegate-dies` (fail-before against the member
+copy without the predecessor seal).*
 
 **Deleted.** `folded_into_later_manifest` (`replay.rs:75-99`, `:140-144`,
 `:533-537`), `rebase_on_truncate`, `truncate_pre_manifest`,
@@ -3463,8 +3522,8 @@ not loosen the bar.
 The final list. Each says what it **blocks**; a question that the code
 answered is marked **decided** (the plan implements the decision; the
 maintainer may still overturn it). Blocking before C0: Q7, Q10a.
-Before C1: Q1, Q13, Q22. Before C2: Q2, Q4, Q9, Q14, Q15, Q16, Q21. Before C4:
-Q6. Before C6: Q5. Before C7b: Q10b, Q10c, Q23. Before C7-F: Q17 (F-a),
+Before C1: Q1, Q13, Q22. Before C2: Q2, Q4, Q9, Q14, Q15, Q16, Q21. Before C3:
+Q24. Before C4: Q6. Before C6: Q5. Before C7b: Q10b, Q10c, Q23. Before C7-F: Q17 (F-a),
 Q18 (F-b). Before C7-H1: Q19. Before C7a's commits 2–4: Q20.
 
 **Answered by the maintainer (2026-10-17): every recommendation below
@@ -3746,6 +3805,34 @@ to land before C0.
   and an in-place `TailFollows` field (as Q21 (a) did for `RecallCut`):
   *recommended*.
   **Answered 2026-10-22:** (a), (b) and (c) taken.
+
+- **Q24 — C3's coder-spec decisions (specified 2026-10-22).** *Blocks
+  C3* (the C3 coder spec, §14, has the detail).
+  (a) No `Origin` in the segment envelope: identity is the envelope's
+  `rows`/`origins` plus C1's `TailOf`: *recommended*.
+  (b) The root's append of a delegate's transaction journals it verbatim;
+  the apply stays tolerant and counts every skip (the sim fails on any),
+  rather than an exact apply that would stall a generation on a bug:
+  *recommended*.
+  (c) The takeover's re-ship (strand, superseded own entries, own-row
+  move, verbatim tail, re-append, fence mark) is one store transaction,
+  rather than separate transactions plus a new read wait on the moved
+  keys: *recommended*, if the measured writer-lock hold for a 10 000-row
+  tail is acceptable.
+  (d) A root inheriting a generation with no recorded backup seals its
+  claim's predecessor (persisted, satisfied by its answer or the
+  delegate's re-stream; the end waits, Q1), instead of "roots named by
+  the archive's epoch markers" (not computable) or a new log record
+  naming each predecessor: *recommended*.
+  (e) The fold and the conditional truncate stay as the lone branch's
+  replay shape (C5 renames them): *recommended*.
+  (f) `QueuedReplay.deps` and its merge stay: *recommended*.
+  (g) `settled_outcome`'s deposed-journal branch stays (the window between
+  a deposition and its recovery): *recommended*.
+  (h) `Held` for lost deps stays, counted outside the lone branch; C5
+  deletes it if the count stayed 0: *recommended*.
+  (i) The uncaptured fallback keeps today's replay of a node's own
+  delegate rows, counted and documented: *recommended*.
 
 ### 11.1 Deferred (not in this plan)
 
