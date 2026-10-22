@@ -2031,3 +2031,81 @@ fn a_later_rename_of_a_hinted_name_ends_the_hint() {
         Some("q19"),
     );
 }
+
+/// Plan 45 review: an `Exists` hint whose entry names an inode this
+/// replica already holds under another name. The holder linked (or
+/// renamed) `a` to `b`; before that segment arrived here, this node's
+/// `create b` (`O_EXCL`) was refused with the entry, `Create { b, X }`.
+/// Installed, the hint's create put a fresh inode record over `X` —
+/// size 0, no manifest, `nlink` 1 — and covered its keys, so a `stat` or
+/// `read` of either name answered from the reset inode at once (no
+/// session wait) until the segment arrived. Such a hint is not installed:
+/// the refusal is uncovered, and reads wait for the log.
+fn a_hint_naming_a_held_inode_keeps_it(segment: LogRecord, names: &[&str], nlink: u32) {
+    let t0 = constellation_fs_core::types::now_ns() + STAMP_MARGIN_NS;
+    let x = ino(60);
+    let (write, _) = write_manifest(x, 7, 100, t0 + 1);
+    let first = [create("a", x, t0), write];
+    let meta = Meta::open_in_memory().unwrap();
+    apply(&meta, 1, 1, &first);
+    let held = meta.getattr(x).unwrap().unwrap();
+    assert_eq!((held.size, held.nlink), (100, 1));
+    let installed = meta
+        .install_hint_from(Some(rid(61)), &[create("b", x, t0)], shipped(2), 1, 0)
+        .unwrap();
+    let now = meta.getattr(x).unwrap().unwrap();
+    assert_eq!(
+        (now.size, now.nlink),
+        (100, 1),
+        "the hint reset the inode this replica holds (installed: {installed})"
+    );
+    assert!(meta.manifest(x).unwrap().is_some(), "the manifest is gone");
+    assert!(
+        !installed,
+        "a hint that cannot apply cleanly covers its keys"
+    );
+    assert!(meta.lookup(ROOT_INO, "b").unwrap().is_none());
+    assert!(!meta.has_outstanding_speculation());
+
+    apply(&meta, 2, 1, std::slice::from_ref(&segment));
+    let after = meta.getattr(x).unwrap().unwrap();
+    assert_eq!((after.size, after.nlink), (100, nlink));
+    for name in names {
+        assert_eq!(meta.lookup(ROOT_INO, name).unwrap().map(|e| e.ino), Some(x));
+    }
+    let reference = Meta::open_in_memory().unwrap();
+    apply(&reference, 1, 1, &first);
+    apply(&reference, 2, 1, &[segment]);
+    assert_eq!(raw_ns(&meta), raw_ns(&reference), "the replica diverged");
+}
+
+#[test]
+fn a_hint_for_a_second_hard_link_keeps_the_held_inode() {
+    let t = constellation_fs_core::types::now_ns() + STAMP_MARGIN_NS + 10;
+    a_hint_naming_a_held_inode_keeps_it(
+        LogRecord::Link {
+            ino: ino(60),
+            parent: ROOT_INO,
+            name: "b".into(),
+            time_ns: t,
+        },
+        &["a", "b"],
+        2,
+    );
+}
+
+#[test]
+fn a_hint_for_a_renamed_name_keeps_the_held_inode() {
+    let t = constellation_fs_core::types::now_ns() + STAMP_MARGIN_NS + 10;
+    a_hint_naming_a_held_inode_keeps_it(
+        LogRecord::Rename {
+            parent: ROOT_INO,
+            name: "a".into(),
+            new_parent: ROOT_INO,
+            new_name: "b".into(),
+            time_ns: t,
+        },
+        &["b"],
+        1,
+    );
+}

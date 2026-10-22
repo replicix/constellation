@@ -181,6 +181,9 @@ fn a_shadow_survives_an_unrelated_rename_tailed_under_it() {
 /// B-2 closed it in the meta layer too: a tailed segment overlapping
 /// outstanding speculation goes in *under* it (the hint is rolled back,
 /// the renames applied, the hint redone or retired), so it converges.
+/// Plan 45 follow-up: such a hint is no longer installed at all — its
+/// create would have replaced `f0`'s inode record (`Meta::install_hint_from`);
+/// the refusal is uncovered and the replica converges from the log alone.
 #[test]
 fn a_hint_installed_on_a_stale_base_converges() {
     let segments = holder_log();
@@ -195,7 +198,7 @@ fn a_hint_installed_on_a_stale_base_converges() {
         }
         Replica::entry_as_record(&m, ROOT_INO, "f1").unwrap()
     };
-    assert!(Replica::install_hint(
+    assert!(!Replica::install_hint(
         &requester,
         rid(2, 99),
         &[f1_after_15],

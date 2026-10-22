@@ -598,6 +598,39 @@ fn live_speculation_touches(
     Ok(false)
 }
 
+/// Whether a hint's entry (`Meta::entry_as_record`'s create) names an
+/// inode `ns` holds while its own name does not name it yet: installing
+/// it would replace the inode record (see `Meta::install_hint_from`).
+fn hint_names_a_held_inode(
+    r: &impl Readable,
+    meta: &Meta,
+    records: &[LogRecord],
+) -> Result<bool, MetaError> {
+    for rec in records {
+        let (parent, name, ino) = match rec {
+            LogRecord::Create {
+                parent, name, ino, ..
+            }
+            | LogRecord::Mkdir {
+                parent, name, ino, ..
+            }
+            | LogRecord::Symlink {
+                parent, name, ino, ..
+            }
+            | LogRecord::Mknod {
+                parent, name, ino, ..
+            } => (*parent, name.as_str(), *ino),
+            _ => continue,
+        };
+        if ns::get_inode_record(r, &meta.ns, ino)?.is_some()
+            && ns::get_dentry_record(r, &meta.ns, parent, name)?.map(|d| d.ino) != Some(ino)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn streamed_entry_with(
     r: &impl Readable,
     meta: &Meta,
@@ -2523,7 +2556,15 @@ impl Meta {
     ///   overtake each other) would put the old entry back over it
     ///   (backup-crash-slow seed 601075: the `Exists` reply to `create
     ///   f0` arrived after the shadow of the later `rename f0 f1`, and the
-    ///   hint left `f0` and `f1` on one inode).
+    ///   hint left `f0` and `f1` on one inode);
+    /// - the entry names an inode this replica holds under another name
+    ///   (the holder linked or renamed it there; this replica has not
+    ///   applied that yet). Replay's create is idempotent only for the
+    ///   same name (`replay::insert_node`); here it would write a fresh
+    ///   inode record over the held one — size 0, no manifest, `nlink`
+    ///   1 — and the hint's coverage would let every read of either
+    ///   name see it at once, until the segment carrying the link
+    ///   arrived (plan 45 review).
     ///
     /// The caller then treats the refusal as uncovered (raises
     /// `observed`), which is always correct.
@@ -2544,6 +2585,9 @@ impl Meta {
             }
         }
         if live_speculation_touches(&tx, self, &TouchSet::from_records(records.iter()))? {
+            return Ok(false);
+        }
+        if hint_names_a_held_inode(&tx, self, records)? {
             return Ok(false);
         }
         self.install_speculative_tx(tx, SpecKind::Hint { at, epoch, gen }, records)?;
