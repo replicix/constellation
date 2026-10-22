@@ -3371,7 +3371,13 @@ successor whose clock is ahead got no quarantine").
   one are shared per node: one in flight serves every request that asks
   meanwhile, and a result under 250 ms old is taken as it stands (the
   lease is one object, so the sharing is by node, which covers every
-  owner).
+  owner). *Review:* a shared or reused read only routes the requests and
+  queues an acquisition (`JobReq::Acquire`), whose own fresh read is the
+  one classified (`acquire_classified`). With C7b's observation rule a
+  shared or reused result is no sighting: the read is observed once, when
+  it is handled (`Core::on_s3`); `HolderRead` keeps no ETag, so it cannot
+  be observed again; claimability is `claimable_observed`'s
+  (`a_reused_lease_read_is_no_sighting_of_the_lease`).
 
 - **F-c — an application whose lock grant lapsed during a root failover
   gets `EIO`.** In `s3-cut-holder-failover-with-locks` the locker's grant

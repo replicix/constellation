@@ -57412,3 +57412,48 @@ needs.
   restored): twenty blocked second runs do not starve a lock wait; sixteen
   lock waits in an attempt against a core that answers in 4 s do not starve
   a parked op (and the pool has sixteen threads in attempts).
+
+### Review (two fixes)
+
+- **N2, a grant for a request that ended.** A request its signal ended while
+  the core's answer was in flight left a grant in it installed with nobody to
+  wait for its floor or drop the kernel's caches; the next request for the
+  inode (the application asking again after its `EINTR`) took its lock under
+  it at once. The caller now keeps such answers (`locks::Orphans`) and the
+  next request for the inode awaits them and waits for a grant among them as
+  its requester would have (`ClusterLocks::adopt_orphans`; one relaxed load
+  while there is none). Test (fails before): the floor of the late grant
+  was never waited for.
+- **W1/W2, a refused inline wait at a discard.** A wait refused on a ring
+  thread or for want of a lock-wait entry was taken as the grant's verdict at
+  a discard (`lock_take_discard`): the data written under a grant still
+  lapsing was discarded. Now the op is refused `EIO` and the verdict decides
+  the data, as for a refused park; only the lapse's bound counts as fenced.
+  Test (fails before): a publication refused that way discarded the data.
+- N3 checked against the lease rules: a shared or reused read only routes
+  requests and queues an acquisition, whose own fresh read is classified;
+  nothing judges a takeover, a claim, a fence or an expiry on it. Rebased
+  onto C7b (commits 1-4): a shared or reused result is no sighting of the
+  lease (observed once, when handled; `HolderRead` keeps no ETag;
+  claimability is the observation's), tested
+  (`a_reused_lease_read_is_no_sighting_of_the_lease`, which fails with a
+  reuse that observes).
+- Sims before the C7b rebase, `locks-*` (64 configurations, 500 seeds,
+  base 37180ae against this stack): 61 identical failing sets. `locks-late-stale-mirror-naive` (9/8)
+  and `locks-writer-hold-unchecked` (319/320) trade seeds within the same
+  violation classes, and `locks-holder-step-back-sealed` fails seed 378 (a
+  holder stepped back 8 s claimed by TTL 181 ms after its acquisition: row
+  2, C7b's pinned gap); with N3's sharing off all three sets are base's,
+  and at 5000 seeds the step-back configuration fails 2 (base, sharing off)
+  against 1 (this stack): N3's shared reads move trajectories.
+- Rebased onto C7b 1-4 (b8a124cb), `locks-*` (75 configurations, 500
+  seeds): 72 identical failing sets; the two negative controls trade seeds
+  as above; `locks-stall-step-delegated-ahead` adds seed 33, a stale read
+  under a fresh grant (rows 9/30, the class main fails 2 of 3 000): at
+  3 000 seeds main fails 1729 and 2071, this stack those and 33, and with
+  N3's sharing off the set is main's. `locks-claimant-ahead` and
+  `fast-takeover-skewed-holder-twice` at 1 000: 0 on both. The pinned
+  control `a_credited_arrival_cap_splits` re-pinned in the N3 commit
+  (199076 no longer fails with the shared reads; 202431 does, inside the
+  first failover's floor, and passes with the real cap).
+
