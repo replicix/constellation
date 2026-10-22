@@ -673,6 +673,9 @@ pub struct Stats {
     /// older build's, or a singleton's): judged by this node's own TTL and
     /// the wall compare as well (`LeaseState::obs_passed_for`).
     pub lease_ttl_unknown_bodies: u64,
+    /// Plan 43 C7b: client deadlines moved once to cover this node's own
+    /// claim of a lease (`Core::on_client_deadline_timer`).
+    pub client_deadlines_extended: u64,
     pub handoffs_served: u64,
     pub handoffs_declined: u64,
     pub releases: u64,
@@ -2456,7 +2459,7 @@ impl Core {
             Timer::OwnRecordWait(rid) => self.on_own_record_wait(now, rid, out),
             Timer::ObservedUpload => self.on_observed_upload(now, replica, out),
             Timer::AcquireRetry(rid) => self.on_acquire_retry(now, rid, replica, out),
-            Timer::ClientDeadline(rid) => self.on_client_deadline(now, rid, replica, out),
+            Timer::ClientDeadline(rid) => self.on_client_deadline_timer(now, rid, replica, out),
             Timer::ReplayDrain => {
                 self.drain_timer = None;
                 self.on_drain_tick(now, replica, out);

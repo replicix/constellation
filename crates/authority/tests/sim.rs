@@ -1474,6 +1474,13 @@ struct M9Totals {
     takeovers: u64,
     acked_rolled_back: usize,
     failovers: Vec<u64>,
+    /// Plan 43 C7b: the failovers of runs in which a node took a lease over
+    /// by TTL (the lease-claim oracle counted a claim of an unreleased
+    /// foreign lease without a permit): they wait the claimant's own
+    /// observation, not a seal.
+    ttl_failovers: Vec<u64>,
+    /// The others' (seals, permitted claims, re-claims).
+    other_failovers: Vec<u64>,
 }
 
 impl M9Totals {
@@ -1501,6 +1508,11 @@ impl M9Totals {
         }
         self.acked_rolled_back += r.acked_rolled_back;
         self.failovers.extend(r.failover_ms.iter().copied());
+        if r.lease_ttl_claims > 0 {
+            self.ttl_failovers.extend(r.failover_ms.iter().copied());
+        } else {
+            self.other_failovers.extend(r.failover_ms.iter().copied());
+        }
     }
 
     fn failover_dist(&self) -> String {
@@ -3322,26 +3334,51 @@ fn a_lagging_backup_still_seals_a_dead_holder() {
         0..120,
     );
     assert!(t.seals >= 60, "the lagging backup rarely sealed: {t:?}");
-    // 2T of the backup's running time plus its lapse (at most 2.5 s, and
-    // its peers' 0.6 s), then the read, the seal and the takeover.
-    let bound = 2 * 1_000 + 2_500 + 600 + 1_500;
-    // Plan 43 C7b (the cold-claim wait, gate G6): a failover that is a TTL
-    // claim, not a seal (seed 78: 6.8 s against 4.9 s before), now waits one
-    // lease TTL of the claimant's own clock from its first read of the
-    // lease's final renewal key instead of the holder's wall expiry: up to
-    // the TTL, the backup's lapse and the claim's own round trips after the
-    // crash. A seal is bounded as before.
-    let ttl = sim::run::backup_core_config(1, 1).ttl_ms;
-    let bound = bound + ttl.saturating_sub(5_000);
-    let late: Vec<u64> = t
-        .failovers
-        .iter()
-        .copied()
-        .filter(|ms| *ms > bound)
-        .collect();
+    let cfg = sim::run::backup_core_config(1, 1);
+    // A seal: 2T of the backup's running time plus its lapse (at most 2.5 s,
+    // and its peers' 0.6 s), then the read, the seal and the takeover.
+    let lapse = 2_500 + 600;
+    let takeover = 1_500;
+    let seal_bound = 2 * cfg.backup_takeover_ms + lapse + takeover;
+    // Plan 43 C7b (the cold-claim wait, gate G6): a TTL claim (the holder
+    // died before a backup was listed, or a backup never sealed) waits one
+    // holder's TTL from the claimant's first read of the lease's final key,
+    // which may come after the crash, so, from the crash:
+    // - the first read: an op of the claimant's (the workload keeps one in
+    //   flight) reaches the lease path when its forwards to the dead holder
+    //   run out — the first send and `forward_retries` retries each time
+    //   out, with backoffs of 1, 2, .. times `forward_backoff_ms` between
+    //   them — on a runtime that may lag (the lapse);
+    // - then the holder's TTL, plus the backups' claim grace for a
+    //   non-backup of a lease that lists backups, plus at most one acquire
+    //   backoff (the retry hint fires at the claim instant; the backoff is
+    //   the bound if the hint is lost to a busy job);
+    // - then the claim, the gate and the first acknowledgement (the seal's
+    //   allowance).
+    // (Seed 78: the holder, node 3, had no backup yet; node 2 first read
+    // its lease 0.34 s after the crash and claimed 6.24 s later: 6.8 s.)
+    let retries = u64::from(cfg.forward_retries);
+    let forwards = (retries + 1) * cfg.forward_timeout_ms
+        + (1..=retries)
+            .map(|k| k * cfg.forward_backoff_ms)
+            .sum::<u64>();
+    let ttl_bound = forwards
+        + lapse
+        + cfg.ttl_ms
+        + 2 * cfg.backup_takeover_ms
+        + cfg.acquire_retry_max_ms
+        + takeover;
+    let late = |v: &[u64], bound: u64| -> Vec<u64> {
+        v.iter().copied().filter(|ms| *ms > bound).collect()
+    };
+    let (late_seals, late_ttl) = (
+        late(&t.other_failovers, seal_bound),
+        late(&t.ttl_failovers, ttl_bound),
+    );
     assert!(
-        late.is_empty(),
-        "failovers past {bound} ms: {late:?}; {}",
+        late_seals.is_empty() && late_ttl.is_empty(),
+        "failovers past {seal_bound} ms: {late_seals:?}; TTL claims past {ttl_bound} ms: \
+         {late_ttl:?}; {}",
         t.failover_dist()
     );
 }

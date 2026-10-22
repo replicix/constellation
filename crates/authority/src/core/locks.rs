@@ -602,6 +602,16 @@ impl Core {
     pub(crate) fn lock_unreachable(&self) -> usize {
         self.lk.unreachable.len()
     }
+
+    /// Owner side: the barrier on directory `dir` itself (tests).
+    #[cfg(test)]
+    pub(crate) fn lock_dir_barrier_at(&self, dir: Ino) -> Option<i64> {
+        self.lk
+            .dir_barriers
+            .iter()
+            .find(|(d, _)| *d == dir)
+            .map(|(_, a)| *a)
+    }
 }
 
 impl LockState {
@@ -6253,8 +6263,13 @@ impl Core {
     /// watched it, a cold taker). The grace ends at `seen + lock_ttl + 2M`:
     /// the releaser's grants were issued before its release CAS and each
     /// ends by true `T(release send) + lock_ttl`, and `seen` is after the
-    /// release landed. A taker that saw the release long ago waits nothing
-    /// (no quarantine, no barrier); a cold one waits the whole grace.
+    /// release landed. A taker that saw the release long ago waits for no
+    /// grant (no quarantine); a cold one waits the whole grace.
+    ///
+    /// The barrier is set either way: the writes it covers were made before
+    /// `until` whether `until` is past or not, and a floor taken from an
+    /// inherited delegate's first renewal may be older than them. A past
+    /// barrier costs nothing once every live generation's head is past it.
     pub(crate) fn lock_on_released_takeover(
         &mut self,
         now: Now,
@@ -6262,16 +6277,16 @@ impl Core {
         replica: &dyn Replica,
     ) {
         let until = seen.plus((self.lock_ttl_ms() + 2 * self.lock_margin_ms()).max(0) as u64);
-        if until <= now.wait {
-            return;
-        }
-        replica.locks().set_quarantine(until);
         // The barrier is a wall value (row 9, C7b): the record's end mapped
         // from this node's wait clock by the time left on it.
         self.lock_dir_barrier(
             constellation_fs_core::types::ROOT_INO,
             now.wall_of_wait(until).0,
         );
+        if until <= now.wait {
+            return;
+        }
+        replica.locks().set_quarantine(until);
         self.stats.lock_grace_periods += 1;
     }
 

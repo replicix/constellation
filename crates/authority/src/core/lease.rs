@@ -830,6 +830,28 @@ impl LeaseState {
         Some(o.since.plus(Self::ttl_of(&o.body, cfg) + extra_ms))
     }
 
+    /// When this node's own observation lets it claim the lease it last
+    /// read by TTL: one holder's TTL after its first sight of the key, plus
+    /// the backups' claim grace for a non-backup of a `Backup` lease. `None`:
+    /// nothing observed, or a lease that waits for no TTL (never held, its
+    /// own, released, fenced).
+    pub fn claim_due(&self, cfg: &Config) -> Option<WaitMs> {
+        let o = self.obs.as_ref()?;
+        let b = &o.body;
+        if b.holder == 0 || b.holder == cfg.node_id || b.released || b.is_fenced() {
+            return None;
+        }
+        let grace = if b.ack_policy == AckPolicy::Backup
+            && !b.backups.is_empty()
+            && !b.backups.contains(&cfg.node_id)
+        {
+            backup_claim_grace_ms(cfg) as u64
+        } else {
+            0
+        };
+        Some(o.since.plus(Self::ttl_of(b, cfg) + grace))
+    }
+
     /// The earliest instant a `Busy` classification of `prev` may change by
     /// this node's own clock alone: its TTL claim, or the `ack=s3` permit's
     /// window (when this node holds the permit).

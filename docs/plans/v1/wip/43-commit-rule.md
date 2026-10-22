@@ -3953,6 +3953,20 @@ to land before C0.
   happens; the placement status decoration with a would-be class is cut
   from C2 for the same reason.
 
+### 11.2 Open findings (measured, not yet triaged)
+
+- **`locks-released-takeover` fails 5 of 2 000 under the default clock-fault
+  mix** (seeds 961, 973, 1253, 1546, 1571 on `f7c8fc7`, with and without
+  C7b; `+unclocked`: 0). Every one is a reboot or a suspend of the taker of
+  a released lease that the mix drew inside the taker's lock grace
+  (`lock_on_released_takeover`); C7b's reading is that the taker loses the
+  quarantine, which lives in memory (the restart horizons cover a node's
+  own grants, not the releaser's: the class of Appendix B row 14's
+  in-memory takeover floor). Found by C7a commit 6's mix. To decide: persist
+  the released-takeover quarantine with the boot-stamped horizons, or
+  re-arm it on restart from the lease's mark. Should be settled before C7b
+  commit 9 puts offsets into the default mix.
+
 ## 12. Risks
 
 - **The recovery paths are the bug source, and this plan rewrites

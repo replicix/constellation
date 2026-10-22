@@ -445,6 +445,89 @@ fn a_timed_out_forward_retries_the_same_rid_then_takes_the_lease_path() {
     ));
 }
 
+/// Plan 43 C7b: a cold claim waits one *holder's* TTL from the claimant's
+/// first read; the client deadline is two of the claimant's own. An op
+/// waiting for the lease of a holder whose TTL is longer than that is given
+/// until its node may claim (plus one retry backoff), once, instead of
+/// failing in doubt before the claim was ever possible. (Fails before: the
+/// op is answered in doubt at the deadline.)
+#[test]
+fn a_cold_claim_of_a_longer_lived_lease_is_not_cut_off_by_the_client_deadline() {
+    let mut h = Harness::new(1);
+    h.core.cfg.ttl_ms = 10_000;
+    h.core.cfg.acquire_deadline_ms = 20_000;
+    h.core.lease.cached_holder = Some(2);
+    let rid = h.rid(1);
+    let op = h.create("a");
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op,
+        tag: Default::default(),
+    });
+    let deadline = timers(&out, TimerKind::ClientDeadline)[0];
+    // The holder does not answer: the forwards run out and the op takes the
+    // lease path, which reads the lease.
+    let mut t = timers(&out, TimerKind::ForwardTimeout)[0];
+    for attempt in 1..=2 {
+        h.advance(500);
+        let out = h.step(Event::Timer { id: t });
+        let b = timers(&out, TimerKind::ForwardBackoff)[0];
+        h.advance(100 * attempt);
+        let out = h.step(Event::Timer { id: b });
+        t = timers(&out, TimerKind::ForwardTimeout)[0];
+    }
+    h.advance(500);
+    let out = h.step(Event::Timer { id: t });
+    let (get, req) = only_s3(&out);
+    assert!(matches!(req, S3Op::LeaseGet), "{req:?}");
+    // The holder (node 2) runs a 30 s TTL; this node first reads it now.
+    let read_at = h.clk().wait;
+    let body = Lease {
+        ttl_ms: 30_000,
+        ..lease_of(2, 1, h.now.0 + 30_000)
+    };
+    h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((body, tag())))),
+    });
+    let phase = h.core.clients().next();
+    assert!(
+        matches!(
+            phase,
+            Some((r, ClientPhase::WaitingLease | ClientPhase::AcquireRetry)) if r == rid
+        ),
+        "{phase:?}"
+    );
+    // The deadline fires 20 s after the submission: the op keeps waiting,
+    // until 30 s after the read and one backoff.
+    h.advance(20_000 - 1_800);
+    let out = h.step(Event::Timer { id: deadline });
+    assert!(
+        replies(&out).is_empty(),
+        "answered at the deadline: {out:?}"
+    );
+    let moved: Vec<u64> = out
+        .iter()
+        .filter_map(|a| match a {
+            Action::SetTimer {
+                kind: TimerKind::ClientDeadline,
+                after_ms,
+                ..
+            } => Some(*after_ms),
+            _ => None,
+        })
+        .collect();
+    let due = read_at.plus(30_000 + h.core.cfg.acquire_retry_max_ms);
+    assert_eq!(moved, vec![due.since(h.clk().wait) as u64]);
+    assert_eq!(h.core.stats.client_deadlines_extended, 1);
+    // Once only: the moved deadline answers in doubt.
+    let again = timers(&out, TimerKind::ClientDeadline)[0];
+    h.advance(due.since(h.clk().wait) as u64);
+    let out = h.step(Event::Timer { id: again });
+    assert_eq!(replies(&out).len(), 1, "{out:?}");
+}
+
 #[test]
 fn the_lease_path_resolves_an_in_doubt_rid_from_the_log() {
     let mut h = Harness::new(1);
@@ -8474,6 +8557,43 @@ mod epoch_rules {
         });
         poke(&mut sub);
         assert_eq!(sub.core.stats.s3_fast_takeovers, 1, "a silent holder kept");
+    }
+
+    /// Plan 43 C7b: an `ack=s3` subscriber with no observation of the lease
+    /// (its reads fail, or found no object) reads it at most once per
+    /// renewal cadence of the holder (half the body's TTL), not after every
+    /// event: 60 events over 30 s, a 10 s TTL, every read failing, make 6
+    /// reads (before: 60).
+    #[test]
+    fn an_unobserved_acks3_lease_is_read_once_per_renewal_cadence() {
+        let (_holder, mut sub, _req) = stream_pair();
+        let mut lease = root_lease(1, 1, sub.now.plus(60_000));
+        lease.ack_policy = constellation_store_s3::AckPolicy::S3;
+        lease.ttl_ms = 10_000;
+        sub.core.lease.note_object(&lease);
+        assert!(sub.core.lease.obs.is_none());
+        let mut reads = 0;
+        for _ in 0..60 {
+            sub.advance(500);
+            let out = sub.step(Event::Activity {
+                last_write: WaitMs(0),
+                acked_seqs: Vec::new(),
+            });
+            let gets: Vec<OpId> = s3_ops(&out)
+                .into_iter()
+                .filter(|(_, req)| matches!(req, S3Op::LeaseGet))
+                .map(|(op, _)| op)
+                .collect();
+            for op in gets {
+                reads += 1;
+                sub.step(Event::S3 {
+                    op,
+                    result: S3Result::LeaseGet(Err(crate::event::S3Failure("cut".into()))),
+                });
+            }
+        }
+        eprintln!("lease reads without an observation: {reads} in 30 s");
+        assert_eq!(reads, 6, "one read per 5 s (half the holder's TTL)");
     }
 
     /// The holder's beats stop at its lease's expiry (they name it):
@@ -19643,6 +19763,16 @@ mod locks {
             h.meta.locks().quarantine_until() <= h.clk().wait,
             "a taker that saw the release longer ago than the grace waits nothing: {:?}",
             h.meta.locks().quarantine_until()
+        );
+        // ... but keeps the barrier at the grace's end: the predecessor's
+        // grant holders wrote into delegates' streams until then, and a
+        // floor from an inherited delegate's first renewal may be older.
+        let ended = then.wait.plus(grace(&h) as u64);
+        assert_eq!(
+            h.core
+                .lock_dir_barrier_at(constellation_fs_core::types::ROOT_INO),
+            Some(h.clk().wall_of_wait(ended).0),
+            "a warm taker keeps the root barrier"
         );
         // And one that saw it half a grace ago waits the other half.
         let mut h = Harness::new(2);

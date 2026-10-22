@@ -57215,3 +57215,61 @@ double fault (holder crashed, its backup rebooted then paused: a TTL claim
 after the grace loses the tail; the retry hint claims 0.3 s before the holder's
 restart, which then replays its acknowledged rows late), pinned as
 `backup_strict_double_fault_known_gap` for C1-3's tail fetch.
+
+## Plan 43 C7b, commit 4/N: the review's follow-ups (2026-10-22)
+
+The review of commits 1-3 found no claim of a live holder; it found four
+places where commit 3 took the less conservative side or left a cost
+unbounded. Each now takes the conservative side.
+
+- **A warm released-taker keeps the root barrier.** `lock_on_released_takeover`
+  returned before the barrier when the grace had already ended on the taker's
+  own observation. The barrier is set either way (only the quarantine is
+  skipped): the releaser's grant holders wrote into delegates' streams until
+  the grace's end, and a floor from an inherited delegate's first renewal may
+  be older than those writes. Fail-before: the warm case of
+  `a_cold_released_taker_arms_the_full_grace_and_a_warm_one_none`.
+- **The unobserved `ack=s3` lease is read at the renewal cadence.**
+  `watch_s3_holder` (run after every event) read the lease each time while it
+  had no observation of it. Now at most once per half of the holder's TTL:
+  `an_unobserved_acks3_lease_is_read_once_per_renewal_cadence`, 60 events in
+  30 s at a 10 s TTL with every read failing: 60 reads before, 6 after.
+- **A client deadline covers a cold claim.** The deadline is two of the node's
+  own TTLs; a cold claim waits one *holder's* TTL from the first read (plus
+  the backups' claim grace for a non-backup). TTLs are per node and not
+  checked across the cluster, so a longer-lived holder outlasted it. A
+  `ClientDeadline` on an op still waiting for the lease now moves, once, to
+  `LeaseState::claim_due` plus one acquire backoff
+  (`Stats::client_deadlines_extended`); `on_own_s3`'s early deadline is
+  unchanged. Fail-before:
+  `a_cold_claim_of_a_longer_lived_lease_is_not_cut_off_by_the_client_deadline`.
+  C0's I4 pin (`long-delegated-late-answers`, re-pinned by C1-1 on 17, 19,
+  114) keeps its late landings with it.
+- **`a_lagging_backup_still_seals_a_dead_holder`, derived.** Commit 3's
+  `+ (ttl - 5 s)` was fitted to seed 78 and loosened the seal bound. Runs now
+  split by the lease-claim oracle's per-run TTL-claim count
+  (`M9Totals::ttl_failovers`): seals keep 6.6 s; a TTL claim is bounded by its
+  derivation (forwards to the dead holder running out 2.5 s, the lapse 3.1 s,
+  the holder's TTL 6 s, the claim grace 2 s, one acquire backoff 1 s, the
+  takeover 1.5 s: 16.1 s). Instrumented: the only TTL claim in the 120 seeds
+  is seed 78's, node 2 first reading node 3's backup-less lease 0.34 s after
+  the crash and claiming 6.24 s later (6.8 s).
+- Plan 43 §11.2: `locks-released-takeover` 5 of 2 000 under the clock mix,
+  an open finding. D6 stays a start-up warning, as decided.
+
+Gates (final tree, on `37180ae`): fmt; clippy `--workspace --all-targets -D warnings`;
+authority lib 582, `meta_repro` 4, sim suite 244 passed (12 ignored); commit 3
+alone the same but lib 580. The
+model crate is not touched by this commit (no modelled rule changes).
+
+Sweeps (the stack on `48d65e8`, I6 strict; base: main, or main + commit 1
+with the oracle off for the configurations main lacks): `locks-claimant-ahead`
+2 000: 307 failing and 1 692 live claims on the base, 0 and 0;
+`fast-takeover-skewed-holder-twice` 2 000: 8 and 1 040, 0 and 0;
+`fast-takeover-skewed-successor` 2 000: 0 and 2, 0 and 0. 88 `locks-*` and
+`fast-takeover*` configurations at 500: 78 failing sets identical, 0 live
+claims in all 88, the rest fixed by the rule, moved within the stale-reads
+class (rows 9/30) or negative controls. Rebased onto C1-1 (`37180ae`): the 26
+`backup*` and `long-backup` configurations at 500 have failing sets identical
+to main's (`backup-locks-ahead`, new, clean) and 0 live claims;
+`locks-claimant-ahead` and `fast-takeover-skewed-holder-twice` at 1 000: 0.

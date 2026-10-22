@@ -114,6 +114,9 @@ pub(crate) struct ClientOp {
     pub forwarded: bool,
     pub acquire_retries: u32,
     pub deadline: crate::ids::TimerId,
+    /// Plan 43 C7b: the deadline was moved once to cover this node's own
+    /// claim of the lease ([`Core::on_client_deadline_timer`]).
+    pub deadline_extended: bool,
     pub timer: Option<crate::ids::TimerId>,
     /// M13: when the op entered the inbox path (its in-doubt deadline
     /// counts from here) and when its batch became durable.
@@ -495,6 +498,7 @@ impl Core {
                 forwarded: in_doubt,
                 acquire_retries: 0,
                 deadline,
+                deadline_extended: false,
                 timer: None,
                 inbox_since: None,
                 inbox_durable_at: None,
@@ -2815,6 +2819,42 @@ impl Core {
             }
             self.route(now, rid, replica, out);
         }
+    }
+
+    /// `Timer::ClientDeadline`. Plan 43 C7b: an op still waiting for the
+    /// lease whose node may claim it only after the deadline — a cold claim
+    /// waits one *holder's* TTL from its first read (plus the backups' claim
+    /// grace for a non-backup of a `Backup` lease), and `acquire_deadline_ms`
+    /// is two of this node's own TTLs: a holder with a longer TTL, or a short
+    /// TTL under a long grace, outlasts it — gets until then (plus one
+    /// retry backoff), once, instead of failing in doubt before its claim
+    /// was ever possible. (`on_own_s3`'s early deadline does not come here.)
+    pub(crate) fn on_client_deadline_timer(
+        &mut self,
+        now: Now,
+        rid: Rid,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let waiting = self.clients.get(&rid).is_some_and(|c| {
+            matches!(c.phase, Phase::WaitingLease | Phase::AcquireRetry) && !c.deadline_extended
+        });
+        if waiting {
+            if let Some(due) = self
+                .lease
+                .claim_due(&self.cfg)
+                .filter(|due| *due > now.wait)
+            {
+                let until = due.plus(self.cfg.acquire_retry_max_ms);
+                let timer = self.set_timer_wait(until, Timer::ClientDeadline(rid), out);
+                let c = self.clients.get_mut(&rid).expect("present");
+                c.deadline = timer;
+                c.deadline_extended = true;
+                self.stats.client_deadlines_extended += 1;
+                return;
+            }
+        }
+        self.on_client_deadline(now, rid, replica, out);
     }
 
     pub(crate) fn on_client_deadline(

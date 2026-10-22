@@ -667,6 +667,9 @@ pub(crate) struct BackupState {
     /// Plan 43 C7b: when `ack=s3`'s silence watch last read the lease to
     /// refresh a stale view (`watch_s3_holder`).
     s3_reread_at: Option<WaitMs>,
+    /// Plan 43 C7b: when that watch last read the lease for want of any
+    /// observation of it (at most once per holder renewal cadence).
+    s3_cold_read_at: Option<WaitMs>,
     /// EC2 follow-up 3b: this node restarted holding a backup role and
     /// has not yet had a P2P link to its holder since: its downtime (and
     /// the redial) is not the holder's silence.
@@ -4624,8 +4627,24 @@ impl Core {
         // Plan 43 C7b: judged on this node's observation. Without one (the
         // key not watched yet) a read first: the S3 permit's window and the
         // lease's TTL both count from it.
+        // Throttled to the holder's renewal cadence (half its TTL): a read
+        // that finds no object (which clears the observation) or fails
+        // must not be repeated at every tick.
         if self.lease.obs.is_none() {
-            self.issue_s3(S3Op::LeaseGet, S3For::PromiseWatch, out);
+            let ttl = if seen.ttl_ms > 0 {
+                seen.ttl_ms
+            } else {
+                self.cfg.ttl_ms
+            };
+            let cadence = (ttl / 2) as i64;
+            if self
+                .bk
+                .s3_cold_read_at
+                .is_none_or(|t| now.wait.since(t) >= cadence)
+            {
+                self.bk.s3_cold_read_at = Some(now.wait);
+                self.issue_s3(S3Op::LeaseGet, S3For::PromiseWatch, out);
+            }
             return;
         }
         if self.lease.claimable_observed(now, &self.cfg) {

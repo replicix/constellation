@@ -1461,7 +1461,9 @@ after it first *saw the release* (plan 43 C7b: the first read, on its own
 wait clock, that showed the released key: the releaser's grants were issued
 before its release CAS, so each is over by `lock_ttl` after that CAS, and
 the first sight is after it landed; a taker that saw the release long ago
-waits nothing, a cold one the whole grace; the configuration warns when
+waits nothing, a cold one the whole grace; either way no grant is made
+before the floor covers the delegates' streams up to the grace's end; the
+configuration warns when
 `lock_ttl + 2 margins` exceeds the lease TTL), and the releasing node, should it claim its own released
 lease back (no takeover), waits until the last dropped grant would have
 expired. Both waits are kept on the node, not with the tenure, so they
