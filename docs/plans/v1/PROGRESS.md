@@ -56906,13 +56906,19 @@ The gates of plan 45 §7 hold: link and unlink at 2,000 names are 0.86x and
 0.84x the n = 1 cost (gate 1.5x), chmod and the manifest commit 0.75x and
 0.81x, the nlink-1 operations within 3 % (gate 5 %), and a listing of
 single-name entries reads zero `0x01` records (the engine tests, H3).
-One observation, not gated: the first 100 `unlink`s right after a 2,000-link
-burst (a window at 2,000 names) cost 57-100 µs after the change (the median of
-6 runs 65 µs, 3.4x n = 1), against 16 µs for the window at 1,000 names and
-for the steady state; the first window after a burst is also twice the steady
-state before the change, and does not grow with n (33-47 µs at 1,000
-names, 60-67 µs at 4,000), so it is a property of the burst's tail, not of
-the number of names.
+One observation, not gated, and explained in review: the "first 100 `unlink`s
+after the burst" figure (57-100 µs) was one sample, the checkpoint at n of a
+window that had just started, i.e. the very first `unlink` after the listing.
+`hardlink_perf` now reports the first 100 as `unlink_p50_first_100` (16.5 µs,
+the steady state's 16.2 µs) and that one operation as `unlink_first_after_burst`
+(58-89 µs). Not a property of the number of names, and not a bug.
+
+Review, rebased onto `7e6e5cb`: A/B/B/A x3 again (meta level, release, workstation),
+link and unlink at 2,000 names 0.92x and 0.86x the n = 1 cost, chmod and the
+manifest commit 0.77x and 0.86x, the nlink-1 create / setattr / set_manifest /
+unlink +0.1 % / +0.4 % / +1.7 % / -2.7 %. fmt, clippy, mtree and meta, authority
+lib 565, authority sim (release) 233 passed / 12 ignored; engine lib 843 passed with
+the five `view::owner_fence_tests` failing in the full run as on `main` (54/54 alone).
 
 ### Unchanged on purpose
 

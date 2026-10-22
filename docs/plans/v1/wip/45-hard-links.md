@@ -460,13 +460,15 @@ What differs from the text above, found while building it:
   looped over the names itself; `apply_write_manifest` and
   `scratch_set_manifest` looped again after `put_inode_keeping_xattrs` had
   already done it. All three now go through `put_inode_record` only.
-- **The meta-level measurement gates on a steady state.** The first 100
-  `unlink`s after a 2,000-link burst cost 57-100 µs after the change against
-  16 µs steady (the window is also twice the steady state before the
-  change, and does not grow with *n*); `link_steady_at_N` and
-  `unlink_steady_at_N` (a name linked and unlinked again at *N* names) are the
-  numbers the 1.5× gate is read from, the burst windows are reported beside
-  them.
+- **The meta-level measurement gates on a steady state.** `link_steady_at_N`
+  and `unlink_steady_at_N` (a name linked and unlinked again at *N* names) are
+  the numbers the 1.5× gate is read from; the burst windows are reported
+  beside them. The first 100 `unlink`s after a 2,000-link burst
+  (`unlink_p50_first_100`) cost what the steady state costs (16.5 µs against
+  16.2 µs). An earlier reading of 57-100 µs for that window was the
+  measurement's: its checkpoint at *n* held one sample, the very first
+  `unlink` after the listing, now reported apart as
+  `unlink_first_after_burst` (58-89 µs, one operation, not a window).
 - **fsck's check is one `0x01` point read per dentry.** It streams (nothing but
   the violations is kept, 100 reported in full), and it reads the head
   commit's tree, so it costs the namespace's size in point reads on top of

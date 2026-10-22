@@ -177,17 +177,30 @@ fn hard_link_scaling() {
         t.elapsed().as_secs_f64() * 1e3
     );
 
-    // unlink, newest first, the same window.
+    // unlink, newest first, the same window. The first window is the
+    // `WINDOW` unlinks right after the burst (`unlink_p50_first_100`); a
+    // checkpoint at `n` itself would hold one sample, the very first
+    // unlink after the listing, not a window.
     let mut window: Vec<Duration> = Vec::new();
     let start = Instant::now();
     for i in (1..=n).rev() {
         let t = Instant::now();
         meta.unlink(d, &format!("l{i}")).unwrap();
-        window.push(t.elapsed());
+        let took = t.elapsed();
+        if i == n {
+            result("unlink_first_after_burst", took);
+        }
+        window.push(took);
         if window.len() > WINDOW {
             window.remove(0);
         }
-        if checkpoints.contains(&i) {
+        if n - i + 1 == WINDOW as u64 {
+            result(
+                &format!("unlink_p50_first_{WINDOW}"),
+                p50(&mut window.clone()),
+            );
+        }
+        if i != n && checkpoints.contains(&i) {
             result(&format!("unlink_p50_at_{i}"), p50(&mut window.clone()));
         }
     }
