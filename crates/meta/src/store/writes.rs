@@ -956,7 +956,7 @@ fn rename_in_tx(
         ns_ks,
         dirty,
         keys::dentry(new_parent, new_name.as_bytes()),
-        DentryRecord::new(ino, src.attrs).encode(),
+        DentryRecord::new(ino, src_rec.attrs).encode(),
     )?;
     ns::ns_insert(
         tx,
@@ -1347,8 +1347,14 @@ impl MetaStore for Meta {
         let Some(d) = ns::get_dentry_record(&r, &self.ns, parent, name)? else {
             return Ok(None);
         };
+        // A name of a hard-linked inode holds no copy (plan 45): its
+        // attributes are the inode's.
+        let (attrs, read_inode) = ns::dentry_attrs(&r, &self.ns, &d)?;
+        if read_inode {
+            self.note_inode_read();
+        }
         let at = atime::get_atime(&r, &self.atime, d.ino)?;
-        Ok(Some(ns::attrs_to_fileattr(d.ino, &d.attrs, at)))
+        Ok(Some(ns::attrs_to_fileattr(d.ino, &attrs, at)))
     }
 
     fn getattr(&self, ino: Ino) -> Result<Option<FileAttr>, MetaError> {

@@ -56875,9 +56875,9 @@ measured, the four-file-system runs are pending.
 | Item | State | Where |
 |---|---|---|
 | Plan document, plan 28 §P6 note, index | landed | `docs/plans/v1/wip/45-hard-links.md`, `README.md`, `done/28-…` |
-| Baseline (H0) | planned | `crates/meta/tests/hardlink_perf.rs`; box: `bench/hardlink/` |
-| Two dentry forms, fsck check (H1) | planned | `crates/mtree/src/record.rs`, `crates/engine/src/{mtree_read,fsck}.rs` |
+| Baseline (H0) | meta level landed (numbers under Gates); box pending | `crates/meta/tests/hardlink_perf.rs`; box: `bench/hardlink/` |
+| Two dentry forms, every reader, fsck check (H1) | landed | `crates/mtree/src/record.rs`, `crates/meta/src/store/{ns,writes,reads,scratch}.rs`, `crates/engine/src/{mtree_read,snapwalk,snapshot,fsck}.rs` |
 | The rule and transitions (H2) | planned | `crates/meta/src/store/{ns,writes,misc,reads,scratch}.rs`, `crates/meta/src/replay.rs` |
-| Engine readers (H3) | planned | `crates/engine/src/{snapshot,snapwalk,snapacct/verify,mtree_read}.rs` |
+| Engine tests (H3) | planned | `crates/engine/src/{mtree_read,mtree_publish,snapwalk}.rs` |
 | Harness scenario, xcheckfs lane (H4) | pending, box | `crates/harness/src/scenarios.rs` |
 | Docs (H5) | pending | `docs/reference` |

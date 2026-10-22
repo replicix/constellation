@@ -12,16 +12,22 @@
 //!   the inline manifest or its hash, the symlink target, and the whole
 //!   xattr set when it fits in [`XATTR_INLINE`].
 //! - `0x02` → [`DentryRecord`]: the target `ino` **plus a denormalized
-//!   copy of the attrs READDIRPLUS returns.** This copy is the one open
-//!   question §P6 left, S1 measured it (§14.10), and the verdict is that
-//!   it stays: dropping it saves 10.9% of stored bytes and 1.3–1.5× on
-//!   `setattr`, and charges **12,039 pack reads for a cold `ls -la`
-//!   against 30.4**, because `ls -la` stops being a sequential scan and
-//!   becomes a scan plus N scattered point reads into the `0x01` range.
-//!   That is the only cost in plan 28 that neither cache nor cores
-//!   absorb (it still ran 144× slower at 8 threads). The copy is
-//!   read-locality state, not accounting state, and [`leaf_agg`] is
-//!   where that distinction is enforced.
+//!   copy of the attrs READDIRPLUS returns, while the inode has one name.**
+//!   This copy is the one open question §P6 left, S1 measured it (§14.10),
+//!   and the verdict is that it stays: dropping it saves 10.9% of stored
+//!   bytes and 1.3–1.5× on `setattr`, and charges **12,039 pack reads for
+//!   a cold `ls -la` against 30.4**, because `ls -la` stops being a
+//!   sequential scan and becomes a scan plus N scattered point reads into
+//!   the `0x01` range. That is the only cost in plan 28 that neither cache
+//!   nor cores absorb (it still ran 144× slower at 8 threads). The copy is
+//!   read-locality state, not accounting state, and [`leaf_agg`] is where
+//!   that distinction is enforced. **Plan 45** narrows the rule to the
+//!   premise §P6 priced it on ("`nlink` is 1 for all but a rounding error
+//!   of files"): the copy costs one rewrite per *name* on every `0x01`
+//!   write, so an inode with n names paid O(n) per `link`, `unlink`,
+//!   `chmod` and write. A non-directory with two or more names now has a
+//!   *remote* dentry (`ino` + `kind`, [`DENTRY_REMOTE_LEN`] bytes) and its
+//!   attributes are read from `0x01`; see [`DentryRecord::for_inode`].
 //! - `0x03` → [`Payload`]: one xattr value, spilled to a blob above
 //!   [`VALUE_SPILL`].
 //! - `0x04` → `()`. The reverse dentry index is a *set*; everything a
@@ -178,6 +184,12 @@ pub enum RecordError {
 
     #[error("unknown subsystem record version {0}")]
     UnknownRecordVersion(u8),
+
+    /// A dentry value is `ino` + `kind` ([`DENTRY_REMOTE_LEN`] bytes) or
+    /// `ino` + attrs ([`DENTRY_LEN`] bytes), told apart by length;
+    /// nothing in between or beyond is a dentry.
+    #[error("a dentry value is {DENTRY_REMOTE_LEN} or {DENTRY_LEN} bytes, got {0}")]
+    BadDentryLength(usize),
 }
 
 // --------------------------------------------------------------- attrs
@@ -701,53 +713,113 @@ pub fn plan_inode(
 
 // ----------------------------------------------------------- 0x02 record
 
-/// The `0x02` value: the target ino plus S1's attr copy.
+/// The `0x02` value: the target ino and kind, plus S1's attr copy when
+/// the inode has one name (plan 45).
 ///
-/// `kind` is inside [`Attrs`], so `readdir` (which needs only ino and
-/// kind) and `readdirplus` (which needs everything) read the same bytes
-/// and there is no second shape to keep in step.
+/// Two forms, told apart by length ([`DentryRecord::decode`]):
+///
+/// - **Full**, [`DENTRY_LEN`] bytes: `ino` + [`Attrs`]. `readdir` (which
+///   needs only ino and kind) and `readdirplus` (which needs everything)
+///   read the same bytes.
+/// - **Remote**, [`DENTRY_REMOTE_LEN`] bytes: `ino` + `kind`. The inode
+///   has several names, and a copy of its attributes under each of them
+///   would have to be rewritten by every `link`, `unlink`, `chmod` and
+///   write of any of them. A reader that wants the attributes reads `0x01`.
+///
+/// Which form a key holds is not a choice: it is
+/// [`DentryRecord::for_inode`] of the inode's `0x01` record, so two
+/// replicas with equal namespaces hold equal bytes and equal root hashes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DentryRecord {
     pub ino: u64,
+    /// The inode's kind: [`Attrs::kind`] of `attrs` when there is a copy.
+    pub kind: Kind,
     /// A copy, for read locality only. The `0x01` record is
     /// authoritative; this one exists so that a cold `ls -la` is a
     /// sequential scan (§14.10). Both are written in one commit under
     /// one root hash, so unlike plan 27's SQLite-vs-tree pair there is
     /// no reconciliation path along which they could drift — and
-    /// [`leaf_agg`] must never count it.
-    pub attrs: Attrs,
+    /// [`leaf_agg`] must never count it. `None` for a remote dentry.
+    pub attrs: Option<Attrs>,
 }
 
-/// ino(8) + attrs.
+/// ino(8) + attrs: the full form.
 pub const DENTRY_LEN: usize = 8 + ATTRS_LEN;
 
+/// ino(8) + kind(1): the remote form.
+pub const DENTRY_REMOTE_LEN: usize = 9;
+
 impl DentryRecord {
+    /// The full form: `ino` with a copy of `attrs`.
     pub fn new(ino: u64, attrs: Attrs) -> DentryRecord {
-        DentryRecord { ino, attrs }
+        DentryRecord {
+            ino,
+            kind: attrs.kind,
+            attrs: Some(attrs),
+        }
+    }
+
+    /// The remote form: `ino` and its `kind`, no attributes.
+    pub fn remote(ino: u64, kind: Kind) -> DentryRecord {
+        DentryRecord {
+            ino,
+            kind,
+            attrs: None,
+        }
+    }
+
+    /// Whether a name of an inode with these attributes carries the
+    /// attribute copy: a directory (always one name) and a non-directory
+    /// with at most one name. The threshold is one: a copy exists iff the
+    /// inode has exactly one name, so a name's copy is rewritten only by
+    /// the writes of that one inode and the 1 ↔ 2 transitions are the only
+    /// ones that touch other names' dentries.
+    pub fn carries_copy(attrs: &Attrs) -> bool {
+        attrs.kind == Kind::Dir || attrs.nlink <= 1
+    }
+
+    /// The value every name of inode `ino` (record attrs `attrs`) holds.
+    /// The one function that decides a dentry's form; every writer of a
+    /// `0x02` value, local or replayed, goes through it.
+    pub fn for_inode(ino: u64, attrs: &Attrs) -> DentryRecord {
+        if DentryRecord::carries_copy(attrs) {
+            DentryRecord::new(ino, *attrs)
+        } else {
+            DentryRecord::remote(ino, attrs.kind)
+        }
+    }
+
+    /// Whether this is the remote form.
+    pub fn is_remote(&self) -> bool {
+        self.attrs.is_none()
     }
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(DENTRY_LEN);
         out.extend_from_slice(&self.ino.to_le_bytes());
-        self.attrs.encode_into(&mut out);
+        match &self.attrs {
+            Some(attrs) => attrs.encode_into(&mut out),
+            None => out.push(self.kind.as_u8()),
+        }
         out
     }
 
     pub fn decode(buf: &[u8]) -> Result<DentryRecord, RecordError> {
-        if buf.len() < 8 {
-            return Err(RecordError::Truncated("dentry ino"));
+        if buf.len() < DENTRY_REMOTE_LEN {
+            return Err(RecordError::Truncated("dentry ino and kind"));
         }
         let ino = u64::from_le_bytes(buf[0..8].try_into().expect("8 bytes"));
-        Ok(DentryRecord {
-            ino,
-            attrs: Attrs::decode(&buf[8..])?,
-        })
+        match buf.len() {
+            DENTRY_REMOTE_LEN => Ok(DentryRecord::remote(ino, Kind::from_u8(buf[8])?)),
+            DENTRY_LEN => Ok(DentryRecord::new(ino, Attrs::decode(&buf[8..])?)),
+            other => Err(RecordError::BadDentryLength(other)),
+        }
     }
 
     /// ino and kind alone, for plain `readdir`, without decoding the
-    /// rest of the copy.
+    /// rest of the copy. Both forms start with them.
     pub fn ino_and_kind(buf: &[u8]) -> Result<(u64, Kind), RecordError> {
-        if buf.len() < 9 {
+        if buf.len() < DENTRY_REMOTE_LEN {
             return Err(RecordError::Truncated("dentry ino and kind"));
         }
         Ok((
@@ -765,7 +837,8 @@ impl DentryRecord {
 /// S2 made this a function pointer instead of baking it into the tree
 /// because only this codec knows which key range is *authoritative*, and
 /// the question is not cosmetic: §P6 stores a file's attrs twice, once
-/// in the `0x01` record and once in every `0x02` dentry that names it.
+/// in the `0x01` record and once in every `0x02` dentry that names it
+/// (while it has one name, plan 45).
 /// Counting both would inflate `du`, `statfs`, quota admission and pin
 /// admission by one whole copy per link — and because the aggregate is
 /// covered by the root hash, it would be inflated *consistently* on
@@ -945,14 +1018,73 @@ mod tests {
     #[test]
     fn dentry_records_round_trip_and_expose_kind_cheaply() {
         for kind in KINDS {
-            let record = DentryRecord::new(7, Attrs { kind, ..attrs() });
-            let encoded = record.encode();
+            let full = DentryRecord::new(7, Attrs { kind, ..attrs() });
+            let encoded = full.encode();
             assert_eq!(encoded.len(), DENTRY_LEN);
-            assert_eq!(DentryRecord::decode(&encoded).unwrap(), record);
+            assert_eq!(DentryRecord::decode(&encoded).unwrap(), full);
             assert_eq!(DentryRecord::ino_and_kind(&encoded).unwrap(), (7, kind));
+            assert!(!full.is_remote());
+
+            let remote = DentryRecord::remote(7, kind);
+            let encoded = remote.encode();
+            assert_eq!(encoded.len(), DENTRY_REMOTE_LEN);
+            assert_eq!(DentryRecord::decode(&encoded).unwrap(), remote);
+            assert_eq!(DentryRecord::ino_and_kind(&encoded).unwrap(), (7, kind));
+            assert!(remote.is_remote());
         }
         assert!(DentryRecord::decode(&[0u8; 8]).is_err());
         assert!(DentryRecord::ino_and_kind(&[0u8; 8]).is_err());
+    }
+
+    /// Plan 45: the two forms are told apart by length alone, and a value
+    /// of any other length is not a dentry (a half-copy would read as
+    /// attributes it never had).
+    #[test]
+    fn the_dentry_encodings_are_pinned() {
+        assert_eq!(DENTRY_LEN, 57);
+        assert_eq!(DENTRY_REMOTE_LEN, 9);
+        let remote = DentryRecord::remote(0x0102_0304_0506_0708, Kind::Symlink).encode();
+        assert_eq!(
+            remote,
+            [0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x02]
+        );
+        let full = DentryRecord::new(1, attrs()).encode();
+        assert_eq!(full.len(), 57);
+        assert_eq!(&full[..9], &[1, 0, 0, 0, 0, 0, 0, 0, Kind::File.as_u8()]);
+        for len in (0..=full.len() + 2).filter(|l| *l != 9 && *l != 57) {
+            let mut buf = full.clone();
+            buf.resize(len, 0);
+            let err = DentryRecord::decode(&buf).unwrap_err();
+            if len < 9 {
+                assert_eq!(err, RecordError::Truncated("dentry ino and kind"));
+            } else {
+                assert_eq!(err, RecordError::BadDentryLength(len));
+            }
+        }
+        assert!(DentryRecord::decode(&[0, 0, 0, 0, 0, 0, 0, 0, 200]).is_err());
+    }
+
+    /// Plan 45's rule: a copy for a directory and for a non-directory
+    /// with at most one name; the remote form for two or more.
+    #[test]
+    fn the_dentry_form_is_a_function_of_kind_and_nlink() {
+        for kind in KINDS {
+            for nlink in [0u32, 1, 2, 3, 1000] {
+                let a = Attrs {
+                    kind,
+                    nlink,
+                    ..attrs()
+                };
+                let rec = DentryRecord::for_inode(5, &a);
+                let expect_copy = kind == Kind::Dir || nlink <= 1;
+                assert_eq!(rec.attrs.is_some(), expect_copy, "{kind:?} nlink {nlink}");
+                assert_eq!(rec.kind, kind);
+                assert_eq!(rec.ino, 5);
+                assert_eq!(DentryRecord::carries_copy(&a), expect_copy);
+                // Bytes depend on nothing else: equal inodes, equal values.
+                assert_eq!(rec.encode(), DentryRecord::for_inode(5, &a).encode());
+            }
+        }
     }
 
     #[test]

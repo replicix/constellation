@@ -860,12 +860,12 @@ impl Inner {
         let mut linked: HashMap<Ino, Option<FileState>> = HashMap::new();
         let mut stack = vec![dir];
         while let Some(parent) = stack.pop() {
-            for (child, kind, nlink) in dentries(side, parent)? {
+            for (child, kind, hard_linked) in dentries(side, parent)? {
                 match kind {
                     Kind::Dir => stack.push(child),
                     Kind::File => {
                         // A hardlinked file is read once, counted per name.
-                        let file = if nlink > 1 {
+                        let file = if hard_linked {
                             match linked.get(&child) {
                                 Some(file) => file.clone(),
                                 None => {
@@ -1060,9 +1060,11 @@ fn kind_of(side: &Side<'_>, ino: Ino) -> Result<Option<Kind>> {
     }
 }
 
-/// A directory's children as `(ino, kind, nlink)`, from the dentry
-/// attr copies (one range scan, no inode reads).
-fn dentries(side: &Side<'_>, dir: Ino) -> Result<Vec<(Ino, Kind, u32)>> {
+/// A directory's children as `(ino, kind, hard linked)`, from the dentries
+/// (one range scan, no inode reads). A name of an inode with several
+/// names holds no attr copy (plan 45): a remote dentry *is* "hard linked",
+/// and a dentry with a copy is when its `nlink` says so.
+fn dentries(side: &Side<'_>, dir: Ino) -> Result<Vec<(Ino, Kind, bool)>> {
     let range = keys::dentries_of(dir);
     let mut out = Vec::new();
     for (key, value) in side
@@ -1073,7 +1075,11 @@ fn dentries(side: &Side<'_>, dir: Ino) -> Result<Vec<(Ino, Kind, u32)>> {
             bail!("a non-dentry key inside directory {dir}'s range");
         }
         let record = DentryRecord::decode(&value)?;
-        out.push((record.ino, record.attrs.kind, record.attrs.nlink));
+        out.push((
+            record.ino,
+            record.kind,
+            record.attrs.is_none_or(|attrs| attrs.nlink > 1),
+        ));
     }
     Ok(out)
 }

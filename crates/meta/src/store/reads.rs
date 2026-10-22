@@ -279,7 +279,9 @@ impl Meta {
     /// in sync with `0x01` in the same commit — see [`DentryRecord`]'s
     /// doc) already carries `size`, so decoding the whole dentry instead
     /// of just `ino_and_kind` answers a file child from the scan alone.
-    /// Directories still only need the ino to push onto the stack.
+    /// Directories still only need the ino to push onto the stack. A name
+    /// of a hard-linked file has no copy (plan 45) and costs one `0x01`
+    /// read per distinct inode; it is counted once per name, as before.
     pub fn recursive_size(&self, ino: Ino) -> Result<(u64, u64), MetaError> {
         use constellation_mtree::record::{DentryRecord, Kind};
 
@@ -290,18 +292,35 @@ impl Meta {
             bytes += root.attrs.size;
             files += 1;
         }
+        // A hard-linked file's names hold no copy (plan 45): its size is
+        // one `0x01` read, made once however many names the walk meets.
+        let mut linked: std::collections::HashMap<Ino, u64> = std::collections::HashMap::new();
         let mut stack = vec![ino];
         while let Some(dir) = stack.pop() {
             let range = keys::dentries_of(dir);
             for guard in r.range(&self.ns, ns::key_range_bounds(&range)) {
                 let (_, v) = guard.into_inner()?;
                 let dentry = DentryRecord::decode(&v)?;
-                match dentry.attrs.kind {
-                    Kind::File => {
-                        bytes += dentry.attrs.size;
+                match (dentry.kind, dentry.attrs) {
+                    (Kind::File, Some(attrs)) => {
+                        bytes += attrs.size;
                         files += 1;
                     }
-                    Kind::Dir => stack.push(dentry.ino),
+                    (Kind::File, None) => {
+                        let size = match linked.get(&dentry.ino) {
+                            Some(size) => *size,
+                            None => {
+                                self.note_inode_read();
+                                let rec = ns::get_inode_record(&r, &self.ns, dentry.ino)?
+                                    .ok_or(MetaError::NoEnt(dentry.ino))?;
+                                linked.insert(dentry.ino, rec.attrs.size);
+                                rec.attrs.size
+                            }
+                        };
+                        bytes += size;
+                        files += 1;
+                    }
+                    (Kind::Dir, _) => stack.push(dentry.ino),
                     _ => {}
                 }
             }

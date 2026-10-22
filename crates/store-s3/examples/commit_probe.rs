@@ -65,7 +65,11 @@ fn main() {
                 None => "absent".to_string(),
                 Some(bytes) if name.starts_with("d:") => {
                     match record::DentryRecord::decode(&bytes) {
-                        Ok(d) => format!("ino {}", d.ino),
+                        Ok(d) => format!(
+                            "ino {} {}",
+                            d.ino,
+                            if d.is_remote() { "remote" } else { "copy" }
+                        ),
                         Err(e) => format!("undecodable {e}"),
                     }
                 }

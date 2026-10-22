@@ -323,7 +323,7 @@ async fn walk(
             let mut stack = vec![ino];
             while let Some(dir) = stack.pop() {
                 for child in reader.readdir(dir, None, usize::MAX)? {
-                    let kind = child.attrs.kind.as_u8();
+                    let kind = child.kind.as_u8();
                     if kind == InodeKind::Dir.as_u8() {
                         stack.push(child.ino);
                     } else if kind == InodeKind::File.as_u8() {

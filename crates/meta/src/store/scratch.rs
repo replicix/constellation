@@ -110,11 +110,10 @@ impl Meta {
         let Some(d) = ns::get_dentry_record(&r, &self.scratch, parent, name)? else {
             return Ok(None);
         };
-        Ok(Some(ns::attrs_to_fileattr(
-            d.ino,
-            &d.attrs,
-            d.attrs.mtime_ns,
-        )))
+        // Scratch files have one name, so the copy is there; an entry
+        // without one resolves through the scratch inode.
+        let (attrs, _) = ns::dentry_attrs(&r, &self.scratch, &d)?;
+        Ok(Some(ns::attrs_to_fileattr(d.ino, &attrs, attrs.mtime_ns)))
     }
 
     pub fn scratch_unlink(&self, parent: Ino, name: &str) -> Result<(), MetaError> {
@@ -150,6 +149,7 @@ impl Meta {
         if ns::child_ino(&tx, &self.scratch, new_parent, new_name)?.is_some() {
             return Err(MetaError::Exists);
         }
+        let (attrs, _) = ns::dentry_attrs(&tx, &self.scratch, &d)?;
         ns::remove_dentry(
             &mut tx,
             &self.scratch,
@@ -165,7 +165,7 @@ impl Meta {
             new_parent,
             new_name,
             d.ino,
-            d.attrs,
+            attrs,
         )?;
         tx.commit()?;
         Ok(())

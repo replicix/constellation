@@ -607,7 +607,7 @@ impl SnapshotManager {
                     let mut ino = ino;
                     for component in &relative {
                         match reader.lookup(ino, component.as_bytes())? {
-                            Some(entry) if entry.attrs.kind.as_u8() == InodeKind::Dir.as_u8() => {
+                            Some(entry) if entry.kind.as_u8() == InodeKind::Dir.as_u8() => {
                                 ino = entry.ino
                             }
                             _ => return Ok(None),
@@ -842,7 +842,7 @@ pub async fn snapshot_chunk_refs(
             let mut stack = vec![ino];
             while let Some(dir) = stack.pop() {
                 for child in reader.readdir(dir, None, usize::MAX)? {
-                    match child.attrs.kind.as_u8() {
+                    match child.kind.as_u8() {
                         k if k == InodeKind::Dir.as_u8() => stack.push(child.ino),
                         k if k == InodeKind::File.as_u8() => {
                             if let Some(bytes) = reader

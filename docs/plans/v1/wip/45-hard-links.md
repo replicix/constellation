@@ -284,25 +284,34 @@ under a timeout.
   1,000 package directories of 100), (iii) an rsnapshot-like tree (7
   `cp -al` generations of 50 k files); concurrent `create` latency during a
   link burst. Nothing else changes.
-- **H1 — `mtree::record`: two dentry forms, and fsck.** `DentryRecord {
-  ino, kind, attrs: Option<Attrs> }`, `new`/`remote`/`for_inode`,
-  `DENTRY_REMOTE_LEN`, `decode` by length, the pinned-encoding test
-  (`the_dentry_encodings_are_pinned`: 9 and 57), `RecordError::BadDentryLength`.
-  `mtree/tests/keys.rs`: the model builder writes `Remote` for every file
-  with a second link and checks the form; the aggregate test still counts
-  `0x01` only (**fail-before**: a builder that writes `Full` on a hard link
-  fails the form check). `TreeReader::check_dentry_forms` and fsck's
-  `dentry_form` issue, with a corpus holding one of each violation
-  (`fsck_reports_a_full_copy_on_a_hard_link`,
+- **H1 — `mtree::record`: two dentry forms, every reader, and fsck.**
+  `DentryRecord { ino, kind, attrs: Option<Attrs> }`, `new`/`remote`/
+  `for_inode`/`carries_copy`, `DENTRY_REMOTE_LEN`, `decode` by length, the
+  pinned-encoding test (`the_dentry_encodings_are_pinned`: 9 and 57),
+  `RecordError::BadDentryLength`. The type change reaches every consumer, so
+  this commit also carries **all readers**, correct for both forms while
+  nothing yet writes `Remote`: `MetaStore::lookup` (the `0x01` fallback),
+  `Meta::inode_reads`, `recursive_size` (one read per distinct inode),
+  `scratch_lookup`/`scratch_rename`, `TreeEntry { kind, attrs: Option }`,
+  `snapwalk::dentries` (`Remote` ⇒ hard linked), `snapshot.rs` and
+  `snapacct/verify.rs` (they use `kind`), the sim oracle's `mask_times` and
+  the `commit_probe` example. `mtree/tests/keys.rs`: the model builder
+  writes `Remote` for every file with a second link and checks the form
+  from its own dentries; the aggregate test still counts `0x01` only
+  (**fail-before**: a builder that writes `Full` on a hard link fails the
+  form check, `the_form_check_rejects_…`). `TreeReader::check_dentry_forms`
+  and fsck's `dentry_form` issue, with a corpus holding one of each
+  violation (`fsck_reports_a_full_copy_on_a_hard_link`,
   `fsck_reports_a_remote_on_a_single_name`, `fsck_reports_a_stale_full_copy`,
   `fsck_reports_a_remote_directory_and_a_wrong_kind`,
-  `fsck_accepts_both_forms_in_the_right_places`). Readers keep compiling
-  by treating a `Full`-only world as before (H2/H3 switch them).
-- **H2 — `meta`: the rule and the transitions.** `ns::for_inode` use in
-  `put_dentry`, `put_inode_record(…, before)` per §4.2, both renames, both
-  exchanges, replay's `apply_*`/`evict_dentry`/`apply_setattr`/
-  `apply_write_manifest`, scratch, clone; `MetaStore::lookup` fallback and
-  `Meta::inode_reads`; `recursive_size` per §4.3. Tests (`crates/meta`):
+  `fsck_reports_a_dangling_dentry_and_a_value_of_no_form`,
+  `fsck_accepts_both_forms_in_the_right_places`). Meta reader tests with
+  hand-written `Remote` dentries (`remote_dentry_reader_tests`).
+- **H2 — `meta`: the rule and the transitions (writers).**
+  `DentryRecord::for_inode` in `put_dentry`, `put_inode_record(…, before)`
+  per §4.2, both renames, both exchanges, replay's `apply_*`/`evict_dentry`/
+  `apply_setattr`/`apply_write_manifest`, scratch, clone. Tests
+  (`crates/meta`):
   - `link_cost_is_flat_in_the_link_count` (**fail-before**): a `link` and
     an `unlink` at *n* = 500 change at most 6 `ns` keys (today *n*+5);
     `chmod` and a manifest commit at *n* = 500 change 2 (today *n*+1);
@@ -321,17 +330,16 @@ under a timeout.
   - `recursive_size_of_a_hard_link_tree` equals the sum over inodes once per
     name and reads each inode once (the counter).
   Meta-level perf (§7) is measured here against H0's baseline.
-- **H3 — Engine readers.** `TreeEntry.attrs: Option<Attrs>` and `kind`;
-  `snapshot.rs`, `snapacct/verify.rs`, `snapwalk::dentries` (`Remote` ⇒
-  hard linked); `mtree_read` bulk load verbatim (its roundtrip test adds a
-  hard link); the `mtree_publish` tests ("just this file's `0x01` plus its
-  one dentry copy") gain a hard-linked twin asserting one key; the sim
-  oracle's `mask_times` and the `commit_probe` example tolerate `Remote`.
-  Engine tests `a_listing_of_single_name_entries_reads_no_inode` (the
-  priority-1 gate, by the `inode_reads` counter) and
+- **H3 — Engine tests.** The `mtree_read` roundtrip test gains a hard link
+  (the bulk load copies `Remote` values verbatim); the `mtree_publish`
+  tests ("just this file's `0x01` plus its one dentry copy") gain a
+  hard-linked twin asserting the key counts; engine tests
+  `a_listing_of_single_name_entries_reads_no_inode` (the priority-1 gate, by
+  the `inode_reads` counter) and
   `a_listing_of_hard_linked_entries_reads_each_inode_once_per_entry`; a
   snapshot-walk test with a hard link (`snapwalk` counts the file per name,
-  reads it once). Plan 40 R5, when it lands after this, adds
+  reads it once); an fsck run over a published tree with hard links reports
+  nothing. Plan 40 R5, when it lands after this, adds
   `plus_entries_of_hard_links_are_what_lookup_answers`.
 - **H4 — Harness and xcheckfs.** Scenario `hardlink-burst`: 8,192 links then
   unlinks of one file on node A while node B replays; both roots equal;
@@ -427,9 +435,9 @@ purpose", "Gates"), with these rows:
 | Item | State | Where |
 |---|---|---|
 | Baseline (H0) | meta level landed, box pending | `crates/meta/tests/hardlink_perf.rs`; `bench/hardlink/` |
-| Two dentry forms, fsck check (H1) | | `crates/mtree/src/record.rs`, `crates/engine/src/{mtree_read,fsck}.rs` |
+| Two dentry forms, every reader, fsck check (H1) | | `crates/mtree/src/record.rs`, `crates/meta/src/store/{ns,writes,reads,scratch}.rs`, `crates/engine/src/{mtree_read,snapwalk,snapshot,fsck}.rs` |
 | The rule and transitions (H2) | | `crates/meta/src/store/{ns,writes,misc,reads,scratch}.rs`, `crates/meta/src/replay.rs` |
-| Engine readers (H3) | | `crates/engine/src/{snapshot,snapwalk,snapacct/verify,mtree_read}.rs` |
+| Engine tests (H3) | | `crates/engine/src/{mtree_read,mtree_publish,snapwalk}.rs` |
 | Harness + xcheckfs (H4) | pending, box | `crates/harness/src/scenarios.rs` |
 | Docs (H5) | | `docs/plans/v1/done/28-…` §P6 note, `docs/reference` |
 

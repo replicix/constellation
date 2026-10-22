@@ -76,6 +76,23 @@ pub(crate) fn get_dentry_record(
     }
 }
 
+/// The attributes a dentry stands for: its copy, or — for a name of a
+/// hard-linked inode, which holds none (plan 45) — the inode's own record,
+/// one point read. The flag says whether that read was made.
+pub(crate) fn dentry_attrs(
+    r: &impl Readable,
+    ns: &SingleWriterTxKeyspace,
+    d: &DentryRecord,
+) -> Result<(Attrs, bool), MetaError> {
+    match d.attrs {
+        Some(attrs) => Ok((attrs, false)),
+        None => {
+            let rec = get_inode_record(r, ns, d.ino)?.ok_or(MetaError::NoEnt(d.ino))?;
+            Ok((rec.attrs, true))
+        }
+    }
+}
+
 /// The dentry pointing at `ino` (there's at most one relevant parent for
 /// this purpose: an ancestor walk only needs *a* parent, and a hard
 /// linked non-directory never needs one).
@@ -349,7 +366,7 @@ pub(crate) fn put_inode_record(
     ns_insert(tx, ns, dirty, keys::inode(ino), record.encode())?;
     for (parent, name) in links_of(tx, ns, ino)? {
         let stale = get_dentry_record(tx, ns, parent, &name)?
-            .is_none_or(|d| d.ino != ino || d.attrs != record.attrs);
+            .is_none_or(|d| d.ino != ino || d.attrs != Some(record.attrs));
         if stale {
             ns_insert(
                 tx,

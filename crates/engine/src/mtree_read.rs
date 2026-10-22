@@ -167,14 +167,17 @@ impl Resolver<'_> {
 
 // ---------------------------------------------------------- tree reader
 
-/// One directory entry as the tree stores it: the name, the target ino,
-/// and S1's attr copy (so `readdirplus` needs nothing else).
+/// One directory entry as the tree stores it: the name, the target ino and
+/// its kind, and S1's attr copy when the inode has one name (plan 45: a
+/// hard-linked inode's names hold none, and `attrs` is `None`; its
+/// attributes are one [`TreeReader::getattr`] away).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct TreeEntry {
     pub name: Vec<u8>,
     pub ino: Ino,
-    pub attrs: record::Attrs,
+    pub kind: record::Kind,
+    pub attrs: Option<record::Attrs>,
 }
 
 /// What [`TreeReader::verify`] found.
@@ -188,6 +191,31 @@ pub(crate) struct Verified {
     /// child they point at.
     pub bad_aggregates: Vec<NodeHash>,
 }
+
+/// A `0x02` value whose form disagrees with its inode (plan 45).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DentryViolation {
+    pub parent: Ino,
+    pub name: Vec<u8>,
+    /// The inode the value names; 0 when the value does not decode.
+    pub ino: Ino,
+    pub what: String,
+}
+
+/// What [`TreeReader::check_dentry_forms`] found.
+#[derive(Debug, Default)]
+pub(crate) struct DentryForms {
+    /// Dentries examined.
+    pub checked: u64,
+    /// Every violation found, however many.
+    pub violations: u64,
+    /// The first [`DENTRY_VIOLATIONS_KEPT`] of them.
+    pub first: Vec<DentryViolation>,
+}
+
+/// How many violations a report keeps in full; a corrupted tree can hold
+/// one per name.
+pub(crate) const DENTRY_VIOLATIONS_KEPT: usize = 100;
 
 /// FUSE's metadata reads over one published root, fetching only what
 /// each call touches. See the module docs.
@@ -220,6 +248,7 @@ impl<S: NodeStore> TreeReader<S> {
         Ok(Some(TreeEntry {
             name: name.to_vec(),
             ino: rec.ino,
+            kind: rec.kind,
             attrs: rec.attrs,
         }))
     }
@@ -255,6 +284,7 @@ impl<S: NodeStore> TreeReader<S> {
             out.push(TreeEntry {
                 name: name.to_vec(),
                 ino: rec.ino,
+                kind: rec.kind,
                 attrs: rec.attrs,
             });
         }
@@ -316,6 +346,79 @@ impl<S: NodeStore> TreeReader<S> {
             }
         }
         Ok(out)
+    }
+
+    /// Plan 45's invariant over every `0x02` value of the root: a dentry
+    /// holds the attribute copy iff its inode is a directory or a
+    /// non-directory with `nlink <= 1`, and then the copy equals the
+    /// inode's attributes; otherwise it is the remote form, with the
+    /// inode's kind. One point read of `0x01` per dentry, streamed: nothing
+    /// but the violations is kept.
+    pub fn check_dentry_forms(&self) -> Result<DentryForms> {
+        let range = keys::whole_range(keys::RANGE_DENTRY);
+        let mut out = DentryForms::default();
+        let mut cursor = self.tree.cursor_at(&self.root, range.start())?;
+        while let Some((key, value)) = cursor.entry()? {
+            if !key.starts_with(range.prefix()) {
+                break;
+            }
+            let Key::Dentry { parent_ino, name } = Key::parse(key)? else {
+                bail!("a non-dentry key inside the dentry range");
+            };
+            let (parent, name) = (parent_ino, name.to_vec());
+            out.checked += 1;
+            let wrong = match DentryRecord::decode(value) {
+                Err(e) => Some((0, format!("the value does not decode: {e}"))),
+                Ok(rec) => self.dentry_form_fault(&rec)?.map(|what| (rec.ino, what)),
+            };
+            if let Some((ino, what)) = wrong {
+                out.violations += 1;
+                if out.first.len() < DENTRY_VIOLATIONS_KEPT {
+                    out.first.push(DentryViolation {
+                        parent,
+                        name,
+                        ino,
+                        what,
+                    });
+                }
+            }
+            cursor.next()?;
+        }
+        Ok(out)
+    }
+
+    /// What is wrong with `rec` against its inode's record, if anything.
+    fn dentry_form_fault(&self, rec: &DentryRecord) -> Result<Option<String>> {
+        let Some(value) = self.tree.get(&self.root, &keys::inode(rec.ino))? else {
+            return Ok(Some(format!("inode {} has no record", rec.ino)));
+        };
+        let inode = match InodeRecord::decode(&value) {
+            Ok(inode) => inode.attrs,
+            Err(e) => return Ok(Some(format!("inode {} does not decode: {e}", rec.ino))),
+        };
+        let copy = DentryRecord::carries_copy(&inode);
+        Ok(match rec.attrs {
+            Some(_) if !copy => Some(format!(
+                "a copy of the attributes on a hard-linked inode (nlink {})",
+                inode.nlink
+            )),
+            Some(held) if held != inode => {
+                Some("a copy that differs from the inode's attributes".to_string())
+            }
+            Some(_) => None,
+            None if inode.kind == record::Kind::Dir => {
+                Some("the remote form on a directory".to_string())
+            }
+            None if copy => Some(format!(
+                "the remote form on an inode with one name (nlink {})",
+                inode.nlink
+            )),
+            None if rec.kind != inode.kind => Some(format!(
+                "the remote form says {:?}, the inode is {:?}",
+                rec.kind, inode.kind
+            )),
+            None => None,
+        })
     }
 
     /// One inode as its replica row, spilled values resolved. `None`
@@ -761,7 +864,14 @@ mod tests {
                 for (g, w) in got.iter().zip(&want) {
                     assert_eq!((g.name.as_slice(), g.ino), (w.name.as_bytes(), w.ino));
                     let attr = meta.getattr(w.ino).unwrap().unwrap();
-                    assert_eq!((g.attrs.size, g.attrs.mode), (attr.size, attr.mode));
+                    // A hard-linked name holds no copy (plan 45); its
+                    // attributes are the inode's.
+                    let held = match g.attrs {
+                        Some(copy) => copy,
+                        None => reader.getattr(g.ino).unwrap().unwrap().attrs,
+                    };
+                    assert_eq!((held.size, held.mode), (attr.size, attr.mode));
+                    assert_eq!(g.kind, held.kind);
                 }
                 let one = &want[want.len() / 2];
                 assert_eq!(

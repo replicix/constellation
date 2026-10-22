@@ -159,8 +159,11 @@ fn mask_times(k: &[u8], v: &[u8]) -> Vec<u8> {
         }
         Some(2) => {
             if let Ok(mut rec) = DentryRecord::decode(v) {
-                rec.attrs.mtime_ns = 0;
-                rec.attrs.ctime_ns = 0;
+                // A remote dentry (plan 45) holds no times to mask.
+                if let Some(attrs) = rec.attrs.as_mut() {
+                    attrs.mtime_ns = 0;
+                    attrs.ctime_ns = 0;
+                }
                 return rec.encode();
             }
         }

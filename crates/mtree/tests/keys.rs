@@ -124,7 +124,49 @@ impl Model {
                 }
             }
         }
+        // A file with several names says so: plan 45's rule keys the
+        // dentry form on `nlink`, and the model must agree with its own
+        // dentries about it.
+        let mut names: BTreeMap<u64, u32> = BTreeMap::new();
+        for ino in dentries.values() {
+            *names.entry(*ino).or_default() += 1;
+        }
+        for (ino, (attrs, _)) in inodes.iter_mut() {
+            if attrs.kind != Kind::Dir {
+                attrs.nlink = names.get(ino).copied().unwrap_or(1);
+            }
+        }
         Model { inodes, dentries }
+    }
+
+    /// How many names the model gives `ino`.
+    fn names_of(&self, ino: u64) -> usize {
+        self.dentries.values().filter(|i| **i == ino).count()
+    }
+
+    /// Plan 45's invariant, stated from the model's own dentries and not
+    /// from `nlink` or `DentryRecord::for_inode`: a `0x02` value holds the
+    /// attribute copy iff its inode is a directory or has exactly one
+    /// name, and is the 9-byte remote form (the inode's kind) otherwise.
+    fn check_forms(&self, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<(), String> {
+        for (key, value) in entries {
+            let Ok(Key::Dentry { parent_ino, name }) = Key::parse(key) else {
+                continue;
+            };
+            let record = DentryRecord::decode(value).map_err(|e| format!("{e}"))?;
+            let (attrs, _) = &self.inodes[&record.ino];
+            let copy = attrs.kind == Kind::Dir || self.names_of(record.ino) == 1;
+            let at = format!("dentry {parent_ino}/{name:?} -> {}", record.ino);
+            match (copy, record.attrs) {
+                (true, Some(held)) if held == *attrs => {}
+                (true, Some(_)) => return Err(format!("{at}: a stale copy")),
+                (true, None) => return Err(format!("{at}: remote on a single name")),
+                (false, Some(_)) => return Err(format!("{at}: a copy on a hard link")),
+                (false, None) if record.kind == attrs.kind => {}
+                (false, None) => return Err(format!("{at}: remote with the wrong kind")),
+            }
+        }
+        Ok(())
     }
 
     /// Every key the §P6 codec writes for this filesystem.
@@ -144,7 +186,7 @@ impl Model {
             let (attrs, _) = &self.inodes[ino];
             out.push((
                 keys::dentry(*parent, name),
-                DentryRecord::new(*ino, *attrs).encode(),
+                DentryRecord::for_inode(*ino, attrs).encode(),
             ));
             out.push((keys::rdentry(*ino, *parent, name), RDENTRY_VALUE.to_vec()));
         }
@@ -174,6 +216,7 @@ fn the_aggregate_counts_each_file_once_and_ignores_the_dentry_copy() {
     let model = Model::build(0xC0FFEE);
     let tree = tree();
     let entries = model.keys();
+    model.check_forms(&entries).unwrap();
     let root = tree.build(entries.clone()).unwrap();
 
     let mut expected = model.total();
@@ -185,9 +228,9 @@ fn the_aggregate_counts_each_file_once_and_ignores_the_dentry_copy() {
     );
 
     // The guard that makes the above non-vacuous: the same model has
-    // 2× as many dentry attr copies as inode records for the hard-linked
-    // files, so a projection that counted `0x02` would inflate the
-    // totals. Build a tree from the inode records alone and assert the
+    // more dentries than inode records (every single-name file's dentry
+    // still copies its attrs), so a projection that counted `0x02` would
+    // inflate the totals. Build a tree from the inode records alone and assert the
     // byte and file totals are identical — i.e. the dentries contributed
     // nothing but keys.
     let inodes_only: Vec<(Vec<u8>, Vec<u8>)> = entries
@@ -212,7 +255,7 @@ fn the_aggregate_counts_each_file_once_and_ignores_the_dentry_copy() {
     let copied: u64 = entries
         .iter()
         .filter_map(|(key, value)| match Key::parse(key) {
-            Ok(Key::Dentry { .. }) => Some(DentryRecord::decode(value).unwrap().attrs),
+            Ok(Key::Dentry { .. }) => DentryRecord::decode(value).unwrap().attrs,
             _ => None,
         })
         .filter(|attrs| attrs.kind.holds_data())
@@ -221,8 +264,9 @@ fn the_aggregate_counts_each_file_once_and_ignores_the_dentry_copy() {
     assert!(copied > 0, "the attr copy must carry sizes to be a hazard");
 
     // An incremental commit keeps the aggregate exact: growing a file
-    // rewrites its `0x01` record and its dentry copies, and only the
-    // first may move the total.
+    // rewrites its `0x01` record and the copy under its one name (a
+    // hard-linked file's dentries are remote and do not change), and only
+    // the `0x01` record may move the total.
     let (ino, (before, xattrs)) = model
         .inodes
         .iter()
@@ -244,7 +288,7 @@ fn the_aggregate_counts_each_file_once_and_ignores_the_dentry_copy() {
         if target == ino {
             edits.push((
                 keys::dentry(*parent, name),
-                Some(DentryRecord::new(*ino, grown).encode()),
+                Some(DentryRecord::for_inode(*ino, &grown).encode()),
             ));
         }
     }
@@ -255,6 +299,68 @@ fn the_aggregate_counts_each_file_once_and_ignores_the_dentry_copy() {
         expected.bytes + 4096,
         "one file grew by 4 KiB, however many dentries copy its attrs"
     );
+}
+
+/// Plan 45's form check has teeth: a builder that copies the attributes
+/// under every name of a hard-linked file (today's behaviour), or that
+/// leaves a remote dentry on a single name, or a stale copy, or a remote
+/// of the wrong kind, fails it; the right builder passes.
+#[test]
+fn the_form_check_rejects_a_copy_on_a_hard_link_and_a_remote_on_a_single_name() {
+    let model = Model::build(0xC0FFEE);
+    let good = model.keys();
+    model.check_forms(&good).unwrap();
+
+    let linked: Vec<u64> = model
+        .inodes
+        .keys()
+        .copied()
+        .filter(|ino| model.names_of(*ino) > 1 && model.inodes[ino].0.kind != Kind::Dir)
+        .collect();
+    let single: Vec<u64> = model
+        .inodes
+        .keys()
+        .copied()
+        .filter(|ino| model.names_of(*ino) == 1 && model.inodes[ino].0.kind != Kind::Dir)
+        .collect();
+    assert!(!linked.is_empty() && !single.is_empty());
+
+    let rewrite = |ino: u64, with: &dyn Fn(&Attrs) -> DentryRecord| {
+        good.iter()
+            .map(|(key, value)| match Key::parse(key) {
+                Ok(Key::Dentry { .. }) if DentryRecord::decode(value).unwrap().ino == ino => {
+                    (key.clone(), with(&model.inodes[&ino].0).encode())
+                }
+                _ => (key.clone(), value.clone()),
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let naive = rewrite(linked[0], &|a| DentryRecord::new(linked[0], *a));
+    assert!(model
+        .check_forms(&naive)
+        .unwrap_err()
+        .contains("a copy on a hard link"));
+    let remote = rewrite(single[0], &|a| DentryRecord::remote(single[0], a.kind));
+    assert!(model
+        .check_forms(&remote)
+        .unwrap_err()
+        .contains("remote on a single name"));
+    let stale = rewrite(single[0], &|a| {
+        DentryRecord::new(
+            single[0],
+            Attrs {
+                size: a.size + 1,
+                ..*a
+            },
+        )
+    });
+    assert!(model.check_forms(&stale).unwrap_err().contains("stale"));
+    let wrong = rewrite(linked[0], &|_| DentryRecord::remote(linked[0], Kind::Fifo));
+    assert!(model
+        .check_forms(&wrong)
+        .unwrap_err()
+        .contains("wrong kind"));
 }
 
 #[test]
@@ -288,9 +394,16 @@ fn a_directory_scan_is_one_contiguous_range_and_stops_at_the_next() {
                 }
                 other => panic!("the scan left the 0x02 range: {other:?}"),
             }
-            // READDIRPLUS reads attrs straight out of the scan.
+            // READDIRPLUS reads attrs straight out of the scan for a
+            // single-name entry; a hard-linked one is remote.
             let record = DentryRecord::decode(value).unwrap();
-            assert_eq!(record.attrs, model.inodes[&record.ino].0);
+            let (attrs, _) = &model.inodes[&record.ino];
+            assert_eq!(record.kind, attrs.kind);
+            if attrs.kind == Kind::Dir || model.names_of(record.ino) == 1 {
+                assert_eq!(record.attrs, Some(*attrs));
+            } else {
+                assert!(record.is_remote());
+            }
         }
         // The bound is exclusive and lands exactly on the next
         // directory's first possible key, so a cursor walking past the

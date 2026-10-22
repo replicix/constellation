@@ -673,6 +673,10 @@ pub struct Meta {
     /// its commit on the same thread, so another thread's report never
     /// takes rows of a transaction that has not committed.
     rolled_back: std::sync::Mutex<Vec<(std::thread::ThreadId, RolledBack)>>,
+    /// Plan 45: `0x01` point reads made on behalf of a dentry — the read a
+    /// hard-linked name's `Remote` entry costs, where a single-name entry
+    /// answers from its copy ([`Meta::inode_reads`]).
+    inode_reads: AtomicU64,
     /// Plan 32 §6.3: bumped (and the hook told) whenever a snapshot row
     /// may have appeared or gone, so the accounting index reconciles
     /// without polling the rows.
@@ -871,6 +875,19 @@ impl Meta {
         gate::note_sync(started.elapsed());
         self.syncs.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Plan 45: how many `0x01` records were read to answer for a dentry
+    /// (`lookup` of a hard-linked name, `recursive_size`'s file sizes
+    /// under hard-linked names). A name that is its inode's only name
+    /// answers from its dentry's copy and adds nothing, so a listing with
+    /// attributes of a tree without hard links leaves this where it was.
+    pub fn inode_reads(&self) -> u64 {
+        self.inode_reads.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn note_inode_read(&self) {
+        self.inode_reads.fetch_add(1, Ordering::Relaxed);
     }
 
     /// How many times [`Self::sync`] completed (tests).
@@ -1081,6 +1098,7 @@ impl Meta {
             foreign_apply_hook: std::sync::OnceLock::new(),
             rollback_hook: std::sync::OnceLock::new(),
             rolled_back: std::sync::Mutex::new(Vec::new()),
+            inode_reads: AtomicU64::new(0),
             snapshot_gen: AtomicU64::new(0),
             snapshot_hook: std::sync::RwLock::new(None),
             vacuum_baselines: Default::default(),
@@ -2364,7 +2382,8 @@ mod dentry_copy_tests {
                 .unwrap()
                 .unwrap_or_else(|| panic!("{label}: dangling dentry {k:?}"));
             assert_eq!(
-                d.attrs, rec.attrs,
+                d.attrs,
+                Some(rec.attrs),
                 "{label}: stale dentry copy for ino {}",
                 d.ino
             );
@@ -2406,6 +2425,85 @@ mod dentry_copy_tests {
             .collect();
         b.apply_records(&records).unwrap();
         assert_copies_match(&b, "replay");
+    }
+}
+
+/// Plan 45: the readers of a dentry answer for a `Remote` entry (a name of
+/// a hard-linked inode, which holds no attribute copy) from the inode's own
+/// record, with `0x01` reads counted and shared per inode. The dentries are
+/// written by hand here; `hardlink.rs` drives the real operations.
+#[cfg(test)]
+mod remote_dentry_reader_tests {
+    use super::*;
+    use crate::MetaStore;
+    use constellation_fs_core::types::ROOT_INO;
+    use constellation_mtree::record::{DentryRecord, Kind};
+
+    fn make_remote(meta: &Meta, parent: u64, name: &str, ino: u64) {
+        let mut tx = meta.db.write_tx();
+        tx.insert(
+            &meta.ns,
+            keys::dentry(parent, name.as_bytes()),
+            DentryRecord::remote(ino, Kind::File).encode(),
+        );
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn lookup_of_a_remote_dentry_answers_from_the_inode_and_counts_the_read() {
+        let meta = Meta::open_in_memory().unwrap();
+        let f = meta.create(ROOT_INO, "f", 0o640, 7, 8).unwrap().ino;
+        meta.set_manifest(f, b"m", 123).unwrap();
+        let single = meta.lookup(ROOT_INO, "f").unwrap().unwrap();
+        assert_eq!(meta.inode_reads(), 0, "a copy answers without 0x01");
+        make_remote(&meta, ROOT_INO, "f", f);
+        let remote = meta.lookup(ROOT_INO, "f").unwrap().unwrap();
+        assert_eq!(meta.inode_reads(), 1);
+        assert_eq!(remote, single);
+        assert_eq!(remote, meta.getattr(f).unwrap().unwrap());
+        // A dentry whose inode is gone is an error, not a made-up answer.
+        make_remote(&meta, ROOT_INO, "gone", 999_999);
+        assert!(meta.lookup(ROOT_INO, "gone").is_err());
+    }
+
+    #[test]
+    fn recursive_size_reads_each_hard_linked_inode_once() {
+        let meta = Meta::open_in_memory().unwrap();
+        let d = meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap().ino;
+        let a = meta.create(d, "a", 0o644, 0, 0).unwrap().ino;
+        meta.set_manifest(a, b"m", 1000).unwrap();
+        let b = meta.create(d, "b", 0o644, 0, 0).unwrap().ino;
+        meta.set_manifest(b, b"m", 10).unwrap();
+        let before = meta.recursive_size(d).unwrap();
+        assert_eq!(before, (1010, 2));
+        assert_eq!(meta.inode_reads(), 0);
+        // Three more names of `a`, all remote: counted once per name.
+        for name in ["a1", "a2", "a3"] {
+            make_remote(&meta, d, name, a);
+        }
+        make_remote(&meta, d, "a", a);
+        assert_eq!(meta.recursive_size(d).unwrap(), (4 * 1000 + 10, 5));
+        assert_eq!(meta.inode_reads(), 1, "one read for the inode, not four");
+    }
+
+    #[test]
+    fn scratch_lookup_resolves_a_remote_entry_through_the_scratch_inode() {
+        let meta = Meta::open_in_memory().unwrap();
+        let attr = meta
+            .scratch_create(ROOT_INO, "s", 0x77_0000_0001, 0o600, 0, 0)
+            .unwrap();
+        let mut tx = meta.db.write_tx();
+        tx.insert(
+            &meta.scratch,
+            keys::dentry(ROOT_INO, b"s"),
+            DentryRecord::remote(attr.ino, Kind::File).encode(),
+        );
+        tx.commit().unwrap();
+        let found = meta.scratch_lookup(ROOT_INO, "s").unwrap().unwrap();
+        assert_eq!(
+            (found.ino, found.mode, found.size),
+            (attr.ino, attr.mode, attr.size)
+        );
     }
 }
 

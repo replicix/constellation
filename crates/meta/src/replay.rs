@@ -1107,7 +1107,7 @@ fn apply_rename(
         &meta.ns,
         dirty,
         keys::dentry(new_parent, new_name.as_bytes()),
-        DentryRecord::new(ino, src.attrs).encode(),
+        DentryRecord::new(ino, src_rec.attrs).encode(),
     )?;
     ns::ns_insert(
         tx,

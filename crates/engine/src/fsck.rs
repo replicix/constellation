@@ -345,6 +345,25 @@ async fn check_metadata_tree_in(
             }),
         }
 
+        match walker.check_dentry_forms() {
+            Ok(forms) => {
+                found.extend(dentry_form_issues(head.seq, &forms));
+                tracing::info!(
+                    seq = head.seq,
+                    dentries = forms.checked,
+                    violations = forms.violations,
+                    "checked every dentry's form"
+                );
+            }
+            Err(e) => found.push(FsckIssue {
+                class: "dentry_form".into(),
+                key: Some(format!("commits/{:016x}", head.seq)),
+                detail: format!("the dentries under the head cannot be checked: {e:#}"),
+                repaired: false,
+                unrepairable: true,
+            }),
+        }
+
         let vector = meta.applied_seq()?;
         let Some(matching) = candidates
             .iter()
@@ -393,6 +412,40 @@ async fn check_metadata_tree_in(
     .context("metadata tree check task")??;
     issues.extend(found);
     Ok(())
+}
+
+/// One issue per violation `forms` kept, and a last one counting the rest
+/// (plan 45: a dentry holds the attribute copy iff its inode is a directory
+/// or has one name). A bad form is a bug's output in a committed tree, not
+/// something fsck can undo: the repair is a rebuild from the log.
+fn dentry_form_issues(seq: u64, forms: &crate::mtree_read::DentryForms) -> Vec<FsckIssue> {
+    let mut issues: Vec<FsckIssue> = forms
+        .first
+        .iter()
+        .map(|v| FsckIssue {
+            class: "dentry_form".into(),
+            key: Some(hex(&constellation_mtree::keys::dentry(v.parent, &v.name))),
+            detail: format!(
+                "commit {seq}: dentry {}/{}: {}",
+                v.parent,
+                String::from_utf8_lossy(&v.name),
+                v.what
+            ),
+            repaired: false,
+            unrepairable: true,
+        })
+        .collect();
+    let more = forms.violations - forms.first.len() as u64;
+    if more > 0 {
+        issues.push(FsckIssue {
+            class: "dentry_form".into(),
+            key: Some(format!("commits/{seq:016x}")),
+            detail: format!("commit {seq}: {more} more dentries of the wrong form"),
+            repaired: false,
+            unrepairable: true,
+        });
+    }
+    issues
 }
 
 /// The rebuilt tree in memory, falling back to the bucket for the
@@ -689,5 +742,207 @@ mod tests {
                 .any(|issue| issue.class == "mtree_node" && issue.unrepairable),
             "{issues:#?}"
         );
+    }
+
+    // ----------------------------------------- plan 45: the dentry forms
+
+    mod dentry_forms {
+        use super::*;
+        use crate::mtree_read::TreeReader;
+        use constellation_mtree::keys;
+        use constellation_mtree::record::{Attrs, DentryRecord, InodeRecord, Kind};
+        use constellation_mtree::{MemoryNodeStore, Tree};
+
+        const ROOT: u64 = 1;
+        const SINGLE: u64 = 10;
+        const TWO: u64 = 11;
+        const THREE: u64 = 12;
+        const SUBDIR: u64 = 13;
+        const LINK: u64 = 14;
+
+        fn attrs(kind: Kind, nlink: u32) -> Attrs {
+            Attrs {
+                kind,
+                mode: 0o644,
+                uid: 1,
+                gid: 2,
+                nlink,
+                size: 10,
+                mtime_ns: 5,
+                ctime_ns: 6,
+                rdev: Default::default(),
+            }
+        }
+
+        fn inode(ino: u64, a: Attrs) -> (Vec<u8>, Vec<u8>) {
+            (keys::inode(ino), InodeRecord::new(a).encode())
+        }
+
+        fn dentry(parent: u64, name: &str, value: DentryRecord) -> (Vec<u8>, Vec<u8>) {
+            (keys::dentry(parent, name.as_bytes()), value.encode())
+        }
+
+        /// A well-formed namespace: a directory, a single-name file, files
+        /// with two and three names, a subdirectory, a symlink with two names.
+        fn good() -> Vec<(Vec<u8>, Vec<u8>)> {
+            let (single, two, three) = (
+                attrs(Kind::File, 1),
+                attrs(Kind::File, 2),
+                attrs(Kind::File, 3),
+            );
+            let (dir, sub) = (attrs(Kind::Dir, 3), attrs(Kind::Dir, 2));
+            let link = attrs(Kind::Symlink, 2);
+            vec![
+                inode(ROOT, dir),
+                inode(SINGLE, single),
+                inode(TWO, two),
+                inode(THREE, three),
+                inode(SUBDIR, sub),
+                inode(LINK, link),
+                dentry(ROOT, "single", DentryRecord::new(SINGLE, single)),
+                dentry(ROOT, "two-a", DentryRecord::remote(TWO, Kind::File)),
+                dentry(SUBDIR, "two-b", DentryRecord::remote(TWO, Kind::File)),
+                dentry(ROOT, "three-a", DentryRecord::remote(THREE, Kind::File)),
+                dentry(ROOT, "three-b", DentryRecord::remote(THREE, Kind::File)),
+                dentry(SUBDIR, "three-c", DentryRecord::remote(THREE, Kind::File)),
+                dentry(ROOT, "sub", DentryRecord::new(SUBDIR, sub)),
+                dentry(ROOT, "sym-a", DentryRecord::remote(LINK, Kind::Symlink)),
+                dentry(SUBDIR, "sym-b", DentryRecord::remote(LINK, Kind::Symlink)),
+            ]
+        }
+
+        /// `good()` with the value of `(parent, name)` replaced.
+        fn with(parent: u64, name: &str, value: Vec<u8>) -> Vec<(Vec<u8>, Vec<u8>)> {
+            let key = keys::dentry(parent, name.as_bytes());
+            let mut entries = good();
+            let slot = entries.iter_mut().find(|(k, _)| *k == key).unwrap();
+            slot.1 = value;
+            entries
+        }
+
+        fn issues_of(mut entries: Vec<(Vec<u8>, Vec<u8>)>) -> Vec<FsckIssue> {
+            entries.sort();
+            let tree = Tree::with_config(
+                MemoryNodeStore::new(),
+                constellation_mtree::record::config(),
+            )
+            .unwrap();
+            let root = tree.build(entries).unwrap();
+            let forms = TreeReader::new(tree, root).check_dentry_forms().unwrap();
+            dentry_form_issues(7, &forms)
+        }
+
+        fn one(entries: Vec<(Vec<u8>, Vec<u8>)>, what: &str) {
+            let issues = issues_of(entries);
+            assert_eq!(issues.len(), 1, "{issues:#?}");
+            assert_eq!(issues[0].class, "dentry_form");
+            assert!(issues[0].unrepairable);
+            assert!(issues[0].detail.contains(what), "{}", issues[0].detail);
+        }
+
+        #[test]
+        fn fsck_accepts_both_forms_in_the_right_places() {
+            assert!(issues_of(good()).is_empty());
+        }
+
+        /// Today's writers' output: the copy under every name of a
+        /// hard-linked inode (and a copy that went stale on the way).
+        #[test]
+        fn fsck_reports_a_full_copy_on_a_hard_link() {
+            let two = attrs(Kind::File, 2);
+            one(
+                with(ROOT, "two-a", DentryRecord::new(TWO, two).encode()),
+                "a copy of the attributes on a hard-linked inode (nlink 2)",
+            );
+            let link = attrs(Kind::Symlink, 2);
+            one(
+                with(SUBDIR, "sym-b", DentryRecord::new(LINK, link).encode()),
+                "hard-linked inode",
+            );
+        }
+
+        #[test]
+        fn fsck_reports_a_remote_on_a_single_name() {
+            one(
+                with(
+                    ROOT,
+                    "single",
+                    DentryRecord::remote(SINGLE, Kind::File).encode(),
+                ),
+                "the remote form on an inode with one name (nlink 1)",
+            );
+        }
+
+        #[test]
+        fn fsck_reports_a_stale_full_copy() {
+            let mut stale = attrs(Kind::File, 1);
+            stale.size += 1;
+            one(
+                with(ROOT, "single", DentryRecord::new(SINGLE, stale).encode()),
+                "differs from the inode's attributes",
+            );
+            let mut stale = attrs(Kind::Dir, 2);
+            stale.mtime_ns -= 1;
+            one(
+                with(ROOT, "sub", DentryRecord::new(SUBDIR, stale).encode()),
+                "differs from the inode's attributes",
+            );
+        }
+
+        #[test]
+        fn fsck_reports_a_remote_directory_and_a_wrong_kind() {
+            one(
+                with(
+                    ROOT,
+                    "sub",
+                    DentryRecord::remote(SUBDIR, Kind::Dir).encode(),
+                ),
+                "the remote form on a directory",
+            );
+            one(
+                with(
+                    ROOT,
+                    "three-a",
+                    DentryRecord::remote(THREE, Kind::Fifo).encode(),
+                ),
+                "the remote form says Fifo, the inode is File",
+            );
+        }
+
+        #[test]
+        fn fsck_reports_a_dangling_dentry_and_a_value_of_no_form() {
+            one(
+                with(
+                    ROOT,
+                    "single",
+                    DentryRecord::remote(99, Kind::File).encode(),
+                ),
+                "inode 99 has no record",
+            );
+            one(
+                with(ROOT, "single", vec![0u8; 20]),
+                "the value does not decode",
+            );
+        }
+
+        #[test]
+        fn fsck_reports_every_violation_but_keeps_a_bounded_list() {
+            let mut entries = good();
+            let many = crate::mtree_read::DENTRY_VIOLATIONS_KEPT as u64 + 20;
+            for i in 0..many {
+                entries.push(dentry(
+                    SUBDIR,
+                    &format!("bad{i:04}"),
+                    DentryRecord::new(TWO, attrs(Kind::File, 2)),
+                ));
+            }
+            let issues = issues_of(entries);
+            assert_eq!(
+                issues.len(),
+                crate::mtree_read::DENTRY_VIOLATIONS_KEPT + 1,
+                "the kept ones and the count of the rest"
+            );
+            assert!(issues.last().unwrap().detail.contains("20 more"));
+        }
     }
 }
