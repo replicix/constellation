@@ -44,7 +44,11 @@ pub struct SessionReport {
 fn names_of(op: &NsOp) -> Vec<&str> {
     match op {
         NsOp::Create(n) | NsOp::Unlink(n) | NsOp::Put(n) => vec![n.as_str()],
-        NsOp::Rename(a, b) => vec![a.as_str(), b.as_str()],
+        NsOp::Rename(a, b) | NsOp::Exchange(a, b) | NsOp::Same(a, b) => {
+            vec![a.as_str(), b.as_str()]
+        }
+        // The source name is only how the client found the inode.
+        NsOp::Link(_, b) => vec![b.as_str()],
     }
 }
 
@@ -130,6 +134,16 @@ pub fn check_sessions(
                         hit = true;
                     }
                     hit
+                }
+                NsOp::Link(_, x) if x == n => {
+                    cur = true;
+                    true
+                }
+                // Both names were present, and each now names the other's
+                // inode: a write to both.
+                NsOp::Exchange(a, b) | NsOp::Same(a, b) if a == n || b == n => {
+                    cur = true;
+                    true
                 }
                 _ => false,
             };
@@ -260,7 +274,9 @@ pub fn check_sessions(
             }
             (NsRet::Eexist | NsRet::Enoent, None) => {
                 let (name, want) = match (op, r) {
-                    (NsOp::Create(n), NsRet::Eexist) => (n.as_str(), true),
+                    (NsOp::Create(n), NsRet::Eexist) | (NsOp::Link(_, n), NsRet::Eexist) => {
+                        (n.as_str(), true)
+                    }
                     (NsOp::Unlink(n), NsRet::Enoent) | (NsOp::Rename(n, _), NsRet::Enoent) => {
                         (n.as_str(), false)
                     }

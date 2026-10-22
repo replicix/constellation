@@ -37,7 +37,10 @@ pub struct CtoReport {
 fn names_of(op: &NsOp) -> Vec<&str> {
     match op {
         NsOp::Create(n) | NsOp::Unlink(n) | NsOp::Put(n) => vec![n.as_str()],
-        NsOp::Rename(a, b) => vec![a.as_str(), b.as_str()],
+        NsOp::Rename(a, b) | NsOp::Exchange(a, b) | NsOp::Same(a, b) => {
+            vec![a.as_str(), b.as_str()]
+        }
+        NsOp::Link(_, b) => vec![b.as_str()],
     }
 }
 
@@ -89,6 +92,8 @@ pub fn check_cto(
                         cur = true;
                     }
                 }
+                NsOp::Link(_, x) if x == n => cur = true,
+                NsOp::Exchange(a, b) | NsOp::Same(a, b) if a == n || b == n => cur = true,
                 _ => {}
             }
             v.push(cur);

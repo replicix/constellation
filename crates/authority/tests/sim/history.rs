@@ -1,8 +1,8 @@
 //! Client histories and the sequential specification they are checked
 //! against — the same shape as `constellation-model`'s `namespace.rs`
 //! (one flat directory of file names; `create_excl`, `unlink` and, new
-//! here, `rename`), with `stateright`'s `LinearizabilityTester` used as
-//! a library.
+//! here, `rename`, `link` and `exchange`), with `stateright`'s
+//! `LinearizabilityTester` used as a library.
 //!
 //! Plan 30 M13 round 3a's tentative-acknowledgement rule is applied at
 //! check time: an op whose effect was rolled back at any point (its rid
@@ -22,6 +22,24 @@ pub enum NsOp {
     Create(String),
     Unlink(String),
     Rename(String, String),
+    /// Plan 45 follow-up: `link(a, b)`. The client resolves `a` on its own
+    /// replica and links that inode (`MutateOp::Link` names an inode, as
+    /// the kernel's `link` does), so the holder may find it under `a`,
+    /// under another name only (a rename it has and the replica lacks),
+    /// or gone. The spec therefore speaks for `b` alone: `Ok` makes `b`
+    /// present and needs it absent, `EEXIST` needs it present, `ENOENT`
+    /// (the resolved inode is gone) is always possible. `a` is kept for
+    /// the reports.
+    Link(String, String),
+    /// Plan 45 follow-up: `renameat2(RENAME_EXCHANGE)` of `a` and `b`
+    /// (by name, on the holder): `Ok` needs both present and changes no
+    /// name's presence; otherwise `ENOENT`.
+    Exchange(String, String),
+    /// Plan 45 follow-up: a `Rename(a, b)` the log shows took no effect —
+    /// `a` and `b` were names of one inode (`run::same_inode_renames`).
+    /// `Ok` needs both present and changes nothing. Never issued by a
+    /// client.
+    Same(String, String),
     /// Plan 30 §M11: the destination half of a rename in a per-directory
     /// projection (`project_dir`): sets the name present, always `Ok`.
     /// Never issued by a client.
@@ -88,6 +106,32 @@ impl SequentialSpec for NsSpec {
                 self.present.insert(n.clone());
                 NsRet::Ok
             }
+            // The deterministic choice (in-flight ops, the log's own
+            // successes): the link took effect if it could.
+            NsOp::Link(_, b) => {
+                if self.present.contains(b) {
+                    NsRet::Eexist
+                } else {
+                    self.present.insert(b.clone());
+                    NsRet::Ok
+                }
+            }
+            NsOp::Exchange(a, b) | NsOp::Same(a, b) => {
+                if self.present.contains(a) && self.present.contains(b) {
+                    NsRet::Ok
+                } else {
+                    NsRet::Enoent
+                }
+            }
+        }
+    }
+
+    /// `Link` is the one op with more than one valid answer
+    /// ([`NsOp::Link`]): `ENOENT` for an inode the holder no longer has.
+    fn is_valid_step(&mut self, op: &NsOp, ret: &NsRet) -> bool {
+        match (op, ret) {
+            (NsOp::Link(..), NsRet::Enoent) => true,
+            _ => self.invoke(op) == *ret,
         }
     }
 }
@@ -125,6 +169,14 @@ pub fn project_dir(events: &[HistEvt], dir: &str) -> Vec<HistEvt> {
                         } else {
                             Some(NsOp::Put(b.clone()))
                         }
+                    }
+                    // The spec reads `b` alone.
+                    NsOp::Link(_, b) if dir_of(b) == dir => Some(op.clone()),
+                    // Changes no presence: kept whole or not at all.
+                    NsOp::Exchange(a, b) | NsOp::Same(a, b)
+                        if dir_of(a) == dir && dir_of(b) == dir =>
+                    {
+                        Some(op.clone())
                     }
                     _ => None,
                 };
@@ -190,6 +242,10 @@ pub fn project_range(events: &[HistEvt], dir: &str, bits: u8, idx: u32) -> Vec<H
                             Some(NsOp::Put(b.clone()))
                         }
                     }
+                    NsOp::Link(_, b) if in_range(b) => Some(op.clone()),
+                    NsOp::Exchange(a, b) | NsOp::Same(a, b) if in_range(a) && in_range(b) => {
+                        Some(op.clone())
+                    }
                     _ => None,
                 };
                 if let Some(p) = p {
@@ -226,7 +282,9 @@ pub fn dirs_of(events: &[HistEvt]) -> Vec<String> {
         if let HistEvt::Invoke { op, .. } = e {
             let names: Vec<&str> = match op {
                 NsOp::Create(n) | NsOp::Unlink(n) | NsOp::Put(n) => vec![n],
-                NsOp::Rename(a, b) => vec![a, b],
+                NsOp::Rename(a, b) | NsOp::Link(a, b) | NsOp::Exchange(a, b) | NsOp::Same(a, b) => {
+                    vec![a, b]
+                }
             };
             for n in names {
                 let d = dir_of(n).to_string();
@@ -490,7 +548,7 @@ pub fn check_linearizable_witnessed(
             .min()
             .unwrap_or(states.len() - 1);
         let hi = hi.min(states.len() - 1);
-        let feasible = (lo..=hi).any(|i| states[i].clone().invoke(op) == *ret);
+        let feasible = (lo..=hi).any(|i| states[i].clone().is_valid_step(op, ret));
         if feasible {
             continue;
         }
@@ -509,12 +567,12 @@ pub fn check_linearizable_witnessed(
                 for (_, t) in &early {
                     st.invoke(t);
                 }
-                st.invoke(op) == *ret
+                st.is_valid_step(op, ret)
             };
             all || early.iter().any(|(_, t)| {
                 let mut st = states[i].clone();
                 st.invoke(t);
-                st.invoke(op) == *ret
+                st.is_valid_step(op, ret)
             })
         });
         if explained {

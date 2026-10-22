@@ -13,7 +13,7 @@ use super::store::{Bucket, Fault, OpKind, Rule, When};
 use constellation_authority::{ClientReply, Config, NodeId, Stats};
 use constellation_fs_core::types::ROOT_INO;
 use constellation_fs_core::ChunkHash;
-use constellation_meta::{Meta, MutateOp, MutateOutcome, Rid};
+use constellation_meta::{LogRecord, Meta, MutateOp, MutateOutcome, Rid};
 use constellation_types::Code;
 use rand::rngs::StdRng;
 use rand::seq::IndexedRandom;
@@ -399,6 +399,13 @@ pub struct SimConfig {
     /// probability the client writes the file — one fresh chunk, dirty on
     /// its node until its upload pass (`chunks.rs`).
     pub chunk_writes: f64,
+    /// Plan 45 follow-up: after an op, with this probability the client
+    /// also links one of its names to another (`NsOp::Link`) or exchanges
+    /// two (`NsOp::Exchange`), in the op's directory: hard links under
+    /// every fault the configuration has (`+links`, `config_variant`).
+    /// From its own generator, so a configuration without links replays
+    /// exactly the schedules it had.
+    pub link_ratio: f64,
     /// Chunk metered-own-rows: the metered upload hold, in ms
     /// (`ChunkWorld::hold_ms`; 0: none). A non-owner's write stays
     /// deferred on the sequencer while its chunk is held, across the
@@ -774,6 +781,7 @@ impl Default for SimConfig {
             epoch_slack: 0,
             join_fresh: true,
             chunk_writes: 0.0,
+            link_ratio: 0.0,
             upload_hold_ms: 0,
             dirs: Vec::new(),
             delegations: Vec::new(),
@@ -831,6 +839,10 @@ pub struct Report {
     pub durability_budget_exceeded: Vec<String>,
     pub ops_invoked: usize,
     pub ops_returned: usize,
+    /// Plan 45 follow-up (`SimConfig::link_ratio`): links and exchanges
+    /// that returned `Ok`.
+    pub links_ok: usize,
+    pub exchanges_ok: usize,
     pub tentative: usize,
     pub segments: usize,
     pub fenced: usize,
@@ -1284,8 +1296,10 @@ pub fn split_name(meta: &Meta, name: &str) -> (u64, String) {
     }
 }
 
-fn mutate_op(meta: &Meta, op: &NsOp) -> MutateOp {
-    match op {
+/// `None`: a `Link` whose source name this replica does not have (the
+/// kernel's `link` fails its lookup before anything is sent).
+fn mutate_op(meta: &Meta, op: &NsOp) -> Option<MutateOp> {
+    Some(match op {
         NsOp::Create(name) => {
             let (parent, name) = split_name(meta, name);
             MutateOp::Create {
@@ -1312,8 +1326,25 @@ fn mutate_op(meta: &Meta, op: &NsOp) -> MutateOp {
                 noreplace: false,
             }
         }
+        NsOp::Link(a, b) => {
+            let (from, leaf) = split_name(meta, a);
+            let ino = meta.child_ino(from, &leaf).ok().flatten()?;
+            let (parent, name) = split_name(meta, b);
+            MutateOp::Link { ino, parent, name }
+        }
+        NsOp::Exchange(a, b) => {
+            let (parent, name) = split_name(meta, a);
+            let (new_parent, new_name) = split_name(meta, b);
+            MutateOp::Exchange {
+                parent,
+                name,
+                new_parent,
+                new_name,
+            }
+        }
         NsOp::Put(_) => unreachable!("Put is a projection-only op"),
-    }
+        NsOp::Same(..) => unreachable!("Same is a check-only op"),
+    })
 }
 
 /// How many times a client resubmits an in-doubt op (same rid) before
@@ -1551,7 +1582,10 @@ async fn client_thread(
         let handle = cluster.get(node);
         let rid = handle.next_rid();
         let mop = match (&op, &write) {
-            (Some(op), _) => mutate_op(&handle.meta, op),
+            (Some(op), _) => match mutate_op(&handle.meta, op) {
+                Some(mop) => mop,
+                None => continue,
+            },
             (None, Some(name)) => match write_op(&cluster, node, rid, name) {
                 Some(mop) => mop,
                 // The name is not here (unlinked, or its create refused).
@@ -1615,7 +1649,7 @@ async fn client_thread(
                         // failover measurement ends at the next `Ok`).
                         if std::env::var_os("AUTHORITY_SIM_TRACE_OPS").is_some() {
                             eprintln!(
-                                "t={} client t{thread} rid({},{},{}) {ret:?} attempts={attempts}",
+                                "t={} client t{thread} rid({},{},{}) {ret:?} attempts={attempts} {op:?}",
                                 cluster.env.clock.elapsed_ms(),
                                 rid.node,
                                 rid.incarnation,
@@ -1744,9 +1778,13 @@ fn gen_ops_unique(
 fn reads_only(ops: Vec<NsOp>) -> Vec<Step> {
     ops.into_iter()
         .map(|op| match op {
-            NsOp::Create(n) | NsOp::Unlink(n) | NsOp::Put(n) | NsOp::Rename(n, _) => {
-                Step::PacedRead(n)
-            }
+            NsOp::Create(n)
+            | NsOp::Unlink(n)
+            | NsOp::Put(n)
+            | NsOp::Rename(n, _)
+            | NsOp::Link(_, n)
+            | NsOp::Exchange(n, _)
+            | NsOp::Same(n, _) => Step::PacedRead(n),
         })
         .collect()
 }
@@ -1757,7 +1795,7 @@ fn with_reads(rng: &mut StdRng, ops: Vec<NsOp>, names: usize, ratio: f64) -> Vec
     for op in ops {
         let touched = match &op {
             NsOp::Create(n) | NsOp::Unlink(n) | NsOp::Put(n) => n.clone(),
-            NsOp::Rename(a, b) => {
+            NsOp::Rename(a, b) | NsOp::Link(a, b) | NsOp::Exchange(a, b) | NsOp::Same(a, b) => {
                 if rng.random_bool(0.5) {
                     a.clone()
                 } else {
@@ -1800,6 +1838,95 @@ fn with_writes(rng: &mut StdRng, steps: Vec<Step>, ratio: f64) -> Vec<Step> {
                 out.push(Step::Write(name));
             }
         }
+    }
+    out
+}
+
+/// Plan 45 follow-up: a rename that completed in the log without its
+/// `Rename` record found both names on one inode (a hard link, POSIX's
+/// no-op): it becomes `NsOp::Same` for the checks, which cannot tell
+/// names of one inode apart from names of two. The log is the witness:
+/// an executed rename's record sits directly before its `Completed`.
+fn same_inode_renames(
+    events: Vec<super::history::HistEvt>,
+    oracle: &check::Oracle,
+) -> Vec<super::history::HistEvt> {
+    use super::history::HistEvt;
+    let leaf = |n: &str| n.rsplit('/').next().unwrap_or(n).to_string();
+    let executed = |rid: &Rid, a: &str, b: &str| -> bool {
+        let Some((seq, idx)) = oracle.completed_at.get(rid) else {
+            return true;
+        };
+        let Some(seg) = oracle.unfenced.get(seq) else {
+            return true;
+        };
+        idx.checked_sub(1)
+            .and_then(|i| seg.records.get(i))
+            .is_some_and(|rec| {
+                matches!(rec, LogRecord::Rename { name, new_name, .. }
+                    if *name == leaf(a) && *new_name == leaf(b))
+            })
+    };
+    events
+        .into_iter()
+        .map(|e| match e {
+            HistEvt::Invoke {
+                thread,
+                rid,
+                op: NsOp::Rename(a, b),
+            } if !executed(&rid, &a, &b) => HistEvt::Invoke {
+                thread,
+                rid,
+                op: NsOp::Same(a, b),
+            },
+            other => other,
+        })
+        .collect()
+}
+
+/// Plan 45 follow-up (`SimConfig::link_ratio`): after each op, with
+/// `ratio`, a `Link` or an `Exchange` (half each) of two distinct names
+/// of this client's plan in the op's directory. Drawn from its own
+/// generator, like `with_writes`.
+fn with_links(rng: &mut StdRng, steps: Vec<Step>, ratio: f64) -> Vec<Step> {
+    if ratio <= 0.0 {
+        return steps;
+    }
+    let mut pool: Vec<String> = steps
+        .iter()
+        .filter_map(|s| match s {
+            Step::Op(NsOp::Create(n) | NsOp::Unlink(n) | NsOp::Rename(n, _)) => Some(n.clone()),
+            _ => None,
+        })
+        .collect();
+    pool.sort();
+    pool.dedup();
+    let mut out = Vec::new();
+    for step in steps {
+        let at = match &step {
+            Step::Op(NsOp::Create(n) | NsOp::Unlink(n) | NsOp::Rename(n, _)) => Some(n.clone()),
+            _ => None,
+        };
+        out.push(step);
+        let Some(a) = at else {
+            continue;
+        };
+        if !rng.random_bool(ratio.min(1.0)) {
+            continue;
+        }
+        let siblings: Vec<&String> = pool
+            .iter()
+            .filter(|n| **n != a && dir_of(n) == dir_of(&a))
+            .collect();
+        let Some(b) = siblings.choose(rng).map(|b| (*b).clone()) else {
+            continue;
+        };
+        let (a, b) = if rng.random_bool(0.5) { (a, b) } else { (b, a) };
+        out.push(Step::Op(if rng.random_bool(0.5) {
+            NsOp::Link(a, b)
+        } else {
+            NsOp::Exchange(a, b)
+        }));
     }
     out
 }
@@ -3152,6 +3279,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             };
             let mut write_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0xc4a1);
             let steps = with_writes(&mut write_rng, steps, cfg.chunk_writes);
+            let mut link_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0x11c4);
+            let steps = with_links(&mut link_rng, steps, cfg.link_ratio);
             // Plan 30 §M14: locks from their own generator too.
             let mut lock_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0x10c5);
             let mut steps = if cfg.lock_nodes.is_empty() || cfg.lock_nodes.contains(&node) {
@@ -3353,7 +3482,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         let handle = cluster.get(id);
         let rid = handle.next_rid();
         let op = NsOp::Create("settle".into());
-        let mop = mutate_op(&handle.meta, &op);
+        let mop = mutate_op(&handle.meta, &op).expect("a create");
         history.invoke(settle_thread, rid, op);
         let mut done = false;
         for _ in 0..3 {
@@ -3425,7 +3554,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                     let handle = cluster.get(id);
                     let rid = handle.next_rid();
                     let op = NsOp::Create(format!("settle-{extra_settles}"));
-                    let mop = mutate_op(&handle.meta, &op);
+                    let mop = mutate_op(&handle.meta, &op).expect("a create");
                     history.invoke(settle_thread + extra_settles, rid, op);
                     match handle.submit(rid, mop).await {
                         Ok(ClientReply::Outcome(o)) => {
@@ -3745,9 +3874,26 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.segments = oracle.segments;
     report.fenced = oracle.fenced;
     report.commits = commit_list.len();
-    let events = history.events();
+    let events = same_inode_renames(history.events(), &oracle);
     report.ops_invoked = history.invoked();
     report.ops_returned = history.returned().len();
+    {
+        let ok: HashSet<Rid> = history
+            .returned()
+            .into_iter()
+            .filter(|(_, ret)| *ret == NsRet::Ok)
+            .map(|(rid, _)| rid)
+            .collect();
+        for e in &events {
+            if let super::history::HistEvt::Invoke { rid, op, .. } = e {
+                match op {
+                    NsOp::Link(..) if ok.contains(rid) => report.links_ok += 1,
+                    NsOp::Exchange(..) if ok.contains(rid) => report.exchanges_ok += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
     report.tentative = tentative.len();
     let lin_context = |e: String| {
         let listing: Vec<String> = events
@@ -4364,7 +4510,7 @@ async fn setup_lock_files(
         let thread = (1 << 21) + i as u64;
         let rid = handle.next_rid();
         let op = NsOp::Create(name.clone());
-        let mop = mutate_op(&handle.meta, &op);
+        let mop = mutate_op(&handle.meta, &op).expect("a create");
         history.invoke(thread, rid, op);
         let mut ok = false;
         for _ in 0..20 {
@@ -4444,7 +4590,7 @@ async fn marker_writer(
             }
             let rid = handle.next_rid();
             let op = NsOp::Create(name.clone());
-            let mop = mutate_op(&handle.meta, &op);
+            let mop = mutate_op(&handle.meta, &op).expect("a create");
             history.invoke(thread, rid, op);
             let mut acked = false;
             for _ in 0..MAX_RESUBMITS {

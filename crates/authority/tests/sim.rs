@@ -28,6 +28,10 @@ use sim::bus::StreamFaults;
 use sim::run::{run_seed, FaultKind, Report, ScheduledFault, SimConfig};
 use sim::store::{Fault, OpKind, Rule, When};
 
+/// `+links` (`config_variant`): after each op, a link or an exchange with
+/// this probability.
+const LINK_RATIO: f64 = 0.4;
+
 /// Seeds per CI shard; four shards run in parallel under `cargo test`.
 const CI_SEEDS_PER_SHARD: u64 = 250;
 
@@ -8534,6 +8538,12 @@ fn locks_production_ttl_heavy_config() -> SimConfig {
 ///   re-send, 9.5 s at the production lock ttl).
 fn config_variant(cfg: SimConfig, variant: &str) -> SimConfig {
     match variant {
+        // Plan 45 follow-up: hard links and exchanges in the op mix
+        // (`SimConfig::link_ratio`).
+        "links" => SimConfig {
+            link_ratio: LINK_RATIO,
+            ..cfg
+        },
         "nomove" => SimConfig {
             cross_ratio: 0.0,
             ..cfg
@@ -11889,3 +11899,38 @@ const I4_SEEDS: &[I4Seeds] = &[(
     // 17, 19 and 114: 1, 1 and 2 late landings.)
     &[17, 19, 114],
 )];
+
+/// Plan 45 follow-up: hard links (`NsOp::Link`) and exchanges
+/// (`NsOp::Exchange`) under the faults of the main configurations: every
+/// replica converges on the log's namespace, dentry forms included, and
+/// the histories hold. The sweeps run every configuration with `+links`.
+#[test]
+fn hard_links_and_exchanges_converge_under_faults() {
+    type Config = fn() -> SimConfig;
+    let configs: [(&str, Config); 5] = [
+        ("backup", backup_config),
+        ("backup-crash", backup_crash_config),
+        ("delegated-crash", delegated_crash_config),
+        ("shared-dir-split", shared_dir_split_config),
+        ("flex", flex_config),
+    ];
+    for (label, config) in configs {
+        let (mut links, mut exchanges) = (0, 0);
+        for seed in 0..12u64 {
+            let r = run_seed(seed, config_variant(config(), "links")).unwrap_or_else(|e| {
+                panic!("{label}+links seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}+links")
+            });
+            assert!(
+                r.converged_checked,
+                "{label}+links seed {seed} did not converge"
+            );
+            links += r.links_ok;
+            exchanges += r.exchanges_ok;
+        }
+        eprintln!("{label}+links: {links} links, {exchanges} exchanges");
+        assert!(
+            links > 0 && exchanges > 0,
+            "{label}+links: vacuous ({links}, {exchanges})"
+        );
+    }
+}
