@@ -928,7 +928,11 @@ process's start. A graceful shutdown deletes a horizon that has already passed,
 so an idle node's reboot waits for nothing; an ungraceful stop leaves it, and a
 reboot after it waits up to the span (about a lock's TTL before the first lock
 grant, about a read delegation's before the first acknowledgement as a
-re-adopting holder).
+re-adopting holder). A successor's takeover floor is persisted the same way
+when its marker lands (and the epoch its claim writes is recorded before the
+claim goes out, for a successor that stops between the two): a successor that
+restarts inside the floor comes back inside it, and does not answer or
+acknowledge over the predecessor's grants.
 
 Both readings pay for the node's oscillator (plan 43 C7a). A crystal runs fast
 or slow by tens of ppm; each node budgets its own, `ρ`, at 1 000 ppm (0.1 %)

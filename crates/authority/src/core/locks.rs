@@ -1291,6 +1291,19 @@ impl Core {
         self.lock_horizon_write(out);
     }
 
+    /// Plan 43 C7a (commit 4): a takeover floor's lock part ends at `until`:
+    /// the restart horizon is written for it (off the core, as for a grant;
+    /// nothing waits for it, the floor itself holds the grants back).
+    pub(crate) fn lock_persist_horizon(&mut self, until: WaitMs, out: &mut Vec<Action>) {
+        self.lk.horizon_want = self.lk.horizon_want.max(until);
+        self.lock_horizon_write(out);
+    }
+
+    /// The restart horizon known durable (this process's wait clock).
+    pub(crate) fn lock_horizon_durable(&self) -> WaitMs {
+        self.lk.horizon_durable
+    }
+
     fn lock_horizon_write(&mut self, out: &mut Vec<Action>) {
         if self.lk.horizon_writing.is_some() || self.lk.horizon_want <= self.lk.horizon_durable {
             return;
@@ -1330,6 +1343,7 @@ impl Core {
                 true
             }
         };
+        self.floor_mark_covered(replica);
         self.lock_flush_held(now, failed, replica, out);
     }
 
@@ -6415,6 +6429,16 @@ impl Core {
         let kept = std::mem::take(&mut self.lk.keep_grants);
         if !kept {
             self.end_takeover_floor();
+            // The floor of a tenure that is over is not the next one's (the
+            // quarantines it set run on; the claim mark names an epoch no
+            // longer ours).
+            self.ack.floor_mark_locks = None;
+            if self.ack.floor_mark.take().is_some() {
+                replica.clear_takeover_floor_pending();
+            }
+            if std::mem::take(&mut self.ack.floor_persisted) {
+                replica.clear_takeover_floor();
+            }
             self.lock_quarantine_dropped_tenure(now, replica);
             self.pr.closed_tenure.clear();
             self.pr.closed_honour.clear();

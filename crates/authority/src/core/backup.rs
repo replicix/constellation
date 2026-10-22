@@ -190,8 +190,41 @@
 //! wait clock, opaque here). And never the lease's expiry compared with S's
 //! clock. No beat, a beat of
 //! another holder or epoch, or none sent within `M/(4ρ)` of `X`: the bound.
-//! The floor and the beats are in memory (plan 43 Appendix B rows 14 and
-//! 27): a successor that restarted waits the bound.
+//! The beats are in memory (plan 43 Appendix B row 27): a successor that
+//! restarted has no cap and waits the bound.
+//!
+//! ## The floor survives a restart (plan 43 C7a, commit 4; Appendix B row 14)
+//!
+//! The floor counts from the marker and lived in memory, so a successor that
+//! stopped inside it re-adopted its own lease (M4's gate, which lands a new
+//! marker) with no floor and answered, granted and acknowledged inside the
+//! predecessor's window. Two writes close it:
+//! - *At arming* (`note_marker_landed`): the floor's three ends are persisted
+//!   as boot stamps (`meta::store::horizon`), the read-grant horizon (until
+//!   which acknowledgements wait: what `read_start` loads as the restart
+//!   quarantine), the lock-grant horizon (`Action::PersistLockHorizon`, off
+//!   the core, as every lock grant's) and the floor itself
+//!   (`takeover_floor_horizon_ms`, which `floor_start` loads, so that the
+//!   lease is not released, handed off or flushed inside a floor the node
+//!   came back into). A restart on the same boot reads the time left on the
+//!   raw clock, another boot waits the span written.
+//! - *Before the claim CAS* (`acquire_cas`): the window the keys cannot
+//!   cover is between the CAS (the lease object now names this node) and the
+//!   marker. A takeover of a tenure that granted records the epoch it writes
+//!   (`takeover_floor_pending`, durable), and removes it once the three ends
+//!   above are durable, or when the won CAS armed no floor (a takeover by
+//!   TTL). A restart that re-adopts its own lease at the recorded epoch arms
+//!   the floor as the takeover would (`note_floor_restart`, counted from the
+//!   re-adoption's own marker: later than the claim's, so never short of it;
+//!   no beat cap, the predecessor's beats are gone; the gate is a fast
+//!   takeover's meanwhile).
+//!
+//! The mark names the epoch only and the floor's bound is recomputed when the
+//! marker lands, because it depends on what the gate adopts (the write
+//! delegations of the log) which neither the CAS nor the restart knows yet.
+//! An upgrade handover that gave up waiting for the gate (`GATE_WAIT`) or
+//! stopped inside the floor starts the new image through the same
+//! `Core::start` and re-adoption, so it needs nothing of its own.
 //!
 //! # Continuation epochs (plan 30 §M10's claim rule, enforced here)
 //!
@@ -482,6 +515,23 @@ pub(crate) struct AckState {
     /// forward wall step must not end it early); 0 for a tenure with
     /// none: the lease is not idle-released before it (`in_takeover_floor`).
     floor_until: WaitMs,
+    /// Plan 43 C7a (commit 4): the epoch the persisted claim mark names
+    /// (`Replica::set_takeover_floor_pending`): a fast claim CAS for it went
+    /// out (or the mark was read at start) and the floor it is to arm is
+    /// not yet durable. A restart that re-adopts its own lease at this epoch
+    /// arms the floor again, counted from its own marker (`acquire_won`).
+    pub(crate) floor_mark: Option<Epoch>,
+    /// Set once the floor the mark stands for is armed and its ends written
+    /// on the core are durable (`persist_floor`): the lock-grant horizon the
+    /// mark still waits for (`on_lock_horizon_persisted` removes the mark
+    /// once it is durable; `WaitMs(i64::MIN)`: none). `None`: the mark is not
+    /// covered yet (the claim's CAS or marker is out, or a write failed),
+    /// and no completed lock-horizon write removes it.
+    pub(crate) floor_mark_locks: Option<WaitMs>,
+    /// A takeover floor of this node is persisted
+    /// (`Replica::note_takeover_floor`, or loaded at start): removed with
+    /// the tenure (`lock_on_lease_gone`).
+    pub(crate) floor_persisted: bool,
     /// The journal seq the last stream-ahead covered, for every
     /// subscriber.
     streamed_through: u64,
@@ -1559,6 +1609,93 @@ impl Core {
         self.ack.pending_cap = cap.filter(|_| prev.granted_delegations);
     }
 
+    /// Plan 43 C7a (commit 4): this node re-adopted its own lease at the
+    /// epoch of a fast claim whose floor was not durable when it stopped
+    /// (`AckState::floor_mark`): it owes the predecessor's floor still. Armed
+    /// as `note_fast_takeover` arms it, but counted from this tenure's marker
+    /// (later than the claim's, so never short of it) and with no beat cap
+    /// (the predecessor's beats are not known any more).
+    pub(crate) fn note_floor_restart(&mut self) {
+        self.dl.inherit_slack_ms = self.cfg.backup_takeover_ms;
+        self.ack.pending_floor = true;
+        self.ack.pending_cap = None;
+    }
+
+    /// At start: the previous incarnation's persisted takeover floor is this
+    /// one's (a restart inside the floor is inside it still: no release, no
+    /// handoff, no flush before it ends; the horizons it set load as the
+    /// quarantines of `read_start` and `locks_start`), and the claim mark a
+    /// fast takeover left is read for `acquire_won`.
+    pub(crate) fn floor_start(&mut self, now: Now, replica: &dyn Replica) {
+        self.ack.floor_mark = replica.takeover_floor_pending();
+        if let Some(until) = replica.load_takeover_floor(now, self.cfg.floor_horizon_span_ms()) {
+            tracing::info!(
+                node = self.cfg.node_id,
+                wait_ms = until.since(now.wait),
+                "a takeover floor of the previous incarnation is still running; \
+                 the lease is not released before it ends"
+            );
+            self.ack.floor_until = self.ack.floor_until.max(until);
+            self.ack.floor_persisted = true;
+        }
+    }
+
+    /// The floor armed at `now` ends at `floor_end`; its read and lock
+    /// parts at `until` and `locks_until` (all on the wait clock): persist
+    /// them as the horizons a restart waits out (the read and lock keys, as
+    /// every grant's horizon is) and as the floor itself (the third key), so
+    /// that a successor that stops inside the floor does not come back
+    /// without it. The claim mark of `acquire_cas` goes once all three are
+    /// durable; one that is not (a write failed; the lock horizon is
+    /// written off the core) leaves it, and a restart then arms the floor
+    /// again.
+    fn persist_floor(
+        &mut self,
+        now: Now,
+        (until, locks_until, floor_end): (WaitMs, WaitMs, WaitMs),
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let mut durable = true;
+        if self.cfg.read_delegations && until > now.wait {
+            durable &= replica.note_grant_horizon(until, now);
+        }
+        if replica.note_takeover_floor(floor_end, now) {
+            self.ack.floor_persisted = true;
+        } else {
+            durable = false;
+        }
+        let locks_need = if self.cfg.locks && locks_until > now.wait {
+            self.lock_persist_horizon(locks_until, out);
+            locks_until
+        } else {
+            WaitMs(i64::MIN)
+        };
+        if durable {
+            self.ack.floor_mark_locks = Some(locks_need);
+            self.floor_mark_covered(replica);
+        }
+    }
+
+    /// The claim mark goes once everything it stands for is durable: the
+    /// floor armed and written (`persist_floor`), and the lock horizon it
+    /// needs. Called for every completed lock-horizon write, which before
+    /// that (the claim's CAS or marker out, a write of the floor failed)
+    /// covers nothing of the floor: a grant's of this node as a delegate's
+    /// lock owner, or of the previous tenure.
+    pub(crate) fn floor_mark_covered(&mut self, replica: &dyn Replica) {
+        let Some(locks_until) = self.ack.floor_mark_locks else {
+            return;
+        };
+        if self.lock_horizon_durable() < locks_until {
+            return;
+        }
+        self.ack.floor_mark_locks = None;
+        if self.ack.floor_mark.take().is_some() {
+            replica.clear_takeover_floor_pending();
+        }
+    }
+
     /// How far before `X` (the end a beat cap counts from) a beat may have
     /// been sent to be used for the cap, ms (plan 43 C7a): `M·1e6/(4ρ)` for
     /// the node's rate budget `ρ` in ppm, so that the error `2ρ·(X − sent)`
@@ -1786,6 +1923,11 @@ impl Core {
             // lapsed, and no floor remains.
             self.ack.floor_until = WaitMs(0);
             self.stats.ack_floor_capped_out += 1;
+            // Nothing to persist and nothing owed: the claim's mark goes.
+            self.ack.floor_mark_locks = None;
+            if self.ack.floor_mark.take().is_some() {
+                replica.clear_takeover_floor_pending();
+            }
             tracing::info!(
                 node = self.cfg.node_id,
                 bound_ms = floor_bound.since(now.wait),
@@ -1819,6 +1961,7 @@ impl Core {
             replica.read_delegations().set_quarantine(until);
             self.arm_grant_quarantine(until, out);
         }
+        self.persist_floor(now, (until, locks_until, floor_end), replica, out);
     }
 
     // ------------------------------------------------------ holder side

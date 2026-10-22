@@ -2689,6 +2689,25 @@ first part of C7a, landed early):
     on a counted forward jump (D4). The restart configurations are clean at
     2 000 seeds and a fresh range (fail-before counts above);
     `fast-takeover-successor-restart-before-marker` is the floor's, commit 4.
+  - *Commit 4 landed (2026-10-21; PROGRESS "Plan 43 C7a, commit 4 of 6"):*
+    the successor's takeover floor is persisted. At arming (`note_marker_landed`)
+    its three ends are written as boot stamps: the read-grant and lock-grant
+    horizons (what a restart's `read_start` and `locks_start` quarantine) and the
+    floor itself (`takeover_floor_horizon_ms`, which `floor_start` loads so the
+    lease is not released, handed off or flushed inside a floor the node came
+    back into); before a claim CAS that takes over a tenure that granted, the
+    epoch it writes is recorded durably (`takeover_floor_pending`), and a
+    re-adoption of the node's own lease at that epoch arms the floor again,
+    counted from its own marker, no beat cap. The mark names the epoch only (the
+    spec's bound is recomputed at the marker: it includes the write delegations
+    the gate adopts). F-a0's in-memory state needs no persisting (an inherited
+    mark becomes the tenure's own at a restart, which only keeps it; a
+    reconfiguration in doubt is settled by the lease every start re-reads).
+    `fast-takeover-successor-restart-before-marker` 56 -> 0 of 2 000 seeds (and
+    61 -> 0 on 2000..4000; 55 -> 0 on 00d7db5); `-in-floor` and its strict
+    variant are clean on the parent too, regressions. Cost: one synchronous KV
+    write before such a claim CAS (1.7 to 2.9 ms on xfs, ext4, btrfs: an fsync)
+    and two when the marker lands (3.5 to 5.7 ms).
   - *Commit 5 landed (2026-10-20; PROGRESS "Plan 43 C7a, commit 5 of 6"):*
     `crates/model/src/clk.rs` (a node's oscillator with a rate, and its wall,
     honour and wait readings), per-node rate, `rate_budget`, `clock_split`,
@@ -3872,7 +3891,7 @@ L = liveness only.
 | 11 | `ack=s3` fast takeover timing — `core/lease.rs:296` | holder's renewal stamp vs taker's W | W↔W | L (the slot CAS fences) | ETag unchanged for `backup_takeover_ms` |
 | 12 | Holder liveness (plan 41 L0) — `liveness_fresh`, `note_s3_liveness`, `strict_answer_allowed`, `LeaseView::reads_locally` | own send stamp vs own clock | W | **S on a backward step > 1.5 s** | honour clock (C7-H1 first) **C7-H1 landed** (the local half); **rate half: C7a landed** (commit 2: ρ is in the honour and wait readings) |
 | 13 | Backup seal watch, holder heartbeat, `OffCore::core_responsive`, `note_holder_heard` | own arrival stamps vs own clock | W | L | wait clock (C7-H1) **C7-H1 landed** (the local half); **rate half: C7a landed** (commit 2: ρ is in the honour and wait readings) |
-| 14 | Restart horizons — `KV_READ_GRANT_HORIZON`/`KV_LOCK_GRANT_HORIZON`, `load_*_quarantine` | own earlier W vs own later W across a restart | W (persisted) | **S on a forward step across the restart** | **C7a landed (commit 3):** a boot stamp `<wall> <span> <boot id> <raw until>`, read on `CLOCK_MONOTONIC_RAW` on the same boot and as the full span on another (or unknown, or an older value: the default span); a graceful shutdown deletes a passed horizon; the promise's `issued` likewise; the takeover floor is commit 4. (The text before it: `(boot_id, BOOTTIME until)`, else the full horizon (C7a; C7-H1 writes them as wall and reads them back onto the wait clock, so only a step while the node is down, or a forward step while it is up after the last write followed by a restart, remains). The promise's `issued` (`promise.rs:366-378`, the KV `epoch_promise_issued_ms`, judged by `promise_join_begin`) is the same kind of horizon. Also: a successor's takeover floor (C7-H2) is not persisted at all (`set_quarantine` in memory), so a successor that restarts inside it, or whose upgrade handover gives up its release, forgets it: persist it under these keys.) |
+| 14 | Restart horizons — `KV_READ_GRANT_HORIZON`/`KV_LOCK_GRANT_HORIZON`, `load_*_quarantine` | own earlier W vs own later W across a restart | W (persisted) | **S on a forward step across the restart** | **C7a landed (commit 3):** a boot stamp `<wall> <span> <boot id> <raw until>`, read on `CLOCK_MONOTONIC_RAW` on the same boot and as the full span on another (or unknown, or an older value: the default span); a graceful shutdown deletes a passed horizon; the promise's `issued` likewise; **the takeover floor (commit 4, landed):** persisted at arming as three boot stamps (the read-grant and lock-grant horizons, and `takeover_floor_horizon_ms`, the floor itself, which keeps the lease from being released inside it) and, before a claim CAS that takes over a tenure that granted, the epoch it writes in `takeover_floor_pending`, which a restart's re-adoption of its own lease at that epoch arms again from its own marker. (The text before it: `(boot_id, BOOTTIME until)`, else the full horizon (C7a; C7-H1 writes them as wall and reads them back onto the wait clock, so only a step while the node is down, or a forward step while it is up after the last write followed by a restart, remains). The promise's `issued` (`promise.rs:366-378`, the KV `epoch_promise_issued_ms`, judged by `promise_join_begin`) is the same kind of horizon. Also: a successor's takeover floor (C7-H2) was not persisted at all (`set_quarantine` in memory), so a successor that restarted inside it, or whose upgrade handover gave up its release, forgot it: persisted under these keys, commit 4.) |
 | 15 | Epoch claim views — `epoch_closed_claim`, `epoch_reclaim_pending`, `resolve_epoch_claims` | own lease stamp vs own clock; resolution by epoch | W | L | clock change only; **rate half: C7a landed** (commit 2) |
 | 16 | Singleton leases (`_snapsched`, GC) — `singleton.rs`, `snapsched.rs` | holder: own; claimant: holder's W vs own W | W↔W | L (the CAS on the holder's ETag is the safety) | observation rule if wanted; not required |
 | 17 | GC — `gc.rs:407` `last_modified ≤ now − horizon` (7 d), completion retention, `mtree_gc.rs:653`; holds' `expires_unix_ms` | S3 `Last-Modified` vs W; hold writer's W vs GC's W | S3↔W, W↔W | S only at offsets of days (or the hold slack) | **stays** (documented tolerance) |

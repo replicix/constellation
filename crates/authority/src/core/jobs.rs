@@ -2924,6 +2924,28 @@ impl Core {
         let lease = self
             .lease
             .granted_lease(now, &self.cfg, Some(prev), inherits_duty);
+        // Plan 43 C7a (commit 4): a takeover of a tenure that granted may arm
+        // a floor when its marker lands (`acquire_won` decides; the permit
+        // can arrive while the CAS is out, so every such claim records it).
+        // The floor counts from the marker, and it lives in memory: a
+        // successor that stops between the CAS and the marker (or before the
+        // floor's horizons are durable) re-adopts its own lease with no
+        // floor, and grants and acknowledges inside the predecessor's
+        // window. The epoch the CAS writes is recorded durably first; a
+        // re-adoption at that epoch owes the floor (`acquire_won`).
+        if takeover_of
+            && !prev.released
+            && prev.granted_delegations
+            && self.ack.floor_mark != Some(lease.epoch)
+        {
+            if !replica.set_takeover_floor_pending(lease.epoch) {
+                self.finish_acquire(now, false, replica, out);
+                return;
+            }
+            self.ack.floor_mark = Some(lease.epoch);
+            // Nothing durable covers this claim's floor yet.
+            self.ack.floor_mark_locks = None;
+        }
         let op = self.issue_s3(
             S3Op::LeaseSwap {
                 lease: lease.clone(),
@@ -3033,9 +3055,33 @@ impl Core {
         // never installed the mirror must not let a later, non-fast one
         // trust a final mirror (`lock_install_mirror`).
         self.lk.takeover_prev = None;
+        // Plan 43 C7a (commit 4): this node's own lease, at the epoch of a fast
+        // claim of its own that stopped before its floor was durable
+        // (`acquire_cas`'s mark): the predecessor's window is not over. The
+        // marker of this re-adoption starts the floor.
+        let floor_restart = !fast_prev
+            && prev.as_ref().is_some_and(|p| {
+                p.holder == self.cfg.node_id
+                    && !p.released
+                    && p.epoch == epoch
+                    && self.ack.floor_mark == Some(epoch)
+            });
         if let Some(p) = prev.as_ref().filter(|_| fast_prev) {
             let cap = self.beat_cap(p);
             self.note_fast_takeover(p, cap);
+        } else if floor_restart {
+            tracing::info!(
+                node = self.cfg.node_id,
+                epoch,
+                "re-adopted the lease of a fast takeover whose floor was not durable: \
+                 the floor is armed again"
+            );
+            self.note_floor_restart();
+        }
+        if !self.ack.pending_floor && self.ack.floor_mark.take().is_some() {
+            // The claim armed no floor (a TTL takeover, or an unmarked
+            // predecessor): its mark goes.
+            replica.clear_takeover_floor_pending();
         }
         // The sealed backup's tail is re-applied by the tenure that
         // succeeds the epoch it backed: a takeover from that holder, or
@@ -3096,7 +3142,7 @@ impl Core {
             takeover,
             marker_shipped: !marker,
             drained: !self.cfg.inbox,
-            fast_prev,
+            fast_prev: fast_prev || floor_restart,
             backup_tail_epoch,
             shippable: false,
         };

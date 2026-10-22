@@ -642,8 +642,9 @@ locks off; about a margin after a holder that was beating to the end of its
 lease). The in-place upgrade waits for it *before it detaches the
 views*, which keep serving meanwhile: only the drain that follows stalls
 the applications, as without a seal; and it waits out a floor in full,
-because a new image would re-adopt the lease without it (the floor is in
-memory only, plan 43 Appendix B row 14). The floor is never given up on.
+so that the lease is not released inside it and the new image starts with
+none to carry (should it start inside one, it restores it: the floor is
+persisted, below). The floor is never given up on.
 A takeover gate that stays pending is: after a fixed 40 s cap (the gate
 only) a shutdown or `stop` ends without releasing, and the lease lapses by
 its TTL, which outlasts the floor, so the next holder takes it over by TTL
@@ -653,6 +654,23 @@ once the gate is over. Releasing inside the floor would hand the lease to
 a node that starts without it (a released lease is no fast takeover), and
 a lease released inside the gate left the log naming the releaser root of
 delegations its delegates could no longer use.
+
+The floor survives a restart (plan 43 C7a, Appendix B row 14). It counts
+from the marker and used to live in memory, so a successor that stopped
+inside it re-adopted its own lease with none and answered, granted and
+acknowledged inside the predecessor's window. Now the three ends of the floor
+(the read-grant horizon and the lock-grant horizon, which a restart waits out
+as the quarantines of its own grants, and the floor itself, which keeps the
+lease from being released) are written, as boot stamps, when the marker lands;
+a restart on the same boot reads the time left on the raw clock, a reboot
+waits the span written. A fast takeover of a tenure that granted also records
+the epoch its claim writes (`takeover_floor_pending`) *before* the claim CAS
+goes out, and removes it once the three are durable: the window between the
+CAS and the marker has no stamp to read, and a successor restarted in it
+re-adopts its own lease at that epoch, which owes the floor, counted from the
+re-adoption's own marker and with no beat cap (the predecessor's beats are
+gone). The cost is one synchronous write before such a claim CAS (an fsync) and
+two when the marker lands; a takeover by TTL records and removes the mark too.
 
 `ack_floor_waits` counts the waits, and the log line "took a lease over by
 seal or ack=s3 from a tenure that served strict reads or locks" carries

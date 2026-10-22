@@ -450,6 +450,19 @@ impl Config {
         (ttl + ttl / 4 + self.expiry_margin_ms + 1_000) as i64
     }
 
+    /// The same for the takeover floor a successor persists (plan 43 C7a,
+    /// commit 4): the floor's bound at its longest (the takeover window, the
+    /// longer of a read delegation's and a lock's TTL, the write-delegation
+    /// reclaim horizon, two margins) and the second the write rounds up by.
+    /// Only read for a value without a boot (the key is new: none exists).
+    pub fn floor_horizon_span_ms(&self) -> i64 {
+        (self.backup_takeover_ms
+            + self.read_delegation_ttl_ms.max(self.lock_ttl_ms)
+            + self.delegation_ttl_ms
+            + 3 * self.expiry_margin_ms
+            + 1_000) as i64
+    }
+
     /// The same for the last promise this node issued.
     pub fn promise_horizon_span_ms(&self) -> i64 {
         (self.promise_ttl_ms + 1_000) as i64
@@ -1787,6 +1800,7 @@ impl Core {
         }
         self.arm_poll(now, 0, out);
         self.arm_drain(now, out);
+        self.floor_start(now, replica);
         self.read_start(now, replica, out);
         self.locks_start(now, replica);
         self.backup_start(now, replica, out);

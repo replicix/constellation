@@ -417,6 +417,24 @@ pub trait Replica {
     /// the returned time (this node's wait clock, as above); no new lock
     /// grant until then.
     fn load_lock_quarantine(&self, now: Now, default_span_ms: i64) -> Option<WaitMs>;
+    /// Plan 43 C7a (commit 4): persist where this tenure's takeover floor
+    /// ends (this node's wait clock; a boot stamp), so that a restart inside
+    /// it is still inside it. `false`: it could not be persisted (the caller
+    /// keeps the pending mark, below).
+    fn note_takeover_floor(&self, until: WaitMs, now: Now) -> bool;
+    /// At start: where the previous incarnation's takeover floor ends on this
+    /// node's wait clock (`None`: none, or none left).
+    fn load_takeover_floor(&self, now: Now, default_span_ms: i64) -> Option<WaitMs>;
+    /// The tenure that armed the floor is over: the floor goes with it.
+    fn clear_takeover_floor(&self);
+    /// Durably record, before a fast claim CAS for `epoch` goes out, that it
+    /// may arm a takeover floor when its marker lands. `false`: not
+    /// recorded, and the CAS must not go out.
+    fn set_takeover_floor_pending(&self, epoch: u64) -> bool;
+    /// At start: the epoch of the claim CAS that recorded it (see above).
+    fn takeover_floor_pending(&self) -> Option<u64>;
+    /// The floor's horizons are durable, or the CAS armed none.
+    fn clear_takeover_floor_pending(&self);
     /// At start: the previous incarnation's last promise, on this node's
     /// wait clock (`Meta::load_promise_issued`), for the join gate.
     fn load_promise_issued(&self, now: Now, default_span_ms: i64) -> Option<WaitMs>;
@@ -1145,6 +1163,46 @@ impl Replica for Meta {
 
     fn load_promise_issued(&self, now: Now, default_span_ms: i64) -> Option<WaitMs> {
         Meta::load_promise_issued(self, now, default_span_ms)
+    }
+
+    fn note_takeover_floor(&self, until: WaitMs, now: Now) -> bool {
+        match Meta::note_takeover_floor(self, until, now) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, "persisting the takeover floor failed");
+                false
+            }
+        }
+    }
+
+    fn load_takeover_floor(&self, now: Now, default_span_ms: i64) -> Option<WaitMs> {
+        Meta::load_takeover_floor(self, now, default_span_ms)
+    }
+
+    fn clear_takeover_floor(&self) {
+        if let Err(error) = Meta::clear_takeover_floor(self) {
+            tracing::warn!(%error, "removing the persisted takeover floor failed");
+        }
+    }
+
+    fn set_takeover_floor_pending(&self, epoch: u64) -> bool {
+        match Meta::set_takeover_floor_pending(self, epoch) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, "recording the takeover floor's claim failed; not claiming");
+                false
+            }
+        }
+    }
+
+    fn takeover_floor_pending(&self) -> Option<u64> {
+        Meta::takeover_floor_pending(self)
+    }
+
+    fn clear_takeover_floor_pending(&self) {
+        if let Err(error) = Meta::clear_takeover_floor_pending(self) {
+            tracing::warn!(%error, "removing the takeover floor's claim mark failed");
+        }
     }
 
     fn recall_inos_of_op(&self, op: &MutateOp) -> Vec<Ino> {

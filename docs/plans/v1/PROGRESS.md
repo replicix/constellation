@@ -56173,3 +56173,132 @@ its rows in the log, even while cut from S3.
 - Plan 43 C1 deletes the TTL claim without the tail and this relaxation
   with it: then these pinned seeds must pass strictly (the third node
   waits for the group).
+
+## Plan 43 C7a, commit 4 of 6: the takeover floor persisted
+
+Appendix B row 14's note. A fast successor's floor (`ack.floor_until`, the read
+delegations' and the locks' `set_quarantine`) counts from the marker's landing and
+lived in memory only, so a successor that stopped inside it, or between its claim CAS
+and its marker, re-adopted its own lease (M4's gate, commit 3: tail, marker, strand and
+replay) with no floor, and answered, granted and acknowledged inside the window of the
+predecessor it had sealed: `fast-takeover-successor-restart-before-marker` failed 55 of
+2 000 seeds on the parent (a still-honoured old grant against a new one 172 to 433 ms
+after the restart).
+
+### What landed
+
+- **At arming** (`Core::note_marker_landed` -> `persist_floor`): the floor's three ends
+  are written as boot stamps (commit 3's `<wall> <span> <boot id> <raw until>`): the
+  read-grant horizon (`Replica::note_grant_horizon`, synchronous, as every read grant's:
+  `read_start` loads it at the next start as the quarantine every acknowledgement waits
+  on), the lock-grant horizon (`Action::PersistLockHorizon`, off the core, as every lock
+  grant's: `locks_start` loads it) and the floor itself (a third key,
+  `takeover_floor_horizon_ms`: `Core::floor_start` loads it into `floor_until`, so the
+  lease is not idle-released, handed off or flushed inside a floor the node came back
+  into; the spec's two keys did not cover that). All three go through
+  `Meta::note_horizon`, so they never lower what the previous process left, and a
+  graceful shutdown deletes a passed one (`clear_passed_horizons`).
+- **Before the claim CAS** (`acquire_cas`): a takeover of a tenure that granted
+  (`takeover_of && !prev.released && prev.granted_delegations`) records the epoch its CAS
+  writes (`takeover_floor_pending`, durable; the CAS is not sent if the write fails).
+  The condition is the superset of the cases that arm a floor: the seal watch's permit can
+  arrive while the CAS is out (`a_permit_arriving_during_the_claim_cas_still_marks_the_
+  lease`), and `acquire_won` decides. It removes the mark when the won claim armed no
+  floor (a TTL takeover; not synced, a mark that survives a crash only makes the
+  re-adoption of that epoch wait a floor it did not owe), and when the floor is capped
+  out. `persist_floor` removes it once all three ends are durable (the lock horizon
+  completes in `on_lock_horizon_persisted`). A write that failed leaves the mark.
+- **The re-adoption** (`acquire_won`): this node's own unreleased lease at the epoch the
+  mark names owes the floor: `note_floor_restart` arms it as `note_fast_takeover` does
+  (the pending floor, the delegation slack), counted from the re-adoption's own marker
+  (later than the claim's, so never short of it; no beat cap, the beats are gone), and the
+  gate is a fast takeover's until the marker lands (`fast_gate_pending`). The mark names the
+  epoch only (append-only: later tokens are ignored): the floor's bound is recomputed when
+  the marker lands, because it depends on the write delegations the gate adopts from the
+  log, which neither the CAS nor the restart knows yet (the spec's `<epoch> <bound_ms>`
+  could not carry that term). An own lease keeps its epoch across a re-adoption
+  (`granted_lease`), so the mark stays valid through repeated restarts.
+- `lock_on_lease_gone` (a tenure that ended: deposed, released, lost) removes the persisted
+  floor and the mark with the in-memory floor; the quarantines it set run on.
+- The upgrade handover (`cli/handover.rs`, `wait_out_takeover_floor`): the old image
+  waits the floor out (the floor is never given up on) and the gate for up to 40 s; the
+  new image is an ordinary start (`Core::start`: `floor_start`, `read_start`,
+  `locks_start`) and an ordinary re-adoption, so a handover that gave up on a pending gate
+  re-adopts through the mark, and one that started inside a floor restores it. It needs
+  nothing of its own.
+
+F-a0's follow-ups (aa40fb2, e01e267, f83f0c4, on which this commit is rebased) keep
+memory only and need nothing persisted, checked one by one: the **inherited mark**
+(`mark_inherited`, cleared by CAS once nothing it stands on is live) is re-derived
+at a restart as the tenure's own (the re-adopted lease is marked and carried:
+`own_carry`), which is conservative (it is never cleared in that process, so a
+later sealer may wait a floor it did not need), and the restored floor, the
+loaded quarantines and `pending_floor` keep `tenure_duty_live` true, so the mark
+is not cleared early either; **`reconfig_doubt`** (a reconfiguration CAS whose
+outcome is unknown) is settled by the lease every start reads (`adopt` clears it).
+
+### Tests, with their fail-before
+
+On c3bda7e, in a scratch copy on the build box (the tests compile against it with
+the mark assertions, which use the new meta API, removed):
+
+- core (`core/tests.rs`, `mod persisted_floor`, on the harness's one boot):
+  `a_restart_inside_the_takeover_floor_keeps_the_floor` fails there ("the
+  restarted successor is outside the floor": the restarted core has no floor and
+  no quarantine), `a_restart_between_the_fast_claim_and_its_marker_arms_the_floor`
+  fails there ("the re-adoption of the claim's lease owes the floor"),
+  `only_a_claim_that_arms_a_floor_leaves_its_mark` (new behaviour: a TTL
+  takeover leaves no mark, a permitted claim of an unmarked lease none, another
+  epoch's mark arms nothing).
+- meta: `a_takeover_floor_survives_a_restart_and_a_wall_step` (same boot: the
+  time left on the raw clock whatever the wall did, another boot the span, a
+  passed floor none, an ended tenure none), `the_claim_mark_names_its_epoch` (the
+  append-only test: tokens after the epoch ignored, garbage no mark),
+  `a_graceful_shutdown_clears_a_passed_floor_and_keeps_a_live_one`. New API:
+  their fail-before is the mutant that persists nothing.
+- Existing tests that needed the harness to behave as the driver does:
+  `sealed_tenure` (F-a0's helper) completes the floor's lock-horizon write, as
+  `Harness::step` does for the steps it makes; `a_tenure_inside_its_takeover_floor_
+  is_not_idle_released` starts the core again past the floor, so its marker is
+  now landed on the harness's boot and the restart waits past the second the
+  write rounds up.
+- sim: `a_successor_restarted_before_its_marker_still_owes_the_floor` (seeds
+  19-21, 34-36, 68-70, 79-81 of `-before-marker`, which fail on the parent, and
+  seeds 0-5 of the in-floor pair); `-before-marker` and `-in-floor` are in
+  `long_locks`.
+
+### The configurations, 2 000 seeds each (`sweep_config`; sim binaries of c3bda7e and this tree)
+
+| Configuration | c3bda7e | this tree | fresh range 2000..4000 (c3bda7e -> this tree) |
+|---|---|---|---|
+| `fast-takeover-successor-restart-before-marker` | 56 (00d7db5: 55) | **0** | 61 -> 0 |
+| `fast-takeover-successor-restart-in-floor`, `-strict` | 0 | 0 | |
+| every other C7a configuration (the five rate ones, `locks-rate-within-budget`, the two suspends, `locks-root-restart-step-forward`, `-step-forward-then-restart`, `-reboot-step-forward`, `-reboot`, `strict-holder-restart-step-forward`, `flex-promiser-restart-step-forward`, `holder-restart-step-forward-readopt`) | 0 | 0 | |
+
+### Identity: the no-fault sweeps
+
+The 150 specs of commit 3's identity run plus the eight `locks-*` it left out and the
+C7a configurations (`locks-*`, `backup*`, `fast-takeover-*`, `delegated-*`, `flex*`,
+`strict-*`, `long-*`, the beats-thread variants; 2 000 seeds where the configuration
+is cheap, 500 for the `delegated`/`heavy` ones, 300 or 100 as in commit 3), c3bda7e against
+this tree: **the failing seeds are identical in 148 of 150**, the nine negative controls
+fail the same counts. The two that differ are `fast-takeover-skewed-successor` and its
+`-thread` variant: seeds [1716, 1987] on c3bda7e, [1716] here. Those two seeds are not
+this commit's: both configurations were clean on 00d7db5 (0 of 2 000) and fail on c3bda7e
+(F-a0's follow-ups; a mutual-exclusion violation at 13 s and at 15 s, no restart in
+either), 1987 passes here by trajectory (this commit's extra `PersistLockHorizon` at
+arming moves event times), 1716 fails in both. **Reported, not fixed here.** The summary
+line, floors and fenced seeds differ for 29 configurations, all with the same shape:
+a restart inside a floor now keeps it (the sim's floor samples count the restored
+floor: `-in-floor` shows floors up to 7 699 ms where they were 7 000, `backup-strict`
+floors 1 976 -> 2 227), and the node that used to serve at once now waits it out, which
+moves later events by a few units (takeovers 3 806 -> 3 836 in `backup-strict`).
+
+### Verification (build box, release unless noted, `-j 4`)
+
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `constellation-authority --lib` 546 (+ 2 ignored), `--test sim` (the whole suite), meta
+  lib, engine lib, types, platform, control, harness: pass.
+- Cost of the new writes (`Meta`, 100 rounds of one claim: the mark write, then the
+  arming's two durable writes; p50): tmpfs 1 and 3 us, xfs 1.7 and 3.5 ms, ext4 2.7 and 5.3
+  ms, btrfs 2.9 and 5.7 ms. A failover that takes 1.5 s pays about 8 ms of fsyncs.

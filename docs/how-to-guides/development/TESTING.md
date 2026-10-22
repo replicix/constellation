@@ -4508,8 +4508,10 @@ stamps; clean now, pinned in four sim tests and in `long_locks`):
 readopt` (clean: M4's own-lease arm, always gated) and the cost control
 `locks-root-reboot` (its first lock grant after the reboot waits the span, see
 PROGRESS); the persisted
-floor, fixed by the fourth: `fast-takeover-successor-restart-before-marker`,
-`fast-takeover-successor-restart-in-floor` (clean) and its strict variant.
+floor, fixed by the fourth (clean now, pinned in `a_successor_restarted_before_
+its_marker_still_owes_the_floor` and in `long_locks`): `fast-takeover-successor-
+restart-before-marker`, and, clean on the parent too and kept as regressions,
+`fast-takeover-successor-restart-in-floor` and its strict variant.
 `delegated-long-delegation` is not a control: it fails on 5 of 100 seeds
 with no clock fault (see PROGRESS).
 Unit tests: `a_simulated_rate_moves_the_elapsed_clocks_and_not_the_wall`,

@@ -1133,8 +1133,10 @@ fn a_tenure_inside_its_takeover_floor_is_not_idle_released() {
         h.core.note_fast_takeover(&prev, None);
         let mut out = Vec::new();
         let landed = h.now;
-        h.core
-            .note_marker_landed(Now::same(landed.0), &h.meta, &mut out);
+        // (On the harness's boot: `releases` starts the core again past the
+        // floor, and a floor persisted with no boot would be read as a span
+        // from that start, as after a reboot.)
+        h.core.note_marker_landed(h.clk(), &h.meta, &mut out);
         let margins = 2 * h.core.cfg.expiry_margin_ms as i64 + h.core.cfg.backup_takeover_ms as i64;
         let until = landed.0 + margins + if locks { 20_000 } else { 5_000 };
         assert!(h.core.in_takeover_floor(Now::same(until - 1)));
@@ -1144,7 +1146,8 @@ fn a_tenure_inside_its_takeover_floor_is_not_idle_released() {
             !releases(&mut h),
             "released inside the takeover floor (locks {locks})"
         );
-        h.now = Ms(until + 1);
+        // (Past the persisted floor, which a write rounds up a second.)
+        h.now = Ms(until + 1_001);
         idle(&mut h);
         assert!(
             releases(&mut h),
@@ -19230,7 +19233,12 @@ mod locks {
         }
     }
 
-    fn backup_lease_of(holder: NodeId, epoch: Epoch, expires: i64, backups: Vec<NodeId>) -> Lease {
+    pub(super) fn backup_lease_of(
+        holder: NodeId,
+        epoch: Epoch,
+        expires: i64,
+        backups: Vec<NodeId>,
+    ) -> Lease {
         Lease {
             backups,
             ack_policy: constellation_store_s3::AckPolicy::Backup,
@@ -19684,14 +19692,14 @@ mod locks {
     /// through the acquisition of `prev` up to its claim CAS: the lease
     /// read, the tail, the gap check, the swap. Returns the lease the
     /// claim CAS wrote; the CAS is answered as won.
-    fn claim_over(h: &mut Harness, prev: &Lease, permitted: bool) -> Lease {
+    pub(super) fn claim_over(h: &mut Harness, prev: &Lease, permitted: bool) -> Lease {
         claim_over_with(h, prev, permitted, false).0
     }
 
     /// [`claim_over`], also with the permit arriving while the claim CAS
     /// is in flight (`permit_in_flight`), and the actions the won CAS led
     /// to.
-    fn claim_over_with(
+    pub(super) fn claim_over_with(
         h: &mut Harness,
         prev: &Lease,
         permitted: bool,
@@ -20212,6 +20220,18 @@ mod locks {
         let mut out = Vec::new();
         h.core.note_marker_landed(h.clk(), &h.meta, &mut out);
         assert!(h.core.in_takeover_floor(h.clk()));
+        // The floor's lock horizon is written off the core (plan 43 C7a,
+        // commit 4): the driver completes it.
+        for a in std::mem::take(&mut out) {
+            if let Action::PersistLockHorizon { until } = a {
+                let durable = h.meta.note_lock_grant_horizon(until, h.clk()).ok();
+                h.core.handle(
+                    h.clk(),
+                    Event::LockHorizonPersisted { until, durable },
+                    &h.meta,
+                );
+            }
+        }
         h.core.lease.gate = None;
         h
     }
@@ -33159,5 +33179,231 @@ mod honour_clock {
             None,
             "honoured past its honour end because the wall clock stepped back"
         );
+    }
+}
+
+/// Plan 43 C7a (commit 4): a successor's takeover floor is persisted. It
+/// counts from the marker and lived in memory: a successor that stopped
+/// inside it (or between its claim CAS and its marker) re-adopted its own
+/// lease with no floor, and acknowledged and granted inside the window of
+/// the predecessor it had sealed.
+mod persisted_floor {
+    use super::locks::{backup_lease_of, claim_over_with};
+    use super::*;
+
+    const PRED: NodeId = 1;
+    const ME: NodeId = 2;
+
+    /// A node whose floor bound is far past anything else in these tests:
+    /// read delegations 20 s, lock grants 30 s.
+    fn successor() -> Harness {
+        let mut h = Harness::new(ME);
+        h.core.cfg.read_delegation_ttl_ms = 20_000;
+        h.core.cfg.lock_ttl_ms = 30_000;
+        h
+    }
+
+    /// The lease of a tenure that granted, sealed by `ME`.
+    fn predecessor(h: &Harness) -> Lease {
+        let mut prev = backup_lease_of(PRED, 1, h.now.0 + 5_000, vec![ME]);
+        prev.granted_delegations = true;
+        prev
+    }
+
+    /// The node stops and comes back `after_ms` later with its disk.
+    fn restart(h: Harness, after_ms: u64) -> Harness {
+        let mut h = Harness {
+            core: Core::new(h.core.cfg.clone()),
+            meta: h.meta,
+            now: h.now.plus(after_ms),
+            honour_off: 0,
+            wait_off: 0,
+            manual_horizon: false,
+        };
+        h.core.start(h.clk(), &h.meta, &mut Vec::new());
+        h
+    }
+
+    /// Answers the acquisition's requests (the tail, the drain, the marker)
+    /// until it asks for no more; the marker has landed then.
+    fn finish_gate(h: &mut Harness, mut out: Vec<Action>) {
+        for _ in 0..16 {
+            let Some((op, req)) = s3_ops(&out)
+                .into_iter()
+                .find(|(_, r)| !matches!(r, S3Op::HeartbeatRead))
+                .map(|(op, r)| (op, r.clone()))
+            else {
+                return;
+            };
+            let result = match req {
+                S3Op::SegmentPut { .. } => S3Result::SegmentPut(Ok(())),
+                S3Op::InboxRun { .. } => S3Result::InboxRun(Ok(Vec::new())),
+                S3Op::InboxDrain { .. } => S3Result::InboxDrain(Ok(Vec::new())),
+                S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+                other => panic!("unexpected request in the gate: {other:?}"),
+            };
+            out = h.step(Event::S3 { op, result });
+        }
+        panic!("the gate never finished: {out:?}");
+    }
+
+    /// Expectation (fail-before: the floor was in memory only): a successor
+    /// restarted inside its takeover floor is inside it still: the floor
+    /// ends no earlier than where it ended, the restart quarantines hold the
+    /// read delegations' and the lock grants' ends, and no lock grant is made
+    /// over a window the predecessor's holders may still honour. Fails on
+    /// the parent: the restarted core has no floor and no quarantine (the
+    /// first lock request is granted at once).
+    #[test]
+    fn a_restart_inside_the_takeover_floor_keeps_the_floor() {
+        let mut h = successor();
+        let prev = predecessor(&h);
+        let (_, won) = claim_over_with(&mut h, &prev, true, false);
+        finish_gate(&mut h, won);
+        let end = h.core.takeover_floor_until();
+        assert!(end > h.clk().wait.plus(20_000), "no floor: {end:?}");
+        let read_end = h.meta.read_delegations().quarantine_until();
+        let lock_end = h.meta.locks().quarantine_until();
+        assert!(lock_end > read_end);
+        // Stopped 300 ms into the floor, back 300 ms later.
+        h.advance(300);
+        let mut r = restart(h, 300);
+        assert!(
+            r.core.in_takeover_floor(r.clk()),
+            "the restarted successor is outside the floor"
+        );
+        assert!(r.core.takeover_floor_until() >= end);
+        assert!(r.meta.read_delegations().quarantine_until() >= read_end);
+        assert!(r.meta.locks().quarantine_until() >= lock_end);
+        // The floor is the whole of what the claim recorded: nothing is
+        // left owed by the claim's mark.
+        assert_eq!(r.meta.takeover_floor_pending(), None);
+        // Past the floor's end a restart finds it over.
+        r.advance(end.since(r.clk().wait) as u64 + 30_000);
+        let again = restart(r, 10);
+        assert!(!again.core.in_takeover_floor(again.clk()));
+        assert_eq!(again.core.takeover_floor_until(), WaitMs(0));
+    }
+
+    /// Expectation (fail-before: the mark and the re-arming do not exist):
+    /// a successor that stops between its claim CAS and its marker owes the
+    /// floor, and the re-adoption of its own lease arms it again, counted
+    /// from its own marker. Fails on the parent: the re-adoption is no
+    /// takeover (`pending_floor` stays false and the marker lands with no
+    /// floor).
+    #[test]
+    fn a_restart_between_the_fast_claim_and_its_marker_arms_the_floor() {
+        let mut h = successor();
+        let prev = predecessor(&h);
+        let (claimed, _won) = claim_over_with(&mut h, &prev, true, false);
+        assert!(h.core.ack.pending_floor, "no floor due after the claim");
+        assert!(
+            !h.core.in_takeover_floor(h.clk()),
+            "the marker has not landed"
+        );
+        assert_eq!(
+            h.meta.takeover_floor_pending(),
+            Some(claimed.epoch),
+            "the claim's epoch was not recorded before its CAS"
+        );
+        // The claim is the lease object: own, unreleased, at epoch 2.
+        assert_eq!((claimed.holder, claimed.epoch), (ME, 2));
+        let mut r = restart(h, 300);
+        assert!(!r.core.in_takeover_floor(r.clk()));
+        let (_, won) = claim_over_with(&mut r, &claimed, false, false);
+        assert!(
+            r.core.ack.pending_floor,
+            "the re-adoption of the claim's lease owes the floor"
+        );
+        assert!(
+            r.core.fast_gate_pending(),
+            "the gate is a fast takeover's until its marker lands"
+        );
+        finish_gate(&mut r, won);
+        assert!(r.core.in_takeover_floor(r.clk()));
+        let c = &r.core.cfg;
+        let bound = c.backup_takeover_ms + c.read_delegation_ttl_ms.max(c.lock_ttl_ms);
+        assert!(
+            r.core.takeover_floor_until() >= r.clk().wait.plus(bound),
+            "{:?}",
+            r.core.takeover_floor_until()
+        );
+        assert!(r.meta.locks().quarantine_until() > r.clk().wait.plus(c.lock_ttl_ms));
+        assert_eq!(
+            r.meta.takeover_floor_pending(),
+            None,
+            "the floor is durable"
+        );
+    }
+
+    /// Expectation (fail-before: any completed lock-horizon write removed
+    /// the mark): a lock-horizon write that completes between the claim CAS
+    /// and its marker, or inside the re-adoption's gate, covers nothing of
+    /// the floor (it is a grant's of this node as a delegate's lock owner,
+    /// or of an earlier tenure): the mark stays, and a restart then still
+    /// arms the floor. Fails on the unreviewed commit: the mark is gone after
+    /// the first write, and the re-adoption owes no floor.
+    #[test]
+    fn a_lock_horizon_written_before_the_marker_leaves_the_mark() {
+        let mut h = successor();
+        let prev = predecessor(&h);
+        let (claimed, _won) = claim_over_with(&mut h, &prev, true, false);
+        let lock_write = |h: &mut Harness| {
+            let until = h.clk().wait.plus(5_000);
+            let durable = h.meta.note_lock_grant_horizon(until, h.clk()).ok();
+            assert!(durable.is_some());
+            h.step(Event::LockHorizonPersisted { until, durable });
+        };
+        lock_write(&mut h);
+        assert_eq!(
+            h.meta.takeover_floor_pending(),
+            Some(claimed.epoch),
+            "a lock-horizon write before the marker removed the claim's mark"
+        );
+        let mut r = restart(h, 300);
+        let (_, won) = claim_over_with(&mut r, &claimed, false, false);
+        assert!(r.core.ack.pending_floor, "the re-adoption owes no floor");
+        lock_write(&mut r);
+        assert_eq!(
+            r.meta.takeover_floor_pending(),
+            Some(claimed.epoch),
+            "a lock-horizon write inside the re-adoption's gate removed the mark"
+        );
+        finish_gate(&mut r, won);
+        assert!(r.core.in_takeover_floor(r.clk()));
+    }
+
+    /// A claim that arms no floor leaves no mark, and a re-adoption of an
+    /// unrelated own lease (no mark, or the mark of another epoch) owes
+    /// nothing: only the claim of a tenure that granted is recorded, and
+    /// the mark is removed once the claim is known to arm none.
+    #[test]
+    fn only_a_claim_that_arms_a_floor_leaves_its_mark() {
+        // A TTL takeover of a tenure that granted (the lease ran out by
+        // this node's clock, no permit): the CAS records the epoch, the win
+        // finds no floor due and removes it.
+        let mut h = successor();
+        let mut prev = predecessor(&h);
+        prev.expires_unix_ms = h.now.0 - 1;
+        let (_, _won) = claim_over_with(&mut h, &prev, false, false);
+        assert!(!h.core.ack.pending_floor);
+        assert_eq!(h.meta.takeover_floor_pending(), None);
+        // A permitted claim of an unmarked lease records nothing at all.
+        let mut h = successor();
+        let unmarked = backup_lease_of(PRED, 1, h.now.0 + 5_000, vec![ME]);
+        let (_, _won) = claim_over_with(&mut h, &unmarked, true, false);
+        assert_eq!(h.meta.takeover_floor_pending(), None);
+        // A mark of another epoch does not arm the re-adoption of this one.
+        let mut h = successor();
+        let prev = predecessor(&h);
+        let (claimed, _) = claim_over_with(&mut h, &prev, true, false);
+        h.meta
+            .set_takeover_floor_pending(claimed.epoch + 5)
+            .unwrap();
+        let mut r = restart(h, 300);
+        let (_, _won) = claim_over_with(&mut r, &claimed, false, false);
+        assert!(!r.core.ack.pending_floor);
+        assert_eq!(r.meta.takeover_floor_pending(), None);
     }
 }

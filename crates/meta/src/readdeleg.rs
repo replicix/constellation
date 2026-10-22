@@ -538,6 +538,20 @@ pub(crate) const KV_READ_GRANT_HORIZON: &str = "read_grant_horizon_ms";
 /// only new lock grants wait for it, not acknowledgements.
 pub(crate) const KV_LOCK_GRANT_HORIZON: &str = "lock_grant_horizon_ms";
 
+/// Local kv key: where the takeover floor this tenure armed ends (plan 43
+/// C7a, commit 4), a boot stamp like the two horizons above. The horizons
+/// make a restart wait out what the floor protected (no acknowledgement, no
+/// lock grant); this one is the floor itself, which also keeps the lease
+/// from being released inside it (`Core::in_takeover_floor`).
+pub(crate) const KV_TAKEOVER_FLOOR: &str = "takeover_floor_horizon_ms";
+
+/// Local kv key: the epoch of a fast claim CAS that is to arm a takeover
+/// floor, written before the CAS goes out and removed once the floor's
+/// horizons are durable (plan 43 C7a, commit 4). The value is the epoch,
+/// decimal; **readers ignore the tokens after it, writers may append**
+/// (the format is append-only).
+pub(crate) const KV_TAKEOVER_FLOOR_PENDING: &str = "takeover_floor_pending";
+
 impl crate::store::Meta {
     /// This node's read-delegation tables (plan 30 §M8).
     pub fn read_delegations(&self) -> &ReadDelegations {
@@ -608,6 +622,52 @@ impl crate::store::Meta {
         Ok(value)
     }
 
+    /// Persist that this tenure's takeover floor ends at `until` (on this
+    /// process's wait clock; plan 43 C7a, commit 4), as a boot stamp, before
+    /// the floor's work goes on: a restart inside the floor
+    /// ([`Self::load_takeover_floor`]) is still inside it.
+    pub fn note_takeover_floor(&self, until: WaitMs, now: Now) -> Result<(), crate::MetaError> {
+        self.note_horizon(KV_TAKEOVER_FLOOR, until, now).map(|_| ())
+    }
+
+    /// At start: where the previous incarnation's takeover floor ends on this
+    /// process's wait clock (see [`Self::load_grant_quarantine`] for how the
+    /// stamp is read; `default_span_ms` for a value without a boot, the
+    /// longest a floor leads its arming). `None`: none, or none left.
+    pub fn load_takeover_floor(&self, now: Now, default_span_ms: i64) -> Option<WaitMs> {
+        self.load_horizon(KV_TAKEOVER_FLOOR, now, default_span_ms)
+    }
+
+    /// The tenure that armed the floor is over (a release, a deposition):
+    /// its floor goes with it (the quarantines it set run on). Not synced:
+    /// a floor that comes back after a crash only holds a release back.
+    pub fn clear_takeover_floor(&self) -> Result<(), crate::MetaError> {
+        self.horizon_wait.lock().unwrap().remove(KV_TAKEOVER_FLOOR);
+        self.kv_del(KV_TAKEOVER_FLOOR)
+    }
+
+    /// Plan 43 C7a, commit 4: a fast claim CAS for `epoch` is about to go
+    /// out and may arm a floor when its marker lands; a crash between the
+    /// two leaves nothing else to say that the successor owes one. Durable,
+    /// before the CAS.
+    pub fn set_takeover_floor_pending(&self, epoch: u64) -> Result<(), crate::MetaError> {
+        self.kv_set_durable(KV_TAKEOVER_FLOOR_PENDING, &epoch.to_string())
+    }
+
+    /// The epoch [`Self::set_takeover_floor_pending`] named, if its mark is
+    /// still there (a value that does not start with a number is none).
+    pub fn takeover_floor_pending(&self) -> Option<u64> {
+        let v = self.kv_get(KV_TAKEOVER_FLOOR_PENDING).ok().flatten()?;
+        v.split_whitespace().next()?.parse().ok()
+    }
+
+    /// The floor's horizons are durable (or the CAS did not arm one): the
+    /// mark goes. Not synced: a mark that survives a crash only makes the
+    /// next re-adoption of that epoch wait a floor it did not owe.
+    pub fn clear_takeover_floor_pending(&self) -> Result<(), crate::MetaError> {
+        self.kv_del(KV_TAKEOVER_FLOOR_PENDING)
+    }
+
     /// At start: grants the previous incarnation made may still be honoured
     /// until the persisted horizon; quarantine until then, on this node's
     /// wait clock: from the raw clock when it was written on this boot (a
@@ -655,7 +715,11 @@ impl crate::store::Meta {
     /// known to have passed).
     pub fn clear_passed_horizons(&self, now: Now) -> Result<(), crate::MetaError> {
         let mut cleared = false;
-        for key in [KV_READ_GRANT_HORIZON, KV_LOCK_GRANT_HORIZON] {
+        for key in [
+            KV_READ_GRANT_HORIZON,
+            KV_LOCK_GRANT_HORIZON,
+            KV_TAKEOVER_FLOOR,
+        ] {
             let passed = self
                 .horizon_wait
                 .lock()
@@ -948,6 +1012,79 @@ mod boot_stamped_horizon_tests {
                 .since(now.wait),
             18_500
         );
+    }
+
+    /// Plan 43 C7a (commit 4). Expectation: a takeover floor is persisted as a
+    /// boot stamp and read like the horizons: on the same boot from the raw
+    /// clock (a wall step, either way, while the node was up or down moves
+    /// nothing), after a reboot as the span recorded; one that has passed
+    /// is none. Fail-before: nothing was persisted (the mutant that
+    /// drops the write reads `None` at once).
+    #[test]
+    fn a_takeover_floor_survives_a_restart_and_a_wall_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = Meta::open(dir.path()).unwrap();
+        let first = at(7, 100_000, 5_000, WALL);
+        meta.note_takeover_floor(WaitMs(25_500), first).unwrap();
+        drop(meta);
+        // Same boot, 3 s on, the wall 10 s forward: 23 500 - 3 000 + 1 000
+        // (the write rounds up) = 21 500 left.
+        let meta = Meta::open(dir.path()).unwrap();
+        let now = at(7, 103_000, 400, WALL + 13_000);
+        let until = meta.load_takeover_floor(now, 30_000).unwrap();
+        assert_eq!(until.since(now.wait), 18_500);
+        // Another boot: the whole span (21 500 at the write), from now.
+        drop(meta);
+        let meta = Meta::open(dir.path()).unwrap();
+        let now = at(8, 3_000, 400, WALL + 13_000);
+        let until = meta.load_takeover_floor(now, 30_000).unwrap();
+        assert_eq!(until.since(now.wait), 21_500);
+        // Past it on the same boot: none.
+        drop(meta);
+        let meta = Meta::open(dir.path()).unwrap();
+        let now = at(7, 130_000, 400, WALL);
+        assert_eq!(meta.load_takeover_floor(now, 30_000), None);
+        // The tenure ended: no floor to come back.
+        meta.clear_takeover_floor().unwrap();
+        let now = at(7, 103_000, 400, WALL);
+        assert_eq!(meta.load_takeover_floor(now, 30_000), None);
+    }
+
+    /// Plan 43 C7a (commit 4). Expectation: the mark of a claim CAS names its
+    /// epoch (append-only: tokens after the number are ignored, a value that
+    /// is no number is no mark) and goes when cleared.
+    #[test]
+    fn the_claim_mark_names_its_epoch() {
+        let meta = Meta::open_in_memory().unwrap();
+        assert_eq!(meta.takeover_floor_pending(), None);
+        meta.set_takeover_floor_pending(7).unwrap();
+        assert_eq!(meta.takeover_floor_pending(), Some(7));
+        meta.kv_set(KV_TAKEOVER_FLOOR_PENDING, "9 future tokens")
+            .unwrap();
+        assert_eq!(meta.takeover_floor_pending(), Some(9));
+        meta.kv_set(KV_TAKEOVER_FLOOR_PENDING, "garbage").unwrap();
+        assert_eq!(meta.takeover_floor_pending(), None);
+        meta.set_takeover_floor_pending(8).unwrap();
+        meta.clear_takeover_floor_pending().unwrap();
+        assert_eq!(meta.takeover_floor_pending(), None);
+    }
+
+    /// Plan 43 C7a (commit 4). Expectation: a graceful shutdown clears a
+    /// floor that has passed and keeps one that has not, like the horizons.
+    #[test]
+    fn a_graceful_shutdown_clears_a_passed_floor_and_keeps_a_live_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = Meta::open(dir.path()).unwrap();
+        let first = at(7, 100_000, 5_000, WALL);
+        meta.note_takeover_floor(WaitMs(25_500), first).unwrap();
+        // Live at wait 20 000: kept.
+        meta.clear_passed_horizons(at(7, 115_000, 20_000, WALL))
+            .unwrap();
+        assert!(meta.kv_get(KV_TAKEOVER_FLOOR).unwrap().is_some());
+        // Passed (the write was rounded up to 26 500): cleared.
+        meta.clear_passed_horizons(at(7, 122_000, 27_000, WALL))
+            .unwrap();
+        assert_eq!(meta.kv_get(KV_TAKEOVER_FLOOR).unwrap(), None);
     }
 
     /// Expectation (fail-before: the wall form): a forward step while the

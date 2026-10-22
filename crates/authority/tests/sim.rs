@@ -8896,6 +8896,33 @@ fn a_holder_restarted_past_its_lease_readopts_it_through_the_gate() {
     }
 }
 
+/// Plan 43 C7a (4/6): a fast successor killed between its claim CAS and its
+/// marker (or inside its floor) and restarted re-adopts its own lease and
+/// owes the predecessor's floor still: the claim records its epoch before the
+/// CAS (`takeover_floor_pending`), the re-adoption arms the floor from its own
+/// marker, and the floor's horizons are persisted at arming. `fast-takeover-
+/// successor-restart-before-marker`: 55 of 2 000 seeds failed before (the
+/// first at 20, 35 and 69: a still-honoured old grant against a new one
+/// 172-433 ms after the restart); `-in-floor` and its strict variant are
+/// clean on the parent too (the lock mirror the successor installed covers
+/// the grants of their geometry) and stay regression configurations.
+#[test]
+fn a_successor_restarted_before_its_marker_still_owes_the_floor() {
+    for seed in [19u64, 20, 21, 34, 35, 36, 68, 69, 70, 79, 80, 81] {
+        run_seed(seed, fast_takeover_successor_restart_before_marker_config())
+            .unwrap_or_else(|e| panic!("before-marker seed {seed}: {e}"));
+    }
+    for seed in 0..6u64 {
+        run_seed(seed, fast_takeover_successor_restart_in_floor_config())
+            .unwrap_or_else(|e| panic!("in-floor seed {seed}: {e}"));
+        run_seed(
+            seed,
+            fast_takeover_successor_restart_in_floor_strict_config(),
+        )
+        .unwrap_or_else(|e| panic!("in-floor strict seed {seed}: {e}"));
+    }
+}
+
 /// Plan 43 C7-F F-a (review F3): the credited-arrival control on the
 /// strict side, where the window it needs is wide: with the successor's
 /// clock 4 s ahead, a cap counted from the beats' credit ends the floor
@@ -10270,6 +10297,17 @@ fn long_locks() {
         "locks-root-reboot",
         locks_root_reboot_config(),
         225_000..225_000 + n,
+    );
+    // Plan 43 C7a (4/6): the takeover floor persisted.
+    run_m14(
+        "fast-takeover-successor-restart-before-marker",
+        fast_takeover_successor_restart_before_marker_config(),
+        226_000..226_000 + n,
+    );
+    run_m14(
+        "fast-takeover-successor-restart-in-floor",
+        fast_takeover_successor_restart_in_floor_config(),
+        227_000..227_000 + n,
     );
 }
 
