@@ -2113,7 +2113,8 @@ impl Core {
                 epoch,
                 acked,
                 sealed,
-            } => self.on_backup_ack(now, from, req, epoch, acked, sealed, replica, out),
+                fresh,
+            } => self.on_backup_ack(now, from, req, epoch, acked, sealed, fresh, replica, out),
             PeerMsg::StreamAhead { epoch, base, txs } => {
                 self.on_stream_ahead(now, from, epoch, base, txs, replica, out)
             }

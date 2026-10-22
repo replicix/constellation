@@ -49,9 +49,24 @@
 //!   lease *object*; adding a backup streams to it first and CASes it
 //!   in only once it has caught up; removing one is a CAS the holder
 //!   waits for before acknowledging anything further (the parked acks
-//!   still need the removed backup until the CAS lands, and need only
-//!   the survivors after). A backup that is not (or no longer) in the
-//!   object never takes over: it reads the object before its CAS.
+//!   need the removed backup and the survivors — the log, if none
+//!   survives — until the CAS lands, and only the survivors after). A
+//!   backup that is not (or no longer) in the object never takes over:
+//!   it reads the object before its CAS.
+//!   Plan 43 C1-1 makes both halves true of what is counted, not only of
+//!   what is asked:
+//!   - A backup counts only from the acknowledgements of appends that
+//!     carried a configuration version listing it
+//!     (`BackupPeer::counted`, `Core::backed_through`): a candidate that
+//!     is not listed yet discards its tail on any lease read that does
+//!     not list it, so what it acknowledged before its listing landed
+//!     proves nothing about what it will keep. A backup whose hold was
+//!     created by an append says so (`PeerMsg::BackupAck::fresh`) and the
+//!     holder restarts its count from that hold.
+//!   - While a removal CAS is out or in doubt, an acknowledgement rests
+//!     on the staying set too (empty: the log), whatever the held version
+//!     says: the version S3 may hold is the one that lists only them
+//!     (`Core::ack_constraint_sets`).
 //! - **The log-slot CAS.** The taker's epoch marker is a create-if-absent
 //!   at the next sequence; any segment the old holder ships after it
 //!   collides, and what it shipped before it the taker adopted in its
@@ -356,7 +371,21 @@ pub(crate) fn candidate_strikes_after(prev: Option<(u32, WaitMs)>, now: Now) -> 
 #[derive(Debug, Clone)]
 pub(crate) struct BackupPeer {
     /// The journal seq it holds through (its highest cumulative ack).
+    /// Catch-up (`backup_promote`, the stream's resend point) is judged on
+    /// this; what an acknowledgement may rest on is [`Self::counted`].
     pub acked: u64,
+    /// Plan 43 C1-1: the held `config_version` at which this node became a
+    /// committed backup in this bring-up (`reconcile_peers_with_lease`);
+    /// `None` while it is a candidate or not committed.
+    pub listed_at: Option<u64>,
+    /// Plan 43 C1-1: the highest cumulative ack of an append that carried
+    /// a `config_version >= listed_at`: what an acknowledgement given to a
+    /// client may count on this backup (`Core::backed_through`). An ack
+    /// given at an older version (as a candidate, or before a restart of
+    /// the holder re-listed it) says nothing about the tail the backup
+    /// will keep once it is listed: it discards its tail on a lease read
+    /// that does not list it.
+    pub counted: u64,
     /// The journal seq the appends in flight reach; the next batch
     /// starts past it (pipelining, `Config::backup_max_inflight`).
     pub sent_through: u64,
@@ -399,6 +428,9 @@ pub(crate) struct Inflight {
     pub req: OpId,
     pub sent: WaitMs,
     pub last: u64,
+    /// The `config_version` the append carried (plan 43 C1-1): its ack
+    /// counts for a backup only if this lists it (`BackupPeer::counted`).
+    pub config_version: u64,
 }
 
 /// Whether a tenure under this lease can be taken over before it expires
@@ -1004,7 +1036,7 @@ impl Core {
                 // Plan 43 C7-F F-a0: a reconfiguration whose outcome is not
                 // known (in doubt, or the first listing still out) may have
                 // listed backups this node does not hold listed
-                // (`doubted_backups`). One of them that seals this
+                // (`ack_constraint_sets`). One of them that seals this
                 // tenure takes over with its tail and the log, nothing
                 // else: an acknowledgement rests on each of them as on a
                 // committed backup — and on the held version's rule too,
@@ -1015,11 +1047,18 @@ impl Core {
                 // (a `LeasePut` timeout, then the candidate cut off and
                 // nobody else in budget: the listed candidate sealed and
                 // took over without what was acknowledged meanwhile).
+                //
+                // Plan 43 C1-1: every such version is a constraint of its
+                // own, an empty one included (a removal of the last backup
+                // is the log: nothing on any backup's disk is what the
+                // version leaves), each counted on its own set. A version
+                // that may be in S3 is a configuration a reconfigurer may
+                // read, and a row acknowledged now must rest, whatever
+                // version S3 holds, on the group that version names.
                 let held = self.durable_jseq_held();
-                if self.doubted_backups().next().is_none() {
-                    return held;
-                }
-                held.min(self.backed_through(self.doubted_backups()))
+                self.ack_constraint_sets().fold(held, |d, set| {
+                    d.min(self.backed_through(set.iter().copied()))
+                })
             }
         }
     }
@@ -1050,13 +1089,62 @@ impl Core {
         self.backed_through(committed.iter().copied())
     }
 
-    /// The journal seq every one of `backups` holds, or the log does.
+    /// The journal seq every one of `backups` holds, or the log does
+    /// (the empty set is the log alone).
+    ///
+    /// Plan 43 C1-1: what a backup holds *for this purpose* is
+    /// `BackupPeer::counted`, its acknowledgements of appends that carried
+    /// a configuration version listing it, never the running maximum of
+    /// every acknowledgement (`acked`). Why that is enough: a backup
+    /// acknowledges an append carrying `v` only after it recorded `v` in
+    /// its role (`on_backup_append`); from then on it discards its tail
+    /// only on a lease read that does not list it (`on_takeover_get`'s
+    /// catch-all) at a version `>= v` (an older read is stale and ignored:
+    /// S3 holds a version `>= v` by then, the holder sent `v` only after
+    /// its CAS landed), which lists it unless this holder removed it
+    /// (while a removal is out or in doubt only the staying set counts:
+    /// `ack_constraint_sets`). Before, the acknowledgements a
+    /// candidate gave while it was not yet listed were counted from the
+    /// moment its listing landed, though a candidate that read the lease
+    /// while the listing was in flight had discarded that tail
+    /// (`long-backup` seeds 892 and 472: an acknowledged row on no disk
+    /// but the holder's, and the TTL successor never saw it).
     fn backed_through(&self, backups: impl Iterator<Item = NodeId>) -> u64 {
         backups
-            .map(|b| self.ack.peers.get(&b).map(|p| p.acked).unwrap_or(0))
+            .map(|b| self.ack.peers.get(&b).map(|p| p.counted).unwrap_or(0))
             .min()
             .unwrap_or(0)
             .max(self.ack.shipped_through)
+    }
+
+    /// Plan 43 C1-1: the backup sets, besides the held version's, that an
+    /// acknowledgement must rest on: the set of every reconfiguration in
+    /// doubt (an answer lost: it may have landed) and the set of the one
+    /// out, when it lists a first backup or removes one, as long as it
+    /// is conditioned on the version held. Each may be what S3 holds when
+    /// the holder dies; none may be empty-handed:
+    /// - a listing out or in doubt: its backups may seal this tenure
+    ///   (plan 43 C7-F F-a0);
+    /// - a removal out or in doubt: the backup it removes is still in the
+    ///   held set, so a row acknowledged on it alone, between the check
+    ///   that judged the removal safe and the landing, would rest after
+    ///   the landing on the holder alone under a version that lists
+    ///   nobody, which a TTL claimant never fetches from. The staying
+    ///   set (empty: the log) carries it.
+    fn ack_constraint_sets(&self) -> impl Iterator<Item = &[NodeId]> + '_ {
+        let doubt = self
+            .lease
+            .reconfig_doubt
+            .iter()
+            .flat_map(|d| d.sets.iter().map(Vec::as_slice));
+        let out = self.lease.held.iter().filter_map(|(held, tag)| {
+            self.ack
+                .reconfig
+                .as_ref()
+                .filter(|r| r.tag == *tag && (r.remove.is_some() || held.backups.is_empty()))
+                .map(|r| r.lease.backups.as_slice())
+        });
+        doubt.chain(out)
     }
 
     /// Whether journal seq `jseq` is durable now: on every committed
@@ -2171,8 +2259,28 @@ impl Core {
     /// showed a reconfiguration landed).
     fn reconcile_peers_with_lease(&mut self) {
         let committed: Vec<NodeId> = self.lease.backups().to_vec();
+        let held_version = self.lease.held.as_ref().map(|(l, _)| l.config_version);
         for (n, p) in self.ack.peers.iter_mut() {
             p.committed = committed.contains(n);
+            // Plan 43 C1-1: listed from this held version on. The first
+            // time the held lease lists the peer in this bring-up, what it
+            // acknowledged before counted for nothing (it was a
+            // candidate, or an earlier tenure of this holder's process
+            // listed it): counting restarts, from the appends sent at a
+            // version that lists it (`on_backup_ack`). The version is the
+            // held one when this runs, which is the one that listed it or
+            // a later one: never earlier, so never an append that did not
+            // list it. An append is due at once (`last_sent`): the backup
+            // may be caught up and idle, and the acknowledgements parked
+            // behind the listing would wait out a heartbeat interval.
+            if !p.committed {
+                p.listed_at = None;
+                p.counted = 0;
+            } else if p.listed_at.is_none() {
+                p.listed_at = held_version;
+                p.counted = 0;
+                p.last_sent = WaitMs(0);
+            }
         }
         // A candidate that made it in starts over.
         self.ack
@@ -2273,6 +2381,8 @@ impl Core {
             n,
             BackupPeer {
                 acked: 0,
+                listed_at: None,
+                counted: 0,
                 sent_through: 0,
                 inflight: std::collections::VecDeque::new(),
                 last_sent: WaitMs(0),
@@ -2361,6 +2471,7 @@ impl Core {
                 req,
                 sent: now.wait,
                 last: last.unwrap_or(start - 1),
+                config_version: lease.config_version,
             });
             p.last_sent = now.wait;
             self.stats.backup_appends += 1;
@@ -2665,7 +2776,7 @@ impl Core {
         !stays.is_empty()
             && stays
                 .iter()
-                .all(|b| self.ack.peers.get(b).is_some_and(|p| p.acked >= hwm))
+                .all(|b| self.ack.peers.get(b).is_some_and(|p| p.counted >= hwm))
     }
 
     pub(crate) fn on_reconfig_put(
@@ -2737,6 +2848,12 @@ impl Core {
                         if !d.backups.contains(b) {
                             d.backups.push(*b);
                         }
+                    }
+                    // Plan 43 C1-1: the set itself too, an empty one
+                    // included: acknowledgements rest on each version in
+                    // doubt as a whole (`ack_constraint_sets`).
+                    if !d.sets.contains(&r.lease.backups) {
+                        d.sets.push(r.lease.backups.clone());
                     }
                 }
                 tracing::warn!(
@@ -2816,6 +2933,7 @@ impl Core {
         epoch: Epoch,
         acked: u64,
         sealed: bool,
+        fresh: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -2875,9 +2993,34 @@ impl Core {
             inflight = p.inflight.len(),
             "backup append acknowledged"
         );
-        // Acks are cumulative (the backup's contiguous hold), and may
-        // arrive out of order.
-        p.acked = p.acked.max(acked);
+        let listed_by_append = p.listed_at.is_some_and(|v| entry.config_version >= v);
+        if fresh {
+            // Plan 43 C1-1: the backup's hold for this `(holder, epoch)`
+            // was created by this very append: whatever it held before
+            // was discarded (a lease read that did not list it, a restart
+            // that lost its role), so what it holds is exactly `acked`
+            // and nothing we counted earlier is still there. Before, the
+            // running maximum kept the discarded `acked`; the stream
+            // resumed from it, never filled the backup's gap, and the
+            // backup was dropped at the ack timeout instead of caught up.
+            // The appends still in flight were sent from the old hold;
+            // their acks are ignored (not in flight) and the stream
+            // resumes from what the backup holds.
+            p.acked = acked;
+            p.sent_through = acked;
+            p.inflight.clear();
+            p.counted = if listed_by_append { acked } else { 0 };
+        } else {
+            // Acks are cumulative (the backup's contiguous hold), and may
+            // arrive out of order.
+            p.acked = p.acked.max(acked);
+            // What an acknowledgement to a client may rest on: only an
+            // append that carried a version listing the backup
+            // (`Core::backed_through`).
+            if listed_by_append {
+                p.counted = p.counted.max(acked);
+            }
+        }
         if acked < entry.last && pos == 0 {
             // The oldest append in flight came back short: rows below
             // it never landed (an earlier request was lost, or answered
@@ -3204,7 +3347,7 @@ impl Core {
             "backup append received"
         );
         self.note_foreign(now, replica, out);
-        let reply = |acked: u64, sealed: bool, out: &mut Vec<Action>| {
+        let reply = |acked: u64, sealed: bool, fresh: bool, out: &mut Vec<Action>| {
             out.push(Action::Send {
                 to: from,
                 msg: PeerMsg::BackupAck {
@@ -3212,6 +3355,7 @@ impl Core {
                     epoch,
                     acked,
                     sealed,
+                    fresh,
                 },
             });
         };
@@ -3224,12 +3368,21 @@ impl Core {
                 .is_some_and(|mine| mine >= epoch && self.lease.held.is_some())
             || self.ship.max_epoch > epoch;
         if superseded || from != holder {
-            reply(0, true, out);
+            reply(0, true, false, out);
             return;
         }
+        // Plan 43 C1-1: this append created the hold (no role for this
+        // `(holder, epoch)` before it).
+        let mut fresh = false;
         match self.bk.role {
             Some(role) if role.epoch == epoch && role.holder == holder => {
-                if role.config_version != config_version {
+                // Plan 43 C1-1 (review): the highest version this node
+                // acknowledged an append at. Appends overtake each other,
+                // and one sent before a listing landed may arrive after
+                // one sent after it; lowered by it, the role's version no
+                // longer told a stale lease read (`on_takeover_get`) from
+                // the listing's.
+                if config_version > role.config_version {
                     let role = BackupRole {
                         config_version,
                         ..role
@@ -3240,10 +3393,11 @@ impl Core {
                 self.bk.candidacy = self.bk.candidacy.max(candidacy);
             }
             Some(role) if role.epoch > epoch => {
-                reply(0, true, out);
+                reply(0, true, false, out);
                 return;
             }
             _ => {
+                fresh = true;
                 let role = BackupRole {
                     holder,
                     epoch,
@@ -3285,7 +3439,7 @@ impl Core {
         }
         let floor = self.bk.acked;
         self.bk.held.retain(|_, last| *last > floor);
-        reply(self.bk.acked, false, out);
+        reply(self.bk.acked, false, fresh, out);
         // Rows below the holder's shipped-through are in the log
         // (trimmed exactly by the segments we apply; this is the cheap
         // bound meanwhile).
@@ -4062,6 +4216,32 @@ impl Core {
                     },
                     replica,
                     out,
+                );
+                self.arm_backup_watch(now, out);
+            }
+            Some((lease, _))
+                if lease.holder == role.holder
+                    && lease.epoch == role.epoch
+                    && lease.config_version < role.config_version =>
+            {
+                // Plan 43 C1-1 (review): a version older than one this node
+                // acknowledged an append at. The read was answered by S3
+                // before the holder's later CAS landed and reached us after
+                // that append: S3 holds a version at least the role's
+                // (versions only grow, and the holder sends one only once
+                // its CAS landed), so what it says about this node's
+                // listing is stale. The holder counts what this node
+                // acknowledged under the role's version
+                // (`BackupPeer::counted`): discarding the tail on this
+                // read left rows acknowledged to clients on no backup's
+                // disk. The watch reads again.
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    holder = lease.holder,
+                    epoch = lease.epoch,
+                    read = lease.config_version,
+                    role = role.config_version,
+                    "a lease read older than the backup role's version; ignored"
                 );
                 self.arm_backup_watch(now, out);
             }

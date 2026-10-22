@@ -56734,3 +56734,119 @@ authority (lib and sim suite) and engine, debug.
 Docs: `delegations.md` (the generation's end and its cut; how a delegate executes), DESIGN, ADR-23.
 Re-tag note (C1): C2a/C2b do not touch the gate or a row's tagging; the class they record is read from today's gating when
 the answer leaves, so a row whose gate went off already counts as `Lone`.
+
+## Plan 43 C1-1 — The root group's commit holds across a listing and a removal
+
+The first commit of plan 43 C1 ([the commit rule](wip/43-commit-rule.md), the coder
+spec's §3): a backup counts toward an acknowledgement only from the acknowledgements of
+appends that carried a configuration version listing it, and a removal CAS that is out
+or in doubt lands covered. It only makes acknowledgements wait longer, in two
+transitions (one append round trip after a listing; the flight of a removal CAS, or its
+doubt, when no backup stays). Maintainer's decision Q22 (a) is in this commit.
+
+### The holes
+
+- **A listing counted acknowledgements the candidate gave before it was listed.** A
+  candidate that reads the lease while its own listing CAS is in flight reads a version
+  that does not list it and discards its tail (`on_takeover_get`'s catch-all); the CAS
+  then lands and `backed_through` counted the running maximum of its acknowledgements
+  (`BackupPeer::acked`), rows it no longer held. `long-backup` seed 892 (a refusal
+  answered under `root-group`, the row on no disk but the holder's) and seed 472 (a
+  restarted holder re-adopts its own lease with `backups: []`, re-invites its old backup,
+  which drops its old-tenure tail on a lease read just before the listing lands:
+  `root-group/exists`). With the default clock-fault mix of C7a 6 the same hole shows
+  on 10 more (configuration, seed) pairs of the sweeps below (`backup` 345, `backup-two` 345, `backup-partition`
+  270, `backup-departs` 889, `backup-hot` 922, `delegated-holder-cut` 14, `long-backup`
+  736, `locks-long-grants-seal` 13, `backup-crash-slow` 976 and 1126).
+- **A removal in flight (or in doubt) still counted the backup it removes.** Rows
+  acknowledged on it between `removal_safe` (judged at issue) and the landing rest, after
+  the landing, on the holder alone under a version that lists nobody, which a TTL
+  claimant never fetches from. Harmless today (the deposed holder replays them), a loss
+  once C1-4 stops the replay.
+
+### The change
+
+| Item | Where |
+|---|---|
+| `BackupPeer.listed_at` (the held `config_version` at which the node became a committed backup in this bring-up) and `counted` (its highest cumulative ack of an append with `config_version >= listed_at`); `Inflight.config_version`; `backed_through` and `removal_safe` read `counted`; `backup_promote` keeps `acked` (catch-up is liveness) | `core/backup.rs` |
+| `reconcile_peers_with_lease` sets `listed_at` at the first held version that lists the peer and makes an append due at once (`last_sent`), so the acknowledgements parked behind a listing wait one round trip, not a heartbeat | `core/backup.rs` |
+| `PeerMsg::BackupAck.fresh` / `Payload::BackupAck.fresh`: the backup's hold for this `(holder, epoch)` was created by the append. The holder restarts `acked`, `sent_through`, the appends in flight and `counted` from that hold (before: the running maximum kept the discarded `acked`, the resend never filled the gap, the backup was dropped at the ack timeout) | `event.rs`, `net/message.rs`, `engine/{authority_driver,p2p,sync}.rs` |
+| `ReconfigDoubt.sets` (the backup set of every version in doubt, an empty one included); `Core::ack_constraint_sets` (every doubted set, and the set of the reconfiguration out when it lists a first backup or removes one, conditioned on the held tag); `durable_jseq` is `held.min` over each set on its own (the empty set is the log) | `core/lease.rs`, `core/backup.rs` |
+| The backup's side (review): a lease read of its holder's epoch at a `config_version` below its role's is older than an append it acknowledged (the read was answered before the listing landed and arrived after the append at the listing's version); `on_takeover_get` ignores it and the watch reads again, where its catch-all discarded the tail the holder now counts | `core/backup.rs` |
+| Docs: the module doc's "The committed set"; `backed_through`'s comment (why counting `counted` is enough); `durability-and-failover.md` "Reconfiguration"; DESIGN §Seal-based failover | |
+
+No version bump, no compatibility shim: the wire fields are appended and mixed versions
+are unsupported, as for every C1 format.
+
+### Evidence (debug builds, the default clock-fault mix, base = main `5fc637d`)
+
+- Fail-before, sim: `c1_a_listing_counts_only_its_own_acknowledgements`
+  (`long-backup` 472 and 892, unclocked as the C0 pins are; no `root-group/*` key in
+  `uncommitted_acks`; `archive/*` keys stay, C2's) fails on the parent with
+  `root-group/exists` and `root-group/refused:ENOENT`.
+- Fail-before, core (`tests.rs`, `c1_counted`): `a_listing_counts_only_acknowledgements_given_under_it`,
+  `a_restarted_holder_counts_its_old_backup_only_from_the_new_listing`,
+  `a_fresh_backup_hold_restarts_the_count`, `a_removal_out_…` and `a_removal_in_doubt_acknowledges_only_what_the_staying_set_or_the_log_holds`.
+  Each fails with its rule reverted (`counted` replaced by `acked`; `ack_constraint_sets`
+  empty; `fresh` ignored): 2, 2 and 1 of the 5 fail respectively. (The API they need —
+  the `fresh` field — is not on the parent, so the parent itself cannot compile them.)
+  `a_lease_read_older_than_the_role_does_not_discard_the_tail` (the backup's side, from
+  the review) fails without the `on_takeover_get` arm: the stale read discarded the role.
+- C0 oracle counts, base → this commit (I1 total with its `root-group` keys; I2, I2c, I5
+  with the seeds they are in):
+
+  | Config (seeds) | I1 | I2 | I2c | I5 |
+  |---|---|---|---|---|
+  | `backup` (700..1300) | 968 → 955, root 0 → 0 | 6 (4) → 9 (8) | 9 (3) → 10 (5) | 69 (40) → 64 (39) |
+  | `backup-crash` (800..1400) | 1222 → 1219 | 42 (20) → 47 (17) | 1856 (495) → 1863 (493) | 1945 (520) → 1958 (521) |
+  | `backup-strict` (0..300) | 562 → 560 | 154 (57) → 177 (70) | 943 (242) → 918 (240) | 962 (247) → 951 (248); I4 0 → 1 |
+  | `acks3-crash` (900..1100) | 0 | 0 | 0 | 281 (152) → same |
+  | `long-backup` (0..1000) | 2183 → 2186, root 1 → 0 | 24 (15) → 31 (22) | 113 (26) → 110 (23) | 234 (102) → 240 (97) |
+  | `long-acks3` (0..300) | 0 | 10 (8) → same | 0 | 70 (45) → same |
+
+  The `archive/*` keys, I2, I2c, I4 and I5 are C2 to C5's and drift with the trajectories
+  (an acknowledgement that waits an append longer shifts timers); `root-group/*` is 0
+  where it was 1 to 2 per sweep.
+- Sweeps, mine against the parent, failing sets: `backup`, `backup-departs`,
+  `backup-partition`, `backup-reconfig-doubt`, `backup-two`, `backup-strict`,
+  `backup-crash`, `backup-hot` (2000 seeds each), `backup-crash-slow` (2000),
+  `long-backup` (0..1000), `long-acks3` (300), `locks-failover-backup`,
+  `-renew`, `-writes`, `locks-long-grants-seal`, `locks-restart-reclaim-seal`,
+  `double-seal-inside-the-grace`, `double-seal-after-the-grace`,
+  `fast-takeover-skewed-successor` (500 each), `delegated-backup`,
+  `delegated-holder-cut` (100 each): failing sets equal, except
+  `backup-crash-slow` 1357 (fails on the parent, an order violation of a rolled-back
+  acknowledged rid under the clock mix; passes here by trajectory shift, not
+  claimed fixed) and `double-seal-after-the-grace` 121 (the same vacuous-lock-workload
+  failure on both). Seeds with a `root-group/*` answer: 10 on the parent (above),
+  0 here.
+- Configurations with no backup (`acks3-crash`, `long-acks3`) have run fingerprints
+  equal seed by seed (one seed of `long-acks3` differs): the change is inert there.
+- Gates: `cargo fmt --check`; `clippy --workspace --all-targets -D warnings`; authority
+  lib (552) and sim suite (227 passed, 12 ignored) and `meta_repro`; net lib (124);
+  engine lib 837 (5 `owner_fence_tests` timing tests failed once under host load, all 54
+  of the module pass alone; unrelated to this change).
+- Perf (`ack-latency`, `bench/commit-rule`): pending, box (no real file systems on the
+  workstation). The steady state is unchanged by construction (one more compare in
+  `backed_through`); the listing's one-append wait and the removal flight's log wait are
+  the only added latency.
+
+### Authorized rewrites (pins)
+
+Pinned seeds (unclocked, `pinned::run_seed`) whose trajectories this commit shifted
+(old → new assertion unchanged, seeds changed):
+
+- `c0_i2_finds_a_rid_queued_twice`: `backup-crash` 815 and 892 → 927 and 1044 (4 copies
+  each); `delegated-holder-cut` 4 → 5.
+- `c0_i5_finds_a_non_lone_rollback`: `backup` 703 → 935.
+- `c0_i4_finds_a_late_landing`: `long-delegated-late-answers` 1, 8, 15 → 17, 19, 114.
+- `a_credited_arrival_cap_splits`: 198196 and 198507 → 194557 and 194698.
+- `a_late_renewal_against_a_stale_mirror_is_refused_and_the_naive_successor_violates`:
+  51, 163, 363 → 76, 98, 113.
+- `a_delegating_root_cut_from_s3_forms_no_epoch_and_fails_over`: 1604 leaves the set
+  (a 1.2 s failover, the class already excluded for 1610): 1600..1630 now shows 6 of
+  that class (1604, 1613, 1621, 1624, 1625, 1629), the set is the other eleven.
+
+### Not done here
+
+- The acknowledgement latency numbers on ext4, xfs, btrfs and tmpfs: pending, box.

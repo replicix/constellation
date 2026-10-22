@@ -1476,7 +1476,12 @@ A backup that hears nothing from its holder for
 syncs "epoch *e* sealed" and refuses every later epoch-*e* append. The
 old holder needs every listed backup's acknowledgement for anything it
 acknowledges, so after the seal it can acknowledge nothing more, whether
-it is dead, slow or only cut off from this backup. The backup then
+it is dead, slow or only cut off from this backup. (A backup counts only
+from acknowledgements of appends that carried a configuration version
+listing it, since a candidate drops its tail on any lease read that does
+not; and while a removal CAS is out, or its answer lost, an
+acknowledgement also rests on the staying backups, or the log when none
+stays.) The backup then
 re-reads the lease, CASes it to epoch *e*+1, tails S3 to head, ships its
 epoch marker (with `TailFollows`, so readers know the predecessor's tail
 comes back after it), re-ships its backup tail deduplicated by rid, and

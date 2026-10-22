@@ -1338,6 +1338,7 @@ pub trait PeerService: Send + Sync + 'static {
                 epoch,
                 acked: 0,
                 sealed: true,
+                fresh: false,
             }
         })
     }

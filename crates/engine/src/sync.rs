@@ -396,7 +396,7 @@ pub enum SyncRequest {
         reply: tokio::sync::oneshot::Sender<()>,
     },
     /// Plan 30 §M9: the holder streams journal transactions to this
-    /// node as its backup; answered with `(acked through, sealed)`.
+    /// node as its backup; answered with `(acked through, sealed, fresh)`.
     PeerBackupAppend {
         holder: u64,
         epoch: u64,
@@ -406,7 +406,7 @@ pub enum SyncRequest {
         txs: Vec<constellation_meta::BackupTx>,
         through: u64,
         expires_unix_ms: i64,
-        reply: tokio::sync::oneshot::Sender<(u64, bool)>,
+        reply: tokio::sync::oneshot::Sender<(u64, bool, bool)>,
     },
     /// Plan 37 §8: the holder this node backs is being replaced on its
     /// own state dir (`Payload::BackupHold`).

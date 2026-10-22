@@ -183,6 +183,22 @@ holds while the CAS that lists a `Local` holder's first backup is still
 out (its answer can take the S3 client's retry budget, and the candidate
 may be dropped meanwhile).
 
+A backup counts toward an acknowledgement only from the acknowledgements
+of appends that carried a `config_version` listing it. A candidate that
+is not listed yet drops its tail on any lease read that does not list it,
+so what it acknowledged before its listing landed proves nothing about
+what it keeps once listed; the holder sends it an append at the new
+version as soon as the listing lands, and acknowledgements parked behind
+the listing wait for that one round trip. A backup whose hold an append
+created (it had dropped its tail, or never had one) says so in its
+answer, and the holder restarts its count and its stream from that hold.
+While a removal CAS is out, or its answer is lost, an acknowledgement
+also needs the staying set — and the log, when no backup stays — whatever
+the held version lists: the version S3 may hold is the one that lists
+only the staying backups, which a claimant of the lease fetches nothing
+from. The wait for the log lasts the CAS's flight (or, with its answer
+lost, until the next lease version is adopted from S3).
+
 ### Seal-based failover
 
 A backup that has heard nothing from its holder for

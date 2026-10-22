@@ -580,6 +580,11 @@ pub enum PeerMsg {
         epoch: Epoch,
         acked: u64,
         sealed: bool,
+        /// Plan 43 C1-1: the backup's hold for this `(holder, epoch)` was
+        /// created by this very append (its earlier tail, if any, was
+        /// discarded or never held): `acked` is all it has, whatever the
+        /// holder counted before. The holder restarts its count from it.
+        fresh: bool,
     },
     /// Plan 30 §M9: pre-S3 streaming. The holder's backups hold `txs`
     /// (journal transactions of its tenure at `epoch`), evaluated against

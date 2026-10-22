@@ -883,7 +883,7 @@ pub struct Driver {
     promise_replies: HashMap<OpId, oneshot::Sender<(Option<i64>, u32)>>,
     /// Plan 30 §M9: the holder's `BackupAppend` requests this node is
     /// answering, by the core's op id.
-    backup_replies: HashMap<OpId, oneshot::Sender<(u64, bool)>>,
+    backup_replies: HashMap<OpId, oneshot::Sender<(u64, bool, bool)>>,
     controls: HashMap<OpId, ControlReply>,
     next_control: u64,
     /// Whether this node holds (from the last refresh), for the tickers.
@@ -4763,11 +4763,12 @@ impl Driver {
                 epoch,
                 acked,
                 sealed,
+                fresh,
             } => {
                 let _ = epoch;
                 tracing::trace!(target: "constellation::fwd", req = req.0, "append reply sent");
                 if let Some(tx) = self.backup_replies.remove(&req) {
-                    let _ = tx.send((acked, sealed));
+                    let _ = tx.send((acked, sealed, fresh));
                 }
             }
             PeerMsg::BackupAppend {
@@ -4843,6 +4844,7 @@ impl Driver {
                             epoch,
                             acked,
                             sealed,
+                            fresh,
                         })) if req_id == req.0 => {
                             let _ = tx.send(Internal::Event(Event::Peer {
                                 from: to,
@@ -4851,6 +4853,7 @@ impl Driver {
                                     epoch,
                                     acked,
                                     sealed,
+                                    fresh,
                                 },
                             }));
                         }

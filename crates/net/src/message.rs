@@ -536,6 +536,9 @@ pub enum Payload {
         epoch: u64,
         acked: u64,
         sealed: bool,
+        /// Plan 43 C1-1: this append created the backup's hold (see
+        /// `PeerMsg::BackupAck::fresh`).
+        fresh: bool,
     },
     /// Plan 30 §M9: pre-S3 streaming — backup-acked transactions
     /// (postcard of `Vec<BackupTx>`) evaluated against the log through

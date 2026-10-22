@@ -783,6 +783,7 @@ impl constellation_net::PeerService for P2pBridge {
                 epoch,
                 acked: 0,
                 sealed: true,
+                fresh: false,
             };
             if crate::fault::p2p_denied(holder) {
                 // Fault injection: the link is cut; no answer.
@@ -821,11 +822,12 @@ impl constellation_net::PeerService for P2pBridge {
                 return refuse;
             }
             let out = match receive.await {
-                Ok((acked, sealed)) => constellation_net::Payload::BackupAck {
+                Ok((acked, sealed, fresh)) => constellation_net::Payload::BackupAck {
                     req_id,
                     epoch,
                     acked,
                     sealed,
+                    fresh,
                 },
                 Err(_) => refuse,
             };

@@ -8990,6 +8990,8 @@ mod pipelined_appends {
                 unreachable: false,
                 answers_beats: false,
                 acked: 0,
+                listed_at: None,
+                counted: 0,
                 sent_through: 0,
                 inflight: Default::default(),
                 last_sent: WaitMs(0),
@@ -9020,6 +9022,7 @@ mod pipelined_appends {
                 epoch: 1,
                 acked,
                 sealed: false,
+                fresh: false,
             },
         })
     }
@@ -10840,6 +10843,8 @@ mod backup_crash {
             unreachable: false,
             answers_beats: false,
             acked,
+            listed_at: None,
+            counted: 0,
             sent_through: acked,
             inflight: Default::default(),
             last_sent: w(h.now),
@@ -27281,6 +27286,7 @@ fn a_candidate_that_sealed_the_epoch_is_not_reinvited() {
                         epoch: 1,
                         acked: 0,
                         sealed: true,
+                        fresh: false,
                     },
                 });
             }
@@ -34025,5 +34031,433 @@ mod recall_cut {
             "{replies:?}"
         );
         assert!(!h.core.has_stream_parks());
+    }
+}
+
+/// Plan 43 C1-1: the root group's commit holds across a listing and a
+/// removal. What a backup counts for is what it acknowledged to an append
+/// that carried a version listing it (`BackupPeer::counted`), and while a
+/// removal CAS is out or in doubt an acknowledgement rests on the staying
+/// set too (the log, when none stays).
+mod c1_counted {
+    use super::*;
+    use constellation_meta::{JournalPos, Position};
+    use constellation_store_s3::AckPolicy;
+
+    fn pos(jseq: u64) -> Position {
+        Position {
+            seq: 0,
+            pending: Some(JournalPos { epoch: 1, jseq }),
+            streams: Default::default(),
+        }
+    }
+
+    /// The appends to node 2 in `out`: (request, first row, version).
+    fn appends(out: &[Action]) -> Vec<(OpId, u64, u64)> {
+        out.iter()
+            .filter_map(|a| match a {
+                Action::Send {
+                    to: 2,
+                    msg:
+                        PeerMsg::BackupAppend {
+                            req,
+                            from,
+                            config_version,
+                            ..
+                        },
+                } => Some((*req, *from, *config_version)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A holder (config version `cv`, `Local`, nobody listed) with node 2
+    /// as its candidate backup.
+    fn holder(cv: u64) -> Harness {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        h.core.lease.held.as_mut().unwrap().0.config_version = cv;
+        h.core.ack.candidate = Some(2);
+        h.core.ack.peers.insert(
+            2,
+            crate::core::backup::BackupPeer {
+                candidacy: 1,
+                alive_at: w(h.now),
+                short_since_progress: false,
+                short_since: w(h.now),
+                unreachable: false,
+                answers_beats: false,
+                acked: 0,
+                listed_at: None,
+                counted: 0,
+                sent_through: 0,
+                inflight: Default::default(),
+                last_sent: WaitMs(0),
+                last_progress: w(h.now),
+                committed: false,
+            },
+        );
+        h
+    }
+
+    fn journal(h: &Harness, name: &str, seq: u64) -> u64 {
+        constellation_meta::execute_mutate(&h.meta, &h.create(name), Some(h.rid(seq))).unwrap();
+        h.meta.journal_tip().unwrap()
+    }
+
+    /// Journal a row and let the core stream it: the append it went in.
+    fn row(h: &mut Harness, name: &str, seq: u64) -> (u64, (OpId, u64, u64)) {
+        let tip = journal(h, name, seq);
+        let out = h.step(Event::Control {
+            op: OpId(900 + seq),
+            req: Control::Journaled,
+        });
+        let sent = appends(&out);
+        assert_eq!(sent.len(), 1, "one append for the row: {out:?}");
+        (tip, sent[0])
+    }
+
+    fn ack(h: &mut Harness, req: OpId, acked: u64, fresh: bool) -> Vec<Action> {
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::BackupAck {
+                req,
+                epoch: 1,
+                acked,
+                sealed: false,
+                fresh,
+            },
+        })
+    }
+
+    fn swap_op(out: &[Action]) -> OpId {
+        s3_ops(out)
+            .into_iter()
+            .find(|(_, r)| matches!(r, S3Op::LeaseSwap { .. }))
+            .map(|(op, _)| op)
+            .unwrap_or_else(|| panic!("no lease swap in {out:?}"))
+    }
+
+    /// The reconfiguration to `backups` is issued and its CAS answers.
+    fn reconfigure(
+        h: &mut Harness,
+        backups: Vec<NodeId>,
+        answer: Result<(), CasFailure>,
+    ) -> Vec<Action> {
+        h.advance(400);
+        let mut out = Vec::new();
+        h.core.issue_reconfig(h.clk(), backups, &h.meta, &mut out);
+        let op = swap_op(&out);
+        h.advance(10);
+        h.step(Event::S3 {
+            op,
+            result: S3Result::LeasePut(answer.map(|()| tag())),
+        })
+    }
+
+    /// 892: the candidate acknowledged rows at the version before its
+    /// listing; the listing lands; the acknowledgements given under the
+    /// old version count for nothing. Fails on the parent: `ack_need` was
+    /// `None` from the landing, on the running maximum of the candidate's
+    /// acknowledgements.
+    #[test]
+    fn a_listing_counts_only_acknowledgements_given_under_it() {
+        let mut h = holder(1);
+        let (tip1, (req1, _, cv)) = row(&mut h, "a", 1);
+        assert_eq!(cv, 1);
+        ack(&mut h, req1, tip1, false);
+        // Row R: its append (at the old version) is still in flight.
+        let (tip2, (req2, _, _)) = row(&mut h, "r", 2);
+        // The listing lands.
+        reconfigure(&mut h, vec![2], Ok(()));
+        assert_eq!(h.core.lease.backups(), &[2]);
+        let p = &h.core.ack.peers[&2];
+        assert!(p.committed);
+        assert_eq!(p.listed_at, Some(2));
+        assert_eq!(
+            h.core.ack_need(&pos(tip1)),
+            Some(tip1),
+            "what the candidate acknowledged before it was listed counts for nothing"
+        );
+        // The late acknowledgement of the old-version append says nothing
+        // either.
+        let out = ack(&mut h, req2, tip2, false);
+        assert_eq!(h.core.ack_need(&pos(tip2)), Some(tip2));
+        // Its own append at the listing's version is due at once (the
+        // backup is caught up and idle: no row to ride, no heartbeat for
+        // a while).
+        let listed = appends(&out);
+        assert_eq!(listed.len(), 1, "an append at the new version: {out:?}");
+        assert_eq!(listed[0].2, 2);
+        ack(&mut h, listed[0].0, tip2, false);
+        assert_eq!(h.core.ack_need(&pos(tip2)), None);
+        assert_eq!(h.core.ack.peers[&2].counted, tip2);
+    }
+
+    /// 892, the discard: the candidate read the lease unlisted while the
+    /// listing was in flight and dropped its tail; the append at the
+    /// listing's version creates its hold anew (`fresh`) and says so. The
+    /// holder restarts its count and its stream from that hold: before,
+    /// `acked` kept the discarded maximum and the stream never filled the
+    /// backup's gap (it was dropped at the ack timeout instead).
+    #[test]
+    fn a_fresh_backup_hold_restarts_the_count() {
+        let mut h = holder(1);
+        let (tip1, (req1, _, _)) = row(&mut h, "a", 1);
+        ack(&mut h, req1, tip1, false);
+        let (tip2, (req2, _, _)) = row(&mut h, "r", 2);
+        ack(&mut h, req2, tip2, false);
+        let out = reconfigure(&mut h, vec![2], Ok(()));
+        let listed = appends(&out);
+        assert_eq!(listed.len(), 1, "an append at the new version: {out:?}");
+        // The backup has nothing: its hold was created by this append.
+        let out = ack(&mut h, listed[0].0, 0, true);
+        let p = &h.core.ack.peers[&2];
+        assert_eq!((p.acked, p.counted), (0, 0));
+        assert_eq!(h.core.ack_need(&pos(tip2)), Some(tip2));
+        // The stream resumes from what it holds, the whole journal.
+        let resend = appends(&out);
+        assert_eq!(resend.len(), 1, "a resend from the empty hold: {out:?}");
+        assert_eq!((resend[0].1, resend[0].2), (1, 2));
+        ack(&mut h, resend[0].0, tip2, false);
+        let p = &h.core.ack.peers[&2];
+        assert_eq!((p.acked, p.counted), (tip2, tip2));
+        assert_eq!(h.core.ack_need(&pos(tip2)), None);
+    }
+
+    /// 472: a restarted holder re-adopted its own lease (version 3, no
+    /// backups) and re-invited its old backup, whose old-tenure tail
+    /// satisfied the candidate's first acknowledgements at once; the
+    /// listing (version 4) counts none of them.
+    #[test]
+    fn a_restarted_holder_counts_its_old_backup_only_from_the_new_listing() {
+        let mut h = holder(3);
+        let (tip1, (req1, _, cv)) = row(&mut h, "a", 1);
+        assert_eq!(cv, 3);
+        // The old backup holds more than this process has streamed yet.
+        ack(&mut h, req1, tip1 + 4, false);
+        assert_eq!(h.core.ack.peers[&2].counted, 0);
+        let out = reconfigure(&mut h, vec![2], Ok(()));
+        assert_eq!(h.core.ack.peers[&2].listed_at, Some(4));
+        assert_eq!(h.core.ack_need(&pos(tip1)), Some(tip1));
+        // Its acknowledgement of an append at the listing's version
+        // counts.
+        let listed = appends(&out);
+        assert_eq!(listed.len(), 1, "{out:?}");
+        assert_eq!(listed[0].2, 4);
+        ack(&mut h, listed[0].0, tip1 + 4, false);
+        assert_eq!(h.core.ack_need(&pos(tip1)), None);
+    }
+
+    /// A holder with node 2 listed (version 2) and caught up through the
+    /// row it returns, which is in the log already.
+    fn listed_holder() -> (Harness, u64) {
+        let mut h = holder(1);
+        let (tip1, (req1, _, _)) = row(&mut h, "a", 1);
+        ack(&mut h, req1, tip1, false);
+        let out = reconfigure(&mut h, vec![2], Ok(()));
+        let listed = appends(&out);
+        assert_eq!(listed.len(), 1, "{out:?}");
+        ack(&mut h, listed[0].0, tip1, false);
+        assert_eq!(h.core.ack_need(&pos(tip1)), None);
+        // Everything acknowledged is in the log: the removal of the last
+        // backup is safe to issue (`removal_safe`).
+        h.core.note_shipped(&[tip1], tip1);
+        // Nobody else in budget: `Local` after the removal.
+        h.core.ack.eligible = Some(false);
+        (h, tip1)
+    }
+
+    /// The removal of the last backup, its CAS out: a row the backup
+    /// acknowledges meanwhile rests, once the CAS lands, on this disk
+    /// alone under a version that lists nobody. It waits for the log.
+    /// Fails on the parent: the held set (the backup being removed)
+    /// released it.
+    #[test]
+    fn a_removal_out_acknowledges_only_what_the_staying_set_or_the_log_holds() {
+        let (mut h, _) = listed_holder();
+        h.advance(400);
+        let mut out = Vec::new();
+        h.core
+            .issue_reconfig(h.clk(), Vec::new(), &h.meta, &mut out);
+        let op = swap_op(&out);
+        assert!(h.core.ack.reconfig.is_some(), "the removal is out");
+        let (tip, (req, _, _)) = row(&mut h, "r", 2);
+        ack(&mut h, req, tip, false);
+        assert_eq!(h.core.ack.peers[&2].counted, tip);
+        assert_eq!(
+            h.core.ack_need(&pos(tip)),
+            Some(tip),
+            "acknowledged on the backup being removed, which no version after lists"
+        );
+        // The log carries it: released.
+        h.core.note_shipped(&[tip], tip);
+        assert_eq!(h.core.ack_need(&pos(tip)), None);
+        // The landing: `Local`, nobody gates.
+        h.advance(10);
+        h.step(Event::S3 {
+            op,
+            result: S3Result::LeasePut(Ok(tag())),
+        });
+        assert_eq!(h.core.lease.ack_policy(), AckPolicy::Local);
+        let (tip3, _) = {
+            let t = journal(&h, "s", 3);
+            (t, ())
+        };
+        assert_eq!(h.core.ack_need(&pos(tip3)), None);
+    }
+
+    /// The same with the CAS's answer lost: it may have landed, and S3
+    /// may list nobody while this node still holds the version that lists
+    /// the backup.
+    #[test]
+    fn a_removal_in_doubt_acknowledges_only_what_the_staying_set_or_the_log_holds() {
+        let (mut h, _) = listed_holder();
+        let out = reconfigure(
+            &mut h,
+            Vec::new(),
+            Err(CasFailure::Failed("timed out".into())),
+        );
+        let _ = out;
+        assert!(h.core.ack.reconfig.is_none());
+        assert_eq!(
+            h.core.lease.backups(),
+            &[2],
+            "the held version still lists it"
+        );
+        let (tip, (req, _, _)) = row(&mut h, "r", 2);
+        ack(&mut h, req, tip, false);
+        assert_eq!(h.core.ack.peers[&2].counted, tip);
+        assert_eq!(
+            h.core.ack_need(&pos(tip)),
+            Some(tip),
+            "acknowledged on a backup S3 may no longer list"
+        );
+        h.core.note_shipped(&[tip], tip);
+        assert_eq!(h.core.ack_need(&pos(tip)), None);
+    }
+
+    /// The backup's side of the listing (C1-1 review): a lease read the
+    /// silence watch issued before the listing landed, answered after this
+    /// node acknowledged an append at the listing's version, shows the
+    /// version before it, which does not list this node. It is older than
+    /// what this node acknowledged (the holder sends a version only once
+    /// its CAS landed, and versions only grow): S3 lists this node, and the
+    /// holder counts that acknowledgement (`BackupPeer::counted`). The tail
+    /// stays. Fails on the parent: the catch-all discarded it, and the rows
+    /// the holder counted were on no backup's disk.
+    #[test]
+    fn a_lease_read_older_than_the_role_does_not_discard_the_tail() {
+        let append = |req, config_version, txs| Event::Peer {
+            from: 1,
+            msg: PeerMsg::BackupAppend {
+                req: OpId(req),
+                epoch: 1,
+                holder: 1,
+                config_version,
+                from: 1,
+                txs,
+                through: 0,
+                candidacy: 1,
+                expires_unix_ms: 0,
+            },
+        };
+        let mut h = Harness::new(2);
+        // A candidate at version 1.
+        let out = h.step(append(7, 1, Vec::new()));
+        let watch = timers(&out, TimerKind::BackupWatch)[0];
+        // The holder is slow: the watch reads the lease (version 1).
+        h.advance(2_000);
+        let read = h.step(Event::Timer { id: watch });
+        // The listing (version 2) lands meanwhile; the holder's append at
+        // it carries row 1, which this node acknowledges.
+        h.advance(100);
+        let row = constellation_meta::BackupTx {
+            first: 1,
+            last: 1,
+            records: vec![constellation_meta::LogRecord::Completed { rid: h.rid(1) }],
+            origin: (0, 0),
+        };
+        let out = h.step(append(8, 2, vec![row]));
+        assert!(
+            matches!(
+                sends(&out).as_slice(),
+                [(
+                    1,
+                    PeerMsg::BackupAck {
+                        acked: 1,
+                        sealed: false,
+                        ..
+                    }
+                )]
+            ),
+            "{out:?}"
+        );
+        // The read answers late with the version before the listing.
+        h.advance(100);
+        let mut before = root_lease(1, 1, h.now.plus(50_000));
+        before.config_version = 1;
+        answer_job_read(&mut h, &read, before);
+        assert!(
+            h.core.bk.role.is_some_and(|r| r.config_version == 2),
+            "a stale read discarded the role"
+        );
+        assert_eq!(h.core.bk.acked, 1, "a stale read discarded the tail");
+        assert_eq!(h.meta.backup_tail(1).unwrap().len(), 1);
+        assert_eq!(h.core.bk.sealed, 0);
+    }
+
+    /// The same with the appends reordered: the holder's last append at
+    /// the version before the listing arrives after its first one at the
+    /// listing's version. The role's version never
+    /// goes back (it is the highest version this node acknowledged at),
+    /// so the stale read is still recognised. Fails without the monotonic
+    /// role version: the late append lowered it to the read's.
+    #[test]
+    fn a_late_append_at_an_older_version_does_not_lower_the_role() {
+        let append = |req, config_version, from, txs| Event::Peer {
+            from: 1,
+            msg: PeerMsg::BackupAppend {
+                req: OpId(req),
+                epoch: 1,
+                holder: 1,
+                config_version,
+                from,
+                txs,
+                through: 0,
+                candidacy: 1,
+                expires_unix_ms: 0,
+            },
+        };
+        let tx = |h: &Harness, jseq: u64| constellation_meta::BackupTx {
+            first: jseq,
+            last: jseq,
+            records: vec![constellation_meta::LogRecord::Completed { rid: h.rid(jseq) }],
+            origin: (0, 0),
+        };
+        let mut h = Harness::new(2);
+        let out = h.step(append(7, 1, 1, Vec::new()));
+        let watch = timers(&out, TimerKind::BackupWatch)[0];
+        h.advance(2_000);
+        let read = h.step(Event::Timer { id: watch });
+        h.advance(100);
+        // The holder sent row 1 at version 1, then the listing landed and
+        // it sent row 2 at version 2; row 2's append arrives first.
+        let row1 = tx(&h, 1);
+        let row2 = tx(&h, 2);
+        h.step(append(9, 2, 2, vec![row2]));
+        h.step(append(8, 1, 1, vec![row1]));
+        assert_eq!(h.core.bk.acked, 2);
+        assert!(
+            h.core.bk.role.is_some_and(|r| r.config_version == 2),
+            "a late append lowered the role's version: {:?}",
+            h.core.bk.role
+        );
+        h.advance(100);
+        let mut before = root_lease(1, 1, h.now.plus(50_000));
+        before.config_version = 1;
+        answer_job_read(&mut h, &read, before);
+        assert!(h.core.bk.role.is_some(), "a stale read discarded the role");
+        assert_eq!(h.core.bk.acked, 2, "a stale read discarded the tail");
     }
 }

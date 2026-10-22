@@ -140,6 +140,11 @@ pub struct ReconfigDoubt {
     /// this tenure with its tail, so an acknowledgement rests on each as
     /// on a committed backup (`Core::durable_jseq`).
     pub backups: Vec<NodeId>,
+    /// Plan 43 C1-1: the backup set of every one of them, an empty one
+    /// (a removal of the last backup) included, each a constraint of its
+    /// own on what an acknowledgement rests on
+    /// (`Core::ack_constraint_sets`). `backups` is who may seal.
+    pub sets: Vec<Vec<NodeId>>,
 }
 
 impl LeaseState {

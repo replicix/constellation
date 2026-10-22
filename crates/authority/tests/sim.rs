@@ -4587,8 +4587,11 @@ fn a_delegating_root_cut_from_s3_forms_no_epoch_and_fails_over() {
     // (L3): its trajectory shifted, and the first mutation answered after
     // the crash came 1.2 s in, before the seal (a failover the measure
     // counts but no seal-and-floor one); the same 1.1 to 1.2 s class shows
-    // on the parent at 1615 and 1628. 1612 takes its place.)
-    for seed in (1600..1610).chain(1611..1613) {
+    // on the parent at 1615 and 1628. 1612 takes its place. Plan 43 C1-1's
+    // listed-acknowledgement count shifts more of them: 6 of 1600..1630
+    // (1604, 1613, 1621, 1624, 1625, 1629: 1.1 to 1.3 s). 1604 leaves the
+    // set; 1613 never joined it.)
+    for seed in (1600..1604).chain(1605..1610).chain(1611..1613) {
         let report = run_seed(seed, delegated_holder_cut_config()).unwrap_or_else(|e| {
             panic!(
                 "delegated-holder-cut seed {seed}: {e}\n  replay with \
@@ -8822,7 +8825,8 @@ fn a_second_seal_after_the_grace_arms_no_second_floor() {
 /// the first successor's floor early, it clears the mark it inherited, and
 /// the CAS it then needs, then the mark CAS before its first grant, delay
 /// that grant past the old grant's window: 7 of the 10 000 seeds
-/// 193000..203000 still fail.) The
+/// 193000..203000 still fail; since plan 43 C1-1's listed-acknowledgement
+/// count 5 of 193000..199000 fail, 193262, 194557 and 194698 pinned.) The
 /// real cap is not clean over every range: it violates at the *second*
 /// failover (about 15 s, a clock beyond the envelope), a different and
 /// older failure (`fast_takeover_skewed_successor_known_gaps`), so the
@@ -8831,7 +8835,7 @@ fn a_second_seal_after_the_grace_arms_no_second_floor() {
 #[test]
 fn a_credited_arrival_cap_splits() {
     use pinned::run_seed;
-    for seed in [193_262, 198_196, 198_507] {
+    for seed in [193_262, 194_557, 194_698] {
         let e = run_seed(seed, fast_takeover_skewed_successor_credited_config())
             .expect_err("a cap counted from the credit never failed: no control");
         assert!(e.contains("mutual exclusion violated"), "seed {seed}: {e}");
@@ -9024,11 +9028,13 @@ fn a_lapsed_locker_resumes_when_the_owner_admits_a_late_renewal() {
 /// refused. `locks-late-stale-mirror`: 0 violations in 2 000 seeds; the same
 /// run with a successor that trusts such a mirror
 /// (`Config::lock_trust_nonfinal_mirror`; `-naive`) violates mutual
-/// exclusion — in 8 of the first 500 seeds, which are pinned.
+/// exclusion — in 8 of the first 500 seeds, which were pinned (19 since plan
+/// 43 C1-1's listed-acknowledgement count: 34, 76, 98, 106, 113, 203, 318 and
+/// 336 are pinned).
 #[test]
 fn a_late_renewal_against_a_stale_mirror_is_refused_and_the_naive_successor_violates() {
     use pinned::run_seed;
-    for seed in [34u64, 51, 106, 163, 203, 318, 336, 363] {
+    for seed in [34u64, 76, 98, 106, 113, 203, 318, 336] {
         run_seed(seed, locks_late_stale_mirror_config())
             .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         let e = run_seed(seed, locks_late_stale_mirror_naive_config())
@@ -10783,6 +10789,34 @@ fn c0_i1_finds_no_uncommitted_group_answer_under_backup() {
     println!("backup 700..760: {seen} archive-class answers uncommitted, {groups} root-group answers judged");
 }
 
+/// Plan 43 C1-1: a backup counts only from acknowledgements given to an
+/// append that carried a version listing it, and a removal lands covered.
+/// `long-backup` seed 892: a candidate acknowledged rows at the version
+/// before its listing, read the lease while the listing CAS was in flight
+/// (unlisted: it discarded its tail), the CAS landed, and the rows the
+/// candidate no longer held were counted (`root-group/refused:ENOENT`).
+/// Seed 472: a restarted holder re-adopted its own lease with no backups,
+/// re-invited its old backup, which discarded its old-tenure tail on a
+/// lease read just before the listing landed (`root-group/exists`). Both
+/// carried a `root-group/*` key in `uncommitted_acks` before the fix (and
+/// failed under `+commit` on it); `archive/*` keys (a fresh tenure
+/// answering another node's forward before a backup: C2's) stay allowed,
+/// which is why `+commit` stays off here until C2.
+#[test]
+fn c1_a_listing_counts_only_its_own_acknowledgements() {
+    use pinned::c0_run;
+    for seed in [472u64, 892] {
+        let r = c0_run("long-backup", seed, long_backup_config());
+        for (k, n) in &r.uncommitted_acks {
+            assert!(
+                k.starts_with("archive/"),
+                "long-backup seed {seed}: an answer expected under {k} was uncommitted ({n}): {:?}",
+                r.oracle_examples
+            );
+        }
+    }
+}
+
 /// A single node answers its own clients: Lone (or Archive), never a
 /// violation; every counter of every oracle is zero.
 #[test]
@@ -11103,15 +11137,22 @@ fn c0_i5_finds_a_non_lone_rollback() {
 /// `long-delegated` (no backup anywhere): `uncommitted_acks["deleg-group/ok"]`.
 const I1_LONG_DELEGATED: &[u64] = &[0, 1, 2];
 /// `backup-crash`: `identity_copies`.
-const I2_BACKUP_CRASH: &[u64] = &[815, 858, 889, 892];
+/// (815 and 892, whose trajectories plan 43 C1-1's listed-acknowledgement count
+/// shifted to no copy, gave their places to 927 and 1044: 4 copies each,
+/// `+identity` fails with I2.)
+const I2_BACKUP_CRASH: &[u64] = &[858, 889, 927, 1044];
 /// `delegated-holder-cut`: `identity_copies`.
 /// (22, whose trajectory plan 43 C7-F F-a0's live-delegation mark shifted to
-/// no copy, gave its place to 3: 3 copies, `+identity` fails with I2.)
-const I2_DELEGATED_HOLDER_CUT: &[u64] = &[0, 3, 4];
+/// no copy, gave its place to 3: 3 copies, `+identity` fails with I2. 4, whose
+/// trajectory plan 43 C1-1's listed-acknowledgement count shifted to no copy,
+/// gave its place to 5: 3 copies.)
+const I2_DELEGATED_HOLDER_CUT: &[u64] = &[0, 3, 5];
 /// `backup-crash`: `non_verbatim`.
 const I2C_BACKUP_CRASH: &[u64] = &[800, 802, 803];
 /// `backup`: `non_lone_rollbacks`.
-const I5_BACKUP: &[u64] = &[703, 746, 819, 931];
+/// (703, whose trajectory plan 43 C1-1's listed-acknowledgement count shifted
+/// to no rollback, gave its place to 935: 1 rollback, `+lone` fails with I5.)
+const I5_BACKUP: &[u64] = &[746, 819, 931, 935];
 /// The paused configurations of `long-delegated-late-answers` where the
 /// sim's `RebuildReplica` fires (9287 and 2945 still do).
 const REBUILD_SEEDS: [u64; 2] = [9287, 2945];
@@ -11122,6 +11163,8 @@ const I4_SEEDS: &[I4Seeds] = &[(
     long_delegated_late_answers_config,
     // (6, whose trajectory plan 43 C7-F F-a0's live-delegation mark shifted
     // to no late landing, gave its place to 15: 2 late landings, `+settle`
-    // fails with I4.)
-    &[1, 8, 15],
+    // fails with I4. 1, 8 and 15, whose trajectories plan 43 C1-1's
+    // listed-acknowledgement count shifted to none, gave their places to
+    // 17, 19 and 114: 1, 1 and 2 late landings.)
+    &[17, 19, 114],
 )];
