@@ -2163,3 +2163,70 @@ fn one_copy_call_is_capped_at_a_few_chunks() {
     c.close(dst, d.fh).unwrap();
     assert!(contents(&c, dst) == data);
 }
+
+/// A listing with attributes, as plus entries answer it (plan 40): the
+/// names of a directory, then a lookup of each.
+fn list_with_attributes(c: &Client, dir: Ino) -> Vec<Entry> {
+    c.readdir(dir, 0, 10_000)
+        .unwrap()
+        .iter()
+        .filter(|(name, _)| name != "." && name != "..")
+        .map(|(name, _)| c.lookup(dir, name).unwrap())
+        .collect()
+}
+
+/// Plan 45, the first priority: a listing with attributes of a directory
+/// whose names are all their inodes' only name answers every entry from
+/// the dentry's copy and reads no `0x01` record for it.
+#[test]
+fn a_listing_of_single_name_entries_reads_no_inode() {
+    let c = client();
+    let d = c.mkdir(ROOT_INO, "d").unwrap().attr.ino;
+    for i in 0..40 {
+        c.put(d, &format!("f{i}"), b"data");
+    }
+    c.mkdir(d, "sub").unwrap();
+    let before = c._meta.inode_reads();
+    let listed = list_with_attributes(&c, d);
+    assert_eq!(listed.len(), 41);
+    assert!(listed
+        .iter()
+        .all(|e| e.attr.nlink == 1 || e.attr.nlink == 2));
+    assert_eq!(
+        c._meta.inode_reads(),
+        before,
+        "a name that is its inode's only name needs no 0x01 read"
+    );
+}
+
+/// The designed cost of a hard link: one `0x01` point read per hard-linked
+/// entry, and the entry answers what `getattr` answers.
+#[test]
+fn a_listing_of_hard_linked_entries_reads_each_inode_once_per_entry() {
+    let c = client();
+    let d = c.mkdir(ROOT_INO, "d").unwrap().attr.ino;
+    let f = c.put(d, "f", b"data");
+    for i in 0..10 {
+        Blocking::run(|r| {
+            c.view
+                .link(&c.cx(OpKind::Link), f, d, Name::new(&format!("h{i}")), r)
+        })
+        .unwrap();
+    }
+    for i in 0..5 {
+        c.put(d, &format!("single{i}"), b"x");
+    }
+    let before = c._meta.inode_reads();
+    let listed = list_with_attributes(&c, d);
+    assert_eq!(listed.len(), 16);
+    assert_eq!(
+        c._meta.inode_reads() - before,
+        11,
+        "f's eleven names cost one read each, the five single names none"
+    );
+    let want = c.getattr(f).unwrap();
+    for e in listed.iter().filter(|e| e.attr.ino == f) {
+        assert_eq!((e.attr.nlink, e.attr.size), (11, want.size));
+        assert_eq!(e.attr.nlink, want.nlink);
+    }
+}

@@ -1069,6 +1069,78 @@ mod tests {
         }
     }
 
+    /// Plan 45: the names of a hard-linked file publish as remote
+    /// dentries, the reader returns them as such (attributes one `0x01`
+    /// read away), the form check passes, and a bootstrap copies every
+    /// `0x02` and `0x04` value verbatim.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_hard_link_publishes_remote_dentries_that_bootstrap_verbatim() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let meta = Arc::new(crate::mtree_publish::test_meta());
+        let d = meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap().ino;
+        let e = meta.mkdir(ROOT_INO, "e", 0o755, 0, 0).unwrap().ino;
+        let f = meta.create(d, "f", 0o644, 0, 0).unwrap().ino;
+        meta.set_manifest(f, b"m", 4096).unwrap();
+        let single = meta.create(d, "single", 0o644, 0, 0).unwrap().ino;
+        meta.link(f, e, "f2").unwrap();
+        meta.link(f, e, "f3").unwrap();
+
+        let pub_dir = TempDir::new().unwrap();
+        let mut publisher = TreePublisher::new(
+            Arc::clone(&meta),
+            cold_cache(Arc::clone(&store), &pub_dir),
+            BlobStore::new(Arc::clone(&store), Hasher::Plain),
+            CommitChain::new(Arc::clone(&store)),
+            record::config(),
+            1,
+        );
+        let commit = publisher.publish(1).await.unwrap().unwrap();
+
+        let read_dir = TempDir::new().unwrap();
+        let cache = cold_cache(Arc::clone(&store), &read_dir);
+        cache.refresh_catalog().await.unwrap();
+        let reader = TreeReader::new(
+            Tree::with_config(cache, record::config()).unwrap(),
+            commit.root(SHARD0).unwrap(),
+        );
+        tokio::task::spawn_blocking(move || {
+            for (dir, name) in [(d, "f"), (e, "f2"), (e, "f3")] {
+                let entry = reader.lookup(dir, name.as_bytes()).unwrap().unwrap();
+                assert_eq!((entry.ino, entry.kind), (f, record::Kind::File), "{name}");
+                assert_eq!(entry.attrs, None, "{name} holds no copy");
+            }
+            let one = reader.lookup(d, b"single").unwrap().unwrap();
+            let held = reader.getattr(single).unwrap().unwrap().attrs;
+            assert_eq!(one.attrs, Some(held));
+            assert_eq!(reader.getattr(f).unwrap().unwrap().attrs.nlink, 3);
+            let listed = reader.readdir(e, None, usize::MAX).unwrap();
+            assert_eq!(listed.len(), 2);
+            assert!(listed.iter().all(|entry| entry.attrs.is_none()));
+            let forms = reader.check_dentry_forms().unwrap();
+            assert_eq!((forms.checked, forms.violations), (6, 0), "{forms:?}");
+        })
+        .await
+        .unwrap();
+
+        let boot_dir = TempDir::new().unwrap();
+        let boot_reader =
+            ChainReader::for_store(Arc::clone(&store), None, boot_dir.path()).unwrap();
+        let fresh = Arc::new(crate::mtree_publish::test_meta());
+        bootstrap_from_commit(&boot_reader, Arc::clone(&fresh))
+            .await
+            .unwrap()
+            .unwrap();
+        let namespace = |m: &Meta| -> Vec<(Vec<u8>, Vec<u8>)> {
+            m.ns_dump()
+                .unwrap()
+                .into_iter()
+                .filter(|(k, _)| matches!(k.first(), Some(0x02 | 0x04)))
+                .collect()
+        };
+        assert_eq!(namespace(&fresh), namespace(&meta));
+        assert_eq!(fresh.lookup(e, "f2").unwrap().unwrap().nlink, 3);
+    }
+
     /// The first publish after a bootstrap is a small delta, not a
     /// rebuild: the ingestion-loaded content is not dirty
     /// (`Meta::clear_all_dirty`), so only the one key a post-bootstrap

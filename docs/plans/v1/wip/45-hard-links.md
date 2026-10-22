@@ -314,32 +314,45 @@ under a timeout.
   (`crates/meta`):
   - `link_cost_is_flat_in_the_link_count` (**fail-before**): a `link` and
     an `unlink` at *n* = 500 change at most 6 `ns` keys (today *n*+5);
-    `chmod` and a manifest commit at *n* = 500 change 2 (today *n*+1);
-  - `every_mutation_keeps_each_dentry_in_the_right_form` (above;
-    **fail-before**: the naive skip of the copy loop leaves a stale `Full`
-    copy after the 1 → 2 transition);
-  - `unlink_to_one_name_materialises_the_copy`,
+    `chmod`, a chown and a manifest commit at *n* = 500 change exactly the
+    inode's own key (today *n*+1);
+  - `every_transition_keeps_each_dentry_in_the_right_form_locally_and_on_replay`
+    (`tests/hardlink.rs`: 1 → 2 → 3 → 2 → 1 → 0, a manifest commit, a chmod
+    and an xattr at three names, a rename, an exchange of two hard-linked
+    files, a rename over a hard-linked target, each step checked on the node
+    and on a replica that replays the log batch by batch) and the in-crate
+    `every_mutation_keeps_each_dentry_in_the_right_form_locally_and_on_replay`
+    (plan 29's long scenario, form-aware); **fail-before**: the naive skip of
+    the copy loop leaves a stale `Full` copy after the 1 → 2 transition;
+  - `the_first_link_rewrites_the_one_existing_name_and_no_other`,
+    `unlink_to_one_name_materialises_the_copy`,
     `lookup_of_a_remote_entry_equals_getattr`,
-    `a_rename_over_a_hard_linked_target_keeps_the_form`;
-  - `tests/dirty.rs` and `tests/speculation.rs` gain `link` at *n* = 2 and
-    `unlink` from 2 in their operation lists (the transition rewrites are
-    dirty-marked and roll back);
-  - replica convergence: two `Meta`s fed the same records in different
-    commuting orders hold byte-equal `ns` dumps (the form is part of the
-    dump);
-  - `recursive_size_of_a_hard_link_tree` equals the sum over inodes once per
-    name and reads each inode once (the counter).
+    `a_rename_over_a_hard_linked_target_keeps_the_form`,
+    `an_exchange_of_two_hard_linked_files_keeps_the_form`;
+  - `tests/dirty.rs` gains `link` at two names and `unlink` from three
+    (the transition rewrites are dirty-marked); `tests/speculation.rs`
+    gains `a_stranded_run_of_links_and_unlinks_restores_each_dentrys_form`
+    (rollback across both transitions, byte for byte);
+  - `replicas_converge_on_the_dentry_bytes` (a replica replaying the whole
+    log holds the same `0x02` and `0x04` bytes);
+  - `recursive_size_of_a_hard_link_tree_reads_each_inode_once` equals the sum
+    over names and reads each inode once (the counter).
   Meta-level perf (§7) is measured here against H0's baseline.
-- **H3 — Engine tests.** The `mtree_read` roundtrip test gains a hard link
-  (the bulk load copies `Remote` values verbatim); the `mtree_publish`
-  tests ("just this file's `0x01` plus its one dentry copy") gain a
-  hard-linked twin asserting the key counts; engine tests
-  `a_listing_of_single_name_entries_reads_no_inode` (the priority-1 gate, by
-  the `inode_reads` counter) and
-  `a_listing_of_hard_linked_entries_reads_each_inode_once_per_entry`; a
-  snapshot-walk test with a hard link (`snapwalk` counts the file per name,
-  reads it once); an fsck run over a published tree with hard links reports
-  nothing. Plan 40 R5, when it lands after this, adds
+- **H3 — Engine tests.** `a_hard_link_publishes_remote_dentries_that_bootstrap_verbatim`
+  (`mtree_read`: the names of a hard-linked file publish as remote dentries,
+  the reader returns them without attributes, `check_dentry_forms` passes, a
+  bootstrap copies every `0x02` and `0x04` value verbatim);
+  `a_hard_linked_files_changes_publish_a_constant_number_of_keys`
+  (`mtree_publish`: a chmod at three names publishes one key, a link at most
+  five); engine tests `a_listing_of_single_name_entries_reads_no_inode` (the
+  priority-1 gate, by the `inode_reads` counter, through `View::readdir` and
+  `View::lookup` as a plus listing will) and
+  `a_listing_of_hard_linked_entries_reads_each_inode_once_per_entry`. The
+  snapshot walks read `kind` only; `snapwalk`'s existing hard-link tests
+  (`hardlinks_weigh_once_per_name_in_the_subtree` and the nested-subtree one)
+  now run on remote dentries, which is their test of the `Remote` ⇒ hard
+  linked rule.
+  Plan 40 R5, when it lands after this, adds
   `plus_entries_of_hard_links_are_what_lookup_answers`.
 - **H4 — Harness and xcheckfs.** Scenario `hardlink-burst`: 8,192 links then
   unlinks of one file on node A while node B replays; both roots equal;
@@ -380,13 +393,14 @@ under a timeout.
 
 ## 8. Exit criteria
 
-- [ ] H0 baseline recorded (meta level locally; box *pending*).
-- [ ] `DentryRecord` two forms, fsck `dentry_form` check, the form tests (H1).
-- [ ] The rule and transitions in every writer, local and replay;
-      `link_cost_is_flat_in_the_link_count` and the form-aware
-      `every_mutation_keeps_each_dentry_in_the_right_form` green, failing
-      before; meta perf gates met (H2).
-- [ ] Engine readers, the `inode_reads` gate tests (H3); the authority
+- [x] H0 baseline recorded at meta level (2026-10-22, PROGRESS "Meta level,
+      before and after"); the box numbers *pending*.
+- [x] `DentryRecord` two forms, every reader, fsck `dentry_form` check, the
+      form tests (H1).
+- [x] The rule and transitions in every writer, local and replay;
+      `link_cost_is_flat_in_the_link_count` and the form-aware transition
+      tests green, failing before (9 of 9); meta perf gates met (H2).
+- [x] Engine tests, the `inode_reads` gate tests (H3); the authority
       simulation suite green.
 - [ ] `hardlink-burst` and the xcheckfs `--link 1` lane (H4, *pending, box*).
 - [ ] Docs and PROGRESS (H5).
@@ -426,7 +440,44 @@ Open, decided by measurement or later:
   hard-linked inodes; it is rebuilt (accepted: no backward compatibility).
   fsck reports it as `dentry_form`.
 
-## 10. PROGRESS.md
+## 10. Implementation notes (2026-10-22)
+
+What differs from the text above, found while building it:
+
+- **The type change forces the readers into H1.** `DentryRecord::attrs` is an
+  `Option`, so every consumer stops compiling in the commit that changes it;
+  H1 therefore carries all readers (§5), H2 the writers, H3 the engine tests.
+  Between H1 and H2 nothing writes the remote form, so H1 is a no-op for a
+  running system and its tests write remote dentries by hand.
+- **`before` is `Option<Attrs>`, not `Option<&InodeRecord>`.** `Attrs` is
+  `Copy`, so a caller that mutates its record in place (`setattr`, the
+  `nlink` bumps) keeps the earlier attributes with one assignment.
+- **A rename over a hard-linked target removes the name first**, then changes
+  `nlink`, so the 2 → 1 materialisation writes the survivor's copy once and
+  never the removed name's. `unlink`, `publish_file` and replay's
+  `evict_dentry` already did.
+- **Replay had private copies of the loop.** `apply_setattr` wrote `0x01` and
+  looped over the names itself; `apply_write_manifest` and
+  `scratch_set_manifest` looped again after `put_inode_keeping_xattrs` had
+  already done it. All three now go through `put_inode_record` only.
+- **The meta-level measurement gates on a steady state.** The first 100
+  `unlink`s after a 2,000-link burst cost 57-100 µs after the change against
+  16 µs steady (the window is also twice the steady state before the
+  change, and does not grow with *n*); `link_steady_at_N` and
+  `unlink_steady_at_N` (a name linked and unlinked again at *N* names) are the
+  numbers the 1.5× gate is read from, the burst windows are reported beside
+  them.
+- **fsck's check is one `0x01` point read per dentry.** It streams (nothing but
+  the violations is kept, 100 reported in full), and it reads the head
+  commit's tree, so it costs the namespace's size in point reads on top of
+  `verify`. A one-entry cache of the last inode read would save the reads of
+  adjacent hard-linked names; not done.
+- **`engine` lib tests on the workstation:** the five `view::owner_fence_tests`
+  parking tests fail in a full `--lib` run on `origin/main` (7f4f5a1 plus
+  documents) exactly as on this branch, and pass alone; not touched here.
+- `DENTRY_LEN` is 57, not the research's 65 (§4.1).
+
+## 11. PROGRESS.md
 
 Add `## Plan 45 — Hard links: dentry attribute copies only for single-name
 inodes` in the established style (intro, "What landed" table, "Unchanged on
@@ -437,7 +488,7 @@ purpose", "Gates"), with these rows:
 | Baseline (H0) | meta level landed, box pending | `crates/meta/tests/hardlink_perf.rs`; `bench/hardlink/` |
 | Two dentry forms, every reader, fsck check (H1) | | `crates/mtree/src/record.rs`, `crates/meta/src/store/{ns,writes,reads,scratch}.rs`, `crates/engine/src/{mtree_read,snapwalk,snapshot,fsck}.rs` |
 | The rule and transitions (H2) | | `crates/meta/src/store/{ns,writes,misc,reads,scratch}.rs`, `crates/meta/src/replay.rs` |
-| Engine tests (H3) | | `crates/engine/src/{mtree_read,mtree_publish,snapwalk}.rs` |
+| Engine tests (H3) | | `crates/engine/src/{mtree_read,mtree_publish}.rs`, `view/vfs_tests.rs` |
 | Harness + xcheckfs (H4) | pending, box | `crates/harness/src/scenarios.rs` |
 | Docs (H5) | | `docs/plans/v1/done/28-…` §P6 note, `docs/reference` |
 

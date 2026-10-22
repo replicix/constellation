@@ -1778,6 +1778,41 @@ mod tests {
         );
     }
 
+    /// Plan 45: the hard-linked twin of the test above. A file with three
+    /// names has no dentry copies, so a chmod through any name edits the
+    /// one `0x01` key and a fourth link edits the inode, the new name's two
+    /// keys and the directory — not one copy per name.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_hard_linked_files_changes_publish_a_constant_number_of_keys() {
+        let mut fx = Fixture::new();
+        let dir = seed(&fx.meta, 4);
+        let ino = fx.meta.child_ino(dir, "f0").unwrap().unwrap();
+        let root = constellation_fs_core::types::ROOT_INO;
+        fx.meta.link(ino, root, "hl1").unwrap();
+        fx.meta.link(ino, root, "hl2").unwrap();
+        let mut publisher = fx.publisher(1);
+        publish(&mut publisher).await.unwrap();
+
+        fx.meta
+            .setattr(ino, Some(0o600), None, None, None, None, None)
+            .unwrap();
+        let chmod = publisher.publish(7).await.unwrap().unwrap();
+        assert_eq!(
+            chmod.intent.ops, 1,
+            "a chmod at three names edited {} keys, not just the inode",
+            chmod.intent.ops
+        );
+
+        fx.meta.link(ino, root, "hl3").unwrap();
+        let link = publisher.publish(7).await.unwrap().unwrap();
+        // The inode, the new name's 0x02 and 0x04, the root's record.
+        assert!(
+            link.intent.ops <= 5,
+            "a link at three names edited {} keys",
+            link.intent.ops
+        );
+    }
+
     /// An object store that lets a test put a competing commit into
     /// the slot *between* a publisher's head discovery and its CAS.
     #[derive(Debug)]

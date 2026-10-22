@@ -56878,7 +56878,7 @@ measured, the four-file-system runs are pending.
 | Baseline (H0) | meta level landed (numbers under Gates); box pending | `crates/meta/tests/hardlink_perf.rs`; box: `bench/hardlink/` |
 | Two dentry forms, every reader, fsck check (H1) | landed | `crates/mtree/src/record.rs`, `crates/meta/src/store/{ns,writes,reads,scratch}.rs`, `crates/engine/src/{mtree_read,snapwalk,snapshot,fsck}.rs` |
 | The rule and transitions (H2) | landed | `crates/meta/src/store/{ns,writes,misc,reads,scratch}.rs`, `crates/meta/src/replay.rs` |
-| Engine tests (H3) | planned | `crates/engine/src/{mtree_read,mtree_publish,snapwalk}.rs` |
+| Engine tests (H3) | landed | `crates/engine/src/{mtree_read,mtree_publish}.rs`, `crates/engine/src/view/vfs_tests.rs` |
 | Harness scenario, xcheckfs lane (H4) | pending, box | `crates/harness/src/scenarios.rs` |
 | Docs (H5) | pending | `docs/reference` |
 
@@ -56913,3 +56913,41 @@ for the steady state; the first window after a burst is also twice the steady
 state before the change, and does not grow with n (33-47 µs at 1,000
 names, 60-67 µs at 4,000), so it is a property of the burst's tail, not of
 the number of names.
+
+### Unchanged on purpose
+
+- `getattr`, `lookup` and every attribute the kernel sees: both answer from
+  `0x01`; a remote entry's `lookup` is that read.
+- A listing of single-name entries: the same bytes, the same scan, no extra
+  read (the engine test counts `0x01` reads and requires none).
+- The S3 log: `LogRecord::Link` was already O(1); only the replay and the
+  published tree's edits per link changed (from *n*+5 keys to 4-6).
+- `DESIGN.md` (CONVENTIONS rule 5): the proposed text for the dentry value
+  forms is in the plan (§4.1, §4.4); a store written before this plan holds a
+  copy under every name of a hard-linked inode and is rebuilt (fsck reports it
+  as `dentry_form`).
+- The journal and open-time work of the same research (a clean close leaves
+  memtables unflushed): a separate piece of work, not in this plan.
+
+### Gates (2026-10-22, the workstation, local; the boxes were unreachable)
+
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D
+  warnings`: clean at H1, H2 and H3.
+- `mtree` (74 tests), `meta` (every test binary: 313 library tests, 9 in
+  `hardlink`, 24 in `speculation`), `authority --lib` 549, the authority
+  simulation suite (release) 226 passed, 12 ignored: pass.
+- `engine --lib` 842 passed with the three new tests, and **five tests fail in
+  every full run, all in `view::owner_fence_tests`**
+  (`a_lapsed_owners_read_waits_for_the_verdict...`,
+  `a_park_the_frontend_or_the_pool_cannot_hold_is_eio...`,
+  `a_parked_read_fails_eio_when_the_owner_refuses`,
+  `a_parked_write_lands_after_the_admission`,
+  `a_signal_ends_a_parked_read_with_eintr...`). They fail identically on the
+  commit before this plan's code (full `--lib` run, 832 passed) and pass when
+  the module runs alone (54 of 54, twice). A sixth, different test failed in
+  each of two further full runs (`a_refused_op_is_reissued_only_under_a_renewed_honoured_grant`,
+  then `log_buffer::...a_frozen_log_is_the_chunk_in_write_then_the_batch_then_the_queue`):
+  timing tests that share process-wide state, on a loaded workstation. None
+  touches a dentry.
+- Pending, box: the four-file-system runs of plan 45 §7 (`bench/hardlink/`),
+  `hardlink-burst`, the xcheckfs lane, pjdfstest, the harness matrix.
