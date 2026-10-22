@@ -3577,7 +3577,7 @@ impl Driver {
     fn dispatch(&mut self, actions: Vec<Action>) {
         for action in actions {
             match action {
-                Action::Reply { rid, reply } => {
+                Action::Reply { rid, reply, .. } => {
                     if let Some(tx) = self.replies.remove(&rid) {
                         if let ClientReply::Outcome(MutateOutcome::Accepted { .. }) = &reply {
                             self.deps.placement.note_local(self.node_id);
@@ -6737,7 +6737,7 @@ impl Standalone {
     fn absorb(&mut self, actions: Vec<Action>) {
         for action in actions {
             match action {
-                Action::Reply { rid, reply } => {
+                Action::Reply { rid, reply, .. } => {
                     self.replies.insert(rid, reply);
                 }
                 Action::ControlDone { op, result } => {

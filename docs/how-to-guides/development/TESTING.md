@@ -4680,10 +4680,10 @@ that makes the invariant hold (C1 turns `strict_lone` on in the
 
 | Oracle | Judged | Counter (`Report`) | Flag |
 |---|---|---|---|
-| I1 `acked_implies_committed` | at the answering sequencer's emission: every definitive answer (`Accepted`, `Errno`, `Exists`, `Conflict`, `LockLapsed`) of a `MutateReply` or of a node's own client reply, by reading every node's store, the bucket's lease and the log as they are then (`tests/sim/oracle.rs`, `committed_at_answer`), independently of what the core claims | `acks_by_class`, `uncommitted_acks` (`"{expected class}/{answer}"`), `unjournaled_refusals` (D6: a refusal that journaled no `Refused` row, e.g. a frozen epoch's `EROFS`: nothing executed, not a violation), `acks_unmapped` (must be 0) | `strict_commit` |
+| I1 `acked_implies_committed` | at the answering sequencer's emission: every definitive answer (`Accepted`, `Errno`, `Exists`, `Conflict`, `LockLapsed`) of a `MutateReply` or of a node's own client reply that this node decided (`Action::Reply.source`: `Sequenced`), by reading every node's store, the bucket's lease and the log as they are then (`tests/sim/oracle.rs`, `committed_at_answer`), independently of what the core claims; what a transaction carries must be the answer's own outcome (plan 43 C2a: a completion for an acceptance, a `Refused` of the answer's code for a refusal — an `Exists` hint is `EEXIST`, a conflict `ESTALE`, a lapsed grant `ENOLCK`), and the same rid carried with another outcome by the archive, the answerer's journal or the lease holder's is a violation of its own whether or not a class holds. A requester passing another node's answer on (`Relayed`) is not judged but verified at the end of the run: an earlier judged `MutateReply` of that node with the same outcome must exist | `acks_by_class`, `uncommitted_acks` (`"{expected class}/{answer}"`), `mismatched_acks` (by answer kind), `unverified_relays`, `class_mismatch` (informational: the core's claimed class is not the judged one), `unjournaled_refusals` (D6: a refusal that journaled no `Refused` row, e.g. a frozen epoch's `EROFS`: nothing executed, not a violation), `acks_unsourced` (an outcome no sequencer decided: a node's own error; not judged), `acks_unmapped` (must be 0) | `strict_commit` |
 | I2 `one_identity_per_op` (b) | after every event a node handles: no rid queued for execution (`pending_replays`, the core's client map) on two nodes at once (`IdentityLedger`) | `identity_copies` | `strict_identity` |
 | I2 (c) verbatim | end of run: an OK answered under a group class is completed in the log under the identity it was committed with (epoch, node and journal row, or `(gen, idx)`) and with its records as one run | `non_verbatim` | `strict_identity` |
-| I4 `unacked_fails_never_lands_late` | end of run: an op answered in doubt (the first `InDoubt` answer; the sim's client resubmits, production answers `EIO` at once) that lands after an op its node invoked later | `late_landings` | `strict_settle` |
+| I4 `unacked_fails_never_lands_late` | end of run: an op answered in doubt (the first `InDoubt` answer; the sim's client resubmits, production answers `EIO` at once) that lands after an op its node invoked later; and (plan 43 C2a) a refusal that journaled no `Refused` row whose rid the log completes | `late_landings`, `unjournaled_landed` | `strict_settle` |
 | I5 `speculation_only_lone` | end of run: an OK that was rolled back whose answer was not class Lone | `non_lone_rollbacks` | `strict_lone` |
 
 **Classes** (`constellation_authority::core::AckClass`): `Archive` (an applied,
@@ -4695,11 +4695,17 @@ or an epoch's hold owner) and `Lone` (the answerer's own client, its group is
 itself, and no peer within the RTT budget that has been linked for the
 stability window — `backup_stable_ms`, the core's own candidate rule: a link
 that has only just come up is not a backup candidate yet). The first class that
-holds is recorded; none is an I1 violation. `SWEEP-ORACLES` (per seed with any
+holds is recorded; none is an I1 violation. The core says who decided every
+answer it gives a client (`AnswerSource`: `Sequenced(class)`, `Relayed { from }`,
+or `None` for an outcome nobody decided) and counts its sequenced answers per
+class (`Stats::ack_classes`, `status.ack.classes`; the sweep totals print them
+as "cores' sequenced answers by class" beside the oracle's `acks by class`).
+`SWEEP-ORACLES` (per seed with any
 counter) and `SWEEP-ORACLE-TOTALS` (per sweep, with `acks_by_class`) print the
-counts; `AUTHORITY_SIM_ORACLE_DEBUG=1` prints each I1 violation as judged.
+counts; `AUTHORITY_SIM_ORACLE_DEBUG=1` prints each I1 violation as judged, and (`ORACLE-END`) the relays no judged answer backs and the unjournaled refusals that landed, with every answer of the rid. The M11 configurations `delegated-crash`, `delegated-partition`, `delegated-root-crash` and `shared-dir`, `-split`, `-ranges`, `-faults` are sweep names too (plan 43 C2a).
 `AUTHORITY_SIM_FINGERPRINT=1` prints `SWEEP-FP` per seed, a hash of what the
-run did over the fields that predate the oracles: two trees give the same
+run did over the fields that predate the oracles (the per-class answer
+counters of C2a are left out): two trees give the same
 fingerprint seed by seed when the oracles' plumbing changed no schedule (the
 identity sweep). With it, `SWEEP-BUDGET` names each seed whose strict
 durability the one-backup failure budget waived (`Cluster::note_takedown`,

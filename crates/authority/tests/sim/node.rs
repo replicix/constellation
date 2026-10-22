@@ -14,8 +14,9 @@ use super::clock::{Clock, NodeClockState};
 use super::store::Bucket;
 use constellation_authority::action::ControlOk;
 use constellation_authority::{
-    Action, Carrier, CasFailure, ClientReply, Config, Control, Core, EpochClaimView, Event, NodeId,
-    OpId, PeerLink, PeerMsg, Policy, Replica, S3Failure, S3Op, S3Result, Seq, Stats, UploadResult,
+    Action, AnswerSource, Carrier, CasFailure, ClientReply, Config, Control, Core, EpochClaimView,
+    Event, NodeId, OpId, PeerLink, PeerMsg, Policy, Replica, S3Failure, S3Op, S3Result, Seq, Stats,
+    UploadResult,
 };
 use constellation_meta::locks::LockTag;
 use constellation_meta::{
@@ -1756,45 +1757,50 @@ impl Driver {
     }
 
     /// Plan 43 C0, I1: an answer leaves this node (a `MutateReply` to a
-    /// requester when `reply`, else its own client's reply). Definitive
-    /// answers are judged now, against every store as it is at this
-    /// emission; a requester passing a sequencer's answer on is a relay.
-    fn note_answer(&self, rid: Rid, outcome: &MutateOutcome, reply: bool) {
+    /// requester when `source` is `None`, else its own client's reply, which
+    /// the core says the source of: plan 43 C2a). A sequencer's answer is
+    /// judged now, against every store as it is at this emission; a
+    /// requester passing another node's answer on is not judged here but
+    /// verified at the end of the run (`oracle::end_of_run`).
+    fn note_answer(&self, rid: Rid, outcome: &MutateOutcome, source: Option<AnswerSource>) {
         use super::oracle::{committed_at_answer, outcome_kind, AckEntry, AnswererState, Expected};
         let Some(kind) = outcome_kind(outcome) else {
             return;
         };
+        let reply = source.is_none();
+        let super::oracle::Treatment {
+            judge,
+            relay_from,
+            claimed,
+            unsourced,
+        } = super::oracle::answer_treatment(source);
+        if unsourced {
+            // This node's own error, decided by no sequencer.
+            self.oracles.acks_unsourced.fetch_add(1, Ordering::Relaxed);
+        }
         let tick = self.oracles.next_tick();
         let at_ms = self.clock.elapsed_ms();
-        let relay = !reply
-            && self
-                .oracles
-                .reply_kinds
-                .lock()
-                .unwrap()
-                .get(&rid)
-                .is_some_and(|v| v.iter().any(|(n, k)| *n != self.id && *k == kind));
-        if reply {
-            self.oracles
-                .reply_kinds
-                .lock()
-                .unwrap()
-                .entry(rid)
-                .or_default()
-                .push((self.id, kind));
-        }
-        let judged = (!relay).then(|| {
+        let judged = judge.then(|| {
             let st = AnswererState::of(&self.core, &self.meta, self.id, self.clock.now().wait.0);
             let j = committed_at_answer(&self.oracles, &self.bus, self.id, &st, rid, outcome);
-            if j.class.is_none() && !(j.expected == Expected::Unjournaled && kind.is_refusal()) {
-                let text = format!(
-                    "I1 acked_implies_committed: node {} answered rid {rid:?} ({}) at t={at_ms} ms, \
-                     expected {}, committed by none: {}",
+            let uncommitted =
+                j.class.is_none() && !(j.expected == Expected::Unjournaled && kind.is_refusal());
+            if uncommitted || j.mismatch.is_some() {
+                let mut text = format!(
+                    "I1 acked_implies_committed: node {} answered rid {rid:?} ({}) at t={at_ms} ms",
                     self.id,
                     kind.name(),
-                    j.expected.name(),
-                    j.detail
                 );
+                if uncommitted {
+                    text += &format!(
+                        ", expected {}, committed by none: {}",
+                        j.expected.name(),
+                        j.detail
+                    );
+                }
+                if let Some(m) = &j.mismatch {
+                    text += &format!("{} but {m}", if uncommitted { ";" } else { "" });
+                }
                 // `AUTHORITY_SIM_ORACLE_DEBUG=1`: every violation, as judged.
                 if std::env::var_os("AUTHORITY_SIM_ORACLE_DEBUG").is_some() {
                     eprintln!("ORACLE-I1 t={at_ms} {text}");
@@ -1810,7 +1816,8 @@ impl Driver {
             at_ms,
             kind,
             reply,
-            relay,
+            relay_from,
+            claimed,
             judged,
         });
     }
@@ -1819,7 +1826,7 @@ impl Driver {
     /// to the rid that request carried.
     fn note_forward_answer(&self, to: NodeId, req: OpId, outcome: &MutateOutcome) {
         match self.forwards.get(&(to, req)).copied() {
-            Some(rid) => self.note_answer(rid, outcome, true),
+            Some(rid) => self.note_answer(rid, outcome, None),
             None => {
                 if super::oracle::outcome_kind(outcome).is_some() {
                     self.oracles.acks_unmapped.fetch_add(1, Ordering::Relaxed);
@@ -1924,7 +1931,7 @@ impl Driver {
             epoch,
         );
         drop(admission);
-        Some(self.fast_path_done(now, *rid, op, outcome))
+        Some(self.fast_path_done(now, *rid, op, outcome, None))
     }
 
     /// F1: start the held write (`HeldWrite`) and stall the core's next
@@ -1994,7 +2001,7 @@ impl Driver {
                 if let Some(t) = held.thread.take() {
                     t.join().expect("held write thread");
                 }
-                self.fast_path_done(now, rid, op, outcome)
+                self.fast_path_done(now, rid, op, outcome, None)
             }
             Err(_) => panic!("held write thread vanished"),
         }
@@ -2125,7 +2132,7 @@ impl Driver {
                 if let Some(idx) = idx {
                     session.note_stream(gen, idx);
                 }
-                Some(self.fast_path_done(now, rid, op, outcome))
+                Some(self.fast_path_done(now, rid, op, outcome, Some(gen)))
             }
             Err(_) => panic!("held write thread vanished"),
         }
@@ -2157,19 +2164,26 @@ impl Driver {
         }
         tracing::debug!(node = self.id, ?rid, ?outcome, "sim: the held write ran");
         let now = self.clock.now();
-        let actions = self.fast_path_done(now, rid, &op, outcome);
+        let actions = self.fast_path_done(now, rid, &op, outcome, deleg);
         self.dispatch(actions);
     }
 
     /// The fast path's answer to an op it executed: the acknowledgement
-    /// to the core and the reply.
+    /// to the core and the reply. `deleg`: the generation of a delegate's
+    /// write; the answer is this node's own sequencing, of the class the
+    /// core gives such answers now.
     fn fast_path_done(
         &mut self,
         now: constellation_authority::Now,
         rid: Rid,
         op: &MutateOp,
         outcome: MutateOutcome,
+        deleg: Option<u64>,
     ) -> Vec<Action> {
+        let class = match deleg {
+            Some(gen) => self.core.deleg_ack_class(gen),
+            None => self.core.root_ack_class(),
+        };
         self.shared
             .fast_path_executed
             .fetch_add(1, Ordering::Relaxed);
@@ -2187,6 +2201,7 @@ impl Driver {
         actions.push(Action::Reply {
             rid,
             reply: ClientReply::Outcome(outcome),
+            source: AnswerSource::Sequenced(class),
         });
         actions
     }
@@ -2194,7 +2209,7 @@ impl Driver {
     fn dispatch(&mut self, actions: Vec<Action>) {
         for action in actions {
             match action {
-                Action::Reply { rid, reply } => {
+                Action::Reply { rid, reply, source } => {
                     match &reply {
                         ClientReply::InDoubt => {
                             let applied = Replica::applied_seq(&*self.meta).unwrap_or(0);
@@ -2205,7 +2220,9 @@ impl Driver {
                                 .unwrap()
                                 .push((self.id, rid, applied, tick));
                         }
-                        ClientReply::Outcome(outcome) => self.note_answer(rid, outcome, false),
+                        ClientReply::Outcome(outcome) => {
+                            self.note_answer(rid, outcome, Some(source))
+                        }
                     }
                     if let Some(tx) = self.shared.replies.lock().unwrap().remove(&rid) {
                         let _ = tx.send(reply);

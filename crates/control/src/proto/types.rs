@@ -2082,6 +2082,11 @@ pub struct AckStatus {
     pub store_writer_lock_wait_us: u64,
     #[serde(default)]
     pub store_writer_lock_wait_max_us: u64,
+    /// Plan 43 C2a: the definitive answers this node gave as a sequencer,
+    /// by the class they waited for: `(class, count)` for `archive`,
+    /// `root-group`, `deleg-group`, `non-stealable` and `lone`.
+    #[serde(default)]
+    pub classes: Vec<(String, u64)>,
 }
 
 /// Partition lease state (DESIGN.md §4). `held` is this node's own

@@ -143,6 +143,26 @@
             "null"
           ]
         },
+        "classes": {
+          "default": [],
+          "description": "Plan 43 C2a: the definitive answers this node gave as a sequencer,\nby the class they waited for: `(class, count)` for `archive`,\n`root-group`, `deleg-group`, `non-stealable` and `lone`.",
+          "items": {
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            ],
+            "type": "array"
+          },
+          "type": "array"
+        },
         "config_version": {
           "format": "uint64",
           "minimum": 0,

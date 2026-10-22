@@ -4745,6 +4745,14 @@ fn sweep_config() {
         "long-sessions" => long_sessions_config(),
         "long-strict" => long_strict_config(),
         "delegated-backup" => delegated_backup_config(),
+        // Plan 43 C2: the M11 configurations the sweep did not name.
+        "delegated-crash" => delegated_crash_config(),
+        "delegated-partition" => delegated_partition_config(),
+        "delegated-root-crash" => delegated_root_crash_config(),
+        "shared-dir" => shared_dir_config(),
+        "shared-dir-split" => shared_dir_split_config(),
+        "shared-dir-ranges" => shared_dir_ranges_config(),
+        "shared-dir-faults" => shared_dir_faults_config(),
         "delegated-two-gens-root-crash" => delegated_two_gens_root_crash_config(),
         "delegated-root-gone" => delegated_root_gone_config(),
         "delegated-delegate-restart" => delegated_delegate_restart_config(),
@@ -5812,7 +5820,26 @@ fn fingerprint(result: &Result<Report, String>) -> String {
         ),
         Err(e) => format!("err {e}"),
     };
+    // The per-class answer counters (`Stats::ack_classes`, plan 43 C2a)
+    // postdate the fingerprint: left out, so trees before and after the
+    // counters give the same fingerprint for the same run.
+    let text = strip_ack_classes(&text);
     blake3::hash(text.as_bytes()).to_hex().to_string()[..16].to_string()
+}
+
+/// `text` without every `ack_classes: [..], ` field of a debug-printed
+/// `Stats`.
+fn strip_ack_classes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("ack_classes: [") {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let end = tail.find("], ").map_or(tail.len(), |e| e + 3);
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Plan 43 C0: the oracles' counters summed over a sweep.
@@ -5822,11 +5849,22 @@ struct OracleTotals {
     acks_by_class: std::collections::BTreeMap<String, usize>,
     uncommitted: std::collections::BTreeMap<String, usize>,
     unjournaled: std::collections::BTreeMap<String, usize>,
+    /// Plan 43 C2a: answers a transaction carries another outcome of, by
+    /// answer kind; relays with no judged answer behind them; claimed class
+    /// not the judged one (informational); unsourced outcomes; unjournaled
+    /// refusals whose rid the log completes; the cores' own count of
+    /// sequenced answers by class (`Stats::ack_classes`, summed).
+    mismatched: std::collections::BTreeMap<String, usize>,
+    unverified_relays: usize,
+    class_mismatch: usize,
+    unsourced: usize,
+    unjournaled_landed: usize,
+    claimed: [u64; 5],
     i2: usize,
     i2c: usize,
     i4: usize,
     i5: usize,
-    seeds_with: [u64; 5],
+    seeds_with: [u64; 7],
     unmapped: usize,
     rebuilds: (u64, u64),
     rebuild_seeds: u64,
@@ -5847,6 +5885,19 @@ impl OracleTotals {
         for (k, v) in &r.unjournaled_refusals {
             *self.unjournaled.entry(k.clone()).or_default() += v;
         }
+        for (k, v) in &r.mismatched_acks {
+            *self.mismatched.entry(k.clone()).or_default() += v;
+        }
+        let mismatched: usize = r.mismatched_acks.values().sum();
+        self.unverified_relays += r.unverified_relays;
+        self.class_mismatch += r.class_mismatch;
+        self.unsourced += r.acks_unsourced;
+        self.unjournaled_landed += r.unjournaled_landed;
+        for st in r.stats.values() {
+            for (c, n) in self.claimed.iter_mut().zip(st.ack_classes) {
+                *c += n;
+            }
+        }
         self.i2 += r.identity_copies;
         self.i2c += r.non_verbatim;
         self.i4 += r.late_landings;
@@ -5857,6 +5908,8 @@ impl OracleTotals {
             r.non_verbatim,
             r.late_landings,
             r.non_lone_rollbacks,
+            mismatched,
+            r.unverified_relays,
         ]
         .into_iter()
         .enumerate()
@@ -5880,17 +5933,24 @@ impl OracleTotals {
             + r.late_landings
             + r.non_lone_rollbacks
             + unjournaled
+            + mismatched
+            + r.unverified_relays
+            + r.unjournaled_landed
             > 0
         {
             eprintln!(
                 "SWEEP-ORACLES {label} seed {seed}: i1={uncommitted} {:?} i2={} i2c={} i4={} i5={} \
-                 unjournaled={unjournaled} {:?} rebuilds={}/{}",
+                 unjournaled={unjournaled} {:?} mismatched={mismatched} {:?} relays={} \
+                 unjournaled-landed={} rebuilds={}/{}",
                 r.uncommitted_acks,
                 r.identity_copies,
                 r.non_verbatim,
                 r.late_landings,
                 r.non_lone_rollbacks,
                 r.unjournaled_refusals,
+                r.mismatched_acks,
+                r.unverified_relays,
+                r.unjournaled_landed,
                 r.rebuilds.0,
                 r.rebuilds.1
             );
@@ -5900,10 +5960,14 @@ impl OracleTotals {
     fn print(&self, label: &str, seeds: u64) {
         let i1: usize = self.uncommitted.values().sum();
         let unjournaled: usize = self.unjournaled.values().sum();
+        let mismatched: usize = self.mismatched.values().sum();
         eprintln!(
             "SWEEP-ORACLE-TOTALS {label} seeds {}/{seeds}: i1={i1} {:?} (in {} seeds) i2={} (in {}) \
              i2c={} (in {}) i4={} (in {}) i5={} (in {}) unjournaled={unjournaled} {:?} unmapped={} \
-             rebuilds={}/{} (in {} seeds) max-backups={}; acks by class {:?}",
+             rebuilds={}/{} (in {} seeds) max-backups={}; acks by class {:?}; \
+             i1-mismatched={mismatched} {:?} (in {} seeds) unverified-relays={} (in {} seeds) \
+             class-mismatch={} unsourced={} unjournaled-landed={}; cores' sequenced answers by \
+             class {:?}",
             self.seeds,
             self.uncommitted,
             self.seeds_with[0],
@@ -5921,7 +5985,15 @@ impl OracleTotals {
             self.rebuilds.1,
             self.rebuild_seeds,
             self.max_backups,
-            self.acks_by_class
+            self.acks_by_class,
+            self.mismatched,
+            self.seeds_with[5],
+            self.unverified_relays,
+            self.seeds_with[6],
+            self.class_mismatch,
+            self.unsourced,
+            self.unjournaled_landed,
+            constellation_authority::core::AckClass::NAMES.iter().zip(self.claimed).collect::<Vec<_>>()
         );
     }
 }

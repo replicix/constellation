@@ -37,7 +37,8 @@ pub mod replica;
 pub mod segment;
 
 pub use action::{
-    Action, ClientReply, ControlOk, LockAnswer, LockTestAnswer, ReadAnswer, S3Op, TimerKind,
+    Action, AnswerSource, ClientReply, ControlOk, LockAnswer, LockTestAnswer, ReadAnswer, S3Op,
+    TimerKind,
 };
 pub use core::{
     beat_sent_ms, lease_may_carry, resolve_epoch_claims, Config, Core, DelegRenewCert,

@@ -5,7 +5,11 @@
 //! * I1 `acked_implies_committed`: every definitive answer is classified,
 //!   **at the answering sequencer's emission**, by reading every node's
 //!   store and the bucket's lease and log at that instant, independently of
-//!   what the core claims ([`committed_at_answer`]).
+//!   what the core claims ([`committed_at_answer`]). What a transaction
+//!   carries must be the answer's own outcome (a completion for an
+//!   acceptance, a refusal of that code for a refusal), and a requester's
+//!   reply passed on is not judged but verified at the end of the run
+//!   against the answer it passes on (plan 43 C2a).
 //! * I2 `one_identity_per_op`: (b) no rid queued for execution on two nodes
 //!   at once ([`IdentityLedger`]); (c) verbatim, at the end of the run
 //!   (`run.rs`).
@@ -56,9 +60,9 @@ pub struct Oracles {
     /// Descriptions of I1 violations, in order (judged at emission, failed
     /// at the end of the run).
     pub i1_violations: Mutex<Vec<String>>,
-    /// Who sent a `MutateReply` for each rid, and of what kind: a
-    /// requester passing it on to its client is a relay, not judged.
-    pub reply_kinds: Mutex<HashMap<Rid, Vec<(NodeId, OutcomeKind)>>>,
+    /// Outcomes the core answered a client with that no sequencer decided
+    /// (`AnswerSource::None`: a node's own error): not judged.
+    pub acks_unsourced: AtomicU64,
 }
 
 impl Oracles {
@@ -75,7 +79,7 @@ impl Oracles {
             tick: AtomicU64::new(1),
             acks_unmapped: AtomicU64::new(0),
             i1_violations: Mutex::new(Vec::new()),
-            reply_kinds: Mutex::new(HashMap::new()),
+            acks_unsourced: AtomicU64::new(0),
         })
     }
 
@@ -131,8 +135,9 @@ struct ArchiveInner {
     max_epoch: u64,
     fenced: BTreeSet<Seq>,
     /// The first outcome (`Completed` or `Refused`) of each rid in an
-    /// applied, unfenced segment: (seq, record index).
-    outcomes: HashMap<Rid, (Seq, usize)>,
+    /// applied, unfenced segment: (seq, record index, the outcome's code:
+    /// `None` for `Completed`, `Some(code)` for `Refused`).
+    outcomes: HashMap<Rid, (Seq, usize, Option<Code>)>,
 }
 
 impl Default for ArchiveIndex {
@@ -168,8 +173,8 @@ impl ArchiveIndex {
                 g.fenced.insert(seq);
             } else {
                 for (i, rec) in seg.records.iter().enumerate() {
-                    if let Some(rid) = outcome_rid(rec) {
-                        g.outcomes.entry(rid).or_insert((seq, i));
+                    if let Some((rid, code)) = record_outcome(rec) {
+                        g.outcomes.entry(rid).or_insert((seq, i, code));
                     }
                 }
                 g.max_epoch = g.max_epoch.max(seg.epoch);
@@ -182,8 +187,24 @@ impl ArchiveIndex {
     /// is in the applied unfenced prefix: (seq, record index, the segment).
     pub fn outcome_of(&self, rid: Rid) -> Option<(Seq, usize, Arc<Segment>)> {
         let g = self.inner.lock().unwrap();
-        let (seq, i) = *g.outcomes.get(&rid)?;
+        let (seq, i, _) = *g.outcomes.get(&rid)?;
         Some((seq, i, g.segments.get(&seq)?.clone()))
+    }
+
+    /// [`Self::outcome_of`] when the outcome is `want` (`None`: a
+    /// completion; `Some(code)`: a refusal of that code).
+    pub fn outcome_as(&self, rid: Rid, want: Option<Code>) -> Option<(Seq, usize, Arc<Segment>)> {
+        let g = self.inner.lock().unwrap();
+        let (seq, i, code) = *g.outcomes.get(&rid)?;
+        (code == want).then_some(())?;
+        Some((seq, i, g.segments.get(&seq)?.clone()))
+    }
+
+    /// The archive's first outcome of `rid`: its segment and code (`None`:
+    /// a completion).
+    pub fn outcome_code(&self, rid: Rid) -> Option<(Seq, Option<Code>)> {
+        let g = self.inner.lock().unwrap();
+        g.outcomes.get(&rid).map(|(seq, _, code)| (*seq, *code))
     }
 
     /// Whether segment `seq` is in the applied prefix and was fenced.
@@ -192,15 +213,39 @@ impl ArchiveIndex {
     }
 }
 
-fn outcome_rid(rec: &LogRecord) -> Option<Rid> {
+/// A record that is a rid's outcome: its rid, and `None` for a completion or
+/// `Some(code)` for a refusal.
+fn record_outcome(rec: &LogRecord) -> Option<(Rid, Option<Code>)> {
     match rec {
-        LogRecord::Completed { rid } | LogRecord::Refused { rid, .. } => Some(*rid),
+        LogRecord::Completed { rid } => Some((*rid, None)),
+        LogRecord::Refused { rid, code } => Some((*rid, Some(*code))),
         _ => None,
     }
 }
 
-fn carries(records: &[LogRecord], rid: Rid) -> bool {
-    records.iter().any(|r| outcome_rid(r) == Some(rid))
+/// Whether `records` carry `rid`'s outcome as `want` (`None`: completed;
+/// `Some(code)`: refused with that code).
+fn carries_as(records: &[LogRecord], rid: Rid, want: Option<Code>) -> bool {
+    records
+        .iter()
+        .any(|r| record_outcome(r) == Some((rid, want)))
+}
+
+/// The first outcome of `rid` in `records` that is not `want`, if any.
+fn carries_other(records: &[LogRecord], rid: Rid, want: Option<Code>) -> Option<Option<Code>> {
+    records
+        .iter()
+        .filter_map(record_outcome)
+        .find(|(r, code)| *r == rid && *code != want)
+        .map(|(_, code)| code)
+}
+
+/// How an outcome in the log reads in a violation's text.
+fn describe_code(code: Option<Code>) -> String {
+    match code {
+        None => "a completion".into(),
+        Some(c) => format!("a refusal ({})", c.posix_name()),
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -245,6 +290,10 @@ pub struct Judgement {
     pub tx: Option<TxRef>,
     /// What each class check saw (for failures).
     pub detail: String,
+    /// Plan 43 C2a: a transaction (the archive's, the answerer's journal,
+    /// the lease holder's journal) carries the rid with another outcome
+    /// than the answer's — judged whether or not a class holds.
+    pub mismatch: Option<String>,
 }
 
 /// What the answering node's core says about itself at the answer: the
@@ -324,6 +373,20 @@ impl OutcomeKind {
         }
     }
 
+    /// The outcome record the sequencer journals for this answer: `None`
+    /// for a completion (`Completed`), `Some(code)` for a refusal
+    /// (`Refused { code }`; an `Exists` hint is `EEXIST`, a conflict
+    /// `ESTALE`, a lapsed grant `ENOLCK`: `core::client::LAPSED_CODE`).
+    pub fn record_code(&self) -> Option<Code> {
+        match self {
+            OutcomeKind::Ok => None,
+            OutcomeKind::Refused(c) => Some(*c),
+            OutcomeKind::Exists => Some(Code::Exists),
+            OutcomeKind::Conflict => Some(Code::Stale),
+            OutcomeKind::LockLapsed => Some(Code::NoLock),
+        }
+    }
+
     /// A refusal journals a `Refused` row, or none (D6).
     pub fn is_refusal(&self) -> bool {
         !matches!(self, OutcomeKind::Ok)
@@ -341,6 +404,34 @@ impl OutcomeKind {
     }
 }
 
+/// How an answer's source is treated by the oracle (plan 43 C2a): a
+/// sequencer's answer (a `MutateReply`, which carries no source, or an
+/// `AnswerSource::Sequenced`) is judged; a relay is verified at the end of
+/// the run; a node's own error is neither.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Treatment {
+    pub judge: bool,
+    pub relay_from: Option<NodeId>,
+    pub claimed: Option<AckClass>,
+    pub unsourced: bool,
+}
+
+pub fn answer_treatment(source: Option<constellation_authority::AnswerSource>) -> Treatment {
+    use constellation_authority::AnswerSource;
+    let (judge, relay_from, claimed, unsourced) = match source {
+        None => (true, None, None, false),
+        Some(AnswerSource::Sequenced(class)) => (true, None, Some(class), false),
+        Some(AnswerSource::Relayed { from }) => (false, Some(from), None, false),
+        Some(AnswerSource::None) => (false, None, None, true),
+    };
+    Treatment {
+        judge,
+        relay_from,
+        claimed,
+        unsourced,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AckEntry {
     pub node: NodeId,
@@ -351,14 +442,26 @@ pub struct AckEntry {
     /// The answer left the node as a `MutateReply` to a requester (the
     /// sequencer's answer), as opposed to its own client's reply.
     pub reply: bool,
-    /// The requester passing on a sequencer's answer: not judged.
-    pub relay: bool,
+    /// The requester passing on the answer of this sequencer (the core
+    /// said so: `AnswerSource::Relayed`): not judged, verified at the end
+    /// of the run against the sequencer's own judged answer.
+    pub relay_from: Option<NodeId>,
+    /// The class the core said the answer waited for
+    /// (`AnswerSource::Sequenced`; none for a `MutateReply`, which carries
+    /// no source).
+    pub claimed: Option<AckClass>,
     pub judged: Option<Judgement>,
 }
 
-/// The transaction in `txs` carrying `rid`'s outcome.
-fn find_tx(txs: &[BackupTx], rid: Rid) -> Option<&BackupTx> {
-    txs.iter().find(|t| carries(&t.records, rid))
+impl AckEntry {
+    pub fn is_relay(&self) -> bool {
+        self.relay_from.is_some()
+    }
+}
+
+/// The transaction in `txs` carrying `rid`'s outcome as `want`.
+fn find_tx(txs: &[BackupTx], rid: Rid, want: Option<Code>) -> Option<&BackupTx> {
+    txs.iter().find(|t| carries_as(&t.records, rid, want))
 }
 
 fn journal_of(meta: &Meta) -> Vec<BackupTx> {
@@ -376,7 +479,10 @@ pub fn committed_at_answer(
     rid: Rid,
     outcome: &MutateOutcome,
 ) -> Judgement {
-    let _ = outcome;
+    // What the transaction must carry: the answer's own outcome (a
+    // completion for an acceptance, a refusal of the answer's code for a
+    // refusal). Whatever else carries the rid is a mismatch.
+    let want = outcome_kind(outcome).and_then(|k| k.record_code());
     let mut detail: Vec<String> = Vec::new();
     let lease = o.bucket.peek_lease();
     let own = o.store(answerer);
@@ -390,7 +496,7 @@ pub fn committed_at_answer(
         None => Vec::new(),
     };
     // T: the answerer's own transaction, else the holder's.
-    let tx: Option<TxRef> = if let Some(t) = find_tx(&own_txs, rid) {
+    let tx: Option<TxRef> = if let Some(t) = find_tx(&own_txs, rid, want) {
         Some(TxRef {
             node: answerer,
             first: t.first,
@@ -400,7 +506,7 @@ pub fn committed_at_answer(
             records: t.records.clone(),
         })
     } else {
-        find_tx(&holder_txs, rid).map(|t| TxRef {
+        find_tx(&holder_txs, rid, want).map(|t| TxRef {
             node: holder.unwrap_or(0),
             first: t.first,
             last: t.last,
@@ -415,13 +521,44 @@ pub fn committed_at_answer(
         bus,
         answerer,
         st,
-        rid,
+        (rid, want),
         lease.as_ref(),
         tx.as_ref(),
         &own_txs,
         &holder_txs,
         &mut detail,
     );
+    // The same rid carried with another outcome anywhere an answer's
+    // commit is read from.
+    let mut others: Vec<String> = Vec::new();
+    if let Some((seq, code)) = o.bucket.archive.outcome_code(rid) {
+        if code != want {
+            others.push(format!(
+                "the archive (segment {seq}) carries {}",
+                describe_code(code)
+            ));
+        }
+    }
+    let other_in = |txs: &[BackupTx]| {
+        txs.iter()
+            .find_map(|t| carries_other(&t.records, rid, want))
+    };
+    if let Some(code) = other_in(&own_txs) {
+        others.push(format!(
+            "the answerer's journal carries {}",
+            describe_code(code)
+        ));
+    }
+    if holder.is_some_and(|h| h != answerer) {
+        if let Some(code) = other_in(&holder_txs) {
+            others.push(format!(
+                "the lease holder {}'s journal carries {}",
+                holder.unwrap_or(0),
+                describe_code(code)
+            ));
+        }
+    }
+    let mismatch = (!others.is_empty()).then(|| others.join(" and "));
     let expected = if tx.is_none() && class.is_none() {
         Expected::Unjournaled
     } else {
@@ -432,6 +569,7 @@ pub fn committed_at_answer(
         expected,
         tx,
         detail: detail.join("; "),
+        mismatch,
     }
 }
 
@@ -441,7 +579,7 @@ fn classify(
     bus: &Bus,
     answerer: NodeId,
     st: &AnswererState,
-    rid: Rid,
+    (rid, want): (Rid, Option<Code>),
     lease: Option<&Lease>,
     tx: Option<&TxRef>,
     own_txs: &[BackupTx],
@@ -449,7 +587,7 @@ fn classify(
     detail: &mut Vec<String>,
 ) -> Option<AckClass> {
     // 1. Archive.
-    if let Some((seq, _, _)) = o.bucket.archive.outcome_of(rid) {
+    if let Some((seq, _, _)) = o.bucket.archive.outcome_as(rid, want) {
         detail.push(format!("archive: in applied segment {seq}"));
         return Some(AckClass::Archive);
     }
@@ -458,7 +596,7 @@ fn classify(
     // 2. RootGroup: the lease object's holder and every listed backup.
     match (lease, tx) {
         (Some(l), Some(t)) if t.origin == (0, 0) && !l.backups.is_empty() => {
-            match root_group(o, l, rid, holder_txs) {
+            match root_group(o, l, (rid, want), holder_txs) {
                 Ok(()) => {
                     detail.push("root-group: holder and every listed backup hold it".into());
                     return Some(AckClass::RootGroup);
@@ -479,7 +617,7 @@ fn classify(
     if let Some(t) = tx {
         let (g, i) = t.origin;
         if g != 0 {
-            match deleg_group(o, answerer, st, rid, g, i, t, holder_txs) {
+            match deleg_group(o, answerer, st, (rid, want), g, i, t, holder_txs) {
                 Ok(why) => {
                     detail.push(format!("deleg-group: {why}"));
                     return Some(AckClass::DelegGroup { gen: g });
@@ -573,8 +711,13 @@ fn peer_in_budget(o: &Oracles, bus: &Bus, answerer: NodeId, now_wait: i64) -> Op
 
 /// RootGroup: the lease object's holder's journal and every listed
 /// backup's tail hold the transaction (`Ok`), or why not.
-fn root_group(o: &Oracles, l: &Lease, rid: Rid, holder_txs: &[BackupTx]) -> Result<(), String> {
-    let Some(ht) = find_tx(holder_txs, rid) else {
+fn root_group(
+    o: &Oracles,
+    l: &Lease,
+    (rid, want): (Rid, Option<Code>),
+    holder_txs: &[BackupTx],
+) -> Result<(), String> {
+    let Some(ht) = find_tx(holder_txs, rid, want) else {
         return Err(format!(
             "the lease holder {} (epoch {}) has no journal row of the rid",
             l.holder, l.epoch
@@ -595,7 +738,7 @@ fn root_group(o: &Oracles, l: &Lease, rid: Rid, holder_txs: &[BackupTx]) -> Resu
                 .backup_tail(*e)
                 .map(|tail| {
                     tail.iter()
-                        .any(|t| carries(&t.records, rid) && t.records == ht.records)
+                        .any(|t| carries_as(&t.records, rid, want) && t.records == ht.records)
                 })
                 .unwrap_or(false)
         });
@@ -615,7 +758,7 @@ fn deleg_group(
     o: &Oracles,
     answerer: NodeId,
     st: &AnswererState,
-    rid: Rid,
+    (rid, want): (Rid, Option<Code>),
     g: u64,
     i: u64,
     t: &TxRef,
@@ -625,7 +768,7 @@ fn deleg_group(
     // delegate retired its row by that (`t` was found at the root then).
     let root_has = holder_txs
         .iter()
-        .any(|x| x.origin == (g, i) && carries(&x.records, rid));
+        .any(|x| x.origin == (g, i) && carries_as(&x.records, rid, want));
     if t.node != answerer && !root_has {
         return Err(format!("the row ({g},{i}) is not the answerer's"));
     }
@@ -645,7 +788,10 @@ fn deleg_group(
             };
             let held = store
                 .deleg_backup_tail(g)
-                .map(|tail| tail.iter().any(|d| d.idx == i && carries(&d.records, rid)))
+                .map(|tail| {
+                    tail.iter()
+                        .any(|d| d.idx == i && carries_as(&d.records, rid, want))
+                })
                 .unwrap_or(false);
             if !held {
                 return Err(format!(
@@ -802,6 +948,18 @@ pub struct Findings {
     pub acks_by_class: BTreeMap<String, usize>,
     pub uncommitted_acks: BTreeMap<String, usize>,
     pub unjournaled_refusals: BTreeMap<String, usize>,
+    /// Plan 43 C2a, I1: answers whose rid a transaction carries with
+    /// another outcome (by answer kind), and relays with no judged answer
+    /// of the sequencer they name behind them.
+    pub mismatched_acks: BTreeMap<String, usize>,
+    pub unverified_relays: usize,
+    /// Answers whose claimed class (`AnswerSource::Sequenced`) is not the
+    /// class the judgement found (informational: the first class that
+    /// holds may be stronger than the one the answer waited for).
+    pub class_mismatch: usize,
+    /// Plan 43 C2a, D6 of C0: an unjournaled refusal answered to a client
+    /// whose rid the log later completes (a failure under `strict_settle`).
+    pub unjournaled_landed: Vec<String>,
     /// I1: the descriptions, in emission order.
     pub i1: Vec<String>,
     /// I2 (b): one description per rid queued on two nodes.
@@ -815,10 +973,17 @@ pub struct Findings {
 impl Findings {
     /// The first five violations of each oracle.
     pub fn examples(&self) -> Vec<String> {
-        [&self.i1, &self.i2, &self.i2c, &self.i4, &self.i5]
-            .into_iter()
-            .flat_map(|v| v.iter().take(5).cloned())
-            .collect()
+        [
+            &self.i1,
+            &self.i2,
+            &self.i2c,
+            &self.i4,
+            &self.unjournaled_landed,
+            &self.i5,
+        ]
+        .into_iter()
+        .flat_map(|v| v.iter().take(5).cloned())
+        .collect()
     }
 }
 
@@ -849,15 +1014,45 @@ pub fn end_of_run(
     let acks = o.acks.lock().unwrap();
     let mut non_lone_ok: BTreeSet<Rid> = BTreeSet::new();
     let mut verbatim: BTreeMap<Rid, String> = BTreeMap::new();
-    for a in acks.iter().filter(|a| !a.relay) {
+    for a in acks.iter().filter(|a| !a.is_relay()) {
         let Some(j) = &a.judged else { continue };
         let class = j.class.map_or("none", |c| c.name());
         *f.acks_by_class.entry(class.to_string()).or_default() += 1;
+        if j.mismatch.is_some() {
+            *f.mismatched_acks.entry(a.kind.name()).or_default() += 1;
+        }
+        if a.claimed
+            .is_some_and(|c| Some(c.index()) != j.class.map(|c| c.index()))
+        {
+            f.class_mismatch += 1;
+        }
         if j.class.is_none() {
             if j.expected == Expected::Unjournaled && a.kind.is_refusal() {
                 *f.unjournaled_refusals
                     .entry(a.kind.refusal_name())
                     .or_default() += 1;
+                // `EROFS` (a frozen epoch's refusal) is not final: the
+                // caller retries the op, the sim's client under the same
+                // rid, and the op then runs.
+                let retried = a.kind == OutcomeKind::Refused(Code::ReadOnly);
+                if let Some((seq, i)) = log.completed_at.get(&a.rid).filter(|_| !retried) {
+                    f.unjournaled_landed.push(format!(
+                        "I4 unjournaled_then_landed: rid {:?} was refused ({}) by node {} at t={} ms \
+                         (tick {}) with no refusal in any journal, and the log completes it at \
+                         segment {seq} record {i} (answered {}; what the judgement saw: {})",
+                        a.rid,
+                        a.kind.name(),
+                        a.node,
+                        a.at_ms,
+                        a.tick,
+                        if a.reply {
+                            "as a forward's reply"
+                        } else {
+                            "to its own client"
+                        },
+                        j.detail
+                    ));
+                }
             } else {
                 *f.uncommitted_acks
                     .entry(format!("{}/{}", j.expected.name(), a.kind.name()))
@@ -898,6 +1093,49 @@ pub fn end_of_run(
         }
     }
     f.i2c = verbatim.into_values().collect();
+    // Relays (plan 43 C2a): a requester passing an answer on must have a
+    // sequencer's judged answer of the same outcome behind it, emitted
+    // earlier — else the client heard an answer nobody gave.
+    for a in acks.iter().filter(|a| a.is_relay()) {
+        let from = a.relay_from.unwrap_or(0);
+        let behind = acks.iter().any(|e| {
+            e.node == from
+                && e.rid == a.rid
+                && e.reply
+                && e.tick < a.tick
+                && e.judged.is_some()
+                && e.kind.record_code() == a.kind.record_code()
+        });
+        if !behind {
+            f.unverified_relays += 1;
+            let others: Vec<String> = acks
+                .iter()
+                .filter(|e| e.rid == a.rid)
+                .map(|e| {
+                    format!(
+                        "node {} tick {} {} reply={} relay_from={:?} judged={}",
+                        e.node,
+                        e.tick,
+                        e.kind.name(),
+                        e.reply,
+                        e.relay_from,
+                        e.judged.is_some()
+                    )
+                })
+                .collect();
+            f.i1.push(format!(
+                "I1 acked_implies_committed: relay of rid {:?} ({}) from node {from} by node {} \
+                 at t={} ms (tick {}) with no judged answer of node {from} behind it \
+                 (every answer of the rid: {})",
+                a.rid,
+                a.kind.name(),
+                a.node,
+                a.at_ms,
+                a.tick,
+                others.join("; ")
+            ));
+        }
+    }
     // I4.
     let invokes = o.invokes.lock().unwrap().clone();
     f.i4 = super::check::no_late_landing(in_doubt, &invokes, log).1;
@@ -907,7 +1145,7 @@ pub fn end_of_run(
             let Some(a) = acks
                 .iter()
                 .rev()
-                .find(|a| a.rid == *rid && !a.relay && a.kind == OutcomeKind::Ok)
+                .find(|a| a.rid == *rid && a.judged.is_some() && a.kind == OutcomeKind::Ok)
             else {
                 continue;
             };
@@ -1006,6 +1244,13 @@ mod tests {
         }
     }
 
+    fn refused_seg(epoch: u64, rid: Rid, code: Code) -> Segment {
+        Segment {
+            records: vec![LogRecord::Refused { rid, code }],
+            ..seg(epoch, &[])
+        }
+    }
+
     /// A small world: stores for nodes 1..=3 (all with a 50 ms budget and
     /// no stability window), an empty bus and bucket.
     struct World {
@@ -1051,7 +1296,7 @@ mod tests {
             constellation_meta::execute_mutate(m, &op, Some(rid)).expect("execute");
             Replica::journal_txs_from(&**m, 0, usize::MAX)
                 .into_iter()
-                .find(|t| carries(&t.records, rid))
+                .find(|t| carries_as(&t.records, rid, None))
                 .expect("journaled")
         }
 
@@ -1060,7 +1305,17 @@ mod tests {
                 epoch: 1,
                 records: Vec::new(),
             };
-            committed_at_answer(&self.o, &self.bus, answerer, st, rid, &outcome)
+            self.judge_as(answerer, st, rid, &outcome)
+        }
+
+        fn judge_as(
+            &self,
+            answerer: u64,
+            st: &AnswererState,
+            rid: Rid,
+            outcome: &MutateOutcome,
+        ) -> Judgement {
+            committed_at_answer(&self.o, &self.bus, answerer, st, rid, outcome)
         }
     }
 
@@ -1069,6 +1324,225 @@ mod tests {
             epoch: Some(epoch),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn i1_an_ok_answer_with_a_refusal_in_the_log_is_a_violation() {
+        let w = world();
+        let r = rid(3, 1);
+        w.lease(1, 1, &[]);
+        // The archive carries the rid *refused*; the answer said OK. The
+        // C0 oracle took "some outcome of the rid is archived" for a
+        // commit of what was answered.
+        w.o.bucket
+            .archive
+            .note_segment(1, refused_seg(1, r, Code::Exists));
+        let st = holder_state(1);
+        let j = w.judge(1, &st, r);
+        assert_eq!(j.class, None, "{}", j.detail);
+        let m = j.mismatch.expect("the archive carries another outcome");
+        assert!(
+            m.contains("the archive (segment 1) carries a refusal (EEXIST)"),
+            "{m}"
+        );
+        // The same answer kind as the log's: committed, no mismatch.
+        let j = w.judge_as(1, &st, r, &MutateOutcome::Errno(Code::Exists));
+        assert_eq!(j.class, Some(AckClass::Archive), "{}", j.detail);
+        assert_eq!(j.mismatch, None);
+        // A refusal of another code is another outcome too.
+        let j = w.judge_as(1, &st, r, &MutateOutcome::Errno(Code::NotFound));
+        assert_eq!(j.class, None, "{}", j.detail);
+        assert!(j.mismatch.is_some());
+        // An `Exists` hint and a conflict are refusals of EEXIST / ESTALE.
+        let j = w.judge_as(
+            1,
+            &st,
+            r,
+            &MutateOutcome::Exists {
+                records: Vec::new(),
+                epoch: 1,
+            },
+        );
+        assert_eq!(j.class, Some(AckClass::Archive), "{}", j.detail);
+        let j = w.judge_as(1, &st, r, &MutateOutcome::Conflict { manifest: None });
+        assert!(j.mismatch.is_some(), "{}", j.detail);
+    }
+
+    #[test]
+    fn i1_a_refusal_answer_with_a_completion_in_the_journal_is_a_violation() {
+        let w = world();
+        let r = rid(1, 1);
+        // The answerer's journal completed the rid (it executed it).
+        w.create(1, r, "a");
+        w.lease(1, 1, &[]);
+        let st = holder_state(1);
+        let j = w.judge(1, &st, r);
+        assert_eq!(j.class, Some(AckClass::Lone), "{}", j.detail);
+        assert_eq!(j.mismatch, None);
+        // Answered refused: no transaction carries a refusal, a completion
+        // does. (A lone node's answer to its own client needs no
+        // transaction, so a class still holds: the mismatch is judged
+        // whether or not one does.)
+        let refused = MutateOutcome::Errno(Code::Exists);
+        let j = w.judge_as(1, &st, r, &refused);
+        assert!(j.tx.is_none(), "no transaction carries the refusal");
+        assert_eq!(
+            j.mismatch.as_deref(),
+            Some("the answerer's journal carries a completion")
+        );
+        // The lease holder's journal is read too (a delegate's answer, the
+        // root's row).
+        let w2 = world();
+        let r2 = rid(3, 1);
+        w2.create(1, r2, "b");
+        w2.lease(1, 1, &[]);
+        let j = w2.judge_as(2, &holder_state(1), r2, &refused);
+        assert_eq!(
+            j.mismatch.as_deref(),
+            Some("the lease holder 1's journal carries a completion"),
+            "{}",
+            j.detail
+        );
+    }
+
+    /// The `Findings` of `acks` over a log that completes `completed`.
+    fn findings(acks: Vec<AckEntry>, completed: &[(Rid, (u64, usize))]) -> Findings {
+        let o = Oracles::new(Bucket::new(1, (0, 0)));
+        *o.acks.lock().unwrap() = acks;
+        end_of_run(
+            &o,
+            &log_with(seg(1, &[]), completed),
+            &[],
+            &HashSet::new(),
+            true,
+        )
+    }
+
+    fn ack(node: u64, r: Rid, tick: u64, kind: OutcomeKind, reply: bool) -> AckEntry {
+        AckEntry {
+            node,
+            rid: r,
+            tick,
+            at_ms: tick,
+            kind,
+            reply,
+            relay_from: None,
+            claimed: None,
+            judged: Some(Judgement {
+                class: Some(AckClass::Lone),
+                expected: Expected::Class(AckClass::Lone),
+                tx: None,
+                detail: String::new(),
+                mismatch: None,
+            }),
+        }
+    }
+
+    fn relay(node: u64, from: u64, r: Rid, tick: u64, kind: OutcomeKind) -> AckEntry {
+        AckEntry {
+            relay_from: Some(from),
+            judged: None,
+            ..ack(node, r, tick, kind, false)
+        }
+    }
+
+    #[test]
+    fn i1_a_relay_without_a_judged_answer_is_a_violation() {
+        let r = rid(3, 1);
+        // Node 3 passes on node 2's OK, which node 2 emitted (judged) first.
+        let f = findings(
+            vec![
+                ack(2, r, 1, OutcomeKind::Ok, true),
+                relay(3, 2, r, 2, OutcomeKind::Ok),
+            ],
+            &[],
+        );
+        assert_eq!(f.unverified_relays, 0, "{:?}", f.i1);
+        // The sequencer's answer is of another kind, is not a reply, is
+        // later, or is another node's: the client heard an answer nobody
+        // gave.
+        for acks in [
+            vec![
+                ack(2, r, 1, OutcomeKind::Refused(Code::Exists), true),
+                relay(3, 2, r, 2, OutcomeKind::Ok),
+            ],
+            vec![
+                ack(2, r, 1, OutcomeKind::Ok, false),
+                relay(3, 2, r, 2, OutcomeKind::Ok),
+            ],
+            vec![
+                relay(3, 2, r, 1, OutcomeKind::Ok),
+                ack(2, r, 2, OutcomeKind::Ok, true),
+            ],
+            vec![
+                ack(1, r, 1, OutcomeKind::Ok, true),
+                relay(3, 2, r, 2, OutcomeKind::Ok),
+            ],
+            vec![relay(3, 2, r, 2, OutcomeKind::Ok)],
+        ] {
+            let f = findings(acks, &[]);
+            assert_eq!(f.unverified_relays, 1, "{:?}", f.i1);
+            assert!(
+                f.i1[0].contains("relay of rid") && f.i1[0].contains("from node 2"),
+                "{:?}",
+                f.i1
+            );
+        }
+        // An unjudged sequencer answer (no store: not judged) does not
+        // back a relay.
+        let mut unjudged = ack(2, r, 1, OutcomeKind::Ok, true);
+        unjudged.judged = None;
+        let f = findings(vec![unjudged, relay(3, 2, r, 2, OutcomeKind::Ok)], &[]);
+        assert_eq!(f.unverified_relays, 1);
+    }
+
+    #[test]
+    fn i1_a_requester_that_re_executes_as_holder_is_judged() {
+        // Node 2 replied OK to node 3's forward; node 3 then took the lease
+        // and answered the same rid OK to its own client by executing it
+        // (`Sequenced`). The C0 oracle took that for a relay of node 2's
+        // reply (same rid, same kind, another node) and never judged it.
+        use constellation_authority::AnswerSource;
+        let treat = |s| super::answer_treatment(s);
+        let t = treat(Some(AnswerSource::Sequenced(AckClass::Lone)));
+        assert!(t.judge && t.relay_from.is_none());
+        assert_eq!(t.claimed, Some(AckClass::Lone));
+        // A `MutateReply` (no source) is a sequencer's answer: judged.
+        let t = treat(None);
+        assert!(t.judge && t.relay_from.is_none() && t.claimed.is_none());
+        // Only an explicit relay is not judged, and it names its sender.
+        let t = treat(Some(AnswerSource::Relayed { from: 2 }));
+        assert!(!t.judge);
+        assert_eq!(t.relay_from, Some(2));
+        // A node's own error is not a sequencer's answer: not judged, not a
+        // relay, counted apart.
+        let t = treat(Some(AnswerSource::None));
+        assert!(!t.judge && t.relay_from.is_none() && t.unsourced);
+    }
+
+    #[test]
+    fn i4_an_unjournaled_refusal_whose_rid_completes_is_reported() {
+        let r = rid(1, 1);
+        let mut a = ack(1, r, 1, OutcomeKind::Refused(Code::Again), false);
+        if let Some(j) = a.judged.as_mut() {
+            j.class = None;
+            j.expected = Expected::Unjournaled;
+        }
+        let f = findings(vec![a.clone()], &[]);
+        assert!(f.unjournaled_landed.is_empty());
+        assert_eq!(f.unjournaled_refusals.values().sum::<usize>(), 1);
+        let f = findings(vec![a.clone()], &[(r, (1, 0))]);
+        assert_eq!(f.unjournaled_landed.len(), 1, "{:?}", f.unjournaled_landed);
+        assert!(f.unjournaled_landed[0].contains("unjournaled_then_landed"));
+        // `EROFS` is not a final answer (the caller retries the op, and it
+        // runs): not a refusal that landed.
+        a.kind = OutcomeKind::Refused(Code::ReadOnly);
+        let f = findings(vec![a], &[(r, (1, 0))]);
+        assert!(
+            f.unjournaled_landed.is_empty(),
+            "{:?}",
+            f.unjournaled_landed
+        );
     }
 
     #[test]

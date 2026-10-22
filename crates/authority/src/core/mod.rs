@@ -1180,6 +1180,12 @@ pub struct Stats {
     /// ended. Nothing was journaled.
     pub lock_lapsed_refusals: u64,
     pub unacked_replays_refused: u64,
+    /// Plan 43 C2a: definitive answers this node gave as a sequencer, by
+    /// the class they waited for (`AckClass::index`: archive, root-group,
+    /// deleg-group, non-stealable, lone) — a `MutateReply` to a requester,
+    /// or an outcome to this node's own client that was not another node's
+    /// answer passed on.
+    pub ack_classes: [u64; 5],
     // ---- M10: heartbeat promises ----
     /// Promises persisted and PUT (on an observed unrenewed expiry, on a
     /// peer's request, or to advertise a changed slack).

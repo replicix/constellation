@@ -409,6 +409,11 @@ impl EngineControl {
                     refusals_journaled: stats.refusals_journaled,
                     unacked_replays_refused: stats.unacked_replays_refused,
                     reads_durability_blocked: s.durability_blocked,
+                    classes: a
+                        .classes
+                        .iter()
+                        .map(|(name, n)| (name.to_string(), *n))
+                        .collect(),
                     store_priority_lock_waits: gate.priority_lock_waits,
                     store_priority_lock_wait_us: gate.priority_lock_wait_us,
                     store_priority_lock_wait_max_us: gate.priority_lock_wait_max_us,

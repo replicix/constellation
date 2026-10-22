@@ -16,6 +16,7 @@
 //! there is no lock a handler could await, and no in-flight round it could
 //! wait on, because a round is just core state advanced by events.
 
+use crate::core::AckClass;
 use crate::event::PeerMsg;
 use crate::ids::{Epoch, NodeId, OpId, Seq, TimerId, WaitMs};
 use constellation_fs_core::Ino;
@@ -27,8 +28,14 @@ use constellation_store_s3::{Lease, LeaseTag};
 /// One thing for the driver to do.
 #[derive(Debug)]
 pub enum Action {
-    /// Answer the local client that submitted `rid`.
-    Reply { rid: Rid, reply: ClientReply },
+    /// Answer the local client that submitted `rid`. `source` says who
+    /// decided an outcome (plan 43 C2a); the engine ignores it, the
+    /// simulation's I1 oracle judges by it.
+    Reply {
+        rid: Rid,
+        reply: ClientReply,
+        source: AnswerSource,
+    },
     /// Send a message to a peer. For a message whose `PeerMsg::requests`
     /// is `Some`, the driver reports `Event::PeerFailed` if it cannot be
     /// delivered; the core's own timers bound the wait for a reply.
@@ -150,6 +157,26 @@ pub enum Action {
         op: OpId,
         result: Result<ControlOk, String>,
     },
+}
+
+/// Plan 43 C2a: who decided the outcome a client is answered with (the
+/// simulation's I1 oracle judges the `Sequenced` answers and verifies the
+/// `Relayed` ones; `Stats::ack_classes` counts the `Sequenced` ones per
+/// class).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnswerSource {
+    /// This node decided it, as a sequencer — or read it from its applied
+    /// log (`Archive`), as an inbox op's outcome is. The class is what the
+    /// answer waited for.
+    Sequenced(AckClass),
+    /// Another node's `MutateReply`, passed on: the sequencer's own
+    /// emission was judged where it left. (An op that waited for the log
+    /// to carry what the sequencer accepted is answered what the log
+    /// carries: `Sequenced(Archive)`, which can differ from it.)
+    Relayed { from: NodeId },
+    /// `InDoubt`, and every outcome no sequencer decided (an error of this
+    /// node's own, such as a shadow that could not be installed).
+    None,
 }
 
 /// The answer to `Event::Submit`.

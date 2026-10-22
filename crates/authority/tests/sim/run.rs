@@ -904,6 +904,17 @@ pub struct Report {
     pub acks_by_class: BTreeMap<String, usize>,
     pub uncommitted_acks: BTreeMap<String, usize>,
     pub unjournaled_refusals: BTreeMap<String, usize>,
+    /// Plan 43 C2a, I1: judged answers whose rid a transaction carries with
+    /// another outcome (by answer kind); relays with no judged answer of
+    /// the sequencer they name behind them; answers whose claimed class was
+    /// not the class judged (informational); outcomes no sequencer decided
+    /// (a node's own error, not judged); and unjournaled refusals whose rid
+    /// the log completes (D6 of C0: fails under `strict_settle`).
+    pub mismatched_acks: BTreeMap<String, usize>,
+    pub unverified_relays: usize,
+    pub class_mismatch: usize,
+    pub acks_unsourced: usize,
+    pub unjournaled_landed: usize,
     /// Answers with no recorded request (must be 0).
     pub acks_unmapped: usize,
     /// I2 (b): rids queued on two nodes at once; (c): answered under a
@@ -3999,9 +4010,28 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         &rolled_back,
         converged_checkable,
     );
+    // `AUTHORITY_SIM_ORACLE_DEBUG=1`: what the end of the run found (the
+    // relays no judged answer backs, the unjournaled refusals that landed).
+    if std::env::var_os("AUTHORITY_SIM_ORACLE_DEBUG").is_some() {
+        for text in found
+            .i1
+            .iter()
+            .filter(|t| t.contains("relay of rid"))
+            .chain(&found.unjournaled_landed)
+        {
+            eprintln!("ORACLE-END {text}");
+        }
+    }
     report.acks_by_class = found.acks_by_class.clone();
     report.uncommitted_acks = found.uncommitted_acks.clone();
     report.unjournaled_refusals = found.unjournaled_refusals.clone();
+    report.mismatched_acks = found.mismatched_acks.clone();
+    report.unverified_relays = found.unverified_relays;
+    report.class_mismatch = found.class_mismatch;
+    report.unjournaled_landed = found.unjournaled_landed.len();
+    report.acks_unsourced = oracles
+        .acks_unsourced
+        .load(std::sync::atomic::Ordering::Relaxed) as usize;
     report.acks_unmapped = oracles
         .acks_unmapped
         .load(std::sync::atomic::Ordering::Relaxed) as usize;
@@ -4012,10 +4042,13 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.oracle_examples = found.examples();
     let counters = format!(
         "oracle counters: acks by class {:?}, uncommitted {:?}, unjournaled refusals {:?}, \
-         identity copies {}, non-verbatim {}, late landings {}, non-lone rollbacks {}",
+         mismatched {:?}, unverified relays {}, identity copies {}, non-verbatim {}, \
+         late landings {}, non-lone rollbacks {}",
         report.acks_by_class,
         report.uncommitted_acks,
         report.unjournaled_refusals,
+        report.mismatched_acks,
+        report.unverified_relays,
         report.identity_copies,
         report.non_verbatim,
         report.late_landings,
@@ -4026,6 +4059,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         (cfg.strict_identity, "I2", &found.i2),
         (cfg.strict_identity, "I2c", &found.i2c),
         (cfg.strict_settle, "I4", &found.i4),
+        (cfg.strict_settle, "I4", &found.unjournaled_landed),
         (cfg.strict_lone, "I5", &found.i5),
     ] {
         if strict {

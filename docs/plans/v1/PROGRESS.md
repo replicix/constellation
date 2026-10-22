@@ -56544,3 +56544,99 @@ With reboots drawn in the lock configurations, the fix changes nothing there: `l
 [222, 469, 784], `-production-ttl` [1224], `-writes` [207] before and after (the open lock
 finding); this commit keeps them unrebooted, so they sweep clean as on main.
 `delegated-core-stall-unlaned` fails every seed on both sides (its negative control).
+
+## Plan 43 C2a: the I1 oracle checks the answer's outcome and judges every answer that is not a verified relay (2026-10-22)
+
+First of C2's commits that need no C1 (spec `c2-spec.md` §12: C2a and C2b). It changes no behaviour: the core's
+decisions are the ones it made before, it only names them, and the oracle that judges them stops guessing.
+
+### What landed
+
+- **The core says who decided every answer** (`Action::Reply { rid, reply, source }`, `AnswerSource`): `Sequenced(class)`
+  (this node decided it as a sequencer; the class is what the answer waits for), `Relayed { from }` (another node's
+  `MutateReply` passed on) or `None` (`InDoubt`, and an outcome no sequencer decided: a node's own error). `finish` is the
+  one emitter of an outcome and takes the source from `ClientOp.answered_by`, which whatever decides the outcome sets just
+  before it (`finish_as`): an execution here (`Core::execute_local`, the delegate's `delegate_execute_now`, the dedup and
+  in-doubt answers read off `completed`), a reply passed on (`on_mutate_reply`), the log (`answer_awaiting_log`,
+  `reroute_ended_epoch_waits`: `Sequenced(Archive)`). A definitive outcome nobody named is a `debug_assert!` (an invariant of
+  the core), `Sequenced(Archive)` in release. The engine ignores the source (`..`).
+- The class rides on `ParkedWhat::{Reply, Finish}` and the immediate answers; **`Stats.ack_classes`** counts the sequenced
+  answers per class (`Core::send_answer`, `finish`), `status.ack.classes` reports them (control wire `AckStatus.classes`,
+  schema re-blessed). The class is read from today's gating (`Core::root_ack_class`: epoch hold, `ack=s3`, a listed or
+  doubted backup, a backup being had, else `Lone`; `Core::deleg_ack_class`: `ack=s3`, a recorded backup, a designation, else
+  `Lone`). C2c's `ack_class` replaces both.
+- **Oracle** (`tests/sim/oracle.rs`, `node.rs`):
+  1. an answer's outcome kind must match the log's: the archive index stores the outcome's code, `carries_as` /
+     `find_tx` / `root_group` / `deleg_group` / the archive check read with the answer's `record_code()`, and a rid carried
+     with another outcome by the archive, the answerer's journal or the lease holder's is an I1 violation of its own
+     (`mismatched_acks`), whether or not a class holds;
+  2. relays are verified, not guessed: the `reply_kinds` heuristic is deleted; only `Relayed` is not judged, and at the end
+     of the run an earlier judged `MutateReply` of the node it names, with the same outcome, must exist
+     (`unverified_relays`, an I1 violation); a requester that took the lease and executed the rid is `Sequenced` and judged;
+  3. D6 of C0: `unjournaled_landed`, an unjournaled refusal whose rid the log completes (fails under `strict_settle`; an
+     `EROFS`, which the caller retries, is not one);
+  4. `class_mismatch` (the core's claimed class is not the one judged: informational), `acks_unsourced`; the sweep prints
+     all of them and the cores' own count of sequenced answers per class. The fingerprint leaves the new counters out.
+
+### Evidence
+
+- Fail-before: the oracle's `i1_an_ok_answer_with_a_refusal_in_the_log_is_a_violation`,
+  `i1_a_refusal_answer_with_a_completion_in_the_journal_is_a_violation`, `i1_a_relay_without_a_judged_answer_is_a_violation`
+  and `i4_an_unjournaled_refusal_whose_rid_completes_is_reported` fail with the C0 oracle's rules put back (the carries
+  check by rid only, no relay verification, no landed check: shown on the build host, below); `i1_a_requester_that_re_executes_as_holder_is_judged`
+  and the core's four `answer_sources` tests exercise API that does not exist on the parent (they do not compile there; the
+  behaviour they pin, that a requester's own execution of a rid is judged, is what the heuristic got wrong).
+- **Fingerprints** (`AUTHORITY_SIM_FINGERPRINT=1`, base `main` against C2a): `backup` 700..1000, `long-delegated` 0..200,
+  `delegated-holder-cut` 0..300, `locks` 0..300: every seed's fingerprint equal (0 of 1100 differ).
+- **The C0 baseline re-counted** with the fixed oracle (release build, 4 threads, flags off, tmpfs temp dir; "main" is the C0 oracle on
+  today's main, "C2a" the fixed oracle on the same schedules; the C0 table's own numbers moved a little with the fixes landed
+  since, e.g. `long-delegated` 83 193 then, 83 210 now). Seeds as C0's table, `backup`/`backup-crash` ×600 and
+  `long-delegated-late-answers`/`delegated-holder-cut` ×1000:
+
+| Config | Seeds | I1 uncommitted (main) | I1 uncommitted (C2a) | kind mismatches | unverified relays | unjournaled landed | failing |
+|---|---|---|---|---|---|---|---|
+| `acks3-crash` | 900..1100 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `backup` | 700..1300 | 913 | 913 | 0 | 0 | 0 | 0 |
+| `backup-crash` | 800..1400 | 1004 | 1004 | 0 | 0 | 0 | 0 |
+| `backup-hot` | 0..300 | 813 | 813 | 0 | 0 | 0 | 0 |
+| `backup-strict` | 0..300 | 526 | 526 | 0 | 0 | 0 | 0 |
+| `backup-two` | 0..2000 | 3163 | 3163 | 0 | 0 | 0 | 0 |
+| `delegated-backup` | 0..2000 | 13 | 13 | 0 | 0 | 0 | 0 |
+| `delegated-holder-cut` | 0..1000 | 126 | 126 | 0 | 0 | 0 | 0 |
+| `delegated-two-gens-root-crash` | 0..500 | 32074 | 32074 | 0 | 0 | 0 | 0 |
+| `far` | 0..300 | 7113 | 7113 | 0 | 0 | 0 | 0 |
+| `flex` | 0..500 | 12548 | 12548 | 0 | 0 | 0 | 0 |
+| `flex-crash` | 0..500 | 13368 | 13368 | 0 | 0 | 0 | 0 |
+| `locks` | 0..300 | 7200 | 7200 | 0 | 0 | 0 | 0 |
+| `locks-delegated` | 0..300 | 7900 | 7900 | 0 | 0 | 0 | 0 |
+| `long-acks3` | 0..300 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `long-backup` | 0..1000 | 1970 | 1970 | 0 | 0 | 0 | 0 |
+| `long-delegated` | 0..2000 | 83210 | 83210 | 0 | 0 | 0 | 0 |
+| `long-delegated-backup` | 0..500 | 391 | 391 | 0 | 0 | 1 | 0 |
+| `long-delegated-late-answers` | 0..1000 | 2302 | 2302 | 0 | 0 | 2 | 0 |
+| `placement-hot` | 0..300 | 127 | 127 | 0 | 0 | 0 | 0 |
+  The uncommitted counts do not change (the fix adds checks, it removes none), and **no answer is newly flagged by the kind
+  check** (0 mismatches in every sweep of the table). What the new checks flagged, and what each was:
+  - **1 unverified relay** (`long-delegated` seed 1297): node 3 passed `ENOENT` on to its client as node 2's, while node 2's
+    only reply was an `OK`. An oracle false positive of my labelling, not of the core: the `OK` was a delegate's tentative
+    acceptance, its generation ended, the rid ran again and was refused; the requester (`AwaitingLog`) answered what the
+    log carries. Fixed in the source, not suppressed: an outcome read from the log is `Sequenced(Archive)` (judged: the
+    archive carries the refusal), only a reply passed on as it came is `Relayed`.
+  - **57 unjournaled landed in `flex-crash`**: all `EROFS`, a frozen epoch's refusal, which the caller (the sim's client)
+    retries under the same rid and which then runs. A false positive of the check, fixed (an `EROFS` is not final).
+  - **4 unjournaled landed, real** (`long-delegated-backup` seeds 252 and 501, `long-delegated-late-answers` seeds 5 and
+    902; 1 and 2 in the table's ranges): a refusal (`EEXIST` hint, `ENOENT`) given to a forwarder while no journal holds a
+    `Refused` for the rid, and the log later completes the rid. Each is emitted at the very millisecond a taking-over
+    delegate's strand rolls its rows back ("takeover stranded speculative state; rolled back, replaying", `local=1..3`): the
+    delegate's parked acknowledgement was released because its row had left the journal (`deleg_stream_durable`'s `!pending()`
+    arm), the rid replayed and landed. Not an oracle error: the client was told "refused" for an op the log carries. Closed by
+    C2b (D7: such a park is aborted, not released): 0 in the same seeds after it.
+  - `class_mismatch` (informational): 44 213 answers over the table's sweeps whose claimed class is not the judged one
+    (the first class that holds is often stronger: an archive-held answer claimed `Lone`, a root-group row already archived).
+- `delegated-long-delegation` 0..300: I1 uncommitted 44 688 (archive 31 111, deleg-group 13 577), identical to spec §14's
+  numbers, 0 failing seeds, 0 mismatches, 0 unverified relays.
+- The M11 configurations `delegated-crash`, `-partition`, `-root-crash` and `shared-dir*` are sweep names now (they ran only
+  through fixed seed ranges of the suite).
+- Gates (the C2a state alone and the series, build host, debug): `cargo fmt --all --check`; `cargo clippy --workspace
+  --all-targets -- -D warnings`; `cargo test` of authority (lib, sim suite), control
+  (schema re-blessed: `AckStatus.classes`), meta, engine.

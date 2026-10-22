@@ -393,7 +393,8 @@ impl Core {
         // An earlier attempt (P2P, or a previous epoch's batch) may have
         // executed it already.
         if let Some(outcome) = super::client::completed_as_outcome(replica, rid, epoch) {
-            self.finish(now, rid, outcome, replica, out);
+            let source = self.completed_source(replica, rid);
+            self.finish_as(now, rid, outcome, source, replica, out);
             return;
         }
         let Some(c) = self.clients.get_mut(&rid) else {

@@ -1377,7 +1377,14 @@ See [Configuration](../configuration.md) for parsing rules.
   `s3_fast_takeovers` (triggers, not wins), `dead_root_acquires` (TTL
   takeovers started for ops waiting on a dead root), `ack_floor_waits`,
   `stale_liveness_refusals`, `epoch_carry_refused`,
-  `refusals_journaled`, `reads_durability_blocked`;
+  `refusals_journaled`, `reads_durability_blocked`; `classes`
+  (plan 43 C2a): the definitive answers this node gave as a sequencer
+  (an answer to a forwarder, or to its own client when it was not
+  another node's answer passed on) by what they waited for, as
+  `[name, count]` pairs for `archive`, `root-group`, `deleg-group`,
+  `non-stealable` and `lone` — the class a row has under today's gating
+  (`Core::root_ack_class`, `Core::deleg_ack_class`); a `lone` answer to
+  another node's forward is the speculation plan 43 C2 removes;
 - `epoch`: `epoch_slack`, `carrier`, `promise_until_ms`,
   `promise_puts`, `promise_requests_answered`,
   `promise_requests_refused`, `promise_checks`,

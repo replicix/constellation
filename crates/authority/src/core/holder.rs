@@ -224,9 +224,10 @@ impl Core {
                     super::delegate::RecallPlan::Wait(w) => w,
                     super::delegate::RecallPlan::Refuse(code) => {
                         if req != OpId(0) {
-                            out.push(Action::Send {
-                                to: from,
-                                msg: PeerMsg::MutateReply {
+                            let class = self.root_ack_class();
+                            self.send_answer(
+                                from,
+                                PeerMsg::MutateReply {
                                     req,
                                     outcome: MutateOutcome::Errno(code),
                                     base: None,
@@ -235,7 +236,9 @@ impl Core {
                                     own_chunks: OwnChunks::None,
                                     own_rows: None,
                                 },
-                            });
+                                class,
+                                out,
+                            );
                         }
                         return;
                     }
@@ -332,6 +335,8 @@ impl Core {
             None => None,
         };
         let durable = self.ack_need(&position);
+        // Plan 43 C2a: what this answer waits for, whether it parks or not.
+        let class = self.root_ack_class();
         if wait.is_some() || durable.is_some() {
             // Only an acknowledgement's wait for durability says now what
             // it waits for (`held_for_upload`); the rest is worked out
@@ -355,6 +360,7 @@ impl Core {
                 base,
                 position,
                 0,
+                class,
                 out,
             );
             if let Some(b) = blockers {
@@ -388,9 +394,9 @@ impl Core {
         } else {
             self.own_reply_parts(from, rid, &outcome, (0, &position), replica)
         };
-        out.push(Action::Send {
-            to: from,
-            msg: PeerMsg::MutateReply {
+        self.send_answer(
+            from,
+            PeerMsg::MutateReply {
                 req,
                 outcome,
                 base,
@@ -399,7 +405,9 @@ impl Core {
                 own_chunks,
                 own_rows,
             },
-        });
+            class,
+            out,
+        );
     }
 
     /// EC2 campaign 8 A-1: a peer forwarded an op to this node, which does

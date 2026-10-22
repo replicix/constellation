@@ -54,8 +54,8 @@
 //! by an operator's `delegate` after the epoch closed.
 
 use super::backup::{FreshHold, FreshVerdict};
-use super::{Core, Timer};
-use crate::action::{Action, ControlOk};
+use super::{AckClass, Core, Timer};
+use crate::action::{Action, AnswerSource, ControlOk};
 use crate::event::PeerMsg;
 use crate::ids::{HonourMs, NodeId, Now, OpId, TimerId, WaitMs};
 use crate::replica::Replica;
@@ -1146,6 +1146,10 @@ impl Core {
         } else {
             self.own_chunks_for(from, rid, &outcome, (gen, &position), replica)
         };
+        // Plan 43 C2a: what this answer waits for (not what it waited for:
+        // a dedup answer, or one whose row is already on the backup, is
+        // still of the class the generation gives now).
+        let class = self.deleg_ack_class(gen);
         if let Some(idx) = exec_idx {
             if self.deleg_ack_gated(gen) && !self.deleg_stream_durable(gen, idx, replica) {
                 self.stats.deleg_acks_parked += 1;
@@ -1153,7 +1157,11 @@ impl Core {
                     if let Some(c) = self.clients.get_mut(&rid) {
                         c.phase = super::client::Phase::Recalling;
                     }
-                    super::readindex::ParkedWhat::Finish { rid, outcome }
+                    super::readindex::ParkedWhat::Finish {
+                        rid,
+                        outcome,
+                        class,
+                    }
                 } else {
                     super::readindex::ParkedWhat::Reply {
                         to: from,
@@ -1165,6 +1173,7 @@ impl Core {
                         gen,
                         held_timer: None,
                         blockers: None,
+                        class,
                     }
                 };
                 self.park_stream_need(now, gen, idx, what);
@@ -1179,13 +1188,20 @@ impl Core {
             }
         }
         if from == 0 {
-            self.finish(now, rid, outcome, replica, out);
+            self.finish_as(
+                now,
+                rid,
+                outcome,
+                AnswerSource::Sequenced(class),
+                replica,
+                out,
+            );
             return;
         }
         if let Some(req) = req {
-            out.push(Action::Send {
-                to: from,
-                msg: PeerMsg::MutateReply {
+            self.send_answer(
+                from,
+                PeerMsg::MutateReply {
                     req,
                     outcome,
                     base,
@@ -1197,7 +1213,25 @@ impl Core {
                     // everything through the position.
                     own_rows: None,
                 },
-            });
+                class,
+                out,
+            );
+        }
+    }
+
+    /// Plan 43 C2a: the class of an answer this delegate gives for `gen`,
+    /// by what it waits for today ([`Self::deleg_ack_gated`]): the archive
+    /// under `ack=s3`, the group of the recorded backup, a designation's
+    /// non-stealable rows, and otherwise nothing but this disk — `Lone`,
+    /// whoever is answered.
+    pub fn deleg_ack_class(&self, gen: u64) -> AckClass {
+        if self.cfg.ack_s3 {
+            return AckClass::Archive;
+        }
+        match self.dl.mine.get(&gen) {
+            Some(d) if d.backup.is_some() => AckClass::DelegGroup { gen },
+            Some(d) if d.designated => AckClass::NonStealable,
+            _ => AckClass::Lone,
         }
     }
 

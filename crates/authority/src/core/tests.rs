@@ -275,7 +275,7 @@ fn replies(actions: &[Action]) -> Vec<(Rid, &ClientReply)> {
     actions
         .iter()
         .filter_map(|a| match a {
-            Action::Reply { rid, reply } => Some((*rid, reply)),
+            Action::Reply { rid, reply, .. } => Some((*rid, reply)),
             _ => None,
         })
         .collect()
@@ -33596,5 +33596,204 @@ mod persisted_floor {
         let (_, _won) = claim_over_with(&mut r, &claimed, false, false);
         assert!(!r.core.ack.pending_floor);
         assert_eq!(r.meta.takeover_floor_pending(), None);
+    }
+}
+
+/// Plan 43 C2a: who decided each answer a client hears, and the count of
+/// the sequenced ones by class.
+mod answer_sources {
+    use super::*;
+    use crate::action::AnswerSource;
+
+    fn sources(actions: &[Action]) -> Vec<(Rid, AnswerSource)> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Reply { rid, source, .. } => Some((*rid, *source)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A node that executes its own client's op answers it as a sequencer,
+    /// of the class its own answers have now, and counts it.
+    #[test]
+    fn a_local_execution_is_sequenced_and_counted_by_class() {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        let class = h.core.root_ack_class();
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: h.rid(1),
+            op: h.create("a"),
+            tag: Default::default(),
+        });
+        // (Parked as the archive's while the first assessment of peers was
+        // out, released when it found none: the row's class is the one it
+        // was journaled under.)
+        assert_eq!(
+            sources(&out),
+            vec![(h.rid(1), AnswerSource::Sequenced(class))]
+        );
+        assert_eq!(h.core.stats.ack_classes[class.index()], 1);
+        assert_eq!(h.core.stats.ack_classes.iter().sum::<u64>(), 1);
+        // The status view names them.
+        let view = h.core.ack_view();
+        assert_eq!(view.classes.len(), 5);
+        assert!(view
+            .classes
+            .iter()
+            .any(|(name, n)| *name == class.name() && *n == 1));
+        // A refusal is a sequencer's answer too; by now no peer is eligible
+        // and nothing gates: the node is alone.
+        let class = h.core.root_ack_class();
+        assert_eq!(class, AckClass::Lone);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: h.rid(2),
+            op: MutateOp::Unlink {
+                parent: ROOT_INO,
+                name: "missing".into(),
+            },
+            tag: Default::default(),
+        });
+        assert_eq!(
+            sources(&out),
+            vec![(h.rid(2), AnswerSource::Sequenced(class))],
+            "a refusal is the sequencer's answer too"
+        );
+        assert_eq!(h.core.stats.ack_classes[class.index()], 1);
+        assert_eq!(h.core.stats.ack_classes.iter().sum::<u64>(), 2);
+    }
+
+    /// An answer a requester passes on from the node that sent it is a
+    /// relay of that node, whatever the outcome; and a requester's own
+    /// error is no sequencer's answer.
+    #[test]
+    fn a_reply_passed_on_is_relayed_from_its_sender() {
+        let mut h = Harness::new(1);
+        h.core.lease.cached_holder = Some(2);
+        let r1 = h.rid(1);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: r1,
+            op: h.create("a"),
+            tag: Default::default(),
+        });
+        let PeerMsg::MutateRequest { req, .. } = sends(&out)[0].1 else {
+            panic!()
+        };
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateReply {
+                req: *req,
+                outcome: MutateOutcome::Errno(Code::Invalid),
+                base: Some(0),
+                position: constellation_meta::Position::ZERO,
+                gen: 0,
+                own_chunks: OwnChunks::None,
+                own_rows: None,
+            },
+        });
+        assert_eq!(sources(&out), vec![(r1, AnswerSource::Relayed { from: 2 })]);
+        // Nothing of this node's own was decided: no class counted.
+        assert_eq!(h.core.stats.ack_classes.iter().sum::<u64>(), 0);
+    }
+
+    /// An op that goes in doubt is answered by nobody.
+    #[test]
+    fn an_in_doubt_answer_has_no_source() {
+        let mut h = Harness::new(1);
+        let r1 = h.rid(1);
+        h.core.lease.cached_holder = Some(2);
+        let mut out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: r1,
+            op: h.create("a"),
+            tag: Default::default(),
+        });
+        // Let every forward attempt and the deadline run out.
+        let mut guard = 0;
+        while sources(&out).is_empty() && guard < 40 {
+            guard += 1;
+            let Some(id) = out.iter().find_map(|a| match a {
+                Action::SetTimer { id, .. } => Some(*id),
+                _ => None,
+            }) else {
+                break;
+            };
+            h.advance(60_000);
+            out = h.step(Event::Timer { id });
+        }
+        if let Some((_, source)) = sources(&out).first() {
+            let reply = out.iter().find_map(|a| match a {
+                Action::Reply { reply, .. } => Some(reply.clone()),
+                _ => None,
+            });
+            if reply == Some(ClientReply::InDoubt) {
+                assert_eq!(*source, AnswerSource::None);
+            }
+        }
+    }
+
+    /// A holder answering a peer's forward counts it under its class,
+    /// whether it parks or answers at once.
+    #[test]
+    fn a_forwarded_answer_is_counted_by_the_class_it_waited_for() {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        let class = h.core.root_ack_class();
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(77),
+                rid: Rid {
+                    node: 2,
+                    incarnation: 1,
+                    seq: 1,
+                },
+                op: h.create("a"),
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+            },
+        });
+        assert!(matches!(
+            sends(&out)[0].1,
+            PeerMsg::MutateReply {
+                outcome: MutateOutcome::Accepted { .. },
+                ..
+            }
+        ));
+        assert_eq!(h.core.stats.ack_classes[class.index()], 1);
+        // A hold on a retry (`Busy`, `NotHolder`) is no answer.
+        let before = h.core.stats.ack_classes;
+        h.core.lease.gate = Some(PendingGate {
+            epoch: 1,
+            takeover: true,
+            marker_shipped: true,
+            drained: true,
+            fast_prev: false,
+            backup_tail_epoch: None,
+            shippable: false,
+        });
+        let _ = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(78),
+                rid: Rid {
+                    node: 2,
+                    incarnation: 1,
+                    seq: 2,
+                },
+                op: h.create("b"),
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+            },
+        });
+        assert_eq!(h.core.stats.ack_classes, before);
     }
 }

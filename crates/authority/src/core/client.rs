@@ -10,8 +10,9 @@
 //! and gets the same retries, but its outcome goes to the replay drain,
 //! never to a client.
 
-use super::{Core, S3For, Timer};
-use crate::action::{Action, ClientReply, S3Op};
+use super::backup::is_answer;
+use super::{AckClass, Core, S3For, Timer};
+use crate::action::{Action, AnswerSource, ClientReply, S3Op};
 use crate::event::{PeerMsg, Policy, S3Result};
 use crate::ids::{Epoch, NodeId, Now, OpId, WaitMs};
 use crate::replica::Replica;
@@ -161,6 +162,11 @@ pub(crate) struct ClientOp {
     /// this op's observation does not owe (`Core::settle_own_rows`): an
     /// `AwaitingLog` op observes its position once the log answered it.
     pub excused: Vec<(u64, u64)>,
+    /// Plan 43 C2a: who decided the outcome this op will be answered with,
+    /// set by whatever decides it (an execution here, a reply passed on, a
+    /// row read from the log) just before `finish`. Unset when `finish`
+    /// emits a definitive outcome is a bug.
+    pub answered_by: Option<AnswerSource>,
 }
 
 /// Chunk metered-own-rows: an observed position's pending upload
@@ -502,6 +508,7 @@ impl Core {
                 own_record_inos: BTreeSet::new(),
                 own_record_uploaded: false,
                 excused: Vec::new(),
+                answered_by: None,
                 tag,
             },
         );
@@ -1189,10 +1196,11 @@ impl Core {
                     // Delivered by the log already; the rest of what the
                     // holder evaluated against normally came with it.
                     self.observe_reply(now, rid, position, &own_chunks, replica, out);
-                    self.finish(
+                    self.finish_as(
                         now,
                         rid,
                         MutateOutcome::Accepted { epoch, records },
+                        AnswerSource::Relayed { from },
                         replica,
                         out,
                     );
@@ -1204,10 +1212,11 @@ impl Core {
                 // this reply — installed already, in the holder's order.
                 if self.adopt_streamed(rid, &position, replica) {
                     replica.note_covering(KeySet::from_records(&records), position);
-                    self.finish(
+                    self.finish_as(
                         now,
                         rid,
                         MutateOutcome::Accepted { epoch, records },
+                        AnswerSource::Relayed { from },
                         replica,
                         out,
                     );
@@ -1215,6 +1224,11 @@ impl Core {
                 }
                 let c = self.clients.get_mut(&rid).expect("present");
                 c.phase = Phase::AwaitingLog { epoch, position };
+                // What the pre-S3 stream brings (`answer_awaiting_streamed`)
+                // is this sequencer's own transaction, its answer passed on;
+                // an outcome read from the log is the log's
+                // (`answer_awaiting_log`).
+                c.answered_by = Some(AnswerSource::Relayed { from });
                 // Chunk metered-own-rows (OVH run 31): a replay of a
                 // stranded op waits for a transaction the sequencer's
                 // stream may have carried here already — before this
@@ -1253,10 +1267,11 @@ impl Core {
                         // covers its keys (the parent directory's
                         // attributes included) up to the reply's position.
                         replica.note_covering(KeySet::from_records(&records), position);
-                        self.finish(
+                        self.finish_as(
                             now,
                             rid,
                             MutateOutcome::Accepted { epoch, records },
+                            AnswerSource::Relayed { from },
                             replica,
                             out,
                         );
@@ -1273,10 +1288,11 @@ impl Core {
                             self.lease_path(now, rid, replica, out);
                         } else {
                             self.observe_reply(now, rid, position, &own_chunks, replica, out);
-                            self.finish(
+                            self.finish_as(
                                 now,
                                 rid,
                                 MutateOutcome::Accepted { epoch, records },
+                                AnswerSource::Relayed { from },
                                 replica,
                                 out,
                             );
@@ -1284,7 +1300,16 @@ impl Core {
                     }
                     Err(error) => {
                         tracing::warn!(%error, node = self.cfg.node_id, ?rid, "failed to install shadow");
-                        self.finish(now, rid, MutateOutcome::Errno(Code::Io), replica, out);
+                        // This node's own error, not an answer of the
+                        // sequencer's.
+                        self.finish_as(
+                            now,
+                            rid,
+                            MutateOutcome::Errno(Code::Io),
+                            AnswerSource::None,
+                            replica,
+                            out,
+                        );
                     }
                 }
             }
@@ -1384,21 +1409,42 @@ impl Core {
                 if !hinted {
                     self.observe_reply(now, rid, position, &own_chunks, replica, out);
                 }
-                self.finish(now, rid, outcome, replica, out);
+                self.finish_as(
+                    now,
+                    rid,
+                    outcome,
+                    AnswerSource::Relayed { from },
+                    replica,
+                    out,
+                );
             }
             MutateOutcome::LockLapsed => {
                 // Plan 30 §M14 phase 2: a grant the op was issued under
                 // ended before it reached the executor. Nothing ran;
                 // final (`EIO`), never retried by rid.
                 self.stats.lock_lapsed_refusals += 1;
-                self.finish(now, rid, outcome, replica, out)
+                self.finish_as(
+                    now,
+                    rid,
+                    outcome,
+                    AnswerSource::Relayed { from },
+                    replica,
+                    out,
+                )
             }
             outcome @ (MutateOutcome::Errno(_) | MutateOutcome::Conflict { .. }) => {
                 // Plan 30 §M6: a refusal observed the holder's state
                 // without installing anything here (this replaces plan 29
                 // M6's per-name causal wait: every later read waits).
                 self.observe_reply(now, rid, position, &own_chunks, replica, out);
-                self.finish(now, rid, outcome, replica, out)
+                self.finish_as(
+                    now,
+                    rid,
+                    outcome,
+                    AnswerSource::Relayed { from },
+                    replica,
+                    out,
+                )
             }
         }
     }
@@ -1861,12 +1907,15 @@ impl Core {
             return;
         }
         if !sent {
-            self.finish(now, rid, MutateOutcome::Errno(code), replica, out);
+            // This node's own refusal (nothing journaled).
+            let source = AnswerSource::Sequenced(self.root_ack_class());
+            self.finish_as(now, rid, MutateOutcome::Errno(code), source, replica, out);
             return;
         }
         if let Some(outcome) = self.settled_outcome(rid, replica) {
             self.stats.forward_indoubt_resolved += 1;
-            self.finish(now, rid, outcome, replica, out);
+            let source = self.completed_source(replica, rid);
+            self.finish_as(now, rid, outcome, source, replica, out);
             return;
         }
         self.finish_in_doubt(now, rid, replica, out);
@@ -1991,6 +2040,10 @@ impl Core {
                         .parked_local
                         .insert(rid, (Default::default(), Some(need)));
                 }
+                let source = self.completed_source(replica, rid);
+                if let Some(c) = self.clients.get_mut(&rid) {
+                    c.answered_by = Some(source);
+                }
                 return outcome;
             }
         }
@@ -2002,8 +2055,25 @@ impl Core {
     }
 
     /// Execute as holder, on this node's own behalf (`dispatch_forward`'s
-    /// local branch).
+    /// local branch). The op is answered as this node's own sequencing,
+    /// of the class the root's answers have now (`answered_by`).
     pub(crate) fn execute_local(
+        &mut self,
+        now: Now,
+        rid: Rid,
+        epoch: Epoch,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> MutateOutcome {
+        let outcome = self.execute_local_outcome(now, rid, epoch, replica, out);
+        let class = self.root_ack_class();
+        if let Some(c) = self.clients.get_mut(&rid) {
+            c.answered_by = Some(AnswerSource::Sequenced(class));
+        }
+        outcome
+    }
+
+    fn execute_local_outcome(
         &mut self,
         now: Now,
         rid: Rid,
@@ -2536,10 +2606,28 @@ impl Core {
                 // position (the segment carrying the completion ships
                 // everything before it), unless an M4 held row keeps the
                 // shipped-through position below it.
-                Some(position) => self.observe(rid, position, replica),
+                Some(position) => {
+                    self.observe(rid, position, replica);
+                    // The outcome is the log's, which need not be what the
+                    // sequencer said (long-delegated seed 1297: a delegate's
+                    // tentative acceptance, its generation ended, the rid
+                    // run again and refused): the client hears what the log
+                    // carries.
+                    if let Some(c) = self.clients.get_mut(&rid) {
+                        c.answered_by = Some(AnswerSource::Sequenced(AckClass::Archive));
+                    }
+                }
                 // M13: an inbox outcome rides the log behind every row it
-                // was evaluated against; nothing to raise.
-                None => self.inbox_answered(now, rid),
+                // was evaluated against; nothing to raise. Read from the
+                // log: the archive's (the sequencer that drained the batch
+                // was judged where it journaled the row, but its answer
+                // reached this node only through the log).
+                None => {
+                    self.inbox_answered(now, rid);
+                    if let Some(c) = self.clients.get_mut(&rid) {
+                        c.answered_by = Some(AnswerSource::Sequenced(AckClass::Archive));
+                    }
+                }
             }
             self.finish(now, rid, outcome, replica, out);
         }
@@ -2682,7 +2770,15 @@ impl Core {
                 continue;
             }
             if let Some(outcome) = completed_as_outcome(replica, rid, epoch) {
-                self.finish(now, rid, outcome, replica, out);
+                // Read from the log, as `answer_awaiting_log` does.
+                self.finish_as(
+                    now,
+                    rid,
+                    outcome,
+                    AnswerSource::Sequenced(AckClass::Archive),
+                    replica,
+                    out,
+                );
                 continue;
             }
             self.stats.awaiting_log_rerouted += 1;
@@ -2755,7 +2851,8 @@ impl Core {
                 ?rid,
                 "deadline: the log answered the op; not in doubt"
             );
-            self.finish(now, rid, outcome, replica, out);
+            let source = self.completed_source(replica, rid);
+            self.finish_as(now, rid, outcome, source, replica, out);
             return;
         }
         self.stats.in_doubt += 1;
@@ -2866,6 +2963,7 @@ impl Core {
                 out.push(Action::Reply {
                     rid,
                     reply: ClientReply::InDoubt,
+                    source: AnswerSource::None,
                 });
             }
             Origin::Replay { queue_seq, .. } => {
@@ -2873,12 +2971,52 @@ impl Core {
                     out.push(Action::Reply {
                         rid,
                         reply: ClientReply::InDoubt,
+                        source: AnswerSource::None,
                     });
                 }
                 self.on_replay_outcome(now, queue_seq, rid, None, replica, out)
             }
         }
         self.release_gated(now, replica, out);
+    }
+
+    /// [`Self::finish`] an outcome whose source is `source` (plan 43 C2a:
+    /// who decided it).
+    pub(crate) fn finish_as(
+        &mut self,
+        now: Now,
+        rid: Rid,
+        outcome: MutateOutcome,
+        source: AnswerSource,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if let Some(c) = self.clients.get_mut(&rid) {
+            c.answered_by = Some(source);
+        }
+        self.finish(now, rid, outcome, replica, out);
+    }
+
+    /// The source `finish` names for `outcome`, which `answered_by` says
+    /// (a definitive outcome nobody named is a bug, and counts as the
+    /// archive's), counted when it leaves as a sequencer's answer.
+    fn answer_source(
+        &mut self,
+        answered_by: Option<AnswerSource>,
+        outcome: &MutateOutcome,
+    ) -> AnswerSource {
+        let source = match answered_by {
+            Some(source) => source,
+            None if is_answer(outcome) => {
+                debug_assert!(false, "an outcome with no source: {outcome:?}");
+                AnswerSource::Sequenced(AckClass::Archive)
+            }
+            None => AnswerSource::None,
+        };
+        if let (AnswerSource::Sequenced(class), true) = (source, is_answer(outcome)) {
+            self.stats.ack_classes[class.index()] += 1;
+        }
+        source
     }
 
     /// Deliver the op's outcome to whoever submitted it.
@@ -2906,8 +3044,15 @@ impl Core {
             return;
         }
         if let Some((wait, durable)) = self.rd.parked_local.remove(&rid) {
-            if self.clients.contains_key(&rid) {
-                self.park_finish(now, rid, wait, durable, outcome);
+            if let Some(c) = self.clients.get(&rid) {
+                let class = match c.answered_by {
+                    Some(AnswerSource::Sequenced(class)) => class,
+                    other => {
+                        debug_assert!(false, "a parked local answer with source {other:?}");
+                        AckClass::Archive
+                    }
+                };
+                self.park_finish(now, rid, wait, durable, outcome, class);
                 return;
             }
         }
@@ -2930,9 +3075,11 @@ impl Core {
                 if rid.node == self.cfg.node_id && rid.incarnation == self.cfg.incarnation {
                     self.acked.mark_done(rid.seq);
                 }
+                let source = self.answer_source(c.answered_by, &outcome);
                 out.push(Action::Reply {
                     rid,
                     reply: ClientReply::Outcome(outcome),
+                    source,
                 });
             }
             Origin::Replay { queue_seq, .. } => {
@@ -2940,9 +3087,11 @@ impl Core {
                     if rid.node == self.cfg.node_id && rid.incarnation == self.cfg.incarnation {
                         self.acked.mark_done(rid.seq);
                     }
+                    let source = self.answer_source(c.answered_by, &outcome);
                     out.push(Action::Reply {
                         rid,
                         reply: ClientReply::Outcome(outcome.clone()),
+                        source,
                     });
                 }
                 self.on_replay_outcome(now, queue_seq, rid, Some(outcome), replica, out)

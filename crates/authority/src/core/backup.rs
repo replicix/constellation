@@ -248,11 +248,11 @@
 //! One node: nothing here ever runs (no peers, no backups, no messages).
 
 use super::{Core, S3For, Timer};
-use crate::action::{Action, S3Op};
+use crate::action::{Action, AnswerSource, S3Op};
 use crate::event::{PeerMsg, S3Result};
 use crate::ids::{Epoch, HonourMs, Ms, NodeId, Now, OpId, Seq, TimerId, WaitMs};
 use crate::replica::Replica;
-use constellation_meta::{BackupRole, BackupTx};
+use constellation_meta::{BackupRole, BackupTx, MutateOutcome, Rid};
 use constellation_store_s3::{AckPolicy, Lease, LeaseTag};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -796,6 +796,26 @@ pub enum AckClass {
 }
 
 impl AckClass {
+    /// The class's names in counter order (`AckClass::index`).
+    pub const NAMES: [&'static str; 5] = [
+        "archive",
+        "root-group",
+        "deleg-group",
+        "non-stealable",
+        "lone",
+    ];
+
+    /// The class's place in `Stats::ack_classes`.
+    pub fn index(&self) -> usize {
+        match self {
+            AckClass::Archive => 0,
+            AckClass::RootGroup => 1,
+            AckClass::DelegGroup { .. } => 2,
+            AckClass::NonStealable => 3,
+            AckClass::Lone => 4,
+        }
+    }
+
     /// The class's name in reports and counters.
     pub fn name(&self) -> &'static str {
         match self {
@@ -806,6 +826,19 @@ impl AckClass {
             AckClass::Lone => "lone",
         }
     }
+}
+
+/// Whether a holder's reply is a definitive answer (the outcome of the op,
+/// accepted or refused) as opposed to a redirect, a retry or a hold.
+pub(crate) fn is_answer(outcome: &MutateOutcome) -> bool {
+    matches!(
+        outcome,
+        MutateOutcome::Accepted { .. }
+            | MutateOutcome::Errno(_)
+            | MutateOutcome::Exists { .. }
+            | MutateOutcome::Conflict { .. }
+            | MutateOutcome::LockLapsed
+    )
 }
 
 /// Plan 30 §M9's view for `status`.
@@ -831,6 +864,10 @@ pub struct AckView {
     /// The latest seal this node made: what its watch measured.
     pub last_seal: Option<SealRecord>,
     pub reconfig_in_flight: bool,
+    /// Plan 43 C2a: the definitive answers this node gave as a sequencer
+    /// by the class they waited for (`Stats::ack_classes`, named by
+    /// `AckClass::NAMES`).
+    pub classes: Vec<(&'static str, u64)>,
 }
 
 impl Core {
@@ -888,6 +925,11 @@ impl Core {
             sealed_epoch: self.bk.sealed,
             last_seal: self.bk.last_seal,
             reconfig_in_flight: self.ack.reconfig.is_some(),
+            classes: AckClass::NAMES
+                .iter()
+                .copied()
+                .zip(self.stats.ack_classes)
+                .collect(),
         }
     }
 
@@ -1040,6 +1082,58 @@ impl Core {
         }
         let jseq = position.pending.map(|p| p.jseq)?;
         (!self.durable_covers(jseq)).then_some(jseq)
+    }
+
+    /// Plan 43 §5.1: the class of an answer this node gives as the root
+    /// sequencer, by what the answer waits for *today* (C2a records it; C2c
+    /// and C2f change what some of them wait for): a continuation epoch's
+    /// hold is non-stealable; under `ack=s3` the archive; with a listed (or
+    /// doubted) backup the root group; while a backup is being had (a
+    /// candidate, an eligible or not yet assessed peer) the archive; and
+    /// otherwise nothing but this node's disk — `Lone`, whoever is
+    /// answered. The same decision as [`Self::ack_need`] (`durable_jseq`),
+    /// named.
+    pub fn root_ack_class(&self) -> AckClass {
+        if self.lease.epoch_held() {
+            AckClass::NonStealable
+        } else if self.lease.ack_policy() == AckPolicy::S3 {
+            AckClass::Archive
+        } else if !self.lease.backups().is_empty() || self.doubted_backups().next().is_some() {
+            AckClass::RootGroup
+        } else if self.durable_jseq() != u64::MAX {
+            AckClass::Archive
+        } else {
+            AckClass::Lone
+        }
+    }
+
+    /// Plan 43 C2a: the source to name for an outcome this node reads off
+    /// its own `completed` row (a dedup, a retry that finds the rid done):
+    /// the archive when an applied segment carries the row, otherwise the
+    /// class its journal row waits for as the root's.
+    pub(crate) fn completed_source(&self, replica: &dyn Replica, rid: Rid) -> AnswerSource {
+        AnswerSource::Sequenced(if replica.outcome_from_log(rid) {
+            AckClass::Archive
+        } else {
+            self.root_ack_class()
+        })
+    }
+
+    /// Send a message to a peer; a `MutateReply` carrying a definitive
+    /// outcome is counted under `class` (`Stats::ack_classes`).
+    pub(crate) fn send_answer(
+        &mut self,
+        to: NodeId,
+        msg: PeerMsg,
+        class: AckClass,
+        out: &mut Vec<Action>,
+    ) {
+        if let PeerMsg::MutateReply { outcome, .. } = &msg {
+            if is_answer(outcome) {
+                self.stats.ack_classes[class.index()] += 1;
+            }
+        }
+        out.push(Action::Send { to, msg });
     }
 
     /// `ship_landed`: journal rows `seqs` are in the log, shipped through

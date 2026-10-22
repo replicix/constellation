@@ -72,8 +72,9 @@
 //! blocks new grants on it until it has.
 
 use super::client::Phase as ClientPhase;
+use super::AckClass;
 use super::{Core, S3For, Timer};
-use crate::action::{Action, ControlOk, ReadAnswer, S3Op};
+use crate::action::{Action, AnswerSource, ControlOk, ReadAnswer, S3Op};
 use crate::event::{PeerMsg, ReadGrantMsg, ReadIndexOutcome, S3Result};
 use crate::ids::{HonourMs, NodeId, Now, OpId, Seq, TimerId, WaitMs};
 use crate::replica::Replica;
@@ -128,9 +129,17 @@ pub(crate) enum ParkedWhat {
         /// worked out. Kept while the acknowledgement waits: see
         /// `Core::on_held_reply_timer`.
         blockers: Option<(WaitMs, constellation_meta::RemoteBlockers)>,
+        /// Plan 43 C2a: what the answer waits for (the class the row was
+        /// journaled under), counted when it leaves.
+        class: AckClass,
     },
-    /// A local client op's `finish`.
-    Finish { rid: Rid, outcome: MutateOutcome },
+    /// A local client op's `finish`, as the sequencer that decided it
+    /// (`class`: what the answer waits for).
+    Finish {
+        rid: Rid,
+        outcome: MutateOutcome,
+        class: AckClass,
+    },
     /// A FUSE fast-path write (`Control::Recall`).
     Control { op: OpId },
     /// A release CAS.
@@ -1014,6 +1023,7 @@ impl Core {
         base: Option<Seq>,
         position: Position,
         gen: u64,
+        class: AckClass,
         out: &mut Vec<Action>,
     ) {
         let id = self.park(
@@ -1028,6 +1038,7 @@ impl Core {
                 base,
                 position,
                 gen,
+                class,
                 held_timer: None,
                 blockers: None,
             },
@@ -1497,6 +1508,7 @@ impl Core {
                     held_timer,
                     // Worked out afresh: the reply leaves once.
                     blockers: _,
+                    class,
                 } => {
                     self.rd.parked_rids.remove(&rid);
                     if let Some(t) = held_timer {
@@ -1505,9 +1517,9 @@ impl Core {
                     if let Some(req) = req {
                         let (own_chunks, own_rows) =
                             self.own_reply_parts(to, rid, &outcome, (gen, &position), replica);
-                        out.push(Action::Send {
+                        self.send_answer(
                             to,
-                            msg: PeerMsg::MutateReply {
+                            PeerMsg::MutateReply {
                                 req,
                                 outcome,
                                 base,
@@ -1516,12 +1528,25 @@ impl Core {
                                 own_chunks,
                                 own_rows,
                             },
-                        });
+                            class,
+                            out,
+                        );
                     }
                     // Answered `Held` already: the retry is answered from
                     // the holder's dedup.
                 }
-                ParkedWhat::Finish { rid, outcome } => self.finish(now, rid, outcome, replica, out),
+                ParkedWhat::Finish {
+                    rid,
+                    outcome,
+                    class,
+                } => self.finish_as(
+                    now,
+                    rid,
+                    outcome,
+                    AnswerSource::Sequenced(class),
+                    replica,
+                    out,
+                ),
                 ParkedWhat::Control { op } => out.push(Action::ControlDone {
                     op,
                     result: Ok(ControlOk::Done),
@@ -1610,11 +1635,21 @@ impl Core {
         wait: RecallWait,
         durable: Option<u64>,
         outcome: MutateOutcome,
+        class: AckClass,
     ) {
         if let Some(c) = self.clients.get_mut(&rid) {
             c.phase = ClientPhase::Recalling;
         }
-        self.park(now, wait, durable, ParkedWhat::Finish { rid, outcome });
+        self.park(
+            now,
+            wait,
+            durable,
+            ParkedWhat::Finish {
+                rid,
+                outcome,
+                class,
+            },
+        );
     }
 
     // ------------------------------------------------------------ delegate
