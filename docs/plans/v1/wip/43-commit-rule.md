@@ -427,7 +427,11 @@ in the code, in PROGRESS and in failure messages.
   journal (or, for a lock owner, of its own journal plus what it
   committed). No message installs a grant, a floor, a barrier or a cut;
   windows (`until`) remain per-replica, clock-bounded (§7.6 of the
-  study, unchanged).
+  study, unchanged). *Refined by the C4 coder spec (Q25 c):* a cut — a
+  position as of a time, like a read index's answer — still rides the
+  root's renewal reply to a delegate; it installs nothing and only
+  settles barriers the log recorded. The derived table is checked for
+  the generations a node owns (the oracle: §7 C4).
 - **I4 `unacked_fails_never_lands_late`.** A client is answered `EIO`
   for rid `r` (in doubt) only after `r` is *settled*: `Completed { r }`
   or `Refused { r, .. }` is committed somewhere (then the client gets
@@ -1003,6 +1007,23 @@ LockExpire { id: GrantId, barrier: Position }, // outwaited; the cut
 LockMove { ids: Vec<GrantId>, gen: u64 },      // to a generation (0: root)
 ```
 
+*As specified for the coder (C4 spec D1–D3, 2026-10-22; §11 Q25 e):*
+`LockGrant { id, ino, node, mode, gen, settled, floor }` (a re-grant or
+an upgrade mints a new id, as the code does, and replaces the node's
+record on the inode); `LockRelease { id, ino, floor }`;
+`LockExpire { id, ino, floor, barrier_ago_ms: Option<u64> }` (the
+outwait's barrier as a duration before the append, re-anchored at each
+apply — the cut is not known at the outwait); and a **self-contained**
+`LockMove { gen, grants: Vec<MovedGrant>, floor, barrier_ago_ms }`,
+each moved grant with its node, inode, mode, `settled`, confirmation and
+what is left of its record (`left_ms`, the carry). The fold is a
+separate in-memory table of identities beside the working table (Q25
+d); an owner fills its working table from it at an ownership
+transition. The delegate journals the move back itself, as a row of its
+stream before it answers a recall, and the moves of grants an unlink
+takes out of its subtree; the root routes an inode the log places under
+a live generation to that generation until its move is applied.
+
 - The owning sequencer journals them in the same transaction as the
   decision: a grant when it mints (`lock_try_grant`, `locks.rs:1300`),
   a release when it processes `LockReleased` (`on_lock_released`,
@@ -1030,7 +1051,12 @@ LockMove { ids: Vec<GrantId>, gen: u64 },      // to a generation (0: root)
   mirror semantics, now exact: the set of live ids is the log's). A
   grant's answer to its holder waits for its record's commit (class of
   the owner; under RootGroup one LAN round trip; the restart-horizon
-  wait stays and overlaps it).
+  wait stays and overlaps it). *C4 spec D5 (§11 Q25 a, b):* the owner's
+  own grants wait too (a Lone-class one does not), and an Archive-class
+  grant waits for the archive; with every honoured grant committed, a
+  fast successor admits a late renewal (F-c) from its log when its sealed
+  tail reaches the journal tip at which the predecessor listed it, which
+  replaces F-c's final mirror (deleted with the mirror, D6).
 - **Floors and barriers** are the records' `floor`/`barrier` fields;
   the in-memory `floors`, `dir_floors`, `handed_floor`, `barriers`,
   `dir_barriers`, `cut` (`locks.rs:296-387`) become caches rebuilt from
@@ -2124,6 +2150,29 @@ no stall.
 deletion list and, per deleted mechanism, the test that pinned it and
 its fate.
 
+*Specified 2026-10-22* (the coder spec is kept with the reviews; the
+decisions are §11 Q25). Six commits: (1) the models
+(`lock_state_in_log`, `answer_before_commit`) and the sim's
+`locks-late-answers`, behaviour-neutral; (2) the records, the fold and
+every owner decision journaled, the I3 oracle counted (its count must be
+above zero where messages still install grants: `locks-delegated`,
+`locks-unlinked-delegated*`, `locks-failover-backup*`,
+`locks-late-answers`); (3) every grant answered after its record's
+commit (G3; Q25 a, b), fable review; (4) a fast successor builds its
+table from the log, the mirror and F-c's final mirror deleted, late
+admission by the completeness rule, fable review; (5) delegation moves
+through the log, the handoff, recall-answer and leaving machinery
+deleted, fable review; (6) `strict_locks_log` everywhere, the harness,
+the campaign and the docs. 4 and 5 may be coded in parallel; 4 lands
+first. C4 assumes plan 41's L1a and L1b (atomic window primitives,
+nothing slow under the tables' mutex): every `LockExpire` is journaled
+from the record the atomic removal returned, never under the tables'
+guard; the lanes extend windows only and journal nothing. A renewal is
+never held for a commit (lock-latency gains a renewal sample: ±3 %).
+The open item above ("Not in that patch") is settled by the records'
+carry for every moved grant (`CarryAll`); the two-ops-per-node model
+check runs with the records and its result is recorded.
+
 ### C5 — The lone branch, isolated and documented
 
 **Code** (§5.7): `LoneBranchOp` and the enqueue assertion; the lone
@@ -2896,7 +2945,11 @@ first part of C7a, landed early):
   - *The cut and barriers* (rows 9, 30): barriers cross nodes as durations;
     a head's as-of is the root's own send time of the reply the delegate
     echoes (renewal k after reply k − 1 does not hold today: a timeout and the
-    off-core lane break it). After C4.
+    off-core lane break it). After C4. *(C4 spec, 2026-10-22: C4 deletes the
+    barriers that crossed in messages — `LockHandback.barrier`,
+    `leaving_barriers`, `DelegRenewed.lock_barrier` — and records barriers as
+    durations in `LockExpire`/`LockMove`; commit 8 converts what remains: the
+    cut's as-of and the settlement against it.)*
   - *Also:* a pad of 1 s per detected suspend on the honour clock (the C7a
     review's caveat: the kernel's sleep accounting may be a second short);
     the models' claim rule by observation (`cto`, `locks`) and anchored
@@ -3450,7 +3503,7 @@ except where the four-file-system column says otherwise.
 |---|---|---|---|
 | `ack-latency` (new) | p50/p90 (p99 reported) per op and topology (§7 C0) | topologies 1, 2, 4, 6: ±3 % (or one IQR) at every milestone; topology 3 (delegate, root on the LAN, no backup): ≤ topology 2 + 0.5 ms from C2 (one LAN acknowledgement, measured +2.0 ms p50 on loopback in plan 30 M9: 1.9 → 3.9 ms) — gate G1; topology 5 forwards: + one archive commit (28–190 ms by S3 distance) — gate G2; topology 5 own ops: ±3 % | C0, C1, C3, C4, C7a |
 | `delegated-op-latency`, `nonowner-op-latency` | per-syscall medians | the scenarios' own bound (under half an S3 round trip) holds; the delegate's own median ≤ C0's topology-2 holder-own-op p50 + 0.5 ms (G1) | C0, C1 |
-| `lock-latency` | first lock from a non-sequencer, cached re-lock, the sequencer's own lock, contended handoff, lone `cluster` vs `local` | first lock ≤ +1 LAN round trip under a backed root (≤ +2 ms on loopback) — gate G3; cached re-lock ±3 %; own lock ≤ +50 µs; handoff ≤ +2 ms; lone ratio ±3 % (C4) | C0, C4 |
+| `lock-latency` | first lock from a non-sequencer, cached re-lock, the sequencer's own lock, contended handoff, lone `cluster` vs `local`; a holder's renewal round trip (C4) | first lock ≤ +1 LAN round trip under a backed root (≤ +2 ms on loopback) — gate G3; cached re-lock ±3 %; own lock ≤ +50 µs when lone, + one LAN round trip under a backed root (Q25 a); an Archive-class first lock + one archive PUT (Q25 b); renewal ±3 %; handoff ≤ +2 ms; lone ratio ±3 % (C4) | C0, C4 |
 | S3 requests | `status.s3` counters over 10 min idle with 100 held grants; `git-under-flock` segment count | idle: equal; segments: ≤ +5 % (C4) | — |
 | failover time | `backup-failover`, `root-failover-with-delegates`, `delegate-backup-handoff-failover`, `holder-kill-rejoin`, `ack-s3-failover` | ≤ C0 + 10 % (C1, C3); C7-H2's longer quarantine (gate G5) reported against the logged `wait_ms`; C7b's cold claim (gate G6) reported | — |
 | `make perf-gate` | vfs-bench ceilings; harness bench rates (20 % tolerance) | green at every milestone | — |
@@ -3484,7 +3537,7 @@ not loosen the bar.
   |---|---|---|---|---|
   | G1 | C2 | a delegate without a recorded backup goes from local-disk acknowledgement to one LAN round trip (the root's append) | ≤ a backed holder's own-op p50 + 0.5 ms (loopback: ≈ +2 ms over today) | Q4 |
   | G2 | C2 | another node's forward to a lone root (or lone delegate) waits for the archive | + one S3 conditional PUT (28–190 ms by distance), WAN topologies only | Q2 |
-  | G3 | C4 | a peer's first lock under a backed root waits for its `LockGrant`'s commit | + one LAN round trip (≤ +2 ms on loopback); the cached re-lock free | Q6 |
+  | G3 | C4 | a peer's first lock under a backed root waits for its `LockGrant`'s commit; if Q25 is taken as recommended, the root's own first lock too, and an Archive-class first lock waits for the archive | + one LAN round trip (≤ +2 ms on loopback); an archive PUT (28–190 ms) under `ack=s3`, the bring-up rule or a lone root's remote peer; the cached re-lock and every renewal free | Q6, Q25 |
   | G4 | C1 (if Q1 strict) | a claim (or a generation end) waits while no member of the old group answers | unbounded until a member answers or the operator abandons; only when the whole group is cut off | Q1 |
   | G5 | C7-H2 | a fast successor always waits the full quarantine bound | ≤ +14.5 s on acknowledgements, ≤ +29.5 s on new lock grants, after strict reads or locks: for a takeover in the predecessor's last seconds, **and** for a takeover after the lease ran out of an S3-cut holder still alive on P2P (its backup seals at the expiry it reads: before C7-H2 that was a TTL takeover with no floor, now it is fast and waits the bound, on top of the ≈ one-TTL failover; applications saw the lock grace as `EAGAIN` on non-blocking requests, `ENOLCK` past the ring's queue depth: F-b made both a wait) | Q10a, **accepted 2026-10-18** with the full floor as landed (safety first); the follow-ups F-a, F-b and F-c (§7 C7-F) take the cost back; `leave`, unmount and the upgrade's handover right after a seal also wait out the floor before they release the lease |
   | G6 | C7b | a cold claimant waits a full TTL from its first read of the lease | ≈ 60.1 s for a cold claim; the seal path and warm claimants unchanged | Q10c |
@@ -3523,7 +3576,7 @@ The final list. Each says what it **blocks**; a question that the code
 answered is marked **decided** (the plan implements the decision; the
 maintainer may still overturn it). Blocking before C0: Q7, Q10a.
 Before C1: Q1, Q13, Q22. Before C2: Q2, Q4, Q9, Q14, Q15, Q16, Q21. Before C3:
-Q24. Before C4: Q6. Before C6: Q5. Before C7b: Q10b, Q10c, Q23. Before C7-F: Q17 (F-a),
+Q24. Before C4: Q6, Q25. Before C6: Q5. Before C7b: Q10b, Q10c, Q23. Before C7-F: Q17 (F-a),
 Q18 (F-b). Before C7-H1: Q19. Before C7a's commits 2–4: Q20.
 
 **Answered by the maintainer (2026-10-17): every recommendation below
@@ -3833,6 +3886,37 @@ to land before C0.
   deletes it if the count stayed 0: *recommended*.
   (i) The uncaptured fallback keeps today's replay of a node's own
   delegate rows, counted and documented: *recommended*.
+
+- **Q25 — C4's coder-spec decisions (specified 2026-10-22).** *Blocks
+  C4.*
+  (a) *Own grants wait for their record's commit* (a Lone-class one does
+  not): + one LAN round trip on the root's own uncached lock under a
+  backed root; F-c's late admission then works from the log, the old
+  root cut off or not. The alternative answers own grants at journal and
+  keeps a final *signal* (`LockFinal { key, through }`, a position, no
+  grant) instead of the final mirror; a successor without it refuses late
+  renewals, as today. *Recommended: wait.*
+  (b) *Archive-class grants wait for the archive* (`ack=s3`, the bring-up
+  rule, a lone root's grant to another node: + one archive PUT on a first
+  lock), or are answered at journal with late admissions refused at such
+  a tenure's successors. *Recommended: wait*, measured as an extension of
+  G3.
+  (c) *The cut stays in the renewal reply* (I3's text refined: a position
+  as of a time, installing nothing). *Recommended.*
+  (d) *The fold in memory*, rebuilt from what a node applies after it
+  opens (only the late admission needs completeness, and it checks it),
+  rather than a node-local keyspace written per record on every replica;
+  never in the published namespace. *Recommended: in memory.*
+  (e) *Records as the coder spec gives them* (§5.5): `LockExpire` with the
+  barrier as a duration, a self-contained `LockMove` with the carry, the
+  floor and the barrier; the delegate journals its own move back and its
+  leaving moves. *Recommended.*
+  (f) *The completeness rule replaces F-c's final mirror* (a backup keeps
+  the journal tip of the first append that listed it; a seal-path
+  successor trusts its log's memory iff its tail reaches it; `ack=s3`
+  successors always; TTL and released takeovers never). *Recommended.*
+  (g) *Order:* C4-4 and C4-5 coded in parallel, C4-4 landed first; C7b
+  commit 8 right after C4. *Recommended.*
 
 ### 11.1 Deferred (not in this plan)
 
