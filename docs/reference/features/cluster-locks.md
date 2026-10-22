@@ -1117,10 +1117,16 @@ How it ends:
   to stay 0;
 - `EINTR`, when a signal reaches the process (the mount cancels the wait
   as it does for `F_SETLKW`): Linux documents `EINTR` for `F_SETLK` on a
-  file system that waits, as NFS does. It is observed between attempts,
-  within 100 ms; an attempt in flight (the request's first, or a re-issue)
-  finishes first, and that is a round trip to the owner, a few seconds
-  against an owner that cannot be reached.
+  file system that waits, as NFS does. It is observed within 100 ms
+  whatever the request is doing: between attempts (the wait pool looks at
+  every waiting request a slice at a time) and during one, where the wait
+  for the core's answer (a round trip to the owner, a few seconds against
+  an owner that cannot be reached) is made in slices of 50 ms that look at
+  the cancellation. A request's first attempt registers for the signal
+  when the core's answer is more than one slice late (an attempt answered
+  at once registers nothing); one the core had not answered when the signal
+  ended it may be granted a lock afterwards, which no request will use: it
+  is a first use abandoned, as for an answer that was lost.
 
 A request told to wait for an owner that cannot say when it may grant (a
 floor, a barrier, a stale or an unreachable owner: the owner hints

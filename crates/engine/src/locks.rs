@@ -54,7 +54,9 @@
 //! frontend that bounds its ops: none in the tree today, the conformance
 //! kit does) passes first:
 //! both are checked between the polls of a wait on a conflicting lock of
-//! this node and before each request to the sequencer. A request the
+//! this node, before each request to the sequencer, and while the core's
+//! answer to one is awaited (in slices of 50 ms: the core may spend seconds
+//! on an owner that does not answer). A request the
 //! owner has parked (another node holds a conflicting grant) is not
 //! withdrawn: that wait still returns only once the grant comes.
 //!
@@ -363,29 +365,108 @@ const POLL_BACKOFF_MAX: Duration = Duration::from_secs(1);
 /// What ends a lock wait before the lock comes: the op's cancellation
 /// (`Intr`) and its deadline (`TimedOut`), both from its `OpCtx`. Checked
 /// where the wait loops, so a wait that the frontend gave up on holds
-/// nothing and leaves no waiter behind.
+/// nothing and leaves no waiter behind. Plan 43 C7-F F-b N2: also while the
+/// core's answer to a request is awaited ([`ClusterLocks::await_core`]), in
+/// slices of [`ANSWER_SLICE`], so a signal ends a request in flight against
+/// an owner that does not answer for seconds within a slice, not after its
+/// round trip.
 #[derive(Clone, Copy)]
 struct Interrupt<'a> {
     cancel: Option<&'a CancelToken>,
     until: Option<std::time::Instant>,
+    /// A request that carries no cancellation (a non-blocking lock request
+    /// registers for signals only once it waits) asks its frontend for one
+    /// when the core's answer is slow.
+    late: Option<&'a dyn Late>,
+}
+
+/// The cancellation a request asks its frontend for late (see
+/// [`Interrupt::late`]): `begin` registers the request for its caller's
+/// signal (`Responder::begin_wait`) and returns the token, once.
+pub struct LateToken<F> {
+    begin: std::cell::RefCell<F>,
+    got: std::cell::OnceCell<Option<CancelToken>>,
+}
+
+/// What [`Interrupt`] asks of a [`LateToken`].
+pub trait Late {
+    /// Register now (once).
+    fn arm(&self);
+
+    /// The token, once registered.
+    fn token(&self) -> Option<&CancelToken>;
+}
+
+impl<F: FnMut() -> Option<CancelToken>> LateToken<F> {
+    /// Nothing is allocated or called until [`Late::arm`]: a request
+    /// answered at once pays for the two cells only.
+    pub fn new(begin: F) -> Self {
+        LateToken {
+            begin: std::cell::RefCell::new(begin),
+            got: std::cell::OnceCell::new(),
+        }
+    }
+}
+
+impl<F: FnMut() -> Option<CancelToken>> Late for LateToken<F> {
+    fn arm(&self) {
+        self.got.get_or_init(|| (self.begin.borrow_mut())());
+    }
+
+    fn token(&self) -> Option<&CancelToken> {
+        self.got.get().and_then(Option::as_ref)
+    }
 }
 
 impl Interrupt<'_> {
     const NONE: Interrupt<'static> = Interrupt {
         cancel: None,
         until: None,
+        late: None,
     };
 
     /// `Err` when the wait must end now. A cancellation wins over a
     /// deadline that passed at the same time: the caller asked.
     fn check(&self) -> Result<(), Code> {
-        if self.cancel.is_some_and(CancelToken::is_cancelled) {
+        if self.cancel.is_some_and(CancelToken::is_cancelled)
+            || self
+                .late
+                .and_then(|l| l.token())
+                .is_some_and(CancelToken::is_cancelled)
+        {
             Err(Code::Intr)
         } else if self.until.is_some_and(|t| std::time::Instant::now() >= t) {
             Err(Code::TimedOut)
         } else {
             Ok(())
         }
+    }
+
+    /// The request has waited a slice for the core: if nothing can cancel
+    /// it yet, ask the frontend for something that can.
+    fn arm_late(&self) {
+        if self.cancel.is_none() {
+            if let Some(late) = self.late {
+                late.arm();
+            }
+        }
+    }
+}
+
+/// How often the wait for the core's answer to a request looks at the
+/// request's cancellation (plan 43 C7-F F-b N2): a signal ends a lock
+/// request within this, whatever the core is doing for it.
+const ANSWER_SLICE: Duration = Duration::from_millis(50);
+
+struct Unpark(std::thread::Thread);
+
+impl std::task::Wake for Unpark {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
     }
 }
 
@@ -826,6 +907,7 @@ impl ClusterLocks {
                 let interrupt = Interrupt {
                     cancel: cancel.as_ref(),
                     until,
+                    late: None,
                 };
                 done(this.set(ino, lock, true, interrupt, None))
             });
@@ -846,7 +928,17 @@ impl ClusterLocks {
         cancel: Option<&CancelToken>,
         until: Option<std::time::Instant>,
     ) -> Result<(), Code> {
-        self.set(ino, lock, sleep, Interrupt { cancel, until }, None)
+        self.set(
+            ino,
+            lock,
+            sleep,
+            Interrupt {
+                cancel,
+                until,
+                late: None,
+            },
+            None,
+        )
     }
 
     /// A non-blocking [`Self::lock_here`] that waits for an earlier turn's
@@ -869,6 +961,7 @@ impl ClusterLocks {
             Interrupt {
                 cancel,
                 until: None,
+                late: None,
             },
             Some(deadline),
         )
@@ -1031,10 +1124,12 @@ impl ClusterLocks {
         lock: LocalLock,
         deadline: std::time::Instant,
         cancel: Option<&CancelToken>,
+        late: Option<&dyn Late>,
     ) -> NbStep {
         let interrupt = Interrupt {
             cancel,
             until: None,
+            late,
         };
         self.nb_step(ino, Self::prepared(lock), interrupt, Some(deadline))
     }
@@ -1219,6 +1314,7 @@ impl ClusterLocks {
         let interrupt = Interrupt {
             cancel: task.cancel.as_ref(),
             until: None,
+            late: None,
         };
         let result = if let Err(code) = interrupt.check() {
             Err(code)
@@ -1359,6 +1455,41 @@ impl ClusterLocks {
         }
     }
 
+    /// The core's answer to a request, awaited in slices of
+    /// [`ANSWER_SLICE`] that look at the request's cancellation and
+    /// deadline (plan 43 C7-F F-b N2): the core may take seconds to answer
+    /// (it asks an owner that is gone, a few times, before it says so),
+    /// and a signal is not to wait for it. A request ended here before its
+    /// answer leaves the core to answer nobody; a grant that comes for it
+    /// after that is the first use no request will make, which
+    /// [`Self::settled`] and the first-use budget account for (as for an
+    /// answer that was lost).
+    fn await_core<T>(
+        answer: tokio::sync::oneshot::Receiver<T>,
+        interrupt: Interrupt<'_>,
+    ) -> Result<T, Code> {
+        use std::future::Future;
+        let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut answer = std::pin::pin!(answer);
+        let mut slices = 0u32;
+        loop {
+            match answer.as_mut().poll(&mut cx) {
+                std::task::Poll::Ready(Ok(answer)) => return Ok(answer),
+                std::task::Poll::Ready(Err(_)) => return Err(Code::Io),
+                std::task::Poll::Pending => {}
+            }
+            interrupt.check()?;
+            if slices == 1 {
+                // Not an answer that comes at once: something that can
+                // cancel the request is wanted from here.
+                interrupt.arm_late();
+            }
+            slices = slices.saturating_add(1);
+            std::thread::park_timeout(ANSWER_SLICE);
+        }
+    }
+
     fn set_inner(
         &self,
         ino: Ino,
@@ -1472,7 +1603,7 @@ impl ClusterLocks {
                             reply,
                         })
                         .map_err(|_| Code::Io)?;
-                    match answer.blocking_recv().map_err(|_| Code::Io)? {
+                    match Self::await_core(answer, interrupt)? {
                         LockAnswer::Granted { position } => {
                             self.granted(ino, &position);
                             granted_round = sleep;

@@ -48,9 +48,13 @@ pub trait Responder<T>: Send + 'static {
     /// reserves what the wait holds (a FUSE-over-io_uring request holds its
     /// ring entry, and a queue lends only `depth - 1` of them to waits:
     /// [`WaitStart::Refused`] once they are spent, and the op then answers
-    /// now, as it did before it could wait). Called at most once, before
-    /// `done`, on the thread that is about to hand the wait over. The
-    /// default holds nothing and registers nothing.
+    /// now, as it did before it could wait). Called before `done`, on the
+    /// thread that is about to wait or to hand the wait over, and possibly
+    /// more than once for one op (a lock request whose first attempt is
+    /// slow asks late, to be interruptible, and asks again when it hands
+    /// its wait over; an op that waits at a fence asks as it waits): a
+    /// repeated call is the same registration, answered with the same
+    /// token. The default holds nothing and registers nothing.
     fn begin_wait(&mut self) -> WaitStart {
         WaitStart::Held(None)
     }

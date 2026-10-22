@@ -2325,6 +2325,9 @@ enum Scripted {
     /// Answers `Granted` and installs nothing: a core granting what the
     /// local tables refuse.
     GrantNothing,
+    /// Takes this many ms to answer `WouldBlock`: a core asking an owner
+    /// that is gone, a few times, before it says so.
+    Slow(u64),
 }
 
 /// A stand-in for the core: answers each `SyncRequest::Lock` from
@@ -2372,6 +2375,10 @@ fn script_core_waits(f: &mut Fenced, ino: Ino, script: Vec<Scripted>) -> Seen {
             let answer = match step {
                 Scripted::Wait(retry_ms) => constellation_authority::LockAnswer::Wait { retry_ms },
                 Scripted::WouldBlock => constellation_authority::LockAnswer::WouldBlock,
+                Scripted::Slow(ms) => {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                    constellation_authority::LockAnswer::WouldBlock
+                }
                 Scripted::GrantNothing => constellation_authority::LockAnswer::Granted {
                     position: constellation_meta::Position::ZERO,
                 },
@@ -2583,6 +2590,86 @@ fn a_cancellation_ends_a_graced_wait_with_eintr() {
     );
     assert!(f.meta.locks().local_locks(ino).is_empty());
     assert_eq!(f.meta.locks().stats().grace_wait_gave_up, 0);
+}
+
+/// Plan 43 C7-F F-b N2: a signal ends a request whose first attempt is in
+/// flight against a core that does not answer for seconds (it asks an owner
+/// that is gone, a few times, before it says so) within a slice of the wait
+/// for the answer, not after the round trip. The request registers for the
+/// signal late, when the answer is slow (a request answered at once
+/// registers nothing). On the landed F-b the wait for the core's answer was
+/// a blocking receive: the signal was seen after the 5 s here.
+#[test]
+fn a_signal_ends_a_first_attempt_in_flight_against_a_slow_core() {
+    let mut f = fenced_fs();
+    let (file, opened) = f.create(&Caller::root(), ROOT_INO, "in_flight").unwrap();
+    let ino = file.attr.ino;
+    script_core(&mut f, ino, vec![Scripted::Slow(5_000)]);
+    let token = constellation_vfs::CancelToken::new();
+    let registered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (t, r) = (token.clone(), registered.clone());
+    let (rx, took) = std::thread::scope(|s| {
+        let call = s.spawn(|| {
+            f.lock_nb_with(
+                ino,
+                opened.fh,
+                None,
+                Box::new(move |tx| RegistersAtWait(Reports(tx), t, r)),
+            )
+        });
+        std::thread::sleep(SECOND / 3);
+        assert!(!call.is_finished(), "the core has not answered");
+        assert_eq!(
+            registered.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "registered for the signal once the answer was slow"
+        );
+        let cancelled = std::time::Instant::now();
+        token.cancel();
+        let rx = call.join().unwrap();
+        (rx, cancelled.elapsed())
+    });
+    let (result, _, _) = rx.try_recv().expect("answered by the call");
+    assert_eq!(result, Err(Code::Intr));
+    assert!(
+        took < SECOND / 4,
+        "the signal ended the request within a slice: {took:?}"
+    );
+    assert!(f.meta.locks().local_locks(ino).is_empty());
+}
+
+/// Plan 43 C7-F F-b N2: the same for a re-issue on the wait pool: its
+/// attempt in flight against a slow core ends within a slice of the
+/// signal (the pool thread then goes on to the next request).
+#[test]
+fn a_signal_ends_a_reissue_in_flight_against_a_slow_core() {
+    let mut f = fenced_fs();
+    let (file, opened) = f.create(&Caller::root(), ROOT_INO, "reissue").unwrap();
+    let ino = file.attr.ino;
+    script_core(&mut f, ino, vec![Scripted::Wait(50), Scripted::Slow(5_000)]);
+    let token = constellation_vfs::CancelToken::new();
+    let registered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (t, r) = (token.clone(), registered.clone());
+    let rx = f.lock_nb_with(
+        ino,
+        opened.fh,
+        None,
+        Box::new(move |tx| RegistersAtWait(Reports(tx), t, r)),
+    );
+    assert!(
+        rx.recv_timeout(SECOND / 3).is_err(),
+        "the second attempt is in flight"
+    );
+    let cancelled = std::time::Instant::now();
+    token.cancel();
+    let (result, thread, at) = rx.recv_timeout(2 * SECOND).expect("answered");
+    assert_eq!(result, Err(Code::Intr));
+    assert_eq!(thread.as_deref(), Some("lock-wait"));
+    assert!(
+        at.duration_since(cancelled) < SECOND / 4,
+        "ended within a slice: {:?}",
+        at.duration_since(cancelled)
+    );
 }
 
 /// Past the bound the request gives up with `EAGAIN`, counted.

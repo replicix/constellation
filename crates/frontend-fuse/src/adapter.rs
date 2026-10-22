@@ -952,6 +952,7 @@ impl Interrupts {
             interrupts: self.clone(),
             unique,
             lazy: None,
+            token: None,
         }
     }
 
@@ -971,6 +972,7 @@ impl Interrupts {
             interrupts: self.clone(),
             unique,
             lazy: Some((pid, lossy)),
+            token: None,
         }
     }
 }
@@ -985,6 +987,10 @@ struct Interruptible<R> {
     /// `begin_wait` ([`Interrupts::guard_when_waiting`]); `None` once it
     /// is (or from the start).
     lazy: Option<(u32, bool)>,
+    /// The token the lazy registration made: a second `begin_wait` (an op
+    /// that asked late, for a slow answer, and again when it hands its wait
+    /// over; plan 43 C7-F F-b N2) is given the same one.
+    token: Option<constellation_vfs::CancelToken>,
 }
 
 impl<T, R: constellation_vfs::Responder<T>> constellation_vfs::Responder<T> for Interruptible<R> {
@@ -1008,11 +1014,14 @@ impl<T, R: constellation_vfs::Responder<T>> constellation_vfs::Responder<T> for 
         match self.lazy.take() {
             // The request is registered from here on; an interrupt that
             // came before is found among the early ones.
-            Some((pid, lossy)) => constellation_vfs::WaitStart::Held(Some(
-                self.interrupts
-                    .register_interruptible(self.unique, pid, lossy),
-            )),
-            None => constellation_vfs::WaitStart::Held(own),
+            Some((pid, lossy)) => {
+                let token = self
+                    .interrupts
+                    .register_interruptible(self.unique, pid, lossy);
+                self.token = Some(token.clone());
+                constellation_vfs::WaitStart::Held(Some(token))
+            }
+            None => constellation_vfs::WaitStart::Held(self.token.clone().or(own)),
         }
     }
 }
@@ -2324,8 +2333,16 @@ mod tests {
             panic!("a wait registers its token");
         };
         assert_eq!((d.count(), registered(&i)), (1, 1));
+        // Plan 43 C7-F F-b N2: a request that asked late (its first attempt
+        // was slow) asks again when it hands its wait over: the same token,
+        // counted and registered once.
+        let WaitStart::Held(Some(again)) = Responder::<()>::begin_wait(&mut r) else {
+            panic!("a second begin_wait keeps the token");
+        };
+        assert_eq!((d.count(), registered(&i)), (1, 1));
         i.interrupt(8);
         assert!(token.is_cancelled(), "any signal ends a lock wait");
+        assert!(again.is_cancelled(), "the second token is the first");
         r.done(Ok(()));
         assert_eq!((d.count(), registered(&i)), (0, 0));
         // An interrupt that overtook the registration.

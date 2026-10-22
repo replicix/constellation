@@ -2496,17 +2496,26 @@ impl Vfs for View {
                 r.done(result.map_err(VfsError::from));
                 return;
             }
-            let step = self.past_closing_locks(
-                locks,
-                ino,
-                local.owner,
-                (local.start, local.end),
-                local.write,
-                deadline,
-                |deadline| locks.try_lock_step(ino, local, deadline, cx.cancel),
-                // (A request to wait is no refusal.)
-                |step| *step == crate::locks::NbStep::Done(Err(Code::Again)),
-            );
+            // A request whose answer from the core is slow asks its frontend
+            // for what a signal can end it with (plan 43 C7-F F-b N2): one
+            // answered at once registers nothing.
+            let step = {
+                let late = crate::locks::LateToken::new(|| match r.begin_wait() {
+                    constellation_vfs::WaitStart::Held(own) => own,
+                    constellation_vfs::WaitStart::Refused => None,
+                });
+                self.past_closing_locks(
+                    locks,
+                    ino,
+                    local.owner,
+                    (local.start, local.end),
+                    local.write,
+                    deadline,
+                    |deadline| locks.try_lock_step(ino, local, deadline, cx.cancel, Some(&late)),
+                    // (A request to wait is no refusal.)
+                    |step| *step == crate::locks::NbStep::Done(Err(Code::Again)),
+                )
+            };
             match step {
                 crate::locks::NbStep::Done(result) => {
                     r.done(result.map_err(VfsError::from));

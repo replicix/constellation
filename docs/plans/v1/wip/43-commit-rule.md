@@ -3316,11 +3316,13 @@ successor whose clock is ahead got no quarantine").
   review.) A request's first attempt, which asks the new owner on its
   offload thread and holds its entry meanwhile (4.5 s while the owner is
   found), is as before F-b: a follow-up is to hand it to the wait pool
-  after a short inline budget. The same attempts are why `EINTR` is
-  observed between attempts (within 100 ms) and not during one: the core's
-  answer is awaited with a blocking receive. Follow-up: await it in
-  slices, looking at the cancellation, so a signal ends a request against
-  an unreachable owner at once instead of after its round trip.
+  after a short inline budget. `EINTR` was observed between attempts
+  (within 100 ms) and not during one: the core's answer was awaited with a
+  blocking receive. *Landed (lock-wait follow-ups, N2):* it is awaited in
+  slices of 50 ms that look at the cancellation, and a first attempt that
+  has no cancellation yet asks its frontend for one when the answer is a
+  slice late, so a signal ends a request against an unreachable owner
+  within a slice, not after its round trip.
   *The grace's end.* A timer at each grace's end serves the parked
   waiters (`lock_reserve_all`); today a blocking waiter is served only
   at its next re-attach, up to `recall_hold_ms` plus a retry later.

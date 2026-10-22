@@ -57273,3 +57273,36 @@ class (rows 9/30) or negative controls. Rebased onto C1-1 (`37180ae`): the 26
 `backup*` and `long-backup` configurations at 500 have failing sets identical
 to main's (`backup-locks-ahead`, new, clean) and 0 live claims;
 `locks-claimant-ahead` and `fast-takeover-skewed-holder-twice` at 1 000: 0.
+
+## Fix: lock-wait follow-ups (plan 43 C7-F F-b N2, N3; F-c W1, W2, W3, H1)
+
+The follow-ups the reviews of F-b and F-c recorded (plan 43 §7 C7-F), one
+commit each.
+
+### N2: a signal ends a lock request in flight within a slice
+
+`EINTR` was honoured between attempts only (the wait pool looks at every
+waiting request every 100 ms); an attempt in flight against an owner that
+does not answer (the core asks it a few times before it says so) could
+take seconds, because `set_inner` awaited the core's answer with a
+blocking receive.
+
+- `ClusterLocks::await_core` awaits it in slices of 50 ms (a `Waker` that
+  unparks the thread, `park_timeout`): the answer is taken the moment it
+  comes, the request's cancellation and deadline are looked at every slice.
+  It applies to blocking requests too (their in-flight attempt, and the
+  deadline of an op that has one).
+- A non-blocking request's first attempt carries no cancellation (it
+  registers for signals only when it waits: one registration costs more
+  than a cached `F_SETLK`). When the core's answer is a slice late the
+  request asks its frontend for one (`LateToken`, `Responder::begin_wait`
+  called from the waiting thread); the adapter's `Interruptible` now keeps
+  the token it made, so the `begin_wait` an attempt makes again when it
+  hands its wait over is given the same one.
+- A request ended before the core answered leaves the core to answer
+  nobody; a grant that comes for it afterwards is a first use no request
+  makes, bounded by the first-use budget, as for an answer that was lost.
+- Tests (fail before, with the blocking receive restored): a signal ends a
+  first attempt in flight against a core that answers in 5 s (the request
+  registers late, once), and a re-issue on the wait pool, each within a
+  slice; the adapter's token is the same on a second `begin_wait`.
