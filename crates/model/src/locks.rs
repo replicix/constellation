@@ -146,7 +146,7 @@
 //! |---|---|
 //! | HONOUR | a node's lease use (`usable_root`, `believes_root`), the probe freshness, the cap of a grant by the lease or the delegation (`ttl_at`), a node's cache (`honoured`, `Cache.until`, `renew_at`) and the `sent` it stamps, a delegate's tenure (`dtenure`), the holder's beats' end |
 //! | WAIT | the owner's table (`Grant.until`, `Park.recv`, `try_grant`, `Expire`, `Land`), graces (`floor`, `FloorPassed`, `grace_left`), the root's record of a delegation (`dgen`, `RecallByTtl`), the carried and restamped records at a move, a beat's `sent` and arrival (the lag) and the lease end it names (`expires_w`) |
-//! | WALL | a TTL claimant's compare with the register's expiry (`ttl_claimable`, `fast`: a stamp of another node's clock, plan 43 C7b's), the expiry written to the register (`Reg::expires`) |
+//! | WALL | a TTL claimant's compare with the register's expiry under `claim_rule: Wall` (`ttl_claimable`, `fast`: a stamp of another node's clock; under `Observed` (plan 43 C7b) the claimant waits a TTL of its WAIT reading from its first read of the register's key instead, and a takeover is fast by the permit alone), the expiry written to the register (`Reg::expires`) |
 //!
 //! `Jump(i, d)` replaces `off[i]` (a wall step); under the split it moves
 //! WALL alone. `step_node` and `step_dir` restrict which node steps and which
@@ -498,6 +498,13 @@ pub struct LockModel {
     /// ticks before the end `X` the cap counts to are used. `None`: no
     /// filter.
     pub beat_span: Option<i16>,
+    // ---- plan 43 C7b ----
+    /// How a TTL claimant decides the register's lease has run out
+    /// ([`crate::clk::ClaimRule`]): its wall reading against the holder's
+    /// wall expiry, or one TTL of its own wait reading from its first read of
+    /// the register's current renewal key. Under `Observed` a takeover is a
+    /// fast one only by the permit (the backup).
+    pub claim_rule: crate::clk::ClaimRule,
     // ---- plan 43 C7-F F-c ----
     /// A holder whose grant lapsed asks for it back (`LateRenew`, at most
     /// `max_late` times) and the owner admits it where it can prove
@@ -607,6 +614,7 @@ impl LockModel {
             step_node: None,
             step_dir: 0,
             beat_span: None,
+            claim_rule: crate::clk::ClaimRule::Wall,
             late_reclaim: false,
             max_late: 1,
             late_admit_unknown: false,
@@ -1007,6 +1015,16 @@ pub struct State {
     /// at most an earlier one's leaves the earlier one out: it is in every
     /// window the earlier one is). Empty without a span.
     pub beat_lags: Vec<BeatLag>,
+    /// Plan 43 C7b (`ClaimRule::Observed`): each node's first read of the
+    /// register's current renewal key (all `None` under `Wall`).
+    pub seen: Vec<crate::clk::Seen>,
+}
+
+impl Reg {
+    /// The renewal key (`ClaimRule::Observed`).
+    pub fn key(&self) -> crate::clk::RegKey {
+        (self.holder, self.epoch, self.expires_w, self.released)
+    }
 }
 
 impl State {
@@ -1578,6 +1596,10 @@ pub enum Action {
     /// Plan 43 C7-F F-c: the old root `h` sends its final mirror (its
     /// lease is no longer usable: it adds nothing under it from here).
     FinalMirror(u8),
+    /// Plan 43 C7b: node `i` reads the register; the first read showing its
+    /// current renewal key starts the node's observation of it
+    /// (`ClaimRule::Observed`).
+    Observe(u8),
 }
 
 impl Model for LockModel {
@@ -1673,6 +1695,7 @@ impl LockModel {
             violation: None,
             saw: 0,
             beat_lags: Vec::new(),
+            seen: vec![None; n],
         }
     }
 
@@ -1784,7 +1807,30 @@ impl LockModel {
             {
                 actions.push(Action::FinalMirror(iu));
             }
-            let ttl_claimable = self.ttl_takeover && now_wall >= s.reg.expires;
+            let ttl_claimable = self.ttl_takeover
+                && match self.claim_rule {
+                    crate::clk::ClaimRule::Wall => now_wall >= s.reg.expires,
+                    // One TTL of this node's own wait reading since its
+                    // first read of the register's current key.
+                    crate::clk::ClaimRule::Observed => {
+                        s.reg.holder != NONE
+                            && s.seen[i].is_some_and(|(key, since)| {
+                                key == s.reg.key() && now - since >= self.lease_ttl
+                            })
+                    }
+                };
+            // A read of the register that shows a key this node has not
+            // seen: a node with a lock to take reads it.
+            if self.claim_rule == crate::clk::ClaimRule::Observed
+                && self.ttl_takeover
+                && anyone_wants
+                && s.reg.holder != NONE
+                && s.reg.holder != iu
+                && !s.reg.released
+                && s.seen[i].map(|(k, _)| k) != Some(s.reg.key())
+            {
+                actions.push(Action::Observe(iu));
+            }
             let fast = s.reg.holder != iu && self.backup_for(s.reg.holder as usize) == iu;
             let released = self.released_takeover && s.reg.released;
             if (ttl_claimable || fast || released) && anyone_wants && s.reg.epoch <= self.max_epoch
@@ -1936,7 +1982,10 @@ impl LockModel {
                 // floor-less TTL path of a backup is the sim's).
                 let permitted =
                     prev.holder != i as u8 && self.backup_for(prev.holder as usize) == i as u8;
-                let fast = permitted || now_wall < prev.expires;
+                // Under `Observed` a claim that is not permitted was proved
+                // expired by the observation: not fast (no grace).
+                let fast = permitted
+                    || (self.claim_rule == crate::clk::ClaimRule::Wall && now_wall < prev.expires);
                 let epoch = prev.epoch + 1;
                 // Plan 43 C7-F F-a0: the register of a takeover that waits
                 // out its predecessor's grants is marked from its first
@@ -2240,6 +2289,13 @@ impl LockModel {
                     sent,
                     late: true,
                 });
+            }
+            Action::Observe(i) => {
+                let i = i as usize;
+                let key = s.reg.key();
+                if s.seen[i].map(|(k, _)| k) != Some(key) {
+                    s.seen[i] = Some((key, s.wait(self, i)));
+                }
             }
             Action::FinalMirror(h) => {
                 let h = h as usize;

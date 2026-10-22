@@ -9,6 +9,7 @@
 //! that disagree and step within the lease's margin. Each search prints
 //! its state counts and time.
 
+use constellation_model::clk::ClaimRule;
 use constellation_model::cto::{Action, CtoModel, Msg, Op, State};
 use stateright::{Checker, Model};
 use std::time::{Duration, Instant};
@@ -885,3 +886,87 @@ fn a_delegate_stepped_back_on_its_honour_clock_is_clean() {
         &["all_ops_done", "read_under_delegation"],
     );
 }
+
+// ---- plan 43 C7b: the claim rule by observation ----
+//
+// A node that judges the register's lease by comparing its own wall reading
+// with the expiry another node wrote on its wall is safe only while every
+// offset is below the margin. The observation rule (`ClaimRule::Observed`)
+// has a claimant wait one lease TTL of its own WAIT reading from its first
+// read of the register's current renewal key and claim on that read's tag:
+// no cross-node compare, safe for any offset, for an oscillator within the
+// budget.
+
+/// Nodes 1 and 2 are `ahead` ticks ahead of the holder (node 0); node 0
+/// reads, node 1 writes. A lease of 6 ticks, margins of 1.
+fn claimant_offsets(rule: ClaimRule, offsets: Vec<i16>) -> CtoModel {
+    CtoModel {
+        init_offsets: Some(offsets),
+        claim_rule: rule,
+        clock_split: true,
+        lease_ttl: 6,
+        max_tick: 9,
+        max_drops: 0,
+        ..CtoModel::strict(vec![vec![R, R], vec![W], vec![W]])
+    }
+}
+
+/// A claimant whose clock is ahead of the holder's by a whole lease reads
+/// the live lease as expired and takes it; the old holder, still inside its
+/// window, answers a read from its own replica after the new holder's write
+/// completed.
+#[test]
+fn a_claimant_ahead_beyond_the_margin_violates() {
+    assert_violates(
+        "claimant-ahead-wall",
+        &claimant_offsets(ClaimRule::Wall, vec![0, 6, 6]),
+    );
+}
+
+/// The same with the holder behind: the same relative offset.
+#[test]
+fn a_holder_behind_beyond_the_margin_violates() {
+    assert_violates(
+        "holder-behind-wall",
+        &claimant_offsets(ClaimRule::Wall, vec![-6, 0, 0]),
+    );
+}
+
+/// The observation rule, with the same offsets (and the other way round):
+/// clean, and the takeover happens (the claimant waits out the TTL).
+#[test]
+fn the_observed_claim_is_clean_with_offsets_up_to_a_ttl() {
+    for (label, offsets) in [
+        ("ahead", vec![0, 6, 6]),
+        ("behind", vec![-6, 0, 0]),
+        ("far-ahead", vec![0, 9, -9]),
+    ] {
+        assert_clean(
+            &format!("claimant-observed-{label}"),
+            &claimant_offsets(ClaimRule::Observed, offsets),
+            &["all_ops_done", "takeover"],
+        );
+    }
+}
+
+/// The observation rule with oscillators at the rate budget's edge
+/// (`rate_period` 4, budget 1: 25 %) and offsets of a whole lease: clean.
+#[test]
+fn the_observed_claim_is_clean_with_offsets_and_rates_within_the_budget() {
+    let m = CtoModel {
+        rate_period: 4,
+        max_rate: 1,
+        init_rates: Some(vec![1, -1, 0]),
+        rate_budget: 1,
+        lease_ttl: 8,
+        max_tick: 12,
+        ..claimant_offsets(ClaimRule::Observed, vec![0, 8, -8])
+    };
+    assert_clean("claimant-observed-rates", &m, &["all_ops_done", "takeover"]);
+}
+
+// (Appendix B row 28, a strict reader that tails S3 past a live holder's
+// acknowledged, unshipped writes, is the sim's: this model's log is the
+// shipped log, a write is in it when it is acknowledged, so a reader that
+// tails misses nothing. `strict-reader-ahead` in the authority sim fails on
+// it: 2 of 300 seeds.)

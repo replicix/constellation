@@ -159,3 +159,30 @@ pub fn initial_clocks(off: &[i16], rate: &[i16]) -> Vec<Clk> {
         })
         .collect()
 }
+
+/// Plan 43 C7b: how a node that reads the lease register decides that its
+/// holder's lease has run out (a TTL claim, a strict read that tails instead
+/// of asking a holder).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ClaimRule {
+    /// The design before C7b: the claimant's own wall reading against the
+    /// expiry the holder wrote on its wall (a value of another node's clock:
+    /// safe only while every offset is below the margin).
+    #[default]
+    Wall,
+    /// The observation rule (C7b commit 3): the claimant waits one lease TTL
+    /// on its own WAIT reading from the first read that showed the
+    /// register's current renewal key, and claims on that read's tag. No
+    /// cross-node clock compare: safe for any offset, for an oscillator
+    /// within its budget.
+    Observed,
+}
+
+/// The renewal key of a register: `(holder, epoch, the holder's wait end,
+/// released)` (the code's `RenewalKey`): it changes exactly when the
+/// holder's honoured window can.
+pub type RegKey = (u8, u8, i16, bool);
+
+/// A node's observation of the register: the key and the WAIT reading of
+/// its first read showing it.
+pub type Seen = Option<(RegKey, i16)>;

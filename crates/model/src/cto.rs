@@ -119,7 +119,7 @@
 //! |---|---|
 //! | HONOUR | a node's lease use (`usable`: `expires_h`, `LeaseView::usable`), its probe freshness (`last_probe`, `liveness_fresh`), a delegate's `Deleg.until` and the `sent` it stamps (`ReadIndex`), the cap of a grant by the lease, the holder's beats' end |
 //! | WAIT | the sequencer's grant records and recall-by-expiry (`Grant.until`), the floor (`ack_floor`, `FloorPassed`), a release's live-grant test, a beat's `sent` and arrival (the lag) and the lease end it names (`expires_w`, the code's `holder_wait_ms`), the cap's `X` |
-//! | WALL | a claimant's compare with the register's expiry (`claimable`, `unexpired`: a stamp of another node's clock, plan 43 C7b's), the expiry written to the register (`Reg::expires`) |
+//! | WALL | a claimant's compare with the register's expiry under `claim_rule: Wall` (`claimable_by`, `unexpired`: a stamp of another node's clock; under `Observed` (plan 43 C7b) the claimant waits a TTL of its WAIT reading from its first read of the register's key instead, and a fast takeover is the permit alone), the expiry written to the register (`Reg::expires`) |
 //!
 //! `Jump(i, d)` replaces `off[i]` (a wall step); under the split it moves
 //! WALL alone. [`CtoModel::step_node`] and `step_dir` restrict which node
@@ -327,6 +327,13 @@ pub struct CtoModel {
     /// beats sent at most this many ticks before the end `X` the cap counts
     /// to are used. `None`: no filter.
     pub beat_span: Option<i16>,
+    // ---- plan 43 C7b ----
+    /// How a node decides the register's lease has run out
+    /// ([`crate::clk::ClaimRule`]): `Wall` (its wall reading against the
+    /// holder's wall expiry) or `Observed` (one TTL of its own wait reading
+    /// after its first read of the register's current renewal key). Under
+    /// `Observed` a fast takeover is judged by the permit alone.
+    pub claim_rule: crate::clk::ClaimRule,
 }
 
 impl CtoModel {
@@ -375,6 +382,7 @@ impl CtoModel {
             step_node: None,
             step_dir: 0,
             beat_span: None,
+            claim_rule: crate::clk::ClaimRule::Wall,
         }
     }
 
@@ -424,6 +432,13 @@ pub struct Reg {
     /// Plan 30 §M9: this tenure has served a strict read (the
     /// `granted_delegations` flag, set by one CAS before the first).
     pub marked: bool,
+}
+
+impl Reg {
+    /// The renewal key (`ClaimRule::Observed`).
+    pub fn key(&self) -> crate::clk::RegKey {
+        (self.holder, self.epoch, self.expires_w, self.released)
+    }
 }
 
 /// Holder side: a grant it must recall or outwait.
@@ -588,6 +603,9 @@ pub struct State {
     /// with a lag at most an earlier one's leaves the earlier one out: it
     /// is in every window the earlier one is). Empty without a span.
     pub beat_lags: Vec<BeatLag>,
+    /// Plan 43 C7b (`ClaimRule::Observed`): each node's first read of the
+    /// register's current renewal key (all `None` under `Wall`).
+    pub seen: Vec<crate::clk::Seen>,
 }
 
 pub use crate::clk::Clk;
@@ -608,6 +626,20 @@ impl State {
     /// A waiter's outwaits and the liveness timers are on this one.
     fn wait(&self, cfg: &CtoModel, i: usize) -> i16 {
         cfg.spec().wait(self.t, &self.clk[i])
+    }
+
+    /// Whether node `i` may treat the register's lease as run out: never
+    /// held, released, or (by the claim rule) expired on `i`'s reading.
+    fn claimable_by(&self, cfg: &CtoModel, i: usize) -> bool {
+        if self.reg.holder == NONE || self.reg.released {
+            return true;
+        }
+        match cfg.claim_rule {
+            crate::clk::ClaimRule::Wall => self.wall(cfg, i) >= self.reg.expires,
+            crate::clk::ClaimRule::Observed => self.seen[i].is_some_and(|(key, since)| {
+                key == self.reg.key() && self.wait(cfg, i) - since >= cfg.lease_ttl
+            }),
+        }
     }
 
     /// The version a replica at prefix `n` holds (writes in the prefix).
@@ -785,6 +817,10 @@ pub enum Action {
     FloorPassed(u8),
     /// Plan 43 C7-F F-a: holder `h` beats to `b` (`beat_cap`).
     Beat(u8, u8),
+    /// Plan 43 C7b: node `i` reads the register; the first read showing its
+    /// current renewal key starts the node's observation of it
+    /// (`ClaimRule::Observed`).
+    Observe(u8),
 }
 
 impl Model for CtoModel {
@@ -873,6 +909,7 @@ impl Model for CtoModel {
                     next_id: 0,
                     saw: 0,
                     beat_lags: Vec::new(),
+                    seen: vec![None; n],
                 }
             })
             .collect()
@@ -924,10 +961,12 @@ impl Model for CtoModel {
             if self.allow_renew && s.may_execute(self, i) && !s.reg.released {
                 actions.push(Action::Renew(iu));
             }
-            // (A claimant compares its wall reading with the register's expiry: a
-            // value of another node's clock, plan 43 C7b's.)
-            let claimable =
-                s.reg.holder == NONE || s.reg.released || s.wall(self, i) >= s.reg.expires;
+            // (A claimant under `Wall` compares its wall reading with the
+            // register's expiry: a value of another node's clock. Under
+            // `Observed` it waits a TTL of its own wait reading from its
+            // first read of the register's current key, and claims on that
+            // read's tag.)
+            let claimable = s.claimable_by(self, i);
             // Plan 30 §M9: on a `fast` tenure the detection of the
             // holder's silence is nondeterministic (safety must hold for
             // any timing), so a live lease is claimable by a peer at any
@@ -940,6 +979,17 @@ impl Model for CtoModel {
                     && self.scripts[i].get(node.pc as usize) == Some(&Op::Write));
             if (claimable || fast) && wants && s.reg.epoch < self.max_epoch {
                 actions.push(Action::Takeover(iu));
+            }
+            // A read of the register that shows a key this node has not
+            // seen (it reads when it has a reason: a write to do, a strict
+            // read with no usable lease or delegation).
+            if self.claim_rule == crate::clk::ClaimRule::Observed
+                && (wants || matches!(node.op, NodeOp::ReadStart { .. }))
+                && s.seen[i].map(|(k, _)| k) != Some(s.reg.key())
+                && s.reg.holder != NONE
+                && !s.reg.released
+            {
+                actions.push(Action::Observe(iu));
             }
             if node.lease.is_some() && self.fast_takeover {
                 actions.push(Action::Probe(iu));
@@ -1012,10 +1062,7 @@ impl Model for CtoModel {
                         && node.deleg.is_some_and(|d| s.honour(self, i) < d.until)
                     {
                         actions.push(Action::ReadUnderDelegation(iu));
-                    } else if s.reg.holder == NONE
-                        || s.reg.released
-                        || s.wall(self, i) >= s.reg.expires
-                    {
+                    } else if s.claimable_by(self, i) {
                         actions.push(Action::ReadLocal(iu));
                     } else {
                         actions.push(Action::SendReadIndex(iu));
@@ -1080,6 +1127,13 @@ impl Model for CtoModel {
                 ));
                 s.nodes[i].last_probe = s.honour(self, i);
             }
+            Action::Observe(i) => {
+                let i = i as usize;
+                let key = s.reg.key();
+                if s.seen[i].map(|(k, _)| k) != Some(key) {
+                    s.seen[i] = Some((key, s.wait(self, i)));
+                }
+            }
             Action::Takeover(i) => {
                 let i = i as usize;
                 let epoch = s.reg.epoch + 1;
@@ -1101,8 +1155,14 @@ impl Model for CtoModel {
                 // silence), so this model explores no takeover that waits
                 // no floor; the code's no-floor TTL path is the sim's.
                 let permitted = self.fast_takeover && prev.holder != NONE && prev.holder != i as u8;
-                let unexpired =
-                    prev.holder != NONE && !prev.released && (permitted || now_wall < prev.expires);
+                // Under `Observed` a claim that is not permitted was proved
+                // expired by the observation: no floor (the old expiry is a
+                // stamp of the old holder's clock and is not compared).
+                let unexpired = prev.holder != NONE
+                    && !prev.released
+                    && (permitted
+                        || (self.claim_rule == crate::clk::ClaimRule::Wall
+                            && now_wall < prev.expires));
                 // Plan 43 C7-F F-a0: a tenure that inherits a floor is
                 // marked from its first CAS.
                 let inherits = self.inherit_mark && self.horizon_wait && unexpired && prev.marked;
@@ -1356,6 +1416,7 @@ impl Model for CtoModel {
                 s.saw & SAW_DELEG_READ != 0
             }),
             Property::sometimes("recall_acked", |_, s: &State| s.saw & SAW_RECALL_ACK != 0),
+            Property::sometimes("takeover", |_, s: &State| s.saw & SAW_TAKEOVER != 0),
             Property::sometimes("fast_takeover", |_, s: &State| {
                 s.saw & SAW_FAST_TAKEOVER != 0
             }),

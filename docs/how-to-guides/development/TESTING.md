@@ -3240,6 +3240,30 @@ and 20-40 s each; the whole `cto` binary already peaks near 23 GB) are
 beat_cap --test-threads=1`. The naive cap's violating traces are cheap and
 always run.
 
+Plan 43 C7b's models carry the claim rule as a knob (`claim_rule: ClaimRule
+{ Wall, Observed }`, `crates/model/src/clk.rs`; `lease_claim` in `flex`, whose
+`claim_rule` is the formation's): `Wall` is the design before C7b (a claimant's
+wall against the holder's wall expiry, a fast takeover judged by that compare as
+well as the permit), `Observed` the observation rule (`Observe(i)` reads the
+register; a claimant waits one TTL of its own wait reading from its first read
+of the register's current renewal key, and a takeover is fast by the permit
+alone). Pairs, each a violating variant and its clean one: `cto` and `locks`:
+`a_claimant_ahead_beyond_the_margin_violates` (`Wall`, a node ahead by a whole
+lease; `a_holder_behind_beyond_the_margin_violates` its twin) against
+`the_observed_claim_is_clean_with_offsets_up_to_a_ttl` and
+`the_observed_claim_is_clean_with_offsets_and_rates_within_the_budget` (offsets
+of a lease either way, oscillators at the budget's edge); `flex` (also
+`promise_rule: PromiseRule { Expiry, Anchored }`, a promise naming the register
+version it was made for, made only after the promiser's own observation of it
+lasted a TTL, counted iff it names the version claimed; the S3 path only):
+`expiry_promises_split_brain_beyond_the_margin` (`Expiry` + `Wall`, drift twice
+the margin) and `expiry_promises_split_brain_beyond_the_margin_even_with_observed_claims`
+(`Observed` claims, `Expiry` promises, offsets of a lease) against
+`anchored_promises_are_clean_beyond_the_margin`. The strict reader that tails S3
+past a live holder's unshipped writes (row 28) is the simulator's
+(`strict-reader-ahead`): the `cto` model's log is the shipped log. Every
+existing test keeps its verdict with the defaults (`Wall`, `Expiry`).
+
 Both models also carry plan 43 C7a's clocks (`crates/model/src/clk.rs`): a
 node's oscillator gains or loses `rate` ticks every `rate_period` real ticks
 (`max_rate`, `explore_rates`, `init_rates`), and its honour, wait and wall

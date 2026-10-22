@@ -2030,3 +2030,66 @@ fn a_root_stepped_forward_on_the_split_clocks_is_clean() {
         &["all_ops_done", "recall_expired"],
     );
 }
+
+// ---- plan 43 C7b: the claim rule by observation ----
+
+/// A TTL takeover judged by a claimant 3 ticks ahead of the old root (a
+/// whole lease): it reads the live lease as expired and becomes the root
+/// while the old root's grants are honoured (a grant over a held lock).
+fn ttl_claim(rule: constellation_model::clk::ClaimRule, offsets: Vec<i16>) -> LockModel {
+    LockModel {
+        ttl_takeover: true,
+        claim_rule: rule,
+        clock_split: true,
+        init_offsets: Some(offsets),
+        lease_ttl: 3,
+        lock_ttl: 6,
+        max_drops: 0,
+        max_tick: 7,
+        max_renews: 0,
+        ..LockModel::design(contend())
+    }
+}
+
+#[test]
+fn a_claimant_ahead_beyond_the_margin_violates() {
+    assert_violates(
+        "ttl-claimant-ahead-wall",
+        &ttl_claim(constellation_model::clk::ClaimRule::Wall, vec![0, 3, 3]),
+    );
+}
+
+/// The observation rule with the same offsets (and the holder behind, a
+/// node far ahead and one far behind): clean, the takeover witnessed.
+#[test]
+fn the_observed_claim_is_clean_with_offsets_up_to_a_ttl() {
+    for (label, offsets) in [
+        ("ahead", vec![0, 3, 3]),
+        ("behind", vec![-3, 0, 0]),
+        ("spread", vec![0, 5, -5]),
+    ] {
+        assert_clean(
+            &format!("ttl-claimant-observed-{label}"),
+            &ttl_claim(constellation_model::clk::ClaimRule::Observed, offsets),
+            &["all_ops_done", "ttl_takeover"],
+        );
+    }
+}
+
+/// The same with oscillators within the rate budget.
+#[test]
+fn the_observed_claim_is_clean_with_offsets_and_rates_within_the_budget() {
+    let m = LockModel {
+        rate_period: 4,
+        max_rate: 1,
+        init_rates: Some(vec![1, -1, 0]),
+        rate_budget: 1,
+        lease_ttl: 4,
+        max_tick: 9,
+        ..ttl_claim(
+            constellation_model::clk::ClaimRule::Observed,
+            vec![0, 4, -4],
+        )
+    };
+    assert_clean("ttl-claimant-observed-rates", &m, &["ttl_takeover"]);
+}

@@ -70,6 +70,21 @@
 //!   `docs/plans/v1/PROGRESS.md`, "Plan 30 M10 — phase 1"); the
 //!   formation-side claim rule is what keeps them apart from epochs.
 //!
+//! - **Plan 43 C7b** (`promise_rule`, `lease_claim`): the rules above compare
+//!   values of other nodes' clocks (a promise's `no_epoch_until` with the
+//!   lease's `expires`, a taker's clock with the holder's expiry), safe
+//!   only while every offset is below the margin. `PromiseRule::Anchored`
+//!   has a promise name the register version it was made for ([`Action::ObserveKey`]
+//!   then [`Action::Issue`], only once the promiser's own observation of
+//!   that version has lasted a lease TTL on its clock) and the taker count
+//!   a promise iff it names the version it claims; `ClaimRule::Observed`
+//!   has the taker wait a TTL of its own clock from its first read of the
+//!   register's current version. Together no clock is compared across
+//!   nodes: the evidence is that a node was in no open epoch at an instant at
+//!   least a TTL after the key was written, and no epoch formed after that
+//!   can carry the key's lease, which has ended. (The S3 path only; the
+//!   P2P request-anchored one gives the same evidence.)
+//!
 //! Each rule is a knob, so the tests can show what each one prevents.
 //!
 //! # Faults and nondeterminism
@@ -146,6 +161,27 @@ pub const PAST: i16 = -100;
 /// A time no clock reaches within the tick horizon: values beyond it are
 /// normalized to it.
 pub const FAR: i16 = 100;
+
+/// Plan 43 C7b: what a promise (`heartbeat/<node>`) says and how a taker
+/// counts it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum PromiseRule {
+    /// The design before C7b: `no_epoch_until`, an instant on the promiser's
+    /// wall; a taker counts a promise that outlasts the lease's expiry (or
+    /// is unexpired on its own clock): a compare of another node's clock,
+    /// safe only while every offset is below the margin.
+    #[default]
+    Expiry,
+    /// Plan 43 C7b commit 5: a promise names the lease key it was made for,
+    /// and is made only once the promiser's own observation of that key has
+    /// lasted a lease TTL on its wait reading (`Action::ObserveKey`, then
+    /// `Action::Issue`); a taker counts a promise iff it names the key it is
+    /// claiming. No clock is compared across nodes: the evidence is "this
+    /// node was in no open epoch at an instant at least a TTL after the key
+    /// was written", and no epoch formed after that instant can carry the
+    /// key's lease (it has ended).
+    Anchored,
+}
 
 /// The lease's acknowledgement policy (plan 30 §M9).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -228,6 +264,15 @@ pub struct FlexEpochs {
     /// failed property (`HasDiscoveries::AnyFailures`) still ends on the
     /// property a test is about.
     pub check_hold_owner: bool,
+    // ---- plan 43 C7b ----
+    /// What a promise says and how a taker counts it ([`PromiseRule`]).
+    pub promise_rule: PromiseRule,
+    /// How a taker decides the register's lease has run out
+    /// ([`crate::clk::ClaimRule`]): its clock against the holder's expiry
+    /// (`Wall`), or one TTL after its first read of the register's current
+    /// version (`Observed`; a node's clock then only measures a duration).
+    /// (Not `claim_rule`, which is the formation's.)
+    pub lease_claim: crate::clk::ClaimRule,
 }
 
 impl FlexEpochs {
@@ -263,6 +308,8 @@ impl FlexEpochs {
             claim_rule: true,
             resolve_by_epoch: true,
             check_hold_owner: false,
+            promise_rule: PromiseRule::Expiry,
+            lease_claim: crate::clk::ClaimRule::Wall,
         }
     }
 
@@ -340,6 +387,12 @@ pub struct Node {
     pub journal: Vec<u8>,
     /// `on_demand`: the register's expiry as this node last read it.
     pub seen: i16,
+    /// Plan 43 C7b (`Observed` claims, `Anchored` promises): the register
+    /// version this node's observation is of, and this node's clock at the
+    /// first read that showed it.
+    pub obs: Option<(u8, i16)>,
+    /// A heartbeat PUT in flight names this register version (`Anchored`).
+    pub pending_key: Option<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -370,6 +423,8 @@ pub struct State {
     pub log: Vec<Entry>,
     /// `heartbeat/<node>`: `no_epoch_until` (in the publisher's clock).
     pub hb: Vec<i16>,
+    /// Plan 43 C7b (`Anchored`): the register version each heartbeat names.
+    pub hb_key: Vec<Option<u8>>,
     pub nodes: Vec<Node>,
     pub epochs: Vec<EpochRec>,
     pub crashes: u8,
@@ -438,6 +493,12 @@ impl State {
     /// Other roster nodes whose published promise is unexpired in `i`'s
     /// clock now (or, `compare_to_expiry`, outlasts the lease's expiry).
     fn unexpired_others(&self, m: &FlexEpochs, i: usize) -> u8 {
+        if m.promise_rule == PromiseRule::Anchored {
+            // Counted iff it names the key being claimed.
+            return (0..self.nodes.len())
+                .filter(|j| *j != i && self.hb_key[*j] == Some(self.reg.version))
+                .count() as u8;
+        }
         let now = if m.compare_to_expiry {
             self.reg.expires
         } else {
@@ -446,6 +507,24 @@ impl State {
         (0..self.nodes.len())
             .filter(|j| *j != i && self.hb[*j] > now)
             .count() as u8
+    }
+
+    /// Whether node `i` may treat the register's lease as run out.
+    fn claimable_by(&self, m: &FlexEpochs, i: usize) -> bool {
+        match m.lease_claim {
+            crate::clk::ClaimRule::Wall => self.local(i) >= self.reg.expires,
+            crate::clk::ClaimRule::Observed => self.nodes[i].obs.is_some_and(|(v, since)| {
+                v == self.reg.version && self.local(i) - since >= m.lease_ttl
+            }),
+        }
+    }
+
+    /// Node `i`'s observation of the register's current version is a lease
+    /// TTL old (its own clock measuring a duration).
+    fn observation_passed(&self, m: &FlexEpochs, i: usize) -> bool {
+        self.nodes[i]
+            .obs
+            .is_some_and(|(v, since)| v == self.reg.version && self.local(i) - since >= m.lease_ttl)
     }
 
     fn takeover(&mut self, m: &FlexEpochs, i: usize) {
@@ -505,6 +584,13 @@ impl State {
             } else {
                 n.seen = 0;
             }
+            if let Some((_, since)) = n.obs.as_mut() {
+                // Only `local - since >= ttl` matters, and once true stays
+                // true for this version.
+                if local - *since >= m.lease_ttl {
+                    *since = PAST;
+                }
+            }
             if n.promise <= local {
                 n.promise = PAST;
             } else if n.promise > ceil {
@@ -533,7 +619,10 @@ impl State {
         for n in &self.nodes {
             seen.extend(n.lease.map(|l| l.version));
             seen.extend(n.snap);
+            seen.extend(n.obs.map(|(v, _)| v));
+            seen.extend(n.pending_key);
         }
+        seen.extend(self.hb_key.iter().flatten());
         seen.extend(self.epochs.iter().map(|r| r.version));
         seen.sort_unstable();
         seen.dedup();
@@ -544,6 +633,11 @@ impl State {
                 l.version = rank(l.version);
             }
             n.snap = n.snap.map(rank);
+            n.obs = n.obs.map(|(v, since)| (rank(v), since));
+            n.pending_key = n.pending_key.map(rank);
+        }
+        for k in self.hb_key.iter_mut() {
+            *k = k.map(rank);
         }
         for r in self.epochs.iter_mut() {
             r.version = rank(r.version);
@@ -581,6 +675,10 @@ pub enum Action {
     Op(u8),
     /// `on_demand`: read the register (its expiry).
     Observe(u8),
+    /// Plan 43 C7b: read the register; the first read showing its current
+    /// version starts this node's observation of it (`Observed` claims,
+    /// `Anchored` promises).
+    ObserveKey(u8),
     /// Tail to head.
     Tail(u8),
     Crash(u8),
@@ -622,6 +720,7 @@ impl Model for FlexEpochs {
                 version: 1,
                 policy: self.policy,
             };
+            let hb_key: Vec<Option<u8>> = vec![None; n];
             let hb: Vec<i16> = (0..n)
                 .map(|i| {
                     if self.promises() {
@@ -649,6 +748,8 @@ impl Model for FlexEpochs {
                     known: 1,
                     journal: Vec::new(),
                     seen: expires,
+                    obs: None,
+                    pending_key: None,
                 })
                 .collect();
             out.push(State {
@@ -657,6 +758,7 @@ impl Model for FlexEpochs {
                 reg,
                 log: vec![Entry::Marker(1)],
                 hb,
+                hb_key,
                 nodes,
                 epochs: Vec::new(),
                 crashes: 0,
@@ -698,13 +800,29 @@ impl Model for FlexEpochs {
             if self.on_demand && node.seen != s.reg.expires {
                 actions.push(Action::Observe(iu));
             }
+            // `Anchored`: only for a key this node has observed for a lease TTL
+            // (its own clock measuring a duration), the register's present
+            // one, and not its own tenure's.
+            let anchored_ok = self.promise_rule == PromiseRule::Expiry
+                || (s.reg.holder != iu && s.observation_passed(self, i));
             if self.promises()
                 && observed
+                && anchored_ok
                 && node.pending.is_none()
                 && (!in_epoch || !self.silent_in_epoch)
                 && s.local(i) + self.promise_ttl > node.promise
             {
                 actions.push(Action::Issue(iu));
+            }
+            // A node reads the register when it has a reason: a takeover to
+            // consider, or a promise to anchor.
+            if (self.lease_claim == crate::clk::ClaimRule::Observed
+                || self.promise_rule == PromiseRule::Anchored)
+                && !in_epoch
+                && s.reg.holder != iu
+                && node.obs.map(|(v, _)| v) != Some(s.reg.version)
+            {
+                actions.push(Action::ObserveKey(iu));
             }
             // Ops.
             if s.history.len() < self.ops.len() && s.can_ack(self, i) {
@@ -733,7 +851,7 @@ impl Model for FlexEpochs {
                 }
             }
             if s.reg.holder != iu && s.reg.epoch < self.max_reg_epoch {
-                let expired = s.local(i) >= s.reg.expires;
+                let expired = s.claimable_by(self, i);
                 if self.promises() && self.takeover_promise_check {
                     let may_read = expired || !self.read_after_expiry;
                     if may_read
@@ -778,6 +896,9 @@ impl Model for FlexEpochs {
                     s.nodes[i].promise = u;
                 }
                 s.nodes[i].pending = Some(u);
+                s.nodes[i].pending_key = (self.promise_rule == PromiseRule::Anchored)
+                    .then(|| s.nodes[i].obs.map(|(v, _)| v))
+                    .flatten();
                 if !self.inflight_puts {
                     return self.next_state(&s, Action::Land(i as u8));
                 }
@@ -786,6 +907,7 @@ impl Model for FlexEpochs {
                 let i = i as usize;
                 let u = s.nodes[i].pending.take()?;
                 s.hb[i] = u;
+                s.hb_key[i] = s.nodes[i].pending_key.take();
                 if !self.persist_before_publish && s.nodes[i].alive {
                     // Persist after the PUT acknowledged.
                     s.nodes[i].promise = s.nodes[i].promise.max(u);
@@ -880,6 +1002,13 @@ impl Model for FlexEpochs {
                 let e = s.reg.expires;
                 s.nodes[i as usize].seen = e;
             }
+            Action::ObserveKey(i) => {
+                let i = i as usize;
+                let version = s.reg.version;
+                if s.nodes[i].obs.map(|(v, _)| v) != Some(version) {
+                    s.nodes[i].obs = Some((version, s.local(i)));
+                }
+            }
             Action::Learn(m) => {
                 s.nodes[m as usize].epoch = None;
             }
@@ -921,6 +1050,9 @@ impl Model for FlexEpochs {
                 s.nodes[i].alive = false;
                 s.nodes[i].lease = None;
                 s.nodes[i].snap = None;
+                // An observation is volatile: a restarted process is a cold
+                // claimant.
+                s.nodes[i].obs = None;
                 s.crashes += 1;
             }
             Action::Restart(i) => {

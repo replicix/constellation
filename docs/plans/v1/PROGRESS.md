@@ -57055,3 +57055,31 @@ The known gaps are pinned `#[ignore]`d (`fast_takeover_skewed_successor_known_ga
 by the oracle, `locks_holder_step_back_sealed_known_gap`,
 `fast_takeover_skewed_holder_twice_known_gaps`, `locks_claimant_ahead_known_gaps`,
 `strict_claimant_ahead_known_gap`, `strict_reader_ahead_known_gaps`) for commit 3.
+
+## Plan 43 C7b, commit 2/N: the models with offsets (2026-10-22)
+
+`crates/model`: `claim_rule: ClaimRule { Wall, Observed }` in `cto` and `locks`
+(`lease_claim` in `flex`, whose `claim_rule` is the formation's), a per-node
+observation of the register's renewal key (`State::seen`, `Action::Observe`),
+and `promise_rule: PromiseRule { Expiry, Anchored }` in `flex`. Defaults are the
+design before C7b: every existing test keeps its verdict (the whole crate,
+`--test-threads=2`: green). Under `Observed` a claimant is claimable iff the
+register is released, never held, or its own wait reading is a lease TTL past
+its first read of the current key; a takeover is fast by the permit alone.
+
+Pairs (violating / clean; the clean ones with offsets of a whole lease either
+way and, in `cto`/`locks`, oscillators at the rate budget's edge):
+
+- `cto` and `locks`: `a_claimant_ahead_beyond_the_margin_violates` (and
+  `a_holder_behind_...` in `cto`) against
+  `the_observed_claim_is_clean_with_offsets_up_to_a_ttl` and `..._and_rates_within_the_budget`.
+  The cto set ran 168 s single-threaded, the locks pair 54 s.
+- `flex`: `expiry_promises_split_brain_beyond_the_margin` (drift twice the
+  margin), `..._even_with_observed_claims` (so the anchored promise rule is
+  needed in addition to the claim rule: row 3), against
+  `anchored_promises_are_clean_beyond_the_margin` (12 s; one op, to stay inside
+  the 30 M-state budget). The S3 path of the anchored promise only.
+
+Row 28 (a strict reader tailing past a live holder's unshipped writes) has no
+model: the `cto` log is the shipped log. The sim has it
+(`strict-reader-ahead`).

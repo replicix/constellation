@@ -14,7 +14,9 @@
 //!
 //! `cargo test -p constellation-model --release --test flex_epochs -- --nocapture`
 
-use constellation_model::flex::{FlexEpochs, Policy};
+use constellation_model::clk::ClaimRule;
+use constellation_model::flex::{FlexEpochs, Policy, PromiseRule};
+use constellation_model::namespace::NsOp;
 use stateright::{Checker, HasDiscoveries, Model};
 use std::time::{Duration, Instant};
 
@@ -583,4 +585,77 @@ fn an_unguarded_seal_takeover_deposes_the_hold_owner() {
     for (k, a) in d.clone().into_actions().into_iter().enumerate() {
         println!("  {k:2}: {a:?}");
     }
+}
+
+// ---- plan 43 C7b: promises anchored to the claimed key (Appendix B row 3) ----
+//
+// A promise's `no_epoch_until` is an instant on the promiser's wall, which a
+// taker compares with the lease's expiry (the holder's wall): the argument
+// that no epoch can carry the lease the taker is replacing ends in a
+// contradiction only if clocks are within `D` of each other with the margin
+// above `2D`. The anchored rule names the lease key in the promise, makes it
+// only once the promiser's own observation of that key has lasted a TTL, and
+// counts it only for the key being claimed: no clock is compared across
+// nodes. (Only the S3 path is modelled: the P2P request-anchored one gives
+// the taker the same evidence with a fresher instant.)
+
+/// `N = 3`, `f = 1`, a lease of 4 ticks, promises of 1, offsets at `±drift`
+/// (extreme), margin `margin`.
+fn beyond(promise: PromiseRule, claim: ClaimRule, drift: i16, margin: i16) -> FlexEpochs {
+    FlexEpochs {
+        lease_ttl: 4,
+        promise_ttl: 1,
+        initial_expiry: 2,
+        initial_promise: 0,
+        max_tick: 8,
+        extreme_offsets: true,
+        inflight_puts: false,
+        max_crashes: 0,
+        promise_rule: promise,
+        lease_claim: claim,
+        ..full().with_drift(drift, margin)
+    }
+}
+
+/// Offsets of `2M` (the margin is below `2D`): a taker ahead of the holder
+/// reads the live lease as expired, counts the promises that outlast the
+/// expiry it reads, and takes the lease inside the holder's window.
+#[test]
+fn expiry_promises_split_brain_beyond_the_margin() {
+    let m = beyond(PromiseRule::Expiry, ClaimRule::Wall, 2, 1);
+    assert_violates("expiry+wall beyond the margin", &m, "single_authority");
+}
+
+/// With the claim by observation but the promises still compared by expiry,
+/// offsets of a whole lease still split the brain: the promise rule is
+/// needed in addition (row 3).
+#[test]
+fn expiry_promises_split_brain_beyond_the_margin_even_with_observed_claims() {
+    let m = FlexEpochs {
+        compare_to_expiry: true,
+        read_after_expiry: false,
+        ..beyond(PromiseRule::Expiry, ClaimRule::Observed, 4, 1)
+    };
+    assert_violates("expiry+observed beyond the margin", &m, "single_authority");
+}
+
+/// Anchored promises and claims by observation: clean with offsets of a whole
+/// lease (the epoch formed with a node missing, the takeover that passed
+/// the check, the flush and every op done all witnessed).
+#[test]
+fn anchored_promises_are_clean_beyond_the_margin() {
+    let m = FlexEpochs {
+        // One op keeps the search inside the budget.
+        ops: vec![NsOp::CreateExcl(0)],
+        ..beyond(PromiseRule::Anchored, ClaimRule::Observed, 4, 1)
+    };
+    assert_clean(
+        "anchored+observed beyond the margin",
+        &m,
+        &[
+            "epoch_with_missing_node",
+            "checked_takeover",
+            "all_ops_done",
+        ],
+    );
 }
