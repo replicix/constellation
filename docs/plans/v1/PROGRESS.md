@@ -56850,3 +56850,34 @@ Pinned seeds (unclocked, `pinned::run_seed`) whose trajectories this commit shif
 ### Not done here
 
 - The acknowledgement latency numbers on ext4, xfs, btrfs and tmpfs: pending, box.
+
+## Plan 45 — Hard links: dentry attribute copies only for single-name inodes
+
+Plan 45 (`docs/plans/v1/wip/45-hard-links.md`) removes the O(n) cost of an
+inode's n names. Plan 28 §P6 gives every `0x02` dentry a copy of its inode's
+attributes and plan 29 M3c rewrites every copy on every `0x01` write, so
+`link`, `unlink`, `rename`, `chmod`, `utimes` and every write commit on an
+inode with n names cost O(n) key rewrites and a burst of n links O(n²)
+(7.4 ms per `link()` at 2,000 names through the FUSE mount; one `stress-ng
+link` bogo-op 38.7 s, 773 MB of journal). The copy now exists only while the
+inode is a directory or has exactly one name; a non-directory with two or
+more names has `Remote` dentries (`ino` + `kind`, 9 bytes), the form being a
+function of `0x01.nlink` written in the same transaction (local and replay)
+and checked by fsck. The maintainer decided the design on 2026-10-22
+(`T = 1`, `Remote` = ino + kind, one `0x01` point read per hard-linked
+READDIRPLUS entry, `MetaStore::lookup` keeps `FileAttr`, the xcheckfs lane
+keeps `--link 1`, the plan lands before plan 40's plus entries). Work was
+done on the workstation only (the boxes unreachable): meta-level numbers are
+measured, the four-file-system runs are pending.
+
+### What landed
+
+| Item | State | Where |
+|---|---|---|
+| Plan document, plan 28 §P6 note, index | landed | `docs/plans/v1/wip/45-hard-links.md`, `README.md`, `done/28-…` |
+| Baseline (H0) | planned | `crates/meta/tests/hardlink_perf.rs`; box: `bench/hardlink/` |
+| Two dentry forms, fsck check (H1) | planned | `crates/mtree/src/record.rs`, `crates/engine/src/{mtree_read,fsck}.rs` |
+| The rule and transitions (H2) | planned | `crates/meta/src/store/{ns,writes,misc,reads,scratch}.rs`, `crates/meta/src/replay.rs` |
+| Engine readers (H3) | planned | `crates/engine/src/{snapshot,snapwalk,snapacct/verify,mtree_read}.rs` |
+| Harness scenario, xcheckfs lane (H4) | pending, box | `crates/harness/src/scenarios.rs` |
+| Docs (H5) | pending | `docs/reference` |

@@ -369,6 +369,18 @@ rules rather than cells:
   the lever is ino allocation locality (§S1b), not the copy. Recursive
   attribute changes should still go through §P9 macros rather than key
   deltas.
+
+  **Amended 2026-10-22 (plan 45,
+  `wip/45-hard-links.md`):** "`nlink` is 1 for all but a rounding error of
+  files" is the premise, and it is the premise that fails for hard-linked
+  inodes: with *n* names every `link`, `unlink`, `chmod` and write commit
+  rewrote *n* copies (7.4 ms per `link()` at 2,000 names; one `stress-ng
+  link` bogo-op 38.7 s). Plan 45 restricts the copy to **inodes that are a
+  directory or have exactly one name**; a non-directory with two or more
+  names has `Remote` dentries (`ino` + `kind`, 9 bytes), and its attributes
+  are read from `0x01`. The form is a function of `0x01.nlink`, written in
+  the same transaction, so the one-hash argument above is unchanged. A
+  listing of single-name entries is byte for byte what this section says.
 - **Indexes stay out of the tree.** Only keys that are *immutable for the
   lifetime of the entity they describe* may live in the hashed tree. That
   admits the four primary ranges above (`ino` and `(parent_ino, name)`
