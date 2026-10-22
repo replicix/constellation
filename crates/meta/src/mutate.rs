@@ -1185,6 +1185,8 @@ mod tests {
                     new_parent: ROOT_INO,
                     new_name: "gone".into(),
                     time_ns: 1,
+                    ino: 0,
+                    new_ino: 0,
                 }],
                 &crate::replay::TouchSet::default(),
             )

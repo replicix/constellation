@@ -418,3 +418,53 @@ fn replicas_converge_on_the_dentry_bytes() {
     };
     assert_eq!(remote_only(&a.meta), remote_only(&b));
 }
+
+/// Plan 45 follow-up (the authority sim's `backup+links` seed 6): a rename
+/// of one name of a hard-linked inode onto another of its names, and an
+/// exchange of two such names, are POSIX no-ops — and journaled nothing,
+/// not even the op's `Completed { rid }`. The op answered `Ok` with no log
+/// position: no durable dedup (a resubmission after a failover executed it
+/// again, against whatever the state was by then) and no wait for the
+/// state its answer read to become durable (the link it found, still in
+/// the holder's journal). Each completes its rid like any other op.
+#[test]
+fn a_same_inode_rename_or_exchange_completes_its_rid() {
+    use constellation_meta::{execute_mutate, MutateOp, Rid};
+    let w = world(2);
+    let rid = |seq| Rid {
+        node: 9,
+        incarnation: 1,
+        seq,
+    };
+    let ops = [
+        MutateOp::Rename {
+            parent: w.d,
+            name: "f".into(),
+            new_parent: w.e,
+            new_name: "l1".into(),
+            noreplace: false,
+        },
+        MutateOp::Exchange {
+            parent: w.d,
+            name: "f".into(),
+            new_parent: w.e,
+            new_name: "l1".into(),
+        },
+    ];
+    for (i, op) in ops.iter().enumerate() {
+        let r = rid(i as u64 + 1);
+        let before = dump(&w.meta);
+        let records = execute_mutate(&w.meta, op, Some(r)).unwrap();
+        assert!(
+            matches!(records.as_slice(), [LogRecord::Completed { rid }] if *rid == r),
+            "{op:?}: {records:?}"
+        );
+        assert!(w.meta.completed_position(r).unwrap().is_some(), "{op:?}");
+        assert_eq!(
+            changed(&before, &dump(&w.meta)),
+            0,
+            "{op:?} changed the namespace"
+        );
+    }
+    assert_eq!(w.meta.lookup(w.d, "f").unwrap().unwrap().nlink, 2);
+}

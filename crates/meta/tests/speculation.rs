@@ -2109,3 +2109,130 @@ fn a_hint_for_a_renamed_name_keeps_the_held_inode() {
         1,
     );
 }
+
+/// Plan 45 follow-up (the authority sim's `backup-hot+links` seed 18): a
+/// streamed `link` of an inode under a new name, and this node's shadow of
+/// an `unlink` of the inode's other name the holder ran after it. Here the
+/// shadow removed the inode (its only name on this replica); the streamed
+/// link, judged disjoint from the unlink (an `Unlink` record names a name,
+/// not the inode), went on top and was skipped ("link endpoint missing"),
+/// and the replica lost the file the log keeps under `f1`. The shadow's
+/// captured inode makes the two overlap: the link goes in under it.
+#[test]
+fn a_streamed_link_goes_under_a_shadowed_unlink_of_the_inodes_other_name() {
+    let x = ino(70);
+    let mine = rid(71);
+    let other = Rid {
+        node: 3,
+        incarnation: 1,
+        seq: 1,
+    };
+    let t0 = constellation_fs_core::types::now_ns() + STAMP_MARGIN_NS;
+    let seg1 = [create("f0", x, t0)];
+    let theirs = [
+        LogRecord::Link {
+            ino: x,
+            parent: ROOT_INO,
+            name: "f1".into(),
+            time_ns: t0 + 1,
+        },
+        completed(other),
+    ];
+    let ours = [unlink("f0", t0 + 2), completed(mine)];
+    let seg2: Vec<LogRecord> = theirs.iter().chain(ours.iter()).cloned().collect();
+    let op = MutateOp::Unlink {
+        parent: ROOT_INO,
+        name: "f0".into(),
+    };
+
+    let reference = Meta::open_in_memory().unwrap();
+    apply(&reference, 1, 1, &seg1);
+    apply(&reference, 2, 1, &seg2);
+    let names = |m: &Meta| {
+        (
+            m.lookup(ROOT_INO, "f0").unwrap().map(|e| e.ino),
+            m.lookup(ROOT_INO, "f1").unwrap().map(|e| (e.ino, e.nlink)),
+        )
+    };
+    assert_eq!(names(&reference), (None, Some((x, 1))));
+
+    let meta = Meta::open_in_memory().unwrap();
+    apply(&meta, 1, 1, &seg1);
+    assert!(meta.install_shadow(mine, 1, &op, &ours).unwrap());
+    assert_eq!(names(&meta), (None, None), "read-your-writes");
+    meta.install_streamed(1, HOLDER, 2, 3, &theirs).unwrap();
+    assert_eq!(
+        names(&meta),
+        (None, Some((x, 1))),
+        "the streamed link was lost under the shadowed unlink"
+    );
+    meta.install_streamed(1, HOLDER, 4, 5, &ours).unwrap();
+    assert_eq!(names(&meta), (None, Some((x, 1))));
+    meta.apply_segment_rows(2, 1, 5, &[2, 3, 4, 5], &[], &seg2, &TouchSet::default())
+        .unwrap();
+    assert!(!meta.has_outstanding_speculation());
+    assert_eq!(raw_ns(&meta), raw_ns(&reference));
+}
+
+/// Plan 45 follow-up (the authority sim's `shared-dir-split+links` seed
+/// 498): the root forwards an exchange to the delegate that owns the
+/// names, installs the reply as a shadow, and later appends the
+/// delegate's transaction for that same op from the stream. Every other
+/// record re-applied over its own effect changes nothing, but an exchange
+/// is its own inverse: the root swapped the names back and published
+/// that. The record names the inodes it swapped, and a replica that finds
+/// them swapped already has it.
+#[test]
+fn a_root_appending_a_delegates_exchange_over_its_shadow_swaps_once() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    let gen = 5;
+    let (a, b) = (ino(1), ino(2));
+    apply(&meta, 1, 1, &[create("a", a, 10), create("b", b, 11)]);
+    let op = MutateOp::Exchange {
+        parent: ROOT_INO,
+        name: "a".into(),
+        new_parent: ROOT_INO,
+        new_name: "b".into(),
+    };
+    let exchange = LogRecord::Exchange {
+        parent: ROOT_INO,
+        name: "a".into(),
+        new_parent: ROOT_INO,
+        new_name: "b".into(),
+        time_ns: 12,
+        ino: a,
+        new_ino: b,
+    };
+    let names = |m: &Meta| {
+        (
+            m.lookup(ROOT_INO, "a").unwrap().map(|e| e.ino),
+            m.lookup(ROOT_INO, "b").unwrap().map(|e| e.ino),
+        )
+    };
+    assert!(meta
+        .install_shadow_from(
+            rid(1),
+            1,
+            gen,
+            &op,
+            &Default::default(),
+            &[exchange.clone(), completed(rid(1))]
+        )
+        .unwrap());
+    assert_eq!(names(&meta), (Some(b), Some(a)), "read-your-writes");
+    assert!(meta
+        .apply_delegate_tx(
+            std::slice::from_ref(&exchange),
+            Some(rid(1)),
+            gen,
+            1,
+            constellation_meta::Position::ZERO
+        )
+        .unwrap());
+    assert_eq!(
+        names(&meta),
+        (Some(b), Some(a)),
+        "the appended exchange swapped the names back"
+    );
+}

@@ -572,7 +572,63 @@ fn tx_keys_and_row(r: &impl Readable, meta: &Meta, tx: &Tx) -> Result<KeysAndRow
         Some(seq) => spec::row_keys_and_origin(r, meta, seq)?.map(|(keys, _)| keys),
         None => None,
     };
-    Ok((keys, local::get_journal_tx(r, meta, tx.first)?))
+    let row = local::get_journal_tx(r, meta, tx.first)?;
+    Ok((tx_keys(tx, keys, row.as_ref()), row))
+}
+
+/// A captured transaction's keys for the ship rule: what it wrote, plus
+/// what its rows name, plus — for a completion alone — what it observed.
+///
+/// Plan 45 follow-up, the rows: a record that applied as a no-op writes
+/// nothing (a replayed `unlink f1` of a stranded op, after `rename f1 f0`
+/// had taken the name), yet the log replays it by name wherever it ships.
+/// Shipped ahead of the deferred rename (the authority sim's
+/// `metered-shared+links` seed 449), every replica unlinked `f1` and
+/// skipped the rename, while the holder kept the renamed file.
+///
+/// The observed keys: an op that executed and changed nothing (a rename
+/// onto another name of the same inode: `writes::complete_noop_tx`) is a
+/// `Completed` row and the keys it observed. Its `Ok` is a success the log
+/// orders like any other, so it is ordered as a write of what it observed:
+/// deferred behind what wrote them, and every later transaction of those
+/// keys behind it. (A refusal's observed keys taint nothing: it is no
+/// success.)
+fn tx_keys(
+    tx: &Tx,
+    keys: Option<Vec<Vec<u8>>>,
+    row: Option<&local::JournalTx>,
+) -> Option<Vec<Vec<u8>>> {
+    let mut out = keys?;
+    let named = crate::replay::TouchSet::from_records(tx.rows.iter().map(|(_, rec)| rec));
+    out.extend(
+        named
+            .dentries
+            .iter()
+            .map(|(parent, name)| constellation_mtree::keys::dentry(*parent, name.as_bytes())),
+    );
+    out.extend(
+        named
+            .inos
+            .iter()
+            .chain(&named.shared)
+            .map(|ino| constellation_mtree::keys::inode(*ino)),
+    );
+    let completion_only = tx
+        .rows
+        .iter()
+        .any(|(_, rec)| matches!(rec, LogRecord::Completed { .. }))
+        && tx.rows.iter().all(|(_, rec)| {
+            matches!(
+                rec,
+                LogRecord::Completed { .. } | LogRecord::InboxAck { .. }
+            )
+        });
+    if let (true, Some(row)) = (completion_only, row) {
+        out.extend(row.observed.iter().cloned());
+    }
+    out.sort();
+    out.dedup();
+    Some(out)
 }
 
 /// The ship rule over the whole unshipped journal ([`Walk::step`]). With
@@ -1553,12 +1609,17 @@ mod tests {
             let mut out: Vec<(u64, Option<Rid>, u64, Option<BTreeSet<Ino>>)> = Vec::new();
             let mut written: Vec<Option<BTreeSet<Vec<u8>>>> = Vec::new();
             for tx in transactions(&r, meta).unwrap() {
-                let keys: Option<BTreeSet<Vec<u8>>> = tx.spec_seq.and_then(|seq| {
-                    spec::row_keys_and_origin(&r, meta, seq)
-                        .unwrap()
-                        .map(|(keys, _)| keys.into_iter().collect())
-                });
                 let row = local::get_journal_tx(&r, meta, tx.first).unwrap();
+                let keys: Option<BTreeSet<Vec<u8>>> = tx_keys(
+                    &tx,
+                    tx.spec_seq.and_then(|seq| {
+                        spec::row_keys_and_origin(&r, meta, seq)
+                            .unwrap()
+                            .map(|(keys, _)| keys)
+                    }),
+                    row.as_ref(),
+                )
+                .map(|keys| keys.into_iter().collect());
                 let mut touched = keys.clone();
                 if let (Some(t), Some(row)) = (touched.as_mut(), row.as_ref()) {
                     t.extend(row.observed.iter().cloned());

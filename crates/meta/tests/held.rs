@@ -704,3 +704,113 @@ fn an_op_depending_on_a_deferred_close_waits_for_the_forwarders_chunks() {
     assert!(blockers(2, &chmod, 7).inos.is_empty());
     assert!(blockers(3, &[], 7).inos.is_empty());
 }
+
+/// Plan 45 follow-up (the authority sim's `flex+links` seed 4): a rename
+/// of a name onto another name of the same inode is a no-op that
+/// completes its rid on a row of its own. That row observed the link that
+/// made the two names one inode; deferred with it, it ships after it — not
+/// ahead, where the log put an `Ok` before the state it was evaluated on —
+/// and a later op of the directory ships after it (seeds 191 and 335: the
+/// log put a create invoked after the rename returned ahead of it).
+#[test]
+fn a_same_inode_rename_completes_behind_the_deferred_link_it_observed() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    let away = ChunkHash::of(b"pending on another node");
+    let file = meta.create(ROOT_INO, "file", 0o644, 0, 0).unwrap().ino;
+    meta.enroll_remote_chunks(file, &[away], 7).unwrap();
+    meta.set_manifest_with_base(file, None, &manifest_naming(away, 19), 19, None, None)
+        .unwrap();
+    // Deferred too: it writes the deferred file's inode.
+    meta.link(file, ROOT_INO, "alias").unwrap();
+    let rid = constellation_meta::Rid {
+        node: 3,
+        incarnation: 1,
+        seq: 1,
+    };
+    let rename = MutateOp::Rename {
+        parent: ROOT_INO,
+        name: "file".into(),
+        new_parent: ROOT_INO,
+        new_name: "alias".into(),
+        noreplace: false,
+    };
+    let rows = constellation_meta::execute_mutate(&meta, &rename, Some(rid)).unwrap();
+    assert!(
+        matches!(rows.as_slice(), [LogRecord::Completed { rid: r }] if *r == rid),
+        "{rows:?}"
+    );
+    // Its `Ok` returned: a create in the directory invoked after it
+    // follows it in the log.
+    meta.create(ROOT_INO, "later", 0o644, 0, 0).unwrap();
+    let completes = |r: &LogRecord| matches!(r, LogRecord::Completed { rid: c } if *c == rid);
+    let later = |r: &LogRecord| matches!(r, LogRecord::Create { name, .. } if name == "later");
+    let recs = records(&batch(&meta));
+    assert!(
+        !recs.iter().any(completes),
+        "the completion shipped ahead of the link it observed: {recs:?}"
+    );
+    assert!(
+        !recs.iter().any(later),
+        "a create invoked after the rename returned shipped ahead of it: {recs:?}"
+    );
+    meta.ack_remote_chunks(&[away]).unwrap();
+    let recs = records(&batch(&meta));
+    let link = recs
+        .iter()
+        .position(|r| matches!(r, LogRecord::Link { name, .. } if name == "alias"));
+    let done = recs.iter().position(completes);
+    let created = recs.iter().position(later);
+    assert!(
+        link.is_some() && done.is_some() && created.is_some() && link < done && done < created,
+        "the link, the completion, then the create: {recs:?}"
+    );
+}
+
+/// Plan 45 follow-up (the authority sim's `metered-shared+links` seed
+/// 449): a record that applied as a no-op writes nothing — here a
+/// stranded op's `unlink f1` replayed after `rename f1 f0` took the name —
+/// but the log replays it by name wherever it ships. Shipped ahead of the
+/// deferred rename, every replica unlinked `f1` and then skipped the
+/// rename, while the holder had renamed the file. The rows a transaction
+/// names count as its keys.
+#[test]
+fn a_no_op_record_ships_behind_the_deferred_transaction_of_its_name() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    let away = ChunkHash::of(b"pending on another node");
+    let file = meta.create(ROOT_INO, "f1", 0o644, 0, 0).unwrap().ino;
+    meta.enroll_remote_chunks(file, &[away], 7).unwrap();
+    meta.set_manifest_with_base(file, None, &manifest_naming(away, 19), 19, None, None)
+        .unwrap();
+    meta.rename(ROOT_INO, "f1", ROOT_INO, "f0").unwrap();
+    let unlink = LogRecord::Unlink {
+        parent: ROOT_INO,
+        name: "f1".into(),
+        time_ns: 1,
+    };
+    meta.apply_records_journaled(std::slice::from_ref(&unlink))
+        .unwrap();
+    assert_eq!(
+        meta.lookup(ROOT_INO, "f0").unwrap().map(|e| e.ino),
+        Some(file)
+    );
+    let renamed = |r: &LogRecord| matches!(r, LogRecord::Rename { .. });
+    let unlinked = |r: &LogRecord| matches!(r, LogRecord::Unlink { name, .. } if name == "f1");
+    let recs = records(&batch(&meta));
+    assert!(
+        !recs.iter().any(renamed),
+        "the rename is deferred: {recs:?}"
+    );
+    assert!(
+        !recs.iter().any(unlinked),
+        "the no-op unlink of the name shipped ahead of the rename: {recs:?}"
+    );
+    meta.ack_remote_chunks(&[away]).unwrap();
+    let recs = records(&batch(&meta));
+    let (r, u) = (
+        recs.iter().position(renamed),
+        recs.iter().position(unlinked),
+    );
+    assert!(r.is_some() && u.is_some() && r < u, "{recs:?}");
+}

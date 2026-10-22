@@ -1176,6 +1176,15 @@ impl Meta {
             )?;
             crate::store::adjust_usage_tx(&mut tx, &self.local, db, df)?;
         }
+        let _observed = match result {
+            Some(_) => None,
+            None => complete_noop_tx(
+                &mut tx,
+                self,
+                [(parent, name), (new_parent, new_name)],
+                replaced,
+            )?,
+        };
         self.finish_local(&mut tx, local)?;
         tx.commit()?;
         if let Some((moved, _, db, df)) = result {
@@ -1315,10 +1324,11 @@ impl Meta {
         let local = self.begin_local(&tx)?;
         let dirty = local.dirty(self);
         let t = now_ns();
+        let one = ns::get_dentry_record(&tx, &self.ns, parent, name)?.map(|d| d.ino);
         let swapped = exchange_in_tx(
             &mut tx, &self.ns, dirty, parent, name, new_parent, new_name, t, true,
         )?;
-        if let Exchanged::Swapped(..) = swapped {
+        if let Exchanged::Swapped(ino, new_ino) = swapped {
             journal::append_tx(
                 &mut tx,
                 &self.journal_ks,
@@ -1330,9 +1340,17 @@ impl Meta {
                     new_parent,
                     new_name: new_name.to_string(),
                     time_ns: t,
+                    ino,
+                    new_ino,
                 },
             )?;
         }
+        let _observed = match swapped {
+            Exchanged::Same => {
+                complete_noop_tx(&mut tx, self, [(parent, name), (new_parent, new_name)], one)?
+            }
+            _ => None,
+        };
         self.finish_local(&mut tx, local)?;
         tx.commit()?;
         if let Exchanged::Swapped(a, b) = swapped {
@@ -1341,6 +1359,42 @@ impl Meta {
         }
         Ok(())
     }
+}
+
+/// A rename or an exchange that changes nothing (one name onto another
+/// name of the same inode, or onto itself: POSIX's no-op) journals no
+/// record, so the rid `mutate::execute` armed for it completes on its
+/// own: without a `Completed { rid }` row its `Ok` had no log position —
+/// no durable dedup, and no wait for the state it read (the link that made
+/// the two names one inode) to become durable. The names, their
+/// directories and the inode are what it observed
+/// (`journal::PendingObserved`, as a refusal's); unlike a refusal's, they
+/// order it like a write of them in the ship plan (`store::held`'s
+/// `tx_keys_and_row`): behind a deferred row that wrote them, and ahead of
+/// a later one of the directory (`flex+links` seeds 4, 191 and 335: the
+/// completion shipped ahead of the rename it had seen, and behind a create
+/// invoked after it returned). The guard must outlive `finish_local`.
+/// Nothing outside `execute`.
+fn complete_noop_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    names: [(Ino, &str); 2],
+    ino: Option<Ino>,
+) -> Result<Option<journal::PendingObservedGuard>, MetaError> {
+    let Some(rid) = journal::PendingCompletion::take() else {
+        return Ok(None);
+    };
+    let mut observed: Vec<Vec<u8>> = Vec::new();
+    for (parent, name) in names {
+        observed.push(keys::dentry(parent, name.as_bytes()));
+        observed.push(keys::inode(parent));
+    }
+    observed.extend(ino.map(keys::inode));
+    observed.sort();
+    observed.dedup();
+    let guard = journal::PendingObserved::set(observed);
+    journal::append_completion_tx(tx, &meta.journal_ks, &meta.local, &meta.completed, rid)?;
+    Ok(Some(guard))
 }
 
 // ----------------------------------------------------------- MetaStore

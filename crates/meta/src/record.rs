@@ -266,12 +266,23 @@ pub enum LogRecord {
     /// entries), moves a directory's `..` link between the parents when
     /// the kinds differ across directories, touches both parents' mtime
     /// and ctime and both inodes' ctime, all with `max` merges.
+    ///
+    /// `ino` and `new_ino` are what `name` and `new_name` named before the
+    /// swap (plan 45 follow-up): an exchange is its own inverse, so unlike
+    /// every other record it is not idempotent by name, and a replica
+    /// that finds the two names already swapped (`name` → `new_ino`,
+    /// `new_name` → `ino`) has it applied and skips it. The authority
+    /// sim's `shared-dir-split+links` seed 498: the root appended a
+    /// delegate's exchange on top of its own shadow of the same op and
+    /// swapped the names back, then published that.
     Exchange {
         parent: Ino,
         name: String,
         new_parent: Ino,
         new_name: String,
         time_ns: i64,
+        ino: Ino,
+        new_ino: Ino,
     },
     /// Plan 32 §0.4: `SnapCreate` plus the row's optional trailing fields
     /// (origin, owning policy, creator, REFER at creation). Writers emit

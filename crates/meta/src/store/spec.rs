@@ -1537,16 +1537,91 @@ fn row_is_ordered(row: &SpecRow) -> bool {
 }
 
 /// The keys a row's application touched (a `Local` row's records are its
-/// journal rows).
+/// journal rows), and every non-directory inode it changed
+/// ([`captured_files`]).
 fn row_touches(r: &impl Readable, meta: &Meta, row: &SpecRow) -> Result<TouchSet, MetaError> {
-    if let SpecKind::Local { first, .. } = &row.kind {
+    let mut set = if let SpecKind::Local { first, .. } = &row.kind {
         let Some(head) = local::get_journal_tx_head(r, meta, *first)? else {
             return Ok(TouchSet::default());
         };
         let records = local::journal_records(r, meta, *first, head.last)?;
-        return Ok(TouchSet::from_records(records.iter().map(|(_, rec)| rec)));
+        TouchSet::from_records(records.iter().map(|(_, rec)| rec))
+    } else {
+        TouchSet::from_records(row.records.iter())
+    };
+    captured_files(row, &mut set);
+    Ok(set)
+}
+
+/// Plan 45 follow-up: a record that removes or replaces a name (`Unlink`,
+/// `Rmdir`, `Rename`, `Exchange`) names the name, not the inode, so its
+/// [`TouchSet`] misses the inode it changed — harmless while every file
+/// had one name, wrong for a hard-linked one: a `Link` of the inode under
+/// another name and an `Unlink` of one of its names do not commute (the
+/// link keeps the inode alive). The authority sim's `backup-hot+links`
+/// seed 18: a shadow of `unlink f0` (its inode's only name *here*: the
+/// holder's earlier `link f0 f1` was still in flight) removed the inode;
+/// the streamed link, judged disjoint, went on top and was skipped
+/// ("link endpoint missing"), and the replica lost the file for good.
+/// A row's captured before-images name every inode it changed: each
+/// non-directory one is held exclusively (directories keep their shared
+/// hold, plan 30 §M12).
+fn captured_files(row: &SpecRow, set: &mut TouchSet) {
+    for (key, before) in &row.before {
+        let (Ok(keys::Key::Inode { ino }), Some(value)) = (keys::Key::parse(key), before) else {
+            continue;
+        };
+        if InodeRecord::decode(value)
+            .is_ok_and(|rec| rec.attrs.kind != constellation_mtree::record::Kind::Dir)
+        {
+            set.inos.insert(ino);
+        }
     }
-    Ok(TouchSet::from_records(row.records.iter()))
+}
+
+/// [`TouchSet::from_records`] of records arriving from the log, plus the
+/// non-directory inodes the names they remove or replace resolve to here
+/// (see [`captured_files`]: the other side of the same gap).
+fn incoming_touches(
+    r: &impl Readable,
+    meta: &Meta,
+    records: &[LogRecord],
+) -> Result<TouchSet, MetaError> {
+    let mut set = TouchSet::from_records(records.iter());
+    let target = |parent: u64, name: &str, set: &mut TouchSet| -> Result<(), MetaError> {
+        if let Some(d) = ns::get_dentry_record(r, &meta.ns, parent, name)? {
+            if d.kind != constellation_mtree::record::Kind::Dir {
+                set.inos.insert(d.ino);
+            }
+        }
+        Ok(())
+    };
+    for rec in records {
+        match rec {
+            LogRecord::Unlink { parent, name, .. } | LogRecord::Rmdir { parent, name, .. } => {
+                target(*parent, name, &mut set)?
+            }
+            LogRecord::Rename {
+                parent,
+                name,
+                new_parent,
+                new_name,
+                ..
+            }
+            | LogRecord::Exchange {
+                parent,
+                name,
+                new_parent,
+                new_name,
+                ..
+            } => {
+                target(*parent, name, &mut set)?;
+                target(*new_parent, new_name, &mut set)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(set)
 }
 
 /// Plan 30 §M9: where [`Meta::install_streamed`] must rewind from to put
@@ -1584,7 +1659,7 @@ fn streamed_out_of_place(
             Some((_, row)) => TouchSet::from_records(row.records.iter()),
             None => return Ok(None),
         },
-        None => TouchSet::from_records(records.iter()),
+        None => incoming_touches(r, meta, records)?,
     };
     for (seq, row) in &rows {
         let misplaced = match adopt {
@@ -3058,6 +3133,7 @@ impl Meta {
         // lost the object. A shadow the segment completes and a streamed
         // row it confirms are its own records; the rest are later ops.
         let first_overlap = {
+            let incoming = incoming_touches(&tx, self, records)?;
             let mut first: Option<u64> = None;
             for (spec_seq, entry) in &live {
                 let candidate = match entry {
@@ -3071,8 +3147,7 @@ impl Meta {
                     _ => match tx.get(&self.spec, seq_key(*spec_seq))? {
                         Some(v) => {
                             let row: SpecRow = postcard::from_bytes(&v)?;
-                            let touched = row_touches(&tx, self, &row)?;
-                            records.iter().any(|rec| touched.conflicts(rec))
+                            row_touches(&tx, self, &row)?.overlaps(&incoming)
                         }
                         None => false,
                     },

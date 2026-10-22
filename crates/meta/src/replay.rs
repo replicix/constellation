@@ -554,7 +554,19 @@ fn apply_one(
             new_parent,
             new_name,
             time_ns,
+            ino,
+            new_ino,
         } => {
+            // Swapped already (see the record's doc): applied.
+            let at = |p: Ino, n: &str| -> Result<Option<Ino>, MetaError> {
+                Ok(ns::get_dentry_record(tx, &meta.ns, p, n)?.map(|d| d.ino))
+            };
+            if ino != new_ino
+                && at(*parent, name)? == Some(*new_ino)
+                && at(*new_parent, new_name)? == Some(*ino)
+            {
+                return Ok(Applied::Done);
+            }
             match crate::store::writes::exchange_in_tx(
                 tx,
                 &meta.ns,
