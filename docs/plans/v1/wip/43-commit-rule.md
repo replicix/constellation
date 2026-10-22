@@ -2880,7 +2880,10 @@ first part of C7a, landed early):
       naming the restarted root until some mutation took it. A renewal now
       re-adopts it too and is left unanswered meanwhile (also while the
       restarted node has read no lease yet); the delegate re-sends it and the
-      root, which inherits the generation, grants it (PROGRESS). The mix
+      root, which inherits the generation, grants it (PROGRESS). A peer's
+      lock request for an undelegated inode re-adopts it the same way and
+      waits (`NotOwner { 0 }` sent it to a lease naming the restarted root
+      until the lease expired). The mix
       draws reboots everywhere again. Also fixed with it: a delegate's own
       op parked before it executed lost its client deadline (the wedge
       above was never answered in doubt at 12 s).

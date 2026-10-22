@@ -57503,9 +57503,14 @@ another node's, or released, or this node is deposed) the refusal stands as befo
 History: the refusal's meaning ("stopped") dates from M11 phase 2a (`578ff9c`); the
 re-adoption from `62268ff` (2026-09-28), forwards only. An open item of an earlier chunk
 ("in-doubt acquisition CAS, lock-only traffic": nothing re-adopts for lock traffic) is the
-same gap for an undelegated lock; the CAS re-read fixed its cause, and a lock request to a
-restarted root is still answered `NotOwner { 0 }` until its lease expires (not fixed here:
-bounded by the lease ttl, 6 s in the sim, 60 s in production).
+same gap for an undelegated lock; the CAS re-read fixed its cause, and a peer's lock request
+to a restarted root was still answered `NotOwner { 0 }`: the requester read the lease, which
+names the root, and asked it again until the lease expired (6 s in the sim, 60 s in
+production). `lock_serve`'s `Route::Unknown` arm now re-adopts the same way and answers
+`Waiting` (not a verdict: nothing is judged from a grant table that is not the owner's yet;
+the requester retries without spending an attempt, a non-blocking one within
+`s3_less_deadline_ms`). A lock *renewal* there is still answered `NotOwner { 0 }` (the grant
+is outwaited, as before).
 
 **Also fixed (the delegate-restart wedge's second observation).** An own op parked at its
 delegate before it executed (`delegate_try_execute`: grant not honoured, deps missing, a
@@ -57527,7 +57532,8 @@ state is what would prove it.
 
 **Tests (fail before).** Core `a_delegation_renewal_to_a_restarted_root_readopts_its_own_lease`,
 `a_delegation_renewal_waits_for_the_lease_read_and_a_non_root_refuses_it`,
-`a_delegate_parked_own_op_goes_in_doubt_at_its_deadline`; sim
+`a_delegate_parked_own_op_goes_in_doubt_at_its_deadline`,
+`a_lock_request_to_a_restarted_root_readopts_its_own_lease`; sim
 `regression_a_root_restarted_in_a_locking_delegated_cluster_answers_the_waiters`
 (unclocked `locks-delegated+crash1@4507:620` seeds 18, 23, 42). The mix's test asserts the
 same draws with and without delegated directories and locks.
@@ -57554,3 +57560,20 @@ Gates: `cargo fmt --check`; `clippy -p constellation-authority --all-targets -D 
 authority lib (568), `meta_repro` (4), sim suite (234 passed, 12 ignored). Not run: other
 crates (no code outside authority changed), the harness, the model suite, perf (pending,
 box).
+
+**Rebased onto `0dc4db6` (the lock-wait follow-ups), with the lock request's re-adoption.**
+Before = `0dc4db6` with the mix's opt-out removed; failing sets, release, 6 threads:
+`locks-delegated` 1 000 [222, 469, 784] -> [], `locks-delegated-writes` [207] -> [],
+`locks-delegated+crash1@4507:620` (clocked) 500 [143, 147, 222, 309, 330, 366, 377, 390]
+-> []; the other `locks-delegated*`, the 17 `delegated-*` (1 000), the 14 `fast-takeover*`,
+`locks-claimant-ahead`, `strict-claimant-ahead` and 11 root-restart and plain `locks*`
+configurations (500) identical. `locks-delegated-partition-skew` (`clock_skew_ms` 5 000)
+1 000: [97, 178, 452, 551, 558, 846, 924] -> the same plus 139, 483, 709, all the same
+signature, rows 9/30 (a stale read under a lock: node 3, cut off as `d2`'s delegate,
+writes under its lock; the lock's owner outwaits its grant under the skew and the next
+holder reads without the write). In each new seed the root restarted, and a renewal's
+re-adoption kept the subtree live where it had stalled before. Seed 1434 of
+`-production-ttl-heavy` under the mix: before, the late renewal is admitted; after,
+refused at node 2 ("continuity is not proven"), 2 I/Os fenced, no violation. Gates:
+`clippy --workspace --all-targets -D warnings`, authority lib (590), `meta_repro` (4),
+sim suite (245 passed, 12 ignored).

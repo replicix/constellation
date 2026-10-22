@@ -28919,6 +28919,90 @@ fn a_delegation_renewal_waits_for_the_lease_read_and_a_non_root_refuses_it() {
     }
 }
 
+/// A lock request for an undelegated inode from `from`.
+fn lock_request_from(from: NodeId, req: u64, honour: HonourMs) -> Event {
+    Event::Peer {
+        from,
+        msg: PeerMsg::LockRequest {
+            req: OpId(req),
+            ino: 42,
+            mode: constellation_meta::locks::LockMode::Exclusive,
+            blocking: true,
+            sent: honour,
+            incarnation: 1,
+            waited_ms: 0,
+        },
+    }
+}
+
+/// The lock requests `out` answers, by their outcome.
+fn lock_reply_outcomes(out: &[Action]) -> Vec<crate::event::LockOutcome> {
+    sends(out)
+        .into_iter()
+        .filter_map(|(_, m)| match m {
+            PeerMsg::LockReply { outcome, .. } => Some(outcome.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A peer's lock request for an undelegated inode reaching a restarted
+/// root that the lease object still names: the root re-adopts its own
+/// lease, as for a forward, and the requester waits. Answered
+/// `NotOwner { 0 }`, the requester read the lease, which names this node,
+/// and asked it again until the lease expired (60 s in production).
+#[test]
+fn a_lock_request_to_a_restarted_root_readopts_its_own_lease() {
+    use crate::event::LockOutcome;
+    let mut h = Harness::new(1);
+    h.core
+        .lease
+        .note_object(&lease_of(1, 3, h.now.plus(30_000).0));
+    let out = h.step(lock_request_from(2, 77, h.honour()));
+    assert!(
+        matches!(
+            lock_reply_outcomes(&out).as_slice(),
+            [LockOutcome::Waiting { grace: false, .. }]
+        ),
+        "{out:?}"
+    );
+    assert_eq!(h.core.job(), Some(JobKind::Acquire));
+    assert_eq!(h.core.stats.readopt_for_forward, 1);
+    // A re-sent request meanwhile waits again, no second acquisition.
+    let out = h.step(lock_request_from(2, 78, h.honour()));
+    assert!(
+        matches!(
+            lock_reply_outcomes(&out).as_slice(),
+            [LockOutcome::Waiting { grace: false, .. }]
+        ),
+        "{out:?}"
+    );
+    assert!(s3_ops(&out)
+        .iter()
+        .all(|(_, r)| !matches!(r, S3Op::LeaseGet)));
+    // A lease that names another node, or that this node released: not
+    // this node's to re-adopt; `NotOwner` as before.
+    for theirs in [
+        lease_of(3, 4, h.now.plus(30_000).0),
+        Lease {
+            released: true,
+            ..lease_of(1, 3, h.now.plus(30_000).0)
+        },
+    ] {
+        let mut h = Harness::new(1);
+        h.core.lease.note_object(&theirs);
+        let out = h.step(lock_request_from(2, 79, h.honour()));
+        assert!(
+            matches!(
+                lock_reply_outcomes(&out).as_slice(),
+                [LockOutcome::NotOwner { .. }]
+            ),
+            "{theirs:?}: {out:?}"
+        );
+        assert_ne!(h.core.job(), Some(JobKind::Acquire), "{theirs:?}");
+    }
+}
+
 /// Plan 31 C1: a holder's refusal is a portable [`Code`] on the wire and in
 /// the journal. Two in-process nodes (real cores over real `Meta`s, like
 /// [`pair`]), with every reply between them carried by the daemon's real

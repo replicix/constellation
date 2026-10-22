@@ -1633,6 +1633,23 @@ impl Core {
                         }),
                 );
             }
+            Route::Unknown
+                if from != self.cfg.node_id
+                    && (self.readopting()
+                        || self.readopt_own_lease_for_forward(now, replica, out)) =>
+            {
+                // A restarted root the lease object still names re-adopts
+                // it, as for a forward (EC2 campaign 8 A-1), and the
+                // requester waits: `NotOwner { 0 }` sent it to the lease,
+                // which names this node, until the lease expired (60 s).
+                // Nothing is judged from a table that is not yet the
+                // owner's.
+                self.stats.readopt_for_forward += 1;
+                return Served::Outcome(LockOutcome::Waiting {
+                    retry_ms: self.lock_resume_retry_ms(),
+                    grace: false,
+                });
+            }
             Route::Unknown => return Served::Outcome(LockOutcome::NotOwner { owner: 0 }),
         };
         // Plan 30 §M9: a tenure that may be taken over before its lease
