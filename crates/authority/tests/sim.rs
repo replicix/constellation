@@ -9367,7 +9367,8 @@ fn a_second_seal_after_the_grace_arms_no_second_floor() {
 /// that grant past the old grant's window: 7 of the 10 000 seeds
 /// 193000..203000 still fail; with plan 43 C1-1's listed-acknowledgement
 /// count and C7b's observation rule 3 of 193000..203000 do: 193262, 195339
-/// and 199076, pinned.) The
+/// and 199076; with the lock-wait follow-ups' shared lease reads (N3),
+/// 193262, 195339 and 202431, pinned.) The
 /// real cap is not clean over every range: it violates at the *second*
 /// failover (about 15 s, a clock beyond the envelope), a different and
 /// older failure (fixed by plan 43 C7b's observation rule:
@@ -9377,7 +9378,7 @@ fn a_second_seal_after_the_grace_arms_no_second_floor() {
 #[test]
 fn a_credited_arrival_cap_splits() {
     use pinned::run_seed;
-    for seed in [193_262, 195_339, 199_076] {
+    for seed in [193_262, 195_339, 202_431] {
         let e = run_seed(seed, fast_takeover_skewed_successor_credited_config())
             .expect_err("a cap counted from the credit never failed: no control");
         assert!(e.contains("mutual exclusion violated"), "seed {seed}: {e}");

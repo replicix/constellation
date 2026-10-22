@@ -993,6 +993,13 @@ pub struct Stats {
     /// reached (its link dead, the lease read again still naming it): a
     /// failover in progress (they failed `ENOLCK` before).
     pub lock_unreachable_waits: u64,
+    /// Plan 43 C7-F F-b N3: lease reads made for lock requests that need
+    /// to know who holds the root, and the requests that shared one in
+    /// flight or took the result of one answered a moment before (one
+    /// read per request before).
+    pub lock_holder_reads: u64,
+    pub lock_holder_read_shared: u64,
+    pub lock_holder_read_cached: u64,
     /// Answers that grant and extend nothing and went ahead of a held
     /// answer to the same peer (they used to queue behind it), and answers
     /// that waited for the order of the answers to their peer alone.
@@ -2515,7 +2522,7 @@ impl Core {
             Timer::DelegExpiry(gen) => self.on_deleg_expiry(now, gen, replica, out),
             Timer::DelegRenew(gen) => self.on_deleg_renew_timer(now, gen, out),
             Timer::DelegLapse(gen) => self.on_deleg_lapse(now, gen, replica, out),
-            Timer::LockRequestTimeout(req) => self.on_lock_request_timeout(now, req, out),
+            Timer::LockRequestTimeout(req) => self.on_lock_request_timeout(now, req, replica, out),
             Timer::LockRetry(op) => self.on_lock_retry(now, op, replica, out),
             Timer::LockHeldReply(w) => self.on_lock_held_reply_timer(w, out),
             Timer::LockGrantExpiry(id) => self.on_lock_grant_expiry(now, id, replica, out),

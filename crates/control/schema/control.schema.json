@@ -4489,6 +4489,22 @@
           },
           "type": "array"
         },
+        "holder_reads": {
+          "description": "Lease reads made for lock requests that need to know who holds the\nroot (a stale or unreachable owner, an unknown one), and the\nrequests that shared one in flight or the result of one answered a\nmoment before: with hundreds of requests waiting for a dead owner,\nthe first stays near one a quarter second.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "holder_reads_cached": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "holder_reads_shared": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "horizon_held": {
           "description": "Owner side: grant and renewal answers that waited for the restart\nhorizon's durable write (run off the authority core), and those\nwrites.",
           "format": "uint64",
@@ -4833,6 +4849,9 @@
         "not_yet_answers",
         "stale_owner_answers",
         "unreachable_owner_waits",
+        "holder_reads",
+        "holder_reads_shared",
+        "holder_reads_cached",
         "answers_order_bypassed",
         "answers_order_held",
         "grace_end_serves",

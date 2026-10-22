@@ -57306,3 +57306,22 @@ blocking receive.
   first attempt in flight against a core that answers in 5 s (the request
   registers late, once), and a re-issue on the wait pool, each within a
   slice; the adapter's token is the same on a second `begin_wait`.
+
+### N3: lease reads of waiting lock requests are shared
+
+A request whose owner cannot be reached re-reads the lease before it gives
+up, once per request, and the engine asks again as a fresh request every
+50 ms to a second: one S3 `GET` per waiter per second.
+
+- `Core::lock_read_holder` shares the read per node: one in flight serves
+  every request that needs one meanwhile (they join, and all take the
+  result, even when the request it was made for is gone), and a result
+  answered less than 250 ms ago is taken as it stands unless gossip moved
+  the holder since. The lease is one object, so sharing it per node covers
+  sharing it per owner. A shared result is applied through the same code
+  as a read's own (`lock_holder_applied`), bounded recursion.
+- Counters `holder_reads`, `holder_reads_shared`, `holder_reads_cached` in
+  status (`locks`), printed by the s3-cut scenarios.
+- Tests (fail before, sharing disabled): thirty requests make one read, ten
+  more within the quarter second make none, one after it reads again; a
+  shared read serves the requests that waited when the first is gone.

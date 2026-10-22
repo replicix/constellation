@@ -21253,7 +21253,10 @@ mod locks {
             [(3, PeerMsg::LockRequest { ino: 42, .. })]
         ));
         // The lease still names the dead holder (not yet expired): one
-        // read, then unavailable.
+        // read, then unavailable. (A moment later: a read answered less
+        // than a quarter second ago is shared, see
+        // `requests_for_an_unreachable_owner_share_one_lease_read`.)
+        r.advance(1_000);
         r.core.lease.cached_holder = Some(1);
         let out = lock(&mut r, 71, 43);
         let get = lease_read(&out);
@@ -21270,6 +21273,216 @@ mod locks {
         assert_eq!(r.core.stats.lock_unreachable_waits, 1);
         assert_eq!(r.core.stats.lock_unavailable, 0);
         assert!(s3_ops(&out).is_empty(), "{out:?}");
+    }
+
+    /// Plan 43 C7-F F-b N3: the lease reads of the requests waiting for an
+    /// owner whose link is dead are shared. A request whose owner cannot be
+    /// reached re-reads the lease once before it gives up, and the engine
+    /// asks again as a fresh request every 50 ms to a second, so a node
+    /// with hundreds of waiters made hundreds of S3 reads a second, one per
+    /// request. Thirty requests at once make one read (the others join it
+    /// and all take its result); requests within a quarter second of its
+    /// answer take it as it stands, none made; one after it reads again.
+    #[test]
+    fn requests_for_an_unreachable_owner_share_one_lease_read() {
+        let mut r = requester();
+        // Node 1, the cached holder, is gone.
+        r.step(Event::Peers {
+            links: (2..=4)
+                .map(|node| crate::event::PeerLink {
+                    node,
+                    connected: true,
+                    last_seen: None,
+                    rtt_ms: Some(1),
+                    since: None,
+                })
+                .collect(),
+        });
+        let lock = |r: &mut Harness, op: u64, ino: Ino| {
+            r.step(Event::Control {
+                op: OpId(op),
+                req: Control::Lock {
+                    ino,
+                    mode: X,
+                    blocking: false,
+                    waited_ms: 0,
+                },
+            })
+        };
+        let wait = LockAnswer::Wait {
+            retry_ms: r.core.lock_resume_retry_ms(),
+        };
+        // Thirty requests: one read.
+        let mut reads = Vec::new();
+        for i in 0..30u64 {
+            let out = lock(&mut r, 100 + i, 42 + i);
+            reads.extend(
+                s3_ops(&out)
+                    .into_iter()
+                    .filter(|(_, req)| matches!(req, S3Op::LeaseGet))
+                    .map(|(op, _)| op),
+            );
+        }
+        assert_eq!(reads.len(), 1, "one read for thirty requests: {reads:?}");
+        assert_eq!(r.core.stats.lock_holder_reads, 1);
+        assert_eq!(r.core.stats.lock_holder_read_shared, 29);
+        // The lease still names the dead holder: every request is told to
+        // wait, by the one read.
+        let expires = r.now.0 + 10_000;
+        let out = r.step(Event::S3 {
+            op: reads[0],
+            result: S3Result::LeaseGet(Ok(Some((lease_of(1, 1, expires), tag())))),
+        });
+        for i in 0..30u64 {
+            assert_eq!(lock_answer(&out, 100 + i), wait, "request {i}");
+        }
+        assert!(s3_ops(&out).is_empty(), "{out:?}");
+        assert_eq!(r.core.stats.lock_unreachable_waits, 30);
+        // The same again within the quarter second: none made.
+        r.advance(100);
+        for i in 0..10u64 {
+            let out = lock(&mut r, 200 + i, 142 + i);
+            assert!(s3_ops(&out).is_empty(), "request {i}: {out:?}");
+            assert_eq!(lock_answer(&out, 200 + i), wait, "request {i}");
+        }
+        assert_eq!(r.core.stats.lock_holder_reads, 1);
+        assert_eq!(r.core.stats.lock_holder_read_cached, 10);
+        // Past it: read again.
+        r.advance(300);
+        let out = lock(&mut r, 300, 242);
+        assert_eq!(
+            s3_ops(&out)
+                .iter()
+                .filter(|(_, req)| matches!(req, S3Op::LeaseGet))
+                .count(),
+            1,
+            "{out:?}"
+        );
+        assert_eq!(r.core.stats.lock_holder_reads, 2);
+    }
+
+    /// Plan 43 C7b with N3: a lease read the lock requests share, or take
+    /// again within the quarter second, was observed once, when it was
+    /// handled. A request that takes it later is no sighting of the lease
+    /// at its own `now`: the observation's stamps stay, and a newer read's
+    /// key (the holder renewed) is not set back to the reused one's, which
+    /// would restart the claimant's watch on a key the holder left.
+    #[test]
+    fn a_reused_lease_read_is_no_sighting_of_the_lease() {
+        let mut r = requester();
+        r.step(Event::Peers {
+            links: (2..=4)
+                .map(|node| crate::event::PeerLink {
+                    node,
+                    connected: true,
+                    last_seen: None,
+                    rtt_ms: Some(1),
+                    since: None,
+                })
+                .collect(),
+        });
+        let lock = |r: &mut Harness, op: u64, ino: Ino| {
+            r.step(Event::Control {
+                op: OpId(op),
+                req: Control::Lock {
+                    ino,
+                    mode: X,
+                    blocking: false,
+                    waited_ms: 0,
+                },
+            })
+        };
+        let out = lock(&mut r, 100, 42);
+        let reads: Vec<OpId> = s3_ops(&out)
+            .into_iter()
+            .filter(|(_, req)| matches!(req, S3Op::LeaseGet))
+            .map(|(op, _)| op)
+            .collect();
+        assert_eq!(reads.len(), 1, "{out:?}");
+        let expires = r.now.0 + 10_000;
+        r.step(Event::S3 {
+            op: reads[0],
+            result: S3Result::LeaseGet(Ok(Some((lease_of(1, 1, expires), tag())))),
+        });
+        let seen = r.core.lease_obs_stamp().expect("the read is observed");
+        // Taken again a moment later: no read, and no sighting.
+        r.advance(100);
+        let out = lock(&mut r, 101, 43);
+        assert!(s3_ops(&out).is_empty(), "{out:?}");
+        assert_eq!(r.core.stats.lock_holder_read_cached, 1);
+        assert_eq!(r.core.lease_obs_stamp(), Some(seen), "a reuse observed");
+        // A read on another path shows the holder's renewal; the reuse
+        // that follows does not set the watch back to the old key.
+        r.advance(50);
+        let renewed = Lease {
+            holder_wait_ms: expires + 50,
+            ..lease_of(1, 1, expires + 50)
+        };
+        let now = r.clk();
+        r.core.lease.observe(now, Some(&(renewed, tag())));
+        let watched = r.core.lease_obs_stamp().expect("observed");
+        assert_ne!(watched.0, seen.0, "the renewal is another key");
+        let out = lock(&mut r, 102, 44);
+        assert!(s3_ops(&out).is_empty(), "{out:?}");
+        assert_eq!(r.core.stats.lock_holder_read_cached, 2);
+        assert_eq!(
+            r.core.lease_obs_stamp(),
+            Some(watched),
+            "a reuse set the watch back"
+        );
+    }
+
+    /// Plan 43 C7-F F-b N3: a read shared by requests is applied to each of
+    /// them even when the one it was made for is gone: the others still
+    /// wait for it, and a successor it names is asked by all.
+    #[test]
+    fn a_shared_lease_read_serves_the_requests_that_waited_when_the_first_is_gone() {
+        let mut r = requester();
+        r.step(Event::Peers {
+            links: (2..=4)
+                .map(|node| crate::event::PeerLink {
+                    node,
+                    connected: true,
+                    last_seen: None,
+                    rtt_ms: Some(1),
+                    since: None,
+                })
+                .collect(),
+        });
+        let lock = |r: &mut Harness, op: u64, ino: Ino| {
+            r.step(Event::Control {
+                op: OpId(op),
+                req: Control::Lock {
+                    ino,
+                    mode: X,
+                    blocking: false,
+                    waited_ms: 0,
+                },
+            })
+        };
+        let out = lock(&mut r, 400, 50);
+        let read = s3_ops(&out)[0].0;
+        for i in 1..4u64 {
+            let out = lock(&mut r, 400 + i, 50 + i);
+            assert!(s3_ops(&out).is_empty(), "{out:?}");
+        }
+        // The one the read was made for goes away (its engine gave up).
+        r.core.forget_lock_op(OpId(400));
+        // The backup, node 3, holds the lease now: the other three ask it.
+        let expires = r.now.0 + 10_000;
+        let out = r.step(Event::S3 {
+            op: read,
+            result: S3Result::LeaseGet(Ok(Some((lease_of(3, 2, expires), tag())))),
+        });
+        let asked: Vec<_> = sends(&out)
+            .into_iter()
+            .filter_map(|(to, m)| match m {
+                PeerMsg::LockRequest { ino, .. } if to == 3 => Some(*ino),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(asked, vec![51, 52, 53], "{out:?}");
+        assert_eq!(r.core.lease.cached_holder, Some(3));
     }
 
     /// A tenure that may not grant yet (its lease is not marked as

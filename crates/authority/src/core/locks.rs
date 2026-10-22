@@ -257,6 +257,62 @@ struct LateRenew {
 /// How long a late renewal answer is still used ([`LateRenew`]).
 const LATE_RENEW_MS: i64 = 60_000;
 
+/// How long a lease read made for lock requests is shared with the ones
+/// that need the same answer (wait clock). A request told its owner cannot
+/// be reached re-reads the lease before it gives up, once per request;
+/// requests re-issued against a dead link (the engine's waits ask again
+/// every 50 ms to a second) used to read it once each: hundreds of waiters
+/// on a node, hundreds of S3 reads a second. Short: the lease names who
+/// holds the root now, and a successor's takeover is learned from the
+/// next read after it.
+const LOCK_HOLDER_READ_TTL_MS: i64 = 250;
+
+/// What a lease read told the lock requests that waited for it
+/// ([`Core::lock_read_holder`]).
+///
+/// Plan 43 C7b: it keeps no ETag, so it cannot be observed
+/// (`LeaseState::observe` takes the tag): the read was observed once, when
+/// it was handled (`Core::on_s3`), and a request that shares it or takes it
+/// up to [`LOCK_HOLDER_READ_TTL_MS`] later is no sighting of the lease at
+/// its own `now`. Whether the lease may be claimed is the observation's
+/// say (`LeaseState::claimable_observed`), never the body's.
+#[derive(Debug, Clone)]
+enum HolderRead {
+    Lease(constellation_store_s3::Lease),
+    Empty,
+    Failed,
+}
+
+impl HolderRead {
+    fn of(result: &crate::event::S3Result) -> Self {
+        match result {
+            crate::event::S3Result::LeaseGet(Ok(Some((lease, _)))) => {
+                HolderRead::Lease(lease.clone())
+            }
+            crate::event::S3Result::LeaseGet(Ok(None)) => HolderRead::Empty,
+            _ => HolderRead::Failed,
+        }
+    }
+}
+
+/// The lease read in flight for lock requests: its S3 op and the requests
+/// it answers.
+#[derive(Debug)]
+struct HolderFlight {
+    s3: OpId,
+    waiting: Vec<OpId>,
+}
+
+/// The last lease read made for lock requests: when it was answered, what
+/// it said, and the holder this node took the lease to name then (a gossip
+/// that moved it since ends the sharing).
+#[derive(Debug)]
+struct HolderDone {
+    at: WaitMs,
+    read: HolderRead,
+    holder: Option<NodeId>,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct LockState {
     // ---- node side ----
@@ -282,6 +338,14 @@ pub(crate) struct LockState {
     pub(crate) release_unmarked: bool,
     /// A lease read to relearn the owner for renewals is in flight.
     relearning: bool,
+    /// Plan 43 C7-F F-b N3: the lease read shared by the lock requests
+    /// that need to know who holds the root (`Core::lock_read_holder`):
+    /// the one in flight with the requests it will answer, and the last
+    /// one's result for [`LOCK_HOLDER_READ_TTL_MS`].
+    holder_flight: Option<HolderFlight>,
+    holder_done: Option<HolderDone>,
+    /// Applications of a shared result on the stack (bounded recursion).
+    holder_depth: u8,
     /// Node side, per generation this node's table still delegates: the
     /// node its delegate named the owner (`NotOwner { root }`) once a
     /// recall had taken the subtree's grants back to that root
@@ -3655,6 +3719,13 @@ impl Core {
         self.lock_route_op(now, op, replica, out);
     }
 
+    /// Tests: the request is gone (answered elsewhere, or its engine gave
+    /// up): what a read made for it still serves.
+    #[cfg(test)]
+    pub(crate) fn forget_lock_op(&mut self, op: OpId) {
+        self.lk.ops.remove(&op);
+    }
+
     fn lock_route_op(&mut self, now: Now, op: OpId, replica: &dyn Replica, out: &mut Vec<Action>) {
         let Some(o) = self.lk.ops.get(&op) else {
             return;
@@ -3723,8 +3794,8 @@ impl Core {
             }
             Route::Node(n) => {
                 if !self.cfg.p2p || !self.reaches(now, n) {
-                    if !self.lock_reread_holder(op, out) {
-                        self.lock_op_unreachable(now, op, out);
+                    if !self.lock_reread_holder(now, op, replica, out) {
+                        self.lock_op_unreachable(now, op, replica, out);
                     }
                     return;
                 }
@@ -3760,13 +3831,13 @@ impl Core {
                     return;
                 }
                 if !self.cfg.p2p {
-                    self.lock_op_unreachable(now, op, out);
+                    self.lock_op_unreachable(now, op, replica, out);
                     return;
                 }
                 if let Some(o) = self.lk.ops.get_mut(&op) {
                     o.attempts += 1;
                 }
-                self.issue_s3(S3Op::LeaseGet, super::S3For::LockHolder(op), out);
+                self.lock_read_holder(now, op, replica, out);
             }
         }
     }
@@ -3780,12 +3851,18 @@ impl Core {
     /// again as a fresh request (fresh attempts, a fresh lease read,
     /// routed to the successor as soon as the lease names it), up to its
     /// bound. Without P2P there is no path at all: `ENOLCK`, as documented.
-    fn lock_op_unreachable(&mut self, now: Now, op: OpId, out: &mut Vec<Action>) {
+    fn lock_op_unreachable(
+        &mut self,
+        now: Now,
+        op: OpId,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
         let Some(o) = self.lk.ops.get(&op) else {
             return;
         };
         if o.blocking && self.cfg.p2p {
-            self.lock_retry(now, op, out);
+            self.lock_retry(now, op, replica, out);
             return;
         }
         self.lock_give_up(op, out);
@@ -3819,7 +3896,13 @@ impl Core {
     /// answered `ENOLCK` while the backup already served). Re-read the
     /// lease, once per request, as for an unknown holder, before a
     /// non-blocking request gives up. `false`: read already (or no P2P).
-    fn lock_reread_holder(&mut self, op: OpId, out: &mut Vec<Action>) -> bool {
+    fn lock_reread_holder(
+        &mut self,
+        now: Now,
+        op: OpId,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> bool {
         if !self.cfg.p2p {
             return false;
         }
@@ -3833,18 +3916,76 @@ impl Core {
             ino = o.ino,
             "lock holder unreachable: re-reading the lease before giving up"
         );
-        self.issue_s3(S3Op::LeaseGet, super::S3For::LockHolder(op), out);
+        self.lock_read_holder(now, op, replica, out);
         true
     }
 
-    fn lock_retry(&mut self, now: Now, op: OpId, out: &mut Vec<Action>) {
+    /// Plan 43 C7-F F-b N3: read the lease for `op` — who holds the root —
+    /// *shared*: one read in flight for every request that needs it, whose
+    /// result they all take, and a result answered less than
+    /// [`LOCK_HOLDER_READ_TTL_MS`] ago, taken as it stands unless gossip has
+    /// moved the holder since. The read made for each request, one per
+    /// request, is what a node with hundreds of requests waiting for a dead
+    /// owner paid per second.
+    fn lock_read_holder(
+        &mut self,
+        now: Now,
+        op: OpId,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if let Some(f) = self
+            .lk
+            .holder_flight
+            .as_mut()
+            .filter(|f| self.s3.contains_key(&f.s3))
+        {
+            if !f.waiting.contains(&op) {
+                f.waiting.push(op);
+            }
+            self.stats.lock_holder_read_shared += 1;
+            return;
+        }
+        self.lk.holder_flight = None;
+        let fresh = self.lk.holder_done.as_ref().is_some_and(|d| {
+            now.wait.0 - d.at.0 < LOCK_HOLDER_READ_TTL_MS
+                && d.holder == self.lease.cached_holder
+                && d.at.0 <= now.wait.0
+        });
+        if fresh && self.lk.holder_depth < 2 {
+            let read = self.lk.holder_done.as_ref().expect("fresh").read.clone();
+            self.stats.lock_holder_read_cached += 1;
+            self.lk.holder_depth += 1;
+            // (No sighting: `HolderRead` carries no tag to observe.)
+            self.lock_holder_applied(now, op, &read, replica, out);
+            self.lk.holder_depth -= 1;
+            return;
+        }
+        self.stats.lock_holder_reads += 1;
+        let s3 = self.issue_s3(S3Op::LeaseGet, super::S3For::LockHolder(op), out);
+        self.lk.holder_flight = Some(HolderFlight {
+            s3,
+            waiting: vec![op],
+        });
+    }
+
+    /// The lease observation's key and stamps (plan 43 C7b), which a
+    /// reused lease read must leave as they are.
+    #[cfg(test)]
+    pub(crate) fn lease_obs_stamp(
+        &self,
+    ) -> Option<(constellation_store_s3::RenewalKey, WaitMs, WaitMs)> {
+        self.lease.obs.as_ref().map(|o| (o.key, o.since, o.read_at))
+    }
+
+    fn lock_retry(&mut self, now: Now, op: OpId, replica: &dyn Replica, out: &mut Vec<Action>) {
         let Some(o) = self.lk.ops.get(&op) else {
             return;
         };
         if !o.blocking && o.attempts >= self.cfg.forward_retries {
             // Out of attempts against the holder this node knew (its
             // requests timed out before the link was declared dead).
-            if self.lock_reread_holder(op, out) {
+            if self.lock_reread_holder(now, op, replica, out) {
                 return;
             }
             self.lock_give_up(op, out);
@@ -3872,6 +4013,10 @@ impl Core {
         self.lock_route_op(now, op, replica, out);
     }
 
+    /// The shared lease read ([`Self::lock_read_holder`]) came back: kept
+    /// for [`LOCK_HOLDER_READ_TTL_MS`], and applied to every request that
+    /// waited for it (the one it was issued for may be gone: the others
+    /// still wait).
     pub(crate) fn on_lock_holder_learned(
         &mut self,
         now: Now,
@@ -3880,11 +4025,40 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        let read = HolderRead::of(&result);
+        if let HolderRead::Lease(lease) = &read {
+            self.lease.note_object(lease);
+        }
+        let mut waiting = match self.lk.holder_flight.take() {
+            Some(f) => f.waiting,
+            None => Vec::new(),
+        };
+        if !waiting.contains(&op) {
+            waiting.push(op);
+        }
+        self.lk.holder_done = Some(HolderDone {
+            at: now.wait,
+            read: read.clone(),
+            holder: self.lease.cached_holder,
+        });
+        for w in waiting {
+            self.lock_holder_applied(now, w, &read, replica, out);
+        }
+    }
+
+    /// What `op` does with what the lease says (read for it, or shared).
+    fn lock_holder_applied(
+        &mut self,
+        now: Now,
+        op: OpId,
+        read: &HolderRead,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
         if !self.lk.ops.contains_key(&op) {
             return;
         }
-        if let crate::event::S3Result::LeaseGet(Ok(Some((lease, _)))) = &result {
-            self.lease.note_object(lease);
+        if let HolderRead::Lease(lease) = read {
             if lease.holder != 0
                 && !self.lease.claimable_observed(now, &self.cfg)
                 && lease.holder != self.cfg.node_id
@@ -3900,7 +4074,7 @@ impl Core {
         if self.lock_op_while_resuming(now, op, replica, out) {
             return;
         }
-        if matches!(&result, crate::event::S3Result::LeaseGet(Err(_))) {
+        if matches!(read, HolderRead::Failed) {
             if let Some(owner) = self.lock_owner_without_s3(now) {
                 self.lease.cached_holder = Some(owner);
                 self.lock_route_op(now, op, replica, out);
@@ -3910,10 +4084,11 @@ impl Core {
         // Nobody usable holds it: a lock needs a sequencer as a write
         // does — acquire (the sim found blocked lockers with nobody
         // taking the lease). Non-blocking: unavailable after the retries.
-        let claimable = matches!(&result, crate::event::S3Result::LeaseGet(Ok(l))
-        if l.as_ref().is_none_or(|(l, _)| {
-            l.holder == 0 || self.lease.claimable_observed(now, &self.cfg)
-        }));
+        let claimable = match read {
+            HolderRead::Lease(l) => l.holder == 0 || self.lease.claimable_observed(now, &self.cfg),
+            HolderRead::Empty => true,
+            HolderRead::Failed => false,
+        };
         if claimable && !self.lease.lost {
             self.enqueue_job(
                 now,
@@ -3925,7 +4100,7 @@ impl Core {
                 out,
             );
         }
-        self.lock_retry(now, op, out);
+        self.lock_retry(now, op, replica, out);
     }
 
     /// A local request while this node is about to own the root again
@@ -4407,7 +4582,7 @@ impl Core {
                     // delegate-fenced-io). The owner answers the request
                     // again at once (it re-affirms the grant this node
                     // holds there), from its fresh send.
-                    self.lock_retry(now, op, out);
+                    self.lock_retry(now, op, replica, out);
                     return;
                 }
                 let held = HeldGrant {
@@ -4434,7 +4609,7 @@ impl Core {
                         // This node released that id already (the reply
                         // crossed the release): ask again.
                         self.stats.lock_released_replies += 1;
-                        self.lock_retry(now, op, out);
+                        self.lock_retry(now, op, replica, out);
                         return;
                     }
                 };
@@ -4499,7 +4674,7 @@ impl Core {
                 let late =
                     !o.blocking && now.wait.0 - o.created.0 >= self.cfg.s3_less_deadline_ms as i64;
                 if late {
-                    self.lock_retry(now, op, out);
+                    self.lock_retry(now, op, replica, out);
                 } else {
                     self.set_timer_wait(now.wait.plus(retry_ms), Timer::LockRetry(op), out);
                 }
@@ -4531,20 +4706,26 @@ impl Core {
                     // `lock_delegated_here`.)
                     self.lease.cached_holder = None;
                 }
-                self.lock_retry(now, op, out);
+                self.lock_retry(now, op, replica, out);
             }
-            LockOutcome::Busy => self.lock_retry(now, op, out),
+            LockOutcome::Busy => self.lock_retry(now, op, replica, out),
         }
     }
 
-    pub(crate) fn on_lock_request_timeout(&mut self, now: Now, req: OpId, out: &mut Vec<Action>) {
+    pub(crate) fn on_lock_request_timeout(
+        &mut self,
+        now: Now,
+        req: OpId,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
         let Some(op) = self.lk.by_req.remove(&req) else {
             return;
         };
         if let Some(o) = self.lk.ops.get_mut(&op) {
             if o.req == Some(req) {
                 o.req = None;
-                self.lock_retry(now, op, out);
+                self.lock_retry(now, op, replica, out);
             }
         }
     }
@@ -4584,7 +4765,7 @@ impl Core {
                     self.lease.cached_holder = None;
                 }
             }
-            self.lock_retry(now, op, out);
+            self.lock_retry(now, op, replica, out);
             return true;
         }
         if self.lk.test_by_req.contains_key(&req) {

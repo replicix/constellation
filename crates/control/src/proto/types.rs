@@ -1709,6 +1709,14 @@ pub struct LockStatus {
     /// owner could not be reached (a failover in progress: `ENOLCK`
     /// before).
     pub unreachable_owner_waits: u64,
+    /// Lease reads made for lock requests that need to know who holds the
+    /// root (a stale or unreachable owner, an unknown one), and the
+    /// requests that shared one in flight or the result of one answered a
+    /// moment before: with hundreds of requests waiting for a dead owner,
+    /// the first stays near one a quarter second.
+    pub holder_reads: u64,
+    pub holder_reads_shared: u64,
+    pub holder_reads_cached: u64,
     /// Lock answers that grant and extend nothing and went ahead of a held
     /// answer to the same peer, and answers that waited for the order of
     /// the answers to their peer alone.

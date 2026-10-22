@@ -1043,9 +1043,15 @@ the owner may not grant yet:
 - an owner that cannot be reached at all: its link is dead and the lease,
   read again, still names it (a failover under way, its successor not
   named yet). The requester asks again as a fresh request, with fresh
-  attempts and a fresh lease read, routed to the successor as soon as the
-  lease names it (`unreachable_owner_waits`). Without P2P there is no path
-  to wait for: `ENOLCK`, as documented.
+  attempts and a lease read, routed to the successor as soon as the lease
+  names it (`unreachable_owner_waits`). The lease reads of the requests
+  that need one are shared: one read in flight serves every request that
+  asks meanwhile, and its result is taken as it stands by the requests of
+  the next quarter second (`holder_reads` made, `holder_reads_shared` and
+  `holder_reads_cached` requests that made none), so hundreds of waiters
+  for a dead owner cost an S3 read about every quarter second, not one a
+  second each. Without P2P there is no path to wait for: `ENOLCK`, as
+  documented.
 
 A refusal or a request to wait is answered at once, never queued behind
 an answer the owner holds back for a lease read or a durable write (see
@@ -1789,7 +1795,9 @@ for both roles:
   (waits that could not begin and failed `EAGAIN` as before: the ring
   queue's lock-wait budget was spent, or no `lock-wait` thread could
   start; 0 in every load campaign), `unreachable_owner_waits` (requests
-  told to wait because their owner could not be reached),
+  told to wait because their owner could not be reached), `holder_reads`,
+  `holder_reads_shared` and `holder_reads_cached` (the lease reads those
+  requests made, and the requests that shared one),
   `stale_owner_answers`, `answers_order_bypassed` and
   `answers_order_held` (above),
   `fenced_owners` (the owners fenced now: `owner`, `pid`, `since_ms`,

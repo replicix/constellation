@@ -1623,6 +1623,9 @@ pub fn s3_cut_holder_failover_with_locks(_seed: u64) -> Result<()> {
                     n,
                     [
                         ("unreachable_owner_waits", g("unreachable_owner_waits")),
+                        ("holder_reads", g("holder_reads")),
+                        ("holder_reads_shared", g("holder_reads_shared")),
+                        ("holder_reads_cached", g("holder_reads_cached")),
                         ("refused_ring", g("grace_wait_refused_ring")),
                         ("refused_pool", g("grace_wait_refused_pool")),
                         ("stale_owner_answers", g("stale_owner_answers")),

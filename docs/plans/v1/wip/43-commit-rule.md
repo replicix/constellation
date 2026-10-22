@@ -3363,12 +3363,15 @@ successor whose clock is ahead got no quarantine").
   `lock_grace_wait_max_ms`: 112.5 s at the defaults); a run of polling
   answers backs off to a second; the refusals and waits are no longer
   queued behind a held renewal: 0 errors on 35 attempts in three runs, the
-  longest wait 61.5 s, 0 give-ups. Follow-up: every re-issue of a request
-  whose owner's link is dead reads the lease once from S3 (not coalesced),
+  longest wait 61.5 s, 0 give-ups. Every re-issue of a request
+  whose owner's link is dead read the lease once from S3 (not coalesced),
   about one GET per waiter per second after the backoff; with hundreds of
-  waiters on a node in such a window, hundreds of GETs a second. Coalesce
-  the lease reads in flight per node, or hint `forward_backoff_ms` for an
-  unreachable wait.
+  waiters on a node in such a window, hundreds of GETs a second. *Landed
+  (lock-wait follow-ups, N3):* the lease reads of the requests that need
+  one are shared per node: one in flight serves every request that asks
+  meanwhile, and a result under 250 ms old is taken as it stands (the
+  lease is one object, so the sharing is by node, which covers every
+  owner).
 
 - **F-c — an application whose lock grant lapsed during a root failover
   gets `EIO`.** In `s3-cut-holder-failover-with-locks` the locker's grant
