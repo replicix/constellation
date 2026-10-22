@@ -28834,6 +28834,91 @@ fn a_node_reads_the_lease_at_start() {
     assert!(core.job().is_none());
 }
 
+/// A delegation renewal from `from` for generation 7.
+fn deleg_renew_from(from: NodeId, req: u64) -> Event {
+    Event::Peer {
+        from,
+        msg: PeerMsg::DelegRenew {
+            req: OpId(req),
+            gen: 7,
+            round: 1,
+            backup: None,
+            stream_head: 0,
+            stream_head_at: 0,
+        },
+    }
+}
+
+/// The delegation renewals `out` answers, by their `ttl_ms`.
+fn deleg_renewed_ttls(out: &[Action]) -> Vec<u64> {
+    sends(out)
+        .into_iter()
+        .filter_map(|(_, m)| match m {
+            PeerMsg::DelegRenewed { ttl_ms, .. } => Some(*ttl_ms),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A delegate's renewal reaching a restarted root that the lease object
+/// still names: the root re-adopts its own lease, as for a forward, and
+/// leaves the renewal unanswered (the delegate re-sends it). Refused
+/// (`ttl_ms` 0), it stopped the generation at its delegate for good and
+/// nothing asked for the lease again: the subtree's lock waiters were
+/// answered `NotOwner { 0 }` for 60 s (sim `locks-delegated+crash1@4507:620`
+/// seed 222).
+#[test]
+fn a_delegation_renewal_to_a_restarted_root_readopts_its_own_lease() {
+    let mut h = Harness::new(1);
+    h.core.cfg.delegation = true;
+    h.core
+        .lease
+        .note_object(&lease_of(1, 3, h.now.plus(30_000).0));
+    let out = h.step(deleg_renew_from(2, 77));
+    assert!(deleg_renewed_ttls(&out).is_empty(), "{out:?}");
+    assert_eq!(h.core.job(), Some(JobKind::Acquire));
+    assert_eq!(h.core.stats.readopt_for_forward, 1);
+    // A re-sent renewal meanwhile: unanswered again, no second acquisition.
+    let out = h.step(deleg_renew_from(2, 78));
+    assert!(deleg_renewed_ttls(&out).is_empty(), "{out:?}");
+    assert!(s3_ops(&out)
+        .iter()
+        .all(|(_, r)| !matches!(r, S3Op::LeaseGet)));
+    assert_eq!(h.core.job(), Some(JobKind::Acquire));
+}
+
+/// ... and one that has not read the lease since it started reads it and
+/// leaves the renewal for the next; a lease that names another node, or
+/// that this node released, refuses it as before.
+#[test]
+fn a_delegation_renewal_waits_for_the_lease_read_and_a_non_root_refuses_it() {
+    let mut h = Harness::new(1);
+    h.core.cfg.delegation = true;
+    let out = h.step(deleg_renew_from(2, 77));
+    assert!(deleg_renewed_ttls(&out).is_empty(), "{out:?}");
+    assert!(
+        s3_ops(&out)
+            .iter()
+            .any(|(_, r)| matches!(r, S3Op::LeaseGet)),
+        "{out:?}"
+    );
+    assert_ne!(h.core.job(), Some(JobKind::Acquire));
+    for theirs in [
+        lease_of(3, 4, h.now.plus(30_000).0),
+        Lease {
+            released: true,
+            ..lease_of(1, 3, h.now.plus(30_000).0)
+        },
+    ] {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.lease.note_object(&theirs);
+        let out = h.step(deleg_renew_from(2, 78));
+        assert_eq!(deleg_renewed_ttls(&out), vec![0], "{theirs:?}: {out:?}");
+        assert_ne!(h.core.job(), Some(JobKind::Acquire), "{theirs:?}");
+    }
+}
+
 /// Plan 31 C1: a holder's refusal is a portable [`Code`] on the wire and in
 /// the journal. Two in-process nodes (real cores over real `Meta`s, like
 /// [`pair`]), with every reply between them carried by the daemon's real
@@ -30931,6 +31016,26 @@ fn a_delegate_gives_up_a_grant_its_dead_root_never_renews() {
         assert_eq!(retry.len(), 1, "no renewal retry armed");
     }
     assert_eq!(h.core.dl.mine[&7].executed, 0);
+}
+
+/// The delegate's own op, parked on a renewal its silent root does not
+/// answer, reaches its client deadline: it never executed, so the park
+/// is dropped and the client hears in doubt (and retries by rid). The
+/// deadline used to find no park it knew (only a root's local one) and
+/// was spent: the op stayed parked, and went on with no deadline to the
+/// lease path when the park let it go (the delegate-restart wedge: 540 s
+/// with no answer).
+#[test]
+fn a_delegate_parked_own_op_goes_in_doubt_at_its_deadline() {
+    let (mut h, _dir, rid, _lapse) = delegate_parked_on_a_silent_root();
+    let deadline = h.core.clients[&rid].deadline;
+    let out = h.step(Event::Timer { id: deadline });
+    assert!(
+        matches!(replies(&out).as_slice(), [(r, ClientReply::InDoubt)] if *r == rid),
+        "{out:?}"
+    );
+    assert!(h.core.dl.mine[&7].parked.is_empty());
+    assert!(!h.core.clients.contains_key(&rid));
 }
 
 /// `rid` left the delegate's park for the ordinary route to an

@@ -410,7 +410,8 @@ impl Core {
         );
     }
 
-    /// EC2 campaign 8 A-1: a peer forwarded an op to this node, which does
+    /// EC2 campaign 8 A-1: a peer forwarded an op to this node (or renewed
+    /// a delegation with it, `on_deleg_renew`), which does
     /// not hold the lease, while the lease object last read names this
     /// node, unreleased: a lease a previous incarnation held when it
     /// died (a restart with nothing of its own to ship does not acquire
@@ -421,7 +422,7 @@ impl Core {
     /// never while deposed, releasing, gated or in a continuation epoch,
     /// and not for a TTL after a re-adoption that did not land (then the
     /// requester is answered `NotHolder` and may take the lease itself).
-    fn readopt_own_lease_for_forward(
+    pub(super) fn readopt_own_lease_for_forward(
         &mut self,
         now: Now,
         replica: &dyn Replica,
@@ -452,8 +453,8 @@ impl Core {
         }
         tracing::info!(
             node = self.cfg.node_id,
-            "a peer forwarded an op while the lease still names this node \
-             (a previous incarnation's): re-adopting it"
+            "a peer forwarded an op or renewed a delegation while the lease \
+             still names this node (a previous incarnation's): re-adopting it"
         );
         self.enqueue_job(
             now,

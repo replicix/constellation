@@ -691,8 +691,9 @@ pub struct Stats {
     pub s3_less_forwards: u64,
     /// A-1: client ops answered in doubt at `s3_less_deadline_ms`.
     pub s3_less_deadlines: u64,
-    /// A-1: forwards answered `Held` while this node re-adopts the live
-    /// lease a previous incarnation of it left behind (a restart).
+    /// A-1: forwards answered `Held`, and delegation renewals left
+    /// unanswered, while this node re-adopts the live lease a previous
+    /// incarnation of it left behind (a restart).
     pub readopt_for_forward: u64,
     /// Acquisition CASes that failed without an answer and that the
     /// re-read found landed (`jobs::acquire_cas_reread`).

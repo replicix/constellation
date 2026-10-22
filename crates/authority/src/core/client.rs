@@ -2868,9 +2868,14 @@ impl Core {
             return;
         };
         // Phase 2b round 2: parked *before* executing (the root waits
-        // for a delegation's recall): nothing ran, the park is dropped
-        // and the client hears in doubt — never held past its deadline.
-        let unexecuted = c.phase == Phase::Recalling && self.abort_exec_local_park(rid);
+        // for a delegation's recall, or this node, the op's delegate,
+        // for its grant's renewal or the op's deps): nothing ran, the
+        // park is dropped and the client hears in doubt — never held past
+        // its deadline. A delegate's park kept the op, deadline spent,
+        // and let it go to the lease path with none (the delegate-restart
+        // wedge's op was re-sent for 540 s, never in doubt).
+        let unexecuted = c.phase == Phase::Recalling
+            && (self.abort_exec_local_park(rid) || self.abort_deleg_own_park(rid));
         let Some(c) = self.clients.get(&rid) else {
             return;
         };

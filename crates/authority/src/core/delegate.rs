@@ -893,6 +893,20 @@ impl Core {
         }
     }
 
+    /// This node's own op `rid`, parked as a delegate before it executed
+    /// (`delegate_try_execute`), reached its client deadline: the park is
+    /// dropped (`true`), as a root's local park is
+    /// (`abort_exec_local_park`).
+    pub(crate) fn abort_deleg_own_park(&mut self, rid: Rid) -> bool {
+        for d in self.dl.mine.values_mut() {
+            if let Some(i) = d.parked.iter().position(|p| p.from == 0 && p.rid == rid) {
+                d.parked.remove(i);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Execute `op` here as a delegate if it is this node's to execute
     /// (`true`), parking it while its `deps` are missing or the grant is
     /// not honoured. `from == 0` is this node's own client op.
@@ -2502,6 +2516,18 @@ impl Core {
             } else {
                 self.stats.deleg_renewals_refused += 1;
             }
+        } else if !self.root_usable(now) && self.deleg_renewal_awaits_own_lease(now, replica, out) {
+            // Left unanswered: the delegate re-sends it when it times out,
+            // and the re-adopted root, which inherits the generation,
+            // grants it.
+            tracing::debug!(
+                node = self.me(),
+                from,
+                gen,
+                ?req,
+                "delegation renewal left unanswered: this node may be the root again"
+            );
+            return;
         } else {
             self.stats.deleg_renewals_refused += 1;
         }
@@ -2545,6 +2571,46 @@ impl Core {
             lock_carry,
         };
         self.deleg_answer_renewal(now, from, hold.filter(|_| ttl_ms > 0), msg, out);
+    }
+
+    /// A delegation renewal reached this node, which holds no usable
+    /// lease: whether it may be the root again in a moment, so that the
+    /// renewal is left unanswered rather than refused. A refusal
+    /// (`ttl_ms` 0) stops the generation at its delegate for good
+    /// (`on_deleg_renewed`), and nothing asked for the lease again: the
+    /// subtree's lock waiters were answered `NotOwner { 0 }` by the
+    /// delegate and relearned a lease naming this node until some
+    /// mutation took it (sim `locks-delegated+crash1@4507:620` seed 222: a
+    /// waiter unanswered for 60 s). So a restarted root whose previous
+    /// incarnation's lease the object still names re-adopts it, as it
+    /// does for a forward (EC2 campaign 8 A-1); and one that has not read
+    /// the lease since it started (the start's read in flight, or failed)
+    /// reads it now and decides at the delegate's next renewal.
+    fn deleg_renewal_awaits_own_lease(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> bool {
+        if self.readopting() || self.readopt_own_lease_for_forward(now, replica, out) {
+            self.stats.readopt_for_forward += 1;
+            return true;
+        }
+        if self.cfg.p2p
+            && self.lease.last_seen.is_none()
+            && self.lease.cached_holder.is_none()
+            && self.lease.held.is_none()
+            && !self.lease.lost
+            && !self.retired()
+        {
+            self.issue_s3(
+                crate::action::S3Op::LeaseGet,
+                super::S3For::RefreshHolder,
+                out,
+            );
+            return true;
+        }
+        false
     }
 
     /// Plan 41 L0: send a delegation renewal's answer, or hold it

@@ -2024,20 +2024,12 @@ pub fn gen_clock_mix(
             },
         });
     }
-    // The draw is made whatever the cluster, so that the other draws of a
-    // seed do not depend on it. A root restarting in a delegating cluster
-    // whose clients take locks leaves a lock waiter unanswered for 60 s
-    // (nothing asks for the lease again: the delegate owner's delegation
-    // lapses and its lock answers name no owner; a plain crash and restart
-    // reproduces it, `locks-delegated+crash1@4507:620` seed 222; plan 43
-    // C7a): a liveness bug the mix found and does not stand for, so no
-    // reboot where directories are delegated and locks are taken.
     let reboot = rng.random_bool(0.5);
     let node = rng.random_range(1..=cfg.nodes);
     let step_ms = step(&mut rng, node);
     let restart_ms = rng.random_range(300..=3_000);
     let at_ms = at(&mut rng);
-    if reboot && (cfg.dirs.is_empty() || cfg.lock_files == 0) {
+    if reboot {
         out.push(ScheduledFault {
             at_ms,
             kind: FaultKind::RebootNode {

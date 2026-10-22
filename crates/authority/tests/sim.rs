@@ -2760,11 +2760,10 @@ fn the_default_clock_mix_is_bounded_deterministic_and_leaves_explicit_clock_faul
         ..SimConfig::default()
     };
     assert!((0..50u64).all(|s| gen_clock_mix(&none, s, 5_000).0.is_empty()));
-    // Delegated directories: the same draws, a reboot included (the
-    // opt-out that hid the delegate-restart wedge is gone with its fix);
-    // with locks taken too, no reboot (a root's restart leaves a lock
-    // waiter unanswered, whatever the clocks: the mix does not stand for
-    // that bug), and the same draws otherwise.
+    // Delegated directories, with locks taken or not: the same draws, a
+    // reboot included (the opt-outs that hid the delegate-restart wedge
+    // and the lock waiter a root's restart left unanswered are gone with
+    // their fixes).
     let delegating = SimConfig {
         dirs: vec!["d1".into(), "d2".into()],
         ..SimConfig::default()
@@ -2773,19 +2772,13 @@ fn the_default_clock_mix_is_bounded_deterministic_and_leaves_explicit_clock_faul
         lock_files: 2,
         ..delegating.clone()
     };
-    let not_reboot = |f: &&ScheduledFault| !matches!(f.kind, FaultKind::RebootNode { .. });
     for seed in 0..200u64 {
         let (r0, f0) = gen_clock_mix(&cfg, seed, 5_000);
-        let (r1, f1) = gen_clock_mix(&delegating, seed, 5_000);
-        let (r2, f2) = gen_clock_mix(&locking, seed, 5_000);
-        assert_eq!(r0, r1);
-        assert_eq!(r0, r2);
-        assert_eq!(format!("{f0:?}"), format!("{f1:?}"));
-        assert!(f2.iter().all(|f| not_reboot(&f)));
-        assert_eq!(
-            format!("{:?}", f0.iter().filter(not_reboot).collect::<Vec<_>>()),
-            format!("{:?}", f2.iter().collect::<Vec<_>>())
-        );
+        for other in [&delegating, &locking] {
+            let (r, f) = gen_clock_mix(other, seed, 5_000);
+            assert_eq!(r0, r);
+            assert_eq!(format!("{f0:?}"), format!("{f:?}"));
+        }
     }
     // Opt-outs and explicit injections: nothing drawn.
     let step = ScheduledFault {
@@ -8444,10 +8437,15 @@ fn production_margin_lease_cap_seeds_keep_their_grants() {
 /// armed at the 5 s cadence) was extended by a late reply
 /// (`Core::lock_late_reply`) to a renewal point no tick was armed for,
 /// and lapsed under the application's I/O; the late reply re-arms it.
+/// Unclocked: no fault is what it stands for. Under the clock-fault mix
+/// seed 1434 reboots the root and then suspends it 1.3 s in its takeover's
+/// gate; a grant of the subtree, unrenewable meanwhile, is renewed late at
+/// a delegate whose moved record of it cannot prove its continuity and is
+/// lost (fenced, not a violation).
 #[test]
 fn a_redelegation_to_the_same_node_keeps_its_first_renewal() {
     for seed in [1434, 691, 1683, 604, 1155, 3850] {
-        let report = run_seed(seed, production_ttl(true, true)).unwrap_or_else(|e| {
+        let report = pinned::run_seed(seed, production_ttl(true, true)).unwrap_or_else(|e| {
             panic!(
                 "locks-delegated-production-ttl-heavy seed {seed}: {e}\n  replay with \
                  AUTHORITY_SIM_CONFIG=locks-delegated-production-ttl-heavy"
@@ -10718,6 +10716,30 @@ fn regression_a_delegate_backup_restarted_while_the_root_is_down_is_answered() {
             panic!(
                 "delegated-holder-cut+crash2@2300:1200 seed {seed}: {e}\n  replay with \
                  AUTHORITY_SIM_CONFIG=delegated-holder-cut+crash2@2300:1200 \
+                 AUTHORITY_SIM_CLOCK_FAULTS=0 AUTHORITY_SIM_BUDGET=0"
+            )
+        });
+    }
+}
+
+/// The lock waiter a root's restart left unanswered (plan 43 C7a commit
+/// 6's finding 2): node 1, the root, crashes and is back 620 ms later with
+/// the lease object still naming it. The delegates' renewals were refused
+/// (`ttl_ms` 0: not the root), which stopped their generations for good,
+/// and nothing asked for the lease again: the delegate answered the
+/// subtree's lock requests `NotOwner { 0 }`, its waiters relearned a lease
+/// naming node 1, and a waiter went unanswered for 60 s (21 of the first
+/// 500 seeds). Now the restarted root re-adopts its lease for a renewal
+/// and leaves it unanswered until then. Unclocked: the seeds failed
+/// before the fix.
+#[test]
+fn regression_a_root_restarted_in_a_locking_delegated_cluster_answers_the_waiters() {
+    let cfg = config_variant(locks_delegated_config(), "crash1@4507:620");
+    for seed in [18, 23, 42] {
+        pinned::run_seed(seed, cfg.clone()).unwrap_or_else(|e| {
+            panic!(
+                "locks-delegated+crash1@4507:620 seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=locks-delegated+crash1@4507:620 \
                  AUTHORITY_SIM_CLOCK_FAULTS=0 AUTHORITY_SIM_BUDGET=0"
             )
         });

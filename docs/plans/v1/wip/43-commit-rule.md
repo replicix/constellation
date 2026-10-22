@@ -2865,19 +2865,25 @@ first part of C7a, landed early):
       `end_generation` now takes the cursor as the cut of a generation the
       takeover stranded (PROGRESS). C2's `RecallCut.through` takes the same
       rule; C3, which appends those rows instead of stranding them, removes
-      the case. The mix draws reboots where `dirs` are delegated again, except
-      where locks are taken too, for the next item.
-    - **Open (liveness):** the root restarting in a delegating cluster whose
-      clients take locks leaves a lock waiter unanswered for 60 s: nothing asks
-      for the lease again, the delegate owner's delegation lapses and its lock
-      answers name no owner (`NotOwner { 0 }`), the waiter relearns from a lease
-      that still names the restarted root (`locks-delegated` 222, 469, 784,
-      `-production-ttl` 1224, `-writes` 207 with the mix's reboot; a plain crash
-      and restart reproduces it: `locks-delegated+crash1@4507:620` seed 222;
-      commit 6's `locks-delegated` 2400, a 540 s wedge with no backups and so no
-      strand, does not reproduce on main's trajectories; this is what a reboot
-      there shows now). The mix draws no reboot where `dirs` are delegated and locks are taken
-      until it is fixed.
+      the case. The mix draws reboots where `dirs` are delegated again (where
+      locks are taken too since the next item's fix).
+    - *Fixed (liveness):* the root restarting in a delegating cluster whose
+      clients take locks left a lock waiter unanswered for 60 s
+      (`locks-delegated` 222, 469, 784, `-production-ttl` 1224, `-writes` 207
+      with the mix's reboot; a plain crash and restart reproduces it:
+      `locks-delegated+crash1@4507:620` seed 222, 21 of its first 500 seeds
+      unclocked). The restarted root answered its delegates' renewals
+      `ttl_ms` 0 (not the root), which stops a generation at its delegate for
+      good, and only a forward made it re-adopt the lease its previous
+      incarnation left (EC2 campaign 8 A-1): the delegate answered the
+      subtree's locks `NotOwner { 0 }` and the waiters relearned a lease
+      naming the restarted root until some mutation took it. A renewal now
+      re-adopts it too and is left unanswered meanwhile (also while the
+      restarted node has read no lease yet); the delegate re-sends it and the
+      root, which inherits the generation, grants it (PROGRESS). The mix
+      draws reboots everywhere again. Also fixed with it: a delegate's own
+      op parked before it executed lost its client deadline (the wedge
+      above was never answered in doubt at 12 s).
     - *Fixed:* a root paused 1.3 s and then a delegate crashed left a
       speculative row unsettled, no quiescence in 90 s
       (`locks-unlinked-delegated-dcrash` seed 2383; a plain `Pause` of 1 310 to

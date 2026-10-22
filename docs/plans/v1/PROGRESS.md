@@ -57474,3 +57474,83 @@ test file):
 
 Creates are within noise everywhere (ext4 −1.9 %, inside both spreads); the close pays
 the final flush (~0.1 s at this size); the reopen no longer replays the journal.
+
+## Fix: a restarted root re-adopts its lease for a delegate's renewal (plan 43 C7a, commit 6's finding 2)
+
+**The stall.** The root restarting in a delegating cluster whose clients take locks left a
+lock waiter unanswered for 60 s (`locks-delegated` 222, 469, 784,
+`locks-delegated-production-ttl` 1224, `locks-delegated-writes` 207 with the mix's reboot;
+a plain crash and restart: `locks-delegated+crash1@4507:620` seed 222, and 21 of that
+variant's first 500 seeds unclocked). The restarted root holds no lease; the lease object
+still names it. Its delegates' next renewals reached it and were refused (`ttl_ms` 0), and
+a refusal stops the generation at its delegate for good (`on_deleg_renewed`: "the
+generation is ending; the log ends it"). EC2 campaign 8 A-1 (`62268ff`) makes a restarted
+holder re-adopt its own lease when a peer forwards it a mutation, and only then; a subtree
+whose clients only lock forwards nothing. So nothing asked for the lease again: the
+delegate answered every lock request and renewal under the subtree `NotOwner { 0 }`, the
+lockers relearned a lease naming the restarted root (or, once it expired, found no owner:
+a request routed to a subtree's delegate never reads the lease), and a waiter went past
+its 60 s until some mutation's acquisition took the lease.
+
+**The fix.** The root side decides, as for a forward. `on_deleg_renew` on a node with no
+usable lease leaves the renewal unanswered when it may be the root again in a moment
+(`deleg_renewal_awaits_own_lease`): the lease names it, unreleased, and it re-adopts it
+(`readopt_own_lease_for_forward`, or that re-adoption under way, its gate included); or it
+has read no lease since it started (the start's read in flight or failed: it reads it
+now). The delegate re-sends the renewal at its timeout, as for a root that is down, and
+the re-adopted root inherits the generation and grants it. Otherwise (the lease is
+another node's, or released, or this node is deposed) the refusal stands as before.
+History: the refusal's meaning ("stopped") dates from M11 phase 2a (`578ff9c`); the
+re-adoption from `62268ff` (2026-09-28), forwards only. An open item of an earlier chunk
+("in-doubt acquisition CAS, lock-only traffic": nothing re-adopts for lock traffic) is the
+same gap for an undelegated lock; the CAS re-read fixed its cause, and a lock request to a
+restarted root is still answered `NotOwner { 0 }` until its lease expires (not fixed here:
+bounded by the lease ttl, 6 s in the sim, 60 s in production).
+
+**Also fixed (the delegate-restart wedge's second observation).** An own op parked at its
+delegate before it executed (`delegate_try_execute`: grant not honoured, deps missing, a
+read recall) is in phase `Recalling`, which `on_client_deadline` read as executed with
+only its acknowledgement waiting: the deadline was spent, the op stayed parked, and when
+the park let it go it took the lease path with no deadline (the wedge's op was never
+answered in doubt). The park is now dropped at the deadline (`abort_deleg_own_park`) and
+the client hears in doubt, as for a root's local park (`d214b1c`'s
+`abort_exec_local_park`, which only knew the root's).
+
+**The mix.** It draws a reboot where directories are delegated and locks are taken again
+(no opt-out left). `a_redelegation_to_the_same_node_keeps_its_first_renewal`, a no-fault
+regression, runs unclocked: under the mix its seed 1434 reboots the root and then suspends
+it 1.3 s inside its takeover's gate; a grant of the subtree, unrenewable meanwhile, is
+renewed late at a delegate whose moved record of it is unsettled, so its continuity is not
+proven and it is lost (fenced, no violation; on the parent the subtree reached the root
+the slow way, by reclaim, and the root admitted the late renewal). C4's log-derived lock
+state is what would prove it.
+
+**Tests (fail before).** Core `a_delegation_renewal_to_a_restarted_root_readopts_its_own_lease`,
+`a_delegation_renewal_waits_for_the_lease_read_and_a_non_root_refuses_it`,
+`a_delegate_parked_own_op_goes_in_doubt_at_its_deadline`; sim
+`regression_a_root_restarted_in_a_locking_delegated_cluster_answers_the_waiters`
+(unclocked `locks-delegated+crash1@4507:620` seeds 18, 23, 42). The mix's test asserts the
+same draws with and without delegated directories and locks.
+
+**Evidence** (release, 6 threads, reboots drawn everywhere; before = parent with the opt-out
+removed; failing sets, then lock I/Os fenced / grants lost summed over the seeds):
+
+| configurations | before | after |
+|---|---|---|
+| `locks-delegated+crash1@4507:620` unclocked, 500 | 21 seeds, all 60 s waiters | [] |
+| `locks-delegated` 1 000 | [222, 469, 784]; 7/8 | []; 5/7 |
+| `locks-delegated-writes` 1 000 | [207]; 28/30 | []; 19/21 |
+| `locks-delegated-production-ttl` 1224 (replay) | 60 s waiter | passes |
+| `locks-delegated-partition`, `-production-ttl`, `-production-ttl-heavy` 1 000 | [] each; 1068/1048, 1/3, 74/65 | [] each; 1078/1059, 0/2, 75/66 |
+| the 18 `delegated-*` sweep configurations, 1 000 | identical (`delegated-core-stall-unlaned` fails every seed, as on main) | identical |
+| 16 `locks-*-delegated*` configurations, 500 | [] but `locks-writer-hold-delegated-unsettled` [15] | the same but `-unsettled` [15, 427] |
+
+`locks-writer-hold-delegated-unsettled` is the settle's negative control: seed 427 fails
+with its intended signature (a held write landing inside the next holder's critical
+section), its settled twin `locks-writer-hold-delegated` is clean before and after. The
+fenced/lost totals move by a few percent either way, under faults only.
+
+Gates: `cargo fmt --check`; `clippy -p constellation-authority --all-targets -D warnings`;
+authority lib (568), `meta_repro` (4), sim suite (234 passed, 12 ignored). Not run: other
+crates (no code outside authority changed), the harness, the model suite, perf (pending,
+box).
