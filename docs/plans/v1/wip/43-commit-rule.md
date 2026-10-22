@@ -3886,6 +3886,7 @@ to land before C0.
   deletes it if the count stayed 0: *recommended*.
   (i) The uncaptured fallback keeps today's replay of a node's own
   delegate rows, counted and documented: *recommended*.
+  **Answered 2026-10-22:** every recommendation taken.
 
 - **Q25 — C4's coder-spec decisions (specified 2026-10-22).** *Blocks
   C4.*
@@ -3917,6 +3918,7 @@ to land before C0.
   successors always; TTL and released takeovers never). *Recommended.*
   (g) *Order:* C4-4 and C4-5 coded in parallel, C4-4 landed first; C7b
   commit 8 right after C4. *Recommended.*
+  **Answered 2026-10-22:** every recommendation taken.
 
 ### 11.1 Deferred (not in this plan)
 
