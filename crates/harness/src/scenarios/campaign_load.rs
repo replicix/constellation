@@ -29,6 +29,16 @@
 //! - `acks3-under-load`: an `ack=s3` holder whose store stalls 1-3 s at a
 //!   time (run it under `cpu:25@a`): no fast takeover of a live holder, no
 //!   rollback of an acknowledged write (finding F2b's twin).
+//! - `lock-owner-reboot` (plan 43 C7a): the same counter on three nodes with no
+//!   backup; the lock owner (the lease holder) is killed and mounted again, as a
+//!   process restart in one fresh cluster and as a reboot (a new boot id,
+//!   `CONSTELLATION_FAULT_BOOT_ID`, [`crate::load::reboot_next`]) in another,
+//!   with an op on its own mount to make it take its lease. The count must be
+//!   exact (no lock granted over a window still honoured, whichever node holds
+//!   the lease afterwards: printed), the errors in the documented set; the
+//!   longest time the counter stood still within 45 s of the kill is printed
+//!   for each. A rebooted owner cannot subtract the time since its last
+//!   horizon write, so it waits the span the horizon was written with.
 //! - `endpoint-wedge-probe`: one node of a busy three-node cluster frozen
 //!   8 s per round (F11): links come back, no FUSE request stalls, no
 //!   write fails.
@@ -233,23 +243,26 @@ fn finish_counter(
 }
 
 fn counter_cluster(name: &str) -> Result<(crate::s3env::S3Env, tempfile::TempDir, Vec<Client>)> {
+    counter_cluster_with(name, &[])
+}
+
+/// [`counter_cluster`] with `more` env on every daemon.
+fn counter_cluster_with(
+    name: &str,
+    more: &[(&str, &str)],
+) -> Result<(crate::s3env::S3Env, tempfile::TempDir, Vec<Client>)> {
     let ttl = LOCK_TTL_MS.to_string();
     let log = format!("info,{}", crate::verify::LOG_DIRECTIVES);
     let stall = std::env::temp_dir().join(format!("harness-{name}-stall-{}", std::process::id()));
-    let (env, root, clients, _) = cluster(
-        name,
-        &["a", "b", "c"],
-        &[
-            ("CONSTELLATION_LOCK_TTL_MS", &ttl),
-            ("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "0"),
-            ("RUST_LOG", &log),
-            (
-                "CONSTELLATION_FAULT_STORE_STALL_FILE",
-                &stall.display().to_string(),
-            ),
-        ],
-        0,
-    )?;
+    let stall = stall.display().to_string();
+    let mut env_vars = vec![
+        ("CONSTELLATION_LOCK_TTL_MS", ttl.as_str()),
+        ("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "0"),
+        ("RUST_LOG", log.as_str()),
+        ("CONSTELLATION_FAULT_STORE_STALL_FILE", stall.as_str()),
+    ];
+    env_vars.extend_from_slice(more);
+    let (env, root, clients, _) = cluster(name, &["a", "b", "c"], &env_vars, 0)?;
     std::fs::write(clients[0].mnt.join("counter"), 0u64.to_be_bytes())?;
     for c in &clients[1..] {
         eventually("the counter everywhere", Duration::from_secs(60), || {
@@ -262,6 +275,130 @@ fn counter_cluster(name: &str) -> Result<(crate::s3env::S3Env, tempfile::TempDir
 
 fn stall_file(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("harness-{name}-stall-{}", std::process::id()))
+}
+
+/// The counter's value now, through `c`'s mount.
+fn counter_at(c: &Client) -> Result<u64> {
+    read_counter(&c.mnt.join("counter"))
+}
+
+/// See the module docs.
+pub(super) fn lock_owner_reboot(_seed: u64) -> Result<()> {
+    // One cluster per variant: the lease moves to the node that uses it
+    // (a handoff), so the second kill would find another owner.
+    for (what, reboot) in [("a process restart", false), ("a reboot", true)] {
+        lock_owner_round(what, reboot)?;
+    }
+    Ok(())
+}
+
+fn lock_owner_round(what: &str, reboot: bool) -> Result<()> {
+    const NAME: &str = "lock-owner-reboot";
+    let (_env, _root, mut clients) = counter_cluster(NAME)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let result = (|| -> Result<()> {
+        let owner = node_id(&clients[0])?;
+        let holder_of =
+            |c: &Client| -> Result<u64> { Ok(lease_of(c)?["holder"].as_u64().unwrap_or(0)) };
+        anyhow::ensure!(
+            holder_of(&clients[1])? == owner,
+            "{} does not hold the lease before the run",
+            clients[0].name
+        );
+        let errnos = ErrnoLog::new();
+        let workers: Vec<_> = [1usize, 2]
+            .iter()
+            .map(|i| {
+                let (mnt, name, e, stop) = (
+                    clients[*i].mnt.clone(),
+                    clients[*i].name.clone(),
+                    errnos.clone(),
+                    stop.clone(),
+                );
+                std::thread::spawn(move || counter_until(&mnt, &name, &e, &stop))
+            })
+            .collect();
+        // Both contend; the owner serves the locks: grants are live when it
+        // stops (the counter moves, so a lock is held most of the time).
+        let moves = |c: &Client, what: &str, within: Duration| -> Result<()> {
+            let from = counter_at(c)?;
+            eventually(what, within, || {
+                anyhow::ensure!(counter_at(c)? >= from + 5);
+                Ok(())
+            })
+        };
+        moves(&clients[1], "the counter moves", Duration::from_secs(60))?;
+        clients[0].kill9()?;
+        let killed = Instant::now();
+        if reboot {
+            crate::load::reboot_next(&clients[0].name);
+        }
+        clients[0].mount()?;
+        // An op on the restarted owner's own mount makes it take its lease
+        // (unexpired, so by the gate: M4's re-adoption) at once; left to the
+        // others it waits for them to ask, and they may claim it by its TTL
+        // first.
+        let _ = std::fs::write(clients[0].mnt.join("poke"), b"x");
+        // The gap in service: the longest time the counter stood still from
+        // the kill to 45 s on (the workers keep contending: what they had in
+        // flight moves it for a moment, then it stands until the owner serves
+        // locks again).
+        let (mut last, mut last_at, mut gap) = (counter_at(&clients[1])?, killed, Duration::ZERO);
+        while killed.elapsed() < Duration::from_secs(45) {
+            std::thread::sleep(Duration::from_millis(50));
+            let v = counter_at(&clients[1])?;
+            if v != last {
+                gap = gap.max(last_at.elapsed());
+                (last, last_at) = (v, Instant::now());
+            }
+        }
+        gap = gap.max(last_at.elapsed());
+        let still = {
+            let mut h = 0;
+            eventually("a holder is known", Duration::from_secs(60), || {
+                h = holder_of(&clients[1])?;
+                anyhow::ensure!(h != 0);
+                Ok(())
+            })?;
+            h
+        };
+        eprintln!(
+            "    {NAME}: {what}: the counter stood still for up to {gap:?} within 45 s of the \
+             kill (the lease: {})",
+            if still == owner {
+                "the restarted owner holds it again"
+            } else {
+                "another node holds it"
+            }
+        );
+        moves(
+            &clients[1],
+            "the counter moves again",
+            Duration::from_secs(60),
+        )?;
+        stop.store(true, Ordering::Relaxed);
+        let (mut done, mut doubt) = (0, 0);
+        for w in workers {
+            let c = w.join().map_err(|_| anyhow::anyhow!("a worker panicked"))?;
+            done += c.done;
+            doubt += c.doubt;
+        }
+        finish_counter(NAME, &clients, done, doubt, &errnos)
+    })();
+    // On a failure the workers (some blocked in a lock request) must let go
+    // of the mounts before they are unmounted: stop them, and take the
+    // daemons down so that a blocked request returns.
+    stop.store(true, Ordering::Relaxed);
+    super::m11::dump_logs_on_failure(NAME, &clients, &result);
+    if result.is_err() {
+        for c in clients.iter_mut() {
+            let _ = c.kill9();
+        }
+    }
+    for c in clients.iter_mut().rev() {
+        let _ = c.unmount();
+    }
+    result
 }
 
 /// See the module docs.

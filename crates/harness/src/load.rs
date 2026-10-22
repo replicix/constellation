@@ -20,6 +20,7 @@
 //! | `clock:<±ms>` / `clock:spread:<ms>` | `CONSTELLATION_FAULT_CLOCK_OFFSET_MS` (within ±500 ms); spread alternates `+ms`, `-ms` across nodes |
 //! | `clock:step:<±ms>:<at_ms>[@node]` | at `<at_ms>` after the daemon spawned, the daemon's protocol wall clock steps by `<ms>` (`CONSTELLATION_FAULT_CLOCK_STEP_FILE`; plan 43 C7-H1): the honour clock follows a forward step, a backward one and the wait clock move nothing; the steps are cumulative per node, armed once per node and kept across a daemon restart (a restarted daemon starts stepped; the step is not applied again) |
 //! | `clock:rate:<±ppm>[:unbudgeted][@node]` | the daemon's boot, raw and monotonic clocks run at `1 + ppm/1e6` of the host's rate from its start, its wall does not (`CONSTELLATION_FAULT_CLOCK_RATE_PPM`; plan 43 C7a): an oscillator off by `ppm` under a disciplined wall. Unless `:unbudgeted`, the node's rate budget is raised to cover it (`CONSTELLATION_CLOCK_RATE_BUDGET_PPM = max(1000, |ppm|)`; each node budgets its own oscillator); `|ppm| < 500000`. The clocks scale WAIT by `1/(1+ρ)` and HONOUR by `1/(1−ρ)` of it (C7a); `:unbudgeted` is the stress run, an oscillator beyond the budget |
+//! | `reboot[@node]` | the daemon's restarts are reboots (plan 43 C7a): every spawn after its first starts on a new boot id (`CONSTELLATION_FAULT_BOOT_ID`), as a host that came back up has one, so the restart horizons it left (lock grants, read grants, the takeover floor) are read as the span they were written with, not as time left on the old boot's raw clock; the node's wall step (`clock:step`, cumulative) is kept across it, so a node that restarts under both comes back with its clock stepped. A scenario reboots a restart by hand with [`reboot_next`] |
 //!
 //! `<dur>` is milliseconds or a protocol boundary with an optional offset
 //! (`lock-lapse+500`, `takeover-300`, `lease-ttl+1000`: see
@@ -173,6 +174,9 @@ pub enum Kind {
         ppm: i64,
         budgeted: bool,
     },
+    /// The daemon's restarts are reboots: a new boot id from its second
+    /// spawn on (plan 43 C7a).
+    Reboot,
 }
 
 /// The rate budget a daemon has without `clock:rate` (ppm): the platform's
@@ -405,6 +409,10 @@ fn parse_item(body: &str, target: Target, spec: &str) -> Result<Item> {
                 Kind::Clock { offset }
             }
         },
+        "reboot" => {
+            anyhow::ensure!(rest.is_empty(), "reboot takes no argument: got {body:?}");
+            Kind::Reboot
+        }
         other => bail!(
             "unknown load item {other:?} in {spec:?} (presets: {})",
             PRESETS
@@ -757,6 +765,14 @@ pub fn daemon_env(node: &str, work: &Path, env: &[(String, String)], cmd: &mut C
             _ => {}
         }
     }
+    let every_restart = items_for(node)
+        .iter()
+        .any(|i| matches!(i.kind, Kind::Reboot));
+    let boot = next_boot(node, every_restart);
+    if boot > 0 {
+        cmd.env("CONSTELLATION_FAULT_BOOT_ID", boot_id_of(boot));
+        note_applied(format!("boot:{boot}@{node}"));
+    }
     let offset = clock_offset_for(node);
     if offset != 0 {
         cmd.env("CONSTELLATION_FAULT_CLOCK_OFFSET_MS", offset.to_string());
@@ -770,6 +786,66 @@ pub fn daemon_env(node: &str, work: &Path, env: &[(String, String)], cmd: &mut C
         clock_step_file(work, node),
     );
     crate::verify::daemon_env(env, cmd);
+}
+
+/// One node's boots in a scenario: how many reboots its daemon has had, whether
+/// it has been spawned, and whether the next spawn is a reboot.
+#[derive(Default)]
+struct Boots {
+    boots: u64,
+    spawned: bool,
+    pending: bool,
+}
+
+static BOOTS: Mutex<Vec<(String, String, Boots)>> = Mutex::new(Vec::new());
+
+fn with_boots<R>(node: &str, f: impl FnOnce(&mut Boots) -> R) -> R {
+    let scenario = crate::client::scenario();
+    let mut all = BOOTS.lock().unwrap_or_else(|e| e.into_inner());
+    let i = match all
+        .iter()
+        .position(|(sc, n, _)| *sc == scenario && n == node)
+    {
+        Some(i) => i,
+        None => {
+            all.push((scenario, node.to_string(), Boots::default()));
+            all.len() - 1
+        }
+    };
+    f(&mut all[i].2)
+}
+
+/// The next spawn of `node`'s daemon in this scenario is a reboot (plan 43
+/// C7a): it starts on a new boot id, as a host that was powered off and on
+/// does, instead of the process restart it would be (same boot, its raw clock
+/// still counting). For a scenario that kills a daemon and mounts it again;
+/// the `reboot` item does it for every restart.
+pub fn reboot_next(node: &str) {
+    with_boots(node, |b| b.pending = true);
+}
+
+/// The boot `node`'s daemon is spawned on now: 0 for the host's own (nothing
+/// is overridden), n for its n-th reboot. A spawn after the first is a reboot
+/// when the profile says so (`every_restart`) or [`reboot_next`] was called.
+fn next_boot(node: &str, every_restart: bool) -> u64 {
+    with_boots(node, |b| {
+        if b.spawned && (every_restart || b.pending) {
+            b.boots += 1;
+        }
+        b.spawned = true;
+        b.pending = false;
+        b.boots
+    })
+}
+
+/// The id of boot number `n`: non-zero, and distinct from every other
+/// harness process's (the pid) so a daemon state kept from an earlier run
+/// reads as another boot.
+fn boot_id_of(n: u64) -> String {
+    format!(
+        "{:016x}",
+        0xC7A0_B007_0000_0000u64 | ((std::process::id() as u64 & 0xFFFF) << 16) | (n & 0xFFFF)
+    )
 }
 
 /// The file `node`'s daemon polls for its cumulative wall-clock step.
@@ -2129,6 +2205,45 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "{bad:?} parsed");
         }
+    }
+
+    /// Expectation: `reboot[@node]` parses, takes no argument, and the boots
+    /// of a node count only from a spawn after its first that the item or
+    /// [`reboot_next`] makes a reboot (the first spawn is the host's own boot,
+    /// nothing overridden); ids are non-zero, 16 hex digits and distinct per
+    /// boot.
+    #[test]
+    fn reboots_parse_and_count_boots() {
+        let p = parse("reboot@a,reboot").unwrap();
+        assert_eq!(
+            p.items,
+            vec![
+                Item {
+                    kind: Kind::Reboot,
+                    target: Target::Node("a".into())
+                },
+                Item {
+                    kind: Kind::Reboot,
+                    target: Target::All
+                },
+            ]
+        );
+        assert!(parse("reboot:5").is_err());
+        // Without the item: a restart is a process restart, a marked one a
+        // reboot, and the mark is used once.
+        assert_eq!(next_boot("boot-test-a", false), 0, "the first spawn");
+        assert_eq!(next_boot("boot-test-a", false), 0, "a process restart");
+        reboot_next("boot-test-a");
+        assert_eq!(next_boot("boot-test-a", false), 1);
+        assert_eq!(next_boot("boot-test-a", false), 1);
+        // With the item every restart is one; another node counts alone.
+        assert_eq!(next_boot("boot-test-b", true), 0);
+        assert_eq!(next_boot("boot-test-b", true), 1);
+        assert_eq!(next_boot("boot-test-b", true), 2);
+        let (one, two) = (boot_id_of(1), boot_id_of(2));
+        assert_ne!(one, two);
+        assert_eq!(one.len(), 16);
+        assert_ne!(u64::from_str_radix(&one, 16).unwrap(), 0);
     }
 
     /// Expectation: `clock:rate:<±ppm>[:unbudgeted][@node]` parses with its

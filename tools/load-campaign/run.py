@@ -160,6 +160,7 @@ PHASES: dict[str, dict] = {
             "load-probe-takeover",
             "lock-contention-paused-holder",
             "lock-contention-stalled-owner",
+            "lock-owner-reboot",
             "delegate-paused-across-ttl",
             "acks3-under-load",
             "snapsched-leader-paused",
@@ -191,6 +192,23 @@ PHASES: dict[str, dict] = {
             "step-pause:2000:8000@b",
         ],
         "seeds": [42, 43, 44, 55],
+    },
+    # Plan 43 C7a: the lock scenarios of phase 3 under oscillator rate
+    # errors. Two nodes 1 000 ppm off in opposite directions (the budget as
+    # it is: every window exact), and one node 5 % off with its budget
+    # raised to cover it (`clock:rate:<ppm>` budgets the node unless
+    # `:unbudgeted`).
+    "clock-rate": {
+        "scenarios": [
+            "lock-contention-paused-holder",
+            "git-under-flock-causal",
+            "delegate-paused-across-ttl",
+        ],
+        "profiles": [
+            "clock:rate:1000@a,clock:rate:-1000@b",
+            "clock:rate:50000@a",
+        ],
+        "seeds": [42, 43, 44],
     },
     "known-bugs": {
         "scenarios": ["stress-ng-fs-nodes", "stress-ng-fs-faults", "chaos-ci"],

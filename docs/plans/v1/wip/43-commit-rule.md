@@ -2723,6 +2723,41 @@ first part of C7a, landed early):
     search finds nothing in 144 cells, so its pair is a trace over the
     renewal tick (the floor ends up to one tick inside the holder's renewed
     window without the span, never with it).
+  - *Commit 6 landed (2026-10-21; PROGRESS "Plan 43 C7a, commit 6 of 6"):*
+    the default clock-fault mix and the rest of the plumbing. The sim's default
+    budget is the production 1 000 ppm, and every run draws, from a stream of its
+    own (`seed ^ 0xC7A0_C10C`), a rate per node within it, 0 to 2 wall steps (at
+    most 150 ms each and 200 ms in sum per node, until C7b), at most one suspend
+    (0.3 to 3 s) and at most one reboot (back in 0.3 to 3 s on a new boot) of a
+    node; a configuration that injects clock faults of its own, or allows no
+    seal (`live_holder`), is left alone, and the exact-timing ones set
+    `clock_faults: false`. Harness: the `reboot[@node]` item (a restart is a
+    reboot: a new `CONSTELLATION_FAULT_BOOT_ID`), `load::reboot_next`, the
+    scenario `lock-owner-reboot` (the lock owner killed and mounted again, as a
+    restart and as a reboot, the count exact and the stand-still printed),
+    the campaign preset `clock-rate`. The sweeps under the mix are clean but for
+    what it found that no clock fault causes (PROGRESS), each reproduced without
+    one, and two of them open:
+    - **Open (liveness):** a node restarting in a cluster with delegated
+      directories while the holder is down wedges it: no op answered for 540 s
+      (`delegated-holder-cut` seed 139, `locks-unlinked-delegated-hcrash-backup`
+      154, `locks-delegated` 2400; a plain crash and restart, no step, no new
+      boot). The mix draws no reboot where `dirs` are delegated until it is
+      fixed; the fix restores it.
+    - **Open (liveness):** a root paused 1.3 s and then a delegate crashed leaves
+      a speculative row unsettled, no quiescence in 90 s
+      (`locks-unlinked-delegated-dcrash` seed 2383; a plain `Pause` of 1 310 to
+      1 329 ms). That configuration with delegate backups opts out of the mix
+      until it is fixed.
+    - *Explained:* the directory real-time-order violation in the
+      lag-at-expiry configurations with a node paused for seconds (seeds 5, 275,
+      277) is the backup paused while its holder is cut from S3, a second
+      failure beyond one backup's budget (`f27d3d1`, `Cluster::note_s3_cut`);
+      C1 (item 5, the TTL path's tail) makes those seeds pass strictly. Those
+      configurations run the mix (about 5 % of their seeds recorded as beyond
+      the budget until C1).
+
+    **C7a is done.**
 - **C7b — the cross-node compares** (rows 2, 3, 6, 9, 11, and the sites
   C7-H2 found and left: 23 the released-takeover lock grace, 24 the seal
   watch's expiry compares, 25 `promise_check_needed`; and those C7-H1's
@@ -3269,7 +3304,7 @@ additionally fails on `non_lone_rollbacks > 0` (I5) from C1. New
 `FaultKind`s: `Operator(AbandonGroup)` (C0, used from C1),
 `ClockStep { who, ms }` and `PartitionLockerStepped` (C7-H1), `StallStep`'s
 `after_event` trigger (C2's `tloss-two-node`), and C7a's `RateSkew` /
-`Suspend`. The sim's `RebuildReplica` runs the production rebuild (C0).
+`Suspend` / `RebootNode` (the default mix: `SimConfig::clock_faults`, `gen_clock_mix`). The sim's `RebuildReplica` runs the production rebuild (C0).
 
 | Config (new unless marked) | Milestone | Fails before because | Seeds |
 |---|---|---|---|
@@ -3806,7 +3841,7 @@ to land before C0.
       producer; the docs' offline-first contract; the full CONVENTIONS
       gates (pjdfstest 8798/8798).
 - [ ] C6: the add-window rule with its fail-before; measured; the maintainer's default recorded.
-- [ ] C7a, C7b: every exit item of §7 C7.
+- [x] C7a (2026-10-21, six commits). [ ] C7b: every exit item of §7 C7.
 - [ ] §9's gates met at every milestone, on the four file systems where
       §9 says so; `bench/commit-rule/RESULTS.md` complete.
 - [ ] Every §6 document change made in its milestone; ADR-33 and the
@@ -3898,8 +3933,8 @@ L = liveness only.
 | 18 | Inbox `submitted_unix_ms`, registry `last_modified`, designation `created_unix_ms`, names, stall stamps, status | stats, naming | W | none / L | leave |
 | 19 | HLC ctime stamps (`hlc.rs`, 300 s tolerance), atime clamp | peer's W vs own W | W↔W | none (timestamps) | leave |
 | 20 | Kernel attr/entry TTLs, `dentries.rs` filter, session waits, ReadIndex deadlines, forward timeout | kernel / `Instant` | I | L | already monotonic (`Instant` stops in suspend: conservative there) |
-| 21 | Fault hook `CONSTELLATION_FAULT_CLOCK_OFFSET_MS` (reaches `now_unix_ms` and rows 1–17) | — | — | capped at ±500 by the campaign (`load.rs:366`) | becomes a constant-offset test (harmless at ±5 s); add rate and step hooks (**landed**: `CONSTELLATION_FAULT_CLOCK_RATE_PPM`, C7a commits 1 and 2) |
-| 22 | Sim `tests/sim/clock.rs` `Clock::skewed` (constant offset), `SimConfig::clock_skew_ms` (plus `clock_offsets`, C7-H2); models' `max_offset`, `Jump` | — | — | — | add per-node `rate_ppm`, suspend and step (**C7a landed**: commits 1 and 2) |
+| 21 | Fault hook `CONSTELLATION_FAULT_CLOCK_OFFSET_MS` (reaches `now_unix_ms` and rows 1–17) | — | — | capped at ±500 by the campaign (`load.rs:366`) | becomes a constant-offset test (harmless at ±5 s); add rate and step hooks (**landed**: `CONSTELLATION_FAULT_CLOCK_RATE_PPM`, C7a commits 1 and 2; the harness's `clock:rate:`, `clock:step:` and `reboot` items, `lock-owner-reboot`, the campaign preset `clock-rate`: commit 6) |
+| 22 | Sim `tests/sim/clock.rs` `Clock::skewed` (constant offset), `SimConfig::clock_skew_ms` (plus `clock_offsets`, C7-H2); models' `max_offset`, `Jump` | — | — | — | add per-node `rate_ppm`, suspend and step (**C7a landed**: commits 1 and 2; the default mix of rates, steps, suspends and reboots, commit 6) |
 | 23 | Released-takeover lock grace — `lock_on_released_takeover`'s gate in `acquire_won` (`takeover && p.released && !p.is_expired(now)`) | released lease's `expires_unix_ms` (its W) vs the taker's W | W↔W | **S** (a taker ahead by more than the released lease's remaining TTL gets no lock grace, while the releaser's grants are honoured) | grace by the taker's own observation of the release, or always (the grace is bounded by `lock_ttl`): C7b |
 | 24 | Seal watch's expiry compares — `on_takeover_get`, `known_expiry`/`lag_discount`, `watch_due_by_expiry` (`backup.rs`) | the holder's `expires` (its W) vs the backup's W | W↔W | L (after C7-H2 an early seal is safe: it gets the whole floor; a late one is latency) | wait clock plus the ETag observation: C7b, with row 13 |
 | 25 | `promise_check_needed` — `!prev.is_expired(now)` (`promise.rs`) | predecessor's `expires` vs the taker's W | W↔W | L (a sealed taker ahead does a promise check it would skip; only conservative) | with row 3's anchored promises: C7b |

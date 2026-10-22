@@ -1040,6 +1040,7 @@ fn regression_resubmitted_rid_withdraws_its_batch() {
 /// helper over 10000–11999).
 #[test]
 fn regression_every_inbox_batch_of_a_rid_is_withdrawn() {
+    use pinned::run_seed;
     let report = run_seed(10247, long_config()).unwrap_or_else(|e| panic!("seed 10247: {e}"));
     assert!(report.converged_checked, "seed 10247 did not converge");
     // Re-pinned after plan 30 M9's rebase (the holder journals refusals
@@ -2595,6 +2596,179 @@ fn holder_restart_step_forward_readopt_config() -> SimConfig {
     }
 }
 
+/// Plan 43 C7a (commit 6): a test that pins what particular seeds do (an
+/// exact timing, a count of seals or lost grants or fenced I/Os, a negative
+/// control's failing seed) runs unclocked, as it was written: no default
+/// clock-fault mix and the unbudgeted clock (the budget stretches every
+/// timer by a few ms, which moves every trajectory). The sweeps and the long
+/// runs, which explore, run the default.
+fn unclocked(cfg: SimConfig) -> SimConfig {
+    SimConfig {
+        clock_faults: false,
+        rate_budget_ppm: 0,
+        ..cfg
+    }
+}
+
+/// The runners of this file with [`unclocked`] applied (`use pinned::{..}`
+/// at the top of a pinning test shadows the plain ones).
+mod pinned {
+    use super::*;
+
+    pub fn run_seed(seed: u64, cfg: SimConfig) -> Result<Report, String> {
+        super::run_seed(seed, unclocked(cfg))
+    }
+
+    pub fn run_m9(label: &str, cfg: SimConfig, seeds: std::ops::Range<u64>) -> M9Totals {
+        super::run_m9(label, unclocked(cfg), seeds)
+    }
+
+    pub fn run_m11(label: &str, cfg: SimConfig, seeds: std::ops::Range<u64>) -> M11Totals {
+        super::run_m11(label, unclocked(cfg), seeds)
+    }
+
+    pub fn run_m14(label: &str, cfg: SimConfig, seeds: std::ops::Range<u64>) -> M14Totals {
+        super::run_m14(label, unclocked(cfg), seeds)
+    }
+
+    pub fn c0_run(label: &str, seed: u64, cfg: SimConfig) -> Report {
+        super::c0_run(label, seed, unclocked(cfg))
+    }
+}
+
+/// Plan 43 C7a (commit 6): the default clock-fault mix of a run is drawn from
+/// the seed on a stream of its own: the same every time, every rate within
+/// the production budget, every step within 150 ms and 200 ms in sum per
+/// node (the reboot's included), every suspend 0.3 to 3 s and on a
+/// cluster only, every reboot's restart 0.3 to 3 s; and a configuration
+/// that injects clock faults, skew, offsets or rates of its own, or opts
+/// out, is left alone. Over 600 seeds each kind of fault occurs (a mix that
+/// drew nothing would pass every sweep for no reason).
+#[test]
+fn the_default_clock_mix_is_bounded_deterministic_and_leaves_explicit_clock_faults_alone() {
+    use sim::run::{gen_clock_mix, FaultKind, StepOf};
+    let cfg = SimConfig::default();
+    assert!(cfg.clock_faults && cfg.rate_budget_ppm == 1_000);
+    let (mut steps, mut suspends, mut reboots, mut nonzero_rates) = (0, 0, 0, 0);
+    for seed in 0..600u64 {
+        let (rates, faults) = gen_clock_mix(&cfg, seed, 5_000);
+        let again = gen_clock_mix(&cfg, seed, 5_000);
+        assert_eq!(
+            format!("{:?}", (&rates, &faults)),
+            format!("{:?}", (&again.0, &again.1)),
+            "seed {seed}: the mix is not a function of the seed"
+        );
+        assert_eq!(rates.len(), cfg.nodes as usize);
+        for (_, ppm) in &rates {
+            assert!(ppm.abs() <= 1_000, "seed {seed}: a rate of {ppm} ppm");
+            nonzero_rates += usize::from(*ppm != 0);
+        }
+        let mut stepped = std::collections::BTreeMap::<u64, i64>::new();
+        for f in &faults {
+            assert!((500..5_000).contains(&f.at_ms), "seed {seed}: {f:?}");
+            match f.kind {
+                FaultKind::ClockStep {
+                    who: StepOf::Node(n),
+                    ms,
+                } => {
+                    assert!(ms != 0 && ms.abs() <= 150, "seed {seed}: a step of {ms} ms");
+                    *stepped.entry(n).or_default() += ms;
+                    steps += 1;
+                }
+                FaultKind::Suspend { ms, .. } => {
+                    assert!((300..=3_000).contains(&ms), "seed {seed}: suspend {ms}");
+                    suspends += 1;
+                }
+                FaultKind::RebootNode {
+                    node,
+                    restart_ms,
+                    step_ms,
+                } => {
+                    assert!((1..=cfg.nodes).contains(&node), "seed {seed}: node {node}");
+                    assert!((300..=3_000).contains(&restart_ms));
+                    *stepped.entry(node).or_default() += step_ms;
+                    reboots += 1;
+                }
+                ref other => panic!("seed {seed}: a fault outside the mix: {other:?}"),
+            }
+        }
+        for (n, sum) in stepped {
+            assert!(sum.abs() <= 200, "seed {seed}: node {n} stepped {sum} ms");
+        }
+    }
+    assert!(
+        steps > 100 && suspends > 100 && reboots > 100 && nonzero_rates > 1_000,
+        "a thin mix: {steps} steps, {suspends} suspends, {reboots} reboots, {nonzero_rates} rates"
+    );
+    // One node: no suspend (nothing to catch up with). No budget: no rate.
+    let one = SimConfig {
+        nodes: 1,
+        ..SimConfig::default()
+    };
+    assert!((0..200u64).all(|s| !gen_clock_mix(&one, s, 5_000)
+        .1
+        .iter()
+        .any(|f| matches!(f.kind, FaultKind::Suspend { .. }))));
+    let none = SimConfig {
+        rate_budget_ppm: 0,
+        ..SimConfig::default()
+    };
+    assert!((0..50u64).all(|s| gen_clock_mix(&none, s, 5_000).0.is_empty()));
+    // Delegated directories: no reboot (a restart wedges the run, whatever the
+    // clocks: the mix does not stand for that bug), and the same draws
+    // otherwise.
+    let delegating = SimConfig {
+        dirs: vec!["d1".into(), "d2".into()],
+        ..SimConfig::default()
+    };
+    for seed in 0..200u64 {
+        let (r0, f0) = gen_clock_mix(&cfg, seed, 5_000);
+        let (r1, f1) = gen_clock_mix(&delegating, seed, 5_000);
+        assert_eq!(r0, r1);
+        assert!(!f1
+            .iter()
+            .any(|f| matches!(f.kind, FaultKind::RebootNode { .. })));
+        let not_reboot = |f: &&ScheduledFault| !matches!(f.kind, FaultKind::RebootNode { .. });
+        assert_eq!(
+            format!("{:?}", f0.iter().filter(not_reboot).collect::<Vec<_>>()),
+            format!("{:?}", f1.iter().collect::<Vec<_>>())
+        );
+    }
+    // Opt-outs and explicit injections: nothing drawn.
+    let step = ScheduledFault {
+        at_ms: 1_000,
+        kind: FaultKind::ClockStep {
+            who: StepOf::Holder,
+            ms: 100,
+        },
+    };
+    for cfg in [
+        SimConfig {
+            clock_faults: false,
+            ..SimConfig::default()
+        },
+        SimConfig {
+            faults: vec![step],
+            ..SimConfig::default()
+        },
+        SimConfig {
+            node_rates: vec![(1, 500)],
+            ..SimConfig::default()
+        },
+        SimConfig {
+            clock_skew_ms: 100,
+            ..SimConfig::default()
+        },
+        SimConfig {
+            clock_offsets: vec![(2, 4_000)],
+            ..SimConfig::default()
+        },
+    ] {
+        let (rates, faults) = gen_clock_mix(&cfg, 7, 5_000);
+        assert!(rates.is_empty() && faults.is_empty());
+    }
+}
+
 /// Plan 43 C7a: the simulated clock model. A rate moves a node's boot, raw
 /// and monotonic clocks and not its wall (here with no budget, which reads
 /// the oscillator as it is). A node at +50 000 ppm for a second reads
@@ -2968,6 +3142,7 @@ fn pre_s3_streaming_installs_and_retires() {
 /// round opened, and a round that never ran dry let the lease lapse).
 #[test]
 fn slow_s3_never_seals_a_live_holder() {
+    use pinned::run_m9;
     let cfg = SimConfig {
         s3_latency: (400, 600),
         clients_per_node: 3,
@@ -3109,6 +3284,13 @@ fn backup_lag_keeps_its_backup_config() -> SimConfig {
         },
     };
     SimConfig {
+        // Plan 43 C7a (commit 6): no default clock-fault mix. A lag must not
+        // cost the holder its backup: a reboot or suspend of a node is a
+        // legitimate drop. And the unbudgeted clock: the lags sit within a few
+        // ms of the drop threshold, and the budget's timer stretch (seed 12
+        // at 1 000 ppm) moves one of them across it.
+        clock_faults: false,
+        rate_budget_ppm: 0,
         faults: vec![
             lag(1_200, sim::run::LagOf::Backup, (300, 1_000)),
             lag(4_500, sim::run::LagOf::Holder, (1_000, 2_500)),
@@ -3121,6 +3303,7 @@ fn backup_lag_keeps_its_backup_config() -> SimConfig {
 
 #[test]
 fn lag_does_not_cost_the_holder_its_backup() {
+    use pinned::run_seed;
     let mut dropped = Vec::new();
     let mut added = 0;
     for seed in 0..120u64 {
@@ -3174,6 +3357,14 @@ fn runtime_lag_faults(other: sim::run::LagOf) -> Vec<ScheduledFault> {
 /// before that fallback: it waited a window past the lapse's end).
 fn backup_lag_at_expiry_config(beats_lost: bool) -> SimConfig {
     SimConfig {
+        // Plan 43 C7a (commit 6): the default clock-fault mix runs here. The
+        // backup suspended or rebooted while its holder is cut from S3 (seeds
+        // 5, 275 and 277 the mix found) is a second failure, beyond one
+        // backup's budget: the run records it (`Cluster::note_s3_cut`,
+        // f27d3d1) and waives strict durability only;
+        // `a_backup_paused_while_its_holder_is_cut_from_s3_is_beyond_the_budget`
+        // pins it, and plan 43 C1 (the TTL path's tail, `SealTail`) makes
+        // those seeds pass strictly.
         clients_per_node: 2,
         ops_per_client: 30,
         random_faults: 0,
@@ -3212,6 +3403,7 @@ fn backup_lag_at_expiry_config(beats_lost: bool) -> SimConfig {
 /// took it, nothing but the appends named the expiry (they carry it).
 #[test]
 fn a_backup_lapsing_at_its_holders_expiry_still_claims_in_time() {
+    use pinned::{run_m9, run_seed};
     let configs = |label: &str| match label {
         "backup-lag-at-expiry" => backup_lag_at_expiry_config(false),
         "backup-lag-at-expiry-timers-first" => timers_first(backup_lag_at_expiry_config(false)),
@@ -3277,6 +3469,7 @@ fn a_backup_lapsing_at_its_holders_expiry_still_claims_in_time() {
 /// then these seeds must pass strictly.)
 #[test]
 fn a_backup_paused_while_its_holder_is_cut_from_s3_is_beyond_the_budget() {
+    use pinned::run_seed;
     let configs = |label: &str| match label {
         "backup-lag-at-expiry" => backup_lag_at_expiry_config(false),
         "backup-lag-at-expiry-timers-first" => timers_first(backup_lag_at_expiry_config(false)),
@@ -3356,6 +3549,8 @@ fn backup_lag_in_margin_config() -> SimConfig {
         },
     };
     SimConfig {
+        // (No default clock-fault mix: `live_holder`, inherited, allows no
+        // seal, and a suspended or rebooted holder is rightly sealed.)
         beats_lost_in_lag: true,
         faults: vec![
             lag(6_000, sim::run::LagOf::Holder, (2_300, 2_600)),
@@ -3384,6 +3579,7 @@ fn backup_lag_in_margin_cut_config() -> SimConfig {
 /// (`backup-lag-in-margin-unaware`: the non-vacuity half).
 #[test]
 fn a_backup_frozen_with_its_holders_lease_at_the_margin_does_not_seal_it() {
+    use pinned::{run_m9, run_seed};
     let t = run_m9(
         "backup-lag-in-margin",
         backup_lag_in_margin_config(),
@@ -4300,6 +4496,7 @@ fn holder_cut_crash_config(decline: bool) -> SimConfig {
 /// return — the stuck peer, reproduced (non-vacuity).
 #[test]
 fn a_holder_alone_cut_from_s3_forms_no_epoch_and_fails_over() {
+    use pinned::run_seed;
     let restart = 9_000;
     let mut epochs = 0;
     let mut failovers = Vec::new();
@@ -4357,6 +4554,7 @@ fn delegated_holder_cut_config() -> SimConfig {
 
 #[test]
 fn a_delegating_root_cut_from_s3_forms_no_epoch_and_fails_over() {
+    use pinned::run_seed;
     // The successor waits its predecessor's delegations out for the whole
     // floor (plan 43 C7-H2: the takeover window, the read-delegation TTL,
     // the write delegations' reclaim horizon and two margins, from its
@@ -4702,6 +4900,12 @@ fn sweep_config() {
                 .map(|(_, p)| p.unsigned_abs() as u32)
                 .max()
                 .unwrap_or(0);
+        }
+        // Plan 43 C7a (commit 6): `AUTHORITY_SIM_CLOCK_FAULTS=0` leaves the
+        // default clock-fault mix out of any configuration (with
+        // `AUTHORITY_SIM_BUDGET=0` the runs read as before the commit).
+        if std::env::var("AUTHORITY_SIM_CLOCK_FAULTS").is_ok_and(|v| v == "0") {
+            c.clock_faults = false;
         }
         if let Some(b) = std::env::var("AUTHORITY_SIM_BUDGET")
             .ok()
@@ -5461,6 +5665,10 @@ fn delegated_core_stall_config() -> SimConfig {
         kind: FaultKind::StallStep { node, for_ms },
     };
     SimConfig {
+        // Plan 43 C7a (commit 6): no default clock-fault mix. A stalled, frozen
+        // or hung delegate: the scenarios assert exact counts of what the root
+        // reclaims and what lapses.
+        clock_faults: false,
         clients_per_node: 1,
         ops_per_client: 60,
         cross_ratio: 0.0,
@@ -5745,7 +5953,7 @@ fn core_stall_check(label: &str, r: &Report) -> Result<(), String> {
 }
 
 fn run_core_stall(label: &str, config: fn() -> SimConfig, seed: u64) -> Report {
-    let r = run_seed(seed, config()).unwrap_or_else(|e| {
+    let r = run_seed(seed, unclocked(config())).unwrap_or_else(|e| {
         panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
     });
     core_stall_check(label, &r).unwrap_or_else(|e| {
@@ -5756,6 +5964,7 @@ fn run_core_stall(label: &str, config: fn() -> SimConfig, seed: u64) -> Report {
 
 #[test]
 fn a_delegate_stuck_in_a_step_keeps_its_grant() {
+    use pinned::run_seed;
     let seeds = 24u64;
     let (mut lane, mut unlaned) = (0, (0, 0));
     for seed in 0..seeds {
@@ -6084,6 +6293,7 @@ fn delegated_root_loss_hands_the_writes_to_a_ttl_successor() {
 /// ops that reached the root while it was down still recall it).
 #[test]
 fn delegated_delegate_restart_readopts_its_generation() {
+    use pinned::run_m11;
     let t = run_m11(
         "delegated-delegate-restart",
         delegated_delegate_restart_config(),
@@ -6156,6 +6366,7 @@ fn delegated_delegate_crash_drains_the_backup() {
 /// them are refused; the isolated designee keeps writing.
 #[test]
 fn delegated_designation_is_never_reclaimed() {
+    use pinned::run_m11;
     let t = run_m11(
         "delegated-designated",
         delegated_designated_config(),
@@ -7488,6 +7699,7 @@ fn locks_blips_tight_delegated_config() -> SimConfig {
 ///   capped ttl; it is now asked for again.
 #[test]
 fn delegate_fenced_io_seeds_keep_their_grants() {
+    use pinned::run_seed;
     let cases: [(&str, &[u64]); 2] = [
         (
             "locks-blips-tight-delegated",
@@ -8261,7 +8473,7 @@ fn capped_grants_hand_a_lock_over_within_a_round_trip() {
             true,
         ),
     ] {
-        let (per_seed, totals) = run_lock_seeds(label, cfg, seeds, &sums);
+        let (per_seed, totals) = run_lock_seeds(label, unclocked(cfg), seeds, &sums);
         for s in &per_seed {
             assert!(
                 s.max_gap_ms <= 6_000,
@@ -8452,6 +8664,7 @@ fn a_second_seal_inside_the_grace_waits_out_the_first_holders_grants() {
 /// (56 of 0..2000).
 #[test]
 fn a_sealer_of_a_reclaimed_lease_waits_out_the_grants_that_lease_waited_out() {
+    use pinned::run_m14;
     let t = run_m14(
         "locks-restart-reclaim-seal",
         locks_restart_reclaim_seal_config(),
@@ -8469,6 +8682,7 @@ fn a_sealer_of_a_reclaimed_lease_waits_out_the_grants_that_lease_waited_out() {
 /// each of the two seals arms one (two floors a seed).
 #[test]
 fn a_second_seal_after_the_grace_arms_no_second_floor() {
+    use pinned::run_m14;
     let t = run_m14(
         "double-seal-after-the-grace",
         double_seal_after_the_grace_config(),
@@ -8506,6 +8720,7 @@ fn a_second_seal_after_the_grace_arms_no_second_floor() {
 /// floor window, where the cap ends the floor early.
 #[test]
 fn a_credited_arrival_cap_splits() {
+    use pinned::run_seed;
     for seed in [193_262, 198_196, 198_507] {
         let e = run_seed(seed, fast_takeover_skewed_successor_credited_config())
             .expect_err("a cap counted from the credit never failed: no control");
@@ -8645,6 +8860,7 @@ fn a_lock_owner_stepped_forward_does_not_outwait_a_grant_early() {
 /// longer sections. No mutual-exclusion violation, whatever the park did.
 #[test]
 fn a_lapsed_locker_resumes_when_the_owner_admits_a_late_renewal() {
+    use pinned::run_seed;
     for (label, config) in [
         (
             "locks-s3-cut-holder-alive",
@@ -8701,6 +8917,7 @@ fn a_lapsed_locker_resumes_when_the_owner_admits_a_late_renewal() {
 /// exclusion — in 8 of the first 500 seeds, which are pinned.
 #[test]
 fn a_late_renewal_against_a_stale_mirror_is_refused_and_the_naive_successor_violates() {
+    use pinned::run_seed;
     for seed in [34u64, 51, 106, 163, 203, 318, 336, 363] {
         run_seed(seed, locks_late_stale_mirror_config())
             .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
@@ -8948,6 +9165,7 @@ fn a_credited_arrival_cap_splits_on_the_strict_side() {
 /// bound (`ack_floor_capped` does not exist).
 #[test]
 fn an_s3_cut_holder_that_beats_on_costs_its_successor_about_a_margin() {
+    use pinned::run_seed;
     let mut t = M14Totals::default();
     let mut floors = Vec::new();
     let mut capped = 0;
@@ -8984,6 +9202,7 @@ fn an_s3_cut_holder_that_beats_on_costs_its_successor_about_a_margin() {
 /// lock is refused for want of a sequencer.
 #[test]
 fn locks_survive_s3_blips() {
+    use pinned::run_seed;
     let mut epochs = 0;
     let mut t = M14Totals::default();
     for seed in 99_000..99_060 {
@@ -9165,6 +9384,7 @@ fn locks_blips_tight_in_doubt_seed_1383_an_overtaken_release_keeps_exclusion() {
 /// t=2.5 s does). Each seed must meet an open epoch.
 #[test]
 fn locks_blips_tight_an_open_epoch_is_not_formed_over() {
+    use pinned::run_seed;
     for seed in [200, 8398] {
         let report = run_seed(seed, locks_blips_tight_config()).unwrap_or_else(|e| {
             panic!(
@@ -9312,6 +9532,7 @@ fn locks_under_random_faults() {
 /// (`strict_lock_turns`), mutual exclusion holds.
 #[test]
 fn locks_writer_hold_refuses_the_held_write() {
+    use pinned::run_m14;
     let t = run_m14(
         "locks-writer-hold",
         locks_writer_hold_config(),
@@ -9356,6 +9577,7 @@ fn locks_writer_hold_delegated_settles_before_the_head() {
 /// on the parent in 0..2000 and here only 1282 does, so 1282 joins the list.
 #[test]
 fn locks_writer_hold_delegated_without_the_settle_is_caught() {
+    use pinned::run_seed;
     let seeds = [745, 1081, 1282, 2045, 2369];
     let mut caught = 0;
     for seed in seeds {
@@ -9509,6 +9731,14 @@ fn locks_unlinked_hcrash_config(backup: bool) -> SimConfig {
 fn locks_unlinked_dcrash_config(backup: bool) -> SimConfig {
     let base = locks_unlinked_delegated_config();
     SimConfig {
+        // Plan 43 C7a (commit 6): no default clock-fault mix with delegate
+        // backups. A pause or suspend of the root before the delegate's crash
+        // leaves node 3 a local speculative row that never settles (seed 2383 of
+        // `locks-unlinked-delegated-dcrash`: quiescence not reached; a plain
+        // Pause of the root reproduces it, for 1 308 + 2, 8, 13 or 21 ms), a
+        // latent bug the mix found and the clocks do not cause (PROGRESS, C7a
+        // commit 6).
+        clock_faults: !backup,
         core: if backup {
             std::sync::Arc::new(sim::run::deleg_backup_core_config)
         } else {
@@ -9763,6 +9993,7 @@ fn regression_locks_unlinked_delegated_dcrash_pause_seed_558() {
 /// path here, and the test asserts that some seed does.
 #[test]
 fn regression_locks_unlinked_delegated_partition_late_recall_answer() {
+    use pinned::run_seed;
     let mut late = 0;
     for seed in [7_455, 1_144, 1_682, 1_945] {
         let report = run_seed(seed, locks_unlinked_partition_config()).unwrap_or_else(|e| {
@@ -10523,6 +10754,7 @@ fn backup_two_config_runs() {
 /// `long-delegated-late-answers` that were fixed on main (9287, 2945).
 #[test]
 fn c0_the_real_rebuild_recovers_a_deposed_root() {
+    use pinned::c0_run;
     let cfg = long_delegated_late_answers_config;
     for seed in REBUILD_SEEDS {
         let real = c0_run("long-delegated-late-answers", seed, cfg());
@@ -10615,6 +10847,7 @@ fn c0_i1_finds_lone_answers_to_remote_requesters() {
 /// tail lacks the row); none with them.
 #[test]
 fn a_reconfig_in_doubt_acknowledges_nothing_its_listed_candidate_lacks() {
+    use pinned::c0_run;
     let mut sealed = 0usize;
     for seed in 0..20 {
         let r = c0_run(
@@ -10639,6 +10872,7 @@ fn a_reconfig_in_doubt_acknowledges_nothing_its_listed_candidate_lacks() {
 /// requester's retry, or a successor's replay of stranded delegate rows.
 #[test]
 fn c0_i2_finds_a_rid_queued_twice() {
+    use pinned::{c0_run, run_seed};
     for (label, cfg, seeds) in [
         ("backup-crash", backup_crash_config(), I2_BACKUP_CRASH),
         (
@@ -10681,6 +10915,7 @@ fn c0_i2c_finds_a_re_shipped_tail() {
 /// I4: an op answered in doubt lands after an op its node invoked later.
 #[test]
 fn c0_i4_finds_a_late_landing() {
+    use pinned::{c0_run, run_seed};
     for &(label, cfg, seeds) in I4_SEEDS {
         for &seed in seeds {
             let r = c0_run(label, seed, cfg());
@@ -10703,6 +10938,7 @@ fn c0_i4_finds_a_late_landing() {
 /// answer was not Lone.
 #[test]
 fn c0_i5_finds_a_non_lone_rollback() {
+    use pinned::{c0_run, run_seed};
     for &seed in I5_BACKUP {
         let r = c0_run("backup", seed, backup_config());
         assert!(

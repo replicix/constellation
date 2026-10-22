@@ -317,11 +317,25 @@ pub struct SimConfig {
     /// predecessor by more than the lease it takes over has left.
     pub clock_offsets: Vec<(NodeId, i64)>,
     /// Plan 43 C7a: the bound on every node's oscillator rate error that its
-    /// protocol clock budgets, ppm (`Config::clock_rate_budget_ppm`). 0 until
-    /// the readings use it (C7a's second commit); the rate configurations
-    /// set the budget they will be fixed with, and fail on the tree where
-    /// it is not read.
+    /// protocol clock budgets, ppm (`Config::clock_rate_budget_ppm`): the
+    /// production default, 1 000. The rate configurations set the budget they
+    /// are fixed with (and fail on a tree that does not read it); 0 is the
+    /// unbudgeted clock of before C7a.
     pub rate_budget_ppm: u32,
+    /// Plan 43 C7a (commit 6, D7): the default clock-fault mix, drawn from
+    /// the seed on a stream of its own (so the existing draws of a seed do
+    /// not move): per node a constant oscillator rate within
+    /// `min(rate_budget_ppm, 1000)`, 0 to 2 wall steps (each at most 150 ms,
+    /// at most 200 ms in sum per node: the cross-node compares take `M/2`
+    /// until C7b), at most one suspend of 0.3 to 3 s (several nodes only) and
+    /// at most one reboot of a node (restart in 0.3 to 3 s on a new boot,
+    /// its wall stepped within the same bound meanwhile; none where
+    /// directories are delegated (`dirs`), which a node's restart wedges: a
+    /// liveness bug the mix found and does not stand for). A configuration
+    /// that injects clock faults, skew, offsets or rates of its own, or sets
+    /// `live_holder` (no seal allowed), is left as it is, whatever this says;
+    /// one that asserts exact timing sets `false`.
+    pub clock_faults: bool,
     /// Plan 43 C7a: `(node, ppm)`: that node's oscillator runs at
     /// `1 + ppm/1e6` of true time from the start (its wall does not).
     pub node_rates: Vec<(NodeId, i64)>,
@@ -727,7 +741,8 @@ impl Default for SimConfig {
             strict: false,
             clock_skew_ms: 0,
             clock_offsets: Vec::new(),
-            rate_budget_ppm: 0,
+            rate_budget_ppm: 1_000,
+            clock_faults: true,
             node_rates: Vec::new(),
             wall_follows_rate: false,
             strict_durability: false,
@@ -1882,6 +1897,108 @@ fn gen_faults(rng: &mut StdRng, cfg: &SimConfig, horizon_ms: u64) -> Vec<Schedul
     out
 }
 
+/// Whether a configuration injects clock faults, skew, offsets or rates of
+/// its own, or allows no seal at all (`live_holder`: a rebooted or suspended
+/// holder is silent and is rightly sealed): the default mix leaves it alone.
+fn injects_clock_faults(cfg: &SimConfig) -> bool {
+    cfg.live_holder
+        || !cfg.node_rates.is_empty()
+        || cfg.clock_skew_ms != 0
+        || !cfg.clock_offsets.is_empty()
+        || cfg.wall_follows_rate
+        || cfg.faults.iter().any(|f| {
+            matches!(
+                f.kind,
+                FaultKind::ClockStep { .. }
+                    | FaultKind::RateSkew { .. }
+                    | FaultKind::Suspend { .. }
+                    | FaultKind::RebootNode { .. }
+                    | FaultKind::CrashHolderStepped { .. }
+                    | FaultKind::PartitionLockerStepped { .. }
+            )
+        })
+}
+
+/// Plan 43 C7a (commit 6): the default clock-fault mix of one run
+/// ([`SimConfig::clock_faults`]): the nodes' constant rates and the timed
+/// faults. Drawn from a stream of its own, seeded from the run's, so the
+/// draws `gen_faults` makes do not move.
+pub fn gen_clock_mix(
+    cfg: &SimConfig,
+    seed: u64,
+    horizon_ms: u64,
+) -> (Vec<(NodeId, i64)>, Vec<ScheduledFault>) {
+    let mut rates = Vec::new();
+    let mut out = Vec::new();
+    if !cfg.clock_faults || cfg.nodes == 0 || injects_clock_faults(cfg) {
+        return (rates, out);
+    }
+    let mut rng = StdRng::seed_from_u64(seed ^ 0xC7A0_C10C);
+    let budget = cfg.rate_budget_ppm.min(1_000) as i64;
+    if budget > 0 {
+        for n in 1..=cfg.nodes {
+            rates.push((n, rng.random_range(-budget..=budget)));
+        }
+    }
+    let at = |rng: &mut StdRng| rng.random_range(500..horizon_ms.max(600));
+    // The steps in force per node, cumulative: |sum| <= 200 ms.
+    let mut stepped: BTreeMap<NodeId, i64> = BTreeMap::new();
+    let mut step = |rng: &mut StdRng, node: NodeId| -> i64 {
+        let cur = stepped.entry(node).or_default();
+        let ms = rng
+            .random_range(-150..=150i64)
+            .clamp(-200 - *cur, 200 - *cur);
+        *cur += ms;
+        ms
+    };
+    for _ in 0..rng.random_range(0..=2) {
+        let node = rng.random_range(1..=cfg.nodes);
+        let ms = step(&mut rng, node);
+        if ms != 0 {
+            out.push(ScheduledFault {
+                at_ms: at(&mut rng),
+                kind: FaultKind::ClockStep {
+                    who: StepOf::Node(node),
+                    ms,
+                },
+            });
+        }
+    }
+    if cfg.nodes > 1 && rng.random_bool(0.5) {
+        let node = rng.random_range(1..=cfg.nodes);
+        out.push(ScheduledFault {
+            at_ms: at(&mut rng),
+            kind: FaultKind::Suspend {
+                who: StepOf::Node(node),
+                ms: rng.random_range(300..=3_000),
+            },
+        });
+    }
+    // The draw is made whatever the cluster, so that the other draws of a
+    // seed do not depend on it. A node restarting in a delegating cluster
+    // while another is down wedges it (no op answered for 540 s, whatever the
+    // clocks: a plain crash and restart reproduces it, `delegated-holder-cut`
+    // seed 139, `locks-delegated` seed 2400; PROGRESS, plan 43 C7a commit 6),
+    // a liveness bug the mix found and does not stand for: no reboot where
+    // directories are delegated (`dirs`).
+    let reboot = rng.random_bool(0.5);
+    let node = rng.random_range(1..=cfg.nodes);
+    let step_ms = step(&mut rng, node);
+    let restart_ms = rng.random_range(300..=3_000);
+    let at_ms = at(&mut rng);
+    if reboot && cfg.dirs.is_empty() {
+        out.push(ScheduledFault {
+            at_ms,
+            kind: FaultKind::RebootNode {
+                node,
+                restart_ms,
+                step_ms,
+            },
+        });
+    }
+    (rates, out)
+}
+
 async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<Vec<String>>>) {
     tokio::time::sleep(Duration::from_millis(fault.at_ms)).await;
     let note = |s: String| log.lock().unwrap().push(s);
@@ -2860,6 +2977,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let commits: Arc<Mutex<Vec<CommitRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let in_doubt: super::node::InDoubtLog = Arc::new(Mutex::new(Vec::new()));
     let oracles = super::oracle::Oracles::new(bucket.clone());
+    // Plan 43 C7a (commit 6): the default clock-fault mix.
+    let horizon = cfg.ops_per_client * 400 + 2_000;
+    let (mix_rates, mix_faults) = gen_clock_mix(&cfg, seed, horizon);
     let env = NodeEnv {
         bucket: bucket.clone(),
         bus: bus.clone(),
@@ -2873,7 +2993,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         clock_offsets: cfg.clock_offsets.clone(),
         clocks: Mutex::new(HashMap::new()),
         rate_budget_ppm: cfg.rate_budget_ppm,
-        node_rates: cfg.node_rates.clone(),
+        node_rates: cfg.node_rates.iter().copied().chain(mix_rates).collect(),
         wall_follows_rate: cfg.wall_follows_rate,
         seed,
         world: ChunkWorld::new(),
@@ -3041,9 +3161,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         }
     }
     // The faults.
-    let horizon = cfg.ops_per_client * 400 + 2_000;
     let mut faults = cfg.faults.clone();
     faults.extend(gen_faults(&mut rng, &cfg, horizon));
+    faults.extend(mix_faults);
     let mut fault_tasks = Vec::new();
     // Plan 30 §M10: the single-authority sampler.
     let sampler = tokio::spawn(super::epochs::sample_authority(cluster.clone()));

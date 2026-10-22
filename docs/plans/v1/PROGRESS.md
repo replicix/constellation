@@ -56302,3 +56302,155 @@ moves later events by a few units (takeovers 3 806 -> 3 836 in `backup-strict`).
 - Cost of the new writes (`Meta`, 100 rounds of one claim: the mark write, then the
   arming's two durable writes; p50): tmpfs 1 and 3 us, xfs 1.7 and 3.5 ms, ext4 2.7 and 5.3
   ms, btrfs 2.9 and 5.7 ms. A failover that takes 1.5 s pays about 8 ms of fsyncs.
+
+## Plan 43 C7a, commit 6 of 6: the default clock-fault mix, the harness's reboot, the campaign preset
+
+The last commit of C7a: every random simulator run now carries rate, step, suspend
+and reboot faults, the harness can reboot a daemon, and the campaign has a rate
+preset. C7a is done.
+
+### What landed
+
+- **The default mix** (`tests/sim/run.rs`: `SimConfig::clock_faults`, default true;
+  `gen_clock_mix`; `rate_budget_ppm` default 1 000, the production budget). Drawn
+  from a stream of its own (`seed ^ 0xC7A0_C10C`), so the draws of `gen_faults` do
+  not move: per node a constant oscillator rate within `min(budget, 1000)` ppm; 0 to 2
+  `ClockStep`s, each at most 150 ms and at most 200 ms in sum per node (a reboot's
+  step counted; the cross-node compares take `M/2` until C7b); at most one `Suspend`
+  of 0.3 to 3 s (more than one node only); at most one `RebootNode` (back in 0.3 to
+  3 s on a new boot, its wall stepped within the bound meanwhile). A configuration
+  that injects clock faults, skew, offsets or rates of its own (`injects_clock_faults`),
+  or allows no seal (`live_holder`), is left alone. `AUTHORITY_SIM_CLOCK_FAULTS=0`
+  with `AUTHORITY_SIM_BUDGET=0` reads any configuration as before the commit.
+  `the_default_clock_mix_is_bounded_deterministic_and_leaves_explicit_clock_faults_
+  alone` pins the bounds (600 seeds: every kind occurs).
+- **What opts out, and why.** The mix gives no reboot where directories are delegated (`dirs`; below).
+  `clock_faults: false` is set, with its reason in the code, for the configurations that
+  assert an exact scenario: `delegated-core-stall` and its four variants (a stalled,
+  frozen or hung delegate: exact counts of what the root reclaims and what lapses),
+  `backup-lag-keeps-its-backup` (no drop: a reboot or suspend is a legitimate
+  drop; also without the budget, the lags sit within ms of the drop threshold and
+  seed 12 crosses it at 100 to 1 000 ppm and not at 0 or 2 000). The suite's tests
+  that pin what a seed does (an exact timing, a count of seals, lost grants or fenced
+  I/Os, a negative control's failing seed: 29 of the 224) run unclocked
+  (`pinned::run_seed` and the like, `unclocked(cfg)`: no mix and budget 0), as they
+  were written; the budget alone stretches every timer by a few ms and moves 12 of them.
+- **Harness.** The load item `reboot[@node]` (every restart of the daemon is a reboot:
+  a new `CONSTELLATION_FAULT_BOOT_ID`, per node, per harness process), `load::
+  reboot_next(node)` (one restart by hand), the scenario `lock-owner-reboot`
+  (`campaign_load.rs`: the flock'ed counter on three nodes, no backup; the lock owner,
+  which holds the lease, is killed and mounted again, as a process restart in one fresh
+  cluster and as a reboot in another, with an op on its own mount to make it take its
+  lease; the count exact, the errno classes in the documented set, the lease holder
+  afterwards and the longest stand-still of the counter printed for each), and the campaign preset `clock-rate` (`tools/load-campaign/run.py`:
+  `lock-contention-paused-holder`, `git-under-flock-causal`, `delegate-paused-across-ttl`
+  under `clock:rate:1000@a,clock:rate:-1000@b` and `clock:rate:50000@a`, seeds 42 to 44;
+  `lock-owner-reboot` is also in phase 3). The `clock:rate:` item and the status line's
+  `rate_budget_ppm` were commits 1 and 2.
+- **One check of the simulator's relaxed** (`tests/sim/node.rs`, the beat guard's base:
+  floor and quarantines, which must not rise once published): a base that has passed is no
+  longer compared. A reboot loads its restart horizon as a full span, which outlives the
+  grants it stands for; a later quarantine of a re-adopted own lease (same epoch, no new
+  tenure to the check) then read as the rise of a published guard (`locks-blips` seed 1339:
+  the horizon passed at 7.4 s, a re-adoption at 10.3 s set a new quarantine; needs a
+  suspend of another node and a reboot on a new boot id, and no floor is involved). A
+  passed base guards nothing, which is all the check is for.
+- Docs: TESTING (the mix, the opt-outs, the load item, the scenario, the preset), the plan
+  (C7a done, Appendix B rows, §8).
+
+### Found by the mix, and not clock faults
+
+Three things, each reproduced without any clock fault (a plain crash and restart, a plain
+`Pause`) and so not C7a's; the first and the third are open (plan 43 §7 C7a, commit 6), the
+second is explained (`f27d3d1`):
+
+1. **A node restarting in a cluster with delegated directories wedges it.** `delegated-holder-cut` seed 139
+   (holder S3-cut and crashed; node 2 restarted at 2.3 s for 1.2 s): no client op is answered
+   for 540 simulated seconds ("waiting: None"; the log shows the stream falling back to S3 on
+   out-of-order frames for the rest of the run), `locks-unlinked-delegated-hcrash-backup`
+   seed 154, `locks-delegated` seed 2400 (fresh range). A crash and restart of the node with
+   no wall step and no new boot, and a restart delay perturbed by 1 to 55 ms, reproduce it in
+   about 70 % of the perturbations: not a fluke. The mix draws no reboot where directories are delegated
+   until it is fixed.
+2. **A directory real-time-order violation in the lag-at-expiry configurations when a node is
+   paused for seconds** (`backup-lag-at-expiry` 277, `-beats-lost` 5, 275, 277,
+   `backup-lag-in-margin-cut` 277): "rid R1 returned before rid R2 was invoked but follows it in
+   the log". A plain `Pause` of the same node, time and duration reproduces it. Explained since
+   (`f27d3d1`, on main before this commit landed): the paused node is the backup of a holder cut
+   from S3, a second failure beyond one backup's budget; the run now records it and waives strict
+   durability only, and C1 makes those seeds pass strictly. So the lag-at-expiry family (and
+   `backup-lag-in-margin-cut`, built on it) runs the mix: seeds 0..999 with the mix, for
+   `backup-lag-at-expiry`, `-beats-lost` and `backup-lag-in-margin-cut`, 0 failures and 50
+   runs each recorded as beyond the budget (the backup of the cut holder suspended or
+   rebooted). `backup-lag-in-margin` sets `live_holder`, which the mix leaves alone (0..999
+   with the mix forced on: 0 failures).
+3. **A root paused, then a delegate crashed, leaves a speculative row unsettled.**
+   `locks-unlinked-delegated-dcrash` seed 2383 (fresh range): node 1 suspended 1.3 s at
+   1.1 s, the delegate (node 2) crashed at 1.5 s: the cluster does not reach quiescence in
+   90 s (node 3 keeps a local speculative row whose journal row is a refused rid). A plain
+   `Pause` of node 1 for the same time and 1 308 + 2, 8, 13 or 21 ms (and not for +0, 1,
+   3, 5, 34 or more) reproduces it: timing-sensitive, not clock. That configuration with
+   delegate backups opts out.
+4. Controls that the mix breaks on one more seed, as designed:
+   `fast-takeover-skewed-successor-credited` seed 231 and `locks-writer-hold-delegated-
+   unsettled` seed 15 (the credited cap and the unsettled held write are the bugs those
+   controls exist to show; the second needed a `Suspend`, which a `Pause` did not reproduce).
+
+### Tests
+
+- sim: `the_default_clock_mix_is_bounded_deterministic_and_leaves_explicit_clock_faults_
+  alone` (600 seeds: bounds, determinism, every kind occurs, no suspend on one node, no
+  rate with no budget, no reboot where directories are delegated, explicit faults left
+  alone). It has no parent to fail on (the mix is new); its fail-before is the mutant
+  that draws nothing, which fails the "thin mix" check. The suite's 29 pinning tests run
+  unclocked and pass as before.
+- harness: `reboots_parse_and_count_boots` (the item parses and takes no argument; a node's
+  boots count only from a spawn after its first that the item or `reboot_next` makes a
+  reboot; ids are non-zero, 16 hex digits, distinct); the daemon-side hook was commit 3's.
+
+### The sweeps under the mix (`sweep_config`, sim binary of this tree)
+
+The 150 specs of commit 4's identity run, with the mix and the budget on (2 000 seeds
+where cheap, 500 for the delegated and heavy ones, 300 or 100 as before), and a fresh range
+(`AUTHORITY_SIM_START=2000`, 141 of them): **no failure** apart from what fails by design
+or by noise:
+
+- the negative controls, with other counts by trajectory (`locks-writer-hold-unchecked`
+  1 463 -> 1 320 and 1 380, `strict-isolated-reader-skewed-credited` 209 -> 208 and 197,
+  `acks3-runtime-lag-unaware`, `backup-lag-in-margin-unaware`, `backup-runtime-lag-
+  unaware`, `delegated-core-stall-unlaned`, `locks-late-stale-mirror-naive` 94 -> 36 and
+  45) and two more seeds of controls whose bug the mix makes easier to reach
+  (`fast-takeover-skewed-successor-credited` seed 231, `locks-writer-hold-delegated-
+  unsettled` seed 15, which needed a `Suspend`);
+- `locks-holder-step-back-sealed` 1 seed (it injects steps of its own, so the mix is not in
+  it: the run-to-run noise of that configuration, 0 on c3bda7e and 1 on 00d7db5),
+  `fast-takeover-skewed-successor` and its `-thread` variant 0 where c3bda7e had 1
+  (seed 1716 by trajectory).
+
+Before opting out, the mix first failed 23 configurations: the five `delegated-core-*`
+(exact counts), the lag family (the findings above), `backup-lag-keeps-its-backup`, the
+wedges and `locks-blips` (the relaxed check), `locks-unlinked-delegated-dcrash` (the
+third finding). The mix with `AUTHORITY_SIM_CLOCK_FAULTS=0 AUTHORITY_SIM_BUDGET=0` is
+identical to c4's sweeps for the 19 configurations compared (`double-seal-inside-the-
+grace` differs in one seed's fenced count in one of three runs of the same binary: the
+configuration's run-to-run noise).
+
+### Verification (build box, release unless noted, `-j 4`)
+
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `constellation-authority --lib` 546, `--test sim` 224 (+ 12 ignored), meta lib 309, engine
+  lib 823, types 42 + 8, platform 60, control 146, harness 150, the whole model suite
+  (`--test-threads=2`): pass.
+- Harness (release builds of c3bda7e and this tree, seed 42, `CONSTELLATION_HARNESS_VERIFY=1`):
+  `lock-failover` and `backup-failover`, two runs each on both trees: PASSED, 0 locker `EIO`,
+  118 contender refusals, 30 to 32 s and 18 to 20 s a run on both; the same with
+  `clock:rate:+800@a,clock:rate:-800@b` and with `clock:rate:+50000@a`: PASSED, 0 `EIO`.
+  `lock-owner-reboot`: PASSED in six runs (no profile twice, `clock:rate:+800@a,
+  clock:rate:-800@b` twice, `clock:rate:+50000@a`, `reboot@a`): the count exact, one fenced op per variant, the counter standing still up to
+  0.2 s after a process restart and up to 5.1 s after a reboot in the plain run (the lease
+  was held by another node after the restart and by the restarted owner after the reboot,
+  which is why it prints both). One further run under the rate profile failed with its
+  error text lost, while a parallel build filled `/tmp` ("No space left on device"); it did
+  not repeat in five reruns. Not run: pjdfstest, `holder-kill-rejoin`, `upgrade-under-load`,
+  `s3-cut-holder-failover-with-locks`, `delegate-backup-handoff-failover`, the file-system
+  perf matrix (nothing on the read path changed in this commit; commit 4's cost is above).

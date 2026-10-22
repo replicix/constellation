@@ -3574,6 +3574,7 @@ scenario spawns; an item is a preset or `kind[:arg...][@node]`:
 | `clock:<±ms>`, `clock:spread:<ms>` (`clock-skew`) | `CONSTELLATION_FAULT_CLOCK_OFFSET_MS` on the protocol clock (`store_s3::lease::now_unix_ms`, which leases, grants, tokens and the core's `now` read), within ±500 ms |
 | `clock:step:<±ms>:<at_ms>[@node]` | at `<at_ms>` after the daemon spawned, its protocol wall clock steps by `<ms>` (`CONSTELLATION_FAULT_CLOCK_STEP_FILE`, plan 43 C7-H1; the item's `@node` is its last `@`, so the plan's `clock:step:<ms>@<s>` form is not used). Only the wall reading moves (stepping the host clock would move every container's): the honour clock follows a forward step once, a backward one and the wait clock move nothing. The file holds the node's **cumulative** step, written whole by a rename; a daemon polls it every 100 ms on a thread of its own and writes `<file>.applied` once the step is in force, which the harness waits for. Steps are not capped at ±500 ms (constant offsets are), they are kept across a restart of the daemon (armed once per node: the restarted daemon starts stepped and the step is not applied again), and `status.clock` counts them (`steps_forward`, `steps_backward`, `stepped_ms_total`, `last_step_ms`, `honour_ahead_ms`, `wait_behind_ms`). The harness keeps each node's step history; the log checkers read a daemon's `at_ms` with the offset **and the steps in force at the log line's time** removed, and `campaign_load`'s stale-generation watch adds the node's step to its skew term |
 | `clock:rate:<±ppm>[:unbudgeted][@node]` | the daemon's boot, raw and monotonic clocks run at `1 + ppm/1e6` of the host's rate from its start, its wall does not (`CONSTELLATION_FAULT_CLOCK_RATE_PPM`, read once by `platform::clock::protocol()`; plan 43 C7a): an oscillator off by `ppm` under a disciplined wall. Unless `:unbudgeted` the node's rate budget is raised to cover it (`CONSTELLATION_CLOCK_RATE_BUDGET_PPM = max(1000, |ppm|)`: each node budgets its own oscillator); both values are refused from 500 000 ppm, the engine logs them once at start-up. The budget is carried into `Config::clock_rate_budget_ppm` and the clock (C7a): WAIT counts `1/(1+ρ)` of the skewed raw clock and HONOUR `1/(1−ρ)` of it, the timers sleep `ρ` longer, and the beat cap's span is `M/(4ρ)`; `:unbudgeted` is the stress run (the oscillator beyond what the clocks budget). `status.clock.rate_budget_ppm` shows it, and the harness prints it with the step counters |
+| `reboot[@node]` | the daemon's restarts are reboots (plan 43 C7a): every spawn after its first starts on a new boot id (`CONSTELLATION_FAULT_BOOT_ID`, 16 hex digits, distinct per boot and per harness process), so the restart horizons it left (lock grants, read grants, the takeover floor, the promise) are read as the span they were written with, not as time left on the old boot's raw clock; the node's wall step (`clock:step`, cumulative, kept across a restart) is kept across the reboot, so a node under both comes back with its clock stepped. A scenario reboots one restart by hand with `load::reboot_next(node)` before it mounts the daemon again; `lock-owner-reboot` does |
 
 `cpu` and `net` need root (`sudo -n`; the run fails at its start without
 it, and without `tc`/stress-ng for the items that need them). Per-daemon
@@ -3786,6 +3787,9 @@ tools/load-campaign/run.py --out /tmp/load-p3 --phase 3 --seeds 42,43,44
 tools/load-campaign/run.py --out /tmp/load-x --scenario 'lock-*' \
     --profile 'cpu:25@a' --profile dm-delay,hogs --seeds 7
 tools/load-campaign/run.py --summarize /tmp/load-p3
+# plan 43 C7a: the lock scenarios of phase 3 under rate errors (1 000 ppm off
+# in opposite directions on a and b, then a 5 % off and budgeted)
+tools/load-campaign/run.py --out /tmp/load-rate --phase clock-rate
 ```
 
 The runner's own `dm-delay` profile item puts the run's `TMPDIR` (state
@@ -3820,6 +3824,7 @@ The campaign's own scenarios (`harness list`: run by name only, but for
 | `fence-token-at-write` (F1; in the default catalog) | a lone node: a rename under a `flock`ed grant passes its token check, its write is held 10 s (the store-stall hook for that caller only: `caller=<task id>`) while the daemon is frozen past the grant's window; it must not land under the ended grant: `EIO`, or (plan 43 C7-F F-c) `OK` from a fresh token once the node's own late renewal was admitted. The next holder's ref is what the file holds. Failed before F1's fix (the token checked again under the writer lock; there, `OK` with no late renewal behind it) |
 | `lock-contention-paused-holder` | the flock'ed counter on three nodes, the holder frozen across lock-half, lock-lapse ∓ 500 ms and lock-outwait + 500 ms: exact count, an op after the thaw EIO only when fenced, and always EIO when the freeze outlasted the window the holder honours (lock-lapse and past) or the owner outwaited the grant; a failed `fsync` is the application's error (EIO there is the fence) |
 | `lock-contention-stalled-owner` | the counter while the owner's store stalls 5/12/20 s (`CONSTELLATION_HARNESS_STALLS_MS`): exact count, token order (checks and landed writes), errno classes |
+| `lock-owner-reboot` | the counter on three nodes with no backup; the lock owner (the lease holder) killed and mounted again (an op on its own mount makes it take its lease), as a process restart in one fresh cluster and as a reboot (a new boot id) in another: the count exact, the errno classes in the documented set, the lease holder afterwards and the longest time the counter stood still within 45 s of the kill printed for each (a rebooted owner cannot subtract the time since its last horizon write: it waits the span the horizon was written with) |
 | `delegate-paused-across-ttl` | the delegate frozen around its grant's lapse and outwait under its writes and a root-side cross-subtree rename: every acknowledged write there, every rid once, the moved file in one place, no generation the root ended live at the delegate afterwards (a late answer installs no stale grant; live means unexpired past the clock-skew margin, in two samples in a row), errors only in doubt past the client deadline (twice the lease TTL) |
 | `acks3-under-load` | an `ack=s3` holder stalling 1-3 s at a time (run under `cpu:25@a`): no fast takeover, nothing acknowledged rolls back (expected to fail until F2b) |
 | `snapsched-leader-paused` | the scheduler's leader frozen for its lease TTL + 2 s: never two leaders, no bucket twice, no orphan snapshot, failed creations only on the frozen node, no writer error |
@@ -4477,8 +4482,8 @@ step_ms }` the same without the new boot, and `CrashSuccessorInFloor
 between its claim and its marker). `SimConfig::rate_budget_ppm` is carried to
 `Config::clock_rate_budget_ppm` and the node's `ProtocolClock`, which scales
 its readings by it (C7a's second commit: WAIT runs slow and HONOUR fast by the
-budget; the beat cap's span is `M/(4ρ)`; budget 0, the default until the sim's
-default mix gets rates, reads exactly as before). A `SetTimer` counts to the
+budget; the beat cap's span is `M/(4ρ)`; budget 0 reads exactly as before; the
+default is the production budget, 1 000 ppm, since C7a's sixth commit). A `SetTimer` counts to the
 node's wait clock reaching the step's reading plus `after_ms`: the sim inverts
 the budget's scaling and the oscillator (`Clock::instant_at_wait`) and checks
 again when the sleep ends, so a timer armed across a suspend fires after the
@@ -4487,6 +4492,33 @@ the sources are the paused clock's whole milliseconds as before, and the
 sweeps do not move (the identity sweeps are in PROGRESS).
 `AUTHORITY_SIM_RATES=1:-250000,2:250000` (and `AUTHORITY_SIM_BUDGET`) set
 the rates of any configuration under `sweep_config`, for tuning one.
+
+**The default clock-fault mix** (plan 43 C7a, commit 6; `SimConfig::
+clock_faults`, `gen_clock_mix`). Every run draws, on a stream of its own seeded
+from the run's (`seed ^ 0xC7A0_C10C`, so the draws `gen_faults` makes do not
+move), a constant oscillator rate per node within `min(rate_budget_ppm,
+1000)`, 0 to 2 wall steps (each at most 150 ms, at most 200 ms in sum per node:
+the cross-node compares take `M/2` until C7b), at most one suspend of 0.3 to 3
+s (a cluster only) and at most one reboot of a node (restart in 0.3 to 3 s on a
+new boot, its wall stepped meanwhile within the same bound; none where
+directories are delegated (`dirs`), where a node's restart wedges the run
+whatever the clocks, a liveness bug the mix found and does not stand for:
+PROGRESS). A configuration
+that injects clock faults, skew, offsets or rates of its own (the C7-H1 and C7a
+configurations above) is left as it is; one that asserts exact timing or no
+seal sets `clock_faults: false` (`delegated-core-stall` and its variants,
+`backup-lag-keeps-its-backup`; `backup-lag-in-margin` is a `live_holder`
+configuration, which the mix leaves alone anyway). The lag-at-expiry family runs
+the mix: a suspend or reboot of a cut holder's backup is a second failure, which
+the run records as beyond the budget (`Cluster::note_s3_cut`),
+and the suite's tests that pin what a seed does run unclocked (`pinned::run_seed`,
+`unclocked`: no mix and no budget). `AUTHORITY_SIM_CLOCK_FAULTS=0` (with
+`AUTHORITY_SIM_BUDGET=0`) reads any configuration as before the commit. The
+test `the_default_clock_mix_is_bounded_deterministic_and_leaves_explicit_clock_
+faults_alone` pins the bounds. A sweep that fails under the mix is read like
+any other: a new failure is a bug, or a compare between nodes that C7b will
+replace (the sim's margin is 500 ms, and a step of 200 ms is a drift of 400
+between two nodes).
 The configurations (`AUTHORITY_SIM_CONFIG=<name>`, `sweep_config`; the
 fail-before counts are in PROGRESS; the ones a later commit fixes are not in
 `long_locks` or the CI tests until it lands, except the controls): rate, fixed

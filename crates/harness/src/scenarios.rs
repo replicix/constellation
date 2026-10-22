@@ -2143,6 +2143,13 @@ pub const CAMPAIGN: &[Scenario] = &[
         run: campaign_load::lock_contention_paused_holder,
     },
     Scenario {
+        name: "lock-owner-reboot",
+        desc: "plan 43 C7a: the flock'ed counter on three nodes (no backup); the lock owner, which holds the lease, is killed and mounted again, as a process restart in one cluster and as a reboot (a new boot id) in another: the count exact, the errno classes, the lease holder afterwards and the longest stand-still of the counter printed for each (a rebooted owner waits the span its horizons were written with)",
+        requires: &[],
+        caps: &[Cap::ClusterLocks],
+        run: campaign_load::lock_owner_reboot,
+    },
+    Scenario {
         name: "lock-contention-stalled-owner",
         desc: "load campaign 5.4 (F1 in the real daemon): the flock'ed counter on three nodes while the owner's store stalls 5/12/20 s: the count exact, the fencing-token order (checks and landed writes), errno classes",
         requires: &[],

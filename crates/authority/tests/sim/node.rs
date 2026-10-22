@@ -1682,7 +1682,13 @@ impl Driver {
                 seen.1 = guard;
             }
             if base != i64::MAX {
-                if seen.2 > 0 && base > seen.2 {
+                // A base that has passed guards nothing any more: a later
+                // quarantine is a new duty, not the rise of a published one
+                // (a reboot loads its restart horizon as a full span, which
+                // outlives the grants it stands for; plan 43 C7a, commit 6:
+                // `locks-blips` seed 1339, the horizon passed at 7.4 s and a
+                // re-adopted own lease at 10.3 s set a new quarantine).
+                if seen.2 > 0 && base > seen.2 && seen.2 > self.clock.wait().0 {
                     self.shared.guard_base_rises.fetch_add(1, Ordering::SeqCst);
                 }
                 seen.2 = base;
