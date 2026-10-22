@@ -1261,6 +1261,21 @@ Decide before the executor starts:
   was considered and declined by the maintainer (about a microsecond per
   positive lookup that misses the kernel cache; not worth the code).
 
+**Decided by the maintainer (2026-10-22)**, on the coder spec's questions:
+
+- **Cookie hash:** the `siphasher` crate (keyed SipHash-1-3); R3a measures
+  a cold scan and records it.
+- **pid-0 plus entries when attrwatch is full:** that entry goes name-only
+  (no attributes); the kernel looks the name up later. No notice per entry.
+- **The fork:** `readdirplus` merges onto `replicix` as pushed; the fork's
+  unpushed `syncfs` work rebases onto it if it lands later.
+- Taken as recommended: `auto` stays the default unless R8's numbers fail;
+  the `CONSTELLATION_READDIR_*` knobs (cookie bits included) are per node;
+  a non-E2E filesystem without `gossip_secret` is refused at mount (§4.9);
+  the listing counters live in a node `readdir` status block with
+  `unlinked_refs` per FUSE mount; R3b reads the Linux NFS client's handling
+  of `NOENT` and stops before R6 if it is worse than `EIO`.
+
 Open, decided by measurement or later:
 
 - **Default `auto` vs `always`** (§4.1): `auto` is proposed. `always` makes
