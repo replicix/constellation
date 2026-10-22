@@ -312,6 +312,42 @@ impl Database {
             .journal_count()
     }
 
+    /// Seals the active journal (whatever its size) and runs one journal
+    /// maintenance pass: every sealed journal that each keyspace has flushed
+    /// past is deleted.
+    ///
+    /// A caller that has just flushed every keyspace (`Meta::close`) is left
+    /// with journals nobody needs: the sealed ones are deleted by the flush
+    /// workers' maintenance pass, but a caller cannot tell when the last
+    /// pass is over, and the active journal is not a candidate until it is
+    /// sealed, while the next open replays it whole.
+    ///
+    /// CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 11).
+    ///
+    /// # Errors
+    ///
+    /// Returns error, if a journal could not be rotated or removed.
+    #[doc(hidden)]
+    pub fn rotate_journal_and_evict(&self) -> crate::Result<()> {
+        crate::journal::rotation::rotate_now(&self.supervisor)?;
+        self.supervisor
+            .journal_manager
+            .write()
+            .expect("lock is poisoned")
+            .maintenance()
+    }
+
+    /// Whether a flush or a journal write failed and poisoned the database:
+    /// the worker that hit it is gone, and the memtables it left sealed are
+    /// never flushed, so a caller waiting for them gives up.
+    ///
+    /// CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 11).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        self.is_poisoned.is_poisoned()
+    }
+
     /// Returns the disk space usage of the journal.
     #[doc(hidden)]
     pub fn journal_disk_space(&self) -> crate::Result<u64> {

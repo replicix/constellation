@@ -1,4 +1,4 @@
-# Vendored fjall 3.1.10: shutdown deadlock fix, fair writer lock, sync outside the journal lock, slow-commit report, version GC outside the version lock, journal rotation without fsyncs under the journal lock, a persist that says when it flushes, a write halt that holds back only its own writer
+# Vendored fjall 3.1.10: shutdown deadlock fix, fair writer lock, sync outside the journal lock, slow-commit report, version GC outside the version lock, journal rotation without fsyncs under the journal lock, a persist that says when it flushes, a write halt that holds back only its own writer, a journal rotation and eviction on demand
 
 This directory is fjall **3.1.10** exactly as published on crates.io
 (checksum `cd201c93…c33f`, upstream commit
@@ -10,7 +10,7 @@ and both texts stay here unchanged.
 
 ## What is changed
 
-There are nine changes, each marked `CONSTELLATION PATCH`:
+There are ten changes, numbered 1-9 and 11 (10 is reserved for plan 41's journal-write change), each marked `CONSTELLATION PATCH`:
 
 1. **`src/db.rs`, `impl Drop for DatabaseInner`**: this is the fix. The
    worker shutdown loop never blocks now.
@@ -50,6 +50,10 @@ There are nine changes, each marked `CONSTELLATION PATCH`:
    commit releases the writer lock before its keyspaces' write stall and
    halt. See
    [Change 9](#change-9-a-write-halt-holds-back-only-its-own-writer).
+11. **`src/db.rs`, `src/tx/single_writer/mod.rs`, `src/journal/rotation.rs`**:
+    `rotate_journal_and_evict()`, which seals the active journal whatever its
+    size and runs one journal maintenance pass, and `is_poisoned()`. See
+    [Change 11](#change-11-a-journal-rotation-and-eviction-on-demand).
 
 The directory is also listed in the workspace `exclude` list. That way it is
 built as a plain dependency, and `cargo clippy --workspace`, `cargo fmt --all`
@@ -503,6 +507,47 @@ commits still halted. The deterministic test is
 flush workers a keyspace with four sealed memtables halts every commit
 into it until the test clears it, and a commit into another keyspace must
 go through meanwhile (before: it waited for as long as the halt lasted).
+
+## Change 11: a journal rotation and eviction on demand
+
+A clean exit should leave nothing for the next open to replay. After every
+keyspace's memtable is flushed (`Meta::close`) two things still keep journal
+bytes alive:
+
+- The **sealed** journals that every keyspace has flushed past are deleted by
+  `JournalManager::maintenance`, which the flush worker runs after each flush
+  (`worker_pool.rs`). A caller that waited for the last flush
+  (`Keyspace::sealed_memtable_count() == 0`) cannot tell when that worker's
+  pass is over.
+- The **active** journal is never a candidate: a journal is evicted only when
+  sealed, which fjall does when a flush finds it over 64 MB
+  (`rotation::rotate_if_full`). Recovery replays the active journal whole,
+  into the memtables, item by item, whether its keyspaces flushed past it or
+  not. So a flushed store with a 60 MB active journal still replays 60 MB
+  (debug build, 20 000 creates: a 4.6 s open).
+
+`Database::rotate_journal_and_evict` (and the same on
+`SingleWriterTxDatabase`) seals the active journal whatever its size
+(`rotation::rotate_now`: `rotate_if_full` without the size check, the same
+steps, syncs outside the journal lock), waits for its sync, and runs one
+maintenance pass on the caller's thread. A journal whose keyspaces all
+flushed past it has no eviction watermark (`build_seqno_map` lists only the
+keyspaces with data in a memtable, sealed or active), so the pass deletes it
+at once. A write that raced the flush, or a flush that failed or was never
+done, keeps its journal, as it must: the watermark is taken under the journal
+writer's lock, which every commit holds while it writes the journal and its
+memtables.
+
+`Database::is_poisoned` says whether a flush (or a journal write) failed. A
+failed flush ends its worker and leaves its memtable sealed for good, so
+`Meta::close` stops waiting for the flushes as soon as it is set, instead of
+holding the exit for its whole timeout.
+
+The tests: `journal::rotation_test::an_eviction_on_demand_keeps_what_a_keyspace_has_not_flushed`
+(a keyspace that did not flush keeps the sealed journal through the call
+and a crash; once it flushed, the next call deletes it), and
+`crates/meta/src/store/close_tests.rs` (writes racing the close, a flush
+that fails, the open and close times).
 
 ## Tests
 

@@ -56,18 +56,28 @@ use std::{
 /// started only after any rotation's syncs, and it still does (a worker
 /// waits here, a commit does not).
 pub fn rotate_if_full(supervisor: &Supervisor) -> crate::Result<()> {
-    rotate(supervisor)?;
+    rotate(supervisor, false)?;
     supervisor.journal.wait_for_sealed()
 }
 
-fn rotate(supervisor: &Supervisor) -> crate::Result<()> {
+/// Rotates the journal whatever its size (the active journal is replayed
+/// whole by the next open, flushed or not), and returns once every sealed
+/// journal is synced.
+///
+/// CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 11).
+pub fn rotate_now(supervisor: &Supervisor) -> crate::Result<()> {
+    rotate(supervisor, true)?;
+    supervisor.journal.wait_for_sealed()
+}
+
+fn rotate(supervisor: &Supervisor, force: bool) -> crate::Result<()> {
     let journal = &supervisor.journal;
     let rotation = journal.lock_rotation();
 
     let next_path = {
         log::trace!("acquiring journal lock to maybe rotate journal");
         let mut journal_writer = journal.get_writer()?;
-        if journal_writer.pos()? <= rotation_threshold(&journal_writer.path) {
+        if !force && journal_writer.pos()? <= rotation_threshold(&journal_writer.path) {
             return Ok(());
         }
         journal_writer.next_path()?

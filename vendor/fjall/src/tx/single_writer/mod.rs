@@ -170,6 +170,18 @@ impl TxDatabase {
         self.inner.write_buffer_size()
     }
 
+    /// [`Database::rotate_journal_and_evict`](crate::Database::rotate_journal_and_evict).
+    ///
+    /// CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 11).
+    ///
+    /// # Errors
+    ///
+    /// Returns error, if a journal could not be rotated or removed.
+    #[doc(hidden)]
+    pub fn rotate_journal_and_evict(&self) -> crate::Result<()> {
+        self.inner.rotate_journal_and_evict()
+    }
+
     /// Returns the number of journal fragments on disk.
     #[must_use]
     pub fn journal_count(&self) -> usize {

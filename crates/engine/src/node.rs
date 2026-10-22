@@ -2314,6 +2314,16 @@ impl Engine {
                 }
             },
         };
+        // The final exit (not a handover: its successor opens this very
+        // state dir, and the handover's window is not the place for a
+        // flush): flush the replica's memtables so the next mount replays
+        // no journal. Whatever the drain left stays in the replica either
+        // way, and a failed flush only costs the next open its replay.
+        if withdraw_holds {
+            if let Err(error) = self.meta.close() {
+                tracing::warn!(%error, "flushing the replica at shutdown failed; the next mount replays its journals");
+            }
+        }
         result
     }
 
@@ -3062,6 +3072,10 @@ mod tests {
         assert!(engine.close_view(&whole), "the last view closed");
         engine.shutdown().expect("a clean shutdown");
         assert!(engine.is_shutting_down());
+        assert!(
+            engine.meta.is_closed(),
+            "the clean shutdown flushes the replica (`Meta::close`)"
+        );
         assert!(
             engine
                 .open_view(

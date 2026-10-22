@@ -660,3 +660,61 @@ fn a_damaged_batch_in_a_sealed_journal_ends_the_prefix() -> crate::Result<()> {
     );
     Ok(())
 }
+
+/// The `.jnl` files in `folder`.
+fn journal_files(folder: &Path) -> std::io::Result<usize> {
+    let mut n = 0;
+    for entry in std::fs::read_dir(folder)? {
+        if entry?.path().extension().is_some_and(|e| e == "jnl") {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// CONSTELLATION PATCH (change 11): `rotate_journal_and_evict` seals the
+/// active journal and deletes only what every keyspace has flushed past. A
+/// keyspace whose memtable still holds writes (a flush that failed, timed
+/// out, or was never asked for) keeps the journal, and a crash then
+/// replays it; once that keyspace has flushed too, the next call deletes it.
+#[test]
+fn an_eviction_on_demand_keeps_what_a_keyspace_has_not_flushed() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let folder = dir.path().join("db");
+    {
+        let db = Database::builder(&folder).worker_threads(2).open()?;
+        let flushed = db.keyspace("flushed", KeyspaceCreateOptions::default)?;
+        let pending = db.keyspace("pending", KeyspaceCreateOptions::default)?;
+        for i in 0..100 {
+            flushed.insert(key(i), b"f")?;
+            pending.insert(key(i), b"p")?;
+        }
+        flushed.rotate_memtable_and_wait()?;
+        db.rotate_journal_and_evict()?;
+        assert_eq!(
+            db.journal_count(),
+            2,
+            "the sealed journal stays for `pending`"
+        );
+        assert_eq!(journal_files(&folder)?, 2);
+        // A crash: nothing more is flushed.
+    }
+    let db = Database::builder(&folder).worker_threads(2).open()?;
+    let pending = db.keyspace("pending", KeyspaceCreateOptions::default)?;
+    for i in 0..100 {
+        assert_eq!(
+            pending.get(key(i))?.as_deref(),
+            Some(&b"p"[..]),
+            "write {i} lost"
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while pending.sealed_memtable_count() > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    pending.rotate_memtable_and_wait()?;
+    db.rotate_journal_and_evict()?;
+    assert_eq!(db.journal_count(), 1, "every keyspace flushed past it");
+    assert_eq!(journal_files(&folder)?, 1);
+    Ok(())
+}

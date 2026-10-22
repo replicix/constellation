@@ -104,6 +104,8 @@ pub mod horizon;
 pub use gate::{
     fault_caller_scope, gate_totals, priority_writes, FaultCallerScope, GateTotals, PriorityStats,
 };
+#[cfg(test)]
+mod close_tests;
 pub mod held;
 pub mod inbox;
 pub(crate) mod journal;
@@ -688,7 +690,24 @@ pub struct Meta {
     sync_group: sync_group::SyncGroup,
     #[allow(dead_code)]
     path: Option<PathBuf>,
+    /// [`Meta::close`] has run, or the open has not finished: `Drop` does
+    /// not flush. An open that refuses the store (another format, a failed
+    /// check) leaves it as it found it, its journals included.
+    closed: AtomicBool,
 }
+
+/// The most journal bytes fjall keeps before it asks the keyspaces that
+/// lag behind the oldest journal to flush (fjall's default is 512 MiB, its
+/// minimum 64 MiB). `journal`, `journal_tx` and the like grow slowly, never
+/// reach their memtable size and keep every sealed journal alive, so this
+/// bound is also what a crash's reopen replays (about 13 s for 493 MB):
+/// 128 MiB asks them every second rotation instead of every eighth.
+const MAX_JOURNALING_SIZE: u64 = 128 * 1024 * 1024;
+
+/// How long [`Meta::close`] waits for the flushes it asked for. A flush
+/// that fails (a full disk) never finishes, and a close must not hang on it:
+/// the journals stay, and the next open replays them.
+const CLOSE_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// [`Meta::vacuum_churn`] leaves a keyspace alone below this many
 /// entries (tombstones included): scanning that many is cheap.
@@ -859,6 +878,101 @@ impl Meta {
         self.syncs.load(Ordering::Relaxed)
     }
 
+    /// Flush every keyspace's memtable and let go of the journals that
+    /// flushed past, then sync: what an orderly shutdown does so the next
+    /// [`Meta::open`] has (almost) no journal to replay.
+    ///
+    /// fjall deletes a sealed journal only once *every* keyspace has
+    /// flushed past it, and `Drop` flushes nothing, so the keyspaces that
+    /// grow slowly (`journal`, `journal_tx`, ...) leave up to
+    /// [`MAX_JOURNALING_SIZE`] of journal behind, which the next open
+    /// replays item by item (13 s for 493 MB after 300 000 creates).
+    /// A crash still leaves them, and the open still replays them
+    /// (`recovery` in the vendored fjall); this only empties them on a
+    /// clean exit.
+    ///
+    /// Safe to call while the store is in use (the daemon's shutdown calls
+    /// it while background threads may still write: what they write after
+    /// stays in the journal, as after any commit), and to call again. The
+    /// first failure is returned, but every step still runs: a flush that
+    /// did not finish within [`CLOSE_FLUSH_TIMEOUT`] leaves its journals
+    /// for the next open. `Drop` calls this when nobody has.
+    pub fn close(&self) -> Result<(), MetaError> {
+        self.closed.store(true, Ordering::Release);
+        let mut first: Option<MetaError> = None;
+        let mut note = |r: Result<(), MetaError>| {
+            if let Err(e) = r {
+                first.get_or_insert(e);
+            }
+        };
+        note(self.flush_all_keyspaces());
+        note(self.db.rotate_journal_and_evict().map_err(MetaError::from));
+        note(
+            self.db
+                .persist(fjall::PersistMode::SyncAll)
+                .map_err(MetaError::from),
+        );
+        first.map_or(Ok(()), Err)
+    }
+
+    /// Seal every non-empty memtable and wait until they are flushed.
+    /// Sealing them all first lets the flush workers run them in parallel.
+    fn flush_all_keyspaces(&self) -> Result<(), MetaError> {
+        let inner = self.db.inner();
+        let mut keyspaces = Vec::new();
+        for name in inner.list_keyspace_names() {
+            keyspaces.push(inner.keyspace(&name, KeyspaceCreateOptions::default)?);
+        }
+        let mut first: Option<MetaError> = None;
+        for keyspace in &keyspaces {
+            if let Err(e) = keyspace.rotate_memtable() {
+                first.get_or_insert(e.into());
+            }
+        }
+        let deadline = std::time::Instant::now() + CLOSE_FLUSH_TIMEOUT;
+        for keyspace in &keyspaces {
+            while keyspace.sealed_memtable_count() > 0 {
+                // A failed flush ends its worker and poisons the database:
+                // nobody flushes what is left sealed, so waiting for it
+                // would only hold the exit for the whole timeout.
+                if inner.is_poisoned() {
+                    tracing::warn!(
+                        keyspace = %keyspace.name(),
+                        "close: a memtable flush failed; its journals stay for the next open"
+                    );
+                    first.get_or_insert(MetaError::Invalid(
+                        "close: a memtable flush failed (the store is poisoned)".into(),
+                    ));
+                    return first.map_or(Ok(()), Err);
+                }
+                if std::time::Instant::now() >= deadline {
+                    tracing::warn!(
+                        keyspace = %keyspace.name(),
+                        "close: a memtable flush did not finish in time; its journals stay for the next open"
+                    );
+                    first.get_or_insert(MetaError::Invalid(
+                        "close: a memtable flush did not finish in time".into(),
+                    ));
+                    return first.map_or(Ok(()), Err);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        first.map_or(Ok(()), Err)
+    }
+
+    /// Whether [`Self::close`] has run (and `Drop` will not run it again).
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// Tests only: drop the store the way a crash leaves it: the journals
+    /// stay as they are, nothing is flushed ([`Meta::close`] is not run).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn drop_without_close_for_tests(self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
     /// [`Self::kv_set`], then [`Self::sync`]: for a value whose loss on
     /// power failure would be a safety problem, not just lost work.
     pub fn kv_set_durable(&self, key: &str, value: &str) -> Result<(), MetaError> {
@@ -871,6 +985,7 @@ impl Meta {
         let db = SingleWriterTxDatabase::builder(path)
             .cache_size(cache_bytes())
             .worker_threads(worker_threads())
+            .max_journaling_size(MAX_JOURNALING_SIZE)
             .open()?;
         Self::init(db, Some(path.to_path_buf()))
     }
@@ -886,6 +1001,7 @@ impl Meta {
         let db = SingleWriterTxDatabase::builder(&dir)
             .cache_size(cache_bytes())
             .worker_threads(worker_threads())
+            .max_journaling_size(MAX_JOURNALING_SIZE)
             .temporary(true)
             .open()?;
         Self::init(db, None)
@@ -972,6 +1088,7 @@ impl Meta {
             syncs: AtomicU64::new(0),
             sync_group: Default::default(),
             path,
+            closed: AtomicBool::new(true),
         };
         meta.check_format()?;
         meta.bootstrap()?;
@@ -996,6 +1113,7 @@ impl Meta {
         // cluster (EC2 campaign 7 B-2).
         let applied_seq = meta.applied_seq().unwrap_or(0);
         meta.session.seed_applied(applied_seq, meta.applied_pos());
+        meta.closed.store(false, Ordering::Release);
         Ok(meta)
     }
 
@@ -1887,8 +2005,14 @@ pub(crate) fn reclaim_ino_counter(
 
 impl Drop for Meta {
     fn drop(&mut self) {
-        // Best effort: an orderly close leaves nothing only in OS buffers.
-        let _ = self.db.persist(fjall::PersistMode::SyncAll);
+        // Best effort: an orderly close leaves nothing only in OS buffers
+        // and flushes the memtables, so the next open replays no journal. A
+        // temporary store is deleted anyway.
+        if !self.closed.load(Ordering::Acquire) && self.path.is_some() {
+            let _ = self.close();
+        } else {
+            let _ = self.db.persist(fjall::PersistMode::SyncAll);
+        }
     }
 }
 
