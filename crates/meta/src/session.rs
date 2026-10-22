@@ -1020,11 +1020,17 @@ impl SessionState {
     /// what the store persists: every generation up to the table's
     /// `max_gen` is held through the log's index of it, and one the
     /// table no longer lists is voided at that cut.
+    ///
+    /// Plan 43 C2: the cut of a generation the table no longer lists is
+    /// the one its `RecallCut` record carried (`void_cut`, persisted when
+    /// the record was applied from the log), else — a generation a `Recall`
+    /// of an older log ended — what the log holds of it (`log_idx`).
     pub fn seed_generations(
         &self,
         max_gen: u64,
         live: &std::collections::BTreeSet<u64>,
         log_idx: &dyn Fn(u64) -> u64,
+        void_cut: &dyn Fn(u64) -> Option<u64>,
     ) {
         let mut g = self.inner.lock().unwrap();
         for gen in 1..=max_gen {
@@ -1034,10 +1040,11 @@ impl SessionState {
                 *cur = idx;
             }
             if !live.contains(&gen) {
+                let cut = void_cut(gen).unwrap_or(idx);
                 g.voided.insert(gen);
-                g.observed.streams.lower(gen, idx);
+                g.observed.streams.lower(gen, cut);
                 let e = g.void_cuts.entry(gen).or_insert(0);
-                *e = (*e).max(idx);
+                *e = (*e).max(cut);
             }
         }
         drop(g);
@@ -1052,6 +1059,21 @@ impl SessionState {
         let mut g = self.inner.lock().unwrap();
         let e = g.void_cuts.entry(gen).or_insert(0);
         *e = (*e).max(cut);
+    }
+
+    /// The cut of voided generation `gen` as this replica knows it (see
+    /// `Inner::void_cuts`): `None` while it is not voided here.
+    pub fn void_cut(&self, gen: u64) -> Option<u64> {
+        let g = self.inner.lock().unwrap();
+        if !g.voided.contains(&gen) {
+            return None;
+        }
+        Some(
+            g.void_cuts
+                .get(&gen)
+                .copied()
+                .unwrap_or_else(|| g.streams.get(&gen).copied().unwrap_or(0)),
+        )
     }
 
     /// Whether generation `gen` is voided here.
@@ -1747,7 +1769,7 @@ mod tests {
             2 => 370,
             _ => 0,
         };
-        s.seed_generations(2, &live, &log_idx);
+        s.seed_generations(2, &live, &log_idx, &|_| None);
         assert!(s.reaches(&floor(1, 816)), "the ended generation is void");
         assert!(s.reaches(&floor(1, 900)), "void past its cut too");
         assert!(
@@ -1760,6 +1782,39 @@ mod tests {
             "the live generation is held through the log's index"
         );
         assert!(!s.reaches(&floor(2, 371)), "and no further");
+    }
+
+    /// Plan 43 C2: the cut of a generation that ended before the restart is
+    /// the one its `RecallCut` record carried (persisted when the record
+    /// was applied), not what the log happens to hold of it — a log
+    /// written before the record has only the latter.
+    #[test]
+    fn a_reopened_session_takes_the_cut_from_the_record_when_it_has_one() {
+        let floor = |g: u64, i: u64| {
+            let mut streams = Streams::NONE;
+            assert!(streams.raise(g, i));
+            Position {
+                seq: 0,
+                pending: None,
+                streams,
+            }
+        };
+        let live = std::collections::BTreeSet::new();
+        let log_idx = |g: u64| if g == 1 { 816 } else { 0 };
+        // The record said the stream was cut at 800; the log holds 816
+        // (rows past the cut that were applied before the record's own
+        // segment) — the record's cut wins.
+        let s = SessionState::default();
+        s.seed_generations(1, &live, &log_idx, &|g| (g == 1).then_some(800));
+        assert_eq!(s.void_cut(1), Some(800));
+        assert!(!s.deps_lost(&floor(1, 800)));
+        assert!(s.deps_lost(&floor(1, 801)));
+        // No record cut (an older log's `Recall`): the log's index, as before.
+        let s = SessionState::default();
+        s.seed_generations(1, &live, &log_idx, &|_| None);
+        assert_eq!(s.void_cut(1), Some(816));
+        assert!(s.deps_lost(&floor(1, 817)));
+        assert_eq!(s.void_cut(2), None, "not voided here");
     }
 
     /// Plan 30 §M9 × §M6 (backup seed 607661, backup-crash-slow 600066):

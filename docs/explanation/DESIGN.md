@@ -669,7 +669,8 @@ delegations over the one log instead, below.)
   `snap_create`, `snap_delete`, `clone`, quota, atime) plus plan 30's
   control records: `Completed { rid }` and `Refused { rid, errno }`
   (exactly-once, below), `InboxAck` (the S3 inbox), `Delegate` and
-  `Recall` (the delegation table), and `TailFollows` (a sealed backup's
+  `RecallCut` (the delegation table; `Recall` in older logs), and
+  `TailFollows` (a sealed backup's
   takeover, §9). The set is an append-only registry, like the manifest
   entry types.
 - **The commit chain** (plan 28,
@@ -806,8 +807,11 @@ lease and one log
 ([ADR-23](DECISIONS.md#adr-23-delegated-sub-sequencers-over-one-log),
 [Delegations](../reference/features/delegations.md)):
 
-- `Delegate { dir, node, gen }` and `Recall { dir, gen }` records keep a
-  replicated delegation table. Delegations never overlap and never nest.
+- `Delegate { dir, node, gen }` and `RecallCut { dir, gen, through }`
+  records keep a replicated delegation table; the end of a generation
+  carries its cut (`through`: the rows the root appended), so every
+  replica reads it from the log and none infers it. Delegations never
+  overlap and never nest.
   A grant lasts `CONSTELLATION_DELEGATION_TTL_MS` (5 s), is renewed by the
   delegate, and is capped by the root lease.
 - **Ownership** is a local ancestor walk: a dentry belongs to the

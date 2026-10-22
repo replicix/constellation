@@ -53,8 +53,10 @@ inside the root's authority, maintained over P2P.
 
 ### The delegation table
 
-`Delegate { dir, node, gen }` and `Recall { dir, gen }` log records
-maintain a replicated delegation table. It is stored in the namespace
+`Delegate { dir, node, gen }` and `RecallCut { dir, gen, through }` log
+records maintain a replicated delegation table (a `Recall { dir, gen }` in
+a log written before the cut was in the record is still read: see
+[The generation's end](#the-generations-end-and-its-cut)). It is stored in the namespace
 (so a bootstrapped replica learns it from the head commit), and every
 node resolves ownership against its own copy.
 
@@ -108,7 +110,15 @@ through the delegate. It then:
 2. acknowledges under its own durability layer: a backup chosen by RTT
    to the delegate, exactly like the root's (see
    [Durability and failover](durability-and-failover.md)), or Layer A
-   when no peer is in budget. The root is never the delegate's backup;
+   when no peer is in budget. The root is never the delegate's backup.
+   An acknowledgement that waits for the log (`ack=s3`, or a backup that
+   lags) counts the log by its index of the generation — the highest row a
+   segment this replica applied carries — never by "the row left this
+   journal", which a strand does too. A row that has left the journal
+   without the log carrying it (a recall's or a takeover's strand, a
+   rebuild) was dropped: its acknowledgement is aborted (`Busy`, the
+   requester retries by rid; `deleg_acks_dropped`), and so is every park
+   for a row past the cut of a generation that ends here;
 3. streams its transactions to the root in index order
    (`DelegateStream`, one batch in flight per generation).
 
@@ -361,14 +371,37 @@ generations:
 3. the root waits for the stream to catch up to `through`, or, if the
    delegate is unreachable, for the grant to expire (if the delegate
    reported a backup, the root first asks the backup to seal);
-4. the root journals `Recall { dir, gen }`, which ends the generation;
-   later stream records of it are refused.
+4. the root journals `RecallCut { dir, gen, through }`, which ends the
+   generation and carries its cut (below); later stream records of it are
+   refused.
 
 The root then executes the op itself. There is no two-phase commit.
 After a cross-subtree op the root delegates the same subtrees again,
 under new generations.
 
-The `Recall` record reaches the other tables later than it ends the
+#### The generation's end and its cut
+
+`through` is the highest stream index of the generation the root had
+appended to its journal before the record (its cursor; further when the
+root held the generation itself, inherited at a takeover, for its own rows
+ship after the record). Every row of the generation past it is void: never
+in the log, never to be acknowledged. Every replica reads the cut from the
+record when it applies it from the log, instead of inferring it from what
+it holds of the generation (a delegate's own head holds its unappended
+rows too, which the record voids): it voids the generation there, lowers
+what it observed of it to the cut, and keeps the cut (`deleg_void_cut`, a
+node-local key written with the record) so that a restart seeds the same
+cut. A root that journaled the record and is deposed before it ships drops
+the kept cut with the stranded row, since the log never carries that
+record. A delegate that applies the record ends the generation here, and the
+acknowledgements it parked for a row past the cut are aborted (`Busy`: the
+requester retries by rid at the generation's new owner); a park at or below
+the cut releases once the log's index of the generation reaches it — the
+archive's, never "the row left this journal", which a recall's strand does
+too. A `Recall { dir, gen }` of an older log has no cut in it: each replica
+infers it from what it holds (as before this change).
+
+The record reaches the other tables later than it ends the
 generation at the root, under an S3 cut only after the cut. Until then
 the recalled delegate answers lock requests and renewals for the subtree
 `NotOwner` naming the root that recalled it, and a node that hears it

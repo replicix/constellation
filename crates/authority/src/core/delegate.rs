@@ -142,6 +142,24 @@ pub(crate) struct GenState {
     pub controls: Vec<OpId>,
 }
 
+/// Plan 43 C2 (D7): where a delegate's stream row stands for the
+/// acknowledgement parked on it (`Core::deleg_stream_state_with`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamState {
+    Committed,
+    Waiting,
+    Dropped,
+}
+
+/// What `complete_ready` reads once for all the parked acknowledgements:
+/// the log's index of each generation and the delegate rows still in the
+/// journal.
+#[derive(Default)]
+pub(crate) struct StreamCache {
+    log_idx: BTreeMap<u64, u64>,
+    pending: Option<Option<std::collections::HashSet<(u64, u64)>>>,
+}
+
 /// An op a delegate holds until its `deps` are here or its grant is
 /// renewed.
 #[derive(Debug, Clone)]
@@ -742,6 +760,10 @@ impl Core {
             return;
         };
         tracing::info!(node = self.me(), dir = d.dir, gen, "delegation ended here");
+        // Plan 43 C2 (D7): what waited for a row past the generation's cut
+        // is never acknowledged (no cut known: every row of it).
+        let through = replica.void_cut(gen).unwrap_or(0);
+        self.deleg_abort_stream_parks_past(now, gen, through, replica, out);
         for t in [d.renew_timer, d.lapse_timer].into_iter().flatten() {
             self.cancel_timer(t, out);
         }
@@ -1242,47 +1264,76 @@ impl Core {
     }
 
     /// Phase 2b: transaction `(gen, idx)` is durable enough to
-    /// acknowledge: on the backup, or in a segment this replica applied.
+    /// acknowledge: on the backup, or in the log (a segment this replica
+    /// applied).
     pub(crate) fn deleg_stream_durable(&self, gen: u64, idx: u64, replica: &dyn Replica) -> bool {
-        self.deleg_stream_durable_with(gen, idx, || replica.delegate_tx_pending(gen, idx))
+        self.deleg_stream_state_with(gen, idx, || replica.log_stream_idx(gen), || true)
+            == StreamState::Committed
     }
 
-    /// [`Self::deleg_stream_durable`] with the journal read cached across
-    /// calls (`pending`, read on first need): `complete_ready` checks every
-    /// parked acknowledgement on every event, and one read of the journal
-    /// heads per check was most of a loaded delegate's core time while its
-    /// backup lagged (`stress-ng-fs-nodes`: 73% of the core thread's
-    /// samples, steps of seconds back to back).
-    pub(crate) fn deleg_stream_durable_cached(
+    /// [`Self::deleg_stream_state_with`] with what it reads cached across
+    /// calls (`cache`): `complete_ready` checks every parked acknowledgement
+    /// on every event, and a read of the store per check was most of a
+    /// loaded delegate's core time while its backup lagged
+    /// (`stress-ng-fs-nodes`: 73% of the core thread's samples, steps of
+    /// seconds back to back).
+    pub(crate) fn deleg_stream_state_cached(
         &self,
         gen: u64,
         idx: u64,
         replica: &dyn Replica,
-        pending: &mut Option<Option<std::collections::HashSet<(u64, u64)>>>,
-    ) -> bool {
-        self.deleg_stream_durable_with(gen, idx, || {
-            pending
-                .get_or_insert_with(|| replica.delegate_txs_pending())
-                .as_ref()
-                .is_none_or(|set| set.contains(&(gen, idx)))
-        })
+        cache: &mut StreamCache,
+    ) -> StreamState {
+        let StreamCache { log_idx, pending } = cache;
+        self.deleg_stream_state_with(
+            gen,
+            idx,
+            || {
+                *log_idx
+                    .entry(gen)
+                    .or_insert_with(|| replica.log_stream_idx(gen))
+            },
+            || {
+                pending
+                    .get_or_insert_with(|| replica.delegate_txs_pending())
+                    .as_ref()
+                    .is_none_or(|set| set.contains(&(gen, idx)))
+            },
+        )
     }
 
-    fn deleg_stream_durable_with(
+    /// Plan 43 C2 (D7): where row `(gen, idx)` of a delegate's stream stands.
+    /// Committed: on the recorded backup, or in the log — counted by the
+    /// log's index of the generation (`log_idx`: the highest row of it a
+    /// segment this replica applied carries), never by "the row left this
+    /// journal". A generation no longer held here, and `ack=s3`, commit only
+    /// through the log. Not committed and still in the journal
+    /// (`pending`): waiting. Not committed and gone from the journal: the
+    /// row was dropped — a recall's or a takeover's strand, a rebuild —
+    /// and what its acknowledgement waited for will never come: the
+    /// acknowledgement is aborted (the requester, or this node's own
+    /// client, retries by rid), not released as if the log carried a write
+    /// it never will.
+    fn deleg_stream_state_with(
         &self,
         gen: u64,
         idx: u64,
+        log_idx: impl FnOnce() -> u64,
         pending: impl FnOnce() -> bool,
-    ) -> bool {
-        let Some(d) = self.dl.mine.get(&gen) else {
-            return true;
+    ) -> StreamState {
+        let committed = match self.dl.mine.get(&gen) {
+            Some(d) if !self.cfg.ack_s3 => match d.backup {
+                None => return StreamState::Committed,
+                Some(_) => d.backup_acked >= idx || idx <= log_idx(),
+            },
+            _ => idx <= log_idx(),
         };
-        if self.cfg.ack_s3 {
-            return !pending();
-        }
-        match d.backup {
-            None => true,
-            Some(_) => d.backup_acked >= idx || !pending(),
+        if committed {
+            StreamState::Committed
+        } else if pending() {
+            StreamState::Waiting
+        } else {
+            StreamState::Dropped
         }
     }
 
@@ -1485,6 +1536,27 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         let ids = self.stream_parks_of(gen);
+        for id in ids {
+            self.abort_park_busy(now, id, replica, out);
+        }
+    }
+
+    /// Plan 43 C2 (D7): generation `gen` ended here with the cut `through`:
+    /// what waited for a row past it will never be in the log (the rows
+    /// past the cut are void: replayed by rid, or dropped), so the
+    /// acknowledgement is not given — the requester, or this node's own
+    /// client, retries by rid at the generation's new owner. Parks of rows
+    /// at or below the cut stay: they release through the archive
+    /// (`deleg_stream_durable`).
+    fn deleg_abort_stream_parks_past(
+        &mut self,
+        now: Now,
+        gen: u64,
+        through: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let ids = self.stream_parks_past(gen, through);
         for id in ids {
             self.abort_park_busy(now, id, replica, out);
         }
@@ -3637,7 +3709,7 @@ impl Core {
         }
     }
 
-    /// End `gen` here and now: the `Recall` record journaled (the table
+    /// End `gen` here and now: the `RecallCut` record journaled (the table
     /// row changes with it), later stream records of it refused, every
     /// parked execution waiting on it released.
     fn end_generation(&mut self, now: Now, gen: u64, replica: &dyn Replica, out: &mut Vec<Action>) {
@@ -3650,34 +3722,34 @@ impl Core {
         let dir = g.dir;
         let cursor = g.cursor;
         let drained = matches!(g.recall, RecallPhase::Drained(_));
-        if let Err(error) = replica.apply_records_journaled(&[LogRecord::Recall { dir, gen }], None)
+        // Plan 43 C2: the generation's end carries its cut: the rows this
+        // root appended (`cursor`) — or, when this root was the
+        // generation's delegate itself (inherited at a takeover), further:
+        // its own rows past the cursor stay in its journal and ship after
+        // the record, so they are not lost. Unless its takeover stranded
+        // them (`strand_for_takeover`, a predecessor's backup tail to
+        // re-apply): then none of them stayed, they are replayed by rid as
+        // root rows, and the cut is the cursor. A cut above it called a
+        // dependency on a stranded row present here while the next root
+        // refused it as lost: the dependent op `Held`, re-sent with the
+        // same deps, forever (`delegated-holder-cut` seed 139 under the
+        // clock mix). Worked out before the record is journaled; every
+        // replica reads it from the record.
+        let own = self.dl.mine.contains_key(&gen) && !replica.delegate_stranded(gen);
+        let through = if own {
+            cursor.max(replica.stream_applied(gen))
+        } else {
+            cursor
+        };
+        if let Err(error) =
+            replica.apply_records_journaled(&[LogRecord::RecallCut { dir, gen, through }], None)
         {
             tracing::warn!(node = self.me(), gen, %error, "could not journal the recall record");
             self.arm_gen_expiry(now.plus(500), gen, out);
             return;
         }
-        replica.void_stream(gen, cursor);
-        // This root was the generation's delegate (inherited at a
-        // takeover): its own rows past the cursor stay in its journal and
-        // ship after the `Recall`, so they are not lost. Unless its
-        // takeover stranded them (`strand_for_takeover`, a predecessor's
-        // backup tail to re-apply): then none of them stayed, they are
-        // replayed by rid as root rows, and the log's cut is the cursor,
-        // as every other replica reads it at the `Recall`. A cut above
-        // it here called a dependency on a stranded row present while
-        // the next root refused it as lost: the dependent op `Held`,
-        // re-sent with the same deps, forever (a delegate that restarted
-        // while the root was down, then took it over as its backup:
-        // `delegated-holder-cut` seed 139 under the clock mix).
-        let own = self.dl.mine.contains_key(&gen) && !replica.delegate_stranded(gen);
-        replica.note_void_cut(
-            gen,
-            if own {
-                cursor.max(replica.stream_applied(gen))
-            } else {
-                cursor
-            },
-        );
+        replica.void_stream(gen, through);
+        replica.note_void_cut(gen, through);
         // What this root holds of the generation's replies (its own
         // forwarded ops' shadows and hints) is stranded like on any
         // other replica applying the `Recall` (long-delegated seed 72780).

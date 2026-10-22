@@ -664,8 +664,9 @@ recovery rule, for every rename across partitions.
 
 **Decision**: keep one root lease in S3 and one log, and let the root
 delegate subtrees to their dominant writers over P2P.
-- `Delegate { dir, node, gen }` and `Recall { dir, gen }` records keep a
-  replicated delegation table. Delegations never overlap, and there is
+- `Delegate { dir, node, gen }` and `RecallCut { dir, gen, through }`
+  records keep a replicated delegation table (the end of a generation
+  carries its cut: plan 43 C2). Delegations never overlap, and there is
   no sub-delegation. A grant lasts `CONSTELLATION_DELEGATION_TTL_MS`
   (5 s), is renewed by the delegate, and is capped by the root's lease.
 - A dentry belongs to the delegation containing its parent; an inode's

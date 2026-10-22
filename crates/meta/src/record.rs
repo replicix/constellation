@@ -240,6 +240,10 @@ pub enum LogRecord {
     /// is void: a delegate that still holds such records rolls them back
     /// and replays them by rid, and a requester's observation of them is
     /// void (M6's rule for a tenure that ended without shipping).
+    ///
+    /// Plan 43 C2: no longer written (see [`LogRecord::RecallCut`], which
+    /// carries the cut); still read, for the logs written before it, with
+    /// the cut each replica infers from what it holds of the generation.
     Recall { dir: u64, gen: u64 },
     /// Plan 30 §M9 × §M6: carried by the epoch marker of a sealed
     /// backup's takeover. The successor re-ships the acknowledged tail of
@@ -302,6 +306,23 @@ pub enum LogRecord {
         held: bool,
         by: Option<String>,
     },
+    /// Plan 43 C2: generation `gen` of the delegation on `dir` ended, and
+    /// its stream is cut at `through`: the root had appended the
+    /// generation's rows `1..=through` before this record (its cursor, or
+    /// further when the root held the generation itself), and every row of
+    /// the generation past it is void — never in the log, and never to be
+    /// acknowledged. Replaces [`LogRecord::Recall`] for everything written
+    /// from this change on, so that every replica reads the cut from the
+    /// record instead of inferring it from what it happens to hold (a
+    /// delegate's own head, which holds its unappended rows too).
+    ///
+    /// Appended after `SnapHold` rather than as a field of `Recall`: the
+    /// records are postcard, not self-describing, so a field added to an
+    /// existing variant would make every segment and journal row that
+    /// carries a `Recall` undecodable (as with `SnapCreate2`). A `Recall`
+    /// already in a log keeps its meaning (the cut inferred from what the
+    /// replica holds of the generation).
+    RecallCut { dir: u64, gen: u64, through: u64 },
 }
 
 impl LogRecord {
@@ -355,6 +376,33 @@ mod tests {
         };
         let bytes = r.to_postcard().unwrap();
         assert_eq!(LogRecord::from_postcard(&bytes).unwrap(), r);
+    }
+
+    /// Plan 43 C2 (D1): `RecallCut` is a variant of its own, appended after
+    /// the last one — a `Recall` written before it still decodes, and the
+    /// postcard tags of every earlier variant did not move.
+    #[test]
+    fn recall_cut_is_appended_and_recall_still_decodes() {
+        let old = LogRecord::Recall { dir: 7, gen: 3 };
+        let bytes = old.to_postcard().unwrap();
+        assert_eq!(LogRecord::from_postcard(&bytes).unwrap(), old);
+        let cut = LogRecord::RecallCut {
+            dir: 7,
+            gen: 3,
+            through: 12,
+        };
+        let bytes = cut.to_postcard().unwrap();
+        assert_eq!(LogRecord::from_postcard(&bytes).unwrap(), cut);
+        // The tags: `SnapHold` was the last variant (25), `RecallCut`
+        // follows it; `Recall` kept its own.
+        let snap_hold = LogRecord::SnapHold {
+            id: "s".into(),
+            held: true,
+            by: None,
+        };
+        assert_eq!(snap_hold.to_postcard().unwrap()[0], 25);
+        assert_eq!(bytes[0], 26);
+        assert_eq!(old.to_postcard().unwrap()[0], 21);
     }
 
     #[test]

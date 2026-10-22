@@ -646,6 +646,172 @@ fn a_segment_goes_under_a_delegates_stream_only_where_it_conflicts() {
     assert!(meta.lookup(d, "a").unwrap().is_none());
 }
 
+/// A delegate that executed three rows of generation 7 (the core notes
+/// each in the session, as `Replica::note_stream`): the setup of the two tests of the recall's cut below.
+fn delegate_of_three_rows() -> (Meta, u64) {
+    let meta = Meta::open_in_memory().unwrap();
+    let d = (2 << 40) | 1;
+    let mkdir = vec![LogRecord::Mkdir {
+        parent: ROOT_INO,
+        name: "d".into(),
+        ino: d,
+        mode: 0o755,
+        uid: 0,
+        gid: 0,
+        time_ns: 1,
+    }];
+    meta.apply_segment(1, 1, &mkdir, &TouchSet::default())
+        .unwrap();
+    let gen = 7;
+    for (seq, name) in [(1, "a"), (2, "b"), (3, "c")] {
+        let op = MutateOp::Create {
+            parent: d,
+            name: name.into(),
+            ino: (2 << 40) | (10 + seq),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        meta.delegate_execute(
+            &op,
+            Some(rid(seq)),
+            gen,
+            Default::default(),
+            &Default::default(),
+            Now::same(0),
+        )
+        .unwrap();
+        meta.session().note_stream(gen, seq);
+    }
+    (meta, d)
+}
+
+fn deps_on(gen: u64, idx: u64) -> constellation_meta::Position {
+    let mut streams = constellation_meta::Streams::NONE;
+    assert!(streams.raise(gen, idx));
+    constellation_meta::Position {
+        streams,
+        ..constellation_meta::Position::ZERO
+    }
+}
+
+/// Plan 43 C2: the end of a generation carries its cut (`RecallCut`), and
+/// a replica that applies it from the log voids the generation there — not
+/// at what it holds of it. A delegate's replica holds its own unappended
+/// rows as well: the record said the root appended one row, the delegate
+/// had executed three, and a dependency on the second is lost, not met.
+/// Fails on the parent, where the cut was this replica's own head.
+#[test]
+fn a_void_cut_is_the_records_through() {
+    let (meta, d) = delegate_of_three_rows();
+    let gen = 7;
+    assert_eq!(meta.void_cut(gen).unwrap(), None, "live: no cut");
+    let end = vec![LogRecord::RecallCut {
+        dir: d,
+        gen,
+        through: 1,
+    }];
+    let applied = meta
+        .apply_segment(2, 1, &end, &TouchSet::default())
+        .unwrap();
+    assert_eq!(
+        applied.stranded.locals, 3,
+        "the rows past the cut are stranded"
+    );
+    let session = meta.session();
+    assert!(session.is_voided(gen));
+    assert_eq!(session.void_cut(gen), Some(1), "the record's cut");
+    assert_eq!(
+        meta.void_cut(gen).unwrap(),
+        Some(1),
+        "persisted with the record, for a restart"
+    );
+    assert!(!session.deps_lost(&deps_on(gen, 1)));
+    assert!(
+        session.deps_lost(&deps_on(gen, 2)),
+        "a dependency past the cut is lost"
+    );
+    // The cut only rises: the same record again, or a lower one, moves
+    // nothing.
+    let lower = vec![LogRecord::RecallCut {
+        dir: d,
+        gen,
+        through: 0,
+    }];
+    meta.apply_segment(3, 1, &lower, &TouchSet::default())
+        .unwrap();
+    assert_eq!(meta.void_cut(gen).unwrap(), Some(1));
+    assert_eq!(session.void_cut(gen), Some(1));
+}
+
+/// Plan 43 C2: a root persists the cut when it journals the `RecallCut`
+/// record. If that journal row leaves the journal unshipped (a deposed
+/// root's strand or rebuild), the record never reaches the log, so the
+/// persisted cut goes with it. Otherwise a restart would seed the cut from a
+/// record the log does not carry. The generation can then end in the log
+/// with a lower cut, and the stale one would keep a dependency past the real
+/// cut from being lost.
+#[test]
+fn a_stranded_recall_record_takes_its_persisted_cut_with_it() {
+    let gen = 9;
+    let end = [LogRecord::RecallCut {
+        dir: ROOT_INO,
+        gen,
+        through: 12,
+    }];
+    // A deposed root's rebuild strands every unshipped row.
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    meta.apply_records_journaled(&end).unwrap();
+    assert_eq!(
+        meta.void_cut(gen).unwrap(),
+        Some(12),
+        "journaled: persisted"
+    );
+    meta.set_holder_epoch(0);
+    meta.replace_ns_from_rebuilt(&Meta::open_in_memory().unwrap(), &Default::default())
+        .unwrap();
+    assert_eq!(meta.journal_len().unwrap(), 0);
+    assert_eq!(meta.void_cut(gen).unwrap(), None, "the rebuild dropped it");
+    // A newer epoch's strand: the same.
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    meta.apply_records_journaled(&end).unwrap();
+    assert!(meta.strand_below_epoch(2).unwrap().any());
+    assert_eq!(meta.void_cut(gen).unwrap(), None, "the strand dropped it");
+    // The generation's end as the log carries it (the successor's, lower).
+    let lower = vec![LogRecord::RecallCut {
+        dir: ROOT_INO,
+        gen,
+        through: 8,
+    }];
+    meta.apply_segment(1, 1, &lower, &TouchSet::default())
+        .unwrap();
+    assert_eq!(meta.void_cut(gen).unwrap(), Some(8), "the log's cut");
+}
+
+/// Plan 43 C2 (D1): a `Recall` already in a log (written before the cut was
+/// in the record) keeps its meaning: every replica infers the cut from what
+/// it holds of the generation, and persists none.
+#[test]
+fn an_old_recall_record_keeps_the_inferred_cut() {
+    let (meta, d) = delegate_of_three_rows();
+    let gen = 7;
+    let end = vec![LogRecord::Recall { dir: d, gen }];
+    meta.apply_segment(2, 1, &end, &TouchSet::default())
+        .unwrap();
+    let session = meta.session();
+    assert!(session.is_voided(gen));
+    assert_eq!(meta.void_cut(gen).unwrap(), None, "no cut in the record");
+    assert_eq!(
+        session.void_cut(gen),
+        Some(3),
+        "the replica's own head, as before"
+    );
+    assert!(!session.deps_lost(&deps_on(gen, 3)));
+    assert!(session.deps_lost(&deps_on(gen, 4)));
+}
+
 /// The publish rule: a holder with unshipped work publishes the log
 /// prefix at `applied_seq` — exactly the state it last shipped.
 #[test]

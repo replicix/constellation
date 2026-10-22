@@ -575,6 +575,17 @@ impl Core {
             .collect()
     }
 
+    /// Plan 43 C2 (D7): the parks waiting on a row of generation `gen`
+    /// past `through`, the cut its end carried.
+    pub(crate) fn stream_parks_past(&self, gen: u64, through: u64) -> Vec<u64> {
+        self.rd
+            .parked
+            .iter()
+            .filter(|(_, p)| p.stream_need.is_some_and(|(g, i)| g == gen && i > through))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     pub(crate) fn has_stream_parks(&self) -> bool {
         self.rd.parked.values().any(|p| p.stream_need.is_some())
     }
@@ -1451,24 +1462,39 @@ impl Core {
         // past its lease; the acknowledgement it was parked for was
         // never released, and its client heard `EIO` at the deadline).
         let shipped = replica.journal_acked_seq().unwrap_or(0);
-        // The delegate's journal is read at most once for all of them.
-        let mut pending = None;
+        // The log's index of each generation is read at most once for all
+        // of them.
+        let mut cache = super::delegate::StreamCache::default();
+        let mut dropped: Vec<u64> = Vec::new();
         let ready: Vec<u64> = self
             .rd
             .parked
             .iter()
-            .filter(|(_, p)| {
+            .filter(|(id, p)| {
                 p.waiting.is_empty()
                     && p.quarantine.is_none_or(|q| q <= now.wait)
                     && p.durable
                         .is_none_or(|j| j <= shipped || self.durable_covers(j))
                     && p.deps.as_ref().is_none_or(|d| replica.reaches_streams(d))
                     && p.stream_need.is_none_or(|(g, i)| {
-                        self.deleg_stream_durable_cached(g, i, replica, &mut pending)
+                        match self.deleg_stream_state_cached(g, i, replica, &mut cache) {
+                            super::delegate::StreamState::Committed => true,
+                            super::delegate::StreamState::Waiting => false,
+                            super::delegate::StreamState::Dropped => {
+                                dropped.push(**id);
+                                false
+                            }
+                        }
                     })
             })
             .map(|(id, _)| *id)
             .collect();
+        // Plan 43 C2 (D7): a row that left the journal without the log
+        // carrying it was dropped; its acknowledgement is never given.
+        for id in dropped {
+            self.stats.deleg_acks_dropped += 1;
+            self.abort_park_busy(now, id, replica, out);
+        }
         for id in ready {
             // Tolerate re-entrancy the way M5's `release_gated` does: a
             // continuation run earlier in this loop (a `finish`, which

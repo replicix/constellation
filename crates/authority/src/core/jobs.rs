@@ -850,11 +850,14 @@ impl Core {
             if !self.dl.mine.is_empty() {
                 self.note_shipped_touches(seq, payload);
             }
-            if seg
-                .records
-                .iter()
-                .any(|r| matches!(r, LogRecord::Delegate { .. } | LogRecord::Recall { .. }))
-            {
+            if seg.records.iter().any(|r| {
+                matches!(
+                    r,
+                    LogRecord::Delegate { .. }
+                        | LogRecord::Recall { .. }
+                        | LogRecord::RecallCut { .. }
+                )
+            }) {
                 self.delegation_sync(now, replica, out);
             }
         }

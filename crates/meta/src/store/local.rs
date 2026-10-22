@@ -490,6 +490,15 @@ impl Meta {
             .unwrap_or(0))
     }
 
+    /// Plan 43 C2: the cut the log's `RecallCut` record of generation `gen`
+    /// carried, as this replica applied it from the log: `None` for a
+    /// generation not ended by one (live, or ended by an older `Recall`).
+    pub fn void_cut(&self, gen: u64) -> Result<Option<u64>, MetaError> {
+        let r = self.db.read_tx();
+        Ok(kv_get_tx(&r, &self.local, &deleg_void_cut_key(gen))?
+            .and_then(|v| v.parse::<u64>().ok()))
+    }
+
     fn note_log_idx(&self, gen: u64, idx: u64) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
         bump_log_idx_tx(&mut tx, &self.local, gen, idx)?;
@@ -643,7 +652,7 @@ impl Meta {
 
     /// Plan 30 §M11 phase 2b: whether transaction `(gen, idx)` of this
     /// delegate's stream is still in the journal (not yet carried by a
-    /// segment the replica applied) — `ack=s3`'s wait.
+    /// segment the replica applied).
     pub fn delegate_tx_pending(&self, gen: u64, idx: u64) -> Result<bool, MetaError> {
         let r = self.db.read_tx();
         Ok(read_journal_tx_heads(&r, self)?
@@ -876,7 +885,14 @@ impl Meta {
         // the same order as the fast path (gate, then the database).
         let _gate = records
             .iter()
-            .any(|r| matches!(r, LogRecord::Delegate { .. } | LogRecord::Recall { .. }))
+            .any(|r| {
+                matches!(
+                    r,
+                    LogRecord::Delegate { .. }
+                        | LogRecord::Recall { .. }
+                        | LogRecord::RecallCut { .. }
+                )
+            })
             .then(|| self.deleg_gate.write().unwrap_or_else(|e| e.into_inner()));
         let mut tx = self.db.write_tx();
         let local = self.begin_local(&tx)?;
@@ -1629,6 +1645,17 @@ pub(crate) fn deleg_log_idx_key(gen: u64) -> String {
     format!("deleg_log_idx:{gen}")
 }
 
+/// `local` kv: the cut of generation `gen` the log's `RecallCut` record
+/// carried (plan 43 C2): the highest stream index its root appended before
+/// the generation ended. Raise-only, except that it goes when the journal
+/// row of the record that set it is stranded unshipped
+/// ([`retract_void_cut_tx`]). Absent for a generation ended by a
+/// `Recall` (a log written before the cut was in the record): the cut is
+/// then what the replica holds of it from the log (`deleg_log_idx_key`).
+pub(crate) fn deleg_void_cut_key(gen: u64) -> String {
+    format!("deleg_void_cut:{gen}")
+}
+
 /// `local` kv: generation `gen`'s stream lost rows to a takeover's
 /// strand (`Meta::strand_for_takeover`); this node, its delegate, never
 /// executes in it again.
@@ -1690,6 +1717,39 @@ pub(crate) fn retract_log_idx_tx(
     }
     kv_set_tx(tx, local, &key, &(idx - 1).to_string());
     Ok(true)
+}
+
+/// Raise the persisted cut of the ended generation `gen` to `through`
+/// (see [`deleg_void_cut_key`]).
+pub(crate) fn bump_void_cut_tx(
+    tx: &mut SingleWriterWriteTx,
+    local: &SingleWriterTxKeyspace,
+    gen: u64,
+    through: u64,
+) -> Result<(), MetaError> {
+    let key = deleg_void_cut_key(gen);
+    let cur = kv_get_tx(tx, local, &key)?.and_then(|v| v.parse::<u64>().ok());
+    if cur.is_none_or(|c| through > c) {
+        kv_set_tx(tx, local, &key, &through.to_string());
+    }
+    Ok(())
+}
+
+/// Forget the persisted cut of `gen` set by a `RecallCut { through }` that
+/// this node journaled and is now stranded unshipped, so the log never
+/// carries it (`spec::strand_local_tx`). The cut is removed only while it
+/// is that record's: a cut that the log's own record raised is left alone.
+pub(crate) fn retract_void_cut_tx(
+    tx: &mut SingleWriterWriteTx,
+    local: &SingleWriterTxKeyspace,
+    gen: u64,
+    through: u64,
+) -> Result<(), MetaError> {
+    let key = deleg_void_cut_key(gen);
+    if kv_get_tx(tx, local, &key)?.and_then(|v| v.parse::<u64>().ok()) == Some(through) {
+        tx.remove(local, key.as_bytes().to_vec());
+    }
+    Ok(())
 }
 
 /// Plan 30 §M11: one transaction of a delegate's stream.

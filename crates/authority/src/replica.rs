@@ -168,6 +168,9 @@ pub trait Replica {
     fn deps_lost(&self, deps: &Position) -> bool;
     /// The log's cut of voided generation `gen` (`SessionState::note_void_cut`).
     fn note_void_cut(&self, gen: u64, cut: u64);
+    /// The cut of `gen` as this replica knows it, `None` while it is not
+    /// voided here (`SessionState::void_cut`).
+    fn void_cut(&self, gen: u64) -> Option<u64>;
     fn pending_replays(&self) -> Result<Vec<StrandedOp>, MetaError>;
     fn forget_replay(&self, queue_seq: u64) -> Result<(), MetaError>;
     fn mark_replay_refused(&self, queue_seq: u64, reason: String) -> Result<(), MetaError>;
@@ -300,13 +303,9 @@ pub trait Replica {
     fn delegate_stranded(&self, gen: u64) -> bool;
     /// Generation `gen` ended at `cut` (the void rule).
     fn void_stream(&self, gen: u64, cut: u64);
-    /// Phase 2b (`ack=s3`): transaction `(gen, idx)` of this delegate's
-    /// stream is still in its journal (no applied segment carries it).
-    fn delegate_tx_pending(&self, gen: u64, idx: u64) -> bool;
-    /// Every `(gen, idx)` of this delegate's streams still in its journal,
-    /// in one read (`delegate_tx_pending` for many transactions at once);
-    /// `None` when it cannot be read (every transaction counts as
-    /// pending).
+    /// Every `(gen, idx)` of this delegate's streams still in its journal
+    /// (no applied segment carries it), in one read; `None` when it cannot
+    /// be read (every transaction counts as pending).
     fn delegate_txs_pending(&self) -> Option<std::collections::HashSet<(u64, u64)>>;
     /// Phase 2b: a delegate's backup persists its transactions; returns
     /// the highest index through which every transaction is in the log
@@ -746,6 +745,10 @@ impl Replica for Meta {
         self.session().note_void_cut(gen, cut)
     }
 
+    fn void_cut(&self, gen: u64) -> Option<u64> {
+        self.session().void_cut(gen)
+    }
+
     fn note_streamed(&self, pos: JournalPos) {
         self.session().note_streamed(pos)
     }
@@ -849,19 +852,32 @@ impl Replica for Meta {
             }
         }
         for rec in records {
-            if let LogRecord::Recall { gen, .. } = rec {
-                let cut = self.session().stream_applied(*gen);
-                self.session().void_stream(*gen, cut);
-                // What the log holds of it (a delegate's own unappended
-                // rows are not): a dependency past this is lost.
-                self.session()
-                    .note_void_cut(*gen, Meta::log_stream_idx(self, *gen).unwrap_or(0));
-                // Phase 2b: the read delegations its delegate granted,
-                // and the tail its backup held, are over.
-                self.read_delegations()
-                    .void_epoch(crate::core::DELEG_READ_EPOCH_BASE + *gen);
-                let _ = Meta::deleg_backup_clear(self, *gen);
-            }
+            let gen = match rec {
+                // Plan 43 C2: the record carries the cut: every replica
+                // voids the generation at it, not at what it holds.
+                LogRecord::RecallCut { gen, through, .. } => {
+                    self.session().void_stream(*gen, *through);
+                    self.session().note_void_cut(*gen, *through);
+                    *gen
+                }
+                // A log written before the cut was in the record: the cut
+                // is what this replica holds of the generation.
+                LogRecord::Recall { gen, .. } => {
+                    let cut = self.session().stream_applied(*gen);
+                    self.session().void_stream(*gen, cut);
+                    // What the log holds of it (a delegate's own unappended
+                    // rows are not): a dependency past this is lost.
+                    self.session()
+                        .note_void_cut(*gen, Meta::log_stream_idx(self, *gen).unwrap_or(0));
+                    *gen
+                }
+                _ => continue,
+            };
+            // Phase 2b: the read delegations its delegate granted,
+            // and the tail its backup held, are over.
+            self.read_delegations()
+                .void_epoch(crate::core::DELEG_READ_EPOCH_BASE + gen);
+            let _ = Meta::deleg_backup_clear(self, gen);
         }
         // Plan 30 §M8: a newer epoch voids the delegations an older
         // holder granted (each was capped by that holder's lease, which is
@@ -971,10 +987,6 @@ impl Replica for Meta {
 
     fn note_stream(&self, gen: u64, idx: u64) {
         self.session().note_stream(gen, idx)
-    }
-
-    fn delegate_tx_pending(&self, gen: u64, idx: u64) -> bool {
-        Meta::delegate_tx_pending(self, gen, idx).unwrap_or(true)
     }
 
     fn delegate_txs_pending(&self) -> Option<std::collections::HashSet<(u64, u64)>> {

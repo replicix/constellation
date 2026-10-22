@@ -56640,3 +56640,97 @@ decisions are the ones it made before, it only names them, and the oracle that j
 - Gates (the C2a state alone and the series, build host, debug): `cargo fmt --all --check`; `cargo clippy --workspace
   --all-targets -- -D warnings`; `cargo test` of authority (lib, sim suite), control
   (schema re-blessed: `AckStatus.classes`), meta, engine.
+
+## Plan 43 C2b: a generation's end carries its cut (2026-10-22)
+
+Second of C2's commits that need no C1 (spec §3.6 without the seal changes, D1, D7).
+
+### The problem
+
+The end of a delegation generation was `LogRecord::Recall { dir, gen }`, with no cut in it. Every replica inferred the cut
+from what it holds of the generation: the root's own cursor where it wrote the record, but on a delegate's replica
+`stream_applied(gen)`, which includes the delegate's own unappended rows. So the same record voided the generation at the
+root's cursor on one node and at the delegate's head on another, and a restart (`seed_generations`) took the log's index.
+A related hole (D7): a delegate's stream park under `ack=s3` or a lagging backup counted the archive by "the row left my
+journal" (`!pending()`), and a recall's strand takes a row out of the journal too, so the park was released for a write the
+log would never carry; a generation no longer held here (`None => true`) released every park of it.
+
+### What landed
+
+- `LogRecord::RecallCut { dir, gen, through }`, appended after `SnapHold` (postcard tag 26). **Not a field of `Recall`**: the
+  records are postcard, so a field added to a variant makes every segment and journal row carrying a `Recall` undecodable
+  (as with `SnapCreate2`). New code journals only `RecallCut`; a `Recall` in an older log is read as before (the cut
+  inferred). No version bump, no shim (Q21).
+- `end_generation` works `through` out before journaling (the cursor, or further when the root held the generation itself
+  and its takeover did not strand its rows: `4936bd4`'s rule, so the record's cut is the one the root voids at; its test
+  `a_root_ending_a_generation_its_takeover_stranded_cuts_it_at_the_log` now also checks the record's `through`)
+  and voids and notes the cut at it. Every replica reads it from the record (`apply_one`, from the durable log: the void,
+  the session's cut, and `deleg_void_cut:{gen}`, a raise-only node-local key written in the same transaction;
+  `Replica::apply_segment` for the session, the read delegations and the backup tail; the strand, the delegation syncs and
+  the journal-write gate treat it as `Recall`). `seed_generations` takes the persisted cut, else the log's index (old logs).
+- D7: `deleg_stream_durable` counts the archive by the log's index of the generation (`idx <= log_stream_idx(gen)`); a
+  generation no longer held here commits only through the archive; ending the generation here aborts (`Busy`, retried by
+  rid) the parks past its cut (`deleg_abort_stream_parks_past`). `Meta::delegate_tx_pending` / `delegate_txs_pending` are
+  gone.
+- The persisted cut goes with its record. A root writes `deleg_void_cut` when it journals the `RecallCut` (the journaled
+  apply is a durable one). When that journal row is stranded unshipped (a deposed root's strand or rebuild), the record
+  never reaches the log, so `strand_local_tx` removes the cut it set (`retract_void_cut_tx`, only while the key still
+  holds that record's `through`). Before this, a restart seeded the void from a record the log never carried. The
+  successor's `RecallCut` can carry a lower cut, and a dependency between the two would then not be counted as lost.
+
+### Evidence
+
+Fail-before (the change reverted on the build host, the named test alone):
+
+| Test | Change reverted | Before |
+|---|---|---|
+| `a_void_cut_is_the_records_through` (meta) | a replica voids at its own head, nothing persisted | FAILS |
+| `the_recall_record_carries_the_cut` (core) | `end_generation` journals `Recall` | FAILS |
+| `a_park_past_the_cut_is_aborted_not_released`, `a_park_whose_row_left_the_journal_is_aborted` (core) | D7: a row that left the journal counts as committed, no abort at the end | both FAIL |
+| `a_stranded_recall_record_takes_its_persisted_cut_with_it` (meta, review) | no retraction on a strand | FAILS |
+
+Guards that pass before and after by design: `an_old_recall_record_keeps_the_inferred_cut`,
+`a_park_at_the_cut_releases_through_the_archive`, the session's `a_reopened_session_takes_the_cut_from_the_record_when_it_has_one`
+and `recall_cut_is_appended_and_recall_still_decodes` (the tags of the earlier variants did not move).
+
+**A first cut of D7 hung clients, and the sweeps found it.** The first version of the predicate counted the archive by the
+log's index alone and left a row that had left the journal without the log carrying it parked: 12 seeds of
+`long-delegated-backup` / `long-delegated-late-answers` ("a client op was never answered within 540 s"; seed 177: node 3's
+park of row `(4, 9)` with the log at 8, the row gone). The park is now three-valued (`Committed` / `Waiting` / `Dropped`:
+a row not in the log and no longer in the journal is aborted, `deleg_acks_dropped`), with the journal read cached once per
+`complete_ready` as before; `a_park_whose_row_left_the_journal_is_aborted` pins it. (A first run of those sweeps was also
+made on a stale build: the box's copy was restored with older file times and cargo did not rebuild; the sweeps below are
+from a binary built after touching every source, and the table's totals differ from the first run exactly where it matters.)
+
+**Sweeps** (release, 4 threads, flags off; main = the parent, C2b = this commit; seeds as named): 0 failing seeds on both in
+every configuration; kind mismatches 0, unverified relays 0, **unjournaled landed 0** (C2a's 4 closed):
+
+| Config | Seeds | I1 uncommitted main → C2b | I2 | I2c | I4 | I5 |
+|---|---|---|---|---|---|---|
+| `long-delegated` | 0..2000 | 83 210 → 83 210 | 27 → 27 | 0 → 0 | 2 → 2 | 397 → 397 |
+| `long-delegated-backup` | 0..500 | 391 → 389 | 18 → 18 | 157 → 157 | 19 → 16 | 87 → 87 |
+| `long-delegated-late-answers` | 0..2000 | 4 577 → 4 551 | 126 → 127 | 1 155 → 1 155 | 245 → 246 | 1 920 → 1 919 |
+| `delegated-backup` | 0..2000 | 13 → 13 | 0 → 0 | 0 → 0 | 0 → 0 | 3 → 3 |
+| `delegated-crash` | 0..2000 | 47 571 → 47 571 | 2 → 2 | 0 → 0 | 0 → 0 | 4 → 4 |
+| `delegated-partition` | 0..2000 | 36 890 → 36 890 | 333 → 333 | 0 → 0 | 0 → 0 | 1 172 → 1 172 |
+| `delegated-root-crash` | 0..2000 | 48 118 → 48 118 | 0 → 0 | 0 → 0 | 0 → 0 | 156 → 156 |
+| `delegated-root-gone` | 0..2000 | 47 420 → 47 420 | 0 → 0 | 0 → 0 | 0 → 0 | 141 → 141 |
+| `delegated-delegate-restart` | 0..2000 | 46 818 → 46 818 | 0 → 0 | 0 → 0 | 0 → 0 | 0 → 0 |
+| `delegated-two-gens-root-crash` | 0..2000 | 128 011 → 128 011 | 0 → 0 | 0 → 0 | 0 → 0 | 62 → 62 |
+| `delegated-holder-cut` | 0..2000 | 235 → 235 | 828 → 828 | 5 742 → 5 742 | 77 → 76 | 7 426 → 7 426 |
+| `delegated-long-delegation` | 0..2000 | 299 486 → 299 486 | 634 → 634 | 0 → 0 | 233 → 233 | 1 161 → 1 161 |
+| `shared-dir`, `-split`, `-ranges`, `-faults` | 0..500 each | unchanged | unchanged | 0 | 0 | unchanged |
+| `far` | 0..1000 | 23 675 → 23 675 | 1 → 1 | 0 → 0 | 0 → 0 | 5 → 5 |
+| `long-sessions` | 0..2000 | 87 688 → 87 688 | 2 → 2 | 0 → 0 | 0 → 0 | 81 → 81 |
+| `flex-crash` | 0..2000 | 54 766 → 54 766 | 1 370 → 1 370 | 0 → 0 | 8 → 8 | 4 878 → 4 878 |
+| `locks-delegated` | 0..2000 | 52 686 → 52 686 | 0 → 0 | 0 → 0 | 0 → 0 | 25 → 25 |
+
+Only the two late-answer configurations' schedules move (the parks that were released for dropped rows are aborted now: 2 and
+26 fewer tentative acknowledgements); `long-delegated-backup`'s late landings fall from 19 to 16.
+
+Gates: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test` of meta, control,
+authority (lib and sim suite) and engine, debug.
+
+Docs: `delegations.md` (the generation's end and its cut; how a delegate executes), DESIGN, ADR-23.
+Re-tag note (C1): C2a/C2b do not touch the gate or a row's tagging; the class they record is read from today's gating when
+the answer leaves, so a row whose gate went off already counts as `Lone`.

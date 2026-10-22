@@ -938,6 +938,9 @@ pub struct Stats {
     pub deleg_backup_appends: u64,
     pub deleg_backup_acks: u64,
     pub deleg_acks_parked: u64,
+    /// Plan 43 C2 (D7): parked delegate acknowledgements aborted because
+    /// their row left the journal without the log carrying it.
+    pub deleg_acks_dropped: u64,
     /// Backup of a delegate: transactions persisted, seals.
     pub deleg_backup_persisted: u64,
     pub deleg_backup_seals: u64,

@@ -11858,6 +11858,21 @@ mod locks {
             h.core.dl.gens.get(&7).is_some_and(|g| g.ended),
             "the generation was not ended"
         );
+        // Plan 43 C2: the `RecallCut` record carries the same cut, the
+        // cursor, so every other replica voids where this one does.
+        let cursor = h.core.dl.gens[&7].cursor;
+        assert!(cursor < 2, "cursor {cursor}");
+        let cuts: Vec<u64> = crate::replica::Replica::journal_txs_from(&h.meta, 0, usize::MAX)
+            .into_iter()
+            .flat_map(|tx| tx.records)
+            .filter_map(|r| match r {
+                LogRecord::RecallCut {
+                    gen: 7, through, ..
+                } => Some(through),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cuts, vec![cursor], "the record's cut");
         let on_row = |i: u64| {
             let mut deps = Position::ZERO;
             assert!(deps.streams.raise(7, i));
@@ -33795,5 +33810,220 @@ mod answer_sources {
             },
         });
         assert_eq!(h.core.stats.ack_classes, before);
+    }
+}
+
+/// Plan 43 C2: a generation's end carries its cut, every replica reads it
+/// from the record, and what waited for a row past it is never answered.
+mod recall_cut {
+    use super::*;
+    use crate::replica::Replica;
+
+    /// The journal's records, in order.
+    fn journal_records(h: &Harness) -> Vec<LogRecord> {
+        Replica::journal_txs_from(&h.meta, 0, usize::MAX)
+            .into_iter()
+            .flat_map(|tx| tx.records)
+            .collect()
+    }
+
+    /// The root ends generation 7 (the delegate silent, the recall
+    /// outwaited) with the cursor at 3: the record it journals says so, and
+    /// no `Recall` is written any more.
+    #[test]
+    fn the_recall_record_carries_the_cut() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        let (dir, _) = locks::delegated_file(&h.meta);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        h.step(Event::Control {
+            op: OpId(1 << 50),
+            req: Control::Undelegate { dir },
+        });
+        // The delegate streamed three rows (appended: the cursor).
+        h.core.dl.gens.get_mut(&7).unwrap().cursor = 3;
+        h.core.dl.gens.get_mut(&7).unwrap().until = w(h.now);
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        assert!(h.core.dl.gens[&7].ended, "not ended: {out:?}");
+        let records = journal_records(&h);
+        assert!(
+            records.contains(&LogRecord::RecallCut {
+                dir,
+                gen: 7,
+                through: 3
+            }),
+            "{records:?}"
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|r| matches!(r, LogRecord::Recall { .. })),
+            "a `Recall` was written: {records:?}"
+        );
+        // The root's own session voids it at the cut it wrote.
+        assert_eq!(Replica::void_cut(&h.meta, 7), Some(3));
+    }
+
+    /// A delegate (node 3, backed by node 4) executed a forwarded create
+    /// of node 2's and parks its acknowledgement for the backup.
+    fn delegate_with_a_parked_ack() -> (Harness, constellation_fs_core::Ino) {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        h.core.dl.mine.get_mut(&7).unwrap().backup = Some(4);
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(500),
+                rid: Rid {
+                    node: 2,
+                    incarnation: 1,
+                    seq: 1,
+                },
+                op: MutateOp::Create {
+                    parent: dir,
+                    name: "a".into(),
+                    ino: h.meta.allocate_ino(dir).unwrap(),
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+            },
+        });
+        assert!(
+            !sends(&out).iter().any(|(_, m)| matches!(
+                m,
+                PeerMsg::MutateReply {
+                    outcome: MutateOutcome::Accepted { .. },
+                    ..
+                }
+            )),
+            "answered before the backup held the row: {out:?}"
+        );
+        assert!(h.core.has_stream_parks(), "the acknowledgement is parked");
+        (h, dir)
+    }
+
+    fn replies_to_2(out: &[Action]) -> Vec<&MutateOutcome> {
+        sends(out)
+            .into_iter()
+            .filter_map(|(to, m)| match m {
+                PeerMsg::MutateReply { req, outcome, .. } if to == 2 && *req == OpId(500) => {
+                    Some(outcome)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The log ends the generation at a cut below the row the delegate
+    /// executed and parked: the recall strands the row (it leaves the
+    /// journal), which the park used to read as "the row is in the log"
+    /// and released — an acknowledgement for a write the log will never
+    /// carry. It is aborted instead (`Busy`: the requester retries by rid
+    /// at the generation's new owner).
+    #[test]
+    fn a_park_past_the_cut_is_aborted_not_released() {
+        let (mut h, dir) = delegate_with_a_parked_ack();
+        Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::RecallCut {
+                dir,
+                gen: 7,
+                through: 0,
+            }],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        assert_eq!(
+            replies_to_2(&out),
+            vec![&MutateOutcome::Busy],
+            "the park of a row past the cut: {out:?}"
+        );
+        assert!(!h.core.has_stream_parks());
+        assert!(!h.core.dl.mine.contains_key(&7));
+    }
+
+    /// A row that leaves the journal without the log carrying it (a
+    /// takeover's strand, here) takes its acknowledgement with it: aborted
+    /// (`Busy`, the requester retries by rid), neither released as if the
+    /// log carried it nor left parked for ever (sim `long-delegated-backup`
+    /// seed 177: the client never heard an answer).
+    #[test]
+    fn a_park_whose_row_left_the_journal_is_aborted() {
+        let (mut h, _dir) = delegate_with_a_parked_ack();
+        let mut out = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        assert!(replies_to_2(&out).is_empty(), "still waiting: {out:?}");
+        assert!(h.core.has_stream_parks());
+        h.meta.strand_for_takeover(2, &[7]).unwrap();
+        let mut out = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        assert_eq!(replies_to_2(&out), vec![&MutateOutcome::Busy], "{out:?}");
+        assert!(!h.core.has_stream_parks());
+        assert_eq!(h.core.stats.deleg_acks_dropped, 1);
+    }
+
+    /// A row at or below the cut is in the log (the root appended it before
+    /// the record, and a segment that carried it was applied): its park
+    /// releases through the archive once the generation is gone here.
+    #[test]
+    fn a_park_at_the_cut_releases_through_the_archive() {
+        let (mut h, dir) = delegate_with_a_parked_ack();
+        // The segment that carries the row (origin (7, 1)), then the end.
+        Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[(7, 1)],
+            &[LogRecord::Create {
+                parent: dir,
+                name: "a".into(),
+                ino: (3 << 40) | 1,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 9,
+            }],
+        )
+        .unwrap();
+        Replica::apply_segment(
+            &h.meta,
+            3,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::RecallCut {
+                dir,
+                gen: 7,
+                through: 1,
+            }],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        let replies = replies_to_2(&out);
+        assert!(
+            matches!(replies.as_slice(), [MutateOutcome::Accepted { .. }]),
+            "{replies:?}"
+        );
+        assert!(!h.core.has_stream_parks());
     }
 }

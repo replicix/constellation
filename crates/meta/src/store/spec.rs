@@ -912,6 +912,7 @@ fn derive_replay_op(records: &[LogRecord]) -> Option<MutateOp> {
                     | LogRecord::InboxAck { .. }
                     | LogRecord::Delegate { .. }
                     | LogRecord::Recall { .. }
+                    | LogRecord::RecallCut { .. }
             )
         })
         .collect();
@@ -1035,6 +1036,12 @@ fn strand_local_tx(
             if !log_carries(tx, rid)? {
                 tx.remove(&meta.completed, rid.to_key());
             }
+        }
+        // Plan 43 C2: the same goes for a generation's end that this root
+        // journaled but never shipped. Its persisted cut goes with it, or a
+        // restart would read the cut from a record the log never carried.
+        if let LogRecord::RecallCut { gen, through, .. } = rec {
+            local::retract_void_cut_tx(tx, &meta.local, *gen, *through)?;
         }
     }
     let op = match row.op {
@@ -2772,7 +2779,7 @@ impl Meta {
         let recalled: HashSet<u64> = records
             .iter()
             .filter_map(|rec| match rec {
-                LogRecord::Recall { gen, .. } => Some(*gen),
+                LogRecord::Recall { gen, .. } | LogRecord::RecallCut { gen, .. } => Some(*gen),
                 _ => None,
             })
             .collect();

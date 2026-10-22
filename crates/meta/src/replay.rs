@@ -118,6 +118,7 @@ impl TouchSet {
             | LogRecord::InboxAck { .. }
             | LogRecord::Delegate { .. }
             | LogRecord::Recall { .. }
+            | LogRecord::RecallCut { .. }
             | LogRecord::TailFollows { .. } => {}
             LogRecord::Clone { nodes, .. } => {
                 for node in nodes {
@@ -824,6 +825,29 @@ fn apply_one(
             if durable {
                 let cut = meta.session().stream_applied(*gen);
                 meta.session().void_stream(*gen, cut);
+            }
+            Ok(Applied::Done)
+        }
+        // Plan 43 C2: the generation's end with its cut. Every replica
+        // reads the cut from the record, not from what it holds of the
+        // generation (a delegate's head holds its unappended rows too).
+        LogRecord::RecallCut { dir, gen, through } => {
+            let mut table = crate::delegation::read_table_tx(tx, meta)?;
+            table.apply(crate::delegation::DelegationRecord::Recall {
+                dir: *dir,
+                gen: *gen,
+            });
+            crate::delegation::write_table_tx(tx, meta, dirty, &table)?;
+            // As `Recall`: only from the durable log (a streamed-ahead
+            // install of the record may strand, and the generation would
+            // then be live again under the successor) — the void, and the
+            // cut kept for a restart (`deleg_void_cut`: written with the
+            // record in one transaction, so it is never ahead of the table
+            // row that says the generation ended).
+            if durable {
+                meta.session().void_stream(*gen, *through);
+                meta.session().note_void_cut(*gen, *through);
+                crate::store::local::bump_void_cut_tx(tx, &meta.local, *gen, *through)?;
             }
             Ok(Applied::Done)
         }
