@@ -56958,6 +56958,51 @@ the five `view::owner_fence_tests` failing in the full run as on `main` (54/54 a
 - Pending, box: the four-file-system runs of plan 45 §7 (`bench/hardlink/`),
   `hardlink-burst`, the xcheckfs lane, pjdfstest, the harness matrix.
 
+### Review follow-ups (2026-10-22)
+
+- **`Exists` hint over a held inode (integrity, pre-existing since plan 29 M6).**
+  A hint is the refused name's `Create { name, ino }`; replay's create is
+  idempotent only when that name already names the inode. For a second hard
+  link (or a rename the replica lacks) it wrote a fresh inode record over the
+  held one — size 0, no manifest, `nlink` 1 — and the hint's coverage let every
+  read of either name see it at once, under `bounded` and `strict` alike, until
+  the segment arrived. Such a hint is no longer installed (`Meta::install_hint_from`):
+  the refusal is uncovered and reads wait for the log.
+- **The authority sim generates `Link` and `Exchange`** (`+links`, any
+  configuration; `SimConfig::link_ratio`), checked by convergence and the
+  history checks (`NsOp::Link` speaks for the new name only; a rename the log
+  shows took no effect is `NsOp::Same`). It found four bugs, fixed with
+  fail-before tests:
+  - a rename or exchange between two names of one inode (POSIX's no-op)
+    journaled nothing, not even `Completed { rid }`: an `Ok` with no log
+    position. It completes its rid now, ordered by the ship plan like a write
+    of the names, their directories and the inode it observed;
+  - an `Unlink`/`Rename`/`Exchange` record names a name, not the inode, so the
+    speculation log judged a streamed `link` of a file disjoint from a shadowed
+    `unlink` of its other name, and a replica lost the file
+    (`backup-hot+links` seed 18). Overlap now counts the inodes a row captured
+    and the inodes incoming name removals resolve to;
+  - `Exchange` is its own inverse: the root, appending a delegate's exchange
+    over its own shadow of it, swapped the names back and published that
+    (`shared-dir-split+links` seed 498). The record names the two inodes, and
+    replay skips one already applied;
+  - a record that applied as a no-op writes nothing (a stranded op's
+    `unlink f1` replayed after `rename f1 f0`), so the ship plan let it ship
+    ahead of the deferred rename of the same name, and every replica unlinked
+    `f1` and skipped the rename (`metered-shared+links` seed 449). A
+    transaction's keys include what its rows name.
+- **fsck** checks every non-directory inode's `nlink` against its names in the
+  `0x04` reverse index (class `link_count`).
+- Gates: fmt, clippy (`--workspace --all-targets -D warnings`), meta 445,
+  mtree 74, authority lib 565, `meta_repro` 4, sim 234; engine lib 844 with
+  the five `view::owner_fence_tests` that fail on the base too. Sweeps with
+  `+links`, all green: backup, -crash, -crash-slow, -partition, -strict,
+  -two, -departs, -hot, delegated-holder-cut, -crash, -partition,
+  -root-crash, -backup, long-backup, -delegated, -strict, -sessions, -acks3
+  (500 seeds each); acks3, acks3-crash, far, shared-dir, -split, -ranges,
+  -faults, flex, flex-crash, flex-tight, metered-shared, locks, locks-faults,
+  locks-delegated, placement-hot (1,000 each).
+
 ## Plan 43 C7b, commit 1/N: the offset configurations and the lease-claim oracle (sim evidence, 2026-10-22)
 
 Behaviour-neutral. The cross-node compares of plan 43 Appendix B (a claimant
