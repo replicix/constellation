@@ -176,8 +176,16 @@ pub struct Counts {
     pub lists: u64,
 }
 
+/// Plan 43 C7b: called with `(writer node, the lease body replaced, the body
+/// written)` when a CAS of the lease object lands.
+pub type LeaseHook = Arc<
+    dyn Fn(u64, Option<constellation_store_s3::Lease>, constellation_store_s3::Lease) + Send + Sync,
+>;
+
 pub struct Bucket {
     inner: Arc<InMemory>,
+    /// Plan 43 C7b: the lease-claim oracle's tap on the lease object.
+    lease_hook: Mutex<Option<LeaseHook>>,
     /// Plan 43 C0: what the log's segments carry, noted as they land (the
     /// I1 oracle judges an answer synchronously and cannot await the bucket).
     pub archive: super::oracle::ArchiveIndex,
@@ -193,6 +201,7 @@ impl Bucket {
     pub fn new(seed: u64, latency: (u64, u64)) -> Arc<Self> {
         Arc::new(Self {
             inner: Arc::new(InMemory::new()),
+            lease_hook: Mutex::new(None),
             archive: super::oracle::ArchiveIndex::default(),
             rng: Mutex::new(StdRng::seed_from_u64(seed ^ 0x5335_5335)),
             latency,
@@ -222,8 +231,36 @@ impl Bucket {
             .map(|(l, _)| l)
     }
 
+    /// Install the tap on the lease object (the oracles' plumbing).
+    pub fn set_lease_hook(&self, hook: LeaseHook) {
+        *self.lease_hook.lock().unwrap() = Some(hook);
+    }
+
+    /// The lease body in the bucket right before a put to `location`, when
+    /// it is the lease object and a tap is installed (read synchronously:
+    /// the in-memory store does not wait, so nothing lands in between).
+    fn lease_before(&self, location: &Path) -> Option<Option<constellation_store_s3::Lease>> {
+        if location.as_ref() != "leases/p0.json" || self.lease_hook.lock().unwrap().is_none() {
+            return None;
+        }
+        Some(self.peek_lease())
+    }
+
     /// A put that took effect: a log segment goes to the archive index.
-    fn put_landed(&self, location: &Path, payload: &PutPayload) {
+    fn put_landed(
+        &self,
+        node: u64,
+        prev: Option<Option<constellation_store_s3::Lease>>,
+        location: &Path,
+        payload: &PutPayload,
+    ) {
+        if let Some(prev) = prev {
+            let hook = self.lease_hook.lock().unwrap().clone();
+            let body: bytes::Bytes = payload.clone().into();
+            if let (Some(hook), Ok(new)) = (hook, serde_json::from_slice(&body)) {
+                hook(node, prev, new);
+            }
+        }
         let name = location.as_ref();
         if let Some(seq) = name
             .strip_prefix("log/p0/")
@@ -360,22 +397,25 @@ impl ObjectStore for NodeStore {
         match self.admit(OpKind::Put, location).await? {
             None => {
                 let landed = payload.clone();
+                let before = self.bucket.lease_before(location);
                 let r = self.bucket.inner.put_opts(location, payload, opts).await?;
-                self.bucket.put_landed(location, &landed);
+                self.bucket.put_landed(self.node, before, location, &landed);
                 Ok(r)
             }
             Some(Fault::Status(status)) => Err(s3_error(location.as_ref(), status, &mode)),
             Some(Fault::Timeout) => Err(timeout_error()),
             Some(Fault::AppliedThen(status)) => {
                 let landed = payload.clone();
+                let before = self.bucket.lease_before(location);
                 self.bucket.inner.put_opts(location, payload, opts).await?;
-                self.bucket.put_landed(location, &landed);
+                self.bucket.put_landed(self.node, before, location, &landed);
                 Err(s3_error(location.as_ref(), status, &mode))
             }
             Some(Fault::AppliedThenTimeout) => {
                 let landed = payload.clone();
+                let before = self.bucket.lease_before(location);
                 self.bucket.inner.put_opts(location, payload, opts).await?;
-                self.bucket.put_landed(location, &landed);
+                self.bucket.put_landed(self.node, before, location, &landed);
                 Err(timeout_error())
             }
         }

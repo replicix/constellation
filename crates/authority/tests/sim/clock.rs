@@ -53,6 +53,13 @@ struct Osc {
     suspends: Vec<(i128, i128)>,
     /// True ns at which each boot began (the first is 0).
     boots: Vec<i128>,
+    /// Plan 43 C7b (`SimConfig::suspend_accounting_short_ms`): how much of
+    /// each suspend the boot clock fails to count, ns. 0: the boot clock
+    /// counts a suspend as it runs (the sim's default, as a host whose
+    /// clocksource runs through suspend). Above 0: as the x86 RTC path, the
+    /// boot clock counts nothing while suspended and adds the sleep, in
+    /// whole seconds short by up to this, once the host resumes.
+    suspend_short_ns: i128,
 }
 
 impl Osc {
@@ -76,7 +83,24 @@ impl Osc {
     /// `CLOCK_BOOTTIME`: since this boot, suspend included. Whole ms.
     fn boot_ns(&self, t: i128) -> i128 {
         let bs = self.boot_start(t);
-        (self.osc(t) - self.osc(bs)) / MS_NS * MS_NS
+        let mut uncounted = 0;
+        if self.suspend_short_ns > 0 {
+            for &(s, e) in &self.suspends {
+                let (lo, hi) = (s.max(bs), e.min(t));
+                if hi <= lo {
+                    continue;
+                }
+                let whole = self.osc(hi) - self.osc(lo);
+                // Over: the sleep is added at the resume, short by the
+                // accounting's error; running: nothing is counted yet.
+                uncounted += if e <= t {
+                    whole.min(self.suspend_short_ns)
+                } else {
+                    whole
+                };
+            }
+        }
+        (self.osc(t) - self.osc(bs) - uncounted) / MS_NS * MS_NS
     }
 
     /// `CLOCK_MONOTONIC_RAW` (and `CLOCK_MONOTONIC`): since this boot,
@@ -160,6 +184,7 @@ impl NodeClockState {
                 rates: vec![(0, ppm)],
                 suspends: Vec::new(),
                 boots: vec![0],
+                suspend_short_ns: 0,
             }),
             wall_follows_rate,
         })
@@ -168,6 +193,11 @@ impl NodeClockState {
     /// The wall step (cumulative ms).
     pub fn step(&self) -> &AtomicI64 {
         &self.step
+    }
+
+    /// `SimConfig::suspend_accounting_short_ms`.
+    pub fn set_suspend_short_ms(&self, ms: u64) {
+        self.osc.lock().unwrap().suspend_short_ns = ms as i128 * MS_NS;
     }
 
     /// From true time `at` (ns) the oscillator runs at `ppm`.
@@ -363,6 +393,12 @@ impl Clock {
 
     pub fn wait(&self) -> WaitMs {
         self.pc.wait()
+    }
+
+    /// The honour reading, recording nothing (`ProtocolClock::peek_honour`):
+    /// for the oracles, which must not move a node's clock.
+    pub fn peek_honour(&self) -> HonourMs {
+        self.pc.peek_honour()
     }
 
     /// The `ProtocolClock::id` the node's stamps carry.

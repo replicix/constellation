@@ -665,7 +665,9 @@ impl Core {
             rseq = rid.seq,
             "holder: executing a forwarded op"
         );
-        let outcome = match replica.execute(op, Some(rid), tag, now) {
+        let outcome = match constellation_meta::locks::TokenPath::P2p
+            .scope(|| replica.execute(op, Some(rid), tag, now))
+        {
             Ok(records) => {
                 replica.remember_outcome(rid, &records);
                 if rid.node != self.cfg.node_id {

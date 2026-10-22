@@ -344,6 +344,15 @@ pub struct SimConfig {
     /// with no time service). Offsets then grow with the rate, which the
     /// cross-node compares (C7b) cannot take: not for sweeps.
     pub wall_follows_rate: bool,
+    /// Plan 43 C7b (commit 7's evidence): each suspend of a node
+    /// (`FaultKind::Suspend`) is counted short by this much (ms, at most
+    /// the suspend's length) by the node's boot clock, which then counts a
+    /// suspend only once the host resumes: the x86 RTC path, where no
+    /// clocksource runs through suspend and the kernel times the sleep in
+    /// whole seconds. HONOUR's `S` then under-reports the suspend by up to
+    /// this. 0: the boot clock counts a suspend as it runs (every other
+    /// configuration).
+    pub suspend_accounting_short_ms: u64,
     /// Plan 30 §M9: the run's acknowledgements are durable (a backup
     /// within budget, or `ack=s3`): an acknowledged op is never
     /// tentative — its rollback is a failure, not an exemption — and a
@@ -446,6 +455,11 @@ pub struct SimConfig {
     /// the delegate's request timeout (`stress-ng-fs-nodes`). `(0, 0)`:
     /// none.
     pub deleg_answer_delay: (u64, u64),
+    /// Plan 43 C7b: every forwarded op (`MutateRequest`) that carries a lock
+    /// token and is sent to this node is delayed by an extra seeded `(lo,
+    /// hi)` ms: an op that leaves its sender inside the window of the lock
+    /// grants it carries and reaches its executor after the owner's outwait.
+    pub request_delay_to: Option<(NodeId, (u64, u64))>,
     /// F1's non-vacuity knob: `false` switches the fencing-token check at
     /// the write off on every node (`LockTables::set_tag_check_at_write_for_tests`),
     /// which is the code before it — a write that waited for the writer
@@ -537,6 +551,15 @@ pub struct SimConfig {
     /// was not of class Lone fails the run (`strict_durability` turns it
     /// on from C1).
     pub strict_lone: bool,
+    /// I6 `no_ttl_claim_of_a_live_lease` (plan 43 C7b): a lease CAS that
+    /// takes another node's unreleased, unfenced lease without a permit
+    /// while the old holder's own process still honours it (its
+    /// `holder_expires_ms` less its margin, on its honour clock) fails the
+    /// run. Always counted (`Report::lease_ttl_claims`,
+    /// `lease_live_claims`); the flag only decides failure. Off for the
+    /// configurations that predate it (a few have offsets beyond the
+    /// margin and would fail), on for the C7b ones.
+    pub strict_lease_claims: bool,
     /// Negative control: the stub that answered every `RebuildReplica`
     /// with `ok: false` (the sim's rebuild before plan 43 C0).
     pub rebuild_stub: bool,
@@ -746,6 +769,7 @@ impl Default for SimConfig {
             clock_faults: true,
             node_rates: Vec::new(),
             wall_follows_rate: false,
+            suspend_accounting_short_ms: 0,
             strict_durability: false,
             rtts: Vec::new(),
             epoch_slack: 0,
@@ -772,6 +796,7 @@ impl Default for SimConfig {
             lock_writes: false,
             lock_data_dir: None,
             deleg_answer_delay: (0, 0),
+            request_delay_to: None,
             tag_check_at_write: true,
             strict_lock_turns: false,
             settle_tagged_writes: true,
@@ -791,6 +816,7 @@ impl Default for SimConfig {
             strict_identity: false,
             strict_settle: false,
             strict_lone: false,
+            strict_lease_claims: false,
             rebuild_stub: false,
             plant_ungated_fast_path: false,
         }
@@ -827,6 +853,19 @@ pub struct Report {
     /// (`LockStats`, summed over the nodes' last incarnations).
     pub token_rejections_at_write: u64,
     pub settle_waits: u64,
+    /// Plan 43 C7b: tokens judged exactly (the grant's record live here) and
+    /// by their window alone, by path (`TokenPath`: p2p, local, inbox,
+    /// replay), summed over the nodes' last incarnations.
+    pub tokens_judged_exact: [u64; 4],
+    pub tokens_judged_window: [u64; 4],
+    /// Plan 43 C7b, I6: claims of another node's unreleased, unfenced lease
+    /// without a permit, those inside the old holder's honour window (the
+    /// violations), permitted claims of a `Backup` lease whose holder still
+    /// honoured it (seals of a live holder), and all permitted claims.
+    pub lease_ttl_claims: u64,
+    pub lease_live_claims: u64,
+    pub seals_of_a_live_holder: u64,
+    pub permitted_claims: u64,
     /// The generic tester ran too (few tentative ops).
     pub stateright_checked: bool,
     /// Refusals explained only by an acked-then-rolled-back effect (L2).
@@ -2987,6 +3026,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     bus.set_beats_lost(cfg.beats_lost);
     bus.set_mirror_drop(cfg.lock_mirror_drop, cfg.lock_mirror_drop_from_ms);
     bus.set_deleg_answer_delay(cfg.deleg_answer_delay);
+    bus.set_request_delay_to(cfg.request_delay_to);
     let commits: Arc<Mutex<Vec<CommitRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let in_doubt: super::node::InDoubtLog = Arc::new(Mutex::new(Vec::new()));
     let oracles = super::oracle::Oracles::new(bucket.clone());
@@ -3008,6 +3048,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         rate_budget_ppm: cfg.rate_budget_ppm,
         node_rates: cfg.node_rates.iter().copied().chain(mix_rates).collect(),
         wall_follows_rate: cfg.wall_follows_rate,
+        suspend_accounting_short_ms: cfg.suspend_accounting_short_ms,
         seed,
         world: ChunkWorld::new(),
         tag_check_at_write: cfg.tag_check_at_write,
@@ -3545,6 +3586,23 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     }
     report.faults = fault_log.lock().unwrap().clone();
     report.simulated_ms = clock.elapsed_ms();
+    {
+        // A sweep greps this (`SWEEP-LEASE`): printed for passing and
+        // failing seeds alike, before any check can fail the run.
+        let ord = std::sync::atomic::Ordering::Relaxed;
+        let (live, seals) = (
+            oracles.leases.live_claims.load(ord),
+            oracles.leases.seals_of_a_live_holder.load(ord),
+        );
+        if live + seals > 0 {
+            eprintln!(
+                "SWEEP-LEASE seed {seed}: ttl claims {} (of a live holder {live}), seals of a \
+                 live holder {seals}, permitted claims {}",
+                oracles.leases.ttl_claims.load(ord),
+                oracles.leases.permitted_claims.load(ord)
+            );
+        }
+    }
     if let Some(f) = failures.lock().unwrap().first() {
         return Err(format!("{f}\n  faults: {:?}", report.faults));
     }
@@ -3591,6 +3649,10 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         let ls = n.meta.locks().stats();
         report.token_rejections_at_write += ls.token_rejections_at_write;
         report.settle_waits += ls.settle_waits;
+        for i in 0..4 {
+            report.tokens_judged_exact[i] += ls.tokens_judged_exact[i];
+            report.tokens_judged_window[i] += ls.tokens_judged_window[i];
+        }
         report.max_backups = report.max_backups.max(load(&n.shared.max_backups) as usize);
         report.rebuilds.0 += load(&n.shared.rebuilds_ok);
         report.rebuilds.1 += load(&n.shared.rebuilds_failed);
@@ -4039,6 +4101,13 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.non_verbatim = found.i2c.len();
     report.late_landings = found.i4.len();
     report.non_lone_rollbacks = found.i5.len();
+    {
+        let ord = std::sync::atomic::Ordering::Relaxed;
+        report.lease_ttl_claims = oracles.leases.ttl_claims.load(ord);
+        report.lease_live_claims = oracles.leases.live_claims.load(ord);
+        report.seals_of_a_live_holder = oracles.leases.seals_of_a_live_holder.load(ord);
+        report.permitted_claims = oracles.leases.permitted_claims.load(ord);
+    }
     report.oracle_examples = found.examples();
     let counters = format!(
         "oracle counters: acks by class {:?}, uncommitted {:?}, unjournaled refusals {:?}, \
@@ -4061,6 +4130,10 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         (cfg.strict_settle, "I4", &found.i4),
         (cfg.strict_settle, "I4", &found.unjournaled_landed),
         (cfg.strict_lone, "I5", &found.i5),
+        // Last: a seed that also fails another check reports that one, so
+        // the failing seeds without the oracle are the ones it does not
+        // head.
+        (cfg.strict_lease_claims, "I6", &found.i6),
     ] {
         if strict {
             if let Some(first) = list.first() {

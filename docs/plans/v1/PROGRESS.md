@@ -56957,3 +56957,101 @@ the five `view::owner_fence_tests` failing in the full run as on `main` (54/54 a
   touches a dentry.
 - Pending, box: the four-file-system runs of plan 45 §7 (`bench/hardlink/`),
   `hardlink-burst`, the xcheckfs lane, pjdfstest, the harness matrix.
+
+## Plan 43 C7b, commit 1/N: the offset configurations and the lease-claim oracle (sim evidence, 2026-10-22)
+
+Behaviour-neutral. The cross-node compares of plan 43 Appendix B (a claimant
+judging a lease by its own wall against the holder's wall expiry, and the rest
+of the list) assume every offset between two nodes is below the margin. This
+commit adds the evidence that the observation rule (commit 3) closes; no
+protocol code changes.
+
+### The oracle (I6 `no_ttl_claim_of_a_live_lease`)
+
+`sim/oracle.rs` `LeaseClaims`, fed by a tap on the sim bucket's lease object
+(`Bucket::set_lease_hook`): at every lease CAS the bucket accepts that replaces
+another node's unreleased, unfenced lease **without a permit** (the claimant's
+`takeover_permit` when it sent the CAS, naming that epoch and holder, with the
+backup listed or the policy `S3`), the predecessor's own honour end for the
+body (`holder_expires_ms` less its margin on the clock `holder_clock` names)
+is compared with the predecessor's honour reading now. The reading is
+`ProtocolClock::peek_honour`, new in `constellation_types::clock` (a read that
+records nothing in `S` and `J`, so the oracle moves no node's clock); the plan
+asked for a `true_of_honour` inverse, and comparing the readings at the claim's
+instant is the same test without inverting `J` and `S`. A claim before the end
+is a violation; a dead or restarted predecessor honours nothing. Judged last
+(a seed that fails another check reports that one), counted always, failing
+under `SimConfig::strict_lease_claims` (on in the C7b configurations; commit 3
+turns it on everywhere). `AUTHORITY_SIM_LEASE_ORACLE=off|strict` overrides it
+for a sweep, which is how the "other checks alone" counts below were taken.
+
+Counters (`SWEEP-LEASE-TOTALS`, `SWEEP-LEASE seed N`, `SWEEP-TOKENS`,
+`SWEEP-FAILOVER`): TTL claims, claims of a live holder (the violations), seals
+of a live holder (a permitted claim of a `Backup` lease whose holder still
+honoured it and had a message delivered from the sealing backup within
+`backup_takeover_ms`: count only), tokens judged exactly and by their window
+alone per path (`LockStats::tokens_judged_*`, labelled by `TokenPath`, set at
+the four execution funnels), and the crash-to-first-ack time of every holder
+crash. Tuning knobs without a rebuild: `AUTHORITY_SIM_OFFSETS`,
+`AUTHORITY_SIM_REQ_DELAY`, `AUTHORITY_SIM_SUSPEND_SHORT`,
+`AUTHORITY_SIM_SUSPEND_MS`, `AUTHORITY_SIM_MARGIN_MS`; the `+unclocked` variant.
+
+### What the configurations show
+
+Measured twice: on `5f3b51c` (the spec's base, before C7a commits 4 and 6) and
+on `f7c8fc7` (this commit's base, with the default clock-fault mix, which the
+configurations that carry offsets are left out of). Failures of the other
+checks alone (I6 off); I6's count in the last column, on `f7c8fc7`.
+
+| Configuration (seeds) | Fails on `5f3b51c` | Fails on `f7c8fc7` | I6, `f7c8fc7` |
+|---|---|---|---|
+| `fast-takeover-skewed-successor` (30 000) | 3: 1716, 1987, 14761 | 0 | 77 live claims, 77 seeds (874, 1743, 2234, ...) |
+| `locks-holder-step-back-sealed` (10 000) | 1: 6275 | 1: 157 | 14 live claims |
+| `fast-takeover-skewed-holder-twice` (2 000) | 9: 245, 375, 424, ... | 8: 312, 503, 935, 1346, 1374, 1530, 1552, 1876 | 1 040 live claims, 1 040 seeds |
+| `locks-claimant-ahead` (300) | 49: 10, 13, 21, ... | 51: 10, 14, 21, ... | 249 live claims, 249 seeds |
+| `locks-holder-behind` | the same 49 (a run depends on relative offsets only) | the same 51 | 249 |
+| `strict-claimant-ahead` | 0 | 0 | 313 claims, 219 seeds with a live one |
+| `locks-skew-60s` / `strict-skew-60s` | 3 (140, 242, 296) / 0 | 0 / 0 | 6 / 114 |
+| `backup-locks-ahead` | 0 (174 seals of a live holder, 14 live claims by non-backups; the spec's probe counted 189) | 0 | 9 live claims, 169 seals of a live holder |
+| `locks-released-takeover-ahead` (row 23) | 276 | 275 | n/a |
+| `locks-released-takeover` (its control, no offset, 2 000) | 0 | 5: 961, 973, 1253, 1546, 1571 (the default mix: a rebooted or suspended taker) | n/a |
+| `strict-reader-ahead` (row 28, 2 000) | 5: 187, 777, 999 by the offset; 260, 1053 by none | 4: 695, 882, 999 by the offset; 260 and 2391 fail with offset 0 too (`AUTHORITY_SIM_OFFSETS=3:0`) | 0 |
+| `locks-stall-step-delegated-ahead` | 2: 91, 113 | 2: 194, 274 | 14 |
+| `locks-delegate-ahead` (rows 9/30) | 2: 266, 295 | 3: 58, 268, 296 | 0 |
+| `locks-delegated-partition-skew` | 6: 48, 62, 75, 97, 186, 280 | 4: 48, 97, 181, 281 | 93 live claims, 91 seeds |
+| `flex-taker-ahead` | 0 | 0 | 0 |
+
+`locks-executor-behind` (row 6) could not be made to fail: node 3 at -5 s, every
+tagged op sent to it delayed 1.5-5 s (`SimConfig::request_delay_to`, new), the
+client giving up on an op after 700 ms: 0 of 300 in four variants (on
+`5f3b51c`), and its no-offset twin is clean as required. Tokens judged by their
+window alone, over 300 seeds of the final variant: 560 on the P2P path, 20
+local, 2 inbox, 0 replay (the numbers D4 asks for: the inbox and replay paths
+judge by the window about never in these configurations).
+`locks-locker-suspend-coarse` (commit 7's evidence:
+`SimConfig::suspend_accounting_short_ms`, the boot clock counting each suspend
+short as the x86 RTC path does) is clean in every variant tried (0 of 600 at
+suspends of 1.3-2 s and margins of 100-500 ms): the knob is in place, the
+failing configuration is not found yet.
+
+I6 is silent (0 live claims) in every configuration without an offset beyond
+the margin, on `5f3b51c` over 2 000 seeds: `long-strict`, `long-backup`,
+`long-delegated`, `locks`, `locks-skew`, `locks-partition`, `locks-failover`,
+`locks-failover-backup`, `locks-failover-backup-renew`, `backup`,
+`backup-strict`, `acks3`, `locks-delegated`, `locks-writes`,
+`locks-writer-hold-delegated`, `locks-stall-step-delegated`, `flex`,
+`flex-crash`; it fires only in the configurations that carry a 4 s offset.
+
+### Identity
+
+On `5f3b51c`: 21 configurations x 2 000 seeds; on `f7c8fc7`: 18 configurations
+x 500 to 1 000 seeds, base against this commit: failing sets and `SWEEP-FLOORS`
+counters identical. Per-seed run fingerprints identical but for nine of about
+42 000 seeds (`5f3b51c`) and nine of 12 500 (`f7c8fc7`): the two that were
+re-run alone reproduce the same fingerprint on both binaries, so they are
+run-to-run nondeterminism of the sweep's threads.
+
+The known gaps are pinned `#[ignore]`d (`fast_takeover_skewed_successor_known_gaps`
+by the oracle, `locks_holder_step_back_sealed_known_gap`,
+`fast_takeover_skewed_holder_twice_known_gaps`, `locks_claimant_ahead_known_gaps`,
+`strict_claimant_ahead_known_gap`, `strict_reader_ahead_known_gaps`) for commit 3.

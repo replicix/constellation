@@ -548,6 +548,52 @@ impl LocalLock {
     }
 }
 
+/// Plan 43 C7b: the path a tagged op reached its executor's token check by
+/// (a label for [`LockStats::tokens_judged_window`]'s counters only).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TokenPath {
+    /// A forwarded op executed by the sequencer that received it over P2P.
+    #[default]
+    P2p,
+    /// An op submitted on this node and executed here (it is its own
+    /// executor).
+    Local,
+    /// An op drained from the inbox (an S3 batch).
+    Inbox,
+    /// A stranded op replayed from the persisted queue.
+    Replay,
+}
+
+impl TokenPath {
+    pub const COUNT: usize = 4;
+
+    /// The slot of this path in the per-path counters.
+    pub fn index(self) -> usize {
+        match self {
+            TokenPath::P2p => 0,
+            TokenPath::Local => 1,
+            TokenPath::Inbox => 2,
+            TokenPath::Replay => 3,
+        }
+    }
+
+    /// The names of the per-path counters, in slot order.
+    pub const NAMES: [&'static str; 4] = ["p2p", "local", "inbox", "replay"];
+
+    /// Run `f` with this path as the label of every token judged on this
+    /// thread inside it. A funnel that does not label itself is `P2p`.
+    pub fn scope<R>(self, f: impl FnOnce() -> R) -> R {
+        let prev = TOKEN_PATH.with(|p| p.replace(self));
+        let r = f();
+        TOKEN_PATH.with(|p| p.set(prev));
+        r
+    }
+}
+
+thread_local! {
+    static TOKEN_PATH: std::cell::Cell<TokenPath> = const { std::cell::Cell::new(TokenPath::P2p) };
+}
+
 /// Counters for `status.locks`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockStats {
@@ -632,6 +678,15 @@ pub struct LockStats {
     /// lock refused — the op had passed the check before it waited for
     /// the lock (a slow writer ahead of it, a stalled step).
     pub token_rejections_at_write: u64,
+    /// Plan 43 C7b (evidence, no decision reads them): the tokens this
+    /// executor judged, by the path the op took ([`TokenPath::index`]: P2P
+    /// forward, local submit, inbox drain, replay queue) and by how: exactly
+    /// (the grant's record is live here and the token passes its
+    /// confirmation) or by the token's window alone (the grant is not here,
+    /// or the record is not yet confirmed for the token). The window is the
+    /// phase-1 check that needs an offset or a delay bound.
+    pub tokens_judged_exact: [u64; 4],
+    pub tokens_judged_window: [u64; 4],
     /// F1: positions this node reported as covering what it executed (a
     /// grant's floor, an outwait's cut, a delegate's stream head) that
     /// first waited for a tagged write still in its transaction under a
@@ -1967,7 +2022,7 @@ impl LockTables {
             return Ok(());
         }
         let mut g = self.lock();
-        self.judge(&mut g, tag, now)
+        self.judge(&mut g, tag, now, true)
     }
 
     /// F1, the token *at the write*: [`Self::check_tag`] on this table's
@@ -1997,7 +2052,7 @@ impl LockTables {
         let mut g = self.lock();
         let now = g.now_or(checked);
         let now_ms = now.wall.0;
-        match self.judge(&mut g, tag, now) {
+        match self.judge(&mut g, tag, now, false) {
             Err(t) => {
                 g.stats.token_rejections_at_write += 1;
                 tracing::info!(
@@ -2169,7 +2224,11 @@ impl LockTables {
 
     /// The token check itself (see [`Self::check_tag`]), under the
     /// table lock.
-    fn judge(&self, g: &mut Inner, tag: &LockTag, now: Now) -> Result<(), LockToken> {
+    ///
+    /// `count`: record how each token was judged (`LockStats::tokens_judged_*`;
+    /// the check at the write repeats the first check's judgement and does
+    /// not count it again).
+    fn judge(&self, g: &mut Inner, tag: &LockTag, now: Now, count: bool) -> Result<(), LockToken> {
         // One call, two readings (plan 43 C7-H1): a token is judged on this
         // node's wall clock against the minter's wall window (Appendix B
         // row 6), the table's records (and the memory of ended grants) on
@@ -2180,6 +2239,20 @@ impl LockTables {
         }
         if g.drop_expired(now.wait) {
             self.expired_dropped.store(true, Ordering::Relaxed);
+        }
+        if count {
+            let path = TOKEN_PATH.with(|p| p.get()).index();
+            for t in &tag.0 {
+                let exact = g
+                    .grants
+                    .get(&t.grant)
+                    .is_some_and(|e| t.until_ms > e.confirmed_ms);
+                if exact {
+                    g.stats.tokens_judged_exact[path] += 1;
+                } else {
+                    g.stats.tokens_judged_window[path] += 1;
+                }
+            }
         }
         let dead = tag
             .0

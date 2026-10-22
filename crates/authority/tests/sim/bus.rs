@@ -64,6 +64,12 @@ pub struct Bus {
     reply_delay: Mutex<HashMap<NodeId, u64>>,
     /// `SimConfig::deleg_answer_delay`.
     deleg_answer_delay: Mutex<(u64, u64)>,
+    /// `SimConfig::request_delay_to`.
+    request_delay_to: Mutex<Option<(NodeId, (u64, u64))>>,
+    /// Plan 43 C7b: when each `(from, to)` pair last had a message
+    /// delivered (the lease-claim oracle's "the holder heard from the
+    /// backup").
+    last_delivered: Mutex<HashMap<(NodeId, NodeId), tokio::time::Instant>>,
     pub sent: Mutex<u64>,
     pub dropped: Mutex<u64>,
     /// M7: per (from, to) lane, when its last frame is delivered.
@@ -108,6 +114,8 @@ impl Bus {
             taps: Mutex::new(BTreeMap::new()),
             reply_delay: Mutex::new(HashMap::new()),
             deleg_answer_delay: Mutex::new((0, 0)),
+            request_delay_to: Mutex::new(None),
+            last_delivered: Mutex::new(HashMap::new()),
             sent: Mutex::new(0),
             dropped: Mutex::new(0),
             lanes: Mutex::new(HashMap::new()),
@@ -203,6 +211,20 @@ impl Bus {
         *self.deleg_answer_delay.lock().unwrap() = range;
     }
 
+    /// How long ago `from` last had a message delivered to `to` (`None`:
+    /// never).
+    pub fn since_delivery(&self, from: NodeId, to: NodeId) -> Option<Duration> {
+        self.last_delivered
+            .lock()
+            .unwrap()
+            .get(&(from, to))
+            .map(|t| t.elapsed())
+    }
+
+    pub fn set_request_delay_to(&self, delay: Option<(NodeId, (u64, u64))>) {
+        *self.request_delay_to.lock().unwrap() = delay;
+    }
+
     pub fn set_reply_delay(&self, node: NodeId, delay_ms: Option<u64>) {
         let mut d = self.reply_delay.lock().unwrap();
         match delay_ms {
@@ -265,6 +287,16 @@ impl Bus {
                 delay += Duration::from_millis(*extra);
             }
         }
+        if let (PeerMsg::MutateRequest { tag, .. }, Some((target, (lo, hi)))) =
+            (&msg, *self.request_delay_to.lock().unwrap())
+        {
+            // Only an op that carries a lock token is late: the delay of
+            // every request would starve the clients instead.
+            if to == target && hi > 0 && !tag.is_empty() {
+                let extra = self.rng.lock().unwrap().random_range(lo..=hi);
+                delay += Duration::from_millis(extra);
+            }
+        }
         if matches!(
             msg,
             PeerMsg::DelegateStreamAck { .. } | PeerMsg::DelegRenewed { .. }
@@ -287,6 +319,10 @@ impl Bus {
                     if let Some(tap) = tap {
                         tap(from, &msg);
                     }
+                    bus.last_delivered
+                        .lock()
+                        .unwrap()
+                        .insert((from, to), tokio::time::Instant::now());
                     let _ = tx.send(Event::Peer { from, msg });
                     return;
                 }

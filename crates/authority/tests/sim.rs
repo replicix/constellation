@@ -462,6 +462,23 @@ fn replay_seed() {
         Ok("strict-reader-rate-fast") => strict_reader_rate_fast_config(),
         Ok("locks-rate-within-budget") => locks_rate_within_budget_config(),
         Ok("locks-locker-suspend") => locks_locker_suspend_config(),
+        Ok("locks-claimant-ahead") => locks_claimant_ahead_config(),
+        Ok("locks-holder-behind") => locks_holder_behind_config(),
+        Ok("strict-claimant-ahead") => strict_claimant_ahead_config(),
+        Ok("strict-reader-ahead") => strict_reader_ahead_config(),
+        Ok("locks-released-takeover-ahead") => locks_released_takeover_ahead_config(),
+        Ok("locks-released-takeover") => locks_released_takeover_config(),
+        Ok("backup-locks-ahead") => backup_locks_ahead_config(),
+        Ok("fast-takeover-skewed-holder-twice") => fast_takeover_skewed_holder_twice_config(),
+        Ok("locks-skew-60s") => locks_skew_60s_config(),
+        Ok("strict-skew-60s") => strict_skew_60s_config(),
+        Ok("locks-stall-step-delegated-ahead") => locks_stall_step_delegated_ahead_config(),
+        Ok("locks-delegate-ahead") => locks_delegate_ahead_config(),
+        Ok("locks-delegated-partition-skew") => locks_delegated_partition_skew_config(),
+        Ok("locks-executor-behind") => locks_executor_behind_config(),
+        Ok("locks-executor-late") => locks_executor_late_config(),
+        Ok("flex-taker-ahead") => flex_taker_ahead_config(),
+        Ok("locks-locker-suspend-coarse") => locks_locker_suspend_coarse_config(),
         Ok("strict-holder-suspend") => strict_holder_suspend_config(),
         Ok("locks-root-restart-step-forward") => locks_root_restart_step_forward_config(),
         Ok("locks-root-step-forward-then-restart") => locks_root_step_forward_then_restart_config(),
@@ -4863,6 +4880,23 @@ fn sweep_config() {
         "strict-reader-rate-fast" => strict_reader_rate_fast_config(),
         "locks-rate-within-budget" => locks_rate_within_budget_config(),
         "locks-locker-suspend" => locks_locker_suspend_config(),
+        "locks-claimant-ahead" => locks_claimant_ahead_config(),
+        "locks-holder-behind" => locks_holder_behind_config(),
+        "strict-claimant-ahead" => strict_claimant_ahead_config(),
+        "strict-reader-ahead" => strict_reader_ahead_config(),
+        "locks-released-takeover-ahead" => locks_released_takeover_ahead_config(),
+        "locks-released-takeover" => locks_released_takeover_config(),
+        "backup-locks-ahead" => backup_locks_ahead_config(),
+        "fast-takeover-skewed-holder-twice" => fast_takeover_skewed_holder_twice_config(),
+        "locks-skew-60s" => locks_skew_60s_config(),
+        "strict-skew-60s" => strict_skew_60s_config(),
+        "locks-stall-step-delegated-ahead" => locks_stall_step_delegated_ahead_config(),
+        "locks-delegate-ahead" => locks_delegate_ahead_config(),
+        "locks-delegated-partition-skew" => locks_delegated_partition_skew_config(),
+        "locks-executor-behind" => locks_executor_behind_config(),
+        "locks-executor-late" => locks_executor_late_config(),
+        "flex-taker-ahead" => flex_taker_ahead_config(),
+        "locks-locker-suspend-coarse" => locks_locker_suspend_coarse_config(),
         "strict-holder-suspend" => strict_holder_suspend_config(),
         "locks-root-restart-step-forward" => locks_root_restart_step_forward_config(),
         "locks-root-step-forward-then-restart" => locks_root_step_forward_then_restart_config(),
@@ -4942,6 +4976,62 @@ fn sweep_config() {
                 core
             });
         }
+        // Plan 43 C7b: `AUTHORITY_SIM_LEASE_ORACLE=off|strict` sets whether
+        // the lease-claim oracle fails a seed, whatever the configuration
+        // says (`off` counts the failures of the other checks alone).
+        // Plan 43 C7b: for tuning a suspend configuration without
+        // rebuilding: `AUTHORITY_SIM_SUSPEND_SHORT=<ms>` sets
+        // `suspend_accounting_short_ms`, `AUTHORITY_SIM_SUSPEND_MS=<ms>` the
+        // length of every `Suspend` fault, `AUTHORITY_SIM_MARGIN_MS=<ms>` the
+        // nodes' expiry margin.
+        if let Some(ms) = std::env::var("AUTHORITY_SIM_SUSPEND_SHORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            c.suspend_accounting_short_ms = ms;
+        }
+        if let Some(len) = std::env::var("AUTHORITY_SIM_SUSPEND_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            for f in c.faults.iter_mut() {
+                if let FaultKind::Suspend { ms, .. } = &mut f.kind {
+                    *ms = len;
+                }
+            }
+        }
+        if let Some(m) = std::env::var("AUTHORITY_SIM_MARGIN_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            let inner = c.core.clone();
+            c.core = std::sync::Arc::new(move |id, inc| {
+                let mut core = inner(id, inc);
+                core.expiry_margin_ms = m;
+                core
+            });
+        }
+        // `AUTHORITY_SIM_OFFSETS=<node>:<ms>,..` (`none`: no offsets) sets
+        // `clock_offsets`.
+        if let Ok(v) = std::env::var("AUTHORITY_SIM_OFFSETS") {
+            c.clock_offsets = v
+                .split(',')
+                .filter_map(|p| p.split_once(':'))
+                .map(|(n, ms)| (n.parse().expect("node"), ms.parse().expect("ms")))
+                .collect();
+        }
+        // `AUTHORITY_SIM_REQ_DELAY=<node>:<lo>:<hi>`: `request_delay_to`.
+        if let Ok(v) = std::env::var("AUTHORITY_SIM_REQ_DELAY") {
+            let p: Vec<u64> = v.split(':').filter_map(|x| x.parse().ok()).collect();
+            if let [node, lo, hi] = p[..] {
+                c.request_delay_to = Some((node, (lo, hi)));
+            }
+        }
+        match std::env::var("AUTHORITY_SIM_LEASE_ORACLE").as_deref() {
+            Ok("off") => c.strict_lease_claims = false,
+            Ok("strict") => c.strict_lease_claims = true,
+            _ => {}
+        }
         c
     };
     let streamed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -4986,6 +5076,10 @@ fn sweep_config() {
         std::sync::atomic::AtomicU64::new(0),
     ]);
     let floor_ms = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+    // Plan 43 C7b: every holder crash's ms to the first acknowledged
+    // mutation after it (`Report::failover_ms`), over the sweep
+    // (`SWEEP-FAILOVER`).
+    let failover_all = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
     let guard_rises = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let guard_base_rises = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     // The lock configurations, per seed `(seed, longest acquisition,
@@ -5010,6 +5104,7 @@ fn sweep_config() {
         let (fenced, fenced_seeds) = (fenced.clone(), fenced_seeds.clone());
         let (parks, park_seeds) = (parks.clone(), park_seeds.clone());
         let (floors, floor_ms) = (floors.clone(), floor_ms.clone());
+        let failover_all = failover_all.clone();
         let guard_rises = guard_rises.clone();
         let guard_base_rises = guard_base_rises.clone();
         let superseded = superseded.clone();
@@ -5053,6 +5148,10 @@ fn sweep_config() {
                         floors[5].fetch_add(s.ack_floor_cap_saved_ms, ord);
                     }
                     floor_ms.lock().unwrap().extend(report.floor_ms.iter().copied());
+                    failover_all
+                        .lock()
+                        .unwrap()
+                        .extend(report.failover_ms.iter().copied());
                     guard_rises.fetch_add(report.guard_rises, ord);
                     guard_base_rises.fetch_add(report.guard_base_rises, ord);
                     if report.guard_rises > 0 {
@@ -5263,6 +5362,19 @@ fn sweep_config() {
         }
     }
     oracle_totals.lock().unwrap().print(&label, seeds);
+    {
+        let mut v = failover_all.lock().unwrap().clone();
+        v.sort_unstable();
+        let at = |p: usize| v.get(v.len().saturating_sub(1) * p / 100).copied();
+        eprintln!(
+            "SWEEP-FAILOVER {label}: {} holder crashes; ms to the first acknowledged mutation \
+             p50 {:?} p90 {:?} max {:?}",
+            v.len(),
+            at(50),
+            at(90),
+            v.last().copied()
+        );
+    }
     eprintln!(
         "SWEEP-FLOORS {label}: takeovers {}, by a seal {}, floors armed {} (capped {}, saved {} ms \
          in all), cap already past {}; floor ms p50 {:?} p90 {:?} max {:?} over {} floors; \
@@ -5872,6 +5984,13 @@ struct OracleTotals {
     rebuilds: (u64, u64),
     rebuild_seeds: u64,
     max_backups: usize,
+    /// Plan 43 C7b: [TTL claims, of a live holder, seals of a live holder,
+    /// permitted claims] and the seeds with a claim of a live holder.
+    lease: [u64; 4],
+    live_claim_seeds: u64,
+    /// Plan 43 C7b: tokens judged exactly and by their window, per path.
+    tokens_exact: [u64; 4],
+    tokens_window: [u64; 4],
 }
 
 impl OracleTotals {
@@ -5920,6 +6039,19 @@ impl OracleTotals {
             self.seeds_with[i] += u64::from(n > 0);
         }
         self.unmapped += r.acks_unmapped;
+        for (t, n) in self.lease.iter_mut().zip([
+            r.lease_ttl_claims,
+            r.lease_live_claims,
+            r.seals_of_a_live_holder,
+            r.permitted_claims,
+        ]) {
+            *t += n;
+        }
+        self.live_claim_seeds += u64::from(r.lease_live_claims > 0);
+        for i in 0..4 {
+            self.tokens_exact[i] += r.tokens_judged_exact[i];
+            self.tokens_window[i] += r.tokens_judged_window[i];
+        }
         self.rebuilds.0 += r.rebuilds.0;
         self.rebuilds.1 += r.rebuilds.1;
         self.max_backups = self.max_backups.max(r.max_backups);
@@ -5997,6 +6129,30 @@ impl OracleTotals {
             self.unsourced,
             self.unjournaled_landed,
             constellation_authority::core::AckClass::NAMES.iter().zip(self.claimed).collect::<Vec<_>>()
+        );
+        eprintln!(
+            "SWEEP-LEASE-TOTALS {label} seeds {}/{seeds}: ttl claims {} (of a live holder {} in \
+             {} seeds), seals of a live holder {}, permitted claims {}",
+            self.seeds,
+            self.lease[0],
+            self.lease[1],
+            self.live_claim_seeds,
+            self.lease[2],
+            self.lease[3]
+        );
+        let by_path = |v: &[u64; 4]| {
+            constellation_meta::locks::TokenPath::NAMES
+                .iter()
+                .zip(v)
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        eprintln!(
+            "SWEEP-TOKENS {label} seeds {}/{seeds}: judged exactly [{}], judged by the window [{}]",
+            self.seeds,
+            by_path(&self.tokens_exact),
+            by_path(&self.tokens_window)
         );
     }
 }
@@ -7358,8 +7514,9 @@ fn fast_takeover_skewed_successor_credited_config() -> SimConfig {
 /// is on the successors' earlier clocks). One failover only: with a second
 /// cut at 9 s, node 1, ahead of whichever node holds, reads a live lease
 /// as expired and claims it by TTL (plan 43's C7b, outside this chunk: 5
-/// of 2 000 seeds violate mutual exclusion that way with the cap, 15
-/// without it).
+/// of 2 000 seeds violated mutual exclusion that way with the cap, 15
+/// without it; 9 of 2 000 on `5f3b51c`, seeds 245, 375, 424, 680, 878,
+/// 1346, 1492, 1769, 1830: `fast-takeover-skewed-holder-twice`).
 fn fast_takeover_skewed_holder_config() -> SimConfig {
     let first = locks_failover_backup_renew_config().faults;
     SimConfig {
@@ -7367,6 +7524,297 @@ fn fast_takeover_skewed_holder_config() -> SimConfig {
         clock_offsets: vec![(1, 4_000)],
         faults: first.into_iter().take(2).collect(),
         ..locks_failover_backup_renew_config()
+    }
+}
+
+// ===================================================================
+// Plan 43 C7b, commit 1: the offset configurations. A node whose clock is
+// off by more than the margin (the lease TTL in the sim is 6 s) judges
+// another node's lease by its own wall against the holder's: the evidence
+// that the lease-claim observation rule (commit 3) closes. Each of them
+// runs the lease-claim oracle strict (`SimConfig::strict_lease_claims`):
+// a TTL claim that lands inside the old holder's own honour window fails
+// the seed, whether or not a client noticed.
+
+/// The offsets and the client plan the claimant-ahead family shares: nodes
+/// 2 and 3 are 8 s ahead of node 1's clock (more than a whole lease), node
+/// 1 writes from the start and the other two from 1 s.
+fn claimant_ahead(base: SimConfig) -> SimConfig {
+    SimConfig {
+        clock_offsets: vec![(2, 8_000), (3, 8_000)],
+        client_plan: vec![(1, 0, 6), (2, 1_000, 6), (3, 1_000, 6)],
+        strict_lease_claims: true,
+        ..base
+    }
+}
+
+/// Node 2 is cut from node 1 over P2P for 4 s from 1.5 s: it reads node 1's
+/// lease (its dead-root check, its routing), finds it expired by its own
+/// wall (8 s ahead of the holder's) and claims it while node 1 renews it.
+fn claimant_partition() -> ScheduledFault {
+    ScheduledFault {
+        at_ms: 1_500,
+        kind: FaultKind::Partition {
+            a: 1,
+            b: 2,
+            for_ms: 4_000,
+        },
+    }
+}
+
+/// Plan 43 C7b (Appendix B row 2): `locks` with nodes 2 and 3 8 s ahead and
+/// node 2 partitioned from the holder. On `5f3b51c`: 49 of 300 seeds fail
+/// mutual exclusion, 250 TTL takeovers of a live holder; with no partition
+/// 0 of 300 (a claimant needs a reason to read the lease).
+fn locks_claimant_ahead_config() -> SimConfig {
+    SimConfig {
+        faults: vec![claimant_partition()],
+        ..claimant_ahead(locks_config())
+    }
+}
+
+/// `locks-claimant-ahead` the other way round: node 1, the holder, is 8 s
+/// behind and nodes 2 and 3 are right. The holder's wall expiry is 8 s
+/// short on their clocks: a node that reads the lease takes it at once.
+fn locks_holder_behind_config() -> SimConfig {
+    SimConfig {
+        clock_offsets: vec![(1, -8_000)],
+        ..locks_claimant_ahead_config()
+    }
+}
+
+/// `locks-claimant-ahead` on the strict side: the same offsets, plan and
+/// partition under `cto=strict`. The close-to-open check alone passes it
+/// (0 of 300 on `5f3b51c`, although node 2 takes node 1's live lease);
+/// the lease-claim oracle catches the two-holder window.
+fn strict_claimant_ahead_config() -> SimConfig {
+    SimConfig {
+        faults: vec![claimant_partition()],
+        ..claimant_ahead(strict_config())
+    }
+}
+
+/// Appendix B row 28: node 3 only reads, 8 s ahead of the holder's clock;
+/// node 1 writes with its stream to node 3 cut after the first writes, so a
+/// strict read at node 3 that decides the holder is dead (by comparing the
+/// lease's wall expiry with its own clock) tails S3 past the live holder's
+/// acknowledged, unshipped writes. Kept as a clean regression with the
+/// oracle if the close-to-open check cannot be made to fail.
+fn strict_reader_ahead_config() -> SimConfig {
+    SimConfig {
+        read_ratio: 0.5,
+        reader_nodes: vec![3],
+        clock_offsets: vec![(3, 8_000)],
+        client_plan: vec![(1, 0, 30), (3, 600, 40)],
+        faults: vec![ScheduledFault {
+            at_ms: 800,
+            kind: FaultKind::Partition {
+                a: 1,
+                b: 3,
+                for_ms: 8_000,
+            },
+        }],
+        strict_lease_claims: true,
+        ..strict_config()
+    }
+}
+
+/// Appendix B row 23: the holder shuts down gracefully (its lease released
+/// with a grant out, 5 s grants) while node 3, cut from S3, is inside a
+/// critical section; node 2, 8 s ahead, takes the released lease and asks
+/// for the lock. The grace that holds a taker off the releaser's grants is
+/// judged on the taker's wall against the releaser's expiry: ahead, it
+/// finds the lease expired and arms none.
+fn locks_released_takeover_ahead_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(|id, inc| {
+            let mut c = sim::run::sim_core_config(id, inc);
+            c.lock_ttl_ms = 5_000;
+            c
+        }),
+        clients_per_node: 1,
+        ops_per_client: 3,
+        lock_files: 1,
+        lock_ratio: 1.0,
+        lock_shared_ratio: 0.0,
+        lock_ios: (14, 20),
+        lock_io_ms: (250, 400),
+        lock_nodes: vec![2, 3],
+        clock_offsets: vec![(2, 8_000)],
+        client_plan: vec![(1, 0, 1), (2, 2_000, 2), (3, 0, 1)],
+        faults: vec![
+            ScheduledFault {
+                at_ms: 1_100,
+                kind: FaultKind::CutS3 {
+                    node: 3,
+                    for_ms: 4_000,
+                },
+            },
+            ScheduledFault {
+                at_ms: 1_200,
+                kind: FaultKind::ShutdownHolder { restart_ms: 4_000 },
+            },
+        ],
+        strict_lease_claims: true,
+        ..locks_config()
+    }
+}
+
+/// `locks-released-takeover-ahead` with no offset: the control. The taker's
+/// clock agrees with the releaser's, finds the released lease live and arms
+/// the grace; clean.
+fn locks_released_takeover_config() -> SimConfig {
+    SimConfig {
+        clock_offsets: Vec::new(),
+        ..locks_released_takeover_ahead_config()
+    }
+}
+
+/// Appendix B row 24: `locks-claimant-ahead`'s offsets and plan with
+/// backups and no fault. A backup 8 s ahead reads the live holder's expiry
+/// as past and seals at every renewal: an availability storm (189 seals of
+/// a live holder, 188 floors of 7 s armed, in 300 seeds of `5f3b51c`; with
+/// the partition 262), not a safety failure.
+fn backup_locks_ahead_config() -> SimConfig {
+    claimant_ahead(SimConfig {
+        core: std::sync::Arc::new(sim::run::backup_core_config),
+        ..locks_config()
+    })
+}
+
+/// `fast-takeover-skewed-holder` with both cuts of
+/// `locks-failover-backup-renew` (the second at 9 s): node 1, 4 s ahead of
+/// whichever node holds, reads a live lease as expired at the second
+/// failover and claims it by TTL. 9 of 2 000 seeds on `5f3b51c`.
+fn fast_takeover_skewed_holder_twice_config() -> SimConfig {
+    SimConfig {
+        faults: locks_failover_backup_renew_config().faults,
+        strict_lease_claims: true,
+        ..fast_takeover_skewed_holder_config()
+    }
+}
+
+/// `locks-skew` with clocks off by up to a minute (a whole lease TTL at the
+/// default): 3 of 300 seeds on `5f3b51c`, with no fault at all — a stream
+/// gap makes a node read the lease, and it claims a live one.
+fn locks_skew_60s_config() -> SimConfig {
+    SimConfig {
+        clock_skew_ms: 60_000,
+        strict_lease_claims: true,
+        ..locks_skew_config()
+    }
+}
+
+/// `strict` with clocks off by up to a minute and a little P2P loss: the
+/// close-to-open check passes (0 of 300 on `5f3b51c`); the lease-claim
+/// oracle sees the claims.
+fn strict_skew_60s_config() -> SimConfig {
+    SimConfig {
+        clock_skew_ms: 60_000,
+        p2p_drop: 0.03,
+        strict_lease_claims: true,
+        ..strict_config()
+    }
+}
+
+/// Appendix B row 2 in a delegated tree: `locks-stall-step-delegated` with
+/// node 3 3 s ahead (2 of 300 seeds on `5f3b51c`: node 3 claims the root
+/// lease by TTL).
+fn locks_stall_step_delegated_ahead_config() -> SimConfig {
+    SimConfig {
+        clock_offsets: vec![(3, 3_000)],
+        strict_lease_claims: true,
+        ..locks_stall_step_delegated_config()
+    }
+}
+
+/// Appendix B rows 9/30: `locks-writer-hold-delegated` with the delegate
+/// (node 3) 3 s ahead of the root (2 of 300 seeds on `5f3b51c`: a stale
+/// read under a lock, after the root's outwait of node 3's grants).
+fn locks_delegate_ahead_config() -> SimConfig {
+    SimConfig {
+        clock_offsets: vec![(3, 3_000)],
+        strict_lease_claims: true,
+        ..locks_writer_hold_delegated_config()
+    }
+}
+
+/// `locks-delegated-partition` with clocks off by up to 5 s (6 of 300 seeds
+/// on `5f3b51c`: mutual exclusion and stale reads under a lock; rows 2, 6,
+/// 9/30).
+fn locks_delegated_partition_skew_config() -> SimConfig {
+    SimConfig {
+        clock_skew_ms: 5_000,
+        strict_lease_claims: true,
+        ..locks_delegated_partition_config()
+    }
+}
+
+/// Appendix B row 6: the executor behind. `locks-writer-hold-delegated`
+/// (the non-minting executor: node 3 sequences `d2`, the locks are the
+/// root's) with node 3 5 s behind and the P2P delay long enough that a
+/// tagged op can leave its sender inside its window and reach node 3 after
+/// the root's outwait (`SimConfig::request_delay_to`: 1.5 to 2.5 s on every tagged
+/// forward to node 3). The delay alone is clean at offset 0 (the absolute
+/// check refuses the late op); behind, node 3's wall says the token is
+/// still live.
+fn locks_executor_behind_config() -> SimConfig {
+    SimConfig {
+        clock_offsets: vec![(3, -5_000)],
+        request_delay_to: Some((3, (1_500, 2_500))),
+        // The client gives up on an op in flight after 700 ms (in doubt),
+        // unlocks and lets the next holder in: the op is then late.
+        lock_write_wait_ms: Some(700),
+        ..locks_writer_hold_delegated_config()
+    }
+}
+
+/// `locks-executor-behind` without the offset: the delay alone, which must
+/// be clean (the absolute stamp refuses the late op).
+fn locks_executor_late_config() -> SimConfig {
+    SimConfig {
+        clock_offsets: Vec::new(),
+        ..locks_executor_behind_config()
+    }
+}
+
+/// Appendix B row 3: the taker of a continuation epoch's carried lease
+/// reads it on a clock 20 s ahead of the promisers': `flex` with a
+/// promise slack of one and an epoch outage, node 3 (outside the epoch,
+/// reaching S3) 20 s ahead.
+fn flex_taker_ahead_config() -> SimConfig {
+    SimConfig {
+        clock_offsets: vec![(3, 20_000)],
+        strict_lease_claims: true,
+        ..flex_config()
+    }
+}
+
+/// Plan 43 C7b §7: `locks-locker-suspend` on an x86 host with no clocksource
+/// that runs through suspend: each suspend is counted short by up to 900 ms
+/// by the boot clock, so the locker's honour clock under-counts it by that
+/// and honours its grant past the owner's outwait. The shortfall must exceed
+/// the two margins the grant carries (the locker honours until `sent + ttl -
+/// M`, the owner outwaits until `recv + ttl + M`): the sim's 500 ms margins
+/// absorb 900 ms, so this configuration runs with 200 ms ones. Suspended
+/// 1.5 s (the grant window is 1.5 s): a locker whose grant had run 0.2 to
+/// 0.7 s before the suspend honours up to 0.5 s past the owner's end.
+fn locks_locker_suspend_coarse_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(|id, inc| {
+            let mut c = sim::run::sim_core_config(id, inc);
+            c.expiry_margin_ms = 200;
+            c
+        }),
+        suspend_accounting_short_ms: 900,
+        faults: vec![ScheduledFault {
+            at_ms: 2_000,
+            kind: FaultKind::Suspend {
+                who: sim::run::StepOf::Locker,
+                ms: 1_500,
+            },
+        }],
+        ..locks_locker_suspend_config()
     }
 }
 
@@ -8870,27 +9318,129 @@ fn violation_ms(e: &str) -> Option<u64> {
 
 /// Known gap, not a regression (plan 43 C7b, the cross-node lease-expiry
 /// compare under a clock offset beyond the envelope): the *real* cap of
-/// `fast-takeover-skewed-successor` violates mutual exclusion at its second
-/// failover (t about 15 to 16 s; nodes 2 and 3 run 4 s ahead) in about one
-/// seed of 15 000, on 63da672 (seeds 11087 and 18138, which pass with the
-/// ask-again traffic) and with it (5570, 11942, 202261): a node whose clock
-/// is ahead reads the live holder's lease as expired and seals its epoch, the
-/// next holder takes the lease and grants 0.35 to 0.8 s later, and the old
-/// holder, alive, keeps admitting I/O under its own grants. Pinned here so
-/// that C7b sees them fail and then pass; run with `--ignored`.
+/// `fast-takeover-skewed-successor` violated mutual exclusion at its second
+/// failover (t about 13 to 16 s; nodes 2 and 3 run 4 s ahead) in 3 of 30 000
+/// seeds on `5f3b51c` (1716, 1987, 14761); C7a's commits 4 and 6 moved the
+/// trajectories again and none of the 30 000 fails the other checks on
+/// `f7c8fc7`, but the lease-claim oracle (I6) sees a node take the live
+/// holder's lease in 77 of them (874, 1743, 2234, ...). A node whose clock is
+/// ahead reads the live holder's lease as expired, seals its epoch (a backup)
+/// or takes its lease over by TTL (a node that is not), and the old holder,
+/// alive, keeps admitting I/O under its own grants. Pinned here so that C7b
+/// sees them fail and then pass; run with `--ignored`.
 #[test]
 #[ignore = "known gap: plan 43 C7b (a clock offset beyond the envelope)"]
 fn fast_takeover_skewed_successor_known_gaps() {
-    for seed in [5_570, 11_942, 202_261] {
-        let e = run_seed(seed, fast_takeover_skewed_successor_config())
-            .expect_err("fixed? then move the seed to the regression list");
-        assert!(e.contains("mutual exclusion violated"), "seed {seed}: {e}");
-        let at = violation_ms(&e).unwrap_or_else(|| panic!("seed {seed}: no time in {e}"));
+    for seed in [874, 1_743, 2_234] {
+        let cfg = SimConfig {
+            strict_lease_claims: true,
+            ..fast_takeover_skewed_successor_config()
+        };
+        let e = run_seed(seed, cfg).expect_err("fixed? then move the seed to the regression list");
         assert!(
-            at >= FIRST_FAILOVER_FLOOR_END_MS,
-            "seed {seed}: a violation at t={at}: {e}"
+            e.contains("TTL claim of a live lease") || e.contains("mutual exclusion violated"),
+            "seed {seed}: {e}"
         );
     }
+}
+
+/// Known gap (plan 43 C7b, row 2): `locks-holder-step-back-sealed` seed 157
+/// (1 of 10 000 on `f7c8fc7`; seed 6275 on `5f3b51c`): node 3 releases its
+/// lease with grants out; node 1 (stepped back 8 s) takes the released lease;
+/// node 2 reads node 1's new lease, whose wall expiry is 8 s short, as
+/// expired shortly after it was written, claims it by TTL and grants over node
+/// 3's grant.
+#[test]
+#[ignore = "known gap: plan 43 C7b (a clock offset beyond the envelope)"]
+fn locks_holder_step_back_sealed_known_gap() {
+    let e = run_seed(157, locks_holder_step_back_sealed_config())
+        .expect_err("fixed? then move the seed to the regression list");
+    assert!(e.contains("mutual exclusion violated"), "seed 157: {e}");
+}
+
+/// Known gap (plan 43 C7b, row 2): `fast-takeover-skewed-holder` with both of
+/// `locks-failover-backup-renew`'s cuts (the doc of that configuration
+/// measured 5 of 2 000; 9 on `5f3b51c` (245, 375, 424, ...), 8 on `f7c8fc7`:
+/// 312, 503, 935, 1346, 1374, 1530, 1552, 1876, at t 11.6 to 15.8 s): node 1,
+/// 4 s ahead, claims a live lease by TTL at the second failover.
+#[test]
+#[ignore = "known gap: plan 43 C7b (a clock offset beyond the envelope)"]
+fn fast_takeover_skewed_holder_twice_known_gaps() {
+    for seed in [312, 503, 935] {
+        let e = run_seed(seed, fast_takeover_skewed_holder_twice_config())
+            .expect_err("fixed? then move the seed to the regression list");
+        assert!(e.contains("mutual exclusion violated"), "seed {seed}: {e}");
+    }
+}
+
+/// Known gap (plan 43 C7b, row 2): `locks-claimant-ahead` (nodes 2 and 3 8 s
+/// ahead, node 2 partitioned from the holder for 4 s): 51 of 300 seeds fail
+/// mutual exclusion on `f7c8fc7` (49 on `5f3b51c`; the first are 10, 14 and
+/// 21), and the lease-claim oracle sees 249 TTL takeovers of a live holder.
+/// Node 2 reads node 1's lease (dead-root check, routing), finds it expired
+/// by its own wall and claims it while node 1 renews it.
+#[test]
+#[ignore = "known gap: plan 43 C7b (a clock offset beyond the envelope)"]
+fn locks_claimant_ahead_known_gaps() {
+    for seed in [10, 14, 21] {
+        let e = run_seed(seed, locks_claimant_ahead_config())
+            .expect_err("fixed? then move the seed to the regression list");
+        assert!(
+            e.contains("mutual exclusion violated") || e.contains("TTL claim of a live lease"),
+            "seed {seed}: {e}"
+        );
+    }
+}
+
+/// Known gap (plan 43 C7b, row 2): the strict side of the same
+/// configuration. The close-to-open check passes it (0 of 300 seeds) although
+/// node 2 takes node 1's live lease in 219 of them; the lease-claim oracle
+/// (I6) catches the window.
+#[test]
+#[ignore = "known gap: plan 43 C7b (a clock offset beyond the envelope)"]
+fn strict_claimant_ahead_known_gap() {
+    for seed in [1, 2, 3] {
+        let e = run_seed(seed, strict_claimant_ahead_config())
+            .expect_err("fixed? then move the seed to the regression list");
+        assert!(
+            e.contains("TTL claim of a live lease"),
+            "seed {seed}: the oracle did not fire: {e}"
+        );
+    }
+}
+
+/// Known gap (plan 43 C7b, row 28): `strict-reader-ahead` seeds 695, 882 and
+/// 999 of 2 000 fail close-to-open on `f7c8fc7` (187, 777, 999 on
+/// `5f3b51c`): node 3, 8 s ahead, decides the live holder is dead and tails S3
+/// past its acknowledged, unshipped writes. (Seeds 260 and 2391 fail the same
+/// check with an offset of 0 too, `AUTHORITY_SIM_OFFSETS=3:0`: not this gap.)
+#[test]
+#[ignore = "known gap: plan 43 C7b (a clock offset beyond the envelope)"]
+fn strict_reader_ahead_known_gaps() {
+    for seed in [695, 882, 999] {
+        let e = run_seed(seed, strict_reader_ahead_config())
+            .expect_err("fixed? then move the seed to the regression list");
+        assert!(e.contains("close-to-open violated"), "seed {seed}: {e}");
+    }
+}
+
+/// The lease-claim oracle (I6) has nothing to say about a cluster whose
+/// clocks agree: TTL claims happen (a crashed holder's lease is taken once
+/// it ran out), none inside the old holder's own window.
+#[test]
+fn the_lease_claim_oracle_is_silent_without_offsets() {
+    let mut claims = 0;
+    for seed in 0..12u64 {
+        for cfg in [locks_failover_config(), locks_failover_backup_config()] {
+            let report = run_seed(seed, cfg).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+            assert_eq!(report.lease_live_claims, 0, "seed {seed}");
+            claims += report.lease_ttl_claims + report.permitted_claims;
+        }
+    }
+    assert!(
+        claims > 0,
+        "vacuous: no claim of another node's lease was seen"
+    );
 }
 
 /// Plan 43 C7-F F-a: the holder's clock 4 s ahead of its successors'

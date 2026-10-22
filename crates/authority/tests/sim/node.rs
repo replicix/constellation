@@ -330,6 +330,8 @@ pub struct NodeEnv {
     pub node_rates: Vec<(NodeId, i64)>,
     /// See `SimConfig::wall_follows_rate`.
     pub wall_follows_rate: bool,
+    /// See `SimConfig::suspend_accounting_short_ms`.
+    pub suspend_accounting_short_ms: u64,
     pub seed: u64,
     /// Fix "capture under an epoch hold": the modelled chunks.
     pub world: Arc<ChunkWorld>,
@@ -370,7 +372,9 @@ impl NodeEnv {
                     .filter(|(n, _)| *n == id)
                     .map(|(_, ppm)| ppm)
                     .sum();
-                NodeClockState::new(id, ppm, self.wall_follows_rate)
+                let state = NodeClockState::new(id, ppm, self.wall_follows_rate);
+                state.set_suspend_short_ms(self.suspend_accounting_short_ms);
+                state
             })
             .clone()
     }
@@ -527,6 +531,14 @@ impl NodeHandle {
             cfg.backup_rtt_budget_ms,
             cfg.backup_stable_ms,
         );
+        env.oracles.leases.register(
+            id,
+            clock.clone(),
+            shared.clone(),
+            cfg.expiry_margin_ms,
+            cfg.backup_takeover_ms,
+        );
+        env.oracles.leases.set_bus(env.bus.clone());
         let beat_every_ms = cfg.backup_heartbeat_ms.max(1);
         let lane = env.deleg_lane && cfg.delegation && cfg.p2p;
         let driver = Driver {
@@ -1927,7 +1939,8 @@ impl Driver {
             }
         }
         let outcome = outcome_of(
-            constellation_meta::execute_tagged(&self.meta, op, Some(*rid), tag, now),
+            constellation_meta::locks::TokenPath::Local
+                .scope(|| constellation_meta::execute_tagged(&self.meta, op, Some(*rid), tag, now)),
             epoch,
         );
         drop(admission);
@@ -1962,7 +1975,8 @@ impl Driver {
                     let _ = checked.send(HeldPhase::Checked);
                     go_rx.recv().unwrap_or(false)
                 })));
-                let r = constellation_meta::execute_tagged(&meta, &op, Some(rid), &tag, now);
+                let r = constellation_meta::locks::TokenPath::Local
+                    .scope(|| constellation_meta::execute_tagged(&meta, &op, Some(rid), &tag, now));
                 constellation_meta::set_before_write_hook_for_tests(None);
                 let _ = phase_tx.send(HeldPhase::Done(
                     outcome_of(r, epoch),
@@ -2480,6 +2494,10 @@ impl Driver {
         let bucket = self.bucket.clone();
         let id = self.id;
         let (meta, s3_up) = (self.meta.clone(), !self.bucket.is_cut(self.id));
+        // Plan 43 C7b: the permit this node holds as it sends a lease CAS
+        // (the claim oracle's "without a permit").
+        let permit = self.core.lease().takeover_permit;
+        let oracles = self.oracles.clone();
         tokio::spawn(async move {
             let leases = LeaseStore::new(store.clone(), "p0", LeaseMode::Cas);
             let log = LogStore::new(store.clone());
@@ -2491,6 +2509,7 @@ impl Driver {
                     S3Result::LeasePut(leases.try_create(&lease).await.map_err(cas_failure))
                 }
                 S3Op::LeaseSwap { lease, tag } => {
+                    oracles.leases.note_attempt(id, lease.epoch, permit);
                     S3Result::LeasePut(leases.try_swap(&lease, &tag).await.map_err(cas_failure))
                 }
                 S3Op::SegmentPut { seq, payload } => {

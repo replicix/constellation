@@ -587,6 +587,29 @@ impl ProtocolClock {
         self.honour_of(wall, boot, mono, raw)
     }
 
+    /// The honour reading this instant would give, recording nothing: `S`
+    /// and `J` (the running maxima) are read, not raised. For an oracle
+    /// that must see what a node honours without moving the node's clock
+    /// (plan 43 C7b: the simulation's lease-claim check). Exactly
+    /// [`Self::honour`]'s value, except that a later read still raises
+    /// the maxima this one would have.
+    pub fn peek_honour(&self) -> HonourMs {
+        let s = self.sources.read();
+        let diff = |b: u64, m: u64| (b as i128 - m as i128) / 1_000_000;
+        let s_now = (diff(s.boot_ns, s.mono_ns) - diff(self.boot0, self.mono0))
+            .clamp(0, i64::MAX as i128) as i64;
+        let susp = self.suspend.load(Ordering::Acquire).max(s_now);
+        let e_h = ns_to_ms(scaled_ns(
+            s.raw_ns.saturating_sub(self.raw0),
+            self.honour_mul,
+            true,
+        ))
+        .saturating_add(susp);
+        let gap = s.wall_ms.saturating_sub(self.wall0).saturating_sub(e_h);
+        let jump = self.jump.load(Ordering::Acquire).max(gap);
+        HonourMs(self.wall0.saturating_add(e_h).saturating_add(jump))
+    }
+
     /// The wait reading (the raw clock: one host read).
     pub fn wait(&self) -> WaitMs {
         self.wait_of(self.sources.raw_ns())
@@ -758,6 +781,26 @@ mod tests {
         let (w, h, t) = (START + 1_234, START + 1_234, START + 1_234);
         assert_eq!(readings(c.now()), (w, h, t));
         assert_eq!(c.step_stats(), StepStats::default());
+    }
+
+    /// Expectation (plan 43 C7b): `peek_honour` returns what `honour` would
+    /// and records nothing: a forward step peeked at and then undone leaves
+    /// no `J` behind, as if nobody had looked.
+    #[test]
+    fn a_peek_reads_honour_and_records_nothing() {
+        let (s, c) = stub();
+        tick(&s, 1_000);
+        step(&s, 3_000);
+        let peeked = c.peek_honour();
+        // Undo the step before anything reads: the peek raised no `J`.
+        step(&s, -3_000);
+        tick(&s, 100);
+        let after = c.honour();
+        assert_eq!(peeked.0, START + 4_000);
+        assert_eq!(after.0, START + 1_100, "the peek must not have raised J");
+        // Peek and read agree on an unstepped clock.
+        tick(&s, 50);
+        assert_eq!(c.peek_honour(), c.honour());
     }
 
     /// Expectation (P4): a backward wall step of 3 s changes neither

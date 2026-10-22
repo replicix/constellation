@@ -4685,6 +4685,7 @@ that makes the invariant hold (C1 turns `strict_lone` on in the
 | I2 (c) verbatim | end of run: an OK answered under a group class is completed in the log under the identity it was committed with (epoch, node and journal row, or `(gen, idx)`) and with its records as one run | `non_verbatim` | `strict_identity` |
 | I4 `unacked_fails_never_lands_late` | end of run: an op answered in doubt (the first `InDoubt` answer; the sim's client resubmits, production answers `EIO` at once) that lands after an op its node invoked later; and (plan 43 C2a) a refusal that journaled no `Refused` row whose rid the log completes | `late_landings`, `unjournaled_landed` | `strict_settle` |
 | I5 `speculation_only_lone` | end of run: an OK that was rolled back whose answer was not class Lone | `non_lone_rollbacks` | `strict_lone` |
+| I6 `no_ttl_claim_of_a_live_lease` (plan 43 C7b) | at every lease CAS the sim's bucket accepts that replaces another node's unreleased, unfenced lease without a permit (`takeover_permit` of the claimant when it sent the CAS, naming that epoch and holder, with the backup listed or the policy `S3`): the predecessor's own honour end for the body (`holder_expires_ms` less its margin, on the clock `holder_clock` names, read with `ProtocolClock::peek_honour`, which moves no clock) against the predecessor's honour reading now. A claim before that end is a violation ("TTL claim of a live lease: node X took epoch E of node Y at true t ms, which honours it for another u ms"); a predecessor that is dead or restarted since honours nothing | `lease_ttl_claims`, `lease_live_claims` (the violations), `seals_of_a_live_holder` (a permitted claim of a `Backup` lease whose holder still honoured it: count only), `permitted_claims` | `strict_lease_claims` |
 
 **Classes** (`constellation_authority::core::AckClass`): `Archive` (an applied,
 unfenced log segment carries the outcome), `RootGroup` (the lease object's
@@ -4710,6 +4711,47 @@ fingerprint seed by seed when the oracles' plumbing changed no schedule (the
 identity sweep). With it, `SWEEP-BUDGET` names each seed whose strict
 durability the one-backup failure budget waived (`Cluster::note_takedown`,
 `note_s3_cut`).
+
+**Plan 43 C7b: offsets beyond the margin.** The cross-node compares (a claimant
+judging a lease by its own wall against the holder's wall expiry) are safe only
+while every offset is below the margin; the configurations below set offsets of
+a whole lease and more, each with I6 strict (`strict_lease_claims`; I6 is
+judged last, so a seed that also fails another check reports that one, and
+`AUTHORITY_SIM_LEASE_ORACLE=off|strict` sets the flag for any configuration to
+count the other checks' failures alone). `SWEEP-LEASE seed N` (any seed with a
+claim of a live holder or a seal of one), `SWEEP-LEASE-TOTALS` and
+`SWEEP-TOKENS` (the fencing tokens judged exactly, and by their window alone,
+per path: `p2p`, `local`, `inbox`, `replay`; `LockStats::tokens_judged_*`)
+print the counts. Tuning knobs, read by the sweep without a rebuild:
+`AUTHORITY_SIM_OFFSETS=<node>:<ms>,..` (`none`), `AUTHORITY_SIM_REQ_DELAY=<node>:<lo>:<hi>`
+(`SimConfig::request_delay_to`: every token-carrying forward to that node is late),
+`AUTHORITY_SIM_SUSPEND_SHORT`, `AUTHORITY_SIM_SUSPEND_MS` and `AUTHORITY_SIM_MARGIN_MS`.
+The numbers are with the I6 flag off, 300 seeds unless said:
+
+| Configuration | Fails (`f7c8fc7`; `5f3b51c` in brackets) | Mechanism |
+|---|---|---|
+| `locks-claimant-ahead` (nodes 2, 3 at +8 s, node 2 partitioned from the holder 1.5-5.5 s) | 51 of 300 (49); I6: 249 TTL takeovers of a live holder | node 2 reads the lease, finds it expired by its clock, claims it (row 2) |
+| `locks-holder-behind` (node 1 at -8 s) | the same: a trajectory depends on relative offsets only | row 2 |
+| `strict-claimant-ahead` | 0 (close-to-open passes); I6: 313 TTL claims, 219 seeds with a live one | the strict oracle does not see the two-holder window |
+| `strict-reader-ahead` (node 3 reads only, +8 s, cut from node 1) | 2 000 seeds: 695, 882, 999 by the offset (187, 777, 999); 260 and 2391 fail with offset 0 too (`AUTHORITY_SIM_OFFSETS=3:0`): close-to-open | node 3 decides the live holder is dead and tails S3 past acknowledged, unshipped writes (row 28) |
+| `locks-released-takeover-ahead` | 275 of 300 (276); control `locks-released-takeover` (no offset): 5 of 2 000 with the default mix, 0 without | a taker ahead of a released lease arms no lock grace (row 23) |
+| `backup-locks-ahead` (backups, no fault) | 0; I6: 9 TTL claims of a live holder (a non-backup node), 169 seals of a live holder | row 24's storm, and row 2 for the non-backups |
+| `fast-takeover-skewed-holder-twice` (2 000 seeds) | 8 (9); I6: 1 040 live claims | node 1, 4 s ahead, claims a live lease at the second failover |
+| `fast-takeover-skewed-successor` (30 000) / `locks-holder-step-back-sealed` (10 000) | 0 (3) / 1: 157 (1: 6275); I6: 77 / 14 live claims | row 2 at the second failover; a stepped-back holder |
+| `locks-skew-60s`, `strict-skew-60s` | 0, 0 (3, 0); I6 (strict): 6 and 114 | row 2 |
+| `locks-stall-step-delegated-ahead`, `locks-delegate-ahead` (node 3 at +3 s) | 2 (2); 3 (2) | row 2; rows 9/30 (an outwait of node 3's grants, then a stale read) |
+| `locks-delegated-partition-skew` (`clock_skew_ms 5 000`) | 4 of 300 (6); I6: 93 live claims | rows 2, 9/30 |
+| `locks-executor-behind` / `-late` (row 6: node 3 at -5 s / no offset, every tagged op sent to node 3 delayed 1.5-2.5 s (`SimConfig::request_delay_to`), the client giving up after 700 ms) | 0 / 0 of 300 (also with 2.5-3.5 s and 3-5 s) on `5f3b51c`: kept clean; tokens judged by the window alone: 560 p2p, 20 local, 2 inbox, 0 replay | the non-minting executor judges a token on its own wall (commit 6) |
+| `flex-taker-ahead` (row 3: node 3 +20 s) | 0 | the model is the primary evidence |
+| `locks-locker-suspend-coarse` (`suspend_accounting_short_ms 900`, margins 200 ms, a 1.5 s suspend) | 0 of 600 in five variants (suspends 1.3-2 s, margins 100-500 ms; `AUTHORITY_SIM_SUSPEND_MS`, `_MARGIN_MS`, `_SUSPEND_SHORT`): not failing yet | commit 7's: the boot clock counts each suspend short, as the x86 RTC path |
+
+The known gaps are pinned (`#[ignore]`: `fast_takeover_skewed_successor_known_gaps`
+seeds 874, 1743, 2234; `locks_holder_step_back_sealed_known_gap` 157;
+`fast_takeover_skewed_holder_twice_known_gaps` 312, 503, 935;
+`locks_claimant_ahead_known_gaps` 10, 14, 21; `strict_claimant_ahead_known_gap`;
+`strict_reader_ahead_known_gaps` 695, 882, 999), and
+`the_lease_claim_oracle_is_silent_without_offsets` pins I6's silence on the
+failover configurations whose clocks agree.
 
 **The sim's rebuild.** `Action::RebuildReplica` (a deposed holder's recovery
 when its journal rows were not captured, or a replica the log was pruned past)

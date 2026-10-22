@@ -20,6 +20,8 @@
 //! decides whether a count fails the run.
 
 use super::bus::Bus;
+use super::clock::Clock;
+use super::node::Shared;
 use super::store::Bucket;
 use constellation_authority::core::AckClass;
 use constellation_authority::segment::{self, Segment};
@@ -63,11 +65,21 @@ pub struct Oracles {
     /// Outcomes the core answered a client with that no sequencer decided
     /// (`AnswerSource::None`: a node's own error): not judged.
     pub acks_unsourced: AtomicU64,
+    /// Plan 43 C7b, I6: the lease-claim oracle (see [`LeaseClaims`]).
+    pub leases: Arc<LeaseClaims>,
 }
 
 impl Oracles {
     pub fn new(bucket: Arc<Bucket>) -> Arc<Self> {
+        let leases = Arc::new(LeaseClaims::default());
+        {
+            let leases = leases.clone();
+            bucket.set_lease_hook(Arc::new(move |node, prev, new| {
+                leases.landed(node, prev, new)
+            }));
+        }
         Arc::new(Self {
+            leases,
             bucket,
             stores: Mutex::new(BTreeMap::new()),
             budgets: Mutex::new(BTreeMap::new()),
@@ -968,6 +980,8 @@ pub struct Findings {
     pub i2c: Vec<String>,
     pub i4: Vec<String>,
     pub i5: Vec<String>,
+    /// I6 (plan 43 C7b): TTL claims of a live lease.
+    pub i6: Vec<String>,
 }
 
 impl Findings {
@@ -980,6 +994,7 @@ impl Findings {
             &self.i4,
             &self.unjournaled_landed,
             &self.i5,
+            &self.i6,
         ]
         .into_iter()
         .flat_map(|v| v.iter().take(5).cloned())
@@ -1001,6 +1016,7 @@ pub fn end_of_run(
 ) -> Findings {
     let mut f = Findings {
         i1: o.i1_violations.lock().unwrap().clone(),
+        i6: o.leases.violations.lock().unwrap().clone(),
         i2: o
             .identity
             .lock()
@@ -1212,6 +1228,169 @@ fn not_verbatim(
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------
+// I6 (plan 43 C7b): no TTL claim of a live lease.
+// ---------------------------------------------------------------------
+
+/// A claimant's `takeover_permit`: the epoch and holder it may take over.
+type Permit = Option<(u64, NodeId)>;
+
+/// What one node's latest incarnation lets the lease-claim oracle see.
+struct ClaimNode {
+    clock: Clock,
+    shared: Arc<Shared>,
+    /// The node's `expiry_margin_ms`: its holder honours its lease only
+    /// until `holder_expires_ms - margin`.
+    margin_ms: u64,
+    /// The node's `backup_takeover_ms`: a seal of a holder that heard from
+    /// the sealing backup within it is a seal of a live holder.
+    window_ms: u64,
+}
+
+/// The direct two-lease-holders oracle (plan 43 C7b, commit 1; invariant
+/// I6): at every lease CAS the bucket accepts that replaces another node's
+/// unreleased, unfenced lease **without a permit** (a seal or an `ack=s3`
+/// takeover, which fence the old holder by another route), the
+/// predecessor's own honour end for that body is looked up on the
+/// predecessor's honour clock (`Lease::holder_expires_ms` on the clock
+/// `holder_clock` names, less its margin: the window in which its holder
+/// admits work under the body) and compared with the predecessor's honour
+/// reading *now* (`ProtocolClock::peek_honour`, which moves no clock). A
+/// claim before that end is a violation: two nodes may act as the holder.
+///
+/// It reads true state only the harness has (the predecessor's clock), and
+/// judges nothing the core claims. A predecessor that is dead, or that has
+/// restarted since (another `holder_clock`), honours nothing: not judged.
+///
+/// Counted always, in every configuration; a count fails the run only under
+/// `SimConfig::strict_lease_claims`.
+#[derive(Default)]
+pub struct LeaseClaims {
+    nodes: Mutex<BTreeMap<NodeId, ClaimNode>>,
+    bus: Mutex<Option<Arc<Bus>>>,
+    /// `(claimant, epoch it writes)` -> the claimant's `takeover_permit`
+    /// when it sent the CAS (the epoch and holder it holds a permit for).
+    intents: Mutex<HashMap<(NodeId, u64), Permit>>,
+    /// Claims of another node's unreleased, unfenced lease with no permit.
+    pub ttl_claims: AtomicU64,
+    /// Of those, the ones that landed inside the predecessor's honour
+    /// window: the violations.
+    pub live_claims: AtomicU64,
+    /// Permitted claims of a `Backup`-policy lease (a seal's takeover)
+    /// whose holder still honoured its lease and had heard from the sealing
+    /// backup within the takeover window: count only, not a violation (the
+    /// seal fences the holder by the segment epoch).
+    pub seals_of_a_live_holder: AtomicU64,
+    /// All permitted claims of an unreleased foreign lease.
+    pub permitted_claims: AtomicU64,
+    pub violations: Mutex<Vec<String>>,
+}
+
+impl LeaseClaims {
+    /// `node`'s current incarnation (its clock, liveness and margin).
+    pub fn register(
+        &self,
+        node: NodeId,
+        clock: Clock,
+        shared: Arc<Shared>,
+        margin_ms: u64,
+        window_ms: u64,
+    ) {
+        self.nodes.lock().unwrap().insert(
+            node,
+            ClaimNode {
+                clock,
+                shared,
+                margin_ms,
+                window_ms,
+            },
+        );
+    }
+
+    /// The run's bus (what the holder heard from whom, and when).
+    pub fn set_bus(&self, bus: Arc<Bus>) {
+        *self.bus.lock().unwrap() = Some(bus);
+    }
+
+    /// `node` is about to send a lease CAS writing `epoch`, holding this
+    /// takeover permit.
+    pub fn note_attempt(&self, node: NodeId, epoch: u64, permit: Option<(u64, NodeId)>) {
+        self.intents.lock().unwrap().insert((node, epoch), permit);
+    }
+
+    /// A lease CAS landed in the bucket (called with the body it replaced).
+    pub fn landed(&self, node: NodeId, prev: Option<Lease>, new: Lease) {
+        let Some(prev) = prev else { return };
+        // A claim: another node, the next epoch, on a lease that was held
+        // and neither released nor fenced.
+        if new.holder != node
+            || prev.holder == 0
+            || prev.holder == node
+            || prev.released
+            || new.epoch != prev.epoch + 1
+            || prev.retired.contains(&prev.holder)
+        {
+            return;
+        }
+        let permit = self
+            .intents
+            .lock()
+            .unwrap()
+            .get(&(node, new.epoch))
+            .copied()
+            .flatten();
+        let permitted = permit == Some((prev.epoch, prev.holder))
+            && match prev.ack_policy {
+                AckPolicy::Backup => prev.backups.contains(&node),
+                AckPolicy::S3 => true,
+                AckPolicy::Local => false,
+            };
+        let nodes = self.nodes.lock().unwrap();
+        // How much longer the predecessor's own process honours the body,
+        // if it does at all.
+        let honoured = nodes.get(&prev.holder).and_then(|n| {
+            if !n.shared.alive.load(Ordering::SeqCst)
+                || prev.holder_clock == 0
+                || prev.holder_clock != n.clock.id()
+                || prev.holder_expires_ms == 0
+            {
+                return None;
+            }
+            let end = prev.holder_expires_ms - n.margin_ms as i64;
+            let left = end - n.clock.peek_honour().0;
+            (left > 0).then_some((left, n.clock.elapsed_ms()))
+        });
+        if permitted {
+            self.permitted_claims.fetch_add(1, Ordering::Relaxed);
+            // A seal of a live holder: its own process still honours the
+            // lease and has heard from the sealing backup within the
+            // takeover window (a holder cut off from its backup is what a
+            // seal is for).
+            let heard = nodes.get(&prev.holder).is_some_and(|h| {
+                self.bus
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|b| b.since_delivery(node, prev.holder))
+                    .is_some_and(|d| d.as_millis() as u64 <= h.window_ms)
+            });
+            if prev.ack_policy == AckPolicy::Backup && honoured.is_some() && heard {
+                self.seals_of_a_live_holder.fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
+        self.ttl_claims.fetch_add(1, Ordering::Relaxed);
+        if let Some((left, at_ms)) = honoured {
+            self.live_claims.fetch_add(1, Ordering::Relaxed);
+            self.violations.lock().unwrap().push(format!(
+                "TTL claim of a live lease: node {node} took epoch {} of node {} at true {at_ms} ms, \
+                 which honours it for another {left} ms",
+                new.epoch, prev.holder
+            ));
+        }
+    }
 }
 
 #[cfg(test)]

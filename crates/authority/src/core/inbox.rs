@@ -1551,13 +1551,15 @@ impl Core {
                 }
             }
             let executed = match &decoded {
-                Ok(decoded_op) => replica.execute_inbox(
-                    ack,
-                    decoded_op,
-                    rid,
-                    &constellation_meta::locks::LockTag::from_wire(&op.lock_tag),
-                    now,
-                ),
+                Ok(decoded_op) => constellation_meta::locks::TokenPath::Inbox.scope(|| {
+                    replica.execute_inbox(
+                        ack,
+                        decoded_op,
+                        rid,
+                        &constellation_meta::locks::LockTag::from_wire(&op.lock_tag),
+                        now,
+                    )
+                }),
                 Err(_) => Err(MetaError::Invalid("undecodable inbox op".into())),
             };
             self.inbox_unblock(now, &touched);
