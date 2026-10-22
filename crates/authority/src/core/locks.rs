@@ -465,6 +465,14 @@ pub(crate) struct LockState {
     /// granted over them (sim `locks-delegated` seed 196102, two
     /// exclusive holders).
     handed: BTreeMap<u64, Vec<Grant>>,
+    /// Root, plan 43 C7-F follow-up (the review's H1): the grants a
+    /// delegate's recall answer handed back, per generation, by `(grant,
+    /// recall)`. A duplicate of the answer (the peer layer re-sent it, a
+    /// retried stream) is the same message: installed again, a record the
+    /// root released or superseded since would come back, and one it kept
+    /// would be restamped (later), and F-c admits a late renewal from a
+    /// record. Each pair installs once; dropped with the generation.
+    returned: BTreeMap<u64, std::collections::BTreeSet<(GrantId, OpId)>>,
     /// Delegate: the moved grant ids a generation installed (a re-sent
     /// handoff installs each once: a grant released or replaced here
     /// since is not revived).
@@ -6073,6 +6081,7 @@ impl Core {
     /// on the same inode, or a conflicting one, is newer and stays (see
     /// `LockTables::install_if_consistent`).
     pub(crate) fn lock_on_generation_ended(&mut self, now: Now, gen: u64, replica: &dyn Replica) {
+        self.lk.returned.remove(&gen);
         if self.lock_final_blocks() {
             // Plan 43 C7-F F-c: nothing is added under a lease whose final
             // mirror went (the copies are not a grant of this table).
@@ -6115,6 +6124,7 @@ impl Core {
     pub(crate) fn lock_install_returned(
         &mut self,
         now: Now,
+        req: OpId,
         gen: u64,
         back: constellation_meta::locks::LockHandback,
         replica: &dyn Replica,
@@ -6164,6 +6174,24 @@ impl Core {
                 );
             }
             return;
+        }
+        // Each (grant, recall) once: a duplicate of the answer brings back
+        // nothing the first did not (a record released or superseded since
+        // stays gone), and extends none (it would be restamped later).
+        let seen = self.lk.returned.entry(gen).or_default();
+        let before = grants.len();
+        let grants: Vec<GrantWire> = grants
+            .into_iter()
+            .filter(|g| seen.insert((g.id, req)))
+            .collect();
+        if grants.len() < before {
+            self.stats.lock_returned_duplicates += (before - grants.len()) as u64;
+            tracing::debug!(
+                node = self.cfg.node_id,
+                gen,
+                n = before - grants.len(),
+                "a duplicate recall answer; its grants dropped"
+            );
         }
         if let Some(handed) = self.lk.handed.get_mut(&gen) {
             handed.retain(|h| !grants.iter().any(|g| g.node == h.node && g.ino == h.ino));
@@ -6679,6 +6707,7 @@ impl Core {
         self.lk.recall_by_req.clear();
         self.lk.handoff.clear();
         self.lk.handed.clear();
+        self.lk.returned.clear();
         self.lk.handed_floor.clear();
         self.lk.grace.clear();
         self.lk.unused_grants.clear();

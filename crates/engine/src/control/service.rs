@@ -612,6 +612,7 @@ impl EngineControl {
                     holder_reads: stats.lock_holder_reads,
                     holder_reads_shared: stats.lock_holder_read_shared,
                     holder_reads_cached: stats.lock_holder_read_cached,
+                    recall_answer_duplicates: stats.lock_returned_duplicates,
                     answers_order_bypassed: stats.lock_order_bypassed,
                     answers_order_held: stats.lock_order_holds,
                     grace_end_serves: stats.lock_grace_end_serves,

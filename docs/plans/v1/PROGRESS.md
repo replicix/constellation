@@ -57364,3 +57364,25 @@ its CPUs.
   behind) returns from a ring thread at once and runs from the pool; an
   inline wait on a ring thread is refused; a mutation's waits end with its
   caller's signal.
+
+### H1: a duplicate recall answer reinstates and extends nothing
+
+A delegate's recall answer (`DelegRecalled`) hands its grants back to the
+root, which installs them restamped or with what was left of their record
+(`lock_install_returned`, `lock_install_moved(gen 0)`). The generation
+stays live until the delegate's stream has caught up with the position the
+answer names, so a duplicate of the answer (the peer layer re-sent it)
+found it live and installed the grants again: a record the root had
+released or superseded since came back, and one it kept was restamped
+later than the first copy's. F-c admits a late renewal from a record, which
+made that riskier.
+
+- `Core::lock_install_returned` takes the recall's id and keeps, per
+  generation, the `(grant, recall)` pairs it installed
+  (`LockState::returned`, dropped with the generation and with the lease);
+  a grant already handed back under that recall is dropped, counted
+  (`recall_answer_duplicates` in status). The floor and the barrier of an
+  answer are joins and restate the first copy's.
+- Test (fails before: the second copy extends the record by the 2 s that
+  passed, a third brings back a released one): a duplicated answer
+  reinstates and extends nothing.

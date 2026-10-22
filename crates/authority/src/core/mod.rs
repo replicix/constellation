@@ -1000,6 +1000,9 @@ pub struct Stats {
     pub lock_holder_reads: u64,
     pub lock_holder_read_shared: u64,
     pub lock_holder_read_cached: u64,
+    /// Plan 43 C7-F follow-up (H1): grants of a delegate's recall answer
+    /// that an earlier copy of the answer had handed back already (dropped).
+    pub lock_returned_duplicates: u64,
     /// Answers that grant and extend nothing and went ahead of a held
     /// answer to the same peer (they used to queue behind it), and answers
     /// that waited for the order of the answers to their peer alone.
@@ -2289,7 +2292,7 @@ impl Core {
                 locks,
             } => {
                 // Back in the root's table (tag 0).
-                self.lock_install_returned(now, gen, locks, replica);
+                self.lock_install_returned(now, req, gen, locks, replica);
                 self.on_deleg_recalled(now, req, gen, through, replica, out)
             }
             PeerMsg::LockRequest {

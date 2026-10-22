@@ -1717,6 +1717,9 @@ pub struct LockStatus {
     pub holder_reads: u64,
     pub holder_reads_shared: u64,
     pub holder_reads_cached: u64,
+    /// Grants of a delegate's recall answer that an earlier copy of it had
+    /// handed back already, dropped (the root installs each once).
+    pub recall_answer_duplicates: u64,
     /// Lock answers that grant and extend nothing and went ahead of a held
     /// answer to the same peer, and answers that waited for the order of
     /// the answers to their peer alone.

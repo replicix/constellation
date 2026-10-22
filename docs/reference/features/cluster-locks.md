@@ -454,6 +454,16 @@ copy's old holder an upgrade beside the delegate's live exclusive grant
 (`locks-unlinked-delegated-partition` seed 7455). Its floor and barrier
 still count while the root knows the generation.
 
+A recall answer installs each grant it hands back once, by (grant,
+recall): the generation stays live until the delegate's stream has
+caught up with the position the answer names, and a copy of the answer
+that arrives meanwhile (a re-send) would otherwise install the grants
+again — a record the root had released or superseded since back in its
+table (from which a late renewal is admitted), and one it kept restamped
+later than the first copy's. The copy's grants are dropped, counted
+(`recall_answer_duplicates`); its floor and barrier are joins and
+restate what the first had.
+
 A grant lapses when its holding node, or that node's path to the
 sequencer, stalls past what is left of the grant's window: a partition,
 a stopped or swapped-out daemon, an overloaded host. Renewed half-way
@@ -1816,6 +1826,8 @@ for both roles:
   told to wait because their owner could not be reached), `holder_reads`,
   `holder_reads_shared` and `holder_reads_cached` (the lease reads those
   requests made, and the requests that shared one),
+  `recall_answer_duplicates` (grants of a delegate's recall answer dropped
+  because an earlier copy had handed them back),
   `stale_owner_answers`, `answers_order_bypassed` and
   `answers_order_held` (above),
   `fenced_owners` (the owners fenced now: `owner`, `pid`, `since_ms`,

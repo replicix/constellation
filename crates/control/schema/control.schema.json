@@ -4681,6 +4681,12 @@
           "minimum": 0,
           "type": "integer"
         },
+        "recall_answer_duplicates": {
+          "description": "Grants of a delegate's recall answer that an earlier copy of it had\nhanded back already, dropped (the root installs each once).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "recalled": {
           "description": "Recalls received (and how many found local locks), releases sent.",
           "format": "uint64",
@@ -4878,6 +4884,7 @@
         "holder_reads",
         "holder_reads_shared",
         "holder_reads_cached",
+        "recall_answer_duplicates",
         "answers_order_bypassed",
         "answers_order_held",
         "grace_end_serves",

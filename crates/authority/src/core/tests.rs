@@ -25196,6 +25196,57 @@ mod locks {
         );
     }
 
+    /// Plan 43 C7-F follow-up (the review's H1): a duplicate of a delegate's
+    /// recall answer reinstates and extends nothing. The root installs the
+    /// grants an answer hands back as it receives it, once per (grant,
+    /// recall): the generation stays live until the stream has caught up
+    /// with the answer's position, so a copy that arrives meanwhile (the
+    /// peer layer re-sent it) found the generation live and installed the
+    /// grants again — restamped later than the first copy's record (an
+    /// extension), and back after the root released one (a record from
+    /// which F-c admits a late renewal).
+    #[test]
+    fn a_duplicated_recall_answer_reinstates_and_extends_nothing() {
+        let (mut d, dir, f, _) = carry_delegate(5_000);
+        delegation_left(&mut d, 60_000);
+        let g = unused_grant(&mut d, f);
+        d.advance(1_000);
+        let back = recall_answer(&mut d, dir, OpId(5));
+        assert_eq!(back.grants.len(), 1, "{back:?}");
+        let (mut r, _, _, recall) = recalling_root(5_000);
+        r.now = d.now;
+        // The answer drains the delegate, but its stream is not here yet.
+        let answer = |r: &mut Harness| {
+            r.step(Event::Peer {
+                from: 3,
+                msg: PeerMsg::DelegRecalled {
+                    req: recall,
+                    gen: 7,
+                    through: 1_000_000,
+                    locks: back.clone(),
+                },
+            })
+        };
+        answer(&mut r);
+        let first = record_end(&r, g);
+        assert_eq!(r.core.stats.lock_moved, 1);
+        // The same answer again, later: nothing moves, nothing is extended.
+        r.advance(2_000);
+        answer(&mut r);
+        assert_eq!(record_end(&r, g), first, "restamped later");
+        assert_eq!(r.core.stats.lock_moved, 1);
+        assert_eq!(r.core.stats.lock_returned_duplicates, 1);
+        // The grant's holder releases it; the answer once more brings it
+        // back to nobody.
+        release_of(&mut r, 4, f, g);
+        assert!(r.meta.locks().get(g).is_none(), "released");
+        r.advance(10);
+        answer(&mut r);
+        assert!(r.meta.locks().get(g).is_none(), "reinstated by a duplicate");
+        assert_eq!(r.core.stats.lock_moved, 1);
+        assert_eq!(r.core.stats.lock_returned_duplicates, 2);
+    }
+
     /// Core test 4: a grant its holder renewed is carried too (it may be
     /// gone since, or have released at the old owner after the move): the
     /// receiver records what was left of it, not a restamp.

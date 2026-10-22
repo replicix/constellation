@@ -3424,7 +3424,12 @@ successor whose clock is ahead got no quarantine").
   thread (a read parks on the pool at its fence; any other op that would
   wait there is refused `EIO` as before F-c), and counted in status
   (`lapse_inline_waits`, `_wait_ms_total`, `_interrupted`,
-  `_refused_thread`, `lapse_late_parks`).
+  `_refused_thread`, `lapse_late_parks`). *H1 (landed):* the root installs
+  the grants of a delegate's recall answer once per (grant, recall): a
+  duplicate that arrived while the generation was still live (its stream
+  not caught up) reinstated a record the root had released and restamped
+  one it kept, which F-c admits a late renewal from; dropped, counted
+  (`recall_answer_duplicates`).
 
 F-a changes the floor's argument by one step (the floor ends at the
 earlier of the bound and the cap, each sufficient on its own); F-b and
