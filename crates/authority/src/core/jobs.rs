@@ -1980,11 +1980,10 @@ impl Core {
     pub(crate) fn dead_root_check(&mut self, now: Now, out: &mut Vec<Action>) {
         // (This node's own unexpired lease, an epoch close's pending
         // re-claim, is no dead root's either.)
-        let seen_live = self
-            .lease
-            .last_seen
-            .as_ref()
-            .is_some_and(|l| l.holder != 0 && !l.released && !l.is_expired(now.wall.0));
+        // Plan 43 C7b: seen live on this node's own observation (the key
+        // watched for less than its holder's TTL), not by the holder's wall
+        // expiry against this clock.
+        let seen_live = self.lease.live_holder_seen(now, &self.cfg).is_some();
         if self.dead_root_get
             || seen_live
             || self.mode.suspended
@@ -2031,7 +2030,7 @@ impl Core {
         if lease.holder == 0
             || lease.holder == self.cfg.node_id
             || lease.released
-            || !lease.is_expired(now.wall.0)
+            || !self.lease.claimable_observed(now, &self.cfg)
             || self.lease.held.is_some()
             || !self.awaits_dead_root(now)
         {
@@ -2728,7 +2727,13 @@ impl Core {
                 epoch,
                 prev,
                 tag,
+                retry_at,
             } => {
+                // Plan 43 C7b: the next read is worth making when this
+                // node's observation lets it claim, not on the backoff
+                // alone (a cold claimant must not poll S3 every 100 ms for
+                // a lease TTL).
+                self.acquire_retry_hint = retry_at;
                 tracing::debug!(
                     node = self.cfg.node_id,
                     holder,
@@ -3046,12 +3051,13 @@ impl Core {
         // a successor ahead of it by more than the lease has left would
         // read the lease as expired, take it for a TTL takeover and wait
         // for nothing while the predecessor's grants are still honoured).
-        let fast_prev = prev.as_ref().is_some_and(|p| {
-            takeover
-                && !p.released
-                && (permitted || !p.is_expired(now.wall.0))
-                && p.holder != self.cfg.node_id
-        });
+        // Plan 43 C7b: by the permit alone. A TTL takeover that is not
+        // permitted was proved expired by this node's own observation of the
+        // lease (`LeaseState::classify`): the old holder's window is over in
+        // true time, and no floor is needed.
+        let fast_prev = prev
+            .as_ref()
+            .is_some_and(|p| takeover && !p.released && permitted && p.holder != self.cfg.node_id);
         self.dl.inherit_slack_ms = 0;
         // Plan 43 C7-F F-c: the lease body a fast takeover replaced is this
         // takeover's alone; a value left by an earlier takeover whose gate
@@ -3117,14 +3123,20 @@ impl Core {
         // the locker's unlock and the contender's request behind it, and
         // the node that took the lease over granted the contender only
         // after `ttl + margin` (16 s) instead of at once.
+        // Plan 43 C7b: from this node's first sight of the *release* (the
+        // release flips the renewal key): the releaser's grants were issued
+        // before its release CAS, each ends by true `T(release send) +
+        // lock_ttl`, and the first sight is after the release landed. A taker
+        // that saw the release long ago waits nothing; a cold one the whole
+        // grace (never longer than `lock_ttl + 2M`, today's).
         if prev.as_ref().is_some_and(|p| {
-            takeover
-                && p.released
-                && p.granted_delegations
-                && !p.is_expired(now.wall.0)
-                && p.holder != self.cfg.node_id
+            takeover && p.released && p.granted_delegations && p.holder != self.cfg.node_id
         }) {
-            self.lock_on_released_takeover(now, replica);
+            let since = prev
+                .as_ref()
+                .and_then(|p| self.lease.released_since(p))
+                .unwrap_or(now.wait);
+            self.lock_on_released_takeover(now, since, replica);
         }
         let backup_tail_epoch = prev
             .as_ref()
@@ -3236,10 +3248,7 @@ impl Core {
                 (self.cfg.node_id, self.lease.epoch().unwrap_or(0))
             } else {
                 self.lease
-                    .last_seen
-                    .as_ref()
-                    .filter(|l| !l.is_claimable(now.wall.0))
-                    .map(|l| (l.holder, l.epoch))
+                    .live_holder_seen(now, &self.cfg)
                     .unwrap_or((0, 0))
             };
             out.push(Action::ControlDone {

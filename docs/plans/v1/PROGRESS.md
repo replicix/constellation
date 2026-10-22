@@ -57083,3 +57083,135 @@ way and, in `cto`/`locks`, oscillators at the rate budget's edge):
 Row 28 (a strict reader tailing past a live holder's unshipped writes) has no
 model: the `cto` log is the shipped log. The sim has it
 (`strict-reader-ahead`).
+
+## Plan 43 C7b, commit 3/N: the lease observation rule (rows 2, 11, 23, 25, 26, 28; 2026-10-22)
+
+### The rule
+
+A claimant never compares the holder's wall expiry with its own clock. It reads
+the lease, remembers the **renewal key** `(holder, epoch, holder_clock,
+holder_wait_ms, released)` (`Lease::renewal_key`: it changes when the holder's
+honoured window can, not on a `wanted_by` edit, a mark or a backup-set change)
+and the wait-clock instant its first read of that key was handled
+(`LeaseState::observe`, called once from the S3 dispatch for every `LeaseGet`),
+and claims by TTL once a read still shows the key one **holder's** TTL later
+(`Lease::ttl_ms`, new, stamped by every holder CAS), the CAS naming that read's
+tag. Safety for any offset: the holder honours the key only until `honour(send)
++ ttl`, no later than true `T(send) + ttl` (the honour reading never
+under-counts); the first read is after the key landed, after `send`; the wait
+reading never over-counts, so `ttl` of it is at least `ttl` of true time; a
+renewal before the CAS changes the tag and fails it, one after fails itself.
+No margin: transit is causality, the oscillator is in the readings (the plan's
+`ttl (1 + 2 rho)` predates that). Released, fenced (`Lease::is_fenced`:
+`retired` names the holder, no new field) and never-held leases are claimable
+at once; an unwatched one (a cold claimant, a restarted node) is not. A body
+without `ttl_ms` (an older build's, a singleton's) is judged by this node's TTL
+and the wall compare both (`lease_ttl_unknown_bodies` counts them).
+
+### Sites
+
+`LeaseState::classify` (own tracked lease: held by its honour end, not the
+body's wall stamp; the `Backup` grace for non-backups counts from the
+observation; `Plan::Busy` carries `retry_at`); `permit_allows` for `ack=s3`
+(row 11: the key unchanged for `backup_takeover_ms` on this node's wait clock);
+`acquire_won`'s `fast_prev` (the permit alone: row 26) and the released-takeover
+lock grace (row 23: it ends `lock_ttl + 2M` after the taker's first sight of the
+*release*, none for a taker that saw it that long ago, the whole of it for a cold
+one); `promise_check_needed` (row 25: a permitted claim before the observation ran
+out skips it) and `promise_after_event` (promise once per observed key);
+`on_read_holder_learned` (row 28: an unobserved holder is live, the reader asks
+it instead of tailing S3) and every routing and trigger compare
+(`on_holder_learned`, the inbox recheck, the lock routing, `dead_root_check`,
+`finish_acquire`'s report, `watch_s3_holder`). `watch_s3_holder` also reads the
+lease again before it asks for a permit if its last read is a silence window old
+(a stale view of a holder that has renewed since would count a takeover of a
+live holder: `acks3-runtime-lag` seed 2). The retry of an op waiting for the
+lease is at the instant its observation lets it claim when that is sooner than
+the backoff (never later than before: a retry held back to the observation's end
+lengthened a seal's failover by 0.7 s and moved several pinned seeds). A warning
+at start-up when `lock_ttl + 2 margins` exceeds the lease TTL (D6; an error would
+refuse a setup that sets short lease TTLs).
+
+Not done in this commit, by the commit table or for want of the boxes: the three
+wall compares of `on_takeover_get` (row 24, commit 4); the harness scenarios
+`lease-claimant-ahead` and `lease-cold-claim` and the G6 measurement of the
+cold-claim wait on a real daemon (the boxes were unreachable: the sim's
+crash-to-first-ack below is the number); the plan's landed notes (they conflict
+with main's edits of the plan).
+
+### Evidence (`f7c8fc7` and this commit; I6 strict; 300 to 30 000 seeds)
+
+| Configuration | Before (`f7c8fc7`, other checks) | After | I6 live claims before / after |
+|---|---|---|---|
+| `locks-claimant-ahead` / `-holder-behind` | 51 of 300 | 0 of 3 000 / 0 of 300 | 249 / 0 |
+| `strict-claimant-ahead` | 0 of 300 | 0 of 3 000 | 219 seeds / 0 |
+| `strict-reader-ahead` (2 000) | 695, 882, 999 by the offset | 0 by the offset (260, 2391 fail with offset 0 too) | n/a |
+| `locks-released-takeover-ahead` | 275 of 300 | 0 of 3 000 | n/a |
+| `backup-locks-ahead` | 0 | 0 of 3 000 | 9 / 0 |
+| `locks-skew-60s`, `strict-skew-60s` | 0, 0 | 0 of 3 000 each | 6, 114 / 0, 0 |
+| `fast-takeover-skewed-holder-twice` | 8 of 2 000 | 0 of 4 000 | 1 040 / 0 |
+| `locks-holder-step-back-sealed` | 1 of 10 000 (157) | 0 of 10 000 | 14 / 0 |
+| `fast-takeover-skewed-successor` | 0 of 30 000 | 0 of 30 000 | 77 / 0 |
+| `locks-stall-step-delegated-ahead` | 2 of 300 | 2 of 3 000: stale reads under a lock (rows 9/30) | 14 / 0 |
+| `locks-delegated-partition-skew` | 4 of 300 | 19 of 3 000: stale reads under a lock (rows 9/30) | 93 / 0 |
+| `locks-delegate-ahead` | 3 of 300 | 36 of 3 000: rows 9/30 | 0 / 0 |
+| `flex-taker-ahead` | 0 | 0 of 3 000 | 0 / 0 |
+
+The configurations that still fail fail by the delegated rows (9, 30, 6: a
+stale read under a lock, or two holders around an outwait of a delegate's
+grants), commit 6 and 8's; none by a claim of a live holder. On `5f3b51c` (the
+spec's base) the same code gave 0 of 4 000 for claimant-ahead, holder-behind,
+strict-claimant-ahead, released-takeover-ahead, skew-60s and both skewed
+failover configurations, and 0 of 30 000 / 10 000 for the successor and
+step-back configurations (the spec's 3 and 1).
+
+`locks-released-takeover` (the control without an offset) fails 5 of 2 000 on
+`f7c8fc7` with and without this commit (961, 973, 1253, 1546, 1571, all of them
+the default clock-fault mix's reboot or suspend of the taker, which loses its
+in-memory lock quarantine; `+unclocked`: 0): pre-existing, a C7a 6 finding left
+for the maintainer.
+
+Identity (19 configurations, 500 to 1 000 seeds): failing sets identical; the
+takeover counters moved as the rule says. Crash to first acknowledged
+mutation, p50 / p90 / max (ms), before then after: `locks-failover`
+5183/5223/5294 then 5187/5225/5278; `locks-failover-backup` 8206/11541/14980
+then 8206/11591/14980; `long-backup` 1177/4297/8163 then 1177/4372/8163;
+`long-delegated` 1172/5360/10610 then 1172/6504/11436; `long-strict`
+819/5892/8218 then 784/6339/9105. A TTL failover pays the cold-claim wait; seals
+are unchanged. `a_lagging_backup_still_seals_a_dead_holder`'s bound counts it
+(seed 78: 6.8 s against 4.9 s).
+
+### Tests and fail-before
+
+Core: `core::lease::tests` (`a_ttl_claim_waits_its_own_observation_whatever_the_expiry_says`,
+`an_unobserved_body_is_live`, `a_renewal_restarts_the_observation`,
+`a_wanted_by_edit_a_mark_or_a_reconfiguration_does_not_restart_it`,
+`a_released_or_fenced_lease_is_claimable_at_once`, `the_holders_ttl_not_mine`,
+`a_body_without_a_ttl_is_judged_by_both_rules`,
+`the_backup_grace_counts_from_the_observation`,
+`the_s3_permit_counts_from_the_observation`,
+`the_observation_keeps_the_latest_body`), `a_cold_released_taker_arms_the_full_grace_and_a_warm_one_none`,
+`a_reader_treats_an_unobserved_holder_as_live`,
+`a_permitted_claim_before_the_observation_ran_out_skips_the_promise_check`; store-s3: the renewal
+key's table test and the body without a TTL. Against a mutant that judges the
+claim and the grace by the wall compare again, 8 of them fail (the claim and
+grace tests, the reader and the cold taker). Sim: the known gaps are
+regressions (`regression_*`), the I6 flag is on everywhere,
+`strict_close_to_open_holds_with_clock_skew_of_a_minute_and_loss`.
+The existing core tests that read an expired foreign lease and expect a claim
+watch it first (`Harness::watch`, and `Harness::step` for a lease read whose
+expiry is past).
+
+On C1-1 (rebased onto it): every lease read is observed before any handler, so
+the read `on_takeover_get` ignores as older than the backup role's version is
+observed too; a read of the same renewal key at an older `config_version` keeps
+the observation's start and does not set its body back
+(`a_stale_reconfiguration_read_of_the_same_key_keeps_the_newer_body`,
+`a_stale_lease_read_sets_back_neither_the_role_nor_the_observation`). Moved by
+the two together: `a_credited_arrival_cap_splits` re-pinned on 193262, 195339,
+199076 (all of 193000..203000 that fail); `backup-strict` seed 1389 (in
+`fast_failover_with_delegations_keeps_close_to_open`'s range) is plan 30 §M9's
+double fault (holder crashed, its backup rebooted then paused: a TTL claim
+after the grace loses the tail; the retry hint claims 0.3 s before the holder's
+restart, which then replays its acknowledged rows late), pinned as
+`backup_strict_double_fault_known_gap` for C1-3's tail fetch.

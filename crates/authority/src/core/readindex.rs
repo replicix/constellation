@@ -1838,7 +1838,12 @@ impl Core {
                 return;
             }
         };
-        let live = object.filter(|l| l.holder != 0 && !l.is_claimable(now.wall.0));
+        // Plan 43 C7b: live on this node's own observation (a cold reader
+        // treats the holder as live: it sends a ReadIndex, and if the holder
+        // is dead the retry finds the lease claimable one TTL later and
+        // tails), never by the holder's wall expiry against this clock.
+        let live =
+            object.filter(|l| l.holder != 0 && !self.lease.claimable_observed(now, &self.cfg));
         match live {
             Some(lease) if lease.holder != self.cfg.node_id => {
                 self.send_read_index(now, op, lease.holder, replica, out)

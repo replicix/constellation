@@ -159,6 +159,11 @@ pub fn resolve_epoch_claims(acks: &[EpochAckClaim]) -> (Option<Carrier>, Epoch) 
 pub(crate) struct PromiseState {
     /// The last promise issued (persisted), mirrored from the replica.
     pub issued: i64,
+    /// Plan 43 C7b: the renewal key this node last promised for on seeing
+    /// its observation run out with P2P down (not persisted: a restarted
+    /// node promises once more, which costs one PUT). Commit 5 names the key
+    /// in the promise itself.
+    pub promised_key: Option<constellation_store_s3::RenewalKey>,
     /// The slack of the last heartbeat that landed.
     pub advertised: Option<u32>,
     /// A PUT advertising this slack is in flight.
@@ -430,14 +435,21 @@ impl Core {
         // P2P down nobody can ask: the idle watch below keeps `last_seen`
         // fresh, and an expiry it shows is a real one.
         let p2p_down = !self.cfg.p2p || !self.links.values().any(|l| l.connected);
-        if let Some(seen) = self.lease.last_seen.as_ref().filter(|_| p2p_down) {
-            if seen.holder != 0
-                && seen.holder != self.cfg.node_id
-                && !seen.released
-                && seen.is_expired(now.wall.0)
-                && self.pr.issued <= seen.expires_unix_ms
-            {
-                self.promise_now(now, replica, out);
+        // Plan 43 C7b: when this node's observation of a foreign unreleased
+        // key has run out (a TTL watched on its own wait clock) and it has
+        // not promised for that key yet (commit 5 names the key in the
+        // promise itself).
+        let observed_out = self.lease.obs.as_ref().filter(|o| {
+            p2p_down
+                && o.body.holder != 0
+                && o.body.holder != self.cfg.node_id
+                && !o.body.released
+                && self.lease.obs_passed(now, &self.cfg, 0)
+                && self.pr.promised_key != Some(o.key)
+        });
+        if let Some(key) = observed_out.map(|o| o.key) {
+            if self.promise_now(now, replica, out) {
+                self.pr.promised_key = Some(key);
             }
         }
         if p2p_down && self.pr.watch_timer.is_none() && !self.lease.usable(now, &self.cfg) {
@@ -1285,9 +1297,11 @@ impl Core {
         if prev.holder == 0 || prev.holder == self.cfg.node_id || prev.released {
             return false;
         }
-        if !prev.is_expired(now.wall.0) {
-            // M9's permit paths (a sealed backup, `ack=s3`): the claim
-            // rule keeps them apart from epochs.
+        // Plan 43 C7b: M9's permit paths (a sealed backup, `ack=s3`) made
+        // before this node's observation of the lease ran out: the claim
+        // rule keeps them apart from epochs. Every other takeover checks.
+        let permitted = self.lease.takeover_permit == Some((prev.epoch, prev.holder));
+        if permitted && !self.lease.obs_passed_for(prev, now, &self.cfg, 0) {
             return false;
         }
         if self.pr.carried.is_some_and(|c| {

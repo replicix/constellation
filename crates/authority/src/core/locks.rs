@@ -3876,7 +3876,7 @@ impl Core {
         if let crate::event::S3Result::LeaseGet(Ok(Some((lease, _)))) = &result {
             self.lease.note_object(lease);
             if lease.holder != 0
-                && !lease.is_claimable(now.wall.0)
+                && !self.lease.claimable_observed(now, &self.cfg)
                 && lease.holder != self.cfg.node_id
             {
                 self.lease.cached_holder = Some(lease.holder);
@@ -3901,7 +3901,9 @@ impl Core {
         // does — acquire (the sim found blocked lockers with nobody
         // taking the lease). Non-blocking: unavailable after the retries.
         let claimable = matches!(&result, crate::event::S3Result::LeaseGet(Ok(l))
-            if l.as_ref().is_none_or(|(l, _)| l.holder == 0 || l.is_claimable(now.wall.0)));
+        if l.as_ref().is_none_or(|(l, _)| {
+            l.holder == 0 || self.lease.claimable_observed(now, &self.cfg)
+        }));
         if claimable && !self.lease.lost {
             self.enqueue_job(
                 now,
@@ -4830,10 +4832,8 @@ impl Core {
             .map(|c| c.node);
         let seen = self
             .lease
-            .last_seen
-            .as_ref()
-            .filter(|l| !l.is_claimable(now.wall.0))
-            .map(|l| l.holder);
+            .live_holder_seen(now, &self.cfg)
+            .map(|(holder, _)| holder);
         carrier.or(seen).filter(|n| *n != 0 && *n != me)
     }
 
@@ -4861,7 +4861,7 @@ impl Core {
         if let crate::event::S3Result::LeaseGet(Ok(Some((lease, _)))) = &result {
             self.lease.note_object(lease);
             if lease.holder != 0
-                && !lease.is_claimable(now.wall.0)
+                && !self.lease.claimable_observed(now, &self.cfg)
                 && lease.holder != self.cfg.node_id
             {
                 self.lease.cached_holder = Some(lease.holder);
@@ -6247,8 +6247,24 @@ impl Core {
     /// barrier on everything as of the quarantine's end (the tenure's
     /// floor takes the inherited delegates' *first* renewals, which may
     /// be older than those writes).
-    pub(crate) fn lock_on_released_takeover(&mut self, now: Now, replica: &dyn Replica) {
-        let until = self.restamp(now);
+    ///
+    /// Plan 43 C7b: `seen` is this node's first sight (wait clock) of the
+    /// release (`LeaseState::released_since`; `now.wait` when it has not
+    /// watched it, a cold taker). The grace ends at `seen + lock_ttl + 2M`:
+    /// the releaser's grants were issued before its release CAS and each
+    /// ends by true `T(release send) + lock_ttl`, and `seen` is after the
+    /// release landed. A taker that saw the release long ago waits nothing
+    /// (no quarantine, no barrier); a cold one waits the whole grace.
+    pub(crate) fn lock_on_released_takeover(
+        &mut self,
+        now: Now,
+        seen: WaitMs,
+        replica: &dyn Replica,
+    ) {
+        let until = seen.plus((self.lock_ttl_ms() + 2 * self.lock_margin_ms()).max(0) as u64);
+        if until <= now.wait {
+            return;
+        }
         replica.locks().set_quarantine(until);
         // The barrier is a wall value (row 9, C7b): the record's end mapped
         // from this node's wait clock by the time left on it.

@@ -893,9 +893,30 @@ grants share one time discipline. The holder of a grant honours it until
 request; the grantor treats it as live until `granted + ttl + margin` on
 its clock; `margin` is the lease's expiry margin, `min(1 s, TTL/4)`. The
 rule is safe while clocks drift apart by less than half the margin
-(`margin > 2 × drift`), the same assumption the lease itself makes. A
-grantor never gives more than it has left, so a grant never outlives the
-lease it came from.
+(`margin > 2 × drift`) for the grants judged on a value another node
+wrote (plan 43 C7b is replacing those one by one); the lease itself no
+longer makes that assumption (below). A grantor never gives more than it
+has left, so a grant never outlives the lease it came from.
+
+**A claimant judges the lease by its own observation** (plan 43 C7b). A node
+never compares the holder's wall expiry with its own clock. It reads the
+lease body, remembers the *renewal key* — `(holder, epoch, holder_clock,
+holder_wait_ms, released)`, which changes exactly when the holder's honoured
+window can: a grant, a renewal, a release, not a `wanted_by` edit, a mark or
+a backup-set change — and the instant it first saw that key on its own wait
+clock, and claims by TTL once a read still shows the key one *holder's* TTL
+(`ttl_ms` in the body) later, with the CAS naming that read's tag. The holder
+honours the key only until `honour(send) + ttl`, no later than true `T(send) +
+ttl` (the honour reading never under-counts); the claimant first saw it after
+it landed, and its wait reading never over-counts, so the holder's window is
+over in true time when the claimant claims, whatever the two clocks say
+about each other. A renewal that lands before the CAS changes the tag and
+fails it; one after fails itself. A released or fenced lease is claimable at
+once. The price is the cold claim: a node that first read the lease after the
+holder died waits one TTL from that read (about 60 s at the default) where
+it waited for the holder's wall expiry before; one that read it after the
+last renewal pays nothing extra. A body without `ttl_ms` (an older build's, a
+singleton's) is judged by the claimant's own TTL and the wall compare both.
 
 The holder's side of that rule is measured on a local **honour clock**
 (plan 43 C7-H1, `constellation_types::clock`): a monotone reading that never
@@ -960,8 +981,9 @@ age of a queue or a retry, the idle and dwell times that release a lease, and
 the stamps of the S3 path's stall test. A wall-clock step therefore neither
 fails an operation early (a forward step) nor keeps one waiting past its bound
 (a backward step), and does not make a healthy S3 path look stalled. What
-still reads the wall clock is exactly what crosses nodes (the expiry in a lease
-or promise body, a batch's submission time, the root's lock cut), what is
+still reads the wall clock is exactly what crosses nodes (the expiry in a promise
+body, a batch's submission time, the root's lock cut; the lease body's wall
+expiry is read by status, singletons and operator tools only), what is
 persisted, what is an identity key, and what is shown in status and logs.
 
 All transitions between roots are explicit and persisted before they take
@@ -1559,7 +1581,7 @@ and a blocking one keeps retrying.
 | forward times out (holder slow or gone) | same-rid retries, then the inbox (no P2P path) or the lease path; resolved exactly once; `EIO` at the client deadline (2 × TTL), never a re-execution |
 | holder deposed (it lost the lease while alive) | it rolls its unshipped journal back and replays it by rid through the new holder; only true overlaps become conflict copies |
 | P2P down, S3 up | everything works through the lease path and the S3 inbox, minus backups, delegations, strict ReadIndex, cluster locks and fast takeover |
-| clock skew | rate: each node's oscillator within its budget (0.1 % by default, C7a: paid by the honour and wait readings, so every local window is exact); offsets: lease, delegation, read-delegation and lock timing across nodes assume `margin > 2 × drift` (±500 ms at the defaults; C7b replaces them); correctness otherwise relies on CAS ordering, never wall clocks; steps: none (C7-H1: holders measure on the honour clock, waiters on the wait clock) |
+| clock skew | rate: each node's oscillator within its budget (0.1 % by default, C7a: paid by the honour and wait readings, so every local window is exact); offsets: the lease is judged by each claimant's own observation (C7b commit 3: none assumed); delegation, read-delegation and lock timing across nodes still assume `margin > 2 × drift` (±500 ms at the defaults; C7b replaces them); correctness otherwise relies on CAS ordering, never wall clocks; steps: none (C7-H1: holders measure on the honour clock, waiters on the wait clock) |
 | cache disk full | evict clean → throttle → ENOSPC (reads still stream uncached) |
 | logical quota exceeded | ENOSPC on write/truncate/fallocate growth (best-effort; see above) |
 | DB disk full | read-only mode + flush-to-recover; alarms in status/UI |

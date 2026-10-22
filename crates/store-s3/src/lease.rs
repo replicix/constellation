@@ -105,6 +105,15 @@ pub struct Lease {
     /// holder honours and wrong for what its grantees' clocks count).
     #[serde(default)]
     pub holder_wait_ms: i64,
+    /// Plan 43 C7b: the TTL this tenure's holder stamps with every renewal
+    /// (`holder_wait_ms - wait_send`): how long a claimant that watches the
+    /// body for a renewal must wait before it may take the lease by TTL
+    /// (`core::lease`'s observation rule). A claimant waits the *holder's*
+    /// TTL, never its own. 0: an older build's body, or a singleton's: the
+    /// claimant then waits its own TTL **and** the wall compare
+    /// ([`Lease::is_expired`]), no worse than before the field existed.
+    #[serde(default)]
+    pub ttl_ms: u64,
     /// Set by a clean unmount: the partition is immediately claimable,
     /// no TTL to wait out.
     pub released: bool,
@@ -187,6 +196,7 @@ impl Lease {
             holder_expires_ms: 0,
             holder_clock: 0,
             holder_wait_ms: 0,
+            ttl_ms,
             released: false,
             wanted_by: Vec::new(),
             backups: Vec::new(),
@@ -287,6 +297,7 @@ impl Lease {
     pub fn renewed(&self, ttl_ms: u64) -> Self {
         Self {
             expires_unix_ms: now_unix_ms() + ttl_ms as i64,
+            ttl_ms,
             released: false,
             ..self.clone()
         }
@@ -319,13 +330,43 @@ impl Lease {
         }
     }
 
+    /// **Wall clock, cross-node: status, singletons and operator tools
+    /// only** (plan 43 C7b). The partition's lease path never compares the
+    /// holder's wall expiry with its own clock: a claimant judges the lease
+    /// by its own observation of the holder's renewal key
+    /// ([`Lease::renewal_key`]; `core::lease`).
     pub fn is_expired(&self, now_ms: i64) -> bool {
         now_ms >= self.expires_unix_ms
     }
 
     /// Claimable by anyone: never held, cleanly released, or expired.
+    /// Wall-clock, cross-node: status, singletons and operator tools only
+    /// (plan 43 C7b).
     pub fn is_claimable(&self, now_ms: i64) -> bool {
         self.holder == 0 || self.released || self.is_expired(now_ms)
+    }
+
+    /// Plan 43 C7b: fenced by an admin `leave --node-id` (`retired` names
+    /// the holder, [`Lease::fenced_for_retirement`]): claimable at once, and
+    /// never by the retired node. Derived: no body field.
+    pub fn is_fenced(&self) -> bool {
+        self.retired.contains(&self.holder)
+    }
+
+    /// Plan 43 C7b: the renewal key. It changes exactly when the holder's
+    /// honoured window can change: a grant, a renewal (a new
+    /// `holder_wait_ms`), a release, a fence. A backup-set change, a mark
+    /// CAS or another claimant's `wanted_by` edit copies all five fields and
+    /// leaves it alone: they must not restart a claimant's watch (an
+    /// ETag-based rule would let waiters starve each other).
+    pub fn renewal_key(&self) -> RenewalKey {
+        RenewalKey {
+            holder: self.holder,
+            epoch: self.epoch,
+            holder_clock: self.holder_clock,
+            holder_wait_ms: self.holder_wait_ms,
+            released: self.released,
+        }
     }
 
     pub fn expires_in_ms(&self, now_ms: i64) -> i64 {
@@ -333,6 +374,16 @@ impl Lease {
         // must not panic on an extreme one.
         self.expires_unix_ms.saturating_sub(now_ms)
     }
+}
+
+/// Plan 43 C7b: what a claimant watches for ([`Lease::renewal_key`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RenewalKey {
+    pub holder: u64,
+    pub epoch: u64,
+    pub holder_clock: u64,
+    pub holder_wait_ms: i64,
+    pub released: bool,
 }
 
 /// Largest lease epoch a lease read from the bucket may carry. Epochs
@@ -605,6 +656,74 @@ mod tests {
             i64::MAX,
             "status arithmetic saturates on an extreme expiry"
         );
+    }
+
+    /// Plan 43 C7b: the renewal key moves exactly when the holder's honoured
+    /// window can: a grant, a renewal (the holder stamps a new
+    /// `holder_wait_ms`; the store's `renewed` leaves that to its caller,
+    /// the core's `renewed_lease`), a release, a fence. A request in
+    /// `wanted_by`, a backup-set change and a mark leave it alone.
+    #[test]
+    fn the_renewal_key_changes_only_when_the_holders_window_can() {
+        let mut base = Lease::granted(P, 7, 3, TTL);
+        base.holder_clock = 11;
+        base.holder_wait_ms = 5_000;
+        base.holder_expires_ms = 9_000;
+        base.ttl_ms = TTL;
+        let key = base.renewal_key();
+        let same = [
+            ("wanting", base.wanting(9)),
+            (
+                "reconfigured",
+                base.reconfigured(vec![2, 3], AckPolicy::Backup),
+            ),
+            ("with_granted_delegations", base.with_granted_delegations()),
+            (
+                "without_granted_delegations",
+                base.with_granted_delegations()
+                    .without_granted_delegations(),
+            ),
+            ("store renewed", base.renewed(TTL)),
+        ];
+        for (what, l) in same {
+            assert_eq!(l.renewal_key(), key, "{what} must keep the key");
+        }
+        let renewed = Lease {
+            holder_wait_ms: 8_000,
+            ..base.clone()
+        };
+        assert_ne!(renewed.renewal_key(), key, "a renewal stamps a new end");
+        assert_ne!(base.released().renewal_key(), key, "a release");
+        assert_ne!(
+            base.released_granting(true).renewal_key(),
+            key,
+            "a release that marks"
+        );
+        let fenced = base.fenced_for_retirement(7, 0);
+        assert_ne!(fenced.renewal_key(), key, "a fence bumps the epoch");
+        assert!(fenced.is_fenced() && !base.is_fenced());
+        // A grant to another holder, or the same holder at its next
+        // incarnation (another clock): another key.
+        let mut taken = Lease::granted(P, 8, 4, TTL);
+        taken.holder_wait_ms = 5_000;
+        taken.holder_clock = 11;
+        assert_ne!(taken.renewal_key(), key);
+        let restarted = Lease {
+            holder_clock: 12,
+            ..base.clone()
+        };
+        assert_ne!(restarted.renewal_key(), key);
+        assert_eq!(base.ttl_ms, TTL, "a body carries its holder's TTL");
+        assert_eq!(base.renewed(1_000).ttl_ms, 1_000);
+    }
+
+    /// A body an older build wrote has no `ttl_ms`: it reads as 0.
+    #[test]
+    fn a_body_without_a_ttl_reads_as_unknown() {
+        let mut v = serde_json::to_value(Lease::granted(P, 7, 3, TTL)).unwrap();
+        v.as_object_mut().unwrap().remove("ttl_ms");
+        let l: Lease = serde_json::from_value(v).unwrap();
+        assert_eq!(l.ttl_ms, 0);
     }
 
     #[tokio::test]

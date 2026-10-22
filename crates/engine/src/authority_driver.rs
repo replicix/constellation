@@ -668,6 +668,15 @@ pub fn load_config(
     // the mount's `--locks` (`crate::locks::cluster_effective`).
     c.locks = p2p;
     c.lock_ttl_ms = crate::locks::lock_ttl_ms(c.lock_ttl_ms);
+    if !c.lock_grace_fits_lease() {
+        tracing::warn!(
+            lock_ttl_ms = c.lock_ttl_ms,
+            expiry_margin_ms = c.expiry_margin_ms,
+            lease_ttl_ms = c.ttl_ms,
+            "the lock TTL plus two margins exceeds the lease TTL: a TTL successor of a tenure \
+             that inherited a lock grace may grant over a grant of the tenure before it"
+        );
+    }
     c.lock_cache_idle_ms = crate::locks::lock_cache_idle_ms(c.lock_cache_idle_ms);
     c.read_index_deadline_ms = crate::cto::read_index_budget_ms();
     // Plan 30 §M9: backups (peers within the RTT budget; `0` backups or

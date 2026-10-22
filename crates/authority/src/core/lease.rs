@@ -10,7 +10,7 @@
 use super::Config;
 use crate::ids::{Epoch, HonourMs, NodeId, Now, WaitMs};
 use constellation_store_s3::lease::LEASE_VERSION;
-use constellation_store_s3::{AckPolicy, Lease, LeaseTag};
+use constellation_store_s3::{AckPolicy, Lease, LeaseTag, RenewalKey};
 
 /// Plan 30 §M3b: a won lease whose takeover gate has not completed. While
 /// pending the view is closed to every new mutation and nothing ships.
@@ -44,6 +44,21 @@ pub struct PendingGate {
     pub shippable: bool,
 }
 
+/// Plan 43 C7b: this node's observation of the lease object's renewal key:
+/// the key, the wait-clock instant it was first seen (the handling time of
+/// the first read that showed it: never a GET's send time, a renewal can
+/// land between the send and S3 serving the read), and the latest body and
+/// tag read with it.
+#[derive(Clone, Debug)]
+pub struct LeaseObs {
+    pub key: RenewalKey,
+    pub since: WaitMs,
+    /// The latest read (or own CAS answer) that showed this key.
+    pub read_at: WaitMs,
+    pub body: Lease,
+    pub tag: Option<LeaseTag>,
+}
+
 /// What the lease object allows this node to do (`LeaseKeeper::classify`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Plan {
@@ -68,6 +83,11 @@ pub enum Plan {
         epoch: Epoch,
         prev: Lease,
         tag: LeaseTag,
+        /// Plan 43 C7b: when this node's own observation of the lease lets
+        /// it claim it (or lets its permit stand), on the wait clock: the
+        /// next read is worth making then, not before (`None`: nothing to
+        /// wait for, or no way to know).
+        retry_at: Option<WaitMs>,
     },
     /// Deposed, or takeover impossible in single-writer mode: nothing to
     /// do but wait.
@@ -96,8 +116,15 @@ pub struct LeaseState {
     /// lease reads).
     pub cached_holder: Option<NodeId>,
     /// The last lease object read from S3, for `AcquireProgress`-style
-    /// progress detection and the cached holder, and when it was read.
+    /// progress detection and the cached holder (what `obs.body` holds,
+    /// plus whatever `note_object` cached without an observation).
     pub last_seen: Option<Lease>,
+    /// Plan 43 C7b: this node's observation of the lease's renewal key (see
+    /// [`LeaseState::observe`]). The only basis on which a claimant judges
+    /// a foreign lease live or run out: never the holder's wall expiry
+    /// against this node's clock. A restart starts with none (a new process
+    /// is a cold claimant: one TTL after its first read).
+    pub obs: Option<LeaseObs>,
     /// Continuation-epoch local authority (DESIGN.md §5.3): no S3 lease
     /// object, writes journal locally, nothing ships until the epoch
     /// closes.
@@ -341,10 +368,10 @@ impl LeaseState {
         }
         match prev.ack_policy {
             AckPolicy::Backup => prev.backups.contains(&cfg.node_id) && sealed_epoch >= prev.epoch,
-            AckPolicy::S3 => {
-                let renewed_at = prev.expires_unix_ms - cfg.ttl_ms as i64;
-                now.wall.0 - renewed_at >= cfg.backup_takeover_ms as i64
-            }
+            // Plan 43 C7b: "no renewal for `backup_takeover_ms`" on this
+            // node's own observation of the key (liveness only: the
+            // log-slot CAS fences the old holder whatever this says).
+            AckPolicy::S3 => self.obs_waited_for(prev, now, cfg.backup_takeover_ms),
             AckPolicy::Local => false,
         }
     }
@@ -371,7 +398,9 @@ impl LeaseState {
             return Plan::Refused("retired by an admin leave (the lease is fenced against us)");
         }
         if prev.holder == cfg.node_id && !prev.released {
-            if self.held.is_some() && !prev.is_expired(now.wall.0) {
+            // Plan 43 C7b: the own body's end is on this node's honour
+            // clock (a mixed compare of the body's wall stamp is gone).
+            if self.held.is_some() && honour_end_of(&prev, cfg).is_some_and(|h| now.honour < h) {
                 return Plan::Held;
             }
             if self.held.is_none() {
@@ -392,12 +421,36 @@ impl LeaseState {
             }
         }
         let permitted = self.permit_allows(now, cfg, &prev, sealed_epoch);
-        if !prev.is_claimable(now.wall.0) && !permitted {
+        // Plan 43 C7b: the observation rule. This node never compares the
+        // holder's wall expiry with its own clock: it claims by TTL once a
+        // read at `t1` still shows the key it first saw at `t0` and `t1 >=
+        // t0 + ttl` on its WAIT clock (the holder's own TTL, from the body),
+        // CAS-ing on that read's tag. Why that is safe for any offset: the
+        // holder honours key K only until `honour(send_K) + ttl`, which by
+        // the readings' P3 is no later than true `T(send_K) + ttl`; `t0` is
+        // after K landed, so after `send_K`; by P2 `t1 >= t0 + ttl` on WAIT
+        // is at least `ttl` of true time; so K's window is over. A renewal
+        // that lands before the CAS changes the tag and fails it; one that
+        // lands after fails itself. No margin is added: transit is covered
+        // by causality and the oscillator by the readings (which carry the
+        // rate budget; the plan's `ttl (1 + 2 rho)` predates that). A
+        // released lease, a fenced one and one nobody ever held are
+        // claimable at once; one this node has not watched (a cold
+        // claimant) is not, until it has.
+        let own = prev.holder == cfg.node_id;
+        let claimable = own
+            || prev.holder == 0
+            || prev.released
+            || prev.is_fenced()
+            || self.obs_passed_for(&prev, now, cfg, 0);
+        if !claimable && !permitted {
+            let retry_at = self.retry_at_for(&prev, cfg);
             return Plan::Busy {
                 holder: prev.holder,
                 epoch: prev.epoch,
                 prev,
                 tag,
+                retry_at,
             };
         }
         // Plan 30 §M9: the listed backups of a `Backup` lease hold the
@@ -418,13 +471,18 @@ impl LeaseState {
             && !prev.backups.is_empty()
             && !prev.backups.contains(&cfg.node_id)
             && !permitted
-            && !prev.is_expired(now.wall.0 - backup_claim_grace_ms(cfg))
+            && !self.obs_passed_for(&prev, now, cfg, backup_claim_grace_ms(cfg) as u64)
         {
+            let retry_at = self.obs_for(&prev).map(|o| {
+                o.since
+                    .plus(Self::ttl_of(&o.body, cfg) + backup_claim_grace_ms(cfg) as u64)
+            });
             return Plan::Busy {
                 holder: prev.holder,
                 epoch: prev.epoch,
                 prev,
                 tag,
+                retry_at,
             };
         }
         let takeover = prev.holder != 0 && prev.holder != cfg.node_id;
@@ -482,6 +540,7 @@ impl LeaseState {
             holder_expires_ms: now.honour.plus(cfg.ttl_ms).0,
             holder_clock: cfg.clock_id,
             holder_wait_ms: now.wait.plus(cfg.ttl_ms).0,
+            ttl_ms: cfg.ttl_ms,
             released: false,
             wanted_by: Vec::new(),
             backups: Vec::new(),
@@ -531,6 +590,7 @@ impl LeaseState {
             holder_expires_ms: now.honour.plus(cfg.ttl_ms).0,
             holder_clock: cfg.clock_id,
             holder_wait_ms: now.wait.plus(cfg.ttl_ms).0,
+            ttl_ms: cfg.ttl_ms,
             released: false,
             ..mine.clone()
         }
@@ -560,6 +620,7 @@ impl LeaseState {
         self.held_since = Some(now.wait);
         self.last_write = now.wait;
         self.last_seen = Some(lease.clone());
+        self.observe_own(now, &lease, &tag);
         self.cached_holder = Some(lease.holder);
         self.held = Some((lease, tag));
         self.reconfig_doubt = None;
@@ -583,6 +644,7 @@ impl LeaseState {
             self.wanted_since = Some(now.wait);
         }
         self.last_seen = Some(lease.clone());
+        self.observe_own(now, &lease, &tag);
         self.held = Some((lease, tag));
         self.reconfig_doubt = None;
     }
@@ -623,12 +685,164 @@ impl LeaseState {
         self.epoch_hold = None;
     }
 
-    /// Remember what a lease read said about who holds it.
+    /// Remember what a lease read said about who holds it (the cache only:
+    /// the observation of its key is [`Self::observe`]'s).
     pub fn note_object(&mut self, lease: &Lease) {
         if lease.holder != 0 {
             self.cached_holder = Some(lease.holder);
         }
         self.last_seen = Some(lease.clone());
+    }
+
+    // ---- plan 43 C7b: the observation rule ----
+
+    /// Record a lease read handled at `now` (every `S3Result::LeaseGet(Ok)`,
+    /// whatever asked for it; `core/mod.rs`'s dispatch calls this once,
+    /// before any handler). `None` (no object) clears the observation. A
+    /// body whose renewal key is the stored one keeps `since` and replaces
+    /// the body and tag; another key restarts the watch at `now.wait`.
+    /// Returns whether the key changed.
+    pub fn observe(&mut self, now: Now, object: Option<&(Lease, LeaseTag)>) -> bool {
+        match object {
+            None => {
+                self.obs = None;
+                false
+            }
+            Some((lease, tag)) => self.observe_body(now, lease, Some(tag.clone())),
+        }
+    }
+
+    /// The body this node itself wrote (a CAS result): observed as of the
+    /// answer, which is conservative.
+    fn observe_own(&mut self, now: Now, lease: &Lease, tag: &LeaseTag) {
+        self.observe_body(now, lease, Some(tag.clone()));
+    }
+
+    fn observe_body(&mut self, now: Now, lease: &Lease, tag: Option<LeaseTag>) -> bool {
+        let key = lease.renewal_key();
+        match &mut self.obs {
+            // Plan 43 C1-1 composes with the rule here: a read of the same
+            // key at an older `config_version` than the body already held
+            // was answered by S3 before a reconfiguration CAS landed and
+            // reached this node after a read of it (versions only grow).
+            // It keeps the observation's start (the key is the same: the
+            // holder's window did not move) and must not set the body back:
+            // the newer backup set, and its tag, stand (`on_takeover_get`
+            // ignores such a read for the backup role likewise).
+            Some(o) if o.key == key && lease.config_version < o.body.config_version => false,
+            Some(o) if o.key == key => {
+                o.body = lease.clone();
+                o.tag = tag;
+                o.read_at = now.wait;
+                false
+            }
+            _ => {
+                self.obs = Some(LeaseObs {
+                    key,
+                    since: now.wait,
+                    read_at: now.wait,
+                    body: lease.clone(),
+                    tag,
+                });
+                true
+            }
+        }
+    }
+
+    /// The TTL a claimant waits for `body`: the holder's, from its body.
+    /// A body without one (an older build's, or a singleton's) is judged by
+    /// this node's own, and by the wall compare as well (`obs_passed_for`).
+    fn ttl_of(body: &Lease, cfg: &Config) -> u64 {
+        if body.ttl_ms > 0 {
+            body.ttl_ms
+        } else {
+            cfg.ttl_ms
+        }
+    }
+
+    /// The observation, if it is of `prev`'s key.
+    fn obs_for(&self, prev: &Lease) -> Option<&LeaseObs> {
+        let key = prev.renewal_key();
+        self.obs.as_ref().filter(|o| o.key == key)
+    }
+
+    /// This node has watched `prev`'s key for its holder's TTL plus
+    /// `extra_ms` on its wait clock. (A body with no TTL also needs the
+    /// wall compare, the rule before C7b: no worse than before.)
+    pub fn obs_passed_for(&self, prev: &Lease, now: Now, cfg: &Config, extra_ms: u64) -> bool {
+        self.obs_for(prev).is_some_and(|o| {
+            let ttl = Self::ttl_of(&o.body, cfg);
+            now.wait >= o.since.plus(ttl + extra_ms)
+                && (o.body.ttl_ms > 0 || o.body.is_expired(now.wall.0))
+        })
+    }
+
+    /// The wait-clock instant this node first saw the (released) key of
+    /// `prev` (`None`: it has not watched it: a cold taker).
+    pub fn released_since(&self, prev: &Lease) -> Option<WaitMs> {
+        self.obs_for(prev).map(|o| o.since)
+    }
+
+    /// This node has watched `prev`'s key for `ms` on its wait clock (the
+    /// `ack=s3` permit's "no renewal for `backup_takeover_ms`").
+    pub fn obs_waited_for(&self, prev: &Lease, now: Now, ms: u64) -> bool {
+        self.obs_for(prev)
+            .is_some_and(|o| now.wait >= o.since.plus(ms))
+    }
+
+    /// The TTL has run out on this node's observation of the current key
+    /// (extra: more to wait, e.g. the backups' claim grace).
+    pub fn obs_passed(&self, now: Now, cfg: &Config, extra_ms: u64) -> bool {
+        self.obs
+            .as_ref()
+            .is_some_and(|o| self.obs_passed_for(&o.body, now, cfg, extra_ms))
+    }
+
+    /// Claimable by anyone, on this node's observation: never held,
+    /// released, fenced, or `obs_passed`. Nothing observed: not (a cold
+    /// reader treats the holder as live until it has watched it).
+    pub fn claimable_observed(&self, now: Now, cfg: &Config) -> bool {
+        self.obs.as_ref().is_some_and(|o| {
+            o.body.holder == 0
+                || o.body.released
+                || o.body.is_fenced()
+                || self.obs_passed_for(&o.body, now, cfg, 0)
+        })
+    }
+
+    /// The holder and epoch of the lease this node last observed, while it
+    /// is live (not claimable) on that observation.
+    pub fn live_holder_seen(&self, now: Now, cfg: &Config) -> Option<(NodeId, Epoch)> {
+        self.obs
+            .as_ref()
+            .filter(|o| o.body.holder != 0 && !self.claimable_observed(now, cfg))
+            .map(|o| (o.body.holder, o.body.epoch))
+    }
+
+    /// When to read again: the instant this node's observation lets it
+    /// claim (`since + ttl + extra_ms` on the wait clock), `None` when it
+    /// is claimable now or nothing is observed.
+    pub fn claimable_at(&self, now: Now, cfg: &Config, extra_ms: u64) -> Option<WaitMs> {
+        let o = self.obs.as_ref()?;
+        if self.claimable_observed(now, cfg) {
+            return None;
+        }
+        Some(o.since.plus(Self::ttl_of(&o.body, cfg) + extra_ms))
+    }
+
+    /// The earliest instant a `Busy` classification of `prev` may change by
+    /// this node's own clock alone: its TTL claim, or the `ack=s3` permit's
+    /// window (when this node holds the permit).
+    fn retry_at_for(&self, prev: &Lease, cfg: &Config) -> Option<WaitMs> {
+        let o = self.obs_for(prev)?;
+        let ttl_at = o.since.plus(Self::ttl_of(&o.body, cfg));
+        let permit_at = self
+            .takeover_permit
+            .filter(|(epoch, holder)| {
+                prev.ack_policy == AckPolicy::S3 && *epoch == prev.epoch && *holder == prev.holder
+            })
+            .map(|_| o.since.plus(cfg.backup_takeover_ms));
+        Some(permit_at.map_or(ttl_at, |p| p.min(ttl_at)))
     }
 }
 
@@ -700,12 +914,20 @@ mod tests {
             Plan::Busy { holder: 3, .. } => {}
             other => panic!("{other:?}"),
         }
-        // Expired and unreleased: a takeover with a marker.
+        // Unreleased and watched for its holder's whole TTL (plan 43 C7b:
+        // by this node's own clock, not by the body's expiry): a takeover
+        // with a marker.
         let expired = Lease {
-            expires_unix_ms: now.wall.0 - 1,
+            ttl_ms: cfg.ttl_ms,
             ..foreign.clone()
         };
-        match st.classify(now, &cfg, Some((expired, tag())), 0) {
+        let mut watching = st.clone();
+        let then = Now {
+            wait: WaitMs(now.wait.0 - cfg.ttl_ms as i64),
+            ..now
+        };
+        watching.observe(then, Some(&(expired.clone(), tag())));
+        match watching.classify(now, &cfg, Some((expired, tag())), 0) {
             Plan::Claim {
                 takeover: true,
                 marker: true,
@@ -748,6 +970,328 @@ mod tests {
             Plan::Refused(_)
         ));
         assert_eq!(lost.lost_floor, 5);
+    }
+
+    // ---- plan 43 C7b: the observation rule ----
+
+    /// A foreign (node 3) lease body written by a holder whose clocks have
+    /// nothing to do with the claimant's, stamping `ttl_ms`.
+    fn foreign(cfg: &Config, at: Now, ttl_ms: u64) -> Lease {
+        let mut l = LeaseState::default().granted_lease(at, cfg, None, false);
+        l.holder = 3;
+        l.holder_clock = 33;
+        l.ttl_ms = ttl_ms;
+        l
+    }
+
+    fn busy_retry(plan: Plan) -> Option<WaitMs> {
+        match plan {
+            Plan::Busy { retry_at, .. } => retry_at,
+            other => panic!("expected Busy, got {other:?}"),
+        }
+    }
+
+    fn is_claim(plan: &Plan) -> bool {
+        matches!(
+            plan,
+            Plan::Claim {
+                takeover: true,
+                marker: true,
+                ..
+            }
+        )
+    }
+
+    /// The claimant never compares the holder's wall expiry with its own
+    /// clock: a body whose expiry is far in the past, first read now, is
+    /// busy until one of the holder's TTLs has passed on the claimant's wait
+    /// clock, and a claim after. (Fails on the parent: the wall compare
+    /// claims at once.)
+    #[test]
+    fn a_ttl_claim_waits_its_own_observation_whatever_the_expiry_says() {
+        let cfg = cfg();
+        let mut st = LeaseState::default();
+        let t0 = Now::same(1_000_000);
+        let mut body = foreign(&cfg, t0, 10_000);
+        body.expires_unix_ms = t0.wall.0 - 1_000_000;
+        let obj = (body, tag());
+        assert!(st.observe(t0, Some(&obj)));
+        let plan = st.classify(t0, &cfg, Some(obj.clone()), 0);
+        assert_eq!(busy_retry(plan), Some(t0.wait.plus(10_000)));
+        let almost = t0.plus(9_999);
+        assert!(
+            !st.observe(almost, Some(&obj)),
+            "the same key keeps its start"
+        );
+        assert!(matches!(
+            st.classify(almost, &cfg, Some(obj.clone()), 0),
+            Plan::Busy { .. }
+        ));
+        let due = t0.plus(10_000);
+        st.observe(due, Some(&obj));
+        assert!(is_claim(&st.classify(due, &cfg, Some(obj), 0)));
+    }
+
+    /// A cold claimant (nothing observed) is busy whatever the body says,
+    /// and so is one that classifies a body it has not watched.
+    #[test]
+    fn an_unobserved_body_is_live() {
+        let cfg = cfg();
+        let st = LeaseState::default();
+        let t0 = Now::same(1_000_000);
+        let mut body = foreign(&cfg, t0, 10_000);
+        body.expires_unix_ms = 0;
+        let plan = st.classify(t0.plus(1_000_000), &cfg, Some((body, tag())), 0);
+        assert!(matches!(plan, Plan::Busy { retry_at: None, .. }));
+    }
+
+    /// A renewal (the holder stamps a new wait end) is a new key: the watch
+    /// restarts, the claim waits another TTL from it.
+    #[test]
+    fn a_renewal_restarts_the_observation() {
+        let cfg = cfg();
+        let mut st = LeaseState::default();
+        let t0 = Now::same(1_000_000);
+        let first = foreign(&cfg, t0, 10_000);
+        st.observe(t0, Some(&(first.clone(), tag())));
+        let t1 = t0.plus(8_000);
+        let renewed = Lease {
+            holder_wait_ms: first.holder_wait_ms + 8_000,
+            ..first
+        };
+        assert!(st.observe(t1, Some(&(renewed.clone(), tag()))));
+        let t2 = t0.plus(10_000);
+        st.observe(t2, Some(&(renewed.clone(), tag())));
+        assert!(
+            matches!(
+                st.classify(t2, &cfg, Some((renewed.clone(), tag())), 0),
+                Plan::Busy { .. }
+            ),
+            "a TTL after the first sight of the old key is not a TTL after the renewal"
+        );
+        let t3 = t1.plus(10_000);
+        st.observe(t3, Some(&(renewed.clone(), tag())));
+        assert!(is_claim(&st.classify(t3, &cfg, Some((renewed, tag())), 0)));
+    }
+
+    /// Another claimant's `wanted_by` edit, a backup-set change and a mark
+    /// copy the renewal key's five fields: they must not restart the watch
+    /// (an ETag-based rule would let waiters starve each other), though the
+    /// claim names the newest tag read.
+    #[test]
+    fn a_wanted_by_edit_a_mark_or_a_reconfiguration_does_not_restart_it() {
+        let cfg = cfg();
+        let mut st = LeaseState::default();
+        let t0 = Now::same(1_000_000);
+        let body = foreign(&cfg, t0, 10_000);
+        st.observe(t0, Some(&(body.clone(), tag())));
+        for (k, edited) in [
+            body.wanting(9),
+            body.with_granted_delegations(),
+            body.reconfigured(vec![4], AckPolicy::Backup),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let at = t0.plus(1_000 * (k as u64 + 1));
+            assert!(!st.observe(at, Some(&(edited, tag()))), "edit {k}");
+        }
+        let due = t0.plus(10_000);
+        let last = body.wanting(9).wanting(10);
+        assert!(!st.observe(due, Some(&(last.clone(), tag()))));
+        assert!(is_claim(&st.classify(due, &cfg, Some((last, tag())), 0)));
+    }
+
+    /// Plan 43 C1-1 with the rule: a late read of the same key at an older
+    /// configuration version (answered before a reconfiguration landed)
+    /// keeps the observation's start and does not set its body back; a read
+    /// of the same version (a `wanted_by` edit, a mark) still replaces it.
+    #[test]
+    fn a_stale_reconfiguration_read_of_the_same_key_keeps_the_newer_body() {
+        let cfg = cfg();
+        let t0 = Now::same(1_000_000);
+        let mut v1 = foreign(&cfg, t0, 10_000);
+        v1.config_version = 1;
+        let v2 = v1.reconfigured(vec![4], AckPolicy::Backup);
+        assert!(v2.config_version > v1.config_version);
+        assert_eq!(v2.renewal_key(), v1.renewal_key());
+        let mut st = LeaseState::default();
+        assert!(st.observe(t0, Some(&(v2.clone(), tag()))));
+        assert!(!st.observe(t0.plus(100), Some(&(v1.clone(), tag()))));
+        let o = st.obs.as_ref().expect("observed");
+        assert_eq!(o.since, t0.wait, "the same key keeps its start");
+        assert_eq!(o.body.config_version, v2.config_version, "set back");
+        assert_eq!(o.body.backups, vec![4]);
+        assert_eq!(o.read_at, t0.wait, "a stale read is not a fresh one");
+        let edited = v2.wanting(9);
+        st.observe(t0.plus(200), Some(&(edited, tag())));
+        let o = st.obs.as_ref().expect("observed");
+        assert_eq!(o.body.wanted_by, vec![9]);
+        assert_eq!(o.since, t0.wait);
+    }
+
+    /// Released, fenced and never-held leases are claimable at once.
+    #[test]
+    fn a_released_or_fenced_lease_is_claimable_at_once() {
+        let cfg = cfg();
+        let t0 = Now::same(1_000_000);
+        let body = foreign(&cfg, t0, 10_000);
+        let st = LeaseState::default();
+        assert!(matches!(
+            st.classify(t0, &cfg, Some((body.released(), tag())), 0),
+            Plan::Claim {
+                takeover: true,
+                marker: false,
+                ..
+            }
+        ));
+        let fenced = body.fenced_for_retirement(3, t0.wall.0);
+        assert!(is_claim(&st.classify(
+            t0,
+            &cfg,
+            Some((fenced.clone(), tag())),
+            0
+        )));
+        let mut seen = LeaseState::default();
+        seen.observe(t0, Some(&(fenced, tag())));
+        assert!(seen.claimable_observed(t0, &cfg));
+        let mut none = LeaseState::default();
+        none.observe(t0, Some(&(body.released(), tag())));
+        assert!(none.claimable_observed(t0, &cfg));
+        assert_eq!(none.claimable_at(t0, &cfg, 0), None);
+    }
+
+    /// A claimant waits the *holder's* TTL, from the body, never its own:
+    /// a holder with a 90 s TTL is not claimed at 60 s by a claimant that
+    /// runs 60 s.
+    #[test]
+    fn the_holders_ttl_not_mine() {
+        let mut cfg = cfg();
+        cfg.ttl_ms = 60_000;
+        let mut st = LeaseState::default();
+        let t0 = Now::same(1_000_000);
+        let body = foreign(&cfg, t0, 90_000);
+        let obj = (body, tag());
+        st.observe(t0, Some(&obj));
+        let at_mine = t0.plus(60_000);
+        st.observe(at_mine, Some(&obj));
+        assert!(matches!(
+            st.classify(at_mine, &cfg, Some(obj.clone()), 0),
+            Plan::Busy { .. }
+        ));
+        let at_theirs = t0.plus(90_000);
+        st.observe(at_theirs, Some(&obj));
+        assert!(is_claim(&st.classify(at_theirs, &cfg, Some(obj), 0)));
+    }
+
+    /// A body without a TTL (an older build's, a singleton's) is judged by
+    /// this node's TTL on its observation **and** the wall compare: neither
+    /// alone claims it.
+    #[test]
+    fn a_body_without_a_ttl_is_judged_by_both_rules() {
+        let cfg = cfg();
+        let t0 = Now::same(1_000_000);
+        let mut body = foreign(&cfg, t0, 0);
+        let mut st = LeaseState::default();
+        // Expired on the wall, not watched long enough.
+        body.expires_unix_ms = t0.wall.0 - 1;
+        st.observe(t0, Some(&(body.clone(), tag())));
+        assert!(matches!(
+            st.classify(t0, &cfg, Some((body.clone(), tag())), 0),
+            Plan::Busy { .. }
+        ));
+        // Watched long enough, not expired on the wall.
+        let due = t0.plus(cfg.ttl_ms);
+        body.expires_unix_ms = due.wall.0 + 1;
+        st.observe(due, Some(&(body.clone(), tag())));
+        assert!(matches!(
+            st.classify(due, &cfg, Some((body.clone(), tag())), 0),
+            Plan::Busy { .. }
+        ));
+        // Both.
+        body.expires_unix_ms = due.wall.0;
+        st.observe(due, Some(&(body.clone(), tag())));
+        assert!(is_claim(&st.classify(due, &cfg, Some((body, tag())), 0)));
+    }
+
+    /// A non-backup waits the backups' claim grace past the TTL of its own
+    /// observation (a listed backup seals on silence well within that).
+    #[test]
+    fn the_backup_grace_counts_from_the_observation() {
+        let cfg = cfg();
+        let t0 = Now::same(1_000_000);
+        let mut body = foreign(&cfg, t0, 10_000);
+        body.ack_policy = AckPolicy::Backup;
+        body.backups = vec![4];
+        let mut st = LeaseState::default();
+        let obj = (body, tag());
+        st.observe(t0, Some(&obj));
+        let grace = backup_claim_grace_ms(&cfg) as u64;
+        let past_ttl = t0.plus(10_000);
+        st.observe(past_ttl, Some(&obj));
+        let plan = st.classify(past_ttl, &cfg, Some(obj.clone()), 0);
+        assert_eq!(
+            busy_retry(plan),
+            Some(t0.wait.plus(10_000 + grace)),
+            "a TTL alone is not enough for a non-backup"
+        );
+        let due = t0.plus(10_000 + grace);
+        st.observe(due, Some(&obj));
+        assert!(is_claim(&st.classify(due, &cfg, Some(obj), 0)));
+    }
+
+    /// Under `ack=s3` the permit's "no renewal for `backup_takeover_ms`" is
+    /// this node's own observation of the key: a renewal restarts it.
+    #[test]
+    fn the_s3_permit_counts_from_the_observation() {
+        let cfg = cfg();
+        let t0 = Now::same(1_000_000);
+        let mut body = foreign(&cfg, t0, 10_000);
+        body.ack_policy = AckPolicy::S3;
+        let mut st = LeaseState {
+            takeover_permit: Some((body.epoch, body.holder)),
+            ..LeaseState::default()
+        };
+        let obj = (body.clone(), tag());
+        st.observe(t0, Some(&obj));
+        let window = cfg.backup_takeover_ms;
+        let early = t0.plus(window - 1);
+        assert!(matches!(
+            st.classify(early, &cfg, Some(obj.clone()), 0),
+            Plan::Busy { retry_at: Some(at), .. } if at == t0.wait.plus(window)
+        ));
+        let due = t0.plus(window);
+        assert!(is_claim(&st.classify(due, &cfg, Some(obj), 0)));
+        // A renewal in between: the window starts again.
+        let renewed = Lease {
+            holder_wait_ms: body.holder_wait_ms + 1_000,
+            ..body
+        };
+        st.observe(early, Some(&(renewed.clone(), tag())));
+        assert!(matches!(
+            st.classify(due, &cfg, Some((renewed, tag())), 0),
+            Plan::Busy { .. }
+        ));
+    }
+
+    /// The claim names the latest read: the observation keeps the newest
+    /// body and tag with the unchanged key, and the first sight's start.
+    #[test]
+    fn the_observation_keeps_the_latest_body() {
+        let cfg = cfg();
+        let t0 = Now::same(1_000_000);
+        let body = foreign(&cfg, t0, 10_000);
+        let mut st = LeaseState::default();
+        st.observe(t0, Some(&(body.clone(), tag())));
+        st.observe(t0.plus(5), Some(&(body.wanting(9), tag())));
+        let o = st.obs.as_ref().expect("observed");
+        assert_eq!(o.since, t0.wait);
+        assert!(o.tag.is_some());
+        assert_eq!(
+            o.body.wanted_by,
+            vec![9],
+            "the newest body, the first sight"
+        );
     }
 
     /// Plan 43 C7a (M4's own-lease arm): an own unreleased lease this node

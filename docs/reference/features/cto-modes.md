@@ -274,10 +274,16 @@ lease object's `granted_delegations` flag).
 The delegate honours a grant until `sent + ttl − margin` on its own
 clock, measured from when it sent the request. The sequencer treats it
 as live until `granted + ttl + margin` on its own clock. `margin` is the
-lease's expiry margin, `min(1 s, lease TTL / 4)`. Every condition
-reduces to the lease's own rule, `margin > 2 × drift`: at the defaults,
-clocks may differ from each other by up to ±500 ms (that is the
-cross-node part; plan 43 C7b replaces it). A clock's *rate* is a separate
+lease's expiry margin, `min(1 s, lease TTL / 4)`. The conditions that
+compare a value one node wrote with another node's clock reduce to
+`margin > 2 × drift`: at the defaults, clocks may differ from each other by
+up to ±500 ms (that is the cross-node part; plan 43 C7b replaces it commit by
+commit). The lease itself no longer is one of them: a claimant judges it by
+its own observation of the holder's renewals (`DESIGN.md` §5), and a strict
+reader that decides the holder is dead (the lease claimable) does so on that
+observation too, so a reader whose clock is ahead no longer tails S3 past a
+live holder's acknowledged writes; a cold reader treats the holder as live
+(it asks, and tails one TTL after a dead holder's last renewal it saw). A clock's *rate* is a separate
 bound that each node pays by itself (plan 43 C7a): its oscillator is
 budgeted at 1 000 ppm (0.1 %), and the honour and wait readings below run
 fast and slow by that budget, so a window measured on one node is exact for

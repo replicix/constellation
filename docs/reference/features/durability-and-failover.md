@@ -509,7 +509,23 @@ whose clock runs ahead of it by more than the lease has left would read it
 as past and wait for nothing while the old holder's grants were still
 honoured. Nor does the successor's reading of that expiry decide whether
 the takeover was a fast one: a seal or an `ack=s3` takeover is, whatever
-its clock says.
+its clock says. (Since plan 43 C7b the same holds for a TTL takeover that
+is not permitted: the claimant waited a holder's TTL of its own wait clock
+from its first read of the lease's current renewal key, so the old holder's
+window is over in true time and no floor is needed.)
+
+**The cold-claim wait.** A node claims a live-looking lease by TTL only after
+it has watched the lease's renewal key unchanged for the holder's TTL on its
+own wait clock (`DESIGN.md` §5; the body's `ttl_ms`). The crash-to-claim time
+of a node that read the lease before the crash is the old one (the holder's
+last renewal plus a TTL, less the time since that read); one that first reads
+it after the crash waits one TTL from that read (about 60 s at the defaults),
+the price of judging by a duration only this node measured, which no offset
+between it and the holder can change. A lease marked released or fenced is
+claimable at once, a listed backup's seal is not delayed, and under
+`ack=s3` the permit's window ("no renewal for `backup_takeover_ms`") counts
+from the first read of the key too, at most 1.5 s at the defaults. Node
+restarts forget the observation (a restarted claimant is a cold one).
 
 **The old holder's own heartbeat can end the wait earlier.** Everything
 the old holder answered or granted is capped by its lease (strict answers

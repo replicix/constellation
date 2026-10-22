@@ -416,6 +416,16 @@ pub struct Config {
 }
 
 impl Config {
+    /// Plan 43 C7b (D6): a lock grace after a released lease ends `lock_ttl
+    /// + 2 margins` after its taker first saw the release
+    /// (`Core::lock_on_released_takeover`), and a TTL successor of a tenure
+    /// that inherited it arms no floor of its own: the grace must fit inside
+    /// one lease TTL for that successor to find every grant of the old
+    /// tenure over. `load_config` warns when it does not.
+    pub fn lock_grace_fits_lease(&self) -> bool {
+        self.lock_ttl_ms + 2 * self.expiry_margin_ms <= self.ttl_ms
+    }
+
     /// How long a non-blocking lock request may wait for an owner that
     /// cannot grant yet (plan 43 F-b) before it gives up with `EAGAIN`:
     /// the longest bound such an owner can have (a fast successor's
@@ -659,6 +669,10 @@ pub struct Stats {
     /// replica was rebuilt from the head commit.
     pub retention_gaps: u64,
     pub takeovers: u64,
+    /// Plan 43 C7b: foreign lease bodies observed that carry no `ttl_ms` (an
+    /// older build's, or a singleton's): judged by this node's own TTL and
+    /// the wall compare as well (`LeaseState::obs_passed_for`).
+    pub lease_ttl_unknown_bodies: u64,
     pub handoffs_served: u64,
     pub handoffs_declined: u64,
     pub releases: u64,
@@ -1548,6 +1562,11 @@ pub struct Core {
     /// `Control::Acquire`/`ClaimOffer` requests answered when the
     /// acquisition in the slot finishes.
     acquire_waiters: Vec<(OpId, Control)>,
+    /// Plan 43 C7b: when the last `Plan::Busy` says this node's observation
+    /// lets it claim (`Plan::Busy::retry_at`): the retry of the ops waiting
+    /// for the lease is at that instant when it is sooner than the backoff
+    /// (`schedule_acquire_retry`).
+    acquire_retry_hint: Option<crate::ids::WaitMs>,
     acked: client::AckTracker,
     replay: replay::ReplayState,
     /// Chunk metered-own-rows: an observed position's upload, repeated
@@ -1650,6 +1669,7 @@ impl Core {
             round_waiters: Vec::new(),
             barriers: Vec::new(),
             acquire_waiters: Vec::new(),
+            acquire_retry_hint: None,
             acked: client::AckTracker::default(),
             replay: replay::ReplayState::default(),
             observed_upload: Default::default(),
@@ -2373,6 +2393,18 @@ impl Core {
         };
         self.note_s3_liveness(now, op, &result);
         self.note_epoch_probe(&result);
+        // Plan 43 C7b: every lease read, whatever asked for it, is observed
+        // here once, before any handler judges it (the handling time is the
+        // `t0` of the observation rule, never the GET's send time).
+        if let S3Result::LeaseGet(Ok(object)) = &result {
+            if self.lease.observe(now, object.as_ref())
+                && object.as_ref().is_some_and(|(l, _)| {
+                    l.holder != 0 && l.holder != self.cfg.node_id && l.ttl_ms == 0
+                })
+            {
+                self.stats.lease_ttl_unknown_bodies += 1;
+            }
+        }
         match purpose {
             S3For::Job => self.on_job_s3(now, op, result, replica, out),
             S3For::LearnHolder(rid) => self.on_holder_learned(now, rid, result, replica, out),

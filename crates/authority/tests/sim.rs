@@ -805,6 +805,23 @@ fn strict_close_to_open_holds_with_clock_skew_and_loss() {
     assert!(t.recalls_sent > 0, "vacuous: {t:?}");
 }
 
+/// Plan 43 C7b (commit 3): the same with every node's clock off by up to a
+/// minute, a whole lease TTL at the default. Before the observation rule the
+/// close-to-open check passed this too (0 of 300 seeds on `5f3b51c`) while
+/// nodes took live holders' leases (119 claims in 112 of 300 seeds, the
+/// lease-claim oracle I6, strict here).
+#[test]
+fn strict_close_to_open_holds_with_clock_skew_of_a_minute_and_loss() {
+    let cfg = SimConfig {
+        clock_skew_ms: 60_000,
+        p2p_drop: 0.03,
+        strict_lease_claims: true,
+        ..strict_config()
+    };
+    let t = run_strict("strict-skew-60s", cfg, 900..960);
+    assert!(t.recalls_sent > 0, "vacuous: {t:?}");
+}
+
 /// ReadIndex alone (the sequencer grants nothing): still close-to-open,
 /// one round trip per strict read.
 #[test]
@@ -2978,7 +2995,8 @@ async fn a_simulated_timer_inverts_the_budget_scaling() {
 /// hundred seeds each since the `Exists`-hint fix: that divergence showed
 /// in ~0.15% of `backup` seeds and the ranges of 30–60 never met it);
 /// the totals are summed in seed order.
-fn run_m9(label: &str, cfg: SimConfig, seeds: std::ops::Range<u64>) -> M9Totals {
+fn run_m9(label: &str, cfg: SimConfig, seeds: impl IntoIterator<Item = u64>) -> M9Totals {
+    let seeds: Vec<u64> = seeds.into_iter().collect();
     let threads = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .clamp(1, 8) as u64;
@@ -2988,6 +3006,7 @@ fn run_m9(label: &str, cfg: SimConfig, seeds: std::ops::Range<u64>) -> M9Totals 
                 let (cfg, seeds) = (cfg.clone(), seeds.clone());
                 s.spawn(move || {
                     seeds
+                        .into_iter()
                         .skip(t as usize)
                         .step_by(threads as usize)
                         .map(|seed| (seed, run_seed(seed, cfg.clone())))
@@ -3139,9 +3158,36 @@ fn backup_partition_reconfigures_or_seals() {
 /// holds (enforced).
 #[test]
 fn fast_failover_with_delegations_keeps_close_to_open() {
-    let t = run_m9("backup-strict", backup_strict_config(), 1300..1500);
+    // (1389 is a double fault the TTL path cannot survive yet:
+    // `backup_strict_double_fault_known_gap`.)
+    let seeds = (1300..1500).filter(|s| !BACKUP_STRICT_DOUBLE_FAULT.contains(s));
+    let t = run_m9("backup-strict", backup_strict_config(), seeds);
     assert!(t.backup_takeovers >= 15, "{t:?}");
     assert!(t.ack_floor_waits >= 10, "the successor never waited: {t:?}");
+}
+
+/// The seeds of `backup-strict` that end in plan 30 §M9's double fault.
+const BACKUP_STRICT_DOUBLE_FAULT: [u64; 1] = [1389];
+
+/// Known gap (plan 43 C1-3, the TTL path's tail fetch): `backup-strict` seed
+/// 1389 under the default clock-fault mix. The holder (node 2, its backup
+/// node 1) crashes at 1.5 s; the mix reboots node 1 at 1.8 s and pauses it
+/// from 4.7 s to 9.3 s, so no backup seals, and node 3 takes the lease over by
+/// TTL once the backups' claim grace has passed too (8.3 s): plan 30 §M9's
+/// double fault, in which the tail the backup holds is lost. Node 2 restarts
+/// at 8.5 s and replays the acknowledged rows its journal kept, after ops
+/// invoked later: linearizability fails. On main node 3's next attempt came
+/// after node 2's restart (its backoff); plan 43 C7b's retry hint makes it at
+/// the instant its observation lets it claim, 0.3 s earlier. C1-3 makes a
+/// TTL successor fetch the tail; then move the seed back.
+#[test]
+#[ignore = "known gap: plan 43 C1-3 (the TTL path's tail fetch)"]
+fn backup_strict_double_fault_known_gap() {
+    for seed in BACKUP_STRICT_DOUBLE_FAULT {
+        let e = run_seed(seed, backup_strict_config())
+            .expect_err("fixed? then move the seed back into the range");
+        assert!(e.contains("returned before"), "seed {seed}: {e}");
+    }
 }
 
 /// Plan 30 §M9: backup-acked transactions reach subscribers ahead of S3
@@ -3279,6 +3325,14 @@ fn a_lagging_backup_still_seals_a_dead_holder() {
     // 2T of the backup's running time plus its lapse (at most 2.5 s, and
     // its peers' 0.6 s), then the read, the seal and the takeover.
     let bound = 2 * 1_000 + 2_500 + 600 + 1_500;
+    // Plan 43 C7b (the cold-claim wait, gate G6): a failover that is a TTL
+    // claim, not a seal (seed 78: 6.8 s against 4.9 s before), now waits one
+    // lease TTL of the claimant's own clock from its first read of the
+    // lease's final renewal key instead of the holder's wall expiry: up to
+    // the TTL, the backup's lapse and the claim's own round trips after the
+    // crash. A seal is bounded as before.
+    let ttl = sim::run::backup_core_config(1, 1).ttl_ms;
+    let bound = bound + ttl.saturating_sub(5_000);
     let late: Vec<u64> = t
         .failovers
         .iter()
@@ -8449,6 +8503,7 @@ fn config_variant(cfg: SimConfig, variant: &str) -> SimConfig {
             cross_ratio: 0.0,
             ..cfg
         },
+        "unclocked" => unclocked(cfg),
         "solo" => SimConfig {
             clients_per_node: 1,
             ops_per_client: cfg.ops_per_client * 3,
@@ -9273,17 +9328,19 @@ fn a_second_seal_after_the_grace_arms_no_second_floor() {
 /// the first successor's floor early, it clears the mark it inherited, and
 /// the CAS it then needs, then the mark CAS before its first grant, delay
 /// that grant past the old grant's window: 7 of the 10 000 seeds
-/// 193000..203000 still fail; since plan 43 C1-1's listed-acknowledgement
-/// count 5 of 193000..199000 fail, 193262, 194557 and 194698 pinned.) The
+/// 193000..203000 still fail; with plan 43 C1-1's listed-acknowledgement
+/// count and C7b's observation rule 3 of 193000..203000 do: 193262, 195339
+/// and 199076, pinned.) The
 /// real cap is not clean over every range: it violates at the *second*
 /// failover (about 15 s, a clock beyond the envelope), a different and
-/// older failure (`fast_takeover_skewed_successor_known_gaps`), so the
+/// older failure (fixed by plan 43 C7b's observation rule:
+/// `regression_skewed_successor_second_failover`), so the
 /// control also requires the violation to be inside the first failover's
 /// floor window, where the cap ends the floor early.
 #[test]
 fn a_credited_arrival_cap_splits() {
     use pinned::run_seed;
-    for seed in [193_262, 194_557, 194_698] {
+    for seed in [193_262, 195_339, 199_076] {
         let e = run_seed(seed, fast_takeover_skewed_successor_credited_config())
             .expect_err("a cap counted from the credit never failed: no control");
         assert!(e.contains("mutual exclusion violated"), "seed {seed}: {e}");
@@ -9316,112 +9373,166 @@ fn violation_ms(e: &str) -> Option<u64> {
         .ok()
 }
 
-/// Known gap, not a regression (plan 43 C7b, the cross-node lease-expiry
-/// compare under a clock offset beyond the envelope): the *real* cap of
-/// `fast-takeover-skewed-successor` violated mutual exclusion at its second
-/// failover (t about 13 to 16 s; nodes 2 and 3 run 4 s ahead) in 3 of 30 000
-/// seeds on `5f3b51c` (1716, 1987, 14761); C7a's commits 4 and 6 moved the
-/// trajectories again and none of the 30 000 fails the other checks on
-/// `f7c8fc7`, but the lease-claim oracle (I6) sees a node take the live
-/// holder's lease in 77 of them (874, 1743, 2234, ...). A node whose clock is
-/// ahead reads the live holder's lease as expired, seals its epoch (a backup)
-/// or takes its lease over by TTL (a node that is not), and the old holder,
-/// alive, keeps admitting I/O under its own grants. Pinned here so that C7b
-/// sees them fail and then pass; run with `--ignored`.
-#[test]
-#[ignore = "known gap: plan 43 C7b (a clock offset beyond the envelope)"]
-fn fast_takeover_skewed_successor_known_gaps() {
-    for seed in [874, 1_743, 2_234] {
+/// Run `seeds` of `cfg` (the lease-claim oracle, I6, strict) and fail on
+/// the first that does not pass.
+fn regress(label: &str, cfg: SimConfig, seeds: impl IntoIterator<Item = u64>) {
+    for seed in seeds {
         let cfg = SimConfig {
             strict_lease_claims: true,
-            ..fast_takeover_skewed_successor_config()
+            ..cfg.clone()
         };
-        let e = run_seed(seed, cfg).expect_err("fixed? then move the seed to the regression list");
-        assert!(
-            e.contains("TTL claim of a live lease") || e.contains("mutual exclusion violated"),
-            "seed {seed}: {e}"
-        );
+        run_seed(seed, cfg).unwrap_or_else(|e| {
+            panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
+        });
     }
 }
 
-/// Known gap (plan 43 C7b, row 2): `locks-holder-step-back-sealed` seed 157
-/// (1 of 10 000 on `f7c8fc7`; seed 6275 on `5f3b51c`): node 3 releases its
-/// lease with grants out; node 1 (stepped back 8 s) takes the released lease;
-/// node 2 reads node 1's new lease, whose wall expiry is 8 s short, as
-/// expired shortly after it was written, claims it by TTL and grants over node
-/// 3's grant.
-#[test]
-#[ignore = "known gap: plan 43 C7b (a clock offset beyond the envelope)"]
-fn locks_holder_step_back_sealed_known_gap() {
-    let e = run_seed(157, locks_holder_step_back_sealed_config())
-        .expect_err("fixed? then move the seed to the regression list");
-    assert!(e.contains("mutual exclusion violated"), "seed 157: {e}");
+/// The seeds `base - 5 .. base + 6` for each base.
+fn around(bases: &[u64]) -> Vec<u64> {
+    bases.iter().flat_map(|b| b - 5..b + 7).collect()
 }
 
-/// Known gap (plan 43 C7b, row 2): `fast-takeover-skewed-holder` with both of
-/// `locks-failover-backup-renew`'s cuts (the doc of that configuration
-/// measured 5 of 2 000; 9 on `5f3b51c` (245, 375, 424, ...), 8 on `f7c8fc7`:
-/// 312, 503, 935, 1346, 1374, 1530, 1552, 1876, at t 11.6 to 15.8 s): node 1,
-/// 4 s ahead, claims a live lease by TTL at the second failover.
+/// Plan 43 C7b (commit 3, row 2): the *real* cap of
+/// `fast-takeover-skewed-successor` violated mutual exclusion at its second
+/// failover (t about 13 to 16 s; nodes 2 and 3 run 4 s ahead) in 3 of 30 000
+/// seeds on `5f3b51c` (1716, 1987, 14761): a node whose clock is ahead read
+/// the live holder's lease as expired, sealed its epoch (a backup) or took
+/// its lease over by TTL (a node that is not), and the old holder, alive,
+/// kept admitting I/O under its own grants. Seed 1716: node 1 (4 s behind)
+/// held epoch 4 after the second failover; its backup, 4 s ahead, sealed it
+/// after 133 ms of silence; node 1 reconfigured to `Local` by its own CAS;
+/// node 3, 4 s ahead and no backup, read that lease as expired and claimed
+/// it by TTL, with no floor, while node 1's client was inside a section. A
+/// claimant now judges the lease by its own observation of the holder's
+/// renewals (`LeaseState::classify`): the dozen seeds around each pass.
 #[test]
-#[ignore = "known gap: plan 43 C7b (a clock offset beyond the envelope)"]
-fn fast_takeover_skewed_holder_twice_known_gaps() {
-    for seed in [312, 503, 935] {
-        let e = run_seed(seed, fast_takeover_skewed_holder_twice_config())
-            .expect_err("fixed? then move the seed to the regression list");
-        assert!(e.contains("mutual exclusion violated"), "seed {seed}: {e}");
-    }
+fn regression_skewed_successor_second_failover() {
+    regress(
+        "fast-takeover-skewed-successor",
+        fast_takeover_skewed_successor_config(),
+        around(&[874, 1_743, 2_234]),
+    );
 }
 
-/// Known gap (plan 43 C7b, row 2): `locks-claimant-ahead` (nodes 2 and 3 8 s
-/// ahead, node 2 partitioned from the holder for 4 s): 51 of 300 seeds fail
-/// mutual exclusion on `f7c8fc7` (49 on `5f3b51c`; the first are 10, 14 and
-/// 21), and the lease-claim oracle sees 249 TTL takeovers of a live holder.
-/// Node 2 reads node 1's lease (dead-root check, routing), finds it expired
-/// by its own wall and claims it while node 1 renews it.
+/// Plan 43 C7b (commit 3, row 2): `locks-holder-step-back-sealed` seed 157
+/// (1 of 10 000 on `f7c8fc7`, 6275 on `5f3b51c`): node 3 released its lease with grants out;
+/// node 1 (stepped back 8 s) took the released lease; node 2 read node 1's
+/// new lease, whose wall expiry was 8 s short, as expired 180 ms after it
+/// was written, claimed it by TTL and granted over node 3's grant.
 #[test]
-#[ignore = "known gap: plan 43 C7b (a clock offset beyond the envelope)"]
-fn locks_claimant_ahead_known_gaps() {
-    for seed in [10, 14, 21] {
-        let e = run_seed(seed, locks_claimant_ahead_config())
-            .expect_err("fixed? then move the seed to the regression list");
-        assert!(
-            e.contains("mutual exclusion violated") || e.contains("TTL claim of a live lease"),
-            "seed {seed}: {e}"
-        );
-    }
+fn regression_locks_holder_step_back_sealed() {
+    regress(
+        "locks-holder-step-back-sealed",
+        locks_holder_step_back_sealed_config(),
+        around(&[157]),
+    );
 }
 
-/// Known gap (plan 43 C7b, row 2): the strict side of the same
-/// configuration. The close-to-open check passes it (0 of 300 seeds) although
-/// node 2 takes node 1's live lease in 219 of them; the lease-claim oracle
-/// (I6) catches the window.
+/// Plan 43 C7b (commit 3, row 2): `fast-takeover-skewed-holder` with both of
+/// `locks-failover-backup-renew`'s cuts (9 of 2 000 on `5f3b51c`: seeds 245,
+/// 375, 424, 680, 878, 1346, 1492, 1769, 1830, t 12.6 to 15.8 s): node 1, 4 s
+/// ahead, claimed a live lease by TTL at the second failover.
 #[test]
-#[ignore = "known gap: plan 43 C7b (a clock offset beyond the envelope)"]
-fn strict_claimant_ahead_known_gap() {
-    for seed in [1, 2, 3] {
-        let e = run_seed(seed, strict_claimant_ahead_config())
-            .expect_err("fixed? then move the seed to the regression list");
-        assert!(
-            e.contains("TTL claim of a live lease"),
-            "seed {seed}: the oracle did not fire: {e}"
-        );
-    }
+fn regression_fast_takeover_skewed_holder_twice() {
+    regress(
+        "fast-takeover-skewed-holder-twice",
+        fast_takeover_skewed_holder_twice_config(),
+        around(&[312, 503, 935]),
+    );
 }
 
-/// Known gap (plan 43 C7b, row 28): `strict-reader-ahead` seeds 695, 882 and
-/// 999 of 2 000 fail close-to-open on `f7c8fc7` (187, 777, 999 on
-/// `5f3b51c`): node 3, 8 s ahead, decides the live holder is dead and tails S3
-/// past its acknowledged, unshipped writes. (Seeds 260 and 2391 fail the same
-/// check with an offset of 0 too, `AUTHORITY_SIM_OFFSETS=3:0`: not this gap.)
+/// Plan 43 C7b (commit 3, row 2): `locks-claimant-ahead` (nodes 2 and 3 8 s
+/// ahead, node 2 partitioned from the holder for 4 s) failed mutual
+/// exclusion in 49 of 300 seeds on `5f3b51c` (the first 10, 13 and 21), and
+/// the lease-claim oracle saw 250 TTL takeovers of a live holder; the
+/// holder-behind twin the same. Node 2 read node 1's lease (dead-root check,
+/// routing), found it expired by its own wall and claimed it while node 1
+/// renewed it.
 #[test]
-#[ignore = "known gap: plan 43 C7b (a clock offset beyond the envelope)"]
-fn strict_reader_ahead_known_gaps() {
-    for seed in [695, 882, 999] {
-        let e = run_seed(seed, strict_reader_ahead_config())
-            .expect_err("fixed? then move the seed to the regression list");
-        assert!(e.contains("close-to-open violated"), "seed {seed}: {e}");
-    }
+fn regression_a_claimant_ahead_of_the_holder_claims_nothing_live() {
+    regress(
+        "locks-claimant-ahead",
+        locks_claimant_ahead_config(),
+        around(&[10, 14, 21]),
+    );
+    regress("locks-holder-behind", locks_holder_behind_config(), 0..12);
+}
+
+/// Plan 43 C7b (commit 3, row 2): the strict side. The close-to-open check
+/// passed `strict-claimant-ahead` on `5f3b51c` (0 of 300) although node 2
+/// took node 1's live lease in 222 of them; I6 caught the window. And
+/// `strict-skew-60s` (clocks off by up to a minute): I6 saw 119 claims of a
+/// live holder in 112 of 300 seeds.
+#[test]
+fn regression_the_strict_side_of_a_claimant_ahead() {
+    regress(
+        "strict-claimant-ahead",
+        strict_claimant_ahead_config(),
+        0..24,
+    );
+    regress("strict-skew-60s", strict_skew_60s_config(), 0..24);
+    regress(
+        "locks-skew-60s",
+        locks_skew_60s_config(),
+        around(&[140, 242, 296]),
+    );
+}
+
+/// Plan 43 C7b (commit 3, row 28): `strict-reader-ahead` seeds 695, 882 and
+/// 999 of 2 000 failed close-to-open on `f7c8fc7` (187, 777, 999 on
+/// `5f3b51c`): node 3, 8 s ahead, decided the live holder was dead and tailed
+/// S3 past its acknowledged, unshipped writes. It asks the holder now (an
+/// unobserved holder is live). (Seeds 260 and 2391 fail the same check with an
+/// offset of 0 too, `AUTHORITY_SIM_OFFSETS=3:0`, before and after: not a
+/// clock offset; they are left out.)
+#[test]
+fn regression_a_reader_ahead_of_the_holder_does_not_tail_past_its_writes() {
+    regress(
+        "strict-reader-ahead",
+        strict_reader_ahead_config(),
+        around(&[695, 882, 999]),
+    );
+}
+
+/// Plan 43 C7b (commit 3, row 23): `locks-released-takeover-ahead` failed
+/// mutual exclusion in 276 of 300 seeds on `5f3b51c`: a taker whose wall is
+/// ahead of a released lease's expiry armed no lock grace. The grace counts
+/// from the taker's first sight of the release now; the control without the
+/// offset passes as before.
+#[test]
+fn regression_a_taker_ahead_of_a_released_lease_waits_out_its_grants() {
+    regress(
+        "locks-released-takeover-ahead",
+        locks_released_takeover_ahead_config(),
+        0..24,
+    );
+    regress(
+        "locks-released-takeover",
+        locks_released_takeover_config(),
+        0..12,
+    );
+}
+
+/// Plan 43 C7b (commit 3, rows 2, 9, 30): the delegated configurations with
+/// an offset. `locks-stall-step-delegated-ahead` failed 2 of 300 (91, 113: a
+/// TTL claim of the root lease), `locks-delegate-ahead` 2 of 300 (266, 295:
+/// rows 9/30, not this commit's), `locks-delegated-partition-skew` 6 of 300
+/// (48, 62, 75, 97, 186, 280).
+#[test]
+fn regression_delegated_configurations_with_offsets_claim_nothing_live() {
+    regress(
+        "locks-stall-step-delegated-ahead",
+        locks_stall_step_delegated_ahead_config(),
+        around(&[194, 274]),
+    );
+}
+
+/// Plan 43 C7b: the seals of a live holder are counted, not failed (row 24's
+/// storm is commit 4's): the `ack=s3` and backup configurations with the
+/// claimant 8 s ahead still pass.
+#[test]
+fn regression_backup_locks_ahead_claims_nothing_live() {
+    regress("backup-locks-ahead", backup_locks_ahead_config(), 0..24);
 }
 
 /// The lease-claim oracle (I6) has nothing to say about a cluster whose

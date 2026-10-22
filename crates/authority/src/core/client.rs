@@ -1012,7 +1012,7 @@ impl Core {
         };
         let live = object
             .as_ref()
-            .filter(|lease| lease.holder != 0 && !lease.is_claimable(now.wall.0));
+            .filter(|lease| lease.holder != 0 && !self.lease.claimable_observed(now, &self.cfg));
         match live {
             Some(lease) if lease.holder != self.cfg.node_id => {
                 let holder = lease.holder;
@@ -1801,6 +1801,7 @@ impl Core {
             .filter(|(_, c)| matches!(c.phase, Phase::WaitingLease))
             .map(|(rid, _)| *rid)
             .collect();
+        let retry_hint = self.acquire_retry_hint.take();
         for rid in waiting {
             // An earlier iteration's `finish` may have released and
             // finished this one through the key gate.
@@ -1818,8 +1819,10 @@ impl Core {
                 self.finish_in_doubt(now, rid, replica, out);
                 continue;
             }
+            self.acquire_retry_hint = retry_hint;
             self.schedule_acquire_retry(now, rid, out);
         }
+        self.acquire_retry_hint = None;
     }
 
     /// Answer every op on the lease path with `code` (a frozen epoch's,
@@ -1926,8 +1929,18 @@ impl Core {
             return;
         };
         c.acquire_retries += 1;
-        let delay = (self.cfg.acquire_retry_min_ms << c.acquire_retries.min(10))
+        let mut delay = (self.cfg.acquire_retry_min_ms << c.acquire_retries.min(10))
             .min(self.cfg.acquire_retry_max_ms);
+        // Plan 43 C7b: a retry also at the instant this node's observation
+        // lets it claim, when that is before the backoff's. The backoff
+        // (capped at `acquire_retry_max_ms`) still bounds the polling of a
+        // cold claimant, and a retry is never later than it was: the lease
+        // may change hands or be released before the observation passes, and
+        // the read that finds out must not wait for it.
+        if let Some(at) = self.acquire_retry_hint {
+            let to_claim = at.since(now.wait).max(0) as u64 + 1;
+            delay = delay.min(to_claim.max(self.cfg.acquire_retry_min_ms));
+        }
         c.phase = Phase::AcquireRetry;
         let timer = self.set_timer_wait(now.wait.plus(delay), Timer::AcquireRetry(rid), out);
         self.clients.get_mut(&rid).expect("present").timer = Some(timer);

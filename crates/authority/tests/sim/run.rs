@@ -556,9 +556,8 @@ pub struct SimConfig {
     /// while the old holder's own process still honours it (its
     /// `holder_expires_ms` less its margin, on its honour clock) fails the
     /// run. Always counted (`Report::lease_ttl_claims`,
-    /// `lease_live_claims`); the flag only decides failure. Off for the
-    /// configurations that predate it (a few have offsets beyond the
-    /// margin and would fail), on for the C7b ones.
+    /// `lease_live_claims`); the flag only decides failure. On (the default)
+    /// since the observation rule (plan 43 C7b, commit 3).
     pub strict_lease_claims: bool,
     /// Negative control: the stub that answered every `RebuildReplica`
     /// with `ok: false` (the sim's rebuild before plan 43 C0).
@@ -816,7 +815,7 @@ impl Default for SimConfig {
             strict_identity: false,
             strict_settle: false,
             strict_lone: false,
-            strict_lease_claims: false,
+            strict_lease_claims: true,
             rebuild_stub: false,
             plant_ungated_fast_path: false,
         }

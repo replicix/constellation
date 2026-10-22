@@ -66,6 +66,7 @@ pub use inbox::{
 };
 pub use lease::{
     fence_retired, live_leases_held_by, AckPolicy, Lease, LeaseMode, LeaseStore, LeaseTag,
+    RenewalKey,
 };
 pub use log::LogStore;
 pub use mark::{live_set, mark, CatalogPack, LiveSet, Mark, PackCatalog};

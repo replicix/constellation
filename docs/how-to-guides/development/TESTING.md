@@ -4769,11 +4769,17 @@ The numbers are with the I6 flag off, 300 seeds unless said:
 | `flex-taker-ahead` (row 3: node 3 +20 s) | 0 | the model is the primary evidence |
 | `locks-locker-suspend-coarse` (`suspend_accounting_short_ms 900`, margins 200 ms, a 1.5 s suspend) | 0 of 600 in five variants (suspends 1.3-2 s, margins 100-500 ms; `AUTHORITY_SIM_SUSPEND_MS`, `_MARGIN_MS`, `_SUSPEND_SHORT`): not failing yet | commit 7's: the boot clock counts each suspend short, as the x86 RTC path |
 
-The known gaps are pinned (`#[ignore]`: `fast_takeover_skewed_successor_known_gaps`
-seeds 874, 1743, 2234; `locks_holder_step_back_sealed_known_gap` 157;
-`fast_takeover_skewed_holder_twice_known_gaps` 312, 503, 935;
-`locks_claimant_ahead_known_gaps` 10, 14, 21; `strict_claimant_ahead_known_gap`;
-`strict_reader_ahead_known_gaps` 695, 882, 999), and
+The known gaps are regressions now (plan 43 C7b, commit 3; the lease-claim
+oracle is strict everywhere): the dozen seeds around each pass
+(`regression_skewed_successor_second_failover`,
+`regression_locks_holder_step_back_sealed`,
+`regression_fast_takeover_skewed_holder_twice`,
+`regression_a_claimant_ahead_of_the_holder_claims_nothing_live`,
+`regression_the_strict_side_of_a_claimant_ahead`,
+`regression_a_reader_ahead_of_the_holder_does_not_tail_past_its_writes`,
+`regression_a_taker_ahead_of_a_released_lease_waits_out_its_grants`,
+`regression_delegated_configurations_with_offsets_claim_nothing_live`,
+`regression_backup_locks_ahead_claims_nothing_live`), and
 `the_lease_claim_oracle_is_silent_without_offsets` pins I6's silence on the
 failover configurations whose clocks agree.
 

@@ -664,6 +664,9 @@ pub(crate) struct BackupState {
     /// `ack=s3` fast takeover: since when the known holder has been
     /// silent on P2P.
     holder_silent_since: Option<WaitMs>,
+    /// Plan 43 C7b: when `ack=s3`'s silence watch last read the lease to
+    /// refresh a stale view (`watch_s3_holder`).
+    s3_reread_at: Option<WaitMs>,
     /// EC2 follow-up 3b: this node restarted holding a backup role and
     /// has not yet had a P2P link to its holder since: its downtime (and
     /// the redial) is not the holder's silence.
@@ -4618,7 +4621,14 @@ impl Core {
             self.bk.holder_silent_since = None;
             return;
         }
-        if seen.is_claimable(now.wall.0) {
+        // Plan 43 C7b: judged on this node's observation. Without one (the
+        // key not watched yet) a read first: the S3 permit's window and the
+        // lease's TTL both count from it.
+        if self.lease.obs.is_none() {
+            self.issue_s3(S3Op::LeaseGet, S3For::PromiseWatch, out);
+            return;
+        }
+        if self.lease.claimable_observed(now, &self.cfg) {
             return;
         }
         // Silence is measured on the holder's log stream when this node
@@ -4665,6 +4675,28 @@ impl Core {
             return;
         }
         if self.lease.takeover_permit == Some((seen.epoch, seen.holder)) {
+            return;
+        }
+        // Plan 43 C7b: silence of the holder in the lease this node last
+        // read is worth a permit only if that read is fresh: a lease read
+        // that is a silence window old may be one the holder has renewed
+        // since (a later epoch even), and a permit for it would claim
+        // nothing and count a takeover of a live holder. Read again first,
+        // at most once per half window.
+        let fresh = self
+            .lease
+            .obs
+            .as_ref()
+            .is_some_and(|o| now.wait.since(o.read_at) <= window);
+        if !fresh {
+            if self
+                .bk
+                .s3_reread_at
+                .is_none_or(|t| now.wait.since(t) >= window / 2)
+            {
+                self.bk.s3_reread_at = Some(now.wait);
+                self.issue_s3(S3Op::LeaseGet, S3For::PromiseWatch, out);
+            }
             return;
         }
         self.stats.s3_fast_takeovers += 1;

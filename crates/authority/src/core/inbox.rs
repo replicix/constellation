@@ -727,7 +727,7 @@ impl Core {
                         "inbox: a takeover stranded a submitted op; re-submitting by rid"
                     );
                     let new_epoch = l.epoch;
-                    if l.is_claimable(now.wall.0) {
+                    if self.lease.claimable_observed(now, &self.cfg) {
                         self.stats.inbox_unavailable += 1;
                         self.lease_path(now, rid, replica, out);
                     } else {
@@ -739,7 +739,7 @@ impl Core {
                         && l.holder != self.cfg.node_id
                         && l.holder != 0
                         && l.epoch == epoch
-                        && !l.is_claimable(now.wall.0)
+                        && !self.lease.claimable_observed(now, &self.cfg)
                         && self.links.get(&l.holder).is_some_and(|k| k.connected)
                         && self.reaches(now, l.holder) =>
                 {
@@ -768,7 +768,7 @@ impl Core {
                     }
                     self.send_forward(now, rid, l.holder, replica, out);
                 }
-                Some(l) if l.is_claimable(now.wall.0) => {
+                Some(_) if self.lease.claimable_observed(now, &self.cfg) => {
                     // The holder is gone; whoever takes over drains the
                     // batch. The lease path resolves the rid.
                     self.inbox.pending.remove(&rid);

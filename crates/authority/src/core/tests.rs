@@ -79,6 +79,32 @@ impl Harness {
     }
 
     fn step(&mut self, event: Event) -> Vec<Action> {
+        // Plan 43 C7b: a test that hands the core a foreign lease whose
+        // expiry has passed means a lease its claimant has watched run out
+        // (a claim is judged by the claimant's own observation, not by the
+        // body's wall expiry): begin that observation long ago. The tests of
+        // the rule itself (`core::lease`) build their observations by hand.
+        if let Event::S3 {
+            result: S3Result::LeaseGet(Ok(Some((lease, _)))),
+            ..
+        } = &event
+        {
+            if lease.holder != 0
+                && lease.holder != self.core.node_id()
+                && !lease.released
+                && lease.ttl_ms == 0
+                && lease.expires_unix_ms <= self.now.0
+                && self
+                    .core
+                    .lease
+                    .obs
+                    .as_ref()
+                    .is_none_or(|o| o.key != lease.renewal_key())
+            {
+                let lease = lease.clone();
+                self.watch(&lease);
+            }
+        }
         let mut out = self.core.handle(self.clk(), event, &self.meta);
         if self.manual_horizon {
             return out;
@@ -112,6 +138,22 @@ impl Harness {
 
     fn advance(&mut self, ms: u64) {
         self.now = self.now.plus(ms);
+    }
+
+    /// Plan 43 C7b: this node read `lease`, watched it run out (see
+    /// [`Self::watch`]) and cached it as the last lease seen.
+    fn seen_expired(&mut self, lease: &Lease) {
+        self.watch(lease);
+        self.core.lease.note_object(lease);
+    }
+
+    /// Plan 43 C7b: this node has watched `lease`'s renewal key for a long
+    /// time (an observation that began 100 lease TTLs ago on its wait
+    /// clock): a TTL claim of it is due.
+    fn watch(&mut self, lease: &Lease) {
+        let mut then = self.clk();
+        then.wait = WaitMs(then.wait.0 - 100 * self.core.cfg.ttl_ms as i64);
+        self.core.lease.observe(then, Some(&(lease.clone(), tag())));
     }
 
     /// The core's reading: the three clocks agree until a test steps the
@@ -188,6 +230,7 @@ impl Harness {
             expires_unix_ms: self.now.plus(10_000).0,
             holder_expires_ms: self.now.plus(10_000).0,
             holder_wait_ms: self.now.plus(10_000).0 + self.wait_off,
+            ttl_ms: 0,
             holder_clock: 1,
             released: false,
             wanted_by: Vec::new(),
@@ -1912,6 +1955,7 @@ fn lose_renewal_with_an_unshipped_create(h: &mut Harness) -> Vec<Action> {
         expires_unix_ms: h.now.plus(10_000).0,
         holder_expires_ms: h.now.plus(10_000).0,
         holder_wait_ms: h.now.plus(10_000).0,
+        ttl_ms: 0,
         holder_clock: 1,
         released: false,
         wanted_by: Vec::new(),
@@ -8383,6 +8427,7 @@ mod epoch_rules {
         let mut lease = root_lease(1, 1, sub.now.plus(60_000));
         lease.ack_policy = constellation_store_s3::AckPolicy::S3;
         sub.core.lease.note_object(&lease);
+        sub.watch(&lease);
         let poke = |h: &mut Harness| {
             h.step(Event::Activity {
                 last_write: WaitMs(0),
@@ -8413,10 +8458,21 @@ mod epoch_rules {
             sub.core.stats.s3_fast_takeovers, 0,
             "took a beating holder over"
         );
-        // The beats stop too: a window later, taken over.
+        // The beats stop too: a window later the holder is silent, and (plan
+        // 43 C7b) the lease this node last read is a window old: it reads
+        // it again before it asks for the permit, and takes over once the
+        // fresh read still shows a holder that has not renewed.
         sub.advance(1_600);
-        poke(&mut sub);
+        let out = poke(&mut sub);
         assert!(sub.core.stream_view().live, "the stream dropped first");
+        assert_eq!(sub.core.stats.s3_fast_takeovers, 0, "a stale view acted on");
+        let (read, req) = only_s3(&out);
+        assert!(matches!(req, S3Op::LeaseGet), "{req:?}");
+        sub.step(Event::S3 {
+            op: read,
+            result: S3Result::LeaseGet(Ok(Some((lease.clone(), tag())))),
+        });
+        poke(&mut sub);
         assert_eq!(sub.core.stats.s3_fast_takeovers, 1, "a silent holder kept");
     }
 
@@ -9642,6 +9698,7 @@ mod m10 {
             expires_unix_ms: expires,
             holder_expires_ms: expires,
             holder_wait_ms: expires,
+            ttl_ms: 0,
             holder_clock: 1,
             released: false,
             wanted_by: Vec::new(),
@@ -9877,7 +9934,7 @@ mod m10 {
         ));
         assert_eq!(h.meta.promise_issued().unwrap(), 0);
         // An observed expiry does not make it promise either.
-        h.core.lease.note_object(&lease_of(2, 3, h.now.0 - 1));
+        h.seen_expired(&lease_of(2, 3, h.now.0 - 1));
         let out = h.step(Event::Peers { links: Vec::new() });
         assert!(s3_ops(&out).is_empty(), "{out:?}");
     }
@@ -9887,7 +9944,7 @@ mod m10 {
         // P2P down (the harness's peers are all unconnected): nobody can
         // ask, so the node promises on what it observes.
         let mut h = flex(1);
-        h.core.lease.note_object(&lease_of(2, 3, h.now.0 - 1));
+        h.seen_expired(&lease_of(2, 3, h.now.0 - 1));
         let out = h.step(Event::Peers { links: Vec::new() });
         let puts = s3_ops(&out)
             .iter()
@@ -9912,7 +9969,7 @@ mod m10 {
                 since: None,
             }],
         });
-        h.core.lease.note_object(&lease_of(2, 3, h.now.0 - 1));
+        h.seen_expired(&lease_of(2, 3, h.now.0 - 1));
         let out = h.step(Event::Peers {
             links: vec![crate::event::PeerLink {
                 node: 2,
@@ -9925,7 +9982,7 @@ mod m10 {
         assert!(s3_ops(&out).is_empty(), "{out:?}");
         // f = 0: never on its own.
         let mut h = flex(0);
-        h.core.lease.note_object(&lease_of(2, 3, h.now.0 - 1));
+        h.seen_expired(&lease_of(2, 3, h.now.0 - 1));
         let out = h.step(Event::Peers { links: Vec::new() });
         assert!(s3_ops(&out).is_empty(), "{out:?}");
     }
@@ -10363,6 +10420,7 @@ fn lease_of(holder: NodeId, epoch: Epoch, expires_unix_ms: i64) -> Lease {
         expires_unix_ms,
         holder_expires_ms: expires_unix_ms,
         holder_wait_ms: expires_unix_ms,
+        ttl_ms: 0,
         holder_clock: 1,
         released: false,
         wanted_by: Vec::new(),
@@ -10454,6 +10512,84 @@ fn a_takeover_deposed_while_retrying_its_marker_finishes_the_acquisition() {
         h.core.job(),
         None,
         "the acquisition must finish once the deposition voided its gate"
+    );
+}
+
+/// Plan 43 C7b (row 28): a strict reader that learns the holder from the
+/// lease judges it live or run out by its own observation of the renewal key,
+/// never by the holder's wall expiry against its own clock. A body whose
+/// expiry is an hour past on the reader's wall, first read now, is a live
+/// holder: the reader asks it (a ReadIndex) instead of tailing S3 past
+/// writes the holder acknowledged and has not shipped. (Fails on the parent:
+/// it tails.)
+#[test]
+fn a_reader_treats_an_unobserved_holder_as_live() {
+    use crate::event::Control;
+    let mut r = Harness::new(2);
+    let out = r.step(Event::Control {
+        op: OpId(60),
+        req: Control::ReadIndex {
+            ino: 42,
+            dir: false,
+            name: None,
+        },
+    });
+    let (get, req) = only_s3(&out);
+    assert!(matches!(req, S3Op::LeaseGet), "{req:?}");
+    let body = Lease {
+        ttl_ms: 10_000,
+        ..lease_of(1, 1, r.now.0 - 3_600_000)
+    };
+    let out = r.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((body, tag())))),
+    });
+    assert!(
+        matches!(
+            out.iter()
+                .filter_map(|a| match a {
+                    Action::Send { to, msg } => Some((*to, msg)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .as_slice(),
+            [(1, PeerMsg::ReadIndex { .. })]
+        ),
+        "expected one ReadIndex to node 1 (and no tail): {out:?}"
+    );
+    assert!(s3_ops(&out).is_empty(), "nothing is read from S3: {out:?}");
+}
+
+/// Plan 43 C7b (row 25): a claim made on a permit before this node's own
+/// observation of the lease ran out skips the promise check (the claim rule
+/// keeps the permit paths apart from epochs); every other takeover checks,
+/// and so does a permitted one made after the observation ran out.
+#[test]
+fn a_permitted_claim_before_the_observation_ran_out_skips_the_promise_check() {
+    let mut h = Harness::new(1);
+    h.core.cfg.takeover_promise_check = true;
+    let prev = Lease {
+        ttl_ms: 10_000,
+        ack_policy: constellation_store_s3::AckPolicy::Backup,
+        backups: vec![1],
+        ..lease_of(2, 1, 0)
+    };
+    h.core.lease.observe(h.clk(), Some(&(prev.clone(), tag())));
+    h.core.lease.takeover_permit = Some((1, 2));
+    assert!(
+        !h.core.promise_check_needed(h.clk(), &prev),
+        "permitted, live"
+    );
+    h.core.lease.takeover_permit = None;
+    assert!(
+        h.core.promise_check_needed(h.clk(), &prev),
+        "no permit: checked"
+    );
+    h.core.lease.takeover_permit = Some((1, 2));
+    h.advance(10_000);
+    assert!(
+        h.core.promise_check_needed(h.clk(), &prev),
+        "permitted after the observation ran out: checked"
     );
 }
 
@@ -11457,8 +11593,14 @@ mod backup_crash {
         let now = Ms(1_000_000);
         let lease = backup_lease(1, 1, now.0 - 1, vec![2]);
         let classify = |node: NodeId, at: Ms| {
-            let h = Harness::new(node);
+            let mut h = Harness::new(node);
             let cfg = h.core.cfg.clone();
+            // Plan 43 C7b: watched since one TTL before the expiry, so that
+            // the TTL ends where the body's expiry did.
+            h.core.lease.observe(
+                Now::same(lease.expires_unix_ms - cfg.ttl_ms as i64),
+                Some(&(lease.clone(), tag())),
+            );
             h.core
                 .lease
                 .classify(Now::same(at.0), &cfg, Some((lease.clone(), tag())), 0)
@@ -11478,8 +11620,12 @@ mod backup_crash {
         ));
         // A `Local` lease (no backups) is anyone's at the expiry.
         let local = lease_of(1, 1, now.0 - 1);
-        let h = Harness::new(3);
+        let mut h = Harness::new(3);
         let cfg = h.core.cfg.clone();
+        h.core.lease.observe(
+            Now::same(local.expires_unix_ms - cfg.ttl_ms as i64),
+            Some(&(local.clone(), tag())),
+        );
         assert!(matches!(
             h.core
                 .lease
@@ -15738,7 +15884,8 @@ mod locks {
         };
         constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
         let now = h.now;
-        h.core.lock_on_released_takeover(Now::same(now.0), &h.meta);
+        h.core
+            .lock_on_released_takeover(Now::same(now.0), WaitMs(now.0), &h.meta);
         let until = h.meta.locks().quarantine_until().0;
         assert!(until > now.0);
         let mut out = Vec::new();
@@ -19213,7 +19360,8 @@ mod locks {
         let (mut h, ino) = holder_with_file();
         let mut out = Vec::new();
         let now = h.now;
-        h.core.lock_on_released_takeover(Now::same(now.0), &h.meta);
+        h.core
+            .lock_on_released_takeover(Now::same(now.0), WaitMs(now.0), &h.meta);
         assert!(h.meta.locks().quarantine_until().0 > now.0);
         let out1 = request(&mut h, 3, 8, ino, X, false);
         let [(3, OpId(8), LockOutcome::Waiting { grace: true, .. })] =
@@ -19453,6 +19601,60 @@ mod locks {
             h.clk().wait
         );
         assert_eq!(grace, 1);
+    }
+
+    /// Plan 43 C7b (row 23): the grace a taker of a marked released lease
+    /// arms ends `lock_ttl + 2 margins` after its first sight of the
+    /// *release* on its own wait clock, never by a compare of the releaser's
+    /// wall expiry with its own: a taker that never saw the release (a cold
+    /// one) waits the whole grace; one that saw it that long ago waits none.
+    /// (Fails on the parent: the grace was armed from the claim, and only if
+    /// the taker's wall read the lease unexpired, so a taker ahead of the
+    /// releaser got none at all.)
+    #[test]
+    fn a_cold_released_taker_arms_the_full_grace_and_a_warm_one_none() {
+        let released = |h: &Harness| {
+            let mut prev = lease_of(1, 1, h.now.0 + 5_000);
+            prev.released = true;
+            prev.granted_delegations = true;
+            prev
+        };
+        let grace = |h: &Harness| h.core.lock_ttl_ms() + 2 * h.core.lock_margin_ms();
+        // Cold: a taker 1 h ahead of the releaser's wall (its compare of
+        // the wall expiry would have read the lease as long expired).
+        let mut h = Harness::new(2);
+        let prev = released(&h);
+        h.step_wall(3_600_000);
+        let wait_now = h.clk().wait;
+        claim_over(&mut h, &prev, false);
+        assert_eq!(
+            h.meta.locks().quarantine_until(),
+            wait_now.plus(grace(&h) as u64),
+            "a cold taker waits the whole grace, whatever its wall says"
+        );
+        // Warm: it saw the release just over a grace ago.
+        let mut h = Harness::new(2);
+        let prev = released(&h);
+        let mut then = h.clk();
+        then.wait = WaitMs(then.wait.0 - grace(&h) - 1);
+        h.core.lease.observe(then, Some(&(prev.clone(), tag())));
+        claim_over(&mut h, &prev, false);
+        assert!(
+            h.meta.locks().quarantine_until() <= h.clk().wait,
+            "a taker that saw the release longer ago than the grace waits nothing: {:?}",
+            h.meta.locks().quarantine_until()
+        );
+        // And one that saw it half a grace ago waits the other half.
+        let mut h = Harness::new(2);
+        let prev = released(&h);
+        let mut then = h.clk();
+        then.wait = WaitMs(then.wait.0 - grace(&h) / 2);
+        h.core.lease.observe(then, Some(&(prev.clone(), tag())));
+        claim_over(&mut h, &prev, false);
+        assert_eq!(
+            h.meta.locks().quarantine_until(),
+            then.wait.plus(grace(&h) as u64)
+        );
     }
 
     /// The same at the lock request: a file under the tenure that took an
@@ -19785,6 +19987,14 @@ mod locks {
         if permitted {
             h.core.lease.takeover_permit = Some((prev.epoch, prev.holder));
             h.core.bk.sealed = prev.epoch;
+        }
+        // Plan 43 C7b: a node claims a lease by TTL once it has watched its
+        // renewal key for the holder's TTL: this helper's claimant has (a
+        // long time ago). A released lease is claimable at once, and its
+        // taker's grace counts from its first sight of the release: left
+        // cold, so that the whole grace is armed.
+        if !prev.released {
+            h.watch(prev);
         }
         let mut out = Vec::new();
         h.core.enqueue_job(
@@ -27370,6 +27580,7 @@ fn an_inbox_op_is_forwarded_once_the_holder_is_reachable() {
         expires_unix_ms: h.now.0 + 30_000,
         holder_expires_ms: h.now.0 + 30_000,
         holder_wait_ms: h.now.0 + 30_000,
+        ttl_ms: 0,
         holder_clock: 1,
         released: false,
         wanted_by: Vec::new(),
@@ -28785,6 +28996,7 @@ fn a_barrier_around_a_deposition_waits_for_the_replay_not_the_strand() {
         expires_unix_ms: h.now.plus(10_000).0,
         holder_expires_ms: h.now.plus(10_000).0,
         holder_wait_ms: h.now.plus(10_000).0,
+        ttl_ms: 0,
         holder_clock: 1,
         released: false,
         wanted_by: Vec::new(),
@@ -30975,6 +31187,7 @@ fn root_lease(holder: NodeId, epoch: Epoch, expires: Ms) -> Lease {
         expires_unix_ms: expires.0,
         holder_expires_ms: expires.0,
         holder_wait_ms: expires.0,
+        ttl_ms: 0,
         holder_clock: 1,
         released: false,
         wanted_by: Vec::new(),
@@ -31014,7 +31227,10 @@ fn an_op_waiting_for_a_dead_roots_append_takes_the_root_over_once_its_lease_ran_
     h.core.dead_root_check(h.clk(), &mut again);
     assert!(s3_ops(&again).is_empty(), "{again:?}");
     // A live root: nothing is asked of it.
-    let live = root_lease(1, 1, h.now.plus(5_000));
+    // (A body that says its holder's TTL: seen live until a TTL has been
+    // watched, plan 43 C7b.)
+    let mut live = root_lease(1, 1, h.now.plus(5_000));
+    live.ttl_ms = 5_000;
     let out = h.step(Event::S3 {
         op,
         result: S3Result::LeaseGet(Ok(Some((live, tag())))),
@@ -31142,6 +31358,12 @@ fn a_dead_root_takeover_leaves_a_backup_lease_in_its_claim_grace_alone() {
     let mut lease = root_lease(1, 1, Ms(h.now.0 - 1));
     lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
     lease.backups = vec![3];
+    // Plan 43 C7b: watched since one TTL before the expiry, so that the TTL
+    // ended just now and only the backups' grace is left.
+    h.core.lease.obs = None;
+    let mut then = h.clk();
+    then.wait = WaitMs(then.wait.0 - h.core.cfg.ttl_ms as i64 - 1);
+    h.core.lease.observe(then, Some(&(lease.clone(), tag())));
     let out = answer_job_read(&mut h, &out, lease);
     asks_nothing_of_the_holder(&h, &out);
 }
@@ -34405,6 +34627,67 @@ mod c1_counted {
         assert_eq!(h.core.bk.acked, 1, "a stale read discarded the tail");
         assert_eq!(h.meta.backup_tail(1).unwrap().len(), 1);
         assert_eq!(h.core.bk.sealed, 0);
+    }
+
+    /// Plan 43 C7b with C1-1: every lease read is observed before any
+    /// handler, the stale one too. A backup that has read the listing's
+    /// version already (an observation of the holder's key at version 2)
+    /// then handles the late read at version 1: the role and the tail stay
+    /// (`on_takeover_get`'s stale arm), and the observation keeps its start
+    /// and the newer body (`LeaseState::observe`): neither the claim rule
+    /// nor the backup role is set back by the read.
+    #[test]
+    fn a_stale_lease_read_sets_back_neither_the_role_nor_the_observation() {
+        let append = |req, config_version, txs| Event::Peer {
+            from: 1,
+            msg: PeerMsg::BackupAppend {
+                req: OpId(req),
+                epoch: 1,
+                holder: 1,
+                config_version,
+                from: 1,
+                txs,
+                through: 0,
+                candidacy: 1,
+                expires_unix_ms: 0,
+            },
+        };
+        let mut h = Harness::new(2);
+        let out = h.step(append(7, 1, Vec::new()));
+        let watch = timers(&out, TimerKind::BackupWatch)[0];
+        h.advance(2_000);
+        let read = h.step(Event::Timer { id: watch });
+        h.advance(100);
+        let row = constellation_meta::BackupTx {
+            first: 1,
+            last: 1,
+            records: vec![constellation_meta::LogRecord::Completed { rid: h.rid(1) }],
+            origin: (0, 0),
+        };
+        h.step(append(8, 2, vec![row]));
+        // This node has seen the holder's lease at the listing's version.
+        let mut before = root_lease(1, 1, h.now.plus(50_000));
+        before.config_version = 1;
+        let mut listed = before.clone();
+        listed.config_version = 2;
+        listed.backups = vec![2];
+        listed.ack_policy = constellation_store_s3::AckPolicy::Backup;
+        let seen_at = h.clk();
+        h.core
+            .lease
+            .observe(seen_at, Some(&(listed.clone(), tag())));
+        // The late read answers with the version before the listing.
+        h.advance(100);
+        answer_job_read(&mut h, &read, before);
+        assert!(
+            h.core.bk.role.is_some_and(|r| r.config_version == 2),
+            "a stale read discarded the role"
+        );
+        assert_eq!(h.core.bk.acked, 1, "a stale read discarded the tail");
+        let o = h.core.lease.obs.as_ref().expect("observed");
+        assert_eq!(o.since, seen_at.wait, "the observation restarted");
+        assert_eq!(o.body.config_version, 2, "the observation went back");
+        assert_eq!(o.body.backups, vec![2]);
     }
 
     /// The same with the appends reordered: the holder's last append at
