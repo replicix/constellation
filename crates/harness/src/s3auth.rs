@@ -178,6 +178,19 @@ fn sign_with(
     ]
 }
 
+/// The one HTTP agent of these requests. `ureq::request` builds a new
+/// agent, with its own connection pool, for every call: each request then
+/// opens a connection and closes it when the response is read, and the
+/// closing side keeps the socket in `TIME_WAIT` for a minute. A verifier
+/// that fetches every log segment of a long scenario (thousands, plan 42's
+/// load campaign: `dir-nlink` cells) filled the ephemeral port range that
+/// way (41 k sockets in `TIME_WAIT`) and failed with "connection reset by
+/// peer". One shared agent keeps idle connections and reuses them.
+fn agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| ureq::AgentBuilder::new().build())
+}
+
 /// A request for `method url`, always signed.
 pub fn signed(method: &str, url: &str) -> ureq::Request {
     let now = std::time::SystemTime::now()
@@ -186,7 +199,7 @@ pub fn signed(method: &str, url: &str) -> ureq::Request {
         .unwrap_or(0);
     sign_at(method, url, now)
         .into_iter()
-        .fold(ureq::request(method, url), |r, (k, v)| r.set(k, &v))
+        .fold(agent().request(method, url), |r, (k, v)| r.set(k, &v))
 }
 
 /// A request for `method url`, signed if the selected S3 backend needs it.
@@ -194,7 +207,7 @@ pub fn request(method: &str, url: &str) -> ureq::Request {
     if crate::s3env::backend().needs_auth() {
         signed(method, url)
     } else {
-        ureq::request(method, url)
+        agent().request(method, url)
     }
 }
 
@@ -217,6 +230,60 @@ pub fn delete(url: &str) -> ureq::Request {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An HTTP/1.1 server on loopback that answers every request `200 ok`
+    /// and keeps connections open; returns its URL and the number of
+    /// connections it accepted so far.
+    fn keepalive_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/bucket/key", listener.local_addr().unwrap());
+        let accepted = std::sync::Arc::new(AtomicUsize::new(0));
+        let count = accepted.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(conn) = conn else { return };
+                count.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let mut out = conn.try_clone().unwrap();
+                    let mut lines = BufReader::new(conn);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match lines.read_line(&mut line) {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) if line == "\r\n" => {
+                                let reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                                if out.write_all(reply.as_bytes()).is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(_) => {}
+                        }
+                    }
+                });
+            }
+        });
+        (url, accepted)
+    }
+
+    /// Requests reuse connections: a verifier that fetched thousands of
+    /// objects with one connection each ran the host out of ephemeral ports
+    /// (`TIME_WAIT`), see [`agent`].
+    #[test]
+    fn requests_reuse_one_connection() {
+        let (url, accepted) = keepalive_server();
+        for i in 0..50 {
+            let r = if i % 2 == 0 {
+                get(&url)
+            } else {
+                signed("GET", &url)
+            };
+            assert_eq!(r.call().unwrap().into_string().unwrap(), "ok");
+        }
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn times() {
