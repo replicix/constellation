@@ -2363,7 +2363,10 @@ mod tests {
 
 /// Plan 29 M3c: `recursive_size` (and readdirplus) read a file's attrs
 /// from the §P6 dentry copy, so every mutation, local or replayed, must
-/// keep each `0x02` copy equal to its `0x01` inode's attrs.
+/// keep each `0x02` copy equal to its `0x01` inode's attrs. Plan 45: the
+/// copy exists only while the inode is a directory or has one name; a name
+/// of a hard-linked inode is the remote form. (`tests/hardlink.rs` drives
+/// the transitions one by one; this is the long mixed scenario of plan 29.)
 #[cfg(test)]
 mod dentry_copy_tests {
     use super::*;
@@ -2371,7 +2374,7 @@ mod dentry_copy_tests {
     use constellation_fs_core::types::ROOT_INO;
     use constellation_mtree::record::{DentryRecord, InodeRecord};
 
-    fn assert_copies_match(meta: &Meta, label: &str) {
+    fn assert_forms_match(meta: &Meta, label: &str) {
         let r = meta.db.read_tx();
         let range = keys::whole_range(keys::RANGE_DENTRY);
         let mut n = 0;
@@ -2381,19 +2384,30 @@ mod dentry_copy_tests {
             let rec: InodeRecord = ns::get_inode_record(&r, &meta.ns, d.ino)
                 .unwrap()
                 .unwrap_or_else(|| panic!("{label}: dangling dentry {k:?}"));
-            assert_eq!(
-                d.attrs,
-                Some(rec.attrs),
-                "{label}: stale dentry copy for ino {}",
-                d.ino
-            );
+            let names = ns::links_of(&r, &meta.ns, d.ino).unwrap().len();
+            let copy = rec.attrs.kind == constellation_mtree::record::Kind::Dir || names == 1;
+            if copy {
+                assert_eq!(
+                    d.attrs,
+                    Some(rec.attrs),
+                    "{label}: stale or missing dentry copy for ino {}",
+                    d.ino
+                );
+            } else {
+                assert_eq!(
+                    d.attrs, None,
+                    "{label}: a copy under one of {names} names of ino {}",
+                    d.ino
+                );
+                assert_eq!(d.kind, rec.attrs.kind, "{label}: remote kind");
+            }
             n += 1;
         }
         assert!(n > 0, "{label}: no dentries checked");
     }
 
     #[test]
-    fn every_mutation_keeps_dentry_attr_copies_in_sync_locally_and_on_replay() {
+    fn every_mutation_keeps_each_dentry_in_the_right_form_locally_and_on_replay() {
         let a = Meta::open_in_memory().unwrap();
         let d = a.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap().ino;
         let e = a.mkdir(ROOT_INO, "e", 0o755, 0, 0).unwrap().ino;
@@ -2414,7 +2428,7 @@ mod dentry_copy_tests {
         a.setattr(g, None, None, None, Some(3), Some(1), Some(2))
             .unwrap();
         a.rename(ROOT_INO, "d", e, "d2").unwrap(); // move a directory
-        assert_copies_match(&a, "local");
+        assert_forms_match(&a, "local");
 
         let b = Meta::open_in_memory().unwrap();
         let records: Vec<_> = a
@@ -2424,7 +2438,7 @@ mod dentry_copy_tests {
             .map(|(_, r)| r)
             .collect();
         b.apply_records(&records).unwrap();
-        assert_copies_match(&b, "replay");
+        assert_forms_match(&b, "replay");
     }
 }
 

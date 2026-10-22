@@ -352,29 +352,64 @@ pub(crate) fn clear_spilled_xattrs(
     Ok(())
 }
 
-/// Write `ino`'s encoded `0x01` record and bring every `0x02` dentry
-/// copy of its attrs (§P6) in line, in the same transaction. Every
-/// `0x01` write goes through here: readdirplus, `recursive_size` and the
-/// published tree all read attrs from the dentry copy.
+/// Write `ino`'s encoded `0x01` record and bring the `0x02` dentries that
+/// name it in line, in the same transaction. Every `0x01` write goes
+/// through here.
+///
+/// A dentry's form is a function of the inode's record
+/// ([`DentryRecord::for_inode`], plan 45): the attribute copy while the
+/// inode is a directory or has one name, the remote form (`ino` + `kind`)
+/// while a non-directory has several. So a write to an inode with several
+/// names that keeps it that way (`chmod`, a manifest commit, a `link` or
+/// `unlink` between two names and more) rewrites **only the `0x01`
+/// record**: there is no copy to keep, and nothing is scanned. The names
+/// are visited only when the form may change:
+///
+/// - the inode has one name after this write (a copy is due: its one name
+///   is rewritten when stale, and the survivor of a 2 → 1 `unlink` gets
+///   its copy here);
+/// - it had one name before and has several now (the 1 → 2 `link`: the
+///   existing name becomes remote; the new name is written by the caller
+///   through [`put_dentry`], which applies the same rule);
+/// - `before` is `None`: the caller knows nothing of the inode's earlier
+///   state (a create or a clone, which have no names yet, or a record
+///   replacing one) and every name is brought in line.
+///
+/// `before` is the inode's attributes as the caller read them from the
+/// record this write replaces. A caller that hands over attributes of a
+/// different form than the stored record's would leave a stale copy under
+/// a name; a debug build checks it.
 pub(crate) fn put_inode_record(
     tx: &mut SingleWriterWriteTx,
     ns: &SingleWriterTxKeyspace,
     dirty: Dirty,
     ino: Ino,
     record: &record::InodeRecord,
+    before: Option<Attrs>,
 ) -> Result<(), MetaError> {
+    #[cfg(debug_assertions)]
+    if let (Some(before), Some(stored)) = (before, get_inode_record(tx, ns, ino)?) {
+        assert_eq!(
+            DentryRecord::carries_copy(&before),
+            DentryRecord::carries_copy(&stored.attrs),
+            "put_inode_record({ino}): `before` has another dentry form than the stored record"
+        );
+    }
     ns_insert(tx, ns, dirty, keys::inode(ino), record.encode())?;
+    let single = DentryRecord::carries_copy(&record.attrs);
+    let was_multi = before.is_some_and(|before| !DentryRecord::carries_copy(&before));
+    if !single && was_multi {
+        return Ok(());
+    }
+    let want = DentryRecord::for_inode(ino, &record.attrs).encode();
     for (parent, name) in links_of(tx, ns, ino)? {
-        let stale = get_dentry_record(tx, ns, parent, &name)?
-            .is_none_or(|d| d.ino != ino || d.attrs != Some(record.attrs));
+        let key = keys::dentry(parent, name.as_bytes());
+        let stale = match tx.get(ns, &key)? {
+            Some(held) => *held != *want,
+            None => true,
+        };
         if stale {
-            ns_insert(
-                tx,
-                ns,
-                dirty,
-                keys::dentry(parent, name.as_bytes()),
-                DentryRecord::new(ino, record.attrs).encode(),
-            )?;
+            ns_insert(tx, ns, dirty, key, want.clone())?;
         }
     }
     Ok(())
@@ -383,7 +418,8 @@ pub(crate) fn put_inode_record(
 /// Write `ino`'s `0x01` record (and any `0x03`/`blobs` bodies its
 /// xattr set or manifest/symlink spill to), applying §P6's plan_inode
 /// spill order. Returns the placement so the caller can maintain
-/// `xattr_by_name`.
+/// `xattr_by_name`. `before` is as for [`put_inode_record`]: `None` for a
+/// new inode.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn put_inode(
     tx: &mut SingleWriterWriteTx,
@@ -395,12 +431,13 @@ pub(crate) fn put_inode(
     manifest: Option<Vec<u8>>,
     symlink_target: Option<Vec<u8>>,
     xattrs: &[(Vec<u8>, Vec<u8>)],
+    before: Option<Attrs>,
 ) -> Result<XattrPlacement, MetaError> {
     let planned = record::plan_inode(attrs, manifest, symlink_target, xattrs, Meta::hash_blob);
     for blob in planned.blobs {
         Meta::put_blob(tx, blobs, blob);
     }
-    put_inode_record(tx, ns, dirty, ino, &planned.record)?;
+    put_inode_record(tx, ns, dirty, ino, &planned.record, before)?;
     if planned.xattrs == XattrPlacement::Spilled {
         clear_spilled_xattrs(tx, ns, dirty, ino)?;
         for (name, value) in xattrs {
@@ -450,6 +487,7 @@ pub(crate) fn put_inode_keeping_xattrs(
             manifest,
             symlink_target,
             &rec.xattrs,
+            Some(rec.attrs),
         )?;
         return Ok(());
     }
@@ -458,7 +496,7 @@ pub(crate) fn put_inode_keeping_xattrs(
     for blob in planned.blobs {
         Meta::put_blob(tx, blobs, blob);
     }
-    put_inode_record(tx, ns, dirty, ino, &planned.record)
+    put_inode_record(tx, ns, dirty, ino, &planned.record, Some(rec.attrs))
 }
 
 /// One xattr of a spilled set set (`Some`) or removed (`None`), when the
@@ -534,10 +572,14 @@ pub(crate) fn put_spilled_xattr(
     // the manifest and target placements it chose stand.
     let mut record = rec.clone();
     record.attrs = attrs;
-    put_inode_record(tx, ns, dirty, ino, &record)?;
+    put_inode_record(tx, ns, dirty, ino, &record, Some(rec.attrs))?;
     Ok(true)
 }
 
+/// A new name for `ino`, whose record has the attributes `attrs`: the `0x02`
+/// value in the form the inode's record decides ([`DentryRecord::for_inode`]),
+/// and the `0x04` entry. `attrs` are the inode's **current** attributes —
+/// after the `nlink` bump when this name is a `link`.
 pub(crate) fn put_dentry(
     tx: &mut SingleWriterWriteTx,
     ns: &SingleWriterTxKeyspace,
@@ -552,7 +594,7 @@ pub(crate) fn put_dentry(
         ns,
         dirty,
         keys::dentry(parent, name.as_bytes()),
-        DentryRecord::new(ino, attrs).encode(),
+        DentryRecord::for_inode(ino, &attrs).encode(),
     )?;
     ns_insert(
         tx,

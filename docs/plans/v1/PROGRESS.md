@@ -56877,7 +56877,39 @@ measured, the four-file-system runs are pending.
 | Plan document, plan 28 §P6 note, index | landed | `docs/plans/v1/wip/45-hard-links.md`, `README.md`, `done/28-…` |
 | Baseline (H0) | meta level landed (numbers under Gates); box pending | `crates/meta/tests/hardlink_perf.rs`; box: `bench/hardlink/` |
 | Two dentry forms, every reader, fsck check (H1) | landed | `crates/mtree/src/record.rs`, `crates/meta/src/store/{ns,writes,reads,scratch}.rs`, `crates/engine/src/{mtree_read,snapwalk,snapshot,fsck}.rs` |
-| The rule and transitions (H2) | planned | `crates/meta/src/store/{ns,writes,misc,reads,scratch}.rs`, `crates/meta/src/replay.rs` |
+| The rule and transitions (H2) | landed | `crates/meta/src/store/{ns,writes,misc,reads,scratch}.rs`, `crates/meta/src/replay.rs` |
 | Engine tests (H3) | planned | `crates/engine/src/{mtree_read,mtree_publish,snapwalk}.rs` |
 | Harness scenario, xcheckfs lane (H4) | pending, box | `crates/harness/src/scenarios.rs` |
 | Docs (H5) | pending | `docs/reference` |
+
+### Meta level, before and after (H0, H2)
+
+`crates/meta/tests/hardlink_perf.rs` (release, no FUSE, an on-disk fjall store
+on the workstation's scratch file system, one file in one directory,
+the median of six runs per build in the order ABBA BAAB ABBA; microseconds
+unless noted; `n` is the number of names of the one file). The "before" build
+is the commit before H1, the "after" build H1 with H2. The steady state is a
+name linked and unlinked again at `n` = 2,000 names.
+
+| | before | after | ratio |
+|---|---:|---:|---:|
+| `link` p50 at n = 1 (the 1 -> 2 transition) / at 2,000, steady | 19.7 / 11,444 | 19.7 / 16.9 | 0.86 of n = 1 (was 581x) |
+| `unlink` p50 at n = 1 (2 -> 1) / at 2,000, steady | 19.2 / 11,602 | 19.3 / 16.2 | 0.84 of n = 1 (was 604x) |
+| `chmod` p50 at n = 1 / at 2,000 | 11.6 / 12,058 | 11.4 / 8.5 | 0.75 of n = 1 (was 1,040x) |
+| manifest commit (a write's close) p50 at n = 1 / at 2,000 | 13.5 / 12,269 | 13.5 / 10.9 | 0.81 of n = 1 (was 909x) |
+| 2,000 links / 2,000 unlinks, total | 10.9 s / 12.4 s | 32 ms / 34 ms | 0.003 |
+| warm listing of the 2,200-entry directory: readdir + a lookup per entry | 53.9 ms | 0.39 ms | 0.007 |
+| `recursive_size` of it | 53.6 ms | 0.37 ms | 0.007 |
+| nlink 1, 2,000 files: create / setattr / set_manifest / unlink | 20.7 / 12.1 / 14.2 / 20.3 | 21.1 / 12.2 / 14.4 / 20.8 | 1.018 / 1.007 / 1.018 / 1.027 |
+
+The gates of plan 45 §7 hold: link and unlink at 2,000 names are 0.86x and
+0.84x the n = 1 cost (gate 1.5x), chmod and the manifest commit 0.75x and
+0.81x, the nlink-1 operations within 3 % (gate 5 %), and a listing of
+single-name entries reads zero `0x01` records (the engine tests, H3).
+One observation, not gated: the first 100 `unlink`s right after a 2,000-link
+burst (a window at 2,000 names) cost 57-100 µs after the change (the median of
+6 runs 65 µs, 3.4x n = 1), against 16 µs for the window at 1,000 names and
+for the steady state; the first window after a burst is also twice the steady
+state before the change, and does not grow with n (33-47 µs at 1,000
+names, 60-67 µs at 4,000), so it is a property of the burst's tail, not of
+the number of names.

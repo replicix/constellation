@@ -22,12 +22,13 @@ pub(crate) fn touch_times_tx(
     t: i64,
 ) -> Result<(), MetaError> {
     if let Some(mut rec) = ns::get_inode_record(tx, ns_ks, ino)? {
+        let before = rec.attrs;
         // Plan 30 §M12: a `max` merge — the parent's times commute
         // under any replay order of its children's records (HLC stamps,
         // `crate::hlc`), and never go backwards.
         rec.attrs.mtime_ns = rec.attrs.mtime_ns.max(t);
         rec.attrs.ctime_ns = rec.attrs.ctime_ns.max(t);
-        ns::put_inode_record(tx, ns_ks, dirty, ino, &rec)?;
+        ns::put_inode_record(tx, ns_ks, dirty, ino, &rec, Some(before))?;
     }
     Ok(())
 }
@@ -77,12 +78,15 @@ fn bump_nlink_touching(
     };
     // Plan 30 §M12: an additive delta and a `max` time merge, both
     // commutative across the replay order.
+    let before = rec.attrs;
     rec.attrs.nlink = (rec.attrs.nlink as i64 + delta).max(0) as u32;
     if mtime {
         rec.attrs.mtime_ns = rec.attrs.mtime_ns.max(t);
     }
     rec.attrs.ctime_ns = rec.attrs.ctime_ns.max(t);
-    ns::put_inode_record(tx, ns_ks, dirty, ino, &rec)?;
+    // The dentries of the inode follow `nlink` (plan 45): a change that
+    // takes it across one name rewrites them, any other leaves them be.
+    ns::put_inode_record(tx, ns_ks, dirty, ino, &rec, Some(before))?;
     Ok(Some(rec))
 }
 

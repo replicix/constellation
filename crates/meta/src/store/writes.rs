@@ -79,6 +79,7 @@ fn insert_new_node(
         manifest,
         symlink_target,
         &[],
+        None,
     )?;
     ns::put_dentry(tx, ns_ks, dirty, parent, name, ino, attrs)?;
     atime::set_atime_tx(tx, atime_ks, ino, attrs.mtime_ns);
@@ -765,6 +766,7 @@ impl Meta {
             Some(manifest.to_vec()),
             None,
             &xattr_pairs,
+            None,
         )?;
         journal::append_tx(
             &mut tx,
@@ -884,6 +886,9 @@ fn rename_in_tx(
         if src_rec.attrs.kind != Kind::Dir && existing_rec.attrs.kind == Kind::Dir {
             return Err(MetaError::IsDir);
         }
+        // The name goes first: an inode left with one name (2 → 1 below)
+        // gets its copy from the `nlink` write, for that one name only.
+        ns::remove_dentry(tx, ns_ks, dirty, new_parent, new_name, existing.ino)?;
         if existing_rec.attrs.kind == Kind::Dir {
             if ns::has_children(tx, ns_ks, existing.ino)? {
                 return Err(MetaError::NotEmpty);
@@ -941,7 +946,6 @@ fn rename_in_tx(
         } else {
             misc::bump_file_nlink_tx(tx, ns_ks, dirty, existing.ino, -1, t)?;
         }
-        ns::remove_dentry(tx, ns_ks, dirty, new_parent, new_name, existing.ino)?;
     }
 
     ns::ns_remove(tx, ns_ks, dirty, keys::dentry(parent, name.as_bytes()))?;
@@ -956,7 +960,7 @@ fn rename_in_tx(
         ns_ks,
         dirty,
         keys::dentry(new_parent, new_name.as_bytes()),
-        DentryRecord::new(ino, src_rec.attrs).encode(),
+        DentryRecord::for_inode(ino, &src_rec.attrs).encode(),
     )?;
     ns::ns_insert(
         tx,
@@ -1894,7 +1898,8 @@ impl MetaStore for Meta {
         }
         rec.attrs.ctime_ns = t;
         let attrs = rec.attrs;
-        ns::put_inode_record(&mut tx, &self.ns, dirty, ino, &rec)?;
+        // `setattr` leaves `nlink` alone, so the dentries' form stands.
+        ns::put_inode_record(&mut tx, &self.ns, dirty, ino, &rec, Some(attrs))?;
         if size.is_some() && attrs.kind == Kind::File {
             // The content past the new size is gone for good (see
             // `replay::clip_manifest`): the log's replay does the same.
@@ -2026,6 +2031,7 @@ impl MetaStore for Meta {
                 manifest,
                 target,
                 &xattr_pairs,
+                Some(rec.attrs),
             )?;
         }
         misc::xattr_by_name_put_tx(&mut tx, &self.xattr_by_name, name, ino, value);
@@ -2097,6 +2103,7 @@ impl MetaStore for Meta {
                 manifest,
                 target,
                 &xattr_pairs,
+                Some(rec.attrs),
             )?;
         }
         misc::xattr_by_name_del_tx(&mut tx, &self.xattr_by_name, name, ino);

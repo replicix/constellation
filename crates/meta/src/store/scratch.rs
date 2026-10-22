@@ -91,6 +91,7 @@ impl Meta {
             None,
             None,
             &[],
+            None,
         )?;
         ns::put_dentry(
             &mut tx,
@@ -221,13 +222,6 @@ impl Meta {
             Some(manifest.to_vec()),
             target,
         )?;
-        for (parent, name) in ns::links_of(&tx, &self.scratch, ino)? {
-            tx.insert(
-                &self.scratch,
-                keys::dentry(parent, name.as_bytes()),
-                constellation_mtree::record::DentryRecord::new(ino, attrs).encode(),
-            );
-        }
         tx.commit()?;
         Ok(())
     }
@@ -328,6 +322,7 @@ impl Meta {
             manifest,
             target,
             &xattr_pairs,
+            Some(rec.attrs),
         )?;
         tx.commit()?;
         Ok(())
@@ -373,6 +368,7 @@ impl Meta {
             manifest,
             target,
             &xattr_pairs,
+            Some(rec.attrs),
         )?;
         tx.commit()?;
         Ok(())

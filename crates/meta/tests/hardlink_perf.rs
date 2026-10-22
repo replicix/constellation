@@ -118,6 +118,21 @@ fn hard_link_scaling() {
         start.elapsed().as_secs_f64()
     );
 
+    // The steady state at n names: a name linked and unlinked again, over
+    // and over, so that neither window's cost is the first operations
+    // after a burst (a memtable and journal effect of the write volume).
+    let (mut links, mut unlinks) = (Vec::new(), Vec::new());
+    for i in 0..200 {
+        let t = Instant::now();
+        meta.link(f, d, &format!("steady{i}")).unwrap();
+        links.push(t.elapsed());
+        let t = Instant::now();
+        meta.unlink(d, &format!("steady{i}")).unwrap();
+        unlinks.push(t.elapsed());
+    }
+    result(&format!("link_steady_at_{n}"), p50(&mut links));
+    result(&format!("unlink_steady_at_{n}"), p50(&mut unlinks));
+
     let mut v = Vec::new();
     for k in 0..101u32 {
         let t = Instant::now();

@@ -109,8 +109,14 @@ fn every_mutating_api_dirties_the_keys_it_changes() {
 
     let other = meta.mkdir(ROOT_INO, "other", 0o755, 0, 0).unwrap().ino;
 
+    // 1 -> 2: the first name's copy becomes the remote form (plan 45).
     step!(meta, "link", {
         meta.link(f1, other, "hardlink").unwrap();
+    });
+
+    // 2 -> 3: nothing but the new name is written.
+    step!(meta, "link at two names", {
+        meta.link(f1, other, "hardlink2").unwrap();
     });
 
     step!(meta, "setattr", {
@@ -149,6 +155,11 @@ fn every_mutating_api_dirties_the_keys_it_changes() {
         meta.rename(dir_ino, "src2", other, "victim").unwrap();
     });
 
+    step!(meta, "unlink from three names", {
+        meta.unlink(other, "hardlink2").unwrap();
+    });
+
+    // 2 -> 1: the surviving name gets its copy back.
     step!(meta, "unlink", {
         meta.unlink(other, "hardlink").unwrap();
     });

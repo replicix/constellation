@@ -910,6 +910,7 @@ fn insert_node(
         None,
         target.map(String::into_bytes),
         &[],
+        None,
     )?;
     let is_new_dentry = ns::get_dentry_record(tx, &meta.ns, parent, name)?.is_none();
     ns::put_dentry(tx, &meta.ns, dirty, parent, name, ino, attrs)?;
@@ -1107,7 +1108,7 @@ fn apply_rename(
         &meta.ns,
         dirty,
         keys::dentry(new_parent, new_name.as_bytes()),
-        DentryRecord::new(ino, src_rec.attrs).encode(),
+        DentryRecord::for_inode(ino, &src_rec.attrs).encode(),
     )?;
     ns::ns_insert(
         tx,
@@ -1175,16 +1176,9 @@ fn apply_setattr(
     }
     rec.attrs.ctime_ns = t;
     let attrs = rec.attrs;
-    ns::ns_insert(tx, &meta.ns, dirty, keys::inode(ino), rec.encode())?;
-    for (parent, name) in ns::links_of(tx, &meta.ns, ino)? {
-        ns::ns_insert(
-            tx,
-            &meta.ns,
-            dirty,
-            keys::dentry(parent, name.as_bytes()),
-            DentryRecord::new(ino, attrs).encode(),
-        )?;
-    }
+    // The one path of every `0x01` write, which keeps the names' dentries in
+    // the form the record decides (`nlink` is unchanged here).
+    ns::put_inode_record(tx, &meta.ns, dirty, ino, &rec, Some(attrs))?;
     if let Some(a) = atime_ns {
         atime::set_atime_tx(tx, &meta.atime, ino, a);
     }
@@ -1309,15 +1303,6 @@ fn apply_write_manifest(
         Some(manifest.to_vec()),
         target,
     )?;
-    for (parent, name) in ns::links_of(tx, &meta.ns, ino)? {
-        ns::ns_insert(
-            tx,
-            &meta.ns,
-            dirty,
-            keys::dentry(parent, name.as_bytes()),
-            DentryRecord::new(ino, attrs).encode(),
-        )?;
-    }
     misc::track_manifest_transition_tx(
         tx,
         &meta.chunk_ref,
@@ -1388,6 +1373,7 @@ fn apply_set_xattr(
         manifest,
         target,
         &xattr_pairs,
+        Some(rec.attrs),
     )?;
     misc::xattr_by_name_put_tx(tx, &meta.xattr_by_name, name, ino, value);
     Ok(Applied::Done)
@@ -1446,6 +1432,7 @@ fn apply_remove_xattr(
         manifest,
         target,
         &xattr_pairs,
+        Some(rec.attrs),
     )?;
     misc::xattr_by_name_del_tx(tx, &meta.xattr_by_name, name, ino);
     Ok(Applied::Done)
@@ -1498,6 +1485,7 @@ fn apply_clone(
             node.manifest.clone(),
             node.target.clone().map(String::into_bytes),
             &xattrs,
+            None,
         )?;
         ns::put_dentry(
             tx,

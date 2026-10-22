@@ -448,6 +448,7 @@ impl Meta {
                 spec.manifest.clone(),
                 spec.target.clone().map(String::into_bytes),
                 &xattrs,
+                None,
             )?;
             ns::put_dentry(&mut tx, &self.ns, dirty, node_parent, name, ino, attrs)?;
             crate::store::atime::set_atime_tx(&mut tx, &self.atime, ino, spec.mtime_ns);

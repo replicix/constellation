@@ -424,6 +424,112 @@ fn a_stranded_unlink_restores_the_file() {
     );
 }
 
+/// Plan 45: a name of a hard-linked inode holds no attribute copy, and the
+/// 1 -> 2 and 2 -> 1 transitions rewrite the other name's dentry. A stranded
+/// run of links and unlinks across both transitions restores every dentry,
+/// the remote and the full form alike, byte for byte; while it is
+/// outstanding each name answers what `getattr` does.
+#[test]
+fn a_stranded_run_of_links_and_unlinks_restores_each_dentrys_form() {
+    use constellation_mtree::record::DentryRecord;
+    let meta = Meta::open_in_memory().unwrap();
+    let (f, g) = (ino(1), ino(2));
+    let link = |ino: u64, name: &str, t: i64| LogRecord::Link {
+        ino,
+        parent: ROOT_INO,
+        name: name.into(),
+        time_ns: t,
+    };
+    apply(
+        &meta,
+        1,
+        1,
+        &[create("f", f, 10), create("g", g, 11), link(f, "f2", 12)],
+    );
+    let held = |meta: &Meta, name: &str| {
+        let key = constellation_mtree::keys::dentry(ROOT_INO, name.as_bytes());
+        let value = raw_ns(meta)
+            .into_iter()
+            .find(|(k, _)| *k == key)
+            .unwrap_or_else(|| panic!("{name} has no dentry"))
+            .1;
+        DentryRecord::decode(&value).unwrap().attrs
+    };
+    assert_eq!((held(&meta, "f"), held(&meta, "f2")), (None, None));
+    assert!(held(&meta, "g").is_some());
+    let before = raw_ns(&meta);
+
+    let shadows: Vec<(MutateOp, LogRecord)> = vec![
+        (
+            MutateOp::Link {
+                ino: f,
+                parent: ROOT_INO,
+                name: "f3".into(),
+            },
+            link(f, "f3", 20),
+        ),
+        (
+            MutateOp::Unlink {
+                parent: ROOT_INO,
+                name: "f2".into(),
+            },
+            unlink("f2", 21),
+        ),
+        (
+            MutateOp::Unlink {
+                parent: ROOT_INO,
+                name: "f".into(),
+            },
+            unlink("f", 22),
+        ),
+        (
+            MutateOp::Link {
+                ino: g,
+                parent: ROOT_INO,
+                name: "g2".into(),
+            },
+            link(g, "g2", 23),
+        ),
+    ];
+    for (i, (op, record)) in shadows.iter().enumerate() {
+        let r = rid(i as u64 + 1);
+        assert!(meta
+            .install_shadow(r, 1, op, &[record.clone(), completed(r)])
+            .unwrap());
+    }
+    // f is down to f3 (2 -> 3 -> 2 -> 1: its copy is back), g is at two.
+    assert_eq!(meta.getattr(f).unwrap().unwrap().nlink, 1);
+    assert_eq!(
+        held(&meta, "f3"),
+        Some(meta_attrs(&meta, f)),
+        "the survivor holds the copy again"
+    );
+    assert_eq!((held(&meta, "g"), held(&meta, "g2")), (None, None));
+    assert_eq!(
+        meta.lookup(ROOT_INO, "g2").unwrap().unwrap(),
+        meta.getattr(g).unwrap().unwrap()
+    );
+    assert_ne!(raw_ns(&meta), before);
+
+    meta.strand_below_epoch(2).unwrap();
+    assert_eq!(raw_ns(&meta), before);
+    assert_eq!((held(&meta, "f"), held(&meta, "f2")), (None, None));
+    assert!(held(&meta, "g").is_some());
+}
+
+/// The inode record's attributes, from the dump (what a copy must equal).
+fn meta_attrs(meta: &Meta, ino: u64) -> constellation_mtree::record::Attrs {
+    let key = constellation_mtree::keys::inode(ino);
+    let value = raw_ns(meta)
+        .into_iter()
+        .find(|(k, _)| *k == key)
+        .expect("the inode record")
+        .1;
+    constellation_mtree::record::InodeRecord::decode(&value)
+        .unwrap()
+        .attrs
+}
+
 /// The orphan a stranded unlink made, xattrs included, goes when the
 /// rollback names the inode again: its xattrs are the restored record's
 /// (what was changed on the orphan meanwhile was never journaled), and
