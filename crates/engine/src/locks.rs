@@ -499,6 +499,76 @@ pub struct ClusterLocks {
     /// The threads that wait out non-blocking requests an owner cannot
     /// grant yet ([`Self::lock_nb_deferred`]).
     pub waits: WaitPool,
+    /// The core's answers to requests that ended before them
+    /// ([`Self::await_core`]).
+    pub orphans: Orphans,
+}
+
+/// Plan 43 C7-F F-b N2 (review): the core's answers still owed to requests
+/// that ended before them (a signal or a deadline while the answer was in
+/// flight). A grant in one lands in the tables with nobody to do what a
+/// grant's requester does ([`ClusterLocks::granted`]: wait for its floor,
+/// what the previous holders wrote, and drop the kernel's caches of the
+/// file), and the next request for the inode would take its lock under it
+/// at once: that request takes the answer first and does it. One relaxed
+/// load while there is none.
+#[derive(Default)]
+pub struct Orphans {
+    n: std::sync::atomic::AtomicUsize,
+    answers: Mutex<Vec<(Ino, Orphan)>>,
+}
+
+/// An answer [`Orphans`] keeps.
+enum Orphan {
+    /// Not in yet.
+    Owed(tokio::sync::oneshot::Receiver<LockAnswer>),
+    /// A grant, its floor not waited for.
+    Granted(Position),
+}
+
+impl Orphans {
+    /// Keep `answer`, owed to a request for `ino` that ended. What no longer
+    /// matters goes: answers that granted nothing, and grants no longer held.
+    fn keep(&self, meta: &Meta, ino: Ino, answer: tokio::sync::oneshot::Receiver<LockAnswer>) {
+        let mut v = self.answers.lock().unwrap();
+        v.retain_mut(|(i, o)| {
+            if let Orphan::Owed(rx) = o {
+                match rx.try_recv() {
+                    Ok(LockAnswer::Granted { position }) => *o = Orphan::Granted(position),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return true,
+                    Ok(_) | Err(_) => return false,
+                }
+            }
+            meta.locks().held(*i).is_some()
+        });
+        v.push((ino, Orphan::Owed(answer)));
+        self.n.store(v.len(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The answers kept for `ino`, taken.
+    fn take(&self, ino: Ino) -> Vec<Orphan> {
+        if self.n.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            return Vec::new();
+        }
+        let mut v = self.answers.lock().unwrap();
+        let mut taken = Vec::new();
+        v.retain_mut(|(i, o)| {
+            if *i != ino {
+                return true;
+            }
+            taken.push(std::mem::replace(o, Orphan::Granted(Position::ZERO)));
+            false
+        });
+        self.n.store(v.len(), std::sync::atomic::Ordering::Relaxed);
+        taken
+    }
+
+    /// Put back what a request took and could not finish.
+    fn put_back(&self, ino: Ino, rest: impl IntoIterator<Item = Orphan>) {
+        let mut v = self.answers.lock().unwrap();
+        v.extend(rest.into_iter().map(|o| (ino, o)));
+        self.n.store(v.len(), std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Most threads of a [`WaitPool`]: a waiting request is a timer and a
@@ -1585,18 +1655,19 @@ impl ClusterLocks {
     /// deadline (plan 43 C7-F F-b N2): the core may take seconds to answer
     /// (it asks an owner that is gone, a few times, before it says so),
     /// and a signal is not to wait for it. A request ended here before its
-    /// answer leaves the core to answer nobody; a grant that comes for it
-    /// after that is the first use no request will make, which
-    /// [`Self::settled`] and the first-use budget account for (as for an
-    /// answer that was lost).
+    /// answer leaves the core to answer nobody: its caller keeps the answer
+    /// ([`Orphans`]), and the next request for the inode waits for a grant
+    /// in it as its requester would have; a grant that nobody takes is the
+    /// first use no request makes, which [`Self::settled`] and the
+    /// first-use budget account for (as for an answer that was lost).
     fn await_core<T>(
-        answer: tokio::sync::oneshot::Receiver<T>,
+        answer: &mut tokio::sync::oneshot::Receiver<T>,
         interrupt: Interrupt<'_>,
     ) -> Result<T, Code> {
         use std::future::Future;
         let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
         let mut cx = std::task::Context::from_waker(&waker);
-        let mut answer = std::pin::pin!(answer);
+        let mut answer = std::pin::Pin::new(answer);
         let mut slices = 0u32;
         loop {
             match answer.as_mut().poll(&mut cx) {
@@ -1613,6 +1684,32 @@ impl ClusterLocks {
             slices = slices.saturating_add(1);
             std::thread::park_timeout(ANSWER_SLICE);
         }
+    }
+
+    /// The answers owed to requests for `ino` that ended before them
+    /// ([`Orphans`]): each awaited (as this request's own would be), and a
+    /// grant among them is waited for as its requester would have
+    /// ([`Self::granted`]) before this request takes a lock under it.
+    fn adopt_orphans(&self, ino: Ino, interrupt: Interrupt<'_>) -> Result<(), Code> {
+        let mut taken = self.orphans.take(ino).into_iter();
+        while let Some(orphan) = taken.next() {
+            let position = match orphan {
+                Orphan::Granted(position) => position,
+                Orphan::Owed(mut rx) => match Self::await_core(&mut rx, interrupt) {
+                    Ok(LockAnswer::Granted { position }) => position,
+                    Ok(_) => continue,
+                    Err(code @ (Code::Intr | Code::TimedOut)) => {
+                        self.orphans
+                            .put_back(ino, std::iter::once(Orphan::Owed(rx)).chain(taken));
+                        return Err(code);
+                    }
+                    // Nobody will answer it.
+                    Err(_) => continue,
+                },
+            };
+            self.granted(ino, &position);
+        }
+        Ok(())
     }
 
     fn set_inner(
@@ -1636,6 +1733,7 @@ impl ClusterLocks {
         // the owner's queue instead of joining it again at the back.
         let started = std::time::Instant::now();
         loop {
+            self.adopt_orphans(ino, interrupt)?;
             let outcome = self.meta.locks().local_set(ino, lock, now());
             if outcome == LocalOutcome::Predecessor && !predecessor_counted {
                 // Once per request, however often it looks again.
@@ -1713,7 +1811,7 @@ impl ClusterLocks {
                     }
                     rounds += 1;
                     constellation_vfs::watch::stage("lock grant (core reply)");
-                    let (reply, answer) = tokio::sync::oneshot::channel();
+                    let (reply, mut answer) = tokio::sync::oneshot::channel();
                     *asked = true;
                     self.tx
                         .send(SyncRequest::Lock {
@@ -1728,7 +1826,15 @@ impl ClusterLocks {
                             reply,
                         })
                         .map_err(|_| Code::Io)?;
-                    match Self::await_core(answer, interrupt)? {
+                    let answered = Self::await_core(&mut answer, interrupt);
+                    if let Err(code @ (Code::Intr | Code::TimedOut)) = answered {
+                        // Ended before its answer: the core answers nobody,
+                        // and a grant it brings is the next request's to
+                        // wait for (`Orphans`).
+                        self.orphans.keep(&self.meta, ino, answer);
+                        return Err(code);
+                    }
+                    match answered? {
                         LockAnswer::Granted { position } => {
                             self.granted(ino, &position);
                             granted_round = sleep;

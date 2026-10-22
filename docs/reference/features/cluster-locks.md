@@ -1165,9 +1165,12 @@ How it ends:
   an owner that cannot be reached) is made in slices of 50 ms that look at
   the cancellation. A request's first attempt registers for the signal
   when the core's answer is more than one slice late (an attempt answered
-  at once registers nothing); one the core had not answered when the signal
-  ended it may be granted a lock afterwards, which no request will use: it
-  is a first use abandoned, as for an answer that was lost.
+  at once registers nothing). One the core had not answered when the signal
+  ended it may be granted a lock afterwards: the engine keeps that answer,
+  and the next request for the file waits for the grant's floor (what the
+  previous holders wrote) and drops the kernel's caches of it before it
+  takes a lock under the grant, as the request would have; a grant no
+  request takes is a first use abandoned, as for an answer that was lost.
 
 A request told to wait for an owner that cannot say when it may grant (a
 floor, a barrier, a stale or an unreachable owner: the owner hints

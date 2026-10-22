@@ -1912,6 +1912,7 @@ impl Engine {
                             ),
                             poll_hint: std::time::Duration::from_millis(self.lock_poll_ms),
                             waits: Default::default(),
+                            orphans: Default::default(),
                         })
                     }),
                     lease: self.lease.clone(),

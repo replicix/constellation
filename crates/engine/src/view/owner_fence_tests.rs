@@ -44,6 +44,7 @@ fn fenced_fs_waiting(owner_wait_max: std::time::Duration) -> Fenced {
         owner_wait_max,
         poll_hint: std::time::Duration::from_millis(50),
         waits: Default::default(),
+        orphans: Default::default(),
     }));
     fs.caps.cluster_locks = true;
     Fenced {
@@ -730,6 +731,7 @@ fn a_deadline_times_out_a_blocking_lock_request_and_never_a_non_blocking_one() {
         owner_wait_max: std::time::Duration::from_secs(50),
         poll_hint: std::time::Duration::from_millis(50),
         waits: Default::default(),
+        orphans: Default::default(),
     });
     let lock = || constellation_meta::locks::LocalLock {
         owner: TURN_OWNER + 2,
@@ -2342,6 +2344,9 @@ enum Scripted {
     /// Takes this many ms to answer `WouldBlock`: a core asking an owner
     /// that is gone, a few times, before it says so.
     Slow(u64),
+    /// Takes this many ms, then installs a grant whose floor is the log's
+    /// first segment and grants.
+    SlowGrant(u64),
 }
 
 /// A stand-in for the core: answers each `SyncRequest::Lock` from
@@ -2396,7 +2401,17 @@ fn script_core_waits(f: &mut Fenced, ino: Ino, script: Vec<Scripted>) -> Seen {
                 Scripted::GrantNothing => constellation_authority::LockAnswer::Granted {
                     position: constellation_meta::Position::ZERO,
                 },
-                Scripted::Grant => {
+                Scripted::Grant | Scripted::SlowGrant(_) => {
+                    let position = match step {
+                        Scripted::SlowGrant(ms) => {
+                            std::thread::sleep(std::time::Duration::from_millis(ms));
+                            constellation_meta::Position {
+                                seq: 1,
+                                ..constellation_meta::Position::ZERO
+                            }
+                        }
+                        _ => constellation_meta::Position::ZERO,
+                    };
                     let now = crate::locks::now().honour;
                     meta.locks().install_held(
                         ino,
@@ -2407,7 +2422,7 @@ fn script_core_waits(f: &mut Fenced, ino: Ino, script: Vec<Scripted>) -> Seen {
                             renew_at: now.plus(30_000),
                             owner: 9,
                             recalled: false,
-                            position: constellation_meta::Position::ZERO,
+                            position,
                             renewing: None,
                             releasing: false,
                             first_use: false,
@@ -2417,9 +2432,7 @@ fn script_core_waits(f: &mut Fenced, ino: Ino, script: Vec<Scripted>) -> Seen {
                             written: false,
                         },
                     );
-                    constellation_authority::LockAnswer::Granted {
-                        position: constellation_meta::Position::ZERO,
-                    }
+                    constellation_authority::LockAnswer::Granted { position }
                 }
             };
             let _ = reply.send(answer);
@@ -2650,6 +2663,47 @@ fn a_signal_ends_a_first_attempt_in_flight_against_a_slow_core() {
         "the signal ended the request within a slice: {took:?}"
     );
     assert!(f.meta.locks().local_locks(ino).is_empty());
+}
+
+/// Plan 43 C7-F F-b N2 (review): a request its signal ended while the
+/// core's answer was in flight leaves the core to answer nobody, and a grant
+/// in that answer lands in the tables with nobody to wait for its floor
+/// (what the previous holders wrote) or to drop the kernel's caches of the
+/// file. The next request for the inode (here the application asking again
+/// after its `EINTR`) takes its lock under that grant: it waits for the
+/// floor first. Before, it found the grant held and took the lock at once.
+#[test]
+fn a_grant_that_lands_after_its_request_ended_is_waited_for_by_the_next() {
+    let mut f = fenced_fs();
+    let (file, _) = f.create(&Caller::root(), ROOT_INO, "late_grant").unwrap();
+    let ino = file.attr.ino;
+    script_core(&mut f, ino, vec![Scripted::SlowGrant(600)]);
+    let token = constellation_vfs::CancelToken::new();
+    let rx = std::thread::scope(|s| {
+        let call = s.spawn(|| f.lock_nb(ino, Some(&token)));
+        std::thread::sleep(SECOND / 5);
+        token.cancel();
+        call.join().unwrap()
+    });
+    assert_eq!(
+        rx.try_recv().expect("answered by the call").0,
+        Err(Code::Intr)
+    );
+    // The grant lands for nobody.
+    let until = std::time::Instant::now() + 5 * SECOND;
+    while f.meta.locks().held(ino).is_none() && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(f.meta.locks().held(ino).is_some(), "the late grant is held");
+    assert_eq!(f.meta.session().observed().seq, 0, "nobody waited yet");
+    let rx = f.lock_nb(ino, None);
+    let (result, _, _) = rx.recv_timeout(5 * SECOND).expect("answered");
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        f.meta.session().observed().seq,
+        1,
+        "the lock was taken under a grant whose floor nobody waited for"
+    );
 }
 
 /// Plan 43 C7-F F-b N2: the same for a re-issue on the wait pool: its
