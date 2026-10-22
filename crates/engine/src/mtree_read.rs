@@ -217,6 +217,25 @@ pub(crate) struct DentryForms {
 /// one per name.
 pub(crate) const DENTRY_VIOLATIONS_KEPT: usize = 100;
 
+/// A non-directory inode whose `nlink` is not the number of its names in
+/// the `0x04` reverse index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LinkCountViolation {
+    pub ino: Ino,
+    pub nlink: u32,
+    pub names: u64,
+}
+
+/// What [`TreeReader::check_link_counts`] found.
+#[derive(Debug, Default)]
+pub(crate) struct LinkCounts {
+    /// Non-directory inodes examined.
+    pub checked: u64,
+    pub violations: u64,
+    /// The first [`DENTRY_VIOLATIONS_KEPT`] of them.
+    pub first: Vec<LinkCountViolation>,
+}
+
 /// FUSE's metadata reads over one published root, fetching only what
 /// each call touches. See the module docs.
 ///
@@ -379,6 +398,58 @@ impl<S: NodeStore> TreeReader<S> {
                         name,
                         ino,
                         what,
+                    });
+                }
+            }
+            cursor.next()?;
+        }
+        Ok(out)
+    }
+
+    /// Every non-directory inode's `nlink` against its names in the `0x04`
+    /// reverse index: plan 45's dentry form is decided by `nlink`
+    /// ([`Self::check_dentry_forms`]), so a count that drifted from the
+    /// names makes a form check pass on the wrong form. Directories are
+    /// skipped (their `nlink` counts subdirectories; they have one name).
+    /// Streamed over `0x01`, one scan of the inode's `0x04` names each:
+    /// nothing but the violations is kept. An inode whose record does not
+    /// decode is the node check's and the form check's to report.
+    pub fn check_link_counts(&self) -> Result<LinkCounts> {
+        let range = keys::whole_range(keys::RANGE_INODE);
+        let mut out = LinkCounts::default();
+        let mut cursor = self.tree.cursor_at(&self.root, range.start())?;
+        while let Some((key, value)) = cursor.entry()? {
+            if !key.starts_with(range.prefix()) {
+                break;
+            }
+            let Key::Inode { ino } = Key::parse(key)? else {
+                bail!("a non-inode key inside the inode range");
+            };
+            let attrs = match InodeRecord::decode(value) {
+                Ok(rec) if rec.attrs.kind != record::Kind::Dir => rec.attrs,
+                _ => {
+                    cursor.next()?;
+                    continue;
+                }
+            };
+            out.checked += 1;
+            let names_range = keys::names_of(ino);
+            let mut names = 0u64;
+            let mut names_cursor = self.tree.cursor_at(&self.root, names_range.start())?;
+            while let Some((name_key, _)) = names_cursor.entry()? {
+                if !name_key.starts_with(names_range.prefix()) {
+                    break;
+                }
+                names += 1;
+                names_cursor.next()?;
+            }
+            if names != u64::from(attrs.nlink) {
+                out.violations += 1;
+                if out.first.len() < DENTRY_VIOLATIONS_KEPT {
+                    out.first.push(LinkCountViolation {
+                        ino,
+                        nlink: attrs.nlink,
+                        names,
                     });
                 }
             }

@@ -364,6 +364,25 @@ async fn check_metadata_tree_in(
             }),
         }
 
+        match walker.check_link_counts() {
+            Ok(counts) => {
+                found.extend(link_count_issues(head.seq, &counts));
+                tracing::info!(
+                    seq = head.seq,
+                    inodes = counts.checked,
+                    violations = counts.violations,
+                    "checked every link count against the reverse index"
+                );
+            }
+            Err(e) => found.push(FsckIssue {
+                class: "link_count".into(),
+                key: Some(format!("commits/{:016x}", head.seq)),
+                detail: format!("the link counts under the head cannot be checked: {e:#}"),
+                repaired: false,
+                unrepairable: true,
+            }),
+        }
+
         let vector = meta.applied_seq()?;
         let Some(matching) = candidates
             .iter()
@@ -412,6 +431,42 @@ async fn check_metadata_tree_in(
     .context("metadata tree check task")??;
     issues.extend(found);
     Ok(())
+}
+
+/// One issue per violation `counts` kept, and a last one counting the rest:
+/// a non-directory inode whose `nlink` is not the number of its names in
+/// the `0x04` reverse index. The dentry form follows `nlink` (plan 45), so
+/// a drifted count hides a wrong form from [`dentry_form_issues`]. Like a
+/// bad form, a bug's output in a committed tree: the repair is a rebuild
+/// from the log.
+fn link_count_issues(seq: u64, counts: &crate::mtree_read::LinkCounts) -> Vec<FsckIssue> {
+    let mut issues: Vec<FsckIssue> = counts
+        .first
+        .iter()
+        .map(|v| FsckIssue {
+            class: "link_count".into(),
+            key: Some(hex(&constellation_mtree::keys::inode(v.ino))),
+            detail: format!(
+                "commit {seq}: inode {} has nlink {}; the reverse index has {} of its names",
+                v.ino, v.nlink, v.names
+            ),
+            repaired: false,
+            unrepairable: true,
+        })
+        .collect();
+    let more = counts.violations - counts.first.len() as u64;
+    if more > 0 {
+        issues.push(FsckIssue {
+            class: "link_count".into(),
+            key: Some(format!("commits/{seq:016x}")),
+            detail: format!(
+                "commit {seq}: {more} more inodes whose nlink disagrees with their names"
+            ),
+            repaired: false,
+            unrepairable: true,
+        });
+    }
+    issues
 }
 
 /// One issue per violation `forms` kept, and a last one counting the rest
@@ -782,6 +837,10 @@ mod tests {
             (keys::dentry(parent, name.as_bytes()), value.encode())
         }
 
+        fn rdentry(ino: u64, parent: u64, name: &str) -> (Vec<u8>, Vec<u8>) {
+            (keys::rdentry(ino, parent, name.as_bytes()), Vec::new())
+        }
+
         /// A well-formed namespace: a directory, a single-name file, files
         /// with two and three names, a subdirectory, a symlink with two names.
         fn good() -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -808,6 +867,15 @@ mod tests {
                 dentry(ROOT, "sub", DentryRecord::new(SUBDIR, sub)),
                 dentry(ROOT, "sym-a", DentryRecord::remote(LINK, Kind::Symlink)),
                 dentry(SUBDIR, "sym-b", DentryRecord::remote(LINK, Kind::Symlink)),
+                rdentry(SINGLE, ROOT, "single"),
+                rdentry(TWO, ROOT, "two-a"),
+                rdentry(TWO, SUBDIR, "two-b"),
+                rdentry(THREE, ROOT, "three-a"),
+                rdentry(THREE, ROOT, "three-b"),
+                rdentry(THREE, SUBDIR, "three-c"),
+                rdentry(SUBDIR, ROOT, "sub"),
+                rdentry(LINK, ROOT, "sym-a"),
+                rdentry(LINK, SUBDIR, "sym-b"),
             ]
         }
 
@@ -828,14 +896,22 @@ mod tests {
             )
             .unwrap();
             let root = tree.build(entries).unwrap();
-            let forms = TreeReader::new(tree, root).check_dentry_forms().unwrap();
-            dentry_form_issues(7, &forms)
+            let reader = TreeReader::new(tree, root);
+            let forms = reader.check_dentry_forms().unwrap();
+            let counts = reader.check_link_counts().unwrap();
+            let mut issues = dentry_form_issues(7, &forms);
+            issues.extend(link_count_issues(7, &counts));
+            issues
         }
 
         fn one(entries: Vec<(Vec<u8>, Vec<u8>)>, what: &str) {
+            one_of("dentry_form", entries, what)
+        }
+
+        fn one_of(class: &str, entries: Vec<(Vec<u8>, Vec<u8>)>, what: &str) {
             let issues = issues_of(entries);
             assert_eq!(issues.len(), 1, "{issues:#?}");
-            assert_eq!(issues[0].class, "dentry_form");
+            assert_eq!(issues[0].class, class);
             assert!(issues[0].unrepairable);
             assert!(issues[0].detail.contains(what), "{}", issues[0].detail);
         }
@@ -943,6 +1019,46 @@ mod tests {
                 "the kept ones and the count of the rest"
             );
             assert!(issues.last().unwrap().detail.contains("20 more"));
+        }
+
+        /// Plan 45 follow-up: `nlink` against the names in the `0x04`
+        /// reverse index. The form check reads `nlink` alone, so a count
+        /// that drifted from the names passes it on the wrong form.
+        #[test]
+        fn fsck_reports_an_nlink_that_is_not_the_reverse_index_count() {
+            // One name short: `three-c` has no reverse entry.
+            let key = keys::rdentry(THREE, SUBDIR, b"three-c");
+            let entries: Vec<_> = good().into_iter().filter(|(k, _)| *k != key).collect();
+            one_of(
+                "link_count",
+                entries,
+                &format!("inode {THREE} has nlink 3; the reverse index has 2 of its names"),
+            );
+            // A single-name file whose count says two: its full-copy
+            // dentry is then the wrong form too.
+            let mut entries = good();
+            let two = attrs(Kind::File, 2);
+            let slot = entries
+                .iter_mut()
+                .find(|(k, _)| *k == keys::inode(SINGLE))
+                .unwrap();
+            slot.1 = InodeRecord::new(two).encode();
+            let issues = issues_of(entries);
+            assert!(
+                issues.iter().any(|i| i.class == "link_count"
+                    && i.detail.contains(&format!(
+                        "inode {SINGLE} has nlink 2; the reverse index has 1 of its names"
+                    ))),
+                "{issues:#?}"
+            );
+            // A name in the reverse index the count misses, on a symlink.
+            let mut entries = good();
+            entries.push(rdentry(LINK, ROOT, "sym-c"));
+            one_of(
+                "link_count",
+                entries,
+                &format!("inode {LINK} has nlink 2; the reverse index has 3 of its names"),
+            );
         }
     }
 }
