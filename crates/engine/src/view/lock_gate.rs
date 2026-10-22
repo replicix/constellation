@@ -13,6 +13,58 @@ thread_local! {
     static REDISPATCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Plan 43 C7-F lock-wait follow-ups (W1, W2): what an op that has to wait
+/// on its own thread for a lapsing grant (an inline wait: its park gate did
+/// not hold it) may use to end the wait early — its context's cancellation,
+/// and the registration its responder offers (`Responder::begin_wait`: a
+/// signal's token for an op that carries none, a lock-wait entry over a
+/// ring).
+pub(crate) struct Waiter<'a> {
+    cancel: Option<&'a CancelToken>,
+    begin: Option<&'a mut dyn FnMut() -> WaitStart>,
+}
+
+impl<'a> Waiter<'a> {
+    /// The op's own cancellation only (an op with no responder at hand).
+    pub(crate) fn cancel(cancel: Option<&'a CancelToken>) -> Self {
+        Waiter {
+            cancel,
+            begin: None,
+        }
+    }
+
+    /// The op's cancellation and its responder's registration.
+    pub(crate) fn registering(
+        cancel: Option<&'a CancelToken>,
+        begin: &'a mut dyn FnMut() -> WaitStart,
+    ) -> Self {
+        Waiter {
+            cancel,
+            begin: Some(begin),
+        }
+    }
+}
+
+/// Whether this thread is one of a FUSE-over-io_uring session's ring
+/// threads (`fuser-ring-N`, the vendored fuser's names): each serves the
+/// requests of its CPUs' queues one at a time, so an op that waits on it
+/// stalls them all. Reads run there (`RingDispatch::Reads`); the frontend's
+/// `reads_stay_on_the_ring_and_whatever_may_block_is_offloaded` (`wire_uring`)
+/// pins the name.
+pub(crate) fn on_ring_thread() -> bool {
+    std::thread::current()
+        .name()
+        .is_some_and(|n| n.starts_with("fuser-ring-"))
+}
+
+/// What a read's fences said ([`View::lock_read_gate`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadGate {
+    Clear,
+    Parked,
+    Check,
+}
+
 /// What an op's park gate looks at (plan 43 C7-F F-c): the checks the op
 /// makes — and so what a lapsing grant makes it wait for — before its first
 /// effect.
@@ -98,10 +150,16 @@ impl View {
     /// Plan 30 §M14, the owner fence: whether `cx` is an op the fence
     /// refuses ([`owner_fence_applies`]) issued by a lock owner whose
     /// grant lapsed — by its lock owner id, or by its process or one that
-    /// process started. One relaxed atomic load while this node holds no
-    /// local lock; two while every grant under one is still honoured.
-    pub(crate) fn lock_owner_fenced(&self, cx: &OpCtx<'_>) -> bool {
-        owner_fence_applies(cx.kind) && self.lock_owner_fenced_any(cx)
+    /// process started. `Err(EIO)` then (`Err(EINTR)`: its caller's signal
+    /// ended the wait for a grant that is lapsing, [`Self::lock_wait_inline`]).
+    /// One relaxed atomic load while this node holds no local lock; two
+    /// while every grant under one is still honoured.
+    pub(crate) fn lock_owner_gate(&self, cx: &OpCtx<'_>, w: &mut Waiter<'_>) -> Result<(), Code> {
+        if owner_fence_applies(cx.kind) {
+            self.lock_owner_gate_any(cx, w)
+        } else {
+            Ok(())
+        }
     }
 
     /// Plan 30 §M14 phase 2: enter the fencing-token scope of `cx`'s op
@@ -110,16 +168,20 @@ impl View {
     /// local`; one relaxed load while this node holds no local lock.
     pub(crate) fn lock_tag_scope(&self, cx: &OpCtx<'_>) -> Option<crate::locks::TagScope> {
         self.cluster_locks()
-            .map(|l| l.tag_scope(cx.caller.pid, cx.lock_owner))
+            .map(|l| l.tag_scope(cx.caller.pid, cx.lock_owner, cx.cancel))
     }
 
-    /// [`Self::lock_owner_fenced`] whatever the op.
-    pub(crate) fn lock_owner_fenced_any(&self, cx: &OpCtx<'_>) -> bool {
+    /// [`Self::lock_owner_gate`] whatever the op.
+    pub(crate) fn lock_owner_gate_any(
+        &self,
+        cx: &OpCtx<'_>,
+        w: &mut Waiter<'_>,
+    ) -> Result<(), Code> {
         let Some(l) = self.cluster_locks() else {
-            return false;
+            return Ok(());
         };
-        let fenced = self.lock_owner_fenced_for(l, cx.caller.pid, cx.lock_owner, cx.cancel);
-        if fenced {
+        let gate = self.lock_owner_gate_for(l, cx.caller.pid, cx.lock_owner, w);
+        if gate.is_err() {
             tracing::debug!(
                 target: "constellation::locks",
                 op = cx.kind.name(),
@@ -128,36 +190,79 @@ impl View {
                 "refused: the caller's lock grant lapsed (EIO until its locks are gone)"
             );
         }
-        fenced
+        gate
     }
 
     /// The owner fence for the caller `pid` / `lock_owner`. Plan 43 C7-F
     /// F-c: a grant that is lapsing is waited for (an op the park gate did
     /// not hold — a race, or one that cannot park — waits here, its thread
-    /// held, bounded).
-    pub(crate) fn lock_owner_fenced_for(
+    /// held, bounded: [`Self::lock_wait_inline`]).
+    pub(crate) fn lock_owner_gate_for(
         &self,
         l: &Arc<crate::locks::ClusterLocks>,
         pid: Option<u32>,
         lock_owner: Option<u64>,
-        cancel: Option<&CancelToken>,
-    ) -> bool {
+        w: &mut Waiter<'_>,
+    ) -> Result<(), Code> {
         loop {
             match l.owner_fenced(pid, lock_owner) {
-                Fence::Ok => return false,
-                Fence::Fenced => return true,
+                Fence::Ok => return Ok(()),
+                Fence::Fenced => return Err(Code::Io),
                 Fence::Parked => {
-                    if !self.lock_wait_inline(l, cancel, || {
+                    self.lock_wait_inline(l, w, || {
                         l.owner_fenced(pid, lock_owner) == Fence::Parked
-                    }) {
-                        return true;
-                    }
+                    })?;
                 }
             }
         }
     }
 
-    /// Plan 30 §M14: I/O on `ino` is fenced (`EIO`) — this node holds
+    /// A read's fences (the owner's, the inode's) in one look (plan 43 C7-F
+    /// lock-wait follow-ups, W2): [`ReadGate::Parked`] when either grant is
+    /// lapsing, the op to park; [`ReadGate::Clear`] when the owner fence was
+    /// looked at and passed (or the node holds no lock), which the read need
+    /// not look at again; [`ReadGate::Check`] otherwise (the owner is
+    /// fenced, or the read is the run again of a parked one, which never
+    /// parks again): the owner fence's own check answers it. The inode's
+    /// fence is checked again at the read, where it was.
+    pub(crate) fn lock_read_gate(&self, cx: &OpCtx<'_>, ino: Ino) -> ReadGate {
+        let Some(l) = self.cluster_locks() else {
+            return ReadGate::Clear;
+        };
+        if !l.meta.locks().active() {
+            return ReadGate::Clear;
+        }
+        if Self::lock_redispatched() {
+            return ReadGate::Check;
+        }
+        if owner_fence_applies(cx.kind) {
+            match l.owner_fenced(cx.caller.pid, cx.lock_owner) {
+                Fence::Ok => {}
+                Fence::Fenced => return ReadGate::Check,
+                Fence::Parked => return ReadGate::Parked,
+            }
+        }
+        if l.fenced(ino) == Fence::Parked {
+            ReadGate::Parked
+        } else {
+            ReadGate::Clear
+        }
+    }
+
+    /// Counted: an op handed to the wait pool at a fence (`lapse_late_parks`).
+    pub(crate) fn note_late_park(&self) {
+        if let Some(l) = self.cluster_locks() {
+            l.meta.locks().with_stats(|s| s.lapse_late_parks += 1);
+        }
+    }
+
+    /// Whether the op already runs a second time after parking
+    /// (`REDISPATCHED`): it does not park again.
+    pub(crate) fn lock_redispatched() -> bool {
+        REDISPATCHED.with(|f| f.get())
+    }
+
+    /// Plan 30 §M14: I/O on `ino` is fenced (`Err(EIO)`) — this node holds
     /// local locks on it under a grant that lapsed. One relaxed atomic
     /// load while no local lock exists anywhere (and nothing at all under
     /// `--locks local`).
@@ -165,42 +270,83 @@ impl View {
     /// Plan 43 C7-F F-c: while the grant is lapsing the answer is not yet
     /// known: the op waits here (inline, bounded: the park gate holds ops
     /// that can be held without a thread, `lock_would_park`) and asks again.
-    pub(crate) fn lock_fenced(&self, ino: Ino) -> bool {
+    /// `Err(EINTR)`: its caller's signal ended the wait.
+    pub(crate) fn lock_fenced(&self, ino: Ino, w: &mut Waiter<'_>) -> Result<(), Code> {
         let Some(l) = self.cluster_locks() else {
-            return false;
+            return Ok(());
         };
         loop {
             match l.fenced(ino) {
-                Fence::Ok => return false,
-                Fence::Fenced => return true,
+                Fence::Ok => return Ok(()),
+                Fence::Fenced => return Err(Code::Io),
                 Fence::Parked => {
-                    if !self.lock_wait_inline(l, None, || l.fenced(ino) == Fence::Parked) {
-                        return true;
-                    }
+                    self.lock_wait_inline(l, w, || l.fenced(ino) == Fence::Parked)?;
                 }
             }
         }
     }
 
     /// Plan 43 C7-F F-c: wait on this thread while `parked` says the grant
-    /// is lapsing: `true` once it does not (the caller asks again), `false`
-    /// when `cancel` fired or the lapse's bound passed (the caller treats
-    /// the grant as fenced; the table gives up at the bound by itself).
+    /// is lapsing: `Ok` once it does not (the caller asks again),
+    /// `Err(EINTR)` when the op's signal came, `Err(EIO)` when the wait is
+    /// not allowed or the lapse's bound passed (the caller treats the grant
+    /// as fenced; the table gives up at the bound by itself).
+    ///
+    /// Lock-wait follow-ups (W1, W2): the wait is interruptible — by the
+    /// op's own cancellation and by the registration its responder makes
+    /// for it (`Responder::begin_wait`) — and is never made on a ring
+    /// thread, which every other request of its CPUs waits behind: there
+    /// it is refused (`EIO`, as before F-c, counted
+    /// `lapse_inline_refused_thread`; a read's fence parks the op on the
+    /// pool instead, so it does not get here), and over a ring a wait that
+    /// has no lock-wait entry to hold is refused too
+    /// (`lapse_park_refused_ring`). Counted: `lapse_inline_waits`,
+    /// `lapse_inline_wait_ms_total`, `lapse_inline_interrupted`.
     pub(crate) fn lock_wait_inline(
         &self,
         l: &crate::locks::ClusterLocks,
-        cancel: Option<&CancelToken>,
+        w: &mut Waiter<'_>,
         parked: impl Fn() -> bool,
-    ) -> bool {
+    ) -> Result<(), Code> {
+        if !parked() {
+            return Ok(());
+        }
+        let stats = l.meta.locks();
+        if on_ring_thread() {
+            stats.with_stats(|s| s.lapse_inline_refused_thread += 1);
+            return Err(Code::Io);
+        }
+        let own = match w.begin.as_mut().map(|begin| begin()) {
+            Some(WaitStart::Refused) => {
+                stats.with_stats(|s| s.lapse_park_refused_ring += 1);
+                return Err(Code::Io);
+            }
+            Some(WaitStart::Held(own)) => own,
+            None => None,
+        };
+        stats.with_stats(|s| s.lapse_inline_waits += 1);
         let started = Instant::now();
         let bound = l.owner_wait_max + Duration::from_secs(5);
-        while parked() {
-            if cancel.is_some_and(CancelToken::is_cancelled) || started.elapsed() >= bound {
-                return false;
+        let cancelled = || {
+            w.cancel.is_some_and(CancelToken::is_cancelled)
+                || own.as_ref().is_some_and(CancelToken::is_cancelled)
+        };
+        let result = loop {
+            if !parked() {
+                break Ok(());
+            }
+            if cancelled() {
+                stats.with_stats(|s| s.lapse_inline_interrupted += 1);
+                break Err(Code::Intr);
+            }
+            if started.elapsed() >= bound {
+                break Err(Code::Io);
             }
             std::thread::sleep(Duration::from_millis(10));
-        }
-        true
+        };
+        let ms = started.elapsed().as_millis() as u64;
+        stats.with_stats(|s| s.lapse_inline_wait_ms_total += ms);
+        result
     }
 
     /// Plan 43 C7-F F-c: whether an op may find a grant lapsing: the node
@@ -408,12 +554,13 @@ impl View {
         &self,
         ino: Ino,
         fh: constellation_vfs::Fh,
+        w: &mut Waiter<'_>,
     ) -> Result<bool, Code> {
         if View::is_synthetic(ino) {
             return Ok(false);
         }
         if let Some(l) = self.cluster_locks() {
-            if let Discard::Discard { fenced } = self.lock_take_discard(l, ino, false) {
+            if let Discard::Discard { fenced } = self.lock_take_discard(l, ino, false, w)? {
                 let dirty = self.discard_lock_writes(ino);
                 if dirty {
                     let seq = l.note_discard(ino);
@@ -444,8 +591,8 @@ impl View {
     /// must not ride along with what comes next (under a fresh grant, or
     /// unlocked). Discarded; every description open now reports `EIO` at
     /// its next close or `fsync`.
-    pub(crate) fn lock_discard_tainted(&self, ino: Ino) {
-        self.lock_discard_tainted_as(ino, false);
+    pub(crate) fn lock_discard_tainted(&self, ino: Ino, w: &mut Waiter<'_>) -> Result<(), Code> {
+        self.lock_discard_tainted_as(ino, false, w)
     }
 
     /// [`Self::lock_discard_tainted`] for a write (or a truncation, an
@@ -453,41 +600,55 @@ impl View {
     /// next is pinned to the grant that covers `ino` — if it lapses before
     /// the data is published, its fate waits for the owner's verdict
     /// ([`constellation_meta::locks::HeldGrant::written`]).
-    pub(crate) fn lock_discard_tainted_for_write(&self, ino: Ino) {
-        self.lock_discard_tainted_as(ino, true);
+    pub(crate) fn lock_discard_tainted_for_write(
+        &self,
+        ino: Ino,
+        w: &mut Waiter<'_>,
+    ) -> Result<(), Code> {
+        self.lock_discard_tainted_as(ino, true, w)
     }
 
-    fn lock_discard_tainted_as(&self, ino: Ino, write: bool) {
+    fn lock_discard_tainted_as(
+        &self,
+        ino: Ino,
+        write: bool,
+        w: &mut Waiter<'_>,
+    ) -> Result<(), Code> {
         let Some(l) = self.cluster_locks() else {
-            return;
+            return Ok(());
         };
         if matches!(
-            self.lock_take_discard(l, ino, write),
+            self.lock_take_discard(l, ino, write, w)?,
             Discard::Discard { .. }
         ) && self.discard_lock_writes(ino)
         {
             l.note_discard(ino);
         }
+        Ok(())
     }
 
     /// [`crate::locks::ClusterLocks::take_discard`], waiting inline (bounded) while the
     /// inode's grant is lapsing (plan 43 C7-F F-c): what comes back is the
-    /// verdict, never `Parked`.
+    /// verdict, never `Parked`; `Err(EINTR)` when the op's signal ended the
+    /// wait.
     pub(crate) fn lock_take_discard(
         &self,
         l: &Arc<crate::locks::ClusterLocks>,
         ino: Ino,
         write: bool,
-    ) -> Discard {
+        w: &mut Waiter<'_>,
+    ) -> Result<Discard, Code> {
         loop {
             match l.take_discard(ino, write) {
                 Discard::Parked => {
                     let pending = || l.meta.locks().lapse_pending(ino, crate::locks::now());
-                    if !self.lock_wait_inline(l, None, pending) {
-                        return Discard::Discard { fenced: true };
+                    match self.lock_wait_inline(l, w, pending) {
+                        Ok(()) => {}
+                        Err(Code::Intr) => return Err(Code::Intr),
+                        Err(_) => return Ok(Discard::Discard { fenced: true }),
                     }
                 }
-                other => return other,
+                other => return Ok(other),
             }
         }
     }
@@ -560,8 +721,8 @@ impl crate::locks::LockFlush for View {
         // since — its data is discarded (reported at the next close).
         if let Some(l) = self.cluster_locks() {
             if matches!(
-                self.lock_take_discard(l, ino, false),
-                Discard::Discard { .. }
+                self.lock_take_discard(l, ino, false, &mut Waiter::cancel(None)),
+                Ok(Discard::Discard { .. })
             ) && self.discard_lock_writes(ino)
             {
                 l.note_discard(ino);

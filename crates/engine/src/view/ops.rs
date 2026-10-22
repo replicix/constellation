@@ -34,6 +34,18 @@ macro_rules! checked_name {
     };
 }
 
+/// Plan 43 C7-F lock-wait follow-ups: what an op's inline wait for a lapsing
+/// grant may end with — the op's cancellation and the registration its
+/// responder makes (`Responder::begin_wait`) — as a `Waiter`. A temporary:
+/// it borrows the responder only for the statement it is made in.
+macro_rules! waiter {
+    ($cx:expr, $r:ident) => {
+        super::lock_gate::Waiter::registering($cx.cancel, &mut || {
+            Responder::<_>::begin_wait(&mut $r)
+        })
+    };
+}
+
 /// The replica inode a frontend's `$ino` names, or answer `Stale` and
 /// return: the view's root renumbered, and confinement (`View::enter_ino`).
 macro_rules! enter {
@@ -60,8 +72,9 @@ macro_rules! admit {
                 // pending discard error (plan 39 §3.7): as with Linux's
                 // errseq, only `fsync` and close report one — `fsync`
                 // checks this fence itself, after `enter!`, for that.
-                if $self.lock_owner_fenced($cx) {
-                    $r.done(Err(Code::Io.into()));
+                let gate = $self.lock_owner_gate($cx, &mut waiter!($cx, $r));
+                if let Err(code) = gate {
+                    $r.done(Err(code.into()));
                     return;
                 }
                 admitted
@@ -105,6 +118,23 @@ macro_rules! admit {
 /// the op goes on: its fences then wait inline, bounded. One relaxed load
 /// while no grant is lapsing.
 macro_rules! park_gate {
+    // Lock-wait follow-ups (W2): the op found a lapsing grant at a fence,
+    // after its gate (before its admission) let it pass: parked now, as the
+    // gate would have, unless it is the run of an op already parked once.
+    (late, $self:expr, $cx:expr, $r:ident, $t:ty, $gate:expr, [$($prep:tt)*], |$v:ident, $c:ident, $r2:ident| $redo:expr) => {
+        if !View::lock_redispatched() {
+            let gate = $gate;
+            // Owned copies of what the op borrows: only on this path.
+            $($prep)*
+            match $self.park_op::<$t, _>($cx, gate, $r, move |$v, $c, $r2| $redo) {
+                Ok(()) => {
+                    $self.note_late_park();
+                    return;
+                }
+                Err(back) => $r = back,
+            }
+        }
+    };
     ($self:expr, $cx:expr, $r:ident, $t:ty, $gate:expr, [$($prep:tt)*], |$v:ident, $c:ident, $r2:ident| $redo:expr) => {
         if $self.lock_parking() {
             let gate = $gate;
@@ -167,7 +197,7 @@ impl Vfs for View {
         self.sync.as_ref().is_some_and(|h| h.cto_strict)
     }
 
-    fn lookup<R: Responder<Entry>>(&self, cx: &OpCtx<'_>, parent: Ino, name: &Name, r: R) {
+    fn lookup<R: Responder<Entry>>(&self, cx: &OpCtx<'_>, parent: Ino, name: &Name, mut r: R) {
         let _w = self.watch.enter("lookup", parent);
         admit!(self, cx, r, _admitted);
         let parent = enter!(self, parent, r);
@@ -286,7 +316,7 @@ impl Vfs for View {
         }
     }
 
-    fn getattr<R: Responder<Attr>>(&self, cx: &OpCtx<'_>, ino: Ino, _fh: Option<Fh>, r: R) {
+    fn getattr<R: Responder<Attr>>(&self, cx: &OpCtx<'_>, ino: Ino, _fh: Option<Fh>, mut r: R) {
         let _w = self.watch.enter("getattr", ino);
         admit!(self, cx, r, _admitted);
         let requested_ino = ino;
@@ -422,11 +452,16 @@ impl Vfs for View {
             }
             // Plan 30 §M14: a truncation is a write (fenced under a
             // lapsed lock grant).
-            if self.lock_fenced(ino) {
-                r.done(self.ino_err(ino, Code::Io));
+            let fenced = self.lock_fenced(ino, &mut waiter!(cx, r));
+            if let Err(code) = fenced {
+                r.done(self.ino_err(ino, code));
                 return;
             }
-            self.lock_discard_tainted_for_write(ino);
+            let discarded = self.lock_discard_tainted_for_write(ino, &mut waiter!(cx, r));
+            if let Err(code) = discarded {
+                r.done(self.ino_err(ino, code));
+                return;
+            }
             if let Err(error) = self.truncate(ino, new_size) {
                 r.done(self.ino_err(ino, error));
                 return;
@@ -487,7 +522,7 @@ impl Vfs for View {
         }
     }
 
-    fn readlink<R: Responder<Vec<u8>>>(&self, cx: &OpCtx<'_>, ino: Ino, r: R) {
+    fn readlink<R: Responder<Vec<u8>>>(&self, cx: &OpCtx<'_>, ino: Ino, mut r: R) {
         let _w = self.watch.enter("readlink", ino);
         admit!(self, cx, r, _admitted);
         let ino = enter!(self, ino, r);
@@ -970,7 +1005,8 @@ impl Vfs for View {
             // Plan 30 §M14: publishing the file is a publication point.
             // No description publishes here (`Fh(0)`): an earlier
             // discard stays owed to the application's descriptions.
-            if let Err(error) = self.lock_publish_gate(attr.ino, Fh(0)) {
+            let gate = self.lock_publish_gate(attr.ino, Fh(0), &mut waiter!(cx, r));
+            if let Err(error) = gate {
                 r.done(err(error));
                 return;
             }
@@ -1154,9 +1190,12 @@ impl Vfs for View {
         // Plan 30 §M14: opening for writing is a write (a read-only open
         // is not fenced: the fence must not stop a fenced owner from
         // reaching its own close).
-        if flags.intersects(OpenFlags::WRITE | OpenFlags::TRUNC) && self.lock_owner_fenced_any(cx) {
-            r.done(self.ino_err(ino, Code::Io));
-            return;
+        if flags.intersects(OpenFlags::WRITE | OpenFlags::TRUNC) {
+            let gate = self.lock_owner_gate_any(cx, &mut waiter!(cx, r));
+            if let Err(code) = gate {
+                r.done(self.ino_err(ino, code));
+                return;
+            }
         }
         let ino = enter!(self, ino, r);
         if let Some(node) = self.synthetic_node(ino) {
@@ -1255,7 +1294,8 @@ impl Vfs for View {
         let _inflight = self.inflight.enter(&[parent]);
         let name = checked_name!(self, name, r);
         let started = std::time::Instant::now();
-        let result = self.create_or_open(parent, &name, mode, flags, cx.caller);
+        let result =
+            self.create_or_open(parent, &name, mode, flags, cx.caller, &mut waiter!(cx, r));
         let took = started.elapsed();
         if took >= slow_fuse_op() {
             tracing::warn!(parent, name = %name, ?took, ok = result.is_ok(), "slow FUSE create");
@@ -1298,8 +1338,35 @@ impl Vfs for View {
             |v, c, r2| { <View as Vfs>::read(v, c, ino, fh, off, len, r2) }
         );
         let _w = self.watch.enter("read", ino);
-        admit!(self, cx, r, _admitted);
+        // The owner fence is checked below, with the inode's, where a
+        // lapsing grant parks the op (`admit!` waits inline for one).
+        admit!(self, cx, r, _admitted, owner_fence_checked_later);
         let ino = enter!(self, ino, r);
+        // Plan 43 C7-F lock-wait follow-ups (W2): a read runs on an
+        // io_uring ring's thread, which must not wait, and the park gate
+        // above looked before the admission (and at an estimate): a grant
+        // found lapsing here parks the op on the wait pool now, as the gate
+        // would have.
+        let gate = self.lock_read_gate(cx, ino);
+        if gate == super::lock_gate::ReadGate::Parked {
+            park_gate!(
+                late,
+                self,
+                cx,
+                r,
+                ReadData,
+                self.gate_io(ino, true, false),
+                [],
+                |v, c, r2| { <View as Vfs>::read(v, c, ino, fh, off, len, r2) }
+            );
+        }
+        if gate != super::lock_gate::ReadGate::Clear {
+            let owner_gate = self.lock_owner_gate(cx, &mut waiter!(cx, r));
+            if let Err(code) = owner_gate {
+                r.done(self.ino_err(ino, code));
+                return;
+            }
+        }
         // §6.12: a handle addresses only the inode it was opened on (the
         // view hands out one per open and knows its inode); anything else
         // was never given out.
@@ -1317,8 +1384,9 @@ impl Vfs for View {
             }
             return;
         }
-        if self.lock_fenced(ino) {
-            r.done(self.ino_err(ino, Code::Io));
+        let fenced = self.lock_fenced(ino, &mut waiter!(cx, r));
+        if let Err(code) = fenced {
+            r.done(self.ino_err(ino, code));
             return;
         }
         // A cold read defers to the completion pool (`io`'s module doc).
@@ -1391,11 +1459,16 @@ impl Vfs for View {
             r.done(self.ino_err(ino, code));
             return;
         }
-        if self.lock_fenced(ino) {
-            r.done(self.ino_err(ino, Code::Io));
+        let fenced = self.lock_fenced(ino, &mut waiter!(cx, r));
+        if let Err(code) = fenced {
+            r.done(self.ino_err(ino, code));
             return;
         }
-        self.lock_discard_tainted_for_write(ino);
+        let discarded = self.lock_discard_tainted_for_write(ino, &mut waiter!(cx, r));
+        if let Err(code) = discarded {
+            r.done(self.ino_err(ino, code));
+            return;
+        }
         let n = match self.do_write(ino, off, data.as_slice()) {
             Ok(n) if flags.contains(OpenFlags::SYNC) => n,
             Ok(n) => return r.done(Ok(n)),
@@ -1482,7 +1555,7 @@ impl Vfs for View {
         // descriptor's close, as POSIX says). The kernel sends no unlock
         // of its own: it keeps no lock for a file whose locks it forwards
         // (`lock_handles`' module doc), so this is the only one.
-        let gate = self.lock_publish_gate(ino, fh);
+        let gate = self.lock_publish_gate(ino, fh, &mut waiter!(cx, r));
         let idle = locks.map(|l| l.drop_owner(ino, owner.0));
         let published = gate.and_then(|owed| {
             let drain = publishes && self.publish_inode(ino, false)?;
@@ -1593,7 +1666,7 @@ impl Vfs for View {
                     .any(|held| owners.contains(&held.owner))
             });
         let publishing = crate::locks::begin_close(ino, ends_turn);
-        let gate = self.lock_publish_gate(ino, fh);
+        let gate = self.lock_publish_gate(ino, fh, &mut waiter!(cx, r));
         drop(_closed);
         // The open file description's own (OFD) locks end with it too. A
         // request waiting for them (`past_closing_locks`) asks again.
@@ -1727,18 +1800,22 @@ impl Vfs for View {
         let _w = self.watch.enter("fsync", ino);
         admit!(self, cx, r, _admitted, owner_fence_checked_later);
         let ino = enter!(self, ino, r);
-        if self.lock_owner_fenced(cx) {
+        let owner_gate = self.lock_owner_gate(cx, &mut waiter!(cx, r));
+        if let Err(code) = owner_gate {
             // This `EIO` also reports a discard this description has not
             // reported yet (plan 39 §3.7: once, not again after the fence
             // lifts).
-            self.lock_errors_reported(ino, fh);
-            r.done(self.ino_err(ino, Code::Io));
+            if code == Code::Io {
+                self.lock_errors_reported(ino, fh);
+            }
+            r.done(self.ino_err(ino, code));
             return;
         }
         // Plan 30 §M14: nothing written under a lapsed grant is made
         // durable (`lock_publish_gate`); a discard this description has
         // not reported yet is reported after the barrier.
-        let owed = match self.lock_publish_gate(ino, fh) {
+        let publish_gate = self.lock_publish_gate(ino, fh, &mut waiter!(cx, r));
+        let owed = match publish_gate {
             Ok(owed) => owed,
             Err(e) => {
                 // As the owner fence's `EIO` above: the report of every
@@ -1874,7 +1951,7 @@ impl Vfs for View {
         r.done(Ok(()));
     }
 
-    fn statfs<R: Responder<StatFs>>(&self, cx: &OpCtx<'_>, ino: Ino, r: R) {
+    fn statfs<R: Responder<StatFs>>(&self, cx: &OpCtx<'_>, ino: Ino, mut r: R) {
         let _w = self.watch.enter("statfs", ino);
         admit!(self, cx, r, _admitted);
         // §6.12: an inode outside the view answers `Stale` here too.
@@ -1943,11 +2020,16 @@ impl Vfs for View {
         // for the lease here (as before forwarding existed) made a
         // non-holder's `fallocate` wait out a busy holder for 2xTTL and
         // fail with EIO (stress-ng-fs-nodes: `iomix`, `fsize`, `sync-file`).
-        if self.lock_fenced(ino) {
-            r.done(self.ino_err(ino, Code::Io));
+        let fenced = self.lock_fenced(ino, &mut waiter!(cx, r));
+        if let Err(code) = fenced {
+            r.done(self.ino_err(ino, code));
             return;
         }
-        self.lock_discard_tainted_for_write(ino);
+        let discarded = self.lock_discard_tainted_for_write(ino, &mut waiter!(cx, r));
+        if let Err(code) = discarded {
+            r.done(self.ino_err(ino, code));
+            return;
+        }
         if len == 0 {
             r.done(self.ino_err(ino, Code::Invalid));
             return;
@@ -1965,7 +2047,7 @@ impl Vfs for View {
         _fh: Fh,
         off: u64,
         whence: SeekWhence,
-        r: R,
+        mut r: R,
     ) {
         let _w = self.watch.enter("lseek", ino);
         admit!(self, cx, r, _admitted);
@@ -2038,8 +2120,13 @@ impl Vfs for View {
             }
         };
         let _inflight = self.inflight.enter(&[src, dst]);
-        if self.lock_fenced(src) || self.lock_fenced(dst) {
-            r.done(self.ino_err(dst, Code::Io));
+        let fenced = self.lock_fenced(src, &mut waiter!(cx, r));
+        let fenced = match fenced {
+            Ok(()) => self.lock_fenced(dst, &mut waiter!(cx, r)),
+            err => err,
+        };
+        if let Err(code) = fenced {
+            r.done(self.ino_err(dst, code));
             return;
         }
         // Plan 39 §3.3: into an `O_SYNC`/`O_DSYNC` description, the copy
@@ -2108,7 +2195,13 @@ impl Vfs for View {
         });
     }
 
-    fn getxattr<R: Responder<Vec<u8>>>(&self, cx: &OpCtx<'_>, ino: Ino, name: &XattrName, r: R) {
+    fn getxattr<R: Responder<Vec<u8>>>(
+        &self,
+        cx: &OpCtx<'_>,
+        ino: Ino,
+        name: &XattrName,
+        mut r: R,
+    ) {
         let _w = self.watch.enter("getxattr", ino);
         admit!(self, cx, r, _admitted);
         let ino = enter!(self, ino, r);
@@ -2165,7 +2258,7 @@ impl Vfs for View {
         name: &XattrName,
         value: &[u8],
         flags: SetXattrFlags,
-        r: R,
+        mut r: R,
     ) {
         let _w = self.watch.enter("setxattr", ino);
         admit!(self, cx, r, _admitted);
@@ -2292,7 +2385,7 @@ impl Vfs for View {
         }
     }
 
-    fn listxattr<R: Responder<Vec<XattrNameBuf>>>(&self, cx: &OpCtx<'_>, ino: Ino, r: R) {
+    fn listxattr<R: Responder<Vec<XattrNameBuf>>>(&self, cx: &OpCtx<'_>, ino: Ino, mut r: R) {
         let _w = self.watch.enter("listxattr", ino);
         admit!(self, cx, r, _admitted);
         let ino = enter!(self, ino, r);
@@ -2318,7 +2411,7 @@ impl Vfs for View {
         }
     }
 
-    fn removexattr<R: Responder<()>>(&self, cx: &OpCtx<'_>, ino: Ino, name: &XattrName, r: R) {
+    fn removexattr<R: Responder<()>>(&self, cx: &OpCtx<'_>, ino: Ino, name: &XattrName, mut r: R) {
         let _w = self.watch.enter("removexattr", ino);
         admit!(self, cx, r, _admitted);
         let ino = enter!(self, ino, r);
@@ -2462,7 +2555,11 @@ impl Vfs for View {
         }
         // Data written under an earlier grant that ended without its
         // flush does not ride along under the new one.
-        self.lock_discard_tainted(ino);
+        let discarded = self.lock_discard_tainted(ino, &mut waiter!(cx, r));
+        if let Err(code) = discarded {
+            r.done(err(code));
+            return;
+        }
         // The request's bound, for every wait it takes on the way.
         let deadline = std::time::Instant::now() + crate::locks::close_wait();
         self.note_lock_handle(fh, ino, lock.owner.0, locks, deadline);

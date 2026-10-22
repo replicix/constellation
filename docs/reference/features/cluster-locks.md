@@ -590,6 +590,24 @@ under it, or a write made under it that may not be published yet — is
   a request it sent, so a wait that could not be interrupted would leave its
   process unkillable for as long as the park lasts. (A caught signal now
   gives `EINTR` from `read`/`write` during a park instead of `EIO`.)
+  An op the park gate did not hold — it looks before the op's admission and
+  at an estimate of the grant's end, so a grant that lapses while the op
+  queues, or after a forward step of the clock, passes it — meets the fence
+  later, and there it is **not** left to wait on whatever thread it is on:
+  a read, which runs on an io_uring ring's thread, is handed to the pool at
+  its fence (`lapse_late_parks`); any other op waits on its own thread (an
+  *inline* wait, `lapse_inline_waits`, `lapse_inline_wait_ms_total`) that
+  ends with its caller's signal (`EINTR`, `lapse_inline_interrupted`: the
+  op's cancellation, or the one its frontend registers for the wait when
+  asked, `Responder::begin_wait`; so does the wait of a mutation for its
+  fencing token), with the verdict, or at the lapse's bound — and never on
+  a ring thread (`fuser-ring-N`): there it is refused, `EIO` as before F-c,
+  counted `lapse_inline_refused_thread`, which a load campaign expects to
+  stay 0. Over a ring a wait with no lock-wait entry to hold is refused too
+  (`lapse_park_refused_ring`). (An op the frontend did not wrap to park —
+  it began more than a second before the grant's end, so it has no
+  registration to ask for — has only the verdict and the bound to end its
+  inline wait.)
 - The holder sends a **late renewal** of the same grant, routed like any
   renewal (the lease is read when the owner is not known), every
   `lock_poll_ms` (at most a second) until it is answered.
@@ -1816,7 +1834,12 @@ for both roles:
   waited), `lapse_park_interrupted` (ended by their caller's signal,
   `EINTR`), `lapse_park_refused_ring` and `lapse_park_refused_pool` (ops
   that could not be held, for want of a ring queue entry or a thread, and
-  failed `EIO` at once; 0 in every load campaign);
+  failed `EIO` at once; 0 in every load campaign), and `lapse_late_parks`,
+  `lapse_inline_waits`, `lapse_inline_wait_ms_total`,
+  `lapse_inline_interrupted` and `lapse_inline_refused_thread` (ops that
+  found the grant lapsing at a fence: parked there, waited on their own
+  thread, for how long in all, ended by a signal, refused on a ring thread;
+  see above);
 - sequencer side: `grants_table`, `grants_made`, `recalls_sent`,
   `recalls_released`, `recalls_expired`, `reclaimed`, `waiters_parked`,
   `grace_refusals`, `grace_wait_answers`, `not_yet_answers` and

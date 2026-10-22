@@ -424,10 +424,22 @@ mod tests {
         let next = Arc::new(Meta::open_in_memory().unwrap());
         let (new, _d2) = super::super::quota_tests::test_fs(next.clone());
         new.import_handles(&snapshot);
-        assert_eq!(new.lock_publish_gate(file.ino, fh), Ok(true), "still owed");
-        assert_eq!(new.lock_publish_gate(file.ino, fh), Ok(false), "once");
+        assert_eq!(
+            new.lock_publish_gate(file.ino, fh, &mut super::lock_gate::Waiter::cancel(None)),
+            Ok(true),
+            "still owed"
+        );
+        assert_eq!(
+            new.lock_publish_gate(file.ino, fh, &mut super::lock_gate::Waiter::cancel(None)),
+            Ok(false),
+            "once"
+        );
         assert!(next.locks().note_discard(file.ino) > seq, "numbered above");
-        assert_eq!(new.lock_publish_gate(file.ino, fh), Ok(true), "a newer one");
+        assert_eq!(
+            new.lock_publish_gate(file.ino, fh, &mut super::lock_gate::Waiter::cancel(None)),
+            Ok(true),
+            "a newer one"
+        );
     }
 
     #[test]

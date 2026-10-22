@@ -57325,3 +57325,42 @@ up, once per request, and the engine asks again as a fresh request every
 - Tests (fail before, sharing disabled): thirty requests make one read, ten
   more within the quarter second make none, one after it reads again; a
   shared read serves the requests that waited when the first is gone.
+
+### W1, W2: inline waits for a lapsing grant are interruptible and never on a ring thread
+
+The park gate (before an op's admission, at an estimate of the grant's end)
+holds the ops that would meet a lapsing grant without a thread. One it
+misses — the grant lapses while the op queues for admission or for its
+staging, or after a forward step of the clock — met the fence later and
+waited there inline, 10 ms polls for up to 117 s, with no cancellation; a
+read does so on an io_uring ring's thread, which stalls every request of
+its CPUs.
+
+- `View::lock_wait_inline` takes a `Waiter`: the op's cancellation and, for
+  an op that has a responder at hand (`waiter!`), the registration it offers
+  (`Responder::begin_wait`: the signal's token for an op that carries none,
+  a lock-wait entry over a ring). The wait ends with the token (`EINTR`,
+  `lapse_inline_interrupted`), the verdict, or the bound. Over a ring a
+  wait with no entry to hold is refused (`lapse_park_refused_ring`), as a
+  park is. The fence sites (`lock_fenced`, `lock_owner_gate`,
+  `lock_take_discard`, `lock_publish_gate`, `lock_discard_tainted*`) return
+  `Result<_, Code>` so that `EINTR` reaches the caller; `copy_range` and the
+  create path's truncation pass their own.
+- The mutation's waits for its fencing token (`current_tag`) and before a
+  refused mutation goes again (`reissue_after_lapse`, now `Reissue::{Yes,
+  No, Interrupted}`) end with the cancellation of the op's context too (the
+  scope carries it).
+- Never on a ring thread (`fuser-ring-N`, the vendored fuser's thread
+  names): a read's fences are one look after its admission
+  (`lock_read_gate`), and a grant found lapsing there parks the op on the
+  pool (`park_gate!(late, ..)`, `lapse_late_parks`); an op that cannot park
+  and would wait on a ring thread is refused `EIO`, as before F-c, counted
+  `lapse_inline_refused_thread` (the campaign's judge fails on it).
+- Counted: `lapse_inline_waits`, `lapse_inline_wait_ms_total`.
+- Tests (fail before, each fix reverted in turn): an inline wait ends with
+  its caller's signal within a poll, the responder registered the wait once,
+  a frontend with no entry to hold it is refused; a read that finds a lapse
+  at its fence (a forward step of the clock leaves the gate's estimate
+  behind) returns from a ring thread at once and runs from the pool; an
+  inline wait on a ring thread is refused; a mutation's waits end with its
+  caller's signal.

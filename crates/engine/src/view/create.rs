@@ -101,6 +101,7 @@ impl View {
         mode: u32,
         flags: OpenFlags,
         caller: &Caller,
+        w: &mut super::lock_gate::Waiter<'_>,
     ) -> Result<(FileAttr, bool), Code> {
         let excl = flags.contains(OpenFlags::EXCL);
         let scratch = self.meta.is_scratch_dir(parent).unwrap_or(false)
@@ -136,7 +137,9 @@ impl View {
             match created {
                 Ok(attr) => return Ok((attr, true)),
                 Err(Code::Exists) if !excl => {
-                    if let Some(attr) = self.open_existing(parent, name, flags, caller, scratch)? {
+                    if let Some(attr) =
+                        self.open_existing(parent, name, flags, caller, scratch, w)?
+                    {
                         tracing::debug!(
                             parent,
                             name,
@@ -157,12 +160,15 @@ impl View {
 
     /// `setattr(size)` alone — what `ftruncate` and an `O_TRUNC` open
     /// send (`setattr` with only a size does exactly this).
-    pub(super) fn setattr_size(&self, ino: Ino, size: u64) -> Result<(), Code> {
+    pub(super) fn setattr_size(
+        &self,
+        ino: Ino,
+        size: u64,
+        w: &mut super::lock_gate::Waiter<'_>,
+    ) -> Result<(), Code> {
         // Plan 30 §M14: a truncation is a write (fenced under a lapsed
         // lock grant).
-        if self.lock_fenced(ino) {
-            return Err(Code::Io);
-        }
+        self.lock_fenced(ino, w)?;
         self.truncate(ino, size)?;
         match self.mutate_op(
             ino,
@@ -195,6 +201,7 @@ impl View {
         flags: OpenFlags,
         caller: &Caller,
         scratch: bool,
+        w: &mut super::lock_gate::Waiter<'_>,
     ) -> Result<Option<FileAttr>, Code> {
         let found = if scratch {
             self.meta
@@ -230,7 +237,7 @@ impl View {
         }
         if flags.contains(OpenFlags::TRUNC) {
             // What the kernel's `handle_truncate` would have sent.
-            self.setattr_size(ino, 0)?;
+            self.setattr_size(ino, 0, w)?;
         }
         // The current attributes, a pending write's size included (as a
         // lookup reports them).
@@ -254,6 +261,10 @@ mod tests {
         Caller::new(1000, 1000, None)
     }
 
+    fn no_wait() -> super::super::lock_gate::Waiter<'static> {
+        super::super::lock_gate::Waiter::cancel(None)
+    }
+
     fn fs() -> (Arc<Meta>, View, tempfile::TempDir) {
         let meta = Arc::new(Meta::open_in_memory().unwrap());
         let (fs, dir) = super::super::quota_tests::test_fs(meta.clone());
@@ -266,7 +277,7 @@ mod tests {
         for flags in [RDWR, RDWR | OpenFlags::EXCL] {
             let name = format!("new-{}", flags.bits());
             let (attr, created) = fs
-                .create_or_open(ROOT_INO, &name, 0o100644, flags, &me())
+                .create_or_open(ROOT_INO, &name, 0o100644, flags, &me(), &mut no_wait())
                 .unwrap();
             assert!(created);
             assert_eq!(attr.kind, InodeKind::File);
@@ -284,14 +295,21 @@ mod tests {
         let won = meta.create(ROOT_INO, "db", 0o644, 1000, 1000).unwrap();
         for flags in [RDWR, WRONLY, RDONLY] {
             let (attr, created) = fs
-                .create_or_open(ROOT_INO, "db", 0o100644, flags, &me())
+                .create_or_open(ROOT_INO, "db", 0o100644, flags, &me(), &mut no_wait())
                 .unwrap();
             assert!(!created, "flags {flags:?}");
             assert_eq!(attr.ino, won.ino);
         }
         assert_eq!(
-            fs.create_or_open(ROOT_INO, "db", 0o100644, RDWR | OpenFlags::EXCL, &me())
-                .unwrap_err(),
+            fs.create_or_open(
+                ROOT_INO,
+                "db",
+                0o100644,
+                RDWR | OpenFlags::EXCL,
+                &me(),
+                &mut no_wait()
+            )
+            .unwrap_err(),
             Code::Exists
         );
         // Nothing else was created under the name.
@@ -305,7 +323,14 @@ mod tests {
         meta.setattr(won.ino, None, None, None, Some(40), None, None)
             .unwrap();
         let (attr, created) = fs
-            .create_or_open(ROOT_INO, "f", 0o100644, RDWR | OpenFlags::TRUNC, &me())
+            .create_or_open(
+                ROOT_INO,
+                "f",
+                0o100644,
+                RDWR | OpenFlags::TRUNC,
+                &me(),
+                &mut no_wait(),
+            )
             .unwrap();
         assert!(!created);
         assert_eq!(attr.ino, won.ino);
@@ -317,7 +342,7 @@ mod tests {
         meta.setattr(won.ino, None, None, None, Some(7), None, None)
             .unwrap();
         let (attr, _) = fs
-            .create_or_open(ROOT_INO, "f", 0o100644, RDWR, &me())
+            .create_or_open(ROOT_INO, "f", 0o100644, RDWR, &me(), &mut no_wait())
             .unwrap();
         assert_eq!(attr.size, 7);
     }
@@ -338,7 +363,7 @@ mod tests {
         )
         .unwrap();
         let open = |name: &str| {
-            fs.create_or_open(ROOT_INO, name, 0o100644, RDWR, &me())
+            fs.create_or_open(ROOT_INO, name, 0o100644, RDWR, &me(), &mut no_wait())
                 .unwrap_err()
         };
         assert_eq!(open("d"), Code::IsDir);
@@ -354,7 +379,7 @@ mod tests {
         meta.create(ROOT_INO, "group-r", 0o640, 2000, 1000).unwrap();
         meta.create(ROOT_INO, "other-r", 0o644, 2000, 2000).unwrap();
         let open = |name: &str, flags: OpenFlags, who: &Caller| {
-            fs.create_or_open(ROOT_INO, name, 0o100644, flags, who)
+            fs.create_or_open(ROOT_INO, name, 0o100644, flags, who, &mut no_wait())
                 .map(|(_, created)| created)
         };
         assert_eq!(open("mine", RDWR, &me()), Ok(false));

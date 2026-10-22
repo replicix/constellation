@@ -1711,6 +1711,11 @@ struct ScopeState {
     locks: Arc<ClusterLocks>,
     pid: Option<u32>,
     lock_owner: Option<u64>,
+    /// The op's cancellation, which ends the wait for a grant that is
+    /// lapsing (plan 43 C7-F lock-wait follow-ups, W1): `EINTR`.
+    cancel: Option<CancelToken>,
+    /// The wait for the grant ended with `cancel`.
+    interrupted: bool,
     /// Worked out (and announced in flight) at the first mutation; a
     /// scope entered with a fixed tag has it from the start.
     tag: Option<Result<LockTag, OwnerFenced>>,
@@ -1789,11 +1794,13 @@ pub struct ScopeCaller {
     locks: Arc<ClusterLocks>,
     pid: Option<u32>,
     lock_owner: Option<u64>,
+    cancel: Option<CancelToken>,
 }
 
 impl ScopeCaller {
     pub fn enter(&self) -> TagScope {
-        self.locks.tag_scope(self.pid, self.lock_owner)
+        self.locks
+            .tag_scope(self.pid, self.lock_owner, self.cancel.as_ref())
     }
 }
 
@@ -1801,7 +1808,12 @@ impl ClusterLocks {
     /// Enter the fencing-token scope of an op by `pid` / `lock_owner` on
     /// this thread (see [`ScopeState`]). One relaxed load, and nothing
     /// else, while no local lock exists on this node.
-    pub fn tag_scope(self: &Arc<Self>, pid: Option<u32>, lock_owner: Option<u64>) -> TagScope {
+    pub fn tag_scope(
+        self: &Arc<Self>,
+        pid: Option<u32>,
+        lock_owner: Option<u64>,
+        cancel: Option<&CancelToken>,
+    ) -> TagScope {
         if self.meta.locks().lockers_none() {
             return TagScope::inert();
         }
@@ -1809,6 +1821,8 @@ impl ClusterLocks {
             locks: self.clone(),
             pid,
             lock_owner,
+            cancel: cancel.cloned(),
+            interrupted: false,
             tag: None,
             sent: LockTag::NONE,
             doubt: LockTag::NONE,
@@ -1830,6 +1844,8 @@ impl ClusterLocks {
             locks: self.clone(),
             pid: None,
             lock_owner: None,
+            cancel: None,
+            interrupted: false,
             tag: Some(Ok(tag)),
             sent: LockTag::NONE,
             doubt: LockTag::NONE,
@@ -1846,6 +1862,7 @@ pub fn scope_caller() -> Option<ScopeCaller> {
             locks: st.locks.clone(),
             pid: st.pid,
             lock_owner: st.lock_owner,
+            cancel: st.cancel.clone(),
         })
     })
 }
@@ -1874,12 +1891,30 @@ pub fn current_tag() -> Result<LockTag, Code> {
                 if tag.is_err() {
                     let started = std::time::Instant::now();
                     let bound = st.locks.owner_wait_max + PARK_BOUND_SLACK;
+                    let mut waited = false;
                     while tag.is_err()
                         && started.elapsed() < bound
                         && st.locks.owner_fenced(st.pid, st.lock_owner) == Fence::Parked
                     {
+                        if st.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+                            st.interrupted = true;
+                            break;
+                        }
+                        if !std::mem::replace(&mut waited, true) {
+                            st.locks
+                                .meta
+                                .locks()
+                                .with_stats(|s| s.lapse_inline_waits += 1);
+                        }
                         std::thread::sleep(Duration::from_millis(10));
                         tag = st.locks.caller_tag(st.pid, st.lock_owner);
+                    }
+                    if waited {
+                        let ms = started.elapsed().as_millis() as u64;
+                        st.locks.meta.locks().with_stats(|s| {
+                            s.lapse_inline_wait_ms_total += ms;
+                            s.lapse_inline_interrupted += u64::from(st.interrupted);
+                        });
                     }
                 }
                 if let Ok(t) = &tag {
@@ -1899,6 +1934,12 @@ pub fn current_tag() -> Result<LockTag, Code> {
             fresh
         });
         tag.map_err(|OwnerFenced| {
+            // Its caller's signal ended the wait for a grant that is
+            // lapsing: nothing is decided about the grant (the op ends
+            // `EINTR`, as a parked one does).
+            if st.interrupted {
+                return Code::Intr;
+            }
             // What it publishes now was written under that lock: never
             // published (see `take_lapsed`).
             note_lapsed();
@@ -1921,29 +1962,65 @@ pub fn current_tag() -> Result<LockTag, Code> {
 /// replay that waited), not an ended grant: an ended grant is renewed no
 /// more, so this is `false` again soon and the op is not re-sent for
 /// ever.
-pub fn reissue_after_lapse() -> bool {
+pub fn reissue_after_lapse() -> Reissue {
     SCOPE.with(|s| {
         let s = s.borrow();
         let Some(st) = s.as_ref() else {
-            return false;
+            return Reissue::No;
         };
         if st.sent.is_empty() {
-            return false;
+            return Reissue::No;
         }
         let locks = st.locks.meta.locks();
         // Plan 43 C7-F F-c: a grant this mutation was issued under that is
         // lapsing is waited for (its owner admits or refuses a late
         // renewal): the op sent under its old window, which the executor
-        // refused as lapsed, goes again under the renewed one.
+        // refused as lapsed, goes again under the renewed one. Lock-wait
+        // follow-ups (W1): its caller's signal ends the wait (`EINTR`), and
+        // the wait is counted with the other inline waits.
         let started = std::time::Instant::now();
         let bound = st.locks.owner_wait_max + PARK_BOUND_SLACK;
+        let mut waited = false;
+        let mut interrupted = false;
         while locks.tag_lapsing(&st.sent, now()) && started.elapsed() < bound {
+            if st.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+                interrupted = true;
+                break;
+            }
+            if !std::mem::replace(&mut waited, true) {
+                locks.with_stats(|s| s.lapse_inline_waits += 1);
+            }
             std::thread::sleep(Duration::from_millis(10));
+        }
+        if waited {
+            let ms = started.elapsed().as_millis() as u64;
+            locks.with_stats(|s| {
+                s.lapse_inline_wait_ms_total += ms;
+                s.lapse_inline_interrupted += u64::from(interrupted);
+            });
+        }
+        if interrupted {
+            return Reissue::Interrupted;
         }
         let now = now();
         let fresh = locks.refresh_tag(&st.sent, now);
-        fresh != st.sent && locks.tag_honoured(&fresh, now)
+        if fresh != st.sent && locks.tag_honoured(&fresh, now) {
+            Reissue::Yes
+        } else {
+            Reissue::No
+        }
     })
+}
+
+/// What [`reissue_after_lapse`] decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reissue {
+    /// Send the mutation again under a fresh rid and token.
+    Yes,
+    /// It stays refused (`EIO`).
+    No,
+    /// Its caller's signal came while it waited (`EINTR`).
+    Interrupted,
 }
 
 /// A tagged mutation of this op ended in doubt (it may still execute

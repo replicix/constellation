@@ -297,10 +297,16 @@ impl View {
             // ended grant. Nothing ran (a refusal is never journaled), so
             // the op goes again under a fresh rid and token; dropped, a
             // continuously renewed holder's write failed with `EIO`.
-            if matches!(result, Err(MutateFail::LockLapsed))
-                && reissued < LAPSED_REISSUES
-                && crate::locks::reissue_after_lapse()
-            {
+            let again =
+                if matches!(result, Err(MutateFail::LockLapsed)) && reissued < LAPSED_REISSUES {
+                    crate::locks::reissue_after_lapse()
+                } else {
+                    crate::locks::Reissue::No
+                };
+            if again == crate::locks::Reissue::Interrupted {
+                break Err(MutateFail::Errno(Code::Intr));
+            }
+            if again == crate::locks::Reissue::Yes {
                 reissued += 1;
                 let old = rid;
                 rid = new_rid();
@@ -354,7 +360,10 @@ impl View {
         // An owner fenced here (its lock under no honoured grant) is
         // refused as a lapsed grant is: `EIO`, and a close's content kept
         // aside (`flush_inode`).
-        let tag = crate::locks::current_tag().map_err(|_| MutateFail::LockLapsed)?;
+        let tag = crate::locks::current_tag().map_err(|code| match code {
+            Code::Intr => MutateFail::Errno(Code::Intr),
+            _ => MutateFail::LockLapsed,
+        })?;
         // One reading of the protocol clock for everything this op decides
         // at its admission (the delegation's and the lease's honour window,
         // the handoff pause, the token check, the activity stamp, the read

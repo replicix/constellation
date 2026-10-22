@@ -5,6 +5,7 @@
 //! on the node does not; the fence lifts with the owner's unlock.
 use super::durable_ack_tests::holder_fs;
 use super::*;
+use crate::locks::Reissue;
 use constellation_authority::HonourMs;
 use constellation_fs_core::types::ROOT_INO;
 use constellation_meta::locks::{Fence, GrantId, HeldGrant, LockMode};
@@ -768,7 +769,7 @@ fn the_lock_owners_mutations_carry_its_grant_and_nobody_elses_do() {
     let locks = f.fs.cluster_locks().unwrap().clone();
     let grant = GrantId { node: 9, seq: 1 };
     {
-        let _scope = locks.tag_scope(Some(me), None);
+        let _scope = locks.tag_scope(Some(me), None, None);
         let tag = crate::locks::current_tag().unwrap();
         // The token: the honour window minted on the wall clock now.
         assert_eq!(tag.0.len(), 1);
@@ -788,7 +789,7 @@ fn the_lock_owners_mutations_carry_its_grant_and_nobody_elses_do() {
         None
     );
     {
-        let _scope = locks.tag_scope(other.pid, None);
+        let _scope = locks.tag_scope(other.pid, None, None);
         assert!(crate::locks::current_tag().unwrap().is_empty());
     }
     // Through the view: the owner's create journals its token.
@@ -821,7 +822,7 @@ fn an_op_that_passed_the_fence_then_stalled_past_its_grant_is_refused() {
     let (turn, _) = f.create(&root, ROOT_INO, "turn.lock").unwrap();
     f.lock(turn.attr.ino, me, crate::locks::now().honour.plus(300));
     let locks = f.fs.cluster_locks().unwrap().clone();
-    let _scope = locks.tag_scope(Some(me), None);
+    let _scope = locks.tag_scope(Some(me), None, None);
     assert_eq!(
         locks.owner_fenced(Some(me), None),
         Fence::Ok,
@@ -894,7 +895,7 @@ fn an_op_sent_after_a_renewal_carries_the_renewed_window() {
     let first = crate::locks::now().honour.plus(300);
     f.lock(turn.attr.ino, me, first);
     let locks = f.fs.cluster_locks().unwrap().clone();
-    let _scope = locks.tag_scope(Some(me), None);
+    let _scope = locks.tag_scope(Some(me), None, None);
     // Taken at the op's start (as `flush` and `release` do).
     // Minted on the wall clock from the honour window (plan 43 C7-H1, R8).
     let minted = crate::locks::current_tag().unwrap().0[0].until_ms;
@@ -942,22 +943,35 @@ fn a_refused_op_is_reissued_only_under_a_renewed_honoured_grant() {
     let (turn, _) = f.create(&root, ROOT_INO, "turn.lock").unwrap();
     f.lock(turn.attr.ino, me, crate::locks::now().honour.plus(300));
     let locks = f.fs.cluster_locks().unwrap().clone();
-    let _scope = locks.tag_scope(Some(me), None);
-    assert!(!crate::locks::reissue_after_lapse(), "nothing sent yet");
+    let _scope = locks.tag_scope(Some(me), None, None);
+    assert_eq!(
+        crate::locks::reissue_after_lapse(),
+        Reissue::No,
+        "nothing sent yet"
+    );
     crate::locks::current_tag().unwrap();
-    assert!(
-        !crate::locks::reissue_after_lapse(),
+    assert_eq!(
+        crate::locks::reissue_after_lapse(),
+        Reissue::No,
         "the window did not move"
     );
     let mut h = f.meta.locks().held(turn.attr.ino).unwrap();
     h.until = crate::locks::now().honour.plus(5_000);
     f.meta.locks().install_held(turn.attr.ino, h);
-    assert!(crate::locks::reissue_after_lapse(), "renewed and honoured");
+    assert_eq!(
+        crate::locks::reissue_after_lapse(),
+        Reissue::Yes,
+        "renewed and honoured"
+    );
     // The re-sent op takes the renewed window: nothing left to re-issue.
     crate::locks::current_tag().unwrap();
-    assert!(!crate::locks::reissue_after_lapse());
+    assert_eq!(crate::locks::reissue_after_lapse(), Reissue::No);
     crate::locks::advance_test_clock(6_000);
-    assert!(!crate::locks::reissue_after_lapse(), "no longer honoured");
+    assert_eq!(
+        crate::locks::reissue_after_lapse(),
+        Reissue::No,
+        "no longer honoured"
+    );
 }
 
 /// Must-fix 2: a commit refused for a lock grant that truly ended (here
@@ -978,7 +992,7 @@ fn a_commit_refused_for_an_ended_grant_becomes_a_conflict_copy() {
     let cx = OpCtx::new(OpKind::Write, &owner);
     assert_eq!(f.write(&cx, ino, opened.fh), Ok(6));
     let locks = f.fs.cluster_locks().unwrap().clone();
-    let _scope = locks.tag_scope(Some(me), None);
+    let _scope = locks.tag_scope(Some(me), None, None);
     crate::locks::current_tag().unwrap();
     // The grant lapses after the close's fence check, before its commit.
     crate::locks::advance_test_clock(400);
@@ -1156,7 +1170,7 @@ fn a_refused_commits_copy_stays_in_the_view_and_keeps_its_owner() {
     let cx = OpCtx::new(OpKind::Write, &owner);
     assert_eq!(f.write(&cx, ino, opened.fh), Ok(6));
     let locks = f.fs.cluster_locks().unwrap().clone();
-    let _scope = locks.tag_scope(Some(me), None);
+    let _scope = locks.tag_scope(Some(me), None, None);
     crate::locks::current_tag().unwrap();
     crate::locks::advance_test_clock(400);
     assert_eq!(f.fs.flush_inode(ino, false), Err(Code::Io));
@@ -1558,7 +1572,7 @@ fn a_non_blocking_lock_waits_for_the_earlier_turns_close_publication() {
         // The earlier turn's close, tagged with the grant while 0xa held
         // its lock, still publishing the file after the lock is gone.
         s.spawn(|| {
-            let _scope = locks.tag_scope(Some(me), Some(0xa));
+            let _scope = locks.tag_scope(Some(me), Some(0xa), None);
             let _publishing = crate::locks::begin_close(ino, true);
             tagged.send(()).unwrap();
             std::thread::sleep(Duration::from_millis(20));
@@ -1799,7 +1813,7 @@ fn a_non_blocking_lock_does_not_wait_for_another_threads_unanswered_op() {
         // The other thread's op, tagged with the grant while 0xa held its
         // lock, unanswered until the lock request below is.
         s.spawn(move || {
-            let _scope = locks.tag_scope(Some(me), Some(0xa));
+            let _scope = locks.tag_scope(Some(me), Some(0xa), None);
             crate::locks::current_tag().unwrap();
             tagged.send(()).unwrap();
             let _ = done.recv_timeout(Duration::from_secs(10));
@@ -1839,7 +1853,7 @@ fn a_new_turn_waits_for_an_op_in_doubt_before_its_scope_ends() {
     let (answered, done) = std::sync::mpsc::channel::<()>();
     std::thread::scope(|s| {
         s.spawn(move || {
-            let _scope = locks.tag_scope(Some(me), Some(0xa));
+            let _scope = locks.tag_scope(Some(me), Some(0xa), None);
             crate::locks::current_tag().unwrap();
             crate::locks::note_tag_in_doubt(None);
             tagged.send(()).unwrap();

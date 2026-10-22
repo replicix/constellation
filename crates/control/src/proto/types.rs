@@ -1775,6 +1775,17 @@ pub struct LockStatus {
     pub lapse_park_interrupted: u64,
     pub lapse_park_refused_ring: u64,
     pub lapse_park_refused_pool: u64,
+    /// Plan 43 C7-F lock-wait follow-ups: ops that found a lapsing grant
+    /// at a fence after their park gate had let them pass, and the ones
+    /// handed to the wait pool then; the ones that waited on their own
+    /// thread (and for how long, in all); those ended by their caller's
+    /// signal; those refused the wait because the thread is a ring's
+    /// (`EIO`; a campaign expects none).
+    pub lapse_late_parks: u64,
+    pub lapse_inline_waits: u64,
+    pub lapse_inline_wait_ms_total: u64,
+    pub lapse_inline_interrupted: u64,
+    pub lapse_inline_refused_thread: u64,
     /// Plan 43 C7-F F-c, owner side: late renewals admitted (a settled
     /// record or its lapsed memory proved no conflicting grant was issued
     /// since) and refused.

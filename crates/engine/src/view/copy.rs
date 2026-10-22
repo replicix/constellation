@@ -241,18 +241,13 @@ impl View {
         // What `read` and `write` check at their start (`admit!`, the lock
         // fence), per step: a long copy is a run of them, and a grant can
         // lapse between two.
-        if self
-            .cluster_locks()
-            .is_some_and(|l| self.lock_owner_fenced_for(l, caller.pid, caller.lock_owner, None))
-        {
-            return Err((dst, Code::Io));
+        let mut w = super::lock_gate::Waiter::cancel(cancel);
+        if let Some(l) = self.cluster_locks() {
+            self.lock_owner_gate_for(l, caller.pid, caller.lock_owner, &mut w)
+                .map_err(|code| (dst, code))?;
         }
-        if self.lock_fenced(src) {
-            return Err((src, Code::Io));
-        }
-        if self.lock_fenced(dst) {
-            return Err((dst, Code::Io));
-        }
+        self.lock_fenced(src, &mut w).map_err(|code| (src, code))?;
+        self.lock_fenced(dst, &mut w).map_err(|code| (dst, code))?;
         self.admission
             .admit_staging_until(want, deadline)
             .map_err(|code| (dst, code))?;
@@ -273,7 +268,8 @@ impl View {
                 buf
             }
         };
-        self.lock_discard_tainted_for_write(dst);
+        self.lock_discard_tainted_for_write(dst, &mut w)
+            .map_err(|code| (dst, code))?;
         let n = self
             .do_write(dst, pos_out, bytes)
             .map_err(|code| (dst, code))?;

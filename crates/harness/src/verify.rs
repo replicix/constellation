@@ -963,7 +963,8 @@ pub struct Evidence {
     pub grace_refused: HashMap<String, u64>,
     /// Per node, the ops parked behind a lapsing lock grant that could not
     /// be held (`locks.lapse_park_refused_ring`/`_pool`, plan 43 C7-F F-c:
-    /// no ring entry, no thread) and were answered `EIO` at once: none may.
+    /// no ring entry, no thread; `lapse_inline_refused_thread`: a wait at a
+    /// fence on a ring's thread) and were answered `EIO` at once: none may.
     pub park_refused: HashMap<String, u64>,
     pub acquire_deadline: Duration,
     /// Allow an `EIO` in doubt past the deadline
@@ -1012,6 +1013,9 @@ impl Evidence {
                 .map(|s| {
                     s["locks"]["lapse_park_refused_ring"].as_u64().unwrap_or(0)
                         + s["locks"]["lapse_park_refused_pool"].as_u64().unwrap_or(0)
+                        + s["locks"]["lapse_inline_refused_thread"]
+                            .as_u64()
+                            .unwrap_or(0)
                 })
                 .unwrap_or(0);
             *park_refused.entry(c.name.clone()).or_insert(0) += p;

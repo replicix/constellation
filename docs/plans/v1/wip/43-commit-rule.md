@@ -3417,6 +3417,14 @@ successor whose clock is ahead got no quarantine").
   successors (no mirror), a TTL or released takeover, a predecessor that
   died, locks in delegated subtrees whose delegate's authority lapsed with
   the root's.
+  *Lock-wait follow-ups (the review's W1, W2; landed):* the inline waits
+  of ops the park gate did not hold are interruptible (the op's
+  cancellation, the registration its responder makes for the wait; the
+  mutations' own waits for their token too), never made on a ring
+  thread (a read parks on the pool at its fence; any other op that would
+  wait there is refused `EIO` as before F-c), and counted in status
+  (`lapse_inline_waits`, `_wait_ms_total`, `_interrupted`,
+  `_refused_thread`, `lapse_late_parks`).
 
 F-a changes the floor's argument by one step (the floor ends at the
 earlier of the bound and the cap, each sufficient on its own); F-b and

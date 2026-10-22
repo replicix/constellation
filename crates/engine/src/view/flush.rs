@@ -1324,7 +1324,10 @@ impl View {
             |base, manifest_bytes, file_len, dirty_hashes| {
                 // Plan 30 §M14 phase 2: the holder's own commit carries the
                 // fencing token too (checked here, recorded for a replay).
-                let tag = crate::locks::current_tag().map_err(|_| MutateFail::LockLapsed)?;
+                let tag = crate::locks::current_tag().map_err(|code| match code {
+                    Code::Intr => MutateFail::Errno(Code::Intr),
+                    _ => MutateFail::LockLapsed,
+                })?;
                 self.meta
                     .with_lock_tag(&tag, crate::locks::now(), || {
                         self.meta.set_manifest_dirty(

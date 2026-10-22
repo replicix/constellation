@@ -4522,6 +4522,32 @@
           "minimum": 0,
           "type": "integer"
         },
+        "lapse_inline_interrupted": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lapse_inline_refused_thread": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lapse_inline_wait_ms_total": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lapse_inline_waits": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lapse_late_parks": {
+          "description": "Plan 43 C7-F lock-wait follow-ups: ops that found a lapsing grant\nat a fence after their park gate had let them pass, and the ones\nhanded to the wait pool then; the ones that waited on their own\nthread (and for how long, in all); those ended by their caller's\nsignal; those refused the wait because the thread is a ring's\n(`EIO`; a campaign expects none).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "lapse_park_gave_up": {
           "format": "uint64",
           "minimum": 0,
@@ -4875,6 +4901,11 @@
         "lapse_park_interrupted",
         "lapse_park_refused_ring",
         "lapse_park_refused_pool",
+        "lapse_late_parks",
+        "lapse_inline_waits",
+        "lapse_inline_wait_ms_total",
+        "lapse_inline_interrupted",
+        "lapse_inline_refused_thread",
         "late_admitted",
         "late_refused",
         "mirror_final_sent",

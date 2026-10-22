@@ -715,6 +715,20 @@ pub struct LockStats {
     pub lapse_park_refused_pool: u64,
     /// Parked ops ended by their caller's signal (`EINTR`).
     pub lapse_park_interrupted: u64,
+    /// Lock-wait follow-ups (W1, W2): ops the park gate did not hold (a
+    /// lapse its estimate missed, or one that began while the op queued)
+    /// that found a lapsing grant at a fence, and the ones among them handed
+    /// to the wait pool then (`lapse_late_parks`: reads, which run on a
+    /// ring's thread); the ones that waited on their own thread
+    /// (`lapse_inline_waits`, and the time they took); those ended by their
+    /// caller's signal (`EINTR`); and those refused the wait because the
+    /// thread is a ring's (`EIO`, as before F-c). A campaign expects the
+    /// last to stay 0.
+    pub lapse_late_parks: u64,
+    pub lapse_inline_waits: u64,
+    pub lapse_inline_wait_ms_total: u64,
+    pub lapse_inline_interrupted: u64,
+    pub lapse_inline_refused_thread: u64,
     /// Sequencer side: late renewals admitted (the grant's continuity
     /// proven: a settled record, or its memory) and refused (`Lost`).
     pub late_admitted: u64,
