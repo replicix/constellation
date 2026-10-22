@@ -587,7 +587,14 @@ fn live_speculation_touches(
     for (seq, _) in read_live(r, meta)? {
         if let Some(v) = r.get(&meta.spec, seq_key(seq))? {
             let row: SpecRow = postcard::from_bytes(&v)?;
-            let theirs = TouchSet::from_records(row.records.iter());
+            let mut theirs = TouchSet::from_records(row.records.iter());
+            // The inodes it changed but names no record by (plan 45
+            // review of the follow-ups): a shadowed `unlink a` whose
+            // inode the holder had linked to `b` meanwhile orphans the
+            // inode here; a hint `Create { b, X }` installed over that
+            // wrote a fresh `X` (size 0, no manifest) that reads of `b`
+            // were answered from.
+            captured_files(&row, &mut theirs);
             if theirs.dentries.iter().any(|d| touches.dentries.contains(d))
                 || theirs.inos.iter().any(|i| touches.inos.contains(i))
             {
@@ -622,7 +629,9 @@ fn hint_names_a_held_inode(
             } => (*parent, name.as_str(), *ino),
             _ => continue,
         };
-        if ns::get_inode_record(r, &meta.ns, ino)?.is_some()
+        // An orphan (no name left here, kept for its open handles or
+        // its speculation's rollback) is held too.
+        if ns::get_inode_any(r, &meta.ns, &meta.orphans, ino)?.is_some()
             && ns::get_dentry_record(r, &meta.ns, parent, name)?.map(|d| d.ino) != Some(ino)
         {
             return Ok(true);

@@ -2236,3 +2236,60 @@ fn a_root_appending_a_delegates_exchange_over_its_shadow_swaps_once() {
         "the appended exchange swapped the names back"
     );
 }
+
+/// Plan 45, review of the follow-ups: the hint's held-inode rule must see
+/// an inode this replica's own speculation took the last local name of.
+/// The holder linked `a` to `b` and had not shipped it; this node's
+/// `unlink a` was accepted against a base without the link and installed
+/// as a shadow, which orphaned `X` here. Its `create b` (`O_EXCL`) was
+/// then refused with `Create { b, X }`: installed, the hint wrote a fresh
+/// `X` (size 0, no manifest) and covered `b`, so a read of `b` answered
+/// an empty file the holder never had.
+#[test]
+fn a_hint_for_the_other_name_of_an_inode_a_shadow_unlinked_is_not_installed() {
+    let t0 = constellation_fs_core::types::now_ns() + STAMP_MARGIN_NS;
+    let x = ino(60);
+    let (write, _) = write_manifest(x, 7, 100, t0 + 1);
+    let meta = Meta::open_in_memory().unwrap();
+    apply(&meta, 1, 1, &[create("a", x, t0), write]);
+    let op = MutateOp::Unlink {
+        parent: ROOT_INO,
+        name: "a".into(),
+    };
+    assert!(meta
+        .install_shadow_from(
+            rid(1),
+            1,
+            0,
+            &op,
+            &Default::default(),
+            &[unlink("a", t0 + 3), completed(rid(1))]
+        )
+        .unwrap());
+    let installed = meta
+        .install_hint_from(Some(rid(61)), &[create("b", x, t0)], shipped(3), 1, 0)
+        .unwrap();
+    let size = meta
+        .lookup(ROOT_INO, "b")
+        .unwrap()
+        .and_then(|e| meta.getattr(e.ino).unwrap())
+        .map(|a| a.size);
+    assert!(
+        !installed,
+        "the hint went in over the shadowed unlink: `b` reads size {size:?}"
+    );
+    assert_eq!(size, None);
+
+    // The log: the link, then the unlink. Every name and byte converges.
+    let link = LogRecord::Link {
+        ino: x,
+        parent: ROOT_INO,
+        name: "b".into(),
+        time_ns: t0 + 2,
+    };
+    apply(&meta, 2, 1, &[link, unlink("a", t0 + 3), completed(rid(1))]);
+    assert!(!meta.has_outstanding_speculation());
+    assert_eq!(meta.lookup(ROOT_INO, "b").unwrap().map(|e| e.ino), Some(x));
+    let after = meta.getattr(x).unwrap().unwrap();
+    assert_eq!((after.size, after.nlink), (100, 1));
+}
