@@ -57003,6 +57003,38 @@ the five `view::owner_fence_tests` failing in the full run as on `main` (54/54 a
   -faults, flex, flex-crash, flex-tight, metered-shared, locks, locks-faults,
   locks-delegated, placement-hot (1,000 each).
 
+### Review of the follow-ups (2026-10-23)
+
+- **The open reply-base gap could answer wrong, not only late.** An
+  unshipped `link a b` was no overlap of a peer's `unlink a` (they share no
+  name; the parent is a shared hold), so the reply carried a shipped base
+  and the requester, without the link, orphaned the inode. Its `create b`
+  (`O_EXCL`) then got the hint `Create { b, X }`, which the held-inode rule
+  let in (the inode was an orphan, not in `ns`): `b` read as an empty file.
+  Fixed at both ends, each with a fail-before test: the hint is refused when
+  live speculation captured its inode or the inode is an orphan
+  (`a_hint_for_the_other_name_of_an_inode_a_shadow_unlinked_is_not_installed`),
+  and the reply base counts the multi-name inodes an op takes a name from
+  (`a_reply_base_counts_an_unshipped_link_of_the_inode_a_name_leaves`).
+- **Exchange replay is keyed by state, not by rid.** The root's append of a
+  delegate's transaction (`apply_delegate_tx`) does not adopt its own live
+  shadow of that rid as `install_streamed` does; the "swapped already" skip
+  covers only the immediate repeat, and a rename has the same shape. Open:
+  plan 45 §12 O1, with two ignored failing tests. Cross-directory links are
+  not in the sim (O2).
+- The ship-plan keys only add constraints in one forward pass over the
+  journal: no cycle, no unrelated reordering.
+- The rebase onto `0dc4db6d` left `+unclocked` twice in `config_variant`
+  (main added it too); the duplicate is dropped in the sim commit.
+- Gates (devbox 2): fmt, clippy, meta 446 (+2 ignored O1), mtree 74,
+  authority lib 587, `meta_repro` 4, sim 245; engine lib 858 with one
+  `view::owner_fence_tests` failure (flaky on main too). Sweeps: the 33
+  `+links` configurations at their sizes, all green; the 44 `backup*` and
+  `delegated*` configurations without `+links` at 500, failing sets identical
+  to main's (three negative controls, `backup-lag-in-margin-unaware`,
+  `backup-runtime-lag-unaware`, `delegated-core-stall-unlaned`, and
+  `backup-lag-keeps-its-backup` seed 259).
+
 ## Plan 43 C7b, commit 1/N: the offset configurations and the lease-claim oracle (sim evidence, 2026-10-22)
 
 Behaviour-neutral. The cross-node compares of plan 43 Appendix B (a claimant

@@ -494,6 +494,41 @@ purpose", "Gates"), with these rows:
 | Harness + xcheckfs (H4) | pending, box | `crates/harness/src/scenarios.rs` |
 | Docs (H5) | | `docs/plans/v1/done/28-…` §P6 note, `docs/reference` |
 
+## 12. Open integrity items (review of the follow-ups, 2026-10-23)
+
+- **O1: a root's append of a delegate's transaction ignores its own live
+  shadow of that rid.** `Meta::apply_delegate_tx` dedups a rid by
+  `completed` only, and a requester's shadow never writes `completed`. When
+  the root forwarded an op to the delegate, installed the reply as a shadow,
+  and shadowed a later op of the same names before the delegate's stream
+  brought the first back, the append re-applies the first op's records on
+  top of the later one. `install_streamed` adopts such a shadow in place by
+  rid; this path has no such rule. Exchange's "swapped already" skip
+  (`LogRecord::Exchange { ino, new_ino }`) catches the immediate repeat that
+  `shared-dir-split+links` seed 498 hit, not a second exchange of the pair
+  in between; and a rename has the same shape without any exchange (shadow
+  `rename a b`, shadow `create a`, append `rename a b`: the new `a` replaces
+  `b`, the renamed file is gone from the root's replica; not yet traced
+  whether the later appends or the shadows' retirement repair it). Fix direction: in `apply_delegate_tx`, a live shadow of
+  the rid is rolled back with what follows it, the transaction is journaled
+  in its place, and the later rows are redone (the segment path's rewind,
+  for a `Local` insertion), or the shadow is adopted as the journaled row.
+  Failing tests, ignored: `o1_a_root_appending_*` in
+  `crates/meta/tests/speculation.rs`.
+- **O2: the `+links` sim links and exchanges within one directory only**
+  (`with_links`' `dir_of` filter). The overlap rules are by inode and so
+  directory-blind, but no sweep exercises a cross-directory link, rename or
+  exchange of a hard-linked inode, nor one across a delegation boundary.
+
+Closed in the same review: the holder's reply base now counts the
+multi-name inodes an op takes a name from (`Core::reply_base`,
+`Replica::linked_victims`), and an `Exists` hint is refused when live
+speculation captured the inode it names (`live_speculation_touches`) or the
+inode is an orphan here. Before, an unshipped `link a b` let a peer's
+`unlink a` be installed as the inode's last name on the requester, and a
+hint `Create { b, X }` then reset `X` to an empty file that reads of `b`
+were answered from.
+
 ## Sources
 
 - The hard-link research of 2026-10-22 (the document this plan implements; its section numbers are cited as "research §n").

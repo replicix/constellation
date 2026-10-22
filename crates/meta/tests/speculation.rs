@@ -2293,3 +2293,120 @@ fn a_hint_for_the_other_name_of_an_inode_a_shadow_unlinked_is_not_installed() {
     let after = meta.getattr(x).unwrap().unwrap();
     assert_eq!((after.size, after.nlink), (100, 1));
 }
+
+/// Plan 45 §12, open integrity item O1 (review of the follow-ups): a root
+/// appends a delegate's transaction by rid (`Meta::apply_delegate_tx`)
+/// on top of everything it holds, also when a live shadow of that same
+/// rid sits under later shadows. `install_streamed` adopts such a shadow
+/// in place; this path re-applies the records over the later ops. The
+/// exchange's "swapped already" skip (`LogRecord::Exchange`) only
+/// catches the immediate repeat: a second exchange of the pair shadowed
+/// in between makes the first apply again.
+#[test]
+#[ignore = "open: plan 45 §12 O1"]
+fn o1_a_root_appending_an_exchange_under_a_later_shadow_keeps_their_order() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    let (x, y) = (ino(1), ino(2));
+    apply(&meta, 1, 1, &[create("a", x, 10), create("b", y, 11)]);
+    let exchange = |i: u64, j: u64, t: i64| LogRecord::Exchange {
+        parent: ROOT_INO,
+        name: "a".into(),
+        new_parent: ROOT_INO,
+        new_name: "b".into(),
+        time_ns: t,
+        ino: i,
+        new_ino: j,
+    };
+    let op = MutateOp::Exchange {
+        parent: ROOT_INO,
+        name: "a".into(),
+        new_parent: ROOT_INO,
+        new_name: "b".into(),
+    };
+    let (e1, e2) = (exchange(x, y, 12), exchange(y, x, 13));
+    for (r, e) in [(1, &e1), (2, &e2)] {
+        assert!(meta
+            .install_shadow_from(
+                rid(r),
+                1,
+                5,
+                &op,
+                &Default::default(),
+                &[e.clone(), completed(rid(r))]
+            )
+            .unwrap());
+    }
+    meta.apply_delegate_tx(
+        std::slice::from_ref(&e1),
+        Some(rid(1)),
+        5,
+        1,
+        constellation_meta::Position::ZERO,
+    )
+    .unwrap();
+    let names = (
+        meta.lookup(ROOT_INO, "a").unwrap().map(|e| e.ino),
+        meta.lookup(ROOT_INO, "b").unwrap().map(|e| e.ino),
+    );
+    assert_eq!(names, (Some(x), Some(y)), "both exchanges are in effect");
+}
+
+/// O1 for a rename: the root's shadow of `rename a b` (rid 1), then of
+/// `create a` (rid 2, a new inode); the delegate's transaction of rid 1
+/// appended on top moves the new `a` over `b` and loses the renamed file.
+#[test]
+#[ignore = "open: plan 45 §12 O1"]
+fn o1_a_root_appending_a_rename_under_a_later_shadow_keeps_their_order() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    let (x, y) = (ino(1), ino(2));
+    apply(&meta, 1, 1, &[create("a", x, 10)]);
+    let rename = LogRecord::Rename {
+        parent: ROOT_INO,
+        name: "a".into(),
+        new_parent: ROOT_INO,
+        new_name: "b".into(),
+        time_ns: 12,
+    };
+    let rename_op = MutateOp::Rename {
+        parent: ROOT_INO,
+        name: "a".into(),
+        new_parent: ROOT_INO,
+        new_name: "b".into(),
+        noreplace: false,
+    };
+    assert!(meta
+        .install_shadow_from(
+            rid(1),
+            1,
+            5,
+            &rename_op,
+            &Default::default(),
+            &[rename.clone(), completed(rid(1))]
+        )
+        .unwrap());
+    assert!(meta
+        .install_shadow_from(
+            rid(2),
+            1,
+            5,
+            &create_op("a", y),
+            &Default::default(),
+            &[create("a", y, 13), completed(rid(2))]
+        )
+        .unwrap());
+    meta.apply_delegate_tx(
+        std::slice::from_ref(&rename),
+        Some(rid(1)),
+        5,
+        1,
+        constellation_meta::Position::ZERO,
+    )
+    .unwrap();
+    let names = (
+        meta.lookup(ROOT_INO, "a").unwrap().map(|e| e.ino),
+        meta.lookup(ROOT_INO, "b").unwrap().map(|e| e.ino),
+    );
+    assert_eq!(names, (Some(y), Some(x)));
+}
