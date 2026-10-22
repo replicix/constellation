@@ -57457,3 +57457,20 @@ needs.
   (199076 no longer fails with the shared reads; 202431 does, inside the
   first failover's floor, and passes with the real cap).
 
+
+### The replica's clean close and the 128 MiB journal bound (7e6e5cb): the four file systems (2026-10-23)
+
+`crates/meta/tests/create_throughput.rs` (300 000 creates into one directory, then a
+clean close and a reopen), release, the build box, `TMPDIR` on each file system, 3
+rounds of before/after/after/before (6 runs each side; before = adc84af with the same
+test file):
+
+| File system | creates/s before → after (median) | close | reopen |
+|---|---|---|---|
+| ext4 | 44 718 → 43 880 (ranges 43 498–44 959, 43 653–44 060) | 0.62 → 0.71 s | 6.05 s → 3 ms |
+| xfs | 44 584 → 44 578 | 0.62 → 0.74 s | 6.05 s → 4 ms |
+| btrfs | 42 777 → 42 606 | 0.63 → 0.76 s | 6.05 s → 5 ms |
+| tmpfs | 44 054 → 44 019 | 0.62 → 0.74 s | 6.05 s → 2 ms |
+
+Creates are within noise everywhere (ext4 −1.9 %, inside both spreads); the close pays
+the final flush (~0.1 s at this size); the reopen no longer replays the journal.
