@@ -2660,6 +2660,10 @@ tokens and promises are not read.
 7. Sim: a delegate 2 s ahead of the root under an outwaited grant
    (row 9): today the floor misses a row (`turn_read` stale); after,
    the as-of is root-anchored.
+   *More witnesses (2026-10-23):* `locks-delegated-partition-skew` seeds
+   139, 483 and 709 fail with this row's stale reads since c7b0f86f/7f5c6f90
+   (a restarted root re-adopts its lease, which keeps the delegate live
+   where it used to lapse); they must pass when rows 9/30 are fixed.
 8. Unit: the lease observation rule (ETag unchanged for ttl·(1 + 2ρ); a
    renewal in between restarts the watch; `fenced` claimable at once;
    `released` unchanged); `takeover_check` with anchored promises;
