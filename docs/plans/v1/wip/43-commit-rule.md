@@ -622,6 +622,12 @@ C1 makes every party believe the commit:
    claimer's expiry judgement only *triggers* the seal, safety rests on
    the seal and the CAS). `SealedTail` is batched like `BackupAppend`
    (`backup_batch_rows`, one batch in flight, the claimer acks each).
+   *Witnesses to unpin when this lands (2026-10-22):* `backup-strict`
+   seed 1389 (the holder crashes while its backup is rebooted and then
+   paused, so no seal; the next node claims by TTL without the tail; C7b's
+   retry hint lets it claim 0.3 s before the holder restarts), pinned as
+   an ignored known gap by C7b; and the lag-at-expiry seeds 5, 275 and 277
+   that f27d3d1 counts beyond the failure budget. Both must pass strict.
 6. **Docs and the stale comment.** `backup.rs:27-36` says what the fast
    path does (writes, then waits for the gate; `Ungated` handled in C2).
 
