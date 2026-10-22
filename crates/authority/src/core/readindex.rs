@@ -239,9 +239,9 @@ impl Core {
 
     /// At start: a previous incarnation's grants may still be honoured.
     pub(crate) fn read_start(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
-        if !self.cfg.read_delegations {
-            return;
-        }
+        // Not gated on `read_delegations`: the horizon is also the takeover
+        // floor's read part (`persist_floor`), which is armed whatever that
+        // setting, and acknowledgements wait on it as on a grant's.
         if let Some(until) = replica.load_grant_quarantine(now, self.cfg.read_horizon_span_ms()) {
             tracing::info!(
                 node = self.cfg.node_id,

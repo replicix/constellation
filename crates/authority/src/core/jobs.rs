@@ -4413,6 +4413,22 @@ impl Core {
             .is_some_and(|j| matches!(j.phase, Phase::Cas { .. } | Phase::CasReread { .. }))
     }
 
+    /// A takeover CAS for `epoch` may still land: it is out (or its re-read
+    /// is), or an earlier one of this node for that epoch failed without an
+    /// answer (`Lease::ambiguous_claim`). The claim mark of that epoch
+    /// stands for a floor the claim may yet owe (`acquire_cas`).
+    pub(crate) fn claim_unsettled_at(&self, epoch: Epoch) -> bool {
+        let out = self.job.as_ref().is_some_and(|j| {
+            matches!(&j.phase,
+                Phase::Cas { sent, .. } | Phase::CasReread { sent, .. } if sent.epoch == epoch)
+        });
+        out || self
+            .lease
+            .ambiguous_claim
+            .as_ref()
+            .is_some_and(|(e, _)| *e == epoch)
+    }
+
     /// The epoch probe's round may close the epoch: mark it probed and
     /// run the complete upload pass; `on_uploads_done` closes.
     fn epoch_probe_close(&mut self, out: &mut Vec<Action>) {

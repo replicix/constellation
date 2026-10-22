@@ -6432,9 +6432,18 @@ impl Core {
             // The floor of a tenure that is over is not the next one's (the
             // quarantines it set run on; the claim mark names an epoch no
             // longer ours).
-            self.ack.floor_mark_locks = None;
-            if self.ack.floor_mark.take().is_some() {
-                replica.clear_takeover_floor_pending();
+            // A claim of a newer epoch that is out (or in doubt) is not the
+            // tenure that ended: its mark stays, as the floor it may owe
+            // (`acquire_cas`) is not armed yet.
+            let claiming = self
+                .ack
+                .floor_mark
+                .is_some_and(|e| self.claim_unsettled_at(e));
+            if !claiming {
+                self.ack.floor_mark_locks = None;
+                if self.ack.floor_mark.take().is_some() {
+                    replica.clear_takeover_floor_pending();
+                }
             }
             if std::mem::take(&mut self.ack.floor_persisted) {
                 replica.clear_takeover_floor();

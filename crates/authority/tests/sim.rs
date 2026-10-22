@@ -4913,6 +4913,17 @@ fn sweep_config() {
         {
             c.rate_budget_ppm = b;
         }
+        // `AUTHORITY_SIM_READ_DELEGATIONS=0` turns the read delegations off
+        // in every node of any configuration (the takeover floor's read part
+        // is armed and persisted whatever that setting).
+        if std::env::var("AUTHORITY_SIM_READ_DELEGATIONS").is_ok_and(|v| v == "0") {
+            let inner = c.core.clone();
+            c.core = std::sync::Arc::new(move |id, inc| {
+                let mut core = inner(id, inc);
+                core.read_delegations = false;
+                core
+            });
+        }
         c
     };
     let streamed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));

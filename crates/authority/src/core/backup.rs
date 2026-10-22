@@ -1657,7 +1657,10 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         let mut durable = true;
-        if self.cfg.read_delegations && until > now.wait {
+        // Whatever `read_delegations` says: `note_marker_landed` quarantines
+        // the acknowledgements until `until` in any case, and a restart
+        // must wait it out as the process that armed it would have.
+        if until > now.wait {
             durable &= replica.note_grant_horizon(until, now);
         }
         if replica.note_takeover_floor(floor_end, now) {

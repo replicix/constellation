@@ -33212,6 +33212,11 @@ mod persisted_floor {
 
     /// The node stops and comes back `after_ms` later with its disk.
     fn restart(h: Harness, after_ms: u64) -> Harness {
+        restart_out(h, after_ms).0
+    }
+
+    /// `restart`, and what the start asked of the driver.
+    fn restart_out(h: Harness, after_ms: u64) -> (Harness, Vec<Action>) {
         let mut h = Harness {
             core: Core::new(h.core.cfg.clone()),
             meta: h.meta,
@@ -33220,8 +33225,9 @@ mod persisted_floor {
             wait_off: 0,
             manual_horizon: false,
         };
-        h.core.start(h.clk(), &h.meta, &mut Vec::new());
-        h
+        let mut out = Vec::new();
+        h.core.start(h.clk(), &h.meta, &mut out);
+        (h, out)
     }
 
     /// Answers the acquisition's requests (the tail, the drain, the marker)
@@ -33284,6 +33290,135 @@ mod persisted_floor {
         let again = restart(r, 10);
         assert!(!again.core.in_takeover_floor(again.clk()));
         assert_eq!(again.core.takeover_floor_until(), WaitMs(0));
+    }
+
+    /// What an acknowledgement of a mutation touching nothing in particular
+    /// waits for on the read side: the end of the quarantine, or `None`.
+    fn ack_waits_until(h: &mut Harness) -> Option<WaitMs> {
+        let mut out = Vec::new();
+        h.core
+            .recall_needed(h.clk(), &[], None, &h.meta, &mut out)
+            .and_then(|(_, until)| until)
+    }
+
+    /// Expectation (fail-before: the floor's read part was written and
+    /// loaded only with read delegations on, but its acknowledgement
+    /// quarantine is set whatever the setting): with read delegations off, a
+    /// restart inside the floor waits the acknowledgements out as the process
+    /// that armed it did. (The harness keeps the in-memory table across a
+    /// restart, so what tells the restart's own load is the quarantine timer
+    /// its start arms.) Fails on the parent: the restart loads nothing, arms
+    /// no timer, and the acknowledgements' quarantine ends with the table's
+    /// life.
+    #[test]
+    fn a_restart_inside_the_floor_keeps_the_ack_wait_with_read_delegations_off() {
+        let mut h = successor();
+        h.core.cfg.read_delegations = false;
+        let prev = predecessor(&h);
+        let (_, won) = claim_over_with(&mut h, &prev, true, false);
+        finish_gate(&mut h, won);
+        // In-process: the acknowledgement waits until the floor's read end.
+        let until = ack_waits_until(&mut h).expect("no ack wait in-process");
+        assert!(until > h.clk().wait.plus(20_000), "{until:?}");
+        h.advance(300);
+        let (mut r, out) = restart_out(h, 300);
+        assert!(!r.core.cfg.read_delegations);
+        let timer = timers(&out, TimerKind::GrantQuarantine);
+        assert_eq!(
+            timer.len(),
+            1,
+            "the restart loaded no read horizon: {out:?}"
+        );
+        assert!(
+            matches!(r.core.timer_at(timer[0]), Some(TimerAt::Wait(at)) if at >= until),
+            "{:?} < {until:?}",
+            r.core.timer_at(timer[0])
+        );
+        let waits = ack_waits_until(&mut r).expect("the restart lost the ack wait");
+        assert!(waits >= until, "{waits:?} < {until:?}");
+        // Past it, nothing is owed.
+        r.advance(waits.since(r.clk().wait) as u64 + 1);
+        assert_eq!(ack_waits_until(&mut r), None, "{waits:?} {until:?}");
+    }
+
+    /// The takeover CAS of `prev`'s tenure, not yet answered: the claim
+    /// mark is down and the swap is out. Returns the lease it writes.
+    fn claim_cas_out(h: &mut Harness, prev: &Lease) -> Lease {
+        h.core.cfg.takeover_promise_check = false;
+        h.core.lease.takeover_permit = Some((prev.epoch, prev.holder));
+        h.core.bk.sealed = prev.epoch;
+        let mut out = Vec::new();
+        h.core.enqueue_job(
+            h.clk(),
+            super::super::jobs::JobReq::Acquire {
+                reason: "test",
+                ask_handoff: false,
+            },
+            &h.meta,
+            &mut out,
+        );
+        for _ in 0..8 {
+            let Some((op, req)) = s3_ops(&out)
+                .into_iter()
+                .find(|(_, r)| !matches!(r, S3Op::HeartbeatRead))
+                .map(|(op, r)| (op, r.clone()))
+            else {
+                panic!("the acquisition stalled: {out:?}")
+            };
+            let result = match &req {
+                S3Op::LeaseGet => S3Result::LeaseGet(Ok(Some((prev.clone(), tag())))),
+                S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+                S3Op::LeaseSwap { lease, .. } => return lease.clone(),
+                other => panic!("unexpected request {other:?}"),
+            };
+            out = h.step(Event::S3 { op, result });
+        }
+        panic!("no claim CAS: {out:?}")
+    }
+
+    /// Hardening (review F4-2; no path reaches it: every caller of
+    /// `lock_on_lease_gone` is on the holder's side, and a claimant holds
+    /// nothing; this is a unit-level test of the guard): the end of a
+    /// tenure leaves the claim mark of an epoch whose CAS is out, or in
+    /// doubt (`ambiguous_claim`), and still removes one that is settled.
+    #[test]
+    fn the_end_of_a_tenure_keeps_the_mark_of_a_claim_that_may_land() {
+        // The CAS is out.
+        let mut h = successor();
+        let prev = predecessor(&h);
+        let sent = claim_cas_out(&mut h, &prev);
+        assert_eq!(h.meta.takeover_floor_pending(), Some(sent.epoch));
+        assert!(h.core.claim_unsettled_at(sent.epoch));
+        h.core.lock_on_lease_gone(h.clk(), &h.meta, &mut Vec::new());
+        assert_eq!(h.core.ack.floor_mark, Some(sent.epoch));
+        assert_eq!(
+            h.meta.takeover_floor_pending(),
+            Some(sent.epoch),
+            "the mark of a claim that is out went with the old tenure"
+        );
+        // The CAS won: settled, the mark of the epoch goes with a tenure
+        // that ends before its marker lands.
+        let mut h = successor();
+        let prev = predecessor(&h);
+        let (claimed, _won) = claim_over_with(&mut h, &prev, true, false);
+        assert!(!h.core.claim_unsettled_at(claimed.epoch));
+        h.core.lock_on_lease_gone(h.clk(), &h.meta, &mut Vec::new());
+        assert_eq!(h.core.ack.floor_mark, None);
+        assert_eq!(h.meta.takeover_floor_pending(), None);
+        // A claim in doubt (an earlier CAS that failed without an answer).
+        let mut h = successor();
+        let prev = predecessor(&h);
+        let (claimed, _won) = claim_over_with(&mut h, &prev, true, false);
+        h.core.lease.ambiguous_claim = Some((claimed.epoch, prev.clone()));
+        assert!(h.core.claim_unsettled_at(claimed.epoch));
+        assert!(!h.core.claim_unsettled_at(claimed.epoch + 1));
+        h.core.lock_on_lease_gone(h.clk(), &h.meta, &mut Vec::new());
+        assert_eq!(h.meta.takeover_floor_pending(), Some(claimed.epoch));
+        // The mark of another epoch than the one in doubt goes.
+        h.core.lease.ambiguous_claim = Some((claimed.epoch + 3, prev));
+        h.core.lock_on_lease_gone(h.clk(), &h.meta, &mut Vec::new());
+        assert_eq!(h.meta.takeover_floor_pending(), None);
     }
 
     /// Expectation (fail-before: the mark and the re-arming do not exist):
