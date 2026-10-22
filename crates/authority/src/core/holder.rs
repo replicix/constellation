@@ -599,8 +599,17 @@ impl Core {
     /// load every requester trails and which would send every reply to
     /// `AwaitingLog` (M5 round 3: `holder-ships-under-forward-load` at 8×
     /// main's time).
+    ///
+    /// A name the op takes away from an inode with another name changes
+    /// that inode too (plan 45, review of the follow-ups): its keys count.
+    /// Without it an unshipped `link a b` was no overlap of a peer's
+    /// `unlink a`; the requester, without the link, applied the unlink
+    /// as the inode's last name and orphaned it until the stream came.
+    /// Only multi-name inodes: a single-name file's own unshipped write
+    /// does not change what an unlink or rename of it does.
     pub(crate) fn reply_base(&self, op: &MutateOp, replica: &dyn Replica) -> Option<Seq> {
-        let keys = keys_of_op(op);
+        let mut keys = keys_of_op(op);
+        keys.inos.extend(replica.linked_victims(op));
         if replica.unshipped_overlaps(&keys) {
             return None;
         }

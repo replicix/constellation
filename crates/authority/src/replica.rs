@@ -67,6 +67,11 @@ pub trait Replica {
     /// The inode `parent/name` names here, for the requester-side
     /// ordering gate's conflict keys (`forward::conflict_keys`).
     fn lookup_ino(&self, parent: Ino, name: &str) -> Option<Ino>;
+    /// The non-directory inodes with more than one name here that `op`
+    /// takes a name of away (an unlink, a rename's or an exchange's
+    /// names): what the op changes beyond the names it carries
+    /// (`Core::reply_base`).
+    fn linked_victims(&self, op: &MutateOp) -> Vec<Ino>;
     /// Whether the unshipped journal (this tenure) touched any of `keys`
     /// (the stale-base rule on forward replies, `Meta::unshipped_overlaps`).
     fn unshipped_overlaps(&self, keys: &TouchSet) -> bool;
@@ -627,6 +632,35 @@ impl Replica for Meta {
             .ok()
             .flatten()
             .map(|a| a.ino)
+    }
+
+    fn linked_victims(&self, op: &MutateOp) -> Vec<Ino> {
+        let names: Vec<(Ino, &str)> = match op {
+            MutateOp::Unlink { parent, name } => vec![(*parent, name)],
+            MutateOp::Rename {
+                parent,
+                name,
+                new_parent,
+                new_name,
+                ..
+            }
+            | MutateOp::Exchange {
+                parent,
+                name,
+                new_parent,
+                new_name,
+            } => vec![(*parent, name), (*new_parent, new_name)],
+            _ => return Vec::new(),
+        };
+        let mut out: Vec<Ino> = names
+            .into_iter()
+            .filter_map(|(parent, name)| MetaStore::lookup(self, parent, name).ok().flatten())
+            .filter(|a| a.kind != constellation_fs_core::types::InodeKind::Dir && a.nlink > 1)
+            .map(|a| a.ino)
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     fn unshipped_overlaps(&self, keys: &TouchSet) -> bool {

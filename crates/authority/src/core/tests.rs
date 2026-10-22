@@ -800,6 +800,78 @@ fn a_reply_base_names_the_unshipped_overlap() {
     assert_eq!(ask("b", 2), Some(0));
 }
 
+/// Plan 45, review of the follow-ups: an unshipped `link a b` changes the
+/// inode a peer's `unlink a` (or a rename or exchange of `a`) then takes
+/// a name from, though neither names the other's name. Answered with a
+/// shipped base, the requester, without the link, applied the unlink as
+/// the inode's last name and orphaned it until the stream arrived (and an
+/// `Exists` hint for `b` could reset it there). Only the log can order
+/// that reply. A single-name file keeps its shipped base.
+#[test]
+fn a_reply_base_counts_an_unshipped_link_of_the_inode_a_name_leaves() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let (create_a, create_c) = (h.create("a"), h.create("c"));
+    let MutateOp::Create { ino: x, .. } = create_a else {
+        unreachable!()
+    };
+    constellation_meta::execute_mutate(&h.meta, &create_a, None).unwrap();
+    constellation_meta::execute_mutate(&h.meta, &create_c, None).unwrap();
+    let rows: Vec<u64> = h
+        .meta
+        .take_journal_grouped(usize::MAX)
+        .unwrap()
+        .into_iter()
+        .flat_map(|(_, b)| b)
+        .map(|(s, _)| s)
+        .collect();
+    h.meta.ack_journal_rows_at(&rows, 5).unwrap();
+    h.core.shipped_floor = 5;
+    h.core.ship.head_seq = 5;
+    h.core.ship.next_seq = 6;
+    let link = MutateOp::Link {
+        ino: x,
+        parent: ROOT_INO,
+        name: "b".into(),
+    };
+    constellation_meta::execute_mutate(&h.meta, &link, None).unwrap();
+    let mut ask = |op: MutateOp, req: u64| {
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(req),
+                rid: Rid {
+                    node: 2,
+                    incarnation: 1,
+                    seq: req,
+                },
+                op,
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+            },
+        });
+        match sends(&out)[0].1 {
+            PeerMsg::MutateReply { base, .. } => *base,
+            other => panic!("{other:?}"),
+        }
+    };
+    let rename = |name: &str| MutateOp::Rename {
+        parent: ROOT_INO,
+        name: name.into(),
+        new_parent: ROOT_INO,
+        new_name: format!("{name}2"),
+        noreplace: false,
+    };
+    assert_eq!(ask(rename("c"), 1), Some(5), "a single-name file");
+    assert_eq!(
+        ask(rename("a"), 2),
+        None,
+        "the other name of a linked inode"
+    );
+}
+
 #[test]
 fn a_non_holder_declines_a_handoff_at_once() {
     let mut h = Harness::new(1);
