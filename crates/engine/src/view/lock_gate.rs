@@ -57,6 +57,28 @@ pub(crate) fn on_ring_thread() -> bool {
         .is_some_and(|n| n.starts_with("fuser-ring-"))
 }
 
+/// How an inline wait for a lapsing grant ended without its verdict
+/// ([`View::lock_wait_inline`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InlineEnd {
+    /// The op's signal (`EINTR`).
+    Interrupted,
+    /// Not waited: a ring's thread, or no lock-wait entry to hold (`EIO`;
+    /// nothing is decided about the grant).
+    Refused,
+    /// The lapse's bound passed (`EIO`; the grant is taken as fenced).
+    Bound,
+}
+
+impl InlineEnd {
+    fn code(self) -> Code {
+        match self {
+            InlineEnd::Interrupted => Code::Intr,
+            InlineEnd::Refused | InlineEnd::Bound => Code::Io,
+        }
+    }
+}
+
 /// What a read's fences said ([`View::lock_read_gate`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReadGate {
@@ -308,18 +330,30 @@ impl View {
         w: &mut Waiter<'_>,
         parked: impl Fn() -> bool,
     ) -> Result<(), Code> {
+        self.lock_wait_inline_end(l, w, parked)
+            .map_err(InlineEnd::code)
+    }
+
+    /// [`Self::lock_wait_inline`], saying how a wait that did not see the
+    /// grant's verdict ended ([`InlineEnd`]).
+    fn lock_wait_inline_end(
+        &self,
+        l: &crate::locks::ClusterLocks,
+        w: &mut Waiter<'_>,
+        parked: impl Fn() -> bool,
+    ) -> Result<(), InlineEnd> {
         if !parked() {
             return Ok(());
         }
         let stats = l.meta.locks();
         if on_ring_thread() {
             stats.with_stats(|s| s.lapse_inline_refused_thread += 1);
-            return Err(Code::Io);
+            return Err(InlineEnd::Refused);
         }
         let own = match w.begin.as_mut().map(|begin| begin()) {
             Some(WaitStart::Refused) => {
                 stats.with_stats(|s| s.lapse_park_refused_ring += 1);
-                return Err(Code::Io);
+                return Err(InlineEnd::Refused);
             }
             Some(WaitStart::Held(own)) => own,
             None => None,
@@ -337,10 +371,10 @@ impl View {
             }
             if cancelled() {
                 stats.with_stats(|s| s.lapse_inline_interrupted += 1);
-                break Err(Code::Intr);
+                break Err(InlineEnd::Interrupted);
             }
             if started.elapsed() >= bound {
-                break Err(Code::Io);
+                break Err(InlineEnd::Bound);
             }
             std::thread::sleep(Duration::from_millis(10));
         };
@@ -630,7 +664,8 @@ impl View {
     /// [`crate::locks::ClusterLocks::take_discard`], waiting inline (bounded) while the
     /// inode's grant is lapsing (plan 43 C7-F F-c): what comes back is the
     /// verdict, never `Parked`; `Err(EINTR)` when the op's signal ended the
-    /// wait.
+    /// wait, `Err(EIO)` when the wait was refused (a ring's thread, no
+    /// lock-wait entry): nothing is discarded before the verdict.
     pub(crate) fn lock_take_discard(
         &self,
         l: &Arc<crate::locks::ClusterLocks>,
@@ -642,10 +677,14 @@ impl View {
             match l.take_discard(ino, write) {
                 Discard::Parked => {
                     let pending = || l.meta.locks().lapse_pending(ino, crate::locks::now());
-                    match self.lock_wait_inline(l, w, pending) {
+                    match self.lock_wait_inline_end(l, w, pending) {
                         Ok(()) => {}
-                        Err(Code::Intr) => return Err(Code::Intr),
-                        Err(_) => return Ok(Discard::Discard { fenced: true }),
+                        Err(InlineEnd::Interrupted) => return Err(Code::Intr),
+                        // Not waited (a ring's thread, or no lock-wait entry
+                        // to hold): the op is refused, as a refused park is,
+                        // and the verdict still to come decides the data.
+                        Err(InlineEnd::Refused) => return Err(Code::Io),
+                        Err(InlineEnd::Bound) => return Ok(Discard::Discard { fenced: true }),
                     }
                 }
                 other => return Ok(other),

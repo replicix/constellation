@@ -3545,3 +3545,65 @@ fn an_inline_wait_is_refused_on_a_ring_thread() {
     );
     assert_eq!(s.lapse_late_parks, 0);
 }
+
+/// Lock-wait follow-ups review: an inline wait the frontend cannot hold (no
+/// lock-wait entry left on its ring queue; or a ring thread) is refused
+/// with `EIO`, as a refused park is, and decides nothing about the grant:
+/// the data written under it waits for the owner's verdict. Taken as the
+/// verdict, the refusal discarded that data at a publication while the
+/// grant was still lapsing, and the owner then admitted the late renewal.
+#[test]
+fn a_refused_inline_wait_at_a_publication_discards_nothing() {
+    let f = fenced_fs();
+    f.meta.locks().set_lapse_park_ms(60_000);
+    let me = std::process::id();
+    let (obj, oo) = f.create(&Caller::root(), ROOT_INO, "obj").unwrap();
+    let ino = obj.attr.ino;
+    let until = crate::locks::now().honour.plus(300);
+    f.lock(ino, me, until);
+    let writer = Caller::new(0, 0, Some(me));
+    f.write(&OpCtx::new(OpKind::Write, &writer), ino, oo.fh)
+        .unwrap();
+    while crate::locks::now().honour < until {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        f.meta.locks().lapse_pending(ino, crate::locks::now()),
+        "the grant is lapsing"
+    );
+    let mut refused = || constellation_vfs::WaitStart::Refused;
+    let gate = f.fs.lock_publish_gate(
+        ino,
+        oo.fh,
+        &mut super::lock_gate::Waiter::registering(None, &mut refused),
+    );
+    assert_eq!(gate, Err(Code::Io), "the publication is refused");
+    assert_eq!(
+        f.meta.locks().error_seq(ino),
+        0,
+        "the data was discarded while its grant's verdict was pending"
+    );
+    assert!(f.meta.locks().lapsing(ino), "the grant's park goes on");
+    let s = f.meta.locks().stats();
+    assert_eq!((s.lapse_park_refused_ring, s.lapse_inline_waits), (1, 0));
+    // The owner admits the late renewal: the data is published.
+    let id = f.meta.locks().held(ino).unwrap().id;
+    let now = crate::locks::now();
+    f.meta.locks().renewed(
+        ino,
+        id,
+        id,
+        LockMode::Exclusive,
+        now.honour,
+        60_000,
+        1_000,
+        false,
+        now,
+    );
+    let gate = f.fs.lock_publish_gate(
+        ino,
+        oo.fh,
+        &mut super::lock_gate::Waiter::registering(None, &mut refused),
+    );
+    assert_eq!(gate, Ok(false));
+}
