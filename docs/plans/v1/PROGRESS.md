@@ -57386,3 +57386,29 @@ made that riskier.
 - Test (fails before: the second copy extends the record by the 2 s that
   passed, a third brings back a released one): a duplicated answer
   reinstates and extends nothing.
+
+### W3: parked ops that run again and lock waits do not wait for each other
+
+A parked op (F-c) is asked again from the start once its grant's verdict is
+in, and that ran on the `lock-wait` pool thread that saw it: any op — a
+close or an `fsync` waits on the store for as long as it is down — on one
+of the sixteen threads F-b's lock waits share. Tests showed the starvation
+both ways: twenty parked ops whose second run blocks held all sixteen
+threads (a lock request waiting for the new owner was not served), and
+sixteen lock requests in an attempt against an owner that does not answer
+(seconds each) held every thread a parked op's next look at its verdict
+needs.
+
+- Parked ops run again (or are answered `EINTR`) on `locks::redo_pool()`
+  (`lock-redo`, 256 threads, jobs queue past that), not on the thread that
+  saw the verdict.
+- The pool's threads have roles: lock waits (up to 16) and the parked ops'
+  looks at their verdicts (up to 4, a table read each). `grow` starts a
+  thread to watch the turns that wait while one thread is at a step; before,
+  the pool grew only when a request was submitted with no thread idle, so a
+  burst of requests woke one thread whose step (a round trip to a dead
+  owner) held the rest.
+- Tests (fail before, with the old shared pool and the inline second run
+  restored): twenty blocked second runs do not starve a lock wait; sixteen
+  lock waits in an attempt against a core that answers in 4 s do not starve
+  a parked op (and the pool has sixteen threads in attempts).

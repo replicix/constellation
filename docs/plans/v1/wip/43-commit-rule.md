@@ -3429,7 +3429,18 @@ successor whose clock is ahead got no quarantine").
   duplicate that arrived while the generation was still live (its stream
   not caught up) reinstated a record the root had released and restamped
   one it kept, which F-c admits a late renewal from; dropped, counted
-  (`recall_answer_duplicates`).
+  (`recall_answer_duplicates`). *W3 (landed):* a parked op asked again
+  from the start ran on the `lock-wait` thread that saw the verdict, so
+  enough of them (a close or an `fsync` waits on the store for as long as
+  it is down), resolving together after a failover, held every thread the
+  lock waits need; tests showed the starvation both ways (sixteen parked
+  ops that run again slowly, and sixteen lock requests in an attempt
+  against a slow owner). Parked ops now run again on their own pool
+  (`lock-redo`, 256 threads, queueing past that) and are looked at by up to
+  four threads of their own; and the lock-wait pool starts a thread to
+  watch the others' turns while one is at a step (it grew only when a
+  request was submitted with no thread idle, so a burst woke one thread
+  whose step held the rest).
 
 F-a changes the floor's argument by one step (the floor ends at the
 earlier of the bound and the cap, each sufficient on its own); F-b and

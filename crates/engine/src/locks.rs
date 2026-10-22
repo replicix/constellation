@@ -514,6 +514,8 @@ const WAIT_POOL_IDLE: Duration = Duration::from_secs(5);
 pub struct WaitPool {
     state: Mutex<PoolState>,
     wake: std::sync::Condvar,
+    /// The park threads' own ([`Role::Park`]).
+    wake_parks: std::sync::Condvar,
     next_id: std::sync::atomic::AtomicU64,
     /// Tests: starting a thread fails.
     #[cfg(test)]
@@ -525,8 +527,43 @@ struct PoolState {
     tasks: Vec<WaitTask>,
     /// Plan 43 C7-F F-c: ops parked behind a lapsing grant.
     parks: Vec<ParkTask>,
+    /// Threads serving `tasks` ([`Role::Task`]) and how many of them wait.
     workers: usize,
     idle: usize,
+    /// Threads serving `parks` ([`Role::Park`]) and how many of them wait.
+    park_workers: usize,
+    park_idle: usize,
+}
+
+/// What a `lock-wait` thread serves. Plan 43 C7-F lock-wait follow-ups
+/// (W3): a request waiting for an owner asks it again after each wait, and
+/// that attempt may take seconds (an owner that does not answer, a few
+/// times over) while it holds its thread; a parked op, which holds a
+/// process in `read` or `write`, waits for the next look at its grant's
+/// verdict — 20 ms apart — and an application resumes as late as the
+/// first free thread. The two are served by threads of their own, so
+/// neither waits for the other.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Task,
+    Park,
+}
+
+/// Most threads serving parked ops (a look at a verdict is a table read;
+/// the op runs again elsewhere, [`redo_pool`]).
+pub const PARK_POOL_THREADS: usize = 4;
+
+/// The threads the parked ops run again on: plan 43 C7-F lock-wait
+/// follow-ups (W3). A parked op asked again from the start is any op — a
+/// close or an `fsync` whose publication waits on the store for as long as
+/// it is down — and it ran on the `lock-wait` thread that saw the verdict,
+/// so enough of them, resolving together after a failover, held every
+/// thread the lock waits need. A pool of its own, like the `fsync` one's:
+/// its jobs wait as long as the store makes them.
+pub fn redo_pool() -> &'static crate::completion::CompletionPool {
+    static POOL: std::sync::OnceLock<crate::completion::CompletionPool> =
+        std::sync::OnceLock::new();
+    POOL.get_or_init(|| crate::completion::CompletionPool::named("lock-redo", 256))
 }
 
 /// How a parked op's wait ended ([`ClusterLocks::park_deferred`]).
@@ -551,6 +588,12 @@ struct ParkTask {
     op: Option<constellation_vfs::watch::Current>,
     ready: Box<dyn Fn() -> bool + Send>,
     done: Box<dyn FnOnce(ParkEnd) + Send>,
+}
+
+/// A parked op whose look at the verdict is due, or whose caller's signal
+/// came.
+fn park_ready(p: &ParkTask, now: std::time::Instant) -> bool {
+    p.due <= now || p.cancel.as_ref().is_some_and(CancelToken::is_cancelled)
 }
 
 /// How often a parked op looks at its grant's verdict.
@@ -1211,7 +1254,7 @@ impl ClusterLocks {
         } else {
             std::thread::Builder::new()
                 .name("lock-wait".into())
-                .spawn(move || this.pool_worker())
+                .spawn(move || this.pool_worker(Role::Task))
         };
         if let Err(error) = spawned {
             tracing::warn!(%error, ino, "could not start a lock-wait thread");
@@ -1240,66 +1283,136 @@ impl ClusterLocks {
         }
     }
 
-    /// A [`WaitPool`] thread: serves the waiting requests that are due
-    /// (their wait is over), cancelled or past their bound, until none is
-    /// left for [`WAIT_POOL_IDLE`].
-    fn pool_worker(self: Arc<Self>) {
+    /// A waiting request whose turn has come: its wait is over, its caller
+    /// cancelled it, or its bound passed.
+    fn task_ready(&self, t: &WaitTask, now: std::time::Instant) -> bool {
+        t.due <= now
+            || t.cancel.as_ref().is_some_and(CancelToken::is_cancelled)
+            || now.duration_since(t.started) >= self.owner_wait_max
+    }
+
+    /// Start one more pool thread of `role` to watch the work that waits
+    /// while every thread is at a step (up to the role's bound). The pool
+    /// grew only when a request was submitted and no thread was idle: a
+    /// burst of requests woke one thread, whose step then held the others'
+    /// turns, as they came due, for as long as it lasted.
+    fn grow(self: &Arc<Self>, st: &mut PoolState, role: Role) {
+        let (workers, idle, cap) = match role {
+            Role::Task => (&mut st.workers, st.idle, WAIT_POOL_THREADS),
+            Role::Park => (&mut st.park_workers, st.park_idle, PARK_POOL_THREADS),
+        };
+        if idle > 0 || *workers >= cap {
+            return;
+        }
+        *workers += 1;
+        let this = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("lock-wait".into())
+            .spawn(move || this.pool_worker(role));
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "could not start a lock-wait thread");
+            match role {
+                Role::Task => st.workers -= 1,
+                Role::Park => st.park_workers -= 1,
+            }
+        }
+    }
+
+    /// A [`WaitPool`] thread of `role`: serves the waiting requests that
+    /// are due (their wait is over), cancelled or past their bound
+    /// ([`Role::Task`]), or the parked ops whose look at the verdict is due
+    /// or whose caller's signal came ([`Role::Park`]), until none is left
+    /// for [`WAIT_POOL_IDLE`].
+    fn pool_worker(self: Arc<Self>, role: Role) {
         let mut st = self.waits.state.lock().unwrap();
         loop {
             let now = std::time::Instant::now();
-            let mut ready = None;
             let mut next = None::<std::time::Instant>;
-            let mut ready_park = None;
-            for (i, p) in st.parks.iter().enumerate() {
-                if p.due <= now || p.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
-                    ready_park = Some(i);
-                    break;
+            if role == Role::Park {
+                let mut ready_park = None;
+                for (i, p) in st.parks.iter().enumerate() {
+                    if park_ready(p, now) {
+                        ready_park = Some(i);
+                        break;
+                    }
+                    next = Some(next.map_or(p.due, |n| n.min(p.due)));
                 }
-                next = Some(next.map_or(p.due, |n| n.min(p.due)));
-            }
-            if let Some(i) = ready_park {
-                let task = st.parks.swap_remove(i);
-                drop(st);
-                let again = self.advance_park(task);
-                st = self.waits.state.lock().unwrap();
-                if let Some(task) = again {
-                    st.parks.push(task);
+                if let Some(i) = ready_park {
+                    let task = st.parks.swap_remove(i);
+                    // Others wait: one thread is to watch for them while
+                    // this one is at its step.
+                    if !st.parks.is_empty() {
+                        self.grow(&mut st, Role::Park);
+                    }
+                    drop(st);
+                    let again = self.advance_park(task);
+                    st = self.waits.state.lock().unwrap();
+                    if let Some(task) = again {
+                        st.parks.push(task);
+                    }
+                    continue;
                 }
-                continue;
-            }
-            for (i, t) in st.tasks.iter().enumerate() {
-                if t.due <= now
-                    || t.cancel.as_ref().is_some_and(CancelToken::is_cancelled)
-                    || now.duration_since(t.started) >= self.owner_wait_max
-                {
-                    ready = Some(i);
-                    break;
+            } else {
+                let mut ready = None;
+                for (i, t) in st.tasks.iter().enumerate() {
+                    if self.task_ready(t, now) {
+                        ready = Some(i);
+                        break;
+                    }
+                    next = Some(next.map_or(t.due, |n| n.min(t.due)));
                 }
-                next = Some(next.map_or(t.due, |n| n.min(t.due)));
-            }
-            if let Some(i) = ready {
-                let task = st.tasks.swap_remove(i);
-                drop(st);
-                let again = self.advance(task);
-                st = self.waits.state.lock().unwrap();
-                if let Some(task) = again {
-                    st.tasks.push(task);
+                if let Some(i) = ready {
+                    let task = st.tasks.swap_remove(i);
+                    // Others wait: one thread is to watch for their turns
+                    // while this one is at its step, which may hold it for a
+                    // round trip to an owner that does not answer.
+                    if !st.tasks.is_empty() {
+                        self.grow(&mut st, Role::Task);
+                    }
+                    drop(st);
+                    let again = self.advance(task);
+                    st = self.waits.state.lock().unwrap();
+                    if let Some(task) = again {
+                        st.tasks.push(task);
+                    }
+                    continue;
                 }
-                continue;
             }
             // Nothing due: look again when the first is, at the latest a
             // slice from now (the cancellations), or end when idle.
-            let idle = st.tasks.is_empty() && st.parks.is_empty();
+            let none = match role {
+                Role::Task => st.tasks.is_empty(),
+                Role::Park => st.parks.is_empty(),
+            };
             let wait = match next {
                 Some(next) => (next - now).min(WAIT_SLICE),
                 None => WAIT_POOL_IDLE,
             };
-            st.idle += 1;
-            let (guard, timeout) = self.waits.wake.wait_timeout(st, wait).unwrap();
+            let wake = match role {
+                Role::Task => {
+                    st.idle += 1;
+                    &self.waits.wake
+                }
+                Role::Park => {
+                    st.park_idle += 1;
+                    &self.waits.wake_parks
+                }
+            };
+            let (guard, timeout) = wake.wait_timeout(st, wait).unwrap();
             st = guard;
-            st.idle -= 1;
-            if idle && timeout.timed_out() && st.tasks.is_empty() && st.parks.is_empty() {
-                st.workers -= 1;
+            match role {
+                Role::Task => st.idle -= 1,
+                Role::Park => st.park_idle -= 1,
+            }
+            let none_now = match role {
+                Role::Task => st.tasks.is_empty(),
+                Role::Park => st.parks.is_empty(),
+            };
+            if none && timeout.timed_out() && none_now {
+                match role {
+                    Role::Task => st.workers -= 1,
+                    Role::Park => st.park_workers -= 1,
+                }
                 return;
             }
         }
@@ -1373,15 +1486,15 @@ impl ClusterLocks {
         };
         let mut st = self.waits.state.lock().unwrap();
         st.parks.push(task);
-        if st.idle > 0 {
-            self.waits.wake.notify_one();
+        if st.park_idle > 0 {
+            self.waits.wake_parks.notify_one();
             return;
         }
-        if st.workers >= WAIT_POOL_THREADS {
+        if st.park_workers >= PARK_POOL_THREADS {
             // Every thread is at work; one of them comes to it.
             return;
         }
-        st.workers += 1;
+        st.park_workers += 1;
         drop(st);
         let this = self.clone();
         #[cfg(test)]
@@ -1396,13 +1509,13 @@ impl ClusterLocks {
         } else {
             std::thread::Builder::new()
                 .name("lock-wait".into())
-                .spawn(move || this.pool_worker())
+                .spawn(move || this.pool_worker(Role::Park))
         };
         if let Err(error) = spawned {
             tracing::warn!(%error, "could not start a lock-wait thread");
             let mut st = self.waits.state.lock().unwrap();
-            st.workers -= 1;
-            if st.workers > 0 {
+            st.park_workers -= 1;
+            if st.park_workers > 0 {
                 return;
             }
             let task = st
@@ -1439,10 +1552,22 @@ impl ClusterLocks {
         };
         match end {
             Some(end) => {
-                (task.done)(end);
-                if let Some(op) = &task.op {
+                // The op asks again (or is answered `EINTR`) on a thread of
+                // the redo pool, which may wait for as long as the store
+                // makes it: this thread looks at the other parked ops.
+                let (op, done) = (task.op.take(), task.done);
+                if let Some(op) = &op {
                     op.release();
                 }
+                redo_pool().submit(move || {
+                    if let Some(op) = &op {
+                        op.adopt();
+                    }
+                    done(end);
+                    if let Some(op) = &op {
+                        op.release();
+                    }
+                });
                 None
             }
             None => {

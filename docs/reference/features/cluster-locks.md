@@ -1097,8 +1097,15 @@ leads to the grant.
 
 The wait never holds a frontend thread. A request that has to wait is
 handed to a bounded pool of `lock-wait` threads (at most 16, however many
-requests wait: a wait is a timer and a short step every so often), and the
-mount answers it from there. It holds neither the FUSE worker nor, over
+requests wait: a wait is a timer and a short step every so often; a
+thread whose step is at an owner that does not answer, which can take
+seconds, is not waited for: a thread starts to watch the others' turns
+while it is there, up to the 16), and the mount answers it from there.
+Ops parked behind a lapsing grant (above) are served by up to four threads
+of their own, and run again on a pool of their own (`lock-redo`): a parked
+close or `fsync` waits on the store for as long as it is down, and a lock
+request waiting for the new owner, or another parked op's next look at its
+verdict, waits for no thread of that. It holds neither the FUSE worker nor, over
 the io_uring transport, an offload thread (the `n_threads` of the pool,
 shared by every ring: a wait of 23.5 s on one would have stalled whatever
 else is offloaded to it). It counts as a deferred reply, so an upgrade's

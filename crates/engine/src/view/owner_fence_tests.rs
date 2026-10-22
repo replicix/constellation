@@ -3119,7 +3119,12 @@ fn a_lapsed_owners_read_waits_for_the_verdict_and_runs_after_the_admission() {
         .map(|(a, b)| (a, b, ()))
         .expect("answered");
     assert_eq!(result, Ok(b"object".to_vec()));
-    assert_eq!(thread.as_deref(), Some("lock-wait"));
+    assert!(
+        thread
+            .as_deref()
+            .is_some_and(|t| t.starts_with("lock-redo")),
+        "the op runs again on the redo pool: {thread:?}"
+    );
     let s = p.meta.locks().stats();
     assert_eq!((s.lapse_parks_resumed, s.lapse_parks_refused), (1, 0));
     // No grant is lapsing now: the next read is inline, one relaxed load.
@@ -3250,4 +3255,293 @@ fn a_frontend_that_cannot_defer_waits_in_the_call_for_the_verdict() {
     assert_ne!(thread.as_deref(), Some("lock-wait"));
     assert!(started.elapsed() >= std::time::Duration::from_millis(100));
     renewer.join().unwrap();
+    // Counted (lock-wait follow-ups): one inline wait, and how long it took.
+    let s = p.meta.locks().stats();
+    assert_eq!(s.lapse_inline_waits, 1, "{s:?}");
+    assert!(s.lapse_inline_wait_ms_total >= 100, "{s:?}");
+    assert_eq!(s.lapse_inline_interrupted, 0);
+}
+
+/// Lock-wait follow-ups (W1): an inline wait — the op's park gate did not
+/// hold it: here a frontend that cannot defer — ends with its caller's
+/// signal, `EINTR`, within a few polls, where it waited out the lapse's
+/// bound (117 s at the defaults) with no cancellation. The op's responder
+/// is asked to register the wait (`Responder::begin_wait`) and its token is
+/// what ends it; a frontend that has no entry to hold it (over a ring)
+/// refuses the wait: `EIO` at once, counted.
+#[test]
+fn an_inline_wait_for_a_lapsing_grant_ends_with_its_callers_signal() {
+    let p = parking_with(300, false);
+    p.lapse();
+    let token = constellation_vfs::CancelToken::new();
+    let registered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (rx, took) = std::thread::scope(|s| {
+        let (t, r) = (token.clone(), registered.clone());
+        let call = s.spawn(|| p.read(Some((t, r)), false));
+        std::thread::sleep(SECOND / 5);
+        assert!(!call.is_finished(), "the read waits in the call");
+        assert_eq!(registered.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let cancelled = std::time::Instant::now();
+        token.cancel();
+        let rx = call.join().unwrap();
+        (rx, cancelled.elapsed())
+    });
+    let (result, _) = rx.try_recv().expect("answered by the call");
+    assert_eq!(result, Err(Code::Intr));
+    assert!(took < SECOND / 4, "ended by the signal at once: {took:?}");
+    let s = p.meta.locks().stats();
+    assert_eq!((s.lapse_inline_waits, s.lapse_inline_interrupted), (1, 1));
+    assert!(p.meta.locks().lapsing(p.turn), "the grant's park goes on");
+    // No entry to hold the wait: refused, `EIO`, counted, nothing waited.
+    let rx = p.read(None, true);
+    assert_eq!(rx.try_recv().expect("answered at once").0, Err(Code::Io));
+    let s = p.meta.locks().stats();
+    assert_eq!(s.lapse_park_refused_ring, 1, "{s:?}");
+    assert_eq!(s.lapse_inline_waits, 1, "{s:?}");
+}
+
+/// Lock-wait follow-ups (W1): the waits a mutation makes for a grant that
+/// is lapsing — for its fencing token at its first mutation, and before it
+/// is sent again under a renewed window — end with its caller's signal
+/// (`EINTR`) too, and are counted with the other inline waits. They
+/// polled for up to the lapse's bound (117 s at the defaults) and never
+/// looked at the caller.
+#[test]
+fn a_mutations_wait_for_a_lapsing_grant_ends_with_its_callers_signal() {
+    let p = parking(300);
+    let me = std::process::id();
+    let locks = p.fs.cluster_locks().unwrap().clone();
+    let token = constellation_vfs::CancelToken::new();
+    // The wait for the token of the first mutation.
+    p.lapse();
+    let (result, took) = std::thread::scope(|s| {
+        let call = s.spawn(|| {
+            let _scope = locks.tag_scope(Some(me), None, Some(&token));
+            crate::locks::current_tag().map(|_| ())
+        });
+        std::thread::sleep(SECOND / 5);
+        assert!(!call.is_finished(), "waiting for the verdict");
+        let cancelled = std::time::Instant::now();
+        token.cancel();
+        let result = call.join().unwrap();
+        (result, cancelled.elapsed())
+    });
+    assert_eq!(result, Err(Code::Intr));
+    assert!(took < SECOND / 4, "{took:?}");
+    let s = p.meta.locks().stats();
+    assert_eq!((s.lapse_inline_waits, s.lapse_inline_interrupted), (1, 1));
+    assert_eq!(s.owner_fenced_ops, 0, "an interrupted wait fences nothing");
+    // The wait before a refused mutation goes again: a grant honoured when
+    // the token was taken, lapsing when the executor refused it.
+    let p = parking(300);
+    let locks = p.fs.cluster_locks().unwrap().clone();
+    let token = constellation_vfs::CancelToken::new();
+    let (result, took) = std::thread::scope(|s| {
+        let call = s.spawn(|| {
+            let _scope = locks.tag_scope(Some(me), None, Some(&token));
+            crate::locks::current_tag().unwrap();
+            p.lapse();
+            crate::locks::reissue_after_lapse()
+        });
+        std::thread::sleep(SECOND / 2);
+        assert!(!call.is_finished(), "waiting for the verdict");
+        let cancelled = std::time::Instant::now();
+        token.cancel();
+        let result = call.join().unwrap();
+        (result, cancelled.elapsed())
+    });
+    assert_eq!(result, Reissue::Interrupted);
+    assert!(took < SECOND / 4, "{took:?}");
+    let s = p.meta.locks().stats();
+    assert_eq!((s.lapse_inline_waits, s.lapse_inline_interrupted), (1, 1));
+}
+
+/// Lock-wait follow-ups (W3): a parked op asked again from the start is any
+/// op, and a close or an `fsync` waits on the store for as long as it is
+/// down. It used to run on the `lock-wait` thread that saw the verdict, so
+/// twenty of them resolving together after a failover held all sixteen
+/// threads, and the lock requests waiting for the new owner waited behind
+/// them for as long as the store took. They run again on a pool of their own
+/// now: here twenty of them block and a lock request that waits is still
+/// served at once.
+#[test]
+fn parked_ops_that_run_again_slowly_do_not_starve_the_lock_waits() {
+    let mut f = fenced_fs();
+    let (file, _) = f.create(&Caller::root(), ROOT_INO, "starved").unwrap();
+    let ino = file.attr.ino;
+    script_core(&mut f, ino, vec![Scripted::Wait(50), Scripted::Grant]);
+    let locks = f.fs.cluster_locks().expect("cluster locks").clone();
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for _ in 0..(crate::locks::WAIT_POOL_THREADS + 4) {
+        let (release, running) = (release.clone(), running.clone());
+        locks.park_deferred(
+            None,
+            || true,
+            move |_end| {
+                running.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (flag, wake) = &*release;
+                let mut open = flag.lock().unwrap();
+                while !*open {
+                    open = wake.wait(open).unwrap();
+                }
+            },
+        );
+    }
+    // They run again, and stay (as many as can: the pool the lock waits
+    // used was sixteen threads).
+    let until = std::time::Instant::now() + 2 * SECOND;
+    while running.load(std::sync::atomic::Ordering::SeqCst) < crate::locks::WAIT_POOL_THREADS
+        && std::time::Instant::now() < until
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    std::thread::sleep(SECOND / 5);
+    // A lock request that waits for its owner's grace is served meanwhile.
+    let rx = f.lock_nb(ino, None);
+    let answered = rx.recv_timeout(2 * SECOND);
+    let (flag, wake) = &*release;
+    *flag.lock().unwrap() = true;
+    wake.notify_all();
+    let (result, _, _) = answered.expect("the lock wait was starved by the ops that run again");
+    assert_eq!(result, Ok(()));
+}
+
+/// ... and the other way: a lock request waiting for an owner that does not
+/// answer holds its thread for each attempt (seconds), and sixteen of them
+/// held every thread a parked op needs for its next look at the verdict,
+/// so an application waiting in `read` resumed as late as the first free
+/// one. Parked ops are served by threads of their own.
+#[test]
+fn lock_waits_in_flight_against_a_slow_owner_do_not_starve_the_parked_ops() {
+    let mut f = fenced_fs();
+    let (file, _) = f.create(&Caller::root(), ROOT_INO, "slow_owner").unwrap();
+    let ino = file.attr.ino;
+    let n = crate::locks::WAIT_POOL_THREADS + 2;
+    // Each request's first attempt is answered at once (it waits), every
+    // attempt after that takes seconds.
+    let mut script = vec![Scripted::Wait(10); n];
+    script.push(Scripted::Slow(4_000));
+    script_core(&mut f, ino, script);
+    let cancel = constellation_vfs::CancelToken::new();
+    let rxs: Vec<_> = (0..n).map(|_| f.lock_nb(ino, Some(&cancel))).collect();
+    let locks = f.fs.cluster_locks().expect("cluster locks").clone();
+    // The pool grows as each thread goes into its attempt: every one of the
+    // sixteen is in one (a loaded host takes its time to start them).
+    let until = std::time::Instant::now() + 5 * SECOND;
+    while locks.waits.threads() < crate::locks::WAIT_POOL_THREADS
+        && std::time::Instant::now() < until
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    std::thread::sleep(SECOND / 5);
+    assert_eq!(
+        locks.waits.threads(),
+        crate::locks::WAIT_POOL_THREADS,
+        "every lock-wait thread is in an attempt"
+    );
+    let (tx, parked) = std::sync::mpsc::channel();
+    let started = std::time::Instant::now();
+    locks.park_deferred(
+        None,
+        || true,
+        move |end| {
+            let _ = tx.send((end, std::time::Instant::now()));
+        },
+    );
+    let answered = parked.recv_timeout(2 * SECOND);
+    cancel.cancel();
+    let (end, at) = answered.expect("the parked op was starved by the lock waits");
+    assert_eq!(end, crate::locks::ParkEnd::Resolved);
+    // (The attempts last 4 s each: the op was not behind one.)
+    assert!(
+        at.duration_since(started) < 2 * SECOND,
+        "{:?}",
+        at.duration_since(started)
+    );
+    for rx in rxs {
+        assert_eq!(
+            rx.recv_timeout(5 * SECOND).expect("ended").0,
+            Err(Code::Intr)
+        );
+    }
+}
+
+/// A thread of an io_uring session's ring serves every request of its CPUs'
+/// queues one at a time (`RingDispatch::Reads` runs reads on it): an op
+/// that waits there stalls them all. Lock-wait follow-ups (W2): a read that
+/// finds its grant lapsing at the fence — the park gate before its
+/// admission did not see it: here its estimate, which a forward step of the
+/// clock leaves behind — is handed to the wait pool, as the gate would have
+/// done, and the ring's thread is free at once. On the landed F-c it waited
+/// where it was, on that thread, for the verdict.
+#[test]
+fn a_read_that_finds_a_lapse_at_its_fence_parks_instead_of_waiting_on_a_ring_thread() {
+    let p = Arc::new(parking(600));
+    let q = p.clone();
+    let (done, ring) = std::sync::mpsc::channel();
+    // (Not scoped: where the read waits on the thread, so does the test.)
+    std::thread::Builder::new()
+        .name("fuser-ring-0".into())
+        .spawn(move || {
+            // The clock stepped forward: the grant is over on this thread's
+            // reading, the gate's estimate (one wait-clock read) has not
+            // seen it.
+            crate::locks::step_test_wall(1_500);
+            let started = std::time::Instant::now();
+            let rx = q.read(None, false);
+            let _ = done.send((rx, started.elapsed()));
+        })
+        .unwrap();
+    let (rx, returned) = ring
+        .recv_timeout(2 * SECOND)
+        .expect("the ring's thread was not held: the read returned");
+    assert!(returned < SECOND, "{returned:?}");
+    // Parked and run again from the pool: its owner's verdict is in (here
+    // the pool's clock never stepped, so the grant is honoured there).
+    let (result, thread) = rx.recv_timeout(5 * SECOND).expect("answered");
+    assert_eq!(result, Ok(b"object".to_vec()));
+    assert!(
+        thread
+            .as_deref()
+            .is_some_and(|t| t.starts_with("lock-redo")),
+        "the op runs again on the redo pool: {thread:?}"
+    );
+    let s = p.meta.locks().stats();
+    assert_eq!((s.lapse_late_parks, s.lapse_parked_ops), (1, 1), "{s:?}");
+    assert_eq!(
+        (s.lapse_inline_waits, s.lapse_inline_refused_thread),
+        (0, 0),
+        "{s:?}"
+    );
+}
+
+/// ... and where the op cannot be parked (a frontend that cannot defer) a
+/// ring thread does not wait either: `EIO` at once, as before F-c, counted
+/// (`lapse_inline_refused_thread`; the campaign's judge fails on it).
+#[test]
+fn an_inline_wait_is_refused_on_a_ring_thread() {
+    let p = Arc::new(parking_with(600, false));
+    let q = p.clone();
+    let (done, ring) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("fuser-ring-1".into())
+        .spawn(move || {
+            crate::locks::step_test_wall(1_500);
+            let started = std::time::Instant::now();
+            let rx = q.read(None, false);
+            let _ = done.send((rx, started.elapsed()));
+        })
+        .unwrap();
+    let (rx, returned) = ring
+        .recv_timeout(2 * SECOND)
+        .expect("the ring's thread was not held: the read returned");
+    assert!(returned < SECOND, "{returned:?}");
+    assert_eq!(rx.try_recv().expect("answered at once").0, Err(Code::Io));
+    let s = p.meta.locks().stats();
+    assert_eq!(
+        (s.lapse_inline_refused_thread, s.lapse_inline_waits),
+        (1, 0)
+    );
+    assert_eq!(s.lapse_late_parks, 0);
 }
