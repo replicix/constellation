@@ -334,14 +334,27 @@ impl RenewLane {
             NodeId,
             Vec<(Ino, GrantId, constellation_meta::locks::LockMode)>,
         > = BTreeMap::new();
+        let freshness = !self.ignores_freshness;
         for (ino, h) in due {
             if own_ok {
                 let cap = view.cap_until;
+                // The cap and the freshness rule are judged again at the
+                // table's own reading, the instant the extension is made
+                // from (`renew_own` reads it inside its guard): the tick's
+                // reading is older, and a proof of liveness fresh then may
+                // be stale by the time the guard is taken.
+                let view = &view;
                 if locks.renew_own(
                     ino,
                     h.id,
                     view.me,
-                    |n| cap.since(n.honour),
+                    |n| {
+                        if view.own_ok_with(n.honour, freshness) {
+                            cap.since(n.honour)
+                        } else {
+                            0
+                        }
+                    },
                     view.lock_ttl_ms,
                     view.margin_ms,
                     now,
@@ -599,6 +612,35 @@ mod tests {
         );
         assert_eq!(out, vec![LaneAction::OwnRenewed { renewed: 1 }]);
         assert_eq!(t.held(7).unwrap().until, HonourMs(2_150 + 4_000 - 500));
+    }
+
+    /// The freshness rule is judged at the instant the extension is made
+    /// from: the table's reading inside its guard, not the tick's older
+    /// one. Fail-before (plan 41 review): a fast tenure's proof of liveness
+    /// fresh at the tick (2 100, 1 100 ms after it) and stale by the guard
+    /// (2 600, 1 600 ms, past the 1 500 ms window) renewed the grant from
+    /// 2 600, an answer outside the window a sealing successor covers.
+    #[test]
+    fn the_freshness_rule_holds_at_the_extensions_own_reading() {
+        let t = LockTables::default();
+        let id = own_grant(&t);
+        t.set_clock(Arc::new(|| Now::same(2_600)));
+        let mut lane = RenewLane::new(DEFAULT_MAX_STALL_MS);
+        let f = facts(LockLaneView {
+            fast: true,
+            last_fresh: HonourMs(1_000),
+            ..view()
+        });
+        assert!(tick(&mut lane, &t, &f, 2_100).is_empty());
+        assert_eq!(t.get(id).unwrap().until, WaitMs(4_500));
+        assert_eq!(t.held(7).unwrap().until, HonourMs(3_500));
+        // Fresh at the table's reading too: renewed from it.
+        t.set_clock(Arc::new(|| Now::same(2_400)));
+        assert_eq!(
+            tick(&mut lane, &t, &f, 2_200),
+            vec![LaneAction::OwnRenewed { renewed: 1 }]
+        );
+        assert_eq!(t.held(7).unwrap().until, HonourMs(2_400 + 4_000 - 500));
     }
 
     #[test]
