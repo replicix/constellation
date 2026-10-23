@@ -1549,6 +1549,23 @@ post-change directory reply.
 `crates/frontend-fuse/src/{pagecache,repair,kernel_fixes}.rs`,
 `crates/engine/src/view/kernel_cache.rs`; PROGRESS, "Plan 42".
 
+**Detection, and the moved inode (plan 42 §5.4, F16)**: `auto` follows a
+fix's verdict, which is an override if set, else a probe's for 0001 and
+0003, else the table of releases (empty until the patches are merged);
+`Unknown` counts as not fixed, so a gap in detection keeps a workaround on.
+The probes run once per process, after the first mount, on a mount of their
+own (a tiny in-memory filesystem the daemon serves), so no view's namespace
+is touched: 0001 by whether an inode notification waits for a held
+`WRITE`'s reply, 0003 by whether a `GETATTR` reply held across a `mkdir`
+is cached. 0002 has no deterministic probe. A kernel with 0003 drops only
+the changed directories' notices: `fuse_rename_common` still updates or
+invalidates the moved inode's `ctime` without bumping its `attr_version`,
+the 2b pattern, so the moved inode's notice stays whatever the verdict
+(`node.status` `dir_change_notify_on` true, `dir_change_notify_dirs_on`
+false). Decided with the workarounds (plan 42 §10, Q5 and Q6). See
+`crates/frontend-fuse/src/kernel_fixes.rs` and `pagecache.rs`
+(`PageCacheConfig::dir_notice_modes`).
+
 ## ADR-35: Clocks: rate, not offset
 
 **Context**: until plan 43 C7b the lease, the seal watch, the promises and

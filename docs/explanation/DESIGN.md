@@ -1337,7 +1337,14 @@ Two invariants define what "stale" can and cannot mean here:
    the holder or a delegate executed in place, a delegate transaction the
    root appended, a transaction streamed ahead of S3. So caching adds no
    staleness beyond propagation lag. (Contrast NFS-style TTL caches, which
-   stay stale even after the server knows better.) And a node's view is
+   stay stale even after the server knows better.) Three races in Linux's
+   FUSE client would break this on today's kernels (a page refetched under
+   a write-through write in flight, attributes marked valid before they are
+   stored, a reply from before a directory change cancelling its
+   invalidation); the frontend works around them, each switched off by
+   itself on a kernel found to carry its fix, and what stays open on an
+   unfixed kernel is one transient `stat` of a directory in bounded mode
+   ([ADR-34](DECISIONS.md#adr-34-kernel-fuse-race-workarounds)). And a node's view is
    always a prefix of the authoritative history plus explicit speculation
    ahead of it: its own acknowledged ops, and records streamed
    contiguously from the log. It is never a mix of unrelated states.
@@ -1783,8 +1790,8 @@ daemon (not yet the metadata-only one below), stable readdir cursors,
 `constellation find`, `constellation changes`, the `unlink_subtree` and
 `copy_manifest` records (and so a metadata-only `copy_file_range`), negative
 dentry caching (a lookup miss is answered `ENOENT`, which the kernel does
-not cache), the writeback cache with `FOPEN_KEEP_CACHE`,
-and FUSE passthrough.
+not cache), the writeback cache, and FUSE passthrough. `FOPEN_KEEP_CACHE`
+is built without the writeback cache (below).
 
 ### Enabled by the local replica
 
@@ -1845,7 +1852,15 @@ and FUSE passthrough.
 - **Kernel TTLs + push invalidation**: every change from another node is
   pushed to the kernel with `notify_inval_entry`/`notify_inval_inode`
   (§6, invariant 1), so the entry/attribute TTL (1 s under `--cto
-  bounded`, 0 under strict) is only a backstop.
+  bounded`, 0 under strict) is only a backstop. A namespace reply is
+  preceded by an attribute-only invalidation of the directories it changed
+  and the inodes it moved, so the kernel rejects an attribute reply
+  generated before the change: for every operation under `--cto strict`,
+  and in bounded mode only for an inode an attribute reply may still be on
+  its way to the kernel for (each notice costs the next path walk a
+  `GETATTR`). On a kernel whose directory changes bump the attribute
+  version the directories' notices go, the moved inodes' stay: a rename
+  still updates the moved inode's `ctime` without a bump (ADR-34).
 - **Negative dentry caching**: ENOENT answers cached as negative entries
   under the same TTL and invalidated by the same push, so repeated misses
   (compilers probing include paths, `PATH` lookups) stay in the kernel.
@@ -1883,9 +1898,18 @@ and FUSE passthrough.
   so `cp --sparse`, rsync, and tar skip them instead of reading zeros.
 - **`fallocate`/`truncate` as metadata-only ops**: extend or punch without
   touching chunks until data is written.
-- **Writeback cache + `FOPEN_KEEP_CACHE`**: the kernel page cache absorbs
-  small writes and persists pages across opens; invalidated exactly on
-  remote change. Warm reads run at page-cache speed.
+- **`FOPEN_KEEP_CACHE` across opens** (no writeback cache): an open keeps
+  the kernel's pages when it finds the file's committed content unchanged
+  since the kernel last dropped them and nothing since could have left a
+  page the view would not answer (a data notification written or lost, a
+  failed or short write, a direct-I/O open, a read the write-race repair
+  cannot vouch for); never under `--cto strict`, where every open drops.
+  Warm reopens read at page-cache speed. Every page drop the frontend
+  causes or can see coming is followed: the write that may have raced a
+  refetch has the refetched pages invalidated before it is answered
+  (ADR-34).
+- **Writeback cache**: the kernel page cache absorbs small writes; a design
+  of its own (durability at `close`/`fsync`, mtime ownership). Not built.
 - **FUSE passthrough (Linux ≥ 6.9)**: for clean, fully-cached chunks,
   register the cache file with the kernel so reads bypass the daemon
   entirely — near-native throughput on cache hits. Optimization-phase item
