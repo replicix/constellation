@@ -1435,6 +1435,9 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> Result<u64, Halt> {
+        // Plan 43 C1-2: every row of the batch is journaled under the class
+        // the node's own answers wait for now.
+        let _class = self.journal_class();
         for (i, op) in batch.ops.iter().enumerate() {
             let rid = rid_of(op);
             let ack = InboxAck {

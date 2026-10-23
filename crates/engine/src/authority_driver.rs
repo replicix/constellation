@@ -67,6 +67,8 @@ pub type MutateReplyParts = (
     Position,
     u64,
     (OwnChunks, Option<constellation_meta::OwnRows>),
+    // Plan 43 C1-2: the answer waited for a group or the archive.
+    bool,
 );
 
 /// How often [`StepProfile`] is logged.
@@ -3029,6 +3031,7 @@ impl Driver {
                             Position::ZERO,
                             0,
                             (OwnChunks::None, None),
+                            false,
                         ));
                         return None;
                     }
@@ -3056,6 +3059,7 @@ impl Driver {
                                 Position::ZERO,
                                 0,
                                 (OwnChunks::None, None),
+                                false,
                             ));
                             return None;
                         }
@@ -4147,6 +4151,7 @@ impl Driver {
                 gen,
                 own_chunks,
                 own_rows,
+                committed,
             } => {
                 tracing::trace!(target: "constellation::fwd", req = req.0, "mutate reply sent");
                 if let Some(tx) = self.mutate_replies.remove(&req) {
@@ -4160,10 +4165,24 @@ impl Driver {
                         // for.
                         tokio::spawn(async move {
                             tokio::time::sleep(Duration::from_millis(delay)).await;
-                            let _ = tx.send((outcome, base, position, gen, (own_chunks, own_rows)));
+                            let _ = tx.send((
+                                outcome,
+                                base,
+                                position,
+                                gen,
+                                (own_chunks, own_rows),
+                                committed,
+                            ));
                         });
                     } else {
-                        let _ = tx.send((outcome, base, position, gen, (own_chunks, own_rows)));
+                        let _ = tx.send((
+                            outcome,
+                            base,
+                            position,
+                            gen,
+                            (own_chunks, own_rows),
+                            committed,
+                        ));
                     }
                 }
             }
@@ -4786,6 +4805,7 @@ impl Driver {
                                 gen: 0,
                                 own_chunks: OwnChunks::None,
                                 own_rows: None,
+                                committed: false,
                             },
                         }));
                         return;
@@ -4836,6 +4856,7 @@ impl Driver {
                             own_chunks,
                             own_inos,
                             own_rows,
+                            committed,
                         })) if req_id == req.0 => {
                             let position = Position {
                                 seq: position_seq,
@@ -4871,6 +4892,7 @@ impl Driver {
                                     gen,
                                     own_chunks: OwnChunks::from_wire(own_chunks, own_inos),
                                     own_rows: constellation_meta::OwnRows::from_wire(&own_rows),
+                                    committed,
                                 },
                             }));
                         }
@@ -4886,6 +4908,7 @@ impl Driver {
                                     gen: 0,
                                     own_chunks: OwnChunks::None,
                                     own_rows: None,
+                                    committed: false,
                                 },
                             }));
                         }

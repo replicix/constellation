@@ -6251,7 +6251,35 @@ fn fingerprint(result: &Result<Report, String>) -> String {
     // postdate the fingerprint: left out, so trees before and after the
     // counters give the same fingerprint for the same run.
     let text = strip_ack_classes(&text);
+    // Plan 43 C1: so do the counters C1-2 and C1-3 added to `Stats`.
+    let text = strip_counters(
+        &text,
+        &["acks_downgraded_lone", "journal_class_from_session"],
+    );
     blake3::hash(text.as_bytes()).to_hex().to_string()[..16].to_string()
+}
+
+/// `text` without every `name: <number>, ` field of a debug-printed `Stats`,
+/// for each of `names` (counters added after the fingerprint).
+fn strip_counters(text: &str, names: &[&str]) -> String {
+    let mut text = text.to_string();
+    // (longest first: one name may end another's.)
+    let mut names = names.to_vec();
+    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    for name in names {
+        let key = format!("{name}: ");
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text.as_str();
+        while let Some(i) = rest.find(&key) {
+            out.push_str(&rest[..i]);
+            let tail = &rest[i..];
+            let end = tail.find(", ").map_or(tail.len(), |e| e + 2);
+            rest = &tail[end..];
+        }
+        out.push_str(rest);
+        text = out;
+    }
+    text
 }
 
 /// `text` without every `ack_classes: [..], ` field of a debug-printed
@@ -12366,6 +12394,64 @@ fn c0_the_oracles_are_clean_on_one_node() {
             c0_count(&r.acks_by_class, "lone") > 0,
             "single seed {seed}: no lone answer judged"
         );
+    }
+}
+
+/// Plan 43 C1-2: the answer's claim of a commit is checked against the
+/// judgement and against the class of the row it answers. A single node's
+/// fast path answers `Lone` rows; with the sim claiming `RootGroup` for them
+/// (`plant_claim_root_group_on_lone`) the check must fail the run under
+/// `+commit`, and without the plant it finds nothing.
+#[test]
+fn c1_the_claim_check_catches_a_planted_commit_claim() {
+    let cfg = |plant| SimConfig {
+        nodes: 1,
+        clients_per_node: 2,
+        ops_per_client: 10,
+        random_faults: 0,
+        fast_path: sim::run::FastPath::Checked,
+        plant_claim_root_group_on_lone: plant,
+        ..SimConfig::default()
+    };
+    let mut caught = 0;
+    for seed in 0..10 {
+        let clean = c0_run("single+fast-path", seed, strict(cfg(false), "commit"));
+        assert_eq!(clean.class_claim_mismatch, 0, "seed {seed}");
+        let planted = run_seed(seed, strict(cfg(true), "commit"));
+        if let Err(e) = planted {
+            assert!(e.contains("class claim"), "seed {seed}: {e}");
+            caught += 1;
+        }
+    }
+    assert!(
+        caught >= 8,
+        "the planted claim was caught on {caught}/10 seeds"
+    );
+}
+
+/// Plan 43 C1-2: every row the core journals carries a class the core set
+/// (`Stats::journal_class_from_session`: a call site that forgot it would
+/// take the session's published class), and no answer claims a commit its
+/// row or the judgement does not bear out, across the configurations that
+/// exercise every journaling path (forwards, replays, the inbox, delegates).
+#[test]
+fn c1_the_core_journals_every_row_with_a_class_and_claims_are_borne_out() {
+    use pinned::c0_run;
+    for (label, cfg) in [
+        ("backup", backup_config()),
+        ("backup-crash", backup_crash_config()),
+        ("delegated-holder-cut", delegated_holder_cut_config()),
+        ("locks", locks_config()),
+    ] {
+        for seed in 0..12 {
+            let r = c0_run(label, seed, cfg.clone());
+            for (node, st) in &r.stats {
+                assert_eq!(
+                    st.journal_class_from_session, 0,
+                    "{label} seed {seed}: node {node} journaled without a class"
+                );
+            }
+        }
     }
 }
 

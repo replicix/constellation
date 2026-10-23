@@ -370,6 +370,8 @@ pub struct NodeEnv {
     pub rebuild_stub: bool,
     /// See `SimConfig::plant_ungated_fast_path`.
     pub plant_ungated_fast_path: bool,
+    /// See `SimConfig::plant_claim_root_group_on_lone`.
+    pub plant_claim_root_group_on_lone: bool,
 }
 
 impl NodeEnv {
@@ -711,6 +713,7 @@ impl NodeHandle {
             forwards: HashMap::new(),
             rebuild_stub: env.rebuild_stub,
             plant_ungated_fast_path: env.plant_ungated_fast_path,
+            plant_claim_root_group_on_lone: env.plant_claim_root_group_on_lone,
         };
         let task = tokio::spawn(driver.run());
         if lane {
@@ -973,6 +976,7 @@ struct Driver {
     forwards: HashMap<(NodeId, OpId), Rid>,
     rebuild_stub: bool,
     plant_ungated_fast_path: bool,
+    plant_claim_root_group_on_lone: bool,
 }
 
 /// A holder's stamps handed over after a lapse: `((holder, epoch), (clock,
@@ -2085,7 +2089,13 @@ impl Driver {
     /// judged now, against every store as it is at this emission; a
     /// requester passing another node's answer on is not judged here but
     /// verified at the end of the run (`oracle::end_of_run`).
-    fn note_answer(&self, rid: Rid, outcome: &MutateOutcome, source: Option<AnswerSource>) {
+    fn note_answer(
+        &self,
+        rid: Rid,
+        outcome: &MutateOutcome,
+        source: Option<AnswerSource>,
+        committed: Option<bool>,
+    ) {
         use super::oracle::{committed_at_answer, outcome_kind, AckEntry, AnswererState, Expected};
         let Some(kind) = outcome_kind(outcome) else {
             return;
@@ -2108,6 +2118,28 @@ impl Driver {
             let j = committed_at_answer(&self.oracles, &self.bus, self.id, &st, rid, outcome);
             let uncommitted =
                 j.class.is_none() && !(j.expected == Expected::Unjournaled && kind.is_refusal());
+            // Plan 43 C1-2: the claim of a commit, and the row's own class.
+            let rows = self.meta.journal_classes_of_rid(rid).unwrap_or_default();
+            let delegated = j.tx.as_ref().is_some_and(|t| t.origin.0 != 0)
+                || matches!(
+                    j.class,
+                    Some(constellation_authority::core::AckClass::DelegGroup { .. })
+                );
+            if let Some(why) =
+                super::oracle::check_claim(claimed, committed, j.class, &rows, delegated)
+            {
+                let text = format!(
+                    "class claim: node {} answered rid {rid:?} ({}) at t={at_ms} ms: {why} \
+                     (journal rows {rows:?}, judged: {})",
+                    self.id,
+                    kind.name(),
+                    j.detail
+                );
+                if std::env::var_os("AUTHORITY_SIM_ORACLE_DEBUG").is_some() {
+                    eprintln!("ORACLE-CLAIM t={at_ms} {text}");
+                }
+                self.oracles.claim_violations.lock().unwrap().push(text);
+            }
             if uncommitted || j.mismatch.is_some() {
                 let mut text = format!(
                     "I1 acked_implies_committed: node {} answered rid {rid:?} ({}) at t={at_ms} ms",
@@ -2147,9 +2179,9 @@ impl Driver {
 
     /// A `MutateReply` to `to` for its request `req`: judged as the answer
     /// to the rid that request carried.
-    fn note_forward_answer(&self, to: NodeId, req: OpId, outcome: &MutateOutcome) {
+    fn note_forward_answer(&self, to: NodeId, req: OpId, outcome: &MutateOutcome, committed: bool) {
         match self.forwards.get(&(to, req)).copied() {
-            Some(rid) => self.note_answer(rid, outcome, None),
+            Some(rid) => self.note_answer(rid, outcome, None, Some(committed)),
             None => {
                 if super::oracle::outcome_kind(outcome).is_some() {
                     self.oracles.acks_unmapped.fetch_add(1, Ordering::Relaxed);
@@ -2505,10 +2537,15 @@ impl Driver {
         outcome: MutateOutcome,
         deleg: Option<u64>,
     ) -> Vec<Action> {
-        let class = match deleg {
+        let mut class = match deleg {
             Some(gen) => self.core.deleg_ack_class(gen),
             None => self.core.root_ack_class(),
         };
+        if self.plant_claim_root_group_on_lone
+            && class == constellation_authority::core::AckClass::Lone
+        {
+            class = constellation_authority::core::AckClass::RootGroup;
+        }
         self.shared
             .fast_path_executed
             .fetch_add(1, Ordering::Relaxed);
@@ -2546,7 +2583,7 @@ impl Driver {
                                 .push((self.id, rid, applied, tick));
                         }
                         ClientReply::Outcome(outcome) => {
-                            self.note_answer(rid, outcome, Some(source))
+                            self.note_answer(rid, outcome, Some(source), None)
                         }
                     }
                     if let Some(tx) = self.shared.replies.lock().unwrap().remove(&rid) {
@@ -2558,9 +2595,15 @@ impl Driver {
                     // `Held` reply was sent already; that reply matches no
                     // request at the requester, which gets its answer from
                     // the dedup when it retries: not an answer.)
-                    if let PeerMsg::MutateReply { req, outcome, .. } = &msg {
+                    if let PeerMsg::MutateReply {
+                        req,
+                        outcome,
+                        committed,
+                        ..
+                    } = &msg
+                    {
                         if *req != OpId(0) {
-                            self.note_forward_answer(to, *req, outcome);
+                            self.note_forward_answer(to, *req, outcome, *committed);
                         }
                     }
                     // A forwarded op's token leaves in its wire form (the time

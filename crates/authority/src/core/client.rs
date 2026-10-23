@@ -2100,8 +2100,9 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> MutateOutcome {
+        constellation_meta::clear_last_journaled();
         let outcome = self.execute_local_outcome(now, rid, epoch, replica, out);
-        let class = self.root_ack_class();
+        let class = self.executed_answer_class(replica, rid);
         if let Some(c) = self.clients.get_mut(&rid) {
             c.answered_by = Some(AnswerSource::Sequenced(class));
         }
@@ -2170,6 +2171,7 @@ impl Core {
             let dirs = Core::dirs_of_keys(&super::holder::keys_of_op(&op), replica);
             self.place_note(self.cfg.node_id, dirs);
         }
+        let _class = self.journal_class();
         let outcome = match constellation_meta::locks::TokenPath::Local
             .scope(|| replica.execute(&op, Some(rid), &tag, now))
         {

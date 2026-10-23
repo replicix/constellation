@@ -1228,13 +1228,26 @@ impl View {
             // acknowledged (the close returns) only once its row is
             // durable, as `execute_mutate`'s fast path does; an in-doubt
             // outcome re-commits through the core, so keep the inputs.
-            let gated =
-                admitted.is_some() && self.sync.as_ref().is_some_and(|h| h.lease.ack_gated());
+            //
+            // Plan 43 C1-2: whether to wait is the committed row's own class
+            // (as `execute_mutate`'s fast path); `gated` only says whether
+            // the inputs are kept for the in-doubt re-commit. A gate that
+            // came on between the two leaves a gated row without them: it
+            // is waited for all the same, and an in-doubt outcome there
+            // fails the close (the staged state is kept; the caller retries)
+            // rather than acknowledging a row nothing holds.
+            let gated = admitted.is_some()
+                && self.sync.as_ref().is_some_and(|h| {
+                    h.lease.ack_gated() || self.meta.session().published_class().gated()
+                });
             let retry = gated.then(|| (base.clone(), manifest_bytes.clone(), dirty_hashes.clone()));
+            constellation_meta::clear_last_journaled();
             let committed =
                 self.commit_manifest_local(ino, &ws, base, manifest_bytes, dirty_hashes);
-            let jseq =
-                (gated && committed.is_ok()).then(|| self.meta.journal_tip().unwrap_or(u64::MAX));
+            let target = match (&committed, &self.sync) {
+                (Ok(()), Some(h)) => self.fast_ack_target(h),
+                _ => None,
+            };
             drop(owned);
             drop(admitted);
             if let Err(errno) = committed {
@@ -1243,8 +1256,14 @@ impl View {
                     ws: Some(Box::new(ws)),
                 });
             }
-            if let (Some(h), Some(jseq), Some((base, bytes, dirty))) = (&self.sync, jseq, retry) {
-                if !self.local_ack_durable(h, jseq) {
+            if let (Some(h), Some(target)) = (&self.sync, target) {
+                if !self.local_ack_durable(h, target) {
+                    let Some((base, bytes, dirty)) = retry else {
+                        return Err(FlushFail {
+                            errno: Code::Io,
+                            ws: Some(Box::new(ws)),
+                        });
+                    };
                     // In doubt (the lease was lost, or the backups never
                     // answered): the row may be rolled back. Commit
                     // again through the core, which resolves it — the

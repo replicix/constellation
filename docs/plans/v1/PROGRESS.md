@@ -56851,6 +56851,54 @@ Pinned seeds (unclocked, `pinned::run_seed`) whose trajectories this commit shif
 
 - The acknowledgement latency numbers on ext4, xfs, btrfs and tmpfs: pending, box.
 
+## Plan 43 C1-2 — The class at journal time, carried with every answer
+
+The second commit of plan 43 C1 (the coder spec's §4): a journal row records the class its
+answer waits for, a row answered without a commit is re-tagged `Lone`, and a reply to a
+forwarder says whether it is committed. Nothing reads the class to decide a rollback yet
+(C1-4); the commit changes what the FUSE fast path waits for in one case (its row, by its own
+class) and what a row is tagged with.
+
+### The change
+
+| Item | Where |
+|---|---|
+| `RowClass { Lone, Archive, RootGroup, DelegGroup, NonStealable }`, `gated()` (Q12); `JournalTx.class` and `JournalTxHead.class` right after `idx` (the head decodes a prefix); `journal::PendingClass` (a guard around a journaling call), `last_journaled()` (the fast path reads the row it just wrote, same thread) | `meta/store/{local,journal}.rs` |
+| `Meta::finish_local` tags the row: `PendingClass`, else `Lone` under a delegation origin (C2 makes the delegate's `DelegGroup`), else the class the session publishes; a re-shipped tail (`apply_adopted_records`) is `RootGroup`. `reclass_journal_tx`, `journal_rows_of_rid`, `journal_tx_class` | `meta/store/local.rs` |
+| `SessionState::set_durable(gate, jseq, lost, class)` publishes the class with the gate (`published_class`) | `meta/session.rs`, `authority/{replica,core/backup}.rs` |
+| `Core::journal_class()` sets `PendingClass` from `root_ack_class()` around every journaling call of the core (`holder_execute`, `execute_local`, the replay and inbox executors, refusals, the grant and recall records); `Core::handle` counts rows that took the published class instead (`Stats::journal_class_from_session`, a debug assertion: the call site forgot) | `authority/core/*` |
+| D4: `complete_ready` releases a gated answer because the gate went off: the row is re-tagged `Lone` first (`Stats::acks_downgraded_lone`) and a reply to a forwarder says `committed: false`; an answer from the dedup is the class of the row it names (`journaled_answer_class`), a gated row nothing gates any more is re-tagged and answered `Lone` | `core/{readindex,backup,holder,client}.rs` |
+| `PeerMsg::MutateReply.committed` / `Payload::MutateReply.committed` (appended): the answer waited for a group or the archive | `event.rs`, `net/message.rs`, `engine/{authority_driver,p2p}.rs` |
+| The fast path (`execute_mutate`'s and the close's): after its op, `last_journaled()` gives the row and its class and the wait is `class.gated()` for the row's last seq (before: the journal's tip and `LeaseView::ack_gated` after the execution); `DurableWait::Ungated` re-tags the row `Lone` (`SessionStats::fast_acks_downgraded`) | `engine/view/{write_gate,flush}.rs` |
+| Sim: `check_claim` (an answer that says it waited for a group but is judged lone, or whose journal row carries another class than the answer names, is a `class_claim_mismatch`, failing under `+commit`; a gated row answered with the gate off is re-tagged `Lone` and the answer counted and sourced `Lone`, D4; a delegate's rows are not compared until C2); `plant_claim_root_group_on_lone` is its non-vacuity control; `SWEEP-CLAIM-TOTALS`; the fingerprint leaves the new counters out | `tests/sim/*`, `tests/sim.rs` |
+
+No version bump, no compatibility shim: `JournalTx` is node-local and changes in place (a
+node upgrades across C1 with a drained journal), the wire fields are appended.
+
+### Evidence (debug, `0dc4db6d` against this commit, 6 threads, default clock mix)
+
+- **Identity sweep** (`AUTHORITY_SIM_FINGERPRINT=1`, flags off): fingerprints equal seed by
+  seed, failing sets equal, on `backup` 700..1000, `backup-crash` 800..1100,
+  `delegated-holder-cut` 0..300, `long-delegated` 0..200, `long-delegated-late-answers`
+  0..200, `locks` 0..300, `flex-crash` 0..200, `long-backup` 0..200 (0 differing seeds in all
+  eight). The oracle totals are equal too, except the informational `class_mismatch` and the
+  cores' own count of sequenced answers by class, which move by a few answers because an
+  answer from the dedup now names the class of its row (`backup` 792 -> 794, `backup-crash`
+  950 -> 986, `long-backup` 1183 -> 1190, `delegated-holder-cut` 810 -> 811; the others equal).
+- Fail-before (tests that need the class cannot compile on the parent; the ones that run on it
+  fail there): `a_gated_row_answered_after_the_gate_went_off_is_lone`,
+  `a_forward_reply_says_committed`, `a_row_is_journaled_with_the_class_its_answer_waits_for`
+  (core); `a_journal_row_records_its_class_and_the_head_reads_it`,
+  `reclass_rewrites_only_the_class`, `the_session_publishes_the_class_with_the_gate` (meta);
+  `ungated_fast_path_answer_retags_the_row_lone`, `the_fast_path_waits_by_the_rows_own_class`
+  (engine); `c1_the_claim_check_catches_a_planted_commit_claim` and
+  `c1_the_core_journals_every_row_with_a_class_and_claims_are_borne_out` (sim).
+- Gates (on `8061e3a5` plus this commit): `cargo fmt --check`; `clippy --workspace --all-targets
+  -D warnings`; meta lib (353), authority lib (652), sim suite (258 passed, 12 ignored),
+  `meta_repro` (4), net lib (125), engine lib (867). The identity sweep above was repeated on
+  that base: fingerprints equal, failing sets equal.
+- Perf: see the C1-3 entry (measured once for both commits).
+
 ## Plan 45 — Hard links: dentry attribute copies only for single-name inodes
 
 Plan 45 (`docs/plans/v1/wip/45-hard-links.md`) removes the O(n) cost of an

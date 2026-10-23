@@ -604,6 +604,10 @@ pub struct SimConfig {
     /// fast path ignores `Core::ack_gated`, so a holder answers its own op
     /// from its local disk while a backup is committed.
     pub plant_ungated_fast_path: bool,
+    /// Test-only (`c1_the_claim_check_catches_a_planted_commit_claim`): the
+    /// sim's fast path claims `RootGroup` for a row that waited for nothing
+    /// (a lone one).
+    pub plant_claim_root_group_on_lone: bool,
 }
 
 /// See `SimConfig::fast_path`.
@@ -864,6 +868,7 @@ impl Default for SimConfig {
             strict_lease_claims: true,
             rebuild_stub: false,
             plant_ungated_fast_path: false,
+            plant_claim_root_group_on_lone: false,
         }
     }
 }
@@ -1006,6 +1011,10 @@ pub struct Report {
     pub mismatched_acks: BTreeMap<String, usize>,
     pub unverified_relays: usize,
     pub class_mismatch: usize,
+    /// Plan 43 C1-2: answers that claim a commit no class bears out, or
+    /// whose row is tagged with another class than the answer names
+    /// (fails under `strict_commit`).
+    pub class_claim_mismatch: usize,
     pub acks_unsourced: usize,
     pub unjournaled_landed: usize,
     /// Answers with no recorded request (must be 0).
@@ -3278,6 +3287,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         oracles: oracles.clone(),
         rebuild_stub: cfg.rebuild_stub,
         plant_ungated_fast_path: cfg.plant_ungated_fast_path,
+        plant_claim_root_group_on_lone: cfg.plant_claim_root_group_on_lone,
     };
     env.world
         .hold_ms
@@ -4348,6 +4358,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.mismatched_acks = found.mismatched_acks.clone();
     report.unverified_relays = found.unverified_relays;
     report.class_mismatch = found.class_mismatch;
+    report.class_claim_mismatch = found.class_claim.len();
     report.unjournaled_landed = found.unjournaled_landed.len();
     report.acks_unsourced = oracles
         .acks_unsourced
@@ -4383,6 +4394,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     );
     for (strict, what, list) in [
         (cfg.strict_commit, "I1", &found.i1),
+        (cfg.strict_commit, "class claim", &found.class_claim),
         (cfg.strict_identity, "I2", &found.i2),
         (cfg.strict_identity, "I2c", &found.i2c),
         (cfg.strict_settle, "I4", &found.i4),

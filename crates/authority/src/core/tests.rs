@@ -2275,6 +2275,7 @@ fn overlapping_forwards_from_one_node_are_issued_in_order() {
             gen: 0,
             own_chunks: OwnChunks::None,
             own_rows: None,
+            committed: false,
         },
     });
     assert_eq!(replies(&out).len(), 1);
@@ -2670,6 +2671,7 @@ fn every_inbox_batch_of_a_rid_is_withdrawn_before_a_forward() {
             gen: 0,
             own_chunks: OwnChunks::None,
             own_rows: None,
+            committed: false,
         },
     });
     assert_eq!(replies(&out).len(), 1);
@@ -2757,6 +2759,7 @@ fn releasing_several_gated_ops_survives_the_nested_release() {
             gen: 0,
             own_chunks: OwnChunks::None,
             own_rows: None,
+            committed: false,
         },
     });
     let answered: Vec<Rid> = replies(&out).into_iter().map(|(rid, _)| rid).collect();
@@ -2897,6 +2900,7 @@ fn a_dedup_answer_without_records_is_not_installed_as_a_shadow() {
             gen: 0,
             own_chunks: OwnChunks::None,
             own_rows: None,
+            committed: false,
         },
     });
     assert_eq!(h.core.stats.shadows_installed, 0, "a shadow of nothing");
@@ -4323,6 +4327,7 @@ fn awaiting_log_forward(name: &str) -> (Harness, Rid, Vec<LogRecord>) {
             gen: 0,
             own_chunks: OwnChunks::None,
             own_rows: None,
+            committed: false,
         },
     });
     assert!(replies(&out).is_empty(), "the op waits for the log");
@@ -4485,6 +4490,7 @@ fn a_stranded_replay_is_not_gated_behind_an_op_awaiting_a_dead_epochs_log() {
             gen: 0,
             own_chunks: OwnChunks::None,
             own_rows: None,
+            committed: false,
         },
     });
     assert!(
@@ -4900,6 +4906,7 @@ mod own_chunks {
                 gen: 0,
                 own_chunks: OwnChunks::None,
                 own_rows: None,
+                committed: false,
             },
         });
         assert!(uploads_awaited(&out).is_empty());
@@ -5212,6 +5219,7 @@ mod own_chunks {
                 gen: 0,
                 own_chunks: OwnChunks::Streamed(vec![ino]),
                 own_rows: None,
+                committed: false,
             },
         });
         assert_eq!(
@@ -5784,6 +5792,7 @@ mod own_chunks {
                     gen: 0,
                     own_chunks: OwnChunks::Streamed(vec![ino]),
                     own_rows: None,
+                    committed: false,
                 },
             });
             assert!(requester
@@ -7784,6 +7793,7 @@ mod epoch_rules {
                 gen: 0,
                 own_chunks: OwnChunks::None,
                 own_rows: None,
+                committed: false,
             },
         });
         assert!(replies(&out).is_empty(), "{out:?}");
@@ -10996,6 +11006,7 @@ fn a_held_forward_executes_locally_once_the_delegation_installs() {
             gen: 0,
             own_chunks: OwnChunks::None,
             own_rows: None,
+            committed: false,
         },
     });
     let backoff = timers(&out, TimerKind::ForwardBackoff);
@@ -12103,6 +12114,7 @@ mod backup_crash {
                 gen: 0,
                 own_chunks: OwnChunks::None,
                 own_rows: None,
+                committed: false,
             },
         });
         let r = replies(&out);
@@ -20865,6 +20877,20 @@ mod locks {
         if !prev.released {
             h.watch(prev);
         }
+        // Plan 43 C1-3: a claim of a lease whose group may hold acknowledged
+        // rows carries the group's tail: a listed backup claiming by TTL
+        // holds it (a role for the holder's epoch); the permitted claimant
+        // sealed it.
+        if !permitted
+            && prev.ack_policy == constellation_store_s3::AckPolicy::Backup
+            && prev.backups.contains(&h.core.node_id())
+        {
+            h.core.bk.role = Some(constellation_meta::BackupRole {
+                holder: prev.holder,
+                epoch: prev.epoch,
+                config_version: prev.config_version,
+            });
+        }
         let mut out = Vec::new();
         h.core.enqueue_job(
             h.clk(),
@@ -24034,6 +24060,7 @@ mod locks {
                 gen: 0,
                 own_chunks: OwnChunks::None,
                 own_rows: None,
+                committed: false,
             },
         });
         assert!(
@@ -29414,6 +29441,7 @@ fn a_node_with_its_s3_stalled_keeps_forwarding_past_the_retry_budget() {
             gen: 0,
             own_chunks: OwnChunks::None,
             own_rows: None,
+            committed: false,
         },
     });
     assert!(
@@ -29976,6 +30004,7 @@ mod portable_codes {
             gen,
             own_chunks,
             own_rows,
+            committed,
         } = msg
         else {
             panic!("not a mutate reply: {msg:?}")
@@ -29991,6 +30020,7 @@ mod portable_codes {
             own_chunks: own_chunks.to_wire().0,
             own_inos: own_chunks.to_wire().1,
             own_rows: constellation_meta::OwnRows::to_wire(own_rows.as_ref()),
+            committed: *committed,
         };
         let key = iroh::SecretKey::from_bytes(&[7; 32]);
         let frame = Signed::new(&key, &payload).unwrap().encode().unwrap();
@@ -30006,6 +30036,7 @@ mod portable_codes {
             own_chunks,
             own_inos,
             own_rows,
+            committed,
         } = received
         else {
             panic!("the frame decoded to another payload")
@@ -30023,6 +30054,7 @@ mod portable_codes {
             gen,
             own_chunks: OwnChunks::from_wire(own_chunks, own_inos),
             own_rows: constellation_meta::OwnRows::from_wire(&own_rows),
+            committed,
         };
         (decoded, outcome)
     }
@@ -30763,6 +30795,7 @@ fn a_not_holder_reply_does_not_make_its_sender_the_holder() {
             gen: 0,
             own_chunks: OwnChunks::None,
             own_rows: None,
+            committed: false,
         },
     };
     let req = forward(&mut h, 1);
@@ -34237,6 +34270,7 @@ fn a_resubmission_in_doubt_merges_into_the_live_replay_of_its_rid() {
             gen: 0,
             own_chunks: OwnChunks::None,
             own_rows: None,
+            committed: false,
         },
     });
     assert_accepted_once(&out);
@@ -34308,6 +34342,7 @@ fn a_replay_of_a_rid_leaves_the_clients_in_doubt_mark_for_its_resubmission() {
             gen: 0,
             own_chunks: OwnChunks::None,
             own_rows: None,
+            committed: false,
         },
     });
     let mut out = Vec::new();
@@ -35696,13 +35731,14 @@ mod answer_sources {
             tag: Default::default(),
         });
         // (Parked as the archive's while the first assessment of peers was
-        // out, released when it found none: the row's class is the one it
-        // was journaled under.)
+        // out, released when it found none: the answer a lone node gives,
+        // so it says `Lone` and its row is re-tagged, plan 43 C1-2 D4.)
+        assert_eq!(class, AckClass::Archive);
         assert_eq!(
             sources(&out),
-            vec![(h.rid(1), AnswerSource::Sequenced(class))]
+            vec![(h.rid(1), AnswerSource::Sequenced(AckClass::Lone))]
         );
-        assert_eq!(h.core.stats.ack_classes[class.index()], 1);
+        assert_eq!(h.core.stats.ack_classes[AckClass::Lone.index()], 1);
         assert_eq!(h.core.stats.ack_classes.iter().sum::<u64>(), 1);
         // The status view names them.
         let view = h.core.ack_view();
@@ -35710,7 +35746,7 @@ mod answer_sources {
         assert!(view
             .classes
             .iter()
-            .any(|(name, n)| *name == class.name() && *n == 1));
+            .any(|(name, n)| *name == AckClass::Lone.name() && *n == 1));
         // A refusal is a sequencer's answer too; by now no peer is eligible
         // and nothing gates: the node is alone.
         let class = h.core.root_ack_class();
@@ -35729,7 +35765,7 @@ mod answer_sources {
             vec![(h.rid(2), AnswerSource::Sequenced(class))],
             "a refusal is the sequencer's answer too"
         );
-        assert_eq!(h.core.stats.ack_classes[class.index()], 1);
+        assert_eq!(h.core.stats.ack_classes[class.index()], 2);
         assert_eq!(h.core.stats.ack_classes.iter().sum::<u64>(), 2);
     }
 
@@ -35760,6 +35796,7 @@ mod answer_sources {
                 gen: 0,
                 own_chunks: OwnChunks::None,
                 own_rows: None,
+                committed: false,
             },
         });
         assert_eq!(sources(&out), vec![(r1, AnswerSource::Relayed { from: 2 })]);
@@ -35833,7 +35870,10 @@ mod answer_sources {
                 ..
             }
         ));
-        assert_eq!(h.core.stats.ack_classes[class.index()], 1);
+        // (Journaled as the archive's, answered once the first assessment
+        // of peers found none: the lone node's answer, D4.)
+        assert_eq!(class, AckClass::Archive);
+        assert_eq!(h.core.stats.ack_classes[AckClass::Lone.index()], 1);
         // A hold on a retry (`Busy`, `NotHolder`) is no answer.
         let before = h.core.stats.ack_classes;
         h.core.lease.gate = Some(PendingGate {
@@ -36090,7 +36130,7 @@ mod c1_counted {
     use constellation_meta::{JournalPos, Position};
     use constellation_store_s3::AckPolicy;
 
-    fn pos(jseq: u64) -> Position {
+    pub(super) fn pos(jseq: u64) -> Position {
         Position {
             seq: 0,
             pending: Some(JournalPos { epoch: 1, jseq }),
@@ -36099,7 +36139,7 @@ mod c1_counted {
     }
 
     /// The appends to node 2 in `out`: (request, first row, version).
-    fn appends(out: &[Action]) -> Vec<(OpId, u64, u64)> {
+    pub(super) fn appends(out: &[Action]) -> Vec<(OpId, u64, u64)> {
         out.iter()
             .filter_map(|a| match a {
                 Action::Send {
@@ -36119,7 +36159,7 @@ mod c1_counted {
 
     /// A holder (config version `cv`, `Local`, nobody listed) with node 2
     /// as its candidate backup.
-    fn holder(cv: u64) -> Harness {
+    pub(super) fn holder(cv: u64) -> Harness {
         let mut h = Harness::new(1);
         h.hold(1, None);
         h.core.lease.held.as_mut().unwrap().0.config_version = cv;
@@ -36146,13 +36186,13 @@ mod c1_counted {
         h
     }
 
-    fn journal(h: &Harness, name: &str, seq: u64) -> u64 {
+    pub(super) fn journal(h: &Harness, name: &str, seq: u64) -> u64 {
         constellation_meta::execute_mutate(&h.meta, &h.create(name), Some(h.rid(seq))).unwrap();
         h.meta.journal_tip().unwrap()
     }
 
     /// Journal a row and let the core stream it: the append it went in.
-    fn row(h: &mut Harness, name: &str, seq: u64) -> (u64, (OpId, u64, u64)) {
+    pub(super) fn row(h: &mut Harness, name: &str, seq: u64) -> (u64, (OpId, u64, u64)) {
         let tip = journal(h, name, seq);
         let out = h.step(Event::Control {
             op: OpId(900 + seq),
@@ -36163,7 +36203,7 @@ mod c1_counted {
         (tip, sent[0])
     }
 
-    fn ack(h: &mut Harness, req: OpId, acked: u64, fresh: bool) -> Vec<Action> {
+    pub(super) fn ack(h: &mut Harness, req: OpId, acked: u64, fresh: bool) -> Vec<Action> {
         h.step(Event::Peer {
             from: 2,
             msg: PeerMsg::BackupAck {
@@ -36176,7 +36216,7 @@ mod c1_counted {
         })
     }
 
-    fn swap_op(out: &[Action]) -> OpId {
+    pub(super) fn swap_op(out: &[Action]) -> OpId {
         s3_ops(out)
             .into_iter()
             .find(|(_, r)| matches!(r, S3Op::LeaseSwap { .. }))
@@ -36185,7 +36225,7 @@ mod c1_counted {
     }
 
     /// The reconfiguration to `backups` is issued and its CAS answers.
-    fn reconfigure(
+    pub(super) fn reconfigure(
         h: &mut Harness,
         backups: Vec<NodeId>,
         answer: Result<(), CasFailure>,
@@ -36297,7 +36337,7 @@ mod c1_counted {
 
     /// A holder with node 2 listed (version 2) and caught up through the
     /// row it returns, which is in the log already.
-    fn listed_holder() -> (Harness, u64) {
+    pub(super) fn listed_holder() -> (Harness, u64) {
         let mut h = holder(1);
         let (tip1, (req1, _, _)) = row(&mut h, "a", 1);
         ack(&mut h, req1, tip1, false);
@@ -37303,5 +37343,212 @@ mod lock_lane_core_tests {
         // root that named no other one is forgotten, and the grant is due.
         assert_eq!(h.core.lease.cached_holder, None);
         assert_eq!(h.meta.locks().held(7).unwrap().renewing, None);
+    }
+}
+
+/// Plan 43 C1-2: the class at journal time, carried with every answer.
+mod c1_class {
+    use super::c1_counted::{ack, appends, listed_holder, pos};
+    use super::*;
+    use crate::AnswerSource;
+    use constellation_meta::RowClass;
+
+    fn sources(actions: &[Action]) -> Vec<(Rid, AnswerSource)> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Reply { rid, source, .. } => Some((*rid, *source)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn classes_of(h: &Harness, rid: Rid) -> Vec<RowClass> {
+        h.meta.journal_classes_of_rid(rid).unwrap()
+    }
+
+    /// The backup is gone and no peer is eligible: nothing gates any more.
+    fn gate_goes_off(h: &mut Harness) {
+        h.core.lease.held.as_mut().unwrap().0.backups.clear();
+        h.core.ack.peers.clear();
+        h.core.ack.candidate = None;
+        h.core.ack.eligible = Some(false);
+        assert_eq!(h.core.durable_jseq(), u64::MAX);
+    }
+
+    /// A row the core journals carries the class its answer waits for (the
+    /// node's own answers: `root_ack_class`), whichever path journaled it.
+    #[test]
+    fn a_row_is_journaled_with_the_class_its_answer_waits_for() {
+        let (mut h, _) = listed_holder();
+        assert_eq!(h.core.root_ack_class(), AckClass::RootGroup);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: h.rid(2),
+            op: h.create("r"),
+            tag: Default::default(),
+        });
+        assert!(sources(&out).is_empty(), "parked for the backup: {out:?}");
+        assert_eq!(classes_of(&h, h.rid(2)), vec![RowClass::RootGroup]);
+        // A peer's forward is journaled as an own op until C2.
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(77),
+                rid: Rid {
+                    node: 3,
+                    incarnation: 1,
+                    seq: 1,
+                },
+                op: h.create("f"),
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+            },
+        });
+        assert!(sends(&out).iter().all(|(_, m)| !matches!(
+            m,
+            PeerMsg::MutateReply {
+                outcome: MutateOutcome::Accepted { .. },
+                ..
+            }
+        )));
+        let forwarded = Rid {
+            node: 3,
+            incarnation: 1,
+            seq: 1,
+        };
+        assert_eq!(classes_of(&h, forwarded), vec![RowClass::RootGroup]);
+        // None of it took the session's published class.
+        assert_eq!(h.core.stats.journal_class_from_session, 0);
+    }
+
+    /// D4: a gated answer released because the gate went off, not because
+    /// the row is committed, is answered as a lone node's: its row is
+    /// re-tagged `Lone` first. Fails on the parent: the row stayed
+    /// `RootGroup`-class (the class did not exist; a deposition would have
+    /// taken it for committed).
+    #[test]
+    fn a_gated_row_answered_after_the_gate_went_off_is_lone() {
+        let (mut h, _) = listed_holder();
+        let rid = h.rid(2);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: h.create("r"),
+            tag: Default::default(),
+        });
+        assert!(sources(&out).is_empty(), "parked for the backup: {out:?}");
+        assert_eq!(classes_of(&h, rid), vec![RowClass::RootGroup]);
+        gate_goes_off(&mut h);
+        let mut out = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        // Answered as the lone node's it is, the row tagged as the answer
+        // says.
+        assert_eq!(
+            sources(&out),
+            vec![(rid, AnswerSource::Sequenced(AckClass::Lone))]
+        );
+        assert_eq!(classes_of(&h, rid), vec![RowClass::Lone]);
+        assert_eq!(h.core.stats.acks_downgraded_lone, 1);
+    }
+
+    /// A row released because it *is* committed keeps its class.
+    #[test]
+    fn a_committed_row_keeps_its_class() {
+        let (mut h, tip1) = listed_holder();
+        let rid = h.rid(2);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: h.create("r"),
+            tag: Default::default(),
+        });
+        let tip = h.meta.journal_tip().unwrap();
+        assert!(tip > tip1);
+        let sent = appends(&out);
+        assert_eq!(sent.len(), 1, "{out:?}");
+        let out = ack(&mut h, sent[0].0, tip, false);
+        assert_eq!(
+            sources(&out),
+            vec![(rid, AnswerSource::Sequenced(AckClass::RootGroup))]
+        );
+        assert_eq!(classes_of(&h, rid), vec![RowClass::RootGroup]);
+        assert_eq!(h.core.stats.acks_downgraded_lone, 0);
+        assert_eq!(h.core.ack_need(&pos(tip)), None);
+    }
+
+    /// A forward's reply says whether it waited for a group: committed when
+    /// the backup held the row, not when the gate went off first.
+    #[test]
+    fn a_forward_reply_says_committed() {
+        let request = |h: &Harness, n: u64| Event::Peer {
+            from: 3,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(70 + n),
+                rid: Rid {
+                    node: 3,
+                    incarnation: 1,
+                    seq: n,
+                },
+                op: h.create(&format!("f{n}")),
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+            },
+        };
+        let committed = |out: &[Action]| {
+            sends(out)
+                .into_iter()
+                .filter_map(|(_, m)| match m {
+                    PeerMsg::MutateReply {
+                        outcome: MutateOutcome::Accepted { .. },
+                        committed,
+                        ..
+                    } => Some(*committed),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let (mut h, _) = listed_holder();
+        let out = h.step(request(&h, 1));
+        let tip = h.meta.journal_tip().unwrap();
+        let sent = appends(&out);
+        assert_eq!(sent.len(), 1, "{out:?}");
+        let out = ack(&mut h, sent[0].0, tip, false);
+        assert_eq!(committed(&out), vec![true], "{out:?}");
+        // The second: the gate goes off while it waits.
+        let out = h.step(request(&h, 2));
+        assert!(committed(&out).is_empty(), "parked: {out:?}");
+        gate_goes_off(&mut h);
+        let mut out = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        assert_eq!(committed(&out), vec![false], "{out:?}");
+        let second = Rid {
+            node: 3,
+            incarnation: 1,
+            seq: 2,
+        };
+        assert_eq!(classes_of(&h, second), vec![RowClass::Lone]);
+        // A non-answer is no commit either.
+        h.core.lease.gate = Some(PendingGate {
+            epoch: 1,
+            takeover: true,
+            marker_shipped: true,
+            drained: true,
+            fast_prev: false,
+            backup_tail_epoch: None,
+            shippable: false,
+        });
+        let out = h.step(request(&h, 3));
+        assert!(sends(&out).iter().all(|(_, m)| !matches!(
+            m,
+            PeerMsg::MutateReply {
+                committed: true,
+                ..
+            }
+        )));
     }
 }

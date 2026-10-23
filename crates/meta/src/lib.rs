@@ -44,6 +44,11 @@ pub use store::held::{DroppedHeld, HeldInode, HeldSummary};
 pub use store::inbox::{CompletedOutcome, InboxAck, InboxAckArmed};
 #[cfg(any(test, feature = "test-util"))]
 pub use store::journal::write_check_hook;
+pub use store::journal::{
+    clear_last_journaled, rows_from_session_on_this_thread, take_last_journaled, JournaledRow,
+    PendingClass, PendingClassGuard,
+};
+pub use store::local::RowClass;
 pub use store::remote::RemoteBlockers;
 pub use store::spec::{
     Refusal, SegmentApplied, SpecKind, SpeculationCounts, Stranded, StrandedOp,

@@ -302,7 +302,12 @@ fn a_gated_holders_close_returns_once_its_manifest_row_is_durable() {
     let file = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
     // Everything journaled so far is durable (on the backups).
     let session = meta.session();
-    session.set_durable(true, meta.journal_tip().unwrap(), false);
+    session.set_durable(
+        true,
+        meta.journal_tip().unwrap(),
+        false,
+        constellation_meta::RowClass::RootGroup,
+    );
     let (fs, _dir, _core) = holder_fs(meta.clone(), true);
     fs.do_write(file.ino, 0, b"hello").unwrap();
 
@@ -332,7 +337,7 @@ fn a_gated_holders_close_returns_once_its_manifest_row_is_durable() {
         );
         assert!(meta.durability_pending(&keys));
         // The backups acknowledge it: the close returns.
-        session.set_durable(true, tip, false);
+        session.set_durable(true, tip, false, constellation_meta::RowClass::RootGroup);
         assert_eq!(close.join().unwrap(), Ok(()));
     });
     // Read-your-writes without a wait: nothing of the file's is
@@ -341,6 +346,71 @@ fn a_gated_holders_close_returns_once_its_manifest_row_is_durable() {
     assert_eq!(meta.session_wait(&keys), SessionWait::Fast);
     assert_eq!(meta.getattr(file.ino).unwrap().unwrap().size, 5);
     assert_eq!(session.stats().fast_acks_waited, 1);
+}
+
+/// Plan 43 C1-2 (D4): the gate goes off while a fast-path close waits (the
+/// group is gone, the lease still this node's): the close returns, the row
+/// it journaled is re-tagged `Lone` — it was answered on this disk alone,
+/// and what a deposition does with the row must match. Fails on the
+/// parent: the row stayed gated-class.
+#[test]
+fn ungated_fast_path_answer_retags_the_row_lone() {
+    use constellation_meta::RowClass;
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let file = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+    let session = meta.session();
+    session.set_durable(
+        true,
+        meta.journal_tip().unwrap(),
+        false,
+        RowClass::RootGroup,
+    );
+    let (fs, _dir, _core) = holder_fs(meta.clone(), true);
+    fs.do_write(file.ino, 0, b"hello").unwrap();
+    std::thread::scope(|scope| {
+        let close = scope.spawn(|| fs.flush_inode(file.ino, false));
+        let started = std::time::Instant::now();
+        let tip = loop {
+            let tip = meta.journal_tip().unwrap();
+            if tip > session.durable_jseq() {
+                break tip;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "never journaled"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        // Journaled under the class the core published with the gate.
+        assert_eq!(
+            meta.journal_tx_class(tip).unwrap(),
+            Some(RowClass::RootGroup)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!close.is_finished(), "the close waits for the group");
+        // The gate goes off, the lease still this node's.
+        session.set_durable(false, u64::MAX, false, RowClass::Lone);
+        assert_eq!(close.join().unwrap(), Ok(()));
+        assert_eq!(meta.journal_tx_class(tip).unwrap(), Some(RowClass::Lone));
+    });
+    assert_eq!(session.stats().fast_acks_downgraded, 1);
+}
+
+/// Plan 43 C1-2: the fast path's wait follows the class the row was
+/// journaled under, not the gate as it stands after the execution: a row
+/// journaled `Lone` (the gate was off) is answered at once, whatever the
+/// lease view says by then.
+#[test]
+fn the_fast_path_waits_by_the_rows_own_class() {
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let file = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+    // The view says gated (a stale mirror, a gate that came on a moment
+    // ago); the published class is the lone node's: the row is `Lone`.
+    let (fs, _dir, _core) = holder_fs(meta.clone(), true);
+    fs.do_write(file.ino, 0, b"hello").unwrap();
+    fs.flush_inode(file.ino, false).unwrap();
+    assert_eq!(meta.session().stats().fast_acks_waited, 0);
+    assert_eq!(meta.session().stats().fast_acks_in_doubt, 0);
 }
 
 #[test]

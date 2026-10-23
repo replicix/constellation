@@ -893,6 +893,7 @@ impl Core {
                     gen: 0,
                     own_chunks: OwnChunks::None,
                     own_rows: None,
+                    committed: false,
                 },
             });
         }
@@ -1106,6 +1107,7 @@ impl Core {
                         gen: 0,
                         own_chunks: OwnChunks::None,
                         own_rows: None,
+                        committed: false,
                     },
                 });
             }
@@ -1295,6 +1297,7 @@ impl Core {
                     // (`Meta::remote_blockers`): the requester waits for
                     // everything through the position.
                     own_rows: None,
+                    committed: false,
                 },
                 class,
                 out,
@@ -4284,6 +4287,7 @@ impl Core {
         } else {
             cursor
         };
+        let _class = self.journal_class();
         if let Err(error) =
             replica.apply_records_journaled(&[LogRecord::RecallCut { dir, gen, through }], None)
         {
@@ -4670,6 +4674,7 @@ impl Core {
             .next_delegation_gen(highest + 1)
             .map_err(|e| e.to_string())?;
         let designated = kind == DelegKind::Designated;
+        let _class = self.journal_class();
         replica
             .apply_records_journaled(
                 &[LogRecord::Delegate {

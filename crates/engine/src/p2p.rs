@@ -476,7 +476,7 @@ impl constellation_net::PeerService for P2pBridge {
             let (reply, receive) = tokio::sync::oneshot::channel();
             let started = std::time::Instant::now();
             tracing::trace!(target: "constellation::fwd", rid = rid.seq, rnode = rid.node, "mutate request queued");
-            let (outcome, base, position, gen, (own_chunks, own_rows)) = if self
+            let (outcome, base, position, gen, (own_chunks, own_rows), committed) = if self
                 .nudge
                 .send(sync::SyncRequest::Mutate {
                     requester,
@@ -497,6 +497,7 @@ impl constellation_net::PeerService for P2pBridge {
                     constellation_meta::Position::ZERO,
                     0,
                     (constellation_meta::OwnChunks::None, None),
+                    false,
                 ))
             } else {
                 (
@@ -505,6 +506,7 @@ impl constellation_net::PeerService for P2pBridge {
                     constellation_meta::Position::ZERO,
                     0,
                     (constellation_meta::OwnChunks::None, None),
+                    false,
                 )
             };
             tracing::trace!(target: "constellation::fwd", rid = rid.seq, rnode = rid.node, "mutate reply taken");
@@ -525,6 +527,7 @@ impl constellation_net::PeerService for P2pBridge {
                 own_chunks: own_wire.0,
                 own_inos: own_wire.1,
                 own_rows: constellation_meta::OwnRows::to_wire(own_rows.as_ref()),
+                committed,
             }
         })
     }

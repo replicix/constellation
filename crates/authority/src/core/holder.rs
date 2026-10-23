@@ -122,6 +122,7 @@ impl Core {
                         gen: 0,
                         own_chunks: OwnChunks::None,
                         own_rows: None,
+                        committed: false,
                     },
                 });
             }
@@ -151,6 +152,7 @@ impl Core {
                             gen: 0,
                             own_chunks: OwnChunks::None,
                             own_rows: None,
+                            committed: false,
                         },
                     });
                     return;
@@ -214,6 +216,7 @@ impl Core {
                                 gen: 0,
                                 own_chunks: OwnChunks::None,
                                 own_rows: None,
+                                committed: false,
                             },
                         });
                         return;
@@ -235,6 +238,7 @@ impl Core {
                                     gen: 0,
                                     own_chunks: OwnChunks::None,
                                     own_rows: None,
+                                    committed: false,
                                 },
                                 class,
                                 out,
@@ -335,8 +339,13 @@ impl Core {
             None => None,
         };
         let durable = self.ack_need(&position);
-        // Plan 43 C2a: what this answer waits for, whether it parks or not.
-        let class = self.root_ack_class();
+        // Plan 43 C2a: what this answer waits for, whether it parks or not;
+        // an answer from the dedup is the class of the row it names (C1-2).
+        let class = if executed {
+            self.root_ack_class()
+        } else {
+            self.journaled_answer_class(replica, rid)
+        };
         if wait.is_some() || durable.is_some() {
             // Only an acknowledgement's wait for durability says now what
             // it waits for (`held_for_upload`); the rest is worked out
@@ -404,6 +413,7 @@ impl Core {
                 gen: 0,
                 own_chunks,
                 own_rows,
+                committed: false,
             },
             class,
             out,
@@ -675,6 +685,7 @@ impl Core {
             rseq = rid.seq,
             "holder: executing a forwarded op"
         );
+        let _class = self.journal_class();
         let outcome = match constellation_meta::locks::TokenPath::P2p
             .scope(|| replica.execute(op, Some(rid), tag, now))
         {
@@ -766,6 +777,7 @@ impl Core {
         op: Option<&MutateOp>,
         replica: &dyn Replica,
     ) {
+        let _class = self.journal_class();
         if let Err(error) = replica.journal_refusal(rid, code, op) {
             tracing::warn!(node = self.cfg.node_id, ?rid, %code, %error, "could not journal a refusal");
             return;

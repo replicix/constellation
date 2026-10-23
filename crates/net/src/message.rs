@@ -349,6 +349,8 @@ pub enum Payload {
         /// of the requester's own transactions unshipped through the
         /// position (empty: not worked out).
         own_rows: Vec<u8>,
+        /// Plan 43 C1-2: the answer waited for a group or the archive.
+        committed: bool,
     },
     /// Plan 30 §M8: a `cto=strict` reader asks the sequencer where the
     /// state of `ino` is (its record; with `dir`, its entries; with

@@ -4,6 +4,15 @@
 
 use super::*;
 
+/// Plan 43 C1-2: the journal row a fast-path acknowledgement waits for:
+/// its first seq (the key `Meta::reclass_journal_tx` finds it by) and its
+/// last (what the durable watermark must cover).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct AckTarget {
+    pub(super) first: u64,
+    pub(super) last: u64,
+}
+
 /// A cheap, non-cryptographic random value in `[0, 1)`, fresh per call.
 /// `RandomState::new()` draws its keys from the OS RNG each time it is
 /// constructed, so hashing nothing still yields a value that varies
@@ -475,6 +484,7 @@ impl View {
             // through the core instead of journaling a row a takeover
             // would strand.
             let lease = h.lease.clone();
+            constellation_meta::clear_last_journaled();
             let result = constellation_meta::execute_admitted(
                 &self.meta,
                 op,
@@ -489,10 +499,13 @@ impl View {
                 return self.submit_to_core(h, op, rid, &tag, false);
             }
             // Plan 30 §M9: under a durability gate, the row this op
-            // journaled (at or below the tip now) must reach the backups
-            // or the log before the acknowledgement.
-            let jseq = if h.lease.ack_gated() && result.is_ok() {
-                Some(self.meta.journal_tip().unwrap_or(u64::MAX))
+            // journaled must reach the backups or the log before the
+            // acknowledgement. Plan 43 C1-2: the op's own row and its own
+            // class decide it (`fast_ack_target`), not the journal's tip
+            // and the gate as it stands after the execution: what the row
+            // is tagged with and what the answer waits for must agree.
+            let jseq = if result.is_ok() {
+                self.fast_ack_target(h)
             } else {
                 None
             };
@@ -505,8 +518,8 @@ impl View {
             return match result {
                 Ok(records) => {
                     h.lease.touch(now.wait);
-                    if let Some(jseq) = jseq {
-                        if let Some(outcome) = self.ack_when_durable(h, rid, op, &tag, jseq) {
+                    if let Some(target) = jseq {
+                        if let Some(outcome) = self.ack_when_durable(h, rid, op, &tag, target) {
                             return outcome;
                         }
                     }
@@ -550,9 +563,9 @@ impl View {
         rid: constellation_meta::Rid,
         op: &constellation_meta::MutateOp,
         tag: &constellation_meta::locks::LockTag,
-        jseq: u64,
+        target: AckTarget,
     ) -> Option<Result<(), MutateFail>> {
-        if self.local_ack_durable(h, jseq) {
+        if self.local_ack_durable(h, target) {
             None
         } else {
             Some(self.submit_to_core(h, op, rid, tag, true))
@@ -568,20 +581,55 @@ impl View {
     /// holder's own manifest commit on close (without it the close
     /// returned before its row was durable, and the file's next read
     /// waited for it in `Meta::durability_pending` instead).
-    pub(super) fn local_ack_durable(&self, h: &SyncHandle, jseq: u64) -> bool {
+    pub(super) fn local_ack_durable(&self, h: &SyncHandle, target: AckTarget) -> bool {
         let _ = h.tx.send(SyncRequest::Journaled);
         let session = self.meta.session();
         constellation_vfs::watch::stage("durability acknowledgement");
-        match session.wait_durable(jseq, DURABLE_WAIT_BUDGET) {
+        match session.wait_durable(target.last, DURABLE_WAIT_BUDGET) {
             constellation_meta::DurableWait::Durable(waited) => {
                 session.count_fast_ack(waited);
                 true
             }
-            constellation_meta::DurableWait::Ungated => true,
+            // Plan 43 C1-2 (D4): the gate went off with the lease still this
+            // node's: the answer is a lone node's, so the row is re-tagged
+            // `Lone` before it is given — what a deposition does with it
+            // must match what the client was told.
+            constellation_meta::DurableWait::Ungated => {
+                if self
+                    .meta
+                    .reclass_journal_tx(target.first, constellation_meta::RowClass::Lone)
+                    .is_ok_and(|changed| changed)
+                {
+                    session.count_fast_ack_downgraded();
+                }
+                true
+            }
             constellation_meta::DurableWait::Lost | constellation_meta::DurableWait::TimedOut => {
                 session.count_fast_ack_in_doubt();
                 false
             }
+        }
+    }
+
+    /// Plan 43 C1-2: what the fast path's acknowledgement of the op that
+    /// just executed on this thread waits for: its own journal row, when
+    /// the row's class is a gated one. `None`: nothing to wait for (the row
+    /// is `Lone` or non-stealable: the gate was off when it was journaled).
+    /// An op that journaled nothing waits for the journal's tip while the
+    /// gate is on (its answer may rest on rows not yet durable).
+    pub(super) fn fast_ack_target(&self, h: &SyncHandle) -> Option<AckTarget> {
+        match constellation_meta::take_last_journaled() {
+            Some(row) => row.class.gated().then_some(AckTarget {
+                first: row.first,
+                last: row.last,
+            }),
+            None => h.lease.ack_gated().then(|| {
+                let tip = self.meta.journal_tip().unwrap_or(u64::MAX);
+                AckTarget {
+                    first: tip,
+                    last: tip,
+                }
+            }),
         }
     }
 

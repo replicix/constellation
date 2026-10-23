@@ -480,6 +480,13 @@ pub enum PeerMsg {
         /// the requester's pending there, a `Held`, a delegate's answer):
         /// everything through the position is owed.
         own_rows: Option<constellation_meta::OwnRows>,
+        /// Plan 43 C1-2: the answer waited for a group or the archive
+        /// (`AckClass::gated`): what it says is committed, so a shadow or
+        /// hint the requester installs from it never rolls back at a
+        /// takeover (C1-4). `false` on an answer that waited for nothing
+        /// (a lone node's, or one released with the gate off) and on every
+        /// non-answer (`Busy`, `NotHolder`, a `Held`).
+        committed: bool,
     },
     /// "I want the lease" (`Payload::LeaseRequest`), sent to the holder.
     /// `epoch_applied`: `Some(applied)` asks for a continuation epoch's

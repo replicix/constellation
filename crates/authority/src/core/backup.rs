@@ -27,8 +27,16 @@
 //!
 //! The wait is a parked continuation (plan 30 §M8's park, extended with a
 //! durability condition): the op has executed, its rows ship like any
-//! other, only the reply waits. Under a non-`Local` policy the FUSE fast
-//! path is closed (`LeaseView::admit`), so every local mutation goes
+//! other, only the reply waits. The FUSE fast path writes its row outside
+//! the core and then waits by the row's own class (plan 43 C1-2): the class
+//! the core published with the gate when the row was journaled
+//! (`Core::root_ack_class`, stored with the journal row as
+//! `constellation_meta::RowClass`), so what the row is tagged with and what
+//! its answer waits for agree; a row whose answer was released because the
+//! gate went off (the group is gone and no peer is eligible, or an epoch
+//! hold took over), not because the row is committed, is re-tagged `Lone`
+//! first (`Core::complete_ready`, the fast path's `DurableWait::Ungated`):
+//! "gated implies committed at the answer". Every other local mutation goes
 //! through the core and parks the same way — which is also what lets a
 //! deposition turn a waiting op into an in-doubt retry by rid instead of
 //! an acknowledgement nobody can honour. And the holder's own reads wait
@@ -521,7 +529,7 @@ pub(crate) struct AckState {
     /// in the order they were made.
     pub(crate) renew_held_deleg: Vec<(FreshHold, NodeId, PeerMsg)>,
     /// What the replica's durability gate was last told.
-    reported: Option<(bool, u64, bool)>,
+    reported: Option<(bool, u64, bool, constellation_meta::RowClass)>,
     /// A fast takeover of a tenure that served strict reads is waiting for
     /// its marker, where the successor's floor starts (see the module
     /// doc); `false` after the floor was set or when none is due.
@@ -626,7 +634,7 @@ pub(crate) struct BackupState {
     /// Transactions persisted ahead of a gap (the holder pipelines
     /// appends, and requests may overtake each other): `first -> last`,
     /// folded into `acked` as the gap closes.
-    held: BTreeMap<u64, u64>,
+    pub(crate) held: BTreeMap<u64, u64>,
     pub last_heard: WaitMs,
     /// The highest epoch sealed (persisted by the replica too).
     pub sealed: Epoch,
@@ -888,6 +896,13 @@ pub enum AckClass {
 }
 
 impl AckClass {
+    /// Q12's rule: the classes whose answer waited for a group or the
+    /// archive, so what it says is committed. Not `NonStealable` and not
+    /// `Lone`. (`RowClass::gated`, the stored class's.)
+    pub fn gated(&self) -> bool {
+        !matches!(self, AckClass::NonStealable | AckClass::Lone)
+    }
+
     /// The class's names in counter order (`AckClass::index`).
     pub const NAMES: [&'static str; 5] = [
         "archive",
@@ -916,6 +931,19 @@ impl AckClass {
             AckClass::DelegGroup { .. } => "deleg-group",
             AckClass::NonStealable => "non-stealable",
             AckClass::Lone => "lone",
+        }
+    }
+}
+
+impl From<AckClass> for constellation_meta::RowClass {
+    /// Plan 43 C1-2: the class stored with a journal row.
+    fn from(class: AckClass) -> Self {
+        match class {
+            AckClass::Archive => constellation_meta::RowClass::Archive,
+            AckClass::RootGroup => constellation_meta::RowClass::RootGroup,
+            AckClass::DelegGroup { .. } => constellation_meta::RowClass::DelegGroup,
+            AckClass::NonStealable => constellation_meta::RowClass::NonStealable,
+            AckClass::Lone => constellation_meta::RowClass::Lone,
         }
     }
 }
@@ -1255,6 +1283,63 @@ impl Core {
         }
     }
 
+    /// Plan 43 C1-2: the class a journal row this node writes now is tagged
+    /// with, for the scope of the journaling call (the guard): what an answer
+    /// to the row's own client waits for ([`Self::root_ack_class`]). A
+    /// forward executed here is journaled as an own op until C2 gives it the
+    /// archive. The class is fixed at the journaling; only a row answered
+    /// with the gate off is re-tagged `Lone` (`complete_ready`).
+    pub(crate) fn journal_class(&self) -> constellation_meta::PendingClassGuard {
+        constellation_meta::PendingClass::set(self.root_ack_class().into())
+    }
+
+    /// Plan 43 C1-2: the class of an answer to a rid this node already
+    /// journaled (a retry's dedup, an in-doubt op's resolution): the class
+    /// of the row itself, not what an answer would wait for now — a row
+    /// journaled `Lone` (the gate was off) answered `RootGroup` because a
+    /// backup has been listed since would tell its requester it is
+    /// committed, and a deposition would then treat it as not. A row that
+    /// is no longer in the journal is in the log (`Archive`) or, failing
+    /// that, answered as the root's now.
+    pub(crate) fn journaled_answer_class(&self, replica: &dyn Replica, rid: Rid) -> AckClass {
+        match replica.journal_class_of_rid(rid) {
+            // A gated row nothing gates any more (its group is gone, the
+            // lease lists no backup): answered on this disk alone, so it
+            // is a lone node's answer and the row is re-tagged `Lone`, as
+            // a parked one released with the gate off is (D4).
+            Some((first, class))
+                if class.gated()
+                    && self.durable_jseq() == u64::MAX
+                    && !self.ack.shipped_rows.contains(&first) =>
+            {
+                let _ = replica.reclass_journal_tx(first, constellation_meta::RowClass::Lone);
+                AckClass::Lone
+            }
+            Some((_, constellation_meta::RowClass::Lone)) => AckClass::Lone,
+            Some((_, constellation_meta::RowClass::Archive)) => AckClass::Archive,
+            Some((_, constellation_meta::RowClass::RootGroup)) => AckClass::RootGroup,
+            Some((_, constellation_meta::RowClass::NonStealable)) => AckClass::NonStealable,
+            Some((_, constellation_meta::RowClass::DelegGroup)) | None => self.root_ack_class(),
+        }
+    }
+
+    /// Plan 43 C1-2: the class of the answer to an op this thread executed
+    /// just now (`execute_local`): that of the row it journaled; an op that
+    /// journaled nothing was answered from what the node had journaled
+    /// before ([`Self::journaled_answer_class`]).
+    pub(crate) fn executed_answer_class(&self, replica: &dyn Replica, rid: Rid) -> AckClass {
+        match constellation_meta::take_last_journaled().map(|r| r.class) {
+            Some(constellation_meta::RowClass::DelegGroup) => self.root_ack_class(),
+            Some(class) => match class {
+                constellation_meta::RowClass::Lone => AckClass::Lone,
+                constellation_meta::RowClass::Archive => AckClass::Archive,
+                constellation_meta::RowClass::RootGroup => AckClass::RootGroup,
+                _ => AckClass::NonStealable,
+            },
+            None => self.journaled_answer_class(replica, rid),
+        }
+    }
+
     /// Plan 43 C2a: the source to name for an outcome this node reads off
     /// its own `completed` row (a dedup, a retry that finds the rid done):
     /// the archive when an applied segment carries the row, otherwise the
@@ -1263,7 +1348,7 @@ impl Core {
         AnswerSource::Sequenced(if replica.outcome_from_log(rid) {
             AckClass::Archive
         } else {
-            self.root_ack_class()
+            self.journaled_answer_class(replica, rid)
         })
     }
 
@@ -1276,9 +1361,28 @@ impl Core {
         class: AckClass,
         out: &mut Vec<Action>,
     ) {
-        if let PeerMsg::MutateReply { outcome, .. } = &msg {
+        self.send_answer_committed(to, msg, class, class.gated(), out)
+    }
+
+    /// [`Self::send_answer`], with whether the answer says it is committed
+    /// given: a gated answer released with the gate off says it is not.
+    pub(crate) fn send_answer_committed(
+        &mut self,
+        to: NodeId,
+        mut msg: PeerMsg,
+        class: AckClass,
+        says_committed: bool,
+        out: &mut Vec<Action>,
+    ) {
+        if let PeerMsg::MutateReply {
+            outcome, committed, ..
+        } = &mut msg
+        {
             if is_answer(outcome) {
                 self.stats.ack_classes[class.index()] += 1;
+                // Plan 43 C1-2: a gated answer is a commit; the requester's
+                // shadow of it is not speculation (C1-4).
+                *committed = says_committed;
             }
         }
         out.push(Action::Send { to, msg });
@@ -1305,9 +1409,13 @@ impl Core {
         let gate = self.lease.held.is_some() && self.durable_jseq() != u64::MAX;
         let jseq = if gate { self.durable_jseq() } else { u64::MAX };
         let lost = self.lease.lost;
-        if self.ack.reported != Some((gate, jseq, lost)) {
-            self.ack.reported = Some((gate, jseq, lost));
-            replica.set_durable(gate, jseq, lost);
+        // Plan 43 C1-2: the class of the answers this node gives its own
+        // clients, published with the gate: the FUSE fast path journals
+        // its rows with it and waits by it.
+        let class: constellation_meta::RowClass = self.root_ack_class().into();
+        if self.ack.reported != Some((gate, jseq, lost, class)) {
+            self.ack.reported = Some((gate, jseq, lost, class));
+            replica.set_durable(gate, jseq, lost, class);
         }
     }
 

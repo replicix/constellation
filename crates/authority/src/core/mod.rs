@@ -1241,6 +1241,12 @@ pub struct Stats {
     /// or an outcome to this node's own client that was not another node's
     /// answer passed on.
     pub ack_classes: [u64; 5],
+    /// Plan 43 C1-2 (D4): gated answers released with the gate off, whose
+    /// rows were re-tagged `Lone` (answered as a lone node would).
+    pub acks_downgraded_lone: u64,
+    /// Plan 43 C1-2: journal rows the core wrote without setting their
+    /// class (they took the session's published one). Must stay 0.
+    pub journal_class_from_session: u64,
     // ---- M10: heartbeat promises ----
     /// Promises persisted and PUT (on an observed unrenewed expiry, on a
     /// peer's request, or to advertise a changed slack).
@@ -1929,6 +1935,24 @@ impl Core {
     /// Handle one event. Every action returned must be carried out by the
     /// driver after this returns; none of them may be waited on before.
     pub fn handle(&mut self, now: Now, event: Event, replica: &dyn Replica) -> Vec<Action> {
+        // Plan 43 C1-2: every row the core journals carries a class it set
+        // (`Core::journal_class`); a row that fell back to the class the
+        // session publishes is a call site that forgot it. Counted, and a
+        // debug assertion for the tests and the simulation.
+        let from_session = replica.class_from_session();
+        let out = self.handle_event(now, event, replica);
+        let missed = replica.class_from_session().saturating_sub(from_session);
+        if missed > 0 {
+            self.stats.journal_class_from_session += missed;
+            debug_assert!(
+                false,
+                "{missed} journal row(s) written by the core without a class of its own"
+            );
+        }
+        out
+    }
+
+    fn handle_event(&mut self, now: Now, event: Event, replica: &dyn Replica) -> Vec<Action> {
         let mut out = Vec::new();
         if self.stopped {
             self.dw.close_all();
@@ -2147,6 +2171,9 @@ impl Core {
                 gen,
                 own_chunks,
                 own_rows,
+                // Plan 43 C1-2: carried for C1-4, which installs the
+                // requester's shadow or hint as committed from it.
+                committed: _,
             } => self.on_mutate_reply(
                 now,
                 from,

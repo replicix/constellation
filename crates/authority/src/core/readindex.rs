@@ -625,6 +625,7 @@ impl Core {
                             gen: 0,
                             own_chunks: OwnChunks::None,
                             own_rows: None,
+                            committed: false,
                         },
                     });
                 }
@@ -661,6 +662,7 @@ impl Core {
                             gen: 0,
                             own_chunks: OwnChunks::None,
                             own_rows: None,
+                            committed: false,
                         },
                     });
                 }
@@ -959,6 +961,7 @@ impl Core {
                                 gen: 0,
                                 own_chunks: OwnChunks::None,
                                 own_rows: None,
+                                committed: false,
                             },
                         });
                     }
@@ -1189,6 +1192,7 @@ impl Core {
                 gen: 0,
                 own_chunks,
                 own_rows: None,
+                committed: false,
             },
         });
     }
@@ -1304,6 +1308,7 @@ impl Core {
                     gen: 0,
                     own_chunks,
                     own_rows: None,
+                    committed: false,
                 },
             });
         }
@@ -1564,6 +1569,35 @@ impl Core {
                 continue;
             };
             let waited = now.wait.since(p.since).max(0) as u64;
+            // Plan 43 C1-2 (D4): a gated answer released because the gate
+            // went off (the group is gone and no peer is eligible, or an
+            // epoch hold took over), not because the row is committed, is
+            // the answer a lone node gives: its row is re-tagged `Lone`
+            // before the answer leaves, and a reply to a requester says it
+            // is not committed (`MutateReply::committed`), so what a
+            // deposition does with the row matches what the client was
+            // told. Nothing that *waits* is re-decided; only a row about to
+            // be answered on this node's disk alone. The answer is counted
+            // and sourced as the lone node's it is (`Lone`), not as the
+            // class it was parked for.
+            let downgraded = p.durable.is_some_and(|j| {
+                j > shipped
+                    && self.durable_jseq() == u64::MAX
+                    && !self.ack.shipped_rows.contains(&j)
+            }) && match &p.what {
+                ParkedWhat::Reply { class, .. } | ParkedWhat::Finish { class, .. } => class.gated(),
+                _ => false,
+            };
+            if downgraded {
+                if let Some(j) = p.durable {
+                    if let Err(error) =
+                        replica.reclass_journal_tx(j, constellation_meta::RowClass::Lone)
+                    {
+                        tracing::warn!(node = self.cfg.node_id, %error, "could not re-tag a row answered with the gate off");
+                    }
+                }
+                self.stats.acks_downgraded_lone += 1;
+            }
             if p.durable.is_some() {
                 self.stats.ack_wait_ms_total += waited;
                 let req = match &p.what {
@@ -1596,6 +1630,7 @@ impl Core {
                     blockers: _,
                     class,
                 } => {
+                    let class = if downgraded { AckClass::Lone } else { class };
                     self.rd.parked_rids.remove(&rid);
                     if let Some(t) = held_timer {
                         self.cancel_timer(t, out);
@@ -1603,7 +1638,7 @@ impl Core {
                     if let Some(req) = req {
                         let (own_chunks, own_rows) =
                             self.own_reply_parts(to, rid, &outcome, (gen, &position), replica);
-                        self.send_answer(
+                        self.send_answer_committed(
                             to,
                             PeerMsg::MutateReply {
                                 req,
@@ -1613,8 +1648,10 @@ impl Core {
                                 gen,
                                 own_chunks,
                                 own_rows,
+                                committed: false,
                             },
                             class,
+                            class.gated(),
                             out,
                         );
                     }
@@ -1629,7 +1666,7 @@ impl Core {
                     now,
                     rid,
                     outcome,
-                    AnswerSource::Sequenced(class),
+                    AnswerSource::Sequenced(if downgraded { AckClass::Lone } else { class }),
                     replica,
                     out,
                 ),

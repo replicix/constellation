@@ -118,6 +118,66 @@ enum Journaled {
     Appended,
 }
 
+/// Plan 43 §5.1: what a journal row's acknowledgement waited, or waits, for
+/// — the class of the sequencer's commit point at the moment the row was
+/// journaled (C1-2). The class is stored with the row because what a
+/// deposition or a takeover does to it (C1-4: a gated row goes to the member
+/// copy, an ungated one is replayed) must follow what its client was told,
+/// not what the node believes later. It is fixed at journal time for
+/// everything that *waits*; the one change after the fact is a row whose own
+/// client was answered with the gate off: it is re-tagged `Lone`
+/// ([`Meta::reclass_journal_tx`]), so that its strand behaviour matches the
+/// answer (S7: "gated implies committed at the answer").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RowClass {
+    /// Nothing but this node's disk holds it: a lone sequencer's row.
+    #[default]
+    Lone,
+    /// The row waits for an applied, unfenced log segment (`ack=s3`, or a
+    /// holder with no backup yet but one to be had).
+    Archive,
+    /// The root group: the holder's journal and every backup the lease
+    /// object lists hold it.
+    RootGroup,
+    /// The delegation's group (C2).
+    DelegGroup,
+    /// A designee's or an epoch hold's row: never stolen, never gated.
+    NonStealable,
+}
+
+impl RowClass {
+    /// Q12's rule: the classes whose acknowledgement waits for a group or
+    /// the archive, so the row is committed once it is answered. Not
+    /// `NonStealable` (its holder cannot be replaced, nothing waits) and
+    /// not `Lone`.
+    pub fn gated(self) -> bool {
+        matches!(
+            self,
+            RowClass::Archive | RowClass::RootGroup | RowClass::DelegGroup
+        )
+    }
+
+    pub(crate) fn to_u8(self) -> u8 {
+        match self {
+            RowClass::Lone => 0,
+            RowClass::Archive => 1,
+            RowClass::RootGroup => 2,
+            RowClass::DelegGroup => 3,
+            RowClass::NonStealable => 4,
+        }
+    }
+
+    pub(crate) fn from_u8(v: u8) -> RowClass {
+        match v {
+            1 => RowClass::Archive,
+            2 => RowClass::RootGroup,
+            3 => RowClass::DelegGroup,
+            4 => RowClass::NonStealable,
+            _ => RowClass::Lone,
+        }
+    }
+}
+
 /// A `journal_tx` value: one journaled transaction still in `journal`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct JournalTx {
@@ -135,6 +195,11 @@ pub(crate) struct JournalTx {
     /// delegate origin ship with it in the segment envelope.
     pub gen: u64,
     pub idx: u64,
+    /// Plan 43 C1-2: the class the row was journaled under
+    /// (`journal::PendingClass`, else the session's published class). It
+    /// sits right after `idx`, before `rid`, so that [`JournalTxHead`]
+    /// decodes it as part of its prefix.
+    pub class: RowClass,
     /// The rid `mutate::execute` ran it under, if any.
     pub rid: Option<Rid>,
     /// The op `mutate::execute` ran, if the transaction came from one. A
@@ -171,6 +236,7 @@ pub(crate) struct JournalTxHead {
     pub epoch: u64,
     pub gen: u64,
     pub idx: u64,
+    pub class: RowClass,
 }
 
 pub(crate) fn tx_key(first: u64) -> Vec<u8> {
@@ -399,6 +465,7 @@ impl Meta {
         // takes the generation's next index (a persisted counter, so a
         // restart continues the stream); the root records the index the
         // delegate assigned.
+        let delegated = journal::PendingDelegate::peek().is_some();
         let (gen, idx, deps) = match journal::PendingDelegate::take() {
             Some(d) => {
                 let idx = match d.idx {
@@ -417,6 +484,26 @@ impl Meta {
             }
             None => (0, 0, crate::session::Position::ZERO),
         };
+        // Plan 43 C1-2: the row's class, decided at the journaling. The
+        // core says it (`journal::PendingClass`) around every call of its
+        // own; a transaction under a delegation origin is `Lone` at C1 (C2
+        // makes the delegate's `DelegGroup`, C3 moves the root's appended
+        // rows); the FUSE fast path's threads publish nothing of their own
+        // and take the class the core last published with the gate, which
+        // is what their wait follows.
+        let class = match journal::PendingClass::current() {
+            Some(c) => c,
+            None if delegated => RowClass::Lone,
+            None => {
+                journal::note_from_session();
+                self.session().published_class()
+            }
+        };
+        journal::note_journaled(journal::JournaledRow {
+            first: local.start,
+            last: end - 1,
+            class,
+        });
         put_journal_tx(
             tx,
             self,
@@ -427,6 +514,7 @@ impl Meta {
                 epoch: local.epoch,
                 gen,
                 idx,
+                class,
                 rid,
                 op,
                 deps,
@@ -474,6 +562,94 @@ impl Meta {
     ) -> Result<(Vec<LogRecord>, u64), MetaError> {
         let _admission = journal::PendingAdmission::set(still_admitted);
         self.delegate_execute(op, rid, gen, deps, tag, now)
+    }
+
+    /// Plan 43 C1-2 (D4): re-tag the journal transaction that holds journal
+    /// seq `seq` (its first, or any later one) with `class`, in one write
+    /// transaction: a row whose own client was answered with the gate off
+    /// (`Lone`) must strand as the answer said. A row that is gone (shipped
+    /// rows are durable anyway) or already of that class is left alone.
+    /// Returns whether a row changed.
+    pub fn reclass_journal_tx(&self, seq: u64, class: RowClass) -> Result<bool, MetaError> {
+        let mut tx = self.db.write_tx();
+        let owner = match tx.range(&self.journal_tx, ..=tx_key(seq)).next_back() {
+            Some(guard) => {
+                let (k, v) = guard.into_inner()?;
+                Some((decode_tx_key(&k)?, postcard::from_bytes::<JournalTx>(&v)?))
+            }
+            None => None,
+        };
+        let Some((first, mut row)) = owner.filter(|(_, row)| row.last >= seq) else {
+            return Ok(false);
+        };
+        if row.class == class {
+            return Ok(false);
+        }
+        row.class = class;
+        put_journal_tx(&mut tx, self, first, &row)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Plan 43 C1-3: whether an unshipped journal transaction was executed
+    /// under lease epoch `epoch`.
+    pub fn journal_has_epoch_rows(&self, epoch: u64) -> Result<bool, MetaError> {
+        let r = self.db.read_tx();
+        Ok(read_journal_tx_heads(&r, self)?
+            .iter()
+            .any(|(_, h)| h.epoch == epoch))
+    }
+
+    /// Plan 43 C1-2: the class of the journal transaction that holds
+    /// journal seq `seq` (`None`: no such unshipped transaction).
+    pub fn journal_tx_class(&self, seq: u64) -> Result<Option<RowClass>, MetaError> {
+        let r = self.db.read_tx();
+        match r.range(&self.journal_tx, ..=tx_key(seq)).next_back() {
+            Some(guard) => {
+                let (_, v) = guard.into_inner()?;
+                let head: JournalTxHead = postcard::from_bytes(&v)?;
+                Ok((head.last >= seq).then_some(head.class))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Plan 43 C1-2: the classes of the unshipped journal transactions that
+    /// carry `rid`, oldest first (the simulation's claim check reads the
+    /// answering row's class; a shipped row is gone from the journal).
+    pub fn journal_classes_of_rid(&self, rid: Rid) -> Result<Vec<RowClass>, MetaError> {
+        Ok(self
+            .journal_rows_of_rid(rid)?
+            .into_iter()
+            .map(|(_, c)| c)
+            .collect())
+    }
+
+    /// Plan 43 C1-2: `(first journal seq, class)` of the unshipped
+    /// transactions that carry `rid`, oldest first.
+    pub fn journal_rows_of_rid(&self, rid: Rid) -> Result<Vec<(u64, RowClass)>, MetaError> {
+        let r = self.db.read_tx();
+        let rows = read_journal_txs(&r, self)?;
+        let by_rid: Vec<(u64, RowClass)> = rows
+            .iter()
+            .filter(|(_, row)| row.rid == Some(rid))
+            .map(|(first, row)| (*first, row.class))
+            .collect();
+        if !by_rid.is_empty() {
+            return Ok(by_rid);
+        }
+        // A journaled refusal records no rid of its own in its row (only
+        // its `Refused` record names it).
+        let mut out = Vec::new();
+        for (first, row) in &rows {
+            let named = journal_records(&r, self, *first, row.last)?.iter().any(|(_, rec)| {
+                matches!(rec, LogRecord::Refused { rid: x, .. } | LogRecord::Completed { rid: x } if *x == rid)
+            });
+            if named {
+                out.push((*first, row.class));
+            }
+        }
+        Ok(out)
     }
 
     /// The highest stream index this node assigned under `gen` (0: none).
@@ -907,6 +1083,12 @@ impl Meta {
                 },
             )
         });
+        // Plan 43 C1-2: a predecessor's tail was committed by its group
+        // (the sealer held it, write-all), whatever this tenure waits for.
+        // (A control row the core journals through the same path — a grant,
+        // a recall — carries the class the core set.)
+        let _class = (adopted && journal::PendingClass::current().is_none())
+            .then(|| journal::PendingClass::set(RowClass::RootGroup));
         // Plan 30 §M12: a grant or a recall changes who may execute
         // what; the root's fast path checks that under the shared side
         // (`Meta::deleg_gate`). Taken before the write transaction, in
@@ -1307,6 +1489,111 @@ mod tests {
         let mut tx = meta.db.write_tx();
         tx.insert(ks, key.to_be_bytes().to_vec(), GARBAGE.to_vec());
         tx.commit().unwrap();
+    }
+
+    /// Plan 43 C1-2: a journal row records the class it was journaled
+    /// under — the class the core sets around its call, else the one the
+    /// session publishes with the gate — and the head decodes it.
+    #[test]
+    fn a_journal_row_records_its_class_and_the_head_reads_it() {
+        use crate::session::SessionState;
+        use crate::store::journal::PendingClass;
+        use crate::store::local::{read_journal_tx_heads, RowClass};
+        let meta = Meta::open_in_memory().unwrap();
+        meta.set_holder_epoch(1);
+        // Nothing published, nothing set: a lone row.
+        create(&meta, 1);
+        // The session publishes the gate with a class: the fast path's rows.
+        let session: &SessionState = meta.session();
+        session.set_durable(true, 0, false, RowClass::RootGroup);
+        create(&meta, 2);
+        // The core's own class wins, scoped to its call.
+        {
+            let _c = PendingClass::set(RowClass::Archive);
+            create(&meta, 3);
+            {
+                let _inner = PendingClass::set(RowClass::NonStealable);
+                create(&meta, 4);
+            }
+            create(&meta, 5);
+        }
+        create(&meta, 6);
+        let r = meta.db.read_tx();
+        let heads = read_journal_tx_heads(&r, &meta).unwrap();
+        let classes: Vec<RowClass> = heads.iter().map(|(_, h)| h.class).collect();
+        // (Each create journals one transaction; read the rids' classes.)
+        assert_eq!(
+            classes,
+            vec![
+                RowClass::Lone,
+                RowClass::RootGroup,
+                RowClass::Archive,
+                RowClass::NonStealable,
+                RowClass::Archive,
+                RowClass::RootGroup,
+            ]
+        );
+        // The classes that wait for something are the gated ones (Q12).
+        assert!(RowClass::Archive.gated() && RowClass::RootGroup.gated());
+        assert!(RowClass::DelegGroup.gated());
+        assert!(!RowClass::Lone.gated() && !RowClass::NonStealable.gated());
+        // Only the fast path's threads fall back to the published class
+        // (counted: the core's own thread must never).
+        assert_eq!(crate::rows_from_session_on_this_thread(), 3);
+        // The full row reads the same and the lookup by rid finds it.
+        let rid = Rid {
+            node: 3,
+            incarnation: 1,
+            seq: 3,
+        };
+        assert_eq!(
+            meta.journal_classes_of_rid(rid).unwrap(),
+            vec![RowClass::Archive]
+        );
+    }
+
+    /// Plan 43 C1-2 (D4): re-tagging a row rewrites its class and nothing
+    /// else, finds the row by any journal seq it holds, and leaves a
+    /// shipped (gone) row and a row of that class alone.
+    #[test]
+    fn reclass_rewrites_only_the_class() {
+        use crate::store::journal::PendingClass;
+        use crate::store::local::{get_journal_tx, read_journal_txs, RowClass};
+        let meta = Meta::open_in_memory().unwrap();
+        meta.set_holder_epoch(1);
+        {
+            let _c = PendingClass::set(RowClass::RootGroup);
+            create(&meta, 1);
+            create(&meta, 2);
+        }
+        let before = {
+            let r = meta.db.read_tx();
+            read_journal_txs(&r, &meta).unwrap()
+        };
+        assert_eq!(before.len(), 2);
+        let (first2, row2) = (before[1].0, before[1].1.clone());
+        // Any seq the row holds finds it (its last, here).
+        assert!(meta.reclass_journal_tx(row2.last, RowClass::Lone).unwrap());
+        let r = meta.db.read_tx();
+        let after = read_journal_txs(&r, &meta).unwrap();
+        assert_eq!(after[0].1.class, RowClass::RootGroup, "the other row");
+        let mut expect = row2.clone();
+        expect.class = RowClass::Lone;
+        assert_eq!(
+            format!("{:?}", get_journal_tx(&r, &meta, first2).unwrap().unwrap()),
+            format!("{expect:?}"),
+            "only the class changed"
+        );
+        drop(r);
+        // Again: nothing changes.
+        assert!(!meta.reclass_journal_tx(first2, RowClass::Lone).unwrap());
+        // A seq past every row finds none.
+        assert!(!meta
+            .reclass_journal_tx(row2.last + 100, RowClass::Lone)
+            .unwrap());
+        // A shipped row is gone: a no-op.
+        ship_all(&meta, 1);
+        assert!(!meta.reclass_journal_tx(first2, RowClass::Archive).unwrap());
     }
 
     /// `status` (`speculation_counts`, `has_outstanding_speculation`,

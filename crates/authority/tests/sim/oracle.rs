@@ -62,6 +62,9 @@ pub struct Oracles {
     /// Descriptions of I1 violations, in order (judged at emission, failed
     /// at the end of the run).
     pub i1_violations: Mutex<Vec<String>>,
+    /// Plan 43 C1-2: answers whose claim of a commit the judgement or the
+    /// answering row's own class does not bear out (`check_claim`).
+    pub claim_violations: Mutex<Vec<String>>,
     /// Outcomes the core answered a client with that no sequencer decided
     /// (`AnswerSource::None`: a node's own error): not judged.
     pub acks_unsourced: AtomicU64,
@@ -91,6 +94,7 @@ impl Oracles {
             tick: AtomicU64::new(1),
             acks_unmapped: AtomicU64::new(0),
             i1_violations: Mutex::new(Vec::new()),
+            claim_violations: Mutex::new(Vec::new()),
             acks_unsourced: AtomicU64::new(0),
         })
     }
@@ -442,6 +446,53 @@ pub fn answer_treatment(source: Option<constellation_authority::AnswerSource>) -
         claimed,
         unsourced,
     }
+}
+
+/// Plan 43 C1-2: an answer that says it waited for a group or the archive
+/// (`claim`: the class the core named, or `committed` on a forward's reply)
+/// must be met by a class that holds (`Lone`, or an epoch hold's
+/// non-stealability, does not meet it), and the answering row, still in the
+/// answerer's journal, must carry the class the answer names (a gated row
+/// answered with the gate off was re-tagged `Lone` and is answered `Lone`:
+/// the core says so, D4). `rows`: the classes of the answerer's unshipped
+/// transactions of the rid; `delegated`: the row is a delegate's or the
+/// root's copy of one (`Lone` until C2/C3 move them: not compared).
+pub fn check_claim(
+    claim: Option<AckClass>,
+    committed: Option<bool>,
+    judged: Option<AckClass>,
+    rows: &[constellation_meta::RowClass],
+    delegated: bool,
+) -> Option<String> {
+    use constellation_meta::RowClass;
+    let gated = match (claim, committed) {
+        (Some(c), _) => c.gated(),
+        (None, Some(c)) => c,
+        (None, None) => return None,
+    };
+    if gated && matches!(judged, Some(AckClass::Lone) | Some(AckClass::NonStealable)) {
+        return Some(format!(
+            "the answer claims a commit ({}) but only {} judges it",
+            claim.map_or("committed".to_string(), |c| c.name().to_string()),
+            judged.map_or("none", |c| c.name())
+        ));
+    }
+    if rows.is_empty() || delegated {
+        return None;
+    }
+    let ok = match claim {
+        Some(AckClass::DelegGroup { .. }) => true,
+        Some(c) => rows.contains(&RowClass::from(c)),
+        None => rows.iter().any(|r| r.gated() == gated),
+    };
+    (!ok).then(|| {
+        format!(
+            "the answer says {} but the journal row of the rid is tagged {:?}",
+            claim.map_or(if gated { "committed" } else { "uncommitted" }, |c| c
+                .name()),
+            rows
+        )
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -974,6 +1025,9 @@ pub struct Findings {
     pub unjournaled_landed: Vec<String>,
     /// I1: the descriptions, in emission order.
     pub i1: Vec<String>,
+    /// Plan 43 C1-2: answers whose class claim is not borne out
+    /// (`strict_commit` fails the run on one).
+    pub class_claim: Vec<String>,
     /// I2 (b): one description per rid queued on two nodes.
     pub i2: Vec<String>,
     /// I2 (c): one description per rid not completed verbatim.
@@ -989,6 +1043,7 @@ impl Findings {
     pub fn examples(&self) -> Vec<String> {
         [
             &self.i1,
+            &self.class_claim,
             &self.i2,
             &self.i2c,
             &self.i4,
@@ -1016,6 +1071,7 @@ pub fn end_of_run(
 ) -> Findings {
     let mut f = Findings {
         i1: o.i1_violations.lock().unwrap().clone(),
+        class_claim: o.claim_violations.lock().unwrap().clone(),
         i6: o.leases.violations.lock().unwrap().clone(),
         i2: o
             .identity

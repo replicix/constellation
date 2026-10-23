@@ -757,6 +757,7 @@ impl Core {
         // Plan 30 §M14 phase 2: with the op's fencing token — a replay
         // under a grant that has ended is refused (`LockLapsed`) and
         // becomes a conflict copy below, as any refusal does.
+        let _class = self.journal_class();
         match constellation_meta::locks::TokenPath::Replay
             .scope(|| replica.execute(&queued.op, Some(queued.rid), &queued.lock_tag, now))
         {

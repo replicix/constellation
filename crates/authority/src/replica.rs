@@ -540,7 +540,20 @@ pub trait Replica {
     fn streamed_tip(&self, epoch: Epoch) -> Result<Option<u64>, MetaError>;
     /// The holder's durability watermark for its own reads
     /// (`Meta::durability_pending`).
-    fn set_durable(&self, gate: bool, jseq: u64, lost: bool);
+    fn set_durable(&self, gate: bool, jseq: u64, lost: bool, class: constellation_meta::RowClass);
+    /// Plan 43 C1-2: how many journal rows were tagged with the session's
+    /// published class instead of one the core set.
+    fn class_from_session(&self) -> u64;
+    /// Plan 43 C1-2: the class of the unshipped journal transaction that
+    /// carries `rid` (the latest of them), if any.
+    fn journal_class_of_rid(&self, rid: Rid) -> Option<(u64, constellation_meta::RowClass)>;
+    /// Plan 43 C1-2 (D4): re-tag the journal row holding `seq`
+    /// (`Meta::reclass_journal_tx`).
+    fn reclass_journal_tx(
+        &self,
+        seq: u64,
+        class: constellation_meta::RowClass,
+    ) -> Result<bool, MetaError>;
 
     // ---- holder state ----
 
@@ -1394,8 +1407,26 @@ impl Replica for Meta {
         Meta::streamed_tip(self, epoch)
     }
 
-    fn set_durable(&self, gate: bool, jseq: u64, lost: bool) {
-        self.session().set_durable(gate, jseq, lost)
+    fn set_durable(&self, gate: bool, jseq: u64, lost: bool, class: constellation_meta::RowClass) {
+        self.session().set_durable(gate, jseq, lost, class)
+    }
+
+    fn journal_class_of_rid(&self, rid: Rid) -> Option<(u64, constellation_meta::RowClass)> {
+        Meta::journal_rows_of_rid(self, rid)
+            .ok()
+            .and_then(|v| v.last().copied())
+    }
+
+    fn class_from_session(&self) -> u64 {
+        constellation_meta::rows_from_session_on_this_thread()
+    }
+
+    fn reclass_journal_tx(
+        &self,
+        seq: u64,
+        class: constellation_meta::RowClass,
+    ) -> Result<bool, MetaError> {
+        Meta::reclass_journal_tx(self, seq, class)
     }
 
     fn set_holder_epoch(&self, epoch: Epoch) {

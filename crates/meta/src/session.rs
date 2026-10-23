@@ -71,8 +71,9 @@
 use crate::mutate::MutateOp;
 use crate::record::LogRecord;
 use crate::replay::TouchSet;
+use crate::store::local::RowClass;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -436,6 +437,9 @@ pub struct SessionStats {
     pub fast_acks_waited: u64,
     pub fast_ack_wait_us_total: u64,
     pub fast_acks_in_doubt: u64,
+    /// Plan 43 C1-2 (D4): fast-path answers given with the gate off whose
+    /// rows were re-tagged `Lone`.
+    pub fast_acks_downgraded: u64,
 }
 
 #[derive(Default)]
@@ -714,6 +718,12 @@ pub struct SessionState {
     durable_lost: AtomicBool,
     /// The highest journal seq that is durable under that policy.
     durable_jseq: AtomicU64,
+    /// Plan 43 C1-2: the class of the answers the core gives its own
+    /// node's clients (`Core::root_ack_class`), published with the gate:
+    /// the class a FUSE fast-path row is journaled with
+    /// (`Meta::finish_local`). Stored before the gate so a reader that sees
+    /// the gate has seen the class.
+    durable_class: AtomicU8,
 }
 
 fn budget_default() -> u64 {
@@ -742,6 +752,7 @@ impl Default for SessionState {
             durable_gate: AtomicBool::new(false),
             durable_lost: AtomicBool::new(false),
             durable_jseq: AtomicU64::new(0),
+            durable_class: AtomicU8::new(RowClass::Lone.to_u8()),
         }
     }
 }
@@ -854,6 +865,10 @@ impl SessionState {
         let mut s = self.stats.lock().unwrap();
         s.fast_acks_waited += 1;
         s.fast_ack_wait_us_total += waited.as_micros() as u64;
+    }
+
+    pub fn count_fast_ack_downgraded(&self) {
+        self.stats.lock().unwrap().fast_acks_downgraded += 1;
     }
 
     pub fn count_fast_ack_in_doubt(&self) {
@@ -1304,9 +1319,10 @@ impl SessionState {
     /// Plan 30 §M9: the core's durability watermark for this holder's
     /// journal (`gate`: a non-`Local` policy is in force). Every advance
     /// wakes the waiters.
-    pub fn set_durable(&self, gate: bool, jseq: u64, lost: bool) {
+    pub fn set_durable(&self, gate: bool, jseq: u64, lost: bool, class: RowClass) {
         self.durable_lost.store(lost, Ordering::Relaxed);
-        self.durable_gate.store(gate, Ordering::Relaxed);
+        self.durable_class.store(class.to_u8(), Ordering::Release);
+        self.durable_gate.store(gate, Ordering::Release);
         let before = self.durable_jseq.swap(jseq, Ordering::Relaxed);
         if !gate || jseq > before {
             self.cv.notify_all();
@@ -1340,6 +1356,12 @@ impl SessionState {
             let g = self.inner.lock().unwrap();
             let _ = self.cv.wait_timeout(g, slice).unwrap();
         }
+    }
+
+    /// Plan 43 C1-2: the class the core published with the gate. The
+    /// fast path's rows are journaled with it and its wait follows it.
+    pub fn published_class(&self) -> RowClass {
+        RowClass::from_u8(self.durable_class.load(Ordering::Acquire))
     }
 
     /// Whether the durability gate is on (one atomic load: the fast
@@ -1668,6 +1690,28 @@ mod tests {
             pending: jp(epoch, jseq),
             streams: Streams::NONE,
         }
+    }
+
+    /// Plan 43 C1-2: the class the core publishes with the gate is what the
+    /// fast path's rows are journaled with and its wait follows; a lone node
+    /// publishes `Lone`.
+    #[test]
+    fn the_session_publishes_the_class_with_the_gate() {
+        let s = SessionState::default();
+        assert_eq!(s.published_class(), RowClass::Lone, "nothing published");
+        s.set_durable(true, 7, false, RowClass::RootGroup);
+        assert_eq!(s.published_class(), RowClass::RootGroup);
+        assert!(s.durable_gated());
+        s.set_durable(true, 7, false, RowClass::Archive);
+        assert_eq!(s.published_class(), RowClass::Archive);
+        // The gate goes off: the class the core publishes with it is the
+        // lone node's, and a waiter finds the gate off.
+        s.set_durable(false, u64::MAX, false, RowClass::Lone);
+        assert_eq!(s.published_class(), RowClass::Lone);
+        assert_eq!(
+            s.wait_durable(9, Duration::from_millis(1)),
+            DurableWait::Ungated
+        );
     }
 
     /// Chunk metered-own-rows: this node's own close at rows 12–13 is
@@ -2257,10 +2301,15 @@ mod tests {
         };
         let dentry = |name: &str| [ReadKey::Dentry(root, name.into())];
         let s = meta.session();
-        s.set_durable(true, 0, false);
+        s.set_durable(true, 0, false, RowClass::RootGroup);
         crate::mutate::execute(&meta, &create("a"), None).unwrap();
         assert!(meta.durability_pending(&dentry("a")));
-        s.set_durable(true, meta.journal_tip().unwrap(), false);
+        s.set_durable(
+            true,
+            meta.journal_tip().unwrap(),
+            false,
+            RowClass::RootGroup,
+        );
         crate::mutate::execute(&meta, &create("b"), None).unwrap();
         // `a` is durable although `b`'s row (a different key) is not.
         assert!(!meta.durability_pending(&dentry("a")));
@@ -2270,22 +2319,32 @@ mod tests {
             meta.durability_pending(&[ReadKey::Dir(root)]),
             "`ls` sees b"
         );
-        s.set_durable(true, meta.journal_tip().unwrap(), false);
+        s.set_durable(
+            true,
+            meta.journal_tip().unwrap(),
+            false,
+            RowClass::RootGroup,
+        );
         assert!(!meta.durability_pending(&[ReadKey::Dir(root)]));
 
         // Gate off: `c` is journaled untracked; with the gate back on it
         // is compared against the tip (and `a` stays exact).
-        s.set_durable(false, u64::MAX, false);
+        s.set_durable(false, u64::MAX, false, RowClass::Lone);
         let before = meta.journal_tip().unwrap();
         crate::mutate::execute(&meta, &create("c"), None).unwrap();
-        s.set_durable(true, before, false);
+        s.set_durable(true, before, false, RowClass::RootGroup);
         assert!(meta.durability_pending(&dentry("c")));
         assert!(!meta.durability_pending(&dentry("a")));
         assert!(
             meta.durability_pending(&[ReadKey::Dir(root)]),
             "the directory's bound became untracked with c"
         );
-        s.set_durable(true, meta.journal_tip().unwrap(), false);
+        s.set_durable(
+            true,
+            meta.journal_tip().unwrap(),
+            false,
+            RowClass::RootGroup,
+        );
         assert!(!meta.durability_pending(&dentry("c")));
         assert!(!meta.durability_pending(&[ReadKey::Dir(root)]));
     }

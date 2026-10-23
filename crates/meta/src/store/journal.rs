@@ -98,6 +98,87 @@ impl Drop for PendingLocalOpGuard {
 }
 
 thread_local! {
+    static PENDING_CLASS: std::cell::Cell<Option<crate::store::local::RowClass>> =
+        const { std::cell::Cell::new(None) };
+    static LAST_JOURNALED: std::cell::Cell<Option<JournaledRow>> =
+        const { std::cell::Cell::new(None) };
+    static FROM_SESSION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many rows this thread journaled with the session's published class
+/// instead of one set by [`PendingClass`]: the FUSE fast path's threads do
+/// by design; the core's thread must not (it counts it around every event,
+/// `Core::handle`, so a call site that forgot its class shows).
+pub fn rows_from_session_on_this_thread() -> u64 {
+    FROM_SESSION.with(|c| c.get())
+}
+
+pub(crate) fn note_from_session() {
+    FROM_SESSION.with(|c| c.set(c.get() + 1));
+}
+
+/// Plan 43 C1-2: the class the journal rows written on this thread are
+/// tagged with, set by the core around every call that journals
+/// (`Core::row_class`, decided at the moment of the journaling). Without
+/// one, `Meta::finish_local` reads the class the core last published to the
+/// session (`SessionState::published_class`) — what the FUSE fast path's
+/// threads use — and counts it (`SessionState::class_from_session`), so a
+/// core call site that forgot to set one shows in the simulation.
+/// Nested scopes restore the outer one.
+pub struct PendingClass;
+
+impl PendingClass {
+    pub fn set(class: crate::store::local::RowClass) -> PendingClassGuard {
+        PendingClassGuard {
+            prev: PENDING_CLASS.with(|c| c.replace(Some(class))),
+        }
+    }
+
+    pub(crate) fn current() -> Option<crate::store::local::RowClass> {
+        PENDING_CLASS.with(|c| c.get())
+    }
+}
+
+pub struct PendingClassGuard {
+    prev: Option<crate::store::local::RowClass>,
+}
+
+impl Drop for PendingClassGuard {
+    fn drop(&mut self) {
+        PENDING_CLASS.with(|c| c.set(self.prev));
+    }
+}
+
+/// The last journal transaction `Meta::finish_local` wrote on this thread:
+/// its first and last journal seq and the class it carries. The FUSE fast
+/// path reads it right after its op executed (same thread), so that the
+/// acknowledgement waits for the op's own row — not for the journal's tip,
+/// which rows journaled meanwhile by other threads move — and by the row's
+/// own class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JournaledRow {
+    pub first: u64,
+    pub last: u64,
+    pub class: crate::store::local::RowClass,
+}
+
+/// Forget the last journaled row of this thread (before an execution whose
+/// row is to be read after it).
+pub fn clear_last_journaled() {
+    LAST_JOURNALED.with(|c| c.set(None));
+}
+
+/// The last row journaled on this thread since [`clear_last_journaled`]
+/// (taken: a second call returns `None`).
+pub fn take_last_journaled() -> Option<JournaledRow> {
+    LAST_JOURNALED.with(|c| c.take())
+}
+
+pub(crate) fn note_journaled(row: JournaledRow) {
+    LAST_JOURNALED.with(|c| c.set(Some(row)));
+}
+
+thread_local! {
     static PENDING_LOCK_TAG: std::cell::RefCell<Option<(crate::locks::LockTag, constellation_types::clock::Now)>> =
         const { std::cell::RefCell::new(None) };
     /// The tags [`PendingLockTag::check_at_write`] pinned on this thread
