@@ -2919,6 +2919,8 @@ mod tests {
     }
 
     const CHILD_ENV: &str = "CST_LOGW_CHILD";
+    /// The lines the pipe test's child logs.
+    const PIPE_LINES: u64 = 20_000;
     const PIPE_TEST: &str =
         "log_buffer::tests::a_process_whose_stderr_is_a_pipe_nobody_reads_keeps_logging";
 
@@ -2934,23 +2936,26 @@ mod tests {
         };
         buffer.start(config, Box::new(StderrSink)).unwrap();
         let subscriber = tracing_subscriber::registry()
-            .with(tracing_subscriber::fmt::layer().with_writer(buffer));
-        let started = Instant::now();
+            .with(tracing_subscriber::fmt::layer().with_writer(buffer.clone()));
         tracing::subscriber::with_default(subscriber, || {
-            for i in 0..20_000 {
+            for i in 0..PIPE_LINES {
                 let payload = "p".repeat(160);
                 tracing::info!(i, %payload, "a line for a pipe nobody reads");
             }
         });
-        println!("ELAPSED_MS={}", started.elapsed().as_millis());
+        let stats = buffer.stats();
+        println!(
+            "WRITTEN={} DROPPED={}",
+            stats.written_lines, stats.dropped_lines
+        );
         // Exit now: the writer is parked in a write to the full pipe.
         std::process::exit(0);
     }
 
     /// Re-execute this test binary on [`PIPE_TEST`] with stderr a pipe
-    /// nobody reads; the child's `ELAPSED_MS`, or None when it was still
-    /// running after `wait`.
-    fn run_pipe_child(mode: &str, wait: Duration) -> Option<u64> {
+    /// nobody reads; the child's `(written, dropped)` lines once it has
+    /// logged them all, or None when it was still running after `wait`.
+    fn run_pipe_child(mode: &str, wait: Duration) -> Option<(u64, u64)> {
         use std::process::{Command, Stdio};
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", PIPE_TEST, "--nocapture"])
@@ -2974,12 +2979,13 @@ mod tests {
         assert!(status.success(), "the child failed: {status}");
         let mut out = String::new();
         std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut out).unwrap();
-        Some(
-            out.lines()
-                .find_map(|l| l.strip_prefix("ELAPSED_MS="))
+        let field = |name: &str| -> u64 {
+            out.split_whitespace()
+                .find_map(|w| w.strip_prefix(name))
                 .and_then(|n| n.parse().ok())
-                .expect("the child prints ELAPSED_MS"),
-        )
+                .unwrap_or_else(|| panic!("the child prints {name}: {out:?}"))
+        };
+        Some((field("WRITTEN="), field("DROPPED=")))
     }
 
     #[test]
@@ -2987,9 +2993,17 @@ mod tests {
         if let Ok(mode) = std::env::var(CHILD_ENV) {
             pipe_child(&mode);
         }
-        let elapsed = run_pipe_child("queue", Duration::from_secs(10))
-            .expect("the queued child must exit within 10 s");
-        assert!(elapsed < 1_000, "20 000 lines took {elapsed} ms");
+        // The pipe holds a few hundred of these lines and the queue (1 MiB)
+        // a few thousand: a child that waited for its sink would never get
+        // through them, so its finishing is the test, and how long it took
+        // is the machine's (this measured "under 1 s" before, which CPU load
+        // alone broke). The bound is a hang guard only.
+        let (written, dropped) = run_pipe_child("queue", Duration::from_secs(120))
+            .expect("the queued child never got through its lines");
+        assert!(
+            written < PIPE_LINES && dropped > 0,
+            "the sink was stalled for the whole run: written {written}, dropped {dropped}"
+        );
         // The naive arm: the synchronous writer is stuck in the full pipe.
         assert!(
             run_pipe_child("sync", Duration::from_secs(3)).is_none(),
