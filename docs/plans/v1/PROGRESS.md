@@ -57857,3 +57857,23 @@ for the same id). No other site stores such an end.
   sides and differ (both pass): that configuration stalls the core's step, whose
   `now` is older than the table's clock, which is the case the in-guard
   clock and the atomic primitives change. Not attributed to one of them.
+
+### Plan 45 (hard links) on ext4, xfs, btrfs and tmpfs (2026-10-23)
+
+`crates/meta/tests/hardlink_perf.rs`, release, the build box, `HL_DIR` on each file
+system, 3 rounds of before/after/after/before (before = 1bc76d4, the H0 baseline;
+after = 37180aef). Medians, µs:
+
+| | ext4 | xfs | btrfs | tmpfs |
+|---|---|---|---|---|
+| `link` at 2 000 names | 6 420 → 15.4 | 6 407 → 15.5 | 6 464 → 16.2 | 6 395 → 15.3 |
+| `chmod` at 2 000 names | 6 762 → 7.2 | 6 751 → 7.3 | 6 800 → 7.7 | 6 713 → 7.1 |
+| write at 2 000 names | 6 914 → 9.4 | 6 886 → 9.4 | 6 918 → 9.9 | 6 852 → 9.3 |
+| `link` / `chmod` / write at n = 1 | ±1 % | ±1 % | ±1 % | ±1.3 % |
+| single-name create | +3.9 % | +2.3 % | +2.0 % | +1.9 % |
+| single-name setattr / set_manifest / unlink | +2.0–2.9 % | +2.0 % | +1.2–1.6 % | +1.2–1.5 % |
+| warm listing / `recursive_size` after the burst | 104 → 0.42 | 106 → 0.42 | 105 → 0.42 | 106 → 0.42 |
+
+Every gate of plan 45 §7 holds on all four (single-name operations within ±5 %); the
+single-name cost is a consistent +1–4 % (the form check on every inode write), the
+same on every file system.
