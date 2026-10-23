@@ -138,6 +138,20 @@ use std::collections::{HashMap, HashSet};
 /// this collides with nothing a mount allocates.
 pub const LOCAL_REPLAY_INCARNATION: u32 = u32::MAX - 1;
 
+/// Plan 43 C1-4: the incarnation of the rid an abandoned group's member
+/// copy queues a transaction that completes no rid under (`GroupAbandoned`,
+/// `queue_abandoned_tx`): `Rid { node: ABANDON_REPLAY_NODE | epoch,
+/// incarnation: this, seq: jseq }` of the transaction's identity — the
+/// `(epoch, first)` of the journal that first held it, one per transaction
+/// across the group, so that every member queues the same rid. Below
+/// `LOCAL_REPLAY_INCARNATION`, far above any mount's.
+pub const ABANDON_REPLAY_INCARNATION: u32 = u32::MAX - 2;
+
+/// The node part of such a rid is the identity's epoch with the top bit set:
+/// never a node id (node ids are inode-number prefixes, below 2^24), so no
+/// node takes it for one of its own requests.
+const ABANDON_REPLAY_NODE: u64 = 1 << 63;
+
 // ---------------------------------------------------------------- types
 
 /// What one `spec` row is. See the module doc.
@@ -401,8 +415,14 @@ struct QueuedReplay {
 pub(crate) fn queue_abandoned_tx(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
+    epoch: u64,
     row: &super::member::MemberTx,
 ) -> Result<bool, MetaError> {
+    // A transaction that completes no rid is queued under its identity
+    // (`ABANDON_REPLAY_INCARNATION`): every member of the group that holds
+    // it queues the same rid, and the holder runs it once. (Under
+    // `replay_rid_for`, the node's own, each member that came back ran it
+    // again.)
     let rid = match row.rid {
         Some(rid) => rid,
         None => match row.tx.records.iter().find_map(|r| match r {
@@ -410,7 +430,15 @@ pub(crate) fn queue_abandoned_tx(
             _ => None,
         }) {
             Some(rid) => rid,
-            None => replay_rid_for(&*tx, meta, row.tx.first)?,
+            None => {
+                let (e, jseq) =
+                    super::member::tail_identity(&row.tx.records).unwrap_or((epoch, row.tx.first));
+                Rid {
+                    node: ABANDON_REPLAY_NODE | e,
+                    incarnation: ABANDON_REPLAY_INCARNATION,
+                    seq: jseq,
+                }
+            }
         },
     };
     let in_log = tx

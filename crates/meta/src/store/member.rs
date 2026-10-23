@@ -619,7 +619,7 @@ pub(crate) fn member_rules_tx(
             }
             if abandoned.contains(&e) {
                 if row.class != RowClass::Lone
-                    && super::spec::queue_abandoned_tx(tx, meta, &row)?
+                    && super::spec::queue_abandoned_tx(tx, meta, e, &row)?
                 {
                     out.abandoned += 1;
                 }

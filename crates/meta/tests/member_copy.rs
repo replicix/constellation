@@ -516,6 +516,52 @@ fn a_marker_without_tail_follows_drops_only_archive_rows() {
 
 /// The operator abandoned the group: its member rows (but a lone node's
 /// own) are queued as the lone branch's replay, once.
+/// Every member of an abandoned group that holds a transaction completing
+/// no rid (a local manifest commit, a snapshot row) queues it under the same
+/// rid, the transaction's identity, so that the holder executing the replays
+/// runs it once whichever members come back. Fails on the parent: each node
+/// queued it under a rid of its own (`node prefix`, journal seq), and the
+/// holder executed it once per member.
+#[test]
+fn an_abandoned_rid_less_row_is_queued_under_one_rid_on_every_member() {
+    let queued_on = |node: u64, epoch: u64, records: Vec<LogRecord>| -> Vec<Rid> {
+        let meta = Meta::open_in_memory().unwrap();
+        meta.set_node_prefix(node).unwrap();
+        meta.member_copy_put_rows(epoch, 3, &[mtx(3, 3, RowClass::RootGroup, records)])
+            .unwrap();
+        let marker = vec![LogRecord::GroupAbandoned {
+            epoch,
+            gen: 0,
+            through_known: 3,
+        }];
+        let applied = meta
+            .apply_segment_rows(1, epoch + 1, 0, &[], &[], &marker, &TouchSet::default())
+            .unwrap();
+        assert_eq!(applied.member.abandoned, 1, "node {node}");
+        meta.pending_replays()
+            .unwrap()
+            .iter()
+            .map(|q| q.rid)
+            .collect()
+    };
+    let plain = vec![create("m", ino(7), 10)];
+    let holder = queued_on(HOLDER, 1, plain.clone());
+    assert_eq!(holder.len(), 1);
+    assert_eq!(
+        queued_on(5, 1, plain),
+        holder,
+        "a backup queues the same rid"
+    );
+    // A re-shipped transaction: its identity is its `TailOf`'s, on every
+    // member, of whichever epoch's copy (here a successor's, epoch 2, which
+    // re-journaled epoch 1's row 3 as its own row 3).
+    let reshipped = vec![
+        LogRecord::TailOf { epoch: 1, jseq: 3 },
+        create("m", ino(7), 10),
+    ];
+    assert_eq!(queued_on(6, 2, reshipped), holder);
+}
+
 #[test]
 fn group_abandoned_moves_the_member_copy_to_the_replay_queue() {
     let meta = Meta::open_in_memory().unwrap();
