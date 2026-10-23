@@ -125,12 +125,9 @@ pub(crate) struct GenState {
     pub seal_attempts: u8,
     /// Appended through this stream index.
     pub cursor: u64,
-    /// The root outwaits the delegate once its **wait** clock reaches this
-    /// (plan 43 C7-H1: a forward wall step must not end an outwait early).
-    pub until: WaitMs,
-    /// What the renewals alone gave `until` (the rest is the delegate's
-    /// stream, `Core::deleg_live_by_stream`).
-    pub renewed_until: WaitMs,
+    // The window (`until`: the root outwaits the delegate once its **wait**
+    // clock reaches it; plan 43 C7-H1) lives in `Core::dw`, the root's
+    // shared window table (plan 41 R1, `DelegWindows`).
     pub recall: RecallPhase,
     /// The phase a seal of the backup replaced: what an unanswered seal
     /// goes back to.
@@ -462,15 +459,15 @@ impl Core {
             gens: self
                 .dl
                 .gens
-                .values()
-                .map(|g| {
+                .iter()
+                .map(|(gen, g)| {
                     (
                         g.dir,
                         g.node,
-                        gen_of(g, &self.dl.gens),
+                        *gen,
                         g.cursor,
                         // Status: a wall stamp, from the wait-clock end.
-                        self.clk.wall_of_wait(g.until).0,
+                        self.clk.wall_of_wait(self.gen_until(*gen)).0,
                         format!("{:?}", g.recall),
                         g.ended,
                     )
@@ -505,6 +502,13 @@ impl Core {
 
     fn me(&self) -> NodeId {
         self.cfg.node_id
+    }
+
+    /// Generation `gen`'s window end on the root's wait clock, from the
+    /// shared window table (plan 41 R1); `WaitMs(0)` for a generation the
+    /// table does not know.
+    pub(crate) fn gen_until(&self, gen: u64) -> WaitMs {
+        self.dw.until(gen).unwrap_or(WaitMs(0))
     }
 
     /// Generations this root has not ended.
@@ -670,6 +674,16 @@ impl Core {
                     stream_applied = replica.stream_applied(d.gen),
                     "inherited a delegation from a predecessor root"
                 );
+                let inherited_until = now
+                    .wait
+                    .plus(self.reclaim_horizon_ms() + self.dl.inherit_slack_ms);
+                self.dw.insert(
+                    d.gen,
+                    d.node,
+                    inherited_until,
+                    inherited_until,
+                    !d.designated,
+                );
                 self.dl.gens.insert(
                     d.gen,
                     GenState {
@@ -687,12 +701,6 @@ impl Core {
                         below_since: None,
                         seal_attempts: 0,
                         cursor,
-                        until: now
-                            .wait
-                            .plus(self.reclaim_horizon_ms() + self.dl.inherit_slack_ms),
-                        renewed_until: now
-                            .wait
-                            .plus(self.reclaim_horizon_ms() + self.dl.inherit_slack_ms),
                         recall: RecallPhase::None,
                         recall_before_seal: RecallPhase::None,
                         ended: false,
@@ -2343,13 +2351,19 @@ impl Core {
                 // renewals were granted again and again, and the root's
                 // own op parked on the recall waited past its deadline —
                 // `EIO` for a write the log carried).
+                let mut granting = false;
                 if let Some(g) = self.dl.gens.get_mut(&gen) {
                     if g.recall == RecallPhase::Sealing {
                         g.recall = match g.recall_before_seal {
                             RecallPhase::Sealing => RecallPhase::None,
                             before => before,
                         };
+                        granting = g.recall == RecallPhase::None && !g.ended;
                     }
+                }
+                if granting && !self.dl.epoch_active {
+                    // The core grants again (and so may the answerer).
+                    self.dw.reopen(gen);
                 }
                 self.arm_gen_expiry(now, gen, out);
             }
@@ -2469,11 +2483,10 @@ impl Core {
                 if g.node == from && !g.ended && g.recall == RecallPhase::None {
                     ttl_ms = self.cfg.delegation_ttl_ms.min(cap);
                     if ttl_ms > 0 {
-                        let until = now.wait.plus(ttl_ms + extra);
-                        if until > g.until {
-                            g.until = until;
-                        }
-                        g.renewed_until = g.renewed_until.max(until);
+                        // (A `max` in the shared window table: it commutes
+                        // with any extension made off the core.)
+                        self.dw
+                            .extend_core(gen, now.wait.plus(ttl_ms + extra), true);
                     }
                     // The backup is the delegate's core's to name: the
                     // lane's certificate can be a step old, and a root that
@@ -3574,6 +3587,9 @@ impl Core {
             return;
         }
         g.recall = RecallPhase::Sent;
+        // The slot closes at the transition, in this step (plan 41 R1,
+        // rule 2): no renewal is granted from here, whoever answers it.
+        self.dw.close(gen);
         let (to, dir) = (g.node, g.dir);
         let req = self.op_id();
         self.dl.gens.get_mut(&gen).expect("present").recall_req = Some(req);
@@ -3616,7 +3632,7 @@ impl Core {
             // §5.2).
             return;
         }
-        let at = g.until.max(now.wait);
+        let at = self.gen_until(gen).max(now.wait);
         if let Some(t) = g.expiry {
             self.cancel_timer(t, out);
         }
@@ -3650,11 +3666,15 @@ impl Core {
             self.dl.gens.get_mut(&gen).expect("present").expiry = Some(t);
             return;
         }
-        let g = self.dl.gens.get(&gen).expect("present").clone();
-        if now.wait < g.until {
+        // One critical section on the window table's own clock (plan 41 R1):
+        // a window extended since this step took its `now` is re-armed, and
+        // one that has run out is closed in the same section, so nothing
+        // lengthens it between this decision and the seal or the reclaim.
+        if self.dw.close_if_expired(gen, now).is_err() {
             self.arm_gen_expiry(now, gen, out);
             return;
         }
+        let g = self.dl.gens.get(&gen).expect("present").clone();
         let done = matches!(g.recall, RecallPhase::Drained(th) if g.cursor >= th);
         if done {
             return;
@@ -3683,7 +3703,11 @@ impl Core {
             g.seal_attempts = 1;
             g.recall_before_seal = g.recall;
             g.recall = RecallPhase::Sealing;
-            g.until = now.wait.plus(self.cfg.forward_timeout_ms * 2);
+            // Closed already (the expiry decision), and nothing reopens it
+            // until the seal is answered or gives up: the seal's own window.
+            self.dw.close(gen);
+            self.dw
+                .set_until_closed(gen, now.wait.plus(self.cfg.forward_timeout_ms * 2));
             self.dl.by_req.insert(req, (gen, ReqKind::Seal));
             self.stats.deleg_seals_sent += 1;
             tracing::info!(
@@ -3704,13 +3728,16 @@ impl Core {
         match g.recall {
             RecallPhase::None => {
                 if !self.cfg.delegation_reclaim_expired {
+                    // Nothing ends here: the decision above shut the slot,
+                    // and the core's own answers go on, so it opens again.
+                    self.dw.reopen(gen);
                     return;
                 }
                 self.stats.deleg_reclaimed += 1;
                 tracing::info!(
                     node = self.me(),
                     gen,
-                    until = g.until.0,
+                    until = self.gen_until(gen).0,
                     now = now.wait.0,
                     "reclaiming an unrenewed delegation"
                 );
@@ -3785,6 +3812,9 @@ impl Core {
         if g.ended {
             return;
         }
+        // Whatever ends a generation passed a closed slot (an expiry, a
+        // recall); closed here too, for every other way in.
+        self.dw.close(gen);
         let dir = g.dir;
         let cursor = g.cursor;
         let drained = matches!(g.recall, RecallPhase::Drained(_));
@@ -3869,6 +3899,7 @@ impl Core {
             return;
         };
         g.ended = true;
+        self.dw.close(gen);
         let expiry = g.expiry.take();
         let recall_req = g.recall_req.take();
         let controls = std::mem::take(&mut g.controls);
@@ -3913,11 +3944,15 @@ impl Core {
             return;
         }
         // (The expiry timer re-arms itself when it fires before `until`.)
-        if now.wait >= g.renewed_until {
+        if self
+            .dw
+            .renewed_until(gen)
+            .is_some_and(|renewed| now.wait >= renewed)
+        {
             // The renewals alone would have let it be outwaited.
             self.stats.deleg_live_by_stream += 1;
         }
-        g.until = g.until.max(now.wait.plus(ttl + extra));
+        self.dw.extend_core(gen, now.wait.plus(ttl + extra), false);
     }
 
     /// The root appends a delegate's batch, and acknowledges the stream
@@ -4197,6 +4232,9 @@ impl Core {
                 None,
             )
             .map_err(|e| e.to_string())?;
+        let first_until = now.wait.plus(self.reclaim_horizon_ms());
+        self.dw
+            .insert(gen, node, first_until, first_until, !designated);
         self.dl.gens.insert(
             gen,
             GenState {
@@ -4210,8 +4248,6 @@ impl Core {
                 below_since: None,
                 seal_attempts: 0,
                 cursor: 0,
-                until: now.wait.plus(self.reclaim_horizon_ms()),
-                renewed_until: now.wait.plus(self.reclaim_horizon_ms()),
                 recall: RecallPhase::None,
                 recall_before_seal: RecallPhase::None,
                 ended: false,
@@ -4416,6 +4452,9 @@ impl Core {
         if !active {
             return;
         }
+        // No renewal is granted inside an epoch: every slot closes at the
+        // transition.
+        self.dw.close_all();
         // Delegates stop; the root recalls everything.
         let mine: Vec<u64> = self.dl.mine.keys().copied().collect();
         let root = self.root_node().unwrap_or(0);
@@ -4453,6 +4492,9 @@ impl Core {
             );
             self.abort_parks_waiting_on(now, &ids, replica, out);
         }
+        // No window is this node's any more: closed and gone in this step.
+        self.dw.close_all();
+        self.dw.clear();
         for (_, g) in std::mem::take(&mut self.dl.gens) {
             if let Some(t) = g.expiry {
                 self.cancel_timer(t, out);
@@ -4498,11 +4540,4 @@ fn is_under(
         }
     }
     false
-}
-
-fn gen_of(g: &GenState, gens: &BTreeMap<u64, GenState>) -> u64 {
-    gens.iter()
-        .find(|(_, s)| std::ptr::eq(*s, g))
-        .map(|(k, _)| *k)
-        .unwrap_or(0)
 }

@@ -48,6 +48,7 @@
 
 mod backup;
 mod client;
+mod deleg_windows;
 mod delegate;
 mod holder;
 mod inbox;
@@ -74,6 +75,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 pub use backup::{beat_sent_ms, liveness_fresh, AckClass, AckView, SealRecord};
 pub use client::ClientPhase;
+pub use deleg_windows::{DelegWindows, Window, WindowsClock};
 pub use delegate::{DelegKind, DelegRenewCert, DelegView, RecallPhase};
 
 /// Plan 30 §M11 phase 2b: read delegations a *delegate* grants carry
@@ -1637,6 +1639,9 @@ pub struct Core {
     pub(crate) pr: promise::PromiseState,
     /// M11: delegations held here and, as the root, the generations.
     pub(crate) dl: delegate::DelegationState,
+    /// Plan 41 R1: the root's delegation windows (`GenState`'s `until`),
+    /// shared with whoever else may extend them ([`DelegWindows`]).
+    pub(crate) dw: std::sync::Arc<DelegWindows>,
     /// Plan 30 §M11 phase 2b: the placement window (the root).
     pl: placement::PlacementState,
     /// Plan 30 §M14.
@@ -1712,6 +1717,7 @@ impl Core {
             bk: backup::BackupState::default(),
             pr: promise::PromiseState::default(),
             dl: delegate::DelegationState::default(),
+            dw: DelegWindows::new(),
             pl: placement::PlacementState::default(),
             lk: locks::LockState::default(),
             mode: AuthorityMode {
@@ -1739,6 +1745,20 @@ impl Core {
     }
 
     /// The lease this node believes it holds, for `status`.
+    /// Plan 41 R1: the root's delegation windows. The driver shares this
+    /// handle with whoever may extend them besides the core, and gives it
+    /// the clock the guard-side decisions read ([`DelegWindows::set_clock`]).
+    pub fn deleg_windows(&self) -> &std::sync::Arc<DelegWindows> {
+        &self.dw
+    }
+
+    /// Use `windows` as this core's delegation windows (before the first
+    /// event): the daemon and a simulation create the table first and share
+    /// it with the answerer.
+    pub fn set_deleg_windows(&mut self, windows: std::sync::Arc<DelegWindows>) {
+        self.dw = windows;
+    }
+
     pub fn lease(&self) -> &LeaseState {
         &self.lease
     }

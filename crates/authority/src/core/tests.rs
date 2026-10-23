@@ -12935,7 +12935,7 @@ mod locks {
             .unwrap_or_else(|| panic!("no recall sent: {out:?}"));
         // The delegate stays silent: the recall is outwaited and the
         // generation ends.
-        h.core.dl.gens.get_mut(&7).unwrap().until = w(h.now);
+        h.core.dw.set_until_for_tests(7, w(h.now));
         let mut out = Vec::new();
         h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
         assert!(h.core.dl.gens[&7].ended, "not ended: {out:?}");
@@ -13018,7 +13018,7 @@ mod locks {
             .unwrap_or_else(|| panic!("no recall sent: {out:?}"));
         let g = h.core.dl.gens.get_mut(&7).unwrap();
         g.recall = crate::core::delegate::RecallPhase::Sealing;
-        g.until = w(h.now.plus(5_000));
+        h.core.dw.set_until_for_tests(7, w(h.now.plus(5_000)));
         let live = constellation_meta::locks::GrantWire {
             id: GrantId { node: 3, seq: 5 },
             node: 4,
@@ -25524,7 +25524,7 @@ mod locks {
         let (mut r, _, _, recall) = recalling_root(5_000);
         r.now = d.now.plus(50);
         // (Its delegation is still honoured: not an outwaited generation.)
-        r.core.dl.gens.get_mut(&7).unwrap().until = w(r.now.plus(60_000));
+        r.core.dw.set_until_for_tests(7, w(r.now.plus(60_000)));
         recalled(&mut r, recall, back);
         let margin = r.core.lock_margin_ms();
         assert_eq!(record_end(&r, g), r.now.0 + margin);
@@ -25623,7 +25623,9 @@ mod locks {
         let (mut root, _, _, recall) = recalling_root(5_000);
         root.now = sent.plus(100);
         // (Its delegation is still honoured: not an outwaited generation.)
-        root.core.dl.gens.get_mut(&7).unwrap().until = w(root.now.plus(60_000));
+        root.core
+            .dw
+            .set_until_for_tests(7, w(root.now.plus(60_000)));
         recalled(&mut root, recall, back);
         let margin = root.core.lock_margin_ms();
         assert_eq!(record_end(&root, g), root.now.0 + left as i64 + margin);
@@ -32023,7 +32025,7 @@ fn an_off_core_renewal_never_changes_the_roots_backup_of_a_delegate() {
         "the lane's renewal unnamed the delegate's backup"
     );
     // It did extend the grant: that is what it is for.
-    let until = h.core.dl.gens[&7].until;
+    let until = h.core.gen_until(7);
     assert!(until >= w(h.now.plus(1_000)), "{until:?}");
     // The core's own renewal still changes it.
     h.advance(100);
@@ -32048,7 +32050,7 @@ fn an_off_core_renewal_never_changes_the_roots_backup_of_a_delegate() {
 fn an_off_core_renewal_of_a_recalled_generation_is_refused() {
     let mut h = root_with_delegate_backed_by(4);
     h.core.dl.gens.get_mut(&7).unwrap().recall = RecallPhase::Sent;
-    let until = h.core.dl.gens[&7].until;
+    let until = h.core.gen_until(7);
     h.advance(100);
     let out = h.step(Event::Peer {
         from: 3,
@@ -32058,7 +32060,7 @@ fn an_off_core_renewal_of_a_recalled_generation_is_refused() {
             round: 1,
         },
     });
-    assert_eq!(h.core.dl.gens[&7].until, until);
+    assert_eq!(h.core.gen_until(7), until);
     assert!(
         sends(&out)
             .iter()
@@ -35083,7 +35085,7 @@ mod recall_cut {
         });
         // The delegate streamed three rows (appended: the cursor).
         h.core.dl.gens.get_mut(&7).unwrap().cursor = 3;
-        h.core.dl.gens.get_mut(&7).unwrap().until = w(h.now);
+        h.core.dw.set_until_for_tests(7, w(h.now));
         let mut out = Vec::new();
         h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
         assert!(h.core.dl.gens[&7].ended, "not ended: {out:?}");
@@ -35752,5 +35754,181 @@ mod c1_counted {
         answer_job_read(&mut h, &read, before);
         assert!(h.core.bk.role.is_some(), "a stale read discarded the role");
         assert_eq!(h.core.bk.acked, 2, "a stale read discarded the tail");
+    }
+}
+
+/// Plan 41 R1: the root's delegation windows live in one shared table
+/// (`DelegWindows`), and every transition that ends a grant closes the slot
+/// inside the core's step.
+mod deleg_windows_tests {
+    use super::*;
+    use crate::core::delegate::RecallPhase;
+
+    fn slot_open(h: &Harness) -> bool {
+        h.core.dw.get(7).expect("slot").open
+    }
+
+    fn renew(h: &mut Harness, req: u64) -> Vec<Action> {
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRenew {
+                req: OpId(req),
+                gen: 7,
+                round: 1,
+                backup: Some(4),
+                stream_head: 0,
+                stream_head_at: 0,
+            },
+        })
+    }
+
+    fn granted(out: &[Action]) -> Option<u64> {
+        sends(out).iter().find_map(|(to, m)| match m {
+            PeerMsg::DelegRenewed { ttl_ms, .. } if *to == 3 => Some(*ttl_ms),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn the_table_holds_the_window_a_renewal_grants() {
+        let mut h = root_with_delegate_backed_by(4);
+        assert!(slot_open(&h));
+        let first = h.core.gen_until(7);
+        // ttl 1 s and the horizon's margin: `now + ttl + extra`.
+        let horizon = h.core.reclaim_horizon_ms();
+        assert!(first >= w(h.now.plus(horizon)), "{first:?}");
+        h.advance(300);
+        let out = renew(&mut h, 2);
+        assert_eq!(granted(&out), Some(1_000));
+        assert_eq!(h.core.gen_until(7), w(h.now.plus(horizon)));
+        assert!(h.core.gen_until(7) > first, "extended, never shortened");
+        assert_eq!(h.core.dw.get(7).unwrap().node, 3);
+    }
+
+    #[test]
+    fn a_recall_closes_the_slot_in_its_step_and_no_renewal_reopens_it() {
+        let mut h = root_with_delegate_backed_by(4);
+        assert!(slot_open(&h));
+        let mut out = Vec::new();
+        h.core.start_recall(h.clk(), 7, &mut out);
+        assert!(
+            !slot_open(&h),
+            "closed at the transition, not at the step's end"
+        );
+        let until = h.core.gen_until(7);
+        h.advance(100);
+        let out = renew(&mut h, 2);
+        assert_eq!(granted(&out), Some(0), "refused");
+        assert!(!slot_open(&h));
+        assert_eq!(h.core.gen_until(7), until, "the outwait is not lengthened");
+    }
+
+    /// Fail-before (R1): a window that was extended after the step took its
+    /// `now` (an extension landing between the expiry timer's step reading the
+    /// clock and deciding) was reclaimed or sealed on the stale read.
+    #[test]
+    fn an_expiry_does_not_act_on_a_window_extended_since_its_step_began() {
+        let mut h = root_with_delegate_backed_by(4);
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let later = w(h.now.plus(5_000));
+        h.core
+            .dw
+            .before_close_for_tests(Box::new(move |dw| dw.extend_core(7, later, true)));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        let g = &h.core.dl.gens[&7];
+        assert!(!g.ended, "reclaimed a renewed grant: {out:?}");
+        assert_eq!(
+            g.recall,
+            RecallPhase::None,
+            "sealed a renewed grant: {out:?}"
+        );
+        assert!(
+            !sends(&out)
+                .iter()
+                .any(|(_, m)| matches!(m, PeerMsg::DelegSeal { .. })),
+            "{out:?}"
+        );
+        assert_eq!(h.core.gen_until(7), later);
+        assert!(
+            h.core.dl.gens[&7].expiry.is_some(),
+            "re-armed for the new end"
+        );
+        assert!(slot_open(&h));
+    }
+
+    #[test]
+    fn an_expiry_closes_the_slot_before_it_reclaims() {
+        let mut h = root_with_delegate_backed_by(0);
+        // (No backup named: the plain reclaim.)
+        h.core.dl.gens.get_mut(&7).unwrap().backup = None;
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        assert!(h.core.dl.gens[&7].ended, "{out:?}");
+        assert!(!slot_open(&h));
+    }
+
+    #[test]
+    fn a_seal_closes_the_slot_and_gives_it_the_seals_own_window() {
+        let mut h = root_with_delegate_backed_by(4);
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        let seal = sends(&out)
+            .iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::DelegSeal { req, .. } if *to == 4 => Some(*req),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no seal: {out:?}"));
+        assert_eq!(h.core.dl.gens[&7].recall, RecallPhase::Sealing);
+        assert!(!slot_open(&h));
+        let seal_window = w(h.now.plus(h.core.cfg.forward_timeout_ms * 2));
+        assert_eq!(h.core.gen_until(7), seal_window);
+        // The seal is not answered (the backup is gone): the phase before
+        // the seal comes back, the core grants again, the slot reopens.
+        h.advance(10);
+        h.step(Event::PeerFailed {
+            req: seal,
+            to: 4,
+            outage: false,
+        });
+        assert_eq!(h.core.dl.gens[&7].recall, RecallPhase::None);
+        assert!(
+            slot_open(&h),
+            "the core grants again after an unanswered seal"
+        );
+    }
+
+    #[test]
+    fn an_epoch_closes_every_slot_and_a_lost_lease_drops_them() {
+        let mut h = root_with_delegate_backed_by(4);
+        assert!(slot_open(&h));
+        let mut out = Vec::new();
+        h.core.deleg_on_epoch(h.clk(), true, &h.meta, &mut out);
+        assert!(!slot_open(&h));
+        let mut h = root_with_delegate_backed_by(4);
+        let mut out = Vec::new();
+        h.core.deleg_on_lease_gone(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dw.get(7).is_none());
+        assert!(h.core.dl.gens.is_empty());
+    }
+
+    #[test]
+    fn a_designation_is_never_open_to_anyone_but_the_core() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        let dir = delegated_to_me(&h.meta, 3);
+        let _ = dir;
+        // (A designation: the table's row says so.)
+        h.core
+            .dw
+            .insert(9, 3, w(h.now.plus(1_000)), w(h.now.plus(1_000)), false);
+        assert!(!h.core.dw.get(9).unwrap().open);
+        h.core.dw.extend_core(9, w(h.now.plus(2_000)), true);
+        assert!(!h.core.dw.get(9).unwrap().open);
     }
 }

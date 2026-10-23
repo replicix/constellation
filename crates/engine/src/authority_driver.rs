@@ -2047,6 +2047,10 @@ impl Driver {
         let urgent_rx = deps.urgent_rx.take();
         let node_id = deps.config.node_id;
         let core = Core::new(deps.config.clone());
+        // The root's delegation windows are decided on the table's own clock
+        // inside its guard (plan 41 R1): the protocol clock, the one every
+        // other reading of the node's time comes from.
+        core.deleg_windows().set_clock(Arc::new(crate::locks::now));
         let leases = LeaseStore::new(deps.store_inner.clone(), PARTITION, deps.lease_mode);
         let inbox = match &deps.e2e {
             Some(keys) => InboxStore::new_e2e(deps.store_inner.clone(), keys.clone()),

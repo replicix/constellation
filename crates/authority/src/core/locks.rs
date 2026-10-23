@@ -6196,7 +6196,7 @@ impl Core {
                 // about to: an expiry retry, `!root_usable`); a seal
                 // pushed `until` on but began after the outwait.
                 let outwaited = g.ended
-                    || now.wait >= g.until
+                    || now.wait >= self.gen_until(gen)
                     || g.recall == super::delegate::RecallPhase::Sealing;
                 let dir = g.dir;
                 self.lock_note_dir_floor(dir, &floor);

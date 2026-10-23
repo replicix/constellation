@@ -544,7 +544,14 @@ impl NodeHandle {
         let driver = Driver {
             id,
             meta: meta.clone(),
-            core: Core::new(cfg),
+            core: {
+                let core = Core::new(cfg);
+                // The window table decides on this node's clock (plan 41 R1).
+                let clock = clock.clone();
+                core.deleg_windows()
+                    .set_clock(Arc::new(move || clock.now()));
+                core
+            },
             store: env.bucket.handle(id),
             bucket: env.bucket.clone(),
             world: env.world.clone(),

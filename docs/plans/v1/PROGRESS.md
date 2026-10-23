@@ -58090,3 +58090,48 @@ on btrfs the runs read -1 % to +10 %. The same library code under a test binary
 that differs only by an unused test function moves by up to 4 %, which is
 the host's and the linker's layout, not the change (the only code on that
 path is one relaxed add per call).
+
+## Plan 41 R1: the root's delegation windows in one shared table (2026-10-22)
+
+First half of plan 41's root-side lane (R): no behaviour change. A delegation
+generation's window (`GenState::until`: how long the root outwaits its
+delegate) was the core's own, so every extension and every decision on it was
+a step of the core; R2 lets the root's P2P service extend it while a step is
+stuck, so the window moves to one table with two rules first.
+
+### The table
+
+`GenState::until`/`renewed_until` became `Window { node, until,
+renewed_until, open, eligible, settled }` under one mutex, owned by the core
+through an `Arc` and given the node's protocol clock (`DelegWindows::set_clock`;
+the daemon's `OffCore` holds the handle, the sim shares it with its bus tap).
+Rule 1: extensions are a `max` and commute. Rule 2: whatever ends or shortens a
+window, or after which the core would grant no more, closes the slot **inside
+the step, at the transition**: `start_recall`, the seal (`set_until_closed`
+only on a closed slot), `mark_ended`/`end_generation`, an epoch, the lease gone;
+an unanswered seal that returns the generation to its earlier phase reopens it.
+The expiry decision is `close_if_expired`: the clock is read inside the guard
+and the slot closed in the same section, so a window extended after the step
+took its `now` is re-armed, never sealed or reclaimed on the stale read.
+
+Fail-before: `an_expiry_does_not_act_on_a_window_extended_since_its_step_began`
+(core), `the_old_read_then_seal_sequence_loses_an_extension_the_primitive_keeps`
+(the table: the pre-R1 sequence, read `until`, decide, write the seal's window,
+cut the renewed window to 11 000 from 13 000; the primitive keeps it). Deviation
+from the spec: the table is owned by the core (not by `Meta`): the transitions
+that close a slot (`start_recall`, `mark_ended`, ...) have no `replica` argument
+and the answerer needs the handle without a store, so `Core` holds the `Arc`
+(`Core::set_deleg_windows`); the slot has no `round` (the root does not track
+the delegate's round; it echoes the request's, and the delegate checks it).
+
+### Evidence
+
+- Core and table unit tests (`deleg_windows::tests`, `core::tests::deleg_windows_tests`:
+  each closing transition, the expiry decision under an extension that lands
+  after the step's clock read, a closed slot reopened only by the core,
+  designations never open): the authority lib tests pass on this tree alone
+  (606), `cargo check --workspace --all-targets` clean.
+- Behaviour is unchanged by construction (the table replaces two fields; the
+  new rules only close earlier or re-arm): the sim sweeps of the next entry
+  (R2) run on the stacked tree, the delegation configurations among them
+  (the broad set of 91 configurations at 80 seeds each, the delegation ones among them).
