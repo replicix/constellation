@@ -358,8 +358,10 @@ impl View {
             Some(WaitStart::Held(own)) => own,
             None => None,
         };
-        stats.with_stats(|s| s.lapse_inline_waits += 1);
+        // The wait's clock starts before it is counted: whoever sees the
+        // count knows the measured wait was already running.
         let started = Instant::now();
+        stats.with_stats(|s| s.lapse_inline_waits += 1);
         let bound = l.owner_wait_max + Duration::from_secs(5);
         let cancelled = || {
             w.cancel.is_some_and(CancelToken::is_cancelled)

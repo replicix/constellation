@@ -3441,7 +3441,7 @@ fn a_parked_write_lands_after_the_admission() {
 
 /// A frontend that cannot answer from another thread waits in the call, as
 /// F-b's lock waits do: the read is answered on the calling thread, once the
-/// verdict is in (here from another thread, 150 ms after the call began).
+/// verdict is in (here from another thread, 150 ms after the wait began).
 #[test]
 fn a_frontend_that_cannot_defer_waits_in_the_call_for_the_verdict() {
     let p = parking_with(300, false);
@@ -3449,6 +3449,18 @@ fn a_frontend_that_cannot_defer_waits_in_the_call_for_the_verdict() {
     let meta = p.meta.clone();
     let turn = p.turn;
     let renewer = std::thread::spawn(move || {
+        // The verdict comes 150 ms after the inline wait is counted (its
+        // clock is running by then), not 150 ms after this thread started:
+        // under CPU load the read could begin its wait late, and the wait it
+        // measured fell short of the 100 ms asserted below (99 ms).
+        let deadline = std::time::Instant::now() + 30 * SECOND;
+        while meta.locks().stats().lapse_inline_waits == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the read never waited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
         std::thread::sleep(std::time::Duration::from_millis(150));
         let id = meta.locks().held(turn).unwrap().id;
         let now = crate::locks::now();
