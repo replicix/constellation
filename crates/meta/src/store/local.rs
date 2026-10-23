@@ -532,7 +532,8 @@ impl Meta {
     /// `completed` row, so the dedup above never saw it, and the records
     /// re-applied over later speculation of the same names: a second
     /// exchange of the pair swapped back, a `create a` after `rename a b`
-    /// moved over `b`.
+    /// moved over `b`. A refusal of such a rid strands the shadow
+    /// (M2, `Meta::journal_refusal_over_shadow`).
     pub fn apply_delegate_tx(
         &self,
         records: &[LogRecord],
@@ -548,8 +549,12 @@ impl Meta {
             if self.completed_position(*r)?.is_some() {
                 return Ok(false);
             }
+            // Plan 45 §12 M2: a live shadow of the refused rid (the root
+            // forwarded the op and installed the delegate's acceptance,
+            // which `repair drop-held` on the delegate then let go) is
+            // stranded by rid in the same transaction.
             let _d = journal::PendingDelegate::set(gen, Some(idx), deps);
-            self.journal_refusal(*r, *code, None)?;
+            self.journal_refusal_over_shadow(*r, *code)?;
             self.note_log_idx(gen, idx)?;
             return Ok(true);
         }

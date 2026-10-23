@@ -2542,6 +2542,74 @@ fn o1_a_root_appending_under_its_own_rows_keeps_the_journal_order() {
     assert_eq!(queued, vec![rid(2)]);
 }
 
+/// Plan 45 §12 M2: the root forwarded `create a` (rid 1) to the delegate of
+/// generation 5 and installed its acceptance as a shadow, then shadowed
+/// `create c` (rid 2) in the same directory. `repair drop-held` on the
+/// delegate let rid 1's transaction go and journaled `Refused { rid 1 }`,
+/// which the root appends. The refused op's effect never reaches the log:
+/// the shadow is stranded by rid (rolled back, the later shadow redone on
+/// top, no replay queued), as the segment path strands a refused rid's
+/// shadow. Before, the shadow stayed live under the journaled refusal and
+/// the refusal's ship retired it in place: `a` stayed in the root's
+/// replica for good.
+#[test]
+fn m2_a_root_appending_a_refusal_strands_its_own_shadow_of_the_rid() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    let (x, y) = (ino(1), ino(2));
+    for (r, name, i, t) in [(1, "a", x, 10), (2, "c", y, 11)] {
+        assert!(meta
+            .install_shadow_from(
+                rid(r),
+                1,
+                5,
+                &create_op(name, i),
+                &Default::default(),
+                &[create(name, i, t), completed(rid(r))]
+            )
+            .unwrap());
+    }
+    assert!(meta
+        .apply_delegate_tx(
+            &[LogRecord::Refused {
+                rid: rid(1),
+                code: Code::Io,
+            }],
+            Some(rid(1)),
+            5,
+            1,
+            constellation_meta::Position::ZERO,
+        )
+        .unwrap());
+    let names = |m: &Meta| ["a", "c"].map(|n| m.lookup(ROOT_INO, n).unwrap().map(|e| e.ino));
+    assert_eq!(
+        names(&meta),
+        [None, Some(y)],
+        "the refused op's effect is gone, the later shadow stays"
+    );
+    assert!(matches!(
+        meta.completed_outcome(rid(1)).unwrap(),
+        Some(constellation_meta::CompletedOutcome::Refused { code: Code::Io })
+    ));
+    assert!(
+        meta.pending_replays().unwrap().is_empty(),
+        "the refusal is final: nothing is queued for replay"
+    );
+    let counts = meta.speculation_counts().unwrap();
+    assert_eq!(
+        (counts.outstanding, counts.local),
+        (1, 1),
+        "rid 2's shadow and the refusal's row"
+    );
+    // Ship the refusal: rid 2's shadow stays (its op is still the
+    // delegate's), and nothing brings `a` back.
+    let (_, batch) = meta.take_journal_grouped(1).unwrap().pop().unwrap();
+    let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
+    meta.ack_journal_rows_at(&seqs, 1).unwrap();
+    assert_eq!(names(&meta), [None, Some(y)]);
+    assert_eq!(meta.speculation_counts().unwrap().outstanding, 1);
+}
+
 /// Plan 45 §12 O1, the stream's side (`delegated-backup+links+stalebase`
 /// seed 138): a replay of a stranded op answered by the holder's dedup
 /// (`Accepted` with no records: the rid was done there, at a position this

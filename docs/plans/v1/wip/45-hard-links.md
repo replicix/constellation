@@ -560,11 +560,26 @@ purpose", "Gates"), with these rows:
   `insert_streamed_tx` redoes the adopted row from the transaction's records).
   Test: `a_streamed_transaction_does_not_adopt_a_shadow_that_lacks_its_effect`.
   The O1 unwind itself never trusted the shadow's effect (it restores the
-  before-images and applies the records). Still open in the same class: the
-  `[Refused { rid }]` branch of `apply_delegate_tx` journals a delegate's
-  refusal without stranding a live shadow of that rid, whose effect
-  `ack_rows_tx` then retires in place (the segment path strands it); reached
-  only through `repair drop-held` on a delegate.
+  before-images and applies the records).
+
+  **M2, the refusal's side (closed 2026-10-23).** The `[Refused { rid }]`
+  branch of `apply_delegate_tx` journaled a delegate's refusal without
+  looking for a live shadow of that rid; the refusal's ship then retired the
+  shadow in place (`ack_rows_tx` retires root shadows by the `Completed` and
+  `Refused` rows a ship carries), so the refused op's effect stayed in the
+  root's replica and reached its publishes. Reached when the root forwarded
+  the op, installed the delegate's acceptance, and `repair drop-held` on the
+  delegate let the transaction go (it was held back, so never streamed) and
+  journaled the refusal. Introduced with the branch (`578ff9cf`); `2ff95df5`
+  gave the segment path its rule for a refused rid's shadow ("a dropped op's
+  shadow kept for good") but not this path. Now the refusal's transaction
+  strands the shadow by rid first (`Meta::journal_refusal_over_shadow`:
+  rolled back, the rows after it redone, its queued replay dropped, as the
+  segment path does), before the refusal's own `Local` bracket, the same
+  place O1's unwind runs. Stranded, not dropped: unlike an append, the
+  refusal carries no effect to take the shadow's place, and the rollback is
+  reported. Test:
+  `m2_a_root_appending_a_refusal_strands_its_own_shadow_of_the_rid`.
 - **O2: the `+links` sim links and exchanges within one directory only**
   (`with_links`' `dir_of` filter). The overlap rules are by inode and so
   directory-blind, but no sweep exercises a cross-directory link, rename or

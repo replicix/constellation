@@ -236,9 +236,23 @@ impl Meta {
     ) -> Result<(), MetaError> {
         let _observed = op.map(|op| journal::PendingObserved::set(observed_keys(op)));
         let mut tx = self.db.write_tx();
-        let local = self.begin_local(&tx)?;
+        self.journal_refusal_tx(&mut tx, rid, code)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The body of [`Self::journal_refusal`] in the caller's transaction:
+    /// the `Refused` row in a `Local` bracket of its own, and the rid's
+    /// `completed` entry.
+    pub(crate) fn journal_refusal_tx(
+        &self,
+        tx: &mut SingleWriterWriteTx,
+        rid: Rid,
+        code: Code,
+    ) -> Result<(), MetaError> {
+        let local = self.begin_local(tx)?;
         let position = journal::append_tx(
-            &mut tx,
+            tx,
             &self.journal_ks,
             &self.local,
             &self.completed,
@@ -250,9 +264,7 @@ impl Meta {
             rid.to_key(),
             Meta::encode_refused_row(position, now_ms, code),
         );
-        self.finish_local(&mut tx, local)?;
-        tx.commit()?;
-        Ok(())
+        self.finish_local(tx, local)
     }
 
     /// An inbox position whose op was deduplicated (its rid already had

@@ -3708,6 +3708,57 @@ impl Meta {
         Ok(stranded)
     }
 
+    /// Plan 45 §12 M2: the root appends a delegate's refusal of `rid`
+    /// (`Meta::apply_delegate_tx`) over its own live shadow of that rid.
+    /// The delegate had accepted the op, the root forwarded it and
+    /// installed the reply, and then `repair drop-held` on the delegate
+    /// let the transaction go and journaled the refusal; the shadow's
+    /// effect never reaches the log. It is stranded by rid in the
+    /// refusal's transaction, before the refusal's own `Local` bracket
+    /// opens (what the root installed after it is redone on top, as in
+    /// every rewind), and its queued replay is dropped: the outcome is
+    /// final. This is the segment path's rule for a refused rid's shadow
+    /// (`apply_segment_rows`), and the refusal's face of the append's
+    /// unwind by rid (`unwind_shadow_for_append_tx`). Before, the shadow
+    /// stayed live under the journaled refusal, and the refusal's ship
+    /// retired it in place (`Meta::ack_rows_tx`): the refused op's effect
+    /// stayed in the root's replica and reached its next publish.
+    pub(crate) fn journal_refusal_over_shadow(
+        &self,
+        rid: Rid,
+        code: constellation_types::Code,
+    ) -> Result<Stranded, MetaError> {
+        let mut tx = self.db.write_tx();
+        let staged = UsageTracker::staging();
+        let stranded = if counter_get(&tx, &self.local, KV_SPEC_LIVE_COUNT)? > 0 {
+            strand_tx(
+                &mut tx,
+                self,
+                &staged,
+                |entry| matches!(entry, LiveEntry::Shadow { rid: r, .. } if *r == rid),
+            )?
+        } else {
+            Stranded::default()
+        };
+        if stranded.shadows > 0 {
+            drop_queued_of_rids_tx(&mut tx, self, &HashSet::from([rid]))?;
+        }
+        self.journal_refusal_tx(&mut tx, rid, code)?;
+        if stranded.any() {
+            let from = journal_from(&tx, self)?;
+            compact_tx(&mut tx, self, from)?;
+            let (bytes, files) = staged.raw_delta();
+            adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
+        }
+        tx.commit()?;
+        self.report_rolled_back();
+        staged.drain_into(self.usage_tracker());
+        if stranded.any() {
+            tracing::debug!(?rid, "root append of a refusal strands its shadow");
+        }
+        Ok(stranded)
+    }
+
     /// Whether any shadow or hint is outstanding: this replica is then not
     /// a log prefix, and must not be published (plan 30 §M3a's publish
     /// rule). Queued replays do not count — their effects are already
