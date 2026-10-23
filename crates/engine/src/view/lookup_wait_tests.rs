@@ -177,3 +177,112 @@ fn a_dot_lookup_waits_for_the_directorys_inode() {
         "the entry carries the attributes the observed commit made"
     );
 }
+
+// ---- Plan 40 P7: a plus entry waits as `getattr` of the child does -------
+
+use super::plus::testing::{guarded, plus_page, NaiveGuard};
+use super::plus::Naive;
+use constellation_vfs::DirEntry;
+
+/// A plus page of `dir` from `cookie` on `fs`, while something is owed
+/// that `release` settles: the page must not answer before it, and the
+/// entries it answers afterwards are returned. (`naive`: the page's
+/// thread runs that naive step.)
+fn plus_page_held_until(
+    fs: &View,
+    dir: Ino,
+    cookie: u64,
+    naive: Option<Naive>,
+    release: impl FnOnce(),
+) -> Result<Vec<DirEntry>, String> {
+    std::thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        scope.spawn(move || {
+            let _naive = naive.map(NaiveGuard::set);
+            let _ = tx.send(plus_page(fs, dir, cookie, 100));
+        });
+        match rx.recv_timeout(HELD_BACK) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(early) => {
+                return Err(format!(
+                    "the plus page answered before what the children are owed was applied: {:?}",
+                    early.map(|page| page.len())
+                ))
+            }
+            Err(e) => panic!("the listing thread died: {e}"),
+        }
+        release();
+        Ok(rx
+            .recv_timeout(PATIENCE)
+            .expect("the plus page was not released")
+            .unwrap())
+    })
+}
+
+fn mode_of(page: &[DirEntry], name: &str) -> u32 {
+    let entry = page
+        .iter()
+        .find(|e| e.name.as_bytes() == name.as_bytes())
+        .and_then(|e| e.entry.as_ref())
+        .unwrap_or_else(|| panic!("{name:?} has no entry in {page:?}"));
+    entry.attr.mode & 0o7777
+}
+
+/// Another node's `chmod` that this node observed (and acknowledged to
+/// its client) is in the next plus page once the replica applied it, as it
+/// is in a `lookup` or a `getattr`. (From cookie 2, past the listing's own
+/// `Dir` wait: the children's keys alone hold the page.)
+#[test]
+fn a_remote_chmod_is_in_the_next_plus_page_once_applied() {
+    guarded(Naive::NoChildWait, |naive| {
+        let (meta, fs, _tmp, _core, file, _dir) = lagging_node();
+        let page = plus_page_held_until(&fs, ROOT_INO, 2, naive, || {
+            meta.apply_segment(1, 1, &[chmod(file, 0o600)], &TouchSet::default())
+                .unwrap();
+        })?;
+        match mode_of(&page, "file") {
+            0o600 => Ok(()),
+            mode => Err(format!("the entry says {mode:o}, the commit made 600")),
+        }
+    });
+}
+
+/// A queued replay (a stranded op rolled back until it lands) that touches
+/// only the child's inode holds the plus page as it holds `getattr`: the
+/// listing's `Dir(dir)` wait does not match it. (Fails with a
+/// `Dir(dir)`-only wait.)
+#[test]
+fn a_queued_replay_touching_only_the_child_holds_the_plus_page() {
+    guarded(Naive::NoChildWait, |naive| {
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let file = meta.create(ROOT_INO, "file", 0o644, 0, 0).unwrap().ino;
+        meta.create(ROOT_INO, "other", 0o644, 0, 0).unwrap();
+        let (fs, _tmp, _core) = holder_fs(meta.clone(), false);
+        meta.session().set_budget_ms(PATIENCE.as_millis() as u64);
+        meta.queue_replay(
+            constellation_meta::Rid {
+                node: 1,
+                incarnation: 1,
+                seq: 1,
+            },
+            &constellation_meta::MutateOp::Setattr {
+                ino: file,
+                mode: Some(0o600),
+                uid: None,
+                gid: None,
+                size: None,
+                atime_ns: None,
+                mtime_ns: None,
+            },
+            &Default::default(),
+        )
+        .unwrap();
+        let queued = meta.pending_replays().unwrap()[0].queue_seq;
+        let page = plus_page_held_until(&fs, ROOT_INO, 0, naive, || {
+            meta.forget_replay(queued).unwrap();
+        })?;
+        let names: Vec<_> = page.iter().map(|e| e.name.as_bytes().to_vec()).collect();
+        assert!(names.contains(&b"file".to_vec()), "{names:?}");
+        Ok(())
+    });
+}

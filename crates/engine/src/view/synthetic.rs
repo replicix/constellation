@@ -36,6 +36,14 @@ pub(super) struct SyntheticRegistry {
     pub(super) next: Ino,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many frozen directories `snapshot_tree` handed this thread: a
+    /// clone of a whole directory each (plan 40 P7: a plus page of a mirror
+    /// costs one, not one per name).
+    pub(super) static TREE_CLONES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl View {
     pub(crate) fn is_synthetic(ino: Ino) -> bool {
         ino & SYNTHETIC_INO_BIT != 0
@@ -174,6 +182,8 @@ impl View {
         &self,
         hash: crate::snapshot::FrozenObject,
     ) -> Result<crate::snapshot::FrozenDir, Code> {
+        #[cfg(test)]
+        TREE_CLONES.with(|n| n.set(n.get() + 1));
         {
             let cache = self.tree_cache.lock().unwrap();
             if let Some(tree) = cache.0.get(&hash) {
@@ -295,10 +305,13 @@ impl View {
         Ok(Some((ino, self.synthetic_attr(ino, &node))))
     }
 
+    /// The children of the synthetic directory `ino`: their numbers, the
+    /// nodes behind them (`synthetic_attr` makes their attributes) and
+    /// their names.
     pub(crate) fn synthetic_entries(
         &self,
         ino: Ino,
-    ) -> Result<Vec<(Ino, InodeKind, String)>, Code> {
+    ) -> Result<Vec<(Ino, SyntheticNode, String)>, Code> {
         let node = self.synthetic_node(ino).ok_or(Code::Stale)?;
         if !self.synthetic_active(&node) {
             return Err(Code::Stale);
@@ -361,8 +374,7 @@ impl View {
             .into_iter()
             .map(|(name, node)| {
                 let child = self.intern_synthetic(format!("{ino}/{name}"), node.clone());
-                let kind = self.synthetic_attr(child, &node).kind;
-                (child, kind, name)
+                (child, node, name)
             })
             .collect())
     }

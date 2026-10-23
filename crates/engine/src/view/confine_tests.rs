@@ -582,3 +582,126 @@ fn confinement_hot_path_cost() {
         started.elapsed() / files.len() as u32
     );
 }
+
+// ---- Plan 40 P7: plus entries of subtree views and snapshot mirrors ------
+
+use super::plus::testing::{guarded, plus_page};
+use super::plus::Naive;
+
+/// A plus entry of a subtree view is a reference the view resolved: the
+/// inode is reached, so an op on it by number succeeds.
+#[test]
+fn a_subtree_views_plus_entries_are_reached() {
+    guarded(Naive::NoReach, |_| {
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let a = meta.mkdir(ROOT_INO, "a", 0o755, 0, 0).unwrap();
+        let sub = meta.mkdir(a.ino, "sub", 0o755, 0, 0).unwrap();
+        let f = meta.create(sub.ino, "f", 0o644, 0, 0).unwrap();
+        meta.create(ROOT_INO, "outside", 0o644, 0, 0).unwrap();
+        let (v, _dir) = view_at(&meta, Some("/a"));
+        assert!(v.is_confined());
+        let page = plus_page(&v, ROOT_INO, 0, 100).unwrap();
+        let entry = page
+            .iter()
+            .find(|e| e.name.as_bytes() == b"sub")
+            .and_then(|e| e.entry.clone())
+            .expect("an entry for sub");
+        assert_eq!(entry.attr.ino, sub.ino);
+        // The view's root is renumbered, and its `.` and `..` are name-only.
+        assert!(page
+            .iter()
+            .filter(|e| matches!(e.name.as_bytes(), b"." | b".."))
+            .all(|e| e.entry.is_none()));
+        if !v.reach.contains(sub.ino) {
+            return Err("the plus entry's inode was not noted as reached".into());
+        }
+        // An op by number succeeds on it and on what it lists.
+        let want = lookup(&v, ROOT_INO, "sub").unwrap();
+        assert_eq!(entry, want);
+        assert_eq!(getattr(&v, sub.ino).unwrap().ino, sub.ino);
+        let inner = plus_page(&v, sub.ino, 0, 100).unwrap();
+        assert!(inner.iter().any(|e| e.ino == f.ino && e.entry.is_some()));
+        assert_eq!(code(getattr(&v, ROOT_INO + 1000)), Code::Stale);
+        Ok(())
+    });
+}
+
+/// The plus entries of a snapshot mirror are the frozen attributes a
+/// lookup there answers, and a page costs one clone of the mirror's frozen
+/// directory, not one per name (a `lookup_synthetic` per name clones it
+/// each time).
+#[test]
+fn a_snapshot_mirrors_plus_entries_are_its_frozen_attrs_and_cost_o_page() {
+    const N: usize = 60;
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    meta.set_node_prefix(1).unwrap();
+    let a = meta.mkdir(ROOT_INO, "a", 0o755, 0, 0).unwrap().ino;
+    for i in 0..N {
+        meta.create(a, &format!("f{i:02}"), 0o640, 0, 0).unwrap();
+    }
+    meta.mkdir(a, "dir", 0o750, 0, 0).unwrap();
+    let (v, _dir, _nodes) = view_with_snapshots(&meta, &[("/a", "snap")]);
+    let dot = lookup(&v, a, ".constellation").unwrap().attr.ino;
+    let snapdir = lookup(&v, dot, "snapshot").unwrap().attr.ino;
+    let mirror = lookup(&v, snapdir, "snap").unwrap().attr.ino;
+    // The `.constellation` nodes list their one child with an entry.
+    let page = plus_page(&v, dot, 0, 100).unwrap();
+    assert!(page
+        .iter()
+        .any(|e| e.name.as_bytes() == b"snapshot" && e.entry.is_some()));
+
+    let clones = || super::synthetic::TREE_CLONES.with(|n| n.get());
+    let before = clones();
+    let page = plus_page(&v, mirror, 0, 1000).unwrap();
+    let plus_cost = clones() - before;
+    assert_eq!(page.len(), N + 1 + 2, "{page:?}");
+    // What a lookup of each name answers.
+    let before = clones();
+    for e in &page {
+        let name = String::from_utf8_lossy(e.name.as_bytes()).into_owned();
+        if name == "." || name == ".." {
+            assert!(e.entry.is_none(), "{name:?} is name-only");
+            continue;
+        }
+        let want = lookup(&v, mirror, &name).unwrap();
+        assert_eq!(e.entry.as_ref(), Some(&want), "{name:?}");
+    }
+    let naive_cost = clones() - before;
+    assert!(plus_cost <= 1, "a plus page cost {plus_cost} tree clones");
+    assert!(
+        naive_cost >= N as u64,
+        "the per-name lookups cost {naive_cost} clones: the counter does not count"
+    );
+    let modes: std::collections::BTreeSet<u32> = page
+        .iter()
+        .filter_map(|e| e.entry.as_ref())
+        .map(|e| e.attr.mode & 0o7777)
+        .collect();
+    // The frozen modes, read-only as a mirror is: 0o640 and 0o750, w bits off.
+    assert_eq!(modes, [0o440, 0o550].into(), "frozen modes");
+}
+
+/// A name of a snapshot that is gone is name-only.
+#[test]
+fn plus_entries_of_a_deleted_snapshot_are_name_only() {
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    meta.set_node_prefix(1).unwrap();
+    let a = meta.mkdir(ROOT_INO, "a", 0o755, 0, 0).unwrap().ino;
+    meta.create(a, "f", 0o644, 0, 0).unwrap();
+    let (v, _dir, _nodes) = view_with_snapshots(&meta, &[("/a", "snap")]);
+    let dot = lookup(&v, a, ".constellation").unwrap().attr.ino;
+    let snapdir = lookup(&v, dot, "snapshot").unwrap().attr.ino;
+    let mirror = lookup(&v, snapdir, "snap").unwrap().attr.ino;
+    let page = plus_page(&v, mirror, 0, 100).unwrap();
+    assert!(page
+        .iter()
+        .find(|e| e.name.as_bytes() == b"f")
+        .is_some_and(|e| e.entry.is_some()));
+    // Listing the mirror needs it; its children are checked per page.
+    let mut node = v.synthetic_node(mirror).unwrap();
+    if let SyntheticNode::Frozen { snapshot_id, .. } = &mut node {
+        *snapshot_id = "no-such-snapshot".into();
+    }
+    let mut p = v.plus_page(mirror, false);
+    assert!(p.synthetic_entry(mirror, &node).is_none());
+}

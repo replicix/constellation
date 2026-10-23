@@ -333,9 +333,8 @@ pub(super) fn plus_dot_and_dotdot_are_name_only(env: &Env<'_>) -> TestResult {
                             e.name
                         ),
                         // Whatever a view hands out has to be about the
-                        // listed name. (What it must equal is the lookup's,
-                        // which needs a target that answers plus entries:
-                        // plan 40 P7.)
+                        // listed name. (What it must equal is the lookup's:
+                        // `plus_entries_are_what_lookup_answers`.)
                         Some(entry) if entry.attr.ino != e.ino || entry.attr.kind != e.kind => {
                             fail!(
                                 "page {page}: the entry of {:?} is for inode {} ({:?}), the \
@@ -483,6 +482,134 @@ pub(super) fn a_cookie_resumes_from_a_fresh_client(env: &Env<'_>) -> TestResult 
     Ok(())
 }
 
+/// Every name of `d` (but `.` and `..`) has a plus entry equal to what a
+/// lookup of it answers now, and to what `getattr` of its inode says; `.`
+/// and `..` have none. Listed whole and in pages of 2, with no name-only
+/// entry: nothing here is a reason for a view to decline one.
+fn plus_matches_lookup(c: &Client, d: Ino, when: &str) -> TestResult {
+    for page in [2usize, 100] {
+        let all = must("plus listing", paged(c, d, 0, page, |_| true));
+        for e in &all {
+            let name = String::from_utf8_lossy(e.name.as_bytes()).into_owned();
+            if matches!(e.name.as_bytes(), b"." | b"..") {
+                continue;
+            }
+            let Some(entry) = &e.entry else {
+                fail!("{when}, pages of {page}: {name:?} is name-only in a quiescent listing");
+            };
+            let want = must("lookup", c.lookup(d, &name));
+            if entry != &want {
+                fail!(
+                    "{when}, pages of {page}: the plus entry of {name:?} is {entry:?}, a lookup \
+                     of it answers {want:?}"
+                );
+            }
+            let attr = must("getattr", c.getattr(e.ino));
+            if entry.attr != attr {
+                fail!(
+                    "{when}, pages of {page}: the plus entry of {name:?} says {:?}, getattr of \
+                     its inode {attr:?}",
+                    entry.attr
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn plus_entries_are_what_lookup_answers(env: &Env<'_>) -> TestResult {
+    let fx = env.fresh();
+    let c = fx.client();
+    let d = must("mkdir d", c.mkdir(c.root(), "d")).attr.ino;
+    let a = must("put a", c.put(d, "a", b"hello")).attr.ino;
+    must("mkdir sub", c.mkdir(d, "sub"));
+    must("symlink", c.symlink(d, "s", "a"));
+    if env.caps().hard_links {
+        must("link", c.link(a, d, "a2"));
+    }
+    // A file with a write session pending: the entry says what `getattr`
+    // does, the size the session holds.
+    let (open, o) = must("create open", c.create(d, "open"));
+    must("write", c.write(open.attr.ino, o.fh, 0, &[7; 3000]));
+    plus_matches_lookup(&c, d, "at first")?;
+    // The changes a listing must not miss: a chmod, a truncate, an
+    // append through the open file, a rename, a new name, a removal.
+    must(
+        "chmod",
+        c.setattr(
+            a,
+            None,
+            &crate::types::SetAttr {
+                mode: Some(0o600),
+                ..crate::types::SetAttr::default()
+            },
+        ),
+    );
+    must("truncate", c.truncate(a, None, 2));
+    must("append", c.write(open.attr.ino, o.fh, 3000, &[8; 500]));
+    must("rename", c.rename(d, "sub", d, "sub2"));
+    must("put b", c.put(d, "b", b"bbbbbbbb"));
+    must("unlink s", c.unlink(d, "s"));
+    plus_matches_lookup(&c, d, "after changes")?;
+    let size = must("plus", c.readdir_page(d, 0, 100, true))
+        .into_iter()
+        .find(|e| e.name.as_bytes() == b"open")
+        .and_then(|e| e.entry)
+        .map(|e| e.attr.size);
+    if size != Some(3500) {
+        fail!("the open file holds 3500 bytes, its plus entry says {size:?}");
+    }
+    must("close", c.close(open.attr.ino, o.fh));
+    plus_matches_lookup(&c, d, "after the close")?;
+    Ok(())
+}
+
+pub(super) fn a_plus_entry_is_a_reference(env: &Env<'_>) -> TestResult {
+    let fx = env.fresh();
+    let c = fx.client();
+    let root = c.root();
+    let d = must("mkdir d", c.mkdir(root, "d")).attr.ino;
+    must("put f", c.put(d, "f", b"abcdef"));
+    must("mkdir sub", c.mkdir(d, "sub"));
+    // The client is handed both by a plus listing and looks neither up.
+    let listed = must("plus listing", c.readdir_page(d, 0, 100, true));
+    let mut held = Vec::new();
+    for want in ["f", "sub"] {
+        let Some(e) = listed.iter().find(|e| e.name.as_bytes() == want.as_bytes()) else {
+            fail!("{want:?} is not listed: {listed:?}");
+        };
+        if e.entry.is_none() {
+            fail!("{want:?} is name-only in a quiescent listing");
+        }
+        held.push((want, e.ino, e.kind));
+    }
+    must("unlink f", c.unlink(d, "f"));
+    must("rmdir sub", c.rmdir(d, "sub"));
+    // The names are gone, the references are not: the platform stats what
+    // it was handed as a local filesystem stats a deleted file or
+    // directory, until it lets go.
+    for (name, ino, kind) in &held {
+        let gone = must("getattr of the removed inode", c.getattr(*ino));
+        let size = if *kind == FileKind::File {
+            6
+        } else {
+            gone.size
+        };
+        if (gone.ino, gone.kind, gone.nlink, gone.size) != (*ino, *kind, 0, size) {
+            fail!("{name:?} was removed and is referenced by its plus entry: {gone:?}");
+        }
+    }
+    for (name, ino, _) in &held {
+        c.forget(*ino);
+        refused_any(
+            &format!("getattr of {name:?} after its forget"),
+            c.getattr(*ino),
+            &[Code::NotFound, Code::Stale],
+        );
+    }
+    Ok(())
+}
+
 /// The naive `readdir`s the plus cases guard against: each is the
 /// reference filesystem's listing with one naive habit, scripted into a
 /// `MockVfs`. A case that passed on one of them would test nothing.
@@ -510,6 +637,10 @@ mod naive {
         GoneIsEmpty,
         /// The cookie is a position in the listing as it is now.
         PositionCookies,
+        /// A plus listing carries no entries: a view that ignores `plus`.
+        NameOnly,
+        /// A plus listing's entries say a size that is not the file's.
+        WrongSizes,
     }
 
     struct Naive(Habit);
@@ -540,56 +671,87 @@ mod naive {
         })
     }
 
+    /// `mock`'s `readdir` as `habit` has it, over the reference answers
+    /// of `inner` (another view of the same filesystem and root).
+    fn script(habit: Habit, mock: &MockVfs, inner: MockVfs) {
+        mock.always_readdir(Script::With(Arc::new(move |call| {
+            let Args::Readdir {
+                ino, cookie, plus, ..
+            } = call.args
+            else {
+                return Err(VfsError::new(Code::Invalid));
+            };
+            match habit {
+                Habit::DotsWithEntries => {
+                    let mut all = listing(&inner, ino, cookie, plus)?;
+                    if plus {
+                        for e in &mut all {
+                            if matches!(e.name.as_bytes(), b"." | b"..") {
+                                let name = String::from_utf8_lossy(e.name.as_bytes());
+                                e.entry = Some(entry_of(&inner, ino, &name)?);
+                            }
+                        }
+                    }
+                    Ok(all)
+                }
+                Habit::PlusSkipsOne => {
+                    let mut all = listing(&inner, ino, cookie, plus)?;
+                    if plus && cookie != 0 && !all.is_empty() {
+                        all.remove(0);
+                    }
+                    Ok(all)
+                }
+                Habit::GoneIsEmpty => match listing(&inner, ino, cookie, plus) {
+                    Err(e) if plus && e.code() == Code::NotFound => Ok(Vec::new()),
+                    other => other,
+                },
+                Habit::PositionCookies => {
+                    let mut all = listing(&inner, ino, 0, plus)?;
+                    let from = (cookie as usize).min(all.len());
+                    all.drain(..from);
+                    for (i, e) in all.iter_mut().enumerate() {
+                        e.next = (from + i + 1) as u64;
+                    }
+                    Ok(all)
+                }
+                Habit::NameOnly => {
+                    let mut all = listing(&inner, ino, cookie, plus)?;
+                    for e in &mut all {
+                        e.entry = None;
+                    }
+                    Ok(all)
+                }
+                Habit::WrongSizes => {
+                    let mut all = listing(&inner, ino, cookie, plus)?;
+                    for e in all.iter_mut().filter(|e| e.kind == crate::FileKind::File) {
+                        if let Some(entry) = &mut e.entry {
+                            entry.attr.size += 1;
+                        }
+                    }
+                    Ok(all)
+                }
+            }
+        })));
+    }
+
     impl ConformanceTarget for Naive {
         type V = MockVfs;
 
         fn fresh(&self, caps: &FrontendCaps, _opts: TargetOpts) -> Fixture<MockVfs> {
             let mock = MockVfs::reference(caps.clone());
-            let inner = mock.view_of("/", false).expect("a second view");
             let habit = self.0;
-            mock.always_readdir(Script::With(Arc::new(move |call| {
-                let Args::Readdir {
-                    ino, cookie, plus, ..
-                } = call.args
-                else {
-                    return Err(VfsError::new(Code::Invalid));
-                };
-                match habit {
-                    Habit::DotsWithEntries => {
-                        let mut all = listing(&inner, ino, cookie, plus)?;
-                        if plus {
-                            for e in &mut all {
-                                if matches!(e.name.as_bytes(), b"." | b"..") {
-                                    let name = String::from_utf8_lossy(e.name.as_bytes());
-                                    e.entry = Some(entry_of(&inner, ino, &name)?);
-                                }
-                            }
-                        }
-                        Ok(all)
-                    }
-                    Habit::PlusSkipsOne => {
-                        let mut all = listing(&inner, ino, cookie, plus)?;
-                        if plus && cookie != 0 && !all.is_empty() {
-                            all.remove(0);
-                        }
-                        Ok(all)
-                    }
-                    Habit::GoneIsEmpty => match listing(&inner, ino, cookie, plus) {
-                        Err(e) if plus && e.code() == Code::NotFound => Ok(Vec::new()),
-                        other => other,
-                    },
-                    Habit::PositionCookies => {
-                        let mut all = listing(&inner, ino, 0, plus)?;
-                        let from = (cookie as usize).min(all.len());
-                        all.drain(..from);
-                        for (i, e) in all.iter_mut().enumerate() {
-                            e.next = (from + i + 1) as u64;
-                        }
-                        Ok(all)
-                    }
-                }
-            })));
-            Fixture::new(Arc::new(mock), caps.clone())
+            script(habit, &mock, mock.view_of("/", false).expect("a view"));
+            let fs = mock.ref_fs().expect("a reference mock").clone();
+            let mut fixture = Fixture::new(Arc::new(mock), caps.clone());
+            // Subtree views list as the habit lists.
+            let caps = caps.clone();
+            fixture.hooks.subtree_view = Some(Arc::new(move |path: &str, confine: bool| {
+                let view = MockVfs::over(&fs, path, confine).map_err(|c| c.to_string())?;
+                let inner = MockVfs::over(&fs, path, confine).map_err(|c| c.to_string())?;
+                script(habit, &view, inner);
+                Ok(Fixture::new(Arc::new(view), caps.clone()))
+            }));
+            fixture
         }
     }
 
@@ -636,10 +798,36 @@ mod naive {
     }
 
     #[test]
+    fn the_plus_entry_cases_fail_on_a_view_that_ignores_plus() {
+        for case in [
+            "readdir::plus_entries_are_what_lookup_answers",
+            "readdir::a_plus_entry_is_a_reference",
+            "confinement::plus_of_a_subtree_view_stays_confined",
+        ] {
+            fails(Habit::NameOnly, case);
+        }
+    }
+
+    #[test]
+    fn the_plus_entry_cases_fail_on_entries_that_are_not_what_lookup_answers() {
+        for case in [
+            "readdir::plus_entries_are_what_lookup_answers",
+            "confinement::plus_of_a_subtree_view_stays_confined",
+        ] {
+            fails(Habit::WrongSizes, case);
+        }
+    }
+
+    #[test]
     fn the_naive_listings_are_otherwise_the_reference() {
         // Guards the guard: a habit that broke the listing in general
         // would make the failures above vacuous.
-        for habit in [Habit::DotsWithEntries, Habit::GoneIsEmpty] {
+        for habit in [
+            Habit::DotsWithEntries,
+            Habit::GoneIsEmpty,
+            Habit::NameOnly,
+            Habit::WrongSizes,
+        ] {
             let report = run_all(&Naive(habit), Some("readdir::cookies_resume"));
             assert_eq!(
                 report.outcome("readdir::cookies_resume_where_they_left_off"),

@@ -112,6 +112,7 @@ mod lock_gate;
 mod lock_handles;
 pub mod ops;
 mod passthrough;
+mod plus;
 mod shards;
 mod spec;
 mod synthetic;
@@ -148,6 +149,8 @@ mod owner_fence_tests;
 mod passthrough_tests;
 #[cfg(test)]
 mod pending_row_tests;
+#[cfg(test)]
+mod plus_perf;
 #[cfg(test)]
 mod qos_tests;
 #[cfg(test)]

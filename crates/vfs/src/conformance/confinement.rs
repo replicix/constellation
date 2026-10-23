@@ -20,7 +20,7 @@
 //! /vol/outside/secret   file "s3cret"
 //! ```
 
-use super::{must, refused, refused_any, Client, Env, Fx, TestResult, LINK_DOMAIN_XATTR};
+use super::{fail, must, refused, refused_any, Client, Env, Fx, TestResult, LINK_DOMAIN_XATTR};
 use crate::types::{Fh, FileKind, Ino, OpenFlags, SetAttr, SetXattrFlags};
 use crate::LockOwner;
 use constellation_types::Code;
@@ -214,6 +214,79 @@ pub(super) fn inodes_outside_the_subtree_are_refused(env: &Env<'_>) -> TestResul
     assert_eq!(must("secret", c.slurp(l.secret)), b"s3cret");
     assert_eq!(must("names inside", c.names(l.inside)), ["f", "sub"]);
     assert_eq!(must("names vol", c.names(l.vol)), ["inside", "outside"]);
+    Ok(())
+}
+
+pub(super) fn plus_of_a_subtree_view_stays_confined(env: &Env<'_>) -> TestResult {
+    let fx = env.fresh();
+    let l = layout(&fx);
+    let view = fx.subtree("vol/inside", false)?;
+    let v = view.client();
+    let r = v.root();
+    // The view's own listing, entries and all: what a lookup there
+    // answers, and nothing of what is above the root.
+    for (dir, what) in [(r, "the view's root"), (l.sub, "a directory below it")] {
+        let all = must("plus listing", v.readdir_page(dir, 0, 100, true));
+        let mut names: Vec<_> = all
+            .iter()
+            .map(|e| String::from_utf8_lossy(e.name.as_bytes()).into_owned())
+            .filter(|n| n != "." && n != "..")
+            .collect();
+        names.sort();
+        let want: &[&str] = if dir == r { &["f", "sub"] } else { &["g"] };
+        if names != want {
+            fail!("plus listing of {what}: {names:?}, expected {want:?}");
+        }
+        for e in &all {
+            let name = String::from_utf8_lossy(e.name.as_bytes()).into_owned();
+            if matches!(e.name.as_bytes(), b"." | b"..") {
+                if let Some(entry) = &e.entry {
+                    fail!("plus listing of {what}: {name:?} carries {entry:?}");
+                }
+                continue;
+            }
+            let Some(entry) = &e.entry else {
+                fail!("plus listing of {what}: {name:?} is name-only");
+            };
+            let looked_up = must("lookup", v.lookup(dir, &name));
+            if entry != &looked_up || entry.attr.ino != e.ino {
+                fail!(
+                    "plus listing of {what}: the entry of {name:?} is {entry:?}, a lookup in \
+                     the view answers {looked_up:?}"
+                );
+            }
+            // A reference the view can serve.
+            must("getattr of a listed inode", v.getattr(e.ino));
+        }
+    }
+    // Entries are no door: everything above the root stays refused, and so
+    // does a plus listing of it.
+    for (what, ino) in [
+        ("the parent directory", l.vol),
+        ("a sibling directory", l.outside),
+        ("a file in a sibling", l.secret),
+        ("a file above", l.top),
+    ] {
+        refused(
+            &format!("getattr on {what} after a plus listing"),
+            v.getattr(ino),
+            Code::Stale,
+        );
+        refused(
+            &format!("plus listing of {what}"),
+            v.readdir_page(ino, 0, 10, true),
+            Code::Stale,
+        );
+    }
+    // `..` of the view's root is the root.
+    let all = must("plus listing", v.readdir_page(r, 0, 100, true));
+    let dotdot = all.iter().find(|e| e.name.as_bytes() == b"..").expect("..");
+    if dotdot.ino != r {
+        fail!(
+            "`..` of the view's root is inode {}, not the root",
+            dotdot.ino
+        );
+    }
     Ok(())
 }
 

@@ -1866,7 +1866,7 @@ impl Vfs for View {
         ino: Ino,
         _fh: Fh,
         cookie: u64,
-        _plus: bool,
+        plus: bool,
         mut r: R,
     ) {
         let _w = self.watch.enter("readdir", ino);
@@ -1879,6 +1879,9 @@ impl Vfs for View {
                 Ok(entries) => entries,
                 Err(error) => return r.done(self.ino_err(ino, error)),
             };
+            // Plan 40 §4.5: each child's entry is what a lookup answers
+            // there, from the node already in hand.
+            let mut page = plus.then(|| self.plus_page(ino, false));
             let mut idx = cookie;
             loop {
                 let next = idx + 1;
@@ -1886,15 +1889,18 @@ impl Vfs for View {
                     0 => r.add(visible_ino, next, FileKind::Dir, b"."),
                     1 => r.add(visible_ino, next, FileKind::Dir, b".."),
                     _ => {
-                        let Some((child_ino, kind, name)) = entries.get((idx - 2) as usize) else {
+                        let Some((child_ino, node, name)) = entries.get((idx - 2) as usize) else {
                             break;
                         };
-                        r.add(
-                            *child_ino,
-                            next,
-                            kind_out(*kind),
-                            &constellation_vfs::name::wire_bytes(name),
-                        )
+                        let kind = kind_out(self.synthetic_attr(*child_ino, node).kind);
+                        let name = constellation_vfs::name::wire_bytes(name);
+                        match page.as_mut() {
+                            Some(page) => {
+                                let entry = page.synthetic_entry(*child_ino, node);
+                                r.add_entry(*child_ino, next, kind, &name, entry.as_ref())
+                            }
+                            None => r.add(*child_ino, next, kind, &name),
+                        }
                     }
                 };
                 if full {
@@ -1910,9 +1916,9 @@ impl Vfs for View {
         if cookie == 0 {
             self.strict_read(ino, true, None, &[ReadKey::Dir(ino)]);
         }
-        let entries = match if self.meta.is_scratch_dir(ino).unwrap_or(false)
-            || self.meta.scratch_getattr(ino).ok().flatten().is_some()
-        {
+        let scratch = self.meta.is_scratch_dir(ino).unwrap_or(false)
+            || self.meta.scratch_getattr(ino).ok().flatten().is_some();
+        let entries = match if scratch {
             self.meta.scratch_readdir(ino)
         } else {
             self.meta.readdir(ino)
@@ -1938,15 +1944,30 @@ impl Vfs for View {
             return r.done(Ok(()));
         }
         let from = children.partition_point(|(c, _)| *c <= cookie);
-        for (next, child) in &children[from..] {
-            if r.add(
-                child.ino,
-                *next,
-                kind_out(child.kind),
-                &constellation_vfs::name::wire_bytes(&child.name),
-            ) {
-                break;
+        // Plan 40 §4.5: a plus entry is what a lookup of the name answers,
+        // waited for as `getattr` of the child waits, one wait per batch.
+        let mut page = plus.then(|| self.plus_page(ino, scratch));
+        'page: for batch in children[from..].chunks(plus::BATCH) {
+            if let Some(page) = &page {
+                page.wait(batch.iter().map(|(_, child)| child.ino));
             }
+            for (next, child) in batch {
+                let name = constellation_vfs::name::wire_bytes(&child.name);
+                let kind = kind_out(child.kind);
+                let full = match page.as_mut() {
+                    Some(page) => {
+                        let entry = page.entry(child.ino, child.name.as_bytes());
+                        r.add_entry(child.ino, *next, kind, &name, entry.as_ref())
+                    }
+                    None => r.add(child.ino, *next, kind, &name),
+                };
+                if full {
+                    break 'page;
+                }
+            }
+        }
+        if let Some(page) = page {
+            page.finish();
         }
         r.done(Ok(()));
     }

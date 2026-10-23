@@ -130,6 +130,40 @@ impl Client {
         })
     }
 
+    /// One plus page of at most `limit` entries from `cookie`.
+    fn readdir_plus(
+        &self,
+        ino: Ino,
+        cookie: u64,
+        limit: usize,
+    ) -> VfsResult<Vec<constellation_vfs::DirEntry>> {
+        let (sink, wait) = CollectDir::pair(limit);
+        self.view.readdir(
+            &self.cx(OpKind::Readdirplus),
+            ino,
+            Fh(0),
+            cookie,
+            true,
+            sink,
+        );
+        wait.wait()
+    }
+
+    /// Every entry of a plus listing, in pages of `PAGE` entries, each
+    /// resumed from the last cookie of the one before.
+    fn readdir_plus_all(&self, ino: Ino) -> Vec<constellation_vfs::DirEntry> {
+        const PAGE: usize = 7;
+        let (mut all, mut cookie) = (Vec::new(), 0);
+        loop {
+            let page = self.readdir_plus(ino, cookie, PAGE).unwrap();
+            let Some(last) = page.last() else {
+                return all;
+            };
+            cookie = last.next;
+            all.extend(page);
+        }
+    }
+
     fn rename(&self, parent: Ino, name: &str, new_parent: Ino, new_name: &str) -> VfsResult<()> {
         Blocking::run(|r| {
             self.view.rename(
@@ -2164,20 +2198,26 @@ fn one_copy_call_is_capped_at_a_few_chunks() {
     assert!(contents(&c, dst) == data);
 }
 
-/// A listing with attributes, as plus entries answer it (plan 40): the
-/// names of a directory, then a lookup of each.
+/// A listing with attributes: the entries a plus listing of `dir` hands
+/// out (plan 40 §4.5), every name but `.` and `..` with one.
 fn list_with_attributes(c: &Client, dir: Ino) -> Vec<Entry> {
-    c.readdir(dir, 0, 10_000)
+    // One page: a page that fills makes the entry that did not fit for
+    // nothing (`DirSink` cannot be asked for room first).
+    c.readdir_plus(dir, 0, 10_000)
         .unwrap()
-        .iter()
-        .filter(|(name, _)| name != "." && name != "..")
-        .map(|(name, _)| c.lookup(dir, name).unwrap())
+        .into_iter()
+        .filter(|e| e.name.as_bytes() != b"." && e.name.as_bytes() != b"..")
+        .map(|e| {
+            let name = String::from_utf8_lossy(e.name.as_bytes()).into_owned();
+            e.entry
+                .unwrap_or_else(|| panic!("{name:?} is name-only in a plus listing"))
+        })
         .collect()
 }
 
-/// Plan 45, the first priority: a listing with attributes of a directory
-/// whose names are all their inodes' only name answers every entry from
-/// the dentry's copy and reads no `0x01` record for it.
+/// Plan 45, the first priority: a plus listing of a directory whose names
+/// are all their inodes' only name answers every entry from the dentry's
+/// copy and reads no `0x01` record for it.
 #[test]
 fn a_listing_of_single_name_entries_reads_no_inode() {
     let c = client();
@@ -2229,4 +2269,375 @@ fn a_listing_of_hard_linked_entries_reads_each_inode_once_per_entry() {
         assert_eq!((e.attr.nlink, e.attr.size), (11, want.size));
         assert_eq!(e.attr.nlink, want.nlink);
     }
+}
+
+// ---- Plan 40 P7: plus entries are what a lookup answers ------------------
+//
+// Each test that guards a step runs twice (`plus::testing::guarded`): on the
+// real page, where it passes, and on the naive implementation of the step it
+// guards (`plus::Naive`), where it has to fail.
+
+use super::plus::testing::{guarded, BetweenGuard};
+use super::plus::Naive;
+
+/// The plus listing of `dir`, name by name: its entry, or `None` for a
+/// name-only one. `.` and `..` are always name-only.
+fn plus_by_name(c: &Client, dir: Ino) -> std::collections::BTreeMap<String, Option<Entry>> {
+    c.readdir_plus_all(dir)
+        .into_iter()
+        .map(|e| {
+            let name = String::from_utf8_lossy(e.name.as_bytes()).into_owned();
+            if name == "." || name == ".." {
+                assert!(e.entry.is_none(), "{name:?} carries an entry");
+            }
+            (name, e.entry)
+        })
+        .collect()
+}
+
+/// Every name of `dir` (but `.` and `..`) has a plus entry equal to what
+/// a lookup of it answers now.
+fn plus_is_lookup(c: &Client, dir: Ino) -> Result<(), String> {
+    for (name, entry) in plus_by_name(c, dir) {
+        if name == "." || name == ".." {
+            continue;
+        }
+        let Some(entry) = entry else {
+            return Err(format!("{name:?} is name-only"));
+        };
+        let want = c.lookup(dir, &name).unwrap();
+        if entry != want {
+            return Err(format!("{name:?}: plus {entry:?}, lookup {want:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// A name's size is what `getattr` of its inode says, with a write session
+/// pending on it (the committed row says less).
+#[test]
+fn plus_attrs_equal_getattr_with_a_pending_write_session() {
+    guarded(Naive::NoOverlay, |_| {
+        let c = client();
+        let d = c.mkdir(ROOT_INO, "d").unwrap().attr.ino;
+        c.put(d, "committed", b"abc");
+        c.mkdir(d, "sub").unwrap();
+        let (open, o) = c.create(d, "open").unwrap();
+        c.write(open.attr.ino, o.fh, 0, &[9u8; 5000]).unwrap();
+        assert_eq!(c._meta.getattr(open.attr.ino).unwrap().unwrap().size, 0);
+        plus_is_lookup(&c, d)?;
+        let entry = plus_by_name(&c, d)["open"].clone().unwrap();
+        let want = c.getattr(open.attr.ino).unwrap();
+        if entry.attr != want || want.size != 5000 {
+            return Err(format!("plus {:?}, getattr {want:?}", entry.attr));
+        }
+        c.close(open.attr.ino, o.fh).unwrap();
+        Ok(())
+    });
+}
+
+/// A scratch directory's names are looked up in the scratch namespace, a
+/// file being written there at its pending size.
+#[test]
+fn plus_entries_of_a_scratch_directory_are_what_lookup_answers() {
+    guarded(Naive::NoScratch, |_| {
+        let c = client();
+        let scratch = c.mkdir(ROOT_INO, "tmp").unwrap().attr.ino;
+        c.setxattr(
+            scratch,
+            constellation_meta::SCRATCH_XATTR,
+            b"1",
+            SetXattrFlags::default(),
+        )
+        .unwrap();
+        c.mkdir(scratch, "sub").unwrap();
+        let (e, o) = c.create(scratch, "f").unwrap();
+        c.write(e.attr.ino, o.fh, 0, b"abcdef").unwrap();
+        plus_is_lookup(&c, scratch)?;
+        let size = plus_by_name(&c, scratch)["f"].clone().unwrap().attr.size;
+        if size != 6 {
+            return Err(format!("the pending size is 6, the entry says {size}"));
+        }
+        c.close(e.attr.ino, o.fh).unwrap();
+        Ok(())
+    });
+}
+
+/// A flush that commits and retires the session between the page's
+/// listing and its attribute read never makes the entry report the size
+/// from before it: the dentry is read under the child's shard, where the
+/// session is either still there or already committed.
+#[test]
+fn a_flush_between_listing_and_attr_read_never_reports_the_old_size() {
+    guarded(Naive::ReadBeforeShard, |_| {
+        let c = client();
+        let d = c.mkdir(ROOT_INO, "d").unwrap().attr.ino;
+        let (f, o) = c.create(d, "f").unwrap();
+        let f = f.attr.ino;
+        c.write(f, o.fh, 0, &[7u8; 100]).unwrap();
+        c.put(d, "other", b"x");
+        let listed = std::thread::scope(|s| {
+            let hook = BetweenGuard::acting(s, |name| {
+                if name == "f" {
+                    c.close(f, o.fh).unwrap();
+                }
+            });
+            let listed = plus_by_name(&c, d);
+            drop(hook);
+            listed
+        });
+        let size = listed["f"].clone().unwrap().attr.size;
+        if size != 100 {
+            return Err(format!("the file holds 100 bytes, the entry says {size}"));
+        }
+        if c.getattr(f).unwrap().size != 100 {
+            return Err("the flush did not commit".into());
+        }
+        Ok(())
+    });
+}
+
+/// `--cto strict` on a node that is not a lone sequencer: the kernel
+/// would cache nothing of an entry, so no entry is made. (From cookie 2,
+/// past the listing's strict read, which needs a sequencer to answer.)
+#[test]
+fn strict_cto_plus_entries_are_name_only() {
+    guarded(Naive::KeepZeroTtl, |_| {
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let d = meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap().ino;
+        for name in ["a", "b", "c"] {
+            meta.create(d, name, 0o644, 0, 0).unwrap();
+        }
+        let (mut fs, _tmp, _core) = super::durable_ack_tests::holder_fs(meta.clone(), false);
+        fs.sync.as_mut().unwrap().cto_strict = true;
+        // Another node showed itself: the TTL is zero from now on.
+        meta.read_delegations()
+            .leave_alone(constellation_authority::WaitMs(0), 0);
+        assert!(fs.ttl().is_zero());
+        let page = super::plus::testing::plus_page(&fs, d, 2, 100).unwrap();
+        let mut names: Vec<_> = page.iter().map(|e| e.name.as_bytes().to_vec()).collect();
+        names.sort();
+        assert_eq!(names, [b"a", b"b", b"c"].map(|n| n.to_vec()));
+        match page.iter().find_map(|e| e.entry.as_ref()) {
+            Some(entry) => Err(format!("an entry with a zero TTL: {entry:?}")),
+            None => Ok(()),
+        }
+    });
+}
+
+/// A lone strict sequencer's TTL is short but not zero, and its pages
+/// carry entries.
+#[test]
+fn a_lone_strict_sequencer_gets_entries() {
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let d = meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap().ino;
+    for name in ["a", "b", "c"] {
+        meta.create(d, name, 0o644, 0, 0).unwrap();
+    }
+    let (mut fs, _tmp, _core) = super::durable_ack_tests::holder_fs(meta, false);
+    fs.sync.as_mut().unwrap().cto_strict = true;
+    assert!(!fs.ttl().is_zero(), "a lone strict sequencer's TTL");
+    // From the start: the listing's strict read is the sequencer's own.
+    let page = super::plus::testing::plus_page(&fs, d, 0, 100).unwrap();
+    let entries: Vec<_> = page.iter().filter_map(|e| e.entry.as_ref()).collect();
+    assert_eq!(entries.len(), 3, "{page:?}");
+    assert!(entries.iter().all(|e| e.attr.ttl == *fs.ttl()));
+}
+
+/// A rename on another view between the batch and the attribute read: the
+/// name no longer leads to the listed inode (gone, or another's), and
+/// the entry is name-only. The page does not fail and does not say the
+/// other inode's attributes under the listed one's number.
+#[test]
+fn a_rename_on_another_view_between_batch_and_attr_read_makes_the_entry_name_only() {
+    guarded(Naive::AnyInode, |_| {
+        let a = client();
+        let d = a.mkdir(ROOT_INO, "d").unwrap().attr.ino;
+        for name in ["gone", "replaced", "stays", "mover"] {
+            a.put(d, name, name.as_bytes());
+        }
+        let (view_b, dir_b) = super::quota_tests::test_fs(a._meta.clone());
+        let b = Client {
+            view: view_b,
+            caller: Caller::new(1000, 1000, None),
+            _meta: a._meta.clone(),
+            _dir: dir_b,
+        };
+        let listed = std::thread::scope(|s| {
+            let hook = BetweenGuard::acting(s, |name| match name {
+                "gone" => b.rename(d, "gone", d, "elsewhere").unwrap(),
+                // "mover" takes over the name, so "replaced" now leads to
+                // another inode.
+                "replaced" => b.rename(d, "mover", d, "replaced").unwrap(),
+                _ => {}
+            });
+            let listed = a.readdir_plus_all(d);
+            drop(hook);
+            listed
+        });
+        for e in &listed {
+            let name = String::from_utf8_lossy(e.name.as_bytes()).into_owned();
+            match (name.as_str(), &e.entry) {
+                ("gone" | "replaced", Some(entry)) => {
+                    return Err(format!(
+                        "{name:?} (listed as inode {}) carries an entry: {entry:?}",
+                        e.ino
+                    ))
+                }
+                ("stays", None) => return Err("an untouched name is name-only".into()),
+                (_, Some(entry)) if entry.attr.ino != e.ino => {
+                    return Err(format!(
+                        "{name:?}: the entry is for inode {}",
+                        entry.attr.ino
+                    ))
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    });
+}
+
+/// Plan 45: a hard-linked name's dentry holds no attributes, so its plus
+/// entry is read from the inode, and says what a lookup does: the link
+/// count and the change time the inode holds, a size a session pending on
+/// it overlays.
+#[test]
+fn plus_entries_of_hard_links_are_what_lookup_answers() {
+    let c = client();
+    let d = c.mkdir(ROOT_INO, "d").unwrap().attr.ino;
+    let f = c.put(d, "f", b"data");
+    c.put(d, "single", b"x");
+    for name in ["h1", "h2"] {
+        Blocking::run(|r| c.view.link(&c.cx(OpKind::Link), f, d, Name::new(name), r)).unwrap();
+    }
+    // Changes through one name that only the inode records: the mode and
+    // its change time, and a pending write.
+    let ctime = c.getattr(f).unwrap().ctime_ns;
+    c.setattr(
+        f,
+        &SetAttr {
+            mode: Some(0o600),
+            ..SetAttr::default()
+        },
+    )
+    .unwrap();
+    let o = c.open(f, OpenFlags::READ | OpenFlags::WRITE).unwrap();
+    c.write(f, o.fh, 0, &[5u8; 3000]).unwrap();
+    plus_is_lookup(&c, d).unwrap();
+    let listed = plus_by_name(&c, d);
+    let want = c.getattr(f).unwrap();
+    assert!(want.ctime_ns > ctime, "the chmod changed the ctime");
+    assert_eq!(
+        (want.nlink, want.size, want.mode & 0o7777),
+        (3, 3000, 0o600)
+    );
+    for name in ["f", "h1", "h2"] {
+        let entry = listed[name].as_ref().unwrap_or_else(|| panic!("{name}"));
+        assert_eq!(entry.attr, want, "{name}");
+    }
+    assert_eq!(listed["single"].as_ref().unwrap().attr.nlink, 1);
+    c.close(f, o.fh).unwrap();
+}
+
+/// A page that fills makes one entry more than it adds (the sink cannot be
+/// asked for room first): a hard-linked name costs its read again on the
+/// next page, but the cost is at most one entry a page, and a single name
+/// costs no inode read at all.
+#[test]
+fn a_full_page_wastes_at_most_one_entry() {
+    let c = client();
+    let d = c.mkdir(ROOT_INO, "d").unwrap().attr.ino;
+    let f = c.put(d, "f", b"data");
+    for i in 0..30 {
+        Blocking::run(|r| {
+            c.view
+                .link(&c.cx(OpKind::Link), f, d, Name::new(&format!("h{i}")), r)
+        })
+        .unwrap();
+    }
+    for i in 0..30 {
+        c.put(d, &format!("single{i}"), b"x");
+    }
+    let before = c._meta.inode_reads();
+    let listed = c.readdir_plus_all(d);
+    let pages = listed.len().div_ceil(7) as u64 + 1;
+    let reads = c._meta.inode_reads() - before;
+    assert!(
+        (31..31 + pages).contains(&reads),
+        "31 hard-linked names over {pages} pages cost {reads} reads"
+    );
+}
+
+/// The dentry's copy is as current as the inode's row for every kind of
+/// change (plan 45's form rule; plan 40 §4.5 step 3 reads the copy where a
+/// lookup reads the row): after each of these, every plus entry of the
+/// directory is what a lookup answers.
+#[test]
+fn plus_entries_follow_every_kind_of_change() {
+    let c = client();
+    let d = c.mkdir(ROOT_INO, "d").unwrap().attr.ino;
+    let f = c.put(d, "f", b"0123456789");
+    let sub = c.mkdir(d, "sub").unwrap().attr.ino;
+    c.put(d, "other", b"o");
+    let step = |what: &str| {
+        if let Err(e) = plus_is_lookup(&c, d) {
+            panic!("after {what}: {e}");
+        }
+    };
+    step("the setup");
+    let set = |s: SetAttr| c.setattr(f, &s).unwrap();
+    set(SetAttr {
+        mode: Some(0o640),
+        ..SetAttr::default()
+    });
+    step("chmod");
+    set(SetAttr {
+        uid: Some(7),
+        gid: Some(8),
+        ..SetAttr::default()
+    });
+    step("chown");
+    set(SetAttr {
+        atime: Some(TimeSet::At(1_000_000_000)),
+        mtime: Some(TimeSet::At(2_000_000_000)),
+        ..SetAttr::default()
+    });
+    step("utimens");
+    set(SetAttr {
+        size: Some(3),
+        ..SetAttr::default()
+    });
+    step("truncate");
+    c.setxattr(f, "user.k", b"v", SetXattrFlags::default())
+        .unwrap();
+    step("setxattr");
+    let o = c.open(f, OpenFlags::READ | OpenFlags::WRITE).unwrap();
+    c.write(f, o.fh, 0, b"abcdefgh").unwrap();
+    step("a write with a session pending");
+    c.close(f, o.fh).unwrap();
+    step("its close");
+    // Inside the child directory: its times and link count change.
+    c.put(sub, "inner", b"i");
+    step("a create in a child directory");
+    c.mkdir(sub, "innerdir").unwrap();
+    step("a mkdir in a child directory");
+    c.unlink(sub, "inner").unwrap();
+    step("an unlink in a child directory");
+    // Names: the form transitions of plan 45 and renames.
+    Blocking::run(|r| c.view.link(&c.cx(OpKind::Link), f, d, Name::new("f2"), r)).unwrap();
+    step("a link");
+    set(SetAttr {
+        mode: Some(0o600),
+        ..SetAttr::default()
+    });
+    step("a chmod of a linked file");
+    c.unlink(d, "f2").unwrap();
+    step("an unlink back to one name");
+    c.rename(d, "f", d, "renamed").unwrap();
+    step("a rename");
+    c.rename(d, "sub", d, "sub2").unwrap();
+    step("a rename of a directory");
+    c.rename(d, "other", d, "renamed").unwrap();
+    step("a rename over a name");
 }
