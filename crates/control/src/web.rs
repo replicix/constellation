@@ -1403,6 +1403,9 @@ fn kernel_cache_metrics(output: &mut String, fuse: &FuseStatus) {
             ("write_repair", w.write_repair_on),
             ("dir_attr_ttl_zero", w.dir_attr_ttl_zero),
             ("dir_change_notify", w.dir_change_notify_on),
+            // With kernel patch 0003 only the moved inodes' notices
+            // (plan 42 F16): `dir_change_notify` 1 and this 0.
+            ("dir_change_notify_dirs", w.dir_change_notify_dirs_on),
         ] {
             let _ = writeln!(
                 output,
@@ -1760,6 +1763,37 @@ mod tests {
         render_snapsched(&mut alone, &stats, None);
         assert!(alone.contains("constellation_snapsched_created_total 9"));
         assert!(!alone.contains("root_snapshots"), "{alone}");
+    }
+
+    /// Plan 42 F16: on a kernel with patch 0003, W3b writes the moved
+    /// inodes' notices but not the directories'; the gauge tells the two
+    /// apart as `node.status` does (`dir_change_notify_on`,
+    /// `dir_change_notify_dirs_on`).
+    #[test]
+    fn the_workaround_gauge_tells_the_directory_notices_apart() {
+        use crate::proto::types::{FuseKernelWorkarounds, FuseMountStatus};
+        let fuse = FuseStatus {
+            mounts: vec![FuseMountStatus {
+                id: 1,
+                mountpoint: "/mnt/a".into(),
+                kernel_workarounds: FuseKernelWorkarounds {
+                    keep_cache: "auto".into(),
+                    dir_change_notify_on: true,
+                    dir_change_notify_dirs_on: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut out = String::new();
+        render_fuse(&mut out, &fuse);
+        for line in [
+            "constellation_fuse_kernel_workaround{mountpoint=\"/mnt/a\",workaround=\"dir_change_notify\"} 1",
+            "constellation_fuse_kernel_workaround{mountpoint=\"/mnt/a\",workaround=\"dir_change_notify_dirs\"} 0",
+        ] {
+            assert!(out.lines().any(|l| l == line), "{line}\n{out}");
+        }
     }
 
     #[test]

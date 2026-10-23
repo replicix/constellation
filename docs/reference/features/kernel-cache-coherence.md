@@ -198,8 +198,13 @@ with the race-1 fix and `CONSTELLATION_FUSE_WRITE_REPAIR=on`.
 ### Which workarounds apply here?
 
 `fuse.mounts[].kernel_workarounds`: each setting, whether it is in effect
-(`write_repair_on`, `dir_attr_ttl_zero`, `dir_change_notify_on`, and `dir_change_notify_dirs_on`: false with patch 0003 while the moved inodes' notices stay on), and per
-fix the verdict and its source (`probe`, `table`, `override`).
+(`write_repair_on`, `dir_attr_ttl_zero`, `dir_change_notify_on`, and
+`dir_change_notify_dirs_on`: false with patch 0003 while the moved inodes'
+notices stay on), and per fix the verdict and its source (`probe`,
+`table`, `override`). `/metrics` has the same as the gauge
+`constellation_fuse_kernel_workaround{mountpoint,workaround}` (1 in
+effect, 0 not; `workaround` is `keep_cache`, `write_repair`,
+`dir_attr_ttl_zero`, `dir_change_notify` or `dir_change_notify_dirs`).
 
 ## FAQ
 
