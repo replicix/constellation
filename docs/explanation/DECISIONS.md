@@ -1674,3 +1674,68 @@ plan 28 [§P6](../plans/v1/done/28-s3-native-metadata-store.md#p6--key-encoding-
 `crates/mtree/src/record.rs` (`DentryRecord::for_inode`),
 `crates/meta/src/store/ns.rs` (`put_inode_record`),
 `crates/engine/src/mtree_read.rs` (`check_dentry_forms`). Amends plan 28 §P6.
+
+## ADR-37: Name-ordered listings with keyed cookies, and `READDIRPLUS` entries that are lookups
+
+**Context**: DESIGN §12 designed `READDIRPLUS` (attributes with each entry,
+from the dentry copies plan 28 §P6 keeps for it) and stable readdir cursors
+from phase 1, and nothing served either. A directory page re-read, hashed
+and sorted the whole directory, quadratic over a full listing, and plus
+pages (about four times fewer names per page) would have made that worse.
+Every plus entry that carries a node id is a kernel lookup reference, so
+getting the accounting wrong either reaps an inode the kernel still holds
+or leaks an orphan (ADR-31).
+
+**Decision**:
+- *Listings*: a page is a name-ordered range scan of the directory's
+  dentries, resumed after a name. An entry's cookie is a keyed hash of its
+  name (SipHash-1-3, 62 bits by default, 31 on opt-in for 32-bit
+  userspace) under a key derived, never rotated, from the master key under
+  E2E and otherwise from `gossip_secret` (label `readdir/cookie-v1`); a
+  filesystem with neither is refused at mount. A small per-node cache of
+  recently served pages, keyed by directory and cookie (never by file
+  handle), turns a cookie back into its name; a cookie no page holds costs
+  one scan of the names. While a directory is open its pages are pinned
+  (128 MiB per directory, 512 MiB per node by default, each open stream's
+  last page always), and the pins cross a handover. Listings become name
+  ordered: an entry created ahead of a running listing appears, one behind
+  it does not, and a renamed name may appear twice. The remaining inexact
+  case (a cookie whose name was removed and whose page is gone) answers
+  `ENOENT`.
+- *Plus entries*: `READDIRPLUS` is negotiated as `auto` by default
+  (`CONSTELLATION_FUSE_READDIRPLUS`: `auto`, `always`, `off`). An entry is
+  what `lookup(dir, name)` answers at that moment, waited for as
+  `getattr` of the child waits, and counted as a lookup reference only
+  once the page's reply succeeds. An entry the view cannot vouch for is
+  name-only: under `--cto strict` on a node that is not a lone sequencer
+  (zero TTL), a name changed between the page and its attribute read, `.`
+  and `..`, and a pid-0 lister whose attribute-reply marks are full (plan
+  42 F21). A hard-linked name's attributes cost one inode read (ADR-36).
+
+**Consequences**: a full listing is O(n) and a page O(page) for plain and
+plus pages alike (50 000 names: about 10 ms against about 900 ms for the
+per-page re-read, on four file systems); `ls -l` of a kernel-cold
+directory takes about one request per page instead of one per name;
+`rm -rf`, `find -delete`, `telldir`/`seekdir` and a `daemon --upgrade`
+mid-listing resume exactly while the directory is open. A cookie changes
+nothing on the write path. The first upgrade across the change is a
+remount (no compatibility shim). The counters (`readdir` block in node
+status: `lost_cookies`, `cold_scans`, `pin_overflows`, and the plus
+counters per mount) report the inexact and costly cases.
+
+**Rejected**: cursors by position in a per-stream snapshot (memory per open
+stream, lost at a handover or a restart); a per-handle hint cache (an
+`nfsd` re-export or a second handle cannot resume); an NFS-style bad-cookie
+error (a FUSE server cannot send one; `ENOENT` is POSIX's "position
+invalid"); plus entries straight from the scan without the `getattr` wait
+(they could install attributes older than what the node's clients have
+seen); a notice per entry when the attribute-mark table is full (the
+name-only entry costs the kernel one lookup instead).
+
+**Status**: decided by the maintainer 2026-10-22 (plan 40 §9, the
+questions marked resolved and the coder spec's decisions); built (P1–P8;
+the default `auto` stands unless the R8 measurements fail it).
+
+**See**: [plan 40](../plans/v1/wip/40-readdirplus.md) §4.5, §4.9 and §9;
+`crates/engine/src/view/{listing,cookie,plus}.rs`,
+`crates/frontend-fuse/src/adapter.rs` (`ReaddirPlus`); PROGRESS, "Plan 40".

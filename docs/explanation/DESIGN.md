@@ -1778,12 +1778,12 @@ an indexed, transactional replica answers directly.
 Not every item below is built yet. Built: push invalidation, the
 recursive aggregates (`user.constellation.rsize`), `SEEK_HOLE`/`SEEK_DATA`,
 metadata-only `fallocate`/`truncate`, `copy_file_range` as a copy by the
-daemon (not yet the metadata-only one below), and time travel as
-snapshots (§13). Designed but not built: `constellation find`,
-`constellation changes`, the `unlink_subtree` and `copy_manifest` records
-(and so a metadata-only `copy_file_range`), stable readdir cursors (`readdir` resumes by position today), negative
+daemon (not yet the metadata-only one below), stable readdir cursors,
+`READDIRPLUS`, and time travel as snapshots (§13). Designed but not built:
+`constellation find`, `constellation changes`, the `unlink_subtree` and
+`copy_manifest` records (and so a metadata-only `copy_file_range`), negative
 dentry caching (a lookup miss is answered `ENOENT`, which the kernel does
-not cache), `READDIRPLUS`, the writeback cache with `FOPEN_KEEP_CACHE`,
+not cache), the writeback cache with `FOPEN_KEEP_CACHE`,
 and FUSE passthrough.
 
 ### Enabled by the local replica
@@ -1804,18 +1804,44 @@ and FUSE passthrough.
   as one transaction emitting one compact log record (`unlink_subtree`)
   — `rm -rf` on a million files in milliseconds, syncing to other nodes as
   a single record.
-- **Stable readdir cursors**: key-ordered cursors give exact resumption
-  offsets for arbitrarily large directories, avoiding FUSE's classic
-  skipped/duplicated readdir entries.
+- **Stable readdir cursors**: a directory is listed in name order from
+  the replica's `(parent, name)` keys, O(page) for `READDIR` and
+  `READDIRPLUS` alike, and an entry's cookie (`d_off`) is a keyed hash of
+  its name (SipHash-1-3 under a key derived from the filesystem's
+  `gossip_secret`, or from the master key under E2E; 62 bits, or 31 for
+  32-bit userspace), the same in every stream, view and node. A resume
+  finds the name its cookie stands for in the recently served pages (a
+  small per-node cache) and continues after it, whatever was created or
+  removed meanwhile; a cookie no remembered page holds costs one scan of
+  the directory's names. While a directory is open its pages are pinned
+  (bounded per directory and per node), so a listing that deletes what it
+  has read (`rm -rf`, `find -delete`), a `seekdir` back to a deleted entry
+  and a `daemon --upgrade` mid-listing resume exactly. The inexact case
+  that remains, a cookie whose name was removed and whose page is no
+  longer remembered (a `seekdir` into a region the pin bounds gave up, a
+  lister that does not keep the directory open, such as an `nfsd`
+  re-export, after its pages were evicted), answers `ENOENT`; where two
+  names share a cookie, entries between them may be listed twice, never
+  skipped
+  ([ADR-37](DECISIONS.md#adr-37-name-ordered-listings-with-keyed-cookies-and-readdirplus-entries-that-are-lookups)).
 - **Time travel**: a commit of the tree as of log position T = a read-only
   view of the tree as it was; content addressing keeps old chunks alive
   until GC. Named, GC-protected freezes of this are **snapshots** (§13).
 
 ### Enabled by the FUSE API
 
-- **`READDIRPLUS`**: attributes returned with each dentry from a single
-  replica scan — kills the stat-storm that slows `ls -la`, `find`, and
-  rsync on every network FS.
+- **`READDIRPLUS`**: the kernel is asked for it (`auto`: in a directory
+  it is stat'ing and for the first chunk of any listing), and each entry is
+  what a `LOOKUP` of its name answers at that moment, waited for as a
+  `getattr` of it waits, and a kernel lookup reference like a `LOOKUP`'s
+  (§3). A single-name entry's attributes come from its dentry's copy, a
+  hard-linked one's from one inode read (§4). Where the view cannot vouch
+  for an entry (`--cto strict` on a node that is not a lone sequencer, a
+  name changed between the page's names and its attribute read, a full
+  table of attribute marks) the entry is name-only and the kernel looks it
+  up when it needs it. `ls -l` of a kernel-cold directory takes about one
+  request per page instead of one per name, which kills the stat-storm
+  that slows `ls -la`, `find`, and rsync on every network FS (ADR-37).
 - **Kernel TTLs + push invalidation**: every change from another node is
   pushed to the kernel with `notify_inval_entry`/`notify_inval_inode`
   (§6, invariant 1), so the entry/attribute TTL (1 s under `--cto
