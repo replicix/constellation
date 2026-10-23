@@ -159,13 +159,20 @@ pub fn lock_cache_idle_ms(default: u64) -> u64 {
 /// the lag measured on a loaded host (p99 2–4 ms), and short enough that
 /// a request behind a lock whose description stays open (a `dup`'s
 /// close) is not held up for long.
+///
+/// The engine's own unit tests run with a window of one second: their
+/// `RELEASE` and their publication come from a thread of the test, which a
+/// host running other work may not schedule within 100 ms, and then the
+/// request is refused as it should be, by what the test did not mean to
+/// race. A test that needs the window to pass waits for it; one that needs
+/// it not to waits for a condition, never for a time.
 pub fn close_wait() -> Duration {
     static WAIT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *WAIT.get_or_init(|| {
         let ms = std::env::var("CONSTELLATION_LOCK_CLOSE_WAIT_MS")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(100);
+            .unwrap_or(if cfg!(test) { 1_000 } else { 100 });
         Duration::from_millis(ms)
     })
 }

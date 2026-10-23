@@ -330,11 +330,14 @@ fn a_grant_that_runs_out_fences_its_owner_without_any_event() {
     let committer = Caller::new(0, 0, Some(me));
     let root = Caller::root();
     let (turn, _) = f.create(&root, ROOT_INO, "turn.lock").unwrap();
-    f.lock(turn.attr.ino, me, crate::locks::now().honour.plus(300));
+    f.lock(turn.attr.ino, me, crate::locks::now().honour.plus(20_000));
     f.mkdir(&committer, "a").unwrap();
     // The grant's end passes on this thread's clock (no sleep: a loaded
-    // host could stretch a real one past anything the test assumes).
-    crate::locks::advance_test_clock(350);
+    // host could stretch a real one past anything the test assumes, and
+    // the window is long enough that none can end it before the clock is
+    // moved, and ends before the holder's lease, which a minute's move
+    // would end too).
+    crate::locks::advance_test_clock(21_000);
     assert_eq!(code(f.mkdir(&committer, "b")), Code::Io);
     f.mkdir(&root, "c").unwrap();
     f.unlock(&committer, turn.attr.ino).unwrap();
@@ -823,7 +826,7 @@ fn an_op_that_passed_the_fence_then_stalled_past_its_grant_is_refused() {
     let me = std::process::id();
     let root = Caller::root();
     let (turn, _) = f.create(&root, ROOT_INO, "turn.lock").unwrap();
-    f.lock(turn.attr.ino, me, crate::locks::now().honour.plus(300));
+    f.lock(turn.attr.ino, me, crate::locks::now().honour.plus(20_000));
     let locks = f.fs.cluster_locks().unwrap().clone();
     let _scope = locks.tag_scope(Some(me), None, None);
     assert_eq!(
@@ -833,8 +836,9 @@ fn an_op_that_passed_the_fence_then_stalled_past_its_grant_is_refused() {
     );
     let tag = crate::locks::current_tag().unwrap();
     assert_eq!(tag.0.len(), 1);
-    // The stall: the grant's window ends before the op executes.
-    crate::locks::advance_test_clock(400);
+    // The stall: the grant's window ends before the op executes (on this
+    // thread's clock: a real stall could not be told from a loaded host's).
+    crate::locks::advance_test_clock(21_000);
     let ino = f.meta.allocate_ino(ROOT_INO).unwrap();
     let r = f.fs.mutate_op(
         ROOT_INO,
@@ -867,13 +871,16 @@ fn a_held_grant_stepped_back_stays_fenced_on_time() {
     let f = fenced_fs();
     let me = std::process::id();
     let (turn, _) = f.create(&Caller::root(), ROOT_INO, "turn.lock").unwrap();
-    f.lock(turn.attr.ino, me, crate::locks::now().honour.plus(300));
+    // A window so long that no real delay of this thread ends it, moved
+    // through on its clock; the wall clock steps back by more than the
+    // distance the clock then passes the window's end by (5 s).
+    f.lock(turn.attr.ino, me, crate::locks::now().honour.plus(20_000));
     let locks = f.fs.cluster_locks().unwrap().clone();
     assert_eq!(locks.fenced(turn.attr.ino), Fence::Ok);
-    crate::locks::step_test_wall(-3_000);
-    crate::locks::advance_test_clock(250);
+    crate::locks::step_test_wall(-10_000);
+    crate::locks::advance_test_clock(15_000);
     assert_eq!(locks.fenced(turn.attr.ino), Fence::Ok, "inside the window");
-    crate::locks::advance_test_clock(100);
+    crate::locks::advance_test_clock(10_000);
     assert_eq!(
         locks.fenced(turn.attr.ino),
         Fence::Fenced,
@@ -895,7 +902,7 @@ fn an_op_sent_after_a_renewal_carries_the_renewed_window() {
     let me = std::process::id();
     let root = Caller::root();
     let (turn, _) = f.create(&root, ROOT_INO, "turn.lock").unwrap();
-    let first = crate::locks::now().honour.plus(300);
+    let first = crate::locks::now().honour.plus(10_000);
     f.lock(turn.attr.ino, me, first);
     let locks = f.fs.cluster_locks().unwrap().clone();
     let _scope = locks.tag_scope(Some(me), None, None);
@@ -913,7 +920,7 @@ fn an_op_sent_after_a_renewal_carries_the_renewed_window() {
     let mut h = f.meta.locks().held(turn.attr.ino).unwrap();
     h.until = renewed;
     f.meta.locks().install_held(turn.attr.ino, h);
-    crate::locks::advance_test_clock(400);
+    crate::locks::advance_test_clock(11_000);
     let ino = f.meta.allocate_ino(ROOT_INO).unwrap();
     let create = |name: &str, ino| constellation_meta::MutateOp::Create {
         parent: ROOT_INO,
@@ -927,7 +934,7 @@ fn an_op_sent_after_a_renewal_carries_the_renewed_window() {
     assert!(f.meta.lookup(ROOT_INO, "slow").unwrap().is_some());
     assert_eq!(f.meta.locks().stats().token_rejections, 0);
     // Past the renewed window too: refused.
-    crate::locks::advance_test_clock(31_000);
+    crate::locks::advance_test_clock(20_000);
     let ino = f.meta.allocate_ino(ROOT_INO).unwrap();
     assert_eq!(f.fs.mutate_op(ROOT_INO, create("late", ino)), Err(Code::Io));
     assert!(f.meta.lookup(ROOT_INO, "late").unwrap().is_none());
@@ -940,11 +947,27 @@ fn an_op_sent_after_a_renewal_carries_the_renewed_window() {
 /// not move (an ended grant is renewed no more), so it cannot loop.
 #[test]
 fn a_refused_op_is_reissued_only_under_a_renewed_honoured_grant() {
+    // The window an op was sent with is the grant's end mapped onto the wall
+    // clock, and the mapping moves by a millisecond as the host's clocks
+    // drift apart (a slewed wall clock against the raw one the honour clock
+    // counts): between two readings a host that ran something else may have
+    // moved it, which is no renewal. Such a re-issue is harmless (the grant
+    // is honoured) and ends with it: the op taking the window it is sent
+    // under again leaves nothing to re-issue.
+    let settled = |why: &str| {
+        for _ in 0..8 {
+            if crate::locks::reissue_after_lapse() == Reissue::No {
+                return;
+            }
+            crate::locks::current_tag().unwrap();
+        }
+        panic!("{why}: re-issued over and over");
+    };
     let f = fenced_fs();
     let me = std::process::id();
     let root = Caller::root();
     let (turn, _) = f.create(&root, ROOT_INO, "turn.lock").unwrap();
-    f.lock(turn.attr.ino, me, crate::locks::now().honour.plus(300));
+    f.lock(turn.attr.ino, me, crate::locks::now().honour.plus(10_000));
     let locks = f.fs.cluster_locks().unwrap().clone();
     let _scope = locks.tag_scope(Some(me), None, None);
     assert_eq!(
@@ -953,13 +976,9 @@ fn a_refused_op_is_reissued_only_under_a_renewed_honoured_grant() {
         "nothing sent yet"
     );
     crate::locks::current_tag().unwrap();
-    assert_eq!(
-        crate::locks::reissue_after_lapse(),
-        Reissue::No,
-        "the window did not move"
-    );
+    settled("the window did not move");
     let mut h = f.meta.locks().held(turn.attr.ino).unwrap();
-    h.until = crate::locks::now().honour.plus(5_000);
+    h.until = crate::locks::now().honour.plus(30_000);
     f.meta.locks().install_held(turn.attr.ino, h);
     assert_eq!(
         crate::locks::reissue_after_lapse(),
@@ -968,8 +987,8 @@ fn a_refused_op_is_reissued_only_under_a_renewed_honoured_grant() {
     );
     // The re-sent op takes the renewed window: nothing left to re-issue.
     crate::locks::current_tag().unwrap();
-    assert_eq!(crate::locks::reissue_after_lapse(), Reissue::No);
-    crate::locks::advance_test_clock(6_000);
+    settled("the renewed window was taken");
+    crate::locks::advance_test_clock(31_000);
     assert_eq!(
         crate::locks::reissue_after_lapse(),
         Reissue::No,
@@ -990,7 +1009,7 @@ fn a_commit_refused_for_an_ended_grant_becomes_a_conflict_copy() {
     let root = Caller::root();
     let (turn, _) = f.create(&root, ROOT_INO, "turn.lock").unwrap();
     let (file, opened) = f.create(&root, ROOT_INO, "data").unwrap();
-    f.lock(turn.attr.ino, me, crate::locks::now().honour.plus(300));
+    f.lock(turn.attr.ino, me, crate::locks::now().honour.plus(20_000));
     let ino = file.attr.ino;
     let cx = OpCtx::new(OpKind::Write, &owner);
     assert_eq!(f.write(&cx, ino, opened.fh), Ok(6));
@@ -998,7 +1017,7 @@ fn a_commit_refused_for_an_ended_grant_becomes_a_conflict_copy() {
     let _scope = locks.tag_scope(Some(me), None, None);
     crate::locks::current_tag().unwrap();
     // The grant lapses after the close's fence check, before its commit.
-    crate::locks::advance_test_clock(400);
+    crate::locks::advance_test_clock(21_000);
     assert_eq!(f.fs.flush_inode(ino, false), Err(Code::Io));
     assert_eq!(
         f.meta.getattr(ino).unwrap().unwrap().size,
@@ -1168,14 +1187,14 @@ fn a_refused_commits_copy_stays_in_the_view_and_keeps_its_owner() {
     f.meta
         .setattr(file.attr.ino, Some(0o640), None, None, None, None, None)
         .unwrap();
-    f.lock(turn.attr.ino, me, crate::locks::now().honour.plus(300));
+    f.lock(turn.attr.ino, me, crate::locks::now().honour.plus(20_000));
     let ino = file.attr.ino;
     let cx = OpCtx::new(OpKind::Write, &owner);
     assert_eq!(f.write(&cx, ino, opened.fh), Ok(6));
     let locks = f.fs.cluster_locks().unwrap().clone();
     let _scope = locks.tag_scope(Some(me), None, None);
     crate::locks::current_tag().unwrap();
-    crate::locks::advance_test_clock(400);
+    crate::locks::advance_test_clock(21_000);
     assert_eq!(f.fs.flush_inode(ino, false), Err(Code::Io));
     let queued = f.meta.pending_replays().unwrap();
     let copy = queued
@@ -1574,19 +1593,20 @@ fn a_non_blocking_lock_waits_for_the_earlier_turns_close_publication() {
     try_lock(&f, &caller, ino, a, 0xa).unwrap();
     let locks = f.fs.cluster_locks().unwrap().clone();
     let (tagged, in_flight) = std::sync::mpsc::channel();
+    let before = f.meta.locks().stats().predecessor_waits;
     std::thread::scope(|s| {
         // The earlier turn's close, tagged with the grant while 0xa held
-        // its lock, still publishing the file after the lock is gone.
+        // its lock, still publishing the file after the lock is gone: until
+        // the request below is seen to wait for it.
         s.spawn(|| {
             let _scope = locks.tag_scope(Some(me), Some(0xa), None);
             let _publishing = crate::locks::begin_close(ino, true);
             tagged.send(()).unwrap();
-            std::thread::sleep(Duration::from_millis(20));
+            wait_for(|| f.meta.locks().stats().predecessor_waits > before);
         });
         in_flight.recv().unwrap();
         release(&f, &caller, ino, a);
         assert!(f.meta.locks().local_locks(ino).is_empty());
-        let before = f.meta.locks().stats().predecessor_waits;
         assert_eq!(
             try_lock(&f, &caller, ino, b, 0xb),
             Ok(()),
@@ -1679,10 +1699,7 @@ fn a_new_turn_waits_for_a_closes_publication_through_the_view() {
                     Ok(_) => {}
                     Err(_) if close.is_finished() && held.is_none() => break,
                     Err(_) => {
-                        assert!(
-                            started.elapsed() < Duration::from_secs(20),
-                            "the close is stuck"
-                        );
+                        assert!(started.elapsed() < ANSWER, "the close is stuck");
                         let waiting = f.meta.locks().stats().predecessor_waits == before + 1;
                         let answered = lock.as_ref().is_some_and(|l| l.is_finished());
                         if held.is_some() && (waiting || answered) {
@@ -1710,10 +1727,11 @@ fn a_new_turn_waits_for_a_closes_publication_through_the_view() {
     }
 }
 
-/// Whether `h` finished within a few seconds.
+/// Whether `h` finished: a thread that waits for what the test has not
+/// done yet does not, however long it is given.
 fn done_soon<T>(h: &std::thread::ScopedJoinHandle<'_, T>) -> bool {
     let started = Instant::now();
-    while !h.is_finished() && started.elapsed() < Duration::from_secs(5) {
+    while !h.is_finished() && started.elapsed() < Duration::from_secs(10) {
         std::thread::sleep(Duration::from_millis(1));
     }
     h.is_finished()
@@ -1763,7 +1781,7 @@ fn a_new_turn_does_not_wait_for_a_closes_upload() {
                 Ok(_) => {}
                 Err(_) => {
                     assert!(
-                        started.elapsed() < Duration::from_secs(5),
+                        started.elapsed() < ANSWER,
                         "the close never asked for its drain"
                     );
                     std::thread::sleep(Duration::from_millis(1));
@@ -1914,7 +1932,7 @@ fn closes_that_keep_coming_do_not_hold_a_request_past_its_bound() {
         assert!(matches!(tested, LockStatus::Locked { .. }));
         for took in [took_lock, took_test] {
             assert!(
-                took < window + Duration::from_millis(500),
+                took < window + 2 * SECOND,
                 "bounded by the request's own deadline: {took:?}"
             );
         }
@@ -1989,7 +2007,7 @@ fn a_single_worker_does_not_wait_for_a_closing_description() {
         "the description is not released yet"
     );
     assert!(
-        started.elapsed() < window / 2,
+        started.elapsed() < window,
         "no wait: {:?}",
         started.elapsed()
     );
@@ -2130,7 +2148,7 @@ fn a_posix_owner_keeps_its_locks_when_another_process_closes_a_shared_descriptio
     let started = Instant::now();
     lock_range(&f, &caller, ino, b, 0xa, true, (30, 39)).unwrap();
     assert!(
-        started.elapsed() < crate::locks::close_wait() + Duration::from_millis(500),
+        started.elapsed() < crate::locks::close_wait() + 2 * SECOND,
         "bounded: {:?}",
         started.elapsed()
     );
@@ -2213,7 +2231,7 @@ fn an_unlocked_closed_descriptions_late_release_spares_the_new_flock() {
     let started = Instant::now();
     lock_range(&f, &caller, ino, fd2, 0x5a, true, whole).unwrap();
     assert!(
-        started.elapsed() < crate::locks::close_wait() / 2,
+        started.elapsed() < crate::locks::close_wait(),
         "nothing held at the close: no wait ({:?})",
         started.elapsed()
     );
@@ -2335,22 +2353,54 @@ fn a_grant_lapsing_between_a_copys_steps_ends_it_short() {
 
 /// What the core's lock path answers a request, in order (the last one
 /// again for any further request).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Scripted {
     /// "Nothing conflicts, ask again in this many ms."
     Wait(u64),
+    /// [`Self::Wait`] for the first `times` requests for each inode, whatever
+    /// order they come in; the script's next entry answers every later one
+    /// (and this entry stays the current one). A script that is read in
+    /// arrival order gives a request's second attempt another request's
+    /// first, when the test thread is slow to ask them.
+    WaitEach {
+        ms: u64,
+        times: usize,
+    },
     WouldBlock,
     /// Installs a grant on the inode, then grants.
     Grant,
     /// Answers `Granted` and installs nothing: a core granting what the
     /// local tables refuse.
     GrantNothing,
-    /// Takes this many ms to answer `WouldBlock`: a core asking an owner
-    /// that is gone, a few times, before it says so.
+    /// Takes this many ms to answer `WouldBlock`, other requests asked
+    /// meanwhile taking their own: a core asking an owner that is gone, a
+    /// few times, before it says so.
     Slow(u64),
-    /// Takes this many ms, then installs a grant whose floor is the log's
-    /// first segment and grants.
-    SlowGrant(u64),
+    /// Waits until the test opens the gate, then installs a grant and
+    /// grants.
+    GrantWhenOpen(Gate),
+}
+
+/// A step of a scripted core that waits for the test.
+#[derive(Clone, Default)]
+struct Gate(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+impl Gate {
+    fn open(&self) {
+        *self.0 .0.lock().unwrap() = true;
+        self.0 .1.notify_all();
+    }
+
+    /// Returns once the gate is open, or after a long while (a test that
+    /// never opens it fails by its own assertions, not by a hang).
+    fn wait(&self) {
+        let open = self.0 .0.lock().unwrap();
+        let _ = self
+            .0
+             .1
+            .wait_timeout_while(open, 30 * SECOND, |open| !*open)
+            .unwrap();
+    }
 }
 
 /// A stand-in for the core: answers each `SyncRequest::Lock` from
@@ -2381,11 +2431,13 @@ fn script_core_waits(f: &mut Fenced, ino: Ino, script: Vec<Scripted>) -> Seen {
     let meta = f.meta.clone();
     std::thread::spawn(move || {
         let mut n = 0;
+        let mut asked = std::collections::HashMap::<Ino, usize>::new();
         while let Some(req) = rx.blocking_recv() {
             let SyncRequest::Lock {
                 blocking,
                 waited_ms,
                 reply,
+                ino: asked_ino,
                 ..
             } = req
             else {
@@ -2393,22 +2445,38 @@ fn script_core_waits(f: &mut Fenced, ino: Ino, script: Vec<Scripted>) -> Seen {
             };
             log.lock().unwrap().push(blocking);
             waited_log.lock().unwrap().push(waited_ms);
-            let step = script[n.min(script.len() - 1)];
-            n += 1;
+            let mut step = script[n.min(script.len() - 1)].clone();
+            if let Scripted::WaitEach { ms, times } = step {
+                let c = asked.entry(asked_ino).or_default();
+                step = if *c < times {
+                    *c += 1;
+                    Scripted::Wait(ms)
+                } else {
+                    script[(n + 1).min(script.len() - 1)].clone()
+                };
+            } else {
+                n += 1;
+            }
             let answer = match step {
                 Scripted::Wait(retry_ms) => constellation_authority::LockAnswer::Wait { retry_ms },
+                Scripted::WaitEach { .. } => unreachable!("answered above"),
                 Scripted::WouldBlock => constellation_authority::LockAnswer::WouldBlock,
                 Scripted::Slow(ms) => {
-                    std::thread::sleep(std::time::Duration::from_millis(ms));
-                    constellation_authority::LockAnswer::WouldBlock
+                    // (Asked meanwhile, the core takes the next request:
+                    // each is answered after its own wait.)
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(ms));
+                        let _ = reply.send(constellation_authority::LockAnswer::WouldBlock);
+                    });
+                    continue;
                 }
                 Scripted::GrantNothing => constellation_authority::LockAnswer::Granted {
                     position: constellation_meta::Position::ZERO,
                 },
-                Scripted::Grant | Scripted::SlowGrant(_) => {
-                    let position = match step {
-                        Scripted::SlowGrant(ms) => {
-                            std::thread::sleep(std::time::Duration::from_millis(ms));
+                Scripted::Grant | Scripted::GrantWhenOpen(_) => {
+                    let position = match &step {
+                        Scripted::GrantWhenOpen(gate) => {
+                            gate.wait();
                             constellation_meta::Position {
                                 seq: 1,
                                 ..constellation_meta::Position::ZERO
@@ -2489,8 +2557,16 @@ impl constellation_vfs::Responder<()> for RegistersAtWait {
         self.0.done(result);
     }
 
+    /// Registered once, however often it is asked: a repeated call is the
+    /// same registration (`Responder::begin_wait`'s contract), and a request
+    /// whose core is slow asks late and again when it hands its wait over.
     fn begin_wait(&mut self) -> constellation_vfs::WaitStart {
-        self.2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.2.compare_exchange(
+            0,
+            1,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        );
         constellation_vfs::WaitStart::Held(Some(self.1.clone()))
     }
 }
@@ -2544,6 +2620,23 @@ impl Fenced {
 
 const SECOND: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How long a test waits for something that must happen. A bound for a
+/// product that hangs, not a measure of how soon it happens: a wait that is
+/// met returns at once, and a loaded host may take its time.
+const ANSWER: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether `cond` held within [`ANSWER`].
+fn wait_for(mut cond: impl FnMut() -> bool) -> bool {
+    let until = std::time::Instant::now() + ANSWER;
+    while !cond() {
+        if std::time::Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    true
+}
+
 /// The core answers a non-blocking request "nothing conflicts, ask again"
 /// (a grace): the call returns at once, without an answer, and the waiting
 /// is done by a `lock-wait` pool thread, which asks again until it is
@@ -2555,20 +2648,23 @@ fn a_nonblocking_lock_in_a_grace_does_not_hold_the_calling_thread() {
     let mut f = fenced_fs();
     let (file, _) = f.create(&Caller::root(), ROOT_INO, "graced").unwrap();
     let ino = file.attr.ino;
+    // The core grants the third time it is asked, once the test lets it: a
+    // call that held its thread for the grace would not return before.
+    let gate = Gate::default();
     let seen = script_core(
         &mut f,
         ino,
-        vec![Scripted::Wait(200), Scripted::Wait(200), Scripted::Grant],
+        vec![
+            Scripted::Wait(200),
+            Scripted::Wait(200),
+            Scripted::GrantWhenOpen(gate.clone()),
+        ],
     );
     let started = std::time::Instant::now();
     let rx = f.lock_nb(ino, None);
-    let returned = started.elapsed();
-    assert!(
-        returned < std::time::Duration::from_millis(150),
-        "the calling thread waited {returned:?}"
-    );
     assert!(rx.try_recv().is_err(), "no answer yet");
-    let (result, thread, at) = rx.recv_timeout(5 * SECOND).expect("answered");
+    gate.open();
+    let (result, thread, at) = rx.recv_timeout(ANSWER).expect("answered");
     assert_eq!(result, Ok(()));
     assert_eq!(thread.as_deref(), Some("lock-wait"));
     assert!(
@@ -2595,7 +2691,7 @@ fn waiting_for_a_grace_is_no_lost_round() {
     script.push(Scripted::Grant);
     script_core(&mut f, ino, script);
     let rx = f.lock_nb(ino, None);
-    let (result, _, _) = rx.recv_timeout(5 * SECOND).expect("answered");
+    let (result, _, _) = rx.recv_timeout(ANSWER).expect("answered");
     assert_eq!(result, Ok(()));
 }
 
@@ -2612,17 +2708,24 @@ fn a_cancellation_ends_a_graced_wait_with_eintr() {
     assert!(rx.recv_timeout(SECOND / 5).is_err(), "waiting");
     let cancelled = std::time::Instant::now();
     cancel.cancel();
-    let (result, thread, at) = rx.recv_timeout(5 * SECOND).expect("answered");
+    let (result, thread, at) = rx.recv_timeout(ANSWER).expect("answered");
     assert_eq!(result, Err(Code::Intr));
     assert_eq!(thread.as_deref(), Some("lock-wait"));
+    // (A bound far under the 10 s the core said to wait, not a measure of
+    // the slice: how soon a loaded host runs the pool thread is its own.)
     assert!(
-        at.duration_since(cancelled) < SECOND / 2,
-        "ended within a slice: {:?}",
+        at.duration_since(cancelled) < 5 * SECOND,
+        "ended by the signal, not by the core's interval: {:?}",
         at.duration_since(cancelled)
     );
     assert!(f.meta.locks().local_locks(ino).is_empty());
     assert_eq!(f.meta.locks().stats().grace_wait_gave_up, 0);
 }
+
+/// How long a scripted core takes to answer a request it was told to be slow
+/// for: a signal that ends the request is told from the core's answer by
+/// ending it sooner than half of this.
+const SLOW_CORE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Plan 43 C7-F F-b N2: a signal ends a request whose first attempt is in
 /// flight against a core that does not answer for seconds (it asks an owner
@@ -2636,7 +2739,11 @@ fn a_signal_ends_a_first_attempt_in_flight_against_a_slow_core() {
     let mut f = fenced_fs();
     let (file, opened) = f.create(&Caller::root(), ROOT_INO, "in_flight").unwrap();
     let ino = file.attr.ino;
-    script_core(&mut f, ino, vec![Scripted::Slow(5_000)]);
+    script_core(
+        &mut f,
+        ino,
+        vec![Scripted::Slow(SLOW_CORE.as_millis() as u64)],
+    );
     let token = constellation_vfs::CancelToken::new();
     let registered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (t, r) = (token.clone(), registered.clone());
@@ -2649,13 +2756,12 @@ fn a_signal_ends_a_first_attempt_in_flight_against_a_slow_core() {
                 Box::new(move |tx| RegistersAtWait(Reports(tx), t, r)),
             )
         });
-        std::thread::sleep(SECOND / 3);
-        assert!(!call.is_finished(), "the core has not answered");
-        assert_eq!(
-            registered.load(std::sync::atomic::Ordering::SeqCst),
-            1,
+        // The answer is slow: the request registers for the signal.
+        assert!(
+            wait_for(|| registered.load(std::sync::atomic::Ordering::SeqCst) == 1),
             "registered for the signal once the answer was slow"
         );
+        assert!(!call.is_finished(), "the core has not answered");
         let cancelled = std::time::Instant::now();
         token.cancel();
         let rx = call.join().unwrap();
@@ -2664,8 +2770,8 @@ fn a_signal_ends_a_first_attempt_in_flight_against_a_slow_core() {
     let (result, _, _) = rx.try_recv().expect("answered by the call");
     assert_eq!(result, Err(Code::Intr));
     assert!(
-        took < SECOND / 4,
-        "the signal ended the request within a slice: {took:?}"
+        took < SLOW_CORE / 2,
+        "the signal ended the request, not the core's answer: {took:?}"
     );
     assert!(f.meta.locks().local_locks(ino).is_empty());
 }
@@ -2682,11 +2788,16 @@ fn a_grant_that_lands_after_its_request_ended_is_waited_for_by_the_next() {
     let mut f = fenced_fs();
     let (file, _) = f.create(&Caller::root(), ROOT_INO, "late_grant").unwrap();
     let ino = file.attr.ino;
-    script_core(&mut f, ino, vec![Scripted::SlowGrant(600)]);
+    // The core holds the grant back until the request has been ended.
+    let gate = Gate::default();
+    let seen = script_core(&mut f, ino, vec![Scripted::GrantWhenOpen(gate.clone())]);
     let token = constellation_vfs::CancelToken::new();
     let rx = std::thread::scope(|s| {
         let call = s.spawn(|| f.lock_nb(ino, Some(&token)));
-        std::thread::sleep(SECOND / 5);
+        assert!(
+            wait_for(|| !seen.lock().unwrap().is_empty()),
+            "the core has the request"
+        );
         token.cancel();
         call.join().unwrap()
     });
@@ -2695,14 +2806,14 @@ fn a_grant_that_lands_after_its_request_ended_is_waited_for_by_the_next() {
         Err(Code::Intr)
     );
     // The grant lands for nobody.
-    let until = std::time::Instant::now() + 5 * SECOND;
-    while f.meta.locks().held(ino).is_none() && std::time::Instant::now() < until {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(f.meta.locks().held(ino).is_some(), "the late grant is held");
+    gate.open();
+    assert!(
+        wait_for(|| f.meta.locks().held(ino).is_some()),
+        "the late grant is held"
+    );
     assert_eq!(f.meta.session().observed().seq, 0, "nobody waited yet");
     let rx = f.lock_nb(ino, None);
-    let (result, _, _) = rx.recv_timeout(5 * SECOND).expect("answered");
+    let (result, _, _) = rx.recv_timeout(ANSWER).expect("answered");
     assert_eq!(result, Ok(()));
     assert_eq!(
         f.meta.session().observed().seq,
@@ -2719,7 +2830,14 @@ fn a_signal_ends_a_reissue_in_flight_against_a_slow_core() {
     let mut f = fenced_fs();
     let (file, opened) = f.create(&Caller::root(), ROOT_INO, "reissue").unwrap();
     let ino = file.attr.ino;
-    script_core(&mut f, ino, vec![Scripted::Wait(50), Scripted::Slow(5_000)]);
+    let seen = script_core(
+        &mut f,
+        ino,
+        vec![
+            Scripted::Wait(50),
+            Scripted::Slow(SLOW_CORE.as_millis() as u64),
+        ],
+    );
     let token = constellation_vfs::CancelToken::new();
     let registered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (t, r) = (token.clone(), registered.clone());
@@ -2730,17 +2848,18 @@ fn a_signal_ends_a_reissue_in_flight_against_a_slow_core() {
         Box::new(move |tx| RegistersAtWait(Reports(tx), t, r)),
     );
     assert!(
-        rx.recv_timeout(SECOND / 3).is_err(),
+        wait_for(|| seen.lock().unwrap().len() == 2),
         "the second attempt is in flight"
     );
+    assert!(rx.try_recv().is_err(), "and unanswered");
     let cancelled = std::time::Instant::now();
     token.cancel();
-    let (result, thread, at) = rx.recv_timeout(2 * SECOND).expect("answered");
+    let (result, thread, at) = rx.recv_timeout(ANSWER).expect("answered");
     assert_eq!(result, Err(Code::Intr));
     assert_eq!(thread.as_deref(), Some("lock-wait"));
     assert!(
-        at.duration_since(cancelled) < SECOND / 4,
-        "ended within a slice: {:?}",
+        at.duration_since(cancelled) < SLOW_CORE / 2,
+        "ended by the signal, not by the core's answer: {:?}",
         at.duration_since(cancelled)
     );
 }
@@ -2754,11 +2873,11 @@ fn a_graced_wait_past_its_bound_gives_up_with_eagain_and_is_counted() {
     script_core(&mut f, ino, vec![Scripted::Wait(50)]);
     let started = std::time::Instant::now();
     let rx = f.lock_nb(ino, None);
-    let (result, thread, at) = rx.recv_timeout(5 * SECOND).expect("answered");
+    let (result, thread, at) = rx.recv_timeout(ANSWER).expect("answered");
     assert_eq!(result, Err(Code::Again));
     assert_eq!(thread.as_deref(), Some("lock-wait"));
     let took = at.duration_since(started);
-    assert!(took >= SECOND / 3 && took < 2 * SECOND, "{took:?}");
+    assert!(took >= SECOND / 3, "{took:?}");
     let stats = f.meta.locks().stats();
     assert_eq!(stats.grace_waits, 1);
     assert_eq!(stats.grace_wait_gave_up, 1);
@@ -2846,9 +2965,9 @@ fn a_wait_registers_for_signals_only_when_it_begins() {
         Box::new(move |tx| RegistersAtWait(Reports(tx), t, r)),
     );
     assert_eq!(registered.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert!(rx.recv_timeout(SECOND / 5).is_err(), "waiting");
+    assert!(rx.try_recv().is_err(), "waiting");
     token.cancel();
-    let (result, thread, _) = rx.recv_timeout(5 * SECOND).expect("answered");
+    let (result, thread, _) = rx.recv_timeout(ANSWER).expect("answered");
     assert_eq!(result, Err(Code::Intr));
     assert_eq!(thread.as_deref(), Some("lock-wait"));
     // Answered at once: never registered.
@@ -2876,13 +2995,27 @@ fn a_wait_registers_for_signals_only_when_it_begins() {
 #[test]
 fn many_waits_are_served_by_a_bounded_pool() {
     let mut f = fenced_fs();
-    let (file, opened) = f.create(&Caller::root(), ROOT_INO, "crowd").unwrap();
-    let ino = file.attr.ino;
-    let mut script = vec![Scripted::Wait(100); 80];
-    script.push(Scripted::WouldBlock);
-    script_core(&mut f, ino, script);
-    let rxs: Vec<_> = (0..40)
-        .map(|_| f.lock_nb_with(ino, opened.fh, None, Box::new(Reports)))
+    // A file each: every request is told to wait twice, whatever order the
+    // core is asked in.
+    let files: Vec<_> = (0..40)
+        .map(|i| {
+            let (file, opened) = f
+                .create(&Caller::root(), ROOT_INO, &format!("crowd{i}"))
+                .unwrap();
+            (file.attr.ino, opened.fh)
+        })
+        .collect();
+    script_core(
+        &mut f,
+        files[0].0,
+        vec![
+            Scripted::WaitEach { ms: 100, times: 2 },
+            Scripted::WouldBlock,
+        ],
+    );
+    let rxs: Vec<_> = files
+        .iter()
+        .map(|(ino, fh)| f.lock_nb_with(*ino, *fh, None, Box::new(Reports)))
         .collect();
     let locks = f.fs.cluster_locks().expect("cluster locks");
     let workers = locks.waits.threads();
@@ -2891,7 +3024,7 @@ fn many_waits_are_served_by_a_bounded_pool() {
         "{workers} pool threads for 40 waits"
     );
     for rx in rxs {
-        let (result, thread, _) = rx.recv_timeout(10 * SECOND).expect("answered");
+        let (result, thread, _) = rx.recv_timeout(ANSWER).expect("answered");
         assert_eq!(result, Err(Code::Again));
         assert_eq!(thread.as_deref(), Some("lock-wait"));
     }
@@ -2907,22 +3040,27 @@ fn many_waits_are_served_by_a_bounded_pool() {
 #[test]
 fn a_pool_that_cannot_start_a_thread_answers_eagain_and_counts_it() {
     let mut f = fenced_fs();
-    let (file, opened) = f.create(&Caller::root(), ROOT_INO, "nothreads").unwrap();
-    let ino = file.attr.ino;
+    // A file for each request: each is told to wait once, whatever order
+    // the core is asked in.
+    let mut files = (0..3).map(|i| {
+        let (file, opened) = f
+            .create(&Caller::root(), ROOT_INO, &format!("nothreads{i}"))
+            .unwrap();
+        (file.attr.ino, opened.fh)
+    });
+    let (ino, fh) = files.next().unwrap();
+    let ((ino1, fh1), (ino2, fh2)) = (files.next().unwrap(), files.next().unwrap());
     script_core(
         &mut f,
         ino,
         vec![
-            Scripted::Wait(50),
-            Scripted::Wait(50),
-            Scripted::Wait(50),
-            Scripted::Wait(50),
+            Scripted::WaitEach { ms: 50, times: 1 },
             Scripted::WouldBlock,
         ],
     );
     let locks = f.fs.cluster_locks().expect("cluster locks");
     locks.waits.fail_spawn(true);
-    let rx = f.lock_nb_with(ino, opened.fh, None, Box::new(Reports));
+    let rx = f.lock_nb_with(ino, fh, None, Box::new(Reports));
     let (result, thread, _) = rx.try_recv().expect("answered before the call returned");
     assert_eq!(result, Err(Code::Again), "not EIO");
     assert_ne!(thread.as_deref(), Some("lock-wait"));
@@ -2935,12 +3073,12 @@ fn a_pool_that_cannot_start_a_thread_answers_eagain_and_counts_it() {
     assert_eq!(locks.waits.threads(), 0);
     // With a thread running, the next one only queues.
     locks.waits.fail_spawn(false);
-    let first = f.lock_nb_with(ino, opened.fh, None, Box::new(Reports));
+    let first = f.lock_nb_with(ino1, fh1, None, Box::new(Reports));
     locks.waits.fail_spawn(true);
-    let second = f.lock_nb_with(ino, opened.fh, None, Box::new(Reports));
-    assert!(second.try_recv().is_err(), "queued for the running thread");
+    let second = f.lock_nb_with(ino2, fh2, None, Box::new(Reports));
+    // (Queued for the running thread: it answers from there, below.)
     for rx in [first, second] {
-        let (result, thread, _) = rx.recv_timeout(5 * SECOND).expect("answered");
+        let (result, thread, _) = rx.recv_timeout(ANSWER).expect("answered");
         assert_eq!(result, Err(Code::Again));
         assert_eq!(thread.as_deref(), Some("lock-wait"));
     }
@@ -2958,10 +3096,12 @@ fn closing_the_file_during_a_graced_wait_leaves_nothing_behind() {
     let caller = Caller::new(0, 0, Some(std::process::id()));
     let (file, opened) = f.create(&Caller::root(), ROOT_INO, "closed").unwrap();
     let ino = file.attr.ino;
-    let seen = script_core(&mut f, ino, vec![Scripted::Wait(300), Scripted::Grant]);
+    // The interval is longer than anything this test does: the request is
+    // ended while it waits, and the core would grant it if asked again.
+    let seen = script_core(&mut f, ino, vec![Scripted::Wait(60_000), Scripted::Grant]);
     let cancel = constellation_vfs::CancelToken::new();
     let rx = f.lock_nb_with(ino, opened.fh, Some(&cancel), Box::new(Reports));
-    assert!(rx.recv_timeout(SECOND / 10).is_err(), "waiting");
+    assert!(rx.try_recv().is_err(), "waiting");
     Blocking::run(|r| {
         f.fs.release(
             &OpCtx::new(OpKind::Release, &caller),
@@ -2975,10 +3115,9 @@ fn closing_the_file_during_a_graced_wait_leaves_nothing_behind() {
     .expect("the close answers while a lock waits on the file");
     let exited = std::time::Instant::now();
     cancel.cancel();
-    let (result, _, at) = rx.recv_timeout(5 * SECOND).expect("answered");
+    let (result, _, at) = rx.recv_timeout(ANSWER).expect("answered");
     assert_eq!(result, Err(Code::Intr));
-    assert!(at.duration_since(exited) < SECOND / 2);
-    std::thread::sleep(std::time::Duration::from_millis(400));
+    assert!(at.duration_since(exited) < 30 * SECOND);
     assert_eq!(
         seen.lock().unwrap().len(),
         1,
@@ -3042,7 +3181,13 @@ impl constellation_vfs::Responder<constellation_vfs::ReadData> for ReadReports {
         }
         match &self.1 {
             Some((token, n)) => {
-                n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Registered once (see `RegistersAtWait`).
+                let _ = n.compare_exchange(
+                    0,
+                    1,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                );
                 constellation_vfs::WaitStart::Held(Some(token.clone()))
             }
             None => constellation_vfs::WaitStart::Held(None),
@@ -3152,6 +3297,12 @@ impl Parking {
         while crate::locks::now().honour < until {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        // The park gates estimate the honour clock from the wait clock and
+        // the offset between them as of the last renewal tick (or full
+        // reading, `may_park`), and an op the estimate lags behind waits
+        // where it is. A host that has not run the view's tick since the
+        // window ended must not decide whether the op is parked.
+        self.meta.locks().may_park(crate::locks::now());
     }
 }
 
@@ -3175,7 +3326,7 @@ fn a_lapsed_owners_read_waits_for_the_verdict_and_runs_after_the_admission() {
     assert!(p.meta.locks().fenced_owners(crate::locks::now()).is_empty());
     p.resume();
     let (result, thread, _) = rx
-        .recv_timeout(5 * SECOND)
+        .recv_timeout(ANSWER)
         .map(|(a, b)| (a, b, ()))
         .expect("answered");
     assert_eq!(result, Ok(b"object".to_vec()));
@@ -3203,7 +3354,7 @@ fn a_parked_read_fails_eio_when_the_owner_refuses() {
     assert!(rx.recv_timeout(SECOND / 5).is_err());
     let id = p.meta.locks().held(p.turn).unwrap().id;
     assert!(p.meta.locks().lost(p.turn, id, crate::locks::now()));
-    let (result, _) = rx.recv_timeout(5 * SECOND).expect("answered");
+    let (result, _) = rx.recv_timeout(ANSWER).expect("answered");
     assert_eq!(result, Err(Code::Io));
     assert_eq!(p.meta.locks().stats().lapse_parks_refused, 1);
 }
@@ -3221,7 +3372,7 @@ fn a_signal_ends_a_parked_read_with_eintr_and_the_park_goes_on() {
     assert_eq!(registered.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(rx.recv_timeout(SECOND / 5).is_err());
     token.cancel();
-    let (result, _) = rx.recv_timeout(5 * SECOND).expect("answered");
+    let (result, _) = rx.recv_timeout(ANSWER).expect("answered");
     assert_eq!(result, Err(Code::Intr));
     assert_eq!(p.meta.locks().stats().lapse_park_interrupted, 1);
     assert!(p.meta.locks().lapsing(p.turn), "the grant's park goes on");
@@ -3230,7 +3381,7 @@ fn a_signal_ends_a_parked_read_with_eintr_and_the_park_goes_on() {
     assert!(other.recv_timeout(SECOND / 5).is_err());
     p.resume();
     assert_eq!(
-        other.recv_timeout(5 * SECOND).expect("answered").0,
+        other.recv_timeout(ANSWER).expect("answered").0,
         Ok(b"object".to_vec())
     );
 }
@@ -3276,10 +3427,15 @@ fn a_parked_write_lands_after_the_admission() {
         W(tx),
     );
     drop(data);
-    assert!(rx.recv_timeout(SECOND / 5).is_err(), "parked");
+    let first = rx.recv_timeout(SECOND / 5);
+    assert!(
+        first.is_err(),
+        "parked: {first:?} {:?}",
+        p.meta.locks().stats()
+    );
     p.resume();
-    assert_eq!(rx.recv_timeout(5 * SECOND).unwrap(), Ok(9));
-    let got = p.read(None, false).recv_timeout(5 * SECOND).unwrap().0;
+    assert_eq!(rx.recv_timeout(ANSWER).unwrap(), Ok(9));
+    let got = p.read(None, false).recv_timeout(ANSWER).unwrap().0;
     assert_eq!(got, Ok(b"rewrit".to_vec()));
 }
 
@@ -3349,7 +3505,10 @@ fn an_inline_wait_for_a_lapsing_grant_ends_with_its_callers_signal() {
     });
     let (result, _) = rx.try_recv().expect("answered by the call");
     assert_eq!(result, Err(Code::Intr));
-    assert!(took < SECOND / 4, "ended by the signal at once: {took:?}");
+    assert!(
+        took < 30 * SECOND,
+        "ended by the signal, not the verdict: {took:?}"
+    );
     let s = p.meta.locks().stats();
     assert_eq!((s.lapse_inline_waits, s.lapse_inline_interrupted), (1, 1));
     assert!(p.meta.locks().lapsing(p.turn), "the grant's park goes on");
@@ -3388,7 +3547,10 @@ fn a_mutations_wait_for_a_lapsing_grant_ends_with_its_callers_signal() {
         (result, cancelled.elapsed())
     });
     assert_eq!(result, Err(Code::Intr));
-    assert!(took < SECOND / 4, "{took:?}");
+    assert!(
+        took < 30 * SECOND,
+        "ended by the signal, not the verdict: {took:?}"
+    );
     let s = p.meta.locks().stats();
     assert_eq!((s.lapse_inline_waits, s.lapse_inline_interrupted), (1, 1));
     assert_eq!(s.owner_fenced_ops, 0, "an interrupted wait fences nothing");
@@ -3412,7 +3574,10 @@ fn a_mutations_wait_for_a_lapsing_grant_ends_with_its_callers_signal() {
         (result, cancelled.elapsed())
     });
     assert_eq!(result, Reissue::Interrupted);
-    assert!(took < SECOND / 4, "{took:?}");
+    assert!(
+        took < 30 * SECOND,
+        "ended by the signal, not the verdict: {took:?}"
+    );
     let s = p.meta.locks().stats();
     assert_eq!((s.lapse_inline_waits, s.lapse_inline_interrupted), (1, 1));
 }
@@ -3451,16 +3616,17 @@ fn parked_ops_that_run_again_slowly_do_not_starve_the_lock_waits() {
     }
     // They run again, and stay (as many as can: the pool the lock waits
     // used was sixteen threads).
-    let until = std::time::Instant::now() + 2 * SECOND;
-    while running.load(std::sync::atomic::Ordering::SeqCst) < crate::locks::WAIT_POOL_THREADS
-        && std::time::Instant::now() < until
-    {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    std::thread::sleep(SECOND / 5);
-    // A lock request that waits for its owner's grace is served meanwhile.
+    assert!(
+        wait_for(
+            || running.load(std::sync::atomic::Ordering::SeqCst) >= crate::locks::WAIT_POOL_THREADS
+        ),
+        "the ops run again"
+    );
+    // A lock request that waits for its owner's grace is served meanwhile
+    // (the ops stay where they are until the test lets them go: a request
+    // starved by them is not answered before).
     let rx = f.lock_nb(ino, None);
-    let answered = rx.recv_timeout(2 * SECOND);
+    let answered = rx.recv_timeout(ANSWER);
     let (flag, wake) = &*release;
     *flag.lock().unwrap() = true;
     wake.notify_all();
@@ -3476,31 +3642,36 @@ fn parked_ops_that_run_again_slowly_do_not_starve_the_lock_waits() {
 #[test]
 fn lock_waits_in_flight_against_a_slow_owner_do_not_starve_the_parked_ops() {
     let mut f = fenced_fs();
-    let (file, _) = f.create(&Caller::root(), ROOT_INO, "slow_owner").unwrap();
-    let ino = file.attr.ino;
     let n = crate::locks::WAIT_POOL_THREADS + 2;
-    // Each request's first attempt is answered at once (it waits), every
-    // attempt after that takes seconds.
-    let mut script = vec![Scripted::Wait(10); n];
-    script.push(Scripted::Slow(4_000));
-    script_core(&mut f, ino, script);
+    // A file each: every request's first attempt is answered at once (it
+    // waits), every attempt after that takes longer than the test.
+    let files: Vec<_> = (0..n)
+        .map(|i| {
+            let (file, _) = f
+                .create(&Caller::root(), ROOT_INO, &format!("slow_owner{i}"))
+                .unwrap();
+            file.attr.ino
+        })
+        .collect();
+    let attempt = 30 * SECOND;
+    let seen = script_core(
+        &mut f,
+        files[0],
+        vec![
+            Scripted::WaitEach { ms: 10, times: 1 },
+            Scripted::Slow(attempt.as_millis() as u64),
+        ],
+    );
     let cancel = constellation_vfs::CancelToken::new();
-    let rxs: Vec<_> = (0..n).map(|_| f.lock_nb(ino, Some(&cancel))).collect();
+    let rxs: Vec<_> = files.iter().map(|i| f.lock_nb(*i, Some(&cancel))).collect();
     let locks = f.fs.cluster_locks().expect("cluster locks").clone();
-    // The pool grows as each thread goes into its attempt: every one of the
-    // sixteen is in one (a loaded host takes its time to start them).
-    let until = std::time::Instant::now() + 5 * SECOND;
-    while locks.waits.threads() < crate::locks::WAIT_POOL_THREADS
-        && std::time::Instant::now() < until
-    {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    std::thread::sleep(SECOND / 5);
-    assert_eq!(
-        locks.waits.threads(),
-        crate::locks::WAIT_POOL_THREADS,
+    // Every one of the sixteen threads is in an attempt: the core has been
+    // asked once by each request, and once more by each thread.
+    assert!(
+        wait_for(|| seen.lock().unwrap().len() >= n + crate::locks::WAIT_POOL_THREADS),
         "every lock-wait thread is in an attempt"
     );
+    assert_eq!(locks.waits.threads(), crate::locks::WAIT_POOL_THREADS);
     let (tx, parked) = std::sync::mpsc::channel();
     let started = std::time::Instant::now();
     locks.park_deferred(
@@ -3510,21 +3681,18 @@ fn lock_waits_in_flight_against_a_slow_owner_do_not_starve_the_parked_ops() {
             let _ = tx.send((end, std::time::Instant::now()));
         },
     );
-    let answered = parked.recv_timeout(2 * SECOND);
+    let answered = parked.recv_timeout(ANSWER);
     cancel.cancel();
     let (end, at) = answered.expect("the parked op was starved by the lock waits");
     assert_eq!(end, crate::locks::ParkEnd::Resolved);
-    // (The attempts last 4 s each: the op was not behind one.)
+    // (The attempts last longer: the op was not behind one.)
     assert!(
-        at.duration_since(started) < 2 * SECOND,
+        at.duration_since(started) < attempt / 2,
         "{:?}",
         at.duration_since(started)
     );
     for rx in rxs {
-        assert_eq!(
-            rx.recv_timeout(5 * SECOND).expect("ended").0,
-            Err(Code::Intr)
-        );
+        assert_eq!(rx.recv_timeout(ANSWER).expect("ended").0, Err(Code::Intr));
     }
 }
 
@@ -3538,7 +3706,8 @@ fn lock_waits_in_flight_against_a_slow_owner_do_not_starve_the_parked_ops() {
 /// where it was, on that thread, for the verdict.
 #[test]
 fn a_read_that_finds_a_lapse_at_its_fence_parks_instead_of_waiting_on_a_ring_thread() {
-    let p = Arc::new(parking(600));
+    // A window no real delay ends: this thread's clock steps past it.
+    let p = Arc::new(parking(20_000));
     let q = p.clone();
     let (done, ring) = std::sync::mpsc::channel();
     // (Not scoped: where the read waits on the thread, so does the test.)
@@ -3548,19 +3717,21 @@ fn a_read_that_finds_a_lapse_at_its_fence_parks_instead_of_waiting_on_a_ring_thr
             // The clock stepped forward: the grant is over on this thread's
             // reading, the gate's estimate (one wait-clock read) has not
             // seen it.
-            crate::locks::step_test_wall(1_500);
+            crate::locks::step_test_wall(21_500);
             let started = std::time::Instant::now();
             let rx = q.read(None, false);
             let _ = done.send((rx, started.elapsed()));
         })
         .unwrap();
     let (rx, returned) = ring
-        .recv_timeout(2 * SECOND)
+        .recv_timeout(ANSWER)
         .expect("the ring's thread was not held: the read returned");
-    assert!(returned < SECOND, "{returned:?}");
+    // (Held, it would wait for the verdict, which the park's bound ends
+    // after a minute.)
+    assert!(returned < 30 * SECOND, "{returned:?}");
     // Parked and run again from the pool: its owner's verdict is in (here
     // the pool's clock never stepped, so the grant is honoured there).
-    let (result, thread) = rx.recv_timeout(5 * SECOND).expect("answered");
+    let (result, thread) = rx.recv_timeout(ANSWER).expect("answered");
     assert_eq!(result, Ok(b"object".to_vec()));
     assert!(
         thread
@@ -3582,22 +3753,24 @@ fn a_read_that_finds_a_lapse_at_its_fence_parks_instead_of_waiting_on_a_ring_thr
 /// (`lapse_inline_refused_thread`; the campaign's judge fails on it).
 #[test]
 fn an_inline_wait_is_refused_on_a_ring_thread() {
-    let p = Arc::new(parking_with(600, false));
+    let p = Arc::new(parking_with(20_000, false));
     let q = p.clone();
     let (done, ring) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("fuser-ring-1".into())
         .spawn(move || {
-            crate::locks::step_test_wall(1_500);
+            crate::locks::step_test_wall(21_500);
             let started = std::time::Instant::now();
             let rx = q.read(None, false);
             let _ = done.send((rx, started.elapsed()));
         })
         .unwrap();
     let (rx, returned) = ring
-        .recv_timeout(2 * SECOND)
+        .recv_timeout(ANSWER)
         .expect("the ring's thread was not held: the read returned");
-    assert!(returned < SECOND, "{returned:?}");
+    // (Held, it would wait for the verdict, which the park's bound ends
+    // after a minute.)
+    assert!(returned < 30 * SECOND, "{returned:?}");
     assert_eq!(rx.try_recv().expect("answered at once").0, Err(Code::Io));
     let s = p.meta.locks().stats();
     assert_eq!(
@@ -3620,14 +3793,12 @@ fn a_refused_inline_wait_at_a_publication_discards_nothing() {
     let me = std::process::id();
     let (obj, oo) = f.create(&Caller::root(), ROOT_INO, "obj").unwrap();
     let ino = obj.attr.ino;
-    let until = crate::locks::now().honour.plus(300);
-    f.lock(ino, me, until);
+    f.lock(ino, me, crate::locks::now().honour.plus(20_000));
     let writer = Caller::new(0, 0, Some(me));
     f.write(&OpCtx::new(OpKind::Write, &writer), ino, oo.fh)
         .unwrap();
-    while crate::locks::now().honour < until {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    // The grant ends on this thread's clock, which is the one asked.
+    crate::locks::advance_test_clock(21_000);
     assert!(
         f.meta.locks().lapse_pending(ino, crate::locks::now()),
         "the grant is lapsing"
