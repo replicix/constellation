@@ -11016,7 +11016,11 @@ fn a_run_leaves_no_bus_behind() {
         ),
     ] {
         run_seed(seed, cfg).unwrap_or_else(|e| panic!("{label} seed {seed}: {e}"));
-        assert_eq!(live(), before, "{label} seed {seed}: the run's bus outlived it");
+        assert_eq!(
+            live(),
+            before,
+            "{label} seed {seed}: the run's bus outlived it"
+        );
     }
 }
 
