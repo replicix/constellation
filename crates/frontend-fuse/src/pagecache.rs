@@ -597,27 +597,29 @@ impl PageCacheConfig {
     }
 
     /// Whether W3b writes notices now, and for which namespace operations
-    /// ([`NoticeMode`]).
-    pub fn dir_notice_mode(&self) -> NoticeMode {
-        match self.dir_change_notify {
-            crate::Switch::On => NoticeMode::Always,
-            crate::Switch::Off => NoticeMode::Off,
-            crate::Switch::Auto => {
-                if crate::kernel_fixes::fixed(crate::kernel_fixes::KernelFix::DirChangeBumpsVersion)
-                {
-                    NoticeMode::Off
-                } else if self.strict {
-                    NoticeMode::Always
-                } else {
-                    NoticeMode::Narrowed
-                }
-            }
-        }
+    /// ([`NoticeMode`]): for the directories an operation changed, and for
+    /// the inodes a rename moved. A kernel with 0003 (`fuse_dir_changed`
+    /// bumps the directory's `attr_version`) needs no directory notice, but
+    /// 0003 does not touch the moved inode: `fuse_rename_common` still
+    /// updates or invalidates its `ctime` without bumping its version (F16),
+    /// so the moved inode's notice stays on whatever the verdict.
+    pub fn dir_notice_modes(&self) -> NoticeModes {
+        notice_modes(
+            self.dir_change_notify,
+            self.strict,
+            crate::kernel_fixes::fixed(crate::kernel_fixes::KernelFix::DirChangeBumpsVersion),
+        )
     }
 
-    /// Whether W3b writes its notices now.
+    /// Whether W3b writes any notice now.
     pub fn dir_notice_on(&self) -> bool {
-        self.dir_notice_mode() != NoticeMode::Off
+        let m = self.dir_notice_modes();
+        m.dirs != NoticeMode::Off || m.moved != NoticeMode::Off
+    }
+
+    /// Whether W3b writes the changed directories' notices now.
+    pub fn dir_notice_dirs_on(&self) -> bool {
+        self.dir_notice_modes().dirs != NoticeMode::Off
     }
 
     /// Whether W3a gives directories' attributes no kernel lifetime now:
@@ -652,6 +654,7 @@ impl PageCacheConfig {
             dir_attr_ttl_zero: self.dir_attr_zero(),
             dir_change_notify: self.dir_change_notify.as_str(),
             dir_change_notify_on: self.dir_notice_on(),
+            dir_change_notify_dirs_on: self.dir_notice_dirs_on(),
             verdicts: KernelFix::ALL
                 .iter()
                 .map(|&fix| {
@@ -679,8 +682,55 @@ pub struct KernelWorkaroundsStatus {
     pub dir_attr_ttl_zero: bool,
     pub dir_change_notify: &'static str,
     pub dir_change_notify_on: bool,
+    /// Whether the changed directories' notices are written (the moved
+    /// inodes' stay on with 0003: `dir_change_notify_on` says whether any is).
+    pub dir_change_notify_dirs_on: bool,
     /// `(fix, verdict, source)`.
     pub verdicts: Vec<(&'static str, &'static str, &'static str)>,
+}
+
+/// [`PageCacheConfig::dir_notice_modes`] for a kernel with (`fixed`) or
+/// without 0003.
+fn notice_modes(switch: crate::Switch, strict: bool, fixed: bool) -> NoticeModes {
+    match switch {
+        crate::Switch::On => NoticeModes::both(NoticeMode::Always),
+        crate::Switch::Off => NoticeModes::both(NoticeMode::Off),
+        crate::Switch::Auto => {
+            let unfixed = if strict {
+                NoticeMode::Always
+            } else {
+                NoticeMode::Narrowed
+            };
+            NoticeModes {
+                dirs: if fixed { NoticeMode::Off } else { unfixed },
+                moved: unfixed,
+            }
+        }
+    }
+}
+
+/// W3b's mode for the two kinds of inode a namespace operation tells the
+/// kernel of ([`PageCacheConfig::dir_notice_modes`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoticeModes {
+    /// The directories the operation changed.
+    pub dirs: NoticeMode,
+    /// The inodes a rename moved.
+    pub moved: NoticeMode,
+}
+
+impl NoticeModes {
+    fn both(mode: NoticeMode) -> Self {
+        Self {
+            dirs: mode,
+            moved: mode,
+        }
+    }
+
+    /// Whether the attribute watch tracks arrivals (narrowed mode).
+    pub fn narrowed(&self) -> bool {
+        self.dirs == NoticeMode::Narrowed || self.moved == NoticeMode::Narrowed
+    }
 }
 
 /// When W3b writes its notice for a namespace operation (plan 42 §5.3.1,
@@ -1159,7 +1209,7 @@ impl PageCacheTable {
     /// [`crate::attrwatch::AttrWatch::arrive`]; untracked unless W3b is
     /// narrowed).
     pub(crate) fn attr_arrive(&self, tid: u32) -> crate::attrwatch::Arrival {
-        if self.config().dir_notice_mode() == NoticeMode::Narrowed {
+        if self.config().dir_notice_modes().narrowed() {
             self.watch.arrive(tid)
         } else {
             crate::attrwatch::Arrival::untracked()
@@ -1260,7 +1310,11 @@ mod tests {
                 strict,
                 ..Default::default()
             };
-            assert_eq!(config.dir_notice_mode(), mode, "{switch:?} strict={strict}");
+            assert_eq!(
+                config.dir_notice_modes(),
+                NoticeModes::both(mode),
+                "{switch:?} strict={strict}"
+            );
             let t = PageCacheTable::new(config);
             // Only the narrowed mode tracks attribute replies (of a task
             // that exists: a change drops the marks of gone ones).
@@ -1271,6 +1325,36 @@ mod tests {
                 "{switch:?} strict={strict}"
             );
         }
+    }
+
+    /// Plan 42 F16 with kernel patch 0003: a kernel that bumps a changed
+    /// directory's `attr_version` needs no directory notice, but the moved
+    /// inode's `ctime` (`fuse_rename_common`) is still the race-2b pattern,
+    /// so its notice stays on whatever the `DirChangeBumpsVersion` verdict;
+    /// an explicit `on`/`off` still overrides both. (Fails before the
+    /// change: a fixed verdict turned every notice off.)
+    #[test]
+    fn a_fixed_kernel_keeps_the_moved_inodes_notice() {
+        use crate::Switch::{Auto, Off, On};
+        for (switch, strict, dirs, moved) in [
+            (Auto, true, NoticeMode::Off, NoticeMode::Always),
+            (Auto, false, NoticeMode::Off, NoticeMode::Narrowed),
+            (On, false, NoticeMode::Always, NoticeMode::Always),
+            (Off, true, NoticeMode::Off, NoticeMode::Off),
+        ] {
+            assert_eq!(
+                notice_modes(switch, strict, true),
+                NoticeModes { dirs, moved },
+                "{switch:?} strict={strict}"
+            );
+        }
+        let fixed = notice_modes(Auto, false, true);
+        assert!(fixed.narrowed(), "the moved inode's replies are tracked");
+        // Without the fix both are on, as before.
+        assert_eq!(
+            notice_modes(Auto, false, false),
+            NoticeModes::both(NoticeMode::Narrowed)
+        );
     }
 
     fn facts(fh: u64, stamp: Option<CacheStamp>) -> OpenFacts {

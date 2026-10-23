@@ -205,6 +205,7 @@ fn kernel_workarounds_status(
         dir_attr_ttl_zero: w.dir_attr_ttl_zero,
         dir_change_notify: w.dir_change_notify.to_string(),
         dir_change_notify_on: w.dir_change_notify_on,
+        dir_change_notify_dirs_on: w.dir_change_notify_dirs_on,
         verdicts: w
             .verdicts
             .iter()

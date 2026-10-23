@@ -3000,6 +3000,10 @@
           "description": "`CONSTELLATION_FUSE_DIR_CHANGE_NOTIFY` (W3b), and whether it writes.",
           "type": "string"
         },
+        "dir_change_notify_dirs_on": {
+          "description": "Whether the changed directories' notices are written: off on a\nkernel with 0003, while the moved inodes' stay on (F16), so\n`dir_change_notify_on` can be true with this false.",
+          "type": "boolean"
+        },
         "dir_change_notify_on": {
           "type": "boolean"
         },
@@ -3030,6 +3034,7 @@
         "dir_attr_ttl_zero",
         "dir_change_notify",
         "dir_change_notify_on",
+        "dir_change_notify_dirs_on",
         "verdicts"
       ],
       "type": "object"

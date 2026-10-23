@@ -920,8 +920,15 @@ the directory refetches it (`fuse_permission`). The notice is therefore
 written only where it does something (below), and unconditionally only
 where it is free.
 
-Setting: `CONSTELLATION_FUSE_DIR_CHANGE_NOTIFY`. `auto` is off on a kernel
-with `DirChangeBumpsVersion`; else **unconditional under `--cto strict`**
+Setting: `CONSTELLATION_FUSE_DIR_CHANGE_NOTIFY`. `auto` writes no notice
+for the *directories* an operation changed on a kernel with
+`DirChangeBumpsVersion`, but **keeps the moved inode's notice of a rename
+there** (patch 0003 as sent bumps `attr_version` in `fuse_dir_changed`
+only; `fuse_rename_common` still updates the moved inode's `ctime` without
+a version bump, F16 — 17 of 20 rounds of `kernel-race-rename-ctime` on a
+patched kernel; a patch that also bumps the moved inode would make the
+notice unnecessary, and the probe cannot tell the two apart, so the notice
+stays for any kernel with 0003); else **unconditional under `--cto strict`**
 (a directory's attributes have no kernel lifetime there, W3a, so the
 notice costs no request) and **narrowed in bounded mode**; `on` is
 unconditional in either mode (diagnosis, and the cost reference of §8);
@@ -1175,7 +1182,9 @@ reported in `node.status` per mount as `kernel_workarounds: { keep_cache,
 write_repair, dir_attr_ttl, dir_change_notify, verdicts: { fix: (verdict,
 source: probe | table | override) } }` (`crates/control/src/proto/types.rs`).
 The race-2a and race-2b parts of W3 follow `AttrsValidAfterStore` and
-`DirChangeBumpsVersion` respectively.
+`DirChangeBumpsVersion` respectively — the 2b part for directories only:
+the moved inode's notice (F16) stays on with 0003 (`node.status`
+`dir_change_notify_on` is then true and `dir_change_notify_dirs_on` false).
 
 The table is not a code redesign away from being filled in: adding a
 row's values is a one-line change with a unit test per entry (§7.1). If

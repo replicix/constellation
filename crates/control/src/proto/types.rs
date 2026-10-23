@@ -778,6 +778,10 @@ pub struct FuseKernelWorkarounds {
     /// `CONSTELLATION_FUSE_DIR_CHANGE_NOTIFY` (W3b), and whether it writes.
     pub dir_change_notify: String,
     pub dir_change_notify_on: bool,
+    /// Whether the changed directories' notices are written: off on a
+    /// kernel with 0003, while the moved inodes' stay on (F16), so
+    /// `dir_change_notify_on` can be true with this false.
+    pub dir_change_notify_dirs_on: bool,
     /// By fix (`write_through_writeback`, `attrs_valid_after_store`,
     /// `dir_change_bumps_version`).
     pub verdicts: std::collections::BTreeMap<String, FuseKernelVerdict>,

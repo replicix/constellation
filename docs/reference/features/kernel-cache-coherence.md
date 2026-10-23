@@ -148,7 +148,7 @@ Keep-cache (W1) is independent of the kernel.
 | `CONSTELLATION_FUSE_WRITE_REPAIR` | `auto`, `on`, `off` | W2's repair (`off` on an unfixed kernel: hits mark the file suspect instead) |
 | `CONSTELLATION_FUSE_WRITE_REPAIR_WAIT_MS` | `1000` | W2's bound |
 | `CONSTELLATION_FUSE_DIR_ATTR_TTL` | `auto`, `zero`, `entry` | W3a (`auto`: `zero` under strict; `entry` in bounded mode, Q1) |
-| `CONSTELLATION_FUSE_DIR_CHANGE_NOTIFY` | `auto`, `on`, `off` | W3b (`auto`: every operation under strict, narrowed in bounded mode; `on`: every operation) |
+| `CONSTELLATION_FUSE_DIR_CHANGE_NOTIFY` | `auto`, `on`, `off` | W3b (`auto`: every operation under strict, narrowed in bounded mode; `on`: every operation; with kernel patch 0003 only the moved inode's notice of a rename remains) |
 | `CONSTELLATION_FUSE_KERNEL_PROBE` | `auto`, `off` | the probe of the kernel's fixes |
 
 Read once at start; an unparseable value fails the mount. The reference
@@ -198,7 +198,7 @@ with the race-1 fix and `CONSTELLATION_FUSE_WRITE_REPAIR=on`.
 ### Which workarounds apply here?
 
 `fuse.mounts[].kernel_workarounds`: each setting, whether it is in effect
-(`write_repair_on`, `dir_attr_ttl_zero`, `dir_change_notify_on`), and per
+(`write_repair_on`, `dir_attr_ttl_zero`, `dir_change_notify_on`, and `dir_change_notify_dirs_on`: false with patch 0003 while the moved inodes' notices stay on), and per
 fix the verdict and its source (`probe`, `table`, `override`).
 
 ## FAQ

@@ -60,15 +60,36 @@ pub(crate) struct DirNotice {
 }
 
 impl DirNotice {
-    /// `inos` were changed by the namespace operation being answered:
-    /// notices for those the mode calls for (module doc above; F21 for
-    /// the narrowed trigger).
-    fn tell(&self, inos: &[Option<Ino>]) {
+    /// `dirs` were changed and `moved` were moved by the namespace
+    /// operation being answered: notices for those the mode calls for
+    /// (module doc above; F21 for the narrowed trigger). A kernel with 0003
+    /// needs none for `dirs`, still one for `moved` (F16;
+    /// [`crate::pagecache::PageCacheConfig::dir_notice_modes`]).
+    fn tell(&self, dirs: &[Option<Ino>], moved: &[Option<Ino>]) {
         use crate::pagecache::NoticeMode;
-        let mode = self.pc.config().dir_notice_mode();
-        if mode == NoticeMode::Off {
+        let modes = self.pc.config().dir_notice_modes();
+        let mut inos: [Option<Ino>; 4] = [None; 4];
+        let mut n = 0;
+        for (class, mode) in [(dirs, modes.dirs), (moved, modes.moved)] {
+            if mode == NoticeMode::Off {
+                continue;
+            }
+            for ino in class {
+                if n < inos.len() {
+                    inos[n] = *ino;
+                    n += 1;
+                }
+            }
+        }
+        if n == 0 {
             return;
         }
+        let inos = &inos[..n];
+        let mode = if modes.narrowed() {
+            NoticeMode::Narrowed
+        } else {
+            NoticeMode::Always
+        };
         let Some(notifier) = self.gate.get().and_then(|g| g.notifier_now()) else {
             return;
         };
@@ -220,7 +241,7 @@ impl Responder<Entry> for EntryReply {
                     pc.size_seen(e.attr.ino, e.attr.size);
                 }
                 if changed.is_some() {
-                    notice.tell(&[changed]);
+                    notice.tell(&[changed], &[]);
                 }
                 notice.replying(seen, e.attr.ino);
                 // Before the bytes go: the kernel may forget this lookup as
@@ -461,7 +482,7 @@ impl Responder<()> for DirChangeReply {
     fn done(self, r: VfsResult<()>) {
         match r {
             Ok(()) => {
-                self.notice.tell(&[Some(self.parent)]);
+                self.notice.tell(&[Some(self.parent)], &[]);
                 self.reply.ok()
             }
             Err(e) => self.reply.error(reply_code(e.code())),
@@ -509,12 +530,10 @@ impl Responder<constellation_vfs::Renamed> for RenameReply {
     fn done(self, r: VfsResult<constellation_vfs::Renamed>) {
         match r {
             Ok(moved) => {
-                self.notice.tell(&[
-                    Some(self.parents.0),
-                    Some(self.parents.1),
-                    moved.moved,
-                    moved.exchanged,
-                ]);
+                self.notice.tell(
+                    &[Some(self.parents.0), Some(self.parents.1)],
+                    &[moved.moved, moved.exchanged],
+                );
                 self.reply.ok();
                 self.names.renamed(self.exchange);
             }
@@ -732,7 +751,7 @@ impl Responder<(Entry, Opened)> for CreateReply {
                 // below hands nothing and changed nothing the kernel knows.
                 if answer_is_ok(&answer) {
                     cx.pc.size_seen(e.attr.ino, e.attr.size);
-                    notice.tell(&[Some(parent)]);
+                    notice.tell(&[Some(parent)], &[]);
                     notice.replying(seen, e.attr.ino);
                 }
                 match fopen(answer) {
