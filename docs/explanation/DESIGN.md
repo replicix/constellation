@@ -808,7 +808,12 @@ chosen per filesystem and topology
 - **`Backup`** (Layer B, automatic when a peer is within
   `CONSTELLATION_BACKUP_RTT_BUDGET_MS`, 5 ms): the holder streams whole
   journal transactions to its backup and acknowledges only what every
-  listed backup holds. Failover takes about 1.5 s in the harness and
+  listed backup holds: such an acknowledgement is a commit by the root's
+  group
+  ([ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)).
+  A backup counts only from its acknowledgements of appends made at a
+  configuration version that lists it, and a claim of the lease, by seal
+  or by TTL, carries the group's sealed tail (§9). Failover takes about 1.5 s in the harness and
   2.3–4.7 s from `kill -9` to a new holder on EC2 ([RESULTS](../../bench/remote/RESULTS.md#failover-time)), and loses
   nothing acknowledged.
 - **`S3`** (Layer C, `fs create --ack-policy s3`): acknowledged once its
@@ -920,7 +925,8 @@ grants share one time discipline. The holder of a grant honours it until
 request; the grantor treats it as live until `granted + ttl + margin` on
 its clock; `margin` is the lease's expiry margin, `min(1 s, TTL/4)`. Each
 side measures its own window as a duration on its own clock, so the offset
-between the two nodes does not enter (plan 43 C7b): the rule needs a rate
+between the two nodes does not enter (plan 43 C7b,
+[ADR-35](DECISIONS.md#adr-35-clocks-rate-not-offset)): the rule needs a rate
 bound per node (below) and a margin that covers transit and rounding, not
 clocks that agree. The few values that still cross nodes as wall stamps are
 listed after the readings below. A grantor never gives more than it has

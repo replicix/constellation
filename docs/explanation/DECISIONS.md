@@ -1484,8 +1484,17 @@ logging never blocks a daemon thread (plan 44)";
 
 ## ADR-33: Commit is the configured group's acknowledgement (Vertical Paxos over S3)
 
-**Status**: proposed (plan 43 C0 drafts the decision; each milestone amends
-it, and C1 adds the rejected options).
+**Status**: accepted by the maintainer on 2026-10-17 (plan 43 §11: every
+recommendation, and the latency gates G1–G6), built in steps. Landed: C0
+(the commit point named and checked), C1-1 to C1-3 (the root group's commit
+holds across a listing and a removal; the class at journal time; the TTL
+claimant's sealed tail and the inherited tail), C2's C2a and C2b (the answer's
+source; a generation's end carries its cut). Not yet: C1-4 (member copies,
+committed shadows and streams, tail identity), the rest of C2 (no
+acknowledgement outside a group where one exists; settling before `EIO`),
+C3–C5. Each milestone amends this record, and C1 adds the rejected options.
+DESIGN.md states each part in the milestone that makes it true (plan 43
+§6).
 
 **Decision**: an acknowledgement is given only for a **committed** row. A row
 is committed when every member of the group in force when it was journaled
