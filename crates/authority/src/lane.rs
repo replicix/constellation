@@ -347,14 +347,20 @@ impl RenewLane {
                 // from (`renew_own` reads it inside its guard): the tick's
                 // reading is older, and a proof of liveness fresh then may
                 // be stale by the time the guard is taken.
+                // So is the certificate: a step that revoked it (a release,
+                // an epoch) after the tick read it was published before its
+                // actions went out, and an extension judged at `n` must not
+                // rest on what that step revoked (the cell is a mutex the
+                // core's publish takes alone: nothing slow under the guard).
                 let view = &view;
                 if locks.renew_own(
                     ino,
                     h.id,
                     view.me,
                     |n| {
-                        if view.own_ok_with(n.honour, freshness) {
-                            cap.since(n.honour)
+                        let now_view = facts.view();
+                        if now_view.own_ok_with(n.honour, freshness) {
+                            now_view.cap_until.min(cap).since(n.honour)
                         } else {
                             0
                         }
@@ -987,5 +993,45 @@ mod tests {
         for macro_name in ["tracing::", "log::", "println!", "eprintln!"] {
             assert!(!code.contains(macro_name), "lane.rs uses {macro_name}");
         }
+    }
+
+    /// Integration review (plan 41 L2 x a revoking step): the core's step
+    /// that revokes the certificate (a marked release: `root_ok` false,
+    /// then its CAS dispatched; a taker's grace counts from the CAS) runs
+    /// between the tick's reading of the certificate and the extension
+    /// inside the tables' guard. The extension is judged at the guard's
+    /// reading of the clock, so it must be judged against the certificate
+    /// as of then too, or it is made from an instant after the revocation.
+    /// Fails on the parent: the tick's snapshot of the certificate was
+    /// used inside the guard.
+    #[test]
+    fn a_certificate_revoked_before_the_guard_extends_nothing() {
+        struct Cell(Arc<Mutex<LockLaneView>>);
+        impl LaneFacts for Cell {
+            fn view(&self) -> LockLaneView {
+                self.0.lock().unwrap().clone()
+            }
+            fn delegations_any(&self) -> bool {
+                false
+            }
+        }
+        let t = LockTables::default();
+        own_grant(&t);
+        let cell = Arc::new(Mutex::new(view()));
+        let f = Cell(cell.clone());
+        // The tables' clock is read inside the guard: the core's revoking
+        // step has published by then.
+        let revoke = cell.clone();
+        t.set_clock(Arc::new(move || {
+            revoke.lock().unwrap().root_ok = false;
+            Now::same(2_000)
+        }));
+        let mut lane = RenewLane::new(DEFAULT_MAX_STALL_MS);
+        let out = lane.handle(at(2_000), LaneEvent::Tick { stuck_ms: 0 }, &t, &f);
+        assert!(
+            !out.contains(&LaneAction::OwnRenewed { renewed: 1 }),
+            "{out:?}"
+        );
+        assert_eq!(t.held(7).unwrap().until, HonourMs(3_500), "not extended");
     }
 }
