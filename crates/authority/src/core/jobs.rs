@@ -3385,8 +3385,12 @@ impl Core {
         self.promise_check_abandon(out);
         if !acquired {
             // Plan 43 C1-3: a tail fetched for a claim that did not happen
-            // is not carried by the next, whatever it is.
+            // is not carried by the next, whatever it is; nor is an abandon
+            // the operator made for it (the next claim's marker would record
+            // `GroupAbandoned` for a group nobody abandoned it for, and its
+            // `ttl_claims_without_tail` check would skip it).
             self.bk.fetched = None;
+            self.bk.abandoned_claim = None;
         }
         let Some(job) = self.job.take() else {
             return;

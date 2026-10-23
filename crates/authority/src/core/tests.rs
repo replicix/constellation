@@ -37682,6 +37682,85 @@ mod c1_tail_fetch {
         );
     }
 
+    /// An abandoned claim that loses its CAS is over: the next claim this
+    /// node makes, of whatever lease, says nothing of the abandoned group.
+    /// Fails on the parent: the abandon's mark outlived the claim it was
+    /// made for, and the next takeover's epoch marker recorded
+    /// `GroupAbandoned` for a group nobody abandoned it for (and the
+    /// `ttl_claims_without_tail` check skipped that claim).
+    #[test]
+    fn an_abandoned_claim_that_loses_its_cas_marks_no_later_claim() {
+        let h0 = Harness::new(3);
+        let lease = expired(&h0, vec![2]);
+        let (mut h, out) = claimant(3, &lease);
+        assert_eq!(seal_tails(&out).len(), 2);
+        let out = h.step(Event::Control {
+            op: OpId(800),
+            req: Control::AbandonGroup { epoch: 1, gen: 0 },
+        });
+        assert!(out.iter().any(|a| matches!(
+            a,
+            Action::ControlDone {
+                op: OpId(800),
+                result: Ok(_)
+            }
+        )));
+        let tail = find_s3(&out, |r| matches!(r, S3Op::SegmentRun { .. }));
+        let out = h.step(Event::S3 {
+            op: tail,
+            result: S3Result::SegmentRun(Ok(Vec::new())),
+        });
+        let out = at_head(&mut h, out);
+        let cas = find_s3(&out, |r| matches!(r, S3Op::LeaseSwap { .. }));
+        // Another claimant won the lease meanwhile.
+        h.step(Event::S3 {
+            op: cas,
+            result: S3Result::LeasePut(Err(CasFailure::Conflict)),
+        });
+        assert_eq!(h.core.stats.groups_abandoned, 1);
+        // Node 2's tenure (epoch 2, nobody backs it) runs out in its turn:
+        // a plain takeover, with no group to abandon.
+        let next = lease_of(2, 2, h.now.0 - 1);
+        h.watch(&next);
+        let acquire = h.step(Event::Control {
+            op: OpId(801),
+            req: Control::Acquire,
+        });
+        let get = find_s3(&acquire, |r| matches!(r, S3Op::LeaseGet));
+        let out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((next.clone(), tag())))),
+        });
+        assert!(seal_tails(&out).is_empty(), "no group: {out:?}");
+        let tail = find_s3(&out, |r| matches!(r, S3Op::SegmentRun { .. }));
+        let out = h.step(Event::S3 {
+            op: tail,
+            result: S3Result::SegmentRun(Ok(Vec::new())),
+        });
+        let out = at_head(&mut h, out);
+        let cas = find_s3(&out, |r| matches!(r, S3Op::LeaseSwap { .. }));
+        let out = h.step(Event::S3 {
+            op: cas,
+            result: S3Result::LeasePut(Ok(tag())),
+        });
+        let put = s3_ops(&out)
+            .into_iter()
+            .find_map(|(_, r)| match r {
+                S3Op::SegmentPut { payload, .. } => Some(payload.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no marker in {out:?}"));
+        let seg = crate::segment::decode(&put).unwrap();
+        assert!(
+            !seg.records
+                .iter()
+                .any(|r| matches!(r, LogRecord::GroupAbandoned { .. })),
+            "epoch 2's marker abandons nothing: {:?}",
+            seg.records
+        );
+        assert_eq!(h.core.stats.groups_abandoned, 1);
+    }
+
     /// The report of a wait ends when the lease moved on (a renewal, another
     /// claim: another key than the one the claim was for), and while no op of
     /// this node needs the claim. Fails on a report that outlived its claim
