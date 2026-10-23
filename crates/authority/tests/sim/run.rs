@@ -406,6 +406,18 @@ pub struct SimConfig {
     /// From its own generator, so a configuration without links replays
     /// exactly the schedules it had.
     pub link_ratio: f64,
+    /// Plan 45 §12 O2: of the ops `link_ratio` adds, this share goes
+    /// across directories: a `Link`, `Rename` or `Exchange` (a third
+    /// each) between one of the client's names and a name of another
+    /// directory of the workload (`/`, `dirs`, `link_dirs`), hence across
+    /// a delegation boundary where one is configured. 0 (`+links-local`)
+    /// keeps `+links`' schedules from before cross-directory links.
+    pub cross_links: f64,
+    /// Plan 45 §12 O2: directories under `/` created at setup only as the
+    /// far side of cross-directory links (`cross_links`): nobody's home,
+    /// never delegated. `+links` adds one to a configuration with no
+    /// `dirs`, which otherwise has the root directory alone.
+    pub link_dirs: Vec<String>,
     /// Chunk metered-own-rows: the metered upload hold, in ms
     /// (`ChunkWorld::hold_ms`; 0: none). A non-owner's write stays
     /// deferred on the sequencer while its chunk is held, across the
@@ -801,6 +813,8 @@ impl Default for SimConfig {
             join_fresh: true,
             chunk_writes: 0.0,
             link_ratio: 0.0,
+            cross_links: 0.0,
+            link_dirs: Vec::new(),
             upload_hold_ms: 0,
             dirs: Vec::new(),
             delegations: Vec::new(),
@@ -867,6 +881,9 @@ pub struct Report {
     /// that returned `Ok`.
     pub links_ok: usize,
     pub exchanges_ok: usize,
+    /// Plan 45 §12 O2: links, renames and exchanges between two
+    /// directories that returned `Ok`.
+    pub cross_dir_ok: usize,
     pub tentative: usize,
     pub segments: usize,
     pub fenced: usize,
@@ -1868,6 +1885,26 @@ fn with_writes(rng: &mut StdRng, steps: Vec<Step>, ratio: f64) -> Vec<Step> {
     out
 }
 
+/// Plan 45 §12 O2: the journal row each completed rid's `Completed`
+/// record was shipped from (`history::JournalOrder`): a segment's `rows`
+/// pair with its non-`Atime` records.
+fn journal_order(oracle: &check::Oracle) -> super::history::JournalOrder {
+    let mut out = super::history::JournalOrder::new();
+    for (rid, (seq, idx)) in &oracle.completed_at {
+        let Some(seg) = oracle.unfenced.get(seq) else {
+            continue;
+        };
+        let j = seg.records[..*idx]
+            .iter()
+            .filter(|rec| !matches!(rec, LogRecord::Atime { .. }))
+            .count();
+        if let Some(row) = seg.rows.get(j) {
+            out.insert(*rid, (seg.epoch, seg.node, *row));
+        }
+    }
+    out
+}
+
 /// Plan 45 follow-up: a rename that completed in the log without its
 /// `Rename` record found both names on one inode (a hard link, POSIX's
 /// no-op): it becomes `NsOp::Same` for the checks, which cannot tell
@@ -1914,7 +1951,21 @@ fn same_inode_renames(
 /// `ratio`, a `Link` or an `Exchange` (half each) of two distinct names
 /// of this client's plan in the op's directory. Drawn from its own
 /// generator, like `with_writes`.
-fn with_links(rng: &mut StdRng, steps: Vec<Step>, ratio: f64) -> Vec<Step> {
+///
+/// Plan 45 §12 O2: with `cross` of those, the op goes across directories
+/// instead: a `Link`, `Rename` or `Exchange` (a third each, either way
+/// round) between the op's name and `f<i>` (`i < names`, the names
+/// `gen_ops_in` gives every directory's clients) of another directory in
+/// `dirs`. `cross` 0 draws nothing more, so its schedules are the ones
+/// `+links` had before.
+fn with_links(
+    rng: &mut StdRng,
+    steps: Vec<Step>,
+    ratio: f64,
+    cross: f64,
+    dirs: &[String],
+    names: usize,
+) -> Vec<Step> {
     if ratio <= 0.0 {
         return steps;
     }
@@ -1938,6 +1989,23 @@ fn with_links(rng: &mut StdRng, steps: Vec<Step>, ratio: f64) -> Vec<Step> {
             continue;
         };
         if !rng.random_bool(ratio.min(1.0)) {
+            continue;
+        }
+        let others: Vec<&String> = dirs.iter().filter(|d| d.as_str() != dir_of(&a)).collect();
+        if cross > 0.0 && !others.is_empty() && rng.random_bool(cross.min(1.0)) {
+            let d = others.choose(rng).unwrap();
+            let i = rng.random_range(0..names.max(1));
+            let b = if d.is_empty() {
+                format!("f{i}")
+            } else {
+                format!("{d}/f{i}")
+            };
+            let (a, b) = if rng.random_bool(0.5) { (a, b) } else { (b, a) };
+            out.push(Step::Op(match rng.random_range(0..3) {
+                0 => NsOp::Link(a, b),
+                1 => NsOp::Rename(a, b),
+                _ => NsOp::Exchange(a, b),
+            }));
             continue;
         }
         let siblings: Vec<&String> = pool
@@ -3246,7 +3314,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // the lease with the first mkdir and delegates as the root).
     let markers: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let marker_stats: Arc<Mutex<(u64, u64)>> = Arc::new(Mutex::new((0, 0)));
-    if !cfg.dirs.is_empty() {
+    if !cfg.dirs.is_empty() || !cfg.link_dirs.is_empty() {
         setup_dirs(&cluster, &cfg, &failures).await;
     }
     if cfg.lock_files > 0 {
@@ -3255,6 +3323,14 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
 
     // The workload.
     let mut clients = Vec::new();
+    // Plan 45 §12 O2: every directory of the workload, the far sides of
+    // a cross-directory link.
+    let link_targets: Vec<String> = std::iter::once(String::new())
+        .chain(cfg.dirs.iter().cloned())
+        .chain(cfg.link_dirs.iter().cloned())
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect();
     for node in 1..=cfg.nodes {
         for k in 0..cfg.clients_per_node {
             // Plan 30 §M11: node 1 (the root) writes in the root
@@ -3310,7 +3386,14 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             let mut write_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0xc4a1);
             let steps = with_writes(&mut write_rng, steps, cfg.chunk_writes);
             let mut link_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0x11c4);
-            let steps = with_links(&mut link_rng, steps, cfg.link_ratio);
+            let steps = with_links(
+                &mut link_rng,
+                steps,
+                cfg.link_ratio,
+                cfg.cross_links,
+                &link_targets,
+                cfg.names,
+            );
             // Plan 30 §M14: locks from their own generator too.
             let mut lock_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0x10c5);
             let mut steps = if cfg.lock_nodes.is_empty() || cfg.lock_nodes.contains(&node) {
@@ -3922,6 +4005,11 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                     NsOp::Exchange(..) if ok.contains(rid) => report.exchanges_ok += 1,
                     _ => {}
                 }
+                if let NsOp::Link(a, b) | NsOp::Rename(a, b) | NsOp::Exchange(a, b) = op {
+                    if ok.contains(rid) && dir_of(a) != dir_of(b) {
+                        report.cross_dir_ok += 1;
+                    }
+                }
             }
         }
     }
@@ -3963,6 +4051,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // check runs on the history projected to one directory (a rename
     // across two appears in both as its halves).
     let dirs = super::history::dirs_of(&events);
+    let journal = journal_order(&oracle);
     let per_dir = !cfg.dirs.is_empty();
     let mut labels: Vec<String> = Vec::new();
     let projections: Vec<Vec<super::history::HistEvt>> = if per_dir && cfg.check_range_bits > 0 {
@@ -3994,8 +4083,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.dirs_checked = projections.len();
     let mut witness = super::history::Witness::default();
     for (i, proj) in projections.iter().enumerate() {
-        let w =
-            check_linearizable_witnessed(proj, &tentative, &oracle.completed_at).map_err(|e| {
+        let w = check_linearizable_witnessed(proj, &tentative, &oracle.completed_at, &journal)
+            .map_err(|e| {
                 lin_context(format!(
                     "[directory {}] {e}",
                     labels.get(i).cloned().unwrap_or_default()
@@ -4007,7 +4096,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.observed_tentative = witness.observed_tentative;
     // EC2 campaign 7, finding B-1: across directories and owners, the
     // log keeps every node's program order (see `history.rs`).
-    super::history::check_session_order(&events, &tentative, &oracle.completed_at)
+    super::history::check_session_order(&events, &tentative, &oracle.completed_at, &journal)
         .map_err(lin_context)?;
     if strict_durability && witness.observed_tentative > 0 {
         return Err(lin_context(format!(
@@ -4321,7 +4410,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
 /// every delegate has installed its generation.
 async fn setup_dirs(cluster: &Arc<Cluster>, cfg: &SimConfig, failures: &Arc<Mutex<Vec<String>>>) {
     let handle = cluster.get(1);
-    for d in &cfg.dirs {
+    for d in cfg.dirs.iter().chain(&cfg.link_dirs) {
         let rid = handle.next_rid();
         let op = MutateOp::Mkdir {
             parent: ROOT_INO,
@@ -4360,6 +4449,7 @@ async fn setup_dirs(cluster: &Arc<Cluster>, cfg: &SimConfig, failures: &Arc<Mute
             let n = cluster.get(id);
             cfg.dirs
                 .iter()
+                .chain(&cfg.link_dirs)
                 .all(|d| n.meta.child_ino(ROOT_INO, d).ok().flatten().is_some())
         });
         if all {

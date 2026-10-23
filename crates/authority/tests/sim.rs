@@ -32,6 +32,10 @@ use sim::store::{Fault, OpKind, Rule, When};
 /// this probability.
 const LINK_RATIO: f64 = 0.4;
 
+/// Plan 45 §12 O2: `+links`' share of those ops that go across two
+/// directories (`SimConfig::cross_links`).
+const CROSS_LINKS: f64 = 0.5;
+
 /// Seeds per CI shard; four shards run in parallel under `cargo test`.
 const CI_SEEDS_PER_SHARD: u64 = 250;
 
@@ -8997,7 +9001,22 @@ fn config_variant(cfg: SimConfig, variant: &str) -> SimConfig {
     match variant {
         // Plan 45 follow-up: hard links and exchanges in the op mix
         // (`SimConfig::link_ratio`).
+        // Plan 45 §12 O2: half of them across directories (a link, a
+        // rename or an exchange), into a directory of the configuration's
+        // own or, when it has none, one made for the purpose (`x`).
         "links" => SimConfig {
+            link_ratio: LINK_RATIO,
+            cross_links: CROSS_LINKS,
+            link_dirs: if cfg.dirs.is_empty() {
+                vec!["x".to_string()]
+            } else {
+                Vec::new()
+            },
+            ..cfg
+        },
+        // `+links` before O2: within the op's directory only. The
+        // regression seeds found under it keep their schedules.
+        "links-local" => SimConfig {
             link_ratio: LINK_RATIO,
             ..cfg
         },
@@ -12546,7 +12565,7 @@ fn hard_links_and_exchanges_converge_under_faults() {
         ("flex", flex_config),
     ];
     for (label, config) in configs {
-        let (mut links, mut exchanges) = (0, 0);
+        let (mut links, mut exchanges, mut cross) = (0, 0, 0);
         for seed in 0..12u64 {
             let r = run_seed(seed, config_variant(config(), "links")).unwrap_or_else(|e| {
                 panic!("{label}+links seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}+links")
@@ -12557,11 +12576,14 @@ fn hard_links_and_exchanges_converge_under_faults() {
             );
             links += r.links_ok;
             exchanges += r.exchanges_ok;
+            cross += r.cross_dir_ok;
         }
-        eprintln!("{label}+links: {links} links, {exchanges} exchanges");
+        eprintln!(
+            "{label}+links: {links} links, {exchanges} exchanges, {cross} across directories"
+        );
         assert!(
-            links > 0 && exchanges > 0,
-            "{label}+links: vacuous ({links}, {exchanges})"
+            links > 0 && exchanges > 0 && cross > 0,
+            "{label}+links: vacuous ({links}, {exchanges}, {cross})"
         );
     }
 }
@@ -12584,13 +12606,13 @@ fn regression_a_root_appending_over_its_own_shadow_keeps_the_log_prefix() {
         (
             "long-delegated",
             long_delegated_config,
-            "links+stalebase",
+            "links-local+stalebase",
             &[333, 416, 430, 447, 472],
         ),
         (
             "delegated-backup",
             delegated_backup_config,
-            "links+stalebase",
+            "links-local+stalebase",
             &[13],
         ),
         (
@@ -12623,7 +12645,7 @@ fn regression_a_root_appending_over_its_own_shadow_keeps_the_log_prefix() {
 /// the reply base.)
 #[test]
 fn regression_placement_hot_links_stalebase_seed_1397() {
-    let variants = "links+stalebase";
+    let variants = "links-local+stalebase";
     let cfg = variants
         .split('+')
         .fold(placement_hot_config(), config_variant);
@@ -12646,7 +12668,7 @@ fn regression_placement_hot_links_stalebase_seed_1397() {
 /// (`a_dedup_answer_without_records_is_not_installed_as_a_shadow`).
 #[test]
 fn regression_delegated_backup_links_stalebase_seed_138() {
-    let variants = "links+stalebase";
+    let variants = "links-local+stalebase";
     let cfg = variants
         .split('+')
         .fold(delegated_backup_config(), config_variant);

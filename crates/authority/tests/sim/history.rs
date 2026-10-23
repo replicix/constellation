@@ -435,6 +435,59 @@ pub fn check_linearizable(events: &[HistEvt], tentative: &HashSet<Rid>) -> Resul
     }
 }
 
+/// Plan 45 §12 O2: each completed rid's journal row, as the shipping
+/// tenure numbered it: `(epoch, node, journal seq)` (`run::journal_order`).
+pub type JournalOrder = std::collections::HashMap<Rid, (u64, u64, u64)>;
+
+/// The successes' linearization order: the log's, except that one
+/// tenure's run of rows is taken in the order it journaled them. The ship
+/// plan sends a tenure's transactions out of journal order only around
+/// one deferred or held on a pending chunk (`store::held`, plan 30
+/// §M4/§M7), and what it sends ahead touches none of the deferred keys:
+/// the two commute, and the journal order is the holder's execution
+/// order, the one its answers were given in. That is write-back's
+/// documented relaxation ("unrelated changes the same node makes
+/// afterwards can become visible first", durability-and-failover): a
+/// later op, of the same node or invoked after the deferred one
+/// returned, may precede it in the log. Within one directory every
+/// entry change also writes the directory's inode, so it takes a link or
+/// a rename into another directory to show (plan 45 §12 O2: `link f3
+/// x/f0` deferred behind `f3`'s pending write, `create f0` shipped
+/// first, `flex+links` seed 9). Rids without a journal row
+/// ([`JournalOrder`]) keep their log position and end a run.
+pub fn witness_order(
+    completed_at: &std::collections::HashMap<Rid, (u64, usize)>,
+    journal: &JournalOrder,
+) -> Vec<Rid> {
+    let mut by_log: Vec<(Rid, (u64, usize))> = completed_at.iter().map(|(r, p)| (*r, *p)).collect();
+    by_log.sort_by_key(|(_, p)| *p);
+    let mut out: Vec<Rid> = Vec::with_capacity(by_log.len());
+    let mut run: Vec<(u64, Rid)> = Vec::new();
+    let mut tenure: Option<(u64, u64)> = None;
+    let flush = |run: &mut Vec<(u64, Rid)>, out: &mut Vec<Rid>| {
+        run.sort_by_key(|(j, _)| *j);
+        out.extend(run.drain(..).map(|(_, r)| r));
+    };
+    for (rid, _) in by_log {
+        match journal.get(&rid) {
+            Some((e, n, j)) => {
+                if tenure != Some((*e, *n)) {
+                    flush(&mut run, &mut out);
+                    tenure = Some((*e, *n));
+                }
+                run.push((*j, rid));
+            }
+            None => {
+                flush(&mut run, &mut out);
+                tenure = None;
+                out.push(rid);
+            }
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
 /// Linearizability with the log as the witness. Every op that took effect
 /// has a `Completed { rid }` at one log position, and the log is the
 /// holder's execution order, so the successes' linearization order is
@@ -446,7 +499,7 @@ pub fn check_linearizable(events: &[HistEvt], tentative: &HashSet<Rid>) -> Resul
 /// tester never finishes). Checks:
 /// 1. real time: a success that returned before another was invoked
 ///    precedes it in the log (tentative ops only need to follow what
-///    returned before their invocation);
+///    returned before their invocation), in [`witness_order`];
 /// 2. values: running the spec in log order gives every non-tentative
 ///    success `Ok`;
 /// 3. refusals: an op refused with `ret` (and absent from the log) has a
@@ -463,6 +516,7 @@ pub fn check_linearizable_witnessed(
     events: &[HistEvt],
     tentative: &HashSet<Rid>,
     completed_at: &std::collections::HashMap<Rid, (u64, usize)>,
+    journal: &JournalOrder,
 ) -> Result<Witness, String> {
     use std::collections::HashMap;
     let mut invoke_at: HashMap<Rid, (usize, NsOp)> = HashMap::new();
@@ -477,16 +531,15 @@ pub fn check_linearizable_witnessed(
             }
         }
     }
-    // The successes in log order.
-    let mut successes: Vec<(Rid, (u64, usize))> = invoke_at
-        .keys()
-        .filter_map(|rid| completed_at.get(rid).map(|p| (*rid, *p)))
+    // The successes in log order (a tenure's run in journal order).
+    let successes: Vec<Rid> = witness_order(completed_at, journal)
+        .into_iter()
+        .filter(|rid| invoke_at.contains_key(rid))
         .collect();
-    successes.sort_by_key(|(_, p)| *p);
     let index_of: HashMap<Rid, usize> = successes
         .iter()
         .enumerate()
-        .map(|(i, (rid, _))| (*rid, i))
+        .map(|(i, rid)| (*rid, i))
         .collect();
     // 1. Real-time order among successes.
     for (a, ia) in &index_of {
@@ -508,7 +561,7 @@ pub fn check_linearizable_witnessed(
     // 2. Values along the log order; the spec states after each success.
     let mut spec = NsSpec::default();
     let mut states: Vec<NsSpec> = vec![spec.clone()];
-    for (rid, _) in &successes {
+    for rid in &successes {
         let (_, op) = &invoke_at[rid];
         let ret = spec.invoke(op);
         if ret != NsRet::Ok && !tentative.contains(rid) {
@@ -626,11 +679,13 @@ pub struct Witness {
 /// names). `check_linearizable_witnessed` checks real time within a
 /// directory only (different owners order their keys independently);
 /// this is the cross-directory rule that still holds: one node's own
-/// order. Tentative ops (rolled back, replayed by rid) are exempt.
+/// order. Tentative ops (rolled back, replayed by rid) are exempt. The
+/// order is [`witness_order`]'s: a tenure's rows as it journaled them.
 pub fn check_session_order(
     events: &[HistEvt],
     tentative: &HashSet<Rid>,
     completed_at: &std::collections::HashMap<Rid, (u64, usize)>,
+    journal: &JournalOrder,
 ) -> Result<(), String> {
     use std::collections::HashMap;
     let mut invoke_at: HashMap<Rid, usize> = HashMap::new();
@@ -646,10 +701,15 @@ pub fn check_session_order(
         }
     }
     // Per session (node incarnation), its non-tentative successes:
-    // (return index, invoke index, log position, rid).
+    // (return index, invoke index, witness position, rid).
     type Op = (usize, usize, (u64, usize), Rid);
+    let order: HashMap<Rid, (u64, usize)> = witness_order(completed_at, journal)
+        .into_iter()
+        .enumerate()
+        .map(|(i, rid)| (rid, (i as u64, 0)))
+        .collect();
     let mut sessions: HashMap<(u64, u32), Vec<Op>> = HashMap::new();
-    for (rid, pos) in completed_at {
+    for (rid, pos) in &order {
         if tentative.contains(rid) {
             continue;
         }
@@ -731,12 +791,12 @@ mod tests {
         ];
         let none = HashSet::new();
         let in_order = [(rid(1), (1, 0)), (rid(2), (1, 1))].into_iter().collect();
-        assert!(check_session_order(&events, &none, &in_order).is_ok());
+        assert!(check_session_order(&events, &none, &in_order, &JournalOrder::new()).is_ok());
         let reversed = [(rid(1), (2, 0)), (rid(2), (1, 0))].into_iter().collect();
-        let err = check_session_order(&events, &none, &reversed).unwrap_err();
+        let err = check_session_order(&events, &none, &reversed, &JournalOrder::new()).unwrap_err();
         assert!(err.contains("program order"), "{err}");
         let tentative: HashSet<Rid> = [rid(1)].into_iter().collect();
-        assert!(check_session_order(&events, &tentative, &reversed).is_ok());
+        assert!(check_session_order(&events, &tentative, &reversed, &JournalOrder::new()).is_ok());
         // Two ops in flight together are unordered.
         let overlapping = vec![
             events[0].clone(),
@@ -744,7 +804,27 @@ mod tests {
             events[1].clone(),
             events[3].clone(),
         ];
-        assert!(check_session_order(&overlapping, &none, &reversed).is_ok());
+        assert!(check_session_order(&overlapping, &none, &reversed, &JournalOrder::new()).is_ok());
+        // Plan 45 §12 O2: one tenure journaled rid 1 first and shipped
+        // rid 2 ahead of it (rid 1 deferred on a pending chunk): the
+        // write-back relaxation, in both checks. Journaled the other way
+        // round, the log broke the order.
+        let deferred: JournalOrder = [(rid(1), (1, 1, 5)), (rid(2), (1, 1, 6))]
+            .into_iter()
+            .collect();
+        assert!(check_session_order(&events, &none, &reversed, &deferred).is_ok());
+        assert!(check_linearizable_witnessed(&events, &none, &reversed, &deferred).is_ok());
+        let journaled_reversed: JournalOrder = [(rid(1), (1, 1, 6)), (rid(2), (1, 1, 5))]
+            .into_iter()
+            .collect();
+        assert!(check_session_order(&events, &none, &reversed, &journaled_reversed).is_err());
+        assert!(
+            check_linearizable_witnessed(&events, &none, &reversed, &journaled_reversed).is_err()
+        );
+        let other_tenure: JournalOrder = [(rid(1), (1, 1, 5)), (rid(2), (2, 2, 6))]
+            .into_iter()
+            .collect();
+        assert!(check_session_order(&events, &none, &reversed, &other_tenure).is_err());
     }
 
     #[test]
@@ -779,9 +859,21 @@ mod tests {
         // The witnessed check agrees: both in the log is a double create;
         // only the second in the log (the first dropped) is fine.
         let both = [(rid(1), (1, 0)), (rid(2), (2, 0))].into_iter().collect();
-        assert!(check_linearizable_witnessed(&events, &HashSet::new(), &both).is_err());
+        assert!(check_linearizable_witnessed(
+            &events,
+            &HashSet::new(),
+            &both,
+            &JournalOrder::new()
+        )
+        .is_err());
         let second_only = [(rid(2), (2, 0))].into_iter().collect();
-        assert!(check_linearizable_witnessed(&events, &tentative, &second_only).is_ok());
+        assert!(check_linearizable_witnessed(
+            &events,
+            &tentative,
+            &second_only,
+            &JournalOrder::new()
+        )
+        .is_ok());
     }
 
     /// `locks-faults` seed 195356's shape (the L2 window seen by a third
@@ -815,7 +907,8 @@ mod tests {
         ];
         let tentative: HashSet<Rid> = [rid(1)].into_iter().collect();
         let log = [(rid(3), (2, 0)), (rid(1), (3, 0))].into_iter().collect();
-        let w = check_linearizable_witnessed(&events, &tentative, &log).expect("witnessed");
+        let w = check_linearizable_witnessed(&events, &tentative, &log, &JournalOrder::new())
+            .expect("witnessed");
         assert_eq!(w.observed_tentative, 1);
         assert!(w.observers.contains(&rid(2)));
         assert!(check_linearizable(&events, &tentative).is_err());
@@ -862,7 +955,10 @@ mod tests {
             },
         ];
         let log = [(rid(1), (1, 0))].into_iter().collect();
-        assert!(check_linearizable_witnessed(&events, &HashSet::new(), &log).is_ok());
+        assert!(
+            check_linearizable_witnessed(&events, &HashSet::new(), &log, &JournalOrder::new())
+                .is_ok()
+        );
         // A refusal that no state in its window explains.
         let mut bad = events.clone();
         bad[4] = HistEvt::Return {
@@ -870,7 +966,10 @@ mod tests {
             rid: rid(2),
             ret: NsRet::Enoent,
         };
-        assert!(check_linearizable_witnessed(&bad, &HashSet::new(), &log).is_err());
+        assert!(
+            check_linearizable_witnessed(&bad, &HashSet::new(), &log, &JournalOrder::new())
+                .is_err()
+        );
         // A tentative success whose original `Ok` came before t2's
         // invocation but whose replay landed late does not bound t2's
         // window: t2's `Eexist` needs a state with `a` present, and the
@@ -892,6 +991,8 @@ mod tests {
         let mut events2 = with_a;
         events2.extend(events.clone());
         let log2 = [(rid(9), (1, 0)), (rid(1), (5, 0))].into_iter().collect();
-        assert!(check_linearizable_witnessed(&events2, &tentative, &log2).is_ok());
+        assert!(
+            check_linearizable_witnessed(&events2, &tentative, &log2, &JournalOrder::new()).is_ok()
+        );
     }
 }

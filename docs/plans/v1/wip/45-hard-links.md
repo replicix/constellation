@@ -585,6 +585,27 @@ purpose", "Gates"), with these rows:
   directory-blind, but no sweep exercises a cross-directory link, rename or
   exchange of a hard-linked inode, nor one across a delegation boundary.
 
+  **Closed (2026-10-23).** Half of the ops `+links` adds now go across
+  directories (`SimConfig::cross_links`): a link, rename or exchange, either
+  way round, between the client's name and `f<i>` of another directory of
+  the workload (`/`, `dirs`, and for a configuration without `dirs` a
+  directory `x` made for it, `link_dirs`). In the delegated configurations
+  that crosses delegation boundaries (`d1`, `d2` and `/` have three
+  owners). `+links-local` is the old variant; the regression seeds found
+  under it keep it. The sweep (33 configurations, 500 or 1,000 seeds) found
+  one failure, a checker gap: the witnessed and session-order checks took
+  the log's order as the linearization, but the ship plan sends a tenure's
+  rows out of journal order around a row deferred on a pending chunk
+  (`store::held`, plan 30 §M4/§M7), which write-back documents ("unrelated
+  changes the same node makes afterwards can become visible first",
+  durability-and-failover). Within one directory every entry change writes
+  the directory's inode, so nothing had shown it; `flex+links` seed 9's
+  `link f3 x/f0` waited behind `f3`'s pending write and the same client's
+  next `create f0` shipped first. The checks now take a tenure's run of
+  rows in journal order (`history::witness_order`, from the segments'
+  `rows`), the holder's execution order. No product bug; the `+links`
+  sweep is green.
+
 Closed in the same review: the holder's reply base now counts the
 multi-name inodes an op takes a name from (`Core::reply_base`,
 `Replica::linked_victims`), and an `Exists` hint is refused when live
