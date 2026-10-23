@@ -1618,3 +1618,59 @@ claim, not from the sealed holder).
 [plan 43](../plans/v1/wip/43-commit-rule.md) (Appendix B, the clock
 inventory), `crates/types/src/clock.rs`, `crates/authority/src/core/lease.rs`,
 `crates/store-s3/src/heartbeat.rs`, `crates/meta/src/locks.rs`.
+
+## ADR-36: A dentry copies its inode's attributes only while the inode has one name
+
+**Context**: plan 28 §P6 gave every dentry (`0x02`) a copy of its inode's
+attributes, so that a listing with attributes is one range scan, and plan 29
+M3c kept the copies exact: every write of the inode record (`0x01`) rewrote
+the copy under each of the inode's names in the same transaction. §P6 priced
+that on "`nlink` is 1 for all but a rounding error of files". For an inode
+with *n* names every `link`, `unlink`, `rename`, `chmod`, `utimes`, truncate
+and write commit rewrote *n* keys, and building *n* links was O(n²): 7.4 ms
+per `link()` at 2,000 names through the mount, one `stress-ng link` bogo-op
+38.7 s and 773 MB of journal. The shape is real (pnpm's content store,
+`cp -al` backup trees, dedup tools).
+
+**Decision**: a dentry carries the copy only while its inode is a directory
+or has exactly one name (`T = 1`). A non-directory with two or more names has
+*remote* dentries, `ino` and `kind` (9 bytes), told apart from a full one
+(57 bytes) by length; there is no primary name and no election. The form is
+one function of the inode record, `DentryRecord::for_inode`, used by every
+writer, local and replay, in the transaction that writes the record: a
+1 → 2 transition rewrites the first name as remote, 2 → 1 writes the
+survivor's copy, and at two names or more an inode record write touches no
+dentry. A lookup or a `READDIRPLUS` entry of a remote name reads the inode
+record (one point read); `MetaStore::lookup` keeps returning the attributes.
+`fsck` reports a dentry of the wrong form (`dentry_form`); a repair is a
+rebuild from the log.
+
+**Consequences**: `link`, `unlink`, `rename` and every attribute or manifest
+commit on an inode with *n* names cost O(1) keys, measured flat in *n* (0.86
+to 0.92 times the single-name cost at 2,000 names). A listing of single-name
+entries is byte for byte what it was, with no extra read; a listing with
+attributes of hard-linked names pays one inode read per such entry (what
+btrfs, ZFS, CephFS and Lustre pay for every entry), and `du` reads each
+inode once. Two replicas with the same namespace hold the same dentry bytes
+and root hash: `nlink` is in the namespace and the form is derived from the
+result of its delta in the same transaction (plan 30 §M12's commutativity).
+A state directory written before the change holds full dentries on
+hard-linked inodes and is rebuilt (no compatibility shim).
+
+**Rejected**: no copy at all (plan 28 §14.10's `nocopy`: every listing a
+scan plus a point read per entry, 12,039 pack reads for a cold `ls -la` of
+1,000 entries against 30); attributes in the dentry alone (`dentry-auth`:
+doubles `getattr`); a copy for the first *K* names, a primary dentry, a copy
+without `nlink`/`ctime`, or a threshold `T = 4` (each keeps an O(K) or
+election path in `link`, `unlink`, `rename` and replay for a listing win on
+a handful of names).
+
+**Status**: decided by the maintainer 2026-10-22 (plan 45 §9, Q1–Q5, Q7);
+built (plan 45 H1–H3).
+
+**See**: [plan 45](../plans/v1/wip/45-hard-links.md) §4 and
+[§9](../plans/v1/wip/45-hard-links.md#9-decided-by-the-maintainer-2026-10-22);
+plan 28 [§P6](../plans/v1/done/28-s3-native-metadata-store.md#p6--key-encoding-the-most-load-bearing-table-in-this-plan);
+`crates/mtree/src/record.rs` (`DentryRecord::for_inode`),
+`crates/meta/src/store/ns.rs` (`put_inode_record`),
+`crates/engine/src/mtree_read.rs` (`check_dentry_forms`). Amends plan 28 §P6.

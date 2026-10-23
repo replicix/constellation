@@ -634,7 +634,15 @@ matter here:
 - `ns`: the replicated namespace, in plan 28's key encoding (inodes,
   dentries, spilled xattrs, reverse links, and subsystem rows such as the
   delegation table and the quota). Its key set is exactly what a published
-  commit holds.
+  commit holds. A dentry carries a copy of its inode's attributes, so a
+  listing with attributes is one range scan, while the inode is a directory
+  or has one name; a non-directory with two or more names has *remote*
+  dentries (`ino` and `kind`) and its attributes are read from the inode
+  record. The form is a function of the inode's `kind` and `nlink`, written
+  in the transaction that writes the inode record, so every replica holds
+  the same bytes and a `link`, `unlink` or attribute change costs the same
+  at any number of names
+  ([ADR-36](DECISIONS.md#adr-36-a-dentry-copies-its-inodes-attributes-only-while-the-inode-has-one-name)).
 - `journal` and `journal_tx`: the local operations not yet in the log,
   with one row per transaction (where it ends, its op and rid, its epoch).
 - `spec`, `spec_live`, `pending_replay`: the speculation log (below).
