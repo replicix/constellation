@@ -522,6 +522,25 @@ impl AckEntry {
     }
 }
 
+/// Plan 43 C1-3, the C1-2/C1-3 review: the rids whose rollback the strict
+/// durability check excuses — those the oracle itself judged answered as a
+/// lone node's ([`committed_at_answer`]: no stronger class held, the
+/// answerer's group was itself by the lease object it saw, no peer within
+/// its budget), every judged answer of the rid. What the core *claims* is
+/// not consulted: a core that wrongly claims `Lone` (the class-claim check
+/// judges that claim) must not also hide the loss of a committed op.
+pub fn lone_answered(acks: &[AckEntry]) -> HashSet<Rid> {
+    let mut lone: BTreeMap<Rid, bool> = BTreeMap::new();
+    for a in acks.iter().filter(|a| !a.is_relay()) {
+        let Some(j) = &a.judged else { continue };
+        *lone.entry(a.rid).or_insert(true) &= j.class == Some(AckClass::Lone);
+    }
+    lone.into_iter()
+        .filter(|(_, l)| *l)
+        .map(|(r, _)| r)
+        .collect()
+}
+
 /// The transaction in `txs` carrying `rid`'s outcome as `want`.
 fn find_tx(txs: &[BackupTx], rid: Rid, want: Option<Code>) -> Option<&BackupTx> {
     txs.iter().find(|t| carries_as(&t.records, rid, want))
@@ -1679,6 +1698,52 @@ mod tests {
             judged: None,
             ..ack(node, r, tick, kind, false)
         }
+    }
+
+    /// The strict durability check excuses the rollback of an answer the
+    /// oracle judged `Lone`, not of one the core claimed `Lone`: a core
+    /// that claims `Lone` for a committed answer would hide its loss.
+    /// Fails on the parent (the claim decided it).
+    #[test]
+    fn only_a_rid_judged_lone_is_excused() {
+        let judged = |class: Option<AckClass>| Judgement {
+            class,
+            expected: Expected::Class(AckClass::RootGroup),
+            tx: None,
+            detail: String::new(),
+            mismatch: None,
+        };
+        let (a, b, c, d) = (rid(1, 1), rid(1, 2), rid(1, 3), rid(1, 4));
+        let acks = vec![
+            // Claimed and judged `Lone`: excused.
+            AckEntry {
+                claimed: Some(AckClass::Lone),
+                ..ack(1, a, 1, OutcomeKind::Ok, false)
+            },
+            // Claimed `Lone`, judged a group's: not excused.
+            AckEntry {
+                claimed: Some(AckClass::Lone),
+                judged: Some(judged(Some(AckClass::RootGroup))),
+                ..ack(1, b, 2, OutcomeKind::Ok, false)
+            },
+            // Claimed `Lone`, no class held: not excused.
+            AckEntry {
+                claimed: Some(AckClass::Lone),
+                judged: Some(judged(None)),
+                ..ack(1, c, 3, OutcomeKind::Ok, false)
+            },
+            // Judged `Lone` once, a group's at a second answer: not excused.
+            AckEntry {
+                claimed: Some(AckClass::Lone),
+                ..ack(1, d, 4, OutcomeKind::Ok, false)
+            },
+            AckEntry {
+                claimed: Some(AckClass::Lone),
+                judged: Some(judged(Some(AckClass::RootGroup))),
+                ..ack(1, d, 5, OutcomeKind::Ok, false)
+            },
+        ];
+        assert_eq!(lone_answered(&acks), HashSet::from([a]));
     }
 
     #[test]

@@ -3971,9 +3971,13 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // acknowledgement a lone node gave its own node's client (`Lone`: its
     // group is itself, no peer within the RTT budget) may be rolled back by a
     // deposition (plan 43 §5.7, C5 documents the lone branch); every other
-    // class is a commit. The core's claim is what is excused, and the I1
-    // oracle judges that claim separately.
-    let lone_answered: HashSet<Rid> = oracles
+    // class is a commit. What is excused is what the oracle judged `Lone`
+    // from the lease and links it observed at the answer, not the core's
+    // claim (the class-claim check judges that).
+    let lone_answered = super::oracle::lone_answered(&oracles.acks.lock().unwrap());
+    // A sweep greps this (`SWEEP-LONE-JUDGE`): the rolled-back rids whose
+    // excuse the core's `Lone` claim and the oracle's judgement disagree on.
+    let lone_claimed: HashSet<Rid> = oracles
         .acks
         .lock()
         .unwrap()
@@ -3983,6 +3987,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         })
         .map(|a| a.rid)
         .collect();
+    let mut lone_disagree: Vec<String> = Vec::new();
     let mut tentative: HashSet<Rid> = abandoned.lock().unwrap().clone();
     let acked: HashSet<Rid> = history.returned().into_iter().map(|(rid, _)| rid).collect();
     let mut rolled_back_acked = 0usize;
@@ -3994,6 +3999,13 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             }
             if !strict_durability || lone_answered.contains(rid) {
                 tentative.insert(*rid);
+            }
+            if strict_durability && lone_claimed.contains(rid) != lone_answered.contains(rid) {
+                lone_disagree.push(format!(
+                    "node {id} rid {rid:?} claimed-lone {} judged-lone {}",
+                    lone_claimed.contains(rid),
+                    lone_answered.contains(rid)
+                ));
             }
         }
         report.stats.insert(id, n.view().stats);
@@ -4027,6 +4039,10 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.max_backups = report.max_backups.max(load(&n.shared.max_backups) as usize);
         report.rebuilds.0 += load(&n.shared.rebuilds_ok);
         report.rebuilds.1 += load(&n.shared.rebuilds_failed);
+    }
+    if !lone_disagree.is_empty() {
+        lone_disagree.sort();
+        eprintln!("SWEEP-LONE-JUDGE seed {seed}: {}", lone_disagree.join("; "));
     }
     report.acked_rolled_back = rolled_back_acked;
     if cfg.keeps_backups {
