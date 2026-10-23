@@ -1401,14 +1401,19 @@ fn releasedir_returns_within_10ms_during_a_cold_scan_and_a_full_cache() {
     let small: Vec<Ino> = (0..200)
         .map(|i| fx.dir(&format!("s{i}"), &names(50)))
         .collect();
-    let streams: Vec<(Ino, Fh)> = small
-        .iter()
-        .map(|d| (*d, opendir_of(&fx.view, &fx.caller, *d)))
-        .collect();
-    for (d, fh) in &streams {
-        let page = page_fh(&fx.view, &fx.caller, *d, *fh, 0, 100).unwrap();
-        assert!(page.len() > 2);
-    }
+    // Open streams with a page served on each: what a release frees.
+    let open = || -> Vec<(Ino, Fh)> {
+        small
+            .iter()
+            .map(|d| {
+                let fh = opendir_of(&fx.view, &fx.caller, *d);
+                let page = page_fh(&fx.view, &fx.caller, *d, fh, 0, 100).unwrap();
+                assert!(page.len() > 2);
+                (*d, fh)
+            })
+            .collect()
+    };
+    let mut streams = open();
     // Fill the hint cache to its cap.
     for i in 0..30 {
         let d = fx.dir(&format!("f{i}"), &names(3000));
@@ -1440,18 +1445,14 @@ fn releasedir_returns_within_10ms_during_a_cold_scan_and_a_full_cache() {
                 releasedir_of(&fx.view, &fx.caller, *d, *fh);
                 slowest = slowest.max(t.elapsed());
             }
+            assert_eq!(fx.listing.stats().open_streams, 0, "every release freed");
             worst = worst.min(slowest);
             if slowest < std::time::Duration::from_millis(10) {
                 break;
             }
-            // Open them again for the next try.
-            let again: Vec<Fh> = small
-                .iter()
-                .map(|d| opendir_of(&fx.view, &fx.caller, *d))
-                .collect();
-            for ((d, _), fh) in streams.iter().zip(again) {
-                releasedir_of(&fx.view, &fx.caller, *d, fh);
-            }
+            // Open them again, each with a page, for the next try: a
+            // release of ids already released would measure nothing.
+            streams = open();
         }
         stop.store(true, Ordering::Relaxed);
         assert!(scan.join().unwrap() >= 1);
