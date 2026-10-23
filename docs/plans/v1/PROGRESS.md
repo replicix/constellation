@@ -59508,3 +59508,14 @@ counted and an entry invalidation of the name must block behind the page
 rather than be skipped. It fails with `took` after the write and with `listed`
 after the write, every run, and passes as landed. `MockVfs`'s `readdir` now
 takes `Script::DeferWith` (the test's gated page).
+
+### Plan 40 P6 review: `.` and `..` of a plus page are name-only whatever the view hands
+
+The kernel skips a plus page's `.` and `..` without taking a lookup and never
+forgets them (`fuse_direntplus_link`), so a node id on one is a count no
+`FORGET` balances: the inode is held for good. The views hand both name-only
+(`DirSink::add`), but `DirPlusReply` relied on that while P6's message said it
+checked; it now makes them name-only by name, as it does node id 1.
+`dot_entries_of_a_plus_page_are_name_only` (a view handing both with
+attributes) fails before (node ids 5 and 80, a reference each) and passes
+after.

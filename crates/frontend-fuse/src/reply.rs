@@ -1217,8 +1217,13 @@ impl DirSink for DirPlusReply {
         entry: Option<&Entry>,
     ) -> bool {
         // The root's node id is refused by the kernel (`-EIO`, and a
-        // forget of it); no view lists it as a child. Defence in depth.
-        let usable = |e: &&Entry| e.attr.ino != ROOT_INO && e.attr.ino != 0;
+        // forget of it); no view lists it as a child. `.` and `..` with a
+        // node id are skipped without a lookup and never forgotten
+        // (`fuse_direntplus_link`), so counting one would hold the inode
+        // for good; views hand them name-only (`DirSink::add_entry`).
+        // Defence in depth, both.
+        let dots = name == b"." || name == b"..";
+        let usable = |e: &&Entry| !dots && e.attr.ino != ROOT_INO && e.attr.ino != 0;
         let Some(e) = entry.filter(usable) else {
             return self.add_name_only(ino, next, kind, name);
         };

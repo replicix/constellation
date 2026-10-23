@@ -3985,6 +3985,34 @@ fn an_entry_the_buffer_refused_is_neither_counted_nor_marked() {
     k.finish();
 }
 
+/// K4: the kernel skips a plus page's `.` and `..` without taking a lookup
+/// and never forgets them, so they go name-only even when a view hands
+/// them with attributes: a count for one would hold its inode for good.
+#[test]
+fn dot_entries_of_a_plus_page_are_name_only() {
+    let PlusSession {
+        mut k, mock, refs, ..
+    } = plus_session();
+    mock.always_readdir(Script::ok(vec![
+        plus_dirent(5, 1, FileKind::Dir, "."),
+        plus_dirent(80, 2, FileKind::Dir, ".."),
+        plus_dirent(81, 3, FileKind::File, "f"),
+    ]));
+    let recs = parse_plus(k.call(READDIRPLUS, 5, &plus_body(0, 4096)).ok());
+    assert_eq!(
+        recs.iter()
+            .map(|r| (r.nodeid, r.d_ino, r.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(0, 5, "."), (0, 80, ".."), (81, 81, "f")]
+    );
+    assert!(recs[..2].iter().all(|r| r.attr.is_none()));
+    assert_eq!(
+        (refs.count(5), refs.count(80), refs.count(81), refs.len()),
+        (0, 0, 1, 1)
+    );
+    k.finish();
+}
+
 /// `setsockopt(SOL_SOCKET, opt, v)` on `s`.
 fn set_sockopt(s: &UnixDatagram, opt: libc::c_int, v: libc::c_int) {
     use std::os::fd::AsRawFd;
