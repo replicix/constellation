@@ -399,6 +399,10 @@ pub trait Replica {
     /// Plan 30 §M14: the lock tables (grants made, grants held, local
     /// locks), shared with the FUSE threads.
     fn locks(&self) -> &constellation_meta::locks::LockTables;
+    /// Whether any delegation is live in this replica's table (one atomic
+    /// read: `Meta::delegations_any`; a `Delegate` record flips it inside the
+    /// store write that applies it). The lock lane re-checks it live.
+    fn delegations_any(&self) -> bool;
     /// Plan 30 §M14: whether `ino` is `dir` or below it (its primary
     /// link's ancestors), for a subtree grace.
     fn is_under(&self, ino: Ino, dir: Ino) -> bool;
@@ -1172,6 +1176,10 @@ impl Replica for Meta {
 
     fn locks(&self) -> &constellation_meta::locks::LockTables {
         Meta::locks(self)
+    }
+
+    fn delegations_any(&self) -> bool {
+        Meta::delegations_any(self)
     }
 
     fn is_under(&self, ino: Ino, dir: Ino) -> bool {

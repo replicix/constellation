@@ -36330,3 +36330,160 @@ mod deleg_windows_tests {
         assert_eq!(h.core.stats.deleg_off_core_answers_applied, 1);
     }
 }
+
+/// Plan 41 L2: the certificate the core publishes for the lock lane
+/// (`Core::lock_lane_view`, at the end of every step) and the events the
+/// lane reports to the core.
+mod lock_lane_core_tests {
+    use super::*;
+    use constellation_meta::locks::{GrantId, LockMode};
+
+    fn roster(h: &mut Harness) {
+        h.step(Event::Roster {
+            write_eligible: vec![1, 2],
+        });
+    }
+
+    fn view(h: &Harness) -> crate::lane::LockLaneView {
+        h.core.lane_cell().view()
+    }
+
+    fn root() -> Harness {
+        let mut h = Harness::new(1);
+        h.core.cfg.locks = true;
+        h.hold(1, None);
+        roster(&mut h);
+        h
+    }
+
+    #[test]
+    fn a_usable_root_publishes_its_certificate_after_every_step() {
+        let h = root();
+        let v = view(&h);
+        assert!(v.root_ok, "{v:?}");
+        let margin = h.core.cfg.expiry_margin_ms as i64;
+        assert_eq!(v.me, 1);
+        assert_eq!(
+            v.cap_until,
+            HonourMs(h.honour().0 + 10_000 - margin),
+            "the lease's usable end"
+        );
+        assert!(!v.fast && v.marked, "a Local, marked tenure");
+        assert_eq!(v.lock_ttl_ms, h.core.lock_ttl_ms());
+        assert_eq!(v.window_ms, h.core.cfg.backup_takeover_ms as i64);
+        // Not a root: nothing to stand on.
+        let mut h = Harness::new(2);
+        h.core.cfg.locks = true;
+        h.core.lease.cached_holder = Some(1);
+        roster(&mut h);
+        let v = view(&h);
+        assert!(!v.root_ok);
+        assert_eq!(v.owner, 1, "where the renewals of held grants go");
+    }
+
+    /// Each state whose core rule differs from "extend a live record up to
+    /// the lease cap" withdraws the certificate in the step that enters it,
+    /// before that step's actions are dispatched.
+    #[test]
+    fn each_excluded_state_withdraws_the_certificate_in_its_own_step() {
+        let flip = |name: &str, on: &dyn Fn(&mut Harness), off: &dyn Fn(&mut Harness)| {
+            let mut h = root();
+            assert!(view(&h).root_ok);
+            on(&mut h);
+            roster(&mut h);
+            assert!(!view(&h).root_ok, "{name}: still published");
+            off(&mut h);
+            roster(&mut h);
+            assert!(view(&h).root_ok, "{name}: never restored");
+        };
+        flip(
+            "a release in flight",
+            &|h| h.core.lease.releasing = true,
+            &|h| h.core.lease.releasing = false,
+        );
+        flip("a lost lease", &|h| h.core.lease.lost = true, &|h| {
+            h.core.lease.lost = false
+        });
+        flip(
+            "a continuation epoch",
+            &|h| h.core.dl.epoch_active = true,
+            &|h| h.core.dl.epoch_active = false,
+        );
+        flip("locks off", &|h| h.core.cfg.locks = false, &|h| {
+            h.core.cfg.locks = true
+        });
+        // The release that is issued unmarked, a delegation (this node
+        // roots one: its table is not the whole truth of the subtree).
+        let h = root_with_delegate_backed_by(4);
+        let mut h = h;
+        h.core.cfg.locks = true;
+        roster(&mut h);
+        assert!(!view(&h).root_ok, "a root with a live delegation");
+    }
+
+    #[test]
+    fn a_fast_tenure_publishes_what_its_freshness_rests_on() {
+        let mut h = root();
+        // A listed backup: the tenure may be taken over before its lease
+        // expires; its freshness is the core's last proof of liveness.
+        let mut lease = h.core.lease.held.clone().unwrap();
+        lease.0.backups = vec![2];
+        lease.0.ack_policy = constellation_store_s3::AckPolicy::Backup;
+        h.core.lease.held = Some(lease);
+        roster(&mut h);
+        let v = view(&h);
+        assert!(v.fast && v.root_ok, "{v:?}");
+        assert_eq!(v.last_fresh, h.core.last_s3_fresh());
+        // Stale: the lane's own rule refuses (nothing to renew from).
+        assert!(!v.own_ok(HonourMs(h.core.last_s3_fresh().0 + v.window_ms)));
+        assert!(v.own_ok(HonourMs(h.core.last_s3_fresh().0 + v.window_ms - 1)));
+    }
+
+    #[test]
+    fn the_lane_own_event_is_bookkeeping_and_never_a_decision() {
+        let mut h = root();
+        let before = h.core.stats.lock_lane_own;
+        h.step(Event::LaneOwn { renewed: 3 });
+        assert_eq!(h.core.stats.lock_lane_own, before + 3);
+    }
+
+    #[test]
+    fn the_core_applies_what_the_lane_reported_as_its_own_renewal_would() {
+        // A node holding a grant from node 3, renewed by the lane (the `Ok`
+        // already applied there); the answer's other results are the core's.
+        let mut h = Harness::new(1);
+        h.core.cfg.locks = true;
+        h.core.lease.cached_holder = Some(3);
+        let id = GrantId { node: 3, seq: 1 };
+        let held = constellation_meta::locks::HeldGrant {
+            id,
+            mode: LockMode::Exclusive,
+            until: hm(h.now.plus(5_000)),
+            renew_at: hm(h.now.plus(2_000)),
+            owner: 3,
+            recalled: false,
+            position: constellation_meta::Position::ZERO,
+            renewing: Some(hm(h.now)),
+            releasing: false,
+            first_use: false,
+            idle_since: None,
+            installed: hm(h.now),
+            lapsing: None,
+            written: false,
+            route: Some(3),
+        };
+        h.meta.locks().install_held(7, held);
+        let sent = hm(h.now);
+        h.advance(100);
+        h.step(Event::LaneRenewed {
+            from: 3,
+            sent,
+            results: vec![(7, id, crate::LockRenewResult::NotOwner { owner: 0 })],
+        });
+        assert_eq!(h.core.stats.lock_lane_results, 1);
+        // The core's `NotOwner { 0 }` path ran: the owner it had cached for a
+        // root that named no other one is forgotten, and the grant is due.
+        assert_eq!(h.core.lease.cached_holder, None);
+        assert_eq!(h.meta.locks().held(7).unwrap().renewing, None);
+    }
+}

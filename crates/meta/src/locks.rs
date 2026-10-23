@@ -3081,7 +3081,21 @@ impl LockTables {
     /// stood for is lost or still stuck behind a stalled core, and the lane
     /// asks again — and a lapsing grant is never returned (a late renewal
     /// is an *add*, the core's).
-    pub fn due_renewals_lane(&self, now: Now, stale_ms: i64) -> Vec<(u64, HeldGrant)> {
+    ///
+    /// `core_stuck`: the authority core is stuck inside a step. A mark that
+    /// is not the lane's own (`lane_marked`) was then set by that step,
+    /// which began renewing the grant and cannot finish (a lone node's own
+    /// grant is marked by the core's renewal tick a moment before its
+    /// commit stalls): it stands for nothing the lane should wait on, and
+    /// the lane renews at once. A renewal done twice is harmless, every
+    /// extension being a max; one waited for `stale_ms` is the lapse.
+    pub fn due_renewals_lane(
+        &self,
+        now: Now,
+        stale_ms: i64,
+        core_stuck: bool,
+        lane_marked: impl Fn(u64, GrantId) -> bool,
+    ) -> Vec<(u64, HeldGrant)> {
         let now = now.honour;
         let budget = self.first_use_budget_ms();
         let mut g = self.lock();
@@ -3089,7 +3103,8 @@ impl LockTables {
         let Inner { held, local, .. } = &mut *g;
         for (ino, h) in held.iter_mut() {
             let pinned = local.get(ino).is_some_and(|v| !v.is_empty());
-            let marked = h.renewing.is_some_and(|t| now.since(t) < stale_ms);
+            let marked = h.renewing.is_some_and(|t| now.since(t) < stale_ms)
+                && !(core_stuck && !lane_marked(*ino, h.id));
             if h.until > now
                 && now >= h.renew_at
                 && !marked
@@ -6992,19 +7007,59 @@ mod window_tests {
         let t = LockTables::default();
         let id = GrantId { node: 1, seq: 5 };
         t.install_held(7, held_of(id, X, 10_000, 100));
-        assert_eq!(t.due_renewals_lane(at(200), 100).len(), 1);
+        assert_eq!(
+            t.due_renewals_lane(at(200), 100, false, |_, _| false).len(),
+            1
+        );
         // Marked at 200: not due again at 250 (fresh), due at 300 (stale).
-        assert!(t.due_renewals_lane(at(250), 100).is_empty());
-        assert_eq!(t.due_renewals_lane(at(300), 100).len(), 1);
+        assert!(t
+            .due_renewals_lane(at(250), 100, false, |_, _| false)
+            .is_empty());
+        assert_eq!(
+            t.due_renewals_lane(at(300), 100, false, |_, _| false).len(),
+            1
+        );
         assert_eq!(t.held(7).unwrap().renewing, Some(HonourMs(300)));
         // The core's tick counts a mark of any age.
         assert!(t.due_renewals(at(900)).is_empty());
         // Lapsing: never (a late renewal is an add, the core's).
         let (t, _) = lapsing();
-        assert!(t.due_renewals_lane(at(200), 0).is_empty());
+        assert!(t
+            .due_renewals_lane(at(200), 0, false, |_, _| false)
+            .is_empty());
         // Nor with an open window, a state the table does not reach.
         t.lock().held.get_mut(&7).unwrap().until = HonourMs(10_000);
-        assert!(t.due_renewals_lane(at(200), 0).is_empty());
+        assert!(t
+            .due_renewals_lane(at(200), 0, false, |_, _| false)
+            .is_empty());
+    }
+
+    /// Fail-before (plan 41 L3): the core's renewal tick marked the grant a
+    /// moment before its step stuck on a commit; the lane waited out the
+    /// forward timeout for a mark nobody could clear (a lone node's 5 s
+    /// stall: the grant lapsed with the lane on, 4 runs in 5). With the
+    /// core stuck the lane renews at once, and still respects its own marks.
+    #[test]
+    fn a_mark_the_stuck_core_set_is_not_waited_for_but_the_lanes_own_is() {
+        let t = LockTables::default();
+        let id = GrantId { node: 1, seq: 5 };
+        t.install_held(7, held_of(id, X, 10_000, 100));
+        // The core's tick marks it.
+        assert_eq!(t.due_renewals(at(200)).len(), 1);
+        // The core runs: the lane waits the mark out.
+        assert!(t
+            .due_renewals_lane(at(300), 10_000, false, |_, _| false)
+            .is_empty());
+        // The core is stuck: not the lane's mark, renewed now.
+        assert_eq!(
+            t.due_renewals_lane(at(300), 10_000, true, |_, _| false)
+                .len(),
+            1
+        );
+        // Now it is the lane's own: respected while stuck.
+        assert!(t
+            .due_renewals_lane(at(350), 10_000, true, |i, g| i == 7 && g == id)
+            .is_empty());
     }
 
     /// An own grant: the owner's record (this node, 1, as the root) and the

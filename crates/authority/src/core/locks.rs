@@ -6051,6 +6051,102 @@ impl Core {
         }
     }
 
+    /// Plan 41 L2: the certificate the lock lane judges by, as of this step
+    /// ([`crate::lane::LockLaneView`]). Every excluded state is one whose
+    /// core rule differs from "extend a live record up to the lease cap".
+    pub fn lock_lane_view(&self, now: Now, replica: &dyn Replica) -> crate::lane::LockLaneView {
+        let me = self.cfg.node_id;
+        let margin = self.lock_margin_ms();
+        let honour_end = self.lease.honour_until(&self.cfg);
+        let root_ok = self.cfg.locks
+            && !self.lease.lost
+            && !self.lease.fenced()
+            && !self.lease.epoch_held()
+            && self.lease.usable(now, &self.cfg)
+            && !self.epoch.open
+            && !self.epoch.active
+            && !self.dl.epoch_active
+            && self.dl.gens.is_empty()
+            && !replica.delegations_any()
+            && !self.lock_owner_resuming(now)
+            && !self.release_unmarked_in_flight()
+            && !self.lock_final_blocks()
+            && honour_end.is_some();
+        crate::lane::LockLaneView {
+            me,
+            root_ok,
+            cap_until: honour_end.map_or(HonourMs(0), |h| h.minus(margin.max(0) as u64)),
+            fast: self.may_be_taken_over_early(),
+            last_fresh: self.last_s3_fresh(),
+            window_ms: self.cfg.backup_takeover_ms as i64,
+            marked: self.tenure_marked(),
+            owner: self
+                .lease
+                .cached_holder
+                .filter(|h| *h != 0 && *h != me)
+                .unwrap_or(0),
+            lock_ttl_ms: self.lock_ttl_ms(),
+            margin_ms: margin,
+            forward_timeout_ms: self.cfg.forward_timeout_ms,
+        }
+    }
+
+    /// Publish [`Core::lock_lane_view`] for the lane: the end of `handle`, so
+    /// before the driver dispatches the step's actions (a release's CAS, an
+    /// epoch's recall go out only after the certificate that forbids
+    /// renewing has been published).
+    pub(crate) fn lock_publish_lane(&self, now: Now, replica: &dyn Replica) {
+        self.lane_cell.publish(if self.cfg.locks {
+            self.lock_lane_view(now, replica)
+        } else {
+            Default::default()
+        });
+    }
+
+    /// Plan 41 L2: the lane extended `renewed` of this node's own grants.
+    /// What the core's own renewal does besides the extension: the mirror
+    /// carries the longer record, and a window short of what a grant needs
+    /// asks the lease (or the delegation) to be renewed now
+    /// ([`Core::lock_renew_authority`]).
+    pub(crate) fn on_lane_own(
+        &mut self,
+        now: Now,
+        renewed: u32,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        self.stats.lock_lane_own += renewed as u64;
+        self.lk.mirror_dirty = true;
+        self.lock_renew_authority(now, out);
+        if replica.locks().held_count() > 0 {
+            self.lock_arm_renew_tick(now, replica, out);
+        }
+    }
+
+    /// Plan 41 L4: the owner `from` answered the lane's renewal sent at
+    /// `sent`: the lane applied every `Ok` (monotone) already; each result is
+    /// applied here as the core applies its own renewal's — idempotent for
+    /// `Ok`; `Lost`, `NotOwner` and a recalled grant's release are the core's
+    /// to decide.
+    pub(crate) fn on_lane_renewed(
+        &mut self,
+        now: Now,
+        from: NodeId,
+        sent: HonourMs,
+        results: Vec<(Ino, GrantId, LockRenewResult)>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        self.note_p2p_result(now, from, true);
+        for (ino, id, result) in results {
+            self.stats.lock_lane_results += 1;
+            self.lock_apply_renew_result(now, from, ino, id, sent, result, replica, out);
+        }
+        if replica.locks().held_count() > 0 {
+            self.lock_arm_renew_tick(now, replica, out);
+        }
+    }
+
     /// Root, plan 41 R2: the lock side has no content pending for a granting
     /// answer to `gen` beyond what the last one carried — no handoff waiting
     /// for the first renewal, no outwait barrier a cut must settle at the

@@ -547,6 +547,15 @@ pub struct SimConfig {
     /// `node.rs`). `false` is the code before it, the non-vacuity knob of
     /// the root-stall configurations (`delegated-core-stall-root-unlaned`).
     pub deleg_root_lane: bool,
+    /// Plan 41 L2: the lock renewal lane (`lock_lane_loop`) renews each
+    /// node's grants beside its core, from the certificate the core
+    /// publishes. `false` is the code before it: the fail-before of the
+    /// core-stall configurations (`locks-core-stall`).
+    pub lock_lane: bool,
+    /// Test-only non-vacuity: the lock lane ignores a fast tenure's
+    /// freshness rule (`locks-core-stall-backup-unfresh` must find a
+    /// violation).
+    pub lock_lane_ignores_freshness: bool,
     /// Test-only non-vacuity: a recall does not close the slot of its
     /// generation (the transition R1's rule 2 requires), so a renewal
     /// answered off the core after the recall began extends the window
@@ -830,6 +839,9 @@ impl Default for SimConfig {
             keeps_backups: false,
             deleg_lane: true,
             deleg_root_lane: true,
+            // `AUTHORITY_SIM_NO_LOCK_LANE=1`: the code without the lock lane.
+            lock_lane: std::env::var_os("AUTHORITY_SIM_NO_LOCK_LANE").is_none(),
+            lock_lane_ignores_freshness: false,
             skip_close_on_recall: false,
             strict_commit: false,
             strict_identity: false,
@@ -898,6 +910,8 @@ pub struct Report {
     /// Plan 30 §M8: close-to-open (enforced under `strict`).
     pub cto: super::cto::CtoReport,
     pub stats: BTreeMap<NodeId, Stats>,
+    /// Plan 41 L2: what each node's lock lane did (`RenewLane::stats`).
+    pub lane: BTreeMap<NodeId, constellation_authority::lane::LaneStats>,
     pub faults: Vec<String>,
     pub simulated_ms: u64,
     /// Plan 30 §M9: acknowledged ops that were rolled back at some point
@@ -3189,6 +3203,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         beats_lost_in_lag: cfg.beats_lost_in_lag,
         deleg_lane: cfg.deleg_lane,
         deleg_root_lane: cfg.deleg_root_lane,
+        lock_lane: cfg.lock_lane,
+        lock_lane_ignores_freshness: cfg.lock_lane_ignores_freshness,
         skip_close_on_recall: cfg.skip_close_on_recall,
         oracles: oracles.clone(),
         rebuild_stub: cfg.rebuild_stub,
@@ -3761,6 +3777,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             }
         }
         report.stats.insert(id, n.view().stats);
+        report.lane.insert(id, n.shared.lane.lock().unwrap().stats);
         report
             .floor_ms
             .extend(n.shared.floor_ms.lock().unwrap().iter().copied());

@@ -245,6 +245,44 @@
 //! granted before): a counterexample that rests on a deposed root's late
 //! grant needs it, an unmarked one is fenced by its first mark CAS.
 //!
+//! # Plan 41 L2: the renewal lane (`lane`, `max_stalls`)
+//!
+//! A node's authority core can be stuck in one step (a store write behind a
+//! slow journal write: `Stall(i)` until `Unstall(i)`): while it is, its core
+//! actions are disabled — messages for it, its probe, lease renewal,
+//! takeover, expiry, grace, release, delegation, lock requests — but the
+//! application's `Io` under an honoured grant and `Unlock` (local), the
+//! node-side `Renew` of a held grant and the delivery of its acknowledgement
+//! (the lane sends and applies them) stay enabled. The **lane** extends a
+//! window without the core: `LaneRenewOwn(i)`, the node's own grant at its
+//! own table, from a *certificate* the core published before it stuck
+//! (`Node::cert`: the lease's epoch, its usable end as an honour instant
+//! (`expires − lease_margin`), the send of its last probe, whether the
+//! tenure is fast). It is enabled only while the certificate stands: `now`
+//! on the honour clock below the cap, and on a fast tenure within
+//! `takeover_window` of the last probe (the L0 freshness); the node's
+//! cache honoured and due; and its record live in its own table
+//! (`g.until > now` on the wait clock). It extends the record and the cache
+//! by `ttl = min(lock_ttl, cap − now)` as the core's own-grant renewal does.
+//! The certificate is refreshed by every core action of an unstuck node and
+//! is not cleared by being stuck (a stuck core learns of nothing); a
+//! release, a deposition and losing the tenure clear it in the core action.
+//! Non-vacuity knobs, each of which must violate `mutual_exclusion`:
+//! `lane_ignores_freshness` (a fast takeover while the old root's lane
+//! renews), `lane_ignores_cap` (a TTL takeover after the lease expired),
+//! and, **together** (see below), `lane_keeps_cert_after_release` and
+//! `lane_extends_expired_records` (a released takeover: the old root keeps
+//! its certificate and the lane re-creates the record the release dropped).
+//! Each of the last two alone finds nothing here: `Release` is atomic in
+//! this model and drops the owner's table, so a kept certificate has no
+//! record to extend, and a lane that revives records has no certificate
+//! after the release. The code's gap (a release decided in one step, its CAS
+//! landing in a later one, the table dropped after it) is the certificate's:
+//! the step that decides the release publishes it withdrawn before the CAS is
+//! dispatched (`core::tests::lock_lane_core_tests`); the record's
+//! liveness is the tables' atomic primitive (`LockTables::renew_own`).
+//! Witnesses: `lane_renewed_while_stalled`.
+//!
 //! # The property
 //!
 //! `mutual_exclusion` (always): a node never performs I/O under a grant
@@ -550,6 +588,23 @@ pub struct LockModel {
     /// the start, so the sealable write is the re-claim). Off, the lease is
     /// unmarked until the tenure grants, and its successor arms no floor.
     pub mark_at_sealable: bool,
+    // ---- plan 41 L2: the renewal lane ----
+    /// The most core stalls (`Stall`) in a run.
+    pub max_stalls: u8,
+    /// The renewal lane (`LaneRenewOwn`) exists. The design has it (the
+    /// lane tests set it); off by default so that every other configuration
+    /// keeps its state space (the lane adds a transition wherever an own
+    /// grant is due).
+    pub lane: bool,
+    /// Non-vacuity: the lane ignores the freshness rule of a fast tenure.
+    pub lane_ignores_freshness: bool,
+    /// Non-vacuity: the lane ignores the cap (the lease's usable end).
+    pub lane_ignores_cap: bool,
+    /// Non-vacuity: a release does not clear the lane's certificate.
+    pub lane_keeps_cert_after_release: bool,
+    /// Non-vacuity: the lane extends (or re-creates) a record that has
+    /// expired at its owner.
+    pub lane_extends_expired_records: bool,
     /// The initial holder has granted before: its lease is marked. (The
     /// default is an unmarked lease, as a new tenure's: a deposed root that
     /// never granted is fenced by its first mark CAS, so a counterexample
@@ -625,6 +680,12 @@ impl LockModel {
             release_mark_duty: true,
             mark_at_sealable: true,
             marked_start: false,
+            max_stalls: 0,
+            lane: false,
+            lane_ignores_freshness: false,
+            lane_ignores_cap: false,
+            lane_keeps_cert_after_release: false,
+            lane_extends_expired_records: false,
         }
     }
 
@@ -835,6 +896,24 @@ pub struct Node {
     pub late: u8,
     /// Owner side: the table came from a final mirror (ghost).
     pub from_final: bool,
+    // ---- plan 41 L2 ----
+    /// The node's authority core is stuck in a step.
+    pub stalled: bool,
+    /// What the core published for the lane (`State::lane_cert`).
+    pub cert: Option<Cert>,
+}
+
+/// The renewal lane's certificate: what the core vouched for before it
+/// stuck (the code's `LeaseView` lane fields, `Core::lock_lane_view`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Cert {
+    pub epoch: u8,
+    /// The lease's usable end as an honour instant (`expires − lease_margin`).
+    pub cap: i16,
+    /// The send of the last probe that proved the tenure live (honour).
+    pub fresh_from: i16,
+    /// The tenure may be taken over before its lease expires.
+    pub fast: bool,
 }
 
 /// A lease body's identity as the code compares it: `(holder, epoch,
@@ -984,6 +1063,10 @@ pub const SAW_LATE_IO: u32 = 1 << 26;
 pub const SAW_LATE_AT_SUCCESSOR: u32 = 1 << 27;
 /// A late renewal refused (`Lost`).
 pub const SAW_LATE_REFUSED: u32 = 1 << 28;
+/// Plan 41 L2: the lane renewed a node's own grant.
+pub const SAW_LANE_RENEWED: u32 = 1 << 29;
+/// ... while that node's core was stuck.
+pub const SAW_LANE_RENEWED_STALLED: u32 = 1 << 30;
 
 /// A beat the backup heard: `(holder, epoch, sent, lag)`.
 pub type BeatLag = (u8, u8, i16, i16);
@@ -1004,6 +1087,8 @@ pub struct State {
     pub deleg_renews: u8,
     pub nodes: Vec<Node>,
     pub net: Vec<Msg>,
+    /// Plan 41 L2: core stalls so far.
+    pub stalls: u8,
     pub next_id: u8,
     /// Ghost: every grant ever issued, `(id, node, mode)`.
     pub issued: Vec<(u8, u8, Mode)>,
@@ -1600,6 +1685,13 @@ pub enum Action {
     /// current renewal key starts the node's observation of it
     /// (`ClaimRule::Observed`).
     Observe(u8),
+    /// Plan 41 L2: node `i`'s core gets stuck in a step.
+    Stall(u8),
+    /// The step ends.
+    Unstall(u8),
+    /// Plan 41 L2: the renewal lane extends node `i`'s own grant at its own
+    /// table, from the certificate its core published.
+    LaneRenewOwn(u8),
 }
 
 impl Model for LockModel {
@@ -1664,6 +1756,8 @@ impl LockModel {
                 final_for: None,
                 late: 0,
                 from_final: false,
+                stalled: false,
+                cert: None,
             })
             .collect();
         let h = self.initial_holder as usize;
@@ -1671,7 +1765,7 @@ impl LockModel {
         nodes[h].lease = Some((1, expires, expires));
         nodes[h].last_probe = off[h];
         nodes[h].marked = self.marked_start;
-        State {
+        let mut state = State {
             t: 0,
             clk: crate::clk::initial_clocks(off, rate),
             jumps: 0,
@@ -1692,14 +1786,78 @@ impl LockModel {
             net: Vec::new(),
             next_id: 0,
             issued: Vec::new(),
+            stalls: 0,
             violation: None,
             saw: 0,
             beat_lags: Vec::new(),
             seen: vec![None; n],
-        }
+        };
+        state.refresh_certs(self, None);
+        state
     }
 
     fn actions_of(&self, s: &State, actions: &mut Vec<Action>) {
+        self.actions_core(s, actions);
+        if s.violation.is_some() || (self.max_stalls == 0 && !self.lane) {
+            return;
+        }
+        let n = self.n();
+        let stalled = |i: usize| s.nodes[i].stalled;
+        let root_stalled = stalled(s.reg.holder as usize % n);
+        // A stuck core does nothing: no message for it (but the
+        // acknowledgement of a renewal the lane sent), no probe, lease
+        // renewal, takeover, expiry, grace, release, delegation or lock
+        // request; the application's local ops stay (a lock only under a
+        // grant it holds).
+        if self.max_stalls > 0 {
+            actions.retain(|a| match a {
+                Action::RenewLease(i)
+                | Action::Probe(i)
+                | Action::Takeover(i)
+                | Action::SendLock(i)
+                | Action::Expire(i)
+                | Action::FloorPassed(i)
+                | Action::Release(i)
+                | Action::Beat(i)
+                | Action::FinalMirror(i)
+                | Action::LateRenew(i) => !stalled(*i as usize),
+                Action::Delegate(_)
+                | Action::RecallDelegation
+                | Action::RecallByTtl
+                | Action::DelegRenewal => !root_stalled,
+                Action::Deliver(k) => {
+                    let m = &s.net[*k];
+                    let to = msg_to(m);
+                    to == NONE || !stalled(to as usize) || matches!(m, Msg::RenewAck { .. })
+                }
+                Action::Start(i) => {
+                    let i = *i as usize;
+                    !stalled(i)
+                        || match self.scripts[i][s.nodes[i].pc as usize] {
+                            Op::Lock(m) => s.honoured(self, i).is_some_and(|c| c.mode.covers(m)),
+                            Op::Io | Op::Unlock => true,
+                        }
+                }
+                _ => true,
+            });
+            for i in 0..n {
+                if stalled(i) {
+                    actions.push(Action::Unstall(i as u8));
+                } else if s.stalls < self.max_stalls {
+                    actions.push(Action::Stall(i as u8));
+                }
+            }
+        }
+        if self.lane {
+            for i in 0..n {
+                if s.lane_can_renew(self, i) {
+                    actions.push(Action::LaneRenewOwn(i as u8));
+                }
+            }
+        }
+    }
+
+    fn actions_core(&self, s: &State, actions: &mut Vec<Action>) {
         if s.violation.is_some() {
             return;
         }
@@ -1930,8 +2088,42 @@ impl LockModel {
     }
 
     fn next_state_of(&self, last: &State, action: Action) -> Option<State> {
+        let mut s = match action {
+            Action::Stall(i) => {
+                let mut s = last.clone();
+                s.nodes[i as usize].stalled = true;
+                s.stalls += 1;
+                return Some(s);
+            }
+            Action::Unstall(i) => {
+                let mut s = last.clone();
+                s.nodes[i as usize].stalled = false;
+                s.refresh_certs(self, None);
+                return Some(s);
+            }
+            Action::LaneRenewOwn(i) => {
+                let mut s = last.clone();
+                s.lane_renew_own(self, i as usize);
+                return Some(s);
+            }
+            _ => self.next_state_core(last, action.clone())?,
+        };
+        // Every core action of an unstuck node publishes its certificate
+        // afresh; a release's (with `lane_keeps_cert_after_release`) is
+        // not cleared.
+        let kept = match action {
+            Action::Release(i) if self.lane_keeps_cert_after_release => Some(i as usize),
+            _ => None,
+        };
+        s.refresh_certs(self, kept);
+        Some(s)
+    }
+
+    fn next_state_core(&self, last: &State, action: Action) -> Option<State> {
         let mut s = last.clone();
         match action {
+            // (Handled by `next_state_of`.)
+            Action::Stall(_) | Action::Unstall(_) | Action::LaneRenewOwn(_) => return None,
             Action::Tick => {
                 s.t += 1;
                 let (t, spec) = (s.t, self.spec());
@@ -2591,7 +2783,153 @@ impl LockModel {
                 s.saw & SAW_LATE_AT_SUCCESSOR != 0
             }),
             Property::sometimes("late_refused", |_, s: &State| s.saw & SAW_LATE_REFUSED != 0),
+            Property::sometimes("lane_renewed_while_stalled", |_, s: &State| {
+                s.saw & SAW_LANE_RENEWED_STALLED != 0
+            }),
         ]
+    }
+}
+
+/// The node a message is for.
+fn msg_to(m: &Msg) -> u8 {
+    match m {
+        Msg::LockReq { to, .. }
+        | Msg::LockReply { to, .. }
+        | Msg::Recall { to, .. }
+        | Msg::Released { to, .. }
+        | Msg::Renew { to, .. }
+        | Msg::RenewAck { to, .. }
+        | Msg::Mirror { to, .. }
+        | Msg::Handoff { to, .. }
+        | Msg::DelegRecall { to }
+        | Msg::DelegRecalled { to, .. } => *to,
+    }
+}
+
+// ----------------------------------------------- plan 41 L2: the renewal lane
+
+impl State {
+    /// What node `i`'s core would publish for the lane now: its lease as it
+    /// believes it (a usable root's, no final mirror sent, and for a fast
+    /// tenure the lease marked), its usable end as an honour instant, the
+    /// send of its last probe. `None` while it is not a root with a lease
+    /// to stand on.
+    fn lane_cert(&self, cfg: &LockModel, i: usize) -> Option<Cert> {
+        if !cfg.lane || self.owner != Owner::Root || !self.believes_root(cfg, i) {
+            return None;
+        }
+        if self.final_sent(cfg, i) {
+            return None;
+        }
+        let (epoch, expires_h, _) = self.nodes[i].lease?;
+        let fast = cfg.fast_root(i);
+        if fast && !self.nodes[i].marked {
+            return None;
+        }
+        Some(Cert {
+            epoch,
+            cap: expires_h - cfg.lease_margin,
+            fresh_from: self.nodes[i].last_probe,
+            fast,
+        })
+    }
+
+    /// After a core action: every unstuck node's core publishes afresh
+    /// (`keep`: a node whose certificate a knob leaves as it was).
+    fn refresh_certs(&mut self, cfg: &LockModel, keep: Option<usize>) {
+        for i in 0..self.nodes.len() {
+            if self.nodes[i].stalled || keep == Some(i) {
+                continue;
+            }
+            // `lane_keeps_cert_after_release`: a node that gave its lease up
+            // keeps the certificate it published before (nothing clears it).
+            if cfg.lane_keeps_cert_after_release
+                && self.nodes[i].lease.is_none()
+                && self.nodes[i].cert.is_some()
+            {
+                continue;
+            }
+            self.nodes[i].cert = self.lane_cert(cfg, i);
+        }
+    }
+
+    /// The lane would extend node `i`'s own grant now.
+    fn lane_can_renew(&self, cfg: &LockModel, i: usize) -> bool {
+        let mut probe = self.clone();
+        probe.lane_renew_own(cfg, i)
+    }
+
+    /// The lane extends node `i`'s own grant at its own table and its cache,
+    /// as the core's own-grant renewal (`Route::Me`) would, under the
+    /// certificate and nothing else. `false`: it does nothing.
+    fn lane_renew_own(&mut self, cfg: &LockModel, i: usize) -> bool {
+        let Some(cert) = self.nodes[i].cert else {
+            return false;
+        };
+        let now_h = self.honour(cfg, i);
+        if !cfg.lane_ignores_cap && now_h >= cert.cap {
+            return false;
+        }
+        if cert.fast
+            && !cfg.lane_ignores_freshness
+            && now_h - cert.fresh_from >= cfg.takeover_window
+        {
+            return false;
+        }
+        let Some(c) = self.honoured(cfg, i) else {
+            return false;
+        };
+        if now_h < c.renew_at || self.nodes[i].renews >= cfg.max_renews {
+            return false;
+        }
+        let ttl = if cfg.lane_ignores_cap {
+            cfg.lock_ttl
+        } else {
+            cfg.lock_ttl.min(cert.cap - now_h)
+        };
+        if ttl <= 0 {
+            return false;
+        }
+        let now = self.wait(cfg, i);
+        let revive = cfg.lane_extends_expired_records;
+        let k = self.nodes[i].table.iter().position(|g| {
+            g.id == c.id && g.node == i as u8 && g.mode.covers(c.mode) && (revive || g.until > now)
+        });
+        let recalled = match k {
+            Some(k) => {
+                let g = &mut self.nodes[i].table[k];
+                g.until = g.until.max(now + ttl + cfg.seq_margin);
+                g.proven |= cfg.marks();
+                g.recalled
+            }
+            None if revive => {
+                self.nodes[i].table.push(Grant {
+                    node: i as u8,
+                    mode: c.mode,
+                    until: now + ttl + cfg.seq_margin,
+                    id: c.id,
+                    recalled: false,
+                    proven: cfg.marks(),
+                    carried: false,
+                    settled: false,
+                });
+                self.nodes[i].table.sort();
+                false
+            }
+            None => return false,
+        };
+        self.nodes[i].renews += 1;
+        self.nodes[i].cache = Some(Cache {
+            until: c.until.max(now_h + ttl - cfg.node_margin),
+            renew_at: c.renew_at.max(now_h + ttl / 2),
+            recalled: c.recalled || recalled,
+            ..c
+        });
+        self.saw |= SAW_LANE_RENEWED;
+        if self.nodes[i].stalled {
+            self.saw |= SAW_LANE_RENEWED_STALLED;
+        }
+        true
     }
 }
 

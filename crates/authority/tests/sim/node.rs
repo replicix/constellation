@@ -251,6 +251,10 @@ pub struct Shared {
     granted_ttl: Mutex<HashMap<(u64, u64), (NodeId, u64)>>,
     deleg_certs: Mutex<Vec<constellation_authority::DelegRenewCert>>,
     urgent: mpsc::UnboundedSender<Event>,
+    /// Plan 41 L2: this node's lock renewal lane (the daemon's
+    /// `lock_lane::LockLane`): its requests in flight, shared by its task
+    /// and the bus tap that hands it the owners' answers.
+    pub lane: Mutex<constellation_authority::lane::RenewLane>,
 }
 
 /// See `Shared::held_ctl`.
@@ -351,6 +355,10 @@ pub struct NodeEnv {
     pub deleg_lane: bool,
     /// See `SimConfig::deleg_root_lane`.
     pub deleg_root_lane: bool,
+    /// See `SimConfig::lock_lane`.
+    pub lock_lane: bool,
+    /// See `SimConfig::lock_lane_ignores_freshness`.
+    pub lock_lane_ignores_freshness: bool,
     /// See `SimConfig::skip_close_on_recall`.
     pub skip_close_on_recall: bool,
     /// Plan 43 C0: the commit-rule oracles' shared plumbing.
@@ -490,6 +498,9 @@ impl NodeHandle {
             granted_ttl: Mutex::new(HashMap::new()),
             deleg_certs: Mutex::new(Vec::new()),
             urgent: urgent_tx,
+            lane: Mutex::new(constellation_authority::lane::RenewLane::new(
+                constellation_authority::lane::DEFAULT_MAX_STALL_MS,
+            )),
         });
         {
             let shared = shared.clone();
@@ -509,11 +520,22 @@ impl NodeHandle {
         // (the daemon's `OffCore::deleg_windows`).
         let windows = constellation_authority::core::DelegWindows::new();
         windows.skip_closes_for_tests(env.skip_close_on_recall, false);
+        // The lock lane's certificate cell (the core publishes it, the lane's
+        // task and its answer tap read it).
+        let lane_cell = constellation_authority::lane::LaneCell::new();
+        shared
+            .lane
+            .lock()
+            .unwrap()
+            .ignore_freshness_for_tests(env.lock_lane_ignores_freshness);
         {
             let shared = shared.clone();
             let windows = windows.clone();
             let bus = env.bus.clone();
             let clock = clock.clone();
+            let meta = meta.clone();
+            let lane_cell = lane_cell.clone();
+            let lock_lane = env.lock_lane;
             let root_lane = env.deleg_root_lane;
             env.bus.set_tap(
                 id,
@@ -575,6 +597,37 @@ impl NodeHandle {
                                 );
                             }
                         }
+                        // The lock lane's answers (plan 41 L2/L4): an owner's
+                        // reply to a `LockRenew` the lane sent is the lane's,
+                        // handled on arrival, off the node's driver (which may
+                        // be stuck in a step); the core hears of it as an event
+                        // on the urgent lane.
+                        PeerMsg::LockRenewed { req, results }
+                            if lock_lane
+                                && req.0 & constellation_authority::lane::LOCK_LANE_REQ_BIT
+                                    != 0 =>
+                        {
+                            if std::env::var_os("AUTHORITY_SIM_LANE_DEBUG").is_some() {
+                                eprintln!(
+                                    "lane n{id} t={} answered req={} {results:?}",
+                                    clock.now().wait.0,
+                                    req.0 & !constellation_authority::lane::LOCK_LANE_REQ_BIT
+                                );
+                            }
+                            let acts = shared.lane.lock().unwrap().handle(
+                                clock.now(),
+                                constellation_authority::lane::LaneEvent::Answered {
+                                    req: req.0,
+                                    results: results.clone(),
+                                },
+                                meta.locks(),
+                                &SimLaneFacts {
+                                    cell: lane_cell.clone(),
+                                    meta: meta.clone(),
+                                },
+                            );
+                            apply_lane_actions(&shared, &bus, id, acts);
+                        }
                         _ => {}
                     }
                 }),
@@ -599,6 +652,8 @@ impl NodeHandle {
         );
         env.oracles.leases.set_bus(env.bus.clone());
         let beat_every_ms = cfg.backup_heartbeat_ms.max(1);
+        let (cfg_locks, lane_timeout_ms) = (cfg.locks, cfg.forward_timeout_ms);
+        let lane_tick_ms = (cfg.forward_timeout_ms / 4).clamp(50, 250);
         let lane = env.deleg_lane && cfg.delegation && cfg.p2p;
         let driver = Driver {
             id,
@@ -609,6 +664,7 @@ impl NodeHandle {
                 let clock = clock.clone();
                 windows.set_clock(Arc::new(move || clock.now()));
                 core.set_deleg_windows(windows);
+                core.set_lane_cell(lane_cell.clone());
                 core
             },
             store: env.bucket.handle(id),
@@ -655,6 +711,18 @@ impl NodeHandle {
                 env.bus.clone(),
                 clock.clone(),
                 beat_every_ms,
+            ));
+        }
+        if env.lock_lane && cfg_locks {
+            tokio::spawn(lock_lane_loop(
+                id,
+                shared.clone(),
+                env.bus.clone(),
+                clock.clone(),
+                meta.clone(),
+                lane_cell,
+                lane_tick_ms,
+                lane_timeout_ms,
             ));
         }
         if env.holder_beats != super::run::HolderBeats::Off {
@@ -1045,6 +1113,143 @@ async fn beat_loop(
                 },
             );
         }
+    }
+}
+
+/// The lane's facts in the simulation: the certificate cell the node's core
+/// publishes, and the live delegation flag of its replica.
+struct SimLaneFacts {
+    cell: Arc<constellation_authority::lane::LaneCell>,
+    meta: Arc<Meta>,
+}
+
+impl constellation_authority::lane::LaneFacts for SimLaneFacts {
+    fn view(&self) -> constellation_authority::lane::LockLaneView {
+        self.cell.view()
+    }
+    fn delegations_any(&self) -> bool {
+        self.meta.delegations_any()
+    }
+}
+
+/// What the lane asked for: its renewals go out on the bus, and what it did
+/// reaches the core on the urgent lane (the daemon's `lock_lane`).
+fn apply_lane_actions(
+    shared: &Arc<Shared>,
+    bus: &Arc<Bus>,
+    id: NodeId,
+    actions: Vec<constellation_authority::lane::LaneAction>,
+) {
+    use constellation_authority::lane::LaneAction;
+    for a in actions {
+        match a {
+            LaneAction::Send { to, req, entries } => {
+                bus.send(
+                    id,
+                    to,
+                    PeerMsg::LockRenew {
+                        req: OpId(req),
+                        entries,
+                    },
+                );
+            }
+            LaneAction::OwnRenewed { renewed } => {
+                let _ = shared.urgent.send(Event::LaneOwn { renewed });
+            }
+            LaneAction::Renewed {
+                from,
+                sent,
+                results,
+            } => {
+                let _ = shared.urgent.send(Event::LaneRenewed {
+                    from,
+                    sent,
+                    results,
+                });
+            }
+        }
+    }
+}
+
+/// The lock renewal lane's task (the daemon's `lock_lane::LockLane`): its
+/// own task, which a step stuck in the store (`StallStep`) does not hold
+/// up. Every `every_ms` of this node's own time, while the process is not
+/// stopped, it asks `RenewLane` for the renewals that are due, with how
+/// long the driver has been stuck (`Shared::busy_since`, set while a
+/// stalled step waits). A request it hears no answer to for
+/// `timeout_ms` is given up on (a late answer still counts).
+#[allow(clippy::too_many_arguments)]
+async fn lock_lane_loop(
+    id: NodeId,
+    shared: Arc<Shared>,
+    bus: Arc<Bus>,
+    clock: Clock,
+    meta: Arc<Meta>,
+    cell: Arc<constellation_authority::lane::LaneCell>,
+    every_ms: u64,
+    timeout_ms: u64,
+) {
+    use constellation_authority::lane::LaneEvent;
+    let facts = SimLaneFacts { cell, meta };
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(every_ms)).await;
+        if !shared.alive.load(Ordering::SeqCst) {
+            return;
+        }
+        if shared
+            .paused_until
+            .lock()
+            .unwrap()
+            .is_some_and(|until| tokio::time::Instant::now() < until)
+        {
+            continue;
+        }
+        let now = clock.now();
+        let busy = shared.busy_since.load(Ordering::SeqCst);
+        let stuck_ms = if busy != 0 { now.wait.0 - busy } else { 0 };
+        let actions = shared.lane.lock().unwrap().handle(
+            now,
+            LaneEvent::Tick { stuck_ms },
+            facts.meta.locks(),
+            &facts,
+        );
+        // `AUTHORITY_SIM_LANE_DEBUG=1`: what each tick of the lock lane did.
+        if std::env::var_os("AUTHORITY_SIM_LANE_DEBUG").is_some() {
+            let st = shared.lane.lock().unwrap().stats;
+            if !actions.is_empty() || st.deferred != 0 || st.uncovered != 0 {
+                eprintln!(
+                    "lane n{id} t={} stuck={stuck_ms} held={} deferred={} uncovered={} {actions:?}",
+                    now.wait.0,
+                    facts.meta.locks().held_count(),
+                    st.deferred,
+                    st.uncovered
+                );
+            }
+        }
+        for a in &actions {
+            if let constellation_authority::lane::LaneAction::Send { req, .. } = a {
+                let (shared, bus, clock, meta, cell, req) = (
+                    shared.clone(),
+                    bus.clone(),
+                    clock.clone(),
+                    facts.meta.clone(),
+                    facts.cell.clone(),
+                    *req,
+                );
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)).await;
+                    let facts = SimLaneFacts { cell, meta };
+                    let acts = shared.lane.lock().unwrap().handle(
+                        clock.now(),
+                        LaneEvent::Failed { req },
+                        facts.meta.locks(),
+                        &facts,
+                    );
+                    apply_lane_actions(&shared, &bus, id, acts);
+                });
+            }
+        }
+        apply_lane_actions(&shared, &bus, id, actions);
     }
 }
 

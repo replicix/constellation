@@ -120,6 +120,29 @@ fn assert_violates_soon(label: &str, model: &LockModel) {
     println!("  final: {:?}", d.last_state().violation);
 }
 
+/// As [`assert_violates_soon`], breadth first: the shortest counterexample,
+/// for a state space a depth-first search wanders in.
+fn assert_violates_bfs(label: &str, model: &LockModel) {
+    let started = Instant::now();
+    let checker = model
+        .clone()
+        .checker()
+        .finish_when(HasDiscoveries::AnyFailures)
+        .target_state_count(CAP.0)
+        .timeout(CAP.1)
+        .spawn_bfs()
+        .join();
+    report(label, &checker, started);
+    let d = checker
+        .discovery("mutual_exclusion")
+        .unwrap_or_else(|| panic!("{label}: expected a mutual-exclusion counterexample"));
+    println!("{label}: counterexample (t = {}):", d.last_state().t);
+    for (s, a) in d.clone().into_actions().into_iter().enumerate() {
+        println!("  {s:2}: {a:?}");
+    }
+    println!("  final: {:?}", d.last_state().violation);
+}
+
 fn assert_clean(label: &str, model: &LockModel, sometimes: &[&'static str]) {
     assert_clean_within(label, model, sometimes, CAP);
 }
@@ -2051,6 +2074,33 @@ fn ttl_claim(rule: constellation_model::clk::ClaimRule, offsets: Vec<i16>) -> Lo
     }
 }
 
+// ------------------------------------------- plan 41 L2: the renewal lane
+
+/// A lane whose root core is stuck: the lane renews the root's own grant
+/// from the certificate its core published, while node 2 (the backup) takes
+/// the lease over before it expires. The design's lane stops when the
+/// tenure's freshness (a probe within `takeover_window`) ends; with
+/// `lane_ignores_freshness` it renews through the successor's grace.
+fn lane_fast_takeover(ignores_freshness: bool, max_tick: u8, max_renews: u8) -> LockModel {
+    LockModel {
+        backup: 1,
+        replicate: false,
+        grace: true,
+        lease_ttl: 30,
+        lock_ttl: 3,
+        max_drops: 0,
+        max_tick,
+        max_renews,
+        // (The lane renews with the core running too: no stall is needed
+        // for the counterexample, and one would multiply the space; the cap
+        // configuration below has them.)
+        max_stalls: 0,
+        lane: true,
+        lane_ignores_freshness: ignores_freshness,
+        ..LockModel::design(vec![vec![Lock(X), Io], vec![Lock(X)]])
+    }
+}
+
 #[test]
 fn a_claimant_ahead_beyond_the_margin_violates() {
     assert_violates(
@@ -2092,4 +2142,87 @@ fn the_observed_claim_is_clean_with_offsets_and_rates_within_the_budget() {
         )
     };
     assert_clean("ttl-claimant-observed-rates", &m, &["ttl_takeover"]);
+}
+
+#[test]
+fn a_lane_ignoring_freshness_renews_through_a_fast_takeovers_grace() {
+    assert_violates_bfs("lane-ignores-freshness", &lane_fast_takeover(true, 6, 5));
+}
+
+#[test]
+fn design_a_lane_on_a_fast_tenure_is_clean() {
+    assert_clean(
+        "lane-fast",
+        &lane_fast_takeover(false, 6, 5),
+        &["fast_takeover"],
+    );
+}
+
+/// The lane past the lease's usable end: a TTL takeover (an empty table, no
+/// grace) grants at once, and the stuck root's lane extended its own grant
+/// beyond the lease.
+fn lane_ttl_takeover(ignores_cap: bool) -> LockModel {
+    LockModel {
+        ttl_takeover: true,
+        lease_ttl: 5,
+        lock_ttl: 3,
+        max_drops: 0,
+        max_tick: 6,
+        max_renews: 4,
+        max_stalls: 1,
+        lane: true,
+        lane_ignores_cap: ignores_cap,
+        ..LockModel::design(vec![vec![Lock(X), Io], vec![Lock(X)], vec![]])
+    }
+}
+
+#[test]
+fn a_lane_ignoring_the_cap_renews_past_the_lease_across_a_ttl_takeover() {
+    assert_violates_soon("lane-ignores-cap", &lane_ttl_takeover(true));
+}
+
+#[test]
+fn design_a_lane_under_the_cap_is_clean_across_a_ttl_takeover() {
+    assert_clean(
+        "lane-cap",
+        &lane_ttl_takeover(false),
+        &["lane_renewed_while_stalled", "ttl_takeover"],
+    );
+}
+
+/// A released takeover (a graceful shutdown with grants live): the old
+/// root's lane after its release. The model's `Release` is atomic and drops
+/// the owner's table, so a lane that merely kept its certificate has no
+/// record to extend (the code's gap between deciding a release and the CAS
+/// landing is the certificate's, revoked by the step that decides it); with
+/// the records revived as well (`lane_extends_expired_records`) the kept
+/// certificate renews the old grant through the successor's grace.
+fn lane_released_takeover(keeps_cert: bool, revives: bool) -> LockModel {
+    LockModel {
+        released_takeover: true,
+        lease_ttl: 30,
+        lock_ttl: 3,
+        max_drops: 0,
+        max_tick: 6,
+        max_renews: 5,
+        max_stalls: 0,
+        lane: true,
+        lane_keeps_cert_after_release: keeps_cert,
+        lane_extends_expired_records: revives,
+        ..LockModel::design(vec![vec![Lock(X), Io], vec![Lock(X)]])
+    }
+}
+
+#[test]
+fn a_lane_that_keeps_its_certificate_and_revives_records_renews_through_the_successors_grace() {
+    assert_violates_bfs("lane-keeps-cert", &lane_released_takeover(true, true));
+}
+
+#[test]
+fn design_a_lane_after_a_release_is_clean() {
+    assert_clean(
+        "lane-release",
+        &lane_released_takeover(false, false),
+        &["released_takeover"],
+    );
 }

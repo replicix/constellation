@@ -256,6 +256,8 @@ fn event_kind(event: &Event) -> &'static str {
         Event::OwnFreeze { .. } => "OwnFreeze",
         Event::DelegRenewSentOffCore { .. } => "DelegRenewSentOffCore",
         Event::DelegRenewAnsweredOffCore { .. } => "DelegRenewAnsweredOffCore",
+        Event::LaneOwn { .. } => "LaneOwn",
+        Event::LaneRenewed { .. } => "LaneRenewed",
         Event::Control { req, .. } => match req {
             Control::Nudge => "Control(Nudge)",
             Control::Journaled => "Control(Journaled)",

@@ -449,6 +449,17 @@ fn replay_seed() {
         }
         Ok("locks-writer-hold-delegated-doubt") => locks_writer_hold_delegated_doubt_config(),
         Ok("locks-stall-step") => locks_stall_step_config(),
+        Ok("locks-core-stall") => locks_core_stall_config(),
+        Ok("locks-core-stall-root") => locks_core_stall_root_config(),
+        Ok("locks-core-stall-unlaned") => locks_core_stall_unlaned_config(),
+        Ok("locks-core-stall-single") => locks_core_stall_single_config(),
+        Ok("locks-core-stall-backup") => locks_core_stall_backup_config(),
+        Ok("locks-core-stall-backup-beats") => locks_core_stall_backup_beats_config(),
+        Ok("locks-core-stall-backup-unfresh") => locks_core_stall_backup_unfresh_config(),
+        Ok("locks-core-stall-s3") => locks_core_stall_s3_config(),
+        Ok("locks-core-stall-writes") => locks_core_stall_writes_config(),
+        Ok("locks-core-stall-blips") => locks_core_stall_blips_config(),
+        Ok("locks-core-stall-delegated") => locks_core_stall_delegated_config(),
         Ok("locks-stall-step-delegated") => locks_stall_step_delegated_config(),
         Ok("locks-root-step-forward") => locks_root_step_forward_config(),
         Ok("locks-locker-step-back") => locks_locker_step_back_config(),
@@ -4959,6 +4970,17 @@ fn sweep_config() {
         "locks-writer-hold-delegated-unsettled" => locks_writer_hold_delegated_unsettled_config(),
         "locks-writer-hold-delegated-doubt" => locks_writer_hold_delegated_doubt_config(),
         "locks-stall-step" => locks_stall_step_config(),
+        "locks-core-stall" => locks_core_stall_config(),
+        "locks-core-stall-root" => locks_core_stall_root_config(),
+        "locks-core-stall-unlaned" => locks_core_stall_unlaned_config(),
+        "locks-core-stall-single" => locks_core_stall_single_config(),
+        "locks-core-stall-backup" => locks_core_stall_backup_config(),
+        "locks-core-stall-backup-beats" => locks_core_stall_backup_beats_config(),
+        "locks-core-stall-backup-unfresh" => locks_core_stall_backup_unfresh_config(),
+        "locks-core-stall-s3" => locks_core_stall_s3_config(),
+        "locks-core-stall-writes" => locks_core_stall_writes_config(),
+        "locks-core-stall-blips" => locks_core_stall_blips_config(),
+        "locks-core-stall-delegated" => locks_core_stall_delegated_config(),
         "locks-stall-step-delegated" => locks_stall_step_delegated_config(),
         "locks-root-step-forward" => locks_root_step_forward_config(),
         "locks-locker-step-back" => locks_locker_step_back_config(),
@@ -8375,6 +8397,153 @@ fn locks_writer_hold_unchecked_config() -> SimConfig {
     }
 }
 
+/// Plan 41 L2/L4 (`locks-core-stall`): the authority core of a lock holder
+/// that is not the lease holder is stuck in one step — a priority store
+/// write behind a FUSE writer's slow journal write, finding 08 — for 2 s,
+/// over `lock_ttl − margin` = 1 s of a grant's window, under what is left
+/// of the 6 s lease. The grants it holds at the (healthy) owner are
+/// renewed by its lane meanwhile, so none lapses and no I/O under one is
+/// fenced; with the lane off (`locks-core-stall-unlaned`) the grants lapse
+/// under the stalls.
+fn locks_core_stall_config() -> SimConfig {
+    let stall = |at_ms, node, for_ms| ScheduledFault {
+        at_ms,
+        kind: FaultKind::StallStep { node, for_ms },
+    };
+    SimConfig {
+        ops_per_client: 10,
+        lock_ios: (4, 12),
+        lock_io_ms: (20, 150),
+        faults: vec![
+            stall(500, 2, 2_000),
+            stall(3_500, 3, 2_000),
+            stall(7_000, 2, 2_000),
+            stall(10_000, 3, 2_000),
+        ],
+        ..locks_config()
+    }
+}
+
+/// The lease holder's core stuck for 2 s (every grant's owner): its own
+/// clients' grants are renewed by its lane (L3); the grants its peers hold
+/// of it are not (answering them is plan 41 L5: they lapse after the
+/// stall's first second, as before). Safety, and the lane's own renewals.
+fn locks_core_stall_root_config() -> SimConfig {
+    let stall = |at_ms, for_ms| ScheduledFault {
+        at_ms,
+        kind: FaultKind::StallStep { node: 0, for_ms },
+    };
+    SimConfig {
+        faults: vec![stall(500, 2_000), stall(4_500, 2_000), stall(9_000, 2_000)],
+        ..locks_core_stall_config()
+    }
+}
+
+/// The same with the lane off: the code before it.
+fn locks_core_stall_unlaned_config() -> SimConfig {
+    SimConfig {
+        lock_lane: false,
+        ..locks_core_stall_config()
+    }
+}
+
+/// One node (finding 08's topology), stalls of 2 s and 8 s: the second is
+/// past the 6 s lease, which the stuck core cannot renew, so the lane's own
+/// renewals end at the lease's usable end (the cap) and the grants lapse
+/// there, never later (mutual exclusion and the owner fence hold).
+fn locks_core_stall_single_config() -> SimConfig {
+    let stall = |at_ms, for_ms| ScheduledFault {
+        at_ms,
+        kind: FaultKind::StallStep { node: 1, for_ms },
+    };
+    SimConfig {
+        nodes: 1,
+        ops_per_client: 14,
+        faults: vec![stall(800, 2_000), stall(6_000, 8_000)],
+        ..locks_core_stall_config()
+    }
+}
+
+/// Under M9's backups: the holder's lane renews only while the core's last
+/// proof of liveness is fresh (1.5 s), its backups seal it on silence
+/// (without the holder's off-core beat) or not for the stall's length (with
+/// it, `-backup-beats`); the takeover's grace, the mirror and the
+/// reclaims keep mutual exclusion. Safety only.
+fn locks_core_stall_backup_config() -> SimConfig {
+    let stall = |at_ms, node, for_ms| ScheduledFault {
+        at_ms,
+        kind: FaultKind::StallStep { node, for_ms },
+    };
+    SimConfig {
+        core: std::sync::Arc::new(sim::run::backup_core_config),
+        faults: vec![
+            stall(500, 0, 2_000),
+            stall(4_000, 0, 5_000),
+            stall(11_000, 2, 2_000),
+        ],
+        ..locks_core_stall_config()
+    }
+}
+
+fn locks_core_stall_backup_beats_config() -> SimConfig {
+    SimConfig {
+        holder_beats: sim::run::HolderBeats::Thread,
+        ..locks_core_stall_backup_config()
+    }
+}
+
+/// Non-vacuity of the freshness rule: the lane renews a fast tenure's own
+/// grants whatever the core's last proof of liveness says, through its
+/// backup's seal and the successor's grace. Must find a violation.
+fn locks_core_stall_backup_unfresh_config() -> SimConfig {
+    SimConfig {
+        lock_lane_ignores_freshness: true,
+        ..locks_core_stall_backup_config()
+    }
+}
+
+/// `ack=s3`: a subscriber takes the lease over after the core's silence
+/// (the stream heartbeat is a core timer). Safety only; the lane is not
+/// expected to add anything here.
+fn locks_core_stall_s3_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(sim::run::ack_s3_core_config),
+        ..locks_core_stall_config()
+    }
+}
+
+/// With writes under the lock (the turns): a stalled owner's lane must not
+/// let a write land past its grant's end.
+fn locks_core_stall_writes_config() -> SimConfig {
+    with_lock_writes(locks_core_stall_config(), "")
+}
+
+/// Under S3 blips (continuation epochs): the certificate's epoch
+/// exclusion under transitions.
+fn locks_core_stall_blips_config() -> SimConfig {
+    SimConfig {
+        faults: locks_blips_config()
+            .faults
+            .into_iter()
+            .chain(locks_core_stall_config().faults)
+            .collect(),
+        ..locks_blips_config()
+    }
+}
+
+/// With a delegation: the owner side is deferred (a root with a live
+/// delegation never renews its own grants off the core), the node side
+/// goes through the lane.
+fn locks_core_stall_delegated_config() -> SimConfig {
+    SimConfig {
+        faults: locks_core_stall_config().faults,
+        ops_per_client: 10,
+        lock_ios: (4, 12),
+        lock_io_ms: (20, 150),
+        ..locks_delegated_config()
+    }
+}
+
 /// F1, F8 (`cst-load-review` §5.2 `locks-stall-step`): steps that take
 /// their `now`, then wait (in the store, or stopped) before deciding with
 /// it, on the lease holder (every grant's owner, and the executor of the
@@ -8997,6 +9166,8 @@ fn with_lock_writes(base: SimConfig, data_dir: &str) -> SimConfig {
 #[derive(Debug, Default)]
 struct M14Totals {
     seeds: u64,
+    /// Plan 41: renewals the lock lanes made (own, and held grants' `Ok`s).
+    lane_renewals: u64,
     clients: sim::locks::LockCounters,
     grants: u64,
     requests: u64,
@@ -9131,6 +9302,11 @@ impl M14Totals {
             self.renew_refused += s.renew_refused;
             self.doubt_lapses += s.lock_doubt_lapses;
         }
+        self.lane_renewals += r
+            .lane
+            .values()
+            .map(|l| l.own_renewals + l.remote_ok + l.late_ok)
+            .sum::<u64>();
         self.held_writes += r.held_writes;
         self.held_refused += r.held_refused;
         self.held_accepted += r.held_accepted;
@@ -10767,6 +10943,92 @@ fn locks_survive_stalled_steps() {
         let t = run_m14(label, cfg, seeds);
         assert!(t.grants > 300, "{label}: {t:?}");
         assert!(t.clients.turn_reads > 0, "{label}: {t:?}");
+    }
+}
+
+/// Plan 41 L2: a stuck authority core's node keeps its locks: its lane
+/// renews meanwhile, so a stall below the lease's usable end fences a
+/// fraction of what it fences without the lane. What is left is not the
+/// lane's to fix: an owner that crashed and restarted knows none of the
+/// grants it made (the renewal is answered `Lost`), and a grant installed
+/// and recalled while its holder's core is stuck waits for that core for its
+/// first local lock, so the recall outwaits it.
+#[test]
+fn locks_survive_core_stalls() {
+    let t = run_m14(
+        "locks-core-stall",
+        locks_core_stall_config(),
+        231_500..231_540,
+    );
+    assert!(t.grants > 300, "{t:?}");
+    assert!(t.lane_renewals > 20, "the lane never renewed: {t:?}");
+    // The fail-before: the code without the lane.
+    let u = run_m14(
+        "locks-core-stall-unlaned",
+        locks_core_stall_unlaned_config(),
+        231_500..231_540,
+    );
+    assert_eq!(u.lane_renewals, 0, "the lane renewed with the lane off");
+    assert!(
+        u.clients.fenced_ios > 0,
+        "without the lane the stalls fenced nothing: the configuration is vacuous: {u:?}"
+    );
+    assert!(
+        t.clients.fenced_ios * 4 <= u.clients.fenced_ios,
+        "the lane saves too little of the I/O the stalls fence ({} with it, {} without): {t:?}",
+        t.clients.fenced_ios,
+        u.clients.fenced_ios
+    );
+}
+
+/// The same under the other topologies and faults (safety, and no I/O
+/// fenced where the stall is below what the lease and freshness allow).
+#[test]
+fn locks_survive_core_stalls_in_every_topology() {
+    for (label, cfg, seeds) in [
+        (
+            "locks-core-stall-root",
+            locks_core_stall_root_config(),
+            231_550..231_570,
+        ),
+        (
+            "locks-core-stall-single",
+            locks_core_stall_single_config(),
+            231_600..231_620,
+        ),
+        (
+            "locks-core-stall-backup",
+            locks_core_stall_backup_config(),
+            231_700..231_720,
+        ),
+        (
+            "locks-core-stall-backup-beats",
+            locks_core_stall_backup_beats_config(),
+            231_800..231_820,
+        ),
+        (
+            "locks-core-stall-s3",
+            locks_core_stall_s3_config(),
+            231_900..231_920,
+        ),
+        (
+            "locks-core-stall-writes",
+            locks_core_stall_writes_config(),
+            232_100..232_120,
+        ),
+        (
+            "locks-core-stall-blips",
+            locks_core_stall_blips_config(),
+            232_200..232_220,
+        ),
+        (
+            "locks-core-stall-delegated",
+            locks_core_stall_delegated_config(),
+            232_300..232_320,
+        ),
+    ] {
+        let t = run_m14(label, cfg, seeds);
+        assert!(t.grants > 50, "{label}: {t:?}");
     }
 }
 

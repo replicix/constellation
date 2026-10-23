@@ -881,6 +881,10 @@ pub struct Stats {
     /// ([`Core::on_deleg_renew_answered_off_core`]); delegate: off-core
     /// answers applied as extensions ([`Core::on_deleg_renewed_off_core`]).
     pub deleg_root_answered_off_core: u64,
+    /// Plan 41: own lock grants the renewal lane extended while the core
+    /// was busy, and the lane's answers the core applied.
+    pub lock_lane_own: u64,
+    pub lock_lane_results: u64,
     pub deleg_off_core_answers_applied: u64,
     /// Delegations this node lost (a lapse; a refusal after the grant ran
     /// out) while a freeze of its heartbeat thread covered the time from
@@ -1649,6 +1653,9 @@ pub struct Core {
     /// Plan 41 R1: the root's delegation windows (`GenState`'s `until`),
     /// shared with whoever else may extend them ([`DelegWindows`]).
     pub(crate) dw: std::sync::Arc<DelegWindows>,
+    /// Plan 41 L2: the certificate the lock lane judges by, published at the
+    /// end of every step (`lock_lane_view`).
+    lane_cell: std::sync::Arc<crate::lane::LaneCell>,
     /// Plan 30 §M11 phase 2b: the placement window (the root).
     pl: placement::PlacementState,
     /// Plan 30 §M14.
@@ -1725,6 +1732,7 @@ impl Core {
             pr: promise::PromiseState::default(),
             dl: delegate::DelegationState::default(),
             dw: DelegWindows::new(),
+            lane_cell: crate::lane::LaneCell::new(),
             pl: placement::PlacementState::default(),
             lk: locks::LockState::default(),
             mode: AuthorityMode {
@@ -1764,6 +1772,17 @@ impl Core {
     /// it with the answerer.
     pub fn set_deleg_windows(&mut self, windows: std::sync::Arc<DelegWindows>) {
         self.dw = windows;
+    }
+
+    /// Plan 41 L2: the lock lane's certificate cell (the driver shares it
+    /// with the lane; [`Core::set_lane_cell`]).
+    pub fn lane_cell(&self) -> &std::sync::Arc<crate::lane::LaneCell> {
+        &self.lane_cell
+    }
+
+    /// Use `cell` as this core's certificate cell (before the first event).
+    pub fn set_lane_cell(&mut self, cell: std::sync::Arc<crate::lane::LaneCell>) {
+        self.lane_cell = cell;
     }
 
     pub fn lease(&self) -> &LeaseState {
@@ -1899,6 +1918,7 @@ impl Core {
         if self.stopped {
             self.dw.close_all();
             self.dw.publish(None, &[]);
+            self.lane_cell.publish(Default::default());
             return out;
         }
         self.clk = now;
@@ -2016,6 +2036,12 @@ impl Core {
                 req,
                 sent,
             } => self.on_deleg_renew_sent_off_core(gen, round, to, req, sent),
+            Event::LaneOwn { renewed } => self.on_lane_own(now, renewed, replica, &mut out),
+            Event::LaneRenewed {
+                from,
+                sent,
+                results,
+            } => self.on_lane_renewed(now, from, sent, results, replica, &mut out),
             Event::DelegRenewAnsweredOffCore { gen, from, ttl_ms } => {
                 self.on_deleg_renew_answered_off_core(now, gen, from, ttl_ms, &mut out)
             }
@@ -2040,6 +2066,7 @@ impl Core {
         // Plan 41 R2: what the root's off-core answerer may rest on, as of
         // the end of this step and before the driver dispatches its actions.
         self.deleg_publish_root(replica);
+        self.lock_publish_lane(now, replica);
         out
     }
 

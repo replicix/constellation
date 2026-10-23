@@ -33,6 +33,7 @@ pub mod core;
 pub mod deleg_lane;
 pub mod event;
 pub mod ids;
+pub mod lane;
 pub mod replica;
 pub mod segment;
 

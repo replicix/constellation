@@ -184,6 +184,25 @@ pub enum Event {
     /// after the request it answers (which the core still handles, and
     /// answers in full).
     DelegRenewAnsweredOffCore { gen: u64, from: NodeId, ttl_ms: u64 },
+    /// Plan 41 L2, the lock lane extended `renewed` of this node's own
+    /// grants at its own table while the core was busy
+    /// ([`Core::on_lane_own`]): statistics, the mirror, the lease renewal a
+    /// short window calls for. Urgent lane.
+    LaneOwn { renewed: u32 },
+    /// Plan 41 L4: the owner `from` answered the lane's `LockRenew` sent at
+    /// `sent` (this node's honour clock): the lane applied every `Ok`
+    /// already; the core applies every result as it applies its own
+    /// renewal's (`Lost`, `NotOwner`, the release of a recalled grant)
+    /// ([`Core::on_lane_renewed`]). Urgent lane.
+    LaneRenewed {
+        from: NodeId,
+        sent: HonourMs,
+        results: Vec<(
+            constellation_fs_core::Ino,
+            constellation_meta::locks::GrantId,
+            LockRenewResult,
+        )>,
+    },
     /// The off-core heartbeat thread did not run from `from` to `until`
     /// (this node's wait clock): the whole process was frozen, and nothing in it
     /// could renew a delegation (`Core::on_own_freeze`). The core uses it

@@ -1211,6 +1211,15 @@ pub async fn client_lock(
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         if (ino_fenced || owner_fenced) && !ignore_fence {
+            // `AUTHORITY_SIM_LANE_DEBUG=1`: when and where a stall fenced I/O.
+            if std::env::var_os("AUTHORITY_SIM_LANE_DEBUG").is_some() {
+                eprintln!(
+                    "fenced n{node} t{thread} ino={ino:#x} at {} ino_fenced={ino_fenced} \
+                     held={:?}",
+                    clock.elapsed_ms(),
+                    h.meta.locks().held(ino)
+                );
+            }
             ghost.count(|c| {
                 c.fenced_ios += 1;
                 if !ino_fenced {
