@@ -52,8 +52,38 @@ pub(super) const BREAKS: &[&str] = &[
 ];
 
 /// A write + `fsync` this slow, with the host attentive, is a latency
-/// regression (a bound with no protocol part: all of it is host slack).
+/// regression: the host slack of [`write_bound`]. Without a takeover the
+/// protocol has no part in it (all of it is host slack).
 const WRITE_BOUND: Duration = Duration::from_secs(10);
+
+/// The protocol part and the bound of the slowest write + `fsync` of a
+/// cell. After a seal-based backup takeover (`takeovers`) the successor
+/// acknowledges no mutation until its predecessor's strict-read horizon
+/// has passed, the quarantine the maintainer accepted (plan 43 gate G5,
+/// Q10a: `Timings::ack_floor_wait`, "acknowledging no mutation until its
+/// delegation horizon has passed wait_ms=..." in the successor's log), so
+/// the protocol's part is the seal window plus the longest wait any
+/// daemon logged (`logged`; measured, as `delegroot` does), and the bound
+/// that plus [`WRITE_BOUND`] of host time. `logged` is checked against
+/// the configured quarantine (`timings.ack_floor_wait(true)`, the most it
+/// can be): a longer wait is a product change this bound must not absorb.
+fn write_bound(
+    timings: &crate::timings::Timings,
+    takeovers: u64,
+    logged: Duration,
+) -> Result<(Duration, Duration)> {
+    anyhow::ensure!(
+        logged <= timings.ack_floor_wait(true),
+        "a successor's quarantine waited {logged:?}, past the configured {:?} (plan 43 G5)",
+        timings.ack_floor_wait(true)
+    );
+    let protocol = if takeovers == 0 {
+        Duration::ZERO
+    } else {
+        timings.backup_takeover + logged
+    };
+    Ok((protocol, protocol + WRITE_BOUND))
+}
 const INCREMENTS: u64 = 20;
 
 fn breaking() -> Result<Option<String>> {
@@ -546,13 +576,37 @@ fn load_probe_with(seed: u64, names: &[&str], takeover: bool) -> Result<()> {
             rep.bugs.join("; ")
         );
         // ---- latency, judged against the host.
+        let takeovers: u64 = clients
+            .iter()
+            .map(|c| {
+                crate::verify::counters(c)["backup_takeovers"]
+                    .as_u64()
+                    .unwrap_or(0)
+            })
+            .sum();
+        let logged = clients
+            .iter()
+            .flat_map(super::delegroot::floor_waits_logged)
+            .max()
+            .map_or(Duration::ZERO, Duration::from_millis);
+        let timings = crate::timings::Timings::from_pairs(&{
+            let mut env = vec![("CONSTELLATION_LEASE_TTL_MS", super::m9::TTL_MS.to_string())];
+            env.extend(extra.iter().cloned());
+            env
+        });
+        let (protocol, bound) = write_bound(&timings, takeovers, logged)?;
+        eprintln!(
+            "    {NAME}: write+fsync bound {bound:?} (protocol {protocol:?}: {takeovers} backup \
+             takeover(s), quarantine logged {logged:?} of at most {:?})",
+            timings.ack_floor_wait(true)
+        );
         for (c, (took, at, _)) in clients.iter().zip(&slowest) {
             crate::hostlag::latency_bound(
                 &format!("{}'s slowest write+fsync", c.name),
                 *at,
                 *took,
-                Duration::ZERO,
-                WRITE_BOUND,
+                protocol,
+                bound,
             )?;
         }
         Ok(())
@@ -667,4 +721,51 @@ fn append(c: &Client, line: &str) -> Result<()> {
         .open(&p)?
         .write_all(line.as_bytes())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::timings::Timings;
+
+    /// The cell's daemons: the M9 lease TTL and `CONSTELLATION_LOCK_TTL_MS`
+    /// 5000 (so the delegation TTL is 5 s too).
+    fn cell() -> Timings {
+        Timings::from_pairs(&[
+            ("CONSTELLATION_LEASE_TTL_MS", "20000"),
+            ("CONSTELLATION_LOCK_TTL_MS", "5000"),
+        ])
+    }
+
+    /// F2 of the 2026-10-24 validation: a takeover's accepted 14.5 s
+    /// quarantine (plan 43 G5) made a 16.5 s and an 18.6 s write fail a
+    /// flat 10 s bound.
+    #[test]
+    fn a_takeover_cell_bound_includes_the_accepted_quarantine() {
+        let t = cell();
+        assert_eq!(t.ack_floor_wait(true), Duration::from_millis(14_500));
+        let (protocol, bound) = write_bound(&t, 1, Duration::from_millis(14_500)).unwrap();
+        assert_eq!(protocol, Duration::from_millis(16_000));
+        assert_eq!(bound, Duration::from_millis(26_000));
+        assert!(Duration::from_millis(18_588) <= bound);
+        assert!(Duration::from_millis(16_462) <= bound);
+        // A quarantine the cap shortened is only what was logged.
+        let (protocol, bound) = write_bound(&t, 1, Duration::from_millis(8_500)).unwrap();
+        assert_eq!(protocol, Duration::from_millis(10_000));
+        assert_eq!(bound, Duration::from_millis(20_000));
+    }
+
+    /// Without a takeover the protocol has no part, as before.
+    #[test]
+    fn a_cell_without_a_takeover_keeps_the_flat_bound() {
+        let (protocol, bound) = write_bound(&cell(), 0, Duration::ZERO).unwrap();
+        assert_eq!(protocol, Duration::ZERO);
+        assert_eq!(bound, WRITE_BOUND);
+    }
+
+    /// A wait past the configured quarantine is not absorbed.
+    #[test]
+    fn a_quarantine_past_the_configured_one_is_an_error() {
+        assert!(write_bound(&cell(), 1, Duration::from_millis(14_501)).is_err());
+    }
 }
