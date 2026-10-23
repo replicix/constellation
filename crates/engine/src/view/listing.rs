@@ -17,12 +17,22 @@
 //!   out, under a byte cap. A cookie found in a remembered page resumes
 //!   after that page's last name when it is the page's last cookie (the
 //!   sequential case: the kernel continues from where the reply ended),
-//!   and otherwise by scanning from the page's anchor and skipping the
-//!   entries whose cookies the page held up to it. That is exact even if
-//!   the entry the cookie names, or the anchor, has since been removed (a
-//!   key seek past a name does not need the name to exist), and covers the
-//!   kernel's re-asks from any cookie of a reply, `seekdir` back within the
-//!   last pages, and another handle (`nfsd`).
+//!   and otherwise by scanning from the page's anchor to the cookie's own
+//!   entry ([`Seek`]): the resume is after that name, as if it were known.
+//!   That is exact even if the anchor has since been removed (a key seek
+//!   past a name does not need the name to exist), and if the entry the
+//!   cookie names was removed too: the place is then where the first of
+//!   the page's later entries, or the first name past the page, begins. It
+//!   covers the kernel's re-asks from any cookie of a reply, `seekdir` back
+//!   within the last pages, and another handle (`nfsd`).
+//!
+//!   A resume is always after a place in name order, so a page served
+//!   holds every entry from its anchor to its last name (nothing in
+//!   between is left out), which is what lets a later resume inside it
+//!   find its place. A page that instead listed the entries of its range
+//!   that a resume had not yet consumed, a name created behind the cursor
+//!   among them, would make the next resume inside it list again what the
+//!   page before had given (plan 40 P3 review).
 //! - **Cold**: a cookie no page holds costs one O(n) scan of the
 //!   directory's names, hashing them, until one hashes to `c`: the page
 //!   resumes after it. A collision (two names of one cookie) resumes after
@@ -149,14 +159,34 @@ impl Shard {
 pub(crate) enum Resume {
     /// 0, 1 or 2: from the first entry.
     Start,
-    /// A remembered page holds it: scan strictly after `after`, skipping
-    /// the entries whose cookies are in `skip` (each at most once).
+    /// A remembered page holds it: scan strictly after `after`, and, with
+    /// a `seek`, pass the entries before the cookie's place first.
     Hint {
         after: Option<Vec<u8>>,
-        skip: Cookies,
+        seek: Option<Seek>,
     },
     /// No page holds it.
     Cold,
+}
+
+/// A resume inside a remembered page: the place of `cookie` among the
+/// entries after the page's anchor.
+///
+/// The page held every entry from its anchor to `last` when it was served,
+/// in name order, the cookie's own among them; the entries of `ahead` came
+/// after it. Scanning from the anchor, an entry is before the place (the
+/// kernel consumed it, or it was created since behind the cursor) while it
+/// is not past `last` and not one of `ahead`, and the cookie's own entry is
+/// the last of those. So the place is after the cookie's entry, or, if it
+/// was removed, before the first entry of `ahead` or past `last` that is
+/// still there. An entry that was there throughout is never passed: it is
+/// either at or before the cookie's (consumed), or in `ahead`, or after
+/// `last`. A name created since with the cookie's own value (a collision)
+/// can only end the seek early, which lists names twice, never skips one.
+pub(crate) struct Seek {
+    cookie: u64,
+    ahead: Cookies,
+    last: Vec<u8>,
 }
 
 /// The counters of the listing path (exported by plan 40 P8).
@@ -301,12 +331,16 @@ impl Listing {
                 // The page's end: resume after its last name.
                 Resume::Hint {
                     after: Some(page.last.to_vec()),
-                    skip: Cookies::default(),
+                    seek: None,
                 }
             } else {
                 Resume::Hint {
                     after: page.anchor.as_ref().map(|a| a.to_vec()),
-                    skip: page.cookies[..=i].iter().copied().collect(),
+                    seek: Some(Seek {
+                        cookie,
+                        ahead: page.cookies[i + 1..].iter().copied().collect(),
+                        last: page.last.to_vec(),
+                    }),
                 }
             })
         });
@@ -408,9 +442,9 @@ impl View {
 
         // Where the page starts.
         let mut cold = false;
-        let (after, mut skip) = match listing.resolve(ino, cookie) {
-            Resume::Start => (None, Cookies::default()),
-            Resume::Hint { after, skip } => (after, skip),
+        let (after, mut seek) = match listing.resolve(ino, cookie) {
+            Resume::Start => (None, None),
+            Resume::Hint { after, seek } => (after, seek),
             Resume::Cold => {
                 listing.cold_scans.fetch_add(1, Ordering::Relaxed);
                 let mut scanned = 0u64;
@@ -436,7 +470,7 @@ impl View {
                     return Err(PageError::LostCookie);
                 };
                 cold = true;
-                (Some(name), Cookies::default())
+                (Some(name), None)
             }
         };
 
@@ -472,25 +506,29 @@ impl View {
             let mut added = None;
             let mut over = false;
             if let Some(page) = &page {
-                // What a lookup of each name the page may add waits for
-                // (`Dentry(dir, name)` and `Ino(child)`): a name already
-                // consumed (`skip`) is not added. Stored names are UTF-8
-                // (escaped, `constellation_vfs::name`); one that is not
-                // gets no entry, so it needs no wait.
-                page.wait(batch.iter().filter_map(|e| {
-                    if !skip.is_empty() && skip.contains(&key.cookie(&e.name)) {
-                        return None;
-                    }
-                    Some((e.ino, std::str::from_utf8(&e.name).ok()?))
-                }));
+                // What a lookup of each name of the batch waits for
+                // (`Dentry(dir, name)` and `Ino(child)`). Stored names are
+                // UTF-8 (escaped, `constellation_vfs::name`); one that is
+                // not gets no entry, so it needs no wait.
+                page.wait(
+                    batch
+                        .iter()
+                        .filter_map(|e| Some((e.ino, std::str::from_utf8(&e.name).ok()?))),
+                );
             }
             for (i, e) in batch.iter().enumerate() {
                 let c = key.cookie(&e.name);
-                if !skip.is_empty() && skip.remove(&c) {
-                    if emitted.is_empty() {
+                if let Some(s) = &seek {
+                    // Before the place (`Seek`): passed, and the page
+                    // starts after it. Only before the first entry added.
+                    if e.name.as_slice() <= s.last.as_slice() && !s.ahead.contains(&c) {
+                        if c == s.cookie {
+                            seek = None;
+                        }
                         anchor = Some(e.name.clone());
+                        continue;
                     }
-                    continue;
+                    seek = None;
                 }
                 if !in_page.insert(c) {
                     // Two names of one cookie in one page: it ends here,

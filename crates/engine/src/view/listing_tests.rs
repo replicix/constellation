@@ -422,6 +422,120 @@ fn a_listing_is_exact_across_inserts_and_removals_between_pages() {
     assert_eq!(fx.listing.stats().lost_cookies, 0);
 }
 
+/// K5 with a create behind the cursor: the kernel resumes from a cookie
+/// inside the reply it got last (getdents' buffer took only part of it),
+/// after a name was created before the entries it consumed. That page, and
+/// a page resumed inside it in turn, list no name that was there throughout
+/// twice and skip none, whether the entry the cookie names is still there
+/// or was removed meanwhile. A page resumed by skipping the consumed
+/// cookies from its anchor used to list the new name first, so the next
+/// resume inside it, skipping only that page's cookies, listed again the
+/// names the page before had already given.
+#[test]
+fn a_resume_inside_a_page_after_a_create_behind_it_repeats_nothing() {
+    for remove_resume_entry in [false, true] {
+        let fx = Fx::new();
+        let stable: Vec<String> = (1..=9).map(|i| format!("b{i}")).collect();
+        let dir = fx.dir("d", &stable);
+        // [., .., b1, b2, b3, b4]: the kernel consumes up to b2.
+        let p1 = fx.page(dir, 0, 6).unwrap();
+        assert_eq!(p1[3].0, "b2");
+        let mut consumed: Vec<String> = vec!["b1".into(), "b2".into()];
+        // Created behind the cursor (and, in the second round, the entry
+        // the cookie names removed).
+        fx.meta.create(dir, "a0", 0o644, 0, 0).unwrap();
+        if remove_resume_entry {
+            fx.meta.unlink(dir, "b2").unwrap();
+        }
+        let p2 = fx.page(dir, p1[3].1, 3).unwrap();
+        // The kernel consumes two entries of this reply.
+        consumed.extend(p2[..2].iter().map(|(n, _)| n.clone()));
+        let mut cookie = p2[1].1;
+        loop {
+            let page = fx.page(dir, cookie, 3).unwrap();
+            let Some(last) = page.last().cloned() else {
+                break;
+            };
+            consumed.extend(page.into_iter().map(|(n, _)| n));
+            cookie = last.1;
+        }
+        // `a0` came after the listing began: it may or may not be listed.
+        let listed: Vec<&String> = consumed.iter().filter(|n| *n != "a0").collect();
+        assert_eq!(
+            listed,
+            stable.iter().collect::<Vec<_>>(),
+            "removed b2: {remove_resume_entry}; listed {consumed:?}"
+        );
+        let stats = fx.listing.stats();
+        assert_eq!((stats.cold_scans, stats.lost_cookies), (0, 0), "{stats:?}");
+    }
+}
+
+/// The same at random: the kernel takes a random part of each reply and
+/// resumes from the last entry it took, while names are created across
+/// the whole order and removed (the one the next cookie names among them),
+/// between every two requests. Every name is listed at most once, and each
+/// that was there throughout exactly once, from the hints alone.
+#[test]
+fn random_partial_replies_under_churn_list_each_name_once() {
+    let fx = Fx::new();
+    let stable = names(600);
+    let dir = fx.dir("d", &stable);
+    let mut rng = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move |n: u64| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng % n
+    };
+    let mut listed: Vec<String> = Vec::new();
+    let mut live_new: Vec<String> = Vec::new();
+    let mut created = 0u64;
+    let mut cookie = 0;
+    loop {
+        let page = fx.page(dir, cookie, 3 + next(40) as usize).unwrap();
+        if page.is_empty() {
+            break;
+        }
+        // The kernel takes a part of the reply, at least one entry.
+        let took = 1 + next(page.len() as u64) as usize;
+        for (n, _) in &page[..took] {
+            if n != "." && n != ".." {
+                listed.push(n.clone());
+            }
+        }
+        let (at, c) = page[took - 1].clone();
+        cookie = c;
+        // Names come and go, behind and ahead of the cursor; sometimes
+        // the one the cookie names goes (only once it was listed, so
+        // that every name of `stable` is there until it is).
+        for _ in 0..next(4) {
+            let name = format!("{:x}-new-{created}", next(1 << 40));
+            created += 1;
+            fx.meta.create(dir, &name, 0o644, 0, 0).unwrap();
+            live_new.push(name);
+        }
+        if at != "." && at != ".." && next(3) == 0 {
+            fx.meta.unlink(dir, &at).unwrap();
+            live_new.retain(|n| *n != at);
+        }
+        if !live_new.is_empty() && next(2) == 0 {
+            let gone = live_new.swap_remove(next(live_new.len() as u64) as usize);
+            fx.meta.unlink(dir, &gone).unwrap();
+        }
+    }
+    let unique: BTreeSet<&String> = listed.iter().collect();
+    assert_eq!(unique.len(), listed.len(), "a name listed twice");
+    for n in &stable {
+        assert!(
+            unique.contains(n),
+            "{n} was there until listed, and is missing"
+        );
+    }
+    let stats = fx.listing.stats();
+    assert_eq!((stats.cold_scans, stats.lost_cookies), (0, 0), "{stats:?}");
+}
+
 /// The same under real concurrency: a thread creates and removes names of
 /// its own in the directory while another lists it.
 #[test]

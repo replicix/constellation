@@ -59332,3 +59332,26 @@ faster, on every file system. Nothing regressed on ext4, xfs, btrfs or tmpfs.
 
 No write path changed (`git diff --stat` touches no file of `crates/meta`, no key, no put). The first
 `daemon --upgrade` and the handoff are unchanged by P3.
+
+## Plan 40 P3 review: a resume inside a page is after its cookie's place (2026-10-23)
+
+A cookie inside a remembered page (K5: the kernel's `getdents` buffer took only part of the last reply)
+resumed by scanning from the page's anchor and skipping the entries whose cookies the page held up to the
+cookie; everything else was emitted. A name created behind the cursor was then listed first, and the page
+recorded for that reply no longer held every entry of its range: the entries it had skipped after its first
+one were consumed but not in it. The next resume inside that page skipped only its own cookies and listed
+those entries again (names `b1`..`b9`, a page `b1`..`b4` taken up to `b2`, `a0` created, the next reply taken
+up to its second entry: `b1` and `b2` listed twice). That breaks "every entry there throughout exactly once",
+and it is the common case under a concurrent create (the kernel resumes inside replies all the time).
+
+Now a resume inside a page is after the cookie's place in name order (`listing::Seek`): from the anchor, an
+entry is passed while it is not past the page's last name and not one of the page's later cookies, up to and
+including the cookie's own entry. If that entry was removed, the place is before the first surviving later
+entry of the page, or past the page. A name created behind the cursor is not listed (allowed), and a served
+page again holds its whole range, which the next resume relies on. A name created since with the cookie's own
+value can only end the seek early (names listed twice, never skipped). Cost unchanged: O(page).
+
+Tests: `a_resume_inside_a_page_after_a_create_behind_it_repeats_nothing` (with the resume entry kept and
+removed) fails before (`b1`, `b2` twice) and passes after; `random_partial_replies_under_churn_list_each_name_once`
+(random part of each reply taken, names created across the order and removed, the resume entry among them,
+between every two requests) passes, from hints alone. Plan 40 §4.9 is updated.

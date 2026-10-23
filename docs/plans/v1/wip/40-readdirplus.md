@@ -611,13 +611,23 @@ already keyed `(parent, name)` (`crates/mtree/src/keys.rs`), so:
   shared by the node's views; ~16 B per remembered cookie plus one name per
   page) — and, while the directory is open, every page of the pin window,
   outside that cap (pins, below). A request cookie `c` found at index `i` of a remembered page
-  resumes by scanning from that page's anchor and skipping every entry whose
-  cookie is in `cookies[0..=i]` (the ones the kernel consumed); everything
-  else is emitted. That is exact even if the entry with cookie `c`, or the
+  resumes **after `c`'s place in name order**: a scan from that page's
+  anchor passes every entry that is not past the page's last name and not
+  one of `cookies[i+1..]`, up to and including the entry of `c`, and emits
+  from there. That is exact even if the entry with cookie `c`, or the
   anchor, has since been removed (a key seek past a name does not need the
-  name to exist), covers K5's "resume from any cookie of the previous
-  reply", interrupted reads, `seekdir` back within the last pages and a
-  different handle (`nfsd`, K12), and costs O(page).
+  name to exist; with `c`'s entry gone the place is before the first
+  surviving entry of `cookies[i+1..]` or past the page), covers K5's
+  "resume from any cookie of the previous reply", interrupted reads,
+  `seekdir` back within the last pages and a different handle (`nfsd`,
+  K12), and costs O(page). Because every resume is after a place, every
+  served page holds all the entries from its anchor to its last name,
+  which is what the next resume inside it relies on. (R3a's first form
+  skipped only the entries whose cookies were in `cookies[0..=i]` and
+  emitted everything else: a name created behind the cursor was then
+  listed first, the page's range was no longer whole, and the next resume
+  inside that page listed again the entries the page before had given;
+  found in the P3 review.)
 - **Cold cookie** (not in the cache: a far `seekdir` on a stream whose
   pins overflowed, `nfsd` re-export, a restart mid-listing, eviction of a
   directory nobody has open): one O(n) scan of the
