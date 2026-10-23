@@ -156,6 +156,13 @@ pub enum Args {
         cookie: u64,
         plus: bool,
     },
+    Opendir {
+        ino: Ino,
+    },
+    Releasedir {
+        ino: Ino,
+        fh: Fh,
+    },
     Statfs {
         ino: Ino,
     },
@@ -217,6 +224,15 @@ pub enum Args {
         range: LockRange,
     },
     SyncView,
+}
+
+/// A directory stream's life, as [`MockVfs::dir_streams`] records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirStream {
+    /// `opendir` of `ino` answered the stream id `fh`.
+    Opened { ino: Ino, fh: Fh },
+    /// `releasedir` of the stream `fh` of `ino` was called.
+    Released { ino: Ino, fh: Fh },
 }
 
 /// The thread a call arrived on or completed on.
@@ -414,6 +430,8 @@ scripts! {
     release: () => on_release, always_release;
     fsync: () => on_fsync, always_fsync;
     readdir: Vec<DirEntry> => on_readdir, always_readdir;
+    opendir: Fh => on_opendir, always_opendir;
+    releasedir: () => on_releasedir, always_releasedir;
     statfs: StatFs => on_statfs, always_statfs;
     fallocate: () => on_fallocate, always_fallocate;
     seek: u64 => on_seek, always_seek;
@@ -442,6 +460,9 @@ struct Inner {
     handover_blockers: Mutex<Vec<String>>,
     /// Every [`Vfs::forget`], in order ([`MockVfs::forgets`]).
     forgets: Mutex<Vec<Ino>>,
+    /// Every directory stream opened and released, in order
+    /// ([`MockVfs::dir_streams`]).
+    dir_streams: Mutex<Vec<DirStream>>,
     /// Which inode's [`Vfs::forget`] waits before it acts, and how long
     /// ([`MockVfs::delay_forget`]).
     forget_delay: Mutex<Option<(Ino, Duration)>>,
@@ -489,6 +510,58 @@ impl<R: DirSink> DirSink for Tap<R> {
     fn add(&mut self, ino: Ino, next: u64, kind: crate::types::FileKind, name: &[u8]) -> bool {
         self.r.add(ino, next, kind, name)
     }
+
+    fn add_entry(
+        &mut self,
+        ino: Ino,
+        next: u64,
+        kind: crate::types::FileKind,
+        name: &[u8],
+        entry: Option<&Entry>,
+    ) -> bool {
+        self.r.add_entry(ino, next, kind, name, entry)
+    }
+}
+
+/// A scripted `readdir` reply into `sink`: under `plus` through
+/// [`DirSink::add_entry`] with the scripted entries' `entry`, else
+/// through [`DirSink::add`], until the sink is full.
+fn replay(sink: &mut dyn DirSink, plus: bool, entries: Vec<DirEntry>) {
+    for e in entries {
+        let name = e.name.as_bytes();
+        let full = if plus {
+            sink.add_entry(e.ino, e.next, e.kind, name, e.entry.as_ref())
+        } else {
+            sink.add(e.ino, e.next, e.kind, name)
+        };
+        if full {
+            break;
+        }
+    }
+}
+
+/// An `opendir` responder that records the stream it answers
+/// ([`MockVfs::dir_streams`]) before forwarding the answer.
+struct OpenedStream<R> {
+    r: R,
+    inner: std::sync::Weak<Inner>,
+    ino: Ino,
+}
+
+impl<R: Responder<Fh>> Responder<Fh> for OpenedStream<R> {
+    fn done(self, result: VfsResult<Fh>) {
+        if let (Ok(fh), Some(inner)) = (&result, self.inner.upgrade()) {
+            inner.dir_streams.lock().unwrap().push(DirStream::Opened {
+                ino: self.ino,
+                fh: *fh,
+            });
+        }
+        self.r.done(result);
+    }
+
+    fn begin_wait(&mut self) -> crate::responder::WaitStart {
+        self.r.begin_wait()
+    }
 }
 
 impl Inner {
@@ -520,6 +593,7 @@ impl MockVfs {
                 deferred: AtomicUsize::new(0),
                 handover_blockers: Mutex::new(Vec::new()),
                 forgets: Mutex::new(Vec::new()),
+                dir_streams: Mutex::new(Vec::new()),
                 forget_delay: Mutex::new(None),
                 lock_grace: Mutex::new(None),
             }),
@@ -530,6 +604,12 @@ impl MockVfs {
     /// no responder, so it is not among [`Self::calls`]).
     pub fn forgets(&self) -> Vec<Ino> {
         self.inner.forgets.lock().unwrap().clone()
+    }
+
+    /// Every directory stream opened (`opendir` answered, scripted or
+    /// not) and released (`releasedir` called), in order.
+    pub fn dir_streams(&self) -> Vec<DirStream> {
+        self.inner.dir_streams.lock().unwrap().clone()
     }
 
     /// Make each later [`Vfs::forget`] of `ino` wait `delay` on its
@@ -706,6 +786,24 @@ impl MockVfs {
         T: Clone + Send + 'static,
         R: Responder<T>,
     {
+        self.run_or(call, slot, r, reference, || {
+            Err(VfsError::new(Code::NotImplemented))
+        });
+    }
+
+    /// As [`Self::run`], `absent` being the answer of a mock with no
+    /// reference filesystem (and no script) in place of `NotImplemented`.
+    fn run_or<T, R>(
+        &self,
+        call: Call,
+        slot: impl FnOnce(&Scripts) -> &Mutex<Slot<T>>,
+        r: R,
+        reference: impl FnOnce(&RefView) -> VfsResult<T>,
+        absent: impl FnOnce() -> VfsResult<T>,
+    ) where
+        T: Clone + Send + 'static,
+        R: Responder<T>,
+    {
         let r = Tap {
             r,
             inner: Arc::downgrade(&self.inner),
@@ -715,7 +813,7 @@ impl MockVfs {
         let fallback = |r: Tap<R>| {
             let result = match &self.inner.view {
                 Some(view) => reference(view.as_ref()),
-                None => Err(VfsError::new(Code::NotImplemented)),
+                None => absent(),
             };
             r.done(result);
         };
@@ -1142,22 +1240,14 @@ impl Vfs for MockVfs {
         let script = self.inner.scripts.readdir.lock().unwrap().next(&call);
         let result = match script {
             None | Some(Script::Reference) => match &self.inner.view {
-                Some(view) => view.readdir(ino, cookie, &mut tap),
+                Some(view) => view.readdir(ino, cookie, plus, &mut tap),
                 None => Err(VfsError::new(Code::NotImplemented)),
             },
             Some(Script::Reply(entries)) => entries.map(|entries| {
-                for e in entries {
-                    if tap.add(e.ino, e.next, e.kind, e.name.as_bytes()) {
-                        break;
-                    }
-                }
+                replay(&mut tap, plus, entries);
             }),
             Some(Script::With(f)) => f(&call).map(|entries| {
-                for e in entries {
-                    if tap.add(e.ino, e.next, e.kind, e.name.as_bytes()) {
-                        break;
-                    }
-                }
+                replay(&mut tap, plus, entries);
             }),
             Some(Script::Defer { after, result }) => {
                 let inner = self.inner.clone();
@@ -1170,11 +1260,7 @@ impl Vfs for MockVfs {
                             std::thread::sleep(after);
                             let mut tap = tap;
                             let result = result.map(|entries| {
-                                for e in entries {
-                                    if tap.add(e.ino, e.next, e.kind, e.name.as_bytes()) {
-                                        break;
-                                    }
-                                }
+                                replay(&mut tap, plus, entries);
                             });
                             tap.done(result);
                             inner.deferred.fetch_sub(1, Ordering::AcqRel);
@@ -1193,6 +1279,28 @@ impl Vfs for MockVfs {
             }
         };
         tap.done(result);
+    }
+
+    fn opendir<R: Responder<Fh>>(&self, cx: &OpCtx<'_>, ino: Ino, r: R) {
+        let call = self.record(cx, Args::Opendir { ino });
+        let r = OpenedStream {
+            r,
+            inner: Arc::downgrade(&self.inner),
+            ino,
+        };
+        // Nothing keeps stream state here, so un-scripted it is the
+        // trait's default, with a reference filesystem or without.
+        self.run_or(call, |s| &s.opendir, r, |_| Ok(Fh(0)), || Ok(Fh(0)));
+    }
+
+    fn releasedir<R: Responder<()>>(&self, cx: &OpCtx<'_>, ino: Ino, fh: Fh, r: R) {
+        let call = self.record(cx, Args::Releasedir { ino, fh });
+        self.inner
+            .dir_streams
+            .lock()
+            .unwrap()
+            .push(DirStream::Released { ino, fh });
+        self.run_or(call, |s| &s.releasedir, r, |_| Ok(()), || Ok(()));
     }
 
     fn statfs<R: Responder<StatFs>>(&self, cx: &OpCtx<'_>, ino: Ino, r: R) {
@@ -1802,6 +1910,7 @@ mod tests {
                 next: i + 1,
                 kind: FileKind::File,
                 name: format!("e{i}").into(),
+                entry: None,
             })
             .collect();
         mock.always_readdir(Script::ok(entries));
@@ -1820,6 +1929,265 @@ mod tests {
                 plus: false
             }
         );
+    }
+
+    #[test]
+    fn a_plus_readdir_script_hands_its_entries_to_the_sink_and_a_plain_one_does_not() {
+        let mock = MockVfs::new();
+        let entries: Vec<DirEntry> = (0..3)
+            .map(|i| DirEntry {
+                ino: 10 + i,
+                next: i + 1,
+                kind: FileKind::File,
+                name: format!("e{i}").into(),
+                // The first is name-only, the others carry attributes.
+                entry: (i > 0).then(|| entry(10 + i)),
+            })
+            .collect();
+        mock.always_readdir(Script::ok(entries));
+        let c = caller();
+        for plus in [true, false] {
+            let (sink, wait) = CollectDir::pair(10);
+            mock.readdir(&cx(OpKind::Readdirplus, &c), 1, Fh(0), 0, plus, sink);
+            let got = wait.wait().unwrap();
+            let carried: Vec<bool> = got.iter().map(|e| e.entry.is_some()).collect();
+            assert_eq!(
+                carried,
+                if plus {
+                    vec![false, true, true]
+                } else {
+                    vec![false; 3]
+                },
+                "plus: {plus}"
+            );
+            if plus {
+                assert_eq!(got[2].entry, Some(entry(12)));
+            }
+        }
+        // A deferred script replays them the same way.
+        mock.always_readdir(Script::Defer {
+            after: Duration::from_millis(1),
+            result: Ok(vec![DirEntry {
+                ino: 3,
+                next: 1,
+                kind: FileKind::File,
+                name: "d".into(),
+                entry: Some(entry(3)),
+            }]),
+        });
+        let (sink, wait) = CollectDir::pair(10);
+        mock.readdir(&cx(OpKind::Readdirplus, &c), 1, Fh(0), 0, true, sink);
+        assert_eq!(wait.wait().unwrap()[0].entry, Some(entry(3)));
+    }
+
+    #[test]
+    fn directory_streams_are_recorded_and_default_to_no_stream() {
+        let c = caller();
+        // No filesystem and no script: the trait's defaults, not
+        // `NotImplemented`.
+        let mock = MockVfs::new();
+        let fh = Blocking::run(|r| mock.opendir(&cx(OpKind::Opendir, &c), 5, r)).unwrap();
+        assert_eq!(fh, Fh(0));
+        Blocking::run(|r| mock.releasedir(&cx(OpKind::Releasedir, &c), 5, fh, r)).unwrap();
+        // A reference filesystem keeps no stream state either.
+        let reference = MockVfs::reference(FrontendCaps::linux_fuse(false));
+        let fh = Blocking::run(|r| reference.opendir(&cx(OpKind::Opendir, &c), ROOT_INO, r));
+        assert_eq!(fh, Ok(Fh(0)));
+        // A script gives the stream its id; a failed open is no stream.
+        mock.on_opendir(Script::ok(Fh(1 << 62 | 9)))
+            .on_opendir(Script::fail(Code::Again));
+        let fh = Blocking::run(|r| mock.opendir(&cx(OpKind::Opendir, &c), 6, r)).unwrap();
+        assert_eq!(fh, Fh(1 << 62 | 9));
+        let failed = Blocking::run(|r| mock.opendir(&cx(OpKind::Opendir, &c), 7, r));
+        assert_eq!(failed, Err(Code::Again.into()));
+        Blocking::run(|r| mock.releasedir(&cx(OpKind::Releasedir, &c), 6, fh, r)).unwrap();
+        assert_eq!(
+            mock.dir_streams(),
+            vec![
+                DirStream::Opened { ino: 5, fh: Fh(0) },
+                DirStream::Released { ino: 5, fh: Fh(0) },
+                DirStream::Opened {
+                    ino: 6,
+                    fh: Fh(1 << 62 | 9)
+                },
+                DirStream::Released {
+                    ino: 6,
+                    fh: Fh(1 << 62 | 9)
+                },
+            ]
+        );
+        let ops: Vec<(OpKind, Args)> = mock
+            .calls()
+            .into_iter()
+            .map(|call| (call.op, call.args))
+            .collect();
+        assert_eq!(ops[0], (OpKind::Opendir, Args::Opendir { ino: 5 }));
+        assert_eq!(
+            ops[1],
+            (OpKind::Releasedir, Args::Releasedir { ino: 5, fh: Fh(0) })
+        );
+    }
+
+    /// The reference filesystem is the plus oracle: each child's entry is
+    /// its lookup's (and its getattr's) at that moment, `.`/`..` are
+    /// name-only, and a hard-linked inode's names all answer the inode's
+    /// attributes.
+    #[test]
+    fn the_reference_plus_listing_answers_what_lookup_answers() {
+        use crate::types::{SetAttr, TimeSet};
+        let mock = MockVfs::reference(FrontendCaps::linux_fuse(false));
+        let c = caller();
+        let root = ROOT_INO;
+        let made = |r: VfsResult<Entry>| r.unwrap();
+        let d = made(Blocking::run(|r| {
+            mock.mkdir(&cx(OpKind::Mkdir, &c), root, Name::new("d"), 0o755, r)
+        }))
+        .attr
+        .ino;
+        let f = made(Blocking::run(|r| {
+            mock.mknod(
+                &cx(OpKind::Mknod, &c),
+                d,
+                Name::new("f"),
+                crate::types::mode::S_IFREG | 0o644,
+                Rdev::default(),
+                r,
+            )
+        }))
+        .attr
+        .ino;
+        made(Blocking::run(|r| {
+            mock.link(&cx(OpKind::Link, &c), f, d, Name::new("f2"), r)
+        }));
+        made(Blocking::run(|r| {
+            mock.mkdir(&cx(OpKind::Mkdir, &c), d, Name::new("sub"), 0o700, r)
+        }));
+        made(Blocking::run(|r| {
+            mock.symlink(&cx(OpKind::Symlink, &c), d, Name::new("s"), b"f", r)
+        }));
+        // Changes a cached directory entry would have missed.
+        Blocking::run(|r| {
+            mock.setattr(
+                &cx(OpKind::Setattr, &c),
+                f,
+                None,
+                &SetAttr {
+                    mode: Some(0o600),
+                    size: Some(5),
+                    mtime: Some(TimeSet::At(7)),
+                    ..SetAttr::default()
+                },
+                r,
+            )
+        })
+        .unwrap();
+        let (sink, wait) = CollectDir::pair(100);
+        mock.readdir(&cx(OpKind::Readdirplus, &c), d, Fh(0), 0, true, sink);
+        let listed = wait.wait().unwrap();
+        assert_eq!(listed.len(), 2 + 4);
+        for e in &listed {
+            if matches!(e.name.as_bytes(), b"." | b"..") {
+                assert_eq!(e.entry, None, "{:?}", e.name);
+                continue;
+            }
+            let looked = Blocking::run(|r| {
+                mock.lookup(&cx(OpKind::Lookup, &c), d, Name::new(&e.name.as_bytes()), r)
+            })
+            .unwrap();
+            assert_eq!(e.entry.as_ref(), Some(&looked), "{:?}", e.name);
+            let got =
+                Blocking::run(|r| mock.getattr(&cx(OpKind::Getattr, &c), e.ino, None, r)).unwrap();
+            assert_eq!(e.entry.as_ref().map(|x| &x.attr), Some(&got));
+        }
+        let by_name = |n: &[u8]| listed.iter().find(|e| e.name.as_bytes() == n).unwrap();
+        let (a, b) = (by_name(b"f"), by_name(b"f2"));
+        assert_eq!(a.ino, b.ino);
+        assert_eq!(a.entry, b.entry, "both names of a hard link");
+        let attr = &a.entry.as_ref().unwrap().attr;
+        assert_eq!((attr.nlink, attr.size, attr.mode & 0o7777), (2, 5, 0o600));
+        // The same listing, plain, has no entry at all.
+        let (sink, wait) = CollectDir::pair(100);
+        mock.readdir(&cx(OpKind::Readdir, &c), d, Fh(0), 0, false, sink);
+        assert!(wait.wait().unwrap().iter().all(|e| e.entry.is_none()));
+    }
+
+    /// A plus entry is a reference as a lookup's is: the name removed
+    /// meanwhile, the inode answers `nlink` 0 until the platform's
+    /// `forget`.
+    #[test]
+    fn the_reference_keeps_a_plus_listed_inode_until_forget() {
+        let mock = MockVfs::reference(FrontendCaps::linux_fuse(false));
+        let c = caller();
+        let f = Blocking::run(|r| {
+            mock.mknod(
+                &cx(OpKind::Mknod, &c),
+                ROOT_INO,
+                Name::new("f"),
+                crate::types::mode::S_IFREG | 0o644,
+                Rdev::default(),
+                r,
+            )
+        })
+        .unwrap()
+        .attr
+        .ino;
+        let (sink, wait) = CollectDir::pair(100);
+        mock.readdir(&cx(OpKind::Readdirplus, &c), ROOT_INO, Fh(0), 0, true, sink);
+        assert!(wait
+            .wait()
+            .unwrap()
+            .iter()
+            .any(|e| e.ino == f && e.entry.is_some()));
+        Blocking::run(|r| mock.unlink(&cx(OpKind::Unlink, &c), ROOT_INO, Name::new("f"), r))
+            .unwrap();
+        let attr = Blocking::run(|r| mock.getattr(&cx(OpKind::Getattr, &c), f, None, r)).unwrap();
+        assert_eq!(attr.nlink, 0);
+        mock.forget(f);
+        let gone = Blocking::run(|r| mock.getattr(&cx(OpKind::Getattr, &c), f, None, r));
+        assert!(gone.is_err());
+    }
+
+    #[test]
+    fn the_reference_plus_listing_of_the_snapshot_tree_is_lookups_too() {
+        let mock = MockVfs::reference(FrontendCaps::linux_fuse(false));
+        let c = caller();
+        Blocking::run(|r| mock.mkdir(&cx(OpKind::Mkdir, &c), ROOT_INO, Name::new("d"), 0o755, r))
+            .unwrap();
+        mock.snapshot("/", "s1").unwrap();
+        let meta = Blocking::run(|r| {
+            mock.lookup(
+                &cx(OpKind::Lookup, &c),
+                ROOT_INO,
+                Name::new(".constellation"),
+                r,
+            )
+        })
+        .unwrap();
+        let mut dir = meta.attr.ino;
+        for level in 0..3 {
+            let (sink, wait) = CollectDir::pair(100);
+            mock.readdir(&cx(OpKind::Readdirplus, &c), dir, Fh(0), 0, true, sink);
+            let listed = wait.wait().unwrap();
+            let child = listed
+                .iter()
+                .find(|e| !matches!(e.name.as_bytes(), b"." | b".."))
+                .unwrap_or_else(|| panic!("level {level} lists a child"));
+            let looked = Blocking::run(|r| {
+                mock.lookup(
+                    &cx(OpKind::Lookup, &c),
+                    dir,
+                    Name::new(&child.name.as_bytes()),
+                    r,
+                )
+            })
+            .unwrap();
+            assert_eq!(child.entry.as_ref(), Some(&looked), "level {level}");
+            assert!(listed
+                .iter()
+                .filter(|e| matches!(e.name.as_bytes(), b"." | b".."))
+                .all(|e| e.entry.is_none()));
+            dir = child.ino;
+        }
     }
 
     #[test]

@@ -1112,6 +1112,7 @@ fn dirent(ino: u64, next: u64, kind: FileKind, name: &str) -> DirEntry {
         next,
         kind,
         name: name.into(),
+        entry: None,
     }
 }
 

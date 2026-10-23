@@ -274,6 +274,20 @@ impl<R: DirSink> DirSink for Timed<R> {
             None => true,
         }
     }
+
+    fn add_entry(
+        &mut self,
+        ino: Ino,
+        next: u64,
+        kind: FileKind,
+        name: &[u8],
+        entry: Option<&crate::types::Entry>,
+    ) -> bool {
+        match self.inner.as_mut() {
+            Some(sink) => sink.add_entry(ino, next, kind, name, entry),
+            None => true,
+        }
+    }
 }
 
 /// One (frontend, view, transport, op) as scraped: the counters of every
@@ -513,5 +527,40 @@ mod tests {
         assert!(!sink.add(2, 1, FileKind::File, b"f"));
         sink.done(Ok(()));
         assert_eq!(wait.wait().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_readdir_sink_wrapped_still_gets_the_plus_entries() {
+        use crate::responder::CollectDir;
+        use crate::types::Entry;
+        let m = OpMetrics::detached("unit", None, NO_TRANSPORT);
+        let (sink, wait) = CollectDir::pair(8);
+        let mut sink = m.timed(OpKind::Readdirplus, Instant::now(), sink);
+        let attr = crate::types::Attr {
+            ino: 2,
+            kind: FileKind::File,
+            size: 0,
+            blocks: 0,
+            mode: 0o644,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: Default::default(),
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
+            blksize: 4096,
+            ttl: Duration::from_secs(1),
+        };
+        let entry = Entry {
+            attr,
+            generation: 3,
+        };
+        assert!(!sink.add_entry(2, 1, FileKind::File, b"f", Some(&entry)));
+        assert!(!sink.add_entry(1, 2, FileKind::Dir, b".", None));
+        sink.done(Ok(()));
+        let got = wait.wait().unwrap();
+        assert_eq!(got[0].entry, Some(entry));
+        assert_eq!(got[1].entry, None);
     }
 }

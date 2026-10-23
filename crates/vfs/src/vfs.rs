@@ -263,6 +263,37 @@ pub trait Vfs: Send + Sync + 'static {
 
     /// List `ino` from `cookie` on (0: the start; each entry carries the
     /// cookie to resume after it) into `r` until it is full, then answer.
+    ///
+    /// **Cookies.** A cookie is deterministic in the name it follows and
+    /// can be resolved from any earlier reply of this directory without
+    /// per-handle state: a listing resumes after the *name* it stopped
+    /// at, from any client, however much the directory changed in
+    /// between, so an unlink or a create never repeats or skips an entry
+    /// that was there throughout. `fh` (what [`Vfs::opendir`] answered)
+    /// is not part of a cookie's meaning; a view may use it only to know
+    /// which directories are being listed. Plain and `plus` pages use
+    /// the same cookies, and a listing may switch between them at any
+    /// page. A cookie whose name is gone answers `NotFound` when the
+    /// view cannot place it any more (no stream of the directory holds
+    /// its place); it never resumes at another position. `.` and `..`
+    /// have cookies that precede every other.
+    ///
+    /// **`plus`.** The listing is a `READDIRPLUS`: the view adds each
+    /// entry with [`DirSink::add_entry`]. Every `Some(entry)` it hands
+    /// out is a reference the platform holds until [`Vfs::forget`],
+    /// exactly as a [`Vfs::lookup`]'s [`Entry`], and is what
+    /// `lookup(ino, name)` would answer at that moment (attributes,
+    /// generation, TTL), waited for as a `getattr` of the child waits (a
+    /// name of a hard-linked inode included: its attributes are the
+    /// inode's, not a copy a dentry kept). `.` and `..` are always
+    /// name-only (`None`), as is a name whose answer the view cannot
+    /// vouch for. Without `plus` every entry is added with
+    /// [`DirSink::add`].
+    ///
+    /// **A view never answers an error after it added an entry** (a
+    /// per-name failure makes that entry name-only), so a frontend can
+    /// account the entries it was given when the page succeeds and none
+    /// when it fails.
     #[allow(clippy::too_many_arguments)]
     fn readdir<R: DirSink + Responder<()>>(
         &self,
@@ -273,6 +304,26 @@ pub trait Vfs: Send + Sync + 'static {
         plus: bool,
         r: R,
     );
+
+    /// A directory `ino` was opened (Linux FUSE: `OPENDIR`). The answer
+    /// is the stream id the platform passes back on `readdir` and
+    /// [`Vfs::releasedir`] of this open. A view uses the pair only to
+    /// know which directories are open, so that what it keeps to place
+    /// their cookies is not dropped meanwhile; cookies stay independent of
+    /// the handle. `Fh(0)` by default (no stream).
+    fn opendir<R: Responder<Fh>>(&self, cx: &OpCtx<'_>, ino: Ino, r: R) {
+        let _ = (cx, ino);
+        r.done(Ok(Fh(0)));
+    }
+
+    /// The directory stream `fh` of `ino` was closed (Linux FUSE:
+    /// `RELEASEDIR`, unwaited for). **It must never block**: a frontend
+    /// may call it from a thread that serves other requests. Answers
+    /// `Ok` by default.
+    fn releasedir<R: Responder<()>>(&self, cx: &OpCtx<'_>, ino: Ino, fh: Fh, r: R) {
+        let _ = (cx, ino, fh);
+        r.done(Ok(()));
+    }
 
     fn statfs<R: Responder<StatFs>>(&self, cx: &OpCtx<'_>, ino: Ino, r: R);
 

@@ -181,7 +181,7 @@ impl Client {
 
     /// The platform lets go of `ino` ([`crate::Vfs::forget`], Linux FUSE's
     /// `FORGET`). Until then, every inode an op handed this client (an
-    /// [`Entry`], or the inode it was asked about) is one the platform
+    /// [`Entry`], a `plus` listing's entry, or the inode it was asked about) is one the platform
     /// still references, as a kernel holds what it looked up: a removed
     /// one answers `getattr` with `nlink == 0`, as a local filesystem
     /// answers `fstat` of a deleted file or directory.
@@ -390,7 +390,10 @@ impl Client {
         .wait()
     }
 
-    /// One `readdir` page of at most `limit` entries from `cookie`.
+    /// One `readdir` page of at most `limit` entries from `cookie`, with
+    /// no directory stream open (`Fh(0)`). Under `plus` each `Some(entry)`
+    /// of the page is a reference this client holds until its
+    /// [`Client::forget`], as a lookup's.
     pub fn readdir_page(
         &self,
         ino: Ino,
@@ -398,8 +401,40 @@ impl Client {
         limit: usize,
         plus: bool,
     ) -> VfsResult<Vec<DirEntry>> {
-        self.start(OpKind::Readdir, "readdir", |v, cx, d| {
-            v.readdir(cx, ino, Fh(0), cookie, plus, limit, d)
+        self.readdir_page_fh(ino, Fh(0), cookie, limit, plus)
+    }
+
+    /// As [`Self::readdir_page`] on the directory stream `fh`
+    /// ([`Self::opendir`]).
+    pub fn readdir_page_fh(
+        &self,
+        ino: Ino,
+        fh: Fh,
+        cookie: u64,
+        limit: usize,
+        plus: bool,
+    ) -> VfsResult<Vec<DirEntry>> {
+        let (kind, what) = if plus {
+            (OpKind::Readdirplus, "readdirplus")
+        } else {
+            (OpKind::Readdir, "readdir")
+        };
+        self.start(kind, what, |v, cx, d| {
+            v.readdir(cx, ino, fh, cookie, plus, limit, d)
+        })
+        .wait()
+    }
+
+    /// `opendir`: the directory stream id.
+    pub fn opendir(&self, ino: Ino) -> VfsResult<Fh> {
+        self.start(OpKind::Opendir, "opendir", |v, cx, d| v.opendir(cx, ino, d))
+            .wait()
+    }
+
+    /// `releasedir`: the stream is closed.
+    pub fn releasedir(&self, ino: Ino, fh: Fh) -> VfsResult<()> {
+        self.start(OpKind::Releasedir, "releasedir", |v, cx, d| {
+            v.releasedir(cx, ino, fh, d)
         })
         .wait()
     }

@@ -64,6 +64,17 @@ struct ProbeDir {
 
 impl DirSink for ProbeDir {
     fn add(&mut self, ino: Ino, next: u64, kind: FileKind, name: &[u8]) -> bool {
+        self.add_entry(ino, next, kind, name, None)
+    }
+
+    fn add_entry(
+        &mut self,
+        ino: Ino,
+        next: u64,
+        kind: FileKind,
+        name: &[u8],
+        entry: Option<&Entry>,
+    ) -> bool {
         if self.entries.len() >= self.limit {
             return true;
         }
@@ -72,6 +83,7 @@ impl DirSink for ProbeDir {
             next,
             kind,
             name: NameBuf::new(name),
+            entry: entry.cloned(),
         });
         false
     }
@@ -158,6 +170,8 @@ pub trait DynVfs: Send + Sync {
         limit: usize,
         done: Done<Vec<DirEntry>>,
     );
+    fn opendir(&self, cx: &OpCtx<'_>, ino: Ino, done: Done<Fh>);
+    fn releasedir(&self, cx: &OpCtx<'_>, ino: Ino, fh: Fh, done: Done<()>);
     fn statfs(&self, cx: &OpCtx<'_>, ino: Ino, done: Done<StatFs>);
     fn fallocate(
         &self,
@@ -393,6 +407,14 @@ impl<V: Vfs> DynVfs for V {
             inner: Probe::new(done),
         };
         Vfs::readdir(self, cx, ino, fh, cookie, plus, sink);
+    }
+
+    fn opendir(&self, cx: &OpCtx<'_>, ino: Ino, done: Done<Fh>) {
+        Vfs::opendir(self, cx, ino, Probe::new(done));
+    }
+
+    fn releasedir(&self, cx: &OpCtx<'_>, ino: Ino, fh: Fh, done: Done<()>) {
+        Vfs::releasedir(self, cx, ino, fh, Probe::new(done));
     }
 
     fn statfs(&self, cx: &OpCtx<'_>, ino: Ino, done: Done<StatFs>) {

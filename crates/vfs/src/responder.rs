@@ -29,7 +29,7 @@
 use crate::ctx::CancelToken;
 use crate::error::{VfsError, VfsResult};
 use crate::name::NameBuf;
-use crate::types::{FileKind, Ino};
+use crate::types::{Entry, FileKind, Ino};
 use constellation_types::Code;
 use std::marker::PhantomData;
 use std::sync::mpsc;
@@ -183,6 +183,33 @@ pub trait DirSink {
     /// `true` when the buffer is full (the entry was not added: resume
     /// from it next time).
     fn add(&mut self, ino: Ino, next: u64, kind: FileKind, name: &[u8]) -> bool;
+
+    /// One entry of a `plus` listing ([`crate::Vfs::readdir`] with `plus`).
+    ///
+    /// `entry` is what a `lookup` of `name` in the listed directory
+    /// answers right now (attributes, TTL, generation), which the
+    /// frontend may hand its platform as a reference exactly like a
+    /// lookup's, or `None`: the name only (`.` and `..`, a name whose
+    /// answer the view cannot vouch for, a zero TTL). Returns `true` when
+    /// the buffer is full (the entry was not added), as [`Self::add`]
+    /// does.
+    ///
+    /// The default drops `entry` and adds the name only, so a sink that
+    /// does not take attributes (a plain `READDIR` reply, a frontend
+    /// without a plus listing) is unchanged. A sink that wraps another
+    /// one must forward this method, or the wrapped sink never sees an
+    /// entry.
+    fn add_entry(
+        &mut self,
+        ino: Ino,
+        next: u64,
+        kind: FileKind,
+        name: &[u8],
+        entry: Option<&Entry>,
+    ) -> bool {
+        let _ = entry;
+        self.add(ino, next, kind, name)
+    }
 }
 
 /// One directory entry, as [`CollectDir`] collects them.
@@ -192,6 +219,9 @@ pub struct DirEntry {
     pub next: u64,
     pub kind: FileKind,
     pub name: NameBuf,
+    /// What [`DirSink::add_entry`] was given (`None` for a plain listing
+    /// and for a name-only plus entry).
+    pub entry: Option<Entry>,
 }
 
 /// A blocking `readdir` responder that collects up to `limit` entries.
@@ -217,6 +247,17 @@ impl CollectDir {
 
 impl DirSink for CollectDir {
     fn add(&mut self, ino: Ino, next: u64, kind: FileKind, name: &[u8]) -> bool {
+        self.add_entry(ino, next, kind, name, None)
+    }
+
+    fn add_entry(
+        &mut self,
+        ino: Ino,
+        next: u64,
+        kind: FileKind,
+        name: &[u8],
+        entry: Option<&Entry>,
+    ) -> bool {
         if self.entries.len() >= self.limit {
             return true;
         }
@@ -225,6 +266,7 @@ impl DirSink for CollectDir {
             next,
             kind,
             name: NameBuf::new(name),
+            entry: entry.cloned(),
         });
         false
     }

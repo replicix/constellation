@@ -71,6 +71,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
+/// One entry of a listing as `readdir` collects it under the lock:
+/// `(ino, next cookie, kind, name, the plus entry)`.
+type ListedEntry = (Ino, u64, FileKind, Vec<u8>, Option<Entry>);
+
 /// The root-only directory marker that starts a *link domain* inside a
 /// view (`ViewSpec::confine_links`, plan 31 §6.12). Mirrors the engine's
 /// `constellation_engine::LINK_DOMAIN_XATTR`; a `trusted.*` name, so only
@@ -1663,12 +1667,31 @@ impl RefView {
         })
     }
 
-    pub fn readdir(&self, ino: Ino, cookie: u64, sink: &mut dyn DirSink) -> VfsResult<()> {
+    /// List `ino` from `cookie` on into `sink`. Under `plus`, a child is
+    /// added with [`Self::lookup`]'s own entry for it (`entry_of`, the
+    /// same code under the same lock hold as the page), so the oracle
+    /// cannot differ from the lookup it is compared with: a hard-linked
+    /// inode's name answers the inode's attributes like any other, and
+    /// `.`/`..` are name-only.
+    ///
+    /// The listing is the contract's: cookies are creation sequence
+    /// numbers, which are stream-independent, resolve without any state,
+    /// and survive the deletion of the name they follow. `ino` handed in
+    /// a `plus` entry is a reference as a lookup's is: a view that
+    /// removes the inode keeps its final attributes (`bury`) until the
+    /// platform's `forget`, whoever it was handed to.
+    pub fn readdir(
+        &self,
+        ino: Ino,
+        cookie: u64,
+        plus: bool,
+        sink: &mut dyn DirSink,
+    ) -> VfsResult<()> {
         let st = self.fs.lock();
         let target = self.enter(&st, ino)?;
-        // Collect (ino, next, kind, name) first: the sink is the
+        // Collect (ino, next, kind, name, entry) first: the sink is the
         // frontend's, and nothing of it runs under our lock's borrows.
-        let mut entries: Vec<(Ino, u64, FileKind, Vec<u8>)> = Vec::new();
+        let mut entries: Vec<ListedEntry> = Vec::new();
         match target {
             Target::Real(dir) => {
                 let node = st.node(dir)?;
@@ -1680,11 +1703,18 @@ impl RefView {
                 } else {
                     node.parents.first().copied().unwrap_or(dir)
                 };
-                entries.push((self.virt(dir), 1, FileKind::Dir, b".".to_vec()));
-                entries.push((self.virt(up), 2, FileKind::Dir, b"..".to_vec()));
+                entries.push((self.virt(dir), 1, FileKind::Dir, b".".to_vec(), None));
+                entries.push((self.virt(up), 2, FileKind::Dir, b"..".to_vec(), None));
                 for (&seq, name) in node.dir().by_seq.range(cookie.saturating_add(1)..) {
                     let (child, _) = node.dir().by_name[name];
-                    entries.push((self.virt(child), seq, st.nodes[&child].kind, name.clone()));
+                    let entry = plus.then(|| self.entry_of(&st, child));
+                    entries.push((
+                        self.virt(child),
+                        seq,
+                        st.nodes[&child].kind,
+                        name.clone(),
+                        entry,
+                    ));
                 }
             }
             Target::Syn(syn) => {
@@ -1720,28 +1750,22 @@ impl RefView {
                         }
                     }
                 }
-                entries.push((ino, 1, FileKind::Dir, b".".to_vec()));
-                entries.push((ino, 2, FileKind::Dir, b"..".to_vec()));
+                entries.push((ino, 1, FileKind::Dir, b".".to_vec(), None));
+                entries.push((ino, 2, FileKind::Dir, b"..".to_vec(), None));
                 for (i, (name, child, kind)) in names.into_iter().enumerate() {
-                    entries.push((child, 3 + i as u64, kind, name));
+                    let entry = plus.then(|| self.syn_entry(&st, child));
+                    entries.push((child, 3 + i as u64, kind, name, entry));
                 }
-                entries.retain(|e| e.1 > cookie);
-                drop(st);
-                return Self::feed(entries, cookie, sink);
             }
         }
         entries.retain(|e| e.1 > cookie);
         drop(st);
-        Self::feed(entries, cookie, sink)
+        Self::feed(entries, sink)
     }
 
-    fn feed(
-        entries: Vec<(Ino, u64, FileKind, Vec<u8>)>,
-        _cookie: u64,
-        sink: &mut dyn DirSink,
-    ) -> VfsResult<()> {
-        for (ino, next, kind, name) in entries {
-            if sink.add(ino, next, kind, &name) {
+    fn feed(entries: Vec<ListedEntry>, sink: &mut dyn DirSink) -> VfsResult<()> {
+        for (ino, next, kind, name, entry) in entries {
+            if sink.add_entry(ino, next, kind, &name, entry.as_ref()) {
                 break;
             }
         }

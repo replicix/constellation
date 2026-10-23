@@ -687,6 +687,10 @@ tests! {
         lists_dot_dotdot_and_children [],
         cookies_resume_where_they_left_off [],
         plus_lists_the_same_entries [],
+        plus_dot_and_dotdot_are_name_only [],
+        plus_and_plain_cookies_interleave [],
+        plus_in_a_removed_directory_is_not_found [],
+        a_cookie_resumes_from_a_fresh_client [],
         removal_between_pages_never_repeats_or_loses [],
         stable_under_concurrent_create [],
         readdir_of_a_file_is_notdir [];
