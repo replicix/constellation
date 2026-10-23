@@ -217,7 +217,18 @@ impl Kernel {
         flags: u32,
         flags2: u32,
     ) -> (Kernel, fuser::Notifier) {
-        let (kernel, daemon) = UnixDatagram::pair().expect("socketpair");
+        let pair = UnixDatagram::pair().expect("socketpair");
+        Kernel::start_fs_notifying_on(fs, flags, flags2, pair)
+    }
+
+    /// [`Self::start_fs_notifying`] over a socket pair the test made
+    /// (`(kernel, daemon)`), say with a daemon side it tuned.
+    fn start_fs_notifying_on<V: Vfs>(
+        fs: FuseFs<V>,
+        flags: u32,
+        flags2: u32,
+        (kernel, daemon): (UnixDatagram, UnixDatagram),
+    ) -> (Kernel, fuser::Notifier) {
         kernel
             .set_read_timeout(Some(Duration::from_secs(20)))
             .unwrap();
@@ -3359,6 +3370,16 @@ fn plus_session_with(
     w: constellation_frontend_fuse::Workarounds,
     flags: u32,
 ) -> PlusSession {
+    plus_session_on(knob, w, flags, UnixDatagram::pair().expect("socketpair"))
+}
+
+/// [`plus_session_with`] over the socket pair `pair` (`(kernel, daemon)`).
+fn plus_session_on(
+    knob: constellation_frontend_fuse::ReaddirPlus,
+    w: constellation_frontend_fuse::Workarounds,
+    flags: u32,
+    pair: (UnixDatagram, UnixDatagram),
+) -> PlusSession {
     let mock = MockVfs::new();
     let fs = FuseFs::new(
         Arc::new(mock.clone()),
@@ -3371,7 +3392,7 @@ fn plus_session_with(
     .with_workarounds(w);
     let refs = fs.kernel_refs().clone();
     let link = fs.kernel_link();
-    let (k, notifier) = Kernel::start_fs_notifying(fs, flags, 0);
+    let (k, notifier) = Kernel::start_fs_notifying_on(fs, flags, 0, pair);
     let sink = FuseNotifySink::linked(notifier, &link);
     mock.always_release(Script::ok(()));
     mock.always_flush(Script::ok(()));
@@ -3960,6 +3981,180 @@ fn an_entry_the_buffer_refused_is_neither_counted_nor_marked() {
     };
     assert_eq!(moving(61), Vec::<u64>::new(), "y was never sent");
     assert_eq!(moving(60), vec![60], "x was");
+    drop(sink);
+    k.finish();
+}
+
+/// `setsockopt(SOL_SOCKET, opt, v)` on `s`.
+fn set_sockopt(s: &UnixDatagram, opt: libc::c_int, v: libc::c_int) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a valid descriptor and an `int` option of the right size.
+    let rc = unsafe {
+        libc::setsockopt(
+            s.as_raw_fd(),
+            libc::SOL_SOCKET,
+            opt,
+            (&v as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+}
+
+/// `s`'s send buffer size (`SO_SNDBUF`, as the kernel set it).
+fn sndbuf(s: &UnixDatagram) -> usize {
+    use std::os::fd::AsRawFd;
+    let mut v: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: a valid descriptor, `v` and `len` describe an `int`.
+    let rc = unsafe {
+        libc::getsockopt(
+            s.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            (&mut v as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    };
+    assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+    v as usize
+}
+
+/// The bytes `s` has sent that its peer has not read yet (`SIOCOUTQ`: a
+/// Unix socket's `sk_wmem_alloc`, what its send buffer is full of).
+fn unread(s: &UnixDatagram) -> usize {
+    use std::os::fd::AsRawFd;
+    let mut v: libc::c_int = 0;
+    // SAFETY: a valid descriptor; `SIOCOUTQ` writes an `int`.
+    let rc = unsafe { libc::ioctl(s.as_raw_fd(), libc::TIOCOUTQ, &mut v) };
+    assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+    v as usize
+}
+
+/// Plan 40 §4.4/§4.7: the kernel may forget a plus entry's lookup as soon
+/// as it has read the page, on another worker, before the thread that
+/// wrote the page runs again; counted after the write, a partial forget
+/// then finds the count one short and reaps an inode the kernel still
+/// holds (and a whole one is `Unknown`, kept for good). So the page's
+/// references are taken, and its names recorded for the entry
+/// invalidations, before its bytes are written. Shown with the write held
+/// open: the daemon's send buffer is filled with replies the test does
+/// not read, so the page's write blocks inside the reply, and while it
+/// does the reference is counted and an invalidation of the name is
+/// written (it waits behind the page) instead of being skipped as one for
+/// a name the kernel cannot hold. Deterministic: a write after the
+/// accounting is held until the test reads, whatever the scheduling.
+#[test]
+fn a_plus_pages_references_and_names_are_recorded_before_its_bytes_go() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    let (kernel_side, daemon_side) = UnixDatagram::pair().expect("socketpair");
+    // The smallest send buffer the kernel allows (it doubles the value
+    // and floors it): a few unread replies fill it.
+    set_sockopt(&daemon_side, libc::SO_SNDBUF, 1);
+    let probe = daemon_side.try_clone().unwrap();
+    let PlusSession {
+        mut k,
+        mock,
+        refs,
+        sink,
+    } = plus_session_on(
+        constellation_frontend_fuse::ReaddirPlus::Auto,
+        Default::default(),
+        PLUS_FLAGS,
+        (kernel_side, daemon_side),
+    );
+    mock.always_getattr(Script::ok(attr(ROOT_INO, FileKind::Dir)));
+    let (go, gate) = std::sync::mpsc::channel::<()>();
+    let gate = std::sync::Mutex::new(gate);
+    mock.always_readdir(Script::DeferWith {
+        after: Duration::ZERO,
+        f: Arc::new(move |_| {
+            let _ = gate.lock().unwrap().recv();
+            Ok(vec![plus_dirent(40, 1, FileKind::File, "d")])
+        }),
+    });
+    let page = k.send(READDIRPLUS, 5, &plus_body(0, 4096).0);
+    // Replies nobody reads, until the daemon's next write blocks.
+    let full = sndbuf(&probe);
+    let mut pending = vec![page];
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while unread(&probe) < full {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the send buffer never filled ({} of {full})",
+            unread(&probe)
+        );
+        pending.push(k.send(op::GETATTR, ROOT_INO, &GETATTR_BODY().0));
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // The page is made and answered now; its write cannot complete.
+    go.send(()).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while refs.count(40) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no reference while the page's write is held: counted after the bytes"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(unread(&probe) >= full, "nothing was read meanwhile");
+    // An invalidation of the name blocks behind the page; one that finds
+    // the name not recorded returns at once, and is tried again.
+    let stop = Arc::new(AtomicBool::new(false));
+    let tries = Arc::new(AtomicUsize::new(0));
+    let inval = std::thread::spawn({
+        let (stop, tries) = (stop.clone(), tries.clone());
+        move || {
+            while !stop.load(SeqCst) {
+                sink.invalidate(&[Invalidation::Entry {
+                    parent: 5,
+                    name: "d".into(),
+                }]);
+                tries.fetch_add(1, SeqCst);
+            }
+            sink
+        }
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut last = tries.load(SeqCst);
+    loop {
+        std::thread::sleep(Duration::from_millis(300));
+        let now = tries.load(SeqCst);
+        if now == last {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{now} invalidations of the name skipped while its page was held: \
+             recorded after the bytes"
+        );
+        last = now;
+    }
+    // Let everything go.
+    stop.store(true, SeqCst);
+    let mut answer = None;
+    while !pending.is_empty() {
+        let r = k.recv();
+        if r.unique == 0 {
+            continue; // the invalidation
+        }
+        let at = pending.iter().position(|u| *u == r.unique).unwrap();
+        pending.swap_remove(at);
+        if r.unique == page {
+            answer = Some(r);
+        }
+    }
+    let sink = inval.join().unwrap();
+    while let Some(r) = k.recv_within(Duration::from_millis(200)) {
+        assert_eq!(r.unique, 0, "only the invalidation is left");
+    }
+    let recs = parse_plus(answer.unwrap().ok());
+    assert_eq!(recs.iter().map(|r| r.nodeid).collect::<Vec<_>>(), vec![40]);
+    // The kernel's forget of it is the last lookup, never an unknown one.
+    forget(&mut k, 40, 1);
+    barrier(&mut k);
+    assert_eq!(mock.forgets(), vec![40]);
+    assert_eq!((refs.forgets_unknown(), refs.count(40)), (0, 0));
     drop(sink);
     k.finish();
 }

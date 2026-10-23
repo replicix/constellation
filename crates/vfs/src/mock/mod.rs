@@ -1262,7 +1262,7 @@ impl Vfs for MockVfs {
             Some(Script::With(f)) => f(&call).map(|entries| {
                 replay(&mut tap, plus, entries);
             }),
-            Some(Script::Defer { after, result }) => {
+            Some(script @ (Script::Defer { .. } | Script::DeferWith { .. })) => {
                 let inner = self.inner.clone();
                 inner.deferred.fetch_add(1, Ordering::AcqRel);
                 let spawned = std::thread::Builder::new()
@@ -1270,7 +1270,17 @@ impl Vfs for MockVfs {
                     .spawn({
                         let inner = inner.clone();
                         move || {
-                            std::thread::sleep(after);
+                            let result = match script {
+                                Script::Defer { after, result } => {
+                                    std::thread::sleep(after);
+                                    result
+                                }
+                                Script::DeferWith { after, f } => {
+                                    std::thread::sleep(after);
+                                    f(&call)
+                                }
+                                _ => unreachable!(),
+                            };
                             let mut tap = tap;
                             let result = result.map(|entries| {
                                 replay(&mut tap, plus, entries);
@@ -1284,7 +1294,6 @@ impl Vfs for MockVfs {
                 }
                 return;
             }
-            Some(Script::DeferWith { .. }) => Err(VfsError::new(Code::NotSupported)),
             Some(Script::Drop) => return drop(tap),
             Some(Script::Hold) => {
                 self.inner.held.lock().unwrap().push(Box::new(tap));

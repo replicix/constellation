@@ -59485,3 +59485,26 @@ after the reply (counts), no `took` (both real-kernel balance tests), no A3.
 `LOOKUP`/`GETATTR` over `READDIR` and for 1 over `READDIRPLUS` (3 listing
 requests). The tests that drop the kernel's caches hold `KERNEL_CACHES` alone, so the
 tests that rely on what their kernel holds do not meet a `drop_caches`.
+
+### Plan 40 P6 review: a plus page is accounted before its bytes go, shown deterministically
+
+`DirPlusReply::done` takes the page's references and records its names before
+`reply.ok()`. For the references the order is an integrity rule: the kernel
+may forget a plus entry's lookup as soon as it has read the page (a
+`fuse_force_forget`, a revalidation), on another worker, before the writing
+thread runs again; counted after the write, a partial forget of an inode the
+adapter already held once finds the count one short, reaches the view as the
+last one and reaps an orphan the kernel still holds (`ESTALE`). For the names
+it is defence in depth: the engine holds the directory's notifications until
+`View::readdir` returns, after `done`, so either order is safe there.
+`readdirplus_counts_only_on_success` and
+`entry_invalidations_cover_names_handed_by_readdirplus` caught `took` moved
+after the write but not `listed` (the race is too narrow to hit).
+`a_plus_pages_references_and_names_are_recorded_before_its_bytes_go` holds the
+write open instead: the daemon side of the wire socket pair gets the smallest
+send buffer and is filled with replies the test does not read (`SIOCOUTQ`),
+so the page's write blocks inside the reply; meanwhile the reference must be
+counted and an entry invalidation of the name must block behind the page
+rather than be skipped. It fails with `took` after the write and with `listed`
+after the write, every run, and passes as landed. `MockVfs`'s `readdir` now
+takes `Script::DeferWith` (the test's gated page).
