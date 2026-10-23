@@ -2237,6 +2237,10 @@ impl Core {
             self.set_phase(Phase::RecallBeforeRelease, None);
             return;
         }
+        // Waited for, or its bound passed: done with.
+        if let Some(w) = self.dl.release_wait.take() {
+            self.cancel_timer(w.timer, out);
+        }
         let Some((lease, tag)) = self.lease.held.clone() else {
             return;
         };
@@ -2291,9 +2295,39 @@ impl Core {
             return;
         }
         let kind = job.kind();
+        let waited = self.dl.release_wait.take();
         if self.lease.held.is_some() && !self.lease.lost {
+            match waited {
+                // Past its bound: `issue_release` does not wait again.
+                Some(w) if w.bound_passed => self.dl.release_wait = Some(w),
+                Some(w) => {
+                    self.cancel_timer(w.timer, out);
+                    // The generations' ends journaled their `RecallCut`s,
+                    // after the delegates' last rows: they ship before the
+                    // lease goes (the next root learns the table from the
+                    // log). A round decides again once they shipped
+                    // (with the lock grants the recalls handed back, it
+                    // keeps the lease, as with any grant); a flush or a
+                    // handoff ships on and releases.
+                    if replica.journal_len().unwrap_or(0) > 0 {
+                        match kind {
+                            JobKind::Round => {
+                                self.lease.releasing = false;
+                                self.nudged = true;
+                                self.finish_round(now, None, replica, out);
+                            }
+                            _ => self.flush_continue(now, 0, replica, out),
+                        }
+                        return;
+                    }
+                }
+                None => {}
+            }
             self.issue_release(now, replica, out);
             return;
+        }
+        if let Some(w) = waited {
+            self.cancel_timer(w.timer, out);
         }
         // The lease went away while the recalls ran: nothing to release.
         self.lease.releasing = false;

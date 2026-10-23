@@ -920,6 +920,15 @@ pub struct Stats {
     pub deleg_recalls_expired: u64,
     pub deleg_reclaimed: u64,
     pub deleg_ended: u64,
+    /// Root: lease releases that waited for a generation's recall in
+    /// flight to end it (`Core::release_recall_waits`), and the ones whose
+    /// wait reached its bound with a generation not ended
+    /// (`Core::on_release_recall_bound`).
+    pub deleg_release_waits: u64,
+    pub deleg_release_wait_bound: u64,
+    /// Root: grants a recall answer handed back while a release waited
+    /// for that recall (`Core::lock_install_returned`).
+    pub lock_returned_in_release: u64,
     /// Requester: ops sent to the root because the observed stream
     /// table was full (coordinator decision 4).
     pub deps_overflow_to_root: u64,
@@ -1476,6 +1485,9 @@ enum Timer {
     DelegStream,
     /// Phase 2b: the placement's evaluation tick.
     Placement,
+    /// A release's wait for the generations being recalled reached its
+    /// bound (`Core::on_release_recall_bound`).
+    ReleaseRecallBound,
 }
 
 impl Timer {
@@ -1524,6 +1536,7 @@ impl Timer {
             Timer::DelegLapse(_) => TimerKind::DelegLapse,
             Timer::DelegStream => TimerKind::DelegStream,
             Timer::Placement => TimerKind::Placement,
+            Timer::ReleaseRecallBound => TimerKind::DelegExpiry,
         }
     }
 }
@@ -2617,6 +2630,7 @@ impl Core {
             Timer::LockTestTimeout(req) => self.on_lock_test_timeout(req, out),
             Timer::DelegStream => self.on_deleg_stream_timer(now, replica, out),
             Timer::Placement => self.on_placement_timer(now, replica, out),
+            Timer::ReleaseRecallBound => self.on_release_recall_bound(now, replica, out),
         }
     }
 

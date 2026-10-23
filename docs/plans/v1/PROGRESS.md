@@ -58908,3 +58908,69 @@ best-of-two within noise on every file system (runs of one build differ by up
 to 2x under the load), except `1node-write4k-lat0` on xfs, p50 0.335/0.345 ms
 against 0.366/0.371 ms (+8 %, both B runs; not seen on the other three): worth
 one rerun on a quiet box before the round is pushed.
+
+## A release while a subtree recall is in flight (2026-10-23)
+
+Found in the seed-230 investigation (8061e3a5): a liveness gap, not a
+safety one (a successor outwaits an inherited generation with a subtree
+grace).
+
+### Mechanism
+
+- A root that released the lease while it recalled a generation dropped the
+  generation with its recall (`deleg_on_lease_gone`). The delegate's
+  `DelegRecalled` then matched no request (`on_deleg_recalled`) and the
+  grants it handed back were dropped (`lock_install_returned`), and no
+  `RecallCut` was journaled: only a root does (`end_generation`). The table
+  kept the subtree delegated to a node that had handed it back, which is
+  the route 8061e3a5's dead-end lease read now routes around.
+- With the answer in before the release, the release decided earlier (an
+  epoch's flush, which keeps the lease while lock grants are live) went on
+  all the same and dropped the grants that had just come back.
+- Either way the handed-back grants' renewals were refused, the grants
+  lapsed and their holders' I/O got `EIO`.
+
+### Fix
+
+The release waits for in-flight subtree recalls as it does for read
+delegations (`park_release_for_recalls`): `Core::release_recall_waits`
+parks it on every generation whose recall is in flight, until the
+generation ends, drained or outwaited by its expiry. The bound comes from the
+recall's own timeout: the latest window (capped at a renewal's horizon), a
+seal of the backup after it, and the expiry's retry tick. Past the bound
+(`on_release_recall_bound`) the release goes on as before. While the release
+waits, the fenced root still ends those recalls: it appends their delegates'
+streams, outwaits them and drains a sealed backup (`root_ends_recall`).
+Once they end, their `RecallCut`s ship before the CAS. A round decides
+again after the ship, so with handed-back grants live an epoch's flush keeps
+the lease. A flush or a handoff ships on and releases. A lost lease ends
+the wait in a step of its own. With no recall in flight there is no park
+and no timer.
+
+Plan 43 C4 D7 moves the hand-back into the delegate's `LockMove` row and the
+`RecallCut` transaction. Those rows need the same ordering (the cut
+journaled and shipped by the root that recalled), so this is compatible with
+D7 and is kept there.
+
+### Evidence
+
+- Core (fail before: released with the recall in flight):
+  `a_release_waits_for_a_recall_in_flight_and_journals_its_cut`,
+  `a_release_outwaits_an_unanswered_recall_and_journals_its_cut`; with
+  `a_release_waits_for_a_recall_only_to_its_bound`,
+  `a_release_waiting_for_a_recall_ends_when_the_lease_is_lost`,
+  `a_release_with_no_recall_in_flight_does_not_wait`.
+- Sim: `regression_a_grant_handed_back_during_a_release_is_renewed`
+  (`locks-unlinked-delegated-blips` 4196, 7730, `locks-blips-tight-delegated`
+  4550: on main a handed-back grant is lost and I/O fenced).
+- Sweeps (release, 500 seeds, the 65 `locks-*delegated*`, `delegated-*`,
+  `fast-takeover*` and `locks-released-takeover` configurations): the
+  failing sets are identical to main. 63 of the 65 sweep summaries are
+  byte-identical to main, so in the common case the sim's deterministic
+  runs, release timing included, are unchanged and the added latency is 0.
+  The two that differ are the only ones where a release waited (one seed
+  each).
+- Fenced I/O and lost grants over 9 500 more seeds of the two blips
+  configurations, which fence about one seed in ten on main: the same within
+  one grant (1 088/1 081 against 1 088/1 082, and 1 021/1 011 against
+  1 020/1 011).

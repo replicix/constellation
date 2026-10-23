@@ -787,7 +787,11 @@ impl Core {
             .rd
             .parked
             .iter()
-            .filter(|(_, p)| p.waiting.iter().any(|w| ids.contains(w)))
+            .filter(|(_, p)| {
+                // A release's wait (`release_recall_waits`) is not an
+                // execution: `deleg_on_lease_gone` ends it on its own.
+                !matches!(p.what, ParkedWhat::Release) && p.waiting.iter().any(|w| ids.contains(w))
+            })
             .map(|(id, _)| *id)
             .collect();
         for id in parked {
@@ -1328,31 +1332,87 @@ impl Core {
     /// A release lets another node take over at once: every live grant
     /// must be gone first. `true`: parked; the release is re-issued when
     /// the recalls are done.
+    ///
+    /// The write delegations being recalled must end here first too
+    /// (`release_recall_waits`).
     pub(crate) fn park_release_for_recalls(
         &mut self,
         now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> bool {
-        if !self.cfg.read_delegations && self.cfg.kernel_cache_ttl_ms == 0 {
+        let gens = self.release_recall_waits(now, out);
+        let reads = if !self.cfg.read_delegations && self.cfg.kernel_cache_ttl_ms == 0 {
+            None
+        } else {
+            // Releasing lets another node take over at once: that is
+            // another node for the kernel-cache latch too.
+            self.note_foreign(now, replica, out);
+            // `all_live` carries the kernel drain, not the restart
+            // quarantine.
+            let need = replica.read_delegations().all_live(now.wait);
+            self.start_recalls(now, need, out)
+        };
+        if reads.is_none() && gens.is_empty() {
             return false;
         }
-        // Releasing lets another node take over at once: that is another
-        // node for the kernel-cache latch too.
-        self.note_foreign(now, replica, out);
-        // `all_live` carries the kernel drain, not the restart quarantine.
-        let need = replica.read_delegations().all_live(now.wait);
-        match self.start_recalls(now, need, out) {
-            None => false,
-            Some(wait) => {
-                tracing::debug!(
-                    node = self.cfg.node_id,
-                    grants = wait.0.len(),
-                    "release waits for read delegations to be recalled"
-                );
-                self.park(now, wait, None, ParkedWhat::Release);
-                true
+        let (mut waiting, quarantine) = reads.unwrap_or_default();
+        if !waiting.is_empty() {
+            tracing::debug!(
+                node = self.cfg.node_id,
+                grants = waiting.len(),
+                "release waits for read delegations to be recalled"
+            );
+        }
+        waiting.extend(gens);
+        self.park(now, (waiting, quarantine), None, ParkedWhat::Release);
+        true
+    }
+
+    /// The bound of a release's wait for the generations being recalled
+    /// (`release_recall_waits`) passed, or the lease went while it waited
+    /// (`deleg_on_lease_gone`): the release stops waiting for them.
+    pub(crate) fn on_release_recall_bound(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(w) = self.dl.release_wait.as_mut() else {
+            return;
+        };
+        let first = !w.bound_passed;
+        w.bound_passed = true;
+        let gens = w.gens.clone();
+        let left: Vec<u64> = gens
+            .iter()
+            .copied()
+            .filter(|g| self.dl.gens.get(g).is_some_and(|s| !s.ended))
+            .collect();
+        if first && !left.is_empty() {
+            self.stats.deleg_release_wait_bound += 1;
+            tracing::warn!(
+                node = self.cfg.node_id,
+                generations = ?left,
+                "the release's wait for recalls reached its bound; releasing without their end"
+            );
+        }
+        let ids: BTreeSet<u64> = gens.iter().map(|g| super::delegate::wait_id(*g)).collect();
+        for p in self.rd.parked.values_mut() {
+            if matches!(p.what, ParkedWhat::Release) {
+                p.waiting.retain(|id| !ids.contains(id));
             }
+        }
+        self.complete_ready(now, replica, out);
+        // No release waits any more (the lease went with no release
+        // parked, or the release went on): nothing for a later one.
+        if !self
+            .rd
+            .parked
+            .values()
+            .any(|p| matches!(p.what, ParkedWhat::Release))
+        {
+            self.dl.release_wait = None;
         }
     }
 

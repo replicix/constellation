@@ -440,6 +440,20 @@ pub(crate) struct DelegationState {
     /// never seen (the recall overtook the record naming this node) —
     /// after [`HANDED_BACK_UNSEEN_MS`].
     pub handed_back: BTreeMap<u64, (NodeId, WaitMs, bool)>,
+    /// A lease release waiting for the generations whose recall was in
+    /// flight when it was issued (`Core::release_recall_waits`).
+    pub(crate) release_wait: Option<ReleaseWait>,
+}
+
+/// A lease release's wait for generations being recalled: their wait ids
+/// are in the release's park, the bound's timer is armed.
+#[derive(Debug, Clone)]
+pub(crate) struct ReleaseWait {
+    pub gens: BTreeSet<u64>,
+    pub timer: TimerId,
+    /// The bound passed with a generation not ended: the release goes
+    /// without waiting for it (as before the wait).
+    pub bound_passed: bool,
 }
 
 /// Plan 30 §M11's view for `status`.
@@ -1714,7 +1728,7 @@ impl Core {
             return;
         }
         let (dir, kind, range) = (gs.dir, gs.kind, gs.range);
-        if sealed && self.root_usable(now) {
+        if sealed && self.root_ends_recall(now, gen) {
             let mut cursor = gs.cursor;
             let mut drained = 0u64;
             for tx in txs {
@@ -3951,6 +3965,97 @@ impl Core {
         self.arm_gen_expiry(now, gen, out);
     }
 
+    /// A release lets another node take the lease over at once. A
+    /// generation this root is recalling would then end nowhere: the
+    /// lease's end drops it with its recall (`deleg_on_lease_gone`), the
+    /// delegate's answer finds no request to match (`on_deleg_recalled`)
+    /// and the lock grants it hands back are dropped
+    /// (`lock_install_returned`), and no `RecallCut` is journaled, which
+    /// only a root does (`end_generation`). The table kept the generation
+    /// delegated while the delegate had handed it back here
+    /// (`handed_back`): lock requests went round the two
+    /// (`locks-unlinked-delegated-blips` seed 230, an epoch's flush
+    /// releasing the lease of a root that had just recalled `d1`), and the
+    /// handed-back grants' renewals were refused until they lapsed under
+    /// their holders' I/O.
+    ///
+    /// So a release waits for every generation whose recall is in flight
+    /// to end here: drained, or outwaited by its expiry. The wait ids for
+    /// the release's park, empty when none is (the common case: no wait,
+    /// no timer). Bounded by the recall's own outwait: the latest window
+    /// of them (capped at a renewal's horizon from now), a seal of a
+    /// silent delegate's backup after it, and the expiry's retry tick.
+    /// Past the bound (`on_release_recall_bound`) the release goes as it
+    /// did before the wait.
+    pub(crate) fn release_recall_waits(
+        &mut self,
+        now: Now,
+        out: &mut Vec<Action>,
+    ) -> BTreeSet<u64> {
+        if !self.cfg.delegation
+            || self
+                .dl
+                .release_wait
+                .as_ref()
+                .is_some_and(|w| w.bound_passed)
+        {
+            return BTreeSet::new();
+        }
+        let gens: BTreeSet<u64> = self
+            .dl
+            .gens
+            .iter()
+            .filter(|(_, g)| !g.ended && g.recall != RecallPhase::None)
+            .map(|(g, _)| *g)
+            .collect();
+        if gens.is_empty() {
+            return BTreeSet::new();
+        }
+        let horizon = now.wait.plus(self.reclaim_horizon_ms());
+        let until = gens
+            .iter()
+            .map(|g| self.gen_until(*g))
+            .max()
+            .unwrap_or(now.wait)
+            .clamp(now.wait, horizon);
+        let bound = until
+            .plus(2 * self.cfg.forward_timeout_ms + self.cfg.delegation_stream_tick_ms.max(100));
+        if let Some(w) = self.dl.release_wait.take() {
+            self.cancel_timer(w.timer, out);
+        }
+        let timer = self.set_timer_wait(bound, Timer::ReleaseRecallBound, out);
+        self.stats.deleg_release_waits += 1;
+        tracing::info!(
+            node = self.me(),
+            generations = ?gens,
+            bound = bound.0,
+            "the release waits for the generations being recalled to end"
+        );
+        let ids = gens.iter().map(|g| wait_id(*g)).collect();
+        self.dl.release_wait = Some(ReleaseWait {
+            gens,
+            timer,
+            bound_passed: false,
+        });
+        ids
+    }
+
+    /// `root_usable`, or a usable lease whose release waits for `gen`'s
+    /// recall (`release_recall_waits`): the release fenced the lease (no
+    /// new op, no renewal of anything), but the recall it waits for still
+    /// ends here, by the delegate's stream reaching its drained answer or
+    /// by the expiry outwaiting it. Fenced, neither happened: the wait ran
+    /// to its bound.
+    fn root_ends_recall(&self, now: Now, gen: u64) -> bool {
+        self.root_usable(now)
+            || (self
+                .dl
+                .release_wait
+                .as_ref()
+                .is_some_and(|w| !w.bound_passed && w.gens.contains(&gen))
+                && self.lease.ship_epoch(now, &self.cfg).is_some())
+    }
+
     fn recall_all(&mut self, now: Now, out: &mut Vec<Action>) {
         let gens: Vec<u64> = self
             .dl
@@ -3996,7 +4101,7 @@ impl Core {
         if g.ended {
             return;
         }
-        if !self.root_usable(now) {
+        if !self.root_ends_recall(now, gen) {
             // Phase 2b round 2: the root is unusable for the moment (a
             // renewal in flight, S3 away) but not gone (`deleg_on_lease_gone`
             // drops the state when it is): the expiry is tried again
@@ -4318,7 +4423,7 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let usable = self.root_usable(now) && self.cfg.delegation;
+        let usable = self.root_ends_recall(now, gen) && self.cfg.delegation;
         let refuse = |out: &mut Vec<Action>, through: u64| {
             out.push(Action::Send {
                 to: from,
@@ -4829,6 +4934,19 @@ impl Core {
         // (a local op to the new holder; a forwarded one is answered
         // `Busy` and re-sent).
         let ids: BTreeSet<u64> = self.dl.gens.keys().map(|g| wait_id(*g)).collect();
+        // A release waiting for recalls (`release_recall_waits`) is not
+        // an execution to abort: it stops waiting for these generations,
+        // and its bound's timer, due now, lets it see the lease gone
+        // (`release_after_recalls`) in a step of its own.
+        if let Some(w) = self.dl.release_wait.as_mut() {
+            w.bound_passed = true;
+            let timer = w.timer;
+            self.cancel_timer(timer, out);
+            let timer = self.set_timer_wait(now.wait, Timer::ReleaseRecallBound, out);
+            if let Some(w) = self.dl.release_wait.as_mut() {
+                w.timer = timer;
+            }
+        }
         if !ids.is_empty() {
             tracing::info!(
                 node = self.me(),

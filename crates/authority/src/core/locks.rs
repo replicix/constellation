@@ -6451,6 +6451,11 @@ impl Core {
                 "a duplicate recall answer; its grants dropped"
             );
         }
+        if self.dl.release_wait.is_some() {
+            // Back while a release waits for this recall
+            // (`release_recall_waits`): before, dropped with the lease.
+            self.stats.lock_returned_in_release += grants.len() as u64;
+        }
         if let Some(handed) = self.lk.handed.get_mut(&gen) {
             handed.retain(|h| !grants.iter().any(|g| g.node == h.node && g.ino == h.ino));
         }

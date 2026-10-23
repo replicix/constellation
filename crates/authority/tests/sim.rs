@@ -5428,6 +5428,20 @@ fn sweep_config() {
                         );
                         fenced_seeds.lock().unwrap().push(seed);
                     }
+                    {
+                        let sum = |f: fn(&constellation_authority::Stats) -> u64| -> u64 {
+                            report.stats.values().map(f).sum()
+                        };
+                        let waits = sum(|s| s.deleg_release_waits);
+                        if waits > 0 {
+                            eprintln!(
+                                "SWEEP-RELEASE-WAIT {label} seed {seed}: {waits} releases waited \
+                                 for recalls, {} to the bound; {} grants handed back meanwhile",
+                                sum(|s| s.deleg_release_wait_bound),
+                                sum(|s| s.lock_returned_in_release)
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     let head: String = e.lines().take(3).collect::<Vec<_>>().join(" | ");
@@ -11403,6 +11417,65 @@ fn regression_locks_unlinked_delegated_blips_seed_230() {
              AUTHORITY_SIM_CONFIG=locks-unlinked-delegated-blips"
         )
     });
+}
+
+/// A root released the lease while it recalled a generation: the release
+/// dropped the generation with its recall, and the lock grants the
+/// delegate's answer handed back were dropped with the lease (or, the
+/// answer in first, the release decided before they came back went on
+/// regardless): their holders' renewals were refused and the grants lapsed
+/// under their I/O (`EIO`). Seeds that fenced I/O on main this way, from
+/// the `locks-unlinked-delegated-blips` and `locks-blips-tight-delegated`
+/// scans: the release waits for the recall (`Core::release_recall_waits`),
+/// the handed-back grants come back into the root's table, and the root
+/// (an epoch's flush there) decides again with them: it keeps the lease,
+/// and the renewals are honoured.
+#[test]
+fn regression_a_grant_handed_back_during_a_release_is_renewed() {
+    for (label, seed, cfg) in [
+        (
+            "locks-unlinked-delegated-blips",
+            4196,
+            locks_unlinked_blips_config(),
+        ),
+        (
+            "locks-unlinked-delegated-blips",
+            7730,
+            locks_unlinked_blips_config(),
+        ),
+        (
+            "locks-blips-tight-delegated",
+            4550,
+            locks_blips_tight_delegated_config(),
+        ),
+    ] {
+        let report = run_seed(seed, cfg).unwrap_or_else(|e| {
+            panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
+        });
+        let sum = |f: fn(&constellation_authority::Stats) -> u64| -> u64 {
+            report.stats.values().map(f).sum()
+        };
+        assert!(
+            sum(|s| s.deleg_release_waits) > 0,
+            "{label} seed {seed}: no release waited for a recall"
+        );
+        assert!(
+            sum(|s| s.lock_returned_in_release) > 0,
+            "{label} seed {seed}: no grant was handed back during a release"
+        );
+        assert_eq!(
+            sum(|s| s.deleg_release_wait_bound),
+            0,
+            "{label} seed {seed}"
+        );
+        let mut t = M14Totals::default();
+        t.add(&report);
+        assert_eq!(t.lost, 0, "{label} seed {seed}: grants lost: {t:?}");
+        assert_eq!(
+            t.clients.fenced_ios, 0,
+            "{label} seed {seed}: I/O fenced: {t:?}"
+        );
+    }
 }
 
 /// `locks-unlinked-delegated-dbackup-random` seeds 2477 and 2982

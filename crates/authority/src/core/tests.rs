@@ -13424,6 +13424,207 @@ mod locks {
         assert_eq!(h.core.stats.lock_returned_after_end, 1);
     }
 
+    /// A root recalling generation 7 (to node 3) of the subtree holding
+    /// `turn.lock`, whose window ends 5 s from now; an operator's flush
+    /// asked for the lease's release, driven to where it stops. The
+    /// recall's request id, the flush's control op, the file, what the
+    /// drive saw.
+    fn release_during_recall() -> (Harness, OpId, OpId, Ino, Driven) {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        let (dir, f) = delegated_file(&h.meta);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let out = h.step(Event::Control {
+            op: OpId(1 << 50),
+            req: Control::Undelegate { dir },
+        });
+        let recall = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::DelegRecall { req, gen: 7, .. } if to == 3 => Some(*req),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no recall sent: {out:?}"));
+        h.core.dw.set_until_for_tests(7, w(h.now.plus(5_000)));
+        let flush = OpId(9);
+        let out = h.step(Event::Control {
+            op: flush,
+            req: Control::Flush,
+        });
+        let d = drive_job(&mut h, out);
+        (h, recall, flush, f, d)
+    }
+
+    /// The cuts of generation 7 the journal holds.
+    fn cuts_of_7(h: &Harness) -> Vec<u64> {
+        crate::replica::Replica::journal_txs_from(&h.meta, 0, usize::MAX)
+            .into_iter()
+            .flat_map(|tx| tx.records)
+            .filter_map(|r| match r {
+                LogRecord::RecallCut {
+                    gen: 7, through, ..
+                } => Some(through),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `locks-unlinked-delegated-blips` seed 230: a root released the
+    /// lease (an epoch's flush there) while it recalled a generation. The
+    /// release dropped the generation with its recall, so the delegate's
+    /// answer was ignored and the grants it handed back dropped, and no
+    /// `RecallCut` was journaled (only a root does): the table kept the
+    /// subtree delegated to a node that had handed it back, and the
+    /// handed-back grants' renewals were refused until they lapsed. The
+    /// release waits for the recall: the answer's grant comes back into
+    /// this table, the generation ends with its cut journaled, the cut
+    /// ships, and then the lease goes.
+    #[test]
+    fn a_release_waits_for_a_recall_in_flight_and_journals_its_cut() {
+        let (mut h, recall, flush, f, d) = release_during_recall();
+        assert!(!d.released, "released with a recall in flight");
+        assert!(d.done.is_empty(), "the flush answered: {:?}", d.done);
+        assert!(
+            h.core.dl.gens.get(&7).is_some_and(|g| !g.ended),
+            "the generation was dropped or ended"
+        );
+        assert_eq!(h.core.stats.deleg_release_waits, 1);
+        h.advance(10);
+        let grant = constellation_meta::locks::GrantWire {
+            id: GrantId { node: 3, seq: 5 },
+            node: 4,
+            ino: f,
+            mode: X,
+            until_ms: h.now.0 + 10_000,
+            recalled: false,
+            gen: 7,
+            confirmed_ms: constellation_meta::locks::Grant::UNCONFIRMED,
+            settled: false,
+            lapsed: false,
+        };
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRecalled {
+                req: recall,
+                gen: 7,
+                through: 0,
+                locks: constellation_meta::locks::LockHandback {
+                    carry: Vec::new(),
+                    grants: vec![grant],
+                    floor: Position::ZERO,
+                    barrier: 0,
+                },
+            },
+        });
+        assert!(h.core.dl.gens[&7].ended, "not ended: {out:?}");
+        assert_eq!(cuts_of_7(&h), vec![0], "the cut was not journaled");
+        assert!(
+            h.meta
+                .locks()
+                .grants_snapshot()
+                .iter()
+                .any(|g| g.id == GrantId { node: 3, seq: 5 } && g.node == 4 && g.gen == 0),
+            "the handed-back grant is not in the root's table: {:?}",
+            h.meta.locks().grants_snapshot()
+        );
+        let d = drive_job(&mut h, out);
+        assert!(d.puts > 0, "released before the cut shipped");
+        assert!(d.released, "not released after the recall ended");
+        assert!(d.done.contains(&(flush, true)), "{:?}", d.done);
+        assert_eq!(h.core.stats.deleg_release_wait_bound, 0);
+        assert!(h.core.dl.release_wait.is_none());
+    }
+
+    /// The same release with a silent delegate: the recall's own outwait
+    /// (the generation's expiry, while the release has fenced the lease)
+    /// ends the generation, its cut is journaled and shipped, and the
+    /// lease goes.
+    #[test]
+    fn a_release_outwaits_an_unanswered_recall_and_journals_its_cut() {
+        let (mut h, _, flush, _, d) = release_during_recall();
+        assert!(!d.released, "released with a recall in flight");
+        h.now = h.now.plus(5_000);
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        assert!(h.core.dl.gens[&7].ended, "not outwaited: {out:?}");
+        assert_eq!(cuts_of_7(&h).len(), 1, "the cut was not journaled");
+        let d = drive_job(&mut h, out);
+        assert!(d.puts > 0, "released before the cut shipped");
+        assert!(d.released, "not released after the outwait");
+        assert!(d.done.contains(&(flush, true)), "{:?}", d.done);
+        assert_eq!(h.core.stats.deleg_release_wait_bound, 0);
+    }
+
+    /// A recall that ends neither way (its expiry never ran) holds the
+    /// release only to the wait's bound: then the lease goes as it did
+    /// before the wait, without the generation's end.
+    #[test]
+    fn a_release_waits_for_a_recall_only_to_its_bound() {
+        let (mut h, _, flush, _, d) = release_during_recall();
+        assert!(!d.released, "released with a recall in flight");
+        h.now = h.now.plus(5_000 + 2 * h.core.cfg.forward_timeout_ms + 100);
+        let mut out = Vec::new();
+        h.core.on_release_recall_bound(h.clk(), &h.meta, &mut out);
+        assert_eq!(h.core.stats.deleg_release_wait_bound, 1);
+        let d = drive_job(&mut h, out);
+        assert!(d.released, "not released at the bound");
+        assert!(d.done.contains(&(flush, true)), "{:?}", d.done);
+        assert!(h.core.dl.release_wait.is_none());
+    }
+
+    /// The lease lost while the release waits: the flush ends unreleased
+    /// in a step of its own, and nothing of the wait stays for a later
+    /// release.
+    #[test]
+    fn a_release_waiting_for_a_recall_ends_when_the_lease_is_lost() {
+        let (mut h, _, flush, _, d) = release_during_recall();
+        assert!(!d.released, "released with a recall in flight");
+        h.core.lease.force_lost();
+        let mut out = Vec::new();
+        h.core.deleg_on_lease_gone(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.gens.is_empty());
+        assert!(
+            out.iter()
+                .all(|a| !matches!(a, Action::ControlDone { op, .. } if *op == flush)),
+            "answered inside the lease's end: {out:?}"
+        );
+        let mut out = Vec::new();
+        h.core.on_release_recall_bound(h.clk(), &h.meta, &mut out);
+        let d = drive_job(&mut h, out);
+        assert!(!d.released);
+        assert!(d.done.contains(&(flush, false)), "{:?}", d.done);
+        assert!(h.core.dl.release_wait.is_none());
+        assert_eq!(h.core.job(), None);
+    }
+
+    /// The common case: no recall in flight (here a live generation, not
+    /// being recalled). The release CAS goes out in the same step as
+    /// before: no wait, no timer.
+    #[test]
+    fn a_release_with_no_recall_in_flight_does_not_wait() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        delegated_file(&h.meta);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.gens.get(&7).is_some_and(|g| !g.ended));
+        let flush = OpId(9);
+        let out = h.step(Event::Control {
+            op: flush,
+            req: Control::Flush,
+        });
+        let d = drive_job(&mut h, out);
+        assert!(d.released);
+        assert_eq!(d.done, vec![(flush, true)]);
+        assert_eq!(h.core.stats.deleg_release_waits, 0);
+        assert!(h.core.dl.release_wait.is_none());
+    }
+
     fn holder_with_file() -> (Harness, Ino) {
         let mut h = Harness::new(1);
         h.hold(1, None);
