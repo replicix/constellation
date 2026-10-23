@@ -2771,10 +2771,21 @@ mod tests {
     fn a_frozen_log_is_the_chunk_in_write_then_the_batch_then_the_queue() {
         let sink = BlockingSink::shut();
         let buffer = queued(1 << 20, &sink);
+        // The writer takes "a" into its write, which the shut sink stalls:
+        // from then on it touches nothing until the write returns, so the
+        // batch and the queue can be set by hand. (Set by hand behind a
+        // writer not yet seen in its write, they were its to take: under
+        // CPU load the new thread's first pass ran after them, took "b"
+        // and "c" as its chunk and dropped the hand-set "a".)
+        log(&buffer, "a");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while lock(&buffer.0.state).in_write.is_empty() {
+            assert!(Instant::now() < deadline, "the writer never took a chunk");
+            std::thread::sleep(Duration::from_millis(2));
+        }
         {
-            // The writer is idle: set the three places by hand.
             let mut st = lock(&buffer.0.state);
-            st.in_write.push("a".into());
+            assert!(st.batch.is_empty() && st.queue.is_empty());
             st.batch.push_back("b".into());
             st.batch.push_back("c".into());
             st.queue.push_back("d".into());
