@@ -631,7 +631,7 @@ impl NodeHandle {
                                     meta: meta.clone(),
                                 },
                             );
-                            apply_lane_actions(&shared, &bus, id, acts);
+                            apply_lane_actions(&shared, &bus, &clock, id, acts);
                         }
                         _ => {}
                     }
@@ -1145,6 +1145,7 @@ impl constellation_authority::lane::LaneFacts for SimLaneFacts {
 fn apply_lane_actions(
     shared: &Arc<Shared>,
     bus: &Arc<Bus>,
+    clock: &Clock,
     id: NodeId,
     actions: Vec<constellation_authority::lane::LaneAction>,
 ) {
@@ -1155,9 +1156,13 @@ fn apply_lane_actions(
                 bus.send(
                     id,
                     to,
+                    // Stamped as it is sent, as the daemon's lane transport
+                    // does (plan 43 C7b, row 29).
                     PeerMsg::LockRenew {
                         req: OpId(req),
                         entries,
+                        sent: clock.now().honour,
+                        clock: clock.id(),
                     },
                 );
             }
@@ -1253,11 +1258,11 @@ async fn lock_lane_loop(
                         facts.meta.locks(),
                         &facts,
                     );
-                    apply_lane_actions(&shared, &bus, id, acts);
+                    apply_lane_actions(&shared, &bus, &clock, id, acts);
                 });
             }
         }
-        apply_lane_actions(&shared, &bus, id, actions);
+        apply_lane_actions(&shared, &bus, &clock, id, actions);
     }
 }
 
@@ -1533,6 +1538,15 @@ impl Driver {
                 // send time) and gives it the slow-backup grace.
                 if *listed && *seq != 0 {
                     self.bus.answer_beat((self.id, *from), *seq);
+                }
+            }
+            if let Event::Peer {
+                msg: PeerMsg::MutateRequest { tag, .. },
+                ..
+            } = &mut event
+            {
+                if !tag.is_empty() {
+                    *tag = tag.received(now.honour);
                 }
             }
             let debug = tracing::enabled!(tracing::Level::DEBUG);
@@ -2525,6 +2539,17 @@ impl Driver {
                     if let PeerMsg::MutateReply { req, outcome, .. } = &msg {
                         if *req != OpId(0) {
                             self.note_forward_answer(to, *req, outcome);
+                        }
+                    }
+                    // A forwarded op's token leaves in its wire form (the time
+                    // it spent here taken off what the holder said it had
+                    // left) and is stamped at the receiver's receipt on its
+                    // honour clock (plan 43 C7b, row 6), as the daemon's P2P
+                    // handlers do.
+                    let mut msg = msg;
+                    if let PeerMsg::MutateRequest { tag, .. } = &mut msg {
+                        if !tag.is_empty() {
+                            *tag = LockTag::from_wire(&tag.to_wire(self.clock.now().honour), None);
                         }
                     }
                     self.bus.send(self.id, to, msg)

@@ -1122,7 +1122,7 @@ pub trait PeerService: Send + Sync + 'static {
         _deps: Vec<u8>,
         _pending: Vec<[u8; 32]>,
         _applied: u64,
-        _lock_tag: Vec<(u64, u64, i64)>,
+        _lock_tag: Vec<(u64, u64, i64, i64, u64, i64)>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
         Box::pin(async move {
             Payload::MutateReply {
@@ -1415,6 +1415,7 @@ pub trait PeerService: Send + Sync + 'static {
         _from: u64,
         req_id: u64,
         entries: Vec<crate::message::LockRenewWire>,
+        _sent: (u64, i64),
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
         Box::pin(async move {
             Payload::LockRenewed {

@@ -490,7 +490,7 @@ impl Core {
                     },
                     op,
                     deps: c.deps.to_postcard(),
-                    lock_tag: c.tag.to_wire(),
+                    lock_tag: c.tag.to_wire(now.honour),
                 })
             })
             .collect();
@@ -1556,7 +1556,7 @@ impl Core {
                         ack,
                         decoded_op,
                         rid,
-                        &constellation_meta::locks::LockTag::from_wire(&op.lock_tag),
+                        &constellation_meta::locks::LockTag::from_wire(&op.lock_tag, None),
                         now,
                     )
                 }),

@@ -736,12 +736,16 @@ impl crate::locks::LockFlush for View {
                 .held(ino)
                 .filter(|h| h.id == grant)
                 .map(|h| {
-                    constellation_meta::locks::LockTag(vec![constellation_meta::locks::LockToken {
-                        grant,
-                        // Minted on the wall clock from the honour window,
-                        // now (plan 43 C7-H1, R8).
-                        until_ms: crate::locks::now().wall_of_honour(h.until).0,
-                    }])
+                    // Minted from the honour window, now (plan 43 C7-H1, R8;
+                    // C7b: with the window's honour end and the time left).
+                    constellation_meta::locks::LockTag(vec![
+                        constellation_meta::locks::LockToken::minted(
+                            grant,
+                            h.until,
+                            crate::locks::now(),
+                            constellation_platform::clock::protocol().id(),
+                        ),
+                    ])
                 })
                 .unwrap_or_default();
             l.fixed_tag_scope(tag, ino)

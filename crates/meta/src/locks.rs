@@ -29,10 +29,12 @@
 //! C7-H1, `constellation_types::clock`): a grant this node *holds*
 //! ([`HeldGrant`]) is stamped and judged on its **honour** clock (never
 //! under-counts: a backward wall step cannot extend it); a fencing token
-//! that leaves the node is on the **wall** clock, minted from the honour
-//! window at that moment (`Now::wall_of_honour`), and the holder's own
-//! wait for a token to run out is a **wait**-clock copy taken when the pin
-//! is made ([`LockTables::tag_end`]). The sequencer's records ([`Grant`], the
+//! that leaves the node names the window's end on the honour clock and
+//! the time left (a duration), beside an absolute **wall** stamp minted from
+//! the honour window at that moment (`Now::wall_of_honour`; plan 43 C7b,
+//! row 6), and the holder's own wait for a token to run out is a
+//! **wait**-clock copy of its honour end taken when the pin is made
+//! ([`LockTables::tag_end`]). The sequencer's records ([`Grant`], the
 //! restart quarantine, the memory of ended grants) are on its **wait**
 //! clock (never over-counts; a wall step moves none of them) and cross a
 //! node as a [`GrantWire`] whose end is informational wall. The sequencer
@@ -115,7 +117,7 @@
 //! are held under grants that are still honoured).
 
 use crate::session::Position;
-use constellation_types::clock::{HonourMs, Ms, Now, WaitMs};
+use constellation_types::clock::{HonourMs, Now, WaitMs};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -162,19 +164,87 @@ pub struct GrantId {
 }
 
 /// Plan 30 §M14 phase 2, the **fencing token**: one grant a mutation was
-/// issued under, as its issuing node honoured it — the grant's id and
-/// the end of the window that node honoured it for (`sent + ttl −
-/// margin` of its latest request or renewal), on the **wall** clock:
-/// minted as `now.wall_of_honour(until)` from the issuing node's honour
-/// window at the moment the tag is built, so a backward wall step of the
-/// issuer only shortens it and the executor judges it on its own wall
-/// clock (plan 43 Appendix B row 6: offset-bound until C7b). See
-/// [`LockTag`].
+/// issued under, as its issuing node (H) honoured it, and what H says of the
+/// end of that window (plan 43 C7b, row 6, phase 1).
+///
+/// - `until_ms`: the end of the window on H's **wall** clock, minted from its
+///   honour window at the moment the tag is built (`Now::wall_of_honour`),
+///   so a backward wall step of H only shortens it. An executor compares it
+///   with its own wall: sound while the offset between the two is below the
+///   margin (the phase-1 absolute check, kept).
+/// - `until_h` / `clock`: the same end on H's **honour** clock and the id of
+///   that clock (`ProtocolClock::id`). They mean nothing on another node;
+///   H judges its own tokens exactly with them, and a sequencer's
+///   [`Grant::confirmed`] compares them with the renewal that confirmed the
+///   grant (both H's readings of one clock).
+/// - `remaining_ms`: how much of the window H had left when the op left it
+///   (`until_h − honour`, a duration), which the executor adds to **its**
+///   receipt of the op on its honour clock (`recv`, below): it honours the
+///   token only until `recv + remaining_ms`. Receipt is after the send and
+///   honour never over-counts, so the op runs at most the transit after the
+///   window H honoured; the minter outwaits H's grant by `2 × margin` past
+///   the end of that window, so the op never runs after a conflicting grant
+///   if either the offset (the absolute stamp) or the one-way delay of the
+///   op is below that — a rate bound and causality, no offset bound, in the
+///   second case.
+/// - `recv`: the executor's honour reading at the earliest point it has the
+///   token (the P2P handler's receive; for a token minted here, the mint),
+///   never serialized. `None` on a token that came by the S3 inbox or the
+///   persisted replay queue, which have no transit bound: such a token is
+///   judged exactly (the grant live and confirmed in this table) or
+///   refused.
+///
+/// The minter records the grant live until `granted + ttl + margin` and
+/// grants no conflicting lock before that, which is at least `2 × margin`
+/// after the holder's window ended. The minter (or the delegate a grant
+/// moved to) judges exactly: a grant live in its table passes whatever the
+/// window, one it ended or outwaited is rejected at once. See [`LockTag`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct LockToken {
     pub grant: GrantId,
     pub until_ms: i64,
+    pub until_h: i64,
+    pub clock: u64,
+    pub remaining_ms: i64,
+    #[serde(skip)]
+    pub recv: Option<i64>,
 }
+
+impl LockToken {
+    /// The token of `grant` for a window H honours until `until` on its
+    /// honour clock `clock`, minted at `now`: also received here, now (the
+    /// executor of a local op is H itself).
+    pub fn minted(grant: GrantId, until: HonourMs, now: Now, clock: u64) -> LockToken {
+        LockToken {
+            grant,
+            until_ms: now.wall_of_honour(until).0,
+            until_h: until.0,
+            clock,
+            remaining_ms: until.since(now.honour).max(0),
+            recv: Some(now.honour.0),
+        }
+    }
+}
+
+impl LockToken {
+    /// A token whose window ends at `until_ms` on clocks that agree (wall
+    /// and honour readings equal, one clock id, received at 0): for tests
+    /// and tools that have no node behind them.
+    pub fn window(grant: GrantId, until_ms: i64) -> LockToken {
+        LockToken {
+            grant,
+            until_ms,
+            until_h: until_ms,
+            clock: 1,
+            remaining_ms: until_ms,
+            recv: Some(0),
+        }
+    }
+}
+
+/// One token on the wire: `(minter, seq, until_ms, until_h, clock,
+/// remaining_ms)`.
+pub type LockTokenWire = (u64, u64, i64, i64, u64, i64);
 
 /// The grants a mutation was issued under (empty: none — the op of a
 /// process that holds no cluster lock, which nothing checks).
@@ -183,13 +253,16 @@ pub struct LockToken {
 /// ancestors, as the owner fence matches them) holds local locks: one
 /// [`LockToken`] per minting sequencer, the earliest window among that
 /// minter's grants under the owner's locks. Every executor rejects the
-/// op ([`LockTables::check_tag`]) once its own clock is at a token's
-/// `until_ms`: the minter records the grant live until `granted + ttl +
-/// margin` and grants no conflicting lock before that, which is at least
-/// `2 × margin` after the holder's window ended — so an executor whose
-/// clock is within that of the holder's (the lease machinery assumes
-/// half a margin) never runs a tagged op after a conflicting grant was
-/// made. The minter (or the delegate a grant moved to) judges exactly: a
+/// op ([`LockTables::check_tag`]) once the token's absolute stamp has
+/// passed on its own wall clock (`until_ms`) or its own honour clock has
+/// passed its receipt plus the time left the holder named
+/// (`recv + remaining_ms`): the minter records the grant live until
+/// `granted + ttl + margin` and grants no conflicting lock before that,
+/// which is at least `2 × margin` after the holder's window ended — so an
+/// op the executor receives within that of the end of the holder's window
+/// (the one-way delay of the op), or whose executor's wall clock is within
+/// that of the holder's, never runs after a conflicting grant was made.
+/// The minter (or the delegate a grant moved to) judges exactly: a
 /// grant live in its table passes whatever the window, one it ended or
 /// outwaited is rejected at once. A node takes the token when it sends
 /// the op, from its current window ([`LockTables::refresh_tag`]). No
@@ -209,26 +282,71 @@ impl LockTag {
         self.0.is_empty()
     }
 
+    /// The tag as it arrives at `at` (this node's honour reading): every
+    /// token received now (a transport that does not go through the wire
+    /// form's receipt stamp: the simulation's bus).
+    pub fn received(&self, at: HonourMs) -> LockTag {
+        LockTag(
+            self.0
+                .iter()
+                .map(|t| LockToken {
+                    recv: Some(at.0),
+                    ..*t
+                })
+                .collect(),
+        )
+    }
+
+    /// What the tokens say of the windows, without how they travelled: per
+    /// token, the grant and the end of the holder's window on its honour
+    /// clock. A token taken again for the same windows (the op is sent again,
+    /// with a new receipt and less time left) is the same windows.
+    pub fn windows(&self) -> Vec<(GrantId, i64)> {
+        self.0.iter().map(|t| (t.grant, t.until_h)).collect()
+    }
+
     /// The earliest window among the tokens (`i64::MAX` with none).
     pub fn until_ms(&self) -> i64 {
         self.0.iter().map(|t| t.until_ms).min().unwrap_or(i64::MAX)
     }
 
-    /// The wire form (`(minter, seq, until_ms)` per token).
-    pub fn to_wire(&self) -> Vec<(u64, u64, i64)> {
+    /// The wire form, as the op leaves this node at honour reading `now`:
+    /// a token received here (`recv`) has spent the time since in this
+    /// node, which the receiver cannot see, so it is taken off the
+    /// remainder (a token with no receipt is sent as it is).
+    pub fn to_wire(&self, now: HonourMs) -> Vec<LockTokenWire> {
         self.0
             .iter()
-            .map(|t| (t.grant.node, t.grant.seq, t.until_ms))
+            .map(|t| {
+                let spent = t.recv.map_or(0, |r| (now.0 - r).max(0));
+                (
+                    t.grant.node,
+                    t.grant.seq,
+                    t.until_ms,
+                    t.until_h,
+                    t.clock,
+                    (t.remaining_ms - spent).max(0),
+                )
+            })
             .collect()
     }
 
-    pub fn from_wire(w: &[(u64, u64, i64)]) -> LockTag {
+    /// The tag as it arrived, received at honour reading `recv` (`None`: it
+    /// came by a path with no transit bound, the S3 inbox, and is judged
+    /// exactly or refused).
+    pub fn from_wire(w: &[LockTokenWire], recv: Option<HonourMs>) -> LockTag {
         LockTag(
             w.iter()
-                .map(|&(node, seq, until_ms)| LockToken {
-                    grant: GrantId { node, seq },
-                    until_ms,
-                })
+                .map(
+                    |&(node, seq, until_ms, until_h, clock, remaining_ms)| LockToken {
+                        grant: GrantId { node, seq },
+                        until_ms,
+                        until_h,
+                        clock,
+                        remaining_ms,
+                        recv: recv.map(|r| r.0),
+                    },
+                )
                 .collect(),
         )
     }
@@ -255,20 +373,22 @@ pub struct Grant {
     /// The M11 generation it was granted (or installed) under; 0 for the
     /// root's table. A generation's grants leave with it.
     pub gen: u64,
-    /// Phase 2: a token naming this grant whose window ends at or before
-    /// this (this table's clock) is judged by its window even while the
-    /// grant is live here ([`LockTables::check_tag`]). [`Self::MINTED`]
-    /// for a grant this table made or its holder renewed from the start;
-    /// [`Self::UNCONFIRMED`] for a copy installed without its holder — a
-    /// backup's mirror, a root's reinstated handoff copy — which may be a
-    /// grant its last sequencer had already ended; the holder's next
-    /// renewal sets it to the renewal's time ([`LockTables::extend`]), so
-    /// only an op it sent under a window running past that passes
-    /// whatever the window. A move keeps it.
-    ///
-    /// Wall clock (it is compared with tokens' `until_ms`, which are
-    /// wall: Appendix B row 6).
-    pub confirmed_ms: i64,
+    /// Phase 2: a token naming this grant that this does not confirm is
+    /// judged by its window even while the grant is live here
+    /// ([`LockTables::check_tag`]). [`Self::MINTED`] for a grant this table
+    /// made or its holder renewed from the start; [`Self::UNCONFIRMED`] for
+    /// a copy installed without its holder — a backup's mirror, a root's
+    /// reinstated handoff copy — which may be a grant its last sequencer
+    /// had already ended; the holder's next renewal sets it to that
+    /// renewal's send, `(the holder's clock id, its honour reading when it
+    /// sent)` ([`LockTables::extend`]), so only an op whose token's window
+    /// (`until_h`, a reading of the same clock) ran past it passes whatever
+    /// the window: the holder honoured the grant continuously into the
+    /// renewal this table accepted, so no gap exists in which it could have
+    /// been ended and granted anew. Another clock id (a restarted holder)
+    /// replaces it. A move keeps it. (Plan 43 C7b, row 29: both readings
+    /// are the holder's own, no offset between nodes is in the compare.)
+    pub confirmed: Option<(u64, i64)>,
     /// Plan 43 C7-F F-c: no grant conflicting with this one was issued
     /// anywhere since it was issued, as long as it (or its memory in
     /// [`Inner::lapsed`]) stays in this table — what a late renewal of it
@@ -284,10 +404,37 @@ pub struct Grant {
 }
 
 impl Grant {
-    /// [`Grant::confirmed_ms`] of a grant confirmed from the start.
-    pub const MINTED: i64 = i64::MIN;
-    /// [`Grant::confirmed_ms`] of a copy no holder has renewed here yet.
-    pub const UNCONFIRMED: i64 = i64::MAX;
+    /// [`Grant::confirmed`] of a grant confirmed from the start (clock 0:
+    /// any holder clock).
+    pub const MINTED: Option<(u64, i64)> = Some((0, i64::MIN));
+    /// [`Grant::confirmed`] of a copy no holder has renewed here yet.
+    pub const UNCONFIRMED: Option<(u64, i64)> = None;
+
+    /// Whether this grant confirms `t`: its window ran past the renewal
+    /// that confirmed the grant here, on the holder's own clock.
+    pub fn confirms(&self, t: &LockToken) -> bool {
+        match self.confirmed {
+            None => false,
+            Some((0, _)) => true,
+            Some((clock, sent)) => t.clock == clock && t.until_h > sent,
+        }
+    }
+
+    /// A renewal sent by the holder at its honour reading `sent` on clock
+    /// `clock` reached this table: confirmed from that send on (the
+    /// earliest renewal of one clock stands; another clock's replaces). A
+    /// clock id of 0 is no clock (an unset certificate or stamp): it
+    /// confirms nothing, since `(0, _)` is [`Self::MINTED`]'s "any clock".
+    pub fn confirm(&mut self, clock: u64, sent: i64) {
+        if clock == 0 {
+            return;
+        }
+        self.confirmed = match self.confirmed {
+            Some((0, _)) => self.confirmed,
+            Some((c, s)) if c == clock => Some((c, s.min(sent))),
+            _ => Some((clock, sent)),
+        };
+    }
 
     /// This grant as it crosses a node: `until_ms` is the end on the
     /// sender's *wall* clock, mapped from the wait-clock record now
@@ -302,7 +449,7 @@ impl Grant {
             until_ms: now.wall_of_wait(self.until).0,
             recalled: self.recalled,
             gen: self.gen,
-            confirmed_ms: self.confirmed_ms,
+            confirmed: self.confirmed,
             settled: self.settled,
             lapsed: false,
         }
@@ -324,7 +471,7 @@ pub struct GrantWire {
     pub until_ms: i64,
     pub recalled: bool,
     pub gen: u64,
-    pub confirmed_ms: i64,
+    pub confirmed: Option<(u64, i64)>,
     /// Plan 43 C7-F F-c, appended: [`Grant::settled`].
     pub settled: bool,
     /// Plan 43 C7-F F-c, appended: the record had expired on its owner's
@@ -346,7 +493,7 @@ impl GrantWire {
             until,
             recalled: self.recalled,
             gen: self.gen,
-            confirmed_ms: self.confirmed_ms,
+            confirmed: self.confirmed,
             settled: self.settled,
         }
     }
@@ -832,8 +979,11 @@ struct Inner {
     /// ([`TagPins`]). A position this node reports as covering what was
     /// executed here ([`crate::Meta::settle_tagged_writes`]) waits for
     /// those whose grant ended here or whose token's window is over: how
-    /// many are in, and the latest window among their tokens.
-    pins: BTreeMap<GrantId, (u32, i64)>,
+    /// many are in, and the latest window among their tokens, as the
+    /// token's absolute stamp (wall) and as the receipt plus the time left
+    /// (this node's honour clock; `i64::MAX` for a token with no receipt,
+    /// which is judged exactly and has no window).
+    pins: BTreeMap<GrantId, (u32, i64, i64)>,
     /// Node side: grants under which a tagged mutation of this node ended
     /// in doubt, and which ones (by rid, where known): such an op may have
     /// passed its check at an executor and still be committing there, so
@@ -1128,14 +1278,13 @@ impl Inner {
         }
     }
 
-    /// An op tagged with `until_wall` (a token's window end, wall clock)
-    /// may still execute somewhere until then: `grant` is not released
-    /// before that has passed *on this node's wait clock* (plan 43
-    /// C7-H1, R8). The wall end is mapped to wait now; between the
-    /// token's minting and the pin a forward wall step of this node would
-    /// shorten the remainder (row 6: offset-bound).
-    fn pin(&mut self, grant: GrantId, until_wall: i64, now: Now) {
-        let wait = now.wait_of_wall(Ms(until_wall));
+    /// An op tagged with `until_h` (a token's window end, this node's
+    /// honour clock: it minted the token) may still execute somewhere until
+    /// then: `grant` is not released before that has passed *on this node's
+    /// wait clock* (plan 43 C7-H1, R8; C7b, row 6: the honour end is mapped
+    /// to wait now, both readings of this node; no wall value is in it).
+    fn pin(&mut self, grant: GrantId, until_h: i64, now: Now) {
+        let wait = now.wait_of_honour(HonourMs(until_h));
         let e = self.inflight.entry(grant).or_default();
         e.pinned_until = e.pinned_until.max(wait);
     }
@@ -1752,7 +1901,7 @@ impl LockTables {
                 until,
                 recalled: false,
                 gen,
-                confirmed_ms: Grant::MINTED,
+                confirmed: Grant::MINTED,
                 // A mint: made only where no grace, floor or barrier holds
                 // the inode, so every grant before it was issued before it
                 // (`Grant::settled`).
@@ -1873,20 +2022,21 @@ impl LockTables {
 
     /// Extend a known grant of `node` at its renewal (`now`): `(mode,
     /// recalled)`, or `None` when unknown. The record ends at `until`
-    /// (wait clock); the renewal confirms an installed copy from `now`'s
-    /// wall reading on ([`Grant::confirmed_ms`], wall like the tokens it
-    /// is compared with).
+    /// (wait clock); the renewal, sent by the holder at honour reading
+    /// `sent` of its clock `clock` (`from`), confirms an installed copy from
+    /// that send on ([`Grant::confirmed`]: the holder's own readings, so no
+    /// offset between the nodes is in the compare with its tokens).
     pub fn extend(
         &self,
         id: GrantId,
         node: u64,
         until: WaitMs,
-        now: Now,
+        from: (u64, i64),
     ) -> Option<(LockMode, bool)> {
         let mut g = self.lock();
         let e = g.grants.get_mut(&id).filter(|e| e.node == node)?;
         e.until = e.until.max(until);
-        e.confirmed_ms = e.confirmed_ms.min(now.wall.0);
+        e.confirm(from.0, from.1);
         Some((e.mode, e.recalled))
     }
 
@@ -1895,13 +2045,17 @@ impl LockTables {
     /// clock, `fallback` while none is set; read inside the critical
     /// section). A second writer's extension (the lock lane) must never
     /// revive what the core may already have expired and outwaited, so
-    /// it extends only what is live at the instant it extends.
+    /// it extends only what is live at the instant it extends. Like
+    /// [`Self::extend`], the renewal confirms an installed copy from its
+    /// send `from` (the holder's clock id and honour reading: plan 43 C7b,
+    /// row 29), never from this table's clock.
     pub fn extend_live(
         &self,
         id: GrantId,
         node: u64,
         until: WaitMs,
         fallback: Now,
+        from: (u64, i64),
     ) -> Option<(LockMode, bool)> {
         let mut g = self.lock();
         let now = g.now_or(fallback);
@@ -1910,7 +2064,7 @@ impl LockTables {
             .get_mut(&id)
             .filter(|e| e.node == node && e.until > now.wait)?;
         e.until = e.until.max(until);
-        e.confirmed_ms = e.confirmed_ms.min(now.wall.0);
+        e.confirm(from.0, from.1);
         Some((e.mode, e.recalled))
     }
 
@@ -2021,12 +2175,14 @@ impl LockTables {
     /// (looked up before anything drops the expired ones), or its memory
     /// is ([`Inner::lapsed`]: dropped by an outwait, and nothing
     /// conflicting granted on the inode since). `Admitted`: the record is
-    /// live until `until` again, settled, confirmed from `now` (a token
-    /// whose window ended before is refused as one past the lapse), and no
+    /// live until `until` again, settled, confirmed from the late renewal's
+    /// send `from` (the holder's clock id and honour reading: a token whose
+    /// window ended before is refused as one past the lapse), and no
     /// longer remembered as ended; `recalled` is `waiter`. Anything else —
     /// an unknown grant, an unsettled record, a mode that does not cover,
     /// a memory superseded — is `Refused`, grace or no grace: an owner
     /// cannot tell what was granted meanwhile.
+    #[allow(clippy::too_many_arguments)]
     pub fn admit_late(
         &self,
         id: GrantId,
@@ -2035,6 +2191,7 @@ impl LockTables {
         until: WaitMs,
         waiter: bool,
         now: Now,
+        from: (u64, i64),
     ) -> Option<LateAdmitted> {
         let mut g = self.lock();
         // An id this table replaced while it was live is its replacement.
@@ -2071,7 +2228,7 @@ impl LockTables {
             }
             let e = g.grants.get_mut(&id).expect("present");
             e.until = e.until.max(until);
-            e.confirmed_ms = now.wall.0;
+            e.confirmed = Some(from);
             let out = LateAdmitted {
                 id,
                 mode: e.mode,
@@ -2100,7 +2257,7 @@ impl LockTables {
                 let mut e = g.forget_lapsed(id).expect("remembered");
                 e.until = until;
                 e.recalled = waiter;
-                e.confirmed_ms = now.wall.0;
+                e.confirmed = Some(from);
                 e.settled = true;
                 // The same node's older record on the inode is replaced.
                 g.grants
@@ -2196,10 +2353,12 @@ impl LockTables {
 
     /// Plan 30 §M14 phase 2, the fencing token at the executor: `Err` with
     /// the first token of `tag` naming a grant that is no longer live — its
-    /// holder's window has passed on this clock (`now_ms >= until_ms`), or
-    /// this table ended the grant (released or outwaited). The caller then
-    /// executes nothing (`MetaError::LockLapsed`). An empty tag costs
-    /// nothing.
+    /// holder's window has passed here (the token's absolute stamp has
+    /// passed on this node's wall clock, or this node's honour clock has
+    /// passed the receipt plus the time the holder said it had left:
+    /// plan 43 C7b, row 6), or this table ended the grant (released or
+    /// outwaited). The caller then executes nothing
+    /// (`MetaError::LockLapsed`). An empty tag costs nothing.
     ///
     /// A grant live in this table (the minter, or the delegate it moved
     /// to) is judged exactly: it passes whatever the token's window says,
@@ -2210,9 +2369,12 @@ impl LockTables {
     /// table ended. Except: a grant installed here from a copy (a mirror,
     /// a reinstated handoff) may be one its last sequencer had ended, so
     /// a token whose window ends before the holder's first renewal here
-    /// confirmed it ([`Grant::confirmed_ms`]) is judged by that window
+    /// confirmed it ([`Grant::confirmed`]) is judged by that window
     /// (lock-fence-token review, round 2: an inbox op drained by a new
-    /// holder that installed a stale mirror).
+    /// holder that installed a stale mirror). A token with no receipt (it
+    /// came by the S3 inbox or the replay queue, which have no transit
+    /// bound) has no window to be judged by here: it passes only exactly,
+    /// and is refused otherwise (plan 43 C7b, row 31).
     pub fn check_tag(&self, tag: &LockTag, now: Now) -> Result<(), LockToken> {
         if tag.is_empty() {
             return Ok(());
@@ -2272,9 +2434,13 @@ impl LockTables {
             }
             Ok(()) => {
                 for t in &tag.0 {
-                    let e = g.pins.entry(t.grant).or_insert((0, i64::MIN));
+                    let e = g.pins.entry(t.grant).or_insert((0, i64::MIN, i64::MIN));
                     e.0 += 1;
                     e.1 = e.1.max(t.until_ms);
+                    e.2 = e.2.max(
+                        t.recv
+                            .map_or(i64::MAX, |r| r.saturating_add(t.remaining_ms)),
+                    );
                 }
                 self.pinned.fetch_add(tag.0.len(), Ordering::SeqCst);
                 let stamp = executed_stamp();
@@ -2328,15 +2494,19 @@ impl LockTables {
             return false;
         }
         let g = self.lock();
-        // One call, two readings (plan 43 C7-H1): the table's records are
-        // on this node's wait clock, a token's window (the pins' `until`)
-        // is the minter's wall window.
+        // One call, three readings (plan 43 C7-H1, C7b): the table's records
+        // are on this node's wait clock; a token's window is over when
+        // either of its bounds is: the minter's wall stamp has passed on
+        // this node's wall clock, or this node's honour clock has passed
+        // the receipt plus the time the holder said it had left.
         let now = g.now_or(Now::same(i64::MIN));
         g.pins
             .iter()
-            .any(|(id, (_, until))| match g.grants.get(id) {
+            .any(|(id, (_, until, until_h))| match g.grants.get(id) {
                 Some(e) => e.until <= now.wait,
-                None => g.ended.contains_key(id) || now.wall.0 >= *until,
+                None => {
+                    g.ended.contains_key(id) || now.wall.0 >= *until || now.honour.0 >= *until_h
+                }
             })
     }
 
@@ -2466,10 +2636,12 @@ impl LockTables {
     /// the check at the write repeats the first check's judgement and does
     /// not count it again).
     fn judge(&self, g: &mut Inner, tag: &LockTag, now: Now, count: bool) -> Result<(), LockToken> {
-        // One call, two readings (plan 43 C7-H1): a token is judged on this
-        // node's wall clock against the minter's wall window (Appendix B
-        // row 6), the table's records (and the memory of ended grants) on
-        // its wait clock.
+        // One call, three readings (plan 43 C7-H1, C7b): a token's window
+        // is judged by this node's wall clock against the minter's absolute
+        // stamp (phase 1, offset-bound) and by this node's honour clock
+        // against its receipt plus the time left the holder named
+        // (rate-only); the table's records (and the memory of ended grants)
+        // are on its wait clock.
         let now_ms = now.wall.0;
         if g.ended.len() > 256 {
             g.ended.retain(|_, keep| *keep > now.wait);
@@ -2477,14 +2649,12 @@ impl LockTables {
         if g.drop_expired(now.wait) {
             self.expired_dropped.store(true, Ordering::Relaxed);
         }
+        let exact =
+            |g: &Inner, t: &LockToken| g.grants.get(&t.grant).is_some_and(|e| e.confirms(t));
         if count {
             let path = TOKEN_PATH.with(|p| p.get()).index();
             for t in &tag.0 {
-                let exact = g
-                    .grants
-                    .get(&t.grant)
-                    .is_some_and(|e| t.until_ms > e.confirmed_ms);
-                if exact {
+                if exact(g, t) {
                     g.stats.tokens_judged_exact[path] += 1;
                 } else {
                     g.stats.tokens_judged_window[path] += 1;
@@ -2495,13 +2665,20 @@ impl LockTables {
             .0
             .iter()
             .find(|t| {
-                if g.grants
-                    .get(&t.grant)
-                    .is_some_and(|e| t.until_ms > e.confirmed_ms)
-                {
+                if exact(g, t) {
                     return false;
                 }
-                now_ms >= t.until_ms || g.ended.contains_key(&t.grant)
+                if g.ended.contains_key(&t.grant) {
+                    return true;
+                }
+                match t.recv {
+                    Some(r) => {
+                        now_ms >= t.until_ms || now.honour.0 >= r.saturating_add(t.remaining_ms)
+                    }
+                    // No receipt: no transit bound, so no window to judge
+                    // by (the inbox, the replay queue): exact or refused.
+                    None => true,
+                }
             })
             .copied();
         match dead {
@@ -3221,7 +3398,9 @@ impl LockTables {
     /// `ttl_cap` runs under the table's mutex: it reads a mirrored fact and
     /// nothing slow. Then the owner record ends at `max(old, now.wait + ttl +
     /// margin)` ([`Self::extend`]) and the held window as
-    /// [`Self::renewed`] extends it for a renewal sent at `now.honour`.
+    /// [`Self::renewed`] extends it for a renewal sent at `now.honour` of
+    /// this node's clock `clock` (its id, which confirms an installed copy
+    /// from that send: [`Grant::confirmed`]).
     /// `true`: renewed; `false`: nothing changed.
     #[allow(clippy::too_many_arguments)]
     pub fn renew_own(
@@ -3233,6 +3412,7 @@ impl LockTables {
         lock_ttl_ms: i64,
         margin_ms: i64,
         fallback: Now,
+        clock: u64,
     ) -> bool {
         let budget = self.first_use_budget_ms();
         let mut g = self.lock();
@@ -3264,7 +3444,10 @@ impl LockTables {
         let mut recalled = false;
         if let Some(e) = g.grants.get_mut(&id) {
             e.until = e.until.max(end);
-            e.confirmed_ms = e.confirmed_ms.min(now.wall.0);
+            // Confirmed from this renewal's send on this node's own clock
+            // (`clock`), as a peer's renewal confirms from its holder's
+            // (plan 43 C7b, row 29).
+            e.confirm(clock, sent.0);
             recalled = e.recalled;
         }
         if let Some(h) = g.held.get_mut(&ino) {
@@ -3531,7 +3714,7 @@ impl LockTables {
     /// [`LockTag`]). `Err` when one of their locks is under no honoured,
     /// covering grant: the owner is fenced (its op is refused, `EIO`).
     /// Empty when they hold no local lock.
-    pub fn owner_tag(&self, owners: &[u64], now: Now) -> Result<LockTag, OwnerFenced> {
+    pub fn owner_tag(&self, owners: &[u64], now: Now, clock: u64) -> Result<LockTag, OwnerFenced> {
         if owners.is_empty() {
             return Ok(LockTag::NONE);
         }
@@ -3544,12 +3727,10 @@ impl LockTables {
                     .get(ino)
                     .filter(|h| h.until > now.honour && h.mode.covers(l.mode()))
                     .ok_or(OwnerFenced)?;
-                // Minted on the wall clock from the honour window, now
-                // (plan 43 C7-H1, R8).
-                let t = LockToken {
-                    grant: h.id,
-                    until_ms: now.wall_of_honour(h.until).0,
-                };
+                // Minted from the honour window, now (plan 43 C7-H1, R8; C7b:
+                // the wall stamp, the honour end with this node's clock id
+                // and the time left).
+                let t = LockToken::minted(h.id, h.until, now, clock);
                 let e = per_minter.entry(h.id.node).or_insert(t);
                 if t.until_ms < e.until_ms {
                     *e = t;
@@ -3594,7 +3775,7 @@ impl LockTables {
                 continue;
             }
             if in_doubt {
-                g.pin(t.grant, t.until_ms, now);
+                g.pin(t.grant, t.until_h, now);
             }
             let e = g.inflight.get_mut(&t.grant).expect("checked");
             e.active = e.active.saturating_sub(1);
@@ -3635,7 +3816,7 @@ impl LockTables {
         let mut g = self.lock();
         let now = g.now_or(Now::same(0));
         for t in &tag.0 {
-            g.pin(t.grant, t.until_ms, now);
+            g.pin(t.grant, t.until_h, now);
             g.note_doubted(t.grant, now.wait, rid);
         }
     }
@@ -3736,16 +3917,22 @@ impl LockTables {
             tag.0
                 .iter()
                 .map(|t| {
-                    let until = g
+                    // A grant this node still holds and honours is named with
+                    // the end of its current window (a renewal moved it); the
+                    // token is received here, now (the op leaves from here).
+                    match g
                         .held
                         .values()
                         .find(|h| h.id == t.grant && h.until > now.honour)
-                        .map_or(t.until_ms, |h| {
-                            now.wall_of_honour(h.until).0.max(t.until_ms)
-                        });
-                    LockToken {
-                        grant: t.grant,
-                        until_ms: until,
+                    {
+                        Some(h) if h.until.0 >= t.until_h => {
+                            LockToken::minted(t.grant, h.until, now, t.clock)
+                        }
+                        _ => LockToken {
+                            remaining_ms: (t.until_h - now.honour.0).max(0),
+                            recv: Some(now.honour.0),
+                            ..*t
+                        },
                     }
                 })
                 .collect(),
@@ -4513,7 +4700,7 @@ mod tests {
             until: WaitMs(100),
             recalled: false,
             gen: 0,
-            confirmed_ms: Grant::UNCONFIRMED,
+            confirmed: Grant::UNCONFIRMED,
             settled: false,
         };
         // Node 2 was granted again (a newer id): the old copy stays out.
@@ -4541,7 +4728,7 @@ mod tests {
             until: WaitMs(until),
             recalled: false,
             gen: 0,
-            confirmed_ms: Grant::UNCONFIRMED,
+            confirmed: Grant::UNCONFIRMED,
             settled: false,
         };
         let t = LockTables::default();
@@ -4594,7 +4781,7 @@ mod tests {
             until: WaitMs(until),
             recalled: false,
             gen: 0,
-            confirmed_ms: Grant::UNCONFIRMED,
+            confirmed: Grant::UNCONFIRMED,
             settled: false,
         };
         t.install(copy(2, 1, LockMode::Exclusive, 100));
@@ -4630,13 +4817,7 @@ mod tests {
         t.forget(c);
         assert!(t.take_outwaited().is_empty(), "nothing dropped yet");
         assert!(t
-            .check_tag(
-                &LockTag(vec![LockToken {
-                    grant: b,
-                    until_ms: 300
-                }]),
-                Now::same(150)
-            )
+            .check_tag(&LockTag(vec![LockToken::window(b, 300)]), Now::same(150))
             .is_ok());
         let first = t.take_outwaited();
         assert_eq!(first.iter().map(|g| g.id).collect::<Vec<_>>(), vec![a]);
@@ -5529,6 +5710,7 @@ mod supersede_tests {
 #[cfg(test)]
 mod token_tests {
     use super::*;
+    use constellation_types::clock::Ms;
 
     fn held(mode: LockMode, until: i64) -> HeldGrant {
         HeldGrant {
@@ -5576,10 +5758,7 @@ mod token_tests {
         let t = LockTables::default();
         t.set_token_memory_ms(3_000);
         let id = t.grant(1, 2, 7, LockMode::Exclusive, WaitMs(1_000), 0);
-        let tag = LockTag(vec![LockToken {
-            grant: id,
-            until_ms: 500,
-        }]);
+        let tag = LockTag(vec![LockToken::window(id, 500)]);
         assert_eq!(t.check_tag(&LockTag::NONE, Now::same(i64::MAX)), Ok(()));
         assert_eq!(t.check_tag(&tag, Now::same(499)), Ok(()));
         assert_eq!(
@@ -5603,10 +5782,7 @@ mod token_tests {
         // so); a token whose window still runs is refused all the same,
         // through 257 other ends (the prune) and for the memory's span.
         let out = t.grant(1, 3, 8, LockMode::Exclusive, WaitMs(2_000), 0);
-        let late = LockTag(vec![LockToken {
-            grant: out,
-            until_ms: 9_000,
-        }]);
+        let late = LockTag(vec![LockToken::window(out, 9_000)]);
         assert!(t
             .conflicting(8, 4, LockMode::Exclusive, WaitMs(2_000))
             .is_empty());
@@ -5643,43 +5819,37 @@ mod token_tests {
             until: WaitMs(10_000),
             recalled: false,
             gen: 0,
-            confirmed_ms: Grant::UNCONFIRMED,
+            confirmed: Grant::UNCONFIRMED,
             settled: false,
         };
         assert!(t.install_if_consistent(copy, WaitMs(0)));
-        let old = LockTag(vec![LockToken {
-            grant: id,
-            until_ms: 500,
-        }]);
+        let old = LockTag(vec![LockToken::window(id, 500)]);
         assert_eq!(t.check_tag(&old, Now::same(499)), Ok(()));
         assert!(
             t.check_tag(&old, Now::same(500)).is_err(),
             "unconfirmed: the window"
         );
         assert_eq!(
-            t.extend(id, 2, WaitMs(12_000), Now::same(1_000)),
+            t.extend(id, 2, WaitMs(12_000), (1, 1_000)),
             Some((LockMode::Exclusive, false))
         );
-        assert_eq!(t.get(id).unwrap().confirmed_ms, 1_000);
+        assert_eq!(t.get(id).unwrap().confirmed, Some((1, 1_000)));
         assert!(
             t.check_tag(&old, Now::same(1_200)).is_err(),
             "sent before the renewal"
         );
-        let new = LockTag(vec![LockToken {
-            grant: id,
-            until_ms: 1_500,
-        }]);
+        let new = LockTag(vec![LockToken::window(id, 1_500)]);
         assert_eq!(
             t.check_tag(&new, Now::same(3_000)),
             Ok(()),
             "confirmed: exact"
         );
         // A later renewal never moves the confirmation forward.
-        t.extend(id, 2, WaitMs(13_000), Now::same(2_000));
-        assert_eq!(t.get(id).unwrap().confirmed_ms, 1_000);
+        t.extend(id, 2, WaitMs(13_000), (1, 2_000));
+        assert_eq!(t.get(id).unwrap().confirmed, Some((1, 1_000)));
         // A grant made here is confirmed from the start.
         let made = t.grant(1, 3, 8, LockMode::Exclusive, WaitMs(10_000), 0);
-        assert_eq!(t.get(made).unwrap().confirmed_ms, Grant::MINTED);
+        assert_eq!(t.get(made).unwrap().confirmed, Grant::MINTED);
     }
 
     /// A token is taken when its op is sent: a renewal since the op began
@@ -5690,21 +5860,28 @@ mod token_tests {
         let t = LockTables::default();
         t.install_held(7, held(LockMode::Exclusive, 1_000));
         let id = GrantId { node: 1, seq: 1 };
-        let old = LockTag(vec![LockToken {
-            grant: id,
-            until_ms: 600,
-        }]);
+        let old = LockTag(vec![LockToken::window(id, 600)]);
         let fresh = t.refresh_tag(&old, Now::same(500));
         assert_eq!(fresh.0[0].until_ms, 1_000);
+        assert_eq!((fresh.0[0].until_h, fresh.0[0].remaining_ms), (1_000, 500));
+        assert_eq!(fresh.0[0].recv, Some(500), "received here, now");
         assert!(t.tag_honoured(&fresh, Now::same(500)));
-        // Past the held window: not honoured, nothing to refresh from.
-        assert_eq!(t.refresh_tag(&old, Now::same(1_000)), old);
+        // Past the held window: not honoured, nothing to refresh from; the
+        // old window stays (the executor judges it), with what is left of
+        // it, none.
+        let stale = t.refresh_tag(&old, Now::same(1_000));
+        assert_eq!(
+            (
+                stale.0[0].until_ms,
+                stale.0[0].until_h,
+                stale.0[0].remaining_ms
+            ),
+            (600, 600, 0)
+        );
         assert!(!t.tag_honoured(&old, Now::same(1_000)));
-        let other = LockTag(vec![LockToken {
-            grant: GrantId { node: 1, seq: 9 },
-            until_ms: 600,
-        }]);
-        assert_eq!(t.refresh_tag(&other, Now::same(500)), other);
+        let other = LockTag(vec![LockToken::window(GrantId { node: 1, seq: 9 }, 600)]);
+        let kept = t.refresh_tag(&other, Now::same(500));
+        assert_eq!((kept.0[0].until_ms, kept.0[0].remaining_ms), (600, 100));
         assert!(!t.tag_honoured(&other, Now::same(500)));
     }
 
@@ -5719,7 +5896,7 @@ mod token_tests {
         let w = woken.clone();
         t.set_release_wake(std::sync::Arc::new(move |ino| w.lock().unwrap().push(ino)));
         let lapsed = GrantId { node: 1, seq: 7 };
-        let tag = |grant, until_ms| LockTag(vec![LockToken { grant, until_ms }]);
+        let tag = |grant, until_ms| LockTag(vec![LockToken::window(grant, until_ms)]);
         t.tag_begin(&tag(lapsed, 300), Now::same(0));
         t.tag_end(&tag(lapsed, 300), true, Now::same(10));
         assert_eq!(t.lock().inflight.len(), 1, "pinned");
@@ -5772,26 +5949,33 @@ mod token_tests {
             t.local_set(7, lk(11, false, 0, 0), Now::same(0)),
             LocalOutcome::Conflict(lk(10, true, 0, u64::MAX))
         );
-        assert_eq!(t.owner_tag(&[], Now::same(0)), Ok(LockTag::NONE));
-        assert_eq!(t.owner_tag(&[12], Now::same(0)), Ok(LockTag(Vec::new())));
-        let tag = t.owner_tag(&[10], Now::same(100)).unwrap();
+        assert_eq!(t.owner_tag(&[], Now::same(0), 7), Ok(LockTag::NONE));
+        assert_eq!(t.owner_tag(&[12], Now::same(0), 7), Ok(LockTag(Vec::new())));
+        let tag = t.owner_tag(&[10], Now::same(100), 7).unwrap();
+        // Minted at honour reading 100 on clock 7: the window's end on both
+        // readings, the time left, and received here, now.
+        let minted = |grant, until: i64| LockToken {
+            grant,
+            until_ms: until,
+            until_h: until,
+            clock: 7,
+            remaining_ms: until - 100,
+            recv: Some(100),
+        };
         assert_eq!(
             tag.0,
             vec![
-                LockToken {
-                    grant: GrantId { node: 1, seq: 2 },
-                    until_ms: 600
-                },
-                LockToken {
-                    grant: GrantId { node: 3, seq: 1 },
-                    until_ms: 800
-                },
+                minted(GrantId { node: 1, seq: 2 }, 600),
+                minted(GrantId { node: 3, seq: 1 }, 800),
             ]
         );
         assert_eq!(tag.until_ms(), 600);
-        assert_eq!(LockTag::from_wire(&tag.to_wire()), tag);
+        assert_eq!(
+            LockTag::from_wire(&tag.to_wire(HonourMs(100)), Some(HonourMs(100))),
+            tag
+        );
         // Past one grant's window: no tag (fenced).
-        assert_eq!(t.owner_tag(&[10], Now::same(600)), Err(OwnerFenced));
+        assert_eq!(t.owner_tag(&[10], Now::same(600), 7), Err(OwnerFenced));
         let mut lockers = t.lockers();
         lockers.sort();
         assert_eq!(lockers, vec![(10, 1, 0)]);
@@ -5803,10 +5987,7 @@ mod token_tests {
     fn a_grant_with_tagged_ops_in_flight_is_held_back() {
         let t = LockTables::default();
         let id = GrantId { node: 1, seq: 4 };
-        let tag = LockTag(vec![LockToken {
-            grant: id,
-            until_ms: 500,
-        }]);
+        let tag = LockTag(vec![LockToken::window(id, 500)]);
         assert_eq!(t.release_blocked(id, Now::same(0)), None);
         t.tag_begin(&tag, Now::same(0));
         t.tag_begin(&tag, Now::same(0));
@@ -5835,10 +6016,7 @@ mod token_tests {
         let t = LockTables::default();
         t.install_held(7, held(LockMode::Exclusive, 10_000));
         let id = GrantId { node: 1, seq: 1 };
-        let tag = LockTag(vec![LockToken {
-            grant: id,
-            until_ms: 500,
-        }]);
+        let tag = LockTag(vec![LockToken::window(id, 500)]);
         assert_eq!(
             t.local_set(7, lk(10, true, 0, 9), Now::same(0)),
             LocalOutcome::Done
@@ -5892,10 +6070,7 @@ mod token_tests {
         let t = LockTables::default();
         t.install_held(7, held(LockMode::Exclusive, 10_000));
         let id = GrantId { node: 1, seq: 1 };
-        let tag = LockTag(vec![LockToken {
-            grant: id,
-            until_ms: 500,
-        }]);
+        let tag = LockTag(vec![LockToken::window(id, 500)]);
         assert_eq!(
             t.local_set(7, lk(10, true, 0, 9), Now::same(0)),
             LocalOutcome::Done
@@ -5949,13 +6124,210 @@ mod token_tests {
         assert_eq!(fenced, vec![10], "the shared owner keeps its lock");
     }
 
+    /// A reading with the wall and honour clocks apart (an executor whose
+    /// wall clock is `wall`, whose honour clock reads `honour`).
+    fn readings(wall: i64, honour: i64) -> Now {
+        Now {
+            wall: Ms(wall),
+            honour: HonourMs(honour),
+            ..Now::same(0)
+        }
+    }
+
+    /// A token as an executor holds it that does not hold the grant: minted
+    /// by a holder whose window ended at honour reading 50 000 of clock 9
+    /// (wall stamp `until_ms`), with 3 s left when the op left it, received
+    /// here at honour reading 70 000.
+    fn foreign(until_ms: i64) -> LockTag {
+        LockTag(vec![LockToken {
+            grant: GrantId { node: 1, seq: 77 },
+            until_ms,
+            until_h: 50_000,
+            clock: 9,
+            remaining_ms: 3_000,
+            recv: Some(70_000),
+        }])
+    }
+
+    /// Plan 43 C7b, row 6, phase 1: an executor that does not hold the grant
+    /// judges the token by its own honour clock, from its receipt plus the
+    /// time the holder said it had left, whatever its wall clock says of the
+    /// holder's. (Fails before: the token carried one wall stamp, and an
+    /// executor whose wall clock was behind the holder's ran the op after
+    /// the holder's window — and the minter's outwait — had ended.)
+    #[test]
+    fn a_token_dies_at_receipt_plus_remaining_on_the_honour_clock() {
+        let t = LockTables::default();
+        // The wall stamp is a minute ahead of the executor's wall clock (the
+        // executor is behind the holder): the old check passes at any time.
+        let tag = foreign(1_000_000);
+        assert_eq!(t.check_tag(&tag, readings(10_000, 72_999)), Ok(()));
+        assert!(
+            t.check_tag(&tag, readings(10_000, 73_000)).is_err(),
+            "receipt 70 000 + 3 000 left"
+        );
+        assert!(t.check_tag(&tag, readings(10_000, 90_000)).is_err());
+    }
+
+    /// The absolute stamp still refuses (phase 1 keeps both bounds): an
+    /// executor whose wall clock is past the holder's stamp refuses a token
+    /// whose remaining time says it has time left.
+    #[test]
+    fn the_absolute_stamp_still_refuses() {
+        let t = LockTables::default();
+        let tag = foreign(20_000);
+        assert_eq!(t.check_tag(&tag, readings(19_999, 71_000)), Ok(()));
+        assert!(t.check_tag(&tag, readings(20_000, 71_000)).is_err());
+    }
+
+    /// Plan 43 C7b, row 29: a copy installed without its holder is confirmed
+    /// by the holder's next renewal, in the holder's own readings: a token
+    /// passes exactly iff its window (the holder's `until_h`) ran past the
+    /// renewal's send on the same clock. (Fails before: the renewal's
+    /// arrival on the sequencer's wall clock was compared with the token's
+    /// wall stamp.)
+    #[test]
+    fn confirmation_is_on_the_holders_clock() {
+        let t = LockTables::default();
+        let id = GrantId { node: 1, seq: 77 };
+        let copy = Grant {
+            id,
+            node: 2,
+            ino: 7,
+            mode: LockMode::Exclusive,
+            until: WaitMs(10_000),
+            recalled: false,
+            gen: 0,
+            confirmed: Grant::UNCONFIRMED,
+            settled: false,
+        };
+        assert!(t.install_if_consistent(copy, WaitMs(0)));
+        let token = |until_h: i64, clock: u64| {
+            LockTag(vec![LockToken {
+                grant: id,
+                until_ms: 1_000_000,
+                until_h,
+                clock,
+                remaining_ms: 0,
+                recv: Some(0),
+            }])
+        };
+        let now = readings(0, 1_000_000);
+        // Unconfirmed: judged by the window, which is over (receipt 0, none left).
+        assert!(t.check_tag(&token(90, 9), now).is_err());
+        // The holder (clock 9) renews, sending at its honour reading 100.
+        t.extend(id, 2, WaitMs(20_000), (9, 100));
+        assert_eq!(t.get(id).unwrap().confirmed, Some((9, 100)));
+        // A token whose window ran past that send is exact, whatever the
+        // window; one that ended before it, or is of another clock, is not.
+        assert_eq!(t.check_tag(&token(101, 9), now), Ok(()));
+        assert!(t.check_tag(&token(100, 9), now).is_err());
+        assert!(t.check_tag(&token(90, 9), now).is_err());
+        assert!(
+            t.check_tag(&token(101, 8), now).is_err(),
+            "another clock's reading proves nothing"
+        );
+        // A later renewal of the same clock never moves the confirmation on.
+        t.extend(id, 2, WaitMs(30_000), (9, 5_000));
+        assert_eq!(t.get(id).unwrap().confirmed, Some((9, 100)));
+    }
+
+    /// Another clock id (a restarted holder) replaces the confirmation: a
+    /// token of the earlier incarnation is unconfirmed again, a minted grant
+    /// is confirmed for every clock.
+    #[test]
+    fn another_clock_is_unconfirmed() {
+        let mut g = Grant {
+            id: GrantId { node: 1, seq: 5 },
+            node: 2,
+            ino: 7,
+            mode: LockMode::Shared,
+            until: WaitMs(1),
+            recalled: false,
+            gen: 0,
+            confirmed: Grant::UNCONFIRMED,
+            settled: false,
+        };
+        let id = g.id;
+        let token = |until_h: i64, clock: u64| LockToken {
+            grant: id,
+            until_ms: 0,
+            until_h,
+            clock,
+            remaining_ms: 0,
+            recv: None,
+        };
+        assert!(!g.confirms(&token(i64::MAX, 9)), "no renewal yet");
+        // A renewal stamped with no clock (an unset certificate) confirms
+        // nothing: `(0, _)` would be "minted", any clock.
+        g.confirm(0, 100);
+        assert_eq!(g.confirmed, Grant::UNCONFIRMED);
+        assert!(!g.confirms(&token(101, 9)));
+        g.confirm(9, 100);
+        assert!(g.confirms(&token(101, 9)));
+        g.confirm(10, 7);
+        assert!(!g.confirms(&token(101, 9)), "replaced by the new clock");
+        assert!(g.confirms(&token(8, 10)));
+        g.confirmed = Grant::MINTED;
+        g.confirm(11, 3);
+        assert!(g.confirms(&token(i64::MIN + 1, 12)), "minted: any clock");
+    }
+
+    /// Plan 43 C7b, row 31: a token that came by the S3 inbox or the persisted
+    /// replay queue has no receipt, so no window: it passes exactly (the
+    /// grant live and confirmed in this table) or is refused, even before
+    /// its holder's window ended. (Fails before: it was judged by the wall
+    /// stamp, which says nothing of an op drained long after it was sent.)
+    #[test]
+    fn an_inbox_token_is_exact_or_refused() {
+        let t = LockTables::default();
+        let now = readings(10_000, 71_000);
+        let wired = foreign(1_000_000).to_wire(HonourMs(70_000));
+        let tag = LockTag::from_wire(&wired, None);
+        assert_eq!(tag.0[0].recv, None);
+        assert!(
+            t.check_tag(&tag, now).is_err(),
+            "not held here: no window to judge it by"
+        );
+        // The same token received over P2P at 70 000 is judged by the window.
+        let p2p = LockTag::from_wire(&wired, Some(HonourMs(70_000)));
+        assert_eq!(t.check_tag(&p2p, now), Ok(()));
+        // Held and confirmed here: exact, with or without a receipt.
+        let id = t.grant(1, 2, 7, LockMode::Exclusive, WaitMs(100_000), 0);
+        let mut tag = tag;
+        tag.0[0].grant = id;
+        assert_eq!(t.check_tag(&tag, now), Ok(()));
+        // Ended here: refused.
+        t.forget(id);
+        assert!(t.check_tag(&tag, now).is_err());
+    }
+
+    /// An op that sat in its sender's queue before it was sent has spent
+    /// that time of the window: the wire form takes it off the remainder.
+    #[test]
+    fn the_wire_form_takes_off_the_time_spent_here() {
+        let tag = LockTag(vec![LockToken {
+            grant: GrantId { node: 1, seq: 1 },
+            until_ms: 0,
+            until_h: 5_000,
+            clock: 9,
+            remaining_ms: 2_000,
+            recv: Some(3_000),
+        }]);
+        assert_eq!(tag.to_wire(HonourMs(3_000))[0].5, 2_000);
+        assert_eq!(tag.to_wire(HonourMs(4_500))[0].5, 500);
+        assert_eq!(tag.to_wire(HonourMs(9_000))[0].5, 0, "never negative");
+    }
+
     /// The token's cost on the wire (postcard, as `MutateRequest` and the
     /// inbox carry it): one byte without a lock; one grant from a minter
-    /// with a full-width node id, a seq in the millions and a unix-ms
-    /// window, 20 bytes more (21 in all).
+    /// with a full-width node id, a seq in the millions, a unix-ms window
+    /// on both readings, a clock id of full width and 20 s left, 39 bytes
+    /// more (40 in all; plan 43 C7b added the honour end, the clock id and
+    /// the time left to the 21 of the phase-2 token).
     #[test]
-    fn a_token_costs_a_byte_without_a_lock_and_21_with_one() {
-        let none = postcard::to_allocvec(&LockTag::NONE.to_wire()).unwrap();
+    fn a_token_costs_a_byte_without_a_lock_and_40_with_one() {
+        let none = postcard::to_allocvec(&LockTag::NONE.to_wire(HonourMs(0))).unwrap();
         assert_eq!(none.len(), 1);
         let one = LockTag(vec![LockToken {
             grant: GrantId {
@@ -5963,9 +6335,13 @@ mod token_tests {
                 seq: 3_000_000,
             },
             until_ms: 1_790_000_000_000,
+            until_h: 1_790_000_000_000,
+            clock: u64::MAX - 3,
+            remaining_ms: 20_000,
+            recv: Some(1_789_999_980_000),
         }]);
-        let bytes = postcard::to_allocvec(&one.to_wire()).unwrap();
-        assert_eq!(bytes.len(), 1 + 10 + 4 + 6, "{bytes:?}");
+        let bytes = postcard::to_allocvec(&one.to_wire(HonourMs(1_789_999_980_000))).unwrap();
+        assert_eq!(bytes.len(), 1 + 10 + 4 + 6 + 6 + 10 + 3, "{bytes:?}");
     }
 
     /// A fence's start is the grant's lapse, whichever path notices it
@@ -6367,7 +6743,15 @@ mod token_tests {
         mode: LockMode,
         now: i64,
     ) -> Option<LateAdmitted> {
-        t.admit_late(id, node, mode, WaitMs(now + 120), false, Now::same(now))
+        t.admit_late(
+            id,
+            node,
+            mode,
+            WaitMs(now + 120),
+            false,
+            Now::same(now),
+            (1, now),
+        )
     }
 
     /// The record is still in the table, expired and not dropped: a late
@@ -6382,21 +6766,15 @@ mod token_tests {
         assert!(!a.from_memory);
         let g = t.get(id).unwrap();
         assert_eq!(
-            (g.until, g.confirmed_ms, g.settled),
-            (WaitMs(270), 150, true)
+            (g.until, g.confirmed, g.settled),
+            (WaitMs(270), Some((1, 150)), true)
         );
         assert_eq!(t.stats().late_admitted, 1);
         // A token whose window ended at the lapse is refused now, one past
         // the admission passes.
-        let old = LockTag(vec![LockToken {
-            grant: id,
-            until_ms: 120,
-        }]);
+        let old = LockTag(vec![LockToken::window(id, 120)]);
         assert!(t.check_tag(&old, Now::same(160)).is_err());
-        let fresh = LockTag(vec![LockToken {
-            grant: id,
-            until_ms: 300,
-        }]);
+        let fresh = LockTag(vec![LockToken::window(id, 300)]);
         assert!(t.check_tag(&fresh, Now::same(160)).is_ok());
     }
 
@@ -6415,7 +6793,7 @@ mod token_tests {
         assert_eq!(t.lapsed_len(), 0);
         assert!(!t.was_ended(id));
         let g = t.get(id).unwrap();
-        assert_eq!((g.until, g.confirmed_ms), (WaitMs(280), 160));
+        assert_eq!((g.until, g.confirmed), (WaitMs(280), Some((1, 160))));
         assert!(
             t.conflicting(7, 3, LockMode::Shared, WaitMs(170)).len() == 1,
             "live again"
@@ -6462,7 +6840,7 @@ mod token_tests {
             until: WaitMs(100),
             recalled: false,
             gen: 0,
-            confirmed_ms: 0,
+            confirmed: Some((1, 0)),
             settled: false,
         });
         assert!(admit(&t, reclaimed, 6, LockMode::Exclusive, 150).is_none());
@@ -6517,7 +6895,7 @@ mod token_tests {
             until: WaitMs(300),
             recalled: false,
             gen: 0,
-            confirmed_ms: Grant::UNCONFIRMED,
+            confirmed: Grant::UNCONFIRMED,
             settled: false,
         });
         let old_rec = t.get(old).unwrap();
@@ -6631,7 +7009,7 @@ mod token_tests {
                     until: WaitMs(500),
                     recalled: false,
                     gen: 0,
-                    confirmed_ms: 0,
+                    confirmed: Some((1, 0)),
                     settled: false,
                 });
             }),
@@ -6644,7 +7022,7 @@ mod token_tests {
                     until: WaitMs(500),
                     recalled: false,
                     gen: 0,
-                    confirmed_ms: 0,
+                    confirmed: Some((1, 0)),
                     settled: false,
                 });
             }),
@@ -6658,7 +7036,7 @@ mod token_tests {
                         until: WaitMs(500),
                         recalled: false,
                         gen: 0,
-                        confirmed_ms: 0,
+                        confirmed: Some((1, 0)),
                         settled: false,
                     },
                     WaitMs(160)
@@ -6731,7 +7109,7 @@ mod token_tests {
                 until: WaitMs(900),
                 recalled: false,
                 gen: 0,
-                confirmed_ms: 0,
+                confirmed: Some((1, 0)),
                 settled: true,
             },
         );
@@ -6903,7 +7281,7 @@ mod window_tests {
         let t = LockTables::default();
         let id = mint(&t, 2, 7, X, 100);
         gap_once(&t, &["forget_if_expired"], move |t| {
-            t.extend(id, 2, WaitMs(5_000), at(120)).unwrap();
+            t.extend(id, 2, WaitMs(5_000), (1, 120)).unwrap();
         });
         assert_eq!(
             t.forget_outwaited_if_expired(id, at(150)),
@@ -6918,7 +7296,7 @@ mod window_tests {
         let old = mint(&t, 2, 7, X, 100);
         // The caller computed its end from an older reading of the record;
         // the record has been extended since.
-        t.extend(old, 2, WaitMs(5_000), at(50)).unwrap();
+        t.extend(old, 2, WaitMs(5_000), (1, 50)).unwrap();
         let new = mint(&t, 2, 7, X, 900);
         assert!(t.get(old).is_none());
         assert_eq!(t.get(new).unwrap().until, WaitMs(5_000));
@@ -6933,18 +7311,21 @@ mod window_tests {
     fn extend_live_extends_only_a_live_record_of_the_node() {
         let t = LockTables::default();
         let id = mint(&t, 2, 7, X, 100);
-        assert_eq!(t.extend_live(id, 2, WaitMs(300), at(50)), Some((X, false)));
+        assert_eq!(
+            t.extend_live(id, 2, WaitMs(300), at(50), (1, 0)),
+            Some((X, false))
+        );
         assert_eq!(t.get(id).unwrap().until, WaitMs(300));
         // Never shortens.
-        t.extend_live(id, 2, WaitMs(200), at(50)).unwrap();
+        t.extend_live(id, 2, WaitMs(200), at(50), (1, 0)).unwrap();
         assert_eq!(t.get(id).unwrap().until, WaitMs(300));
         // Another node's id, an expired record: nothing.
-        assert!(t.extend_live(id, 3, WaitMs(900), at(50)).is_none());
-        assert!(t.extend_live(id, 2, WaitMs(900), at(300)).is_none());
+        assert!(t.extend_live(id, 3, WaitMs(900), at(50), (1, 0)).is_none());
+        assert!(t.extend_live(id, 2, WaitMs(900), at(300), (1, 0)).is_none());
         assert_eq!(t.get(id).unwrap().until, WaitMs(300));
         // The table's clock is the one read.
         t.set_clock(Arc::new(|| at(400)));
-        assert!(t.extend_live(id, 2, WaitMs(900), at(50)).is_none());
+        assert!(t.extend_live(id, 2, WaitMs(900), at(50), (1, 0)).is_none());
     }
 
     #[test]
@@ -7074,7 +7455,7 @@ mod window_tests {
     fn an_own_renewal_extends_the_record_and_the_window_together() {
         let t = LockTables::default();
         let id = own(&t, 800, 1_000);
-        assert!(t.renew_own(7, id, 1, |_| 5_000, 4_000, 100, at(600)));
+        assert!(t.renew_own(7, id, 1, |_| 5_000, 4_000, 100, at(600), 1));
         let e = t.get(id).unwrap();
         assert_eq!(e.until, WaitMs(600 + 4_000 + 100));
         let h = t.held(7).unwrap();
@@ -7082,7 +7463,7 @@ mod window_tests {
         assert_eq!(h.renew_at, renew_point(HonourMs(600), 4_000, 100));
         assert_eq!((h.renewing, h.route), (None, Some(1)));
         // The cap bounds the ttl; the window never shortens.
-        assert!(t.renew_own(7, id, 1, |_| 500, 4_000, 100, at(700)));
+        assert!(t.renew_own(7, id, 1, |_| 500, 4_000, 100, at(700), 1));
         assert_eq!(t.held(7).unwrap().until, HonourMs(4_500));
         assert_eq!(t.get(id).unwrap().until, WaitMs(4_700));
     }
@@ -7094,7 +7475,7 @@ mod window_tests {
             let id = build(&t);
             let (rec, held) = (t.get(id), t.held(7));
             assert!(
-                !t.renew_own(7, id, 1, |_| cap, 4_000, 100, at(600)),
+                !t.renew_own(7, id, 1, |_| cap, 4_000, 100, at(600), 1),
                 "{what}"
             );
             assert_eq!((t.get(id), t.held(7)), (rec, held), "{what}: untouched");
@@ -7181,7 +7562,8 @@ mod window_tests {
             |_| 5_000,
             4_000,
             100,
-            at(600)
+            at(600),
+            1
         ));
     }
 
@@ -7192,7 +7574,7 @@ mod window_tests {
         t.set_clock(Arc::new(|| at(1_200)));
         // The caller's reading (600) says live; the table's (1200) says the
         // window is over.
-        assert!(!t.renew_own(7, id, 1, |_| 5_000, 4_000, 100, at(600)));
+        assert!(!t.renew_own(7, id, 1, |_| 5_000, 4_000, 100, at(600), 1));
     }
 
     #[test]
@@ -7224,7 +7606,7 @@ mod window_tests {
             until: WaitMs(50),
             recalled: false,
             gen: 0,
-            confirmed_ms: Grant::MINTED,
+            confirmed: Grant::MINTED,
             settled: true,
         };
         t.install_lapsed(m);
@@ -7331,10 +7713,7 @@ mod window_tests {
         }
         let t = Arc::new(LockTables::default());
         let id = mint(&t, 2, 7, X, 10_000);
-        let tag = LockTag(vec![LockToken {
-            grant: id,
-            until_ms: 5_000,
-        }]);
+        let tag = LockTag(vec![LockToken::window(id, 5_000)]);
         let seen = Arc::new(M::new(Vec::new()));
         let probe = Probe(seen.clone());
         tracing::subscriber::with_default(probe, || {
@@ -7342,10 +7721,7 @@ mod window_tests {
             t.check_tag_at_write(&tag, at(100)).unwrap();
             t.unpin(&tag);
             // A refusal logs too.
-            let dead = LockTag(vec![LockToken {
-                grant: GrantId { node: 1, seq: 999 },
-                until_ms: 50,
-            }]);
+            let dead = LockTag(vec![LockToken::window(GrantId { node: 1, seq: 999 }, 50)]);
             assert!(t.check_tag_at_write(&dead, at(100)).is_err());
         });
         assert!(

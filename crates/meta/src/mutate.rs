@@ -1559,10 +1559,7 @@ mod tests {
             constellation_types::clock::WaitMs(30_000),
             0,
         );
-        let tag = LockTag(vec![LockToken {
-            grant: g,
-            until_ms: 28_000,
-        }]);
+        let tag = LockTag(vec![LockToken::window(g, 28_000)]);
         let before = m.journal_len().unwrap();
         // The grant ends at the minter while the op waits for the writer
         // lock (`At::Before`: right before the op's transaction).
@@ -1605,10 +1602,7 @@ mod tests {
             .set_clock(Arc::new(move || Now::same(c.load(Ordering::SeqCst))));
         m.create(ROOT_INO, "tmp", 0o644, 0, 0).unwrap();
         // Another sequencer's grant: judged by its window here.
-        let tag = LockTag(vec![LockToken {
-            grant: GrantId { node: 9, seq: 1 },
-            until_ms: 5_000,
-        }]);
+        let tag = LockTag(vec![LockToken::window(GrantId { node: 9, seq: 1 }, 5_000)]);
         let c = clock.clone();
         window_hook::set(Some(Box::new(move |_: &Meta, at| {
             if at == window_hook::At::Before {
@@ -1663,10 +1657,7 @@ mod tests {
             constellation_types::clock::WaitMs(30_000),
             0,
         );
-        let tag = LockTag(vec![LockToken {
-            grant: g,
-            until_ms: 28_000,
-        }]);
+        let tag = LockTag(vec![LockToken::window(g, 28_000)]);
         // Live grant, nothing in a transaction: nothing to settle.
         assert!(!m.locks().unsettled_writes());
         assert!(!m.settle_tagged_writes());
@@ -1803,10 +1794,7 @@ mod tests {
         let c = clock.clone();
         m.locks()
             .set_clock(Arc::new(move || Now::same(c.load(Ordering::SeqCst))));
-        let foreign = LockTag(vec![LockToken {
-            grant: GrantId { node: 9, seq: 1 },
-            until_ms: 5_000,
-        }]);
+        let foreign = LockTag(vec![LockToken::window(GrantId { node: 9, seq: 1 }, 5_000)]);
         m.locks()
             .check_tag_at_write(&foreign, Now::same(1_000))
             .unwrap();
@@ -1825,10 +1813,7 @@ mod tests {
             constellation_types::clock::WaitMs(60_000),
             0,
         );
-        let own = LockTag(vec![LockToken {
-            grant: g,
-            until_ms: 50_000,
-        }]);
+        let own = LockTag(vec![LockToken::window(g, 50_000)]);
         m.locks()
             .check_tag_at_write(&own, Now::same(5_000))
             .unwrap();

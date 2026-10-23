@@ -454,10 +454,15 @@ impl constellation_net::PeerService for P2pBridge {
         deps: Vec<u8>,
         pending: Vec<[u8; 32]>,
         applied: u64,
-        lock_tag: Vec<(u64, u64, i64)>,
+        lock_tag: Vec<(u64, u64, i64, i64, u64, i64)>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
+            // The token's receipt, on this node's honour clock, at the
+            // earliest point this node has the op (plan 43 C7b, row 6): the
+            // token is honoured for the time its holder said it had left
+            // from here, however long the op then queues.
+            let recv = constellation_platform::clock::protocol().honour();
             let _ = part;
             let pending = pending
                 .into_iter()
@@ -481,7 +486,7 @@ impl constellation_net::PeerService for P2pBridge {
                     deps,
                     pending,
                     applied,
-                    tag: constellation_meta::locks::LockTag::from_wire(&lock_tag),
+                    tag: constellation_meta::locks::LockTag::from_wire(&lock_tag, Some(recv)),
                     reply,
                 })
                 .is_ok()
@@ -1025,6 +1030,7 @@ impl constellation_net::PeerService for P2pBridge {
         from: u64,
         req_id: u64,
         entries: Vec<constellation_net::LockRenewWire>,
+        sent: (u64, i64),
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
@@ -1034,6 +1040,7 @@ impl constellation_net::PeerService for P2pBridge {
                 .send(sync::SyncRequest::PeerLockRenew {
                     from,
                     entries: crate::locks::renew_entries_of(entries),
+                    sent,
                     reply,
                 })
                 .is_ok();

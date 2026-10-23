@@ -150,11 +150,14 @@ pub struct InboxOp {
     /// appended ahead of it.
     pub deps: Vec<u8>,
     /// Plan 30 §M14 phase 2: the op's fencing token,
-    /// `(minter, seq, until_ms)` per cluster-lock grant it was issued
-    /// under (`constellation_meta::locks::LockTag`), as a P2P forward
-    /// carries it. The holder's drain refuses the op once a named grant
-    /// is no longer live.
-    pub lock_tag: Vec<(u64, u64, i64)>,
+    /// `(minter, seq, until_ms, until_h, clock, remaining_ms)` per
+    /// cluster-lock grant it was issued under
+    /// (`constellation_meta::locks::LockTag`), as a P2P forward carries it.
+    /// The holder's drain judges it exactly (the grant live and confirmed in
+    /// its table) or refuses the op: a batch drained from S3 has no transit
+    /// bound, so the time the holder said it had left proves nothing
+    /// (plan 43 C7b, row 31).
+    pub lock_tag: Vec<(u64, u64, i64, i64, u64, i64)>,
 }
 
 /// One batch object. `epoch`, `node` and `n` are also the key; they are

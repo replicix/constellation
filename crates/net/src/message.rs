@@ -308,11 +308,14 @@ pub enum Payload {
         applied: u64,
         /// Plan 30 §M14 phase 2, the fencing token
         /// (`constellation_meta::locks::LockTag`): the cluster-lock grants
-        /// the op was issued under, as `(minter, seq, until_ms)` — the
-        /// grant's id and the end of the window the requester honoured it
-        /// for. Empty for an op whose issuer holds no lock (one byte). The
-        /// executor refuses the op once a named grant is no longer live.
-        lock_tag: Vec<(u64, u64, i64)>,
+        /// the op was issued under, as `(minter, seq, until_ms, until_h,
+        /// clock, remaining_ms)` — the grant's id, the end of the window the
+        /// requester honoured it for as an absolute wall stamp and on its
+        /// honour clock `clock`, and the time it had left when the op left
+        /// the requester (plan 43 C7b, row 6). Empty for an op whose issuer
+        /// holds no lock (one byte). The executor refuses the op once a
+        /// named grant is no longer live.
+        lock_tag: Vec<(u64, u64, i64, i64, u64, i64)>,
     },
     /// Holder's answer: postcard-encoded `MutateOutcome`.
     MutateReply {
@@ -637,6 +640,11 @@ pub enum Payload {
         from: u64,
         req_id: u64,
         entries: Vec<LockRenewWire>,
+        /// The holder's honour reading when this left it, and the id of
+        /// that clock (opaque here): the owner confirms grants it installed
+        /// as copies from that send on (plan 43 C7b, row 29).
+        sent_ms: i64,
+        clock: u64,
     },
     LockRenewed {
         req_id: u64,

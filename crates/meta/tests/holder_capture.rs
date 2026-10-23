@@ -1434,7 +1434,7 @@ fn a_stranded_commit_not_composed_on_the_cut_keeps_its_base() {
 /// lease's expiry (it passed every check) and committed after a successor
 /// took over is stranded by the successor's segment, rolled back and queued
 /// for replay by rid *with its fencing token*; the replay, at a sequencer
-/// that judges the token by its window and after the window is over, is
+/// that holds no such grant (exact or refused), is
 /// refused (`LockLapsed`): the write never lands over the next holder's,
 /// and the stranded op's acknowledgement becomes a conflict copy.
 #[test]
@@ -1443,10 +1443,7 @@ fn a_tagged_row_stranded_past_its_lease_replays_with_its_token_and_is_refused() 
     use constellation_meta::{execute_tagged, MetaError};
     let meta = Meta::open_in_memory().unwrap();
     meta.set_holder_epoch(1);
-    let tag = LockTag(vec![LockToken {
-        grant: GrantId { node: 9, seq: 1 },
-        until_ms: 5_000,
-    }]);
+    let tag = LockTag(vec![LockToken::window(GrantId { node: 9, seq: 1 }, 5_000)]);
     let op = MutateOp::Create {
         parent: ROOT_INO,
         name: "ref".into(),
@@ -1477,7 +1474,18 @@ fn a_tagged_row_stranded_past_its_lease_replays_with_its_token_and_is_refused() 
     let queued = meta.pending_replays().unwrap();
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0].rid, rid(1));
-    assert_eq!(queued[0].lock_tag, tag, "the replay carries its token");
+    // (Without its receipt: a replayed token has no transit bound and is
+    // judged exactly or refused, plan 43 C7b, row 31.)
+    let without_receipt = LockTag(
+        tag.0
+            .iter()
+            .map(|t| LockToken { recv: None, ..*t })
+            .collect(),
+    );
+    assert_eq!(
+        queued[0].lock_tag, without_receipt,
+        "the replay carries its token"
+    );
     // Replayed by rid at a sequencer that never held the grant, after the
     // window: refused, nothing written.
     let next = Meta::open_in_memory().unwrap();

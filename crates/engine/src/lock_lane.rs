@@ -174,11 +174,8 @@ fn run(
                     let results = if crate::fault::p2p_denied(to) {
                         None
                     } else {
-                        let payload = Payload::LockRenew {
-                            from: node_id,
-                            req_id: req,
-                            entries: crate::locks::renew_entries_wire(&entries),
-                        };
+                        // Stamped here, as it leaves (`lane_renew_payload`).
+                        let payload = lane_renew_payload(node_id, req, &entries);
                         match tokio::time::timeout(
                             timeout,
                             peers.request_to_node_timeout(to, &payload, timeout),
@@ -209,6 +206,30 @@ fn run(
             }
             other => report(vec![other], off_core),
         }
+    }
+}
+
+/// The lane's `LockRenew` as it leaves now: `sent_ms` is this node's honour
+/// reading at the send and `clock` its protocol clock's id, as the core
+/// driver stamps its own renewals at their send (plan 43 C7b, row 29). An
+/// owner confirms a grant it installed as a copy from that send on
+/// (`Grant::confirmed`), so the stamp must be no earlier than the send:
+/// never the reading of the tick that planned it, which is older by the
+/// lane's queue and the spawn. (The lane's own window for the answer counts
+/// from the tick's reading, the earlier one, which is the safe direction
+/// there.)
+fn lane_renew_payload(
+    from: NodeId,
+    req: u64,
+    entries: &[constellation_authority::LockRenewEntry],
+) -> Payload {
+    let pc = constellation_platform::clock::protocol();
+    Payload::LockRenew {
+        from,
+        req_id: req,
+        entries: crate::locks::renew_entries_wire(entries),
+        sent_ms: pc.honour().0,
+        clock: pc.id(),
     }
 }
 
@@ -246,6 +267,35 @@ fn send_reports(tx: &mpsc::UnboundedSender<SyncRequest>, actions: Vec<LaneAction
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plan 43 C7b (row 29) with plan 41's lane: a lane renewal carries the
+    /// holder's honour reading at its send and the clock's id, read when the
+    /// payload is built for the send, not before (an owner confirms an
+    /// installed copy from it; a stamp older than the send would confirm
+    /// tokens whose window ended before the renewal left).
+    #[test]
+    fn the_lanes_renewal_is_stamped_as_it_is_sent() {
+        let pc = constellation_platform::clock::protocol();
+        let planned = pc.honour();
+        std::thread::sleep(Duration::from_millis(30));
+        let Payload::LockRenew {
+            from,
+            req_id,
+            sent_ms,
+            clock,
+            ..
+        } = lane_renew_payload(3, 9, &[])
+        else {
+            panic!("not a LockRenew");
+        };
+        assert_eq!((from, req_id), (3, 9));
+        assert!(
+            sent_ms >= planned.0 + 30,
+            "stamped at the send: {sent_ms} vs {planned:?}"
+        );
+        assert_eq!(clock, pc.id());
+        assert_ne!(clock, 0, "a clock id of 0 would confirm for every clock");
+    }
 
     /// The lane logs nothing (a dropped line is lost evidence, and the
     /// lane's liveness must not depend on the log's queue).
@@ -305,6 +355,7 @@ mod tests {
             window_ms: 1_500,
             marked: true,
             owner: 0,
+            clock: constellation_platform::clock::protocol().id(),
             lock_ttl_ms: 4_000,
             margin_ms: 500,
             forward_timeout_ms: 400,
@@ -381,6 +432,7 @@ mod tests {
             window_ms: 1_500,
             marked: true,
             owner: 0,
+            clock: constellation_platform::clock::protocol().id(),
             lock_ttl_ms: 4_000,
             margin_ms: 500,
             forward_timeout_ms: 400,

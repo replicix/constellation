@@ -803,13 +803,20 @@ written under it. So the check also happens where the write is recorded
   process of the thread that took a lock, its threads and the processes
   it started, or the kernel's lock owner — carries a **token**: per
   minting sequencer, the grant whose window ends first among those the
-  owner's locks are under, as `(grant id, until)`. `until` is when this
-  node stops honouring the grant (`sent + ttl − margin` of its latest
-  request or renewal). The window lives on the node's honour clock; the
-  token carries it as a wall-clock time, minted when the mutation is built
-  (the wall clock now plus what is left of the honour window), because the
-  executor judges it on its own wall clock (so that comparison is still
-  bound by the clock offset, plan 43 C7b). Operations of processes that hold
+  owner's locks are under. The window is when this node stops honouring
+  the grant (`sent + ttl − margin` of its latest request or renewal), and
+  lives on the node's honour clock. The token carries it three ways, all
+  taken when the mutation is sent (plan 43 C7b, phase 1): the end on the
+  honour clock and the id of that clock (`until_h`, `clock`: the holder's
+  own readings, which only it and the grant's minter, comparing a renewal's
+  send, ever read); the time the window has **left** (`remaining`, a
+  duration); and an absolute wall-clock stamp (`until`, the wall clock now
+  plus what is left), which an executor compares with its own wall clock.
+  An executor stamps its **receipt** of the operation on its own honour
+  clock, at the earliest point it has it (the P2P handler, not the core's
+  queue), and refuses the token once that clock reaches the receipt plus
+  `remaining`; a node that forwards an operation takes the time it kept it
+  off the remainder. Operations of processes that hold
   no lock carry nothing and are not checked. Which grants an operation
   is under is worked out at its first mutation (a close works it out
   before it drops the closer's locks); each mutation's `until` is taken
@@ -861,20 +868,37 @@ written under it. So the check also happens where the write is recorded
     Until its holder renews it here, the window judges every token
     naming it; from that renewal on, only tokens whose `until` runs past
     the renewal pass whatever the window, so an operation sent before
-    the copy was confirmed is still judged by its window.
+    the copy was confirmed is still judged by its window. Both sides of that
+    comparison are the holder's own: the token's `until_h` and the send time
+    of the renewal that confirmed the grant, readings of one clock of the
+    holder (the renewal names the clock; a restarted holder's renewal
+    replaces the confirmation).
   - A sequencer that ended the grant (released it, or outwaited it: its
     record expired) refuses the token at once, inside its window. It
     remembers the ended id for `ttl + 2 × margin` past the end of its
     record (at most 4096 ids).
-  - Any other sequencer refuses the token once its own clock reaches
-    `until`. The minter records the grant live until `granted + ttl +
-    margin` and grants nothing conflicting before that, which is at
-    least `2 × margin` after `until`. So while clocks stay within that
-    of each other (the lease machinery assumes half a margin), no
-    conflicting grant exists while a token is still accepted anywhere.
-    That holds whether or not the executor minted the grant: git's turn
-    file is the root's while its objects may live in a delegated
-    subtree.
+  - Any other sequencer refuses the token once its own wall clock
+    reaches the absolute stamp, or its honour clock reaches the receipt
+    plus `remaining`. The minter records the grant live until `granted +
+    ttl + margin` and grants nothing conflicting before that, which is at
+    least `2 × margin` after the end of the holder's window. The second
+    bound is an operation the executor receives within that of the end of
+    the window (the operation's one-way delay below `2 × margin`) and a
+    rate bound on the executor's clock: no offset between the nodes enters
+    it. The first is the older bound: the executor's wall clock within
+    that of the holder's. Safety needs **either**: the offset or the
+    delay of the operation below `2 × margin`. That holds whether or not
+    the executor minted the grant: git's turn file is the root's while its
+    objects may live in a delegated subtree.
+  - A token that arrives with no receipt (an inbox batch drained from S3
+    or an operation replayed from the persisted queue, which wait for
+    arbitrary times, so the time left proves nothing) is judged exactly
+    or refused: it passes only where the grant is live in the table, and
+    confirmed as above. A non-minting executor draining such a batch
+    refuses an operation whose grant it does not hold, even inside the
+    window (`LockLapsed`, as above); the sims count how often (the
+    `tokens_judged_*` counters by path: about never outside fault
+    configurations).
 - **Refusal.** Nothing is executed or journaled (only an inbox refusal
   is journaled, as every inbox outcome is), and a retry of the rid is
   refused the same way. A refusal by the check at the write is the same

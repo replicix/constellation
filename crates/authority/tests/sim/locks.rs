@@ -1276,7 +1276,11 @@ pub async fn client_lock(
                 // Plan 30 §M14 phase 2: the write carries the fencing
                 // token of the client's locks, as a FUSE thread's does,
                 // and counts in flight for their release.
-                let tag = match h.meta.locks().owner_tag(&[thread], h.clock.now()) {
+                let tag = match h
+                    .meta
+                    .locks()
+                    .owner_tag(&[thread], h.clock.now(), h.clock.id())
+                {
                     Ok(tag) => tag,
                     Err(_) => {
                         // Lapsed since the fence check above: fenced.

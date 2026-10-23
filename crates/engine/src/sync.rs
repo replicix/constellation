@@ -577,6 +577,8 @@ pub enum SyncRequest {
     PeerLockRenew {
         from: u64,
         entries: Vec<constellation_authority::LockRenewEntry>,
+        /// `(clock id, honour reading)` of the holder when it sent.
+        sent: (u64, i64),
         reply: tokio::sync::oneshot::Sender<
             Vec<(
                 Ino,

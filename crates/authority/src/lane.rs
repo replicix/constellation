@@ -109,6 +109,10 @@ pub struct LockLaneView {
     /// Where the renewals of held grants go when no route is known: the
     /// holder as last learned (`lease.cached_holder`, 0: unknown).
     pub owner: NodeId,
+    /// This node's protocol clock id: an own renewal confirms a grant
+    /// installed as a copy from its send on this clock (plan 43 C7b, row 29;
+    /// `LockTables::renew_own`). 0 (no certificate): confirms nothing.
+    pub clock: u64,
     /// `lock_ttl_ms`, `expiry_margin_ms`, `forward_timeout_ms`.
     pub lock_ttl_ms: i64,
     pub margin_ms: i64,
@@ -358,6 +362,7 @@ impl RenewLane {
                     view.lock_ttl_ms,
                     view.margin_ms,
                     now,
+                    view.clock,
                 ) {
                     own += 1;
                     continue;
@@ -518,6 +523,7 @@ mod tests {
             window_ms: 1_500,
             marked: true,
             owner: 0,
+            clock: 7,
             lock_ttl_ms: 4_000,
             margin_ms: 500,
             forward_timeout_ms: 400,

@@ -58694,3 +58694,79 @@ clock) the tests fail, each its own; the parent cannot run them (new fields).
 Gates: fmt; `clippy --workspace --all-targets -D warnings`; the workspace tests
 (authority lib 599, store-s3 235, meta 323, `meta_repro` 4, sim suite 245 + 12
 ignored); the model crate (see the commit message).
+
+## Plan 43 C7b, spec commit 6: fencing tokens on the honour clock (rows 6, 29, 31; 2026-10-23)
+
+### The rule (phase 1, Q10b; D4 (a), D12)
+
+The token a lock holder H stamps on an op (`LockToken`) now carries, beside its
+absolute wall stamp `until_ms` (kept: the executor refuses when its wall clock is at
+it), the end of the window on H's honour clock `until_h`, the id of that clock
+`clock`, and the time the window had **left** when the op left H, `remaining_ms`
+(`LockToken::minted`; the wire form is `(minter, seq, until_ms, until_h, clock,
+remaining_ms)`). An executor E that does not hold the grant stamps its **receipt** on
+its own honour clock at the earliest point it has the op (the P2P handler, not the
+core's queue; a token minted here is received at the mint, so E = H judges on its own
+clock) and refuses the token once `now.honour >= recv + remaining_ms` (or its wall is
+at `until_ms`). `recv` rides in the token (never serialized: a persisted or inbox
+token has none) through every executor queue to `check_tag` and `check_tag_at_write`
+and the pins. A node that forwards an op takes the time it kept it off the remainder
+(`to_wire`). Honour, not wait: E honours the token, so it must not over-accept;
+safety needs *either* the offset (the absolute stamp) *or* the op's one-way delay
+below `2M` (the minter outwaits H's grant by `recv_M + ttl + M`, at least `2M` after
+H's window ended in true time). Documented in `cluster-locks.md`.
+
+Row 31: a token with no receipt (an S3 inbox batch, the persisted replay queue: no
+transit bound) passes only exactly (the grant live and confirmed in E's table) or is
+refused (`LockLapsed`). Counters before the change (`SWEEP-TOKENS`, the 113
+`locks-*`/`fast-takeover*`/`backup*` configurations, 1 000 seeds): tokens judged by
+the window on the inbox path 725 (and 69 exactly), on the replay path 14 (0 exactly),
+all but single digits in the configurations with partitions, delegate crashes or
+failovers (`locks-delegated-partition` 184, `-skew` 206, `locks-failover-backup-writes`
+84, `locks-unlinked-delegated-partition` 131); `locks-delegated-writes` 0,
+`locks-released-writes` 0, `locks-stall-step*` 0: about nothing outside fault
+configurations, so D4 (a) stands and (b) is not needed.
+
+Row 29: a grant installed as a copy (a mirror, a reinstated handoff copy) is
+`Grant::confirmed = None` until its holder's next renewal, which now carries the
+holder's clock id and its honour reading when it **sent** (`PeerMsg::LockRenew
+{ sent, clock }`; the driver re-stamps it as it leaves): `confirmed = Some((clock,
+sent))`, and a token passes exactly iff `t.clock == clock && t.until_h > sent`: both
+readings the holder's, no arrival time on the sequencer's wall. A later renewal of
+that clock never moves it on, another clock id (a restarted holder) replaces it,
+`MINTED` is clock 0 (any), `admit_late` sets it to the late renewal's send.
+
+The holder's own waits map `until_h` to its wait clock (`Inner::pin`:
+`Now::wait_of_honour`, both readings of one node); the replay pins of a previous
+incarnation's tokens (another clock id) fall back to the wall stamp mapped on this
+node, as before (row 14).
+
+### Evidence
+
+(Base = commit 5's tree; release sims on the box.) The 113 configurations at 1 000
+seeds: failing sets identical but `locks-stall-step-delegated-ahead` [33] -> [] (a
+fixed seed); seals of a live holder 2 479 -> 2 479; seven `long-*` configurations
+(200 to 300 seeds) identical. Tokens judged, summed over the 113 (exact p2p/local/
+inbox/replay, then by the window): 239 731/121 984/69/0 then 294 182/11 740/725/14
+before; 239 781/121 994/70/0 then 294 162/11 742/724/14 after: the same events, the
+inbox and replay ones are now refused unless exact. The spec's `locks-executor-behind`
+(row 6: node 3 at -5 s, every tagged op to it delayed 1.5-2.5 s) could not be made to fail on
+the parent (the absolute check refuses what the delay would let through at offset 0,
+and the -5 s executor is the one that needs a late op past the root's outwait; the
+sweeps stay clean before and after), so the unit tests are the fail-before. See the
+extra sweeps in the commit message.
+
+### Tests and fail-before
+
+meta: `a_token_dies_at_receipt_plus_remaining_on_the_honour_clock`,
+`the_absolute_stamp_still_refuses`, `confirmation_is_on_the_holders_clock`,
+`another_clock_is_unconfirmed`, `an_inbox_token_is_exact_or_refused`,
+`the_wire_form_takes_off_the_time_spent_here`, the token cost on the wire (40 bytes
+with a lock, was 21), the owner/refresh/pin tests on the new fields; authority core:
+the renewal confirms from the holder's send. Against mutants (the honour bound
+removed; a receipt-less token judged by the wall; confirmation without the clock id; the
+wire form without the time spent) the five meta tests fail, each its own.
+
+Gates: `cargo fmt --check`; `clippy --workspace --all-targets -D warnings`; workspace
+tests (authority lib 599, `meta_repro` 4, sim suite 245 + 12 ignored); model crate
+unchanged by this commit.

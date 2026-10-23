@@ -866,7 +866,11 @@ impl ClusterLocks {
             })
             .map(|l| l.0)
             .collect();
-        locks.owner_tag(&owners, now())
+        locks.owner_tag(
+            &owners,
+            now(),
+            constellation_platform::clock::protocol().id(),
+        )
     }
 
     /// Whether `ino`'s dirty data must be discarded rather than
@@ -2235,7 +2239,7 @@ pub fn reissue_after_lapse() -> Reissue {
         }
         let now = now();
         let fresh = locks.refresh_tag(&st.sent, now);
-        if fresh != st.sent && locks.tag_honoured(&fresh, now) {
+        if fresh.windows() != st.sent.windows() && locks.tag_honoured(&fresh, now) {
             Reissue::Yes
         } else {
             Reissue::No
@@ -2285,10 +2289,12 @@ pub fn note_tag_in_doubt(rid: Option<constellation_meta::Rid>) {
                     // Minted as a token is: the honour window on the wall
                     // clock, now (plan 43 C7-H1, R8).
                     table.pin_in_doubt(
-                        &LockTag(vec![constellation_meta::locks::LockToken {
-                            grant: h.id,
-                            until_ms: now().wall_of_honour(h.until).0,
-                        }]),
+                        &LockTag(vec![constellation_meta::locks::LockToken::minted(
+                            h.id,
+                            h.until,
+                            now(),
+                            constellation_platform::clock::protocol().id(),
+                        )]),
                         rid,
                     );
                 }
@@ -2758,7 +2764,7 @@ mod tests {
             until_ms: 99,
             recalled: false,
             gen: 0,
-            confirmed_ms: constellation_meta::locks::Grant::UNCONFIRMED,
+            confirmed: constellation_meta::locks::Grant::UNCONFIRMED,
             settled: true,
             lapsed: true,
         }];

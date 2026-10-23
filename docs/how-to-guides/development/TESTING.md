@@ -4792,7 +4792,7 @@ The numbers are with the I6 flag off, 300 seeds unless said:
 | `locks-skew-60s`, `strict-skew-60s` | 0, 0 (3, 0); I6 (strict): 6 and 114 | row 2 |
 | `locks-stall-step-delegated-ahead`, `locks-delegate-ahead` (node 3 at +3 s) | 2 (2); 3 (2) | row 2; rows 9/30 (an outwait of node 3's grants, then a stale read) |
 | `locks-delegated-partition-skew` (`clock_skew_ms 5 000`) | 4 of 300 (6); I6: 93 live claims | rows 2, 9/30 |
-| `locks-executor-behind` / `-late` (row 6: node 3 at -5 s / no offset, every tagged op sent to node 3 delayed 1.5-2.5 s (`SimConfig::request_delay_to`), the client giving up after 700 ms) | 0 / 0 of 300 (also with 2.5-3.5 s and 3-5 s) on `5f3b51c`: kept clean; tokens judged by the window alone: 560 p2p, 20 local, 2 inbox, 0 replay | the non-minting executor judges a token on its own wall (commit 6) |
+| `locks-executor-behind` / `-late` (row 6: node 3 at -5 s / no offset, every tagged op sent to node 3 delayed 1.5-2.5 s (`SimConfig::request_delay_to`), the client giving up after 700 ms) | 0 / 0 of 300 (also with 2.5-3.5 s and 3-5 s) on `5f3b51c`: kept clean; tokens judged by the window alone: 560 p2p, 20 local, 2 inbox, 0 replay | the non-minting executor judged a token on its own wall; spec commit 6 judges it from its receipt on its honour clock (the sweeps stay clean: the unit tests are the fail-before) |
 | `flex-taker-ahead` (row 3: node 3 +20 s) | 0 | the model is the primary evidence |
 | `locks-locker-suspend-coarse` (`suspend_accounting_short_ms 900`, margins 200 ms, a 1.5 s suspend) | 0 of 600 in five variants (suspends 1.3-2 s, margins 100-500 ms; `AUTHORITY_SIM_SUSPEND_MS`, `_MARGIN_MS`, `_SUSPEND_SHORT`): not failing yet | commit 7's: the boot clock counts each suspend short, as the x86 RTC path |
 

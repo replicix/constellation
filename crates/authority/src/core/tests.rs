@@ -12701,6 +12701,8 @@ mod locks {
                         mode: X,
                         late: false,
                     }],
+                    sent: HonourMs(h.now.0),
+                    clock: 1,
                 },
             });
             let [(2, PeerMsg::LockRenewed { results, .. })] = sends(&out).as_slice() else {
@@ -12742,7 +12744,7 @@ mod locks {
             until: WaitMs(h.now.0 + 5_000),
             recalled: false,
             gen: 7,
-            confirmed_ms: constellation_meta::locks::Grant::MINTED,
+            confirmed: constellation_meta::locks::Grant::MINTED,
             settled: false,
         };
         // The delegate's batch with the unlink row (index 1), carrying
@@ -13074,6 +13076,8 @@ mod locks {
                     mode: X,
                     late: false,
                 }],
+                sent: HonourMs(h.now.0),
+                clock: 1,
             },
         });
         assert!(
@@ -13220,7 +13224,7 @@ mod locks {
                 until: WaitMs(until_ms),
                 recalled: false,
                 gen: 0,
-                confirmed_ms: constellation_meta::locks::Grant::UNCONFIRMED,
+                confirmed: constellation_meta::locks::Grant::UNCONFIRMED,
                 settled: false,
             };
         let live = grant(1, 4, f, h.now.0 + 5_000);
@@ -13317,7 +13321,7 @@ mod locks {
             until_ms: h.now.0 - 1_000,
             recalled: false,
             gen: 7,
-            confirmed_ms: constellation_meta::locks::Grant::UNCONFIRMED,
+            confirmed: constellation_meta::locks::Grant::UNCONFIRMED,
             settled: false,
             lapsed: false,
         };
@@ -13394,7 +13398,7 @@ mod locks {
             until_ms: h.now.0 + 1_000,
             recalled: false,
             gen: 7,
-            confirmed_ms: constellation_meta::locks::Grant::UNCONFIRMED,
+            confirmed: constellation_meta::locks::Grant::UNCONFIRMED,
             settled: false,
             lapsed: false,
         };
@@ -14630,7 +14634,7 @@ mod locks {
         };
         let renew_of = |out: &[Action], seq: u64| {
             sends(out).iter().find_map(|(to, m)| match m {
-                PeerMsg::LockRenew { req, entries }
+                PeerMsg::LockRenew { req, entries, .. }
                     if *to == 1 && entries.iter().any(|e| e.grant == GrantId { node: 1, seq }) =>
                 {
                     Some(*req)
@@ -15077,6 +15081,8 @@ mod locks {
                         mode: X,
                         late: false,
                     }],
+                    sent: HonourMs(h.now.0),
+                    clock: 1,
                 },
             });
             let [(2, PeerMsg::LockRenewed { results, .. })] = sends(&out).as_slice() else {
@@ -15217,6 +15223,8 @@ mod locks {
                     mode: X,
                     late: false,
                 }],
+                sent: HonourMs(h.now.0),
+                clock: 1,
             },
         })
     }
@@ -17160,6 +17168,8 @@ mod locks {
                     mode: S,
                     late: false,
                 }],
+                sent: HonourMs(h.now.0),
+                clock: 1,
             },
         });
         assert!(
@@ -18297,6 +18307,8 @@ mod locks {
                     mode: X,
                     late: false,
                 }],
+                sent: HonourMs(h.now.0),
+                clock: 1,
             },
         });
         let [(
@@ -18338,6 +18350,8 @@ mod locks {
                     mode: S,
                     late: false,
                 }],
+                sent: HonourMs(h.now.0),
+                clock: 1,
             },
         });
         let [(4, PeerMsg::LockRenewed { results, .. })] = sends(&out).as_slice() else {
@@ -18364,6 +18378,8 @@ mod locks {
                     mode: X,
                     late: false,
                 }],
+                sent: HonourMs(h.now.0),
+                clock: 1,
             },
         });
         let [(4, PeerMsg::LockRenewed { results, .. })] = sends(&out).as_slice() else {
@@ -18508,6 +18524,8 @@ mod locks {
                     mode: X,
                     late: false,
                 }],
+                sent: HonourMs(h.now.0),
+                clock: 1,
             },
         });
         let [(2, PeerMsg::LockRenewed { results, .. })] = sends(&out).as_slice() else {
@@ -18533,6 +18551,8 @@ mod locks {
                     mode: S,
                     late: false,
                 }],
+                sent: HonourMs(h.now.0),
+                clock: 1,
             },
         });
         let [(3, PeerMsg::LockRenewed { results, .. })] = sends(&out).as_slice() else {
@@ -19329,6 +19349,8 @@ mod locks {
                             mode: X,
                             late: false,
                         }],
+                        sent: HonourMs(h.now.0),
+                        clock: 1,
                     },
                 });
                 let [(2, PeerMsg::LockRenewed { results, .. })] = sends(&out).as_slice() else {
@@ -19636,7 +19658,7 @@ mod locks {
         r.now = Ms(sent.plus(2_600).0);
         let renew_sent = r.now;
         let out = r.step(Event::Timer { id: tick });
-        let [(1, PeerMsg::LockRenew { req, entries })] = sends(&out).as_slice() else {
+        let [(1, PeerMsg::LockRenew { req, entries, .. })] = sends(&out).as_slice() else {
             panic!("expected a renewal: {out:?}")
         };
         assert_eq!(entries.len(), 1);
@@ -20589,7 +20611,7 @@ mod locks {
             until: WaitMs(until),
             recalled: false,
             gen: 0,
-            confirmed_ms: constellation_meta::locks::Grant::UNCONFIRMED,
+            confirmed: constellation_meta::locks::Grant::UNCONFIRMED,
             settled: false,
         });
         assert!(h.core.lock_duty_live(h.clk(), &h.meta));
@@ -21243,7 +21265,7 @@ mod locks {
             until: WaitMs(until),
             recalled: false,
             gen: 0,
-            confirmed_ms: constellation_meta::locks::Grant::UNCONFIRMED,
+            confirmed: constellation_meta::locks::Grant::UNCONFIRMED,
             settled: false,
         });
     }
@@ -22451,6 +22473,8 @@ mod locks {
                     mode: X,
                     late: false,
                 }],
+                sent: HonourMs(h.now.0),
+                clock: 1,
             },
         });
         let renewed = sends(&out)
@@ -22499,6 +22523,8 @@ mod locks {
                         mode: X,
                         late: false,
                     }],
+                    sent: HonourMs(h.now.0),
+                    clock: 1,
                 },
             });
             sends(&out)
@@ -23370,7 +23396,7 @@ mod locks {
     use constellation_meta::locks::{LockTag, LockToken};
 
     fn token(grant: GrantId, until_ms: i64) -> LockTag {
-        LockTag(vec![LockToken { grant, until_ms }])
+        LockTag(vec![LockToken::window(grant, until_ms)])
     }
 
     fn setattr_mtime(ino: Ino, mtime_ns: i64) -> MutateOp {
@@ -23635,6 +23661,8 @@ mod locks {
                     mode: X,
                     late: false,
                 }],
+                sent: HonourMs(h.now.0),
+                clock: 1,
             },
         });
         assert!(!sends(&out).is_empty());
@@ -23785,7 +23813,12 @@ mod locks {
                 },
             )] => {
                 assert_eq!(*rr, rid);
-                assert_eq!(*tag, dead, "the replay carries its token");
+                // (Its windows, without the receipt: a persisted token has none.)
+                assert_eq!(
+                    tag.windows(),
+                    dead.windows(),
+                    "the replay carries its token"
+                );
                 *req
             }
             other => panic!("expected the replay's forward: {other:?}"),
@@ -24426,6 +24459,8 @@ mod locks {
                     mode: X,
                     late: false,
                 }],
+                sent: HonourMs(h.now.0),
+                clock: 1,
             },
         });
         let ttl = sends(&out)
@@ -24606,7 +24641,7 @@ mod locks {
                     until_ms: window2 + 2_000,
                     recalled: false,
                     gen: 0,
-                    confirmed_ms: constellation_meta::locks::Grant::MINTED,
+                    confirmed: constellation_meta::locks::Grant::MINTED,
                     settled: false,
                     lapsed: false,
                 }],
@@ -24625,7 +24660,7 @@ mod locks {
         );
         let before = mtime(&h, ino);
         let mut batch = super::inbox_batch(2, 0, 1, &setattr_mtime(ino, 2));
-        batch.ops[0].lock_tag = token(g2, window2).to_wire();
+        batch.ops[0].lock_tag = token(g2, window2).to_wire(HonourMs(0));
         let mut out = Vec::new();
         h.core
             .inbox_drain(h.clk(), vec![batch], &h.meta, &mut out)
@@ -24644,10 +24679,12 @@ mod locks {
                     mode: X,
                     late: false,
                 }],
+                sent: HonourMs(h.now.0),
+                clock: 1,
             },
         });
-        let confirmed = h.meta.locks().get(g2).unwrap().confirmed_ms;
-        assert_eq!(confirmed, h.now.0);
+        let confirmed = h.meta.locks().get(g2).unwrap().confirmed;
+        assert_eq!(confirmed, Some((1, h.now.0)));
         let out = forward_tagged(
             &mut h,
             2,
@@ -24703,7 +24740,7 @@ mod locks {
                     until: WaitMs(h.now.0 + 6_000),
                     recalled: false,
                     gen: 0,
-                    confirmed_ms: h.now.0,
+                    confirmed: Some((1, h.now.0)),
                     settled: false,
                 })
             };
@@ -24719,6 +24756,8 @@ mod locks {
                             mode: X,
                             late: false,
                         }],
+                        sent: HonourMs(h.now.0),
+                        clock: 1,
                     },
                 });
                 sends(&out)
@@ -24964,6 +25003,8 @@ mod locks {
                     mode: X,
                     late: false,
                 }],
+                sent: HonourMs(h.now.0),
+                clock: 1,
             },
         })
     }
@@ -25782,6 +25823,8 @@ mod locks {
                     mode: X,
                     late: false,
                 }],
+                sent: HonourMs(d.now.0),
+                clock: 1,
             },
         });
         let [(4, PeerMsg::LockRenewed { results, .. })] = sends(&out).as_slice() else {
@@ -25824,7 +25867,7 @@ mod locks {
                 until_ms,
                 recalled: false,
                 gen: 7,
-                confirmed_ms: constellation_meta::locks::Grant::UNCONFIRMED,
+                confirmed: constellation_meta::locks::Grant::UNCONFIRMED,
                 settled: false,
                 lapsed: false,
             }],
@@ -25849,7 +25892,7 @@ mod locks {
             until: WaitMs(later),
             recalled: false,
             gen: 0,
-            confirmed_ms: constellation_meta::locks::Grant::UNCONFIRMED,
+            confirmed: constellation_meta::locks::Grant::UNCONFIRMED,
             settled: false,
         });
         let g = GrantId { node: 3, seq: 9 };
@@ -25971,6 +26014,8 @@ mod locks {
                     mode: X,
                     late: false,
                 }],
+                sent: HonourMs(d.now.0),
+                clock: 1,
             },
         });
         assert!(
@@ -26108,13 +26153,13 @@ mod locks {
         );
         let held = r.meta.locks().held(42).expect("held");
         r.advance(1_000);
-        let before = r.meta.locks().owner_tag(&[9], r.clk()).unwrap();
+        let before = r.meta.locks().owner_tag(&[9], r.clk(), 1).unwrap();
         assert_eq!(
             before.0[0].until_ms, held.until.0,
             "no step: the same instant"
         );
         r.step_wall(-3_000);
-        let after = r.meta.locks().owner_tag(&[9], r.clk()).unwrap();
+        let after = r.meta.locks().owner_tag(&[9], r.clk(), 1).unwrap();
         assert_eq!(after.0[0].until_ms, held.until.0 - 3_000);
         // A refreshed token keeps the later of the two windows it names.
         let fresh = r.meta.locks().refresh_tag(&after, r.clk());
@@ -26393,6 +26438,8 @@ mod locks {
                     mode: X,
                     late,
                 }],
+                sent: HonourMs(h.now.0),
+                clock: 1,
             },
         });
         renew_result(&out)
@@ -26528,7 +26575,7 @@ mod locks {
             until_ms: 0,
             recalled: false,
             gen: 0,
-            confirmed_ms: constellation_meta::locks::Grant::MINTED,
+            confirmed: constellation_meta::locks::Grant::MINTED,
             settled: true,
             lapsed,
         };
@@ -26609,7 +26656,7 @@ mod locks {
                 until_ms: 0,
                 recalled: false,
                 gen: 0,
-                confirmed_ms: constellation_meta::locks::Grant::MINTED,
+                confirmed: constellation_meta::locks::Grant::MINTED,
                 settled: true,
                 lapsed: final_for.is_some(),
             };
@@ -26748,7 +26795,7 @@ mod locks {
         let late: Vec<_> = sends(&out)
             .into_iter()
             .filter_map(|(to, m)| match m {
-                PeerMsg::LockRenew { req, entries } if to == 1 => Some((*req, entries.clone())),
+                PeerMsg::LockRenew { req, entries, .. } if to == 1 => Some((*req, entries.clone())),
                 _ => None,
             })
             .collect();
@@ -26901,7 +26948,7 @@ mod locks {
         let far = WaitMs(h.clk().wait.0 + 60_000);
         let now = h.clk();
         gap_once(&h, &["get", "forget_if_expired"], move |t| {
-            t.extend(g2, 2, far, now).expect("extended");
+            t.extend(g2, 2, far, (2, now.honour.0)).expect("extended");
         });
         let out = h.step(Event::Timer { id: expiry });
         h.meta.locks().set_gap_hook_for_tests(None);
@@ -27024,7 +27071,7 @@ mod locks {
                 s.spawn(move || {
                     let _ = meta.locks().get(id);
                     let _ = meta.locks().held_count();
-                    let _ = meta.locks().extend(id, 2, until, clk);
+                    let _ = meta.locks().extend(id, 2, until, (2, clk.honour.0));
                     let _ = meta.locks().fenced_owners(clk);
                     let _ = done_tx.send(());
                 });
@@ -31002,7 +31049,7 @@ fn a_root_change_mid_stream_drops_the_old_rounds_answers() {
                 until_ms: h.now.0 + 5_000,
                 recalled: false,
                 gen: 0,
-                confirmed_ms: constellation_meta::locks::Grant::MINTED,
+                confirmed: constellation_meta::locks::Grant::MINTED,
                 settled: false,
                 lapsed: false,
             }],

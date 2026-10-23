@@ -894,6 +894,12 @@ pub enum PeerMsg {
     LockRenew {
         req: OpId,
         entries: Vec<LockRenewEntry>,
+        /// The holder's honour reading when it sent this, and the id of that
+        /// clock: what a sequencer that installed these grants as copies
+        /// confirms them from (`Grant::confirmed`; plan 43 C7b, row 29).
+        /// Readings of the holder's own clock, opaque to the owner.
+        sent: HonourMs,
+        clock: u64,
     },
     LockRenewed {
         req: OpId,

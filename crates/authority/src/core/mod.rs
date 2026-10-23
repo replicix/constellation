@@ -2408,9 +2408,12 @@ impl Core {
                 grant,
                 position,
             } => self.on_lock_released(now, from, ino, grant, position, replica, out),
-            PeerMsg::LockRenew { req, entries } => {
-                self.on_lock_renew(now, from, req, entries, replica, out)
-            }
+            PeerMsg::LockRenew {
+                req,
+                entries,
+                sent,
+                clock,
+            } => self.on_lock_renew(now, from, req, entries, (clock, sent.0), replica, out),
             PeerMsg::LockRenewed { req, results } => {
                 self.on_lock_renewed(now, from, req, results, replica, out)
             }

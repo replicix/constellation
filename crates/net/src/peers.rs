@@ -1914,7 +1914,13 @@ async fn handle_stream<S: PeerService>(
                 from,
                 req_id,
                 entries,
-            } => Some(service.lock_renew_requested(from, req_id, entries).await),
+                sent_ms,
+                clock,
+            } => Some(
+                service
+                    .lock_renew_requested(from, req_id, entries, (clock, sent_ms))
+                    .await,
+            ),
             Payload::LockTest {
                 requester,
                 req_id,

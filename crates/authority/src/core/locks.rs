@@ -3427,12 +3427,13 @@ impl Core {
         from: NodeId,
         req: OpId,
         entries: Vec<LockRenewEntry>,
+        sent: (u64, i64),
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
         let mut results = Vec::with_capacity(entries.len());
         for e in entries {
-            let r = self.lock_renew_one(now, from, e.ino, e.grant, e.mode, e.late, replica);
+            let r = self.lock_renew_one(now, from, e.ino, e.grant, e.mode, e.late, sent, replica);
             results.push((e.ino, e.grant, r));
         }
         self.lock_answer(now, from, PeerMsg::LockRenewed { req, results }, out);
@@ -3469,6 +3470,7 @@ impl Core {
         id: GrantId,
         mode: LockMode,
         late: bool,
+        sent: (u64, i64),
         replica: &dyn Replica,
     ) -> LockRenewResult {
         // Renewed: the grant is in use (`LockState::served`).
@@ -3534,7 +3536,7 @@ impl Core {
                 .any(|w| w.ino == ino && w.node != from && w.mode.conflicts(mode));
             return match replica
                 .locks()
-                .admit_late(id, from, mode, until, waiter, now)
+                .admit_late(id, from, mode, until, waiter, now, sent)
             {
                 Some(a) => {
                     if from != self.cfg.node_id {
@@ -3612,7 +3614,7 @@ impl Core {
             // durable; a failed write only makes the owner wait longer
             // (it refuses the answer, the table keeps the later expiry).
             self.lk.unproven.remove(&target);
-            if let Some((mode, recalled)) = replica.locks().extend(target, from, until, now) {
+            if let Some((mode, recalled)) = replica.locks().extend(target, from, until, sent) {
                 if from != self.cfg.node_id {
                     self.lock_need_horizon(until, until.plus((ttl / 4).max(0) as u64));
                 }
@@ -3649,7 +3651,7 @@ impl Core {
                 until,
                 recalled: false,
                 gen,
-                confirmed_ms: now.wall.0,
+                confirmed: Some(sent),
                 settled: false,
             });
             self.stats.lock_reclaimed += 1;
@@ -5009,7 +5011,16 @@ impl Core {
             match self.lock_route_for(now, ino, replica, true) {
                 Route::Me { .. } => {
                     let me = self.cfg.node_id;
-                    let r = self.lock_renew_one(now, me, ino, h.id, h.mode, late, replica);
+                    let r = self.lock_renew_one(
+                        now,
+                        me,
+                        ino,
+                        h.id,
+                        h.mode,
+                        late,
+                        (self.cfg.clock_id, now.honour.0),
+                        replica,
+                    );
                     if let Some(f) = self.lk.fresh_need.take() {
                         // Plan 41 L0: the tenure's liveness is stale; the
                         // grant stays `renewing` (not due again) until the
@@ -5087,6 +5098,8 @@ impl Core {
                             late,
                         })
                         .collect(),
+                    sent: now.honour,
+                    clock: self.cfg.clock_id,
                 },
             });
         }
@@ -5485,22 +5498,31 @@ impl Core {
             self.lk.replay_pins.clear();
             return;
         };
-        let queued: std::collections::BTreeSet<(GrantId, i64)> = queued
+        // Per token: its identity (grant, wall stamp) and where its window
+        // ends on this node's wait clock. A token this process minted ends
+        // by its honour end (plan 43 C7b, row 6: both readings of this
+        // clock); one a previous incarnation minted (another clock id; the
+        // queue is persisted) can only be placed by the wall stamp it was
+        // given, this node's own, as before (row 14).
+        let queued: std::collections::BTreeMap<(GrantId, i64), WaitMs> = queued
             .iter()
             .filter(|q| q.refused.is_none() && !q.foreign)
             .flat_map(|q| q.lock_tag.0.iter())
-            .map(|t| (t.grant, t.until_ms))
+            .map(|t| {
+                let until = if t.clock == self.cfg.clock_id {
+                    now.wait_of_honour(HonourMs(t.until_h))
+                } else {
+                    now.wait_of_wall(Ms(t.until_ms))
+                };
+                ((t.grant, t.until_ms), until)
+            })
             .collect();
         self.lk
             .replay_pins
-            .retain(|key, until| queued.contains(key) && *until > now.wait);
-        for (grant, until_ms) in queued {
-            let until = now.wait_of_wall(Ms(until_ms));
+            .retain(|key, until| queued.contains_key(key) && *until > now.wait);
+        for (key, until) in queued {
             if until > now.wait {
-                self.lk
-                    .replay_pins
-                    .entry((grant, until_ms))
-                    .or_insert(until);
+                self.lk.replay_pins.entry(key).or_insert(until);
             }
         }
     }
@@ -5761,7 +5783,7 @@ impl Core {
             // never read: the record is restamped on this node's wait clock.
             let grant = Grant {
                 recalled: false,
-                confirmed_ms: Grant::UNCONFIRMED,
+                confirmed: Grant::UNCONFIRMED,
                 settled: trusted && g.settled,
                 ..g.into_grant(until)
             };
@@ -6082,7 +6104,7 @@ impl Core {
         for g in back {
             let g = Grant {
                 gen: 0,
-                confirmed_ms: Grant::UNCONFIRMED,
+                confirmed: Grant::UNCONFIRMED,
                 settled: false,
                 ..g
             };
@@ -6139,6 +6161,7 @@ impl Core {
                 .cached_holder
                 .filter(|h| *h != 0 && *h != me)
                 .unwrap_or(0),
+            clock: self.cfg.clock_id,
             lock_ttl_ms: self.lock_ttl_ms(),
             margin_ms: margin,
             forward_timeout_ms: self.cfg.forward_timeout_ms,
@@ -6332,7 +6355,7 @@ impl Core {
             // the grant (and granted another) before the generation ended.
             let g = Grant {
                 gen: 0,
-                confirmed_ms: Grant::UNCONFIRMED,
+                confirmed: Grant::UNCONFIRMED,
                 settled: false,
                 ..g
             };

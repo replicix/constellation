@@ -3650,13 +3650,19 @@ impl Driver {
             SyncRequest::PeerLockRenew {
                 from,
                 entries,
+                sent: (clock, sent),
                 reply,
             } => {
                 let req = self.control_id();
                 self.lock_renew_replies.insert(req, reply);
                 Some(Internal::Event(Event::Peer {
                     from,
-                    msg: PeerMsg::LockRenew { req, entries },
+                    msg: PeerMsg::LockRenew {
+                        req,
+                        entries,
+                        sent: HonourMs(sent),
+                        clock,
+                    },
                 }))
             }
             SyncRequest::LockRenewAnswered {
@@ -4285,11 +4291,22 @@ impl Driver {
                     _ => None,
                 });
             }
-            PeerMsg::LockRenew { req, entries } => {
+            PeerMsg::LockRenew {
+                req,
+                entries,
+                sent,
+                clock,
+            } => {
+                // The send stamp is read as the renewal leaves (never
+                // earlier than the core's own): the later it is, the fewer
+                // tokens a sequencer confirms from it (plan 43 C7b, row 29).
+                let sent_now = constellation_platform::clock::protocol().honour().0;
                 let payload = Payload::LockRenew {
                     from: self.node_id,
                     req_id: req.0,
                     entries: crate::locks::renew_entries_wire(&entries),
+                    sent_ms: sent.0.max(sent_now),
+                    clock,
                 };
                 self.lock_renew_rpc(to, req, payload);
             }
@@ -4752,7 +4769,7 @@ impl Driver {
                 let peers = self.deps.peers.clone();
                 let forward = self.deps.forward.clone();
                 let deps_bytes = deps.to_postcard();
-                let lock_tag = tag.to_wire();
+                let lock_tag = tag.to_wire(constellation_platform::clock::protocol().honour());
                 let timeout = Duration::from_millis(self.core.config().forward_timeout_ms);
                 let requester = self.node_id;
                 let denied = crate::fault::p2p_denied(to);
