@@ -44,6 +44,7 @@ pub mod kernel_inval;
 pub mod lease;
 pub mod leave;
 pub mod lifecycle;
+mod lock_lane;
 pub mod locks;
 pub mod log_buffer;
 pub mod manager;

@@ -4340,6 +4340,91 @@
       ],
       "type": "object"
     },
+    "LockLaneStatus": {
+      "description": "Plan 41 L3/L4: the lock renewal lane (`LockStatus::lane`). It renews\nthis node's own grants and the ones it holds at an owner from the\ncertificate its authority core publishes, while the core is busy or\nstuck (a metadata write behind a slow journal write).",
+      "properties": {
+        "deferred": {
+          "description": "Due renewals it left to the core (no owner known), and ones it did\nnot send because the driver had been stuck past\n`CONSTELLATION_LOCK_LANE_MAX_STALL_MS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "enabled": {
+          "description": "The lane runs (`CONSTELLATION_LOCK_LANE`, default on).",
+          "type": "boolean"
+        },
+        "in_flight": {
+          "description": "Requests waiting for an answer now.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "late_ok": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_stuck_ms": {
+          "description": "The longest the core had been stuck at a tick (ms).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "own_renewals": {
+          "description": "This node's own grants it extended at its own owner table.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remote_ok": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remote_sent": {
+          "description": "Renewals of held grants it sent to their owner, and the granted ones\nit applied (the answer's `Ok`; `late_ok` after it had given up on\nthe request).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "stall_stops": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "stuck_ticks": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ticks": {
+          "description": "Ticks that found grants held, those of them at which the core was\nstuck in a step, and due own grants the core's certificate did not\ncover.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "uncovered": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "enabled",
+        "own_renewals",
+        "remote_sent",
+        "remote_ok",
+        "late_ok",
+        "deferred",
+        "stall_stops",
+        "ticks",
+        "stuck_ticks",
+        "uncovered",
+        "max_stuck_ms",
+        "in_flight"
+      ],
+      "type": "object"
+    },
     "LockStatus": {
       "description": "Plan 30 §M14: `--locks cluster` — lock grants leased from the\nowning sequencer.",
       "properties": {
@@ -4559,6 +4644,24 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "lane": {
+          "$ref": "#/$defs/LockLaneStatus",
+          "default": {
+            "deferred": 0,
+            "enabled": false,
+            "in_flight": 0,
+            "late_ok": 0,
+            "max_stuck_ms": 0,
+            "own_renewals": 0,
+            "remote_ok": 0,
+            "remote_sent": 0,
+            "stall_stops": 0,
+            "stuck_ticks": 0,
+            "ticks": 0,
+            "uncovered": 0
+          },
+          "description": "Plan 41: the renewal lane beside the authority core."
         },
         "lapse_inline_interrupted": {
           "format": "uint64",

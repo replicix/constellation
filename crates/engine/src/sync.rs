@@ -311,6 +311,22 @@ pub enum SyncRequest {
         gen: u64,
         round: u64,
     },
+    /// Plan 41 L2: the lock lane extended `renewed` of this node's own
+    /// grants (urgent lane, `Event::LaneOwn`).
+    LaneOwn {
+        renewed: u32,
+    },
+    /// Plan 41 L4: the owner `from` answered the lane's renewal sent at
+    /// `sent` (this node's honour clock): urgent lane, `Event::LaneRenewed`.
+    LaneRenewed {
+        from: u64,
+        sent: i64,
+        results: Vec<(
+            Ino,
+            constellation_meta::locks::GrantId,
+            constellation_authority::LockRenewResult,
+        )>,
+    },
     /// Plan 41 R2: the root answered this delegate's renewal off its core
     /// (the RPC reply, [`Payload::DelegRenewedOffCore`]): a grant of
     /// `ttl_ms`, applied by the core as an extension only

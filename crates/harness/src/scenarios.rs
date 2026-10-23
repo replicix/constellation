@@ -2158,10 +2158,24 @@ pub const CAMPAIGN: &[Scenario] = &[
     },
     Scenario {
         name: "lock-stall-lone-node",
-        desc: "load campaign 5.3: lock-lapse-lone-node's workload with one metadata write holding the store's writer lock 5/12/20 s instead of a freeze: every op OK or EIO, the tree holds exactly what answered OK, the locked file what its close published (or what was fsynced when the close was fenced), fsck clean, also after a remount",
+        desc: "load campaign 5.3, plan 41 L3: lock-lapse-lone-node's workload with one metadata write holding the store's writer lock 5/12/20 s instead of a freeze: with the lock lane the grant does not lapse (no op EIO, no owner fenced, lane.own_renewals > 0), the tree holds exactly what answered OK, fsck clean, also after a remount; CONSTELLATION_HARNESS_LONE_LANE=off expects the lapse (the in-scenario fail-before)",
         requires: &[],
         caps: &[Cap::ClusterLocks],
         run: m14::lock_stall_lone_node,
+    },
+    Scenario {
+        name: "lock-store-stall-past-lease",
+        desc: "plan 41 L3, the cap: a lone node with a 12 s lease and a 3 s lock TTL, one metadata write holding the store 20 s (past what is left of the lease): the lane renews the node's own grant up to the lease's usable end (lane.own_renewals > 0) and the grant lapses there, never later; the application sees EIO after it, the fence lifts with the lock, the tree holds what answered OK, fsck clean",
+        requires: &[],
+        caps: &[Cap::ClusterLocks],
+        run: m14::lock_store_stall_past_lease,
+    },
+    Scenario {
+        name: "lock-store-stall-holder",
+        desc: "plan 41 L4: two nodes, B holds an exclusive flock granted by A while A's client blocks on it; one metadata write of B's holds B's store 10 s (a 3 s lock TTL): B's lane renews the grant at the owner, so B keeps the lock (its write under it answers OK, nothing lost or fenced, lane.remote_ok > 0) and A gets it only after B's unlock; CONSTELLATION_HARNESS_HOLDER_LANE=off expects B's EIO (the in-scenario fail-before)",
+        requires: &[],
+        caps: &[Cap::ClusterLocks],
+        run: m14::lock_store_stall_holder,
     },
     Scenario {
         name: "lock-contention-paused-holder",

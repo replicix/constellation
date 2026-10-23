@@ -2607,16 +2607,20 @@ pub fn lock_lapse_lone_node(_seed: u64) -> Result<()> {
 }
 
 /// Load campaign §5.3: `lock-lapse-lone-node`'s workload with the
-/// daemon stalled from inside instead of frozen: one ordinary metadata
-/// write holds the store's writer lock for 5, 12 and 20 s
-/// (`CONSTELLATION_FAULT_STORE_STALL_FILE`), so the core's step waits
-/// behind a slow FUSE writer (finding 08). Whether the grant lapses
-/// depends on whether the core had to write meanwhile (the lock lane of
-/// plan 41 L1-L4 renews without it; `CONSTELLATION_LOCK_LANE=off` then
-/// makes this its fail-before); what must hold either way: every op
-/// answers OK or EIO, the tree holds exactly what answered OK, the locked
-/// file what its close published (or what was fsynced, when the close
-/// was fenced), and fsck finds nothing, also after a remount.
+/// daemon stalled from inside instead of frozen: one of the core's own
+/// metadata commits holds the store's writer lock for 5, 12 and 20 s
+/// (`CONSTELLATION_FAULT_STORE_STALL_FILE`, `core-only`), so the core's
+/// step is stuck on a slow journal write (finding 08). With the lock lane of plan 41
+/// (the default), which renews the node's own grant without the stuck core,
+/// the grant does not lapse: no op answers `EIO`, no owner is fenced, the
+/// lock is never lost, and the status counts the lane's own renewals.
+/// `CONSTELLATION_HARNESS_LONE_LANE=off` runs the daemon with
+/// `CONSTELLATION_LOCK_LANE=off` and expects the lapse instead (the
+/// in-scenario fail-before: the fault point reaches the core). What must
+/// hold in both: every op answers OK or EIO, the tree holds exactly what
+/// answered OK, the locked file what its close published (or what was
+/// fsynced, when the close was fenced), and fsck finds nothing, also after
+/// a remount.
 pub fn lock_stall_lone_node(_seed: u64) -> Result<()> {
     const NAME: &str = "lock-stall-lone-node";
     const LOCK_TTL_MS: u64 = 3_000;
@@ -2625,6 +2629,10 @@ pub fn lock_stall_lone_node(_seed: u64) -> Result<()> {
         .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
         .filter(|v: &Vec<u64>| !v.is_empty())
         .unwrap_or_else(|| vec![5_000, 12_000, 20_000]);
+    // `CONSTELLATION_HARNESS_LONE_LANE=off`: the daemon runs with
+    // `CONSTELLATION_LOCK_LANE=off` and the scenario expects the lapse (the
+    // in-scenario fail-before: the fault point is proven effective).
+    let lane_off = std::env::var("CONSTELLATION_HARNESS_LONE_LANE").as_deref() == Ok("off");
     for ms in stalls {
         let (env, root) = setup(NAME)?;
         let backend = format!("s3://{BUCKET}/{NAME}-{ms}-{}", ts());
@@ -2638,26 +2646,39 @@ pub fn lock_stall_lone_node(_seed: u64) -> Result<()> {
                 &file.display().to_string(),
             )
             .with_env(
+                "CONSTELLATION_LOCK_LANE",
+                if lane_off { "off" } else { "on" },
+            )
+            .with_env(
                 "RUST_LOG",
                 "info,constellation_authority::core::locks=debug,constellation::locks=debug",
             );
         c.fs_create()?;
         c.mount()?;
         eprintln!("    {NAME}: a {ms} ms store stall");
-        let result =
-            lock_lapse_lone_run(NAME, &c, LoneStall::Store { ms, file }).and_then(|expected| {
-                c.unmount()?;
-                c.mount()?;
-                lock_lapse_lone_check(NAME, &c, &expected, "after a remount")?;
-                let fsck = c.fsck(false)?;
-                anyhow::ensure!(
-                    fsck.status.success(),
-                    "fsck: {}{}",
-                    String::from_utf8_lossy(&fsck.stdout),
-                    String::from_utf8_lossy(&fsck.stderr)
-                );
-                Ok(())
-            });
+        let result = lock_lapse_lone_run(
+            NAME,
+            &c,
+            LoneStall::Store {
+                ms,
+                file,
+                lane_off,
+                past_lease: false,
+            },
+        )
+        .and_then(|expected| {
+            c.unmount()?;
+            c.mount()?;
+            lock_lapse_lone_check(NAME, &c, &expected, "after a remount")?;
+            let fsck = c.fsck(false)?;
+            anyhow::ensure!(
+                fsck.status.success(),
+                "fsck: {}{}",
+                String::from_utf8_lossy(&fsck.stdout),
+                String::from_utf8_lossy(&fsck.stderr)
+            );
+            Ok(())
+        });
         if result.is_err() {
             keep_logs(NAME, std::slice::from_ref(&c));
         }
@@ -2665,6 +2686,215 @@ pub fn lock_stall_lone_node(_seed: u64) -> Result<()> {
         result.with_context(|| format!("the {ms} ms store stall"))?;
     }
     Ok(())
+}
+
+/// Plan 41 L3, the cap: a lone node, lease 12 s, lock TTL 3 s, one metadata
+/// write holds the store 20 s — past what is left of the root lease, which
+/// the stuck core cannot renew. The lane renews the node's own grant up to
+/// the lease's usable end (`own_renewals > 0`) and no further: the grant
+/// lapses there, the owner is fenced (the application sees `EIO` after it)
+/// and the fence lifts with the lock; tree, file and fsck as in
+/// `lock-stall-lone-node`.
+pub fn lock_store_stall_past_lease(_seed: u64) -> Result<()> {
+    const NAME: &str = "lock-store-stall-past-lease";
+    const LOCK_TTL_MS: u64 = 3_000;
+    const STALL_MS: u64 = 20_000;
+    let (env, root) = setup(NAME)?;
+    let backend = format!("s3://{BUCKET}/{NAME}-{}", ts());
+    let file = root.path().join("store-stall");
+    let mut c = Client::new(root.path(), "lone", &env.direct_endpoint, &backend)?
+        .with_write_mode("back")
+        .with_env("CONSTELLATION_LOCKS", "cluster")
+        .with_env("CONSTELLATION_LOCK_TTL_MS", &LOCK_TTL_MS.to_string())
+        .with_env("CONSTELLATION_LEASE_TTL_MS", "12000")
+        .with_env(
+            "CONSTELLATION_FAULT_STORE_STALL_FILE",
+            &file.display().to_string(),
+        )
+        .with_env(
+            "RUST_LOG",
+            "info,constellation_authority::core::locks=debug,constellation::locks=debug",
+        );
+    c.fs_create()?;
+    c.mount()?;
+    eprintln!("    {NAME}: a {STALL_MS} ms store stall, lease 12 s");
+    let result = lock_lapse_lone_run(
+        NAME,
+        &c,
+        LoneStall::Store {
+            ms: STALL_MS,
+            file,
+            lane_off: false,
+            past_lease: true,
+        },
+    )
+    .and_then(|expected| {
+        c.unmount()?;
+        c.mount()?;
+        lock_lapse_lone_check(NAME, &c, &expected, "after a remount")?;
+        let fsck = c.fsck(false)?;
+        anyhow::ensure!(
+            fsck.status.success(),
+            "fsck: {}{}",
+            String::from_utf8_lossy(&fsck.stdout),
+            String::from_utf8_lossy(&fsck.stderr)
+        );
+        Ok(())
+    });
+    if result.is_err() {
+        keep_logs(NAME, std::slice::from_ref(&c));
+    }
+    let _ = c.unmount();
+    result
+}
+
+/// Plan 41 L4: a lock held at a healthy owner survives a stall of the
+/// *holder's* store. Two nodes, a 3 s lock TTL, no backup: B holds an
+/// exclusive `flock` (and writes under it) while A's client blocks on the
+/// same lock and A creates files in a loop (the log B tails: B's core has
+/// store writes to make). One ordinary metadata write of B's holds B's store
+/// 10 s (`CONSTELLATION_FAULT_STORE_STALL_FILE`), longer than a grant's
+/// window; B's core waits behind it. B's lane renews the grant at A
+/// meanwhile: B keeps the lock (its write under it answers `OK`, nothing is
+/// fenced or lost, `lane.remote_ok > 0`), A gets it only after B's unlock.
+/// `CONSTELLATION_HARNESS_HOLDER_LANE=off` runs the daemons with
+/// `CONSTELLATION_LOCK_LANE=off` and expects the lapse instead (B's write
+/// answers `EIO`): the in-scenario fail-before.
+pub fn lock_store_stall_holder(_seed: u64) -> Result<()> {
+    const NAME: &str = "lock-store-stall-holder";
+    const LOCK_TTL_MS: u64 = 3_000;
+    const STALL_MS: u64 = 10_000;
+    const UNDER: &[u8] = b"B-UNDER-LOCK";
+    const AFTER: &[u8] = b"B-AFTER-STALL";
+    let lane_off = std::env::var("CONSTELLATION_HARNESS_HOLDER_LANE").as_deref() == Ok("off");
+    let ttl = LOCK_TTL_MS.to_string();
+    let stall_dir = tempfile::tempdir()?;
+    let file = stall_dir.path().join("store-stall");
+    let file_str = file.display().to_string();
+    let (_env, _root, mut clients, _) = cluster(
+        NAME,
+        &["a", "b"],
+        &[
+            ("CONSTELLATION_LOCK_TTL_MS", &ttl),
+            ("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "0"),
+            ("CONSTELLATION_FAULT_STORE_STALL_FILE", &file_str),
+            (
+                "CONSTELLATION_LOCK_LANE",
+                if lane_off { "off" } else { "on" },
+            ),
+            (
+                "RUST_LOG",
+                "info,constellation_authority::core::locks=debug,constellation::locks=debug",
+            ),
+        ],
+        0,
+    )?;
+    let result = (|| -> Result<()> {
+        let a = &clients[0];
+        let b = &clients[1];
+        std::fs::write(a.mnt.join("g"), b"initial")?;
+        eventually("the file visible on b", Duration::from_secs(30), || {
+            anyhow::ensure!(std::fs::read(b.mnt.join("g"))? == b"initial");
+            Ok(())
+        })?;
+        let mut wb = open_rw(&b.mnt.join("g"))?;
+        flock(&wb, libc::LOCK_EX).map_err(|e| anyhow::anyhow!("B's lock: {e}"))?;
+        write_at(&mut wb, 0, UNDER).context("B's write under its lock")?;
+        // A's client waits for the same lock; A also creates files, so
+        // B tails a log that moves.
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<Duration>();
+        let a_wait = {
+            let path = a.mnt.join("g");
+            std::thread::spawn(move || -> Result<()> {
+                let f = open_rw(&path)?;
+                let t0 = Instant::now();
+                flock(&f, libc::LOCK_EX).map_err(|e| anyhow::anyhow!("A's lock: {e}"))?;
+                let _ = tx.send(t0.elapsed());
+                let _ = flock(&f, libc::LOCK_UN);
+                Ok(())
+            })
+        };
+        let a_files = {
+            let (dir, stop) = (a.mnt.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut i = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = std::fs::write(dir.join(format!("busy-{i}")), b"x");
+                    i += 1;
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            })
+        };
+        std::thread::sleep(Duration::from_millis(1_000));
+        // B's store stalls: the next ordinary write of B's holds the lock.
+        let pid = b.pid().context("b has no daemon")?;
+        let tmp = file.with_extension("tmp");
+        std::fs::write(&tmp, format!("{STALL_MS} once pid={pid}"))?;
+        std::fs::rename(&tmp, &file)?;
+        let trigger = {
+            let path = b.mnt.join("stall-trigger");
+            std::thread::spawn(move || std::fs::write(path, b"x"))
+        };
+        std::thread::sleep(Duration::from_millis(STALL_MS + 1_500));
+        anyhow::ensure!(
+            !file.exists(),
+            "no metadata write of B's took the {STALL_MS} ms store stall"
+        );
+        let early = rx.try_recv().ok();
+        let after = write_at(&mut wb, 0, AFTER);
+        let locks = locks_of(b)?;
+        let after_eio = after.as_ref().err().and_then(Code::from_os_error) == Some(Code::Io);
+        eprintln!(
+            "    {NAME}: after a {STALL_MS} ms stall of B's store: B's write {after:?}, A granted \
+             {early:?} (before B's unlock); B's locks: {locks}"
+        );
+        if lane_off {
+            anyhow::ensure!(
+                after_eio,
+                "with the lane off B's grant should have lapsed under a {STALL_MS} ms stall: its \
+                 write answered {after:?}; locks: {locks}"
+            );
+        } else {
+            anyhow::ensure!(
+                after.is_ok() && early.is_none(),
+                "B lost the lock to its own store stall (write {after:?}) or A was granted it \
+                 while B held it ({early:?}); locks: {locks}"
+            );
+            anyhow::ensure!(
+                locks["lost"].as_u64().unwrap_or(0) == 0
+                    && locks["owners_fenced"].as_u64().unwrap_or(0) == 0
+                    && locks["lane"]["remote_ok"].as_u64().unwrap_or(0) > 0,
+                "B's lane did not carry its grant at the owner (remote_ok > 0, nothing lost or \
+                 fenced expected): {locks}"
+            );
+        }
+        // B lets go (the close of a lapsed one may answer EIO: the lane-off
+        // arm); A then gets the lock.
+        let _ = flock(&wb, libc::LOCK_UN);
+        drop(wb);
+        let granted = match early {
+            Some(d) => d,
+            None => rx
+                .recv_timeout(Duration::from_secs(20))
+                .context("A never got the lock after B's unlock")?,
+        };
+        eprintln!("    {NAME}: A's lock came {granted:?} after it asked");
+        stop.store(true, Ordering::Relaxed);
+        let _ = trigger.join();
+        let _ = a_files.join();
+        a_wait
+            .join()
+            .map_err(|_| anyhow::anyhow!("A's waiter panicked"))??;
+        Ok(())
+    })();
+    if result.is_err() {
+        keep_logs(NAME, &clients);
+    }
+    for c in clients.iter_mut().rev() {
+        let _ = c.unmount();
+    }
+    result
 }
 
 /// Load campaign §5.3, finding F1 in the real daemon: a fencing token
@@ -2871,12 +3101,23 @@ struct LoneExpected {
 enum LoneStall {
     /// `SIGSTOP` for this long: the grant lapses, by construction.
     Freeze(Duration),
-    /// One ordinary metadata write holds the store's writer lock this
-    /// long (`CONSTELLATION_FAULT_STORE_STALL_FILE` at `file`): the core
-    /// waits behind it whenever it writes, finding 08's shape. Whether
-    /// the grant lapses depends on whether the core had to write
-    /// meanwhile; the correctness checks hold either way.
-    Store { ms: u64, file: PathBuf },
+    /// One of the core's own metadata commits holds the store's writer lock
+    /// this long (`CONSTELLATION_FAULT_STORE_STALL_FILE` at `file`,
+    /// `core-only`): the core's step is stuck, and every FUSE writer waits
+    /// behind it, finding 08's shape. Plan 41: with the
+    /// lock lane (the default) it must not lapse the grant (`lane_off`
+    /// false: no `EIO`, nothing fenced, the lane's own renewals counted);
+    /// with `CONSTELLATION_LOCK_LANE=off` (`lane_off`: the in-scenario
+    /// fail-before, which proves the fault point effective) it must.
+    Store {
+        ms: u64,
+        file: PathBuf,
+        lane_off: bool,
+        /// The stall outlasts the root lease (the stuck core cannot renew it):
+        /// the lane's renewals end at the lease's usable end and the grant
+        /// lapses there (`lock-store-stall-past-lease`).
+        past_lease: bool,
+    },
 }
 
 /// The locked file's content: what was `fsync`ed under the honoured grant.
@@ -3008,10 +3249,12 @@ fn lock_lapse_lone_run(name: &str, c: &Client, stall: LoneStall) -> Result<LoneE
                 let _thaw = Thaw(c);
                 std::thread::sleep(*frozen);
             }
-            LoneStall::Store { ms, file } => {
+            LoneStall::Store { ms, file, .. } => {
                 // Whole, by a rename (a prefix would stall for less).
                 let tmp = file.with_extension("tmp");
-                std::fs::write(&tmp, format!("{ms} once"))?;
+                // The core's own commit is the slow one (`core-only`): the stall
+                // reaches the core whatever the FUSE writers have to write.
+                std::fs::write(&tmp, format!("{ms} once core-only"))?;
                 std::fs::rename(&tmp, file)?;
                 std::thread::sleep(Duration::from_millis(*ms + 1_000));
                 anyhow::ensure!(
@@ -3100,6 +3343,87 @@ fn lock_lapse_lone_run(name: &str, c: &Client, stall: LoneStall) -> Result<LoneE
             if let Some((n, r)) = v.iter().find(|(_, r)| r.is_err()) {
                 bail!("{what} {n} answered {r:?} after a freeze: the I/O should have waited");
             }
+        }
+    } else if let LoneStall::Store {
+        ms,
+        lane_off,
+        past_lease,
+        ..
+    } = &stall
+    {
+        let eios: usize = outcomes
+            .values()
+            .map(|v| v.iter().filter(|(_, r)| *r == Err(Code::Io)).count())
+            .sum();
+        let owners_fenced = fence["owners_fenced"].as_u64().unwrap_or(0);
+        let own = fence["lane"]["own_renewals"].as_u64().unwrap_or(0);
+        eprintln!(
+            "    {name}: the grant {} during the {ms} ms store stall ({fenced_ops} fenced ops, \
+             {eios} EIO, {owners_fenced} owners fenced, lane own renewals {own})",
+            if after_eio { "lapsed" } else { "held" }
+        );
+        if *lane_off {
+            // The code before plan 41: the stuck core renews nothing, the
+            // grant lapses under a stall past its window (the 3 s ttl). Plan
+            // 43's lapse parking keeps the owner from being fenced (its
+            // I/O parks for the stall and then answers OK), so the lapse is
+            // read from the parking: the ops parked for most of the stall.
+            let parks = fence["lapse_parks"].as_u64().unwrap_or(0);
+            let parked_ms = fence["lapse_park_ms_max"].as_u64().unwrap_or(0);
+            anyhow::ensure!(
+                after_eio || fenced_ops > 0 || eios > 0 || (parks > 0 && parked_ms >= ms / 3),
+                "with CONSTELLATION_LOCK_LANE=off a {ms} ms store stall lapsed nothing (lapse \
+                 parks {parks}, longest {parked_ms} ms): the fault point did not reach the core \
+                 (or the scenario is vacuous); locks: {fence}"
+            );
+            anyhow::ensure!(
+                fence["lane"]["own_renewals"].as_u64().unwrap_or(0) == 0,
+                "the lane renewed with the lane off: {fence}"
+            );
+        } else if *past_lease {
+            // The stall outlasts the lease the stuck core cannot renew: the lane
+            // renews up to the lease's usable end and the grant lapses there
+            // (never later: the cap), the owner is fenced and the application
+            // sees `EIO` until the lock is gone.
+            // (Plan 43's lapse parking keeps the owner from being fenced: the
+            // lapse shows as I/O parked for the rest of the stall.)
+            let parks = fence["lapse_parks"].as_u64().unwrap_or(0);
+            let parked_ms = fence["lapse_park_ms_max"].as_u64().unwrap_or(0);
+            anyhow::ensure!(
+                after_eio || fenced_ops > 0 || eios > 0 || (parks > 0 && parked_ms >= ms / 4),
+                "a {ms} ms store stall outlasted the lease and the grant never lapsed (lapse \
+                 parks {parks}, longest {parked_ms} ms): the cap was not enforced (or the stall \
+                 did not reach the core); locks: {fence}"
+            );
+            anyhow::ensure!(
+                own > 0,
+                "the lane never renewed the node's own grant before the lease's end \
+                 (lane.own_renewals {own}); locks: {fence}"
+            );
+        } else {
+            // The lane renews meanwhile: no op answers EIO, nothing is fenced,
+            // the lock is never lost, and the lane's own renewals are counted.
+            anyhow::ensure!(
+                !after_eio && eios == 0 && fenced_ops == 0 && owners_fenced == 0,
+                "a {ms} ms store stall lapsed the lock with the lane on: {eios} EIO, \
+                 {fenced_ops} fenced ops, {owners_fenced} owners fenced; locks: {fence}"
+            );
+            anyhow::ensure!(
+                fence["lost"].as_u64().unwrap_or(0) == 0 && own > 0,
+                "the lane did not renew the node's own grant during a {ms} ms store stall \
+                 (lane.own_renewals {own}, lost {}); locks: {fence}",
+                fence["lost"]
+            );
+            // The signal the lane-off arm shows: no op parked for a lapsed
+            // grant (the lane kept the window open through the stall).
+            let parks = fence["lapse_parks"].as_u64().unwrap_or(0);
+            anyhow::ensure!(
+                parks == 0 && fence["late_admitted"].as_u64().unwrap_or(0) == 0,
+                "the grant lapsed during a {ms} ms store stall with the lane on: {parks} lapse \
+                 parks, longest {} ms, {} late admissions; locks: {fence}",
+                fence["lapse_park_ms_max"],
+                fence["late_admitted"]
+            );
         }
     } else {
         eprintln!(

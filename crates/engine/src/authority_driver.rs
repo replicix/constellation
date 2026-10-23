@@ -161,6 +161,10 @@ pub struct CoreStatus {
     /// and the ones it declined while the core was stuck, by reason
     /// (`DelegWindows::stats`; atomics the core's step does not guard).
     pub delegation_root_answers_off_core: u64,
+    /// Plan 41 L3/L4: what the lock lane did, and whether it runs.
+    pub lock_lane: constellation_authority::lane::LaneStats,
+    pub lock_lane_enabled: bool,
+    pub lock_lane_in_flight: usize,
     pub delegation_root_answers_deferred: Vec<(String, u64)>,
     /// Phase 2b: the placement's busiest subtrees, `(dir, node, node_ops,
     /// subtree_ops)`.
@@ -1706,6 +1710,11 @@ pub struct OffCore {
     /// ([`Core::set_deleg_windows`]) and the P2P service's off-core
     /// answerer (plan 41 R2, `deleg_lane::answer_root`).
     pub(crate) deleg_windows: Arc<constellation_authority::core::DelegWindows>,
+    /// Plan 41 L2: the lock lane's certificate (published by the core at the
+    /// end of every step) and its state (requests in flight, statistics),
+    /// shared with the lane's task (`crate::lock_lane`) and with status.
+    pub(crate) lane_cell: Arc<constellation_authority::lane::LaneCell>,
+    pub(crate) lock_lane: Mutex<constellation_authority::lane::RenewLane>,
 }
 
 impl OffCore {
@@ -1728,6 +1737,10 @@ impl OffCore {
             beat_freeze: std::sync::atomic::AtomicU64::new(0),
             granted_ttl: Mutex::new(HashMap::new()),
             deleg_windows: constellation_authority::core::DelegWindows::new(),
+            lane_cell: constellation_authority::lane::LaneCell::new(),
+            lock_lane: Mutex::new(constellation_authority::lane::RenewLane::new(
+                crate::lock_lane::lock_lane_max_stall_ms(),
+            )),
         }
     }
 
@@ -2172,6 +2185,7 @@ impl Driver {
         // inside its guard (plan 41 R1): the protocol clock, the one every
         // other reading of the node's time comes from.
         core.set_deleg_windows(deps.off_core.deleg_windows.clone());
+        core.set_lane_cell(deps.off_core.lane_cell.clone());
         core.deleg_windows().set_clock(Arc::new(crate::locks::now));
         let leases = LeaseStore::new(deps.store_inner.clone(), PARTITION, deps.lease_mode);
         let inbox = match &deps.e2e {
@@ -2307,6 +2321,18 @@ impl Driver {
                 self.loop_thread.clone(),
             )
         });
+        // Plan 41 L3/L4: the lock renewal lane, beside the core.
+        let _lock_lane = (self.core.config().p2p && self.core.config().locks)
+            .then(|| {
+                crate::lock_lane::LockLane::start(
+                    self.deps.meta.clone(),
+                    self.deps.peers.clone(),
+                    self.deps.off_core.clone(),
+                    self.node_id,
+                    self.core.config().forward_timeout_ms,
+                )
+            })
+            .flatten();
         crate::fault::start_runtime_hog_file(self.node_id);
         crate::fault::start_clock_faults();
         self.step_end = std::time::Instant::now();
@@ -2598,6 +2624,9 @@ impl Driver {
             status.recent_longest_step_ms = self.step_tail.recent();
         }
         if step_us >= SLOW_STEP_US {
+            // Plan 41: what the lock lane renewed meanwhile (cumulative: the
+            // difference between two of these lines is the stall's).
+            let lane = self.deps.off_core.lock_lane.lock().unwrap().stats;
             // Everything the core does (backup heartbeats included)
             // waits for this step: a long one silences the node.
             tracing::warn!(
@@ -2614,6 +2643,9 @@ impl Driver {
                     .map(|(at, held_us)| format!("{at} (held {} ms)", held_us / 1000)),
                 store_syncs = store.syncs,
                 store_sync_us = store.sync_us,
+                lane_own_renewals = lane.own_renewals,
+                lane_remote_ok = lane.remote_ok,
+                lane_remote_sent = lane.remote_sent,
                 "slow core step"
             );
         }
@@ -2712,6 +2744,12 @@ impl Driver {
         status.delegation_fast_path_executed = self.deps.delegates.executed();
         status.delegation_fast_path_routed = self.deps.delegates.routed();
         status.delegation_fast_path_fenced = self.deps.delegates.fenced();
+        {
+            let l = self.deps.off_core.lock_lane.lock().unwrap();
+            status.lock_lane = l.stats;
+            status.lock_lane_in_flight = l.in_flight();
+            status.lock_lane_enabled = crate::lock_lane::lock_lane_on();
+        }
         {
             let w = self.deps.off_core.deleg_windows.stats();
             status.delegation_root_answers_off_core = w.answered_off_core.load(Ordering::Relaxed);
@@ -3147,6 +3185,16 @@ impl Driver {
                     round,
                     ttl_ms,
                 },
+            })),
+            SyncRequest::LaneOwn { renewed } => Some(Internal::Event(Event::LaneOwn { renewed })),
+            SyncRequest::LaneRenewed {
+                from,
+                sent,
+                results,
+            } => Some(Internal::Event(Event::LaneRenewed {
+                from,
+                sent: HonourMs(sent),
+                results,
             })),
             SyncRequest::DelegRenewAnsweredOffCore { gen, from, ttl_ms } => {
                 Some(Internal::Event(Event::DelegRenewAnsweredOffCore {

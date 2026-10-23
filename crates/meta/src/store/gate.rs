@@ -179,6 +179,13 @@ pub(crate) struct GatedDb {
     /// The last writer to take the lock: the one a priority writer waits
     /// behind (it is served next).
     holder: Mutex<Option<Holder>>,
+    /// Tests only ([`crate::Meta::set_write_stall`]): how long every ordinary
+    /// writer, and (`core_stall_ms`) every priority writer, holds the writer
+    /// lock after taking it (0: not at all). One relaxed load per write.
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) stall_ms: std::sync::atomic::AtomicU64,
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) core_stall_ms: std::sync::atomic::AtomicU64,
     /// Tests only: [`crate::Meta::set_writer_wait_hook_for_tests`].
     #[cfg(any(test, feature = "test-util"))]
     pub(crate) wait_hook: Mutex<Option<WriterWaitHook>>,
@@ -196,6 +203,10 @@ impl GatedDb {
         Self {
             db,
             holder: Mutex::new(None),
+            #[cfg(any(test, feature = "test-util"))]
+            stall_ms: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-util"))]
+            core_stall_ms: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "test-util"))]
             wait_hook: Mutex::new(None),
             #[cfg(any(test, feature = "test-util"))]
@@ -221,6 +232,22 @@ impl GatedDb {
             }
         }
         self.db.read_tx()
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    fn in_process_stall(&self, priority: bool) -> Option<Duration> {
+        let ms = if priority {
+            self.core_stall_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+        } else {
+            self.stall_ms.load(std::sync::atomic::Ordering::Relaxed)
+        };
+        (ms > 0).then(|| Duration::from_millis(ms))
+    }
+
+    #[cfg(not(any(test, feature = "test-util")))]
+    fn in_process_stall(&self, _priority: bool) -> Option<Duration> {
+        None
     }
 
     fn holder(&self) -> std::sync::MutexGuard<'_, Option<Holder>> {
@@ -262,15 +289,19 @@ impl GatedDb {
             since: now,
             thread: std::thread::current(),
         });
-        if !priority {
-            if let Some(hold) = fault_store_stall() {
-                tracing::warn!(
-                    hold_ms = hold.as_millis() as u64,
-                    op = %at,
-                    "fault injection: holding the metadata writer lock (testing only)"
-                );
-                std::thread::sleep(hold);
-            }
+        // The store-stall fault point holds the lock after taking it: an
+        // ordinary writer's (finding 08: a FUSE writer's slow journal
+        // write, the core's step waiting behind it), and with `core` the
+        // core's own commit's too (its own `write(2)` stalled).
+        if let Some(hold) = fault_store_stall(priority).or_else(|| self.in_process_stall(priority))
+        {
+            tracing::warn!(
+                hold_ms = hold.as_millis() as u64,
+                op = %at,
+                priority,
+                "fault injection: holding the metadata writer lock (testing only)"
+            );
+            std::thread::sleep(hold);
         }
         let waited_us = waited.as_micros() as u64;
         let behind = ahead.map(|h| {
@@ -318,20 +349,29 @@ impl GatedDb {
 
 /// `CONSTELLATION_FAULT_STORE_STALL_FILE=<path>` (load campaign): while
 /// that file exists, an ordinary writer (a FUSE worker or a background
-/// pass, never a [`priority_writes`] scope, so never the core's step)
-/// holds the writer lock for the number of milliseconds the file holds
-/// after taking it, and the core's next step waits behind it (finding
-/// 08's slow journal write). `<ms> once`: the first writer to see the
-/// file removes it, so one transaction stalls. `pid=<n>`: only the daemon
-/// of that pid stalls (several daemons may share one path). `caller=<n>`:
-/// only a write made for the FUSE request of that caller (the kernel's
-/// task id, as FUSE names it: [`fault_caller_scope`]). Write the file
-/// whole (to a temporary name, then rename): a reader that sees a prefix
-/// stalls for the wrong time. Unset, one cached lookup.
-fn fault_store_stall() -> Option<Duration> {
+/// pass, not a [`priority_writes`] scope, so not the core's step) holds the
+/// writer lock for the number of milliseconds the file holds after taking
+/// it, and the core's next step waits behind it (finding 08's slow
+/// journal write). `<ms> once`: the first writer to see the file removes
+/// it, so one transaction stalls. `pid=<n>`: only the daemon of that pid
+/// stalls (several daemons may share one path). `caller=<n>`: only a write
+/// made for the FUSE request of that caller (the kernel's task id, as FUSE
+/// names it: [`fault_caller_scope`]). `core`: the core's own commits stall
+/// too (plan 41 L3: finding 08's own-commit case, a priority writer's
+/// `write(2)` held up on the device); `core-only`: only those (the stall
+/// is then the core's own, whatever the FUSE writers do). Write the file whole (to a temporary
+/// name, then rename): a reader that sees a prefix stalls for the wrong
+/// time. Unset, one cached lookup.
+fn fault_store_stall(priority: bool) -> Option<Duration> {
     let path = store_stall_path()?;
     let text = std::fs::read_to_string(path).ok()?;
     let spec = parse_store_stall(&text)?;
+    if priority && !spec.core {
+        return None;
+    }
+    if !priority && spec.core_only {
+        return None;
+    }
     if spec.pid.is_some_and(|p| p != std::process::id()) {
         return None;
     }
@@ -384,13 +424,20 @@ impl Drop for FaultCallerScope {
     }
 }
 
-/// [`fault_store_stall`]'s file: `<ms>[ once][ pid=<n>][ caller=<n>]`.
+/// [`fault_store_stall`]'s file: `<ms>[ once][ core|core-only][ pid=<n>][ caller=<n>]`.
 #[derive(Debug, PartialEq, Eq)]
 struct StoreStall {
     ms: u64,
     once: bool,
     pid: Option<u32>,
     caller: Option<u32>,
+    /// The core's own commits stall too.
+    core: bool,
+    /// Only the core's own commits stall (implies `core`): the slow
+    /// journal write is the core's, deterministically (a FUSE writer
+    /// holding the lock stalls the core only if it has something to write
+    /// meanwhile).
+    core_only: bool,
 }
 
 fn parse_store_stall(text: &str) -> Option<StoreStall> {
@@ -401,10 +448,21 @@ fn parse_store_stall(text: &str) -> Option<StoreStall> {
         once: false,
         pid: None,
         caller: None,
+        core: false,
+        core_only: false,
     };
     for w in it {
         if w == "once" && !spec.once {
             spec.once = true;
+            continue;
+        }
+        if w == "core" && !spec.core {
+            spec.core = true;
+            continue;
+        }
+        if w == "core-only" && !spec.core_only {
+            spec.core = true;
+            spec.core_only = true;
             continue;
         }
         if let Some(p) = w.strip_prefix("pid=").filter(|_| spec.pid.is_none()) {
@@ -417,6 +475,31 @@ fn parse_store_stall(text: &str) -> Option<StoreStall> {
         spec.caller = Some(p.parse().ok()?);
     }
     (ms > 0).then_some(spec)
+}
+
+impl crate::Meta {
+    /// Tests only (`test-util`; plan 41 L3): every ordinary writer of this
+    /// store holds the writer lock for `stall` after taking it, until it is
+    /// set to `None` — a slow journal write on the device, in process (the
+    /// fault file's `<ms>`).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_write_stall(&self, stall: Option<Duration>) {
+        self.db.stall_ms.store(
+            stall.map_or(0, |d| d.as_millis().max(1) as u64),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Tests only (`test-util`; plan 41 L3): the same for the core's own
+    /// commits (priority writers: the fault file's `core`), finding 08's
+    /// own-commit case.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_core_write_stall(&self, stall: Option<Duration>) {
+        self.db.core_stall_ms.store(
+            stall.map_or(0, |d| d.as_millis().max(1) as u64),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
 }
 
 impl std::ops::Deref for GatedDb {
@@ -442,6 +525,8 @@ mod tests {
                 once,
                 pid,
                 caller,
+                core: false,
+                core_only: false,
             })
         };
         assert_eq!(parse_store_stall("5000"), spec(5000, false, None, None));
@@ -457,7 +542,33 @@ mod tests {
             parse_store_stall("800 pid=7 caller=99 once"),
             spec(800, true, Some(7), Some(99))
         );
+        // `core`: the core's own commits stall too.
+        assert_eq!(
+            parse_store_stall("9000 once core pid=3"),
+            Some(StoreStall {
+                ms: 9000,
+                once: true,
+                pid: Some(3),
+                caller: None,
+                core: true,
+                core_only: false,
+            })
+        );
+        // `core-only`: only the core's own commits (implies `core`).
+        assert_eq!(
+            parse_store_stall("5000 once core-only"),
+            Some(StoreStall {
+                ms: 5000,
+                once: true,
+                pid: None,
+                caller: None,
+                core: true,
+                core_only: true,
+            })
+        );
         for bad in [
+            "1 core core",
+            "1 core-only core-only",
             "1 caller=x",
             "1 caller=2 caller=3",
             "",

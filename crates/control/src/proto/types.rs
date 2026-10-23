@@ -1843,6 +1843,42 @@ pub struct LockStatus {
     /// Grants a delegation move installed here carrying what was left of
     /// their record instead of a restamp (every moved grant does).
     pub moved_carried: u64,
+    /// Plan 41: the renewal lane beside the authority core.
+    #[serde(default)]
+    pub lane: LockLaneStatus,
+}
+
+/// Plan 41 L3/L4: the lock renewal lane (`LockStatus::lane`). It renews
+/// this node's own grants and the ones it holds at an owner from the
+/// certificate its authority core publishes, while the core is busy or
+/// stuck (a metadata write behind a slow journal write).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct LockLaneStatus {
+    /// The lane runs (`CONSTELLATION_LOCK_LANE`, default on).
+    pub enabled: bool,
+    /// This node's own grants it extended at its own owner table.
+    pub own_renewals: u64,
+    /// Renewals of held grants it sent to their owner, and the granted ones
+    /// it applied (the answer's `Ok`; `late_ok` after it had given up on
+    /// the request).
+    pub remote_sent: u64,
+    pub remote_ok: u64,
+    pub late_ok: u64,
+    /// Due renewals it left to the core (no owner known), and ones it did
+    /// not send because the driver had been stuck past
+    /// `CONSTELLATION_LOCK_LANE_MAX_STALL_MS`.
+    pub deferred: u64,
+    pub stall_stops: u64,
+    /// Ticks that found grants held, those of them at which the core was
+    /// stuck in a step, and due own grants the core's certificate did not
+    /// cover.
+    pub ticks: u64,
+    pub stuck_ticks: u64,
+    pub uncovered: u64,
+    /// The longest the core had been stuck at a tick (ms).
+    pub max_stuck_ms: u64,
+    /// Requests waiting for an answer now.
+    pub in_flight: u64,
 }
 
 /// One lock owner fenced on this node (`LockStatus::fenced_owners`).
