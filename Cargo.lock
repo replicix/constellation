@@ -1288,6 +1288,7 @@ dependencies = [
  "postcard",
  "serde",
  "serde_json",
+ "smallvec",
  "tempfile",
  "tracing",
 ]

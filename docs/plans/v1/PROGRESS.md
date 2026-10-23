@@ -58460,3 +58460,41 @@ configurations, negative controls and seeds noted above. Harness 5 of 5
 each: `lock-stall-lone-node`, `lock-store-stall-past-lease`,
 `delegate-store-stall` (and its root-stalled arm; with the root lane off it
 fails `KNOWN-GAP root core stuck`).
+
+## Fix: an attribute reply may mark several inodes of one task (plan 40 P6a, plan 42 F21)
+
+`attrwatch` kept one mark per task, so a reply that installs several inodes in
+one syscall (plan 40's `READDIRPLUS` page) would have left only its last entry
+marked: a namespace change of an earlier entry's inode would find no mark and
+write no notice, which re-opens race 2b for it. A task's record is now a set of
+inodes under one mark id (`TaskMarks`, inline for one inode, so the
+single-inode path allocates nothing), and `AttrWatch::replying_each` adds an
+inode to the set of the task's current request where `replying` replaces the
+task's mark. The task's next request discharges the whole set; a notice for
+one inode releases that inode's mark only. Marks are still dropped on
+evidence, never by time. `MARKS_MAX` counts inodes. A pid-0 reply keeps one
+mark per inode, superseding as before. When the table is full a single-inode
+reply writes its notice at once (as before); `replying_each` answers
+`Replying::Full` instead, and the page leaves that entry name-only (no
+attributes, no kernel reference), so a large listing by a pid-0 lister (an
+`nfsd` re-export) is not a notice per entry. Nothing calls `replying_each`
+yet: plan 40 P6 does.
+
+Tests (`attrwatch` unit): a reply of many inodes keeps every mark, the next
+request discharges the set, an inode named twice is one mark, a single reply
+replaces the set, a change during a page notices that entry only, the bound
+counts inodes (and the full answers), pages sweep the sets of exited tasks, a
+release spares a newer set, a page and changes never both miss each other (two
+threads), and a consistency stress of pages, replies, requests, changes and
+exits over eight threads. Nine of them fail on the one-mark-per-task code
+(checked with `replying_each` as an alias of `replying`).
+
+Measured (release, `attrwatch::tests::cost`, the box shared, alternating
+builds, seven runs each, three for eight threads): one thread 131 to 187 ns against 140 to 191
+(medians 153 and 163, within the box's noise), four threads 510 to 796 against
+554 to 707, eight threads 1 080 to 1 341 against 1 079 to 1 167; the sweep of
+32 768 marks 3.9 to 6.5 ms against 4.1 to 9.2 ms. `open` does not touch the
+watch. Harness at L0, seed 42, a debug build: `kernel-race-dir-nlink`,
+`-dir-version`, `-rename-ctime`, `-dir-version-remote` and
+`-dir-ttl-strict-lone`, each on both transports: PASSED (0 mismatches, 0 stale
+of 20).

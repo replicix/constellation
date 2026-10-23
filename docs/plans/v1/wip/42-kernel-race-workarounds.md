@@ -970,19 +970,28 @@ adapter tracks both:
    "some such reply may be uninstalled" until a notice is written for the
    inode (a pid-0 task that keeps reading a directory another task keeps
    changing therefore costs one notice per change, as `on` would, but not
-   one per read).
-3. **No room.** The table is bounded (32 768 marks of tasks with an id
-   and 32 768 for pid 0, separately, a few MiB each): at most one mark per
-   live task id and one per inode for pid 0. A full table
+   one per read). A reply that installs several inodes in one syscall
+   (plan 40's `READDIRPLUS` page) adds each inode to the task's one set of
+   marks (`replying_each`) instead of replacing the task's mark, so a change
+   of any of them finds its mark; the task's next request discharges the
+   set, a notice discharges its inode's mark and leaves the others.
+3. **No room.** The table is bounded (32 768 marks (inodes) of tasks with
+   an id and 32 768 for pid 0, separately, a few MiB each): the marks of
+   at most one reply per live task id (a page's worth) and one per inode
+   for pid 0. A full table
    first drops the marks of exited tasks (a sweep, at most every 100 ms,
    so a table full of live marks is not scanned per reply); if it is still
-   full the reply **writes its notice at once, before the reply** (the
-   request was sent before the notice, so the kernel rejects exactly this
-   reply) and keeps no mark, and that notice also discharges the inode's
-   marks, which makes room: it costs a `GETATTR` per reply while the table
-   is full, never a stale attribute. A pid-0 reply of an inode that has a
-   pid-0 mark replaces it in place and needs no room, so re-reading a tree
-   the table is full of costs no notice.
+   full a single-inode reply **writes its notice at once, before the
+   reply** (the request was sent before the notice, so the kernel rejects
+   exactly this reply) and keeps no mark, and that notice also discharges
+   the inode's marks, which makes room: it costs a `GETATTR` per reply
+   while the table is full, never a stale attribute. An entry of a
+   several-inode reply instead gets `Full` and goes **name-only** (no
+   attributes, no kernel reference: nothing is installed for it, so
+   nothing needs a mark, and the kernel looks the name up when it needs
+   it; a notice per entry would be a storm). A pid-0 reply of an inode
+   that has a pid-0 mark replaces it in place and needs no room, so
+   re-reading a tree the table is full of costs no notice.
 
 Each side records its fact, issues a full fence and reads the other's, so
 at least one of them sees the other (the same store-buffering argument as a

@@ -13,6 +13,8 @@ constellation-platform.workspace = true
 fuser = { workspace = true, features = ["serializable"] }
 libc.workspace = true
 serde.workspace = true
+# `attrwatch`: a task's marks of one reply, inline for one inode.
+smallvec = "1.15"
 tracing.workspace = true
 
 [features]

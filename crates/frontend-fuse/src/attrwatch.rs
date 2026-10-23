@@ -61,21 +61,43 @@
 //! have no task id to ask or clear: one mark per inode stands for "some
 //! such reply may be uninstalled" until a notice is written for the inode.
 //!
-//! The table is bounded: [`MARKS_MAX`] marks of tasks with an id and as
-//! many for pid 0, separately, so a pid-0 client reading a large tree
-//! cannot take the room of the others. It holds at most one mark per live
-//! task id and one per inode for pid 0, so it reaches the bound only with
-//! that many tasks idle after a reply, or a pid-0 task that read that many
-//! inodes since they were last changed. A full table first sweeps the marks of exited tasks (at most
-//! once per [`SWEEP_EVERY`], so a table full of live ones is not scanned
-//! per reply); if it is still full the reply **writes its notice at once,
-//! before the reply** (the request was sent before the notice, so the
-//! kernel rejects exactly this reply), and no mark is needed. That costs a
-//! `GETATTR` per reply, never a stale attribute.
+//! **A reply may carry several inodes** (plan 40: a `READDIRPLUS` page
+//! installs one dentry and inode per entry, all in the task's `getdents`).
+//! [`AttrWatch::replying_each`] adds one inode to the set of marks the
+//! task's current request has made so far, under the one mark id, instead
+//! of replacing the task's mark as [`AttrWatch::replying`] does (one
+//! inode: `GETATTR`, `LOOKUP`, `SETATTR`, a single entry). The set is
+//! discharged as a whole by the task's next request, and by the inode: a
+//! notice for one of its inodes releases that inode's mark and leaves the
+//! others. A task's request is answered by one thread at a time, so the
+//! set is built by one caller in a row; a pid-0 reply has no task to hold
+//! them together and marks each inode on its own, as above.
+//!
+//! The table is bounded: [`MARKS_MAX`] marks (inodes) of tasks with an id
+//! and as many for pid 0, separately, so a pid-0 client reading a large
+//! tree cannot take the room of the others. It holds at most one mark per
+//! live task id (a set of at most one page) and one per inode for pid 0,
+//! so it reaches the bound only with that many inodes marked by tasks idle
+//! after a reply, or a pid-0 task that read that many inodes since they
+//! were last changed. A full table first sweeps the marks of exited tasks
+//! (at most once per [`SWEEP_EVERY`], so a table full of live ones is not
+//! scanned per reply); if it is still full:
+//!
+//! - a single-inode reply **writes its notice at once, before the reply**
+//!   (the request was sent before the notice, so the kernel rejects
+//!   exactly this reply), and no mark is needed. That costs a `GETATTR`
+//!   per reply, never a stale attribute;
+//! - a reply of several inodes gets [`Replying::Full`] and leaves that
+//!   inode out (a `READDIRPLUS` entry goes name-only: the kernel looks the
+//!   name up when it needs it). A notice per entry would be a storm, and
+//!   each would also make the kernel reject the attributes the page
+//!   installs. Nothing is installed for it, so nothing needs a mark.
+//!
 //! `CONSTELLATION_FUSE_DIR_CHANGE_NOTIFY=on` notices every operation.
 
 use crate::refs::Mix;
 use constellation_vfs::Ino;
+use smallvec::SmallVec;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::hash::BuildHasherDefault;
@@ -220,13 +242,54 @@ impl Arrival {
     }
 }
 
-/// What a task's mark says: the inode its reply was for.
+/// One mark: the inode a reply was for, and the id of the set it is in.
 #[derive(Debug, Clone, Copy)]
-struct Task {
+struct Mark {
     ino: Ino,
-    /// Unique per mark: a removal names the mark it found, never a newer
+    /// Unique per set: a removal names the mark it found, never a newer
     /// one of the same task.
     id: u64,
+}
+
+/// What a task's marks say: the inodes its current reply was for (one,
+/// except for a reply of several inodes), under one id.
+#[derive(Debug, Clone)]
+struct TaskMarks {
+    /// Never empty while the record is held.
+    inos: SmallVec<[Ino; 1]>,
+    id: u64,
+}
+
+impl TaskMarks {
+    fn one(ino: Ino, id: u64) -> Self {
+        Self {
+            inos: SmallVec::from_buf([ino]),
+            id,
+        }
+    }
+}
+
+/// What [`AttrWatch::record`] did to a task's record.
+struct Recorded {
+    /// The set's id the mark goes under.
+    id: u64,
+    /// The set a single-inode reply replaced.
+    replaced: Option<TaskMarks>,
+    /// Whether the inode is a new mark (to index). Not when a reply of
+    /// several inodes names an inode its set already holds.
+    fresh: bool,
+}
+
+/// What a reply of several inodes does for one of them.
+#[derive(Debug)]
+#[must_use = "a notice must be written and released; Full leaves the inode out"]
+pub(crate) enum Replying {
+    /// The inode is marked; nothing to write first.
+    Clear,
+    /// Write the notice for the inode before the reply, then release.
+    Notice(Found),
+    /// No room for another mark: leave the inode out of the reply.
+    Full,
 }
 
 /// Marks a notice is being written for, `(key, ino, id)`: discharged by
@@ -279,24 +342,24 @@ impl Changes {
 
 /// The session's record of attribute replies in flight.
 ///
-/// Two maps over the same marks: by task (to clear a task's mark when its
+/// Two maps over the same marks: by task (to clear a task's marks when its
 /// next request arrives) and by inode (to find the marks of a changed inode
 /// in one lookup). `inodes` is what a mark *is*: a notice finds a mark
-/// there. `tasks` holds a mark's record, for the clearing, the count, and
+/// there. `tasks` holds a task's marks, for the clearing, the count, and
 /// the bound, and is a superset: a mark goes in `tasks` first and out of it
 /// last, so a key in `inodes` always has its task record (the invariant
 /// the tests check). No operation holds both locks.
 pub(crate) struct AttrWatch {
     changes: Changes,
     /// By task key (task id, or an anonymous key).
-    tasks: Vec<Padded<Mutex<HashMap<u64, Task, Hash>>>>,
+    tasks: Vec<Padded<Mutex<HashMap<u64, TaskMarks, Hash>>>>,
     /// By inode: the `(task key, mark id)` of its marks.
     inodes: Vec<Padded<Mutex<HashMap<Ino, Chain, Hash>>>>,
     /// Keys for the marks of requests without a pid.
     anonymous: AtomicU64,
-    /// [`Task::id`]s.
+    /// [`TaskMarks::id`]s.
     ids: AtomicU64,
-    /// Task records held: of tasks with an id, and of pid 0. A change
+    /// Marks (inodes) held: of tasks with an id, and of pid 0. A change
     /// finds no mark without taking a lock when both are 0 (a single
     /// task's reply is installed before its next request, so its own
     /// changes find none).
@@ -305,7 +368,8 @@ pub(crate) struct AttrWatch {
     max: usize,
     /// When the table was last swept for exited tasks.
     swept: Mutex<Option<Instant>>,
-    /// Times a reply found the table full and wrote its notice at once.
+    /// Times a reply found the table full (it wrote its notice at once, or
+    /// left the inode out).
     full: AtomicU64,
     /// Whether a task id still exists (`task_exists`; replaced in tests).
     exists: Box<dyn Fn(u32) -> bool + Send + Sync>,
@@ -333,7 +397,7 @@ impl AttrWatch {
         }
     }
 
-    fn task_shard(&self, key: u64) -> &Mutex<HashMap<u64, Task, Hash>> {
+    fn task_shard(&self, key: u64) -> &Mutex<HashMap<u64, TaskMarks, Hash>> {
         &self.tasks[key as usize % SHARDS]
     }
 
@@ -349,8 +413,10 @@ impl AttrWatch {
             let key = u64::from(tid);
             let task = self.task_shard(key).lock().unwrap().remove(&key);
             if let Some(task) = task {
-                self.held[0].fetch_sub(1, Ordering::Relaxed);
-                self.unindex(key, task);
+                self.held[0].fetch_sub(task.inos.len(), Ordering::Relaxed);
+                for &ino in &task.inos {
+                    self.unindex(key, Mark { ino, id: task.id });
+                }
             }
         }
         Arrival {
@@ -361,41 +427,62 @@ impl AttrWatch {
         }
     }
 
-    /// The request replies with the attributes of `ino`. `Some` when the
-    /// reply must be preceded by a notice for `ino`: a change of it was
-    /// recorded since the request arrived, or the table of marks is full.
-    /// The marks of `ino`, to [`Self::release`] once the notice is
-    /// written.
+    /// The request replies with the attributes of `ino` (and with no
+    /// other inode's: the task's mark is this one). `Some` when the reply
+    /// must be preceded by a notice for `ino`: a change of it was recorded
+    /// since the request arrived, or the table of marks is full. The marks
+    /// of `ino`, to [`Self::release`] once the notice is written.
     pub(crate) fn replying(&self, a: Arrival, ino: Ino) -> Option<Found> {
-        let t = a.track?;
-        if !self.mark(t.tid, ino) {
-            self.full.fetch_add(1, Ordering::Relaxed);
+        match self.reply(a, ino, false) {
+            Replying::Clear => None,
+            Replying::Notice(found) => Some(found),
             // The notice discharges the inode's marks too: room for the
             // next reply.
-            return Some(self.find(&[ino]).1);
+            Replying::Full => Some(self.find(&[ino]).1),
+        }
+    }
+
+    /// The request replies with the attributes of several inodes, one call
+    /// each, all installed by the task's next syscall: the call **adds**
+    /// `ino` to the set of marks this request has made (module doc),
+    /// where [`Self::replying`] makes it the task's only mark.
+    /// [`Replying::Notice`]: the same as `replying`'s `Some`.
+    /// [`Replying::Full`]: no room and none could be made; nothing was
+    /// marked and nothing is written, the caller leaves the inode out.
+    // Plan 40 P6 (`READDIRPLUS`) is the caller.
+    #[allow(dead_code)]
+    pub(crate) fn replying_each(&self, a: Arrival, ino: Ino) -> Replying {
+        self.reply(a, ino, true)
+    }
+
+    fn reply(&self, a: Arrival, ino: Ino, each: bool) -> Replying {
+        let Some(t) = a.track else {
+            return Replying::Clear;
+        };
+        if !self.mark(t.tid, ino, each) {
+            self.full.fetch_add(1, Ordering::Relaxed);
+            return Replying::Full;
         }
         fence(Ordering::SeqCst);
         if self.changes.seq.load(Ordering::Acquire) == t.seq {
-            return None;
+            return Replying::Clear;
         }
         if self.changes.touched_since(t.seq, ino) {
-            return Some(self.find(&[ino]).1);
+            return Replying::Notice(self.find(&[ino]).1);
         }
-        None
+        Replying::Clear
     }
 
-    /// Records the reply of `tid` for `ino`; `false` when the table is full
-    /// and sweeping exited tasks did not make room.
-    fn mark(&self, tid: u32, ino: Ino) -> bool {
+    /// Records the reply of `tid` for `ino` (`each`: in the set of the
+    /// task's current request); `false` when the table is full and
+    /// sweeping exited tasks did not make room.
+    fn mark(&self, tid: u32, ino: Ino, each: bool) -> bool {
         let key = if tid == 0 {
             ANONYMOUS | self.anonymous.fetch_add(1, Ordering::Relaxed)
         } else {
             u64::from(tid)
         };
-        let task = Task {
-            ino,
-            id: self.ids.fetch_add(1, Ordering::Relaxed),
-        };
+        let id = self.ids.fetch_add(1, Ordering::Relaxed);
         // A pid-0 reply of an inode that has a pid-0 mark replaces it (the
         // mark below supersedes it): it needs no room, a re-read of a tree
         // the table is full of costs no notice.
@@ -406,59 +493,103 @@ impl AttrWatch {
                 .unwrap()
                 .get(&ino)
                 .is_some_and(Chain::has_anonymous);
-        let Some(replaced) = self.record(key, task, over).or_else(|| {
+        let Some(rec) = self.record(key, ino, id, each, over).or_else(|| {
             (!anonymous(key) && self.sweep())
-                .then(|| self.record(key, task, false))
+                .then(|| self.record(key, ino, id, each, false))
                 .flatten()
         }) else {
             return false;
         };
+        let mark = Mark { ino, id: rec.id };
         // After the task record (see the type's doc), before the fence.
-        let superseded = self.index(key, task);
+        let superseded = if rec.fresh {
+            self.index(key, mark)
+        } else {
+            Vec::new()
+        };
         if over && superseded.is_empty() && self.held[1].load(Ordering::Relaxed) > self.max {
             // The mark it meant to replace went meanwhile: no room after
             // all.
-            self.discharge(key, task);
+            self.discharge(key, mark);
             return false;
         }
-        if let Some(old) = replaced {
-            self.unindex(key, old);
+        if let Some(old) = rec.replaced {
+            for &i in &old.inos {
+                self.unindex(key, Mark { ino: i, id: old.id });
+            }
         }
         // An older reply of this inode to a pid-0 task is covered by the
         // notice this mark will get: one mark per inode stands for both.
         for (k, id) in superseded {
-            self.discharge(k, Task { ino, id });
+            self.discharge(k, Mark { ino, id });
         }
         true
     }
 
-    /// Stores `task` under `key`: `Some(old record of the key)`, or `None`
-    /// when a new record does not fit (`over`: it may exceed the bound by
-    /// one, a mark it supersedes is about to go).
-    fn record(&self, key: u64, task: Task, over: bool) -> Option<Option<Task>> {
+    /// Stores the mark in `key`'s record. `each`: in the record's set when
+    /// it has one (a set the inode is in already takes no room), else a
+    /// new record of one; without it the record is replaced by one of this
+    /// inode alone. `None` when a new mark does not fit (`over`: it may
+    /// exceed the bound by one, a mark it supersedes is about to go).
+    fn record(&self, key: u64, ino: Ino, id: u64, each: bool, over: bool) -> Option<Recorded> {
+        let held = &self.held[usize::from(anonymous(key))];
         let mut shard = self.task_shard(key).lock().unwrap();
         match shard.entry(key) {
-            Entry::Occupied(mut e) => Some(Some(e.insert(task))),
-            Entry::Vacant(e) => {
-                let held = &self.held[usize::from(anonymous(key))];
+            Entry::Occupied(mut e) if each => {
+                let marks = e.get_mut();
+                if marks.inos.contains(&ino) {
+                    return Some(Recorded {
+                        id: marks.id,
+                        replaced: None,
+                        fresh: false,
+                    });
+                }
                 if held.fetch_add(1, Ordering::Relaxed) >= self.max && !over {
                     held.fetch_sub(1, Ordering::Relaxed);
                     return None;
                 }
-                e.insert(task);
-                Some(None)
+                marks.inos.push(ino);
+                Some(Recorded {
+                    id: marks.id,
+                    replaced: None,
+                    fresh: true,
+                })
+            }
+            Entry::Occupied(mut e) => {
+                // One mark replaces the set: the count only goes down.
+                let old = e.insert(TaskMarks::one(ino, id));
+                if old.inos.len() > 1 {
+                    held.fetch_sub(old.inos.len() - 1, Ordering::Relaxed);
+                }
+                Some(Recorded {
+                    id,
+                    replaced: Some(old),
+                    fresh: true,
+                })
+            }
+            Entry::Vacant(e) => {
+                if held.fetch_add(1, Ordering::Relaxed) >= self.max && !over {
+                    held.fetch_sub(1, Ordering::Relaxed);
+                    return None;
+                }
+                e.insert(TaskMarks::one(ino, id));
+                Some(Recorded {
+                    id,
+                    replaced: None,
+                    fresh: true,
+                })
             }
         }
     }
 
     /// Adds the mark to its inode's index. Returns the pid-0 marks of the
     /// inode it supersedes.
-    fn index(&self, key: u64, task: Task) -> Vec<(u64, u64)> {
-        let mut shard = self.inode_shard(task.ino).lock().unwrap();
+    fn index(&self, key: u64, mark: Mark) -> Vec<(u64, u64)> {
+        let mut shard = self.inode_shard(mark.ino).lock().unwrap();
         let mut superseded = Vec::new();
-        match shard.entry(task.ino) {
+        match shard.entry(mark.ino) {
             Entry::Vacant(e) => {
-                e.insert(Chain::One(key, task.id));
+                e.insert(Chain::One(key, mark.id));
             }
             Entry::Occupied(mut e) => {
                 let chain = e.get_mut();
@@ -472,7 +603,7 @@ impl AttrWatch {
                         chain.remove(*k);
                     }
                 }
-                chain.insert(key, task.id);
+                chain.insert(key, mark.id);
             }
         }
         superseded
@@ -480,10 +611,10 @@ impl AttrWatch {
 
     /// Takes the mark out of its inode's index (if that mark is still the
     /// one there).
-    fn unindex(&self, key: u64, task: Task) {
-        let mut shard = self.inode_shard(task.ino).lock().unwrap();
-        if let Entry::Occupied(mut e) = shard.entry(task.ino) {
-            if e.get().get(key) == Some(task.id) {
+    fn unindex(&self, key: u64, mark: Mark) {
+        let mut shard = self.inode_shard(mark.ino).lock().unwrap();
+        if let Entry::Occupied(mut e) = shard.entry(mark.ino) {
+            if e.get().get(key) == Some(mark.id) {
                 e.get_mut().remove(key);
             }
             if e.get().is_empty() {
@@ -492,14 +623,25 @@ impl AttrWatch {
         }
     }
 
-    /// Drops the mark: out of the index first, then out of the task
-    /// records (only that mark: a newer one of the task stays).
-    fn discharge(&self, key: u64, task: Task) {
-        self.unindex(key, task);
+    /// Drops the mark: out of the index first, then out of the task's
+    /// record (only that mark: a newer set of the task stays, and so do
+    /// the other inodes of this one).
+    fn discharge(&self, key: u64, mark: Mark) {
+        self.unindex(key, mark);
         let mut shard = self.task_shard(key).lock().unwrap();
-        if shard.get(&key).is_some_and(|t| t.id == task.id) {
-            shard.remove(&key);
+        if let Entry::Occupied(mut e) = shard.entry(key) {
+            let marks = e.get_mut();
+            if marks.id != mark.id {
+                return;
+            }
+            let Some(at) = marks.inos.iter().position(|i| *i == mark.ino) else {
+                return;
+            };
+            marks.inos.swap_remove(at);
             self.held[usize::from(anonymous(key))].fetch_sub(1, Ordering::Relaxed);
+            if marks.inos.is_empty() {
+                e.remove();
+            }
         }
     }
 
@@ -516,17 +658,19 @@ impl AttrWatch {
         let mut freed = 0;
         for shard in &self.tasks {
             // The probes run outside the lock: a shard holds thousands.
-            let tasks: Vec<(u64, Task)> = shard
+            let tasks: Vec<(u64, TaskMarks)> = shard
                 .lock()
                 .unwrap()
                 .iter()
                 .filter(|(k, _)| !anonymous(**k))
-                .map(|(k, t)| (*k, *t))
+                .map(|(k, t)| (*k, t.clone()))
                 .collect();
             for (key, task) in tasks {
                 if !(self.exists)(key as u32) {
-                    self.discharge(key, task);
-                    freed += 1;
+                    for &ino in &task.inos {
+                        self.discharge(key, Mark { ino, id: task.id });
+                        freed += 1;
+                    }
                 }
             }
         }
@@ -567,7 +711,7 @@ impl AttrWatch {
                 .unwrap_or_default();
             for (key, id) in chain {
                 if !anonymous(key) && !(self.exists)(key as u32) {
-                    self.discharge(key, Task { ino, id });
+                    self.discharge(key, Mark { ino, id });
                     continue;
                 }
                 if !found.contains(&ino) {
@@ -584,19 +728,29 @@ impl AttrWatch {
     /// replaced, is left alone).
     pub(crate) fn release(&self, found: Found) {
         for (key, ino, id) in found.0 {
-            self.discharge(key, Task { ino, id });
+            self.discharge(key, Mark { ino, id });
         }
     }
 
-    /// Task records held.
+    /// Marks (inodes) held.
     fn held(&self) -> usize {
         self.held[0].load(Ordering::Relaxed) + self.held[1].load(Ordering::Relaxed)
     }
 
-    /// Marks held (tests, `node.status` has no use for it).
+    /// Marks held, counted in the records (tests, `node.status` has no use
+    /// for it).
     #[cfg(test)]
     fn marks(&self) -> usize {
-        self.tasks.iter().map(|s| s.lock().unwrap().len()).sum()
+        self.tasks
+            .iter()
+            .map(|s| {
+                s.lock()
+                    .unwrap()
+                    .values()
+                    .map(|t| t.inos.len())
+                    .sum::<usize>()
+            })
+            .sum()
     }
 }
 
@@ -621,30 +775,45 @@ mod tests {
     }
 
     /// The two maps agree: every indexed mark has its task record, and the
-    /// count is the number of records.
+    /// count is the number of marks in the records.
     fn check(w: &AttrWatch) {
-        let tasks: HashMap<u64, Task> = w
+        let tasks: HashMap<u64, TaskMarks> = w
             .tasks
             .iter()
             .flat_map(|s| {
                 s.lock()
                     .unwrap()
                     .iter()
-                    .map(|(k, t)| (*k, *t))
+                    .map(|(k, t)| (*k, t.clone()))
                     .collect::<Vec<_>>()
             })
             .collect();
-        assert_eq!(tasks.len(), w.held(), "count");
-        let anon = tasks.keys().filter(|k| anonymous(**k)).count();
+        for t in tasks.values() {
+            assert!(!t.inos.is_empty(), "an empty record is dropped");
+            let distinct: HashSet<_> = t.inos.iter().collect();
+            assert_eq!(distinct.len(), t.inos.len(), "an inode once per set");
+        }
+        let count = |anon: bool| -> usize {
+            tasks
+                .iter()
+                .filter(|(k, _)| anonymous(**k) == anon)
+                .map(|(_, t)| t.inos.len())
+                .sum()
+        };
+        let (anon, named) = (count(true), count(false));
+        assert_eq!(anon + named, w.held(), "count");
         assert_eq!(anon, w.held[1].load(Ordering::Relaxed), "pid-0 count");
-        assert!(anon <= w.max && tasks.len() - anon <= w.max, "bound");
+        assert!(anon <= w.max && named <= w.max, "bound");
         for (i, s) in w.inodes.iter().enumerate() {
             for (ino, chain) in s.lock().unwrap().iter() {
                 assert_eq!(*ino as usize % SHARDS, i, "shard");
                 assert!(!chain.is_empty(), "an empty chain is dropped");
                 for (key, id) in chain.entries() {
                     let t = tasks.get(&key).expect("an indexed mark has its record");
-                    assert_eq!((t.ino, t.id), (*ino, id), "the record is that mark");
+                    assert!(
+                        t.inos.contains(ino) && t.id == id,
+                        "the record holds that mark"
+                    );
                 }
             }
         }
@@ -660,6 +829,27 @@ mod tests {
     /// A reply whose notice, if any, is written at once.
     fn reply(w: &AttrWatch, a: Arrival, ino: Ino) -> bool {
         w.replying(a, ino).map(|m| w.release(m)).is_some()
+    }
+
+    /// What one inode of a reply of several came to.
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    enum Each {
+        Marked,
+        Noticed,
+        Full,
+    }
+
+    /// One inode of a reply of several, its notice, if any, written at
+    /// once.
+    fn each(w: &AttrWatch, a: Arrival, ino: Ino) -> Each {
+        match w.replying_each(a, ino) {
+            Replying::Clear => Each::Marked,
+            Replying::Notice(m) => {
+                w.release(m);
+                Each::Noticed
+            }
+            Replying::Full => Each::Full,
+        }
     }
 
     #[test]
@@ -1159,6 +1349,388 @@ mod tests {
             }
         }
         assert_eq!(missed.load(Ordering::Relaxed), 0);
+    }
+
+    /// Plan 40 P6a: a reply of several inodes (a `READDIRPLUS` page) keeps
+    /// every one marked, so a change of the first still finds its mark.
+    /// (Failed when a task kept one mark: the last entry's.)
+    #[test]
+    fn a_reply_of_many_inodes_keeps_every_mark() {
+        let w = watch();
+        let a = w.arrive(7);
+        for ino in [100, 101, 102] {
+            assert_eq!(each(&w, a, ino), Each::Marked);
+        }
+        assert_eq!((w.marks(), w.held()), (3, 3));
+        check(&w);
+        // The first entry's inode changes: its mark is there.
+        assert_eq!(change(&w, &[100]), vec![100]);
+        assert_eq!(w.marks(), 2, "only that inode's mark is discharged");
+        check(&w);
+        let mut found = change(&w, &[101, 102, 103]);
+        found.sort_unstable();
+        assert_eq!(found, vec![101, 102]);
+        assert_eq!(w.marks(), 0);
+        check(&w);
+    }
+
+    /// The contrast: a single-inode reply per entry (what a page would
+    /// do without `replying_each`) leaves the last one marked.
+    #[test]
+    fn a_single_inode_reply_per_entry_keeps_only_the_last_mark() {
+        let w = watch();
+        let a = w.arrive(7);
+        for ino in [100, 101, 102] {
+            assert!(!reply(&w, a, ino));
+        }
+        assert_eq!(w.marks(), 1);
+        assert!(change(&w, &[100]).is_empty(), "race 2b would be open");
+        assert_eq!(change(&w, &[102]), vec![102]);
+    }
+
+    #[test]
+    fn the_tasks_next_request_discharges_the_whole_set() {
+        let w = watch();
+        let a = w.arrive(7);
+        for ino in [100, 101, 102] {
+            each(&w, a, ino);
+        }
+        let b = w.arrive(8);
+        for ino in [200, 201] {
+            each(&w, b, ino);
+        }
+        assert_eq!(w.marks(), 5);
+        // Another task's request leaves the set alone.
+        w.arrive(9);
+        assert_eq!(w.marks(), 5);
+        w.arrive(7);
+        assert_eq!((w.marks(), w.held()), (2, 2));
+        check(&w);
+        assert!(change(&w, &[100, 101, 102]).is_empty(), "installed");
+        assert_eq!(change(&w, &[200]), vec![200]);
+        // The next request is also a reply: it starts a set of its own.
+        let a = w.arrive(8);
+        assert_eq!(each(&w, a, 300), Each::Marked);
+        assert_eq!(w.marks(), 1);
+        check(&w);
+    }
+
+    /// An inode named twice by one reply is one mark (a hard link listed
+    /// twice).
+    #[test]
+    fn an_inode_named_twice_by_a_reply_is_one_mark() {
+        let w = watch();
+        let a = w.arrive(7);
+        for ino in [100, 101, 100, 100] {
+            assert_eq!(each(&w, a, ino), Each::Marked);
+        }
+        assert_eq!((w.marks(), w.held()), (2, 2));
+        check(&w);
+        assert_eq!(change(&w, &[100]), vec![100]);
+        assert_eq!(w.marks(), 1);
+        check(&w);
+    }
+
+    /// A single-inode reply replaces the task's whole set, and gives its
+    /// room back.
+    #[test]
+    fn a_single_inode_reply_replaces_the_set() {
+        let w = watch();
+        let a = w.arrive(7);
+        for ino in [100, 101, 102] {
+            each(&w, a, ino);
+        }
+        let again = w.arrive(7);
+        assert_eq!((w.marks(), w.held()), (0, 0));
+        assert!(!reply(&w, again, 100));
+        assert!(!reply(&w, again, 101));
+        assert_eq!((w.marks(), w.held()), (1, 1));
+        check(&w);
+        assert!(change(&w, &[100]).is_empty());
+        assert_eq!(change(&w, &[101]), vec![101]);
+    }
+
+    /// An entry whose inode changed while the page was being built gets
+    /// its notice at once; the others stay marked.
+    #[test]
+    fn a_change_during_a_page_notices_that_entry_only() {
+        let w = watch();
+        let a = w.arrive(7);
+        assert_eq!(each(&w, a, 100), Each::Marked);
+        // 101 changes after the request arrived, before its entry is built.
+        assert!(change(&w, &[101]).is_empty(), "no mark for 101 yet");
+        assert_eq!(each(&w, a, 101), Each::Noticed);
+        assert_eq!(each(&w, a, 102), Each::Marked);
+        assert_eq!(w.marks(), 2, "the notice released 101's mark");
+        check(&w);
+        // And a change of an earlier entry, during the page, finds it.
+        assert_eq!(change(&w, &[100]), vec![100]);
+        assert_eq!(each(&w, a, 103), Each::Marked);
+        assert_eq!(w.marks(), 2);
+        check(&w);
+    }
+
+    /// A pid-0 page marks each inode on its own (superseding, one per
+    /// inode, as a single reply does).
+    #[test]
+    fn a_pid_0_page_marks_each_inode_once() {
+        let w = watch();
+        for _ in 0..3 {
+            let a = w.arrive(0);
+            for ino in [100, 101, 102] {
+                assert_eq!(each(&w, a, ino), Each::Marked);
+            }
+        }
+        assert_eq!(w.marks(), 3, "one mark per inode");
+        check(&w);
+        assert_eq!(change(&w, &[101]), vec![101]);
+        assert_eq!(w.marks(), 2);
+        // Its "next request" clears nothing.
+        w.arrive(0);
+        assert_eq!(change(&w, &[100, 102]), vec![100, 102]);
+        assert_eq!(w.marks(), 0);
+        check(&w);
+    }
+
+    /// The bound counts inodes, not tasks: one task's page can fill the
+    /// table, and a task with room for none more is told so.
+    #[test]
+    fn the_bound_counts_inodes() {
+        let (w, _) = watch_of(5);
+        let a = w.arrive(1);
+        for ino in 100..103 {
+            assert_eq!(each(&w, a, ino), Each::Marked);
+        }
+        let b = w.arrive(2);
+        for ino in 200..202 {
+            assert_eq!(each(&w, b, ino), Each::Marked);
+        }
+        assert_eq!(w.marks(), 5);
+        // Full: another inode of a task that has a set, a new task.
+        assert_eq!(each(&w, a, 103), Each::Full);
+        assert_eq!(each(&w, b, 203), Each::Full);
+        let c = w.arrive(3);
+        assert_eq!(each(&w, c, 300), Each::Full);
+        assert_eq!(w.marks(), 5, "nothing was added");
+        assert_eq!(w.full.load(Ordering::Relaxed), 3);
+        // An inode the set holds takes no room.
+        assert_eq!(each(&w, a, 101), Each::Marked);
+        check(&w);
+        // The marks stay: a Full left the page's earlier entries covered.
+        assert_eq!(change(&w, &[100]), vec![100]);
+        // The notice made room for one inode; a task's next request makes
+        // room for its whole set.
+        assert_eq!(each(&w, c, 300), Each::Marked);
+        assert_eq!(each(&w, c, 301), Each::Full);
+        w.arrive(2);
+        assert_eq!(w.marks(), 3);
+        assert_eq!(each(&w, c, 301), Each::Marked);
+        assert_eq!(w.marks(), 4);
+        check(&w);
+        // pid 0 has room of its own, and counts inodes too.
+        for ino in 400..405 {
+            let a = w.arrive(0);
+            assert_eq!(each(&w, a, ino), Each::Marked);
+        }
+        let a = w.arrive(0);
+        assert_eq!(each(&w, a, 405), Each::Full);
+        // A re-read of a marked inode needs no room.
+        let a = w.arrive(0);
+        assert_eq!(each(&w, a, 404), Each::Marked);
+        assert_eq!(w.marks(), 9);
+        check(&w);
+    }
+
+    /// A reply of several inodes is told `Full`; a single-inode reply
+    /// writes its notice at once, as before.
+    #[test]
+    fn a_full_table_answers_full_to_a_many_inode_reply_and_notices_a_single_one() {
+        let (w, _) = watch_of(3);
+        let a = w.arrive(1);
+        for ino in 100..103 {
+            assert_eq!(each(&w, a, ino), Each::Marked);
+        }
+        let b = w.arrive(2);
+        assert_eq!(each(&w, b, 200), Each::Full);
+        assert!(matches!(w.replying_each(b, 200), Replying::Full));
+        assert_eq!(w.marks(), 3);
+        // The single-inode path, with the same arrival: a notice, no mark.
+        assert!(reply(&w, b, 200), "the notice goes before this reply");
+        assert_eq!(w.marks(), 3);
+        // That notice released the marks of its inode (here none); one of
+        // an inode that has one frees it.
+        assert!(
+            reply(&w, w.arrive(3), 101),
+            "full: noticed, and 101 released"
+        );
+        assert_eq!(w.marks(), 2);
+        assert_eq!(each(&w, b, 200), Each::Marked, "room again");
+        assert_eq!(w.full.load(Ordering::Relaxed), 4);
+        check(&w);
+    }
+
+    /// An exited task's marks are swept as a set to make room for a page.
+    #[test]
+    fn a_page_makes_room_by_sweeping_the_sets_of_exited_tasks() {
+        let (w, gone) = watch_of(4);
+        let a = w.arrive(1);
+        for ino in 100..104 {
+            each(&w, a, ino);
+        }
+        let b = w.arrive(2);
+        assert_eq!(each(&w, b, 200), Each::Full);
+        gone.lock().unwrap().insert(1);
+        std::thread::sleep(SWEEP_EVERY + Duration::from_millis(20));
+        let c = w.arrive(3);
+        assert_eq!(each(&w, c, 300), Each::Marked, "the set of 1 was swept");
+        assert_eq!(w.marks(), 1);
+        check(&w);
+        // A change that finds one mark of a gone task drops that mark.
+        let (w, gone) = watch_of(10);
+        let a = w.arrive(1);
+        for ino in 100..103 {
+            each(&w, a, ino);
+        }
+        gone.lock().unwrap().insert(1);
+        assert!(change(&w, &[100]).is_empty());
+        assert_eq!(w.marks(), 2);
+        check(&w);
+    }
+
+    /// An untracked request leaves no mark, for a page too.
+    #[test]
+    fn an_untracked_page_leaves_no_mark() {
+        let w = watch();
+        for ino in 1..4 {
+            assert_eq!(each(&w, Arrival::untracked(), ino), Each::Marked);
+        }
+        assert_eq!(w.marks(), 0);
+    }
+
+    /// A release spares a newer set of the task.
+    #[test]
+    fn a_release_spares_a_newer_set_of_the_task() {
+        let w = watch();
+        let a = w.arrive(7);
+        each(&w, a, 100);
+        each(&w, a, 101);
+        let (_, marks) = w.changed(&[100, 101]);
+        // The task installed, sent its next request and got another page.
+        let a = w.arrive(7);
+        each(&w, a, 100);
+        each(&w, a, 102);
+        w.release(marks);
+        assert_eq!(w.marks(), 2, "the new set stays");
+        check(&w);
+        assert_eq!(change(&w, &[100, 102]), vec![100, 102]);
+        assert_eq!(w.held(), 0);
+    }
+
+    /// Both orders of a page's reply against changes of its inodes, from
+    /// two threads: each inode's notice is written by one of them.
+    #[test]
+    fn a_page_and_changes_never_both_miss_each_other() {
+        use std::sync::Barrier;
+        let w = Arc::new(watch());
+        let missed = Arc::new(AtomicUsize::new(0));
+        for round in 0..1000u64 {
+            let base = 20_000 + round * 4;
+            let go = Arc::new(Barrier::new(2));
+            let (w1, go1) = (w.clone(), go.clone());
+            let reader = std::thread::spawn(move || {
+                let a = w1.arrive(1);
+                go1.wait();
+                (0..4)
+                    .map(|i| each(&w1, a, base + i) == Each::Noticed)
+                    .collect::<Vec<_>>()
+            });
+            go.wait();
+            let mut found = Vec::new();
+            for i in (0..4).rev() {
+                found.extend(change(&w, &[base + i]));
+            }
+            let wrote = reader.join().unwrap();
+            for i in 0..4 {
+                if !wrote[i as usize] && !found.contains(&(base + i)) {
+                    missed.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        assert_eq!(missed.load(Ordering::Relaxed), 0);
+        check(&w);
+    }
+
+    /// Pages, single replies, requests, changes and exits from eight
+    /// threads leave the two maps consistent, the bound held, and the table
+    /// empty once every task has gone on.
+    #[test]
+    fn pages_keep_the_maps_consistent_under_threads() {
+        let (w, gone) = watch_of(48);
+        let w = Arc::new(w);
+        let handles: Vec<_> = (0..8u32)
+            .map(|t| {
+                let (w, gone) = (w.clone(), gone.clone());
+                std::thread::spawn(move || {
+                    let mut x = 0x9e37_79b9_u64 + u64::from(t);
+                    for step in 0..10_000u64 {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        // Each thread owns its task ids (a task has one
+                        // request outstanding).
+                        let tid = ((x % 12) as u32 + 1) * 8 + t;
+                        let ino = (x >> 8) % 24;
+                        match (x >> 20) % 8 {
+                            0..=1 => {
+                                let a = w.arrive(tid);
+                                for k in 0..=(x >> 32) % 6 {
+                                    each(&w, a, (ino + k) % 24);
+                                }
+                            }
+                            2 => {
+                                let a = w.arrive(tid);
+                                reply(&w, a, ino);
+                            }
+                            3 => {
+                                w.arrive(tid);
+                            }
+                            4 => {
+                                change(&w, &[ino, (ino + 1) % 24, (ino + 2) % 24]);
+                            }
+                            5 => {
+                                let a = w.arrive(0);
+                                each(&w, a, ino);
+                            }
+                            6 => {
+                                let a = w.arrive(0);
+                                reply(&w, a, ino);
+                            }
+                            _ => {
+                                let mut g = gone.lock().unwrap();
+                                if step % 2 == 0 {
+                                    g.insert(tid);
+                                } else {
+                                    g.remove(&tid);
+                                }
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        check(&w);
+        gone.lock().unwrap().clear();
+        for tid in 1..=(13 * 8 + 8) {
+            w.arrive(tid);
+        }
+        for ino in 0..26 {
+            change(&w, &[ino]);
+        }
+        assert_eq!(w.marks(), 0, "every task went on, every inode noticed");
+        check(&w);
     }
 
     /// The real probe: this process's threads exist, an id nobody has
