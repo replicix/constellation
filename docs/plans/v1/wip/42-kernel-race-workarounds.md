@@ -1549,6 +1549,8 @@ A threshold "≥ M" applies to the base run and makes it a valid fail-before.
 | `kernel-race-rename-ctime` | `dir_version`'s pattern on a file: `stat(f)` whose `GETATTR` is held 200 ms (`CONSTELLATION_FAULT_GETATTR_DELAY_INO`), `rename(f, g)` meanwhile, then `stat(g)`: ctime must be the rename's | 20/20 old ctime | 0/20 (K5, W3b with the moved inode) |
 | `kernel-race-dir-version-remote` | two nodes: B `mkdir`s in the directory during A's delayed `stat` | 0 (the data notification bumps `attr_version`) | 0 (guard) |
 | `kernel-race-dir-ttl-strict-lone` | `nlink_race` on a lone `--cto strict` node (`lone_kernel_ttl` > 0, F8) | mismatches ≥ 20 | 0 (K5) |
+| `kernel-race-probe-exit` | the daemon's unmount 0, 0.3, 1.2 and 2.5 s after its mount (the kernel-fix probe may hold a reply of its own mount) | on a kernel with 0001: the daemon stays a zombie, 600 s wait | the daemon is gone within 30 s each time (§7.5) |
+| `kernel-race-repair-stall` | `CONSTELLATION_FUSE_WRITE_REPAIR=on`, `KEEP_CACHE=off`, repair bound 200 ms; 30 rounds each of: read two pages, write half a page (the tail page, left out of the repair) / read two pages, write both whole | kernel without 0001: no late repair, writes fast | kernel with 0001: half-page rounds 0 late (about 100 ms each); whole-page rounds one late repair per round and each write takes the bound (F10); stale 0 (§7.5) |
 
 ### 7.3 xcheckfs lockstep
 
@@ -1602,13 +1604,45 @@ the final build once with every §7.2 row at L0:
 - the probes report `WriteThroughWriteback` and `DirChangeBumpsVersion`
   `Fixed` (`node.status … verdicts`, `source: probe`), so W2 and W3b are
   off; W3a follows the table/override (no probe);
-- every race row is 0 with W2/W3 off (the kernel closes them);
-- with `CONSTELLATION_FUSE_WRITE_REPAIR=on` forced, `kernel-race-open-repair`
-  shows the F10 stall: `repairs_late` > 0 and `repair_wait_ms` at the bound
-  — the only check of the detection path before a release carries the
-  fixes;
+- every race row is 0 with W2 and the directory notices of W3b off (the
+  kernel closes them). `kernel-race-rename-ctime` needs more than 0003 as
+  first written: that patch bumps `attr_version` of the changed
+  *directory* only, so the moved inode's `ctime` (F16) stayed cached from a
+  reply that predates the rename (17 of 20 rounds with W3b's notice for it
+  off). Therefore W3b **keeps the moved inode's notice on a kernel with
+  0003** (the probe tests the directory case only and cannot tell a
+  kernel whose 0003 also covers the moved inode); with 0003 v2, which also
+  bumps the moved inode's version in `fuse_rename_common`, the row passes
+  with W3b fully off (`CONSTELLATION_FUSE_DIR_CHANGE_NOTIFY=off`);
+- with `CONSTELLATION_FUSE_WRITE_REPAIR=on` forced, the F10 stall shows in
+  `kernel-race-repair-stall` (a read of two pages, then a write of both
+  whole): `repairs_late` equals the rounds and each write takes the bound.
+  `kernel-race-open-repair` forced on shows no stall (`repairs_late` 0, 542
+  repairs): its writes are half pages, whose tail page the repair leaves out
+  (KF2), and `repair_wait_ms` counts only waits behind another request of
+  the inode, never the lane's own wait for `W`, so it stays 0 — `repairs_late`
+  is the stall's counter;
 - the same guest on the unpatched base kernel reports `NotFixed` from both
-  probes (the probes' fail-before).
+  probes (the probes' fail-before);
+- a daemon that exits while the probe is in flight does not hang on a
+  kernel with 0001 (`kernel-race-probe-exit`).
+
+**Recorded** (build `4488a6a6` plus the probe-exit fix and the moved-inode
+notice; guests 7.3.0-rc7, 6 vCPU, 6 GiB; 60 s rows, L0; "fix" is mainline
+`4056b3c9d3c9` with 0001–0003 as first written, "fix2" with 0003 v2, "base"
+without):
+
+| Kernel | Check | Result |
+|---|---|---|
+| fix, fix2 | probes | `WriteThroughWriteback` Fixed, `DirChangeBumpsVersion` Fixed, both `source: probe`; `AttrsValidAfterStore` NotFixed (table); `write_repair_on` false; `dir_change_notify_on` true and `dir_change_notify_dirs_on` false (the moved inodes' notice stays) |
+| fix | 22 rows, `/dev/fuse` and, with `fuse.enable_uring=1` on the kernel command line, the ring | `open`, `open-repair`, `-delay`, `notify`, `-foreign`, `unseen-drop`, `cfr`, `strict`, `handover`, `-keep`, `uncommitted` (3), `discard-local`, `other-view`, `rename-ctime`, `dir-nlink`, `dir-version`, `-remote`, `dir-ttl-strict-lone`, `probe-exit`, `repair-stall`: all pass, stale/corrupt/differing/mismatches 0, `repairs_late` 0 (`unseen-drop`: 1, allowed by R1; `repair-stall`: by design) |
+| fix2 | the same 22 rows | all pass |
+| fix2 | `rename-ctime`, W3b forced off | 0 of 20 stale, 0 notices written (fix with W3b's moved-inode notice off: 17 of 20) |
+| fix, fix2 | `repair-stall` | half page: 0 late, writes 107 ms (a repair of the neighbouring page waits about 100 ms; cause not investigated, base kernel: under 1 ms); whole pages: 30 late of 30, writes 208 ms at a 200 ms bound |
+| fix | forced `WRITE_REPAIR=on`, `open-repair` | stale 0, 542 repairs, 0 late (see above) |
+| base | probes | both NotFixed, `source: probe`; W2 and W3b on |
+| base | `repair-stall`, `probe-exit` | pass: no late repair, writes under 1 ms; daemon exit 101 ms |
+| fix, without the probe-exit fix | `probe-exit` | the daemon stays a zombie (two threads in `D`: `fuse_perform_write` waiting for the probe's held `WRITE`, `fuse_reverse_inval_inode` in `folio_wait_writeback`); 600 s wait |
 
 ## 8. Benchmarks and acceptance
 
@@ -1740,7 +1774,9 @@ decided on this measurement:
 - [x] K6: detection table, the 0001 and 0003 probes and their tests,
       status, metrics, docs, ADR.
 - [ ] K7: §7.3 xcheckfs runs clean; §7.4 campaign passes on the final
-      build (`repairs_late` 0 in every profile); §7.5 on a patched kernel;
+      build (`repairs_late` 0 in every profile); §7.5 on a patched kernel
+      (run; recorded in §7.5: probes, every row, the exit fix and the F10 stall met;
+      the moved inode's notice stays on with 0003, F16);
       §8 acceptance met on every backing store; §8.1 recorded.
 - [ ] Every CONVENTIONS gate green; pjdfstest 8798/8798; `stress-ng-fs`
       within its baseline.

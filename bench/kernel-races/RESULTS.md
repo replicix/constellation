@@ -80,7 +80,12 @@ the nlink race).
 
 ## §7.5
 
-Not run: no `/dev/kvm` and no QEMU on the test host.
+Run on a QEMU/KVM guest, mainline `4056b3c9d3c9` with and without patches
+0001–0003; the table and the findings are in plan 42 §7.5 (probes Fixed on
+the patched kernel and NotFixed on the base; every row 0, the moved inode's notice kept
+with 0003 (17 of 20 old ctimes without it; 0 of 20 with 0003 v2 and no notice);
+the F10 stall shown by `kernel-race-repair-stall`; a daemon exit during the
+probe hung on the patched kernel until `kernel-race-probe-exit`'s fix).
 
 ## §8.1 Q1: directory attribute TTL `entry` against `zero` (run without the quiet-host gate)
 
