@@ -556,6 +556,30 @@ is not permitted: the claimant waited a holder's TTL of its own wait clock
 from its first read of the lease's current renewal key, so the old holder's
 window is over in true time and no floor is needed.)
 
+**The seal watch judges the holder's lease on the backup's own clock** (plan 43
+C7b). A backup places where the holder's lease ends on its own wait clock from
+what the holder's beats and appends name, as readings of the holder's own wait
+clock: when each was sent and where its lease ends. The end is the highest end
+named plus the least `arrival − sent` among the latest arrivals of that holder
+clock (the arrival stamped least late, as for the successor's cap below); a
+restarted holder is a new clock and starts afresh. A lease the backup read
+whose renewal no beat or append named is alive until its first sight plus the
+holder's TTL. So a backup whose wall clock is ahead of the holder's no longer
+reads a live holder's lease as past at every renewal and seals it (the sim's
+`backup-locks-ahead`, a backup 8 s ahead, measures it), and one behind seals at
+the holder's end, not later.
+One wall hint is left, for a backup that has heard nothing of the holder since
+it started: until a beat or an append has placed the end, the end is the
+earlier of its first sight plus the TTL and the lease object's wall expiry
+mapped onto the wait clock. It decides when to read the lease and when an
+object counts as ended, in the direction where a mistake is safe (a seal is
+fenced by the log slot's CAS and the successor's floor); it never decides a
+claim. A backup that restarted while the holder died, with a wall seconds
+behind, seals after a node that watched the holder has claimed by TTL; the tail
+it holds is no longer lost, because a TTL successor of a backed lease fetches
+the tail (plan 43 C1-3; the sim's `backup-strict` seeds 551 and 909 are the
+witnesses).
+
 **The cold-claim wait.** A node claims a live-looking lease by TTL only after
 it has watched the lease's renewal key unchanged for the holder's TTL on its
 own wait clock (`DESIGN.md` §5; the body's `ttl_ms`). The crash-to-claim time
@@ -579,7 +603,8 @@ expiry of the lease it held. Its off-core heartbeat (every
 `ack=s3`) carries the holder's **wait clock** when it was sent, the end
 of the lease it holds on that clock and the guard (below) on it too,
 with the id of that clock (a restarted holder is a new process with a new
-clock), and the lease body's wall expiry (the seal watch's). The lease
+clock) (no wall expiry: since plan 43 C7b nothing the heartbeat or an append
+carries is a stamp of the holder's wall clock). The lease
 object itself carries the same end on the holder's wait clock
 (`holder_wait_ms`), beside the end it honours on its honour clock
 (`holder_expires_ms`) and the clock id (`holder_clock`) it was written

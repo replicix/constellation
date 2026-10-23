@@ -897,12 +897,13 @@ delegations (§4), read delegations (§6) and lock grants (§6). All derived
 grants share one time discipline. The holder of a grant honours it until
 `sent + ttl − margin` on its own clock, measured from when it sent the
 request; the grantor treats it as live until `granted + ttl + margin` on
-its clock; `margin` is the lease's expiry margin, `min(1 s, TTL/4)`. The
-rule is safe while clocks drift apart by less than half the margin
-(`margin > 2 × drift`) for the grants judged on a value another node
-wrote (plan 43 C7b is replacing those one by one); the lease itself no
-longer makes that assumption (below). A grantor never gives more than it
-has left, so a grant never outlives the lease it came from.
+its clock; `margin` is the lease's expiry margin, `min(1 s, TTL/4)`. Each
+side measures its own window as a duration on its own clock, so the offset
+between the two nodes does not enter (plan 43 C7b): the rule needs a rate
+bound per node (below) and a margin that covers transit and rounding, not
+clocks that agree. The few values that still cross nodes as wall stamps are
+listed after the readings below. A grantor never gives more than it has
+left, so a grant never outlives the lease it came from.
 
 **A claimant judges the lease by its own observation** (plan 43 C7b). A node
 never compares the holder's wall expiry with its own clock. It reads the
@@ -932,11 +933,12 @@ ignoring a backward one). A holder stamps what it sends and judges what it
 honours (its lease, its lock grants, its delegation, its read delegations,
 its right to answer strict reads) on that clock, so a wall-clock step on a
 holder never extends a window it honours: a backward step changes nothing,
-a forward step ends its windows early, by the step. Values that cross nodes
-or a restart stay wall-clock (a lease body's expiry, a fencing token's
-window) and keep the offset bound above; a token is minted on the wall clock
-from the honour window at the moment it is built. A horizon persisted across a
-restart is not read on the wall clock at all (plan 43 C7a): see below.
+a forward step ends its windows early, by the step. A lease body's wall expiry is for status and for
+bodies without `ttl_ms`; no node decides on a peer's. A fencing token carries
+what its holder's window had left when the op left it, and the executor
+honours it from its own receipt on its own honour clock (plan 43 C7b, phase
+1). A horizon persisted across a restart is not read on the wall clock at all
+(plan 43 C7a): see below.
 A grantor or a waiter measures what it waits out (an owner's record of a
 grant, a root's outwait of a delegation, a read-delegation grant, the
 quarantines and graces after a restart or a takeover, a successor's floor,
@@ -987,10 +989,25 @@ age of a queue or a retry, the idle and dwell times that release a lease, and
 the stamps of the S3 path's stall test. A wall-clock step therefore neither
 fails an operation early (a forward step) nor keeps one waiting past its bound
 (a backward step), and does not make a healthy S3 path look stalled. What
-still reads the wall clock is exactly what crosses nodes (the expiry in a promise
-body, a batch's submission time, the root's lock cut; the lease body's wall
-expiry is read by status, singletons and operator tools only), what is
-persisted, what is an identity key, and what is shown in status and logs.
+still reads the wall clock is what is shown in status and logs, what is
+persisted (with its boot stamp), what is an identity key, and the few values
+that cross nodes as wall stamps (plan 43 C7b leaves exactly these):
+
+- the lock cut and the barriers shipped between a root and a delegate (the
+  delegate's stream head on a renewal, `LockHandback.barrier`,
+  `DelegRenewed.lock_barrier`/`lock_cut_at`): they still assume the two
+  nodes' offset is below the margin (plan 43 Appendix B rows 9 and 30; the
+  root-anchored cut is C7b's last commit, after C4);
+- a fencing token's absolute stamp, the older of the executor's two checks
+  (above): the token is honoured only while both pass, and safety needs
+  either the offset below the margin or the op's one-way delay below
+  `2 × margin`;
+- a lease body without `ttl_ms` (an older build's, a singleton's), judged by
+  the claimant's own TTL and the wall compare both, and the lease body's wall
+  expiry otherwise read by status and operator tools only;
+- garbage collection, which compares object ages (S3's `Last-Modified`)
+  with the collector's clock against a horizon of a week (Appendix B row 17);
+- a batch's submission time in the S3 inbox, read for statistics only.
 
 All transitions between roots are explicit and persisted before they take
 effect. Heartbeats and silence now drive liveness decisions — a backup
@@ -1606,7 +1623,7 @@ and a blocking one keeps retrying.
 | holder deposed (it lost the lease while alive) | it rolls its unshipped journal back and replays it by rid through the new holder; only true overlaps become conflict copies. (A holder asked for its tail by a claimant of its expired lease deposes itself first and keeps the rows as a member copy, plan 43 C1-3.) |
 | holder and its backup both down past the lease's end | the claim of the lease waits (`status.lease.waiting_for_group`) until one of them answers a `SealTail`; the operator may abandon the group (`repair abandon-group`), and the rows it acknowledged are then lost |
 | P2P down, S3 up | everything works through the lease path and the S3 inbox, minus backups, delegations, strict ReadIndex, cluster locks and fast takeover |
-| clock skew | rate: each node's oscillator within its budget (0.1 % by default, C7a: paid by the honour and wait readings, so every local window is exact); offsets: the lease is judged by each claimant's own observation (C7b commit 3: none assumed); delegation, read-delegation and lock timing across nodes still assume `margin > 2 × drift` (±500 ms at the defaults; C7b replaces them); correctness otherwise relies on CAS ordering, never wall clocks; steps: none (C7-H1: holders measure on the honour clock, waiters on the wait clock) |
+| clock skew | rate: each node's oscillator within its budget (0.1 % by default, C7a: paid by the honour and wait readings, so every local window is exact); offset: unconstrained for the lease (a claimant's own observation of the holder's renewals), the seal watch (the holder's durations on the backup's wait clock), promises (made for the claimed key, counted per key), delegation, read-delegation and lock windows (each a duration on one node's clock) and the tokens of the S3 inbox and the replay queue (exact or refused); the exceptions are the lock cut and barriers between a root and a delegate (rows 9 and 30: offset below the margin, until the root-anchored cut) and the non-minting token check (offset below the margin, or the op's one-way delay below `2 × margin`, either alone); correctness otherwise relies on CAS ordering, never wall clocks; steps: none (C7-H1: holders measure on the honour clock, waiters on the wait clock) |
 | cache disk full | evict clean → throttle → ENOSPC (reads still stream uncached) |
 | logical quota exceeded | ENOSPC on write/truncate/fallocate growth (best-effort; see above) |
 | DB disk full | read-only mode + flush-to-recover; alarms in status/UI |

@@ -207,13 +207,13 @@ same as for [read delegations](cto-modes.md#read-delegations):
   exclusive holders);
 - the sequencer treats it as live until `granted + ttl + margin`, on its
   own clock;
-- `margin` is the lease's expiry margin (`min(1 s, lease TTL / 4)`), so
-  the rule holds while clocks stay within half the margin of each other.
-  That is the offset between nodes. A clock's *rate* is paid by the clock
-  itself (plan 43 C7a): each node's honour and wait readings carry its
-  oscillator budget (0.1 % by default), so `margin ≥ 2ρ·T + transit` holds
-  with the `2ρ·T` (40 ms on a 20 s grant) already in the readings and the
-  margin left as slack for transit and rounding.
+- `margin` is the lease's expiry margin (`min(1 s, lease TTL / 4)`). Both
+  windows are durations on one node's clock, so the rule holds for any
+  offset between the nodes' clocks (plan 43 C7b). A clock's *rate* is paid
+  by the clock itself (plan 43 C7a): each node's honour and wait readings
+  carry its oscillator budget (0.1 % by default), so `margin ≥ 2ρ·T +
+  transit` holds with the `2ρ·T` (40 ms on a 20 s grant) already in the
+  readings and the margin left as slack for transit and rounding.
 
 What a node honours is measured on its **honour clock** (plan 43 C7-H1): a
 monotone reading that never under-counts real time and follows a forward
@@ -237,8 +237,14 @@ span ahead of the write, the boot id and the raw clock's end) and read back as
 time left on the new process's wait clock: on the raw clock when the node
 restarts on the same boot, so no step of the wall clock, up or down, while the
 node was running or down changes it, and as the whole recorded span after a
-reboot. A fencing token's window stays a wall value, so the executor's check of
-it keeps the offset bound.
+reboot. A fencing token carries both the holder's absolute window end (a wall
+stamp) and what the window had left when the op left the holder; an executor
+that does not hold the grant refuses the token once either bound is
+reached, so it keeps the offset bound **or** a bound on the op's one-way
+delay (below, "The fencing token"). The lock cut and the barriers a root and
+a delegate hand each other are wall stamps of the sender as well, and keep
+the offset bound until the root-anchored cut (plan 43 C7b's last commit,
+after C4).
 
 A grant is renewed half-way through the window the node honours it for
 (`(ttl − margin) / 2` after the send: 9.5 s at the defaults), one
@@ -1279,7 +1285,7 @@ How it ends:
 - `EAGAIN`, if the table then shows a conflict, or if the request has
   waited `lock_owner_wait_max_ms` from its start, one bound for every wait
   on an owner: a stale owner's lease (it may have just been renewed) and
-  the margin clock skew adds to its expiry, its backup's acquisition
+  the margin on its expiry, its backup's acquisition
   (`acquire_retry_max_ms` at most), and the successor's grace with the
   bound an operation has without a sequencer (`lock_grace_wait_max_ms`:
   the takeover window, the longest grant, the delegations' reclaim horizon
@@ -1370,10 +1376,14 @@ waits (parked, or `EWOULDBLOCK`) until a **cut** as of that time is its
 floor:
 
 - The fencing token bounds what is left to learn. The holder's operations
-  are refused everywhere from its window's end, which is `2 × margin`
-  minus the transit and the holder's clock skew before the record's end —
-  positive by the margin rule (margin ≥ skew + transit) — so whatever was
-  executed under the grant was executed before the record ended. A
+  are refused everywhere once their window has run out: at the executor's
+  receipt plus what the holder's window had left when the op left it, a
+  duration on the executor's clock, which is `2 × margin` minus the transit
+  before the record's end — positive by the margin rule (margin ≥ transit;
+  no clock skew enters) — so whatever was executed under the grant was
+  executed before the record ended. (The absolute stamp refuses at the
+  holder's window end by the executor's wall clock: sooner or later by the
+  offset, and only ever in addition.) A
   write that passed its check before then and is still committing is
   waited for by whoever reports a position for the cut (see
   [The fencing token](#the-fencing-token), "Until the commit").
@@ -1980,7 +1990,7 @@ for both roles:
   `answers_order_held` (above),
   `fenced_owners` (the owners fenced now: `owner`, `pid`, `since_ms`,
   and `grant`, the `[minter, seq]` whose end fenced it), `margin_ms`
-  (the clock-skew margin the lock machinery assumes),
+  (the lease's expiry margin the lock machinery adds to windows, slack for transit and rounding: no offset between nodes enters it since plan 43 C7b),
   `tagged_ops` (mutations that carried a fencing token),
   `release_waits` (releases held back for one) and `predecessor_waits`
   (lock requests of new local turns held back for an earlier turn's

@@ -59609,3 +59609,112 @@ coordinator:
   a full table of attribute marks) the entry is name-only and the kernel looks
   it up when it needs it. `ls -l` of a kernel-cold directory takes about one
   request per page instead of one per name.
+
+## Plan 43 C7b, spec commit 9: offsets in the default mix, the harness's cap lifted, the campaign preset, the docs (2026-10-23)
+
+Spec commit 9 of 9 (commit 8, the root-anchored cut and barriers, rows 9 and 30,
+waits for C4). It makes the sim, the harness and the documents say what spec
+commits 3 to 7 made true: safety needs a rate bound per node and causality, and
+no bound on the offset between nodes.
+
+### Sim
+
+The default clock-fault mix (`gen_clock_mix`, C7a commit 6) bounded wall steps
+to 150 ms (200 ms in sum per node) because the cross-node compares took half the
+margin. It now draws steps of up to 10 s (10 s in sum per node, the reboot's
+included: `SimConfig::clock_mix_step_ms`), and `gen_clock_offsets` draws a
+constant wall offset per node in `[-2 TTL, +2 TTL]` of the configuration's lease
+TTL, on a stream of its own (`seed ^ 0xC7B0_0FF5`) so no existing draw moves.
+Where directories are delegated and locks are taken (`dirs` and `lock_files`)
+the lock cut and the barriers between a root and a delegate still compare walls
+(rows 9 and 30, spec commit 8): those runs draw no offsets and keep 150/200 ms
+(`mix_step_bound_ms`), so their trajectories are those of main and their sweeps
+are identical. `AUTHORITY_SIM_MIX_OFFSETS=0` and `AUTHORITY_SIM_MIX_STEP_MS=<ms>`
+tell on `sweep_config` which part of the mix a failure needs. `long_strict`
+drops its own seeded skew of 200 ms and runs the mix.
+
+One oracle was offset-dependent: `Cluster::check_failure_budget` compared the
+lease's expiry (a stamp of the holder's honour clock) with true time to decide
+whether a second failure was beyond the budget. It now subtracts how far the
+holder's honour reading stands above true time (`peek_honour`: the offset and
+the forward steps, a backward step not at all). Without it
+`backup-lag-at-expiry-beats-lost` seed 129 failed (a S3-cut holder stepped back
+8.8 s: the check read its expiry 8.8 s late and called a second failure within
+the budget).
+
+Test `the_default_clock_mix_is_bounded_deterministic_and_leaves_explicit_clock_faults_alone`
+pins the bounds, the streams and the opt-outs, and that the mix reaches beyond
+the margin (steps and offsets above 500 ms, offsets above a TTL).
+
+### Sweeps (release, 1 000 seeds; 125 configurations: every `locks-*`,
+`fast-takeover*`, `backup*`, the two `-heavy` ones at 300)
+
+Against origin/main `5964fd68` (before plan 43 C1-3) the failing sets were identical
+in 120 of 125. Changed:
+
+- `backup-strict` [551] and `backup-strict-inbox-off` [909] failed on the base
+  before plan 43 C1-3 (the double fault of `backup-strict` seed 1389: the holder
+  crashes, its backup is rebooted, a node without the tail takes the lease by TTL
+  before the backup has sealed; a rebooted backup places the holder's lease end
+  with one wall hint, `core/backup.rs` `known_end`, spec commit 4, and with its wall
+  seconds off the seal is late). With the TTL tail fetch (C1-3) both pass, and so
+  does `backup-strict` / `-inbox-off` over 3 000 seeds; no pin is kept.
+- the negative controls trade seeds: `locks-core-stall-backup-long-unfresh`
+  27 -> 21, `locks-late-stale-mirror-naive` 21 -> 20, `locks-writer-hold-unchecked`
+  70 -> 78.
+- seed 129 of `backup-lag-at-expiry-beats-lost` (and its variants) failed in a
+  first run and was the oracle above, not the protocol.
+
+Rebased onto main `323ccc54` (C1-2, C1-3 and their follow-ups, F1), the `backup*`
+configurations, `locks-claimant-ahead`, `locks-holder-behind` and
+`fast-takeover-skewed-holder-twice` (27, 1 000 seeds) again: identical failing sets to main in all 27 (the -unaware controls and backup-lag-keeps-its-backup 259 fail as on main),
+`backup-strict` and `backup-strict-inbox-off` pass over 3 000 seeds, 551 and 909
+included (the TTL tail fetch covers them). `backup-runtime-lag-then-crash` 340 and
+639 failed on `e33c4dc6` (the holder, stepped forward 8 to 9 s, re-claims its own
+lease and dies; its backup, no longer listed, discarded its tail, and the
+claimants waited for a group none of whose members had it); F1 (`b2a81f34`..
+`323ccc54`: a re-adopted lease names its group and keeps its copy) fixes both,
+and the pin I had added is gone.
+
+Unchanged and failing as on main: the `-unaware` controls, `backup-lag-keeps-its-
+backup` 259, `locks-core-stall-backup-long` 946, `locks-delegate-ahead` 8,
+`locks-delegated-partition-skew` 10 (rows 9/30), `locks-released-takeover` 961
+and 973, `locks-writer-hold-delegated-unsettled` 2. TTL claims of a live holder
+(oracle I6): 0 in all 125; seals of a live holder 7 970 against 7 785, TTL claims
+4 162 against 4 131. Long runs, clean: `long-backup` 5 000, `long-acks3` 2 500,
+`long-delegated` 2 000, `long-strict` 1 000, `flex` and `flex-crash` 1 000 each.
+`long_locks` stops at `strict-isolated-reader-holder-step-forward` seed 217254,
+which fails on main too (that configuration injects its own clock faults).
+
+Fail-before of the mix: with the wall-compare rule back (a mutant of
+`obs_passed_for`), 131 of 500 seeds of `backup`, 214 of `backup-strict`, 36 of
+`locks-failover` and 9 of `locks` fail under the new mix, and none under the old
+one (`AUTHORITY_SIM_MIX_OFFSETS=0 AUTHORITY_SIM_MIX_STEP_MS=200`).
+
+### Harness
+
+`load.rs`: `clock:<ms>` and `clock:spread:<ms>` take any offset up to a day
+(`MAX_CLOCK_OFFSET_MS`), the preset `clock-offset-large` is `clock:spread:90000`,
+`set_scenario_clock_offset` and `clock_offset_now` are new. `campaign_load`'s
+`StaleWatch` subtracts the injected offset and steps of the watched node instead of
+widening a margin. New scenarios `lease-claimant-ahead` (the claim 34.8 to 34.9 s
+after the holder's death, a node ahead never claims a live lease; fails 1.6 s in on
+the parent of spec commit 3 with these changes applied) and `lease-cold-claim` (G6:
+the claim 20.4 to 20.5 s after the node's start, 22.4 to 22.5 s after the crash).
+`lock-failover`, `backup-failover`, `flock-cross-node` and `fence-token-at-write`
+under `clock:spread:90000`: pass, 3 of 3 seeds each, locker `EIO` 0, seal failovers
+1.49 to 1.50 s. The campaign phase `clock-offset` (`clock:5000`, `clock:spread:5000`,
+`clock:-60000@b` under `lock-contention-paused-holder`, `delegate-paused-across-ttl`,
+`git-under-flock-causal`, `visibility-s3-latency`), seed 42: 12 of 12 cells passed.
+Run on a ring host (`enable_uring` Y) with docker S3.
+
+### Docs
+
+DESIGN.md §5 (the time discipline: durations on one node's clock, the values that
+still cross nodes as wall stamps, listed) and §9's clock-skew row, cto-modes.md
+"Clocks and margins", cluster-locks.md (the grant rule and the token's two
+bounds), durability-and-failover.md (the seal watch on the backup's own clock and
+its one wall hint), ADR-25 (the token), the new ADR-35 "Clocks: rate, not offset",
+ARBITER-STUDY §7's clock envelope, TESTING.md (the mix, the harness items, the
+scenarios, the campaign phase) and the fault hook's doc in `platform::clock`.
+Plan 43: Appendix B rows 2, 11, 21, 22, 23, 25, 26, 28 and the C7b section.

@@ -846,11 +846,15 @@ strict mode (cross-node byte-range locks) had never been built.
   A stall of the authority core alone (a metadata-store write behind a
   slow journal write) is no longer such a stop: see the amendment below.
 - Each mutation of a lock owner carries a fencing token (Chubby's
-  sequencer, Kleppmann's argument): its grants and the end of the window
-  its node honours them for. A sequencer that holds the grant (its
+  sequencer, Kleppmann's argument): its grants, the end of the window
+  its node honours them for and what that window had left when the
+  operation left the node. A sequencer that holds the grant (its
   minter) judges it exactly, live or ended; any other refuses it once
-  its own clock passes that window, so an operation admitted before a
-  lapse and delayed past it never lands. A
+  its own wall clock reaches the end or its honour clock reaches its own
+  receipt plus what was left (plan 43 C7b), so an operation admitted
+  before a lapse and delayed past it never lands: safe with either the
+  offset below the margin or the operation's one-way delay below
+  `2 × margin`. A
   window, not only an id, because the sequencer executing a write often
   did not mint the lock (a delegated subtree under a root-owned lock
   file): checking the window costs no round trip to the minter and no
@@ -1544,3 +1548,73 @@ post-change directory reply.
 **See**: [plan 42](../plans/v1/wip/42-kernel-race-workarounds.md);
 `crates/frontend-fuse/src/{pagecache,repair,kernel_fixes}.rs`,
 `crates/engine/src/view/kernel_cache.rs`; PROGRESS, "Plan 42".
+
+## ADR-35: Clocks: rate, not offset
+
+**Context**: until plan 43 C7b the lease, the seal watch, the promises and
+the fencing tokens compared a value one node wrote on its own clock (a
+lease's wall expiry, a promise's end, a token's window) with another
+node's clock, and were safe only while the clocks differed by less than
+half the lease margin (±500 ms at the defaults). Measured in the simulation
+at offsets of a few seconds: a claimant ahead of the holder took a live
+lease by TTL and granted over the holder's grants, a backup ahead sealed
+a live holder at every renewal, an executor behind ran a stale operation
+after the next grant. A node's *rate* error, by contrast, is bounded by
+its oscillator (tens of ppm; 1 000 ppm budgeted) and a wall clock can be
+off by minutes. C7-H1 and C7a had already put every local duration on a
+clock that cannot err the dangerous way.
+
+**Decision**: safety needs a rate bound per node and causality (a message
+or an S3 object is read after it was written), and no bound on the offset
+between nodes. Three readings of a node's clock (`constellation_types::clock`):
+HONOUR never under-counts elapsed time (what a holder may honour is measured
+on it), WAIT never over-counts (what a waiter outwaits), WALL is for status,
+logs and identity keys; each of the first two is scaled by the node's rate
+budget `ρ`, so a window measured on one node is exact for any oscillator
+within it. Every cross-node decision is then a duration measured on one node
+from its own send or receipt, or an observation of one object:
+- *The lease* (`LeaseState::observe`/`classify`): a claimant remembers the
+  renewal key `(holder, epoch, holder_clock, holder_wait_ms, released)` and
+  the instant on its wait clock it first read it, and claims by TTL once a
+  read still shows the key one holder's TTL (`ttl_ms` in the body) later; a
+  released or fenced lease is claimable at once. A cold claimant pays one
+  full TTL from its first read (about 60 s at the defaults).
+- *The seal watch*: the holder's beats and appends name its own wait-clock
+  readings, and the backup places the lease's end on its own wait clock.
+- *Promises*: made for one lease key and counted per key; no clock of
+  another node is compared.
+- *Fencing tokens* (phase 1): the executor honours a token from its own
+  receipt for what the holder's window had left, on its honour clock; the
+  confirmation of a copied grant is the holder's own send reading. A token
+  with no receipt (an S3 inbox batch, the replay queue) is judged exactly
+  or refused.
+- A suspend the kernel counts short is covered by a pad of a second per
+  detected suspend on HONOUR only.
+- *The cut and barriers between a root and a delegate*: decided to be
+  root-anchored, as of the root's own request and reply (plan 43 C7b's last
+  commit, after C4); not landed, they still compare the two nodes' wall
+  stamps.
+
+**Consequences**: the fault-injecting harness takes any offset (up to a
+day) and its checkers subtract the offset they injected; the simulation's
+default mix draws a constant offset per node in `[-2 TTL, +2 TTL]` and wall
+steps up to 10 s. A cold claim waits a TTL from its first read
+where it waited for the holder's wall expiry. What stays offset-dependent,
+and says so: the lock cut and barriers (until the root-anchored cut), the
+absolute stamp of a token when the operation's delay is not below `2 ×
+margin`, garbage collection against S3's `Last-Modified` (a horizon of a
+week), and a lease body without `ttl_ms` (an older build's, a singleton's).
+
+**Rejected**: estimating the offset from beats or ReadIndex round trips
+(NTP-style) and correcting each compare (it needs P2P, which the S3-only
+paths lack, a fresh estimate that a step breaks, and a round-trip bound: a
+delay assumption in every compare instead of one); detecting an offset and
+refusing to act (undetectable without P2P, a liveness outage, and an
+undetected offset is still unsafe); having a holder that learns it was
+sealed stop admitting local sections (the traced violations came from a TTL
+claim, not from the sealed holder).
+
+**See**: [DESIGN.md §5](DESIGN.md#5-write-authority-the-one-rule),
+[plan 43](../plans/v1/wip/43-commit-rule.md) (Appendix B, the clock
+inventory), `crates/types/src/clock.rs`, `crates/authority/src/core/lease.rs`,
+`crates/store-s3/src/heartbeat.rs`, `crates/meta/src/locks.rs`.

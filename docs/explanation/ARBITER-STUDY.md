@@ -95,8 +95,10 @@ ADR-22, ADR-27, plan 30 §2:
 Time-bounded derived grants (delegations 5 s, read delegations 5 s,
 lock grants 20 s) are capped by the lease and share one clock
 discipline: holder honours until `sent + ttl − margin`, grantor until
-`granted + ttl + margin`, margin `min(1 s, TTL/4)`, correct while clocks
-drift less than half a margin apart (DESIGN §5). None of these touches S3
+`granted + ttl + margin`, margin `min(1 s, TTL/4)`, each a duration on one
+node's clock, so correct for any offset between the nodes (DESIGN §5; the lock
+cut between a root and a delegate is the exception until plan 43 C7b's last
+commit). None of these touches S3
 on the hot path; they touch it through the lease they are capped by.
 
 The original rationale for S3 as arbiter (GOALS "Key enablers", ADR-2,
@@ -1098,10 +1100,15 @@ step 4 closes the "Not covered" gap of the 2026-10-16 fix for good.
   for everyone else. No protocol removes this choice.
 - **Clock envelope.** Rate: at most 0.1 % per node for every local window
   (plan 43 C7a: the honour and wait readings carry the budget, so a window
-  measured on one node is exact for any oscillator within it). Offset: ±500
-  ms at the default margins for every compare between nodes, until C7b. A
-  quorum log would not relax it (lock windows and read leases still need
-  it); a hybrid logical clock already stamps records.
+  measured on one node is exact for any oscillator within it). Offset
+  (plan 43 C7b, ADR-35): unconstrained; the lease, the seal watch, the
+  promises and the grant windows are durations on one node's clock or an
+  observation of one object, and the non-minting token check needs the offset
+  below the margin or the operation's one-way delay below 2 × margin (either
+  alone); the root-to-delegate lock cut still compares walls until its
+  root-anchored form lands. A quorum log would not relax any of this (lock
+  windows and read leases are durations on a node's clock either way); a
+  hybrid logical clock already stamps records.
 - **Kernel and store.** The plan 42 races, FUSE `FORGET` semantics, the
   `execve` close window, fjall stalls: unaffected by anything above and
   the majority of the fixes this month.
