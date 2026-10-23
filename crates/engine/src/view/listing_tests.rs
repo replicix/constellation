@@ -1361,7 +1361,7 @@ fn pin_caps_hold_and_each_streams_last_page_stays_pinned() {
     for d in 0..dirs {
         for s in 0..per_dir {
             let last = cookie(d, s, pages_each - 1, 99);
-            let resume = listing.resolve(5000 + d, last);
+            let resume = listing.resolve(5000 + d, last, None);
             assert!(
                 resume.is_after_for_test(name(d, s, pages_each - 1).as_bytes()),
                 "dir {d} stream {s}"
@@ -1530,6 +1530,36 @@ fn releasing_what_is_no_stream_is_nothing() {
     );
     assert_eq!(fx.listing.stats().pinned_bytes, 0);
     fx.listing.accounted_for_test();
+}
+
+/// A stream continues from the page last served through it, even when a
+/// newer page of another stream holds a different name with the same
+/// cookie (a collision across pages: in-page cookies are unique, cookies
+/// of a directory are not). Resolving by the newest page alone resumed
+/// after the other name, past entries the stream had not read.
+#[test]
+fn a_stream_resumes_from_its_own_last_page_past_a_colliding_newer_one() {
+    let listing = Listing::with_caps(CookieKey::fixed(1, 2), 256 << 10, PinCaps::default());
+    let dir = 9000;
+    let (s, t) = ((7, DIR_FH_BIT | 1), (7, DIR_FH_BIT | 2));
+    listing.open_stream(dir, s);
+    listing.open_stream(dir, t);
+    // `s` was served `a`..`m`, the last one's cookie 12.
+    listing.record_via_for_test(dir, None, b"m", &[10, 11, 12], Some(s));
+    // Then `t`, further on: `x`, whose cookie is 12 too, mid-page.
+    listing.record_via_for_test(dir, Some(b"p"), b"z", &[20, 12, 21], Some(t));
+    assert!(
+        listing.resolve(dir, 12, Some(s)).is_after_for_test(b"m"),
+        "`s` continues after `m`, not after `t`'s `x`"
+    );
+    // Through no stream (or `t`), the newest page still answers.
+    assert!(!listing.resolve(dir, 12, None).is_after_for_test(b"m"));
+    assert!(!listing.resolve(dir, 12, Some(t)).is_after_for_test(b"m"));
+    // A cookie that is not in the stream's last page: the other pages.
+    assert!(listing.resolve(dir, 21, Some(s)).is_after_for_test(b"z"));
+    listing.close_stream(dir, s);
+    listing.close_stream(dir, t);
+    listing.accounted_for_test();
 }
 
 /// A listing's pages are hints again once its last stream is released:

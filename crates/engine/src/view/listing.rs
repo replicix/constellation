@@ -256,6 +256,16 @@ impl DirHints {
         }
     }
 
+    /// The pinned or held page numbered `seq` (a stream's last page is
+    /// always one or the other).
+    fn page_at(&self, seq: u64) -> Option<&PageRef> {
+        let at = self.pinned.partition_point(|p| p.seq < seq);
+        match self.pinned.get(at) {
+            Some(p) if p.seq == seq => Some(p),
+            _ => self.held.get(&seq),
+        }
+    }
+
     fn pinned_push(&mut self, page: PageRef) {
         self.pinned_bytes += page.bytes();
         self.pinned.push_back(page);
@@ -861,15 +871,22 @@ impl Listing {
         Some(out)
     }
 
-    /// Where `cookie` resumes in `dir`.
-    pub(crate) fn resolve(&self, dir: Ino, cookie: u64) -> Resume {
+    /// Where `cookie` resumes in `dir`, asked through the open stream
+    /// `via` (if it is one).
+    pub(crate) fn resolve(&self, dir: Ino, cookie: u64, via: Option<StreamKey>) -> Resume {
         if cookie <= 2 {
             return Resume::Start;
         }
-        // The newest page that holds it knows the most. The newest pinned
-        // pages and the ordinary hints are looked at under the lock; the
-        // rest of a big pin window (a `seekdir` far back) outside it, on
-        // pages held by `Arc`.
+        // The page last served through the stream first: it is where the
+        // stream continues from (K5), whatever was served since to other
+        // streams, and a newer page of another stream may hold a different
+        // name with the same cookie (two names share one in a directory of
+        // ~2^31 names at 62 bits, and of ~2^16 at 31: the newest page would
+        // then place the resume after the wrong name, which can skip).
+        // Otherwise the newest page that holds it knows the most. The
+        // newest pinned pages and the ordinary hints are looked at under
+        // the lock; the rest of a big pin window (a `seekdir` far back)
+        // outside it, on pages held by `Arc`.
         let mut older: Vec<PageRef> = Vec::new();
         let mut hit: Option<(PageRef, usize)>;
         {
@@ -877,12 +894,18 @@ impl Listing {
             let Some(d) = shard.dirs.get(&dir) else {
                 return Resume::Cold;
             };
-            hit = d
-                .pinned
-                .iter()
-                .rev()
-                .take(RECENT)
-                .find_map(|p| Some((p.clone(), p.locate(cookie)?)));
+            hit = via
+                .and_then(|key| d.open.get(&key)?.last)
+                .and_then(|seq| d.page_at(seq))
+                .and_then(|p| Some((p.clone(), p.locate(cookie)?)));
+            if hit.is_none() {
+                hit = d
+                    .pinned
+                    .iter()
+                    .rev()
+                    .take(RECENT)
+                    .find_map(|p| Some((p.clone(), p.locate(cookie)?)));
+            }
             if hit.is_none() {
                 let ring = d
                     .ring
@@ -1446,7 +1469,7 @@ impl View {
 
         // Where the page starts.
         let mut cold = false;
-        let (after, mut seek) = match listing.resolve(ino, cookie) {
+        let (after, mut seek) = match listing.resolve(ino, cookie, via) {
             Resume::Start => (None, None),
             Resume::Hint { after, seek } => (after, seek),
             Resume::Cold => {
