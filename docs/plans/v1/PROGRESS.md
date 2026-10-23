@@ -58265,9 +58265,10 @@ delegate sends such a renewal once more after the answerer's threshold plus
 - Authority lib tests (642 on the full tree, 606 on R1 alone), engine lib
   (865), model suite in release (all), `cargo clippy --workspace
   --all-targets -D warnings` and `cargo fmt --check` clean. The whole
-  `tests/sim.rs` file was not run to the end: its 250 tests take hours and
-  fail in bulk with `EAGAIN` from the store when more than a few run at once
-  on one box; individual tests pass (`ack_s3_no_acked_op_lost`,
+  `tests/sim.rs` file was not run to the end (the review found why it failed
+  in bulk with `EAGAIN`: this branch's sim bus tap leaked every run's stores,
+  see "Plan 41 review" below; with that fixed the file runs in two to four
+  minutes); individual tests pass (`ack_s3_no_acked_op_lost`,
   `a_second_seal_inside_the_grace_waits_out_the_first_holders_grants`,
   `a_successor_stepped_forward_keeps_its_takeover_floor`, the new
   `a_root_stuck_in_a_step_keeps_its_delegations` and `a_root_hung_past_the_bound_loses_its_delegations`).
@@ -58411,3 +58412,51 @@ and `lock-store-stall-past-lease` likewise.
   alternated): `lock-latency` with the lane on against off, and the branch against
   its base, show no regression on the requests that go through the core (within
   5 %); the cached local operations are bimodal run to run on both sides.
+
+## Plan 41 review: R1, R2, L2 to L8 (2026-10-23)
+
+Integrity read of the off-core paths against plan 43 C7a/C7b (1 to 4) and
+C7-F, then the full gates. Verdict: R1, R2, L2 and L3/L4 sound as designed;
+fixes below, each with a test that fails before.
+
+- **The suite's `EAGAIN` was the branch's.** The sim bus tap (R2, L2) held the
+  bus it is stored in: every run leaked its nodes' `Meta` (store threads,
+  tmpfs directories) and the suite hit the user's task limit within seconds.
+  The tap holds the bus weakly (`a_run_leaves_no_bus_behind`).
+- **Lane freshness at the extension's own instant.** The lane judged a fast
+  tenure's freshness at its tick's reading and `renew_own` extended from the
+  table's later reading: judged inside the guard now
+  (`the_freshness_rule_holds_at_the_extensions_own_reading`). R2's answerer
+  decides and extends at one reading and needs no change.
+- **The freshness knob is reachable in the sim** on a 30 s lease
+  (`locks-core-stall-backup-long{,-unfresh}`, seed 44); on the 6 s lease the
+  cap masks it.
+- **Re-pinned** (schedules moved): I4 seeds 17, 19, 114 to 40, 43, 69 (R2's
+  resend); the unsettled writer-hold seeds to 940, 1246 (L2's lane).
+- **Relaxations.** `locks_survive_core_stalls`: the residual fences are the
+  default clock mix's reboots and suspends (0 of 200 unclocked seeds fence;
+  asserted now). The R2 unlaned arm's delegate-lapse count and the backed
+  pair's kept-delegation note are sound; the backed pair stays a known gap
+  until the decided off-core lease read (D3, P) lands, which this branch
+  does not implement.
+- **The stuck-core mark** is safe to ignore: every extension is a max and
+  needs the full certificate or the owner's answer; the core acts on a mark
+  only to skip duplicates and in the L0 hold, where the lane's own
+  freshness rule refuses too.
+- **`locks-delegate-ahead` 58** passes on main since before this branch's
+  base (stale-read class rows 9/30); 268 and 296 still fail on both.
+- **Open (not fixed):** `locks-unlinked-delegated-blips` seed 230 fails
+  (a lock not granted for 60 s) from L2 on, main passes: both takeovers
+  around the third epoch outage release the lease at once and nobody claims
+  it again for 55 s; the lane only moves the timing. With C7b commit 6 the
+  lane must stamp the wire `sent` of its `LockRenew` at the send, as the
+  driver does, not at its tick.
+
+Gates on the final tree (release): fmt, clippy `-D warnings`, authority lib
+645, sim suite 255 (two to four minutes), `meta_repro`, engine 873, control
+146, harness lib 153, model crate. Sweeps of 111 `locks-*`/`delegated-*`
+configurations at 500 seeds: failing sets as main apart from the new
+configurations, negative controls and seeds noted above. Harness 5 of 5
+each: `lock-stall-lone-node`, `lock-store-stall-past-lease`,
+`delegate-store-stall` (and its root-stalled arm; with the root lane off it
+fails `KNOWN-GAP root core stuck`).
