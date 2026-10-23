@@ -1019,7 +1019,9 @@ Counted: `dir_attr_notices` (written) and `dir_attr_notices_skipped`
 (changed inodes no reply was on its way for), per mount in `kernel_cache`
 and in the metrics.
 
-What it does not cover: `readdirplus` (not negotiated) and replies the old
+`READDIRPLUS` pages are covered (plan 40: they are attribute replies, marked
+per entry with `replying_each`; an entry the full table cannot mark goes
+name-only). What it does not cover: replies the old
 process wrote just before a `daemon --upgrade` handover (the watch lives in
 the per-process table; the new process cannot know them). The marks are
 bookkeeping of replies already written; they do not delay or reorder any

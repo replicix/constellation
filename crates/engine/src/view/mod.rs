@@ -968,6 +968,12 @@ impl View {
         self.unlinked_refs.lock().unwrap().contains_key(&ino)
     }
 
+    /// Orphans this view keeps for its platform's references until their
+    /// `forget` (plan 40 D11: `node.status`'s `unlinked_refs`).
+    pub fn unlinked_refs_len(&self) -> usize {
+        self.unlinked_refs.lock().unwrap().len()
+    }
+
     /// The platform let go of `ino` ([`Vfs::forget`]): an orphan its
     /// reference kept is reaped, with its write session — unless a handle
     /// here still has it (its last close reaps it), and keeping the

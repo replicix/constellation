@@ -319,6 +319,12 @@ impl<V: Vfs> FuseFs<V> {
         self.entries.refs()
     }
 
+    /// What this connection's `READDIRPLUS` pages handed the kernel (its
+    /// stats report them, plan 40 §4.11).
+    pub fn plus_counters(&self) -> &Arc<crate::PlusCounters> {
+        self.entries.plus()
+    }
+
     /// The names this connection's kernel can hold a valid dentry for, as
     /// the notification sink ([`crate::FuseNotifySink::new`]) consults
     /// them.
@@ -2077,6 +2083,8 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
                 seen: self.pc.attr_arrive(req.pid()),
                 dir_zero: self.dir_zero(),
                 handed: HandedList::default(),
+                knob_off: self.tuning.readdirplus == ReaddirPlus::Off,
+                tally: Default::default(),
             }),
         );
     }

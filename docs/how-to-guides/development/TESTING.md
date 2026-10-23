@@ -3175,6 +3175,39 @@ and fetched again never served from the unlinked file); a frozen snapshot
 file's zero-copy reads are in `view::passthrough_tests`
 (`a_frozen_multi_chunk_file_reads_zero_copy`).
 
+## Directory listing and `READDIRPLUS` (plan 40)
+
+What listing a directory costs, and that a listing in progress stays exact
+whatever happens to the directory meanwhile, is tested at four levels. None
+needs a kernel mount.
+
+| Level | Where | What it proves |
+|---|---|---|
+| Listing engine | `crates/engine/src/view/{listing,cookie,plus}_tests.rs`, `vfs_tests.rs` | cookies are keyed hashes of names and stable across views and nodes; a page reads O(page) dentries (`a_full_listing_reads_each_dentry_o1_times`, with the n²/page cost of the old code as its fail-before); a resume from any cookie of a recent page hits the cache; a cold resume never skips a name; an open directory's pages are pinned and released with the handle; plus entries are what `lookup` answers |
+| Wire | `crates/frontend-fuse/tests/wire.rs` (`cargo test -p constellation-frontend-fuse --test wire plus`) | `FUSE_INIT` negotiation per knob, the `READDIRPLUS` record encoding, name-only entries, references taken once per entry the buffer took and only on success, balanced by `FORGET`, marks for the attribute races (W3b), A3 arming, a pid-0 lister past the mark table, a resumed session with the knob off; and the counters below |
+| Conformance kit | `crates/vfs/src/conformance/{readdir,confinement}.rs`, run on `MockVfs` and the engine view | `plus_entries_are_what_lookup_answers`, `a_plus_entry_is_a_reference`, `plus_of_a_subtree_view_stays_confined` |
+| Status | `crates/engine/src/control/ops.rs`, `crates/control/src/web.rs`, `crates/control/src/schema.rs` | a listing moves each `node.status` `readdir` counter (`the_listing_counters_and_unlinked_refs_reach_node_status`), a mount's `unlinked_refs` follows unlinks and `FORGET`s, every counter has its `/metrics` series, the control schema is current (`CONSTELLATION_BLESS=1 cargo test -p constellation-control schema` regenerates it) |
+
+The counters are the way a system test asserts that plus was really used:
+`fuse.mounts[].readdirplus_entries` rose, `readdirplus_name_only_why` says
+why entries did not carry attributes, `readdir.cold_scans` and
+`readdir.lost_cookies` stay 0 for a sequential or deleting lister, and
+`readdir.pinned_dirs` is above 0 while a directory is open and 0 after
+(reference: [configuration](../../reference/configuration.md), "Listing and
+`READDIRPLUS` in the status"). `fuse.mounts[].unlinked_refs` returns to 0
+once the kernel has let go of what a listing found and something unlinked.
+
+The system scenarios of plan 40 §7 (`readdirplus-attrs-match`,
+`readdirplus-local-appender`, `readdirplus-orphan-forget`,
+`readdirplus-strict`, `readdirplus-handover`, `readdir-huge-delete`,
+`readdir-seekdir-after-delete`, `readdir-many-open-dirs`, `fuse-inval-storm`
+with an `ls -l` lister, and the `kernel-races` workloads under an `ls -l`
+lister) land with plan 40 P9 and read these counters.
+
+Ad hoc, an engine-level measurement of listing time is the ignored test
+`view::listing_perf` (release mode; its header documents `LP_DIR`,
+`LP_MODE`, `LP_SIZES`).
+
 ## Linux FUSE client races (plan 42)
 
 Three races in the Linux kernel's FUSE client, reproduced through a real

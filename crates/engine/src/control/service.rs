@@ -40,6 +40,23 @@ pub(crate) fn log_status(stats: &crate::log_buffer::LogStats) -> api::LogStatus 
 /// A replicated snapshot row as the control protocol reports it. Plan 32
 /// §0.4's `origin` is a small integer in the row and a word on the wire,
 /// so a reader never has to know that 1 means "a policy's own".
+/// The listing path's counters in the protocol's shape (plan 40 §4.11).
+pub(crate) fn readdir_status(s: &crate::view::ListingStats) -> api::ReaddirStatus {
+    api::ReaddirStatus {
+        hint_hits: s.hint_hits,
+        cold_scans: s.cold_scans,
+        cold_scan_entries: s.cold_scan_entries,
+        lost_cookies: s.lost_cookies,
+        cookie_collisions: s.cookie_collisions,
+        hint_bytes: s.hint_bytes,
+        open_streams: s.open_streams,
+        pinned_dirs: s.pinned_dirs,
+        pinned_bytes: s.pinned_bytes,
+        exempt_bytes: s.exempt_bytes,
+        pin_overflows: s.pin_overflows,
+    }
+}
+
 pub(crate) fn snapshot_status(row: constellation_meta::SnapshotRow) -> api::SnapshotStatus {
     let seq = snapshot::SnapshotRoot::parse(&row.root_hash)
         .ok()
@@ -900,6 +917,7 @@ impl EngineControl {
                 }
             },
             log: log_status(&self.log_buffer.stats()),
+            readdir: readdir_status(&self.engine.listing_stats()),
         }
     }
 
@@ -1904,5 +1922,46 @@ mod tests {
         // rather than being silently read as "manual".
         row.origin = 9;
         assert_eq!(snapshot_status(row).origin, "unknown(9)");
+    }
+}
+
+#[cfg(test)]
+mod readdir_status_tests {
+    use super::*;
+
+    /// Every counter of the listing path reaches `node.status` as itself:
+    /// eleven different values, so a field wired to another shows.
+    #[test]
+    fn each_listing_counter_is_reported_as_itself() {
+        let stats = crate::view::ListingStats {
+            hint_hits: 1,
+            cold_scans: 2,
+            cold_scan_entries: 3,
+            lost_cookies: 4,
+            cookie_collisions: 5,
+            hint_bytes: 6,
+            open_streams: 7,
+            pinned_dirs: 8,
+            pinned_bytes: 9,
+            exempt_bytes: 10,
+            pin_overflows: 11,
+        };
+        let r = readdir_status(&stats);
+        assert_eq!(
+            [
+                r.hint_hits,
+                r.cold_scans,
+                r.cold_scan_entries,
+                r.lost_cookies,
+                r.cookie_collisions,
+                r.hint_bytes,
+                r.open_streams,
+                r.pinned_dirs,
+                r.pinned_bytes,
+                r.exempt_bytes,
+                r.pin_overflows
+            ],
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        );
     }
 }

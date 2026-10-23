@@ -639,6 +639,38 @@ fn an_inode_removed_elsewhere_is_a_stale_handle() {
     assert_eq!(c.view.gone(synthetic, Code::NotFound), Code::NotFound);
 }
 
+/// Plan 40 D11: `unlinked_refs_len` counts the orphans the view keeps
+/// for its platform's references: an unlink of a file moves it up, the
+/// platform's `forget` back down, and a view whose platform reports no
+/// `forget` keeps none.
+#[test]
+fn unlinked_refs_len_counts_the_orphans_kept_for_the_kernel() {
+    let c = fuse_client();
+    assert_eq!(c.view.unlinked_refs_len(), 0);
+    let mut inos = Vec::new();
+    for name in ["a", "b"] {
+        let (e, o) = c.create(ROOT_INO, name).unwrap();
+        c.close(e.attr.ino, o.fh).unwrap();
+        inos.push(e.attr.ino);
+    }
+    assert_eq!(c.view.unlinked_refs_len(), 0, "still linked");
+    c.unlink(ROOT_INO, "a").unwrap();
+    assert_eq!(c.view.unlinked_refs_len(), 1);
+    c.unlink(ROOT_INO, "b").unwrap();
+    assert_eq!(c.view.unlinked_refs_len(), 2);
+    c.view.forget(inos[0]);
+    assert_eq!(c.view.unlinked_refs_len(), 1);
+    c.view.forget(inos[1]);
+    assert_eq!(c.view.unlinked_refs_len(), 0);
+
+    // No `forget` is ever reported: nothing is kept, so nothing is counted.
+    let plain = client_with(|_| {});
+    let (e, o) = plain.create(ROOT_INO, "f").unwrap();
+    plain.close(e.attr.ino, o.fh).unwrap();
+    plain.unlink(ROOT_INO, "f").unwrap();
+    assert_eq!(plain.view.unlinked_refs_len(), 0);
+}
+
 /// The kernel's reference to an unlinked file crosses a handover: the
 /// next process's view keeps it openable until the `FORGET` it receives.
 #[test]

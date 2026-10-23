@@ -160,6 +160,10 @@ pub struct KernelEntries {
     /// (plan 40 R2). Kept here so that a reply's [`EntryGuard`] reaches
     /// them without another shared reference per request.
     refs: Arc<KernelRefs>,
+    /// What this connection's `READDIRPLUS` pages handed the kernel (plan
+    /// 40 §4.11). Kept here for the same reason as `refs`: a plus reply
+    /// already holds the entries.
+    plus: Arc<crate::PlusCounters>,
 }
 
 impl Default for KernelEntries {
@@ -170,6 +174,7 @@ impl Default for KernelEntries {
             unfiltered_until: Mutex::new(None),
             longest_ttl_ns: AtomicU64::new(0),
             refs: KernelRefs::new(),
+            plus: crate::PlusCounters::new(),
         }
     }
 }
@@ -182,6 +187,11 @@ impl KernelEntries {
     /// The kernel's lookup counts on this connection ([`KernelRefs`]).
     pub(crate) fn refs(&self) -> &Arc<KernelRefs> {
         &self.refs
+    }
+
+    /// The connection's `READDIRPLUS` counters.
+    pub(crate) fn plus(&self) -> &Arc<crate::PlusCounters> {
+        &self.plus
     }
 
     /// This connection was served by another process (or another session)

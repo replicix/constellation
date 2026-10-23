@@ -1337,6 +1337,7 @@ impl<V: Vfs> FuseSession<V> {
                 passthrough.clone(),
             )
             .with_kernel_refs(entries.refs().clone())
+            .with_plus_counters(entries.plus().clone())
             .with_page_cache(pc.clone())
             .with_zero_copy_reads(zero_copy_reads)
             .with_ring_health(RingHealthStats::of_session(&config, transport)),
@@ -3132,6 +3133,9 @@ mod tests {
             lookups,
             "no entry was looked up by name"
         );
+        let counted = stats.readdirplus_counts();
+        assert!(counted.pages >= pages as u64, "{counted:?}");
+        assert!(counted.entries >= 300, "{counted:?}");
         let after = settled_refs(&stats);
         assert_eq!(after, before, "every lookup was given back");
         assert_eq!(stats.forgets_unknown(), 0);

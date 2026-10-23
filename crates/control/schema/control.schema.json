@@ -3176,6 +3176,37 @@
         "passthrough": {
           "$ref": "#/$defs/FusePassthroughStatus"
         },
+        "readdirplus": {
+          "description": "`READDIRPLUS` as `FUSE_INIT` agreed it (plan 40 §4.1): `off`,\n`auto` or `always`; empty on a mount with no session. A resumed\nsession reports its connection's, not the new image's knob.",
+          "type": "string"
+        },
+        "readdirplus_entries": {
+          "description": "Entries those pages handed with attributes: each a kernel lookup\nreference, saving the `LOOKUP` of its name\n(`constellation_fuse_readdirplus_entries_total{kind=\"attr\"}`).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "readdirplus_name_only": {
+          "description": "Entries handed name-only, the sum of `readdirplus_name_only_why`\n(`kind=\"name_only\"`).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "readdirplus_name_only_why": {
+          "additionalProperties": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "description": "Name-only entries by why: `knob_off` (this image's\n`CONSTELLATION_FUSE_READDIRPLUS=off` on a connection that still asks\nfor plus), `dots` (`.` and `..`), `view` (the view could not vouch\nfor the attributes: a strict mount, or a change between the name\nbatch and the attribute read) and `watch_full` (the attribute\nreply-mark table is full: a pid-0 lister of a huge directory).",
+          "type": "object"
+        },
+        "readdirplus_pages": {
+          "description": "`READDIRPLUS` pages this mount answered.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "ring_entries_held_long": {
           "description": "Ring entries this mount's userspace has held -- fetched from the\nkernel, not yet answered back -- for longer than the FUSE request\nstall threshold (`CONSTELLATION_FUSE_REQUEST_STALL_S`), blocking lock\nrequests aside, as of the ring watchdog's last pass. Unlike\n`fuse_requests` this includes requests still queued for a worker,\nwhich the view has not been handed yet. Always 0 on `dev_fuse`.",
           "format": "uint64",
@@ -3191,6 +3222,12 @@
         "transport": {
           "description": "What the connection negotiated: `dev_fuse`, `uring` or `uring_zc`,\nfixed for the connection's life.",
           "type": "string"
+        },
+        "unlinked_refs": {
+          "description": "Orphans this mount's view keeps for the kernel's lookups of files\nit unlinked, until their `FORGET` (plan 40 D11; the view's\n`unlinked_refs`). Each holds an inode's data until the kernel lets\ngo, so a count that only grows is a lookup the kernel never gives\nback.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         },
         "uring_queue_depth": {
           "description": "Ring entries per kernel queue; 0 on `dev_fuse` (no ring queues).",
@@ -3220,6 +3257,12 @@
         "forgets_partial",
         "forgets_unknown",
         "forgets_underflow",
+        "unlinked_refs",
+        "readdirplus",
+        "readdirplus_pages",
+        "readdirplus_entries",
+        "readdirplus_name_only",
+        "readdirplus_name_only_why",
         "kernel_cache",
         "kernel_workarounds"
       ],
@@ -6544,6 +6587,91 @@
       ],
       "type": "object"
     },
+    "ReaddirStatus": {
+      "description": "Plan 40 §4.11: what the listing path of this node has done, from\n`Listing::stats` (`constellation_readdir_*`). A resume from a\nremembered page is a hint hit; one that had to scan the directory is a\ncold scan (a hint miss).",
+      "properties": {
+        "cold_scan_entries": {
+          "description": "Directory entries those scans read.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cold_scans": {
+          "description": "Pages resumed by scanning the directory from its start (a cookie no\nremembered page covers: a `seekdir`, an evicted hint, a restart).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cookie_collisions": {
+          "description": "Equal cookies of different names seen (two names of one 62-bit hash,\nor of a 31-bit one under `CONSTELLATION_READDIR_COOKIE_BITS=31`).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exempt_bytes": {
+          "description": "Bytes of open streams' last pages kept past those bounds: the\nlisting in progress is never given up for them.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "hint_bytes": {
+          "description": "Bytes the ordinary hints hold (`CONSTELLATION_READDIR_HINT_BYTES`\nbounds it).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "hint_hits": {
+          "description": "Pages resumed from a remembered page: `O(page)` reads.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lost_cookies": {
+          "description": "Cold resumes whose cookie's name had been removed meanwhile: the\n`ENOENT` case (a `seekdir` back into a region the pin bounds gave\nup, or a handle that was never open here).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "open_streams": {
+          "description": "Directory streams (`opendir` handles with a listing under way)\nopen now.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pin_overflows": {
+          "description": "Times a pin bound unpinned pages: only a `seekdir` back into that\nregion can then meet a cold scan, or `ENOENT` if its name is gone.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pinned_bytes": {
+          "description": "Bytes of pages pinned for open directories (bounded by\n`CONSTELLATION_READDIR_PIN_BYTES_PER_DIR` and\n`CONSTELLATION_READDIR_PIN_BYTES`).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pinned_dirs": {
+          "description": "Directories with at least one stream open.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "hint_hits",
+        "cold_scans",
+        "cold_scan_entries",
+        "lost_cookies",
+        "cookie_collisions",
+        "hint_bytes",
+        "open_streams",
+        "pinned_dirs",
+        "pinned_bytes",
+        "exempt_bytes",
+        "pin_overflows"
+      ],
+      "type": "object"
+    },
     "ReclaimEstimate": {
       "description": "What deleting a set of snapshots would give back once GC has run (plan\n32 §6.1 `reclaim(D)`): the logical bytes and chunks no other snapshot\nand not the live tree reference, as of the accounting index's commit\n`as_of_seq`. While the index does not match the snapshots yet,\n`building` is set (with `building_pct`) and `bytes`/`chunks` are 0 and\nmean nothing: never a partial number.",
       "properties": {
@@ -9360,6 +9488,10 @@
           "$ref": "#/$defs/QuotaStatus",
           "description": "Optional cluster-wide logical byte cap and current used bytes."
         },
+        "readdir": {
+          "$ref": "#/$defs/ReaddirStatus",
+          "description": "Plan 40 §4.11: the directory listing path (cookies, the hint cache\nand the pins of open directories). Node-wide: every view of the node\nshares one cache."
+        },
         "reintegration": {
           "$ref": "#/$defs/ReintegrationStatus",
           "description": "Stranded-journal reintegration (phase 4b)."
@@ -9460,7 +9592,8 @@
         "vfs_ops",
         "fuse",
         "clock",
-        "log"
+        "log",
+        "readdir"
       ],
       "type": "object"
     },

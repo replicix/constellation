@@ -364,6 +364,9 @@ pub struct SessionStats {
     ring_health: RingHealthStats,
     /// Plan 40 R2: the kernel's lookup counts, read live.
     refs: Option<Arc<KernelRefs>>,
+    /// Plan 40 §4.11: what the connection's plus pages handed the kernel,
+    /// read live.
+    plus: Option<Arc<crate::PlusCounters>>,
     /// Plan 42: what the session knows of the kernel's page cache, and
     /// the workarounds' counters, read live.
     pc: Option<Arc<crate::PageCacheTable>>,
@@ -437,6 +440,7 @@ impl SessionStats {
             lock_wait_downgrades: LockWaitCounter::default(),
             ring_health: RingHealthStats::default(),
             refs: None,
+            plus: None,
             pc: None,
             readdirplus: crate::ReaddirPlus::Off,
         }
@@ -473,6 +477,19 @@ impl SessionStats {
     pub(crate) fn with_kernel_refs(mut self, refs: Arc<KernelRefs>) -> Self {
         self.refs = Some(refs);
         self
+    }
+
+    /// Report the plus pages `plus` counts (the session's filesystem's).
+    pub(crate) fn with_plus_counters(mut self, plus: Arc<crate::PlusCounters>) -> Self {
+        self.plus = Some(plus);
+        self
+    }
+
+    /// `READDIRPLUS` pages, entries with attributes and name-only entries
+    /// (by reason) this session handed the kernel (plan 40 §4.11); all 0
+    /// for a `SessionStats` built without a session.
+    pub fn readdirplus_counts(&self) -> crate::PlusCounts {
+        self.plus.as_ref().map(|p| p.counts()).unwrap_or_default()
     }
 
     /// Report `pc`'s counters (the session's filesystem's table).
@@ -758,6 +775,27 @@ mod tests {
             );
             assert_eq!(stats.readdirplus(), mode, "{flags:?}");
         }
+    }
+
+    /// Plan 40 §4.11: a session reports the plus pages its filesystem's
+    /// counters hold, live; one built without a session reports none.
+    #[test]
+    fn a_session_reports_its_plus_counters_live() {
+        use crate::plus_stats::{NameOnly, PageTally, PlusCounters};
+        let plain = SessionStats::with_fallback(Transport::DevFuse, 0, None);
+        assert_eq!(plain.readdirplus_counts(), Default::default());
+        let counters = PlusCounters::new();
+        let stats = SessionStats::with_fallback(Transport::DevFuse, 0, None)
+            .with_plus_counters(counters.clone());
+        let mut t = PageTally {
+            attr: 3,
+            ..Default::default()
+        };
+        t.name_only(NameOnly::View);
+        counters.page(t);
+        let c = stats.readdirplus_counts();
+        assert_eq!((c.pages, c.entries, c.name_only_total()), (1, 3, 1));
+        assert_eq!(c.name_only[2], ("view", 1));
     }
 
     /// Plan 38 Z2c: a lock-wait downgrade counts on its session and in

@@ -23,6 +23,7 @@ pub mod kernel_fixes;
 mod notify;
 pub mod pagecache;
 pub mod passthrough;
+pub mod plus_stats;
 pub mod refs;
 mod repair;
 mod reply;
@@ -42,6 +43,7 @@ pub use passthrough::{
     has_cap_sys_admin, InodeHandoff, PassthroughHandoff, PassthroughPolicy, PassthroughState,
     PassthroughStatus, PassthroughWish, PASSTHROUGH_ENV,
 };
+pub use plus_stats::{NameOnly, PlusCounters, PlusCounts};
 pub use refs::{KernelRefs, RefsHandoff};
 pub use reply::reply_code;
 pub use session::{

@@ -14,6 +14,7 @@ use crate::dentries::{EntryGuard, KernelEntries, RenameGuard};
 use crate::notify::NotifyGate;
 use crate::pagecache::{Claim, Mark, OpenFacts, PageCacheTable};
 use crate::passthrough::{OpenAnswer, PassthroughState, PreOpen};
+use crate::plus_stats::{NameOnly, PageTally};
 use crate::repair::RepairLane;
 use crate::stats::ZeroCopyCounter;
 use constellation_types::Code;
@@ -1194,18 +1195,45 @@ pub(crate) struct DirPlusReply {
     /// (its entry keeps its TTL: `add_with_ttls`).
     pub dir_zero: bool,
     pub handed: HandedList,
+    /// `CONSTELLATION_FUSE_READDIRPLUS=off` in this image: the kernel's
+    /// plus request is served name-only throughout (the reason the
+    /// entries are counted under).
+    pub knob_off: bool,
+    /// What the buffer took, by kind: added to the connection's counters
+    /// when the page succeeds ([`crate::plus_stats`]).
+    pub tally: PageTally,
 }
 
 impl DirPlusReply {
-    fn add_name_only(&mut self, ino: Ino, next: u64, kind: FileKind, name: &[u8]) -> bool {
-        self.reply
-            .add_name(INodeNo(ino), next, file_type(kind), OsStr::from_bytes(name))
+    /// A name-only record, `why` it is one unless the knob or the name
+    /// says otherwise. Counted when the buffer took it.
+    fn add_name_only(
+        &mut self,
+        ino: Ino,
+        next: u64,
+        kind: FileKind,
+        name: &[u8],
+        why: NameOnly,
+    ) -> bool {
+        let full =
+            self.reply
+                .add_name(INodeNo(ino), next, file_type(kind), OsStr::from_bytes(name));
+        if !full {
+            self.tally.name_only(if self.knob_off {
+                NameOnly::Knob
+            } else if name == b"." || name == b".." {
+                NameOnly::Dots
+            } else {
+                why
+            });
+        }
+        full
     }
 }
 
 impl DirSink for DirPlusReply {
     fn add(&mut self, ino: Ino, next: u64, kind: FileKind, name: &[u8]) -> bool {
-        self.add_name_only(ino, next, kind, name)
+        self.add_name_only(ino, next, kind, name, NameOnly::View)
     }
 
     fn add_entry(
@@ -1225,7 +1253,7 @@ impl DirSink for DirPlusReply {
         let dots = name == b"." || name == b"..";
         let usable = |e: &&Entry| !dots && e.attr.ino != ROOT_INO && e.attr.ino != 0;
         let Some(e) = entry.filter(usable) else {
-            return self.add_name_only(ino, next, kind, name);
+            return self.add_name_only(ino, next, kind, name, NameOnly::View);
         };
         debug_assert_eq!(e.attr.ino, ino, "an entry's node id is its inode");
         if self.reply.remaining_capacity() < direntplus_len(name) {
@@ -1234,7 +1262,7 @@ impl DirSink for DirPlusReply {
         if !self.notice.replying_each(self.seen, e.attr.ino) {
             // The table of marks is full (a pid-0 lister of a huge
             // directory): the kernel looks this name up when it needs it.
-            return self.add_name_only(ino, next, kind, name);
+            return self.add_name_only(ino, next, kind, name, NameOnly::Watch);
         }
         let full = self.reply.add_with_ttls(
             INodeNo(e.attr.ino),
@@ -1248,6 +1276,7 @@ impl DirSink for DirPlusReply {
         if !full {
             let size = (e.attr.kind == FileKind::File).then_some(e.attr.size);
             self.handed.push(e.attr.ino, name, e.attr.ttl, size);
+            self.tally.attr += 1;
         }
         full
     }
@@ -1265,6 +1294,7 @@ impl Responder<()> for DirPlusReply {
                     self.entries.refs().took(h.ino);
                     self.entries.listed(self.parent, name, h.ttl);
                 }
+                self.entries.plus().page(self.tally);
                 self.reply.ok();
             }
             Err(e) => {

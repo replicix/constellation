@@ -59519,3 +59519,93 @@ checked; it now makes them name-only by name, as it does node id 1.
 `dot_entries_of_a_plus_page_are_name_only` (a view handing both with
 attributes) fails before (node ids 5 and 80, a reference each) and passes
 after.
+
+### Plan 40 P8: listing and `READDIRPLUS` observability, and the docs (R7)
+
+What an operator and a test can now read (§4.11, decisions D11 and Q6):
+
+- `node.status` `readdir` (node-wide, one block: the hint cache is shared by
+  every view): `hint_hits`, `cold_scans` (a hint miss), `cold_scan_entries`,
+  `lost_cookies` (the `ENOENT` case), `cookie_collisions`, `hint_bytes`,
+  `open_streams`, `pinned_dirs`, `pinned_bytes`, `exempt_bytes`,
+  `pin_overflows`: `Listing::stats()` through `Engine::listing_stats()`.
+- `fuse.mounts[]`: `readdirplus` (the mode `FUSE_INIT` agreed),
+  `readdirplus_pages`, `readdirplus_entries` (with attributes),
+  `readdirplus_name_only` and `readdirplus_name_only_why`
+  (`knob_off`, `dots`, `view`, `watch_full`), and `unlinked_refs`
+  (`View::unlinked_refs_len()`, filled by the engine from the mount's view).
+  The counters are `frontend-fuse/src/plus_stats.rs`, held by
+  `KernelEntries` beside the lookup counts, tallied per page by
+  `DirPlusReply` and added in `done(Ok)`: an entry the reply buffer refused,
+  and a page that failed, count as nothing.
+- `/metrics`: `constellation_fuse_readdirplus{mode}`,
+  `..._readdirplus_pages_total`, `..._readdirplus_entries_total{kind}`,
+  `..._readdirplus_name_only_total{reason}`, `constellation_fuse_unlinked_refs`
+  and the `constellation_readdir_*` series (one per `readdir` field; the
+  spec's `lost_cookies`, `cold_scans`, `hint_bytes`, `pinned_bytes`,
+  `pin_overflows` among them). The op metrics already carried
+  `op="readdirplus"` (the op name comes from `OpKind`); a test pins it.
+- The control schema is re-blessed in place; no version bump, no shim.
+
+Docs: `docs/reference/configuration.md` (the two pin bounds were missing; the
+`ENOENT` case and when it can still occur; the 31-bit opt-in was already
+there; a new "Listing and `READDIRPLUS` in the status" section),
+`docs/reference/features/kernel-cache-coherence.md` (plus entries under W3a,
+W3b and A3, and how to tell `ls -l` is served from the listing),
+`docs/how-to-guides/development/TESTING.md` (the four test levels; the P9
+scenarios are listed as landing with P9), plan 42 §5.3.1 ("does not cover
+`readdirplus`" now says it is covered, as that plan's §1 note allows), and
+plan 40 §4.11 and §7 (the per-view names of the plan became the node block and
+the per-mount fields of Q6). `docs/explanation/DESIGN.md` is not edited
+(CONVENTIONS rule 5); the text proposed for the coordinator is below.
+
+Tests (each counter moves by an operation): `wire.rs`
+`readdirplus_counts_pages_entries_and_name_only_by_reason` (pages, entries,
+each reason but `watch_full`, a buffer-full stop, a failed page and a plain
+`READDIR` counting nothing), the knob-off and pid-0 tests (`knob_off`,
+`watch_full`), `stats::a_session_reports_its_plus_counters_live`,
+`ops::the_listing_counters_and_unlinked_refs_reach_node_status` (hint hits,
+a pinned open directory and its release, a cold scan with its entries, a lost
+cookie, `unlinked_refs` up by an unlink and down by a `FORGET`; the fixture's
+views now declare `reports_forget` as the FUSE adapter does),
+`service::each_listing_counter_is_reported_as_itself` (all eleven fields with
+distinct values: `cookie_collisions`, `exempt_bytes` and `pin_overflows` move
+in `listing_tests.rs`), `vfs_tests::unlinked_refs_len_counts_the_orphans_kept_for_the_kernel`,
+and the `web::tests` series render (every `readdir` field, the per-mount
+series, `op="readdirplus"`).
+
+Proposed `docs/explanation/DESIGN.md` §12 text (plan 40 R7), for the
+coordinator:
+
+- In the paragraph "Not every item below is built yet. Built: …" add
+  `READDIRPLUS` and stable readdir cursors to the built list, and remove
+  "stable readdir cursors (`readdir` resumes by position today)" and
+  "`READDIRPLUS`" from the designed-but-not-built list.
+- Replace the "Stable readdir cursors" bullet: *Stable readdir cursors:* a
+  directory is listed in name order from the replica's `(parent, name)` keys,
+  O(page) for `READDIR` and `READDIRPLUS` alike, and an entry's cookie
+  (`d_off`) is a keyed hash of its name (SipHash-1-3 under a key derived from
+  the filesystem's `gossip_secret`, or the master key under E2E; 62 bits, or
+  31 for 32-bit userspace), so it is the same in every stream, view and node.
+  A resume finds the name its cookie stands for in the recently served pages
+  (a small per-node cache) and continues after it whatever was created or
+  removed meanwhile; a cookie no remembered page holds costs one scan of the
+  directory's names. While a directory is open its pages are pinned (bounded
+  per directory and per node), so a listing that deletes what it has read
+  (`rm -rf`, `find -delete`), a `seekdir` back to a deleted entry and a
+  `daemon --upgrade` mid-listing resume exactly. The inexact cases that
+  remain: a `seekdir` into a region the pin bounds gave up, or a lister that
+  does not keep the directory open (an `nfsd` re-export) after its pages were
+  evicted, whose cookie's name was removed, answers `ENOENT` (counted:
+  `lost_cookies`); two names of one cookie are listed twice, never skipped.
+- Replace the `READDIRPLUS` bullet: *`READDIRPLUS`:* the kernel is asked for
+  it (`auto`: in a directory it is stat'ing and for the first chunk of any
+  listing), and each entry is what a `LOOKUP` of its name answers at that
+  moment, waited for as a `getattr` of it waits, each a kernel lookup
+  reference (given back by `FORGET`; only the last one reaches the view, so an
+  unlinked file the kernel still references is kept for it). Where the view
+  cannot vouch for an entry (`--cto strict` on a node that is not a lone
+  sequencer, a name changed between the page's names and its attribute read,
+  a full table of attribute marks) the entry is name-only and the kernel looks
+  it up when it needs it. `ls -l` of a kernel-cold directory takes about one
+  request per page instead of one per name.

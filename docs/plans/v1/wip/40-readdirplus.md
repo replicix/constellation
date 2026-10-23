@@ -674,7 +674,7 @@ already keyed `(parent, name)` (`crates/mtree/src/keys.rs`), so:
     node: of the directory with the most pinned bytes) are unpinned — they
     become ordinary LRU hints — **except each open stream's `last_page`**,
     which stays pinned whatever the caps; counted
-    (`readdir_pin_overflows`), warned once per directory. So sequential
+    (`readdir.pin_overflows`), warned once per directory. So sequential
     continuation (the `fts` case) is exact at any size; only a `seekdir`
     back into an overflowed region can still meet the unresolvable case.
   - **`releasedir` never blocks**: it removes the stream under the
@@ -781,7 +781,7 @@ already keyed `(parent, name)` (`crates/mtree/src/keys.rs`), so:
   style): exact and stateless, but one more put/delete per dentry change
   (two per rename) on every write path — local ops, replay, inbox, scratch,
   speculation rollback, bootstrap — and a rebuild after a tree bootstrap.
-  **Documented escalation, not built**: if `readdir_cold_scans` shows the
+  **Documented escalation, not built**: if `readdir.cold_scans` shows the
   O(n) fallback matters (busy `nfsd` re-export of huge directories, frequent
   restarts), build it lazily per directory above a size threshold.
 - *`FOPEN_CACHE_DIR`*: now safe (cookies are stream-independent, K10) —
@@ -813,22 +813,28 @@ already keyed `(parent, name)` (`crates/mtree/src/keys.rs`), so:
   in `node.status` per mount: `readdirplus` (`off`/`auto`/`always`, as
   negotiated), `readdirplus_entries`, `readdirplus_name_only`, and (from
   R2) `kernel_refs`, `forgets_final`, `forgets_partial`, `forgets_unknown`.
-- Per view in `node.status`: `unlinked_refs` (the orphans kept for kernel
-  references — there is no orphan count in status today), and the listing
-  counters `readdir_hint_hits`, `readdir_cold_scans`,
-  `readdir_cold_scan_entries`, `readdir_lost_cookies` (the `ENOENT`
-  case), `readdir_cookie_collisions`, `readdir_hint_bytes`,
-  `readdir_open_streams`, `readdir_pinned_dirs`, `readdir_pinned_bytes`,
-  `readdir_pin_overflows`.
-- `/metrics`: `constellation_fuse_readdirplus_entries_total{kind="attr"|
-  "name_only"}`, `constellation_readdir_cold_scans_total`,
-  `constellation_readdir_lost_cookies_total`,
-  `constellation_readdir_hint_bytes` and `constellation_readdir_pinned_bytes`
-  (gauges), `constellation_readdir_pin_overflows_total`, plus R2's
-  `constellation_fuse_kernel_refs` and
-  `constellation_fuse_forgets_total{outcome}`; the op metrics gain
-  `op="readdirplus"`. Status schema re-blessed
-  (`crates/control/src/schema.rs`).
+- Per mount, `fuse.mounts[].unlinked_refs` (the orphans the view keeps for
+  kernel references, `View::unlinked_refs_len()`; there was no orphan count
+  in status before). Q6: the listing counters are node-wide (the hint cache
+  is shared by every view), so they are one `node.status` block,
+  `readdir`: `hint_hits`, `cold_scans` (a hint miss), `cold_scan_entries`,
+  `lost_cookies` (the `ENOENT` case), `cookie_collisions`, `hint_bytes`,
+  `open_streams`, `pinned_dirs`, `pinned_bytes`, `exempt_bytes`,
+  `pin_overflows`. Per mount also `readdirplus_pages` and
+  `readdirplus_name_only_why` (`knob_off`, `dots`, `view`, `watch_full`),
+  counted from what the reply buffer took on a page that succeeded.
+- `/metrics`: `constellation_fuse_readdirplus{mode}`,
+  `constellation_fuse_readdirplus_pages_total`,
+  `constellation_fuse_readdirplus_entries_total{kind="attr"|"name_only"}`,
+  `constellation_fuse_readdirplus_name_only_total{reason}`,
+  `constellation_fuse_unlinked_refs`, and per node
+  `constellation_readdir_{hint_hits,cold_scans,cold_scan_entries,
+  lost_cookies,cookie_collisions,pin_overflows}_total` and
+  `constellation_readdir_{hint_bytes,open_streams,pinned_dirs,pinned_bytes,
+  exempt_bytes}`, plus R2's `constellation_fuse_kernel_refs` and
+  `constellation_fuse_forgets_total{outcome}`; the op metrics carry
+  `op="readdirplus"` (the op name needed no change). Status schema
+  re-blessed (`crates/control/schema/control.schema.json`).
 
 ## 5. Prior art for §4.9
 
@@ -956,7 +962,7 @@ Each milestone ends green on `cargo fmt`/`clippy -D warnings`/`cargo test
     after it not;
   - handover mid-listing: export/import the handle table between two views
     with the next resume entry deleted in between: the resume is exact
-    (no cold scan, `readdir_cold_scans` unchanged);
+    (no cold scan, `readdir.cold_scans` unchanged);
   - pin caps: 10k open streams over 1k directories with small caps —
     pinned bytes never exceed either cap, overflow unpins the oldest pages
     except each stream's last page, and every stream's sequential
@@ -1099,7 +1105,7 @@ each 3× green, seeded):
   `forgets_partial` rose by exactly 1. (2) Plus references: processes take
   `O_PATH` descriptors of names they found through `ls -l`, another process
   unlinks and `rmdir`s them; every `fstat` answers `nlink 0`; after the
-  processes exit and the mount is unmounted, the per-view `unlinked_refs`
+  processes exit and the mount is unmounted, the mount's `unlinked_refs`
   count was 0 before the unmount once the kernel let go (where the harness
   may drop the dentry cache), and `gc-open-orphan-hold`'s bucket check
   finds no held data.
@@ -1114,7 +1120,7 @@ each 3× green, seeded):
   program pauses a listing mid-directory with the stream open, the name its
   next cookie points at is deleted, `daemon --upgrade` runs, and the
   listing completes exactly — no entry skipped or repeated, no error, no
-  cold scan (`readdir_cold_scans` unchanged: the pinned hints crossed).
+  cold scan (`readdir.cold_scans` unchanged: the pinned hints crossed).
   (The first upgrade across R2/R3b is a remount by design; this scenario
   runs between two images of this plan.)
 - `readdir-huge-delete` — a 1M-entry directory (`--write-mode back`), `rm
@@ -1124,9 +1130,9 @@ each 3× green, seeded):
   process lists 20 directories of 200k entries in a loop the whole time, so
   unpinned hints are evicted continuously; in parallel `find -ls` of the
   doomed directory from a third process. `rm -rf` succeeds, `rmdir`
-  succeeds, no entry is left behind, `readdir_lost_cookies` stays 0,
-  `readdir_pinned_dirs` > 0 while it runs and 0 after, and
-  `readdir_cold_scans` stays 0 for the deleters.
+  succeeds, no entry is left behind, `readdir.lost_cookies` stays 0,
+  `readdir.pinned_dirs` > 0 while it runs and 0 after, and
+  `readdir.cold_scans` stays 0 for the deleters.
 - `readdir-seekdir-after-delete` — a 200k-entry directory opened by a
   program that `telldir`s every 1,000th entry, deletes 90 % of the names
   (the saved ones included) with the stream still open, then `seekdir`s to
@@ -1140,7 +1146,7 @@ each 3× green, seeded):
 - `readdir-many-open-dirs` — 5,000 processes each hold a different
   directory open mid-listing (1,000–20,000 entries each) with the pin caps
   lowered: daemon RSS stays within the caps plus the hint cap,
-  `readdir_pin_overflows` counts, and every process's sequential
+  `readdir.pin_overflows` counts, and every process's sequential
   continuation completes exactly.
 - `fuse-inval-storm` runs a second time with the lister doing `ls -l`
   (plus) instead of `getdents` only: no stall, no wedge (`kill -9` lands as
@@ -1227,7 +1233,7 @@ Acceptance (R8, per host file system and kernel):
    open directories within R0 + the caps; CPU per listed name for `ls -l`
    at most R0's.
 6. **Pins**: `rm -rf` of the 1M-entry directory under the
-   `readdir-huge-delete` pressure succeeds with zero `readdir_lost_cookies`;
+   `readdir-huge-delete` pressure succeeds with zero `readdir.lost_cookies`;
    `releasedir` p99 under 1 ms; the handover with a pinned 1M-entry
    directory adds at most 1 s to the detach-to-serve gap (reported for
    10M).
@@ -1298,7 +1304,7 @@ Open, decided by measurement or later:
   name-only (§4.5); should the knob's default resolve to `off` there
   (saves the larger first page)? Proposed: keep `auto`, measure.
 - **31-bit cookies** default off; legacy 32-bit userspace must opt in.
-- **Cold-scan cost**: if `readdir_cold_scans` is material in production
+- **Cold-scan cost**: if `readdir.cold_scans` is material in production
   (busy `nfsd` re-export of huge directories, frequent restarts), build
   option (b) lazily for large directories (§4.9); it would also close the
   remaining inexact case for restarts and `nfsd`.

@@ -3363,6 +3363,8 @@ struct PlusSession {
     mock: MockVfs,
     refs: Arc<constellation_frontend_fuse::KernelRefs>,
     sink: FuseNotifySink,
+    /// The connection's plus counters (what `node.status` reports).
+    plus: Arc<constellation_frontend_fuse::PlusCounters>,
 }
 
 fn plus_session_with(
@@ -3391,6 +3393,7 @@ fn plus_session_on(
     )
     .with_workarounds(w);
     let refs = fs.kernel_refs().clone();
+    let plus = fs.plus_counters().clone();
     let link = fs.kernel_link();
     let (k, notifier) = Kernel::start_fs_notifying_on(fs, flags, 0, pair);
     let sink = FuseNotifySink::linked(notifier, &link);
@@ -3401,6 +3404,7 @@ fn plus_session_on(
         mock,
         refs,
         sink,
+        plus,
     }
 }
 
@@ -3536,6 +3540,55 @@ fn readdirplus_encodes_entries_and_name_only_records() {
     k.finish();
 }
 
+/// Plan 40 §4.11: the connection counts the pages it answered, the
+/// entries it handed with attributes, and the name-only ones by why — from
+/// what the kernel's buffer took, and only for a page that succeeded.
+#[test]
+fn readdirplus_counts_pages_entries_and_name_only_by_reason() {
+    let PlusSession {
+        mut k, mock, plus, ..
+    } = plus_session();
+    // (pages, attr entries, [knob_off, dots, view, watch_full]).
+    let counts = || {
+        let c = plus.counts();
+        assert_eq!(
+            c.name_only.iter().map(|(w, _)| *w).collect::<Vec<_>>(),
+            ["knob_off", "dots", "view", "watch_full"]
+        );
+        let by: Vec<u64> = c.name_only.iter().map(|(_, n)| *n).collect();
+        assert_eq!(by.iter().sum::<u64>(), c.name_only_total());
+        (c.pages, c.entries, by)
+    };
+    assert_eq!(counts(), (0, 0, vec![0; 4]));
+    mock.always_readdir(Script::ok(vec![
+        dirent(1, 1, FileKind::Dir, "."),
+        // A view that hands the dots with attributes: still name-only.
+        plus_dirent(1, 2, FileKind::Dir, ".."),
+        plus_dirent(20, 3, FileKind::Dir, "sub"),
+        plus_dirent(21, 4, FileKind::File, "a"),
+        dirent(22, 5, FileKind::File, "b"),
+        plus_dirent(23, 6, FileKind::File, "cc"),
+    ]));
+    parse_plus(k.call(READDIRPLUS, 1, &plus_body(0, 8192)).ok());
+    assert_eq!(counts(), (1, 3, vec![0, 2, 1, 0]));
+    // A buffer that takes three records (160 bytes each): `.`, `..`, `sub`.
+    parse_plus(k.call(READDIRPLUS, 1, &plus_body(0, 480)).ok());
+    assert_eq!(counts(), (2, 4, vec![0, 4, 1, 0]), "what the buffer took");
+    // Two records: the entries it refused are counted as nothing.
+    parse_plus(k.call(READDIRPLUS, 1, &plus_body(0, 479)).ok());
+    assert_eq!(counts(), (3, 4, vec![0, 6, 1, 0]));
+    // A page that fails after it offered its entries counts nothing.
+    mock.abandon_readdir(true);
+    let r = k.call(READDIRPLUS, 1, &plus_body(0, 8192));
+    assert_eq!(r.errno(), libc::EIO);
+    mock.abandon_readdir(false);
+    assert_eq!(counts(), (3, 4, vec![0, 6, 1, 0]));
+    // A plain READDIR is not a plus page.
+    k.call(op::READDIR, 1, &plus_body(0, 8192)).ok();
+    assert_eq!(counts(), (3, 4, vec![0, 6, 1, 0]));
+    k.finish();
+}
+
 /// Plan 40 §4.7: accounting is on success only, before the bytes go. A
 /// page whose responder is dropped after entries were offered (fuser
 /// answers `EIO`) takes no reference and records no name; a good one takes
@@ -3549,6 +3602,7 @@ fn readdirplus_counts_only_on_success() {
         mock,
         refs,
         sink,
+        ..
     } = plus_session();
     mock.always_getattr(Script::ok(attr(ROOT_INO, FileKind::Dir)));
     let entry_inval = |name: &str| Invalidation::Entry {
@@ -3803,6 +3857,8 @@ fn a_pid0_listing_past_the_watch_bound_degrades_to_name_only() {
         mock,
         refs,
         sink,
+        plus,
+        ..
     } = plus_session();
     const TOTAL: u64 = 36_000;
     const FIRST: u64 = 100_000;
@@ -3845,6 +3901,18 @@ fn a_pid0_listing_past_the_watch_bound_degrades_to_name_only() {
         assert_eq!(refs.count(r.d_ino), 0, "no reference for {r:?}");
     }
     assert_eq!(refs.len(), linked);
+    // Counted: the ones with attributes, and the rest as `watch_full`.
+    let c = plus.counts();
+    assert_eq!(c.entries, linked as u64);
+    assert_eq!(
+        c.name_only
+            .iter()
+            .find(|(w, _)| *w == "watch_full")
+            .unwrap()
+            .1,
+        TOTAL - linked as u64
+    );
+    assert_eq!(c.name_only_total(), TOTAL - linked as u64);
     drop(sink);
     k.finish();
 }
@@ -3906,7 +3974,11 @@ fn a_plus_file_entry_with_a_new_size_arms_a3() {
 #[test]
 fn a_resumed_session_serves_readdirplus_with_the_knob_off() {
     let PlusSession {
-        mut k, mock, refs, ..
+        mut k,
+        mock,
+        refs,
+        plus,
+        ..
     } = plus_session_with(
         constellation_frontend_fuse::ReaddirPlus::Off,
         Default::default(),
@@ -3929,6 +4001,10 @@ fn a_resumed_session_serves_readdirplus_with_the_knob_off() {
         vec![1, 70, 71]
     );
     assert!(refs.is_empty());
+    // Every entry of the page is name-only for the knob, the dot too.
+    let c = plus.counts();
+    assert_eq!((c.pages, c.entries, c.name_only_total()), (1, 0, 3));
+    assert_eq!(c.name_only[0], ("knob_off", 3));
     assert!(matches!(
         mock.last_call().unwrap().args,
         Args::Readdir { plus: false, .. }
@@ -3947,6 +4023,7 @@ fn an_entry_the_buffer_refused_is_neither_counted_nor_marked() {
         mock,
         refs,
         sink,
+        ..
     } = plus_session();
     mock.always_readdir(Script::ok(vec![
         plus_dirent(60, 1, FileKind::File, "x"),
@@ -4085,6 +4162,7 @@ fn a_plus_pages_references_and_names_are_recorded_before_its_bytes_go() {
         mock,
         refs,
         sink,
+        ..
     } = plus_session_on(
         constellation_frontend_fuse::ReaddirPlus::Auto,
         Default::default(),

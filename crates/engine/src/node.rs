@@ -2684,6 +2684,11 @@ impl Engine {
     pub fn started(&self) -> Instant {
         self.started
     }
+    /// The counters of the directory listing path every view of this node
+    /// shares (plan 40 §4.11: `node.status`'s `readdir`).
+    pub fn listing_stats(&self) -> crate::view::ListingStats {
+        self.listing.stats()
+    }
     /// Plan 30 §M8: `--cto strict`.
     pub fn cto_strict(&self) -> bool {
         self.cto_strict

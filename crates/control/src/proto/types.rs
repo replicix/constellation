@@ -567,6 +567,10 @@ pub struct StatusReport {
     /// Plan 44: the daemon's log writer. Logging never blocks a daemon
     /// thread; what the log sink could not keep up with is counted here.
     pub log: LogStatus,
+    /// Plan 40 §4.11: the directory listing path (cookies, the hint cache
+    /// and the pins of open directories). Node-wide: every view of the node
+    /// shares one cache.
+    pub readdir: ReaddirStatus,
 }
 
 /// The daemon's log writer (plan 44): one queue between every logging
@@ -695,6 +699,46 @@ pub struct ClockStatus {
     pub rate_budget_ppm: u32,
 }
 
+/// Plan 40 §4.11: what the listing path of this node has done, from
+/// `Listing::stats` (`constellation_readdir_*`). A resume from a
+/// remembered page is a hint hit; one that had to scan the directory is a
+/// cold scan (a hint miss).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReaddirStatus {
+    /// Pages resumed from a remembered page: `O(page)` reads.
+    pub hint_hits: u64,
+    /// Pages resumed by scanning the directory from its start (a cookie no
+    /// remembered page covers: a `seekdir`, an evicted hint, a restart).
+    pub cold_scans: u64,
+    /// Directory entries those scans read.
+    pub cold_scan_entries: u64,
+    /// Cold resumes whose cookie's name had been removed meanwhile: the
+    /// `ENOENT` case (a `seekdir` back into a region the pin bounds gave
+    /// up, or a handle that was never open here).
+    pub lost_cookies: u64,
+    /// Equal cookies of different names seen (two names of one 62-bit hash,
+    /// or of a 31-bit one under `CONSTELLATION_READDIR_COOKIE_BITS=31`).
+    pub cookie_collisions: u64,
+    /// Bytes the ordinary hints hold (`CONSTELLATION_READDIR_HINT_BYTES`
+    /// bounds it).
+    pub hint_bytes: u64,
+    /// Directory streams (`opendir` handles with a listing under way)
+    /// open now.
+    pub open_streams: u64,
+    /// Directories with at least one stream open.
+    pub pinned_dirs: u64,
+    /// Bytes of pages pinned for open directories (bounded by
+    /// `CONSTELLATION_READDIR_PIN_BYTES_PER_DIR` and
+    /// `CONSTELLATION_READDIR_PIN_BYTES`).
+    pub pinned_bytes: u64,
+    /// Bytes of open streams' last pages kept past those bounds: the
+    /// listing in progress is never given up for them.
+    pub exempt_bytes: u64,
+    /// Times a pin bound unpinned pages: only a `seekdir` back into that
+    /// region can then meet a cold scan, or `ENOENT` if its name is gone.
+    pub pin_overflows: u64,
+}
+
 /// Plan 38 §5's `fuse` section: what each FUSE mount's connection is
 /// served over and what of the read path's fast lanes it uses, plus the
 /// process-wide counters behind `constellation_fuse_*`.
@@ -775,6 +819,32 @@ pub struct FuseMountStatus {
     /// `FORGET`s of more lookups than the session counted (a reply's count
     /// was lost): the inode is kept from the view (logged).
     pub forgets_underflow: u64,
+    /// Orphans this mount's view keeps for the kernel's lookups of files
+    /// it unlinked, until their `FORGET` (plan 40 D11; the view's
+    /// `unlinked_refs`). Each holds an inode's data until the kernel lets
+    /// go, so a count that only grows is a lookup the kernel never gives
+    /// back.
+    pub unlinked_refs: u64,
+    /// `READDIRPLUS` as `FUSE_INIT` agreed it (plan 40 §4.1): `off`,
+    /// `auto` or `always`; empty on a mount with no session. A resumed
+    /// session reports its connection's, not the new image's knob.
+    pub readdirplus: String,
+    /// `READDIRPLUS` pages this mount answered.
+    pub readdirplus_pages: u64,
+    /// Entries those pages handed with attributes: each a kernel lookup
+    /// reference, saving the `LOOKUP` of its name
+    /// (`constellation_fuse_readdirplus_entries_total{kind="attr"}`).
+    pub readdirplus_entries: u64,
+    /// Entries handed name-only, the sum of `readdirplus_name_only_why`
+    /// (`kind="name_only"`).
+    pub readdirplus_name_only: u64,
+    /// Name-only entries by why: `knob_off` (this image's
+    /// `CONSTELLATION_FUSE_READDIRPLUS=off` on a connection that still asks
+    /// for plus), `dots` (`.` and `..`), `view` (the view could not vouch
+    /// for the attributes: a strict mount, or a change between the name
+    /// batch and the attribute read) and `watch_full` (the attribute
+    /// reply-mark table is full: a pid-0 lister of a huge directory).
+    pub readdirplus_name_only_why: std::collections::BTreeMap<String, u64>,
     /// Plan 42: the Linux FUSE kernel-race workarounds' counters.
     pub kernel_cache: FuseKernelCacheStatus,
     /// Plan 42 §5.4: their settings, and what the kernel carries.

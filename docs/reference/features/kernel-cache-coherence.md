@@ -14,6 +14,7 @@ fixes.
   - [Keeping a file's pages across opens (W1)](#keeping-a-files-pages-across-opens-w1)
   - [Race 1 and the write-race repair (W2)](#race-1-and-the-write-race-repair-w2)
   - [Races 2a and 2b and directory attributes (W3)](#races-2a-and-2b-and-directory-attributes-w3)
+  - [Directory listings with `READDIRPLUS`](#directory-listings-with-readdirplus)
   - [Kernels with the fixes](#kernels-with-the-fixes)
   - [Settings](#settings)
   - [What stays open](#what-stays-open)
@@ -128,6 +129,39 @@ to).
   directory, never data. `CONSTELLATION_FUSE_DIR_ATTR_TTL=zero` closes it
   at that cost.
 
+### Directory listings with `READDIRPLUS`
+
+With `CONSTELLATION_FUSE_READDIRPLUS` on (`auto`, the default), the kernel
+asks for a directory's entries together with their attributes (plan 40), so
+`ls -l` costs no `LOOKUP` per name. An entry with attributes is what a
+`LOOKUP` of its name answers, and the kernel takes it as one: a dentry, an
+inode, one more lookup of its node id (given back by `FORGET`). The three
+workarounds treat it as the attribute reply it is:
+
+- **W3a**: a directory's entry carries attribute TTL 0 where `LOOKUP` does
+  (`CONSTELLATION_FUSE_DIR_ATTR_TTL`), and keeps its entry TTL.
+- **W3b**: a page installs the attributes of many inodes in one
+  `getdents`. Each is marked for the listing task like any attribute reply,
+  all in one set (a mark per inode, not one mark replaced by the next), so a
+  namespace change of any listed inode that lands before the task's next
+  request is noticed and the kernel rejects the stale entry. Under
+  `--cto strict` a node that is not the lone sequencer hands every entry
+  name-only (its attributes have no kernel lifetime, so the kernel would
+  discard them), and a name removed or renamed between the page's names and
+  its attribute read goes name-only on any mount. When the table of marks is full
+  (a pid-0 lister, such as an `nfsd` re-export, of a huge directory) the
+  rest of the page goes name-only instead of writing a notice per entry;
+  the kernel looks those names up when it needs them, which is correct and
+  slower.
+- **A3**: a regular file's entry with a size other than the one last handed
+  to the kernel arms the file's page-cache check exactly as a `LOOKUP`
+  reply does, since the kernel drops the file's pages when it installs a
+  new size.
+
+`.` and `..` are always name-only (the kernel skips them and never forgets
+them). Every entry that goes name-only is counted by reason
+(`fuse.mounts[].readdirplus_name_only_why`).
+
 ### Kernels with the fixes
 
 The kernel patches (0001 keeps write-through folios under writeback for
@@ -208,6 +242,16 @@ notices stay on), and per fix the verdict and its source (`probe`,
 effect, 0 not; `workaround` is `keep_cache`, `write_repair`,
 `dir_attr_ttl_zero`, `dir_change_notify` or `dir_change_notify_dirs`).
 
+### Is `ls -l` served from the listing?
+
+`fuse.mounts[].readdirplus` is the mode the connection agreed (`off` when
+the kernel does not offer `READDIRPLUS` or the knob is `off`). With `auto`
+or `always`, `readdirplus_entries` should rise by about one per listed name
+and the `lookup` operations of `constellation_vfs_ops_total` should not.
+`readdirplus_name_only_why` says why entries did not carry attributes:
+mostly `dots`; `view` in numbers on a `--cto strict` mount that is not a lone sequencer; `watch_full` for
+a pid-0 lister of a very large directory.
+
 ## FAQ
 
 - **Why not the writeback cache (`FUSE_WRITEBACK_CACHE`)?** It closes race
@@ -222,5 +266,6 @@ effect, 0 not; `workaround` is `keep_cache`, `write_repair`,
 - Plan 42 (`docs/plans/v1/wip/42-kernel-race-workarounds.md`)
 - ADR-34 in [DECISIONS](../../explanation/DECISIONS.md)
 - [Close-to-open modes](cto-modes.md), [Cluster locks](cluster-locks.md)
-- Code: `crates/frontend-fuse/src/{pagecache,repair,kernel_fixes,workarounds,reply,notify}.rs`,
+- Plan 40 (`docs/plans/v1/wip/40-readdirplus.md`)
+- Code: `crates/frontend-fuse/src/{pagecache,repair,kernel_fixes,workarounds,reply,notify,plus_stats}.rs`,
   `crates/engine/src/view/kernel_cache.rs`, `crates/engine/src/kernel_inval.rs`

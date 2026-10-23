@@ -137,6 +137,7 @@ impl DaemonHost {
 /// engine fills in the mount's id and mountpoint.
 fn fuse_mount_status(stats: &constellation_frontend_fuse::SessionStats) -> api::FuseMountStatus {
     let p = stats.passthrough();
+    let plus = stats.readdirplus_counts();
     api::FuseMountStatus {
         passthrough: api::FusePassthroughStatus {
             enabled: p.enabled,
@@ -156,6 +157,15 @@ fn fuse_mount_status(stats: &constellation_frontend_fuse::SessionStats) -> api::
         forgets_partial: stats.forgets_partial(),
         forgets_unknown: stats.forgets_unknown(),
         forgets_underflow: stats.forgets_underflow(),
+        readdirplus: stats.readdirplus().to_string(),
+        readdirplus_pages: plus.pages,
+        readdirplus_entries: plus.entries,
+        readdirplus_name_only: plus.name_only_total(),
+        readdirplus_name_only_why: plus
+            .name_only
+            .iter()
+            .map(|(why, n)| (why.to_string(), *n))
+            .collect(),
         kernel_cache: kernel_cache_status(&stats.kernel_cache()),
         kernel_workarounds: kernel_workarounds_status(&stats.kernel_workarounds()),
         last_fallback: stats.last_fallback().map(|f| api::FuseFallback {

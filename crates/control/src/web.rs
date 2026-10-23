@@ -44,8 +44,8 @@ use crate::authz::Principal;
 use crate::methods::SnapshotSchedStatus;
 use crate::methods::{method_info, NodeStatus, StreamKind};
 use crate::proto::types::{
-    FileStat, FuseStatus, LogStatus, SnapSchedReport, SnapSchedStatus, StatusReport, VfsOpSeries,
-    VfsOpsStatus,
+    FileStat, FuseStatus, LogStatus, ReaddirStatus, SnapSchedReport, SnapSchedStatus, StatusReport,
+    VfsOpSeries, VfsOpsStatus,
 };
 use crate::proto::{ControlError, ErrorKind};
 use crate::server::{
@@ -925,8 +925,91 @@ pub fn render_metrics(status: &StatusReport, sched: Option<&SnapSchedReport>) ->
     );
     render_vfs_ops(&mut output, &status.vfs_ops);
     render_fuse(&mut output, &status.fuse);
+    render_readdir(&mut output, &status.readdir);
     render_log(&mut output, &status.log);
     output
+}
+
+/// Plan 40 §4.11: the node's directory listing path. A hint hit resumed a
+/// page from a remembered one; a cold scan (a hint miss) read the
+/// directory from its start; a lost cookie is the `ENOENT` of a cold
+/// resume whose name was removed; the byte gauges are what the hint cap
+/// and the pin bounds limit.
+fn render_readdir(output: &mut String, r: &ReaddirStatus) {
+    use std::fmt::Write;
+    for (name, kind, help, value) in [
+        (
+            "constellation_readdir_hint_hits_total",
+            "counter",
+            "Directory pages resumed from a remembered page.",
+            r.hint_hits,
+        ),
+        (
+            "constellation_readdir_cold_scans_total",
+            "counter",
+            "Directory pages resumed by scanning the directory from its start (a hint miss).",
+            r.cold_scans,
+        ),
+        (
+            "constellation_readdir_cold_scan_entries_total",
+            "counter",
+            "Directory entries read by cold scans.",
+            r.cold_scan_entries,
+        ),
+        (
+            "constellation_readdir_lost_cookies_total",
+            "counter",
+            "Cold directory resumes whose cookie's name had been removed (ENOENT).",
+            r.lost_cookies,
+        ),
+        (
+            "constellation_readdir_cookie_collisions_total",
+            "counter",
+            "Equal directory cookies of different names seen.",
+            r.cookie_collisions,
+        ),
+        (
+            "constellation_readdir_hint_bytes",
+            "gauge",
+            "Bytes the directory listing hints hold (bounded by CONSTELLATION_READDIR_HINT_BYTES).",
+            r.hint_bytes,
+        ),
+        (
+            "constellation_readdir_open_streams",
+            "gauge",
+            "Open directory streams.",
+            r.open_streams,
+        ),
+        (
+            "constellation_readdir_pinned_dirs",
+            "gauge",
+            "Directories with at least one open stream.",
+            r.pinned_dirs,
+        ),
+        (
+            "constellation_readdir_pinned_bytes",
+            "gauge",
+            "Bytes of listing pages pinned for open directories (bounded by CONSTELLATION_READDIR_PIN_BYTES and _PER_DIR).",
+            r.pinned_bytes,
+        ),
+        (
+            "constellation_readdir_exempt_bytes",
+            "gauge",
+            "Bytes of open streams' last pages kept past the pin bounds.",
+            r.exempt_bytes,
+        ),
+        (
+            "constellation_readdir_pin_overflows_total",
+            "counter",
+            "Times a pin bound unpinned listing pages.",
+            r.pin_overflows,
+        ),
+    ] {
+        let _ = write!(
+            output,
+            "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n"
+        );
+    }
 }
 
 /// Plan 44: the log writer's two numbers an alert wants. Lines dropped
@@ -1310,7 +1393,82 @@ fn render_fuse(output: &mut String, fuse: &FuseStatus) {
             );
         }
     }
+    readdirplus_metrics(output, fuse);
     kernel_cache_metrics(output, fuse);
+}
+
+/// Plan 40 §4.11: `READDIRPLUS` per mount — the mode the connection
+/// negotiated, the pages answered, the entries by `kind` (`attr`: handed
+/// with attributes, `name_only`), the name-only ones by `reason`, and the
+/// orphans the view keeps for the kernel's lookups.
+fn readdirplus_metrics(output: &mut String, fuse: &FuseStatus) {
+    use std::fmt::Write;
+    output.push_str(
+        "# HELP constellation_fuse_readdirplus The READDIRPLUS mode FUSE_INIT agreed (1 on the series of the mode).\n\
+         # TYPE constellation_fuse_readdirplus gauge\n",
+    );
+    for m in &fuse.mounts {
+        let _ = writeln!(
+            output,
+            "constellation_fuse_readdirplus{{mountpoint=\"{}\",mode=\"{}\"}} 1",
+            label_value(&m.mountpoint),
+            label_value(&m.readdirplus),
+        );
+    }
+    output.push_str(
+        "# HELP constellation_fuse_readdirplus_pages_total READDIRPLUS pages answered.\n\
+         # TYPE constellation_fuse_readdirplus_pages_total counter\n",
+    );
+    for m in &fuse.mounts {
+        let _ = writeln!(
+            output,
+            "constellation_fuse_readdirplus_pages_total{{mountpoint=\"{}\"}} {}",
+            label_value(&m.mountpoint),
+            m.readdirplus_pages
+        );
+    }
+    output.push_str(
+        "# HELP constellation_fuse_readdirplus_entries_total READDIRPLUS entries handed to the kernel: with attributes (attr) or name-only.\n\
+         # TYPE constellation_fuse_readdirplus_entries_total counter\n",
+    );
+    for m in &fuse.mounts {
+        for (kind, n) in [
+            ("attr", m.readdirplus_entries),
+            ("name_only", m.readdirplus_name_only),
+        ] {
+            let _ = writeln!(
+                output,
+                "constellation_fuse_readdirplus_entries_total{{mountpoint=\"{}\",kind=\"{kind}\"}} {n}",
+                label_value(&m.mountpoint),
+            );
+        }
+    }
+    output.push_str(
+        "# HELP constellation_fuse_readdirplus_name_only_total Name-only READDIRPLUS entries by reason: knob_off, dots, view (the view could not vouch for the attributes), watch_full.\n\
+         # TYPE constellation_fuse_readdirplus_name_only_total counter\n",
+    );
+    for m in &fuse.mounts {
+        for (reason, n) in &m.readdirplus_name_only_why {
+            let _ = writeln!(
+                output,
+                "constellation_fuse_readdirplus_name_only_total{{mountpoint=\"{}\",reason=\"{}\"}} {n}",
+                label_value(&m.mountpoint),
+                label_value(reason),
+            );
+        }
+    }
+    output.push_str(
+        "# HELP constellation_fuse_unlinked_refs Unlinked files a mount's view keeps for the kernel's lookups until their FORGET.\n\
+         # TYPE constellation_fuse_unlinked_refs gauge\n",
+    );
+    for m in &fuse.mounts {
+        let _ = writeln!(
+            output,
+            "constellation_fuse_unlinked_refs{{mountpoint=\"{}\"}} {}",
+            label_value(&m.mountpoint),
+            m.unlinked_refs
+        );
+    }
 }
 
 /// Plan 42 §5.7: the kernel-race workarounds' counters.
@@ -1869,5 +2027,105 @@ mod tests {
         ] {
             assert!(out.lines().any(|l| l == line), "{line}\n{out}");
         }
+    }
+
+    /// Plan 40 §4.11: the listing path's counters are one series each in
+    /// `/metrics`, with the value the report carries (all different, so a
+    /// series wired to the wrong field shows).
+    #[test]
+    fn the_listing_counters_render_one_series_each() {
+        let status = StatusReport {
+            readdir: ReaddirStatus {
+                hint_hits: 1,
+                cold_scans: 2,
+                cold_scan_entries: 3,
+                lost_cookies: 4,
+                cookie_collisions: 5,
+                hint_bytes: 6,
+                open_streams: 7,
+                pinned_dirs: 8,
+                pinned_bytes: 9,
+                exempt_bytes: 10,
+                pin_overflows: 11,
+            },
+            ..Default::default()
+        };
+        let out = render_metrics(&status, None);
+        for line in [
+            "# TYPE constellation_readdir_hint_hits_total counter",
+            "constellation_readdir_hint_hits_total 1",
+            "# TYPE constellation_readdir_cold_scans_total counter",
+            "constellation_readdir_cold_scans_total 2",
+            "constellation_readdir_cold_scan_entries_total 3",
+            "constellation_readdir_lost_cookies_total 4",
+            "constellation_readdir_cookie_collisions_total 5",
+            "# TYPE constellation_readdir_hint_bytes gauge",
+            "constellation_readdir_hint_bytes 6",
+            "constellation_readdir_open_streams 7",
+            "constellation_readdir_pinned_dirs 8",
+            "# TYPE constellation_readdir_pinned_bytes gauge",
+            "constellation_readdir_pinned_bytes 9",
+            "constellation_readdir_exempt_bytes 10",
+            "# TYPE constellation_readdir_pin_overflows_total counter",
+            "constellation_readdir_pin_overflows_total 11",
+        ] {
+            assert!(out.lines().any(|l| l == line), "{line}\n{out}");
+        }
+    }
+
+    /// Plan 40 §4.11: `READDIRPLUS` per mount: the mode, pages, entries by
+    /// kind, name-only entries by reason, and the view's orphans; and the
+    /// op metrics carry `op="readdirplus"`.
+    #[test]
+    fn readdirplus_metrics_render_per_mount() {
+        use crate::proto::types::{FuseMountStatus, VfsOpSeries, VfsOpsStatus};
+        let fuse = FuseStatus {
+            mounts: vec![FuseMountStatus {
+                id: 1,
+                mountpoint: "/mnt/a".into(),
+                readdirplus: "auto".into(),
+                readdirplus_pages: 3,
+                readdirplus_entries: 40,
+                readdirplus_name_only: 7,
+                readdirplus_name_only_why: [("dots".to_string(), 6), ("view".to_string(), 1)]
+                    .into_iter()
+                    .collect(),
+                unlinked_refs: 5,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut out = String::new();
+        render_fuse(&mut out, &fuse);
+        for line in [
+            "constellation_fuse_readdirplus{mountpoint=\"/mnt/a\",mode=\"auto\"} 1",
+            "# TYPE constellation_fuse_readdirplus_pages_total counter",
+            "constellation_fuse_readdirplus_pages_total{mountpoint=\"/mnt/a\"} 3",
+            "# TYPE constellation_fuse_readdirplus_entries_total counter",
+            "constellation_fuse_readdirplus_entries_total{mountpoint=\"/mnt/a\",kind=\"attr\"} 40",
+            "constellation_fuse_readdirplus_entries_total{mountpoint=\"/mnt/a\",kind=\"name_only\"} 7",
+            "constellation_fuse_readdirplus_name_only_total{mountpoint=\"/mnt/a\",reason=\"dots\"} 6",
+            "constellation_fuse_readdirplus_name_only_total{mountpoint=\"/mnt/a\",reason=\"view\"} 1",
+            "# TYPE constellation_fuse_unlinked_refs gauge",
+            "constellation_fuse_unlinked_refs{mountpoint=\"/mnt/a\"} 5",
+        ] {
+            assert!(out.lines().any(|l| l == line), "{line}\n{out}");
+        }
+        let ops = VfsOpsStatus {
+            bucket_bounds_s: vec![0.001],
+            series: vec![VfsOpSeries {
+                frontend: "fuse".into(),
+                view: None,
+                op: "readdirplus".into(),
+                transport: "dev_fuse".into(),
+                outcomes: [("ok".to_string(), 2)].into_iter().collect(),
+                buckets: vec![2, 0],
+                sum_ns: 10,
+            }],
+        };
+        let mut out = String::new();
+        render_vfs_ops(&mut out, &ops);
+        assert!(out.lines().any(|l| l
+            == "constellation_vfs_ops_total{frontend=\"fuse\",op=\"readdirplus\",transport=\"dev_fuse\",outcome=\"ok\"} 2"));
     }
 }

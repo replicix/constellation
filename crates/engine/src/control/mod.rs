@@ -324,6 +324,9 @@ impl EngineControl {
                 let mut fuse = v.fuse?;
                 fuse.id = v.id;
                 fuse.mountpoint = v.mountpoint.display().to_string();
+                if let Some(view) = &v.view {
+                    fuse.unlinked_refs = view.unlinked_refs_len() as u64;
+                }
                 match &v.view {
                     Some(view) if fuse.passthrough == api::FusePassthroughStatus::default() => {
                         let p = view.passthrough_status();

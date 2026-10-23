@@ -244,7 +244,12 @@ pub(super) mod tests {
                         labels: labels.clone(),
                         ..ViewSpec::new("/")
                     },
-                    constellation_vfs::FrontendCaps::linux_fuse(false),
+                    // What the FUSE adapter declares: its `FORGET`s reach the
+                    // view (an unlinked file stays for the kernel's lookups).
+                    constellation_vfs::FrontendCaps {
+                        reports_forget: true,
+                        ..constellation_vfs::FrontendCaps::linux_fuse(false)
+                    },
                     DeferredEvents::new(),
                 )
                 .unwrap();
@@ -810,6 +815,112 @@ pub(super) mod tests {
             sample.gauges["constellation_cache_memory_used_bytes"],
             65536.0
         );
+    }
+
+    /// Plan 40 §4.11/D11: a listing moves the node's `readdir` block of
+    /// `node.status`, and a mount's `unlinked_refs` is its view's count of
+    /// orphans kept for the kernel's references.
+    #[test]
+    fn the_listing_counters_and_unlinked_refs_reach_node_status() {
+        use constellation_vfs::{CollectDir, Fh, OpCtx, OpenFlags, OpenOwner};
+        let f = fixture(&[&[]]);
+        let view = &f.views[0];
+        let caller = Caller::new(0, 0, None);
+        let cx = |op| OpCtx::new(op, &caller);
+        assert_eq!(f.svc.status().readdir, api::ReaddirStatus::default());
+        let d =
+            Blocking::run(|r| view.mkdir(&cx(OpKind::Mkdir), ROOT_INO, Name::new("d"), 0o755, r))
+                .unwrap()
+                .attr
+                .ino;
+        let mut files = Vec::new();
+        for i in 0..40 {
+            let name = format!("f{i:02}");
+            let (e, o) = Blocking::run(|r| {
+                view.create(
+                    &cx(OpKind::Create),
+                    d,
+                    Name::new(&name),
+                    0o100644,
+                    OpenFlags::READ | OpenFlags::WRITE,
+                    OpenOwner::NONE,
+                    r,
+                )
+            })
+            .unwrap();
+            Blocking::run(|r| {
+                view.release(
+                    &cx(OpKind::Release),
+                    e.attr.ino,
+                    o.fh,
+                    OpenFlags::WRITE,
+                    None,
+                    r,
+                )
+            })
+            .unwrap();
+            files.push((name, e.attr.ino));
+        }
+        let page = |fh: Fh, cookie: u64, limit: usize| {
+            let (sink, wait) = CollectDir::pair(limit);
+            view.readdir(&cx(OpKind::Readdir), d, fh, cookie, false, sink);
+            wait.wait()
+        };
+        // A listing through an open stream, in pages of 4: hints, and the
+        // directory pinned meanwhile.
+        let fh = Blocking::run(|r| view.opendir(&cx(OpKind::Opendir), d, r)).unwrap();
+        let (mut cookie, mut listed) = (0, Vec::new());
+        loop {
+            let entries = page(fh, cookie, 4).unwrap();
+            let Some(last) = entries.last() else { break };
+            cookie = last.next;
+            listed.extend(entries);
+        }
+        assert_eq!(listed.len(), 42, "40 names, . and ..");
+        let open = f.svc.status().readdir;
+        assert!(open.hint_hits >= 9, "{open:?}");
+        assert_eq!((open.open_streams, open.pinned_dirs), (1, 1), "{open:?}");
+        assert!(open.pinned_bytes > 0, "{open:?}");
+        assert_eq!(open.cold_scans, 0, "{open:?}");
+        Blocking::run(|r| view.releasedir(&cx(OpKind::Releasedir), d, fh, r)).unwrap();
+        let closed = f.svc.status().readdir;
+        assert_eq!(
+            (closed.open_streams, closed.pinned_dirs, closed.pinned_bytes),
+            (0, 0, 0)
+        );
+        assert!(closed.hint_bytes > 0, "the last pages stay as hints");
+
+        // A cookie from the first pages, which only the last four remain
+        // of: a cold scan.
+        page(Fh(0), listed[5].next, 4).unwrap();
+        let cold = f.svc.status().readdir;
+        assert_eq!(cold.cold_scans, 1, "{cold:?}");
+        // `f00`..`f03`: the scan stopped at the name the cookie stands for.
+        assert_eq!(cold.cold_scan_entries, 4, "{cold:?}");
+        // The same cookie after its name was removed: nothing to resume
+        // from, `ENOENT`, counted.
+        let gone = listed[17].next;
+        let name = String::from_utf8(listed[17].name.clone().into_bytes()).unwrap();
+        Blocking::run(|r| view.unlink(&cx(OpKind::Unlink), d, Name::new(&name), r)).unwrap();
+        assert_eq!(page(Fh(0), gone, 4).unwrap_err().code(), Code::NotFound);
+        let lost = f.svc.status().readdir;
+        assert_eq!(lost.lost_cookies, 1, "{lost:?}");
+        assert_eq!(lost.cold_scans, 2, "the scan that did not find it");
+
+        // `unlinked_refs` per mount: the host reports a FUSE section for
+        // the view, the engine fills in what is the view's.
+        f.host.0.lock().unwrap()[0].fuse = Some(Default::default());
+        let refs = || f.svc.status().fuse.mounts[0].unlinked_refs;
+        // The file unlinked above for the lost cookie is one already.
+        assert_eq!(refs(), 1);
+        let first = files.iter().find(|(n, _)| *n == name).unwrap().1;
+        let (victim, ino) = files.iter().find(|(n, _)| *n != name).unwrap().clone();
+        Blocking::run(|r| view.unlink(&cx(OpKind::Unlink), d, Name::new(&victim), r)).unwrap();
+        assert_eq!(refs(), 2, "kept for the kernel's references");
+        view.forget(ino);
+        assert_eq!(refs(), 1, "given back at its FORGET");
+        view.forget(first);
+        assert_eq!(refs(), 0);
     }
 
     /// Plan 38 §5: the host's per-session FUSE state reaches
