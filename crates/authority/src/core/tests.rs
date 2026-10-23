@@ -38442,6 +38442,162 @@ mod c1_tail_fetch {
             "{out:?}"
         );
     }
+
+    /// Integration re-review (F1 x a member brought up again): the
+    /// re-adopted holder brings the member its lease names up again as a
+    /// backup, at the same epoch; its appends carry the re-adopted
+    /// configuration's version, which the member's role takes, and a member
+    /// answers only a claimant asking at or above its role's version (D8).
+    /// A TTL claimant of the re-adopted lease must ask the group at the
+    /// version it read, and the lease it writes must name that member too.
+    /// Fails on the parent: asked at the tail's version 2, node 2 (role at
+    /// 3) refused, and the claim waited for a holder that was gone.
+    #[test]
+    fn a_member_the_readopted_holder_brought_up_again_answers_its_claimant() {
+        let mut b = Harness::new(2);
+        let append = |b: &mut Harness, cv: u64, candidacy: u64, txs: Vec<BackupTx>, from| {
+            b.step(Event::Peer {
+                from: 1,
+                msg: PeerMsg::BackupAppend {
+                    req: OpId(cv),
+                    epoch: 1,
+                    holder: 1,
+                    config_version: cv,
+                    candidacy,
+                    from,
+                    txs,
+                    through: 0,
+                    sent_ms: 0,
+                    expires_ms: 0,
+                    clock: 0,
+                },
+            })
+        };
+        let txs = tail_of(2);
+        let next = txs.last().unwrap().last + 1;
+        append(&mut b, 2, 1, txs.clone(), 1);
+        // The re-adopted configuration (version 3) brings it up again.
+        append(&mut b, 3, 2, Vec::new(), next);
+        assert_eq!(b.core.bk.role.map(|r| r.config_version), Some(3));
+        let readopted = Lease {
+            config_version: 3,
+            inherited_tail: Some(Box::new(InheritedTail {
+                epoch: 1,
+                config_version: 2,
+                members: vec![1, 2],
+                through: 2,
+            })),
+            ..lease_of(1, 1, b.now.0 - 1)
+        };
+        let (mut h, out) = claimant(3, &readopted);
+        let (_, req, epoch, cv, from) = *seal_tails(&out)
+            .iter()
+            .find(|a| a.0 == 2)
+            .unwrap_or_else(|| panic!("{out:?}"));
+        let answered = seal_tail(&mut b, 3, epoch, cv, from);
+        assert!(
+            sealed(&answered)
+                .iter()
+                .any(|s| s.0 == 3 && s.1 && s.2 == txs.len()),
+            "the member answers: {answered:?}"
+        );
+        // The claim goes on with it; the lease it writes names the group.
+        let out = h.step(answer(2, req, 1, txs.clone()));
+        let tail = find_s3(&out, |r| matches!(r, S3Op::SegmentRun { .. }));
+        let out = h.step(Event::S3 {
+            op: tail,
+            result: S3Result::SegmentRun(Ok(Vec::new())),
+        });
+        let out = at_head(&mut h, out);
+        let written = s3_ops(&out)
+            .into_iter()
+            .find_map(|(_, r)| match r {
+                S3Op::LeaseSwap { lease, .. } => Some(lease.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no CAS in {out:?}"));
+        assert_eq!(written.epoch, 2);
+        let t = written.inherited_tail.expect("names the group");
+        assert_eq!(t.epoch, 1);
+        assert_eq!(t.members, vec![1, 2, 3]);
+    }
+
+    /// ... and the re-adopted holder never dismisses that member: dropping
+    /// its candidacy (a bring-up that timed out) or its listing must not
+    /// tell it to wipe the copy (`HolderAlive { listed: false }` ends the
+    /// role and clears the tail). It is beaten to with candidacy 0, which
+    /// no dismissal names, until the lease stops naming it. Fails on the
+    /// parent: listed with its candidacy, so the driver's book dismissed it
+    /// once it was dropped, and the member let go of rows only it and the
+    /// holder held.
+    #[test]
+    fn the_readopted_holder_never_dismisses_a_member_of_its_tail() {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        let tail = InheritedTail {
+            epoch: 1,
+            config_version: 2,
+            members: vec![1, 2],
+            through: 2,
+        };
+        if let Some((l, _)) = h.core.lease.held.as_mut() {
+            l.config_version = 3;
+            l.inherited_tail = Some(Box::new(tail.clone()));
+        }
+        h.core.ack.candidate = Some(2);
+        h.core.ack.peers.insert(
+            2,
+            crate::core::backup::BackupPeer {
+                candidacy: 9,
+                alive_at: w(h.now),
+                short_since_progress: false,
+                short_since: w(h.now),
+                unreachable: false,
+                answers_beats: false,
+                acked: 0,
+                listed_at: None,
+                counted: 0,
+                sent_through: 0,
+                inflight: Default::default(),
+                last_sent: WaitMs(0),
+                last_progress: w(h.now),
+                committed: false,
+            },
+        );
+        assert_eq!(h.core.backup_candidacies(), vec![(2, 0)]);
+        // A dismissal of candidacy 0 is ignored at the member.
+        let mut b = Harness::new(2);
+        b.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::BackupAppend {
+                req: OpId(1),
+                epoch: 1,
+                holder: 1,
+                config_version: 3,
+                candidacy: 9,
+                from: 1,
+                txs: tail_of(2),
+                through: 0,
+                sent_ms: 0,
+                expires_ms: 0,
+                clock: 0,
+            },
+        });
+        b.core
+            .on_holder_alive(1, 1, 0, false, w(b.now), (0, 0, 0, 0, 0), &b.meta);
+        assert!(b.core.bk.role.is_some(), "kept");
+        assert!(!b.meta.backup_tail(1).unwrap().is_empty());
+        // A tail of an earlier epoch (a takeover's) does not hold it.
+        if let Some((l, _)) = h.core.lease.held.as_mut() {
+            l.inherited_tail = Some(Box::new(InheritedTail { epoch: 0, ..tail }));
+        }
+        assert_eq!(h.core.backup_candidacies(), vec![(2, 9)]);
+        // Nor does a lease that stopped naming the group.
+        if let Some((l, _)) = h.core.lease.held.as_mut() {
+            l.inherited_tail = None;
+        }
+        assert_eq!(h.core.backup_candidacies(), vec![(2, 9)]);
+    }
 }
 
 /// Plan 43 C1-2: the class at journal time, carried with every answer.

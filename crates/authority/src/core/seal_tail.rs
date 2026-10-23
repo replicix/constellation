@@ -576,6 +576,12 @@ impl Core {
         // may ask; this node's copy outlives the fetch.
         let mut members: Vec<NodeId> = match &prev.inherited_tail {
             Some(t) if t.epoch == ch.epoch && prev.epoch != ch.epoch => t.members.clone(),
+            // A tail of the lease's own epoch (`own_group_tail`): the group
+            // it names holds the rows as well as whoever the lease lists.
+            Some(t) if t.epoch == ch.epoch => std::iter::once(prev.holder)
+                .chain(prev.backups.iter().copied())
+                .chain(t.members.iter().copied())
+                .collect(),
             _ => std::iter::once(prev.holder)
                 .chain(prev.backups.iter().copied())
                 .collect(),

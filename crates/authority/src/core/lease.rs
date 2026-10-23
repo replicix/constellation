@@ -545,7 +545,18 @@ impl LeaseState {
                     vec![(prev.holder, prev.epoch, prev.config_version)];
                 match &prev.inherited_tail {
                     Some(t) if prev.backups.is_empty() => {
-                        sources.extend(t.members.iter().map(|m| (*m, t.epoch, t.config_version)));
+                        // A tail of the lease's own epoch (a restart
+                        // re-adoption, `Core::own_group_tail`): the holder
+                        // may have brought its members up again since, at
+                        // that epoch, and a member answers only a version
+                        // at or above the one it backs (D8). Asked at the
+                        // version this read saw, which is at least that.
+                        let cv = if t.epoch == prev.epoch {
+                            prev.config_version.max(t.config_version)
+                        } else {
+                            t.config_version
+                        };
+                        sources.extend(t.members.iter().map(|m| (*m, t.epoch, cv)));
                     }
                     _ => sources.extend(
                         prev.backups

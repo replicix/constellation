@@ -1050,13 +1050,34 @@ impl Core {
     /// The backups the holder's off-core heartbeat goes to: the committed
     /// ones and the candidate, each with its candidacy (0: none known —
     /// such a node is never dismissed).
+    ///
+    /// A member of the group the held lease names as the tail of its own
+    /// epoch (a restart re-adoption, `own_group_tail`) is listed with
+    /// candidacy 0 while the lease names it: its copy of the rows the log
+    /// does not carry yet predates this incarnation's candidacies, and a
+    /// dismissal (a bring-up that timed out, a removal) would wipe it. It
+    /// lets go of the copy when a lease read stops naming it.
     pub fn backup_candidacies(&self) -> Vec<(NodeId, u64)> {
+        let named = |n: NodeId| {
+            self.lease.held.as_ref().is_some_and(|(l, _)| {
+                l.inherited_tail
+                    .as_ref()
+                    .is_some_and(|t| t.epoch == l.epoch && t.members.contains(&n))
+            })
+        };
         self.lease
             .backups()
             .iter()
             .copied()
             .chain(self.ack.candidate)
-            .map(|n| (n, self.ack.peers.get(&n).map_or(0, |p| p.candidacy)))
+            .map(|n| {
+                let candidacy = if named(n) {
+                    0
+                } else {
+                    self.ack.peers.get(&n).map_or(0, |p| p.candidacy)
+                };
+                (n, candidacy)
+            })
             .collect()
     }
 
