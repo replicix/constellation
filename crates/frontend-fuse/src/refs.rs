@@ -24,7 +24,7 @@
 //!   `fuse_create_open`) forgets its one lookup;
 //! - a `READDIRPLUS` entry the kernel fails to link is force-forgotten
 //!   (`fuse_force_forget`, `fs/fuse/readdir.c`, `nlookup = 1`), whatever
-//!   else holds the inode (plan 40 §3 K4; not served yet).
+//!   else holds the inode (plan 40 §3 K4; served: `DirPlusReply`).
 //!
 //! The view reaps an orphan it kept for the kernel's reference at its
 //! `forget` (`View::forget_unlinked`, 9447477), so a partial `FORGET`

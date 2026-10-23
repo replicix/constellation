@@ -799,7 +799,8 @@ already keyed `(parent, name)` (`crates/mtree/src/keys.rs`), so:
   `InitFlags::all()`, which contains both bits
   (`src/ll/flags/init_flags.rs:36-38`); constellation's `session.rs` never
   mentions them today. With `off` in the new image the entries are
-  name-only (logged once).
+  name-only (logged once), and the adapter asks the view for a plain page
+  (`plus` false) rather than for attributes it would throw away.
 - What crosses: the lookup table (§4.4); `KernelEntries` keeps its
   `resumed()` unfiltered window (`dentries.rs:68-71`), which covers
   plus-installed dentries too; the open directory streams and their pinned

@@ -75,9 +75,10 @@ use crate::passthrough::{reason, BackingOps, PassthroughState, PassthroughWish, 
 use crate::refs::{Forgot, KernelRefs};
 use crate::repair::RepairLane;
 use crate::reply::{
-    AttrReply, BytesReply, CopyReply, CreateReply, DirChangeReply, DirNotice, DirReply, EmptyReply,
-    EntryReply, LockReply, LseekReply, OpenCtx, OpenDirReply, OpenReply, ReadReply, RenameReply,
-    StatfsReply, Undo, WriteReply, XattrListReply, XattrReply, F_RDLCK, F_UNLCK, F_WRLCK,
+    AttrReply, BytesReply, CopyReply, CreateReply, DirChangeReply, DirNotice, DirPlusReply,
+    DirReply, EmptyReply, EntryReply, HandedList, LockReply, LseekReply, OpenCtx, OpenDirReply,
+    OpenReply, ReadReply, RenameReply, StatfsReply, Undo, WriteReply, XattrListReply, XattrReply,
+    F_RDLCK, F_UNLCK, F_WRLCK,
 };
 use crate::stats::ZeroCopyCounter;
 use constellation_types::{Code, Rdev};
@@ -88,8 +89,8 @@ use constellation_vfs::{
 };
 use fuser::{
     BsdFileFlags, FileHandle, Filesystem, INodeNo, InitFlags, KernelConfig, ReplyAttr, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLseek, ReplyOpen, ReplyWrite, ReplyXattr, Request,
-    TimeOrNow, WriteFlags,
+    ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyLseek, ReplyOpen, ReplyWrite,
+    ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -107,6 +108,66 @@ pub struct KernelTuning {
     pub congestion_threshold: u16,
     /// `FUSE_PARALLEL_DIROPS`: more than one worker.
     pub parallel_dirops: bool,
+    /// Plan 40 §4.1: whether `FUSE_INIT` asks for `READDIRPLUS`, and how
+    /// ([`ReaddirPlus`]). A mount takes it from
+    /// [`TransportConfig::readdirplus`](crate::TransportConfig::readdirplus)
+    /// ([`MountOptions::new`](crate::MountOptions::new)).
+    pub readdirplus: ReaddirPlus,
+}
+
+/// `CONSTELLATION_FUSE_READDIRPLUS` (plan 40 §4.1): what `FUSE_INIT` asks
+/// the kernel for besides plain `READDIR`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReaddirPlus {
+    /// `FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO`: the kernel asks for
+    /// plus in a directory it is stat'ing and for the first chunk of any
+    /// listing (`fuse_use_readdirplus`), plain `READDIR` otherwise.
+    #[default]
+    Auto,
+    /// `FUSE_DO_READDIRPLUS` alone: every chunk is a `READDIRPLUS` (for
+    /// benchmarks, and workloads that stat everything).
+    Always,
+    /// Neither: the kernel only sends `READDIR`. A resumed session whose
+    /// kernel negotiated plus under an earlier image still gets
+    /// `READDIRPLUS` and answers every entry name-only.
+    Off,
+}
+
+impl ReaddirPlus {
+    /// `auto`, `always` or `off` (case-insensitive).
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "always" => Some(Self::Always),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Always => "always",
+            Self::Off => "off",
+        }
+    }
+
+    /// The mode a connection's negotiated capabilities amount to.
+    pub(crate) fn of_flags(flags: InitFlags) -> Self {
+        if !flags.contains(InitFlags::FUSE_DO_READDIRPLUS) {
+            Self::Off
+        } else if flags.contains(InitFlags::FUSE_READDIRPLUS_AUTO) {
+            Self::Auto
+        } else {
+            Self::Always
+        }
+    }
+}
+
+impl std::fmt::Display for ReaddirPlus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl KernelTuning {
@@ -117,6 +178,7 @@ impl KernelTuning {
             max_background: crate::threads::max_background(workers),
             congestion_threshold: crate::threads::congestion_threshold(workers),
             parallel_dirops: workers > 1,
+            readdirplus: ReaddirPlus::default(),
         }
     }
 }
@@ -1216,6 +1278,26 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
                 );
             }
         }
+        // Plan 40 §4.1: `READDIRPLUS` per the knob. The two bits go
+        // together (a kernel that offers one offers both, and AUTO without
+        // plus is ignored); one it does not offer leaves the mount on
+        // plain `READDIR`, as `off` does.
+        let plus = match self.tuning.readdirplus {
+            ReaddirPlus::Auto => {
+                Some(InitFlags::FUSE_DO_READDIRPLUS | InitFlags::FUSE_READDIRPLUS_AUTO)
+            }
+            ReaddirPlus::Always => Some(InitFlags::FUSE_DO_READDIRPLUS),
+            ReaddirPlus::Off => None,
+        };
+        if let Some(plus) = plus {
+            if let Err(missing) = config.add_capabilities(plus) {
+                tracing::info!(
+                    ?missing,
+                    knob = %self.tuning.readdirplus,
+                    "the kernel does not offer FUSE READDIRPLUS; this mount lists with plain READDIR"
+                );
+            }
+        }
         // Plan 38 Z3b: passthrough only for a process that can register
         // backing files and a kernel that offers it; `max_stack_depth`
         // is what turns it on for the connection, so it stays 0
@@ -1814,8 +1896,9 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         // another dentry, an open file or an `O_PATH` descriptor: the
         // answer of a dentry revalidation's `LOOKUP` that named another
         // inode than the dentry's (`fuse_dentry_revalidate`), an entry
-        // the kernel could not instantiate, and (once served) a
-        // `READDIRPLUS` entry it failed to link (`fuse_force_forget`).
+        // the kernel could not instantiate, and a `READDIRPLUS` entry it
+        // failed to link (`fuse_force_forget`, `nlookup = 1`; served:
+        // `DirPlusReply` counts each entry it hands a node id).
         // Until plan 40 R2 every `FORGET` was forwarded, on the argument
         // that the revalidation one names an inode a name just led to,
         // never an unlinked one; true when the reply is written, not when
@@ -1944,6 +2027,57 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             offset,
             false,
             op.responder(DirReply(reply)),
+        );
+    }
+
+    /// Plan 40 §4.7: a listing page whose entries are what a `LOOKUP` of
+    /// each name answers, each a kernel lookup reference
+    /// ([`DirPlusReply`]). Taken like `getattr` (an [`Arrival`] for the
+    /// F21 marks: a plus page installs attributes in the task's
+    /// `getdents`), where plain `readdir` carries no attribute and takes
+    /// none.
+    ///
+    /// [`Arrival`]: crate::attrwatch::Arrival
+    fn readdirplus(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        reply: ReplyDirectoryPlus,
+    ) {
+        if self.tuning.readdirplus == ReaddirPlus::Off {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::info!(
+                    "the kernel asks for READDIRPLUS (negotiated by an earlier image) and \
+                     CONSTELLATION_FUSE_READDIRPLUS is off: every entry is name-only"
+                )
+            });
+        }
+        let caller = caller(req);
+        let op = self.obs().begin(OpKind::Readdirplus, ino.0);
+        let _in = op.enter();
+        self.vfs.readdir(
+            &op.ctx(&caller),
+            ino.0,
+            Fh(fh.0),
+            offset,
+            // A resumed session whose image has the knob off still serves
+            // what its kernel asks (K3: no `ENOSYS` fallback), every
+            // entry name-only: a plain page, which the view answers
+            // without the attributes it would only throw away.
+            self.tuning.readdirplus != ReaddirPlus::Off,
+            op.responder(DirPlusReply {
+                reply,
+                parent: ino.0,
+                entries: self.entries.clone(),
+                pc: self.pc.clone(),
+                notice: self.notice(),
+                seen: self.pc.attr_arrive(req.pid()),
+                dir_zero: self.dir_zero(),
+                handed: HandedList::default(),
+            }),
         );
     }
 

@@ -29,7 +29,8 @@
 //! `ENOENT`, which the kernel caches as an already expired dentry it
 //! always looks up again), so the only dentries a notification can make a
 //! difference to are positive ones the kernel got from one of *our*
-//! replies — `LOOKUP`, `CREATE`, `MKDIR`, `MKNOD`, `SYMLINK`, `LINK` — and
+//! replies — `LOOKUP`, `CREATE`, `MKDIR`, `MKNOD`, `SYMLINK`, `LINK`, and
+//! each `READDIRPLUS` entry that carries a node id (plan 40) — and
 //! keeps valid for the entry TTL that reply carried, or that a local
 //! `RENAME` carried over to the new name (the kernel moves the dentry).
 //! An expired dentry is looked up again before use, exactly as an
@@ -61,6 +62,20 @@
 //! and the kernel applies it after that answer (the lookup holds the
 //! directory lock the notification needs). A request that only reaches
 //! the adapter after the decision reads the replica after the change.
+//!
+//! **`READDIRPLUS`** records each name it hands out with a node id
+//! ([`KernelEntries::listed`]) when its page succeeds, before the page's
+//! bytes are written, and registers no name when the page starts. Nothing
+//! needs it to: the engine holds every notification about the listed
+//! directory back until the page has been answered (`InFlight`, entered
+//! by `View::readdir` and left after the responder's `done` returned),
+//! the sink decides whether a name may be cached when it writes — after
+//! that — and the kernel applies the notification after the page's
+//! dentries (it needs the directory's `i_rwsem`, which the `getdents`
+//! holds). A directory-wide "plus in flight" marker would make every
+//! *foreign* name of the directory look cached for the whole listing,
+//! each a write that parks the notification thread on that lock. A
+//! name-only entry installs nothing and is not recorded.
 //!
 //! Names are keyed by a 64-bit hash: a collision only makes a name look
 //! cached, which costs one notification, never a missed one.
@@ -216,6 +231,28 @@ impl KernelEntries {
                 slot.expires = Some(slot.expires.map_or(expires, |e| e.max(expires)));
             }
         }
+        shard.sweep_if_due(now);
+    }
+
+    /// A `READDIRPLUS` page is about to hand the kernel `name` under
+    /// `parent` with entry TTL `ttl`: the name counts as cached until the
+    /// TTL (and slack) has passed, as after [`EntryGuard::replied`], but
+    /// there is no in-flight count to give back — a listing does not
+    /// register its names when it starts (module doc). Called before the
+    /// page's bytes are written, on success only; a zero TTL installs a
+    /// dentry that is never valid, so it records nothing.
+    pub(crate) fn listed(&self, parent: u64, name: &[u8], ttl: Duration) {
+        let ns = u64::try_from(ttl.as_nanos()).unwrap_or(u64::MAX);
+        self.longest_ttl_ns.fetch_max(ns, Ordering::Relaxed);
+        if ttl.is_zero() {
+            return;
+        }
+        let now = Instant::now();
+        let key = self.key(parent, name);
+        let mut shard = self.shard(&key).lock().unwrap();
+        let expires = expiry_after(now, ttl);
+        let slot = shard.slots.entry(key).or_default();
+        slot.expires = Some(slot.expires.map_or(expires, |e| e.max(expires)));
         shard.sweep_if_due(now);
     }
 
@@ -397,6 +434,25 @@ mod tests {
     fn a_name_never_handed_out_is_not_cached() {
         let e = KernelEntries::new();
         assert!(!e.may_be_cached(1, b"x"));
+    }
+
+    #[test]
+    fn a_listed_name_is_cached_for_its_ttl_and_a_zero_ttl_records_nothing() {
+        let e = KernelEntries::new();
+        e.listed(1, b"x", Duration::from_secs(60));
+        assert!(e.may_be_cached(1, b"x"));
+        assert!(!e.may_be_cached(1, b"y"), "a foreign name of the directory");
+        assert!(!e.may_be_cached(2, b"x"));
+        assert_eq!(e.inflight(&e.key(1, b"x")), 0, "no request to end");
+        e.listed(1, b"zero", Duration::ZERO);
+        assert!(!e.may_be_cached(1, b"zero"));
+        // A later shorter listing does not shorten it.
+        e.listed(1, b"x", Duration::from_millis(1));
+        let left = e.expiry(&e.key(1, b"x")).unwrap() - Instant::now();
+        assert!(left > Duration::from_secs(100), "{left:?}");
+        // The longest TTL a reply carried includes a listing's.
+        e.listed(1, b"long", Duration::from_secs(30));
+        assert_eq!(e.longest_ttl(), Duration::from_secs(60));
     }
 
     #[test]

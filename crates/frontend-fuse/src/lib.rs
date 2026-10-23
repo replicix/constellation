@@ -32,7 +32,7 @@ pub mod threads;
 pub mod workarounds;
 
 pub use adapter::KernelLink;
-pub use adapter::{FuseFs, KernelTuning};
+pub use adapter::{FuseFs, KernelTuning, ReaddirPlus};
 pub use constellation_vfs::FrontendCaps;
 pub use dentries::KernelEntries;
 pub use fuser::{NegotiatedInit, Transport};
@@ -48,7 +48,7 @@ pub use session::{
     mount, mount_source, DetachError, FuseHandoff, FuseSession, FuseUnmounter, HandoverCapable,
     MountOptions, MountSource, SessionControl, SessionExit, SessionHandoff, TransportConfig,
     TransportPolicy, UringZeroCopy, CLUSTER_LOCKS_URING_QUEUE_DEPTH, DEFAULT_URING_QUEUE_DEPTH,
-    TRANSPORT_ENV, URING_QUEUE_DEPTH_ENV, URING_ZERO_COPY_ENV,
+    READDIRPLUS_ENV, TRANSPORT_ENV, URING_QUEUE_DEPTH_ENV, URING_ZERO_COPY_ENV,
 };
 pub use stats::{
     FallbackReason, LockWaitCounter, RingHealthStats, SessionStats, TransportFallback,

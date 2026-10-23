@@ -287,8 +287,6 @@ pub(crate) enum Replying {
     /// The inode is marked; nothing to write first.
     Clear,
     /// Write the notice for the inode before the reply, then release.
-    // Read by plan 40 P6, `replying_each`'s caller.
-    #[allow(dead_code)]
     Notice(Found),
     /// No room for another mark: leave the inode out of the reply.
     Full,
@@ -456,8 +454,6 @@ impl AttrWatch {
     /// [`Replying::Notice`]: the same as `replying`'s `Some`.
     /// [`Replying::Full`]: no room and none could be made; nothing was
     /// marked and nothing is written, the caller leaves the inode out.
-    // Plan 40 P6 (`READDIRPLUS`) is the caller.
-    #[allow(dead_code)]
     pub(crate) fn replying_each(&self, a: Arrival, ino: Ino) -> Replying {
         let Some(t) = a.track else {
             return Replying::Clear;

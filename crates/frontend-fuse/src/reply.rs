@@ -9,8 +9,8 @@
 //! on every path, including a `lock-wait` thread that could not be
 //! started (`constellation_engine::locks::ClusterLocks::lock`).
 
-use crate::attrwatch::Arrival;
-use crate::dentries::{EntryGuard, RenameGuard};
+use crate::attrwatch::{Arrival, Replying};
+use crate::dentries::{EntryGuard, KernelEntries, RenameGuard};
 use crate::notify::NotifyGate;
 use crate::pagecache::{Claim, Mark, OpenFacts, PageCacheTable};
 use crate::passthrough::{OpenAnswer, PassthroughState, PreOpen};
@@ -19,12 +19,12 @@ use crate::stats::ZeroCopyCounter;
 use constellation_types::Code;
 use constellation_vfs::{
     Attr, DirSink, Entry, Fh, FileKind, Ino, LockKind, LockStatus, OpenFlags, Opened, ReadData,
-    Responder, StatFs, VfsResult, XattrNameBuf, ZeroCopySource,
+    Responder, StatFs, VfsResult, XattrNameBuf, ZeroCopySource, ROOT_INO,
 };
 use fuser::{
     Errno, FileHandle, FileType, FopenFlags, Generation, INodeNo, ReplyAttr, ReplyCreate,
-    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock, ReplyLseek, ReplyOpen,
-    ReplyStatfs, ReplyWrite, ReplyXattr, Transport,
+    ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyLock, ReplyLseek,
+    ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Transport,
 };
 use std::ffi::OsStr;
 use std::os::fd::{AsFd, BorrowedFd};
@@ -135,6 +135,28 @@ impl DirNotice {
             self.pc.count_dir_notice();
         }
         self.pc.attr_watch().release(marks);
+    }
+
+    /// [`Self::replying`] for a reply of several inodes (`READDIRPLUS`):
+    /// `ino` joins the set of marks the request has made so far, and the
+    /// notice is written first if a change of it was recorded since the
+    /// request arrived. `false`: the table of marks is full, nothing was
+    /// marked and nothing written — the caller leaves `ino`'s attributes
+    /// out of the reply (a notice per entry would be a storm, and would
+    /// make the kernel reject the page's attributes, `attrwatch`).
+    fn replying_each(&self, seen: Arrival, ino: Ino) -> bool {
+        match self.pc.attr_watch().replying_each(seen, ino) {
+            Replying::Clear => true,
+            Replying::Full => false,
+            Replying::Notice(marks) => {
+                if let Some(notifier) = self.gate.get().and_then(|g| g.notifier_now()) {
+                    let _ = notifier.inval_inode(INodeNo(ino), -1, 0);
+                    self.pc.count_dir_notice();
+                }
+                self.pc.attr_watch().release(marks);
+                true
+            }
+        }
     }
 }
 
@@ -1071,6 +1093,185 @@ impl Responder<()> for DirReply {
         match r {
             Ok(()) => self.0.ok(),
             Err(e) => self.0.error(reply_code(e.code())),
+        }
+    }
+}
+
+/// The bytes of a `fuse_direntplus` ahead of its name: a `fuse_entry_out`
+/// (128) and a `fuse_dirent` (24).
+const DIRENTPLUS_HEADER: usize = 152;
+
+/// What a `READDIRPLUS` record of `name` takes in the reply buffer (a name
+/// only entry takes the same): fuser's `ReplyDirectoryPlus` refuses a
+/// record that does not fit, and writes nothing.
+fn direntplus_len(name: &[u8]) -> usize {
+    (DIRENTPLUS_HEADER + name.len()).next_multiple_of(8)
+}
+
+/// One entry of a `READDIRPLUS` page that handed the kernel a node id.
+struct Handed {
+    ino: Ino,
+    /// The entry's name is `names[prev.name_end..name_end]`.
+    name_end: usize,
+    /// The entry TTL the dentry was installed with.
+    ttl: Duration,
+    /// A regular file's size, which the page handed the kernel (A3).
+    size: Option<u64>,
+}
+
+/// The entries a `READDIRPLUS` reply buffered with a node id, in order,
+/// and their names (one buffer, not one allocation per name).
+#[derive(Default)]
+pub(crate) struct HandedList {
+    items: Vec<Handed>,
+    names: Vec<u8>,
+}
+
+impl HandedList {
+    fn push(&mut self, ino: Ino, name: &[u8], ttl: Duration, size: Option<u64>) {
+        self.names.extend_from_slice(name);
+        self.items.push(Handed {
+            ino,
+            name_end: self.names.len(),
+            ttl,
+            size,
+        });
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&Handed, &[u8])> {
+        let mut start = 0;
+        self.items.iter().map(move |h| {
+            let name = &self.names[start..h.name_end];
+            start = h.name_end;
+            (h, name)
+        })
+    }
+}
+
+/// `readdirplus`'s buffer and completion in one (`R: DirSink +
+/// Responder<()>`; plan 40 §4.7).
+///
+/// An entry with attributes is what a `LOOKUP` of its name answers, and
+/// the kernel takes it as one: a dentry, an inode and one more lookup of
+/// the node id, to be given back by `FORGET`. So this is, per entry, what
+/// [`EntryReply`] does, with two differences in *when*:
+///
+/// - **Only the entries the buffer took are accounted.** A page's entries
+///   are offered one at a time and the buffer says no from some entry on
+///   (the kernel's request size, `ReplyDirectoryPlus`); that entry, and
+///   the ones the view then does not offer, reach the kernel as nothing.
+///   Counting one would leave the inode held for good, and a mark for one
+///   a notice and a table slot for nothing. So nothing is marked for an
+///   entry before the buffer is known to have room for it
+///   ([`ReplyDirectoryPlus::remaining_capacity`]).
+/// - **Accounting is in [`Responder::done`], on success.** The view
+///   answers no error after it added an entry (`Vfs::readdir`), so a page
+///   either succeeds with everything it added or hands the kernel an
+///   error and nothing. `done(Ok)` takes the references, arms A3 and
+///   records the names, all before the bytes are written (a `FORGET` can
+///   follow the reply at once, on another worker, and an `Unknown` one is
+///   kept from the view for good); an error or a dropped responder
+///   accounts nothing.
+///
+/// What cannot wait for `done` is the attribute reply mark: the reply is
+/// on its way to the kernel as soon as it is written, a change of an inode
+/// recorded after the request arrived must find the mark, and the entry
+/// is not marked after its bytes are in the buffer. So the mark (or the
+/// notice that replaces it, `DirNotice::replying_each`) is made when the
+/// entry is offered, after the room check and before the bytes are
+/// buffered.
+pub(crate) struct DirPlusReply {
+    pub reply: ReplyDirectoryPlus,
+    /// The listed directory (the names are recorded under it).
+    pub parent: Ino,
+    pub entries: Arc<KernelEntries>,
+    /// Plan 42 §5.2.1 (A3): the size a file's entry hands the kernel.
+    pub pc: Arc<PageCacheTable>,
+    pub notice: DirNotice,
+    /// Plan 42 F21: what the request saw when it arrived.
+    pub seen: Arrival,
+    /// Plan 42 §5.3.2: a directory's attributes get no kernel lifetime
+    /// (its entry keeps its TTL: `add_with_ttls`).
+    pub dir_zero: bool,
+    pub handed: HandedList,
+}
+
+impl DirPlusReply {
+    fn add_name_only(&mut self, ino: Ino, next: u64, kind: FileKind, name: &[u8]) -> bool {
+        self.reply
+            .add_name(INodeNo(ino), next, file_type(kind), OsStr::from_bytes(name))
+    }
+}
+
+impl DirSink for DirPlusReply {
+    fn add(&mut self, ino: Ino, next: u64, kind: FileKind, name: &[u8]) -> bool {
+        self.add_name_only(ino, next, kind, name)
+    }
+
+    fn add_entry(
+        &mut self,
+        ino: Ino,
+        next: u64,
+        kind: FileKind,
+        name: &[u8],
+        entry: Option<&Entry>,
+    ) -> bool {
+        // The root's node id is refused by the kernel (`-EIO`, and a
+        // forget of it); no view lists it as a child. Defence in depth.
+        let usable = |e: &&Entry| e.attr.ino != ROOT_INO && e.attr.ino != 0;
+        let Some(e) = entry.filter(usable) else {
+            return self.add_name_only(ino, next, kind, name);
+        };
+        debug_assert_eq!(e.attr.ino, ino, "an entry's node id is its inode");
+        if self.reply.remaining_capacity() < direntplus_len(name) {
+            return true;
+        }
+        if !self.notice.replying_each(self.seen, e.attr.ino) {
+            // The table of marks is full (a pid-0 lister of a huge
+            // directory): the kernel looks this name up when it needs it.
+            return self.add_name_only(ino, next, kind, name);
+        }
+        let full = self.reply.add_with_ttls(
+            INodeNo(e.attr.ino),
+            next,
+            OsStr::from_bytes(name),
+            &e.attr.ttl,
+            &attr_ttl(&e.attr, self.dir_zero),
+            &fuse_attr(&e.attr),
+            Generation(e.generation),
+        );
+        if !full {
+            let size = (e.attr.kind == FileKind::File).then_some(e.attr.size);
+            self.handed.push(e.attr.ino, name, e.attr.ttl, size);
+        }
+        full
+    }
+}
+
+impl Responder<()> for DirPlusReply {
+    fn done(self, r: VfsResult<()>) {
+        match r {
+            Ok(()) => {
+                for (h, name) in self.handed.iter() {
+                    if let Some(size) = h.size {
+                        self.pc.size_seen(h.ino, size);
+                    }
+                    // Before the bytes go, as `EntryGuard::hands_out`.
+                    self.entries.refs().took(h.ino);
+                    self.entries.listed(self.parent, name, h.ttl);
+                }
+                self.reply.ok();
+            }
+            Err(e) => {
+                // The contract: no error after an entry was added. (A
+                // dropped responder, which fuser answers `EIO`, never
+                // gets here.)
+                debug_assert!(
+                    self.handed.items.is_empty(),
+                    "a readdir page failed ({e:?}) after it added entries"
+                );
+                self.reply.error(reply_code(e.code()));
+            }
         }
     }
 }

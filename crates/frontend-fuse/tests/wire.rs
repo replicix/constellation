@@ -3275,3 +3275,691 @@ fn a_directorys_attributes_get_no_kernel_lifetime_under_zero() {
         k.finish();
     }
 }
+
+// ------------------------------------------------- plan 40: READDIRPLUS
+
+const READDIRPLUS: u32 = 44;
+/// `FUSE_DO_READDIRPLUS` and `FUSE_READDIRPLUS_AUTO`: bits 13 and 14.
+const DO_READDIRPLUS: u32 = 1 << 13;
+const READDIRPLUS_AUTO: u32 = 1 << 14;
+const PLUS_FLAGS: u32 = KERNEL_INIT_FLAGS | DO_READDIRPLUS | READDIRPLUS_AUTO;
+
+/// `fuse_read_in` of a `READDIR`/`READDIRPLUS`: the stream `Fh(4)`, the
+/// cookie, the size of the kernel's buffer.
+fn plus_body(off: u64, size: u32) -> Body {
+    Body::new()
+        .u64(4)
+        .u64(off)
+        .u32(size)
+        .u32(0)
+        .u64(0)
+        .i32(0)
+        .u32(0)
+}
+
+/// An entry with attributes (what a lookup of `name` answers).
+fn plus_dirent(ino: u64, next: u64, kind: FileKind, name: &str) -> DirEntry {
+    DirEntry {
+        entry: Some(entry(ino, kind)),
+        ..dirent(ino, next, kind, name)
+    }
+}
+
+/// One `fuse_direntplus` of a `READDIRPLUS` reply.
+#[derive(Debug)]
+struct PlusRec {
+    nodeid: u64,
+    generation: u64,
+    entry_valid: u64,
+    attr_valid: u64,
+    /// `None` for a name-only record (node id 0, zeroed attributes).
+    attr: Option<WireAttr>,
+    d_ino: u64,
+    off: u64,
+    typ: u32,
+    name: String,
+}
+
+/// The records of a `READDIRPLUS` reply: a `fuse_entry_out` (128 bytes)
+/// and a `fuse_dirent`, padded to 8, each.
+fn parse_plus(mut b: &[u8]) -> Vec<PlusRec> {
+    let u64_at = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+    let u32_at = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    let mut out = Vec::new();
+    while b.len() >= 152 {
+        let nodeid = u64_at(b, 0);
+        let (d, namelen) = (&b[128..], u32_at(b, 128 + 16) as usize);
+        out.push(PlusRec {
+            nodeid,
+            generation: u64_at(b, 8),
+            entry_valid: u64_at(b, 16),
+            attr_valid: u64_at(b, 24),
+            attr: (nodeid != 0).then(|| wire_attr(&b[40..128])),
+            d_ino: u64_at(d, 0),
+            off: u64_at(d, 8),
+            typ: u32_at(d, 20),
+            name: String::from_utf8_lossy(&d[24..24 + namelen]).into_owned(),
+        });
+        b = &b[128 + (24 + namelen).next_multiple_of(8)..];
+    }
+    assert!(b.is_empty(), "{} bytes of a torn record", b.len());
+    out
+}
+
+/// What a session built for `READDIRPLUS` tests shares with the test.
+struct PlusSession {
+    k: Kernel,
+    mock: MockVfs,
+    refs: Arc<constellation_frontend_fuse::KernelRefs>,
+    sink: FuseNotifySink,
+}
+
+fn plus_session_with(
+    knob: constellation_frontend_fuse::ReaddirPlus,
+    w: constellation_frontend_fuse::Workarounds,
+    flags: u32,
+) -> PlusSession {
+    let mock = MockVfs::new();
+    let fs = FuseFs::new(
+        Arc::new(mock.clone()),
+        constellation_frontend_fuse::caps(false),
+        KernelTuning {
+            readdirplus: knob,
+            ..KernelTuning::for_workers(1)
+        },
+    )
+    .with_workarounds(w);
+    let refs = fs.kernel_refs().clone();
+    let link = fs.kernel_link();
+    let (k, notifier) = Kernel::start_fs_notifying(fs, flags, 0);
+    let sink = FuseNotifySink::linked(notifier, &link);
+    mock.always_release(Script::ok(()));
+    mock.always_flush(Script::ok(()));
+    PlusSession {
+        k,
+        mock,
+        refs,
+        sink,
+    }
+}
+
+fn plus_session() -> PlusSession {
+    plus_session_with(
+        constellation_frontend_fuse::ReaddirPlus::Auto,
+        Default::default(),
+        PLUS_FLAGS,
+    )
+}
+
+/// Plan 40 §4.1: `FUSE_INIT` asks for `FUSE_DO_READDIRPLUS` (with
+/// `FUSE_READDIRPLUS_AUTO` under `auto`) when the knob says so and the
+/// kernel offers it; a kernel that does not offer it leaves the mount on
+/// plain `READDIR`, and still mounts.
+#[test]
+fn init_negotiates_readdirplus_per_knob() {
+    use constellation_frontend_fuse::ReaddirPlus::{Always, Auto, Off};
+    for (knob, offered, expect) in [
+        (Auto, PLUS_FLAGS, DO_READDIRPLUS | READDIRPLUS_AUTO),
+        (Always, PLUS_FLAGS, DO_READDIRPLUS),
+        (Off, PLUS_FLAGS, 0),
+        // A kernel that offers neither: plain, whatever the knob.
+        (Auto, KERNEL_INIT_FLAGS, 0),
+        (Always, KERNEL_INIT_FLAGS, 0),
+        // Both bits go together: one without the other is not auto.
+        (Auto, KERNEL_INIT_FLAGS | DO_READDIRPLUS, 0),
+    ] {
+        let s = plus_session_with(knob, Default::default(), offered);
+        assert_eq!(
+            s.k.init.u32_at(12) & (DO_READDIRPLUS | READDIRPLUS_AUTO),
+            expect,
+            "{knob} against a kernel offering {offered:#x}"
+        );
+        s.k.finish();
+    }
+}
+
+/// `READDIRPLUS` records: node ids, `d_ino`, types, timeouts, the
+/// name-only ones (`.`, `..`, a name the view could not vouch for) with
+/// node id 0 and their real `d_ino`, a directory's attribute validity 0
+/// with its entry validity kept (`dir_zero`), and a buffer-full stop at a
+/// whole record. Only entries with a node id are references.
+#[test]
+fn readdirplus_encodes_entries_and_name_only_records() {
+    let w = constellation_frontend_fuse::Workarounds {
+        dir_attr_ttl: constellation_frontend_fuse::DirAttrTtl::Zero,
+        ..Default::default()
+    };
+    let PlusSession {
+        mut k, mock, refs, ..
+    } = plus_session_with(
+        constellation_frontend_fuse::ReaddirPlus::Auto,
+        w,
+        PLUS_FLAGS,
+    );
+    mock.always_readdir(Script::ok(vec![
+        dirent(1, 1, FileKind::Dir, "."),
+        dirent(1, 2, FileKind::Dir, ".."),
+        plus_dirent(20, 3, FileKind::Dir, "sub"),
+        plus_dirent(21, 4, FileKind::File, "a"),
+        dirent(22, 5, FileKind::File, "b"),
+        plus_dirent(23, 6, FileKind::File, "cc"),
+    ]));
+    let r = k.call(READDIRPLUS, 1, &plus_body(0, 8192));
+    let recs = parse_plus(r.ok());
+    assert_eq!(recs.len(), 6);
+    for (rec, (d_ino, typ, name)) in recs.iter().zip([(1, 4, "."), (1, 4, "..")]) {
+        assert_eq!((rec.nodeid, rec.d_ino, rec.typ), (0, d_ino, typ), "{rec:?}");
+        assert_eq!(rec.name, name);
+        assert!(rec.attr.is_none());
+        assert_eq!((rec.entry_valid, rec.attr_valid), (0, 0), "{rec:?}");
+    }
+    let sub = &recs[2];
+    assert_eq!((sub.nodeid, sub.d_ino, sub.typ, sub.off), (20, 20, 4, 3));
+    assert_eq!(sub.generation, 9);
+    assert_eq!(
+        (sub.entry_valid, sub.attr_valid),
+        (3, 0),
+        "a directory: the entry keeps its TTL, the attributes get none"
+    );
+    let a = &recs[3];
+    assert_eq!((a.nodeid, a.d_ino, a.typ, a.off), (21, 21, 8, 4));
+    assert_eq!((a.entry_valid, a.attr_valid), (3, 3), "a file: both");
+    let attr = a.attr.as_ref().unwrap();
+    assert_eq!(
+        (attr.ino, attr.size, attr.mode, attr.nlink, attr.mtime),
+        (21, 1000, modebits::S_IFREG | 0o644, 3, 2)
+    );
+    assert_eq!(
+        recs[2].attr.as_ref().unwrap().mode,
+        modebits::S_IFDIR | 0o644
+    );
+    let b = &recs[4];
+    assert_eq!(
+        (b.nodeid, b.d_ino, b.typ, b.off, b.name.as_str()),
+        (0, 22, 8, 5, "b")
+    );
+    assert!(b.attr.is_none());
+    assert_eq!((recs[5].nodeid, recs[5].name.as_str()), (23, "cc"));
+    assert_eq!(
+        mock.last_call().unwrap().args,
+        Args::Readdir {
+            ino: 1,
+            fh: Fh(4),
+            cookie: 0,
+            plus: true
+        }
+    );
+    // One reference per entry with a node id: not `.`, `..`, nor `b`.
+    assert_eq!(refs.len(), 3);
+    for ino in [20, 21, 23] {
+        assert_eq!(refs.count(ino), 1, "{ino}");
+    }
+    assert_eq!(refs.count(22), 0);
+
+    // The buffer is full at a whole record, whichever way it falls: each
+    // of these records here takes 152 + the name rounded up to 8 = 160
+    // bytes. Only what the buffer took is a reference.
+    for (size, taken, linked) in [(480, 3, vec![20]), (479, 2, vec![]), (640, 4, vec![20, 21])] {
+        let before = refs.len();
+        let r = k.call(READDIRPLUS, 1, &plus_body(0, size));
+        let recs = parse_plus(r.ok());
+        assert_eq!(recs.len(), taken, "{size} bytes");
+        assert!(r.body.len() <= size as usize);
+        let nodes: Vec<u64> = recs.iter().map(|r| r.nodeid).filter(|n| *n != 0).collect();
+        assert_eq!(nodes, linked, "{size} bytes");
+        assert_eq!(refs.len(), before, "(the same inodes, counted again)");
+    }
+    assert_eq!(refs.count(20), 3, "once per page that took it");
+    assert_eq!(refs.count(21), 2);
+    assert_eq!(refs.count(23), 1, "never taken after the first page");
+    k.finish();
+}
+
+/// Plan 40 §4.7: accounting is on success only, before the bytes go. A
+/// page whose responder is dropped after entries were offered (fuser
+/// answers `EIO`) takes no reference and records no name; a good one takes
+/// exactly one per entry with a node id, and a `FORGET` read right after
+/// the reply — by another thread than the one that wrote it — is the
+/// `Last`, never an `Unknown`.
+#[test]
+fn readdirplus_counts_only_on_success() {
+    let PlusSession {
+        mut k,
+        mock,
+        refs,
+        sink,
+    } = plus_session();
+    mock.always_getattr(Script::ok(attr(ROOT_INO, FileKind::Dir)));
+    let entry_inval = |name: &str| Invalidation::Entry {
+        parent: 5,
+        name: name.into(),
+    };
+    let quiet = Duration::from_millis(300);
+    mock.always_readdir(Script::ok(vec![
+        dirent(5, 1, FileKind::Dir, "."),
+        plus_dirent(30, 2, FileKind::File, "p"),
+        plus_dirent(31, 3, FileKind::File, "q"),
+    ]));
+    // A page that fails after it offered its entries.
+    mock.abandon_readdir(true);
+    let r = k.call(READDIRPLUS, 5, &plus_body(0, 8192));
+    assert_eq!(r.errno(), libc::EIO);
+    assert!(refs.is_empty(), "nothing is a reference");
+    sink.invalidate(&[entry_inval("p"), entry_inval("q")]);
+    assert_quiet(&mut k, quiet, "no name was handed out");
+    mock.abandon_readdir(false);
+
+    // A page that succeeds.
+    k.call(READDIRPLUS, 5, &plus_body(0, 8192)).ok();
+    assert_eq!((refs.count(30), refs.count(31), refs.len()), (1, 1, 2));
+    sink.invalidate(&[entry_inval("p")]);
+    assert_eq!(inval_entry(&k.recv()), (5, "p".into()));
+
+    // Answered from another thread, with the kernel's FORGET read
+    // straight after the reply by the worker: always counted by then.
+    mock.always_readdir(Script::Defer {
+        after: Duration::ZERO,
+        result: Ok(vec![plus_dirent(40, 1, FileKind::File, "d")]),
+    });
+    for i in 1..=300usize {
+        k.call(READDIRPLUS, 5, &plus_body(0, 8192)).ok();
+        forget(&mut k, 40, 1);
+        if i % 50 == 0 {
+            barrier(&mut k);
+            assert_eq!(mock.forgets().len(), i, "every FORGET was the last");
+            assert_eq!(refs.forgets_unknown(), 0, "after {i} pages");
+        }
+    }
+    assert_eq!(refs.forgets_underflow(), 0);
+    assert_eq!(refs.count(40), 0);
+    k.finish();
+}
+
+/// K5: the kernel links a whole reply and asks again from the cookie of
+/// the last entry it emitted, so entries come back; every send is one
+/// lookup, balanced by `FORGET`s.
+#[test]
+fn readdirplus_references_balance_the_kernels_forgets() {
+    let PlusSession {
+        mut k, mock, refs, ..
+    } = plus_session();
+    mock.always_getattr(Script::ok(attr(ROOT_INO, FileKind::Dir)));
+    let all: Vec<DirEntry> = (1..=8u64)
+        .map(|i| plus_dirent(100 + i, i, FileKind::File, &format!("f{i}")))
+        .collect();
+    mock.always_readdir(Script::With(Arc::new(move |call| {
+        let Args::Readdir { cookie, .. } = &call.args else {
+            unreachable!()
+        };
+        Ok(all.iter().filter(|e| e.next > *cookie).cloned().collect())
+    })));
+    // 800 bytes hold five records. The first page links 101-105; the
+    // kernel's buffer took three, so it asks again from cookie 3.
+    let first = parse_plus(k.call(READDIRPLUS, 1, &plus_body(0, 800)).ok());
+    assert_eq!(first.len(), 5);
+    let second = parse_plus(k.call(READDIRPLUS, 1, &plus_body(3, 800)).ok());
+    assert_eq!(second.first().map(|r| r.nodeid), Some(104));
+    let given: Vec<u64> = first.iter().chain(&second).map(|r| r.nodeid).collect();
+    assert_eq!(given.len(), 10);
+    assert_eq!(refs.count(104), 2, "sent twice");
+    assert_eq!(refs.count(105), 2);
+    assert_eq!(refs.count(101), 1);
+    // The kernel gives back what it took: a batch for the lot.
+    let mut totals: Vec<(u64, u64)> = Vec::new();
+    for ino in 101..=108u64 {
+        let n = given.iter().filter(|g| **g == ino).count() as u64;
+        totals.push((ino, n));
+    }
+    // One at a time first: a partial forget keeps the inode.
+    forget(&mut k, 104, 1);
+    barrier(&mut k);
+    assert_eq!(refs.count(104), 1);
+    assert!(mock.forgets().is_empty(), "partial");
+    totals[3].1 -= 1;
+    batch_forget(&mut k, &totals);
+    barrier(&mut k);
+    assert!(refs.is_empty(), "back to the baseline");
+    let mut forgets = mock.forgets();
+    forgets.sort_unstable();
+    assert_eq!(forgets, (101..=108).collect::<Vec<u64>>(), "each, once");
+    assert_eq!(refs.forgets_unknown(), 0);
+    assert_eq!(refs.forgets_underflow(), 0);
+    k.finish();
+}
+
+/// K4: an entry the kernel fails to link is force-forgotten with
+/// `nlookup = 1` while it may hold the same inode through a `LOOKUP`: a
+/// partial forget, which must not reach the view.
+#[test]
+fn a_force_forget_of_a_plus_entry_is_partial() {
+    let PlusSession {
+        mut k, mock, refs, ..
+    } = plus_session();
+    mock.always_getattr(Script::ok(attr(ROOT_INO, FileKind::Dir)));
+    mock.always_lookup(Script::ok(entry(50, FileKind::File)));
+    mock.always_readdir(Script::ok(vec![plus_dirent(50, 1, FileKind::File, "x")]));
+    k.call(op::LOOKUP, ROOT_INO, &Body::new().cstr("x")).ok();
+    k.call(READDIRPLUS, ROOT_INO, &plus_body(0, 4096)).ok();
+    assert_eq!(refs.count(50), 2, "a lookup and a plus entry");
+    forget(&mut k, 50, 1);
+    barrier(&mut k);
+    assert_eq!(refs.forgets_partial(), 1);
+    assert!(mock.forgets().is_empty(), "the kernel still holds it");
+    forget(&mut k, 50, 1);
+    barrier(&mut k);
+    assert_eq!(mock.forgets(), vec![50]);
+    assert!(refs.is_empty());
+    k.finish();
+}
+
+/// `KernelEntries` coverage per name (`dentries`): a name handed out with
+/// a node id may be invalidated, until its TTL and slack have passed; a
+/// name listed name-only installed nothing, a foreign name of the same
+/// directory was never handed out, and an entry with a zero TTL is never
+/// a valid dentry.
+#[test]
+fn entry_invalidations_cover_names_handed_by_readdirplus() {
+    let PlusSession {
+        mut k, mock, sink, ..
+    } = plus_session();
+    let entry_inval = |name: &str| Invalidation::Entry {
+        parent: 5,
+        name: name.into(),
+    };
+    let quiet = Duration::from_millis(300);
+    let mut zero = plus_dirent(32, 4, FileKind::File, "z");
+    zero.entry.as_mut().unwrap().attr.ttl = Duration::ZERO;
+    mock.always_readdir(Script::ok(vec![
+        plus_dirent(30, 1, FileKind::File, "p"),
+        dirent(31, 2, FileKind::File, "n"),
+        dirent(5, 3, FileKind::Dir, ".."),
+        zero,
+    ]));
+    k.call(READDIRPLUS, 5, &plus_body(0, 8192)).ok();
+    sink.invalidate(&[
+        entry_inval("foreign"),
+        entry_inval("n"),
+        entry_inval(".."),
+        entry_inval("z"),
+    ]);
+    assert_quiet(
+        &mut k,
+        quiet,
+        "name-only, foreign and zero-TTL names hold nothing",
+    );
+    sink.invalidate(&[entry_inval("foreign"), entry_inval("p")]);
+    assert_eq!(inval_entry(&k.recv()), (5, "p".into()));
+    assert!(k.recv_within(quiet).is_none());
+
+    // Written for a listed name the moment the reply is out: what the
+    // engine releases after it answered a page it held back.
+    mock.always_readdir(Script::Defer {
+        after: Duration::ZERO,
+        result: Ok(vec![plus_dirent(33, 1, FileKind::File, "late")]),
+    });
+    for _ in 0..100 {
+        k.call(READDIRPLUS, 5, &plus_body(0, 8192)).ok();
+        sink.invalidate(&[entry_inval("late")]);
+        assert_eq!(inval_entry(&k.recv()), (5, "late".into()));
+    }
+    k.finish();
+}
+
+/// Plan 42 F21 on a plus page: every entry is marked for the task that
+/// listed, and a namespace change of any of them after the page was
+/// written finds its mark; one that happened while the page was being
+/// made is noticed before the entry is written. (A per-entry
+/// `replying` would keep only the last entry's mark.)
+#[test]
+fn a_plus_entry_gets_the_w3b_notice_when_its_inode_changed_meanwhile() {
+    let PlusSession {
+        mut k, mock, sink, ..
+    } = plus_session();
+    mock.always_rename(Script::ok(constellation_vfs::Renamed::default()));
+    let rename_moving = |k: &mut Kernel, pid: u32, ino: u64| {
+        mock.always_rename(Script::ok(constellation_vfs::Renamed {
+            moved: Some(ino),
+            exchanged: None,
+        }));
+        let (n, r) = call_noticed_as(
+            k,
+            pid,
+            op::RENAME,
+            5,
+            &Body::new().u64(6).cstr("f").cstr("g"),
+        );
+        r.ok();
+        noticed_inodes(&n)
+    };
+    mock.always_getattr(Script::ok(attr(9, FileKind::File)));
+    mock.always_readdir(Script::Defer {
+        after: Duration::from_millis(400),
+        result: Ok(vec![
+            plus_dirent(60, 1, FileKind::File, "x"),
+            plus_dirent(61, 2, FileKind::File, "y"),
+            plus_dirent(62, 3, FileKind::File, "z"),
+        ]),
+    });
+    let (lister, writer) = (Task::spawn(), Task::spawn());
+    let held = k.send_as(
+        READDIRPLUS,
+        5,
+        (1000, 100, lister.pid()),
+        &plus_body(0, 4096).0,
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    // Another task renames x while the page is being made: no reply of it
+    // was marked yet, so nothing is written for the rename ...
+    assert_eq!(rename_moving(&mut k, writer.pid(), 60), Vec::<u64>::new());
+    // ... and the page writes the notice itself, for x only.
+    let (n, r) = collect_until(&mut k, held);
+    assert_eq!(noticed_inodes(&n), vec![60]);
+    assert_eq!(parse_plus(r.ok()).len(), 3);
+    // The page is written, the lister has sent nothing since: a change of
+    // any of its entries is noticed, once each.
+    assert_eq!(rename_moving(&mut k, writer.pid(), 61), vec![61]);
+    assert_eq!(rename_moving(&mut k, writer.pid(), 61), Vec::<u64>::new());
+    assert_eq!(rename_moving(&mut k, writer.pid(), 62), vec![62]);
+    assert_eq!(rename_moving(&mut k, writer.pid(), 62), Vec::<u64>::new());
+    // The lister's next request installed the rest of the page.
+    let (n, r) = call_noticed_as(&mut k, lister.pid(), op::GETATTR, 9, &GETATTR_BODY());
+    r.ok();
+    assert!(n.is_empty());
+    assert_eq!(rename_moving(&mut k, writer.pid(), 62), Vec::<u64>::new());
+    drop(sink);
+    k.finish();
+}
+
+/// Q2: a lister outside the mount's pid namespace marks one inode at a
+/// time and the table holds `MARKS_MAX` (32 768) of them. Past that the
+/// entries go name-only — no attributes, no reference — and no notice is
+/// written for them (one per entry would be a storm, and each would
+/// make the kernel reject the attributes of the page).
+#[test]
+fn a_pid0_listing_past_the_watch_bound_degrades_to_name_only() {
+    let PlusSession {
+        mut k,
+        mock,
+        refs,
+        sink,
+    } = plus_session();
+    const TOTAL: u64 = 36_000;
+    const FIRST: u64 = 100_000;
+    mock.always_readdir(Script::With(Arc::new(|call| {
+        let Args::Readdir { cookie, .. } = &call.args else {
+            unreachable!()
+        };
+        Ok((*cookie + 1..=TOTAL.min(*cookie + 1000))
+            .map(|i| plus_dirent(FIRST + i, i, FileKind::File, &format!("f{i:05}")))
+            .collect())
+    })));
+    let mut cookie = 0;
+    let mut seen: Vec<PlusRec> = Vec::new();
+    loop {
+        let unique = k.send_as(
+            READDIRPLUS,
+            1,
+            (1000, 100, 0),
+            &plus_body(cookie, 100_000).0,
+        );
+        let (notices, r) = collect_until(&mut k, unique);
+        assert!(notices.is_empty(), "no notice per entry");
+        let recs = parse_plus(r.ok());
+        let Some(last) = recs.last() else { break };
+        cookie = last.off;
+        seen.extend(recs);
+    }
+    assert_eq!(seen.len() as u64, TOTAL);
+    let linked = seen.iter().filter(|r| r.nodeid != 0).count();
+    assert!(
+        (32_000..=33_000).contains(&linked),
+        "{linked} entries had attributes"
+    );
+    // The bound is crossed once, for good: nothing is linked after it.
+    let first_bare = seen.iter().position(|r| r.nodeid == 0).unwrap();
+    assert!(seen[first_bare..].iter().all(|r| r.nodeid == 0));
+    for r in &seen[first_bare..] {
+        assert_eq!(r.d_ino, FIRST + r.off, "the name still has its inode");
+        assert!(r.attr.is_none());
+        assert_eq!(refs.count(r.d_ino), 0, "no reference for {r:?}");
+    }
+    assert_eq!(refs.len(), linked);
+    drop(sink);
+    k.finish();
+}
+
+/// Plan 42 §5.2.1 (A3): a plus entry of a regular file with a size other
+/// than the one last handed to the kernel makes the kernel drop the
+/// file's pages when it installs the entry, as a `LOOKUP` reply does: the
+/// next write of the file, if a read fetched its pages meanwhile, is
+/// answered after a repair, not before.
+#[test]
+fn a_plus_file_entry_with_a_new_size_arms_a3() {
+    let PlusSession {
+        mut k, mock, sink, ..
+    } = plus_session();
+    let p = page();
+    mock.always_open(Script::ok(stamped(9, 5)));
+    mock.always_read(Script::ok(ReadData::from_vec(vec![0; p as usize])));
+    mock.always_write(Script::ok(p as u32));
+    let r = k.call(op::OPEN, 50, &Body::new().i32(RW).u32(0));
+    let _ = open_out(&r);
+    read_req(&mut k, 50, 9, 0, p as u32).ok();
+    // The open's drop, claimed by a repaired write.
+    let unique = write_send(&mut k, 50, 9, 0, &vec![1; p as usize], 0);
+    assert_eq!(inval_inode(&k.recv()).1, 0);
+    assert_eq!(k.recv().unique, unique);
+    // Nothing armed now.
+    read_req(&mut k, 50, 9, 0, p as u32).ok();
+    let unique = write_send(&mut k, 50, 9, 0, &vec![2; p as usize], 0);
+    assert_eq!(k.recv().unique, unique, "answered at once");
+    // A listing hands the kernel the file with a size it has not seen.
+    mock.always_readdir(Script::ok(vec![plus_dirent(50, 1, FileKind::File, "f")]));
+    k.call(READDIRPLUS, 5, &plus_body(0, 4096)).ok();
+    read_req(&mut k, 50, 9, 0, p as u32).ok();
+    let unique = write_send(&mut k, 50, 9, 0, &vec![3; p as usize], 0);
+    assert_eq!(
+        inval_inode(&k.recv()).1,
+        0,
+        "armed by the listing: the pages are repaired"
+    );
+    assert_eq!(k.recv().unique, unique);
+    // The size the kernel has been handed (the writes extended the file to
+    // a page) again drops nothing.
+    let mut same = plus_dirent(50, 1, FileKind::File, "f");
+    same.entry.as_mut().unwrap().attr.size = p;
+    mock.always_readdir(Script::ok(vec![same]));
+    k.call(READDIRPLUS, 5, &plus_body(0, 4096)).ok();
+    read_req(&mut k, 50, 9, 0, p as u32).ok();
+    let unique = write_send(&mut k, 50, 9, 0, &vec![4; p as usize], 0);
+    assert_eq!(k.recv().unique, unique, "the same size arms nothing");
+    drop(sink);
+    k.finish();
+}
+
+/// K3: a kernel that negotiated plus under an earlier image keeps asking
+/// after a resume whose knob is `off`, and an error would reach `getdents`
+/// (no `ENOSYS` fallback). It is served, every entry name-only: nothing
+/// is linked, so nothing is counted, and the view is not asked for
+/// attributes.
+#[test]
+fn a_resumed_session_serves_readdirplus_with_the_knob_off() {
+    let PlusSession {
+        mut k, mock, refs, ..
+    } = plus_session_with(
+        constellation_frontend_fuse::ReaddirPlus::Off,
+        Default::default(),
+        PLUS_FLAGS,
+    );
+    assert_eq!(k.init.u32_at(12) & DO_READDIRPLUS, 0, "not asked for");
+    mock.always_readdir(Script::ok(vec![
+        dirent(1, 1, FileKind::Dir, "."),
+        plus_dirent(70, 2, FileKind::File, "a"),
+        plus_dirent(71, 3, FileKind::Dir, "b"),
+    ]));
+    let recs = parse_plus(k.call(READDIRPLUS, 1, &plus_body(0, 4096)).ok());
+    assert_eq!(recs.len(), 3);
+    for r in &recs {
+        assert_eq!(r.nodeid, 0, "{r:?}");
+        assert!(r.attr.is_none());
+    }
+    assert_eq!(
+        recs.iter().map(|r| r.d_ino).collect::<Vec<_>>(),
+        vec![1, 70, 71]
+    );
+    assert!(refs.is_empty());
+    assert!(matches!(
+        mock.last_call().unwrap().args,
+        Args::Readdir { plus: false, .. }
+    ));
+    k.finish();
+}
+
+/// The P7 review's rule on the adapter's side: an entry the reply buffer
+/// does not take is not a reference and not a mark — the kernel never
+/// sees it, so it would be an inode held for good and a notice for
+/// nothing.
+#[test]
+fn an_entry_the_buffer_refused_is_neither_counted_nor_marked() {
+    let PlusSession {
+        mut k,
+        mock,
+        refs,
+        sink,
+    } = plus_session();
+    mock.always_readdir(Script::ok(vec![
+        plus_dirent(60, 1, FileKind::File, "x"),
+        plus_dirent(61, 2, FileKind::File, "y"),
+    ]));
+    let (lister, writer) = (Task::spawn(), Task::spawn());
+    // Room for one record (160 bytes).
+    let unique = k.send_as(
+        READDIRPLUS,
+        5,
+        (1000, 100, lister.pid()),
+        &plus_body(0, 200).0,
+    );
+    let (n, r) = collect_until(&mut k, unique);
+    assert!(n.is_empty());
+    assert_eq!(parse_plus(r.ok()).len(), 1);
+    assert_eq!((refs.count(60), refs.count(61)), (1, 0));
+    let mut moving = |ino: u64| {
+        mock.always_rename(Script::ok(constellation_vfs::Renamed {
+            moved: Some(ino),
+            exchanged: None,
+        }));
+        let (n, r) = call_noticed_as(
+            &mut k,
+            writer.pid(),
+            op::RENAME,
+            5,
+            &Body::new().u64(6).cstr("f").cstr("g"),
+        );
+        r.ok();
+        noticed_inodes(&n)
+    };
+    assert_eq!(moving(61), Vec::<u64>::new(), "y was never sent");
+    assert_eq!(moving(60), vec![60], "x was");
+    drop(sink);
+    k.finish();
+}

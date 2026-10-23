@@ -367,6 +367,8 @@ pub struct SessionStats {
     /// Plan 42: what the session knows of the kernel's page cache, and
     /// the workarounds' counters, read live.
     pc: Option<Arc<crate::PageCacheTable>>,
+    /// Plan 40 §4.1: what `FUSE_INIT` agreed about `READDIRPLUS`.
+    readdirplus: crate::ReaddirPlus,
 }
 
 impl SessionStats {
@@ -379,6 +381,9 @@ impl SessionStats {
     ) -> Self {
         let reason = classify(&h, cfg!(feature = "io-uring"));
         let mut stats = Self::with_fallback(h.negotiated, h.uring_queue_depth, reason);
+        stats.readdirplus = h.init.map_or(crate::ReaddirPlus::Off, |i| {
+            crate::ReaddirPlus::of_flags(InitFlags::from_bits_retain(i.flags))
+        });
         stats.lock_wait_downgrades = lock_waits;
         stats.passthrough = Some(passthrough);
         stats
@@ -433,7 +438,15 @@ impl SessionStats {
             ring_health: RingHealthStats::default(),
             refs: None,
             pc: None,
+            readdirplus: crate::ReaddirPlus::Off,
         }
+    }
+
+    /// `READDIRPLUS` as the kernel and this mount agreed at `FUSE_INIT`
+    /// (plan 40 §4.1): what the kernel will ask for. A resumed session
+    /// reports its connection's, not the new image's knob.
+    pub fn readdirplus(&self) -> crate::ReaddirPlus {
+        self.readdirplus
     }
 
     /// The transport the session is served over.
@@ -711,6 +724,40 @@ mod tests {
         granted.count_zero_copy_read();
         assert_eq!(granted.zero_copy_reads(), 1);
         assert!(zero_copy_reads_total() > zc);
+    }
+
+    /// Plan 40 §4.1: the session reports the `READDIRPLUS` mode its
+    /// connection agreed, from the capabilities in force.
+    #[test]
+    fn a_session_reports_the_readdirplus_mode_its_handshake_agreed() {
+        use crate::ReaddirPlus::{Always, Auto, Off};
+        let plus = InitFlags::FUSE_DO_READDIRPLUS;
+        let auto = InitFlags::FUSE_READDIRPLUS_AUTO;
+        for (flags, mode) in [
+            (InitFlags::empty(), Off),
+            (plus, Always),
+            (plus | auto, Auto),
+            // AUTO without plus is ignored by the kernel.
+            (auto, Off),
+        ] {
+            let negotiated = NegotiatedInit {
+                flags: flags.bits(),
+                ..init(false)
+            };
+            let stats = SessionStats::at_handshake(
+                hs(
+                    TransportPolicy::DevFuse,
+                    false,
+                    Some(&negotiated),
+                    Transport::DevFuse,
+                ),
+                LockWaitCounter::default(),
+                crate::passthrough::PassthroughState::new(
+                    crate::passthrough::PassthroughWish::Off(crate::passthrough::reason::DISABLED),
+                ),
+            );
+            assert_eq!(stats.readdirplus(), mode, "{flags:?}");
+        }
     }
 
     /// Plan 38 Z2c: a lock-wait downgrade counts on its session and in

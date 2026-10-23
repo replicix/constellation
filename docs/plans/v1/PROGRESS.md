@@ -59439,3 +59439,49 @@ release real streams (they released ids already released). Q7 re-read at the pin
 changed: each open stream's last page is outside every cap, so the exempt bytes are bounded only by the number of
 open directory streams times one page (up to about a quarter of a 1 MiB `READDIR` reply with `max_pages` 256);
 `exempt_bytes` counts them.
+
+## Plan 40 P6: the FUSE adapter serves `READDIRPLUS` (2026-10-23)
+
+`CONSTELLATION_FUSE_READDIRPLUS` = `auto` (default) | `always` | `off`
+(`TransportConfig::readdirplus`, carried into `KernelTuning::readdirplus` by
+`MountOptions::new`; an unknown value fails the mount). `FuseFs::init` asks for
+`FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO` (`auto`), `FUSE_DO_READDIRPLUS`
+(`always`) or neither; a kernel that does not offer the bits leaves the mount on
+`READDIR` (one info line). `SessionStats::readdirplus()` is the mode the
+connection's capabilities amount to. The fuser pin moves to `9c180f5`
+(`add_with_ttls`, `add_name`, `remaining_capacity`).
+
+`FuseFs::readdirplus` takes an `Arrival` (D9) and answers through `DirPlusReply`:
+
+- An entry with attributes is offered only if the reply buffer has room for its
+  record (`remaining_capacity`); only then is it marked (`replying_each`, the
+  W3b notice first if a change of its inode was recorded since the request
+  arrived) and buffered with `add_with_ttls` (entry TTL as a lookup's, attribute
+  TTL 0 for a directory under W3a). A `Full` mark table (a pid-0 lister of a
+  huge directory) makes that one entry name-only; so do `.`/`..`, `None`, and a
+  child with node id 1.
+- `done(Ok)` arms A3 for each regular file, takes one kernel reference per
+  buffered entry with a node id (`KernelRefs::took`) and records its name
+  (`KernelEntries::listed`), all before the bytes are written. A failed or
+  dropped page accounts nothing: the kernel links nothing from an error.
+  Nothing is counted for an entry the buffer refused (the P7 review's rule).
+- With the knob `off` on a resumed session the kernel still asks (K3): the view
+  is asked for a plain page, so every entry is name-only, and one info line says
+  so.
+
+Tests: `tests/wire.rs` (`init_negotiates_readdirplus_per_knob`, the record
+encoding with name-only entries and the exact-fit buffer stop,
+`readdirplus_counts_only_on_success`, `..._references_balance_the_kernels_forgets`,
+`a_force_forget_of_a_plus_entry_is_partial`, the entry invalidations,
+the W3b notice and the whole-set marks, pid 0 past the bound, A3, the resumed
+knob `off`, an entry the buffer refused), `tests/wire_uring.rs` (byte-identical
+plus pages on `/dev/fuse` and both ring legs), and real-kernel tests in
+`session::tests` (`plus_references_balance_after_drop_caches`,
+`an_o_path_descriptor_of_a_plus_listed_file_answers_nlink_0_after_unlink`,
+`ls_l_with_readdirplus_needs_no_lookup_per_name`). Mutations that fail them:
+a per-entry `replying` (W3b, pid 0), no room check (refused entry), `took`
+after the reply (counts), no `took` (both real-kernel balance tests), no A3.
+`ls -l` of a kernel-cold directory of 300 names asks the daemon for 301
+`LOOKUP`/`GETATTR` over `READDIR` and for 1 over `READDIRPLUS` (3 listing
+requests). The tests that drop the kernel's caches hold `KERNEL_CACHES` alone, so the
+tests that rely on what their kernel holds do not meet a `drop_caches`.

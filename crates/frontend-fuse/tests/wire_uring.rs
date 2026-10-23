@@ -39,8 +39,8 @@ use constellation_frontend_fuse::{FuseFs, KernelTuning};
 use constellation_types::Rdev;
 use constellation_vfs::mock::{Args, MockVfs, Script};
 use constellation_vfs::{
-    Attr, Entry, Fh, FileKind, FrontendCaps, Ino, LockOwner, OpKind, OpenFlags, OpenOwner, Opened,
-    ReadData,
+    Attr, DirEntry, Entry, Fh, FileKind, FrontendCaps, Ino, LockOwner, OpKind, OpenFlags,
+    OpenOwner, Opened, ReadData,
 };
 use fuser::{InMemoryRingKernel, RegistrationRefused, Transport};
 use std::os::fd::OwnedFd;
@@ -62,6 +62,7 @@ mod op {
     pub const RELEASEDIR: u32 = 29;
     pub const FLUSH: u32 = 25;
     pub const INIT: u32 = 26;
+    pub const READDIRPLUS: u32 = 44;
     pub const SETLK: u32 = 32;
     pub const SETLKW: u32 = 33;
     pub const DESTROY: u32 = 38;
@@ -75,7 +76,7 @@ fn op_in_len(opcode: u32) -> usize {
         op::LOOKUP => 0,
         op::GETATTR => 16, // fuse_getattr_in
         op::OPEN => 8,     // fuse_open_in
-        op::READ | op::WRITE => 40,
+        op::READ | op::WRITE | op::READDIRPLUS => 40,
         op::FLUSH | op::RELEASE | op::RELEASEDIR => 24,
         op::OPENDIR => 8, // fuse_open_in
         op::FSYNC => 16,
@@ -163,9 +164,13 @@ struct Kernel {
     /// Blocking lock requests the lock-wait budget served as non-blocking
     /// (`Config::io_uring_lock_wait_downgrades`).
     lock_wait_downgrades: Arc<std::sync::atomic::AtomicU64>,
+    /// The capabilities `FUSE_INIT` agreed (`fuse_init_out.flags`).
+    init_flags: u32,
 }
 
-const KERNEL_INIT_FLAGS: u32 = (1 << 1) | (1 << 10) | (1 << 18);
+/// `FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO` are bits 13 and 14.
+const READDIRPLUS_FLAGS: u32 = (1 << 13) | (1 << 14);
+const KERNEL_INIT_FLAGS: u32 = (1 << 1) | (1 << 10) | (1 << 18) | READDIRPLUS_FLAGS;
 const FUSE_INIT_EXT: u32 = 1 << 30;
 /// `FUSE_OVER_IO_URING`, bit 41: bit 9 of `flags2`.
 const FUSE_OVER_IO_URING_HI: u32 = 1 << 9;
@@ -211,6 +216,7 @@ impl Kernel {
             session: None,
             transport: Transport::DevFuse,
             lock_wait_downgrades: Arc::default(),
+            init_flags: 0,
         };
         let (flags, flags2) = match leg {
             Leg::DevFuse => (KERNEL_INIT_FLAGS, 0),
@@ -251,6 +257,7 @@ impl Kernel {
         let reply = k.recv_dev();
         assert_eq!(reply.unique(), init);
         assert_eq!(reply.error(), 0, "FUSE_INIT");
+        k.init_flags = u32::from_le_bytes(reply.body()[12..16].try_into().unwrap());
         k.session = Some(std::thread::spawn(move || session.run()));
         Ok(k)
     }
@@ -403,6 +410,22 @@ fn round(leg: Leg) -> (Vec<Reply>, Vec<Args>) {
     mock.always_flush(Script::ok(()));
     mock.always_release(Script::ok(()));
     mock.always_fsync(Script::ok(()));
+    // Plan 40: a `READDIRPLUS` page of two name-only records and two
+    // entries with attributes (one a name the view could not vouch for).
+    let listed = |ino: Ino, next: u64, kind: FileKind, name: &str, plus: bool| DirEntry {
+        ino,
+        next,
+        kind,
+        name: name.into(),
+        entry: plus.then(|| entry(ino, kind)),
+    };
+    mock.always_readdir(Script::ok(vec![
+        listed(1, 1, FileKind::Dir, ".", false),
+        listed(1, 2, FileKind::Dir, "..", false),
+        listed(9, 3, FileKind::File, "file", true),
+        listed(10, 4, FileKind::Dir, "dir", true),
+        listed(11, 5, FileKind::File, "late", false),
+    ]));
     mock.on_read(Script::ok(ReadData::from_vec(b"hello".to_vec())));
     mock.on_read(Script::ok(multi_segment()));
     // A short read (EOF inside the request) and an empty one (at EOF).
@@ -461,6 +484,11 @@ fn round(leg: Leg) -> (Vec<Reply>, Vec<Args>) {
         9,
         &Body::default().u64(3).i32(libc::O_RDWR).u32(0).u64(0),
     ));
+    // The kernel asked for plus (`auto`), and the page a full buffer and a
+    // 400-byte one (two records of 160) answer is the same on every leg.
+    assert_eq!(k.init_flags & READDIRPLUS_FLAGS, READDIRPLUS_FLAGS);
+    replies.push(k.call(op::READDIRPLUS, 1, &read_body(4, 0, 8192)));
+    replies.push(k.call(op::READDIRPLUS, 1, &read_body(4, 0, 400)));
     k.finish();
     let calls = mock.calls().into_iter().map(|c| c.args).collect();
     (replies, calls)
@@ -530,6 +558,44 @@ fn the_ring_and_dev_fuse_answer_byte_for_byte_alike() {
             owner: OpenOwner::NONE
         }
     );
+    // The `READDIRPLUS` pages, the last two replies: node ids and names.
+    let plus = |r: &Reply| -> Vec<(u64, u64, String)> {
+        let mut b = r.body();
+        let mut out = Vec::new();
+        while !b.is_empty() {
+            let nodeid = u64::from_le_bytes(b[0..8].try_into().unwrap());
+            let d_ino = u64::from_le_bytes(b[128..136].try_into().unwrap());
+            let namelen = u32::from_le_bytes(b[144..148].try_into().unwrap()) as usize;
+            let name = String::from_utf8(b[152..152 + namelen].to_vec()).unwrap();
+            out.push((nodeid, d_ino, name));
+            b = &b[128 + (24 + namelen).next_multiple_of(8)..];
+        }
+        out
+    };
+    assert_eq!(
+        plus(&ring[ring.len() - 2]),
+        vec![
+            (0, 1, ".".to_string()),
+            (0, 1, "..".to_string()),
+            (9, 9, "file".to_string()),
+            (10, 10, "dir".to_string()),
+            (0, 11, "late".to_string()),
+        ]
+    );
+    assert_eq!(
+        plus(&ring[ring.len() - 1]),
+        vec![(0, 1, ".".to_string()), (0, 1, "..".to_string())],
+        "a buffer of two records stops at a whole one"
+    );
+    assert!(matches!(
+        ring_calls.last().unwrap(),
+        Args::Readdir {
+            ino: 1,
+            fh: Fh(4),
+            cookie: 0,
+            plus: true
+        }
+    ));
     assert_eq!(
         ring_calls[9],
         Args::Flush {

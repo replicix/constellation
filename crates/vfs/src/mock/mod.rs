@@ -49,7 +49,7 @@ use crate::vfs::Vfs;
 use constellation_types::{Code, Rdev};
 use std::any::Any;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
@@ -469,6 +469,9 @@ struct Inner {
     /// How long a non-blocking lock request waits before it is tried
     /// ([`MockVfs::lock_grace`]).
     lock_grace: Mutex<Option<Duration>>,
+    /// Whether a `readdir` drops its responder after it filled the sink
+    /// instead of completing it ([`MockVfs::abandon_readdir`]).
+    abandon_readdir: AtomicBool,
 }
 
 /// A recording, scriptable [`Vfs`]; see the module doc.
@@ -596,6 +599,7 @@ impl MockVfs {
                 dir_streams: Mutex::new(Vec::new()),
                 forget_delay: Mutex::new(None),
                 lock_grace: Mutex::new(None),
+                abandon_readdir: AtomicBool::new(false),
             }),
         }
     }
@@ -618,6 +622,15 @@ impl MockVfs {
     /// requests that came after it.
     pub fn delay_forget(&self, delay: Option<(Ino, Duration)>) {
         *self.inner.forget_delay.lock().unwrap() = delay;
+    }
+
+    /// Make each later `readdir` drop its responder without completing it
+    /// once it has filled the sink (`false`: complete as scripted): a view
+    /// that breaks the contract's "no error after an entry was added", as
+    /// a responder dropped mid-page does — the frontend's fail-safe answer
+    /// then goes out for a page whose entries were offered.
+    pub fn abandon_readdir(&self, on: bool) {
+        self.inner.abandon_readdir.store(on, Ordering::SeqCst);
     }
 
     /// Make a non-blocking `lock_acquire` wait `grace` first (`None`: none
@@ -1278,6 +1291,9 @@ impl Vfs for MockVfs {
                 return;
             }
         };
+        if self.inner.abandon_readdir.load(Ordering::SeqCst) {
+            return drop(tap);
+        }
         tap.done(result);
     }
 

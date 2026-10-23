@@ -59,7 +59,7 @@
 //! once every worker has stopped and imported before the next server
 //! reads, so a `FORGET` queued during the gap subtracts from them.
 
-use crate::adapter::{Deferred, FuseFs, KernelTuning};
+use crate::adapter::{Deferred, FuseFs, KernelTuning, ReaddirPlus};
 use crate::dentries::KernelEntries;
 use crate::notify::{FuseNotifySink, NotifyGate};
 use crate::passthrough::{
@@ -194,6 +194,10 @@ pub const URING_QUEUE_DEPTH_ENV: &str = "CONSTELLATION_FUSE_URING_QUEUE_DEPTH";
 /// is an error, as for the other transport knobs.
 pub const URING_ZERO_COPY_ENV: &str = "CONSTELLATION_FUSE_URING_ZERO_COPY";
 
+/// Plan 40 §4.1: whether the mount asks the kernel for `READDIRPLUS`:
+/// `auto` (the default), `always` or `off` ([`ReaddirPlus`]).
+pub const READDIRPLUS_ENV: &str = "CONSTELLATION_FUSE_READDIRPLUS";
+
 /// Plan 38 Z4b: on a `uring_zc` session, the smallest read answered
 /// zero-copy, in bytes (`<n>`, `<n>k` or `<n>m`, binary units; `0`:
 /// every read), and the smallest file whose open is marked for it. A
@@ -303,6 +307,8 @@ pub struct TransportConfig {
     /// Plan 42: the kernel-race workarounds' settings
     /// ([`crate::workarounds`]), read with the rest.
     pub workarounds: crate::Workarounds,
+    /// Plan 40 §4.1: `READDIRPLUS` ([`READDIRPLUS_ENV`]).
+    pub readdirplus: ReaddirPlus,
 }
 
 impl Default for TransportConfig {
@@ -314,6 +320,7 @@ impl Default for TransportConfig {
             uring_zero_copy: UringZeroCopy::default(),
             zero_copy_min_read: DEFAULT_ZERO_COPY_MIN_READ,
             workarounds: crate::Workarounds::default(),
+            readdirplus: ReaddirPlus::default(),
         }
     }
 }
@@ -401,6 +408,12 @@ impl TransportConfig {
             None => PassthroughPolicy::platform_default(),
         };
         let workarounds = crate::Workarounds::resolve_from(&var)?;
+        // An unknown value fails the mount, as for the other knobs.
+        let readdirplus = match get(READDIRPLUS_ENV) {
+            Some(raw) => ReaddirPlus::parse(&raw)
+                .ok_or_else(|| format!("{READDIRPLUS_ENV}={raw}: expected auto, always or off"))?,
+            None => ReaddirPlus::default(),
+        };
         Ok(Self {
             policy,
             uring_queue_depth: depth,
@@ -408,6 +421,7 @@ impl TransportConfig {
             uring_zero_copy,
             zero_copy_min_read,
             workarounds,
+            readdirplus,
         })
     }
 
@@ -510,7 +524,11 @@ impl MountOptions {
             allow_other: false,
             read_only: false,
             n_threads,
-            tuning,
+            // The knob is `cfg`'s (resolved once, with the others).
+            tuning: KernelTuning {
+                readdirplus: cfg.readdirplus,
+                ..tuning
+            },
             transport: cfg.policy,
             asked: cfg.policy,
             uring_queue_depth: cfg.uring_queue_depth,
@@ -2047,6 +2065,57 @@ mod tests {
         }
     }
 
+    /// Plan 40 §4.1: `CONSTELLATION_FUSE_READDIRPLUS` is `auto` unless set,
+    /// an unknown value fails the mount, and a mount's tuning carries
+    /// the knob whichever constructor made its options.
+    #[test]
+    fn the_readdirplus_knob() {
+        let resolve = |v: Option<&'static str>| {
+            let f = move |key: &str| v.filter(|_| key == READDIRPLUS_ENV).map(String::from);
+            TransportConfig::resolve_from(f, None, None, TransportPolicy::default())
+        };
+        assert_eq!(resolve(None).unwrap().readdirplus, ReaddirPlus::Auto);
+        assert_eq!(resolve(Some("  ")).unwrap().readdirplus, ReaddirPlus::Auto);
+        for (raw, want) in [
+            ("auto", ReaddirPlus::Auto),
+            (" Always ", ReaddirPlus::Always),
+            ("OFF", ReaddirPlus::Off),
+        ] {
+            assert_eq!(resolve(Some(raw)).unwrap().readdirplus, want, "{raw}");
+        }
+        let err = resolve(Some("sometimes")).expect_err("an unknown value fails the mount");
+        assert!(err.contains(READDIRPLUS_ENV), "{err}");
+        let cfg = resolve(Some("off")).unwrap();
+        let tuning = KernelTuning::for_workers(2);
+        assert_eq!(tuning.readdirplus, ReaddirPlus::Auto, "the default");
+        assert_eq!(
+            MountOptions::new("p", 2, tuning, cfg).tuning.readdirplus,
+            ReaddirPlus::Off
+        );
+        assert_eq!(
+            MountOptions::handover_capable("h", 2, tuning, cfg, HandoverCapable)
+                .tuning
+                .readdirplus,
+            ReaddirPlus::Off,
+            "a handover-capable mount asks too"
+        );
+        assert_eq!(
+            MountOptions::new("p", 2, tuning, TransportConfig::default())
+                .tuning
+                .readdirplus,
+            ReaddirPlus::Auto
+        );
+        // The mode a connection's capabilities amount to.
+        let plus = fuser::InitFlags::FUSE_DO_READDIRPLUS;
+        let auto = fuser::InitFlags::FUSE_READDIRPLUS_AUTO;
+        assert_eq!(ReaddirPlus::of_flags(plus | auto), ReaddirPlus::Auto);
+        assert_eq!(ReaddirPlus::of_flags(plus), ReaddirPlus::Always);
+        assert_eq!(ReaddirPlus::of_flags(auto), ReaddirPlus::Off);
+        for mode in [ReaddirPlus::Auto, ReaddirPlus::Always, ReaddirPlus::Off] {
+            assert_eq!(ReaddirPlus::parse(&mode.to_string()), Some(mode));
+        }
+    }
+
     /// Plan 38 Z3b: `CONSTELLATION_FUSE_PASSTHROUGH` and
     /// `--cache-verify always`, as `MountOptions` and the adapter see them.
     #[test]
@@ -2382,6 +2451,64 @@ mod tests {
             eprintln!("skipping: needs root and /dev/fuse");
             return false;
         }
+        cache_share();
+        true
+    }
+
+    /// What a test holds of the kernel's caches, until its thread ends
+    /// (the guards are held for their `Drop`).
+    #[allow(dead_code)]
+    enum CacheHold {
+        Shared(std::sync::RwLockReadGuard<'static, ()>),
+        Exclusive(std::sync::RwLockWriteGuard<'static, ()>),
+    }
+
+    /// `drop_caches` evicts the dentries and inodes of every mount of the
+    /// host, the other tests' included, and several of them (a late
+    /// `FORGET`, a revalidation) rely on what their kernel holds staying
+    /// there. A test that mounts shares this lock for its life; one that
+    /// drops the caches ([`kernel_exclusive`]) holds it alone.
+    static KERNEL_CACHES: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+    thread_local! {
+        static CACHE_HOLD: std::cell::RefCell<Option<CacheHold>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// The calling test shares the kernel's caches (once; a no-op in a
+    /// test that holds them exclusively).
+    fn cache_share() {
+        CACHE_HOLD.with(|h| {
+            let mut h = h.borrow_mut();
+            if h.is_none() {
+                *h = Some(CacheHold::Shared(
+                    KERNEL_CACHES.read().unwrap_or_else(|e| e.into_inner()),
+                ));
+            }
+        });
+    }
+
+    /// [`kernel_available`], and the kernel's caches to this test alone
+    /// (waits for the tests that mount to end, holds the others back).
+    fn kernel_exclusive() -> bool {
+        // SAFETY: no preconditions.
+        let root = unsafe { libc::geteuid() } == 0;
+        if !root || !Path::new("/dev/fuse").exists() {
+            eprintln!("skipping: needs root and /dev/fuse");
+            return false;
+        }
+        CACHE_HOLD.with(|h| {
+            let mut h = h.borrow_mut();
+            if matches!(*h, Some(CacheHold::Exclusive(_))) {
+                return;
+            }
+            // A shared hold is given up first: waiting for the writers
+            // with it would wait for ourselves.
+            *h = None;
+            *h = Some(CacheHold::Exclusive(
+                KERNEL_CACHES.write().unwrap_or_else(|e| e.into_inner()),
+            ));
+        });
         true
     }
 
@@ -2849,6 +2976,285 @@ mod tests {
         );
         drop(fd);
         end(control, thread);
+    }
+
+    // ---------------------------------------------- plan 40: READDIRPLUS
+
+    /// A mount of `vfs` that asks for `READDIRPLUS` as `knob` says; its
+    /// stats, to read the kernel's lookup counts from.
+    fn mount_plus(vfs: &MockVfs, knob: ReaddirPlus) -> Option<(Mounted, Arc<SessionStats>)> {
+        if !kernel_exclusive() {
+            return None;
+        }
+        let mut opts = MountOptions::handover_capable(
+            "constellation-readdirplus-test",
+            2,
+            KernelTuning::for_workers(2),
+            TransportConfig {
+                readdirplus: knob,
+                ..TransportConfig::default()
+            },
+            HandoverCapable,
+        );
+        opts.allow_other = true;
+        let dir = MountDir::new();
+        let session = match mount(Arc::new(vfs.clone()), dir.path(), &opts, caps()) {
+            Ok(session) => session,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping: mount(2) refused here ({e})");
+                return None;
+            }
+            Err(e) => panic!("mount: {e}"),
+        };
+        assert_eq!(
+            session.stats().readdirplus(),
+            knob,
+            "what the kernel agreed"
+        );
+        let stats = session.stats();
+        let (control, thread) = serve(session);
+        Some((
+            Mounted {
+                dir,
+                control,
+                thread,
+            },
+            stats,
+        ))
+    }
+
+    /// `echo 2 > /proc/sys/vm/drop_caches`: the kernel evicts every
+    /// dentry and inode nothing holds, and so sends the `FORGET`s of
+    /// the lookups it took for them.
+    fn drop_dentries_and_inodes() {
+        std::fs::write("/proc/sys/vm/drop_caches", b"2").expect("drop_caches");
+    }
+
+    /// The kernel's lookup count once it has stopped changing under
+    /// repeated cache drops.
+    fn settled_refs(stats: &SessionStats) -> u64 {
+        let mut last = u64::MAX;
+        for _ in 0..40 {
+            drop_dentries_and_inodes();
+            std::thread::sleep(Duration::from_millis(250));
+            let now = stats.kernel_refs();
+            if now == last {
+                return now;
+            }
+            last = now;
+        }
+        panic!("the kernel's lookup count never settled ({last})");
+    }
+
+    /// `LOOKUP`s of the test files' names so far.
+    fn by_name_lookups(vfs: &MockVfs) -> usize {
+        vfs.calls_of(OpKind::Lookup)
+            .iter()
+            .filter(|c| format!("{:?}", c.args).contains("file-"))
+            .count()
+    }
+
+    /// `getdents64` of `dir` with a `buf`-byte buffer until the end: the
+    /// names, in order.
+    fn getdents_names(dir: &Path, buf: usize) -> Vec<String> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid path; the descriptor is ours.
+        let fd = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut names = Vec::new();
+        let mut bytes = vec![0u8; buf];
+        loop {
+            // SAFETY: the buffer is ours and `buf` bytes long.
+            let n = unsafe {
+                libc::syscall(
+                    libc::SYS_getdents64,
+                    fd.as_raw_fd(),
+                    bytes.as_mut_ptr(),
+                    buf,
+                )
+            };
+            assert!(n >= 0, "{}", std::io::Error::last_os_error());
+            if n == 0 {
+                return names;
+            }
+            let mut at = 0usize;
+            while at < n as usize {
+                // `linux_dirent64`: ino 8, off 8, reclen 2, type 1, name.
+                let reclen = u16::from_ne_bytes([bytes[at + 16], bytes[at + 17]]) as usize;
+                let name = &bytes[at + 19..at + reclen];
+                let name = &name[..name.iter().position(|b| *b == 0).unwrap()];
+                names.push(String::from_utf8_lossy(name).into_owned());
+                at += reclen;
+            }
+        }
+    }
+
+    /// Plan 40 §4.4 / K5, on a real kernel. A `READDIRPLUS` links every
+    /// entry of its reply, but a small `getdents64` buffer takes only a few
+    /// of them and the next call asks again from the last one it took, so
+    /// most entries are sent (and counted) many times. When the kernel
+    /// evicts the inodes (`drop_caches`) it gives every lookup back:
+    /// the count returns to where it was, and no `FORGET` finds a node id
+    /// that was not counted or more given back than counted.
+    #[test]
+    fn plus_references_balance_after_drop_caches() {
+        let vfs = MockVfs::reference(caps());
+        let Some((m, stats)) = mount_plus(&vfs, ReaddirPlus::Always) else {
+            return;
+        };
+        let dir = m.dir.path().join("d");
+        std::fs::create_dir(&dir).unwrap();
+        for i in 0..300 {
+            std::fs::write(dir.join(format!("file-{i:04}")), b"x").unwrap();
+        }
+        let before = settled_refs(&stats);
+        let plus = vfs.calls_of(OpKind::Readdirplus).len();
+        let lookups = by_name_lookups(&vfs);
+        // 32-byte records, four to a call; a reply holds some 25 entries.
+        let names = getdents_names(&dir, 128);
+        assert_eq!(names.len(), 302, "300 files, . and ..");
+        let pages = vfs.calls_of(OpKind::Readdirplus).len() - plus;
+        assert!(pages >= 300 / 4 / 6, "{pages} READDIRPLUS requests");
+        assert!(
+            stats.kernel_refs() > before + 250,
+            "the listing took lookups: {} against {before}",
+            stats.kernel_refs()
+        );
+        assert_eq!(
+            by_name_lookups(&vfs),
+            lookups,
+            "no entry was looked up by name"
+        );
+        let after = settled_refs(&stats);
+        assert_eq!(after, before, "every lookup was given back");
+        assert_eq!(stats.forgets_unknown(), 0);
+        assert_eq!(stats.forgets_underflow(), 0);
+        end(m.control, m.thread);
+    }
+
+    /// Plan 40 §4.4, R2's race with a file the kernel holds through a
+    /// `READDIRPLUS` entry (and nothing else) instead of a `LOOKUP`. The
+    /// kernel holds Y under `m` and through an `O_PATH` descriptor, X under
+    /// `n`; another view renames `m` over `n`. Once `n`'s dentry has
+    /// expired, a `stat n` revalidates it: the `LOOKUP` answers Y, so the
+    /// kernel queues `FORGET(Y, 1)` for that answer and looks `n` up again;
+    /// the `FORGET` is applied late, after `rm n` removed Y's last name.
+    /// Y's `fstat` must answer `nlink` 0, never `ESTALE`, and when the
+    /// kernel finally evicts Y its whole count — the listing's lookup
+    /// included — is the last `FORGET`: no node id unknown, no count short.
+    #[test]
+    fn an_o_path_descriptor_of_a_plus_listed_file_answers_nlink_0_after_unlink() {
+        let vfs = MockVfs::reference(caps());
+        let Some((m, stats)) = mount_plus(&vfs, ReaddirPlus::Always) else {
+            return;
+        };
+        let (n, mm) = (m.dir.path().join("n"), m.dir.path().join("m"));
+        std::fs::write(&n, b"x").unwrap();
+        std::fs::write(&mm, b"yy").unwrap();
+        let (x, y) = (
+            std::fs::metadata(&n).unwrap().ino(),
+            std::fs::metadata(&mm).unwrap().ino(),
+        );
+        // Nothing of either is held now; the listing is what links them.
+        settled_refs(&stats);
+        let lookups = vfs.calls_of(OpKind::Lookup).len();
+        let listed = getdents_names(m.dir.path(), 4096);
+        assert!(listed.contains(&"n".to_string()) && listed.contains(&"m".to_string()));
+        let fd = o_path(&mm);
+        assert_eq!(
+            vfs.calls_of(OpKind::Lookup).len(),
+            lookups,
+            "the kernel holds both through the listing alone"
+        );
+        rename_elsewhere(&vfs, "m", "n");
+        vfs.delay_forget(Some((y, Duration::from_millis(500))));
+        // Past the reference filesystem's entry TTL (1 s).
+        std::thread::sleep(Duration::from_millis(1300));
+        let partial = stats.forgets_partial();
+        assert_eq!(
+            std::fs::metadata(&n).unwrap().ino(),
+            y,
+            "n names Y, not X ({x})"
+        );
+        std::fs::remove_file(&n).unwrap();
+        std::thread::sleep(Duration::from_millis(1200));
+        vfs.delay_forget(None);
+        assert_eq!(
+            fstat_sync(&fd).expect("fstat of the descriptor after the late forget"),
+            (y, 0)
+        );
+        assert!(
+            stats.forgets_partial() > partial,
+            "the revalidation's forget was partial"
+        );
+        drop(fd);
+        let _ = settled_refs(&stats);
+        assert_eq!(stats.forgets_unknown(), 0);
+        assert_eq!(stats.forgets_underflow(), 0);
+        end(m.control, m.thread);
+    }
+
+    /// Plan 40 §8: `ls -l` of a kernel-cold directory with `READDIRPLUS`
+    /// asks the daemon for the listing and nothing else, where plain
+    /// `READDIR` follows with a `LOOKUP` per name.
+    #[test]
+    fn ls_l_with_readdirplus_needs_no_lookup_per_name() {
+        if !kernel_exclusive() {
+            return;
+        }
+        let count = |knob: ReaddirPlus| -> Option<(usize, usize)> {
+            let vfs = MockVfs::reference(caps());
+            let (m, stats) = mount_plus(&vfs, knob)?;
+            let dir = m.dir.path().join("d");
+            std::fs::create_dir(&dir).unwrap();
+            for i in 0..300 {
+                std::fs::write(dir.join(format!("file-{i:04}")), b"x").unwrap();
+            }
+            settled_refs(&stats);
+            let before = vfs.calls();
+            let out = std::process::Command::new("ls")
+                .arg("-l")
+                .arg(&dir)
+                .output()
+                .expect("run ls");
+            assert!(out.status.success(), "{out:?}");
+            assert_eq!(out.stdout.iter().filter(|b| **b == b'\n').count(), 301);
+            let calls = &vfs.calls()[before.len()..];
+            let per_name = calls
+                .iter()
+                .filter(|c| matches!(c.op, OpKind::Lookup | OpKind::Getattr))
+                .count();
+            let listing = calls
+                .iter()
+                .filter(|c| matches!(c.op, OpKind::Readdir | OpKind::Readdirplus))
+                .count();
+            end(m.control, m.thread);
+            Some((per_name, listing))
+        };
+        let Some((plain_names, _)) = count(ReaddirPlus::Off) else {
+            return;
+        };
+        let (plus_names, plus_pages) = count(ReaddirPlus::Always).unwrap();
+        eprintln!(
+            "ls -l of 300 names: {plain_names} per-name requests with READDIR, \
+             {plus_names} with READDIRPLUS ({plus_pages} listing requests)"
+        );
+        assert!(
+            plain_names >= 300,
+            "READDIR: a LOOKUP per name ({plain_names})"
+        );
+        assert!(plus_pages >= 1);
+        assert!(
+            plus_names * 10 <= plain_names,
+            "READDIRPLUS: {plus_names} per-name requests against {plain_names}"
+        );
     }
 
     /// Plan 40 R2: the kernel's lookup counts leave with a detached

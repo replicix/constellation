@@ -651,6 +651,8 @@ fn run(recorder: &MountRecorder) -> (Verdict, Verdict) {
     }
     let mut cfg = crate::TransportConfig {
         policy: crate::TransportPolicy::DevFuse,
+        // The probe lists nothing it needs attributes of.
+        readdirplus: crate::ReaddirPlus::Off,
         ..Default::default()
     };
     // The probe's own mount writes nothing that would close the races it
