@@ -313,19 +313,26 @@ impl LockTag {
     /// The wire form, as the op leaves this node at honour reading `now`:
     /// a token received here (`recv`) has spent the time since in this
     /// node, which the receiver cannot see, so it is taken off the
-    /// remainder (a token with no receipt is sent as it is).
+    /// remainder. A token with no receipt (it came by the S3 inbox or the
+    /// persisted replay queue, which have no transit bound) has no window to
+    /// hand on: it leaves with no time left, so the next executor, which
+    /// stamps its own receipt, judges it exactly or refuses it as this node
+    /// would (plan 43 C7b, row 31: a stranded op replayed and forwarded to
+    /// the new holder is not given its old remainder afresh).
     pub fn to_wire(&self, now: HonourMs) -> Vec<LockTokenWire> {
         self.0
             .iter()
             .map(|t| {
-                let spent = t.recv.map_or(0, |r| (now.0 - r).max(0));
+                let left = t
+                    .recv
+                    .map_or(0, |r| (t.remaining_ms - (now.0 - r).max(0)).max(0));
                 (
                     t.grant.node,
                     t.grant.seq,
                     t.until_ms,
                     t.until_h,
                     t.clock,
-                    (t.remaining_ms - spent).max(0),
+                    left,
                 )
             })
             .collect()
@@ -981,8 +988,9 @@ struct Inner {
     /// those whose grant ended here or whose token's window is over: how
     /// many are in, and the latest window among their tokens, as the
     /// token's absolute stamp (wall) and as the receipt plus the time left
-    /// (this node's honour clock; `i64::MAX` for a token with no receipt,
-    /// which is judged exactly and has no window).
+    /// (this node's honour clock; `i64::MIN` for a token with no receipt,
+    /// which is judged exactly and has no window: over as soon as its grant
+    /// is not live here).
     pins: BTreeMap<GrantId, (u32, i64, i64)>,
     /// Node side: grants under which a tagged mutation of this node ended
     /// in doubt, and which ones (by rid, where known): such an op may have
@@ -2437,9 +2445,13 @@ impl LockTables {
                     let e = g.pins.entry(t.grant).or_insert((0, i64::MIN, i64::MIN));
                     e.0 += 1;
                     e.1 = e.1.max(t.until_ms);
+                    // A token with no receipt passed exactly and has no
+                    // window of its own: once its grant is not live here, it
+                    // is over (`unsettled_writes`), never "open" by the wall
+                    // stamp alone.
                     e.2 = e.2.max(
                         t.recv
-                            .map_or(i64::MAX, |r| r.saturating_add(t.remaining_ms)),
+                            .map_or(i64::MIN, |r| r.saturating_add(t.remaining_ms)),
                     );
                 }
                 self.pinned.fetch_add(tag.0.len(), Ordering::SeqCst);
@@ -6317,6 +6329,54 @@ mod token_tests {
         assert_eq!(tag.to_wire(HonourMs(3_000))[0].5, 2_000);
         assert_eq!(tag.to_wire(HonourMs(4_500))[0].5, 500);
         assert_eq!(tag.to_wire(HonourMs(9_000))[0].5, 0, "never negative");
+    }
+
+    /// Plan 43 C7b, row 31: a token with no receipt (a stranded op replayed
+    /// from the persisted queue, an op drained from the S3 inbox) leaves with
+    /// no time left, so the executor it is forwarded to, which stamps a
+    /// receipt of its own, judges it exactly or refuses it. (Fails before:
+    /// it left with the remainder its holder named when the op first left
+    /// it, and the next executor honoured that afresh from its receipt,
+    /// however long the op had waited: only the wall stamp refused it.)
+    #[test]
+    fn a_token_with_no_receipt_leaves_with_no_time_left() {
+        let mut tag = foreign(1_000_000);
+        tag.0[0].recv = None;
+        let wired = tag.to_wire(HonourMs(70_000));
+        assert_eq!(wired[0].5, 0);
+        // Forwarded over P2P, received at 70 000: not held there, refused.
+        let t = LockTables::default();
+        let now = readings(10_000, 70_001);
+        let fwd = LockTag::from_wire(&wired, Some(HonourMs(70_000)));
+        assert!(t.check_tag(&fwd, now).is_err());
+        // Held and confirmed there: exact.
+        let id = t.grant(1, 2, 7, LockMode::Exclusive, WaitMs(100_000), 0);
+        let mut fwd = fwd;
+        fwd.0[0].grant = id;
+        assert_eq!(t.check_tag(&fwd, now), Ok(()));
+    }
+
+    /// F1 with a token that has no receipt: it passed exactly, so it has no
+    /// window; once its grant leaves the table without ending here (its
+    /// generation moved away), the write in its transaction is unsettled,
+    /// whatever the wall stamp says. (Fails before: the pin's honour bound
+    /// was `i64::MAX`, so only the holder's wall stamp could end it.)
+    #[test]
+    fn a_pinned_write_without_a_receipt_is_unsettled_once_its_grant_moved() {
+        let t = LockTables::default();
+        t.set_clock(std::sync::Arc::new(|| readings(10_000, 70_000)));
+        let id = t.grant(1, 2, 7, LockMode::Exclusive, WaitMs(100_000), 5);
+        let mut tag = foreign(1_000_000);
+        tag.0[0].grant = id;
+        tag.0[0].recv = None;
+        assert_eq!(t.check_tag(&tag, readings(10_000, 70_000)), Ok(()));
+        // In its transaction: pinned.
+        assert_eq!(t.check_tag_at_write(&tag, readings(10_000, 70_000)), Ok(()));
+        assert!(!t.unsettled_writes(), "live here");
+        assert_eq!(t.take_by_gen(5).len(), 1);
+        assert!(t.unsettled_writes(), "moved: no window to wait by");
+        t.unpin(&tag);
+        assert!(!t.unsettled_writes());
     }
 
     /// The token's cost on the wire (postcard, as `MutateRequest` and the

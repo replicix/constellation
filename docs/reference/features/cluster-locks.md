@@ -898,7 +898,11 @@ written under it. So the check also happens where the write is recorded
     refuses an operation whose grant it does not hold, even inside the
     window (`LockLapsed`, as above); the sims count how often (the
     `tokens_judged_*` counters by path: about never outside fault
-    configurations).
+    configurations). Such a token stays receipt-less when its operation
+    is sent on (a replayed operation forwarded to the new holder): it
+    leaves with no time left, so the next executor's own receipt gives it
+    no window either, and a write in its transaction under it counts as
+    unsettled once its grant is not live in the table.
 - **Refusal.** Nothing is executed or journaled (only an inbox refusal
   is journaled, as every inbox outcome is), and a retry of the rid is
   refused the same way. A refusal by the check at the write is the same
