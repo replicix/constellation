@@ -589,18 +589,23 @@ epoch becomes impossible to form: one sleeping laptop blocks everyone.
 **Decision**: a per-filesystem slack `f` (`epoch_slack`, set with
 `fs create --epoch-slack` or `fs set epoch-slack`, default 0).
 - An epoch needs `N − f` members of the write-eligible roster.
-- A *promise* is a node's persisted word that it joins no epoch before
-  `no_epoch_until` (its own clock). It is written to
-  `heartbeat/<node>` after being persisted locally, and only on demand:
-  when a would-be taker asks over P2P, when the node sees a lease expire
-  unrenewed and nobody can ask it, or when its slack changes.
-- A node joins an epoch only once its own last issued promise has
-  expired, and publishes no promise while its epoch is open.
+- A *promise* is a node's persisted word that it is in no open epoch and
+  joins none for a while, a duration on its own wait clock, made for one
+  lease key (plan 43 C7b: it names the key, so no clock of another node
+  is compared). It is written to `heartbeat/<node>` after being persisted
+  locally, and only on demand: when a would-be taker asks over P2P, when
+  the node's own observation of a foreign lease key ran out and nobody
+  can ask it, or when its slack changes.
+- A node joins an epoch only once its own last issued promise has run
+  out on its wait clock, and publishes no promise while its epoch is
+  open.
 - An S3 takeover of an expired lease that another node held needs at
-  least `f` *other* roster nodes whose promise outlasts the lease's
-  recorded expiry. A taker's `f` promisers and an epoch's `N − f`
-  members must share a node, whose promise would have to be both
-  expired and still binding.
+  least `f` *other* roster nodes with evidence for the lease key it
+  claims (a heartbeat naming the key, or a P2P grant to a request sent
+  after its own observation of the key ran out). A taker's `f` promisers
+  and an epoch's `N − f` members must share a node, which would have to
+  be in no open epoch after the key's lease had ended and yet a member of
+  an epoch that formed before.
 - The promise TTL is at most a quarter of the lease TTL, so members'
   promises run out well before the leases an epoch wants to carry.
 - A taker honours the largest slack any roster node advertises, so a

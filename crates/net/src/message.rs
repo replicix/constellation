@@ -194,18 +194,20 @@ pub enum Payload {
         proposer: u64,
     },
     /// Plan 30 §M10: a would-be taker of the expired lease asks for a
-    /// heartbeat promise past `expires_unix_ms`. Answered by
-    /// [`Payload::PromiseReply`].
+    /// promise anchored to the lease key it is about to claim (plan 43 C7b:
+    /// the taker's own observation of that key has run out, and the request
+    /// is sent after that). Answered by [`Payload::PromiseReply`].
     PromiseRequest {
         requester: u64,
         req_id: u64,
-        expires_unix_ms: i64,
+        key: LeaseKeyWire,
     },
-    /// Plan 30 §M10: the persisted promise (`None`: refused — in an open
-    /// continuation epoch, or retired), and the answerer's slack.
+    /// Plan 30 §M10: whether the promise was given (`granted: false`:
+    /// refused — in an open continuation epoch, retired, or running with no
+    /// slack), and the answerer's slack.
     PromiseReply {
         req_id: u64,
-        until: Option<i64>,
+        granted: bool,
         epoch_slack: u32,
     },
     /// Gossiped bloom of one hash-prefix bucket of this node's
@@ -786,6 +788,17 @@ pub enum Payload {
         round: u64,
         ttl_ms: u64,
     },
+}
+
+/// A lease's renewal key on the wire (`constellation_store_s3::RenewalKey`):
+/// what a taker asks a promise for, and what the promise names.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseKeyWire {
+    pub holder: u64,
+    pub epoch: u64,
+    pub holder_clock: u64,
+    pub holder_wait_ms: i64,
+    pub released: bool,
 }
 
 /// One beat of the holder's off-core heartbeat ([`Payload::HolderAlive`]):

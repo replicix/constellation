@@ -1,60 +1,70 @@
 //! Plan 30 §M10: heartbeat promises and the TTL takeover's promise check
 //! (flexible-quorum continuation epochs; the rule is checked by the
-//! Stateright model `constellation_model::flex`).
+//! Stateright model `constellation_model::flex`), anchored to the claimed
+//! lease key by plan 43 C7b.
 //!
 //! With `epoch_slack = f > 0` a continuation epoch may form with up to
 //! `f` write-eligible nodes missing, and a missing node may still reach
-//! S3. A *promise* is a node's persisted word that it joins no
-//! continuation epoch before `no_epoch_until` (its own clock); an S3
-//! takeover of an expired lease someone else held proceeds only when at
-//! least `f` other roster nodes promise past the lease's recorded expiry
+//! S3. A *promise* is a node's persisted word that it is in no open epoch
+//! and joins none for a while (a duration on its own wait clock), made for
+//! one lease [`RenewalKey`](constellation_store_s3::RenewalKey); an S3
+//! takeover of a lease someone else held proceeds only when at least `f`
+//! other roster nodes offer evidence for the key being claimed
 //! (`store_s3::heartbeat::takeover_check`). An epoch needs `N − f`
-//! members, each past its own last issued promise, so a taker's `f`
-//! promisers and an epoch's `N − f` members share a node, whose promise
-//! would then have to be both expired and outlast the expiry of a lease
-//! the epoch holder still used — two clocks further apart than drift
-//! allows.
+//! members, so a taker's `f` promisers and an epoch's `N − f` members share
+//! a node, which would have to be in no open epoch at an instant after the
+//! key's lease had ended, and yet a member of an epoch that formed before
+//! it. No clock is compared across nodes: the taker claims a key only once
+//! its own observation of it has run out (a TTL on its own wait clock,
+//! `LeaseState::obs_passed_for`), and the evidence is produced after that
+//! (a P2P answer to a request the taker sent after it; a heartbeat the
+//! promiser wrote when its own observation of the key ran out, or in answer
+//! to such a request).
 //!
 //! # Cadence: on demand
 //!
 //! Nothing is published on a timer. A node promises when:
-//! - a would-be taker asks for one over P2P ([`PeerMsg::PromiseRequest`]);
-//! - with P2P unavailable (nobody can ask), it observes the lease expire
-//!   unrenewed (a lease object it read, held by another node, not
-//!   released, past its expiry in this node's clock, and not already
-//!   covered by its last promise);
+//! - a would-be taker asks for one over P2P ([`PeerMsg::PromiseRequest`],
+//!   naming the key);
+//! - with P2P unavailable (nobody can ask), its own observation of a foreign
+//!   unreleased lease key ran out (`LeaseState::obs_passed`) and it has not
+//!   promised for that key yet;
 //! - its slack changed (the heartbeat advertises the slack it runs with,
 //!   and a taker honours the largest one any roster node advertises).
 //!
 //! Every promise is persisted through the replica *before* its PUT
-//! (`Replica::issue_promise`), and the replica refuses while a
+//! (`Replica::issue_promise`: the gate, `receipt + promise_ttl` on the
+//! promiser's wait clock), and the replica refuses while a
 //! continuation-epoch join holds the gate: a member publishes nothing.
 //! With P2P unavailable a would-be taker cannot ask, so a node with
 //! `f > 0` and no P2P link re-reads the lease every `promise_watch_ms`
-//! (GETs, not PUTs) to notice the expiry itself.
+//! (GETs, not PUTs) to watch it.
 //!
 //! # The takeover check
 //!
 //! In the acquisition job (`jobs.rs`), a `Plan::Claim { takeover: true }`
 //! on an *expired*, unreleased lease another node held — not M9's permit
 //! paths, which the claim rule keeps apart from epochs — reads
-//! `heartbeat/` and asks every roster peer for a promise, then counts the
-//! heartbeats and the replies whose promise outlasts the lease's
-//! `expires_unix_ms`. The heartbeat read always completes first: it is
-//! where a larger advertised slack would show. Exempt: the flush
-//! re-claim of exactly the lease object a continuation epoch this node
-//! was a member of carried (the register unchanged since formation — no
-//! other epoch can hold it, and the members stay silent until the flush,
-//! so the check would deadlock).
+//! `heartbeat/` and asks every roster peer for a promise for the key, then
+//! counts the heartbeats that name it and the grants answered. The request
+//! goes out only once this node's observation of the key has run out (always
+//! after `classify`; not for a fenced lease, which is claimable at once: its
+//! check waits for the heartbeats and the next attempt). The heartbeat read
+//! always completes first: it is where a larger advertised slack would
+//! show. Exempt: the flush re-claim of exactly the lease object a
+//! continuation epoch this node was a member of carried (the register
+//! unchanged since formation — no other epoch can hold it, and the members
+//! stay silent until the flush, so the check would deadlock).
 
 use super::{Core, S3For, Timer};
 use crate::action::{Action, S3Op};
 use crate::event::{Carrier, PeerMsg, S3Result};
-use crate::ids::{Epoch, HonourMs, NodeId, Now, OpId, TimerId};
+use crate::ids::{Epoch, HonourMs, NodeId, Now, OpId, TimerId, WaitMs};
 use crate::replica::Replica;
 use constellation_store_s3::heartbeat::{
-    effective_slack, takeover_check, Promise, PromiseConfig, PROMISE_TTL_LEASE_DIVISOR,
+    effective_slack, takeover_check, Evidence, Promise, PromiseConfig, PROMISE_TTL_LEASE_DIVISOR,
 };
+use constellation_store_s3::RenewalKey;
 use constellation_store_s3::{AckPolicy, Lease, LeaseTag};
 use std::collections::BTreeMap;
 
@@ -157,13 +167,14 @@ pub fn resolve_epoch_claims(acks: &[EpochAckClaim]) -> (Option<Carrier>, Epoch) 
 
 #[derive(Debug, Default)]
 pub(crate) struct PromiseState {
-    /// The last promise issued (persisted), mirrored from the replica.
-    pub issued: i64,
-    /// Plan 43 C7b: the renewal key this node last promised for on seeing
-    /// its observation run out with P2P down (not persisted: a restarted
-    /// node promises once more, which costs one PUT). Commit 5 names the key
-    /// in the promise itself.
-    pub promised_key: Option<constellation_store_s3::RenewalKey>,
+    /// Where the last promise issued (persisted) ends on this node's wait
+    /// clock (0: none), mirrored from the replica: the join gate.
+    pub issued: WaitMs,
+    /// Plan 43 C7b: the renewal key the last heartbeat this node wrote
+    /// names (not persisted: a restarted node promises once more, which
+    /// costs one PUT). A slack advertisement carries it again, so that
+    /// re-publishing the heartbeat does not take the evidence back.
+    pub promised_key: Option<RenewalKey>,
     /// The slack of the last heartbeat that landed.
     pub advertised: Option<u32>,
     /// A PUT advertising this slack is in flight.
@@ -251,12 +262,16 @@ pub(crate) struct PromiseState {
 
 #[derive(Debug)]
 pub(crate) struct Check {
-    pub holder: NodeId,
-    pub expires: i64,
+    /// The renewal key being claimed: what the evidence must name.
+    pub key: RenewalKey,
+    /// This node's observation of `key` had run out when the check began,
+    /// so a request sent now is sent after it (plan 43 C7b): the only kind
+    /// that goes out, and the only reply that counts.
+    pub fresh: bool,
     /// Outstanding promise requests → the peer asked.
     pub asked: BTreeMap<OpId, NodeId>,
-    /// Promises received over P2P: node → until (and its slack).
-    pub replies: BTreeMap<NodeId, (i64, u32)>,
+    /// Answers received over P2P: node → (granted, its slack).
+    pub replies: BTreeMap<NodeId, (bool, u32)>,
     /// The heartbeat read's result (`None` while outstanding).
     pub heartbeats: Option<Result<Vec<(NodeId, Promise)>, String>>,
     pub timer: Option<TimerId>,
@@ -268,10 +283,11 @@ pub(crate) struct Check {
 
 impl Core {
     pub(crate) fn promise_start(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
-        self.pr.issued = replica.promise_issued();
         // The promise the previous process issued, on this clock, for the
         // join gate (plan 43 C7a).
-        replica.load_promise_issued(now, self.cfg.promise_horizon_span_ms());
+        self.pr.issued = replica
+            .load_promise_issued(now, self.cfg.promise_horizon_span_ms())
+            .unwrap_or(WaitMs(0));
         self.pr.restored_hold = replica.epoch_hold_persisted();
         self.pr.persisted_hold = self.pr.restored_hold;
         self.pr.hold_ended = replica.epoch_hold_ended();
@@ -341,12 +357,18 @@ impl Core {
         if self.pr.retired || self.pr.advertising.is_some() || self.pr.advertised == Some(f) {
             return;
         }
-        if f == 0 && self.pr.advertised.is_none() && self.pr.issued == 0 {
+        if f == 0 && self.pr.advertised.is_none() && self.pr.issued.0 == 0 {
             return;
         }
         // Same promise as last issued: only the slack changes. Nothing to
         // persist first (the promise is not extended).
-        let promise = Promise::new(self.cfg.node_id, self.pr.issued, f, now.wall.0);
+        let promise = Promise::new(
+            self.cfg.node_id,
+            self.pr.promised_key,
+            self.cfg.promise_ttl_ms,
+            f,
+            now.wall.0,
+        );
         self.pr.advertising = Some(f);
         self.stats.promise_puts += 1;
         self.issue_s3(S3Op::HeartbeatPut { promise }, S3For::HeartbeatPut(f), out);
@@ -366,10 +388,18 @@ impl Core {
         }
     }
 
-    /// Persist, then publish, a promise binding this node until
-    /// `now + promise_ttl` (never shortening one already issued). `false`
-    /// when refused: in an open epoch (or joining one), or retired.
-    fn promise_now(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) -> bool {
+    /// Persist, then publish, a promise for `key` binding this node to join
+    /// no continuation epoch for `promise_ttl` from now on its wait clock
+    /// (never shortening one already issued). `false` when refused: in an
+    /// open epoch (or joining one), or retired. The heartbeat names `key`:
+    /// the evidence a taker of that key counts (plan 43 C7b).
+    fn promise_now(
+        &mut self,
+        now: Now,
+        key: RenewalKey,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> bool {
         // An epoch's hold owner stays silent through its flush too (found
         // by the simulation, flex-crash seed 30002): it closed its epoch,
         // but until its journal is in the log it is still the epoch's
@@ -377,11 +407,11 @@ impl Core {
         if self.pr.retired || self.epoch.open || self.pr.flush_pending {
             return false;
         }
-        let until = now.wall.0 + self.cfg.promise_ttl_ms as i64;
-        if until <= self.pr.issued {
+        let end = now.wait.plus(self.cfg.promise_ttl_ms);
+        if end <= self.pr.issued && self.pr.promised_key == Some(key) {
             return true;
         }
-        match replica.issue_promise(until, now) {
+        match replica.issue_promise(self.cfg.promise_ttl_ms, now) {
             Ok(true) => {}
             Ok(false) => return false,
             Err(e) => {
@@ -389,10 +419,17 @@ impl Core {
                 return false;
             }
         }
-        self.pr.issued = until;
+        self.pr.issued = self.pr.issued.max(end);
+        self.pr.promised_key = Some(key);
         self.stats.promise_puts += 1;
         let f = self.cfg.epoch_slack;
-        let promise = Promise::new(self.cfg.node_id, until, f, now.wall.0);
+        let promise = Promise::new(
+            self.cfg.node_id,
+            Some(key),
+            self.cfg.promise_ttl_ms,
+            f,
+            now.wall.0,
+        );
         self.issue_s3(S3Op::HeartbeatPut { promise }, S3For::HeartbeatPut(f), out);
         true
     }
@@ -437,8 +474,9 @@ impl Core {
         let p2p_down = !self.cfg.p2p || !self.links.values().any(|l| l.connected);
         // Plan 43 C7b: when this node's observation of a foreign unreleased
         // key has run out (a TTL watched on its own wait clock) and it has
-        // not promised for that key yet (commit 5 names the key in the
-        // promise itself).
+        // not promised for that key yet: the heartbeat names the key, and
+        // is written after the observation ran out, which is the evidence
+        // a taker of that key counts.
         let observed_out = self.lease.obs.as_ref().filter(|o| {
             p2p_down
                 && o.body.holder != 0
@@ -448,9 +486,7 @@ impl Core {
                 && self.pr.promised_key != Some(o.key)
         });
         if let Some(key) = observed_out.map(|o| o.key) {
-            if self.promise_now(now, replica, out) {
-                self.pr.promised_key = Some(key);
-            }
+            self.promise_now(now, key, replica, out);
         }
         if p2p_down && self.pr.watch_timer.is_none() && !self.lease.usable(now, &self.cfg) {
             let id = self.set_timer_wait(
@@ -482,32 +518,34 @@ impl Core {
         now: Now,
         from: NodeId,
         req: OpId,
-        expires_unix_ms: i64,
+        key: RenewalKey,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
         // A node running with `f = 0` joins only epochs of the whole
         // roster (the taker included): its promise would add nothing, and
-        // `f = 0` never touches `heartbeat/`.
-        let until = if self.cfg.epoch_slack > 0 && self.promise_now(now, replica, out) {
+        // `f = 0` never touches `heartbeat/`. The gate it persists counts
+        // from this receipt on its own wait clock; the request's key is
+        // named in the heartbeat and never compared with this node's clock
+        // (plan 43 C7b).
+        let granted = self.cfg.epoch_slack > 0 && self.promise_now(now, key, replica, out);
+        if granted {
             self.stats.promise_requests_answered += 1;
-            Some(self.pr.issued)
         } else {
             self.stats.promise_requests_refused += 1;
-            None
-        };
+        }
         tracing::debug!(
             node = self.cfg.node_id,
             from,
-            expires_unix_ms,
-            ?until,
+            ?key,
+            granted,
             "answered a promise request"
         );
         out.push(Action::Send {
             to: from,
             msg: PeerMsg::PromiseReply {
                 req,
-                until,
+                granted,
                 epoch_slack: self.cfg.epoch_slack,
             },
         });
@@ -1322,13 +1360,13 @@ impl Core {
             node = self.cfg.node_id,
             prev_holder = prev.holder,
             prev_epoch = prev.epoch,
-            prev_expires = prev.expires_unix_ms,
+            fresh = self.lease.obs_passed_for(prev, now, &self.cfg, 0),
             carried = ?self.pr.carried,
             "takeover needs the promise check"
         );
         let mut check = Check {
-            holder: prev.holder,
-            expires: prev.expires_unix_ms,
+            key: prev.renewal_key(),
+            fresh: self.lease.obs_passed_for(prev, now, &self.cfg, 0),
             asked: BTreeMap::new(),
             replies: BTreeMap::new(),
             heartbeats: None,
@@ -1359,7 +1397,11 @@ impl Core {
 
     fn ask_for_promises(&mut self, check: &mut Check, out: &mut Vec<Action>) {
         check.asked_any = true;
-        if !self.cfg.p2p {
+        // Only after this node's observation of the key ran out: an answer
+        // to an earlier request would say nothing about the instants after
+        // the key's lease ended. (A claim that needed no observation, a
+        // fenced lease, relies on the heartbeats alone.)
+        if !self.cfg.p2p || !check.fresh {
             return;
         }
         let peers: Vec<NodeId> = self
@@ -1376,7 +1418,7 @@ impl Core {
                 to: peer,
                 msg: PeerMsg::PromiseRequest {
                     req,
-                    expires_unix_ms: check.expires,
+                    key: check.key,
                 },
             });
         }
@@ -1406,7 +1448,7 @@ impl Core {
         now: Now,
         from: NodeId,
         req: OpId,
-        until: Option<i64>,
+        granted: bool,
         epoch_slack: u32,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1418,12 +1460,13 @@ impl Core {
             return;
         };
         let _ = from;
-        if let Some(until) = until {
-            check.replies.insert(peer, (until, epoch_slack));
-        } else {
-            // A refusal still tells the slack the peer runs with.
-            check.replies.insert(peer, (0, epoch_slack));
-        }
+        // Requests go out only once the observation ran out (plan 43 C7b).
+        debug_assert!(
+            check.fresh,
+            "a promise request went out before its observation ran out"
+        );
+        // A refusal still tells the slack the peer runs with.
+        check.replies.insert(peer, (granted, epoch_slack));
         self.promise_check_evaluate(now, replica, out);
     }
 
@@ -1475,20 +1518,25 @@ impl Core {
                 return self.promise_check_finish(now, false, replica, out);
             }
         };
-        // Replies count like heartbeats (both are persisted promises).
+        // Replies count like heartbeats (both are promises given after the
+        // observation ran out); a refusal and a stale one count for nothing
+        // but the slack it advertises.
         let mut all = hb;
-        for (node, (until, slack)) in &check.replies {
-            all.push((*node, Promise::new(*node, *until, *slack, 0)));
+        let mut evidence: Vec<(NodeId, Evidence)> = all
+            .iter()
+            .map(|(n, p)| (*n, Evidence::Heartbeat(p.clone())))
+            .collect();
+        for (node, (granted, slack)) in &check.replies {
+            all.push((*node, Promise::new(*node, None, 0, *slack, 0)));
+            evidence.push((
+                *node,
+                Evidence::Reply {
+                    fresh: *granted && check.fresh,
+                },
+            ));
         }
         let slack = effective_slack(self.cfg.epoch_slack, &self.roster, &all);
-        let verdict = takeover_check(
-            slack,
-            self.cfg.node_id,
-            &self.roster,
-            check.holder,
-            check.expires,
-            &all,
-        );
+        let verdict = takeover_check(slack, self.cfg.node_id, &self.roster, &check.key, &evidence);
         if !verdict.allows() && !check.asked_any {
             // `f = 0` here, but a roster node still advertises more.
             let mut check = self.pr.check.take().expect("checked above");

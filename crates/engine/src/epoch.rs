@@ -923,10 +923,7 @@ mod tests {
         // f = 1 but this node's promise is still out.
         let (m, meta) = manager(1, 1);
         assert!(meta
-            .promise_issue(
-                now_ms() + 60_000,
-                constellation_platform::clock::protocol().now()
-            )
+            .promise_issue(60_000, constellation_platform::clock::protocol().now())
             .unwrap());
         assert!(!accepted(&m.handle_propose(
             "e".into(),
@@ -938,10 +935,7 @@ mod tests {
         // Expired: joins, and no promise can be issued while open.
         let (m, meta) = manager(1, 1);
         assert!(meta
-            .promise_issue(
-                now_ms() - 1,
-                constellation_platform::clock::protocol().now()
-            )
+            .promise_issue(0, constellation_platform::clock::protocol().now())
             .unwrap());
         assert!(accepted(&m.handle_propose(
             "e".into(),
@@ -953,10 +947,7 @@ mod tests {
         assert!(m.is_open());
         assert!(
             !meta
-                .promise_issue(
-                    now_ms() + 60_000,
-                    constellation_platform::clock::protocol().now()
-                )
+                .promise_issue(60_000, constellation_platform::clock::protocol().now())
                 .unwrap(),
             "gated"
         );
@@ -1013,11 +1004,8 @@ mod tests {
         m.set_roster(vec![1, 3]);
         assert!(!m.is_open(), "abandoned");
         assert!(
-            meta.promise_issue(
-                now_ms() + 1_000,
-                constellation_platform::clock::protocol().now()
-            )
-            .unwrap(),
+            meta.promise_issue(1_000, constellation_platform::clock::protocol().now())
+                .unwrap(),
             "promises again"
         );
         // The carrier survives a restart of the coordinator.
@@ -1144,10 +1132,7 @@ mod tests {
         assert_eq!(mgr.status().epoch_id.as_deref(), Some("1-2"));
         assert!(
             !meta
-                .promise_issue(
-                    now_ms() + 60_000,
-                    constellation_platform::clock::protocol().now()
-                )
+                .promise_issue(60_000, constellation_platform::clock::protocol().now())
                 .unwrap(),
             "the join gate stayed held"
         );
@@ -1223,10 +1208,7 @@ mod tests {
         // The join gate is released: a promise is issued (one already
         // expired, so the next join is not held back by it).
         assert!(meta
-            .promise_issue(
-                now_ms() - 1,
-                constellation_platform::clock::protocol().now()
-            )
+            .promise_issue(0, constellation_platform::clock::protocol().now())
             .unwrap());
         // Closed: another proposer's epoch is taken like any node's.
         let ack = mgr.handle_propose_checked("3-3".into(), vec![1, 2, 3], vec![], 3, 0, false);

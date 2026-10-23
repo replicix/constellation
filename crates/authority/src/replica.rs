@@ -553,11 +553,11 @@ pub trait Replica {
 
     // ---- plan 30 §M10: heartbeat promises ----
 
-    /// The last promise this node issued (`Meta::promise_issued`).
-    fn promise_issued(&self) -> i64;
-    /// Persist a promise before its PUT (`Meta::promise_issue`): `false`
-    /// while a continuation-epoch join holds the gate (nothing written).
-    fn issue_promise(&self, until_unix_ms: i64, now: Now) -> Result<bool, MetaError>;
+    /// Persist a promise before its PUT (`Meta::promise_issue`): the node
+    /// joins no continuation epoch for `span_ms` from `now` on its wait
+    /// clock (plan 43 C7b: a duration, never a wall instant). `false` while
+    /// a continuation-epoch join holds the gate (nothing written).
+    fn issue_promise(&self, span_ms: u64, now: Now) -> Result<bool, MetaError>;
     /// The continuation-epoch hold this node owns (`local["epoch_hold"]`),
     /// so a restarted hold owner re-adopts it and can flush its journal.
     fn epoch_hold_persisted(&self) -> Option<Epoch>;
@@ -1413,12 +1413,8 @@ impl Replica for Meta {
         Meta::kv_set(self, "lease_lost", if lost { "1" } else { "0" })
     }
 
-    fn promise_issued(&self) -> i64 {
-        Meta::promise_issued(self).unwrap_or(0)
-    }
-
-    fn issue_promise(&self, until_unix_ms: i64, now: Now) -> Result<bool, MetaError> {
-        Meta::promise_issue(self, until_unix_ms, now)
+    fn issue_promise(&self, span_ms: u64, now: Now) -> Result<bool, MetaError> {
+        Meta::promise_issue(self, span_ms, now)
     }
 
     fn epoch_hold_persisted(&self) -> Option<Epoch> {

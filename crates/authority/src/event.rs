@@ -637,19 +637,22 @@ pub enum PeerMsg {
         epoch: Epoch,
         for_ms: u64,
     },
-    /// Plan 30 §M10: a would-be taker of the expired lease that expires
-    /// at `expires_unix_ms` asks for a promise ("join no continuation
-    /// epoch before …"). The peer persists one and publishes it (unless
-    /// it is in an open epoch), and answers with it.
+    /// Plan 30 §M10: a would-be taker of the lease whose renewal key is
+    /// `key` asks for a promise anchored to it ("I have watched that key
+    /// run out; are you in no open epoch, and will you join none for a
+    /// while?"; plan 43 C7b: sent only after the taker's own observation of
+    /// the key ran out). The peer persists its gate, publishes a heartbeat
+    /// naming the key (unless it is in an open epoch), and answers.
     PromiseRequest {
         req: OpId,
-        expires_unix_ms: i64,
+        key: constellation_store_s3::RenewalKey,
     },
-    /// Plan 30 §M10: the persisted promise (`None`: refused — this node
-    /// is in an open epoch, or retired), and the epoch slack it runs with.
+    /// Plan 30 §M10: whether the promise was given (`granted: false`:
+    /// refused — this node is in an open epoch, retired, or runs with no
+    /// slack), and the epoch slack it runs with.
     PromiseReply {
         req: OpId,
-        until: Option<i64>,
+        granted: bool,
         epoch_slack: u32,
     },
     /// Plan 30 §M11: a delegate streams its executed transactions of

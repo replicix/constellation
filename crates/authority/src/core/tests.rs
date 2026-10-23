@@ -10243,7 +10243,7 @@ mod m10 {
     }
 
     #[test]
-    fn a_ttl_takeover_proceeds_once_f_others_promise_past_the_expiry() {
+    fn a_ttl_takeover_proceeds_once_f_others_promise_for_the_claimed_key() {
         let mut h = flex(1);
         let expires = h.now.0 - 1_000;
         let out = acquire_against(&mut h, lease_of(2, 3, expires));
@@ -10261,7 +10261,7 @@ mod m10 {
             from: 3,
             msg: PeerMsg::PromiseReply {
                 req: asked[1].1,
-                until: Some(h.now.0 + 15_000),
+                granted: true,
                 epoch_slack: 1,
             },
         });
@@ -10282,17 +10282,23 @@ mod m10 {
         let out = acquire_against(&mut h, lease_of(2, 3, expires));
         let hb = heartbeat_read(&out);
         let asked = promise_requests(&out);
-        // A heartbeat that does not outlast the expiry does not count.
+        // A heartbeat that names another renewal of the lease does not
+        // count.
+        let mut older = lease_of(2, 3, expires - 1);
+        older.holder_wait_ms = expires - 1;
         h.step(Event::S3 {
             op: hb,
-            result: S3Result::Heartbeats(Ok(vec![(3, Promise::new(3, expires, 1, 0))])),
+            result: S3Result::Heartbeats(Ok(vec![(
+                3,
+                Promise::new(3, Some(older.renewal_key()), 15_000, 1, 0),
+            )])),
         });
         // Node 2 is in an open epoch (refuses); node 3 is unreachable.
         h.step(Event::Peer {
             from: 2,
             msg: PeerMsg::PromiseReply {
                 req: asked[0].1,
-                until: None,
+                granted: false,
                 epoch_slack: 1,
             },
         });
@@ -10320,7 +10326,7 @@ mod m10 {
         // its promise ran out: the taker asks now, gets nothing, refuses.
         let out = h.step(Event::S3 {
             op: hb,
-            result: S3Result::Heartbeats(Ok(vec![(3, Promise::new(3, 0, 1, 0))])),
+            result: S3Result::Heartbeats(Ok(vec![(3, Promise::new(3, None, 0, 1, 0))])),
         });
         let asked = promise_requests(&out);
         assert_eq!(asked.len(), 2, "{out:?}");
@@ -10349,39 +10355,42 @@ mod m10 {
     #[test]
     fn a_promise_request_persists_then_publishes_then_answers() {
         let mut h = flex(1);
+        let key = lease_of(3, 4, h.now.0 - 10).renewal_key();
         let out = h.step(Event::Peer {
             from: 2,
-            msg: PeerMsg::PromiseRequest {
-                req: OpId(5),
-                expires_unix_ms: h.now.0 - 10,
-            },
+            msg: PeerMsg::PromiseRequest { req: OpId(5), key },
         });
         let until = h.now.0 + 15_000;
         assert_eq!(h.meta.promise_issued().unwrap(), until, "persisted first");
         assert!(
             s3_ops(&out).iter().any(|(_, r)| matches!(
                 r,
-                S3Op::HeartbeatPut { promise } if promise.no_epoch_until_unix_ms == until
+                S3Op::HeartbeatPut { promise }
+                    if promise.key == Some(key) && promise.no_epoch_for_ms == 15_000
             )),
-            "{out:?}"
+            "the heartbeat names the key asked for: {out:?}"
         );
         assert!(matches!(
             sends(&out).as_slice(),
-            [(2, PeerMsg::PromiseReply { until: Some(u), epoch_slack: 1, .. })] if *u == until
+            [(
+                2,
+                PeerMsg::PromiseReply {
+                    granted: true,
+                    epoch_slack: 1,
+                    ..
+                }
+            )]
         ));
         // A join holds the gate: no promise is issued, the answer refuses.
         h.advance(20_000);
         assert!(h.meta.promise_join_begin(h.clk()).unwrap());
         let out = h.step(Event::Peer {
             from: 2,
-            msg: PeerMsg::PromiseRequest {
-                req: OpId(6),
-                expires_unix_ms: h.now.0 - 10,
-            },
+            msg: PeerMsg::PromiseRequest { req: OpId(6), key },
         });
         assert!(matches!(
             sends(&out).as_slice(),
-            [(2, PeerMsg::PromiseReply { until: None, .. })]
+            [(2, PeerMsg::PromiseReply { granted: false, .. })]
         ));
         assert!(!s3_ops(&out)
             .iter()
@@ -10389,8 +10398,137 @@ mod m10 {
         assert_eq!(h.meta.promise_issued().unwrap(), until);
     }
 
+    /// Plan 43 C7b, row 3: the promiser's gate is a duration on its own
+    /// wait clock from the request's receipt; a forward step of its wall
+    /// clock lets it join nothing early, and the request's key is never
+    /// compared with any clock of its. (Fails before: the gate was a wall
+    /// instant the taker named.)
     #[test]
-    fn a_member_of_an_open_epoch_promises_nothing() {
+    fn the_gate_is_on_the_promisers_wait_clock() {
+        let mut h = flex(1);
+        // The wall clock is 10 s ahead of the wait clock from the start (a
+        // gate counted in wall time would end 10 s late), and steps 10 s
+        // further forward after the request (one counted in wall time
+        // would end early).
+        h.step_wall(10_000);
+        let key = lease_of(3, 4, h.now.0 - 10).renewal_key();
+        let received = h.clk();
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::PromiseRequest { req: OpId(5), key },
+        });
+        h.step_wall(10_000);
+        h.advance(1_000);
+        assert!(!h.meta.promise_join_begin(h.clk()).unwrap());
+        // Only the wait clock reaching the receipt plus the promise ends it.
+        let still_left = received.wait.0 + 15_000 - h.clk().wait.0;
+        assert!(still_left > 0);
+        h.advance(still_left as u64 - 1);
+        assert!(!h.meta.promise_join_begin(h.clk()).unwrap());
+        h.advance(1);
+        assert!(h.meta.promise_join_begin(h.clk()).unwrap());
+    }
+
+    /// A claimed key is the evidence's key: a heartbeat for the key counts,
+    /// one for another renewal of the same lease, for none, or for another
+    /// holder's lease does not (plan 43 C7b).
+    #[test]
+    fn a_promise_counts_only_for_the_claimed_key() {
+        let expires = 1_000_000 - 1_000;
+        let claimed = lease_of(2, 3, expires);
+        let key = claimed.renewal_key();
+        let mut renewed = claimed.clone();
+        renewed.holder_wait_ms += 1;
+        let mut other_holder = claimed.clone();
+        other_holder.holder = 3;
+        for (name, named, counts) in [
+            ("the claimed key", Some(key), true),
+            ("a later renewal", Some(renewed.renewal_key()), false),
+            ("another holder's", Some(other_holder.renewal_key()), false),
+            ("no key", None, false),
+        ] {
+            let mut h = flex(1);
+            let out = acquire_against(&mut h, claimed.clone());
+            let hb = heartbeat_read(&out);
+            let asked = promise_requests(&out);
+            // Node 2 is the holder (not counted); node 3 refuses, so only
+            // its heartbeat can count.
+            h.step(Event::Peer {
+                from: 3,
+                msg: PeerMsg::PromiseReply {
+                    req: asked.iter().find(|(n, _)| *n == 3).unwrap().1,
+                    granted: false,
+                    epoch_slack: 1,
+                },
+            });
+            let out = h.step(Event::S3 {
+                op: hb,
+                result: S3Result::Heartbeats(Ok(vec![(3, Promise::new(3, named, 15_000, 1, 0))])),
+            });
+            // (Node 2, the dead holder, is still to answer: a refusal ends
+            // the check either way.)
+            let out2 = h.step(Event::PeerFailed {
+                req: asked.iter().find(|(n, _)| *n == 2).unwrap().1,
+                to: 2,
+                outage: true,
+            });
+            let proceeded = tails(&out) + tails(&out2) == 1;
+            assert_eq!(proceeded, counts, "{name}");
+        }
+    }
+
+    /// A claim that needed no observation to run out (a fenced lease:
+    /// claimable at once) sends no request, because an answer to it would
+    /// say nothing about the instants after the key's lease ended; the
+    /// heartbeats alone decide (plan 43 C7b).
+    #[test]
+    fn a_request_is_not_sent_before_the_observation_passed() {
+        let expires = 1_000_000 + 40_000;
+        let mut fenced = lease_of(2, 3, expires);
+        fenced.retired = vec![2];
+        let mut h = flex(1);
+        let out = h.step(Event::Control {
+            op: OpId(700),
+            req: Control::Acquire,
+        });
+        let (get, _) = s3_ops(&out)[0];
+        let out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((fenced.clone(), tag())))),
+        });
+        assert!(promise_requests(&out).is_empty(), "{out:?}");
+        let hb = heartbeat_read(&out);
+        // A heartbeat for the key is enough.
+        let out = h.step(Event::S3 {
+            op: hb,
+            result: S3Result::Heartbeats(Ok(vec![(
+                3,
+                Promise::new(3, Some(fenced.renewal_key()), 15_000, 1, 0),
+            )])),
+        });
+        assert_eq!(tails(&out), 1, "{out:?}");
+        // Without it the check is refused at once: nobody was asked.
+        let mut h = flex(1);
+        let out = h.step(Event::Control {
+            op: OpId(700),
+            req: Control::Acquire,
+        });
+        let (get, _) = s3_ops(&out)[0];
+        let out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((fenced, tag())))),
+        });
+        let hb = heartbeat_read(&out);
+        let out = h.step(Event::S3 {
+            op: hb,
+            result: S3Result::Heartbeats(Ok(Vec::new())),
+        });
+        assert_eq!(tails(&out), 0, "{out:?}");
+        assert_eq!(h.core.stats.takeovers_refused_promises, 1);
+    }
+
+    #[test]
+    fn a_member_of_an_open_epoch_refuses() {
         let mut h = flex(1);
         h.step(Event::Control {
             op: OpId(900),
@@ -10409,12 +10547,12 @@ mod m10 {
             from: 3,
             msg: PeerMsg::PromiseRequest {
                 req: OpId(5),
-                expires_unix_ms: 0,
+                key: lease_of(3, 4, 0).renewal_key(),
             },
         });
         assert!(matches!(
             sends(&out).as_slice(),
-            [(3, PeerMsg::PromiseReply { until: None, .. })]
+            [(3, PeerMsg::PromiseReply { granted: false, .. })]
         ));
         assert_eq!(h.meta.promise_issued().unwrap(), 0);
         // An observed expiry does not make it promise either.
@@ -10435,6 +10573,14 @@ mod m10 {
             .filter(|(_, r)| matches!(r, S3Op::HeartbeatPut { .. }))
             .count();
         assert_eq!(puts, 1, "{out:?}");
+        assert!(
+            s3_ops(&out).iter().any(|(_, r)| matches!(
+                r,
+                S3Op::HeartbeatPut { promise }
+                    if promise.key == Some(lease_of(2, 3, h.now.0 - 1).renewal_key())
+            )),
+            "the heartbeat names the key observed: {out:?}"
+        );
         let out = h.step(Event::Peers { links: Vec::new() });
         assert!(
             !s3_ops(&out)
@@ -10741,12 +10887,12 @@ mod m10 {
             from: 2,
             msg: PeerMsg::PromiseRequest {
                 req: OpId(5),
-                expires_unix_ms: 0,
+                key: lease_of(3, 4, 0).renewal_key(),
             },
         });
         assert!(matches!(
             sends(&out).as_slice(),
-            [(2, PeerMsg::PromiseReply { until: None, .. })]
+            [(2, PeerMsg::PromiseReply { granted: false, .. })]
         ));
     }
 }

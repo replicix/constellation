@@ -1036,12 +1036,12 @@ pub trait PeerService: Send + Sync + 'static {
         &self,
         _requester: u64,
         req_id: u64,
-        _expires_unix_ms: i64,
+        _key: crate::LeaseKeyWire,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
         Box::pin(async move {
             Payload::PromiseReply {
                 req_id,
-                until: None,
+                granted: false,
                 epoch_slack: 0,
             }
         })

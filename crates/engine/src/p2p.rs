@@ -331,13 +331,13 @@ impl constellation_net::PeerService for P2pBridge {
         &self,
         requester: u64,
         req_id: u64,
-        expires_unix_ms: i64,
+        key: constellation_net::LeaseKeyWire,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
             let refuse = constellation_net::Payload::PromiseReply {
                 req_id,
-                until: None,
+                granted: false,
                 epoch_slack: 0,
             };
             if crate::fault::p2p_denied(requester) {
@@ -350,7 +350,13 @@ impl constellation_net::PeerService for P2pBridge {
                 .nudge
                 .send(sync::SyncRequest::PeerPromiseRequest {
                     requester,
-                    expires_unix_ms,
+                    key: constellation_store_s3::RenewalKey {
+                        holder: key.holder,
+                        epoch: key.epoch,
+                        holder_clock: key.holder_clock,
+                        holder_wait_ms: key.holder_wait_ms,
+                        released: key.released,
+                    },
                     reply,
                 })
                 .is_err()
@@ -358,9 +364,9 @@ impl constellation_net::PeerService for P2pBridge {
                 return refuse;
             }
             match receive.await {
-                Ok((until, epoch_slack)) => constellation_net::Payload::PromiseReply {
+                Ok((granted, epoch_slack)) => constellation_net::Payload::PromiseReply {
                     req_id,
-                    until,
+                    granted,
                     epoch_slack,
                 },
                 Err(_) => refuse,

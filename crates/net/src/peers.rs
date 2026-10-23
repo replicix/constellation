@@ -2020,12 +2020,8 @@ async fn handle_stream<S: PeerService>(
             Payload::PromiseRequest {
                 requester,
                 req_id,
-                expires_unix_ms,
-            } => Some(
-                service
-                    .promise_requested(requester, req_id, expires_unix_ms)
-                    .await,
-            ),
+                key,
+            } => Some(service.promise_requested(requester, req_id, key).await),
             Payload::ReconcileRequest { queries } => {
                 Some(service.reconcile_requested(queries).await)
             }

@@ -478,13 +478,13 @@ pub enum SyncRequest {
         at_unix_ms: i64,
         beat: constellation_net::Beat,
     },
-    /// Plan 30 §M10: a would-be taker asks this node for a heartbeat
-    /// promise; answered with `(until, epoch_slack)` (`until: None`:
-    /// refused).
+    /// Plan 30 §M10: a would-be taker asks this node for a promise anchored
+    /// to the lease key it claims (plan 43 C7b); answered with `(granted,
+    /// epoch_slack)`.
     PeerPromiseRequest {
         requester: u64,
-        expires_unix_ms: i64,
-        reply: tokio::sync::oneshot::Sender<(Option<i64>, u32)>,
+        key: constellation_store_s3::RenewalKey,
+        reply: tokio::sync::oneshot::Sender<(bool, u32)>,
     },
     /// Plan 30 §M10: `meta.json`'s `epoch_slack` as last read.
     Slack(u32),

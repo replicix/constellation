@@ -5,7 +5,7 @@ use crate::error::MetaError;
 use crate::store::{kv_get_tx, kv_set_tx, ns, EpochRow, Meta};
 use constellation_fs_core::{ChunkHash, Ino};
 use constellation_mtree::record::{InodeRecord, Payload};
-use constellation_types::clock::{Ms, Now, WaitMs};
+use constellation_types::clock::{Now, WaitMs};
 use fjall::{Readable, SingleWriterTxKeyspace, SingleWriterWriteTx};
 use std::collections::HashSet;
 
@@ -704,10 +704,10 @@ impl Meta {
 
     // ------------------------------------------- plan 30 §M10: promises
 
-    /// The last heartbeat promise this node *issued*, as the wall value it
-    /// published (`no_epoch_until_unix_ms`, persisted before its PUT; 0:
-    /// none): token 0 of the persisted stamp, or the whole value an older
-    /// build wrote.
+    /// The last heartbeat promise this node *issued*, as the instant on its
+    /// wall clock it ends (persisted before its PUT; 0: none): token 0 of
+    /// the persisted stamp, or the whole value an older build wrote. Status
+    /// only; the join gate counts the wait-clock end.
     pub fn promise_issued(&self) -> Result<i64, MetaError> {
         Ok(self
             .kv_get(PROMISE_ISSUED)?
@@ -749,23 +749,25 @@ impl Meta {
     /// takes the same (single) writer lock, so a promise can never be
     /// issued between a join's check and its gate.
     ///
-    /// `until_unix_ms` is the promise as published (a wall value, row 3's
-    /// cross-node compare); `now` maps it onto this node's wait clock, where
-    /// the join gate waits it out, and stamps it with the boot (plan 43
-    /// C7a): the persisted value is `<wall> <span> <boot> <raw_until>`
-    /// ([`crate::store::horizon`]).
-    pub fn promise_issue(&self, until_unix_ms: i64, now: Now) -> Result<bool, MetaError> {
+    /// The promise binds this node for `span_ms` from `now` on its wait
+    /// clock, where the join gate waits it out (plan 43 C7b, row 3: a
+    /// duration measured by the promiser alone; no wall value of this node
+    /// is mapped, and none is compared by another). It is stamped with the
+    /// boot (plan 43 C7a): the persisted value is `<wall> <span> <boot>
+    /// <raw_until>` ([`crate::store::horizon`]), `<wall>` being the instant
+    /// it ends on this node's wall clock, for status only.
+    pub fn promise_issue(&self, span_ms: u64, now: Now) -> Result<bool, MetaError> {
         self.ensure_promise_loaded(now);
         let mut tx = self.db.write_tx();
         if kv_get_tx(&tx, &self.local, PROMISE_JOINING)?.as_deref() == Some("1") {
             return Ok(false);
         }
-        let end = now.wait_of_wall(Ms(until_unix_ms));
+        let end = now.wait.plus(span_ms);
         let known = *self.promise_issued_wait.lock().unwrap();
         let extends = known.is_none_or(|known| end > known);
         if extends {
             let mut stamp = now.stamp_of_wait(end);
-            stamp.wall = Ms(until_unix_ms);
+            stamp.wall = now.wall.plus(span_ms);
             kv_set_tx(
                 &mut tx,
                 &self.local,

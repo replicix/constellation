@@ -376,8 +376,9 @@ impl Lease {
     }
 }
 
-/// Plan 43 C7b: what a claimant watches for ([`Lease::renewal_key`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Plan 43 C7b: what a claimant watches for ([`Lease::renewal_key`]); also
+/// what an anchored promise names ([`crate::heartbeat::Promise::key`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RenewalKey {
     pub holder: u64,
     pub epoch: u64,

@@ -1046,17 +1046,23 @@ registry record. Majority quorum is deliberately insufficient. With
 `epoch_slack = f` (`fs create --epoch-slack`, `fs set epoch-slack`) it
 needs `N − f`, and the missing nodes are held off by **promises**:
 
-- A promise is a node's word that it joins no epoch before a given time
-  (`heartbeat/<node>`, persisted and synced locally before the PUT). It
-  is published on demand only: when a would-be taker asks over P2P, when
-  the node sees a lease expire unrenewed and nobody can ask it, or when
-  its slack changes. A steady cluster writes none.
-- A node joins an epoch only once its own last promise has expired, and
-  promises nothing while its epoch is open.
-- An S3 takeover of an expired lease another node held needs `f` *other*
-  nodes whose promises outlast the lease's recorded expiry. A taker's `f`
-  promisers and an epoch's `N − f` members must share a node, whose
-  promise would have to be both expired and binding.
+- A promise is a node's word that it is in no open epoch and joins none
+  for a while, a duration on its own wait clock, **made for one lease
+  key** (`heartbeat/<node>`, persisted and synced locally before the
+  PUT). It is published on demand only: when a would-be taker asks over
+  P2P, when the node's own observation of a foreign lease key ran out and
+  nobody can ask it, or when its slack changes. A steady cluster writes
+  none.
+- A node joins an epoch only once its own last promise has run out on its
+  own wait clock, and promises nothing while its epoch is open.
+- An S3 takeover of a lease another node held needs `f` *other* nodes with
+  evidence for exactly the key being claimed: a heartbeat naming it, or a
+  P2P answer to a request the taker sent after its own observation of the
+  key had run out (§5.1's observation rule: a TTL on its own wait clock
+  from its first sight of the key). A taker's `f` promisers and an epoch's
+  `N − f` members must share a node, which would have to be in no open
+  epoch at an instant after the key's lease had ended and yet a member of
+  an epoch that formed before it. No clock is compared across nodes.
 - The promise TTL is at most a quarter of the lease TTL, and a taker
   honours the largest slack any node advertises, so changing `f` is safe
   while it propagates.

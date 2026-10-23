@@ -901,7 +901,7 @@ pub struct Driver {
     deleg_backup_replies: HashMap<OpId, oneshot::Sender<(u64, bool)>>,
     deleg_seal_replies: HashMap<OpId, oneshot::Sender<(bool, Vec<constellation_meta::DelegateTx>)>>,
     /// Plan 30 §M10: peers' promise requests this node is answering.
-    promise_replies: HashMap<OpId, oneshot::Sender<(Option<i64>, u32)>>,
+    promise_replies: HashMap<OpId, oneshot::Sender<(bool, u32)>>,
     /// Plan 30 §M9: the holder's `BackupAppend` requests this node is
     /// answering, by the core's op id.
     backup_replies: HashMap<OpId, oneshot::Sender<(u64, bool, bool)>>,
@@ -3489,17 +3489,14 @@ impl Driver {
             })),
             SyncRequest::PeerPromiseRequest {
                 requester,
-                expires_unix_ms,
+                key,
                 reply,
             } => {
                 let req = self.control_id();
                 self.promise_replies.insert(req, reply);
                 Some(Internal::Event(Event::Peer {
                     from: requester,
-                    msg: PeerMsg::PromiseRequest {
-                        req,
-                        expires_unix_ms,
-                    },
+                    msg: PeerMsg::PromiseRequest { req, key },
                 }))
             }
             SyncRequest::Slack(epoch_slack) => {
@@ -5130,17 +5127,14 @@ impl Driver {
             }
             PeerMsg::PromiseReply {
                 req,
-                until,
+                granted,
                 epoch_slack,
             } => {
                 if let Some(tx) = self.promise_replies.remove(&req) {
-                    let _ = tx.send((until, epoch_slack));
+                    let _ = tx.send((granted, epoch_slack));
                 }
             }
-            PeerMsg::PromiseRequest {
-                req,
-                expires_unix_ms,
-            } => {
+            PeerMsg::PromiseRequest { req, key } => {
                 let tx = self.int_tx.clone();
                 let peers = self.deps.peers.clone();
                 let requester = self.node_id;
@@ -5157,7 +5151,13 @@ impl Driver {
                     let payload = Payload::PromiseRequest {
                         requester,
                         req_id: req.0,
-                        expires_unix_ms,
+                        key: constellation_net::LeaseKeyWire {
+                            holder: key.holder,
+                            epoch: key.epoch,
+                            holder_clock: key.holder_clock,
+                            holder_wait_ms: key.holder_wait_ms,
+                            released: key.released,
+                        },
                     };
                     let reply = tokio::time::timeout(
                         timeout,
@@ -5167,14 +5167,14 @@ impl Driver {
                     match reply {
                         Ok(Ok(Payload::PromiseReply {
                             req_id,
-                            until,
+                            granted,
                             epoch_slack,
                         })) if req_id == req.0 => {
                             let _ = tx.send(Internal::Event(Event::Peer {
                                 from: to,
                                 msg: PeerMsg::PromiseReply {
                                     req,
-                                    until,
+                                    granted,
                                     epoch_slack,
                                 },
                             }));

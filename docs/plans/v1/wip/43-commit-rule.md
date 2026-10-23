@@ -2990,6 +2990,11 @@ first part of C7a, landed early):
     of it passed. With the observation rule no epoch carrying that key can
     form after such evidence, so no clock is compared across nodes; the
     `heartbeat/ask-<taker>` objects are not needed.
+    *Landed (spec commit 5, 2026-10-23):* as specified; the promise object
+    drops `no_epoch_until_unix_ms` for `{ key, no_epoch_for_ms }`, the join
+    gate is a duration on the promiser's wait clock (`Meta::promise_issue`
+    takes a span), a lease claimable at once asks nobody and relies on
+    heartbeats. `flex*` 0 of 3 000 before and after.
   - *Tokens* (rows 6, 29, 31): phase 1 (Q10b) with the receipt on the
     executor's **honour** clock (it honours the token; the text above said
     wait); `confirmed` on the holder's own clock (its renewal's `sent`);
@@ -4189,7 +4194,7 @@ L = liveness only.
 |---|---|---|---|---|---|
 | 1 | Root lease, holder side — `engine/lease.rs` `usable`, `core/lease.rs` `usable`, `store-s3/lease.rs` `granted`/`renewed` | own stamp vs own clock | W | L (a backward step on the holder: honours longer = S) | honour until `renew_sent + ttl − M` on the honour clock; `expires_unix_ms` for status **C7-H1 landed** (the local half); **rate half: C7a landed** (commit 2: ρ is in the honour and wait readings) |
 | 2 | Root lease, claimant — `Lease::is_claimable(now)` in `classify`/jobs, `live_leases_held_by`, `fence_retired` | holder's `expires_unix_ms` vs claimant's W | W↔W | **S** (a claimant ahead takes over while the holder writes) | ETag-observation rule; `released` unchanged; `fenced` flag; `ttl_ms` in the body |
-| 3 | Heartbeat promise — `heartbeat.rs` `Promise::outlasts`, `takeover_check`; `promise.rs` | promiser's `no_epoch_until` vs holder's `expires`, read by a third node | W↔W | **S** (split brain through an epoch) | request-anchored promises ("d from receipt"); `ask-<taker>` nonce without P2P |
+| 3 | Heartbeat promise — `heartbeat.rs` `Promise::outlasts`, `takeover_check`; `promise.rs` | promiser's `no_epoch_until` vs holder's `expires`, read by a third node | W↔W | **S** (split brain through an epoch) | request-anchored promises ("d from receipt"); `ask-<taker>` nonce without P2P (landed, spec commit 5: promises name the claimed key, evidence counted per key, no nonce object) |
 | 4 | Lock grant, holder side — `core/locks.rs` (`sent + ttl − margin`), `HeldGrant::until_ms`, `renew_point`, `due_renewals`, `fenced` | own send stamp vs own clock | W | L for offset; **S** for a backward step / suspend | honour clock (C7-H1 first) **C7-H1 landed** (the local half); **rate half: C7a landed** (commit 2: ρ is in the honour and wait readings) |
 | 5 | Lock grant, owner side — `until = recv + ttl + margin`, `restamp`, expiry timers, `drop_expired`, quarantines, graces | own receipt stamp vs own clock | W | L (a forward step on the owner: early outwait = S; 73 of 2 000 seeds at +2.5 s, the F-a review) | wait clock (C7-H1); margin `2ρ·ttl` + transit (C7a) **C7-H1 landed** (the local half); **rate half: C7a landed** (commit 2: ρ is in the honour and wait readings) |
 | 6 | Fencing token at a non-minting executor — `LockToken::until_ms` judged by `check_tag`/`check_tag_at_write`; `unsettled_writes`; token memory | holder's absolute window end vs executor's clock | W↔W | **S** (an executor behind runs a stale op after the next grant) | `remaining_ms` judged from receipt; `min` with the absolute stamp in phase 1 |

@@ -2218,15 +2218,14 @@ impl Core {
                 self.on_stream_ahead(now, from, epoch, base, txs, replica, out)
             }
             PeerMsg::BackupHold { epoch, for_ms } => self.on_backup_hold(now, from, epoch, for_ms),
-            PeerMsg::PromiseRequest {
-                req,
-                expires_unix_ms,
-            } => self.on_promise_request(now, from, req, expires_unix_ms, replica, out),
+            PeerMsg::PromiseRequest { req, key } => {
+                self.on_promise_request(now, from, req, key, replica, out)
+            }
             PeerMsg::PromiseReply {
                 req,
-                until,
+                granted,
                 epoch_slack,
-            } => self.on_promise_reply(now, from, req, until, epoch_slack, replica, out),
+            } => self.on_promise_reply(now, from, req, granted, epoch_slack, replica, out),
             PeerMsg::DelegateStream {
                 req,
                 gen,

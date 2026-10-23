@@ -58633,3 +58633,64 @@ latest beat or append (`the_seal_watch_is_handed_the_holders_latest_arrival`).
 
 Gates: `cargo fmt --check`; `clippy --workspace --all-targets -D warnings`; authority
 lib (596), sim suite, `meta_repro`.
+
+## Plan 43 C7b, spec commit 5: promises anchored to the claimed key (row 3; 2026-10-23)
+
+### The rule
+
+A promise is no longer "I join no epoch before this wall instant" compared by the
+taker with the lease's wall expiry (sound only while the offset between the nodes is
+below the margin, `M > 2D`). It is a promiser's word that it is in no open epoch and
+joins none for `no_epoch_for_ms` of its own wait clock, **made for one lease
+`RenewalKey`** (commit 3). The taker counts evidence for exactly the key it claims:
+
+- a `heartbeat/<node>` object whose `key` is that key (`Promise { key, no_epoch_for_ms,
+  epoch_slack, written_unix_ms }`; the wall `no_epoch_until_unix_ms` is gone, the
+  object's version stays 1 and an older object names no key, so counts for nothing);
+- a P2P grant (`PromiseReply { granted }`) to a `PromiseRequest { key }` the taker sent
+  after its own observation of the key ran out (`Check::fresh`, from
+  `LeaseState::obs_passed_for`). A lease claimable at once (a fenced one) sends no
+  request, its heartbeats decide; a debug assert pins that a reply only comes to a
+  fresh request.
+
+`takeover_check(epoch_slack, taker, roster, claimed, evidence)` takes
+`Evidence::{Heartbeat(Promise), Reply { fresh }}` and no clock; its proof (module
+doc) is rate and causality only: the taker's key has ended in true time at the
+instant its observation ran out; evidence produced after it was produced by a node
+in no open epoch (a member of an open epoch publishes nothing and answers nothing)
+that joins none before its promise ran out, so an epoch carrying the key cannot have
+formed after the evidence, and one that formed before it would have had the promiser
+as a member. A promiser's heartbeat is written when its own observation of the key
+ran out (P2P down), or when asked (it names the key asked for; the request's key is
+never compared with its clock). `advertise_slack` carries the last key again. The
+join gate stays (D8) and is a duration from the promiser's receipt on its wait
+clock: `Meta::promise_issue(span_ms, now)` persists `now.wait + span` (the stamp's
+wall token is for status only), `PromiseState::issued` is a `WaitMs`.
+
+Wire: `Payload::PromiseRequest { key: LeaseKeyWire }`, `PromiseReply { granted }`;
+`PeerMsg` the same with `RenewalKey`. No new object kind (D7).
+
+### Evidence
+
+`flex`, `flex-crash`, `flex-promiser-restart-step-forward`, `flex-taker-ahead`,
+`flex-tight`, 3 000 seeds each, before (commit 4's binary) and after: 0 failing
+both (`flex-taker-ahead` is the spec's 0 of 2 000, 20 s offsets; the model is its
+primary fail-before: `expiry_promises_split_brain_beyond_the_margin` violates and
+`anchored_promises_are_clean_beyond_the_margin` is clean, commit 2). The
+flex family is the only one that sets `epoch_slack`, so the other sweeps cannot move
+(`promise_check_needed` is unchanged and the check is `NotRequired` at `f = 0`).
+
+### Tests and fail-before
+
+`a_promise_counts_only_for_the_claimed_key` (the claimed key, a later renewal,
+another holder's, none), `a_request_is_not_sent_before_the_observation_passed`,
+`the_gate_is_on_the_promisers_wait_clock` (a 10 s forward wall step lets nothing
+join early), `a_member_of_an_open_epoch_refuses`, the request/persist/answer test
+with the heartbeat naming the key, `an_observed_unrenewed_expiry_is_promised_on_once`
+naming the key; store-s3 `takeover_check_counts_other_roster_nodes_with_evidence_for_the_claimed_key`
+and the object round trip. Against mutants (a heartbeat counts whatever key it
+names; a request goes out before the observation passed; the gate counts the wall
+clock) the tests fail, each its own; the parent cannot run them (new fields).
+Gates: fmt; `clippy --workspace --all-targets -D warnings`; the workspace tests
+(authority lib 599, store-s3 235, meta 323, `meta_repro` 4, sim suite 245 + 12
+ignored); the model crate (see the commit message).

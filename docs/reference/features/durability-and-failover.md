@@ -1062,34 +1062,43 @@ With `epoch_slack = f > 0` (`fs create --epoch-slack f`, or
 `constellation fs set epoch-slack TARGET f`):
 
 - An epoch needs `N − f` members of the write-eligible roster.
-- A *promise* is a node's persisted word that it joins no epoch before
-  `no_epoch_until` (its own clock). It is written to
-  `heartbeat/<node>` only after it is persisted locally, and only on
-  demand: when a would-be taker asks over P2P, when the node sees a lease
-  expire unrenewed and nobody can ask it (it then re-reads the lease
-  every 5 s), or when its slack changes. A steady cluster writes no
-  heartbeats.
-- A node joins an epoch only once its last issued promise has expired,
-  and issues no promise while its epoch is open.
+- A *promise* is a node's persisted word that it is in no open epoch and
+  joins none for a while (a duration on its own wait clock), made for one
+  lease key (the lease's renewal key, which moves with each renewal of
+  the holder). It is written to `heartbeat/<node>` only after it is
+  persisted locally, naming the key, and only on demand: when a would-be
+  taker asks over P2P (the request names the key), when the node's own
+  observation of a foreign lease key ran out and nobody can ask it (it
+  then re-reads the lease every 5 s), or when its slack changes. A steady
+  cluster writes no heartbeats.
+- A node joins an epoch only once its last issued promise has run out on
+  its own wait clock, and issues no promise while its epoch is open.
 - Raising `f` at runtime (`fs set epoch-slack`) on a mount whose
   promise TTL exceeds a quarter of the lease TTL (never checked at mount
   while `f` was 0) clamps the TTL to lease TTL / 4, with an error in the
   log; a mount that starts with `f > 0` and an invalid TTL refuses to
   mount.
-- An S3 takeover of an expired lease another node held needs at least
-  `f` *other* roster nodes whose promise outlasts the lease's recorded
-  expiry. The taker reads `heartbeat/` and asks every roster peer over
-  P2P, waiting up to 1 s for replies. Otherwise it refuses and retries
-  later.
+- An S3 takeover of a lease another node held needs at least `f`
+  *other* roster nodes with evidence for the key being claimed: a
+  heartbeat naming exactly that key, or a P2P grant answering a request the
+  taker sent after its own observation of the key had run out. The taker
+  reads `heartbeat/` and asks every roster peer over P2P, waiting up to
+  1 s for replies (a lease claimable at once, a fenced one, asks nobody:
+  its heartbeats decide). Otherwise it refuses and retries later.
 - The promise TTL (`CONSTELLATION_PROMISE_TTL_S`, default a quarter of
   the lease TTL) must be at most a quarter of the lease TTL.
 - A taker honours the largest slack any roster node advertises, so a
   change of `f` is safe while it propagates (about a minute).
 
 Why it is safe: a taker's `f` promisers and an epoch's `N − f` members
-share at least one node, whose promise would have to be both expired
-(to join) and still binding after the lease's expiry (to count for the
-taker), which clock drift within the lease margin rules out.
+share at least one node. The taker claims a key only after its own
+observation of it has run out, which is at least a lease TTL of real time
+after the holder sent it, when every key up to it has ended; the promiser's
+evidence was produced after that, when it was in no open epoch and joined
+none before its promise ran out. So no epoch carrying that key can have
+formed after the evidence, and one that formed before it would have had
+the promiser as a member, which publishes nothing. Only rate bounds and
+causality are used; there is no offset between the nodes' clocks to bound.
 
 Operational rules:
 
@@ -1449,7 +1458,7 @@ A filesystem created with `--ack-policy s3` uses no backups.
 ### A takeover is refused with `epoch_slack` set
 
 `epoch.takeovers_refused_promises` rises: fewer than `f` other nodes
-promised past the lease's expiry. Either enough nodes are unreachable
+have evidence for the lease key being claimed. Either enough nodes are unreachable
 that an epoch could be holding the lease, or `f` is too large for the
 cluster. Bring nodes back, retire the dead holder with
 `constellation leave --node-id`, or lower `f`.

@@ -840,7 +840,7 @@ mod durability_tests {
             ..Now::same(0)
         };
         // Issued at wall 1_000 / wait 5_000 for 10 s.
-        assert!(meta.promise_issue(11_000, at(1_000, 5_000)).unwrap());
+        assert!(meta.promise_issue(10_000, at(1_000, 5_000)).unwrap());
         // The wall clock stepped 9 s forward: past the promise on the wall
         // clock, 1 s into it on the wait clock.
         assert!(!meta.promise_join_begin(at(10_000, 6_000)).unwrap());
@@ -877,7 +877,7 @@ mod durability_tests {
         {
             let meta = Meta::open(dir.path()).unwrap();
             let t0 = at(7, 100_000, 5_000, WALL);
-            assert!(meta.promise_issue(WALL + 15_000, t0).unwrap());
+            assert!(meta.promise_issue(15_000, t0).unwrap());
             assert_eq!(meta.promise_issued().unwrap(), WALL + 15_000);
             // The persisted value carries the boot: the wall form first.
             let stored = meta.kv_get("epoch_promise_issued_ms").unwrap().unwrap();
