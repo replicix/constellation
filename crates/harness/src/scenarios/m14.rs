@@ -752,6 +752,7 @@ pub fn lock_holder_killed_contention(_seed: u64) -> Result<()> {
         let (held_tx, held_rx) = std::sync::mpsc::channel();
         let (go_tx, go_rx) = std::sync::mpsc::channel();
         let mut hold = Some((VICTIM_AT, held_tx, go_rx));
+        let phase1_from = Instant::now();
         let mut workers = Vec::new();
         for (i, c) in clients.iter().enumerate() {
             let path = c.mnt.join("counter");
@@ -838,9 +839,19 @@ pub fn lock_holder_killed_contention(_seed: u64) -> Result<()> {
             .as_u64()
             .unwrap_or(0);
         eprintln!("    {NAME}: counter {got} exact; the owner outwaited {expired} grant(s)");
+        // A survivor a load profile paused while it held the lock is
+        // outwaited too, once per pause (a holder paused past its grant:
+        // the contract, no error); without one the count is exact.
+        let paused1: usize = clients
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != victim)
+            .map(|(_, c)| crate::hostlag::injected_pauses(&c.name, phase1_from, Instant::now()))
+            .sum();
         anyhow::ensure!(
-            expired == 1,
-            "{expired} grants outwaited; expected the dead holder's only"
+            outwaits_allowed(1, expired, paused1),
+            "{expired} grants outwaited; expected the dead holder's only ({paused1} injected \
+             pause(s) of a survivor in the phase)"
         );
 
         // ---- phase 2: a node killed while parked, first in line.
@@ -849,6 +860,7 @@ pub fn lock_holder_killed_contention(_seed: u64) -> Result<()> {
             let refs: Vec<&Client> = clients.iter().collect();
             wait_for_p2p(&refs)?;
         }
+        let phase2_from = Instant::now();
         let held = hold_flock(
             clients[1].mnt.join("counter"),
             libc::LOCK_EX,
@@ -884,8 +896,20 @@ pub fn lock_holder_killed_contention(_seed: u64) -> Result<()> {
             clients[victim].name, clients[3].name
         );
         // An outwait of the dead waiter's grant is counted: exact. How
-        // long the next waiter waited is latency.
-        anyhow::ensure!(expired2 == expired, "a grant was outwaited in phase 2");
+        // long the next waiter waited is latency. The one exception is the
+        // lock's holder here (`b`) paused by a load profile past its
+        // grant: the owner outwaits it, once per pause, and it is `b`'s
+        // grant, not the dead waiter's (the 2026-10-24 validation's
+        // `step-pause:2000:8000@b`: no error, the counter exact, the next
+        // waiter granted when `b` resumed).
+        let paused2 =
+            crate::hostlag::injected_pauses(&clients[1].name, phase2_from, Instant::now());
+        anyhow::ensure!(
+            outwaits_allowed(expired, expired2, paused2),
+            "a grant was outwaited in phase 2 ({expired} -> {expired2}, {paused2} injected \
+             pause(s) of the holder {})",
+            clients[1].name
+        );
         for c in &clients {
             print_locks(NAME, c);
         }
@@ -3828,4 +3852,34 @@ pub fn lock_release_at_close(_seed: u64) -> Result<()> {
         r?;
     }
     Ok(())
+}
+
+/// Whether the owner's outwaited-grant count went from `before` to
+/// `after` by no more than the load profile's pauses of the lock's holder
+/// explain: none without one (exact), one per pause.
+fn outwaits_allowed(before: u64, after: u64, pauses: usize) -> bool {
+    after >= before && after - before <= pauses as u64
+}
+
+#[cfg(test)]
+mod outwait_tests {
+    use super::outwaits_allowed;
+
+    /// The count stays exact without a pause of the holder.
+    #[test]
+    fn exact_without_a_pause() {
+        assert!(outwaits_allowed(1, 1, 0));
+        assert!(!outwaits_allowed(1, 2, 0));
+    }
+
+    /// The 2026-10-24 validation: a 2 s pause of the holder `b` took the
+    /// count from 1 to 2.
+    #[test]
+    fn a_paused_holder_is_outwaited_once_per_pause() {
+        assert!(outwaits_allowed(1, 2, 1));
+        assert!(outwaits_allowed(1, 1, 1));
+        // A dead waiter's outwait on top of the pause's is still a bug.
+        assert!(!outwaits_allowed(1, 3, 1));
+        assert!(outwaits_allowed(1, 3, 2));
+    }
 }

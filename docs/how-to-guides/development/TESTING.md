@@ -3893,7 +3893,10 @@ budget (`net-wan`, `net-lossy`, `net:delay:<N>ms` with 2 N over 5 ms), the
 scenarios that need a backup (`NEEDS_BACKUP` in `run.py`: `backup-*`,
 `lock-failover`, `delegate-root-loss`, `load-probe-takeover`, ...) are
 `excluded` too: no peer is a backup candidate past the budget, by design
-(`CONSTELLATION_BACKUP_RTT_BUDGET_MS`, DESIGN layer B):
+(`CONSTELLATION_BACKUP_RTT_BUDGET_MS`, DESIGN layer B). A pause aimed at a
+lock's holder (`pause:...@b`) is outwaited by the owner like a dead one, so
+`lock-holder-killed-contention` allows one more outwaited grant per pause
+of that holder and stays exact otherwise:
 
 ```sh
 # every injector under load-probe, then every checker's deliberate break

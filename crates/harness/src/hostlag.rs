@@ -279,6 +279,27 @@ pub fn note_injected(node: &str, what: &str, from: Instant, to: Instant) {
     }
 }
 
+/// How many pauses of `node` an injector completed that overlap
+/// `[from, to]` (zero outside a scenario or without a load profile). A
+/// scenario with an exact count that a stopped daemon changes by contract
+/// (a lock holder paused past its grant is outwaited by the owner, once
+/// per pause) allows that many more.
+pub fn injected_pauses(node: &str, from: Instant, to: Instant) -> usize {
+    let Some(p) = current() else {
+        return 0;
+    };
+    pauses_in(&p, node, mono_of(from), mono_of(to))
+}
+
+fn pauses_in(p: &Probe, node: &str, w0: u64, w1: u64) -> usize {
+    p.injected
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|i| i.node == node && overlap(i.from, i.to, w0, w1) > 0)
+        .count()
+}
+
 /// Record an inconclusive latency verdict for the current scenario.
 pub fn inconclusive(note: String) {
     eprintln!("    INCONCLUSIVE: {note}");
@@ -727,6 +748,29 @@ mod tests {
             stop: AtomicBool::new(false),
             disks: Mutex::new(Vec::new()),
         }
+    }
+
+    #[test]
+    fn pauses_are_counted_per_node_inside_the_window() {
+        const S: u64 = 1_000_000_000;
+        let inj = |node: &str, from, to| Injected {
+            node: node.into(),
+            what: "pause".into(),
+            from,
+            to,
+        };
+        let p = probe_with(
+            vec![],
+            vec![
+                inj("b", 2 * S, 4 * S),
+                inj("b", 10 * S, 12 * S),
+                inj("a", 2 * S, 4 * S),
+            ],
+        );
+        assert_eq!(pauses_in(&p, "b", 0, 20 * S), 2);
+        assert_eq!(pauses_in(&p, "b", 3 * S, 5 * S), 1);
+        assert_eq!(pauses_in(&p, "b", 5 * S, 9 * S), 0);
+        assert_eq!(pauses_in(&p, "c", 0, 20 * S), 0);
     }
 
     #[test]
