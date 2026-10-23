@@ -752,7 +752,7 @@ impl LeaseState {
     /// The TTL a claimant waits for `body`: the holder's, from its body.
     /// A body without one (an older build's, or a singleton's) is judged by
     /// this node's own, and by the wall compare as well (`obs_passed_for`).
-    fn ttl_of(body: &Lease, cfg: &Config) -> u64 {
+    pub(crate) fn ttl_of(body: &Lease, cfg: &Config) -> u64 {
         if body.ttl_ms > 0 {
             body.ttl_ms
         } else {

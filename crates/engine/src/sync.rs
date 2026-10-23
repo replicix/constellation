@@ -440,7 +440,9 @@ pub enum SyncRequest {
         from: u64,
         txs: Vec<constellation_meta::BackupTx>,
         through: u64,
-        expires_unix_ms: i64,
+        /// `(sent_ms, expires_ms, clock)` of the holder's wait clock when it
+        /// built the append (what a beat carries).
+        stamp: (i64, i64, u64),
         reply: tokio::sync::oneshot::Sender<(u64, bool, bool)>,
     },
     /// Plan 37 §8: the holder this node backs is being replaced on its

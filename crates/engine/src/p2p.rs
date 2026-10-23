@@ -814,7 +814,7 @@ impl constellation_net::PeerService for P2pBridge {
         from: u64,
         txs: Vec<u8>,
         through: u64,
-        expires_unix_ms: i64,
+        (sent_ms, expires_ms, clock): (i64, i64, u64),
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
@@ -838,14 +838,13 @@ impl constellation_net::PeerService for P2pBridge {
             };
             tracing::trace!(target: "constellation::fwd", from, "append queued");
             // Heard from now, whenever the core gets to it (`OffCore`).
-            self.off_core.note_holder_heard(
-                holder,
-                epoch,
-                // Arrival on this node's wait clock (plan 43 C7-H1), the
-                // clock the core's seal watch counts silence on.
-                constellation_platform::clock::protocol().wait().0,
-                expires_unix_ms,
-            );
+            // Arrival on this node's wait clock (plan 43 C7-H1), the clock
+            // the core's seal watch counts silence on, with the holder's
+            // readings the append carries (plan 43 C7b, row 24: never a
+            // wall expiry).
+            let arrival = constellation_platform::clock::protocol().wait().0;
+            self.off_core
+                .note_holder_heard(holder, epoch, arrival, (clock, sent_ms, expires_ms));
             let (reply, receive) = tokio::sync::oneshot::channel();
             if self
                 .nudge
@@ -857,7 +856,7 @@ impl constellation_net::PeerService for P2pBridge {
                     from,
                     txs,
                     through,
-                    expires_unix_ms,
+                    stamp: (sent_ms, expires_ms, clock),
                     reply,
                 })
                 .is_err()
@@ -918,8 +917,12 @@ impl constellation_net::PeerService for P2pBridge {
             return false;
         }
         if listed {
-            self.off_core
-                .note_holder_heard(holder, epoch, now, beat.expires_unix_ms);
+            self.off_core.note_holder_heard(
+                holder,
+                epoch,
+                now,
+                (beat.clock, beat.sent_ms, beat.expires_ms),
+            );
         }
         let _ = self.urgent.send(sync::SyncRequest::PeerHolderAlive {
             holder,

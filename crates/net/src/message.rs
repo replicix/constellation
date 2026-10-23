@@ -515,9 +515,10 @@ pub enum Payload {
     /// backup last acknowledged), `through` the holder's shipped-through
     /// seq. `candidacy` names the holder's bring-up of this backup (a
     /// dismissal, [`Payload::HolderAlive`], applies to it only).
-    /// `expires_unix_ms` is the expiry of the lease the holder holds at
-    /// `epoch` when it builds the append (0: none held), the same as a
-    /// [`Beat`] names. Answered by [`Payload::BackupAck`].
+    /// `sent_ms`, `expires_ms` and `clock` are what a [`Beat`] carries: the
+    /// holder's wait clock when it built the append, the end of the lease it
+    /// holds at `epoch` on that clock (0: none held or unknown) and the
+    /// clock's id (plan 43 C7b, row 24). Answered by [`Payload::BackupAck`].
     BackupAppend {
         holder: u64,
         req_id: u64,
@@ -527,7 +528,9 @@ pub enum Payload {
         from: u64,
         txs: Vec<u8>,
         through: u64,
-        expires_unix_ms: i64,
+        sent_ms: i64,
+        expires_ms: i64,
+        clock: u64,
     },
     /// Plan 30 §M9: the backup holds every row through `acked`, or has
     /// `sealed` the epoch (it will never acknowledge it again).
@@ -790,35 +793,30 @@ pub enum Payload {
 /// `sent_ms` is the holder's **wait** clock when it sent this one
 /// (`ProtocolClock::wait`) and `clock` the id of that clock
 /// (`ProtocolClock::id`: a restarted holder is a new process with a new
-/// clock); `expires_unix_ms` is the expiry of the lease it beats for on the
-/// lease body's wall clock (the beats stop at the holder's honour end of
-/// it). A watcher tells from `seq` and `sent_ms` whether beats it
+/// clock). A watcher tells from `seq` and `sent_ms` whether beats it
 /// heard late were sent on time (held up on the way, or by its own runtime)
 /// or late (the holder's process itself was held up), and lengthens its
-/// silence window while either has happened lately; from `expires_unix_ms`,
-/// that silence at the expiry is the lease ending, and is not given that
-/// grace.
+/// silence window while either has happened lately.
 ///
-/// Plan 43 C7-F F-a / C7-H1: `sent_ms`, `expires_ms` and `guard_ms` are
-/// readings of one clock of the holder, `clock`, and let the watcher, once it
-/// has taken the lease over, place the end of what the holder's grants could
-/// still be honoured on its own clock (`Core::beat_cap`): a difference on the
-/// holder's clock added to the beat's arrival stamp on the watcher's. The
+/// `sent_ms`, `expires_ms` and `guard_ms` are readings of one clock of the
+/// holder, `clock`: a difference of two of them is a duration measured on
+/// the holder, with no offset in it. They let the watcher place the lease's
+/// end on its own wait clock, the end named plus the least `arrival - sent`
+/// lately (`Core::known_end`), which is how the seal watch knows that the
+/// lease ran out (plan 43 C7b, row 24: no wall expiry crosses nodes), and,
+/// once it has taken the lease over, place the end of what the holder's
+/// grants could still be honoured on its own clock (`Core::beat_cap`): a
+/// difference on the holder's clock added to the beat's arrival stamp on the
+/// watcher's. The
 /// holder's wait clock ignores a wall step in both directions and never
 /// over-counts real time, so that difference never under-estimates the time
 /// left (a forward step moves the holder's honour clock, which is right for
-/// what it honours and wrong here: its grantees' clocks did not step). The
-/// wire fields keep their positions: the three that changed meaning are in
-/// place, the new ones are appended.
+/// what it honours and wrong here: its grantees' clocks did not step).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Beat {
     pub seq: u64,
     /// The holder's wait clock at send.
     pub sent_ms: i64,
-    /// The lease body's wall expiry (`Lease::expires_unix_ms`): the seal
-    /// watch's `known_expiry` (plan 43 Appendix B row 24, C7b). Never mixed
-    /// with the wait values.
-    pub expires_unix_ms: i64,
     /// What the holder waits out that its lease does not cap (its takeover
     /// floor, its lock and read quarantines, its subtree graces), as the
     /// latest instant on the same wait clock at which grants it protects
@@ -1523,7 +1521,6 @@ mod tests {
             let beat = Beat {
                 seq: 7,
                 sent_ms: 1_000,
-                expires_unix_ms: 7_000,
                 guard_ms,
                 expires_ms: 6_500,
                 clock: 9,
@@ -1540,13 +1537,12 @@ mod tests {
             let back = Signed::decode(&frame[4..]).unwrap();
             assert_eq!(back.verify().unwrap().1, payload);
         }
-        // The first four fields keep their positions, the wait-clock end and
+        // The guard rides after the send reading, the wait-clock end and
         // the clock id follow.
-        let head = postcard::to_stdvec(&(7u64, 1_000i64, 7_000i64, 42i64)).unwrap();
+        let head = postcard::to_stdvec(&(7u64, 1_000i64, 42i64)).unwrap();
         let whole = postcard::to_stdvec(&Beat {
             seq: 7,
             sent_ms: 1_000,
-            expires_unix_ms: 7_000,
             guard_ms: 42,
             expires_ms: 6_500,
             clock: 9,

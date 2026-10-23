@@ -2973,6 +2973,17 @@ first part of C7a, landed early):
     backup's wait clock (a beat's arrival plus the end minus `sent`, an
     append's receipt plus the time left the holder names); the wall expiry
     leaves the beat and the append.
+    *Landed (spec commit 4, 2026-10-23):* the end is the holder's named end
+    plus the *least* `arrival - sent` of the recent arrivals (the arrival
+    stamped least late), not each arrival's own stamp plus the time left: a
+    backup whose runtime lapsed stamps its backlog late, which put the end
+    past the 2T claim grace (`backup-lag-at-expiry*`). Beats and appends carry
+    `(sent, end, clock)` of the holder's wait clock. One wall hint is left, for
+    a backup that has heard nothing of the holder since it started (the
+    earlier of `first sight + TTL` and the object's wall expiry), because
+    waiting a TTL lost the tail a rebooted backup holds (`backup-crash` 410).
+    `backup-locks-ahead` seals of a live holder 749 -> 0 of 1 000 seeds; 112 of
+    113 failing sets identical (the 113th a negative control).
   - *Promises* (row 3) are anchored to the claimed key: a P2P reply counts
     for a request sent after the taker's observation passed; an S3 heartbeat
     counts if it names the key, written when the promiser's own observation
@@ -4199,7 +4210,7 @@ L = liveness only.
 | 21 | Fault hook `CONSTELLATION_FAULT_CLOCK_OFFSET_MS` (reaches `now_unix_ms` and rows 1–17) | — | — | capped at ±500 by the campaign (`load.rs:366`) | becomes a constant-offset test (harmless at ±5 s); add rate and step hooks (**landed**: `CONSTELLATION_FAULT_CLOCK_RATE_PPM`, C7a commits 1 and 2; the harness's `clock:rate:`, `clock:step:` and `reboot` items, `lock-owner-reboot`, the campaign preset `clock-rate`: commit 6) |
 | 22 | Sim `tests/sim/clock.rs` `Clock::skewed` (constant offset), `SimConfig::clock_skew_ms` (plus `clock_offsets`, C7-H2); models' `max_offset`, `Jump` | — | — | — | add per-node `rate_ppm`, suspend and step (**C7a landed**: commits 1 and 2; the default mix of rates, steps, suspends and reboots, commit 6) |
 | 23 | Released-takeover lock grace — `lock_on_released_takeover`'s gate in `acquire_won` (`takeover && p.released && !p.is_expired(now)`) | released lease's `expires_unix_ms` (its W) vs the taker's W | W↔W | **S** (a taker ahead by more than the released lease's remaining TTL gets no lock grace, while the releaser's grants are honoured) | grace by the taker's own observation of the release, or always (the grace is bounded by `lock_ttl`): C7b |
-| 24 | Seal watch's expiry compares — `on_takeover_get`, `known_expiry`/`lag_discount`, `watch_due_by_expiry` (`backup.rs`) | the holder's `expires` (its W) vs the backup's W | W↔W | L (after C7-H2 an early seal is safe: it gets the whole floor; a late one is latency) | wait clock plus the ETag observation: C7b, with row 13 |
+| 24 | Seal watch's expiry compares — `on_takeover_get`, `known_expiry`/`lag_discount`, `watch_due_by_expiry` (`backup.rs`) | the holder's `expires` (its W) vs the backup's W | W↔W | L (after C7-H2 an early seal is safe: it gets the whole floor; a late one is latency) | wait clock plus the ETag observation: C7b, with row 13 (landed, spec commit 4: the holder's own durations placed by the least arrival lag; a wall hint once per start for a cold backup) |
 | 25 | `promise_check_needed` — `!prev.is_expired(now)` (`promise.rs`) | predecessor's `expires` vs the taker's W | W↔W | L (a sealed taker ahead does a promise check it would skip; only conservative) | with row 3's anchored promises: C7b |
 | 26 | `acquire_won`'s fast classification — `fast_prev` (`!p.is_expired(now)`) | predecessor's `expires` vs the successor's W | W↔W | was **S** (a sealed backup ahead by more than the lease's remainder took a TTL takeover: no floor) | **fixed (C7-H2)**: a takeover the permit allowed is fast whatever the clock says; the expiry is no longer kept |
 | 27 | Fast-takeover floor's beat cap (C7-F F-a) — `HolderBeats` (`note_beat`), `note_fast_takeover`, `note_marker_landed` | the predecessor's `expires`/`guard` minus its beat's `sent` (one clock), added to the beat's arrival `at` (the successor's) | W−W (holder), W (successor) | none for offset (a difference on one clock plus a stamp on the other); a backward step on the holder lengthens its honour (C7-H1); a forward step on the successor shortens every wait-side window alike; **a forward step `J` on the holder moves the cap early by `J` (unsafe when `J > 3M + δ`, the holder beating on and sealed mid-lease): the same class as the root's own grant table (C7-H1), which breaks exclusion with or without the cap** | already rate-only: `2ρ·(X − sent) ≤ M/2` for beats within `250·M`. C7-H1: `sent`, the named expiry and the guard on the holder's honour clock with its clock id; the lease body's `holder_expires_ms` replaces `expires_unix_ms` in `X`; `at` and the floor on the successor's wait clock; lags combined within one clock id: closes the forward step **C7-H1 landed** (the local half); **rate half: C7a landed** (commit 2: ρ is in the honour and wait readings) |

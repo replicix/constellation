@@ -153,7 +153,7 @@ pub struct Shared {
     /// When the current runtime lag began.
     lag_since: Mutex<Option<tokio::time::Instant>>,
     /// What the off-core heartbeat beats to (the daemon's
-    /// `AliveTargets`): the epoch and expiry of the lease this node
+    /// `AliveTargets`): the epoch and end of the lease this node
     /// holds, `Core::beat_guard_wait_ms` and `Core::liveness_targets`,
     /// after every event.
     liveness: Mutex<Option<Liveness>>,
@@ -953,10 +953,14 @@ struct Driver {
     plant_ungated_fast_path: bool,
 }
 
-/// What the off-core heartbeat beats to: `(epoch, wall expiry, honour end,
-/// wait end, guard (wait), targets)`: what the beat thread reads (the
-/// daemon's `AliveTargets`, plan 43 C7-H1).
-type Liveness = (u64, i64, i64, i64, i64, Vec<NodeId>);
+/// A holder's stamps handed over after a lapse: `((holder, epoch), (clock,
+/// sent, end))`.
+type Stamped = ((NodeId, u64), (u64, i64, i64));
+
+/// What the off-core heartbeat beats to: `(epoch, honour end, wait end,
+/// guard (wait), targets)`: what the beat thread reads (the daemon's
+/// `AliveTargets`, plan 43 C7-H1).
+type Liveness = (u64, i64, i64, i64, Vec<NodeId>);
 
 /// F1 in the simulation (`WriterLockHold`): a fast-path write that passed
 /// its fencing-token check and waits for the store's writer lock behind a
@@ -1090,7 +1094,7 @@ async fn beat_loop(
                 }
             }
         }
-        let Some((epoch, until_wall, until_honour, until_wait, guard, targets)) =
+        let Some((epoch, until_honour, until_wait, guard, targets)) =
             shared.liveness.lock().unwrap().clone()
         else {
             continue;
@@ -1113,7 +1117,6 @@ async fn beat_loop(
                     sent: constellation_authority::beat_sent_ms(now),
                     holder_expires: until_wait,
                     guard,
-                    expires: until_wall,
                     echo: now.wait.0,
                 },
             );
@@ -1842,39 +1845,47 @@ impl Driver {
             // beats, before any timer (`Driver::hand_heard`); the appends
             // themselves (its sync lane) come after the timers, and the
             // numbered beats with the rest of what peers sent.
-            // Each stamp carries the highest expiry the beats and appends
-            // it stands for named, as the bridge's does
-            // (`OffCore::note_holder_heard`).
-            let mut stamped: Vec<((NodeId, u64), i64)> = Vec::new();
+            // Each stamp carries the holder's readings `(clock, sent,
+            // end)` of the beat or append that named the latest end, as the
+            // bridge's does (`OffCore::note_holder_heard`).
+            let mut stamped: Vec<Stamped> = Vec::new();
             for e in &queued {
                 let key = match e {
                     Event::HolderAlive {
                         from,
                         epoch,
                         listed: true,
-                        expires,
+                        clock,
+                        sent,
+                        holder_expires,
                         ..
-                    } => Some(((*from, *epoch), expires.0)),
+                    } => Some(((*from, *epoch), (*clock, *sent, *holder_expires))),
                     Event::Peer {
                         msg:
                             PeerMsg::BackupAppend {
                                 holder,
                                 epoch,
-                                expires_unix_ms,
+                                sent_ms,
+                                expires_ms,
+                                clock,
                                 ..
                             },
                         ..
-                    } => Some(((*holder, *epoch), *expires_unix_ms)),
+                    } => Some(((*holder, *epoch), (*clock, *sent_ms, *expires_ms))),
                     _ => None,
                 };
-                if let Some((key, expires)) = key {
+                if let Some((key, stamp)) = key {
                     match stamped.iter_mut().find(|(k, _)| *k == key) {
-                        Some((_, e)) => *e = (*e).max(expires),
-                        None => stamped.push((key, expires)),
+                        Some((_, e)) => {
+                            if stamp.0 != 0 && (e.0 != stamp.0 || stamp.2 > e.2) {
+                                *e = stamp;
+                            }
+                        }
+                        None => stamped.push((key, stamp)),
                     }
                 }
             }
-            for ((from, epoch), expires) in stamped {
+            for ((from, epoch), (clock, sent, expires)) in stamped {
                 self.ready.push_back(Event::HolderAlive {
                     from,
                     epoch,
@@ -1882,11 +1893,10 @@ impl Driver {
                     listed: true,
                     at: now.wait,
                     seq: 0,
-                    clock: 0,
-                    sent: 0,
-                    holder_expires: 0,
+                    clock,
+                    sent,
+                    holder_expires: expires,
                     guard: 0,
-                    expires: constellation_authority::Ms(expires),
                 });
             }
         }
@@ -1951,10 +1961,6 @@ impl Driver {
             }
             _ => None,
         };
-        let wall_expiry = match &lease.held {
-            Some((l, _)) => l.expires_unix_ms,
-            None => 0,
-        };
         let certs = self.core.deleg_renew_certs();
         let liveness = view.s3_held.map(|(epoch, until_honour, until_wait)| {
             let targets = self.core.liveness_targets().into_iter().map(|(n, _)| n);
@@ -1982,14 +1988,7 @@ impl Driver {
                 }
                 seen.2 = base;
             }
-            (
-                epoch,
-                wall_expiry,
-                until_honour,
-                until_wait,
-                guard,
-                targets.collect(),
-            )
+            (epoch, until_honour, until_wait, guard, targets.collect())
         });
         drop(view);
         *self.shared.liveness.lock().unwrap() = liveness;

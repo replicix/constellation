@@ -11,7 +11,7 @@
 //! stale and dropped instead of being misread as the answer to something
 //! else.
 
-use crate::ids::{Epoch, HonourMs, Ms, NodeId, OpId, Seq, TimerId, WaitMs};
+use crate::ids::{Epoch, HonourMs, NodeId, OpId, Seq, TimerId, WaitMs};
 use constellation_fs_core::Ino;
 use constellation_meta::locks::LockTag;
 use constellation_meta::{BackupTx, DelegateTx, MutateOp, MutateOutcome, OwnChunks, Position, Rid};
@@ -131,10 +131,12 @@ pub enum Event {
     /// does not cap, on it too; `clock` is the id of that clock
     /// (`constellation_net::Beat`; plan 43 C7-H1: values of one holder
     /// clock, opaque on this node, never compared with its own readings:
-    /// `Core::beat_cap` keeps them per clock id). `expires` is the lease
-    /// body's wall expiry, which the seal watch reads. `seq` 0: not a
+    /// `Core::beat_cap` keeps them per clock id). The seal watch places the
+    /// lease's end on this node's clock from them too (`Core::known_end`;
+    /// plan 43 C7b, row 24: no wall expiry crosses nodes). `seq` 0: not a
     /// numbered beat (the driver handing the latest arrival over,
-    /// `Driver::hand_heard`).
+    /// `Driver::hand_heard`): `clock`, `sent` and `holder_expires` are then
+    /// those of the latest beat or append it stands for (0: none).
     HolderAlive {
         from: NodeId,
         epoch: Epoch,
@@ -152,7 +154,6 @@ pub enum Event {
         /// arrival; `i64::MAX`: unknown (its takeover gate is pending),
         /// which disables the cap (`Core::beat_cap`).
         guard: i64,
-        expires: Ms,
     },
     /// This node's own runtime was held up from `from` until `until` (its
     /// lag probe woke at least an eighth of `backup_takeover_ms` late; a
@@ -583,11 +584,12 @@ pub enum PeerMsg {
     /// `candidacy` names the holder's bring-up of this backup (unique per
     /// holder and growing; a backup dropped and re-added gets a new one):
     /// a dismissal (`HolderAlive { listed: false }`) applies only to the
-    /// candidacy it names. `expires_unix_ms` is the expiry of the lease
-    /// the holder holds at `epoch`, as it knows it when it builds the
-    /// append (0: none): a lower bound of the tenure's expiry, which only
-    /// moves later. A backup whose heartbeat lane is broken learns from
-    /// it when to read the lease (`Core::known_expiry`).
+    /// candidacy it names. `sent_ms`, `expires_ms` and `clock` are what a
+    /// beat carries (`constellation_net::Beat`): the holder's wait clock
+    /// when it built the append, the end of the lease it holds at `epoch` on
+    /// that clock (0: none) and the clock's id. A backup whose heartbeat lane
+    /// is broken learns from them when to read the lease (`Core::known_end`;
+    /// plan 43 C7b, row 24).
     BackupAppend {
         req: OpId,
         epoch: Epoch,
@@ -597,7 +599,9 @@ pub enum PeerMsg {
         from: u64,
         txs: Vec<BackupTx>,
         through: u64,
-        expires_unix_ms: i64,
+        sent_ms: i64,
+        expires_ms: i64,
+        clock: u64,
     },
     /// Plan 30 §M9: the backup holds every row through `acked`
     /// (durably), or has `sealed` the epoch and will never acknowledge

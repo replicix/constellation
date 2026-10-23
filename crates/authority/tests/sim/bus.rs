@@ -29,8 +29,8 @@ pub type Tap = Arc<dyn Fn(NodeId, &PeerMsg) + Send + Sync>;
 
 /// What a beat of the holder's off-core heartbeat carries (plan 43 C7-H1):
 /// the holder's wait clock reading when it sent it (`sent`) and its id
-/// (`clock`), the end of its lease and its guard on that clock, the lease
-/// body's wall expiry (`expires`), and the holder's wait reading `echo`,
+/// (`clock`), the end of its lease and its guard on that clock, and the
+/// holder's wait reading `echo`,
 /// which the daemon's holder keeps in the closure that waits for the answer
 /// (`Event::BackupAlive.at`): the bus keeps it here by `(holder, backup,
 /// seq)`.
@@ -40,7 +40,6 @@ pub struct BeatStamps {
     pub sent: i64,
     pub holder_expires: i64,
     pub guard: i64,
-    pub expires: i64,
     pub echo: i64,
 }
 
@@ -487,7 +486,6 @@ impl Bus {
                 sent: stamps.sent,
                 holder_expires: stamps.holder_expires,
                 guard: stamps.guard,
-                expires: constellation_authority::Ms(stamps.expires),
             },
         );
     }

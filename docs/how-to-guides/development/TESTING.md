@@ -4786,7 +4786,7 @@ The numbers are with the I6 flag off, 300 seeds unless said:
 | `strict-claimant-ahead` | 0 (close-to-open passes); I6: 313 TTL claims, 219 seeds with a live one | the strict oracle does not see the two-holder window |
 | `strict-reader-ahead` (node 3 reads only, +8 s, cut from node 1) | 2 000 seeds: 695, 882, 999 by the offset (187, 777, 999); 260 and 2391 fail with offset 0 too (`AUTHORITY_SIM_OFFSETS=3:0`): close-to-open | node 3 decides the live holder is dead and tails S3 past acknowledged, unshipped writes (row 28) |
 | `locks-released-takeover-ahead` | 275 of 300 (276); control `locks-released-takeover` (no offset): 5 of 2 000 with the default mix, 0 without | a taker ahead of a released lease arms no lock grace (row 23) |
-| `backup-locks-ahead` (backups, no fault) | 0; I6: 9 TTL claims of a live holder (a non-backup node), 169 seals of a live holder | row 24's storm, and row 2 for the non-backups |
+| `backup-locks-ahead` (backups, no fault) | 0; I6: 9 TTL claims of a live holder (a non-backup node), 169 seals of a live holder; **spec commit 4: 0 seals of a live holder** (749 of 1 000 before, 0 after) | row 24's storm (the backup judges the lease by the holder's own durations on its wait clock), and row 2 for the non-backups |
 | `fast-takeover-skewed-holder-twice` (2 000 seeds) | 8 (9); I6: 1 040 live claims | node 1, 4 s ahead, claims a live lease at the second failover |
 | `fast-takeover-skewed-successor` (30 000) / `locks-holder-step-back-sealed` (10 000) | 0 (3) / 1: 157 (1: 6275); I6: 77 / 14 live claims | row 2 at the second failover; a stepped-back holder |
 | `locks-skew-60s`, `strict-skew-60s` | 0, 0 (3, 0); I6 (strict): 6 and 114 | row 2 |

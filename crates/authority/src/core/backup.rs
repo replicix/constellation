@@ -262,6 +262,7 @@
 //! behaviour — a WAN-only cluster never pays a synchronous round trip.
 //! One node: nothing here ever runs (no peers, no backups, no messages).
 
+use super::lease::LeaseState;
 use super::{Core, S3For, Timer};
 use crate::action::{Action, AnswerSource, S3Op};
 use crate::event::{PeerMsg, S3Result};
@@ -745,10 +746,18 @@ pub(crate) struct HolderBeats {
     /// The latest numbered beat: `(seq, sent, arrival, clock)`; `sent` a
     /// reading of the holder's wait clock `clock` (plan 43 C7-H1).
     pub(crate) last: Option<(u64, i64, WaitMs, u64)>,
-    /// The latest expiry of the holder's lease its beats at `epoch` named,
-    /// on the lease body's **wall** clock (0: none heard): they stop there.
-    /// The seal watch's `known_expiry` (plan 43 Appendix B row 24).
-    pub(crate) expires: Ms,
+    /// Plan 43 C7b (row 24), the seal watch's evidence of where the holder's
+    /// lease ends: every arrival of the holder's at `epoch` (a numbered beat,
+    /// an arrival the driver handed over, an append) says, as readings of the
+    /// holder's own wait clock, when it was sent and where the lease it holds
+    /// ends, per clock id of the holder (at most [`BEAT_CLOCKS_KEPT`], oldest
+    /// first) like `clocks`. [`Core::known_end`] places the end on this node's
+    /// clock as `named end + the least (arrival − sent) lately`.
+    ends: Vec<(u64, EndAgg)>,
+    /// The holder clock id whose samples came last (0: none): a restarted
+    /// holder is a new process with a new clock, and the earlier one's end
+    /// is not this one's.
+    end_clock: u64,
     /// Plan 43 C7-F F-a / C7-H1: what the numbered beats of `epoch` say of
     /// where the holder's lease ends on *this* node's clock, for the cap of
     /// a fast takeover's floor ([`Core::beat_cap`]), per clock id of the
@@ -768,6 +777,36 @@ pub(crate) struct HolderBeats {
 }
 
 impl HolderBeats {
+    /// An arrival at `at` (this node's wait clock) of the holder's, sent at
+    /// `sent` and naming the end `expires` of the lease it holds, both
+    /// readings of its wait clock `clock` ([`HolderBeats::ends`]). An
+    /// arrival naming none (0, or `i64::MAX`: its takeover gate is pending)
+    /// says nothing of the end.
+    fn end_sample(&mut self, at: WaitMs, clock: u64, sent: i64, expires: i64) {
+        if clock == 0 || sent <= 0 || expires <= 0 || expires == i64::MAX {
+            return;
+        }
+        let i = match self.ends.iter().position(|(c, _)| *c == clock) {
+            Some(i) => i,
+            None => {
+                if self.ends.len() >= BEAT_CLOCKS_KEPT {
+                    self.ends.remove(0);
+                }
+                self.ends.push((clock, EndAgg::default()));
+                // A clock not seen before is a restarted holder's: its
+                // samples stand for the end from now on.
+                self.end_clock = clock;
+                self.ends.len() - 1
+            }
+        };
+        let agg = &mut self.ends[i].1;
+        if agg.lags.len() >= BEAT_LAGS_KEPT {
+            agg.lags.pop_front();
+        }
+        agg.lags.push_back((sent, at.0.saturating_sub(sent)));
+        agg.named_max = agg.named_max.max(expires);
+    }
+
     /// The terms of the holder clock `clock`, started afresh when it is
     /// new; past [`BEAT_CLOCKS_KEPT`] clocks the oldest goes.
     fn clock_agg(&mut self, clock: u64) -> &mut BeatClockAgg {
@@ -800,6 +839,21 @@ pub(crate) struct BeatClockAgg {
     /// beats named, on that clock.
     pub(crate) named_max: i64,
     pub(crate) guard_max: i64,
+}
+
+/// What the arrivals of one holder clock say of where its lease ends
+/// ([`HolderBeats::ends`]).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct EndAgg {
+    /// `(sent, arrival − sent)` of the latest [`BEAT_LAGS_KEPT`] arrivals:
+    /// `sent` a reading of the holder's wait clock, `arrival` the stamp on
+    /// this node's. The least difference is the arrival stamped least late:
+    /// an arrival this node stamped late (its runtime was held up, the
+    /// driver stamps a backlog when it gets to it) lengthens its own
+    /// difference and no other's.
+    lags: std::collections::VecDeque<(i64, i64)>,
+    /// The highest lease end any arrival named, on the holder's wait clock.
+    named_max: i64,
 }
 
 /// How many holder clock ids a [`HolderBeats`] keeps terms for.
@@ -2502,9 +2556,15 @@ impl Core {
                     from: start,
                     txs,
                     through,
-                    // The lease as the holder holds it now: the beats'
-                    // source too (`publish_alive_targets`).
-                    expires_unix_ms: lease.expires_unix_ms,
+                    // The holder's readings of its own wait clock now, as a beat
+                    // carries them (`publish_alive_targets`): when this was
+                    // built and where the lease it holds ends (0: unknown), and
+                    // the clock's id. The backup places the end on its own
+                    // clock by the least lag of what it receives (plan 43 C7b,
+                    // row 24).
+                    sent_ms: now.wait.0,
+                    expires_ms: self.lease.wait_until(&self.cfg).map_or(0, |end| end.0),
+                    clock: self.cfg.clock_id,
                 },
             });
         }
@@ -3339,7 +3399,7 @@ impl Core {
         (epoch, holder, config_version, candidacy): (Epoch, NodeId, u64, u64),
         from_jseq: u64,
         txs: Vec<BackupTx>,
-        (through, expires): (u64, Ms),
+        (through, (clock, sent, expires)): (u64, (u64, i64, i64)),
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -3420,7 +3480,10 @@ impl Core {
         self.bk.restarted = false;
         self.lease.cached_holder = Some(holder);
         self.bk.holder_silent_since = None;
-        self.note_named_expiry(holder, epoch, now.wait, expires);
+        // Where the lease ends, as this append says it (plan 43 C7b, row
+        // 24): the holder's readings when it built it, placed on this node's
+        // clock by the least lag of its arrivals (`known_end`).
+        self.note_named_end(holder, epoch, now.wait, (clock, sent, expires));
         // What is acknowledged is held *contiguously* (or is in the log:
         // rows through the holder's shipped-through seq, `through`, are
         // durable in S3, so a batch may start past them). The holder
@@ -3562,7 +3625,7 @@ impl Core {
         epoch: Epoch,
         candidacy: u64,
         listed: bool,
-        (at, expires): (WaitMs, Ms),
+        at: WaitMs,
         beat: (u64, u64, i64, i64, i64),
         replica: &dyn Replica,
     ) {
@@ -3574,7 +3637,7 @@ impl Core {
         // clock id), so the credit is gone. What it bought was at most one
         // margin of silence window for a beat held up in a retransmit queue.
         if listed {
-            self.note_beat(from, epoch, at, expires, beat);
+            self.note_beat(from, epoch, at, beat);
         }
         let Some(role) = self.bk.role else {
             return;
@@ -3610,11 +3673,11 @@ impl Core {
         self.backup_role_ends(replica);
     }
 
-    /// A beat of `from`'s at `epoch`, heard at `at` and credited as heard
-    /// at `credit` (`seq` 0: an arrival the driver handed over, not a
-    /// numbered beat; it carries the expiry the beat named, if it was
-    /// one, and nothing to tell its lateness by): its arrival, the lease
-    /// expiry it names, and whether it came late ([`HolderBeats::late`]).
+    /// A beat of `from`'s at `epoch`, heard at `at` (`seq` 0: an arrival the
+    /// driver handed over, not a numbered beat; it carries the stamps of the
+    /// latest beat or append it stands for, if any, and nothing to tell its
+    /// lateness by): its arrival, and whether it came late
+    /// ([`HolderBeats::late`]).
     /// A numbered beat also records what it says of the holder's lease on
     /// this node's clock (`lags`, with the raw `at`: see
     /// [`Core::beat_cap`]) and the guard it names.
@@ -3623,7 +3686,6 @@ impl Core {
         from: NodeId,
         epoch: Epoch,
         at: WaitMs,
-        expires: Ms,
         (seq, clock, sent, holder_expires, guard): (u64, u64, i64, i64, i64),
     ) {
         let interval = self.cfg.backup_heartbeat_ms as i64;
@@ -3638,13 +3700,7 @@ impl Core {
         let Some(b) = self.beats_at(from, epoch, at) else {
             return;
         };
-        // The expiry a beat names (the lease body's wall expiry), numbered
-        // or an arrival the driver handed over (the peer service notes it
-        // with the stamp, so it is as fresh as the stamp however far behind
-        // this node's steps are).
-        if expires.0 != 0 {
-            b.expires = b.expires.max(expires);
-        }
+        b.end_sample(at, clock, sent, holder_expires);
         if seq == 0 {
             return;
         }
@@ -3710,7 +3766,8 @@ impl Core {
             b.epoch = epoch;
             b.heard_at = at;
             b.last = None;
-            b.expires = Ms(0);
+            b.ends.clear();
+            b.end_clock = 0;
             b.clocks.clear();
             b.guard_unknown = false;
         }
@@ -3718,23 +3775,25 @@ impl Core {
         Some(b)
     }
 
-    /// An append of `from`'s at `epoch`, arrived at `at`, names the
-    /// expiry of the lease it holds (`expires`; 0: unknown): recorded
-    /// where a beat's is, for [`Self::known_expiry`]. Appends reach a
-    /// backup whose heartbeat lane is broken, and a tenure that sent at
-    /// least one has named its expiry. Never lowered, and no other
-    /// epoch's: an epoch's expiry only moves later, so each value is a
-    /// lower bound, and a lower bound can only make the watch read the
-    /// lease early (which seals nothing: `on_takeover_get` seals only an
-    /// expired object that lists this node). Through `beats_at` it also
-    /// moves `HolderBeats::heard_at` to the core's `now`, which the
-    /// `ack=s3` holder watch reads: by at most one core lag, within the epoch.
-    fn note_named_expiry(&mut self, from: NodeId, epoch: Epoch, at: WaitMs, expires: Ms) {
-        if expires.0 <= 0 {
+    /// An append of `from`'s at `epoch`, arrived at `at`, carries the holder's
+    /// readings `(clock, sent, expires)` when it built it, as a beat does:
+    /// recorded for [`Self::known_end`]. Appends reach a backup whose
+    /// heartbeat lane is broken, and a tenure that sent at least one has
+    /// named its end. No other epoch's. Through `beats_at` it also moves
+    /// `HolderBeats::heard_at` to the core's `now`, which the `ack=s3` holder
+    /// watch reads: by at most one core lag, within the epoch.
+    fn note_named_end(
+        &mut self,
+        from: NodeId,
+        epoch: Epoch,
+        at: WaitMs,
+        (clock, sent, expires): (u64, i64, i64),
+    ) {
+        if clock == 0 || sent <= 0 || expires <= 0 {
             return;
         }
         if let Some(b) = self.beats_at(from, epoch, at) {
-            b.expires = b.expires.max(expires);
+            b.end_sample(at, clock, sent, expires);
         }
     }
 
@@ -3779,12 +3838,12 @@ impl Core {
     /// ([`Self::attentive_since`]; `None`: no discount, plain silence, and
     /// no late-beat window either):
     ///
-    /// - none within the expiry margin of the holder's lease, as its own
-    ///   beats and appends last named the expiry — or, before either has,
-    ///   as this node's last read of the lease object did (a lower
-    ///   bound: the holder renews past it, so the discount ends early,
-    ///   never late).
-    ///   Its beats stop at the expiry, so silence there may be the lease
+    /// - none within the expiry margin of the end of the holder's lease,
+    ///   as its own beats and appends last placed it on this node's wait
+    ///   clock — or, before either has, as this node's last read of the
+    ///   lease object did ([`Self::known_end`]; an end a renewal has not
+    ///   moved yet, so the discount may end early, never late).
+    ///   Its beats stop at the end, so silence there may be the lease
     ///   ending, not a stall — and a backup must seal and claim promptly
     ///   then: nobody else may claim a `Backup` lease for
     ///   `backup_claim_grace_ms` (2T) past its expiry, time meant for a
@@ -3809,40 +3868,95 @@ impl Core {
         }
         let t = self.cfg.backup_takeover_ms.max(1) as i64;
         let margin = self.cfg.expiry_margin_ms as i64;
-        match self.known_expiry(holder, epoch) {
-            Some(expires) => (expires.since(now.wall) > margin).then_some(Reach::PlusLapses(t)),
+        match self.known_end(holder, epoch, now) {
+            Some(end) => (end.since(now.wait) > margin).then_some(Reach::PlusLapses(t)),
             None if seal => Some(Reach::Flat(t / 2)),
             None => Some(Reach::PlusLapses(t)),
         }
     }
 
-    /// The expiry of `holder`'s lease at `epoch` as its beats and appends
-    /// last named it (or as a lease read past it showed it renewed).
-    fn beat_named_expiry(&self, holder: NodeId, epoch: Epoch) -> Option<Ms> {
-        self.bk
-            .beats
-            .get(&holder)
-            .filter(|b| b.epoch == epoch && b.expires.0 != 0)
-            .map(|b| b.expires)
-    }
-
-    /// The expiry of `holder`'s lease at `epoch` as this node knows it:
-    /// the latest of what its beats and its appends named and what this
-    /// node last read (each a lower bound: the holder may have renewed
-    /// since). Every `BackupAppend` carries the expiry the holder holds,
-    /// so a backup with a broken heartbeat lane that never read the lease
-    /// during the tenure still knows it, once the holder has sent it one
-    /// append; `None` is a tenure that sent this node no append, no beat
-    /// (and none read): it has nothing unshipped to lose, a holder lists
-    /// a backup only to append to it.
-    pub(crate) fn known_expiry(&self, holder: NodeId, epoch: Epoch) -> Option<Ms> {
+    /// Where `holder`'s lease at `epoch` ends on this node's **wait** clock,
+    /// as this node knows it (plan 43 C7b, row 24): the latest of what the
+    /// holder's own words placed and, for a lease this node read whose
+    /// renewal they had not named (a renewal it did not hear: its beats lost,
+    /// or the holder's other word), the first sight of that key plus the
+    /// holder's TTL ([`LeaseState::observe`]; the holder's window for it ends
+    /// one TTL after it was written, which was before this node first saw it).
+    ///
+    /// The holder's words are readings of its own wait clock, `X` the
+    /// highest end named and `sent` when each arrival left it. `X` is placed
+    /// on this node's clock as `X + the least (arrival − sent)` over the
+    /// recent arrivals, the way a successor places the end of the floor it
+    /// waits out ([`Self::beat_cap`]; rate only, no offset): an arrival this
+    /// node stamped late, because its runtime was held up and the driver
+    /// stamps the backlog when it gets to it, lengthens its own difference
+    /// and no other's, so the end is not pushed past the 2T claim grace
+    /// that a listed backup's seal must beat by a lapse of its own. Each term
+    /// is no earlier in true time than the holder's own end (the holder's wait
+    /// clock never over-counts, and an arrival follows its send): a seal by
+    /// it is never earlier than the holder's, and the silence trigger is the
+    /// other way in.
+    /// Every append carries the same readings, so a backup with a broken
+    /// heartbeat lane that never read the lease during the tenure still knows
+    /// it, once the holder has sent it one append; `None` is a tenure that
+    /// sent this node no append, no beat (and none read): it has nothing
+    /// unshipped to lose, a holder lists a backup only to append to it.
+    pub(crate) fn known_end(&self, holder: NodeId, epoch: Epoch, now: Now) -> Option<WaitMs> {
+        let beats = self.bk.beats.get(&holder).filter(|b| b.epoch == epoch);
+        let latest = beats.and_then(|b| {
+            b.ends
+                .iter()
+                .find(|(c, _)| *c == b.end_clock)
+                .map(|(c, agg)| (*c, agg))
+        });
+        let span = self.beat_cap_span_ms();
+        let placed = latest.and_then(|(_, agg)| {
+            let x = agg.named_max;
+            agg.lags
+                .iter()
+                // The rate error of a sample sent long before `X` (see
+                // `beat_cap`): left out beyond the span.
+                .filter(|(sent, _)| (0..=span).contains(&x.saturating_sub(*sent)))
+                .map(|(_, lag)| *lag)
+                .min()
+                .map(|lag| WaitMs(x.saturating_add(lag)))
+        });
         let read = self
             .lease
-            .last_seen
+            .obs
             .as_ref()
-            .filter(|l| l.holder == holder && l.epoch == epoch)
-            .map(|l| Ms(l.expires_unix_ms));
-        self.beat_named_expiry(holder, epoch).max(read)
+            .filter(|o| o.body.holder == holder && o.body.epoch == epoch && !o.body.released)
+            .filter(|o| {
+                // The holder's words had named this very renewal (or a
+                // later one): their placing is the better one.
+                !latest.is_some_and(|(clock, agg)| {
+                    o.body.holder_clock == clock && o.body.holder_wait_ms <= agg.named_max
+                })
+            })
+            .map(|o| {
+                let by_observation = o.since.plus(LeaseState::ttl_of(&o.body, &self.cfg));
+                if placed.is_some() {
+                    return by_observation;
+                }
+                // Cold: this node has not heard a word of the holder's own
+                // since it started (a reboot, an upgrade; or since the
+                // holder's last beat is older than its samples), so its wait
+                // clock says nothing of how long ago the holder renewed, and
+                // a node that watched all along claims the lease one TTL and
+                // 2T after that renewal (`backup-lag-at-expiry-beats-lost`
+                // seed 318, `backup-crash` 410): a cold backup that waited a
+                // TTL from its first read would lose the tail it holds. The
+                // one thing that knows how long it was away is the wall
+                // clock, so the object's wall expiry is read as a hint, the
+                // earlier of the two: an early read is harmless and a seal
+                // is safe, only a seal of a live holder when this node's
+                // clock is ahead of the holder's, once per start; never a
+                // claim, which is judged on observations alone. Heard once
+                // (a beat, an append), the holder's own words place the end
+                // and the hint is gone.
+                by_observation.min(now.wait_of_wall(Ms(o.body.expires_unix_ms)))
+            });
+        placed.max(read)
     }
 
     /// Whether a watch discounts lag at all ([`Self::lag_discount`]).
@@ -3931,23 +4045,19 @@ impl Core {
         }
         let mut due = now.wait.plus(self.cfg.backup_takeover_ms.max(1));
         if let Some(role) = self.bk.role {
-            due = self.watch_due_by_expiry(role.holder, role.epoch, now, due);
+            due = self.watch_due_by_end(role.holder, role.epoch, now, due);
         }
         let id = self.set_timer_wait(due, Timer::BackupWatch, out);
         self.bk.watch_timer = Some(id);
     }
 
-    /// `due`, but no later than the expiry of `holder`'s lease at `epoch`
-    /// as this node knows it, if that is still ahead: the watch looks at
-    /// the expiry itself, whatever it has credited since
+    /// `due`, but no later than the end of `holder`'s lease at `epoch` as
+    /// this node knows it ([`Self::known_end`]), if that is still ahead: the
+    /// watch looks at the end itself, whatever it has credited since
     /// (`on_backup_watch`).
-    fn watch_due_by_expiry(&self, holder: NodeId, epoch: Epoch, now: Now, due: WaitMs) -> WaitMs {
-        match self.known_expiry(holder, epoch) {
-            // The holder's expiry is a wall stamp (row 24, C7b): the watch
-            // is due where this node's wall clock reads it, as time left
-            // on the wait clock the timer runs on (the decision itself
-            // compares the wall clock again, `on_backup_watch`).
-            Some(expires) if expires > now.wall => due.min(now.wait_of_wall(expires)),
+    fn watch_due_by_end(&self, holder: NodeId, epoch: Epoch, now: Now, due: WaitMs) -> WaitMs {
+        match self.known_end(holder, epoch, now) {
+            Some(end) if end > now.wait => due.min(end),
             _ => due,
         }
     }
@@ -4005,9 +4115,10 @@ impl Core {
         let window = self.silence_window(watched, now);
         let since = self.attentive_since(watched, self.bk.last_heard, now);
         let silent = now.wait.since(since);
-        // Past the expiry of the holder's lease as this node knows it (its
-        // beats named it, or this node read it), its silence is not the
-        // question; the lease ending is. What this node
+        // Past the end of the holder's lease as this node knows it on its
+        // own wait clock (its beats and appends placed it, or this node
+        // read it: `known_end`), its silence is not the question; the
+        // lease ending is. What this node
         // credited since may be the backlog of its own lapse — the daemon
         // stamps beats and appends as its runtime gets to them and hands
         // the stamps over before this timer — and a window counted from
@@ -4018,25 +4129,26 @@ impl Core {
         // attentive time (its own lapses discounted, though the watch
         // counted plain silence inside the expiry margin), and a holder
         // heard within a window of that has a window again, no later than
-        // the object's expiry; moved on, the role ends. Known that way,
-        // the expiry is a lower bound, so this reads early at worst, never
-        // seals early.
+        // the object's end; moved on, the role ends. Known that way, the
+        // end is a placing of the holder's own duration, so a seal by it
+        // comes no earlier than the holder's own end in real time (plan 43
+        // C7b, row 24: no wall value of another node is compared).
         let expired = self
-            .known_expiry(role.holder, role.epoch)
-            .is_some_and(|expires| now.wall >= expires);
+            .known_end(role.holder, role.epoch, now)
+            .is_some_and(|end| now.wait >= end);
         if silent < window && !expired {
             // Looked at again no later than where the discount ends (the
             // lease's expiry margin, `lag_aware`): from there the plain
             // window applies, and a backup that waited out a long one
             // past the expiry would miss its claim grace.
             let mut due = since.plus(window as u64);
-            if let Some(expires) = self.known_expiry(role.holder, role.epoch) {
-                let aware_until = Ms(expires.0 - self.cfg.expiry_margin_ms as i64);
-                if aware_until > now.wall {
-                    due = due.min(now.wait_of_wall(aware_until));
+            if let Some(end) = self.known_end(role.holder, role.epoch, now) {
+                let aware_until = end.minus(self.cfg.expiry_margin_ms);
+                if aware_until > now.wait {
+                    due = due.min(aware_until);
                 }
             }
-            let due = self.watch_due_by_expiry(role.holder, role.epoch, now, due);
+            let due = self.watch_due_by_end(role.holder, role.epoch, now, due);
             let id = self.set_timer_wait(due, Timer::BackupWatch, out);
             self.bk.watch_timer = Some(id);
             return;
@@ -4090,7 +4202,17 @@ impl Core {
                     && !lease.released
                     && lease.backups.contains(&self.cfg.node_id) =>
             {
-                if probe && !lease.is_expired(now.wall.0) {
+                // Whether the lease this read shows has run out, on this node's
+                // own clocks (plan 43 C7b, row 24): the end its beats and
+                // appends placed, or, for a renewal it had not heard, one TTL
+                // from its first sight of it (`known_end`; the dispatch
+                // observed this read just before): a renewal the beats did
+                // not name is alive until its TTL has run on this node's
+                // wait clock, never by a wall compare with the holder's.
+                let ended = self
+                    .known_end(role.holder, role.epoch, now)
+                    .is_some_and(|end| now.wait >= end);
+                if probe && !ended {
                     // A restarted backup's probe (3b): the holder is
                     // renewing — alive; wait for its link. An expired
                     // lease is a holder gone: seal and take over now.
@@ -4098,7 +4220,7 @@ impl Core {
                     self.arm_backup_watch(now, out);
                     return;
                 }
-                if !lease.is_expired(now.wall.0) {
+                if !ended {
                     // The object is unexpired and lists this node. Whether
                     // the holder is silent is judged in this node's
                     // attentive time (`after_own_lapses`: its own lapses
@@ -4112,7 +4234,7 @@ impl Core {
                     // window of attentive time (or read for the expiry it
                     // knew of, which the object moved), the holder is alive:
                     // a window again, no later than the object's expiry
-                    // (`watch_due_by_expiry`), where the watch reads again
+                    // (`watch_due_by_end`), where the watch reads again
                     // and an expired object seals. 2026-10-16 `snapsched`
                     // under host load: the holder's core held up 6.7 s (no
                     // renewal, its 10 s lease inside the margin), the
@@ -4127,20 +4249,15 @@ impl Core {
                     };
                     let window = self.silence_window((role.holder, role.epoch, true), now);
                     if for_expiry || now.wait.since(since) < window {
-                        if let Some(b) = self.bk.beats.get_mut(&role.holder) {
-                            if b.epoch == role.epoch {
-                                b.expires = b.expires.max(Ms(lease.expires_unix_ms));
-                            }
-                        }
+                        // (The lease read is in `known_end` through the
+                        // observation: a renewal unheard is alive for its TTL
+                        // from the first sight of it.)
                         self.lease.note_object(&lease);
                         self.arm_backup_watch(now, out);
                         return;
                     }
                 }
-                if !probe
-                    && self.bk.last_heard >= self.bk.takeover_read_at
-                    && !lease.is_expired(now.wall.0)
-                {
+                if !probe && self.bk.last_heard >= self.bk.takeover_read_at && !ended {
                     // The holder spoke while the lease was read: alive.
                     // Not once the lease it holds has expired: a holder
                     // stops acting a margin before that, so what reached

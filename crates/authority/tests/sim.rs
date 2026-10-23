@@ -9876,7 +9876,13 @@ fn a_second_seal_after_the_grace_arms_no_second_floor() {
 /// 193000..203000 still fail; with plan 43 C1-1's listed-acknowledgement
 /// count and C7b's observation rule 3 of 193000..203000 do: 193262, 195339
 /// and 199076; with the lock-wait follow-ups' shared lease reads (N3),
-/// 193262, 195339 and 202431, pinned.) The
+/// 193262, 195339 and 202431; with the backup watch on the holder's own
+/// durations (C7b spec commit 4) 6 of 193000..203000 fail (`+unclocked`, as
+/// the pins run), 194557, 194567, 195339, 199719, 202316 and 202419, all at
+/// t = 3.1 to 3.2 s inside the first failover's floor, none with the real
+/// cap, and three are pinned; with plan 41's lock lane 194557 no longer
+/// fails, the other five do, at t = 3.1 to 3.2 s, and 199719 takes its
+/// pin.) The
 /// real cap is not clean over every range: it violates at the *second*
 /// failover (about 15 s, a clock beyond the envelope), a different and
 /// older failure (fixed by plan 43 C7b's observation rule:
@@ -9886,7 +9892,7 @@ fn a_second_seal_after_the_grace_arms_no_second_floor() {
 #[test]
 fn a_credited_arrival_cap_splits() {
     use pinned::run_seed;
-    for seed in [193_262, 195_339, 202_431] {
+    for seed in [195_339, 199_719, 202_316] {
         let e = run_seed(seed, fast_takeover_skewed_successor_credited_config())
             .expect_err("a cap counted from the credit never failed: no control");
         assert!(e.contains("mutual exclusion violated"), "seed {seed}: {e}");

@@ -7997,7 +7997,9 @@ mod epoch_rules {
                 from: 1,
                 txs: Vec::new(),
                 through: 0,
-                expires_unix_ms: 0,
+                sent_ms: 0,
+                expires_ms: 0,
+                clock: 0,
             },
         });
         assert!(matches!(
@@ -8051,7 +8053,9 @@ mod epoch_rules {
                 from: 1,
                 txs: Vec::new(),
                 through: 0,
-                expires_unix_ms: 0,
+                sent_ms: 0,
+                expires_ms: 0,
+                clock: 0,
             },
         };
         let hold = |from, epoch, for_ms| Event::Peer {
@@ -8121,7 +8125,9 @@ mod epoch_rules {
                 from: 1,
                 txs: Vec::new(),
                 through: 0,
-                expires_unix_ms: 0,
+                sent_ms: 0,
+                expires_ms: 0,
+                clock: 0,
             },
         });
         let watch = timers(&out, TimerKind::BackupWatch);
@@ -8140,7 +8146,6 @@ mod epoch_rules {
             clock: 1,
             holder_expires: 0,
             sent: 0,
-            expires: Ms(0),
             guard: 0,
         })
     }
@@ -8190,7 +8195,6 @@ mod epoch_rules {
             clock: 1,
             holder_expires: 0,
             sent: 0,
-            expires: Ms(0),
             guard: 0,
         });
         h.step(Event::HolderAlive {
@@ -8203,7 +8207,6 @@ mod epoch_rules {
             clock: 1,
             holder_expires: 0,
             sent: 0,
-            expires: Ms(0),
             guard: 0,
         });
         let out = h.step(Event::Timer { id: watch });
@@ -8223,9 +8226,8 @@ mod epoch_rules {
             at: w(at),
             seq,
             clock: 1,
-            holder_expires: 0,
+            holder_expires: (at.plus(120_000)).0,
             sent: sent.0,
-            expires: at.plus(120_000),
             guard: 0,
         })
     }
@@ -8303,6 +8305,10 @@ mod epoch_rules {
                 let mut lease = root_lease(1, 1, t0.plus(30_000));
                 lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
                 lease.backups = vec![2];
+                lease.ttl_ms = 30_000;
+                // Read just now: its end, as this node knows it, is one
+                // TTL from the first sight.
+                h.core.lease.observe(h.clk(), Some(&(lease.clone(), tag())));
                 h.core.lease.note_object(&lease);
             }
             h.advance(1_500);
@@ -8351,6 +8357,8 @@ mod epoch_rules {
                 let mut lease = root_lease(1, 1, expires);
                 lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
                 lease.backups = vec![2];
+                lease.ttl_ms = 2_000;
+                h.core.lease.observe(h.clk(), Some(&(lease.clone(), tag())));
                 h.core.lease.note_object(&lease);
             } else {
                 h.step(Event::HolderAlive {
@@ -8361,9 +8369,8 @@ mod epoch_rules {
                     at: w(t0),
                     seq: 1,
                     clock: 1,
-                    holder_expires: 0,
+                    holder_expires: (expires).0,
                     sent: t0.0,
-                    expires,
                     guard: 0,
                 });
             }
@@ -8385,7 +8392,9 @@ mod epoch_rules {
                     from: 1,
                     txs: Vec::new(),
                     through: 0,
-                    expires_unix_ms: 0,
+                    sent_ms: 0,
+                    expires_ms: 0,
+                    clock: 0,
                 },
             });
             let out = h.step(Event::Timer { id: watch });
@@ -8397,6 +8406,7 @@ mod epoch_rules {
             let mut lease = root_lease(1, 1, if renewed { t0.plus(62_000) } else { expires });
             lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
             lease.backups = vec![2];
+            lease.ttl_ms = 2_000;
             let out = answer_job_read(&mut h, &out, lease);
             if renewed {
                 assert_eq!(h.core.bk.sealed, 0, "sealed a renewed holder: {out:?}");
@@ -8438,19 +8448,23 @@ mod epoch_rules {
                     from: 1,
                     txs: Vec::new(),
                     through: 0,
-                    expires_unix_ms: expires.0,
+                    // The holder's readings: when it built the append, the end
+                    // of its lease, its clock.
+                    sent_ms: h.now.0,
+                    expires_ms: expires.0,
+                    clock: 1,
                 },
             })
         };
         let out = append(&mut h, 7, 1, Ms(0));
         let watch = timers(&out, TimerKind::BackupWatch)[0];
-        assert_eq!(h.core.known_expiry(1, 1), None, "0 is unknown");
+        assert_eq!(known_end(&h, 1, 1), None, "0 is unknown");
         append(&mut h, 8, 1, expires);
-        assert_eq!(h.core.known_expiry(1, 1), Some(expires));
+        assert_eq!(known_end(&h, 1, 1), Some(expires));
         // Never lowered, by an older value or by a 0.
         append(&mut h, 9, 1, t0.plus(500));
         append(&mut h, 10, 1, Ms(0));
-        assert_eq!(h.core.known_expiry(1, 1), Some(expires));
+        assert_eq!(known_end(&h, 1, 1), Some(expires));
         assert_eq!(h.core.bk.beats[&1].epoch, 1);
 
         h.advance(3_600);
@@ -8480,12 +8494,12 @@ mod epoch_rules {
         let far = t0.plus(600_000);
         append(&mut h, 7, 2, t0.plus(2_000));
         append(&mut h, 8, 1, far);
-        assert_eq!(h.core.known_expiry(1, 2), Some(t0.plus(2_000)));
-        assert_eq!(h.core.known_expiry(1, 1), None);
+        assert_eq!(known_end(&h, 1, 2), Some(t0.plus(2_000)));
+        assert_eq!(known_end(&h, 1, 1), None);
         // A new tenure's expiry replaces the old tenure's, not maxes with it.
         append(&mut h, 9, 3, t0.plus(1_000));
-        assert_eq!(h.core.known_expiry(1, 3), Some(t0.plus(1_000)));
-        assert_eq!(h.core.known_expiry(1, 2), None);
+        assert_eq!(known_end(&h, 1, 3), Some(t0.plus(1_000)));
+        assert_eq!(known_end(&h, 1, 2), None);
     }
 
     /// A backup whose runtime lags again and again still seals a dead
@@ -8633,16 +8647,13 @@ mod epoch_rules {
             at: w(t0.plus(2_000)),
             seq: 1,
             clock: 1,
-            holder_expires: 0,
+            holder_expires: (t0.plus(60_000)).0,
             sent: t0.plus(2_000).0,
-            expires: t0.plus(60_000),
             guard: 0,
         });
         let b = &h.core.bk.beats[&1];
-        assert_eq!(
-            (b.epoch, b.last.map(|l| l.0), b.expires),
-            (2, Some(1), t0.plus(60_000))
-        );
+        assert_eq!((b.epoch, b.last.map(|l| l.0)), (2, Some(1)));
+        assert_eq!(known_end(&h, 1, 2), Some(t0.plus(60_000)));
         assert_eq!(
             h.core.silence_window((1, 2, true), h.clk()),
             1_500 + 2 * 700
@@ -8678,9 +8689,8 @@ mod epoch_rules {
                 at: w(at),
                 seq: i,
                 clock: 1,
-                holder_expires: 0,
+                holder_expires: (at.plus(60_000)).0,
                 sent: at.0,
-                expires: at.plus(60_000),
                 guard: 0,
             });
             poke(&mut sub);
@@ -8769,9 +8779,8 @@ mod epoch_rules {
                 at: w(at),
                 seq,
                 clock: 1,
-                holder_expires: 0,
+                holder_expires: (expires).0,
                 sent: at.0,
-                expires,
                 guard: 0,
             })
         };
@@ -8859,9 +8868,8 @@ mod epoch_rules {
                     at: w(at),
                     seq,
                     clock: 1,
-                    holder_expires: 0,
+                    holder_expires: (expires).0,
                     sent: at.0,
-                    expires,
                     guard: 0,
                 });
             };
@@ -8959,7 +8967,7 @@ mod epoch_rules {
         let mut h = Harness::new(2);
         let _watch = backing(&mut h);
         let t0 = h.now;
-        assert_eq!(h.core.known_expiry(1, 1), None);
+        assert_eq!(known_end(&h, 1, 1), None);
         let arrival = |h: &mut Harness, epoch: u64, at: Ms, expires: Ms| {
             h.step(Event::HolderAlive {
                 from: 1,
@@ -8969,28 +8977,27 @@ mod epoch_rules {
                 at: w(at),
                 seq: 0,
                 clock: 1,
-                holder_expires: 0,
-                sent: 0,
-                expires,
+                holder_expires: (expires).0,
+                sent: (at).0,
                 guard: 0,
             });
         };
         // An arrival that names none changes nothing.
         arrival(&mut h, 1, t0, Ms(0));
-        assert_eq!(h.core.known_expiry(1, 1), None);
+        assert_eq!(known_end(&h, 1, 1), None);
         // One that names an expiry sets it, with no numbered beat handled.
         arrival(&mut h, 1, t0.plus(100), t0.plus(6_000));
-        assert_eq!(h.core.known_expiry(1, 1), Some(t0.plus(6_000)));
+        assert_eq!(known_end(&h, 1, 1), Some(t0.plus(6_000)));
         assert_eq!(h.core.bk.last_heard, w(t0.plus(100)));
         // A later arrival that names none, or an older expiry, leaves it.
         arrival(&mut h, 1, t0.plus(200), Ms(0));
         arrival(&mut h, 1, t0.plus(300), t0.plus(5_000));
-        assert_eq!(h.core.known_expiry(1, 1), Some(t0.plus(6_000)));
+        assert_eq!(known_end(&h, 1, 1), Some(t0.plus(6_000)));
         // A renewal moves it.
         arrival(&mut h, 1, t0.plus(400), t0.plus(11_000));
-        assert_eq!(h.core.known_expiry(1, 1), Some(t0.plus(11_000)));
+        assert_eq!(known_end(&h, 1, 1), Some(t0.plus(11_000)));
         // Another epoch's expiry is not this one's.
-        assert_eq!(h.core.known_expiry(1, 2), None);
+        assert_eq!(known_end(&h, 1, 2), None);
         // The numbered beat the core gets to later, naming an older expiry
         // (it sat on the urgent lane), does not take it back.
         h.step(Event::HolderAlive {
@@ -9001,12 +9008,11 @@ mod epoch_rules {
             at: w(t0.plus(500)),
             seq: 1,
             clock: 1,
-            holder_expires: 0,
+            holder_expires: (t0.plus(6_000)).0,
             sent: t0.plus(500).0,
-            expires: t0.plus(6_000),
             guard: 0,
         });
-        assert_eq!(h.core.known_expiry(1, 1), Some(t0.plus(11_000)));
+        assert_eq!(known_end(&h, 1, 1), Some(t0.plus(11_000)));
         // A holder not listing this node is not tracked at all.
         h.step(Event::HolderAlive {
             from: 1,
@@ -9016,12 +9022,11 @@ mod epoch_rules {
             at: w(t0.plus(600)),
             seq: 0,
             clock: 1,
-            holder_expires: 0,
-            sent: 0,
-            expires: t0.plus(90_000),
+            holder_expires: (t0.plus(90_000)).0,
+            sent: (t0.plus(600)).0,
             guard: 0,
         });
-        assert_eq!(h.core.known_expiry(1, 1), Some(t0.plus(11_000)));
+        assert_eq!(known_end(&h, 1, 1), Some(t0.plus(11_000)));
     }
 
     /// A numbered beat records the expiry it names, as an arrival does
@@ -9035,7 +9040,7 @@ mod epoch_rules {
         let mut h = Harness::new(2);
         let _watch = backing(&mut h);
         let t0 = h.now;
-        assert_eq!(h.core.known_expiry(1, 1), None);
+        assert_eq!(known_end(&h, 1, 1), None);
         let numbered = |h: &mut Harness, epoch: u64, seq: u64, expires: Ms| {
             let at = h.now;
             h.step(Event::HolderAlive {
@@ -9046,28 +9051,206 @@ mod epoch_rules {
                 at: w(at),
                 seq,
                 clock: 1,
-                holder_expires: 0,
+                holder_expires: (expires).0,
                 sent: at.0,
-                expires,
                 guard: 0,
             });
         };
         numbered(&mut h, 1, 1, t0.plus(6_000));
-        assert_eq!(h.core.known_expiry(1, 1), Some(t0.plus(6_000)));
+        assert_eq!(known_end(&h, 1, 1), Some(t0.plus(6_000)));
         h.advance(100);
         numbered(&mut h, 1, 2, t0.plus(5_000));
-        assert_eq!(h.core.known_expiry(1, 1), Some(t0.plus(6_000)), "lowered");
+        assert_eq!(known_end(&h, 1, 1), Some(t0.plus(6_000)), "lowered");
         h.advance(100);
         numbered(&mut h, 1, 3, t0.plus(11_000));
-        assert_eq!(h.core.known_expiry(1, 1), Some(t0.plus(11_000)));
+        assert_eq!(known_end(&h, 1, 1), Some(t0.plus(11_000)));
         // A beat naming none leaves it; a newer epoch starts over.
         h.advance(100);
         numbered(&mut h, 1, 4, Ms(0));
-        assert_eq!(h.core.known_expiry(1, 1), Some(t0.plus(11_000)));
+        assert_eq!(known_end(&h, 1, 1), Some(t0.plus(11_000)));
         h.advance(100);
         numbered(&mut h, 2, 1, t0.plus(20_000));
-        assert_eq!(h.core.known_expiry(1, 2), Some(t0.plus(20_000)));
-        assert_eq!(h.core.known_expiry(1, 1), None);
+        assert_eq!(known_end(&h, 1, 2), Some(t0.plus(20_000)));
+        assert_eq!(known_end(&h, 1, 1), None);
+    }
+
+    /// A numbered beat of holder 1 (epoch 1, clock `clock`) sent at wait
+    /// reading `sent`, heard at `at`, for a lease that ends `left` ms after
+    /// it was sent.
+    fn beat_ending(h: &mut Harness, seq: u64, clock: u64, left: i64) -> Vec<Action> {
+        let sent = h.clk().wait.0;
+        h.step(Event::HolderAlive {
+            from: 1,
+            epoch: 1,
+            candidacy: 1,
+            listed: true,
+            at: WaitMs(sent),
+            seq,
+            clock,
+            holder_expires: sent + left,
+            sent,
+            guard: 0,
+        })
+    }
+
+    /// Plan 43 C7b, row 24: a backup whose wall clock is 8 s ahead of the
+    /// holder's reads the lease's wall expiry as long past at every
+    /// renewal, and sealed a live holder (189 seals in 300 seeds of
+    /// `backup-locks-ahead`). The end now comes from the holder's own
+    /// beats, a duration anchored on this node's wait clock: whatever the
+    /// wall reads, a renewing holder is never read, let alone sealed.
+    #[test]
+    fn a_backup_ahead_does_not_seal_a_renewing_holder() {
+        let mut h = Harness::new(2);
+        let mut watch = backing(&mut h);
+        h.step_wall(8_000);
+        for seq in 1..=60u64 {
+            h.advance(300);
+            beat_ending(&mut h, seq, 1, 2_000);
+            let out = h.step(Event::Timer { id: watch });
+            assert!(
+                s3_ops(&out).is_empty(),
+                "read the lease of a renewing holder at beat {seq}: {out:?}"
+            );
+            watch = timers(&out, TimerKind::BackupWatch)[0];
+        }
+        assert_eq!(h.core.bk.sealed, 0);
+    }
+
+    /// The same with the backup 8 s *behind*: it used to wait for the
+    /// holder's wall expiry to come round on its own clock, 8 s after the
+    /// lease ended. Now it reads at the holder's end, on its wait clock.
+    #[test]
+    fn a_backup_behind_seals_at_the_holders_end_not_later() {
+        let mut h = Harness::new(2);
+        let watch = backing(&mut h);
+        h.step_wall(-8_000);
+        // The last beat names an end 1 s ahead (inside the 1.5 s window).
+        beat_ending(&mut h, 1, 1, 1_000);
+        h.advance(999);
+        let out = h.step(Event::Timer { id: watch });
+        assert!(s3_ops(&out).is_empty(), "read before the end: {out:?}");
+        let watch = timers(&out, TimerKind::BackupWatch)[0];
+        h.advance(1);
+        let out = h.step(Event::Timer { id: watch });
+        assert!(
+            matches!(s3_ops(&out).as_slice(), [(_, S3Op::LeaseGet)]),
+            "no read at the holder's end: {out:?}"
+        );
+        // The object is the one the beat named and still lists this node:
+        // sealed there, not eight seconds later.
+        let end = h.clk().wait.0;
+        let mut lease = root_lease(1, 1, Ms(end));
+        lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+        lease.backups = vec![2];
+        lease.ttl_ms = 10_000;
+        h.core.lease.observe(
+            {
+                let mut then = h.clk();
+                then.wait = WaitMs(end - 1_000);
+                then
+            },
+            Some(&(lease.clone(), tag())),
+        );
+        answer_job_read(&mut h, &out, lease);
+        assert_eq!(h.core.bk.sealed, 1, "did not seal at the holder's end");
+    }
+
+    /// A renewal this backup never heard (its beats lost) is alive for its
+    /// TTL from the first sight of it: the read at the old end finds a newer
+    /// key, seals nothing, and the end moves to `first sight + ttl`.
+    #[test]
+    fn an_unheard_renewal_read_from_s3_keeps_the_holder_alive() {
+        let mut h = Harness::new(2);
+        let watch = backing(&mut h);
+        beat_ending(&mut h, 1, 1, 1_000);
+        let named = h.clk().wait.0 + 1_000;
+        h.advance(1_000);
+        let out = h.step(Event::Timer { id: watch });
+        assert!(
+            matches!(s3_ops(&out).as_slice(), [(_, S3Op::LeaseGet)]),
+            "{out:?}"
+        );
+        let mut lease = root_lease(1, 1, Ms(named + 5_000));
+        lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+        lease.backups = vec![2];
+        lease.ttl_ms = 10_000;
+        let out = answer_job_read(&mut h, &out, lease);
+        assert_eq!(h.core.bk.sealed, 0, "sealed a holder that renewed: {out:?}");
+        assert!(h.core.bk.role.is_some());
+        let first_sight = h.clk().wait.0;
+        assert_eq!(
+            known_end(&h, 1, 1),
+            Some(Ms(first_sight + 10_000)),
+            "a renewal unheard lives one TTL from its first sight"
+        );
+        assert_eq!(timers(&out, TimerKind::BackupWatch).len(), 1, "{out:?}");
+    }
+
+    /// A backup that has heard nothing of the holder's own since it started
+    /// (a reboot) has only the lease it reads, and its wait clock does not
+    /// know how long it was down: it reads the object's wall expiry as a
+    /// hint, so that it seals what a node watching all along would claim
+    /// (`backup-crash` seed 410, `backup-lag-at-expiry-beats-lost` seed 318).
+    /// Once a beat or an append has placed the end, the hint is gone: a
+    /// backup whose wall clock is 8 s ahead does not read a renewing holder's
+    /// lease as over.
+    #[test]
+    fn a_cold_backup_reads_the_wall_expiry_as_a_hint_and_a_warm_one_does_not() {
+        let mut h = Harness::new(2);
+        let watch = backing(&mut h);
+        let t0 = h.now;
+        // Cold, wall 8 s ahead: the object (renewed just now, the holder
+        // alive) shows its expiry as past.
+        h.step_wall(8_000);
+        let mut lease = root_lease(1, 1, t0.plus(5_000));
+        lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+        lease.backups = vec![2];
+        lease.ttl_ms = 10_000;
+        h.core.lease.observe(h.clk(), Some(&(lease.clone(), tag())));
+        assert!(
+            known_end(&h, 1, 1).is_some_and(|e| e.0 < h.clk().wait.0 + 10_000),
+            "the hint is the earlier of the two"
+        );
+        // A beat places the end: the hint is gone, the end is the holder's
+        // (the object read is an older renewal than the beat names).
+        let _ = watch;
+        h.core
+            .lease
+            .obs
+            .as_mut()
+            .expect("observed")
+            .body
+            .holder_wait_ms = 1;
+        beat_ending(&mut h, 1, 1, 2_000);
+        let wait = h.clk().wait.0;
+        assert_eq!(known_end(&h, 1, 1), Some(Ms(wait + 2_000)));
+    }
+
+    /// A restarted holder is a new process with a new wait clock: its
+    /// beats restart the end (the earlier process's is not this one's),
+    /// while an unnumbered arrival only raises it.
+    #[test]
+    fn a_new_holder_clock_restarts_the_end() {
+        let mut h = Harness::new(2);
+        let _watch = backing(&mut h);
+        let t0 = h.clk().wait.0;
+        beat_ending(&mut h, 1, 1, 100_000);
+        assert_eq!(known_end(&h, 1, 1), Some(Ms(t0 + 100_000)));
+        h.advance(100);
+        beat_ending(&mut h, 2, 1, 5_000);
+        assert_eq!(
+            known_end(&h, 1, 1),
+            Some(Ms(t0 + 100_000)),
+            "same clock: max"
+        );
+        h.advance(100);
+        beat_ending(&mut h, 1, 2, 5_000);
+        assert_eq!(
+            known_end(&h, 1, 1),
+            Some(Ms(t0 + 200 + 5_000)),
+            "a new clock id starts afresh"
+        );
     }
 
     /// With the expiry handed along, the watch is not blind to a renewal
@@ -9090,9 +9273,8 @@ mod epoch_rules {
             at: w(t0),
             seq: 1,
             clock: 1,
-            holder_expires: 0,
+            holder_expires: (t0.plus(3_000)).0,
             sent: t0.0,
-            expires: t0.plus(3_000),
             guard: 0,
         });
         // The holder kept beating and renewed; the bridge's stamps say so.
@@ -9106,9 +9288,8 @@ mod epoch_rules {
             at: w(at),
             seq: 0,
             clock: 1,
-            holder_expires: 0,
-            sent: 0,
-            expires: t0.plus(13_000),
+            holder_expires: (t0.plus(13_000)).0,
+            sent: (at).0,
             guard: 0,
         });
         let out = h.step(Event::Timer { id: watch });
@@ -9352,6 +9533,35 @@ mod pipelined_appends {
         })
     }
 
+    /// Plan 43 C7b, row 24: an append carries the holder's readings of its
+    /// own wait clock — when it built it, where its lease ends, the clock's
+    /// id — never a wall expiry.
+    #[test]
+    fn an_append_carries_the_holders_readings_of_its_own_clock() {
+        let mut h = holder_with_candidate();
+        journal(&h, "a", 1);
+        h.advance(1_500);
+        let out = journaled(&mut h, 900);
+        let stamps: Vec<(i64, i64, u64)> = out
+            .iter()
+            .filter_map(|a| match a {
+                Action::Send {
+                    to: 2,
+                    msg:
+                        PeerMsg::BackupAppend {
+                            sent_ms,
+                            expires_ms,
+                            clock,
+                            ..
+                        },
+                } => Some((*sent_ms, *expires_ms, *clock)),
+                _ => None,
+            })
+            .collect();
+        let sent = h.clk().wait.0;
+        assert_eq!(stamps, vec![(sent, sent + 10_000 - 1_500, 1)], "{out:?}");
+    }
+
     /// Rows journaled while an append is in flight go out at once in a
     /// second append (up to the pipeline depth), and a cumulative ack
     /// for the second retires both.
@@ -9456,7 +9666,9 @@ mod pipelined_appends {
                 from: 1,
                 txs: batch,
                 through: 0,
-                expires_unix_ms: 0,
+                sent_ms: 0,
+                expires_ms: 0,
+                clock: 0,
             },
         });
         let acked = out
@@ -9775,7 +9987,9 @@ mod pipelined_appends {
                     from: tx.first,
                     txs: vec![tx.clone()],
                     through: 0,
-                    expires_unix_ms: 0,
+                    sent_ms: 0,
+                    expires_ms: 0,
+                    clock: 0,
                 },
             });
             out.iter()
@@ -9843,7 +10057,9 @@ mod pipelined_appends {
                     from,
                     txs,
                     through: 0,
-                    expires_unix_ms: 0,
+                    sent_ms: 0,
+                    expires_ms: 0,
+                    clock: 0,
                 },
             });
             out.iter()
@@ -9874,7 +10090,6 @@ mod pipelined_appends {
                 clock: 1,
                 holder_expires: 0,
                 sent: 0,
-                expires: Ms(0),
                 guard: 0,
             })
         };
@@ -11397,7 +11612,9 @@ mod backup_crash {
                 from: 1,
                 txs,
                 through: 0,
-                expires_unix_ms: 0,
+                sent_ms: 0,
+                expires_ms: 0,
+                clock: 0,
             },
         });
         let watch = timers(&out, TimerKind::BackupWatch)[0];
@@ -11542,7 +11759,9 @@ mod backup_crash {
                 from: 1,
                 txs,
                 through: 0,
-                expires_unix_ms: 0,
+                sent_ms: 0,
+                expires_ms: 0,
+                clock: 0,
             },
         });
         let watch = timers(&out, TimerKind::BackupWatch)[0];
@@ -11623,7 +11842,9 @@ mod backup_crash {
                 from: 1,
                 txs,
                 through: 0,
-                expires_unix_ms: 0,
+                sent_ms: 0,
+                expires_ms: 0,
+                clock: 0,
             },
         });
         h.meta.backup_seal(1).unwrap();
@@ -32274,6 +32495,13 @@ fn deleg_renew_certs_differ_notices_exactly_a_changed_certificate() {
     assert!(h.core.deleg_renew_certs_differ(&published));
 }
 
+/// Plan 43 C7b: where the lease of `holder` at `epoch` ends on this node's
+/// wait clock as it knows it (`Core::known_end`), as a number the harness's
+/// wall reading shares.
+fn known_end(h: &Harness, holder: NodeId, epoch: Epoch) -> Option<Ms> {
+    h.core.known_end(holder, epoch, h.clk()).map(|w| Ms(w.0))
+}
+
 fn root_lease(holder: NodeId, epoch: Epoch, expires: Ms) -> Lease {
     Lease {
         v: 1,
@@ -32540,7 +32768,9 @@ fn a_backup_its_live_holder_removed_does_not_seal_and_can_be_invited_back() {
             txs: Vec::new(),
             through: 0,
             candidacy,
-            expires_unix_ms: 0,
+            sent_ms: 0,
+            expires_ms: 0,
+            clock: 0,
         },
     };
     let mut h = Harness::new(2);
@@ -32588,7 +32818,9 @@ fn a_holder_heard_while_the_lease_is_read_is_not_sealed() {
             txs: Vec::new(),
             through: 0,
             candidacy: 1,
-            expires_unix_ms: 0,
+            sent_ms: 0,
+            expires_ms: 0,
+            clock: 0,
         },
     };
     let mut h = Harness::new(2);
@@ -32624,7 +32856,9 @@ fn a_holder_heard_while_its_expired_lease_is_read_is_sealed() {
             txs: Vec::new(),
             through: 0,
             candidacy: 1,
-            expires_unix_ms: 0,
+            sent_ms: 0,
+            expires_ms: 0,
+            clock: 0,
         },
     };
     let mut h = Harness::new(2);
@@ -32663,7 +32897,9 @@ fn a_continuation_epoch_opened_during_the_takeover_read_blocks_the_seal() {
             txs: Vec::new(),
             through: 0,
             candidacy: 1,
-            expires_unix_ms: 0,
+            sent_ms: 0,
+            expires_ms: 0,
+            clock: 0,
         },
     });
     let watch = timers(&out, TimerKind::BackupWatch)[0];
@@ -33775,7 +34011,7 @@ mod beat_cap {
             1,
             0,
             true,
-            (WaitMs(at), Ms(expires)),
+            WaitMs(at),
             (seq, 1, sent, expires, guard),
             &h.meta,
         );
@@ -33894,7 +34130,9 @@ mod beat_cap {
                 from: 1,
                 txs,
                 through: 0,
-                expires_unix_ms: 0,
+                sent_ms: 0,
+                expires_ms: 0,
+                clock: 0,
             },
         });
         let watch = timers(&out, crate::TimerKind::BackupWatch)[0];
@@ -33912,9 +34150,8 @@ mod beat_cap {
                 at: WaitMs(sent + 5),
                 seq: k + 1,
                 clock: 1,
-                holder_expires: 0,
+                holder_expires: (Ms(x)).0,
                 sent,
-                expires: Ms(x),
                 guard: 0,
             });
         }
@@ -34059,7 +34296,7 @@ mod beat_cap {
             2,
             0,
             true,
-            (WaitMs(now0 + 10), Ms(x)),
+            WaitMs(now0 + 10),
             (5, 1, now0, 0, 0),
             &h.meta,
         );
@@ -34092,7 +34329,7 @@ mod beat_cap {
             1,
             0,
             true,
-            (WaitMs(now0), Ms(x)),
+            WaitMs(now0),
             (4, 1, now0 - 10, 0, 0),
             &h.meta,
         );
@@ -34104,7 +34341,7 @@ mod beat_cap {
             2,
             0,
             true,
-            (WaitMs(now0), Ms(x)),
+            WaitMs(now0),
             (5, 1, now0 - 10, 0, 0),
             &h.meta,
         );
@@ -34118,7 +34355,7 @@ mod beat_cap {
             1,
             1,
             false,
-            (WaitMs(now0), Ms(x)),
+            WaitMs(now0),
             (1, 1, now0 - 10, 0, 0),
             &h.meta,
         );
@@ -34385,7 +34622,7 @@ mod beat_cap {
                     1,
                     0,
                     true,
-                    (WaitMs(at), Ms(0)),
+                    WaitMs(at),
                     (seq, clock, sent, expires, 0),
                     &h.meta,
                 );
@@ -34427,7 +34664,7 @@ mod beat_cap {
             1,
             0,
             true,
-            (WaitMs(19_400), Ms(0)),
+            WaitMs(19_400),
             (3, 2, 49_400, 0, i64::MAX),
             &h.meta,
         );
@@ -34444,7 +34681,7 @@ mod beat_cap {
                 1,
                 0,
                 true,
-                (WaitMs(1_000 * clock as i64), Ms(0)),
+                WaitMs(1_000 * clock as i64),
                 (1, clock, 500 * clock as i64, 0, 0),
                 &h.meta,
             );
@@ -34484,7 +34721,7 @@ mod beat_cap {
                 1,
                 0,
                 true,
-                (s.clk().wait, Ms(0)),
+                s.clk().wait,
                 (
                     seq,
                     cfg.clock_id,
@@ -35774,7 +36011,9 @@ mod c1_counted {
                 txs,
                 through: 0,
                 candidacy: 1,
-                expires_unix_ms: 0,
+                sent_ms: 0,
+                expires_ms: 0,
+                clock: 0,
             },
         };
         let mut h = Harness::new(2);
@@ -35842,7 +36081,9 @@ mod c1_counted {
                 txs,
                 through: 0,
                 candidacy: 1,
-                expires_unix_ms: 0,
+                sent_ms: 0,
+                expires_ms: 0,
+                clock: 0,
             },
         };
         let mut h = Harness::new(2);
@@ -35902,7 +36143,9 @@ mod c1_counted {
                 txs,
                 through: 0,
                 candidacy: 1,
-                expires_unix_ms: 0,
+                sent_ms: 0,
+                expires_ms: 0,
+                clock: 0,
             },
         };
         let tx = |h: &Harness, jseq: u64| constellation_meta::BackupTx {

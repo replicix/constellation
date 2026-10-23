@@ -31,8 +31,8 @@ use constellation_authority::action::ControlOk;
 use constellation_authority::core::JobKind;
 use constellation_authority::{
     Action, CasFailure, ClientReply, Config, Control, Core, EpochState, Event, HonourMs, InboxView,
-    LockAnswer, LockOutcome, LockRenewResult, LockTestAnswer, LockTestOutcome, Ms, NodeId, Now,
-    OpId, PeerLink, PeerMsg, Policy, ReadAnswer, ReadGrantMsg, ReadIndexOutcome, S3Failure, S3Op,
+    LockAnswer, LockOutcome, LockRenewResult, LockTestAnswer, LockTestOutcome, NodeId, Now, OpId,
+    PeerLink, PeerMsg, Policy, ReadAnswer, ReadGrantMsg, ReadIndexOutcome, S3Failure, S3Op,
     S3Result, ShipState, Stats, TimerId, TimerKind, UploadResult, WaitMs,
 };
 use constellation_fs_core::cache::DiskCache;
@@ -973,9 +973,6 @@ struct AliveTargets {
     listed: Vec<(NodeId, u64)>,
     /// Candidacies the holder dropped lately (`listed: false`).
     dismissed: Vec<(NodeId, u64)>,
-    /// The lease body's wall expiry, carried on every beat for the seal
-    /// watch (row 24, C7b).
-    until_unix_ms: i64,
     /// Plan 43 C7-H1: the end of the lease this holder honours, on its
     /// honour clock (`LeaseState::honour_until`; 0: none): no heartbeat at
     /// or past it (a backward wall step must not keep the holder beating
@@ -1012,17 +1009,16 @@ struct AliveBook {
 }
 
 impl AliveBook {
-    /// The targets for this refresh: `held` is the epoch, the wall expiry,
-    /// the honour end, the wait end and the guard of a lease this node
-    /// holds (`None`: none, or only within an open continuation epoch),
+    /// The targets for this refresh: `held` is the epoch, the honour end,
+    /// the wait end and the guard of a lease this node holds (`None`: none, or only within an open continuation epoch),
     /// `listed` its backups.
     fn update(
         &mut self,
         now_wait_ms: i64,
-        held: Option<(u64, i64, i64, i64, i64)>,
+        held: Option<(u64, i64, i64, i64)>,
         listed: Vec<(NodeId, u64)>,
     ) -> Option<AliveTargets> {
-        let Some((epoch, until_unix_ms, until_honour, until_wait, guard_wait)) = held else {
+        let Some((epoch, until_honour, until_wait, guard_wait)) = held else {
             self.dismissed.clear();
             self.prev = None;
             return None;
@@ -1053,7 +1049,6 @@ impl AliveBook {
             epoch,
             listed,
             dismissed,
-            until_unix_ms,
             until_honour,
             until_wait,
             guard_wait,
@@ -1327,7 +1322,6 @@ async fn holder_alive_loop(
                 beat: constellation_net::Beat {
                     seq,
                     sent_ms: constellation_authority::beat_sent_ms(clk),
-                    expires_unix_ms: t.until_unix_ms,
                     guard_ms: t.guard_wait,
                     expires_ms: t.until_wait,
                     clock: constellation_platform::clock::protocol().id(),
@@ -1988,25 +1982,22 @@ impl OffCore {
     }
 
     /// The holder `holder` was heard from at `epoch` (a heartbeat or an
-    /// append arrived) at `at_unix_ms`; both name the expiry of the
-    /// holder's lease, `expires_unix_ms` (0: none held). An older
-    /// epoch's is ignored.
-    pub(crate) fn note_holder_heard(
-        &self,
-        holder: NodeId,
-        epoch: u64,
-        at_unix_ms: i64,
-        expires_unix_ms: i64,
-    ) {
+    /// append arrived) at `at_ms`, on this node's wait clock; both carry the
+    /// holder's readings of its own wait clock `(clock, sent, expires)`: when
+    /// it sent and where the lease it holds ends (0s: none named; plan 43
+    /// C7b, row 24: no wall value crosses). An older epoch's is ignored. Of
+    /// the stamps heard the one with the latest end stands (a stamp of a
+    /// clock not seen before, a restarted holder's, replaces it).
+    pub(crate) fn note_holder_heard(&self, holder: NodeId, epoch: u64, at_ms: i64, stamp: Stamp) {
         let mut heard = self.heard.lock().unwrap();
-        let e = heard
-            .entry(holder)
-            .or_insert((epoch, at_unix_ms, expires_unix_ms));
+        let e = heard.entry(holder).or_insert((epoch, at_ms, stamp));
         if epoch > e.0 {
-            *e = (epoch, at_unix_ms, expires_unix_ms);
+            *e = (epoch, at_ms, stamp);
         } else if epoch == e.0 {
-            e.1 = e.1.max(at_unix_ms);
-            e.2 = e.2.max(expires_unix_ms);
+            e.1 = e.1.max(at_ms);
+            if stamp.0 != 0 && (e.2 .0 != stamp.0 || stamp.2 > e.2 .2) {
+                e.2 = stamp;
+            }
         }
     }
 
@@ -2015,26 +2006,30 @@ impl OffCore {
     }
 }
 
-/// A holder as the peer service heard it: `(epoch, arrival, expiry)`
-/// (unix ms; the expiry 0: none named yet).
-type Heard = (u64, i64, i64);
+/// What an arrival of a holder's carries of its clock: `(clock id, sent,
+/// lease end)`, the last two readings of that clock (0s: none named).
+type Stamp = (u64, i64, i64);
+
+/// A holder as the peer service heard it: `(epoch, arrival on this node's
+/// wait clock, the stamp of the latest end named)`.
+type Heard = (u64, i64, Stamp);
 
 /// The holders heard from since what was handed to the core
-/// (`handed`, updated): `(holder, epoch, arrival, expiry)`. A newer
-/// expiry alone (an arrival that named a later one at the same stamp)
-/// is fresh too.
+/// (`handed`, updated): `(holder, epoch, arrival, stamp)`. A later end
+/// alone (an arrival that named a later one at the same stamp) is fresh
+/// too.
 fn fresh_heard(
     heard: HashMap<NodeId, Heard>,
     handed: &mut HashMap<NodeId, Heard>,
-) -> Vec<(NodeId, u64, i64, i64)> {
-    let mut fresh: Vec<(NodeId, u64, i64, i64)> = heard
+) -> Vec<(NodeId, u64, i64, Stamp)> {
+    let mut fresh: Vec<(NodeId, u64, i64, Stamp)> = heard
         .into_iter()
         .filter(|(holder, now)| handed.get(holder).is_none_or(|was| now > was))
-        .map(|(holder, (epoch, at, expires))| (holder, epoch, at, expires))
+        .map(|(holder, (epoch, at, stamp))| (holder, epoch, at, stamp))
         .collect();
     fresh.sort_unstable();
-    for &(holder, epoch, at, expires) in &fresh {
-        handed.insert(holder, (epoch, at, expires));
+    for &(holder, epoch, at, stamp) in &fresh {
+        handed.insert(holder, (epoch, at, stamp));
     }
     fresh
 }
@@ -2507,7 +2502,8 @@ impl Driver {
     /// measures the holder's silence, not this node's backlog.
     fn hand_heard(&mut self) {
         let heard = self.deps.off_core.heard();
-        for (from, epoch, at, expires) in fresh_heard(heard, &mut self.heard_handed) {
+        for (from, epoch, at, (clock, sent, expires)) in fresh_heard(heard, &mut self.heard_handed)
+        {
             self.step(Internal::Event(Event::HolderAlive {
                 from,
                 epoch,
@@ -2515,11 +2511,10 @@ impl Driver {
                 listed: true,
                 at: WaitMs(at),
                 seq: 0,
-                clock: 0,
-                sent: 0,
-                holder_expires: 0,
+                clock,
+                sent,
+                holder_expires: expires,
                 guard: 0,
-                expires: Ms(expires),
             }));
         }
     }
@@ -2791,7 +2786,6 @@ impl Driver {
         let held = match &lease.held {
             Some((l, _)) if !lease.epoch_held() => Some((
                 l.epoch,
-                l.expires_unix_ms,
                 lease.honour_until(self.core.config()).map_or(0, |h| h.0),
                 lease.wait_until(self.core.config()).map_or(0, |w| w.0),
                 self.core.beat_guard_wait_ms(&*self.deps.meta),
@@ -3391,7 +3385,7 @@ impl Driver {
                 from,
                 txs,
                 through,
-                expires_unix_ms,
+                stamp: (sent_ms, expires_ms, clock),
                 reply,
             } => {
                 let req = self.control_id();
@@ -3408,7 +3402,9 @@ impl Driver {
                         from,
                         txs,
                         through,
-                        expires_unix_ms,
+                        sent_ms,
+                        expires_ms,
+                        clock,
                     },
                 }))
             }
@@ -3490,7 +3486,6 @@ impl Driver {
                 sent: beat.sent_ms,
                 holder_expires: beat.expires_ms,
                 guard: beat.guard_ms,
-                expires: Ms(beat.expires_unix_ms),
             })),
             SyncRequest::PeerPromiseRequest {
                 requester,
@@ -4999,7 +4994,9 @@ impl Driver {
                 from,
                 txs,
                 through,
-                expires_unix_ms,
+                sent_ms,
+                expires_ms,
+                clock,
             } => {
                 let tx = self.int_tx.clone();
                 let peers = self.deps.peers.clone();
@@ -5042,7 +5039,9 @@ impl Driver {
                         from,
                         txs,
                         through,
-                        expires_unix_ms,
+                        sent_ms,
+                        expires_ms,
+                        clock,
                     };
                     let started = std::time::Instant::now();
                     let reply = tokio::time::timeout(
@@ -7152,7 +7151,7 @@ mod tests {
     fn the_alive_book_dismisses_dropped_candidacies_until_reselected() {
         use super::{AliveBook, DISMISS_FOR_MS};
         let mut book = AliveBook::default();
-        let held = Some((4, 100_000, 100_000, 100_000, 0));
+        let held = Some((4, 100_000, 100_000, 0));
         let t = book.update(1_000, held, vec![(2, 10), (3, 11)]).unwrap();
         assert_eq!(t.listed, vec![(2, 10), (3, 11)]);
         assert!(t.dismissed.is_empty());
@@ -7162,7 +7161,7 @@ mod tests {
         let g = book
             .update(
                 1_050,
-                Some((4, 100_000, 100_000, 100_000, i64::MAX)),
+                Some((4, 100_000, 100_000, i64::MAX)),
                 vec![(2, 10), (3, 11)],
             )
             .unwrap();
@@ -7171,7 +7170,7 @@ mod tests {
         let g2 = book
             .update(
                 1_060,
-                Some((4, 100_000, 100_000, 100_000, 9_000)),
+                Some((4, 100_000, 100_000, 9_000)),
                 vec![(2, 10), (3, 11)],
             )
             .unwrap();
@@ -7206,7 +7205,7 @@ mod tests {
         // A new epoch forgets the old one's dismissals; no lease, all.
         book.update(20_200, held, Vec::new());
         let t = book
-            .update(20_300, Some((5, 100_000, 100_000, 100_000, 0)), Vec::new())
+            .update(20_300, Some((5, 100_000, 100_000, 0)), Vec::new())
             .unwrap();
         assert!(
             t.dismissed.is_empty(),
@@ -7227,7 +7226,6 @@ mod tests {
             epoch: 4,
             listed: vec![(2, 10)],
             dismissed: vec![(3, 11)],
-            until_unix_ms: 50_000,
             until_honour: 50_000,
             until_wait: 50_000,
             guard_wait: 0,
@@ -7286,7 +7284,6 @@ mod tests {
             epoch: 1,
             listed: vec![(2, 1)],
             dismissed: Vec::new(),
-            until_unix_ms: i64::MAX,
             until_honour: i64::MAX,
             until_wait: i64::MAX,
             guard_wait: 0,
@@ -7322,7 +7319,6 @@ mod tests {
             epoch: 1,
             listed: Vec::new(),
             dismissed: Vec::new(),
-            until_unix_ms: i64::MAX,
             until_honour: i64::MAX,
             until_wait: i64::MAX,
             guard_wait: 0,
@@ -7461,37 +7457,45 @@ mod tests {
         let off = OffCore::new(5_000);
         let mut handed = std::collections::HashMap::new();
         assert!(fresh_heard(off.heard(), &mut handed).is_empty());
-        off.note_holder_heard(1, 4, 1_000, 5_000);
-        off.note_holder_heard(1, 4, 1_300, 0);
-        off.note_holder_heard(1, 4, 1_200, 4_000);
-        off.note_holder_heard(2, 7, 900, 0);
-        // The latest arrival, and the latest expiry any beat named.
+        let none = (0, 0, 0);
+        // A holder's stamps are its own clock's readings `(clock, sent, end)`.
+        off.note_holder_heard(1, 4, 1_000, (9, 900, 5_000));
+        off.note_holder_heard(1, 4, 1_300, none);
+        off.note_holder_heard(1, 4, 1_200, (9, 1_100, 4_000));
+        off.note_holder_heard(2, 7, 900, none);
+        // The latest arrival, and the stamp of the latest end any beat named.
         assert_eq!(
             fresh_heard(off.heard(), &mut handed),
-            vec![(1, 4, 1_300, 5_000), (2, 7, 900, 0)]
+            vec![(1, 4, 1_300, (9, 900, 5_000)), (2, 7, 900, none)]
         );
         assert!(
             fresh_heard(off.heard(), &mut handed).is_empty(),
             "handed twice"
         );
-        off.note_holder_heard(1, 4, 1_600, 0);
-        off.note_holder_heard(1, 3, 9_000, 9_000);
+        off.note_holder_heard(1, 4, 1_600, none);
+        off.note_holder_heard(1, 3, 9_000, (9, 8_900, 9_000));
         assert_eq!(
             fresh_heard(off.heard(), &mut handed),
-            vec![(1, 4, 1_600, 5_000)]
+            vec![(1, 4, 1_600, (9, 900, 5_000))]
         );
         // A renewal named at an arrival already handed is fresh too: the
-        // core's idea of the holder's expiry follows the stamps.
-        off.note_holder_heard(1, 4, 1_600, 6_000);
+        // core's idea of the holder's end follows the stamps.
+        off.note_holder_heard(1, 4, 1_600, (9, 1_500, 6_000));
         assert_eq!(
             fresh_heard(off.heard(), &mut handed),
-            vec![(1, 4, 1_600, 6_000)]
+            vec![(1, 4, 1_600, (9, 1_500, 6_000))]
         );
-        // A newer epoch replaces the older one's arrival and expiry.
-        off.note_holder_heard(1, 5, 1_500, 0);
+        // A restarted holder's clock replaces the stamp, whatever its end.
+        off.note_holder_heard(1, 4, 1_700, (10, 1_650, 2_000));
         assert_eq!(
             fresh_heard(off.heard(), &mut handed),
-            vec![(1, 5, 1_500, 0)]
+            vec![(1, 4, 1_700, (10, 1_650, 2_000))]
+        );
+        // A newer epoch replaces the older one's arrival and stamp.
+        off.note_holder_heard(1, 5, 1_500, none);
+        assert_eq!(
+            fresh_heard(off.heard(), &mut handed),
+            vec![(1, 5, 1_500, none)]
         );
     }
 
@@ -8257,7 +8261,6 @@ mod tests {
                 epoch: 1,
                 listed: vec![(2, 1)],
                 dismissed: Vec::new(),
-                until_unix_ms: i64::MAX,
                 until_honour: i64::MAX,
                 until_wait: i64::MAX,
                 guard_wait: 0,

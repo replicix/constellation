@@ -66,7 +66,9 @@ mod tests;
 
 use crate::action::{Action, ControlOk, TimerKind};
 use crate::event::{CasFailure, Control, Event, PeerLink, PeerMsg, S3Result};
-use crate::ids::{Epoch, HonourMs, Ms, NodeId, Now, OpId, Seq, TimerId, WaitMs};
+#[cfg(test)]
+use crate::ids::Ms;
+use crate::ids::{Epoch, HonourMs, NodeId, Now, OpId, Seq, TimerId, WaitMs};
 use crate::replica::Replica;
 use constellation_meta::Rid;
 use constellation_store_s3::inbox::InboxKey;
@@ -2017,13 +2019,12 @@ impl Core {
                 sent,
                 holder_expires,
                 guard,
-                expires,
             } => self.on_holder_alive(
                 from,
                 epoch,
                 candidacy,
                 listed,
-                (at, expires),
+                at,
                 (seq, clock, sent, holder_expires, guard),
                 replica,
             ),
@@ -2192,7 +2193,9 @@ impl Core {
                 from: from_jseq,
                 txs,
                 through,
-                expires_unix_ms,
+                sent_ms,
+                expires_ms,
+                clock,
             } => self.on_backup_append(
                 now,
                 from,
@@ -2200,7 +2203,7 @@ impl Core {
                 (epoch, holder, config_version, candidacy),
                 from_jseq,
                 txs,
-                (through, Ms(expires_unix_ms)),
+                (through, (clock, sent_ms, expires_ms)),
                 replica,
                 out,
             ),

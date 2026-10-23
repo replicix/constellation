@@ -58560,3 +58560,76 @@ the table as before.
   (both: `locks-delegated-partition-skew` 97, 178, 179, 452,
   `locks-writer-hold-delegated-unsettled` 15, the two `-unlaned` negative
   controls).
+
+## Plan 43 C7b, spec commit 4: the seal watch on the backup's wait clock (row 24; 2026-10-23)
+
+(The C7b spec's commit 4; the stack's "4/N" is the commits 1-3 review follow-ups.)
+
+### The rule
+
+A backup no longer compares the holder's wall expiry with its own wall clock. The
+holder's beats and appends name, as readings of the holder's own wait clock, when
+they were sent and where its lease ends (`Beat::{sent_ms, expires_ms, clock}`;
+`BackupAppend` carries the same three, and the wall `expires_unix_ms` left both
+messages and `Event::HolderAlive`). `Core::known_end` places that end on the backup's
+**wait** clock the way a successor places the end of the floor it waits out
+(`beat_cap`): the highest end named, `X`, plus the *least* `arrival - sent` over the
+latest 64 arrivals of that holder clock (a restarted holder is a new clock and starts
+afresh). The least difference is the arrival stamped least late: an arrival the
+backup stamped late (its runtime was held up, the driver stamps the backlog when it
+gets to it; the sim's `peers stamped up to 0.6 s after`) lengthens its own difference
+and no other's. The spec's first form, `arrival + (end - sent)` of each arrival, put
+the end up to a lapse too late and failed the `backup-lag-at-expiry` family (7, 5 and
+hundreds of 1 000 seeds): a listed backup must seal inside the 2T claim grace past
+the lease's end. A lease this backup read whose renewal its beats and appends had not
+named (an unheard renewal) is alive until `first sight + the holder's TTL`
+(`LeaseState::observe`, commit 3). `lag_discount`, `watch_due_by_end`,
+`on_backup_watch` and the three compares of `on_takeover_get` read it; `backup.rs` has
+no `wait_of_wall` outside the beat cap's and no `is_expired(` call.
+
+**One wall hint is left, for a cold backup.** A backup that has heard nothing of the
+holder's own since it started (a reboot, an upgrade) cannot place the end, and its
+wait clock does not know how long it was down, while a node that watched the holder
+all along claims the lease one TTL and 2T after the holder's last renewal: waiting a
+TTL from its first read lost the tail it holds (`backup-crash` seeds 410, 902,
+`backup-strict` 551, `backup-strict-inbox-off` 909, `backup-lag-at-expiry-beats-lost`
+318, 633, 799 with the pure rule). So until a beat or an append places the end,
+`known_end` is the earlier of `first sight + TTL` and the object's wall expiry mapped
+to the wait clock (`Now::wait_of_wall`): a hint for when to read and when an object
+counts as ended, the direction in which a mistake is safe (an early read is harmless,
+a seal is fenced; a backup ahead of its holder by more than the lease's remainder
+seals a live holder once per start). Never a claim: claims are judged on observations
+alone. Appendix B row 24 stays "wait clock, ETag observation" for a warm backup and
+"a wall hint once per start" for a cold one. Flag for the reviewer.
+
+### Evidence (box, release sims, 1 000 seeds per configuration; base = origin/main `4488a6a6`)
+
+The 113 `backup*`, `fast-takeover*` and `locks-*` configurations: failing sets
+**identical** in 112; `locks-late-stale-mirror-naive` (a negative control that fails
+by design) 21 -> 23 seeds (87 and 787 added, the same class). Seals of a live holder
+(`SWEEP-LEASE-TOTALS`), summed over the 113: 7 348 -> 2 479. `backup-locks-ahead` (a
+backup 8 s ahead, no fault; the spec's 189 of 300): **749 -> 0** of 1 000, and its
+permitted claims 749 -> 0. `fast-takeover-skewed-holder-twice` 771 -> 34,
+`-skewed-successor` 1 003 -> 34, `-successor-nobeats` 1 543 -> 61: the seal storm
+under offsets is gone; what is left is a backup's own lapse. Crash to first
+acknowledged mutation, p50/p90/max (ms), before then after: `backup`
+1212/4736/7997 then the same; `backup-crash` 1205/4727/8108 then 1205/4733/8108;
+`locks-failover-backup` 8204/11649/15179 then the same. The seal counts of the
+backup configurations without an offset are unchanged.
+
+### Tests and fail-before
+
+Core (`epoch_rules`): `a_backup_ahead_does_not_seal_a_renewing_holder` (wall 8 s ahead,
+60 beats), `a_backup_behind_seals_at_the_holders_end_not_later`,
+`an_unheard_renewal_read_from_s3_keeps_the_holder_alive`,
+`a_new_holder_clock_restarts_the_end`,
+`a_cold_backup_reads_the_wall_expiry_as_a_hint_and_a_warm_one_does_not`,
+`an_append_carries_the_holders_readings_of_its_own_clock`; the existing seal-watch
+tests keep their verdicts with their stamps in the new form. Against mutants (the
+expiry decision on the wall clock; the discount on the wall clock; no read term; no
+restart on a new clock id; no cold hint) 6 of them fail, each its own: the parent
+cannot fail them (they use the new fields). `OffCore` hands the core the stamps of the
+latest beat or append (`the_seal_watch_is_handed_the_holders_latest_arrival`).
+
+Gates: `cargo fmt --check`; `clippy --workspace --all-targets -D warnings`; authority
+lib (596), sim suite, `meta_repro`.
