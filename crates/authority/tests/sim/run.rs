@@ -212,6 +212,20 @@ pub enum FaultKind {
     /// is down, and restart it after `restart_ms` on the same boot, with
     /// its disk (what a persisted wall deadline does not survive).
     CrashHolderStepped { restart_ms: u64, step_ms: i64 },
+    /// The harness's `lock-failover` under `clock:step:+3000:6000,
+    /// clock:step:-3000:12000`: once a node other than the lease holder is
+    /// inside a lock's critical section, kill the lease holder (restart it
+    /// after `restart_ms`), `after_ms` later step the wall clock of every
+    /// other node by `step_ms`, and `back_after_ms` after that step them
+    /// back. A forward step ends the windows the survivors honour early
+    /// (their honour clock follows it): the locker has that much less time
+    /// to find the successor and renew there.
+    CrashHolderWhileLockedStepped {
+        restart_ms: Option<u64>,
+        after_ms: u64,
+        step_ms: i64,
+        back_after_ms: u64,
+    },
     /// Plan 43 C7a (Appendix B row 14's floor note): kill the first node
     /// (within 10 s) that is a fast successor inside its takeover floor
     /// (`after_marker`: its marker has landed, the floor is armed) or that
@@ -2242,6 +2256,7 @@ fn injects_clock_faults(cfg: &SimConfig) -> bool {
                     | FaultKind::Suspend { .. }
                     | FaultKind::RebootNode { .. }
                     | FaultKind::CrashHolderStepped { .. }
+                    | FaultKind::CrashHolderWhileLockedStepped { .. }
                     | FaultKind::PartitionLockerStepped { .. }
             )
         })
@@ -2968,6 +2983,63 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 log.clone(),
             ))
             .await;
+        }
+        FaultKind::CrashHolderWhileLockedStepped {
+            restart_ms,
+            after_ms,
+            step_ms,
+            back_after_ms,
+        } => {
+            if wait_for_locker(&cluster).await.is_none() {
+                note(format!(
+                    "t={} crash-holder-while-locked-stepped: no locker",
+                    fault.at_ms
+                ));
+                return;
+            }
+            let holder = read_lease(&cluster.env.bucket)
+                .await
+                .map_or(0, |l| l.holder);
+            note(format!(
+                "t={} a locker is in its critical section: crash the holder {holder}, step \
+                 the others by {step_ms}ms {after_ms}ms later",
+                cluster.env.clock.elapsed_ms()
+            ));
+            let stepper = {
+                let (cluster, log) = (cluster.clone(), log.clone());
+                tokio::spawn(async move {
+                    let step_all = |ms: i64| {
+                        for n in cluster.ids().into_iter().filter(|n| *n != holder) {
+                            cluster
+                                .env
+                                .clock_state_of(n)
+                                .step()
+                                .fetch_add(ms, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        log.lock().unwrap().push(format!(
+                            "t={} clock step of every node but {holder} by {ms}ms (wall)",
+                            cluster.env.clock.elapsed_ms()
+                        ));
+                    };
+                    tokio::time::sleep(Duration::from_millis(after_ms)).await;
+                    step_all(step_ms);
+                    tokio::time::sleep(Duration::from_millis(back_after_ms)).await;
+                    step_all(-step_ms);
+                })
+            };
+            Box::pin(run_fault(
+                cluster,
+                ScheduledFault {
+                    at_ms: 0,
+                    kind: FaultKind::CrashHolder {
+                        restart_ms,
+                        keep_journal: true,
+                    },
+                },
+                log.clone(),
+            ))
+            .await;
+            let _ = stepper.await;
         }
         FaultKind::CrashWhenTailUnshipped {
             node,

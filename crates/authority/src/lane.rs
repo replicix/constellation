@@ -206,6 +206,9 @@ pub enum LaneAction {
         sent: HonourMs,
         results: Vec<(Ino, GrantId, LockRenewResult)>,
     },
+    /// Tell the core that `to` did not answer a renewal in time
+    /// (`Event::LaneUnanswered`).
+    Unanswered { to: NodeId },
 }
 
 /// What the lane did (status).
@@ -284,15 +287,29 @@ impl RenewLane {
             LaneEvent::Tick { stuck_ms } => self.tick(now, stuck_ms, locks, facts),
             LaneEvent::Answered { req, results } => self.answered(now, req, results, locks, facts),
             LaneEvent::Failed { req } => {
-                if let Some(p) = self.inflight.remove(&req) {
-                    for (ino, id) in &p.entries {
-                        locks.renewal_failed(*ino, *id);
-                    }
-                    self.late
-                        .retain(|_, (_, sent)| p.sent.since(*sent) < LATE_MS);
-                    self.late.insert(req, (p.to, p.sent));
+                let Some(p) = self.inflight.remove(&req) else {
+                    return Vec::new();
+                };
+                // The owner the renewal went to did not answer: it may be
+                // gone (a failover). Its grants are due again, no longer
+                // routed to it (the next renewal goes to the holder as the
+                // core last learned it, `LockLaneView::owner`), and the core
+                // learns the holder again from the lease, as after its own
+                // renewal's timeout. Routed to the same node again, a dead
+                // root's lockers renewed nowhere but there, every forward
+                // timeout, holding each grant's `renewing` mark so that the
+                // core's tick, which would have read the lease, never took
+                // it, until the window ended (the harness's `lock-failover`
+                // under a forward wall step, which ends the window early:
+                // the late renewal at the successor is refused, EIO).
+                for (ino, id) in &p.entries {
+                    locks.renewal_failed(*ino, *id);
+                    locks.clear_route(*ino, *id, p.to);
                 }
-                Vec::new()
+                self.late
+                    .retain(|_, (_, sent)| p.sent.since(*sent) < LATE_MS);
+                self.late.insert(req, (p.to, p.sent));
+                vec![LaneAction::Unanswered { to: p.to }]
             }
         }
     }
@@ -834,6 +851,52 @@ mod tests {
         let out = tick(&mut lane, &t, &f, 2_000 + 4_000 / 2);
         assert!(
             matches!(out.as_slice(), [LaneAction::Send { to: 3, .. }]),
+            "{out:?}"
+        );
+    }
+
+    /// A renewal its route (the owner that answered the last one) does not
+    /// answer is no longer routed there: the core is told (it reads the
+    /// lease for the owner) and the next renewal goes to the holder as the
+    /// core learned it. Sent to the route again, the lockers of a root that
+    /// died renewed nowhere but at it until their windows ended.
+    #[test]
+    fn an_unanswered_route_is_dropped_and_the_core_told() {
+        let t = LockTables::default();
+        let id = remote(&t, 3);
+        let mut lane = RenewLane::new(DEFAULT_MAX_STALL_MS);
+        let mut v = view();
+        v.root_ok = false;
+        v.owner = 3;
+        let f = facts(v.clone());
+        let out = tick(&mut lane, &t, &f, 2_000);
+        let LaneAction::Send { req, .. } = &out[0] else {
+            panic!("{out:?}")
+        };
+        lane.handle(
+            at(2_010),
+            LaneEvent::Answered {
+                req: *req,
+                results: vec![(8, id, ok(id, 4_000))],
+            },
+            &t,
+            &f,
+        );
+        assert_eq!(t.held(8).unwrap().route, Some(3));
+        // Node 3 dies; the core has learned node 5 as the holder since.
+        v.owner = 5;
+        let f = facts(v);
+        let due = 2_000 + (4_000 - 500) / 2;
+        let out = tick(&mut lane, &t, &f, due);
+        let [LaneAction::Send { to: 3, req, .. }] = out.as_slice() else {
+            panic!("{out:?}")
+        };
+        let out = lane.handle(at(due + 400), LaneEvent::Failed { req: *req }, &t, &f);
+        assert_eq!(out, vec![LaneAction::Unanswered { to: 3 }]);
+        assert_eq!(t.held(8).unwrap().route, None);
+        let out = tick(&mut lane, &t, &f, due + 400);
+        assert!(
+            matches!(out.as_slice(), [LaneAction::Send { to: 5, .. }]),
             "{out:?}"
         );
     }

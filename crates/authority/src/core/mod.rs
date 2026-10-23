@@ -2106,6 +2106,7 @@ impl Core {
                 sent,
                 results,
             } => self.on_lane_renewed(now, from, sent, results, replica, &mut out),
+            Event::LaneUnanswered { to } => self.on_lane_unanswered(to, replica, &mut out),
             Event::DelegRenewAnsweredOffCore { gen, from, ttl_ms } => {
                 self.on_deleg_renew_answered_off_core(now, gen, from, ttl_ms, &mut out)
             }

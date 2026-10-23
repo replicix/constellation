@@ -1206,6 +1206,9 @@ fn apply_lane_actions(
                     results,
                 });
             }
+            LaneAction::Unanswered { to } => {
+                let _ = shared.urgent.send(Event::LaneUnanswered { to });
+            }
         }
     }
 }

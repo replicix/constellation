@@ -3481,6 +3481,18 @@ impl Core {
             Route::Node(n) => return LockRenewResult::NotOwner { owner: n },
             Route::Unknown => return LockRenewResult::NotOwner { owner: 0 },
         };
+        if gen == 0 && self.lock_mirror_pending() {
+            // The predecessor's grants are not in this table yet: a grant
+            // unknown now is not lost. Asked again here (`NotOwner` naming
+            // this node; its own tick waits behind `lock_relearn_floor`).
+            // Answered `Lost`, a locker whose renewal reached the successor
+            // between its claim and its mirror's install was fenced (sim
+            // `locks-failover-stepped`, once a lane renewal's timeout made
+            // the lockers read the lease again at once).
+            return LockRenewResult::NotOwner {
+                owner: self.cfg.node_id,
+            };
+        }
         let ttl = self.lock_ttl_ms().min(cap_ms);
         if ttl <= 0 {
             return LockRenewResult::NotOwner { owner: 0 };
@@ -5122,12 +5134,26 @@ impl Core {
     /// request: an owner learned meanwhile otherwise (a push, a hint, a
     /// lock reply) is used at the next tick; the read's answer re-ticks at
     /// once.
+    /// So, too, while the predecessor's lock table is not installed yet
+    /// (`lock_mirror_pending`): its own grants' renewals are answered
+    /// `NotOwner` naming this node until then.
     fn lock_relearn_floor(&self, now: Now) -> HonourMs {
-        if self.lk.relearning {
+        if self.lk.relearning || self.lock_mirror_pending() {
             now.honour.plus(self.lock_resume_retry_ms())
         } else {
             now.honour
         }
+    }
+
+    /// A successor that backed its predecessor installs the predecessor's
+    /// lock table (its last mirror) with the backup tail, in its gate's step
+    /// after the epoch marker lands (`lock_install_mirror`): until then the
+    /// grants the mirror lists are not in this table.
+    fn lock_mirror_pending(&self) -> bool {
+        self.lease
+            .gate
+            .as_ref()
+            .is_some_and(|g| g.backup_tail_epoch.is_some())
     }
 
     /// The owner to ask when the lease could not be read (S3 cut): the
@@ -6222,6 +6248,28 @@ impl Core {
         if replica.locks().held_count() > 0 {
             self.lock_arm_renew_tick(now, replica, out);
         }
+    }
+
+    /// The lane's renewal to `to` went unanswered: its grants are due again
+    /// and no longer routed to `to` (`RenewLane`'s `Failed`). As after the
+    /// core's own renewal's timeout (`on_lock_renew_timeout`), the owner is
+    /// read again from the lease; the next certificate names the holder
+    /// learned, where the lane's next renewal goes.
+    pub(crate) fn on_lane_unanswered(
+        &mut self,
+        to: NodeId,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if replica.locks().held_count() == 0 {
+            return;
+        }
+        tracing::debug!(
+            node = self.cfg.node_id,
+            to,
+            "lock lane renewal unanswered; relearning the owner"
+        );
+        self.lock_relearn_owner(out);
     }
 
     /// Root, plan 41 R2: the lock side has no content pending for a granting

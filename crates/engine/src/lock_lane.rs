@@ -11,7 +11,8 @@
 //!
 //! It never logs, never touches the store (only `meta.locks()`'s memory), and
 //! tells the core what it did on the urgent lane (`SyncRequest::LaneOwn`,
-//! `LaneRenewed`), which the core handles when its step ends.
+//! `LaneRenewed`, `LaneUnanswered`), which the core handles when its step
+//! ends.
 //! `CONSTELLATION_LOCK_LANE=off` turns it off (A/B runs, the fail-before of
 //! the stall scenarios); `CONSTELLATION_LOCK_LANE_MAX_STALL_MS` (default
 //! 120000) bounds the remote renewals while the driver is stuck.
@@ -258,6 +259,9 @@ fn send_reports(tx: &mpsc::UnboundedSender<SyncRequest>, actions: Vec<LaneAction
                     sent: sent.0,
                     results,
                 });
+            }
+            LaneAction::Unanswered { to } => {
+                let _ = tx.send(SyncRequest::LaneUnanswered { to });
             }
             LaneAction::Send { .. } => {}
         }

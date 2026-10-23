@@ -264,6 +264,7 @@ fn event_kind(event: &Event) -> &'static str {
         Event::DelegRenewAnsweredOffCore { .. } => "DelegRenewAnsweredOffCore",
         Event::LaneOwn { .. } => "LaneOwn",
         Event::LaneRenewed { .. } => "LaneRenewed",
+        Event::LaneUnanswered { .. } => "LaneUnanswered",
         Event::Control { req, .. } => match req {
             Control::Nudge => "Control(Nudge)",
             Control::Journaled => "Control(Journaled)",
@@ -3198,6 +3199,9 @@ impl Driver {
                 sent: HonourMs(sent),
                 results,
             })),
+            SyncRequest::LaneUnanswered { to } => {
+                Some(Internal::Event(Event::LaneUnanswered { to }))
+            }
             SyncRequest::DelegRenewAnsweredOffCore { gen, from, ttl_ms } => {
                 Some(Internal::Event(Event::DelegRenewAnsweredOffCore {
                     gen,

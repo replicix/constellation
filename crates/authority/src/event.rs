@@ -204,6 +204,11 @@ pub enum Event {
             LockRenewResult,
         )>,
     },
+    /// The lane's `LockRenew` to `to` was not answered in time (or failed
+    /// at the transport): the core learns the lock owner again, as after
+    /// its own renewal's timeout ([`Core::on_lane_unanswered`]). Urgent
+    /// lane.
+    LaneUnanswered { to: NodeId },
     /// The off-core heartbeat thread did not run from `from` to `until`
     /// (this node's wait clock): the whole process was frozen, and nothing in it
     /// could renew a delegation (`Core::on_own_freeze`). The core uses it

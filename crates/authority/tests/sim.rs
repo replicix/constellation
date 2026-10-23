@@ -394,6 +394,7 @@ fn replay_seed() {
         Ok("locks-failover") => locks_failover_config(),
         Ok("locks-failover-backup") => locks_failover_backup_config(),
         Ok("locks-failover-backup-renew") => locks_failover_backup_renew_config(),
+        Ok("locks-failover-stepped") => locks_failover_stepped_config(),
         Ok("locks-long-grants") => locks_long_grants_config(),
         Ok("locks-long-grants-seal") => locks_long_grants_seal_config(),
         Ok("fast-takeover-skewed-successor") => fast_takeover_skewed_successor_config(),
@@ -5218,6 +5219,7 @@ fn sweep_config() {
         "locks-failover" => locks_failover_config(),
         "locks-failover-backup" => locks_failover_backup_config(),
         "locks-failover-backup-renew" => locks_failover_backup_renew_config(),
+        "locks-failover-stepped" => locks_failover_stepped_config(),
         "locks-long-grants" => locks_long_grants_config(),
         "locks-long-grants-seal" => locks_long_grants_seal_config(),
         "fast-takeover-skewed-successor" => fast_takeover_skewed_successor_config(),
@@ -8021,6 +8023,39 @@ fn locks_failover_backup_config() -> SimConfig {
     }
 }
 
+/// The harness's `lock-failover` under `clock:step:+3000:6000,clock:step:
+/// -3000:12000` (the validation of 45a302b2, seeds 42 and 43): 8 s grants
+/// under a 12 s lease (so the lease rarely caps them), the backup
+/// configuration, long critical sections, the lease holder killed while a
+/// locker is inside one, and every surviving node's wall stepped forward 3 s
+/// 250 ms later (back 2.2 s after that). The step ends the lockers' windows
+/// 3 s early on their honour clocks (by design); they still have seconds to
+/// find the successor and renew there. A lock across a failover costs
+/// latency, never an error: no locker I/O may be fenced.
+fn locks_failover_stepped_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(|id, inc| {
+            let mut c = sim::run::backup_core_config(id, inc);
+            c.ttl_ms = 12_000;
+            c.lock_ttl_ms = 8_000;
+            c
+        }),
+        ops_per_client: 8,
+        lock_ios: (10, 30),
+        lock_io_ms: (40, 160),
+        faults: vec![ScheduledFault {
+            at_ms: 800,
+            kind: FaultKind::CrashHolderWhileLockedStepped {
+                restart_ms: Some(5_000),
+                after_ms: 250,
+                step_ms: 3_000,
+                back_after_ms: 2_200,
+            },
+        }],
+        ..locks_config()
+    }
+}
+
 /// Plan 41 L0: while locks are held and renewed, the holder loses S3
 /// and is cut from its backup (P2P to the other nodes stays): the backup
 /// seals and takes the lease over before it expires, and the old root,
@@ -10667,6 +10702,50 @@ fn a_lapsed_locker_resumes_when_the_owner_admits_a_late_renewal() {
     }
 }
 
+/// The harness's `lock-failover` under a +3 s / -3 s wall step pair
+/// (`locks-failover-stepped`): the lease holder is killed while a locker
+/// is inside its critical section and the survivors' walls step forward
+/// just after. The step ends the locker's window early on its honour clock
+/// (by design), so it has less time to find the successor; it must renew
+/// there in time and keep its grant: no I/O of it is fenced, no late
+/// renewal is refused. Before the lock lane gave up on an owner that did
+/// not answer, it renewed at the dead root every forward timeout until the
+/// window ended, holding the grant's `renewing` mark so that the core's
+/// tick (which reads the lease) never took it: 8 of these 60 seeds fenced
+/// the locker (the successor refuses the late renewal: its mirror is not
+/// the old root's final one).
+#[test]
+fn a_locker_keeps_its_grant_across_a_seal_and_a_forward_step() {
+    let n: u64 = std::env::var("AUTHORITY_SIM_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+    let (mut fenced, mut refused, mut parked, mut acquired) = (0, 0, 0, 0);
+    let mut bad = Vec::new();
+    for seed in 0..n {
+        let report = run_seed(seed, locks_failover_stepped_config()).unwrap_or_else(|e| {
+            panic!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=locks-failover-stepped")
+        });
+        if report.locks.fenced_ios + report.locks.park_refused_ios > 0 {
+            bad.push(seed);
+        }
+        fenced += report.locks.fenced_ios;
+        refused += report.locks.park_refused_ios;
+        parked += report.locks.parked_ios;
+        acquired += report.locks.acquired;
+    }
+    eprintln!(
+        "locks-failover-stepped: {n} seeds, {acquired} acquired, {parked} parked, {fenced} \
+         fenced, {refused} refused; seeds with a fenced I/O: {bad:?}"
+    );
+    assert!(acquired > 0, "no lock was ever acquired");
+    assert!(
+        bad.is_empty(),
+        "a locker's I/O was fenced across the failover ({fenced} fenced, {refused} late \
+         renewals refused) in seeds {bad:?}"
+    );
+}
+
 /// Plan 43 C7-F F-c: the successor of a fast takeover trusts only the old
 /// root's *final* mirror. Every lock mirror after the first second is lost,
 /// a locker is cut from everyone (its grant lapses and is outwaited, the
@@ -11344,9 +11423,11 @@ fn locks_writer_hold_delegated_without_the_settle_is_caught() {
     use pinned::run_seed;
     // (745, 1081, 1282, 2045 and 2369, whose trajectories plan 41 L2's lock
     // lane shifted to no held write inside the next holder's section, gave their
-    // places to 940 and 1246, the two of seeds 0 to 3 000 that now show it,
-    // with the settle clean on both.)
-    let seeds = [940, 1246];
+    // places to 940 and 1246, the two of seeds 0 to 3 000 that then showed it.
+    // The lane's giving up on an unanswered owner shifted those two in turn:
+    // 767, 2369 and 2741 are the three of seeds 0 to 3 000 that show it now,
+    // with the settle clean on all 3 000.)
+    let seeds = [767, 2369, 2741];
     let mut caught = 0;
     for seed in seeds {
         if let Err(e) = run_seed(seed, locks_writer_hold_delegated_unsettled_config()) {

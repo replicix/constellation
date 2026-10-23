@@ -332,6 +332,11 @@ pub enum SyncRequest {
             constellation_authority::LockRenewResult,
         )>,
     },
+    /// The lane's renewal to `to` went unanswered: urgent lane,
+    /// `Event::LaneUnanswered`.
+    LaneUnanswered {
+        to: u64,
+    },
     /// Plan 41 R2: the root answered this delegate's renewal off its core
     /// (the RPC reply, [`Payload::DelegRenewedOffCore`]): a grant of
     /// `ttl_ms`, applied by the core as an extension only
