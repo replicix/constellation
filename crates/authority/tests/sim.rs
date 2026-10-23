@@ -11030,7 +11030,9 @@ fn a_run_leaves_no_bus_behind() {
 /// lane's to fix: an owner that crashed and restarted knows none of the
 /// grants it made (the renewal is answered `Lost`), and a grant installed
 /// and recalled while its holder's core is stuck waits for that core for its
-/// first local lock, so the recall outwaits it.
+/// first local lock, so the recall outwaits it. Both come with the default
+/// clock-fault mix (its reboots and suspends); without the mix the stalls
+/// fence nothing, which the test asserts too.
 #[test]
 fn locks_survive_core_stalls() {
     let t = run_m14(
@@ -11056,6 +11058,19 @@ fn locks_survive_core_stalls() {
         "the lane saves too little of the I/O the stalls fence ({} with it, {} without): {t:?}",
         t.clients.fenced_ios,
         u.clients.fenced_ios
+    );
+    // What the lane leaves fenced is the default clock-fault mix's (a reboot,
+    // a suspend: a stop, not a slow disk): without it, nothing is fenced
+    // (sweeps of 200 seeds: 0 with the lane, 92 I/Os without it).
+    let c = run_m14(
+        "locks-core-stall+unclocked",
+        unclocked(locks_core_stall_config()),
+        0..40,
+    );
+    assert!(c.lane_renewals > 0, "{c:?}");
+    assert_eq!(
+        c.clients.fenced_ios, 0,
+        "a core stall alone fenced I/O with the lane on: {c:?}"
     );
 }
 
