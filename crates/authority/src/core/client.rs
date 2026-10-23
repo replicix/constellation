@@ -481,7 +481,15 @@ impl Core {
         // same op can be waiting for that very acquisition (M5 round 5,
         // long seed 11932: the gate's replay journaled it, then
         // `on_acquire_finished` executed the waiting copy a second time).
-        let in_doubt = self.in_doubt_rids.remove(&rid) || matches!(origin, Origin::Replay { .. });
+        //
+        // The mark is the client's: a replay leaves it for the client's
+        // own resubmission (`placement-hot+links+stalebase` seed 1397: a
+        // deposed root's op went in doubt at its deadline, the drain then
+        // submitted the rid's queue entry and took the mark, the replay
+        // completed it, and the client's resubmission by rid, not in
+        // doubt, ran it again: refused `EEXIST`, the rid's second outcome
+        // in the log, and the answer the client heard).
+        let in_doubt = matches!(origin, Origin::Replay { .. }) || self.in_doubt_rids.remove(&rid);
         let inbox_keys = self.in_doubt_batches.remove(&rid).unwrap_or_default();
         self.next_client_order += 1;
         self.clients.insert(

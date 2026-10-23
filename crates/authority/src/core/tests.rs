@@ -33342,6 +33342,87 @@ fn a_resubmission_in_doubt_merges_into_the_live_replay_of_its_rid() {
     );
 }
 
+/// `placement-hot+links+stalebase` seed 1397: one rid completed and then
+/// refused (`EEXIST`) by the same node, and the client heard the refusal.
+/// A deposed root's op went in doubt at its deadline (the client's mark);
+/// the drain then submitted the rid's queue entry as a replay op, which
+/// took the mark; the replay completed the rid; the client's resubmission
+/// by rid, not in doubt, skipped `completed` and ran the op again. A
+/// replay leaves the mark for the client's resubmission.
+#[test]
+fn a_replay_of_a_rid_leaves_the_clients_in_doubt_mark_for_its_resubmission() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let rx = h.rid(1);
+    let x = h.create("x");
+    constellation_meta::execute_mutate(&h.meta, &x, Some(rx)).unwrap();
+    h.core.lease.mark_lost(2, 2, 1);
+    recover_deposed_node(&mut h);
+    assert_eq!(queued_rids(&h), vec![rx]);
+    // The client heard `InDoubt` for the rid (`finish_in_doubt`'s mark).
+    h.core.in_doubt_rids.insert(rx);
+    // The drain sends the queue entry to the holder as a replay op.
+    let mut out = Vec::new();
+    h.core.on_drain_tick(h.clk(), &h.meta, &mut out);
+    assert!(matches!(
+        h.core.clients.get(&rx).map(|c| &c.origin),
+        Some(crate::core::client::Origin::Replay { .. })
+    ));
+    let PeerMsg::MutateRequest { req, .. } = sends(&out)
+        .into_iter()
+        .find(|(_, m)| matches!(m, PeerMsg::MutateRequest { rid, .. } if *rid == rx))
+        .expect("the replay goes to the holder")
+        .1
+    else {
+        unreachable!()
+    };
+    let req = *req;
+    assert!(
+        h.core.in_doubt_rids.contains(&rx),
+        "the client's mark stays"
+    );
+    // The lease comes back to this node; its gate replays the queue.
+    h.hold(3, None);
+    let mut out = Vec::new();
+    h.core
+        .replay_queue_locally(h.clk(), &h.meta, &mut out)
+        .unwrap();
+    assert!(queued_rids(&h).is_empty(), "replayed");
+    assert_eq!(journaled_outcomes(&h, rx), vec![false]);
+    // The old holder's answer sends the replay op down the lease path;
+    // the acquisition (the one this node won) finishes, and the op finds
+    // the completion.
+    h.step(Event::Peer {
+        from: 2,
+        msg: PeerMsg::MutateReply {
+            req,
+            outcome: MutateOutcome::NotHolder { holder: 0 },
+            base: None,
+            position: constellation_meta::Position::ZERO,
+            gen: 0,
+            own_chunks: OwnChunks::None,
+            own_rows: None,
+        },
+    });
+    let mut out = Vec::new();
+    h.core.on_acquire_finished(h.clk(), true, &h.meta, &mut out);
+    assert!(!h.core.clients.contains_key(&rx), "the replay op is done");
+    assert_eq!(journaled_outcomes(&h, rx), vec![false]);
+    // The client's resubmission by rid finds the completion.
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid: rx,
+        op: x.clone(),
+        tag: Default::default(),
+    });
+    assert_accepted_once(&out);
+    assert_eq!(
+        journaled_outcomes(&h, rx),
+        vec![false],
+        "one outcome for the rid"
+    );
+}
+
 /// A mark that evicts the oldest in-doubt rid forgets its inbox batch
 /// keys with it, as `finish_in_doubt` does.
 #[test]

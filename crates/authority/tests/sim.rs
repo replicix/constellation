@@ -11998,3 +11998,25 @@ fn regression_a_root_appending_over_its_own_shadow_keeps_the_log_prefix() {
         }
     }
 }
+
+/// A replay of a rid leaves the client's in-doubt mark for the client's
+/// resubmission (`Core::submit`). This seed failed before with "rid
+/// (1,1,40) was refused (Eexist) but completed 1 times in the log": a
+/// deposed root's link went in doubt at its deadline, the drain then
+/// submitted the rid's queue entry and took the mark, the replay
+/// completed the link, and the client's resubmission by rid ran it again.
+/// (`+stalebase` only changes the schedule; the mechanism does not read
+/// the reply base.)
+#[test]
+fn regression_placement_hot_links_stalebase_seed_1397() {
+    let variants = "links+stalebase";
+    let cfg = variants
+        .split('+')
+        .fold(placement_hot_config(), config_variant);
+    run_seed(1397, cfg).unwrap_or_else(|e| {
+        panic!(
+            "placement-hot+{variants} seed 1397: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=placement-hot+{variants}"
+        )
+    });
+}
