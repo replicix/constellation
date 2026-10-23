@@ -1097,8 +1097,15 @@ about 1.5 s into a stall); `ack=s3` holders, deposed on the core's silence;
 a stall past the root lease (the grants end at its usable end); a hung core
 (past the bound). *Rejected*: asynchronous store writes in the core (a
 rewrite of the step discipline), bounding the core's blocking (timeouts
-on a write that cannot be abandoned), and a second lease renewer (it races
-the core's CAS tags). The same pattern, for delegations, is
+on a write that cannot be abandoned), a second lease renewer (it races
+the core's CAS tags), and the journal's `write(2)` outside the store's
+single-writer lock (vendored fjall change 10, plan 41 §4 D8: decided on
+2026-10-22, withdrawn by the maintainer on 2026-10-23 after its review). A
+commit can drop the lock across its `write(2)` only by publishing before its
+bytes reach the OS, which lets the shipper or a backup read a commit a crash
+then loses; restoring that order removes every gain, since a later commit
+may depend on the stuck one and the kernel's inode lock serializes the
+journal's writes anyway (the core's 12 s stall waited 62 µs for the lock). The same pattern, for delegations, is
 `deleg_lane` / `DelegWindows` (the delegate's renewal lane, and the root's
 answer off its core, plan 41 R).
 

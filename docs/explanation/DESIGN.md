@@ -832,7 +832,14 @@ lease and one log
   replica reads it from the log and none infers it. Delegations never
   overlap and never nest.
   A grant lasts `CONSTELLATION_DELEGATION_TTL_MS` (5 s), is renewed by the
-  delegate, and is capped by the root lease.
+  delegate, and is capped by the root lease. A core stuck in one step (a
+  store write behind a slow disk) does not lapse it: the delegate's lane
+  sends the renewals its core cannot, and the root's P2P service answers a
+  renewal itself while the root's core is stuck, extending only a window
+  its core opened and has not closed, under the lease certificate the core
+  publishes after every step
+  ([ADR-23](DECISIONS.md#adr-23-delegated-sub-sequencers-over-one-log),
+  amended by plan 41).
 - **Ownership** is a local ancestor walk: a dentry belongs to the
   delegation containing its parent; an inode's own keys to the one
   containing its primary link's parent. An op whose keys have two owners
@@ -891,7 +898,8 @@ never go through the inbox
 
 Cluster `flock`/`fcntl` locks are leased grants kept by the owning
 sequencer (the root or the delegate of the file), in the same core that
-sequences the file's mutations. §6 explains them.
+sequences the file's mutations; their renewals also run in a lane beside
+that core, so a stuck core step does not lapse them. §6 explains them.
 
 ## 5. Write Authority: the One Rule
 
@@ -1263,7 +1271,19 @@ of another node's `close()` out of band, with no lock between them
   the window its holder honours it for, so a short grant is renewed
   inside its window too. A delegate grants nothing on less than
   `2 × margin` of delegation left, and keeps its delegation topped up
-  while it has grants out.
+  while it has grants out. Renewals do not wait for the node's authority
+  core, whose steps write the metadata store and can wait seconds on a
+  slow disk: a renewal lane beside the core extends windows from the
+  in-memory lock tables, only as the core could have extended them at
+  that moment, under a certificate the core publishes after every step
+  (the lease held, usable and not fenced, no epoch or delegation, the
+  freshness rule of a tenure that can be taken over early). It renews
+  this node's own grants at its own table (no later than the lease's
+  usable end) and the grants it holds at another owner (until the core has
+  been stuck past a bound, 120 s), and never grants, refuses, releases or
+  drops anything
+  ([ADR-25](DECISIONS.md#adr-25-cluster-locks-are-leased-grants-from-the-owning-sequencer),
+  amended by plan 41).
 - **Conflicts** recall the other grants; a recalled node flushes the
   file's dirty data to the log before it releases. Blocking requests park
   first-in first-out at the sequencer; non-blocking ones get `EAGAIN` and
