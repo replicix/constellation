@@ -491,8 +491,9 @@ impl LeaseState {
         // renew; a non-backup claimed at the expiry while the backup
         // still held an acknowledged create, which came back later only
         // as the deposed holder's replay — after ops invoked once it had
-        // been acknowledged). If no backup claims, the lease is anyone's
-        // after the grace (a double fault: the tail is lost).
+        // been acknowledged). The grace orders that race and nothing more:
+        // past it a claim by anyone else carries the group's tail too
+        // (plan 43 C1-3: `Plan::FetchTail` below, or the wait for it).
         if prev.ack_policy == AckPolicy::Backup
             && !prev.released
             && prev.holder != 0
