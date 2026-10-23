@@ -286,3 +286,40 @@ fn a_queued_replay_touching_only_the_child_holds_the_plus_page() {
         Ok(())
     });
 }
+
+/// A queued replay of this node's own unlink of a name (a stranded op,
+/// rolled back until it lands) touches the name and its directory, never
+/// the inode the name led to: a plus page past the listing's `Dir` wait
+/// (cookie 2) holds as a `lookup` of the name holds on `Dentry`, instead
+/// of handing the kernel an entry for a name this node's client already
+/// removed. (Fails with only the children's `Ino` keys.)
+#[test]
+fn a_queued_replay_of_an_unlink_holds_a_later_plus_page() {
+    guarded(Naive::NoDentryWait, |naive| {
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        meta.create(ROOT_INO, "file", 0o644, 0, 0).unwrap();
+        meta.create(ROOT_INO, "other", 0o644, 0, 0).unwrap();
+        let (fs, _tmp, _core) = holder_fs(meta.clone(), false);
+        meta.session().set_budget_ms(PATIENCE.as_millis() as u64);
+        meta.queue_replay(
+            constellation_meta::Rid {
+                node: 1,
+                incarnation: 1,
+                seq: 1,
+            },
+            &constellation_meta::MutateOp::Unlink {
+                parent: ROOT_INO,
+                name: "file".into(),
+            },
+            &Default::default(),
+        )
+        .unwrap();
+        let queued = meta.pending_replays().unwrap()[0].queue_seq;
+        let page = plus_page_held_until(&fs, ROOT_INO, 2, naive, || {
+            meta.forget_replay(queued).unwrap();
+        })?;
+        let names: Vec<_> = page.iter().map(|e| e.name.as_bytes().to_vec()).collect();
+        assert!(names.contains(&b"other".to_vec()), "{names:?}");
+        Ok(())
+    });
+}

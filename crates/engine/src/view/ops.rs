@@ -1949,7 +1949,11 @@ impl Vfs for View {
         let mut page = plus.then(|| self.plus_page(ino, scratch));
         'page: for batch in children[from..].chunks(plus::BATCH) {
             if let Some(page) = &page {
-                page.wait(batch.iter().map(|(_, child)| child.ino));
+                page.wait(
+                    batch
+                        .iter()
+                        .map(|(_, child)| (child.ino, child.name.as_str())),
+                );
             }
             for (next, child) in batch {
                 let name = constellation_vfs::name::wire_bytes(&child.name);

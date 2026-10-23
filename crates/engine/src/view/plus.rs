@@ -9,12 +9,15 @@
 //!    sequencer): every entry is name-only and nothing below runs. An
 //!    attribute with timeout 0 is pure overhead for the kernel, which
 //!    falls back to plain pages by itself.
-//! 2. **One session wait per batch**, with one `ReadKey::Ino(child)` per
-//!    name, before any write shard is taken (plan 30 §M6: never block
-//!    holding one). The listing's own `Dir(dir)` wait (cookie 0) is
-//!    weaker than the `Ino(child)` wait `getattr` makes: a queued replay
-//!    or an unshipped durable-gated row that touched only the child does
-//!    not touch `Dir(dir)`.
+//! 2. **One session wait per batch**, with the keys a `lookup` of each
+//!    name waits on (`Dentry(dir, name)`, then `Ino(child)`), before any
+//!    write shard is taken (plan 30 §M6: never block holding one). The
+//!    listing's own `Dir(dir)` wait (cookie 0 only) is weaker than the
+//!    `Ino(child)` wait `getattr` makes: a queued replay or an unshipped
+//!    durable-gated row that touched only the child does not touch
+//!    `Dir(dir)`. And a later page waits on nothing else: a queued replay
+//!    of this node's unlink or rename of a name touches the name, not the
+//!    inode it led to.
 //! 3. **The attributes under the child's write shard**, from the dentry's
 //!    copy ([`MetaStore::lookup`]: the copy and the `atime` point read; a
 //!    hard-linked name holds none, so its attributes cost one `0x01`
@@ -64,6 +67,8 @@ pub(super) enum Naive {
     ReadBeforeShard,
     /// Step 2 without the children's keys (the listing's `Dir` wait only).
     NoChildWait,
+    /// Step 2 with the children's inodes but not their names.
+    NoDentryWait,
     /// Step 1 ignored.
     KeepZeroTtl,
     /// Step 3 without the check that the name still leads to the listed
@@ -146,13 +151,26 @@ impl View {
 }
 
 impl PlusPage<'_> {
-    /// Step 2: wait, once, for what a `getattr` of each of `children`
-    /// would wait for. Takes no lock.
-    pub(super) fn wait(&self, children: impl Iterator<Item = Ino>) {
+    /// Step 2: wait, once, for what a `lookup` of each of `children` (a
+    /// name and the inode the listing says it leads to) would wait for:
+    /// `Dentry(dir, name)`, then `Ino(child)` as `getattr` waits. The
+    /// dentry's key is not implied by the listing's `Dir(dir)` wait, which
+    /// only a first page makes: a later page's names are read with no
+    /// wait at all, and a queued replay of this node's own unlink or
+    /// rename touches the name and the directory, never the inode the
+    /// name led to. Takes no lock.
+    pub(super) fn wait<'n>(&self, children: impl Iterator<Item = (Ino, &'n str)>) {
         if self.name_only || naive(Naive::NoChildWait) {
             return;
         }
-        let keys: Vec<ReadKey> = children.map(ReadKey::Ino).collect();
+        let dentries = !naive(Naive::NoDentryWait);
+        let mut keys: Vec<ReadKey> = Vec::new();
+        for (child, name) in children {
+            if dentries {
+                keys.push(ReadKey::Dentry(self.dir, name.to_string()));
+            }
+            keys.push(ReadKey::Ino(child));
+        }
         if !keys.is_empty() {
             self.view.session_wait(&keys);
         }
