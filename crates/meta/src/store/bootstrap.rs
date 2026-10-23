@@ -413,7 +413,13 @@ impl Meta {
             let (k, v) = guard.into_inner()?;
             tx.insert(&self.completed, k.to_vec(), v.to_vec());
         }
-        crate::store::spec::reset_for_rebuilt_ns_tx(&mut tx, self)?;
+        // Plan 43 C1-4: what the rebuilt log says of each epoch's tail, and
+        // how far it reaches, so that a committed entry the reset keeps is
+        // judged by that log (`member::log_carries_tx`): the applied
+        // position is installed below, after the reset.
+        crate::store::member::adopt_log_tail_facts_tx(&mut tx, self, &side_snap, side)?;
+        let side_pos = crate::store::applied_pos_at(&side_snap, &side.local);
+        crate::store::spec::reset_for_rebuilt_ns_tx(&mut tx, self, side_pos)?;
         if let Some(v) = side_snap.get(&side.local, KV_APPLIED_SEQ.as_bytes())? {
             tx.insert(&self.local, KV_APPLIED_SEQ.as_bytes().to_vec(), v.to_vec());
         }

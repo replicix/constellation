@@ -2788,6 +2788,7 @@ pub(crate) fn local_before_images_from(
 pub(crate) fn reset_for_rebuilt_ns_tx(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
+    rebuilt_pos: Option<crate::session::JournalPos>,
 ) -> Result<(), MetaError> {
     let live = read_live(tx, meta)?;
     // Plan 43 C1-4: a committed shadow or streamed transaction is not this
@@ -2795,7 +2796,9 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
     // committed effect disappearing to this node's clients, and queueing it
     // would execute a row its group holds a second time. It is re-installed
     // on the rebuilt namespace below, unless the log the rebuild carries
-    // completes it.
+    // completes it or (a streamed one) carries it by position: the rebuilt
+    // log's applied position (`rebuilt_pos`) and what it says of each
+    // epoch's tail (`member::log_carries_tx`).
     let mut kept: Vec<(u64, LiveEntry)> = Vec::new();
     for (seq, entry) in &live {
         if entry.gated() && matches!(entry, LiveEntry::Shadow { .. } | LiveEntry::Streamed { .. }) {
@@ -2875,12 +2878,25 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
                 .is_some_and(|position| position == 0),
             None => false,
         };
+        // A streamed transaction the rebuilt log carries by position (its
+        // own epoch's segments, or a successor's re-ship naming its
+        // identity): retired too. Matched by rid alone, one that completes
+        // none was redone over the namespace holding it already.
+        let in_log = in_log
+            || match entry {
+                LiveEntry::Streamed {
+                    epoch, ident, last, ..
+                } => {
+                    rebuilt_pos.is_some_and(|p| p.epoch == epoch && p.jseq >= last)
+                        || super::member::log_carries_tx(&*tx, meta, epoch, ident, last)?
+                }
+                _ => false,
+            };
         if in_log {
             // The rebuilt log carries it: retired.
             tx.remove(&meta.spec, seq_key(seq));
             tx.remove(&meta.spec_live, seq_key(seq));
             counter_add_tx(tx, &meta.local, KV_SPEC_LIVE_COUNT, -1)?;
-            let _ = entry;
             continue;
         }
         redo_row_tx(

@@ -147,6 +147,59 @@ fn log_settled_tx(
     Ok(kv_u64(r, meta, &reship_key(ie))?.is_some_and(|m| ij <= m))
 }
 
+/// Whether the log this replica applied carries row `ident` of `epoch`'s
+/// tenure, ending at `last`: shipped by its own epoch (at or below the
+/// applied position of that epoch, or of `member_shipped`), or re-shipped by
+/// a successor (`member_reship` reaches its identity). A committed requester
+/// or subscriber entry a namespace rebuild finds is retired by it rather than
+/// redone over a namespace that holds it already.
+pub(crate) fn log_carries_tx(
+    r: &impl Readable,
+    meta: &Meta,
+    epoch: u64,
+    ident: (u64, u64),
+    last: u64,
+) -> Result<bool, MetaError> {
+    if super::applied_pos_at(r, &meta.local).is_some_and(|p| p.epoch == epoch && p.jseq >= last) {
+        return Ok(true);
+    }
+    if kv_u64(r, meta, &shipped_key(epoch))?.is_some_and(|s| last <= s) {
+        return Ok(true);
+    }
+    Ok(kv_u64(r, meta, &reship_key(ident.0))?.is_some_and(|m| ident.1 <= m))
+}
+
+/// Take over what the log told `side` of every epoch's tail (module doc's
+/// `member_shipped`/`member_reship`/`member_through`, each raised, never
+/// lowered): a namespace rebuilt from `side` is a replica that applied that
+/// log.
+pub(crate) fn adopt_log_tail_facts_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    side_snap: &impl Readable,
+    side: &Meta,
+) -> Result<(), MetaError> {
+    let mut facts: Vec<(String, u64)> = Vec::new();
+    for prefix in ["member_shipped:", "member_reship:", "member_through:"] {
+        for guard in side_snap.prefix(&side.local, prefix.as_bytes()) {
+            let (k, v) = guard.into_inner()?;
+            let (Ok(k), Some(v)) = (
+                String::from_utf8(k.to_vec()),
+                std::str::from_utf8(&v)
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok()),
+            ) else {
+                continue;
+            };
+            facts.push((k, v));
+        }
+    }
+    for (k, v) in facts {
+        kv_raise(tx, meta, &k, v)?;
+    }
+    Ok(())
+}
+
 /// One transaction of a member copy: the journal transaction as the group
 /// held it, and what an abandon needs to queue it as the lone branch would.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -565,7 +618,9 @@ pub(crate) fn member_rules_tx(
                 continue;
             }
             if abandoned.contains(&e) {
-                if row.class != RowClass::Lone && super::spec::queue_abandoned_tx(tx, meta, &row)? {
+                if row.class != RowClass::Lone
+                    && super::spec::queue_abandoned_tx(tx, meta, &row)?
+                {
                     out.abandoned += 1;
                 }
                 tx.remove(&meta.backup_tail, key);

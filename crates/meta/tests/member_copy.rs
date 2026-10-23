@@ -373,6 +373,44 @@ fn a_rebuild_keeps_a_committed_shadow() {
     assert!(meta.lookup(ROOT_INO, "a").unwrap().is_some());
 }
 
+/// A rebuild retires a committed streamed transaction that the log it was
+/// rebuilt from carries, whether its own epoch's segment shipped it or a
+/// successor re-shipped it (`TailOf`) — also when it completes no rid. Fails
+/// on the parent: such an entry was re-installed on a namespace that holds
+/// it already, its records applied a second time.
+#[test]
+fn a_rebuild_retires_a_committed_streamed_entry_the_log_carries() {
+    let tx1 = vec![create("a", ino(1), 10)];
+    let reship = vec![
+        LogRecord::TailOf { epoch: 1, jseq: 1 },
+        create("a", ino(1), 10),
+    ];
+    for (epoch, recs) in [(1u64, tx1.clone()), (2, reship)] {
+        let meta = Meta::open_in_memory().unwrap();
+        meta.install_streamed_committed(1, HOLDER, 1, 1, &tx1, true)
+            .unwrap();
+        let side = Meta::open_in_memory().unwrap();
+        apply_rows(&side, 1, epoch, 1, &[1], &recs);
+        let rebuilt = meta.replace_ns_from_rebuilt(&side, &Default::default());
+        assert!(rebuilt.is_ok(), "epoch {epoch}: {rebuilt:?}");
+        assert!(
+            !meta.has_outstanding_speculation(),
+            "epoch {epoch}: the entry the log carries is retired"
+        );
+        assert_eq!(raw_ns(&meta), raw_ns(&side), "epoch {epoch}: applied once");
+    }
+    // Not carried (the log stops before it): re-installed, as before.
+    let meta = Meta::open_in_memory().unwrap();
+    meta.install_streamed_committed(1, HOLDER, 2, 2, &tx1, true)
+        .unwrap();
+    let side = Meta::open_in_memory().unwrap();
+    apply_rows(&side, 1, 1, 1, &[1], &[create("b", ino(2), 9)]);
+    meta.replace_ns_from_rebuilt(&side, &Default::default())
+        .unwrap();
+    assert!(meta.has_outstanding_speculation());
+    assert!(meta.lookup(ROOT_INO, "a").unwrap().is_some());
+}
+
 // -------------------------------------------------------- the drop rules
 
 fn put(meta: &Meta, rows: &[MemberTx]) {
