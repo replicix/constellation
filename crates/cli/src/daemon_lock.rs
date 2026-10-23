@@ -358,6 +358,36 @@ pub fn record_mount(state_dir: &Path, id: u64, mountpoint: &Path, fs_name: &str)
         .with_context(|| format!("writing {}", path.display()))
 }
 
+/// The name prefix of the record of a kernel-fix probe's mount
+/// (`record_probe_mount`): `probe-<pid>`, never a view id.
+const PROBE_RECORD_PREFIX: &str = "probe-";
+
+fn probe_record_path(state_dir: &Path) -> PathBuf {
+    state_dir
+        .join(MOUNTS_DIR)
+        .join(format!("{PROBE_RECORD_PREFIX}{}", std::process::id()))
+}
+
+/// Note that this process is about to mount the kernel-fix probe's
+/// filesystem (plan 42 K6) at `mountpoint`. On a kernel with fix 0001 the
+/// probe holds a `WRITE`'s reply of that mount on purpose, with a thread of
+/// this process in `D` meanwhile: a `kill -9` there leaves a zombie that
+/// only an abort of the probe mount's connection releases, so the mount is
+/// recorded like a view's, before it exists. [`forget_probe_mount`] drops
+/// the record when the probe ends.
+pub fn record_probe_mount(state_dir: &Path, mountpoint: &Path, fs_name: &str) -> Result<()> {
+    let dir = state_dir.join(MOUNTS_DIR);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = probe_record_path(state_dir);
+    std::fs::write(&path, format!("{}\n{fs_name}\n", mountpoint.display()))
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+/// The probe of this process ended: drop its record.
+pub fn forget_probe_mount(state_dir: &Path) {
+    let _ = std::fs::remove_file(probe_record_path(state_dir));
+}
+
 /// The view `id` is unmounted: drop its record.
 pub fn forget_mount(state_dir: &Path, id: u64) {
     let _ = std::fs::remove_file(state_dir.join(MOUNTS_DIR).join(id.to_string()));
@@ -411,10 +441,11 @@ impl std::fmt::Display for StaleMount {
 }
 
 /// Abort the FUSE connections of the mounts recorded in `state_dir` by a
-/// previous daemon, and drop the records. Only for a caller that holds
-/// `daemon.lock`: the records then belong to a daemon that is gone, and
-/// its mounts serve nothing any more — at best they answer `ENOTCONN`,
-/// at worst (the daemon `kill -9`ed while a thread was inside a
+/// previous daemon, and drop the records. A probe's mount
+/// ([`record_probe_mount`]) is also unmounted and its directory removed.
+/// Only for a caller that holds `daemon.lock`: the records then belong to
+/// a daemon that is gone, and its mounts serve nothing any more — at best
+/// they answer `ENOTCONN`, at worst (the daemon `kill -9`ed while a thread was inside a
 /// `FUSE_NOTIFY_INVAL_ENTRY` write, EC2 campaign 6 B-1) they hang every
 /// process that touches them, keep the dead daemon's last thread wedged
 /// in the kernel forever with the daemon's whole file table, and block
@@ -438,6 +469,10 @@ pub fn abort_stale_mounts(state_dir: &Path) -> Vec<StaleMount> {
             let _ = std::fs::remove_file(&path);
             continue;
         };
+        let is_probe = entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(PROBE_RECORD_PREFIX);
         let mut stale = StaleMount {
             mountpoint: PathBuf::from(mountpoint),
             fs_name: fs_name.to_string(),
@@ -455,6 +490,14 @@ pub fn abort_stale_mounts(state_dir: &Path) -> Vec<StaleMount> {
             // The fusectl files belong to the user who mounted, so the
             // daemon's own user may abort.
             stale.aborted = Some(table.abort_fuse(connection).map_err(|e| e.to_string()));
+        }
+        if is_probe {
+            // The probe's mount is a directory of its own that nothing else
+            // is ever mounted on, so the dead connection goes at once
+            // (whoever aborts has no mountpoint to protect, as for a
+            // view's) and the directory with it.
+            let _ = lazy_unmount_connection(&stale);
+            let _ = std::fs::remove_dir(&stale.mountpoint);
         }
         let _ = std::fs::remove_file(&path);
         out.push(stale);
@@ -748,6 +791,32 @@ mod tests {
             .next()
             .is_none());
         assert!(abort_stale_mounts(state).is_empty());
+    }
+
+    /// A probe that was killed leaves its record and its mount directory:
+    /// whoever takes the state dir over drops both (a mount still there is
+    /// aborted and unmounted too; `cli/tests/reaper.rs` has the real one).
+    /// A probe that ended forgets its own record.
+    #[test]
+    fn a_probe_record_left_behind_is_dropped_with_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let probe_dir = state.join("constellation-kernel-probe-1-0");
+        std::fs::create_dir(&probe_dir).unwrap();
+        let records = || std::fs::read_dir(state.join(MOUNTS_DIR)).unwrap().count();
+
+        record_probe_mount(state, &probe_dir, "constellation-probe").unwrap();
+        assert_eq!(records(), 1);
+        forget_probe_mount(state);
+        assert_eq!(records(), 0, "an ended probe forgets its record");
+
+        record_probe_mount(state, &probe_dir, "constellation-probe").unwrap();
+        let got = abort_stale_mounts(state);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].mountpoint, probe_dir);
+        assert_eq!(got[0].fs_name, "constellation-probe");
+        assert_eq!(records(), 0, "the record is dropped");
+        assert!(!probe_dir.exists(), "and so is the probe's directory");
     }
 
     /// The Linux `/proc` text through the platform's parser, then the

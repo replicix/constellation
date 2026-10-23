@@ -1625,7 +1625,12 @@ the final build once with every §7.2 row at L0:
 - the same guest on the unpatched base kernel reports `NotFixed` from both
   probes (the probes' fail-before);
 - a daemon that exits while the probe is in flight does not hang on a
-  kernel with 0001 (`kernel-race-probe-exit`).
+  kernel with 0001 (`kernel-race-probe-exit`);
+- a daemon `kill -9`ed (or OOM-killed) while the probe is in flight leaves
+  nothing behind: the probe's mount is recorded in `state_dir/mounts`
+  (`probe-<pid>`) before it is mounted and forgotten when the probe ends,
+  so the zombie reaper or the next daemon of the state dir aborts the
+  connection, unmounts it and removes its directory (`crates/cli/tests/reaper.rs`).
 
 **Recorded** (build `4488a6a6` plus the probe-exit fix and the moved-inode
 notice; guests 7.3.0-rc7, 6 vCPU, 6 GiB; 60 s rows, L0; "fix" is mainline

@@ -560,8 +560,26 @@ pub(crate) fn wait_done(bound: Duration) -> bool {
     !*running
 }
 
+/// [`MountRecorder::record`].
+pub type RecordFn = Box<dyn Fn(&Path, &str) + Send + Sync>;
+
+/// How the probe tells the daemon about its mount, so that a daemon killed
+/// while the probe holds a reply (a zombie with a thread in `D` on a kernel
+/// with fix 0001) leaves a record whoever takes over can find the mount by
+/// and abort its connection (the daemon's `mounts` record, as for a view's).
+pub struct MountRecorder {
+    /// Called before the probe mounts, with its mountpoint and the file
+    /// system name the mount carries.
+    pub record: RecordFn,
+    /// Called when the probe has unmounted, or could not mount.
+    pub forget: Box<dyn Fn() + Send + Sync>,
+}
+
+/// The file system name of the probe's mount.
+const PROBE_FS_NAME: &str = "constellation-probe";
+
 /// Run the probes once per process, from a thread (`super`'s module doc).
-pub(crate) fn start_once() {
+pub(crate) fn start_once(recorder: MountRecorder) {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let off = std::env::var(PROBE_ENV).is_ok_and(|v| v.trim().eq_ignore_ascii_case("off"));
@@ -581,7 +599,7 @@ pub(crate) fn start_once() {
         unsafe { libc::atexit(stop_at_exit) };
         let spawned = std::thread::Builder::new()
             .name("fuse-kernel-probe".into())
-            .spawn(|| {
+            .spawn(move || {
                 struct Done;
                 impl Drop for Done {
                     fn drop(&mut self) {
@@ -590,7 +608,7 @@ pub(crate) fn start_once() {
                     }
                 }
                 let _done = Done;
-                let (w, d) = run();
+                let (w, d) = run(&recorder);
                 set_probed(KernelFix::WriteThroughWriteback, w);
                 set_probed(KernelFix::DirChangeBumpsVersion, d);
                 tracing::info!(
@@ -608,7 +626,7 @@ pub(crate) fn start_once() {
 }
 
 /// The mount, both probes, the unmount: `(0001, 0003)`.
-fn run() -> (Verdict, Verdict) {
+fn run(recorder: &MountRecorder) -> (Verdict, Verdict) {
     // A fresh directory of our own: `create` (not `create_dir_all`) fails
     // on anything already at the path — a directory or a symlink planted
     // in the shared temp directory, which a daemon running as root would
@@ -644,16 +662,15 @@ fn run() -> (Verdict, Verdict) {
         dir_attr_ttl: crate::DirAttrTtl::Entry,
         ..Default::default()
     };
-    let opts = crate::MountOptions::new(
-        "constellation-probe",
-        2,
-        crate::KernelTuning::for_workers(2),
-        cfg,
-    );
+    let opts = crate::MountOptions::new(PROBE_FS_NAME, 2, crate::KernelTuning::for_workers(2), cfg);
+    // Recorded before the mount exists: a kill between the two leaves a
+    // record of a mount that is not there, which is dropped.
+    (recorder.record)(&dir, PROBE_FS_NAME);
     let session = match crate::mount(vfs.clone(), &dir, &opts, crate::caps(false)) {
         Ok(s) => s,
         Err(error) => {
             tracing::debug!(%error, "the FUSE kernel probe could not mount");
+            (recorder.forget)();
             let _ = std::fs::remove_dir(&dir);
             *ACTIVE.lock().unwrap() = None;
             return (Verdict::Unknown, Verdict::Unknown);
@@ -667,6 +684,7 @@ fn run() -> (Verdict, Verdict) {
     let d = probe_dir(&dir, &vfs);
     let _ = control.unmount();
     let _ = served.join();
+    (recorder.forget)();
     let _ = std::fs::remove_dir(&dir);
     *ACTIVE.lock().unwrap() = None;
     if ABORTED.load(Ordering::SeqCst) {
@@ -861,6 +879,78 @@ mod tests {
         vfs.wait_release(|st| st.release_getattr && !st.aborted);
         assert!(t.elapsed() < Duration::from_secs(2));
         assert!(vfs.state.lock().unwrap().aborted);
+    }
+
+    /// The probe's mount is recorded before it exists and forgotten after
+    /// it is gone, and while it is up the kernel lists it under the very
+    /// mountpoint and name the record carries: that pair is how whoever
+    /// takes over from a killed daemon finds the connection to abort (the
+    /// daemon's `mounts` records). Needs `/dev/fuse` and `fusermount3`.
+    #[test]
+    fn the_probe_records_its_mount_while_it_is_up() {
+        let have_fusermount = std::env::var_os("PATH")
+            .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("fusermount3").exists()));
+        if !Path::new("/dev/fuse").exists() || !have_fusermount {
+            eprintln!("skipping: needs /dev/fuse and fusermount3");
+            return;
+        }
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let ended = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(AtomicBool::new(false));
+        let sampler = Arc::new(Mutex::new(None::<std::thread::JoinHandle<()>>));
+        let recorder = MountRecorder {
+            record: {
+                let (events, ended, seen) = (events.clone(), ended.clone(), seen.clone());
+                let sampler = sampler.clone();
+                Box::new(move |dir, name| {
+                    events
+                        .lock()
+                        .unwrap()
+                        .push(format!("record {} {name}", dir.display()));
+                    let (dir, name) = (dir.to_path_buf(), name.to_string());
+                    let (ended, seen) = (ended.clone(), seen.clone());
+                    let handle = std::thread::spawn(move || {
+                        while !ended.load(Ordering::SeqCst) {
+                            let table =
+                                std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+                            let listed = table.lines().any(|l| {
+                                let f: Vec<&str> = l.split(' ').collect();
+                                f.get(4) == Some(&dir.to_str().unwrap())
+                                    && l.contains(&format!(" - fuse {name} "))
+                            });
+                            if listed {
+                                seen.store(true, Ordering::SeqCst);
+                            }
+                            std::thread::sleep(Duration::from_micros(200));
+                        }
+                    });
+                    *sampler.lock().unwrap() = Some(handle);
+                })
+            },
+            forget: {
+                let (events, ended) = (events.clone(), ended.clone());
+                Box::new(move || {
+                    events.lock().unwrap().push("forget".into());
+                    ended.store(true, Ordering::SeqCst);
+                })
+            },
+        };
+        let _ = run(&recorder);
+        ended.store(true, Ordering::SeqCst);
+        if let Some(h) = sampler.lock().unwrap().take() {
+            h.join().unwrap();
+        }
+        let events = events.lock().unwrap().clone();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(
+            events[0].starts_with("record ") && events[0].ends_with(" constellation-probe"),
+            "{events:?}"
+        );
+        assert_eq!(events[1], "forget");
+        assert!(
+            seen.load(Ordering::SeqCst),
+            "the kernel never listed a mount for the recorded pair: {events:?}"
+        );
     }
 
     /// A running thread, a sleeping one and one that does not exist are

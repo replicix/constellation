@@ -875,7 +875,25 @@ impl NodeRuntime {
         // Plan 42 §5.4: which FUSE fixes this kernel carries, probed once
         // per process (in the background; until it answers, `auto` keeps
         // every workaround on).
-        constellation_frontend_fuse::kernel_fixes::start_probe();
+        // The probe's mount is recorded like a view's, so that a kill in
+        // the middle of it (a zombie with a thread in `D` on a kernel with
+        // fix 0001) is cleared by the reaper or the next daemon.
+        let (record_dir, forget_dir) = (
+            self.engine.state_dir().to_path_buf(),
+            self.engine.state_dir().to_path_buf(),
+        );
+        constellation_frontend_fuse::kernel_fixes::start_probe(
+            constellation_frontend_fuse::kernel_fixes::MountRecorder {
+                record: Box::new(move |mountpoint, fs_name| {
+                    if let Err(e) =
+                        crate::daemon_lock::record_probe_mount(&record_dir, mountpoint, fs_name)
+                    {
+                        tracing::warn!(error = %e, "recording the probe mount in the state dir failed");
+                    }
+                }),
+                forget: Box::new(move || crate::daemon_lock::forget_probe_mount(&forget_dir)),
+            },
+        );
         Ok(self.serve_session(
             session,
             fs,

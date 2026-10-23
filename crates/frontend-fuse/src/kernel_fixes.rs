@@ -268,12 +268,13 @@ pub(crate) fn set_probed(fix: KernelFix, v: Verdict) {
 
 pub(crate) mod probe;
 
-pub use probe::PROBE_ENV;
+pub use probe::{MountRecorder, PROBE_ENV};
 
 /// Probe the running kernel's fixes, once per process, in the background
-/// (the module doc).
-pub fn start_probe() {
-    probe::start_once();
+/// (the module doc). `recorder` notes the probe's mount where a successor
+/// of a killed daemon looks for mounts to abort.
+pub fn start_probe(recorder: MountRecorder) {
+    probe::start_once(recorder);
 }
 
 /// Wait, at most `bound`, until no probe is running; `false` if one still
