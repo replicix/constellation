@@ -4046,6 +4046,24 @@ to land before C0.
   the released-takeover quarantine with the boot-stamped horizons, or
   re-arm it on restart from the lease's mark. Should be settled before C7b
   commit 9 puts offsets into the default mix.
+- **No sim configuration shows what C7b spec commit 6's honour bound fixes**
+  (the review of spec commits 4-7). `locks-executor-behind` delays the op
+  in transit by more than 2M, outside phase 1's bound, so it passes on the
+  parent and after alike; the case the bound fixes is an op queued at the
+  executor after its receipt, and the sim stamps a forwarded op's receipt
+  when the node handles it, after its event queue. To do with commit 9:
+  stamp the receipt at the bus's delivery, then an executor-behind
+  configuration with a stalled executor.
+- **The cold backup's wall hint** (spec commit 4, row 24) can seal a live
+  holder once per start when the backup's wall is ahead of the holder's by
+  more than the lease has left (fenced, an availability event), and seals
+  late when it is behind (the restarted-backup window, pinned until C1-3).
+- **Plan 41's lock lane and row 29** (settled while rebasing spec commit 6
+  onto plan 41): the lane's `LockRenew` is stamped with the holder's honour
+  reading and clock id as it is sent, its own renewals confirm from the
+  certificate's clock id, and an off-core extension (`extend_live`, unused
+  so far) takes the renewal's `(clock, sent)`. Any later off-core owner
+  path must do the same, never confirm from the owner's clock.
 
 ## 12. Risks
 

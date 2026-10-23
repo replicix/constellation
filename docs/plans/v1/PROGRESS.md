@@ -58797,3 +58797,114 @@ some would, asserted so the test is not vacuous). The sim's `locks-locker-suspen
 notes), so the property test is the fail-before.
 
 Evidence and gates: see the commit message.
+
+## Plan 43 C7b, review of spec commits 4-7 (2026-10-23)
+
+Rebased onto main `e83aaa67` (plan 45 O1, the stalebase fixes, plan 42). One
+textual conflict (this file: kept both) and one semantic one: plan 41 L1's
+`LockTables::extend_live` and `renew_own` confirmed an installed copy from the
+extending table's wall clock; in spec commit 6 they confirm from the renewal's
+send as `extend` does (`extend_live` takes the holder's `(clock, sent)`,
+`renew_own` this node's clock id). Recorded in that commit's message.
+Rebased again onto plan 41 R1/R2, L2-L8 (`d4876e4a`): the lock lane's
+`LockRenew` is stamped with the holder's honour reading and clock id as its
+transport task builds the payload for the send (the plan 41 review's point: a
+stamp taken at the lane's tick would be older than the send, and an owner
+confirms an installed copy from it); the lane's own renewals confirm from the
+certificate's clock id (`LockLaneView::clock`); `Grant::confirm` ignores clock
+id 0 (it would read as "any clock"). Tests: engine
+`the_lanes_renewal_is_stamped_as_it_is_sent`, meta
+`another_clock_is_unconfirmed` (clock 0). With the lane the credited-cap
+control's seed 194557 no longer fails (five of the six still do, inside the
+first floor; the real cap is clean over 193000..203000): pinned 195339, 199719,
+202316, in spec commit 4.
+
+Verdicts: spec commit 4 (seal watch) approve; 5 (promises) approve; 6 (tokens)
+approve with fix A; 7 (suspend pad) approve, its message corrected, fail-before
+added (fix B).
+
+The C7b invariant (no claim, seal, token or promise honoured past what the
+holder can still use, under offset, rate, pause or suspend), as checked:
+
+- Commit 4 changes when a seal happens, not what it allows: a seal is fenced
+  (C7-H2) and its permitted claim arms the floor, capped by `beat_cap` (which
+  adds M) or, with no beat heard, the predecessor's whole strict-read horizon.
+  `known_end`'s least-lag placement is no earlier than the holder's end but for
+  the rate error of a sample sent before the renewal that set `X`, which the
+  span keeps under M/2: liveness only. The cold backup's wall hint can seal a
+  live holder (the backup's wall ahead by more than the lease has left; once
+  per start, as the parent did at every renewal): an availability event, not
+  a safety one, and it does lead to a permitted claim (the message's "never
+  decides a claim" means no TTL claim). Its other direction (a backup behind)
+  is the restarted-backup window pinned until C1-3.
+- Commit 5: the heartbeat argument needs no taker-side observation (the
+  promiser's own observation of K ran out before it wrote, so `w >= end(K)`),
+  the reply argument needs the request sent after the taker's (`fresh`), and a
+  re-advertised key is covered by its first promise. Sound.
+- Commit 6: the honour bound protects queueing at the executor after the
+  receipt; the delay of the op itself stays phase 1's assumption (offset or
+  transit below 2M). `unsettled_writes`: the code is right and the spec's
+  wording inverted (a write is unsettled once its window is over, when the
+  next grant may exist; the code takes the earlier of the two bounds, the safe
+  direction). `recv` is not serialised: after a restart or an upgrade (which
+  refuses while a cluster lock is held and starts with a new clock id) every
+  persisted token comes back receipt-less, judged exactly or refused.
+- Commit 7: a suspend the RTC path counts as nothing (shorter than its second)
+  is undetectable on the host (the kernel injects the same short sleep into
+  the wall clock) and is absorbed by M, once per window.
+
+Fixes:
+
+- **A (medium), `fix(meta)`**: a receipt-less token was forwarded with the
+  remainder its holder named when the op first left it, and the receiver's
+  P2P receipt honoured that afresh: a stranded op replayed and forwarded to
+  the new holder was judged by the window again, refused only by the
+  offset-bound wall stamp (row 31 reopened for forwards). It now leaves with
+  no time left; its pin has no honour window (`i64::MIN`). Two meta tests,
+  both failing on the parent.
+- **B (test), `test(authority)`**: `locks-locker-suspend-coarse` could not
+  fail on commit 7's parent because the sim's wall counted the whole suspend
+  (HONOUR's jump term made up the boot clock's shortfall) and lock clients ran
+  through the suspend. With the wall short as on the RTC path and the clients
+  standing still it fails on the parent in 1 532 of 2 000 seeds (mutual
+  exclusion: the locker re-enters at its resume under a grant the owner has
+  outwaited) and in none with the pad; `locks-locker-suspend` and
+  `strict-holder-suspend` 0 of 2 000. Two sim tests, both failing on the
+  parent.
+
+Not changed, for the plan (§11.2):
+
+- `locks-executor-behind` delays the op 1.5 to 2.5 s in transit, beyond 2M:
+  outside phase 1's bound, so it cannot tell the parent from commit 6. The
+  case commit 6 fixes is queueing at the executor after the receipt, which the
+  sim cannot show: it stamps a forwarded op's receipt when the node handles it,
+  after its event queue (later than the daemon's P2P handler, the lenient
+  direction). A sim fail-before needs the receipt stamped at delivery.
+- Any later off-core owner path (none extends a grant off the core today;
+  `extend_live` is unused) must confirm from the renewal's `(clock, sent)`.
+
+Gates (box, this tree): fmt; `clippy --workspace --all-targets -D warnings`;
+workspace tests (authority lib 654, sim suite 257 + 12 ignored, meta 356,
+meta_repro 4, control 160 with the schema, engine 866; the two `known_gap`
+pins still fail as pinned); the model crate (`--test-threads=2`, alone, 28 GB
+free): 228 passed.
+Sweeps (box, release, 125 `locks-*`, `fast-takeover*`, `backup*`
+configurations, 1 000 seeds, 2 000 for `locks-claimant-ahead` and
+`fast-takeover-skewed-holder-twice`), main `d4876e4a` against this tree:
+failing sets identical in 118; `locks-core-stall-backup-long` 2 -> 1; the rest
+are negative controls that fail by design (`backup-lag-in-margin-unaware` 371
+-> 372, `backup-runtime-lag-unaware` 995 -> 994, `locks-core-stall-backup-long-
+unfresh` 29 -> 27, `locks-late-stale-mirror-naive` 19 -> 21,
+`locks-writer-hold-delegated-unsettled` 1 -> 2, `locks-writer-hold-unchecked`
+69 -> 70). claimant-ahead and holder-twice 0 of 2 000 both. Seals of a live
+holder 15 050 -> 7 827 (`backup-locks-ahead` 749 -> 0); TTL claims of a live
+holder 0 both. On the earlier base (`e83aaa67`) the stack as submitted showed
+the same classes against main (108 of 112 identical, `locks-stall-step-
+delegated-ahead` 1 -> 0).
+Bench (box 1, release, ABBA, main `d4876e4a` against this tree, each side
+with its own daemon; co-tenant load 5 to 95): vfs-bench's view rows within
+-3.6 to +2.8 % on tmpfs, ext4, xfs and btrfs (noise); meta-bench `1node-*`
+best-of-two within noise on every file system (runs of one build differ by up
+to 2x under the load), except `1node-write4k-lat0` on xfs, p50 0.335/0.345 ms
+against 0.366/0.371 ms (+8 %, both B runs; not seen on the other three): worth
+one rerun on a quiet box before the round is pushed.
