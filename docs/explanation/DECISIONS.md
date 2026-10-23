@@ -1105,9 +1105,47 @@ commit can drop the lock across its `write(2)` only by publishing before its
 bytes reach the OS, which lets the shipper or a backup read a commit a crash
 then loses; restoring that order removes every gain, since a later commit
 may depend on the stuck one and the kernel's inode lock serializes the
-journal's writes anyway (the core's 12 s stall waited 62 µs for the lock). The same pattern, for delegations, is
-`deleg_lane` / `DelegWindows` (the delegate's renewal lane, and the root's
-answer off its core, plan 41 R).
+journal's writes anyway (the core's 12 s stall waited 62 µs for the lock).
+The same pattern, for delegations, is `deleg_lane` / `DelegWindows` (the
+delegate's renewal lane, and the root's answer off its core, plan 41 R).
+
+**Amended (latency, not errors, across a failover; plan 43 C7-F)**: a lock
+request or a lapsed grant used to fail where the owner could not act yet: a
+non-blocking request in a grace got `EAGAIN`, one at a stale owner (cut from
+S3, its lease not over) `ENOLCK` after three `Busy` answers, one at an
+unreachable owner `ENOLCK` once its attempts were spent, and a grant that
+lapsed across a root failover fenced its owner with `EIO` from the lapse
+whether or not anyone else was granted the lock (25 of 50 reads of the
+harness's in-process locker at a 20 s lease). The maintainer decided
+(plan 43 §11 Q18, 2026-10-18; C7-F F-c) that these cost latency:
+- *F-b*: a request for a lock nobody holds waits out the grace, the new
+  tenure's floor, a barrier, a delegate's short authority, a stale owner and
+  an unreachable one (asked again as a fresh request, routed to the
+  successor once the lease names it), all under one bound from the
+  request's start, `lock_owner_wait_max_ms = ttl + margin +
+  acquire_retry_max + lock_grace_wait_max` (112.5 s at the defaults), then
+  `EAGAIN`; a signal ends it with `EINTR`; a conflicting grant still
+  answers `EAGAIN` at once. The wait holds no frontend thread.
+- *F-c*: a grant that lapses while local locks or an unpublished write rest
+  on it is *lapsing*: the I/O that would be fenced is parked and asked again
+  once the verdict is in, the holder sends late renewals, and the owner
+  admits one only where it can prove no conflicting grant was issued since
+  (a *settled* record in its table or in a bounded memory of outwaited
+  records that every change letting another node act on the inode forgets,
+  or, at a fast successor, the old root's *final mirror* of the lease body
+  it replaced). Refused, or unanswered within the same bound, the fence
+  applies from the end of the grant's window as before.
+
+Checked by the lock model (`late_reclaim` and the three naive variants
+`late_admit_unknown`, `late_admit_nonfinal`, `late_lapsed_unsuperseded`,
+each violating mutual exclusion), the simulator and the harness
+(`s3-cut-holder-failover-with-locks`). *Rejected*: reclaiming an unknown late
+grant inside a grace (the old owner may have outwaited it and granted
+another node the successor never heard of). Plan 43 C4 moves grants into
+the log and replaces the final mirror with it. See
+[Cluster locks](../reference/features/cluster-locks.md); PROGRESS, "a stale
+or unreachable owner is a wait" and "a lapsed lock holder parks instead of
+failing".
 
 ## ADR-26: Exact chunk-location reconciliation replaces bloom digests
 

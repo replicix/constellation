@@ -1311,10 +1311,19 @@ of another node's `close()` out of band, with no lock between them
   until every inherited delegation has renewed with it. That is what
   keeps lock-protected read-modify-write of a *set* of files correct
   across nodes (git's refs under an `flock` turn file).
-- **Fencing.** A node whose grant lapsed (for example, partitioned past
-  the lock TTL) fails I/O with `EIO` on the files it holds locks on,
-  until they are unlocked or a new grant arrives (NFSv4's rule), and its
-  writes under the lapsed grant are never published. The lock's *owner*
+- **Fencing.** A grant that lapses (its holder partitioned past the lock
+  TTL, or its owner failing over) while local locks or an unpublished write
+  rest on it is first *lapsing*: the I/O the fence would refuse waits,
+  parked off the frontend's threads (a signal ends it with `EINTR`), while
+  the holder sends late renewals, and the owner admits one only where it
+  can prove that nothing conflicting was granted since (a settled record in
+  its table or in a bounded memory of outwaited ones, or, at a fast
+  successor, the old root's final mirror of its table). Admitted, the
+  parked I/O runs. Refused, or unanswered within the bound of every wait
+  on an owner (`lock_owner_wait_max_ms`, 112.5 s at the defaults), the
+  node fails I/O with `EIO` on the files it holds locks on, until they are
+  unlocked or a new grant arrives (NFSv4's rule), and its writes under the
+  lapsed grant are never published. The lock's *owner*
   is fenced on every file: the process of the thread that took the lock
   (by thread group, named by pid and an identity no later process with
   that pid has: its pidfd's inode number where pidfs exists, else its
@@ -1340,7 +1349,15 @@ of another node's `close()` out of band, with no lock between them
 - **Failover.** After a TTL takeover every old grant has already lapsed,
   so there is nothing to reclaim. After a fast takeover the successor
   waits out a grace period and accepts reclaims. A delegation's first
-  renewal carries what is left of any root grace over its subtree.
+  renewal carries what is left of any root grace over its subtree. A
+  request for a lock nobody holds waits out what keeps the owner from
+  granting (a grace, a new tenure's floor, a barrier, an owner whose S3
+  liveness is stale, an owner that cannot be reached while a failover is
+  under way) instead of failing, bounded by `lock_owner_wait_max_ms` and
+  then `EAGAIN`; a conflicting grant answers `EAGAIN` at once. A failover
+  costs a lock latency, not an error
+  ([ADR-25](DECISIONS.md#adr-25-cluster-locks-are-leased-grants-from-the-owning-sequencer),
+  amended by plan 43 C7-F).
 - **Limits.** A blocked lock wait cannot be interrupted, there is no
   deadlock detection, and one process's `flock` and `fcntl` locks on the
   same file conflict. Locks never use the S3 inbox: with P2P off the mode
@@ -1644,15 +1661,17 @@ latency.
 ### Lock holders
 
 A node partitioned from a file's sequencer past the lock TTL loses its
-grant and is fenced: `EIO` on the locked files until they are unlocked,
-and on every write or namespace operation of the lock's owner, on any
-file, until the owner's locks are gone.
+grant. Its I/O under the grant waits while it asks for the grant back
+(§6, Fencing); unless the sequencer admits that request, it is fenced:
+`EIO` on the locked files until they are unlocked, and on every write or
+namespace operation of the lock's owner, on any file, until the owner's
+locks are gone.
 The sequencer outwaits the grant (`granted + ttl + margin`) before
 granting the lock elsewhere, so the fence always comes first, and an
 operation of the owner already on its way is refused by whichever
 sequencer executes it (the fencing token). With P2P up
-but the sequencer unreachable, a non-blocking lock fails with `ENOLCK`
-and a blocking one keeps retrying.
+but the sequencer unreachable, a lock request waits for it or its
+successor, bounded (§6, Failover), and a blocking one keeps retrying.
 
 ### Other failures
 
