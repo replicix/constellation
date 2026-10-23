@@ -62,6 +62,7 @@ pub(super) fn test_fs_on(
     let _enter = handle.enter();
     let fs = View::new(
         FsDependencies {
+            listing: crate::view::Listing::for_test(),
             meta,
             store,
             cache,
@@ -740,6 +741,7 @@ fn view_usage_scopes_to_snapshot_mount() {
         .unwrap();
     let mut fs = View::new(
         FsDependencies {
+            listing: crate::view::Listing::for_test(),
             meta,
             store,
             cache,

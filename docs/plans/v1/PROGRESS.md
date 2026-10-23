@@ -59182,3 +59182,153 @@ D7 and is kept there.
   configurations, which fence about one seed in ten on main: the same within
   one grant (1 088/1 081 against 1 088/1 082, and 1 021/1 011 against
   1 020/1 011).
+
+## Plan 40 P3: directory pages are name-ordered range scans with keyed cookies (R3a, 2026-10-23)
+
+Every `readdir` page of the engine, plain and plus, is now a range scan of the directory's dentry keys,
+`Meta::readdir_after`, resumed after a *name*: O(page), no read of the whole directory, no sort. Scratch
+directories use the scratch twin. The synthetic listing is unchanged. Rebased onto P7 (plus entries), the page
+loop makes the plus page: for each batch it reads, one session wait on each name's `Dentry(dir, name)` and
+`Ino(child)` (P7 review), then the entry of each name as it is added, and the fault delay once at the end.
+
+**The cookie** (`view/cookie.rs`) is `(siphash13(k, name) >> 2) + 3` (`[3, 2^62 + 2]`; 0 rewinds, `.` is 1 and
+`..` is 2), or `(h mod (2^31 - 4)) + 3` under `CONSTELLATION_READDIR_COOKIE_BITS=31` (any other value fails the
+start). `k` is derived per filesystem, never stored: E2E `dek("readdir/cookie-v1")`, otherwise
+`blake3::derive_key("constellation readdir/cookie-v1", gossip_secret)`, truncated to two `u64`. Q1 (decided
+2026-10-22): the `siphasher` crate. Q5: `Engine::start` fails on a non-E2E filesystem without a `gossip_secret`
+("this filesystem predates `gossip_secret` ... recreate it"). The seedless-filesystem test sweep found no test
+that starts an engine on one (`FsMeta::new` always seeds; the two `gossip_secret = None` sites build E2E
+filesystems, which the master keys), so the only new tests of the refusal are
+`a_non_e2e_filesystem_without_a_gossip_secret_refuses_to_start` and a derive unit test. `dir_cookie` (unkeyed
+FNV-1a) is gone. One-time effect: a listing paused across the first restart on this build presents an FNV
+cookie, finds no name for it and gets `ENOENT` once (plan 40 §4.9; the handover does not carry it).
+
+**The hint cache** (`view/listing.rs`), one `Listing` per node shared by every view: 16 shards, the last 4
+served pages per directory (`anchor`, `last` name, cookies), keyed by the replica's directory inode, LRU by
+directory under `CONSTELLATION_READDIR_HINT_BYTES` (default 16 MiB, split over the shards; 8 B per cookie plus
+the two names plus 64 B per page). No lock is held across a replica read. A cookie resumes (1) from a hint: after
+the page's `last` name when it is the page's last cookie (the sequential case: each dentry is read once, below
+the spec's 2n bound), else by scanning from the page's `anchor` skipping the cookies up to it; (2) cold: one
+O(n) scan of the names in batches of 256, hashing, until one hashes to it, resuming after the first in name
+order; a cookie whose name is gone answers `NotFound` directly (not through `ino_err`). A page ends before an
+entry whose cookie it already holds. Counters on `Listing::stats()`: `hint_hits`, `cold_scans`,
+`cold_scan_entries`, `lost_cookies`, `cookie_collisions`, `hint_bytes` (exported by P8).
+
+Two things the spec did not say, found by the kit and by measurement: (a) an empty tail of a resume is checked
+against the directory's record (one 1-entry read at the end of a listing), because the kit's
+`plus_in_a_removed_directory_is_not_found` wants `NotFound` for a resume of a removed directory, and a resume
+reads no directory record; (b) the hint keeps the page's last name, so a sequential listing costs one dentry
+read per name, not two. Known limit of the 4-page ring: each resumed request records its page, so a client
+that jumps back more than three requests in one directory resumes cold (exact, one scan); the real kernel
+re-ask pattern (K5) moves forward through the pages and always hits. P5 pins the window.
+
+**Tests** (`view/listing_tests.rs`, `view/cookie.rs`, `tests/listing_cookies.rs`), each written against its
+naive implementation and failing on it (variants patched into a copy of this tree, run on the build box):
+
+| test | naive implementation | result |
+|---|---|---|
+| `a_full_listing_reads_each_dentry_o1_times`, `a_scratch_directory_pages_like_any_other` | every batch reads the whole directory and skips (what reusing `readdir` gives) | both FAIL (the 100k listing reads ~n^2/256 dentries) |
+| `resume_from_every_cookie_of_the_last_page`, `resume_three_pages_back_hits_the_cache`, `a_cookie_resumes_through_a_fresh_view_of_the_node`, `a_listing_is_exact_across_inserts_and_removals_between_pages` (and its `a_cold_cookie...` hint half) | no hint cache: every resume is a cold scan | FAIL (no hint hits; the resume entry deleted between pages gives `ENOENT`); the 100k test never finishes |
+| `a_cold_cookie_whose_name_was_removed_is_not_found_never_a_skip` | a cold cookie with no name ends the listing silently | FAILS |
+| `two_names_with_one_cookie_are_never_skipped_by_a_cold_resume` | a cold resume anchors on the last name of the cookie | FAILS (`m2` skipped) |
+| `a_page_never_holds_two_equal_cookies`, and the above | no in-page collision rule | both FAIL |
+| `thirty_one_bit_cookies_stay_below_2_31` (unit and listing) | the 31-bit knob ignored | both FAIL |
+| `the_cookie_is_the_same_on_two_nodes_and_differs_between_filesystems`, the derive unit test | one key for every filesystem | both FAIL |
+| `a_non_e2e_filesystem_without_a_gossip_secret_refuses_to_start` | a seedless filesystem served under a constant key | FAILS |
+| `hint_bytes_never_exceed_the_cap` | the cap never evicts | FAILS |
+
+Also green: stable cookies under inserts and removals between pages, including removing the entry the next
+cookie names (`a_listing_is_exact_across_inserts_and_removals_between_pages`) and with another thread
+creating and removing names during the listing (`..._while_another_thread_changes_the_directory`); cookie range
+`[3, 2^62 + 2]` and `.`/`..` keep 1/2; a non-UTF-8 name resumes by its exact key; a removed or non-directory
+inode fails before the first entry, and a resume of a removed one answers `NotFound`/`Stale`; the cap through
+the real page loop. The kit's `cookies_resume_where_they_left_off`, `removal_between_pages_never_repeats_or_loses`,
+`stable_under_concurrent_create`, `concurrency::creates_in_one_directory_are_all_visible` and the four P4 cases
+pass on `RefTarget` and on the engine (`tests/conformance.rs`: 100 cases). Gates on the build box: `cargo fmt
+--all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, the engine lib (880 pass) with its
+integration tests, the meta, vfs (`--features conformance`) and frontend-fuse libs, the cli and authority
+suites. Two engine tests, `owner_fence_tests::a_parked_write_lands_after_the_admission` (and once
+`lock_waits_in_flight_against_a_slow_owner_do_not_starve_the_parked_ops`), fail in a parallel run on a loaded box
+**on `main` too** (200 ms timing windows; both pass alone): not this change.
+
+**Perf**, engine level (`view/listing_perf.rs`, an `#[ignore]`d release measurement that uses only the `Vfs`
+surface both trees have; A = `main`, B = this commit), the replica on each of the four file systems of the build
+box (the DB of 5 000, 50 000 and 1 000 000 names, populated once per file system), A/B/B/A x 3 rounds (two
+runs of each per round, medians of 5 reps each), every run started with the box's load below 8:
+
+5,000 names (A = main, B = P3; medians of 3 rounds x 2 runs):
+
+| | ext4 A | ext4 B | xfs A | xfs B | btrfs A | btrfs B | tmpfs A | tmpfs B |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| whole listing in one call (ms) | 1.4 | 1.3 | 1.4 | 1.4 | 1.4 | 1.4 | 1.4 | 1.4 |
+| whole listing in 680-name pages (ms) | 10.0 | 1.5 | 10.1 | 1.5 | 10.0 | 1.5 | 10.0 | 1.4 |
+| one 680-name page (µs) | 1118 | 196 | 1132 | 195 | 1121 | 195 | 1117 | 194 |
+| one page resumed by a view that never listed the directory (µs) | 1121 | 997 | 1137 | 1012 | 1124 | 1006 | 1132 | 997 |
+
+50,000 names (A = main, B = P3; medians of 3 rounds x 2 runs):
+
+| | ext4 A | ext4 B | xfs A | xfs B | btrfs A | btrfs B | tmpfs A | tmpfs B |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| whole listing in one call (ms) | 14.8 | 14.9 | 15.2 | 14.7 | 14.7 | 14.3 | 14.6 | 14.2 |
+| whole listing in 680-name pages (ms) | 866 | 15.4 | 880 | 15.3 | 863 | 15.1 | 853 | 15.1 |
+| one 680-name page (µs) | 11541 | 208 | 11714 | 207 | 11468 | 204 | 11349 | 204 |
+| one page resumed by a view that never listed the directory (µs) | 11591 | 8274 | 11830 | 8244 | 11561 | 8158 | 11466 | 8152 |
+
+1,000,000 names (A = main, B = P3; medians of 3 rounds x 2 runs):
+
+| | ext4 A | ext4 B | xfs A | xfs B | btrfs A | btrfs B | tmpfs A | tmpfs B |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| whole listing in one call (ms) | - | 422 | - | 420 | - | 410 | - | 410 |
+| whole listing in 680-name pages (ms) | - | 325 | - | 323 | - | 323 | - | 322 |
+| one 680-name page (µs) | 292103 | 217 | 296396 | 216 | 293271 | 216 | 292368 | 215 |
+| one page resumed by a view that never listed the directory (µs) | 288835 | 168522 | 292984 | 166959 | 290025 | 166653 | 288643 | 167190 |
+
+Whole listing in 680-name pages at 1M names on A is not run to the end (one page is 0.29 s there, 1 471 pages
+~7 min): it is ~430 s projected against B's 0.32 s. B's per-page time at 1M (216 µs) is within 2x of 5k's (195
+µs) (spec §4 "Page cost"); the first page after a 1M-entry one-call listing reads 3.7 ms in B (the allocator
+returning the listing's memory; 0.33 ms without that listing before it). One-call listing, B vs A, is within the
+spread on every file system (the page loop's per-entry work, the hash and the set, is paid back by not sorting).
+A cold resume is one scan of the names hashed: 167 ms at 1M on the build box, below one A page (289 ms).
+
+**Microbench** (release, `cookie_hash_and_cold_scan_cost`, in-memory replica, load below 8): the cookie hash
+is 7.1 ns per name (17-byte names; `blake3::keyed_hash` 87.5 ns, 12x: Q1's option (a) holds, with (c) a 1M cold
+scan would cost ~80 ms more and a 10M one ~0.9 s). A cold resume at 1M names scans 0.5-0.9 M names in 143-253
+ms (~0.28 us per name, the replica's range read dominates), then the next page is a hint hit (0.3 ms); a
+sequential listing of 1M names is 0.40 s (269 us per page, 1 471 pages). Not gated here; the cold scan is what
+`readdir_cold_scans` will count (P8).
+
+**Perf**, through a real FUSE mount (release `constellation` of `main` and of this commit, a local-file backend,
+the daemon's state dir and backend on each of the four file systems, `--cache-size 1G`): a flat directory of
+5 000 and one of 50 000 files (12-40-byte names), and a repository checkout of 20 000 files in 1 000
+directories; `ls -f` (getdents only), `ls -l`, `find -type f -name`, `git status --porcelain`. Cold = the
+kernel's dentries and inodes dropped (`echo 2 > drop_caches`) with the daemon and its replica warm; warm = the
+same command right after. Median of 3 cold/warm pairs per mount, A/B/B/A x 3 rounds, started only while the
+box's load was below 8; the table is the median of the 6 mounts, ms:
+
+cold :
+
+| | ext4 A | ext4 B | xfs A | xfs B | btrfs A | btrfs B | tmpfs A | tmpfs B |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `ls_f_50k` | 312 | 31 | 296 | 31 | 306 | 32 | 306 | 32 |
+| `ls_l_5k` | 178 | 156 | 202 | 184 | 192 | 166 | 169 | 173 |
+| `ls_l_50k` | 2124 | 1685 | 2006 | 1520 | 2036 | 1578 | 2021 | 1695 |
+| `find_repo` | 130 | 121 | 126 | 115 | 124 | 111 | 121 | 121 |
+| `git_status` | 226 | 215 | 224 | 221 | 198 | 169 | 221 | 219 |
+
+warm :
+
+| | ext4 A | ext4 B | xfs A | xfs B | btrfs A | btrfs B | tmpfs A | tmpfs B |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `ls_f_50k` | 308 | 31 | 295 | 31 | 301 | 31 | 306 | 31 |
+| `ls_l_5k` | 69 | 60 | 73 | 72 | 68 | 55 | 67 | 57 |
+| `ls_l_50k` | 2068 | 1579 | 2087 | 1559 | 1961 | 1543 | 2009 | 1718 |
+| `find_repo` | 109 | 99 | 109 | 100 | 108 | 98 | 108 | 103 |
+| `git_status` | 88 | 79 | 98 | 94 | 88 | 84 | 98 | 83 |
+
+`ls -f` of 50 000 names is 10x faster; `ls -l` of 50 000 names is 16-24 % faster (the stat storm is unchanged,
+the quadratic listing under it is gone); the 5 000-name `ls -l`, `find` and `git status` are within the runs'
+spread (min-max of the 6 mounts overlap, e.g. tmpfs cold `ls -l` 5k A 163-184 ms against B 150-192 ms) or
+faster, on every file system. Nothing regressed on ext4, xfs, btrfs or tmpfs.
+
+No write path changed (`git diff --stat` touches no file of `crates/meta`, no key, no put). The first
+`daemon --upgrade` and the handoff are unchanged by P3.

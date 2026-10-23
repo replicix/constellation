@@ -50,6 +50,7 @@ fn env_with_budget(chunk: u32, staging_budget: u64) -> Env {
         .unwrap();
     let fs = View::new(
         FsDependencies {
+            listing: crate::view::Listing::for_test(),
             meta: meta.clone(),
             store: store.clone(),
             cache: cache.clone(),

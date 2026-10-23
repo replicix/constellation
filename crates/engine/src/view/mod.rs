@@ -99,6 +99,7 @@
 
 mod admission;
 mod confine;
+mod cookie;
 mod copy;
 mod create;
 mod durable;
@@ -108,6 +109,7 @@ mod frozen_manifests;
 mod handoff;
 mod io;
 mod kernel_cache;
+mod listing;
 mod lock_gate;
 mod lock_handles;
 pub mod ops;
@@ -125,7 +127,9 @@ pub(crate) fn jitter() -> f64 {
 }
 
 pub use confine::LINK_DOMAIN_XATTR;
+pub use cookie::{CookieBits, CookieKey, COOKIE_BITS_ENV};
 pub use handoff::{HandleTableSnapshot, ViewHandoff};
+pub use listing::{hint_bytes_from, Listing, ListingStats, DEFAULT_HINT_BYTES, HINT_BYTES_ENV};
 pub use passthrough::PassthroughStatus;
 pub use spec::{metric_view_label, ViewQos, ViewSpec, METRIC_LABELS};
 
@@ -139,6 +143,10 @@ mod durable_ack_tests;
 mod fsync_drain_tests;
 #[cfg(test)]
 mod kernel_cache_tests;
+#[cfg(test)]
+mod listing_perf;
+#[cfg(test)]
+mod listing_tests;
 #[cfg(test)]
 mod lookup_wait_tests;
 #[cfg(test)]
@@ -331,6 +339,10 @@ pub struct FsDependencies {
     /// The kernel invalidation thread's registry of FUSE requests in
     /// flight (`kernel_inval`); `InFlight::disabled()` without one.
     pub inflight: crate::kernel_inval::InFlight,
+    /// The node's directory listing state: the cookie key of the
+    /// filesystem and the hint cache, shared by every view
+    /// ([`listing`]'s module doc).
+    pub listing: Arc<Listing>,
     /// The node's open-orphan hold writer (`crate::holds`), whose view
     /// registry says whether *any* view has an inode open: `unlink`'s
     /// fast reap asks it before reaping. `None` in unit tests.
@@ -420,6 +432,8 @@ pub struct View {
     staging_gen: GenCounter,
     snapshots: Arc<crate::snapshot::SnapshotManager>,
     synthetic: Mutex<SyntheticRegistry>,
+    /// The node's cookie key and listing hints.
+    listing: Arc<Listing>,
     tree_cache: Mutex<(
         HashMap<crate::snapshot::FrozenObject, crate::snapshot::FrozenDir>,
         VecDeque<crate::snapshot::FrozenObject>,
@@ -561,6 +575,7 @@ impl View {
             prune_stats: deps.prune_stats,
             snapsched_stats: deps.snapsched_stats,
             inflight: deps.inflight,
+            listing: deps.listing,
             holds: deps.holds,
             watch: deps.watch,
             policies: PolicyStack::for_caps(&deps.caps),

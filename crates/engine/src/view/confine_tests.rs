@@ -257,6 +257,7 @@ fn view_with_snapshots(
         .unwrap();
     let view = View::new(
         FsDependencies {
+            listing: crate::view::Listing::for_test(),
             meta: meta.clone(),
             store,
             cache,

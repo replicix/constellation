@@ -71,6 +71,7 @@ fn view_on(
         .unwrap();
     let fs = View::new(
         FsDependencies {
+            listing: crate::view::Listing::for_test(),
             meta: s.meta.clone(),
             store: s.store.clone(),
             cache: s.cache.clone(),

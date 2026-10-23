@@ -1,8 +1,10 @@
 //! Plus entries (plan 40 §4.5): what a `readdir` with `plus` hands out
 //! with a name is what `lookup(dir, name)` answers at that moment, waited
 //! for as `getattr` of the child waits — or the name alone, when the view
-//! cannot vouch for it. The page loop (`ops::readdir`) asks, per batch of
-//! up to [`BATCH`] names, for one session wait ([`PlusPage::wait`]) and
+//! cannot vouch for it. The page loop (`listing::list_page`) asks, per batch of
+//! up to [`BATCH`](super::listing::BATCH) names it reads (one replica
+//! read, and more than a plus page holds: 32 KiB over ~176 bytes a record,
+//! so a page is one batch), for one session wait ([`PlusPage::wait`]) and
 //! then, per name it adds, for its entry ([`PlusPage::entry`]):
 //!
 //! 1. **Zero TTL** (`--cto strict` on a node that is not a lone
@@ -48,11 +50,6 @@ use super::*;
 use constellation_vfs::Entry;
 use std::collections::HashSet;
 use std::time::Duration;
-
-/// How many names are waited for at once (plan 40 §4.5 step 2): more than
-/// a plus page holds (32 KiB over ~176 bytes a record), so a page is
-/// one batch, and a larger buffer takes another.
-pub(super) const BATCH: usize = 256;
 
 /// What the tests of this module run the module's rules against: each is
 /// one naive implementation of a step (a test that passes on one tests

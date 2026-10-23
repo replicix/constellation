@@ -43,6 +43,8 @@ tokio.workspace = true
 futures.workspace = true
 bytes.workspace = true
 blake3.workspace = true
+# `view::cookie`: the keyed hash a directory listing's cookie is (plan 40).
+siphasher.workspace = true
 tracing.workspace = true
 # `log_buffer`'s `MakeWriter` and the summary line's timestamp (plan 44); the
 # workspace already builds it for `cli`.

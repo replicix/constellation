@@ -277,6 +277,8 @@ pub struct Engine {
     /// across views. Volatile — the incarnation bump keeps that safe.
     next_rid_seq: Arc<AtomicU64>,
     fsmeta: FsMeta,
+    /// The cookie key and the listing hint cache every view shares.
+    listing: Arc<crate::view::Listing>,
     backend_url: String,
     state_dir: PathBuf,
     meta: Arc<Meta>,
@@ -546,6 +548,22 @@ impl Engine {
         if let Some(pin) = &pin {
             pin.confirm(e2e_keys.as_deref())?;
         }
+        // Directory cookies are keyed by the filesystem's own secret
+        // (plan 40 §4.9): a non-E2E filesystem without a `gossip_secret`
+        // has none and is not served. Both knobs are read once here: a
+        // cookie width other than 62 or 31 fails the start (a 32-bit fleet
+        // must not get 62-bit cookies by a typo); an unparseable hint cache
+        // size warns and keeps the default.
+        let listing = crate::view::Listing::new(
+            crate::view::CookieKey::derive(
+                e2e_keys.as_ref(),
+                &fsmeta,
+                crate::view::CookieBits::from_env()?,
+            )?,
+            crate::view::hint_bytes_from(
+                std::env::var(crate::view::HINT_BYTES_ENV).ok().as_deref(),
+            ),
+        );
         let store = Arc::new(match &e2e_keys {
             Some(keys) => ChunkStore::new_e2e(backend.clone(), keys.clone()),
             None => ChunkStore::new(backend.clone()),
@@ -1740,6 +1758,7 @@ impl Engine {
             incarnation,
             next_rid_seq: Arc::new(AtomicU64::new(0)),
             fsmeta,
+            listing,
             backend_url,
             state_dir,
             meta,
@@ -1918,6 +1937,7 @@ impl Engine {
                     .kernel_inval
                     .as_ref()
                     .map_or_else(kernel_inval::InFlight::disabled, |k| k.inflight()),
+                listing: self.listing.clone(),
                 meta: self.meta.clone(),
                 store: self.store.clone(),
                 cache: self.cache.clone(),

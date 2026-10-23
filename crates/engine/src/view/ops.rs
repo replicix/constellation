@@ -1916,64 +1916,15 @@ impl Vfs for View {
         if cookie == 0 {
             self.strict_read(ino, true, None, &[ReadKey::Dir(ino)]);
         }
-        let scratch = self.meta.is_scratch_dir(ino).unwrap_or(false)
-            || self.meta.scratch_getattr(ino).ok().flatten().is_some();
-        let entries = match if scratch {
-            self.meta.scratch_readdir(ino)
-        } else {
-            self.meta.readdir(ino)
-        } {
-            Ok(e) => e,
-            Err(e) => return r.done(self.ino_err(ino, e.code())),
-        };
-        // Cookies: "." answers 1, ".." 2, and each child its name's
-        // `dir_cookie` — so a listing resumes after the *name* it stopped
-        // at, not at a position that an unlink or a create in between
-        // (here, or replayed from another node) shifts: a positional
-        // cookie repeated or skipped entries that were there throughout.
-        // Children are listed in cookie order.
-        let mut children: Vec<(u64, &constellation_meta::DirEntry)> = entries
-            .iter()
-            .map(|entry| (dir_cookie(entry.name.as_bytes()), entry))
-            .collect();
-        children.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.cmp(&b.1.name)));
-        if cookie == 0 && r.add(visible_ino, 1, FileKind::Dir, b".") {
-            return r.done(Ok(()));
+        // Name-ordered range scan resumed from the cookie's name: O(page)
+        // (plan 40 §4.9, `listing`).
+        match self.list_page(ino, visible_ino, cookie, plus, &mut r) {
+            Ok(()) => r.done(Ok(())),
+            Err(listing::PageError::Meta(code)) => r.done(self.ino_err(ino, code)),
+            // Not through `ino_err`: the directory is there, the position
+            // is not.
+            Err(listing::PageError::LostCookie) => r.done(Err(VfsError::new(Code::NotFound))),
         }
-        if cookie <= 1 && r.add(visible_ino, 2, FileKind::Dir, b"..") {
-            return r.done(Ok(()));
-        }
-        let from = children.partition_point(|(c, _)| *c <= cookie);
-        // Plan 40 §4.5: a plus entry is what a lookup of the name answers,
-        // waited for as `getattr` of the child waits, one wait per batch.
-        let mut page = plus.then(|| self.plus_page(ino, scratch));
-        'page: for batch in children[from..].chunks(plus::BATCH) {
-            if let Some(page) = &page {
-                page.wait(
-                    batch
-                        .iter()
-                        .map(|(_, child)| (child.ino, child.name.as_str())),
-                );
-            }
-            for (next, child) in batch {
-                let name = constellation_vfs::name::wire_bytes(&child.name);
-                let kind = kind_out(child.kind);
-                let full = match page.as_mut() {
-                    Some(page) => {
-                        let entry = page.entry(child.ino, child.name.as_bytes());
-                        r.add_entry(child.ino, *next, kind, &name, entry.as_ref())
-                    }
-                    None => r.add(child.ino, *next, kind, &name),
-                };
-                if full {
-                    break 'page;
-                }
-            }
-        }
-        if let Some(page) = page {
-            page.finish();
-        }
-        r.done(Ok(()));
     }
 
     fn statfs<R: Responder<StatFs>>(&self, cx: &OpCtx<'_>, ino: Ino, mut r: R) {
@@ -2749,18 +2700,6 @@ impl Vfs for View {
         }
         r.done(self.sync_barrier(self.view_root).map_err(VfsError::from));
     }
-}
-
-/// A child's `readdir` cookie: a 64-bit FNV-1a of its name, kept clear of
-/// the `.`/`..` cookies (1, 2) and below `i64::MAX` (fuser's offsets are
-/// signed). Two names of one directory sharing a cookie (odds ~n²/2⁶³)
-/// are both listed in one page but a listing that stops between them
-/// resumes after both.
-pub(super) fn dir_cookie(name: &[u8]) -> u64 {
-    let hash = name.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
-        (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
-    });
-    (hash >> 2) + 3
 }
 
 impl View {

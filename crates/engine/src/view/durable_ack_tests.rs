@@ -59,6 +59,7 @@ pub(super) fn holder_fs(
     let handle = rt.handle().clone();
     let fs = View::new(
         FsDependencies {
+            listing: crate::view::Listing::for_test(),
             meta,
             store,
             cache,

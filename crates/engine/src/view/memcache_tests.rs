@@ -59,6 +59,7 @@ fn env_verify(e2e: bool, verify: CacheVerify) -> Env {
         .unwrap();
     let fs = View::new(
         FsDependencies {
+            listing: crate::view::Listing::for_test(),
             meta: meta.clone(),
             store: store.clone(),
             cache: cache.clone(),
