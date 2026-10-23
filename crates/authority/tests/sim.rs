@@ -11333,6 +11333,26 @@ fn regression_locks_unlinked_delegated_hcrash_backup_seed_41() {
     });
 }
 
+/// `locks-unlinked-delegated-blips` seed 230 (failing from plan 41 L2 on,
+/// which only moved its timing): an epoch's flush released the lease of
+/// the root that had just recalled `d1` from its delegate, node 2, before
+/// the recall's end reached the delegation table. Nobody took the
+/// released lease for 55 s: node 2 sent `d1`'s lock requests to that
+/// root, which sent them back (`NotOwner { 0 }`), and the third node went
+/// round the two; each followed its table's route whatever the lease said,
+/// and only a mutation took the lease in the end. Now a dead end on the
+/// table's route reads the lease next (`Core::lock_delegated_dead_end`)
+/// and takes a free one for the lock.
+#[test]
+fn regression_locks_unlinked_delegated_blips_seed_230() {
+    run_seed(230, locks_unlinked_blips_config()).unwrap_or_else(|e| {
+        panic!(
+            "locks-unlinked-delegated-blips seed 230: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=locks-unlinked-delegated-blips"
+        )
+    });
+}
+
 /// `locks-unlinked-delegated-dbackup-random` seeds 2477 and 2982
 /// (overload-cascade-2 round 3, should-fix 2): node 2, a delegate and
 /// the root's backup, took the root over while it held rows of its

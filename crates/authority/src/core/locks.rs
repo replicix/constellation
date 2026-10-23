@@ -132,6 +132,10 @@ struct LockOp {
     /// The lease was re-read once because the cached holder could not be
     /// reached (see `lock_route_op`).
     reread: bool,
+    /// The node the delegation table routed this request to answered
+    /// `NotOwner` with nowhere new to go (`Core::lock_delegated_dead_end`):
+    /// the next attempt reads the lease instead, once.
+    ask_lease: bool,
 }
 
 /// Why `lock_try_grant` did not grant.
@@ -980,6 +984,42 @@ impl Core {
         } else if self.lk.deleg_moved.get(&d.gen) == Some(&from) {
             self.lk.deleg_moved.remove(&d.gen);
         }
+    }
+
+    /// `from`, asked for `ino` by the route this node's delegation table
+    /// gives (the subtree's delegate, the root a recall redirected it to,
+    /// or, at the delegate, the root it handed the generation back to),
+    /// answered `NotOwner` with nowhere new to go: it names nobody, or
+    /// this node, or it is the redirect's root and names the delegate
+    /// again. That route is followed whatever the cached holder says, so
+    /// clearing the cache (650acc8's "`NotOwner { 0 }` sends it to the
+    /// lease") reached no lease read: the next attempt reads the lease
+    /// instead (`LockOp::ask_lease`), and takes it if nobody holds it.
+    ///
+    /// Without it nobody took a free lease while only lock waiters needed
+    /// it (`locks-unlinked-delegated-blips` seed 230: an epoch's flush
+    /// released the lease of the root that had just recalled `d1`, before
+    /// the recall's end reached the table; its delegate sent the subtree's
+    /// requests to that root, which sent them back, and the third node
+    /// went round the two; 55 s, until a mutation took the lease).
+    fn lock_delegated_dead_end(
+        &self,
+        from: NodeId,
+        ino: Ino,
+        owner: NodeId,
+        replica: &dyn Replica,
+    ) -> bool {
+        if from == self.cfg.node_id || !self.cfg.delegation || replica.delegation_table().is_empty()
+        {
+            return false;
+        }
+        let keys = Self::read_keys(ino, None);
+        let constellation_meta::delegation::Ownership::Delegated(d) =
+            replica.resolve_ownership(&keys)
+        else {
+            return false;
+        };
+        owner == 0 || owner == self.cfg.node_id || self.lk.deleg_moved.get(&d.gen) == Some(&from)
     }
 
     /// The root lease is this node's again in a moment, with the grant
@@ -3763,6 +3803,7 @@ impl Core {
                 since,
                 local_wait: false,
                 reread: false,
+                ask_lease: false,
             },
         );
         self.lock_route_op(now, op, replica, out);
@@ -3819,7 +3860,15 @@ impl Core {
                 return;
             }
         }
-        match self.lock_route(now, ino, replica) {
+        let mut route = self.lock_route(now, ino, replica);
+        // The table's route led to a dead end last time: ask the lease, as
+        // for an unknown owner (`lock_delegated_dead_end`).
+        if let (Route::Node(_), Some(o)) = (&route, self.lk.ops.get_mut(&op)) {
+            if std::mem::take(&mut o.ask_lease) {
+                route = Route::Unknown;
+            }
+        }
+        match route {
             Route::Me { .. } => {
                 let me = self.cfg.node_id;
                 if let Some(o) = self.lk.ops.get_mut(&op) {
@@ -4747,6 +4796,11 @@ impl Core {
             }
             LockOutcome::NotOwner { owner } => {
                 let ino = o.ino;
+                if self.lock_delegated_dead_end(from, ino, owner, replica) {
+                    if let Some(o) = self.lk.ops.get_mut(&op) {
+                        o.ask_lease = true;
+                    }
+                }
                 self.lock_note_not_owner(from, ino, owner, replica);
                 if owner != 0 && owner != from && owner != self.cfg.node_id {
                     let names_delegate = replica.delegation_table().iter().any(|e| e.node == owner);

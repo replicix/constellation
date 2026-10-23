@@ -31134,6 +31134,187 @@ mod redelegated_to_the_requester {
     }
 }
 
+/// `locks-unlinked-delegated-blips` seed 230: a lock request routed by
+/// this node's delegation table, answered `NotOwner` with nowhere new to
+/// go, reads the lease on its next attempt and takes a released one
+/// (`Core::lock_delegated_dead_end`). Before, it asked the table's route
+/// again and again, and a free lease stayed free for 55 s while only lock
+/// waiters needed it.
+mod delegated_lock_dead_end {
+    use super::*;
+    use crate::event::{Control, LockOutcome};
+    use constellation_fs_core::Ino;
+    use constellation_meta::locks::LockMode;
+
+    /// Node 1, holding no lease, whose table delegates `/d` to node 2 as
+    /// generation 7: a blocking request for `/d/f` is sent to node 2 (its
+    /// `req` returned).
+    fn setup() -> (Harness, OpId) {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.step(Event::Peers {
+            links: (1..=3)
+                .map(|node| crate::event::PeerLink {
+                    node,
+                    connected: true,
+                    last_seen: None,
+                    rtt_ms: Some(1),
+                    since: None,
+                })
+                .collect(),
+        });
+        let dir: Ino = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let f: Ino = h.meta.allocate_ino(dir).unwrap();
+        crate::replica::Replica::apply_segment(
+            &h.meta,
+            1,
+            1,
+            0,
+            &[],
+            &[],
+            &[
+                LogRecord::Mkdir {
+                    parent: ROOT_INO,
+                    name: "d".into(),
+                    ino: dir,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 1,
+                },
+                LogRecord::Create {
+                    parent: dir,
+                    name: "f".into(),
+                    ino: f,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 2,
+                },
+                LogRecord::Delegate {
+                    dir,
+                    node: 2,
+                    gen: 7,
+                    designated: false,
+                    range: (0, 0),
+                },
+            ],
+        )
+        .unwrap();
+        let out = h.step(Event::Control {
+            op: OpId(50),
+            req: Control::Lock {
+                ino: f,
+                mode: LockMode::Exclusive,
+                blocking: true,
+                waited_ms: 0,
+            },
+        });
+        let req = match sends(&out).as_slice() {
+            [(2, PeerMsg::LockRequest { req, .. })] => *req,
+            other => panic!("expected a LockRequest to the delegate: {other:?}"),
+        };
+        (h, req)
+    }
+
+    /// `from` answers the request `NotOwner { owner }`; the retry that
+    /// follows fires.
+    fn refused_then_retried(
+        h: &mut Harness,
+        from: NodeId,
+        req: OpId,
+        owner: NodeId,
+    ) -> Vec<Action> {
+        h.advance(5);
+        let out = h.step(Event::Peer {
+            from,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: LockOutcome::NotOwner { owner },
+            },
+        });
+        let t = timers(&out, TimerKind::LockRetry)[0];
+        h.now = h.core.timer_ms(t).expect("armed");
+        h.step(Event::Timer { id: t })
+    }
+
+    fn lease_read(out: &[Action]) -> Option<OpId> {
+        s3_ops(out)
+            .into_iter()
+            .find_map(|(op, r)| matches!(r, S3Op::LeaseGet).then_some(op))
+    }
+
+    fn request_to(out: &[Action]) -> Option<(NodeId, OpId)> {
+        sends(out).into_iter().find_map(|(to, m)| match m {
+            PeerMsg::LockRequest { req, .. } => Some((to, *req)),
+            _ => None,
+        })
+    }
+
+    /// The released lease of node 3, which recalled `/d` and let the
+    /// lease go before the recall's end reached the table.
+    fn released_by_3(h: &Harness) -> Lease {
+        let mut lease = lease_of(3, 2, h.now.0 + 60_000);
+        lease.ttl_ms = 6_000;
+        lease.released = true;
+        lease
+    }
+
+    #[test]
+    fn a_not_owner_naming_nobody_from_the_delegate_reads_the_lease_and_takes_a_released_one() {
+        let (mut h, req) = setup();
+        let out = refused_then_retried(&mut h, 2, req, 0);
+        let read = lease_read(&out)
+            .unwrap_or_else(|| panic!("the delegate was asked again, not the lease: {out:?}"));
+        assert!(request_to(&out).is_none(), "{out:?}");
+        assert!(!h.core.acquiring());
+        let lease = released_by_3(&h);
+        h.step(Event::S3 {
+            op: read,
+            result: S3Result::LeaseGet(Ok(Some((lease, tag())))),
+        });
+        assert!(h.core.acquiring(), "nobody takes the released lease");
+    }
+
+    /// The third node's loop: the delegate redirects to the root its recall
+    /// handed the subtree back to, and that node (not the root any more)
+    /// names the delegate again. The redirect is dropped as before, and the
+    /// next attempt reads the lease rather than ask the delegate again.
+    #[test]
+    fn a_redirects_root_naming_the_delegate_again_sends_the_next_attempt_to_the_lease() {
+        let (mut h, req) = setup();
+        let out = refused_then_retried(&mut h, 2, req, 3);
+        // A redirect is followed (not a dead end).
+        assert!(lease_read(&out).is_none(), "{out:?}");
+        let (to, req) = request_to(&out).expect("the redirect was not followed");
+        assert_eq!(to, 3);
+        let out = refused_then_retried(&mut h, 3, req, 2);
+        assert!(
+            lease_read(&out).is_some(),
+            "the delegate was asked again, not the lease: {out:?}"
+        );
+        assert!(request_to(&out).is_none(), "{out:?}");
+    }
+
+    /// A lease read naming a live holder sends the request on by the table
+    /// again: the flag is spent on one read.
+    #[test]
+    fn a_live_holder_in_the_lease_routes_by_the_table_again() {
+        let (mut h, req) = setup();
+        let out = refused_then_retried(&mut h, 2, req, 0);
+        let read = lease_read(&out).expect("no lease read");
+        let mut lease = lease_of(3, 2, h.now.0 + 60_000);
+        lease.ttl_ms = 6_000;
+        let out = h.step(Event::S3 {
+            op: read,
+            result: S3Result::LeaseGet(Ok(Some((lease, tag())))),
+        });
+        assert!(!h.core.acquiring(), "{out:?}");
+        assert_eq!(request_to(&out).map(|(to, _)| to), Some(2), "{out:?}");
+    }
+}
+
 /// delegate-stream-acks: a late renewal answer for a generation this
 /// node no longer has (ended under the old root) counts for nothing:
 /// its lock cut, from the old root, never replaces the current root's

@@ -58511,3 +58511,52 @@ from both callers (117 again). `replying` keeps its own body with `mark`,
 `index` and the post-mark check inlined (`#[inline(always)]`): 113 against
 112 (ranges 112-116 against 111-117), four threads 372 against 373, eight
 1 064 against 1 109, the same rotation with the commit before it at 116.
+
+## `locks-unlinked-delegated-blips` seed 230: a free lease nobody took (2026-10-23)
+
+The plan 41 review left this seed open (a lock not granted for 60 s, from
+L2 on). The lane only moves the timing; the gap is older.
+
+### Mechanism
+
+- **The releases are the epoch flush's.** Both takeovers after the third
+  outage happened while the driver still reported the closed epoch as
+  flushing, and `round_release` lets the lease go once the backlog is
+  shipped (by design). The second was node 3's, which had just inherited
+  `d1`'s generation from the released lease and recalled it from node 2.
+  The recall's end never reached the table: node 2 kept the generation
+  handed back to node 3 (`handed_back`), node 3's table kept it delegated
+  to node 2.
+- **Nobody asked for the released lease.** Only lock waiters needed it, and
+  a lock request for a delegated inode follows the table's route whatever
+  the lease says: node 2 asked node 3 (the handed-back root), node 3 asked
+  node 2 (the delegate), each answered the other `NotOwner { 0 }`, and node
+  1 went round the two (`NotOwner { 3 }`, then `NotOwner { 2 }`). 650acc8's
+  rule ("`NotOwner { 0 }` sends it to the lease") clears the cached holder,
+  which a delegated route never reads, so no lease read and no `lock`
+  acquisition happened for 55 s, until a mutation took the lease.
+- **Not the claim compare.** A released lease is claimable at once on main
+  (`classify`, `claimable_observed`; C7b's observation rule waits only for
+  a live body): no claim was tried at all. C7a's lock-waiter fixes (a
+  restarted root re-adopting its lease) cover a lease naming the root, not
+  a released one.
+
+### Fix
+
+`Core::lock_delegated_dead_end`: a lock request routed by the delegation
+table and answered `NotOwner` with nowhere new to go (it names nobody, or
+this node, or the redirect's root names the delegate again) reads the lease
+on its next attempt, once (`LockOp::ask_lease`), through the shared holder
+read; a free lease is taken (`lock`), a live holder sends the request on by
+the table as before.
+
+### Evidence
+
+- Core (fail before): `delegated_lock_dead_end::*` (3 tests).
+- Sim (fails before): `regression_locks_unlinked_delegated_blips_seed_230`.
+- Gates: fmt, clippy `-D warnings`, authority lib 648, sim suite 256.
+- Sweeps (release, 500 seeds, the 57 `locks-*delegated*`, `locks-*blips*`
+  and `delegated-*` configurations): failing sets as main apart from 230
+  (both: `locks-delegated-partition-skew` 97, 178, 179, 452,
+  `locks-writer-hold-delegated-unsettled` 15, the two `-unlaned` negative
+  controls).
