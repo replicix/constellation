@@ -13501,7 +13501,7 @@ mod locks {
             until_ms: h.now.0 + 10_000,
             recalled: false,
             gen: 7,
-            confirmed_ms: constellation_meta::locks::Grant::UNCONFIRMED,
+            confirmed: constellation_meta::locks::Grant::UNCONFIRMED,
             settled: false,
             lapsed: false,
         };
