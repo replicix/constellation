@@ -1754,6 +1754,17 @@ The socket is served by a thread of its own, apart from the engine's shared
 runtime, so the control plane answers while that runtime is saturated or
 blocked.
 
+Logging never blocks a daemon thread. Every line goes into the in-memory
+ring that `log tail` reads and into a sink queue bounded in bytes, which
+one writer thread drains to the daemon's stderr (its `daemon.log`, a
+container's pipe). A line that does not fit is dropped, counted
+(`status`, `/metrics`) and marked in the log once the queue drains; the
+ring keeps it. The queue is flushed, bounded, at exit and before an abort,
+and a handover's `exec` hands what is left to the new image. A stalled log
+disk therefore costs log lines, never a stalled core, FUSE worker or
+heartbeat
+([ADR-32](DECISIONS.md#adr-32-logging-never-blocks-a-daemon-thread)).
+
 CLI highlights: `fs create|set|passwd|list`, `mount [SOURCE[@snap]]
 MOUNTPOINT`, `umount`, `export`, `status` (includes `node_id` /
 `enrolled` and the spool), `doctor`, `pin|unpin|pins`,
