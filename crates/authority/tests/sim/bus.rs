@@ -44,6 +44,14 @@ pub struct BeatStamps {
     pub echo: i64,
 }
 
+thread_local! {
+    /// The buses alive on this thread (a run's bus lives and dies on the
+    /// thread that runs it: `run_seed`'s current-thread runtime). A run
+    /// whose bus outlives it leaks every node's `Meta` with it (its store's
+    /// threads and directory): `a_run_leaves_no_bus_behind`.
+    pub static LIVE_BUSES: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
 pub struct Bus {
     rng: Mutex<StdRng>,
     /// The holder's wait stamp of each beat in flight, for the answer.
@@ -101,8 +109,15 @@ pub struct StreamFaults {
     pub drop_segment_frames: Vec<u64>,
 }
 
+impl Drop for Bus {
+    fn drop(&mut self) {
+        LIVE_BUSES.with(|n| n.set(n.get() - 1));
+    }
+}
+
 impl Bus {
     pub fn new(seed: u64, delay: (u64, u64), drop_p: f64) -> Arc<Self> {
+        LIVE_BUSES.with(|n| n.set(n.get() + 1));
         Arc::new(Self {
             rng: Mutex::new(StdRng::seed_from_u64(seed ^ 0xb05_b05)),
             beat_echo: Mutex::new(BTreeMap::new()),

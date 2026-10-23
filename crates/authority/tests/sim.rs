@@ -10946,6 +10946,29 @@ fn locks_survive_stalled_steps() {
     }
 }
 
+/// A run leaves nothing behind: its bus, and with it every node's `Meta`
+/// (the store's worker threads and its directory), is gone when the run
+/// returns. Fail-before (plan 41 review): the bus tap of plan 41 R2/L2 held
+/// the bus it is stored in, so every seed leaked its nodes' stores; the
+/// full suite ran out of threads (`EAGAIN` from the store's open, 198
+/// tests failing on a 16-CPU box) and of tmpfs inodes.
+#[test]
+fn a_run_leaves_no_bus_behind() {
+    let live = || sim::bus::LIVE_BUSES.with(|n| n.get());
+    let before = live();
+    for (label, cfg, seed) in [
+        ("locks-core-stall", locks_core_stall_config(), 231_500),
+        (
+            "delegated-core-stall-root",
+            delegated_core_stall_root_config(),
+            1,
+        ),
+    ] {
+        run_seed(seed, cfg).unwrap_or_else(|e| panic!("{label} seed {seed}: {e}"));
+        assert_eq!(live(), before, "{label} seed {seed}: the run's bus outlived it");
+    }
+}
+
 /// Plan 41 L2: a stuck authority core's node keeps its locks: its lane
 /// renews meanwhile, so a stall below the lease's usable end fences a
 /// fraction of what it fences without the lane. What is left is not the

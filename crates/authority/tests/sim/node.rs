@@ -531,7 +531,9 @@ impl NodeHandle {
         {
             let shared = shared.clone();
             let windows = windows.clone();
-            let bus = env.bus.clone();
+            // Weak: the bus stores this tap, and a tap that held its bus
+            // kept both (and every node's `Meta`) alive past the run.
+            let bus = Arc::downgrade(&env.bus);
             let clock = clock.clone();
             let meta = meta.clone();
             let lane_cell = lane_cell.clone();
@@ -540,6 +542,9 @@ impl NodeHandle {
             env.bus.set_tap(
                 id,
                 Arc::new(move |from: NodeId, msg: &PeerMsg| {
+                    let Some(bus) = bus.upgrade() else {
+                        return;
+                    };
                     match msg {
                         PeerMsg::DelegRenewed {
                             gen, round, ttl_ms, ..
