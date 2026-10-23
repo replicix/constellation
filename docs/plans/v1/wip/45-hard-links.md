@@ -544,6 +544,27 @@ purpose", "Gates"), with these rows:
   `regression_a_root_appending_over_its_own_shadow_keeps_the_log_prefix`
   (the new `+stalebase` variant, seven seeds that failed before). The
   exchange's skip by state stays as replay's tolerance.
+
+  **The stream's side of the same class (review of O1, 2026-10-23;
+  `delegated-backup+links+stalebase` seed 138).** `install_streamed` adopted a
+  live shadow of the transaction's rid as the transaction's effect without
+  checking that the shadow's records were the transaction's. A replay of a
+  stranded op answered by the holder's dedup (`Accepted` with no records: the
+  rid was done there, at a position the replica lacks; the reply's `base` is
+  `None`, so this is not the knob's doing, only rarer without it) installed a
+  shadow that applied nothing; adopted in place, the stream's create was never
+  applied, the rename streamed after it found no entry, and the segment skipped
+  both as confirmed rows. Now a shadow whose effect records are not the
+  transaction's is rolled back from its seq and the transaction's records are
+  applied in its place, still as this node's own op (`same_effect`,
+  `insert_streamed_tx` redoes the adopted row from the transaction's records).
+  Test: `a_streamed_transaction_does_not_adopt_a_shadow_that_lacks_its_effect`.
+  The O1 unwind itself never trusted the shadow's effect (it restores the
+  before-images and applies the records). Still open in the same class: the
+  `[Refused { rid }]` branch of `apply_delegate_tx` journals a delegate's
+  refusal without stranding a live shadow of that rid, whose effect
+  `ack_rows_tx` then retires in place (the segment path strands it); reached
+  only through `repair drop-held` on a delegate.
 - **O2: the `+links` sim links and exchanges within one directory only**
   (`with_links`' `dir_of` filter). The overlap rules are by inode and so
   directory-blind, but no sweep exercises a cross-directory link, rename or

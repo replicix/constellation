@@ -57091,6 +57091,40 @@ the five `view::owner_fence_tests` failing in the full run as on `main` (54/54 a
   warnings`), meta 470, mtree 74, authority lib 594, `meta_repro` 4, engine
   lib 859, sim 247, all passing.
 
+### O1's twin on the stream: a streamed transaction does not adopt a shadow that lacks its effect (2026-10-23)
+
+- **Found by** the review of O1, tracing `delegated-backup+links+stalebase`
+  seed 138, which failed on both sides of O1 ("node 1 did not converge").
+- **Cause.** `Meta::install_streamed` adopts a live shadow of the
+  transaction's rid as the transaction's effect ("in place already") and
+  `insert_streamed_tx` redoes an adopted row from the *shadow's* records.
+  Neither checked that those records were the transaction's. A deposed root's
+  replay of a stranded rid, answered by the new root's dedup (`Accepted` with
+  no records; `base = None`, so the reply-base check passes regardless of
+  `speculate_on_stale_base`), installed a shadow that applied nothing; the
+  stream's copy of the transaction adopted it, its create was never applied,
+  the rename streamed after it was skipped ("entry missing"), and the
+  segment skipped both rows as confirmed. Same class as O1 (identity by rid,
+  effect assumed), a different path.
+- **Fix** (`crates/meta/src/store/spec.rs`). `same_effect` compares the
+  shadow's records with the transaction's, outcome rows and `Atime` aside.
+  When they differ, `install_streamed` forces the rewind from the shadow's
+  seq, and the adopt arm of `insert_streamed_tx` sets the row's records to
+  the transaction's before the redo; the entry stays this node's own op
+  (`own: Some`), so a takeover still replays it by rid.
+- **Tests.** Meta
+  `a_streamed_transaction_does_not_adopt_a_shadow_that_lacks_its_effect`
+  (fails on `e5868fef`: the create is not applied). Sim: seed 138 of
+  `delegated-backup+links+stalebase` passes (failed on the parent). Sweeps
+  (devbox 2, 300 seeds each, with the fix): see the review's results.
+- **Gates (devbox 2):** meta 471 (all suites), clippy
+  (`-p constellation-meta --all-targets -D warnings`), sim
+  `regression_a_root_appending_over_its_own_shadow_keeps_the_log_prefix`.
+- **Still open in the class** (described in the review, not fixed): the
+  `[Refused { rid }]` branch of `apply_delegate_tx` does not strand a live
+  shadow of that rid before journaling the refusal; reached only through
+  `repair drop-held` on a delegate.
+
 ## Plan 43 C7b, commit 1/N: the offset configurations and the lease-claim oracle (sim evidence, 2026-10-22)
 
 Behaviour-neutral. The cross-node compares of plan 43 Appendix B (a claimant

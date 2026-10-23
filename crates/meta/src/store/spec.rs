@@ -1684,6 +1684,23 @@ fn streamed_out_of_place(
     Ok(None)
 }
 
+/// The records that change the namespace: a transaction's identity as an
+/// effect, without its outcome rows (`Completed`, `Refused`, `InboxAck`)
+/// and `Atime`. A shadow's records are its reply's `applied` list; the
+/// stream's are the holder's journal rows.
+fn same_effect(a: &[LogRecord], b: &[LogRecord]) -> bool {
+    let effect = |rec: &&LogRecord| {
+        !matches!(
+            rec,
+            LogRecord::Completed { .. }
+                | LogRecord::Refused { .. }
+                | LogRecord::InboxAck { .. }
+                | LogRecord::Atime { .. }
+        )
+    };
+    a.iter().filter(effect).eq(b.iter().filter(effect))
+}
+
 /// [`Meta::install_streamed`]'s reordering, inside the caller's
 /// transaction: roll every row from `cutoff` back, then redo in the log's
 /// order — the tailed, streamed and hint rows (their relative order
@@ -1738,6 +1755,10 @@ fn insert_streamed_tx(
                 source: t.source,
                 own: Some((rid, op, tag)),
             };
+            // The transaction's records are what the redo applies: the
+            // shadow's were its reply's, which may carry less (a dedup
+            // reply carries none; see `Meta::install_streamed`).
+            row.records = t.records.to_vec();
             live.insert(
                 seq,
                 LiveEntry::Streamed {
@@ -2901,6 +2922,27 @@ impl Meta {
                 }
             }
         }
+        // Plan 45 §12 O1, the stream's side (`delegated-backup+links+
+        // stalebase` seed 138): a shadow is adopted for the rid it names,
+        // but it is the transaction's effect only if its records are the
+        // transaction's. A replay of a stranded op answered by the
+        // holder's dedup (`Accepted` with no records: the rid was done
+        // there, at a position this replica lacks) installed a shadow that
+        // applied nothing; adopted in place, the stream's create was never
+        // applied here, the rename streamed after it found no entry, and
+        // the segment skipped both as confirmed rows. A shadow whose
+        // records are not the transaction's effect is rolled back and the
+        // transaction's records applied in its place (the rewind below,
+        // from the shadow on), still as this node's own op.
+        let mut shadow_lacks_effect = None;
+        if let Some((seq, ..)) = &adopt {
+            if let Some(v) = tx.get(&self.spec, seq_key(*seq))? {
+                let row: SpecRow = postcard::from_bytes(&v)?;
+                if !same_effect(&row.records, records) {
+                    shadow_lacks_effect = Some(*seq);
+                }
+            }
+        }
         // The stream is contiguous and in the holder's order, so every
         // shadow still outstanding here — a reply the stream has not
         // reached yet — belongs *after* this transaction, and a
@@ -2920,9 +2962,12 @@ impl Meta {
         // other replica ended on node 0's). When that order matters (the
         // keys overlap), roll back to the oldest outstanding shadow and
         // redo in the log's order.
-        if let Some(cutoff) =
-            streamed_out_of_place(&tx, self, adopt.as_ref().map(|a| a.0), records)?
-        {
+        let out_of_place = streamed_out_of_place(&tx, self, adopt.as_ref().map(|a| a.0), records)?;
+        let cutoff = match (out_of_place, shadow_lacks_effect) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        if let Some(cutoff) = cutoff {
             let staged = UsageTracker::staging();
             insert_streamed_tx(
                 &mut tx,

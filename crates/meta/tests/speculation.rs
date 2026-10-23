@@ -2541,3 +2541,41 @@ fn o1_a_root_appending_under_its_own_rows_keeps_the_journal_order() {
         .collect();
     assert_eq!(queued, vec![rid(2)]);
 }
+
+/// Plan 45 §12 O1, the stream's side (`delegated-backup+links+stalebase`
+/// seed 138): a replay of a stranded op answered by the holder's dedup
+/// (`Accepted` with no records: the rid was done there, at a position this
+/// replica lacks) installs a shadow that carries no effect. The holder's
+/// stream then brings the transaction, and `install_streamed` adopted the
+/// shadow by rid as the transaction's effect, which was never applied here;
+/// the segment skipped the confirmed rows, and the replica lacked the file
+/// for good. The shadow is adopted as this node's own op, but the
+/// transaction's records are applied.
+#[test]
+fn a_streamed_transaction_does_not_adopt_a_shadow_that_lacks_its_effect() {
+    let meta = Meta::open_in_memory().unwrap();
+    let x = ino(1);
+    let t0 = constellation_fs_core::types::now_ns() + STAMP_MARGIN_NS;
+    let tx = [create("a", x, t0), completed(rid(1))];
+    // The dedup reply: accepted, nothing to apply.
+    assert!(meta
+        .install_shadow(rid(1), 1, &create_op("a", x), &[])
+        .unwrap());
+    assert!(meta.lookup(ROOT_INO, "a").unwrap().is_none());
+    meta.install_streamed(1, HOLDER, 1, 2, &tx).unwrap();
+    assert_eq!(
+        meta.lookup(ROOT_INO, "a").unwrap().map(|e| e.ino),
+        Some(x),
+        "the streamed transaction's create is applied"
+    );
+    assert_eq!(meta.speculation_counts().unwrap().outstanding, 1);
+    // The segment confirms the rows: the entry stays, nothing is left
+    // outstanding, and a takeover afterwards strands nothing.
+    meta.apply_segment_rows(1, 1, 2, &[1, 2], &[], &tx, &TouchSet::default())
+        .unwrap();
+    assert_eq!(meta.lookup(ROOT_INO, "a").unwrap().map(|e| e.ino), Some(x));
+    assert!(!meta.has_outstanding_speculation());
+    let reference = Meta::open_in_memory().unwrap();
+    apply(&reference, 1, 1, &tx);
+    assert_eq!(raw_ns(&meta), raw_ns(&reference));
+}
