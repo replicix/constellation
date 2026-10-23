@@ -1199,11 +1199,21 @@ impl Core {
             "forward reply"
         );
         match outcome {
-            MutateOutcome::Accepted { epoch, records } if !base_ok => {
+            MutateOutcome::Accepted { epoch, records } if !base_ok || records.is_empty() => {
                 // The holder evaluated the op against state this replica
                 // has not applied: installing the records now would put
                 // them ahead of records they follow. The log delivers
                 // them in order; answer when it has.
+                //
+                // No records: the holder's `completed` dedup answer (an
+                // op it executed before). There is nothing to install,
+                // and a shadow of nothing would stand for the op's
+                // effect: the holder's stream then adopts it in place by
+                // rid and the transaction is never applied here
+                // (`delegated-backup+links+stalebase` seed 138: a
+                // deposed root's replay of a delegate's create was
+                // answered from dedup, and the create was lost on that
+                // replica). Wait for the log, or the stream, instead.
                 if replica.completed_position(rid).ok().flatten().is_some() {
                     // Delivered by the log already; the rest of what the
                     // holder evaluated against normally came with it.

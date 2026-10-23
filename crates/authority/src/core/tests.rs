@@ -2858,6 +2858,83 @@ fn touch_ls_stat_after_forwarded_creates_take_the_fast_path() {
     );
 }
 
+/// `delegated-backup+links+stalebase` seed 138: a holder answers an op it
+/// executed before from its `completed` dedup, `Accepted` with no records.
+/// Installed as a shadow, that empty row stood for the op's effect: the
+/// holder's pre-S3 stream then carried the op's transaction, adopted the
+/// shadow in place by rid (`Meta::install_streamed`), and the create never
+/// reached this replica (the segment retires streamed rows). The requester
+/// installs nothing and waits for the log (or the stream) instead.
+#[test]
+fn a_dedup_answer_without_records_is_not_installed_as_a_shadow() {
+    let mut h = Harness::new(1);
+    h.core.lease.cached_holder = Some(2);
+    let rid = h.rid(1);
+    let op = h.create("a");
+    let MutateOp::Create { ino, .. } = op else {
+        unreachable!()
+    };
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op,
+        tag: Default::default(),
+    });
+    let [(2, PeerMsg::MutateRequest { req, .. })] = sends(&out).as_slice() else {
+        panic!("expected one forward to node 2: {:?}", sends(&out))
+    };
+    let req = *req;
+    let out = h.step(Event::Peer {
+        from: 2,
+        msg: PeerMsg::MutateReply {
+            req,
+            outcome: MutateOutcome::Accepted {
+                epoch: 1,
+                records: Vec::new(),
+            },
+            base: Some(0),
+            position: constellation_meta::Position::ZERO,
+            gen: 0,
+            own_chunks: OwnChunks::None,
+            own_rows: None,
+        },
+    });
+    assert_eq!(h.core.stats.shadows_installed, 0, "a shadow of nothing");
+    assert!(
+        replies(&out).is_empty(),
+        "answered before the effect is here"
+    );
+    assert!(matches!(
+        h.core.clients().find(|(r, _)| *r == rid),
+        Some((_, ClientPhase::AwaitingLog))
+    ));
+    // The holder's stream brings the op's transaction.
+    h.meta
+        .install_streamed(
+            1,
+            2,
+            1,
+            2,
+            &[
+                LogRecord::Create {
+                    parent: ROOT_INO,
+                    name: "a".into(),
+                    ino,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 1,
+                },
+                LogRecord::Completed { rid },
+            ],
+        )
+        .unwrap();
+    assert!(
+        MetaStore::lookup(&h.meta, ROOT_INO, "a").unwrap().is_some(),
+        "the streamed create is applied"
+    );
+}
+
 /// A refusal observes the holder's unshipped state: later reads wait for
 /// it (here they time out at the 20 ms test budget, degraded), except a
 /// key a newer shadow covers — the parent's attributes included — until
@@ -33317,14 +33394,30 @@ fn a_resubmission_in_doubt_merges_into_the_live_replay_of_its_rid() {
         "the live op took the mark"
     );
     // The holder decides it once; its answer settles the replay and
-    // answers the client.
+    // answers the client. (Its records: an answer without them is a
+    // dedup answer, which waits for the log, see
+    // `a_dedup_answer_without_records_is_not_installed_as_a_shadow`.)
+    let MutateOp::Create { ino, .. } = x else {
+        unreachable!()
+    };
     let out = h.step(Event::Peer {
         from: 2,
         msg: PeerMsg::MutateReply {
             req,
             outcome: MutateOutcome::Accepted {
                 epoch: 2,
-                records: Vec::new(),
+                records: vec![
+                    LogRecord::Create {
+                        parent: ROOT_INO,
+                        name: "x".into(),
+                        ino,
+                        mode: 0o644,
+                        uid: 0,
+                        gid: 0,
+                        time_ns: 1,
+                    },
+                    LogRecord::Completed { rid: rx },
+                ],
             },
             base: Some(0),
             position: constellation_meta::Position::ZERO,

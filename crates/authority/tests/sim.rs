@@ -12020,3 +12020,26 @@ fn regression_placement_hot_links_stalebase_seed_1397() {
         )
     });
 }
+
+/// `delegated-backup+links+stalebase` seed 138 (node 1 lost `d1/f1`): the
+/// root, paused, appended a delegate's create in `d2` and executed a
+/// rename of it into `d1`, neither shipped, and was deposed. Its replay
+/// of the create (by rid) was answered from the new holder's `completed`
+/// dedup, `Accepted` with no records, which it installed as a shadow of
+/// nothing; the holder's stream then adopted that shadow by rid as the
+/// create's transaction, so the create never applied there, and the
+/// rename after it found no source. A dedup answer is not installed
+/// (`a_dedup_answer_without_records_is_not_installed_as_a_shadow`).
+#[test]
+fn regression_delegated_backup_links_stalebase_seed_138() {
+    let variants = "links+stalebase";
+    let cfg = variants
+        .split('+')
+        .fold(delegated_backup_config(), config_variant);
+    run_seed(138, cfg).unwrap_or_else(|e| {
+        panic!(
+            "delegated-backup+{variants} seed 138: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=delegated-backup+{variants}"
+        )
+    });
+}
