@@ -1087,3 +1087,109 @@ fn today_a_delegate_without_a_backup_acks_alone() {
         "acked_ops_are_never_replayed",
     );
 }
+
+// ------------------------------------------- plan 41 R: the root lane
+
+/// A root whose core is stuck in a step while its lease runs out and a
+/// successor takes over: the delegate (clock a tick behind) renews, and
+/// the stalled root's lane grants the full ttl past the lease's usable end
+/// (`root_lane_ignores_cap`). The successor treats the inherited grant as
+/// dead (every grant is capped by the lease, so none outlives it), recalls
+/// at once, executes a move into the subtree; the delegate, renewed past
+/// the takeover, still acknowledges under the ended generation.
+fn root_lane_config(ignores_cap: bool, after_close: bool) -> DelegModel {
+    DelegModel {
+        initial_delegations: vec![(1, 1)],
+        initial_present: vec![RA],
+        allow_renew: true,
+        reclaim_expired: true,
+        lease_ttl: 3,
+        deleg_ttl: 2,
+        max_epoch: 2,
+        max_stalls: 1,
+        root_lane_ignores_cap: ignores_cap,
+        root_lane_after_close: after_close,
+        init_offsets: Some(vec![0, 1, 0]),
+        max_offset: 1,
+        max_jumps: 1,
+        max_tick: 4,
+        ..DelegModel::design(
+            P3.to_vec(),
+            vec![vec![], vec![create(D1A)], vec![mv(RA, D1A)]],
+        )
+    }
+}
+
+#[test]
+fn a_root_lane_without_the_cap_renews_past_the_lease_across_a_takeover() {
+    assert_search_finds(
+        "root-lane-ignores-cap",
+        &root_lane_config(true, false),
+        "recall_safety",
+    );
+}
+
+/// The lane extends a slot the core closed: a generation the root already
+/// ended (an unrenewed grant reclaimed) is renewed by the lane while the
+/// root is stuck, and its delegate acknowledges under it.
+fn root_lane_after_end_config(after_close: bool) -> DelegModel {
+    DelegModel {
+        initial_delegations: vec![(1, 1)],
+        initial_present: vec![RA],
+        allow_renew: true,
+        reclaim_expired: true,
+        lease_ttl: 30,
+        deleg_ttl: 2,
+        max_stalls: 1,
+        max_drops: 1,
+        root_lane_after_close: after_close,
+        max_tick: 5,
+        ..DelegModel::design(
+            P3.to_vec(),
+            vec![vec![], vec![create(D1A), create(D1B)], vec![]],
+        )
+    }
+}
+
+#[test]
+fn a_root_lane_that_extends_a_closed_slot_renews_an_ended_generation() {
+    assert_search_finds(
+        "root-lane-after-close",
+        &root_lane_after_end_config(true),
+        "recall_safety",
+    );
+}
+
+/// The design: the lane renews under the cap and only open slots, with the
+/// root stalled while grants are renewed, a delegate crash and a failover.
+#[test]
+fn design_a_stalled_root_lane_is_clean() {
+    assert_clean(
+        "root-lane (cap, no takeover)",
+        &DelegModel {
+            max_epoch: 1,
+            ..root_lane_config(false, false)
+        },
+        &["root_lane_renewed"],
+    );
+    // (Clocks honest here: the drift is the margin's own argument,
+    // `design_is_clean_under_drift_with_the_margin`; the clocks' state
+    // space would exceed the budget.)
+    assert_clean(
+        "root-lane (cap, takeover)",
+        &DelegModel {
+            init_offsets: None,
+            max_offset: 0,
+            max_jumps: 0,
+            reclaim_expired: false,
+            max_tick: 3,
+            ..root_lane_config(false, false)
+        },
+        &["root_lane_renewed", "root_takeover"],
+    );
+    assert_clean(
+        "root-lane (closed slots)",
+        &root_lane_after_end_config(false),
+        &["root_lane_renewed"],
+    );
+}

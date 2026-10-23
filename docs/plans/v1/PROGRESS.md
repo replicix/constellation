@@ -58135,3 +58135,162 @@ the delegate's round; it echoes the request's, and the delegate checks it).
   new rules only close earlier or re-arm): the sim sweeps of the next entry
   (R2) run on the stacked tree, the delegation configurations among them
   (the broad set of 91 configurations at 80 seeds each, the delegation ones among them).
+
+## Plan 41 R2: the root answers delegation renewals off its core (2026-10-22)
+
+Plan 41's root-side lane (decisions of 2026-10-22: D2 take R into plan 41,
+D3 the lane confirms the lease with an off-core S3 read, D5 root lane only
+while the core is stuck, D6 bounded at 15 s). The delegate's side was
+`1b4e642` (`DelegLane`); what stayed open was the root's: it answered every
+delegation renewal from its authority core, and a core stuck in one step (a
+priority store write behind a slow journal write) answered nothing, so a
+delegation was reclaimed and lapsed with both nodes alive
+(`delegate-store-stall` with the root stalled, labelled `KNOWN-GAP root
+core stuck`; 2 of 7 loaded runs on 2026-10-19).
+
+### What landed
+
+| Item | State | Where |
+|---|---|---|
+| R2: the off-core answer | done (Local tenures; fast tenures within `backup_takeover_ms` of the core's last proof until P) | `deleg_lane.rs` (`answer_root`), `DelegWindows::extend_off_core`, `crates/engine/src/{authority_driver,p2p,sync}.rs`, `crates/net/src/{message,peers,endpoint}.rs` (`Payload::DelegRenewedOffCore`, appended last) |
+| The delegate applies it as an extension only | done | `Core::on_deleg_renewed_off_core` (`PeerMsg::DelegRenewedOffCore`), `Core::on_deleg_renew_answered_off_core` (`Event::DelegRenewAnsweredOffCore`) |
+| Models | done | `crates/model/src/delegation.rs` (`Stall`, `LaneRenew`, knobs), `crates/model/tests/delegation.rs` |
+| Sims | done | `delegated-core-stall-root{,-unlaned,-lease6,-backup,-hang,-recall,-recall-open}`, `-both` |
+| Harness | done | `delegate-store-stall` with `CONSTELLATION_HARNESS_DELEG_STALL_NODE=a\|b\|both`, `CONSTELLATION_HARNESS_DELEG_BACKED` |
+| Docs, status | done | `delegations.md`, `configuration.md` (`CONSTELLATION_DELEG_ROOT_LANE`), ADR-23 amended, status `delegation.root_answers_off_core`, `root_answers_deferred`, `off_core_answers_applied` |
+
+### R2 (the answer)
+
+While the root's driver has been stuck for `stuck_threshold_ms(grant / 2)` (100
+to 500 ms) and no longer than `CONSTELLATION_HOLDER_STALL_MS`, the P2P service
+(`P2pBridge::deleg_renew`, `deleg_renew_off_core`) answers the delegate's
+renewal as **the RPC reply of the request**: `Payload::DelegRenewedOffCore {
+req_id, gen, round, ttl_ms }` in place of `Payload::Ok`, after
+`DelegWindows::extend_off_core` extended the window `now + ttl + extra` in one
+critical section over the lease certificate (`RootLease`: the honour-clock end
+and the cap, the freshness facts of `renew_hold`, the mark; published by
+`Core::handle`'s last act, before the driver dispatches) and the slot (open,
+not a designation, `settled`: a granting core answer was sent this tenure and
+no lock handoff, barrier or raised floor has been pending since: the answer
+carries no lock content and must never be a first grant). The request is still
+queued to the core, which answers it in full when it runs; the bookkeeping the
+off-core answer skipped is `Event::DelegRenewAnsweredOffCore`. The delegate
+(whoever sent: the core's task, or its lane) hands the reply to `OffCore`,
+which notes the grant and tells the core on the urgent lane; the core applies
+it only to a grant it already serves, from the request's own send, never as a
+first grant; for its own request in flight it also arms the next renewal (the
+full answer later is a late one).
+
+Argument (on `answer_root`): same process and clocks; the root rule from a
+certificate published before the step's actions are dispatched, time-bounded
+facts re-checked at `t`, a deposition/release/epoch learned in a running step
+covered by the freshness window (fast tenure) or the cap (Local) exactly as for
+the lock lane; per-generation facts that change in a step close the shared slot
+in that step; the delegate honours from its own send, no later than `t`; no lock
+content crosses.
+
+### Evidence
+
+- Core and table unit tests (`deleg_windows_tests`, `deleg_windows::tests`:
+  81 delegation tests), engine tests (the stuck gate, the reply path), net
+  (`the_root_off_core_answer_is_appended_after_every_other_variant`).
+- Models: `a_root_lane_without_the_cap_renews_past_the_lease_across_a_takeover`
+  (`root_lane_ignores_cap` violates `recall_safety`, 672 452 states) and
+  `a_root_lane_that_extends_a_closed_slot_renews_an_ended_generation`
+  (`root_lane_after_close`, 35 435 states) find counterexamples;
+  `design_a_stalled_root_lane_is_clean` is exhaustive (2.2M, 1.8M and 2.3M
+  states) with `root_lane_renewed` and `root_takeover` witnessed.
+  **`root_lane_ignores_freshness` is not modelled**: the delegation model has no
+  early takeover (a seal is "the same transition with an earlier trigger" there),
+  so a freshness violation cannot occur in it; the sim's `-root-backup` is its
+  stand-in and the lock model has the freshness knob. **The recall's close alone
+  is not load-bearing for exclusion**: skipping it (`-root-recall-open`,
+  `skip_close_on_recall`) finds no violation in 2000 seeds, and the argument says
+  why: after a recall the delegate stops at the recall, and a later extension only
+  lengthens the outwait of a recall whose message was lost (liveness). The close
+  that matters is the expiry decision's (`close_if_expired`) and the end's.
+
+### Review round (independent read of R1/R2, 2026-10-22)
+
+Findings acted on, each with a test that fails without the change:
+
+- A lock-side change inside a step (a barrier noted, a handoff queued, a floor
+  raised) left the slot `settled` until the step's publication; an answer in
+  between would leave it behind. Now `DelegWindows::unsettle`/`unsettle_all` run
+  where those change (`a_barrier_noted_inside_a_step_unsettles_the_generation_at_once`).
+- "Never the delegate's first grant" was per generation; the delegate's
+  `serving` survives a root change. The delegate now records the round of the
+  root core's latest granting answer (`DelegateState::core_granted_round`) and
+  applies an answer off the core only in that round
+  (`an_off_core_answer_needs_a_core_grant_in_the_current_round`).
+- The core's refusal of a request that the root's off-core answer completed was
+  swallowed by the late path (a generation the root ended lived on until the
+  next renewal). It ends the generation now
+  (`the_cores_refusal_after_an_off_core_grant_still_ends_the_generation`).
+- `lock_deleg_quiet` counted a barrier anywhere in the tree; it is scoped to the
+  generation's subtree (`a_barrier_elsewhere_does_not_take_the_lane_from_a_delegate`).
+- An expiry decision with `delegation_reclaim_expired` off left the slot shut
+  (R1: it reopens). A dying driver now revokes the certificate and shuts the
+  slots (`AliveTask`'s drop).
+
+Not changed: the root marks `answered_granting` when the answer is pushed, not
+when it is acknowledged; the delegate's per-round check above covers what that
+could leave open. The sim cannot exercise the expiry race (its answerer runs
+between steps, not inside one), so that is the table's unit test with the
+`before_close` hook, not a sweep; the sim's `stuck_ms` ignores the echo and
+runtime terms of the daemon's gate. `skip_close_on_expiry` is therefore not set
+by any sim configuration.
+
+### Why the harness arm flaked, and the driver thread
+
+`delegate-store-stall` with the root stalled failed in about half of the runs
+(`KNOWN-GAP root core stuck`; 4 of 7 on a quiet box) with the answerer in
+place. The root's service log showed it read none of the delegate's renewals
+until the stall ended, and the answerer's own counter said the driver was not
+stuck. Cause: the core's driver was a task of the shared runtime that blocked
+its worker in a step waiting behind the store's writer lock, and the tasks
+queued on that worker (the P2P service's among them) waited with it. The
+driver now runs on a thread of its own, polled by `Handle::block_on` (the
+runtime's I/O and timers stay on its workers; a task of the runtime holds a
+sender whose drop at the runtime's teardown ends the thread, so a second engine
+on the same state directory finds the store free). 12 of 12 runs of the arm
+pass after it (4 with the default stalls of 5, 9, 12 and 25 s), none failed.
+A second, independent race: a renewal that reached the root just before its
+core stuck was queued to that core and nobody answers it off the core; the
+delegate sends such a renewal once more after the answerer's threshold plus
+250 ms (`Core::deleg_resend_ms`).
+
+### Evidence
+
+- Authority lib tests (642 on the full tree, 606 on R1 alone), engine lib
+  (865), model suite in release (all), `cargo clippy --workspace
+  --all-targets -D warnings` and `cargo fmt --check` clean. The whole
+  `tests/sim.rs` file was not run to the end: its 250 tests take hours and
+  fail in bulk with `EAGAIN` from the store when more than a few run at once
+  on one box; individual tests pass (`ack_s3_no_acked_op_lost`,
+  `a_second_seal_inside_the_grace_waits_out_the_first_holders_grants`,
+  `a_successor_stepped_forward_keeps_its_takeover_floor`, the new
+  `a_root_stuck_in_a_step_keeps_its_delegations` and `a_root_hung_past_the_bound_loses_its_delegations`).
+- Sim sweeps of this tree: `delegated-core-stall-root` 300 seeds, and
+  `-lease6`, `-backup`, `-hang`, `-recall`, `-recall-open`, `-both`,
+  `delegated-core-stall{,-lease6,-forwarded}`, `delegated-core-hang`,
+  `delegated-core-freeze` 200 seeds each: 0 failing. `-root-unlaned` fails
+  300 of 300 (the fail-before). The broad set (every `delegated-*`, `locks-*`,
+  `long-delegated*` and `backup-locks-ahead` configuration, 91 of them, 80 seeds
+  each) fails only in the controls built to fail (`delegated-core-stall-unlaned`,
+  `locks-late-stale-mirror-naive`, `locks-writer-hold-unchecked`,
+  `locks-writer-hold-delegated-unsettled`) and in one seed of
+  `locks-delegate-ahead` (58, a stale read under a lock). That seed passes on the
+  current main and on this tree built on it; it failed on the tree built on the
+  main two commits earlier, which the sweeps ran on, and I did not find out
+  whether a main commit fixed it or the schedule moved. The sweeps ran on that
+  earlier base; the stacked tree was not swept again.
+- Harness (`delegate-store-stall`): the root stalled (`a`), 12 of 12 after the
+  driver thread; the delegate stalled (`b`) and `delegate-handoff-renewal`
+  pass. `delegate-store-stall` with the root stalled
+  (`a`): 16 of 16; both stalled: 3 of 3; the delegate stalled: 6 of 6;
+  `delegate-handoff-renewal`: 6 of 6; with `CONSTELLATION_DELEG_ROOT_LANE=off`
+  the arm fails with `KNOWN-GAP root core stuck` (the in-scenario fail-before);
+  the backed pair: 3 of 3 (a loss is accepted only as the known gap until P:
+  the 5 s stall kept the delegation, the longer ones lost it).
+

@@ -3426,6 +3426,16 @@ client give up on the held write (in doubt), so the recalled grant takes
 the doubt lapse (`locks_writer_hold_delegated_doubt_lapses_the_grant`).
 Its released twin cannot fail here, because a pinned commit ends at the
 node's next store write. The release decision is pinned in core tests.
+`delegated-core-stall-root*` (plan 41 R2, `a_root_stuck_in_a_step_keeps_its_delegations`,
+`a_root_hung_past_the_bound_loses_its_delegations`): the lease holder's core
+(`StallStep { node: 0 }`) is stuck 6.5, 9 and 12.5 s while the delegates
+renew; the root's P2P service answers off the core (the bus tap of
+`sim/node.rs`, `deleg_lane::answer_root`), so nothing is reclaimed, lapsed or
+ended; `-unlaned` (`SimConfig::deleg_root_lane: false`) loses every
+generation (2000 of 2000 seeds), `-lease6` runs the sim's 6 s lease (the cap),
+`-backup` a backed root (safety), `-hang` a stall past the 15 s bound
+(lost, as for a dead root), `-both` the root and a delegate at once and
+`-recall` cross-subtree recalls during the stall.
 `locks-stall-step` and `locks-stall-step-delegated` (the turns' executor
 judges tokens by the window) stall the steps of owners, executors and
 holders across grant windows (`locks_survive_stalled_steps`). Their
@@ -3460,6 +3470,7 @@ Harness scenarios (the harness process is the application: it calls
 | `lock-latency` | measurements: first lock from a non-sequencer, cached re-locks, the sequencer's own locks, a contended handoff, and a lone node under `cluster` against `local` |
 | `lock-holder-killed-contention` | four nodes increment one `flock`ed counter (read, add, write, `fsync`); the holder is `kill -9`'d with the lock held. The survivors stall only until its grant is outwaited (ttl + margin, never less than its remaining life), hand the lock on with no further outwait (the owner's `recalls_expired` is 1), and the count is exact. Then a node killed while parked first in line costs the next waiter nothing (granted within milliseconds of the unlock, not ttl + margin later) |
 | `lock-fence-at-close` | B writes under a lock and is cut from the owner past its grant; C takes the lock and writes. B's close returns `EIO` (`fcntl` closed while still locked; `flock` unlocked first, then closed), and the file holds C's data on every node |
+| `delegate-store-stall` with `CONSTELLATION_HARNESS_DELEG_STALL_NODE=a\|b\|both` | plan 41 R2: whose store stalls (default `b`, the delegate: its off-core lane keeps the delegation). With `a` the root's core is stuck (the unbacked pair, a 60 s lease, a writer in a root directory): its P2P service answers the delegate's renewals off the core, so the same generation survives, nothing is reclaimed or lapsed, `delegation.root_answers_off_core > 0` and `b`'s writes still run on the delegate; `CONSTELLATION_DELEG_ROOT_LANE=off` fails with `KNOWN-GAP root core stuck` (the in-scenario fail-before). `both` stalls both stores. `CONSTELLATION_HARNESS_DELEG_BACKED=1` runs the backed pair, where the loss is expected (and asserted as the known gap) until plan 41 P |
 | `lock-lapse-lone-node` | a lone node (`--write-mode back`, ttl 3 s) is frozen (`SIGSTOP`) past a lock grant's window while the lock's owner process has `fsync`ed one write under the lock and left a second one dirty, and creates, links, symlinks and renames from other threads: every op answers OK or `EIO` and the tree holds exactly what answered OK (an op in flight across the stall is applied and answered OK, or not applied), the write and the close after the lapse answer `OK` (plan 43 C7-F F-c: the node asks itself for its grant back and the I/O the freeze held up runs; before, they answered `EIO` and the file held exactly the `fsync`ed write): no op answers `EIO`, the file holds the writes in order, the status counts the parks resumed and no op fenced. After a remount the tree, the file and every write a later `fsync` acknowledged are there, and fsck is clean. The node that sequences its own grants lapses them too: the core that renews them is the one stalled (the xcheckfs run of 2026-10-13) |
 
 On failure `lock-failover`, `lock-holder-killed-contention`,

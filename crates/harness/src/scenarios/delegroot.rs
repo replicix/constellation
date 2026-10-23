@@ -273,8 +273,15 @@ pub(super) fn delegated_pair_with(
     let mut env_vars = ENV.to_vec();
     env_vars.extend_from_slice(extra);
     if !backed {
-        env_vars.push(("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "0"));
-        env_vars.push(("CONSTELLATION_LEASE_TTL_MS", "20000"));
+        // (A caller's own value for either wins.)
+        for (k, v) in [
+            ("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "0"),
+            ("CONSTELLATION_LEASE_TTL_MS", "20000"),
+        ] {
+            if !extra.iter().any(|(e, _)| *e == k) {
+                env_vars.push((k, v));
+            }
+        }
     }
     let (env, root, clients, _) = cluster(name, &["a", "b"], &env_vars, 0)?;
     Ok((env, root, clients))
@@ -1329,6 +1336,43 @@ fn arm_repeating_store_stall(file: &std::path::Path, ms: u64, pid: u32) -> Resul
     Ok(())
 }
 
+/// Which node's store `delegate-store-stall` stalls
+/// (`CONSTELLATION_HARNESS_DELEG_STALL_NODE`): `b`, the delegate (the
+/// default); `a`, the root (plan 41 R: the root's P2P service answers the
+/// delegate's renewals off its stuck core); `both`, the shared-disk case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StallNode {
+    A,
+    B,
+    Both,
+}
+
+fn stall_node() -> StallNode {
+    match std::env::var("CONSTELLATION_HARNESS_DELEG_STALL_NODE")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "a" => StallNode::A,
+        "both" => StallNode::Both,
+        _ => StallNode::B,
+    }
+}
+
+/// [`arm_store_stall`] for every daemon sharing the file (no `pid=`): the
+/// first commit of each daemon's core holds its writer lock for `ms`
+/// (`core-only`: the stall is the core's own, whatever the FUSE writers do —
+/// with both stores stalled their writers stop and the cores would otherwise
+/// have nothing to write). The caller removes the file once both have taken
+/// it.
+fn arm_store_stall_all(file: &std::path::Path, ms: u64) -> Result<()> {
+    let tmp = file.with_extension("tmp");
+    std::fs::write(&tmp, format!("{ms} core-only\n"))?;
+    std::fs::rename(&tmp, file)?;
+    Ok(())
+}
+
 /// A delegate whose core is stuck behind a slow store write keeps its
 /// delegation. One ordinary metadata write on `b` (the writer's create)
 /// holds the store's writer lock for 5, 9 and 12 s
@@ -1358,6 +1402,19 @@ fn arm_repeating_store_stall(file: &std::path::Path, ms: u64, pid: u32) -> Resul
 /// keeps the store slow after each stall (every ordinary write holds the
 /// writer lock for that long): the delegation is intact and must not be
 /// reported lost, whatever the latency (not judged then).
+/// `CONSTELLATION_HARNESS_DELEG_STALL_NODE=a|b|both` chooses whose store
+/// stalls (default `b`). With `a` the root's core is stuck (the unbacked pair,
+/// a 60 s lease, a writer in a root directory of `a`): the root's P2P service
+/// answers the delegate's renewals off the core (plan 41 R), so the same
+/// generation survives, nothing is reclaimed or lapsed, the root counts its
+/// off-core answers (`root_answers_off_core`) and `b`'s writes still run on
+/// the delegate; `CONSTELLATION_DELEG_ROOT_LANE=off` is the in-scenario
+/// fail-before (`KNOWN-GAP root core stuck`). `both` stalls the first
+/// commit of each core at once (the root's core is asserted stuck, the
+/// delegate's only if it committed inside the window). `CONSTELLATION_HARNESS_DELEG_BACKED=1` runs `a` / `both` on the
+/// backed pair: a root with a backup answers off the core only within the
+/// takeover window of its last proof of liveness, so until plan 41 P a
+/// loss is possible and accepted only as the known gap.
 pub fn delegate_store_stall(_seed: u64) -> Result<()> {
     const NAME: &str = "delegate-store-stall";
     // `CONSTELLATION_HARNESS_DELEG_STALLS_MS=9000,12000` runs those stalls
@@ -1373,21 +1430,48 @@ pub fn delegate_store_stall(_seed: u64) -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|v| *v > 0);
+    let node = stall_node();
+    // The root stalled: the unbacked pair (a root with no backup answers off
+    // its core under the lease's cap alone), unless asked for the backed one.
+    let backed = node == StallNode::B
+        || std::env::var("CONSTELLATION_HARNESS_DELEG_BACKED").as_deref() == Ok("1");
+    let expect_known_gap = backed && node != StallNode::B;
     let stall_dir = tempfile::tempdir()?;
     let file = stall_dir.path().join("store-stall");
     let file_str = file.display().to_string();
-    let (_env, _root, mut clients) = delegated_pair_with(
-        NAME,
-        true,
-        &[("CONSTELLATION_FAULT_STORE_STALL_FILE", &file_str)],
-    )?;
+    let mut extra = vec![("CONSTELLATION_FAULT_STORE_STALL_FILE", file_str.as_str())];
+    if node != StallNode::B {
+        // A lease longer than any stall: the cap by the root's lease is not
+        // what is judged here.
+        extra.push(("CONSTELLATION_LEASE_TTL_MS", "60000"));
+    }
+    // `CONSTELLATION_HARNESS_DELEG_DEBUG=1`: the delegation core's renewal
+    // lines (sent, answered, late) in the daemons' logs.
+    if std::env::var("CONSTELLATION_HARNESS_DELEG_DEBUG").as_deref() == Ok("1") {
+        extra.push((
+            "RUST_LOG",
+            "info,constellation_authority::core::delegate=debug,constellation_engine::authority_driver=debug",
+        ));
+    }
+    let (_env, _root, mut clients) = delegated_pair_with(NAME, backed, &extra)?;
     let result = (|| -> Result<()> {
-        delegate_d1(NAME, &clients, true)?;
+        delegate_d1(NAME, &clients, backed)?;
         let a = &clients[0];
         let b = &clients[1];
         let pid = b.pid().context("b has no daemon")?;
+        let pid_a = a.pid().context("a has no daemon")?;
         let w = Writer::start(b.mnt.clone(), "d1");
         w.wait_ops_after(Duration::ZERO, 20, Duration::from_secs(30))?;
+        // A writer in a directory the root owns: its ordinary write is what
+        // holds `a`'s store while `a`'s core waits behind it.
+        let wa = (node != StallNode::B)
+            .then(|| -> Result<Writer> {
+                std::fs::create_dir(a.mnt.join("ra"))?;
+                let wa = Writer::start(a.mnt.clone(), "ra");
+                wa.wait_ops_after(Duration::ZERO, 20, Duration::from_secs(30))?;
+                Ok(wa)
+            })
+            .transpose()?;
         let delta = |d: &serde_json::Value, d0: &serde_json::Value, k: &str| {
             n(d, k).saturating_sub(n(d0, k))
         };
@@ -1407,7 +1491,17 @@ pub fn delegate_store_stall(_seed: u64) -> Result<()> {
             let control_p90 = quantile(&control_meta, 0.9);
             let (da0, db0) = (deleg_of(a)?, deleg_of(b)?);
             let armed_at = w.now();
-            arm_store_stall(&file, ms, pid)?;
+            match node {
+                StallNode::B => arm_store_stall(&file, ms, pid)?,
+                StallNode::A => arm_store_stall(&file, ms, pid_a)?,
+                StallNode::Both => {
+                    arm_store_stall_all(&file, ms)?;
+                    // Both daemons' first ordinary write takes it within a
+                    // writer's period; one stall each.
+                    std::thread::sleep(Duration::from_millis(400));
+                    let _ = std::fs::remove_file(&file);
+                }
+            }
             // The writes after the stall: the longest wait of the writer
             // is the stall itself; then back to normal.
             let back_from = armed_at + Duration::from_millis(ms) + Duration::from_secs(1);
@@ -1420,9 +1514,31 @@ pub fn delegate_store_stall(_seed: u64) -> Result<()> {
                 arm_repeating_store_stall(&file, after, pid)?;
             }
             std::thread::sleep(Duration::from_secs(2));
-            w.wait_ops_after(back_from, 20, Duration::from_secs(60))?;
+            // Past the bound the delegation is lost and what the delegate had
+            // executed meanwhile is replayed through the root one op at a time
+            // (a sequencer round trip each, ~4 per second): the writer's next
+            // op waits behind that backlog, which grows with how fast the host
+            // lets the writer run. Slow, not failed: given time.
+            let recovery = Duration::from_secs(if past_bound { 300 } else { 60 });
+            w.wait_ops_after(back_from, 20, recovery).map_err(|e| {
+                // What each side counted over the stall: whether the root
+                // answered off its core, and what it declined.
+                let side = |c: &Client| {
+                    deleg_of(c)
+                        .map(|d| d.to_string())
+                        .unwrap_or_else(|e| format!("(no status: {e})"))
+                };
+                anyhow::anyhow!(
+                    "{e}; after a {ms} ms store stall of {node:?}: a {} b {}",
+                    side(a),
+                    side(b)
+                )
+            })?;
             let window_end = Instant::now();
-            let (ops, errs) = w.after(armed_at);
+            let (ops, mut errs) = w.after(armed_at);
+            if let Some(wa) = &wa {
+                errs.extend(wa.after(armed_at).1);
+            }
             let after_meta = w.meta_after(back_from);
             let after_p50 = quantile(&after_meta, 0.5);
             let counted_to = w.now();
@@ -1435,14 +1551,23 @@ pub fn delegate_store_stall(_seed: u64) -> Result<()> {
             }
             let (da, db) = (deleg_of(a)?, deleg_of(b)?);
             let gen_after = held_generation(&db);
-            let (_, recent_step) = core_steps(b)?;
+            // The stalled core's longest recent step (both: the root's; the
+            // delegate's core takes its stall only if it commits inside the
+            // window the file is armed for, and `b_step` says if it did).
+            let (recent_step, b_step) = match node {
+                StallNode::B => (core_steps(b)?.1, Duration::ZERO),
+                StallNode::A => (core_steps(a)?.1, Duration::ZERO),
+                StallNode::Both => (core_steps(a)?.1, core_steps(b)?.1),
+            };
             let lane = delta(&db, &db0, "renewals_off_core");
+            let root_answers = delta(&da, &da0, "root_answers_off_core");
             let reclaimed = delta(&da, &da0, "reclaimed");
             let recalls = delta(&da, &da0, "recalls_sent");
             eprintln!(
-                "    {NAME}: a {ms} ms store stall{}: b's core stuck {recent_step:?} at most; \
-                 the lane sent {lane} renewals; generation {gen} -> {gen_after:?}; at a: \
-                 reclaimed +{reclaimed} recalls +{recalls}; at b: lapsed {}; writes across it: \
+                "    {NAME}: a {ms} ms store stall of {node:?}{}: the stalled core stuck \
+                 {recent_step:?} at most; the lane sent {lane} renewals, the root answered \
+                 {root_answers} off its core (declined: {}); generation {gen} -> {gen_after:?}; \
+                 at a: reclaimed +{reclaimed} recalls +{recalls}; at b: lapsed {}; writes across it: \
                  {}; create + close before: p50 {:?} p90 {control_p90:?}, after: p50 \
                  {after_p50:?}; b's writes after it: {} executed on b, {} forwarded",
                 if past_bound {
@@ -1450,6 +1575,7 @@ pub fn delegate_store_stall(_seed: u64) -> Result<()> {
                 } else {
                     ""
                 },
+                da["root_answers_deferred"],
                 n(&db, "lapsed"),
                 dist(&ops),
                 quantile(&control_meta, 0.5),
@@ -1465,15 +1591,43 @@ pub fn delegate_store_stall(_seed: u64) -> Result<()> {
                     "a {ms} ms store stall never held b's core past the hung bound (longest \
                      step {recent_step:?}): the scenario did not exercise it"
                 );
+                // (A root hung past the bound answers late, not never: its
+                // core grants the renewals queued meanwhile when it runs, so
+                // the loss shows at the delegate, which lapsed.)
+                let at_b = delta(&db, &db0, "lapsed");
                 anyhow::ensure!(
-                    reclaimed + recalls > 0,
-                    "the root kept the delegation of a delegate hung for {recent_step:?}, past \
+                    reclaimed + recalls > 0 || (node != StallNode::B && at_b > 0),
+                    "the root kept the delegation of a node hung for {recent_step:?}, past \
                      the bound: the lane renewed without end: a {da} b {db}"
                 );
                 continue;
             }
             let l = Losses::since(&da, &da0, &db, &db0);
             let lost = gen_after != Some(gen) || l.any();
+            if expect_known_gap && Duration::from_millis(ms) > slack {
+                // The root has a backup (a fast tenure): until plan 41 P it
+                // answers off its core only within the takeover window of its
+                // core's last proof of liveness, so a stall past the grant's
+                // slack may lose the delegation, as the known gap. (It need not:
+                // a renewal that reaches the root inside the window of its
+                // core's last proof is answered, and the stall then ends before
+                // the next one is due. A loss must be that gap and nothing
+                // else; a kept delegation is a note, not the proof of P.)
+                if !lost {
+                    eprintln!(
+                        "    {NAME}: the backed root, stalled {ms} ms, kept the delegation \
+                         (the freshness window held; not the proof of plan 41 P)"
+                    );
+                    continue;
+                }
+                let e = l.failure(&format!("a {ms} ms store stall"), Some(gen), "");
+                anyhow::ensure!(
+                    e.to_string().contains(KNOWN_GAP) || l.excused(Some(gen)).is_some(),
+                    "the backed root's loss is not the expected known gap: {e}"
+                );
+                eprintln!("    {NAME}: expected, before plan 41 P: {e}");
+                continue;
+            }
             if lost {
                 // A loss the daemon classified as under a freeze of its
                 // whole process, of this generation, in this iteration (the
@@ -1497,13 +1651,24 @@ pub fn delegate_store_stall(_seed: u64) -> Result<()> {
             if Duration::from_millis(ms) > slack {
                 anyhow::ensure!(
                     recent_step >= Duration::from_millis(ms) * 4 / 5,
-                    "a {ms} ms store stall never held b's core (longest step {recent_step:?}): \
+                    "a {ms} ms store stall never held the core (longest step {recent_step:?}): \
                      the scenario did not exercise the lane"
                 );
-                anyhow::ensure!(
-                    lane > 0,
-                    "b's core was stuck {recent_step:?} and the off-core lane sent no renewal"
-                );
+                if node == StallNode::B
+                    || (node == StallNode::Both && b_step >= Duration::from_millis(ms) * 4 / 5)
+                {
+                    anyhow::ensure!(
+                        lane > 0,
+                        "b's core was stuck {b_step:?} and the off-core lane sent no renewal"
+                    );
+                }
+                if node != StallNode::B {
+                    anyhow::ensure!(
+                        root_answers > 0,
+                        "a's core was stuck {recent_step:?} and its P2P service answered no \
+                         renewal off the core (`root_answers_off_core`)"
+                    );
+                }
             }
             // Where the writes ran: the delegation counters, not how long
             // they took.
@@ -1531,6 +1696,9 @@ pub fn delegate_store_stall(_seed: u64) -> Result<()> {
             }
         }
         w.finish();
+        if let Some(wa) = wa {
+            wa.finish();
+        }
         print_deleg(NAME, "a", &deleg_of(a)?);
         print_deleg(NAME, "b", &deleg_of(b)?);
         Ok(())

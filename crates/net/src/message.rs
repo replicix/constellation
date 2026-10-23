@@ -768,6 +768,21 @@ pub enum Payload {
         /// The requester's clock: waiters last sent before it are dropped.
         upto: i64,
     },
+    // ---- the root's off-core answer (plan 41 R2, appended) ----
+    /// The root's answer to [`Payload::DelegRenew`] or
+    /// [`Payload::DelegRenewOffCore`] `req_id`, as the RPC reply of that
+    /// request (in place of [`Payload::Ok`]), made by its P2P service while
+    /// its authority core was stuck in a step: a grant of `ttl_ms` on
+    /// `gen`, stream round `round`, carrying no lock handoff, grace, floor,
+    /// cut or barrier. The delegate honours it from its own send and only as
+    /// an extension of a grant it already serves; the root's core still
+    /// answers the request in full ([`Payload::DelegRenewed`]).
+    DelegRenewedOffCore {
+        req_id: u64,
+        gen: u64,
+        round: u64,
+        ttl_ms: u64,
+    },
 }
 
 /// One beat of the holder's off-core heartbeat ([`Payload::HolderAlive`]):
@@ -1163,6 +1178,35 @@ mod tests {
         let k = key();
         let signed = Signed::new(&k, &payload).unwrap();
         assert_eq!(signed.verify().unwrap().1, payload);
+    }
+
+    /// The root's off-core answer (plan 41 R2) is appended after every other
+    /// variant: the others keep their postcard variant indices, and a binary
+    /// without it fails to decode it rather than reading another message.
+    #[test]
+    fn the_root_off_core_answer_is_appended_after_every_other_variant() {
+        let tag = |payload: &Payload| postcard::to_allocvec(payload).unwrap()[0];
+        let last_before = tag(&Payload::LockCancel {
+            from: 1,
+            ino: 2,
+            exclusive: true,
+            shared: false,
+            upto: 3,
+        });
+        let answer = Payload::DelegRenewedOffCore {
+            req_id: 9,
+            gen: 7,
+            round: 1,
+            ttl_ms: 5_000,
+        };
+        assert!(
+            last_before < 0x80 && tag(&answer) < 0x80,
+            "one-byte variant indices"
+        );
+        assert_eq!(tag(&answer), last_before + 1);
+        let k = key();
+        let signed = Signed::new(&k, &answer).unwrap();
+        assert_eq!(signed.verify().unwrap().1, answer);
     }
 
     /// Plan 32 Step 0.1: the snapshot batch variants are appended after

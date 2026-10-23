@@ -349,6 +349,10 @@ pub struct NodeEnv {
     pub beats_lost_in_lag: bool,
     /// See `SimConfig::deleg_lane`.
     pub deleg_lane: bool,
+    /// See `SimConfig::deleg_root_lane`.
+    pub deleg_root_lane: bool,
+    /// See `SimConfig::skip_close_on_recall`.
+    pub skip_close_on_recall: bool,
     /// Plan 43 C0: the commit-rule oracles' shared plumbing.
     pub oracles: Arc<super::oracle::Oracles>,
     /// See `SimConfig::rebuild_stub`.
@@ -501,22 +505,77 @@ impl NodeHandle {
             meta.locks().set_settle_for_tests(env.settle_tagged_writes);
         }
         env.bus.attach(id, tx.clone());
+        // The root's delegation windows, shared with the answerer below
+        // (the daemon's `OffCore::deleg_windows`).
+        let windows = constellation_authority::core::DelegWindows::new();
+        windows.skip_closes_for_tests(env.skip_close_on_recall, false);
         {
             let shared = shared.clone();
+            let windows = windows.clone();
+            let bus = env.bus.clone();
+            let clock = clock.clone();
+            let root_lane = env.deleg_root_lane;
             env.bus.set_tap(
                 id,
                 Arc::new(move |from: NodeId, msg: &PeerMsg| {
-                    if let PeerMsg::DelegRenewed {
-                        gen, round, ttl_ms, ..
-                    } = msg
-                    {
-                        if *ttl_ms > 0 {
-                            shared
-                                .granted_ttl
-                                .lock()
-                                .unwrap()
-                                .insert((*gen, *round), (from, *ttl_ms));
+                    match msg {
+                        PeerMsg::DelegRenewed {
+                            gen, round, ttl_ms, ..
                         }
+                        | PeerMsg::DelegRenewedOffCore {
+                            gen, round, ttl_ms, ..
+                        } => {
+                            if *ttl_ms > 0 {
+                                shared
+                                    .granted_ttl
+                                    .lock()
+                                    .unwrap()
+                                    .insert((*gen, *round), (from, *ttl_ms));
+                            }
+                        }
+                        // The daemon's P2P bridge (`P2pBridge::root_answer_off_core`):
+                        // a delegation renewal that arrives while this node's
+                        // driver is stuck in a step is answered from outside it,
+                        // as the RPC reply of the request.
+                        PeerMsg::DelegRenew {
+                            req, gen, round, ..
+                        }
+                        | PeerMsg::DelegRenewOffCore { req, gen, round } => {
+                            let now = clock.now();
+                            let busy = shared.busy_since.load(Ordering::SeqCst);
+                            let stuck_ms = if busy != 0 { now.wait.0 - busy } else { 0 };
+                            if !root_lane
+                                || stuck_ms
+                                    < constellation_authority::deleg_lane::DELEG_LANE_STUCK_MIN_MS
+                            {
+                                return;
+                            }
+                            if let Ok(ttl_ms) = constellation_authority::deleg_lane::answer_root(
+                                &windows,
+                                stuck_ms,
+                                SIM_HOLDER_STALL_MS,
+                                from,
+                                *gen,
+                                now,
+                            ) {
+                                let _ = shared.urgent.send(Event::DelegRenewAnsweredOffCore {
+                                    gen: *gen,
+                                    from,
+                                    ttl_ms,
+                                });
+                                bus.send(
+                                    id,
+                                    from,
+                                    PeerMsg::DelegRenewedOffCore {
+                                        req: *req,
+                                        gen: *gen,
+                                        round: *round,
+                                        ttl_ms,
+                                    },
+                                );
+                            }
+                        }
+                        _ => {}
                     }
                 }),
             );
@@ -545,11 +604,11 @@ impl NodeHandle {
             id,
             meta: meta.clone(),
             core: {
-                let core = Core::new(cfg);
+                let mut core = Core::new(cfg);
                 // The window table decides on this node's clock (plan 41 R1).
                 let clock = clock.clone();
-                core.deleg_windows()
-                    .set_clock(Arc::new(move || clock.now()));
+                windows.set_clock(Arc::new(move || clock.now()));
+                core.set_deleg_windows(windows);
                 core
             },
             store: env.bucket.handle(id),

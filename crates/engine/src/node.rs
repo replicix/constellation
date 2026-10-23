@@ -1230,16 +1230,52 @@ impl Engine {
             // task: the task's join error is turned into a loud abort
             // (the kill-9 model every scenario already covers), not a
             // silent wedge (M5 round 5).
-            let driver_task = rt.spawn(driver.run());
+            // The driver runs on a thread of its own, polled there by
+            // `Handle::block_on`: its steps write the metadata store
+            // synchronously, and a step that waits behind a slow journal
+            // write (finding 08) used to block a worker of the shared
+            // runtime, taking with it the tasks queued on that worker —
+            // the P2P service among them, so a delegate's renewal that
+            // reached the root during the stall was read only when the
+            // stall ended (`delegate-store-stall` with the root stalled,
+            // about half of the runs failed). The runtime's I/O and timers
+            // are still driven by its own workers.
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<bool>();
+            // A task of the runtime holds the sender of `gone`: when the
+            // runtime is torn down (a process exit, a test's second engine on
+            // the same state dir) it drops, and the thread lets go of the
+            // driver and the store it holds.
+            let (alive_tx, gone) = tokio::sync::oneshot::channel::<()>();
             rt.spawn(async move {
-                if let Err(error) = driver_task.await {
-                    if error.is_panic() {
-                        tracing::error!(%error, "the authority driver panicked; aborting");
-                        // The line that says why survives a healthy sink;
-                        // a stalled one cannot hold the abort (plan 44).
-                        crate::log_buffer::flush_process(std::time::Duration::from_millis(500));
-                        std::process::abort();
-                    }
+                let _alive = alive_tx;
+                std::future::pending::<()>().await
+            });
+            let driver_rt = rt.clone();
+            let spawned = std::thread::Builder::new()
+                .name("cst-authority".into())
+                .spawn(move || {
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        driver_rt.block_on(async move {
+                            tokio::select! {
+                                _ = driver.run() => {}
+                                _ = gone => {}
+                            }
+                        })
+                    }));
+                    let _ = done_tx.send(r.is_err());
+                });
+            if let Err(error) = spawned {
+                tracing::error!(%error, "could not start the authority driver's thread; aborting");
+                crate::log_buffer::flush_process(std::time::Duration::from_millis(500));
+                std::process::abort();
+            }
+            rt.spawn(async move {
+                if let Ok(true) = done_rx.await {
+                    tracing::error!("the authority driver panicked; aborting");
+                    // The line that says why survives a healthy sink;
+                    // a stalled one cannot hold the abort (plan 44).
+                    crate::log_buffer::flush_process(std::time::Duration::from_millis(500));
+                    std::process::abort();
                 }
             });
         }

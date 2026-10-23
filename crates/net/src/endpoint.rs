@@ -1230,7 +1230,10 @@ pub trait PeerService: Send + Sync + 'static {
         })
     }
     /// Plan 30 §M11, one way: a delegate's renewal (answered by the
-    /// root's own [`Payload::DelegRenewed`]). Default: ignored.
+    /// root's own [`Payload::DelegRenewed`]). Default: ignored. The reply
+    /// to the request itself is [`Payload::Ok`], or the returned payload
+    /// (plan 41 R2: [`Payload::DelegRenewedOffCore`], the root's answer from
+    /// outside its stuck core).
     #[allow(clippy::too_many_arguments)]
     fn deleg_renew(
         &self,
@@ -1241,11 +1244,21 @@ pub trait PeerService: Send + Sync + 'static {
         _backup: u64,
         _stream_head: u64,
         _stream_head_at: i64,
-    ) {
+    ) -> Option<Payload> {
+        None
     }
     /// One way: a delegate's off-core renewal ([`Payload::DelegRenewOffCore`],
-    /// answered by the root's [`Payload::DelegRenewed`]). Default: ignored.
-    fn deleg_renew_off_core(&self, _from: u64, _req_id: u64, _gen: u64, _round: u64) {}
+    /// answered by the root's [`Payload::DelegRenewed`]). Default: ignored;
+    /// the reply is as [`Self::deleg_renew`]'s.
+    fn deleg_renew_off_core(
+        &self,
+        _from: u64,
+        _req_id: u64,
+        _gen: u64,
+        _round: u64,
+    ) -> Option<Payload> {
+        None
+    }
     /// Plan 30 §M11, one way: the root's answer to a renewal. Default:
     /// ignored.
     #[allow(clippy::too_many_arguments)]

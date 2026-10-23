@@ -35931,4 +35931,402 @@ mod deleg_windows_tests {
         h.core.dw.extend_core(9, w(h.now.plus(2_000)), true);
         assert!(!h.core.dw.get(9).unwrap().open);
     }
+
+    // ------------------------------------------------ R2, the root's side
+
+    /// The certificate the core publishes at the end of a step names the
+    /// lease and, once a granting answer has been sent, the generation as
+    /// settled; a recall's step publishes it unsettled and closed.
+    #[test]
+    fn the_core_publishes_the_roots_certificate_at_the_end_of_every_step() {
+        let mut h = root_with_delegate_backed_by(4);
+        let cert = h.core.dw.lease_cert().expect("a usable root publishes");
+        assert_eq!(cert.delegation_ttl_ms, 1_000);
+        assert_eq!(cert.margin_ms, h.core.cfg.expiry_margin_ms);
+        assert_eq!(
+            cert.extra_ms,
+            h.core.reclaim_horizon_ms() - h.core.cfg.delegation_ttl_ms
+        );
+        assert!(
+            !cert.fast && cert.marked,
+            "a Local tenure: fresh and marked"
+        );
+        // The first granting answer was sent in the step above: settled.
+        assert!(h.core.deleg_settled(7, &h.meta));
+        assert!(h.core.dw.get(7).unwrap().settled);
+        // A step that begins a recall closes the slot in it and publishes the
+        // generation as unsettled.
+        h.advance(10);
+        let mut out = Vec::new();
+        h.core.start_recall(h.clk(), 7, &mut out);
+        h.step(Event::Roster {
+            write_eligible: vec![1, 3],
+        });
+        assert!(!h.core.dw.get(7).unwrap().open);
+        assert!(!h.core.dw.get(7).unwrap().settled);
+        assert_eq!(
+            h.core.dw.extend_off_core(7, 3, h.clk()),
+            Err(crate::core::Refusal::Closed)
+        );
+    }
+
+    /// Fail-before (R2): a recall closes the slot in its own step, not when
+    /// the certificate is next published. With the close skipped (the code
+    /// before the rule) an answer between the recall and the end of the step
+    /// extends the window the recall outwaits.
+    #[test]
+    fn an_off_core_answer_between_a_recall_and_the_end_of_its_step_is_refused() {
+        let mut h = root_with_delegate_backed_by(4);
+        h.advance(10);
+        let mut out = Vec::new();
+        h.core.start_recall(h.clk(), 7, &mut out);
+        // (No step has ended: the published certificate still says settled.)
+        assert!(h.core.dw.get(7).unwrap().settled);
+        let before = h.core.gen_until(7);
+        assert_eq!(
+            h.core.dw.extend_off_core(7, 3, h.clk()),
+            Err(crate::core::Refusal::Closed)
+        );
+        assert_eq!(h.core.gen_until(7), before);
+
+        let mut h = root_with_delegate_backed_by(4);
+        h.core.dw.skip_closes_for_tests(true, false);
+        h.advance(10);
+        let mut out = Vec::new();
+        h.core.start_recall(h.clk(), 7, &mut out);
+        let before = h.core.gen_until(7);
+        assert!(h.core.dw.extend_off_core(7, 3, h.clk()).is_ok());
+        assert!(h.core.gen_until(7) > before, "extended past the recall");
+    }
+
+    /// A release, a takeover gate and an epoch are published as no
+    /// certificate at all: nothing is answered off the core.
+    #[test]
+    fn a_release_or_an_epoch_publishes_no_certificate() {
+        let mut h = root_with_delegate_backed_by(4);
+        assert!(h.core.dw.lease_cert().is_some());
+        h.core.lease.releasing = true;
+        h.step(Event::Roster {
+            write_eligible: vec![1, 3],
+        });
+        assert!(h.core.dw.lease_cert().is_none());
+        assert_eq!(
+            h.core.dw.extend_off_core(7, 3, h.clk()),
+            Err(crate::core::Refusal::Lease)
+        );
+        h.core.lease.releasing = false;
+        h.step(Event::Roster {
+            write_eligible: vec![1, 3],
+        });
+        assert!(h.core.dw.lease_cert().is_some());
+        let mut out = Vec::new();
+        h.core.deleg_on_epoch(h.clk(), true, &h.meta, &mut out);
+        h.step(Event::Roster {
+            write_eligible: vec![1, 3],
+        });
+        assert!(h.core.dw.lease_cert().is_none());
+    }
+
+    /// A pending lock handoff, an outwait barrier or a raised floor leaves
+    /// the generation unsettled: an answer without lock content would
+    /// leave something behind.
+    #[test]
+    fn a_pending_lock_handoff_or_a_raised_floor_leaves_the_generation_unsettled() {
+        let mut h = root_with_delegate_backed_by(4);
+        assert!(h.core.deleg_settled(7, &h.meta));
+        // A floor raised since the last granting answer.
+        let raised = constellation_meta::Position {
+            seq: 9,
+            ..Default::default()
+        };
+        h.core.lock_set_handed_floor_for_tests(7, raised);
+        assert!(!h.core.deleg_settled(7, &h.meta));
+        // The next granting answer carries it: settled again.
+        h.advance(100);
+        renew(&mut h, 2);
+        assert!(h.core.deleg_settled(7, &h.meta));
+    }
+
+    /// Fail-before (R2): a lock-side change inside a step leaves the
+    /// generation unsettled at once. Without the `unsettle` calls the slot
+    /// stays settled until the step's publication, and an answer between the
+    /// change and the end of the step leaves the barrier behind.
+    #[test]
+    fn a_barrier_noted_inside_a_step_unsettles_the_generation_at_once() {
+        let mut h = root_with_delegate_backed_by(4);
+        let dir = h.core.dl.gens[&7].dir;
+        assert!(h.core.dw.get(7).unwrap().settled);
+        // A barrier under the subtree (the dir itself).
+        h.core.lock_dir_barrier(dir, 5_000);
+        assert!(!h.core.dw.get(7).unwrap().settled);
+        assert_eq!(
+            h.core.dw.extend_off_core(7, 3, h.clk()),
+            Err(crate::core::Refusal::Unsettled)
+        );
+        // The end of the step does not settle it while the barrier applies
+        // under the subtree.
+        h.step(Event::Roster {
+            write_eligible: vec![1, 3],
+        });
+        assert!(!h.core.dw.get(7).unwrap().settled);
+    }
+
+    /// A barrier elsewhere in the tree is no content of this subtree's
+    /// answer: the generation is settled again at the end of the step.
+    #[test]
+    fn a_barrier_elsewhere_does_not_take_the_lane_from_a_delegate() {
+        let mut h = root_with_delegate_backed_by(4);
+        let other = h
+            .meta
+            .allocate_ino(constellation_fs_core::types::ROOT_INO)
+            .unwrap();
+        h.core.lock_barrier(other, 5_000, None);
+        assert!(!h.core.dw.get(7).unwrap().settled, "in the step itself");
+        h.step(Event::Roster {
+            write_eligible: vec![1, 3],
+        });
+        assert!(h.core.dw.get(7).unwrap().settled, "re-published settled");
+    }
+
+    /// Fail-before (R2): "never the delegate's first grant" is per round.
+    /// A generation granted by one root's core, whose stream then restarted
+    /// at a new root (a new round), takes an answer off the core only after
+    /// that root's core has granted in the new round.
+    #[test]
+    fn an_off_core_answer_needs_a_core_grant_in_the_current_round() {
+        let (mut h, _t0, req, _) = delegate_with_a_renewal_in_flight();
+        let first = h.core.dl.mine[&7].core_granted_round;
+        assert_eq!(first, Some(round_of(&h, 7)));
+        // The root changed and came back: a new round, served from before.
+        h.core.dl.mine.get_mut(&7).unwrap().stream_round += 1;
+        let until = h.core.deleg_mine_until(7);
+        h.advance(100);
+        h.step(off_core_answer(&h, req, 7, 5_000));
+        assert_eq!(h.core.stats.deleg_off_core_answers_applied, 0);
+        assert_eq!(h.core.deleg_mine_until(7), until);
+        // Its core's answer in the new round: granted, and from then on the
+        // off-core answers count.
+        h.step(renewed(&h, req, 7, 5_000));
+        assert_eq!(h.core.dl.mine[&7].core_granted_round, Some(round_of(&h, 7)));
+    }
+
+    /// Fail-before (R2): the core's refusal of a request the root's off-core
+    /// answer completed still ends the generation here.
+    #[test]
+    fn the_cores_refusal_after_an_off_core_grant_still_ends_the_generation() {
+        let (mut h, _t0, req, _) = delegate_with_a_renewal_in_flight();
+        h.advance(100);
+        h.step(off_core_answer(&h, req, 7, 5_000));
+        assert_eq!(h.core.stats.deleg_off_core_answers_applied, 1);
+        assert!(!h.core.dl.mine[&7].stopped);
+        h.advance(100);
+        h.step(renewed(&h, req, 7, 0));
+        assert!(h.core.dl.mine[&7].stopped, "the refusal was swallowed");
+        assert_eq!(h.core.stats.deleg_renewals_refused, 1);
+        // An ordinary late refusal (a request given up on) is left to the
+        // renewal in flight, as before.
+    }
+
+    #[test]
+    fn the_bookkeeping_of_an_off_core_answer_is_the_cores() {
+        let mut h = root_with_delegate_backed_by(4);
+        let timer_before = h.core.dl.gens[&7].expiry;
+        h.advance(100);
+        let out = h.step(Event::DelegRenewAnsweredOffCore {
+            gen: 7,
+            from: 3,
+            ttl_ms: 1_000,
+        });
+        assert_eq!(h.core.stats.deleg_root_answered_off_core, 1);
+        assert!(h.core.dl.gens[&7].expiry.is_some());
+        assert_ne!(h.core.dl.gens[&7].expiry, timer_before, "re-armed: {out:?}");
+        // Another node's, or an unknown generation's, is nothing.
+        h.step(Event::DelegRenewAnsweredOffCore {
+            gen: 7,
+            from: 4,
+            ttl_ms: 1_000,
+        });
+        h.step(Event::DelegRenewAnsweredOffCore {
+            gen: 99,
+            from: 3,
+            ttl_ms: 1_000,
+        });
+        assert_eq!(h.core.stats.deleg_root_answered_off_core, 1);
+    }
+
+    // --------------------------------------------- R2, the delegate's side
+
+    fn off_core_answer(h: &Harness, req: OpId, gen: u64, ttl_ms: u64) -> Event {
+        Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegRenewedOffCore {
+                req,
+                gen,
+                round: round_of(h, gen),
+                ttl_ms,
+            },
+        }
+    }
+
+    /// The core's renewal sent at `t0 + 2.5 s` (the timer's), still in flight.
+    fn delegate_with_a_renewal_in_flight() -> (Harness, Ms, OpId, Vec<Action>) {
+        let (mut h, _dir, t0, _lapse) = delegate_renewed_once();
+        h.advance(2_500);
+        let timer = h
+            .core
+            .dl
+            .mine
+            .get(&7)
+            .and_then(|d| d.renew_timer)
+            .expect("the renewal timer");
+        let out = h.step(Event::Timer { id: timer });
+        let req = renew_req(&out, 7).expect("a renewal at the timer");
+        (h, t0, req, out)
+    }
+
+    #[test]
+    fn an_off_core_answer_extends_a_served_grant_from_the_requests_own_send() {
+        let (mut h, t0, req, _) = delegate_with_a_renewal_in_flight();
+        let sent = t0.plus(2_500);
+        // Until now: the first grant's end, t0 + 4 s.
+        assert_eq!(h.core.deleg_mine_until(7), Some(hm(t0.plus(4_000))));
+        h.advance(700);
+        let out = h.step(off_core_answer(&h, req, 7, 5_000));
+        // Honoured from the send: `sent + ttl - margin`, not from the receipt.
+        assert_eq!(h.core.deleg_mine_until(7), Some(hm(sent.plus(4_000))));
+        assert_eq!(h.core.stats.deleg_off_core_answers_applied, 1);
+        // The request is complete for the schedule: the next renewal is armed
+        // from its send, at half the ttl.
+        let t = timers(&out, TimerKind::DelegRenew);
+        assert_eq!(t.len(), 1, "{out:?}");
+        assert_eq!(h.core.timer_honour(t[0]), Some(hm(sent.plus(2_500))));
+        assert!(h.core.dl.mine[&7].renew.is_none());
+        assert_eq!(h.core.deleg_late_reqs(), vec![req]);
+        // The root's full answer, when its core runs, is a late one: its
+        // extension is a no-op and the late entry is consumed.
+        h.advance(900);
+        h.step(renewed(&h, req, 7, 5_000));
+        assert!(h.core.deleg_late_reqs().is_empty());
+        assert_eq!(h.core.deleg_mine_until(7), Some(hm(sent.plus(4_000))));
+    }
+
+    #[test]
+    fn an_off_core_answer_is_never_a_first_grant() {
+        // A generation installed, its first renewal in flight, never granted.
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let _dir = delegated_to_me(&h.meta, 3);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let req = renew_req(&out, 7).expect("renewal on install");
+        h.advance(100);
+        h.step(off_core_answer(&h, req, 7, 5_000));
+        assert_eq!(h.core.deleg_mine_until(7), None, "served on a bare ttl");
+        assert_eq!(h.core.stats.deleg_off_core_answers_applied, 0);
+        assert!(
+            h.core.dl.mine[&7].renew.is_some(),
+            "its full answer is awaited"
+        );
+    }
+
+    #[test]
+    fn an_off_core_answer_from_another_root_round_or_request_is_ignored() {
+        let (mut h, t0, req, _) = delegate_with_a_renewal_in_flight();
+        let until = h.core.deleg_mine_until(7);
+        // Another node's.
+        h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegRenewedOffCore {
+                req,
+                gen: 7,
+                round: round_of(&h, 7),
+                ttl_ms: 5_000,
+            },
+        });
+        // Another round (a previous incarnation's).
+        h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegRenewedOffCore {
+                req,
+                gen: 7,
+                round: round_of(&h, 7) + 1,
+                ttl_ms: 5_000,
+            },
+        });
+        // A request this node never sent.
+        h.step(off_core_answer(&h, OpId(9_999), 7, 5_000));
+        // A refusal is not an off-core answer at all.
+        h.step(off_core_answer(&h, req, 7, 0));
+        // An unknown generation.
+        h.step(off_core_answer(&h, req, 8, 5_000));
+        assert_eq!(h.core.deleg_mine_until(7), until);
+        assert_eq!(h.core.stats.deleg_off_core_answers_applied, 0);
+        assert!(h.core.dl.mine[&7].renew.is_some());
+        let _ = t0;
+    }
+
+    #[test]
+    fn an_off_core_answer_to_a_recalled_generation_is_ignored() {
+        let (mut h, _t0, req, _) = delegate_with_a_renewal_in_flight();
+        h.core.dl.mine.get_mut(&7).unwrap().stopped = true;
+        h.step(off_core_answer(&h, req, 7, 5_000));
+        assert_eq!(h.core.stats.deleg_off_core_answers_applied, 0);
+    }
+
+    /// Fail-before (R2): a request that reached the root just before its core
+    /// got stuck was queued to that core and nobody answers it; the delegate
+    /// sends the renewal once more after what the root's answerer needs to see
+    /// the core stuck (a request made after the stall began is answered off
+    /// the core), once, and the first one still counts if it is answered.
+    #[test]
+    fn an_unanswered_renewal_is_sent_once_more_after_the_answerers_threshold() {
+        let (mut h, t0, req, _) = delegate_with_a_renewal_in_flight();
+        // (The daemon's forward timeout is seconds; the harness's 500 ms
+        // would give up before the early resend.)
+        h.core.cfg.forward_timeout_ms = 10_000;
+        let resend = h.core.deleg_resend_ms();
+        assert_eq!(resend, 750, "a quarter of a 2.5 s period, plus the slack");
+        h.advance(resend as u64 - 50);
+        assert!(renewal_sent(&poke(&mut h)).is_none(), "too early");
+        h.advance(100);
+        let out = poke(&mut h);
+        let (to, again, round) = renewal_sent(&out).expect("no resend of an unanswered renewal");
+        assert_eq!((to, round), (1, round_of(&h, 7)));
+        assert_ne!(again, req);
+        assert_eq!(h.core.deleg_late_reqs(), vec![req], "the first is kept");
+        // Only once: the resend waits for the ordinary timeout.
+        h.advance(resend as u64 + 100);
+        assert!(renewal_sent(&poke(&mut h)).is_none());
+        // The first one's answer still counts, from its own send.
+        h.step(renewed(&h, req, 7, 5_000));
+        assert_eq!(h.core.deleg_mine_until(7), Some(hm(t0.plus(2_500 + 4_000))));
+    }
+
+    #[test]
+    fn an_answered_renewal_is_not_sent_again() {
+        let (mut h, _t0, req, _) = delegate_with_a_renewal_in_flight();
+        h.advance(300);
+        h.step(renewed(&h, req, 7, 5_000));
+        h.advance(900);
+        assert!(renewal_sent(&poke(&mut h)).is_none());
+        assert!(h.core.deleg_late_reqs().is_empty());
+    }
+
+    /// The lane's registered request (the core was stuck): extension only,
+    /// the schedule is not touched.
+    #[test]
+    fn an_off_core_answer_to_a_lane_request_extends_and_does_not_reschedule() {
+        let (mut h, _dir, t0, _lapse) = delegate_renewed_once();
+        h.advance(3_000);
+        h.step(lane_sent(&h, 1, hm(t0.plus(2_600))));
+        let req = OpId(crate::deleg_lane::LANE_REQ_BIT | 1);
+        let timer = h.core.dl.mine[&7].renew_timer;
+        let out = h.step(off_core_answer(&h, req, 7, 5_000));
+        assert_eq!(h.core.deleg_mine_until(7), Some(hm(t0.plus(2_600 + 4_000))));
+        assert!(timers(&out, TimerKind::DelegRenew).is_empty(), "{out:?}");
+        assert_eq!(h.core.dl.mine[&7].renew_timer, timer);
+        assert_eq!(h.core.stats.deleg_off_core_answers_applied, 1);
+    }
 }

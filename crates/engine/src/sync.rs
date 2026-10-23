@@ -311,6 +311,25 @@ pub enum SyncRequest {
         gen: u64,
         round: u64,
     },
+    /// Plan 41 R2: the root answered this delegate's renewal off its core
+    /// (the RPC reply, [`Payload::DelegRenewedOffCore`]): a grant of
+    /// `ttl_ms`, applied by the core as an extension only
+    /// (`PeerMsg::DelegRenewedOffCore`). Urgent lane.
+    PeerDelegRenewedOffCore {
+        from: u64,
+        req_id: u64,
+        gen: u64,
+        round: u64,
+        ttl_ms: u64,
+    },
+    /// Plan 41 R2, root: this node's P2P service extended delegate `from`'s
+    /// window of `gen` off the core by `ttl_ms` ([`Event::DelegRenewAnsweredOffCore`]).
+    /// Urgent lane, after the request it answers.
+    DelegRenewAnsweredOffCore {
+        gen: u64,
+        from: u64,
+        ttl_ms: u64,
+    },
     /// The off-core lane's request `req_id` to `to` failed at the transport
     /// (urgent lane, behind its registration): the core takes it off its
     /// pending renewals (`Event::PeerFailed`).

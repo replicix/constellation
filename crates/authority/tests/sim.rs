@@ -369,6 +369,16 @@ fn replay_seed() {
         Ok("delegated-core-stall-forwarded") => delegated_core_stall_forwarded_config(),
         Ok("delegated-core-stall-unlaned") => delegated_core_stall_unlaned_config(),
         Ok("delegated-core-hang") => delegated_core_hang_config(),
+        Ok("delegated-core-stall-root") => delegated_core_stall_root_config(),
+        Ok("delegated-core-stall-root-unlaned") => delegated_core_stall_root_unlaned_config(),
+        Ok("delegated-core-stall-root-lease6") => delegated_core_stall_root_lease6_config(),
+        Ok("delegated-core-stall-root-backup") => delegated_core_stall_root_backup_config(),
+        Ok("delegated-core-stall-root-hang") => delegated_core_stall_root_hang_config(),
+        Ok("delegated-core-stall-both") => delegated_core_stall_both_config(),
+        Ok("delegated-core-stall-root-recall") => delegated_core_stall_root_recall_config(),
+        Ok("delegated-core-stall-root-recall-open") => {
+            delegated_core_stall_root_recall_open_config()
+        }
         // Plan 30 §M14.
         Ok("locks") => locks_config(),
         Ok("locks-partition") => locks_partition_config(),
@@ -4872,6 +4882,14 @@ fn sweep_config() {
         "delegated-core-stall-forwarded" => delegated_core_stall_forwarded_config(),
         "delegated-core-stall-unlaned" => delegated_core_stall_unlaned_config(),
         "delegated-core-hang" => delegated_core_hang_config(),
+        "delegated-core-stall-root" => delegated_core_stall_root_config(),
+        "delegated-core-stall-root-unlaned" => delegated_core_stall_root_unlaned_config(),
+        "delegated-core-stall-root-lease6" => delegated_core_stall_root_lease6_config(),
+        "delegated-core-stall-root-backup" => delegated_core_stall_root_backup_config(),
+        "delegated-core-stall-root-hang" => delegated_core_stall_root_hang_config(),
+        "delegated-core-stall-both" => delegated_core_stall_both_config(),
+        "delegated-core-stall-root-recall" => delegated_core_stall_root_recall_config(),
+        "delegated-core-stall-root-recall-open" => delegated_core_stall_root_recall_open_config(),
         "placement-hot" => placement_hot_config(),
         "backup-hot" => backup_hot_config(),
         "flex" => flex_config(),
@@ -6001,6 +6019,127 @@ fn delegated_core_hang_config() -> SimConfig {
     }
 }
 
+/// Plan 41 R2, `delegate-store-stall` with the root stalled: the lease
+/// holder's core (`StallStep { node: 0 }`) is stuck in a step for 6.5 s,
+/// 9 s and 12.5 s (1.3, 1.8 and 2.5 × the 5 s grant) while the delegates of
+/// `d1` and `d2` renew: the root's P2P service answers from outside its core
+/// (`deleg_lane::answer_root`, the bus tap of `node.rs`), no generation is
+/// reclaimed, none lapses, none ends. The lease is 30 s: longer than any
+/// stall, so the cap is not the question here (`-root-lease6` has it).
+fn delegated_core_stall_root_config() -> SimConfig {
+    let stall = |at_ms, for_ms| ScheduledFault {
+        at_ms,
+        kind: FaultKind::StallStep { node: 0, for_ms },
+    };
+    SimConfig {
+        core: std::sync::Arc::new(|node, incarnation| {
+            let mut c = sim::run::sim_core_config(node, incarnation);
+            c.ttl_ms = 30_000;
+            c
+        }),
+        faults: vec![
+            stall(1_500, 6_500),
+            stall(11_000, 9_000),
+            stall(22_000, 12_500),
+        ],
+        ..delegated_core_stall_config()
+    }
+}
+
+/// [`delegated_core_stall_root_config`] without the root's answerer: what
+/// stock did (`KNOWN-GAP root core stuck`): the stuck root answered nothing,
+/// the delegates lapsed and the root reclaimed.
+fn delegated_core_stall_root_unlaned_config() -> SimConfig {
+    SimConfig {
+        deleg_root_lane: false,
+        ..delegated_core_stall_root_config()
+    }
+}
+
+/// [`delegated_core_stall_root_config`] on the sim's default 6 s root lease:
+/// a root core stuck past what is left of its lease cannot renew it, and the
+/// answerer's grants end at the cap (the lease's end less the margin), never
+/// later. Safety only: the oracles judge, and the root answers off the core
+/// while the lease lasts.
+fn delegated_core_stall_root_lease6_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(sim::run::sim_core_config),
+        ..delegated_core_stall_root_config()
+    }
+}
+
+/// The usual delegation root has a backup (a fast tenure): the answerer
+/// answers only within `backup_takeover_ms` of the core's last proof of
+/// liveness, and the holder's off-core beat runs (`holder_beats`), so its
+/// backup does not seal it. Safety only (plan 41 P lengthens the answers).
+fn delegated_core_stall_root_backup_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(|node, incarnation| {
+            let mut c = sim::run::deleg_backup_core_config(node, incarnation);
+            c.ttl_ms = 30_000;
+            c
+        }),
+        holder_beats: sim::run::HolderBeats::Thread,
+        ..delegated_core_stall_root_config()
+    }
+}
+
+/// One root stall past the hung bound (15 s): the answerer stops there, the
+/// delegates' grants run out, and the generations are reclaimed or lapse.
+fn delegated_core_stall_root_hang_config() -> SimConfig {
+    SimConfig {
+        faults: vec![ScheduledFault {
+            at_ms: 1_500,
+            kind: FaultKind::StallStep {
+                node: 0,
+                for_ms: 26_000,
+            },
+        }],
+        settle_ms: 60_000,
+        ..delegated_core_stall_root_config()
+    }
+}
+
+/// The root and a delegate stuck in the same instant (the shared-disk case,
+/// `g6-renewal` run 14's shape): the delegate's lane renews while the root's
+/// answerer answers; neither side's core runs.
+fn delegated_core_stall_both_config() -> SimConfig {
+    let stall = |at_ms, node, for_ms| ScheduledFault {
+        at_ms,
+        kind: FaultKind::StallStep { node, for_ms },
+    };
+    SimConfig {
+        faults: vec![
+            stall(1_500, 0, 6_500),
+            stall(1_500, 2, 6_500),
+            stall(11_000, 0, 9_000),
+            stall(11_000, 3, 9_000),
+            stall(22_000, 0, 12_500),
+            stall(22_000, 2, 12_500),
+        ],
+        ..delegated_core_stall_root_config()
+    }
+}
+
+/// Cross-subtree ops recall the generations while the root is stuck: a
+/// recall that begins closes its slot in its step, and an answer after it is
+/// refused (`DelegWindows`). With `skip_close_on_recall` (the code before
+/// the close) the answerer extends windows a recall is outwaiting.
+fn delegated_core_stall_root_recall_config() -> SimConfig {
+    SimConfig {
+        cross_ratio: 0.3,
+        ..delegated_core_stall_root_config()
+    }
+}
+
+/// [`delegated_core_stall_root_recall_config`] without the recall's close.
+fn delegated_core_stall_root_recall_open_config() -> SimConfig {
+    SimConfig {
+        skip_close_on_recall: true,
+        ..delegated_core_stall_root_recall_config()
+    }
+}
+
 /// Plan 43 C0 (`AUTHORITY_SIM_FINGERPRINT=1`): a hash of what a run did, over
 /// the fields that predate the commit-rule oracles and the run's text — two
 /// trees whose runs are the same have the same fingerprint seed by seed (the
@@ -6252,6 +6391,7 @@ fn core_stall_check(label: &str, r: &Report) -> Result<(), String> {
         |f: fn(&constellation_authority::Stats) -> u64| -> u64 { r.stats.values().map(f).sum() };
     let (reclaimed, lapsed) = (sum(|s| s.deleg_reclaimed), sum(|s| s.deleg_lapsed));
     let (ended, off_core) = (sum(|s| s.deleg_ended), sum(|s| s.deleg_renewals_off_core));
+    let root_off_core = sum(|s| s.deleg_root_answered_off_core);
     let lost = || {
         format!(
             "reclaimed {reclaimed}, lapsed {lapsed}, ended {ended}, lane renewals {off_core}, \
@@ -6280,6 +6420,27 @@ fn core_stall_check(label: &str, r: &Report) -> Result<(), String> {
                 Ok(())
             }
         }
+        // The root stalled (plan 41 R2): the answerer keeps every grant (the
+        // unlaned variant is judged as the laned one: it fails).
+        "delegated-core-stall-root"
+        | "delegated-core-stall-root-unlaned"
+        | "delegated-core-stall-both"
+            if reclaimed + lapsed + ended > 0 || root_off_core == 0 =>
+        {
+            Err(format!(
+                "reclaimed {reclaimed}, lapsed {lapsed}, ended {ended}, root answers off the \
+                 core {root_off_core}: a delegation whose root core was stuck below the hung \
+                 bound was lost (installed {}, recalls {})",
+                sum(|s| s.deleg_installed),
+                sum(|s| s.deleg_recalls_sent),
+            ))
+        }
+        // (A short lease or a backed tenure answers within what it may: safety.)
+        "delegated-core-stall-root-lease6" | "delegated-core-stall-root-backup" => Ok(()),
+        "delegated-core-stall-root-hang" if reclaimed + lapsed == 0 => Err(format!(
+            "a root hung past the bound answered every grant (root answers {root_off_core}, \
+             ended {ended})"
+        )),
         "delegated-core-hang" if reclaimed == 0 => Err(format!(
             "a delegate hung past the bound was never reclaimed (lapsed {lapsed}, ended {ended}, \
              lane renewals {off_core}, recalls {})",
@@ -6388,6 +6549,101 @@ fn a_delegate_frozen_past_its_grant_counts_its_loss_as_one_in_a_freeze() {
 fn a_delegate_hung_past_the_bound_is_reclaimed() {
     for seed in 0..20u64 {
         run_core_stall("delegated-core-hang", delegated_core_hang_config, seed);
+    }
+}
+
+/// Plan 41 R2: a root whose core is stuck in a step below the hung bound
+/// keeps its delegations: its P2P service answers the renewals from outside
+/// the core, so nothing is reclaimed, lapsed or ended; the same seeds without
+/// the answerer lose them (`KNOWN-GAP root core stuck`).
+#[test]
+fn a_root_stuck_in_a_step_keeps_its_delegations() {
+    let seeds = 24u64;
+    let (mut answers, mut recall_answers, mut unlaned) = (0, 0, (0, 0));
+    for seed in 0..seeds {
+        let r = run_core_stall(
+            "delegated-core-stall-root",
+            delegated_core_stall_root_config,
+            seed,
+        );
+        answers += r
+            .stats
+            .values()
+            .map(|s| s.deleg_root_answered_off_core)
+            .sum::<u64>();
+        run_core_stall(
+            "delegated-core-stall-both",
+            delegated_core_stall_both_config,
+            seed,
+        );
+        run_core_stall(
+            "delegated-core-stall-root-lease6",
+            delegated_core_stall_root_lease6_config,
+            seed,
+        );
+        run_core_stall(
+            "delegated-core-stall-root-backup",
+            delegated_core_stall_root_backup_config,
+            seed,
+        );
+        // (A recall can end the tenure or the generation before the root is
+        // stuck: judged over all seeds, below.)
+        let r = run_core_stall(
+            "delegated-core-stall-root-recall",
+            delegated_core_stall_root_recall_config,
+            seed,
+        );
+        recall_answers += r
+            .stats
+            .values()
+            .map(|s| s.deleg_root_answered_off_core)
+            .sum::<u64>();
+        // The naive variant, the same seeds: the grants are lost.
+        let r = run_seed(seed, delegated_core_stall_root_unlaned_config()).unwrap_or_else(|e| {
+            panic!(
+                "seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=delegated-core-stall-root-unlaned"
+            )
+        });
+        assert_eq!(
+            r.stats
+                .values()
+                .map(|s| s.deleg_root_answered_off_core)
+                .sum::<u64>(),
+            0,
+            "the root answered off the core with the answerer off"
+        );
+        unlaned.0 += r.stats.values().map(|s| s.deleg_reclaimed).sum::<u64>();
+        unlaned.1 += r.stats.values().map(|s| s.deleg_lapsed).sum::<u64>();
+    }
+    eprintln!(
+        "delegated-core-stall-root: root answers {answers}, unlaned reclaimed/lapsed {unlaned:?}"
+    );
+    assert!(answers > 0, "the root never answered off the core");
+    assert!(
+        recall_answers > 0,
+        "no root answered off the core with recalls"
+    );
+    // (Lapsed at the delegate is the loss. The root's own reclaim is not
+    // asserted: the renewals the delegate resends queue up behind the stuck
+    // step and the core, when it runs, answers them before its expiry timer.)
+    assert!(
+        unlaned.1 >= seeds,
+        "without the answerer the delegations of a stalled root survived: the configuration is \
+         vacuous ({unlaned:?})"
+    );
+}
+
+/// A root hung past the bound is a dead one: the answerer stops at 15 s, the
+/// delegations are lost as they always were.
+#[test]
+fn a_root_hung_past_the_bound_loses_its_delegations() {
+    for seed in 0..20u64 {
+        run_core_stall(
+            "delegated-core-stall-root-hang",
+            delegated_core_stall_root_hang_config,
+            seed,
+        );
     }
 }
 

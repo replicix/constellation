@@ -730,6 +730,34 @@ optimistic commits (ADR-28).
 models `crates/model/src/delegation.rs`, `crates/model/src/hotdir.rs`.
 Amends ADR-5, ADR-14 and ADR-15.
 
+**Amended (a stuck core and delegations, plan 41)**: both ends of a
+delegation's renewal are steps of an authority core, and a core stuck in
+one step (a metadata-store write behind a slow journal write) renewed or
+answered nothing, so a delegation was reclaimed and lapsed with both nodes
+alive. Two lanes beside the cores keep it: the delegate's, which sends the
+renewals the stuck core cannot (`deleg_lane`, registered with the core and
+counted as a late answer, honoured from the lane's own send), and, at the
+root, its P2P service answering the renewal itself while the root's driver
+is stuck (`deleg_lane::answer_root`): the generation's window lives in one
+shared table (`DelegWindows`), extended by a `max` by the core and the
+answerer alike, and **closed inside the core's step** by whatever ends or
+shortens it or after which the core would grant no more (a recall, a seal,
+the end, an epoch, the lease gone); the expiry decision reads the clock
+inside the table's guard and closes in the same critical section, so a
+window extended after a step took its `now` is re-armed, never reclaimed on
+the stale read. The answer rests on the lease certificate the core publishes
+at the end of every step (usability, the cap by the lease, the freshness rule
+of a tenure that can be taken over early, the lease mark) and on a lock side
+that has nothing to hand over; it carries no lock content, and the delegate
+applies it only as an extension of a grant it already serves. Every
+extension is one the core could have made then. Checked by the delegation
+model (`Stall`, `LaneRenew`; the lane extending a closed slot, or without the
+cap, violates `recall_safety`, the design is clean), the simulator
+(`delegated-core-stall-root*`) and the harness (`delegate-store-stall` with
+the root stalled). A root with a backup answers only within
+`backup_takeover_ms` of its core's last proof of liveness until the lane can
+prove its own (plan 41 P). Same pattern for lock grants: ADR-25's amendment.
+
 ## ADR-24: The hybrid S3 inbox for writes without a P2P path
 
 **Context**: with P2P off, or with no path to the holder, every write
@@ -807,9 +835,11 @@ strict mode (cross-node byte-range locks) had never been built.
   (git) must not write on without it. The TTL is long (20 s) so that
   lapses are rare; a crashed holder costs its waiters `ttl + margin`.
   Renewed half-way through its window, a grant is sure to survive a
-  stall of its holder (or of the core that sequences it, on the same
-  node) only up to `(ttl − margin) / 2` (9.5 s), and one up to
+  *stop* of its holder (a partition, a frozen or dead process: nothing
+  in it runs) only up to `(ttl − margin) / 2` (9.5 s), and one up to
   `ttl − margin` (19 s) only right after a renewal, never a whole TTL.
+  A stall of the authority core alone (a metadata-store write behind a
+  slow journal write) is no longer such a stop: see the amendment below.
 - Each mutation of a lock owner carries a fencing token (Chubby's
   sequencer, Kleppmann's argument): its grants and the end of the window
   its node honours them for. A sequencer that holds the grant (its

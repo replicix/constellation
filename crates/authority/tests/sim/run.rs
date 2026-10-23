@@ -542,6 +542,16 @@ pub struct SimConfig {
     /// `deleg_lane_loop`). `false` is the code before it, the non-vacuity
     /// knob of the core-stall configurations.
     pub deleg_lane: bool,
+    /// Plan 41 R2: the root's P2P service answers a delegation renewal off
+    /// its stuck core (`deleg_lane::answer_root`, in the bus tap of
+    /// `node.rs`). `false` is the code before it, the non-vacuity knob of
+    /// the root-stall configurations (`delegated-core-stall-root-unlaned`).
+    pub deleg_root_lane: bool,
+    /// Test-only non-vacuity: a recall does not close the slot of its
+    /// generation (the transition R1's rule 2 requires), so a renewal
+    /// answered off the core after the recall began extends the window
+    /// the recall outwaits (`delegated-core-stall-root-recall`).
+    pub skip_close_on_recall: bool,
     /// Plan 43 C0, I1 `acked_implies_committed`: an answer that no class
     /// of the plan's §4 covers (judged at its emission, `oracle.rs`) fails
     /// the run. Always counted (`Report::uncommitted_acks`); the flag only
@@ -819,6 +829,8 @@ impl Default for SimConfig {
             beats_lost_in_lag: false,
             keeps_backups: false,
             deleg_lane: true,
+            deleg_root_lane: true,
+            skip_close_on_recall: false,
             strict_commit: false,
             strict_identity: false,
             strict_settle: false,
@@ -3176,6 +3188,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         beats_credited: cfg.beats_credited,
         beats_lost_in_lag: cfg.beats_lost_in_lag,
         deleg_lane: cfg.deleg_lane,
+        deleg_root_lane: cfg.deleg_root_lane,
+        skip_close_on_recall: cfg.skip_close_on_recall,
         oracles: oracles.clone(),
         rebuild_stub: cfg.rebuild_stub,
         plant_ungated_fast_path: cfg.plant_ungated_fast_path,

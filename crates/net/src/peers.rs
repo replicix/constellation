@@ -1723,27 +1723,29 @@ async fn handle_stream<S: PeerService>(
                 backup,
                 stream_head,
                 stream_head_at,
-            } => {
-                service.deleg_renew(
-                    from,
-                    req_id,
-                    gen,
-                    round,
-                    backup,
-                    stream_head,
-                    stream_head_at,
-                );
-                Some(Payload::Ok { req_id })
-            }
+            } => Some(
+                service
+                    .deleg_renew(
+                        from,
+                        req_id,
+                        gen,
+                        round,
+                        backup,
+                        stream_head,
+                        stream_head_at,
+                    )
+                    .unwrap_or(Payload::Ok { req_id }),
+            ),
             Payload::DelegRenewOffCore {
                 from,
                 req_id,
                 gen,
                 round,
-            } => {
-                service.deleg_renew_off_core(from, req_id, gen, round);
-                Some(Payload::Ok { req_id })
-            }
+            } => Some(
+                service
+                    .deleg_renew_off_core(from, req_id, gen, round)
+                    .unwrap_or(Payload::Ok { req_id }),
+            ),
             Payload::DelegRenewed {
                 from,
                 req_id,
@@ -2089,7 +2091,8 @@ async fn handle_stream<S: PeerService>(
             | Payload::ChunkHandoffReply { .. }
             | Payload::SnapshotBatchReply { .. }
             | Payload::Ok { .. }
-            | Payload::HolderAliveAck { .. } => None,
+            | Payload::HolderAliveAck { .. }
+            | Payload::DelegRenewedOffCore { .. } => None,
         }))
     };
     let reply = tokio::select! {

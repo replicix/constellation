@@ -20,8 +20,8 @@
 //! it carries neither a backup nor a stream head, and the root extends the
 //! grant and learns nothing about the delegate's stream or backup from it.
 
-use crate::core::DelegRenewCert;
-use crate::ids::{HonourMs, WaitMs};
+use crate::core::{DelegRenewCert, DelegWindows, Refusal};
+use crate::ids::{HonourMs, NodeId, Now, WaitMs};
 use std::collections::HashMap;
 
 /// Request ids of the lane's renewals carry this bit; the core's are
@@ -45,6 +45,11 @@ pub const DELEG_LANE_STUCK_MIN_MS: i64 = 100;
 /// [`DELEG_LANE_STUCK_MIN_MS`]). The core would have renewed by one period
 /// after the last renewal; the lane steps in after a quarter of one, so a
 /// short grant is not given up on for most of its length first.
+/// The slack a delegate adds to [`stuck_threshold_ms`] before it sends a
+/// renewal that the root has not answered once more (`Core::deleg_resend_ms`):
+/// the request's trip and the answerer's own reading.
+pub const DELEG_RESEND_SLACK_MS: i64 = 250;
+
 pub fn stuck_threshold_ms(period_ms: u64) -> i64 {
     ((period_ms / 4) as i64).clamp(DELEG_LANE_STUCK_MIN_MS, DELEG_LANE_STUCK_MS)
 }
@@ -202,6 +207,81 @@ pub fn due(
         })
         .cloned()
         .collect()
+}
+
+/// The root's side (plan 41 R2): whether a delegation renewal that reached
+/// this node's P2P service is answered there, off the root's core, and with
+/// what grant. `stuck_ms` is how long the driver has made no progress
+/// (`OffCore`'s reading), `hung_ms` the holder heartbeat's bound
+/// (`CONSTELLATION_HOLDER_STALL_MS`): as the delegate's lane, nothing
+/// unless the driver has been stuck for [`stuck_threshold_ms`] of half the
+/// grant (the period a delegate renews at) and no longer than `hung_ms`.
+/// Then [`DelegWindows::extend_off_core`] decides, in one critical section,
+/// from the lease certificate the core published after its last step and
+/// the generation's slot. `Ok(ttl_ms)` is the grant the caller replies
+/// with ([`constellation_net::Payload::DelegRenewedOffCore`], as the RPC
+/// reply of the request: no send waits on the root's runtime); the request
+/// itself is still queued to the core, which answers it in full when it runs
+/// (a second extension is a `max`).
+///
+/// # Why this is the root's own answer
+///
+/// Each extension made here at time `t` is one the core could have made at
+/// `t` (`Core::on_deleg_renew`):
+///
+/// 1. *Same process, same clocks*: `now` is a reading of the protocol clock,
+///    the one the core's steps read, and the window table's own clock inside
+///    its guard is the same.
+/// 2. *Authority*: the root's rule (`root_usable`, no epoch, the cap, the
+///    freshness hold and the lease mark) from a certificate published
+///    before the actions of the step it describes were dispatched
+///    (`Core::deleg_publish_root`: the end of every `handle`), with the
+///    time-bounded facts re-checked against the honour clock at `t`
+///    ([`crate::core::decide`]). A deposition, a release or an epoch that a
+///    step learns while it runs (the certificate is a step old): a tenure
+///    that can be taken over before its lease expires needs a proof of
+///    liveness within `backup_takeover_ms` of the answer (a deposing
+///    successor takes over only by waiting out, or sealing, a tenure
+///    silent for longer); one that cannot (`Local`) is bounded by the cap,
+///    the lease's own end. Both are exactly the cases of the lock lane's
+///    argument (`docs/reference/features/cluster-locks.md`). Those that begin
+///    in a step and take effect through an *action* (a release's CAS, an
+///    epoch's recall) are published closed before the action is dispatched.
+/// 3. *The generation*: everything that happens to a generation inside a
+///    step — a recall, a seal, the end, an expiry decision, the lease gone,
+///    an epoch — closes its slot in that step ([`DelegWindows`]), and the
+///    slot is the one place the window lives, so the core never reclaims a
+///    window the answerer extended (the expiry decision re-reads it under the
+///    mutex) and the answerer never extends one the core closed.
+/// 4. *The delegate honours from its own send*, which is no later than
+///    `t`: it stops at `sent + ttl − margin ≤ t + ttl − margin`, the root's
+///    window runs to `t + ttl + extra` with `extra ≥ margin`.
+/// 5. *No lock content crosses*: the reply carries no lock handoff, grace,
+///    floor, cut or barrier (the core's answer does, when it runs), so it
+///    is never the delegate's first grant (`Window::settled`: a granting
+///    core answer was sent, and nothing pending since), and the delegate
+///    applies it only as an extension of a grant it already serves
+///    (`Core::on_deleg_renewed_off_core`).
+pub fn answer_root(
+    windows: &DelegWindows,
+    stuck_ms: i64,
+    hung_ms: i64,
+    from: NodeId,
+    gen: u64,
+    now: Now,
+) -> Result<u64, Refusal> {
+    let period = windows
+        .lease_cert()
+        .map_or(DELEG_LANE_STUCK_MS as u64 * 2, |l| l.delegation_ttl_ms / 2);
+    if stuck_ms < stuck_threshold_ms(period) {
+        windows.note_deferred(Refusal::NotStuck);
+        return Err(Refusal::NotStuck);
+    }
+    if stuck_ms > hung_ms {
+        windows.note_deferred(Refusal::Hung);
+        return Err(Refusal::Hung);
+    }
+    windows.extend_off_core(gen, from, now)
 }
 
 #[cfg(test)]

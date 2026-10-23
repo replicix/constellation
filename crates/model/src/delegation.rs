@@ -110,6 +110,29 @@
 //! | `Seal`/`Drain` | M9's backup seal, addressed to the root instead of the lease |
 //! | `Takeover` | the M5 acquisition; the table is read from the replica |
 //!
+//! # The root's answer off its core (plan 41 R)
+//!
+//! A root whose authority core is stuck in a step (`Stall(i)`: its core
+//! actions are disabled: delivery to it, `Ship`, `RecallTimeout`, `Delegate`,
+//! its own ops) still has its P2P service, which answers a delegate's
+//! `RenewReq` itself (`LaneRenew`): the root lane. It decides from what the
+//! core published before it stuck, never from the register (the lane does
+//! not know of a deposition): the root's lease end (`Root::expires`, the cap:
+//! `ttl = min(deleg_ttl, expires − lease_margin − now)`, nothing at or below
+//! 0) and the generation's slot (live, not ended, no recall, no seal asked,
+//! asked for by its delegate: the slot a core transition closes in its own
+//! step, which in this model is the action itself). It extends `until` (a
+//! `max`) and sends `Renewed`; the delegate honours from its own send as ever.
+//! Knobs, each a violation of `recall_safety` the design does not have:
+//! `root_lane_after_close` (the lane extends a closed slot: a generation the
+//! root already ended is renewed, and its delegate acknowledges under it),
+//! `root_lane_ignores_cap` (the lane grants the full ttl past the lease's
+//! usable end, across a takeover). `root_lane_ignores_freshness` would be the
+//! lane renewing a fast tenure a backup has sealed; this model has no
+//! early takeover (M9's seal is "the same transition with an earlier trigger
+//! and is not modeled separately"), so that knob is the sim's non-vacuity
+//! switch's (`delegated-core-stall-root-backup`), recorded in PROGRESS.
+//!
 //! # Properties
 //!
 //! - `per_key_linearizable` (always): each key's history — `Create`,
@@ -577,6 +600,17 @@ pub struct DelegModel {
     pub max_tick: u8,
     pub max_epoch: u8,
     pub max_history: usize,
+    /// Plan 41 R: the most core stalls (`Stall`) of a root in a run.
+    pub max_stalls: u8,
+    /// Plan 41 R: a stalled root's P2P service answers `RenewReq` itself
+    /// (`LaneRenew`). Design: `true`; with `false` a stalled root answers
+    /// nothing.
+    pub root_lane: bool,
+    /// Non-vacuity: the lane extends a closed slot (a recall begun, a seal
+    /// asked, the generation ended).
+    pub root_lane_after_close: bool,
+    /// Non-vacuity: the lane grants the full ttl, with no cap by the lease.
+    pub root_lane_ignores_cap: bool,
     /// Plan 43 C0: check `acked_ops_are_never_replayed`. Off by default so
     /// a counterexample search that stops at the first failed property still
     /// ends on the property a test is about (C2 turns it on everywhere).
@@ -619,12 +653,93 @@ impl DelegModel {
             max_tick: 6,
             max_epoch: 1,
             max_history: 40,
+            max_stalls: 0,
+            root_lane: true,
+            root_lane_after_close: false,
+            root_lane_ignores_cap: false,
             check_acked_replay: false,
         }
     }
 
     fn n(&self) -> usize {
         self.scripts.len()
+    }
+
+    /// What the root lane would grant `msg` (a `RenewReq` to a stalled root)
+    /// now: `Some(ttl)`, decided from the root's own state and clock alone
+    /// (never the register: a stalled core has not learned of a
+    /// deposition), or `None`.
+    fn lane_grant(&self, s: &State, msg: &Msg) -> Option<i16> {
+        let Msg::RenewReq { from, to, gen } = msg else {
+            return None;
+        };
+        if !self.root_lane {
+            return None;
+        }
+        let r = *to as usize;
+        let node = &s.nodes[r];
+        let root = node.root.as_ref().filter(|_| node.alive)?;
+        let gs = &root.gens[*gen as usize];
+        let designated = s.designated_gens & (1 << *gen) != 0;
+        let open = gs.live
+            && !gs.ended
+            && gs.recall == RecallPhase::None
+            && !gs.seal_asked
+            && gs.node == *from
+            && !designated;
+        if !open && !self.root_lane_after_close {
+            return None;
+        }
+        if !gs.live || gs.node != *from {
+            return None;
+        }
+        let now = s.local(r);
+        let ttl = if self.root_lane_ignores_cap {
+            self.deleg_ttl
+        } else {
+            self.deleg_ttl.min(root.expires - self.lease_margin - now)
+        };
+        (ttl > 0).then_some(ttl)
+    }
+
+    fn lane_may_renew(&self, s: &State, msg: &Msg) -> bool {
+        self.lane_grant(s, msg).is_some()
+    }
+
+    /// The root lane answers `msg`: `until` is extended (a `max`) and
+    /// `Renewed` sent; the stalled core does nothing.
+    fn lane_renew(&self, s: &mut State, msg: Msg) {
+        let Some(ttl) = self.lane_grant(s, &msg) else {
+            return;
+        };
+        let Msg::RenewReq { from, to, gen } = msg else {
+            return;
+        };
+        let r = to as usize;
+        let now = s.local(r);
+        let root = s.nodes[r].root.as_mut().expect("root");
+        let gs = &mut root.gens[gen as usize];
+        gs.until = gs.until.max(now + ttl + self.root_margin);
+        s.send(Msg::Renewed { to: from, gen, ttl });
+        s.saw |= SAW_ROOT_LANE_RENEWED;
+    }
+}
+
+/// The node a message is for (`NONE`: none).
+fn msg_to(m: &Msg) -> u8 {
+    match m {
+        Msg::Fwd { to, .. }
+        | Msg::Ack { to, .. }
+        | Msg::NotOwner { to, .. }
+        | Msg::Stream { to, .. }
+        | Msg::RenewReq { to, .. }
+        | Msg::Renewed { to, .. }
+        | Msg::Recall { to, .. }
+        | Msg::Recalled { to, .. }
+        | Msg::Append { to, .. }
+        | Msg::AppendAck { to, .. }
+        | Msg::Drain { to, .. }
+        | Msg::SealReq { to, .. } => *to,
     }
 }
 
@@ -893,6 +1008,8 @@ pub const SAW_TENTATIVE: u16 = 2048;
 /// died or was recalled). `acked_ops_are_never_replayed` is this bit never
 /// set — C2 makes it hold; today it does not.
 pub const SAW_ACKED_REPLAYED: u16 = 4096;
+/// Plan 41 R: a stalled root's P2P service renewed a grant.
+pub const SAW_ROOT_LANE_RENEWED: u16 = 8192;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
@@ -915,6 +1032,10 @@ pub struct State {
     pub durable_rids: Vec<Rid>,
     /// Phase 2b: the generations that are designations (bit `gen`).
     pub designated_gens: u16,
+    /// Plan 41 R: the nodes whose authority core is stuck in a step
+    /// (bit `i`), and how many stalls the run has had.
+    pub stalled: u8,
+    pub stalls: u8,
     pub violation: Option<Violation>,
     pub saw: u16,
 }
@@ -924,6 +1045,10 @@ pub struct State {
 impl State {
     fn local(&self, i: usize) -> i16 {
         self.t as i16 + self.off[i]
+    }
+
+    fn is_stalled(&self, i: usize) -> bool {
+        self.stalled & (1 << i) != 0
     }
 
     fn usable_root(&self, cfg: &DelegModel, i: usize) -> bool {
@@ -1185,6 +1310,13 @@ pub enum Action {
     Seal(u8),
     /// A requester replays a retracted op by rid.
     SendReplay(u8),
+    /// Plan 41 R: node `i`'s authority core gets stuck in a step.
+    Stall(u8),
+    /// The step ends.
+    Unstall(u8),
+    /// Plan 41 R: the stalled root's P2P service answers the `RenewReq`
+    /// at `net[k]` itself.
+    LaneRenew(usize),
 }
 
 impl Model for DelegModel {
@@ -1311,6 +1443,8 @@ impl Model for DelegModel {
             closed: 0,
             durable_rids: Vec::new(),
             designated_gens,
+            stalled: 0,
+            stalls: 0,
             violation: None,
             saw: 0,
         }]
@@ -1338,7 +1472,16 @@ impl Model for DelegModel {
                 if s.drops < self.max_drops {
                     actions.push(Action::Drop(k));
                 }
-                actions.push(Action::Deliver(k));
+                // A message for a node whose core is stuck waits for it,
+                // unless the root lane answers it.
+                let to = msg_to(&s.net[k]);
+                if to != NONE && s.is_stalled(to as usize) {
+                    if self.lane_may_renew(s, &s.net[k]) {
+                        actions.push(Action::LaneRenew(k));
+                    }
+                } else {
+                    actions.push(Action::Deliver(k));
+                }
             }
         }
         for i in 0..n {
@@ -1349,6 +1492,15 @@ impl Model for DelegModel {
             }
             if s.crashes < self.max_crashes {
                 actions.push(Action::Crash(iu));
+            }
+            if s.is_stalled(i) {
+                actions.push(Action::Unstall(iu));
+                // Nothing else of a stuck core: no tail, ship, timeout,
+                // delegation, takeover, client op or renewal.
+                continue;
+            }
+            if node.root.is_some() && s.stalls < self.max_stalls {
+                actions.push(Action::Stall(iu));
             }
             if (node.applied as usize) < s.log.len() {
                 actions.push(Action::Tail(iu));
@@ -1501,6 +1653,15 @@ impl Model for DelegModel {
             Action::Deliver(k) => {
                 let m = s.net.remove(k);
                 deliver(self, &mut s, m);
+            }
+            Action::Stall(i) => {
+                s.stalled |= 1 << i;
+                s.stalls += 1;
+            }
+            Action::Unstall(i) => s.stalled &= !(1 << i),
+            Action::LaneRenew(k) => {
+                let m = s.net.remove(k);
+                self.lane_renew(&mut s, m);
             }
             Action::Crash(i) => {
                 s.nodes[i as usize].alive = false;
@@ -1733,6 +1894,7 @@ impl Model for DelegModel {
         witness!("restreamed", SAW_RESTREAM);
         witness!("deps_waited", SAW_DEPS_WAIT);
         witness!("redelegated", SAW_REDELEGATED);
+        witness!("root_lane_renewed", SAW_ROOT_LANE_RENEWED);
         props
     }
 

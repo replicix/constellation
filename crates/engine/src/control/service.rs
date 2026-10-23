@@ -502,6 +502,9 @@ impl EngineControl {
                     place_range_recalls: stats.place_range_recalls,
                     read_index_served: stats.deleg_read_index_served,
                     read_grants: stats.deleg_read_grants,
+                    root_answers_off_core: core.delegation_root_answers_off_core,
+                    root_answers_deferred: core.delegation_root_answers_deferred.clone(),
+                    off_core_answers_applied: stats.deleg_off_core_answers_applied,
                 }
             },
             cto: {

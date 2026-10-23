@@ -298,6 +298,94 @@ delegated directory do not wait for its ship either. Status:
   the transport is reported to the core (on the urgent lane, behind its
   registration), which drops it from its pending renewals, as it does a core
   renewal's failure.
+  **The root's side: its answer off the core.** The root answers every
+  renewal from its core too (`DelegRenewed`), and a root core stuck in a
+  step answers nothing: the delegate lapsed at `sent + ttl − margin` and
+  the root reclaimed at `until`, though both nodes were alive
+  (`delegate-store-stall` with the root's store stalled, which reported
+  `KNOWN-GAP root core stuck`). While the root's driver has been stuck
+  for the same time as the delegate's lane waits (a quarter of half the
+  grant, 100 to 500 ms) and no longer than `CONSTELLATION_HOLDER_STALL_MS`,
+  the root's P2P service, which receives the renewal on the shared
+  runtime, answers it itself: as the RPC reply of the request (no send
+  waits on the root's runtime), `DelegRenewedOffCore { ttl_ms }`, after
+  extending the generation's window in the **shared window table**
+  (`DelegWindows`, the one place a generation's `until` lives; the core
+  reads it through `gen_until`). The request is still queued to the core
+  unchanged, which answers it in full when it runs (a second extension is
+  a `max`) and does the bookkeeping the off-core answer skipped
+  (`Event::DelegRenewAnsweredOffCore`: statistics, the lease's activity
+  stamp, the expiry timer, the lease renewal a short grant calls for). The
+  delegate applies the reply only as an **extension of a grant it already
+  serves**, honoured from the request's own send, never as a first grant,
+  and with no lock content: no handoff, grace, floor, cut or barrier. For
+  its own request that was in flight it also arms the next renewal from the
+  send (the full answer, later, is a late one: its lock content is
+  installed as ever). A renewal that reached the root just before its core
+  got stuck was queued to that core (nothing looked stuck yet) and nobody
+  answers it off the core; so a delegate sends a renewal the root has not
+  answered within a quarter of a grant period plus 250 ms once more
+  (`Core::deleg_resend_ms`; the first request is kept for a late answer),
+  and that second one arrives while the core is stuck. The service that
+  answers is a task of the shared runtime, so the core's driver runs on a
+  thread of its own (`cst-authority`, polled by `Handle::block_on`): a step
+  waiting behind a slow journal write used to block a worker of that
+  runtime and the tasks queued on it, the service's among them, and a
+  renewal that reached the root during the stall was read only when the
+  stall ended (about half of the `delegate-store-stall` runs with the root
+  stalled). The window table and the certificate are what make it the
+  root's own answer:
+  1. *The window is one critical section.* Extensions (the core's and the
+     answerer's) are a `max` and commute. Whatever ends a window, or
+     after which the core would grant no more, **closes the generation's
+     slot inside the core's step**, at the transition: a recall begins, a
+     seal is sent, the generation ends, an epoch opens, the lease is gone
+     (`DelegWindows::close*`; a closed slot is extended by the core only,
+     which reopens it). The expiry decision (`close_if_expired`) reads the
+     clock inside the table's guard and closes in the same section, so a
+     window the answerer extended after the step took its `now` (a step
+     that waited in the store) is re-armed, never sealed or reclaimed on
+     the stale read.
+  2. *The root rule is the core's.* The answerer decides from the lease
+     certificate the core publishes at the end of every step, before the
+     driver dispatches its actions (`RootLease`: the lease epoch and its
+     end on the honour clock, the margin, the grant, the freshness facts
+     of `renew_hold`: whether the tenure may be taken over early, the
+     send of the latest S3 request that proved it live, the window, the
+     lease mark): usable (held, not lost, no gate or release in flight, no
+     continuation epoch), the cap (a grant never outlives the lease's end
+     less the margin: `ttl = min(grant, cap)`, nothing at or below 0) and
+     the freshness rule (a tenure that can be taken over before its lease
+     expires answers only within `backup_takeover_ms` of a proof of
+     liveness, and only with a marked lease), each judged against the
+     honour clock at the answer. A release, a takeover gate or an epoch
+     learned in a running step is published as no certificate before the
+     action that makes it effective goes out; the rest the freshness window
+     (fast tenures) or the cap (`Local`) bounds, exactly as for the lock
+     lane. A root with a backup, the usual delegation root, answers only
+     within 1.5 s of the core's last proof until the lane learns to prove
+     its own liveness (plan 41 P).
+  3. *The lock side is settled.* The generation is answered only if the
+     core sent it a granting answer in this tenure and since then no lock
+     handoff is pending, no outwait barrier is out and the subtree's floor
+     is what that answer carried (`Window::settled`), and the delegate
+     applies the reply only while it is serving and the root's core has
+     granted it in the current round (a root change starts a new round:
+     the new root's core grants first); so no answer without lock content
+     is ever the delegate's first grant or leaves a handoff behind. A
+     refusal by the core after an off-core grant of the same request still
+     ends the generation at the delegate.
+  4. *The delegate honours from its own send*, which is no later than the
+     answer: it stops at `sent + ttl − margin`, the root's window runs to
+     `answer + ttl + (margin)`.
+  `CONSTELLATION_DELEG_ROOT_LANE=off` turns the answerer off (A/B runs).
+  Status: `delegation.root_answers_off_core`, `root_answers_deferred` (by
+  reason: `hung`, `lease`, `generation`, `node`, `closed`, `unsettled`,
+  `stale_liveness`, `unmarked`, `cap`) on the root,
+  `off_core_answers_applied` on the delegate. A receive path that is a task
+  of the root's shared runtime is held up with it: a runtime blocked for
+  seconds answers nothing off the core either (the harness's runtime-hog
+  arm measures it; not fixed here).
   Not covered, and told apart by the core when it gives a grant up (a lapse, a
   refusal after the grant ran out, or the log ending the generation after it
   ran out; each is also counted in `grants_lost`):
@@ -510,10 +598,12 @@ designations create no delegation.
   and every later write in the subtree went through the root, 4 to 12 times
   slower, until something delegated it again (`delegate-store-stall`). A
   stall past the hung bound is the delegate being hung, not slow: the lane
-  stops there and the root reclaims, as for a dead delegate. The root's own
-  answering stays in its core: a root stuck in a step answers late (it
-  reclaims nothing meanwhile), so a delegate may lapse then, and keeps its
-  grant unless ops were parked.
+  stops there and the root reclaims, as for a dead delegate.
+- **Root's core stalled behind a slow disk**: the root's P2P service
+  answers the delegates' renewals itself while the core is stuck below the
+  same bound ("The root's side" above), so the generations are neither
+  reclaimed nor lapsed; a root hung past the bound is a dead one, and a
+  lease that ends during the stall ends the grants at its cap.
 - **Delegate restarts or is handed off** (a crash and remount, `daemon
   --upgrade`, a K5 engine-pod handoff: the same node identity and
   journal): it re-adopts the generations the table names for it when
@@ -599,6 +689,7 @@ designations create no delegation.
 | `CONSTELLATION_DELEGATION` | on | delegate and accept delegations |
 | `CONSTELLATION_DELEGATION_TTL_MS` | lock TTL (20 s), at least `5000` | grant lifetime |
 | `CONSTELLATION_DELEG_LANE` | on | the off-core renewal lane for a stuck core; `off` for A/B runs |
+| `CONSTELLATION_DELEG_ROOT_LANE` | on | the root's off-core answer to a delegate's renewal while its core is stuck; `off` for A/B runs |
 | `CONSTELLATION_DELEGATION_PLACEMENT` | on | automatic placement and splits |
 | `CONSTELLATION_DELEGATION_WINDOW_MS` | `30000` | placement window |
 | `CONSTELLATION_DELEGATION_MIN_OPS` | `200` | rate floor per window |
@@ -629,7 +720,9 @@ node's takeover gate while the op waited for the store's writer lock),
 `streamed_txs`, `appended_txs`, `cross_subtree`, `recalls_sent`,
 `recalls_drained`, `recalls_expired`, `reclaimed`, `ended`,
 `renewals_off_core` (renewals the off-core lane sent while the core was
-stuck in a step), `grants_lost` (every grant the node gave up), of which
+stuck in a step), `root_answers_off_core` and `root_answers_deferred` (the
+root's own answers off its stuck core, and why it declined), `off_core_answers_applied`,
+`grants_lost` (every grant the node gave up), of which
 `lapses_during_freeze` with `last_freeze_ms` and `last_freeze_gen` (the
 node's whole process was frozen) and `lapses_root_silent` with
 `last_silent_gen` (a renewal sent in time was never answered by the root)

@@ -157,6 +157,11 @@ pub struct CoreStatus {
     /// Ops the delegate's FUSE fast path sent through the core because its
     /// generation ended at this node's takeover gate.
     pub delegation_fast_path_fenced: u64,
+    /// Plan 41 R2: renewals this node's P2P service answered off its core,
+    /// and the ones it declined while the core was stuck, by reason
+    /// (`DelegWindows::stats`; atomics the core's step does not guard).
+    pub delegation_root_answers_off_core: u64,
+    pub delegation_root_answers_deferred: Vec<(String, u64)>,
     /// Phase 2b: the placement's busiest subtrees, `(dir, node, node_ops,
     /// subtree_ops)`.
     pub placement_top: Vec<(u64, u64, u64, u64)>,
@@ -250,6 +255,7 @@ fn event_kind(event: &Event) -> &'static str {
         Event::OwnLag { .. } => "OwnLag",
         Event::OwnFreeze { .. } => "OwnFreeze",
         Event::DelegRenewSentOffCore { .. } => "DelegRenewSentOffCore",
+        Event::DelegRenewAnsweredOffCore { .. } => "DelegRenewAnsweredOffCore",
         Event::Control { req, .. } => match req {
             Control::Nudge => "Control(Nudge)",
             Control::Journaled => "Control(Journaled)",
@@ -1055,8 +1061,22 @@ impl AliveBook {
 /// heartbeat, so its backups seal it `CONSTELLATION_BACKUP_TAKEOVER_MS`
 /// later. That long is a hung authority, not a busy one; a dead process,
 /// a stopped driver or a cut link stops the heartbeat at once.
-fn holder_stall_ms() -> i64 {
+pub(crate) fn holder_stall_ms() -> i64 {
     env_ms("CONSTELLATION_HOLDER_STALL_MS", 15_000).max(1) as i64
+}
+
+/// Whether the root's P2P service answers a delegation renewal off its stuck
+/// core (plan 41 R2). `CONSTELLATION_DELEG_ROOT_LANE=off` turns it off (A/B
+/// runs, the fail-before of `delegate-store-stall` with the root stalled).
+pub(crate) fn deleg_root_lane_on() -> bool {
+    !matches!(
+        std::env::var("CONSTELLATION_DELEG_ROOT_LANE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "off" | "false"
+    )
 }
 
 /// What one tick of [`holder_alive_loop`] does.
@@ -1224,12 +1244,22 @@ async fn holder_alive_loop(
                     Payload::DelegRenewOffCore { req_id, .. } => *req_id,
                     _ => 0,
                 };
-                if peers
+                match peers
                     .request_to_node_liveness(root, &payload, BEAT_TIMEOUT)
                     .await
-                    .is_err()
                 {
-                    off_core.lane_send_failed(root, req_id);
+                    Err(_) => off_core.lane_send_failed(root, req_id),
+                    // The root's P2P service answered it off its stuck core
+                    // (plan 41 R2): the reply is the grant.
+                    Ok(Payload::DelegRenewedOffCore {
+                        req_id: r,
+                        gen,
+                        round,
+                        ttl_ms,
+                    }) if r == req_id => {
+                        off_core.deleg_renewed_off_core(root, r, gen, round, ttl_ms)
+                    }
+                    Ok(_) => {}
                 }
             });
         }
@@ -1597,6 +1627,10 @@ impl Drop for AliveTask {
         // A probe that no longer runs is not a stalled runtime
         // ([`OffCore::runtime_stalled`]).
         self.off_core.probe_stopped();
+        // A driver that is gone answers no renewal off the core either
+        // (plan 41 R2): no certificate, every slot shut.
+        self.off_core.deleg_windows.publish(None, &[]);
+        self.off_core.deleg_windows.close_all();
     }
 }
 
@@ -1666,6 +1700,10 @@ pub struct OffCore {
     /// ([`deleg_lane::with_granted_ttl`]), where the core's bookkeeping is
     /// behind a stuck step. The root caps a grant by its own lease.
     pub(crate) granted_ttl: Mutex<HashMap<(u64, u64), (NodeId, u64)>>,
+    /// The root's delegation windows, shared with the core
+    /// ([`Core::set_deleg_windows`]) and the P2P service's off-core
+    /// answerer (plan 41 R2, `deleg_lane::answer_root`).
+    pub(crate) deleg_windows: Arc<constellation_authority::core::DelegWindows>,
 }
 
 impl OffCore {
@@ -1687,7 +1725,59 @@ impl OffCore {
             beat_due: std::sync::atomic::AtomicI64::new(0),
             beat_freeze: std::sync::atomic::AtomicU64::new(0),
             granted_ttl: Mutex::new(HashMap::new()),
+            deleg_windows: constellation_authority::core::DelegWindows::new(),
         }
+    }
+
+    /// How long the authority driver has made no progress, as the heartbeat
+    /// thread reads it ([`holder_alive_loop`]): inside one step, a lag of the
+    /// shared runtime's probe, or an echo the loop has not taken. The
+    /// root's off-core answer (plan 41 R2) acts on the same reading.
+    pub(crate) fn stuck_ms(&self, now_wait_ms: i64) -> i64 {
+        let busy = self.busy_since();
+        let echo = self.echo_sent.load(Ordering::Relaxed);
+        (if busy != 0 { now_wait_ms - busy } else { 0 })
+            .max(self.runtime_stalled_ms(now_wait_ms))
+            .max(if echo != 0 { now_wait_ms - echo } else { 0 })
+    }
+
+    /// Plan 41 R2: the root's off-core answer to delegate `from`'s renewal of
+    /// `gen` at `clk` (the P2P service's reading of the protocol clock):
+    /// `Some(ttl_ms)` if the driver has been stuck (and not hung) and the
+    /// shared window table was extended
+    /// ([`constellation_authority::deleg_lane::answer_root`] decides, and
+    /// has the argument), else `None` and the core answers in full when it
+    /// runs. `enabled`: [`deleg_root_lane_on`]; `hung_ms`: [`holder_stall_ms`].
+    pub(crate) fn answer_root(
+        &self,
+        enabled: bool,
+        hung_ms: i64,
+        clk: constellation_authority::Now,
+        from: NodeId,
+        gen: u64,
+    ) -> Option<u64> {
+        let stuck_ms = self.stuck_ms(clk.wait.0);
+        // The healthy case: one atomic read and a compare.
+        if !enabled {
+            return None;
+        }
+        if stuck_ms < constellation_authority::deleg_lane::DELEG_LANE_STUCK_MIN_MS {
+            // (Counted, as one relaxed add per renewal: a stall during which
+            // no renewal reached this node shows as no `not_stuck` count at
+            // all, one it reached but found the core running as one.)
+            self.deleg_windows
+                .note_deferred(constellation_authority::core::Refusal::NotStuck);
+            return None;
+        }
+        constellation_authority::deleg_lane::answer_root(
+            &self.deleg_windows,
+            stuck_ms,
+            hung_ms,
+            from,
+            gen,
+            clk,
+        )
+        .ok()
     }
 
     /// The core's renewal of `(gen, round)` was dispatched at `at_honour_ms`
@@ -1731,6 +1821,35 @@ impl OffCore {
             .lock()
             .unwrap()
             .insert((gen, round), (from, ttl_ms));
+    }
+
+    /// The root `from` answered this node's renewal `req_id` of `gen` off its
+    /// core ([`Payload::DelegRenewedOffCore`], the RPC reply): a grant of
+    /// `ttl_ms`. The lane's period follows the grant, and the core is told on
+    /// the urgent lane, which applies it as an extension only
+    /// (`Core::on_deleg_renewed_off_core`). Called by whoever sent the
+    /// request: the core's send task, or the lane.
+    pub(crate) fn deleg_renewed_off_core(
+        &self,
+        from: NodeId,
+        req_id: u64,
+        gen: u64,
+        round: u64,
+        ttl_ms: u64,
+    ) {
+        if ttl_ms == 0 {
+            return;
+        }
+        self.note_granted_ttl(from, gen, round, ttl_ms);
+        if let Some(tx) = self.urgent.lock().unwrap().as_ref() {
+            let _ = tx.send(SyncRequest::PeerDelegRenewedOffCore {
+                from,
+                req_id,
+                gen,
+                round,
+                ttl_ms,
+            });
+        }
     }
 
     /// The lane's request `req_id` to `to` failed at the transport: the core
@@ -2046,10 +2165,11 @@ impl Driver {
     ) -> Self {
         let urgent_rx = deps.urgent_rx.take();
         let node_id = deps.config.node_id;
-        let core = Core::new(deps.config.clone());
+        let mut core = Core::new(deps.config.clone());
         // The root's delegation windows are decided on the table's own clock
         // inside its guard (plan 41 R1): the protocol clock, the one every
         // other reading of the node's time comes from.
+        core.set_deleg_windows(deps.off_core.deleg_windows.clone());
         core.deleg_windows().set_clock(Arc::new(crate::locks::now));
         let leases = LeaseStore::new(deps.store_inner.clone(), PARTITION, deps.lease_mode);
         let inbox = match &deps.e2e {
@@ -2590,6 +2710,20 @@ impl Driver {
         status.delegation_fast_path_executed = self.deps.delegates.executed();
         status.delegation_fast_path_routed = self.deps.delegates.routed();
         status.delegation_fast_path_fenced = self.deps.delegates.fenced();
+        {
+            let w = self.deps.off_core.deleg_windows.stats();
+            status.delegation_root_answers_off_core = w.answered_off_core.load(Ordering::Relaxed);
+            status.delegation_root_answers_deferred = constellation_authority::core::Refusal::ALL
+                .iter()
+                .map(|r| {
+                    (
+                        r.label().to_string(),
+                        w.deferred[r.index()].load(Ordering::Relaxed),
+                    )
+                })
+                .filter(|(_, n)| *n > 0)
+                .collect();
+        }
         self.deps.delegates.mirror(&status.delegation);
         self.deps
             .delegates
@@ -2997,6 +3131,28 @@ impl Driver {
                     round,
                 },
             })),
+            SyncRequest::PeerDelegRenewedOffCore {
+                from,
+                req_id,
+                gen,
+                round,
+                ttl_ms,
+            } => Some(Internal::Event(Event::Peer {
+                from,
+                msg: PeerMsg::DelegRenewedOffCore {
+                    req: OpId(req_id),
+                    gen,
+                    round,
+                    ttl_ms,
+                },
+            })),
+            SyncRequest::DelegRenewAnsweredOffCore { gen, from, ttl_ms } => {
+                Some(Internal::Event(Event::DelegRenewAnsweredOffCore {
+                    gen,
+                    from,
+                    ttl_ms,
+                }))
+            }
             SyncRequest::DelegRenewOffCoreFailed { to, req_id } => {
                 Some(Internal::Event(Event::PeerFailed {
                     req: OpId(req_id),
@@ -5092,6 +5248,7 @@ impl Driver {
             return;
         }
         let peers = self.deps.peers.clone();
+        let off_core = self.deps.off_core.clone();
         let timeout = Duration::from_millis(self.core.config().forward_timeout_ms * 4);
         tokio::spawn(async move {
             let reply = tokio::time::timeout(
@@ -5099,9 +5256,22 @@ impl Driver {
                 peers.request_to_node_timeout(to, &payload, timeout),
             )
             .await;
-            if !matches!(reply, Ok(Ok(Payload::Ok { .. }))) {
-                let outage = crate::fault::p2p_denied(to) || !peers.connection_alive(to).await;
-                let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
+            match reply {
+                Ok(Ok(Payload::Ok { .. })) => {}
+                // The root's P2P service answered a renewal off its stuck
+                // core (plan 41 R2): the reply is the grant.
+                Ok(Ok(Payload::DelegRenewedOffCore {
+                    req_id,
+                    gen,
+                    round,
+                    ttl_ms,
+                })) if req_id == req.0 => {
+                    off_core.deleg_renewed_off_core(to, req_id, gen, round, ttl_ms)
+                }
+                _ => {
+                    let outage = crate::fault::p2p_denied(to) || !peers.connection_alive(to).await;
+                    let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
+                }
             }
         });
     }
@@ -7127,6 +7297,107 @@ mod tests {
         );
         assert!(stop.load(Ordering::Relaxed), "the beat thread was not told");
         assert!(alive.lock().unwrap().is_none(), "targets kept");
+    }
+
+    /// Plan 41 R2: the root's P2P service answers a delegation renewal from
+    /// outside its core only while the driver is stuck (a quarter of half the
+    /// grant, at least 100 ms) and not hung, from the certificate the core
+    /// published and the generation's slot; the healthy case and every other
+    /// state is the core's answer alone.
+    #[test]
+    fn the_root_answers_a_renewal_off_the_core_only_while_its_driver_is_stuck() {
+        use super::OffCore;
+        use constellation_authority::core::{DelegWindows, Refusal, RootLease};
+        use constellation_authority::{HonourMs, Now, WaitMs};
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+        let off = OffCore::new(5_000);
+        let w: &Arc<DelegWindows> = &off.deleg_windows;
+        w.insert(7, 3, WaitMs(5_000), WaitMs(5_000), true);
+        w.publish(
+            Some(RootLease {
+                epoch: 2,
+                honour_until: HonourMs(60_000),
+                margin_ms: 1_000,
+                delegation_ttl_ms: 4_000,
+                extra_ms: 1_000,
+                fast: false,
+                last_s3_fresh: HonourMs(0),
+                window_ms: 1_500,
+                marked: true,
+            }),
+            &[7],
+        );
+        let at = |ms: i64| Now::same(ms);
+        // The driver waits for work: nothing.
+        assert_eq!(off.answer_root(true, 15_000, at(10_000), 3, 7), None);
+        // Inside one step for 50 ms: nothing (the core is merely busy).
+        off.busy_since.store(9_950, Ordering::Relaxed);
+        assert_eq!(off.answer_root(true, 15_000, at(10_000), 3, 7), None);
+        // Stuck 200 ms, short of a quarter of half the 4 s grant (500 ms):
+        // nothing either.
+        off.busy_since.store(9_800, Ordering::Relaxed);
+        assert_eq!(off.answer_root(true, 15_000, at(10_000), 3, 7), None);
+        // Stuck 600 ms: answered, and the window is where the core would
+        // have put it: `now + ttl + extra`.
+        off.busy_since.store(9_400, Ordering::Relaxed);
+        assert_eq!(off.answer_root(false, 15_000, at(10_000), 3, 7), None);
+        assert_eq!(off.answer_root(true, 15_000, at(10_000), 3, 7), Some(4_000));
+        assert_eq!(w.until(7), Some(WaitMs(15_000)));
+        // Another node's renewal, an unknown generation: the core's.
+        assert_eq!(off.answer_root(true, 15_000, at(10_000), 9, 7), None);
+        assert_eq!(off.answer_root(true, 15_000, at(10_000), 3, 8), None);
+        // Past the hung bound: nothing, counted.
+        off.busy_since.store(10_000 - 16_000, Ordering::Relaxed);
+        assert_eq!(off.answer_root(true, 15_000, at(10_000), 3, 7), None);
+        let st = w.stats();
+        assert_eq!(st.answered_off_core.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            st.deferred[Refusal::Hung.index()].load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            st.deferred[Refusal::Node.index()].load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            st.deferred[Refusal::Generation.index()].load(Ordering::Relaxed),
+            1
+        );
+        // A stalled shared runtime (the lag probe stopped) counts as stuck too.
+        off.busy_since.store(0, Ordering::Relaxed);
+        off.probe_tick.store(9_000, Ordering::Relaxed);
+        assert!(off.stuck_ms(10_000) >= 900, "{}", off.stuck_ms(10_000));
+    }
+
+    /// Plan 41 R2, the delegate's side: whoever sent the request (the core's
+    /// task, the lane) hands the root's off-core reply to `OffCore`, which
+    /// notes the grant for the lane's period and tells the core on the urgent
+    /// lane, which applies it as an extension only.
+    #[test]
+    fn the_roots_off_core_reply_reaches_the_core_on_the_urgent_lane() {
+        use super::{OffCore, SyncRequest};
+        let off = OffCore::new(5_000);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        *off.urgent.lock().unwrap() = Some(tx);
+        off.deleg_renewed_off_core(1, 77, 7, 3, 4_000);
+        match rx.try_recv() {
+            Ok(SyncRequest::PeerDelegRenewedOffCore {
+                from,
+                req_id,
+                gen,
+                round,
+                ttl_ms,
+            }) => assert_eq!((from, req_id, gen, round, ttl_ms), (1, 77, 7, 3, 4_000)),
+            _ => panic!("not the off-core reply"),
+        }
+        assert_eq!(
+            off.granted_ttl.lock().unwrap().get(&(7, 3)),
+            Some(&(1, 4_000))
+        );
+        // A refusal is never an off-core reply: nothing.
+        off.deleg_renewed_off_core(1, 78, 7, 3, 0);
+        assert!(rx.try_recv().is_err());
     }
 
     /// A backup's seal watch is handed the holder's latest arrival, not

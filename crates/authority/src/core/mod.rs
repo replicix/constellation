@@ -75,7 +75,9 @@ use std::collections::{BTreeMap, VecDeque};
 
 pub use backup::{beat_sent_ms, liveness_fresh, AckClass, AckView, SealRecord};
 pub use client::ClientPhase;
-pub use deleg_windows::{DelegWindows, Window, WindowsClock};
+pub use deleg_windows::{
+    decide, DelegWindows, Refusal, RootLease, Window, WindowStats, WindowsClock,
+};
 pub use delegate::{DelegKind, DelegRenewCert, DelegView, RecallPhase};
 
 /// Plan 30 §M11 phase 2b: read delegations a *delegate* grants carry
@@ -875,6 +877,11 @@ pub struct Stats {
     /// Renewals the off-core lane sent while the core was stuck in a step
     /// ([`Core::on_deleg_renew_sent_off_core`]).
     pub deleg_renewals_off_core: u64,
+    /// Root, plan 41 R2: renewals its P2P service answered off the core
+    /// ([`Core::on_deleg_renew_answered_off_core`]); delegate: off-core
+    /// answers applied as extensions ([`Core::on_deleg_renewed_off_core`]).
+    pub deleg_root_answered_off_core: u64,
+    pub deleg_off_core_answers_applied: u64,
     /// Delegations this node lost (a lapse; a refusal after the grant ran
     /// out) while a freeze of its heartbeat thread covered the time from
     /// the renewal's due time to the loss: nothing in the process could
@@ -1890,6 +1897,8 @@ impl Core {
     pub fn handle(&mut self, now: Now, event: Event, replica: &dyn Replica) -> Vec<Action> {
         let mut out = Vec::new();
         if self.stopped {
+            self.dw.close_all();
+            self.dw.publish(None, &[]);
             return out;
         }
         self.clk = now;
@@ -2007,6 +2016,9 @@ impl Core {
                 req,
                 sent,
             } => self.on_deleg_renew_sent_off_core(gen, round, to, req, sent),
+            Event::DelegRenewAnsweredOffCore { gen, from, ttl_ms } => {
+                self.on_deleg_renew_answered_off_core(now, gen, from, ttl_ms, &mut out)
+            }
             Event::BackupAlive { from, at } => self.on_backup_alive(from, at),
             Event::Slack { epoch_slack } => self.on_slack(now, epoch_slack, replica, &mut out),
             Event::Control { op, req } => self.on_control(now, op, req, replica, &mut out),
@@ -2025,6 +2037,9 @@ impl Core {
         self.locks_after_event(now, replica, &mut out);
         self.renew_after_event(now, replica, &mut out);
         self.note_client_states(now);
+        // Plan 41 R2: what the root's off-core answerer may rest on, as of
+        // the end of this step and before the driver dispatches its actions.
+        self.deleg_publish_root(replica);
         out
     }
 
@@ -2243,6 +2258,12 @@ impl Core {
                 replica,
                 out,
             ),
+            PeerMsg::DelegRenewedOffCore {
+                req,
+                gen,
+                round,
+                ttl_ms,
+            } => self.on_deleg_renewed_off_core(now, from, req, gen, round, ttl_ms, replica, out),
             PeerMsg::DelegRenewed {
                 req,
                 gen,

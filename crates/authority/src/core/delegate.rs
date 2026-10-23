@@ -202,6 +202,11 @@ pub(crate) struct DelegateState {
     /// When `renew` was sent, on the wait clock: its give-up timeout is
     /// liveness, and a forward step must not fire it early.
     pub renew_sent_wait: WaitMs,
+    /// Plan 41 R2: the renewal in flight is itself an early resend (or was
+    /// already resent): it waits for the ordinary timeout. `renew_resend_next`:
+    /// the one that just expired early, so the next one is marked.
+    pub renew_resent: bool,
+    pub renew_resend_next: bool,
     pub renew_timer: Option<TimerId>,
     /// When this node installed the generation: a grant it never got
     /// renewed lapses counting from here (`deleg_lapse_at`); honour clock.
@@ -276,6 +281,13 @@ pub(crate) struct DelegateState {
     /// 75504's class); and an answer to this node's previous incarnation
     /// names request ids this one reuses.
     pub stream_round: u64,
+    /// The round of the latest granting answer the root's core sent for this
+    /// generation (`on_deleg_renewed`): the lock content of the first
+    /// answer (handoff, grace, floor, cut) has been installed in that round.
+    /// An answer off the core (plan 41 R2) extends only a generation whose
+    /// current round it names here — "never the first grant" holds per
+    /// round, so a root that changed leaves it to its core to grant first.
+    pub core_granted_round: Option<u64>,
     /// The last batch sent carried this generation's grants on these
     /// inodes out of the subtree (`Core::deleg_leaving_grants`); its last
     /// index. Dropped from this table once the root acknowledged it.
@@ -301,6 +313,10 @@ struct LateReq {
     to: Option<NodeId>,
     /// This node's honour clock at the send.
     sent: HonourMs,
+    /// The request was completed by the root's off-core answer
+    /// ([`Core::on_deleg_renewed_off_core`]): the core's own answer, when
+    /// it comes, is still its verdict on it, a refusal included.
+    off_core: bool,
 }
 
 /// What the off-core renewal lane (`crate::deleg_lane`) needs to renew one
@@ -383,6 +399,12 @@ pub(crate) struct DelegationState {
     pub(crate) inherit_slack_ms: u64,
     /// The root's generations (this node holds the lease).
     pub gens: BTreeMap<u64, GenState>,
+    /// Plan 41 R2: the generations this tenure sent a granting answer for,
+    /// and the lock floor the latest carried (`Core::deleg_settled`).
+    answered_granting: BTreeSet<u64>,
+    floor_sent: BTreeMap<u64, Position>,
+    /// Whether a certificate is published (`Core::deleg_publish_root`).
+    cert_set: bool,
     /// The generations this node is the delegate of.
     pub mine: BTreeMap<u64, DelegateState>,
     /// Phase 2b: the generations this node backs, `gen -> (delegate,
@@ -603,6 +625,8 @@ impl Core {
                     inflight: None,
                     renew: None,
                     renew_sent_wait: WaitMs(0),
+                    renew_resent: false,
+                    renew_resend_next: false,
                     renew_timer: None,
                     installed: now.honour,
                     last_renew_sent: HonourMs(0),
@@ -626,6 +650,7 @@ impl Core {
                     backup_inflight_at: HonourMs(0),
                     backup_inflight_wait: WaitMs(0),
                     stream_round,
+                    core_granted_round: None,
                     leaving: None,
                 },
             );
@@ -1970,6 +1995,15 @@ impl Core {
         (u64::from(self.cfg.incarnation) << OP_BITS) | (op & ((1 << OP_BITS) - 1))
     }
 
+    /// Plan 41 R2: how long a renewal waits for the root before it is sent
+    /// once more: the root's off-core answerer acts after its core has been
+    /// stuck for `stuck_threshold_ms` (a quarter of a grant period), and a
+    /// request that arrived before that went to the core.
+    pub(crate) fn deleg_resend_ms(&self) -> i64 {
+        crate::deleg_lane::stuck_threshold_ms(self.cfg.delegation_ttl_ms / 2)
+            + crate::deleg_lane::DELEG_RESEND_SLACK_MS
+    }
+
     /// How long a stream batch, backup append or renewal waits for its
     /// answer before it is sent again (a partition drops it silently).
     pub(crate) fn deleg_request_timeout_ms(&self) -> u64 {
@@ -1988,6 +2022,7 @@ impl Core {
     /// and the same batch every timeout only adds to what it is slow with.
     fn deleg_expire_inflight(&mut self, now: Now) -> Vec<u64> {
         let timeout = self.deleg_request_timeout_ms() as i64;
+        let resend = self.deleg_resend_ms().min(timeout);
         let tick = self.cfg.delegation_stream_tick_ms.max(1);
         let root = self.root_node();
         let mut late = Vec::new();
@@ -2011,7 +2046,17 @@ impl Core {
                 }
             }
             if let Some((req, sent)) = d.renew {
-                if now.wait.since(d.renew_sent_wait) >= timeout {
+                let age = now.wait.since(d.renew_sent_wait);
+                // Plan 41 R2: a renewal the root has not answered within what
+                // its off-core answerer needs to see its core stuck
+                // ([`Core::deleg_resend_ms`]) is sent once more, the first one
+                // kept for a late answer. A request that reached the root
+                // just before its core got stuck was queued to that core
+                // (nothing was stuck yet) and waits for it; only a request
+                // made after the stall began is answered off the core.
+                let early = !d.renew_resent && !d.stopped && !d.designated && age >= resend;
+                if age >= timeout || early {
+                    d.renew_resend_next = early;
                     late.push((req, root, sent));
                     d.renew = None;
                     if d.renew_timer.is_none() && !d.stopped {
@@ -2035,6 +2080,7 @@ impl Core {
                         kind,
                         to,
                         sent,
+                        off_core: false,
                     },
                 );
             }
@@ -2407,6 +2453,8 @@ impl Core {
         let d = self.dl.mine.get_mut(&gen).expect("present");
         d.renew = Some((req, now.honour));
         d.renew_sent_wait = now.wait;
+        d.renew_resent = std::mem::take(&mut d.renew_resend_next);
+        let first = !d.renew_resent;
         if let Some(t) = d.renew_timer.take() {
             self.cancel_timer(t, out);
         }
@@ -2435,6 +2483,13 @@ impl Core {
                 stream_head_at: now.wall.0,
             },
         });
+        // The stream step that sends the early resend (`deleg_expire_inflight`)
+        // runs on events and on the stream tick: make sure one comes.
+        if first && self.dl.stream_timer.is_none() {
+            let at = now.wait.plus(self.deleg_resend_ms().max(1) as u64);
+            let t = self.set_timer_wait(at, Timer::DelegStream, out);
+            self.dl.stream_timer = Some(t);
+        }
     }
 
     pub(crate) fn on_deleg_renew_timer(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
@@ -2626,6 +2681,127 @@ impl Core {
         false
     }
 
+    /// A granting answer (`ttl_ms > 0`) to a delegate's renewal goes out
+    /// from this tenure: the delegate has the lock content it carried (the
+    /// first handoff, the grace, the floor of its subtree).
+    fn note_granting_answer(&mut self, msg: &PeerMsg) {
+        if let PeerMsg::DelegRenewed {
+            gen,
+            ttl_ms,
+            lock_floor,
+            ..
+        } = msg
+        {
+            if *ttl_ms > 0 {
+                self.dl.answered_granting.insert(*gen);
+                self.dl.floor_sent.insert(*gen, *lock_floor);
+            }
+        }
+    }
+
+    /// Plan 41 R2: the lock side has nothing left for generation `gen`'s
+    /// delegate that an answer without lock content would leave behind: this
+    /// tenure sent it a granting answer, and since then no handoff is
+    /// waiting, no barrier is out and the subtree's floor is what that
+    /// answer carried ([`Core::lock_deleg_quiet`]).
+    pub(crate) fn deleg_settled(&self, gen: u64, replica: &dyn Replica) -> bool {
+        let Some(dir) = self.dl.gens.get(&gen).map(|g| g.dir) else {
+            return false;
+        };
+        self.dl.answered_granting.contains(&gen)
+            && self.lock_deleg_quiet(gen, dir, replica)
+            && self.lock_floor_for_generation(gen)
+                == self.dl.floor_sent.get(&gen).copied().unwrap_or_default()
+    }
+
+    /// Plan 41 R2: the facts the root's off-core answerer rests on (the lease
+    /// as this tenure holds it, the freshness rule of `renew_hold`), or
+    /// `None` while this node is not a usable root: no delegation, no
+    /// lease, a release or takeover gate, a continuation epoch.
+    pub(crate) fn deleg_root_lease(&self) -> Option<super::RootLease> {
+        if !self.cfg.delegation || !self.cfg.p2p || self.dl.epoch_active {
+            return None;
+        }
+        let l = &self.lease;
+        if l.lost || l.fenced() || l.epoch_held() {
+            return None;
+        }
+        let (held, _) = l.held.as_ref()?;
+        Some(super::RootLease {
+            epoch: held.epoch,
+            honour_until: l.honour_until(&self.cfg)?,
+            margin_ms: self.cfg.expiry_margin_ms,
+            delegation_ttl_ms: self.cfg.delegation_ttl_ms,
+            extra_ms: self.reclaim_horizon_ms() - self.cfg.delegation_ttl_ms,
+            fast: self.may_be_taken_over_early(),
+            last_s3_fresh: self.last_s3_fresh(),
+            window_ms: self.cfg.backup_takeover_ms as i64,
+            marked: self.tenure_marked(),
+        })
+    }
+
+    /// Plan 41 R2: publish what the off-core answerer may rest on, as of the
+    /// end of the step that just ran (`Core::handle`'s last act, so before
+    /// the driver dispatches the step's actions: a release's CAS or an
+    /// epoch's recall goes out only after the certificate that forbids
+    /// answering has been published).
+    pub(crate) fn deleg_publish_root(&mut self, replica: &dyn Replica) {
+        if self.dl.gens.is_empty() {
+            if self.dl.cert_set {
+                self.dw.publish(None, &[]);
+                self.dl.cert_set = false;
+            }
+            return;
+        }
+        let lease = self.deleg_root_lease();
+        let settled: Vec<u64> = if lease.is_some() {
+            self.dl
+                .gens
+                .iter()
+                .filter(|(gen, g)| {
+                    !g.ended
+                        && g.recall == RecallPhase::None
+                        && g.kind != DelegKind::Designated
+                        && self.deleg_settled(**gen, replica)
+                })
+                .map(|(gen, _)| *gen)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.dw.publish(lease, &settled);
+        self.dl.cert_set = true;
+    }
+
+    /// The root's P2P service extended delegate `from`'s window of `gen` off
+    /// the core by a grant of `ttl_ms` ([`Event::DelegRenewAnsweredOffCore`]):
+    /// the table is extended already; this is the bookkeeping the answer
+    /// skipped. The request itself is handled in full by
+    /// [`Core::on_deleg_renew`] (it was queued ahead of this event).
+    pub(crate) fn on_deleg_renew_answered_off_core(
+        &mut self,
+        now: Now,
+        gen: u64,
+        from: NodeId,
+        ttl_ms: u64,
+        out: &mut Vec<Action>,
+    ) {
+        if !self.dl.gens.get(&gen).is_some_and(|g| g.node == from) {
+            return;
+        }
+        self.stats.deleg_root_answered_off_core += 1;
+        self.lease.touch(now);
+        // The expiry watch reads the (longer) window again.
+        self.arm_gen_expiry(now, gen, out);
+        // As a short grant of the core's own: the lease is renewed now, for
+        // the delegate to be able to grant locks (see `on_deleg_renew`).
+        if ttl_ms < self.cfg.delegation_ttl_ms
+            && (ttl_ms as i64) < self.lock_min_grant_ms() + 2 * self.lock_margin_ms()
+        {
+            self.lease_renew_for_grants(now, out);
+        }
+    }
+
     /// Plan 41 L0: send a delegation renewal's answer, or hold it
     /// (`hold`) until the tenure is proven live. Answers to one delegate
     /// keep their order: one made behind a held one waits with it.
@@ -2646,7 +2822,10 @@ impl Core {
             .find(|(_, n, _)| *n == to)
             .map(|(f, ..)| *f);
         match (hold, behind) {
-            (None, None) => out.push(Action::Send { to, msg }),
+            (None, None) => {
+                self.note_granting_answer(&msg);
+                out.push(Action::Send { to, msg })
+            }
             (Some(f), _) => {
                 self.stats.renew_held += 1;
                 self.ack.renew_held_deleg.push((f, to, msg));
@@ -2672,7 +2851,10 @@ impl Core {
                 self.renew_verdict(now, f)
             };
             match verdict {
-                FreshVerdict::Ready => out.push(Action::Send { to, msg }),
+                FreshVerdict::Ready => {
+                    self.note_granting_answer(&msg);
+                    out.push(Action::Send { to, msg })
+                }
                 FreshVerdict::Wait => keep.push((f, to, msg)),
                 FreshVerdict::Refuse => self.stats.renew_refused += 1,
             }
@@ -3021,6 +3203,7 @@ impl Core {
                 kind: ReqKind::Renew,
                 to: Some(to),
                 sent,
+                off_core: false,
             },
         );
         self.stats.deleg_renewals_off_core += 1;
@@ -3108,7 +3291,32 @@ impl Core {
                 return false;
             }
         }
+        if ttl_ms > 0 {
+            // The lock content of this answer is installed by the caller;
+            // the generation's first grant in this round has been the core's
+            // ([`DelegateState::core_granted_round`]).
+            if let Some(d) = self.dl.mine.get_mut(&gen) {
+                d.core_granted_round = Some(round);
+            }
+        }
         if !self.dl.by_req.contains_key(&req) {
+            // The core's verdict on a request the root's off-core answer
+            // completed: a refusal still ends the generation here, as it
+            // would have in time (the answer off the core is a grant of
+            // what the lease allowed, not a change of the root's mind).
+            if ttl_ms == 0
+                && self
+                    .dl
+                    .late
+                    .get(&req)
+                    .is_some_and(|l| l.off_core && l.gen == gen && l.kind == ReqKind::Renew)
+            {
+                self.dl.late.remove(&req);
+                if self.dl.mine.get(&gen).is_some_and(|d| !d.stopped) {
+                    self.deleg_renewal_refused(now, gen, replica, out);
+                }
+                return true;
+            }
             self.deleg_late_renewed(now, req, gen, ttl_ms, replica, out);
             return true;
         }
@@ -3128,30 +3336,61 @@ impl Core {
             // (A lapsed generation's retry.)
             self.cancel_timer(t, out);
         }
-        let Some(d) = self.dl.mine.get(&gen) else {
-            return true;
-        };
-        if ttl_ms == 0 {
-            // Refused: the generation is ending; stop executing (the log
-            // ends it), keep the parked ops for `NotHolder` then. A root
-            // that reclaimed a grant this node's frozen process could not
-            // renew refuses the renewal it sends on thawing, before the
-            // lapse watch is handled: counted as a loss in a freeze too.
-            self.stats.deleg_renewals_refused += 1;
-            let ran_out = !d.lapsed && now.honour >= self.deleg_lapse_at(d);
-            if ran_out {
-                // (The root answered: it cannot have been silent.)
-                self.deleg_note_loss(gen, false);
-            }
-            let d = self.dl.mine.get_mut(&gen).expect("present");
-            d.stopped = true;
-            let parked = std::mem::take(&mut d.parked);
-            let root = self.root_node().unwrap_or(0);
-            for p in parked {
-                self.answer_not_owner(now, p, root, replica, out);
-            }
+        if !self.dl.mine.contains_key(&gen) {
             return true;
         }
+        if ttl_ms == 0 {
+            self.deleg_renewal_refused(now, gen, replica, out);
+            return true;
+        }
+        self.deleg_granted(now, gen, sent, ttl_ms, replica, out);
+        true
+    }
+
+    /// The root's core refused a renewal of `gen`: the generation is ending;
+    /// stop executing (the log ends it), keep the parked ops for `NotHolder`
+    /// then. A root that reclaimed a grant this node's frozen process could
+    /// not renew refuses the renewal it sends on thawing, before the lapse
+    /// watch is handled: counted as a loss in a freeze too.
+    fn deleg_renewal_refused(
+        &mut self,
+        now: Now,
+        gen: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(d) = self.dl.mine.get(&gen) else {
+            return;
+        };
+        self.stats.deleg_renewals_refused += 1;
+        let ran_out = !d.lapsed && now.honour >= self.deleg_lapse_at(d);
+        if ran_out {
+            // (The root answered: it cannot have been silent.)
+            self.deleg_note_loss(gen, false);
+        }
+        let d = self.dl.mine.get_mut(&gen).expect("present");
+        d.stopped = true;
+        let parked = std::mem::take(&mut d.parked);
+        let root = self.root_node().unwrap_or(0);
+        for p in parked {
+            self.answer_not_owner(now, p, root, replica, out);
+        }
+    }
+
+    /// A granting answer to the renewal of `gen` that this node sent at
+    /// `sent`: honour the grant from the send, renew again at half the ttl
+    /// (a quarter with lock grants out), re-arm the lapse watch. The root's
+    /// core's answer, or its P2P service's off-core one
+    /// ([`Core::on_deleg_renewed_off_core`]).
+    fn deleg_granted(
+        &mut self,
+        now: Now,
+        gen: u64,
+        sent: HonourMs,
+        ttl_ms: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
         let d = self.dl.mine.get_mut(&gen).expect("present");
         // Measured from the send (M8's discipline): honoured until
         // `sent + ttl − margin` on this clock.
@@ -3193,7 +3432,95 @@ impl Core {
             self.deleg_renew_now(now, gen, out);
         }
         self.deleg_after_event(now, replica, out);
-        true
+    }
+
+    /// The root's P2P service answered renewal `req` of `gen` off its core
+    /// (plan 41 R2, [`PeerMsg::DelegRenewedOffCore`]): a grant of `ttl_ms`
+    /// with no lock content. Applied only as an extension of a grant this
+    /// node already serves — the honoured end from the request's own send,
+    /// as a late answer is ([`LateReq`]) — and never as a first grant: no
+    /// lock install, cut, floor, grace or barrier (the root's core sends
+    /// them with its own answer, which still comes and is counted as a late
+    /// one here). Ignored unless the generation is still this node's,
+    /// executing and serving (the root's core granted it in this round:
+    /// [`DelegateState::core_granted_round`], that answer carried the
+    /// handoff), in the round the answer names, from the root it
+    /// renews with, and the request is one this node sent (its own in
+    /// flight, or a lane's registered one).
+    ///
+    /// The core's own request that this answers is then complete as far as
+    /// the schedule goes: the next renewal is armed from its send as for
+    /// any granting answer (a root stuck for longer than the grant would
+    /// otherwise have this node wait for the full answer, and lapse, before
+    /// it asked again). The full answer, when the root's core runs, is a
+    /// late answer: its extension is a no-op and its lock content is
+    /// installed as ever.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn on_deleg_renewed_off_core(
+        &mut self,
+        now: Now,
+        from: NodeId,
+        req: OpId,
+        gen: u64,
+        round: u64,
+        ttl_ms: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let root = self.root_node();
+        let serving = self.deleg_mine_until(gen).is_some();
+        let sent = match self.dl.mine.get(&gen) {
+            Some(d)
+                if ttl_ms > 0
+                    && serving
+                    && !d.designated
+                    && root == Some(from)
+                    && d.stream_round == round
+                    && d.core_granted_round == Some(round) =>
+            {
+                match d.renew {
+                    Some((r, sent)) if r == req => Some((sent, true)),
+                    _ => self
+                        .dl
+                        .late
+                        .get(&req)
+                        .filter(|l| l.gen == gen && l.kind == ReqKind::Renew && l.to == Some(from))
+                        .map(|l| (l.sent, false)),
+                }
+            }
+            _ => None,
+        };
+        let Some((sent, in_flight)) = sent else {
+            self.stats.deleg_renewed_stale += 1;
+            return;
+        };
+        self.stats.deleg_off_core_answers_applied += 1;
+        if !in_flight {
+            // A lane's request, or one the core gave up waiting for: a late
+            // answer, extension only; its full answer, if it comes, is
+            // counted as late too.
+            self.deleg_extend_late(now, gen, sent, ttl_ms, replica, out);
+            return;
+        }
+        // The core's own request in flight: complete for the schedule, its
+        // full answer is a late one from here.
+        self.dl.by_req.remove(&req);
+        let d = self.dl.mine.get_mut(&gen).expect("present");
+        d.renew = None;
+        if let Some(t) = d.renew_timer.take() {
+            self.cancel_timer(t, out);
+        }
+        self.dl.late.insert(
+            req,
+            LateReq {
+                gen,
+                kind: ReqKind::Renew,
+                to: Some(from),
+                sent,
+                off_core: true,
+            },
+        );
+        self.deleg_granted(now, gen, sent, ttl_ms, replica, out);
     }
 
     /// The answer to a renewal [`Core::deleg_expire_inflight`] stopped
@@ -3217,6 +3544,21 @@ impl Core {
         if ttl_ms == 0 || late.to.is_none() || late.to != root {
             return;
         }
+        self.deleg_extend_late(now, gen, late.sent, ttl_ms, replica, out);
+    }
+
+    /// A granted renewal sent at `sent` that did not count in time (a late
+    /// answer, the lane's, an off-core one): the grant is honoured from that
+    /// send, as an answer in time would have been. Extension only.
+    fn deleg_extend_late(
+        &mut self,
+        now: Now,
+        gen: u64,
+        sent: HonourMs,
+        ttl_ms: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
         let margin = self.cfg.expiry_margin_ms;
         let Some(d) = self.dl.mine.get_mut(&gen) else {
             return;
@@ -3224,19 +3566,19 @@ impl Core {
         if d.stopped {
             return;
         }
-        let until = late.sent.plus(ttl_ms.saturating_sub(margin));
+        let until = sent.plus(ttl_ms.saturating_sub(margin));
         if until <= d.until {
             return;
         }
         tracing::debug!(
             node = self.cfg.node_id,
             gen,
-            late_ms = now.honour.since(late.sent),
+            late_ms = now.honour.since(sent),
             "a late delegation renewal counted"
         );
         d.until = until;
-        d.last_renew_sent = d.last_renew_sent.max(late.sent);
-        d.answered_sent = d.answered_sent.max(late.sent);
+        d.last_renew_sent = d.last_renew_sent.max(sent);
+        d.answered_sent = d.answered_sent.max(sent);
         if d.lapsed && now.honour < d.until {
             tracing::info!(
                 node = self.cfg.node_id,
@@ -3589,7 +3931,7 @@ impl Core {
         g.recall = RecallPhase::Sent;
         // The slot closes at the transition, in this step (plan 41 R1,
         // rule 2): no renewal is granted from here, whoever answers it.
-        self.dw.close(gen);
+        self.dw.close_for_recall(gen);
         let (to, dir) = (g.node, g.dir);
         let req = self.op_id();
         self.dl.gens.get_mut(&gen).expect("present").recall_req = Some(req);
@@ -3900,6 +4242,9 @@ impl Core {
         };
         g.ended = true;
         self.dw.close(gen);
+        self.dl.answered_granting.remove(&gen);
+        self.dl.floor_sent.remove(&gen);
+        let g = self.dl.gens.get_mut(&gen).expect("present");
         let expiry = g.expiry.take();
         let recall_req = g.recall_req.take();
         let controls = std::mem::take(&mut g.controls);
@@ -4495,6 +4840,9 @@ impl Core {
         // No window is this node's any more: closed and gone in this step.
         self.dw.close_all();
         self.dw.clear();
+        self.dl.answered_granting.clear();
+        self.dl.floor_sent.clear();
+        self.dl.cert_set = false;
         for (_, g) in std::mem::take(&mut self.dl.gens) {
             if let Some(t) = g.expiry {
                 self.cancel_timer(t, out);

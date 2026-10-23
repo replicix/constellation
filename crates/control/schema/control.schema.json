@@ -1634,6 +1634,13 @@
           "minimum": 0,
           "type": "integer"
         },
+        "off_core_answers_applied": {
+          "default": 0,
+          "description": "As a delegate: the root's off-core answers applied as extensions of\na grant already served.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "parked_expired": {
           "format": "uint64",
           "minimum": 0,
@@ -1768,6 +1775,32 @@
           "type": "integer"
         },
         "restreams": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "root_answers_deferred": {
+          "default": [],
+          "items": {
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            ],
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "root_answers_off_core": {
+          "default": 0,
+          "description": "As the root: renewals this node's P2P service answered off its core\nwhile the core was stuck in a step (each a grant a stalled core would\nhave lost, `lapses_root_silent` in the delegate's report), and the\nones it declined while the core was stuck, by reason (the core\nanswers those in full when it runs).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"

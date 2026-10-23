@@ -359,6 +359,20 @@ pub struct DelegationReport {
     pub place_range_recalls: u64,
     pub read_index_served: u64,
     pub read_grants: u64,
+    // ---- plan 41 R2 (appended) ----
+    /// As the root: renewals this node's P2P service answered off its core
+    /// while the core was stuck in a step (each a grant a stalled core would
+    /// have lost, `lapses_root_silent` in the delegate's report), and the
+    /// ones it declined while the core was stuck, by reason (the core
+    /// answers those in full when it runs).
+    #[serde(default)]
+    pub root_answers_off_core: u64,
+    #[serde(default)]
+    pub root_answers_deferred: Vec<(String, u64)>,
+    /// As a delegate: the root's off-core answers applied as extensions of
+    /// a grant already served.
+    #[serde(default)]
+    pub off_core_answers_applied: u64,
 }
 
 /// One pinned subtree on this node.

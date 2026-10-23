@@ -2386,7 +2386,10 @@ impl Core {
 
     /// No grant on `ino` before a cut as of `at` is its floor; `holder`:
     /// whose record it was, if known.
-    fn lock_barrier(&mut self, ino: Ino, at: i64, holder: Option<NodeId>) {
+    pub(super) fn lock_barrier(&mut self, ino: Ino, at: i64, holder: Option<NodeId>) {
+        // (Plan 41 R2: a barrier is lock content an answer off the core
+        // would leave behind; the generation is unsettled in this step.)
+        self.dw.unsettle_all();
         let e = self.lk.barriers.entry(ino).or_insert((i64::MIN, holder));
         if e.1 != holder {
             e.1 = None;
@@ -2410,10 +2413,11 @@ impl Core {
     }
 
     /// No grant under `dir` before a cut as of `at` is its floor.
-    fn lock_dir_barrier(&mut self, dir: Ino, at: i64) {
+    pub(super) fn lock_dir_barrier(&mut self, dir: Ino, at: i64) {
         if at <= 0 {
             return;
         }
+        self.dw.unsettle_all();
         match self.lk.dir_barriers.iter_mut().find(|(d, _)| *d == dir) {
             Some((_, a)) => *a = (*a).max(at),
             None => self.lk.dir_barriers.push((dir, at)),
@@ -2587,6 +2591,7 @@ impl Core {
             for gen in gens {
                 if let Some(f) = self.lk.handed_floor.get_mut(&gen) {
                     *f = constellation_meta::locks::floor_join(f, pos);
+                    self.dw.unsettle(gen);
                 }
             }
         }
@@ -3219,6 +3224,7 @@ impl Core {
             {
                 if let Some(f) = self.lk.handed_floor.get_mut(&d.gen) {
                     *f = constellation_meta::locks::floor_join(f, &position);
+                    self.dw.unsettle(d.gen);
                 }
             }
         }
@@ -5750,6 +5756,7 @@ impl Core {
         if !moved.is_empty() {
             self.lk.mirror_dirty = true;
             self.lk.handoff.entry(gen).or_default().extend(moved);
+            self.dw.unsettle(gen);
         }
         // The subtree's lock floor goes with it (with every granting
         // renewal: a join, so a resend is harmless).
@@ -5765,7 +5772,11 @@ impl Core {
                 },
                 replica,
             );
-            self.lk.handed_floor.insert(gen, floor);
+            // (Unsettled only if it moved: the same floor again, as every
+            // granting renewal re-computes it, leaves nothing behind.)
+            if self.lk.handed_floor.insert(gen, floor) != Some(floor) {
+                self.dw.unsettle(gen);
+            }
         }
     }
 
@@ -6038,6 +6049,26 @@ impl Core {
                 "grants moved to a delegation came back with their inodes, which left its subtree"
             );
         }
+    }
+
+    /// Root, plan 41 R2: the lock side has no content pending for a granting
+    /// answer to `gen` beyond what the last one carried — no handoff waiting
+    /// for the first renewal, no outwait barrier a cut must settle at the
+    /// delegate. (The floor is compared by the caller against what it
+    /// last sent.) An answer without lock content (`PeerMsg::DelegRenewedOffCore`)
+    /// leaves nothing behind then.
+    ///
+    /// A barrier counts only if it applies under the generation's subtree
+    /// `dir` (what a renewal's answer would carry, `lock_barrier_under`): one
+    /// elsewhere in the tree does not take the lane away from this delegate.
+    pub(crate) fn lock_deleg_quiet(&self, gen: u64, dir: Ino, replica: &dyn Replica) -> bool {
+        !self.lk.handoff.contains_key(&gen) && self.lock_barrier_under(dir, replica) == 0
+    }
+
+    /// A floor raised under `gen`'s subtree since the last answer (tests).
+    #[cfg(test)]
+    pub(crate) fn lock_set_handed_floor_for_tests(&mut self, gen: u64, floor: Position) {
+        self.lk.handed_floor.insert(gen, floor);
     }
 
     /// Root: the lock floor a granting renewal of `gen` carries.

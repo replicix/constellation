@@ -34,10 +34,16 @@
 //! delegate stops before the root reclaims (`Core::on_deleg_renew` has the
 //! argument).
 //!
-//! This is R1: the table and the core's use of it, no behaviour change.
+//! R1 is the table and the core's use of it. R2 adds the off-core answerer's
+//! side: the lease certificate the core publishes after every step
+//! ([`RootLease`]) and [`DelegWindows::extend_off_core`], which decides from
+//! it and from the generation's slot in one critical section, so a
+//! certificate that revokes (a release, an epoch, a deposition) and an
+//! extension are ordered by the same mutex.
 
-use crate::ids::{NodeId, Now, WaitMs};
+use crate::ids::{HonourMs, NodeId, Now, WaitMs};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// The table's clock (the daemon's protocol clock, a simulation's node
@@ -63,6 +69,150 @@ pub struct Window {
     /// Not a designation: only a delegation the root reclaims by the clock
     /// is ever opened to a party other than the core.
     pub eligible: bool,
+    /// The lock side has nothing to hand this generation that an answer
+    /// without lock content would leave behind: a granting answer was sent
+    /// (the delegate has the first handoff, the grace and the floor), and
+    /// no handoff, barrier or raised floor is pending since
+    /// (`Core::deleg_settled`). Set by the core when it publishes
+    /// ([`DelegWindows::publish`]).
+    pub settled: bool,
+}
+
+/// What the off-core answerer needs to know of the root's lease and
+/// tenure, published by the core after every step (R2; [`Core::deleg_root_lease`]):
+/// the state at the end of the last finished step, never newer. Every field
+/// is either time-bounded (judged against the answerer's own reading of the
+/// honour clock when it answers) or a fact that can only become false
+/// inside a running step, where the argument in `deleg_lane::answer_root`
+/// covers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RootLease {
+    /// The lease epoch the certificate is of.
+    pub epoch: u64,
+    /// The end of the lease on this node's **honour** clock; the cap of a
+    /// grant is this less the margin.
+    pub honour_until: HonourMs,
+    /// `expiry_margin_ms`.
+    pub margin_ms: u64,
+    /// `delegation_ttl_ms`, and what the root adds to a grant's end
+    /// (`reclaim_horizon_ms − delegation_ttl_ms`).
+    pub delegation_ttl_ms: u64,
+    pub extra_ms: u64,
+    /// The tenure may be taken over before its lease expires
+    /// (`may_be_taken_over_early`), the send of the latest S3 request that
+    /// proved it live (honour clock), the freshness window, and whether the
+    /// lease is marked (`tenure_marked`): the freshness rule of
+    /// `renew_hold`.
+    pub fast: bool,
+    pub last_s3_fresh: HonourMs,
+    pub window_ms: i64,
+    pub marked: bool,
+}
+
+/// Why the answerer did not extend a window ([`DelegWindows::extend_off_core`]):
+/// the request is queued to the core as before and answered there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The driver is not stuck (the common case: the renewal is the core's).
+    NotStuck,
+    /// The driver has been stuck past the bound: hung, not slow.
+    Hung,
+    /// No certificate: this node is not a usable root now (no lease, a
+    /// release or takeover gate, an epoch).
+    Lease,
+    /// No such generation in the table.
+    Generation,
+    /// Not the generation's delegate.
+    Node,
+    /// The slot is closed (a recall, a seal or an end began), or the
+    /// generation is a designation.
+    Closed,
+    /// The lock side has something an answer without lock content would
+    /// leave behind (`Window::settled`).
+    Unsettled,
+    /// A tenure that may be taken over early without fresh S3 liveness.
+    Stale,
+    /// A tenure that may be taken over early whose lease is not marked.
+    Unmarked,
+    /// Nothing is left of the lease below its margin: the cap is zero.
+    Cap,
+}
+
+impl Refusal {
+    pub const COUNT: usize = 10;
+    pub const ALL: [Refusal; Refusal::COUNT] = [
+        Refusal::NotStuck,
+        Refusal::Hung,
+        Refusal::Lease,
+        Refusal::Generation,
+        Refusal::Node,
+        Refusal::Closed,
+        Refusal::Unsettled,
+        Refusal::Stale,
+        Refusal::Unmarked,
+        Refusal::Cap,
+    ];
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Refusal::NotStuck => "not_stuck",
+            Refusal::Hung => "hung",
+            Refusal::Lease => "lease",
+            Refusal::Generation => "generation",
+            Refusal::Node => "node",
+            Refusal::Closed => "closed",
+            Refusal::Unsettled => "unsettled",
+            Refusal::Stale => "stale_liveness",
+            Refusal::Unmarked => "unmarked",
+            Refusal::Cap => "cap",
+        }
+    }
+}
+
+/// The decision of the answerer (pure): extend `w` to the returned `until`
+/// with a grant of the returned `ttl_ms`, or why not. `now` is the
+/// answerer's own reading, taken when the request arrived; `lease` is the
+/// core's certificate, which holds at least as far as the argument in
+/// `deleg_lane::answer_root` says.
+pub fn decide(
+    lease: &RootLease,
+    w: &Window,
+    from: NodeId,
+    now: Now,
+) -> Result<(u64, WaitMs), Refusal> {
+    if w.node != from {
+        return Err(Refusal::Node);
+    }
+    if !w.open || !w.eligible {
+        return Err(Refusal::Closed);
+    }
+    if !w.settled {
+        return Err(Refusal::Unsettled);
+    }
+    // The core's freshness rule (`Core::renew_hold`): a tenure that may be
+    // taken over before its lease expires answers only within the freshness
+    // window of a proof of liveness, and only if its lease is marked.
+    if !crate::core::liveness_fresh(lease.fast, now.honour, lease.last_s3_fresh, lease.window_ms) {
+        return Err(Refusal::Stale);
+    }
+    if !lease.marked {
+        return Err(Refusal::Unmarked);
+    }
+    // The cap (`Core::grant_cap_ms`): a grant never outlives the lease's
+    // usable end, which is also `root_usable`'s time bound.
+    let cap = lease
+        .honour_until
+        .since(now.honour)
+        .saturating_sub(lease.margin_ms as i64);
+    if cap <= 0 {
+        return Err(Refusal::Cap);
+    }
+    let ttl = lease.delegation_ttl_ms.min(cap as u64);
+    Ok((ttl, now.wait.plus(ttl + lease.extra_ms)))
 }
 
 /// A test hook run once before the expiry decision takes the guard.
@@ -73,6 +223,9 @@ type CloseHook = Box<dyn FnOnce(&DelegWindows) + Send>;
 struct Inner {
     slots: HashMap<u64, Window>,
     clock: Option<WindowsClock>,
+    /// The lease facts the answerer needs, published by the core after
+    /// every step ([`DelegWindows::publish`]); `None`: answer nothing.
+    lease: Option<RootLease>,
     /// Test hook: run once just before [`DelegWindows::close_if_expired`]
     /// takes the guard (an extension landing between a step's earlier read
     /// of the window and its decision).
@@ -84,6 +237,23 @@ struct Inner {
 #[derive(Default)]
 pub struct DelegWindows {
     inner: Mutex<Inner>,
+    stats: WindowStats,
+    /// Non-vacuity knobs of the simulation (never set by the daemon): skip
+    /// the close a recall makes, and the close the expiry decision makes —
+    /// the code without R1's rule 2.
+    skip_close_on_recall: std::sync::atomic::AtomicBool,
+    skip_close_on_expiry: std::sync::atomic::AtomicBool,
+}
+
+/// What the answerer did (`status`: `delegation.root_answers_off_core`,
+/// `root_answers_deferred`).
+#[derive(Default, Debug)]
+pub struct WindowStats {
+    /// Renewals extended off the core ([`DelegWindows::extend_off_core`]).
+    pub answered_off_core: AtomicU64,
+    /// Renewals the answerer declined while the driver was stuck, by reason
+    /// (indexed by [`Refusal::index`]).
+    pub deferred: [AtomicU64; Refusal::COUNT],
 }
 
 impl std::fmt::Debug for DelegWindows {
@@ -136,13 +306,21 @@ impl DelegWindows {
                 renewed_until,
                 open: eligible,
                 eligible,
+                settled: false,
             },
         );
     }
 
-    /// The lease is gone: no generation is this node's. Every slot goes.
+    /// The lease is gone: no generation is this node's. Every slot goes,
+    /// and the certificate with them.
     pub fn clear(&self) {
-        self.lock().slots.clear();
+        let mut g = self.lock();
+        g.slots.clear();
+        g.lease = None;
+    }
+
+    pub fn stats(&self) -> &WindowStats {
+        &self.stats
     }
 
     pub fn get(&self, gen: u64) -> Option<Window> {
@@ -163,6 +341,23 @@ impl DelegWindows {
         if let Some(w) = self.lock().slots.get_mut(&gen) {
             w.open = false;
         }
+    }
+
+    /// A recall begins: [`Self::close`], unless the simulation's non-vacuity
+    /// knob says to skip it ([`Self::skip_closes_for_tests`]).
+    pub fn close_for_recall(&self, gen: u64) {
+        if !self.skip_close_on_recall.load(Ordering::Relaxed) {
+            self.close(gen);
+        }
+    }
+
+    /// The simulation's non-vacuity knobs: a build without the close a recall
+    /// makes (`recall`) and without the one the expiry decision makes
+    /// (`expiry`). Never set by the daemon.
+    #[doc(hidden)]
+    pub fn skip_closes_for_tests(&self, recall: bool, expiry: bool) {
+        self.skip_close_on_recall.store(recall, Ordering::Relaxed);
+        self.skip_close_on_expiry.store(expiry, Ordering::Relaxed);
     }
 
     /// Close every slot (the lease is released or lost, an epoch opened).
@@ -217,7 +412,9 @@ impl DelegWindows {
         if now < w.until {
             return Err(w.until);
         }
-        w.open = false;
+        if !self.skip_close_on_expiry.load(Ordering::Relaxed) {
+            w.open = false;
+        }
         Ok(())
     }
 
@@ -231,6 +428,73 @@ impl DelegWindows {
             }
             _ => false,
         }
+    }
+
+    /// The core publishes what it knows after a step: the lease certificate
+    /// (`None`: nothing may be answered) and the generations whose lock side
+    /// is settled ([`Window::settled`]; one not named is not). Replaces the
+    /// previous publication.
+    pub fn publish(&self, lease: Option<RootLease>, settled: &[u64]) {
+        let mut g = self.lock();
+        g.lease = lease;
+        for (gen, w) in g.slots.iter_mut() {
+            w.settled = settled.contains(gen);
+        }
+    }
+
+    /// A lock-side change within a step (a handoff queued, a floor raised, a
+    /// barrier noted) leaves generation `gen` unsettled at once, not at the
+    /// next publication: an answer without lock content between the change
+    /// and the end of the step would leave it behind.
+    pub fn unsettle(&self, gen: u64) {
+        if let Some(w) = self.lock().slots.get_mut(&gen) {
+            w.settled = false;
+        }
+    }
+
+    /// [`Self::unsettle`] for every generation (a barrier whose subtree is
+    /// not known here).
+    pub fn unsettle_all(&self) {
+        for w in self.lock().slots.values_mut() {
+            w.settled = false;
+        }
+    }
+
+    /// Count a renewal the answerer declined before it reached the table.
+    pub fn note_deferred(&self, why: Refusal) {
+        self.stats.deferred[why.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The certificate last published (tests, status).
+    pub fn lease_cert(&self) -> Option<RootLease> {
+        self.lock().lease
+    }
+
+    /// The off-core answerer's extension: one critical section that decides
+    /// from the published certificate and the generation's slot at `now`
+    /// ([`decide`]) and, if every rule holds, extends the window (a `max`,
+    /// commuting with the core's own). `Ok(ttl_ms)`: the window is now at
+    /// least `now.wait + ttl + extra` and the reply carries `ttl_ms`; the
+    /// delegate honours from its own send, which is no later than `now`.
+    pub fn extend_off_core(&self, gen: u64, from: NodeId, now: Now) -> Result<u64, Refusal> {
+        let result = {
+            let mut g = self.lock();
+            let Inner { slots, lease, .. } = &mut *g;
+            match (lease.as_ref(), slots.get_mut(&gen)) {
+                (None, _) => Err(Refusal::Lease),
+                (_, None) => Err(Refusal::Generation),
+                (Some(lease), Some(w)) => decide(lease, w, from, now).map(|(ttl, until)| {
+                    w.until = w.until.max(until);
+                    w.renewed_until = w.renewed_until.max(until);
+                    ttl
+                }),
+            }
+        };
+        match result {
+            Ok(_) => self.stats.answered_off_core.fetch_add(1, Ordering::Relaxed),
+            Err(r) => self.stats.deferred[r.index()].fetch_add(1, Ordering::Relaxed),
+        };
+        result
     }
 
     /// Set a generation's window outright (a core unit test that forces an
@@ -358,5 +622,150 @@ mod tests {
         assert!(!w.get(8).unwrap().open);
         w.clear();
         assert!(w.get(7).is_none());
+    }
+
+    fn lease() -> RootLease {
+        RootLease {
+            epoch: 3,
+            honour_until: HonourMs(60_000),
+            margin_ms: 1_000,
+            delegation_ttl_ms: 5_000,
+            extra_ms: 1_000,
+            fast: false,
+            last_s3_fresh: HonourMs(0),
+            window_ms: 1_500,
+            marked: true,
+        }
+    }
+
+    fn window() -> Window {
+        Window {
+            node: 2,
+            until: WaitMs(10_000),
+            renewed_until: WaitMs(10_000),
+            open: true,
+            eligible: true,
+            settled: true,
+        }
+    }
+
+    #[test]
+    fn the_answerer_grants_the_ttl_and_never_past_the_cap() {
+        let now = Now::same(20_000);
+        // Far from the lease's end: the full ttl, window to `now + ttl + extra`.
+        assert_eq!(
+            decide(&lease(), &window(), 2, now),
+            Ok((5_000, WaitMs(26_000)))
+        );
+        // The lease ends at 24 s with a 1 s margin: the cap is 3 s.
+        let mut l = lease();
+        l.honour_until = HonourMs(24_000);
+        assert_eq!(decide(&l, &window(), 2, now), Ok((3_000, WaitMs(24_000))));
+        // A grant never outlives the cap, by construction: the delegate
+        // stops at `sent + ttl - margin`, before the lease's end less margin.
+        for left in [1_001i64, 1_500, 4_999, 5_000, 6_000, 30_000] {
+            let mut l = lease();
+            l.honour_until = HonourMs(20_000 + left + 1_000);
+            let (ttl, _) = decide(&l, &window(), 2, now).unwrap();
+            assert!(ttl as i64 <= left, "ttl {ttl} past the cap {left}");
+        }
+        // Nothing left below the margin: no answer.
+        l.honour_until = HonourMs(21_000);
+        assert_eq!(decide(&l, &window(), 2, now), Err(Refusal::Cap));
+        l.honour_until = HonourMs(20_500);
+        assert_eq!(decide(&l, &window(), 2, now), Err(Refusal::Cap));
+    }
+
+    #[test]
+    fn the_answerer_refuses_each_state_the_core_would_not_grant_in() {
+        let now = Now::same(20_000);
+        let l = lease();
+        assert!(decide(&l, &window(), 2, now).is_ok());
+        // Another node's renewal.
+        assert_eq!(decide(&l, &window(), 9, now), Err(Refusal::Node));
+        // A recall, seal or end closed the slot; a designation never opens.
+        let mut w = window();
+        w.open = false;
+        assert_eq!(decide(&l, &w, 2, now), Err(Refusal::Closed));
+        let mut w = window();
+        w.eligible = false;
+        assert_eq!(decide(&l, &w, 2, now), Err(Refusal::Closed));
+        // The lock side has something to hand over.
+        let mut w = window();
+        w.settled = false;
+        assert_eq!(decide(&l, &w, 2, now), Err(Refusal::Unsettled));
+        // A tenure that may be taken over early needs a fresh proof of
+        // liveness within the window, and a marked lease.
+        let mut fast = lease();
+        fast.fast = true;
+        fast.last_s3_fresh = HonourMs(18_500);
+        assert_eq!(decide(&fast, &window(), 2, now), Err(Refusal::Stale));
+        fast.last_s3_fresh = HonourMs(18_501);
+        assert!(decide(&fast, &window(), 2, now).is_ok());
+        fast.marked = false;
+        assert_eq!(decide(&fast, &window(), 2, now), Err(Refusal::Unmarked));
+        // (A `Local` tenure that cannot be taken over early needs neither
+        // freshness nor a proof; the cap is its bound.)
+        let mut local = lease();
+        local.last_s3_fresh = HonourMs(0);
+        assert!(decide(&local, &window(), 2, now).is_ok());
+    }
+
+    #[test]
+    fn the_certificate_and_the_slot_are_one_critical_section() {
+        let w = windows();
+        let now = Now::same(20_000);
+        // No certificate: nothing is answered.
+        assert_eq!(w.extend_off_core(7, 2, now), Err(Refusal::Lease));
+        w.publish(Some(lease()), &[7]);
+        assert_eq!(w.extend_off_core(7, 2, now), Ok(5_000));
+        assert_eq!(w.until(7), Some(WaitMs(26_000)));
+        assert_eq!(w.extend_off_core(8, 2, now), Err(Refusal::Generation));
+        // A certificate that revokes (a release began) stops it at once;
+        // the window stays what it was.
+        w.publish(None, &[7]);
+        assert_eq!(w.extend_off_core(7, 2, now), Err(Refusal::Lease));
+        assert_eq!(w.until(7), Some(WaitMs(26_000)));
+        // A generation the core did not name as settled is not answered.
+        w.publish(Some(lease()), &[]);
+        assert_eq!(w.extend_off_core(7, 2, now), Err(Refusal::Unsettled));
+        // The extension is a max: a shorter one later leaves it.
+        w.publish(Some(lease()), &[7]);
+        assert_eq!(w.extend_off_core(7, 2, Now::same(19_000)), Ok(5_000));
+        assert_eq!(w.until(7), Some(WaitMs(26_000)));
+        assert_eq!(
+            w.stats().answered_off_core.load(Ordering::Relaxed),
+            2,
+            "two answers"
+        );
+        assert_eq!(
+            w.stats().deferred[Refusal::Unsettled.index()].load(Ordering::Relaxed),
+            1
+        );
+        w.clear();
+        assert!(w.lease_cert().is_none());
+    }
+
+    /// The fail-before of the recall's close: without it (the code before
+    /// R1's rule 2) a renewal answered after the recall began extends the
+    /// window the recall outwaits.
+    #[test]
+    fn a_closed_slot_is_not_extended_and_an_open_one_is() {
+        let w = windows();
+        w.publish(Some(lease()), &[7]);
+        let now = Now::same(20_000);
+        w.close_for_recall(7);
+        assert_eq!(w.extend_off_core(7, 2, now), Err(Refusal::Closed));
+        assert_eq!(w.until(7), Some(WaitMs(10_000)));
+        // The knob: the recall's close skipped.
+        let w = windows();
+        w.skip_closes_for_tests(true, false);
+        w.publish(Some(lease()), &[7]);
+        w.close_for_recall(7);
+        assert_eq!(
+            w.extend_off_core(7, 2, now),
+            Ok(5_000),
+            "extended past the recall"
+        );
     }
 }

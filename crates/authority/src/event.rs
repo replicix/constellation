@@ -175,6 +175,15 @@ pub enum Event {
         req: OpId,
         sent: HonourMs,
     },
+    /// The root's P2P service answered delegate `from`'s renewal of `gen`
+    /// off the core (plan 41 R2, `crate::deleg_lane::answer_root`): the
+    /// shared window table is extended already, by a grant of `ttl_ms`. The
+    /// core does the bookkeeping the answer skipped ([`Core::on_deleg_renew_answered_off_core`]):
+    /// the statistics, the lease's activity stamp, the expiry timer, the
+    /// lease renewal a short grant calls for. Sent on the urgent lane,
+    /// after the request it answers (which the core still handles, and
+    /// answers in full).
+    DelegRenewAnsweredOffCore { gen: u64, from: NodeId, ttl_ms: u64 },
     /// The off-core heartbeat thread did not run from `from` to `until`
     /// (this node's wait clock): the whole process was frozen, and nothing in it
     /// could renew a delegation (`Core::on_own_freeze`). The core uses it
@@ -690,6 +699,19 @@ pub enum PeerMsg {
         gen: u64,
         round: u64,
     },
+    /// The root's P2P service answered a delegation renewal off its core
+    /// while the core was stuck (plan 41 R2): the RPC reply of `req`, as
+    /// `Payload::DelegRenewedOffCore`. A grant of `ttl_ms` on `gen`, stream
+    /// round `round`, with no lock content: the delegate's core applies it
+    /// only as an extension of a grant it already serves, honoured from the
+    /// request's own send (`Core::on_deleg_renewed_off_core`); the root's
+    /// core still answers `req` in full, with `DelegRenewed`.
+    DelegRenewedOffCore {
+        req: OpId,
+        gen: u64,
+        round: u64,
+        ttl_ms: u64,
+    },
     DelegRenewed {
         req: OpId,
         gen: u64,
@@ -904,6 +926,7 @@ impl PeerMsg {
             PeerMsg::DelegateStreamAck { .. } => "DelegateStreamAck",
             PeerMsg::DelegRenew { .. } => "DelegRenew",
             PeerMsg::DelegRenewOffCore { .. } => "DelegRenewOffCore",
+            PeerMsg::DelegRenewedOffCore { .. } => "DelegRenewedOffCore",
             PeerMsg::DelegRenewed { .. } => "DelegRenewed",
             PeerMsg::DelegRecall { .. } => "DelegRecall",
             PeerMsg::DelegRecalled { .. } => "DelegRecalled",
@@ -937,6 +960,7 @@ impl PeerMsg {
             | PeerMsg::PromiseReply { req, .. }
             | PeerMsg::DelegateStreamAck { req, .. }
             | PeerMsg::DelegRenewed { req, .. }
+            | PeerMsg::DelegRenewedOffCore { req, .. }
             | PeerMsg::DelegRecalled { req, .. }
             | PeerMsg::DelegBackupAck { req, .. }
             | PeerMsg::DelegSealed { req, .. }
