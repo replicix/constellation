@@ -3887,7 +3887,13 @@ scenarios whose exact asserts assume no lock holder or delegate is ever
 paused (`lock-*`, `flock-cross-node`, `sqlite-two-nodes`,
 `git-under-flock*`, `delegate-*`, `root-failover-with-delegates`: a
 holder paused past its grant is fenced with `EIO` by contract) are
-reported `excluded`; aim the pause at a non-holder (`@node`) instead:
+reported `excluded`; aim the pause at a non-holder (`@node`) instead. Under
+a profile whose network delay makes a round trip longer than the backup RTT
+budget (`net-wan`, `net-lossy`, `net:delay:<N>ms` with 2 N over 5 ms), the
+scenarios that need a backup (`NEEDS_BACKUP` in `run.py`: `backup-*`,
+`lock-failover`, `delegate-root-loss`, `load-probe-takeover`, ...) are
+`excluded` too: no peer is a backup candidate past the budget, by design
+(`CONSTELLATION_BACKUP_RTT_BUDGET_MS`, DESIGN layer B):
 
 ```sh
 # every injector under load-probe, then every checker's deliberate break

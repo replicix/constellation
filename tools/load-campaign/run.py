@@ -255,6 +255,63 @@ NO_UNTARGETED_PAUSE = [
 ]
 
 
+# Scenarios that need a backup peer: they wait for the root to list one
+# (`wait_for_backup`) or assert the seal-based takeover it enables. A
+# backup is chosen only among peers whose measured RTT to the holder is
+# within CONSTELLATION_BACKUP_RTT_BUDGET_MS (5 ms by default; docs/reference/
+# features/durability-and-failover.md "Selection", DESIGN.md layer B). Past
+# it the cluster runs `Local` by design and the documented way to force a
+# backup across a WAN is to raise the budget, which pays that round trip on
+# every acknowledgement: another configuration, not these scenarios under
+# load. Their cells under a delaying network profile are reported
+# `excluded`; the other scenarios (and `ack-latency`, which has a WAN
+# topology of its own) still run under it.
+NEEDS_BACKUP = [
+    "backup-failover*",
+    "backup-departs",
+    "backup-partition",
+    "unmount-inside-the-takeover-floor",
+    "lock-failover",
+    "lock-grace-wait",
+    "s3-cut-holder-failover-with-locks",
+    "delegate-root-loss",
+    "delegate-backup-handoff-failover",
+    "delegate-root-blackhole",
+    "delegate-handoff-renewal",
+    "delegate-crash-backup",
+    "root-failover-with-delegates",
+    "upgrade-after-a-seal",
+    "small-file-write-path",
+    "nonowner-back-crash",
+    "slow-s3-no-seal",
+    "load-probe-takeover",
+]
+
+# The product's default backup RTT budget, ms.
+BACKUP_RTT_BUDGET_MS = 5
+
+# The one-way delay (ms) of the netem presets (crates/harness/src/load.rs
+# PRESETS); a profile item `net:delay:<N>ms...` gives it inline.
+NET_PRESET_DELAY_MS = {"net-lan": 1, "net-wan": 60, "net-lossy": 30}
+
+
+def delays_past_backup_budget(profile: str) -> bool:
+    """Whether a profile delays the P2P links so that a round trip (twice
+    the one-way delay, which `tc netem` adds in each direction) exceeds the
+    backup RTT budget: no peer is then a backup candidate."""
+    for item in (i.strip() for i in profile.split(",")):
+        if item in NET_PRESET_DELAY_MS:
+            delay = NET_PRESET_DELAY_MS[item]
+        else:
+            m = re.fullmatch(r"net:delay:(\d+(?:\.\d+)?)ms(?::.*)?", item)
+            if not m:
+                continue
+            delay = float(m.group(1))
+        if 2 * delay > BACKUP_RTT_BUDGET_MS:
+            return True
+    return False
+
+
 def untargeted_pause(profile: str) -> bool:
     """Whether a profile pauses every daemon (a pause item without `@node`,
     or a pause preset)."""
@@ -559,6 +616,19 @@ def main() -> int:
                             "seed": seed, "verdict": "excluded",
                             "reason": "untargeted pause profile x a scenario asserting no EIO "
                                       "for an unpaused holder",
+                            "seconds": 0, "host_lag": None, "dir": "",
+                        })
+                        continue
+                    if delays_past_backup_budget(profile) and any(
+                        fnmatch.fnmatchcase(scenario, p) for p in NEEDS_BACKUP
+                    ):
+                        print(f"--- {phase} | {profile} | {scenario} | seed {seed}: excluded "
+                              "(needs a backup; the profile's RTT exceeds the backup RTT budget)")
+                        rows.append({
+                            "phase": phase, "profile": profile, "scenario": scenario,
+                            "seed": seed, "verdict": "excluded",
+                            "reason": "a scenario needing a backup peer x a profile whose RTT "
+                                      "exceeds the backup RTT budget (no backup is chosen by design)",
                             "seconds": 0, "host_lag": None, "dir": "",
                         })
                         continue
