@@ -679,8 +679,9 @@ already keyed `(parent, name)` (`crates/mtree/src/keys.rs`), so:
     back into an overflowed region can still meet the unresolvable case.
   - **`releasedir` never blocks**: it removes the stream under the
     directory's short-lived lock and recomputes the directory's smallest
-    `start` (O(open streams of that directory)); pages behind the new
-    window become evictable lazily, at eviction time. No I/O, no wait —
+    `start` (O(log open streams of that directory)); the pages behind the
+    new window are freed then, each page once (the cost of a release is
+    that of the pages it frees, nothing else). No I/O, no wait —
     `RELEASEDIR` runs inline on the io_uring ring thread (fork
     `session.rs:1258`). The listing cache's locks are never held across a
     replica read (a scan reads first, then records under the lock).
@@ -701,7 +702,8 @@ already keyed `(parent, name)` (`crates/mtree/src/keys.rs`), so:
     `FuseHandoff` and cross-process in `MountHandoff.view`
     (`crates/cli/src/handover.rs:374`) — like R2's lookup counts. Unpinned
     hints do not cross. Pinned pages are encoded compactly (little-endian
-    cookie runs, not one JSON number per cookie), bounded by the pin caps;
+    cookie runs as base64 text in the handoff's JSON, not one JSON number
+    per cookie), bounded by the pin caps;
     R8 measures the handover with a pinned 1M-entry directory. A listing in
     progress across `daemon --upgrade` therefore stays exact even if its
     resume entry was deleted.
@@ -730,8 +732,9 @@ already keyed `(parent, name)` (`crates/mtree/src/keys.rs`), so:
   reads as a storage failure; `EINVAL` → `nfserr_inval` blames the
   caller's argument. Chosen: `ENOENT`, answered directly (not through
   `ino_err`, which is for a vanished inode). How the Linux NFS client
-  reacts to `NOENT` on `READDIR` (`fs/nfs/dir.c`) is not verified; R3b
-  records it.
+  reacts to `NOENT` on `READDIR` (`fs/nfs/dir.c`): read in R3b, recorded in
+  PROGRESS.md — it returns any error other than a bad cookie to
+  `getdents` unchanged, as it does `EIO`, so `ENOENT` is no worse.
 - **In-page collisions.** A page never holds two entries with equal
   cookies: when the next entry's cookie already occurs in the page, the
   page ends before it (it starts the next page, anchored by name), so a

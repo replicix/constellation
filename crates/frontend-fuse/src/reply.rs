@@ -1042,6 +1042,20 @@ impl Responder<LockStatus> for LockReply {
     }
 }
 
+/// `opendir`'s reply: the view's stream id for the directory (plan 40
+/// §4.9), and no open flags (the kernel does not cache the directory:
+/// `FOPEN_CACHE_DIR` is a follow-up).
+pub(crate) struct OpenDirReply(pub ReplyOpen);
+
+impl Responder<Fh> for OpenDirReply {
+    fn done(self, r: VfsResult<Fh>) {
+        match r {
+            Ok(fh) => self.0.opened(FileHandle(fh.0), FopenFlags::empty()),
+            Err(e) => self.0.error(reply_code(e.code())),
+        }
+    }
+}
+
 /// `readdir`'s buffer and completion in one (`R: DirSink + Responder<()>`).
 pub(crate) struct DirReply(pub ReplyDirectory);
 

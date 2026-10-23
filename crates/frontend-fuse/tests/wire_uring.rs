@@ -58,6 +58,8 @@ mod op {
     pub const WRITE: u32 = 16;
     pub const RELEASE: u32 = 18;
     pub const FSYNC: u32 = 20;
+    pub const OPENDIR: u32 = 27;
+    pub const RELEASEDIR: u32 = 29;
     pub const FLUSH: u32 = 25;
     pub const INIT: u32 = 26;
     pub const SETLK: u32 = 32;
@@ -74,7 +76,8 @@ fn op_in_len(opcode: u32) -> usize {
         op::GETATTR => 16, // fuse_getattr_in
         op::OPEN => 8,     // fuse_open_in
         op::READ | op::WRITE => 40,
-        op::FLUSH | op::RELEASE => 24,
+        op::FLUSH | op::RELEASE | op::RELEASEDIR => 24,
+        op::OPENDIR => 8, // fuse_open_in
         op::FSYNC => 16,
         op::SETLK | op::SETLKW => 48, // fuse_lk_in
         other => panic!("no op_in size for opcode {other}"),
@@ -593,6 +596,35 @@ fn reads_stay_on_the_ring_and_whatever_may_block_is_offloaded() {
         };
         assert!(thread.starts_with(prefix), "{}", call.summary());
     }
+}
+
+/// Plan 40 §4.9: `RELEASEDIR` never blocks, so it is answered on the ring
+/// thread itself (the fork's `dispatch_on_ring` lists it), and reaches the
+/// filesystem with the stream id the kernel holds; `OPENDIR` is a hop away.
+#[test]
+fn releasedir_is_answered_inline_on_the_ring_thread() {
+    let mock = MockVfs::new();
+    let stream = Fh((1 << 62) | 3);
+    mock.on_opendir(Script::ok(stream));
+    mock.always_releasedir(Script::ok(()));
+    let mut k = Kernel::start(&mock, Leg::Ring);
+    let r = k.call(op::OPENDIR, 5, &Body::default().i32(0).u32(0));
+    assert_eq!(r.error(), 0);
+    k.call(
+        op::RELEASEDIR,
+        5,
+        &Body::default().u64(stream.0).i32(0).u32(0).u64(0),
+    )
+    .body();
+    k.finish();
+    let calls = mock.calls();
+    let release = calls
+        .iter()
+        .find(|c| c.op == OpKind::Releasedir)
+        .expect("the releasedir reached the filesystem");
+    assert_eq!(release.args, Args::Releasedir { ino: 5, fh: stream });
+    let thread = release.thread.name.clone().unwrap_or_default();
+    assert!(thread.starts_with("fuser-ring-"), "{}", release.summary());
 }
 
 /// Plan 38 Z1b's ring-leg finding (`s3-cut-one-node`): a flush blocked in

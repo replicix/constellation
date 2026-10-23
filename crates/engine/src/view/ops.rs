@@ -1864,7 +1864,7 @@ impl Vfs for View {
         &self,
         cx: &OpCtx<'_>,
         ino: Ino,
-        _fh: Fh,
+        fh: Fh,
         cookie: u64,
         plus: bool,
         mut r: R,
@@ -1918,13 +1918,28 @@ impl Vfs for View {
         }
         // Name-ordered range scan resumed from the cookie's name: O(page)
         // (plan 40 §4.9, `listing`).
-        match self.list_page(ino, visible_ino, cookie, plus, &mut r) {
+        match self.list_page(ino, visible_ino, fh, cookie, plus, &mut r) {
             Ok(()) => r.done(Ok(())),
             Err(listing::PageError::Meta(code)) => r.done(self.ino_err(ino, code)),
             // Not through `ino_err`: the directory is there, the position
             // is not.
             Err(listing::PageError::LostCookie) => r.done(Err(VfsError::new(Code::NotFound))),
         }
+    }
+
+    /// Plan 40 §4.9: a stream id, so that the pages served on it are
+    /// pinned until it is released. No I/O, no wait, no admission: it
+    /// never fails and costs a counter and a map insert.
+    fn opendir<R: Responder<Fh>>(&self, _cx: &OpCtx<'_>, ino: Ino, r: R) {
+        r.done(Ok(self.opendir_stream(ino)));
+    }
+
+    /// Never blocks (the frontend may call it from a thread that serves
+    /// other requests): the stream's pin goes under the directory's shard
+    /// lock.
+    fn releasedir<R: Responder<()>>(&self, _cx: &OpCtx<'_>, _ino: Ino, fh: Fh, r: R) {
+        self.releasedir_stream(fh);
+        r.done(Ok(()));
     }
 
     fn statfs<R: Responder<StatFs>>(&self, cx: &OpCtx<'_>, ino: Ino, mut r: R) {

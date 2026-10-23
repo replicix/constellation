@@ -59355,3 +59355,71 @@ Tests: `a_resume_inside_a_page_after_a_create_behind_it_repeats_nothing` (with t
 removed) fails before (`b1`, `b2` twice) and passes after; `random_partial_replies_under_churn_list_each_name_once`
 (random part of each reply taken, names created across the order and removed, the resume entry among them,
 between every two requests) passes, from hints alone. Plan 40 §4.9 is updated.
+
+## Plan 40 P5: an open directory's listing hints are pinned (R3b, 2026-10-23)
+
+P3 left one reachable inexact case: an `fts`-style listing (`rm -rf`, `find -delete`, `du`) reads a round of
+entries, deletes them, the one its next cookie names included, and continues on the same open stream; if other
+listings evicted that cookie's hint meanwhile, the resume found no name for it and answered `ENOENT`. Now an open
+directory pins its hints.
+
+- **Streams** (`crates/engine/src/view/listing.rs`). `Vfs::opendir` is served by the view (the adapter now has
+  `opendir`/`releasedir`; `opendir` still answers no open flags, so no `FOPEN_CACHE_DIR`): it allocates a stream id
+  `DIR_FH_BIT | n` (`1 << 62`, n from 1: disjoint from file handles, which count up from 1) and registers
+  `(owner view, id)` on the directory in the node-wide `Listing`. No I/O, no wait, no admission. `releasedir`
+  removes it, under the directory's shard lock only; an id that is not a live stream (0, stale, a file handle)
+  does nothing. A view that is dropped releases its streams (`impl Drop for View`).
+- **The pin window.** Every page served for a directory gets the directory's next sequence number, through any
+  handle or none. A stream records the number it started at (opendir, or a request at cookie 0 through it: a
+  rewind) and the page last served through it. While any stream is open, every page from the smallest start on
+  is held outside the hint cap (`DirHints::pinned`); the older pages of a window that moved are freed at the
+  rewind or release, each page once. Cookies stay stream-independent: a lookup is by `(directory, cookie)`.
+  A lookup searches the four newest pinned pages and the ordinary hints under the shard lock, and the older
+  pinned pages outside it (pages are shared by `Arc`), so a `seekdir` far back never holds the lock.
+- **Caps** (`CONSTELLATION_READDIR_PIN_BYTES_PER_DIR` 128 MiB, `CONSTELLATION_READDIR_PIN_BYTES` 512 MiB, per
+  node; an unparseable value warns and keeps the default). Past the per-directory cap the oldest pinned pages of
+  that directory are unpinned (they become ordinary hints); past the node cap the directory with the most pinned
+  bytes gives up first, to 1/16 below the cap so that the next page does not scan again. **Each open stream's
+  last page is exempt** (`DirHints::held`): sequential continuation is exact at any size. Counted
+  (`pin_overflows`), warned once per directory. `ListingStats` gains `open_streams`, `pinned_dirs`,
+  `pinned_bytes`, `exempt_bytes`, `pin_overflows` (exported by P8).
+- **Handover.** `HandleTableSnapshot` gains `listing: ListingSnapshot` (the open streams with their start and
+  last page, each pinned directory's sequence number, its pinned and held pages). It crosses the `exec` in
+  `MountHandoff.view` (the handoff is JSON in a memfd, so a page's cookies are one base64 text of little-endian
+  u64s, not a number each) and in-process beside `FuseHandoff`. Unpinned hints do not cross. Imports merge by
+  sequence number (two views' exports of one directory, or an in-process import before the old view drops, do
+  not duplicate), and the caps are enforced after. **In place, no version bump, no `serde(default)`**: the first
+  `daemon --upgrade` across P5 cannot read the old handoff and rolls back to the image that wrote it
+  (`roll_back_unread`): it is a remount, as across R2. `HANDOVER_VERSION`'s doc says so.
+- `fsyncdir` carries a stream id; `View::fsync` needed no change (`Handles::take_error`/`mark_seen` already
+  treat a handle they did not give out as owed nothing); `sync_barrier`'s `handle_used` is a no-op for it. The
+  adapter doc is rewritten. `Vfs::readdir`'s doc now lists what stays inexact (answering `ENOENT`, never a
+  guess): a listing paused across a crash or restart whose resume entry was also deleted; an `nfsd`-style
+  re-export (it opens per request) with an evicted hint and a deleted entry; a `seekdir` back into a region the
+  pin bounds gave up on.
+
+**Q7: the Linux NFS client and `NOENT` on `READDIR`** (`fs/nfs/dir.c`, mainline `master` read through a fetch
+and summarised; the pinned commit of the plan was not checked out, and the mapping of `NFS3ERR_NOENT` to
+`-ENOENT` in the status-to-errno table was not verified directly). `nfs_readdir` treats `-EBADCOOKIE` (and
+`-ENOTSYNC` after an uncached retry) as a cookie the server lost, ends the listing quietly, and retries
+`-ETOOSMALL`; any other negative result, `-ENOENT` and `-EIO` alike, ends the loop and goes to `getdents`
+unchanged. The filler functions convert no server error. So `ENOENT` is not worse than `EIO` for the client,
+and the errno decision stands. (The code that maps the wire status to an errno is in the protocol-specific
+files and was not read.)
+
+Tests (`view/listing_tests.rs`, `tests/wire.rs`, `tests/wire_uring.rs`, `conformance/readdir.rs`,
+`cli/src/handover.rs`): `fts_deletion_under_hint_pressure_lists_every_name_once` (scaled: 20k names in rounds
+of ~2k, 50 directories of 1.5k listed by a second view, a 128 KiB cap; with `without_a_stream_the_same_deletion_loses_its_cookie`
+as its fail-before: `ENOENT`), `seekdir_after_mass_deletion_with_the_stream_open`, `a_rewind_moves_the_pin_window`,
+`a_listing_resumes_exactly_across_a_handle_table_handover` (no cold scan, no lost cookie; the pins are freed on
+release and when the old view drops), `an_in_process_handover_keeps_the_pins_of_the_stream`,
+`pin_caps_hold_and_each_streams_last_page_stays_pinned` (10k streams over 1k directories, node cap 1 MiB,
+directory cap 24 KiB, checked after every page), `releasedir_returns_within_10ms_during_a_cold_scan_and_a_full_cache`
+(a 250k-name directory scanned cold by another thread, not 1M), `a_stream_id_never_equals_a_file_handle`,
+`a_released_pin_frees_its_hints`, `releasing_what_is_no_stream_is_nothing`, the wire test for `OPENDIR` →
+`READDIR`/`FSYNCDIR`/`RELEASEDIR` carrying the id, the ring test (`RELEASEDIR` answered on the ring thread), the
+handoff tests (the pins cross the `exec`; a handoff without `listing` rolls back) and the kit case
+`readdir::an_open_directory_resumes_after_its_deleted_names` (exact on `RefTarget` and on the engine, plain and
+plus), with its naive habit (a view that resolves cookies by name alone fails it). With the stream registration
+removed the engine tests above and the kit case on both engine targets fail (`ENOENT`); the Listing-level cap
+test is unaffected, as it never opens a view stream.

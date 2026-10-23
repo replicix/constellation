@@ -554,7 +554,7 @@ impl Engine {
         // cookie width other than 62 or 31 fails the start (a 32-bit fleet
         // must not get 62-bit cookies by a typo); an unparseable hint cache
         // size warns and keeps the default.
-        let listing = crate::view::Listing::new(
+        let listing = crate::view::Listing::with_caps(
             crate::view::CookieKey::derive(
                 e2e_keys.as_ref(),
                 &fsmeta,
@@ -563,6 +563,7 @@ impl Engine {
             crate::view::hint_bytes_from(
                 std::env::var(crate::view::HINT_BYTES_ENV).ok().as_deref(),
             ),
+            crate::view::PinCaps::from_env(),
         );
         let store = Arc::new(match &e2e_keys {
             Some(keys) => ChunkStore::new_e2e(backend.clone(), keys.clone()),

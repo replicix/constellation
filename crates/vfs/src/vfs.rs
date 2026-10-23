@@ -278,6 +278,21 @@ pub trait Vfs: Send + Sync + 'static {
     /// its place); it never resumes at another position. `.` and `..`
     /// have cookies that precede every other.
     ///
+    /// **While a directory is open** ([`Vfs::opendir`] answered, not yet
+    /// [`Vfs::releasedir`]) a view keeps the places of the cookies it
+    /// handed out since the oldest open stream's open or last rewind, so
+    /// that a listing which deletes the entries it has read (`rm -rf`,
+    /// `find -delete`), a `seekdir` back to a saved `telldir` position
+    /// whose entry was deleted, and a listing that crosses a handover of
+    /// the daemon resume exactly after the name they stopped at, with no
+    /// error. What stays inexact, and answers `NotFound` rather than
+    /// guess: a listing paused across a daemon crash or restart (nothing
+    /// crossed) whose resume entry was also deleted; a re-export such as
+    /// `nfsd`, which opens per request, so that no stream outlives one,
+    /// with an evicted hint and a deleted entry; and a `seekdir` back
+    /// into a region the view's pin bounds gave up on, to a deleted entry.
+    /// The page last served to each open stream is never given up on.
+    ///
     /// **`plus`.** The listing is a `READDIRPLUS`: the view adds each
     /// entry with [`DirSink::add_entry`]. Every `Some(entry)` it hands
     /// out is a reference the platform holds until [`Vfs::forget`],

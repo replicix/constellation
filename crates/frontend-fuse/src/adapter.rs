@@ -76,8 +76,8 @@ use crate::refs::{Forgot, KernelRefs};
 use crate::repair::RepairLane;
 use crate::reply::{
     AttrReply, BytesReply, CopyReply, CreateReply, DirChangeReply, DirNotice, DirReply, EmptyReply,
-    EntryReply, LockReply, LseekReply, OpenCtx, OpenReply, ReadReply, RenameReply, StatfsReply,
-    Undo, WriteReply, XattrListReply, XattrReply, F_RDLCK, F_UNLCK, F_WRLCK,
+    EntryReply, LockReply, LseekReply, OpenCtx, OpenDirReply, OpenReply, ReadReply, RenameReply,
+    StatfsReply, Undo, WriteReply, XattrListReply, XattrReply, F_RDLCK, F_UNLCK, F_WRLCK,
 };
 use crate::stats::ZeroCopyCounter;
 use constellation_types::{Code, Rdev};
@@ -319,6 +319,10 @@ impl<V: Vfs> FuseFs<V> {
         let caller = caller(req);
         let op = self.obs().begin(OpKind::Fsync, ino.0);
         let _in = op.enter();
+        // For `fsyncdir` the handle is a directory stream id (the view's,
+        // `DIR_FH_BIT`): no open arm of the table has it (it completes
+        // only an `Arm::Open` of a file handle on a file inode), so this
+        // is a no-op there.
         self.pc.handle_used(ino.0, fh.0);
         let unique = req.unique().0;
         let token = self.interrupts.register(unique, req.pid(), self.lossy());
@@ -1785,8 +1789,9 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
     /// after a create or rename" means what applications rely on it to
     /// mean. Before, fuser's default answered `ENOSYS`, and the kernel then
     /// answered every later directory `fsync` on the mount 0 without
-    /// asking. `fh` is the `opendir` handle (always 0: the view keeps
-    /// none for directories).
+    /// asking. `fh` is the `opendir` handle: the view's directory stream
+    /// id (`DIR_FH_BIT`, never equal to a file handle), which it ignores
+    /// here, as it ignores any handle it did not give a write session.
     fn fsyncdir(
         &self,
         req: &Request,
@@ -1885,6 +1890,39 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             open_flags(flags.0),
             lock_owner.map(|owner| LockOwner(owner.0)),
             op.responder(self.parkable(req, EmptyReply(reply))),
+        );
+    }
+
+    /// Plan 40 §4.9: the view hands out a stream id for the directory
+    /// (it only tracks which directories are open, so that the hints that
+    /// place their cookies are not dropped meanwhile), still with no open
+    /// flags and so no `FOPEN_CACHE_DIR`.
+    fn opendir(&self, req: &Request, ino: INodeNo, _flags: fuser::OpenFlags, reply: ReplyOpen) {
+        let caller = caller(req);
+        let op = self.obs().begin(OpKind::Opendir, ino.0);
+        let _in = op.enter();
+        self.vfs
+            .opendir(&op.ctx(&caller), ino.0, op.responder(OpenDirReply(reply)));
+    }
+
+    /// The stream is closed. Answered here, with no ring wait: the view
+    /// never blocks in it (`RELEASEDIR` runs on the ring thread).
+    fn releasedir(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        _flags: fuser::OpenFlags,
+        reply: ReplyEmpty,
+    ) {
+        let caller = caller(req);
+        let op = self.obs().begin(OpKind::Releasedir, ino.0);
+        let _in = op.enter();
+        self.vfs.releasedir(
+            &op.ctx(&caller),
+            ino.0,
+            Fh(fh.0),
+            op.responder(EmptyReply(reply)),
         );
     }
 

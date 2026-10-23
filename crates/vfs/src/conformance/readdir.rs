@@ -482,6 +482,99 @@ pub(super) fn a_cookie_resumes_from_a_fresh_client(env: &Env<'_>) -> TestResult 
     Ok(())
 }
 
+/// With a directory stream open (`opendir`), a listing resumes after the
+/// place its cookie names even when the name it stopped at was deleted
+/// (`rm -rf` and `find -delete` read a round, delete it and continue on
+/// the same stream), and so does a `seekdir` back to the cookie of any
+/// entry since deleted. No error is allowed: the stream is what lets a
+/// view keep the place.
+pub(super) fn an_open_directory_resumes_after_its_deleted_names(env: &Env<'_>) -> TestResult {
+    let fx = env.fresh();
+    let c = fx.client();
+    let d = must("mkdir d", c.mkdir(c.root(), "d")).attr.ino;
+    let names: Vec<String> = (0..40).map(|i| format!("name-{i:02}")).collect();
+    for n in &names {
+        must("put", c.put(d, n, b""));
+    }
+    let fh = must("opendir", c.opendir(d));
+    // The first three pages of 7 (plain and plus alternating), through
+    // the stream: `.`, `..` and 19 names.
+    let mut listed: Vec<DirEntry> = Vec::new();
+    let mut cookie = 0;
+    for n in 0..3 {
+        let got = must("page", c.readdir_page_fh(d, fh, cookie, 7, n % 2 == 1));
+        cookie = got.last().expect("a page").next;
+        listed.extend(got);
+    }
+    assert_eq!(listed.len(), 21);
+    // What a listing that deleted what it read continues with: the names
+    // it has not read, in the order the view lists them. That order is
+    // the first listing's.
+    let full = must("whole listing", c.readdir_all(d, 64));
+    let order = key(&full);
+    let read: HashSet<String> = key(&listed).into_iter().map(|(_, n, _)| n).collect();
+    for e in &listed {
+        let name = String::from_utf8_lossy(e.name.as_bytes()).into_owned();
+        if name != "." && name != ".." {
+            must("unlink", c.unlink(d, &name));
+        }
+    }
+    let alive = |entries: &[(Ino, String, u64)]| -> Vec<(Ino, String, u64)> {
+        entries
+            .iter()
+            .filter(|(_, n, _)| n == "." || n == ".." || !read.contains(n))
+            .cloned()
+            .collect()
+    };
+    // Continue from the last cookie, whose name is gone.
+    for plus in [false, true] {
+        let mut rest = Vec::new();
+        let mut from = cookie;
+        loop {
+            let got = must(
+                "the page after the deleted names",
+                c.readdir_page_fh(d, fh, from, 7, plus),
+            );
+            let Some(last) = got.last() else { break };
+            from = last.next;
+            rest.extend(got);
+        }
+        let at = order
+            .iter()
+            .position(|(_, _, next)| *next == cookie)
+            .expect("the last cookie is in the listing");
+        let expected = alive(&order[at + 1..]);
+        if key(&rest) != expected {
+            fail!(
+                "resuming (plus: {plus}) after the deleted {:?} gave {:?}, the names not yet \
+                 read are {:?}",
+                order[at].1,
+                key(&rest),
+                expected
+            );
+        }
+    }
+    // A `seekdir` back to the cookie of every entry read, all deleted.
+    for e in &listed {
+        let at = order
+            .iter()
+            .position(|(_, _, next)| *next == e.next)
+            .expect("a cookie of the first listing");
+        let got = must("seekdir", c.readdir_page_fh(d, fh, e.next, 1000, false));
+        let expected = alive(&order[at + 1..]);
+        if key(&got) != expected {
+            fail!(
+                "seekdir to the cookie of the deleted {:?} gave {:?}, expected {:?}",
+                order[at].1,
+                key(&got),
+                expected
+            );
+        }
+    }
+    must("releasedir", c.releasedir(d, fh));
+    Ok(())
+}
+
 /// Every name of `d` (but `.` and `..`) has a plus entry equal to what a
 /// lookup of it answers now, and to what `getattr` of its inode says; `.`
 /// and `..` have none. Listed whole and in pages of 2, with no name-only
@@ -641,6 +734,9 @@ mod naive {
         NameOnly,
         /// A plus listing's entries say a size that is not the file's.
         WrongSizes,
+        /// A cookie resolves by the name it follows alone: one whose name
+        /// is gone is `NotFound`, whatever stream is open.
+        NamesOnly,
     }
 
     struct Naive(Habit);
@@ -720,6 +816,16 @@ mod naive {
                         e.entry = None;
                     }
                     Ok(all)
+                }
+                Habit::NamesOnly => {
+                    if cookie > 2
+                        && !listing(&inner, ino, 0, plus)?
+                            .iter()
+                            .any(|e| e.next == cookie)
+                    {
+                        return Err(VfsError::new(Code::NotFound));
+                    }
+                    listing(&inner, ino, cookie, plus)
                 }
                 Habit::WrongSizes => {
                     let mut all = listing(&inner, ino, cookie, plus)?;
@@ -819,6 +925,14 @@ mod naive {
     }
 
     #[test]
+    fn a_view_that_resolves_cookies_by_name_alone_fails_with_a_stream_open() {
+        fails(
+            Habit::NamesOnly,
+            "readdir::an_open_directory_resumes_after_its_deleted_names",
+        );
+    }
+
+    #[test]
     fn the_naive_listings_are_otherwise_the_reference() {
         // Guards the guard: a habit that broke the listing in general
         // would make the failures above vacuous.
@@ -827,6 +941,7 @@ mod naive {
             Habit::GoneIsEmpty,
             Habit::NameOnly,
             Habit::WrongSizes,
+            Habit::NamesOnly,
         ] {
             let report = run_all(&Naive(habit), Some("readdir::cookies_resume"));
             assert_eq!(

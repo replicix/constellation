@@ -902,3 +902,688 @@ fn batch_cost() {
     });
     println!("RESULT Meta::readdir {old:.2} ms, one-call page loop {page:.2} ms");
 }
+
+// ---------------------------------------------------------------------------
+// Plan 40 R3b: an open directory's listing hints are pinned.
+// ---------------------------------------------------------------------------
+
+use constellation_vfs::Blocking;
+use listing::{PinCaps, DIR_FH_BIT};
+
+fn opendir_of(view: &View, caller: &Caller, ino: Ino) -> Fh {
+    Blocking::run(|r| view.opendir(&OpCtx::new(OpKind::Opendir, caller), ino, r)).unwrap()
+}
+
+fn releasedir_of(view: &View, caller: &Caller, ino: Ino, fh: Fh) {
+    Blocking::run(|r| view.releasedir(&OpCtx::new(OpKind::Releasedir, caller), ino, fh, r)).unwrap()
+}
+
+fn page_fh(
+    view: &View,
+    caller: &Caller,
+    ino: Ino,
+    fh: Fh,
+    cookie: u64,
+    limit: usize,
+) -> VfsResult<Vec<(String, u64)>> {
+    let (sink, wait) = CollectDir::pair(limit);
+    view.readdir(
+        &OpCtx::new(OpKind::Readdir, caller),
+        ino,
+        fh,
+        cookie,
+        false,
+        sink,
+    );
+    wait.wait().map(|entries| {
+        entries
+            .into_iter()
+            .map(|e| (String::from_utf8(e.name.into_bytes()).unwrap(), e.next))
+            .collect()
+    })
+}
+
+fn children(page: Vec<(String, u64)>) -> Vec<(String, u64)> {
+    page.into_iter()
+        .filter(|(n, _)| n != "." && n != "..")
+        .collect()
+}
+
+/// A hint cache small enough that other listings evict a directory's
+/// pages.
+fn pressed() -> Fx {
+    Fx::with(Listing::new(CookieKey::fixed(1, 2), 128 << 10))
+}
+
+/// What `fts` (`rm -rf`, `find -delete`) does to a directory: read a round
+/// of entries, delete them all, the one the next cookie names included,
+/// and continue on the same open stream, while a second view lists other
+/// directories so that the hint cache evicts. Returns every name listed
+/// (or the first error) and the counters.
+///
+/// Scaled from the plan (100k names in rounds of 10k, 50 directories of
+/// 20k names, a 1 MiB cap): 20k names in rounds of ~2k, 50 directories of
+/// 1.5k, a 128 KiB cap. The cap is what makes the pressure; pages are 680
+/// names.
+fn fts_walk(with_stream: bool) -> (Result<Vec<String>, Code>, ListingStats) {
+    let fx = pressed();
+    let all = names(20_000);
+    let dir = fx.dir("d", &all);
+    let others: Vec<Ino> = (0..50)
+        .map(|i| fx.dir(&format!("p{i}"), &names(1500)))
+        .collect();
+    let (second, _keep) = fx.second_view();
+    let fh = if with_stream {
+        opendir_of(&fx.view, &fx.caller, dir)
+    } else {
+        Fh(0)
+    };
+    let mut listed: Vec<String> = Vec::new();
+    let mut cookie = 0;
+    let out = loop {
+        let mut round: Vec<(String, u64)> = Vec::new();
+        let mut last = cookie;
+        let mut failed = None;
+        while round.len() < 2000 {
+            match page_fh(&fx.view, &fx.caller, dir, fh, last, 680) {
+                Ok(page) => {
+                    let Some(l) = page.last() else { break };
+                    last = l.1;
+                    round.extend(children(page));
+                }
+                Err(e) => {
+                    failed = Some(e.code());
+                    break;
+                }
+            }
+        }
+        if let Some(code) = failed {
+            break Err(code);
+        }
+        if round.is_empty() {
+            break Ok(listed);
+        }
+        for (n, _) in &round {
+            fx.meta.unlink(dir, n).unwrap();
+        }
+        listed.extend(round.into_iter().map(|(n, _)| n));
+        for p in &others {
+            walk_of(&second, &fx.caller, *p, 680);
+        }
+        cookie = last;
+    };
+    (out, fx.listing.stats())
+}
+
+/// Against R3a alone (no stream): the cookie of a deleted name, evicted
+/// by other listings, is lost (`ENOENT`). This is what the pins are for.
+#[test]
+fn without_a_stream_the_same_deletion_loses_its_cookie() {
+    let (out, stats) = fts_walk(false);
+    assert_eq!(out.unwrap_err(), Code::NotFound, "{stats:?}");
+    assert!(stats.lost_cookies > 0, "{stats:?}");
+}
+
+#[test]
+fn fts_deletion_under_hint_pressure_lists_every_name_once() {
+    let (out, stats) = fts_walk(true);
+    let mut got = out.unwrap_or_else(|c| panic!("{c:?}: {stats:?}"));
+    assert_eq!(got.len(), 20_000, "{stats:?}");
+    got.sort();
+    got.dedup();
+    assert_eq!(got.len(), 20_000, "every name once");
+    assert_eq!(stats.lost_cookies, 0, "{stats:?}");
+}
+
+/// A small xorshift, for a shuffle that is the same every run.
+fn shuffle<T>(v: &mut [T], mut x: u64) {
+    for i in (1..v.len()).rev() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        v.swap(i, (x % (i as u64 + 1)) as usize);
+    }
+}
+
+/// `telldir` every 1,000th entry, delete 90 % of the names including the
+/// saved ones, `seekdir` to each in random order: each resumes exactly
+/// after its name, with the stream open and the cache pressed.
+#[test]
+fn seekdir_after_mass_deletion_with_the_stream_open() {
+    let fx = pressed();
+    let all = sorted(&names(10_000));
+    let dir = fx.dir("d", &all);
+    let others: Vec<Ino> = (0..30)
+        .map(|i| fx.dir(&format!("p{i}"), &names(1500)))
+        .collect();
+    let (second, _keep) = fx.second_view();
+    let fh = opendir_of(&fx.view, &fx.caller, dir);
+    let mut listed: Vec<(String, u64)> = Vec::new();
+    let mut cookie = 0;
+    loop {
+        let page = page_fh(&fx.view, &fx.caller, dir, fh, cookie, 680).unwrap();
+        let Some(l) = page.last() else { break };
+        cookie = l.1;
+        listed.extend(children(page));
+    }
+    assert_eq!(listed.len(), 10_000);
+    let saved: Vec<(String, u64)> = listed.iter().step_by(1000).cloned().collect();
+    let saved_names: BTreeSet<&str> = saved.iter().map(|(n, _)| n.as_str()).collect();
+    let mut gone = BTreeSet::new();
+    for (i, (n, _)) in listed.iter().enumerate() {
+        if saved_names.contains(n.as_str()) || i % 10 != 3 {
+            fx.meta.unlink(dir, n).unwrap();
+            gone.insert(n.clone());
+        }
+    }
+    assert!(gone.len() >= 9000);
+    for p in &others {
+        walk_of(&second, &fx.caller, *p, 680);
+    }
+    let survivors: Vec<&String> = all.iter().filter(|n| !gone.contains(*n)).collect();
+    let before = fx.listing.stats();
+    let mut order = saved.clone();
+    shuffle(&mut order, 0x9e37_79b9);
+    for (name, cookie) in &order {
+        let got = children(page_fh(&fx.view, &fx.caller, dir, fh, *cookie, 100).unwrap());
+        let expected: Vec<&String> = survivors
+            .iter()
+            .copied()
+            .filter(|n| n.as_bytes() > name.as_bytes())
+            .take(100)
+            .collect();
+        let got_names: Vec<&String> = got.iter().map(|(n, _)| n).collect();
+        assert_eq!(got_names, expected, "seekdir to the removed {name}");
+    }
+    let after = fx.listing.stats();
+    assert_eq!(after.cold_scans, before.cold_scans, "{after:?}");
+    assert_eq!(after.lost_cookies, 0, "{after:?}");
+    // Without the stream the same seekdirs lose their cookies.
+    releasedir_of(&fx.view, &fx.caller, dir, fh);
+    for p in &others {
+        walk_of(&second, &fx.caller, *p, 680);
+    }
+    let lost = order
+        .iter()
+        .filter(|(_, c)| page_fh(&fx.view, &fx.caller, dir, Fh(0), *c, 100).is_err())
+        .count();
+    assert!(lost > 0, "the pins were what kept them");
+}
+
+/// A `rewinddir` moves the window: pages before it may be evicted, after
+/// it not.
+#[test]
+fn a_rewind_moves_the_pin_window() {
+    let fx = pressed();
+    let all = sorted(&names(4000));
+    let dir = fx.dir("d", &all);
+    let others: Vec<Ino> = (0..30)
+        .map(|i| fx.dir(&format!("p{i}"), &names(1500)))
+        .collect();
+    let (second, _keep) = fx.second_view();
+    let fh = opendir_of(&fx.view, &fx.caller, dir);
+    let mut cookie = 0;
+    let mut first_page_end = None;
+    let mut pages = 0;
+    loop {
+        let page = page_fh(&fx.view, &fx.caller, dir, fh, cookie, 100).unwrap();
+        let Some(l) = page.last() else { break };
+        cookie = l.1;
+        pages += 1;
+        if pages == 3 {
+            first_page_end = Some(children(page)[99].clone());
+        }
+    }
+    assert_eq!(pages, 41, "4000 names and the dots, 100 to a page");
+    let (kept, ..) = fx.listing.window_for_test(dir);
+    assert_eq!(kept, pages, "every page since the open is pinned");
+    // Rewind: the first page served after it starts the window.
+    let page = children(page_fh(&fx.view, &fx.caller, dir, fh, 0, 100).unwrap());
+    let (kept, ..) = fx.listing.window_for_test(dir);
+    assert_eq!(kept, 1, "the pages before the rewind left the window");
+    let (late_name, late_cookie) = page[page.len() - 1].clone();
+    // Both names are deleted and the cache is pressed.
+    let (early_name, early_cookie) = first_page_end.unwrap();
+    fx.meta.unlink(dir, &early_name).unwrap();
+    fx.meta.unlink(dir, &late_name).unwrap();
+    for p in &others {
+        walk_of(&second, &fx.caller, *p, 680);
+    }
+    // After the rewind: pinned, exact.
+    let got = children(page_fh(&fx.view, &fx.caller, dir, fh, late_cookie, 100).unwrap());
+    let expected: Vec<&String> = all
+        .iter()
+        .filter(|n| n.as_bytes() > late_name.as_bytes())
+        .take(100)
+        .collect();
+    assert_eq!(got.iter().map(|(n, _)| n).collect::<Vec<_>>(), expected);
+    // Before it: the window no longer holds it, so a cache that evicted
+    // it answers `ENOENT` (never a guess).
+    match page_fh(&fx.view, &fx.caller, dir, fh, early_cookie, 100) {
+        Err(e) => assert_eq!(e.code(), Code::NotFound),
+        Ok(got) => {
+            let expected: Vec<&String> = all
+                .iter()
+                .filter(|n| n.as_bytes() > early_name.as_bytes() && **n != late_name)
+                .take(100)
+                .collect();
+            assert_eq!(
+                children(got).iter().map(|(n, _)| n).collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+}
+
+/// The view's side of a handover: export and import of the handle table
+/// between two views, one per node (their listings are separate), the next
+/// resume entry deleted in between.
+#[test]
+fn a_listing_resumes_exactly_across_a_handle_table_handover() {
+    let old = Fx::new();
+    let all = sorted(&names(3000));
+    let dir = old.dir("d", &all);
+    let fh = opendir_of(&old.view, &old.caller, dir);
+    let mut cookie = 0;
+    let mut mid = None;
+    let mut last = String::new();
+    for p in 0..3 {
+        let page = children(page_fh(&old.view, &old.caller, dir, fh, cookie, 100).unwrap());
+        if p == 1 {
+            mid = Some(page[40].clone());
+        }
+        cookie = page.last().unwrap().1;
+        last = page.last().unwrap().0.clone();
+    }
+    let (mid_name, mid_cookie) = mid.unwrap();
+    // The names the resumes point at are deleted.
+    old.meta.unlink(dir, &last).unwrap();
+    old.meta.unlink(dir, &mid_name).unwrap();
+    // A stream of another directory that was never listed pins nothing.
+    let empty = old.dir("e", &[]);
+    let idle = opendir_of(&old.view, &old.caller, empty);
+    let snapshot = old.view.export_handles();
+    let json = serde_json::to_string(&snapshot).unwrap();
+    let snapshot: HandleTableSnapshot = serde_json::from_str(&json).unwrap();
+    assert_eq!(snapshot.listing.streams.len(), 2);
+    // The next process: a view of the same replica with a listing of its
+    // own and nothing cached.
+    let new = Fx::on(old.meta.clone(), Listing::for_test());
+    new.view.import_handles(&snapshot);
+    let alive: Vec<&String> = all
+        .iter()
+        .filter(|n| **n != last && **n != mid_name)
+        .collect();
+    let after = |name: &str| -> Vec<&String> {
+        alive
+            .iter()
+            .copied()
+            .filter(|n| n.as_bytes() > name.as_bytes())
+            .take(100)
+            .collect()
+    };
+    let got = children(page_fh(&new.view, &new.caller, dir, fh, cookie, 100).unwrap());
+    assert_eq!(got.iter().map(|(n, _)| n).collect::<Vec<_>>(), after(&last));
+    let got = children(page_fh(&new.view, &new.caller, dir, fh, mid_cookie, 100).unwrap());
+    assert_eq!(
+        got.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+        after(&mid_name)
+    );
+    let stats = new.listing.stats();
+    assert_eq!(stats.cold_scans, 0, "{stats:?}");
+    assert_eq!(stats.lost_cookies, 0, "{stats:?}");
+    assert_eq!(stats.open_streams, 2, "{stats:?}");
+    assert!(stats.pinned_bytes > 0, "{stats:?}");
+    // The new numbering does not reuse an id the kernel holds.
+    let fresh = opendir_of(&new.view, &new.caller, dir);
+    assert!(fresh != fh && fresh != idle, "{fresh:?}");
+    // Released there, it is all let go of.
+    for (ino, fh) in [(dir, fh), (empty, idle), (dir, fresh)] {
+        releasedir_of(&new.view, &new.caller, ino, fh);
+    }
+    let stats = new.listing.stats();
+    assert_eq!(
+        (stats.open_streams, stats.pinned_bytes, stats.exempt_bytes),
+        (0, 0, 0)
+    );
+    new.listing.accounted_for_test();
+    assert!(
+        stats.hint_bytes <= 4 * 1000,
+        "only ordinary hints remain: {stats:?}"
+    );
+    // The old view going away lets go of its own streams.
+    assert_eq!(old.listing.stats().open_streams, 2);
+    let Fx { view, listing, .. } = old;
+    drop(view);
+    assert_eq!(listing.stats().open_streams, 0);
+    assert_eq!(listing.stats().pinned_bytes, 0);
+}
+
+/// ... and within one process: the new view imports into the listing the
+/// old one still pins in, then the old one goes away.
+#[test]
+fn an_in_process_handover_keeps_the_pins_of_the_stream() {
+    let fx = pressed();
+    let all = sorted(&names(2000));
+    let dir = fx.dir("d", &all);
+    let fh = opendir_of(&fx.view, &fx.caller, dir);
+    let mut cookie = 0;
+    let mut name = String::new();
+    for _ in 0..3 {
+        let page = page_fh(&fx.view, &fx.caller, dir, fh, cookie, 100).unwrap();
+        cookie = page.last().unwrap().1;
+        name = page.last().unwrap().0.clone();
+    }
+    let snapshot = fx.view.export_handles();
+    let (next, _keep) = fx.second_view();
+    next.import_handles(&snapshot);
+    let pinned = fx.listing.stats().pinned_bytes;
+    assert_eq!(fx.listing.stats().open_streams, 2, "both views' streams");
+    // The old view goes away; the new one's stream holds the same pages.
+    let Fx {
+        view,
+        listing,
+        meta,
+        caller,
+        ..
+    } = fx;
+    drop(view);
+    let stats = listing.stats();
+    assert_eq!(stats.open_streams, 1, "{stats:?}");
+    assert_eq!(stats.pinned_bytes, pinned, "{stats:?}");
+    listing.accounted_for_test();
+    meta.unlink(dir, &name).unwrap();
+    let got = children(page_fh(&next, &caller, dir, fh, cookie, 5).unwrap());
+    let at = all.iter().position(|n| *n == name).unwrap();
+    assert_eq!(
+        got.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        all[at + 1..at + 6]
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(listing.stats().cold_scans, 0);
+    releasedir_of(&next, &caller, dir, fh);
+    assert_eq!(listing.stats().pinned_bytes, 0);
+}
+
+/// The pin bounds hold with many streams over many directories, each
+/// stream's last page stays resolvable, and releasing frees everything.
+#[test]
+fn pin_caps_hold_and_each_streams_last_page_stays_pinned() {
+    let caps = PinCaps {
+        per_dir: 24 << 10,
+        per_node: 1 << 20,
+    };
+    let listing = Listing::with_caps(CookieKey::fixed(1, 2), 256 << 10, caps);
+    let (dirs, per_dir, pages_each) = (1000u64, 10u64, 30u64);
+    let owner = 7;
+    let key = |dir: u64, s: u64| (owner, DIR_FH_BIT | (dir * per_dir + s + 1));
+    for d in 0..dirs {
+        for s in 0..per_dir {
+            listing.open_stream(5000 + d, key(d, s));
+        }
+    }
+    assert_eq!(listing.stats().open_streams, dirs * per_dir);
+    assert_eq!(listing.stats().pinned_dirs, dirs);
+    let cookie =
+        |d: u64, s: u64, p: u64, i: u64| 3 + (((d * per_dir + s) * pages_each + p) << 8) + i;
+    let name = |d: u64, s: u64, p: u64| format!("n-{d}-{s}-{p}");
+    for p in 0..pages_each {
+        for d in 0..dirs {
+            for s in 0..per_dir {
+                let cookies: Vec<u64> = (0..100).map(|i| cookie(d, s, p, i)).collect();
+                listing.record_via_for_test(
+                    5000 + d,
+                    Some(b"anchor"),
+                    name(d, s, p).as_bytes(),
+                    &cookies,
+                    Some(key(d, s)),
+                );
+                let stats = listing.stats();
+                assert!(
+                    stats.pinned_bytes <= caps.per_node as u64,
+                    "node cap: {stats:?}"
+                );
+            }
+            let (_, window, _) = listing.window_for_test(5000 + d);
+            assert!(window <= caps.per_dir, "dir cap: {window}");
+        }
+    }
+    let stats = listing.stats();
+    assert!(stats.pin_overflows > 0, "{stats:?}");
+    assert!(
+        stats.exempt_bytes > 0,
+        "last pages outside the caps: {stats:?}"
+    );
+    listing.accounted_for_test();
+    // Every stream continues exactly from the last page it was served.
+    for d in 0..dirs {
+        for s in 0..per_dir {
+            let last = cookie(d, s, pages_each - 1, 99);
+            let resume = listing.resolve(5000 + d, last);
+            assert!(
+                resume.is_after_for_test(name(d, s, pages_each - 1).as_bytes()),
+                "dir {d} stream {s}"
+            );
+        }
+    }
+    for d in 0..dirs {
+        for s in 0..per_dir {
+            listing.close_stream(5000 + d, key(d, s));
+        }
+    }
+    let stats = listing.stats();
+    assert_eq!(
+        (
+            stats.open_streams,
+            stats.pinned_dirs,
+            stats.pinned_bytes,
+            stats.exempt_bytes
+        ),
+        (0, 0, 0, 0),
+        "{stats:?}"
+    );
+    let (_, _, held) = listing.accounted_for_test();
+    assert_eq!(held, 0);
+    assert!(stats.hint_bytes <= 256 << 10, "{stats:?}");
+}
+
+/// `RELEASEDIR` runs inline on the ring thread: while another thread
+/// scans a big directory cold and the hint cache is full, it still
+/// returns at once.
+#[test]
+fn releasedir_returns_within_10ms_during_a_cold_scan_and_a_full_cache() {
+    // The plan says a 1M-name directory; 250k keeps the scan running long
+    // enough here and the test's setup short.
+    let fx = Fx::with(Listing::new(CookieKey::fixed(1, 2), 64 << 10));
+    let big = fx.dir("big", &names(250_000));
+    let small: Vec<Ino> = (0..200)
+        .map(|i| fx.dir(&format!("s{i}"), &names(50)))
+        .collect();
+    let streams: Vec<(Ino, Fh)> = small
+        .iter()
+        .map(|d| (*d, opendir_of(&fx.view, &fx.caller, *d)))
+        .collect();
+    for (d, fh) in &streams {
+        let page = page_fh(&fx.view, &fx.caller, *d, *fh, 0, 100).unwrap();
+        assert!(page.len() > 2);
+    }
+    // Fill the hint cache to its cap.
+    for i in 0..30 {
+        let d = fx.dir(&format!("f{i}"), &names(3000));
+        walk_of(&fx.view, &fx.caller, d, 680);
+    }
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let mut worst = std::time::Duration::MAX;
+    std::thread::scope(|scope| {
+        let scan = scope.spawn(|| {
+            let mut scans = 0;
+            while !stop.load(Ordering::Relaxed) {
+                // A cookie no name has: one full cold scan, then `ENOENT`.
+                let err = page_fh(&fx.view, &fx.caller, big, Fh(0), 12345, 10).unwrap_err();
+                assert_eq!(err.code(), Code::NotFound);
+                scans += 1;
+            }
+            scans
+        });
+        // Let the scan begin.
+        while fx.listing.stats().cold_scans == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // Three tries: a blocked release takes as long as the scan, every
+        // time; a slow one is the machine.
+        for _ in 0..3 {
+            let mut slowest = std::time::Duration::ZERO;
+            for (d, fh) in &streams {
+                let t = Instant::now();
+                releasedir_of(&fx.view, &fx.caller, *d, *fh);
+                slowest = slowest.max(t.elapsed());
+            }
+            worst = worst.min(slowest);
+            if slowest < std::time::Duration::from_millis(10) {
+                break;
+            }
+            // Open them again for the next try.
+            let again: Vec<Fh> = small
+                .iter()
+                .map(|d| opendir_of(&fx.view, &fx.caller, *d))
+                .collect();
+            for ((d, _), fh) in streams.iter().zip(again) {
+                releasedir_of(&fx.view, &fx.caller, *d, fh);
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert!(scan.join().unwrap() >= 1);
+    });
+    assert!(
+        worst < std::time::Duration::from_millis(10),
+        "the slowest release took {worst:?}"
+    );
+}
+
+/// D8: a stream id is never a file handle, so a directory `fsync` on it is
+/// the barrier and owes and consumes nothing of a file's.
+#[test]
+fn a_stream_id_never_equals_a_file_handle() {
+    use constellation_vfs::{Durability, OpenFlags, OpenOwner};
+    let fx = Fx::new();
+    let dir = fx.dir("d", &[]);
+    let file = fx.meta.create(dir, "f", 0o644, 0, 0).unwrap().ino;
+    let mut files = BTreeSet::new();
+    let mut streams = BTreeSet::new();
+    for _ in 0..50 {
+        let opened = Blocking::run(|r| {
+            fx.view.open(
+                &OpCtx::new(OpKind::Open, &fx.caller),
+                file,
+                OpenFlags::READ | OpenFlags::WRITE,
+                OpenOwner::NONE,
+                r,
+            )
+        })
+        .unwrap();
+        files.insert(opened.fh.0);
+        streams.insert(opendir_of(&fx.view, &fx.caller, dir).0);
+    }
+    assert_eq!((files.len(), streams.len()), (50, 50));
+    assert!(streams.iter().all(|s| s & DIR_FH_BIT != 0));
+    assert!(files.iter().all(|f| f & DIR_FH_BIT == 0));
+    assert!(files.is_disjoint(&streams));
+    // The barrier on a stream id succeeds ...
+    let stream = Fh(*streams.iter().next().unwrap());
+    Blocking::run(|r| {
+        fx.view.fsync(
+            &OpCtx::new(OpKind::Fsync, &fx.caller),
+            dir,
+            stream,
+            Durability::Configured,
+            r,
+        )
+    })
+    .unwrap();
+    // ... and an error event owed to a file handle is not owed to a
+    // directory stream, nor consumed by it.
+    let file_fh = Fh(*files.iter().next().unwrap());
+    assert!(!fx.view.handles.take_error(stream, file, u64::MAX));
+    assert!(!fx.view.handles.take_error(stream, dir, u64::MAX));
+    assert!(fx.view.handles.take_error(file_fh, file, u64::MAX));
+}
+
+/// Releasing an unknown, stale or non-stream handle is nothing.
+#[test]
+fn releasing_what_is_no_stream_is_nothing() {
+    let fx = Fx::new();
+    let dir = fx.dir("d", &names(10));
+    let fh = opendir_of(&fx.view, &fx.caller, dir);
+    releasedir_of(&fx.view, &fx.caller, dir, Fh(0));
+    releasedir_of(&fx.view, &fx.caller, dir, Fh(DIR_FH_BIT | 999));
+    releasedir_of(&fx.view, &fx.caller, dir, Fh(5));
+    assert_eq!(fx.listing.stats().open_streams, 1);
+    releasedir_of(&fx.view, &fx.caller, dir, fh);
+    releasedir_of(&fx.view, &fx.caller, dir, fh);
+    assert_eq!(fx.listing.stats().open_streams, 0);
+    // A readdir through a released stream is a plain one.
+    assert_eq!(
+        children(page_fh(&fx.view, &fx.caller, dir, fh, 0, 100).unwrap()).len(),
+        10
+    );
+    assert_eq!(fx.listing.stats().pinned_bytes, 0);
+    fx.listing.accounted_for_test();
+}
+
+/// A listing's pages are hints again once its last stream is released:
+/// the window is freed, not kept.
+#[test]
+fn a_released_pin_frees_its_hints() {
+    let fx = Fx::new();
+    let dir = fx.dir("d", &names(3000));
+    let a = opendir_of(&fx.view, &fx.caller, dir);
+    let b = opendir_of(&fx.view, &fx.caller, dir);
+    let mut cookie = 0;
+    loop {
+        let page = page_fh(&fx.view, &fx.caller, dir, a, cookie, 100).unwrap();
+        let Some(l) = page.last() else { break };
+        cookie = l.1;
+    }
+    let (n, bytes, _) = fx.listing.window_for_test(dir);
+    assert_eq!(n, 31, "3000 names and the dots, 100 to a page");
+    assert_eq!(fx.listing.stats().pinned_bytes, bytes as u64);
+    // The older stream (b, opened before the listing) holds the window.
+    releasedir_of(&fx.view, &fx.caller, dir, a);
+    assert_eq!(fx.listing.window_for_test(dir).0, 31, "b still pins them");
+    releasedir_of(&fx.view, &fx.caller, dir, b);
+    let stats = fx.listing.stats();
+    assert_eq!((stats.pinned_bytes, stats.pinned_dirs), (0, 0), "{stats:?}");
+    let (ring, pinned, held) = fx.listing.accounted_for_test();
+    assert_eq!((pinned, held), (0, 0));
+    assert_eq!(ring, stats.hint_bytes);
+    assert!(
+        ring > 0 && ring <= 4 * 1000,
+        "the last pages stay as hints: {ring}"
+    );
+}
+
+/// The handoff carries a page's cookies as base64 text.
+#[test]
+fn a_pinned_pages_cookies_round_trip_through_the_handoffs_json() {
+    for n in [0usize, 1, 2, 3, 4, 5, 7, 680] {
+        let cookies: Vec<u8> = (0..n * 8).map(|i| (i * 37 + 11) as u8).collect();
+        let page = listing::PageSnapshot {
+            seq: 9,
+            anchor: Some(b"a".to_vec()),
+            last: b"z".to_vec(),
+            cookies: cookies.clone(),
+        };
+        let json = serde_json::to_string(&page).unwrap();
+        let back: listing::PageSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, page, "{n} cookies");
+        assert!(
+            n < 100 || json.len() < cookies.len() * 3 / 2,
+            "compact: {}",
+            json.len()
+        );
+    }
+    let bad = r#"{"seq":1,"anchor":null,"last":[],"cookies":"a!"}"#;
+    assert!(serde_json::from_str::<listing::PageSnapshot>(bad).is_err());
+}

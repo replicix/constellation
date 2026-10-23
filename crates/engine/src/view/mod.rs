@@ -129,7 +129,11 @@ pub(crate) fn jitter() -> f64 {
 pub use confine::LINK_DOMAIN_XATTR;
 pub use cookie::{CookieBits, CookieKey, COOKIE_BITS_ENV};
 pub use handoff::{HandleTableSnapshot, ViewHandoff};
-pub use listing::{hint_bytes_from, Listing, ListingStats, DEFAULT_HINT_BYTES, HINT_BYTES_ENV};
+pub use listing::{
+    hint_bytes_from, DirSnapshot, Listing, ListingSnapshot, ListingStats, PageSnapshot, PinCaps,
+    StreamSnapshot, DEFAULT_HINT_BYTES, DEFAULT_PIN_BYTES, DEFAULT_PIN_BYTES_PER_DIR,
+    HINT_BYTES_ENV, PIN_BYTES_ENV, PIN_BYTES_PER_DIR_ENV,
+};
 pub use passthrough::PassthroughStatus;
 pub use spec::{metric_view_label, ViewQos, ViewSpec, METRIC_LABELS};
 
@@ -434,6 +438,8 @@ pub struct View {
     synthetic: Mutex<SyntheticRegistry>,
     /// The node's cookie key and listing hints.
     listing: Arc<Listing>,
+    /// The directory streams this view handed out (`OPENDIR`).
+    dir_streams: listing::DirStreams,
     tree_cache: Mutex<(
         HashMap<crate::snapshot::FrozenObject, crate::snapshot::FrozenDir>,
         VecDeque<crate::snapshot::FrozenObject>,
@@ -576,6 +582,7 @@ impl View {
             snapsched_stats: deps.snapsched_stats,
             inflight: deps.inflight,
             listing: deps.listing,
+            dir_streams: listing::DirStreams::new(),
             holds: deps.holds,
             watch: deps.watch,
             policies: PolicyStack::for_caps(&deps.caps),

@@ -693,6 +693,7 @@ tests! {
         plus_and_plain_cookies_interleave [],
         plus_in_a_removed_directory_is_not_found [],
         a_cookie_resumes_from_a_fresh_client [],
+        an_open_directory_resumes_after_its_deleted_names [],
         removal_between_pages_never_repeats_or_loses [],
         stable_under_concurrent_create [],
         readdir_of_a_file_is_notdir [];

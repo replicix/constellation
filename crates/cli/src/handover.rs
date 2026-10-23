@@ -154,6 +154,11 @@ use std::time::Duration;
 /// "chosen per mount" (8, or 32 for a cluster-lock mount) where a version-5 image always sent
 /// the depth it used: across the mix a version-5 image would refuse the
 /// policy and a version-6 one would pin every ring mount to 8.
+///
+/// Changes in place since the rule: plan 40 R2 (`MountHandoff::refs`, the
+/// kernel's lookup counts) and R3b (`HandleTableSnapshot::listing`, the
+/// open directory streams and the listing hints they pin). The first
+/// `daemon --upgrade` across each is a remount.
 pub const HANDOVER_VERSION: u32 = 6;
 
 /// `daemon.lock`'s descriptor (held for the process's life; handed on).
@@ -1850,6 +1855,62 @@ mod tests {
         nameless["rollback_exe_fd"] = serde_json::Value::Null;
         assert!(unread_rollback(&nameless.to_string()).is_err());
         assert!(unread_rollback("not json").is_err());
+    }
+
+    /// Plan 40 R3b: a mount's open directory streams and the listing hints
+    /// they pin cross the `exec` in its view's handle table.
+    #[test]
+    fn an_open_directorys_pins_cross_the_exec() {
+        use constellation_engine::view::{
+            DirSnapshot, ListingSnapshot, PageSnapshot, StreamSnapshot,
+        };
+        let mut sent = handoff();
+        let mut m = mount(Vec::new());
+        m.view.handles.listing = ListingSnapshot {
+            next: 3,
+            streams: vec![StreamSnapshot {
+                id: (1 << 62) | 2,
+                dir: 77,
+                start: 4,
+                last: Some(5),
+            }],
+            dirs: vec![DirSnapshot {
+                dir: 77,
+                seq_next: 6,
+                pages: vec![PageSnapshot {
+                    seq: 5,
+                    anchor: Some(b"a".to_vec()),
+                    last: b"m".to_vec(),
+                    cookies: (0..64u8).collect(),
+                }],
+            }],
+        };
+        let listing = m.view.handles.listing.clone();
+        sent.mounts.push(m);
+        let got = read_handoff(write_handoff(&sent).unwrap()).unwrap();
+        assert_eq!(got.mounts[0].view.handles.listing, listing);
+    }
+
+    /// ... and an image written before it sends none: this one cannot read
+    /// that handoff (no `serde(default)`, no version bump), so it goes back
+    /// to its writer, and the first upgrade across R3b is a remount.
+    #[test]
+    fn a_handoff_without_the_listing_state_rolls_back_to_its_writer() {
+        let mut sent = handoff();
+        sent.mounts.push(mount(Vec::new()));
+        let mut old: serde_json::Value = serde_json::to_value(&sent).unwrap();
+        old["mounts"][0]["view"]["handles"]
+            .as_object_mut()
+            .unwrap()
+            .remove("listing")
+            .expect("the handle table has a listing field");
+        let text = old.to_string();
+        let err = read_handoff(write_memfd(text.as_bytes()).unwrap()).unwrap_err();
+        assert!(format!("{err:#}").contains("listing"), "{err:#}");
+        let (exe, body) = unread_rollback(&text).unwrap();
+        assert_eq!(exe, 9, "the previous executable");
+        let back: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(back["is_rollback"], true);
     }
 
     #[test]

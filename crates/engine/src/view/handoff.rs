@@ -47,6 +47,14 @@
 //!   `O_PATH` descriptor can still reopen. They are claimed at once
 //!   there: the old process's hold may already name them, and the next
 //!   one's first pass replaces that hold.
+//! - **`listing`**: the open directory streams (the kernel keeps their
+//!   ids), each pinned directory's page sequence and its pinned pages
+//!   (`listing`'s module doc): a listing in progress resumes exactly after
+//!   its cookie's place, even if that entry was deleted meanwhile. The
+//!   unpinned hints do not cross. New in the handover's handle table,
+//!   which is postcard (positional): a handover from a daemon built
+//!   before it fails to decode and rolls back — accepted, no
+//!   compatibility is kept for handover formats.
 //! - **`writers`**: the write-intent handles among `opens`, which refuse
 //!   passthrough on their inode (plan 38 Z3b).
 //! - **`passthrough`**: the chunk each passthrough handle sits on (plan 38
@@ -87,6 +95,9 @@ pub struct HandleTableSnapshot {
     pub passthrough: Vec<(Ino, Vec<[u8; 32]>)>,
     /// The orphans the kernel may still reference without a handle.
     pub unlinked_refs: Vec<Ino>,
+    /// The open directory streams and the listing hints they pin (plan 40
+    /// §4.9): a listing in progress stays exact across the handover.
+    pub listing: ListingSnapshot,
 }
 
 /// A synthetic node, opaquely (its type is the engine's own).
@@ -186,6 +197,7 @@ impl View {
             writers,
             passthrough: self.export_passthrough(),
             unlinked_refs,
+            listing: self.export_listing(),
         }
     }
 
@@ -212,6 +224,7 @@ impl View {
             }
         }
         self.import_passthrough(&snapshot.passthrough);
+        self.import_listing(&snapshot.listing);
         // Referenced since before this process, maybe claimed by its hold
         // already: claimed at once, so the first pass here never
         // withdraws a claim the old one published.

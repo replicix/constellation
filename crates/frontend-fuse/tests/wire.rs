@@ -75,6 +75,7 @@ mod op {
     pub const INIT: u32 = 26;
     pub const OPENDIR: u32 = 27;
     pub const READDIR: u32 = 28;
+    pub const RELEASEDIR: u32 = 29;
     pub const GETLK: u32 = 31;
     pub const SETLK: u32 = 32;
     pub const SETLKW: u32 = 33;
@@ -1828,8 +1829,8 @@ fn forget_needs_no_reply_and_unknown_opcodes_are_refused_not_fatal() {
     k.send(op::FORGET, 5, &Body::new().u64(1).0);
     let r = k.call(op::GETATTR, 1, &Body::new().u32(0).u32(0).u64(0));
     r.ok();
-    // OPENDIR is not implemented by the adapter: fuser's default opens
-    // directory handle 0.
+    // OPENDIR of a view that keeps no stream (the trait's default)
+    // answers handle 0.
     let r = k.call(op::OPENDIR, 1, &Body::new().i32(0).u32(0));
     assert_eq!(r.error, 0);
     // An opcode nobody implements: ENOSYS, and the session lives.
@@ -2101,6 +2102,74 @@ fn fsyncdir_is_the_fsync_barrier_on_the_directory() {
             }
         );
     }
+    k.finish();
+}
+
+/// Plan 40 §4.9: `OPENDIR` hands the view's stream id to the kernel, with
+/// no open flags (no `FOPEN_CACHE_DIR`), and `READDIR`, `FSYNCDIR` and
+/// `RELEASEDIR` carry it back; every opened stream is released once.
+#[test]
+fn opendir_hands_the_views_stream_id_and_the_kernel_brings_it_back() {
+    let (mut k, mock) = plain();
+    let stream = Fh((1 << 62) | 9);
+    mock.on_opendir(Script::ok(stream));
+    mock.always_readdir(Script::ok(Vec::new()));
+    mock.always_fsync(Script::ok(()));
+    let r = k.call(op::OPENDIR, 5, &Body::new().i32(0).u32(0));
+    let out = r.ok();
+    assert_eq!(out.len(), 16, "fuse_open_out");
+    assert_eq!(r.u64_at(0), stream.0, "the view's stream id");
+    assert_eq!(r.u32_at(8), 0, "no open flags: the kernel caches nothing");
+    // The kernel's READDIR (fh first), FSYNCDIR and RELEASEDIR.
+    k.call(
+        op::READDIR,
+        5,
+        &Body::new()
+            .u64(stream.0)
+            .u64(0)
+            .u32(4096)
+            .u32(0)
+            .u64(0)
+            .i32(0)
+            .u32(0),
+    )
+    .ok();
+    assert_eq!(
+        mock.last_call().unwrap().args,
+        Args::Readdir {
+            ino: 5,
+            fh: stream,
+            cookie: 0,
+            plus: false
+        }
+    );
+    k.call(op::FSYNCDIR, 5, &Body::new().u64(stream.0).u32(0).u32(0))
+        .ok();
+    assert_eq!(
+        mock.last_call().unwrap().args,
+        Args::Fsync {
+            ino: 5,
+            fh: stream,
+            level: Durability::Configured
+        }
+    );
+    k.call(
+        op::RELEASEDIR,
+        5,
+        &Body::new().u64(stream.0).u32(0).u32(0).u64(0),
+    )
+    .ok();
+    assert_eq!(
+        mock.last_call().unwrap().args,
+        Args::Releasedir { ino: 5, fh: stream }
+    );
+    assert_eq!(
+        mock.dir_streams(),
+        vec![
+            constellation_vfs::mock::DirStream::Opened { ino: 5, fh: stream },
+            constellation_vfs::mock::DirStream::Released { ino: 5, fh: stream },
+        ]
+    );
     k.finish();
 }
 
