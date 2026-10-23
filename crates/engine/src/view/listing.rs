@@ -610,6 +610,9 @@ pub struct Listing {
     pinned_bytes: AtomicU64,
     exempt_bytes: AtomicU64,
     pin_overflows: AtomicU64,
+    /// Tests only: run after each batch a cold scan reads (`list_page`).
+    #[cfg(test)]
+    pub(crate) cold_scan_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl Listing {
@@ -637,6 +640,8 @@ impl Listing {
             pinned_bytes: AtomicU64::new(0),
             exempt_bytes: AtomicU64::new(0),
             pin_overflows: AtomicU64::new(0),
+            #[cfg(test)]
+            cold_scan_hook: Mutex::new(None),
         })
     }
 
@@ -1478,6 +1483,13 @@ impl View {
                 let mut from: Option<Vec<u8>> = None;
                 let found = 'scan: loop {
                     let batch = read(from.as_deref()).map_err(meta_err)?;
+                    #[cfg(test)]
+                    {
+                        let hook = listing.cold_scan_hook.lock().unwrap().clone();
+                        if let Some(hook) = hook {
+                            hook();
+                        }
+                    }
                     for e in &batch {
                         scanned += 1;
                         if key.cookie(&e.name) == cookie {

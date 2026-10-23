@@ -1389,78 +1389,101 @@ fn pin_caps_hold_and_each_streams_last_page_stays_pinned() {
     assert!(stats.hint_bytes <= 256 << 10, "{stats:?}");
 }
 
-/// `RELEASEDIR` runs inline on the ring thread: while another thread
-/// scans a big directory cold and the hint cache is full, it still
-/// returns at once.
+/// `RELEASEDIR` runs inline on the ring thread and never blocks (plan 40
+/// §P5: the shard lock of the directory's hints, nothing else): while
+/// another thread is in the middle of a cold scan of a big directory and
+/// the hint cache is full, every release completes and frees its stream.
+///
+/// The scan is parked inside its reads (`Listing::cold_scan_hook`), so a
+/// release that waited for it could not complete until the park ends: the
+/// releases must all be done while the scan is still parked. (This measured
+/// a 10 ms wall bound before, which CPU load alone broke: the plan's own
+/// latency target, `releasedir` p99 < 1 ms, is a bench's, not this test's.)
 #[test]
-fn releasedir_returns_within_10ms_during_a_cold_scan_and_a_full_cache() {
-    // The plan says a 1M-name directory; 250k keeps the scan running long
-    // enough here and the test's setup short.
+fn releasedir_never_waits_for_a_cold_scan_or_a_full_cache() {
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
+    // The plan says a 1M-name directory, sized for a scan to outlast a
+    // timed release; a scan parked in its reads needs only more than one
+    // batch.
     let fx = Fx::with(Listing::new(CookieKey::fixed(1, 2), 64 << 10));
-    let big = fx.dir("big", &names(250_000));
+    let big = fx.dir("big", &names(4 * BATCH));
     let small: Vec<Ino> = (0..200)
         .map(|i| fx.dir(&format!("s{i}"), &names(50)))
         .collect();
     // Open streams with a page served on each: what a release frees.
-    let open = || -> Vec<(Ino, Fh)> {
-        small
-            .iter()
-            .map(|d| {
-                let fh = opendir_of(&fx.view, &fx.caller, *d);
-                let page = page_fh(&fx.view, &fx.caller, *d, fh, 0, 100).unwrap();
-                assert!(page.len() > 2);
-                (*d, fh)
-            })
-            .collect()
-    };
-    let mut streams = open();
+    let streams: Vec<(Ino, Fh)> = small
+        .iter()
+        .map(|d| {
+            let fh = opendir_of(&fx.view, &fx.caller, *d);
+            let page = page_fh(&fx.view, &fx.caller, *d, fh, 0, 100).unwrap();
+            assert!(page.len() > 2);
+            (*d, fh)
+        })
+        .collect();
     // Fill the hint cache to its cap.
     for i in 0..30 {
         let d = fx.dir(&format!("f{i}"), &names(3000));
         walk_of(&fx.view, &fx.caller, d, 680);
     }
-    let stop = std::sync::atomic::AtomicBool::new(false);
-    let mut worst = std::time::Duration::MAX;
+    let before = fx.listing.stats();
+    assert_eq!(before.open_streams, small.len() as u64);
+    // (parked, let go): the scan parks in its first batch until let go.
+    // The park is bounded (a release that blocks fails the test below
+    // instead of hanging it).
+    let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+    let hook_gate = gate.clone();
+    *fx.listing.cold_scan_hook.lock().unwrap() = Some(Arc::new(move || {
+        let (state, cv) = &*hook_gate;
+        let mut st = state.lock().unwrap();
+        if st.1 {
+            return;
+        }
+        st.0 = true;
+        cv.notify_all();
+        let (mut st, _) = cv
+            .wait_timeout_while(st, Duration::from_secs(60), |st| !st.1)
+            .unwrap();
+        st.0 = false;
+    }));
     std::thread::scope(|scope| {
         let scan = scope.spawn(|| {
-            let mut scans = 0;
-            while !stop.load(Ordering::Relaxed) {
-                // A cookie no name has: one full cold scan, then `ENOENT`.
-                let err = page_fh(&fx.view, &fx.caller, big, Fh(0), 12345, 10).unwrap_err();
-                assert_eq!(err.code(), Code::NotFound);
-                scans += 1;
-            }
-            scans
+            // A cookie no name has: one full cold scan, then `ENOENT`.
+            let err = page_fh(&fx.view, &fx.caller, big, Fh(0), 12345, 10).unwrap_err();
+            assert_eq!(err.code(), Code::NotFound);
         });
-        // Let the scan begin.
-        while fx.listing.stats().cold_scans == 0 {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+        {
+            let (state, cv) = &*gate;
+            let st = state.lock().unwrap();
+            let (st, _) = cv
+                .wait_timeout_while(st, Duration::from_secs(60), |st| !st.0)
+                .unwrap();
+            assert!(st.0, "the cold scan never began");
         }
-        // Three tries: a blocked release takes as long as the scan, every
-        // time; a slow one is the machine.
-        for _ in 0..3 {
-            let mut slowest = std::time::Duration::ZERO;
-            for (d, fh) in &streams {
-                let t = Instant::now();
-                releasedir_of(&fx.view, &fx.caller, *d, *fh);
-                slowest = slowest.max(t.elapsed());
-            }
-            assert_eq!(fx.listing.stats().open_streams, 0, "every release freed");
-            worst = worst.min(slowest);
-            if slowest < std::time::Duration::from_millis(10) {
-                break;
-            }
-            // Open them again, each with a page, for the next try: a
-            // release of ids already released would measure nothing.
-            streams = open();
+        for (d, fh) in &streams {
+            releasedir_of(&fx.view, &fx.caller, *d, *fh);
         }
-        stop.store(true, Ordering::Relaxed);
-        assert!(scan.join().unwrap() >= 1);
+        let parked = gate.0.lock().unwrap().0;
+        let after = fx.listing.stats();
+        {
+            let (state, cv) = &*gate;
+            state.lock().unwrap().1 = true;
+            cv.notify_all();
+        }
+        scan.join().unwrap();
+        assert!(
+            parked,
+            "a release waited for the cold scan: the releases ended after its park"
+        );
+        assert_eq!(after.open_streams, 0, "every release freed: {after:?}");
+        assert_eq!(after.pinned_bytes, 0, "{after:?}");
+        assert_eq!(
+            (after.cold_scans, after.cold_scan_entries),
+            (before.cold_scans + 1, before.cold_scan_entries),
+            "the releases scanned nothing (only the parked scan began): {after:?}"
+        );
     });
-    assert!(
-        worst < std::time::Duration::from_millis(10),
-        "the slowest release took {worst:?}"
-    );
+    *fx.listing.cold_scan_hook.lock().unwrap() = None;
 }
 
 /// D8: a stream id is never a file handle, so a directory `fsync` on it is
