@@ -406,6 +406,55 @@ step (the existing lease mirror, `LeaseView`, extended). Details §5.
   stalled.** Exactly what `cluster-locks.md:317-339` rightly rejects:
   from inside a stall the node cannot know nobody acted. B never
   honours past a window; it extends the window by the owner's rule.
+- **D8. The journal's `write(2)` outside the store's writer lock**
+  (vendored fjall change 10, "FJ"; decided on 2026-10-22, **dropped on
+  2026-10-23**). The idea was that a commit whose `write(2)` blocks on
+  the device should not hold the single-writer lock, so the writers
+  behind it, the core's included, would not queue on it. A commit can
+  hold no lock across its `write(2)` only if it publishes before its
+  bytes are written. Its review showed what that costs: a reader
+  (`journal_txs_from`/`journal_tip`, i.e. the S3 shipper and backup
+  streaming) can see a commit that a process crash then loses, and a
+  memtable flushed while a write is parked can tear a transaction.
+  Today a commit's bytes reach the OS (`persist(Buffer)`) before the
+  memtable insert and the publish (`vendor/fjall/src/batch/mod.rs`,
+  `tx/single_writer/mod.rs`; `Meta::sync`'s doc). Restoring that
+  guarantee removes everything FJ gains, under any design that keeps
+  one journal:
+  - One history: transactions are serialized by the single-writer lock,
+    and recovery keeps a prefix of the journal (it truncates at the
+    first incomplete batch). If commit N's `write(2)` is stuck, a later
+    commit N+1 may depend on what N wrote. N+1 cannot be visible until
+    N's bytes are written too, wherever N+1's own bytes go.
+  - The kernel agrees: a buffered write takes the file's inode lock
+    (ext4, xfs, btrfs, tmpfs), so N+1's `write(2)` to the journal waits
+    for N's anyway.
+  - So every commit behind a stuck write waits for it, with or without
+    a lock. That is the convoy, with the same latency. What a
+    lock-free form would still let run (reads, the lock tables, the
+    lanes) does not take the writer lock today. Group commit gives
+    nothing either: a single-writer transaction holds the lock from its
+    open to its commit, so there is never a second commit ready to
+    batch, unless the lock is released early, which is FJ again.
+  - Measured on the lane's work tree (`lock-stall-lone-node`, a
+    `core-only` stall: the core's own commit holds the writer lock 5
+    or 12 s): the core's step was 12.0 s, of which 62 µs was waiting
+    for the lock. A stall of the core's own commit is beyond any
+    form of FJ (finding 08's second phase, 24 s, was this case). The
+    lanes (L2–L4, R) are what keep renewals going. They touch `Meta`
+    only through `locks()` and `delegations_any()`, and L1 keeps every
+    store read out of the tables' mutex.
+  - A separate journal for some state is the only layout that
+    unblocks a committer, and only for stalls of one file (btrfs
+    stable pages, a btrfs fsync holding the journal's inode lock), not
+    a device or ext4 jbd2 stall. In this plan's scope the only lock
+    state that is persisted is the restart horizon. That is D4,
+    relevant only with L5. The core's own commits (journal acks,
+    applied segments, forwarded ops) are atomic with the namespace and
+    cannot move out of the shared journal.
+
+  Rejected: no gain for any committer, a large vendored change, and
+  0.91–0.99× on contended single-writer commits in its perf run.
 
 | | Integrity argument | Covers | Cost |
 |---|---|---|---|
@@ -415,6 +464,7 @@ step (the existing lease mirror, `LeaseView`, extended). Details §5.
 | D1 | unchanged | stalls < 29.5 s | waiters 3× longer behind a crash |
 | D2 | breaks tokens | lone node only | low |
 | D3 | unchanged | stalls < 12.7 s | 1.5× messages |
+| D8 | only by publishing after the write, which removes its gain | nothing a lane does not; no committer is freed | a large vendored fjall change |
 
 ## 5. Decision and design
 
@@ -1353,7 +1403,10 @@ nothing for a root with a backup); D5, the lock lane stays always on and the
 root-side lane runs only while the core is stuck; D6, the node-side bound
 for held locks stays 120 s and the root-side lane is bounded at 15 s; D7,
 the fjall change (the journal's `write(2)` outside the single-writer lock)
-lands as its own vendored commit.
+lands as its own vendored commit. **D7 was withdrawn on 2026-10-23**
+after its review: the change is dropped (§4 D8). It gains nothing unless
+a commit is visible before its bytes are written, and that is a
+durability regression. Vendored fjall change number 10 stays unused.
 
 ## 12. Exit criteria
 

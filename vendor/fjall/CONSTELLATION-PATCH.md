@@ -10,7 +10,7 @@ and both texts stay here unchanged.
 
 ## What is changed
 
-There are ten changes, numbered 1-9 and 11 (10 is reserved for plan 41's journal-write change), each marked `CONSTELLATION PATCH`:
+There are ten changes, numbered 1-9 and 11 (10 was plan 41's journal write outside the writer lock, dropped: plan 41 §4 D8), each marked `CONSTELLATION PATCH`:
 
 1. **`src/db.rs`, `impl Drop for DatabaseInner`**: this is the fix. The
    worker shutdown loop never blocks now.
