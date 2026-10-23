@@ -21,7 +21,8 @@
 //! served by this process (`ProbeVfs`): the verdict is the kernel's, not a
 //! mount's, so no view's namespace is touched and a read-only or subtree
 //! view is probed like any other. The probe runs once per process, from a
-//! thread, after the first mount: until it answers (a few hundred ms) the
+//! thread, after the first mount: until it answers (a few hundred ms; about
+//! 2 s on a kernel with 0001, where each of its two holds lasts a second) the
 //! verdicts are the table's. A probe that cannot mount (no `/dev/fuse`, no
 //! `fusermount3`), or whose test does not come out clearly, answers
 //! `Unknown`.

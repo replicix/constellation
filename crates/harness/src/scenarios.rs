@@ -2125,7 +2125,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "kernel-race-repair-stall",
-        desc: "plan 42 F10 — W2 forced on: a read then a partial write of one page; with kernel fix 0001 every repair waits for its bound, without it none does",
+        desc: "plan 42 F10 — W2 forced on: two pages read, then half a page written (no stall on any kernel) or both written whole (with kernel fix 0001 every repair waits for its bound, without it none does)",
         requires: &[],
         caps: &[],
         run: kernel_races::repair_stall,

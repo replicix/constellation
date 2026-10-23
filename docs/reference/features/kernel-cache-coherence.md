@@ -133,10 +133,12 @@ to).
 The kernel patches (0001 keeps write-through folios under writeback for
 the `WRITE`; 0002 marks attributes valid only after storing them; 0003
 bumps a directory's attribute version when it changes) make the
-workarounds unnecessary. Each workaround's `auto` follows its fix's
+workarounds unnecessary, except W3b's notice for the inode a rename
+moves: 0003 as first sent does not bump that inode's version, so the
+notice stays on with it (plan 42 F16). Each workaround's `auto` follows its fix's
 verdict: a setting `on`/`off` overrides it; else the daemon probes 0001
 and 0003 at its first mount, on a private mount of its own (a few hundred
-milliseconds, in the background); else a table of releases decides (empty
+milliseconds, about 2 s on a kernel with 0001, in the background); else a table of releases decides (empty
 until the patches are merged). An unknown verdict keeps the workaround on.
 Keep-cache (W1) is independent of the kernel.
 

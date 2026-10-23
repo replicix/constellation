@@ -3207,6 +3207,7 @@ the handover rows are `/dev/fuse` only (a ring cannot be handed over).
 | `kernel-race-dir-version-remote` | guard | the `mkdir` made on another node | 0 of 20 |
 | `kernel-race-dir-ttl-strict-lone` | 2a | the `dir-nlink` workload on a lone `--cto strict` node (its kernel TTL is not 0) | 0 mismatches |
 | `kernel-race-probe-exit` | K6 | the daemon's unmount 0, 0.3, 1.2 and 2.5 s after its mount, while the kernel-fix probe may hold a reply of its own mount | the daemon exits within 30 s each time (on a kernel with fix 0001 an exit during the probe used to leave a zombie with two threads in `D`; a guard on kernels without it) |
+| `kernel-race-repair-stall` | 1 (F10) | `CONSTELLATION_FUSE_WRITE_REPAIR=on`, `KEEP_CACHE=off`, repair bound 200 ms; 30 rounds of reading two pages then writing half a page (the tail page, left out of the repair), 30 of reading two pages then writing both whole | 0 stale; no late repair in the half-page rounds; whole pages: on a kernel with fix 0001 (probe `fixed`) a late repair per round and a median write at the bound or above half of it, without it (`not_fixed`) none late and writes under half the bound |
 
 `CONSTELLATION_HARNESS_KERNEL_RACE_SECS` shortens the 60 s runs while
 developing. The counters the scenarios read are `node.status`'s
