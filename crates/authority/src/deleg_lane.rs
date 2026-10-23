@@ -39,17 +39,17 @@ pub const DELEG_LANE_STUCK_MS: i64 = 500;
 /// thread ticks every few hundred ms, and an ordinary step is shorter.
 pub const DELEG_LANE_STUCK_MIN_MS: i64 = 100;
 
+/// The slack a delegate adds to [`stuck_threshold_ms`] before it sends a
+/// renewal that the root has not answered once more (`Core::deleg_resend_ms`):
+/// the request's trip and the answerer's own reading.
+pub const DELEG_RESEND_SLACK_MS: i64 = 250;
+
 /// How long the driver must have been stuck before the lane renews a
 /// generation renewed every `period_ms`: [`DELEG_LANE_STUCK_MS`], or a
 /// quarter of the period if that is less (not below
 /// [`DELEG_LANE_STUCK_MIN_MS`]). The core would have renewed by one period
 /// after the last renewal; the lane steps in after a quarter of one, so a
 /// short grant is not given up on for most of its length first.
-/// The slack a delegate adds to [`stuck_threshold_ms`] before it sends a
-/// renewal that the root has not answered once more (`Core::deleg_resend_ms`):
-/// the request's trip and the answerer's own reading.
-pub const DELEG_RESEND_SLACK_MS: i64 = 250;
-
 pub fn stuck_threshold_ms(period_ms: u64) -> i64 {
     ((period_ms / 4) as i64).clamp(DELEG_LANE_STUCK_MIN_MS, DELEG_LANE_STUCK_MS)
 }

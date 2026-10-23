@@ -621,7 +621,8 @@ lock workload exercises the path; `CONSTELLATION_LOCK_LANE=off` turns it off
   counts as none as soon as the core has been stuck for 100 ms
   (`stuck_ticks` in the status): the lane's own marks it still respects.
   An answer after the lane gave up on the request still counts, for up to a
-  minute, from that request's own send.
+  minute, from that request's own send (in the simulation; the daemon's lane
+  drops a request at its timeout, so no late answer reaches it there).
 
 It never grants, upgrades, reclaims, answers `Lost` or `NotOwner`,
 releases, flushes, drops a grant, routes, writes or reads the store, or logs.
