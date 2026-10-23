@@ -3017,7 +3017,7 @@ first part of C7a, landed early):
     `leaving_barriers`, `DelegRenewed.lock_barrier` — and records barriers as
     durations in `LockExpire`/`LockMove`; commit 8 converts what remains: the
     cut's as-of and the settlement against it.)*
-  - *Also:* a pad of 1 s per detected suspend on the honour clock (the C7a
+  - *Also (the suspend pad landed, spec commit 7, 2026-10-23):* a pad of 1 s per detected suspend on the honour clock (the C7a
     review's caveat: the kernel's sleep accounting may be a second short);
     the models' claim rule by observation (`cto`, `locks`) and anchored
     promises (`flex`); offsets of up to two TTLs in the sim's default mix;

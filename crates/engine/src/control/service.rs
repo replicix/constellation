@@ -883,6 +883,7 @@ impl EngineControl {
                     steps_backward: steps.steps_backward,
                     stepped_ms_total: steps.stepped_ms_total,
                     last_step_ms: steps.last_step.map_or(0, |(_, delta)| delta),
+                    suspends: steps.suspends,
                     honour_ahead_ms: now.honour.0 - now.wall.0,
                     wait_behind_ms: now.wall.0 - now.wait.0,
                     rate_budget_ppm: constellation_platform::clock::protocol().rate_budget_ppm(),

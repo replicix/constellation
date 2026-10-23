@@ -672,6 +672,12 @@ pub struct ClockStatus {
     pub stepped_ms_total: u64,
     /// The last step, signed (ms); 0 when none was seen.
     pub last_step_ms: i64,
+    /// Plan 43 C7b: suspends of this host the protocol clock detected since
+    /// the daemon started (the kernel's sleep accounting grew by more than a
+    /// few ms between two readings). The honour clock adds a second for
+    /// each: the kernel may count a suspend short by up to that (the x86
+    /// RTC path). Counted at the first reading after the resume.
+    pub suspends: u64,
     /// How far the honour clock runs ahead of the wall clock (ms): what
     /// forward steps and wall slewing added, and the rate budget (plan 43
     /// C7a: the honour clock runs fast by `rate_budget_ppm` of the uptime,

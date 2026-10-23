@@ -11,6 +11,11 @@
 //! The protocol clock reads WAIT from `raw` alone and HONOUR from `raw`
 //! plus the time suspended, `boot - mono`: the two must be slewed together
 //! (or neither slewed) so that a slew cancels in their difference.
+//! A host that times a suspend with a persistent clock of whole seconds (the
+//! x86 RTC path, where no clock source runs through suspend) can count it up
+//! to a second short, so HONOUR adds a second for every suspend it detects
+//! (`constellation_types::clock::SUSPEND_PAD_MS`, plan 43 C7b; on every
+//! platform, the safe direction), counted in `status.clock.suspends`.
 //!
 //! | OS | boot (counts suspend) | raw (rate source) | mono (does not count suspend) | rate budget |
 //! |---|---|---|---|---|

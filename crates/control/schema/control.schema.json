@@ -815,6 +815,12 @@
           "minimum": 0,
           "type": "integer"
         },
+        "suspends": {
+          "description": "Plan 43 C7b: suspends of this host the protocol clock detected since\nthe daemon started (the kernel's sleep accounting grew by more than a\nfew ms between two readings). The honour clock adds a second for\neach: the kernel may count a suspend short by up to that (the x86\nRTC path). Counted at the first reading after the resume.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "wait_behind_ms": {
           "description": "How far the wait clock runs behind the wall clock (ms; negative if\nit is ahead): what steps and wall slewing left between them, and the\nrate budget (the wait clock runs slow by `rate_budget_ppm` of the\nuptime).",
           "format": "int64",
@@ -829,6 +835,7 @@
         "steps_backward",
         "stepped_ms_total",
         "last_step_ms",
+        "suspends",
         "honour_ahead_ms",
         "wait_behind_ms",
         "rate_budget_ppm"

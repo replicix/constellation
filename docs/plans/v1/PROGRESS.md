@@ -58770,3 +58770,30 @@ wire form without the time spent) the five meta tests fail, each its own.
 Gates: `cargo fmt --check`; `clippy --workspace --all-targets -D warnings`; workspace
 tests (authority lib 599, `meta_repro` 4, sim suite 245 + 12 ignored); model crate
 unchanged by this commit.
+
+## Plan 43 C7b, spec commit 7: the suspend pad (the C7a review's caveat; 2026-10-23)
+
+HONOUR adds `S`, the running maximum of `BOOTTIME - MONOTONIC` (the time suspended).
+On an x86 host whose clocksource does not run through suspend the kernel times the
+sleep with the RTC in whole seconds, so `S` is up to a second short per suspend and
+HONOUR under-counts it (`cst-c7a-23-review.md` §1): a window the holder honours across
+a suspend ends that much late. `ProtocolClock` now counts the suspends it detects (a
+reading at which `S` grew by more than `SUSPEND_DETECT_MS` = 5) and HONOUR adds
+`SUSPEND_PAD_MS` = 1 000 for each, on every platform (D9: cheap, the safe direction; a
+suspend already lapses every window shorter than it). WAIT never gets it (RAW stops in
+suspend). `S` and the count are one packed atomic word raised by a CAS on the rare rise,
+so a reader never sees `S` raised without its pad and the hot path stays two loads; the
+count is `status.clock.suspends`. P2's caveat in the module doc is rewritten. A suspend
+the host counts as nothing, shorter than a second, is not detected (S grows by 0) and
+is absorbed by the margin, as before.
+
+Tests: `a_suspend_counts_for_honour_and_not_for_wait` (10 s then 11 s),
+`a_detected_suspend_is_padded_once` (the 5 ms threshold, once per suspend, the peek is the
+reading, WAIT untouched), `a_suspend_counted_short_by_the_kernel_is_covered_by_the_pad`
+(500 histories of 1 000 intervals, suspends of 2 to 60 s counted in whole seconds rounded
+down: no interval has HONOUR short of the real time plus the suspend; without the pad
+some would, asserted so the test is not vacuous). The sim's `locks-locker-suspend-coarse`
+(`suspend_accounting_short_ms 900`) was never made to fail on the parent (see commit 1's
+notes), so the property test is the fail-before.
+
+Evidence and gates: see the commit message.

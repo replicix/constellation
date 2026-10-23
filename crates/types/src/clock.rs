@@ -78,7 +78,14 @@
 //!   own account of the time asleep, outside the budget, and a host that
 //!   times a suspend with a persistent clock of whole seconds (the x86 CMOS
 //!   RTC, where no clock source runs through suspend) can count it short by
-//!   up to about a second; the margin absorbs that, not transit as well.
+//!   up to a second. HONOUR therefore adds [`SUSPEND_PAD_MS`] (one second)
+//!   per suspend it detects (`S` grew by more than [`SUSPEND_DETECT_MS`]
+//!   between two readings; plan 43 C7b), on every platform: a suspend that
+//!   was counted exactly is over-counted by a second, the safe direction (a
+//!   window an honouring node keeps ends that much early, and a suspend
+//!   already lapses every window shorter than it), and one counted short is
+//!   covered. A suspend the host counts as nothing at all, shorter than a
+//!   second, is not detected, and is absorbed by the margin as before.
 //! - **P3, WAIT never over-counts.** `w2 - w1` is RAW's delta scaled by
 //!   `1/(1 + rho)`: at most the real elapsed time, exactly for any
 //!   oscillator within the budget, and not slewed. It does not count
@@ -157,6 +164,14 @@ use std::sync::{Arc, Mutex};
 /// A wall-clock difference this large between two samples is counted as a
 /// step (`StepStats`).
 pub const STEP_DETECT_MS: i64 = 100;
+
+/// Growth of `S` between two readings above which they straddle a suspend
+/// (rounding of the millisecond differences stays below it).
+pub const SUSPEND_DETECT_MS: i64 = 5;
+
+/// What HONOUR adds per detected suspend: the most the kernel's sleep
+/// accounting can be short by on a host that times it in whole seconds.
+pub const SUSPEND_PAD_MS: i64 = 1_000;
 
 /// The largest rate budget a clock takes, ppm (the platform refuses the same
 /// bound): a larger one is clamped, so the scale `1/(1 - rho)` stays finite.
@@ -436,6 +451,9 @@ pub trait ClockSources: Send + Sync {
 /// What the clock has seen of wall steps (observability; decides nothing).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StepStats {
+    /// Suspends the readings straddled (each padded by [`SUSPEND_PAD_MS`]
+    /// on the honour clock).
+    pub suspends: u64,
     pub steps_forward: u64,
     pub steps_backward: u64,
     /// The sum of the steps' magnitudes.
@@ -465,8 +483,12 @@ pub struct ProtocolClock {
     mono0: u64,
     /// The highest forward excess seen (the module doc's `J`).
     jump: AtomicI64,
-    /// The most time suspended seen, ms (the module doc's `S`).
-    suspend: AtomicI64,
+    /// The most time suspended seen, ms (the module doc's `S`), packed with
+    /// the number of suspends the readings straddled (`S` grew by more than
+    /// [`SUSPEND_DETECT_MS`] at one reading), which HONOUR pads each by
+    /// [`SUSPEND_PAD_MS`]: one word, so that a reader never sees `S` raised
+    /// without the pad for it ([`pack_suspend`]).
+    suspend: AtomicU64,
     /// `wall - (boot - boot0)` as last seen to change by a step.
     last_skew: AtomicI64,
     steps_forward: AtomicU64,
@@ -499,6 +521,35 @@ fn ns_to_ms(ns: u64) -> i64 {
     (ns / 1_000_000).min(i64::MAX as u64) as i64
 }
 
+/// `S` (ms, below 2^40: 35 years of sleep) and the suspend count (the high
+/// 24 bits) in one word.
+const SUSPEND_BITS: u32 = 40;
+
+fn pack_suspend((s, n): (i64, u64)) -> u64 {
+    (n.min((1 << 24) - 1) << SUSPEND_BITS) | (s.clamp(0, (1 << SUSPEND_BITS) - 1) as u64)
+}
+
+fn unpack_suspend(w: u64) -> (i64, u64) {
+    ((w & ((1 << SUSPEND_BITS) - 1)) as i64, w >> SUSPEND_BITS)
+}
+
+/// `S` and the count after a reading whose own `S` is `s_now`, from the
+/// packed state `w`: `S` is the running maximum; a rise past
+/// [`SUSPEND_DETECT_MS`] is one more suspend straddled.
+fn raised_suspend(w: u64, s_now: i64) -> (i64, u64) {
+    let (s, n) = unpack_suspend(w);
+    if s_now > s {
+        (s_now, n + u64::from(s_now > s + SUSPEND_DETECT_MS))
+    } else {
+        (s, n)
+    }
+}
+
+/// What HONOUR adds for `count` suspends.
+fn suspend_pad_ms(count: u64) -> i64 {
+    (count as i64).saturating_mul(SUSPEND_PAD_MS)
+}
+
 impl ProtocolClock {
     /// A clock over `sources` with a random non-zero id, whose node's
     /// oscillator is budgeted `budget_ppm` (plan 43 C7a: the bound on its
@@ -527,7 +578,7 @@ impl ProtocolClock {
             raw0: s.raw_ns,
             mono0: s.mono_ns,
             jump: AtomicI64::new(0),
-            suspend: AtomicI64::new(0),
+            suspend: AtomicU64::new(0),
             last_skew: AtomicI64::new(s.wall_ms),
             steps_forward: AtomicU64::new(0),
             steps_backward: AtomicU64::new(0),
@@ -598,13 +649,14 @@ impl ProtocolClock {
         let diff = |b: u64, m: u64| (b as i128 - m as i128) / 1_000_000;
         let s_now = (diff(s.boot_ns, s.mono_ns) - diff(self.boot0, self.mono0))
             .clamp(0, i64::MAX as i128) as i64;
-        let susp = self.suspend.load(Ordering::Acquire).max(s_now);
+        let (susp, count) = raised_suspend(self.suspend.load(Ordering::Acquire), s_now);
         let e_h = ns_to_ms(scaled_ns(
             s.raw_ns.saturating_sub(self.raw0),
             self.honour_mul,
             true,
         ))
-        .saturating_add(susp);
+        .saturating_add(susp)
+        .saturating_add(suspend_pad_ms(count));
         let gap = s.wall_ms.saturating_sub(self.wall0).saturating_sub(e_h);
         let jump = self.jump.load(Ordering::Acquire).max(gap);
         HonourMs(self.wall0.saturating_add(e_h).saturating_add(jump))
@@ -626,18 +678,32 @@ impl ProtocolClock {
         let diff = |b: u64, m: u64| (b as i128 - m as i128) / 1_000_000;
         let s_now =
             (diff(boot, mono) - diff(self.boot0, self.mono0)).clamp(0, i64::MAX as i128) as i64;
-        let seen_s = self.suspend.load(Ordering::Acquire);
-        let susp = if s_now > seen_s {
-            self.suspend.fetch_max(s_now, Ordering::AcqRel).max(s_now)
-        } else {
-            seen_s
+        let mut cur = self.suspend.load(Ordering::Acquire);
+        let (susp, count) = loop {
+            let next = raised_suspend(cur, s_now);
+            if next == unpack_suspend(cur) {
+                break next;
+            }
+            // The thread whose reading raised `S` records it, and the
+            // suspend it straddled if the rise passes the threshold, in one
+            // step (a rise another thread made first is read, not redone).
+            match self.suspend.compare_exchange_weak(
+                cur,
+                pack_suspend(next),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break next,
+                Err(seen) => cur = seen,
+            }
         };
         let e_h = ns_to_ms(scaled_ns(
             raw.saturating_sub(self.raw0),
             self.honour_mul,
             true,
         ))
-        .saturating_add(susp);
+        .saturating_add(susp)
+        .saturating_add(suspend_pad_ms(count));
         let gap = wall.saturating_sub(self.wall0).saturating_sub(e_h);
         let seen = self.jump.load(Ordering::Acquire);
         let jump = if gap > seen {
@@ -705,6 +771,7 @@ impl ProtocolClock {
     /// The steps seen so far.
     pub fn step_stats(&self) -> StepStats {
         StepStats {
+            suspends: unpack_suspend(self.suspend.load(Ordering::Relaxed)).1,
             steps_forward: self.steps_forward.load(Ordering::Relaxed),
             steps_backward: self.steps_backward.load(Ordering::Relaxed),
             stepped_ms_total: self.stepped_ms_total.load(Ordering::Relaxed),
@@ -896,7 +963,8 @@ mod tests {
     }
 
     /// Expectation: a suspend (boot advances 10 s; raw and mono do not;
-    /// wall advances 10 s) advances HONOUR by 10 s and WAIT by nothing.
+    /// wall advances 10 s) advances HONOUR by 10 s plus the pad
+    /// ([`SUSPEND_PAD_MS`]) and WAIT by nothing.
     #[test]
     fn a_suspend_counts_for_honour_and_not_for_wait() {
         let (s, c) = stub();
@@ -904,10 +972,51 @@ mod tests {
         s.wall.fetch_add(10_000, Ordering::SeqCst);
         s.boot.fetch_add(10_000 * MS, Ordering::SeqCst);
         let after = c.now();
-        assert_eq!(after.honour.since(before.honour), 10_000);
+        assert_eq!(after.honour.since(before.honour), 10_000 + SUSPEND_PAD_MS);
         assert_eq!(after.wait.since(before.wait), 0);
         // A suspend moves wall and boot together: not a step.
-        assert_eq!(c.step_stats(), StepStats::default());
+        assert_eq!(
+            c.step_stats(),
+            StepStats {
+                suspends: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    /// Plan 43 C7b (commit 7): each detected suspend is padded once, however
+    /// many readings follow, and `S` growing by rounding (the detection
+    /// threshold) is no suspend. `peek_honour` shows the pad a reading would
+    /// add, recording nothing.
+    #[test]
+    fn a_detected_suspend_is_padded_once() {
+        let (s, c) = stub();
+        let t0 = c.now();
+        // 5 ms of difference between boot and mono: rounding, no suspend.
+        s.boot.fetch_add(5 * MS, Ordering::SeqCst);
+        s.wall.fetch_add(5, Ordering::SeqCst);
+        assert_eq!(c.now().honour.since(t0.honour), 5);
+        assert_eq!(c.step_stats().suspends, 0);
+        // A suspend of 3 s: padded, whoever reads first.
+        s.boot.fetch_add(3_000 * MS, Ordering::SeqCst);
+        s.wall.fetch_add(3_000, Ordering::SeqCst);
+        let peeked = c.peek_honour();
+        let a = c.honour();
+        assert_eq!(a, peeked, "the peek is the reading");
+        assert_eq!(a.since(t0.honour), 5 + 3_000 + SUSPEND_PAD_MS);
+        assert_eq!(c.step_stats().suspends, 1);
+        // Later readings add nothing more.
+        tick(&s, 100);
+        assert_eq!(c.now().honour.since(a), 100);
+        assert_eq!(c.honour().since(a), 100);
+        assert_eq!(c.step_stats().suspends, 1);
+        // A second suspend is a second pad; WAIT never counts either.
+        s.boot.fetch_add(20_000 * MS, Ordering::SeqCst);
+        s.wall.fetch_add(20_000, Ordering::SeqCst);
+        let n = c.now();
+        assert_eq!(n.honour.since(a), 100 + 20_000 + SUSPEND_PAD_MS);
+        assert_eq!(n.wait.since(t0.wait), 100);
+        assert_eq!(c.step_stats().suspends, 2);
     }
 
     /// Expectation: with mono and boot slewed to 0.92 of raw (and the wall
@@ -957,7 +1066,7 @@ mod tests {
         s.boot.fetch_add(30_000 * MS, Ordering::SeqCst);
         s.wall.fetch_add(30_000, Ordering::SeqCst);
         let n1 = c.now();
-        assert_eq!(n1.honour.since(n0.honour), 30_000);
+        assert_eq!(n1.honour.since(n0.honour), 30_000 + SUSPEND_PAD_MS);
         assert_eq!(n1.wait.since(n0.wait), 0);
         // 12 s real, mono (and boot, wall) slewed fast: 13 s.
         s.raw.fetch_add(12_000 * MS, Ordering::SeqCst);
@@ -1201,8 +1310,10 @@ mod tests {
     }
 
     /// Expectation: budget 0 reads exactly as C7-H1's clock did (the formula
-    /// of the module doc without `rho`), over random samples, steps and
-    /// suspends: the identity the simulator's sweeps rely on.
+    /// of the module doc without `rho`, plus the suspend pad of plan 43 C7b:
+    /// a second for each reading at which `S` grew past the detection
+    /// threshold), over random samples, steps and suspends: the identity the
+    /// simulator's sweeps rely on.
     #[test]
     fn a_zero_budget_reads_exactly_as_before() {
         let (s, c) = stub();
@@ -1215,7 +1326,7 @@ mod tests {
         };
         let (wall0, raw0) = (START, 7_000 * MS as i128);
         let diff0 = (5_000 - 9_000) as i128;
-        let (mut susp_max, mut jump) = (0i128, 0i128);
+        let (mut susp_max, mut jump, mut suspends) = (0i128, 0i128, 0i128);
         for _ in 0..5_000 {
             let real = rnd(40_000_000_000); // ns
             let susp = if rnd(8) == 0 { rnd(30_000) } else { 0 };
@@ -1231,8 +1342,12 @@ mod tests {
             let r = s.read();
             let e_raw_ms = (r.raw_ns as i128 - raw0) / MS as i128;
             let diff = (r.boot_ns as i128 - r.mono_ns as i128) / MS as i128;
+            let before = susp_max;
             susp_max = susp_max.max(diff - diff0);
-            let e_h = e_raw_ms + susp_max;
+            if susp_max > before + SUSPEND_DETECT_MS as i128 {
+                suspends += 1;
+            }
+            let e_h = e_raw_ms + susp_max + suspends * SUSPEND_PAD_MS as i128;
             jump = jump.max(r.wall_ms as i128 - wall0 as i128 - e_h);
             assert_eq!(n.wait.0 as i128, wall0 as i128 + e_raw_ms);
             assert_eq!(n.honour.0 as i128, wall0 as i128 + e_h + jump);
@@ -1353,6 +1468,71 @@ mod tests {
         assert!(
             short0 > 0 && over0 > 0,
             "the unbudgeted clock should violate: honour short {short0}, wait over {over0}"
+        );
+    }
+
+    /// Plan 43 C7b (commit 7), P2 across a suspend: on a host that times its
+    /// sleeps with a persistent clock of whole seconds (the x86 RTC path)
+    /// BOOTTIME counts a suspend short by up to 999 ms, so `S` and with it
+    /// HONOUR fell that far behind the real time that passed. With the pad
+    /// (a second per detected suspend) no interval has HONOUR short of the
+    /// real elapsed time plus the suspend. Returns `(intervals checked,
+    /// intervals short with the pad, intervals that would be short without
+    /// it: the parent's readings)`; suspends here are 2 s or more, as a
+    /// shorter one is counted as nothing and not detected (the margin
+    /// absorbs it).
+    fn coarse_violations(seed: u64) -> (usize, usize, usize) {
+        let s = Arc::new(Stub::default());
+        s.wall.store(START, Ordering::SeqCst);
+        s.boot.store(5_000 * MS, Ordering::SeqCst);
+        s.raw.store(7_000 * MS, Ordering::SeqCst);
+        s.mono.store(9_000 * MS, Ordering::SeqCst);
+        let c = ProtocolClock::with_id(s.clone(), 7, 1_000);
+        let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut rnd = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let (mut checked, mut short, mut short_without) = (0, 0, 0);
+        let mut prev = c.now();
+        for _ in 0..1_000 {
+            let real = 1 + rnd(5_000);
+            let susp = if rnd(8) == 0 { 2_000 + rnd(58_000) } else { 0 };
+            // The kernel counts the sleep in whole seconds, rounded down.
+            let counted = susp / 1_000 * 1_000;
+            s.raw.fetch_add(real * MS, Ordering::SeqCst);
+            s.mono.fetch_add(real * MS, Ordering::SeqCst);
+            s.boot.fetch_add((real + counted) * MS, Ordering::SeqCst);
+            s.wall.fetch_add((real + susp) as i64, Ordering::SeqCst);
+            let now = c.now();
+            let dh = now.honour.since(prev.honour);
+            checked += 1;
+            if dh + 1 < (real + susp) as i64 {
+                short += 1;
+            }
+            let pad = if susp > 0 { SUSPEND_PAD_MS } else { 0 };
+            if dh - pad + 1 < (real + susp) as i64 {
+                short_without += 1;
+            }
+            prev = now;
+        }
+        (checked, short, short_without)
+    }
+
+    #[test]
+    fn a_suspend_counted_short_by_the_kernel_is_covered_by_the_pad() {
+        let mut uncovered = 0;
+        for seed in 1..=500u64 {
+            let (n, short, without) = coarse_violations(seed);
+            assert_eq!(n, 1_000);
+            assert_eq!(short, 0, "seed {seed}");
+            uncovered += without;
+        }
+        assert!(
+            uncovered > 0,
+            "without the pad some suspends would have HONOUR short: the test is vacuous"
         );
     }
 

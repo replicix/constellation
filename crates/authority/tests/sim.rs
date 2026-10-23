@@ -2882,7 +2882,8 @@ async fn a_simulated_rate_moves_the_elapsed_clocks_and_not_the_wall() {
 
 /// Plan 43 C7a: a suspended host's raw and monotonic clocks stop while its
 /// boot clock and wall run on: WAIT does not count the suspend, HONOUR does
-/// (through `S`), and a timer armed across it fires after the node resumes.
+/// (through `S`, plus the commit-7 pad), and a timer armed across it fires
+/// after the node resumes.
 #[tokio::test(start_paused = true)]
 async fn a_simulated_suspend_stops_wait_and_not_honour_or_the_wall() {
     let truth = sim::clock::Clock::start();
@@ -2901,7 +2902,9 @@ async fn a_simulated_suspend_stops_wait_and_not_honour_or_the_wall() {
     tokio::time::advance(std::time::Duration::from_millis(5_000)).await;
     let n1 = node.now();
     assert_eq!(n1.wall.0 - n0.wall.0, 5_000);
-    assert_eq!(n1.honour.0 - n0.honour.0, 5_000);
+    // HONOUR counts the 3 s the suspend took and, from plan 43 C7b's
+    // commit 7, one pad second for the detected suspend.
+    assert_eq!(n1.honour.0 - n0.honour.0, 6_000);
     assert_eq!(n1.wait.0 - n0.wait.0, 2_000);
 }
 
