@@ -2666,13 +2666,14 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 .note_takedown(node, Some(now + ms as i64), fault.at_ms)
                 .await;
             // The oscillator's raw and mono clocks stand still for the
-            // interval; the process is held as for a `Pause`.
+            // interval; the process is held as for a `Pause`, and its lock
+            // clients stand still too (`NodeHandle::suspend_until`).
             cluster
                 .env
                 .clock_state_of(node)
                 .suspend(cluster.env.clock.elapsed_ns(), ms);
             let until = tokio::time::Instant::now() + Duration::from_millis(ms);
-            cluster.get(node).pause_until(until);
+            cluster.get(node).suspend_until(until);
         }
         FaultKind::RebootNode {
             node,

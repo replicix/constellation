@@ -1155,6 +1155,21 @@ pub async fn client_lock(
                 ghost.count(|c| c.abandoned += 1);
                 return;
             };
+            // Plan 43 C7b (review of spec commit 7): no thread of a suspended
+            // host runs. The client performs no I/O while it is suspended
+            // (it leaves its critical section where it notices), and on
+            // resume it judges its grant by the clocks it reads then: an
+            // honour clock that under-counted the suspend lets it re-enter
+            // under a grant its owner has outwaited.
+            if h.suspended() {
+                if entered {
+                    ghost.leave(ino, node, thread, clock.elapsed_ms(), "suspended");
+                    entered = false;
+                    resumed_once = true;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                continue;
+            }
             let now = h.clock.now();
             let ino_fence = h.meta.locks().fenced(ino, now);
             let owner_fenced = h

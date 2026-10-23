@@ -2908,6 +2908,46 @@ async fn a_simulated_suspend_stops_wait_and_not_honour_or_the_wall() {
     assert_eq!(n1.wait.0 - n0.wait.0, 2_000);
 }
 
+/// Plan 43 C7b (review of spec commit 7): on the x86 RTC path the kernel
+/// injects the same short sleep time into the wall clock as into the boot
+/// clock, so HONOUR's jump term (the wall running ahead of it) does not make
+/// up the boot clock's shortfall: only the suspend pad does. (Fails before:
+/// the simulated wall counted the whole suspend and the jump term covered
+/// what the boot clock missed, so `locks-locker-suspend-coarse` could not
+/// fail without the pad.)
+#[tokio::test(start_paused = true)]
+async fn a_suspend_counted_short_leaves_the_wall_as_short() {
+    let truth = sim::clock::Clock::start();
+    let state = sim::clock::NodeClockState::new(2, 0, false);
+    state.set_suspend_short_ms(900);
+    let node = truth.for_node(0, state.clone(), (2 << 32) | 1, 0);
+    tokio::time::advance(std::time::Duration::from_millis(500)).await;
+    let n0 = node.now();
+    state.suspend(truth.elapsed_ns(), 3_500);
+    tokio::time::advance(std::time::Duration::from_millis(5_000)).await;
+    let n1 = node.now();
+    // 5 s passed, 3.5 s of it suspended and counted 900 ms short, by the
+    // boot clock and the wall alike.
+    assert_eq!(n1.wall.0 - n0.wall.0, 4_100);
+    // HONOUR: 1.5 s of raw time, 2.6 s of `S` and the pad, past the 5 s.
+    assert_eq!(n1.honour.0 - n0.honour.0, 1_500 + 2_600 + 1_000);
+    assert_eq!(n1.wait.0 - n0.wait.0, 1_500);
+}
+
+/// Plan 43 C7b (review of spec commit 7): a locker suspended 1.5 s on a host
+/// whose kernel counts the sleep 900 ms short resumes with its honour clock
+/// past its grant, so it re-enters no critical section the owner has
+/// outwaited. (Fails before: every one of these seeds breaks mutual
+/// exclusion on spec commit 7's parent, with this commit's sim.)
+#[test]
+fn a_locker_suspended_on_a_coarse_host_resumes_past_its_grant() {
+    for seed in [2, 3, 4, 5, 6, 7, 8, 9] {
+        if let Err(e) = run_seed(seed, locks_locker_suspend_coarse_config()) {
+            panic!("seed {seed}: {e}");
+        }
+    }
+}
+
 /// Plan 43 C7a: a reboot restarts boot, raw and monotonic from 0 and
 /// changes the boot id; a restart of the process on the same boot does not.
 #[tokio::test(start_paused = true)]
@@ -8167,8 +8207,11 @@ fn flex_taker_ahead_config() -> SimConfig {
 
 /// Plan 43 C7b §7: `locks-locker-suspend` on an x86 host with no clocksource
 /// that runs through suspend: each suspend is counted short by up to 900 ms
-/// by the boot clock, so the locker's honour clock under-counts it by that
-/// and honours its grant past the owner's outwait. The shortfall must exceed
+/// by the boot clock and the wall alike (the kernel injects the same sleep
+/// time into both), so without the suspend pad the locker's honour clock
+/// under-counts it by that and honours its grant past the owner's outwait
+/// (1 532 of 2 000 seeds on spec commit 7's parent; its lock clients stand
+/// still while the host is suspended, `NodeHandle::suspend_until`). The shortfall must exceed
 /// the two margins the grant carries (the locker honours until `sent + ttl -
 /// M`, the owner outwaits until `recv + ttl + M`): the sim's 500 ms margins
 /// absorb 900 ms, so this configuration runs with 200 ms ones. Suspended

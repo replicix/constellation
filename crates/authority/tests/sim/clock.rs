@@ -58,7 +58,9 @@ struct Osc {
     /// counts a suspend as it runs (the sim's default, as a host whose
     /// clocksource runs through suspend). Above 0: as the x86 RTC path, the
     /// boot clock counts nothing while suspended and adds the sleep, in
-    /// whole seconds short by up to this, once the host resumes.
+    /// whole seconds short by up to this, once the host resumes; and so does
+    /// the wall clock, which the kernel advances by the same injected sleep
+    /// time (until a time daemon steps it, which this does not model).
     suspend_short_ns: i128,
 }
 
@@ -83,24 +85,32 @@ impl Osc {
     /// `CLOCK_BOOTTIME`: since this boot, suspend included. Whole ms.
     fn boot_ns(&self, t: i128) -> i128 {
         let bs = self.boot_start(t);
-        let mut uncounted = 0;
-        if self.suspend_short_ns > 0 {
-            for &(s, e) in &self.suspends {
-                let (lo, hi) = (s.max(bs), e.min(t));
-                if hi <= lo {
-                    continue;
-                }
-                let whole = self.osc(hi) - self.osc(lo);
-                // Over: the sleep is added at the resume, short by the
-                // accounting's error; running: nothing is counted yet.
-                uncounted += if e <= t {
-                    whole.min(self.suspend_short_ns)
-                } else {
-                    whole
-                };
-            }
+        (self.osc(t) - self.osc(bs) - self.uncounted_ns(bs, t, |x| self.osc(x))) / MS_NS * MS_NS
+    }
+
+    /// What the host's sleep accounting has not counted by true time `t` of
+    /// the suspends since true time `from` (`suspend_short_ns`; 0 when it
+    /// counts them as they run), measured by `clock`: a suspend that is over
+    /// was added at the resume, short by the accounting's error; one still
+    /// running is not counted yet.
+    fn uncounted_ns(&self, from: i128, t: i128, clock: impl Fn(i128) -> i128) -> i128 {
+        if self.suspend_short_ns <= 0 {
+            return 0;
         }
-        (self.osc(t) - self.osc(bs) - uncounted) / MS_NS * MS_NS
+        let mut uncounted = 0;
+        for &(s, e) in &self.suspends {
+            let (lo, hi) = (s.max(from), e.min(t));
+            if hi <= lo {
+                continue;
+            }
+            let whole = clock(hi) - clock(lo);
+            uncounted += if e <= t {
+                whole.min(self.suspend_short_ns)
+            } else {
+                whole
+            };
+        }
+        uncounted
     }
 
     /// `CLOCK_MONOTONIC_RAW` (and `CLOCK_MONOTONIC`): since this boot,
@@ -260,10 +270,12 @@ impl SimSources {
     }
 
     fn wall_at(&self, osc: &Osc, t: i128) -> i64 {
+        // The kernel injects the same sleep time into the wall clock as into
+        // the boot clock: on the RTC path both are short by the same.
         let elapsed_ms = if self.state.wall_follows_rate {
-            osc.osc(t) / MS_NS
+            (osc.osc(t) - osc.uncounted_ns(0, t, |x| osc.osc(x))) / MS_NS
         } else {
-            t / MS_NS
+            (t - osc.uncounted_ns(0, t, |x| x)) / MS_NS
         };
         self.base_ms + self.offset_ms + self.state.step.load(Ordering::SeqCst) + elapsed_ms as i64
     }

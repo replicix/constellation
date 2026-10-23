@@ -146,6 +146,9 @@ pub struct Shared {
     paused_until: Mutex<Option<tokio::time::Instant>>,
     /// When the last pause began.
     paused_since: Mutex<Option<tokio::time::Instant>>,
+    /// Until when the node's host is suspended (`FaultKind::Suspend`): no
+    /// thread of it runs, the lock clients included (`suspend_until`).
+    suspended_until: Mutex<Option<tokio::time::Instant>>,
     /// A runtime lag (`FaultKind::RuntimeLag`): until when the node's
     /// runtime is held up, and until when what peers send it is not yet
     /// stamped.
@@ -466,6 +469,7 @@ impl NodeHandle {
             alive: AtomicBool::new(true),
             paused_until: Mutex::new(None),
             paused_since: Mutex::new(None),
+            suspended_until: Mutex::new(None),
             lag: Mutex::new(None),
             lag_since: Mutex::new(None),
             liveness: Mutex::new(None),
@@ -825,6 +829,24 @@ impl NodeHandle {
     pub fn pause_until(&self, until: tokio::time::Instant) {
         *self.shared.paused_until.lock().unwrap() = Some(until);
         *self.shared.paused_since.lock().unwrap() = Some(tokio::time::Instant::now());
+    }
+
+    /// Plan 43 C7b (review of spec commit 7): a suspended host. As a pause
+    /// for the event loop, and no thread of the node runs either: its lock
+    /// clients stand still until it resumes ([`Self::suspended`]), where a
+    /// stopped process's would have run on with their clocks.
+    pub fn suspend_until(&self, until: tokio::time::Instant) {
+        self.pause_until(until);
+        *self.shared.suspended_until.lock().unwrap() = Some(until);
+    }
+
+    /// Whether the node's host is suspended now ([`Self::suspend_until`]).
+    pub fn suspended(&self) -> bool {
+        self.shared
+            .suspended_until
+            .lock()
+            .unwrap()
+            .is_some_and(|until| tokio::time::Instant::now() < until)
     }
 
     /// Whether a pause holds this node's event loop now (its view is the
