@@ -19,9 +19,14 @@ before starting any plan. Every plan file assumes you did.
 4. Never weaken an existing test/scenario to make it pass unless the
    plan explicitly authorizes it. Fixing a test's *bug* is fine —
    loosening its assertion is not.
-5. Do not edit `docs/explanation/DESIGN.md` (the spec). If you find a genuine
-   contradiction between the spec and reality, implement what the plan
-   says and record the contradiction in `docs/plans/v1/PROGRESS.md`.
+5. `docs/explanation/DESIGN.md` is the spec. Do not edit it to match an
+   implementation detail or an accident. If you find a genuine contradiction
+   between the spec and reality, implement what the plan says and record the
+   contradiction in `docs/plans/v1/PROGRESS.md`. But when a plan
+   deliberately changes one of the spec's design decisions (decided by the
+   maintainer, recorded in an ADR in `docs/explanation/DECISIONS.md`),
+   DESIGN.md **must** be updated in the commit that makes it true, stating
+   the new decision and linking the ADR.
 
 ## Orientation (read in this order, skim where obvious)
 
