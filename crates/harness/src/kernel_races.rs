@@ -655,6 +655,27 @@ impl Drop for Fd {
     }
 }
 
+/// The request a round holds: a forced `statx` of `fd`, or a listing of
+/// `listing` from its start (the first chunk of which the kernel asks
+/// `READDIRPLUS` for under `auto`).
+fn held(fd: &Arc<Fd>, listing: Option<&Path>) -> std::thread::JoinHandle<std::io::Result<()>> {
+    match listing {
+        None => {
+            let fd = fd.clone();
+            std::thread::spawn(move || fd.statx(true).map(|_| ()))
+        }
+        Some(parent) => {
+            let parent = parent.to_path_buf();
+            std::thread::spawn(move || {
+                for e in std::fs::read_dir(parent)? {
+                    e?;
+                }
+                Ok(())
+            })
+        }
+    }
+}
+
 /// Race 2b's round (module doc), `rounds` times, in `dir`; the daemon
 /// holds every directory `GETATTR` for `delay` after reading the
 /// attributes (`CONSTELLATION_FAULT_DIR_GETATTR_DELAY_MS`). A round:
@@ -665,11 +686,16 @@ impl Drop for Fd {
 /// `2 + a + b`. Everything goes through descriptors ([`Fd`]). `remote`:
 /// the change is made through another mount of the same filesystem
 /// (another node), and the check waits for it to be visible here first.
+/// `listing`: the held reply is a `READDIRPLUS` page instead (plan 40
+/// P9): a thread lists that directory (`dir`'s parent) from the start,
+/// so the page carries `dir`'s attributes as of the read, and the daemon
+/// holds the page for `delay`.
 pub fn dir_version(
     dir: &Path,
     rounds: u64,
     delay: Duration,
     remote: Option<&Path>,
+    listing: Option<&Path>,
 ) -> Result<RoundCounts> {
     let d = Arc::new(Fd::open(dir)?);
     let other = remote.map(Fd::open).transpose()?;
@@ -677,10 +703,7 @@ pub fn dir_version(
     for _ in 0..rounds {
         let a = d.toggle("a")?;
         d.statx(false)?;
-        let t = {
-            let d = d.clone();
-            std::thread::spawn(move || d.statx(true).map(|_| ()))
-        };
+        let t = held(&d, listing);
         std::thread::sleep(delay / 2);
         let b = other.as_ref().unwrap_or(&*d).toggle("b")?;
         t.join()
@@ -717,7 +740,14 @@ pub fn dir_version(
 /// delay `rename(src, dst)`; join; a plain `statx(file)` must show the
 /// `ctime` a forced one answers. The file is stated through a descriptor
 /// ([`Fd`]), the rename made in the directory's.
-pub fn rename_ctime(dir: &Path, rounds: u64, delay: Duration) -> Result<RoundCounts> {
+/// `listing`: as for [`dir_version`], the held reply is a listing of
+/// `dir` (the file's directory) from the start.
+pub fn rename_ctime(
+    dir: &Path,
+    rounds: u64,
+    delay: Duration,
+    listing: bool,
+) -> Result<RoundCounts> {
     let d = Fd::open(dir)?;
     let f = Arc::new(Fd::open(&dir.join("f"))?);
     let mut c = RoundCounts::default();
@@ -735,10 +765,7 @@ pub fn rename_ctime(dir: &Path, rounds: u64, delay: Duration) -> Result<RoundCou
         f.statx(false)?;
         // Past the ctime the last change stamped (the clock's granularity).
         std::thread::sleep(Duration::from_millis(5));
-        let t = {
-            let f = f.clone();
-            std::thread::spawn(move || f.statx(true).map(|_| ()))
-        };
+        let t = held(&f, listing.then_some(dir));
         std::thread::sleep(delay / 2);
         // SAFETY: an open directory descriptor and NUL-terminated names.
         if unsafe { libc::renameat(d.0, csrc.as_ptr(), d.0, cdst.as_ptr()) } != 0 {

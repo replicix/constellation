@@ -3217,12 +3217,23 @@ why entries did not carry attributes, `readdir.cold_scans` and
 `READDIRPLUS` in the status"). `fuse.mounts[].unlinked_refs` returns to 0
 once the kernel has let go of what a listing found and something unlinked.
 
-The system scenarios of plan 40 §7 (`readdirplus-attrs-match`,
-`readdirplus-local-appender`, `readdirplus-orphan-forget`,
-`readdirplus-strict`, `readdirplus-handover`, `readdir-huge-delete`,
-`readdir-seekdir-after-delete`, `readdir-many-open-dirs`, `fuse-inval-storm`
-with an `ls -l` lister, and the `kernel-races` workloads under an `ls -l`
-lister) land with plan 40 P9 and read these counters.
+The system scenarios of plan 40 §7 are harness scenarios that read these
+counters (`crates/harness/src/scenarios/{readdirplus,readdir_pins}.rs`). Each
+runs on `CONSTELLATION_FUSE_TRANSPORT=dev-fuse` and `=auto`
+(`readdirplus-handover` pins `/dev/fuse`, as every handover scenario does):
+
+| Scenario | What it shows |
+|---|---|
+| `readdirplus-attrs-match` | two nodes; one changes a 2,000-entry directory in seeded batches (chmod, utimes, truncate, append, rename, replace, unlink, link), the other loops `ls -l` and `find -ls`; after each batch its `ls -l` equals the oracle. Sizes: `READDIRPLUS_ATTRS_ENTRIES`, `_STEPS`, `_OPS` |
+| `readdirplus-local-appender` | `O_APPEND` writers, `ls -l` listers and a `chmod`er in `--write-mode back` and `through`: no listing shows a size below what a writer completed, every record lands in order. `READDIRPLUS_APPENDER_SECS` |
+| `readdirplus-orphan-forget` | the revalidation's partial `FORGET` (`forgets_partial` +1, `fstat` of an `O_PATH` descriptor answers `nlink 0`, never `ESTALE`), then descriptors of names found through `ls -l` survive `unlink`/`rmdir`, `unlinked_refs` drains once they are closed, no `holds/` key is left in the bucket |
+| `readdirplus-strict` | a lone `--cto strict` sequencer hands attributes; with a second node every plus entry is name-only (`view`), and the strict visibility checks hold under `ls -l` loops |
+| `readdirplus-handover` | `daemon --upgrade` with plus references and `ls -lR` loops (`kernel_refs` crosses, no `ESTALE`, orphans reaped), and a listing paused mid-directory whose resume name is deleted completes exactly across the upgrade with no cold scan |
+| `readdir-huge-delete` | `rm -rf` of a huge directory (fts rounds) under hint-cache pressure (`CONSTELLATION_READDIR_HINT_BYTES=1MiB`, a lister of 20 filler directories) with `find -ls` beside it: nothing left, `lost_cookies` and `cold_scans` unchanged. `READDIR_HUGE_ENTRIES` (1,000,000), `READDIR_HUGE_FILLERS` (20), `READDIR_HUGE_FILLER_ENTRIES` (20,000; the plan has 200,000) |
+| `readdir-seekdir-after-delete` | `telldir`/`seekdir` after deleting 90 % of a 200,000-entry directory with the stream open; then across a `kill -9` and remount (cold scan for surviving names, `ENOENT` for deleted ones). `READDIR_SEEKDIR_ENTRIES` |
+| `readdir-many-open-dirs` | 5,000 streams over 100 directories, pin caps lowered: pinned bytes under the cap, RSS within caps plus hint cache, `pin_overflows` counted, every continuation exact. `READDIR_MANY_STREAMS`, `_DIRS`, `_MIN`, `_MAX` |
+| `fuse-inval-storm-plus` | `fuse-inval-storm` with `ls -l` listers, after a check that a name a plus page installed is invalidated when another node removes it |
+| `kernel-race-dir-version-plus`, `-rename-ctime-plus`, `-dir-version-remote-plus` (each with `-dev-fuse`) | plan 42's race 2b with the held reply a `READDIRPLUS` page (`CONSTELLATION_FAULT_DIR_GETATTR_DELAY_MS` holds a plus page after it read its entries' attributes) |
 
 Ad hoc, an engine-level measurement of listing time is the ignored test
 `view::listing_perf` (release mode; its header documents `LP_DIR`,

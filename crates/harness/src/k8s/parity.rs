@@ -171,6 +171,8 @@ const NODES4: &str =
     "runs four clients of one filesystem (the kind lane has two workers: a pool has two node-owned engine pods)";
 const CHAOS: &str = "drives local mounts with the constellation-chaos tool";
 const KERNEL_RACE: &str = "injects plan 42's kernel-race fault points (CONSTELLATION_FAULT_*) into a local daemon and reads its page-cache counters from node.status";
+const READDIR_KNOBS: &str = "sets the node-wide CONSTELLATION_READDIR_* listing bounds on a local daemon and reads its readdir block from node.status";
+const HOLDS: &str = "lists the holds/ keys in the filesystem's bucket directly";
 const GIT: &str =
     "runs git in the client's mount namespace (the lane's pods run the driver image: no git)";
 
@@ -493,6 +495,7 @@ pub const SKIPPED: &[(&str, Skip)] = &[
     ("unmount-inside-the-takeover-floor", Skip::Local(&[KILL, CTO_STRICT, NODES3])),
     ("holder-kill-rejoin", Skip::Local(&[KILL, NODES4])),
     ("fuse-inval-storm", Skip::Local(&[KILL, NODES3])),
+    ("fuse-inval-storm-plus", Skip::Local(&[KILL, NODES3])),
     (
         "stale-daemon-lock",
         Skip::Local(&["holds a local daemon.lock and control socket with a process that never answers (CONSTELLATION_FAULT_ASSUME_WEDGED_PID)"]),
@@ -623,6 +626,17 @@ pub const SKIPPED: &[(&str, Skip)] = &[
         Skip::Unported("`..`, symlinks and hard links at a view root, which is what a pool PV is; its maintenance view would be a static PV of the pool root"),
     ),
     (
+        "readdirplus-attrs-match",
+        Skip::Unported("two nodes, a seeded change stream on one and ls -l/find -ls on the other, plus the mount's node.status counters"),
+    ),
+    ("readdirplus-local-appender", Skip::Local(&[WRITE_MODE])),
+    ("readdirplus-orphan-forget", Skip::Local(&[HOLDS])),
+    ("readdirplus-strict", Skip::Local(&[CTO_STRICT, KILL])),
+    ("readdirplus-handover", Skip::Local(&[UPGRADE])),
+    ("readdir-huge-delete", Skip::Local(&[READDIR_KNOBS, WRITE_MODE])),
+    ("readdir-seekdir-after-delete", Skip::Local(&[KILL, WRITE_MODE])),
+    ("readdir-many-open-dirs", Skip::Local(&[READDIR_KNOBS, WRITE_MODE, RSS])),
+    (
         "session-handover-idle",
         Skip::Covered(
             &[UPGRADE],
@@ -698,6 +712,12 @@ pub const SKIPPED: &[(&str, Skip)] = &[
     ("kernel-race-rename-ctime-dev-fuse", Skip::Local(&[KERNEL_RACE, TRANSPORT])),
     ("kernel-race-dir-version-remote", Skip::Local(&[KERNEL_RACE])),
     ("kernel-race-dir-version-remote-dev-fuse", Skip::Local(&[KERNEL_RACE, TRANSPORT])),
+    ("kernel-race-dir-version-plus", Skip::Local(&[KERNEL_RACE])),
+    ("kernel-race-dir-version-plus-dev-fuse", Skip::Local(&[KERNEL_RACE, TRANSPORT])),
+    ("kernel-race-rename-ctime-plus", Skip::Local(&[KERNEL_RACE])),
+    ("kernel-race-rename-ctime-plus-dev-fuse", Skip::Local(&[KERNEL_RACE, TRANSPORT])),
+    ("kernel-race-dir-version-remote-plus", Skip::Local(&[KERNEL_RACE])),
+    ("kernel-race-dir-version-remote-plus-dev-fuse", Skip::Local(&[KERNEL_RACE, TRANSPORT])),
     ("kernel-race-dir-ttl-strict-lone", Skip::Local(&[KERNEL_RACE, CTO_STRICT])),
     ("kernel-race-dir-ttl-strict-lone-dev-fuse", Skip::Local(&[KERNEL_RACE, TRANSPORT, CTO_STRICT])),
     ("kernel-race-probe-exit", Skip::Local(&[KERNEL_RACE])),

@@ -54,7 +54,11 @@ pub(super) fn bin() -> PathBuf {
 /// `transport-detach-refused` is the scenario for *that*). Not a
 /// weakening: a daemon whose plain mounts are on a ring cannot be
 /// upgraded in place either, by design.
-fn dev_fuse_client(env: &crate::s3env::S3Env, root: &Path, prefix: &str) -> Result<Client> {
+pub(super) fn dev_fuse_client(
+    env: &crate::s3env::S3Env,
+    root: &Path,
+    prefix: &str,
+) -> Result<Client> {
     let backend = format!("s3://{}/{prefix}", crate::s3env::BUCKET);
     let mut c = Client::new(root, "c0", &env.endpoint, &backend)?
         .with_env("CONSTELLATION_FUSE_TRANSPORT", "dev-fuse");

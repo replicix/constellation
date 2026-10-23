@@ -75,6 +75,10 @@ mod m9;
 mod ovh;
 /// Plan 38 §6/Z3b: FUSE passthrough on a real kernel.
 mod passthrough;
+/// Plan 40 §7: listing exactness under deletion and pressure.
+mod readdir_pins;
+/// Plan 40 §7: `READDIRPLUS` through a real mount.
+mod readdirplus;
 /// Campaign 6 B-1: a lease holder's `kill -9` and its rejoin, and a
 /// `daemon.lock` still held by a daemon the kernel has killed.
 mod rejoin;
@@ -1224,6 +1228,13 @@ pub const SCENARIOS: &[Scenario] = &[
         run: inval_storm::fuse_inval_storm,
     },
     Scenario {
+        name: "fuse-inval-storm-plus",
+        desc: "plan 40 P9: fuse-inval-storm with the listing done by ls -l (READDIRPLUS), after a check that a name a plus page installed in a kernel is invalidated when another node removes it: no op exceeds its bound, no worker hangs, the killed daemon exits within 5 s, it remounts within 60 s and the directory converges everywhere",
+        requires: &[],
+        caps: &[Cap::FuseAbort, Cap::PushInvalFull],
+        run: inval_storm::fuse_inval_storm_plus,
+    },
+    Scenario {
         name: "stale-daemon-lock",
         desc: "campaign 6 B-1: daemon.lock and control.sock held by a process that never answers: a mount fails within the attach timeout naming the live holder (no takeover of anything that can run), `status` fails within the control timeout, and once the holder counts as killed by the kernel the next mount takes the state dir over and serves",
         requires: &[],
@@ -1642,6 +1653,62 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &["fusermount3"],
         caps: &[Cap::HardLinks, Cap::Xattrs],
         run: confinement::subtree_confinement,
+    },
+    Scenario {
+        name: "readdirplus-attrs-match",
+        desc: "plan 40 P9: two nodes; one changes a 2000-entry directory in seeded batches (chmod, utimes, truncate, append, rename, replace, unlink, link) while the other loops ls -l and find -ls; after each batch settles the other's ls -l equals the oracle, and READDIRPLUS entries were handed",
+        requires: &[],
+        caps: &[],
+        run: readdirplus::attrs_match,
+    },
+    Scenario {
+        name: "readdirplus-local-appender",
+        desc: "plan 40 P9: one node, --write-mode back and through: four O_APPEND writers append numbered records while two listers loop ls -l and a process chmods the files; no listing shows a size below what a writer completed, and every file ends with every record in order",
+        requires: &[],
+        caps: &[],
+        run: readdirplus::local_appender,
+    },
+    Scenario {
+        name: "readdirplus-orphan-forget",
+        desc: "plan 40 P9 (plan 40 R2's deferred phase): the revalidation's partial FORGET after another node's mv-over (forgets_partial +1, fstat of the O_PATH descriptor answers nlink 0, never ESTALE); then O_PATH descriptors of names found through ls -l survive their unlink and rmdir with nlink 0, unlinked_refs drains once they are closed, and no held data is left in the bucket",
+        requires: &[],
+        caps: &[Cap::KeepOpenUnlinked],
+        run: readdirplus::orphan_forget,
+    },
+    Scenario {
+        name: "readdirplus-strict",
+        desc: "plan 40 P9: --cto strict: a lone sequencer hands attributes with its plus pages; once a second node joins every plus entry is name-only (reason view) and cto-strict's visibility holds under ls -l loops",
+        requires: &[],
+        caps: &[],
+        run: readdirplus::strict,
+    },
+    Scenario {
+        name: "readdirplus-handover",
+        desc: "plan 40 P9: daemon --upgrade over /dev/fuse with ls -lR loops and O_PATH references from plus pages: kernel_refs after the resume equals before minus the forgets read meanwhile, no ESTALE, orphans reaped after their forgets; a listing paused mid-directory whose resume name is deleted completes exactly across the upgrade with no cold scan",
+        requires: &[],
+        caps: &[],
+        run: readdirplus::handover,
+    },
+    Scenario {
+        name: "readdir-huge-delete",
+        desc: "plan 40 P9: rm -rf of a READDIR_HUGE_ENTRIES (1000000) entry directory (fts reads 100,000 per round and deletes between rounds) under hint-cache pressure (CONSTELLATION_READDIR_HINT_BYTES=1MiB, a second process listing 20 filler directories in a loop) with find -ls of it in parallel: succeeds, nothing left behind, lost_cookies 0, cold_scans 0, pinned while it runs and not after",
+        requires: &[],
+        caps: &[],
+        run: readdir_pins::huge_delete,
+    },
+    Scenario {
+        name: "readdir-seekdir-after-delete",
+        desc: "plan 40 P9: a 200000-entry directory opened by a program that telldirs every 1000th entry, deletes 90% of the names (the saved ones included) with the stream open and seekdirs to each saved position in random order: every resume continues exactly after its name; then the same across a kill -9 and remount: surviving names resume by a cold scan, deleted ones answer ENOENT, none is skipped silently",
+        requires: &[],
+        caps: &[],
+        run: readdir_pins::seekdir_after_delete,
+    },
+    Scenario {
+        name: "readdir-many-open-dirs",
+        desc: "plan 40 P9: 5000 directory streams over 100 directories, each paused mid-listing, with the pin caps lowered: pinned bytes stay under the node cap, RSS within the caps plus the hint cap and the streams' last pages, pin_overflows counts, and every stream's sequential continuation completes exactly",
+        requires: &[],
+        caps: &[],
+        run: readdir_pins::many_open_dirs,
     },
     Scenario {
         name: "session-handover-idle",
@@ -2110,6 +2177,48 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[],
         caps: &[],
         run: kernel_races::dir_version_remote_dev_fuse,
+    },
+    Scenario {
+        name: "kernel-race-dir-version-plus",
+        desc: "plan 40 P9 -- race 2b through READDIRPLUS: a plus page of the parent, held after reading the directory's attributes, from before a mkdir never caches the old st_nlink",
+        requires: &[],
+        caps: &[],
+        run: kernel_races::dir_version_plus,
+    },
+    Scenario {
+        name: "kernel-race-dir-version-plus-dev-fuse",
+        desc: "plan 40 P9 -- kernel-race-dir-version-plus over /dev/fuse",
+        requires: &[],
+        caps: &[],
+        run: kernel_races::dir_version_plus_dev_fuse,
+    },
+    Scenario {
+        name: "kernel-race-rename-ctime-plus",
+        desc: "plan 40 P9 -- guard: race 2b for a renamed file's ctime through READDIRPLUS: a held plus page of the file's directory never caches the old ctime (the kernel does not install it even with W3b off, so this row cannot fail on a missing notice)",
+        requires: &[],
+        caps: &[],
+        run: kernel_races::rename_ctime_plus,
+    },
+    Scenario {
+        name: "kernel-race-rename-ctime-plus-dev-fuse",
+        desc: "plan 40 P9 -- kernel-race-rename-ctime-plus over /dev/fuse",
+        requires: &[],
+        caps: &[],
+        run: kernel_races::rename_ctime_plus_dev_fuse,
+    },
+    Scenario {
+        name: "kernel-race-dir-version-remote-plus",
+        desc: "plan 40 P9 -- guard: another node's mkdir during a held READDIRPLUS page (its notification bumps the version)",
+        requires: &[],
+        caps: &[],
+        run: kernel_races::dir_version_remote_plus,
+    },
+    Scenario {
+        name: "kernel-race-dir-version-remote-plus-dev-fuse",
+        desc: "plan 40 P9 -- kernel-race-dir-version-remote-plus over /dev/fuse",
+        requires: &[],
+        caps: &[],
+        run: kernel_races::dir_version_remote_plus_dev_fuse,
     },
     Scenario {
         name: "kernel-race-dir-ttl-strict-lone",

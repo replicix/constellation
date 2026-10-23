@@ -27,6 +27,14 @@
 //! bound, no worker hung, the killed daemon exited within 5 s (no zombie
 //! with a thread in `fuse_reverse_inval_entry`), it remounts within 60 s,
 //! the directory converges everywhere, and no conflict was recorded.
+//!
+//! `fuse-inval-storm-plus` (plan 40 P9) runs it a second time with the
+//! listing done by `ls -l`, so the listing is `READDIRPLUS` and every page
+//! installs dentries and attributes in the kernel for the names the other
+//! nodes keep changing: no stall, no wedge (`kill -9` lands as before), and
+//! first a check that the names a plus page installed are invalidated when
+//! another node removes them (`KernelEntries` has a record per plus-listed
+//! name), which is what the storm then depends on.
 
 use super::m8::dist;
 use super::m9::{cluster, unmount_all};
@@ -41,6 +49,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const NAME: &str = "fuse-inval-storm";
+const NAME_PLUS: &str = "fuse-inval-storm-plus";
 
 fn env_or(name: &str, default: u64) -> u64 {
     std::env::var(name)
@@ -84,7 +93,8 @@ fn timed<T>(
 }
 
 /// Create, write, rename, unlink — and a listing now and then — in
-/// `dir`, until `stop`.
+/// `dir`, until `stop`. `ls_l`: every 4th cycle runs the real `ls -l`
+/// (a plus listing) in place of the 8th cycle's `getdents`-and-`stat`.
 fn worker(
     node: usize,
     tag: String,
@@ -92,6 +102,7 @@ fn worker(
     stop: Arc<AtomicBool>,
     current: Current,
     done: mpsc::Sender<Report>,
+    ls_l: bool,
 ) {
     let mut report = Report {
         node,
@@ -115,7 +126,18 @@ fn worker(
                 "readdir",
                 &dir,
                 Box::new(|| {
-                    if i.is_multiple_of(8) {
+                    if ls_l {
+                        if i.is_multiple_of(4) {
+                            // Names vanish under it: a non-zero exit is the
+                            // storm, a hang is what the bounds catch.
+                            std::process::Command::new("ls")
+                                .arg("-l")
+                                .arg(&dir)
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null())
+                                .status()?;
+                        }
+                    } else if i.is_multiple_of(8) {
                         for e in std::fs::read_dir(&dir)? {
                             // A name gone since the listing is the storm.
                             let _ = e?.metadata();
@@ -159,6 +181,81 @@ fn listing(dir: &Path) -> Result<BTreeSet<String>> {
 }
 
 pub fn fuse_inval_storm(_seed: u64) -> Result<()> {
+    storm(NAME, false)
+}
+
+pub fn fuse_inval_storm_plus(_seed: u64) -> Result<()> {
+    storm(NAME_PLUS, true)
+}
+
+/// A plus page installs a dentry for each name it lists; another node's
+/// removal of the name must invalidate it in the kernel, as it does a
+/// `LOOKUP`'s. Per trial: node b creates a name; node a lists the
+/// directory until the name shows (that page, the first chunk of a fresh
+/// listing, is `READDIRPLUS`); b removes the name and creates a marker; once
+/// a sees the marker, within the entry TTL of the listing, a `stat` of the
+/// name must answer `ENOENT` -- a stale dentry would still answer.
+fn plus_notified(a: &Client, b: &Client) -> Result<()> {
+    const TRIALS: usize = 30;
+    let (ad, bd) = (a.mnt.join("d"), b.mnt.join("d"));
+    let status = |c: &Client| -> Result<u64> {
+        Ok(
+            c.control_status()?["fuse"]["mounts"][0]["readdirplus_entries"]
+                .as_u64()
+                .unwrap_or(0),
+        )
+    };
+    let before = status(a)?;
+    let (mut valid, mut late) = (0, 0);
+    for i in 0..TRIALS {
+        let (name, marker) = (format!("pn-{i}"), format!("pm-{i}"));
+        std::fs::write(bd.join(&name), b"x")?;
+        let mut listed_at;
+        let t = Instant::now();
+        loop {
+            listed_at = Instant::now();
+            if listing(&ad)?.contains(&name) {
+                break;
+            }
+            anyhow::ensure!(
+                t.elapsed() < Duration::from_secs(30),
+                "a never lists {name}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::remove_file(bd.join(&name))?;
+        std::fs::write(bd.join(&marker), b"")?;
+        let t = Instant::now();
+        while std::fs::symlink_metadata(ad.join(&marker)).is_err() {
+            anyhow::ensure!(
+                t.elapsed() < Duration::from_secs(30),
+                "a never sees {marker}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if listed_at.elapsed() > Duration::from_millis(850) {
+            late += 1;
+            continue;
+        }
+        valid += 1;
+        anyhow::ensure!(
+            std::fs::symlink_metadata(ad.join(&name)).is_err(),
+            "trial {i}: {name}, installed by a plus page {:?} ago, is still valid in a's kernel \
+             after b removed it and a applied the removal",
+            listed_at.elapsed()
+        );
+    }
+    let used = status(a)? - before;
+    eprintln!(
+        "    {NAME_PLUS}: {valid} trials checked within the entry TTL ({late} too slow to judge); \
+         a's plus entries +{used}"
+    );
+    anyhow::ensure!(used > 0, "a's listings used no plus");
+    anyhow::ensure!(valid >= 5, "only {valid} trials were fast enough to judge");
+    Ok(())
+}
+
+fn storm(name: &'static str, plus: bool) -> Result<()> {
     let rounds = env_or("INVAL_STORM_ROUNDS", 3) as usize;
     let secs = env_or("INVAL_STORM_SECS", 12);
     let workers_per_node = env_or("INVAL_STORM_WORKERS", 2) as usize;
@@ -167,7 +264,7 @@ pub fn fuse_inval_storm(_seed: u64) -> Result<()> {
     let op_bound = Duration::from_secs(env_or("INVAL_STORM_OP_BOUND_S", 45));
     let exit_bound = Duration::from_secs(5);
     let (_env, _root, mut clients, _) = cluster(
-        NAME,
+        name,
         &["a", "b", "c"],
         &[
             ("CONSTELLATION_SLOW_OP_MS", "1000"),
@@ -186,6 +283,9 @@ pub fn fuse_inval_storm(_seed: u64) -> Result<()> {
                     Ok(())
                 },
             )?;
+        }
+        if plus {
+            plus_notified(&clients[0], &clients[1])?;
         }
         let mut exits = Vec::new();
         let mut reaped_rounds = 0usize;
@@ -209,14 +309,14 @@ pub fn fuse_inval_storm(_seed: u64) -> Result<()> {
                     let tag = format!("{}-r{round}-w{w}", c.name);
                     let stop = stop.clone();
                     let done = done_tx.clone();
-                    std::thread::spawn(move || worker(i, tag, dir, stop, current, done));
+                    std::thread::spawn(move || worker(i, tag, dir, stop, current, done, plus));
                     n_workers += 1;
                 }
             }
             drop(done_tx);
             std::thread::sleep(Duration::from_secs(secs / 2));
             eprintln!(
-                "    {NAME}: round {round}: kill -9 the holder {} under load",
+                "    {name}: round {round}: kill -9 the holder {} under load",
                 clients[holder].name
             );
             let killed_at = Instant::now();
@@ -234,7 +334,7 @@ pub fn fuse_inval_storm(_seed: u64) -> Result<()> {
             if reaped.contains("is dead but wedged") {
                 reaped_rounds += 1;
                 eprintln!(
-                    "    {NAME}: round {round}: the reaper had to release {}:\n{}",
+                    "    {name}: round {round}: the reaper had to release {}:\n{}",
                     clients[holder].name,
                     reaped.trim()
                 );
@@ -292,7 +392,7 @@ pub fn fuse_inval_storm(_seed: u64) -> Result<()> {
                     per_node_errors[r.node] += 1;
                     if per_node_errors[r.node] <= 3 {
                         eprintln!(
-                            "    {NAME}: round {round}: {} {what} failed: {e}",
+                            "    {name}: round {round}: {} {what} failed: {e}",
                             clients[r.node].name
                         );
                     }
@@ -307,7 +407,7 @@ pub fn fuse_inval_storm(_seed: u64) -> Result<()> {
             }
             for (i, ops) in per_node_ops.iter().enumerate() {
                 eprintln!(
-                    "    {NAME}: round {round}: {} {} errors {}",
+                    "    {name}: round {round}: {} {} errors {}",
                     clients[i].name,
                     dist(ops.clone()),
                     per_node_errors[i]
@@ -318,7 +418,7 @@ pub fn fuse_inval_storm(_seed: u64) -> Result<()> {
                 }
             }
             eprintln!(
-                "    {NAME}: round {round}: the holder exited {exit:?} after kill -9; remounting"
+                "    {name}: round {round}: the holder exited {exit:?} after kill -9; remounting"
             );
             let t = Instant::now();
             clients[holder]
@@ -350,15 +450,15 @@ pub fn fuse_inval_storm(_seed: u64) -> Result<()> {
                 },
             )?;
             eprintln!(
-                "    {NAME}: round {round}: {} remounted in {remount:?}; the directory converged \
+                "    {name}: round {round}: {} remounted in {remount:?}; the directory converged \
                  with {} leftover name(s) from the ops cut short by the kill",
                 clients[holder].name,
                 lists[0].len()
             );
         }
-        eprintln!("    {NAME}: all completed ops {}", dist(all_ops));
+        eprintln!("    {name}: all completed ops {}", dist(all_ops));
         eprintln!(
-            "    {NAME}: holder exit after kill -9 {}; rounds where the reaper had to release \
+            "    {name}: holder exit after kill -9 {}; rounds where the reaper had to release \
              it {reaped_rounds}/{rounds}; errors on surviving nodes {}",
             dist(exits),
             all_errors_elsewhere
@@ -372,7 +472,7 @@ pub fn fuse_inval_storm(_seed: u64) -> Result<()> {
             let slow = log.lines().filter(|l| l.contains("slow FUSE")).count();
             let left_behind = log.lines().filter(|l| l.contains("left behind")).count();
             eprintln!(
-                "    {NAME}: {}: invalidation stall warnings {stalls}, slow FUSE ops {slow}, \
+                "    {name}: {}: invalidation stall warnings {stalls}, slow FUSE ops {slow}, \
                  stale mounts aborted at takeover {left_behind}",
                 c.name
             );
@@ -381,7 +481,7 @@ pub fn fuse_inval_storm(_seed: u64) -> Result<()> {
                 .filter(|l| l.contains("blocked in the kernel"))
                 .take(3)
             {
-                eprintln!("    {NAME}: {}: {}", c.name, l.trim());
+                eprintln!("    {name}: {}: {}", c.name, l.trim());
             }
         }
         let refs: Vec<&Client> = clients.iter().collect();

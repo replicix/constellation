@@ -130,6 +130,12 @@ outcome = "skipped"
 reason = "Not yet ported (F6): two mounts and the lease's status; portable to two pods and the engine pods' node.status."
 
 [[expect]]
+scenario = "readdirplus-attrs-match"
+lanes = ["linux-csi"]
+outcome = "skipped"
+reason = "Not yet ported (F6): two pods on an RWX PV, a seeded change stream on one and ls -l/find -ls with an oracle on the other, and the pod's per-mount READDIRPLUS counters from the engine's node.status."
+
+[[expect]]
 scenario = "scratch-publish"
 lanes = ["linux-csi"]
 outcome = "skipped"

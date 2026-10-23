@@ -162,6 +162,14 @@ fn dropping(m: &serde_json::Value) -> u64 {
         .map_or(0, |o| o.values().filter_map(|v| v.as_u64()).sum())
 }
 
+/// The mount's `READDIRPLUS` counters, for the plus rows.
+fn plus_line(m: &serde_json::Value) -> String {
+    format!(
+        "plus_pages={} plus_entries={} plus_name_only={}",
+        m["readdirplus_pages"], m["readdirplus_entries"], m["readdirplus_name_only_why"]
+    )
+}
+
 fn counters_line(m: &serde_json::Value) -> String {
     COUNTERS
         .iter()
@@ -750,7 +758,18 @@ twice!(
 
 const HOLD: Duration = Duration::from_millis(200);
 
-fn race_dir_version(name: &str, wire: Wire) -> Result<()> {
+/// The mount's `READDIRPLUS` entries handed with attributes so far.
+fn plus_entries(c: &Client) -> Result<u64> {
+    Ok(mount_status(c, None)?["readdirplus_entries"]
+        .as_u64()
+        .unwrap_or(0))
+}
+
+/// `plus` (plan 40 P9): the held reply is a `READDIRPLUS` page of the
+/// directory's parent, which carries the directory's attributes as of its
+/// read (the engine holds a plus page for the longest delay of the entries
+/// it made, `view/plus.rs`); the page is what the kernel installs late.
+fn race_dir_version(name: &str, wire: Wire, plus: bool) -> Result<()> {
     let mut stale = Vec::new();
     // The parent notice alone closes 2b: once with the directory
     // attribute TTL as configured, once with the TTL part off.
@@ -767,7 +786,15 @@ fn race_dir_version(name: &str, wire: Wire) -> Result<()> {
         let r = (|| -> Result<_> {
             let dir = c.mnt.join("dv");
             std::fs::create_dir(&dir)?;
-            dir_version(&dir, 20, HOLD, None)
+            let before = plus_entries(&c)?;
+            let counts = dir_version(&dir, 20, HOLD, None, plus.then_some(c.mnt.as_path()))?;
+            if plus {
+                ensure!(
+                    plus_entries(&c)? > before,
+                    "no READDIRPLUS entry was handed: the listing did not exercise plus"
+                );
+            }
+            Ok(counts)
         })();
         let m = mount_status(&c, None);
         let _ = c.unmount();
@@ -790,10 +817,13 @@ fn race_dir_version(name: &str, wire: Wire) -> Result<()> {
 }
 
 twice!(dir_version_hold, dir_version_hold_dev_fuse, |n: &str, w| {
-    race_dir_version(&name(n).replace("-hold", ""), w)
+    race_dir_version(&name(n).replace("-hold", ""), w, false)
+});
+twice!(dir_version_plus, dir_version_plus_dev_fuse, |n: &str, w| {
+    race_dir_version(&name(n), w, true)
 });
 
-fn race_rename_ctime(name: &str, wire: Wire) -> Result<()> {
+fn race_rename_ctime(name: &str, wire: Wire, plus: bool) -> Result<()> {
     let (env, root) = setup(name)?;
     let backend = format!("s3://{BUCKET}/{name}-{}", ts());
     let mut c = client(&env, root.path(), "c0", &backend, wire)?;
@@ -808,15 +838,25 @@ fn race_rename_ctime(name: &str, wire: Wire) -> Result<()> {
     c.set_env("CONSTELLATION_FAULT_DIR_GETATTR_DELAY_MS", "200");
     c.set_env("CONSTELLATION_FAULT_GETATTR_DELAY_INO", &ino.to_string());
     c.mount()?;
-    let r = rename_ctime(&dir, 20, HOLD);
+    let before = plus_entries(&c)?;
+    let r = rename_ctime(&dir, 20, HOLD, plus).and_then(|counts| {
+        if plus {
+            ensure!(
+                plus_entries(&c)? > before,
+                "no READDIRPLUS entry was handed: the listing did not exercise plus"
+            );
+        }
+        Ok(counts)
+    });
     let m = mount_status(&c, None);
     let _ = c.unmount();
     let counts = r?;
     result(
         name,
         &format!(
-            "ino={ino} {} {}",
+            "ino={ino} {} {} {}",
             counts.line(),
+            m.as_ref().map(plus_line).unwrap_or_default(),
             m.map(|m| counters_line(&m)).unwrap_or_default()
         ),
     );
@@ -832,10 +872,15 @@ fn race_rename_ctime(name: &str, wire: Wire) -> Result<()> {
 twice!(
     rename_ctime_hold,
     rename_ctime_hold_dev_fuse,
-    |n: &str, w| { race_rename_ctime(&name(n).replace("-hold", ""), w) }
+    |n: &str, w| { race_rename_ctime(&name(n).replace("-hold", ""), w, false) }
+);
+twice!(
+    rename_ctime_plus,
+    rename_ctime_plus_dev_fuse,
+    |n: &str, w| { race_rename_ctime(&name(n), w, true) }
 );
 
-fn race_dir_version_remote(name: &str, wire: Wire) -> Result<()> {
+fn race_dir_version_remote(name: &str, wire: Wire, plus: bool) -> Result<()> {
     let (_env, _root, mut clients) = two_nodes(
         name,
         wire,
@@ -854,7 +899,21 @@ fn race_dir_version_remote(name: &str, wire: Wire) -> Result<()> {
                 Ok(())
             },
         )?;
-        dir_version(&dir, 20, HOLD, Some(&other))
+        let before = plus_entries(a)?;
+        let counts = dir_version(
+            &dir,
+            20,
+            HOLD,
+            Some(&other),
+            plus.then_some(a.mnt.as_path()),
+        )?;
+        if plus {
+            ensure!(
+                plus_entries(a)? > before,
+                "no READDIRPLUS entry was handed: the listing did not exercise plus"
+            );
+        }
+        Ok(counts)
     })();
     unmount_all(&mut clients);
     let counts = r?;
@@ -866,7 +925,12 @@ fn race_dir_version_remote(name: &str, wire: Wire) -> Result<()> {
 twice!(
     dir_version_remote,
     dir_version_remote_dev_fuse,
-    |n: &str, w| race_dir_version_remote(&name(n), w)
+    |n: &str, w| race_dir_version_remote(&name(n), w, false)
+);
+twice!(
+    dir_version_remote_plus,
+    dir_version_remote_plus_dev_fuse,
+    |n: &str, w| race_dir_version_remote(&name(n), w, true)
 );
 
 /// How long a daemon may take to exit after its unmount in
