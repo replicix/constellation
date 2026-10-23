@@ -38398,6 +38398,98 @@ mod c1_class {
         assert_eq!(h.core.stats.acks_downgraded_lone, 1);
     }
 
+    /// D4, the C1-2/C1-3 review: the gate goes off while an answer is
+    /// parked, and the store fails the `Lone` re-tag. The row keeps its
+    /// gated class, so the answer can claim neither it nor `Lone`: `EIO`.
+    /// Fails on the parent: the error was logged and the op answered
+    /// `Accepted` as `Lone`.
+    #[test]
+    fn a_failed_retag_at_the_gate_off_answers_eio() {
+        let (mut h, _) = listed_holder();
+        let rid = h.rid(2);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: h.create("r"),
+            tag: Default::default(),
+        });
+        assert!(sources(&out).is_empty(), "parked for the backup: {out:?}");
+        gate_goes_off(&mut h);
+        constellation_meta::fail_reclass_on_this_thread_for_tests(1);
+        let mut out = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        constellation_meta::fail_reclass_on_this_thread_for_tests(0);
+        let replies: Vec<_> = out
+            .iter()
+            .filter_map(|a| match a {
+                Action::Reply { rid: r, reply, .. } if *r == rid => Some(reply.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(
+                replies.as_slice(),
+                [ClientReply::Outcome(MutateOutcome::Errno(Code::Io))]
+            ),
+            "{out:?}"
+        );
+        assert_eq!(classes_of(&h, rid), vec![RowClass::RootGroup]);
+        assert_eq!(h.core.stats.acks_downgraded_lone, 0);
+    }
+
+    /// The same at a dedup: a forward's retry finds its gated row with the
+    /// gate off, and the store fails the re-tag: `EIO`, not an `Accepted`
+    /// that claims `Lone`. Fails on the parent: the error was ignored.
+    #[test]
+    fn a_failed_retag_at_a_dedup_answers_eio() {
+        let request = |h: &Harness, req: u64| Event::Peer {
+            from: 3,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(req),
+                rid: Rid {
+                    node: 3,
+                    incarnation: 1,
+                    seq: 1,
+                },
+                op: h.create("f"),
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+            },
+        };
+        let replies = |out: &[Action]| {
+            sends(out)
+                .into_iter()
+                .filter_map(|(_, m)| match m {
+                    PeerMsg::MutateReply { outcome, .. } => Some(outcome.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let (mut h, _) = listed_holder();
+        let out = h.step(request(&h, 71));
+        assert!(replies(&out).is_empty(), "parked: {out:?}");
+        gate_goes_off(&mut h);
+        // The requester retries by rid before the parked answer leaves.
+        constellation_meta::fail_reclass_on_this_thread_for_tests(1);
+        let out = h.step(request(&h, 72));
+        constellation_meta::fail_reclass_on_this_thread_for_tests(0);
+        assert!(
+            replies(&out)
+                .iter()
+                .all(|o| matches!(o, MutateOutcome::Errno(Code::Io))),
+            "{out:?}"
+        );
+        assert!(!replies(&out).is_empty(), "answered: {out:?}");
+        let rid = Rid {
+            node: 3,
+            incarnation: 1,
+            seq: 1,
+        };
+        assert_eq!(classes_of(&h, rid), vec![RowClass::RootGroup]);
+    }
+
     /// A row released because it *is* committed keeps its class.
     #[test]
     fn a_committed_row_keeps_its_class() {

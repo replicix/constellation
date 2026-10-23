@@ -571,6 +571,12 @@ impl Meta {
     /// rows are durable anyway) or already of that class is left alone.
     /// Returns whether a row changed.
     pub fn reclass_journal_tx(&self, seq: u64, class: RowClass) -> Result<bool, MetaError> {
+        #[cfg(any(test, feature = "test-util"))]
+        if reclass_fault::take() {
+            return Err(MetaError::Io(std::io::Error::other(
+                "injected re-tag fault (testing only)",
+            )));
+        }
         let mut tx = self.db.write_tx();
         let owner = match tx.range(&self.journal_tx, ..=tx_key(seq)).next_back() {
             Some(guard) => {
@@ -2093,4 +2099,27 @@ pub struct DelegateTx {
     pub rid: Option<Rid>,
     pub records: Vec<LogRecord>,
     pub deps: crate::session::Position,
+}
+
+/// Tests only (`test-util`): fail this thread's next `n` calls of
+/// [`Meta::reclass_journal_tx`] with an I/O error, nothing written — a store
+/// that cannot record the class a gate-off answer would claim.
+#[cfg(any(test, feature = "test-util"))]
+pub fn fail_reclass_on_this_thread_for_tests(n: u32) {
+    reclass_fault::LEFT.with(|c| c.set(n));
+}
+
+#[cfg(any(test, feature = "test-util"))]
+mod reclass_fault {
+    thread_local! {
+        pub(super) static LEFT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn take() -> bool {
+        LEFT.with(|c| {
+            let n = c.get();
+            c.set(n.saturating_sub(1));
+            n > 0
+        })
+    }
 }

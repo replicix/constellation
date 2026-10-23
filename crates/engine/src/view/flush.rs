@@ -1257,7 +1257,19 @@ impl View {
                 });
             }
             if let (Some(h), Some(target)) = (&self.sync, target) {
-                if !self.local_ack_durable(h, target) {
+                let acked = match self.local_ack_durable(h, target) {
+                    Ok(acked) => acked,
+                    // Plan 43 C1-2 (D4): the gate went off and the row
+                    // could not be re-tagged `Lone`: not acknowledged (the
+                    // staged state is kept; the caller retries).
+                    Err(_) => {
+                        return Err(FlushFail {
+                            errno: Code::Io,
+                            ws: Some(Box::new(ws)),
+                        });
+                    }
+                };
+                if !acked {
                     let Some((base, bytes, dirty)) = retry else {
                         return Err(FlushFail {
                             errno: Code::Io,

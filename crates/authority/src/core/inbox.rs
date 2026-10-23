@@ -393,7 +393,11 @@ impl Core {
         // An earlier attempt (P2P, or a previous epoch's batch) may have
         // executed it already.
         if let Some(outcome) = super::client::completed_as_outcome(replica, rid, epoch) {
-            let source = self.completed_source(replica, rid);
+            let (outcome, source) = Self::eio_unless_recorded(
+                outcome,
+                self.completed_source(replica, rid),
+                crate::action::AnswerSource::Sequenced(super::AckClass::Lone),
+            );
             self.finish_as(now, rid, outcome, source, replica, out);
             return;
         }

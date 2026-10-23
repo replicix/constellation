@@ -1939,7 +1939,11 @@ impl Core {
         }
         if let Some(outcome) = self.settled_outcome(rid, replica) {
             self.stats.forward_indoubt_resolved += 1;
-            let source = self.completed_source(replica, rid);
+            let (outcome, source) = Self::eio_unless_recorded(
+                outcome,
+                self.completed_source(replica, rid),
+                AnswerSource::Sequenced(AckClass::Lone),
+            );
             self.finish_as(now, rid, outcome, source, replica, out);
             return;
         }
@@ -2075,7 +2079,11 @@ impl Core {
                         .parked_local
                         .insert(rid, (Default::default(), Some(need)));
                 }
-                let source = self.completed_source(replica, rid);
+                let (outcome, source) = Self::eio_unless_recorded(
+                    outcome,
+                    self.completed_source(replica, rid),
+                    AnswerSource::Sequenced(AckClass::Lone),
+                );
                 if let Some(c) = self.clients.get_mut(&rid) {
                     c.answered_by = Some(source);
                 }
@@ -2102,7 +2110,11 @@ impl Core {
     ) -> MutateOutcome {
         constellation_meta::clear_last_journaled();
         let outcome = self.execute_local_outcome(now, rid, epoch, replica, out);
-        let class = self.executed_answer_class(replica, rid);
+        let (outcome, class) = Self::eio_unless_recorded(
+            outcome,
+            self.executed_answer_class(replica, rid),
+            AckClass::Lone,
+        );
         if let Some(c) = self.clients.get_mut(&rid) {
             c.answered_by = Some(AnswerSource::Sequenced(class));
         }
@@ -2931,7 +2943,11 @@ impl Core {
                 ?rid,
                 "deadline: the log answered the op; not in doubt"
             );
-            let source = self.completed_source(replica, rid);
+            let (outcome, source) = Self::eio_unless_recorded(
+                outcome,
+                self.completed_source(replica, rid),
+                AnswerSource::Sequenced(AckClass::Lone),
+            );
             self.finish_as(now, rid, outcome, source, replica, out);
             return;
         }

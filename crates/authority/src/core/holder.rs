@@ -341,10 +341,14 @@ impl Core {
         let durable = self.ack_need(&position);
         // Plan 43 C2a: what this answer waits for, whether it parks or not;
         // an answer from the dedup is the class of the row it names (C1-2).
-        let class = if executed {
-            self.root_ack_class()
+        let (outcome, class) = if executed {
+            (outcome, self.root_ack_class())
         } else {
-            self.journaled_answer_class(replica, rid)
+            Self::eio_unless_recorded(
+                outcome,
+                self.journaled_answer_class(replica, rid),
+                super::AckClass::Lone,
+            )
         };
         if wait.is_some() || durable.is_some() {
             // Only an acknowledgement's wait for durability says now what

@@ -1360,8 +1360,16 @@ impl Core {
     /// committed, and a deposition would then treat it as not. A row that
     /// is no longer in the journal is in the log (`Archive`) or, failing
     /// that, answered as the root's now.
-    pub(crate) fn journaled_answer_class(&self, replica: &dyn Replica, rid: Rid) -> AckClass {
-        match replica.journal_class_of_rid(rid) {
+    ///
+    /// `Err`: the row had to be re-tagged `Lone` and the store failed the
+    /// write; the answer may claim neither class, and the caller answers
+    /// `EIO` ([`Self::eio_unless_recorded`]; the C1-2/C1-3 review).
+    pub(crate) fn journaled_answer_class(
+        &self,
+        replica: &dyn Replica,
+        rid: Rid,
+    ) -> Result<AckClass, constellation_meta::MetaError> {
+        Ok(match replica.journal_class_of_rid(rid) {
             // A gated row nothing gates any more (its group is gone, the
             // lease lists no backup): answered on this disk alone, so it
             // is a lone node's answer and the row is re-tagged `Lone`, as
@@ -1371,7 +1379,11 @@ impl Core {
                     && self.durable_jseq() == u64::MAX
                     && !self.ack.shipped_rows.contains(&first) =>
             {
-                let _ = replica.reclass_journal_tx(first, constellation_meta::RowClass::Lone);
+                replica
+                    .reclass_journal_tx(first, constellation_meta::RowClass::Lone)
+                    .inspect_err(|error| {
+                        tracing::warn!(node = self.cfg.node_id, ?rid, %error, "could not re-tag a row answered with the gate off: EIO");
+                    })?;
                 AckClass::Lone
             }
             Some((_, constellation_meta::RowClass::Lone)) => AckClass::Lone,
@@ -1379,6 +1391,23 @@ impl Core {
             Some((_, constellation_meta::RowClass::RootGroup)) => AckClass::RootGroup,
             Some((_, constellation_meta::RowClass::NonStealable)) => AckClass::NonStealable,
             Some((_, constellation_meta::RowClass::DelegGroup)) | None => self.root_ack_class(),
+        })
+    }
+
+    /// The answer to give when its class is `class`: `outcome` under it,
+    /// or — the store failed the `Lone` re-tag ([`Self::journaled_answer_class`])
+    /// — `EIO`, sourced as this node's uncommitted answer.
+    pub(crate) fn eio_unless_recorded<T>(
+        outcome: MutateOutcome,
+        class: Result<T, constellation_meta::MetaError>,
+        uncommitted: T,
+    ) -> (MutateOutcome, T) {
+        match class {
+            Ok(class) => (outcome, class),
+            Err(_) => (
+                MutateOutcome::Errno(constellation_types::Code::Io),
+                uncommitted,
+            ),
         }
     }
 
@@ -1386,29 +1415,40 @@ impl Core {
     /// just now (`execute_local`): that of the row it journaled; an op that
     /// journaled nothing was answered from what the node had journaled
     /// before ([`Self::journaled_answer_class`]).
-    pub(crate) fn executed_answer_class(&self, replica: &dyn Replica, rid: Rid) -> AckClass {
-        match constellation_meta::take_last_journaled().map(|r| r.class) {
-            Some(constellation_meta::RowClass::DelegGroup) => self.root_ack_class(),
-            Some(class) => match class {
-                constellation_meta::RowClass::Lone => AckClass::Lone,
-                constellation_meta::RowClass::Archive => AckClass::Archive,
-                constellation_meta::RowClass::RootGroup => AckClass::RootGroup,
-                _ => AckClass::NonStealable,
+    pub(crate) fn executed_answer_class(
+        &self,
+        replica: &dyn Replica,
+        rid: Rid,
+    ) -> Result<AckClass, constellation_meta::MetaError> {
+        Ok(
+            match constellation_meta::take_last_journaled().map(|r| r.class) {
+                Some(constellation_meta::RowClass::DelegGroup) => self.root_ack_class(),
+                Some(class) => match class {
+                    constellation_meta::RowClass::Lone => AckClass::Lone,
+                    constellation_meta::RowClass::Archive => AckClass::Archive,
+                    constellation_meta::RowClass::RootGroup => AckClass::RootGroup,
+                    _ => AckClass::NonStealable,
+                },
+                None => return self.journaled_answer_class(replica, rid),
             },
-            None => self.journaled_answer_class(replica, rid),
-        }
+        )
     }
 
     /// Plan 43 C2a: the source to name for an outcome this node reads off
     /// its own `completed` row (a dedup, a retry that finds the rid done):
     /// the archive when an applied segment carries the row, otherwise the
     /// class its journal row waits for as the root's.
-    pub(crate) fn completed_source(&self, replica: &dyn Replica, rid: Rid) -> AnswerSource {
-        AnswerSource::Sequenced(if replica.outcome_from_log(rid) {
+    /// `Err`: as [`Self::journaled_answer_class`]'s.
+    pub(crate) fn completed_source(
+        &self,
+        replica: &dyn Replica,
+        rid: Rid,
+    ) -> Result<AnswerSource, constellation_meta::MetaError> {
+        Ok(AnswerSource::Sequenced(if replica.outcome_from_log(rid) {
             AckClass::Archive
         } else {
-            self.journaled_answer_class(replica, rid)
-        })
+            self.journaled_answer_class(replica, rid)?
+        }))
     }
 
     /// Send a message to a peer; a `MutateReply` carrying a definitive

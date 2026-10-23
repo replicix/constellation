@@ -565,10 +565,16 @@ impl View {
         tag: &constellation_meta::locks::LockTag,
         target: AckTarget,
     ) -> Option<Result<(), MutateFail>> {
-        if self.local_ack_durable(h, target) {
-            None
-        } else {
-            Some(self.submit_to_core(h, op, rid, tag, true))
+        match self.local_ack_durable(h, target) {
+            Ok(true) => None,
+            Ok(false) => Some(self.submit_to_core(h, op, rid, tag, true)),
+            // The row is journaled and may still reach the log: its
+            // grants wait for its token's window before a release, as for
+            // every other `EIO` an executed op can get.
+            Err(e) => {
+                crate::locks::note_tag_in_doubt(Some(rid));
+                Some(Err(mutate_fail(e)))
+            }
         }
     }
 
@@ -576,37 +582,48 @@ impl View {
     /// is durable under the lease's acknowledgement policy (or the gate
     /// went off with the lease still this node's). `false`: in doubt —
     /// the lease was lost meanwhile, or the budget ran out; the caller
-    /// resolves the op through the core. Every fast-path acknowledgement
+    /// resolves the op through the core. `Err`: the gate went off and the
+    /// row could not be re-tagged `Lone` — the answer may claim neither
+    /// the class it was journaled with (nothing committed it) nor the one
+    /// it could not record; the caller answers `EIO` (plan 43 C1-2, D4).
+    /// Every fast-path acknowledgement
     /// under a gate goes through here: `execute_mutate`'s ops and the
     /// holder's own manifest commit on close (without it the close
     /// returned before its row was durable, and the file's next read
     /// waited for it in `Meta::durability_pending` instead).
-    pub(super) fn local_ack_durable(&self, h: &SyncHandle, target: AckTarget) -> bool {
+    pub(super) fn local_ack_durable(
+        &self,
+        h: &SyncHandle,
+        target: AckTarget,
+    ) -> Result<bool, MetaError> {
         let _ = h.tx.send(SyncRequest::Journaled);
         let session = self.meta.session();
         constellation_vfs::watch::stage("durability acknowledgement");
         match session.wait_durable(target.last, DURABLE_WAIT_BUDGET) {
             constellation_meta::DurableWait::Durable(waited) => {
                 session.count_fast_ack(waited);
-                true
+                Ok(true)
             }
             // Plan 43 C1-2 (D4): the gate went off with the lease still this
             // node's: the answer is a lone node's, so the row is re-tagged
             // `Lone` before it is given — what a deposition does with it
-            // must match what the client was told.
+            // must match what the client was told. A re-tag that fails
+            // leaves the row gated-class: no answer is given on it.
             constellation_meta::DurableWait::Ungated => {
-                if self
+                let changed = self
                     .meta
                     .reclass_journal_tx(target.first, constellation_meta::RowClass::Lone)
-                    .is_ok_and(|changed| changed)
-                {
+                    .inspect_err(|error| {
+                        tracing::warn!(%error, first = target.first, "could not re-tag a row answered with the gate off: EIO");
+                    })?;
+                if changed {
                     session.count_fast_ack_downgraded();
                 }
-                true
+                Ok(true)
             }
             constellation_meta::DurableWait::Lost | constellation_meta::DurableWait::TimedOut => {
                 session.count_fast_ack_in_doubt();
-                false
+                Ok(false)
             }
         }
     }

@@ -397,6 +397,113 @@ fn ungated_fast_path_answer_retags_the_row_lone() {
     assert_eq!(session.stats().fast_acks_downgraded, 1);
 }
 
+/// Waits until something journaled past the durable watermark; returns
+/// the journal's tip.
+fn journaled_past_durable(meta: &Meta) -> u64 {
+    let session = meta.session();
+    let started = std::time::Instant::now();
+    loop {
+        let tip = meta.journal_tip().unwrap();
+        if tip > session.durable_jseq() {
+            return tip;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "never journaled"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Plan 43 C1-2 (D4), the C1-2/C1-3 review: the gate goes off while a
+/// fast-path close waits, and the store fails the `Lone` re-tag. The close
+/// is not acknowledged (`EIO`, the staged state kept): the row is still
+/// gated-class, and an answer on it would claim a class nothing recorded.
+/// Fails on the parent: the error was ignored and the close returned
+/// `Ok`.
+#[test]
+fn a_failed_retag_fails_the_fast_path_close() {
+    use constellation_meta::RowClass;
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let file = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+    let session = meta.session();
+    session.set_durable(
+        true,
+        meta.journal_tip().unwrap(),
+        false,
+        RowClass::RootGroup,
+    );
+    let (fs, _dir, _core) = holder_fs(meta.clone(), true);
+    fs.do_write(file.ino, 0, b"hello").unwrap();
+    std::thread::scope(|scope| {
+        let close = scope.spawn(|| {
+            constellation_meta::fail_reclass_on_this_thread_for_tests(1);
+            let r = fs.flush_inode(file.ino, false);
+            constellation_meta::fail_reclass_on_this_thread_for_tests(0);
+            r
+        });
+        let tip = journaled_past_durable(&meta);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!close.is_finished(), "the close waits for the group");
+        session.set_durable(false, u64::MAX, false, RowClass::Lone);
+        assert_eq!(close.join().unwrap(), Err(Code::Io));
+        assert_eq!(
+            meta.journal_tx_class(tip).unwrap(),
+            Some(RowClass::RootGroup)
+        );
+    });
+    assert_eq!(session.stats().fast_acks_downgraded, 0);
+}
+
+/// The same for a namespace op on the fast path: `EIO`, not `Ok`, when the
+/// re-tag fails. Fails on the parent: the create was answered `Ok`.
+#[test]
+fn a_failed_retag_fails_the_fast_path_op() {
+    use constellation_meta::RowClass;
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let session = meta.session();
+    session.set_durable(
+        true,
+        meta.journal_tip().unwrap(),
+        false,
+        RowClass::RootGroup,
+    );
+    let (fs, _dir, _core) = holder_fs(meta.clone(), true);
+    let ino = meta.allocate_ino(ROOT_INO).unwrap();
+    std::thread::scope(|scope| {
+        let op = scope.spawn(|| {
+            constellation_meta::fail_reclass_on_this_thread_for_tests(1);
+            let r = fs.mutate_op(
+                ROOT_INO,
+                constellation_meta::MutateOp::Create {
+                    parent: ROOT_INO,
+                    name: "c".into(),
+                    ino,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+            );
+            constellation_meta::fail_reclass_on_this_thread_for_tests(0);
+            r
+        });
+        let tip = journaled_past_durable(&meta);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!op.is_finished(), "the op waits for the group");
+        session.set_durable(false, u64::MAX, false, RowClass::Lone);
+        assert_eq!(
+            op.join().unwrap(),
+            Err(Code::Io),
+            "answered on a row whose class could not be recorded"
+        );
+        assert_eq!(
+            meta.journal_tx_class(tip).unwrap(),
+            Some(RowClass::RootGroup)
+        );
+    });
+    assert_eq!(session.stats().fast_acks_downgraded, 0);
+}
+
 /// Plan 43 C1-2: the fast path's wait follows the class the row was
 /// journaled under, not the gate as it stands after the execution: a row
 /// journaled `Lone` (the gate was off) is answered at once, whatever the

@@ -82,6 +82,7 @@ use constellation_fs_core::Ino;
 use constellation_meta::{
     HeldDelegation, MutateOp, MutateOutcome, OwnChunks, Position, RecallNeed, Rid,
 };
+use constellation_types::Code;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A strict read waiting for its answer.
@@ -1588,15 +1589,26 @@ impl Core {
                 ParkedWhat::Reply { class, .. } | ParkedWhat::Finish { class, .. } => class.gated(),
                 _ => false,
             };
+            // A re-tag the store fails leaves the row gated-class: the
+            // answer can claim neither that class (nothing committed the
+            // row) nor `Lone` (not recorded), so the op is answered `EIO`
+            // (the C1-2/C1-3 review).
+            let mut p = p;
             if downgraded {
                 if let Some(j) = p.durable {
                     if let Err(error) =
                         replica.reclass_journal_tx(j, constellation_meta::RowClass::Lone)
                     {
-                        tracing::warn!(node = self.cfg.node_id, %error, "could not re-tag a row answered with the gate off");
+                        tracing::warn!(node = self.cfg.node_id, %error, "could not re-tag a row answered with the gate off: EIO");
+                        if let ParkedWhat::Reply { outcome, .. }
+                        | ParkedWhat::Finish { outcome, .. } = &mut p.what
+                        {
+                            *outcome = MutateOutcome::Errno(Code::Io);
+                        }
+                    } else {
+                        self.stats.acks_downgraded_lone += 1;
                     }
                 }
-                self.stats.acks_downgraded_lone += 1;
             }
             if p.durable.is_some() {
                 self.stats.ack_wait_ms_total += waited;
