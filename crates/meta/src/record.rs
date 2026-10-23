@@ -274,7 +274,13 @@ pub enum LogRecord {
     /// `new_name` → `ino`) has it applied and skips it. The authority
     /// sim's `shared-dir-split+links` seed 498: the root appended a
     /// delegate's exchange on top of its own shadow of the same op and
-    /// swapped the names back, then published that.
+    /// swapped the names back, then published that. That append now
+    /// takes its shadow's place by rid (plan 45 §12 O1,
+    /// `Meta::apply_delegate_tx`), which the skip by state could not do:
+    /// a second exchange of the pair shadowed in between made the names
+    /// look unswapped again. The skip stays as replay's tolerance of an
+    /// exchange re-applied over its own effect, the same tolerance every
+    /// other record has by name.
     Exchange {
         parent: Ino,
         name: String,

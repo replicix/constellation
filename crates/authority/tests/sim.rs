@@ -8549,6 +8549,23 @@ fn config_variant(cfg: SimConfig, variant: &str) -> SimConfig {
             ..cfg
         },
         "unclocked" => unclocked(cfg),
+        // Plan 45 §12 O1: a requester installs an accepted reply even
+        // when the sequencer evaluated it on state it has not applied
+        // (M5's `speculate_on_stale_base`). A delegate's reply base
+        // otherwise keeps a root from shadowing a second op on names
+        // whose first op the delegate has not streamed yet, which is
+        // where the root's append met its own shadow under a later one.
+        "stalebase" => {
+            let core = cfg.core.clone();
+            SimConfig {
+                core: std::sync::Arc::new(move |node, inc| {
+                    let mut c = core(node, inc);
+                    c.speculate_on_stale_base = true;
+                    c
+                }),
+                ..cfg
+            }
+        }
         "solo" => SimConfig {
             clients_per_node: 1,
             ops_per_client: cfg.ops_per_client * 3,
@@ -11932,5 +11949,52 @@ fn hard_links_and_exchanges_converge_under_faults() {
             links > 0 && exchanges > 0,
             "{label}+links: vacuous ({links}, {exchanges})"
         );
+    }
+}
+
+/// Plan 45 §12 O1: the root's append of a delegate's transaction takes
+/// the place of its own live shadow of that rid (`Meta::apply_delegate_tx`)
+/// instead of applying over it. These seeds failed before, each with
+/// "commit N by node 1 is not the log prefix": the root, appending over
+/// its shadow, either re-applied the op over a later shadow of the same
+/// names, or captured the shadow's state as the appended row's
+/// before-images, so its publish overlay put the unshipped op's effect
+/// into a commit. `+stalebase` lets a requester install a reply on a base
+/// it lacks, which is what lets the root shadow a second op on names
+/// whose first op the delegate has not streamed yet (its reply base
+/// otherwise sends the root to wait for the log).
+#[test]
+fn regression_a_root_appending_over_its_own_shadow_keeps_the_log_prefix() {
+    type Config = fn() -> SimConfig;
+    let cases: [(&str, Config, &str, &[u64]); 3] = [
+        (
+            "long-delegated",
+            long_delegated_config,
+            "links+stalebase",
+            &[333, 416, 430, 447, 472],
+        ),
+        (
+            "delegated-backup",
+            delegated_backup_config,
+            "links+stalebase",
+            &[13],
+        ),
+        (
+            "shared-dir-split",
+            shared_dir_split_config,
+            "stalebase",
+            &[298],
+        ),
+    ];
+    for (label, config, variants, seeds) in cases {
+        for &seed in seeds {
+            let cfg = variants.split('+').fold(config(), config_variant);
+            run_seed(seed, cfg).unwrap_or_else(|e| {
+                panic!(
+                    "{label}+{variants} seed {seed}: {e}\n  replay with \
+                     AUTHORITY_SIM_CONFIG={label}+{variants}"
+                )
+            });
+        }
     }
 }

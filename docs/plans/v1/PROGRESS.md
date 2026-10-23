@@ -57035,6 +57035,62 @@ the five `view::owner_fence_tests` failing in the full run as on `main` (54/54 a
   `backup-runtime-lag-unaware`, `delegated-core-stall-unlaned`, and
   `backup-lag-keeps-its-backup` seed 259).
 
+### O1: the root's append takes its own shadow's place by rid (2026-10-23)
+
+- **Cause.** A shadow is keyed by rid in `spec_live` but writes no
+  `completed` row (requester speculation is not durable), and
+  `Meta::apply_delegate_tx` looked for the rid only in `completed`. Since
+  plan 30 M11 phase 2a (`578ff9cf`) nothing on that path asked the
+  speculation log, so the root could not tell its own installed copy of an
+  op (it forwarded the op to the delegate and installed the reply) from a
+  new op on the same names, and appended the records on top of it. Every
+  other apply path keys by rid: a segment rolls back a shadow it completes
+  and applies in its place, `install_streamed` adopts it (M9), a rebuild
+  queues it for replay by rid (deduped by `completed`).
+- **Two faces.** Under a later shadow of the same names the op applied
+  twice (a second exchange of the pair swapped back; `create a` after
+  `rename a b` moved over `b`). Even alone, the appended row's
+  before-images were the shadow's state, so the root's publish overlay put
+  the unshipped op's effect into a commit ("not the log prefix").
+- **Fix.** `spec::unwind_shadow_for_append_tx`, in the append's
+  transaction: when nothing installed after the shadow touches its keys
+  or the append's, only its before-images are restored and the
+  transaction is journaled at the end; otherwise every row from the shadow
+  on is rolled back, the journaled, tailed and hint rows are redone, the
+  transaction is journaled, and the later shadows are redone on top
+  (`redo_after_append_tx`). That is a root's log order (a live shadow is a
+  delegate row not appended yet), and captured rows' `spec_seq`s keep
+  rising with journal order, which `first_captured_from` and compaction
+  rely on. The shadow is dropped, not stranded. The exchange's skip by
+  state stays as replay's tolerance. Plan 43 C3 does not prescribe this
+  (its D4 is the takeover-time supersede; C3-1 dedups the append by
+  origin); C3-1's `append_verbatim_tx` must keep the unwind.
+- **Tests, each failing on the parent.** Meta: the two ignored
+  `o1_a_root_appending_*` tests, un-ignored, plus
+  `o1_a_root_appending_over_its_own_shadow_takes_the_shadows_place` (before:
+  two live entries, the shadow stranded and queued at a takeover) and
+  `o1_a_root_appending_under_its_own_rows_keeps_the_journal_order` (a root
+  row between the shadows, then a partial ship and a takeover's strand;
+  before: the renamed file lost). Sim: the `+stalebase` variant
+  (`speculate_on_stale_base`: the delegate's reply base otherwise keeps the
+  root from shadowing a second op on names the delegate has not streamed)
+  and `regression_a_root_appending_over_its_own_shadow_keeps_the_log_prefix`:
+  `long-delegated+links+stalebase` 333, 416, 430, 447, 472,
+  `delegated-backup+links+stalebase` 13, `shared-dir-split+stalebase` 298,
+  each "commit N by node 1 is not the log prefix" before. The variant's
+  other failures (read-your-writes and monotonic reads, the knob's known
+  cost, and `delegated-backup+links+stalebase` 138's convergence) are on
+  both sides.
+- **Sweeps (devbox 2), parent and fix:** the 33 `+links` configurations at
+  their sizes, and the 46 `backup*`, `delegated-*` and `shared-dir*`
+  configurations at 1,000: failing sets identical (the negative controls
+  `backup-lag-in-margin-unaware`, `backup-runtime-lag-unaware`,
+  `delegated-core-stall-unlaned`, and `backup-lag-keeps-its-backup` seed
+  259).
+- **Gates (devbox 2):** fmt, clippy (`--workspace --all-targets -D
+  warnings`), meta 470, mtree 74, authority lib 594, `meta_repro` 4, engine
+  lib 859, sim 247, all passing.
+
 ## Plan 43 C7b, commit 1/N: the offset configurations and the lease-claim oracle (sim evidence, 2026-10-22)
 
 Behaviour-neutral. The cross-node compares of plan 43 Appendix B (a claimant

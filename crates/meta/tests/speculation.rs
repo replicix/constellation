@@ -2294,16 +2294,15 @@ fn a_hint_for_the_other_name_of_an_inode_a_shadow_unlinked_is_not_installed() {
     assert_eq!((after.size, after.nlink), (100, 1));
 }
 
-/// Plan 45 §12, open integrity item O1 (review of the follow-ups): a root
-/// appends a delegate's transaction by rid (`Meta::apply_delegate_tx`)
-/// on top of everything it holds, also when a live shadow of that same
-/// rid sits under later shadows. `install_streamed` adopts such a shadow
-/// in place; this path re-applies the records over the later ops. The
+/// Plan 45 §12, integrity item O1 (review of the follow-ups): a root
+/// appended a delegate's transaction by rid (`Meta::apply_delegate_tx`)
+/// on top of everything it held, also when a live shadow of that same
+/// rid sat under later shadows. `install_streamed` adopts such a shadow
+/// in place; this path re-applied the records over the later ops. The
 /// exchange's "swapped already" skip (`LogRecord::Exchange`) only
-/// catches the immediate repeat: a second exchange of the pair shadowed
-/// in between makes the first apply again.
+/// caught the immediate repeat: a second exchange of the pair shadowed
+/// in between made the first apply again.
 #[test]
-#[ignore = "open: plan 45 §12 O1"]
 fn o1_a_root_appending_an_exchange_under_a_later_shadow_keeps_their_order() {
     let meta = Meta::open_in_memory().unwrap();
     meta.set_holder_epoch(1);
@@ -2354,9 +2353,8 @@ fn o1_a_root_appending_an_exchange_under_a_later_shadow_keeps_their_order() {
 
 /// O1 for a rename: the root's shadow of `rename a b` (rid 1), then of
 /// `create a` (rid 2, a new inode); the delegate's transaction of rid 1
-/// appended on top moves the new `a` over `b` and loses the renamed file.
+/// appended on top moved the new `a` over `b` and lost the renamed file.
 #[test]
-#[ignore = "open: plan 45 §12 O1"]
 fn o1_a_root_appending_a_rename_under_a_later_shadow_keeps_their_order() {
     let meta = Meta::open_in_memory().unwrap();
     meta.set_holder_epoch(1);
@@ -2409,4 +2407,137 @@ fn o1_a_root_appending_a_rename_under_a_later_shadow_keeps_their_order() {
         meta.lookup(ROOT_INO, "b").unwrap().map(|e| e.ino),
     );
     assert_eq!(names, (Some(y), Some(x)));
+}
+
+/// O1, the shape without a rewind: nothing the root installed after its
+/// shadow touches the shadow's keys, so the append takes the shadow's
+/// place by rid and goes at the end. Before: the shadow stayed live
+/// under the appended row (two copies of one op's effect, the shadow
+/// stranded and queued for replay at the next takeover).
+#[test]
+fn o1_a_root_appending_over_its_own_shadow_takes_the_shadows_place() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    let (x, y) = (ino(1), ino(2));
+    for (r, name, i, t) in [(1, "a", x, 10), (2, "c", y, 11)] {
+        assert!(meta
+            .install_shadow_from(
+                rid(r),
+                1,
+                5,
+                &create_op(name, i),
+                &Default::default(),
+                &[create(name, i, t), completed(rid(r))]
+            )
+            .unwrap());
+    }
+    assert!(meta
+        .apply_delegate_tx(
+            &[create("a", x, 10)],
+            Some(rid(1)),
+            5,
+            1,
+            constellation_meta::Position::ZERO,
+        )
+        .unwrap());
+    let counts = meta.speculation_counts().unwrap();
+    assert_eq!(
+        (counts.outstanding, counts.local),
+        (1, 1),
+        "the shadow of rid 1 became the appended row"
+    );
+    assert_eq!(meta.lookup(ROOT_INO, "a").unwrap().map(|e| e.ino), Some(x));
+    assert_eq!(meta.lookup(ROOT_INO, "c").unwrap().map(|e| e.ino), Some(y));
+    // A takeover strands the shadow of rid 2 only: rid 1 is the
+    // generation's appended row now, not this node's speculation.
+    meta.strand_below_epoch(2).unwrap();
+    let queued: Vec<Rid> = meta
+        .pending_replays()
+        .unwrap()
+        .iter()
+        .map(|s| s.rid)
+        .collect();
+    assert_eq!(queued, vec![rid(2)]);
+    assert_eq!(meta.lookup(ROOT_INO, "a").unwrap().map(|e| e.ino), Some(x));
+    assert!(meta.lookup(ROOT_INO, "c").unwrap().is_none());
+}
+
+/// O1 with the root's own row between the shadows: `rename a b` shadowed
+/// (rid 1), the root's own `create z` journaled, `create a` shadowed
+/// (rid 2), then rid 1's append. The rewind redoes `create z` first, the
+/// append after it (its journal rows are the newest: captured rows'
+/// `spec_seq`s must rise with journal order) and the later shadow on
+/// top. Shipping `z` alone and then a takeover's strand must leave the
+/// log's state plus the appended row: `b` is the renamed file, `z`
+/// stays, the new `a` is gone with its shadow.
+#[test]
+fn o1_a_root_appending_under_its_own_rows_keeps_the_journal_order() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    let (x, y, z) = (ino(1), ino(2), ino(3));
+    apply(&meta, 1, 1, &[create("a", x, 10)]);
+    let rename = LogRecord::Rename {
+        parent: ROOT_INO,
+        name: "a".into(),
+        new_parent: ROOT_INO,
+        new_name: "b".into(),
+        time_ns: 12,
+    };
+    let rename_op = MutateOp::Rename {
+        parent: ROOT_INO,
+        name: "a".into(),
+        new_parent: ROOT_INO,
+        new_name: "b".into(),
+        noreplace: false,
+    };
+    assert!(meta
+        .install_shadow_from(
+            rid(1),
+            1,
+            5,
+            &rename_op,
+            &Default::default(),
+            &[rename.clone(), completed(rid(1))]
+        )
+        .unwrap());
+    execute_mutate(&meta, &create_op("z", z), Some(rid(10))).unwrap();
+    assert!(meta
+        .install_shadow_from(
+            rid(2),
+            1,
+            5,
+            &create_op("a", y),
+            &Default::default(),
+            &[create("a", y, 13), completed(rid(2))]
+        )
+        .unwrap());
+    assert!(meta
+        .apply_delegate_tx(
+            std::slice::from_ref(&rename),
+            Some(rid(1)),
+            5,
+            1,
+            constellation_meta::Position::ZERO,
+        )
+        .unwrap());
+    let names = |m: &Meta| ["a", "b", "z"].map(|n| m.lookup(ROOT_INO, n).unwrap().map(|e| e.ino));
+    assert_eq!(names(&meta), [Some(y), Some(x), Some(z)]);
+    let counts = meta.speculation_counts().unwrap();
+    assert_eq!((counts.outstanding, counts.local), (1, 2));
+    // Ship the root's own `create z` (the journal's first transaction).
+    let (_, batch) = meta.take_journal_grouped(1).unwrap().pop().unwrap();
+    assert!(batch
+        .iter()
+        .any(|(_, rec)| matches!(rec, LogRecord::Create { name, .. } if name == "z")));
+    let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
+    meta.ack_journal_rows_at(&seqs, 2).unwrap();
+    meta.strand_below_epoch(2).unwrap();
+    assert_eq!(names(&meta), [None, Some(x), Some(z)]);
+    let queued: Vec<Rid> = meta
+        .pending_replays()
+        .unwrap()
+        .iter()
+        .map(|s| s.rid)
+        .collect();
+    assert_eq!(queued, vec![rid(2)]);
 }

@@ -107,6 +107,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::Ordering;
 
+/// Which journaled apply `Meta::apply_records_journaled_inner` runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Journaled {
+    Plain,
+    /// A takeover's adoption of its predecessor's backed-up transaction.
+    Adopted,
+    /// The root's append of a delegate's transaction (plan 45 §12 O1:
+    /// its own live shadow of the rid is replaced, not applied over).
+    Appended,
+}
+
 /// A `journal_tx` value: one journaled transaction still in `journal`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct JournalTx {
@@ -511,6 +522,17 @@ impl Meta {
     /// journal with the delegate's origin and `deps`, completing `rid`
     /// once. A rid the log or this journal already completed is skipped
     /// (`Ok(false)`).
+    ///
+    /// Plan 45 §12 O1: a rid this root holds a live shadow of (it
+    /// forwarded the op to the delegate and installed the reply) is
+    /// neither skipped nor applied over the shadow: the shadow is taken
+    /// out by rid and the transaction journaled in its place, with what
+    /// the root installed after it redone on top
+    /// (`spec::unwind_shadow_for_append_tx`). A shadow writes no
+    /// `completed` row, so the dedup above never saw it, and the records
+    /// re-applied over later speculation of the same names: a second
+    /// exchange of the pair swapped back, a `create a` after `rename a b`
+    /// moved over `b`.
     pub fn apply_delegate_tx(
         &self,
         records: &[LogRecord],
@@ -538,7 +560,7 @@ impl Meta {
             }
         }
         let _d = journal::PendingDelegate::set(gen, Some(idx), deps);
-        self.apply_records_journaled_completing(records, rid)?;
+        self.apply_records_journaled_inner(records, rid, Journaled::Appended)?;
         self.note_log_idx(gen, idx)?;
         Ok(true)
     }
@@ -831,7 +853,7 @@ impl Meta {
         records: &[LogRecord],
         rid: Option<crate::Rid>,
     ) -> Result<(), MetaError> {
-        self.apply_records_journaled_inner(records, rid, false)
+        self.apply_records_journaled_inner(records, rid, Journaled::Plain)
     }
 
     /// Plan 30 §M9 × §M4: [`Self::apply_records_journaled_completing`]
@@ -858,15 +880,16 @@ impl Meta {
         records: &[LogRecord],
         rid: Option<crate::Rid>,
     ) -> Result<(), MetaError> {
-        self.apply_records_journaled_inner(records, rid, true)
+        self.apply_records_journaled_inner(records, rid, Journaled::Adopted)
     }
 
     fn apply_records_journaled_inner(
         &self,
         records: &[LogRecord],
         rid: Option<crate::Rid>,
-        adopted: bool,
+        how: Journaled,
     ) -> Result<(), MetaError> {
+        let adopted = how == Journaled::Adopted;
         // With a rid, the transaction is that op's (plan 30 §M9): a
         // stranding replays it *by rid* — where `completed` dedups —
         // never as anonymous records under a derived rid, which would
@@ -895,6 +918,19 @@ impl Meta {
             })
             .then(|| self.deleg_gate.write().unwrap_or_else(|e| e.into_inner()));
         let mut tx = self.db.write_tx();
+        // Plan 45 §12 O1: the root's own live shadow of the rid it
+        // appends is that transaction's effect already; it is taken out
+        // by rid and the append goes in its place (see
+        // `spec::unwind_shadow_for_append_tx`). Moved rows' usage is
+        // staged apart from this transaction's, which its `Local` row
+        // records.
+        let moved = UsageTracker::staging();
+        let unwind = match (how, rid) {
+            (Journaled::Appended, Some(rid)) => {
+                spec::unwind_shadow_for_append_tx(&mut tx, self, &moved, rid, records)?
+            }
+            _ => None,
+        };
         let local = self.begin_local(&tx)?;
         let staged = UsageTracker::staging();
         let (_, applied) = {
@@ -1002,8 +1038,14 @@ impl Meta {
         let (bytes, files) = staged.raw_delta();
         adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
         self.finish_local(&mut tx, local)?;
+        if let Some(unwind) = unwind {
+            spec::redo_after_append_tx(&mut tx, self, &moved, unwind)?;
+        }
+        let (bytes, files) = moved.raw_delta();
+        adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
         tx.commit()?;
         staged.drain_into(self.usage_tracker());
+        moved.drain_into(self.usage_tracker());
         // The rows journaled here are unshipped work of this tenure, like
         // `mutate::execute`'s: plan 30 §M5's forward-reply `base`, §M8's
         // ReadIndex positions and §M9's holder-read durability wait all

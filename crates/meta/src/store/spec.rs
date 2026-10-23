@@ -1799,6 +1799,165 @@ fn insert_streamed_tx(
     Ok(())
 }
 
+/// What [`unwind_shadow_for_append_tx`] leaves for the root's append to
+/// redo once its own `Local` row is recorded: the shadows installed after
+/// the one the append replaces, and the live entries as they were read
+/// before the unwind (a redone row's entry moves with it).
+pub(crate) struct AppendUnwind {
+    live: HashMap<u64, LiveEntry>,
+    behind: Vec<(u64, SpecRow)>,
+}
+
+/// Plan 45 §12 O1: the root is about to append a delegate's transaction
+/// for `rid` (`Meta::apply_delegate_tx`) while it holds a live shadow of
+/// that same rid — it forwarded the op to the delegate and installed the
+/// reply. The shadow *is* that transaction's effect, installed ahead of
+/// the stream; appending the records on top applies the op twice, over
+/// whatever the root installed after the shadow (a second exchange of the
+/// pair swapped back, a `create a` after `rename a b` moved over `b`).
+/// The skip by state (`LogRecord::Exchange`'s inodes) only caught the
+/// immediate repeat. So the shadow is taken out, by rid, and the append
+/// goes in its place — the segment path's rewind (a shadow a segment
+/// completes is rolled back and the segment applied in its place), for a
+/// `Local` insertion. `install_streamed` adopts a shadow by rid the same
+/// way.
+///
+/// The append's row goes after every other `Local` row (its journal rows
+/// are the newest, and captured rows' `spec_seq`s must rise with journal
+/// order: `local::first_captured_from`, hence compaction, relies on it)
+/// and before the shadows that followed the replaced one. That is the
+/// log's order at a root: its journal is the log's next rows in order
+/// (tailed and shipped `Foreign` rows are in the log already), and a
+/// live shadow is a delegate's row not appended yet, which joins the
+/// journal after everything in it. Hints stay with the journaled rows,
+/// in place: a hint never overlaps the speculation live at its install
+/// (`Meta::install_hint_from`), so moving the shadows past it changes no
+/// key it holds.
+///
+/// Two shapes, in the caller's transaction, before it opens its
+/// `Local` bracket:
+/// - nothing installed after the shadow touches its keys or the
+///   append's: only the shadow's before-images are restored (the later
+///   rows left those keys alone), and the append goes at the end;
+/// - otherwise every row from the shadow on is rolled back, the
+///   non-shadow rows are redone (fresh `spec_seq`s, their order kept),
+///   and the later shadows are returned for [`redo_after_append_tx`],
+///   which the caller runs once the append's row is recorded.
+///
+/// The shadow is dropped, not stranded: nothing is queued (the append is
+/// its op, completing the rid) and nothing counts as rolled back. `None`:
+/// no live shadow of `rid` here.
+pub(crate) fn unwind_shadow_for_append_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    staged: &UsageTracker,
+    rid: Rid,
+    records: &[LogRecord],
+) -> Result<Option<AppendUnwind>, MetaError> {
+    let Some((shadow_seq, ..)) = shadow_row_for(tx, meta, rid)? else {
+        return Ok(None);
+    };
+    let Some(v) = tx.get(&meta.spec, seq_key(shadow_seq))? else {
+        return Ok(None);
+    };
+    let shadow: SpecRow = postcard::from_bytes(&v)?;
+    let later = read_rows_from(tx, &meta.spec, shadow_seq + 1)?;
+    let shadow_keys: HashSet<&[u8]> = shadow.before.iter().map(|(k, _)| k.as_slice()).collect();
+    let mut touches = incoming_touches(tx, meta, records)?;
+    let theirs = row_touches(tx, meta, &shadow)?;
+    touches.dentries.extend(theirs.dentries);
+    touches.inos.extend(theirs.inos);
+    touches.shared.extend(theirs.shared);
+    let mut overlap = false;
+    for (_, row) in &later {
+        if row
+            .before
+            .iter()
+            .any(|(k, _)| shadow_keys.contains(k.as_slice()))
+            || row_touches(tx, meta, row)?.overlaps(&touches)
+        {
+            overlap = true;
+            break;
+        }
+    }
+    let drop_shadow = |tx: &mut SingleWriterWriteTx| -> Result<(), MetaError> {
+        tx.remove(&meta.spec, seq_key(shadow_seq));
+        tx.remove(&meta.spec_live, seq_key(shadow_seq));
+        counter_add_tx(tx, &meta.local, KV_SPEC_LIVE_COUNT, -1)
+    };
+    let live: HashMap<u64, LiveEntry> = read_live(tx, meta)?.into_iter().collect();
+    if !overlap {
+        let plain = meta.dirty_for_ns();
+        for (key, before) in shadow.before.iter().rev() {
+            restore_key_tx(tx, meta, plain, key, before.as_deref())?;
+        }
+        staged.adjust(-shadow.usage.0, -shadow.usage.1);
+        drop_shadow(tx)?;
+        tracing::debug!(?rid, shadow_seq, "root append replaces its shadow in place");
+        return Ok(Some(AppendUnwind {
+            live,
+            behind: Vec::new(),
+        }));
+    }
+    let plain = meta.dirty_for_ns();
+    for (_, row) in later.iter().rev() {
+        for (key, before) in row.before.iter().rev() {
+            restore_key_tx(tx, meta, plain, key, before.as_deref())?;
+        }
+        staged.adjust(-row.usage.0, -row.usage.1);
+    }
+    for (key, before) in shadow.before.iter().rev() {
+        restore_key_tx(tx, meta, plain, key, before.as_deref())?;
+    }
+    staged.adjust(-shadow.usage.0, -shadow.usage.1);
+    drop_shadow(tx)?;
+    let (behind, ahead): (Vec<_>, Vec<_>) = later
+        .into_iter()
+        .partition(|(_, row)| matches!(row.kind, SpecKind::Shadow { .. }));
+    let none = HashSet::new();
+    let mut out = Stranded::default();
+    for (seq, row) in ahead {
+        redo_row_tx(
+            tx, meta, staged, &live, &none, &mut out, true, seq, row, &none,
+        )?;
+    }
+    tracing::debug!(
+        ?rid,
+        shadow_seq,
+        behind = behind.len(),
+        "root append replaces its shadow under later speculation"
+    );
+    Ok(Some(AppendUnwind { live, behind }))
+}
+
+/// The second half of [`unwind_shadow_for_append_tx`]: redo the shadows
+/// that followed the replaced one, on top of the append's row, under
+/// fresh `spec_seq`s (their order kept).
+pub(crate) fn redo_after_append_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    staged: &UsageTracker,
+    unwind: AppendUnwind,
+) -> Result<(), MetaError> {
+    let none = HashSet::new();
+    let mut out = Stranded::default();
+    for (seq, row) in unwind.behind {
+        redo_row_tx(
+            tx,
+            meta,
+            staged,
+            &unwind.live,
+            &none,
+            &mut out,
+            true,
+            seq,
+            row,
+            &none,
+        )?;
+    }
+    Ok(())
+}
+
 /// See [`Meta::streamed_tip`].
 fn streamed_tip_tx(r: &impl Readable, meta: &Meta, epoch: u64) -> Result<Option<u64>, MetaError> {
     if counter_get(r, &meta.local, KV_SPEC_LIVE_COUNT)? == 0 {

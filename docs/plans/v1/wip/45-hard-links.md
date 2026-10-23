@@ -494,7 +494,7 @@ purpose", "Gates"), with these rows:
 | Harness + xcheckfs (H4) | pending, box | `crates/harness/src/scenarios.rs` |
 | Docs (H5) | | `docs/plans/v1/done/28-…` §P6 note, `docs/reference` |
 
-## 12. Open integrity items (review of the follow-ups, 2026-10-23)
+## 12. Integrity items of the follow-ups review (2026-10-23)
 
 - **O1: a root's append of a delegate's transaction ignores its own live
   shadow of that rid.** `Meta::apply_delegate_tx` dedups a rid by
@@ -515,6 +515,35 @@ purpose", "Gates"), with these rows:
   for a `Local` insertion), or the shadow is adopted as the journaled row.
   Failing tests, ignored: `o1_a_root_appending_*` in
   `crates/meta/tests/speculation.rs`.
+
+  **Closed (2026-10-23).** The root cause: a shadow is keyed by rid in
+  `spec_live` but writes no `completed` row, and `apply_delegate_tx`
+  looked for the rid only in `completed`; nothing on that path asked the
+  speculation log, so the root could not tell its own installed copy of
+  the op from a new op on the same names. Every other apply path keys by
+  rid already: a segment rolls back a shadow it completes and applies in
+  its place (`apply_segment_rows`), the pre-S3 stream adopts it
+  (`install_streamed`), a rebuild queues it for replay by rid, which
+  `completed` dedups. Now `apply_delegate_tx` takes the shadow out by rid
+  (`spec::unwind_shadow_for_append_tx`): when nothing installed after it
+  touches its keys, its before-images alone are restored and the
+  transaction is journaled at the end; otherwise every row from the
+  shadow on is rolled back, the journaled rows (and hints, tailed rows)
+  are redone, the transaction is journaled, and the later shadows are
+  redone on top. That is the log's order at a root, and it keeps
+  captured rows' `spec_seq`s rising with journal order. The shadow is
+  dropped, not stranded. The same change fixes the immediate repeat's
+  other face: appended over its shadow, the row's before-images were the
+  shadow's state, so the root's publish overlay put the unshipped op into
+  a commit ("not the log prefix"). Plan 43 C3 does not prescribe this:
+  its D4 supersedes a shadow the takeover tail carries, C3-1's verbatim
+  append dedups by origin; C3-1's `append_verbatim_tx` must keep this
+  unwind. Tests: the two above, un-ignored, plus
+  `o1_a_root_appending_over_its_own_shadow_takes_the_shadows_place` and
+  `o1_a_root_appending_under_its_own_rows_keeps_the_journal_order`; sim
+  `regression_a_root_appending_over_its_own_shadow_keeps_the_log_prefix`
+  (the new `+stalebase` variant, seven seeds that failed before). The
+  exchange's skip by state stays as replay's tolerance.
 - **O2: the `+links` sim links and exchanges within one directory only**
   (`with_links`' `dir_of` filter). The overlap rules are by inode and so
   directory-blind, but no sweep exercises a cross-directory link, rename or
