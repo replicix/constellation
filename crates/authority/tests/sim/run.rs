@@ -332,21 +332,31 @@ pub struct SimConfig {
     /// are fixed with (and fail on a tree that does not read it); 0 is the
     /// unbudgeted clock of before C7a.
     pub rate_budget_ppm: u32,
-    /// Plan 43 C7a (commit 6, D7): the default clock-fault mix, drawn from
-    /// the seed on a stream of its own (so the existing draws of a seed do
-    /// not move): per node a constant oscillator rate within
-    /// `min(rate_budget_ppm, 1000)`, 0 to 2 wall steps (each at most 150 ms,
-    /// at most 200 ms in sum per node: the cross-node compares take `M/2`
-    /// until C7b), at most one suspend of 0.3 to 3 s (several nodes only) and
-    /// at most one reboot of a node (restart in 0.3 to 3 s on a new boot,
-    /// its wall stepped within the same bound meanwhile; none where
-    /// directories are delegated and locks are taken, which a root's
-    /// restart leaves unanswered: a liveness bug the mix found and does not
-    /// stand for). A configuration
+    /// Plan 43 C7a (commit 6, D7), C7b (commit 9): the default clock-fault
+    /// mix, drawn from the seed on streams of their own (so the existing
+    /// draws of a seed do not move): per node a constant oscillator rate
+    /// within `min(rate_budget_ppm, 1000)` and a constant wall offset in
+    /// `[-2 TTL, +2 TTL]` (`gen_clock_offsets`); 0 to 2 wall steps (each at
+    /// most 10 s, at most 10 s in sum per node: no cross-node compare assumes
+    /// an offset bound since C7b); at most one suspend of 0.3 to 3 s (several
+    /// nodes only) and at most one reboot of a node (restart in 0.3 to 3 s on
+    /// a new boot, its wall stepped within the same bound meanwhile). Where
+    /// directories are delegated and locks taken, the lock cut and barriers
+    /// across a delegation still compare walls (rows 9 and 30, C7b's commit
+    /// 8 after C4): no offsets there, steps at most 150 ms and 200 ms in sum
+    /// per node (`mix_step_bound_ms`). A configuration
     /// that injects clock faults, skew, offsets or rates of its own, or sets
     /// `live_holder` (no seal allowed), is left as it is, whatever this says;
     /// one that asserts exact timing sets `false`.
     pub clock_faults: bool,
+    /// Plan 43 C7b (commit 9): the default mix's constant per-node wall
+    /// offsets (`gen_clock_offsets`); `false` leaves them out (a tuning
+    /// knob: `AUTHORITY_SIM_MIX_OFFSETS=0` on `sweep_config`).
+    pub clock_mix_offsets: bool,
+    /// Plan 43 C7b (commit 9): the most a wall step of the default mix
+    /// takes, and the most a node's steps add up to, in ms
+    /// (`AUTHORITY_SIM_MIX_STEP_MS` on `sweep_config`).
+    pub clock_mix_step_ms: i64,
     /// Plan 43 C7a: `(node, ppm)`: that node's oscillator runs at
     /// `1 + ppm/1e6` of true time from the start (its wall does not).
     pub node_rates: Vec<(NodeId, i64)>,
@@ -824,6 +834,8 @@ impl Default for SimConfig {
             clock_offsets: Vec::new(),
             rate_budget_ppm: 1_000,
             clock_faults: true,
+            clock_mix_offsets: true,
+            clock_mix_step_ms: 10_000,
             node_rates: Vec::new(),
             wall_follows_rate: false,
             suspend_accounting_short_ms: 0,
@@ -1241,15 +1253,26 @@ impl Cluster {
             })
             .min()
             .unwrap_or(now);
+        // The expiry is a stamp of the holder's HONOUR clock (C7-H1): in true
+        // time (this check's `now`) it is that less how far the holder's honour
+        // reading stands above true time, its offset and its forward steps (a
+        // backward step moves it not at all). Plan 43 C7b, commit 9: the
+        // default mix offsets nodes by up to 2 TTL.
+        let honour_error = if ids.contains(&lease.holder) {
+            self.get(lease.holder).clock.peek_honour().0 - now
+        } else {
+            0
+        };
+        let expires_true = lease.expires_unix_ms - honour_error;
         // Nobody else may claim a `Backup` lease before its expiry plus
         // the backups' grace (`LeaseState::classify`).
         let claimable_by_others = if lease.ack_policy == constellation_store_s3::AckPolicy::Backup
             && !lease.backups.is_empty()
         {
-            lease.expires_unix_ms
+            expires_true
                 + constellation_authority::core::backup_claim_grace_ms(&(self.env.config)(node, 0))
         } else {
-            lease.expires_unix_ms
+            expires_true
         };
         if first_back > claimable_by_others {
             self.budget_exceeded.lock().unwrap().push(format!(
@@ -2224,6 +2247,51 @@ fn injects_clock_faults(cfg: &SimConfig) -> bool {
         })
 }
 
+/// Plan 43 C7b (commit 9): the largest wall step the default mix draws, and
+/// the most a node's steps add up to, in ms. Since C7b no cross-node compare
+/// assumes an offset bound, so a step is limited by what the run can take
+/// (ten seconds: longer than a lease's TTL); where directories are delegated
+/// and locks taken, the lock cut and the barriers across a delegation
+/// (plan 43 Appendix B rows 9 and 30) still compare walls until C7b's
+/// commit 8 (after C4), and the steps and offsets stay within the margin's
+/// half as C7a left them.
+pub fn mix_step_bound_ms(cfg: &SimConfig) -> (i64, i64) {
+    if offsets_wait_for_the_root_anchored_cut(cfg) {
+        (150, 200)
+    } else {
+        (cfg.clock_mix_step_ms, cfg.clock_mix_step_ms)
+    }
+}
+
+/// Whether the configuration has a lock cut or barriers across a delegation
+/// (rows 9 and 30: C7b's commit 8, after C4).
+fn offsets_wait_for_the_root_anchored_cut(cfg: &SimConfig) -> bool {
+    !cfg.dirs.is_empty() && cfg.lock_files > 0
+}
+
+/// Plan 43 C7b (commit 9): the default mix's constant clock offsets of one
+/// run: every node's wall off by a draw in `[-2 TTL, +2 TTL]` (the lease's TTL
+/// from the configuration), from a stream of its own so the draws of
+/// [`gen_clock_mix`] and `gen_faults` do not move. Empty where the mix is
+/// off (a configuration with clock faults, skew, offsets or rates of its own,
+/// or `clock_faults: false`) and where the lock cut still compares walls
+/// across a delegation (see [`mix_step_bound_ms`]).
+pub fn gen_clock_offsets(cfg: &SimConfig, seed: u64) -> Vec<(NodeId, i64)> {
+    if !cfg.clock_faults
+        || !cfg.clock_mix_offsets
+        || cfg.nodes == 0
+        || injects_clock_faults(cfg)
+        || offsets_wait_for_the_root_anchored_cut(cfg)
+    {
+        return Vec::new();
+    }
+    let mut rng = StdRng::seed_from_u64(seed ^ 0xC7B0_0FF5);
+    let ttl = (cfg.core)(1, 1).ttl_ms as i64;
+    (1..=cfg.nodes)
+        .map(|n| (n, rng.random_range(-2 * ttl..=2 * ttl)))
+        .collect()
+}
+
 /// Plan 43 C7a (commit 6): the default clock-fault mix of one run
 /// ([`SimConfig::clock_faults`]): the nodes' constant rates and the timed
 /// faults. Drawn from a stream of its own, seeded from the run's, so the
@@ -2245,14 +2313,15 @@ pub fn gen_clock_mix(
             rates.push((n, rng.random_range(-budget..=budget)));
         }
     }
+    let (step_max, sum_max) = mix_step_bound_ms(cfg);
     let at = |rng: &mut StdRng| rng.random_range(500..horizon_ms.max(600));
-    // The steps in force per node, cumulative: |sum| <= 200 ms.
+    // The steps in force per node, cumulative: |sum| <= `sum_max`.
     let mut stepped: BTreeMap<NodeId, i64> = BTreeMap::new();
     let mut step = |rng: &mut StdRng, node: NodeId| -> i64 {
         let cur = stepped.entry(node).or_default();
         let ms = rng
-            .random_range(-150..=150i64)
-            .clamp(-200 - *cur, 200 - *cur);
+            .random_range(-step_max..=step_max)
+            .clamp(-sum_max - *cur, sum_max - *cur);
         *cur += ms;
         ms
     };
@@ -3327,6 +3396,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // Plan 43 C7a (commit 6): the default clock-fault mix.
     let horizon = cfg.ops_per_client * 400 + 2_000;
     let (mix_rates, mix_faults) = gen_clock_mix(&cfg, seed, horizon);
+    // Plan 43 C7b (commit 9): and the nodes' constant offsets.
+    let mix_offsets = gen_clock_offsets(&cfg, seed);
     let env = NodeEnv {
         bucket: bucket.clone(),
         bus: bus.clone(),
@@ -3337,7 +3408,12 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         panic_after_events: cfg.panic_after_events,
         fast_path: cfg.fast_path,
         clock_skew_ms: cfg.clock_skew_ms,
-        clock_offsets: cfg.clock_offsets.clone(),
+        clock_offsets: cfg
+            .clock_offsets
+            .iter()
+            .copied()
+            .chain(mix_offsets)
+            .collect(),
         clocks: Mutex::new(HashMap::new()),
         rate_budget_ppm: cfg.rate_budget_ppm,
         node_rates: cfg.node_rates.iter().copied().chain(mix_rates).collect(),

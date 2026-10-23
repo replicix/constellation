@@ -1442,7 +1442,8 @@ fn long_random() {
 }
 
 /// Plan 30 §M8: the long configuration with `cto=strict` reads (0.6 per
-/// op), ±200 ms clock skew and 2 % P2P loss:
+/// op) and the default clock mix (since C7b's commit 9 offsets up to two
+/// TTLs and steps up to 10 s; it was a seeded skew of ±200 ms before):
 /// `cargo test -p constellation-authority --release --test sim -- --ignored long_strict`
 /// (`AUTHORITY_SIM_SEEDS`, `AUTHORITY_SIM_START`; replay one with
 /// `AUTHORITY_SIM_CONFIG=long-strict`).
@@ -1450,7 +1451,6 @@ fn long_strict_config() -> SimConfig {
     SimConfig {
         read_ratio: 0.6,
         strict: true,
-        clock_skew_ms: 200,
         ..long_config()
     }
 }
@@ -2881,20 +2881,27 @@ mod pinned {
     }
 }
 
-/// Plan 43 C7a (commit 6): the default clock-fault mix of a run is drawn from
-/// the seed on a stream of its own: the same every time, every rate within
-/// the production budget, every step within 150 ms and 200 ms in sum per
-/// node (the reboot's included), every suspend 0.3 to 3 s and on a
-/// cluster only, every reboot's restart 0.3 to 3 s; and a configuration
-/// that injects clock faults, skew, offsets or rates of its own, or opts
-/// out, is left alone. Over 600 seeds each kind of fault occurs (a mix that
-/// drew nothing would pass every sweep for no reason).
+/// Plan 43 C7a (commit 6), C7b (commit 9): the default clock-fault mix of a
+/// run is drawn from the seed on streams of its own: the same every time,
+/// every rate within the production budget, every step within 10 s and 10 s in
+/// sum per node (the reboot's included), every node's constant offset within
+/// two lease TTLs, every suspend 0.3 to 3 s and on a cluster only, every
+/// reboot's restart 0.3 to 3 s; and a configuration that injects clock
+/// faults, skew, offsets or rates of its own, or opts out, is left alone.
+/// Where directories are delegated and locks taken (the lock cut across a
+/// delegation still compares walls until C7b's commit 8) the steps stay within
+/// 150 ms and 200 ms in sum and there are no offsets. Over 600 seeds each kind
+/// of fault occurs (a mix that drew nothing would pass every sweep for no
+/// reason), the offsets reach beyond a TTL, and the offsets and steps are
+/// beyond the margin (500 ms) for some seeds.
 #[test]
 fn the_default_clock_mix_is_bounded_deterministic_and_leaves_explicit_clock_faults_alone() {
-    use sim::run::{gen_clock_mix, FaultKind, StepOf};
+    use sim::run::{gen_clock_mix, gen_clock_offsets, FaultKind, StepOf};
     let cfg = SimConfig::default();
     assert!(cfg.clock_faults && cfg.rate_budget_ppm == 1_000);
+    let ttl = (cfg.core)(1, 1).ttl_ms as i64;
     let (mut steps, mut suspends, mut reboots, mut nonzero_rates) = (0, 0, 0, 0);
+    let (mut big_steps, mut big_offsets, mut beyond_ttl) = (0, 0, 0);
     for seed in 0..600u64 {
         let (rates, faults) = gen_clock_mix(&cfg, seed, 5_000);
         let again = gen_clock_mix(&cfg, seed, 5_000);
@@ -2903,6 +2910,15 @@ fn the_default_clock_mix_is_bounded_deterministic_and_leaves_explicit_clock_faul
             format!("{:?}", (&again.0, &again.1)),
             "seed {seed}: the mix is not a function of the seed"
         );
+        let offsets = gen_clock_offsets(&cfg, seed);
+        assert_eq!(offsets, gen_clock_offsets(&cfg, seed));
+        assert_eq!(offsets.len(), cfg.nodes as usize);
+        for (n, ms) in &offsets {
+            assert!((1..=cfg.nodes).contains(n));
+            assert!(ms.abs() <= 2 * ttl, "seed {seed}: an offset of {ms} ms");
+            big_offsets += usize::from(ms.abs() > 500);
+            beyond_ttl += usize::from(ms.abs() > ttl);
+        }
         assert_eq!(rates.len(), cfg.nodes as usize);
         for (_, ppm) in &rates {
             assert!(ppm.abs() <= 1_000, "seed {seed}: a rate of {ppm} ppm");
@@ -2916,7 +2932,11 @@ fn the_default_clock_mix_is_bounded_deterministic_and_leaves_explicit_clock_faul
                     who: StepOf::Node(n),
                     ms,
                 } => {
-                    assert!(ms != 0 && ms.abs() <= 150, "seed {seed}: a step of {ms} ms");
+                    assert!(
+                        ms != 0 && ms.abs() <= 10_000,
+                        "seed {seed}: a step of {ms} ms"
+                    );
+                    big_steps += usize::from(ms.abs() > 500);
                     *stepped.entry(n).or_default() += ms;
                     steps += 1;
                 }
@@ -2938,12 +2958,20 @@ fn the_default_clock_mix_is_bounded_deterministic_and_leaves_explicit_clock_faul
             }
         }
         for (n, sum) in stepped {
-            assert!(sum.abs() <= 200, "seed {seed}: node {n} stepped {sum} ms");
+            assert!(
+                sum.abs() <= 10_000,
+                "seed {seed}: node {n} stepped {sum} ms"
+            );
         }
     }
     assert!(
         steps > 100 && suspends > 100 && reboots > 100 && nonzero_rates > 1_000,
         "a thin mix: {steps} steps, {suspends} suspends, {reboots} reboots, {nonzero_rates} rates"
+    );
+    assert!(
+        big_steps > 50 && big_offsets > 1_000 && beyond_ttl > 500,
+        "a mix inside the margin: {big_steps} steps, {big_offsets} offsets beyond 500 ms, \
+         {beyond_ttl} beyond a TTL"
     );
     // One node: no suspend (nothing to catch up with). No budget: no rate.
     let one = SimConfig {
@@ -2959,26 +2987,51 @@ fn the_default_clock_mix_is_bounded_deterministic_and_leaves_explicit_clock_faul
         ..SimConfig::default()
     };
     assert!((0..50u64).all(|s| gen_clock_mix(&none, s, 5_000).0.is_empty()));
-    // Delegated directories, with locks taken or not: the same draws, a
-    // reboot included (the opt-outs that hid the delegate-restart wedge
-    // and the lock waiter a root's restart left unanswered are gone with
-    // their fixes).
+    // Delegated directories without locks: the same draws as the plain
+    // configuration, a reboot included.
     let delegating = SimConfig {
         dirs: vec!["d1".into(), "d2".into()],
         ..SimConfig::default()
     };
+    for seed in 0..200u64 {
+        let (r0, f0) = gen_clock_mix(&cfg, seed, 5_000);
+        let (r, f) = gen_clock_mix(&delegating, seed, 5_000);
+        assert_eq!(r0, r);
+        assert_eq!(format!("{f0:?}"), format!("{f:?}"));
+        assert_eq!(
+            gen_clock_offsets(&cfg, seed),
+            gen_clock_offsets(&delegating, seed)
+        );
+    }
+    // Delegated directories with locks taken (rows 9 and 30, until commit 8):
+    // no offsets, steps within the margin's half as before C7b's commit 9.
     let locking = SimConfig {
         lock_files: 2,
         ..delegating.clone()
     };
-    for seed in 0..200u64 {
-        let (r0, f0) = gen_clock_mix(&cfg, seed, 5_000);
-        for other in [&delegating, &locking] {
-            let (r, f) = gen_clock_mix(other, seed, 5_000);
-            assert_eq!(r0, r);
-            assert_eq!(format!("{f0:?}"), format!("{f:?}"));
+    let mut locking_steps = 0;
+    for seed in 0..300u64 {
+        assert!(gen_clock_offsets(&locking, seed).is_empty());
+        let mut stepped = std::collections::BTreeMap::<u64, i64>::new();
+        for f in gen_clock_mix(&locking, seed, 5_000).1 {
+            match f.kind {
+                FaultKind::ClockStep {
+                    who: StepOf::Node(n),
+                    ms,
+                } => {
+                    assert!(ms.abs() <= 150, "seed {seed}: a step of {ms} ms");
+                    *stepped.entry(n).or_default() += ms;
+                    locking_steps += 1;
+                }
+                FaultKind::RebootNode { node, step_ms, .. } => {
+                    *stepped.entry(node).or_default() += step_ms;
+                }
+                _ => {}
+            }
         }
+        assert!(stepped.values().all(|s| s.abs() <= 200), "seed {seed}");
     }
+    assert!(locking_steps > 50);
     // Opt-outs and explicit injections: nothing drawn.
     let step = ScheduledFault {
         at_ms: 1_000,
@@ -3011,6 +3064,7 @@ fn the_default_clock_mix_is_bounded_deterministic_and_leaves_explicit_clock_faul
     ] {
         let (rates, faults) = gen_clock_mix(&cfg, 7, 5_000);
         assert!(rates.is_empty() && faults.is_empty());
+        assert!(gen_clock_offsets(&cfg, 7).is_empty());
     }
 }
 
@@ -5334,6 +5388,19 @@ fn sweep_config() {
         // `AUTHORITY_SIM_BUDGET=0` the runs read as before the commit).
         if std::env::var("AUTHORITY_SIM_CLOCK_FAULTS").is_ok_and(|v| v == "0") {
             c.clock_faults = false;
+        }
+        // Plan 43 C7b (commit 9): for telling which part of the mix a failure
+        // needs: `AUTHORITY_SIM_MIX_OFFSETS=0` draws no constant offsets,
+        // `AUTHORITY_SIM_MIX_STEP_MS=<ms>` bounds the wall steps (and their
+        // sum per node) by that.
+        if std::env::var("AUTHORITY_SIM_MIX_OFFSETS").is_ok_and(|v| v == "0") {
+            c.clock_mix_offsets = false;
+        }
+        if let Some(ms) = std::env::var("AUTHORITY_SIM_MIX_STEP_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            c.clock_mix_step_ms = ms;
         }
         if let Some(b) = std::env::var("AUTHORITY_SIM_BUDGET")
             .ok()
