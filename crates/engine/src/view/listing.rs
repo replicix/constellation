@@ -1360,9 +1360,13 @@ impl View {
     }
 }
 
-impl Drop for View {
-    /// A view that goes away lets go of what its streams pinned.
-    fn drop(&mut self) {
+impl View {
+    /// Every stream of this view is closed: its frontend is gone (no
+    /// `RELEASEDIR` will come for them, `Engine::close_view`) or the view
+    /// itself is. What they pinned is let go of. A later `RELEASEDIR` or
+    /// page on one of their ids finds no stream (nothing to pin, nothing
+    /// to free).
+    pub(crate) fn release_dir_streams(&self) {
         let live = std::mem::take(
             &mut self
                 .dir_streams
@@ -1374,6 +1378,13 @@ impl Drop for View {
         for (id, dir) in live {
             self.listing.close_stream(dir, (self.dir_streams.owner, id));
         }
+    }
+}
+
+impl Drop for View {
+    /// A view that goes away lets go of what its streams pinned.
+    fn drop(&mut self) {
+        self.release_dir_streams();
     }
 }
 

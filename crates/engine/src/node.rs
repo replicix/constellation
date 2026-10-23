@@ -2081,6 +2081,9 @@ impl Engine {
         // the last `Arc<View>` happens to die (plan 38 §3(c)).
         view.drop_all_passthrough();
         view.drop_all_zero_copy();
+        // Nor a `RELEASEDIR` for its open directories: their listing pins
+        // (node-wide, plan 40 §4.9) go now too.
+        view.release_dir_streams();
         if let Some(k) = &self.kernel_inval {
             k.unregister(id);
         }
@@ -3145,6 +3148,83 @@ mod tests {
             "no views once shutting down"
         );
         assert_eq!(engine.shutdown_error(), None);
+    }
+
+    /// Plan 40 §4.9: a view whose frontend is gone (the kernel aborted the
+    /// connection, the mount ended) gets no `RELEASEDIR` for the
+    /// directories it had open. `close_view` lets go of their listing pins
+    /// in the node-wide `Listing` then, not whenever the last `Arc<View>`
+    /// dies: other views' pages of those directories stop being pinned.
+    #[test]
+    fn close_view_lets_go_of_the_views_open_directory_streams() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = format!("file://{}/backend", root.path().display());
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        create_fs(&rt, &backend);
+        let engine = Engine::start(
+            config(&rt, &backend, root.path().join("state")),
+            HostServices::native(),
+            offline(),
+        )
+        .expect("Engine::start");
+        let caps = FrontendCaps::linux_fuse(engine.locks_cluster());
+        let view = engine
+            .open_view(ViewSpec::new("/"), caps.clone(), DeferredEvents::new())
+            .unwrap();
+        let other = engine
+            .open_view(ViewSpec::new("/"), caps, DeferredEvents::new())
+            .unwrap();
+        let caller = Caller::root();
+        let cx = |kind| OpCtx::new(kind, &caller);
+        let d =
+            Blocking::run(|r| view.mkdir(&cx(OpKind::Mkdir), ROOT_INO, Name::new("d"), 0o755, r))
+                .unwrap()
+                .attr
+                .ino;
+        for i in 0..20 {
+            let name = format!("f{i:02}");
+            Blocking::run(|r| {
+                view.create(
+                    &cx(OpKind::Create),
+                    d,
+                    Name::new(&name),
+                    0o644,
+                    OpenFlags::READ,
+                    OpenOwner::NONE,
+                    r,
+                )
+            })
+            .unwrap();
+        }
+        let fh = Blocking::run(|r| view.opendir(&cx(OpKind::Opendir), d, r)).unwrap();
+        let page = |v: &View, fh: constellation_vfs::Fh| {
+            let (sink, wait) = constellation_vfs::CollectDir::pair(8);
+            v.readdir(&cx(OpKind::Readdir), d, fh, 0, false, sink);
+            wait.wait().unwrap()
+        };
+        assert!(page(&view, fh).len() > 2);
+        // Another view's listing of the directory is pinned by the open
+        // stream too.
+        page(&other, constellation_vfs::Fh(0));
+        let stats = engine.listing.stats();
+        assert_eq!(stats.open_streams, 1, "{stats:?}");
+        assert!(stats.pinned_bytes > 0, "{stats:?}");
+        // The frontend is gone; `view` itself is still referenced.
+        engine.close_view(&view);
+        let stats = engine.listing.stats();
+        assert_eq!(stats.open_streams, 0, "{stats:?}");
+        assert_eq!(stats.pinned_dirs, 0, "{stats:?}");
+        assert_eq!(stats.pinned_bytes + stats.exempt_bytes, 0, "{stats:?}");
+        // A late `RELEASEDIR` on the id is nothing.
+        Blocking::run(|r| view.releasedir(&cx(OpKind::Releasedir), d, fh, r)).unwrap();
+        assert_eq!(engine.listing.stats().open_streams, 0);
+        drop(view);
+        assert!(engine.close_view(&other));
+        engine.shutdown().expect("a clean shutdown");
     }
 
     /// Two P2P engines on one backend, `a` with a pooled connection to
