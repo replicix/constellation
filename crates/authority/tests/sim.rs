@@ -4977,6 +4977,8 @@ fn sweep_config() {
         "locks-core-stall-backup" => locks_core_stall_backup_config(),
         "locks-core-stall-backup-beats" => locks_core_stall_backup_beats_config(),
         "locks-core-stall-backup-unfresh" => locks_core_stall_backup_unfresh_config(),
+        "locks-core-stall-backup-long" => locks_core_stall_backup_long_config(),
+        "locks-core-stall-backup-long-unfresh" => locks_core_stall_backup_long_unfresh_config(),
         "locks-core-stall-s3" => locks_core_stall_s3_config(),
         "locks-core-stall-writes" => locks_core_stall_writes_config(),
         "locks-core-stall-blips" => locks_core_stall_blips_config(),
@@ -8502,6 +8504,36 @@ fn locks_core_stall_backup_unfresh_config() -> SimConfig {
     }
 }
 
+/// [`locks_core_stall_backup_config`] on a 30 s root lease, its holder's core
+/// stuck 8 s: the cap (the lease's usable end) lies past the successor's
+/// floor, so the freshness rule, not the cap, is what keeps the lane's own
+/// renewals inside what a sealing successor waits out (with the 6 s lease
+/// the cap ends them first).
+fn locks_core_stall_backup_long_config() -> SimConfig {
+    let stall = |at_ms, node, for_ms| ScheduledFault {
+        at_ms,
+        kind: FaultKind::StallStep { node, for_ms },
+    };
+    SimConfig {
+        core: std::sync::Arc::new(|node, incarnation| {
+            let mut c = sim::run::backup_core_config(node, incarnation);
+            c.ttl_ms = 30_000;
+            c
+        }),
+        faults: vec![stall(1_500, 0, 8_000), stall(14_000, 0, 8_000)],
+        ..locks_core_stall_backup_config()
+    }
+}
+
+/// [`locks_core_stall_backup_long_config`] with the lane ignoring the
+/// freshness rule: the non-vacuity of the rule where the cap does not mask it.
+fn locks_core_stall_backup_long_unfresh_config() -> SimConfig {
+    SimConfig {
+        lock_lane_ignores_freshness: true,
+        ..locks_core_stall_backup_long_config()
+    }
+}
+
 /// `ack=s3`: a subscriber takes the lease over after the core's silence
 /// (the stream heartbeat is a core timer). Safety only; the lane is not
 /// expected to add anything here.
@@ -10850,7 +10882,11 @@ fn locks_writer_hold_delegated_settles_before_the_head() {
 #[test]
 fn locks_writer_hold_delegated_without_the_settle_is_caught() {
     use pinned::run_seed;
-    let seeds = [745, 1081, 1282, 2045, 2369];
+    // (745, 1081, 1282, 2045 and 2369, whose trajectories plan 41 L2's lock
+    // lane shifted to no held write inside the next holder's section, gave their
+    // places to 940 and 1246, the two of seeds 0 to 3 000 that now show it,
+    // with the settle clean on both.)
+    let seeds = [940, 1246];
     let mut caught = 0;
     for seed in seeds {
         if let Err(e) = run_seed(seed, locks_writer_hold_delegated_unsettled_config()) {
@@ -10944,6 +10980,21 @@ fn locks_survive_stalled_steps() {
         assert!(t.grants > 300, "{label}: {t:?}");
         assert!(t.clients.turn_reads > 0, "{label}: {t:?}");
     }
+}
+
+/// Plan 41 review: the sim's non-vacuity of the lane's freshness rule. On the
+/// 6 s lease of `locks-core-stall-backup-unfresh` the cap ends the lane's own
+/// renewals before a sealing successor's floor (0 of 200 seeds fail); on a
+/// 30 s lease the rule is what keeps them inside it: a lane that ignores it
+/// renews the stalled holder's grant through the successor's grant (seed 44,
+/// found by the sweep of 200), and the design is clean on the same seed.
+#[test]
+fn the_lanes_freshness_rule_is_load_bearing_on_a_long_lease() {
+    let e = run_seed(44, locks_core_stall_backup_long_unfresh_config())
+        .expect_err("locks-core-stall-backup-long-unfresh seed 44 must fail");
+    assert!(e.contains("mutual exclusion violated"), "seed 44: {e}");
+    run_seed(44, locks_core_stall_backup_long_config())
+        .unwrap_or_else(|e| panic!("locks-core-stall-backup-long seed 44: {e}"));
 }
 
 /// A run leaves nothing behind: its bus, and with it every node's `Meta`
@@ -12454,8 +12505,11 @@ const I4_SEEDS: &[I4Seeds] = &[(
     // to no late landing, gave its place to 15: 2 late landings, `+settle`
     // fails with I4. 1, 8 and 15, whose trajectories plan 43 C1-1's
     // listed-acknowledgement count shifted to none, gave their places to
-    // 17, 19 and 114: 1, 1 and 2 late landings.)
-    &[17, 19, 114],
+    // 17, 19 and 114: 1, 1 and 2 late landings. Those three, whose
+    // trajectories plan 41 R2's early renewal resend shifted to none, gave
+    // their places to 40, 43 and 69: 2, 2 and 1 late landings, `+settle`
+    // fails with I4; 24 of seeds 0 to 300 qualify.)
+    &[40, 43, 69],
 )];
 
 /// Plan 45 follow-up: hard links (`NsOp::Link`) and exchanges
