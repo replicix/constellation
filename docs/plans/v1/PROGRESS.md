@@ -58498,3 +58498,16 @@ watch. Harness at L0, seed 42, a debug build: `kernel-race-dir-nlink`,
 `-dir-version`, `-rename-ctime`, `-dir-version-remote` and
 `-dir-ttl-strict-lone`, each on both transports: PASSED (0 mismatches, 0 stale
 of 20).
+
+Review (plan 40 P6a): re-measured on a quiet 16-core box (load below 6), the
+same test, ABBA, 16 runs each, medians: four threads 363 against 366 ns,
+eight 1 089 against 1 108 (the +14 % at four threads above was the shared
+box), but one thread a consistent 116 against 112 (ranges 114-117 against
+111-114). Not the record's layout (a 24-byte record, the rest of the set
+boxed, measured 117) nor the extra id check: `replying` went through the
+body it now shares with `replying_each` and mapped a `Replying`, and once
+`replying` has a body of its own the compiler outlines `mark` and `index`
+from both callers (117 again). `replying` keeps its own body with `mark`,
+`index` and the post-mark check inlined (`#[inline(always)]`): 113 against
+112 (ranges 112-116 against 111-117), four threads 372 against 373, eight
+1 064 against 1 109, the same rotation with the commit before it at 116.

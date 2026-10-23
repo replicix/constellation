@@ -287,6 +287,8 @@ pub(crate) enum Replying {
     /// The inode is marked; nothing to write first.
     Clear,
     /// Write the notice for the inode before the reply, then release.
+    // Read by plan 40 P6, `replying_each`'s caller.
+    #[allow(dead_code)]
     Notice(Found),
     /// No room for another mark: leave the inode out of the reply.
     Full,
@@ -433,13 +435,18 @@ impl AttrWatch {
     /// since the request arrived, or the table of marks is full. The marks
     /// of `ino`, to [`Self::release`] once the notice is written.
     pub(crate) fn replying(&self, a: Arrival, ino: Ino) -> Option<Found> {
-        match self.reply(a, ino, false) {
-            Replying::Clear => None,
-            Replying::Notice(found) => Some(found),
+        // The hot path (every GETATTR, LOOKUP and entry reply): its own
+        // body, with `mark` and `index` inlined, as before `replying_each`
+        // (through a shared body that maps a `Replying`, one thread's
+        // request and reply cost 116 ns against 112).
+        let t = a.track?;
+        if !self.mark(t.tid, ino, false) {
+            self.full.fetch_add(1, Ordering::Relaxed);
             // The notice discharges the inode's marks too: room for the
             // next reply.
-            Replying::Full => Some(self.find(&[ino]).1),
+            return Some(self.find(&[ino]).1);
         }
+        self.changed_since(t, ino)
     }
 
     /// The request replies with the attributes of several inodes, one call
@@ -452,30 +459,39 @@ impl AttrWatch {
     // Plan 40 P6 (`READDIRPLUS`) is the caller.
     #[allow(dead_code)]
     pub(crate) fn replying_each(&self, a: Arrival, ino: Ino) -> Replying {
-        self.reply(a, ino, true)
-    }
-
-    fn reply(&self, a: Arrival, ino: Ino, each: bool) -> Replying {
         let Some(t) = a.track else {
             return Replying::Clear;
         };
-        if !self.mark(t.tid, ino, each) {
+        if !self.mark(t.tid, ino, true) {
             self.full.fetch_add(1, Ordering::Relaxed);
             return Replying::Full;
         }
+        match self.changed_since(t, ino) {
+            Some(found) => Replying::Notice(found),
+            None => Replying::Clear,
+        }
+    }
+
+    /// After the mark (store buffering, module doc): the marks of `ino`
+    /// when a change of it was recorded since the request arrived.
+    #[inline(always)]
+    fn changed_since(&self, t: Tracked, ino: Ino) -> Option<Found> {
         fence(Ordering::SeqCst);
         if self.changes.seq.load(Ordering::Acquire) == t.seq {
-            return Replying::Clear;
+            return None;
         }
         if self.changes.touched_since(t.seq, ino) {
-            return Replying::Notice(self.find(&[ino]).1);
+            return Some(self.find(&[ino]).1);
         }
-        Replying::Clear
+        None
     }
 
     /// Records the reply of `tid` for `ino` (`each`: in the set of the
     /// task's current request); `false` when the table is full and
     /// sweeping exited tasks did not make room.
+    // Inlined (with `index`) into both callers: with two of them the
+    // compiler outlines it, a call more on the hot path.
+    #[inline(always)]
     fn mark(&self, tid: u32, ino: Ino, each: bool) -> bool {
         let key = if tid == 0 {
             ANONYMOUS | self.anonymous.fetch_add(1, Ordering::Relaxed)
@@ -584,6 +600,7 @@ impl AttrWatch {
 
     /// Adds the mark to its inode's index. Returns the pid-0 marks of the
     /// inode it supersedes.
+    #[inline(always)]
     fn index(&self, key: u64, mark: Mark) -> Vec<(u64, u64)> {
         let mut shard = self.inode_shard(mark.ino).lock().unwrap();
         let mut superseded = Vec::new();

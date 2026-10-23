@@ -285,6 +285,11 @@ shared; the previous build, same test, back to back, two runs each):
 404 / 406), 8 threads 1 116 / 1 053 ns (previous 1 305 / 1 252). Equal at one
 thread, faster under contention (cache-line padded shards).
 
+Plan 40 P6a (a task's marks are a set of inodes): the same test on a quiet
+16-core box (load below 6), against the build before, ABBA, 16 runs each,
+medians: 1 thread 113 / 112 ns, 4 threads 372 / 373 ns, 8 threads
+1 064 / 1 109 ns. Within noise.
+
 Pruning: sweeping a full table of 32 768 marks of tasks that no longer exist
 takes 3 to 8 ms (about 0.1 to 0.25 us per mark: one `kill(2)` each, outside
 the shard locks; at most once per 100 ms, so below 8 % of a thread even
