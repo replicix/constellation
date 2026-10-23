@@ -210,6 +210,26 @@ PHASES: dict[str, dict] = {
         ],
         "seeds": [42, 43, 44],
     },
+    # Plan 43 C7b: offsets between the nodes' clocks far beyond the old
+    # +-500 ms margin (the harness's cap is gone; one day is its sanity
+    # bound). Every node 5 s ahead (nothing between the nodes, but the
+    # wall against S3's and the harness's), a 5 s spread (a node 5 s ahead
+    # beside one 5 s behind: 10 s apart, beyond the 3 s lock TTL some of
+    # these scenarios run with), and node b a minute behind.
+    "clock-offset": {
+        "scenarios": [
+            "lock-contention-paused-holder",
+            "delegate-paused-across-ttl",
+            "git-under-flock-causal",
+            "visibility-s3-latency",
+        ],
+        "profiles": [
+            "clock:5000",
+            "clock:spread:5000",
+            "clock:-60000@b",
+        ],
+        "seeds": [42, 43, 44],
+    },
     "known-bugs": {
         "scenarios": ["stress-ng-fs-nodes", "stress-ng-fs-faults", "chaos-ci"],
         "profiles": ["baseline", "cpu25", "hogs", "runtime-hog", "net-flap", "s3-jitter"],

@@ -17,7 +17,7 @@
 //! | `runtime-hog:<n>:<ms>[:<gap_ms>]` | `CONSTELLATION_FAULT_RUNTIME_HOG` |
 //! | `s3:latency:<ms>:<jitter>` / `s3:bandwidth:<kBps>` / `s3:slicer:<bytes>:<delay_us>` / `s3:blackhole:<ms>[:<at_ms>]` | toxics on the S3 path of every client |
 //! | `net:<netem args...>` / `net:flap[:<netem args...>]` | `tc netem` on the daemon's own P2P (UDP) ports on `lo`; flap: loss 100 % for 2 s every 10 s |
-//! | `clock:<±ms>` / `clock:spread:<ms>` | `CONSTELLATION_FAULT_CLOCK_OFFSET_MS` (within ±500 ms); spread alternates `+ms`, `-ms` across nodes |
+//! | `clock:<±ms>` / `clock:spread:<ms>` | `CONSTELLATION_FAULT_CLOCK_OFFSET_MS` (any offset up to one day, [`MAX_CLOCK_OFFSET_MS`]: since plan 43 C7b no cross-node compare assumes an offset bound, only a rate bound per node); spread alternates `+ms`, `-ms` across nodes |
 //! | `clock:step:<±ms>:<at_ms>[@node]` | at `<at_ms>` after the daemon spawned, the daemon's protocol wall clock steps by `<ms>` (`CONSTELLATION_FAULT_CLOCK_STEP_FILE`; plan 43 C7-H1): the honour clock follows a forward step, a backward one and the wait clock move nothing; the steps are cumulative per node, armed once per node and kept across a daemon restart (a restarted daemon starts stepped; the step is not applied again) |
 //! | `clock:rate:<±ppm>[:unbudgeted][@node]` | the daemon's boot, raw and monotonic clocks run at `1 + ppm/1e6` of the host's rate from its start, its wall does not (`CONSTELLATION_FAULT_CLOCK_RATE_PPM`; plan 43 C7a): an oscillator off by `ppm` under a disciplined wall. Unless `:unbudgeted`, the node's rate budget is raised to cover it (`CONSTELLATION_CLOCK_RATE_BUDGET_PPM = max(1000, |ppm|)`; each node budgets its own oscillator); `|ppm| < 500000`. The clocks scale WAIT by `1/(1+ρ)` and HONOUR by `1/(1−ρ)` of it (C7a); `:unbudgeted` is the stress run, an oscillator beyond the budget |
 //! | `reboot[@node]` | the daemon's restarts are reboots (plan 43 C7a): every spawn after its first starts on a new boot id (`CONSTELLATION_FAULT_BOOT_ID`), as a host that came back up has one, so the restart horizons it left (lock grants, read grants, the takeover floor) are read as the span they were written with, not as time left on the old boot's raw clock; the node's wall step (`clock:step`, cumulative) is kept across it, so a node that restarts under both comes back with its clock stepped. A scenario reboots a restart by hand with [`reboot_next`] |
@@ -81,7 +81,15 @@ pub const PRESETS: &[(&str, &str)] = &[
     ("net-lossy", "net:delay:30ms:20ms:loss:0.5%:reorder:5%"),
     ("net-flap", "net:flap"),
     ("clock-skew", "clock:spread:400"),
+    // Plan 43 C7b (commit 9): offsets far beyond the old margin (±500 ms):
+    // one node 90 s ahead, the next 90 s behind, and so on.
+    ("clock-offset-large", "clock:spread:90000"),
 ];
+
+/// The largest constant clock offset `clock:<ms>` and `clock:spread:<ms>`
+/// take (ms): a sanity bound of one day, not a design limit. Plan 43 C7b:
+/// safety needs a rate bound per node and causality, no offset bound.
+pub const MAX_CLOCK_OFFSET_MS: i64 = 86_400_000;
 
 /// Which daemons an item applies to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -424,14 +432,14 @@ fn parse_item(body: &str, target: Target, spec: &str) -> Result<Item> {
     };
     if let Kind::Clock { offset } = kind {
         anyhow::ensure!(
-            offset.abs() <= 500,
-            "clock:{offset}: outside the ±500 ms the design assumes"
+            offset.abs() <= MAX_CLOCK_OFFSET_MS,
+            "clock:{offset}: beyond the one-day sanity bound ({MAX_CLOCK_OFFSET_MS} ms)"
         );
     }
     if let Kind::ClockSpread { ms } = kind {
         anyhow::ensure!(
-            (0..=500).contains(&ms),
-            "clock:spread:{ms}: outside the ±500 ms the design assumes"
+            (0..=MAX_CLOCK_OFFSET_MS).contains(&ms),
+            "clock:spread:{ms}: outside 0 to the one-day sanity bound ({MAX_CLOCK_OFFSET_MS} ms)"
         );
     }
     Ok(Item { kind, target })
@@ -696,6 +704,21 @@ fn items_for(node: &str) -> Vec<&'static Item> {
         .unwrap_or_default()
 }
 
+/// Offsets a scenario sets for its own nodes: `(scenario, node, ms)`.
+static SCENARIO_OFFSETS: Mutex<Vec<(String, String, i64)>> = Mutex::new(Vec::new());
+
+/// The current scenario runs `node`'s daemon with a constant clock offset of
+/// `ms` (`CONSTELLATION_FAULT_CLOCK_OFFSET_MS`), unless the profile has a
+/// `clock:` item for that node: set it before the node's daemon spawns. For
+/// scenarios whose point is an offset (plan 43 C7b's `lease-claimant-ahead`),
+/// so they need no profile; the harness's checkers see it like a profile's.
+pub fn set_scenario_clock_offset(node: &str, ms: i64) {
+    let scenario = crate::client::scenario();
+    let mut all = SCENARIO_OFFSETS.lock().unwrap_or_else(|e| e.into_inner());
+    all.retain(|(sc, n, _)| !(*sc == scenario && n == node));
+    all.push((scenario, node.to_string(), ms));
+}
+
 /// The clock offset `node` runs with under the profile.
 fn clock_offset_for(node: &str) -> i64 {
     let mut offset = 0;
@@ -716,6 +739,13 @@ fn clock_offset_for(node: &str) -> i64 {
                 offset = if idx % 2 == 0 { ms } else { -ms };
             }
             _ => {}
+        }
+    }
+    if offset == 0 {
+        let scenario = crate::client::scenario();
+        let all = SCENARIO_OFFSETS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, _, ms)) = all.iter().find(|(sc, n, _)| *sc == scenario && n == node) {
+            offset = *ms;
         }
     }
     offset
@@ -877,6 +907,15 @@ pub fn clock_step_now(node: &str) -> i64 {
         .rev()
         .find(|r| r.node == node && r.scenario == crate::client::scenario())
         .map_or(0, |r| r.cumulative_ms)
+}
+
+/// What `node`'s daemon's protocol wall clock reads above the host's now
+/// (ms): the constant offset the profile injects (`clock:<ms>`,
+/// `clock:spread`) and the node's cumulative step. The checkers that compare
+/// a daemon's stamps with the harness's clock subtract it, so they hold for
+/// any offset (plan 43 C7b).
+pub fn clock_offset_now(node: &str) -> i64 {
+    clock_offset_for(node) + clock_step_now(node)
 }
 
 /// The steps of `node`'s daemon in `scenario`, oldest first: `(applied at
@@ -2246,6 +2285,31 @@ mod tests {
         assert_ne!(u64::from_str_radix(&one, 16).unwrap(), 0);
     }
 
+    /// Expectation (plan 43 C7b, commit 9): a constant clock offset is any
+    /// size up to the one-day sanity bound (the old cap was 500 ms): the
+    /// campaign's `clock:5000`, `clock:spread:5000` and `clock:-60000@b`
+    /// and the `clock-offset-large` preset parse, so do a day and its
+    /// negative; a day and a millisecond is refused with an error that names
+    /// the bound.
+    #[test]
+    fn large_clock_offsets_parse() {
+        let p = parse("clock:5000,clock:spread:5000,clock:-60000@b").unwrap();
+        assert_eq!(p.items.len(), 3);
+        assert_eq!(p.items[0].kind, Kind::Clock { offset: 5_000 });
+        assert_eq!(p.items[1].kind, Kind::ClockSpread { ms: 5_000 });
+        assert_eq!(p.items[2].kind, Kind::Clock { offset: -60_000 });
+        assert_eq!(p.items[2].target, Target::Node("b".into()));
+        let p = parse("clock-offset-large").unwrap();
+        assert_eq!(p.items[0].kind, Kind::ClockSpread { ms: 90_000 });
+        assert!(PRESETS.iter().any(|(n, _)| *n == "clock-offset-large"));
+        assert!(parse("clock:86400000").is_ok());
+        assert!(parse("clock:-86400000").is_ok());
+        assert!(parse("clock:spread:86400000").is_ok());
+        let e = parse("clock:86400001").unwrap_err().to_string();
+        assert!(e.contains("86400000"), "{e}");
+        assert!(parse("clock:spread:86400001").is_err());
+    }
+
     /// Expectation: `clock:rate:<±ppm>[:unbudgeted][@node]` parses with its
     /// sign, its flag and its node; a zero rate, one from 500 000 ppm and
     /// an unknown flag are refused.
@@ -2297,8 +2361,10 @@ mod tests {
             "cpu",
             "cpu:0",
             "warp:9",
-            "clock:900",
-            "clock:spread:600",
+            "clock:86400001",
+            "clock:-86400001",
+            "clock:spread:86400001",
+            "clock:spread:-1",
             "pause:never",
             "runtime-hog:4",
             "s3:wobble",

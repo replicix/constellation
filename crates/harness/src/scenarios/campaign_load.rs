@@ -24,8 +24,8 @@
 //!   rename: every write once (the bucket log), every acknowledged one
 //!   there, the moved file in one place, no generation the root ended
 //!   live at the delegate afterwards (a recalled generation's late answer
-//!   installs no stale grant; live past the clock-skew margin in two
-//!   samples in a row), errors only in doubt past the deadline.
+//!   installs no stale grant; live past the margin, on the node's clock
+//!   less the offset and steps the load injected, in two samples in a row), errors only in doubt past the deadline.
 //! - `acks3-under-load`: an `ack=s3` holder whose store stalls 1-3 s at a
 //!   time (run it under `cpu:25@a`): no fast takeover of a live holder, no
 //!   rollback of an acknowledged write (finding F2b's twin).
@@ -607,7 +607,7 @@ pub(super) fn lock_contention_stalled_owner(_seed: u64) -> Result<()> {
 
 /// A ledgered writer in `dir` (relative to `mnt`) until `stop`: the
 /// slowest write and when it began.
-fn ledger_writer(
+pub(super) fn ledger_writer(
     mnt: &Path,
     dir: &str,
     node: &str,
@@ -640,7 +640,7 @@ fn ledger_writer(
 /// After quiescence (no op answered in doubt can still land), wait until
 /// `ledger` checks out on every client's mount (or 90 s), and fail with
 /// what it found otherwise.
-fn ledger_converges(name: &str, clients: &[Client], ledger: &Ledger) -> Result<()> {
+pub(super) fn ledger_converges(name: &str, clients: &[Client], ledger: &Ledger) -> Result<()> {
     let refs: Vec<&Client> = clients.iter().collect();
     crate::verify::wait_quiescent(&refs, crate::load::scaled(Duration::from_secs(120)))?;
     let deadline = Instant::now() + crate::load::scaled(Duration::from_secs(90));
@@ -923,18 +923,20 @@ pub(super) fn endpoint_wedge_probe(_seed: u64) -> Result<()> {
 /// must not be one the root `a` ended (`ended` accumulates what the root
 /// reported ended, across calls): a recalled or reclaimed generation's
 /// late answer never installs it again (cluster-locks.md, delegations).
-/// `until_ms` is on `b`'s protocol clock, which may run up to `skew` off
-/// the harness's, and further by the wall-clock step the load applied to
-/// `b` (`clock:step`): see [`StaleWatch`].
+/// `until_ms` is on `b`'s protocol clock, which runs off the harness's by
+/// the offset and the wall-clock steps the load applied to `b`
+/// (`clock:<ms>`, `clock:spread`, `clock:step`; any size since plan 43 C7b):
+/// the watch takes them off, and `tolerance` is for the sampling and the
+/// rate budget, see [`StaleWatch`].
 fn no_stale_generation(
     a: &Client,
     b: &Client,
     ended: &mut std::collections::BTreeSet<u64>,
-    skew: Duration,
+    tolerance: Duration,
     within: Duration,
 ) -> Result<()> {
     let until = Instant::now() + within;
-    let mut watch = StaleWatch::new(skew);
+    let mut watch = StaleWatch::new(tolerance);
     loop {
         let root = a.control_status()?["delegation"].clone();
         for g in root["gens"].as_array().into_iter().flatten() {
@@ -943,9 +945,9 @@ fn no_stale_generation(
             }
         }
         let mine = b.control_status()?["delegation"]["mine"].clone();
-        // The step the load applied to `b`'s wall clock moves `until_ms`
-        // with it (plan 43 C7-H1).
-        watch.step_ms = crate::load::clock_step_now(&b.name);
+        // The offset and the steps the load applied to `b`'s wall clock
+        // move `until_ms` with them (plan 43 C7-H1, C7b).
+        watch.offset_ms = crate::load::clock_offset_now(&b.name);
         if let Some((gen, until_ms, now)) = watch.sample(&mine, ended, super::snapsched::now_ms()) {
             bail!(
                 "b holds generation {gen} live (until {until_ms}, harness clock {now}) that the \
@@ -961,24 +963,28 @@ fn no_stale_generation(
 
 /// [`no_stale_generation`]'s rule over `delegation.mine` samples. A
 /// generation is suspect when the root ended it and `b` holds it neither
-/// stopped nor lapsed even if `b`'s clock runs `skew` ahead of the
-/// harness's (`until_ms > now + skew + step`); it is a stale grant once suspect
-/// in two samples in a row, so neither a clock-skew transient nor one
-/// sample racing the stop is called one.
+/// stopped nor lapsed (`until_ms - offset > now + tolerance`); it is a stale
+/// grant once suspect in two samples in a row, so neither a transient nor
+/// one sample racing the stop is called one.
+///
+/// Plan 43 C7b: the watch compares generation ends across nodes on the
+/// wall, so it removes the offset and steps the harness itself injected
+/// for the watched node (`load::clock_offset_now`) instead of widening a
+/// margin by them: it is exact for any offset.
 struct StaleWatch {
-    skew_ms: i64,
-    /// The wall-clock step applied to the node being watched (ms): its
-    /// `until_ms` values run that far ahead (behind, if negative) of the
-    /// harness's clock on top of `skew_ms`.
-    step_ms: i64,
+    tolerance_ms: i64,
+    /// The constant offset and the wall-clock steps applied to the node
+    /// being watched (ms): its `until_ms` values run that far ahead (behind,
+    /// if negative) of the harness's clock.
+    offset_ms: i64,
     suspect: std::collections::BTreeSet<u64>,
 }
 
 impl StaleWatch {
-    fn new(skew: Duration) -> StaleWatch {
+    fn new(tolerance: Duration) -> StaleWatch {
         StaleWatch {
-            skew_ms: skew.as_millis() as i64,
-            step_ms: 0,
+            tolerance_ms: tolerance.as_millis() as i64,
+            offset_ms: 0,
             suspect: Default::default(),
         }
     }
@@ -1000,7 +1006,10 @@ impl StaleWatch {
                 m[2].as_i64().unwrap_or(0),
                 m[3] == true,
             );
-            if !stopped && until_ms > now + self.skew_ms + self.step_ms && ended.contains(&gen) {
+            if !stopped
+                && until_ms - self.offset_ms > now + self.tolerance_ms
+                && ended.contains(&gen)
+            {
                 suspect.insert(gen);
                 if stale.is_none() && self.suspect.contains(&gen) {
                     stale = Some((gen, until_ms, now));
@@ -1205,14 +1214,14 @@ mod tests {
         let row = |until: i64| serde_json::json!([[7, 3, until, false, 0, 0, 0]]);
         let now = 1_000_000;
         let mut w = StaleWatch::new(Duration::from_millis(1_000));
-        w.step_ms = 3_000;
+        w.offset_ms = 3_000;
         for at in [now, now + 500] {
             assert_eq!(w.sample(&row(now + 3_900), &ended, at), None);
         }
         assert_eq!(w.sample(&row(now + 8_000), &ended, now), None);
         assert!(w.sample(&row(now + 8_000), &ended, now + 500).is_some());
         let mut w = StaleWatch::new(Duration::from_millis(1_000));
-        w.step_ms = -3_000;
+        w.offset_ms = -3_000;
         // Its clock is 3 s behind: the threshold is now - 2 s.
         assert_eq!(w.sample(&row(now - 2_500), &ended, now), None);
         assert_eq!(w.sample(&row(now - 2_500), &ended, now + 500), None);
@@ -1220,17 +1229,34 @@ mod tests {
         assert!(w.sample(&row(now - 900), &ended, now + 500).is_some());
     }
 
+    /// Plan 43 C7b: the watch is offset-free. A node the load put 90 s ahead
+    /// (or 60 s behind, as a campaign preset does) is judged on its clock less
+    /// that offset, with no margin widened to cover it: a grant that lapsed
+    /// is never stale however large the offset, one held live past the
+    /// tolerance is, in two samples.
+    #[test]
+    fn the_watch_takes_the_injected_offset_off_however_large() {
+        let ended: std::collections::BTreeSet<u64> = [3].into();
+        let row = |until: i64| serde_json::json!([[7, 3, until, false, 0, 0, 0]]);
+        let now = 1_000_000;
+        for offset in [90_000, -60_000, 86_400_000, 0] {
+            let mut w = StaleWatch::new(Duration::from_millis(1_000));
+            w.offset_ms = offset;
+            for at in [now, now + 500, now + 1_000] {
+                // Lapsed 200 ms ago, or about to lapse within the tolerance.
+                assert_eq!(w.sample(&row(offset + now - 200), &ended, at), None);
+                assert_eq!(w.sample(&row(offset + now + 900), &ended, at), None);
+            }
+            // Live 5 s past the harness's clock: stale in two samples.
+            assert_eq!(w.sample(&row(offset + now + 5_000), &ended, now), None);
+            assert!(w
+                .sample(&row(offset + now + 5_000), &ended, now + 500)
+                .is_some());
+        }
+    }
+
     #[test]
     fn a_stale_generation_is_one_held_past_the_skew_in_two_samples() {
-        // The scenario's margin covers the ±500 ms clock injectors.
-        let t = Timings::from_pairs(&[
-            ("CONSTELLATION_DELEGATION_TTL_MS", "5000".to_string()),
-            (
-                "CONSTELLATION_LEASE_TTL_MS",
-                super::super::m11::TTL_MS.to_string(),
-            ),
-        ]);
-        assert!(t.margin >= Duration::from_millis(500), "{t:?}");
         let ended: std::collections::BTreeSet<u64> = [3].into();
         let row = |gen: u64, until: i64, stopped: bool| {
             serde_json::json!([7, gen, until, stopped, 0, 0, 0])

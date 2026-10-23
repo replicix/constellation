@@ -205,6 +205,17 @@ pub const SKIPPED: &[(&str, Skip)] = &[
         "lease-handover",
         Skip::Local(&["shortens the lease TTL (CONSTELLATION_LEASE_TTL_MS=10000) so the handover fits its bound"]),
     ),
+    (
+        "lease-claimant-ahead",
+        Skip::Local(&[
+            KILL,
+            P2P_CUT,
+            TIMERS,
+            NODES3,
+            "runs a node's daemon with a wall clock 90 s ahead (CONSTELLATION_FAULT_CLOCK_OFFSET_MS)",
+        ]),
+    ),
+    ("lease-cold-claim", Skip::Local(&[KILL, TIMERS])),
     ("lease-fencing", Skip::Local(&[STOP, TIMERS])),
     ("continuation-epoch", Skip::Local(&[S3_FAULTS, TIMERS])),
     ("epoch-member-lost", Skip::Local(&[STOP, S3_FAULTS, TIMERS])),

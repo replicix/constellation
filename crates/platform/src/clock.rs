@@ -42,14 +42,16 @@
 //!
 //! - `CONSTELLATION_FAULT_CLOCK_OFFSET_MS=<ms>` (load campaign): a constant
 //!   offset, read once. One daemon's clock runs ahead of or behind its
-//!   peers' by up to what the margins assume (`cto-modes.md`, "Clocks and
-//!   margins": ±500 ms at the defaults). It moves this clock and what
-//!   reads it (the engine's epoch promises, the snapshot paths, the
-//!   scheduler and the prune audit's `ts`); the registry's and commits'
-//!   timestamps, the S3 objects' own and the log lines keep the host's
-//!   clock, so one daemon mixes the two by the offset (within the margins
-//!   the design tolerates across nodes anyway). The engine logs it once at
-//!   start-up (this crate has no logger).
+//!   peers' by any amount (plan 43 C7b: safety assumes a rate bound per node
+//!   and no bound on the offset, `DESIGN.md` §5; the harness takes up to a
+//!   day). It moves this clock and what reads it (the lease body's stamps,
+//!   the engine's epoch promises, the snapshot paths, the scheduler and the
+//!   prune audit's `ts`); the registry's and commits' timestamps, the S3
+//!   objects' own and the log lines keep the host's clock, so one daemon
+//!   mixes the two by the offset (none of those decides on a peer's clock;
+//!   the hybrid logical clock observes a peer's stamp only within
+//!   `CONSTELLATION_HLC_SKEW_TOLERANCE_S`, 300 s). The engine logs it once
+//!   at start-up (this crate has no logger).
 //! - [`set_fault_step_ms`]: a runtime step, cumulative, set by the engine's
 //!   `CONSTELLATION_FAULT_CLOCK_STEP_FILE` poller (the harness's
 //!   `clock:step:<ms>:<at_ms>[@node]` load item) and by engine tests.

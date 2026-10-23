@@ -47,6 +47,8 @@ mod handover;
 mod inval_storm;
 /// Plan 42: three races in the Linux kernel's FUSE client.
 mod kernel_races;
+/// Plan 43 C7b: a lease claimed by observation, whatever the claimant's clock.
+mod leaseclaim;
 /// Plan 31 C8: the engine's host lifecycle (suspend, resume, metered).
 mod lifecycle;
 mod logsink;
@@ -209,6 +211,20 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[],
         caps: &[],
         run: lease_handover,
+    },
+    Scenario {
+        name: "lease-claimant-ahead",
+        desc: "plan 43 C7b: three nodes, no backup, b's clock 90 s ahead (beyond the 20 s lease TTL) while a and b write under the ledger: for 1.5 TTL a keeps its lease at one epoch and b and c never hold it; then a is killed and a claim comes only after a node has watched the lease stand still for a TTL (not before half a TTL after the kill, within two and a half TTLs of it; the time is printed); the ledger and the errno classes clean",
+        requires: &[],
+        caps: &[],
+        run: leaseclaim::lease_claimant_ahead,
+    },
+    Scenario {
+        name: "lease-cold-claim",
+        desc: "plan 43 C7b (gate G6): a lone holder is killed and a node that was not running starts afterwards and writes: it claims one full TTL after its start (not at the dead holder's expiry), within two TTLs of its mount (a TTL and two read cadences without host slack); crash-to-claim and start-to-claim are printed",
+        requires: &[],
+        caps: &[],
+        run: leaseclaim::lease_cold_claim,
     },
     Scenario {
         name: "lease-fencing",
