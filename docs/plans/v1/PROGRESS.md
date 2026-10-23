@@ -59718,3 +59718,39 @@ its one wall hint), ADR-25 (the token), the new ADR-35 "Clocks: rate, not offset
 ARBITER-STUDY §7's clock envelope, TESTING.md (the mix, the harness items, the
 scenarios, the campaign phase) and the fault hook's doc in `platform::clock`.
 Plan 43: Appendix B rows 2, 11, 21, 22, 23, 25, 26, 28 and the C7b section.
+
+## A backup listed moments before a lag keeps its window (2026-10-23)
+
+`backup-lag-keeps-its-backup` seed 259, failing in every sweep since plan 43
+C1-1 (the first bad commit by bisect, `adc84afb`; C1-1 only moved the seed's
+schedule, the rule below dates from `ce4c1ec9`).
+
+### Mechanism
+
+- Node 3 took the lease at t=7824, brought node 1 up at 7854 and listed it
+  at 7918. Node 1's runtime held up at 8000 for 0.6 s. At 8596 the holder
+  dropped it, `backup_timeouts`' silence rule: silent 650 ms, unheard
+  742 ms, both past the 600 ms ack timeout.
+- The lag-aware window (`backup_takeover_ms` on top of the ack timeout) is
+  given only to a backup that has answered in this bring-up. That was
+  recorded only by a heartbeat answer (`Event::BackupAlive`). A backup
+  answers beats once it is listed, at the beat cadence, so in the first
+  interval after its listing it had acknowledged its whole catch-up but
+  counted as one that never answered.
+
+### Fix
+
+An append acknowledgement of this bring-up sets the flag too
+(`BackupPeer::answers_beats` renamed `answered`). A backup that acked and then
+died without a transport failure now goes at the ack timeout plus a window,
+as one that answered a beat always did.
+
+### Evidence
+
+- Core (fails before: dropped at the plain timeout):
+  `a_slow_backup_known_alive_is_kept_until_the_slow_bound`'s new case.
+- Sim: `lag_does_not_cost_the_holder_its_backup` also runs seed 259.
+- Sweeps (`backup*`, 29 configurations, 500 seeds, main and fix): the failing
+  sets are identical apart from 259. They are the negative controls
+  `backup-lag-in-margin-unaware` (181) and `backup-runtime-lag-unaware` (497).
+- Gates: fmt, clippy (authority, all targets), authority lib 680, sim 262.

@@ -3709,7 +3709,10 @@ fn lag_does_not_cost_the_holder_its_backup() {
     use pinned::run_seed;
     let mut dropped = Vec::new();
     let mut added = 0;
-    for seed in 0..120u64 {
+    // Seed 259: the holder's new backup, listed 82 ms before its runtime
+    // held up, had answered appends but no heartbeat yet, and was dropped
+    // at the plain timeout.
+    for seed in (0..120u64).chain([259]) {
         let r = run_seed(seed, backup_lag_keeps_its_backup_config()).unwrap_or_else(|e| {
             panic!(
                 "seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=backup-lag-keeps-its-backup"

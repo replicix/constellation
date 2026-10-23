@@ -9506,7 +9506,7 @@ mod pipelined_appends {
                 short_since_progress: false,
                 short_since: w(h.now),
                 unreachable: false,
-                answers_beats: false,
+                answered: false,
                 acked: 0,
                 listed_at: None,
                 counted: 0,
@@ -9915,6 +9915,27 @@ mod pipelined_appends {
                 "{aware} {answered}: {took}"
             );
         }
+        // Silent after acknowledging an append, before any heartbeat
+        // answer (`backup-lag-keeps-its-backup` seed 259: listed 82 ms
+        // before its runtime held up for 0.6 s): it has answered in this
+        // bring-up, so it gets the window too.
+        let mut h = holder_with_candidate();
+        let tip = journal(&h, "a", 1);
+        let sent = appends(&journaled(&mut h, 900));
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        h.advance(50);
+        ack(&mut h, sent[0].0, tip);
+        assert!(h.core.ack.peers[&2].answered);
+        journal(&h, "b", 2);
+        journaled(&mut h, 901);
+        let start = h.now;
+        assert!(
+            !run(&mut h, timeout + 200, false),
+            "a backup that acknowledged an append was dropped at the plain timeout"
+        );
+        assert!(run(&mut h, 6 * timeout, false));
+        let took = h.now.since(start);
+        assert!(took < timeout + window + 500, "{took}");
         // Alive at first, then silent: the ack timeout counts from the
         // last answer.
         let mut h = holder_with_candidate();
@@ -11622,7 +11643,7 @@ mod backup_crash {
             short_since_progress: false,
             short_since: w(h.now),
             unreachable: false,
-            answers_beats: false,
+            answered: false,
             acked,
             listed_at: None,
             counted: 0,
@@ -36201,7 +36222,7 @@ mod c1_counted {
                 short_since_progress: false,
                 short_since: w(h.now),
                 unreachable: false,
-                answers_beats: false,
+                answered: false,
                 acked: 0,
                 listed_at: None,
                 counted: 0,

@@ -457,9 +457,10 @@ pub(crate) struct BackupPeer {
     /// and gets the ordinary acknowledgement timeout, not the slow-core
     /// grace.
     pub unreachable: bool,
-    /// It has answered the holder's heartbeat (`Event::BackupAlive`) in
-    /// this bring-up: a backup known to answer may answer a window late.
-    pub answers_beats: bool,
+    /// It has answered the holder in this bring-up, the heartbeat
+    /// (`Event::BackupAlive`) or an append: a backup known to answer may
+    /// answer a window late.
+    pub answered: bool,
 }
 
 /// One pipelined append: its request, send time and the rows it carries.
@@ -2681,7 +2682,7 @@ impl Core {
                 short_since_progress: false,
                 short_since: now.wait,
                 unreachable: false,
-                answers_beats: false,
+                answered: false,
             },
         );
     }
@@ -2876,7 +2877,7 @@ impl Core {
                 let unheard = now.wait.since(since(self, p.alive_at));
                 tip_behind(p)
                     && silent >= timeout
-                    && (unheard >= timeout + if p.answers_beats { grace } else { 0 }
+                    && (unheard >= timeout + if p.answered { grace } else { 0 }
                         // Short for a while of its answering time, not once:
                         // a backup that answered short and then lapsed (its
                         // runtime held up: no answers at all) answers its
@@ -3287,6 +3288,14 @@ impl Core {
         let before = self.durable_jseq();
         let p = self.ack.peers.get_mut(&from).expect("present");
         p.unreachable = false;
+        // An answer as good as the heartbeat's. A backup listed moments
+        // ago has acknowledged its catch-up but may not have answered a
+        // heartbeat yet (it answers them once listed, at the beat
+        // cadence): without this, a lag of its runtime in that first
+        // interval dropped it at the plain timeout
+        // (`backup-lag-keeps-its-backup` seed 259: listed 82 ms before a
+        // 0.6 s lag).
+        p.answered = true;
         // Progress is the hold advancing, or an append answered in full
         // (a heartbeat's included): a backup that keeps answering short
         // for the same rows is stuck, and the timeout rule drops it
@@ -3370,7 +3379,7 @@ impl Core {
                 p.short_since = p.short_since.plus(gap as u64);
             }
             p.alive_at = p.alive_at.max(at);
-            p.answers_beats = true;
+            p.answered = true;
         }
     }
 
