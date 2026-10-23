@@ -605,6 +605,27 @@ purpose", "Gates"), with these rows:
   rows in journal order (`history::witness_order`, from the segments'
   `rows`), the holder's execution order. No product bug; the `+links`
   sweep is green.
+- **`flex-crash+links+stalebase` seed 647 ("inode only on the left"; the
+  old `+links`, now `+links-local`): the knob's cost (2026-10-23).** Node 3, partitioned from the epoch's
+  hold owner, installed `Exists` hints from replies with base `None`: the
+  entries were in the owner's journal, held behind a chunk only a crashed
+  member had. `repair drop-held --remote` then rolled those rows back and
+  queued them for replay by rid; the next segment shipped `through` past
+  the hints' floors without them, so each hint retired as reached
+  (`hint_reached`) and kept an entry the log never carried there; the
+  replays landed later in other places, and the segment's exchanges found
+  their entries moved ("exchange entry missing"). It is the hint's form of
+  the dropped streamed row `apply_segment_rows` already strands, but it
+  needs the knob: without it a hint is installed only on a base the
+  requester has applied, and the holder's reply base is `None` for an
+  entry in its unshipped journal, which is the only kind `drop-held` can
+  take away (the seed passes without the knob). With hints kept to the
+  real base under the knob (an experiment, not landed), seed 647, the five
+  seeds of the same shape under the new cross-directory `+links` (337, 397,
+  590, 718, 977) and both `flex-crash` `+stalebase` sweeps at 1,000 seeds
+  converge. Not fixed. If `+stalebase` is to serve as a convergence
+  control, narrow it to accepted forwards, which is what its doc
+  (`Config::speculate_on_stale_base`) and O1 need.
 
 Closed in the same review: the holder's reply base now counts the
 multi-name inodes an op takes a name from (`Core::reply_base`,
