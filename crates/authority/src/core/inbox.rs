@@ -838,7 +838,9 @@ impl Core {
 
     fn evaluate_escalation(&mut self, now: Now) {
         self.inbox.prune_window(now, self.cfg.escalate_window_ms);
-        if !self.cfg.escalation {
+        // Single-writer mode: this node can never claim another node's
+        // lease (`Config::single_writer`), so it never asks for it.
+        if !self.cfg.escalation || self.cfg.single_writer {
             self.inbox.escalated_since = None;
             return;
         }
@@ -1745,5 +1747,34 @@ impl Core {
             self.nudge(now, out);
         }
         waiting
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{Config, Core};
+    use crate::ids::Now;
+
+    /// Single-writer mode: a requester whose inbox demand is sustained
+    /// does not escalate — it could never claim the holder's lease
+    /// (`Config::single_writer`), and asking made the holder release it
+    /// to nobody.
+    #[test]
+    fn a_single_writer_requester_never_asks_for_the_lease() {
+        for single_writer in [false, true] {
+            let mut cfg = Config::defaults(2, 1);
+            cfg.single_writer = single_writer;
+            let mut core = Core::new(cfg);
+            let t0 = Now::same(1_000_000);
+            let ops = core.cfg.escalate_ops;
+            for i in 0..ops {
+                core.note_inbox_op(t0.plus(i * 100), 2_000);
+            }
+            assert_eq!(
+                core.escalated(t0.plus(ops * 100)),
+                !single_writer,
+                "sustained inbox demand (single writer: {single_writer})"
+            );
+        }
     }
 }

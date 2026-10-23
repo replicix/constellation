@@ -363,7 +363,14 @@ impl LeaseState {
         if self.release_when_idle && now.wait.since(self.last_write) >= cfg.dwell_ms as i64 {
             return true;
         }
-        !self.wanted.is_empty()
+        // Single-writer mode: no wanter can claim the lease once it is
+        // released (`classify` refuses a takeover of another node's lease,
+        // released or not), so handing it over to one left nobody holding
+        // it — the wanter's writes, which reached this node through the
+        // inbox until then, waited for the lease until their deadline.
+        // Sustained inbox demand under load was enough to ask for it.
+        !cfg.single_writer
+            && !self.wanted.is_empty()
             && (now.wait.since(self.last_write) >= cfg.idle_release_ms as i64
                 || self
                     .wanted_since

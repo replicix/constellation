@@ -2836,7 +2836,12 @@ impl Core {
                 // Plan 31 C8: a forward-only node never asks a live
                 // holder for the lease — a registration would make it
                 // hand over (`wants_handoff`).
-                if !offered && !self.mode.forwards() && !prev.wanted_by.contains(&self.cfg.node_id)
+                // Nor in single-writer mode: a claim of another node's lease
+                // is refused there, so a handover would strand it.
+                if !offered
+                    && !self.mode.forwards()
+                    && !self.cfg.single_writer
+                    && !prev.wanted_by.contains(&self.cfg.node_id)
                 {
                     self.issue_s3(
                         S3Op::LeaseSwap {
@@ -2859,7 +2864,12 @@ impl Core {
                 // known silent, and the permit's own rule decides when
                 // the lease is claimable.)
                 let permitted = self.lease.takeover_permit == Some((epoch, holder));
-                if ask && self.cfg.p2p && attempts == 0 && holder != self.cfg.node_id && !permitted
+                if ask
+                    && self.cfg.p2p
+                    && !self.cfg.single_writer
+                    && attempts == 0
+                    && holder != self.cfg.node_id
+                    && !permitted
                 {
                     let req = self.op_id();
                     self.set_phase(

@@ -823,7 +823,10 @@ impl Core {
         // stays; see `round_release`), nor inside the takeover floor (plan
         // 43 C7-H2: the gate covers the read quarantine only with the
         // inbox on, and not the lock grace at all).
-        let can_serve = self.lease.ship_epoch(now, &self.cfg).is_some()
+        // Single-writer mode: the requester could not claim what this node
+        // released (`Config::single_writer`); declining is always correct.
+        let can_serve = !self.cfg.single_writer
+            && self.lease.ship_epoch(now, &self.cfg).is_some()
             && !self.lease.fenced()
             && self.deleg_live_generations() == 0
             && replica.locks().grants_len() == 0

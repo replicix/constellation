@@ -119,7 +119,11 @@ pub struct Config {
     pub clock_rate_budget_ppm: u32,
     pub partition: String,
     /// `LeaseMode::SingleWriter`: no `If-Match`; takeover from another
-    /// node is refused.
+    /// node is refused, a released lease's included. So no node asks for
+    /// the lease (no inbox escalation, no `wanted_by` registration, no P2P
+    /// handoff request) and a holder never hands it over: one that did
+    /// left nobody who could hold it, and every write waited out its
+    /// deadline (`InDoubt`, `EIO`).
     pub single_writer: bool,
     pub ttl_ms: u64,
     /// `lease::EXPIRY_MARGIN_MS`: a lease is usable only with this much

@@ -1393,6 +1393,75 @@ fn a_tenure_inside_its_takeover_floor_is_not_idle_released() {
     );
 }
 
+/// Single-writer mode (a backend without `If-Match`): no other node can
+/// claim a released lease (`classify` refuses a takeover of another node's
+/// lease, released or not), so a holder asked for it keeps it, whether the
+/// wanter asked over S3 (`wanted_by`, an inbox batch's `wants_lease`) or
+/// over P2P. Handing it over left nobody holding it: the wanter's writes,
+/// served through the inbox until then, waited for the lease until their
+/// deadline and answered `EIO` (the engine's conformance test
+/// `invalidation::events_come_from_one_dedicated_thread` under CPU load,
+/// where the peer's slowed inbox ops counted as sustained demand).
+#[test]
+fn a_single_writer_holder_never_hands_the_lease_over() {
+    let wanted = |h: &mut Harness| {
+        let long_ago = WaitMs(h.now.0 - 1_000_000);
+        h.core.lease.wanted = vec![2];
+        h.core.lease.wanted_since = Some(long_ago);
+        h.core.lease.held_since = Some(long_ago);
+        h.core.lease.last_write = long_ago;
+    };
+    let p2p_request = |h: &mut Harness| {
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::LeaseRequest {
+                req: OpId(5),
+                epoch_applied: None,
+            },
+        })
+    };
+    for single_writer in [false, true] {
+        let mut h = Harness::new(1);
+        h.core.cfg.single_writer = single_writer;
+        h.hold(1, None);
+        wanted(&mut h);
+        assert_eq!(
+            h.core.lease.wants_handoff(h.clk(), h.core.config()),
+            !single_writer,
+            "a wanted lease past its grace (single writer: {single_writer})"
+        );
+        let mut out = Vec::new();
+        h.core.round_release(h.clk(), &h.meta, &mut out);
+        assert_eq!(
+            h.core.lease.releasing, !single_writer,
+            "released for a wanter (single writer: {single_writer})"
+        );
+        let mut h = Harness::new(1);
+        h.core.cfg.single_writer = single_writer;
+        h.hold(1, None);
+        let out = p2p_request(&mut h);
+        if single_writer {
+            assert!(
+                matches!(
+                    sends(&out).as_slice(),
+                    [(
+                        2,
+                        PeerMsg::LeaseHandoff {
+                            req: OpId(5),
+                            released: false,
+                            ..
+                        }
+                    )]
+                ),
+                "a single-writer holder declines a P2P handoff: {out:?}"
+            );
+            assert!(h.core.job().is_none());
+        } else {
+            assert_eq!(h.core.job(), Some(JobKind::Handoff), "the control");
+        }
+    }
+}
+
 /// What [`drive_job`] saw.
 #[derive(Default)]
 struct Driven {
