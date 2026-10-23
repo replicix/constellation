@@ -1032,6 +1032,67 @@ would wait for disk writes); bounding the commit's duration (a blocked
 `write(2)` has no bound). See
 [The fencing token](../reference/features/cluster-locks.md#the-fencing-token).
 
+**Amended (renewals off the core, plan 41)**: the renewal of a grant was a
+step of the node's authority core, and the core's step writes the metadata
+store synchronously, so a store write that waits seconds on the device (a
+FUSE writer's slow journal write holding the writer lock, the core's
+priority write behind it; the xcheckfs run of 2026-10-13: 18 s and 24 s on
+one node) lapsed the node's grants and fenced its lock owner with `EIO`
+although nothing was wrong with the node but a slow disk. A **renewal lane**
+beside the core now extends windows from memory alone — the lock tables
+the FUSE threads already share — under a **certificate** the core publishes
+at the end of every step, before the driver dispatches the step's actions
+(`Core::lock_lane_view`, `crates/authority/src/lane.rs`). It renews this
+node's own grants at its own owner table (one `LockTables` critical
+section, `renew_own`) and sends `LockRenew` for the grants it holds at an
+owner, applying `Ok` answers from the send as the core does; it never
+grants, reclaims, refuses, releases, drops a grant, routes, touches the
+store or logs, and reports every result to the core, which decides the rest.
+It runs always (so every lock workload exercises it).
+
+*What it may judge*: own grants only under the certificate — the root lease
+held, usable and not fenced, no continuation epoch, no delegation (checked
+live), not resuming, no unmarked release or final mirror — `now` below the
+lease's usable end, and, for a tenure that can be taken over early, an S3
+proof of liveness within `backup_takeover_ms` and a marked lease (the L0
+freshness rule); held grants at a remote owner without such conditions
+(routing is liveness only: a wrong owner answers `NotOwner`, which the core
+handles), until the driver has been stuck `CONSTELLATION_LOCK_LANE_MAX_STALL_MS`
+(120 s).
+
+*The argument*: every extension at `t` is one the core could have made at
+`t`. One process, one clock; the lane extends a record only if it is live
+under the tables' mutex and every core decision that ends a record is one
+critical section of the tables (`forget_outwaited_if_expired`,
+`drop_held_if_lapsed`, `renew_own`: plan 41 L1), so it precedes or follows
+an extension, never straddles it; the authority facts are time-bounded and
+enforced by the lane (the cap, the freshness window) or withdrawn by the
+certificate of the step that changes them, published before the step's
+actions (a release's CAS, an epoch's recall) go out, so any extension
+precedes the change and the successor's grace covers it.
+
+*Checked by*: the lock model (`Stall`, `LaneRenewOwn`; the lane ignoring the
+cap, ignoring a fast tenure's freshness, or — together — keeping its
+certificate through a release and reviving dropped records, each violates
+`mutual_exclusion`; the design with stalls, backups, TTL and released
+takeovers is clean), the simulator on every lock configuration
+(`locks-core-stall*`), the unit tests of the lane and of the certificate
+(`lock_lane_core_tests`), and the harness (`lock-stall-lone-node`,
+`lock-store-stall-holder`, `lock-store-stall-past-lease`).
+
+*Not covered, on purpose*: a **stalled owner's** peers' grants (answering
+their renewals off the core, and the restart horizon's lead: follow-up L5);
+the lane's own lease probe for fast tenures (L6: until then a fast tenure's
+own grants are renewed only while the core's last proof of liveness is fresh,
+about 1.5 s into a stall); `ack=s3` holders, deposed on the core's silence;
+a stall past the root lease (the grants end at its usable end); a hung core
+(past the bound). *Rejected*: asynchronous store writes in the core (a
+rewrite of the step discipline), bounding the core's blocking (timeouts
+on a write that cannot be abandoned), and a second lease renewer (it races
+the core's CAS tags). The same pattern, for delegations, is
+`deleg_lane` / `DelegWindows` (the delegate's renewal lane, and the root's
+answer off its core, plan 41 R).
+
 ## ADR-26: Exact chunk-location reconciliation replaces bloom digests
 
 **Context**: peers learned each other's cached chunks from bloom-filter

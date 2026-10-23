@@ -58294,3 +58294,120 @@ delegate sends such a renewal once more after the answerer's threshold plus
   the backed pair: 3 of 3 (a loss is accepted only as the known gap until P:
   the 5 s stall kept the delegation, the longer ones lost it).
 
+
+## Plan 41 L2, L3, L4, L7, L8: the lock renewal lane (2026-10-23)
+
+Finding 08 (the xcheckfs run of 2026-10-13: an 18 s and a 24 s store stall on one
+node lapsed its lock grants and fenced the lock's owner with `EIO`): every
+renewal of a lock grant was a step of the authority core, and the core's step
+writes the metadata store synchronously, so a store write that waits seconds on
+the device (a FUSE writer's slow journal write holding the writer lock, the
+core's priority write behind it) renewed nothing. Plan 41's lane renews from
+memory beside the core. L1 (the lock tables' atomic primitives, the audit, no
+I/O under the tables' mutex) landed before this; the lane uses its
+`renew_own`, `HeldGrant::route` and the read hook, and adds
+`due_renewals_lane`, `Meta::set_write_stall` and the fault file's `core` and
+`core-only` keywords.
+
+### What landed
+
+| Item | State | Where |
+|---|---|---|
+| L2 model: `Stall`, `LaneRenewOwn`, the certificate, knobs | done | `crates/model/src/locks.rs`, `crates/model/tests/locks.rs` |
+| L2 the certificate (`Core::lock_lane_view`), the sans-IO lane, the core's events | done | `crates/authority/src/lane.rs`, `core/locks.rs` (`lock_lane_view`, `lock_publish_lane`, `on_lane_own`, `on_lane_renewed`), `event.rs` (`LaneOwn`, `LaneRenewed`), `replica.rs` (`delegations_any`) |
+| L2 sim: the lane task per node, `StallStep` stalls | done | `crates/authority/tests/sim/{node,run}.rs`, `tests/sim.rs` (`locks-core-stall*`) |
+| L3 engine task: own grants; fault point `core`, `Meta::set_write_stall` | done | `crates/engine/src/lock_lane.rs`, `authority_driver.rs` (`OffCore::lock_lane`, `lane_cell`, `stuck_ms`), `crates/meta/src/store/gate.rs` |
+| L4 held grants at a remote owner | done | the same lane (`RenewLane::tick`), `core::on_lane_renewed` |
+| L7 status, docs, ADR-25 | done | `LockStatus.lane`, `cluster-locks.md` ("Renewals off the core"), `configuration.md`, `TESTING.md`, ADR-25 amended |
+| L8 harness scenarios, bench script | done / measured: see Evidence | `lock-stall-lone-node` (lane assertions, `CONSTELLATION_HARNESS_LONE_LANE=off`), `lock-store-stall-past-lease`, `lock-store-stall-holder`, `bench/lock-lane/run.sh` |
+| L5 (peers' renewals at a stalled owner), L6 (the lane's lease probe) | not in scope (follow-ups) | |
+
+### Deviations from the spec
+
+- **The certificate is a cell, not `LeaseView`**: `lane::LaneCell`, written by
+  `Core::handle`'s last act (`lock_publish_lane`) and read by the lane. The
+  ordering argument is the spec's (published before the driver dispatches the
+  step's actions), without extending the FUSE-facing atomics; the freshness
+  facts are in it (`fast`, `last_fresh`, `window_ms`, `marked`), so
+  `set_liveness`'s ordering is moot. The lane cell is shared by `OffCore`
+  (daemon) and the sim node.
+- **No `LeaseView::lane_root`, no `lock_cap_until_ms` atomic**; `LockLaneView::own_ok`.
+- **No in-process multi-node engine test of a held `flock`** (no such harness in
+  the engine crate): the lane task is tested against a real `Meta`
+  (`the_task_renews_an_own_grant_off_the_core_and_tells_it`), the logic in the
+  sim and the end-to-end in the harness scenarios.
+- **`lock-store-stall-backup` (three nodes, a backup) is not written**: the
+  holder-stall-with-backup safety is the sim's `locks-core-stall-backup*`.
+- **Model**: `lane` is off by default (it adds a transition wherever an own
+  grant is due, which would multiply every other configuration's state space);
+  the lane tests enable it. `lane_keeps_cert_after_release` and
+  `lane_extends_expired_records` violate only **together** (the model's
+  `Release` is atomic and drops the table: a kept certificate has no record to
+  extend, and a lane that revives records has no certificate after a release);
+  the code's gap (a release decided in one step, its CAS landing later) is
+  closed by the certificate of the deciding step, which a core test pins
+  (`each_excluded_state_withdraws_the_certificate_in_its_own_step`).
+- **Sim non-vacuity of the freshness rule** (`locks-core-stall-backup-unfresh`):
+  the sim does **not** reach it: 0 of 200 seeds fail with the lane ignoring the
+  freshness rule. The model does (`lane-ignores-freshness` violates mutual
+  exclusion across a fast takeover; the design is clean), so the rule's
+  non-vacuity rests on the model and the unit tests
+  (`a_fast_tenure_publishes_what_its_freshness_rests_on`,
+  `nothing_is_renewed_when_the_certificate_does_not_stand`).
+- **`locks-core-stall`** stalls the non-holder nodes (the holders at a healthy
+  owner: L4); the stalled *owner's* peers' grants are L5's, so `-root` stalls the
+  lease holder as a safety run (its own clients' grants are renewed by the lane,
+  its peers' lapse as before).
+
+### Root cause of the lone-node stalls that were not renewed (L3)
+
+`lock-stall-lone-node` (the core's own commit holding the writer lock 5, 12 and
+20 s) showed the lane renewing the own grant in 1 of 5 stalls; the store was not
+the cause (a lane renewal touches only the lock tables). Two defects, both found
+by counting what the lane saw (`locks.lane`: `ticks`, `stuck_ticks`,
+`uncovered`, `max_stuck_ms`):
+
+1. The lane ran as a task of the shared runtime. The stuck step blocked a worker
+   and the lane's timer wake-ups waited with it: `max_stuck_ms` 4966 with
+   `stuck_ticks` 1, one tick at the very end of a 5 s stall. The lane now runs on
+   a thread and a current-thread runtime of its own, like the holder's heartbeat
+   (`the_lane_ticks_while_the_shared_runtime_is_blocked`, which fails on the task).
+2. The core's renewal tick marks a due grant as renewing a moment before its step
+   sticks, and the lane did not touch a marked grant for the forward timeout.
+   With the core stuck (100 ms), a mark the lane did not set is no mark
+   (`LockTables::due_renewals_lane`, `an_own_grant_the_stuck_cores_tick_marked_is_renewed_by_the_lane`).
+
+After both, 5 of 5 runs pass at 5 and 12 s (8 own renewals, 40 stuck ticks), and
+every run with 20 s. The scenario's lane-off fail-before had become vacuous
+(plan 43's lapse parking keeps the owner from being fenced: the operations park
+for the stall and then answer OK, no `EIO`); the lapse is now read from the
+parking (`lapse_parks > 0` with the lane off, 0 and no late admission with it on),
+and `lock-store-stall-past-lease` likewise.
+
+### Evidence
+
+- Unit tests: authority lib 642, meta lib 344, engine lib 865 (the lane's four
+  engine tests among them), model suite in release, clippy and fmt clean. The
+  whole `tests/sim.rs` file was not run to the end (see R2).
+- Models (`crates/model/tests/locks.rs`): the freshness, cap and released-takeover
+  knobs find counterexamples, the designs are clean.
+- Sim (200 seeds each): `locks-core-stall{,-root,-single,-backup,-backup-beats,
+  -backup-unfresh,-s3,-writes,-blips,-delegated}` 0 failing (safety). Fenced I/O
+  of `locks-core-stall` over seeds 0 to 200: 15 with the lane, 79 without it
+  (231500 to 231540: 2 and 18); what is left is an owner that crashed and
+  restarted (its table is gone, the renewal is answered `Lost`) and a grant
+  installed and recalled while its holder's core is stuck (its first local lock
+  waits for that core). `locks_survive_core_stalls` asserts the fraction (a
+  quarter at most) and the non-vacuity of the unlaned configuration, where it used
+  to assert none; an earlier base had none in those seeds.
+- Harness: `lock-stall-lone-node` (5, 12 and 20 s): 8 of 8 runs
+  pass with the lane (5 runs of the final batch, three earlier), with
+  `CONSTELLATION_HARNESS_LONE_LANE=off` 3 of 3 (the lapse read from the parking);
+  before the two fixes above 4 of 5 failed. `lock-store-stall-past-lease` 4 of 4,
+  `lock-store-stall-holder` 6 of 6, `lock-lapse-lone-node`, `lock-failover`,
+  `lock-holder-killed-contention`, `lock-fence-at-close`, `lock-release-at-close`
+  and `flock-cross-node` pass (two batches).
+- Bench: `bench/lock-lane/RESULTS.md` (ext4, xfs, btrfs, tmpfs, 3 runs
+  alternated): `lock-latency` with the lane on against off, and the branch against
+  its base, show no regression on the requests that go through the core (within
+  5 %); the cached local operations are bimodal run to run on both sides.

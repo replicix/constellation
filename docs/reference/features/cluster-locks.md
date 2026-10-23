@@ -15,6 +15,7 @@ between nodes safely. It is on by default whenever P2P is on.
   - [Grants and local locks](#grants-and-local-locks)
   - [Close and release](#close-and-release)
   - [Leases, renewal and fencing](#leases-renewal-and-fencing)
+  - [Renewals off the core](#renewals-off-the-core)
   - [A lapsed grant is asked for back](#a-lapsed-grant-is-asked-for-back)
   - [The fencing token](#the-fencing-token)
   - [Conflicts, recalls and blocking waits](#conflicts-recalls-and-blocking-waits)
@@ -465,27 +466,44 @@ later than the first copy's. The copy's grants are dropped, counted
 restate what the first had.
 
 A grant lapses when its holding node, or that node's path to the
-sequencer, stalls past what is left of the grant's window: a partition,
-a stopped or swapped-out daemon, an overloaded host. Renewed half-way
-through, a grant has between `(ttl − margin) / 2` and `ttl − margin` of
-its window left at any moment (9.5–19 s at the defaults): a stall
-under 9.5 s never lapses it, a longer one shorter than the TTL can.
-The node that sequences the lock itself (a lone node, or the lease
-holder's own locks) is no exception: its renewal is a step of the same
-authority core, and a stalled core renews nothing. The xcheckfs run of
-2026-10-13 stalled a lone node's core for 18 s (a metadata-store write
-waiting on a journal write the overloaded host held up) and its grants
-lapsed. Its window is not stretched to the lease's for its own grants,
-because the node cannot tell from inside a stall that nobody acted on
-the expiry: a backup's seal or an `ack=s3` takeover deposes a holder
-well inside its lease TTL, and the successor's grace assumes every
-grant lapsed at its holder within a lock window. (The close-and-release
-waits above are bounded separately, by
-`CONSTELLATION_LOCK_CLOSE_WAIT_MS`; they do not stretch a window
-either.) The sequencer then outwaits the grant (its own too: the
-record lives until `ttl + margin` from its send, while the lapsed grant
-itself is dropped at the node's first renewal tick after the stall) and
-may give the lock to another node while the application on the first
+sequencer, **stops** past what is left of the grant's window: a partition,
+a stopped, swapped-out, frozen or dead daemon, a host that does not run
+the process at all (every thread of it stopped, `SIGSTOP`, a starved or
+suspended machine), or an authority core hung past the bounds below.
+Renewed half-way through, a grant has between `(ttl − margin) / 2` and
+`ttl − margin` of its window left at any moment (9.5–19 s at the
+defaults): a stop under 9.5 s never lapses it, a longer one shorter than
+the TTL can.
+
+**A slow disk alone no longer lapses it** (plan 41, [Renewals off the
+core](#renewals-off-the-core)). A renewal is a step of the node's authority
+core, and a core that waits seconds for a metadata-store write (a FUSE
+writer's slow journal write holding the store's writer lock, the core's
+priority write behind it: the xcheckfs run of 2026-10-13 stalled a lone
+node's core for 18 s and 24 s and its grants lapsed, the application's
+owner fenced with `EIO`) renews nothing. The renewal lane renews the
+grants meanwhile, off the core, so a `Local` lease holder's own grants and
+the grants a node holds at a healthy owner survive a stalled core up to the
+bounds below. What still lapses: the grants a stalled **owner**'s peers
+hold of it (the owner answers their renewals from its core; answering them
+off the core is a follow-up, plan 41 L5); a fast tenure (a listed backup,
+or `ack=s3`) past its freshness (the lane renews only within
+`backup_takeover_ms` of the core's last proof of liveness; a backup that
+seals the holder, or an `ack=s3` subscriber, takes the lease over and the
+holder's authority ends there); a stall past what is left of the root
+lease, which the stuck core cannot renew (the grants end at the lease's
+usable end, never later); and a core hung past
+`CONSTELLATION_LOCK_LANE_MAX_STALL_MS` for the grants held at another node.
+The node cannot tell from inside a *stop* that nobody acted on the expiry
+(a backup's seal or an `ack=s3` takeover deposes a holder well inside its
+lease TTL, and the successor's grace assumes every grant lapsed at its
+holder within a lock window), so a window is never stretched beyond what the
+lane's certificate allows. (The close-and-release waits above are bounded
+separately, by `CONSTELLATION_LOCK_CLOSE_WAIT_MS`; they do not stretch a
+window either.) After a lapse the sequencer outwaits the grant (its own
+too: the record lives until `ttl + margin` from its send, while the lapsed
+grant itself is dropped at the node's first renewal tick after the stop)
+and may give the lock to another node while the application on the first
 node still holds its `flock`. That node is **fenced** — unless the owner can prove nobody else was
 granted the lock since, in which case its I/O only waited
 ([below](#a-lapsed-grant-is-asked-for-back)):
@@ -571,6 +589,92 @@ cached pages of the file are dropped with them:
 
 Publishing that data later would overwrite what the next holder wrote
 under its own grant.
+
+### Renewals off the core
+
+A lock grant's renewal used to be a step of the node's authority core, and
+the core's step writes the metadata store synchronously: a store write that
+waits seconds on the device stopped every renewal of the node with it. The
+**renewal lane** (plan 41, `crates/authority/src/lane.rs`, driven by
+`crates/engine/src/lock_lane.rs` on a thread and a current-thread runtime of
+its own, like the holder's heartbeat: a core step stuck in a commit blocks a
+worker of the shared runtime and the tasks queued on it, and the lane, as a
+task there, did not tick for the whole of a 5 s stall) renews from
+memory alone, beside the core, under a **certificate** the core publishes at
+the end of every step, before the driver dispatches the step's actions
+(`Core::lock_lane_view`). It runs always, not only during stalls, so every
+lock workload exercises the path; `CONSTELLATION_LOCK_LANE=off` turns it off
+(A/B runs, the fail-before of the stall tests). It does two things:
+
+- **Own renewals**: this node's own grant at its own owner table (it is the
+  root lease holder and the holder both): the owner record and the held
+  window are extended in one `LockTables` critical section
+  (`renew_own`), with `now` read inside it, for `ttl = min(lock ttl,
+  certificate cap − now)` (no renewal at or below 0).
+- **Remote renewals**: it sends `LockRenew` for the held grants that are
+  due to their owner (where the last answer came from, else the holder as
+  last learned), one message per owner, and applies the `Ok` answers at once
+  (`LockTables::renewed`), counted from the send as the core counts them. A
+  renewal in flight whose mark is older than the forward timeout counts as
+  none: the request may be lost, and the lane asks again. A mark the
+  *core* left (its tick began to renew the grant and its step then stuck)
+  counts as none as soon as the core has been stuck for 100 ms
+  (`stuck_ticks` in the status): the lane's own marks it still respects.
+  An answer after the lane gave up on the request still counts, for up to a
+  minute, from that request's own send.
+
+It never grants, upgrades, reclaims, answers `Lost` or `NotOwner`,
+releases, flushes, drops a grant, routes, writes or reads the store, or logs.
+Every result, `Ok` included, goes to the core on the urgent lane
+(`Event::LaneRenewed`, `Event::LaneOwn`), which applies it as its own
+renewal's: the core decides everything the lane does not (`Lost`,
+`NotOwner`, the release of a recalled grant).
+
+The certificate (`LockLaneView`) says the lane may extend this node's own
+grants only while **all** hold: cluster locks on; the root lease held,
+usable, not lost, not fenced (no takeover gate, no release in flight);
+no continuation epoch open, held or being re-claimed; this node delegates
+nothing and no delegation is live in its replica (checked live by the lane);
+not resuming; no unmarked release in flight; no final mirror sent; `now`
+below the lease's usable end (`honour end − margin`); and, for a tenure that
+can be taken over before its lease expires, an S3 request that proved it
+live was sent within `backup_takeover_ms` and the lease is marked (the
+freshness rule of `renew_hold`). Each excluded state is one whose core rule
+differs from "extend a live record up to the lease cap". The lane's remote
+renewals need none of it (routing is liveness only: a wrong owner answers
+`NotOwner`, which the core handles), so they work under delegations and
+epochs too, and stop once the driver has been stuck for
+`CONSTELLATION_LOCK_LANE_MAX_STALL_MS` (default 120 s): a node whose core is
+hung, not slow, lets its grants lapse as it always did.
+
+Why every extension is one the core could have made at that instant: the
+lane and the core run in one process on one clock; the lane extends a
+record only if it is live under the tables' mutex, and every core decision
+that ends a record (expiry, release, move, outwait) is one critical section
+of `LockTables`, so it happens before the extension (which then finds
+nothing and leaves it) or after (and sees it); the authority facts are
+time-bounded and enforced by the lane (the cap, the freshness window) or
+revoked by the certificate of the step that changes them, published before
+that step's actions go out (a release's CAS, an epoch's recall), so every
+extension precedes the change and the successor's grace covers it; and the
+held window is extended from an owner's `Ok` with a `sent` no later than
+the real send. The model checks it (`crates/model/src/locks.rs`, plan 41
+L2: `Stall`, `LaneRenewOwn`; the lane ignoring the cap, ignoring a fast
+tenure's freshness, or keeping its certificate through a release and
+reviving dropped records each violate `mutual_exclusion`, the design is
+clean), the simulator runs it on every lock configuration
+(`locks-core-stall*`).
+
+Status: `locks.lane` (`enabled`, `own_renewals`, `remote_sent`,
+`remote_ok`, `late_ok`, `deferred`, `stall_stops`, `in_flight`, and the
+diagnosis counters `ticks`, `stuck_ticks`, `uncovered`, `max_stuck_ms`).
+
+**Host guidance.** A store stall is a property of the host, and the lane
+does not make it free: the application's writes wait for it. Fewer stalls:
+mount the state directory's file system `lazytime` (or `noatime`) and put
+the metadata journal on a device of its own; put the daemon log on a device
+that does not stall (the log writer never blocks the core since plan 44, but
+a stalled log device makes it drop lines, counted in `log lines dropped`).
 
 ### A lapsed grant is asked for back
 
@@ -1794,6 +1898,8 @@ WAN numbers are measured separately (`lock-latency`, `bench/remote`).
 | `CONSTELLATION_LOCKS` | unset | default for `--locks`; the flag wins |
 | `CONSTELLATION_LOCK_TTL_MS` | `20000` | a grant's lifetime, renewed half-way through the window it is honoured for |
 | `CONSTELLATION_LOCK_CACHE_IDLE_MS` | `30000` | how long a grant with no local lock under it is kept |
+| `CONSTELLATION_LOCK_LANE` | `on` | `off`, `0` or `false` turns the renewal lane off (A/B runs; [Renewals off the core](#renewals-off-the-core)) |
+| `CONSTELLATION_LOCK_LANE_MAX_STALL_MS` | `120000` | the lane's remote renewals stop once the authority driver has been stuck this long (a hung core is not a slow one) |
 | `CONSTELLATION_LOCK_CLOSE_WAIT_MS` | `100` | how long a non-blocking request may wait for a just-closed description's locks to go, counted from the close, and for an earlier turn's operations still in flight — never longer than this from the request itself ([Close and release](#close-and-release)); `0`: no wait; a single-worker mount never waits for the closed description's locks |
 
 The margin is the lease's; see [Configuration](../configuration.md#cluster-locks).
@@ -1817,6 +1923,9 @@ the delegation's TTL anyway.
 `constellation status` (JSON, under `locks`) shows the mode and counters
 for both roles:
 
+- the renewal lane (plan 41): `lane` (`enabled`, `own_renewals`,
+  `remote_sent`, `remote_ok`, `late_ok`, `deferred`, `stall_stops`,
+  `in_flight`, `ticks`, `stuck_ticks`, `uncovered`, `max_stuck_ms`), see [Renewals off the core](#renewals-off-the-core);
 - node side: `grants_held`, `requests`, `local_hits`,
   `local_conflicts`, `granted`, `would_block`, `unavailable`,
   `grant_ms_total` and the `grant_ms` histogram, `renewals`, `lost`,
@@ -1915,9 +2024,13 @@ grant lapsed is refused by its sequencer instead: `token_rejections`
 rises there, and the daemon logs "the lock grant it was issued under is
 no longer live". The usual cause is a stall of the node, or a
 partition from the owning sequencer, longer than
-`CONSTELLATION_LOCK_TTL_MS` (on the holder itself, a stall of its
-authority core: renewals of its own grants run there too, so a
-`slow core step` of that length in the log fences them; the disk under
+`CONSTELLATION_LOCK_TTL_MS` (a stall of the node's authority core no longer
+is, up to the bounds of [Renewals off the core](#renewals-off-the-core): the
+lane renews its own grants and the grants it holds at an owner meanwhile; one
+that outlasts the root lease, a core hung past
+`CONSTELLATION_LOCK_LANE_MAX_STALL_MS`, a stalled *owner*'s peers' grants and
+a fast tenure past its freshness still lapse, and a `slow core step` of that
+length in the log says which; the disk under
 `daemon.log` is not such a cause (unless the queue is off,
 `CONSTELLATION_LOG_QUEUE_BYTES=0`): a daemon's log writer never blocks the
 core, and a `log lines dropped` line says where that disk made the log lose
