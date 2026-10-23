@@ -949,7 +949,7 @@ impl constellation_net::PeerService for P2pBridge {
         });
     }
 
-    fn stream_ahead(&self, from: u64, epoch: u64, base: u64, txs: Vec<u8>) {
+    fn stream_ahead(&self, from: u64, epoch: u64, base: u64, txs: Vec<u8>, committed: bool) {
         if crate::fault::p2p_denied(from) {
             return;
         }
@@ -961,6 +961,7 @@ impl constellation_net::PeerService for P2pBridge {
             epoch,
             base,
             txs,
+            committed,
         });
     }
 

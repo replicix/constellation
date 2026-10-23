@@ -559,6 +559,8 @@ pub enum Payload {
         epoch: u64,
         base: u64,
         txs: Vec<u8>,
+        /// Plan 43 C1-4: see `PeerMsg::StreamAhead::committed`.
+        committed: bool,
     },
     /// A reply with nothing to say.
     Ok {

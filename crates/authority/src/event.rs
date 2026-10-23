@@ -647,6 +647,12 @@ pub enum PeerMsg {
         epoch: Epoch,
         base: Seq,
         txs: Vec<BackupTx>,
+        /// Plan 43 C1-4: the rows are held by the holder's group (or the
+        /// archive) — a holder streams only what its backups acknowledged —
+        /// except an epoch hold's, which streams to its tip; a subscriber
+        /// installs them as committed entries (not stranded by a takeover of
+        /// their epoch) iff set. Appended field: mixed versions unsupported.
+        committed: bool,
     },
     /// Plan 37 §8: the holder is about to be replaced by a successor on
     /// its own state dir (same node, lease and epoch): a backup of it at

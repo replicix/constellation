@@ -1880,7 +1880,7 @@ mod root_substitution_tests {
         }
         // Before the strand the generation executes.
         assert!(!meta.delegate_stranded(5).unwrap());
-        let stranded = meta.strand_for_takeover(2, &[5, 9]).unwrap();
+        let stranded = meta.strand_for_takeover(2, &[5, 9], None).unwrap();
         assert_eq!(stranded.locals, 3, "{stranded:?}");
         assert!(meta.delegate_stranded(5).unwrap());
         assert!(
@@ -1951,7 +1951,7 @@ mod root_substitution_tests {
         // generation still ends, or a write between the strand and the
         // tail's re-journal would precede it.
         let quiet = Meta::open_in_memory().unwrap();
-        assert!(!quiet.strand_for_takeover(2, &[7]).unwrap().any());
+        assert!(!quiet.strand_for_takeover(2, &[7], None).unwrap().any());
         assert!(quiet.delegate_stranded(7).unwrap());
         let refused = quiet.delegate_execute(
             &create("f1", 1),
@@ -1965,7 +1965,7 @@ mod root_substitution_tests {
             matches!(refused, Err(MetaError::NotAdmitted)),
             "{refused:?}"
         );
-        assert!(!quiet.strand_for_takeover(3, &[]).unwrap().any());
+        assert!(!quiet.strand_for_takeover(3, &[], None).unwrap().any());
     }
 }
 

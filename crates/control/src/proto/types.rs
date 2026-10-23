@@ -1459,6 +1459,16 @@ pub struct SpeculationStatus {
     /// at (the node then also asks for the lease to make them locally).
     pub copies_pending: u64,
     pub copies_stalled: u64,
+    /// Plan 43 C1-4: committed entries (answered or streamed as held by the
+    /// group or the archive) rolled back and replayed, since start. Only an
+    /// operator's `repair abandon-group` may raise it.
+    pub committed_rolled_back: u64,
+    /// Plan 43 C1-4: this node's committed unshipped transactions moved to a
+    /// member copy instead of replayed, since start.
+    pub member_copied: u64,
+    /// Plan 43 C1-4: committed requester/subscriber entries a takeover's
+    /// re-applied tail superseded, since start.
+    pub committed_superseded: u64,
 }
 
 /// Plan 30 §M13: the S3 inbox — a non-holder's forwarded mutations

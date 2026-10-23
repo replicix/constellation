@@ -884,6 +884,11 @@ pub fn counters(c: &crate::client::Client) -> serde_json::Value {
         "stranded_replayed": n(&s["speculation"]["stranded_replayed"]),
         "replay_conflicts": n(&s["speculation"]["replay_conflicts"]),
         "depositions": n(&s["speculation"]["depositions"]),
+        // Plan 43 C1-4: committed work rolled back (0 unless an operator
+        // abandoned a group), and the member copies held.
+        "non_lone_rollbacks": n(&s["speculation"]["committed_rolled_back"]),
+        "member_copied": n(&s["speculation"]["member_copied"]),
+        "member_copies": n(&s["ack"]["member_copies"]),
         "stranded_records": n(&s["reintegration"]["stranded_records"]),
         "conflicts_materialized": n(&s["reintegration"]["conflicts_materialized"]),
         "lock_recalls_expired": n(&s["locks"]["recalls_expired"]),

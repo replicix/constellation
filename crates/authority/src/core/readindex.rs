@@ -967,7 +967,7 @@ impl Core {
                         });
                     }
                 }
-                ParkedWhat::Finish { rid, .. } => {
+                ParkedWhat::Finish { rid, class, .. } => {
                     // Executed here but never acknowledged: in doubt, and
                     // retried by the same rid (the row is stranded and
                     // replayed by the recovery; `completed` dedups — a
@@ -975,7 +975,15 @@ impl Core {
                     // and the replay entry is marked unacked so that a
                     // refusal of it is this client's answer, not a
                     // conflict copy).
-                    self.replay.unacked.insert(rid);
+                    //
+                    // Plan 43 C1-4: a gated row is not replayed by this node
+                    // (the recovery moves it to the member copy of its epoch,
+                    // nothing is queued to mark): its client's retry dedups
+                    // against the successor's re-ship if the group held it,
+                    // and executes once if not.
+                    if !constellation_meta::RowClass::from(class).gated() {
+                        self.replay.unacked.insert(rid);
+                    }
                     if let Some(c) = self.clients.get_mut(&rid) {
                         c.forwarded = true;
                         c.phase = ClientPhase::WaitingLease;

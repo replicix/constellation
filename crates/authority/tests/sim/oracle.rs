@@ -946,6 +946,9 @@ fn expected_class(
 #[derive(Debug, Default, Clone)]
 pub struct NodeCopies {
     pub queued: BTreeSet<Rid>,
+    /// The queued rids whose entry stands for a committed answer (plan 43
+    /// C1-4: the class is gated).
+    pub queued_gated: BTreeSet<Rid>,
     pub executing: BTreeSet<Rid>,
 }
 
@@ -954,7 +957,12 @@ pub struct NodeCopies {
 #[derive(Debug, Default)]
 pub struct IdentityLedger {
     per_node: BTreeMap<NodeId, NodeCopies>,
+    /// Plan 43 C1-4: a rid queued for execution on two nodes at once where a
+    /// queued copy stands for a committed answer (what I2 (b) judges from C1).
     pub violations: BTreeMap<Rid, String>,
+    /// The same pairs where no copy stands for a committed answer: the lone
+    /// branch's and the delegations' (C2/C3 close them); counted, not judged.
+    pub ungated: BTreeMap<Rid, String>,
 }
 
 impl IdentityLedger {
@@ -963,14 +971,19 @@ impl IdentityLedger {
         &mut self,
         node: NodeId,
         queued: BTreeSet<Rid>,
+        queued_gated: BTreeSet<Rid>,
         executing: BTreeSet<Rid>,
         tick: u64,
     ) {
         let copies = self.per_node.entry(node).or_default();
-        if copies.queued == queued && copies.executing == executing {
+        if copies.queued == queued
+            && copies.queued_gated == queued_gated
+            && copies.executing == executing
+        {
             return;
         }
         copies.queued = queued;
+        copies.queued_gated = queued_gated;
         copies.executing = executing;
         let mine = copies.clone();
         let rids: BTreeSet<Rid> = mine.queued.union(&mine.executing).copied().collect();
@@ -992,14 +1005,16 @@ impl IdentityLedger {
                     }
                     k.join("+")
                 };
-                self.violations.insert(
-                    rid,
-                    format!(
-                        "I2 one_identity_per_op: rid {rid:?} queued on {node} ({}) and {other} ({}) at tick {tick}",
-                        kinds(&mine),
-                        kinds(c)
-                    ),
+                let text = format!(
+                    "I2 one_identity_per_op: rid {rid:?} queued on {node} ({}) and {other} ({}) at tick {tick}",
+                    kinds(&mine),
+                    kinds(c)
                 );
+                if mine.queued_gated.contains(&rid) || c.queued_gated.contains(&rid) {
+                    self.violations.insert(rid, text);
+                } else {
+                    self.ungated.entry(rid).or_insert(text);
+                }
                 break;
             }
         }
@@ -1047,8 +1062,11 @@ pub struct Findings {
     /// Plan 43 C1-2: answers whose class claim is not borne out
     /// (`strict_commit` fails the run on one).
     pub class_claim: Vec<String>,
-    /// I2 (b): one description per rid queued on two nodes.
+    /// I2 (b): one description per rid queued on two nodes (a copy standing
+    /// for a committed answer).
     pub i2: Vec<String>,
+    /// I2 (b) where no copy stands for a committed answer (counted).
+    pub i2_ungated: Vec<String>,
     /// I2 (c): one description per rid not completed verbatim.
     pub i2c: Vec<String>,
     pub i4: Vec<String>,
@@ -1092,16 +1110,14 @@ pub fn end_of_run(
         i1: o.i1_violations.lock().unwrap().clone(),
         class_claim: o.claim_violations.lock().unwrap().clone(),
         i6: o.leases.violations.lock().unwrap().clone(),
-        i2: o
-            .identity
-            .lock()
-            .unwrap()
-            .violations
-            .values()
-            .cloned()
-            .collect(),
         ..Findings::default()
     };
+    {
+        // (One guard: two in the literal above would deadlock.)
+        let ledger = o.identity.lock().unwrap();
+        f.i2 = ledger.violations.values().cloned().collect();
+        f.i2_ungated = ledger.ungated.values().cloned().collect();
+    }
     let acks = o.acks.lock().unwrap();
     let mut non_lone_ok: BTreeSet<Rid> = BTreeSet::new();
     let mut verbatim: BTreeMap<Rid, String> = BTreeMap::new();
@@ -1263,44 +1279,87 @@ pub fn end_of_run(
 }
 
 /// Why the log does not carry `t` as it was committed (`None`: it does).
+///
+/// Plan 43 C1-4 (D9): a transaction a takeover re-ships carries its identity
+/// as its first record (`TailOf { epoch, jseq }`: the journal that first held
+/// it, kept through any number of re-ships). The transaction `t` is judged by
+/// that identity — its own `TailOf` if it is a re-shipped one, else its place
+/// in its epoch's journal — against the log's completing transaction's, and
+/// its records must be the log's, ignoring the `TailOf` records of either.
 fn not_verbatim(
     log: &super::check::Oracle,
     rid: Rid,
     t: &TxRef,
     converged: bool,
 ) -> Option<String> {
+    use constellation_meta::LogRecord;
     let Some((seq, i)) = log.completed_at.get(&rid).copied() else {
         return converged.then(|| "absent: the log never completed it".to_string());
     };
     let seg = log.unfenced.get(&seq)?;
+    let plain = |r: &&LogRecord| !matches!(r, LogRecord::TailOf { .. });
+    let want: Vec<&LogRecord> = t.records.iter().filter(plain).collect();
+    // The run of the log's records that is the completing transaction:
+    // ends at the completing record, carries `want` (ignoring `TailOf`), and
+    // may begin with the `TailOf` that names it.
+    let mut run: Option<(usize, usize)> = None;
+    if !want.is_empty() {
+        // (The completion is not always the transaction's last record: an
+        // inbox position's acknowledgement rides after it.)
+        'search: for st in (0..=i).rev() {
+            if !plain(&&seg.records[st]) {
+                continue;
+            }
+            for end in i..seg.records.len() {
+                let got: Vec<&LogRecord> = seg.records[st..=end].iter().filter(plain).collect();
+                if got.len() > want.len() {
+                    break;
+                }
+                if got == want {
+                    run = Some((st, end));
+                    break 'search;
+                }
+            }
+            if seg.records[st..=i].iter().filter(plain).count() > want.len() {
+                break;
+            }
+        }
+    }
+    let log_ident = run.and_then(|(st, _)| match st.checked_sub(1).map(|p| &seg.records[p]) {
+        Some(LogRecord::TailOf { epoch, jseq }) => Some((*epoch, *jseq)),
+        _ => None,
+    });
+    let t_ident = constellation_meta::tail_identity(&t.records).unwrap_or((t.epoch, t.first));
     let identity = if t.origin.0 == 0 {
-        seg.epoch == t.epoch && seg.node == t.node && seg.rows.contains(&t.first)
+        match log_ident {
+            Some(id) => id == t_ident,
+            None => {
+                seg.epoch == t.epoch
+                    && seg.node == t.node
+                    && seg.rows.contains(&t.first)
+                    && t_ident == (t.epoch, t.first)
+            }
+        }
     } else {
         seg.origins.contains(&t.origin)
     };
     if !identity {
         return Some(format!(
-            "its completion is in segment {seq} (epoch {}, node {}, rows {:?}, origins {:?}): \
-             not under the identity it was committed with",
+            "its completion is in segment {seq} (epoch {}, node {}, rows {:?}, origins {:?}, \
+             identity {log_ident:?}): not under the identity it was committed with {t_ident:?}",
             seg.epoch, seg.node, seg.rows, seg.origins
         ));
     }
-    if !t.records.is_empty() {
-        // The records it was committed with, contiguous, around the
-        // completing record.
-        let n = t.records.len();
-        let start_lo = (i + 1).saturating_sub(n);
-        let found = (start_lo..=i).any(|st| {
-            seg.records
-                .get(st..st + n)
-                .is_some_and(|w| w == t.records.as_slice())
-        });
-        if !found {
-            return Some(format!(
-                "its completion is in segment {seq} at record {i}, which does not carry the \
-                 {n} record(s) it was committed with as one run"
-            ));
-        }
+    if !want.is_empty() && run.is_none() {
+        let from = i.saturating_sub(want.len() + 1);
+        return Some(format!(
+            "its completion is in segment {seq} at record {i}, which does not carry the \
+             {} record(s) it was committed with as one run (committed with {:?}; the log's \
+             records {from}..={i}: {:?})",
+            want.len(),
+            t.records,
+            &seg.records[from..=i]
+        ));
     }
     None
 }
@@ -2136,31 +2195,38 @@ mod tests {
     fn i2_two_nodes_queue_one_rid() {
         let mut l = IdentityLedger::default();
         let r = rid(2, 5);
-        l.update(1, [r].into(), BTreeSet::new(), 1);
+        l.update(1, [r].into(), [r].into(), BTreeSet::new(), 1);
         assert!(l.violations.is_empty(), "one copy is fine");
         // The same node holding the rid queued and executing is one copy
         // (the client's retry merged with its queue entry).
-        l.update(1, [r].into(), [r].into(), 2);
+        l.update(1, [r].into(), [r].into(), [r].into(), 2);
         assert!(l.violations.is_empty());
-        l.update(2, BTreeSet::new(), [r].into(), 3);
+        l.update(2, BTreeSet::new(), BTreeSet::new(), [r].into(), 3);
         assert_eq!(l.violations.len(), 1, "{:?}", l.violations);
         let text = &l.violations[&r];
         assert!(text.contains("queued on 2 (executing) and 1"), "{text}");
         // A crash drops the executing copy but keeps the queue.
         let mut l = IdentityLedger::default();
-        l.update(2, BTreeSet::new(), [r].into(), 1);
+        l.update(2, BTreeSet::new(), BTreeSet::new(), [r].into(), 1);
         l.crash(2);
-        l.update(1, [r].into(), BTreeSet::new(), 2);
+        l.update(1, [r].into(), [r].into(), BTreeSet::new(), 2);
         assert!(l.violations.is_empty());
         let mut l = IdentityLedger::default();
-        l.update(1, [r].into(), BTreeSet::new(), 1);
+        l.update(1, [r].into(), [r].into(), BTreeSet::new(), 1);
         l.crash(1);
-        l.update(2, BTreeSet::new(), [r].into(), 2);
+        l.update(2, BTreeSet::new(), BTreeSet::new(), [r].into(), 2);
         assert_eq!(l.violations.len(), 1, "the queue survives a crash");
         let mut l = IdentityLedger::default();
-        l.update(1, [r].into(), BTreeSet::new(), 1);
+        l.update(1, [r].into(), [r].into(), BTreeSet::new(), 1);
         l.wipe(1);
-        l.update(2, BTreeSet::new(), [r].into(), 2);
+        l.update(2, BTreeSet::new(), BTreeSet::new(), [r].into(), 2);
         assert!(l.violations.is_empty(), "a restart without the journal");
+        // Plan 43 C1-4: a pair none of whose queued copies stands for a
+        // committed answer is the lone branch's: counted apart.
+        let mut l = IdentityLedger::default();
+        l.update(1, [r].into(), BTreeSet::new(), BTreeSet::new(), 1);
+        l.update(2, BTreeSet::new(), BTreeSet::new(), [r].into(), 2);
+        assert!(l.violations.is_empty());
+        assert_eq!(l.ungated.len(), 1);
     }
 }

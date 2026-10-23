@@ -1268,6 +1268,30 @@ pub struct Stats {
     pub tail_fetch_wait_ms_total: u64,
     pub groups_abandoned: u64,
     pub member_copies_retired: u64,
+    /// Plan 43 C1-4: a backup's contiguous tail moved to a member copy when
+    /// its holder's lease moved on to a later epoch.
+    pub tails_kept_as_member_copy: u64,
+    /// Plan 43 C1-4: member-copy rows dropped as never committed (past a
+    /// marker's `through`, or unacknowledged at a newer marker).
+    pub member_copies_dropped: u64,
+    /// Plan 43 C1-4: member-copy rows an operator's abandon queued.
+    pub member_copies_abandoned: u64,
+    /// Plan 43 C1-4: this node's committed unshipped transactions moved to
+    /// a member copy (a deposition, a takeover's strand) instead of queued.
+    pub rows_member_copied: u64,
+    /// Plan 43 C1-4: committed requester/subscriber entries a takeover
+    /// gate took out because the tail it re-applies carries their rows.
+    pub committed_superseded: u64,
+    /// Plan 43 C1-4 (`speculation.committed_rolled_back`): committed
+    /// entries rolled back and replayed. Only an operator's abandon may
+    /// raise it.
+    pub committed_rolled_back: u64,
+    /// Plan 43 C1-4: a gated `Local` row put in the replay queue. Must stay
+    /// 0 (a debug assertion backs it).
+    pub replay_gated_enqueued: u64,
+    /// Plan 43 C1-4: tail transactions past a gap, not re-shipped (never
+    /// acknowledged; their clients retry by rid).
+    pub tail_beyond_gap_dropped: u64,
     pub inherited_tails_cleared: u64,
     pub ttl_claims_without_tail: u64,
     /// Plan 43 C1-2: journal rows the core wrote without setting their
@@ -2198,15 +2222,15 @@ impl Core {
                 gen,
                 own_chunks,
                 own_rows,
-                // Plan 43 C1-2: carried for C1-4, which installs the
-                // requester's shadow or hint as committed from it.
-                committed: _,
+                // Plan 43 C1-4: the requester's shadow or hint is installed as
+                // committed from it.
+                committed,
             } => self.on_mutate_reply(
                 now,
                 from,
                 req,
                 outcome,
-                (base, position, gen, own_chunks, own_rows),
+                (base, position, gen, own_chunks, own_rows, committed),
                 replica,
                 out,
             ),
@@ -2281,9 +2305,12 @@ impl Core {
                 sealed,
                 fresh,
             } => self.on_backup_ack(now, from, req, epoch, acked, sealed, fresh, replica, out),
-            PeerMsg::StreamAhead { epoch, base, txs } => {
-                self.on_stream_ahead(now, from, epoch, base, txs, replica, out)
-            }
+            PeerMsg::StreamAhead {
+                epoch,
+                base,
+                txs,
+                committed,
+            } => self.on_stream_ahead(now, from, epoch, base, txs, committed, replica, out),
             PeerMsg::BackupHold { epoch, for_ms } => self.on_backup_hold(now, from, epoch, for_ms),
             PeerMsg::PromiseRequest { req, key } => {
                 self.on_promise_request(now, from, req, key, replica, out)
@@ -2585,7 +2612,6 @@ impl Core {
             // Plan 43 C1-3: a lease of a later epoch that no longer names
             // a tail this node keeps a copy of ends the copy.
             if let Some((lease, _)) = object {
-                self.retire_member_copies(lease, replica);
                 self.note_group_wait_lease(lease);
             }
             if self.lease.observe(now, object.as_ref())

@@ -1210,6 +1210,23 @@ impl SessionState {
         self.cv.notify_all();
     }
 
+    /// Plan 43 C1-4: whether row `jseq` of `epoch`'s tenure is in the log this
+    /// replica applied: at or below the applied journal position of that
+    /// epoch, or applied ahead of it (a segment named it while an earlier row
+    /// was deferred). The pre-S3 stream delivers a transaction a millisecond
+    /// after the segment carrying it now and then; installed after the fact,
+    /// a committed entry would wait for a segment that already went by.
+    pub fn row_in_log(&self, epoch: u64, jseq: u64) -> bool {
+        let g = self.inner.lock().unwrap();
+        let Some(a) = g.applied.filter(|a| a.epoch == epoch) else {
+            return false;
+        };
+        jseq <= a.jseq
+            || g.ahead
+                .as_ref()
+                .is_some_and(|(e, rows)| *e == epoch && rows.end_covering(jseq).is_some())
+    }
+
     /// Plan 30 §M9 × §M11: the pre-S3 stream installed the holder's
     /// journal here through `pos` (see `Inner::streamed`).
     pub fn note_streamed(&self, pos: JournalPos) {

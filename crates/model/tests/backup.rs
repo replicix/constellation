@@ -55,7 +55,13 @@ fn assert_clean(label: &str, model: &BackupModel, sometimes: &[&'static str]) {
         checker.is_done() && checker.state_count() < CAP.0,
         "{label}: expected exhaustive exploration within budget"
     );
-    for p in ["acked_never_lost", "ack_order_is_log_order"] {
+    let mut props = vec!["acked_never_lost", "ack_order_is_log_order"];
+    // Without `commit_rule` a deposed holder replays what it journaled
+    // (`today_a_deposed_holder_replays_committed_rows`).
+    if model.commit_rule {
+        props.push("acked_never_rolled_back");
+    }
+    for p in props {
         if let Some(d) = checker.discovery(p) {
             panic!(
                 "{label}: `{p}` violated: {:?}\n{:#?}",
@@ -240,6 +246,7 @@ fn today_a_deposed_holder_replays_committed_rows() {
 /// expires.
 fn ttl_claim_model(tail_fetch: bool) -> BackupModel {
     BackupModel {
+        commit_rule: true,
         tail_fetch,
         fast_takeover: false,
         reconfig: false,
@@ -280,6 +287,7 @@ fn a_ttl_claim_with_the_tail_fetch_is_clean() {
 /// copy of the old group only.
 fn chained_takeover_model(inherited_tail: bool) -> BackupModel {
     BackupModel {
+        commit_rule: true,
         tail_fetch: true,
         inherited_tail,
         initial_backups: vec![1, 2],
@@ -339,13 +347,126 @@ fn tail_fetch_and_inherited_tail_three_nodes_with_reconfiguration_is_clean() {
     );
 }
 
-/// The knob C1 will implement is refused until then.
+/// Plan 43 C1-4: the design with every knob the real protocol has — a
+/// backed holder deposed by its backup's seal takeover keeps its gated rows
+/// as a member copy (never in its replay set), the successor re-ships, a
+/// removal, a crash. Two nodes.
 #[test]
-#[should_panic(expected = "plan 43 C1")]
-fn the_commit_rule_knob_is_not_implemented_before_c1() {
+fn commit_rule_two_nodes_is_clean() {
     let m = BackupModel {
         commit_rule: true,
+        tail_fetch: true,
+        inherited_tail: true,
+        max_tick: 2,
+        max_epoch: 2,
         ..BackupModel::backup(2, 1)
     };
-    let _ = m.init_states();
+    assert_clean(
+        "commit-rule-2",
+        &m,
+        &[
+            "seal_takeover",
+            "tail_reshipped",
+            "backup_removed",
+            "member_copy_kept",
+            "member_copy_retired",
+            "all_acked_and_in_log",
+        ],
+    );
+}
+
+/// Plan 43 C1-4: three nodes (one writer with two writes; every node writing
+/// is the ignored variant below), a removal and an addition, seal and TTL
+/// takeovers, a crash, the chain of two takeovers.
+#[test]
+fn commit_rule_three_nodes_is_clean() {
+    let m = BackupModel {
+        commit_rule: true,
+        tail_fetch: true,
+        inherited_tail: true,
+        writers: 1,
+        max_tick: 1,
+        lease_ttl: 1,
+        max_epoch: 3,
+        ..BackupModel::backup(3, 2)
+    };
+    assert_clean(
+        "commit-rule-3",
+        &m,
+        &[
+            "seal_takeover",
+            "tail_fetched",
+            "member_copy_kept",
+            "member_copy_retired",
+            "all_acked_and_in_log",
+        ],
+    );
+}
+
+/// Plan 43 C1-4: the chained takeover of D2 with the commit rule — the
+/// successor dies before shipping and a TTL claimant fetches the old group's
+/// tail from a member copy (a deposed holder's, or a backup's kept tail).
+#[test]
+fn commit_rule_chained_takeover_fetches_a_member_copy() {
+    assert_clean(
+        "commit-rule-chained",
+        &chained_takeover_model(true),
+        &[
+            "tail_fetched",
+            "inherited_tail_fetched",
+            "member_copy_fetched",
+        ],
+    );
+}
+
+/// Plan 43 C1-4 (fail-before for rule 2 of spec §6.4): a successor's marker
+/// that drops the whole member copy of the epoch it carries the tail of —
+/// not only the rows past `through` — leaves the re-shipped rows with the
+/// successor alone; when it dies before shipping, the acknowledged write is
+/// lost. Rows are retired by the log carrying them, not by the marker.
+#[test]
+fn dropping_the_member_copy_at_the_marker_loses_an_acked_write() {
+    let m = BackupModel {
+        drop_member_at_tail_follows: true,
+        ..chained_takeover_model(true)
+    };
+    assert_violates("drop-at-marker", &m, "acked_never_lost");
+}
+
+/// Plan 43 C1-4: the same chain with the three nodes all writing is over the
+/// budget for the default run (about 25M states, 20 s).
+#[test]
+#[ignore]
+fn commit_rule_three_nodes_all_writing_is_clean() {
+    let m = BackupModel {
+        commit_rule: true,
+        tail_fetch: true,
+        inherited_tail: true,
+        max_tick: 1,
+        lease_ttl: 1,
+        max_epoch: 3,
+        ..BackupModel::backup(3, 1)
+    };
+    assert_clean(
+        "commit-rule-3-all-writers",
+        &m,
+        &["seal_takeover", "tail_fetched", "member_copy_kept"],
+    );
+}
+
+/// Plan 43 C1-4: `S3` with the commit rule — an `Archive`-class row of a
+/// deposed holder is never acknowledged, so the marker without a tail drops
+/// it (rule 4); no acknowledged write is replayed or lost.
+#[test]
+fn commit_rule_s3_is_clean() {
+    let m = BackupModel {
+        commit_rule: true,
+        max_tick: 1,
+        ..BackupModel::s3(3, 1)
+    };
+    assert_clean(
+        "commit-rule-s3",
+        &m,
+        &["s3_fast_takeover", "all_acked_and_in_log"],
+    );
 }

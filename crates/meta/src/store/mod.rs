@@ -101,6 +101,7 @@ pub mod backup;
 mod bootstrap;
 pub(crate) mod gate;
 pub mod horizon;
+pub(crate) mod member;
 pub use gate::{
     fault_caller_scope, gate_totals, priority_writes, FaultCallerScope, GateTotals, PriorityStats,
 };
@@ -634,6 +635,9 @@ pub struct Meta {
     /// `None`: unknown (fresh open, or cleared), the next trim scans
     /// from the start and establishes it.
     pub(crate) backup_tail_floor: std::sync::Mutex<Option<(u64, u64)>>,
+    /// Plan 43 C1-4: this node holds a member copy (`store::member`); the
+    /// segment path reads it before looking for one.
+    pub(crate) any_member_copy: std::sync::atomic::AtomicBool,
     /// How many times a ship plan, a retirement or an ack took a held-set
     /// path (plan 30 §M4 round 2). Only ever moves while something is
     /// poisoned or held; the cost tests in `store::local` pin that it stays
@@ -1107,6 +1111,7 @@ impl Meta {
             unshipped_gen: AtomicU64::new(0),
             unshipped_seqs: std::sync::Mutex::new(UnshippedSeqs::default()),
             backup_tail_floor: std::sync::Mutex::new(None),
+            any_member_copy: std::sync::atomic::AtomicBool::new(false),
             held_work: AtomicU64::new(0),
             blame_cache: Default::default(),
             session: crate::session::SessionState::default(),
@@ -1130,6 +1135,7 @@ impl Meta {
         };
         meta.check_format()?;
         meta.bootstrap()?;
+        meta.refresh_member_copy_flag()?;
         meta.build_pending_by_ino()?;
         meta.verify_mark_counts()?;
         let table = meta.delegation_table();

@@ -688,7 +688,7 @@ impl NodeHandle {
             rx,
             urgent_rx,
             shared: shared.clone(),
-            rolled_back_seen: (0, 0),
+            rolled_back_seen: (0, 0, 0),
             journal_seen: None,
             timers: HashSet::new(),
             timer_kinds: HashMap::new(),
@@ -930,7 +930,7 @@ struct Driver {
     /// ([`Driver::next_event`]).
     urgent_rx: mpsc::UnboundedReceiver<Event>,
     shared: Arc<Shared>,
-    rolled_back_seen: (u64, u64),
+    rolled_back_seen: (u64, u64, u64),
     /// `(journal tip, journal length)` when `Shared::journaled_refusals`
     /// was last taken.
     journal_seen: Option<(u64, u64)>,
@@ -2042,14 +2042,27 @@ impl Driver {
     /// the rids whose acknowledgements are now tentative.
     fn note_rollbacks(&mut self) {
         let s = self.core.stats;
-        let now = (s.speculation_rolled_back, s.local_rolled_back);
+        // (Plan 43 C1-4: a committed row moved to a member copy is no
+        // replay, but the journal row it leaves is a refusal's to re-judge.)
+        let now = (
+            s.speculation_rolled_back,
+            s.local_rolled_back,
+            s.rows_member_copied,
+        );
         if now == self.rolled_back_seen {
             return;
         }
         self.rolled_back_seen = now;
         let mut t = self.shared.tentative.lock().unwrap();
+        let debug = std::env::var_os("AUTHORITY_SIM_ORACLE_DEBUG").is_some();
         if let Ok(queue) = self.meta.pending_replays() {
             for q in queue {
+                if debug {
+                    eprintln!(
+                        "ORACLE-ROLLBACK node {} replay queue: {:?} class {:?} foreign {}",
+                        self.id, q.rid, q.class, q.foreign
+                    );
+                }
                 t.insert(q.rid);
             }
         }
@@ -2061,7 +2074,29 @@ impl Driver {
                 // The refusal's row is gone, or the log now carries the rid
                 // executed: the refusal was rolled back either way.
                 Ok(None | Some(CompletedOutcome::Executed { .. })) => {
-                    t.insert(*rid);
+                    // Plan 43 C1-4: a committed refusal the deposition moved
+                    // to the member copy is held, not rolled back: the
+                    // successor re-ships it.
+                    // Nor is one this node never answered: the client was told
+                    // the rid's outcome by the sequencer it retried at (a
+                    // paused holder's refusal, journaled and parked, is
+                    // another thing than the answer its client heard).
+                    let answered_here = self
+                        .oracles
+                        .acks
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|a| a.node == self.id && a.rid == *rid && a.kind.is_refusal());
+                    if answered_here && !self.meta.member_copy_carries(*rid).unwrap_or(false) {
+                        if debug {
+                            eprintln!(
+                                "ORACLE-ROLLBACK node {} journaled refusal gone: {:?}",
+                                self.id, rid
+                            );
+                        }
+                        t.insert(*rid);
+                    }
                     false
                 }
                 _ => true,
@@ -2072,18 +2107,22 @@ impl Driver {
     /// execution — its replay queue and the core's client map (its own
     /// clients' submissions and its in-flight replays, one entry per rid).
     fn note_identity(&self) {
-        let queued: BTreeSet<Rid> = self
-            .meta
-            .pending_replays()
-            .map(|q| q.into_iter().map(|s| s.rid).collect())
-            .unwrap_or_default();
+        let replays = self.meta.pending_replays().unwrap_or_default();
+        let queued: BTreeSet<Rid> = replays.iter().map(|s| s.rid).collect();
+        let queued_gated: BTreeSet<Rid> = replays
+            .iter()
+            .filter(|s| s.class.gated())
+            .map(|s| s.rid)
+            .collect();
         let executing: BTreeSet<Rid> = self.core.clients().map(|(rid, _)| rid).collect();
         let tick = self.oracles.tick.load(Ordering::SeqCst);
-        self.oracles
-            .identity
-            .lock()
-            .unwrap()
-            .update(self.id, queued, executing, tick);
+        self.oracles.identity.lock().unwrap().update(
+            self.id,
+            queued,
+            queued_gated,
+            executing,
+            tick,
+        );
     }
 
     /// Plan 43 C0, I1: an answer leaves this node (a `MutateReply` to a

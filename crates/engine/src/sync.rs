@@ -485,6 +485,7 @@ pub enum SyncRequest {
         epoch: u64,
         base: u64,
         txs: Vec<constellation_meta::BackupTx>,
+        committed: bool,
     },
     /// The lease holder's off-core liveness heartbeat, stamped with its
     /// arrival (this node's wait clock, ms): `Event::HolderAlive`, with the beat's number

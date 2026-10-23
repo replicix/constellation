@@ -751,7 +751,9 @@ impl Core {
                 .filter(|r| {
                     !matches!(
                         r,
-                        LogRecord::TailFollows { .. } | LogRecord::GroupAbandoned { .. }
+                        LogRecord::TailFollows { .. }
+                            | LogRecord::TailFollowsThrough { .. }
+                            | LogRecord::GroupAbandoned { .. }
                     )
                 })
                 .cloned()
@@ -786,7 +788,9 @@ impl Core {
             if seg.records.iter().all(|r| {
                 matches!(
                     r,
-                    LogRecord::TailFollows { .. } | LogRecord::GroupAbandoned { .. }
+                    LogRecord::TailFollows { .. }
+                        | LogRecord::TailFollowsThrough { .. }
+                        | LogRecord::GroupAbandoned { .. }
                 )
             }) {
                 if let Some(gate) = self.lease.gate.as_mut() {
@@ -806,6 +810,19 @@ impl Core {
             );
             replica.skip_segment(seq)?;
         } else {
+            // Plan 43 C1-4: a backup whose holder's tenure a newer epoch's
+            // segment ends keeps its tail as a member copy *before* the
+            // segment is applied: the marker's `TailFollowsThrough` and the
+            // re-shipped rows' identities that follow it are what drop and
+            // retire the copy, and they find it there.
+            if let Some(role) = self.bk.role.filter(|r| r.epoch < seg.epoch) {
+                if self.keep_tail_as_member_copy(role, replica) {
+                    self.bk.role = None;
+                    self.bk.acked = 0;
+                    self.bk.held.clear();
+                    replica.backup_clear();
+                }
+            }
             let applied = replica.apply_segment(
                 seq,
                 seg.epoch,
@@ -822,14 +839,21 @@ impl Core {
                 records = seg.records.len(),
                 retired = applied.retired,
                 skipped = applied.skipped,
+                rows = ?seg.rows,
+                through = seg.through,
                 "applied foreign segment"
             );
             self.stats.conflicts += applied.skipped as u64;
             if applied.stranded.any() {
                 self.stats.speculation_rolled_back +=
                     (applied.stranded.shadows + applied.stranded.hints) as u64;
-                self.stats.local_rolled_back += applied.stranded.locals as u64;
+                self.stats.local_rolled_back +=
+                    (applied.stranded.locals + applied.stranded.member_copied) as u64;
+                self.note_committed_stranded(&applied.stranded);
             }
+            self.stats.member_copies_retired += applied.member.retired as u64;
+            self.stats.member_copies_dropped += applied.member.dropped as u64;
+            self.stats.member_copies_abandoned += applied.member.abandoned as u64;
             // A newer tenure strands what the old one streamed ahead: the
             // stream's watermark no longer stands for this replica.
             if applied.stranded.any() || seg.epoch > self.ship.max_epoch {
@@ -1178,7 +1202,7 @@ impl Core {
             through,
             &[],
             &[],
-            &marker_records(&gate, self.bk.abandoned_claim),
+            &marker_records(&gate, self.bk.abandoned_claim, self.bk.tail_through),
         )
         .expect("marker segment");
         let seq = self.ship.next_seq;
@@ -1229,7 +1253,7 @@ impl Core {
             } else {
                 Vec::new()
             };
-            match replica.strand_for_takeover(gate.epoch, &own_gens) {
+            match replica.strand_for_takeover(gate.epoch, &own_gens, self.bk.gate_abandoned) {
                 Ok(stranded) => {
                     self.lock_note_replay_pins(now, replica);
                     if stranded.any() {
@@ -1239,11 +1263,15 @@ impl Core {
                             shadows = stranded.shadows,
                             hints = stranded.hints,
                             local = stranded.locals,
+                            member_copied = stranded.member_copied,
+                            superseded = stranded.superseded,
                             "takeover stranded speculative state; rolled back, replaying"
                         );
                         self.stats.speculation_rolled_back +=
                             (stranded.shadows + stranded.hints) as u64;
-                        self.stats.local_rolled_back += stranded.locals as u64;
+                        self.stats.local_rolled_back +=
+                            (stranded.locals + stranded.member_copied) as u64;
+                        self.note_committed_stranded(&stranded);
                     }
                     // A generation that lost rows here never executes
                     // again: ended by this node once its gate opens, or
@@ -1301,6 +1329,7 @@ impl Core {
             return GateStep::NeedDrain;
         }
         self.lease.gate = None;
+        self.bk.gate_abandoned = None;
         GateStep::Done
     }
 
@@ -1334,7 +1363,7 @@ impl Core {
         self.ship.head_seq = self.ship.head_seq.max(seq);
         self.ship.max_epoch = self.ship.max_epoch.max(epoch);
         self.stats.epoch_markers += 1;
-        let records = marker_records(gate, self.bk.abandoned_claim.take());
+        let records = marker_records(gate, self.bk.abandoned_claim.take(), self.bk.tail_through);
         let payload = segment::encode(self.cfg.node_id, epoch, through, &[], &[], &records)
             .expect("marker segment");
         self.stream_passed(now, seq, epoch, &payload, out);
@@ -1441,8 +1470,9 @@ impl Core {
             let stranded = replica
                 .strand_below_epoch(floor)
                 .map_err(|e| e.to_string())?;
-            rolled += stranded.locals as u64;
+            rolled += (stranded.locals + stranded.member_copied) as u64;
             self.stats.speculation_rolled_back += (stranded.shadows + stranded.hints) as u64;
+            self.note_committed_stranded(&stranded);
             let clk = self.clk;
             self.lock_note_replay_pins(clk, replica);
         }
@@ -3325,6 +3355,11 @@ impl Core {
             );
         }
         self.bk.fetched = None;
+        // Plan 43 C1-4: what this gate re-ships reaches `through` (the
+        // sealed tail's contiguous hold: its marker says so), and the group
+        // the operator gave up, if any, strands its committed entries too.
+        self.bk.tail_through = backup_tail_epoch.map_or(0, |e| replica.backup_acked(e));
+        self.bk.gate_abandoned = self.bk.abandoned_claim;
         // Plan 30 §M3 takeover gate; M13: every acquisition drains the
         // older epochs' inbox before its view opens.
         let gate = PendingGate {
@@ -4866,10 +4901,30 @@ impl Core {
 /// member of which answered (`constellation repair abandon-group`) says so
 /// instead: `LogRecord::GroupAbandoned`, the log's permanent record that
 /// rows that group acknowledged are not re-shipped by this tenure.
-fn marker_records(gate: &PendingGate, abandoned: Option<Epoch>) -> Vec<LogRecord> {
+///
+/// Plan 43 C1-4: a takeover that carries no tail says so for the epoch it
+/// took over, `TailFollowsThrough { prev_epoch, through: 0 }`: nothing of
+/// that epoch's group was committed and unshipped (its lease listed no
+/// backup and named no tail; a claim over a group that might hold rows
+/// fetches its tail or waits, C1-3). A node that holds rows of that epoch as
+/// a member copy — or comes to hold them later, a deposed holder back from a
+/// crash — drops them: they were never committed.
+fn marker_records(gate: &PendingGate, abandoned: Option<Epoch>, through: u64) -> Vec<LogRecord> {
+    let no_tail = (gate.takeover
+        && gate.epoch >= 2
+        && gate.backup_tail_epoch.is_none()
+        && abandoned.is_none())
+    .then(|| LogRecord::TailFollowsThrough {
+        prev_epoch: gate.epoch - 1,
+        through: 0,
+    });
     gate.backup_tail_epoch
-        .map(|prev_epoch| LogRecord::TailFollows { prev_epoch })
+        .map(|prev_epoch| LogRecord::TailFollowsThrough {
+            prev_epoch,
+            through,
+        })
         .into_iter()
+        .chain(no_tail)
         .chain(abandoned.map(|epoch| LogRecord::GroupAbandoned {
             epoch,
             gen: 0,

@@ -6538,6 +6538,14 @@ fn fingerprint(result: &Result<Report, String>) -> String {
             "tail_fetch_wait_ms_total",
             "groups_abandoned",
             "member_copies_retired",
+            "member_copies_dropped",
+            "member_copies_abandoned",
+            "tails_kept_as_member_copy",
+            "rows_member_copied",
+            "committed_superseded",
+            "committed_rolled_back",
+            "replay_gated_enqueued",
+            "tail_beyond_gap_dropped",
             "inherited_tails_cleared",
             "ttl_claims_without_tail",
         ],
@@ -6622,6 +6630,12 @@ struct OracleTotals {
     /// them, of an inherited tail), claims that carried no tail (must be 0
     /// outside an abandon), groups abandoned, runs that ended waiting.
     tail: [u64; 6],
+    /// Plan 43 C1-4: [committed entries rolled back, superseded by a
+    /// takeover's tail, rows moved to a member copy, member rows retired,
+    /// dropped, abandoned, tails kept by a backup, tail rows past a gap,
+    /// gated rows queued for replay (must be 0), ungated I2 pairs, nodes
+    /// with member rows at convergence (must be 0)].
+    c14: [u64; 11],
     /// Plan 43 C7b: [TTL claims, of a live holder, seals of a live holder,
     /// permitted claims] and the seeds with a claim of a live holder.
     lease: [u64; 4],
@@ -6666,6 +6680,23 @@ impl OracleTotals {
             self.tail[4] += st.groups_abandoned;
         }
         self.tail[5] += u64::from(r.waiting_for_group);
+        for st in r.stats.values() {
+            for (c, n) in self.c14.iter_mut().zip([
+                st.committed_rolled_back,
+                st.committed_superseded,
+                st.rows_member_copied,
+                st.member_copies_retired,
+                st.member_copies_dropped,
+                st.member_copies_abandoned,
+                st.tails_kept_as_member_copy,
+                st.tail_beyond_gap_dropped,
+                st.replay_gated_enqueued,
+            ]) {
+                *c += n;
+            }
+        }
+        self.c14[9] += r.identity_copies_ungated as u64;
+        self.c14[10] += r.member_copy_rows_left as u64;
         self.unsourced += r.acks_unsourced;
         self.unjournaled_landed += r.unjournaled_landed;
         for st in r.stats.values() {
@@ -6800,6 +6831,24 @@ impl OracleTotals {
             self.tail[4],
             self.tail[5],
             self.class_claim_seeds
+        );
+        eprintln!(
+            "SWEEP-C14-TOTALS {label} seeds {}/{seeds}: committed rolled back {}, superseded by a \
+             tail {}, rows to a member copy {}, member rows retired {} dropped {} abandoned {}, \
+             tails kept by a backup {}, tail rows past a gap {}, gated rows queued {}, ungated \
+             I2 pairs {}, nodes with member rows at convergence {}",
+            self.seeds,
+            self.c14[0],
+            self.c14[1],
+            self.c14[2],
+            self.c14[3],
+            self.c14[4],
+            self.c14[5],
+            self.c14[6],
+            self.c14[7],
+            self.c14[8],
+            self.c14[9],
+            self.c14[10]
         );
         eprintln!(
             "SWEEP-LEASE-TOTALS {label} seeds {}/{seeds}: ttl claims {} (of a live holder {} in \
@@ -13087,9 +13136,14 @@ fn a_reconfig_in_doubt_acknowledges_nothing_its_listed_candidate_lacks() {
 }
 
 /// I2 (b): a rid queued on two nodes — a deposed holder's queue and the
-/// requester's retry, or a successor's replay of stranded delegate rows.
+/// requester's retry, or a successor's replay of stranded rows. Plan 43 C1-4:
+/// a deposed group tenure queues nothing it was told is committed (the rows
+/// go to the member copy and the successor re-ships them), so the pairs C0
+/// found in `backup-crash` and `delegated-holder-cut` (the seeds C0 pinned)
+/// are gone, and `+identity` holds. Fails on the parent: the same seeds
+/// count copies there.
 #[test]
-fn c0_i2_finds_a_rid_queued_twice() {
+fn c1_a_committed_rid_is_queued_on_one_node_only() {
     use pinned::{c0_run, run_seed};
     for (label, cfg, seeds) in [
         ("backup-crash", backup_crash_config(), I2_BACKUP_CRASH),
@@ -13101,33 +13155,56 @@ fn c0_i2_finds_a_rid_queued_twice() {
     ] {
         for &seed in seeds {
             let r = c0_run(label, seed, cfg.clone());
-            assert!(
-                r.identity_copies > 0,
+            assert_eq!(
+                r.identity_copies, 0,
                 "{label} seed {seed}: {:?}",
                 r.oracle_examples
             );
-            let e =
-                run_seed(seed, strict(cfg.clone(), "identity")).expect_err("+identity must fail");
-            assert!(e.contains("I2"), "{label} seed {seed}: {e}");
+            // (`+identity` also judges I2 (c), which a delegate's rows still
+            // fail until C3: only the backup configuration is held to it.)
+            if label == "backup-crash" {
+                run_seed(seed, strict(cfg.clone(), "identity"))
+                    .unwrap_or_else(|e| panic!("{label} seed {seed}: {e}"));
+            }
         }
     }
 }
 
 /// I2 (c): a successor re-journals a re-shipped tail under its own epoch and
-/// new journal rows, so the log does not carry what the client was told
-/// verbatim (`backup_failover_reships_the_tail`'s configuration).
+/// new journal rows; the transaction it names (`LogRecord::TailOf`, the first
+/// record of every re-shipped transaction) is the one the client was told,
+/// and the log carries it as committed. Plan 43 C1-4: the seeds C0 pinned in
+/// `backup-crash` (`backup_failover_reships_the_tail`'s configuration) are
+/// clean, `+identity` holds. Fails on the parent: `non_verbatim > 0`.
 #[test]
-fn c0_i2c_finds_a_re_shipped_tail() {
+fn c1_a_re_shipped_tail_is_the_transaction_the_client_was_told() {
+    use pinned::{c0_run, run_seed};
     for &seed in I2C_BACKUP_CRASH {
         let r = c0_run("backup-crash", seed, backup_crash_config());
-        assert!(
-            r.non_verbatim > 0,
+        assert_eq!(
+            r.non_verbatim, 0,
             "backup-crash seed {seed}: {:?}",
             r.oracle_examples
         );
-        let e = run_seed(seed, strict(backup_crash_config(), "identity")).expect_err("+identity");
-        assert!(e.contains("I2c verbatim"), "seed {seed}: {e}");
+        run_seed(seed, strict(backup_crash_config(), "identity"))
+            .unwrap_or_else(|e| panic!("backup-crash seed {seed}: {e}"));
     }
+}
+
+/// I2 (c) still finds what C1 does not change: a delegate's row the root
+/// appended and re-journals is not verbatim (C3's), in `delegated-holder-cut`
+/// (the first seed of 0..60 that counts one fails `+identity`).
+#[test]
+fn c0_i2c_finds_a_delegate_row_not_verbatim() {
+    use pinned::{c0_run, run_seed};
+    let seed = (0..60)
+        .find(|&seed| {
+            c0_run("delegated-holder-cut", seed, delegated_holder_cut_config()).non_verbatim > 0
+        })
+        .expect("no seed of 0..60 counts a row that is not verbatim");
+    let e =
+        run_seed(seed, strict(delegated_holder_cut_config(), "identity")).expect_err("+identity");
+    assert!(e.contains("I2c verbatim"), "seed {seed}: {e}");
 }
 
 /// I4: an op answered in doubt lands after an op its node invoked later.
@@ -13152,21 +13229,46 @@ fn c0_i4_finds_a_late_landing() {
 }
 
 /// I5: under `backup` an acknowledged op is rolled back (the transient
-/// shadow rollbacks `backup_no_acked_op_lost`'s comment describes) and its
-/// answer was not Lone.
+/// shadow rollbacks `backup_no_acked_op_lost`'s comment described) and its
+/// answer was not Lone. Plan 43 C1-4: there are none (a committed requester
+/// or subscriber entry is re-shipped, not rolled back), `+lone` holds, and
+/// `speculation.committed_rolled_back` stays 0. Fails on the parent: the
+/// same seeds roll back.
 #[test]
-fn c0_i5_finds_a_non_lone_rollback() {
+fn c1_a_committed_entry_is_never_rolled_back() {
     use pinned::{c0_run, run_seed};
     for &seed in I5_BACKUP {
         let r = c0_run("backup", seed, backup_config());
-        assert!(
-            r.non_lone_rollbacks > 0,
+        assert_eq!(
+            r.non_lone_rollbacks, 0,
             "backup seed {seed}: {:?}",
             r.oracle_examples
         );
-        let e = run_seed(seed, strict(backup_config(), "lone")).expect_err("+lone must fail");
-        assert!(e.contains("I5 speculation_only_lone"), "seed {seed}: {e}");
+        assert!(
+            r.stats.values().all(|s| s.committed_rolled_back == 0),
+            "backup seed {seed}"
+        );
+        run_seed(seed, strict(backup_config(), "lone"))
+            .unwrap_or_else(|e| panic!("backup seed {seed}: {e}"));
     }
+}
+
+/// I5 still finds what C1 does not change: a delegate's acknowledged op
+/// (DelegGroup until C2) rolled back by a root change, in
+/// `delegated-holder-cut` (the first seed of 0..60 that counts one fails
+/// `+lone`).
+#[test]
+fn c0_i5_finds_a_delegates_rolled_back_acknowledgement() {
+    use pinned::{c0_run, run_seed};
+    let seed = (0..60)
+        .find(|&seed| {
+            c0_run("delegated-holder-cut", seed, delegated_holder_cut_config()).non_lone_rollbacks
+                > 0
+        })
+        .expect("no seed of 0..60 counts a rolled-back acknowledgement");
+    let e =
+        run_seed(seed, strict(delegated_holder_cut_config(), "lone")).expect_err("+lone must fail");
+    assert!(e.contains("I5 speculation_only_lone"), "seed {seed}: {e}");
 }
 
 // Pinned seeds, each found by the sweep of its configuration with the counter
@@ -13184,7 +13286,7 @@ const I2_BACKUP_CRASH: &[u64] = &[858, 889, 927, 1044];
 /// trajectory plan 43 C1-1's listed-acknowledgement count shifted to no copy,
 /// gave its place to 5: 3 copies.)
 const I2_DELEGATED_HOLDER_CUT: &[u64] = &[0, 3, 5];
-/// `backup-crash`: `non_verbatim`.
+/// `backup-crash`: `non_verbatim` (on the parent; clean from plan 43 C1-4).
 const I2C_BACKUP_CRASH: &[u64] = &[800, 802, 803];
 /// `backup`: `non_lone_rollbacks`.
 /// (703, whose trajectory plan 43 C1-1's listed-acknowledgement count shifted

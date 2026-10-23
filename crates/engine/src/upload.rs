@@ -1913,6 +1913,11 @@ pub(crate) mod pending_upload_tests {
             incarnation: 1,
             seq: 3,
         };
+        // (Plan 43 C1-4: a re-shipped tail is committed, so a deposition keeps
+        // it as a member copy and queues nothing; the replay this test is
+        // about is the lone branch's, or an abandoned group's: the row is
+        // journaled as a lone one's.)
+        let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
         b.meta
             .apply_adopted_records(
                 &[

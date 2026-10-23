@@ -1073,6 +1073,12 @@ pub struct Report {
     /// I2 (b): rids queued on two nodes at once; (c): answered under a
     /// group class but not completed verbatim in the log.
     pub identity_copies: usize,
+    /// Plan 43 C1-4: rids queued on two nodes where no copy stands for a
+    /// committed answer (the lone branch's, the delegations': C2/C3).
+    pub identity_copies_ungated: usize,
+    /// Plan 43 C1-4: nodes holding member-copy rows at convergence (must be
+    /// 0; fails a `strict_durability` run).
+    pub member_copy_rows_left: usize,
     pub non_verbatim: usize,
     /// I4: in-doubt rids that landed after an op invoked later.
     pub late_landings: usize,
@@ -4433,8 +4439,18 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.observed_tentative = witness.observed_tentative;
     // EC2 campaign 7, finding B-1: across directories and owners, the
     // log keeps every node's program order (see `history.rs`).
-    super::history::check_session_order(&events, &tentative, &oracle.completed_at, &journal)
-        .map_err(lin_context)?;
+    //
+    // Plan 43 C1-4: not under the rebuild stub (a negative control whose
+    // deposed root never recovers). A recovery that never finishes leaves
+    // the deposed node's clients' later ops free to go ahead of the
+    // acknowledgements a delegation gave them before the root changed
+    // (the lone branch's, DelegGroup until C2); the replays of its gated
+    // rows that used to queue up behind them, and held them back, are the
+    // member copy's now. The real rebuild keeps the check.
+    if !cfg.rebuild_stub {
+        super::history::check_session_order(&events, &tentative, &oracle.completed_at, &journal)
+            .map_err(lin_context)?;
+    }
     if strict_durability && witness.observed_tentative > 0 {
         return Err(lin_context(format!(
             "{} refusal(s) observed an acknowledged effect that was later rolled back              (impossible under a durable acknowledgement policy)",
@@ -4527,6 +4543,30 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             .collect();
         check::check_convergence(&replicas, &oracle).map_err(|e| lin_context(e.to_string()))?;
         report.converged_checked = true;
+        // Plan 43 C1-4 (`member_copies_drained`): at convergence every row a
+        // node kept as a member of a group the archive carries is gone. A
+        // row of a group-committed transaction left over is either a commit
+        // that was lost or a drop the rules missed; both fail.
+        let mut left: Vec<String> = Vec::new();
+        for id in cluster.ids() {
+            let n = cluster.get(id);
+            if !n.alive() {
+                continue;
+            }
+            let rows = constellation_authority::Replica::member_copy_rows(&*n.meta);
+            if rows > 0 {
+                left.push(format!(
+                    "node {id}: {rows} row(s) of epoch(s) {:?}",
+                    constellation_authority::Replica::member_copy_epochs(&*n.meta)
+                ));
+            }
+        }
+        report.member_copy_rows_left = left.len();
+        if !left.is_empty() && cfg.strict_durability {
+            return Err(lin_context(format!(
+                "member_copies_drained: member copies outlive the archive at convergence: {left:?}"
+            )));
+        }
     } else if !quiescent {
         // What keeps each node from quiescence (phase 2b diagnostics).
         let why: Vec<String> = cluster
@@ -4693,6 +4733,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         .acks_unmapped
         .load(std::sync::atomic::Ordering::Relaxed) as usize;
     report.identity_copies = found.i2.len();
+    report.identity_copies_ungated = found.i2_ungated.len();
     report.non_verbatim = found.i2c.len();
     report.late_landings = found.i4.len();
     report.non_lone_rollbacks = found.i5.len();
@@ -4721,11 +4762,23 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     for (strict, what, list) in [
         (cfg.strict_commit, "I1", &found.i1),
         (cfg.strict_commit, "class claim", &found.class_claim),
-        (cfg.strict_identity, "I2", &found.i2),
-        (cfg.strict_identity, "I2c", &found.i2c),
+        // Plan 43 C1-4: a durable acknowledgement policy is a commit: its
+        // rows are never queued twice (I2 (b), for rows standing for a
+        // committed answer), complete verbatim (I2 (c)), and are rolled back
+        // only if the node answered them as a lone one's (I5).
+        (
+            cfg.strict_identity || cfg.strict_durability,
+            "I2",
+            &found.i2,
+        ),
+        (
+            cfg.strict_identity || cfg.strict_durability,
+            "I2c",
+            &found.i2c,
+        ),
         (cfg.strict_settle, "I4", &found.i4),
         (cfg.strict_settle, "I4", &found.unjournaled_landed),
-        (cfg.strict_lone, "I5", &found.i5),
+        (cfg.strict_lone || cfg.strict_durability, "I5", &found.i5),
         // Last: a seed that also fails another check reports that one, so
         // the failing seeds without the oracle are the ones it does not
         // head.

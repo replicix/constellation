@@ -232,7 +232,8 @@ A backup that has heard nothing from its holder for
    epoch marker at the next log slot (a create-if-absent, which fences
    any late segment of the old holder);
 4. re-applies its backup tail, deduplicated by rid, as its own journal
-   (the marker records the takeover with a `TailFollows` record);
+   (the marker records the takeover with a `TailFollowsThrough` record:
+   the epoch and how far the sealed hold reached);
 5. opens its view.
 
 A node that answers an append with `sealed` (it sealed that epoch,
@@ -256,8 +257,8 @@ lose them. So a claimant of a `Backup` lease first asks the group:
    epoch) and answers its journal. Write-all makes any one member's
    answer complete;
 3. the first member to answer is the one the tail is pulled from; the
-   claim then goes on as a takeover that carries it (`TailFollows` in its
-   marker), conditioned on the lease it read: a holder that renewed or
+   claim then goes on as a takeover that carries it (`TailFollowsThrough` in
+   its marker), conditioned on the lease it read: a holder that renewed or
    reconfigured meanwhile fails the CAS, and the claim starts over;
 4. a listed backup that holds the tail needs no fetch: it seals its role
    and claims at the expiry; a holder that sealed itself never revives
@@ -277,10 +278,26 @@ are in the log they are on its disk and in the old group's copies only.
 The lease it writes names that group (`inherited_tail`) until the first
 renewal or reconfiguration after its journal shipped through them; a
 claimant of such a lease fetches from the listed backups (which caught up
-with the whole unshipped journal) or from the holder and the old group,
-and the old members keep their copies until a lease read no longer names
-them. Without it, a successor that died before shipping would take the
-last copies of acknowledged rows with it.
+with the whole unshipped journal) or from the holder and the old group.
+The old members keep their copies as *member copies* until the log carries
+the rows, which it says by the identity every re-shipped transaction opens
+with (`TailOf`: the journal that first held it): not until a marker or a
+lease read says something about the epoch. Without it, a successor that
+died before shipping would take the last copies of acknowledged rows with
+it.
+
+**Nothing committed is re-executed (plan 43 C1-4).** A row whose client was
+told it is committed (the group or the archive held it) is not replayed by
+anyone who held it. A deposed holder rolls such rows back and keeps them as
+a member copy (`status.ack.member_copies`); its clients' retries by rid find
+them done in the successor's re-ship, or execute once if the group did not
+hold them (a marker that reaches only through *n* drops the copy's rows past
+*n*). A requester's shadow or hint answered as committed, and a transaction a
+subscriber was streamed as committed, are not rolled back when the tenure
+ends: they retire when the re-ship reaches them
+(`status.speculation.committed_rolled_back` stays 0). Only an operator's
+`repair abandon-group` strands them and hands the member copy to the replay
+queue, the one way a committed row is re-executed.
 
 The 1.5 s window does not adapt to S3 latency, and does not need to:
 nothing on the heartbeat path touches S3 (the backup channel is P2P

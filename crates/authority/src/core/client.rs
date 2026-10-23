@@ -1142,12 +1142,13 @@ impl Core {
         from: NodeId,
         req: OpId,
         outcome: MutateOutcome,
-        (base, position, gen, own_chunks, own_rows): (
+        (base, position, gen, own_chunks, own_rows, committed): (
             Option<crate::ids::Seq>,
             Position,
             u64,
             OwnChunks,
             Option<constellation_meta::OwnRows>,
+            bool,
         ),
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1280,7 +1281,7 @@ impl Core {
                 else {
                     return;
                 };
-                match replica.install_shadow(rid, epoch, gen, &op, &tag, &records) {
+                match replica.install_shadow(rid, epoch, gen, &op, &tag, &records, committed) {
                     Ok(true) => {
                         tracing::debug!(node = self.cfg.node_id, ?rid, epoch, "shadow installed");
                         self.stats.shadows_installed += 1;
@@ -1418,7 +1419,7 @@ impl Core {
                     // already — streamed ahead of the log, with what the
                     // holder did after it — so the hint is stale (backup
                     // sim seed 600396); the refusal is uncovered, as below.
-                    match replica.install_hint(rid, records, position, epoch, gen) {
+                    match replica.install_hint(rid, records, position, epoch, gen, committed) {
                         Ok(true) => {
                             self.stats.hints_installed += 1;
                             replica.note_covering(KeySet::from_records(records), position);

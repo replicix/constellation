@@ -357,6 +357,30 @@ pub enum LogRecord {
         gen: u64,
         through_known: u64,
     },
+    /// Plan 43 C1-4 (D10): the identity of a re-shipped root transaction —
+    /// `(epoch, first)` of the journal that first held it. The first record
+    /// of every transaction a takeover re-journals from its predecessor's
+    /// tail (`apply_backup_tail`); a transaction that already carries one
+    /// (re-shipped twice, A to B to C) keeps A's, so the identity is
+    /// transitive by construction. It travels with the records (to backups,
+    /// into segments, into the archive), which is what lets a member copy
+    /// of `(epoch, jseq)` retire once the log carries it, a requester's or
+    /// subscriber's committed entry retire instead of rolling back, and the
+    /// oracle judge a re-shipped transaction by its origin. Touches nothing.
+    ///
+    /// Appended at the end of the enum, as the postcard ordering comment on
+    /// this type requires (no envelope or `BackupTx` field: a trailing
+    /// field would make every earlier segment undecodable).
+    TailOf { epoch: u64, jseq: u64 },
+    /// Plan 43 C1-4 (D10, Q11): the marker of a takeover that re-ships the
+    /// predecessor's tail, with the extent of what it holds: the sealed
+    /// tail's contiguous prefix reaches journal seq `through`. A member copy
+    /// of `prev_epoch` past `through` was never committed (the sealer's
+    /// write-all hold did not reach it) and is dropped. Replaces
+    /// [`LogRecord::TailFollows`] for everything written from this change
+    /// on; `TailFollows` stays decodable and keeps its meaning for logs
+    /// written before (`through` unknown: nothing is dropped by it).
+    TailFollowsThrough { prev_epoch: u64, through: u64 },
 }
 
 impl LogRecord {

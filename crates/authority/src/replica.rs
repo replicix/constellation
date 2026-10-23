@@ -30,6 +30,8 @@ pub struct Applied {
     pub skipped: usize,
     pub retired: usize,
     pub inserted_before_local: bool,
+    /// Plan 43 C1-4: what the segment did to this node's member copies.
+    pub member: constellation_meta::MemberOutcome,
 }
 
 pub trait Replica {
@@ -126,6 +128,12 @@ pub trait Replica {
     /// Install an accepted forward's records ahead of the log. `false`
     /// when not installed: the rid is already completed here, or this
     /// node now holds a higher epoch and queued the op for replay.
+    ///
+    /// Plan 43 C1-4: `committed` is the reply's own word that the holder's
+    /// group (or the archive) held the row when it answered: such a shadow
+    /// survives a takeover of its epoch and retires by the successor's
+    /// re-ship.
+    #[allow(clippy::too_many_arguments)]
     fn install_shadow(
         &self,
         rid: Rid,
@@ -134,6 +142,7 @@ pub trait Replica {
         op: &MutateOp,
         tag: &LockTag,
         records: &[LogRecord],
+        committed: bool,
     ) -> Result<bool, MetaError>;
     /// The pre-S3 stream installed `rid`'s transaction here already:
     /// adopt it as this node's own op (`Meta::adopt_streamed`).
@@ -150,6 +159,7 @@ pub trait Replica {
         at: Position,
         epoch: Epoch,
         gen: u64,
+        committed: bool,
     ) -> Result<bool, MetaError>;
     fn has_outstanding_speculation(&self) -> bool;
     /// Roll back every speculative entry accepted below `epoch` and
@@ -157,8 +167,15 @@ pub trait Replica {
     fn strand_below_epoch(&self, epoch: Epoch) -> Result<Stranded, MetaError>;
     /// The takeover gate's strand: [`Self::strand_below_epoch`] plus this
     /// node's own transactions as the delegate of `own_gens`
-    /// (`Meta::strand_for_takeover`).
-    fn strand_for_takeover(&self, epoch: Epoch, own_gens: &[u64]) -> Result<Stranded, MetaError>;
+    /// (`Meta::strand_for_takeover`). `abandoned`: the epoch of a group the
+    /// operator gave up (this claim's marker says so): its committed
+    /// entries strand and replay too (plan 43 C1-4).
+    fn strand_for_takeover(
+        &self,
+        epoch: Epoch,
+        own_gens: &[u64],
+        abandoned: Option<Epoch>,
+    ) -> Result<Stranded, MetaError>;
     /// The pre-S3 stream installed the holder's journal through `pos`
     /// (`SessionState::note_streamed`).
     fn note_streamed(&self, pos: JournalPos);
@@ -196,6 +213,13 @@ pub trait Replica {
     /// unfenced" means the same after a restart or a rebuild as for a
     /// replica that tailed every segment.
     fn applied_epoch(&self) -> Epoch;
+    /// Plan 43 C1-4: row `jseq` of `epoch`'s tenure is in the log this
+    /// replica applied (`SessionState::row_in_log`).
+    fn row_in_log(&self, epoch: Epoch, jseq: u64) -> bool;
+    /// The journal seq of epoch `epoch`'s tenure this replica has applied
+    /// the log through (0: none, or the log's last applied segment is of
+    /// another epoch).
+    fn applied_jseq_of(&self, epoch: Epoch) -> u64;
     fn journal_len(&self) -> Result<u64, MetaError>;
     /// The next unshipped journal rows, whole transactions only, at most
     /// `max` rows (plan 30 §M3b: an op's records and its `Completed`
@@ -510,7 +534,20 @@ pub trait Replica {
     /// of the same lease. `put` is persisted and synced before it returns
     /// `true`.
     fn member_copy_put(&self, epoch: Epoch, config_version: u64, txs: &[BackupTx]) -> bool;
+    /// Plan 43 C1-4: this node's unshipped journal rows from journal seq
+    /// `from`, with the class each was journaled under, put as the member
+    /// copy of `epoch` (a sealed holder's snapshot).
+    fn member_copy_put_journal(
+        &self,
+        epoch: Epoch,
+        config_version: u64,
+        from: u64,
+    ) -> Option<Vec<BackupTx>>;
     fn member_copy(&self, epoch: Epoch) -> Option<(u64, Vec<BackupTx>)>;
+    /// Plan 43 C1-4: whether a member copy carries a transaction of `rid`.
+    fn member_copy_carries(&self, rid: Rid) -> bool;
+    /// How many rows the member copies hold.
+    fn member_copy_rows(&self) -> usize;
     fn member_copy_epochs(&self) -> Vec<Epoch>;
     fn member_copy_drop(&self, epoch: Epoch);
     /// Plan 43 C1-3: whether the journal holds an unshipped transaction
@@ -545,6 +582,7 @@ pub trait Replica {
         first: u64,
         last: u64,
         records: &[LogRecord],
+        committed: bool,
     ) -> Result<(), MetaError>;
     /// The highest journal seq of `epoch` this replica holds as streamed
     /// speculation (`Meta::streamed_tip`): a stream-ahead below it is
@@ -559,6 +597,9 @@ pub trait Replica {
     /// Plan 43 C1-2: the class of the unshipped journal transaction that
     /// carries `rid` (the latest of them), if any.
     fn journal_class_of_rid(&self, rid: Rid) -> Option<(u64, constellation_meta::RowClass)>;
+    /// Plan 43 C1-4: the class of the journal transaction starting at
+    /// journal seq `first`, if it is still in the journal.
+    fn journal_tx_class(&self, first: u64) -> Option<constellation_meta::RowClass>;
     /// Plan 43 C1-2 (D4): re-tag the journal row holding `seq`
     /// (`Meta::reclass_journal_tx`).
     fn reclass_journal_tx(
@@ -769,8 +810,9 @@ impl Replica for Meta {
         op: &MutateOp,
         tag: &LockTag,
         records: &[LogRecord],
+        committed: bool,
     ) -> Result<bool, MetaError> {
-        Meta::install_shadow_from(self, rid, epoch, gen, op, tag, records)
+        Meta::install_shadow_committed(self, rid, epoch, gen, op, tag, records, committed)
     }
 
     fn install_hint(
@@ -780,8 +822,9 @@ impl Replica for Meta {
         at: Position,
         epoch: Epoch,
         gen: u64,
+        committed: bool,
     ) -> Result<bool, MetaError> {
-        Meta::install_hint_from(self, Some(rid), records, at, epoch, gen)
+        Meta::install_hint_committed(self, Some(rid), records, at, epoch, gen, committed)
     }
 
     fn has_outstanding_speculation(&self) -> bool {
@@ -792,8 +835,13 @@ impl Replica for Meta {
         Meta::strand_below_epoch(self, epoch)
     }
 
-    fn strand_for_takeover(&self, epoch: Epoch, own_gens: &[u64]) -> Result<Stranded, MetaError> {
-        Meta::strand_for_takeover(self, epoch, own_gens)
+    fn strand_for_takeover(
+        &self,
+        epoch: Epoch,
+        own_gens: &[u64],
+        abandoned: Option<Epoch>,
+    ) -> Result<Stranded, MetaError> {
+        Meta::strand_for_takeover(self, epoch, own_gens, abandoned)
     }
 
     fn strand_recalled_speculation(&self, gen: u64) -> Result<Stranded, MetaError> {
@@ -853,6 +901,16 @@ impl Replica for Meta {
 
     fn applied_epoch(&self) -> Epoch {
         Meta::applied_pos(self).map_or(0, |pos| pos.epoch)
+    }
+
+    fn row_in_log(&self, epoch: Epoch, jseq: u64) -> bool {
+        self.session().row_in_log(epoch, jseq)
+    }
+
+    fn applied_jseq_of(&self, epoch: Epoch) -> u64 {
+        Meta::applied_pos(self)
+            .filter(|pos| pos.epoch == epoch)
+            .map_or(0, |pos| pos.jseq)
     }
 
     fn journal_len(&self) -> Result<u64, MetaError> {
@@ -948,10 +1006,14 @@ impl Replica for Meta {
         self.read_delegations().void_below_epoch(epoch);
         // Plan 30 §M9 × §M6: a sealed backup's takeover marker; the
         // predecessor's acknowledged tail follows it.
-        if records
-            .iter()
-            .any(|r| matches!(r, LogRecord::TailFollows { .. }))
-        {
+        if records.iter().any(|r| {
+            // (A `TailFollowsThrough` reaching nothing declares that no tail
+            // follows: nothing is owed.)
+            matches!(
+                r,
+                LogRecord::TailFollows { .. } | LogRecord::TailFollowsThrough { through: 1.., .. }
+            )
+        }) {
             self.session().owe(JournalPos {
                 epoch,
                 jseq: through,
@@ -970,6 +1032,7 @@ impl Replica for Meta {
             skipped: applied.skipped,
             retired: applied.retired,
             inserted_before_local: applied.inserted_before_local,
+            member: applied.member,
         })
     }
 
@@ -1380,6 +1443,25 @@ impl Replica for Meta {
         Meta::member_copy_put(self, epoch, config_version, txs).is_ok()
     }
 
+    fn member_copy_put_journal(
+        &self,
+        epoch: Epoch,
+        config_version: u64,
+        from: u64,
+    ) -> Option<Vec<BackupTx>> {
+        let rows = Meta::journal_member_rows_from(self, from).ok()?;
+        Meta::member_copy_put_rows(self, epoch, config_version, &rows).ok()?;
+        Some(rows.into_iter().map(|m| m.tx).collect())
+    }
+
+    fn member_copy_carries(&self, rid: Rid) -> bool {
+        Meta::member_copy_carries(self, rid).unwrap_or(false)
+    }
+
+    fn member_copy_rows(&self) -> usize {
+        Meta::member_copy_rows_total(self).unwrap_or(0)
+    }
+
     fn member_copy(&self, epoch: Epoch) -> Option<(u64, Vec<BackupTx>)> {
         Meta::member_copy(self, epoch)
             .ok()
@@ -1434,8 +1516,9 @@ impl Replica for Meta {
         first: u64,
         last: u64,
         records: &[LogRecord],
+        committed: bool,
     ) -> Result<(), MetaError> {
-        Meta::install_streamed(self, epoch, source, first, last, records)
+        Meta::install_streamed_committed(self, epoch, source, first, last, records, committed)
     }
 
     fn streamed_tip(&self, epoch: Epoch) -> Result<Option<u64>, MetaError> {
@@ -1444,6 +1527,10 @@ impl Replica for Meta {
 
     fn set_durable(&self, gate: bool, jseq: u64, lost: bool, class: constellation_meta::RowClass) {
         self.session().set_durable(gate, jseq, lost, class)
+    }
+
+    fn journal_tx_class(&self, first: u64) -> Option<constellation_meta::RowClass> {
+        Meta::journal_tx_class(self, first).ok().flatten()
     }
 
     fn journal_class_of_rid(&self, rid: Rid) -> Option<(u64, constellation_meta::RowClass)> {

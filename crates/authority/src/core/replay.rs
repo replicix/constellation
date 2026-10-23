@@ -156,7 +156,9 @@ impl Core {
                 if let Ok(stranded) = replica.strand_below_epoch(epoch) {
                     self.stats.speculation_rolled_back +=
                         (stranded.shadows + stranded.hints) as u64;
-                    self.stats.local_rolled_back += stranded.locals as u64;
+                    self.stats.local_rolled_back +=
+                        (stranded.locals + stranded.member_copied) as u64;
+                    self.note_committed_stranded(&stranded);
                     self.lock_note_replay_pins(now, replica);
                     if stranded.any() {
                         replica.clear_streamed();

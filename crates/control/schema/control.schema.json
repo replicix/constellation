@@ -9086,6 +9086,18 @@
     "SpeculationStatus": {
       "description": "Plan 30 §M3a: this node's speculation log (`constellation_meta::\nstore::spec`) — effects applied ahead of the durable log, and the\nstranded ops being replayed by rid.",
       "properties": {
+        "committed_rolled_back": {
+          "description": "Plan 43 C1-4: committed entries (answered or streamed as held by the\ngroup or the archive) rolled back and replayed, since start. Only an\noperator's `repair abandon-group` may raise it.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "committed_superseded": {
+          "description": "Plan 43 C1-4: committed requester/subscriber entries a takeover's\nre-applied tail superseded, since start.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "copies_pending": {
           "description": "Plan 30 §M4: refused replays whose `.constellation-conflict/` copy\ncould not be made yet (retried with backoff; later ops are not held\nup), and those failing for at least 10 s — a stall worth looking\nat (the node then also asks for the lease to make them locally).",
           "format": "uint64",
@@ -9121,6 +9133,12 @@
         },
         "local_rolled_back": {
           "description": "Plan 30 §M3b: this node's own unshipped transactions rolled back\nbecause it was deposed (and queued for replay by rid), since start.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "member_copied": {
+          "description": "Plan 43 C1-4: this node's committed unshipped transactions moved to a\nmember copy instead of replayed, since start.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -9168,7 +9186,10 @@
         "epoch_markers",
         "gate_pending",
         "copies_pending",
-        "copies_stalled"
+        "copies_stalled",
+        "committed_rolled_back",
+        "member_copied",
+        "committed_superseded"
       ],
       "type": "object"
     },

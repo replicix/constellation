@@ -611,9 +611,15 @@ holder or delegate whose group is itself because no peer is within the RTT
 budget; its answers to its own node's clients are the one speculation the
 design keeps. A **non-stealable** authority (an offline designation, a
 continuation epoch's hold) is never replaced while its holder lives. The rows a
-node keeps as a **member copy** of a group it no longer sequences for stay in
-the `backup_tail` keyspace until the archive carries them. No type is renamed
-for the vocabulary.
+node keeps as a **member copy** of a group it no longer sequences for (a
+deposed holder's committed unshipped rows, a backup's tail once its holder's
+lease moved on to a later epoch, a successor's copy of the tail it re-ships)
+stay in a key range of the `backup_tail` keyspace of their own, apart from
+the tail the node holds as a backup, until the archive carries them: the log
+carries a re-shipped transaction's identity (`TailOf`), a marker's
+`TailFollowsThrough { prev_epoch, through }` drops the rows the sealer's hold
+did not reach, and `GroupAbandoned` hands them to the replay queue. No type is
+renamed for the vocabulary.
 
 ### Local store
 
@@ -689,8 +695,11 @@ delegations over the one log instead, below.)
   control records: `Completed { rid }` and `Refused { rid, errno }`
   (exactly-once, below), `InboxAck` (the S3 inbox), `Delegate` and
   `RecallCut` (the delegation table; `Recall` in older logs), and
-  `TailFollows` (a sealed backup's
-  takeover, §9). The set is an append-only registry, like the manifest
+  `TailFollowsThrough` (a takeover that re-ships a predecessor's tail and
+  how far its hold reached; `TailFollows` in older logs), `TailOf` (the
+  identity of a re-shipped transaction: the journal that first held it,
+  the first record of the re-shipped transaction, kept through any number of
+  re-ships) and `GroupAbandoned` (an operator gave a group's rows up; §9). The set is an append-only registry, like the manifest
   entry types.
 - **The commit chain** (plan 28,
   [28-s3-native-metadata-store.md](../plans/v1/done/28-s3-native-metadata-store.md))
@@ -813,7 +822,15 @@ chosen per filesystem and topology
   ([ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)).
   A backup counts only from its acknowledgements of appends made at a
   configuration version that lists it, and a claim of the lease, by seal
-  or by TTL, carries the group's sealed tail (§9). Failover takes about 1.5 s in the harness and
+  or by TTL, carries the group's sealed tail (§9). Nothing committed is
+  re-executed: a deposed holder keeps the committed rows it had not shipped
+  as a member copy instead of replaying them, a backup whose holder's lease
+  moved on keeps its tail the same way, and a requester's or subscriber's
+  entry for a row answered or streamed as committed survives the takeover and
+  retires when the successor's re-ship (each transaction led by its identity,
+  `TailOf`) reaches it
+  ([ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3),
+  C1-4). Failover takes about 1.5 s in the harness and
   2.3–4.7 s from `kill -9` to a new holder on EC2 ([RESULTS](../../bench/remote/RESULTS.md#failover-time)), and loses
   nothing acknowledged.
 - **`S3`** (Layer C, `fs create --ack-policy s3`): acknowledged once its
@@ -1597,9 +1614,15 @@ not; and while a removal CAS is out, or its answer lost, an
 acknowledgement also rests on the staying backups, or the log when none
 stays.) The backup then
 re-reads the lease, CASes it to epoch *e*+1, tails S3 to head, ships its
-epoch marker (with `TailFollows`, so readers know the predecessor's tail
-comes back after it), re-ships its backup tail deduplicated by rid, and
-opens. A holder's CAS removing a silent backup and that backup's takeover
+epoch marker (with `TailFollowsThrough`, so readers know the predecessor's
+tail comes back after it, and how far it reaches), re-ships its backup tail —
+the contiguous prefix its hold reached — deduplicated by rid and led by each
+transaction's identity (`TailOf`), keeps its copy of what it re-shipped as a
+member copy until the log carries the identities, and opens. What the
+requesters and subscribers of the old tenure hold of those rows (a shadow
+answered as committed, a transaction streamed as committed) is not rolled
+back: it retires when the re-ship reaches it; the successor's own such
+entries are taken out by its gate, not replayed (the tail carries the rows). A holder's CAS removing a silent backup and that backup's takeover
 CAS are on the same lease version (`config_version`), so exactly one
 wins. A node that is not a listed backup waits 3 s past a `Backup`
 lease's expiry before claiming it, so a backup gets there first.
@@ -1685,7 +1708,7 @@ successor, bounded (§6, Failover), and a blocking one keeps retrying.
 |---|---|
 | node crash | journal, speculation, backup tail, seals, promises and epoch state reload from the local store; stranded ops replay by rid; dirty chunks re-upload; the lease is re-acquired or expires |
 | forward times out (holder slow or gone) | same-rid retries, then the inbox (no P2P path) or the lease path; resolved exactly once; `EIO` at the client deadline (2 × TTL), never a re-execution |
-| holder deposed (it lost the lease while alive) | it rolls its unshipped journal back and replays it by rid through the new holder; only true overlaps become conflict copies. (A holder asked for its tail by a claimant of its expired lease deposes itself first and keeps the rows as a member copy, plan 43 C1-3.) |
+| holder deposed (it lost the lease while alive) | it rolls its unshipped journal back. Rows its clients were told are committed (the group or the archive held them) are kept as a member copy of the epoch and are *not* replayed: the successor re-ships them from the group, and their clients' retries by rid find them done (plan 43 C1-4); the rows of a lone node replay by rid through the new holder, and only true overlaps become conflict copies. (A holder asked for its tail by a claimant of its expired lease deposes itself first and keeps the rows as a member copy, plan 43 C1-3.) |
 | holder and its backup both down past the lease's end | the claim of the lease waits (`status.lease.waiting_for_group`) until one of them answers a `SealTail`; the operator may abandon the group (`repair abandon-group`), and the rows it acknowledged are then lost |
 | P2P down, S3 up | everything works through the lease path and the S3 inbox, minus backups, delegations, strict ReadIndex, cluster locks and fast takeover |
 | clock skew | rate: each node's oscillator within its budget (0.1 % by default, C7a: paid by the honour and wait readings, so every local window is exact); offset: unconstrained for the lease (a claimant's own observation of the holder's renewals), the seal watch (the holder's durations on the backup's wait clock), promises (made for the claimed key, counted per key), delegation, read-delegation and lock windows (each a duration on one node's clock) and the tokens of the S3 inbox and the replay queue (exact or refused); the exceptions are the lock cut and barriers between a root and a delegate (rows 9 and 30: offset below the margin, until the root-anchored cut) and the non-minting token check (offset below the margin, or the op's one-way delay below `2 × margin`, either alone); correctness otherwise relies on CAS ordering, never wall clocks; steps: none (C7-H1: holders measure on the honour clock, waiters on the wait clock) |

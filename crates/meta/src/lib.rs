@@ -39,7 +39,7 @@ pub use session::{
     STREAMS_CAP,
 };
 pub use snapsched::{SnapPolicy, SNAPSHOT_POLICY_XATTR};
-pub use store::backup::{BackupRole, BackupTx, MemberCopyInfo};
+pub use store::backup::{BackupRole, BackupTx};
 pub use store::held::{DroppedHeld, HeldInode, HeldSummary};
 pub use store::inbox::{CompletedOutcome, InboxAck, InboxAckArmed};
 #[cfg(any(test, feature = "test-util"))]
@@ -51,6 +51,7 @@ pub use store::journal::{
 #[cfg(any(test, feature = "test-util"))]
 pub use store::local::fail_reclass_on_this_thread_for_tests;
 pub use store::local::RowClass;
+pub use store::member::{tail_identity, MemberCopyInfo, MemberOutcome, MemberTx};
 pub use store::remote::RemoteBlockers;
 pub use store::spec::{
     Refusal, SegmentApplied, SpecKind, SpeculationCounts, Stranded, StrandedOp,

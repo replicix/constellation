@@ -1486,13 +1486,14 @@ logging never blocks a daemon thread (plan 44)";
 
 **Status**: accepted by the maintainer on 2026-10-17 (plan 43 §11: every
 recommendation, and the latency gates G1–G6), built in steps. Landed: C0
-(the commit point named and checked), C1-1 to C1-3 (the root group's commit
+(the commit point named and checked), C1-1 to C1-4 (the root group's commit
 holds across a listing and a removal; the class at journal time; the TTL
-claimant's sealed tail and the inherited tail), C2's C2a and C2b (the answer's
-source; a generation's end carries its cut). Not yet: C1-4 (member copies,
-committed shadows and streams, tail identity), the rest of C2 (no
-acknowledgement outside a group where one exists; settling before `EIO`),
-C3–C5. Each milestone amends this record, and C1 adds the rejected options.
+claimant's sealed tail and the inherited tail; member copies, committed
+shadows and streams, tail identity: nothing committed is re-executed), C2's
+C2a and C2b (the answer's source; a generation's end carries its cut). Not
+yet: the rest of C2 (no acknowledgement outside a group where one exists;
+settling before `EIO`), C3–C5. Each milestone amends this record; C1's
+rejected options are below.
 DESIGN.md states each part in the milestone that makes it true (plan 43
 §6).
 
@@ -1533,6 +1534,29 @@ the old group in its lease (`inherited_tail`) until the log carries the
 rows, so that a successor's death does not take the last copies of rows
 the old group acknowledged. The lease, the log and the seals are the only
 evidence: no claim compares clocks beyond the observation rule of C7b.
+
+**C1-4 (plan 43)**: nothing committed is re-executed. A deposed group tenure
+keeps the rows its clients were told are committed as a **member copy** of
+their epoch (a key range of the `backup_tail` keyspace of its own) instead of
+queueing them for replay; a backup whose holder's lease moved on to a later
+epoch keeps its tail the same way; a successor keeps the copy of the tail it
+re-ships. A copy leaves only when the log carries the rows' identity (each
+re-shipped transaction opens with `LogRecord::TailOf { epoch, jseq }`, kept
+through any number of re-ships), when a marker's `TailFollowsThrough` says
+the sealer's hold did not reach it (never committed), or, for the rows
+nobody acknowledged, at the first marker of a newer epoch that announces no
+tail of theirs. A requester's shadow or hint answered as committed and a
+subscriber's transaction streamed as committed survive a takeover of their
+epoch and retire by the re-ship; only `repair abandon-group` strands them and
+queues the copy, the one re-execution of a committed row. Rejected: replaying
+the committed rows from the deposed holder and relying on the dedup by rid
+(the replay races the retry of the same rid and the ops invoked between: two
+queues for one op); keeping the member copy in the journal (a journal row is
+shipped by its holder, and the successor already ships the row); dropping a
+copy at any marker without a tail announcement (the successor may itself be
+replaced before it ships, D2). The formats are append-only: `TailOf` and
+`TailFollowsThrough` are new `LogRecord` variants, `TailFollows` stays
+decodable.
 
 ## ADR-34: Kernel FUSE race workarounds
 

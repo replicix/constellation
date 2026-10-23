@@ -77,14 +77,14 @@ pub struct BackupRole {
     pub config_version: u64,
 }
 
-fn tail_key(epoch: u64, first: u64) -> Vec<u8> {
+pub(super) fn tail_key(epoch: u64, first: u64) -> Vec<u8> {
     let mut k = Vec::with_capacity(16);
     k.extend_from_slice(&epoch.to_be_bytes());
     k.extend_from_slice(&first.to_be_bytes());
     k
 }
 
-fn decode_tail_key(k: &[u8]) -> Result<(u64, u64), MetaError> {
+pub(super) fn decode_tail_key(k: &[u8]) -> Result<(u64, u64), MetaError> {
     if k.len() != 16 {
         return Err(MetaError::Invalid("backup_tail key".into()));
     }
@@ -262,6 +262,7 @@ impl Meta {
         let row_set: std::collections::BTreeSet<u64> = rows.iter().copied().collect();
         let mut tx = self.db.write_tx();
         let mut doomed = Vec::new();
+        let mut holes: Vec<(Vec<u8>, u64, u64)> = Vec::new();
         let mut survivor: Option<(u64, u64)> = None;
         for guard in tx.range(&self.backup_tail, start..=tail_key(epoch, u64::MAX)) {
             let (k, v) = guard.into_inner()?;
@@ -275,8 +276,23 @@ impl Meta {
                 break;
             }
             let t: BackupTx = postcard::from_bytes(&v)?;
-            if t.last <= through || row_set.contains(&t.last) {
+            if t.last <= through {
                 doomed.push(k.to_vec());
+            } else if row_set.contains(&t.last) {
+                // Shipped ahead of a row still deferred on the holder (above
+                // `through`): in the log, so not part of what a successor
+                // re-ships — but not a gap in the tail either. Plan 43 C1-4
+                // (D6): the contiguous prefix a sealer's hold reaches
+                // (`backup_acked`, the `through` of its marker) is counted
+                // across it, so the row stays as a hole (the shape a shipped
+                // or dropped row has in a holder's stream) until `through`
+                // passes it. Trimmed away, the next transactions looked like
+                // rows beyond a gap, never acknowledged, and a successor
+                // dropped them from its re-ship.
+                if !t.records.is_empty() {
+                    holes.push((k.to_vec(), t.first, t.last));
+                }
+                survivor = Some(survivor.map_or((e, first), |s| s.min((e, first))));
             } else {
                 survivor = Some(survivor.map_or((e, first), |s| s.min((e, first))));
             }
@@ -285,13 +301,25 @@ impl Meta {
         // the lowest survivor; with none, a later append begins above
         // what the holder shipped through.
         *floor = Some(survivor.unwrap_or((epoch, through.saturating_add(1))));
-        let n = doomed.len();
+        let n = doomed.len() + holes.len();
         if n == 0 {
             tx.rollback();
             return Ok(0);
         }
         for k in doomed {
             tx.remove(&self.backup_tail, k);
+        }
+        for (k, first, last) in holes {
+            tx.insert(
+                &self.backup_tail,
+                k,
+                postcard::to_allocvec(&BackupTx {
+                    first,
+                    last,
+                    records: Vec::new(),
+                    origin: (0, 0),
+                })?,
+            );
         }
         tx.commit()?;
         Ok(n)
@@ -497,135 +525,6 @@ impl Meta {
         for k in keys {
             tx.remove(&self.backup_tail, k);
         }
-        tx.commit()?;
-        Ok(())
-    }
-}
-
-// ------------------------------------------------- plan 43 C1-3: member copies
-
-/// The `backup_tail` key space of the member copies: `epoch` slots above this
-/// base hold the copy of lease epoch `epoch - base` (plan 43 D5: a copy of
-/// its own, apart from the tail this node holds as a backup:
-/// [`Meta::backup_trim`] drops every older epoch of the tail and
-/// [`Meta::backup_clear`] wipes it, both on events unrelated to a member
-/// copy; neither reaches this range).
-const MEMBER_COPY_BASE: u64 = 2 << 48;
-
-fn member_epoch(epoch: u64) -> u64 {
-    MEMBER_COPY_BASE + epoch
-}
-
-fn member_info_key(epoch: u64) -> String {
-    format!("member_copy:{epoch}")
-}
-
-/// What a member copy records besides its rows: the configuration version
-/// the answer was given for and the last journal seq of the copy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MemberCopyInfo {
-    pub config_version: u64,
-    pub through: u64,
-}
-
-impl Meta {
-    /// Plan 43 C1-3: this node's copy of epoch `epoch`'s unshipped
-    /// transactions, as a member of that epoch's group that was sealed by a
-    /// claimant's `SealTail` (a holder: its own journal rows). Persisted and
-    /// synced before the caller answers: the answer is what a claimant's
-    /// claim rests on, and the copy is what a later claimant of the same
-    /// lease is told when this node is asked again. Idempotent: a second
-    /// put of the same epoch adds the rows it brings.
-    pub fn member_copy_put(
-        &self,
-        epoch: u64,
-        config_version: u64,
-        txs: &[BackupTx],
-    ) -> Result<(), MetaError> {
-        let mut tx = self.db.write_tx();
-        let mut through = 0;
-        for t in txs {
-            through = through.max(t.last);
-            tx.insert(
-                &self.backup_tail,
-                tail_key(member_epoch(epoch), t.first),
-                postcard::to_allocvec(t)?,
-            );
-        }
-        if let Some(old) = kv_get_tx(&tx, &self.local, &member_info_key(epoch))? {
-            let mut it = old.split(':').map(|x| x.parse::<u64>());
-            if let (Some(Ok(_)), Some(Ok(t))) = (it.next(), it.next()) {
-                through = through.max(t);
-            }
-        }
-        kv_set_tx(
-            &mut tx,
-            &self.local,
-            &member_info_key(epoch),
-            &format!("{config_version}:{through}"),
-        );
-        tx.commit()?;
-        self.sync()
-    }
-
-    /// The member copy of `epoch`: its info and rows, oldest first.
-    pub fn member_copy(
-        &self,
-        epoch: u64,
-    ) -> Result<Option<(MemberCopyInfo, Vec<BackupTx>)>, MetaError> {
-        let r = self.db.read_tx();
-        let Some(s) = kv_get_tx(&r, &self.local, &member_info_key(epoch))? else {
-            return Ok(None);
-        };
-        let mut it = s.split(':').map(|x| x.parse::<u64>());
-        let (Some(Ok(config_version)), Some(Ok(through))) = (it.next(), it.next()) else {
-            return Ok(None);
-        };
-        let e = member_epoch(epoch);
-        let mut out = Vec::new();
-        for guard in r.range(&self.backup_tail, tail_key(e, 0)..=tail_key(e, u64::MAX)) {
-            let (_, v) = guard.into_inner()?;
-            out.push(postcard::from_bytes(&v)?);
-        }
-        Ok(Some((
-            MemberCopyInfo {
-                config_version,
-                through,
-            },
-            out,
-        )))
-    }
-
-    /// Every epoch this node holds a member copy of.
-    pub fn member_copy_epochs(&self) -> Result<Vec<u64>, MetaError> {
-        let r = self.db.read_tx();
-        let mut out = Vec::new();
-        for guard in r.prefix(&self.local, "member_copy:".as_bytes()) {
-            let (k, _) = guard.into_inner()?;
-            if let Some(e) = std::str::from_utf8(&k)
-                .ok()
-                .and_then(|k| k.strip_prefix("member_copy:"))
-                .and_then(|e| e.parse::<u64>().ok())
-            {
-                out.push(e);
-            }
-        }
-        Ok(out)
-    }
-
-    /// Forget the member copy of `epoch` (its rows are in the log, or the
-    /// group was abandoned).
-    pub fn member_copy_drop(&self, epoch: u64) -> Result<(), MetaError> {
-        let mut tx = self.db.write_tx();
-        let e = member_epoch(epoch);
-        let keys: Vec<Vec<u8>> = tx
-            .range(&self.backup_tail, tail_key(e, 0)..=tail_key(e, u64::MAX))
-            .map(|g| g.into_inner().map(|(k, _)| k.to_vec()))
-            .collect::<Result<_, _>>()?;
-        for k in keys {
-            tx.remove(&self.backup_tail, k);
-        }
-        tx.remove(&self.local, member_info_key(epoch).into_bytes());
         tx.commit()?;
         Ok(())
     }

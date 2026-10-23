@@ -1237,7 +1237,7 @@ fn a_rebuild_takes_back_the_stream_index_of_a_delegate_row_it_drops() {
     }
     assert_eq!(meta.log_stream_idx(own).unwrap(), 0);
     assert_eq!(meta.session().stream_applied(own), 2);
-    let stranded = meta.strand_for_takeover(2, &[own]).unwrap();
+    let stranded = meta.strand_for_takeover(2, &[own], None).unwrap();
     assert_eq!(stranded.locals, 2);
     assert_eq!(meta.log_stream_idx(own).unwrap(), 0);
     assert_eq!(meta.session().stream_applied(own), 2);

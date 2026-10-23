@@ -352,6 +352,9 @@ impl EngineControl {
                     gate_pending,
                     copies_pending: core.copies.0,
                     copies_stalled: core.copies.1,
+                    committed_rolled_back: stats.committed_rolled_back,
+                    member_copied: stats.rows_member_copied,
+                    committed_superseded: stats.committed_superseded,
                 }
             },
             held: held::status(&self.meta),

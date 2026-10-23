@@ -104,8 +104,9 @@
 //!   after its journal shipped through them; a claimant of such a lease
 //!   fetches from the listed backups (which caught up with the whole
 //!   unshipped journal before they were listed) or from the holder and the
-//!   old group, and the old members keep their copies until a lease reading
-//!   no longer names them.
+//!   old group, and the old members keep their copies — as *member copies*
+//!   (plan 43 C1-4, `constellation_meta::MemberTx`) — until the log carries
+//!   the rows (below), not until a lease stops naming them.
 //! - **The log-slot CAS.** The taker's epoch marker is a create-if-absent
 //!   at the next sequence; any segment the old holder ships after it
 //!   collides, and what it shipped before it the taker adopted in its
@@ -113,9 +114,64 @@
 //!   acknowledged record is in a slot below the marker.
 //! - **Reconfiguration races.** A backup's takeover CAS and the holder's
 //!   removal CAS are on the same object version; exactly one wins.
-//!   Holder wins: the backup re-reads, finds itself unlisted, discards
-//!   its tail. Backup wins: the holder's re-read shows a new holder — a
-//!   deposition, with the stranding and replay by rid of plan 30 §M3b.
+//!   Holder wins: the backup re-reads, finds itself unlisted in the same
+//!   epoch, discards its tail (safe: the holder counts only what a backup
+//!   acknowledged under a version that lists it, C1-1). Backup wins: the
+//!   holder's re-read shows a new holder — a deposition, which since plan 43
+//!   C1-4 queues nothing it was told is committed for replay: those rows
+//!   are rolled back and kept as the member copy of their epoch (plan 30
+//!   §M3b's stranding and replay by rid remain for the rows of a lone
+//!   node, and for an operator's `abandon-group`). A backup that reads the
+//!   lease moved on to a *later epoch* keeps its tail the same way.
+//!
+//! # Why a backup-acknowledged row is committed (plan 43 C1)
+//!
+//! - **S1.** A gated answer leaves when every backup of every
+//!   configuration that may be in S3 holds the row: the held version's set
+//!   and every out or doubted version's set (empty: the log), each counted
+//!   only from acknowledgements given under a version that lists it
+//!   (C1-1). A backup that acknowledged under `v` keeps its tail until it
+//!   reads a version above `v` without it in the same epoch — a removal by
+//!   this holder, during which only the staying set counts. So at the
+//!   answer the lease object's group holds the row, whatever version S3 has.
+//! - **S2 (seal path).** The sealer is listed in the version it CASes over;
+//!   write-all means its contiguous tail holds every committed unshipped
+//!   row; its persisted seal stops further commits; the marker's slot CAS
+//!   fences later segments; it re-ships the prefix (`TailFollowsThrough`'s
+//!   `through`) before its gate opens, each transaction led by its identity
+//!   (`LogRecord::TailOf`).
+//! - **S3 (TTL path).** A claimant of a lease whose group may hold
+//!   committed rows obtains one member's sealed tail before its CAS;
+//!   the seal stops further commits of the epoch; the CAS is conditioned on
+//!   the version whose group it fetched from. No member: the claim waits
+//!   (Q1) or the operator abandons.
+//! - **S4 (inherited tail).** Rows a successor re-ships are committed by the
+//!   old group but, until the log carries them, held by the new holder and
+//!   the old group's copies only. The lease names that group until then, and
+//!   every member keeps its copy until the log carries the rows' identities
+//!   (never because of a marker alone: a marker that announces no tail of an
+//!   epoch drops only the rows nobody acknowledged); a later claimant
+//!   fetches from the new group's backups or from the old group.
+//! - **S5 (deposed holder).** Gated rows go to the member copy, never to the
+//!   replay queue; the client of an aborted parked answer retries by rid and
+//!   dedups against the re-ship (committed) or executes once (uncommitted:
+//!   the member copy drops it at a `TailFollowsThrough` past `through`).
+//! - **S6 (requesters and subscribers).** A shadow or hint answered as
+//!   committed (`MutateReply::committed`) and a transaction streamed as
+//!   committed (`PeerMsg::StreamAhead::committed`) are not stranded by a
+//!   takeover of their epoch: the successor re-ships the row with its rid
+//!   and identity, so the entry retires instead of rolling back; the
+//!   successor's own entries of the tenure are rolled back, not queued, by
+//!   its takeover gate (the tail it re-applies carries the rows). Only an
+//!   operator's abandon of the group strands a committed entry
+//!   (`speculation.committed_rolled_back`).
+//! - **S7 (the class is truthful).** Every row answered without a commit is
+//!   `Lone`-class at its answer (C1-2's re-tag), so "gated implies committed
+//!   at the answer" holds and only `Lone` rows enter the lone branch.
+//!
+//! What stays on clocks is liveness (the claim grace orders the sealer
+//! before others; the fetch makes losing the race harmless); what is
+//! availability is G4 (a claim waits while no member answers).
 //!
 //! # The delegation horizon across a fast failover
 //!
@@ -697,7 +753,7 @@ pub(crate) struct BackupState {
     /// Kept (oldest first, a few) and installed once the segment is
     /// applied ([`Core::retry_stream_ahead`]) instead of dropped, which
     /// sent every forward whose reply waited for them to the log.
-    ahead_waiting: std::collections::VecDeque<(NodeId, Epoch, Seq, Vec<BackupTx>)>,
+    ahead_waiting: std::collections::VecDeque<(NodeId, Epoch, Seq, Vec<BackupTx>, bool)>,
     /// Subscriber: `StreamAhead` transactions that did not follow what
     /// this replica holds — a batch arrived while a job had the cursor,
     /// or after an earlier one was lost — kept until the log closes the
@@ -707,7 +763,7 @@ pub(crate) struct BackupState {
     /// was "not contiguous" too), so this node saw every write only
     /// through S3 — one segment PUT and the ship pacing, 0.4-5 s at
     /// 300 ms per S3 request (EC2 campaign 6, visibility-s3-latency).
-    ahead_gapped: std::collections::VecDeque<(NodeId, Epoch, Seq, Vec<BackupTx>)>,
+    ahead_gapped: std::collections::VecDeque<(NodeId, Epoch, Seq, Vec<BackupTx>, bool)>,
     /// `ack=s3` fast takeover: since when the known holder has been
     /// silent on P2P.
     holder_silent_since: Option<WaitMs>,
@@ -753,6 +809,12 @@ pub(crate) struct BackupState {
     pub(crate) group_wait: Option<super::seal_tail::GroupWait>,
     pub(crate) abandon: Option<Epoch>,
     pub(crate) abandoned_claim: Option<Epoch>,
+    /// Plan 43 C1-4: the abandoned epoch of the claim whose gate is open
+    /// (its strand rolls back that group's committed entries too).
+    pub(crate) gate_abandoned: Option<Epoch>,
+    /// Plan 43 C1-4: the extent of the tail the open gate re-ships (its
+    /// marker's `TailFollowsThrough.through`).
+    pub(crate) tail_through: u64,
     pub(crate) member_epochs: Vec<Epoch>,
 }
 
@@ -3610,6 +3672,17 @@ impl Core {
                 msg: PeerMsg::StreamAhead {
                     epoch,
                     base,
+                    // Committed: held by the group (not an epoch hold's tip)
+                    // and every row of the root's own tenure in it was
+                    // journaled under a class that waits for a group or the
+                    // archive — a hold's rows (non-stealable) and a lone
+                    // node's streamed after the gate went off are not.
+                    committed: !in_epoch
+                        && batch.iter().all(|t| {
+                            t.records.is_empty()
+                                || t.origin != (0, 0)
+                                || replica.journal_tx_class(t.first).is_some_and(|c| c.gated())
+                        }),
                     txs: batch,
                 },
             });
@@ -4647,11 +4720,26 @@ impl Core {
                 self.arm_backup_watch(now, out);
             }
             Some((lease, _)) => {
-                // Not listed any more, or the lease moved on: our tail is
-                // void (a listed successor re-shipped what mattered). Not
-                // sealed: a live holder that removed this node may invite
-                // it back as a candidate in the same epoch.
                 self.lease.note_object(&lease);
+                // Plan 43 C1-4 (S4): the lease moved on to a later epoch —
+                // a successor took this holder's group over. What this node
+                // held of the old epoch may be the last copy of rows the
+                // group committed that the successor has not shipped yet
+                // (the successor's lease names this group until it has): it
+                // is kept as a member copy of the epoch, served to a
+                // claimant that fetches it, and dropped when the log
+                // carries it. (A tail this node held through a gap is not
+                // the group's: only the contiguous hold.)
+                if lease.epoch > role.epoch && !self.keep_tail_as_member_copy(role, replica) {
+                    self.arm_backup_watch(now, out);
+                    return;
+                }
+                // Not listed any more in the same epoch (a removal, or a
+                // candidate that was not listed yet): our tail is void —
+                // the holder counts only what a listed backup acknowledged
+                // (plan 43 C1-1). Not sealed: a live holder that removed
+                // this node may invite it back as a candidate in the same
+                // epoch.
                 tracing::info!(
                     node = self.cfg.node_id,
                     holder = lease.holder,
@@ -4672,6 +4760,35 @@ impl Core {
         }
     }
 
+    /// Plan 43 C1-4: move the contiguous tail this node holds for `role`'s
+    /// epoch into the member copy of that epoch (persisted and synced), so
+    /// that clearing the backup tail loses nothing a later claimant may need.
+    /// `false`: could not persist it; the caller keeps the tail and tries
+    /// again.
+    pub(crate) fn keep_tail_as_member_copy(
+        &mut self,
+        role: BackupRole,
+        replica: &dyn Replica,
+    ) -> bool {
+        let acked = replica.backup_acked(role.epoch);
+        // (Not what the log carries already: rows of the epoch this replica
+        // applied through — a tail that outlived a crash before its trim.)
+        let shipped = replica.applied_jseq_of(role.epoch);
+        let txs: Vec<BackupTx> = replica
+            .backup_tail(role.epoch)
+            .into_iter()
+            .filter(|t| t.last <= acked && t.last > shipped && !t.records.is_empty())
+            .collect();
+        if txs.is_empty() {
+            return true;
+        }
+        if !replica.member_copy_put(role.epoch, role.config_version, &txs) {
+            return false;
+        }
+        self.stats.tails_kept_as_member_copy += 1;
+        true
+    }
+
     /// This node backs nobody any more; its tail is void.
     pub(crate) fn backup_role_ends(&mut self, replica: &dyn Replica) {
         self.bk.role = None;
@@ -4690,11 +4807,22 @@ impl Core {
         replica: &dyn Replica,
     ) -> Result<(), String> {
         let tail = replica.backup_tail(prev_epoch);
+        // Plan 43 C1-4 (D6): the re-ship is the sealed tail's contiguous
+        // prefix. Rows past a gap were never acknowledged (the holder counts
+        // contiguous acknowledgements); their clients retry by rid.
+        let through = self.bk.tail_through;
         let mut applied = 0u64;
+        let mut moved: Vec<constellation_meta::BackupTx> = Vec::new();
+        let mut failed: Option<String> = None;
         for tx in &tail {
             if tx.records.is_empty() {
                 // A hole: rows the holder had shipped (or rolled back)
                 // before it streamed past them; nothing to re-apply.
+                replica.backup_trim(prev_epoch, tx.last, &[]);
+                continue;
+            }
+            if tx.last > through {
+                self.stats.tail_beyond_gap_dropped += 1;
                 replica.backup_trim(prev_epoch, tx.last, &[]);
                 continue;
             }
@@ -4723,13 +4851,37 @@ impl Core {
                 "backup tail transaction"
             );
             if !done {
+                // Plan 43 C1-4 (D10): the transaction's identity travels with
+                // it, as its first record: the journal that first held it.
+                // One that carries one already keeps it (re-shipped twice,
+                // A to B to C, it is A's still).
+                let records: std::borrow::Cow<'_, [constellation_meta::LogRecord]> = if tx.origin
+                    == (0, 0)
+                    && constellation_meta::tail_identity(&tx.records).is_none()
+                {
+                    let mut r = Vec::with_capacity(tx.records.len() + 1);
+                    r.push(constellation_meta::LogRecord::TailOf {
+                        epoch: prev_epoch,
+                        jseq: tx.first,
+                    });
+                    r.extend(tx.records.iter().cloned());
+                    std::borrow::Cow::Owned(r)
+                } else {
+                    std::borrow::Cow::Borrowed(&tx.records)
+                };
                 // Under the row's delegation origin: a root's append of a
                 // delegate's stream row stays one (delegated-holder-cut
                 // seed 1719).
-                replica
-                    .apply_backup_tx_journaled(&tx.records, rid, tx.origin)
-                    .map_err(|e| format!("re-applying the backup tail: {e}"))?;
+                if let Err(e) = replica.apply_backup_tx_journaled(&records, rid, tx.origin) {
+                    failed = Some(format!("re-applying the backup tail: {e}"));
+                    break;
+                }
                 applied += 1;
+                // This node's journal holds the row now; the group's copy
+                // stays as a member copy until the log carries it.
+                if tx.origin == (0, 0) {
+                    moved.push(tx.clone());
+                }
             }
             replica.backup_trim(prev_epoch, tx.last, &[]);
         }
@@ -4741,6 +4893,22 @@ impl Core {
                 applied,
                 "re-shipping the predecessor's backup tail under the new epoch"
             );
+        }
+        // Plan 43 C1-4 (S4): the successor keeps the committed rows it
+        // re-ships as a member copy of the epoch they were committed in, so
+        // that a claimant of its lease that fetches the inherited tail finds
+        // them here whatever happens to its journal, until the log carries
+        // their identities.
+        if !moved.is_empty() {
+            let cv = self.bk.role.map_or(0, |r| r.config_version);
+            if !replica.member_copy_put(prev_epoch, cv, &moved) {
+                return Err("keeping the re-shipped tail as a member copy".into());
+            }
+        }
+        if let Some(e) = failed {
+            // (Retried by the next round: what applied is journaled, held as
+            // a member copy and trimmed from the tail.)
+            return Err(e);
         }
         self.stats.backup_tail_applied += applied;
         self.stats.backup_takeovers += 1;
@@ -4756,6 +4924,7 @@ impl Core {
         }
         self.bk.role = None;
         self.bk.acked = 0;
+        self.bk.tail_through = 0;
         replica.backup_clear();
         Ok(())
     }
@@ -4769,15 +4938,22 @@ impl Core {
         rows: &[u64],
         replica: &dyn Replica,
     ) {
-        if self.bk.role.is_some_and(|r| r.epoch <= epoch) {
-            replica.backup_trim(epoch, through, rows);
-            if self.bk.role.is_some_and(|r| r.epoch < epoch) {
-                // A newer tenure: whoever holds now re-shipped or
-                // stranded what our holder left; our tail is void.
-                self.bk.role = None;
-                self.bk.acked = 0;
-                self.bk.held.clear();
-                replica.backup_clear();
+        if let Some(role) = self.bk.role.filter(|r| r.epoch <= epoch) {
+            if role.epoch < epoch {
+                // A newer tenure: whoever holds now re-ships what our
+                // holder left, from its own copy or ours. Plan 43 C1-4: ours
+                // is kept as a member copy of the old epoch until the log
+                // carries it (the successor may yet be replaced before it
+                // ships); the backup tail itself is void. (Before the trim
+                // below, which drops every older epoch of the tail.)
+                if self.keep_tail_as_member_copy(role, replica) {
+                    self.bk.role = None;
+                    self.bk.acked = 0;
+                    self.bk.held.clear();
+                    replica.backup_clear();
+                }
+            } else {
+                replica.backup_trim(epoch, through, rows);
             }
         }
         // The next streamed transaction must follow the log — or what the
@@ -4803,6 +4979,7 @@ impl Core {
         epoch: Epoch,
         base: Seq,
         txs: Vec<BackupTx>,
+        committed: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -4815,7 +4992,7 @@ impl Core {
         {
             // A job moves the cursor: follow the log first, then these.
             self.bk.ahead_next = None;
-            self.park_gapped(from, epoch, base, txs);
+            self.park_gapped(from, epoch, base, txs, committed);
             return;
         }
         if !self.cfg.pre_s3_streaming
@@ -4840,12 +5017,14 @@ impl Core {
         if self.ship.head_seq < base {
             // Ahead of the segment it follows: wait for that segment.
             if self.bk.ahead_waiting.len() >= AHEAD_WAITING_MAX {
-                if let Some((_, _, _, old)) = self.bk.ahead_waiting.pop_front() {
+                if let Some((_, _, _, old, _)) = self.bk.ahead_waiting.pop_front() {
                     self.stats.streamed_dropped += old.len() as u64;
                     self.bk.ahead_next = None;
                 }
             }
-            self.bk.ahead_waiting.push_back((from, epoch, base, txs));
+            self.bk
+                .ahead_waiting
+                .push_back((from, epoch, base, txs, committed));
             return;
         }
         let mut completed: Vec<(constellation_meta::Rid, constellation_meta::KeySet)> = Vec::new();
@@ -4854,7 +5033,7 @@ impl Core {
             let Some((e, next)) = self.bk.ahead_next else {
                 // The cursor is lost until the next segment re-syncs it.
                 let rest: Vec<BackupTx> = std::iter::once(tx).chain(txs).collect();
-                self.park_gapped(from, epoch, base, rest);
+                self.park_gapped(from, epoch, base, rest, committed);
                 break;
             };
             if e != epoch || tx.first < next {
@@ -4897,7 +5076,7 @@ impl Core {
                 // What lies between reaches this node in a segment; these
                 // follow it.
                 let rest: Vec<BackupTx> = std::iter::once(tx).chain(txs).collect();
-                self.park_gapped(from, epoch, base, rest);
+                self.park_gapped(from, epoch, base, rest, committed);
                 break;
             }
             if tx.records.is_empty() {
@@ -4912,7 +5091,23 @@ impl Core {
                 });
                 continue;
             }
-            match replica.install_streamed(epoch, from, tx.first, tx.last, &tx.records) {
+            // The log carries it already (a segment named the row a moment
+            // before the stream delivered it): nothing to install, and a
+            // committed entry installed now would wait for a segment that went
+            // by. The cursor steps over it.
+            if replica.row_in_log(epoch, tx.last) {
+                self.bk.ahead_next = Some((epoch, tx.last + 1));
+                replica.note_streamed(constellation_meta::JournalPos {
+                    epoch,
+                    jseq: tx.last,
+                });
+                continue;
+            }
+            // A delegate's row the root appended (`origin` of a generation) is no
+            // committed row of the root's group at C1 (its class is the
+            // delegation's, C2/C3): it strands with its tenure as before.
+            let committed = committed && tx.origin == (0, 0);
+            match replica.install_streamed(epoch, from, tx.first, tx.last, &tx.records, committed) {
                 Ok(()) => {
                     replica.note_foreign_executed(&tx.records);
                     tracing::debug!(
@@ -4985,32 +5180,42 @@ impl Core {
             .bk
             .ahead_waiting
             .front()
-            .is_some_and(|(_, _, base, _)| *base <= self.ship.head_seq)
+            .is_some_and(|(_, _, base, _, _)| *base <= self.ship.head_seq)
         {
-            let (from, epoch, base, txs) = self.bk.ahead_waiting.pop_front().expect("front");
-            self.on_stream_ahead(now, from, epoch, base, txs, replica, out);
+            let (from, epoch, base, txs, committed) =
+                self.bk.ahead_waiting.pop_front().expect("front");
+            self.on_stream_ahead(now, from, epoch, base, txs, committed, replica, out);
         }
         // The log may have closed the gap before parked transactions (or
         // re-synced a lost cursor): install what now follows it; what the
         // log already holds is skipped, what is still ahead of a gap
         // waits again.
-        for (from, epoch, base, txs) in std::mem::take(&mut self.bk.ahead_gapped) {
-            self.on_stream_ahead(now, from, epoch, base, txs, replica, out);
+        for (from, epoch, base, txs, committed) in std::mem::take(&mut self.bk.ahead_gapped) {
+            self.on_stream_ahead(now, from, epoch, base, txs, committed, replica, out);
         }
     }
 
     /// Keep `txs` for [`Core::retry_stream_ahead`] (the oldest go once
     /// [`AHEAD_WAITING_MAX`] batches wait).
-    fn park_gapped(&mut self, from: NodeId, epoch: Epoch, base: Seq, txs: Vec<BackupTx>) {
+    fn park_gapped(
+        &mut self,
+        from: NodeId,
+        epoch: Epoch,
+        base: Seq,
+        txs: Vec<BackupTx>,
+        committed: bool,
+    ) {
         if txs.is_empty() {
             return;
         }
         if self.bk.ahead_gapped.len() >= AHEAD_WAITING_MAX {
-            if let Some((_, _, _, old)) = self.bk.ahead_gapped.pop_front() {
+            if let Some((_, _, _, old, _)) = self.bk.ahead_gapped.pop_front() {
                 self.stats.streamed_dropped += old.len() as u64;
             }
         }
-        self.bk.ahead_gapped.push_back((from, epoch, base, txs));
+        self.bk
+            .ahead_gapped
+            .push_back((from, epoch, base, txs, committed));
     }
 
     // ------------------------------------------- `ack=s3` fast takeover

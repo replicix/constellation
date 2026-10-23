@@ -2135,6 +2135,15 @@ fn a_handoff_request_that_waited_past_its_timeout_is_declined() {
 /// node 2's takeover at epoch 2: the core is deposed and its recovery
 /// round's tail to head is outstanding in the returned actions.
 fn lose_renewal_with_an_unshipped_create(h: &mut Harness) -> Vec<Action> {
+    lose_renewal_with_a_create_of_class(h, None)
+}
+
+/// [`lose_renewal_with_an_unshipped_create`], the create's row re-tagged
+/// `class` (plan 43 C1-4: what a deposition does to it depends on it).
+fn lose_renewal_with_a_create_of_class(
+    h: &mut Harness,
+    class: Option<constellation_meta::RowClass>,
+) -> Vec<Action> {
     h.hold(1, None);
     // Something unshipped, so the deposition has work to roll back.
     let out = h.step(Event::Submit {
@@ -2147,6 +2156,10 @@ fn lose_renewal_with_an_unshipped_create(h: &mut Harness) -> Vec<Action> {
         replies(&out)[0].1,
         ClientReply::Outcome(MutateOutcome::Accepted { .. })
     ));
+    if let Some(class) = class {
+        let first = h.meta.journal_acked_seq().unwrap() + 1;
+        h.meta.reclass_journal_tx(first, class).unwrap();
+    }
     // Past half-TTL the round renews; the CAS is lost to a takeover.
     h.advance(6_000);
     let mut out = Vec::new();
@@ -3450,6 +3463,10 @@ fn the_drains_fold_settles_the_truncates_rid_at_the_holder() {
 /// cut it was composed on and lands.
 #[test]
 fn a_truncate_the_tail_carried_leaves_its_commit_on_the_cut_base() {
+    // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
+    // told is committed); gated rows of a deposed holder are kept as a member
+    // copy instead (`member_copy` tests).
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
     let mut h = Harness::new(2);
     let file = h.meta.create(ROOT_INO, "f7", 0o644, 0, 0).unwrap();
     constellation_meta::execute_mutate(&h.meta, &commit_of(file.ino, None, b"payload-1"), None)
@@ -3508,6 +3525,10 @@ fn a_truncate_the_tail_carried_leaves_its_commit_on_the_cut_base() {
 /// T's nor M's copy touches the winner.
 #[test]
 fn a_folded_truncate_replays_as_the_base_checked_cut() {
+    // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
+    // told is committed); gated rows of a deposed holder are kept as a member
+    // copy instead (`member_copy` tests).
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
     let stranded = |h: &mut Harness| {
         let file = h.meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
         constellation_meta::execute_mutate(&h.meta, &commit_of(file.ino, None, b"payload-1"), None)
@@ -3674,7 +3695,7 @@ fn a_delegates_own_write_between_the_takeovers_strand_and_its_replay_lands_after
     );
     assert!(h.meta.lookup(dir, "g7").unwrap().is_some());
     // The gate's strand: the rows are rolled back and queued by rid.
-    let stranded = h.meta.strand_for_takeover(2, &[1]).unwrap();
+    let stranded = h.meta.strand_for_takeover(2, &[1], None).unwrap();
     assert_eq!(stranded.locals, 3, "{stranded:?}");
     assert_eq!(h.meta.pending_replays().unwrap().len(), 3);
     assert!(h.meta.lookup(dir, "f7").unwrap().is_none());
@@ -3743,6 +3764,10 @@ fn a2(seq: u64) -> Rid {
 /// refused it, a false conflict).
 #[test]
 fn a_no_op_completion_is_not_the_truncates_effect() {
+    // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
+    // told is committed); gated rows of a deposed holder are kept as a member
+    // copy instead (`member_copy` tests).
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
     let mut h = Harness::new(2);
     let file = h.meta.create(ROOT_INO, "f7", 0o644, 0, 0).unwrap();
     constellation_meta::execute_mutate(&h.meta, &commit_of(file.ino, None, b"payload-1"), None)
@@ -3793,6 +3818,10 @@ fn a_no_op_completion_is_not_the_truncates_effect() {
 /// nearest truncate's uncut manifest, M was refused against the original.)
 #[test]
 fn two_folded_truncates_and_their_commit_all_land() {
+    // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
+    // told is committed); gated rows of a deposed holder are kept as a member
+    // copy instead (`member_copy` tests).
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
     let mut h = Harness::new(2);
     let file = h.meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
     constellation_meta::execute_mutate(&h.meta, &commit_of(file.ino, None, b"payload-1"), None)
@@ -3842,6 +3871,10 @@ fn two_folded_truncates_and_their_commit_all_land() {
 /// in-doubt answer) still replays it by the rule.
 #[test]
 fn the_drain_leaves_a_folded_truncates_row_as_it_was() {
+    // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
+    // told is committed); gated rows of a deposed holder are kept as a member
+    // copy instead (`member_copy` tests).
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
     let (_holder, mut requester) = pair();
     let file = requester.meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
     constellation_meta::execute_mutate(
@@ -4191,6 +4224,10 @@ fn a_holders_drain_journals_a_refused_replay() {
 /// and materializes a conflict copy of a version that was never lost.
 #[test]
 fn a_deposed_holders_adopted_manifest_commit_is_not_replayed() {
+    // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
+    // told is committed); gated rows of a deposed holder are kept as a member
+    // copy instead (`member_copy` tests).
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
     use constellation_fs_core::{ChunkHash, Manifest};
     let mut h = Harness::new(1);
     let file = h.meta.create(ROOT_INO, "same", 0o644, 0, 0).unwrap();
@@ -6345,6 +6382,7 @@ fn a_stream_ahead_batch_that_overtakes_its_segment_waits_for_it() {
             epoch: 1,
             base: 1,
             txs,
+            committed: false,
         },
     });
     assert!(MetaStore::lookup(&sub.meta, ROOT_INO, "b")
@@ -6392,6 +6430,7 @@ fn a_segment_behind_the_stream_keeps_its_cursor() {
             epoch: 1,
             base: 1,
             txs,
+            committed: false,
         },
     });
     assert_eq!(sub.core.stats.streamed_installed, 2);
@@ -6411,6 +6450,7 @@ fn a_segment_behind_the_stream_keeps_its_cursor() {
             epoch: 1,
             base: 2,
             txs,
+            committed: false,
         },
     });
     assert!(MetaStore::lookup(&sub.meta, ROOT_INO, "d")
@@ -6442,6 +6482,7 @@ fn a_restarted_subscriber_does_not_reinstall_what_it_holds() {
         epoch: 1,
         base: 1,
         txs: txs.clone(),
+        committed: false,
     };
     sub.step(Event::Peer {
         from: 1,
@@ -6473,6 +6514,7 @@ fn a_restarted_subscriber_does_not_reinstall_what_it_holds() {
             epoch: 1,
             base: 1,
             txs,
+            committed: false,
         },
     });
     assert!(MetaStore::lookup(&sub.meta, ROOT_INO, "d")
@@ -6512,6 +6554,7 @@ fn stream_ahead_after_a_lost_transaction_resumes_once_the_log_closes_the_gap() {
             epoch: 1,
             base: 1,
             txs: c,
+            committed: false,
         },
     });
     assert!(MetaStore::lookup(&sub.meta, ROOT_INO, "c")
@@ -6542,6 +6585,7 @@ fn stream_ahead_after_a_lost_transaction_resumes_once_the_log_closes_the_gap() {
             epoch: 1,
             base: 2,
             txs: d,
+            committed: false,
         },
     });
     assert!(MetaStore::lookup(&sub.meta, ROOT_INO, "d")
@@ -11638,7 +11682,7 @@ mod backup_crash {
 
     /// The job S3 request matching `pred` in `out` (heartbeat reads and
     /// other traffic aside).
-    fn find_s3(out: &[Action], pred: impl Fn(&S3Op) -> bool) -> OpId {
+    pub(super) fn find_s3(out: &[Action], pred: impl Fn(&S3Op) -> bool) -> OpId {
         s3_ops(out)
             .into_iter()
             .find(|(_, r)| pred(r))
@@ -11646,7 +11690,12 @@ mod backup_crash {
             .unwrap_or_else(|| panic!("no matching S3 request in {out:?}"))
     }
 
-    fn backup_lease(holder: NodeId, epoch: Epoch, expires: i64, backups: Vec<NodeId>) -> Lease {
+    pub(super) fn backup_lease(
+        holder: NodeId,
+        epoch: Epoch,
+        expires: i64,
+        backups: Vec<NodeId>,
+    ) -> Lease {
         Lease {
             backups,
             ack_policy: AckPolicy::Backup,
@@ -11962,10 +12011,13 @@ mod backup_crash {
             })
             .expect("the marker");
         let seg = crate::segment::decode(&payload).unwrap();
-        assert_eq!(
-            seg.records,
-            vec![LogRecord::TailFollows { prev_epoch: 1 }],
-            "the marker announces the tail"
+        assert!(
+            matches!(
+                seg.records.as_slice(),
+                [LogRecord::TailFollowsThrough { prev_epoch: 1, through }] if *through > 0
+            ),
+            "the marker announces the tail and how far it reaches: {:?}",
+            seg.records
         );
         let _ = h.step(Event::S3 {
             op: marker,
@@ -12677,7 +12729,7 @@ mod locks {
         h.core.delegation_sync(h.clk(), &h.meta, &mut out);
         assert!(!h.core.dl.mine[&7].stopped);
         two_delegate_rows(&h, dir);
-        h.meta.strand_for_takeover(2, &[7]).unwrap();
+        h.meta.strand_for_takeover(2, &[7], None).unwrap();
         assert_eq!(h.meta.delegate_idx(7).unwrap(), 2, "the counter stays");
         // The restart.
         h.core = Core::new(h.core.cfg.clone());
@@ -33657,6 +33709,10 @@ fn a_deposed_nodes_op_is_not_forwarded_before_the_recovery() {
 /// new holder), then forwarded under the same rid.
 #[test]
 fn a_deposed_nodes_op_waits_for_its_own_earlier_write_then_forwards() {
+    // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
+    // told is committed); gated rows of a deposed holder are kept as a member
+    // copy instead (`member_copy` tests).
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
     let (mut h, (before_rid, before_op), rid, retry) = op_submitted_while_deposed();
     recover_deposed_node(&mut h);
     assert_eq!(h.meta.pending_replays().unwrap().len(), 1);
@@ -33715,6 +33771,10 @@ fn a_deposed_nodes_op_waits_for_its_own_earlier_write_then_forwards() {
 /// node's own stranded write.
 #[test]
 fn a_stalled_s3_does_not_forward_a_deposed_nodes_op_ahead_of_its_own_write() {
+    // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
+    // told is committed); gated rows of a deposed holder are kept as a member
+    // copy instead (`member_copy` tests).
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
     let (mut h, _before, rid, _retry) = op_submitted_while_deposed();
     recover_deposed_node(&mut h);
     h.advance(1_000);
@@ -33803,6 +33863,10 @@ fn deposed_root_with_a_marker_replay() -> (Harness, Rid, constellation_meta::Str
 /// queued for the drain, whose submit makes the root wait for them.
 #[test]
 fn the_gate_leaves_a_replay_to_the_drain_until_its_delegate_rows_are_here() {
+    // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
+    // told is committed); gated rows of a deposed holder are kept as a member
+    // copy instead (`member_copy` tests).
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
     let (mut h, _rid, _q) = deposed_root_with_a_marker_replay();
     let mut out = Vec::new();
     h.core
@@ -33827,6 +33891,10 @@ fn the_gate_leaves_a_replay_to_the_drain_until_its_delegate_rows_are_here() {
 /// publishing).
 #[test]
 fn the_gate_forgets_a_replay_the_log_already_settled_whatever_its_deps() {
+    // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
+    // told is committed); gated rows of a deposed holder are kept as a member
+    // copy instead (`member_copy` tests).
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
     let (mut h, rid, _q) = deposed_root_with_a_marker_replay();
     let seg = [
         LogRecord::Create {
@@ -33904,6 +33972,10 @@ fn kept_deps(h: &Harness, rid: Rid) -> Vec<(u64, u64)> {
 /// ordered after them), and drops only those of a generation that ended.
 #[test]
 fn a_replay_with_one_lost_generation_keeps_the_rows_of_the_live_one() {
+    // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
+    // told is committed); gated rows of a deposed holder are kept as a member
+    // copy instead (`member_copy` tests).
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
     let (mut h, rid, q) = deposed_root_with_a_marker_replay();
     let mut deps = constellation_meta::Streams::NONE;
     deps.raise(4, 7);
@@ -33933,6 +34005,10 @@ fn a_replay_with_one_lost_generation_keeps_the_rows_of_the_live_one() {
 /// does not record it, so the replay runs.
 #[test]
 fn a_replay_does_not_wait_on_the_successors_stream_of_an_undone_grants_number() {
+    // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
+    // told is committed); gated rows of a deposed holder are kept as a member
+    // copy instead (`member_copy` tests).
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
     let mut h = Harness::new(1);
     h.core.cfg.delegation = true;
     h.hold(1, None);
@@ -34019,6 +34095,10 @@ fn a_replay_does_not_wait_on_the_successors_stream_of_an_undone_grants_number() 
 /// lists are not waited for, whatever this session remembers of it.
 #[test]
 fn a_replay_does_not_keep_rows_of_a_generation_the_log_ended_below_its_own_cut() {
+    // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
+    // told is committed); gated rows of a deposed holder are kept as a member
+    // copy instead (`member_copy` tests).
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
     let (mut h, rid, q) = deposed_root_with_a_marker_replay();
     // This replica's own memory: generation 4 ended at its cursor 7 (the
     // rows it appended), so row 7 is not lost *here*.
@@ -34157,6 +34237,10 @@ fn queued_rids(h: &Harness) -> Vec<Rid> {
 /// of its own entry.
 #[test]
 fn a_deposed_nodes_own_op_at_the_head_of_its_replay_queue_is_not_held_behind_the_rest() {
+    // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
+    // told is committed); gated rows of a deposed holder are kept as a member
+    // copy instead (`member_copy` tests).
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
     let (mut h, [(rx, x), (ry, _y)]) = deposed_with_stranded_rows(["x", "y"]);
     let out = resubmit_in_doubt(&mut h, rx, &x);
     // It goes to the holder at once (held, it sat in a backoff).
@@ -34186,6 +34270,10 @@ fn a_deposed_nodes_own_op_at_the_head_of_its_replay_queue_is_not_held_behind_the
 /// must not overtake it).
 #[test]
 fn a_deposed_nodes_own_op_behind_another_replay_is_held_until_it_settles() {
+    // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
+    // told is committed); gated rows of a deposed holder are kept as a member
+    // copy instead (`member_copy` tests).
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
     let (mut h, [(ry, y), (rx, x)]) = deposed_with_stranded_rows(["y", "x"]);
     let out = resubmit_in_doubt(&mut h, rx, &x);
     assert!(!forwards_of(&out, rx), "held, not forwarded: {out:?}");
@@ -34213,6 +34301,10 @@ fn a_deposed_nodes_own_op_behind_another_replay_is_held_until_it_settles() {
 /// behind it (which the drain reaches only after it).
 #[test]
 fn a_deposed_nodes_own_op_in_the_middle_of_its_queue_is_held_for_the_one_ahead_only() {
+    // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
+    // told is committed); gated rows of a deposed holder are kept as a member
+    // copy instead (`member_copy` tests).
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
     let (mut h, [(ry, y), (rx, x), (rz, _z)]) = deposed_with_stranded_rows(["y", "x", "z"]);
     let out = resubmit_in_doubt(&mut h, rx, &x);
     assert!(!forwards_of(&out, rx), "held for ry: {out:?}");
@@ -34248,6 +34340,10 @@ fn a_deposed_nodes_own_op_in_the_middle_of_its_queue_is_held_for_the_one_ahead_o
 /// its session had voided the rows, and so did not name them.)
 #[test]
 fn a_deposed_nodes_own_op_keeps_the_live_rows_its_queue_entry_recorded() {
+    // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
+    // told is committed); gated rows of a deposed holder are kept as a member
+    // copy instead (`member_copy` tests).
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
     let mut h = Harness::new(1);
     h.core.cfg.delegation = true;
     h.hold(1, None);
@@ -34359,6 +34455,10 @@ fn assert_accepted_once(out: &[Action]) {
 /// handles, the op is an op never sent and skips the `completed` check.
 #[test]
 fn a_lost_fast_path_write_resubmitted_in_doubt_is_decided_once_across_a_takeover_replay() {
+    // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
+    // told is committed); gated rows of a deposed holder are kept as a member
+    // copy instead (`member_copy` tests).
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
     let mut h = Harness::new(1);
     h.hold(1, None);
     let rx = h.rid(1);
@@ -34443,6 +34543,10 @@ fn a_rid_the_core_already_completed_is_answered_from_completed_when_resubmitted_
 /// and the holder's one answer settles both.
 #[test]
 fn a_resubmission_in_doubt_merges_into_the_live_replay_of_its_rid() {
+    // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
+    // told is committed); gated rows of a deposed holder are kept as a member
+    // copy instead (`member_copy` tests).
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
     let mut h = Harness::new(1);
     h.hold(1, None);
     let rx = h.rid(1);
@@ -34528,6 +34632,10 @@ fn a_resubmission_in_doubt_merges_into_the_live_replay_of_its_rid() {
 /// replay leaves the mark for the client's resubmission.
 #[test]
 fn a_replay_of_a_rid_leaves_the_clients_in_doubt_mark_for_its_resubmission() {
+    // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
+    // told is committed); gated rows of a deposed holder are kept as a member
+    // copy instead (`member_copy` tests).
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
     let mut h = Harness::new(1);
     h.hold(1, None);
     let rx = h.rid(1);
@@ -36298,7 +36406,7 @@ mod recall_cut {
         h.core.complete_ready(h.clk(), &h.meta, &mut out);
         assert!(replies_to_2(&out).is_empty(), "still waiting: {out:?}");
         assert!(h.core.has_stream_parks());
-        h.meta.strand_for_takeover(2, &[7]).unwrap();
+        h.meta.strand_for_takeover(2, &[7], None).unwrap();
         let mut out = Vec::new();
         h.core.complete_ready(h.clk(), &h.meta, &mut out);
         assert_eq!(replies_to_2(&out), vec![&MutateOutcome::Busy], "{out:?}");
@@ -37768,7 +37876,7 @@ mod c1_tail_fetch {
         assert!(
             seg.records
                 .iter()
-                .any(|r| matches!(r, LogRecord::TailFollows { prev_epoch: 1 })),
+                .any(|r| matches!(r, LogRecord::TailFollowsThrough { prev_epoch: 1, .. })),
             "{:?}",
             seg.records
         );
@@ -39104,5 +39212,208 @@ mod c1_class {
                 ..
             }
         )));
+    }
+}
+
+/// Plan 43 C1-4: nothing committed is re-executed — a deposed group tenure
+/// keeps what its clients were told is committed as a member copy, and a
+/// successor keeps the tail it re-ships as one.
+mod c1_member_copy {
+    use super::backup_crash::{backup_lease, find_s3};
+    use super::*;
+    use constellation_meta::RowClass;
+
+    /// A deposed holder's committed row is rolled back and kept as the
+    /// member copy of its epoch; nothing is queued for replay, and its
+    /// client's retry (the rid) finds no completion here. A row nobody was
+    /// told is committed is replayed as before. Fails on the parent: the
+    /// gated row was queued.
+    #[test]
+    fn a_deposed_backed_holder_queues_no_replay_for_gated_rows() {
+        for (class, replayed) in [
+            (RowClass::RootGroup, false),
+            (RowClass::Archive, false),
+            (RowClass::Lone, true),
+        ] {
+            let mut h = Harness::new(1);
+            let out = lose_renewal_with_a_create_of_class(&mut h, Some(class));
+            let (tail, _) = s3_ops(&out)[0];
+            let out = h.step(Event::S3 {
+                op: tail,
+                result: S3Result::SegmentRun(Ok(Vec::new())),
+            });
+            let _ = at_head(&mut h, out);
+            assert!(!h.core.lease().lost, "{class:?}");
+            assert_eq!(
+                h.meta.pending_replays().unwrap().len(),
+                usize::from(replayed),
+                "{class:?}: {:?}",
+                h.meta.pending_replays()
+            );
+            assert_eq!(h.core.stats.local_rolled_back, 1, "{class:?}");
+            assert_eq!(
+                h.core.stats.rows_member_copied,
+                u64::from(!replayed),
+                "{class:?}"
+            );
+            assert_eq!(h.core.stats.replay_gated_enqueued, 0);
+            assert!(
+                h.meta.member_copy_carries(h.rid(1)).unwrap() != replayed,
+                "{class:?}: the copy holds it iff it is not replayed"
+            );
+            assert!(
+                h.meta.completed_position(h.rid(1)).unwrap().is_none(),
+                "this node no longer claims to have executed it"
+            );
+            assert_eq!(
+                constellation_meta::MetaStore::journal_len(&h.meta).unwrap(),
+                0
+            );
+            assert!(h.meta.lookup(ROOT_INO, "a").unwrap().is_none());
+        }
+    }
+
+    /// A tail a node re-ships: each transaction starts with the identity of
+    /// the journal that first held it; a transaction past the sealed hold's
+    /// contiguous prefix is not re-shipped (never acknowledged); the group's
+    /// copy of what was re-shipped is kept as a member copy of its epoch.
+    /// Fails on the parent: no identity, no member copy, the gap applied.
+    #[test]
+    fn a_tail_is_re_shipped_with_identity_and_a_beyond_the_gap_row_is_not() {
+        let holder = Harness::new(1);
+        holder.meta.set_holder_epoch(1);
+        for (i, name) in ["a", "b", "c"].into_iter().enumerate() {
+            let rid = Rid {
+                node: 1,
+                incarnation: 1,
+                seq: i as u64 + 1,
+            };
+            constellation_meta::execute_mutate(&holder.meta, &holder.create(name), Some(rid))
+                .unwrap();
+        }
+        let txs = holder.meta.journal_txs_from(1, 1000).unwrap();
+        assert!(txs.len() >= 3, "{txs:?}");
+        let mut h = Harness::new(2);
+        assert!(crate::Replica::backup_append(&h.meta, 1, &txs));
+        // The sealer's hold reaches the second transaction.
+        h.core.bk.tail_through = txs[1].last;
+        h.core.apply_backup_tail(1, &h.meta).unwrap();
+        assert!(h.meta.lookup(ROOT_INO, "a").unwrap().is_some());
+        assert!(h.meta.lookup(ROOT_INO, "b").unwrap().is_some());
+        assert!(
+            h.meta.lookup(ROOT_INO, "c").unwrap().is_none(),
+            "past the gap: not re-shipped"
+        );
+        assert_eq!(h.core.stats.tail_beyond_gap_dropped, 1);
+        // Each re-shipped transaction opens with its identity.
+        let journal = h.meta.journal_txs_from(1, 1000).unwrap();
+        let ids: Vec<(u64, u64)> = journal
+            .iter()
+            .filter_map(|t| constellation_meta::tail_identity(&t.records))
+            .collect();
+        assert_eq!(ids, vec![(1, txs[0].first), (1, txs[1].first)]);
+        // The group's copy is kept, until the log carries the identities.
+        let (_, copy) = h.meta.member_copy(1).unwrap().expect("a member copy");
+        assert_eq!(copy.iter().map(|t| t.first).collect::<Vec<_>>(), {
+            vec![txs[0].first, txs[1].first]
+        });
+    }
+
+    /// The identity is transitive: a tail whose transactions carry one
+    /// already (they were a re-ship) keeps it, A to B to C.
+    #[test]
+    fn tail_of_identity_is_transitive() {
+        let holder = Harness::new(1);
+        holder.meta.set_holder_epoch(1);
+        let rid = Rid {
+            node: 1,
+            incarnation: 1,
+            seq: 1,
+        };
+        constellation_meta::execute_mutate(&holder.meta, &holder.create("a"), Some(rid)).unwrap();
+        let mut txs = holder.meta.journal_txs_from(1, 1000).unwrap();
+        // B's journal held it as a re-ship of A's (7, 3).
+        txs[0]
+            .records
+            .insert(0, LogRecord::TailOf { epoch: 7, jseq: 3 });
+        let mut h = Harness::new(3);
+        assert!(crate::Replica::backup_append(&h.meta, 2, &txs));
+        h.core.bk.tail_through = txs[0].last;
+        h.core.apply_backup_tail(2, &h.meta).unwrap();
+        let journal = h.meta.journal_txs_from(1, 1000).unwrap();
+        let ids: Vec<(u64, u64)> = journal
+            .iter()
+            .filter_map(|t| constellation_meta::tail_identity(&t.records))
+            .collect();
+        assert_eq!(ids, vec![(7, 3)], "A's identity, once");
+        assert!(
+            journal[0]
+                .records
+                .iter()
+                .filter(|r| matches!(r, LogRecord::TailOf { .. }))
+                .count()
+                == 1
+        );
+    }
+
+    /// A backup whose holder's lease moved on to a later epoch keeps what
+    /// it held as a member copy of the old epoch (the successor may yet be
+    /// replaced before it ships it); a lease read that shows it merely
+    /// unlisted in the same epoch drops it (C1-1 makes that safe). Fails on
+    /// the parent: both dropped the tail.
+    #[test]
+    fn a_sealed_backup_keeps_its_tail_as_a_member_copy_at_the_next_epoch() {
+        for (lease_epoch, kept) in [(2u64, true), (1u64, false)] {
+            let holder = Harness::new(1);
+            holder.meta.set_holder_epoch(1);
+            let rid = Rid {
+                node: 1,
+                incarnation: 1,
+                seq: 1,
+            };
+            constellation_meta::execute_mutate(&holder.meta, &holder.create("a"), Some(rid))
+                .unwrap();
+            let txs = holder.meta.journal_txs_from(1, 1000).unwrap();
+            let mut h = Harness::new(2);
+            h.core.cfg.takeover_promise_check = false;
+            let out = h.step(Event::Peer {
+                from: 1,
+                msg: PeerMsg::BackupAppend {
+                    req: OpId(1),
+                    epoch: 1,
+                    holder: 1,
+                    config_version: 2,
+                    candidacy: 1,
+                    from: 1,
+                    txs,
+                    through: 0,
+                    sent_ms: 0,
+                    expires_ms: 0,
+                    clock: 0,
+                },
+            });
+            let watch = timers(&out, TimerKind::BackupWatch)[0];
+            h.advance(5_000);
+            let out = h.step(Event::Timer { id: watch });
+            let get = find_s3(&out, |r| matches!(r, S3Op::LeaseGet));
+            // The lease object: another holder at `lease_epoch`, no longer
+            // listing this node.
+            let theirs = backup_lease(3, lease_epoch, h.now.plus(4_000).0, vec![4]);
+            let _ = h.step(Event::S3 {
+                op: get,
+                result: S3Result::LeaseGet(Ok(Some((theirs, tag())))),
+            });
+            assert_eq!(h.core.bk.role, None, "epoch {lease_epoch}");
+            assert!(h.meta.backup_tail(1).unwrap().is_empty());
+            assert_eq!(
+                h.meta.member_copy(1).unwrap().is_some(),
+                kept,
+                "epoch {lease_epoch}: {:?}",
+                h.meta.member_copy_epochs()
+            );
+            if kept {
+                assert!(h.meta.member_copy_carries(rid).unwrap());
+            }
+        }
     }
 }

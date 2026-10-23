@@ -57059,6 +57059,130 @@ A rerun on a quiet box with ext4, xfs and btrfs is owed (`bench/commit-rule/run.
 - `locks-holder-behind` and the long tail of locks and delegated configurations at 2000 seeds (the sweeps took the delegated
   families 500 on the base).
 
+## Plan 43 C1-4 — Nothing committed is re-executed
+
+The fourth commit of plan 43 C1 (the coder spec's §6, Q22 (c) decided): a row whose client was
+told it is committed is never executed a second time by a node that held it. A deposed holder
+keeps such rows as a member copy of their epoch instead of queueing them for replay; a backup
+whose holder's lease moved on keeps its tail the same way; a requester's shadow or hint answered
+as committed and a subscriber's transaction streamed as committed survive the takeover and retire
+when the successor's re-ship reaches them; the re-ship leads each transaction with its identity.
+The one way a committed row is re-executed is the operator's `repair abandon-group`. DESIGN.md
+§4 (Backup, Local store, the log's records, §9) and ADR-33 (accepted, with C1's rejected
+options) say so.
+
+### The change
+
+| Item | Where |
+|---|---|
+| `LogRecord::TailOf { epoch, jseq }` (the first record of every re-shipped root transaction: the journal that first held it, kept through any number of re-ships) and `TailFollowsThrough { prev_epoch, through }` (the marker of a takeover that re-ships a tail: how far the sealer's hold reached; `through: 0` when a takeover carries none), both appended; `TailFollows` stays decodable | `meta/record.rs`, `meta/replay.rs`, `authority/replica.rs` (owe) |
+| Member copies: a key range of `backup_tail` of their own (`MemberTx`: the transaction, its class, rid, op, lock tag; info `config_version:through`), written by a deposition's strand (gated gen-0 rows are rolled back from their before-images and kept, never queued), by a backup whose holder's lease moved on (before the first segment of the later epoch is applied), by a successor for the tail it re-ships, and by the sealed holder's snapshot (with classes) | `meta/store/member.rs`, `spec.rs` (`strand_local_tx`, `Strand`), `authority/core/{backup,jobs,seal_tail}.rs` |
+| The drop rules, run where the log reaches the node (`apply_segment_rows`, the node's own acks): coverage (a segment naming the row's identity or its own epoch's row), `TailFollowsThrough` (past `through`: never committed), `GroupAbandoned` (queued as the lone branch, once), the first segment of a newer epoch that announces no tail (unacknowledged rows). What the log said is kept per epoch (`member_shipped/reship/through`) so a copy made after it (a deposed holder back from a crash) is judged by it | `meta/store/member.rs` |
+| `apply_backup_tail`: the contiguous prefix only (D6), each transaction led by its `TailOf` unless it carries one, the copy kept before the backup tail is cleared. A backup's trim keeps rows shipped ahead of a deferred one as holes, so the contiguity the marker's `through` counts is not broken by a trim | `core/backup.rs`, `meta/store/backup.rs` |
+| Committed requester and subscriber entries: `gated` on `Shadow`/`Hint`/`Streamed` (from `MutateReply.committed`; `StreamAhead.committed`, new, true only when the rows are held by the group and every root row was journaled under a gated class); not stranded by a later epoch's segment; a streamed one retires by its `TailOf` identity; the takeover gate rolls its own back without queueing (the tail it re-applies carries the rows; F1 of the C3 spec); a rebuilt namespace re-installs them; `abort_durable_parks` marks no replay for a gated row; a stream delivery the log already carries is skipped (`SessionState::row_in_log`) | `meta/store/spec.rs`, `meta/session.rs`, `core/{client,backup,readindex,jobs}.rs`, `net`, `engine` |
+| `Stranded::{member_copied, superseded, committed_rolled_back, gated_queued}`, `Stats` (`rows_member_copied`, `committed_superseded`, `committed_rolled_back` = `speculation.committed_rolled_back` (0 outside an abandon), `member_copies_{retired,dropped,abandoned}`, `tails_kept_as_member_copy`, `tail_beyond_gap_dropped`, `replay_gated_enqueued` (0)), `status.speculation.{committed_rolled_back, member_copied, committed_superseded}`, harness `verify::counters` | `core/mod.rs`, `control`, `engine/control`, `harness` |
+| Sim: `strict_durability` means I2 (b)/(c), I5 and `member_copies_drained` too; I2 (b) judges queued copies that stand for a committed answer (`identity_copies_ungated` counts the rest); I2 (c) judges a re-shipped transaction by its `TailOf` identity and its records ignoring `TailOf` (the completion need not be the last record: an inbox acknowledgement rides after it); a journaled refusal this node never answered, and one a member copy holds, is not a rollback; `SWEEP-C14-TOTALS` | `tests/sim/*`, `tests/sim.rs` |
+| Model: `commit_rule` implemented (member copies, drop rules, a fetch from a member copy, `Unlist`), five new tests; the violating variants (`a_ttl_claim_without_the_tail_fetch…`, `a_chained_takeover_without_the_inherited_tail…`, `dropping_the_member_copy_at_the_marker_loses_an_acked_write`) run with `commit_rule` on | `crates/model` |
+
+The S4 item C1-3's review left open (an old backup dropped its tail on a lease read that no
+longer lists it, the model kept it) is closed: a read of a later epoch moves the tail to a member
+copy; a read of the same epoch that merely does not list it discards it (C1-1 makes that safe); a
+backup the lease names as a member of an inherited tail keeps it (the integration review's F1).
+Spec deviations: the member copy is a key range of `backup_tail` (as C1-3 had it), not a keyspace
+of its own; `TailFollowsThrough { through: 0 }`
+is written by a takeover that carries no tail, so that a copy made after the marker is dropped
+(the spec's rule 4 alone left a deposed holder's rows for ever when it restarted after a TTL claim).
+
+### Evidence (debug builds, 5 sweep threads, the default clock-fault mix; base `323ccc54`, mine its child; one 16-CPU shared box)
+
+Failing sets are empty on both trees on every configuration; the oracle totals, base against this
+commit (the I1 `root-group/*` keys are 0 on both; the `archive/*` totals are C2's and move by a
+handful: `backup-crash` 974 to 999, `backup-chain-ttl` 41213 to 41015):
+
+| config (seeds) | failing base | failing mine | root-group keys b/m | I2 b/m | I2c b/m | I5 b/m | failover p50/p90/max b -> m |
+|---|---|---|---|---|---|---|---|
+| backup (0..500) | 0 | 0 | 0/0 | 0 (0) / 0 (0) | 8 (2) / 0 (0) | 12 (6) / 0 (0) | 1243/4725/8123 -> 1243/4725/8123 |
+| backup-chain-ttl (0..500) | 0 | 0 | 0/0 | 158 (91) / 0 (0) | 70 (55) / 0 (0) | 348 (154) / 0 (0) | None/None/None -> None/None/None |
+| backup-crash (0..500) | 0 | 0 | 0/0 | 51 (21) / 0 (0) | 1545 (413) / 0 (0) | 1592 (434) / 0 (0) | 1199/4396/8956 -> 1201/4285/9093 |
+| backup-crash-slow (0..500) | 0 | 0 | 0/0 | 199 (95) / 0 (0) | 1470 (189) / 0 (0) | 1898 (396) / 0 (0) | 5381/7824/9680 -> 5621/7824/9961 |
+| backup-departs (0..500) | 0 | 0 | 0/0 | 1 (1) / 0 (0) | 0 (0) / 0 (0) | 2 (2) / 0 (0) | None/None/None -> None/None/None |
+| backup-group-cut-ttl (0..500) | 0 | 0 | 0/0 | 130 (85) / 0 (0) | 4410 (143) / 0 (0) | 4410 (143) / 0 (0) | None/None/None -> None/None/None |
+| backup-group-cut-ttl-backup-only (0..500) | 0 | 0 | 0/0 | 5 (5) / 0 (0) | 2760 (164) / 0 (0) | 245 (49) / 0 (0) | None/None/None -> None/None/None |
+| backup-group-cut-ttl-holder-only (0..500) | 0 | 0 | 0/0 | 2 (2) / 0 (0) | 2508 (155) / 0 (0) | 292 (45) / 0 (0) | None/None/None -> None/None/None |
+| backup-hot (0..500) | 0 | 0 | 0/0 | 2 (2) / 0 (0) | 2 (2) / 0 (0) | 9 (7) / 0 (0) | None/None/None -> None/None/None |
+| backup-lag-at-expiry (0..500) | 0 | 0 | 0/0 | 448 (141) / 0 (0) | 16352 (485) / 0 (0) | 16440 (491) / 0 (0) | None/None/None -> None/None/None |
+| backup-lag-at-expiry-beats-lost (0..500) | 0 | 0 | 0/0 | 535 (144) / 0 (0) | 15898 (484) / 0 (0) | 15978 (491) / 0 (0) | None/None/None -> None/None/None |
+| backup-partition (0..500) | 0 | 0 | 0/0 | 0 (0) / 0 (0) | 1 (1) / 0 (0) | 1 (1) / 0 (0) | None/None/None -> None/None/None |
+| backup-reconfig-doubt (0..500) | 0 | 0 | 0/0 | 0 (0) / 0 (0) | 0 (0) / 0 (0) | 148 (140) / 0 (0) | None/None/None -> None/None/None |
+| backup-strict (0..500) | 0 | 0 | 0/0 | 274 (108) / 0 (0) | 1500 (397) / 0 (0) | 1557 (414) / 0 (0) | 8183/11645/16629 -> 8185/11745/17119 |
+| backup-two (0..500) | 0 | 0 | 0/0 | 0 (0) / 0 (0) | 7 (2) / 0 (0) | 10 (5) / 0 (0) | 1194/4326/8246 -> 1194/4326/8246 |
+| delegated-backup (0..300) | 0 | 0 | 0/0 | 1 (1) / 0 (0) | 21 (9) / 21 (9) | 4 (4) / 2 (2) | None/None/None -> None/None/None |
+| delegated-crash (0..300) | 0 | 0 | 0/0 | 5 (5) / 0 (0) | 0 (0) / 0 (0) | 10 (7) / 10 (7) | None/None/None -> None/None/None |
+| delegated-delegate-restart (0..300) | 0 | 0 | 0/0 | 0 (0) / 0 (0) | 0 (0) / 0 (0) | 0 (0) / 0 (0) | None/None/None -> None/None/None |
+| delegated-holder-cut (0..300) | 0 | 0 | 0/0 | 84 (47) / 0 (0) | 692 (240) / 53 (32) | 929 (269) / 276 (133) | 12945/15664/23649 -> 13226/15773/23649 |
+| delegated-partition (0..300) | 0 | 0 | 0/0 | 54 (51) / 0 (0) | 0 (0) / 0 (0) | 179 (149) / 179 (149) | None/None/None -> None/None/None |
+| delegated-root-crash (0..300) | 0 | 0 | 0/0 | 0 (0) / 0 (0) | 0 (0) / 0 (0) | 0 (0) / 0 (0) | 112/5218/11825 -> 112/5218/11825 |
+| delegated-root-gone (0..300) | 0 | 0 | 0/0 | 0 (0) / 0 (0) | 0 (0) / 0 (0) | 16 (14) / 16 (14) | 118/7159/40257 -> 118/7159/40257 |
+| delegated-two-gens-root-crash (0..300) | 0 | 0 | 0/0 | 0 (0) / 0 (0) | 0 (0) / 0 (0) | 2 (1) / 2 (1) | 248/6390/7957 -> 248/6390/7957 |
+| fast-takeover-skewed-holder-twice (0..500) | 0 | 0 | 0/0 | 95 (89) / 0 (0) | 28 (27) / 0 (0) | 1052 (444) / 0 (0) | None/None/None -> None/None/None |
+| locks-claimant-ahead (0..500) | 0 | 0 | 0/0 | 0 (0) / 0 (0) | 0 (0) / 0 (0) | 0 (0) / 0 (0) | None/None/None -> None/None/None |
+| long-backup (0..500) | 0 | 0 | 0/0 | 11 (5) / 0 (0) | 74 (12) / 0 (0) | 118 (35) / 0 (0) | 1172/4297/8212 -> 1173/4297/8212 |
+| strict-claimant-ahead (0..500) | 0 | 0 | 0/0 | 0 (0) / 0 (0) | 0 (0) / 0 (0) | 1 (1) / 1 (1) | 3750/6515/7195 -> 3750/6515/7195 |
+
+`backup*` and `long-backup` ran 500 seeds, `delegated-*` 300 (the names `delegated-backup-crash`,
+`-designated`, `-epoch`, `-faults`, `-marker`, `-placement`, `-strict` are no sweep configurations
+on either tree), `locks-claimant-ahead`, `strict-claimant-ahead` and
+`fast-takeover-skewed-holder-twice` 500 (0 failing, I6 silent). I2, I2c and I5 of every backup
+configuration are 0 (were: `backup-crash` 51, 1545, 1592; `backup-lag-at-expiry` 448, 16352,
+16440); `delegated-holder-cut` I2 84 to 0, I2c 692 to 53, I5 929 to 276 (the rest are the delegate's
+rows and acknowledgements: C2/C3/C5's, pinned as controls). `SWEEP-C14-TOTALS`: committed rolled
+back 0, gated rows queued 0, nodes with member rows at convergence 0 everywhere; `backup-crash`
+(500): 3573 rows kept as member copies, 3486 retired by identity, 97 dropped, 2526 committed
+entries superseded by a tail. The C1-3 witnesses pass strict (`backup_strict_1389_waits_for_the_group`,
+`a_backup_paused_while_its_holder_is_cut_from_s3_waits_for_the_group`, the group-cut and chain
+configurations 0 failing at 500). The oracle's I2 (c) stop condition (a records difference of a
+re-applied tail) did not trigger: the two seeds that failed it (backup-strict 29, 82) were the oracle
+requiring the completion to be the transaction's last record.
+
+**Fail-before.** The meta tests (`strand_below_epoch_moves_gated_rows_to_the_member_copy`, the committed
+shadow/streamed/abandon/rebuild cases, the five drop-rule tests), the core tests
+(`a_deposed_backed_holder_queues_no_replay_for_gated_rows`, `a_tail_is_re_shipped_with_identity…`,
+`tail_of_identity_is_transitive`, `a_sealed_backup_keeps_its_tail_as_a_member_copy_at_the_next_epoch`)
+and the model tests need the new API and do not compile on the parent; the sim shows it: the
+pinned seeds C0 found (`backup-crash` 858/889/927/1044 for I2, 800/802/803 for I2c, `backup` 746/819/931/935
+for I5) count copies, non-verbatim transactions and rolled-back acknowledgements on the parent and
+0 here (`c1_a_committed_rid_is_queued_on_one_node_only`, `c1_a_re_shipped_tail_is_the_transaction_the_client_was_told`,
+`c1_a_committed_entry_is_never_rolled_back`).
+
+**Authorized rewrites (old to new assertion).** `c0_i2_finds_a_rid_queued_twice`, `c0_i2c_finds_a_re_shipped_tail`,
+`c0_i5_finds_a_non_lone_rollback` (counts > 0 on `backup-crash`/`backup`) became the `c1_…` tests above (counts
+= 0, strict holds); `c0_i2c_finds_a_delegate_row_not_verbatim` and `c0_i5_finds_a_delegates_rolled_back_acknowledgement`
+keep a fail-before for the oracles on `delegated-holder-cut`, which C1 does not change (first seed of 0..60).
+Core tests about a deposed node's replay (20) set the lone class around their ops (they are about the lone
+branch). `a_stranded_adopted_manifest_replayed_elsewhere_is_still_held` (engine) journals its adopted row as a
+lone one's. `c0_the_real_rebuild_recovers_a_deposed_root`: the rebuild-stub negative control (a deposed root that
+never recovers) no longer runs the program-order check: the replays of its gated rows no longer queue up behind
+its clients' later ops and hold them back, which hid an ordering the delegation's acknowledgement does not
+guarantee (a lone-branch semantics, C2). Markers of takeovers without a tail carry a `TailFollowsThrough { through: 0 }`.
+
+### Gates
+
+`cargo fmt --check`, `clippy --workspace --all-targets -D warnings`; meta lib 362 and integration, authority lib 691,
+sim suite 265 passed / 11 ignored (debug; release run below), `meta_repro` 4, engine lib 926, net lib 125,
+control and cli, the model crate (`--release`, `--test-threads=2`, all green).
+
+### Not done here
+
+- Performance (`ack-latency`, `meta-bench`, the four file systems): the shared box's spread exceeded the gates
+  (as for C1-3) and box 1 was reserved; the hot-path changes are a class compare in the strand, an atomic read per
+  tailed segment (`any_member_copy`) and one point read of the applied position per segment.
+- The harness (`backup-group-isolated` and the list of the spec's §10) and the load campaign: no box with the
+  harness's toxiproxy. The harness scenarios that assert `stranded_replayed >= 1` for a deposed holder's rows
+  (`holder-crash-phantom-shadow`, `takeover-marker-strands-promptly`) were not run: an Archive- or group-class
+  row of a deposed holder is a member copy now, not a replay, so they may need the lone class or a changed
+  assertion.
+- The model does not express an abandon, and the contiguity of `through`.
+
 ## Plan 45 — Hard links: dentry attribute copies only for single-name inodes
 
 Plan 45 (`docs/plans/v1/wip/45-hard-links.md`) removes the O(n) cost of an

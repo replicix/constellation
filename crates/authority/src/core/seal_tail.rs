@@ -152,10 +152,9 @@ impl Core {
             }
             self.bk.sealed = self.bk.sealed.max(epoch);
             let first = replica.journal_acked_seq().unwrap_or(0) + 1;
-            let txs = replica.journal_txs_from(first, usize::MAX);
-            if !replica.member_copy_put(epoch, config_version, &txs) {
-                return None;
-            }
+            // (With the class each row was journaled under: an abandon queues
+            // only what a lone node's replay would not.)
+            let txs = replica.member_copy_put_journal(epoch, config_version, first)?;
             if !self.bk.member_epochs.contains(&epoch) {
                 self.bk.member_epochs.push(epoch);
             }
@@ -854,28 +853,12 @@ impl Core {
         }
     }
 
-    /// Drop the member copies a newer tenure made redundant: a copy of epoch
-    /// `e` goes once a lease of a later epoch is read that does not name `e`
-    /// as its inherited tail (the re-shipped rows are in the log, or the
-    /// claim carried none). C1-4 replaces this with the log's own coverage.
-    pub(crate) fn retire_member_copies(&mut self, lease: &Lease, replica: &dyn Replica) {
-        if self.bk.member_epochs.is_empty() {
-            return;
-        }
-        let gone: Vec<Epoch> = self
-            .bk
-            .member_epochs
-            .iter()
-            .copied()
-            .filter(|e| {
-                lease.epoch > *e && lease.inherited_tail.as_ref().is_none_or(|t| t.epoch != *e)
-            })
-            .collect();
-        for e in gone {
-            replica.member_copy_drop(e);
-            self.bk.member_epochs.retain(|x| *x != e);
-            self.stats.member_copies_retired += 1;
-        }
+    /// Count what a stranding pass did to committed work (plan 43 C1-4).
+    pub(crate) fn note_committed_stranded(&mut self, s: &constellation_meta::Stranded) {
+        self.stats.rows_member_copied += s.member_copied as u64;
+        self.stats.committed_superseded += s.superseded as u64;
+        self.stats.committed_rolled_back += s.committed_rolled_back as u64;
+        self.stats.replay_gated_enqueued += s.gated_queued as u64;
     }
 }
 

@@ -117,7 +117,7 @@ use crate::record::LogRecord;
 use crate::replay::{apply_batch_tx, apply_record, ApplyCx, TouchSet};
 use crate::rid::Rid;
 use crate::session::{JournalPos, Position, Streams};
-use crate::store::local::{self, LogPrefixView};
+use crate::store::local::{self, LogPrefixView, RowClass};
 use crate::store::{
     adjust_usage_tx, counter_add_tx, counter_get, counter_set_tx, kv_get_tx, kv_set_tx, misc, ns,
     Meta, UsageTracker, KV_APPLIED_SEQ, KV_LOCAL_SPEC_COUNT, KV_NEXT_SPEC_SEQ, KV_NODE_PREFIX,
@@ -155,13 +155,26 @@ pub enum SpecKind {
         /// Plan 30 §M14 phase 2: the op's fencing token, which a replay
         /// carries.
         lock_tag: LockTag,
+        /// Plan 43 C1-4: the accepting holder answered it as committed
+        /// (`MutateReply.committed`: its group or the archive held the row
+        /// when it answered). A committed shadow is not stranded by a
+        /// takeover of its epoch: the successor re-ships the row, and the
+        /// shadow retires by the segment that completes its rid; only an
+        /// operator's abandon of the group strands it.
+        gated: bool,
     },
     /// The `Exists` early install: retires once the applied state
     /// reaches `at`, the position the refusal was evaluated at
     /// ([`hint_reached`]); strands if a segment above `epoch` arrives
     /// first (or, plan 30 §M11, the log recalls the answering delegate's
     /// generation `gen`).
-    Hint { at: Position, epoch: u64, gen: u64 },
+    Hint {
+        at: Position,
+        epoch: u64,
+        gen: u64,
+        /// Plan 43 C1-4: see [`SpecKind::Shadow::gated`].
+        gated: bool,
+    },
     /// Plan 30 §M9: one of the holder's journal transactions (rows
     /// `first..=last` of its tenure at `epoch`), streamed to this
     /// subscriber once its backups held it, ahead of the log. Retires
@@ -178,6 +191,11 @@ pub enum SpecKind {
         /// stranded foreign row queues its replay under it
         /// ([`StrandedOp::source`]).
         source: u64,
+        /// Plan 43 C1-4: the holder streamed it as committed
+        /// (`StreamAhead.committed`: a backup-held row, not an epoch hold's
+        /// tip). Not stranded by a takeover of its epoch; retires when a
+        /// segment carries the row (or, re-shipped, its `TailOf`).
+        gated: bool,
         /// Plan 30 §M9: this node's own op. A requester subscribed to the
         /// holder's stream sees its op twice — on the stream and in its
         /// reply — and keeps *one* entry, this kind, whichever arrived
@@ -225,23 +243,25 @@ enum LiveEntry {
         rid: Rid,
         epoch: u64,
         gen: u64,
+        gated: bool,
     },
     Hint {
         at: Position,
         epoch: u64,
         gen: u64,
+        gated: bool,
     },
     Streamed {
         epoch: u64,
+        /// The transaction's identity: its `TailOf` if it is a re-shipped
+        /// one, else `(epoch, first)`.
+        ident: (u64, u64),
         last: u64,
+        gated: bool,
     },
     /// Plan 30 §M11: `gen` is the delegation stream the transaction
     /// belongs to (0: this node's own row as a holder).
-    Local {
-        first: u64,
-        epoch: u64,
-        gen: u64,
-    },
+    Local { first: u64, epoch: u64, gen: u64 },
 }
 
 impl LiveEntry {
@@ -261,11 +281,52 @@ impl LiveEntry {
     /// stream's row is tied to its generation, not to any epoch — a root
     /// takeover strands nothing of it (the delegate re-streams to the
     /// successor); only the log's `Recall` of the generation does.
+    ///
+    /// Plan 43 C1-4: not a committed entry (`gated`): a shadow, hint or
+    /// streamed transaction the holder answered or streamed as held by its
+    /// group or the archive is re-shipped by the successor, so the segment
+    /// of a later epoch does not roll it back; it retires by the rows that
+    /// carry it ([`LiveEntry::superseded_by_takeover`] is the takeover
+    /// gate's own rule, [`LiveEntry::stranded_by_abandon`] the operator's).
     fn stranded_by(&self, epoch: u64) -> bool {
         match self {
             LiveEntry::Local { epoch: 0, .. } => false,
             LiveEntry::Local { gen, .. } if *gen != 0 => false,
+            entry if entry.gated() => false,
             entry => entry.epoch() < epoch,
+        }
+    }
+
+    /// Plan 43 C1-4: a committed (answered or streamed as held by the
+    /// group or the archive) requester or subscriber entry.
+    fn gated(&self) -> bool {
+        match self {
+            LiveEntry::Shadow { gated, .. }
+            | LiveEntry::Hint { gated, .. }
+            | LiveEntry::Streamed { gated, .. } => *gated,
+            LiveEntry::Local { .. } => false,
+        }
+    }
+
+    /// Plan 43 C1-4: whether the takeover gate of a node taking the lease
+    /// at `epoch` takes this committed entry out: the gate re-applies the
+    /// predecessor's tail (which carries the row, write-all), so an entry of
+    /// this node's own that applied it already would apply it twice. Rolled
+    /// back and not queued ([`Self::stranded_by`] is false for it).
+    fn superseded_by_takeover(&self, epoch: u64) -> bool {
+        self.gated() && self.epoch() < epoch
+    }
+
+    /// Plan 43 C1-4: the operator abandoned the group of root epoch `e`
+    /// (`LogRecord::GroupAbandoned`): no successor re-ships its rows, so
+    /// even a committed entry of epoch `e` or older strands, and its rid
+    /// replays (the only way a committed entry is rolled back).
+    fn stranded_by_abandon(&self, e: u64) -> bool {
+        match self {
+            LiveEntry::Shadow { gen: 0, epoch, .. }
+            | LiveEntry::Hint { gen: 0, epoch, .. }
+            | LiveEntry::Streamed { epoch, .. } => *epoch <= e,
+            _ => false,
         }
     }
 
@@ -325,6 +386,65 @@ struct QueuedReplay {
     /// the delegate's re-stream, not from this replay
     /// ([`stranded_local_deps`]). The replay carries them as `deps`.
     deps: Streams,
+    /// Plan 43 C1-4: the class of the answer the entry stands for: a row
+    /// the client was told is committed (`gated`) is queued only by an
+    /// operator's abandon of its group; every other entry is the lone
+    /// branch's. The simulation's oracle (I2 (b)) judges the former.
+    class: RowClass,
+}
+
+/// Plan 43 C1-4: the operator abandoned the group of this member copy's
+/// epoch (`LogRecord::GroupAbandoned`): no successor re-ships the row, so it
+/// is queued for replay by its rid, as the lone branch would (the only way a
+/// committed row is re-executed). `false`: nothing queued — the log carries
+/// the rid already, or the row has no op to run.
+pub(crate) fn queue_abandoned_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    row: &super::member::MemberTx,
+) -> Result<bool, MetaError> {
+    let rid = match row.rid {
+        Some(rid) => rid,
+        None => match row.tx.records.iter().find_map(|r| match r {
+            LogRecord::Completed { rid } => Some(*rid),
+            _ => None,
+        }) {
+            Some(rid) => rid,
+            None => replay_rid_for(&*tx, meta, row.tx.first)?,
+        },
+    };
+    let in_log = tx
+        .get(&meta.completed, rid.to_key())?
+        .and_then(|v| {
+            v.get(0..8)
+                .map(|p| u64::from_be_bytes(p.try_into().expect("8 bytes")))
+        })
+        .is_some_and(|position| position == 0);
+    if in_log {
+        return Ok(false);
+    }
+    let op = match &row.op {
+        Some(op) => Some(op.clone()),
+        None => derive_replay_op(&row.tx.records),
+    };
+    let Some(op) = op else {
+        return Ok(false);
+    };
+    let key = next_spec_seq_tx(tx, &meta.local)?;
+    enqueue_replay_as_tx(
+        tx,
+        meta,
+        key,
+        rid,
+        op,
+        row.lock_tag.clone(),
+        None,
+        0,
+        Streams::NONE,
+        &[],
+    )?;
+    mark_queued_class_tx(tx, meta, key, row.class)?;
+    Ok(true)
 }
 
 /// A stranded op waiting to be replayed by rid (plan 30 §M3a recovery
@@ -348,6 +468,8 @@ pub struct StrandedOp {
     pub deps: Streams,
     /// See `QueuedReplay::truncate_base`.
     pub truncate_base: Option<Vec<u8>>,
+    /// See `QueuedReplay::class`.
+    pub class: RowClass,
 }
 
 impl StrandedOp {
@@ -396,17 +518,66 @@ pub struct Stranded {
     /// (their journal rows deleted) and queued for replay by rid — a
     /// deposed holder's journal.
     pub locals: usize,
+    /// Plan 43 C1-4: this node's own committed (gated) unshipped
+    /// transactions, rolled back and moved to the member copy of their
+    /// epoch instead of queued for replay (a deposed group tenure replays
+    /// nothing it was told is committed). Not in `locals`.
+    pub member_copied: usize,
+    /// Plan 43 C1-4: committed requester and subscriber entries a
+    /// takeover gate took out because the tail it re-applies carries their
+    /// rows; rolled back, not queued. Not in `shadows`/`hints`.
+    pub superseded: usize,
+    /// Plan 43 C1-4: of `shadows`/`hints`, the entries the holder had
+    /// answered or streamed as committed — rolled back only by an operator's
+    /// abandon of the group (`speculation.committed_rolled_back`).
+    pub committed_rolled_back: usize,
+    /// Plan 43 C1-4: gated rows of the root's own journal a deposition
+    /// queued for replay (must stay 0; also in `locals`).
+    pub gated_queued: usize,
 }
 
 impl Stranded {
     pub fn any(&self) -> bool {
-        self.shadows + self.hints + self.locals > 0
+        self.shadows + self.hints + self.locals + self.member_copied + self.superseded > 0
     }
 
     /// Entries rolled back, of any kind.
     pub fn total(&self) -> usize {
-        self.shadows + self.hints + self.locals
+        self.shadows + self.hints + self.locals + self.member_copied + self.superseded
     }
+}
+
+/// What [`strand_local_tx`] did with a transaction.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stranding {
+    /// Its op (if any) was queued for replay.
+    Queued,
+    /// A gated row, moved to the member copy of its epoch.
+    Member,
+    /// A gated row queued for replay in a pass that must not (counted,
+    /// `Stranded::gated_queued`; a debug build asserts).
+    GatedQueued,
+}
+
+/// Plan 43 C1-4: how a stranding pass treats the committed work it meets.
+#[derive(Clone, Copy)]
+struct Strand<'a> {
+    /// A gated (committed) unshipped `Local` row of the root's own
+    /// journal (`gen` 0) goes to the member copy of its epoch, never to the
+    /// replay queue: its client was told it is committed, and the successor
+    /// re-ships it from the group.
+    member: bool,
+    /// Entries (by `spec_seq`) rolled back and not queued: committed
+    /// entries a takeover gate's tail re-applies.
+    quiet: Option<&'a HashSet<u64>>,
+}
+
+impl Strand<'static> {
+    /// Today's stranding: everything stranded is queued for replay.
+    const PLAIN: Strand<'static> = Strand {
+        member: false,
+        quiet: None,
+    };
 }
 
 /// What [`Meta::apply_segment`] did besides applying the records.
@@ -418,6 +589,8 @@ pub struct SegmentApplied {
     pub stranded: Stranded,
     /// Outstanding entries this segment retired.
     pub retired: usize,
+    /// Plan 43 C1-4: what the segment did to this node's member copies.
+    pub member: super::member::MemberOutcome,
     /// Plan 30 §M3b: the segment was inserted before this node's own
     /// outstanding `Local` transactions (rolled back, applied, redone).
     pub inserted_before_local: bool,
@@ -747,20 +920,39 @@ fn record_tx(
     let seq = next_spec_seq_tx(tx, &meta.local)?;
     let live = match &kind {
         SpecKind::Shadow {
-            rid, epoch, gen, ..
+            rid,
+            epoch,
+            gen,
+            gated,
+            ..
         } => Some(LiveEntry::Shadow {
             rid: *rid,
             epoch: *epoch,
             gen: *gen,
+            gated: *gated,
         }),
-        SpecKind::Hint { at, epoch, gen } => Some(LiveEntry::Hint {
+        SpecKind::Hint {
+            at,
+            epoch,
+            gen,
+            gated,
+        } => Some(LiveEntry::Hint {
             at: *at,
             epoch: *epoch,
             gen: *gen,
+            gated: *gated,
         }),
-        SpecKind::Streamed { epoch, last, .. } => Some(LiveEntry::Streamed {
+        SpecKind::Streamed {
+            epoch,
+            first,
+            last,
+            gated,
+            ..
+        } => Some(LiveEntry::Streamed {
             epoch: *epoch,
+            ident: super::member::tail_identity(&records).unwrap_or((*epoch, *first)),
             last: *last,
+            gated: *gated,
         }),
         SpecKind::Foreign { .. } | SpecKind::Local { .. } => None,
     };
@@ -845,6 +1037,29 @@ fn enqueue_replay_gen_tx(
     )
 }
 
+/// Plan 43 C1-4: say what the queued entry at `key` stands for (see
+/// `QueuedReplay::class`).
+fn mark_queued_class_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    key: u64,
+    class: RowClass,
+) -> Result<(), MetaError> {
+    if class == RowClass::Lone {
+        return Ok(());
+    }
+    if let Some(v) = tx.get(&meta.pending_replay, seq_key(key))? {
+        let mut row: QueuedReplay = postcard::from_bytes(&v)?;
+        row.class = class;
+        tx.insert(
+            &meta.pending_replay,
+            seq_key(key),
+            postcard::to_allocvec(&row)?,
+        );
+    }
+    Ok(())
+}
+
 /// Queue `op` for replay by `rid` under `key`. `before` is the stranded
 /// row's before-images (empty when there are none): a truncate keeps the
 /// manifest it cut from them ([`StrandedOp::conditional_truncate`]).
@@ -874,6 +1089,7 @@ fn enqueue_replay_as_tx(
         truncate_base,
         lock_tag,
         deps,
+        class: RowClass::Lone,
     };
     if tx.get(&meta.pending_replay, seq_key(key))?.is_none() {
         counter_add_tx(tx, &meta.local, KV_PENDING_REPLAY_COUNT, 1)?;
@@ -955,6 +1171,9 @@ fn derive_replay_op(records: &[LogRecord]) -> Option<MutateOp> {
                     | LogRecord::Delegate { .. }
                     | LogRecord::Recall { .. }
                     | LogRecord::RecallCut { .. }
+                    // Plan 43 C1-4: bookkeeping of a re-shipped tail, no
+                    // effect to redo.
+                    | LogRecord::TailOf { .. }
             )
         })
         .collect();
@@ -1009,9 +1228,10 @@ fn strand_local_tx(
     key: u64,
     before: &Before,
     undone: &HashSet<u64>,
-) -> Result<(), MetaError> {
+    member: bool,
+) -> Result<Stranding, MetaError> {
     let Some(row) = local::get_journal_tx(&*tx, meta, first)? else {
-        return Ok(());
+        return Ok(Stranding::Queued);
     };
     let deps = stranded_local_deps(&*tx, meta, first, undone)?;
     let rows = local::journal_records(&*tx, meta, first, row.last)?;
@@ -1086,14 +1306,51 @@ fn strand_local_tx(
             local::retract_void_cut_tx(tx, &meta.local, *gen, *through)?;
         }
     }
+    // Plan 43 C1-4 (§5.2 item 2, §5.6): a row this node's client was told
+    // is committed (its group or the archive held it) is not this node's to
+    // re-execute: it was rolled back above and goes to the member copy of
+    // its epoch, to be served to the successor that seals or fetches the
+    // group (which re-ships it) and dropped once the log carries it. Its
+    // client's retry by rid dedups against the re-ship, or executes once
+    // if the row turns out not to have been held (an unanswered row).
+    if member && row.class.gated() && row.gen == 0 && row.epoch > 0 {
+        super::member::put_row_tx(
+            tx,
+            meta,
+            row.epoch,
+            &super::member::MemberTx {
+                tx: crate::BackupTx {
+                    first,
+                    last: row.last,
+                    records,
+                    origin: (row.gen, row.idx),
+                },
+                class: row.class,
+                rid: row.rid,
+                op: row.op,
+                lock_tag: row.lock_tag.clone(),
+            },
+        )?;
+        return Ok(Stranding::Member);
+    }
+    // (A gated row of this node's own tenure that a deposition queues for
+    // replay is a bug: it would be re-executed by a node whose client was
+    // told it is committed. Only an operator's drop of a held transaction
+    // (`member` false) queues one, on purpose.)
+    let gated_queue = member && row.class.gated() && row.gen == 0;
     let op = match row.op {
         Some(op) => Some(op),
         None => derive_replay_op(&records),
     };
     if let Some(op) = op {
         enqueue_replay_as_tx(tx, meta, key, rid, op, row.lock_tag, None, 0, deps, before)?;
+        mark_queued_class_tx(tx, meta, key, row.class)?;
     }
-    Ok(())
+    Ok(if gated_queue {
+        Stranding::GatedQueued
+    } else {
+        Stranding::Queued
+    })
 }
 
 /// Plan 30 §M11: what a stranded transaction of this node, starting at
@@ -1279,6 +1536,7 @@ struct Inserted<'a> {
 /// (`store::held`), so it precedes the inserted segment in the log; it
 /// touches none of the held rows' keys, so redoing it ahead of them is
 /// the same state.
+#[allow(clippy::too_many_arguments)]
 fn rewind_tx(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
@@ -1286,6 +1544,7 @@ fn rewind_tx(
     live: &HashMap<u64, LiveEntry>,
     stranded: &HashSet<u64>,
     cutoff: u64,
+    strand: Strand<'_>,
     insert: Option<Inserted<'_>>,
 ) -> Result<(Stranded, usize), MetaError> {
     let rows = read_rows_from(tx, &meta.spec, cutoff)?;
@@ -1315,7 +1574,7 @@ fn rewind_tx(
         // 3. Redo, oldest first, what still stands.
         for (seq, row) in rows {
             redo_row_tx(
-                tx, meta, staged, live, stranded, &mut out, false, seq, row, &undone,
+                tx, meta, staged, live, stranded, &mut out, false, seq, row, &undone, strand,
             )?;
         }
         return Ok((out, skipped));
@@ -1327,7 +1586,7 @@ fn rewind_tx(
         .partition(|(_, row)| matches!(row.kind, SpecKind::Foreign { .. }));
     for (seq, row) in durable {
         redo_row_tx(
-            tx, meta, staged, live, stranded, &mut out, true, seq, row, &undone,
+            tx, meta, staged, live, stranded, &mut out, true, seq, row, &undone, strand,
         )?;
     }
 
@@ -1360,7 +1619,7 @@ fn rewind_tx(
     // 3. Redo, oldest first, what still stands.
     for (seq, row) in rest {
         redo_row_tx(
-            tx, meta, staged, live, stranded, &mut out, renumber, seq, row, &undone,
+            tx, meta, staged, live, stranded, &mut out, renumber, seq, row, &undone, strand,
         )?;
     }
     Ok((out, skipped))
@@ -1381,6 +1640,7 @@ fn redo_row_tx(
     seq: u64,
     mut row: SpecRow,
     undone: &HashSet<u64>,
+    strand: Strand<'_>,
 ) -> Result<(), MetaError> {
     if stranded.contains(&seq) {
         // Plan 42 §5.1.5: the rows this entry wrote stay at their
@@ -1394,22 +1654,64 @@ fn redo_row_tx(
             tx.remove(&meta.spec_live, seq_key(seq));
             counter_add_tx(tx, &meta.local, KV_SPEC_LIVE_COUNT, -1)?;
         }
+        // Plan 43 C1-4: a committed entry the takeover gate's tail carries
+        // is taken out and not queued.
+        let quiet = strand.quiet.is_some_and(|q| q.contains(&seq));
         match row.kind {
             SpecKind::Shadow {
                 rid,
                 op,
                 gen,
                 lock_tag,
+                gated,
                 ..
             } => {
-                enqueue_replay_gen_tx(tx, meta, row.origin, rid, op, lock_tag, gen, &row.before)?;
-                out.shadows += 1;
+                if quiet {
+                    out.superseded += 1;
+                } else {
+                    enqueue_replay_gen_tx(
+                        tx,
+                        meta,
+                        row.origin,
+                        rid,
+                        op,
+                        lock_tag,
+                        gen,
+                        &row.before,
+                    )?;
+                    if gated {
+                        mark_queued_class_tx(tx, meta, row.origin, RowClass::RootGroup)?;
+                    }
+                    out.shadows += 1;
+                    out.committed_rolled_back += usize::from(gated);
+                }
             }
             SpecKind::Local { first, .. } => {
-                strand_local_tx(tx, meta, first, row.origin, &row.before, undone)?;
-                out.locals += 1;
+                match strand_local_tx(
+                    tx,
+                    meta,
+                    first,
+                    row.origin,
+                    &row.before,
+                    undone,
+                    strand.member,
+                )? {
+                    Stranding::Member => out.member_copied += 1,
+                    Stranding::Queued => out.locals += 1,
+                    Stranding::GatedQueued => {
+                        out.locals += 1;
+                        out.gated_queued += 1;
+                    }
+                }
             }
-            SpecKind::Streamed { own, source, .. } => {
+            SpecKind::Streamed { gated, .. } if quiet => {
+                let _ = gated;
+                out.superseded += 1;
+            }
+            SpecKind::Streamed {
+                own, source, gated, ..
+            } => {
+                out.committed_rolled_back += usize::from(gated);
                 // Plan 30 §M9: the tenure ended without shipping it; its
                 // successor re-ships what its backup held (or the op's
                 // requester replays it). Until then reads of its keys
@@ -1418,6 +1720,9 @@ fn redo_row_tx(
                 // a shadow's would.
                 if let Some((rid, op, tag)) = own {
                     enqueue_replay_tx(tx, meta, row.origin, rid, op, tag, &row.before)?;
+                    if gated {
+                        mark_queued_class_tx(tx, meta, row.origin, RowClass::RootGroup)?;
+                    }
                     out.shadows += 1;
                 } else {
                     let rid = row.records.iter().find_map(|r| match r {
@@ -1440,11 +1745,22 @@ fn redo_row_tx(
                             Streams::NONE,
                             &[],
                         )?;
+                        if gated {
+                            mark_queued_class_tx(tx, meta, row.origin, RowClass::RootGroup)?;
+                        }
                     }
                     out.hints += 1;
                 }
             }
-            SpecKind::Hint { .. } | SpecKind::Foreign { .. } => out.hints += 1,
+            SpecKind::Hint { gated, .. } => {
+                if quiet {
+                    out.superseded += 1;
+                } else {
+                    out.hints += 1;
+                    out.committed_rolled_back += usize::from(gated);
+                }
+            }
+            SpecKind::Foreign { .. } => out.hints += 1,
         }
         return Ok(());
     }
@@ -1527,6 +1843,8 @@ struct StreamedTx<'a> {
     last: u64,
     records: &'a [LogRecord],
     adopt: Option<(u64, Rid, MutateOp, LockTag)>,
+    /// Plan 43 C1-4: see [`SpecKind::Streamed::gated`].
+    gated: bool,
 }
 
 /// Whether a row stays ahead of a transaction the stream delivers now: a
@@ -1743,7 +2061,17 @@ fn insert_streamed_tx(
     let mut out = Stranded::default();
     for (seq, row) in ahead {
         redo_row_tx(
-            tx, meta, staged, &live, &none, &mut out, true, seq, row, &no_grants,
+            tx,
+            meta,
+            staged,
+            &live,
+            &none,
+            &mut out,
+            true,
+            seq,
+            row,
+            &no_grants,
+            Strand::PLAIN,
         )?;
     }
     match (adopted, t.adopt) {
@@ -1753,6 +2081,7 @@ fn insert_streamed_tx(
                 first: t.first,
                 last: t.last,
                 source: t.source,
+                gated: t.gated || matches!(row.kind, SpecKind::Shadow { gated: true, .. }),
                 own: Some((rid, op, tag)),
             };
             // The transaction's records are what the redo applies: the
@@ -1763,11 +2092,23 @@ fn insert_streamed_tx(
                 seq,
                 LiveEntry::Streamed {
                     epoch: t.epoch,
+                    ident: super::member::tail_identity(t.records).unwrap_or((t.epoch, t.first)),
                     last: t.last,
+                    gated: t.gated,
                 },
             );
             redo_row_tx(
-                tx, meta, staged, &live, &none, &mut out, true, seq, row, &no_grants,
+                tx,
+                meta,
+                staged,
+                &live,
+                &none,
+                &mut out,
+                true,
+                seq,
+                row,
+                &no_grants,
+                Strand::PLAIN,
             )?;
         }
         (None, None) => {
@@ -1798,6 +2139,7 @@ fn insert_streamed_tx(
                     first: t.first,
                     last: t.last,
                     source: t.source,
+                    gated: t.gated,
                     own: None,
                 },
                 applied,
@@ -1814,7 +2156,17 @@ fn insert_streamed_tx(
     }
     for (seq, row) in behind {
         redo_row_tx(
-            tx, meta, staged, &live, &none, &mut out, true, seq, row, &no_grants,
+            tx,
+            meta,
+            staged,
+            &live,
+            &none,
+            &mut out,
+            true,
+            seq,
+            row,
+            &no_grants,
+            Strand::PLAIN,
         )?;
     }
     Ok(())
@@ -1939,7 +2291,17 @@ pub(crate) fn unwind_shadow_for_append_tx(
     let mut out = Stranded::default();
     for (seq, row) in ahead {
         redo_row_tx(
-            tx, meta, staged, &live, &none, &mut out, true, seq, row, &none,
+            tx,
+            meta,
+            staged,
+            &live,
+            &none,
+            &mut out,
+            true,
+            seq,
+            row,
+            &none,
+            Strand::PLAIN,
         )?;
     }
     tracing::debug!(
@@ -1974,6 +2336,7 @@ pub(crate) fn redo_after_append_tx(
             seq,
             row,
             &none,
+            Strand::PLAIN,
         )?;
     }
     Ok(())
@@ -1987,7 +2350,7 @@ fn streamed_tip_tx(r: &impl Readable, meta: &Meta, epoch: u64) -> Result<Option<
     Ok(read_live(r, meta)?
         .into_iter()
         .filter_map(|(_, entry)| match entry {
-            LiveEntry::Streamed { epoch: e, last } if e == epoch => Some(last),
+            LiveEntry::Streamed { epoch: e, last, .. } if e == epoch => Some(last),
             _ => None,
         })
         .max())
@@ -2000,6 +2363,8 @@ fn strand_tx(
     meta: &Meta,
     staged: &UsageTracker,
     strands: impl Fn(&LiveEntry) -> bool,
+    member: bool,
+    quiet: impl Fn(&LiveEntry) -> bool,
 ) -> Result<Stranded, MetaError> {
     let live: HashMap<u64, LiveEntry> = read_live(tx, meta)?.into_iter().collect();
     let stranded: HashSet<u64> = live
@@ -2010,7 +2375,16 @@ fn strand_tx(
     let Some(&cutoff) = stranded.iter().min() else {
         return Ok(Stranded::default());
     };
-    Ok(rewind_tx(tx, meta, staged, &live, &stranded, cutoff, None)?.0)
+    let quiet: HashSet<u64> = stranded
+        .iter()
+        .copied()
+        .filter(|seq| live.get(seq).is_some_and(&quiet))
+        .collect();
+    let strand = Strand {
+        member,
+        quiet: Some(&quiet),
+    };
+    Ok(rewind_tx(tx, meta, staged, &live, &stranded, cutoff, strand, None)?.0)
 }
 
 /// Whether a replica that has applied the log through `applied_seq` —
@@ -2416,7 +2790,18 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
     meta: &Meta,
 ) -> Result<(), MetaError> {
     let live = read_live(tx, meta)?;
+    // Plan 43 C1-4: a committed shadow or streamed transaction is not this
+    // node's to re-execute and not to drop: dropping it would show a
+    // committed effect disappearing to this node's clients, and queueing it
+    // would execute a row its group holds a second time. It is re-installed
+    // on the rebuilt namespace below, unless the log the rebuild carries
+    // completes it.
+    let mut kept: Vec<(u64, LiveEntry)> = Vec::new();
     for (seq, entry) in &live {
+        if entry.gated() && matches!(entry, LiveEntry::Shadow { .. } | LiveEntry::Streamed { .. }) {
+            kept.push((*seq, *entry));
+            continue;
+        }
         if let LiveEntry::Shadow { .. } = entry {
             if let Some(v) = tx.get(&meta.spec, seq_key(*seq))? {
                 let row: SpecRow = postcard::from_bytes(&v)?;
@@ -2446,7 +2831,7 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
             tx.remove(&meta.spec_live, seq_key(*seq));
         }
     }
-    counter_set_tx(tx, &meta.local, KV_SPEC_LIVE_COUNT, 0);
+    counter_set_tx(tx, &meta.local, KV_SPEC_LIVE_COUNT, kept.len() as u64);
     let journal = local::read_journal_txs(&*tx, meta)?;
     let undone = undone_grants(&*tx, meta, journal.iter().map(|(first, _)| *first))?;
     for (first, row) in journal {
@@ -2460,7 +2845,57 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
             },
             None => (next_spec_seq_tx(tx, &meta.local)?, Vec::new()),
         };
-        strand_local_tx(tx, meta, first, key, &before, &undone)?;
+        strand_local_tx(tx, meta, first, key, &before, &undone, true)?;
+    }
+    // The committed entries, in their spec order, on the rebuilt namespace.
+    kept.sort_by_key(|(seq, _)| *seq);
+    let kept_live: HashMap<u64, LiveEntry> = kept.iter().copied().collect();
+    let mut out = Stranded::default();
+    for (seq, entry) in kept {
+        let Some(v) = tx.get(&meta.spec, seq_key(seq))? else {
+            tx.remove(&meta.spec_live, seq_key(seq));
+            counter_add_tx(tx, &meta.local, KV_SPEC_LIVE_COUNT, -1)?;
+            continue;
+        };
+        let row: SpecRow = postcard::from_bytes(&v)?;
+        let completing: Option<Rid> = match &row.kind {
+            SpecKind::Shadow { rid, .. } => Some(*rid),
+            _ => row.records.iter().find_map(|r| match r {
+                LogRecord::Completed { rid } => Some(*rid),
+                _ => None,
+            }),
+        };
+        let in_log = match completing {
+            Some(rid) => tx
+                .get(&meta.completed, rid.to_key())?
+                .and_then(|v| {
+                    v.get(0..8)
+                        .map(|p| u64::from_be_bytes(p.try_into().expect("8 bytes")))
+                })
+                .is_some_and(|position| position == 0),
+            None => false,
+        };
+        if in_log {
+            // The rebuilt log carries it: retired.
+            tx.remove(&meta.spec, seq_key(seq));
+            tx.remove(&meta.spec_live, seq_key(seq));
+            counter_add_tx(tx, &meta.local, KV_SPEC_LIVE_COUNT, -1)?;
+            let _ = entry;
+            continue;
+        }
+        redo_row_tx(
+            tx,
+            meta,
+            &UsageTracker::staging(),
+            &kept_live,
+            &HashSet::new(),
+            &mut out,
+            false,
+            seq,
+            row,
+            &HashSet::new(),
+            Strand::PLAIN,
+        )?;
     }
     // Every journaled transaction is gone now: drop every row.
     let from = journal_from(tx, meta)?;
@@ -2514,7 +2949,17 @@ pub(crate) fn strand_seqs_tx(
     let Some(&cutoff) = stranded.iter().min() else {
         return Ok(Stranded::default());
     };
-    let out = rewind_tx(tx, meta, staged, &live, &stranded, cutoff, None)?.0;
+    let out = rewind_tx(
+        tx,
+        meta,
+        staged,
+        &live,
+        &stranded,
+        cutoff,
+        Strand::PLAIN,
+        None,
+    )?
+    .0;
     let from = journal_from(tx, meta)?;
     compact_tx(tx, meta, from)?;
     Ok(out)
@@ -2545,6 +2990,7 @@ pub(crate) fn refuse_queued_tx(
         truncate_base: None,
         lock_tag: LockTag::NONE,
         deps: Streams::NONE,
+        class: RowClass::Lone,
     };
     tx.insert(
         &meta.pending_replay,
@@ -2611,6 +3057,7 @@ pub(crate) fn read_pending_replays(
             lock_tag: row.lock_tag,
             deps: row.deps,
             truncate_base: row.truncate_base,
+            class: row.class,
         });
     }
     Ok(out)
@@ -2734,6 +3181,23 @@ impl Meta {
         tag: &LockTag,
         records: &[LogRecord],
     ) -> Result<bool, MetaError> {
+        self.install_shadow_committed(rid, epoch, gen, op, tag, records, false)
+    }
+
+    /// [`Self::install_shadow_from`] for a reply the holder answered as
+    /// committed (`committed`, plan 43 C1-4: its group or the archive held
+    /// the row): the shadow is not stranded by a takeover of its epoch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn install_shadow_committed(
+        &self,
+        rid: Rid,
+        epoch: u64,
+        gen: u64,
+        op: &MutateOp,
+        tag: &LockTag,
+        records: &[LogRecord],
+        committed: bool,
+    ) -> Result<bool, MetaError> {
         let mut tx = self.db.write_tx();
         if tx.get(&self.completed, rid.to_key())?.is_some() {
             return Ok(false);
@@ -2779,6 +3243,7 @@ impl Meta {
             op: op.clone(),
             gen,
             lock_tag: tag.clone(),
+            gated: committed && gen == 0,
         };
         self.install_speculative_tx(tx, kind, records)?;
         Ok(true)
@@ -2840,6 +3305,20 @@ impl Meta {
         epoch: u64,
         gen: u64,
     ) -> Result<bool, MetaError> {
+        self.install_hint_committed(rid, records, at, epoch, gen, false)
+    }
+
+    /// [`Self::install_hint_from`] for a refusal the holder answered as
+    /// committed (plan 43 C1-4): not stranded by a takeover of its epoch.
+    pub fn install_hint_committed(
+        &self,
+        rid: Option<Rid>,
+        records: &[LogRecord],
+        at: Position,
+        epoch: u64,
+        gen: u64,
+        committed: bool,
+    ) -> Result<bool, MetaError> {
         let tx = self.db.write_tx();
         if let Some(rid) = rid {
             if tx.get(&self.completed, rid.to_key())?.is_some()
@@ -2854,7 +3333,16 @@ impl Meta {
         if hint_names_a_held_inode(&tx, self, records)? {
             return Ok(false);
         }
-        self.install_speculative_tx(tx, SpecKind::Hint { at, epoch, gen }, records)?;
+        self.install_speculative_tx(
+            tx,
+            SpecKind::Hint {
+                at,
+                epoch,
+                gen,
+                gated: committed && gen == 0,
+            },
+            records,
+        )?;
         Ok(true)
     }
 
@@ -2879,6 +3367,22 @@ impl Meta {
         first: u64,
         last: u64,
         records: &[LogRecord],
+    ) -> Result<(), MetaError> {
+        self.install_streamed_committed(epoch, source, first, last, records, false)
+    }
+
+    /// [`Self::install_streamed`] for a transaction the holder streamed as
+    /// committed (plan 43 C1-4, `StreamAhead.committed`): the entry is not
+    /// stranded by a takeover of its epoch, and retires when a segment
+    /// carries the row or its re-shipped `TailOf`.
+    pub fn install_streamed_committed(
+        &self,
+        epoch: u64,
+        source: u64,
+        first: u64,
+        last: u64,
+        records: &[LogRecord],
+        committed: bool,
     ) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
         // Fix "capture under an epoch hold": already installed here —
@@ -2981,6 +3485,7 @@ impl Meta {
                     last,
                     records,
                     adopt,
+                    gated: committed,
                 },
             )?;
             let (bytes, files) = staged.raw_delta();
@@ -2992,20 +3497,27 @@ impl Meta {
         if let Some((seq, rid, op, tag)) = adopt {
             if let Some(v) = tx.get(&self.spec, seq_key(seq))? {
                 let mut row: SpecRow = postcard::from_bytes(&v)?;
+                let gated = committed || matches!(row.kind, SpecKind::Shadow { gated: true, .. });
                 row.kind = SpecKind::Streamed {
                     epoch,
                     first,
                     last,
                     source,
+                    gated,
                     own: Some((rid, op, tag)),
                 };
                 put_row(&mut tx, &self.spec, seq, &row)?;
+                tx.insert(
+                    &self.spec_live,
+                    seq_key(seq),
+                    postcard::to_allocvec(&LiveEntry::Streamed {
+                        epoch,
+                        ident: super::member::tail_identity(records).unwrap_or((epoch, first)),
+                        last,
+                        gated,
+                    })?,
+                );
             }
-            tx.insert(
-                &self.spec_live,
-                seq_key(seq),
-                postcard::to_allocvec(&LiveEntry::Streamed { epoch, last })?,
-            );
             tx.commit()?;
             return Ok(());
         }
@@ -3016,6 +3528,7 @@ impl Meta {
                 first,
                 last,
                 source,
+                gated: committed,
                 own: None,
             },
             records,
@@ -3144,11 +3657,35 @@ impl Meta {
             epoch,
             jseq: through,
         };
+        // Plan 43 C1-4: the identities of re-shipped transactions this
+        // segment carries (`TailOf`), and the groups it says the operator
+        // abandoned.
+        let tail_ids: HashSet<(u64, u64)> = records
+            .iter()
+            .filter_map(|rec| match rec {
+                LogRecord::TailOf { epoch, jseq } => Some((*epoch, *jseq)),
+                _ => None,
+            })
+            .collect();
+        let abandoned: Vec<u64> = records
+            .iter()
+            .filter_map(|rec| match rec {
+                LogRecord::GroupAbandoned { epoch, gen: 0, .. } => Some(*epoch),
+                _ => None,
+            })
+            .collect();
+        let prev_applied = crate::store::applied_pos_at(&self.db.read_tx(), &self.local);
+        let first_of_epoch = prev_applied.is_none_or(|pos| pos.epoch < epoch);
         let mut tx = self.db.write_tx();
         let staged = UsageTracker::staging();
-        let stranded = strand_tx(&mut tx, self, &staged, |entry| {
-            (entry.stranded_by(epoch)
+        let stranded = strand_tx(
+            &mut tx,
+            self,
+            &staged,
+            |entry| {
+                (entry.stranded_by(epoch)
                 && !matches!(entry, LiveEntry::Shadow { rid, .. } if completes.contains(rid)))
+                || abandoned.iter().any(|a| entry.stranded_by_abandon(*a))
                 || matches!(entry, LiveEntry::Shadow { rid, .. } if refused.contains(rid))
                 // A streamed transaction of this tenure the segment ships
                 // *past* (`through` at or beyond its last row) without
@@ -3163,9 +3700,18 @@ impl Meta {
                 // comes back through the log). Retiring it as confirmed
                 // (M9's first rule) kept the dropped write in the member's
                 // replica for good.
-                || matches!(entry, LiveEntry::Streamed { epoch: e, last }
+                // (Plan 43 C1-4: not a committed one. A row the holder's group
+                // held and streamed as committed is re-shipped by whoever
+                // continues the tenure — a self-sealed holder re-claiming its
+                // own epoch numbers its journal on from the old one, so a
+                // later segment's `through` passes the committed rows without
+                // naming them, and they are in its re-ship.)
+                || matches!(entry, LiveEntry::Streamed { epoch: e, last, gated: false, .. }
                     if *e == epoch && through >= *last && !rows.contains(last))
-        })?;
+            },
+            true,
+            |_| false,
+        )?;
         if !refused.is_empty() && stranded.shadows > 0 {
             drop_queued_of_rids_tx(&mut tx, self, &refused)?;
         }
@@ -3252,7 +3798,7 @@ impl Meta {
         // below: a later redo still carries its effect.
         let mut confirmed: Vec<(u64, u64, u64)> = Vec::new();
         for (spec_seq, entry) in &live {
-            let LiveEntry::Streamed { epoch: e, last } = entry else {
+            let LiveEntry::Streamed { epoch: e, last, .. } = entry else {
                 continue;
             };
             if *e != epoch || !rows.contains(last) {
@@ -3357,6 +3903,11 @@ impl Meta {
                         false
                     }
                     LiveEntry::Shadow { rid, .. } if completes.contains(rid) => true,
+                    // Plan 43 C1-4: a committed streamed transaction the
+                    // successor re-ships (its `TailOf` names it) is its
+                    // segment's record now: rolled back and applied in its
+                    // place, as a shadow this segment completes.
+                    LiveEntry::Streamed { ident, .. } if tail_ids.contains(ident) => true,
                     _ => match tx.get(&self.spec, seq_key(*spec_seq))? {
                         Some(v) => {
                             let row: SpecRow = postcard::from_bytes(&v)?;
@@ -3430,7 +3981,10 @@ impl Meta {
                     // segment need not carry the entry, and one that does
                     // not must find it redone over itself.
                     LiveEntry::Hint { .. } => !hints_ending.contains(spec_seq),
-                    LiveEntry::Streamed { .. } => !confirmed.iter().any(|(s, _, _)| s == *spec_seq),
+                    LiveEntry::Streamed { ident, .. } => {
+                        !confirmed.iter().any(|(s, _, _)| s == *spec_seq)
+                            && !tail_ids.contains(ident)
+                    }
                     LiveEntry::Local { .. } => !own_spec.contains(spec_seq),
                 })
                 .map(|(s, e)| (*s, *e))
@@ -3442,6 +3996,7 @@ impl Meta {
                 &live_after,
                 &HashSet::new(),
                 cutoff,
+                Strand::PLAIN,
                 Some(Inserted {
                     segment_seq: seq,
                     records,
@@ -3478,6 +4033,18 @@ impl Meta {
             apply_batch_tx(&mut tx, self, cx, records, pending, &staged, false)?.0
         };
         let mut retired = retire_tx(&mut tx, self, &completes, seq, Some(seg_pos), &superseded)?;
+        // Plan 43 C1-4: the committed streamed transactions this segment
+        // re-ships (`TailOf`) are in the log now; their entries retire.
+        for (spec_seq, entry) in &live {
+            let LiveEntry::Streamed { ident, .. } = entry else {
+                continue;
+            };
+            if tail_ids.contains(ident) && tx.get(&self.spec_live, seq_key(*spec_seq))?.is_some() {
+                tx.remove(&self.spec_live, seq_key(*spec_seq));
+                counter_add_tx(&mut tx, &self.local, KV_SPEC_LIVE_COUNT, -1)?;
+                retired += 1;
+            }
+        }
         for (spec_seq, _, _) in &confirmed {
             if let Some(v) = tx.get(&self.spec, seq_key(*spec_seq))? {
                 let mut row: SpecRow = postcard::from_bytes(&v)?;
@@ -3508,9 +4075,14 @@ impl Meta {
         // appended is before the `Recall` record, hence retired above).
         let mut stranded = stranded;
         if !recalled.is_empty() {
-            let more = strand_tx(&mut tx, self, &staged, |entry| {
-                entry.stranded_by_recall(&recalled)
-            })?;
+            let more = strand_tx(
+                &mut tx,
+                self,
+                &staged,
+                |entry| entry.stranded_by_recall(&recalled),
+                false,
+                |_| false,
+            )?;
             stranded.shadows += more.shadows;
             stranded.hints += more.hints;
             stranded.locals += more.locals;
@@ -3538,6 +4110,21 @@ impl Meta {
                 tx.insert(&self.completed, rid.to_key(), row);
             }
         }
+        // Plan 43 C1-4: what the log delivered tells the member copies
+        // (coverage, `TailFollowsThrough`, an abandon, a newer marker).
+        super::member::note_log_tail_tx(&mut tx, self, epoch, records, prev_applied)?;
+        let member = super::member::member_rules_tx(
+            &mut tx,
+            self,
+            &super::member::Facts {
+                epoch,
+                through,
+                rows,
+                records,
+                first_of_epoch,
+                own: false,
+            },
+        )?;
         let from = journal_from(&tx, self)?;
         compact_tx(&mut tx, self, from)?;
         kv_set_tx(&mut tx, &self.local, KV_APPLIED_SEQ, &seq.to_string());
@@ -3552,11 +4139,15 @@ impl Meta {
                 let _ = self.prune_recent_shipped(upto);
             }
         }
+        if member != Default::default() {
+            let _ = self.refresh_member_copy_flag();
+        }
         Ok(SegmentApplied {
             skipped,
             stranded,
             retired,
             inserted_before_local,
+            member,
         })
     }
 
@@ -3575,7 +4166,14 @@ impl Meta {
     pub fn strand_below_epoch(&self, epoch: u64) -> Result<Stranded, MetaError> {
         let mut tx = self.db.write_tx();
         let staged = UsageTracker::staging();
-        let stranded = strand_tx(&mut tx, self, &staged, |entry| entry.stranded_by(epoch))?;
+        let stranded = strand_tx(
+            &mut tx,
+            self,
+            &staged,
+            |entry| entry.stranded_by(epoch),
+            true,
+            |_| false,
+        )?;
         if !stranded.any() {
             return Ok(stranded);
         }
@@ -3634,16 +4232,38 @@ impl Meta {
     /// unwritten, at the write under the writer lock, and the engine
     /// sends the op through the core, whose gate parks it until the
     /// replay is done.
-    pub fn strand_for_takeover(&self, epoch: u64, own_gens: &[u64]) -> Result<Stranded, MetaError> {
+    pub fn strand_for_takeover(
+        &self,
+        epoch: u64,
+        own_gens: &[u64],
+        abandoned: Option<u64>,
+    ) -> Result<Stranded, MetaError> {
         let mut tx = self.db.write_tx();
         let staged = UsageTracker::staging();
         let own = |entry: &LiveEntry| match entry {
             LiveEntry::Local { gen, .. } if *gen != 0 && own_gens.contains(gen) => Some(*gen),
             _ => None,
         };
-        let stranded = strand_tx(&mut tx, self, &staged, |entry| {
-            entry.stranded_by(epoch) || own(entry).is_some()
-        })?;
+        // Plan 43 C1-4: a committed entry of this node's own (a requester's
+        // shadow, a subscriber's streamed transaction of the tenure being
+        // taken over) is taken out here too: the gate re-applies the
+        // predecessor's tail, which carries the row, so the entry would
+        // apply it twice. Not queued — unless the operator abandoned the
+        // group, whose rows no one re-ships.
+        let abandons = |entry: &LiveEntry| abandoned.is_some_and(|a| entry.stranded_by_abandon(a));
+        let stranded = strand_tx(
+            &mut tx,
+            self,
+            &staged,
+            |entry| {
+                entry.stranded_by(epoch)
+                    || own(entry).is_some()
+                    || entry.superseded_by_takeover(epoch)
+                    || abandons(entry)
+            },
+            true,
+            |entry| entry.superseded_by_takeover(epoch) && !abandons(entry),
+        )?;
         if !stranded.any() && own_gens.is_empty() {
             return Ok(stranded);
         }
@@ -3689,12 +4309,19 @@ impl Meta {
     pub fn strand_recalled_speculation(&self, gen: u64) -> Result<Stranded, MetaError> {
         let mut tx = self.db.write_tx();
         let staged = UsageTracker::staging();
-        let stranded = strand_tx(&mut tx, self, &staged, |entry| {
-            matches!(
-                entry,
-                LiveEntry::Shadow { gen: g, .. } | LiveEntry::Hint { gen: g, .. } if *g == gen
-            )
-        })?;
+        let stranded = strand_tx(
+            &mut tx,
+            self,
+            &staged,
+            |entry| {
+                matches!(
+                    entry,
+                    LiveEntry::Shadow { gen: g, .. } | LiveEntry::Hint { gen: g, .. } if *g == gen
+                )
+            },
+            false,
+            |_| false,
+        )?;
         if !stranded.any() {
             return Ok(stranded);
         }
@@ -3736,6 +4363,8 @@ impl Meta {
                 self,
                 &staged,
                 |entry| matches!(entry, LiveEntry::Shadow { rid: r, .. } if *r == rid),
+                false,
+                |_| false,
             )?
         } else {
             Stranded::default()

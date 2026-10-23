@@ -1843,8 +1843,9 @@ async fn handle_stream<S: PeerService>(
                 epoch,
                 base,
                 txs,
+                committed,
             } => {
-                service.stream_ahead(from, epoch, base, txs);
+                service.stream_ahead(from, epoch, base, txs, committed);
                 Some(Payload::Ok { req_id: 0 })
             }
             Payload::BackupHold {

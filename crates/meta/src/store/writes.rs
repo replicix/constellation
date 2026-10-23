@@ -117,6 +117,9 @@ impl Meta {
         applied_seq: u64,
     ) -> Result<(), MetaError> {
         use crate::store::spec::{retire_local_tx, retire_tx, Shipped};
+        // Plan 43 C1-4: rows of this node's own tenure that shipped cover
+        // member copies (a re-shipped transaction names the one it carries).
+        self.member_cover_shipped_tx(tx, journal_seqs)?;
         // Plan 30 §M11: the root's own ops forwarded to a delegate are
         // shadows here (§M6) that no segment apply completes: the
         // completions this ship carries retire them, as the segment

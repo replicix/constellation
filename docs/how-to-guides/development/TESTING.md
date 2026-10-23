@@ -4814,17 +4814,18 @@ core carries no assert (C0 changes no behaviour). Each oracle **always
 counts**; its strict flag (`SimConfig::strict_*`, config variants
 `+commit`, `+identity`, `+settle`, `+lone`, `+oracles` for all four) only
 decides whether a count fails the run. All default off until the milestone
-that makes the invariant hold (C1 turns `strict_lone` on in the
-`strict_durability` configs; C2 `strict_commit` and `strict_settle`; C3
-`strict_identity`).
+that makes the invariant hold (C1-4 turns `strict_lone` and the I2 checks on
+in the `strict_durability` configs; C2 `strict_commit` and `strict_settle`; C3
+`strict_identity` on the delegated families).
 
 | Oracle | Judged | Counter (`Report`) | Flag |
 |---|---|---|---|
 | I1 `acked_implies_committed` | at the answering sequencer's emission: every definitive answer (`Accepted`, `Errno`, `Exists`, `Conflict`, `LockLapsed`) of a `MutateReply` or of a node's own client reply that this node decided (`Action::Reply.source`: `Sequenced`), by reading every node's store, the bucket's lease and the log as they are then (`tests/sim/oracle.rs`, `committed_at_answer`), independently of what the core claims; what a transaction carries must be the answer's own outcome (plan 43 C2a: a completion for an acceptance, a `Refused` of the answer's code for a refusal — an `Exists` hint is `EEXIST`, a conflict `ESTALE`, a lapsed grant `ENOLCK`), and the same rid carried with another outcome by the archive, the answerer's journal or the lease holder's is a violation of its own whether or not a class holds. A requester passing another node's answer on (`Relayed`) is not judged but verified at the end of the run: an earlier judged `MutateReply` of that node with the same outcome must exist | `acks_by_class`, `uncommitted_acks` (`"{expected class}/{answer}"`), `mismatched_acks` (by answer kind), `unverified_relays`, `class_mismatch` (informational: the core's claimed class is not the judged one), `unjournaled_refusals` (D6: a refusal that journaled no `Refused` row, e.g. a frozen epoch's `EROFS`: nothing executed, not a violation), `acks_unsourced` (an outcome no sequencer decided: a node's own error; not judged), `acks_unmapped` (must be 0) | `strict_commit` |
-| I2 `one_identity_per_op` (b) | after every event a node handles: no rid queued for execution (`pending_replays`, the core's client map) on two nodes at once (`IdentityLedger`) | `identity_copies` | `strict_identity` |
-| I2 (c) verbatim | end of run: an OK answered under a group class is completed in the log under the identity it was committed with (epoch, node and journal row, or `(gen, idx)`) and with its records as one run | `non_verbatim` | `strict_identity` |
+| I2 `one_identity_per_op` (b) | after every event a node handles: no rid queued for execution (`pending_replays`, the core's client map) on two nodes at once (`IdentityLedger`), judged when a queued copy stands for a committed answer (its entry's class is gated: plan 43 C1-4; a stranded committed entry, an abandoned member row); the pairs of lone-branch and delegate copies are counted apart | `identity_copies`, `identity_copies_ungated` | `strict_identity`, `strict_durability` |
+| I2 (c) verbatim | end of run: an OK answered under a group class is completed in the log under the identity it was committed with (the transaction's `LogRecord::TailOf`, kept through any number of re-ships, else epoch, node and journal row; or `(gen, idx)`) and with its records as one run, ignoring the `TailOf` records of either (plan 43 C1-4, D9) | `non_verbatim` | `strict_identity`, `strict_durability` |
+| `member_copies_drained` (plan 43 C1-4) | a converged run: no node still holds a row of a member copy (the archive carries every identity, or a marker said the row was never committed) | `member_copy_rows_left` | `strict_durability` |
 | I4 `unacked_fails_never_lands_late` | end of run: an op answered in doubt (the first `InDoubt` answer; the sim's client resubmits, production answers `EIO` at once) that lands after an op its node invoked later; and (plan 43 C2a) a refusal that journaled no `Refused` row whose rid the log completes | `late_landings`, `unjournaled_landed` | `strict_settle` |
-| I5 `speculation_only_lone` | end of run: an OK that was rolled back whose answer was not class Lone | `non_lone_rollbacks` | `strict_lone` |
+| I5 `speculation_only_lone` | end of run: an OK that was rolled back whose answer was not class Lone (a rollback is what the core counts as one: a stranded replay, not a committed row kept as a member copy, and not a refusal this node never answered) | `non_lone_rollbacks` | `strict_lone`, `strict_durability` |
 | I6 `no_ttl_claim_of_a_live_lease` (plan 43 C7b) | at every lease CAS the sim's bucket accepts that replaces another node's unreleased, unfenced lease without a permit (`takeover_permit` of the claimant when it sent the CAS, naming that epoch and holder, with the backup listed or the policy `S3`): the predecessor's own honour end for the body (`holder_expires_ms` less its margin, on the clock `holder_clock` names, read with `ProtocolClock::peek_honour`, which moves no clock) against the predecessor's honour reading now. A claim before that end is a violation ("TTL claim of a live lease: node X took epoch E of node Y at true t ms, which honours it for another u ms"); a predecessor that is dead or restarted since honours nothing | `lease_ttl_claims`, `lease_live_claims` (the violations), `seals_of_a_live_holder` (a permitted claim of a `Backup` lease whose holder still honoured it: count only), `permitted_claims` | `strict_lease_claims` |
 
 **Classes** (`constellation_authority::core::AckClass`): `Archive` (an applied,
@@ -4877,6 +4878,22 @@ third node for a lease TTL and four takeover windows; `-holder-only` and
 (a sealing successor dies holding the predecessor's tail unshipped:
 `FaultKind::CrashWhenTailUnshipped`; the third node must fetch it from the
 old group, `inherited_tail_fetches`).
+
+**Plan 43 C1-4.** `SWEEP-C14-TOTALS` prints, per sweep: committed entries
+rolled back (must be 0 outside an abandon), committed entries a takeover
+gate's re-applied tail superseded, rows moved to a member copy, member rows
+retired by the log's identities, dropped as never committed, abandoned (queued
+by an operator's `repair abandon-group`), tails a backup kept when its holder's
+lease moved on, tail rows past a gap not re-shipped, gated rows queued for
+replay (must be 0), the ungated I2 pairs, and nodes holding member rows at
+convergence (must be 0: `member_copies_drained`). `strict_durability` now means
+`strict_identity` (I2 (b) and (c)) and `strict_lone` too, and
+`member_copies_drained`; the lone branch's answers (what the core claims
+`Lone`) are the one exemption of the strict checks. The oracle judges a
+re-shipped transaction by its `TailOf` identity and its records ignoring the
+`TailOf`, and the completion need not be the transaction's last record (an
+inbox acknowledgement rides after it). The rebuild-stub negative control no
+longer runs the program-order check (see PROGRESS, plan 43 C1-4).
 
 **Plan 43 C7b: offsets beyond the margin.** The cross-node compares (a claimant
 judging a lease by its own wall against the holder's wall expiry) are safe only

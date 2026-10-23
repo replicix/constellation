@@ -3495,9 +3495,15 @@ impl Driver {
                 epoch,
                 base,
                 txs,
+                committed,
             } => Some(Internal::Event(Event::Peer {
                 from,
-                msg: PeerMsg::StreamAhead { epoch, base, txs },
+                msg: PeerMsg::StreamAhead {
+                    epoch,
+                    base,
+                    txs,
+                    committed,
+                },
             })),
             SyncRequest::PeerHolderAlive {
                 holder,
@@ -5246,7 +5252,12 @@ impl Driver {
                     .await;
                 });
             }
-            PeerMsg::StreamAhead { epoch, base, txs } => {
+            PeerMsg::StreamAhead {
+                epoch,
+                base,
+                txs,
+                committed,
+            } => {
                 let peers = self.deps.peers.clone();
                 let from = self.node_id;
                 let timeout = Duration::from_millis(self.core.config().backup_ack_timeout_ms);
@@ -5262,6 +5273,7 @@ impl Driver {
                         epoch,
                         base,
                         txs,
+                        committed,
                     };
                     // Fire and forget: a follower that misses a batch
                     // gets the rows from the segment.
