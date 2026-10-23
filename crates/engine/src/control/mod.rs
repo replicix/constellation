@@ -793,6 +793,7 @@ pub fn register(r: &mut Router, svc: &Arc<EngineControl>) {
     // ---- locks / cache / quota ----
     unary::<LocksForceRelease>(r, svc, |s, _, p| ack(s.force_release(&p.part)));
     unary::<LocksDropHeld>(r, svc, |s, _, p| ack(s.drop_held(p.ino, p.remote)));
+    unary::<LeaseAbandonGroup>(r, svc, |s, _, p| ack(s.abandon_group(p.epoch, p.gen)));
     unary::<CacheList>(r, svc, |s, _, _| {
         Ok(CacheEntryListing {
             entries: s.cache_list(),

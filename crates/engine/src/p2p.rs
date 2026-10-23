@@ -286,6 +286,52 @@ impl constellation_net::PeerService for P2pBridge {
         })
     }
 
+    fn seal_tail_requested(
+        &self,
+        claimant: u64,
+        req_id: u64,
+        epoch: u64,
+        config_version: u64,
+        from_seq: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
+    {
+        Box::pin(async move {
+            let none = constellation_net::Payload::SealedTail {
+                req_id,
+                epoch,
+                held: false,
+                txs: Vec::new(),
+                through: 0,
+                next: None,
+            };
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            if self
+                .nudge
+                .send(sync::SyncRequest::PeerSealTail {
+                    claimant,
+                    epoch,
+                    config_version,
+                    from_seq,
+                    reply,
+                })
+                .is_err()
+            {
+                return none;
+            }
+            match receive.await {
+                Ok((held, txs, through, next)) => constellation_net::Payload::SealedTail {
+                    req_id,
+                    epoch,
+                    held,
+                    txs: postcard::to_allocvec(&txs).unwrap_or_default(),
+                    through,
+                    next,
+                },
+                Err(_) => none,
+            }
+        })
+    }
+
     fn epoch_proposed(
         &self,
         epoch_id: String,

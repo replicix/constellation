@@ -356,6 +356,7 @@ impl LeaseView {
             epoch: self.epoch.load(Ordering::Relaxed),
             expires_in_ms: if until > 0 { until - now } else { 0 },
             lost: self.lost.load(Ordering::Relaxed),
+            waiting_for_group: None,
         }
     }
 }

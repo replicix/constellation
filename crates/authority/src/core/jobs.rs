@@ -21,7 +21,7 @@ use crate::replica::Replica;
 use crate::segment;
 use constellation_fs_core::Ino;
 use constellation_meta::{JournalPos, LogRecord};
-use constellation_store_s3::{Lease, LeaseTag};
+use constellation_store_s3::{AckPolicy, Lease, LeaseTag};
 use constellation_types::Code;
 
 /// EC2 campaign 8 A-1: the reason of an acquisition started because a
@@ -201,6 +201,10 @@ enum Phase {
     Recover { op: OpId },
     /// Acquire: `LeaseGet` outstanding.
     Get,
+    /// Plan 43 C1-3: a claim by TTL of a lease whose group may hold
+    /// acknowledged rows waits for one member's sealed tail (`SealTail`
+    /// outstanding; the state is `BackupState::tf`).
+    TailFetch,
     /// Acquire: the CAS outstanding, and the object it writes (adopted
     /// exactly on success — see `Renew::sent`).
     Cas { plan: Plan, sent: Box<Lease> },
@@ -744,7 +748,12 @@ impl Core {
             let rows: Vec<LogRecord> = seg
                 .records
                 .iter()
-                .filter(|r| !matches!(r, LogRecord::TailFollows { .. }))
+                .filter(|r| {
+                    !matches!(
+                        r,
+                        LogRecord::TailFollows { .. } | LogRecord::GroupAbandoned { .. }
+                    )
+                })
                 .cloned()
                 .collect();
             let Some(seqs) = replica.journal_head_matching(&rows)? else {
@@ -774,11 +783,12 @@ impl Core {
             );
             // A marker whose PUT landed but whose reply was lost: the gate
             // need not ship another.
-            if seg
-                .records
-                .iter()
-                .all(|r| matches!(r, LogRecord::TailFollows { .. }))
-            {
+            if seg.records.iter().all(|r| {
+                matches!(
+                    r,
+                    LogRecord::TailFollows { .. } | LogRecord::GroupAbandoned { .. }
+                )
+            }) {
                 if let Some(gate) = self.lease.gate.as_mut() {
                     if gate.epoch == seg.epoch {
                         gate.marker_shipped = true;
@@ -1168,7 +1178,7 @@ impl Core {
             through,
             &[],
             &[],
-            &marker_records(&gate),
+            &marker_records(&gate, self.bk.abandoned_claim),
         )
         .expect("marker segment");
         let seq = self.ship.next_seq;
@@ -1272,6 +1282,18 @@ impl Core {
         if let Some(g) = self.lease.gate.as_mut() {
             g.shippable = true;
         }
+        // Plan 43 C1-3 (D2): a re-adoption of this node's own lease, which
+        // still names a tail its tenure re-ships: everything in the journal
+        // is what must ship before the lease stops naming it.
+        if self.ack.inherited_last.is_none()
+            && self
+                .lease
+                .held
+                .as_ref()
+                .is_some_and(|(l, _)| l.inherited_tail.is_some())
+        {
+            self.ack.inherited_last = Some(replica.journal_tip());
+        }
         if !gate.drained {
             if replica.read_delegations().quarantine_until() > now.wait {
                 return GateStep::Wait;
@@ -1312,7 +1334,7 @@ impl Core {
         self.ship.head_seq = self.ship.head_seq.max(seq);
         self.ship.max_epoch = self.ship.max_epoch.max(epoch);
         self.stats.epoch_markers += 1;
-        let records = marker_records(gate);
+        let records = marker_records(gate, self.bk.abandoned_claim.take());
         let payload = segment::encode(self.cfg.node_id, epoch, through, &[], &[], &records)
             .expect("marker segment");
         self.stream_passed(now, seq, epoch, &payload, out);
@@ -1789,7 +1811,8 @@ impl Core {
 
     fn issue_renew(&mut self, now: Now, mid_ship: bool, out: &mut Vec<Action>) {
         let (mine, tag) = self.lease.held.clone().expect("held");
-        let renewed = self.lease.renewed_lease(now, &self.cfg, &mine);
+        let mut renewed = self.lease.renewed_lease(now, &self.cfg, &mine);
+        self.clear_covered_tail(&mut renewed);
         let op = self.issue_s3(
             S3Op::LeaseSwap {
                 lease: renewed.clone(),
@@ -2707,6 +2730,16 @@ impl Core {
         if self.acquire_overtaken_by_epoch(now, replica, out) {
             return;
         }
+        // Plan 43 C1-3: what this node holds of the group's tail, and the
+        // epoch it sealed, are what the classification decides a claim by.
+        self.lease.sealed_own = self.bk.sealed;
+        self.lease.tail_held.clear();
+        if let Some(r) = self.bk.role {
+            self.lease.tail_held.push((r.holder, r.epoch));
+        }
+        self.lease
+            .tail_held
+            .extend(self.bk.member_epochs.iter().map(|e| (self.cfg.node_id, *e)));
         let plan = self.lease.classify(now, &self.cfg, object, self.bk.sealed);
         if let Some(What::Acquire {
             reason: READOPT_REASON,
@@ -2730,6 +2763,11 @@ impl Core {
                 self.finish_acquire(now, false, replica, out);
                 return;
             }
+        }
+        if !matches!(plan, Plan::FetchTail { .. }) {
+            // Plan 43 C1-3: nothing waits for a group any more.
+            self.bk.group_wait = None;
+            self.bk.abandon = None;
         }
         match plan {
             Plan::Held => {
@@ -2847,31 +2885,78 @@ impl Core {
                 }
                 self.finish_acquire(now, false, replica, out);
             }
-            Plan::Claim { takeover, .. } => {
-                if takeover {
-                    if let Plan::Claim { prev, .. } = &plan {
-                        if self.promise_check_needed(now, prev) {
-                            let prev = prev.clone();
-                            self.set_phase(Phase::PromiseCheck, None);
-                            self.pending_plan = Some(plan);
-                            self.promise_check_begin(now, &prev, out);
-                            return;
-                        }
-                    }
-                    self.set_phase(
-                        Phase::Tail {
-                            then: TailThen::Takeover,
-                        },
-                        None,
-                    );
-                    // Stash the plan for after the tail.
-                    self.pending_plan = Some(plan);
-                    self.issue_tail(out);
-                    return;
-                }
-                self.acquire_cas(now, plan, replica, out);
+            Plan::Claim { .. } => self.claim_plan(now, plan, replica, out),
+            // Plan 43 C1-3: the claim carries the group's sealed tail, or
+            // waits for it.
+            Plan::FetchTail { prev, tag, sources } => {
+                self.begin_tail_fetch(now, prev, tag, sources, replica, out)
             }
         }
+    }
+
+    /// The claim of a `Plan::Claim`: a takeover first tails the log to its
+    /// head (and passes the promise check), then CASes.
+    fn claim_plan(&mut self, now: Now, plan: Plan, replica: &dyn Replica, out: &mut Vec<Action>) {
+        let Plan::Claim { takeover, .. } = &plan else {
+            return;
+        };
+        if *takeover {
+            if let Plan::Claim { prev, .. } = &plan {
+                if self.promise_check_needed(now, prev) {
+                    let prev = prev.clone();
+                    self.set_phase(Phase::PromiseCheck, None);
+                    self.pending_plan = Some(plan);
+                    self.promise_check_begin(now, &prev, out);
+                    return;
+                }
+            }
+            self.set_phase(
+                Phase::Tail {
+                    then: TailThen::Takeover,
+                },
+                None,
+            );
+            // Stash the plan for after the tail.
+            self.pending_plan = Some(plan);
+            self.issue_tail(out);
+            return;
+        }
+        self.acquire_cas(now, plan, replica, out);
+    }
+
+    /// Plan 43 C1-3: the sealed tail is in hand (or the group abandoned):
+    /// the claim goes on as the takeover of `prev` it is.
+    pub(super) fn claim_with_tail(
+        &mut self,
+        now: Now,
+        prev: Lease,
+        tag: LeaseTag,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let plan = Plan::Claim {
+            prev,
+            tag,
+            takeover: true,
+            marker: true,
+        };
+        self.claim_plan(now, plan, replica, out);
+    }
+
+    /// Plan 43 C1-3: the job is a claim waiting for a group's tail.
+    pub(super) fn tail_fetch_phase(&mut self) {
+        self.set_phase(Phase::TailFetch, None);
+    }
+
+    /// Plan 43 C1-3: this attempt of the acquisition ends without the lease
+    /// (the group did not answer): the ops behind it retry.
+    pub(super) fn end_acquire_attempt(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        self.finish_acquire(now, false, replica, out);
     }
 
     /// Plan 30 §M10: the promise check decided. Allowed: the takeover
@@ -2963,9 +3048,25 @@ impl Core {
                 permitted
             })
             || (self.cfg.ack_s3 && self.tenure_duty_live(now, replica));
-        let lease = self
+        let mut lease = self
             .lease
             .granted_lease(now, &self.cfg, Some(prev), inherits_duty);
+        // Plan 43 C1-3: the claim's tail. A listed backup that claims at
+        // expiry seals its role first, a self-sealed holder takes its own
+        // member copy as the tail; whatever tail the claim re-ships is
+        // named by the lease it writes (D2), until the log carries it. A
+        // re-adoption of this node's own lease (a restart) keeps what the
+        // lease already says: its rows are on this disk still.
+        if !self.prepare_tail_for_claim(prev, replica) {
+            self.finish_acquire(now, false, replica, out);
+            return;
+        }
+        lease.inherited_tail =
+            if prev.holder == self.cfg.node_id && !prev.released && self.bk.sealed < prev.epoch {
+                prev.inherited_tail.clone()
+            } else {
+                self.tail_to_inherit(prev, replica).map(Box::new)
+            };
         // Plan 43 C7a (commit 4): a takeover of a tenure that granted may arm
         // a floor when its marker lands (`acquire_won` decides; the permit
         // can arrive while the CAS is out, so every such claim records it).
@@ -3032,6 +3133,7 @@ impl Core {
             .as_ref()
             .is_some_and(|p| p.holder == self.cfg.node_id && !p.released && p.granted_delegations);
         let lease = sent;
+        self.ack.inherited_last = None;
         self.ack.mark_own = lease.granted_delegations && (self.cfg.strict_mounts || own_carry);
         self.ack.mark_inherited = lease.granted_delegations && !self.ack.mark_own;
         self.ack.unmarking = None;
@@ -3177,13 +3279,39 @@ impl Core {
             .and_then(|p| {
                 self.bk.role.filter(|r| {
                     if p.holder != self.cfg.node_id {
-                        takeover && r.epoch == p.epoch && r.holder == p.holder
+                        // Plan 43 C1-3: the tail this claim fetched may be
+                        // an older epoch's than the lease's own (an
+                        // inherited tail's).
+                        takeover
+                            && ((r.epoch == p.epoch && r.holder == p.holder)
+                                || self.bk.fetched.as_ref().is_some_and(|f| f.epoch == r.epoch))
                     } else {
-                        p.epoch == r.epoch + 1 && epoch == p.epoch && sealed >= r.epoch
+                        // (A self-sealed holder's own claim: its member
+                        // copy is the tail, at the epoch it sealed.)
+                        (p.epoch > r.epoch && epoch == p.epoch && sealed >= r.epoch)
+                            || (takeover && sealed >= p.epoch && r.epoch == p.epoch)
                     }
                 })
             })
             .map(|r| r.epoch);
+        if takeover
+            && backup_tail_epoch.is_none()
+            && self.bk.abandoned_claim.is_none()
+            && prev.as_ref().is_some_and(|p| {
+                p.holder != self.cfg.node_id
+                    && !p.released
+                    && ((p.ack_policy == AckPolicy::Backup && !p.backups.is_empty())
+                        || p.inherited_tail.is_some())
+            })
+        {
+            self.stats.ttl_claims_without_tail += 1;
+            tracing::warn!(
+                node = self.cfg.node_id,
+                epoch,
+                "claimed a lease whose group may hold acknowledged rows without a tail"
+            );
+        }
+        self.bk.fetched = None;
         // Plan 30 §M3 takeover gate; M13: every acquisition drains the
         // older epochs' inbox before its view opens.
         let gate = PendingGate {
@@ -3255,6 +3383,11 @@ impl Core {
     ) {
         self.pending_plan = None;
         self.promise_check_abandon(out);
+        if !acquired {
+            // Plan 43 C1-3: a tail fetched for a claim that did not happen
+            // is not carried by the next, whatever it is.
+            self.bk.fetched = None;
+        }
         let Some(job) = self.job.take() else {
             return;
         };
@@ -3810,8 +3943,9 @@ impl Core {
                         } else {
                             // Lost the CAS to a `wanted_by` edit: renew
                             // against the fresh object.
-                            let renewed = self.lease.renewed_lease(now, &self.cfg, &cur);
+                            let mut renewed = self.lease.renewed_lease(now, &self.cfg, &cur);
                             self.lease.renewed(now, cur, tag.clone());
+                            self.clear_covered_tail(&mut renewed);
                             let op = self.issue_s3(
                                 S3Op::LeaseSwap {
                                     lease: renewed.clone(),
@@ -4710,9 +4844,19 @@ impl Core {
 /// announcement that this tenure re-ships its predecessor's acknowledged
 /// backup tail (`LogRecord::TailFollows`), which keeps readers' older
 /// observations waiting past the marker.
-fn marker_records(gate: &PendingGate) -> Vec<LogRecord> {
+///
+/// Plan 43 C1-3: a claim the operator made without the tail of a group no
+/// member of which answered (`constellation repair abandon-group`) says so
+/// instead: `LogRecord::GroupAbandoned`, the log's permanent record that
+/// rows that group acknowledged are not re-shipped by this tenure.
+fn marker_records(gate: &PendingGate, abandoned: Option<Epoch>) -> Vec<LogRecord> {
     gate.backup_tail_epoch
         .map(|prev_epoch| LogRecord::TailFollows { prev_epoch })
         .into_iter()
+        .chain(abandoned.map(|epoch| LogRecord::GroupAbandoned {
+            epoch,
+            gen: 0,
+            through_known: 0,
+        }))
         .collect()
 }

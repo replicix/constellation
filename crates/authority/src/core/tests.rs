@@ -242,6 +242,7 @@ impl Harness {
             // itself_before_its_first_strict_answer` covers that).
             granted_delegations: true,
             retired: Vec::new(),
+            inherited_tail: None,
         };
         self.core.lease.adopt(self.clk(), lease, tag(), gate);
         self.meta.set_holder_epoch(epoch);
@@ -2119,6 +2120,7 @@ fn lose_renewal_with_an_unshipped_create(h: &mut Harness) -> Vec<Action> {
         ack_policy: constellation_store_s3::AckPolicy::Local,
         granted_delegations: false,
         retired: Vec::new(),
+        inherited_tail: None,
     };
     h.step(Event::S3 {
         op: reread,
@@ -10201,6 +10203,7 @@ mod m10 {
             ack_policy: constellation_store_s3::AckPolicy::Local,
             granted_delegations: false,
             retired: Vec::new(),
+            inherited_tail: None,
         }
     }
 
@@ -11070,6 +11073,7 @@ fn lease_of(holder: NodeId, epoch: Epoch, expires_unix_ms: i64) -> Lease {
         ack_policy: constellation_store_s3::AckPolicy::Local,
         granted_delegations: false,
         retired: Vec::new(),
+        inherited_tail: None,
     }
 }
 
@@ -12257,15 +12261,37 @@ mod backup_crash {
             matches!(classify(3, now), Plan::Busy { .. }),
             "a non-backup claimed inside the grace"
         );
+        // Plan 43 C1-3: a claim of a lease whose group may hold rows it
+        // acknowledged carries the group's tail: a listed backup that holds
+        // it (a role for the lease's holder and epoch) claims at the
+        // expiry; one that holds nothing, like anyone else past the grace,
+        // fetches it first.
         assert!(
-            matches!(classify(2, now), Plan::Claim { takeover: true, .. }),
-            "the listed backup may claim at the expiry"
+            matches!(classify(2, now), Plan::FetchTail { .. }),
+            "a listed backup without the tail fetches it"
         );
         let grace = crate::core::backup_claim_grace_ms(&Config::defaults(3, 1));
         assert!(matches!(
             classify(3, Ms(lease.expires_unix_ms + grace)),
-            Plan::Claim { takeover: true, .. }
+            Plan::FetchTail { .. }
         ));
+        let mut holds = Harness::new(2);
+        let cfg = holds.core.cfg.clone();
+        holds.core.lease.observe(
+            Now::same(lease.expires_unix_ms - cfg.ttl_ms as i64),
+            Some(&(lease.clone(), tag())),
+        );
+        holds.core.lease.tail_held = vec![(1, 1)];
+        assert!(
+            matches!(
+                holds
+                    .core
+                    .lease
+                    .classify(Now::same(now.0), &cfg, Some((lease.clone(), tag())), 0),
+                Plan::Claim { takeover: true, .. }
+            ),
+            "the listed backup that holds the tail may claim at the expiry"
+        );
         // A `Local` lease (no backups) is anyone's at the expiry.
         let local = lease_of(1, 1, now.0 - 1);
         let mut h = Harness::new(3);
@@ -28957,6 +28983,7 @@ fn an_inbox_op_is_forwarded_once_the_holder_is_reachable() {
         ack_policy: constellation_store_s3::AckPolicy::Local,
         granted_delegations: false,
         retired: Vec::new(),
+        inherited_tail: None,
     };
     let out = h.step(Event::S3 {
         op: get,
@@ -30547,6 +30574,7 @@ fn a_barrier_around_a_deposition_waits_for_the_replay_not_the_strand() {
         ack_policy: constellation_store_s3::AckPolicy::Local,
         granted_delegations: false,
         retired: Vec::new(),
+        inherited_tail: None,
     };
     let deposed = h.step(Event::S3 {
         op: reread,
@@ -32947,6 +32975,7 @@ fn root_lease(holder: NodeId, epoch: Epoch, expires: Ms) -> Lease {
         ack_policy: constellation_store_s3::AckPolicy::Local,
         granted_delegations: false,
         retired: Vec::new(),
+        inherited_tail: None,
     }
 }
 
@@ -37343,6 +37372,782 @@ mod lock_lane_core_tests {
         // root that named no other one is forgotten, and the grant is due.
         assert_eq!(h.core.lease.cached_holder, None);
         assert_eq!(h.meta.locks().held(7).unwrap().renewing, None);
+    }
+}
+
+/// Plan 43 C1-3: the TTL claimant fetches the sealed tail of the old
+/// group; the member's side; the inherited tail; the strict wait.
+mod c1_tail_fetch {
+    use super::c1_counted::listed_holder;
+    use super::*;
+    use constellation_meta::BackupTx;
+    use constellation_store_s3::{AckPolicy, InheritedTail};
+
+    fn find_s3(out: &[Action], pred: impl Fn(&S3Op) -> bool) -> OpId {
+        s3_ops(out)
+            .into_iter()
+            .find(|(_, r)| pred(r))
+            .map(|(op, _)| op)
+            .unwrap_or_else(|| panic!("no matching S3 request in {out:?}"))
+    }
+
+    /// An expired `Backup` lease of node 1 at epoch 1 listing `backups`.
+    fn expired(h: &Harness, backups: Vec<NodeId>) -> Lease {
+        Lease {
+            backups,
+            ack_policy: AckPolicy::Backup,
+            config_version: 2,
+            ..lease_of(1, 1, h.now.0 - 1)
+        }
+    }
+
+    /// `n` acknowledged creates of node 1, as its journal would stream them.
+    fn tail_of(n: u64) -> Vec<BackupTx> {
+        let holder = Harness::new(1);
+        holder.meta.set_holder_epoch(1);
+        for i in 1..=n {
+            let create = holder.create(&format!("f{i}"));
+            let rid = Rid {
+                node: 1,
+                incarnation: 1,
+                seq: i,
+            };
+            constellation_meta::execute_mutate(&holder.meta, &create, Some(rid)).unwrap();
+        }
+        holder.meta.journal_txs_from(1, 1000).unwrap()
+    }
+
+    /// Node `node` (no promise check) that has watched `lease` run out and
+    /// asks for the lease: the outputs of its acquisition up to the lease
+    /// read's answer.
+    fn claimant(node: NodeId, lease: &Lease) -> (Harness, Vec<Action>) {
+        let mut h = Harness::new(node);
+        h.core.cfg.takeover_promise_check = false;
+        h.watch(lease);
+        let out = h.step(Event::Control {
+            op: OpId(700),
+            req: Control::Acquire,
+        });
+        let get = find_s3(&out, |r| matches!(r, S3Op::LeaseGet));
+        let out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((lease.clone(), tag())))),
+        });
+        (h, out)
+    }
+
+    fn seal_tails(out: &[Action]) -> Vec<(NodeId, OpId, Epoch, u64, u64)> {
+        sends(out)
+            .into_iter()
+            .filter_map(|(to, m)| match m {
+                PeerMsg::SealTail {
+                    req,
+                    epoch,
+                    config_version,
+                    from,
+                } => Some((to, *req, *epoch, *config_version, *from)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn sealed(out: &[Action]) -> Vec<(NodeId, bool, usize, u64, Option<u64>)> {
+        sends(out)
+            .into_iter()
+            .filter_map(|(to, m)| match m {
+                PeerMsg::SealedTail {
+                    held,
+                    txs,
+                    through,
+                    next,
+                    ..
+                } => Some((to, *held, txs.len(), *through, *next)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn answer(from: NodeId, req: OpId, epoch: Epoch, txs: Vec<BackupTx>) -> Event {
+        let through = txs.iter().map(|t| t.last).max().unwrap_or(0);
+        Event::Peer {
+            from,
+            msg: PeerMsg::SealedTail {
+                req,
+                epoch,
+                held: true,
+                txs,
+                through,
+                next: None,
+            },
+        }
+    }
+
+    fn seal_tail(h: &mut Harness, from: NodeId, epoch: Epoch, cv: u64, at: u64) -> Vec<Action> {
+        h.step(Event::Peer {
+            from,
+            msg: PeerMsg::SealTail {
+                req: OpId(40 + at),
+                epoch,
+                config_version: cv,
+                from: at,
+            },
+        })
+    }
+
+    /// A node that is not a listed backup claims a `Backup` lease past the
+    /// grace: it first asks the holder and every listed backup, and its
+    /// claim carries the tail the first of them answers (its marker
+    /// announces it, the lease it writes names the group). Fails on the
+    /// parent: the claim went straight to its CAS, without the tail.
+    #[test]
+    fn a_ttl_claimer_fetches_the_sealed_tail_before_its_marker() {
+        let h0 = Harness::new(3);
+        let lease = expired(&h0, vec![2]);
+        let (mut h, out) = claimant(3, &lease);
+        let asked = seal_tails(&out);
+        assert_eq!(asked.len(), 2, "the holder and the backup: {out:?}");
+        assert!(asked.iter().any(|a| a.0 == 1) && asked.iter().any(|a| a.0 == 2));
+        assert!(asked.iter().all(|a| a.2 == 1 && a.3 == 2 && a.4 == 0));
+        assert!(
+            s3_ops(&out)
+                .iter()
+                .all(|(_, r)| !matches!(r, S3Op::LeaseSwap { .. })),
+            "no CAS before the tail: {out:?}"
+        );
+        // The backup answers; the holder (silent) never does.
+        let (_, req2, ..) = *asked.iter().find(|a| a.0 == 2).unwrap();
+        let txs = tail_of(2);
+        let out = h.step(answer(2, req2, 1, txs.clone()));
+        assert_eq!(h.core.stats.tail_fetches, 1);
+        assert_eq!(h.core.bk.sealed, 1, "the claimant sealed the epoch too");
+        assert_eq!(h.core.bk.role.map(|r| r.epoch), Some(1));
+        assert_eq!(h.meta.backup_tail(1).unwrap().len(), txs.len());
+        // The claim goes on as a takeover: tail to head, then the CAS.
+        let tail = find_s3(&out, |r| matches!(r, S3Op::SegmentRun { .. }));
+        let out = h.step(Event::S3 {
+            op: tail,
+            result: S3Result::SegmentRun(Ok(Vec::new())),
+        });
+        let out = at_head(&mut h, out);
+        let (cas, lease_written) = s3_ops(&out)
+            .into_iter()
+            .find_map(|(op, r)| match r {
+                S3Op::LeaseSwap { lease, .. } => Some((op, lease.clone())),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no CAS in {out:?}"));
+        assert_eq!(lease_written.epoch, 2);
+        let inherited = lease_written
+            .inherited_tail
+            .clone()
+            .expect("names the group");
+        assert_eq!(inherited.epoch, 1);
+        assert_eq!(inherited.members, vec![1, 2, 3]);
+        assert_eq!(inherited.through, txs.last().unwrap().last);
+        // Won: the gate applies the tail, the marker says so.
+        let out = h.step(Event::S3 {
+            op: cas,
+            result: S3Result::LeasePut(Ok(tag())),
+        });
+        let put = s3_ops(&out)
+            .into_iter()
+            .find_map(|(_, r)| match r {
+                S3Op::SegmentPut { payload, .. } => Some(payload.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no marker in {out:?}"));
+        let seg = crate::segment::decode(&put).unwrap();
+        assert!(
+            seg.records
+                .iter()
+                .any(|r| matches!(r, LogRecord::TailFollows { prev_epoch: 1 })),
+            "{:?}",
+            seg.records
+        );
+        assert_eq!(h.core.stats.ttl_claims_without_tail, 0);
+    }
+
+    /// Nobody answers: the claim waits (G4), however long, and says so;
+    /// no CAS is ever issued. The operator's abandon lets it go on, and its
+    /// marker says so. Fails on the parent: it claimed without the tail.
+    #[test]
+    fn no_member_answering_the_tail_fetch_holds_the_claim() {
+        let h0 = Harness::new(3);
+        let lease = expired(&h0, vec![2]);
+        let (mut h, out) = claimant(3, &lease);
+        let asked = seal_tails(&out);
+        assert_eq!(asked.len(), 2);
+        // Both fail (the transport says so) or say nothing.
+        h.step(Event::PeerFailed {
+            req: asked[0].1,
+            to: asked[0].0,
+            outage: true,
+        });
+        let waiting = h.core.waiting_for_group(h.clk()).expect("waiting");
+        assert_eq!(waiting.epoch, 1);
+        assert_eq!(waiting.sources, vec![1, 2]);
+        let wake = timers(&out, TimerKind::JobRequestTimeout)[0];
+        h.advance(h.core.cfg.backup_takeover_ms);
+        let out = h.step(Event::Timer { id: wake });
+        assert!(
+            s3_ops(&out)
+                .iter()
+                .all(|(_, r)| !matches!(r, S3Op::LeaseSwap { .. })),
+            "{out:?}"
+        );
+        // (Between attempts the wait is reported while an op of this node
+        // waits for the lease; none does here.)
+        // The acquisition retries (the ops behind it), and asks again, and
+        // again: the same attempt, never a CAS.
+        for round in 0..3 {
+            let acquire = h.step(Event::Control {
+                op: OpId(710 + round),
+                req: Control::Acquire,
+            });
+            let get = find_s3(&acquire, |r| matches!(r, S3Op::LeaseGet));
+            let out = h.step(Event::S3 {
+                op: get,
+                result: S3Result::LeaseGet(Ok(Some((lease.clone(), tag())))),
+            });
+            assert_eq!(seal_tails(&out).len(), 2, "asked again: {out:?}");
+            let wake = timers(&out, TimerKind::JobRequestTimeout)[0];
+            h.advance(h.core.cfg.backup_takeover_ms);
+            let out = h.step(Event::Timer { id: wake });
+            assert!(s3_ops(&out)
+                .iter()
+                .all(|(_, r)| !matches!(r, S3Op::LeaseSwap { .. })));
+        }
+        assert_eq!(h.core.stats.ttl_claims_without_tail, 0);
+        assert!(h.core.stats.tail_fetch_attempts >= 4);
+        // The operator: the group is gone for good.
+        let out = h.step(Event::Control {
+            op: OpId(800),
+            req: Control::AbandonGroup { epoch: 1, gen: 0 },
+        });
+        assert!(
+            out.iter().any(|a| matches!(
+                a,
+                Action::ControlDone {
+                    op: OpId(800),
+                    result: Ok(_)
+                }
+            )),
+            "{out:?}"
+        );
+        let acquire = h.step(Event::Control {
+            op: OpId(711),
+            req: Control::Acquire,
+        });
+        let get = find_s3(&acquire, |r| matches!(r, S3Op::LeaseGet));
+        let out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((lease.clone(), tag())))),
+        });
+        assert!(seal_tails(&out).is_empty(), "no more asking: {out:?}");
+        let tail = find_s3(&out, |r| matches!(r, S3Op::SegmentRun { .. }));
+        let out = h.step(Event::S3 {
+            op: tail,
+            result: S3Result::SegmentRun(Ok(Vec::new())),
+        });
+        let out = at_head(&mut h, out);
+        let cas = find_s3(&out, |r| matches!(r, S3Op::LeaseSwap { .. }));
+        assert_eq!(h.core.stats.groups_abandoned, 1);
+        let out = h.step(Event::S3 {
+            op: cas,
+            result: S3Result::LeasePut(Ok(tag())),
+        });
+        let put = s3_ops(&out)
+            .into_iter()
+            .find_map(|(_, r)| match r {
+                S3Op::SegmentPut { payload, .. } => Some(payload.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no marker in {out:?}"));
+        let seg = crate::segment::decode(&put).unwrap();
+        assert!(
+            seg.records.iter().any(|r| matches!(
+                r,
+                LogRecord::GroupAbandoned {
+                    epoch: 1,
+                    gen: 0,
+                    ..
+                }
+            )),
+            "{:?}",
+            seg.records
+        );
+        assert_eq!(
+            h.core.stats.ttl_claims_without_tail, 0,
+            "an abandon is the documented branch"
+        );
+    }
+
+    /// The report of a wait ends when the lease moved on (a renewal, another
+    /// claim: another key than the one the claim was for), and while no op of
+    /// this node needs the claim. Fails on a report that outlived its claim
+    /// (`long-backup` seed 50126 ended "waiting" after node 1 re-took its
+    /// lease).
+    #[test]
+    fn a_wait_for_a_group_ends_when_the_lease_moves_on() {
+        let h0 = Harness::new(3);
+        let lease = expired(&h0, vec![2]);
+        let (mut h, _) = claimant(3, &lease);
+        assert!(h.core.waiting_for_group(h.clk()).is_some());
+        let renewed = Lease {
+            holder_wait_ms: lease.holder_wait_ms + 5_000,
+            ..lease.clone()
+        };
+        h.core.note_group_wait_lease(&lease);
+        assert!(
+            h.core.waiting_for_group(h.clk()).is_some(),
+            "the same key: still waiting"
+        );
+        h.core.note_group_wait_lease(&renewed);
+        assert!(h.core.waiting_for_group(h.clk()).is_none());
+    }
+
+    /// The abandon is refused unless a claim waits for that epoch's group.
+    #[test]
+    fn abandon_group_is_refused_unless_waiting() {
+        let mut h = Harness::new(3);
+        let refused = |out: &[Action]| {
+            out.iter().any(|a| {
+                matches!(
+                    a,
+                    Action::ControlDone {
+                        result: Err(e),
+                        ..
+                    } if e.contains("not waiting")
+                )
+            })
+        };
+        let out = h.step(Event::Control {
+            op: OpId(800),
+            req: Control::AbandonGroup { epoch: 1, gen: 0 },
+        });
+        assert!(refused(&out), "{out:?}");
+        // Waiting for epoch 1's group: another epoch is refused, a
+        // generation of a delegation is C2's.
+        let lease = expired(&h, vec![2]);
+        let (mut h, _) = claimant(3, &lease);
+        let out = h.step(Event::Control {
+            op: OpId(801),
+            req: Control::AbandonGroup { epoch: 2, gen: 0 },
+        });
+        assert!(refused(&out), "{out:?}");
+        let out = h.step(Event::Control {
+            op: OpId(802),
+            req: Control::AbandonGroup { epoch: 1, gen: 3 },
+        });
+        assert!(
+            out.iter()
+                .any(|a| matches!(a, Action::ControlDone { result: Err(_), .. })),
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.groups_abandoned, 0);
+    }
+
+    /// A listed backup that claims at the expiry (it never sealed) seals
+    /// before its CAS: the group commits nothing more of the epoch while
+    /// the lease is taken. Fails on the parent: it claimed unsealed.
+    #[test]
+    fn a_listed_backup_seals_before_claiming_at_expiry() {
+        let mut h = Harness::new(2);
+        h.core.cfg.takeover_promise_check = false;
+        let txs = tail_of(1);
+        h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::BackupAppend {
+                req: OpId(1),
+                epoch: 1,
+                holder: 1,
+                config_version: 2,
+                candidacy: 1,
+                from: 1,
+                txs,
+                through: 0,
+
+                sent_ms: 0,
+
+                expires_ms: 0,
+
+                clock: 0,
+            },
+        });
+        assert_eq!(h.core.bk.sealed, 0);
+        let lease = expired(&h, vec![2]);
+        h.watch(&lease);
+        let out = h.step(Event::Control {
+            op: OpId(700),
+            req: Control::Acquire,
+        });
+        let get = find_s3(&out, |r| matches!(r, S3Op::LeaseGet));
+        let out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((lease.clone(), tag())))),
+        });
+        // It holds the tail: no fetch; the takeover tails the log first.
+        assert!(seal_tails(&out).is_empty(), "{out:?}");
+        let tail = find_s3(&out, |r| matches!(r, S3Op::SegmentRun { .. }));
+        assert_eq!(h.core.bk.sealed, 0, "sealed only at the CAS");
+        let out = h.step(Event::S3 {
+            op: tail,
+            result: S3Result::SegmentRun(Ok(Vec::new())),
+        });
+        let out = at_head(&mut h, out);
+        let (_, written) = s3_ops(&out)
+            .into_iter()
+            .find_map(|(op, r)| match r {
+                S3Op::LeaseSwap { lease, .. } => Some((op, lease.clone())),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no CAS in {out:?}"));
+        assert_eq!(h.core.bk.sealed, 1, "the role is sealed before the CAS");
+        assert_eq!(h.meta.backup_sealed_epoch().unwrap(), 1, "persisted");
+        assert_eq!(
+            written.inherited_tail.map(|t| t.members),
+            Some(vec![1, 2]),
+            "the claim re-ships the tail and says whose it was"
+        );
+    }
+
+    /// A member answers `SealTail` for the epoch it holds, never for
+    /// another; a backup accepts any configuration version at or above the
+    /// one it holds (D8).
+    #[test]
+    fn seal_tail_for_another_epoch_is_refused() {
+        let mut h = Harness::new(2);
+        h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::BackupAppend {
+                req: OpId(1),
+                epoch: 3,
+                holder: 1,
+                config_version: 4,
+                candidacy: 1,
+                from: 1,
+                txs: tail_of(1),
+                through: 0,
+
+                sent_ms: 0,
+
+                expires_ms: 0,
+
+                clock: 0,
+            },
+        });
+        for (epoch, cv, held) in [(2, 4, false), (4, 4, false), (3, 3, false), (3, 4, true)] {
+            let out = seal_tail(&mut h, 3, epoch, cv, 0);
+            assert_eq!(sealed(&out).len(), 1, "{out:?}");
+            assert_eq!(sealed(&out)[0].1, held, "epoch {epoch} cv {cv}");
+            if !held {
+                assert!(
+                    h.core.bk.sealed < epoch.max(1) || epoch != 3,
+                    "a refused ask seals nothing"
+                );
+            }
+        }
+        assert_eq!(h.core.bk.sealed, 3);
+    }
+
+    /// D8: a claimant that read a newer configuration (the backup was
+    /// listed at version `v`, and holds the role of `v - 1`) is answered.
+    #[test]
+    fn seal_tail_from_a_newer_config_version_is_accepted() {
+        let mut h = Harness::new(2);
+        h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::BackupAppend {
+                req: OpId(1),
+                epoch: 1,
+                holder: 1,
+                config_version: 2,
+                candidacy: 1,
+                from: 1,
+                txs: tail_of(1),
+                through: 0,
+
+                sent_ms: 0,
+
+                expires_ms: 0,
+
+                clock: 0,
+            },
+        });
+        let out = seal_tail(&mut h, 3, 1, 3, 0);
+        assert!(sealed(&out)[0].1, "{out:?}");
+        assert_eq!(h.core.bk.sealed, 1);
+        // And again: idempotent, the same tail.
+        let out = seal_tail(&mut h, 3, 1, 3, 0);
+        assert!(sealed(&out)[0].1);
+        assert_eq!(sealed(&out)[0].2, 1);
+    }
+
+    /// The tail goes in batches of `backup_batch_rows`, each asked from
+    /// where the last ended; the claimant stitches them.
+    #[test]
+    fn sealed_tail_is_sent_in_batches() {
+        let mut h = Harness::new(2);
+        h.core.cfg.backup_batch_rows = 4;
+        let txs = tail_of(5);
+        let rows: usize = txs.iter().map(|t| t.records.len()).sum();
+        assert!(rows > 4, "a tail longer than a batch: {rows} rows");
+        h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::BackupAppend {
+                req: OpId(1),
+                epoch: 1,
+                holder: 1,
+                config_version: 2,
+                candidacy: 1,
+                from: 1,
+                txs: txs.clone(),
+                through: 0,
+
+                sent_ms: 0,
+
+                expires_ms: 0,
+
+                clock: 0,
+            },
+        });
+        let mut got = 0usize;
+        let mut at = 0;
+        let mut batches = 0;
+        loop {
+            let out = seal_tail(&mut h, 3, 1, 2, at);
+            let (_, held, n, through, next) = sealed(&out)[0];
+            assert!(held);
+            assert_eq!(through, txs.last().unwrap().last);
+            got += n;
+            batches += 1;
+            match next {
+                Some(n) => at = n,
+                None => break,
+            }
+        }
+        assert_eq!(got, txs.len(), "every transaction exactly once");
+        assert!(batches > 1, "more than one batch");
+        // The claimant side: stitched from the batches in order.
+        let h0 = Harness::new(3);
+        let lease = expired(&h0, vec![2]);
+        let (mut c, out) = claimant(3, &lease);
+        c.core.cfg.backup_batch_rows = 4;
+        let asked = seal_tails(&out);
+        let (_, req2, ..) = *asked.iter().find(|a| a.0 == 2).unwrap();
+        let (first, rest) = txs.split_at(2);
+        let out = c.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::SealedTail {
+                req: req2,
+                epoch: 1,
+                held: true,
+                txs: first.to_vec(),
+                through: txs.last().unwrap().last,
+                next: Some(rest[0].first),
+            },
+        });
+        let more = seal_tails(&out);
+        assert_eq!(
+            more.len(),
+            1,
+            "the next batch is asked of the same member: {out:?}"
+        );
+        assert_eq!((more[0].0, more[0].4), (2, rest[0].first));
+        assert_eq!(c.core.stats.tail_fetches, 0);
+        c.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::SealedTail {
+                req: more[0].1,
+                epoch: 1,
+                held: true,
+                txs: rest.to_vec(),
+                through: txs.last().unwrap().last,
+                next: None,
+            },
+        });
+        assert_eq!(c.core.stats.tail_fetches, 1);
+        assert_eq!(c.meta.backup_tail(1).unwrap().len(), txs.len());
+    }
+
+    /// A holder asked for its tail seals its own epoch: it keeps its rows
+    /// as a member copy, aborts what waits for the group, and
+    /// acknowledges nothing of the epoch again (a late acknowledgement of
+    /// its backup releases no answer). Fails on the parent: it ignored the
+    /// request and went on acknowledging.
+    #[test]
+    fn a_holder_that_answered_seal_tail_acknowledges_nothing_more() {
+        let (mut h, _) = listed_holder();
+        let rid = h.rid(2);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: h.create("r"),
+            tag: Default::default(),
+        });
+        assert!(replies(&out).is_empty(), "parked for the backup");
+        let tip = h.meta.journal_tip().unwrap();
+        let append = sends(&out)
+            .into_iter()
+            .find_map(|(_, m)| match m {
+                PeerMsg::BackupAppend { req, .. } => Some(*req),
+                _ => None,
+            })
+            .expect("the row is streamed");
+        let out = seal_tail(&mut h, 3, 1, 2, 0);
+        let (to, held, n, through, next) = sealed(&out)[0];
+        assert_eq!((to, held, next), (3, true, None));
+        assert!(n >= 1 && through == tip, "the row is in the tail: {out:?}");
+        assert!(h.core.lease.lost && h.core.lease.held.is_none(), "deposed");
+        assert_eq!(h.core.bk.sealed, 1);
+        assert_eq!(h.meta.backup_sealed_epoch().unwrap(), 1);
+        assert!(h.meta.member_copy(1).unwrap().is_some());
+        // The parked answer is aborted (the client's retry by rid, not an
+        // answer), and the backup's late acknowledgement releases nothing.
+        assert!(replies(&out).is_empty(), "{out:?}");
+        assert!(
+            timers(&out, TimerKind::ForwardBackoff).len() == 1,
+            "the op goes on to retry by rid: {out:?}"
+        );
+        let out = super::c1_counted::ack(&mut h, append, tip, false);
+        assert!(
+            replies(&out).is_empty(),
+            "nothing is acknowledged after the seal: {out:?}"
+        );
+        assert!(!h.core.ack_gated());
+        assert_eq!(h.core.stats.seal_tail_holder, 1);
+    }
+
+    /// D7: the self-sealed holder recovers at once and, once its lease
+    /// expired and nobody claimed it, claims it at the *next* epoch (never
+    /// reviving the one it sealed), its own member copy being the tail it
+    /// re-ships — and the lease says whose it was.
+    #[test]
+    fn a_self_sealed_holder_recovers_and_claims_its_own_expired_lease_at_the_next_epoch() {
+        let (mut h, _) = listed_holder();
+        h.core.cfg.takeover_promise_check = false;
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: h.rid(2),
+            op: h.create("r"),
+            tag: Default::default(),
+        });
+        seal_tail(&mut h, 3, 1, 2, 0);
+        assert!(h.core.lease.lost);
+        // The recovery round runs (strand, clear lost).
+        h.meta.strand_below_epoch(2).unwrap();
+        h.meta.set_holder_epoch(0);
+        h.core.lease.clear_lost();
+        h.meta.persist_lost(false).unwrap();
+        // Its own lease, expired, listing node 2.
+        let lease = Lease {
+            backups: vec![2],
+            ack_policy: AckPolicy::Backup,
+            config_version: 2,
+            ..lease_of(1, 1, h.now.0 - 1)
+        };
+        h.watch(&lease);
+        let out = h.step(Event::Control {
+            op: OpId(700),
+            req: Control::Acquire,
+        });
+        let get = find_s3(&out, |r| matches!(r, S3Op::LeaseGet));
+        let out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((lease, tag())))),
+        });
+        assert!(seal_tails(&out).is_empty(), "its own copy: {out:?}");
+        let tail = find_s3(&out, |r| matches!(r, S3Op::SegmentRun { .. }));
+        let out = h.step(Event::S3 {
+            op: tail,
+            result: S3Result::SegmentRun(Ok(Vec::new())),
+        });
+        let out = at_head(&mut h, out);
+        let written = s3_ops(&out)
+            .into_iter()
+            .find_map(|(_, r)| match r {
+                S3Op::LeaseSwap { lease, .. } => Some(lease.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no CAS in {out:?}"));
+        assert_eq!(written.epoch, 2, "never the epoch it sealed");
+        assert_eq!(written.holder, 1);
+        let t = written.inherited_tail.expect("re-ships its own tail");
+        assert_eq!((t.epoch, t.members), (1, vec![1, 2]));
+        assert_eq!(
+            h.meta.backup_tail(1).unwrap().len(),
+            2.max(h.meta.backup_tail(1).unwrap().len())
+        );
+        assert!(!h.meta.backup_tail(1).unwrap().is_empty());
+    }
+
+    /// D2: a lease whose tenure re-ships a predecessor's tail (and lists no
+    /// backup yet) is claimed with a fetch from its holder at its own epoch
+    /// and from the inherited group at the inherited one.
+    #[test]
+    fn a_claim_of_a_lease_with_an_inherited_tail_fetches_it() {
+        let h0 = Harness::new(3);
+        let lease = Lease {
+            holder: 2,
+            epoch: 2,
+            config_version: 1,
+            inherited_tail: Some(Box::new(InheritedTail {
+                epoch: 1,
+                config_version: 2,
+                members: vec![1, 2],
+                through: 7,
+            })),
+            ..lease_of(2, 2, h0.now.0 - 1)
+        };
+        let (_h, out) = claimant(3, &lease);
+        let mut asked: Vec<(NodeId, Epoch, u64)> =
+            seal_tails(&out).iter().map(|a| (a.0, a.2, a.3)).collect();
+        asked.sort();
+        assert_eq!(
+            asked,
+            vec![(1, 1, 2), (2, 1, 2), (2, 2, 1)],
+            "the holder at its epoch, the inherited group at its: {out:?}"
+        );
+        // Without the field, a `Local` lease is anyone's at once.
+        let plain = lease_of(2, 2, h0.now.0 - 1);
+        let (_h, out) = claimant(3, &plain);
+        assert!(seal_tails(&out).is_empty(), "{out:?}");
+    }
+
+    /// D2: the lease names the tail until the log carries it: the first
+    /// renewal after the journal shipped through its last row clears it.
+    #[test]
+    fn the_inherited_tail_is_cleared_once_the_log_carries_it() {
+        let mut h = Harness::new(1);
+        h.hold(2, None);
+        let inherited = InheritedTail {
+            epoch: 1,
+            config_version: 2,
+            members: vec![1, 2],
+            through: 5,
+        };
+        h.core.lease.held.as_mut().unwrap().0.inherited_tail = Some(Box::new(inherited));
+        let mut lease = h.core.lease.held.as_ref().unwrap().0.clone();
+        h.core.ack.inherited_last = Some(5);
+        h.core.ack.shipped_through = 4;
+        h.core.clear_covered_tail(&mut lease);
+        assert!(lease.inherited_tail.is_some(), "row 5 is not shipped yet");
+        h.core.ack.shipped_through = 5;
+        h.core.lease.gate = Some(PendingGate {
+            epoch: 2,
+            takeover: true,
+            marker_shipped: false,
+            drained: false,
+            fast_prev: false,
+            backup_tail_epoch: None,
+            shippable: false,
+        });
+        h.core.clear_covered_tail(&mut lease);
+        assert!(lease.inherited_tail.is_some(), "the gate is not done");
+        h.core.lease.gate = None;
+        h.core.clear_covered_tail(&mut lease);
+        assert!(lease.inherited_tail.is_none());
+        assert_eq!(h.core.stats.inherited_tails_cleared, 1);
     }
 }
 

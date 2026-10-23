@@ -1,5 +1,25 @@
 {
   "$defs": {
+    "AbandonGroupParams": {
+      "description": "`lease.abandon_group` (plan 43 C1-3): the lease claim that waits for the\ntail of `epoch`'s backup group goes on without it. `gen` names the group\nwithin the epoch; only 0 (the root group) is accepted for now.",
+      "properties": {
+        "epoch": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "gen": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "epoch"
+      ],
+      "type": "object"
+    },
     "Ack": {
       "description": "A method's `Ok` result when the only news is a human-readable summary\n(the old `Response::Ok { detail }`). Methods whose outcome has an\nobvious structure return that instead.",
       "properties": {
@@ -215,6 +235,13 @@
         "longest_step_ms": {
           "default": 0,
           "description": "The authority core's longest step since the mount (ms) and its\nevent's kind, and the longest within the last minute or two: a\nholder whose driver is held in one step past\n`CONSTELLATION_HOLDER_STALL_MS` stops its heartbeat and is sealed,\nso this is the tail that bound must stay above.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "member_copies": {
+          "default": 0,
+          "description": "How many member copies of sealed epochs this node keeps (plan 43\nC1-3).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -4121,6 +4148,18 @@
         "lost": {
           "description": "This node was deposed: it refuses to ship and its unshipped\njournal is stranded pending reintegration.",
           "type": "boolean"
+        },
+        "waiting_for_group": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WaitingForGroupStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "A claim of the lease waits for the tail of an old group (plan 43\nC1-3); `null` when nothing waits. `constellation repair\nabandon-group --epoch E` lets it go on without the tail."
         }
       },
       "required": [
@@ -9934,6 +9973,38 @@
       ],
       "type": "object"
     },
+    "WaitingForGroupStatus": {
+      "description": "`status.lease.waiting_for_group`: the claim waits for the tail of\n`epoch`'s group, which none of `sources` has answered with yet.",
+      "properties": {
+        "epoch": {
+          "description": "The epoch of the lease whose group's tail is awaited.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sources": {
+          "description": "The members asked.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "waited_ms": {
+          "description": "How long this claim has waited (ms).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "epoch",
+        "waited_ms",
+        "sources"
+      ],
+      "type": "object"
+    },
     "Welcome": {
       "description": "Server → client, the answer to `Hello`. Always JSON.",
       "properties": {
@@ -10523,6 +10594,17 @@
       },
       "result": {
         "$ref": "#/$defs/GcReport"
+      },
+      "streaming": "none"
+    },
+    "lease.abandon_group": {
+      "min_role": "admin",
+      "mutating": true,
+      "params": {
+        "$ref": "#/$defs/AbandonGroupParams"
+      },
+      "result": {
+        "$ref": "#/$defs/Ack"
       },
       "streaming": "none"
     },

@@ -612,6 +612,12 @@ for the vocabulary.
 
 ### Local store
 
+(Each journal row records the class its answer waits for, `RowClass`, decided
+when the row is journaled; a row answered without a commit is re-tagged
+`Lone`; plan 43 C1-2. A holder sealed by a claimant keeps its unshipped
+rows in the `member_copy` part of the backup keyspace, apart from the tail it
+holds as a backup; C1-3.)
+
 Every node keeps a **full metadata replica** in [fjall](https://github.com/fjall-rs/fjall)
 3, an LSM key-value store (plan 29,
 [29-fjall-metadata-engine.md](../plans/v1/done/29-fjall-metadata-engine.md);
@@ -1523,6 +1529,18 @@ taker's marker, so any peer may take a silent holder over (silence is
 read from its log stream, so this needs P2P); a holder that renewed its
 lease recently has proven it reaches S3 and keeps it.
 
+A lease claimed **by TTL** carries the group's tail too (plan 43 C1-3): a
+claimant of a `Backup` lease first asks the holder and every listed
+backup for their sealed tail (`SealTail`; the member persists a seal
+before it answers, so its group commits nothing more of the epoch),
+re-ships the first answer as a seal takeover would, and waits while no
+member answers; only `constellation repair abandon-group` lets it go on
+without. A tenure that re-ships a predecessor's tail names the old group
+in its lease (`inherited_tail`) until its journal shipped through the
+rows, so a successor that dies first does not take the last copies of
+acknowledged rows with it. A holder that sealed itself keeps its rows as
+a member copy and re-claims at the next epoch.
+
 A fast successor (seal or `ack=s3`) waits out the previous tenure's
 read-delegation and lock grants before it acknowledges a mutation or
 grants a lock, and accepts lock reclaims meanwhile. A TTL successor has
@@ -1585,7 +1603,8 @@ and a blocking one keeps retrying.
 |---|---|
 | node crash | journal, speculation, backup tail, seals, promises and epoch state reload from the local store; stranded ops replay by rid; dirty chunks re-upload; the lease is re-acquired or expires |
 | forward times out (holder slow or gone) | same-rid retries, then the inbox (no P2P path) or the lease path; resolved exactly once; `EIO` at the client deadline (2 × TTL), never a re-execution |
-| holder deposed (it lost the lease while alive) | it rolls its unshipped journal back and replays it by rid through the new holder; only true overlaps become conflict copies |
+| holder deposed (it lost the lease while alive) | it rolls its unshipped journal back and replays it by rid through the new holder; only true overlaps become conflict copies. (A holder asked for its tail by a claimant of its expired lease deposes itself first and keeps the rows as a member copy, plan 43 C1-3.) |
+| holder and its backup both down past the lease's end | the claim of the lease waits (`status.lease.waiting_for_group`) until one of them answers a `SealTail`; the operator may abandon the group (`repair abandon-group`), and the rows it acknowledged are then lost |
 | P2P down, S3 up | everything works through the lease path and the S3 inbox, minus backups, delegations, strict ReadIndex, cluster locks and fast takeover |
 | clock skew | rate: each node's oscillator within its budget (0.1 % by default, C7a: paid by the honour and wait readings, so every local window is exact); offsets: the lease is judged by each claimant's own observation (C7b commit 3: none assumed); delegation, read-delegation and lock timing across nodes still assume `margin > 2 × drift` (±500 ms at the defaults; C7b replaces them); correctness otherwise relies on CAS ordering, never wall clocks; steps: none (C7-H1: holders measure on the honour clock, waiters on the wait clock) |
 | cache disk full | evict clean → throttle → ENOSPC (reads still stream uncached) |

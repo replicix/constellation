@@ -304,6 +304,10 @@ fn replay_seed() {
         },
         Ok("acks3-crash") => ack_s3_crash_config(),
         Ok("backup-departs") => backup_departs_config(),
+        Ok("backup-group-cut-ttl") => backup_group_cut_ttl_config(GroupCut::Both),
+        Ok("backup-group-cut-ttl-holder-only") => backup_group_cut_ttl_config(GroupCut::HolderOnly),
+        Ok("backup-group-cut-ttl-backup-only") => backup_group_cut_ttl_config(GroupCut::BackupOnly),
+        Ok("backup-chain-ttl") => backup_chain_ttl_config(),
         Ok("backup-partition") => backup_partition_config(),
         Ok("backup-reconfig-doubt") => backup_reconfig_doubt_config(),
         Ok("long-backup") => long_backup_config(),
@@ -1631,6 +1635,144 @@ fn ack_s3_crash_config() -> SimConfig {
     SimConfig {
         core: std::sync::Arc::new(sim::run::ack_s3_core_config),
         ..backup_crash_config()
+    }
+}
+
+/// What else happens to the group while it is cut off
+/// ([`backup_group_cut_ttl_config`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GroupCut {
+    /// Both members come back at the heal.
+    Both,
+    /// The backup crashes for good during the cut: the holder is the one
+    /// member the claimant can fetch from.
+    HolderOnly,
+    /// The holder crashes for good during the cut: the backup is.
+    BackupOnly,
+}
+
+/// Plan 43 C1-3 (`backup-group-cut-ttl`): three nodes; 1 the holder, 2 its
+/// backup (their RTT within the budget), 3 beyond it. At 1.5 s both are cut
+/// from S3 and from node 3 for the lease TTL plus four takeover windows
+/// (10 s at `backup_core_config`), then healed. The lease runs out
+/// meanwhile; node 3 reaches it past the backups' grace and, before, claimed
+/// by TTL without the tail the group had acknowledged: the holder's rows
+/// came back as replays by rid after ops invoked later. Now the claim asks
+/// the group for its tail (`SealTail`), waits while neither member answers,
+/// and fetches it at the heal.
+fn backup_group_cut_ttl_config(cut: GroupCut) -> SimConfig {
+    let for_ms = 6_000 + 4 * 1_000;
+    let mut faults = vec![
+        ScheduledFault {
+            at_ms: 1_500,
+            kind: FaultKind::CutS3 { node: 1, for_ms },
+        },
+        ScheduledFault {
+            at_ms: 1_500,
+            kind: FaultKind::CutS3 { node: 2, for_ms },
+        },
+        ScheduledFault {
+            at_ms: 1_500,
+            kind: FaultKind::Partition { a: 1, b: 3, for_ms },
+        },
+        ScheduledFault {
+            at_ms: 1_500,
+            kind: FaultKind::Partition { a: 2, b: 3, for_ms },
+        },
+    ];
+    match cut {
+        GroupCut::Both => {}
+        GroupCut::HolderOnly => faults.push(ScheduledFault {
+            at_ms: 3_000,
+            kind: FaultKind::CrashNode {
+                node: 2,
+                restart_ms: None,
+                keep_journal: true,
+            },
+        }),
+        GroupCut::BackupOnly => faults.push(ScheduledFault {
+            at_ms: 3_000,
+            kind: FaultKind::CrashNode {
+                node: 1,
+                restart_ms: None,
+                keep_journal: true,
+            },
+        }),
+    }
+    SimConfig {
+        nodes: 3,
+        clients_per_node: 2,
+        ops_per_client: 40,
+        random_faults: 0,
+        join_fresh: false,
+        rtts: vec![((1, 3), 120), ((2, 3), 120)],
+        faults,
+        // The schedule is the test: a rebooted backup or a stepped clock
+        // from the default mix would drop the listed backup before the cut
+        // and leave a lone holder (the lone branch, plan 43 C5's).
+        clock_faults: false,
+        ..backup_config()
+    }
+}
+
+/// Plan 43 C1-3 (`backup-chain-ttl`, D2's fail-before): holder 1 is cut
+/// from S3 and from node 2 at 1.5 s, so that 2 seals its epoch and takes it
+/// over, re-shipping the tail (its lease lists no backup yet); the rule
+/// fails every segment PUT of 2 after its marker, and 2 crashes the moment
+/// it holds that tail unshipped (restart after the TTL and four windows).
+/// Node 3 claims 2's `Local` lease by TTL: the lease names the old group
+/// (`inherited_tail`), and 3 fetches the tail from it (node 1 still holds
+/// its rows, or node 2 once it is back) instead of claiming without it.
+fn backup_chain_ttl_config() -> SimConfig {
+    let for_ms = 6_000 + 4 * 1_000;
+    SimConfig {
+        nodes: 3,
+        clients_per_node: 2,
+        ops_per_client: 40,
+        random_faults: 0,
+        join_fresh: false,
+        rtts: vec![((1, 3), 120), ((2, 3), 120)],
+        faults: vec![
+            ScheduledFault {
+                at_ms: 1_500,
+                kind: FaultKind::CutS3 {
+                    node: 1,
+                    for_ms: 40_000,
+                },
+            },
+            ScheduledFault {
+                at_ms: 1_500,
+                kind: FaultKind::Partition {
+                    a: 1,
+                    b: 2,
+                    for_ms: 40_000,
+                },
+            },
+            ScheduledFault {
+                at_ms: 2_000,
+                kind: FaultKind::S3RuleFor {
+                    rule: Rule::new(
+                        Some(2),
+                        OpKind::Put,
+                        "log/",
+                        When::From(2),
+                        Fault::Status(500),
+                    ),
+                    for_ms: 40_000,
+                },
+            },
+            ScheduledFault {
+                at_ms: 2_000,
+                kind: FaultKind::CrashWhenTailUnshipped {
+                    node: 2,
+                    within_ms: 20_000,
+                    restart_ms: Some(for_ms),
+                },
+            },
+        ],
+        // (As `backup_group_cut_ttl_config`.)
+        clock_faults: false,
+        ..backup_config()
     }
 }
 
@@ -3235,36 +3377,35 @@ fn backup_partition_reconfigures_or_seals() {
 /// holds (enforced).
 #[test]
 fn fast_failover_with_delegations_keeps_close_to_open() {
-    // (1389 is a double fault the TTL path cannot survive yet:
-    // `backup_strict_double_fault_known_gap`.)
-    let seeds = (1300..1500).filter(|s| !BACKUP_STRICT_DOUBLE_FAULT.contains(s));
+    let seeds = 1300..1500;
     let t = run_m9("backup-strict", backup_strict_config(), seeds);
     assert!(t.backup_takeovers >= 15, "{t:?}");
     assert!(t.ack_floor_waits >= 10, "the successor never waited: {t:?}");
 }
 
-/// The seeds of `backup-strict` that end in plan 30 §M9's double fault.
-const BACKUP_STRICT_DOUBLE_FAULT: [u64; 1] = [1389];
-
-/// Known gap (plan 43 C1-3, the TTL path's tail fetch): `backup-strict` seed
-/// 1389 under the default clock-fault mix. The holder (node 2, its backup
-/// node 1) crashes at 1.5 s; the mix reboots node 1 at 1.8 s and pauses it
-/// from 4.7 s to 9.3 s, so no backup seals, and node 3 takes the lease over by
-/// TTL once the backups' claim grace has passed too (8.3 s): plan 30 §M9's
-/// double fault, in which the tail the backup holds is lost. Node 2 restarts
-/// at 8.5 s and replays the acknowledged rows its journal kept, after ops
-/// invoked later: linearizability fails. On main node 3's next attempt came
-/// after node 2's restart (its backoff); plan 43 C7b's retry hint makes it at
-/// the instant its observation lets it claim, 0.3 s earlier. C1-3 makes a
-/// TTL successor fetch the tail; then move the seed back.
+/// `backup-strict` seed 1389 under the default clock-fault mix (pinned as a
+/// known gap by plan 43 C7b, unpinned by C1-3). The holder (node 2, its
+/// backup node 1) crashes at 1.5 s; the mix reboots node 1 at 1.8 s and
+/// pauses it from 4.7 s to 9.3 s, so no backup seals, and node 3 reaches the
+/// point where it may claim the lease by TTL (8.3 s, past the backups' claim
+/// grace) before node 2 restarts (8.5 s). Plan 30 §M9's double fault: the
+/// tail the backup holds was lost, node 2 replayed the acknowledged rows its
+/// journal kept after ops invoked later, linearizability failed. Now node 3
+/// asks the group for its tail first and waits (it claims nothing without
+/// it): the seed passes the strict checks, and no claim carried no tail.
 #[test]
-#[ignore = "known gap: plan 43 C1-3 (the TTL path's tail fetch)"]
-fn backup_strict_double_fault_known_gap() {
-    for seed in BACKUP_STRICT_DOUBLE_FAULT {
-        let e = run_seed(seed, backup_strict_config())
-            .expect_err("fixed? then move the seed back into the range");
-        assert!(e.contains("returned before"), "seed {seed}: {e}");
-    }
+fn backup_strict_1389_waits_for_the_group() {
+    let r = run_seed(1389, backup_strict_config()).unwrap_or_else(|e| {
+        panic!("seed 1389: {e}\n  replay with AUTHORITY_SIM_CONFIG=backup-strict")
+    });
+    let sum =
+        |f: fn(&constellation_authority::Stats) -> u64| -> u64 { r.stats.values().map(f).sum() };
+    assert_eq!(sum(|s| s.ttl_claims_without_tail), 0);
+    assert!(
+        sum(|s| s.tail_fetch_attempts) > 0,
+        "node 3 never asked the group: {:?}",
+        r.stats
+    );
 }
 
 /// Plan 30 §M9: backup-acked transactions reach subscribers ahead of S3
@@ -3634,21 +3775,20 @@ fn a_backup_lapsing_at_its_holders_expiry_still_claims_in_time() {
 /// The lag-at-expiry configurations with a `Pause` of the cut holder's
 /// backup on top (plan 43 C7a's clock-fault mix found them as a suspend:
 /// seeds 5, 275 and 277): the backup seals, or is about to, and stands
-/// still past the claim grace; the third node claims the lapsed lease by
-/// TTL from a log without the tail, and the rows both copies held come
-/// back as the deposed holder's replays by rid, after ops invoked later
-/// ("returned before ... but follows it in the log"). Two failures — the
-/// holder cut from S3 and its backup stopped — are beyond one backup's
-/// budget: the run records them (`Cluster::note_s3_cut`) and waives strict
-/// durability, so the acknowledged ops rolled back are tentative (they
-/// need not be in the log, nor in real-time order); every other check
-/// stays. Before, the cut holder counted as a live
-/// copy and these runs failed. The same pause of the holder itself or of
-/// the third node is no second failure: nothing is recorded. (Plan 43 C1
-/// deletes the TTL claim without the tail and this relaxation with it:
-/// then these seeds must pass strictly.)
+/// still past the claim grace; the third node used to claim the lapsed
+/// lease by TTL from a log without the tail, and the rows both copies held
+/// came back as the deposed holder's replays by rid, after ops invoked
+/// later ("returned before ... but follows it in the log"). Two failures —
+/// the holder cut from S3 and its backup stopped — are beyond one backup's
+/// budget: the run still classifies them (`Cluster::note_s3_cut`,
+/// `Report::double_faults`), but since plan 43 C1-3 waives nothing: the
+/// claimant of a lease whose group may hold acknowledged rows fetches the
+/// sealed tail of a member (the holder, the backup once it is back, ...) or
+/// waits for one, so every case passes the strict checks. The same pause of
+/// the holder itself or of the third node is no second failure: nothing is
+/// recorded.
 #[test]
-fn a_backup_paused_while_its_holder_is_cut_from_s3_is_beyond_the_budget() {
+fn a_backup_paused_while_its_holder_is_cut_from_s3_waits_for_the_group() {
     use pinned::run_seed;
     let configs = |label: &str| match label {
         "backup-lag-at-expiry" => backup_lag_at_expiry_config(false),
@@ -3698,11 +3838,27 @@ fn a_backup_paused_while_its_holder_is_cut_from_s3_is_beyond_the_budget() {
             panic!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}+{pause}")
         });
         assert_eq!(
-            !r.durability_budget_exceeded.is_empty(),
+            !r.double_faults.is_empty(),
             second,
             "{label} seed {seed} +{pause}: {:?}",
-            r.durability_budget_exceeded
+            r.double_faults
         );
+        // No claim carried no tail; a second failure shows the group's tail
+        // fetched, or the sealer's own claim (never a waiver).
+        let sum = |f: fn(&constellation_authority::Stats) -> u64| -> u64 {
+            r.stats.values().map(f).sum()
+        };
+        assert_eq!(
+            sum(|s| s.ttl_claims_without_tail),
+            0,
+            "{label} seed {seed} +{pause}: a claim without the tail"
+        );
+        if second {
+            assert!(
+                sum(|s| s.tail_fetches) + sum(|s| s.backup_takeovers) > 0,
+                "{label} seed {seed} +{pause}: neither a fetch nor a sealer's claim"
+            );
+        }
     }
 }
 
@@ -4062,24 +4218,34 @@ fn regression_backup_crash_classes() {
         });
         assert!(report.converged_checked, "seed {seed} did not converge");
         assert!(
-            report.durability_budget_exceeded.is_empty(),
+            report.double_faults.is_empty(),
             "seed {seed} must pass under the strict checks: {:?}",
-            report.durability_budget_exceeded
+            report.double_faults
         );
     }
     // Two failures that took every copy of acknowledged rows down across
     // the lease's lapse are beyond one backup's budget (the holder
     // crashed; its sealed successor was paused past its own lease before
     // re-shipping the tail, 609417; its backup crashed and came back too
-    // late to claim, 802797): recorded, and the strict checks relaxed for
-    // that run only (`Cluster::note_takedown`).
+    // late to claim, 802797): still recognised (`Cluster::note_takedown`),
+    // and since plan 43 C1-3 passing the strict checks all the same: the
+    // claim waits for a member of the group, whose tail it carries.
     for seed in [609_417u64, 802_797] {
         let report = run_seed(seed, backup_crash_config()).unwrap_or_else(|e| {
             panic!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=backup-crash")
         });
         assert!(
-            !report.durability_budget_exceeded.is_empty(),
+            !report.double_faults.is_empty(),
             "seed {seed}: the double fault was not recognised"
+        );
+        assert_eq!(
+            report
+                .stats
+                .values()
+                .map(|s| s.ttl_claims_without_tail)
+                .sum::<u64>(),
+            0,
+            "seed {seed}: a claim carried no tail"
         );
     }
 }
@@ -4902,6 +5068,10 @@ fn sweep_config() {
         "acks3" => ack_s3_config(),
         "far" | "backup-far" => far_config(),
         "backup-departs" => backup_departs_config(),
+        "backup-group-cut-ttl" => backup_group_cut_ttl_config(GroupCut::Both),
+        "backup-group-cut-ttl-holder-only" => backup_group_cut_ttl_config(GroupCut::HolderOnly),
+        "backup-group-cut-ttl-backup-only" => backup_group_cut_ttl_config(GroupCut::BackupOnly),
+        "backup-chain-ttl" => backup_chain_ttl_config(),
         "backup-partition" => backup_partition_config(),
         "backup-reconfig-doubt" => backup_reconfig_doubt_config(),
         "backup-two" => backup_two_config(),
@@ -5298,7 +5468,7 @@ fn sweep_config() {
                 // The runs whose strict durability the failure budget
                 // waived (`Cluster::note_takedown`).
                 if let Ok(r) = &result {
-                    if !r.durability_budget_exceeded.is_empty() {
+                    if !r.double_faults.is_empty() {
                         eprintln!("SWEEP-BUDGET {label} seed {seed}");
                     }
                 }
@@ -6254,7 +6424,22 @@ fn fingerprint(result: &Result<Report, String>) -> String {
     // Plan 43 C1: so do the counters C1-2 and C1-3 added to `Stats`.
     let text = strip_counters(
         &text,
-        &["acks_downgraded_lone", "journal_class_from_session"],
+        &[
+            "acks_downgraded_lone",
+            "journal_class_from_session",
+            "seal_tail_holder",
+            "seal_tail_backup",
+            "seal_tail_refused",
+            "claim_seals",
+            "tail_fetch_attempts",
+            "tail_fetches",
+            "inherited_tail_fetches",
+            "tail_fetch_wait_ms_total",
+            "groups_abandoned",
+            "member_copies_retired",
+            "inherited_tails_cleared",
+            "ttl_claims_without_tail",
+        ],
     );
     blake3::hash(text.as_bytes()).to_hex().to_string()[..16].to_string()
 }
@@ -6324,6 +6509,18 @@ struct OracleTotals {
     rebuilds: (u64, u64),
     rebuild_seeds: u64,
     max_backups: usize,
+    /// Plan 43 C1-2: answers whose class claim is not borne out (and the
+    /// seeds with one), gated answers released with the gate off and
+    /// re-tagged `Lone`, rows the core journaled without a class of its own
+    /// (must be 0).
+    class_claim: (usize, u64),
+    class_claim_seeds: Vec<u64>,
+    downgraded_lone: u64,
+    class_from_session: u64,
+    /// Plan 43 C1-3: attempts to fetch a group's tail, fetches completed (of
+    /// them, of an inherited tail), claims that carried no tail (must be 0
+    /// outside an abandon), groups abandoned, runs that ended waiting.
+    tail: [u64; 6],
     /// Plan 43 C7b: [TTL claims, of a live holder, seals of a live holder,
     /// permitted claims] and the seeds with a claim of a live holder.
     lease: [u64; 4],
@@ -6353,6 +6550,21 @@ impl OracleTotals {
         let mismatched: usize = r.mismatched_acks.values().sum();
         self.unverified_relays += r.unverified_relays;
         self.class_mismatch += r.class_mismatch;
+        self.class_claim.0 += r.class_claim_mismatch;
+        self.class_claim.1 += u64::from(r.class_claim_mismatch > 0);
+        if r.class_claim_mismatch > 0 && self.class_claim_seeds.len() < 30 {
+            self.class_claim_seeds.push(seed);
+        }
+        for st in r.stats.values() {
+            self.downgraded_lone += st.acks_downgraded_lone;
+            self.class_from_session += st.journal_class_from_session;
+            self.tail[0] += st.tail_fetch_attempts;
+            self.tail[1] += st.tail_fetches;
+            self.tail[2] += st.inherited_tail_fetches;
+            self.tail[3] += st.ttl_claims_without_tail;
+            self.tail[4] += st.groups_abandoned;
+        }
+        self.tail[5] += u64::from(r.waiting_for_group);
         self.unsourced += r.acks_unsourced;
         self.unjournaled_landed += r.unjournaled_landed;
         for st in r.stats.values() {
@@ -6469,6 +6681,24 @@ impl OracleTotals {
             self.unsourced,
             self.unjournaled_landed,
             constellation_authority::core::AckClass::NAMES.iter().zip(self.claimed).collect::<Vec<_>>()
+        );
+        eprintln!(
+            "SWEEP-CLAIM-TOTALS {label} seeds {}/{seeds}: class-claim-mismatch={} in {} seeds, \
+             acks-downgraded-lone={}, journal-class-from-session={}; tail fetch attempts {}, \
+             fetches {} (inherited {}), claims without a tail {}, groups abandoned {}, runs \
+             ending waiting {}; claim mismatch in seeds {:?}",
+            self.seeds,
+            self.class_claim.0,
+            self.class_claim.1,
+            self.downgraded_lone,
+            self.class_from_session,
+            self.tail[0],
+            self.tail[1],
+            self.tail[2],
+            self.tail[3],
+            self.tail[4],
+            self.tail[5],
+            self.class_claim_seeds
         );
         eprintln!(
             "SWEEP-LEASE-TOTALS {label} seeds {}/{seeds}: ttl claims {} (of a live holder {} in \

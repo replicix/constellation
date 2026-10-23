@@ -1460,6 +1460,22 @@ that check them ([TESTING.md](../how-to-guides/development/TESTING.md),
 checked". Amends nothing yet; C1-C5 amend ADR-2, ADR-14, ADR-18, ADR-19,
 ADR-21, ADR-22, ADR-23 and ADR-25 as plan 43 §6 lists.
 
+**C1-2 and C1-3 (plan 43)**: the class a row's answer waits for is decided
+when the row is journaled and stored with it (`RowClass`; the fast path's
+rows carry the class the core published with its gate; the one change
+after the fact is a row answered with the gate off, re-tagged `Lone`), and
+every answer to a forwarder says whether it is committed. A claim of the
+root lease by TTL carries the tail of the old group or waits for it
+(ADR-21 amended): the claimant asks the lease's group (`SealTail`; a
+member seals the epoch before it answers, so the group commits nothing
+more of it) and the first member's answer is the tail it re-ships. Where
+no member answers the claim waits, and only the operator's `repair
+abandon-group` lets it go on without. A tenure that re-ships a tail names
+the old group in its lease (`inherited_tail`) until the log carries the
+rows, so that a successor's death does not take the last copies of rows
+the old group acknowledged. The lease, the log and the seals are the only
+evidence: no claim compares clocks beyond the observation rule of C7b.
+
 ## ADR-34: Kernel FUSE race workarounds
 
 **Context**: three races in the Linux kernel's FUSE client, reproduced on

@@ -75,6 +75,37 @@
 //!     on the staying set too (empty: the log), whatever the held version
 //!     says: the version S3 may hold is the one that lists only them
 //!     (`Core::ack_constraint_sets`).
+//! - **The tail fetch (plan 43 C1-3: the TTL path).** A claim of a lease
+//!   by TTL used to carry nothing: the lease's group (the holder and the
+//!   listed backups) may have acknowledged rows nobody shipped, which the
+//!   claimant's log lacks. Since write-all makes every member hold every
+//!   committed row, the claimant of a lease that lists backups (or names a
+//!   tail its tenure re-ships: below) first asks the group for one
+//!   member's tail (`PeerMsg::SealTail`, `core::seal_tail`). A member
+//!   persists and syncs a seal of the epoch before it answers, so its
+//!   group commits nothing more of it: a *backup* seals its role and
+//!   answers its contiguous tail; a *holder* deposes itself (nothing of
+//!   the epoch is acknowledged again, its unshipped rows are kept as a
+//!   member copy) and answers the same rows. The claim is conditioned, as
+//!   every claim is, on the lease version it read: a holder that renewed
+//!   meanwhile fails it, and the attempt starts over. A claimant that is
+//!   itself a listed backup holding the tail seals first and claims with
+//!   it. **If no member answers the claim waits** (G4: no claim without the
+//!   tail, `status.lease.waiting_for_group`) until one does, or until the
+//!   operator abandons the group (`constellation repair abandon-group`,
+//!   `LogRecord::GroupAbandoned` in the claimant's marker). A holder that
+//!   sealed itself never revives its epoch: it re-claims its own expired
+//!   lease at the next epoch with its member copy as the tail (D7).
+//! - **The inherited tail (D2).** A takeover that re-ships a predecessor's
+//!   tail journals the committed rows as its own, and until their segments
+//!   are in the log they rest on its disk and in the old group's copies.
+//!   The lease it writes says so (`Lease::inherited_tail`: the epoch, the
+//!   members, `through`) until the first renewal or reconfiguration CAS
+//!   after its journal shipped through them; a claimant of such a lease
+//!   fetches from the listed backups (which caught up with the whole
+//!   unshipped journal before they were listed) or from the holder and the
+//!   old group, and the old members keep their copies until a lease reading
+//!   no longer names them.
 //! - **The log-slot CAS.** The taker's epoch marker is a create-if-absent
 //!   at the next sequence; any segment the old holder ships after it
 //!   collides, and what it shipped before it the taker adopted in its
@@ -469,6 +500,12 @@ pub(crate) struct Reconfig {
 /// reconfiguration in flight.
 #[derive(Debug, Default)]
 pub(crate) struct AckState {
+    /// Plan 43 C1-3 (D2): the last journal seq of the predecessor's tail this
+    /// tenure journaled as its own (`apply_backup_tail`; at the gate's end
+    /// for a lease that says it inherits a tail and this node re-adopted).
+    /// The lease's `inherited_tail` is cleared by the first renewal or
+    /// reconfiguration CAS after the journal is shipped through it.
+    pub(crate) inherited_last: Option<u64>,
     pub peers: BTreeMap<NodeId, BackupPeer>,
     /// Candidates that answered `sealed` for the epoch held: never asked
     /// again for it (EC2 follow-up (e)).
@@ -702,6 +739,20 @@ pub(crate) struct BackupState {
     /// oldest first, merged where they overlap: no silence counts before
     /// the latest one ended ([`Core::attentive_since`]).
     own_lapses: std::collections::VecDeque<(WaitMs, WaitMs)>,
+    /// Plan 43 C1-3: the claim's attempt to fetch the group's sealed tail
+    /// in flight, the timer id that ends it, the tail a claim carries
+    /// (fetched, a self-sealed holder's own, until the lease is won), the
+    /// wait across attempts (`waiting_for_group`), the epoch whose group
+    /// the operator abandoned (to be claimed without), the abandoned epoch
+    /// the claim in flight records in its marker, and the epochs this node
+    /// keeps a member copy of.
+    pub(crate) tf: Option<super::seal_tail::TailFetch>,
+    pub(crate) tf_round: Option<OpId>,
+    pub(crate) fetched: Option<super::seal_tail::FetchedTail>,
+    pub(crate) group_wait: Option<super::seal_tail::GroupWait>,
+    pub(crate) abandon: Option<Epoch>,
+    pub(crate) abandoned_claim: Option<Epoch>,
+    pub(crate) member_epochs: Vec<Epoch>,
 }
 
 /// The most own lapses remembered (older ones than
@@ -988,6 +1039,11 @@ pub struct AckView {
     /// by the class they waited for (`Stats::ack_classes`, named by
     /// `AckClass::NAMES`).
     pub classes: Vec<(&'static str, u64)>,
+    /// Plan 43 C1-3: a claim of the lease waits for the tail of an old
+    /// group (`status.lease.waiting_for_group`), and the member copies this
+    /// node keeps of epochs it sealed.
+    pub waiting_for_group: Option<super::seal_tail::WaitingForGroup>,
+    pub member_copies: usize,
 }
 
 impl Core {
@@ -1050,6 +1106,8 @@ impl Core {
                 .copied()
                 .zip(self.stats.ack_classes)
                 .collect(),
+            waiting_for_group: self.waiting_for_group(self.clk),
+            member_copies: self.bk.member_epochs.len(),
         }
     }
 
@@ -1059,6 +1117,7 @@ impl Core {
     /// before it restarted) and a persisted seal are honoured.
     pub(crate) fn backup_start(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         self.bk.sealed = replica.backup_sealed_epoch();
+        self.bk.member_epochs = replica.member_copy_epochs();
         if let Some(role) = replica.backup_role() {
             self.bk.role = Some(role);
             self.bk.acked = replica.backup_acked(role.epoch);
@@ -2909,6 +2968,7 @@ impl Core {
             AckPolicy::Backup
         };
         let mut new = lease.reconfigured(backups.clone(), policy);
+        self.clear_covered_tail(&mut new);
         // Plan 43 C7-F F-a0 L3: the tenure becomes sealable here (a lease
         // that lists a backup, or says `ack=s3`): a duty it stands on now
         // is in this version, which a sealer replaces
@@ -2936,6 +2996,24 @@ impl Core {
             add,
             remove,
         });
+    }
+
+    /// Plan 43 C1-3 (D2): `lease`, a renewal or a reconfiguration of the one
+    /// held, no longer names the predecessor's tail once the rows this tenure
+    /// re-shipped are in the log (the gate done, the journal shipped through
+    /// the last of them). A configuration that has not yet made its
+    /// predecessor's tail durable is not one a claimant may skip.
+    pub(crate) fn clear_covered_tail(&mut self, lease: &mut Lease) {
+        if lease.inherited_tail.is_some()
+            && self.lease.gate.is_none()
+            && self
+                .ack
+                .inherited_last
+                .is_some_and(|last| self.ack.shipped_through >= last)
+        {
+            lease.inherited_tail = None;
+            self.stats.inherited_tails_cleared += 1;
+        }
     }
 
     /// Whether every journal seq an acknowledgement may have rested on is
@@ -4193,7 +4271,15 @@ impl Core {
         let Some(role) = self.bk.role else {
             return;
         };
-        if self.lease.held.is_some() || self.bk.takeover_get.is_some() || self.epoch.open {
+        if self.lease.held.is_some()
+            || self.bk.takeover_get.is_some()
+            || self.epoch.open
+            // Plan 43 C1-3: a claim that fetched a group's tail holds it as
+            // a sealed backup's until its gate applies it; the seal watch
+            // must not read the lease and discard it as "not listed".
+            || self.bk.fetched.is_some()
+            || self.bk.tf.is_some()
+        {
             // (`epoch.open`: rule (b) — a member of an open epoch never
             // seals; `backup_watch_after_epoch` resumes the watch.)
             return;
@@ -4574,6 +4660,16 @@ impl Core {
         }
         self.stats.backup_tail_applied += applied;
         self.stats.backup_takeovers += 1;
+        // Plan 43 C1-3 (D2): the lease names this tail until the journal is
+        // shipped through what it now holds.
+        if self
+            .lease
+            .held
+            .as_ref()
+            .is_some_and(|(l, _)| l.inherited_tail.is_some())
+        {
+            self.ack.inherited_last = Some(replica.journal_tip());
+        }
         self.bk.role = None;
         self.bk.acked = 0;
         replica.backup_clear();

@@ -171,7 +171,16 @@ impl EngineControl {
         let gate_pending = self.lease.gate_pending();
         let usage = self.cache.usage();
         let memory = self.cache.memory_stats().unwrap_or_default();
-        let p0_lease = self.lease.status();
+        let mut p0_lease = self.lease.status();
+        p0_lease.waiting_for_group =
+            core.ack
+                .waiting_for_group
+                .as_ref()
+                .map(|w| api::WaitingForGroupStatus {
+                    epoch: w.epoch,
+                    waited_ms: w.waited_ms,
+                    sources: w.sources.clone(),
+                });
         let designations = self.list_designations();
         let mut epoch = self.epochs.status();
         epoch.promise_puts = stats.promise_puts;
@@ -365,6 +374,7 @@ impl EngineControl {
                     backing_epoch: a.backing_epoch,
                     backing_acked: a.backing_acked,
                     sealed_epoch: a.sealed_epoch,
+                    member_copies: a.member_copies as u64,
                     longest_step_ms: core.longest_step_ms,
                     longest_step_kind: core.longest_step_kind.to_string(),
                     recent_longest_step_ms: core.recent_longest_step_ms,
@@ -1055,6 +1065,24 @@ impl EngineControl {
             self.rt
                 .block_on(receive)
                 .map_err(|_| "reintegration task stopped".to_string())?
+        })
+    }
+
+    /// `lease.abandon_group` (plan 43 C1-3): let the lease claim waiting for
+    /// `epoch`'s tail go on without it. The text or the core's refusal.
+    pub(crate) fn abandon_group(
+        &self,
+        epoch: u64,
+        gen: u64,
+    ) -> std::result::Result<String, String> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.sync_tx
+            .send(sync::SyncRequest::AbandonGroup { epoch, gen, reply })
+            .map_err(|_| "sync task is not running".to_string())?;
+        tokio::task::block_in_place(|| {
+            self.rt
+                .block_on(receive)
+                .map_err(|_| "sync task stopped".to_string())?
         })
     }
 

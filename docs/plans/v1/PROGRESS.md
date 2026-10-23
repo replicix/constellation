@@ -56899,6 +56899,166 @@ node upgrades across C1 with a drained journal), the wire fields are appended.
   that base: fingerprints equal, failing sets equal.
 - Perf: see the C1-3 entry (measured once for both commits).
 
+## Plan 43 C1-3 — The TTL claimant fetches the sealed tail; the inherited tail; the strict wait
+
+The third commit of plan 43 C1 (the coder spec's §5, Q22 (b) and (c) decided): a claim of a lease by
+TTL no longer starts from the log alone. Where the lease's group (the holder and its listed
+backups) may hold rows it acknowledged and nobody shipped, the claimant first obtains one member's
+sealed tail and re-ships it; where no member answers, the claim waits. Both of the witnesses C7b and
+f27d3d1 pinned pass strict.
+
+### The change
+
+| Item | Where |
+|---|---|
+| `PeerMsg::SealTail { req, epoch, config_version, from }` / `SealedTail { req, epoch, held, txs, through, next }` (appended; `Payload` likewise), request/response like `DelegSeal`, timeout `backup_takeover_ms` | `event.rs`, `net/{message,peers,endpoint}.rs`, `engine/{authority_driver,p2p,sync}.rs` |
+| The member's side `Core::on_seal_tail` (`core/seal_tail.rs`): a *backup* with a role for the epoch (any `config_version` at or above its own, D8) persists and syncs the seal and answers its contiguous tail; a *holder* of the epoch (or a restarted node with unshipped rows of it) seals, snapshots its unshipped rows into a member copy (a key range of `backup_tail` apart from the tail it holds as a backup, so neither `backup_trim` nor `backup_clear` reaches it; synced), deposes itself (`deposed`: parked answers abort, nothing of the epoch is acknowledged again) and answers from the snapshot; any later `SealTail` of the epoch is answered from the copy (idempotent). Batches of `backup_batch_rows` | `core/seal_tail.rs`, `meta/store/backup.rs` |
+| The claimant: `LeaseState::classify` returns `Plan::FetchTail` for a lease that lists backups or names an inherited tail, claimed by anyone who is not its permitted sealer and holds no copy of the tail (a listed backup holding the role claims; a self-sealed holder holding its member copy re-claims its own lease at the next epoch, D7: `sealed_own`, `granted_lease`'s `own` rule). `Core::begin_tail_fetch` asks every member at once; the first `held` answer is pulled to its end, written as a sealed backup's tail and role, and the claim goes on as a takeover (`TailFollows` in its marker, the CAS conditioned on the tag read); the attempt ends at `backup_takeover_ms`, the ops behind it retry, `status.lease.waiting_for_group { epoch, waited_ms, sources }`, a WARN once a minute | `core/{lease,jobs,seal_tail}.rs` |
+| A listed backup claiming at expiry seals its role before its CAS (`prepare_tail_for_claim`); the seal watch does not read the lease while a fetched tail is held | `core/{seal_tail,backup}.rs` |
+| The inherited tail (D2): `Lease.inherited_tail { epoch, config_version, members, through }` (JSON, `serde(default)`, boxed), written by the claim CAS that re-ships a tail (a seal, a fetch, a self-sealed re-claim), copied by renewals and reconfigurations, cleared by the first renewal or reconfiguration CAS after the journal shipped through the last re-shipped row (`AckState::inherited_last`, the gate done) and by a release; a claimant of a lease with an inherited tail fetches from its listed backups, or from the holder and the old group; members keep their copy until a lease read no longer names it | `store-s3/lease.rs`, `core/{jobs,backup,seal_tail}.rs` |
+| The operator escape (§5.5): `Control::AbandonGroup { epoch, gen }` (valid while a claim waits for that epoch's group with no member answering; `gen` must be 0), `LogRecord::GroupAbandoned { epoch, gen, through_known }` in the abandoning claim's marker instead of `TailFollows`, control method `lease.abandon_group` (Admin), `constellation repair abandon-group --epoch E [--gen G]`, `status.lease.waiting_for_group`, `status.ack.member_copies` | `core/seal_tail.rs`, `meta/record.rs`, `control`, `cli`, `engine/control` |
+| `Stats`: `seal_tail_{holder,backup,refused}`, `claim_seals`, `tail_fetch_attempts`, `tail_fetches`, `inherited_tail_fetches`, `tail_fetch_wait_ms_total`, `groups_abandoned`, `member_copies_retired`, `inherited_tails_cleared`, `ttl_claims_without_tail` (a takeover claim of a lease whose group may hold rows that carries no tail: must stay 0 outside an abandon) | `core/mod.rs` |
+| Sim: the TTL relaxation is gone (`Cluster::check_failure_budget` still classifies, `Report::double_faults`, `SWEEP-BUDGET`, and waives nothing); an acknowledgement a lone node gave its own client may still be rolled back (§5.7, C5), so the rolled-back rids whose answer the core claimed `Lone` are the strict check's exemption instead (`long-backup` 1063 is such a run: a lone ack of a holder that was the only live copy); `SimConfig.abandon_after_ms` (the operator abandons a group a claim has waited for that long), `Report.waiting_for_group` (a run that ends with a claim waiting skips convergence and checks `acked_held_somewhere`), `FaultKind::CrashWhenTailUnshipped`, configurations `backup-group-cut-ttl` (+ `-holder-only`, `-backup-only`) and `backup-chain-ttl` | `tests/sim/*`, `tests/sim.rs` |
+| Models: knobs `tail_fetch` and `inherited_tail` (default off) with their pairs | `model/{src,tests}/backup.rs` |
+
+No version bump, no compatibility shim: the lease field is JSON with `serde(default)`, the
+`LogRecord` variant is appended, the wire variants are appended.
+
+### Authorized rewrites (old -> new assertion)
+
+- `a_backup_paused_while_its_holder_is_cut_from_s3_is_beyond_the_budget` is now
+  `…_waits_for_the_group`: every one of the nine cases passes the strict checks (it asserted the
+  double-fault classification and a waiver); the six second-failure cases show a tail fetch or a
+  sealer's claim, none a claim without a tail.
+- `regression_backup_crash_classes`: seeds 609417 and 802797 are still recognised as double faults and
+  now pass strict with `ttl_claims_without_tail == 0` (before: only the classification was asserted
+  and the checks were waived).
+- `backup_strict_double_fault_known_gap` (`#[ignore]`, C7b) is `backup_strict_1389_waits_for_the_group`,
+  and 1389 is back in `fast_failover_with_delegations_keeps_close_to_open`'s range.
+- The `a_non_backup_waits_the_grace_before_claiming_a_backup_lease` classification now ends in
+  `Plan::FetchTail` where it ended in `Plan::Claim` (a listed backup that holds the tail still claims).
+
+### Evidence (debug builds, 6 threads, the default clock-fault mix; base `0dc4db6d`; sim sweeps on a 16-CPU build box)
+
+**The witnesses.**
+
+- `backup-strict` 0..2000: base 1 failing (**1389**, the C7b pin: "returned before ... but follows it in the log"), this commit 0.
+  The sweep prints 208 tail-fetch attempts, 15 fetches (12 of an inherited tail), 0 claims without a tail.
+- The lag-at-expiry seeds 5, 275, 277: `a_backup_paused_while_its_holder_is_cut_from_s3_waits_for_the_group` (nine cases) passes the
+  strict checks with `ttl_claims_without_tail == 0` (the six second-failure cases show a fetch or a sealer's claim).
+  `backup-lag-at-expiry` and `-beats-lost` 0..2000: 0 failing on both trees; 26 and 25 fetches on this commit.
+- `regression_backup_crash_classes` seeds 609417 and 802797 pass strict (still classified `double_faults`).
+- C7b's `locks-claimant-ahead` and `strict-claimant-ahead` (0..2000) and `fast-takeover-skewed-holder-twice` (0..2000): 0 failing
+  on both trees; I6 silent. (`locks-holder-behind`: not rerun.)
+
+**Fail-before of the new configurations.** The configurations added to a tree that has none of this commit (the base plus their
+definitions only): `backup-group-cut-ttl` 156 failing of 2000, `-holder-only` 267, `-backup-only` 219 (the claim by TTL without the tail:
+acknowledged rows come back as replays by rid after ops invoked later); this commit: 0, 0, 0 (0..2000; 2245, 2145 and 2135
+fetch attempts, 277, 177 and 166 fetches, `ttl_claims_without_tail == 0`). `backup-chain-ttl` (a successor dying holding the predecessor's
+tail unshipped; the third node claims its `Local` lease): 0 failing on both trees, since the deposed holder still replays what it
+held — the counter shows the path (148 attempts, 141 fetches of an inherited tail on this commit, none possible on the base); D2's
+fail-before is the model's `a_chained_takeover_without_the_inherited_tail_loses_an_acked_write`.
+
+**Failing sets, base against this commit** (`SWEEP` lines; the same range on both unless noted; seeds: 2000 for the backup and `long-backup`
+configurations, `locks-failover-backup*`, `locks-long-grants-seal`; the delegated and locks families 500 on the base and 2000 on this
+commit for `locks`, `locks-failover`, `locks-delegated`, `delegated-backup`, 500 both for the others; 500 for every `long-*`).
+Failing sets are equal (empty) on every configuration except `backup-strict` (base 1389). The oracle totals (I1 `root-group/*`
+keys, I2, I2c, I5) are equal where the ranges are equal; they are C2 to C5's and C1-4's to change:
+
+| config (seeds) | failing base | failing mine | root-group keys b/m | I2 b/m | I2c b/m | I5 b/m | failover p50/p90/max b -> m |
+|---|---|---|---|---|---|---|---|
+| backup (0..2000) | 0 | 0 | 0/0 | 31 (16) / 31 (16) | 70 (17) / 70 (17) | 237 (124) / 237 (124) | 1203/4457/8099 -> 1203/4457/8123 |
+| backup-crash (0..2000) | 0 | 0 | 0/0 | 152 (72) / 151 (71) | 6272 (1672) / 6263 (1670) | 6570 (1757) / 6560 (1754) | 1209/4728/8356 -> 1209/4728/8956 |
+| backup-crash-slow (0..2000) | 0 | 0 | 0/0 | 744 (383) / 740 (383) | 5601 (738) / 5601 (738) | 7334 (1548) / 7335 (1548) | 6051/7858/9747 -> 6051/7868/10569 |
+| backup-departs (0..2000) | 0 | 0 | 0/0 | 7 (6) / 7 (6) | 0 (0) / 0 (0) | 55 (41) / 55 (41) | None/None/None -> None/None/None |
+| backup-hot (0..2000) | 0 | 0 | 0/0 | 19 (16) / 19 (16) | 2 (2) / 2 (2) | 283 (149) / 283 (149) | None/None/None -> None/None/None |
+| backup-lag-at-expiry (0..2000) | 0 | 0 | 0/0 | 1869 (542) / 1815 (539) | 66486 (1951) / 66486 (1951) | 67047 (1980) / 67049 (1980) | None/None/None -> None/None/None |
+| backup-lag-at-expiry-beats-lost (0..2000) | 0 | 0 | 0/0 | 2081 (581) / 2022 (578) | 65751 (1944) / 65751 (1944) | 66269 (1981) / 66270 (1981) | None/None/None -> None/None/None |
+| backup-partition (0..2000) | 0 | 0 | 0/0 | 18 (17) / 18 (17) | 1 (1) / 1 (1) | 196 (137) / 196 (137) | None/None/None -> None/None/None |
+| backup-reconfig-doubt (0..2000) | 0 | 0 | 0/0 | 5 (5) / 5 (5) | 0 (0) / 0 (0) | 755 (648) / 755 (648) | None/None/None -> None/None/None |
+| backup-strict (0..2000) | 1 1389 | 0 | 0/0 | 1074 (419) / 1074 (419) | 6129 (1625) / 6128 (1624) | 6399 (1703) / 6396 (1702) | 8180/11678/15000 -> 8183/11682/16629 |
+| backup-two (0..2000) | 0 | 0 | 0/0 | 23 (16) / 23 (16) | 42 (15) / 42 (15) | 223 (128) / 223 (128) | 1174/4084/8018 -> 1174/4084/9092 |
+| delegated-backup (0..500) | 0 | n/a | 0/None | 13 (10) / - | 29 (14) / - | 45 (40) / - | None/None/None -> - |
+| delegated-backup (0..2000) | n/a | 0 | None/0 | - / 45 (41) | - / 142 (83) | - / 160 (147) | - -> None/None/None |
+| delegated-crash (0..500) | 0 | 0 | 0/0 | 3 (3) / 3 (3) | 0 (0) / 0 (0) | 9 (7) / 9 (7) | None/None/None -> None/None/None |
+| delegated-holder-cut (0..500) | 0 | 0 | 0/0 | 165 (93) / 165 (93) | 1198 (416) / 1198 (416) | 1596 (449) / 1596 (449) | 12770/15657/23121 -> 12770/15657/23121 |
+| delegated-partition (0..500) | 0 | 0 | 0/0 | 84 (81) / 84 (81) | 0 (0) / 0 (0) | 317 (255) / 317 (255) | None/None/None -> None/None/None |
+| delegated-root-crash (0..500) | 0 | 0 | 0/0 | 0 (0) / 0 (0) | 0 (0) / 0 (0) | 5 (5) / 5 (5) | 127/5236/10928 -> 127/5236/10928 |
+| fast-takeover-skewed-holder-twice (0..2000) | 0 | 0 | 0/0 | 448 (403) / 448 (403) | 126 (119) / 126 (119) | 4387 (1839) / 4387 (1839) | None/None/None -> None/None/None |
+| locks (0..500) | 0 | n/a | 0/None | 0 (0) / - | 0 (0) / - | 0 (0) / - | None/None/None -> - |
+| locks (0..2000) | n/a | 0 | None/0 | - / 0 (0) | - / 0 (0) | - / 0 (0) | - -> None/None/None |
+| locks-claimant-ahead (0..2000) | 0 | 0 | 0/0 | 0 (0) / 0 (0) | 0 (0) / 0 (0) | 0 (0) / 0 (0) | None/None/None -> None/None/None |
+| locks-delegated (0..500) | 0 | n/a | 0/None | 0 (0) / - | 0 (0) / - | 7 (7) / - | None/None/None -> - |
+| locks-delegated (0..2000) | n/a | 0 | None/0 | - / 0 (0) | - / 0 (0) | - / 22 (22) | - -> None/None/None |
+| locks-failover (0..500) | 0 | n/a | 0/None | 0 (0) / - | 0 (0) / - | 0 (0) / - | 5183/5222/5272 -> - |
+| locks-failover (0..2000) | n/a | 0 | None/0 | - / 0 (0) | - / 0 (0) | - / 0 (0) | - -> 5183/5224/5376 |
+| locks-failover-backup (0..2000) | 0 | 0 | 0/0 | 8 (6) / 8 (6) | 0 (0) / 0 (0) | 10 (8) / 10 (8) | 8209/11666/15179 -> 8209/11666/15179 |
+| locks-failover-backup-renew (0..2000) | 0 | 0 | 0/0 | 759 (671) / 759 (671) | 43 (43) / 43 (43) | 2113 (1351) / 2113 (1351) | None/None/None -> None/None/None |
+| locks-long-grants-seal (0..2000) | 0 | 0 | 0/0 | 488 (452) / 489 (453) | 68 (68) / 68 (68) | 1849 (1274) / 1851 (1276) | None/None/None -> None/None/None |
+| long-acks3 (0..500) | 0 | 0 | 0/0 | 5 (5) / 5 (5) | 0 (0) / 0 (0) | 84 (53) / 84 (53) | 1139/4601/7282 -> 1139/4601/7282 |
+| long-backup (0..2000) | 0 | 0 | 0/0 | 57 (38) / 57 (38) | 205 (53) / 205 (53) | 439 (182) / 438 (181) | 1180/4502/9680 -> 1180/4502/9680 |
+| long-delegated (0..500) | 0 | 0 | 0/0 | 12 (8) / 12 (8) | 0 (0) / 0 (0) | 118 (86) / 118 (86) | 976/6504/11542 -> 976/6504/11542 |
+| long-delegated-backup (0..500) | 0 | 0 | 0/0 | 20 (12) / 20 (12) | 130 (67) / 130 (67) | 87 (60) / 87 (60) | 1161/13792/18439 -> 1161/13792/18439 |
+| long-delegated-late-answers (0..500) | 0 | 0 | 0/0 | 41 (26) / 41 (26) | 260 (93) / 260 (93) | 470 (308) / 470 (308) | 3127/14134/20424 -> 3127/14134/20424 |
+| long-sessions (0..500) | 0 | 0 | 0/0 | 1 (1) / 1 (1) | 0 (0) / 0 (0) | 27 (6) / 27 (6) | 3673/6630/10996 -> 3673/6630/10996 |
+| long-strict (0..500) | 0 | 0 | 0/0 | 3 (1) / 3 (1) | 0 (0) / 0 (0) | 20 (4) / 20 (4) | 784/6339/9105 -> 784/6339/9105 |
+| strict-claimant-ahead (0..2000) | 0 | 0 | 0/0 | 1 (1) / 1 (1) | 0 (0) / 0 (0) | 5 (4) / 5 (4) | 3356/6512/8451 -> 3356/6512/8451 |
+
+(`failover` is the simulation's time from a holder crash to the first acknowledged mutation, ms, p50/p90/max, on the simulated clock:
+unchanged everywhere except `backup-strict`'s max, 15000 -> 16629, which is seed 1389 — a measured failover now, where the base never
+acknowledged again — and `backup-crash`/`backup-crash-slow`/`backup-two`/`backup` maxima, a few hundred ms to 1.1 s higher on the
+single seeds whose lease the claim waited for a group on. The TTL path pays one round trip and a synced seal at a member, and waits
+while no member answers.)
+
+**The class claim** (`SWEEP-CLAIM-TOTALS`, this commit): `journal_class_from_session == 0` everywhere. `class_claim_mismatch` is
+0 on 24 of the 32 configurations; on the others it is the answers that are already `archive/*` and `deleg-group/*` in C0's I1 count and
+are C2's: an inbox op drained inside a takeover gate is answered by the drain without the archive (`backup` 2 answers in 2 seeds,
+`backup-crash` 10/7, `backup-crash-slow` 14/10, `backup-two` 3/3, `long-backup` 11/7), and a delegate's `deleg-group` answers
+judged lone (`delegated-holder-cut` 3, `long-delegated-backup` 10, `long-delegated-late-answers` 16). They do not fail a run (`+commit`
+stays off until C2). `backup-crash` seed 124 is the first of the first family: node 1 takes node 2's lease by a seal and answers its own
+client's inbox op, journaled `Archive`-class, at the gate.
+
+**Identity.** C1-2 against the base (`AUTHORITY_SIM_FINGERPRINT=1`): fingerprints equal seed by seed on the eight configurations of
+that entry; this commit changes the schedule only where a claim by TTL fetches or waits.
+
+**Gates.** `cargo fmt --check`; `clippy --workspace --all-targets -D warnings`; meta lib (327), authority lib (602), sim suite (247 passed,
+11 ignored: the pin of 1389 is gone), `meta_repro` (4), net lib (124), engine lib (860), control and cli (282), the model crate
+(`--release --test-threads=2`, 224 passed: the four new pairs `a_ttl_claim_with_/without_the_tail_fetch…`,
+`a_chained_takeover_with_/without_the_inherited_tail…` and the three-node reconfiguration run).
+
+**Fail-before (tests).** Core: `a_ttl_claimer_fetches_the_sealed_tail_before_its_marker`,
+`a_holder_that_answered_seal_tail_acknowledges_nothing_more`, `a_listed_backup_seals_before_claiming_at_expiry`,
+`no_member_answering_the_tail_fetch_holds_the_claim` (+ the abandon), `abandon_group_is_refused_unless_waiting`,
+`seal_tail_for_another_epoch_is_refused`, `seal_tail_from_a_newer_config_version_is_accepted`,
+`a_self_sealed_holder_recovers_and_claims_its_own_expired_lease_at_the_next_epoch`, `sealed_tail_is_sent_in_batches`,
+`a_claim_of_a_lease_with_an_inherited_tail_fetches_it`, `the_inherited_tail_is_cleared_once_the_log_carries_it`,
+`a_wait_for_a_group_ends_when_the_lease_moves_on`; meta: `the_member_copy_snapshot_survives_a_restart`; sim:
+`backup_strict_1389_waits_for_the_group`, the rewritten tests above, the new configurations; control and cli: the method-list and
+parity tests, `repair_abandon_group_parses`. None of them compiles on the parent (they need the API); the ones that run on it
+(sim) fail there as the sweeps above show.
+
+**Performance** (`ack-latency`, release builds of the base and of this commit, ABBA, 4 runs each of 300 samples per op and actor, on
+tmpfs and btrfs of a shared 16-CPU build box; the box's load average was 12 to 35 from other jobs throughout, and the other file systems
+of the gate — ext4, xfs — and a quiet box were not available, so **the ±3 % / one-IQR gate is not certified**). What the data shows:
+the host's run-to-run spread is larger than the gate on both trees (the same tree's p50 of one op ranges 500 to 4500 µs between
+runs; btrfs is bimodal, 80 µs or 4 ms for a single node's rename in the base as well as here), so a ratio of the medians is noise:
+of 156 median-of-4 comparisons (p50 and p90 of the ops of topologies 1-6, two file systems) 127 are within 3 % or one IQR, 16 are
+beyond it with this commit faster, and 13 beyond it with this commit slower (12 on btrfs, 11 of them `forward` ops where runs of
+the four were in a 4 ms mode; one `unlink` of 75 µs against 93 µs on tmpfs with IQR 12). The single-node
+topology on tmpfs, which carries the one hot-path change of C1-2 (the row's class and `last_journaled()` in `finish_local`), is 0.82
+to 1.0 of the base in the median (p50 `create` 100 -> 81 µs, `unlink` 59 -> 51, `chmod` 32 -> 30, `rename` 70 -> 61, `write` 169 -> 170).
+A rerun on a quiet box with ext4, xfs and btrfs is owed (`bench/commit-rule/run.sh --fs ...`).
+
+### Not done here
+
+- The harness scenario `backup-group-isolated` and the harness list of the spec's §10, the load campaign: no box with the harness's
+  toxiproxy and the time; the claim path is covered by the simulation configurations and the model.
+- C1-4 (member copies in general, `TailOf`, committed shadows and streams, the strict flags `strict_identity`/`strict_lone`).
+  The member copy is C1-3's: a sealed holder's snapshot only; its retirement is by the lease no longer naming the epoch, not by the
+  log's coverage.
+- `locks-holder-behind` and the long tail of locks and delegated configurations at 2000 seeds (the sweeps took the delegated
+  families 500 on the base).
+
 ## Plan 45 — Hard links: dentry attribute copies only for single-name inodes
 
 Plan 45 (`docs/plans/v1/wip/45-hard-links.md`) removes the O(n) cost of an

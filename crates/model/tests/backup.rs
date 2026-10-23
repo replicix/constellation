@@ -234,6 +234,111 @@ fn today_a_deposed_holder_replays_committed_rows() {
     checker.assert_discovery("acked_never_rolled_back", path);
 }
 
+/// Plan 43 C1-3: three nodes, node 1 the only backup; the TTL path only (no
+/// seal takeover, no reconfiguration) with one crash. The holder
+/// acknowledges a write that only its backup holds, dies, and the lease
+/// expires.
+fn ttl_claim_model(tail_fetch: bool) -> BackupModel {
+    BackupModel {
+        tail_fetch,
+        fast_takeover: false,
+        reconfig: false,
+        max_epoch: 2,
+        max_tick: 1,
+        lease_ttl: 1,
+        ..BackupModel::backup(3, 1)
+    }
+}
+
+/// Plan 43 C1-3 (fail-before): today a TTL claimant of a lease with a
+/// listed backup carries no tail, so a third node that claims after the
+/// holder died leaves the acknowledged write on the backup's unlisted copy.
+/// The checker reports it as `acked_never_lost` (the write is on no node the
+/// register names), not as a rollback: the old holder is dead, so nothing
+/// replays it. The name is the plan's.
+#[test]
+fn a_ttl_claim_without_the_tail_fetch_rolls_back_an_acked_write() {
+    assert_violates("ttl-claim", &ttl_claim_model(false), "acked_never_lost");
+}
+
+/// Plan 43 C1-3: the same configuration with `tail_fetch`: the claimant
+/// fetches the backup's tail (and seals it) or waits; no acknowledged write
+/// is lost.
+#[test]
+fn a_ttl_claim_with_the_tail_fetch_is_clean() {
+    assert_clean(
+        "ttl-claim-fetch",
+        &ttl_claim_model(true),
+        &["tail_fetched", "all_acked_and_in_log"],
+    );
+}
+
+/// Plan 43 C1-3 (D2): four nodes, holder 0 with backups 1 and 2, a crash of
+/// the holder and of its successor. Node 0 acknowledges a write held by 1
+/// and 2; 1 seals and takes over, re-shipping the tail into a tenure with no
+/// listed backups, and dies before shipping it. The write is then on node 2's
+/// copy of the old group only.
+fn chained_takeover_model(inherited_tail: bool) -> BackupModel {
+    BackupModel {
+        tail_fetch: true,
+        inherited_tail,
+        initial_backups: vec![1, 2],
+        writers: 1,
+        reconfig: false,
+        max_crashes: 2,
+        max_epoch: 3,
+        max_tick: 1,
+        lease_ttl: 1,
+        ..BackupModel::backup(4, 1)
+    }
+}
+
+/// Plan 43 C1-3 (D2's fail-before): without the inherited tail the
+/// successor's lease names no group, so a claimant of it fetches nothing and
+/// the old group's copy (which drops at the successor's marker) is
+/// unreachable: `acked_never_lost` is violated.
+#[test]
+fn a_chained_takeover_without_the_inherited_tail_loses_an_acked_write() {
+    assert_violates(
+        "chained-no-inherited",
+        &chained_takeover_model(false),
+        "acked_never_lost",
+    );
+}
+
+/// Plan 43 C1-3 (D2): with the inherited tail the lease names the old group,
+/// its members keep their copy until the log carries the rows, and a third
+/// node's TTL claim fetches from them: nothing is lost.
+#[test]
+fn a_chained_takeover_with_the_inherited_tail_is_clean() {
+    assert_clean(
+        "chained-inherited",
+        &chained_takeover_model(true),
+        &["tail_fetched", "inherited_tail_fetched"],
+    );
+}
+
+/// Plan 43 C1-3: the whole design with both knobs — seal and TTL takeovers,
+/// a removal and an addition, a crash, three nodes (one writer; with every
+/// node writing it is over the budget).
+#[test]
+fn tail_fetch_and_inherited_tail_three_nodes_with_reconfiguration_is_clean() {
+    let m = BackupModel {
+        tail_fetch: true,
+        inherited_tail: true,
+        writers: 1,
+        max_tick: 1,
+        lease_ttl: 1,
+        max_epoch: 3,
+        ..BackupModel::backup(3, 1)
+    };
+    assert_clean(
+        "fetch-inherited-3-reconfig",
+        &m,
+        &["seal_takeover", "tail_fetched", "all_acked_and_in_log"],
+    );
+}
+
 /// The knob C1 will implement is refused until then.
 #[test]
 #[should_panic(expected = "plan 43 C1")]

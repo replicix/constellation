@@ -77,6 +77,18 @@ pub enum Plan {
         takeover: bool,
         marker: bool,
     },
+    /// Plan 43 C1-3: the lease may be claimed, but its group may hold rows
+    /// it acknowledged that nobody has shipped (listed backups, or a tail
+    /// its tenure re-ships: `Lease::inherited_tail`), and this node holds
+    /// none of them: the claim first fetches the sealed tail from one
+    /// member (`SealTail`, a `(node, epoch, config_version)` each) and waits
+    /// while none answers (G4). The claim that follows is `Claim { prev,
+    /// tag, takeover: true, marker: true }` on the tag read here.
+    FetchTail {
+        prev: Lease,
+        tag: LeaseTag,
+        sources: Vec<(NodeId, Epoch, u64)>,
+    },
     /// A live foreign holder.
     Busy {
         holder: NodeId,
@@ -111,6 +123,18 @@ pub struct LeaseState {
     /// A release/handoff is in its final flush + CAS section.
     pub releasing: bool,
     pub gate: Option<PendingGate>,
+    /// Plan 43 C1-3: the highest epoch this node sealed (set by the core
+    /// before it classifies: `BackupState::sealed`). A node that sealed its
+    /// own epoch (a holder asked for its tail by a claimant) never revives
+    /// it: it claims its own expired lease as a takeover, at the next epoch
+    /// (D7).
+    pub sealed_own: Epoch,
+    /// Plan 43 C1-3: the group's tails this node holds a copy of, as
+    /// `(holder, epoch)`: its backup role's, and `(this node, epoch)` for
+    /// each member copy it keeps (set by the core before it classifies). A
+    /// listed backup that holds the tail of the lease it claims, and a
+    /// self-sealed holder with its own copy, need no fetch.
+    pub tail_held: Vec<(NodeId, Epoch)>,
     pub last_write: WaitMs,
     /// `ForwardState::cached_holder` (from `NotHolder` redirects and
     /// lease reads).
@@ -397,7 +421,12 @@ impl LeaseState {
             // against this node; it never holds it again.
             return Plan::Refused("retired by an admin leave (the lease is fenced against us)");
         }
-        if prev.holder == cfg.node_id && !prev.released {
+        // Plan 43 C1-3 (D7): this node's own lease whose epoch this node
+        // sealed (it was asked for its tail and gave it): the epoch is
+        // never revived; the lease is claimed like another node's, once it
+        // can be, as a takeover at the next epoch.
+        let sealed_own = prev.holder == cfg.node_id && self.sealed_own >= prev.epoch;
+        if prev.holder == cfg.node_id && !prev.released && !sealed_own {
             // Plan 43 C7b: the own body's end is on this node's honour
             // clock (a mixed compare of the body's wall stamp is gone).
             if self.held.is_some() && honour_end_of(&prev, cfg).is_some_and(|h| now.honour < h) {
@@ -437,7 +466,7 @@ impl LeaseState {
         // released lease, a fenced one and one nobody ever held are
         // claimable at once; one this node has not watched (a cold
         // claimant) is not, until it has.
-        let own = prev.holder == cfg.node_id;
+        let own = prev.holder == cfg.node_id && !sealed_own;
         let claimable = own
             || prev.holder == 0
             || prev.released
@@ -485,11 +514,48 @@ impl LeaseState {
                 retry_at,
             };
         }
-        let takeover = prev.holder != 0 && prev.holder != cfg.node_id;
+        let takeover = prev.holder != 0 && (prev.holder != cfg.node_id || sealed_own);
         if takeover && cfg.single_writer {
             return Plan::Refused("no If-Match support: takeover cannot be made safe");
         }
         let marker = takeover && !prev.released;
+        // Plan 43 C1-3: a claim that is not a sealer's (permitted) of a
+        // tenure whose group may hold acknowledged rows nobody shipped
+        // carries that group's tail, or waits for it: a listed backup that
+        // holds the tail claims it (and seals it first, `acquire_cas`'s
+        // caller); a self-sealed holder re-ships its own member copy;
+        // everyone else fetches it from one member (`SealTail`). Any one
+        // member has every committed row (write-all), and a claim that
+        // skipped them would lose rows the group acknowledged.
+        let group_may_hold = !prev.released
+            && prev.holder != 0
+            && !permitted
+            && ((prev.ack_policy == AckPolicy::Backup && !prev.backups.is_empty())
+                || prev.inherited_tail.is_some());
+        if group_may_hold {
+            let has_own = if sealed_own {
+                self.tail_held.contains(&(cfg.node_id, prev.epoch))
+            } else {
+                prev.backups.contains(&cfg.node_id)
+                    && self.tail_held.contains(&(prev.holder, prev.epoch))
+            };
+            if !has_own {
+                let mut sources: Vec<(NodeId, Epoch, u64)> =
+                    vec![(prev.holder, prev.epoch, prev.config_version)];
+                match &prev.inherited_tail {
+                    Some(t) if prev.backups.is_empty() => {
+                        sources.extend(t.members.iter().map(|m| (*m, t.epoch, t.config_version)));
+                    }
+                    _ => sources.extend(
+                        prev.backups
+                            .iter()
+                            .map(|b| (*b, prev.epoch, prev.config_version)),
+                    ),
+                }
+                sources.dedup();
+                return Plan::FetchTail { prev, tag, sources };
+            }
+        }
         Plan::Claim {
             prev,
             tag,
@@ -523,7 +589,8 @@ impl LeaseState {
         prev: Option<&Lease>,
         inherits_duty: bool,
     ) -> Lease {
-        let own = prev.filter(|p| p.holder == cfg.node_id && !p.released);
+        let own =
+            prev.filter(|p| p.holder == cfg.node_id && !p.released && self.sealed_own < p.epoch);
         let epoch = match prev {
             None => 1,
             Some(prev) if own.is_some() => prev.epoch.max(1),
@@ -554,6 +621,7 @@ impl LeaseState {
                 || inherits_duty
                 || own.is_some_and(|p| p.granted_delegations),
             retired: prev.map(|p| p.retired.clone()).unwrap_or_default(),
+            inherited_tail: None,
         }
     }
 
@@ -1259,7 +1327,12 @@ mod tests {
         );
         let due = t0.plus(10_000 + grace);
         st.observe(due, Some(&obj));
-        assert!(is_claim(&st.classify(due, &cfg, Some(obj), 0)));
+        // Plan 43 C1-3: past the grace the claim is by TTL, and carries the
+        // group's tail: this node holds none, so it fetches it first.
+        assert!(matches!(
+            st.classify(due, &cfg, Some(obj.clone()), 0),
+            Plan::FetchTail { .. }
+        ));
     }
 
     /// Under `ack=s3` the permit's "no renewal for `backup_takeover_ms`" is

@@ -60,6 +60,7 @@ mod placement;
 mod promise;
 mod readindex;
 mod replay;
+mod seal_tail;
 mod stream;
 #[cfg(test)]
 mod tests;
@@ -81,6 +82,7 @@ pub use deleg_windows::{
     decide, DelegWindows, Refusal, RootLease, Window, WindowStats, WindowsClock,
 };
 pub use delegate::{DelegKind, DelegRenewCert, DelegView, RecallPhase};
+pub use seal_tail::WaitingForGroup;
 
 /// Plan 30 §M11 phase 2b: read delegations a *delegate* grants carry
 /// `epoch = DELEG_READ_EPOCH_BASE + gen`, so a `Recall` of the
@@ -1244,6 +1246,26 @@ pub struct Stats {
     /// Plan 43 C1-2 (D4): gated answers released with the gate off, whose
     /// rows were re-tagged `Lone` (answered as a lone node would).
     pub acks_downgraded_lone: u64,
+    /// Plan 43 C1-3: the tail fetch. `SealTail`s answered by this node as a
+    /// holder (it sealed its own epoch), as a backup, and refused;
+    /// attempts of a claim to fetch, fetches completed (of those, of a
+    /// lease with an inherited tail), the time spent waiting for a group,
+    /// groups the operator abandoned, member copies dropped, and takeover
+    /// claims of a lease whose group may hold acknowledged rows that
+    /// carried no tail (must stay 0 except after an abandon).
+    pub seal_tail_holder: u64,
+    pub seal_tail_backup: u64,
+    pub seal_tail_refused: u64,
+    /// A listed backup that claimed at the expiry and sealed its role first.
+    pub claim_seals: u64,
+    pub tail_fetch_attempts: u64,
+    pub tail_fetches: u64,
+    pub inherited_tail_fetches: u64,
+    pub tail_fetch_wait_ms_total: u64,
+    pub groups_abandoned: u64,
+    pub member_copies_retired: u64,
+    pub inherited_tails_cleared: u64,
+    pub ttl_claims_without_tail: u64,
     /// Plan 43 C1-2: journal rows the core wrote without setting their
     /// class (they took the session's published one). Must stay 0.
     pub journal_class_from_session: u64,
@@ -2396,6 +2418,33 @@ impl Core {
                 sealed,
                 txs,
             } => self.on_deleg_sealed(now, from, req, gen, sealed, txs, replica, out),
+            // Plan 43 C1-3: a claimant asks for the tail of an epoch this
+            // node was a member of the group of, and the answer.
+            PeerMsg::SealTail {
+                req,
+                epoch,
+                config_version,
+                from: from_seq,
+            } => self.on_seal_tail(
+                now,
+                from,
+                req,
+                epoch,
+                config_version,
+                from_seq,
+                replica,
+                out,
+            ),
+            PeerMsg::SealedTail {
+                req,
+                epoch,
+                held,
+                txs,
+                through,
+                next,
+            } => self.on_sealed_tail(
+                now, from, req, epoch, held, txs, through, next, replica, out,
+            ),
             PeerMsg::DelegRecalled {
                 req,
                 gen,
@@ -2488,6 +2537,10 @@ impl Core {
         if self.on_backup_request_failed(now.wait, req, to) {
             return;
         }
+        // Plan 43 C1-3: a member that did not answer a `SealTail`.
+        if self.on_tail_fetch_failed(now, req, replica, out) {
+            return;
+        }
         if self.on_promise_request_failed(now, req, replica, out) {
             return;
         }
@@ -2524,6 +2577,12 @@ impl Core {
         // here once, before any handler judges it (the handling time is the
         // `t0` of the observation rule, never the GET's send time).
         if let S3Result::LeaseGet(Ok(object)) = &result {
+            // Plan 43 C1-3: a lease of a later epoch that no longer names
+            // a tail this node keeps a copy of ends the copy.
+            if let Some((lease, _)) = object {
+                self.retire_member_copies(lease, replica);
+                self.note_group_wait_lease(lease);
+            }
             if self.lease.observe(now, object.as_ref())
                 && object.as_ref().is_some_and(|(l, _)| {
                     l.holder != 0 && l.holder != self.cfg.node_id && l.ttl_ms == 0
@@ -2590,7 +2649,11 @@ impl Core {
                 self.arm_drain(now, out);
             }
             Timer::JobRequestTimeout(req) => {
-                self.on_job_peer_failed(now, req, 0, replica, out);
+                // Plan 43 C1-3: the timer that ends an attempt of a claim to
+                // fetch its group's tail.
+                if !self.on_tail_fetch_timer(now, req, replica, out) {
+                    self.on_job_peer_failed(now, req, 0, replica, out);
+                }
             }
             Timer::FlushFloor => {
                 self.flush_floor_timer = None;
@@ -2704,6 +2767,9 @@ impl Core {
                 self.publish_forced = true;
                 self.round_waiters.push((op, req));
                 self.nudge(now, out);
+            }
+            Control::AbandonGroup { epoch, gen } => {
+                self.on_control_abandon_group(now, op, epoch, gen, replica, out)
             }
             Control::Reintegrate => {
                 if replica.lost_persisted() && !self.lease.lost {

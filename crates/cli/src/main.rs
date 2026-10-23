@@ -577,6 +577,20 @@ enum RepairCommand {
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
+    /// Let a lease claim that waits for the tail of a lost group go on
+    /// without it (`status.lease.waiting_for_group`). Rows that group
+    /// acknowledged may be lost.
+    AbandonGroup {
+        target: String,
+        /// The epoch `status.lease.waiting_for_group` names.
+        #[arg(long)]
+        epoch: u64,
+        /// The group within the epoch; only 0 (the default) is accepted yet.
+        #[arg(long, default_value_t = 0)]
+        gen: u64,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1779,6 +1793,9 @@ fn run() -> Result<()> {
             print_json(&s)?;
             // The human blocks go to stderr: stdout stays the JSON that
             // scripts and the harness parse.
+            if let Some(line) = render_waiting_for_group(&s.lease) {
+                eprintln!("{line}");
+            }
             eprint!(
                 "{}",
                 sched_cli::render_node_summary(&s.snapsched, &s.snapacct)
@@ -1874,6 +1891,23 @@ fn run() -> Result<()> {
         } => {
             let (_, dir) = resolve_target(&target, state_dir)?;
             ctl::<cm::LocksDropHeld>(&rt, &dir, api::DropHeldParams { ino, remote }, print_ack)
+        }
+        Command::Repair {
+            command:
+                RepairCommand::AbandonGroup {
+                    target,
+                    epoch,
+                    gen,
+                    state_dir,
+                },
+        } => {
+            let (_, dir) = resolve_target(&target, state_dir)?;
+            ctl::<cm::LeaseAbandonGroup>(
+                &rt,
+                &dir,
+                api::AbandonGroupParams { epoch, gen },
+                print_ack,
+            )
         }
         Command::Leave {
             target,
@@ -4089,6 +4123,22 @@ fn ctl<M: constellation_control::Method>(
     print(rt.block_on(control::call::<M>(dir, params))?)
 }
 
+/// The `status` line for a lease claim that waits for the tail of a lost
+/// group (plan 43 C1-3), or `None` when nothing waits.
+fn render_waiting_for_group(lease: &api::LeaseStatus) -> Option<String> {
+    let w = lease.waiting_for_group.as_ref()?;
+    let sources: Vec<String> = w.sources.iter().map(u64::to_string).collect();
+    Some(format!(
+        "lease claim waits for the tail of epoch {}'s group (asked node(s) {}, {} s so far); \
+         `constellation repair abandon-group --epoch {}` lets it go on without it, and rows \
+         that group acknowledged may be lost",
+        w.epoch,
+        sources.join(", "),
+        w.waited_ms / 1000,
+        w.epoch
+    ))
+}
+
 fn print_ack(ack: api::Ack) -> Result<()> {
     println!("{}", ack.detail);
     Ok(())
@@ -4746,6 +4796,60 @@ mod parse_byte_size_tests {
             Command::Mount { web_ui, .. } => assert_eq!(web_ui, Some(8080)),
             _ => panic!("expected Mount"),
         }
+    }
+
+    #[test]
+    fn repair_abandon_group_parses() {
+        let cli = Cli::try_parse_from([
+            "constellation",
+            "repair",
+            "abandon-group",
+            "fs",
+            "--epoch",
+            "7",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Repair {
+                command: RepairCommand::AbandonGroup { epoch, gen, .. },
+            } => assert_eq!((epoch, gen), (7, 0)),
+            _ => panic!("expected repair abandon-group"),
+        }
+        let cli = Cli::try_parse_from([
+            "constellation",
+            "repair",
+            "abandon-group",
+            "fs",
+            "--epoch",
+            "7",
+            "--gen",
+            "2",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Repair {
+                command: RepairCommand::AbandonGroup { epoch, gen, .. },
+            } => assert_eq!((epoch, gen), (7, 2)),
+            _ => panic!("expected repair abandon-group"),
+        }
+        // The epoch is required.
+        assert!(Cli::try_parse_from(["constellation", "repair", "abandon-group", "fs"]).is_err());
+    }
+
+    #[test]
+    fn status_line_names_the_waiting_group() {
+        let mut lease = api::LeaseStatus::default();
+        assert_eq!(render_waiting_for_group(&lease), None);
+        lease.waiting_for_group = Some(api::WaitingForGroupStatus {
+            epoch: 4,
+            waited_ms: 12_000,
+            sources: vec![2, 3],
+        });
+        let line = render_waiting_for_group(&lease).unwrap();
+        assert!(line.contains("epoch 4"), "{line}");
+        assert!(line.contains("2, 3"), "{line}");
+        assert!(line.contains("12 s"), "{line}");
+        assert!(line.contains("abandon-group --epoch 4"), "{line}");
     }
 
     #[test]

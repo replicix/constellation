@@ -340,6 +340,23 @@ pub enum LogRecord {
     /// already in a log keeps its meaning (the cut inferred from what the
     /// replica holds of the generation).
     RecallCut { dir: u64, gen: u64, through: u64 },
+    /// Plan 43 C1-3 (§5.8, Q1): the operator abandoned the group of epoch
+    /// `epoch` (`gen` 0: the root group; C2 uses the other generations):
+    /// the claimant that took the lease went on without that group's tail,
+    /// because no member of it could be reached. Carried by that claimant's
+    /// epoch marker instead of [`LogRecord::TailFollows`]; the log's
+    /// permanent record that rows the group may have acknowledged are not
+    /// re-shipped by this tenure (their clients' retries by rid are what
+    /// remains). `through_known`: the highest journal seq of the group the
+    /// claimant knew of (0: none). Touches nothing.
+    ///
+    /// Appended at the end of the enum, as the postcard ordering comment on
+    /// this type requires.
+    GroupAbandoned {
+        epoch: u64,
+        gen: u64,
+        through_known: u64,
+    },
 }
 
 impl LogRecord {

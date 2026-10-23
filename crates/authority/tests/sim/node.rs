@@ -3129,3 +3129,37 @@ pub fn is_quiescent(meta: &Meta) -> bool {
             .map(|q| q.is_empty())
             .unwrap_or(false)
 }
+
+/// Plan 43 C1-3: whether `meta` carries `rid`'s outcome anywhere a copy
+/// of an acknowledged op can be: its `completed` rows (the log, or its
+/// journal), its journal's transactions, any backup tail it holds (the
+/// epochs of a run are few), and its member copies.
+pub fn meta_holds_rid(meta: &Meta, rid: Rid) -> bool {
+    let carries = |txs: &[constellation_meta::BackupTx]| {
+        txs.iter().any(|t| {
+            t.records.iter().any(|r| {
+                matches!(
+                    r,
+                    constellation_meta::LogRecord::Completed { rid: x }
+                        | constellation_meta::LogRecord::Refused { rid: x, .. }
+                        if *x == rid
+                )
+            })
+        })
+    };
+    if Replica::completed_outcome(meta, rid)
+        .map(|o| o.is_some())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if carries(&Replica::journal_txs_from(meta, 0, usize::MAX)) {
+        return true;
+    }
+    let mut epochs: Vec<u64> = (1..=64).collect();
+    epochs.extend(Replica::member_copy_epochs(meta));
+    epochs.into_iter().any(|e| {
+        carries(&Replica::backup_tail(meta, e))
+            || Replica::member_copy(meta, e).is_some_and(|(_, txs)| carries(&txs))
+    })
+}

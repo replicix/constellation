@@ -119,6 +119,7 @@ impl TouchSet {
             | LogRecord::Delegate { .. }
             | LogRecord::Recall { .. }
             | LogRecord::RecallCut { .. }
+            | LogRecord::GroupAbandoned { .. }
             | LogRecord::TailFollows { .. } => {}
             LogRecord::Clone { nodes, .. } => {
                 for node in nodes {
@@ -864,7 +865,7 @@ fn apply_one(
             Ok(Applied::Done)
         }
         // The replica's session state reads it (`SessionState::owe`).
-        LogRecord::TailFollows { .. } => Ok(Applied::Done),
+        LogRecord::TailFollows { .. } | LogRecord::GroupAbandoned { .. } => Ok(Applied::Done),
     }
 }
 

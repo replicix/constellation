@@ -4759,9 +4759,35 @@ counts; `AUTHORITY_SIM_ORACLE_DEBUG=1` prints each I1 violation as judged, and (
 run did over the fields that predate the oracles (the per-class answer
 counters of C2a are left out): two trees give the same
 fingerprint seed by seed when the oracles' plumbing changed no schedule (the
-identity sweep). With it, `SWEEP-BUDGET` names each seed whose strict
-durability the one-backup failure budget waived (`Cluster::note_takedown`,
-`note_s3_cut`).
+identity sweep). With it, `SWEEP-BUDGET` names each seed whose faults took
+every copy of acknowledged, unshipped rows down (or cut from S3) past the
+point others may claim the lease (`Cluster::note_takedown`, `note_s3_cut`;
+`Report::double_faults`). Since plan 43 C1-3 it waives nothing: the claim
+of such a lease fetches a member's sealed tail or waits for one.
+
+**Plan 43 C1-2/C1-3.** `SWEEP-CLAIM-TOTALS` prints, per sweep, the answers
+whose class claim no judgement or journal row bears out
+(`class_claim_mismatch`: an answer that says it waited for a group but only
+`Lone` judges it, or whose row carries another class than the answer names
+— fails under `strict_commit`, with the planted
+`plant_claim_root_group_on_lone` as its non-vacuity control), the gated
+answers released with the gate off whose rows were re-tagged `Lone`
+(`acks-downgraded-lone`), and the rows the core journaled without setting a
+class (`journal-class-from-session`, must be 0: a call site that forgot it).
+The tail fetch: `Stats::tail_fetches`, `tail_fetch_attempts`,
+`inherited_tail_fetches`, `groups_abandoned` and (must be 0 outside an
+abandon) `ttl_claims_without_tail`. `SimConfig::abandon_after_ms` has the
+operator abandon a group a claim has waited for that long
+(`repair abandon-group`); a run that ends with a claim still waiting
+(`Report::waiting_for_group`) skips the convergence checks and owes instead
+that every acknowledged rid is held somewhere (`acked_held_somewhere`: the
+log, a journal, a backup tail or a member copy). New configurations:
+`backup-group-cut-ttl` (the holder and its backup cut from S3 and from the
+third node for a lease TTL and four takeover windows; `-holder-only` and
+`-backup-only` also lose the other member for good) and `backup-chain-ttl`
+(a sealing successor dies holding the predecessor's tail unshipped:
+`FaultKind::CrashWhenTailUnshipped`; the third node must fetch it from the
+old group, `inherited_tail_fetches`).
 
 **Plan 43 C7b: offsets beyond the margin.** The cross-node compares (a claimant
 judging a lease by its own wall against the holder's wall expiry) are safe only

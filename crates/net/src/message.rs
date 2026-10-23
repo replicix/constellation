@@ -798,6 +798,30 @@ pub enum Payload {
         round: u64,
         ttl_ms: u64,
     },
+    // ---- plan 43 C1-3: the tail fetch (appended, as above) ----
+    /// A claimant of the lease by TTL asks a member of the old group to
+    /// seal epoch `epoch` and send what it holds of it, from journal seq
+    /// `from_seq` (0: the first batch); `config_version`: the version of
+    /// the lease the claimant read. Answered by [`Payload::SealedTail`].
+    SealTail {
+        claimant: u64,
+        req_id: u64,
+        epoch: u64,
+        config_version: u64,
+        from_seq: u64,
+    },
+    /// The member's answer: `txs` is postcard of `Vec<BackupTx>` (a batch
+    /// of `backup_batch_rows`; `next`: ask again from there), `through`
+    /// the last journal seq of its contiguous hold; `held: false`: it
+    /// holds no tail of the epoch.
+    SealedTail {
+        req_id: u64,
+        epoch: u64,
+        held: bool,
+        txs: Vec<u8>,
+        through: u64,
+        next: Option<u64>,
+    },
 }
 
 /// A lease's renewal key on the wire (`constellation_store_s3::RenewalKey`):

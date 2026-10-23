@@ -133,6 +133,16 @@ pub enum FaultKind {
     /// Plan 30 §M14: kill a node other than the lease holder while it is
     /// inside a critical section (its grant is outwaited).
     CrashLocker { restart_ms: Option<u64> },
+    /// Plan 43 C1-3 (`backup-chain-ttl`): kill `node` the moment it holds a
+    /// lease whose tenure took a predecessor's tail over (a seal) and has
+    /// that tail journaled but unshipped (waiting up to `within_ms` for it);
+    /// restart it after `restart_ms`. The tail then rests on its disk and
+    /// in the old group's copies only (D2).
+    CrashWhenTailUnshipped {
+        node: NodeId,
+        within_ms: u64,
+        restart_ms: Option<u64>,
+    },
     /// Plan 30 §M10: an S3 outage for the current holder and `members −
     /// 1` other nodes (the lowest ids), which are also cut from every
     /// other node over P2P; the others keep S3. The sim's epoch
@@ -604,6 +614,12 @@ pub struct SimConfig {
     /// fast path ignores `Core::ack_gated`, so a holder answers its own op
     /// from its local disk while a backup is committed.
     pub plant_ungated_fast_path: bool,
+    /// Plan 43 C1-3 (§5.8, Q1): the operator abandons the group a claim has
+    /// waited for this long (simulated ms), as `constellation repair
+    /// abandon-group --epoch E` does (`Control::AbandonGroup` on the node
+    /// that waits). `None`: nobody does; a claim whose group is gone for good
+    /// then ends the run `waiting_for_group`.
+    pub abandon_after_ms: Option<u64>,
     /// Test-only (`c1_the_claim_check_catches_a_planted_commit_claim`): the
     /// sim's fast path claims `RootGroup` for a row that waited for nothing
     /// (a lone one).
@@ -869,6 +885,7 @@ impl Default for SimConfig {
             rebuild_stub: false,
             plant_ungated_fast_path: false,
             plant_claim_root_group_on_lone: false,
+            abandon_after_ms: None,
         }
     }
 }
@@ -877,9 +894,17 @@ impl Default for SimConfig {
 pub struct Report {
     pub seed: u64,
     /// Plan 30 §M9: faults that exceeded the one-failure durability
-    /// budget (`Cluster::note_takedown`); non-empty relaxes the
-    /// strict-durability checks for the run.
-    pub durability_budget_exceeded: Vec<String>,
+    /// budget (`Cluster::note_takedown`): classified and printed
+    /// (`SWEEP-BUDGET`), never waived since plan 43 C1-3 (the claim of a
+    /// lease whose group may hold acknowledged rows carries a member's
+    /// sealed tail or waits for one).
+    pub double_faults: Vec<String>,
+    /// Plan 43 C1-3: the run ended with a claim still waiting for the tail
+    /// of a group none of whose members answers (after the end-of-run heal
+    /// and settle): the convergence checks are skipped and every
+    /// acknowledged rid must be held somewhere instead
+    /// (`acked_held_somewhere`).
+    pub waiting_for_group: bool,
     pub ops_invoked: usize,
     pub ops_returned: usize,
     /// Plan 45 follow-up (`SimConfig::link_ratio`): links and exchanges
@@ -2875,6 +2900,53 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
             ))
             .await;
         }
+        FaultKind::CrashWhenTailUnshipped {
+            node,
+            within_ms,
+            restart_ms,
+        } => {
+            let mut waited = 0;
+            let found = loop {
+                let n = cluster.get(node);
+                let v = n.view();
+                if n.alive()
+                    && v.held_epoch.is_some()
+                    && v.stats.backup_tail_applied > 0
+                    && v.journal_len > 0
+                {
+                    break true;
+                }
+                if waited >= within_ms {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                waited += 5;
+            };
+            if !found {
+                note(format!(
+                    "t={} crash-when-tail-unshipped: node {node} never held a tail",
+                    fault.at_ms
+                ));
+                return;
+            }
+            note(format!(
+                "t={} node {node} holds the predecessor's tail unshipped: crash it",
+                cluster.env.clock.elapsed_ms()
+            ));
+            Box::pin(run_fault(
+                cluster,
+                ScheduledFault {
+                    at_ms: 0,
+                    kind: FaultKind::CrashNode {
+                        node,
+                        restart_ms,
+                        keep_journal: true,
+                    },
+                },
+                log.clone(),
+            ))
+            .await;
+        }
         FaultKind::CrashLocker { restart_ms } => {
             let Some(node) = wait_for_locker(&cluster).await else {
                 note(format!("t={} crash-locker: no locker", fault.at_ms));
@@ -3478,6 +3550,37 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // log must not stall on one absent member's chunk.
     let sampler_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stall_violations: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    // Plan 43 C1-3: the operator who abandons a group a claim has waited
+    // for too long.
+    if let Some(after_ms) = cfg.abandon_after_ms {
+        let (cluster, stop, fault_log) = (cluster.clone(), sampler_stop.clone(), fault_log.clone());
+        tokio::spawn(async move {
+            let mut done: BTreeSet<(NodeId, u64)> = BTreeSet::new();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                for id in cluster.ids() {
+                    let n = cluster.get(id);
+                    if !n.alive() {
+                        continue;
+                    }
+                    let Some(w) = n.view().ack.waiting_for_group else {
+                        continue;
+                    };
+                    if w.waited_ms >= after_ms && done.insert((id, w.epoch)) {
+                        fault_log.lock().unwrap().push(format!(
+                            "t={} node {id}: repair abandon-group --epoch {}",
+                            cluster.env.clock.elapsed_ms(),
+                            w.epoch
+                        ));
+                        drop(n.control(constellation_authority::Control::AbandonGroup {
+                            epoch: w.epoch,
+                            gen: 0,
+                        }));
+                    }
+                }
+            }
+        });
+    }
     if cfg.chunk_writes > 0.0 {
         let (cluster, stop, violations) = (
             cluster.clone(),
@@ -3854,9 +3957,32 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // op is never exempt — a rollback of one is exactly what the backup
     // (or `ack=s3`) exists to make impossible, so only ops the client
     // abandoned (its process died with the call in flight) are tentative.
-    let budget_exceeded = cluster.budget_exceeded.lock().unwrap().clone();
-    report.durability_budget_exceeded = budget_exceeded.clone();
-    let strict_durability = cfg.strict_durability && budget_exceeded.is_empty();
+    // Plan 43 C1-3: a double fault (every copy of the rows down, or cut
+    // from S3, past the point others may claim the lease) is still
+    // classified and printed (`SWEEP-BUDGET`), but waives nothing: a claim
+    // of a lease whose group may hold acknowledged rows fetches the sealed
+    // tail of a member, or waits for one (`waiting_for_group`), so what was
+    // acknowledged is never rolled back by the claim.
+    let double_faults = cluster.budget_exceeded.lock().unwrap().clone();
+    report.double_faults = double_faults;
+    let strict_durability = cfg.strict_durability;
+    // Plan 43 C1-3: what the failure budget used to excuse by classifying the
+    // run is excused by what the plan keeps, for the class that keeps it: an
+    // acknowledgement a lone node gave its own node's client (`Lone`: its
+    // group is itself, no peer within the RTT budget) may be rolled back by a
+    // deposition (plan 43 §5.7, C5 documents the lone branch); every other
+    // class is a commit. The core's claim is what is excused, and the I1
+    // oracle judges that claim separately.
+    let lone_answered: HashSet<Rid> = oracles
+        .acks
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|a| {
+            a.claimed == Some(constellation_authority::core::AckClass::Lone) && !a.is_relay()
+        })
+        .map(|a| a.rid)
+        .collect();
     let mut tentative: HashSet<Rid> = abandoned.lock().unwrap().clone();
     let acked: HashSet<Rid> = history.returned().into_iter().map(|(rid, _)| rid).collect();
     let mut rolled_back_acked = 0usize;
@@ -3866,7 +3992,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             if acked.contains(rid) {
                 rolled_back_acked += 1;
             }
-            if !strict_durability {
+            if !strict_durability || lone_answered.contains(rid) {
                 tentative.insert(*rid);
             }
         }
@@ -3996,6 +4122,42 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let commit_list = commits.lock().unwrap().clone();
     let snapshots: BTreeSet<u64> = commit_list.iter().map(|c| c.applied).collect();
     let oracle = check::replay_log(bucket.raw(), &snapshots).await;
+    // Plan 43 C1-3 (G4): a claim that still waits for the tail of a group
+    // none of whose members answers (no operator abandoned it, or none
+    // could): the cluster is not meant to converge. What is owed instead:
+    // every rid a client was acknowledged is carried by the log, a
+    // journal, a backup tail or a member copy somewhere — nothing was
+    // answered that no copy holds.
+    let waiting_for_group = cluster
+        .ids()
+        .into_iter()
+        .map(|id| cluster.get(id))
+        .filter(|n| n.alive())
+        .any(|n| n.view().ack.waiting_for_group.is_some());
+    if waiting_for_group {
+        report.waiting_for_group = true;
+        let nowhere: Vec<Rid> = history
+            .returned()
+            .into_iter()
+            .map(|(rid, _)| rid)
+            .filter(|rid| !oracle.completed_at.contains_key(rid))
+            .filter(|rid| {
+                !cluster
+                    .ids()
+                    .into_iter()
+                    .any(|id| super::node::meta_holds_rid(&cluster.get(id).meta, *rid))
+            })
+            .collect();
+        if !nowhere.is_empty() {
+            return Err(format!(
+                "acked_held_somewhere: {} acknowledged rid(s) are in no log, journal, backup tail \
+                 or member copy while a claim waits for the group: {nowhere:?}\n  faults: {:?}",
+                nowhere.len(),
+                report.faults
+            ));
+        }
+        return Ok(report);
+    }
     report.segments = oracle.segments;
     report.fenced = oracle.fenced;
     report.commits = commit_list.len();

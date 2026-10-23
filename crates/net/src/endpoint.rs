@@ -1230,6 +1230,27 @@ pub trait PeerService: Send + Sync + 'static {
             }
         })
     }
+    /// Plan 43 C1-3: a claimant of the lease asks this node to seal `epoch`
+    /// and send its tail. Default: not a member of that group.
+    fn seal_tail_requested(
+        &self,
+        _claimant: u64,
+        req_id: u64,
+        epoch: u64,
+        _config_version: u64,
+        _from_seq: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+        Box::pin(async move {
+            Payload::SealedTail {
+                req_id,
+                epoch,
+                held: false,
+                txs: Vec::new(),
+                through: 0,
+                next: None,
+            }
+        })
+    }
     /// Plan 30 §M11, one way: a delegate's renewal (answered by the
     /// root's own [`Payload::DelegRenewed`]). Default: ignored. The reply
     /// to the request itself is [`Payload::Ok`], or the returned payload

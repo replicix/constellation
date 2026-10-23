@@ -902,6 +902,9 @@ pub struct Driver {
     lock_test_replies: HashMap<OpId, oneshot::Sender<LockTestOutcome>>,
     deleg_backup_replies: HashMap<OpId, oneshot::Sender<(u64, bool)>>,
     deleg_seal_replies: HashMap<OpId, oneshot::Sender<(bool, Vec<constellation_meta::DelegateTx>)>>,
+    /// Plan 43 C1-3: a claimant's `SealTail` handed to the core, answered
+    /// by the `SealedTail` the core sends back to the claimant.
+    seal_tail_replies: HashMap<(NodeId, OpId), oneshot::Sender<crate::sync::SealTailAnswer>>,
     /// Plan 30 §M10: peers' promise requests this node is answering.
     promise_replies: HashMap<OpId, oneshot::Sender<(bool, u32)>>,
     /// Plan 30 §M9: the holder's `BackupAppend` requests this node is
@@ -2216,6 +2219,7 @@ impl Driver {
             lock_test_replies: HashMap::new(),
             deleg_backup_replies: HashMap::new(),
             deleg_seal_replies: HashMap::new(),
+            seal_tail_replies: HashMap::new(),
             promise_replies: HashMap::new(),
             backup_replies: HashMap::new(),
             controls: HashMap::new(),
@@ -3280,6 +3284,25 @@ impl Driver {
                     msg: PeerMsg::DelegBackupAppend { req, gen, txs },
                 }))
             }
+            SyncRequest::PeerSealTail {
+                claimant,
+                epoch,
+                config_version,
+                from_seq,
+                reply,
+            } => {
+                let req = self.control_id();
+                self.seal_tail_replies.insert((claimant, req), reply);
+                Some(Internal::Event(Event::Peer {
+                    from: claimant,
+                    msg: PeerMsg::SealTail {
+                        req,
+                        epoch,
+                        config_version,
+                        from: from_seq,
+                    },
+                }))
+            }
             SyncRequest::PeerDelegSeal { root, gen, reply } => {
                 let req = self.control_id();
                 self.deleg_seal_replies.insert(req, reply);
@@ -3551,6 +3574,10 @@ impl Driver {
                     .store(true, Ordering::Relaxed);
                 control(Control::Reintegrate, ControlReply::Text(reply))
             }
+            SyncRequest::AbandonGroup { epoch, gen, reply } => control(
+                Control::AbandonGroup { epoch, gen },
+                ControlReply::Text(reply),
+            ),
             SyncRequest::Leave { force, reply } => {
                 if let Err(e) = crate::leave::refuse_open_epoch(&self.deps.epochs) {
                     let _ = reply.send(Err(e.to_string()));
@@ -4411,6 +4438,82 @@ impl Driver {
                 if let Some(tx) = self.deleg_seal_replies.remove(&req) {
                     let _ = tx.send((sealed, txs));
                 }
+            }
+            // Plan 43 C1-3: the core's answer to a claimant's `SealTail`
+            // goes back to the request's handler.
+            PeerMsg::SealedTail {
+                req,
+                held,
+                txs,
+                through,
+                next,
+                ..
+            } if self.seal_tail_replies.contains_key(&(to, req)) => {
+                if let Some(tx) = self.seal_tail_replies.remove(&(to, req)) {
+                    let _ = tx.send((held, txs, through, next));
+                }
+            }
+            // Plan 43 C1-3: this node, a claimant, asks a member.
+            PeerMsg::SealTail {
+                req,
+                epoch,
+                config_version,
+                from: from_seq,
+            } => {
+                let tx = self.int_tx.clone();
+                let peers = self.deps.peers.clone();
+                let claimant = self.node_id;
+                let timeout = Duration::from_millis(self.core.config().backup_takeover_ms.max(1));
+                if crate::fault::p2p_denied(to) {
+                    let _ = tx.send(Internal::Event(Event::PeerFailed {
+                        req,
+                        to,
+                        outage: true,
+                    }));
+                    return;
+                }
+                tokio::spawn(async move {
+                    let payload = Payload::SealTail {
+                        claimant,
+                        req_id: req.0,
+                        epoch,
+                        config_version,
+                        from_seq,
+                    };
+                    let reply = tokio::time::timeout(
+                        timeout,
+                        peers.request_to_node_timeout(to, &payload, timeout),
+                    )
+                    .await;
+                    match reply {
+                        Ok(Ok(Payload::SealedTail {
+                            req_id,
+                            epoch,
+                            held,
+                            txs,
+                            through,
+                            next,
+                        })) if req_id == req.0 => {
+                            let txs = postcard::from_bytes(&txs).unwrap_or_default();
+                            let _ = tx.send(Internal::Event(Event::Peer {
+                                from: to,
+                                msg: PeerMsg::SealedTail {
+                                    req,
+                                    epoch,
+                                    held,
+                                    txs,
+                                    through,
+                                    next,
+                                },
+                            }));
+                        }
+                        _ => {
+                            let outage =
+                                crate::fault::p2p_denied(to) || !peers.connection_alive(to).await;
+                            let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
+                        }
+                    }
+                });
             }
             PeerMsg::DelegBackupAppend { req, gen, txs } => {
                 let tx = self.int_tx.clone();

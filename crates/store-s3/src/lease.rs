@@ -161,6 +161,37 @@ pub struct Lease {
     /// tombstone. Carried by every tenure that follows.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retired: Vec<u64>,
+    /// Plan 43 C1-3 (D2): the predecessor's committed tail this tenure
+    /// re-ships, until the log carries it. A successor that took a tail over
+    /// (a seal, a fetch, a self-sealed holder's re-claim) journals the
+    /// predecessor's committed rows as its own, and until their segments are
+    /// in the log they are on its disk and in the old group's copies only.
+    /// A claimant of this lease by TTL fetches the tail from the group named
+    /// here (or from the listed backups, which caught up with the whole
+    /// unshipped journal, re-shipped rows included): a configuration that has
+    /// not yet made its predecessor's tail durable is not a configuration a
+    /// claimant may skip. Written by the claim CAS that will re-ship a tail;
+    /// copied by renewals and reconfigurations; cleared by the first renewal
+    /// or reconfiguration CAS after the re-shipped rows are shipped, and by a
+    /// release (everything is in the log).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_tail: Option<Box<InheritedTail>>,
+}
+
+/// Plan 43 C1-3 (D2): the group a tenure's re-shipped tail came from
+/// ([`Lease::inherited_tail`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InheritedTail {
+    /// The epoch the tail belongs to, and the configuration version of its
+    /// lease: what a member is asked for (`SealTail`).
+    pub epoch: u64,
+    pub config_version: u64,
+    /// The nodes that held it: the old holder, the backups its lease listed,
+    /// and the node that fetched it (its copy outlives the fetch).
+    pub members: Vec<u64>,
+    /// The last journal seq of the tail as the claimant took it (the
+    /// source's contiguous hold).
+    pub through: u64,
 }
 
 /// Plan 30 §M9: what an acknowledgement means under a tenure.
@@ -204,6 +235,7 @@ impl Lease {
             ack_policy: AckPolicy::Local,
             granted_delegations: false,
             retired: Vec::new(),
+            inherited_tail: None,
         }
     }
 
@@ -312,6 +344,8 @@ impl Lease {
         Self {
             released: true,
             wanted_by: Vec::new(),
+            // Everything the tenure held is in the log (the release flushed).
+            inherited_tail: None,
             ..self.clone()
         }
     }

@@ -240,6 +240,48 @@ possibly in an earlier life) is dropped and never invited again for the
 epoch, and no acknowledgement waits for it as a backup that could be
 had.
 
+**The TTL path carries the tail too (plan 43 C1-3).** A lease is also
+claimed by anyone, once it ran out unrenewed and the backups' claim grace
+has passed. Its group (the holder and the backups it lists) may hold rows
+it acknowledged that nobody shipped, and a claim from the log alone would
+lose them. So a claimant of a `Backup` lease first asks the group:
+
+1. it sends `SealTail` for the lease's epoch and configuration version to
+   the holder and to every listed backup;
+2. a member persists and syncs a seal of the epoch (its group commits
+   nothing more of it) and answers with what it holds, in batches. A
+   backup answers its contiguous tail; a holder deposes itself (it
+   acknowledges nothing of that epoch again; its unshipped rows are kept
+   as a *member copy*, which also answers any later `SealTail` of the
+   epoch) and answers its journal. Write-all makes any one member's
+   answer complete;
+3. the first member to answer is the one the tail is pulled from; the
+   claim then goes on as a takeover that carries it (`TailFollows` in its
+   marker), conditioned on the lease it read: a holder that renewed or
+   reconfigured meanwhile fails the CAS, and the claim starts over;
+4. a listed backup that holds the tail needs no fetch: it seals its role
+   and claims at the expiry; a holder that sealed itself never revives
+   the epoch, it claims its own expired lease at the next epoch with its
+   member copy as the tail.
+
+**If no member answers, the claim waits** rather than claim without the
+tail (`status.lease.waiting_for_group`; a warning once a minute; the
+writes behind it wait for the lease). An operator who knows the group is
+gone for good ends the wait with `constellation repair abandon-group
+--epoch E`: the claim goes on without the tail and its marker carries
+`GroupAbandoned`. The rows that group acknowledged are then lost.
+
+**An inherited tail stays reachable.** A takeover that re-ships a
+predecessor's tail journals its rows as its own, and until their segments
+are in the log they are on its disk and in the old group's copies only.
+The lease it writes names that group (`inherited_tail`) until the first
+renewal or reconfiguration after its journal shipped through them; a
+claimant of such a lease fetches from the listed backups (which caught up
+with the whole unshipped journal) or from the holder and the old group,
+and the old members keep their copies until a lease read no longer names
+them. Without it, a successor that died before shipping would take the
+last copies of acknowledged rows with it.
+
 The 1.5 s window does not adapt to S3 latency, and does not need to:
 nothing on the heartbeat path touches S3 (the backup channel is P2P
 only, the renewal is never starved by the ship loop, the liveness
@@ -1418,7 +1460,8 @@ See [Configuration](../configuration.md) for parsing rules.
   `s3_fast_takeovers` (triggers, not wins), `dead_root_acquires` (TTL
   takeovers started for ops waiting on a dead root), `ack_floor_waits`,
   `stale_liveness_refusals`, `epoch_carry_refused`,
-  `refusals_journaled`, `reads_durability_blocked`; `classes`
+  `refusals_journaled`, `reads_durability_blocked`; `member_copies` (how
+  many member copies of sealed epochs this node keeps); `classes`
   (plan 43 C2a): the definitive answers this node gave as a sequencer
   (an answer to a forwarder, or to its own client when it was not
   another node's answer passed on) by what they waited for, as
@@ -1426,6 +1469,12 @@ See [Configuration](../configuration.md) for parsing rules.
   `non-stealable` and `lone` — the class a row has under today's gating
   (`Core::root_ack_class`, `Core::deleg_ack_class`); a `lone` answer to
   another node's forward is the speculation plan 43 C2 removes;
+- `lease`: `held`, `holder`, `epoch`, `expires_in_ms`, `lost`, and
+  `waiting_for_group` (`epoch`, `waited_ms`, `sources`; `null` when
+  nothing waits): a claim of the lease is waiting for the tail of
+  `epoch`'s group, which none of the members in `sources` has answered
+  with yet (see
+  [A claim waits for a lost group's tail](#a-claim-waits-for-a-lost-groups-tail));
 - `epoch`: `epoch_slack`, `carrier`, `promise_until_ms`,
   `promise_puts`, `promise_requests_answered`,
   `promise_requests_refused`, `promise_checks`,
@@ -1441,6 +1490,17 @@ See [Configuration](../configuration.md) for parsing rules.
   [Write-path hygiene](write-path-hygiene.md#held-records-statusheld).
 
 ## Troubleshooting
+
+### A claim waits for a lost group's tail
+
+`status.lease.waiting_for_group` is set: the lease of `epoch` listed
+backups, and this node, claiming it, has not yet heard from any of them
+(`sources`) with the tail they acknowledged. The claim keeps asking; it
+goes on by itself as soon as one answers. If those members are gone for
+good, `constellation repair abandon-group myfs --epoch E` (admin) lets
+the claim go on without the tail. Rows that group acknowledged and no
+other copy holds are lost; the command refuses unless a claim waits for
+exactly that epoch's group. `--gen` is accepted but must be 0.
 
 ### Writes got slower after a second node joined
 

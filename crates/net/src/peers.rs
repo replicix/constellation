@@ -1529,6 +1529,7 @@ fn claimed_node_id(payload: &Payload) -> Option<u64> {
         | LockRenew { from, .. }
         | LockMirror { from, .. } => *from,
         DelegRecall { root, .. } | DelegSeal { root, .. } => *root,
+        SealTail { claimant, .. } => *claimant,
         // `BackupAppend::from` is a journal seq; `holder` is the sender.
         ReadRecall { holder, .. }
         | BackupAppend { holder, .. }
@@ -1877,6 +1878,17 @@ async fn handle_stream<S: PeerService>(
             Payload::DelegSeal { root, req_id, gen } => {
                 Some(service.deleg_seal_requested(root, req_id, gen).await)
             }
+            Payload::SealTail {
+                claimant,
+                req_id,
+                epoch,
+                config_version,
+                from_seq,
+            } => Some(
+                service
+                    .seal_tail_requested(claimant, req_id, epoch, config_version, from_seq)
+                    .await,
+            ),
             Payload::LockRequest {
                 requester,
                 req_id,
@@ -2086,6 +2098,7 @@ async fn handle_stream<S: PeerService>(
             | Payload::DelegRecalled { .. }
             | Payload::DelegBackupAck { .. }
             | Payload::DelegSealed { .. }
+            | Payload::SealedTail { .. }
             | Payload::BackupAck { .. }
             | Payload::PromiseReply { .. }
             | Payload::LockReply { .. }

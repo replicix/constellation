@@ -47,7 +47,15 @@
 //!   the acknowledgements that needed it wait for the CAS to land. It
 //!   may add one: stream the journal to it first, CAS it in once it has
 //!   caught up.
-//! - A takeover after the lease expired (`Tick`s) is today's TTL path.
+//! - A takeover after the lease expired (`Tick`s) is today's TTL path: the
+//!   claimant carries no tail (a claimant that is itself a backup carries
+//!   its own). With [`BackupModel::tail_fetch`] (plan 43 C1-3) the claim of
+//!   a lease with listed backups first fetches a live member's tail (and
+//!   seals that member), or waits when no member is alive; with
+//!   [`BackupModel::inherited_tail`] a takeover that re-ships a tail records
+//!   the old group in the register until the log carries the rows, the
+//!   group's members keep their copy until then, and a claim of such a
+//!   lease with no listed backups fetches from those members.
 //!
 //! # Model action → code
 //!
@@ -59,6 +67,7 @@
 //! | `Tail(i)` | `apply_incoming` (a higher epoch deposes the holder at once; a backup trims its tail) |
 //! | `Seal(b)` / `Takeover(b)` | `on_backup_watch` (read the register) → `on_takeover_get` (listed? persist the seal; unlisted: give the role up, unsealed) → `Acquire` with the permit → marker → `apply_backup_tail` |
 //! | `TakeoverS3(i)` | `watch_s3_holder` → the permit → `classify` |
+//! | `TakeoverFetch(i, m)` | `LeaseState::classify` `Plan::FetchTail` → `on_seal_tail` (the member seals and answers) → the claim CAS with `inherited_tail` (`Lease.inherited_tail`) |
 //! | `Remove(h, b)` / `Add(h, b)` | `drop_backup` / `backup_promote` → `issue_reconfig` (a CAS on the object's version) |
 //! | `Crash(i)` | fail-stop; the sim's `CrashHolder` |
 //!
@@ -85,6 +94,11 @@
 //!   [`BackupModel::commit_rule`] is the knob C1 implements; it is
 //!   `false` (today's protocol) in every constructor and the model
 //!   refuses `true` until then.
+//! - A copy held by a member of a register's `inherited` group counts as
+//!   holding an acknowledged write (plan 43 C1-3, D2): the lease names that
+//!   group, so a claimant can fetch from it. Without `inherited_tail` the
+//!   copies of the old group are unreachable once the successor is gone, and
+//!   `acked_never_lost` reports it.
 //! - `sometimes` witnesses: a seal-based takeover, an `S3` fast takeover,
 //!   a removal, a tail re-shipped, every write acknowledged and in the
 //!   log (convergence).
@@ -106,6 +120,9 @@ pub struct BackupModel {
     pub nodes: u8,
     /// Writes per node (each node's client issues them in order).
     pub writes_per_node: u8,
+    /// Plan 43 C1-3: only nodes `0..writers` issue writes (the others are
+    /// holders-to-be and backups); `nodes` in every constructor.
+    pub writers: u8,
     pub policy: Policy,
     /// Nodes listed as backups in the initial register (`Backup` only).
     pub initial_backups: Vec<u8>,
@@ -134,6 +151,19 @@ pub struct BackupModel {
     /// in its replay queue. `false` is today's protocol; `true` is not
     /// implemented yet (C0 records the counterexample of `false`).
     pub commit_rule: bool,
+    /// Plan 43 C1-3: a TTL takeover of a lease whose group may hold
+    /// acknowledged rows (listed backups, or with `inherited_tail` an
+    /// inherited tail) first fetches a live member's tail and seals that
+    /// member; with no live member the claim waits. `false` is today's
+    /// protocol: the TTL claimant carries no tail.
+    pub tail_fetch: bool,
+    /// Plan 43 C1-3 (D2): a takeover that re-ships a predecessor's tail
+    /// records the old group in the register until the log carries the
+    /// rows; the group's members keep their copy of the tail (they do not
+    /// drop it at a newer epoch's marker) until the log carries it; a TTL
+    /// claim of such a lease with no listed backups fetches from those
+    /// members. `false` is today's protocol.
+    pub inherited_tail: bool,
 }
 
 impl BackupModel {
@@ -141,6 +171,7 @@ impl BackupModel {
         BackupModel {
             nodes,
             writes_per_node,
+            writers: nodes,
             policy: Policy::Backup,
             initial_backups: vec![1],
             max_crashes: 1,
@@ -155,6 +186,8 @@ impl BackupModel {
             reconfig: true,
             check_all_acks: false,
             commit_rule: false,
+            tail_fetch: false,
+            inherited_tail: false,
         }
     }
 
@@ -190,6 +223,11 @@ pub struct Reg {
     /// The object's version (`If-Match`): every write to it bumps this,
     /// and a CAS names the version it read.
     pub version: u8,
+    /// Plan 43 C1-3 (D2): the predecessor's group `(epoch, members)` whose
+    /// tail this tenure re-ships, until the log carries the rows. A
+    /// configuration that has not made its predecessor's tail durable is not
+    /// one a claimant may skip.
+    pub inherited: Option<(u8, Vec<u8>)>,
 }
 
 /// One log slot.
@@ -225,6 +263,10 @@ pub struct Node {
     /// As a backup: `(holder, epoch)` backed, and the tail held.
     pub backing: Option<(u8, u8)>,
     pub tail: Vec<u8>,
+    /// Plan 43 C1-3 (`inherited_tail`): `(epoch, id)` copies of a tail this
+    /// node backed, kept past a newer epoch's marker until the log carries
+    /// them (the member copy of the code).
+    pub kept: Vec<(u8, u8)>,
     /// A deposed holder's stranded writes, kept for replay by rid (plan
     /// 30 §M3b); credited while this node is alive.
     pub replay: Vec<u8>,
@@ -270,6 +312,8 @@ pub const SAW_S3_TAKEOVER: u8 = 2;
 pub const SAW_REMOVE: u8 = 4;
 pub const SAW_TAIL_RESHIPPED: u8 = 8;
 pub const SAW_ADD: u8 = 16;
+pub const SAW_TAIL_FETCHED: u8 = 32;
+pub const SAW_INHERITED_FETCHED: u8 = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
@@ -290,6 +334,10 @@ pub struct State {
     pub acked: Vec<(u8, u8, bool)>,
     pub invoked: Vec<u8>,
     pub saw: u8,
+    /// Ghost (plan 43 C1-3): the rows the register's `inherited` tail
+    /// re-shipped (the code's `InheritedTail.through`); the register's
+    /// field is cleared once the log carries all of them.
+    pub inherited_rows: Vec<u8>,
     /// A rule was violated: `(what, write id)`.
     pub violation: Option<(&'static str, u8)>,
 }
@@ -346,7 +394,18 @@ impl State {
                     && n.backing == Some((self.reg.holder, self.reg.epoch))
                     && n.tail.contains(&id)
             });
-            if !held_by_live && !held_by_backup && self.violation.is_none() {
+            // Plan 43 C1-3 (D2): the register's inherited group is named by the
+            // lease, so a claimant can fetch its copy (a live member's tail
+            // of that epoch, or the copy it kept past a newer marker).
+            let held_by_inherited = self.reg.inherited.as_ref().is_some_and(|(ie, members)| {
+                members.iter().any(|m| {
+                    let n = &self.nodes[*m as usize];
+                    n.alive
+                        && ((n.backing.is_some_and(|(_, be)| be == *ie) && n.tail.contains(&id))
+                            || n.kept.contains(&(*ie, id)))
+                })
+            });
+            if !held_by_live && !held_by_backup && !held_by_inherited && self.violation.is_none() {
                 self.violation = Some(("acked write lost", id));
             }
         }
@@ -444,6 +503,10 @@ pub enum Action {
     TakeoverS3(u8),
     /// Anyone takes an expired lease over.
     TakeoverExpired(u8),
+    /// Plan 43 C1-3 (`tail_fetch`): anyone takes an expired lease over after
+    /// fetching the tail of member `.1` of the lease's group (the member
+    /// seals).
+    TakeoverFetch(u8, u8),
     /// The holder decides to remove a backup (an ack timeout), then CASes
     /// the register. With `wait_for_reconfig` the acknowledgements that
     /// needed it wait for the CAS; without, they leave at the decision.
@@ -473,9 +536,17 @@ impl Model for BackupModel {
                     && self.initial_backups.contains(&(i as u8)))
                 .then_some((0, 1)),
                 tail: Vec::new(),
+                kept: Vec::new(),
                 replay: Vec::new(),
                 sealed: 0,
-                writes: vec![WriteState::Pending; self.writes_per_node as usize],
+                writes: vec![
+                    WriteState::Pending;
+                    if (i as u8) < self.writers {
+                        self.writes_per_node as usize
+                    } else {
+                        0
+                    }
+                ],
                 putting: Vec::new(),
             })
             .collect();
@@ -493,6 +564,7 @@ impl Model for BackupModel {
                 config_version: 1,
                 policy: self.policy,
                 version: 1,
+                inherited: None,
             },
             log: vec![Slot::Marker(1)],
             nodes,
@@ -503,6 +575,7 @@ impl Model for BackupModel {
             acked: Vec::new(),
             invoked: vec![0; 16 * n],
             saw: 0,
+            inherited_rows: Vec::new(),
             violation: None,
         }]
     }
@@ -565,7 +638,16 @@ impl Model for BackupModel {
                 && s.reg.epoch < self.max_epoch
                 && (s.reg.holder == NONE || !s.nodes[s.reg.holder as usize].alive)
             {
-                actions.push(Action::TakeoverExpired(iu));
+                match self.fetch_group(s) {
+                    None => actions.push(Action::TakeoverExpired(iu)),
+                    // Plan 43 C1-3: the claim needs one member's tail; with
+                    // no live member it waits (no action).
+                    Some(g) => {
+                        for m in g.candidates {
+                            actions.push(Action::TakeoverFetch(iu, m));
+                        }
+                    }
+                }
             }
             // Reconfiguration by the holder.
             if self.reconfig && s.is_holder(i) {
@@ -665,13 +747,26 @@ impl Model for BackupModel {
                             s.nodes[i].replay.extend(stranded);
                             s.nodes[i].putting.clear();
                         }
-                        if s.nodes[i].backing.is_some_and(|(_, be)| be < e) {
+                        if let Some((_, be)) = s.nodes[i].backing.filter(|(_, be)| *be < e) {
+                            // Plan 43 C1-3 (`inherited_tail`): a member keeps
+                            // its copy of what the log does not carry yet; a
+                            // successor's marker is not coverage.
+                            if self.inherited_tail {
+                                let keep: Vec<u8> = s.nodes[i]
+                                    .tail
+                                    .iter()
+                                    .copied()
+                                    .filter(|id| !s.in_log(*id))
+                                    .collect();
+                                s.nodes[i].kept.extend(keep.into_iter().map(|id| (be, id)));
+                            }
                             s.nodes[i].backing = None;
                             s.nodes[i].tail.clear();
                         }
                     }
                     Slot::Write { id, .. } => {
                         s.nodes[i].tail.retain(|w| *w != id);
+                        s.nodes[i].kept.retain(|(_, w)| *w != id);
                         s.nodes[i].replay.retain(|w| *w != id);
                     }
                 }
@@ -698,7 +793,21 @@ impl Model for BackupModel {
                 s.saw |= SAW_S3_TAKEOVER;
             }
             Action::TakeoverExpired(i) => {
+                if self.fetch_group(&s).is_some() {
+                    return None;
+                }
                 takeover(self, &mut s, i as usize);
+            }
+            Action::TakeoverFetch(i, m) => {
+                let g = self.fetch_group(&s)?;
+                if !g.candidates.contains(&m) {
+                    return None;
+                }
+                s.saw |= SAW_TAIL_FETCHED;
+                if g.inherited {
+                    s.saw |= SAW_INHERITED_FETCHED;
+                }
+                takeover_from(self, &mut s, i as usize, Some((m as usize, g)));
             }
             Action::RemoveDecide(h, b) => {
                 let h = h as usize;
@@ -772,6 +881,16 @@ impl Model for BackupModel {
                 });
             }
         }
+        // Plan 43 C1-3: the first renewal after the log carries the
+        // re-shipped rows clears the inherited tail (`InheritedTail` is
+        // cleared once `shipped_through` reaches it); modelled as it happens.
+        if s.reg.inherited.is_some() && s.inherited_rows.iter().all(|id| s.in_log(*id)) {
+            s.reg.inherited = None;
+            s.reg.version += 1;
+        }
+        if s.reg.inherited.is_none() {
+            s.inherited_rows.clear();
+        }
         s.check_lost(self.check_all_acks);
         s.check_order();
         Some(s)
@@ -797,7 +916,7 @@ impl Model for BackupModel {
                 s.nodes
                     .iter()
                     .all(|n| n.writes.iter().all(|w| *w == WriteState::Acked))
-                    && (0..m.nodes as usize)
+                    && (0..m.writers as usize)
                         .all(|i| (0..m.writes_per_node).all(|k| s.in_log(s.write_id(i as u8, k))))
             }),
         ];
@@ -817,6 +936,17 @@ impl Model for BackupModel {
             }
             _ => {}
         }
+        if self.tail_fetch && self.policy == Policy::Backup {
+            props.push(Property::sometimes("tail_fetched", |_, s: &State| {
+                s.saw & SAW_TAIL_FETCHED != 0
+            }));
+            if self.inherited_tail {
+                props.push(Property::sometimes(
+                    "inherited_tail_fetched",
+                    |_, s: &State| s.saw & SAW_INHERITED_FETCHED != 0,
+                ));
+            }
+        }
         if self.reconfig {
             props.push(Property::sometimes("backup_removed", |_, s: &State| {
                 s.saw & SAW_REMOVE != 0
@@ -830,25 +960,118 @@ impl Model for BackupModel {
     }
 }
 
+/// The group a TTL claimant must fetch a tail from (plan 43 C1-3).
+struct FetchGroup {
+    /// The epoch whose tail is fetched.
+    epoch: u8,
+    /// The group's members (the old holder and its backups).
+    members: Vec<u8>,
+    /// The members alive and holding a tail (or a kept copy) of `epoch`.
+    candidates: Vec<u8>,
+    /// The group is the register's inherited one, not its listed backups.
+    inherited: bool,
+}
+
+impl BackupModel {
+    /// The group an expired lease's claimant fetches from (`tail_fetch`): the
+    /// holder and listed backups of a `Backup` lease with listed backups (a
+    /// member that is alive and holds the role: the holder is dead on the
+    /// TTL path), else the lease's inherited group (`inherited_tail`). `None`:
+    /// no fetch (today's claim, or a lease whose group holds nothing).
+    fn fetch_group(&self, s: &State) -> Option<FetchGroup> {
+        if !self.tail_fetch || s.reg.policy != Policy::Backup {
+            return None;
+        }
+        if !s.reg.backups.is_empty() {
+            let mut members = s.reg.backups.clone();
+            members.push(s.reg.holder);
+            let candidates = s
+                .reg
+                .backups
+                .iter()
+                .copied()
+                .filter(|b| {
+                    let n = &s.nodes[*b as usize];
+                    n.alive && n.backing == Some((s.reg.holder, s.reg.epoch))
+                })
+                .collect();
+            return Some(FetchGroup {
+                epoch: s.reg.epoch,
+                members,
+                candidates,
+                inherited: false,
+            });
+        }
+        let (ie, members) = s.reg.inherited.as_ref().filter(|_| self.inherited_tail)?;
+        let candidates = members
+            .iter()
+            .copied()
+            .filter(|m| {
+                let n = &s.nodes[*m as usize];
+                n.alive
+                    && (n.backing.is_some_and(|(_, be)| be == *ie)
+                        || n.kept.iter().any(|(e, _)| e == ie))
+            })
+            .collect();
+        Some(FetchGroup {
+            epoch: *ie,
+            members: members.clone(),
+            candidates,
+            inherited: true,
+        })
+    }
+}
+
 /// Node `i` takes the register over: CAS to itself at `epoch + 1` (no
 /// backups; the policy the new tenure asks for is the model's), tails to
 /// head, appends its marker, and — as a sealed backup — re-ships what is
 /// left of its tail.
 fn takeover(cfg: &BackupModel, s: &mut State, i: usize) {
-    let from_tail = s.nodes[i].backing == Some((s.reg.holder, s.reg.epoch));
-    let epoch = s.reg.epoch + 1;
+    takeover_from(cfg, s, i, None);
+}
+
+/// [`takeover`], with the tail fetched from member `m` of group `g` (plan 43
+/// C1-3, `tail_fetch`): the member seals (it never acknowledges that epoch
+/// again) and its tail is re-shipped as a seal takeover's is.
+fn takeover_from(cfg: &BackupModel, s: &mut State, i: usize, fetched: Option<(usize, FetchGroup)>) {
+    let old = s.reg.clone();
+    let from_tail = fetched.is_none() && s.nodes[i].backing == Some((old.holder, old.epoch));
+    // The tail that is re-shipped, and the group it comes from.
+    let mut reship: Vec<u8> = Vec::new();
+    let mut group: Option<(u8, Vec<u8>)> = None;
+    if let Some((m, g)) = &fetched {
+        let n = &s.nodes[*m];
+        if n.backing.is_some_and(|(_, be)| be == g.epoch) {
+            reship.extend(n.tail.iter().copied());
+        }
+        for (e, id) in &n.kept {
+            if *e == g.epoch && !reship.contains(id) {
+                reship.push(*id);
+            }
+        }
+        s.nodes[*m].sealed = s.nodes[*m].sealed.max(g.epoch);
+        group = Some((g.epoch, g.members.clone()));
+    } else if from_tail {
+        reship.extend(s.nodes[i].tail.iter().copied());
+        let mut members = old.backups.clone();
+        members.push(old.holder);
+        members.sort();
+        group = Some((old.epoch, members));
+    }
+    let epoch = old.epoch + 1;
     s.reg = Reg {
         holder: i as u8,
         epoch,
         expires: s.t + cfg.lease_ttl,
         backups: Vec::new(),
-        config_version: s.reg.config_version + 1,
+        config_version: old.config_version + 1,
         // The tenure's policy is the model's: `Backup` with no backups
         // yet acknowledges locally and counts nothing as durable until a
         // backup is added (the code's `Local` register policy with a
         // candidate in flight).
         policy: cfg.policy,
-        version: s.reg.version + 1,
+        version: old.version + 1,
+        inherited: None,
     };
     // Tail to head.
     while (s.nodes[i].applied as usize) < s.log.len() {
@@ -865,17 +1088,30 @@ fn takeover(cfg: &BackupModel, s: &mut State, i: usize) {
     // (replayed by rid through itself, plan 30 §M3b's gate).
     let stranded: Vec<u8> = s.nodes[i].journal.drain(..).map(|(w, _)| w).collect();
     s.nodes[i].replay.extend(stranded);
-    if from_tail {
-        let tail = std::mem::take(&mut s.nodes[i].tail);
-        for id in tail {
-            if !s.in_log(id) {
-                s.nodes[i].journal.push((id, Vec::new()));
-                s.saw |= SAW_TAIL_RESHIPPED;
-            }
+    let mut reshipped: Vec<u8> = Vec::new();
+    for id in reship {
+        if !s.in_log(id) {
+            s.nodes[i].journal.push((id, Vec::new()));
+            reshipped.push(id);
+            s.saw |= SAW_TAIL_RESHIPPED;
+        }
+    }
+    // Plan 43 C1-3 (D2): the claim that re-ships a tail names the group the
+    // rows came from, so a later claimant can fetch them from it until the
+    // log carries them; it replaces the predecessor's inherited tail (the
+    // rows that one named are inside this tail).
+    if cfg.inherited_tail && !reshipped.is_empty() {
+        if let Some(g) = group {
+            s.reg.inherited = Some(g);
+            s.inherited_rows.extend(reshipped);
         }
     }
     s.nodes[i].backing = None;
     s.nodes[i].tail.clear();
+    if fetched.is_some_and(|(m, _)| m == i) {
+        // The claimant's own copy became its journal.
+        s.nodes[i].kept.clear();
+    }
     // Under `Local`/`Backup`-with-no-backups the re-shipped writes were
     // already acknowledged; nothing new to acknowledge. Under `S3` they
     // ship as slots and ack on landing (already acked ones stay acked).

@@ -436,6 +436,7 @@ quarter of the lease TTL and logs an error.
 | `constellation delegations TARGET` | list the live delegation table |
 | `constellation reintegrate TARGET` | run a deposed holder's recovery now: roll back the stranded journal and replay it by rid (it also runs on its own) |
 | `constellation repair drop-held TARGET INO` | discard held-back records of an inode into a conflict copy (plan 30 M4, see [Write-path hygiene](features/write-path-hygiene.md)) |
+| `constellation repair abandon-group TARGET --epoch E [--gen G]` | let a lease claim that waits for the tail of a lost group (`status.lease.waiting_for_group`) go on without it; rows that group acknowledged may be lost. `--gen` must be 0 for now. Admin. See [Durability and failover](features/durability-and-failover.md#a-claim-waits-for-a-lost-groups-tail) |
 
 ## Environment variables
 

@@ -104,6 +104,11 @@ impl From<SyncFailure> for String {
     }
 }
 
+/// Plan 43 C1-3: what a member answers a `SealTail` with: whether it holds
+/// the tail, a batch of it, the last journal seq of its contiguous hold,
+/// and where the next batch starts.
+pub type SealTailAnswer = (bool, Vec<constellation_meta::BackupTx>, u64, Option<u64>);
+
 /// A request to the daemon's sync task — the authority core's driver
 /// (`crate::authority_driver`), which turns each into a core event.
 pub enum SyncRequest {
@@ -396,6 +401,15 @@ pub enum SyncRequest {
         gen: u64,
         reply: tokio::sync::oneshot::Sender<(bool, Vec<constellation_meta::DelegateTx>)>,
     },
+    /// Plan 43 C1-3: a claimant's request to seal `epoch` and send this
+    /// node's tail of it; answered `(held, txs, through, next)`.
+    PeerSealTail {
+        claimant: u64,
+        epoch: u64,
+        config_version: u64,
+        from_seq: u64,
+        reply: tokio::sync::oneshot::Sender<SealTailAnswer>,
+    },
     /// Plan 30 §M11 phase 2b: the live write designations `(dir,
     /// designee)`, after every refresh; the root keeps the table in step.
     SyncDesignations {
@@ -516,6 +530,13 @@ pub enum SyncRequest {
     /// Run the deposition recovery now (the control API, or automatically
     /// after mounting a persisted deposed state dir).
     Reintegrate(tokio::sync::oneshot::Sender<Result<String, String>>),
+    /// Plan 43 C1-3, `repair abandon-group`: let the lease claim that waits
+    /// for `epoch`'s tail go on without it (`gen` 0 is the root group).
+    AbandonGroup {
+        epoch: u64,
+        gen: u64,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
     /// Permanently leave the cluster (self). Flushes, tombstones the
     /// registry record, marks the state dir spent, then the caller
     /// unmounts.

@@ -505,6 +505,18 @@ pub trait Replica {
     /// attempted).
     fn backup_seal(&self, epoch: Epoch) -> bool;
     fn backup_sealed_epoch(&self) -> Epoch;
+    /// Plan 43 C1-3: this node's member copy of `epoch` (`Meta::member_copy*`):
+    /// the rows a sealed holder handed a claimant, kept for the next claimant
+    /// of the same lease. `put` is persisted and synced before it returns
+    /// `true`.
+    fn member_copy_put(&self, epoch: Epoch, config_version: u64, txs: &[BackupTx]) -> bool;
+    fn member_copy(&self, epoch: Epoch) -> Option<(u64, Vec<BackupTx>)>;
+    fn member_copy_epochs(&self) -> Vec<Epoch>;
+    fn member_copy_drop(&self, epoch: Epoch);
+    /// Plan 43 C1-3: whether the journal holds an unshipped transaction
+    /// that was executed under `epoch` (a restarted holder's rows, which it
+    /// still owes a claimant that seals them).
+    fn journal_has_epoch_rows(&self, epoch: Epoch) -> bool;
     /// A takeover re-applies one of the predecessor's transactions into
     /// this node's own journal (plan 30 §M3b's replay-from-records path),
     /// completing `rid` once. Every chunk an applied manifest names is
@@ -1362,6 +1374,29 @@ impl Replica for Meta {
 
     fn backup_seal(&self, epoch: Epoch) -> bool {
         Meta::backup_seal(self, epoch).is_ok()
+    }
+
+    fn member_copy_put(&self, epoch: Epoch, config_version: u64, txs: &[BackupTx]) -> bool {
+        Meta::member_copy_put(self, epoch, config_version, txs).is_ok()
+    }
+
+    fn member_copy(&self, epoch: Epoch) -> Option<(u64, Vec<BackupTx>)> {
+        Meta::member_copy(self, epoch)
+            .ok()
+            .flatten()
+            .map(|(info, txs)| (info.config_version, txs))
+    }
+
+    fn member_copy_epochs(&self) -> Vec<Epoch> {
+        Meta::member_copy_epochs(self).unwrap_or_default()
+    }
+
+    fn member_copy_drop(&self, epoch: Epoch) {
+        let _ = Meta::member_copy_drop(self, epoch);
+    }
+
+    fn journal_has_epoch_rows(&self, epoch: Epoch) -> bool {
+        Meta::journal_has_epoch_rows(self, epoch).unwrap_or(false)
     }
 
     fn backup_sealed_epoch(&self) -> Epoch {

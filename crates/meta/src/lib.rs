@@ -39,7 +39,7 @@ pub use session::{
     STREAMS_CAP,
 };
 pub use snapsched::{SnapPolicy, SNAPSHOT_POLICY_XATTR};
-pub use store::backup::{BackupRole, BackupTx};
+pub use store::backup::{BackupRole, BackupTx, MemberCopyInfo};
 pub use store::held::{DroppedHeld, HeldInode, HeldSummary};
 pub use store::inbox::{CompletedOutcome, InboxAck, InboxAckArmed};
 #[cfg(any(test, feature = "test-util"))]

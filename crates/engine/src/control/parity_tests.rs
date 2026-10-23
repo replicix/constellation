@@ -236,6 +236,8 @@ fn params_for(name: &str, root_view: u64, backend_dir: &str) -> Value {
         "browse.xattr" => json!({"path": "/f", "op": "List"}),
         "locks.force_release" => json!({"part": "p0"}),
         "locks.drop_held" => json!({"ino": 987_654_321u64}),
+        // No claim waits for an epoch this offline engine never saw.
+        "lease.abandon_group" => json!({"epoch": 987_654_321u64}),
         "cache.prune" => json!({"target_bytes": u64::MAX}),
         "quota.set" => json!({"max_bytes": null}),
         "view.mount" => {
@@ -629,6 +631,15 @@ fn unix_socket_and_http_dispatch_the_whole_table_identically() {
                 assert!(
                     matches!(unix, Outcome::Ok(_)),
                     "{what}: expected success over the socket: {unix:?}"
+                );
+            }
+            // Plan 43 C1-3: no claim waits for that epoch's group, so the
+            // core refuses: the call reached the handler and was refused
+            // there, never decoded wrongly.
+            if role == Some(Role::Admin) && m.name == "lease.abandon_group" {
+                assert!(
+                    matches!(unix, Outcome::Err(ErrorKind::Failed, _)),
+                    "{what}: expected the core's refusal over the socket: {unix:?}"
                 );
             }
             if role == Some(Role::Admin) && m.name == "browse.read" {

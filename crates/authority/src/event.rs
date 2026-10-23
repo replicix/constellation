@@ -302,6 +302,13 @@ pub enum Control {
     /// Run the deposition recovery now, if this node was deposed, and
     /// report what it did (`reintegrate`).
     Reintegrate,
+    /// Plan 43 C1-3 (§5.8, Q1): the operator accepts that the group of
+    /// `epoch` (generation `gen`; the root group is `gen` 0, anything else
+    /// is C2's) is gone for good: the claim that waits for its tail
+    /// proceeds without it (`constellation repair abandon-group`).
+    /// Answered with `ControlOk::Text`; refused unless a claim is waiting
+    /// for that group.
+    AbandonGroup { epoch: Epoch, gen: u64 },
     /// Flush the journal, publish if the holder, release the lease, and
     /// answer — without stopping (`leave`).
     Flush,
@@ -936,6 +943,32 @@ pub enum PeerMsg {
         req: OpId,
         outcome: LockTestOutcome,
     },
+    /// Plan 43 C1-3 (Q13): seal epoch `epoch` here and send what this node
+    /// holds of it. The claimant of a lease by TTL asks every member of the
+    /// old group (the holder and each listed backup, or the inherited
+    /// group) before its CAS: the first member that answers `held` has,
+    /// write-all, every committed row. `config_version`: the configuration
+    /// of the lease the claimant read (a member accepts any version at or
+    /// above the one it holds); `from`: the first journal seq wanted (0:
+    /// the first batch).
+    SealTail {
+        req: OpId,
+        epoch: Epoch,
+        config_version: u64,
+        from: u64,
+    },
+    /// The answer, in batches of `backup_batch_rows` (`next`: ask again
+    /// from there). `held: false`: this node holds no tail of `epoch` (it
+    /// was not a member, or is not any more); `through`: the last journal
+    /// seq of the contiguous hold.
+    SealedTail {
+        req: OpId,
+        epoch: Epoch,
+        held: bool,
+        txs: Vec<BackupTx>,
+        through: u64,
+        next: Option<u64>,
+    },
 }
 
 impl PeerMsg {
@@ -985,6 +1018,8 @@ impl PeerMsg {
             PeerMsg::LockMirror { .. } => "LockMirror",
             PeerMsg::LockTest { .. } => "LockTest",
             PeerMsg::LockTestReply { .. } => "LockTestReply",
+            PeerMsg::SealTail { .. } => "SealTail",
+            PeerMsg::SealedTail { .. } => "SealedTail",
         }
     }
 
@@ -1006,7 +1041,8 @@ impl PeerMsg {
             | PeerMsg::LockReply { req, .. }
             | PeerMsg::LockRecalled { req }
             | PeerMsg::LockRenewed { req, .. }
-            | PeerMsg::LockTestReply { req, .. } => Some(*req),
+            | PeerMsg::LockTestReply { req, .. }
+            | PeerMsg::SealedTail { req, .. } => Some(*req),
             _ => None,
         }
     }
@@ -1031,7 +1067,8 @@ impl PeerMsg {
             | PeerMsg::LockRequest { req, .. }
             | PeerMsg::LockRecall { req, .. }
             | PeerMsg::LockRenew { req, .. }
-            | PeerMsg::LockTest { req, .. } => Some(*req),
+            | PeerMsg::LockTest { req, .. }
+            | PeerMsg::SealTail { req, .. } => Some(*req),
             _ => None,
         }
     }

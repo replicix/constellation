@@ -2055,6 +2055,10 @@ pub struct AckStatus {
     pub backing_epoch: u64,
     pub backing_acked: u64,
     pub sealed_epoch: u64,
+    /// How many member copies of sealed epochs this node keeps (plan 43
+    /// C1-3).
+    #[serde(default)]
+    pub member_copies: u64,
     /// The latest seal this node made, as its watch measured the holder's
     /// silence.
     #[serde(default)]
@@ -2183,6 +2187,23 @@ pub struct LeaseStatus {
     /// This node was deposed: it refuses to ship and its unshipped
     /// journal is stranded pending reintegration.
     pub lost: bool,
+    /// A claim of the lease waits for the tail of an old group (plan 43
+    /// C1-3); `null` when nothing waits. `constellation repair
+    /// abandon-group --epoch E` lets it go on without the tail.
+    #[serde(default)]
+    pub waiting_for_group: Option<WaitingForGroupStatus>,
+}
+
+/// `status.lease.waiting_for_group`: the claim waits for the tail of
+/// `epoch`'s group, which none of `sources` has answered with yet.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WaitingForGroupStatus {
+    /// The epoch of the lease whose group's tail is awaited.
+    pub epoch: u64,
+    /// How long this claim has waited (ms).
+    pub waited_ms: u64,
+    /// The members asked.
+    pub sources: Vec<u64>,
 }
 
 /// Spool observability (DESIGN.md §12): outstanding unflushed metadata.
@@ -2863,6 +2884,16 @@ pub struct DropHeldParams {
     pub ino: u64,
     #[serde(default)]
     pub remote: bool,
+}
+
+/// `lease.abandon_group` (plan 43 C1-3): the lease claim that waits for the
+/// tail of `epoch`'s backup group goes on without it. `gen` names the group
+/// within the epoch; only 0 (the root group) is accepted for now.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AbandonGroupParams {
+    pub epoch: u64,
+    #[serde(default)]
+    pub gen: u64,
 }
 
 /// `node.logs.tail`: the most recent `lines` log lines, then (with
