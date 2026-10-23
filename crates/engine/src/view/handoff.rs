@@ -51,10 +51,11 @@
 //!   ids), each pinned directory's page sequence and its pinned pages
 //!   (`listing`'s module doc): a listing in progress resumes exactly after
 //!   its cookie's place, even if that entry was deleted meanwhile. The
-//!   unpinned hints do not cross. New in the handover's handle table,
-//!   which is postcard (positional): a handover from a daemon built
-//!   before it fails to decode and rolls back — accepted, no
-//!   compatibility is kept for handover formats.
+//!   unpinned hints do not cross. New in the handle table, with no
+//!   `serde(default)`: across the `exec` the table travels in the
+//!   handoff's JSON (`MountHandoff.view`), where a handoff written by a
+//!   daemon built before it lacks the field, fails to decode and rolls
+//!   back — accepted, no compatibility is kept for handover formats.
 //! - **`writers`**: the write-intent handles among `opens`, which refuse
 //!   passthrough on their inode (plan 38 Z3b).
 //! - **`passthrough`**: the chunk each passthrough handle sits on (plan 38

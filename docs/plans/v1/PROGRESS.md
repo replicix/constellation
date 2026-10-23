@@ -59398,14 +59398,19 @@ directory pins its hints.
   re-export (it opens per request) with an evicted hint and a deleted entry; a `seekdir` back into a region the
   pin bounds gave up on.
 
-**Q7: the Linux NFS client and `NOENT` on `READDIR`** (`fs/nfs/dir.c`, mainline `master` read through a fetch
-and summarised; the pinned commit of the plan was not checked out, and the mapping of `NFS3ERR_NOENT` to
-`-ENOENT` in the status-to-errno table was not verified directly). `nfs_readdir` treats `-EBADCOOKIE` (and
+**Q7: the Linux NFS client and `NOENT` on `READDIR`** (`fs/nfs/dir.c`, first read on mainline `master`;
+**re-read at the plan's pinned `4056b3c9d3c9` in the P5 review**, with the status tables, below). `nfs_readdir` treats `-EBADCOOKIE` (and
 `-ENOTSYNC` after an uncached retry) as a cookie the server lost, ends the listing quietly, and retries
 `-ETOOSMALL`; any other negative result, `-ENOENT` and `-EIO` alike, ends the loop and goes to `getdents`
 unchanged. The filler functions convert no server error. So `ENOENT` is not worse than `EIO` for the client,
-and the errno decision stands. (The code that maps the wire status to an errno is in the protocol-specific
-files and was not read.)
+and the errno decision stands. At `4056b3c9d3c9`: `nfs_readdir` (`fs/nfs/dir.c:1222-1320`) special-cases only
+`-EBADCOOKIE` (`:1279`, with `-ENOTSYNC` after the uncached retry, `:1287`) and `-ETOOSMALL` for plus (`:1292`),
+and `find_and_lock_cache_page` (`:1037`) the same two; any other `res < 0` breaks out and is returned. The wire
+status reaches it as `nfs_stat_to_errno` (`fs/nfs/nfs3xdr.c:2101`, the `READDIR3` decoder), whose table maps
+`NFSERR_NOENT` to `-ENOENT` and `NFSERR_IO` to `-EIO` (`fs/nfs_common/common.c:17-18`); NFSv4 goes through
+`nfs4_stat_to_errno`, whose common table maps `NFS4ERR_NOENT` to `-ENOENT` and `NFS4ERR_IO` to `-EIO`
+(`fs/nfs_common/common.c:81-82`). Not read: `nfs4proc.c`'s exception handler on the v4 path (it acts on
+state and delay errors, not `NOENT`, on mainline).
 
 Tests (`view/listing_tests.rs`, `tests/wire.rs`, `tests/wire_uring.rs`, `conformance/readdir.rs`,
 `cli/src/handover.rs`): `fts_deletion_under_hint_pressure_lists_every_name_once` (scaled: 20k names in rounds
@@ -59423,3 +59428,14 @@ handoff tests (the pins cross the `exec`; a handoff without `listing` rolls back
 plus), with its naive habit (a view that resolves cookies by name alone fails it). With the stream registration
 removed the engine tests above and the kit case on both engine targets fail (`ENOENT`); the Listing-level cap
 test is unaffected, as it never opens a view stream.
+
+**P5 review (2026-10-23).** Fixes: `Engine::close_view` releases the view's directory streams (no `RELEASEDIR`
+comes once the frontend is gone; before, they stayed pinned until the last `Arc<View>` died), test
+`close_view_lets_go_of_the_views_open_directory_streams`; a page asked through an open stream resolves its cookie
+in the page last served through that stream first, so a newer page of another stream holding a different name
+with the same cookie cannot place the resume after the wrong name (a skip; likely at 31 bits), test
+`a_stream_resumes_from_its_own_last_page_past_a_colliding_newer_one`; the releasedir latency test's retries
+release real streams (they released ids already released). Q7 re-read at the pinned commit (above). Open, not
+changed: each open stream's last page is outside every cap, so the exempt bytes are bounded only by the number of
+open directory streams times one page (up to about a quarter of a 1 MiB `READDIR` reply with `max_pages` 256);
+`exempt_bytes` counts them.
