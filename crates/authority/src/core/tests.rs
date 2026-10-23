@@ -38574,7 +38574,7 @@ mod c1_tail_fetch {
                 short_since_progress: false,
                 short_since: w(h.now),
                 unreachable: false,
-                answers_beats: false,
+                answered: false,
                 acked: 0,
                 listed_at: None,
                 counted: 0,
