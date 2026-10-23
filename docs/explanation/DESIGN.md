@@ -534,8 +534,13 @@ know client opens; Constellation avoids the problem with explicit claims.)
   (`FrontendCaps::reports_forget`: the FUSE adapter; never a host that
   drives a view without a kernel, whose kept inodes would never be
   reaped), the view that unlinked a file keeps the orphan, its data and
-  its unpublished writes until the kernel's `FORGET`, not only until the
-  last close, and reports it to the hold task as open. The hold claims it
+  its unpublished writes until the kernel lets go of its last lookup of
+  the inode, not only until the last close, and reports it to the hold
+  task as open. The FUSE adapter counts the lookups its replies hand the
+  kernel and tells the view only when a `FORGET` brings the count to zero:
+  the kernel also forgets single lookups of inodes it still holds, and a
+  `FORGET` of more than was counted keeps the inode rather than reap it
+  ([ADR-31](DECISIONS.md#adr-31-the-fuse-adapter-keeps-the-kernels-lookup-counts)). The hold claims it
   only once the reference outlives a short grace (≤ 1 s, well inside the
   lease TTL a GC round waits; the view asks the hold task to wake for it,
   whatever its refresh period), so the unlink's own lookup, let go of as
