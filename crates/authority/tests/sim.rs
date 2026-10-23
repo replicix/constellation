@@ -529,6 +529,7 @@ fn replay_seed() {
             fast_takeover_successor_restart_before_marker_config()
         }
         Ok("holder-restart-step-forward-readopt") => holder_restart_step_forward_readopt_config(),
+        Ok("ir-readopt-cut") => ir_readopt_cut_config(),
         Ok("locks-nofence") => SimConfig {
             lock_ignore_fence: true,
             ..locks_partition_config()
@@ -1623,6 +1624,33 @@ fn backup_crash_config() -> SimConfig {
                 at_ms: 1_500,
                 kind: FaultKind::CrashHolder {
                     restart_ms: Some(7_000),
+                    keep_journal: true,
+                },
+            },
+        ],
+        ..backup_config()
+    }
+}
+
+/// Integration review (C1-3 x the restart re-adoption): the holder
+/// acknowledges through its backup while cut from S3, restarts at once with
+/// its journal and re-adopts its own lease (a new configuration that lists
+/// no backup). A `+cuts3<node>@<at>:<for>` variant cuts it from S3 again
+/// around the re-adoption, so that its gate cannot ship the rows and its
+/// lease runs out: whoever claims it by TTL must carry them.
+fn ir_readopt_cut_config() -> SimConfig {
+    SimConfig {
+        ops_per_client: 8,
+        random_faults: 0,
+        faults: vec![
+            ScheduledFault {
+                at_ms: 1_100,
+                kind: FaultKind::CutS3Holder { for_ms: 700 },
+            },
+            ScheduledFault {
+                at_ms: 1_500,
+                kind: FaultKind::CrashHolder {
+                    restart_ms: Some(150),
                     keep_journal: true,
                 },
             },
@@ -5078,6 +5106,7 @@ fn sweep_config() {
         "backup-strict" => backup_strict_config(),
         "backup-strict-inbox-off" => backup_strict_inbox_off_config(),
         "backup-crash" => backup_crash_config(),
+        "ir-readopt-cut" => ir_readopt_cut_config(),
         "backup-crash-slow" => SimConfig {
             s3_latency: (60, 200),
             ..backup_crash_config()
@@ -9404,6 +9433,24 @@ fn config_variant(cfg: SimConfig, variant: &str) -> SimConfig {
                 Some(ScheduledFault {
                     at_ms: at.parse().ok()?,
                     kind: FaultKind::Pause {
+                        node: node.parse().ok()?,
+                        for_ms: for_ms.parse().ok()?,
+                    },
+                })
+            };
+            let fault = parse().unwrap_or_else(|| panic!("bad variant +{other}"));
+            let mut faults = cfg.faults.clone();
+            faults.push(fault);
+            SimConfig { faults, ..cfg }
+        }
+        // `cuts3<node>@<at_ms>:<for_ms>`: one more scheduled `CutS3`.
+        other if other.starts_with("cuts3") => {
+            let parse = || -> Option<ScheduledFault> {
+                let (node, rest) = other["cuts3".len()..].split_once('@')?;
+                let (at, for_ms) = rest.split_once(':')?;
+                Some(ScheduledFault {
+                    at_ms: at.parse().ok()?,
+                    kind: FaultKind::CutS3 {
                         node: node.parse().ok()?,
                         for_ms: for_ms.parse().ok()?,
                     },

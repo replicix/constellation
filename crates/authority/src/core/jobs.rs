@@ -3055,15 +3055,18 @@ impl Core {
         // expiry seals its role first, a self-sealed holder takes its own
         // member copy as the tail; whatever tail the claim re-ships is
         // named by the lease it writes (D2), until the log carries it. A
-        // re-adoption of this node's own lease (a restart) keeps what the
-        // lease already says: its rows are on this disk still.
+        // re-adoption of this node's own lease (a restart) names the group
+        // its rows are held by (`own_group_tail`): this disk, and the
+        // backups the lease listed, which the new configuration does not.
         if !self.prepare_tail_for_claim(prev, replica) {
             self.finish_acquire(now, false, replica, out);
             return;
         }
         lease.inherited_tail =
             if prev.holder == self.cfg.node_id && !prev.released && self.bk.sealed < prev.epoch {
-                prev.inherited_tail.clone()
+                self.own_group_tail(prev, replica)
+                    .map(Box::new)
+                    .or_else(|| prev.inherited_tail.clone())
             } else {
                 self.tail_to_inherit(prev, replica).map(Box::new)
             };

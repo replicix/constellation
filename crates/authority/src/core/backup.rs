@@ -4602,6 +4602,20 @@ impl Core {
                 );
                 self.arm_backup_watch(now, out);
             }
+            Some((lease, _))
+                if !lease.released
+                    && lease.inherited_tail.as_ref().is_some_and(|t| {
+                        t.epoch == role.epoch && t.members.contains(&self.cfg.node_id)
+                    }) =>
+            {
+                // Not listed, but the lease names this node's group as the
+                // holder of a tail nobody shipped yet (C1-3 D2; a holder's
+                // restart re-adoption writes a configuration that lists no
+                // backup, `Core::own_group_tail`): a TTL claimant fetches it
+                // from here. Kept, unsealed, until the lease stops naming it.
+                self.lease.note_object(&lease);
+                self.arm_backup_watch(now, out);
+            }
             Some((lease, _)) => {
                 // Not listed any more, or the lease moved on: our tail is
                 // void (a listed successor re-shipped what mattered). Not

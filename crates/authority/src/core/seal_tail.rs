@@ -715,6 +715,38 @@ impl Core {
         })
     }
 
+    /// A re-adoption of this node's own `Backup` lease (a restart, or a CAS
+    /// whose reply was lost): the configuration its CAS writes lists no
+    /// backup (`granted_lease`), but the rows its tenure acknowledged and
+    /// has not shipped are held by this disk and by every backup `prev`
+    /// lists (write-all, C1-1). The lease names that group until the log
+    /// carries them (D2, `clear_covered_tail`), so that a TTL claimant of
+    /// the re-adopted lease fetches them (from a backup, if this node is
+    /// gone) and does not claim a `Local` lease at once without them.
+    pub(crate) fn own_group_tail(
+        &self,
+        prev: &Lease,
+        replica: &dyn Replica,
+    ) -> Option<InheritedTail> {
+        if prev.ack_policy != AckPolicy::Backup
+            || prev.backups.is_empty()
+            || !replica.journal_has_epoch_rows(prev.epoch)
+        {
+            return None;
+        }
+        let mut members: Vec<NodeId> = std::iter::once(prev.holder)
+            .chain(prev.backups.iter().copied())
+            .collect();
+        members.sort_unstable();
+        members.dedup();
+        Some(InheritedTail {
+            epoch: prev.epoch,
+            config_version: prev.config_version,
+            members,
+            through: replica.journal_tip(),
+        })
+    }
+
     /// Before a claim's CAS: a listed backup that claims at the lease's
     /// expiry seals its role first (it takes the tail it holds, and its
     /// group commits nothing more of the epoch); a self-sealed holder

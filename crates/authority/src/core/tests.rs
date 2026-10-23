@@ -38288,6 +38288,160 @@ mod c1_tail_fetch {
         assert!(lease.inherited_tail.is_none());
         assert_eq!(h.core.stats.inherited_tails_cleared, 1);
     }
+
+    /// Integration review (C1-3 x the restart re-adoption of 7f5c6f90 /
+    /// c7b0f86f): node 1 restarted holding rows it acknowledged under
+    /// `Backup` with node 2 listed and has not shipped. A delegate's
+    /// renewal makes it re-adopt its own lease. The claim CAS writes a new
+    /// configuration that lists no backup (`granted_lease`); it must name
+    /// the group that holds those rows (`inherited_tail`) until the log
+    /// carries them, or a TTL claimant of the re-adopted lease (node 1 cut
+    /// from S3 before its gate ships, then gone) claims a `Local` lease at
+    /// once and loses rows node 2 still holds. Fails on the parent: the
+    /// re-adoption kept the old lease's `inherited_tail` (none).
+    #[test]
+    fn a_restart_readoption_names_the_group_holding_its_unshipped_rows() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.takeover_promise_check = false;
+        // The previous incarnation's acknowledged rows of epoch 1.
+        h.meta.set_holder_epoch(1);
+        for i in 1..=2 {
+            let create = h.create(&format!("f{i}"));
+            let rid = Rid {
+                node: 1,
+                incarnation: 1,
+                seq: i,
+            };
+            constellation_meta::execute_mutate(&h.meta, &create, Some(rid)).unwrap();
+        }
+        assert!(h.meta.journal_has_epoch_rows(1).unwrap());
+        let lease = Lease {
+            backups: vec![2],
+            ack_policy: AckPolicy::Backup,
+            config_version: 2,
+            ..lease_of(1, 1, h.now.plus(30_000).0)
+        };
+        h.core.lease.note_object(&lease);
+        let out = h.step(deleg_renew_from(2, 77));
+        assert_eq!(h.core.job(), Some(JobKind::Acquire), "{out:?}");
+        let get = find_s3(&out, |r| matches!(r, S3Op::LeaseGet));
+        let mut out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((lease.clone(), tag())))),
+        });
+        // Drive the claim to its CAS (tail to head first, if it asks).
+        let mut written = None;
+        for _ in 0..8 {
+            if let Some(l) = s3_ops(&out).into_iter().find_map(|(_, r)| match r {
+                S3Op::LeaseSwap { lease, .. } => Some(lease.clone()),
+                _ => None,
+            }) {
+                written = Some(l);
+                break;
+            }
+            if let Some((op, _)) = s3_ops(&out)
+                .into_iter()
+                .find(|(_, r)| matches!(r, S3Op::SegmentRun { .. }))
+            {
+                out = h.step(Event::S3 {
+                    op,
+                    result: S3Result::SegmentRun(Ok(Vec::new())),
+                });
+                continue;
+            }
+            out = at_head(&mut h, out);
+        }
+        let written = written.unwrap_or_else(|| panic!("no CAS in {out:?}"));
+        assert_eq!((written.holder, written.epoch), (1, 1), "a re-adoption");
+        assert!(written.backups.is_empty(), "a new configuration lists none");
+        let t = written
+            .inherited_tail
+            .clone()
+            .expect("names the group that holds its unshipped rows");
+        assert_eq!((t.epoch, t.config_version), (1, 2));
+        assert!(t.members.contains(&2), "{t:?}");
+        // So a TTL claimant of the re-adopted lease asks node 2 for them.
+        let h0 = Harness::new(3);
+        let expired = Lease {
+            expires_unix_ms: h0.now.0 - 1,
+            holder_expires_ms: h0.now.0 - 1,
+            holder_wait_ms: h0.now.0 - 1,
+            ..written
+        };
+        let (_h, out) = claimant(3, &expired);
+        assert!(
+            seal_tails(&out).iter().any(|a| a.0 == 2 && a.2 == 1),
+            "{out:?}"
+        );
+    }
+
+    /// ... and the backup the re-adopted lease no longer lists, but names
+    /// as a member of the tail's group, keeps its tail for the claimant
+    /// that asks for it. Fails on the parent: its watch read the
+    /// re-adopted lease as "no longer a listed backup" and discarded the
+    /// tail, so the claimant's fetch waited for a holder that was gone.
+    #[test]
+    fn a_backup_named_by_the_inherited_tail_keeps_it_for_a_claimant() {
+        let mut h = Harness::new(2);
+        let txs = tail_of(2);
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::BackupAppend {
+                req: OpId(1),
+                epoch: 1,
+                holder: 1,
+                config_version: 2,
+                candidacy: 1,
+                from: 1,
+                txs: txs.clone(),
+                through: 0,
+                sent_ms: 0,
+                expires_ms: 0,
+                clock: 0,
+            },
+        });
+        assert_eq!(h.core.bk.role.map(|r| r.epoch), Some(1));
+        let readopted = Lease {
+            config_version: 3,
+            inherited_tail: Some(Box::new(InheritedTail {
+                epoch: 1,
+                config_version: 2,
+                members: vec![1, 2],
+                through: 2,
+            })),
+            ..lease_of(1, 1, h.now.plus(30_000).0)
+        };
+        let mut watch = timers(&out, TimerKind::BackupWatch)[0];
+        let mut read = false;
+        for _ in 0..8 {
+            h.advance(1_500);
+            let out = h.step(Event::Timer { id: watch });
+            if let Some((op, _)) = s3_ops(&out)
+                .into_iter()
+                .find(|(_, r)| matches!(r, S3Op::LeaseGet))
+            {
+                let out = h.step(Event::S3 {
+                    op,
+                    result: S3Result::LeaseGet(Ok(Some((readopted.clone(), tag())))),
+                });
+                read = true;
+                let _ = out;
+                break;
+            }
+            watch = timers(&out, TimerKind::BackupWatch)[0];
+        }
+        assert!(read, "the watch read the lease");
+        assert_eq!(h.core.bk.sealed, 0, "unlisted: never sealed by silence");
+        assert!(h.core.bk.role.is_some(), "the tail is kept");
+        assert!(!h.meta.backup_tail(1).unwrap().is_empty());
+        // A TTL claimant of the re-adopted lease asks it: it answers.
+        let out = seal_tail(&mut h, 3, 1, 2, 0);
+        assert!(
+            sealed(&out).iter().any(|s| s.0 == 3 && s.1 && s.2 > 0),
+            "{out:?}"
+        );
+    }
 }
 
 /// Plan 43 C1-2: the class at journal time, carried with every answer.
