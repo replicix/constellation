@@ -37970,6 +37970,66 @@ mod c1_tail_fetch {
         assert_eq!(c.meta.backup_tail(1).unwrap().len(), txs.len());
     }
 
+    /// A member that keeps answering is not a member that is gone: a tail
+    /// longer than one window's batches is pulled to its end, each batch in
+    /// a window of its own. Fails on the parent: the attempt's single
+    /// window, armed when it began, ended the pull mid-tail (the next
+    /// attempt starts over from the first batch, and so does every later
+    /// one): the claim waited for a group whose member answered all along.
+    #[test]
+    fn a_tail_pulled_in_batches_gets_a_window_per_batch() {
+        let txs = tail_of(3);
+        let h0 = Harness::new(3);
+        let lease = expired(&h0, vec![2]);
+        let (mut c, out) = claimant(3, &lease);
+        let window = c.core.cfg.backup_takeover_ms;
+        let first_window = timers(&out, TimerKind::JobRequestTimeout)[0];
+        let asked = seal_tails(&out);
+        let (_, req2, ..) = *asked.iter().find(|a| a.0 == 2).unwrap();
+        let through = txs.last().unwrap().last;
+        let batch = |req: OpId, txs: &[BackupTx], next: Option<u64>| Event::Peer {
+            from: 2,
+            msg: PeerMsg::SealedTail {
+                req,
+                epoch: 1,
+                held: true,
+                txs: txs.to_vec(),
+                through,
+                next,
+            },
+        };
+        // Each batch arrives late in its window, but within it; the window
+        // before it then runs out.
+        let mut req = req2;
+        let mut expiring = first_window;
+        c.advance(window - 10);
+        for i in 0..txs.len() - 1 {
+            let out = c.step(batch(req, &txs[i..=i], Some(txs[i + 1].first)));
+            let more = seal_tails(&out);
+            assert_eq!(more.len(), 1, "the next batch is asked: {out:?}");
+            req = more[0].1;
+            c.advance(20);
+            c.step(Event::Timer { id: expiring });
+            assert!(
+                c.core.bk.tf.is_some(),
+                "the pull goes on after batch {i} (the member answers)"
+            );
+            if let Some(w) = timers(&out, TimerKind::JobRequestTimeout).first() {
+                expiring = *w;
+            }
+            c.advance(window - 30);
+        }
+        let out = c.step(batch(req, &txs[txs.len() - 1..], None));
+        assert_eq!(c.core.stats.tail_fetches, 1, "{out:?}");
+        assert_eq!(c.meta.backup_tail(1).unwrap().len(), txs.len());
+        assert!(
+            s3_ops(&out)
+                .iter()
+                .any(|(_, r)| matches!(r, S3Op::SegmentRun { .. })),
+            "the claim goes on to its tail to head: {out:?}"
+        );
+    }
+
     /// A holder asked for its tail seals its own epoch: it keeps its rows
     /// as a member copy, aborts what waits for the group, and
     /// acknowledges nothing of the epoch again (a late acknowledgement of

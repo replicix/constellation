@@ -403,7 +403,8 @@ impl Core {
         self.tail_fetch_next(now, next, replica, out);
     }
 
-    /// Pull the next batch of the chosen member, or finish.
+    /// Pull the next batch of the chosen member (in a window of its own), or
+    /// finish.
     fn tail_fetch_next(
         &mut self,
         now: Now,
@@ -413,8 +414,29 @@ impl Core {
     ) {
         match next {
             Some(from_seq) => {
+                if self.bk.tf.as_ref().is_none_or(|t| t.chosen.is_none()) {
+                    return;
+                }
+                // A member that answers is no member that is gone: each
+                // batch it is asked for gets a window of its own. The
+                // attempt's one window, armed when it began, ended the pull
+                // of any tail longer than one window's batches and started
+                // it over from the first, every attempt, with the member
+                // answering all along (a wait no member's return ends).
+                let old = self.bk.tf.as_mut().and_then(|t| t.timer.take());
+                if let Some(t) = old {
+                    self.cancel_timer(t, out);
+                }
+                let round = self.op_id();
+                let at = now.wait.plus(self.cfg.backup_takeover_ms.max(1));
+                let timer = self.set_timer_wait(at, Timer::JobRequestTimeout(round), out);
+                self.bk.tf_round = Some(round);
                 let req = self.op_id();
-                let Some(ch) = self.bk.tf.as_mut().and_then(|t| t.chosen.as_mut()) else {
+                let Some(tf) = self.bk.tf.as_mut() else {
+                    return;
+                };
+                tf.timer = Some(timer);
+                let Some(ch) = tf.chosen.as_mut() else {
                     return;
                 };
                 ch.req = req;
