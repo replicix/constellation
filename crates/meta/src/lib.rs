@@ -67,6 +67,16 @@ pub struct DirEntry {
     pub kind: constellation_fs_core::InodeKind,
 }
 
+/// A directory entry with its name as the dentry key stores it: the bytes
+/// of the stored (UTF-8) form, never lossy-converted. A name resumes a
+/// listing by exactly these bytes ([`MetaStore::readdir_after`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawDirEntry {
+    pub name: Vec<u8>,
+    pub ino: Ino,
+    pub kind: constellation_fs_core::InodeKind,
+}
+
 /// One child row used by the snapshot builder.  `snapshot_children` performs
 /// the dentry/inode join in one indexed query per directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +198,29 @@ pub trait MetaStore: Send + Sync {
     fn lookup(&self, parent: Ino, name: &str) -> Result<Option<FileAttr>, MetaError>;
     fn getattr(&self, ino: Ino) -> Result<Option<FileAttr>, MetaError>;
     fn readdir(&self, parent: Ino) -> Result<Vec<DirEntry>, MetaError>;
+    /// One page of `parent`'s entries in name order (the byte order of the
+    /// stored names): at most `limit` entries strictly after the name
+    /// `after`, or from the first when it is `None`. The work is bounded by
+    /// the page: the range is read lazily and no dentry beyond it is
+    /// decoded, and a single-name and a hard-linked name (plan 45: the copy
+    /// form and the `Remote` form) are read alike, as `ino` and `kind` are
+    /// all this reads.
+    ///
+    /// The cursor is a name, so it needs no state, and it survives the
+    /// removal of the name it points at: the page then starts at what
+    /// follows. `NotDir`/`NoEnt` are checked only for the first page
+    /// (`after` is `None`). A resume of a directory removed in the meantime
+    /// answers the empty tail, and the caller, which holds the directory,
+    /// decides what that means. (Names are never empty, so `Some(b"")`
+    /// is the first page too.)
+    ///
+    /// `Meta::readdir` stays for callers that want every entry as a `String`.
+    fn readdir_after(
+        &self,
+        parent: Ino,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<RawDirEntry>, MetaError>;
     fn readlink(&self, ino: Ino) -> Result<Option<String>, MetaError>;
     fn manifest(&self, ino: Ino) -> Result<Option<Vec<u8>>, MetaError>;
     fn get_xattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>, MetaError>;

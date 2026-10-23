@@ -58044,3 +58044,49 @@ after = 37180aef). Medians, µs:
 Every gate of plan 45 §7 holds on all four (single-name operations within ±5 %); the
 single-name cost is a consistent +1–4 % (the form check on every inode write), the
 same on every file system.
+
+## Plan 40 — FUSE READDIRPLUS and name-ordered listings
+
+In progress (spec `p40-spec.md`). Each commit's fail-before and gates are recorded as it lands.
+
+### P1: a dentry range read resumed after a name (R3a, meta level)
+
+`MetaStore::readdir_after(parent, after, limit)` returns up to `limit` entries
+of a directory in name-byte order, strictly after `after` (`RawDirEntry`: the
+stored name's bytes, so a non-UTF-8 name, escaped by `vfs::name::stored_form`,
+resumes by its exact key; `Meta::readdir` and its callers are unchanged), and
+`Meta::scratch_readdir_after` is its scratch twin. The range starts at
+`dentry(parent, after) + 0x00` and `take(limit)` bounds the dentries decoded.
+Only `ino_and_kind` is read, which both dentry forms of plan 45 (the
+attribute copy, the 9-byte `Remote`) begin with, so a page costs the same
+under either. `require_dir` runs for the first page only; a resume of a
+directory removed meanwhile answers the empty tail. `Meta::dentries_read()`
+(always on, like plan 45's `inode_reads`) counts the dentries decoded by
+`readdir`, `readdir_after` and the scratch twins.
+
+Tests (`readdir_after_tests`, `store/mod.rs`): pages of 1, 7 and 1000 equal a
+full scan over names that are prefixes of one another, hold NUL and escaped
+bytes, and sit under both dentry forms; resume after a removed name; the
+cost. Written against the naive implementation (`readdir_entries`, then
+skip): on it only the two `reads_only_the_page` tests fail (the count is the
+whole directory per page); on the real code all 6 pass.
+
+Meta-level measurement, `crates/meta/tests/readdir_after_perf.rs`, release,
+the build box, 50 000 names in a single-name directory and in a
+directory of two-name files, 7 reps, A/B/B/A (the before build is the same
+file without the `readdir_after` workloads), warm. Per file system, the page
+loop the engine runs today (a full `readdir`, sorted, per 680-name page)
+against `readdir_after` pages, ms for the whole listing:
+
+| | ext4 | xfs | btrfs | tmpfs |
+|---|---|---|---|---|
+| `readdir` + skip per page (today) | 920 / 925 | 908 / 811 | 766 / 738 | 858 / 796 |
+| `readdir_after` pages | 10.5 / 10.2 | 11.1 / 9.8 | 9.8 / 9.1 | 10.1 / 9.5 |
+| one cold resumed page (µs) | 139 / 132 | 138 / 126 | 127 / 121 | 128 / 123 |
+
+(single-name / hard-linked directory.) The unchanged path, `readdir` of the
+whole directory, before to after: within -4 % to +3 % on ext4, xfs and tmpfs;
+on btrfs the runs read -1 % to +10 %. The same library code under a test binary
+that differs only by an unused test function moves by up to 4 %, which is
+the host's and the linker's layout, not the change (the only code on that
+path is one relaxed add per call).

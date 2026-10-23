@@ -15,6 +15,7 @@ use constellation_mtree::record::{
     self, Attrs, DentryRecord, InodeRecord, Kind, Payload, XattrPlacement,
 };
 use fjall::{Readable, SingleWriterTxKeyspace, SingleWriterWriteTx};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) fn kind_to_mtree(k: InodeKind) -> Kind {
     Kind::from_u8(k.as_u8()).expect("InodeKind and mtree::Kind discriminants match")
@@ -641,6 +642,7 @@ pub(crate) fn readdir_entries(
     r: &impl Readable,
     ns: &SingleWriterTxKeyspace,
     parent: Ino,
+    read: &AtomicU64,
 ) -> Result<Vec<crate::DirEntry>, MetaError> {
     let range = keys::dentries_of(parent);
     let mut out = Vec::new();
@@ -659,6 +661,52 @@ pub(crate) fn readdir_entries(
             kind: kind_from_mtree(kind),
         });
     }
+    read.fetch_add(out.len() as u64, Ordering::Relaxed);
+    Ok(out)
+}
+
+/// One page of `parent`'s dentries in key (name byte) order, strictly after
+/// `after`. The lower bound is the smallest key greater than
+/// `dentry(parent, after)`, which is that key with a zero byte appended (the
+/// name `after` + `\0` itself is a valid name and is included). The fjall
+/// range is lazy, so `take(limit)` bounds the dentries read to the page.
+///
+/// `read` counts the dentries decoded ([`Meta::dentries_read`](crate::store::Meta::dentries_read)).
+///
+/// `require_dir` is the caller's, for a first page only: see
+/// [`crate::MetaStore::readdir_after`].
+pub(crate) fn readdir_after_entries(
+    r: &impl Readable,
+    ns: &SingleWriterTxKeyspace,
+    parent: Ino,
+    after: Option<&[u8]>,
+    limit: usize,
+    read: &AtomicU64,
+) -> Result<Vec<crate::RawDirEntry>, MetaError> {
+    let range = keys::dentries_of(parent);
+    let from = match after {
+        Some(name) if !name.is_empty() => {
+            let mut key = keys::dentry(parent, name);
+            key.push(0);
+            key
+        }
+        _ => range.start().to_vec(),
+    };
+    let mut out = Vec::with_capacity(limit.min(1024));
+    for guard in r.range(ns, from..range.end().to_vec()).take(limit) {
+        let (k, v) = guard.into_inner()?;
+        let (ino, kind) = DentryRecord::ino_and_kind(&v)?;
+        let name = match constellation_mtree::keys::Key::parse(&k)? {
+            constellation_mtree::keys::Key::Dentry { name, .. } => name.to_vec(),
+            _ => continue,
+        };
+        out.push(crate::RawDirEntry {
+            name,
+            ino,
+            kind: kind_from_mtree(kind),
+        });
+    }
+    read.fetch_add(out.len() as u64, Ordering::Relaxed);
     Ok(out)
 }
 

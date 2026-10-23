@@ -6,7 +6,7 @@ use crate::error::MetaError;
 use crate::hlc::now_ns;
 use crate::record::LogRecord;
 use crate::store::{alloc_ino_tx, atime, journal, misc, ns, Meta};
-use crate::{DirEntry, MetaStore, SetXattrMode};
+use crate::{DirEntry, MetaStore, RawDirEntry, SetXattrMode};
 use constellation_fs_core::types::ROOT_INO;
 use constellation_fs_core::{FileAttr, Ino, InodeKind};
 use constellation_mtree::keys;
@@ -1427,7 +1427,20 @@ impl MetaStore for Meta {
     fn readdir(&self, parent: Ino) -> Result<Vec<DirEntry>, MetaError> {
         let r = self.db.read_tx();
         ns::require_dir(&r, &self.ns, parent)?;
-        ns::readdir_entries(&r, &self.ns, parent)
+        ns::readdir_entries(&r, &self.ns, parent, &self.dentries_read)
+    }
+
+    fn readdir_after(
+        &self,
+        parent: Ino,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<RawDirEntry>, MetaError> {
+        let r = self.db.read_tx();
+        if after.is_none() {
+            ns::require_dir(&r, &self.ns, parent)?;
+        }
+        ns::readdir_after_entries(&r, &self.ns, parent, after, limit, &self.dentries_read)
     }
 
     fn readlink(&self, ino: Ino) -> Result<Option<String>, MetaError> {

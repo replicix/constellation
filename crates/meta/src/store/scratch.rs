@@ -14,7 +14,7 @@
 
 use crate::error::MetaError;
 use crate::store::{ns, Meta};
-use crate::{DirEntry, MetaStore, SetXattrMode};
+use crate::{DirEntry, MetaStore, RawDirEntry, SetXattrMode};
 use constellation_fs_core::types::now_ns;
 use constellation_fs_core::{FileAttr, Ino};
 use constellation_mtree::keys;
@@ -174,7 +174,20 @@ impl Meta {
 
     pub fn scratch_readdir(&self, parent: Ino) -> Result<Vec<DirEntry>, MetaError> {
         let r = self.db.read_tx();
-        ns::readdir_entries(&r, &self.scratch, parent)
+        ns::readdir_entries(&r, &self.scratch, parent, &self.dentries_read)
+    }
+
+    /// [`MetaStore::readdir_after`] over the scratch namespace. Like
+    /// `scratch_readdir` it does not `require_dir`: a scratch directory
+    /// that is gone lists as empty.
+    pub fn scratch_readdir_after(
+        &self,
+        parent: Ino,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<RawDirEntry>, MetaError> {
+        let r = self.db.read_tx();
+        ns::readdir_after_entries(&r, &self.scratch, parent, after, limit, &self.dentries_read)
     }
 
     pub fn scratch_getattr(&self, ino: Ino) -> Result<Option<FileAttr>, MetaError> {

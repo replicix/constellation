@@ -677,6 +677,10 @@ pub struct Meta {
     /// hard-linked name's `Remote` entry costs, where a single-name entry
     /// answers from its copy ([`Meta::inode_reads`]).
     inode_reads: AtomicU64,
+    /// Plan 40: dentries decoded by the directory reads (`readdir`,
+    /// `readdir_after` and their scratch twins) — what a page costs
+    /// ([`Meta::dentries_read`]).
+    dentries_read: AtomicU64,
     /// Plan 32 §6.3: bumped (and the hook told) whenever a snapshot row
     /// may have appeared or gone, so the accounting index reconciles
     /// without polling the rows.
@@ -884,6 +888,14 @@ impl Meta {
     /// attributes of a tree without hard links leaves this where it was.
     pub fn inode_reads(&self) -> u64 {
         self.inode_reads.load(Ordering::Relaxed)
+    }
+
+    /// Plan 40: how many dentries the directory reads have decoded in all.
+    /// A page of `readdir_after` adds the entries it returned, so a listing
+    /// by pages reads each dentry once; a read that decoded the directory
+    /// to find a page would add the whole directory per page.
+    pub fn dentries_read(&self) -> u64 {
+        self.dentries_read.load(Ordering::Relaxed)
     }
 
     pub(crate) fn note_inode_read(&self) {
@@ -1099,6 +1111,7 @@ impl Meta {
             rollback_hook: std::sync::OnceLock::new(),
             rolled_back: std::sync::Mutex::new(Vec::new()),
             inode_reads: AtomicU64::new(0),
+            dentries_read: AtomicU64::new(0),
             snapshot_gen: AtomicU64::new(0),
             snapshot_hook: std::sync::RwLock::new(None),
             vacuum_baselines: Default::default(),
@@ -2439,6 +2452,421 @@ mod dentry_copy_tests {
             .collect();
         b.apply_records(&records).unwrap();
         assert_forms_match(&b, "replay");
+    }
+}
+
+/// Plan 40 R3a: `readdir_after`, one name-ordered page of a directory
+/// resumed after a name. The tests are written against the naive
+/// implementation (read the whole directory with `readdir_entries` and skip
+/// to the name), which gets the order and the removed-name cases right and
+/// fails only the cost test.
+#[cfg(test)]
+mod readdir_after_tests {
+    use super::*;
+    use crate::{MetaStore, RawDirEntry};
+    use constellation_fs_core::types::ROOT_INO;
+    use constellation_fs_core::{Ino, InodeKind};
+
+    /// How `crates/vfs/src/name.rs` stores the byte `b` (0x80..=0xFF) of a
+    /// name that is not UTF-8: the code point `U+10FF00 + b`. Such a name's
+    /// key bytes are `F4 8F BE/BF xx`, past every name made of ordinary
+    /// code points, and among themselves in the order of the bytes.
+    fn esc(b: u8) -> char {
+        assert!(b >= 0x80);
+        char::from_u32(0x10_FF00 + u32::from(b)).unwrap()
+    }
+
+    /// Names that stress the byte order of the keys: prefixes of one
+    /// another (`a`, `a\0`, `ab`), NUL inside, multi-byte code points and
+    /// escaped bytes, then random mixtures of them.
+    fn tricky_names(n: usize) -> Vec<String> {
+        let mut names: Vec<String> = vec![
+            "a".into(),
+            "a\0".into(),
+            "a\0\0".into(),
+            "ab".into(),
+            "a\u{1}".into(),
+            "b".into(),
+            "\u{e9}".into(),
+            "\u{ffff}".into(),
+            "\u{10000}".into(),
+            format!("a{}", esc(0xff)),
+            format!("a{}b", esc(0x80)),
+            format!("{}", esc(0x80)),
+            format!("{}", esc(0xfe)),
+            format!("{}", esc(0xff)),
+            format!("{}{}", esc(0xff), esc(0x80)),
+            format!("{}\0", esc(0x80)),
+        ];
+        let alphabet: Vec<char> = vec![
+            'a',
+            'b',
+            'z',
+            '\0',
+            '\u{7f}',
+            '\u{e9}',
+            '\u{20ac}',
+            esc(0x80),
+            esc(0xc3),
+            esc(0xff),
+        ];
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        while names.len() < n {
+            let len = 1 + (next() % 5) as usize;
+            let name: String = (0..len)
+                .map(|_| alphabet[(next() % alphabet.len() as u64) as usize])
+                .collect();
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        names
+    }
+
+    /// One page read: `limit` entries after a name, or the first page.
+    type Page<'a> = dyn Fn(Option<&[u8]>, usize) -> Vec<RawDirEntry> + 'a;
+
+    /// Every page walk of a directory: `limit` names at a time, each page
+    /// resumed after the previous page's last name.
+    fn walk(read: &Page<'_>, limit: usize) -> Vec<RawDirEntry> {
+        let mut all: Vec<RawDirEntry> = Vec::new();
+        loop {
+            let after = all.last().map(|e| e.name.clone());
+            let page = read(after.as_deref(), limit);
+            assert!(page.len() <= limit, "a page is at most the limit");
+            if page.is_empty() {
+                return all;
+            }
+            all.extend(page);
+        }
+    }
+
+    /// The expected listing: `readdir`'s entries, by the bytes of the name.
+    fn by_bytes(entries: Vec<crate::DirEntry>) -> Vec<RawDirEntry> {
+        let mut v: Vec<RawDirEntry> = entries
+            .into_iter()
+            .map(|e| RawDirEntry {
+                name: e.name.into_bytes(),
+                ino: e.ino,
+                kind: e.kind,
+            })
+            .collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v
+    }
+
+    fn names_of(v: &[RawDirEntry]) -> Vec<Vec<u8>> {
+        v.iter().map(|e| e.name.clone()).collect()
+    }
+
+    /// A directory with the names of [`tricky_names`] in both dentry forms
+    /// (plan 45: a single-name inode's dentry holds the attribute copy; a
+    /// hard-linked inode's names are 9-byte `Remote` entries), and
+    /// sub-directories among them.
+    fn populated(meta: &Meta, n: usize) -> (Ino, Vec<String>) {
+        let dir = meta.mkdir(ROOT_INO, "dir", 0o755, 0, 0).unwrap().ino;
+        let other = meta.mkdir(ROOT_INO, "other", 0o755, 0, 0).unwrap().ino;
+        let names = tricky_names(n);
+        for (i, name) in names.iter().enumerate() {
+            match i % 4 {
+                0 => {
+                    meta.mkdir(dir, name, 0o755, 0, 0).unwrap();
+                }
+                1 => {
+                    // Two names: this one and one in `other` are `Remote`.
+                    let ino = meta.create(dir, name, 0o644, 0, 0).unwrap().ino;
+                    meta.link(ino, other, &format!("l{i}")).unwrap();
+                }
+                2 => {
+                    meta.symlink(dir, name, "target", 0, 0).unwrap();
+                }
+                _ => {
+                    meta.create(dir, name, 0o644, 0, 0).unwrap();
+                }
+            }
+        }
+        (dir, names)
+    }
+
+    fn forms_in(meta: &Meta, dir: Ino) -> (usize, usize) {
+        let r = meta.db.read_tx();
+        let (mut copies, mut remotes) = (0, 0);
+        for e in ns::readdir_entries(&r, &meta.ns, dir, &meta.dentries_read).unwrap() {
+            let d = ns::get_dentry_record(&r, &meta.ns, dir, &e.name)
+                .unwrap()
+                .unwrap();
+            if d.attrs.is_some() {
+                copies += 1;
+            } else {
+                remotes += 1;
+            }
+        }
+        (copies, remotes)
+    }
+
+    #[test]
+    fn readdir_after_pages_equal_a_full_scan() {
+        let meta = Meta::open_in_memory().unwrap();
+        let (dir, names) = populated(&meta, 300);
+        let (copies, remotes) = forms_in(&meta, dir);
+        assert!(
+            copies > 0 && remotes > 0,
+            "{copies} copies, {remotes} remotes"
+        );
+
+        let expected = by_bytes(meta.readdir(dir).unwrap());
+        assert_eq!(expected.len(), names.len());
+        // The names came back as the stored bytes, escaped ones included,
+        // not as a lossy conversion.
+        for n in &names {
+            assert!(
+                expected.iter().any(|e| e.name == n.as_bytes()),
+                "{n:?} is listed under its own bytes"
+            );
+        }
+        assert!(expected.iter().any(|e| e.kind == InodeKind::Dir));
+        assert!(expected.iter().any(|e| e.kind == InodeKind::File));
+        assert!(expected.iter().any(|e| e.kind == InodeKind::Symlink));
+        // `a` < `a\0` < `a\0\0` < `a\x01` < `ab`, and the escaped names are
+        // last, in the order of their bytes.
+        let pos = |n: &str| {
+            expected
+                .iter()
+                .position(|e| e.name == n.as_bytes())
+                .unwrap()
+        };
+        assert!(pos("a") < pos("a\0") && pos("a\0") < pos("a\0\0"));
+        assert!(pos("a\0\0") < pos("a\u{1}") && pos("a\u{1}") < pos("ab"));
+        assert!(pos("\u{10000}") < pos(&esc(0x80).to_string()));
+        assert!(pos(&esc(0x80).to_string()) < pos(&esc(0xfe).to_string()));
+        assert!(pos(&esc(0xfe).to_string()) < pos(&esc(0xff).to_string()));
+
+        for limit in [1, 7, 1000] {
+            let got = walk(
+                &|after, n| meta.readdir_after(dir, after, n).unwrap(),
+                limit,
+            );
+            assert_eq!(got, expected, "pages of {limit}");
+        }
+        // The first page, and a page that starts anywhere, agree with the
+        // full scan too.
+        let first = meta.readdir_after(dir, None, 5).unwrap();
+        assert_eq!(first, expected[..5]);
+        for (i, e) in expected.iter().enumerate().step_by(11) {
+            let page = meta.readdir_after(dir, Some(&e.name), 9).unwrap();
+            assert_eq!(page, expected[i + 1..(i + 10).min(expected.len())]);
+        }
+        assert!(meta.readdir_after(dir, None, 0).unwrap().is_empty());
+        // `Some("")` cannot name an entry: the first page.
+        assert_eq!(meta.readdir_after(dir, Some(b""), 5).unwrap(), first);
+        // A neighbouring directory's entries are not read into the page.
+        let other = meta.lookup(ROOT_INO, "other").unwrap().unwrap().ino;
+        let o = meta.readdir_after(other, None, 10_000).unwrap();
+        assert_eq!(
+            names_of(&o).len(),
+            names.len() / 4 + (names.len() % 4 > 1) as usize
+        );
+        assert!(o.iter().all(|e| e.kind == InodeKind::File));
+        // A name that is not there resumes at the next one.
+        let at = expected
+            .iter()
+            .position(|e| e.name.as_slice() > &b"a\0\0\0"[..])
+            .unwrap();
+        let gone = meta.readdir_after(dir, Some(b"a\0\0\0"), 2).unwrap();
+        assert_eq!(gone, expected[at..at + 2]);
+    }
+
+    #[test]
+    fn readdir_after_resumes_after_a_removed_name() {
+        let meta = Meta::open_in_memory().unwrap();
+        let (dir, _) = populated(&meta, 40);
+        let all = by_bytes(meta.readdir(dir).unwrap());
+        let page = meta.readdir_after(dir, None, 10).unwrap();
+        let last = page.last().unwrap().name.clone();
+        let name = String::from_utf8(last.clone()).unwrap();
+        if page.last().unwrap().kind == InodeKind::Dir {
+            meta.rmdir(dir, &name).unwrap();
+        } else {
+            meta.unlink(dir, &name).unwrap();
+        }
+        // The cursor is a name, not an entry: the page continues at what
+        // follows, exactly as if the name were still there.
+        let rest = meta.readdir_after(dir, Some(&last), 10_000).unwrap();
+        assert_eq!(rest, all[10..]);
+        // Removing the names after it as well.
+        for e in &all[10..14] {
+            let n = String::from_utf8(e.name.clone()).unwrap();
+            if e.kind == InodeKind::Dir {
+                meta.rmdir(dir, &n).unwrap();
+            } else {
+                meta.unlink(dir, &n).unwrap();
+            }
+        }
+        let rest = meta.readdir_after(dir, Some(&last), 10_000).unwrap();
+        assert_eq!(rest, all[14..]);
+        // Resuming after the last name, removed or not, is the empty tail.
+        let end = &all.last().unwrap().name;
+        assert!(meta.readdir_after(dir, Some(end), 10).unwrap().is_empty());
+
+        // The first page of a directory that is not one, or not there, is
+        // an error; a resume of a directory removed meanwhile is the empty
+        // tail (the view decides what that means).
+        let file = String::from_utf8(
+            all.iter()
+                .find(|e| e.kind == InodeKind::File)
+                .unwrap()
+                .name
+                .clone(),
+        )
+        .unwrap();
+        if let Ok(Some(f)) = meta.lookup(dir, &file) {
+            assert!(meta.readdir_after(f.ino, None, 10).is_err());
+        }
+        assert!(meta.readdir_after(9_999_999, None, 10).is_err());
+        let gone = meta.mkdir(ROOT_INO, "gone", 0o755, 0, 0).unwrap().ino;
+        meta.create(gone, "x", 0o644, 0, 0).unwrap();
+        meta.unlink(gone, "x").unwrap();
+        meta.rmdir(ROOT_INO, "gone").unwrap();
+        assert!(meta.readdir_after(gone, Some(b"x"), 10).unwrap().is_empty());
+        assert!(meta.readdir_after(gone, None, 10).is_err());
+    }
+
+    #[test]
+    fn readdir_after_reads_only_the_page() {
+        let meta = Meta::open_in_memory().unwrap();
+        let dir = meta.mkdir(ROOT_INO, "big", 0o755, 0, 0).unwrap().ino;
+        let n = 1000;
+        for i in 0..n {
+            let ino = meta
+                .create(dir, &format!("f{i:05}"), 0o644, 0, 0)
+                .unwrap()
+                .ino;
+            if i % 3 == 0 {
+                meta.link(ino, ROOT_INO, &format!("l{i}")).unwrap();
+            }
+        }
+        // One page from the middle reads the page, and at most one more.
+        let before = meta.dentries_read();
+        let page = meta.readdir_after(dir, Some(b"f00500"), 10).unwrap();
+        let cost = meta.dentries_read() - before;
+        assert_eq!(page.len(), 10);
+        assert!(
+            (10..=11).contains(&cost),
+            "a page of 10 read {cost} dentries"
+        );
+
+        // A whole listing by pages reads each dentry once.
+        let before = meta.dentries_read();
+        let all = walk(&|after, k| meta.readdir_after(dir, after, k).unwrap(), 25);
+        let cost = meta.dentries_read() - before;
+        assert_eq!(all.len(), n);
+        assert!(
+            cost <= n as u64 + 1,
+            "{cost} dentries read to list {n} (naive: ~n^2/page)"
+        );
+        // The full read counts too.
+        let before = meta.dentries_read();
+        meta.readdir(dir).unwrap();
+        assert_eq!(meta.dentries_read() - before, n as u64);
+    }
+
+    fn scratch_populated(meta: &Meta, parent: Ino, n: usize) -> Vec<String> {
+        let names = tricky_names(n);
+        for (i, name) in names.iter().enumerate() {
+            let ino = 1_000_000 + i as u64;
+            if i % 3 == 0 {
+                meta.scratch_mkdir(parent, name, ino, 0o755, 0, 0).unwrap();
+            } else {
+                meta.scratch_create(parent, name, ino, 0o644, 0, 0).unwrap();
+            }
+        }
+        names
+    }
+
+    #[test]
+    fn scratch_readdir_after_pages_equal_a_full_scan() {
+        let meta = Meta::open_in_memory().unwrap();
+        let parent = 900_000;
+        let names = scratch_populated(&meta, parent, 200);
+        let expected = by_bytes(meta.scratch_readdir(parent).unwrap());
+        assert_eq!(expected.len(), names.len());
+        let sorted: Vec<Vec<u8>> = {
+            let mut v: Vec<Vec<u8>> = names.iter().map(|n| n.as_bytes().to_vec()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names_of(&expected), sorted);
+        for limit in [1, 7, 1000] {
+            let got = walk(
+                &|after, n| meta.scratch_readdir_after(parent, after, n).unwrap(),
+                limit,
+            );
+            assert_eq!(got, expected, "pages of {limit}");
+        }
+        // No `require_dir`, as `scratch_readdir`: nothing there lists empty.
+        assert!(meta.scratch_readdir_after(1, None, 10).unwrap().is_empty());
+        assert!(meta
+            .scratch_readdir_after(1, Some(b"x"), 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn scratch_readdir_after_resumes_after_a_removed_name() {
+        let meta = Meta::open_in_memory().unwrap();
+        let parent = 900_000;
+        scratch_populated(&meta, parent, 40);
+        let all = by_bytes(meta.scratch_readdir(parent).unwrap());
+        let page = meta.scratch_readdir_after(parent, None, 10).unwrap();
+        let last = page.last().unwrap().name.clone();
+        meta.scratch_unlink(parent, std::str::from_utf8(&last).unwrap())
+            .unwrap();
+        let rest = meta
+            .scratch_readdir_after(parent, Some(&last), 1000)
+            .unwrap();
+        assert_eq!(rest, all[10..]);
+    }
+
+    #[test]
+    fn scratch_readdir_after_reads_only_the_page() {
+        let meta = Meta::open_in_memory().unwrap();
+        let parent = 900_000;
+        let n = 1000;
+        for i in 0..n {
+            meta.scratch_create(
+                parent,
+                &format!("f{i:05}"),
+                1_000_000 + i as u64,
+                0o644,
+                0,
+                0,
+            )
+            .unwrap();
+        }
+        let before = meta.dentries_read();
+        let page = meta
+            .scratch_readdir_after(parent, Some(b"f00500"), 10)
+            .unwrap();
+        let cost = meta.dentries_read() - before;
+        assert_eq!(page.len(), 10);
+        assert!(
+            (10..=11).contains(&cost),
+            "a page of 10 read {cost} dentries"
+        );
+        let before = meta.dentries_read();
+        let all = walk(
+            &|after, k| meta.scratch_readdir_after(parent, after, k).unwrap(),
+            25,
+        );
+        let cost = meta.dentries_read() - before;
+        assert_eq!(all.len(), n);
+        assert!(cost <= n as u64 + 1, "{cost} dentries read to list {n}");
     }
 }
 
