@@ -1700,6 +1700,15 @@ so the rise needs the state the cell's earlier fio and database phases leave, an
 attributed to a plan 42 commit. **(3)** xfs untar 1.10x: a standalone repeat shows a
 17 % spread and no effect.
 
+**(2), follow-up (2026-10-24).** The rise did not reproduce in full cells either: three
+btrfs cells per build, interleaved, gave final a one-view per-commit p50 of 868 to 887
+µs (median 871) against base 555 to 938 µs (median 921). Attributed on a file system
+aged as the cell ages it (ext4, xfs, btrfs, 5 interleaved rounds per build), the one
+measurable step is `7e6e5cb3` (a clean close flushes the replica, journals bounded at
+128 MiB): per-commit p50 2.5 to 8.7 % above its parent (medians: xfs, btrfs, ext4; means
+4.6 to 7.8 %). Accepted: without it 300 000 creates left 493 MB of journal and a 13 s
+open, and a crash replays at most about 200 MB of journal instead of 512 MiB.
+
 ### 8.1 Quiet-host measurement for Q1 (run 2026-10-20 without the quiet-host gate; decided option B)
 
 The numbers of Appendix A.2 were taken on a host shared with other
