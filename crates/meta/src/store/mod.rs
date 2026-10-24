@@ -546,6 +546,13 @@ pub struct Meta {
     /// `store::local`). Removed with the transaction's journal rows when
     /// they ship, or when a deposition strands them.
     pub(crate) journal_tx: SingleWriterTxKeyspace,
+    /// `gen(8 BE) ++ idx(8 BE) ++ first_journal_seq(8 BE) -> ()`: the
+    /// `journal_tx` rows of a delegation origin (`gen` != 0), by origin
+    /// (`store::local::put_journal_origin`). Written and removed with the
+    /// `journal_tx` row in the same transaction, so a delegate's stream
+    /// from an index, or whether one transaction of it is still here, is
+    /// a seek, not a walk of every outstanding row.
+    pub(crate) journal_origin: SingleWriterTxKeyspace,
     pub(crate) blobs: SingleWriterTxKeyspace,
     /// Plan 28 §S1b: `dir_ino(8 BE) -> block_start(8 BE) ++ used(4 BE)`,
     /// the per-directory ino allocation cursor `alloc_ino_tx` reads and
@@ -1107,6 +1114,7 @@ impl Meta {
         let spec_live = db.keyspace("spec_live", KeyspaceCreateOptions::default)?;
         let pending_replay = db.keyspace("pending_replay", KeyspaceCreateOptions::default)?;
         let journal_tx = db.keyspace("journal_tx", KeyspaceCreateOptions::default)?;
+        let journal_origin = db.keyspace("journal_origin", KeyspaceCreateOptions::default)?;
         let blobs = db.keyspace("blobs", KeyspaceCreateOptions::default)?;
         let ino_alloc = db.keyspace("ino_alloc", KeyspaceCreateOptions::default)?;
         let completed = db.keyspace("completed", KeyspaceCreateOptions::default)?;
@@ -1134,6 +1142,7 @@ impl Meta {
             spec_live,
             pending_replay,
             journal_tx,
+            journal_origin,
             blobs,
             ino_alloc,
             completed,
@@ -1898,12 +1907,13 @@ impl Meta {
     /// [`VACUUM_MIN_ENTRIES`], has its memtable flushed and is compacted
     /// to its last level, which drops them. Returns the keyspaces vacuumed.
     pub fn vacuum_churn(&self) -> Result<Vec<&'static str>, MetaError> {
-        let churn: [(&'static str, &SingleWriterTxKeyspace); 14] = [
+        let churn: [(&'static str, &SingleWriterTxKeyspace); 15] = [
             ("dirty", &self.dirty),
             ("pending_upload", &self.pending_upload),
             ("pending_upload_by_ino", &self.pending_upload_by_ino),
             ("journal", &self.journal_ks),
             ("journal_tx", &self.journal_tx),
+            ("journal_origin", &self.journal_origin),
             ("spec", &self.spec),
             ("spec_live", &self.spec_live),
             ("pending_replay", &self.pending_replay),

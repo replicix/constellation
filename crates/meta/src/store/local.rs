@@ -104,7 +104,7 @@ use constellation_mtree::keys;
 use constellation_mtree::record::{InodeRecord, Payload};
 use fjall::{Readable, SingleWriterTxKeyspace, SingleWriterWriteTx, Snapshot};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 
 /// Which journaled apply `Meta::apply_records_journaled_inner` runs.
@@ -280,6 +280,86 @@ pub(crate) fn put_journal_tx(
 ) -> Result<(), MetaError> {
     tx.insert(&meta.journal_tx, tx_key(first), postcard::to_allocvec(row)?);
     Ok(())
+}
+
+/// The [`Meta::journal_origin`] key of the transaction at journal seq
+/// `first` of delegation origin `(gen, idx)`.
+fn journal_origin_key(gen: u64, idx: u64, first: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(24);
+    k.extend_from_slice(&gen.to_be_bytes());
+    k.extend_from_slice(&idx.to_be_bytes());
+    k.extend_from_slice(&first.to_be_bytes());
+    k
+}
+
+fn decode_journal_origin_key(k: &[u8]) -> Result<(u64, u64, u64), MetaError> {
+    if k.len() != 24 {
+        return Err(MetaError::Invalid("journal_origin key".into()));
+    }
+    let word = |i: usize| u64::from_be_bytes(k[i * 8..i * 8 + 8].try_into().unwrap());
+    Ok((word(0), word(1), word(2)))
+}
+
+/// The transaction at journal seq `first` is journaled under delegation
+/// origin `(gen, idx)`: indexed by origin ([`Meta::journal_origin`]),
+/// in the transaction writing its `journal_tx` row. Nothing for `gen` 0.
+pub(crate) fn put_journal_origin(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    gen: u64,
+    idx: u64,
+    first: u64,
+) {
+    if gen != 0 {
+        tx.insert(
+            &meta.journal_origin,
+            journal_origin_key(gen, idx, first),
+            [],
+        );
+    }
+}
+
+/// [`put_journal_origin`] undone: the `journal_tx` row at `first` leaves
+/// (retired or stranded), in the transaction removing it.
+pub(crate) fn remove_journal_origin(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    gen: u64,
+    idx: u64,
+    first: u64,
+) {
+    if gen != 0 {
+        tx.remove(&meta.journal_origin, journal_origin_key(gen, idx, first));
+    }
+}
+
+/// The outstanding transactions of delegation origin `gen` from stream
+/// index `from_idx` on, as `(idx, first)` in index order (journal order
+/// within one index), lazily: one seek, then a row per transaction
+/// taken. Rows at or below the acked watermark are left out, as every
+/// journal scan does ([`read_journal_tx_heads`]).
+fn journal_origins_from<'a>(
+    r: &'a impl Readable,
+    meta: &'a Meta,
+    gen: u64,
+    from_idx: u64,
+) -> Result<impl Iterator<Item = Result<(u64, u64), MetaError>> + 'a, MetaError> {
+    let floor = journal::acked_watermark(r, &meta.local)?;
+    let lo = journal_origin_key(gen, from_idx, 0);
+    let hi = journal_origin_key(gen, u64::MAX, u64::MAX);
+    Ok(r.range(&meta.journal_origin, lo..=hi)
+        .filter_map(move |guard| {
+            let row = guard
+                .key()
+                .map_err(MetaError::from)
+                .and_then(|k| decode_journal_origin_key(&k));
+            meta.note_local_rows_read(1);
+            match row {
+                Ok((_, idx, first)) if first > floor => Some(Ok((idx, first))),
+                Ok(_) => None,
+                Err(e) => Some(Err(e)),
+            }
+        }))
 }
 
 /// Every `journal_tx` row's head, oldest first. Starts past the acked
@@ -530,6 +610,7 @@ impl Meta {
                 lock_tag: journal::PendingLockTag::current().unwrap_or_default(),
             },
         )?;
+        put_journal_origin(tx, self, gen, idx, local.start);
         if gen != 0 {
             spec::note_deleg_tx(self, local.start, gen, deleg_first);
         }
@@ -825,12 +906,28 @@ impl Meta {
         let mut pending = crate::store::remote::PendingView::new(&r, self)?;
         let mut out = Vec::new();
         let mut rows = 0usize;
-        let mut txs: Vec<(u64, JournalTx)> = read_journal_txs(&r, self)?
-            .into_iter()
-            .filter(|(_, row)| row.gen == gen && row.idx >= from_idx)
-            .collect();
-        txs.sort_by_key(|(_, row)| row.idx);
-        for (first, row) in txs {
+        // In index order from `from_idx`, read by origin
+        // (`journal_origin`): the cost is the batch's, not the whole
+        // outstanding stream's (a delegate far ahead of the log read
+        // every one of its rows, ops and all, for every batch).
+        let txs: Box<dyn Iterator<Item = Result<(u64, u64), MetaError>>> = if gen == 0 {
+            Box::new(
+                self.journal_txs_of_gen_scan(&r, 0, from_idx)?
+                    .into_iter()
+                    .map(Ok),
+            )
+        } else {
+            Box::new(journal_origins_from(&r, self, gen, from_idx)?)
+        };
+        for found in txs {
+            let (_, first) = found?;
+            let Some(row) = get_journal_tx(&r, self, first)? else {
+                continue;
+            };
+            if row.gen != gen || row.idx < from_idx {
+                continue;
+            }
+            self.note_local_rows_read(1);
             let records: Vec<LogRecord> = journal_records(&r, self, first, row.last)?
                 .into_iter()
                 .map(|(_, rec)| rec)
@@ -849,49 +946,114 @@ impl Meta {
                 break;
             }
         }
-        out.sort_by_key(|t| t.idx);
         Ok(out)
+    }
+
+    /// `(idx, first)` of every transaction of generation `gen` at index
+    /// `from_idx` or above, by a walk of the whole journal, in index order
+    /// (journal order within one index): what [`Self::delegate_txs_from`]
+    /// reads for `gen` 0, which `journal_origin` does not index.
+    fn journal_txs_of_gen_scan(
+        &self,
+        r: &impl Readable,
+        gen: u64,
+        from_idx: u64,
+    ) -> Result<Vec<(u64, u64)>, MetaError> {
+        let mut txs: Vec<(u64, u64)> = read_journal_tx_heads(r, self)?
+            .into_iter()
+            .filter(|(_, h)| h.gen == gen && h.idx >= from_idx)
+            .map(|(first, h)| (h.idx, first))
+            .collect();
+        txs.sort_by_key(|(idx, _)| *idx);
+        Ok(txs)
     }
 
     /// Plan 30 §M11: the delegation origin of each journal row in
     /// `seqs` (`(0, 0)` for this node's own rows), for the segment
     /// envelope.
+    ///
+    /// A transaction's journal seqs are one run, so a seq's is the one
+    /// starting at or below it (past the acked watermark) if it reaches
+    /// that far. Ascending `seqs` over a dense run (a ship: whole
+    /// transactions from the journal's head) are matched in one walk of
+    /// the heads between their ends; others take a seek per transaction
+    /// they fall in. Never a walk of every outstanding head per seq.
     pub fn journal_origins(&self, seqs: &[u64]) -> Result<Vec<(u64, u64)>, MetaError> {
         let r = self.db.read_tx();
-        let heads = read_journal_tx_heads(&r, self)?;
-        Ok(seqs
-            .iter()
-            .map(|seq| {
-                heads
-                    .iter()
-                    .find(|(first, h)| *first <= *seq && *seq <= h.last)
-                    .map(|(_, h)| (h.gen, h.idx))
-                    .unwrap_or((0, 0))
-            })
-            .collect())
+        let from = journal::acked_watermark(&r, &self.local)?.saturating_add(1);
+        let origin = |found: Option<(u64, JournalTxHead)>, seq: u64| {
+            found
+                .filter(|(first, h)| *first <= seq && seq <= h.last)
+                .map(|(_, h)| (h.gen, h.idx))
+                .unwrap_or((0, 0))
+        };
+        let decode = |guard: fjall::Guard| -> Result<(u64, JournalTxHead), MetaError> {
+            let (k, v) = guard.into_inner()?;
+            self.note_local_rows_read(1);
+            Ok((decode_tx_key(&k)?, postcard::from_bytes(&v)?))
+        };
+        // The transaction starting at or below `seq`, past the watermark.
+        let floor = |seq: u64| -> Result<Option<(u64, JournalTxHead)>, MetaError> {
+            if seq < from {
+                return Ok(None);
+            }
+            r.range(&self.journal_tx, tx_key(from)..=tx_key(seq))
+                .next_back()
+                .map(decode)
+                .transpose()
+        };
+        let mut out = Vec::with_capacity(seqs.len());
+        let (Some(&lo), Some(&hi)) = (seqs.first(), seqs.last()) else {
+            return Ok(out);
+        };
+        let ascending = seqs.windows(2).all(|w| w[0] <= w[1]);
+        if ascending && hi - lo < 2 * seqs.len() as u64 {
+            // `at`: the transaction starting at or below the current seq;
+            // `next`: the first one after it.
+            let mut at = floor(lo)?;
+            let start = at.map_or(from.max(lo), |(first, _)| first.saturating_add(1));
+            // Nothing after `at` when it starts at `hi` (an empty range,
+            // not an inverted one).
+            let mut heads = (start <= hi)
+                .then(|| r.range(&self.journal_tx, tx_key(start)..=tx_key(hi)))
+                .into_iter()
+                .flatten();
+            let mut next = heads.next().map(decode).transpose()?;
+            for &seq in seqs {
+                while let Some(n) = next.filter(|(first, _)| *first <= seq) {
+                    at = Some(n);
+                    next = heads.next().map(decode).transpose()?;
+                }
+                out.push(origin(at, seq));
+            }
+            return Ok(out);
+        }
+        let mut at: Option<(u64, JournalTxHead)> = None;
+        for &seq in seqs {
+            if !at.is_some_and(|(first, h)| first <= seq && seq <= h.last) {
+                at = floor(seq)?;
+            }
+            out.push(origin(at, seq));
+        }
+        Ok(out)
     }
 
     /// Plan 30 §M11 phase 2b: whether transaction `(gen, idx)` of this
     /// delegate's stream is still in the journal (not yet carried by a
-    /// segment the replica applied).
+    /// segment the replica applied). One seek (`journal_origin`) for a
+    /// delegation origin.
     pub fn delegate_tx_pending(&self, gen: u64, idx: u64) -> Result<bool, MetaError> {
         let r = self.db.read_tx();
-        Ok(read_journal_tx_heads(&r, self)?
-            .iter()
-            .any(|(_, h)| h.gen == gen && h.idx == idx))
-    }
-
-    /// [`Self::delegate_tx_pending`] for every delegate transaction at
-    /// once: the `(gen, idx)` of each still in the journal. One read of
-    /// the journal heads, which a caller checking many parked
-    /// acknowledgements would otherwise do once per acknowledgement.
-    pub fn delegate_txs_pending(&self) -> Result<HashSet<(u64, u64)>, MetaError> {
-        let r = self.db.read_tx();
-        Ok(read_journal_tx_heads(&r, self)?
-            .into_iter()
-            .filter(|(_, h)| h.gen != 0)
-            .map(|(_, h)| (h.gen, h.idx))
-            .collect())
+        if gen == 0 {
+            return Ok(read_journal_tx_heads(&r, self)?
+                .iter()
+                .any(|(_, h)| h.gen == gen && h.idx == idx));
+        }
+        let first = journal_origins_from(&r, self, gen, idx)?.next();
+        match first {
+            Some(found) => Ok(found?.0 == idx),
+            None => Ok(false),
+        }
     }
 
     /// Plan 30 §M11: whether the unshipped journal holds any transaction
@@ -2151,5 +2313,370 @@ mod reclass_fault {
             c.set(n.saturating_sub(1));
             n > 0
         })
+    }
+}
+
+/// `journal_origin` against the walk of the whole journal it replaced:
+/// on randomized journals (a delegate's own streams, a root's appends of
+/// another's, this node's own rows, segments retiring stream rows, ships,
+/// recall strands), every read by origin answers exactly what the walk
+/// did.
+#[cfg(test)]
+mod origin_index_tests {
+    use super::*;
+    use crate::mutate::{execute, MutateOp};
+    use crate::rid::Rid;
+    use crate::MetaStore;
+    use constellation_fs_core::types::ROOT_INO;
+    use constellation_types::clock::Now;
+    use std::collections::HashSet;
+
+    /// The walk `delegate_txs_from` did before `journal_origin`.
+    fn txs_from_walk(meta: &Meta, gen: u64, from_idx: u64, max_rows: usize) -> Vec<DelegateTx> {
+        let r = meta.db.read_tx();
+        let mut pending = crate::store::remote::PendingView::new(&r, meta).unwrap();
+        let mut out = Vec::new();
+        let mut rows = 0usize;
+        let mut txs: Vec<(u64, JournalTx)> = read_journal_txs(&r, meta)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, row)| row.gen == gen && row.idx >= from_idx)
+            .collect();
+        txs.sort_by_key(|(_, row)| row.idx);
+        for (first, row) in txs {
+            let records: Vec<LogRecord> = journal_records(&r, meta, first, row.last)
+                .unwrap()
+                .into_iter()
+                .map(|(_, rec)| rec)
+                .collect();
+            if pending.names_pending(&records).unwrap() {
+                break;
+            }
+            rows += records.len();
+            out.push(DelegateTx {
+                idx: row.idx,
+                rid: row.rid,
+                records,
+                deps: row.deps,
+            });
+            if rows >= max_rows {
+                break;
+            }
+        }
+        out.sort_by_key(|t| t.idx);
+        out
+    }
+
+    /// The walk `journal_origins` did.
+    fn origins_walk(meta: &Meta, seqs: &[u64]) -> Vec<(u64, u64)> {
+        let r = meta.db.read_tx();
+        let heads = read_journal_tx_heads(&r, meta).unwrap();
+        seqs.iter()
+            .map(|seq| {
+                heads
+                    .iter()
+                    .find(|(first, h)| *first <= *seq && *seq <= h.last)
+                    .map(|(_, h)| (h.gen, h.idx))
+                    .unwrap_or((0, 0))
+            })
+            .collect()
+    }
+
+    /// The set `delegate_txs_pending` read.
+    fn pending_walk(meta: &Meta) -> HashSet<(u64, u64)> {
+        let r = meta.db.read_tx();
+        read_journal_tx_heads(&r, meta)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, h)| h.gen != 0)
+            .map(|(_, h)| (h.gen, h.idx))
+            .collect()
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+    }
+
+    fn mkdir(name: &str, ino: u64) -> LogRecord {
+        LogRecord::Mkdir {
+            parent: ROOT_INO,
+            name: name.into(),
+            ino,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            time_ns: 1,
+        }
+    }
+
+    fn create(parent: u64, name: String, ino: u64) -> MutateOp {
+        MutateOp::Create {
+            parent,
+            name,
+            ino,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        }
+    }
+
+    /// Checks every read; returns the outstanding rows of each origin.
+    fn check(meta: &Meta, rng: &mut Rng, gens: &[u64], step: usize) -> HashSet<(u64, u64)> {
+        let walk = pending_walk(meta);
+        let top = walk.iter().map(|(_, i)| *i).max().unwrap_or(0) + 2;
+        for &gen in gens {
+            for from in [0, 1, rng.below(top), rng.below(top)] {
+                for max in [1, 1 + rng.below(4) as usize, usize::MAX] {
+                    assert_eq!(
+                        meta.delegate_txs_from(gen, from, max).unwrap(),
+                        txs_from_walk(meta, gen, from, max),
+                        "step {step}: delegate_txs_from({gen}, {from}, {max})"
+                    );
+                }
+            }
+            for idx in 0..=top {
+                assert_eq!(
+                    meta.delegate_tx_pending(gen, idx).unwrap(),
+                    if gen == 0 {
+                        let r = meta.db.read_tx();
+                        read_journal_tx_heads(&r, meta)
+                            .unwrap()
+                            .iter()
+                            .any(|(_, h)| h.gen == 0 && h.idx == idx)
+                    } else {
+                        walk.contains(&(gen, idx))
+                    },
+                    "step {step}: delegate_tx_pending({gen}, {idx})"
+                );
+            }
+        }
+        let journal: Vec<u64> = meta
+            .take_journal(usize::MAX)
+            .unwrap()
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        let tip = journal.last().copied().unwrap_or(0) + 3;
+        let mut probes = vec![journal.clone()];
+        if !journal.is_empty() {
+            let a = rng.below(journal.len() as u64) as usize;
+            let b = a + rng.below((journal.len() - a) as u64) as usize;
+            probes.push(journal[a..=b].to_vec());
+        }
+        probes.push((0..8).map(|_| rng.below(tip)).collect());
+        probes.push((0..tip).rev().collect());
+        probes.push((0..tip).collect());
+        let mut sparse: Vec<u64> = (0..6).map(|_| rng.below(tip)).collect();
+        sparse.sort();
+        probes.push(sparse);
+        for seqs in probes {
+            assert_eq!(
+                meta.journal_origins(&seqs).unwrap(),
+                origins_walk(meta, &seqs),
+                "step {step}: journal_origins({seqs:?})"
+            );
+        }
+        walk
+    }
+
+    fn run(seed: u64, steps: usize) {
+        let meta = Meta::open_in_memory().unwrap();
+        let tag = crate::locks::LockTag::NONE;
+        let (d, d2, c, e, f) = (2 << 40, 5 << 40, 6 << 40, 3 << 40, 4 << 40);
+        let mut seg = 1;
+        meta.apply_segment(
+            seg,
+            1,
+            &[
+                mkdir("d", d | 1),
+                mkdir("d2", d2 | 1),
+                mkdir("c", c | 1),
+                mkdir("e", e | 1),
+                mkdir("f", f | 1),
+            ],
+            &TouchSet::default(),
+        )
+        .unwrap();
+        let mut rng = Rng(seed | 1);
+        let mut n = 100u64;
+        let own_a = 7u64;
+        let mut own_b = 9u64;
+        let appended = 11u64;
+        let mut appended_idx = 0u64;
+        let mut gens = vec![0, own_a, own_b, appended, 99];
+        let (mut seen, mut gone, mut last_held) = (HashSet::new(), HashSet::new(), HashSet::new());
+        let mut oldest_a = 0;
+        let rid = |seq: u64| Rid {
+            node: 3,
+            incarnation: 1,
+            seq,
+        };
+        for step in 0..steps {
+            n += 1;
+            match rng.below(10) {
+                0..=2 => {
+                    meta.delegate_execute(
+                        &create(d | 1, format!("a{n}"), d | n),
+                        Some(rid(n)),
+                        own_a,
+                        Default::default(),
+                        &tag,
+                        Now::same(0),
+                    )
+                    .unwrap();
+                }
+                3 => {
+                    meta.delegate_execute(
+                        &create(d2 | 1, format!("b{n}"), d2 | n),
+                        Some(rid(n)),
+                        own_b,
+                        Default::default(),
+                        &tag,
+                        Now::same(0),
+                    )
+                    .unwrap();
+                }
+                4 => {
+                    // A root's append of another delegate's transaction,
+                    // one to three records.
+                    appended_idx += 1;
+                    let records: Vec<LogRecord> = (0..1 + rng.below(3))
+                        .map(|k| LogRecord::Create {
+                            parent: c | 1,
+                            name: format!("c{n}-{k}"),
+                            ino: c | (n * 4 + k),
+                            mode: 0o644,
+                            uid: 0,
+                            gid: 0,
+                            time_ns: 5,
+                        })
+                        .collect();
+                    let rid = (rng.below(2) == 0).then_some(Rid {
+                        node: 4,
+                        incarnation: 1,
+                        seq: n,
+                    });
+                    meta.apply_delegate_tx(
+                        &records,
+                        rid,
+                        appended,
+                        appended_idx,
+                        crate::session::Position::ZERO,
+                    )
+                    .unwrap();
+                }
+                5 => {
+                    execute(&meta, &create(e | 1, format!("e{n}"), e | n), Some(rid(n))).unwrap();
+                }
+                6 => {
+                    // A segment brings the oldest few of the own stream back.
+                    let back = txs_from_walk(&meta, own_a, 0, 1 + rng.below(4) as usize);
+                    seg += 1;
+                    let mut records = vec![LogRecord::Create {
+                        parent: f | 1,
+                        name: format!("f{n}"),
+                        ino: f | n,
+                        mode: 0o644,
+                        uid: 0,
+                        gid: 0,
+                        time_ns: 5,
+                    }];
+                    let mut rows = vec![seg * 1000];
+                    let mut origins = vec![(0, 0)];
+                    for t in back {
+                        for r in t.records {
+                            if !matches!(r, LogRecord::Atime { .. }) {
+                                rows.push(rows.last().unwrap() + 1);
+                                origins.push((own_a, t.idx));
+                            }
+                            records.push(r);
+                        }
+                    }
+                    let through = *rows.last().unwrap();
+                    meta.apply_segment_rows(
+                        seg,
+                        1,
+                        through,
+                        &rows,
+                        &origins,
+                        &records,
+                        &TouchSet::default(),
+                    )
+                    .unwrap();
+                }
+                7 => {
+                    // A ship of the journal's head, whole transactions.
+                    let batch = meta.take_journal(64).unwrap();
+                    let want = 1 + rng.below(batch.len() as u64) as usize;
+                    let k = meta.whole_tx_prefix(&batch, want).unwrap();
+                    let seqs: Vec<u64> = batch[..k].iter().map(|(s, _)| *s).collect();
+                    seg += 1;
+                    meta.ack_journal_rows_at(&seqs, seg).unwrap();
+                }
+                8 if rng.below(4) == 0 => {
+                    // A segment recalls the second generation: its rows
+                    // strand, and a later one takes its place.
+                    seg += 1;
+                    meta.apply_segment_rows(
+                        seg,
+                        1,
+                        seg * 1000,
+                        &[seg * 1000],
+                        &[(0, 0)],
+                        &[LogRecord::Recall {
+                            dir: d2 | 1,
+                            gen: own_b,
+                        }],
+                        &TouchSet::default(),
+                    )
+                    .unwrap();
+                    own_b += 2 + rng.below(3) * 2;
+                    gens.push(own_b);
+                }
+                9 if rng.below(40) == 0 => {
+                    // A deposition strands everything journaled.
+                    meta.strand_below_epoch(1).unwrap();
+                }
+                _ => {}
+            }
+            for (gen, idx) in check(&meta, &mut rng, &gens, step) {
+                seen.insert(gen);
+                if gen == own_a {
+                    oldest_a = oldest_a.max(idx);
+                }
+            }
+            let now_held = pending_walk(&meta);
+            gone.extend(last_held.difference(&now_held).map(|(g, _)| *g));
+            last_held = now_held;
+        }
+        // Every kind of row was outstanding, and left, at some point.
+        assert!(gens.len() > 5, "seed {seed}: no recall strand");
+        for g in [own_a, appended] {
+            assert!(
+                seen.contains(&g) && gone.contains(&g),
+                "seed {seed}: gen {g}"
+            );
+        }
+        assert!(
+            gone.iter().any(|g| ![own_a, appended].contains(g)),
+            "seed {seed}: no strand"
+        );
+        assert!(oldest_a > 0);
+    }
+
+    #[test]
+    fn reads_by_origin_match_the_walk_of_the_journal() {
+        for seed in [1, 0x9e37_79b9, 42, 7_777, 31_337, 0xdead_beef] {
+            run(seed, 160);
+        }
     }
 }

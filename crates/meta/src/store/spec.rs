@@ -1314,6 +1314,7 @@ fn strand_local_tx(
         tx.remove(&meta.journal_ks, seq.to_be_bytes().to_vec());
     }
     tx.remove(&meta.journal_tx, local::tx_key(first));
+    local::remove_journal_origin(tx, meta, row.gen, row.idx, first);
     let count = if row.spec_seq.is_some() {
         KV_LOCAL_SPEC_COUNT
     } else {
@@ -2938,8 +2939,9 @@ pub(crate) fn retire_local_tx(
         .iter()
         .filter(|(_, row)| row.spec_seq.is_some())
         .count();
-    for (first, _) in &shipped {
+    for (first, row) in &shipped {
         tx.remove(&meta.journal_tx, local::tx_key(*first));
+        local::remove_journal_origin(tx, meta, row.gen, row.idx, *first);
     }
     counter_add_tx(tx, &meta.local, KV_LOCAL_SPEC_COUNT, -(captured as i64))?;
     let deleg = shipped

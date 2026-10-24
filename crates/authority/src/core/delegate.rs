@@ -184,12 +184,13 @@ pub(crate) enum StreamState {
 }
 
 /// What `complete_ready` reads once for all the parked acknowledgements:
-/// the log's index of each generation and the delegate rows still in the
-/// journal.
+/// the log's index of each generation, and whether each delegate row
+/// asked about is still in the journal (a seek each: the set of every
+/// outstanding row cost a walk of the whole stream per event).
 #[derive(Default)]
 pub(crate) struct StreamCache {
     log_idx: BTreeMap<u64, u64>,
-    pending: Option<Option<std::collections::HashSet<(u64, u64)>>>,
+    pending: std::collections::HashMap<(u64, u64), bool>,
 }
 
 /// An op a delegate holds until its `deps` are here or its grant is
@@ -1526,10 +1527,9 @@ impl Core {
                     .or_insert_with(|| replica.log_stream_idx(gen))
             },
             || {
-                pending
-                    .get_or_insert_with(|| replica.delegate_txs_pending())
-                    .as_ref()
-                    .is_none_or(|set| set.contains(&(gen, idx)))
+                *pending
+                    .entry((gen, idx))
+                    .or_insert_with(|| replica.delegate_tx_pending(gen, idx).unwrap_or(true))
             },
         )
     }

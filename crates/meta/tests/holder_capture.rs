@@ -2005,3 +2005,51 @@ fn a_recalled_delegates_gated_rows_are_dropped_and_its_lone_rows_replayed() {
     }
     assert_eq!(meta.speculation_counts().unwrap().local, 0);
 }
+
+/// xcheckfs two-node runs, the delegate's other walks of its outstanding
+/// stream: each stream or backup batch (`delegate_txs_from`) read every
+/// one of its transactions, ops and all; each parked acknowledgement check
+/// (`delegate_tx_pending`, the set behind `complete_ready`) and each ship
+/// envelope (`journal_origins`, every head per shipped row) read every
+/// head. They read the batch, the one transaction, the shipped
+/// transactions now. Fails on the parent: 2,000 rows a call, 160,000 in
+/// all.
+#[test]
+fn a_delegates_stream_reads_take_the_rows_asked_for_not_the_whole_stream() {
+    let meta = Meta::open_in_memory().unwrap();
+    let d = (2 << 40) | 1;
+    meta.apply_segment(1, 1, &mkdirs(&[("d", d)]), &TouchSet::default())
+        .unwrap();
+    let gen = 7;
+    let n = 2000u64;
+    let own: Vec<(Vec<LogRecord>, u64)> = (1..=n)
+        .map(|i| delegate_create(&meta, gen, i, d, &format!("f{i}"), (2 << 40) | (10 + i)))
+        .collect();
+    let journal: Vec<u64> = meta
+        .take_journal(usize::MAX)
+        .unwrap()
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect();
+    let per_tx = journal.len() / n as usize;
+    let tail = &journal[journal.len() - 4 * per_tx..];
+    let calls = 20u64;
+    let before = meta.local_rows_read();
+    for i in 0..calls {
+        let from = n - 10 - i;
+        let txs = meta.delegate_txs_from(gen, from, 8).unwrap();
+        assert_eq!(txs.first().map(|t| t.idx), Some(from));
+        assert!(txs.windows(2).all(|w| w[0].idx + 1 == w[1].idx));
+        assert!(meta
+            .delegate_tx_pending(gen, own[(from - 1) as usize].1)
+            .unwrap());
+        assert!(!meta.delegate_tx_pending(gen, n + 1).unwrap());
+        let origins = meta.journal_origins(tail).unwrap();
+        assert!(origins.iter().all(|(g, i)| *g == gen && *i > n - 4));
+    }
+    let read = meta.local_rows_read() - before;
+    assert!(
+        read <= 1_000,
+        "{calls} rounds of stream reads read {read} rows of a {n}-row stream"
+    );
+}

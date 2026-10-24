@@ -339,10 +339,10 @@ pub trait Replica {
     fn delegate_stranded(&self, gen: u64) -> bool;
     /// Generation `gen` ended at `cut` (the void rule).
     fn void_stream(&self, gen: u64, cut: u64);
-    /// Every `(gen, idx)` of this delegate's streams still in its journal
-    /// (no applied segment carries it), in one read; `None` when it cannot
-    /// be read (every transaction counts as pending).
-    fn delegate_txs_pending(&self) -> Option<std::collections::HashSet<(u64, u64)>>;
+    /// Whether transaction `(gen, idx)` of this delegate's streams is
+    /// still in its journal (no applied segment carries it), in one seek;
+    /// `None` when it cannot be read (it counts as pending).
+    fn delegate_tx_pending(&self, gen: u64, idx: u64) -> Option<bool>;
     /// Phase 2b: a delegate's backup persists its transactions; returns
     /// the highest index through which every transaction is in the log
     /// as this replica holds it or held here, contiguously above that
@@ -1130,8 +1130,8 @@ impl Replica for Meta {
         self.session().note_stream(gen, idx)
     }
 
-    fn delegate_txs_pending(&self) -> Option<std::collections::HashSet<(u64, u64)>> {
-        Meta::delegate_txs_pending(self).ok()
+    fn delegate_tx_pending(&self, gen: u64, idx: u64) -> Option<bool> {
+        Meta::delegate_tx_pending(self, gen, idx).ok()
     }
 
     fn deleg_backup_append(&self, gen: u64, txs: &[DelegateTx]) -> u64 {
