@@ -94,9 +94,9 @@ use crate::record::LogRecord;
 use crate::replay::{apply_batch_tx, ApplyCx, TouchSet};
 use crate::rid::Rid;
 use crate::store::{
-    adjust_usage_tx, counter_add_tx, counter_get, journal, kv_get_tx, kv_set_tx, ns, spec,
-    usage_note_begin, usage_note_take, Meta, UsageTracker, KV_DELEG_SPEC_COUNT,
-    KV_LOCAL_SPEC_COUNT, KV_SPEC_LIVE_COUNT, KV_UNCAPTURED_TX_COUNT,
+    adjust_usage_tx, counter_add_get_tx, counter_add_tx, counter_get, journal, kv_get_tx,
+    kv_set_tx, ns, spec, usage_note_begin, usage_note_take, Meta, UsageTracker,
+    KV_DELEG_SPEC_COUNT, KV_LOCAL_SPEC_COUNT, KV_SPEC_LIVE_COUNT, KV_UNCAPTURED_TX_COUNT,
 };
 use crate::TreeInode;
 use constellation_fs_core::Ino;
@@ -486,9 +486,12 @@ impl Meta {
             }
             None => (0, 0, crate::session::Position::ZERO),
         };
-        if gen != 0 && spec_seq.is_some() {
-            counter_add_tx(tx, &self.local, KV_DELEG_SPEC_COUNT, 1)?;
-        }
+        // The only captured row of a delegation origin in this view: what
+        // `spec::DelegRows` holds is of rows gone since (it is never
+        // shrunk), and it starts afresh.
+        let deleg_first = gen != 0
+            && spec_seq.is_some()
+            && counter_add_get_tx(tx, &self.local, KV_DELEG_SPEC_COUNT, 1)? == 1;
         // Plan 43 C1-2: the row's class, decided at the journaling. The
         // core says it (`journal::PendingClass`) around every call of its
         // own; a transaction under a delegation origin is `Lone` at C1 (C2
@@ -528,7 +531,7 @@ impl Meta {
             },
         )?;
         if gen != 0 {
-            spec::note_deleg_tx(self, local.start, gen);
+            spec::note_deleg_tx(self, local.start, gen, deleg_first);
         }
         Ok(())
     }

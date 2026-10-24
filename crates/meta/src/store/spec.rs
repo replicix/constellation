@@ -1999,7 +1999,9 @@ fn captured_files(row: &SpecRow, set: &mut TouchSet) {
 /// transaction that strands rows and then fails must not leave them out),
 /// and rebuilt once it has grown by more than twice what it held then.
 /// Nothing is taken out as rows retire: a stale key costs a needless
-/// scan, never a missed overlap. Noting runs inside the journaling
+/// scan, never a missed overlap; the summary is dropped (built afresh at
+/// the next use) once a row is journaled with no other one of a
+/// delegation origin captured ([`note_deleg_tx`]). Noting runs inside the journaling
 /// transaction, using inside the segment's: both under the store's
 /// writer lock, so a note's transaction has ended (committed or not) by
 /// the time a use reads it.
@@ -2109,8 +2111,21 @@ fn deleg_rows_ready<'a>(
 /// A journal transaction of delegation origin `gen` was journaled at
 /// journal seq `first` (in the calling transaction): noted in
 /// [`DelegRows`] (nothing to do while the summary is not built).
-pub(crate) fn note_deleg_tx(meta: &Meta, first: u64, gen: u64) {
+///
+/// `fresh`: it is the only captured row of a delegation origin the
+/// calling transaction sees. Everything the summary holds is then of
+/// rows gone since (retired or stranded), and it is dropped, to be built
+/// at the next use from the store as it is then: otherwise a delegate
+/// that once held a long stream would keep every key of it for good, and
+/// a later segment on any of them would read its whole new stream again.
+/// Dropping is always sound (the build reads both views, so rows the
+/// calling transaction took out and does not commit are seen).
+pub(crate) fn note_deleg_tx(meta: &Meta, first: u64, gen: u64, fresh: bool) {
     let mut rows = meta.deleg_rows.lock().unwrap();
+    if fresh {
+        rows.built = None;
+        return;
+    }
     if let Some(summary) = rows.built.as_mut() {
         summary.gens.insert(gen);
         summary.pending.push(first);

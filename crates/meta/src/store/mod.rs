@@ -377,14 +377,27 @@ pub(crate) fn counter_add_tx(
     if delta == 0 {
         return Ok(());
     }
+    counter_add_get_tx(tx, local, key, delta).map(|_| ())
+}
+
+/// [`counter_add_tx`], returning the counter's new value.
+pub(crate) fn counter_add_get_tx(
+    tx: &mut SingleWriterWriteTx,
+    local: &SingleWriterTxKeyspace,
+    key: &str,
+    delta: i64,
+) -> Result<u64, MetaError> {
     let now = counter_get(tx, local, key)?;
+    if delta == 0 {
+        return Ok(now);
+    }
     let next = if delta >= 0 {
         now.saturating_add(delta as u64)
     } else {
         now.saturating_sub(delta.unsigned_abs())
     };
     counter_set_tx(tx, local, key, next);
-    Ok(())
+    Ok(next)
 }
 
 thread_local! {

@@ -846,6 +846,113 @@ fn a_delegates_row_journaled_after_the_summary_is_still_seen() {
     assert_eq!(meta.getattr(g).unwrap().unwrap().mode & 0o7777, 0o600);
 }
 
+/// The rows' segments that retire every one of them (`batch` a segment,
+/// from segment `seq` and journal row `jseq` on). Returns the next
+/// segment's seq and the last journal row carried.
+fn bring_back(
+    meta: &Meta,
+    gen: u64,
+    own: Vec<(Vec<LogRecord>, u64)>,
+    batch: usize,
+    mut seq: u64,
+    mut jseq: u64,
+) -> (u64, u64) {
+    for chunk in own.chunks(batch) {
+        let (mut records, mut rows, mut origins) = (Vec::new(), Vec::new(), Vec::new());
+        for (recs, idx) in chunk {
+            for r in recs {
+                if !matches!(r, LogRecord::Atime { .. }) {
+                    jseq += 1;
+                    rows.push(jseq);
+                    origins.push((gen, *idx));
+                }
+                records.push(r.clone());
+            }
+        }
+        meta.apply_segment_rows(
+            seq,
+            1,
+            jseq,
+            &rows,
+            &origins,
+            &records,
+            &TouchSet::default(),
+        )
+        .unwrap();
+        seq += 1;
+    }
+    (seq, jseq)
+}
+
+/// What [`a_tailed_segment_reads_none_of_a_delegates_rows_it_does_not_touch`]'s
+/// summary holds is never taken out as rows retire, so it starts afresh
+/// once they are all gone: a delegate that once held a long stream does
+/// not keep its keys for good, and a later segment on one of them (here a
+/// `chmod` of a file the old stream created) reads none of the new
+/// stream. Fails without the reset: every such segment reads the whole
+/// new stream twice.
+#[test]
+fn a_delegates_summary_starts_afresh_once_its_rows_are_gone() {
+    let meta = Meta::open_in_memory().unwrap();
+    let (d, e) = ((2 << 40) | 1, (4 << 40) | 1);
+    meta.apply_segment(1, 1, &mkdirs(&[("d", d), ("e", e)]), &TouchSet::default())
+        .unwrap();
+    let gen = 7;
+    let n = 500u64;
+    let old: Vec<(Vec<LogRecord>, u64)> = (1..=n)
+        .map(|i| delegate_create(&meta, gen, i, d, &format!("f{i}"), (2 << 40) | (10 + i)))
+        .collect();
+    // A segment elsewhere builds the summary of the old stream.
+    let applied = meta
+        .apply_segment(
+            2,
+            1,
+            &[create_in(e, "x", (4 << 40) | 2)],
+            &TouchSet::default(),
+        )
+        .unwrap();
+    assert!(!applied.inserted_before_local);
+    let (mut seq, _) = bring_back(&meta, gen, old, 50, 3, 0);
+    assert_eq!(meta.speculation_counts().unwrap().local, 0);
+    // A new stream, on other names.
+    let m = 200u64;
+    for i in 1..=m {
+        delegate_create(
+            &meta,
+            gen,
+            n + i,
+            d,
+            &format!("g{i}"),
+            (2 << 40) | (10 + n + i),
+        );
+    }
+    assert_eq!(meta.speculation_counts().unwrap().local, m);
+    let segments = 20u64;
+    let before = meta.local_rows_read();
+    for s in 0..segments {
+        let records = vec![LogRecord::Setattr {
+            ino: (2 << 40) | (11 + s),
+            mode: Some(0o600),
+            uid: None,
+            gid: None,
+            size: None,
+            atime_ns: None,
+            mtime_ns: None,
+            time_ns: 6,
+        }];
+        let applied = meta
+            .apply_segment(seq, 1, &records, &TouchSet::default())
+            .unwrap();
+        assert!(!applied.inserted_before_local);
+        seq += 1;
+    }
+    let read = meta.local_rows_read() - before;
+    assert!(
+        read <= 5 * m,
+        "{segments} segments on the old stream's files read {read} rows of a {m}-row stream"
+    );
+}
+
 /// A delegate that executed three rows of generation 7 (the core notes
 /// each in the session, as `Replica::note_stream`): the setup of the two tests of the recall's cut below.
 fn delegate_of_three_rows() -> (Meta, u64) {
