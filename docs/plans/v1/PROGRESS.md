@@ -60182,6 +60182,24 @@ The loop's `ls -l` also failed on a name the loop had just removed
 (`ENOENT`, exit 1): the lister now accepts that; `READDIRPLUS_STRICT_ROUNDS`
 sizes the loop.
 
+**Rerun on the ring after the fix (2026-10-24, `9e8c92bf`, open).** Transport
+`auto` (`uring` negotiated), plus `auto`, the `ls -l` lister on A, `stress-ng
+--cpu` sized to the load wanted. At a load of 10 to 17: 0 stale reads in
+21,400 rounds (6 x 200, 9 x 1,000, 11 x 1,000). At a load of 20 to 40: 4 in
+about 110,000 rounds (runs of 1,000 to 5,000 rounds), and 0 in another
+110,000 with `constellation::cto` and `core::readindex` debug logging on.
+Every one is the reader seeing `""` after the other node's write returned
+(the truncation, not the content): three times B after A's write, once A
+after B's; in two of the four runs the lease had moved between the nodes
+before the failure. The one re-read recorded, 16 ms later, is right;
+`degraded`, `s3_tail` and session `timeouts` stay 0 on both nodes. The
+lister-node case P9 saw is not a sequencer reading its own store: in one
+failure the lease had gone from A to B 22 s earlier (B asked for it, A
+handed it over), so A was the non-holder reader, the ship-ack race's
+side. The mechanism of what is left is not found. The loop now reports,
+on a stale read, the re-reads until the content shows and both nodes'
+`cto` and `session` status.
+
 `readdirplus-strict` also taught two things: a lone strict sequencer's kernel
 cache needs its lease (`reads_locally`), which a restarted node takes with its
 first write (before that, plus entries are name-only with reason `view`), so

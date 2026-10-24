@@ -1239,7 +1239,37 @@ pub fn strict(_seed: u64) -> Result<()> {
             let content = format!("round-{i}");
             std::fs::write(&f, &content)?;
             let got = std::fs::read_to_string(r.mnt.join("s/f000"))?;
-            ensure!(got == content, "{} read {got:?} after {content:?}", r.name);
+            if got != content {
+                // What the strict reads of both nodes did, to tell a
+                // degraded or tailed read from a wrong position.
+                // How long the reader's replica takes to show the write.
+                let started = std::time::Instant::now();
+                let mut seen = Vec::new();
+                let mut caught_up = None;
+                while started.elapsed() < Duration::from_secs(3) {
+                    let again = std::fs::read_to_string(r.mnt.join("s/f000"))?;
+                    if seen.last() != Some(&again) {
+                        seen.push(again.clone());
+                    }
+                    if again == content {
+                        caught_up = Some(started.elapsed());
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                let cto = |c: &Client| {
+                    c.control_status()
+                        .map(|s| format!("cto {} session {}", s["cto"], s["session"]))
+                        .unwrap_or_else(|e| format!("{e:#}"))
+                };
+                bail!(
+                    "{} read {got:?} after {content:?} (round {i}); re-reads {seen:?}, \
+                     right after {caught_up:?}; reader {}; writer {}",
+                    r.name,
+                    cto(r),
+                    cto(w)
+                );
+            }
             let n = w.mnt.join("s").join(format!("new-{i}"));
             std::fs::write(&n, b"n")?;
             ensure!(
