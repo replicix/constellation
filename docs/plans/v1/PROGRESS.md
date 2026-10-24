@@ -59843,6 +59843,33 @@ invalidation of the file (`inflight.enter` holds the directory's
 notifications while a page is in flight). Next step: the same 600-iteration
 loop, plus `auto` against `off`, under `stress-ng --cpu 16`, 8 runs each.
 
+**Resolved (2026-10-24): not plan 40's; a plan 30 §M5/§M8 race.** A ship's
+acknowledgement (`Meta::ack_journal_rows_at`) read the journal as empty in
+its transaction, committed, and then cleared the in-memory set of keys the
+unshipped journal touched. A writer waiting for the store's write lock
+commits right after that commit and notes its rows; when the
+acknowledging thread lost its CPU between its commit and its clear (host
+load), the clear wiped the note of a row that had not shipped. The
+sequencer's ReadIndex answer then left that row out of the position
+(`unshipped_touches_read` false: no `pending`), and the strict reader on
+the other node read the shipped state: A's truncation had shipped, its
+content commit had not, so B read `""` (the recorded failure, "round-7",
+exactly). Plus entries and the lister only added load. Shown with a delay
+injected between the commit and the clear (30 ms, no host load, an
+experiment build): 25 of 200 strict reads stale with plus `auto`, 13 of
+200 with plus `off`, every one B reading `""` after A's write; with the
+fix, 0 of 200 and 0 of 300. The fix: notes bump a generation under the
+set's lock, the acknowledgement reads it under the write lock and clears
+only if nothing was noted since (`Meta::clear_unshipped_since`); its
+fail-before test is `a_row_noted_between_a_ship_ack_and_its_clear_stays_unshipped`
+(`constellation-meta`). The same clear fed a forward reply's `base` (§M5).
+Not reproduced here: stale reads on the lister's own node (the sequencer,
+which reads its own store); the diagnostic loop that saw them was not kept,
+and the runs here (`/dev/fuse`; the first runs used the ring) saw none.
+The loop's `ls -l` also failed on a name the loop had just removed
+(`ENOENT`, exit 1): the lister now accepts that; `READDIRPLUS_STRICT_ROUNDS`
+sizes the loop.
+
 `readdirplus-strict` also taught two things: a lone strict sequencer's kernel
 cache needs its lease (`reads_locally`), which a restarted node takes with its
 first write (before that, plus entries are name-only with reason `view`), so

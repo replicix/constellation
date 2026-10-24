@@ -614,9 +614,15 @@ pub struct Meta {
     /// the holder evaluated the op behind unshipped work on the same keys
     /// (`Meta::unshipped_overlaps`). Fed by `mutate::execute` — every
     /// journaled op, the FUSE fast path included — and cleared the moment
-    /// the journal ships out completely. Conservative when it is stale
-    /// (a key stays until the next full ship), never permissive.
+    /// the journal ships out completely, unless a row was noted since the
+    /// ship's acknowledgement looked (`unshipped_gen`). Conservative when
+    /// it is stale (a key stays until the next full ship), never
+    /// permissive.
     pub(crate) unshipped: std::sync::Mutex<crate::replay::TouchSet>,
+    /// How many times `unshipped` was added to, bumped under its lock: a
+    /// ship's acknowledgement reads it under the store's write lock and
+    /// clears only if no row was noted since ([`Meta::clear_unshipped_since`]).
+    pub(crate) unshipped_gen: AtomicU64,
     /// Plan 30 §M9, per row: for each key of `unshipped`, an upper bound
     /// on the journal seq of the rows that touched it (see
     /// [`UnshippedSeqs`]), so a gated holder's read waits for the rows it
@@ -1098,6 +1104,7 @@ impl Meta {
             held: std::sync::Mutex::new(held::HeldSummary::default()),
             held_any: AtomicBool::new(false),
             unshipped: std::sync::Mutex::new(crate::replay::TouchSet::default()),
+            unshipped_gen: AtomicU64::new(0),
             unshipped_seqs: std::sync::Mutex::new(UnshippedSeqs::default()),
             backup_tail_floor: std::sync::Mutex::new(None),
             held_work: AtomicU64::new(0),
@@ -1376,6 +1383,7 @@ impl Meta {
             let mut mine = self.unshipped.lock().unwrap();
             mine.dentries.extend(touched.dentries.iter().cloned());
             mine.inos.extend(touched.inos.iter().copied());
+            self.unshipped_gen.fetch_add(1, Ordering::SeqCst);
         }
         self.note_unshipped_seqs(&touched);
     }
@@ -1383,7 +1391,11 @@ impl Meta {
     /// An inode's record just journaled outside `mutate::execute` (the
     /// holder's own manifest commit): it joins the unshipped set.
     pub(crate) fn note_unshipped_ino(&self, ino: u64) {
-        self.unshipped.lock().unwrap().inos.insert(ino);
+        {
+            let mut mine = self.unshipped.lock().unwrap();
+            mine.inos.insert(ino);
+            self.unshipped_gen.fetch_add(1, Ordering::SeqCst);
+        }
         let mut touched = crate::replay::TouchSet::default();
         touched.inos.insert(ino);
         self.note_unshipped_seqs(&touched);
@@ -1440,10 +1452,29 @@ impl Meta {
         Some(if need == 0 { UNTRACKED } else { need })
     }
 
-    /// The journal shipped out completely: nothing unshipped touches
-    /// anything any more.
-    pub(crate) fn clear_unshipped(&self) {
-        *self.unshipped.lock().unwrap() = crate::replay::TouchSet::default();
+    /// [`Self::unshipped_gen`]'s value, for [`Self::clear_unshipped_since`].
+    pub(crate) fn unshipped_gen(&self) -> u64 {
+        self.unshipped_gen.load(Ordering::SeqCst)
+    }
+
+    /// The journal shipped out completely when the ship's acknowledgement
+    /// read it, `gen` ([`Self::unshipped_gen`]) taken then, under the
+    /// store's write lock: nothing unshipped touches anything any more —
+    /// unless a row was noted since. A writer notes its rows after its
+    /// commit, and one that committed after the acknowledgement's commit
+    /// may have noted them before this runs: clearing then made its
+    /// unshipped row invisible to a ReadIndex position (plan 30 §M8; the
+    /// strict reader read the shipped state, `readdirplus-strict`'s `""`)
+    /// and to a forward reply's `base` (§M5). The set then stays as it is,
+    /// conservative, until the next acknowledgement with no writer beside
+    /// it. Both sets are cleared under `unshipped`'s lock, which a writer
+    /// takes first, so a note after this keeps both its parts.
+    pub(crate) fn clear_unshipped_since(&self, gen: u64) {
+        let mut mine = self.unshipped.lock().unwrap();
+        if self.unshipped_gen.load(Ordering::SeqCst) != gen {
+            return;
+        }
+        *mine = crate::replay::TouchSet::default();
         *self.unshipped_seqs.lock().unwrap() = UnshippedSeqs::default();
     }
 

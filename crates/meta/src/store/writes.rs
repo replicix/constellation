@@ -171,13 +171,18 @@ impl Meta {
         applied_seq: u64,
     ) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
+        // Under the write lock: a row this transaction does not see is
+        // committed after it, and noted after that (`clear_unshipped_since`).
+        let gen = self.unshipped_gen();
         self.ack_rows_tx(&mut tx, journal_seqs, applied_seq)?;
         // Plan 30 §M5: with nothing left unshipped, no key is behind an
         // unshipped record any more (`Meta::unshipped_overlaps`).
         let empty = crate::store::journal::len(&tx, &self.journal_ks, &self.local)? == 0;
         tx.commit()?;
+        #[cfg(test)]
+        after_ack_commit::fire(self);
         if empty {
-            self.clear_unshipped();
+            self.clear_unshipped_since(gen);
         }
         // Plan 30 §M13: what shipped is in `completed`; `recent` need not
         // remember it any more (see `Meta::prune_recent_shipped`).
@@ -2309,5 +2314,110 @@ impl MetaStore for Meta {
         atime::drop_atime_all(&mut tx, &self.atime_journal)?;
         tx.commit()?;
         Ok(())
+    }
+}
+
+/// Tests: what runs on the acknowledging thread between a ship
+/// acknowledgement's commit and its clear of the unshipped set — another
+/// writer that got the store's write lock first.
+#[cfg(test)]
+pub(crate) mod after_ack_commit {
+    use super::Meta;
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnOnce(&Meta)>;
+
+    thread_local! {
+        pub(crate) static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn set(hook: impl FnOnce(&Meta) + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn fire(meta: &Meta) {
+        if let Some(hook) = HOOK.with(|h| h.borrow_mut().take()) {
+            hook(meta);
+        }
+    }
+}
+
+#[cfg(test)]
+mod unshipped_tests {
+    use super::after_ack_commit;
+    use crate::mutate::{execute, MutateOp};
+    use crate::rid::Rid;
+    use crate::store::Meta;
+    use crate::MetaStore;
+    use constellation_fs_core::types::ROOT_INO;
+
+    fn ino(n: u64) -> u64 {
+        (3 << 40) | n
+    }
+
+    fn create(meta: &Meta, n: u64) {
+        execute(
+            meta,
+            &MutateOp::Create {
+                parent: ROOT_INO,
+                name: format!("f{n}"),
+                ino: ino(n),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            Some(Rid {
+                node: 3,
+                incarnation: 1,
+                seq: n,
+            }),
+        )
+        .unwrap();
+    }
+
+    fn journal_seqs(meta: &Meta) -> Vec<u64> {
+        meta.take_journal(usize::MAX)
+            .unwrap()
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect()
+    }
+
+    /// Plan 30 §M5/§M8: a row journaled after a ship's acknowledgement
+    /// committed, and noted before that acknowledgement cleared the
+    /// unshipped set, is still unshipped: the set must keep it, or a
+    /// ReadIndex position leaves it out and a strict reader on another
+    /// node reads the shipped state (`readdirplus-strict` under load: `b
+    /// read "" after "round-7"`, the truncation shipped and the content
+    /// not). The ack used to clear on "the journal was empty when I
+    /// looked", whoever noted a row since.
+    #[test]
+    fn a_row_noted_between_a_ship_ack_and_its_clear_stays_unshipped() {
+        let meta = Meta::open_in_memory().unwrap();
+        create(&meta, 1);
+        let shipped = journal_seqs(&meta);
+        assert!(!shipped.is_empty());
+        assert!(meta.unshipped_touches_read(ino(1), false, None));
+        after_ack_commit::set(|meta| create(meta, 2));
+        meta.ack_journal_rows_at(&shipped, 1).unwrap();
+        assert!(
+            !journal_seqs(&meta).is_empty(),
+            "the second row is in the journal, unshipped"
+        );
+        assert!(
+            meta.unshipped_touches_read(ino(2), false, None),
+            "a ReadIndex of the second file would leave its unshipped row out"
+        );
+        let mut keys = crate::replay::TouchSet::default();
+        keys.inos.insert(ino(2));
+        assert!(
+            meta.unshipped_overlaps(&keys),
+            "a forward reply's base would leave it out"
+        );
+        // The next acknowledgement with no writer beside it clears.
+        let rest = journal_seqs(&meta);
+        meta.ack_journal_rows_at(&rest, 2).unwrap();
+        assert!(!meta.unshipped_touches_read(ino(2), false, None));
+        assert!(!meta.unshipped_touches_read(ino(1), false, None));
     }
 }
