@@ -1214,14 +1214,26 @@ pub fn strict(_seed: u64) -> Result<()> {
             let dir = adir.clone();
             Loop::start(move || {
                 let out = Command::new("ls").arg("-l").arg(&dir).output()?;
-                ensure!(out.status.success(), "ls -l failed: {out:?}");
+                // A name the loop below removed between the listing and
+                // its `lstat` is `ENOENT` (`ls` exits 1 for it): a race
+                // of the test's own, not a failure.
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let vanished = !stderr.trim().is_empty()
+                    && stderr
+                        .lines()
+                        .all(|l| l.ends_with("No such file or directory"));
+                ensure!(
+                    out.status.success() || (out.status.code() == Some(1) && vanished),
+                    "ls -l failed: {out:?}"
+                );
                 Ok(())
             })
         };
         // cto-strict's visibility, under the listing loop: a close on one
         // node is visible to the very next open on the other, and so are
         // a new name and a removed one.
-        for i in 0..40 {
+        let rounds = env_usize("READDIRPLUS_STRICT_ROUNDS", 40);
+        for i in 0..rounds {
             let (w, r) = if i % 2 == 0 { (b, a) } else { (a, b) };
             let f = w.mnt.join("s").join("f000");
             let content = format!("round-{i}");
