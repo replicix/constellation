@@ -36931,6 +36931,92 @@ mod deleg_group {
         assert!(answer_to_2(&again, 502).is_some(), "{again:?}");
     }
 
+    /// D6 across generations: the rid's row is this delegate's, uncommitted,
+    /// in another generation's stream than the one its retry reaches (the
+    /// ops' keys moved: a second delegation of this node, a re-delegation of
+    /// the directory to it before the first generation's strand). The retry
+    /// waits for that row's commit; before, it was answered at once, and the
+    /// end of the row's generation could drop the row it reported.
+    #[test]
+    fn a_dedup_answer_waits_for_its_row_in_another_generation() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        let dir2 = h
+            .meta
+            .allocate_ino(constellation_fs_core::types::ROOT_INO)
+            .unwrap();
+        Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[
+                LogRecord::Mkdir {
+                    parent: constellation_fs_core::types::ROOT_INO,
+                    name: "e".into(),
+                    ino: dir2,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 1,
+                },
+                LogRecord::Delegate {
+                    dir: dir2,
+                    node: 3,
+                    gen: 8,
+                    designated: false,
+                    range: (0, 0),
+                },
+            ],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let req8 = renew_req(&out, 8).expect("no renewal of the second generation");
+        h.step(renewed(&h, req8, 8, 5_000));
+        let out = forward_create(&mut h, dir, 1, 500);
+        let (req, round, last) = batch(&out).expect("sent");
+        assert_eq!(answer_to_2(&out, 500), None);
+        let row = h.meta.outcome_row(rid_of(2, 1)).unwrap();
+        assert!(
+            row.is_some_and(|r| r.gen == 7 && r.class.gated()),
+            "{row:?}"
+        );
+        let mut out = Vec::new();
+        for id in h.core.stream_parks_of(7) {
+            h.core.abort_park_busy(h.clk(), id, &h.meta, &mut out);
+        }
+        // The same rid, its op now in the second generation's subtree.
+        let ino = h.meta.allocate_ino(dir2).unwrap();
+        let retry = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(501),
+                rid: rid_of(2, 1),
+                op: MutateOp::Create {
+                    parent: dir2,
+                    name: "f1".into(),
+                    ino,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+            },
+        });
+        assert_eq!(
+            answer_to_2(&retry, 501),
+            None,
+            "answered from generation 7's uncommitted row: {retry:?}"
+        );
+        let out = root_acks(&mut h, req, round, last);
+        assert!(answer_to_2(&out, 501).is_some(), "{out:?}");
+    }
+
     /// The requester's deadline settles a rid from the delegate's own
     /// journal only when its row is committed: an uncommitted `DelegGroup`
     /// row is not an outcome the generation's end will keep (D6).

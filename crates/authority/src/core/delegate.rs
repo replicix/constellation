@@ -1182,6 +1182,9 @@ impl Core {
         // re-streams and the replay dedups) and never before.
         let epoch = self.ship.max_epoch.max(1);
         let mut exec_idx: Option<u64> = None;
+        // The stream whose row the answer waits for: this generation's, or
+        // (a dedup) the generation that journaled the rid's row.
+        let mut wait_gen = gen;
         // Plan 43 C2 (§2.1): what an answer of the row this delegate journals
         // now waits for, by who is asked; set for the journaling below (the
         // row's class is fixed there) and for the answer after it.
@@ -1194,7 +1197,11 @@ impl Core {
             // waits for that row's commit as if it had just executed it —
             // the row may be this delegate's, still in its own uncommitted
             // journal, and the retry is no reason to leave it.
-            (class, exec_idx) = self.deleg_dedup_wait(class, gen, rid, from, replica);
+            let wait;
+            (class, wait) = self.deleg_dedup_wait(class, gen, rid, from, replica);
+            if let Some((g, idx)) = wait {
+                (wait_gen, exec_idx) = (g, Some(idx));
+            }
         }
         let _row_class = (!dedup).then(|| constellation_meta::PendingClass::set(class.into()));
         let outcome = if let Some(records) = replica.recent_outcome(rid) {
@@ -1302,7 +1309,7 @@ impl Core {
         // answered once its group holds it: the root's journaled append of
         // the stream, or the recorded backup's acknowledgement, or the log.
         if let Some(idx) = exec_idx {
-            if class.gated() && !self.deleg_stream_durable(gen, idx, replica) {
+            if class.gated() && !self.deleg_stream_durable(wait_gen, idx, replica) {
                 self.stats.deleg_acks_parked += 1;
                 let what = if from == 0 {
                     if let Some(c) = self.clients.get_mut(&rid) {
@@ -1327,7 +1334,7 @@ impl Core {
                         class,
                     }
                 };
-                self.park_stream_need(now, gen, idx, what);
+                self.park_stream_need(now, wait_gen, idx, what);
                 if matches!(own_chunks, OwnChunks::Upload(_)) {
                     // Neither this delegate's backup nor its stream to
                     // the root carries the transaction before the
@@ -1341,7 +1348,7 @@ impl Core {
                 return;
             }
             if class.gated() {
-                if let Some(d) = self.dl.mine.get_mut(&gen) {
+                if let Some(d) = self.dl.mine.get_mut(&wait_gen) {
                     d.acked_max = d.acked_max.max(idx);
                 }
             }
@@ -1414,7 +1421,12 @@ impl Core {
     /// the root's append (or the backup) holds a later index. This node's
     /// own client, retrying a `Lone` row, is answered at once as `Lone`.
     /// The row gone from the journal (the log carries it, or it was
-    /// shipped) is answered from the log.
+    /// shipped) is answered from the log. The row may be of another
+    /// generation of this node than `gen` (the rid's keys moved to it: a
+    /// second delegation here, the directory delegated here again before the
+    /// first generation's strand): the wait is then for that generation's
+    /// row — `(generation, index)` — and a generation that ended here
+    /// commits only through the log, or drops the row and aborts the wait.
     fn deleg_dedup_wait(
         &self,
         class: AckClass,
@@ -1422,8 +1434,8 @@ impl Core {
         rid: Rid,
         from: NodeId,
         replica: &dyn Replica,
-    ) -> (AckClass, Option<u64>) {
-        let committed_class = || {
+    ) -> (AckClass, Option<(u64, u64)>) {
+        let committed_class = |gen: u64| {
             if self.cfg.ack_s3 {
                 AckClass::Archive
             } else {
@@ -1431,11 +1443,11 @@ impl Core {
             }
         };
         match replica.outcome_row(rid) {
-            Some(r) if r.gen == gen => {
+            Some(r) if r.gen != 0 => {
                 if class == AckClass::NonStealable {
                     (class, None)
-                } else if r.class.gated() || from != 0 {
-                    (committed_class(), Some(r.idx))
+                } else if r.class.gated() || from != 0 || r.gen != gen {
+                    (committed_class(r.gen), Some((r.gen, r.idx)))
                 } else {
                     (AckClass::Lone, None)
                 }
