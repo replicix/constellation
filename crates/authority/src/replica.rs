@@ -598,6 +598,9 @@ pub trait Replica {
     /// The holder's durability watermark for its own reads
     /// (`Meta::durability_pending`).
     fn set_durable(&self, gate: bool, jseq: u64, lost: bool, class: constellation_meta::RowClass);
+    /// Plan 43 C2d: what the core knows of the delegation `gen` this node
+    /// holds, for the delegate's FUSE fast path (`None`: not held).
+    fn set_deleg_durable(&self, gen: u64, d: Option<constellation_meta::DelegDurable>);
     /// Plan 43 C1-2: how many journal rows were tagged with the session's
     /// published class instead of one the core set.
     fn class_from_session(&self) -> u64;
@@ -1542,6 +1545,10 @@ impl Replica for Meta {
 
     fn set_durable(&self, gate: bool, jseq: u64, lost: bool, class: constellation_meta::RowClass) {
         self.session().set_durable(gate, jseq, lost, class)
+    }
+
+    fn set_deleg_durable(&self, gen: u64, d: Option<constellation_meta::DelegDurable>) {
+        self.session().set_deleg_durable(gen, d)
     }
 
     fn journal_tx_class(&self, first: u64) -> Option<constellation_meta::RowClass> {

@@ -56904,6 +56904,99 @@ Topology 3's forwards rise by 0.4-1.2 ms at p50 (they wait for the root's append
 within noise. A noisy host and three runs: the p90 overruns need the box's quiet run (C2d's gate) before Q4's fallback
 is weighed.
 
+## Plan 43 C2d: the delegate's fast path writes, then waits for its group (2026-10-24)
+
+Fourth of C2's commits (spec §4). It removes C2c's interim gate (`deleg_fast_path_gated`, `DelegateView.gated`, `set_gated`):
+the delegate's own FUSE writes run on the FUSE thread whatever the delegation's group is.
+
+### What landed
+
+- **The core tells the session** (`Core::report_deleg_durable`, after `deleg_after_event`, published on change, withdrawn when a
+  generation is no longer held): per generation this node is the delegate of, `DelegDurable { class, through, lost }` in the
+  replica's session (`Replica::set_deleg_durable`, `SessionState::set_deleg_durable`). `class` is `deleg_ack_class(.., Own)`
+  as a `RowClass`; `through` the highest stream index whose prefix is committed (`deleg_committed_through`: the log carries
+  it, or every member of the applied group and of a requested change holds it; `deleg_group_through` is the one predicate
+  the core path's parks (`deleg_stream_state_with`) use too); `lost` is stopped, lapsed or the backup sealed.
+- **The fast path** (`write_gate.rs`): reads the class from the session with the admission (no published class: through the
+  core), journals the row with it (`PendingClass`), and after the write (`note_stream`, `recall_after_local_write`) returns
+  at once for `Lone`/`NonStealable`, else waits in `SessionState::wait_deleg_durable` (`Durable` once `through >= idx`, a
+  committed row staying committed whatever became of the delegation; `Lost` for a generation stopped, lapsed, sealed,
+  withdrawn or never published; `TimedOut` at `DURABLE_WAIT_BUDGET`). `Lost`/`TimedOut` count `fast_acks_in_doubt` and
+  resubmit by rid through the core (`submit_to_core(.., in_doubt)`), which answers from the row's commit (D6) or re-executes.
+- **Deviations from the spec text**, both deliberate: (1) the class is read from the session (it is published with the
+  watermark, one source) instead of a new element of `DelegView.mine` mirrored into `DelegateView`; (2) `wait_deleg_durable`
+  has no `Ungated` outcome and no `lone` field: a delegate that turned lone after journaling a `DelegGroup` row keeps waiting
+  for that row (the root's append), which is what the core path does and is cheaper than a round trip through the core.
+- **`acked_max` (found while doing it; the spec is silent)**: the fast path answers where the core does not see it, so
+  `deleg_group_maintain`'s add/remove-safe rules (`acked_max`, "every index answered") would have ignored fast-path answers
+  and let a backup leave the record while a row answered through it was on no other disk. `report_deleg_durable` raises
+  `acked_max` to `through` while the class waits (committed rows may have been answered).
+- **Simulation**: the F1 hold of a delegate's write (`delegate_hold`) is no longer closed by a gated class; it journals with the
+  class the core published and, for a class that waits, parks the answer and polls `wait_deleg_durable` after every step (an
+  `InDoubt` resubmission by rid on `Lost`/out-of-budget): the real mechanism, so the I1 oracle judges the fast path's
+  answers. New configurations `locks-writer-hold-delegated-group` (the root within the budget: group = delegate + root) and
+  `-backup` (a backup) and the test `locks_writer_hold_delegated_group_waits_for_the_group` (held writes that wait and are
+  answered: non-vacuity).
+- Docs: DESIGN (the delegate paragraph of the delegation section, ADR-33 link kept), `delegations.md` (how a delegate executes).
+
+### Evidence
+
+Fail-before (each on a copy of the tree with the change reverted, devbox 2, debug; the interim is the C2c gate put back):
+
+| Test | With the change reverted |
+|---|---|
+| engine `the_delegates_fast_path_writes_then_waits_for_its_group` | fails ("never journaled": the interim gate sends the write through the core) with the fast path closed for a class that waits; so do the other two engine tests below |
+| engine `the_delegates_fast_path_answers_a_lone_row_and_a_committed_row_at_once`, `..._resubmits_in_doubt_when_its_generation_is_lost` | fail the same way (the write is submitted to the core, not answered / not resubmitted in doubt) |
+| core `the_core_publishes_the_class_and_the_commit_point_to_the_fast_path`, `the_published_commit_point_follows_the_group`, `rows_the_fast_path_may_have_answered_keep_their_backup_in_the_record` | 3 of 3 fail with `report_deleg_durable` not called |
+| core `rows_the_fast_path_may_have_answered_keep_their_backup_in_the_record` | fails with the `acked_max` raise off |
+| meta `a_delegates_wait_follows_the_published_commit_point`, sim `locks_writer_hold_delegated_group_waits_for_the_group` | new API / new configurations (no parent to run on) |
+
+Gates (devbox 2, the tree as committed): `cargo fmt --check`, `clippy --workspace --all-targets -D warnings`, meta 364 +
+integration, authority lib 715, `meta_repro` 4, engine lib 929, control 146, the model crate (`--release`, 2 threads), the release
+sim suite 270 passed / 11 ignored.
+
+Sweeps (devbox 2, release, 8 threads; base = `aef7dae7` for the 7 configurations it was re-run for, the C2c review's logs
+for the rest, which a base re-run of `delegated-holder-cut`, `long-delegated-backup` and the writer-hold configurations
+reproduced exactly): `delegated-*`, `locks-delegated*`, `locks-unlinked-delegated*` (incl. `dcrash*`), `long-delegated*`,
+`backup*`, `locks-writer-hold-delegated*` 0..500 (backup 0..300) and `locks-unlinked-delegated-dcrash` 2000..4000: **71 jobs,
+every failing set and every oracle counter (I1 total and `deleg-group/*`, I2, I2c, I4, I5) identical to base**. The existing
+configurations do not move: the sim's only delegate fast path is the F1 hold, and in the existing hold configurations the
+delegate is lone (the path was open before and is unchanged). The new `locks-writer-hold-delegated-group` / `-backup` 0..500: 0 failing; `deleg-group/*` uncommitted answers
+4 / 11 (the rest of I1 is the root's `archive/*`, C2f); the ones traced (backup 17, 23; group 112, 297) were not fast-path
+answers (the fast path answered nothing in those seeds) but the known straggler shape, a delegate that counted the append of
+a root whose journal lacks the row after a restart (C3).
+
+G1 (`ack-latency`, release, loopback, **box 1 with ext4 state, 8 runs per tree, 200 samples, pre-C2c / C2c / C2d in
+alternating and rotating order (ABBA and cyclic), a run started only with the 1-minute load below 4**; medians of the 8 runs'
+p50 and p90, µs; the pre-C2c and C2c binaries are the C2c review's builds). The boxes were unreachable until mid-day, and the
+box carried other benches meanwhile; in several of the first 5 rounds a run started right after another met a 9-36 ms fsync stall on
+every topology (`1-single`, which has no delegation, too), so `write` is reported as the median across runs and nothing is
+concluded from it:
+
+| op (µs) | holder, topology 2 (budget base): p50 / p90 | delegate, topology 3, pre-C2c | C2c | **C2d** | G1 (holder + 500) |
+|---|---|---|---|---|---|
+| create | 361 / 584 | 143 / 241 | 471 / 784 | **462 / 758** | met / met |
+| rename | 258 / 349 | 127 / 230 | 522 / 1487 | **455 / 1180** | met / **over by 331** |
+| unlink | 239 / 342 | 109 / 214 | 445 / 1742 | **434 / 1185** | met / **over by 343** |
+| chmod | 235 / 365 | 60 / 142 | 423 / 2044 | **396 / 878** | met / **over by 13** |
+
+Topology 4 (a recorded backup), delegate p50 / p90: create 497 / 774 -> 508 / 823 (C2c) -> **487 / 710**; rename 610 / 1580 -> 578 /
+1581 -> **488 / 1243**; unlink 487 / 1652 -> 519 / 1719 -> **461 / 1188**; chmod 438 / 1575 -> 433 / 1586 -> **427 / 562**.
+`write` (4 KiB + fsync, dominated by the disk): topology 3 3 212 / 4 236 (pre) -> 3 551 / 4 469 (C2c) -> 3 516 / 4 471 (C2d);
+topology 4 3 587 / 4 537 -> 3 590 / 4 509 -> 3 614 / 4 522; topology 2 holder 3 428 -> 3 430 -> 3 403 (p50). Eight runs each.
+
+Topology 3's delegate pays the root's append round trip (it is not lone), as C2c's core path did, without the channel hop and
+the core's park: p50 2-13 % under C2c, p90 down 3 % (create) to 57 % (chmod). **G1 is met at p50 on all four ops and at p90 on
+create; the p90 of rename and unlink is over the budget by 0.33 ms, chmod's by 13 µs** (C2c: 0.6-1.2 ms over). The tail is the
+root's append round trip landing behind a core step on the delegate or the root; Q4's fallback (the root as the delegate's
+backup) was not measured here and is the next step if the p90 matters. Topology 4 is better at p90 and equal or better at p50.
+
+### Not done here / left open
+
+C2e, C2f, C2g, C2h as before. The failing-sets claim covers the configurations above; the fast path's wait is exercised by
+the two new configurations only (the hold fault is the sim's only delegate fast path). Q4's fallback (the root as the
+delegate's backup) was not weighed: G1's p50/p90 are met.
+
 ## Plan 43 C1-1 — The root group's commit holds across a listing and a removal
 
 The first commit of plan 43 C1 ([the commit rule](wip/43-commit-rule.md), the coder

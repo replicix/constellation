@@ -457,6 +457,9 @@ pub(crate) struct DelegationState {
     cert_set: bool,
     /// The generations this node is the delegate of.
     pub mine: BTreeMap<u64, DelegateState>,
+    /// Plan 43 C2d: what [`Core::report_deleg_durable`] last told the
+    /// replica's session, per generation.
+    pub reported: BTreeMap<u64, constellation_meta::DelegDurable>,
     /// Phase 2b: the generations this node backs, `gen -> (delegate,
     /// acked)`, and the ones it sealed.
     pub backing: BTreeMap<u64, (NodeId, u64)>,
@@ -1481,20 +1484,6 @@ impl Core {
         }
     }
 
-    /// Plan 43 C2: whether the fast path of this node's delegations is
-    /// closed — ops go through the core and park — because a generation
-    /// answers its own node's client from a group (or the archive), not
-    /// from its disk. Interim: the fast path writes first and waits for the
-    /// group afterwards (C2d).
-    pub fn deleg_fast_path_gated(&self, now: Now) -> bool {
-        self.cfg.ack_s3
-            || self
-                .dl
-                .mine
-                .values()
-                .any(|d| !d.designated && !self.deleg_lone(now, d))
-    }
-
     /// Plan 43 C2 (§3.4): transaction `(gen, idx)` is committed — the answer
     /// of a row of the class `DelegGroup` may leave — from what this
     /// delegate knows: the log carries it, or every member of the group
@@ -1534,6 +1523,95 @@ impl Core {
         )
     }
 
+    /// Plan 43 C2 (§3.4): the highest index of `d`'s stream that every
+    /// member of its group holds — of the applied version and, while a
+    /// change is pending, of the requested one (D4): a recorded backup by
+    /// its acknowledgement of this delegate's appends (a backup that is
+    /// not the one appended to holds nothing for it), the root (no backup
+    /// recorded: the group is the delegate and the root, Q16) by the
+    /// cursor of its journaled append of the stream (`streamed_through`).
+    /// What the log carries is not counted here.
+    fn deleg_group_through(d: &DelegateState) -> u64 {
+        let held = |members: &[NodeId]| {
+            members
+                .iter()
+                .map(|b| {
+                    if d.backup == Some(*b) {
+                        d.backup_acked
+                    } else {
+                        0
+                    }
+                })
+                .min()
+                .unwrap_or(d.streamed_through)
+        };
+        held(&d.group_backups).min(d.group_requested.as_deref().map_or(u64::MAX, held))
+    }
+
+    /// Plan 43 C2d (§4): the highest index of generation `d`'s stream whose
+    /// prefix is committed — the log carries it (`log_idx`), or its group
+    /// holds it. `ack=s3` commits only through the log. What the delegate's
+    /// FUSE fast path waits on ([`Self::report_deleg_durable`]), the same
+    /// predicate the core path's parks wait on
+    /// ([`Self::deleg_stream_state_with`]).
+    fn deleg_committed_through(&self, d: &DelegateState, log_idx: u64) -> u64 {
+        if self.cfg.ack_s3 {
+            log_idx
+        } else {
+            Self::deleg_group_through(d).max(log_idx)
+        }
+    }
+
+    /// Plan 43 C2d (§4): tell the replica's session, for each generation
+    /// this node is the delegate of, how its own clients' rows are classed
+    /// and how far the group has committed the stream — the FUSE fast path
+    /// journals its row with the class and answers once the watermark
+    /// covers it. Published on change; a generation no longer held is
+    /// withdrawn, which ends a wait on it (`Lost`).
+    pub(crate) fn report_deleg_durable(&mut self, now: Now, replica: &dyn Replica) {
+        if self.dl.mine.is_empty() && self.dl.reported.is_empty() {
+            return;
+        }
+        let mut current = BTreeMap::new();
+        let mut raised = Vec::new();
+        for d in self.dl.mine.values() {
+            let class = self.deleg_ack_class(now, d.gen, Asker::Own);
+            let through = self.deleg_committed_through(d, replica.log_stream_idx(d.gen));
+            // The fast path answers its own node's clients from the FUSE
+            // thread, where the core does not see it: every index committed
+            // while the class waits may have been answered, so
+            // `deleg_group_maintain` lets go of none of them before the
+            // group that is left holds it (`acked_max`).
+            if class.gated() && through > d.acked_max {
+                raised.push((d.gen, through));
+            }
+            current.insert(
+                d.gen,
+                constellation_meta::DelegDurable {
+                    class: class.into(),
+                    through,
+                    lost: d.stopped || d.lapsed || d.backup_sealed,
+                },
+            );
+        }
+        for (gen, through) in raised {
+            if let Some(d) = self.dl.mine.get_mut(&gen) {
+                d.acked_max = d.acked_max.max(through);
+            }
+        }
+        for gen in self.dl.reported.keys() {
+            if !current.contains_key(gen) {
+                replica.set_deleg_durable(*gen, None);
+            }
+        }
+        for (gen, d) in &current {
+            if self.dl.reported.get(gen) != Some(d) {
+                replica.set_deleg_durable(*gen, Some(*d));
+            }
+        }
+        self.dl.reported = current;
+    }
+
     /// Plan 43 C2 (§3.4, D7): where row `(gen, idx)` of a delegate's stream
     /// stands. Committed: the log carries it (`idx` at or below the log's
     /// index of the generation, never "the row left this journal"), or every
@@ -1558,19 +1636,7 @@ impl Core {
         pending: impl FnOnce() -> bool,
     ) -> StreamState {
         let committed = match self.dl.mine.get(&gen) {
-            Some(d) if !self.cfg.ack_s3 => {
-                let holds = |members: &[NodeId]| {
-                    if members.is_empty() {
-                        d.streamed_through >= idx
-                    } else {
-                        members
-                            .iter()
-                            .all(|b| d.backup == Some(*b) && d.backup_acked >= idx)
-                    }
-                };
-                (holds(&d.group_backups) && d.group_requested.as_deref().is_none_or(holds))
-                    || idx <= log_idx()
-            }
+            Some(d) if !self.cfg.ack_s3 => idx <= Self::deleg_group_through(d) || idx <= log_idx(),
             _ => idx <= log_idx(),
         };
         if committed {

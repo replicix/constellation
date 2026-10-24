@@ -891,9 +891,12 @@ lease and one log
   speculation place is a *lone* delegate — no recorded backup and no peer,
   the root included, within `CONSTELLATION_BACKUP_RTT_BUDGET_MS` — which
   answers its own node's client from its disk; another node's forward still
-  waits for the root. A delegate whose fast path would answer before the
-  group holds the row is closed to it (the fast path stays open only while
-  the delegate is lone). At the end of a generation the rows past its cut
+  waits for the root. The delegate's own FUSE fast path writes
+  first and waits for the group afterwards: it journals the row with the
+  class the core published for the generation and returns once the
+  generation's commit point covers the row (a lone delegate's and a
+  designee's rows at once); a delegation lost meanwhile puts the op in doubt
+  and it goes back through the core by rid. At the end of a generation the rows past its cut
   that nobody was answered for are dropped, not replayed (their clients retry
   by rid at the new owner); a lone delegate's own rows are replayed as
   before; and a generation whose latest record names a backup is not ended

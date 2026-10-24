@@ -458,6 +458,8 @@ fn replay_seed() {
             locks_writer_hold_delegated_unsettled_config()
         }
         Ok("locks-writer-hold-delegated-doubt") => locks_writer_hold_delegated_doubt_config(),
+        Ok("locks-writer-hold-delegated-group") => locks_writer_hold_delegated_group_config(false),
+        Ok("locks-writer-hold-delegated-backup") => locks_writer_hold_delegated_group_config(true),
         Ok("locks-stall-step") => locks_stall_step_config(),
         Ok("locks-core-stall") => locks_core_stall_config(),
         Ok("locks-core-stall-root") => locks_core_stall_root_config(),
@@ -5276,6 +5278,8 @@ fn sweep_config() {
         "locks-writer-hold-delegated" => locks_writer_hold_delegated_config(),
         "locks-writer-hold-delegated-unsettled" => locks_writer_hold_delegated_unsettled_config(),
         "locks-writer-hold-delegated-doubt" => locks_writer_hold_delegated_doubt_config(),
+        "locks-writer-hold-delegated-group" => locks_writer_hold_delegated_group_config(false),
+        "locks-writer-hold-delegated-backup" => locks_writer_hold_delegated_group_config(true),
         "locks-stall-step" => locks_stall_step_config(),
         "locks-core-stall" => locks_core_stall_config(),
         "locks-core-stall-root" => locks_core_stall_root_config(),
@@ -8943,6 +8947,25 @@ fn locks_writer_hold_delegated_doubt_config() -> SimConfig {
     }
 }
 
+/// Plan 43 C2d: [`locks_writer_hold_delegated_config`] where the delegate is
+/// not lone, so its own writes are journaled with the group's class and the
+/// fast path writes first and waits for the group: the root within the
+/// budget of both delegates (`backup`: false; the group is the delegate and
+/// the root), or the delegates next to each other (`backup`: true; node 3
+/// chooses node 2). The held write of the fault is then a write whose
+/// answer waits.
+fn locks_writer_hold_delegated_group_config(backup: bool) -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(sim::run::backup_core_config),
+        rtts: if backup {
+            vec![((1, 2), 80), ((1, 3), 80), ((2, 3), 10)]
+        } else {
+            vec![((1, 2), 10), ((1, 3), 10), ((2, 3), 80)]
+        },
+        ..locks_writer_hold_delegated_config()
+    }
+}
+
 /// F1's non-vacuity knob: [`locks_writer_hold_config`] with the token
 /// check at the write off (the code before it).
 fn locks_writer_hold_unchecked_config() -> SimConfig {
@@ -9839,6 +9862,8 @@ struct M14Totals {
     held_writes: u64,
     held_refused: u64,
     held_accepted: u64,
+    fast_waited: u64,
+    fast_answered: u64,
     doubt_lapses: u64,
     token_rejections_at_write: u64,
     settle_waits: u64,
@@ -9928,6 +9953,8 @@ impl M14Totals {
         self.held_writes += r.held_writes;
         self.held_refused += r.held_refused;
         self.held_accepted += r.held_accepted;
+        self.fast_waited += r.fast_waited;
+        self.fast_answered += r.fast_answered;
         self.token_rejections_at_write += r.token_rejections_at_write;
         self.settle_waits += r.settle_waits;
         self.max_simulated_ms = self.max_simulated_ms.max(r.simulated_ms);
@@ -11547,6 +11574,33 @@ fn locks_writer_hold_delegated_without_the_settle_is_caught() {
         caught > 0,
         "no write landed under the next holder without the settle"
     );
+}
+
+/// Plan 43 C2d: a delegate whose group is not itself (the root near, or a
+/// backup) writes on its fast path and waits for the group: the held writes
+/// of the fault are answered once the group holds their rows, and the oracle
+/// (I1: an answer that says committed is committed) is silent.
+#[test]
+fn locks_writer_hold_delegated_group_waits_for_the_group() {
+    for backup in [false, true] {
+        let label = if backup {
+            "locks-writer-hold-delegated-backup"
+        } else {
+            "locks-writer-hold-delegated-group"
+        };
+        let t = run_m14(
+            label,
+            locks_writer_hold_delegated_group_config(backup),
+            235_000..235_040,
+        );
+        assert!(t.held_writes > 20, "writes were rarely held: {t:?}");
+        assert!(
+            t.fast_waited > 10,
+            "no held write waited for its group: {t:?}"
+        );
+        assert!(t.fast_answered > 0, "no waiting write was answered: {t:?}");
+        assert_eq!(t.clients.stale_turn_reads, 0, "{t:?}");
+    }
 }
 
 /// F1 (review T2): the held delegate write's client gives up on it (in

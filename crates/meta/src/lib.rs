@@ -35,8 +35,8 @@ pub use reintegrate::{conflict_dentry_name, CONFLICT_DIR};
 pub use replay::TouchSet;
 pub use rid::Rid;
 pub use session::{
-    DurableWait, JournalPos, KeySet, Position, ReadKey, SessionStats, SessionWait, Streams,
-    STREAMS_CAP,
+    DelegDurable, DurableWait, JournalPos, KeySet, Position, ReadKey, SessionStats, SessionWait,
+    Streams, STREAMS_CAP,
 };
 pub use snapsched::{SnapPolicy, SNAPSHOT_POLICY_XATTR};
 pub use store::backup::{BackupRole, BackupTx};

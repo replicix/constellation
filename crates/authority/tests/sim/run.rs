@@ -956,6 +956,10 @@ pub struct Report {
     pub held_writes: u64,
     pub held_refused: u64,
     pub held_accepted: u64,
+    /// Plan 43 C2d: delegate fast-path writes that waited for their group,
+    /// and those answered once it held the row.
+    pub fast_waited: u64,
+    pub fast_answered: u64,
     /// F1: tagged writes refused only by the check at the write, and
     /// positions that waited for a tagged write in its transaction
     /// (`LockStats`, summed over the nodes' last incarnations).
@@ -4183,6 +4187,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.held_writes += load(&n.shared.held_writes);
         report.held_refused += load(&n.shared.held_refused);
         report.held_accepted += load(&n.shared.held_accepted);
+        report.fast_waited += load(&n.shared.fast_waited);
+        report.fast_answered += load(&n.shared.fast_answered);
         let ls = n.meta.locks().stats();
         report.token_rejections_at_write += ls.token_rejections_at_write;
         report.settle_waits += ls.settle_waits;

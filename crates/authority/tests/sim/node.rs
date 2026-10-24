@@ -221,6 +221,11 @@ pub struct Shared {
     pub held_writes: AtomicU64,
     pub held_refused: AtomicU64,
     pub held_accepted: AtomicU64,
+    /// Plan 43 C2d: delegate fast-path writes whose answer waited for the
+    /// group (`Driver::delegate_done`), and those answered once it held the
+    /// row.
+    pub fast_waited: AtomicU64,
+    pub fast_answered: AtomicU64,
     /// F1 (a held delegate write): the write parked inside its
     /// transaction, pinned, with the store's writer lock, until a writer
     /// that waits for that lock (`Meta::set_writer_wait_hook_for_tests`)
@@ -492,6 +497,8 @@ impl NodeHandle {
             held_writes: AtomicU64::new(0),
             held_refused: AtomicU64::new(0),
             held_accepted: AtomicU64::new(0),
+            fast_waited: AtomicU64::new(0),
+            fast_answered: AtomicU64::new(0),
             held_ctl: Mutex::new(None),
             hold_partition: Mutex::new(None),
             landed: Mutex::new(Vec::new()),
@@ -695,6 +702,7 @@ impl NodeHandle {
             panic_after_events: env.panic_after_events,
             fast_path: env.fast_path,
             held: None,
+            fast_waits: Vec::new(),
             ready: std::collections::VecDeque::new(),
             held_peers: std::collections::VecDeque::new(),
             peers_held_until: None,
@@ -946,6 +954,9 @@ struct Driver {
     fast_path: super::run::FastPath,
     /// F1: the fast-path write held behind the slow writer, if any.
     held: Option<HeldWrite>,
+    /// Plan 43 C2d: the delegate's fast-path writes that wait for their
+    /// group (the engine's `wait_deleg_durable`), polled after every step.
+    fast_waits: Vec<FastWait>,
     /// A runtime lag's aftermath ([`Driver::next_event`]): what goes
     /// next, before the queue; what peers sent, held until
     /// `peers_held_until`.
@@ -985,6 +996,21 @@ type Stamped = ((NodeId, u64), (u64, i64, i64));
 /// `AliveTargets`, plan 43 C7-H1).
 type Liveness = (u64, i64, i64, i64, Vec<NodeId>);
 
+/// Plan 43 C2d: a delegate's fast-path write whose row waits for its group:
+/// the engine thread sits in `wait_deleg_durable` for it; here the driver
+/// polls the same watermark after every step.
+struct FastWait {
+    rid: Rid,
+    op: MutateOp,
+    tag: LockTag,
+    outcome: MutateOutcome,
+    gen: u64,
+    idx: u64,
+    class: constellation_authority::core::AckClass,
+    /// The engine's wait budget ends here: the op is then in doubt.
+    deadline: tokio::time::Instant,
+}
+
 /// F1 in the simulation (`WriterLockHold`): a fast-path write that passed
 /// its fencing-token check and waits for the store's writer lock behind a
 /// slow writer. It runs `execute_tagged` on an OS thread of its own, parked
@@ -999,6 +1025,11 @@ struct HeldWrite {
     /// A delegate's write (parked inside its transaction, `Shared::held_ctl`
     /// holds its go), and its generation.
     deleg: Option<u64>,
+    /// A delegate's write: the class its row was journaled with (the one
+    /// the core had published when the write was admitted), which its
+    /// answer says and waits by.
+    class: Option<constellation_authority::core::AckClass>,
+    tag: LockTag,
     shared: Arc<Shared>,
     release_at: tokio::time::Instant,
     go: Option<std::sync::mpsc::Sender<bool>>,
@@ -1750,6 +1781,7 @@ impl Driver {
             self.note_journaled_refusals();
             self.note_identity();
             self.dispatch(actions);
+            self.poll_fast_waits();
             self.refresh_view();
         }
     }
@@ -2377,6 +2409,8 @@ impl Driver {
             op: op.clone(),
             epoch,
             deleg: None,
+            class: None,
+            tag: tag.clone(),
             shared: self.shared.clone(),
             release_at: tokio::time::Instant::now() + std::time::Duration::from_millis(write_ms),
             go: Some(go),
@@ -2426,12 +2460,6 @@ impl Driver {
         if self.shared.hold_next.lock().unwrap().is_none() {
             return None;
         }
-        // Plan 43 C2 (interim, until the fast path writes and then waits):
-        // the delegate's fast path is open only while its own node's ops
-        // are answered from its disk (`Lone`, or a designation's).
-        if self.core.deleg_fast_path_gated(now) {
-            return None;
-        }
         let constellation_meta::delegation::Ownership::Delegated(d) =
             self.meta.resolve_ownership(&TouchSet::from_op(op))
         else {
@@ -2451,6 +2479,11 @@ impl Driver {
         }
         let session = self.meta.session();
         let deps = session.deps().filter(|dp| session.reaches(dp))?;
+        // The class the core has published for the generation, read at the
+        // admission as the engine's fast path does: the row is journaled
+        // with it and the answer says it and waits by it.
+        let row_class = session.deleg_row_class(gen)?;
+        let class = ack_class_of(row_class, gen);
         let (_, write_ms) = self.shared.hold_next.lock().unwrap().take()?;
         let epoch = self.core.ship().max_epoch.max(1);
         let (phase_tx, phase) = std::sync::mpsc::channel();
@@ -2471,7 +2504,10 @@ impl Driver {
                     let _ = checked.send(HeldPhase::Checked);
                     go_rx.take().is_none_or(|rx| rx.recv().unwrap_or(false))
                 })));
-                let r = meta.delegate_execute(&op, Some(rid), gen, deps, &tag, now);
+                let r = {
+                    let _class = constellation_meta::PendingClass::set(row_class);
+                    meta.delegate_execute(&op, Some(rid), gen, deps, &tag, now)
+                };
                 constellation_meta::write_check_hook::set(None);
                 let at = clock.elapsed_ms();
                 let _ = committed_tx.send(());
@@ -2489,6 +2525,8 @@ impl Driver {
             op: op.clone(),
             epoch,
             deleg: Some(gen),
+            class: Some(class),
+            tag: tag.clone(),
             shared: self.shared.clone(),
             release_at: tokio::time::Instant::now() + std::time::Duration::from_millis(write_ms),
             go: None,
@@ -2539,7 +2577,7 @@ impl Driver {
                 if let Some(idx) = idx {
                     session.note_stream(gen, idx);
                 }
-                Some(self.fast_path_done(now, rid, op, outcome, Some(gen)))
+                Some(self.delegate_done(now, rid, op, tag, outcome, gen, idx, class))
             }
             Err(_) => panic!("held write thread vanished"),
         }
@@ -2553,6 +2591,8 @@ impl Driver {
         let (rid, op) = (held.rid, held.op.clone());
         let _ = held.epoch;
         let deleg = held.deleg;
+        let class = held.class;
+        let tag = held.tag.clone();
         let (outcome, idx, landed_at) = held.finish();
         match &outcome {
             MutateOutcome::LockLapsed => {
@@ -2571,27 +2611,29 @@ impl Driver {
         }
         tracing::debug!(node = self.id, ?rid, ?outcome, "sim: the held write ran");
         let now = self.clock.now();
-        let actions = self.fast_path_done(now, rid, &op, outcome, deleg);
+        let actions = match (deleg, class) {
+            (Some(gen), Some(class)) => {
+                self.delegate_done(now, rid, &op, &tag, outcome, gen, idx, class)
+            }
+            _ => self.fast_path_done(now, rid, &op, outcome, None),
+        };
         self.dispatch(actions);
     }
 
     /// The fast path's answer to an op it executed: the acknowledgement
-    /// to the core and the reply. `deleg`: the generation of a delegate's
-    /// write; the answer is this node's own sequencing, of the class the
-    /// core gives such answers now.
+    /// to the core and the reply. `deleg`: the class a delegate's write was
+    /// journaled with, which the answer says (`None`: the root's own write,
+    /// of the class the core gives such answers now).
     fn fast_path_done(
         &mut self,
         now: constellation_authority::Now,
         rid: Rid,
         op: &MutateOp,
         outcome: MutateOutcome,
-        deleg: Option<u64>,
+        deleg: Option<constellation_authority::core::AckClass>,
     ) -> Vec<Action> {
         let mut class = match deleg {
-            Some(gen) => {
-                self.core
-                    .deleg_ack_class(now, gen, constellation_authority::core::Asker::Own)
-            }
+            Some(class) => class,
             None => self.core.root_ack_class(),
         };
         if self.plant_claim_root_group_on_lone
@@ -2619,6 +2661,90 @@ impl Driver {
             source: AnswerSource::Sequenced(class),
         });
         actions
+    }
+
+    /// Plan 43 C2d: a delegate's fast-path write is over (`idx`: the stream
+    /// index it journaled; `None`: refused, nothing journaled). A row whose
+    /// class waits (`DelegGroup`, `Archive`) is answered once its group
+    /// holds it (`poll_fast_waits`), as the engine's thread waits in
+    /// `wait_deleg_durable`; `Lone` and `NonStealable` rows at once.
+    #[allow(clippy::too_many_arguments)]
+    fn delegate_done(
+        &mut self,
+        now: constellation_authority::Now,
+        rid: Rid,
+        op: &MutateOp,
+        tag: &LockTag,
+        outcome: MutateOutcome,
+        gen: u64,
+        idx: Option<u64>,
+        class: constellation_authority::core::AckClass,
+    ) -> Vec<Action> {
+        match idx {
+            Some(idx) if class.gated() && matches!(outcome, MutateOutcome::Accepted { .. }) => {
+                self.shared.fast_waited.fetch_add(1, Ordering::Relaxed);
+                self.fast_waits.push(FastWait {
+                    rid,
+                    op: op.clone(),
+                    tag: tag.clone(),
+                    outcome,
+                    gen,
+                    idx,
+                    class,
+                    deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                });
+                Vec::new()
+            }
+            _ => self.fast_path_done(now, rid, op, outcome, Some(class)),
+        }
+    }
+
+    /// Plan 43 C2d: the waits of the delegate's fast-path writes, against
+    /// the watermark the core published (`wait_deleg_durable` with no
+    /// budget): answered once the group holds the row; in doubt, resubmitted
+    /// by rid to the core, when the generation was lost or the budget ran
+    /// out.
+    fn poll_fast_waits(&mut self) {
+        if self.fast_waits.is_empty() {
+            return;
+        }
+        let meta = self.meta.clone();
+        let session = meta.session();
+        let now = self.clock.now();
+        for w in std::mem::take(&mut self.fast_waits) {
+            let wait = session.wait_deleg_durable(w.gen, w.idx, std::time::Duration::ZERO);
+            let expired = tokio::time::Instant::now() >= w.deadline;
+            match wait {
+                constellation_meta::DurableWait::Durable(_) => {
+                    self.shared.fast_answered.fetch_add(1, Ordering::Relaxed);
+                    let actions = self.fast_path_done(now, w.rid, &w.op, w.outcome, Some(w.class));
+                    self.dispatch(actions);
+                }
+                constellation_meta::DurableWait::Lost
+                | constellation_meta::DurableWait::Ungated => self.resubmit_in_doubt(now, w),
+                constellation_meta::DurableWait::TimedOut if expired => {
+                    self.resubmit_in_doubt(now, w)
+                }
+                constellation_meta::DurableWait::TimedOut => self.fast_waits.push(w),
+            }
+        }
+    }
+
+    /// The op comes back through the core under its rid, which dedups it
+    /// against the row it journaled and answers when that row is committed.
+    fn resubmit_in_doubt(&mut self, now: constellation_authority::Now, w: FastWait) {
+        self.step_now = now;
+        let actions = self.core.handle(
+            now,
+            Event::SubmitInDoubt {
+                rid: w.rid,
+                op: w.op,
+                policy: Policy::Client,
+                tag: w.tag,
+            },
+            &*self.meta,
+        );
+        self.dispatch(actions);
     }
 
     fn dispatch(&mut self, actions: Vec<Action>) {
@@ -3215,4 +3341,21 @@ pub fn meta_holds_rid(meta: &Meta, rid: Rid) -> bool {
         carries(&Replica::backup_tail(meta, e))
             || Replica::member_copy(meta, e).is_some_and(|(_, txs)| carries(&txs))
     })
+}
+
+/// The class a journal row of `RowClass` answers as, for the delegation
+/// `gen` (the inverse of `AckClass`'s `Into<RowClass>`).
+fn ack_class_of(
+    class: constellation_meta::RowClass,
+    gen: u64,
+) -> constellation_authority::core::AckClass {
+    use constellation_authority::core::AckClass;
+    use constellation_meta::RowClass;
+    match class {
+        RowClass::Lone => AckClass::Lone,
+        RowClass::Archive => AckClass::Archive,
+        RowClass::RootGroup => AckClass::RootGroup,
+        RowClass::DelegGroup => AckClass::DelegGroup { gen },
+        RowClass::NonStealable => AckClass::NonStealable,
+    }
 }

@@ -1288,3 +1288,271 @@ fn a_deposed_nodes_fsync_commits_through_the_core_not_eio() {
     assert_eq!(commits, 1, "the commit went through the core once");
     assert_eq!(result, Some(Ok(())));
 }
+
+// ---- plan 43 C2d: the delegate's fast path writes, then waits ----
+
+const DELEG_GEN: u64 = 7;
+
+/// A delegate's filesystem: `holder_fs` for node 1, with a directory
+/// delegated to it as generation [`DELEG_GEN`], the fast path's view of
+/// that delegation honoured, and the core's publication of the class
+/// (`class`) and the committed stream index (`through`) for it. Returns
+/// the directory too.
+fn delegate_fs(
+    class: constellation_meta::RowClass,
+    through: u64,
+) -> (
+    View,
+    Arc<Meta>,
+    Ino,
+    TempDir,
+    tokio::sync::mpsc::UnboundedReceiver<SyncRequest>,
+) {
+    use constellation_meta::LogRecord;
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let dir: Ino = (1 << 40) | 9;
+    meta.apply_records(&[
+        LogRecord::Mkdir {
+            parent: ROOT_INO,
+            name: "d".into(),
+            ino: dir,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            time_ns: 1,
+        },
+        LogRecord::Delegate {
+            dir,
+            node: 1,
+            gen: DELEG_GEN,
+            designated: false,
+            range: (0, 0),
+        },
+    ])
+    .unwrap();
+    let (fs, tmp, core) = holder_fs(meta.clone(), false);
+    fs.sync
+        .as_ref()
+        .unwrap()
+        .delegates
+        .mirror(&constellation_authority::core::DelegView {
+            mine: vec![(dir, DELEG_GEN, i64::MAX, false, 0, 0, 0)],
+            ..Default::default()
+        });
+    meta.session().set_deleg_durable(
+        DELEG_GEN,
+        Some(constellation_meta::DelegDurable {
+            class,
+            through,
+            lost: false,
+        }),
+    );
+    (fs, meta, dir, tmp, core)
+}
+
+fn delegate_create(dir: Ino, seq: u64) -> (constellation_meta::MutateOp, constellation_meta::Rid) {
+    (
+        constellation_meta::MutateOp::Create {
+            parent: dir,
+            name: format!("f{seq}"),
+            ino: (1 << 40) | (100 + seq),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        },
+        constellation_meta::Rid {
+            node: 1,
+            incarnation: 1,
+            seq,
+        },
+    )
+}
+
+/// Waits until the delegate has journaled its `n`th row.
+fn journaled_stream_row(meta: &Meta, n: u64) {
+    let started = std::time::Instant::now();
+    while meta.delegate_idx(DELEG_GEN).unwrap() < n {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "never journaled"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// A stand-in for the core that answers whatever the write sends it with
+/// "in doubt" (for at most 20 s), counting the submissions: a write that
+/// should stay on the fast path never sends one, and one that does not
+/// (the interim gate of C2c) fails the test instead of hanging it.
+fn core_answering_in_doubt(
+    core: &mut tokio::sync::mpsc::UnboundedReceiver<SyncRequest>,
+    stop: &std::sync::atomic::AtomicBool,
+    submitted: &Mutex<Vec<(constellation_meta::Rid, bool)>>,
+) {
+    use std::sync::atomic::Ordering;
+    let started = std::time::Instant::now();
+    while !stop.load(Ordering::Relaxed) && started.elapsed() < Duration::from_secs(20) {
+        match core.try_recv() {
+            Ok(SyncRequest::Submit {
+                reply,
+                rid,
+                in_doubt,
+                ..
+            }) => {
+                submitted.lock().unwrap().push((rid, in_doubt));
+                let _ = reply.send(constellation_authority::ClientReply::InDoubt);
+            }
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+}
+
+/// Plan 43 C2d: with a class that waits, the delegate's fast path
+/// journals the row with it and returns only once the core's watermark
+/// covers the row. The interim gate (C2c) closed the path whenever the
+/// class waited: the write went through the core and parked there.
+#[test]
+fn the_delegates_fast_path_writes_then_waits_for_its_group() {
+    use constellation_meta::RowClass;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (fs, meta, dir, _tmp, mut core) = delegate_fs(RowClass::DelegGroup, 0);
+    let h = fs.sync.as_ref().unwrap();
+    let (op, rid) = delegate_create(dir, 1);
+    let (stop, submitted) = (AtomicBool::new(false), Mutex::new(Vec::new()));
+    std::thread::scope(|scope| {
+        let responder = scope.spawn(|| core_answering_in_doubt(&mut core, &stop, &submitted));
+        let write = scope.spawn(|| fs.mutate_op_rebasable_with_rid(h, dir, &op, rid));
+        let journaled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            journaled_stream_row(&meta, 1);
+            // Journaled on this thread, under the published class.
+            assert_eq!(
+                meta.journal_tx_class(meta.journal_tip().unwrap()).unwrap(),
+                Some(RowClass::DelegGroup)
+            );
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!write.is_finished(), "the write waits for its group");
+            // The group holds the stream through the row.
+            meta.session().set_deleg_durable(
+                DELEG_GEN,
+                Some(constellation_meta::DelegDurable {
+                    class: RowClass::DelegGroup,
+                    through: 1,
+                    lost: false,
+                }),
+            );
+        }));
+        let result = write.join().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        responder.join().unwrap();
+        if let Err(e) = journaled {
+            std::panic::resume_unwind(e);
+        }
+        assert!(result.is_ok());
+    });
+    // It never went through the core: only the stream's nudge.
+    assert!(
+        submitted.lock().unwrap().is_empty(),
+        "the write went through the core"
+    );
+    let stats = meta.session().stats();
+    assert_eq!((stats.fast_acks_waited, stats.fast_acks_in_doubt), (1, 0));
+    assert_eq!(h.delegates.executed(), 1);
+}
+
+/// A row the core says is committed already (the watermark covers it by
+/// the time the write is done) is answered without a wait; a class that
+/// does not wait (`Lone`) never looks at the watermark.
+#[test]
+fn the_delegates_fast_path_answers_a_lone_row_and_a_committed_row_at_once() {
+    use constellation_meta::RowClass;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (fs, meta, dir, _tmp, mut core) = delegate_fs(RowClass::Lone, 0);
+    let h = fs.sync.as_ref().unwrap();
+    let (stop, submitted) = (AtomicBool::new(false), Mutex::new(Vec::new()));
+    let (first, second) = std::thread::scope(|scope| {
+        let responder = scope.spawn(|| core_answering_in_doubt(&mut core, &stop, &submitted));
+        let (op, rid) = delegate_create(dir, 1);
+        let first = fs.mutate_op_rebasable_with_rid(h, dir, &op, rid).is_ok();
+        assert_eq!(
+            meta.journal_tx_class(meta.journal_tip().unwrap()).unwrap(),
+            Some(RowClass::Lone)
+        );
+        assert_eq!(meta.session().stats().fast_acks_waited, 0);
+        // A group class with the watermark past the row: answered, counted.
+        meta.session().set_deleg_durable(
+            DELEG_GEN,
+            Some(constellation_meta::DelegDurable {
+                class: RowClass::DelegGroup,
+                through: u64::MAX,
+                lost: false,
+            }),
+        );
+        let (op, rid) = delegate_create(dir, 2);
+        let second = fs.mutate_op_rebasable_with_rid(h, dir, &op, rid).is_ok();
+        stop.store(true, Ordering::Relaxed);
+        responder.join().unwrap();
+        (first, second)
+    });
+    assert!(first && second);
+    assert!(
+        submitted.lock().unwrap().is_empty(),
+        "went through the core"
+    );
+    assert_eq!(
+        meta.journal_tx_class(meta.journal_tip().unwrap()).unwrap(),
+        Some(RowClass::DelegGroup)
+    );
+    assert_eq!(meta.session().stats().fast_acks_waited, 1);
+    assert_eq!(h.delegates.executed(), 2);
+}
+
+/// A generation the core stops publishing (ended here), or one it marks
+/// lost, is not an answer: the op is in doubt and goes back through the
+/// core under its rid, which answers from the row's commit.
+#[test]
+fn the_delegates_fast_path_resubmits_in_doubt_when_its_generation_is_lost() {
+    use constellation_meta::RowClass;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    for withdraw in [false, true] {
+        let (fs, meta, dir, _tmp, mut core) = delegate_fs(RowClass::DelegGroup, 0);
+        let h = fs.sync.as_ref().unwrap();
+        let (op, rid) = delegate_create(dir, 1);
+        let (stop, submitted) = (AtomicBool::new(false), Mutex::new(Vec::new()));
+        let result = std::thread::scope(|scope| {
+            let responder = scope.spawn(|| core_answering_in_doubt(&mut core, &stop, &submitted));
+            let write = scope.spawn(|| fs.mutate_op_rebasable_with_rid(h, dir, &op, rid));
+            let waiting = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                journaled_stream_row(&meta, 1);
+                std::thread::sleep(Duration::from_millis(50));
+                assert!(!write.is_finished());
+                if withdraw {
+                    meta.session().set_deleg_durable(DELEG_GEN, None);
+                } else {
+                    meta.session().set_deleg_durable(
+                        DELEG_GEN,
+                        Some(constellation_meta::DelegDurable {
+                            class: RowClass::DelegGroup,
+                            through: 0,
+                            lost: true,
+                        }),
+                    );
+                }
+            }));
+            let result = write.join().unwrap();
+            stop.store(true, Ordering::Relaxed);
+            responder.join().unwrap();
+            if let Err(e) = waiting {
+                std::panic::resume_unwind(e);
+            }
+            result
+        });
+        assert_eq!(
+            *submitted.lock().unwrap(),
+            vec![(rid, true)],
+            "resubmitted once, in doubt"
+        );
+        assert!(result.is_err(), "not answered OK");
+        assert_eq!(meta.session().stats().fast_acks_in_doubt, 1);
+    }
+}

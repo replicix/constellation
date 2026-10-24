@@ -392,22 +392,34 @@ impl View {
             let session = self.meta.session();
             // The op's `deps` (`observed` plus every position this
             // node's clients were answered with); `None` (the streams
-            // overflow) goes through the core, to the root.
-            if let Some(deps) = session.deps().filter(|d| session.reaches(d)) {
+            // overflow) goes through the core, to the root. Likewise a
+            // generation the core has not published a class for yet.
+            //
+            // Plan 43 C2d: the row is journaled with the class the core
+            // published for the generation (`Core::report_deleg_durable`):
+            // `Lone` or `NonStealable` is answered at once, a class that
+            // waits (`DelegGroup`, `Archive`) once the group holds the row.
+            let published = session.deleg_row_class(gen);
+            if let (Some(deps), Some(class)) =
+                (session.deps().filter(|d| session.reaches(d)), published)
+            {
                 constellation_vfs::watch::stage("delegate execute (meta)");
                 // F1/F9: the delegation is judged again once the op holds
                 // the store's writer lock; one that ran out while the op
                 // waited for it sends the op through the core instead.
                 let delegates = h.delegates.clone();
-                let result = self.meta.delegate_execute_admitted(
-                    op,
-                    Some(rid),
-                    gen,
-                    deps,
-                    &tag,
-                    now,
-                    Box::new(move || delegates.honours(gen)),
-                );
+                let result = {
+                    let _class = constellation_meta::PendingClass::set(class);
+                    self.meta.delegate_execute_admitted(
+                        op,
+                        Some(rid),
+                        gen,
+                        deps,
+                        &tag,
+                        now,
+                        Box::new(move || delegates.honours(gen)),
+                    )
+                };
                 // Journaled (or refused): the admission ends here, before
                 // the core can answer a recall with a `through` this op
                 // would be past.
@@ -451,6 +463,28 @@ impl View {
                         session.note_stream(gen, idx);
                         h.delegates.note_executed();
                         self.recall_after_local_write(h, &records, now.wait);
+                        // Plan 43 C2d: the write is done; a row of a class
+                        // that waits is answered once the delegation's
+                        // group holds it (the core publishes how far the
+                        // stream is committed, `wait_deleg_durable`). The
+                        // generation lost or the budget out: in doubt, by
+                        // rid through the core, which answers from the
+                        // row's commit or re-executes it at the new owner
+                        // (a delegate that turned lone meanwhile waits on:
+                        // the row is `DelegGroup`, never answered as lone).
+                        if class.gated() {
+                            match session.wait_deleg_durable(gen, idx, DURABLE_WAIT_BUDGET) {
+                                constellation_meta::DurableWait::Durable(waited) => {
+                                    session.count_fast_ack(waited);
+                                }
+                                constellation_meta::DurableWait::Ungated
+                                | constellation_meta::DurableWait::Lost
+                                | constellation_meta::DurableWait::TimedOut => {
+                                    session.count_fast_ack_in_doubt();
+                                    return self.submit_to_core(h, op, rid, &tag, true);
+                                }
+                            }
+                        }
                         Ok(())
                     }
                     Err(e) => Err(mutate_fail(e)),

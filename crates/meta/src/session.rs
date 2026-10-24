@@ -512,6 +512,10 @@ struct Inner {
     /// whose effects this replica carries (`OwnRows::settle`). Every
     /// other row through it is owed as before.
     excused: std::collections::BTreeSet<u64>,
+    /// Plan 43 C2d: per generation this node is the delegate of, what the
+    /// core says of the answers to this node's own clients
+    /// ([`SessionState::set_deleg_durable`]).
+    deleg_durable: std::collections::BTreeMap<u64, DelegDurable>,
 }
 
 /// Disjoint inclusive journal seq ranges, `start -> end`.
@@ -697,6 +701,25 @@ pub enum DurableWait {
     /// The gate is off because the lease was lost.
     Lost,
     TimedOut,
+}
+
+/// Plan 43 C2d (C2 spec §4): per generation this node is the delegate of,
+/// what the core knows of the delegation's group, for the FUSE fast path:
+/// the class its own clients' rows are journaled with, and how far the
+/// group has committed the generation's stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DelegDurable {
+    /// The class of a row the fast path journals under the generation now
+    /// (`Core::deleg_ack_class(.., Asker::Own)`): `Lone` or `NonStealable`
+    /// answer at once, `DelegGroup` and `Archive` wait.
+    pub class: RowClass,
+    /// The highest stream index whose prefix is committed: the log carries
+    /// it, or every member of the group (and of a requested change) holds
+    /// it (`Core::deleg_committed_through`).
+    pub through: u64,
+    /// The generation is stopped, lapsed or lost its backup: nothing more
+    /// will commit under it from here, the op's answer is in doubt.
+    pub lost: bool,
 }
 
 pub struct SessionState {
@@ -1375,6 +1398,61 @@ impl SessionState {
         }
     }
 
+    /// Plan 43 C2d: what the core knows of the delegation `gen` held here
+    /// (`None`: not held). Every change wakes the waiters.
+    pub fn set_deleg_durable(&self, gen: u64, d: Option<DelegDurable>) {
+        let mut g = self.inner.lock().unwrap();
+        let changed = match d {
+            Some(d) => g.deleg_durable.insert(gen, d) != Some(d),
+            None => g.deleg_durable.remove(&gen).is_some(),
+        };
+        drop(g);
+        if changed {
+            self.cv.notify_all();
+        }
+    }
+
+    /// Plan 43 C2d: the class a delegate's fast-path row of `gen` is
+    /// journaled with now; `None`: the core has not published the
+    /// generation (the op goes through the core).
+    pub fn deleg_row_class(&self, gen: u64) -> Option<RowClass> {
+        self.inner
+            .lock()
+            .unwrap()
+            .deleg_durable
+            .get(&gen)
+            .map(|d| d.class)
+    }
+
+    /// Plan 43 C2d: the delegate fast path's wait for its group. The op
+    /// journaled stream index `idx` of generation `gen`: `Durable` once the
+    /// group has committed the prefix through it (the log, or every member
+    /// of the group; a row that is committed is answered whatever became of
+    /// the delegation since); `Lost` if the generation is not held, is
+    /// stopped, lapsed or lost its backup (the answer is in doubt: the core
+    /// dedups the retry by rid and answers from the row's commit);
+    /// `TimedOut` at `budget`. Never `Ungated`: a delegate that turned
+    /// lone after it journaled a `DelegGroup` row still waits for that
+    /// row's commit (the root's append), as the core's own answer does.
+    pub fn wait_deleg_durable(&self, gen: u64, idx: u64, budget: Duration) -> DurableWait {
+        let started = Instant::now();
+        let mut g = self.inner.lock().unwrap();
+        loop {
+            match g.deleg_durable.get(&gen) {
+                Some(d) if d.through >= idx => return DurableWait::Durable(started.elapsed()),
+                Some(d) if !d.lost => {}
+                _ => return DurableWait::Lost,
+            }
+            let waited = started.elapsed();
+            if waited >= budget {
+                return DurableWait::TimedOut;
+            }
+            // (Every change notifies; the slice only bounds a missed wake.)
+            let slice = (budget - waited).min(Duration::from_millis(20));
+            g = self.cv.wait_timeout(g, slice).unwrap().0;
+        }
+    }
+
     /// Plan 43 C1-2: the class the core published with the gate. The
     /// fast path's rows are journaled with it and its wait follows it.
     pub fn published_class(&self) -> RowClass {
@@ -1707,6 +1785,53 @@ mod tests {
             pending: jp(epoch, jseq),
             streams: Streams::NONE,
         }
+    }
+
+    /// Plan 43 C2d: the delegate fast path's wait follows the commit point
+    /// the core publishes per generation: a covered row is durable (whatever
+    /// became of the delegation since), an uncovered one waits, and a
+    /// generation lost, withdrawn or never published is in doubt; a raise
+    /// wakes a waiter.
+    #[test]
+    fn a_delegates_wait_follows_the_published_commit_point() {
+        let s = std::sync::Arc::new(SessionState::default());
+        let published = |class, through, lost| DelegDurable {
+            class,
+            through,
+            lost,
+        };
+        let wait = |gen, idx| s.wait_deleg_durable(gen, idx, Duration::ZERO);
+        assert_eq!(wait(7, 1), DurableWait::Lost, "never published");
+        assert_eq!(s.deleg_row_class(7), None);
+        s.set_deleg_durable(7, Some(published(RowClass::DelegGroup, 0, false)));
+        assert_eq!(s.deleg_row_class(7), Some(RowClass::DelegGroup));
+        assert_eq!(wait(7, 1), DurableWait::TimedOut);
+        assert_eq!(wait(8, 1), DurableWait::Lost, "another generation");
+        // A waiter is woken by the raise (and not by waiting out its budget).
+        let waiter = {
+            let s = s.clone();
+            std::thread::spawn(move || s.wait_deleg_durable(7, 2, Duration::from_secs(30)))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        s.set_deleg_durable(7, Some(published(RowClass::DelegGroup, 2, false)));
+        assert!(matches!(waiter.join().unwrap(), DurableWait::Durable(_)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // Committed stays committed when the delegation is lost; the rest
+        // is in doubt.
+        s.set_deleg_durable(7, Some(published(RowClass::DelegGroup, 2, true)));
+        assert!(matches!(wait(7, 2), DurableWait::Durable(_)));
+        assert_eq!(wait(7, 3), DurableWait::Lost);
+        // Withdrawn while a waiter sleeps: it is told, not left to its budget.
+        s.set_deleg_durable(7, Some(published(RowClass::DelegGroup, 2, false)));
+        let waiter = {
+            let s = s.clone();
+            std::thread::spawn(move || s.wait_deleg_durable(7, 3, Duration::from_secs(30)))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        s.set_deleg_durable(7, None);
+        assert_eq!(waiter.join().unwrap(), DurableWait::Lost);
+        assert_eq!(wait(7, 1), DurableWait::Lost);
     }
 
     /// Plan 43 C1-2: the class the core publishes with the gate is what the

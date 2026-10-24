@@ -2161,6 +2161,7 @@ impl Core {
         self.backup_after_event(now, replica, &mut out);
         self.promise_after_event(now, replica, &mut out);
         self.deleg_after_event(now, replica, &mut out);
+        self.report_deleg_durable(now, replica);
         if self.cfg.delegation {
             self.withdraw_lost_deps_inbox_ops(now, replica, &mut out);
         }

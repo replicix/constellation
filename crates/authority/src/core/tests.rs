@@ -36547,6 +36547,13 @@ mod deleg_group {
             .collect()
     }
 
+    /// The fast path's wait for stream index `idx` of generation 7, polled.
+    fn deleg_wait(h: &Harness, idx: u64) -> constellation_meta::DurableWait {
+        h.meta
+            .session()
+            .wait_deleg_durable(7, idx, std::time::Duration::ZERO)
+    }
+
     /// The delegate's own client submits a create (`seq`).
     fn own_create(h: &mut Harness, dir: Ino, seq: u64) -> (Rid, Vec<Action>) {
         let rid = h.rid(seq);
@@ -36683,9 +36690,10 @@ mod deleg_group {
     fn a_lone_delegate_acks_its_own_node_and_waits_for_the_root_for_others() {
         let (mut h, dir, _, _) = delegate_renewed_once();
         assert!(h.core.deleg_lone(h.clk(), &h.core.dl.mine[&7]));
-        assert!(
-            !h.core.deleg_fast_path_gated(h.clk()),
-            "lone: the fast path stays open"
+        assert_eq!(
+            h.core.deleg_ack_class(h.clk(), 7, Asker::Own),
+            AckClass::Lone,
+            "lone: its own client's row is answered at once"
         );
         let (rid, out) = own_create(&mut h, dir, 1);
         assert_eq!(
@@ -36703,9 +36711,10 @@ mod deleg_group {
         assert!(answer_to_2(&out, 501).is_some(), "{out:?}");
         // The root comes within the budget: the next own op waits.
         root_is_near(&mut h);
-        assert!(
-            h.core.deleg_fast_path_gated(h.clk()),
-            "not lone: the fast path closes"
+        assert_eq!(
+            h.core.deleg_ack_class(h.clk(), 7, Asker::Own),
+            AckClass::DelegGroup { gen: 7 },
+            "not lone: its own client's row waits for the group"
         );
         let (rid, out) = own_create(&mut h, dir, 3);
         assert!(client_answers(&out).is_empty(), "answered alone: {out:?}");
@@ -36868,6 +36877,151 @@ mod deleg_group {
             Some(vec![]),
             "the root holds row 1: the removal is asked for"
         );
+    }
+
+    /// Plan 43 C2d: what the core tells the delegate's FUSE fast path —
+    /// the class its own clients' rows are journaled with, and how far the
+    /// group has committed the stream. Lone: the row is `Lone`; the root
+    /// comes within reach: `DelegGroup`, committed on the root's append;
+    /// the generation ending here withdraws it.
+    #[test]
+    fn the_core_publishes_the_class_and_the_commit_point_to_the_fast_path() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        // (Published by the steps the harness took.)
+        assert_eq!(
+            h.meta.session().deleg_row_class(7),
+            Some(constellation_meta::RowClass::Lone)
+        );
+        root_is_near(&mut h);
+        assert_eq!(
+            h.meta.session().deleg_row_class(7),
+            Some(constellation_meta::RowClass::DelegGroup)
+        );
+        let (_, out) = own_create(&mut h, dir, 1);
+        let (req, round, last) = batch(&out).expect("sent to the root");
+        assert_eq!(deleg_wait(&h, 1), constellation_meta::DurableWait::TimedOut);
+        root_acks(&mut h, req, round, last);
+        assert!(matches!(
+            deleg_wait(&h, 1),
+            constellation_meta::DurableWait::Durable(_)
+        ));
+        assert_eq!(deleg_wait(&h, 2), constellation_meta::DurableWait::TimedOut);
+        // The generation is stopped (a recall): nothing more will commit.
+        h.core.dl.mine.get_mut(&7).unwrap().stopped = true;
+        h.step(Event::Roster {
+            write_eligible: vec![1, 2, 3],
+        });
+        assert_eq!(deleg_wait(&h, 2), constellation_meta::DurableWait::Lost);
+        assert!(
+            matches!(
+                deleg_wait(&h, 1),
+                constellation_meta::DurableWait::Durable(_)
+            ),
+            "a committed row stays committed"
+        );
+        // No longer held: withdrawn.
+        h.core.dl.mine.remove(&7);
+        h.step(Event::Roster {
+            write_eligible: vec![1, 2, 3],
+        });
+        assert_eq!(h.meta.session().deleg_row_class(7), None);
+        assert_eq!(deleg_wait(&h, 1), constellation_meta::DurableWait::Lost);
+    }
+
+    /// Plan 43 C2d: the published commit point is the predicate the core
+    /// path's parks wait on — a recorded backup alone, and both versions
+    /// while a change is pending.
+    #[test]
+    fn the_published_commit_point_follows_the_group() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        {
+            let d = h.core.dl.mine.get_mut(&7).unwrap();
+            d.backup = Some(4);
+            d.group_requested = Some(vec![4]);
+        }
+        let committed = |h: &Harness| {
+            matches!(
+                deleg_wait(h, 1),
+                constellation_meta::DurableWait::Durable(_)
+            )
+        };
+        let out = forward_create(&mut h, dir, 1, 500);
+        let (breq, blast) = backup_append(&out).expect("appended to the backup");
+        let (req, round, last) = batch(&out).expect("sent to the root");
+        backup_acks(&mut h, breq, blast);
+        assert!(!committed(&h), "the backup alone is not both versions");
+        root_acks(&mut h, req, round, last);
+        assert!(committed(&h), "the root and the backup hold it");
+        // The record names the backup alone: the root's cursor is not needed.
+        record_group(&mut h, dir, 2, 1, vec![4]);
+        let out = forward_create(&mut h, dir, 2, 501);
+        let (breq, blast) = backup_append(&out).expect("appended");
+        assert!(matches!(
+            deleg_wait(&h, 2),
+            constellation_meta::DurableWait::TimedOut
+        ));
+        backup_acks(&mut h, breq, blast);
+        assert!(matches!(
+            deleg_wait(&h, 2),
+            constellation_meta::DurableWait::Durable(_)
+        ));
+    }
+
+    /// Plan 43 C2d: the fast path answers from the FUSE thread, where the
+    /// core does not see it, so the rows the group has committed while the
+    /// class waits count as answered: a backup leaves the record only once
+    /// the root holds them too (`a_backup_is_dropped_from_the_record_...`,
+    /// with the answer given by the fast path).
+    #[test]
+    fn rows_the_fast_path_may_have_answered_keep_their_backup_in_the_record() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        h.core.dl.mine.get_mut(&7).unwrap().backup = Some(4);
+        record_group(&mut h, dir, 2, 1, vec![4]);
+        // The FUSE thread's write: executed on the replica, unseen by the core.
+        let ino = h.meta.allocate_ino(dir).unwrap();
+        let op = MutateOp::Create {
+            parent: dir,
+            name: "fast".into(),
+            ino,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        {
+            let _class =
+                constellation_meta::PendingClass::set(constellation_meta::RowClass::DelegGroup);
+            h.meta
+                .delegate_execute(
+                    &op,
+                    Some(h.rid(1)),
+                    7,
+                    Default::default(),
+                    &Default::default(),
+                    h.clk(),
+                )
+                .unwrap();
+        }
+        let out = h.step(Event::Roster {
+            write_eligible: vec![1, 2, 3],
+        });
+        let (breq, blast) = backup_append(&out).expect("streamed to the backup");
+        let (req, round, last) = batch(&out).expect("streamed to the root");
+        assert_eq!(h.core.dl.mine[&7].acked_max, 0);
+        backup_acks(&mut h, breq, blast);
+        assert_eq!(
+            h.core.dl.mine[&7].acked_max, 1,
+            "the group committed row 1: the fast path may have answered it"
+        );
+        // The backup is lost; the root has not acknowledged row 1 yet.
+        h.core.dl.mine.get_mut(&7).unwrap().backup = None;
+        let mut out = Vec::new();
+        h.core.deleg_after_event(h.clk(), &h.meta, &mut out);
+        assert!(
+            h.core.dl.mine[&7].group_requested.is_none(),
+            "no removal yet"
+        );
+        root_acks(&mut h, req, round, last);
+        assert_eq!(h.core.dl.mine[&7].group_requested, Some(vec![]));
     }
 
     /// A retry of a rid whose row is still in the delegate's own uncommitted

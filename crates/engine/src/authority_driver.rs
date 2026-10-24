@@ -2767,9 +2767,6 @@ impl Driver {
                 .collect();
         }
         self.deps.delegates.mirror(&status.delegation);
-        self.deps
-            .delegates
-            .set_gated(self.core.deleg_fast_path_gated(now));
         status.placement_top = self.core.placement_top();
         status.locks_cluster = cfg.locks;
         let lv = self.core.lock_view();

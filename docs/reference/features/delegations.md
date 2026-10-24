@@ -146,10 +146,24 @@ through the delegate. It then:
    (`DelegateStream`, one batch in flight per generation).
 
 The delegate's own FUSE writes under its delegation take the local fast
-path only while the delegate is lone (or the delegation is a designation):
-otherwise they go through the core and park for the group like a forwarded
-op (`deleg_fast_path_gated`; the fast path will write first and wait after,
-plan 43 C2d). Its journal rows retire when a root segment carries them. If
+path whatever the delegation's group is (plan 43 C2d): the write runs on the
+FUSE thread and journals its row with the class the core published for the
+generation (`Core::report_deleg_durable`: `Lone` while the delegate is lone,
+`NonStealable` for a designation, otherwise `DelegGroup`, or `Archive` under
+`ack=s3`). A `Lone` or `NonStealable` row is answered at once; a row that
+waits is answered once the core's commit point for the generation covers its
+stream index (`Meta::session().wait_deleg_durable`: the log carries it, or
+every member of the group, and of a requested change, holds it — the same
+predicate the core path's parks wait on). If the generation is stopped,
+lapsed, lost its backup or ended before that, or the wait runs out
+(the 30 s durability wait budget), the op is in doubt: it goes back
+through the core under its rid, which answers from the row's commit or
+re-executes it at the new owner. A delegate that turns lone after journaling
+a `DelegGroup` row still waits for that row. The indexes the group has
+committed while the class waits count as answered for the group's
+reconfiguration (`acked_max`): a backup leaves the record only once the
+root's cursor or the log covers them. Its journal rows retire when a root
+segment carries them. If
 the generation ends first, the rows past the cut are stranded: rolled back,
 and — a lone delegate's rows, answered on its disk — replayed by rid through
 the new owner, or — rows that waited for a group, whose clients were never
