@@ -1977,7 +1977,21 @@ impl Core {
             return;
         }
         let (dir, kind, range) = (gs.dir, gs.kind, gs.range);
-        if sealed && self.root_ends_recall(now, gen) {
+        // Where the tail runs to without a gap from the cursor: what the
+        // drain must reach before the generation may end (below).
+        let tail_end = txs.iter().fold(
+            gs.cursor,
+            |end, tx| {
+                if tx.idx == end + 1 {
+                    tx.idx
+                } else {
+                    end
+                }
+            },
+        );
+        let ends_recall = self.root_ends_recall(now, gen);
+        let mut drained_to = gs.cursor;
+        if sealed && ends_recall {
             let mut cursor = gs.cursor;
             let mut drained = 0u64;
             for tx in txs {
@@ -2010,6 +2024,7 @@ impl Core {
             if let Some(gs) = self.dl.gens.get_mut(&gen) {
                 gs.cursor = cursor;
             }
+            drained_to = cursor;
             self.stats.deleg_sealed_drained += drained;
             if drained > 0 {
                 self.answer_awaiting_log(now, replica, out);
@@ -2024,6 +2039,28 @@ impl Core {
                 cursor,
                 "drained a sealed delegation"
             );
+        }
+        // Plan 43 C2 (D8, interim until C2e): rows of the sealed tail past
+        // the drain's break (a dependency not here yet, a row of a newer
+        // tenure, an append error) — or the whole tail, when this root may
+        // not end the recall now — may have been answered through the
+        // backup, and the recall that ends the generation drops them on the
+        // delegate rather than replaying them. So the generation stays
+        // `Sealing`: the window's end asks the seal again (the backup is
+        // sealed and answers with its tail) and the drain resumes from the
+        // cursor.
+        if sealed && (!ends_recall || drained_to < tail_end) {
+            self.stats.deleg_seal_waits += 1;
+            tracing::warn!(
+                node = self.me(),
+                gen,
+                backup = from,
+                cursor = drained_to,
+                tail_end,
+                ends_recall,
+                "a sealed delegation's tail is not drained to its end: the generation is not ended yet"
+            );
+            return;
         }
         self.end_generation(now, gen, replica, out);
         if sealed && kind != DelegKind::Designated {

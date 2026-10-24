@@ -37815,6 +37815,73 @@ mod deleg_windows_tests {
         assert!(!Replica::deleg_backup_holds_any(&h.meta, 7));
     }
 
+    /// Plan 43 C2 (D8, the part C2c's drop needs): a sealed tail the root
+    /// cannot drain to its end — a row whose dependencies it does not hold
+    /// yet — does not end the generation: rows past the break may have been
+    /// answered through the backup, and the recall that ends the generation
+    /// drops them on the delegate instead of replaying them. The generation
+    /// stays `Sealing`; the seal is asked again at the window's end, and the
+    /// drain resumes from the cursor.
+    #[test]
+    fn a_sealed_tail_drained_short_does_not_end_the_generation() {
+        let mut h = root_with_delegate_backed_by(4);
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        let seal_req = |out: &[Action]| {
+            sends(out).iter().find_map(|(to, m)| match m {
+                PeerMsg::DelegSeal { req, .. } if *to == 4 => Some(*req),
+                _ => None,
+            })
+        };
+        let first = seal_req(&out).unwrap_or_else(|| panic!("no seal: {out:?}"));
+        let row = |idx: u64, deps: constellation_meta::Position| constellation_meta::DelegateTx {
+            idx,
+            rid: None,
+            records: Vec::new(),
+            deps,
+        };
+        let mut unreachable = constellation_meta::Position::ZERO;
+        unreachable.streams.raise(99, 5);
+        let tail = vec![
+            row(1, constellation_meta::Position::ZERO),
+            row(2, unreachable),
+            row(3, constellation_meta::Position::ZERO),
+        ];
+        h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegSealed {
+                req: first,
+                gen: 7,
+                sealed: true,
+                txs: tail.clone(),
+            },
+        });
+        let g = &h.core.dl.gens[&7];
+        assert!(!g.ended, "ended with the tail drained through 1 of 3");
+        assert_eq!(g.cursor, 1);
+        assert_eq!(g.recall, RecallPhase::Sealing);
+        // The window's end asks again; the dependency arrived meanwhile.
+        h.advance((h.core.cfg.forward_timeout_ms * 2).max(h.core.cfg.backup_takeover_ms) + 10);
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        let again = seal_req(&out).unwrap_or_else(|| panic!("not asked again: {out:?}"));
+        let mut tail = tail;
+        tail[1].deps = constellation_meta::Position::ZERO;
+        h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegSealed {
+                req: again,
+                gen: 7,
+                sealed: true,
+                txs: tail,
+            },
+        });
+        let g = &h.core.dl.gens[&7];
+        assert!(g.ended, "the whole tail drained: the generation ends");
+        assert_eq!(g.cursor, 3);
+    }
+
     /// A generation without a recorded backup keeps the plain reclaim: the
     /// root's cursor covers everything acknowledged through the group.
     #[test]
