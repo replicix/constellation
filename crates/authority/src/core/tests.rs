@@ -15558,6 +15558,59 @@ mod locks {
         })
     }
 
+    /// A root whose gate still has a backup tail to apply (and a mirror to
+    /// install) answers the renewal of a grant it does not know yet
+    /// `NotOwner` naming itself (ask again), and renews one it knows as
+    /// before: a lease whose gate is pending serves renewals, and the
+    /// "ask again" answered for every grant left the lockers of a re-claim
+    /// whose marker S3 cut again with nothing but a lapse.
+    #[test]
+    fn a_pending_mirror_asks_again_only_for_a_grant_it_does_not_know() {
+        let (mut h, ino) = holder_with_file();
+        let out = request(&mut h, 2, 7, ino, X, false);
+        assert!(
+            matches!(
+                lock_replies(&out).as_slice(),
+                [(2, OpId(7), LockOutcome::Granted { .. })]
+            ),
+            "{out:?}"
+        );
+        let id = h
+            .meta
+            .locks()
+            .own_grant(ino, 2, h.clk().wait)
+            .expect("granted")
+            .id;
+        h.core.lease.gate = Some(PendingGate {
+            epoch: 1,
+            takeover: true,
+            marker_shipped: false,
+            drained: false,
+            fast_prev: false,
+            backup_tail_epoch: Some(1),
+            shippable: false,
+        });
+        h.advance(100);
+        let out = renew(&mut h, 2, 40, ino, id);
+        assert!(
+            matches!(
+                renewed(&out, 2).as_deref(),
+                Some([LockRenewResult::Ok { id: g, .. }]) if *g == id
+            ),
+            "a known grant not renewed under the pending gate: {out:?}"
+        );
+        let unknown = GrantId {
+            node: 9,
+            seq: id.seq + 100,
+        };
+        let out = renew(&mut h, 3, 41, ino, unknown);
+        assert_eq!(
+            renewed(&out, 3),
+            Some(vec![LockRenewResult::NotOwner { owner: 1 }]),
+            "{out:?}"
+        );
+    }
+
     /// Lock-fence-token fix round 4 (`git-under-flock-b2b` seed 7: one
     /// renewal blocked the core 12 s on a 7.6 s sync, and another node's
     /// grant lapsed meanwhile): the restart horizon is written off the

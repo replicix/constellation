@@ -3486,18 +3486,6 @@ impl Core {
             Route::Node(n) => return LockRenewResult::NotOwner { owner: n },
             Route::Unknown => return LockRenewResult::NotOwner { owner: 0 },
         };
-        if gen == 0 && self.lock_mirror_pending() {
-            // The predecessor's grants are not in this table yet: a grant
-            // unknown now is not lost. Asked again here (`NotOwner` naming
-            // this node; its own tick waits behind `lock_relearn_floor`).
-            // Answered `Lost`, a locker whose renewal reached the successor
-            // between its claim and its mirror's install was fenced (sim
-            // `locks-failover-stepped`, once a lane renewal's timeout made
-            // the lockers read the lease again at once).
-            return LockRenewResult::NotOwner {
-                owner: self.cfg.node_id,
-            };
-        }
         let ttl = self.lock_ttl_ms().min(cap_ms);
         if ttl <= 0 {
             return LockRenewResult::NotOwner { owner: 0 };
@@ -3579,6 +3567,7 @@ impl Core {
                         mode: a.mode,
                     }
                 }
+                None if gen == 0 && self.lock_mirror_pending() => self.lock_ask_again(),
                 None => {
                     self.stats.lock_late_refused += 1;
                     tracing::info!(
@@ -3646,6 +3635,9 @@ impl Core {
                     mode,
                 };
             }
+        }
+        if gen == 0 && self.lock_mirror_pending() {
+            return self.lock_ask_again();
         }
         // Unknown: a reclaim during a grace period, if nothing conflicts.
         let grace = self.lock_grace_active(now, ino, replica);
@@ -5153,6 +5145,28 @@ impl Core {
             now.honour
         };
         self.lk.ask_again_at.map_or(floor, |at| floor.max(at))
+    }
+
+    /// The answer to a renewal of a grant this root does not know while the
+    /// predecessor's lock table is not in it yet (`lock_mirror_pending`):
+    /// not lost, perhaps only not installed. Asked again here (`NotOwner`
+    /// naming this node: the holder asks again after a retry,
+    /// `ask_again_at`; this node's own tick waits behind
+    /// `lock_relearn_floor`). Answered `Lost`, a locker whose renewal
+    /// reached the successor between its claim and its mirror's install
+    /// was fenced (sim `locks-failover-stepped`, once a lane renewal's
+    /// timeout made the lockers read the lease again at once). Only for an
+    /// unknown grant: a grant this table knows is renewed as before (a
+    /// lease whose gate is pending serves renewals: `on_lock_renew_tick`),
+    /// and a late renewal it can admit is admitted. The gate clears the
+    /// tail in its first step after the marker lands, whether or not a
+    /// mirror came, so this lasts as long as the marker's write (and the
+    /// tail's apply); a holder whose window ends meanwhile lapses and asks
+    /// late, as from an owner that does not answer, until its park's bound.
+    fn lock_ask_again(&self) -> LockRenewResult {
+        LockRenewResult::NotOwner {
+            owner: self.cfg.node_id,
+        }
     }
 
     /// A successor that backed its predecessor installs the predecessor's
