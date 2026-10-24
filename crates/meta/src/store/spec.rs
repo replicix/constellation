@@ -120,8 +120,9 @@ use crate::session::{JournalPos, Position, Streams};
 use crate::store::local::{self, LogPrefixView, RowClass};
 use crate::store::{
     adjust_usage_tx, counter_add_tx, counter_get, counter_set_tx, kv_get_tx, kv_set_tx, misc, ns,
-    Meta, UsageTracker, KV_APPLIED_SEQ, KV_LOCAL_SPEC_COUNT, KV_NEXT_SPEC_SEQ, KV_NODE_PREFIX,
-    KV_PENDING_REPLAY_COUNT, KV_SPEC_FLOOR, KV_SPEC_LIVE_COUNT, KV_UNCAPTURED_TX_COUNT,
+    Meta, UsageTracker, KV_APPLIED_SEQ, KV_DELEG_SPEC_COUNT, KV_LOCAL_SPEC_COUNT, KV_NEXT_SPEC_SEQ,
+    KV_NODE_PREFIX, KV_PENDING_REPLAY_COUNT, KV_SPEC_FLOOR, KV_SPEC_LIVE_COUNT,
+    KV_UNCAPTURED_TX_COUNT,
 };
 use constellation_mtree::keys;
 use constellation_mtree::record::{InodeRecord, Payload};
@@ -1319,6 +1320,9 @@ fn strand_local_tx(
         KV_UNCAPTURED_TX_COUNT
     };
     counter_add_tx(tx, &meta.local, count, -1)?;
+    if row.gen != 0 && row.spec_seq.is_some() {
+        counter_add_tx(tx, &meta.local, KV_DELEG_SPEC_COUNT, -1)?;
+    }
     // The rid's `completed` row goes with the transaction — unless the
     // log carries the rid's outcome already (a row applied from a
     // segment records position 0; a journaled one its journal seq): a
@@ -1866,6 +1870,15 @@ fn redo_row_tx(
     row.usage = row_staged.raw_delta();
     staged.adjust(row.usage.0, row.usage.1);
     row.before = capture.into_before();
+    // A delegation origin's row may touch more than before (its captured
+    // inodes are this redo's): what it touches joins `DelegRows`.
+    if let Some(LiveEntry::Local { gen, .. }) = live.get(&seq) {
+        if *gen != 0 {
+            let mut touched = TouchSet::from_records(records.iter());
+            captured_files(&row, &mut touched);
+            note_deleg_touches(meta, *gen, &touched);
+        }
+    }
     if !renumber {
         put_row(tx, &meta.spec, seq, &row)?;
         return Ok(());
@@ -1928,6 +1941,7 @@ fn row_is_ordered(row: &SpecRow) -> bool {
 /// ([`captured_files`]).
 fn row_touches(r: &impl Readable, meta: &Meta, row: &SpecRow) -> Result<TouchSet, MetaError> {
     let mut set = if let SpecKind::Local { first, .. } = &row.kind {
+        meta.note_local_rows_read(1);
         let Some(head) = local::get_journal_tx_head(r, meta, *first)? else {
             return Ok(TouchSet::default());
         };
@@ -1964,6 +1978,191 @@ fn captured_files(row: &SpecRow, set: &mut TouchSet) {
             set.inos.insert(ino);
         }
     }
+}
+
+/// What the outstanding journal transactions of a delegation origin
+/// (`gen` != 0: a delegate's own stream rows, a root's appended ones) may
+/// touch: the union of their [`row_touches`] and the generations they
+/// belong to. A tailed segment that touches none of it commutes with all
+/// of them and need not read one (xcheckfs two-node runs: a delegate
+/// holding 142,000 unappended rows read every one of them for every
+/// segment it tailed, 0.5 to 0.65 s a segment, and fell tens of thousands
+/// of segments behind the log, so its rows retired ever later and the
+/// next segment cost more).
+///
+/// A superset, never a subset. Every transaction journaled with an
+/// origin is noted (its generation at once, its first journal seq for
+/// later), and what the noted ones touch joins the union at the next use,
+/// read from the committed store *and* from the using transaction's view;
+/// a redo adds what it touches (its captured inodes are the redo's). The
+/// summary is built on first use the same way, from both views (a
+/// transaction that strands rows and then fails must not leave them out),
+/// and rebuilt once it has grown by more than twice what it held then.
+/// Nothing is taken out as rows retire: a stale key costs a needless
+/// scan, never a missed overlap. Noting runs inside the journaling
+/// transaction, using inside the segment's: both under the store's
+/// writer lock, so a note's transaction has ended (committed or not) by
+/// the time a use reads it.
+#[derive(Default)]
+pub struct DelegRows {
+    built: Option<DelegSummary>,
+}
+
+#[derive(Default)]
+struct DelegSummary {
+    gens: HashSet<u64>,
+    touch: TouchSet,
+    /// First journal seqs of transactions noted and not read yet.
+    pending: Vec<u64>,
+    added: usize,
+    rebuild_after: usize,
+}
+
+/// The fewest additions after which a built [`DelegRows`] is rebuilt.
+const DELEG_ROWS_REBUILD_MIN: usize = 4096;
+/// The most noted transactions a built [`DelegRows`] keeps unread.
+const DELEG_ROWS_PENDING_MAX: usize = 1 << 20;
+
+impl DelegSummary {
+    fn add(&mut self, touched: &TouchSet) {
+        self.touch.dentries.extend(touched.dentries.iter().cloned());
+        self.touch.inos.extend(touched.inos.iter().copied());
+        self.touch.shared.extend(touched.shared.iter().copied());
+        self.added += 1;
+    }
+
+    /// What the captured transaction at journal seq `first` touches, as
+    /// `r` holds it (nothing: not there, or not captured).
+    fn add_first(&mut self, r: &impl Readable, meta: &Meta, first: u64) -> Result<(), MetaError> {
+        let Some(head) = local::get_journal_tx_head(r, meta, first)? else {
+            return Ok(());
+        };
+        self.gens.insert(head.gen);
+        let Some(spec_seq) = head.spec_seq else {
+            return Ok(());
+        };
+        if let Some(v) = r.get(&meta.spec, seq_key(spec_seq))? {
+            let touched = row_touches(r, meta, &postcard::from_bytes::<SpecRow>(&v)?)?;
+            self.add(&touched);
+        }
+        Ok(())
+    }
+
+    /// Every outstanding transaction of an origin `r` holds. Returns how
+    /// many captured ones it read.
+    fn add_all(&mut self, r: &impl Readable, meta: &Meta) -> Result<usize, MetaError> {
+        let mut rows = 0;
+        if counter_get(r, &meta.local, KV_LOCAL_SPEC_COUNT)? == 0
+            && counter_get(r, &meta.local, KV_UNCAPTURED_TX_COUNT)? == 0
+        {
+            return Ok(rows);
+        }
+        for (_, head) in local::read_journal_tx_heads(r, meta)? {
+            if head.gen == 0 {
+                continue;
+            }
+            self.gens.insert(head.gen);
+            let Some(spec_seq) = head.spec_seq else {
+                continue;
+            };
+            if let Some(v) = r.get(&meta.spec, seq_key(spec_seq))? {
+                let touched = row_touches(r, meta, &postcard::from_bytes::<SpecRow>(&v)?)?;
+                self.add(&touched);
+                rows += 1;
+            }
+        }
+        Ok(rows)
+    }
+}
+
+/// [`DelegRows`], built (or rebuilt), and with every noted transaction
+/// read, as described there.
+fn deleg_rows_ready<'a>(
+    tx: &SingleWriterWriteTx,
+    meta: &Meta,
+    rows: &'a mut DelegRows,
+) -> Result<&'a mut DelegSummary, MetaError> {
+    let stale = rows
+        .built
+        .as_ref()
+        .is_none_or(|s| s.added > s.rebuild_after);
+    if stale {
+        let mut summary = DelegSummary::default();
+        let committed = summary.add_all(&meta.db.read_tx(), meta)?;
+        let own = summary.add_all(tx, meta)?;
+        summary.added = 0;
+        summary.rebuild_after = DELEG_ROWS_REBUILD_MIN.max(2 * committed.max(own));
+        rows.built = Some(summary);
+    }
+    let summary = rows.built.as_mut().expect("built");
+    if !summary.pending.is_empty() {
+        let pending = std::mem::take(&mut summary.pending);
+        let snapshot = meta.db.read_tx();
+        for first in pending {
+            summary.add_first(tx, meta, first)?;
+            summary.add_first(&snapshot, meta, first)?;
+        }
+    }
+    Ok(summary)
+}
+
+/// A journal transaction of delegation origin `gen` was journaled at
+/// journal seq `first` (in the calling transaction): noted in
+/// [`DelegRows`] (nothing to do while the summary is not built).
+pub(crate) fn note_deleg_tx(meta: &Meta, first: u64, gen: u64) {
+    let mut rows = meta.deleg_rows.lock().unwrap();
+    if let Some(summary) = rows.built.as_mut() {
+        summary.gens.insert(gen);
+        summary.pending.push(first);
+        // Nothing has tailed a segment for a long while: built afresh
+        // at the next use instead.
+        if summary.pending.len() > DELEG_ROWS_PENDING_MAX {
+            rows.built = None;
+        }
+    }
+}
+
+/// A redo of a row of delegation origin `gen`: what it touches now joins
+/// [`DelegRows`].
+fn note_deleg_touches(meta: &Meta, gen: u64, touched: &TouchSet) {
+    if let Some(summary) = meta.deleg_rows.lock().unwrap().built.as_mut() {
+        summary.gens.insert(gen);
+        summary.add(touched);
+    }
+}
+
+/// Whether a journal transaction of a delegation origin may touch what
+/// `touch` names (`false`: none does).
+fn deleg_rows_may_overlap(
+    tx: &SingleWriterWriteTx,
+    meta: &Meta,
+    touch: &TouchSet,
+) -> Result<bool, MetaError> {
+    let mut rows = meta.deleg_rows.lock().unwrap();
+    let union = &deleg_rows_ready(tx, meta, &mut rows)?.touch;
+    // `union.overlaps(touch)`, looked up from the segment's (small) side.
+    Ok(touch.dentries.iter().any(|d| union.dentries.contains(d))
+        || touch
+            .inos
+            .iter()
+            .any(|i| union.inos.contains(i) || union.shared.contains(i))
+        || touch.shared.iter().any(|i| union.inos.contains(i)))
+}
+
+/// The origins in `origins` whose generation may have a transaction in
+/// this journal (the others have none).
+pub(crate) fn deleg_origins_held(
+    tx: &SingleWriterWriteTx,
+    meta: &Meta,
+    origins: &[(u64, u64)],
+) -> Result<HashSet<(u64, u64)>, MetaError> {
+    let mut rows = meta.deleg_rows.lock().unwrap();
+    let summary = deleg_rows_ready(tx, meta, &mut rows)?;
+    Ok(origins
+        .iter()
+        .filter(|(gen, _)| *gen != 0 && summary.gens.contains(gen))
+        .copied()
+        .collect())
 }
 
 /// [`TouchSet::from_records`] of records arriving from the log, plus the
@@ -2728,6 +2927,13 @@ pub(crate) fn retire_local_tx(
         tx.remove(&meta.journal_tx, local::tx_key(*first));
     }
     counter_add_tx(tx, &meta.local, KV_LOCAL_SPEC_COUNT, -(captured as i64))?;
+    let deleg = shipped
+        .iter()
+        .filter(|(_, row)| row.gen != 0 && row.spec_seq.is_some())
+        .count();
+    if deleg > 0 {
+        counter_add_tx(tx, &meta.local, KV_DELEG_SPEC_COUNT, -(deleg as i64))?;
+    }
     counter_add_tx(
         tx,
         &meta.local,
@@ -3768,12 +3974,8 @@ impl Meta {
         let first_of_epoch = prev_applied.is_none_or(|pos| pos.epoch < epoch);
         let mut tx = self.db.write_tx();
         let staged = UsageTracker::staging();
-        let stranded = strand_tx(
-            &mut tx,
-            self,
-            &staged,
-            |entry| {
-                (entry.stranded_by(epoch)
+        let strands = |entry: &LiveEntry| {
+            (entry.stranded_by(epoch)
                 && !matches!(entry, LiveEntry::Shadow { rid, .. } if completes.contains(rid)))
                 || abandoned.iter().any(|a| entry.stranded_by_abandon(*a))
                 || matches!(entry, LiveEntry::Shadow { rid, .. } if refused.contains(rid))
@@ -3798,11 +4000,23 @@ impl Meta {
                 // naming them, and they are in its re-ship.)
                 || matches!(entry, LiveEntry::Streamed { epoch: e, last, gated: false, .. }
                     if *e == epoch && through >= *last && !rows.contains(last))
-            },
-            true,
-            false,
-            |_| false,
-        )?;
+        };
+        // Only a holder's own captured transactions (`gen` 0) among the
+        // `Local` rows can strand here (`LiveEntry::stranded_by`); with
+        // none of them outstanding, the other entries decide, and a
+        // delegate's own stream rows are read only if the segment needs
+        // them (`DelegRows`, below).
+        let holder_locals = counter_get(&tx, &self.local, KV_LOCAL_SPEC_COUNT)?
+            > counter_get(&tx, &self.local, KV_DELEG_SPEC_COUNT)?;
+        let stranded = if holder_locals
+            || live_non_local(&tx, self)?
+                .iter()
+                .any(|(_, entry)| strands(entry))
+        {
+            strand_tx(&mut tx, self, &staged, strands, true, false, |_| false)?
+        } else {
+            Stranded::default()
+        };
         if !refused.is_empty() && stranded.shadows > 0 {
             drop_queued_of_rids_tx(&mut tx, self, &refused)?;
         }
@@ -3843,7 +4057,17 @@ impl Meta {
                 })
                 .collect()
         };
-        let live: HashMap<u64, LiveEntry> = read_live(&tx, self)?.into_iter().collect();
+        // Every outstanding entry — or, with no holder's own captured
+        // transaction outstanding, every one but the delegation origins'
+        // `Local` rows, read below only where the segment needs them
+        // (`live_full`). Nothing else here looks at a `Local` entry.
+        let mut live_full = holder_locals;
+        let mut live: HashMap<u64, LiveEntry> = if live_full {
+            read_live(&tx, self)?.into_iter().collect()
+        } else {
+            live_non_local(&tx, self)?.into_iter().collect()
+        };
+        let any_local = counter_get(&tx, &self.local, KV_LOCAL_SPEC_COUNT)? > 0;
         // The hints this segment ends: the log now holds everything their
         // refusal was read at, or it changes their entry after that (the
         // later change ships only with or after the entry's own row: a
@@ -3941,6 +4165,13 @@ impl Meta {
                 let jseq = jseqs.next().copied();
                 !jseq.is_some_and(|j| skipped.contains(&j))
             }));
+            // Without a holder's own row, the delegation origins' rows are
+            // all there is to look at: read only if one may touch the
+            // segment's keys.
+            if !live_full && any_local && deleg_rows_may_overlap(&tx, self, &touch)? {
+                live.extend(read_live(&tx, self)?);
+                live_full = true;
+            }
             let holder_first = live
                 .iter()
                 .filter(|(_, entry)| matches!(entry, LiveEntry::Local { gen: 0, .. }))
@@ -4064,6 +4295,9 @@ impl Meta {
             // redone after it, a hint would resurrect the entry the
             // segment's later records moved (epoch seed 64010).
             let own_spec: HashSet<u64> = own_txs.iter().filter_map(|(_, _, s)| *s).collect();
+            if !live_full {
+                live.extend(read_live(&tx, self)?);
+            }
             let live_after: HashMap<u64, LiveEntry> = live
                 .iter()
                 .filter(|(spec_seq, entry)| match entry {
@@ -4095,7 +4329,7 @@ impl Meta {
                 }),
             )?
             .1
-        } else if !live.is_empty() {
+        } else if !live.is_empty() || any_local {
             let capture = Capture::new();
             let row_staged = UsageTracker::staging();
             let (skipped, applied) = {

@@ -95,8 +95,8 @@ use crate::replay::{apply_batch_tx, ApplyCx, TouchSet};
 use crate::rid::Rid;
 use crate::store::{
     adjust_usage_tx, counter_add_tx, counter_get, journal, kv_get_tx, kv_set_tx, ns, spec,
-    usage_note_begin, usage_note_take, Meta, UsageTracker, KV_LOCAL_SPEC_COUNT, KV_SPEC_LIVE_COUNT,
-    KV_UNCAPTURED_TX_COUNT,
+    usage_note_begin, usage_note_take, Meta, UsageTracker, KV_DELEG_SPEC_COUNT,
+    KV_LOCAL_SPEC_COUNT, KV_SPEC_LIVE_COUNT, KV_UNCAPTURED_TX_COUNT,
 };
 use crate::TreeInode;
 use constellation_fs_core::Ino;
@@ -296,6 +296,7 @@ pub(crate) fn read_journal_tx_heads(
         let (k, v) = guard.into_inner()?;
         out.push((decode_tx_key(&k)?, postcard::from_bytes(&v)?));
     }
+    meta.note_local_rows_read(out.len());
     Ok(out)
 }
 
@@ -310,6 +311,7 @@ pub(crate) fn read_journal_txs(
         let (k, v) = guard.into_inner()?;
         out.push((decode_tx_key(&k)?, postcard::from_bytes(&v)?));
     }
+    meta.note_local_rows_read(out.len());
     Ok(out)
 }
 
@@ -484,6 +486,9 @@ impl Meta {
             }
             None => (0, 0, crate::session::Position::ZERO),
         };
+        if gen != 0 && spec_seq.is_some() {
+            counter_add_tx(tx, &self.local, KV_DELEG_SPEC_COUNT, 1)?;
+        }
         // Plan 43 C1-2: the row's class, decided at the journaling. The
         // core says it (`journal::PendingClass`) around every call of its
         // own; a transaction under a delegation origin is `Lone` at C1 (C2
@@ -521,7 +526,11 @@ impl Meta {
                 observed: journal::PendingObserved::take().unwrap_or_default(),
                 lock_tag: journal::PendingLockTag::current().unwrap_or_default(),
             },
-        )
+        )?;
+        if gen != 0 {
+            spec::note_deleg_tx(self, local.start, gen);
+        }
+        Ok(())
     }
 
     /// Plan 30 §M11: execute `op` here as the delegate of generation
@@ -894,18 +903,36 @@ impl Meta {
 
     /// Plan 30 §M11: the journal seqs of this node's transactions whose
     /// origins are in `origins` (a segment carried them: they retire).
+    ///
+    /// An origin names one transaction: a delegate numbers its stream
+    /// from a persisted counter, and a root appends index `cursor + 1`
+    /// only. The scan ends once every origin this journal may hold
+    /// ([`spec::deleg_origins_held`]) is found: a segment brings a
+    /// delegate's rows back oldest first, so they are at the head of its
+    /// journal, and the cost is theirs, not the whole stream's.
     pub(crate) fn journal_seqs_of_origins(
         &self,
-        r: &impl Readable,
+        tx: &SingleWriterWriteTx,
         origins: &[(u64, u64)],
     ) -> Result<Vec<(u64, u64, Option<u64>)>, MetaError> {
         if origins.iter().all(|(g, _)| *g == 0) {
             return Ok(Vec::new());
         }
+        let mut wanted = spec::deleg_origins_held(tx, self, origins)?;
         let mut out = Vec::new();
-        for (first, h) in read_journal_tx_heads(r, self)? {
-            if h.gen != 0 && origins.contains(&(h.gen, h.idx)) {
-                out.push((first, h.last, h.spec_seq));
+        if wanted.is_empty() {
+            return Ok(out);
+        }
+        let from = journal::acked_watermark(tx, &self.local)?.saturating_add(1);
+        for guard in tx.range(&self.journal_tx, tx_key(from)..) {
+            let (k, v) = guard.into_inner()?;
+            let h: JournalTxHead = postcard::from_bytes(&v)?;
+            self.note_local_rows_read(1);
+            if h.gen != 0 && wanted.remove(&(h.gen, h.idx)) {
+                out.push((decode_tx_key(&k)?, h.last, h.spec_seq));
+                if wanted.is_empty() {
+                    break;
+                }
             }
         }
         Ok(out)

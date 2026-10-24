@@ -646,6 +646,206 @@ fn a_segment_goes_under_a_delegates_stream_only_where_it_conflicts() {
     assert!(meta.lookup(d, "a").unwrap().is_none());
 }
 
+fn mkdirs(names: &[(&str, u64)]) -> Vec<LogRecord> {
+    names
+        .iter()
+        .map(|(name, ino)| LogRecord::Mkdir {
+            parent: ROOT_INO,
+            name: (*name).into(),
+            ino: *ino,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            time_ns: 1,
+        })
+        .collect()
+}
+
+fn create_in(parent: u64, name: &str, ino: u64) -> LogRecord {
+    LogRecord::Create {
+        parent,
+        name: name.into(),
+        ino,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        time_ns: 5,
+    }
+}
+
+/// The delegate of `d` (generation `gen`) executes a create of `name`.
+fn delegate_create(
+    meta: &Meta,
+    gen: u64,
+    seq: u64,
+    d: u64,
+    name: &str,
+    ino: u64,
+) -> (Vec<LogRecord>, u64) {
+    let op = MutateOp::Create {
+        parent: d,
+        name: name.into(),
+        ino,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    meta.delegate_execute(
+        &op,
+        Some(rid(seq)),
+        gen,
+        Default::default(),
+        &Default::default(),
+        Now::same(0),
+    )
+    .unwrap()
+}
+
+/// xcheckfs two-node runs: a delegate with 142,000 stream rows not yet
+/// back through the log spent 0.5 to 0.65 s on every segment it tailed —
+/// it read every one of its rows (their heads twice, their touched keys
+/// once) for each — and fell tens of thousands of segments behind. A
+/// segment elsewhere in the tree reads none of them (once, the summary of
+/// what they touch is built), and one that brings some of them back reads
+/// those, not the rest. Fails on the parent: 3 reads per row and segment.
+#[test]
+fn a_tailed_segment_reads_none_of_a_delegates_rows_it_does_not_touch() {
+    let meta = Meta::open_in_memory().unwrap();
+    let (d, e) = ((2 << 40) | 1, (4 << 40) | 1);
+    meta.apply_segment(1, 1, &mkdirs(&[("d", d), ("e", e)]), &TouchSet::default())
+        .unwrap();
+    let gen = 7;
+    let n = 2000u64;
+    let own: Vec<(Vec<LogRecord>, u64)> = (1..=n)
+        .map(|i| delegate_create(&meta, gen, i, d, &format!("f{i}"), (2 << 40) | (10 + i)))
+        .collect();
+    assert_eq!(meta.speculation_counts().unwrap().local, n);
+    let segments = 20u64;
+    let before = meta.local_rows_read();
+    for s in 0..segments {
+        let records: Vec<LogRecord> = (0..10)
+            .map(|i| {
+                let ino = (4 << 40) | (100 + s * 10 + i);
+                create_in(e, &format!("x{ino}"), ino)
+            })
+            .collect();
+        let applied = meta
+            .apply_segment(2 + s, 1, &records, &TouchSet::default())
+            .unwrap();
+        assert!(!applied.inserted_before_local);
+    }
+    let elsewhere = meta.local_rows_read() - before;
+    assert!(
+        elsewhere <= 4 * n,
+        "{segments} segments elsewhere read {elsewhere} rows of a {n}-row stream"
+    );
+    // Segments that bring the oldest rows back, five a segment.
+    let before = meta.local_rows_read();
+    let mut jseq = 0;
+    let mut own = own.into_iter();
+    for seq in 2 + segments..2 + 2 * segments {
+        let (mut records, mut rows, mut origins) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..5 {
+            let (recs, idx) = own.next().unwrap();
+            for r in recs {
+                if !matches!(r, LogRecord::Atime { .. }) {
+                    jseq += 1;
+                    rows.push(jseq);
+                    origins.push((gen, idx));
+                }
+                records.push(r);
+            }
+        }
+        meta.apply_segment_rows(
+            seq,
+            1,
+            jseq,
+            &rows,
+            &origins,
+            &records,
+            &TouchSet::default(),
+        )
+        .unwrap();
+    }
+    let returning = meta.local_rows_read() - before;
+    assert_eq!(meta.speculation_counts().unwrap().local, n - 5 * segments);
+    assert!(
+        returning <= 50 * segments,
+        "{segments} segments of 5 returning rows read {returning} rows of a {n}-row stream"
+    );
+}
+
+/// The summary [`a_tailed_segment_reads_none_of_a_delegates_rows_it_does_not_touch`]
+/// relies on is a superset of what the rows touch, rows journaled after
+/// it was built included: a segment on such a row's keys still goes under
+/// the delegate's rows, and the replica is the log order.
+#[test]
+fn a_delegates_row_journaled_after_the_summary_is_still_seen() {
+    let meta = Meta::open_in_memory().unwrap();
+    let log_order = Meta::open_in_memory().unwrap();
+    let (d, e, g) = ((2 << 40) | 1, (4 << 40) | 1, (2 << 40) | 9);
+    let mut first = mkdirs(&[("d", d), ("e", e)]);
+    first.push(create_in(d, "g", g));
+    meta.apply_segment(1, 1, &first, &TouchSet::default())
+        .unwrap();
+    log_order.apply_records(&first).unwrap();
+    let gen = 7;
+    let (mut delegate_records, _) = delegate_create(&meta, gen, 1, d, "a", (2 << 40) | 2);
+    // Elsewhere: on top, and the summary is built.
+    let elsewhere = vec![create_in(e, "x", (4 << 40) | 2)];
+    let applied = meta
+        .apply_segment(2, 1, &elsewhere, &TouchSet::default())
+        .unwrap();
+    assert!(!applied.inserted_before_local);
+    log_order.apply_records(&elsewhere).unwrap();
+    // A row journaled now, on `g`, and a segment on `g` alone.
+    let chmod = |mode| MutateOp::Setattr {
+        ino: g,
+        mode: Some(mode),
+        uid: None,
+        gid: None,
+        size: None,
+        atime_ns: None,
+        mtime_ns: None,
+    };
+    let (records, _) = meta
+        .delegate_execute(
+            &chmod(0o600),
+            Some(rid(2)),
+            gen,
+            Default::default(),
+            &Default::default(),
+            Now::same(0),
+        )
+        .unwrap();
+    delegate_records.extend(records);
+    let on_g = vec![LogRecord::Setattr {
+        ino: g,
+        mode: Some(0o640),
+        uid: None,
+        gid: None,
+        size: None,
+        atime_ns: None,
+        mtime_ns: None,
+        time_ns: 6,
+    }];
+    let applied = meta
+        .apply_segment(3, 1, &on_g, &TouchSet::default())
+        .unwrap();
+    assert!(
+        applied.inserted_before_local,
+        "a conflict with the new row rewinds"
+    );
+    log_order.apply_records(&on_g).unwrap();
+    log_order.apply_records(&delegate_records).unwrap();
+    assert_eq!(
+        meta.dump_replicated().unwrap(),
+        log_order.dump_replicated().unwrap(),
+        "the delegate's rows after the segments, as the log will have them"
+    );
+    assert_eq!(meta.getattr(g).unwrap().unwrap().mode & 0o7777, 0o600);
+}
+
 /// A delegate that executed three rows of generation 7 (the core notes
 /// each in the session, as `Replica::note_stream`): the setup of the two tests of the recall's cut below.
 fn delegate_of_three_rows() -> (Meta, u64) {

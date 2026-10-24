@@ -204,6 +204,9 @@ pub(crate) const KV_USAGE_FILES: &str = "usage_files";
 /// - `local_spec_count`: `journal_tx` rows with a `spec_seq` (outstanding
 ///   captured `Local` transactions);
 /// - `uncaptured_tx_count`: `journal_tx` rows without one;
+/// - `deleg_spec_count`: the `local_spec_count` rows journaled under a
+///   delegation origin (`gen` != 0), so a tailed segment knows without a
+///   scan whether a holder's own captured row (`gen` 0) is outstanding;
 /// - `spec_floor`: every `spec` row below it is deleted, so compaction
 ///   ranges from here instead of from the (tombstone-laden) start;
 /// - `journal_acked`: every `journal` and `journal_tx` row at or below it
@@ -213,6 +216,7 @@ pub(crate) const KV_SPEC_LIVE_COUNT: &str = "spec_live_count";
 pub(crate) const KV_PENDING_REPLAY_COUNT: &str = "pending_replay_count";
 pub(crate) const KV_LOCAL_SPEC_COUNT: &str = "local_spec_count";
 pub(crate) const KV_UNCAPTURED_TX_COUNT: &str = "uncaptured_tx_count";
+pub(crate) const KV_DELEG_SPEC_COUNT: &str = "deleg_spec_count";
 pub(crate) const KV_SPEC_FLOOR: &str = "spec_floor";
 pub(crate) const KV_JOURNAL_ACKED: &str = "journal_acked";
 /// Plan 30 §M4: how many unrecoverable-chunk marks (`poisoned/` keys in
@@ -629,6 +633,12 @@ pub struct Meta {
     /// [`UnshippedSeqs`]), so a gated holder's read waits for the rows it
     /// would observe, not for every row. Cleared with `unshipped`.
     pub(crate) unshipped_seqs: std::sync::Mutex<UnshippedSeqs>,
+    /// What the outstanding journal transactions of a delegation origin
+    /// (`gen` != 0: a delegate's own stream rows, a root's appended ones)
+    /// may touch, kept in memory so a tailed segment that touches none of
+    /// them does not read every one ([`spec::DelegRows`]). Conservative
+    /// when stale, never permissive.
+    pub(crate) deleg_rows: std::sync::Mutex<spec::DelegRows>,
     /// Plan 30 §M9 round 2: a lower bound on every live `backup_tail`
     /// key, `(epoch, first)`, so a trim scans the live tail and not the
     /// tombstones of everything trimmed before it (`Meta::backup_trim`).
@@ -687,6 +697,10 @@ pub struct Meta {
     /// hard-linked name's `Remote` entry costs, where a single-name entry
     /// answers from its copy ([`Meta::inode_reads`]).
     inode_reads: AtomicU64,
+    /// Journal transaction heads decoded, and `Local` rows' touched keys
+    /// read, on behalf of this node's outstanding journal
+    /// ([`Meta::local_rows_read`]).
+    local_rows_read: AtomicU64,
     /// Plan 40: dentries decoded by the directory reads (`readdir`,
     /// `readdir_after` and their scratch twins) — what a page costs
     /// ([`Meta::dentries_read`]).
@@ -908,6 +922,18 @@ impl Meta {
         self.dentries_read.load(Ordering::Relaxed)
     }
 
+    /// How many journal transaction heads were decoded, and how many
+    /// `Local` rows' touched keys read, in all: what looking at this
+    /// node's outstanding journal costs. A tailed segment that touches
+    /// none of a delegate's outstanding stream rows reads none of them.
+    pub fn local_rows_read(&self) -> u64 {
+        self.local_rows_read.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn note_local_rows_read(&self, n: usize) {
+        self.local_rows_read.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
     pub(crate) fn note_inode_read(&self) {
         self.inode_reads.fetch_add(1, Ordering::Relaxed);
     }
@@ -1110,6 +1136,7 @@ impl Meta {
             unshipped: std::sync::Mutex::new(crate::replay::TouchSet::default()),
             unshipped_gen: AtomicU64::new(0),
             unshipped_seqs: std::sync::Mutex::new(UnshippedSeqs::default()),
+            deleg_rows: std::sync::Mutex::new(spec::DelegRows::default()),
             backup_tail_floor: std::sync::Mutex::new(None),
             any_member_copy: std::sync::atomic::AtomicBool::new(false),
             held_work: AtomicU64::new(0),
@@ -1123,6 +1150,7 @@ impl Meta {
             rollback_hook: std::sync::OnceLock::new(),
             rolled_back: std::sync::Mutex::new(Vec::new()),
             inode_reads: AtomicU64::new(0),
+            local_rows_read: AtomicU64::new(0),
             dentries_read: AtomicU64::new(0),
             snapshot_gen: AtomicU64::new(0),
             snapshot_hook: std::sync::RwLock::new(None),
