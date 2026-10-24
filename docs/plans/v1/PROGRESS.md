@@ -57183,6 +57183,25 @@ control and cli, the model crate (`--release`, `--test-threads=2`, all green).
   assertion.
 - The model does not express an abandon, and the contiguity of `through`.
 
+### Review fixes (three commits after this one)
+
+- A namespace rebuild retired a kept committed streamed entry only by its rid's completion: one that completes
+  no rid was redone over the rebuilt namespace that held it already. It now also retires by the rebuilt log's
+  position and tail facts (`member::log_carries_tx`); `a_rebuild_retires_a_committed_streamed_entry_the_log_carries`.
+- At `GroupAbandoned` every member queued a rid-less row (a manifest commit, a snapshot row) under a rid of its own
+  node, so the holder ran it once per member that came back; it is queued under its identity now
+  (`ABANDON_REPLAY_INCARNATION`); `an_abandoned_rid_less_row_is_queued_under_one_rid_on_every_member`.
+- A backup that kept its tail as a member copy kept the delegates' rows the root had appended too; no re-ship names
+  them, and `delegated-holder-cut` seed 170 (the C7b clock mix) ended with six of them on node 2 (not a strict
+  configuration, so it passed). Only the root's own rows are kept; `c1_a_backups_member_copy_holds_no_delegate_rows`.
+
+Open after the review (not changed): `TailFollowsThrough { through: 0 }` is written for every takeover without a
+tail, wider than its comment (a lease that listed no backup and named no tail): in the `ttl_claims_without_tail`
+case (0 in every sweep) it would drop committed rows of the old group's members; the rebuild-stub control's
+program-order failure (`long-delegated-late-answers+rebuild-stub+unclocked` seed 2945 with the check on) is a
+delegation acknowledgement overtaken at a root change, C2's; I2 (b) judges by the queued entry's class only, not
+also a gated answer of the rid (§6.6); the harness scenarios asserting `stranded_replayed >= 1` are unrun.
+
 ## Plan 45 — Hard links: dentry attribute copies only for single-name inodes
 
 Plan 45 (`docs/plans/v1/wip/45-hard-links.md`) removes the O(n) cost of an
