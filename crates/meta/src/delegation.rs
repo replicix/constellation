@@ -35,6 +35,7 @@ use constellation_fs_core::types::ROOT_INO;
 use constellation_fs_core::Ino;
 use constellation_mtree::keys;
 use fjall::{Readable, SingleWriterWriteTx};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub type NodeId = u64;
@@ -447,6 +448,83 @@ pub(crate) fn write_table_tx(
     }
 }
 
+/// Plan 43 C2: the configuration of one delegation generation as this
+/// replica's table records it: the latest [`LogRecord::DelegGroup`] applied
+/// (`version` 0: none, the group is the delegate and the root), and every
+/// backup any record of the generation ever named (`named`, sorted: the
+/// seal's best-effort set at the generation's end, C2e). A separate key per
+/// generation beside the table's row, so the table's persisted form does
+/// not change; written in the same funnel (dirty-tracked, captured, rolled
+/// back with the table) and deleted with the generation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegGroupRow {
+    pub version: u64,
+    pub backups: Vec<NodeId>,
+    pub named: Vec<NodeId>,
+}
+
+/// `0x30 | Delegation | "group/" | gen` (big endian).
+pub fn group_key(gen: Gen) -> Vec<u8> {
+    let mut id = b"group/".to_vec();
+    id.extend_from_slice(&gen.to_be_bytes());
+    keys::subsystem(keys::Subsystem::Delegation, &id)
+}
+
+pub(crate) fn read_group_tx(
+    r: &impl Readable,
+    meta: &Meta,
+    gen: Gen,
+) -> Result<Option<DelegGroupRow>, MetaError> {
+    match r.get(&meta.ns, group_key(gen))? {
+        Some(v) => Ok(Some(postcard::from_bytes(&v).map_err(|e| {
+            MetaError::Invalid(format!("delegation group row: {e}"))
+        })?)),
+        None => Ok(None),
+    }
+}
+
+/// Apply a `DelegGroup` record: a version above the row's replaces it; a
+/// replayed or stale one is ignored. `true`: the row changed.
+pub(crate) fn apply_group_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    dirty: ns::Dirty<'_>,
+    gen: Gen,
+    version: u64,
+    backups: &[NodeId],
+) -> Result<bool, MetaError> {
+    let old = read_group_tx(&*tx, meta, gen)?.unwrap_or_default();
+    if version <= old.version {
+        return Ok(false);
+    }
+    let mut named = old.named;
+    named.extend_from_slice(backups);
+    named.sort_unstable();
+    named.dedup();
+    let row = DelegGroupRow {
+        version,
+        backups: backups.to_vec(),
+        named,
+    };
+    let bytes = postcard::to_allocvec(&row)
+        .map_err(|e| MetaError::Invalid(format!("delegation group row: {e}")))?;
+    ns::ns_insert(tx, &meta.ns, dirty, group_key(gen), bytes)?;
+    Ok(true)
+}
+
+/// The generation ended: its group row goes with its table row.
+pub(crate) fn remove_group_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    dirty: ns::Dirty<'_>,
+    gen: Gen,
+) -> Result<(), MetaError> {
+    if tx.get(&meta.ns, group_key(gen))?.is_some() {
+        ns::ns_remove(tx, &meta.ns, dirty, group_key(gen))?;
+    }
+    Ok(())
+}
+
 impl Meta {
     /// The live delegation table as this replica knows it: the fold of
     /// every `Delegate`/`Recall` record it applied (its journal
@@ -454,6 +532,13 @@ impl Meta {
     pub fn delegation_table(&self) -> DelegationTable {
         let r = self.db.read_tx();
         read_table_tx(&r, self).unwrap_or_default()
+    }
+
+    /// Plan 43 C2: generation `gen`'s configuration as this replica's table
+    /// records it (`None`: no `DelegGroup` record applied, version 0).
+    pub fn deleg_group(&self, gen: Gen) -> Result<Option<DelegGroupRow>, MetaError> {
+        let r = self.db.read_tx();
+        read_group_tx(&r, self, gen)
     }
 
     /// Plan 30 §M12: whether the table names any live delegation, as

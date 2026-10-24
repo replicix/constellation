@@ -1469,6 +1469,10 @@ pub struct SpeculationStatus {
     /// Plan 43 C1-4: committed requester/subscriber entries a takeover's
     /// re-applied tail superseded, since start.
     pub committed_superseded: u64,
+    /// Plan 43 C2: a delegate's uncommitted rows (their clients were never
+    /// answered) dropped at the end of their generation instead of replayed,
+    /// since start.
+    pub deleg_dropped: u64,
 }
 
 /// Plan 30 §M13: the S3 inbox — a non-holder's forwarded mutations

@@ -890,6 +890,7 @@ impl Core {
                     LogRecord::Delegate { .. }
                         | LogRecord::Recall { .. }
                         | LogRecord::RecallCut { .. }
+                        | LogRecord::DelegGroup { .. }
                 )
             }) {
                 self.delegation_sync(now, replica, out);

@@ -320,8 +320,13 @@ pub struct AnswererState {
     pub epoch: Option<u64>,
     /// A continuation epoch's hold is in force.
     pub epoch_held: bool,
-    /// Per generation this node holds as a delegate: its recorded backup.
-    pub deleg_backups: Vec<(u64, NodeId)>,
+    /// Per generation this node holds as a delegate: the backups its own
+    /// store's table records for it (`DelegGroup`, plan 43 C2; empty: no
+    /// record, the group is the delegate and the root). Read from the
+    /// answerer's store, not from the core — the delegate counts a backup
+    /// only once its own table names it, and the oracle must not take the
+    /// core's word for it.
+    pub deleg_groups: Vec<(u64, Vec<NodeId>)>,
     /// The generations this node holds as a delegate.
     pub holds_gens: Vec<u64>,
     /// The generations of the delegation table that are designations of
@@ -343,7 +348,7 @@ impl AnswererState {
         Self {
             epoch: core.lease().epoch(),
             epoch_held: core.lease().epoch_held(),
-            deleg_backups: view.backups.iter().map(|(g, b, _)| (*g, *b)).collect(),
+            deleg_groups: recorded_groups(meta, view.mine.iter().map(|m| m.1)),
             holds_gens: view.mine.iter().map(|m| m.1).collect(),
             designated_gens: meta
                 .delegation_table()
@@ -354,6 +359,20 @@ impl AnswererState {
             now_wait,
         }
     }
+}
+
+/// The groups `meta`'s table records for generations `gens` (plan 43 C2).
+pub fn recorded_groups(meta: &Meta, gens: impl Iterator<Item = u64>) -> Vec<(u64, Vec<NodeId>)> {
+    gens.map(|g| {
+        let backups = meta
+            .deleg_group(g)
+            .ok()
+            .flatten()
+            .map(|r| r.backups)
+            .unwrap_or_default();
+        (g, backups)
+    })
+    .collect()
 }
 
 /// How an answer reads in the report: `ok`, `refused:<code>`, `exists`, ….
@@ -732,7 +751,10 @@ fn classify(
     }
     let group_is_itself = match tx {
         Some(t) if t.origin.0 != 0 => {
-            let backed = st.deleg_backups.iter().any(|(g, _)| *g == t.origin.0);
+            let backed = st
+                .deleg_groups
+                .iter()
+                .any(|(g, b)| *g == t.origin.0 && !b.is_empty());
             if backed {
                 detail.push(format!("lone: generation {} records a backup", t.origin.0));
             }
@@ -858,10 +880,10 @@ fn deleg_group(
         return Err(format!("the answerer holds no generation {g}"));
     }
     let backups: Vec<NodeId> = st
-        .deleg_backups
+        .deleg_groups
         .iter()
         .filter(|(gen, _)| *gen == g)
-        .map(|(_, b)| *b)
+        .flat_map(|(_, b)| b.iter().copied())
         .collect();
     if !backups.is_empty() {
         for b in &backups {
@@ -907,8 +929,21 @@ fn expected_class(
 ) -> Expected {
     let g = tx.map_or(0, |t| t.origin.0);
     if g != 0 {
+        // Plan 43 C2 (§2.1): a lone delegate — its table records no backup
+        // and no peer, the root included, is within the budget — answers its
+        // own node's client from its disk; every other answer waits for the
+        // group (the root's append, when no backup is recorded).
+        let backed = st
+            .deleg_groups
+            .iter()
+            .any(|(gen, b)| *gen == g && !b.is_empty());
         return Expected::Class(if st.designated_gens.contains(&g) {
             AckClass::NonStealable
+        } else if rid.node == answerer
+            && !backed
+            && peer_in_budget(o, bus, answerer, st.now_wait).is_none()
+        {
+            AckClass::Lone
         } else {
             AckClass::DelegGroup { gen: g }
         });
@@ -2013,7 +2048,7 @@ mod tests {
         // With a recorded backup it is the backup's tail that must hold it.
         let st = AnswererState {
             holds_gens: vec![1],
-            deleg_backups: vec![(1, 3)],
+            deleg_groups: vec![(1, vec![3])],
             ..Default::default()
         };
         let j = w.judge(2, &st, r);
@@ -2025,6 +2060,83 @@ mod tests {
             deps: Position::ZERO,
         };
         w.metas[&3].deleg_backup_append(1, 0, &[dtx]).unwrap();
+        let j = w.judge(2, &st, r);
+        assert_eq!(
+            j.class,
+            Some(AckClass::DelegGroup { gen: 1 }),
+            "{}",
+            j.detail
+        );
+    }
+
+    /// Plan 43 C2 (§7.1 item 3): the delegate's group is the record its own
+    /// table holds, not the backup the delegate appends to. A backup that
+    /// holds the row but is in no applied record is not the group: the
+    /// root's journal must (D4: a configuration counts once its master has
+    /// it durably). Once the delegate's table records the backup, the
+    /// backup's tail is the check.
+    #[test]
+    fn i1_deleg_group_reads_the_record_not_the_append_target() {
+        let w = world();
+        let r = rid(3, 1);
+        let m = &w.metas[&2];
+        let ino = m.allocate_ino(ROOT_INO).unwrap();
+        let op = MutateOp::Create {
+            parent: ROOT_INO,
+            name: "x".into(),
+            ino,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let (records, _) = m
+            .delegate_execute(
+                &op,
+                Some(r),
+                1,
+                Position::ZERO,
+                &constellation_meta::locks::LockTag::NONE,
+                Now::same(0),
+            )
+            .unwrap();
+        w.lease(1, 1, &[]);
+        // Node 3 holds the row (the delegate appended to it) ...
+        let dtx = DelegateTx {
+            idx: 1,
+            rid: Some(r),
+            records,
+            deps: Position::ZERO,
+        };
+        w.metas[&3].deleg_backup_append(1, 0, &[dtx]).unwrap();
+        // ... but the delegate's table records no group: not committed.
+        let st = AnswererState {
+            holds_gens: vec![1],
+            deleg_groups: recorded_groups(&w.metas[&2], [1].into_iter()),
+            ..Default::default()
+        };
+        assert_eq!(st.deleg_groups, vec![(1, vec![])]);
+        let j = w.judge(2, &st, r);
+        assert_eq!(j.class, None, "{}", j.detail);
+        // The record reaches the delegate's table: the backup is the group.
+        w.metas[&2]
+            .apply_segment(
+                2,
+                1,
+                &[LogRecord::DelegGroup {
+                    dir: ROOT_INO,
+                    gen: 1,
+                    version: 1,
+                    backups: vec![3],
+                }],
+                &Default::default(),
+            )
+            .unwrap();
+        let st = AnswererState {
+            holds_gens: vec![1],
+            deleg_groups: recorded_groups(&w.metas[&2], [1].into_iter()),
+            ..Default::default()
+        };
+        assert_eq!(st.deleg_groups, vec![(1, vec![3])]);
         let j = w.judge(2, &st, r);
         assert_eq!(
             j.class,

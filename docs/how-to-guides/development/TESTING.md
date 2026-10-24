@@ -4831,8 +4831,10 @@ in the `strict_durability` configs; C2 `strict_commit` and `strict_settle`; C3
 **Classes** (`constellation_authority::core::AckClass`): `Archive` (an applied,
 unfenced log segment carries the outcome), `RootGroup` (the lease object's
 holder journal and every listed backup's tail hold the transaction),
-`DelegGroup { gen }` (the delegate's journal and each recorded backup's delegate
-tail, or the root's journal when none is recorded), `NonStealable` (a designee,
+`DelegGroup { gen }` (the delegate's journal and each backup *the answerer's own
+table records* (`DelegGroup` records, plan 43 C2c: the oracle reads the
+answerer's store, not the backup the delegate happens to append to) in its
+delegate tail, or the root's journal when none is recorded), `NonStealable` (a designee,
 or an epoch's hold owner) and `Lone` (the answerer's own client, its group is
 itself, and no peer within the RTT budget that has been linked for the
 stability window — `backup_stable_ms`, the core's own candidate rule: a link
@@ -4893,7 +4895,27 @@ convergence (must be 0: `member_copies_drained`). `strict_durability` now means
 re-shipped transaction by its `TailOf` identity and its records ignoring the
 `TailOf`, and the completion need not be the transaction's last record (an
 inbox acknowledgement rides after it). The rebuild-stub negative control no
-longer runs the program-order check (see PROGRESS, plan 43 C1-4).
+longer runs the program-order check (see PROGRESS, plan 43 C1-4) — it does again from C2c (the delegate's acknowledgement waits for its group, so a root change
+cannot overtake it).
+
+**Plan 43 C2c.** A delegate row of a lone delegate (no recorded backup in the
+answerer's table and no peer, the root included, within the budget) answered to
+its own node's client is `Lone`; to another node it is `DelegGroup`. New
+configuration `delegated-no-backup-root-near` (`backup_rtt_budget_ms` 50, the
+root 10 ms from each delegate, the delegates 80 ms apart: no backup can be had
+and the delegate is not lone), whose `deleg-group/*` answers are all committed
+by the root's append. `regression_delegated_long_delegation_no_refusal_for_an_op_that_lands`
+(seeds 11, 86, 200) replaces the tentative-refusal exception of
+`note_rollbacks`: a refusal whose rid the log carries executed is a failure
+again. `+commit` still fails on the root's own `archive/*` answers to forwards
+(C2f). Two things depend on the host: the simulation drives the stores' real
+writes against a simulated clock, so which seeds a fault schedule reaches
+inside the 20 s setup differs between machines, and a root change inside the
+setup window (a crash of the holder, a backup sealing a holder after a lost
+acknowledgement) ends the setup quietly rather than failing it; and pinned
+seeds that depend on a trajectory (I4's late landings, the writer hold's
+unsettled control, the release-wait regression) are re-pinned from a sweep
+when a change moves them.
 
 **Plan 43 C7b: offsets beyond the margin.** The cross-node compares (a claimant
 judging a lease by its own wall against the holder's wall expiry) are safe only

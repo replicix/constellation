@@ -3250,8 +3250,19 @@ fn appended_truncate_of(ino: constellation_fs_core::Ino) -> MutateOp {
     }
 }
 
-/// `from`'s replay of `op` by `rid`, forwarded to the holder `h`.
+/// `from`'s replay of `op` by `rid`, forwarded to the holder `h`. A
+/// delegate answers a forward once the root's append holds the row (Plan 43
+/// C2): the root's stream acknowledgement is delivered when the reply waits
+/// for it.
 fn replay_copy_at(h: &mut Harness, from: NodeId, rid: Rid, op: MutateOp) -> MutateOutcome {
+    let reply_in = |out: &[Action]| {
+        sends(out).into_iter().find_map(|(to, msg)| match msg {
+            PeerMsg::MutateReply { req, outcome, .. } if to == from && *req == OpId(9_001) => {
+                Some(outcome.clone())
+            }
+            _ => None,
+        })
+    };
     let out = h.step(Event::Peer {
         from,
         msg: PeerMsg::MutateRequest {
@@ -3264,15 +3275,14 @@ fn replay_copy_at(h: &mut Harness, from: NodeId, rid: Rid, op: MutateOp) -> Muta
             tag: Default::default(),
         },
     });
-    sends(&out)
-        .into_iter()
-        .find_map(|(to, msg)| match msg {
-            PeerMsg::MutateReply { req, outcome, .. } if to == from && *req == OpId(9_001) => {
-                Some(outcome.clone())
-            }
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("no reply to the copy: {out:?}"))
+    if let Some(outcome) = reply_in(&out) {
+        return outcome;
+    }
+    let Some((req, round, _, last)) = stream_batch(&out, 1) else {
+        panic!("no reply to the copy: {out:?}");
+    };
+    let out = h.step(stream_ack(1, req, round, last));
+    reply_in(&out).unwrap_or_else(|| panic!("no reply to the copy after the root's ack: {out:?}"))
 }
 
 /// Load campaign `pause:lock-lapse+500:10000@b`, seeds 42 and 61 (ten
@@ -33126,7 +33136,7 @@ fn root_with_delegate_backed_by(backup: NodeId) -> Harness {
 #[test]
 fn an_off_core_renewal_never_changes_the_roots_backup_of_a_delegate() {
     let mut h = root_with_delegate_backed_by(4);
-    assert_eq!(h.core.dl.gens[&7].backup, Some(4));
+    assert_eq!(h.core.dl.gens[&7].group.backup(), Some(4));
     h.advance(100);
     h.step(Event::Peer {
         from: 3,
@@ -33137,7 +33147,7 @@ fn an_off_core_renewal_never_changes_the_roots_backup_of_a_delegate() {
         },
     });
     assert_eq!(
-        h.core.dl.gens[&7].backup,
+        h.core.dl.gens[&7].group.backup(),
         Some(4),
         "the lane's renewal unnamed the delegate's backup"
     );
@@ -33157,7 +33167,7 @@ fn an_off_core_renewal_never_changes_the_roots_backup_of_a_delegate() {
             stream_head_at: 0,
         },
     });
-    assert_eq!(h.core.dl.gens[&7].backup, None);
+    assert_eq!(h.core.dl.gens[&7].group.backup(), None);
 }
 
 /// A lane renewal for a generation whose root recalled it, or that the
@@ -36465,6 +36475,597 @@ mod recall_cut {
     }
 }
 
+/// Plan 43 C2 (§2.1, §3.1-3.5): a delegate acknowledges once its group holds
+/// the row — the root's journaled append when no backup is recorded, the
+/// recorded backup after a `DelegGroup` record — and its own node's client
+/// is answered from its disk only while it is lone.
+mod deleg_group {
+    use super::*;
+    use crate::replica::Replica;
+    use crate::AnswerSource;
+    use constellation_fs_core::Ino;
+
+    fn rid_of(node: NodeId, seq: u64) -> Rid {
+        Rid {
+            node,
+            incarnation: 1,
+            seq,
+        }
+    }
+
+    /// Node 2 forwards a create in `dir` to the delegate (`req`).
+    fn forward_create(h: &mut Harness, dir: Ino, seq: u64, req: u64) -> Vec<Action> {
+        let ino = h.meta.allocate_ino(dir).unwrap();
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(req),
+                rid: rid_of(2, seq),
+                op: MutateOp::Create {
+                    parent: dir,
+                    name: format!("f{seq}"),
+                    ino,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+            },
+        })
+    }
+
+    /// The answer to node 2's request `req` in `out`, with whether it says it
+    /// is committed.
+    fn answer_to_2(out: &[Action], req: u64) -> Option<(MutateOutcome, bool)> {
+        sends(out).into_iter().find_map(|(to, m)| match m {
+            PeerMsg::MutateReply {
+                req: r,
+                outcome,
+                committed,
+                ..
+            } if to == 2 && *r == OpId(req) && crate::core::backup::is_answer(outcome) => {
+                Some((outcome.clone(), *committed))
+            }
+            _ => None,
+        })
+    }
+
+    /// The client replies of `out`, with the source they name.
+    fn client_answers(out: &[Action]) -> Vec<(Rid, AnswerSource)> {
+        out.iter()
+            .filter_map(|a| match a {
+                Action::Reply {
+                    rid,
+                    reply: ClientReply::Outcome(_),
+                    source,
+                } => Some((*rid, *source)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The delegate's own client submits a create (`seq`).
+    fn own_create(h: &mut Harness, dir: Ino, seq: u64) -> (Rid, Vec<Action>) {
+        let rid = h.rid(seq);
+        let ino = h.meta.allocate_ino(dir).unwrap();
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: MutateOp::Create {
+                parent: dir,
+                name: format!("own{seq}"),
+                ino,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            tag: Default::default(),
+        });
+        (rid, out)
+    }
+
+    /// The root (node 1) is a peer within the budget, up long enough to be a
+    /// backup candidate: the delegate is not lone, and has no backup to
+    /// choose (never the root).
+    fn root_is_near(h: &mut Harness) {
+        h.core.cfg.backup_rtt_budget_ms = 50;
+        h.core.cfg.backups_max = 1;
+        h.core.cfg.backup_stable_ms = 0;
+        h.step(Event::Roster {
+            write_eligible: vec![1, 2, 3],
+        });
+        h.step(Event::Peers {
+            links: vec![crate::event::PeerLink {
+                node: 1,
+                connected: true,
+                last_seen: None,
+                rtt_ms: Some(5),
+                since: Some(WaitMs(0)),
+            }],
+        });
+        assert!(!h.core.deleg_lone(h.clk(), &h.core.dl.mine[&7]));
+    }
+
+    /// The batch to the root in `out`: `(req, round, last)`.
+    fn batch(out: &[Action]) -> Option<(OpId, u64, u64)> {
+        stream_batch(out, 1).map(|(req, round, _, last)| (req, round, last))
+    }
+
+    fn root_acks(h: &mut Harness, req: OpId, round: u64, through: u64) -> Vec<Action> {
+        h.step(stream_ack(1, req, round, through))
+    }
+
+    /// The backup append (node 4) in `out`: `(req, last idx)`.
+    fn backup_append(out: &[Action]) -> Option<(OpId, u64)> {
+        sends(out).into_iter().find_map(|(to, m)| match m {
+            PeerMsg::DelegBackupAppend { req, gen: 7, txs } if to == 4 => {
+                Some((*req, txs.last().map_or(0, |t| t.idx)))
+            }
+            _ => None,
+        })
+    }
+
+    fn backup_acks(h: &mut Harness, req: OpId, acked: u64) -> Vec<Action> {
+        h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegBackupAck {
+                req,
+                gen: 7,
+                acked,
+                sealed: false,
+            },
+        })
+    }
+
+    /// The log records `DelegGroup { version, backups }` of generation 7 and
+    /// the delegate's core learns it (the segment path).
+    fn record_group(
+        h: &mut Harness,
+        dir: Ino,
+        seq: u64,
+        version: u64,
+        backups: Vec<u64>,
+    ) -> Vec<Action> {
+        Replica::apply_segment(
+            &h.meta,
+            seq,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::DelegGroup {
+                dir,
+                gen: 7,
+                version,
+                backups,
+            }],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        h.core.deleg_after_event(h.clk(), &h.meta, &mut out);
+        out
+    }
+
+    /// A delegate with no recorded backup answers another node's forward
+    /// once the root's append holds the row, not before: the group is the
+    /// delegate and the root (Q16). Before C2 it answered on its own disk.
+    #[test]
+    fn a_delegate_without_a_recorded_backup_waits_for_the_roots_append() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        let out = forward_create(&mut h, dir, 1, 500);
+        assert_eq!(answer_to_2(&out, 500), None, "answered alone: {out:?}");
+        let (req, round, last) = batch(&out).expect("the row is sent to the root at once");
+        assert!(h.core.has_stream_parks());
+        let out = root_acks(&mut h, req, round, last);
+        let (outcome, committed) = answer_to_2(&out, 500).expect("answered after the root's ack");
+        assert!(
+            matches!(outcome, MutateOutcome::Accepted { .. }),
+            "{outcome:?}"
+        );
+        assert!(committed, "a group-held answer says it is committed");
+        assert_eq!(
+            h.core.stats.ack_classes[AckClass::DelegGroup { gen: 7 }.index()],
+            1
+        );
+        assert_eq!(h.core.dl.mine[&7].acked_max, 1);
+    }
+
+    /// Lone: nobody within reach, no backup recorded. Its own client is
+    /// answered from its disk (`Lone`), other nodes' forwards wait for the
+    /// root. Not lone (the root within the budget): its own client waits for
+    /// the root too.
+    #[test]
+    fn a_lone_delegate_acks_its_own_node_and_waits_for_the_root_for_others() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        assert!(h.core.deleg_lone(h.clk(), &h.core.dl.mine[&7]));
+        assert!(
+            !h.core.deleg_fast_path_gated(h.clk()),
+            "lone: the fast path stays open"
+        );
+        let (rid, out) = own_create(&mut h, dir, 1);
+        assert_eq!(
+            client_answers(&out),
+            vec![(rid, AnswerSource::Sequenced(AckClass::Lone))],
+            "{out:?}"
+        );
+        // (Its row streams to the root meanwhile.)
+        let (req, round, last) = batch(&out).expect("the lone row streams");
+        root_acks(&mut h, req, round, last);
+        let out = forward_create(&mut h, dir, 2, 501);
+        assert_eq!(answer_to_2(&out, 501), None, "{out:?}");
+        let (req, round, last) = batch(&out).expect("sent to the root");
+        let out = root_acks(&mut h, req, round, last);
+        assert!(answer_to_2(&out, 501).is_some(), "{out:?}");
+        // The root comes within the budget: the next own op waits.
+        root_is_near(&mut h);
+        assert!(
+            h.core.deleg_fast_path_gated(h.clk()),
+            "not lone: the fast path closes"
+        );
+        let (rid, out) = own_create(&mut h, dir, 3);
+        assert!(client_answers(&out).is_empty(), "answered alone: {out:?}");
+        let (req, round, last) =
+            batch(&out).unwrap_or_else(|| panic!("not sent to the root: {out:?}"));
+        let out = root_acks(&mut h, req, round, last);
+        assert!(
+            client_answers(&out).contains(&(
+                rid,
+                AnswerSource::Sequenced(AckClass::DelegGroup { gen: 7 })
+            )),
+            "{out:?}"
+        );
+    }
+
+    /// A backup counts only once the delegate's own table records a
+    /// `DelegGroup` naming it (D4): its acknowledgements before that are not
+    /// the delegate's commit; after, they are, and the root's append is not
+    /// needed any more.
+    #[test]
+    fn a_delegate_counts_a_backup_only_after_its_deleg_group_record() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        h.core.dl.mine.get_mut(&7).unwrap().backup = Some(4);
+        let out = forward_create(&mut h, dir, 1, 500);
+        let (breq, last) = backup_append(&out).expect("appended to the backup");
+        let out = backup_acks(&mut h, breq, last);
+        assert_eq!(
+            answer_to_2(&out, 500),
+            None,
+            "the backup held the row but is in no recorded group: {out:?}"
+        );
+        // The delegate asked for the record (the backup holds what was answered).
+        assert_eq!(h.core.dl.mine[&7].group_requested, Some(vec![4]));
+        // The root's record reaches the delegate through the log.
+        let out = record_group(&mut h, dir, 2, 1, vec![4]);
+        assert_eq!(h.core.dl.mine[&7].group_backups, vec![4]);
+        assert!(h.core.dl.mine[&7].group_requested.is_none());
+        assert!(
+            answer_to_2(&out, 500).is_some(),
+            "recorded: the backup's ack counts: {out:?}"
+        );
+        // A later row waits for the backup alone — not for the root.
+        let out = forward_create(&mut h, dir, 2, 501);
+        let (breq, last) = backup_append(&out).expect("appended");
+        assert_eq!(answer_to_2(&out, 501), None);
+        let out = backup_acks(&mut h, breq, last);
+        assert!(answer_to_2(&out, 501).is_some(), "{out:?}");
+        assert_eq!(
+            h.core.dl.mine[&7].streamed_through, 0,
+            "the root never acknowledged"
+        );
+    }
+
+    /// While a change is requested and not yet recorded, an acknowledgement
+    /// needs the members of both versions (D4): the root may end the
+    /// generation by either.
+    #[test]
+    fn a_pending_group_change_needs_both_versions() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        {
+            let d = h.core.dl.mine.get_mut(&7).unwrap();
+            d.backup = Some(4);
+            d.group_requested = Some(vec![4]);
+        }
+        let out = forward_create(&mut h, dir, 1, 500);
+        let (breq, blast) = backup_append(&out).expect("appended to the backup");
+        let (req, round, last) = batch(&out).expect("sent to the root");
+        let out = backup_acks(&mut h, breq, blast);
+        assert_eq!(
+            answer_to_2(&out, 500),
+            None,
+            "the backup alone is not enough: {out:?}"
+        );
+        let out = root_acks(&mut h, req, round, last);
+        assert!(
+            answer_to_2(&out, 500).is_some(),
+            "the root and the backup hold it: {out:?}"
+        );
+        // The other order: the root first.
+        let out = forward_create(&mut h, dir, 2, 501);
+        let (breq, blast) = backup_append(&out).expect("appended");
+        let (req, round, last) = batch(&out).expect("sent");
+        let out = root_acks(&mut h, req, round, last);
+        assert_eq!(
+            answer_to_2(&out, 501),
+            None,
+            "the root alone is not enough: {out:?}"
+        );
+        let out = backup_acks(&mut h, breq, blast);
+        assert!(answer_to_2(&out, 501).is_some(), "{out:?}");
+    }
+
+    /// A backup the delegate stopped appending to (dropped, here) is still
+    /// needed until the record without it is applied (D4): nothing is
+    /// answered on the root's append alone meanwhile. The delegate asks for
+    /// the removal once every index it answered is covered.
+    #[test]
+    fn a_removed_backup_is_needed_until_the_record_without_it_is_applied() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        record_group(&mut h, dir, 2, 1, vec![4]);
+        assert_eq!(h.core.dl.mine[&7].group_backups, vec![4]);
+        // The backup was unreachable and is dropped.
+        h.core.dl.mine.get_mut(&7).unwrap().backup = None;
+        let out = forward_create(&mut h, dir, 1, 500);
+        let (req, round, last) = batch(&out).expect("sent to the root");
+        let out = root_acks(&mut h, req, round, last);
+        assert_eq!(
+            answer_to_2(&out, 500),
+            None,
+            "the recorded backup holds nothing: the root's append is not the group: {out:?}"
+        );
+        // Nothing was answered yet: the removal is safe, and is asked for.
+        assert_eq!(h.core.dl.mine[&7].group_requested, Some(vec![]), "{out:?}");
+        let renewals: Vec<_> = sends(&out)
+            .into_iter()
+            .filter_map(|(_, m)| match m {
+                PeerMsg::DelegRenew { gen: 7, backup, .. } => Some(*backup),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            renewals.is_empty() || renewals == vec![None],
+            "{renewals:?}"
+        );
+        let out = record_group(&mut h, dir, 3, 2, vec![]);
+        assert!(
+            answer_to_2(&out, 500).is_some(),
+            "the record without the backup is applied: the root's append is the group: {out:?}"
+        );
+    }
+
+    /// A backup leaves the record only once every index the delegate
+    /// answered is at or below the root's journaled cursor (or in the log):
+    /// no acknowledged row is left only on a backup the record stops naming.
+    #[test]
+    fn a_backup_is_dropped_from_the_record_only_once_its_rows_are_covered() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        h.core.dl.mine.get_mut(&7).unwrap().backup = Some(4);
+        record_group(&mut h, dir, 2, 1, vec![4]);
+        let out = forward_create(&mut h, dir, 1, 500);
+        let (breq, blast) = backup_append(&out).expect("appended");
+        let (req, round, last) = batch(&out).expect("sent");
+        let out = backup_acks(&mut h, breq, blast);
+        assert!(
+            answer_to_2(&out, 500).is_some(),
+            "answered on the backup: {out:?}"
+        );
+        assert_eq!(h.core.dl.mine[&7].acked_max, 1);
+        // The backup is lost; the root has not acknowledged row 1 yet.
+        h.core.dl.mine.get_mut(&7).unwrap().backup = None;
+        let mut out = Vec::new();
+        h.core.deleg_after_event(h.clk(), &h.meta, &mut out);
+        assert!(
+            h.core.dl.mine[&7].group_requested.is_none(),
+            "row 1 is acknowledged and only the backup holds it: no removal yet"
+        );
+        root_acks(&mut h, req, round, last);
+        assert_eq!(
+            h.core.dl.mine[&7].group_requested,
+            Some(vec![]),
+            "the root holds row 1: the removal is asked for"
+        );
+    }
+
+    /// A retry of a rid whose row is still in the delegate's own uncommitted
+    /// journal, its first answer gone (the park was aborted, `Busy`), is
+    /// answered when the row commits, not at once (D6): the dedup branch
+    /// answered at once from the rid's `completed` row.
+    #[test]
+    fn a_delegates_dedup_answer_waits_for_its_rows_commit() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        let out = forward_create(&mut h, dir, 1, 500);
+        let (req, round, last) = batch(&out).expect("sent");
+        assert_eq!(answer_to_2(&out, 500), None);
+        let row = h.meta.outcome_row(rid_of(2, 1)).unwrap();
+        assert!(
+            row.is_some_and(|r| r.gen == 7 && r.class.gated()),
+            "{row:?}"
+        );
+        // The first answer is given up on (the requester is told `Busy`).
+        let mut out = Vec::new();
+        for id in h.core.stream_parks_of(7) {
+            h.core.abort_park_busy(h.clk(), id, &h.meta, &mut out);
+        }
+        assert!(!h.core.has_stream_parks());
+        // The requester's copy of the same rid (a retry, a new request id).
+        let copy = |h: &mut Harness, req: u64| {
+            let ino = h.meta.allocate_ino(dir).unwrap();
+            h.step(Event::Peer {
+                from: 2,
+                msg: PeerMsg::MutateRequest {
+                    req: OpId(req),
+                    rid: rid_of(2, 1),
+                    op: MutateOp::Create {
+                        parent: dir,
+                        name: "f1".into(),
+                        ino,
+                        mode: 0o644,
+                        uid: 0,
+                        gid: 0,
+                    },
+                    acked_through: 0,
+                    deps: constellation_meta::Position::ZERO,
+                    applied: 0,
+                    tag: Default::default(),
+                },
+            })
+        };
+        let retry = copy(&mut h, 501);
+        assert_eq!(
+            answer_to_2(&retry, 501),
+            None,
+            "the dedup answered a row the root has not appended: {retry:?}"
+        );
+        assert!(
+            h.core.has_stream_parks(),
+            "the dedup answer is parked on the row"
+        );
+        let out = root_acks(&mut h, req, round, last);
+        assert!(answer_to_2(&out, 501).is_some(), "{out:?}");
+        // A retry of the committed row is answered at once.
+        let again = copy(&mut h, 502);
+        assert!(answer_to_2(&again, 502).is_some(), "{again:?}");
+    }
+
+    /// The requester's deadline settles a rid from the delegate's own
+    /// journal only when its row is committed: an uncommitted `DelegGroup`
+    /// row is not an outcome the generation's end will keep (D6).
+    #[test]
+    fn settled_outcome_does_not_answer_an_uncommitted_delegate_row() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        root_is_near(&mut h);
+        let (rid, out) = own_create(&mut h, dir, 1);
+        let (req, round, last) = batch(&out).expect("sent");
+        assert!(client_answers(&out).is_empty());
+        assert!(
+            h.core.settled_outcome(rid, &h.meta).is_none(),
+            "settled from a row only this disk holds"
+        );
+        root_acks(&mut h, req, round, last);
+        assert!(h.core.settled_outcome(rid, &h.meta).is_some());
+    }
+
+    /// The root journals the group a delegate asks for: `DelegGroup` at the
+    /// next version when the request differs from the latest record, nothing
+    /// when it is the same.
+    #[test]
+    fn a_root_journals_the_group_its_delegate_requests() {
+        let mut h = root_with_delegate_backed_by(4);
+        let groups = |h: &Harness| -> Vec<(u64, Vec<u64>)> {
+            Replica::journal_txs_from(&h.meta, 0, usize::MAX)
+                .into_iter()
+                .flat_map(|tx| tx.records)
+                .filter_map(|r| match r {
+                    LogRecord::DelegGroup {
+                        gen: 7,
+                        version,
+                        backups,
+                        ..
+                    } => Some((version, backups)),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(groups(&h), vec![(1, vec![4])]);
+        assert_eq!(h.core.dl.gens[&7].group.version, 1);
+        let renew = |h: &mut Harness, req: u64, backup| {
+            h.step(Event::Peer {
+                from: 3,
+                msg: PeerMsg::DelegRenew {
+                    req: OpId(req),
+                    gen: 7,
+                    round: 1,
+                    backup,
+                    stream_head: 0,
+                    stream_head_at: 0,
+                },
+            });
+        };
+        renew(&mut h, 2, Some(4));
+        assert_eq!(
+            groups(&h),
+            vec![(1, vec![4])],
+            "the same request: no record"
+        );
+        renew(&mut h, 3, None);
+        assert_eq!(groups(&h), vec![(1, vec![4]), (2, vec![])]);
+        renew(&mut h, 4, Some(5));
+        assert_eq!(groups(&h), vec![(1, vec![4]), (2, vec![]), (3, vec![5])]);
+        assert_eq!(h.core.dl.gens[&7].group.backup(), Some(5));
+        assert_eq!(
+            h.core.dl.gens[&7].group.named,
+            [4u64, 5].into_iter().collect()
+        );
+    }
+
+    /// Rows past the cut that a delegate answered to nobody (they waited for
+    /// the group) are dropped at the generation's end: no replay by rid; the
+    /// requester retries at the new owner (`Busy` for the parked answer).
+    #[test]
+    fn a_recalled_delegates_uncommitted_rows_are_dropped_not_replayed() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        forward_create(&mut h, dir, 1, 500);
+        let applied = Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::RecallCut {
+                dir,
+                gen: 7,
+                through: 0,
+            }],
+        )
+        .unwrap();
+        assert_eq!(applied.stranded.deleg_dropped, 1);
+        assert!(
+            h.meta.pending_replays().unwrap().is_empty(),
+            "queued for replay"
+        );
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(!h.core.has_stream_parks());
+    }
+
+    /// A lone delegate's own client was answered from its disk: its row past
+    /// the cut is replayed by rid as before (the lone branch).
+    #[test]
+    fn a_recalled_delegates_lone_rows_are_still_replayed() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        let (rid, out) = own_create(&mut h, dir, 1);
+        assert_eq!(client_answers(&out).len(), 1, "answered alone: {out:?}");
+        let applied = Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::RecallCut {
+                dir,
+                gen: 7,
+                through: 0,
+            }],
+        )
+        .unwrap();
+        assert_eq!(applied.stranded.deleg_dropped, 0);
+        let queued: Vec<Rid> = h
+            .meta
+            .pending_replays()
+            .unwrap()
+            .into_iter()
+            .map(|q| q.rid)
+            .collect();
+        assert_eq!(queued, vec![rid]);
+    }
+}
+
 /// Plan 43 C1-1: the root group's commit holds across a listing and a
 /// removal. What a backup counts for is what it acknowledged to an append
 /// that carried a version listing it (`BackupPeer::counted`), and while a
@@ -37064,7 +37665,7 @@ mod deleg_windows_tests {
     fn an_expiry_closes_the_slot_before_it_reclaims() {
         let mut h = root_with_delegate_backed_by(0);
         // (No backup named: the plain reclaim.)
-        h.core.dl.gens.get_mut(&7).unwrap().backup = None;
+        h.core.dl.gens.get_mut(&7).unwrap().group.backups.clear();
         h.core.dw.set_until_for_tests(7, w(h.now));
         let mut out = Vec::new();
         h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
@@ -37102,6 +37703,84 @@ mod deleg_windows_tests {
             slot_open(&h),
             "the core grants again after an unanswered seal"
         );
+    }
+
+    /// Plan 43 C2 (Q1, the interim of C2e): a generation whose latest record
+    /// names a backup is not ended without that member's tail. The seal
+    /// that went unanswered for its window is asked again, however many
+    /// windows pass (the generation stays `Sealing`, `waiting_for_group`);
+    /// the backup's late answer drains the tail and ends it. Before, the
+    /// root reclaimed the generation at the window's end: the rows only the
+    /// backup held — acknowledged — were lost (long-delegated-backup 358 and
+    /// the pinned 78172).
+    #[test]
+    fn an_unanswered_seal_of_the_recorded_backup_holds_the_end() {
+        let mut h = root_with_delegate_backed_by(4);
+        assert_eq!(h.core.dl.gens[&7].group.backup(), Some(4));
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        let first = sends(&out)
+            .iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::DelegSeal { req, .. } if *to == 4 => Some(*req),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no seal: {out:?}"));
+        // The window passes unanswered, twice: the seal is asked again, the
+        // generation is not ended.
+        for round in 0..2 {
+            h.advance((h.core.cfg.forward_timeout_ms * 2).max(h.core.cfg.backup_takeover_ms) + 10);
+            let mut out = Vec::new();
+            h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+            let g = &h.core.dl.gens[&7];
+            assert!(
+                !g.ended,
+                "round {round}: ended without the backup's tail: {out:?}"
+            );
+            assert_eq!(g.recall, RecallPhase::Sealing);
+            assert!(g.waiting_for_group);
+            assert!(
+                sends(&out)
+                    .iter()
+                    .any(|(to, m)| *to == 4 && matches!(m, PeerMsg::DelegSeal { .. })),
+                "round {round}: not asked again: {out:?}"
+            );
+        }
+        assert_eq!(h.core.stats.deleg_seal_waits, 2);
+        // The first request's late answer is as good as the latest's.
+        let tail = vec![constellation_meta::DelegateTx {
+            idx: 1,
+            rid: None,
+            records: Vec::new(),
+            deps: constellation_meta::Position::ZERO,
+        }];
+        h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegSealed {
+                req: first,
+                gen: 7,
+                sealed: true,
+                txs: tail,
+            },
+        });
+        assert!(
+            h.core.dl.gens[&7].ended,
+            "the tail arrived: the generation ends"
+        );
+    }
+
+    /// A generation without a recorded backup keeps the plain reclaim: the
+    /// root's cursor covers everything acknowledged through the group.
+    #[test]
+    fn a_generation_without_a_recorded_backup_is_still_reclaimed_at_its_window() {
+        let mut h = root_with_delegate_backed_by(0);
+        h.core.dl.gens.get_mut(&7).unwrap().group.backups.clear();
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        assert!(h.core.dl.gens[&7].ended, "{out:?}");
+        assert!(!h.core.dl.gens[&7].waiting_for_group);
     }
 
     #[test]

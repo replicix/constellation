@@ -3001,6 +3001,16 @@ impl Core {
             {
                 return None;
             }
+            // Plan 43 C2 (D6): the outcome is in this node's own journal as a
+            // delegate's row of a generation: settled once its group holds
+            // it (or when it is this node's own client's `Lone` row), not
+            // while the row is the delegate's disk alone — the generation
+            // may end without it.
+            if let Some(r) = replica.outcome_row(rid).filter(|r| r.gen != 0) {
+                if r.class.gated() && !self.deleg_stream_durable(r.gen, r.idx, replica) {
+                    return None;
+                }
+            }
             return completed_as_outcome(replica, rid, self.ship.max_epoch);
         }
         if self.lease.lost {

@@ -4440,17 +4440,13 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // EC2 campaign 7, finding B-1: across directories and owners, the
     // log keeps every node's program order (see `history.rs`).
     //
-    // Plan 43 C1-4: not under the rebuild stub (a negative control whose
-    // deposed root never recovers). A recovery that never finishes leaves
-    // the deposed node's clients' later ops free to go ahead of the
-    // acknowledgements a delegation gave them before the root changed
-    // (the lone branch's, DelegGroup until C2); the replays of its gated
-    // rows that used to queue up behind them, and held them back, are the
-    // member copy's now. The real rebuild keeps the check.
-    if !cfg.rebuild_stub {
-        super::history::check_session_order(&events, &tentative, &oracle.completed_at, &journal)
-            .map_err(lin_context)?;
-    }
+    // (Plan 43 C1-4 had left the rebuild stub out of this check: a deposed
+    // root that never recovers let its clients' later ops go ahead of the
+    // acknowledgements a delegation gave them before the root changed.
+    // Plan 43 C2 closes that: a delegate acknowledges once its group holds
+    // the row, so a root change cannot overtake an acknowledged row.)
+    super::history::check_session_order(&events, &tentative, &oracle.completed_at, &journal)
+        .map_err(lin_context)?;
     if strict_durability && witness.observed_tentative > 0 {
         return Err(lin_context(format!(
             "{} refusal(s) observed an acknowledged effect that was later rolled back              (impossible under a durable acknowledgement policy)",
@@ -4981,6 +4977,22 @@ async fn setup_dirs(cluster: &Arc<Cluster>, cfg: &SimConfig, failures: &Arc<Mute
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // A root change inside the setup's window (a backup that sealed a live
+    // holder, a crashed holder's takeover: the faults of the random-fault
+    // configurations reach it, and which seeds do depends on how fast the
+    // host runs the store's real writes against the simulated clock) ends
+    // the delegations the setup made, and the workload goes on under the new
+    // root; the setup's expectation holds only while the first root does.
+    let failed_over = (1..=cfg.nodes as NodeId).any(|n| {
+        cluster
+            .get(n)
+            .view()
+            .held_epoch
+            .is_some_and(|epoch| epoch > 1)
+    });
+    if failed_over {
+        return;
     }
     failures
         .lock()

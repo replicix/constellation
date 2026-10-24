@@ -355,6 +355,7 @@ impl EngineControl {
                     committed_rolled_back: stats.committed_rolled_back,
                     member_copied: stats.rows_member_copied,
                     committed_superseded: stats.committed_superseded,
+                    deleg_dropped: stats.deleg_dropped,
                 }
             },
             held: held::status(&self.meta),

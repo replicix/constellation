@@ -62,6 +62,9 @@ pub trait Replica {
     /// Whether `rid`'s outcome row came from an applied segment, not this
     /// node's journal (`Meta::outcome_from_log`).
     fn outcome_from_log(&self, rid: Rid) -> bool;
+    /// Plan 43 C2 (D6): the unshipped journal transaction behind `rid`'s
+    /// outcome row (`Meta::outcome_row`).
+    fn outcome_row(&self, rid: Rid) -> Option<constellation_meta::OutcomeRow>;
     /// The entry behind an `EEXIST` refusal (`MutateOutcome::Exists`).
     fn entry_as_record(&self, parent: Ino, name: &str) -> Option<LogRecord>;
     fn manifest(&self, ino: Ino) -> Option<Vec<u8>>;
@@ -259,6 +262,10 @@ pub trait Replica {
 
     /// The live delegation table as this replica knows it.
     fn delegation_table(&self) -> DelegationTable;
+    /// Plan 43 C2: generation `gen`'s configuration as this replica's table
+    /// records it (`None`: no `DelegGroup` record applied: the group is the
+    /// delegate and the root).
+    fn deleg_group(&self, gen: u64) -> Option<constellation_meta::delegation::DelegGroupRow>;
     /// Who executes an op touching `keys` (an ancestor walk on this
     /// replica's table; `Root` at once when the table is empty).
     fn resolve_ownership(&self, keys: &TouchSet) -> Ownership;
@@ -682,6 +689,10 @@ impl Replica for Meta {
         Meta::outcome_from_log(self, rid).unwrap_or(false)
     }
 
+    fn outcome_row(&self, rid: Rid) -> Option<constellation_meta::OutcomeRow> {
+        Meta::outcome_row(self, rid).ok().flatten()
+    }
+
     fn entry_as_record(&self, parent: Ino, name: &str) -> Option<LogRecord> {
         Meta::entry_as_record(self, parent, name).ok().flatten()
     }
@@ -1038,6 +1049,10 @@ impl Replica for Meta {
 
     fn delegation_table(&self) -> DelegationTable {
         Meta::delegation_table(self)
+    }
+
+    fn deleg_group(&self, gen: u64) -> Option<constellation_meta::delegation::DelegGroupRow> {
+        Meta::deleg_group(self, gen).ok().flatten()
     }
 
     fn resolve_ownership(&self, keys: &TouchSet) -> Ownership {

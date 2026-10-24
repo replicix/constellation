@@ -41,7 +41,7 @@ pub use session::{
 pub use snapsched::{SnapPolicy, SNAPSHOT_POLICY_XATTR};
 pub use store::backup::{BackupRole, BackupTx};
 pub use store::held::{DroppedHeld, HeldInode, HeldSummary};
-pub use store::inbox::{CompletedOutcome, InboxAck, InboxAckArmed};
+pub use store::inbox::{CompletedOutcome, InboxAck, InboxAckArmed, OutcomeRow};
 #[cfg(any(test, feature = "test-util"))]
 pub use store::journal::write_check_hook;
 pub use store::journal::{

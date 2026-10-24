@@ -9109,6 +9109,12 @@
           "minimum": 0,
           "type": "integer"
         },
+        "deleg_dropped": {
+          "description": "Plan 43 C2: a delegate's uncommitted rows (their clients were never\nanswered) dropped at the end of their generation instead of replayed,\nsince start.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "depositions": {
           "description": "Plan 30 §M3b: deposition recoveries run (rollback plus replay, or\nthe capture-off rebuild), since start.",
           "format": "uint64",
@@ -9189,7 +9195,8 @@
         "copies_stalled",
         "committed_rolled_back",
         "member_copied",
-        "committed_superseded"
+        "committed_superseded",
+        "deleg_dropped"
       ],
       "type": "object"
     },

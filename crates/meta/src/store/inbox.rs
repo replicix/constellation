@@ -86,6 +86,19 @@ pub enum CompletedOutcome {
     Refused { code: Code },
 }
 
+/// Plan 43 C2 (D6): the journal transaction behind a `completed` row
+/// ([`Meta::outcome_row`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutcomeRow {
+    /// The transaction's first journal seq.
+    pub jseq: u64,
+    /// The delegation stream it belongs to (`gen` 0: the holder's own).
+    pub gen: u64,
+    pub idx: u64,
+    /// The class the row was journaled under.
+    pub class: super::local::RowClass,
+}
+
 fn decode_outcome(v: &[u8]) -> Result<CompletedOutcome, MetaError> {
     let position = u64::from_be_bytes(
         v.get(0..8)
@@ -165,6 +178,40 @@ impl Meta {
         Ok(r.get(&self.completed, rid.to_key())?
             .and_then(|v| v.get(0..8).map(|p| p.iter().all(|b| *b == 0)))
             .unwrap_or(false))
+    }
+
+    /// Plan 43 C2 (D6): the unshipped journal transaction of this node that
+    /// holds `rid`'s outcome — where an answer to a retry of the rid must
+    /// wait for the row's commit, as for the first execution. `None`: the
+    /// rid has no `completed` row, or it came from the log (position 0), or
+    /// the transaction left the journal (shipped, retired, stranded).
+    pub fn outcome_row(&self, rid: Rid) -> Result<Option<OutcomeRow>, MetaError> {
+        let r = self.db.read_tx();
+        let Some(v) = r.get(&self.completed, rid.to_key())? else {
+            return Ok(None);
+        };
+        let position = u64::from_be_bytes(
+            v.get(0..8)
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| MetaError::Invalid("completed row".into()))?,
+        );
+        if position == 0 {
+            return Ok(None);
+        }
+        let Some(guard) = r
+            .range(&self.journal_tx, ..=super::local::tx_key(position))
+            .next_back()
+        else {
+            return Ok(None);
+        };
+        let (k, hv) = guard.into_inner()?;
+        let head: super::local::JournalTxHead = postcard::from_bytes(&hv)?;
+        Ok((head.last >= position).then(|| OutcomeRow {
+            jseq: super::local::decode_tx_key(&k).unwrap_or(0),
+            gen: head.gen,
+            idx: head.idx,
+            class: head.class,
+        }))
     }
 
     /// The code the log refused `rid` with, if it did.

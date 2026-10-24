@@ -615,6 +615,13 @@ pub struct DelegModel {
     /// a counterexample search that stops at the first failed property still
     /// ends on the property a test is about (C2 turns it on everywhere).
     pub check_acked_replay: bool,
+    /// Plan 43 C2: a delegate with no backup acknowledges an op only once
+    /// the root has appended it (`Msg::StreamAck`: the root's journaled
+    /// cursor): the group of a delegation with no recorded backup is the
+    /// delegate and the root, and the root's append is the second copy
+    /// (Q16). Design: `true`. With `false` it acknowledges alone — today's
+    /// Layer A (`today_a_delegate_without_a_backup_acks_alone`).
+    pub ack_via_root: bool,
 }
 
 impl DelegModel {
@@ -658,6 +665,7 @@ impl DelegModel {
             root_lane_after_close: false,
             root_lane_ignores_cap: false,
             check_acked_replay: false,
+            ack_via_root: true,
         }
     }
 
@@ -739,7 +747,8 @@ fn msg_to(m: &Msg) -> u8 {
         | Msg::Append { to, .. }
         | Msg::AppendAck { to, .. }
         | Msg::Drain { to, .. }
-        | Msg::SealReq { to, .. } => *to,
+        | Msg::SealReq { to, .. }
+        | Msg::StreamAck { to, .. } => *to,
     }
 }
 
@@ -976,6 +985,14 @@ pub enum Msg {
         to: u8,
         gen: u8,
     },
+    /// Plan 43 C2: the root appended the generation's stream through
+    /// `through` (its journaled cursor), at root epoch `epoch`.
+    StreamAck {
+        to: u8,
+        gen: u8,
+        through: u8,
+        epoch: u8,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1010,6 +1027,10 @@ pub const SAW_TENTATIVE: u16 = 2048;
 pub const SAW_ACKED_REPLAYED: u16 = 4096;
 /// Plan 41 R: a stalled root's P2P service renewed a grant.
 pub const SAW_ROOT_LANE_RENEWED: u16 = 8192;
+/// Plan 43 C2: an op whose first attempt was never acknowledged (its
+/// delegate's generation ended under it, or the delegate died) landed by the
+/// requester's retry, by the same rid, at the owner then.
+pub const SAW_RETRY_LANDED: u16 = 16384;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
@@ -1030,6 +1051,9 @@ pub struct State {
     pub closed: u16,
     /// Ghost: rids acknowledged after a backup persisted them.
     pub durable_rids: Vec<Rid>,
+    /// Plan 43 C2 ghost: rids whose first attempt was refused (`NotOwner`)
+    /// and retried; one that then lands is `SAW_RETRY_LANDED`.
+    pub retried: Vec<Rid>,
     /// Phase 2b: the generations that are designations (bit `gen`).
     pub designated_gens: u16,
     /// Plan 41 R: the nodes whose authority core is stuck in a step
@@ -1442,6 +1466,7 @@ impl Model for DelegModel {
             ended_gens: 0,
             closed: 0,
             durable_rids: Vec::new(),
+            retried: Vec::new(),
             designated_gens,
             stalled: 0,
             stalls: 0,
@@ -1617,7 +1642,10 @@ impl Model for DelegModel {
                             .is_some_and(|r| r.held.iter().any(|h| h.rid == *rid))
                             || x.deleg.as_ref().is_some_and(|d| {
                                 d.parked.iter().any(|p| p.rid == *rid)
-                                    || d.awaiting.iter().any(|a| a.rid == *rid)
+                                    // (Plan 43 C2: an acknowledgement waiting
+                                    // for the root on a node that died is not
+                                    // coming.)
+                                    || (x.alive && d.awaiting.iter().any(|a| a.rid == *rid))
                             })
                     });
                     if !in_flight {
@@ -1895,6 +1923,7 @@ impl Model for DelegModel {
         witness!("deps_waited", SAW_DEPS_WAIT);
         witness!("redelegated", SAW_REDELEGATED);
         witness!("root_lane_renewed", SAW_ROOT_LANE_RENEWED);
+        witness!("retry_landed", SAW_RETRY_LANDED);
         props
     }
 
@@ -2111,6 +2140,21 @@ fn delegate_handle(
                 from: i as u8,
                 to: b,
                 rec,
+            });
+            return;
+        }
+        // Plan 43 C2: no backup — the group is the delegate and the root;
+        // the root's append of the record is the second copy.
+        // (A designation's rows are non-stealable: answered at once.)
+        if cfg.ack_via_root && s.designated_gens & (1 << d.gen) == 0 {
+            let pos = s.pos_of(i);
+            s.nodes[i].deleg.as_mut().unwrap().awaiting.push(Awaiting {
+                idx,
+                from,
+                rid,
+                replay,
+                ret,
+                pos,
             });
             return;
         }
@@ -2361,6 +2405,24 @@ fn root_progress(cfg: &DelegModel, s: &mut State, r: usize) {
                     s.nodes[r].applied = s.log.len() as u8;
                 }
                 changed = true;
+                if cfg.ack_via_root {
+                    let (node, epoch) = {
+                        let root = s.nodes[r].root.as_ref().unwrap();
+                        (root.gens[g].node, root.epoch)
+                    };
+                    // (Cumulative: a later ack of the same generation
+                    // covers an earlier one still in the network.)
+                    s.net.retain(|m| {
+                        !matches!(m, Msg::StreamAck { to, gen, epoch: e, .. }
+                            if *to == node && *gen == g as u8 && *e == epoch)
+                    });
+                    s.send(Msg::StreamAck {
+                        to: node,
+                        gen: g as u8,
+                        through: next,
+                        epoch,
+                    });
+                }
             }
         }
         // Drained recalls.
@@ -2595,6 +2657,25 @@ fn tail(cfg: &DelegModel, s: &mut State, i: usize) {
         if let Some(d) = s.nodes[i].deleg.clone() {
             if gen_stream(d.gen) == st {
                 s.nodes[i].deleg = None;
+                // Plan 43 C2: what waited for the root's append of a row the
+                // generation's end left out is never acknowledged: the
+                // requester retries by rid at the owner now (never queued
+                // for replay). One that was appended is answered by the
+                // retry's dedup at the root.
+                if cfg.ack_via_root && !cfg.backups.iter().any(|(dn, _)| *dn == i as u8) {
+                    for a in d.awaiting.iter() {
+                        ack(
+                            cfg,
+                            s,
+                            i,
+                            Msg::NotOwner {
+                                to: a.from,
+                                rid: a.rid,
+                                replay: a.replay,
+                            },
+                        );
+                    }
+                }
                 for p in d.parked {
                     ack(
                         cfg,
@@ -2691,6 +2772,9 @@ fn deliver(cfg: &DelegModel, s: &mut State, m: Msg) {
                 return;
             }
             s.returned(i as u8, rid, op, ret);
+            if ret == Ret::Ok && s.retried.contains(&rid) {
+                s.saw |= SAW_RETRY_LANDED;
+            }
             if ret == Ret::Ok && durable && !s.durable_rids.contains(&rid) {
                 s.durable_rids.push(rid);
             }
@@ -2730,6 +2814,11 @@ fn deliver(cfg: &DelegModel, s: &mut State, m: Msg) {
             {
                 if *r == rid {
                     *sent = NONE;
+                    // (A ghost only where the witness is: it would otherwise
+                    // split states the other configurations merge.)
+                    if cfg.ack_via_root && !s.retried.contains(&rid) {
+                        s.retried.push(rid);
+                    }
                 }
             }
         }
@@ -2872,7 +2961,6 @@ fn deliver(cfg: &DelegModel, s: &mut State, m: Msg) {
             if !s.nodes[i].alive {
                 return;
             }
-            let now = s.local(i);
             let Some(d) = s.nodes[i].deleg.as_mut() else {
                 return;
             };
@@ -2888,38 +2976,36 @@ fn deliver(cfg: &DelegModel, s: &mut State, m: Msg) {
                 return;
             };
             let a = d.awaiting.remove(k);
-            // M9's rule for a parked reply: it leaves only while the
-            // grant is still honoured (the requester retries otherwise).
-            if now >= d.until || d.stopped {
+            ack_awaiting(cfg, s, i, gen, a);
+        }
+        Msg::StreamAck {
+            to,
+            gen,
+            through,
+            epoch,
+        } => {
+            let i = to as usize;
+            if !s.nodes[i].alive {
                 return;
             }
-            let appended = s.log.iter().any(|e| {
-                e.origin
-                    == Origin {
-                        stream: gen_stream(gen),
-                        idx,
-                    }
-            });
-            if s.ended_gens & (1 << gen) != 0 && !appended {
-                s.violate(Violation::RecallSafety(i as u8, gen));
+            // An ack from a root that is not the current one is stale: the
+            // delegate re-streamed to the new root, whose append is the
+            // copy that counts (the core drops it by round).
+            if epoch != s.reg.epoch {
+                return;
             }
-            ack(
-                cfg,
-                s,
-                i,
-                Msg::Ack {
-                    to: a.from,
-                    rid: a.rid,
-                    ret: a.ret,
-                    pos: a.pos,
-                    origin: Some(Origin {
-                        stream: gen_stream(gen),
-                        idx,
-                    }),
-                    replay: a.replay,
-                    durable: true,
-                },
-            );
+            let Some(d) = s.nodes[i].deleg.as_mut() else {
+                return;
+            };
+            if d.gen != gen {
+                return;
+            }
+            let (ready, rest): (Vec<Awaiting>, Vec<Awaiting>) =
+                d.awaiting.drain(..).partition(|a| a.idx <= through);
+            d.awaiting = rest;
+            for a in ready {
+                ack_awaiting(cfg, s, i, gen, a);
+            }
         }
         Msg::SealReq { to, gen } => {
             let b = to as usize;
@@ -2948,6 +3034,48 @@ fn deliver(cfg: &DelegModel, s: &mut State, m: Msg) {
             root_progress(cfg, s, r);
         }
     }
+}
+
+/// A delegate's acknowledgement that waited for the group (its backup's
+/// append, or — Plan 43 C2, no backup — the root's) leaves.
+fn ack_awaiting(cfg: &DelegModel, s: &mut State, i: usize, gen: u8, a: Awaiting) {
+    let now = s.local(i);
+    let Some(d) = s.nodes[i].deleg.as_ref() else {
+        return;
+    };
+    // M9's rule for a parked reply: it leaves only while the grant is still
+    // honoured (the requester retries otherwise).
+    if now >= d.until || d.stopped {
+        return;
+    }
+    let idx = a.idx;
+    let appended = s.log.iter().any(|e| {
+        e.origin
+            == Origin {
+                stream: gen_stream(gen),
+                idx,
+            }
+    });
+    if s.ended_gens & (1 << gen) != 0 && !appended {
+        s.violate(Violation::RecallSafety(i as u8, gen));
+    }
+    ack(
+        cfg,
+        s,
+        i,
+        Msg::Ack {
+            to: a.from,
+            rid: a.rid,
+            ret: a.ret,
+            pos: a.pos,
+            origin: Some(Origin {
+                stream: gen_stream(gen),
+                idx,
+            }),
+            replay: a.replay,
+            durable: true,
+        },
+    );
 }
 
 /// Backup `b` seals (`gen`, or whatever its tail holds) and drains its

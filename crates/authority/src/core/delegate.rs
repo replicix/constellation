@@ -54,7 +54,7 @@
 //! by an operator's `delegate` after the epoch closed.
 
 use super::backup::{FreshHold, FreshVerdict};
-use super::{AckClass, Core, Timer};
+use super::{AckClass, Asker, Core, Timer};
 use crate::action::{Action, AnswerSource, ControlOk};
 use crate::event::PeerMsg;
 use crate::ids::{HonourMs, NodeId, Now, OpId, TimerId, WaitMs};
@@ -109,9 +109,11 @@ pub(crate) struct GenState {
     /// Why it exists (phase 2b): an operator, the placement, a
     /// designation.
     pub kind: DelegKind,
-    /// Phase 2b: the delegate's backup peer, as its renewals report it;
-    /// the root drains it (seal) when the delegate dies.
-    pub backup: Option<NodeId>,
+    /// Plan 43 C2: the generation's configuration — the latest
+    /// `DelegGroup` record this root journaled (seeded from its table
+    /// for an inherited generation). The root drains its backup (seal)
+    /// when the delegate dies.
+    pub group: GroupState,
     /// Phase 2b: ended by a cross-subtree op: delegate the directory to
     /// the same node again once the op executed.
     pub redelegate: bool,
@@ -121,8 +123,14 @@ pub(crate) struct GenState {
     /// Placement: since when the delegate's share has been below the
     /// leave threshold (`None`: it is not).
     pub below_since: Option<WaitMs>,
-    /// Phase 2b: seals asked of the backup (one; then the plain reclaim).
+    /// Phase 2b: seals asked of the backup (one; then the plain reclaim —
+    /// for a generation whose latest record names no backup).
     pub seal_attempts: u8,
+    /// Plan 43 C2 (Q1): the generation cannot end: its latest `DelegGroup`
+    /// record names a backup, which may hold acknowledged rows the root
+    /// does not, and it has not answered the seal. Asked again every window
+    /// until it does (counted in `Stats::deleg_seal_waits`).
+    pub waiting_for_group: bool,
     /// Appended through this stream index.
     pub cursor: u64,
     // The window (`until`: the root outwaits the delegate once its **wait**
@@ -137,6 +145,33 @@ pub(crate) struct GenState {
     pub recall_req: Option<OpId>,
     /// `Undelegate` controls answered when the generation ends.
     pub controls: Vec<OpId>,
+}
+
+/// Plan 43 C2: a generation's configuration as the root knows it (the
+/// latest `DelegGroup` record journaled for it; version 0 and no backups:
+/// the group is the delegate and the root).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct GroupState {
+    pub version: u64,
+    pub backups: Vec<NodeId>,
+    /// Every backup any record of the generation named (C2e's seal set).
+    pub named: BTreeSet<NodeId>,
+}
+
+impl GroupState {
+    pub(crate) fn of(row: Option<constellation_meta::delegation::DelegGroupRow>) -> Self {
+        row.map(|r| GroupState {
+            version: r.version,
+            backups: r.backups,
+            named: r.named.into_iter().collect(),
+        })
+        .unwrap_or_default()
+    }
+
+    /// The backup to seal (delegates keep at most one).
+    pub(crate) fn backup(&self) -> Option<NodeId> {
+        self.backups.first().copied()
+    }
 }
 
 /// Plan 43 C2 (D7): where a delegate's stream row stands for the
@@ -292,6 +327,20 @@ pub(crate) struct DelegateState {
     /// inodes out of the subtree (`Core::deleg_leaving_grants`); its last
     /// index. Dropped from this table once the root acknowledged it.
     pub leaving: Option<(u64, Vec<Ino>)>,
+    /// Plan 43 C2: the generation's group as this replica's table records it
+    /// (version 0 and no backups: no record, the group is the delegate and
+    /// the root). Learned only from the replica — the log, or the committed
+    /// pre-S3 stream — never from a message (D4): a configuration counts
+    /// once its master holds it durably.
+    pub group_version: u64,
+    pub group_backups: Vec<NodeId>,
+    /// A change this delegate asked for (`DelegRenew.backup`) that its table
+    /// does not record yet: until it does, an acknowledgement needs the
+    /// members of the applied group and of this one (D4, the union rule) —
+    /// the root may end the generation by either version.
+    pub group_requested: Option<Vec<NodeId>>,
+    /// The highest index answered under a group (`removal_safe`'s bound).
+    pub acked_max: u64,
 }
 
 /// A renewal or backup append [`Core::deleg_expire_inflight`] gave up
@@ -520,15 +569,9 @@ impl Core {
                 .dl
                 .gens
                 .iter()
-                .map(|(g, s)| (*g, format!("{:?}", s.kind), s.backup.unwrap_or(0)))
+                .map(|(g, s)| (*g, format!("{:?}", s.kind), s.group.backup().unwrap_or(0)))
                 .collect(),
         }
-    }
-
-    /// Phase 2b: the delegate's fast path is gated (a backup acknowledges
-    /// first, or `ack=s3`): its writes go through the core and park.
-    pub fn deleg_fast_path_gated(&self) -> bool {
-        self.cfg.ack_s3 || self.dl.mine.values().any(|d| d.backup.is_some())
     }
 
     /// Phase 2b: the placement's busiest subtrees (`status`).
@@ -611,6 +654,7 @@ impl Core {
                 continue;
             }
             let stream_round = self.deleg_new_round();
+            let group = replica.deleg_group(d.gen);
             tracing::info!(node = me, dir = d.dir, gen = d.gen, "delegation installed");
             self.stats.deleg_installed += 1;
             // A delegate's reply base is the last applied segment that
@@ -666,6 +710,10 @@ impl Core {
                     stream_round,
                     core_granted_round: None,
                     leaving: None,
+                    group_version: group.as_ref().map_or(0, |g| g.version),
+                    group_backups: group.map(|g| g.backups).unwrap_or_default(),
+                    group_requested: None,
+                    acked_max: 0,
                 },
             );
             if d.designated {
@@ -676,6 +724,8 @@ impl Core {
             self.deleg_renew_now(now, d.gen, out);
             self.arm_deleg_lapse(now, d.gen, out);
         }
+        // Plan 43 C2 (D4): the group each held generation's table records.
+        self.deleg_group_refresh(replica);
         // The root side.
         self.dl.root_synced = self.root_usable(now);
         if self.dl.root_synced {
@@ -734,11 +784,12 @@ impl Core {
                         } else {
                             DelegKind::Manual
                         },
-                        backup: None,
+                        group: GroupState::of(replica.deleg_group(d.gen)),
                         redelegate: false,
                         granted: now.wait,
                         below_since: None,
                         seal_attempts: 0,
+                        waiting_for_group: false,
                         cursor,
                         recall: RecallPhase::None,
                         recall_before_seal: RecallPhase::None,
@@ -1131,6 +1182,21 @@ impl Core {
         // re-streams and the replay dedups) and never before.
         let epoch = self.ship.max_epoch.max(1);
         let mut exec_idx: Option<u64> = None;
+        // Plan 43 C2 (§2.1): what an answer of the row this delegate journals
+        // now waits for, by who is asked; set for the journaling below (the
+        // row's class is fixed there) and for the answer after it.
+        let asker = if from == 0 { Asker::Own } else { Asker::Remote };
+        let mut class = self.deleg_ack_class(now, gen, asker);
+        let dedup = replica.recent_outcome(rid).is_some()
+            || replica.completed_outcome(rid).ok().flatten().is_some();
+        if dedup {
+            // Plan 43 C2 (D6): an answer from the rid's earlier execution
+            // waits for that row's commit as if it had just executed it —
+            // the row may be this delegate's, still in its own uncommitted
+            // journal, and the retry is no reason to leave it.
+            (class, exec_idx) = self.deleg_dedup_wait(class, gen, rid, from, replica);
+        }
+        let _row_class = (!dedup).then(|| constellation_meta::PendingClass::set(class.into()));
         let outcome = if let Some(records) = replica.recent_outcome(rid) {
             self.stats.forward_dedup_hits += 1;
             MutateOutcome::Accepted { epoch, records }
@@ -1231,12 +1297,12 @@ impl Core {
         } else {
             self.own_chunks_for(from, rid, &outcome, (gen, &position), replica)
         };
-        // Plan 43 C2a: what this answer waits for (not what it waited for:
-        // a dedup answer, or one whose row is already on the backup, is
-        // still of the class the generation gives now).
-        let class = self.deleg_ack_class(gen);
+        // Plan 43 C2 (§3.4): `class` is the row's, fixed when it was
+        // journaled. A row whose class waits (`DelegGroup`, `Archive`) is
+        // answered once its group holds it: the root's journaled append of
+        // the stream, or the recorded backup's acknowledgement, or the log.
         if let Some(idx) = exec_idx {
-            if self.deleg_ack_gated(gen) && !self.deleg_stream_durable(gen, idx, replica) {
+            if class.gated() && !self.deleg_stream_durable(gen, idx, replica) {
                 self.stats.deleg_acks_parked += 1;
                 let what = if from == 0 {
                     if let Some(c) = self.clients.get_mut(&rid) {
@@ -1269,7 +1335,15 @@ impl Core {
                     self.held_for_upload(rid, own_chunks, out);
                 }
                 self.deleg_backup_stream(now, replica, out);
+                // The root's append is what a delegate without a recorded
+                // backup waits for: send the row now, not on the tick.
+                self.deleg_stream(now, replica, out);
                 return;
+            }
+            if class.gated() {
+                if let Some(d) = self.dl.mine.get_mut(&gen) {
+                    d.acked_max = d.acked_max.max(idx);
+                }
             }
         }
         if from == 0 {
@@ -1305,31 +1379,113 @@ impl Core {
         }
     }
 
-    /// Plan 43 C2a: the class of an answer this delegate gives for `gen`,
-    /// by what it waits for today ([`Self::deleg_ack_gated`]): the archive
-    /// under `ack=s3`, the group of the recorded backup, a designation's
-    /// non-stealable rows, and otherwise nothing but this disk — `Lone`,
-    /// whoever is answered.
-    pub fn deleg_ack_class(&self, gen: u64) -> AckClass {
+    /// Plan 43 C2 (§2.1): what an answer of a row this delegate journals now
+    /// waits for, by whom it is asked. A designation's rows are
+    /// non-stealable; under `ack=s3` the archive; a lone delegate (below)
+    /// answers its own node's client from its disk (`Lone`, the one
+    /// speculation place) and every other node's forward from the group of
+    /// the generation — the root, whose journaled append is the second copy
+    /// (Q16); otherwise the group (a recorded backup, or the root).
+    ///
+    /// Decided at journal time and never again for that row: a delegate
+    /// that turns lone after journaling a `DelegGroup` row still waits for
+    /// that row's commit, and the row's strand behaviour follows it.
+    pub fn deleg_ack_class(&self, now: Now, gen: u64, asker: Asker) -> AckClass {
         if self.cfg.ack_s3 {
             return AckClass::Archive;
         }
         match self.dl.mine.get(&gen) {
-            Some(d) if d.backup.is_some() => AckClass::DelegGroup { gen },
             Some(d) if d.designated => AckClass::NonStealable,
-            _ => AckClass::Lone,
+            Some(d) if self.deleg_lone(now, d) && asker == Asker::Own => AckClass::Lone,
+            Some(_) => AckClass::DelegGroup { gen },
+            // The generation ended here: what is left of it is in the log.
+            None => AckClass::Archive,
         }
     }
 
-    /// Phase 2b: whether this delegate's acknowledgements of `gen` wait
-    /// for durability beyond its own disk.
-    pub(crate) fn deleg_ack_gated(&self, gen: u64) -> bool {
-        self.cfg.ack_s3 || self.dl.mine.get(&gen).is_some_and(|d| d.backup.is_some())
+    /// Plan 43 C2 (D6): the class and wait of the answer to a retry of `rid`
+    /// that this delegate answers from the rid's earlier execution (`class`:
+    /// what a new row would be given). The earlier row may still be in this
+    /// delegate's own journal and uncommitted; the retry's answer then
+    /// waits for it exactly as the first execution's did. A row of this
+    /// generation that waits for its group (gated), or any row asked for by
+    /// another node, parks under `DelegGroup`: a remote must never be
+    /// answered a `Lone` row, and prefix commit makes the row committed once
+    /// the root's append (or the backup) holds a later index. This node's
+    /// own client, retrying a `Lone` row, is answered at once as `Lone`.
+    /// The row gone from the journal (the log carries it, or it was
+    /// shipped) is answered from the log.
+    fn deleg_dedup_wait(
+        &self,
+        class: AckClass,
+        gen: u64,
+        rid: Rid,
+        from: NodeId,
+        replica: &dyn Replica,
+    ) -> (AckClass, Option<u64>) {
+        let committed_class = || {
+            if self.cfg.ack_s3 {
+                AckClass::Archive
+            } else {
+                AckClass::DelegGroup { gen }
+            }
+        };
+        match replica.outcome_row(rid) {
+            Some(r) if r.gen == gen => {
+                if class == AckClass::NonStealable {
+                    (class, None)
+                } else if r.class.gated() || from != 0 {
+                    (committed_class(), Some(r.idx))
+                } else {
+                    (AckClass::Lone, None)
+                }
+            }
+            _ if class == AckClass::NonStealable => (class, None),
+            _ => (AckClass::Archive, None),
+        }
     }
 
-    /// Phase 2b: transaction `(gen, idx)` is durable enough to
-    /// acknowledge: on the backup, or in the log (a segment this replica
-    /// applied).
+    /// Plan 43 C2 (§2.1): this delegate is lone for `d`'s generation: its
+    /// replica records no backup for it and none is requested, it appends
+    /// to none, and no peer — the root included — is a backup candidate
+    /// (linked, within `backup_rtt_budget_ms`, up for `backup_stable_ms`:
+    /// the rule `Core::backup_candidates` selects by, D10). The group is
+    /// itself then, and its own node's client is answered from its disk.
+    pub(crate) fn deleg_lone(&self, now: Now, d: &DelegateState) -> bool {
+        d.group_backups.is_empty()
+            && d.group_requested.is_none()
+            && d.backup.is_none()
+            && self.backup_candidates(now).is_empty()
+    }
+
+    /// The backup this delegate tells the root it wants (`DelegRenew.backup`,
+    /// the *request* for a `DelegGroup` record): the change it asked for and
+    /// the table does not record yet, else the group it applied.
+    pub(crate) fn deleg_requested_backup(d: &DelegateState) -> Option<NodeId> {
+        match &d.group_requested {
+            Some(v) => v.first().copied(),
+            None => d.group_backups.first().copied(),
+        }
+    }
+
+    /// Plan 43 C2: whether the fast path of this node's delegations is
+    /// closed — ops go through the core and park — because a generation
+    /// answers its own node's client from a group (or the archive), not
+    /// from its disk. Interim: the fast path writes first and waits for the
+    /// group afterwards (C2d).
+    pub fn deleg_fast_path_gated(&self, now: Now) -> bool {
+        self.cfg.ack_s3
+            || self
+                .dl
+                .mine
+                .values()
+                .any(|d| !d.designated && !self.deleg_lone(now, d))
+    }
+
+    /// Plan 43 C2 (§3.4): transaction `(gen, idx)` is committed — the answer
+    /// of a row of the class `DelegGroup` may leave — from what this
+    /// delegate knows: the log carries it, or every member of the group
+    /// holds it. See [`Self::deleg_stream_state_with`].
     pub(crate) fn deleg_stream_durable(&self, gen: u64, idx: u64, replica: &dyn Replica) -> bool {
         self.deleg_stream_state_with(gen, idx, || replica.log_stream_idx(gen), || true)
             == StreamState::Committed
@@ -1366,18 +1522,22 @@ impl Core {
         )
     }
 
-    /// Plan 43 C2 (D7): where row `(gen, idx)` of a delegate's stream stands.
-    /// Committed: on the recorded backup, or in the log — counted by the
-    /// log's index of the generation (`log_idx`: the highest row of it a
-    /// segment this replica applied carries), never by "the row left this
-    /// journal". A generation no longer held here, and `ack=s3`, commit only
-    /// through the log. Not committed and still in the journal
-    /// (`pending`): waiting. Not committed and gone from the journal: the
-    /// row was dropped — a recall's or a takeover's strand, a rebuild —
-    /// and what its acknowledgement waited for will never come: the
-    /// acknowledgement is aborted (the requester, or this node's own
-    /// client, retries by rid), not released as if the log carried a write
-    /// it never will.
+    /// Plan 43 C2 (§3.4, D7): where row `(gen, idx)` of a delegate's stream
+    /// stands. Committed: the log carries it (`idx` at or below the log's
+    /// index of the generation, never "the row left this journal"), or every
+    /// member of the applied group — and of a requested one, while a change
+    /// is pending (D4: the root may end the generation by either version) —
+    /// holds it: a recorded backup by its acknowledgement of this delegate's
+    /// appends, the root (no backup recorded: the group is the delegate and
+    /// the root, Q16) by the cursor of its journaled append of the stream
+    /// (`DelegateStreamAck.through`, `streamed_through`). A generation no
+    /// longer held here, and `ack=s3`, commit only through the log. Not
+    /// committed and still in the journal (`pending`): waiting. Not
+    /// committed and gone from the journal: the row was dropped — a
+    /// recall's or a takeover's strand, a rebuild — and what its
+    /// acknowledgement waited for will never come: the acknowledgement is
+    /// aborted (the requester, or this node's own client, retries by rid),
+    /// not released as if the log carried a write it never will.
     fn deleg_stream_state_with(
         &self,
         gen: u64,
@@ -1386,10 +1546,19 @@ impl Core {
         pending: impl FnOnce() -> bool,
     ) -> StreamState {
         let committed = match self.dl.mine.get(&gen) {
-            Some(d) if !self.cfg.ack_s3 => match d.backup {
-                None => return StreamState::Committed,
-                Some(_) => d.backup_acked >= idx || idx <= log_idx(),
-            },
+            Some(d) if !self.cfg.ack_s3 => {
+                let holds = |members: &[NodeId]| {
+                    if members.is_empty() {
+                        d.streamed_through >= idx
+                    } else {
+                        members
+                            .iter()
+                            .all(|b| d.backup == Some(*b) && d.backup_acked >= idx)
+                    }
+                };
+                (holds(&d.group_backups) && d.group_requested.as_deref().is_none_or(holds))
+                    || idx <= log_idx()
+            }
             _ => idx <= log_idx(),
         };
         if committed {
@@ -1398,6 +1567,76 @@ impl Core {
             StreamState::Waiting
         } else {
             StreamState::Dropped
+        }
+    }
+
+    /// Plan 43 C2 (§3.3): request a change of the generation's group when
+    /// one is due — the transposition of the root lease's add-then-record,
+    /// remove-when-safe rules (`backup_promote`, `removal_safe`). The
+    /// delegate *requests* it in its next renewal (`DelegRenew.backup`); the
+    /// root journals the `DelegGroup` record; the delegate counts the new
+    /// member only once its own table records it, and an acknowledgement
+    /// needs the members of both versions meanwhile.
+    ///
+    /// - Adding or replacing: the backup appended to holds every index
+    ///   answered so far (`backup_acked >= acked_max`), or the log does.
+    /// - Removing (the backup is gone: dropped, sealed): every index
+    ///   answered is at or below the root's journaled cursor or in the log
+    ///   (`removal_safe`), so no acknowledged row is left only on a backup
+    ///   the record stops naming.
+    fn deleg_group_maintain(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
+        let gens: Vec<u64> = self.dl.mine.keys().copied().collect();
+        for gen in gens {
+            let d = self.dl.mine.get(&gen).expect("present");
+            if d.stopped || d.group_requested.is_some() {
+                continue;
+            }
+            let want: Vec<NodeId> = d.backup.into_iter().collect();
+            if want == d.group_backups {
+                continue;
+            }
+            let adding = want.iter().any(|b| !d.group_backups.contains(b));
+            let (acked_max, backup_acked, streamed) =
+                (d.acked_max, d.backup_acked, d.streamed_through);
+            let safe = acked_max == 0 || {
+                let logged = replica.log_stream_idx(gen);
+                if adding {
+                    backup_acked >= acked_max || acked_max <= logged
+                } else {
+                    acked_max <= streamed.max(logged)
+                }
+            };
+            if !safe {
+                continue;
+            }
+            tracing::info!(
+                node = self.cfg.node_id,
+                gen,
+                ?want,
+                applied = ?self.dl.mine[&gen].group_backups,
+                "delegate asks the root to record a group change"
+            );
+            self.dl.mine.get_mut(&gen).expect("present").group_requested = Some(want);
+            self.deleg_renew_now(now, gen, out);
+        }
+    }
+
+    /// Plan 43 C2 (D4): the delegate learns its group from its replica's
+    /// table, nowhere else — a record applied from the log (or the
+    /// committed pre-S3 stream). A pending request ends when the table
+    /// records it.
+    pub(crate) fn deleg_group_refresh(&mut self, replica: &dyn Replica) {
+        for d in self.dl.mine.values_mut() {
+            let (version, backups) = replica
+                .deleg_group(d.gen)
+                .map_or((0, Vec::new()), |r| (r.version, r.backups));
+            if version != d.group_version || backups != d.group_backups {
+                d.group_version = version;
+                d.group_backups = backups;
+            }
+            if d.group_requested.as_ref() == Some(&d.group_backups) {
+                d.group_requested = None;
+            }
         }
     }
 
@@ -1585,6 +1824,7 @@ impl Core {
         if paced {
             self.arm_stream_tick(now, out);
         }
+        self.deleg_group_maintain(now, replica, out);
         self.complete_ready(now, replica, out);
         self.deleg_backup_stream(now, replica, out);
     }
@@ -1727,7 +1967,7 @@ impl Core {
         let Some(gs) = self.dl.gens.get(&gen) else {
             return;
         };
-        if gs.ended || gs.backup != Some(from) {
+        if gs.ended || gs.group.backup() != Some(from) {
             return;
         }
         let (dir, kind, range) = (gs.dir, gs.kind, gs.range);
@@ -1967,6 +2207,7 @@ impl Core {
         self.deleg_stream(now, replica, out);
         // Phase 2b: the delegate's backup.
         self.deleg_backup_select(now, out);
+        self.deleg_group_maintain(now, replica, out);
         self.deleg_backup_stream(now, replica, out);
         // Root-side parked executions waiting for `deps` (and, phase 2b,
         // a delegate's acknowledgements waiting for a segment).
@@ -2002,8 +2243,9 @@ impl Core {
     /// incarnations share them only 2^24 restarts apart).
     fn deleg_new_round(&mut self) -> u64 {
         const OP_BITS: u32 = 40;
-        let op = self.op_id().0;
-        debug_assert!(op < 1 << OP_BITS, "op id {op} overflows a round");
+        // (An op id carries the incarnation in its high bits already: the low
+        // bits are the counter.)
+        let op = self.op_id().0 & ((1 << OP_BITS) - 1);
         debug_assert!(
             u64::from(self.cfg.incarnation) < 1 << (64 - OP_BITS),
             "incarnation {} overflows a round",
@@ -2322,6 +2564,12 @@ impl Core {
             self.stats.deleg_stream_acks_unmatched += 1;
         }
         self.deleg_drop_left(gen, replica);
+        // Plan 43 C2 (§3.4): the root's journaled append is the second copy a
+        // delegate without a recorded backup waits for: what waited for
+        // these rows is answered now.
+        if progressed && self.has_stream_parks() {
+            self.complete_ready(now, replica, out);
+        }
         self.deleg_stream(now, replica, out);
     }
 
@@ -2477,7 +2725,10 @@ impl Core {
         }
         self.dl.by_req.insert(req, (gen, ReqKind::Renew));
         let d = self.dl.mine.get_mut(&gen).expect("present");
-        let backup = d.backup;
+        // Plan 43 C2: the renewal carries the *request* for a group change
+        // (the root journals a `DelegGroup` record for it), or the group the
+        // delegate applied.
+        let backup = Self::deleg_requested_backup(d);
         d.renew_backup = backup;
         let round = d.stream_round;
         tracing::debug!(
@@ -2509,6 +2760,50 @@ impl Core {
         }
     }
 
+    /// Plan 43 C2 (§3.3): the root journals the generation's configuration
+    /// as asked by its delegate's renewal: `DelegGroup { version: latest + 1,
+    /// backups }`. Only while the generation lives and is not ending (the
+    /// end uses the latest record). The record is a root row like any other
+    /// (its class is the root's now); no answer waits for it, and the
+    /// delegate counts the new member only once its own table records it,
+    /// i.e. once the record is committed (D4).
+    fn deleg_journal_group(
+        &mut self,
+        gen: u64,
+        dir: Ino,
+        backups: Vec<NodeId>,
+        replica: &dyn Replica,
+    ) {
+        let Some(g) = self.dl.gens.get(&gen) else {
+            return;
+        };
+        let version = g.group.version + 1;
+        let _class = self.journal_class();
+        let rec = LogRecord::DelegGroup {
+            dir,
+            gen,
+            version,
+            backups: backups.clone(),
+        };
+        if let Err(error) = replica.apply_records_journaled(&[rec], None) {
+            tracing::warn!(node = self.me(), gen, %error, "could not journal a delegation group record");
+            return;
+        }
+        self.stats.deleg_group_records += 1;
+        tracing::info!(
+            node = self.me(),
+            gen,
+            version,
+            ?backups,
+            "delegation group recorded"
+        );
+        if let Some(g) = self.dl.gens.get_mut(&gen) {
+            g.group.named.extend(backups.iter().copied());
+            g.group.version = version;
+            g.group.backups = backups;
+        }
+    }
+
     pub(crate) fn on_deleg_renew_timer(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
         if let Some(d) = self.dl.mine.get_mut(&gen) {
             d.renew_timer = None;
@@ -2535,6 +2830,7 @@ impl Core {
     ) {
         let mut ttl_ms = 0u64;
         let mut hold = None;
+        let mut group_change: Option<(Ino, Vec<NodeId>)> = None;
         if self.root_usable(now) && !self.dl.epoch_active {
             // Plan 41 L0: as a lock renewal (`lock_renew_one`), the
             // root extends a delegation only as far as a fresh owner may:
@@ -2560,17 +2856,23 @@ impl Core {
                         self.dw
                             .extend_core(gen, now.wait.plus(ttl_ms + extra), true);
                     }
-                    // The backup is the delegate's core's to name: the
-                    // lane's certificate can be a step old, and a root that
-                    // took a stale `None` (or the previous backup) would
-                    // not seal the one the core chose and clients were
-                    // acknowledged by.
+                    // Plan 43 C2: the delegate's request for its group is
+                    // the core's to make: the lane's certificate can be a
+                    // step old, and a record journaled for a stale `None` (or
+                    // the previous backup) would name a member clients are
+                    // no longer acknowledged by. A request that differs from
+                    // the generation's latest record is journaled as the
+                    // next version, below.
                     if let RenewFrom::Core { backup } = source {
-                        if g.backup != backup {
-                            g.backup = backup;
+                        let want: Vec<NodeId> = backup.into_iter().collect();
+                        if want != g.group.backups {
+                            group_change = Some((g.dir, want));
                         }
                     }
                 }
+            }
+            if let Some((dir, want)) = group_change {
+                self.deleg_journal_group(gen, dir, want, replica);
             }
             tracing::debug!(
                 node = self.me(),
@@ -3443,9 +3745,9 @@ impl Core {
         }
         self.arm_deleg_lapse(now, gen, out);
         let d = self.dl.mine.get_mut(&gen).expect("present");
-        if d.backup.is_some() && d.renew_backup != d.backup {
-            // Phase 2b: the root seals the backup on a silent delegate
-            // only once it knows it — tell it now, not at the next timer.
+        if d.group_requested.is_some() && d.renew_backup != Self::deleg_requested_backup(d) {
+            // Plan 43 C2: the root journals the group change when it learns
+            // the request — tell it now, not at the next timer.
             self.deleg_renew_now(now, gen, out);
         }
         self.deleg_after_event(now, replica, out);
@@ -4133,12 +4435,21 @@ impl Core {
         // it may still be honoured with this root's windows: a grace on
         // the subtree (the seal path re-delegates; the grace stands).
         let outwaited_dir = (g.recall != RecallPhase::Sealing).then_some(g.dir);
+        // Plan 43 C2 (Q1, interim until C2e): a generation whose latest
+        // record names a backup is not ended without that member's tail —
+        // rows acknowledged through the group may be nowhere else — so its
+        // seal is asked again until it answers (below), however many times
+        // the window passed. Without a record (the group is the delegate and
+        // the root) the root's cursor covers everything acknowledged, and the
+        // seal stays a single attempt.
+        let recorded = g.group.backup().is_some();
         let seal = match (
-            g.backup,
+            g.group.backup(),
             g.seal_attempts,
             g.recall != RecallPhase::Drained(0),
         ) {
             (Some(backup), 0, true) => Some(backup),
+            (Some(backup), _, true) if recorded && g.recall != RecallPhase::Sealing => Some(backup),
             _ => None,
         };
         if let Some(dir) = outwaited_dir {
@@ -4191,6 +4502,41 @@ impl Core {
                     now = now.wait.0,
                     "reclaiming an unrenewed delegation"
                 );
+            }
+            RecallPhase::Sealing if recorded => {
+                // Plan 43 C2 (Q1): the recorded backup did not answer in
+                // time: the generation is not ended without its tail. Ask
+                // again (the first request stays known: a late answer to it
+                // is as good), and wait.
+                let Some(backup) = g.group.backup() else {
+                    return;
+                };
+                let req = self.op_id();
+                self.dl.by_req.insert(req, (gen, ReqKind::Seal));
+                self.stats.deleg_seals_sent += 1;
+                self.stats.deleg_seal_waits += 1;
+                let gs = self.dl.gens.get_mut(&gen).expect("present");
+                if !gs.waiting_for_group {
+                    gs.waiting_for_group = true;
+                    tracing::warn!(
+                        node = self.me(),
+                        gen,
+                        backup,
+                        "a delegation's recorded backup has not answered its seal: the generation is not ended without its tail"
+                    );
+                }
+                self.dw.close(gen);
+                self.dw.set_until_closed(
+                    gen,
+                    now.wait
+                        .plus(self.cfg.backup_takeover_ms.max(self.cfg.forward_timeout_ms)),
+                );
+                out.push(Action::Send {
+                    to: backup,
+                    msg: PeerMsg::DelegSeal { req, gen },
+                });
+                self.arm_gen_expiry(now, gen, out);
+                return;
             }
             RecallPhase::Sealing => {
                 // The seal was not answered in time.
@@ -4697,11 +5043,12 @@ impl Core {
                 node,
                 range,
                 kind,
-                backup: None,
+                group: GroupState::default(),
                 redelegate: false,
                 granted: now.wait,
                 below_since: None,
                 seal_attempts: 0,
+                waiting_for_group: false,
                 cursor: 0,
                 recall: RecallPhase::None,
                 recall_before_seal: RecallPhase::None,

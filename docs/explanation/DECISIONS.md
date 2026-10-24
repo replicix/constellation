@@ -1490,9 +1490,11 @@ recommendation, and the latency gates G1–G6), built in steps. Landed: C0
 holds across a listing and a removal; the class at journal time; the TTL
 claimant's sealed tail and the inherited tail; member copies, committed
 shadows and streams, tail identity: nothing committed is re-executed), C2's
-C2a and C2b (the answer's source; a generation's end carries its cut). Not
-yet: the rest of C2 (no acknowledgement outside a group where one exists;
-settling before `EIO`), C3–C5. Each milestone amends this record; C1's
+C2a, C2b and C2c (the answer's source; a generation's end carries its cut; a
+delegate acknowledges once its group holds the row). Not yet: the rest of C2
+(the delegate's fast path writing and then waiting, the end of a generation
+waiting for every member a record named, the lone root answering other nodes
+from the archive, settling before `EIO`), C3–C5. Each milestone amends this record; C1's
 rejected options are below.
 DESIGN.md states each part in the milestone that makes it true (plan 43
 §6).
@@ -1557,6 +1559,36 @@ copy at any marker without a tail announcement (the successor may itself be
 replaced before it ships, D2). The formats are append-only: `TailOf` and
 `TailFollowsThrough` are new `LogRecord` variants, `TailFollows` stays
 decodable.
+
+**C2c (plan 43)**: a delegate acknowledges once its group holds the row. The
+generation's configuration is a log record, `DelegGroup { dir, gen, version,
+backups }`, journaled by the root when the delegate's renewal asks for a
+different backup (the request is the renewal's `backup`); with no record the
+group is the delegate and the root, and the root's journaled append of the
+row (`DelegateStreamAck.through`) is the second copy. The delegate learns its
+group from its own replica's table only, never from a message: a
+configuration counts once its master has it durably. While a change it asked
+for is not recorded yet an acknowledgement needs the members of both versions,
+and a backup leaves the record only once every index answered through it is at
+or below the root's cursor or in the log. A delegate is **lone** when its
+table records no backup, none is requested or appended to, and no peer — the
+root included — is a backup candidate (linked, within the RTT budget, stable);
+it then answers its own node's client from its disk and every other node's
+forward from the root's append, and its fast path stays open only then. The
+class is fixed when the row is journaled, a retry's answer waits for its row
+like the first answer did (D6), and the end of a generation drops the
+uncommitted rows past its cut instead of replaying them (their clients were
+never answered), keeping only a lone delegate's rows for replay. A generation
+whose latest record names a backup is not ended before that backup answers its
+seal: rows acknowledged through the group may be nowhere else (Q1, which C2e
+completes with the operator's escape). Rejected: counting a backup from the
+renewal that names it, or from the root's uncommitted record (the record could
+be lost at the root's deposition and the root would seal a different member
+than the one clients were answered by); letting a retry's dedup answer leave at
+once (it would acknowledge a row the generation's end may still drop). The
+format is append-only: `DelegGroup` is a new `LogRecord` variant and the
+table's persisted row is unchanged (a key of its own per generation).
+
 
 ## ADR-34: Kernel FUSE race workarounds
 

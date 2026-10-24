@@ -288,6 +288,16 @@ fn assert_clean(label: &str, model: &DelegModel, witnesses: &[&'static str]) {
             );
         }
     }
+    // Plan 43 C2: the commit rule's property, where the model checks it.
+    if model.check_acked_replay {
+        if let Some(d) = checker.discovery("acked_ops_are_never_replayed") {
+            panic!(
+                "{label}: an acknowledged op was replayed: history {:?}\npath {:?}",
+                d.last_state().history,
+                d.clone().into_actions()
+            );
+        }
+    }
     for p in witnesses {
         assert!(
             checker.discovery(p).is_some(),
@@ -352,6 +362,10 @@ fn append_without_deps_config() -> DelegModel {
         initial_delegations: vec![(1, 1)],
         deps_at_root: false,
         max_tick: 1,
+        // Plan 43 C2: a counterexample path of another rule, walked with the
+        // delegate acknowledging alone (the commit rule's own configurations
+        // are the `design_*` ones with `ack_via_root`).
+        ack_via_root: false,
         ..DelegModel::design(
             P3.to_vec(),
             vec![vec![], vec![create(D1A), create(RA)], vec![pair(RA, D1A)]],
@@ -395,6 +409,10 @@ fn delegate_ignores_deps_config() -> DelegModel {
         initial_delegations: vec![(1, 1), (2, 2)],
         deps_at_delegate: false,
         max_tick: 1,
+        // Plan 43 C2: a counterexample path of another rule, walked with the
+        // delegate acknowledging alone (the commit rule's own configurations
+        // are the `design_*` ones with `ack_via_root`).
+        ack_via_root: false,
         ..DelegModel::design(
             P3.to_vec(),
             vec![vec![], vec![create(D1A), create(D2A)], vec![pair(D2A, D1A)]],
@@ -449,6 +467,10 @@ fn recall_without_drain_config() -> DelegModel {
         initial_delegations: vec![(1, 1)],
         drain_before_execute: false,
         max_tick: 1,
+        // Plan 43 C2: a counterexample path of another rule, walked with the
+        // delegate acknowledging alone (the commit rule's own configurations
+        // are the `design_*` ones with `ack_via_root`).
+        ack_via_root: false,
         ..DelegModel::design(
             P3.to_vec(),
             vec![vec![], vec![create(D1A)], vec![mv(D1A, RA)]],
@@ -577,6 +599,10 @@ fn expired_ack_config(deleg_margin: i16, root_margin: i16) -> DelegModel {
         max_jumps: 2,
         max_drops: 1,
         max_tick: 3,
+        // Plan 43 C2: a counterexample path of another rule, walked with the
+        // delegate acknowledging alone (the commit rule's own configurations
+        // are the `design_*` ones with `ack_via_root`).
+        ack_via_root: false,
         ..DelegModel::design(
             P3.to_vec(),
             vec![vec![], vec![create(D1A)], vec![mv(RA, D1A)]],
@@ -681,6 +707,9 @@ fn design_local_writes_are_clean() {
         initial_delegations: vec![(1, 1), (2, 2)],
         initial_present: vec![D2A],
         max_tick: 0,
+        // Plan 43 C2: an acknowledged op is never replayed (the delegates
+        // answer once the root's append holds the row).
+        check_acked_replay: true,
         ..DelegModel::design(
             P3.to_vec(),
             vec![
@@ -704,6 +733,7 @@ fn design_forwarded_writes_are_clean() {
     let m = DelegModel {
         initial_delegations: vec![(1, 1)],
         max_tick: 0,
+        check_acked_replay: true,
         ..DelegModel::design(
             P3.to_vec(),
             vec![
@@ -746,16 +776,19 @@ fn design_cross_subtree_move_drains_the_delegation() {
 }
 
 /// The same, with one message lost: a lost recall, recall ack or stream
-/// record is outwaited by the root, and what the delegate acknowledged
-/// past the cut is replayed by its requester through the new owner.
+/// record is outwaited by the root, and what the delegate had not had the
+/// root append is never acknowledged (Plan 43 C2): its requester retries by
+/// rid through the new owner. (Before C2 the delegate acknowledged alone and
+/// the acknowledged op was replayed: `design_..._and_replayed`.)
 #[test]
-fn design_unreachable_delegate_is_outwaited_and_replayed() {
+fn design_unreachable_delegate_is_outwaited_and_fails_unacked_ops() {
     let m = DelegModel {
         initial_delegations: vec![(1, 1)],
         initial_present: vec![RA],
         deleg_ttl: 2,
         max_drops: 1,
         max_tick: 4,
+        check_acked_replay: true,
         ..DelegModel::design(
             P3.to_vec(),
             vec![vec![], vec![create(D1A)], vec![mv(RA, D1B)]],
@@ -764,21 +797,25 @@ fn design_unreachable_delegate_is_outwaited_and_replayed() {
     assert_clean(
         "unreachable-delegate",
         &m,
-        &["all_ops_done", "recall_timed_out", "replay_landed"],
+        &["all_ops_done", "recall_timed_out", "retry_landed"],
     );
 }
 
 /// The delegate crashes without a backup: the root reclaims the expired
-/// grant, the requester's acknowledged create is retracted and replayed
-/// through the root, and its later read is read-your-writes-exempt.
+/// grant. The requester's create was acknowledged only if the root had
+/// appended it (Plan 43 C2): an acknowledged op is in the root's log, never
+/// retracted and replayed; one that was not acknowledged is retried by rid
+/// through the root. Its later read is read-your-writes-exempt only
+/// for the second.
 #[test]
-fn design_delegate_crash_without_backup_replays_by_rid() {
+fn design_delegate_crash_without_backup_loses_no_acked_op() {
     let m = DelegModel {
         initial_delegations: vec![(1, 1)],
         reclaim_expired: true,
         deleg_ttl: 2,
         max_crashes: 1,
         max_tick: 4,
+        check_acked_replay: true,
         ..DelegModel::design(
             P3.to_vec(),
             vec![vec![], vec![], vec![create(D1A), read(D1A)]],
@@ -787,7 +824,7 @@ fn design_delegate_crash_without_backup_replays_by_rid() {
     assert_clean(
         "delegate-crash-no-backup",
         &m,
-        &["all_ops_done", "recall_timed_out", "replay_landed"],
+        &["all_ops_done", "recall_timed_out"],
     );
 }
 
@@ -829,6 +866,10 @@ fn design_root_failover_with_a_live_delegate() {
         deleg_ttl: 2,
         max_epoch: 2,
         max_tick: 4,
+        // Plan 43 C2: this configuration's subject is not the commit rule; its
+        // delegate acknowledges alone so the exhaustive search stays within the
+        // state budget (the StreamAck interleavings multiply it past 5M).
+        ack_via_root: false,
         ..DelegModel::design(
             P3.to_vec(),
             vec![vec![create(RA)], vec![create(D1A)], vec![]],
@@ -894,6 +935,10 @@ fn design_redelegation_after_a_timed_out_recall() {
         allow_renew: true,
         deleg_ttl: 2,
         max_tick: 3,
+        // Plan 43 C2: this configuration's subject is not the commit rule; its
+        // delegate acknowledges alone so the exhaustive search stays within the
+        // state budget (the StreamAck interleavings multiply it past 5M).
+        ack_via_root: false,
         ..DelegModel::design(
             P3.to_vec(),
             vec![vec![], vec![create(D1A)], vec![mv(RA, D1B)]],
@@ -940,6 +985,10 @@ fn deep_root_failover_two_delegates() {
         max_epoch: 2,
         max_crashes: 1,
         max_tick: 6,
+        // Plan 43 C2: this configuration's subject is not the commit rule; its
+        // delegate acknowledges alone so the exhaustive search stays within the
+        // state budget (the StreamAck interleavings multiply it past 5M).
+        ack_via_root: false,
         ..DelegModel::design(
             P3.to_vec(),
             vec![
@@ -1066,7 +1115,8 @@ fn design_root_failover_with_a_designation() {
 /// reclaims the expired grant, and the requester's *acknowledged* create is
 /// retracted and replayed by rid — an acknowledged op replayed
 /// (`acked_ops_are_never_replayed`, not in `ALWAYS` until C2 makes it hold).
-/// The configuration is `design_delegate_crash_without_backup_replays_by_rid`'s.
+/// The configuration is `design_delegate_crash_without_backup_loses_no_acked_op`'s
+/// with `ack_via_root` off.
 #[test]
 fn today_a_delegate_without_a_backup_acks_alone() {
     let m = DelegModel {
@@ -1076,6 +1126,8 @@ fn today_a_delegate_without_a_backup_acks_alone() {
         max_crashes: 1,
         max_tick: 4,
         check_acked_replay: true,
+        // Plan 43 C2: today's Layer A, the knob off.
+        ack_via_root: false,
         ..DelegModel::design(
             P3.to_vec(),
             vec![vec![], vec![], vec![create(D1A), read(D1A)]],
@@ -1113,6 +1165,10 @@ fn root_lane_config(ignores_cap: bool, after_close: bool) -> DelegModel {
         max_offset: 1,
         max_jumps: 1,
         max_tick: 4,
+        // Plan 43 C2: this configuration's subject is not the commit rule; its
+        // delegate acknowledges alone so the exhaustive search stays within the
+        // state budget (the StreamAck interleavings multiply it past 5M).
+        ack_via_root: false,
         ..DelegModel::design(
             P3.to_vec(),
             vec![vec![], vec![create(D1A)], vec![mv(RA, D1A)]],

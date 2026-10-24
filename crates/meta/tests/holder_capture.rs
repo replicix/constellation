@@ -1545,3 +1545,156 @@ fn a_segment_carrying_a_journaled_rid_makes_its_outcome_the_logs() {
     assert!(meta.outcome_from_log(r).unwrap());
     assert!(!meta.outcome_from_log(rid(2)).unwrap(), "no row at all");
 }
+
+/// Plan 43 C2 (§3.1): a `DelegGroup` record sets the generation's row in the
+/// table — its latest version's backups, and every backup any version named —
+/// and the generation's end deletes it.
+#[test]
+fn a_deleg_group_record_updates_the_table_row() {
+    let (meta, d) = delegate_of_three_rows();
+    let gen = 7;
+    assert_eq!(meta.deleg_group(gen).unwrap(), None, "no record: version 0");
+    let group = |version, backups: Vec<u64>| LogRecord::DelegGroup {
+        dir: d,
+        gen,
+        version,
+        backups,
+    };
+    meta.apply_segment(2, 1, &[group(1, vec![4])], &TouchSet::default())
+        .unwrap();
+    let row = meta.deleg_group(gen).unwrap().expect("a row");
+    assert_eq!((row.version, row.backups, row.named), (1, vec![4], vec![4]));
+    // The backup is removed, then another named: `named` keeps both.
+    meta.apply_segment(3, 1, &[group(2, vec![])], &TouchSet::default())
+        .unwrap();
+    let row = meta.deleg_group(gen).unwrap().expect("a row");
+    assert_eq!(
+        (row.version, row.backups, row.named),
+        (2, vec![], vec![4]),
+        "removed: no member, still named"
+    );
+    meta.apply_segment(4, 1, &[group(3, vec![5])], &TouchSet::default())
+        .unwrap();
+    let row = meta.deleg_group(gen).unwrap().expect("a row");
+    assert_eq!(
+        (row.version, row.backups, row.named),
+        (3, vec![5], vec![4, 5])
+    );
+    // The generation's end takes the row with the table's.
+    let end = vec![LogRecord::RecallCut {
+        dir: d,
+        gen,
+        through: 1,
+    }];
+    meta.apply_segment(5, 1, &end, &TouchSet::default())
+        .unwrap();
+    assert_eq!(
+        meta.deleg_group(gen).unwrap(),
+        None,
+        "ended with the generation"
+    );
+}
+
+/// A record of a version at or below the row's (a replayed segment, a
+/// stale re-ship) changes nothing.
+#[test]
+fn a_stale_deleg_group_record_is_ignored() {
+    let (meta, d) = delegate_of_three_rows();
+    let gen = 7;
+    let group = |version, backups: Vec<u64>| LogRecord::DelegGroup {
+        dir: d,
+        gen,
+        version,
+        backups,
+    };
+    meta.apply_segment(2, 1, &[group(2, vec![5])], &TouchSet::default())
+        .unwrap();
+    meta.apply_segment(3, 1, &[group(1, vec![4])], &TouchSet::default())
+        .unwrap();
+    meta.apply_segment(4, 1, &[group(2, vec![6])], &TouchSet::default())
+        .unwrap();
+    let row = meta.deleg_group(gen).unwrap().expect("a row");
+    assert_eq!(
+        (row.version, row.backups, row.named),
+        (2, vec![5], vec![5]),
+        "a lower or equal version moves nothing"
+    );
+}
+
+/// Plan 43 C2 (§3.8): at the end of a generation a delegate's rows past the
+/// cut that waited for a group (`DelegGroup`: their clients were never
+/// answered) are dropped, not queued for replay; a `Lone` row — answered on
+/// the delegate's disk alone — is replayed as before. Fails on the parent,
+/// which queued all of them.
+#[test]
+fn a_recalled_delegates_gated_rows_are_dropped_and_its_lone_rows_replayed() {
+    use constellation_meta::{PendingClass, RowClass};
+    let meta = Meta::open_in_memory().unwrap();
+    let d = (2 << 40) | 1;
+    meta.apply_segment(
+        1,
+        1,
+        &[LogRecord::Mkdir {
+            parent: ROOT_INO,
+            name: "d".into(),
+            ino: d,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            time_ns: 1,
+        }],
+        &TouchSet::default(),
+    )
+    .unwrap();
+    let gen = 7;
+    for (seq, name, class) in [
+        (1, "a", RowClass::DelegGroup),
+        (2, "b", RowClass::Lone),
+        (3, "c", RowClass::DelegGroup),
+    ] {
+        let _class = PendingClass::set(class);
+        let op = MutateOp::Create {
+            parent: d,
+            name: name.into(),
+            ino: (2 << 40) | (10 + seq),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        meta.delegate_execute(
+            &op,
+            Some(rid(seq)),
+            gen,
+            Default::default(),
+            &Default::default(),
+            Now::same(0),
+        )
+        .unwrap();
+        meta.session().note_stream(gen, seq);
+    }
+    let end = vec![LogRecord::RecallCut {
+        dir: d,
+        gen,
+        through: 0,
+    }];
+    let applied = meta
+        .apply_segment(2, 1, &end, &TouchSet::default())
+        .unwrap();
+    assert_eq!(
+        (applied.stranded.deleg_dropped, applied.stranded.locals),
+        (2, 1),
+        "the group rows dropped, the lone row queued"
+    );
+    let queued: Vec<_> = meta
+        .pending_replays()
+        .unwrap()
+        .into_iter()
+        .map(|q| q.rid)
+        .collect();
+    assert_eq!(queued, vec![rid(2)], "only the lone row is replayed");
+    // None of the three is here any more.
+    for name in ["a", "b", "c"] {
+        assert!(meta.lookup(d, name).unwrap().is_none(), "{name}");
+    }
+    assert_eq!(meta.speculation_counts().unwrap().local, 0);
+}

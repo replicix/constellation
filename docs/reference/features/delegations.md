@@ -107,26 +107,56 @@ through the delegate. It then:
 1. journals the transaction as speculation (see
    [Forwarded mutations](forwarded-mutations.md#speculation-and-stranded-op-recovery)),
    with the generation's next stream index and the requester's `deps`;
-2. acknowledges under its own durability layer: a backup chosen by RTT
-   to the delegate, exactly like the root's (see
-   [Durability and failover](durability-and-failover.md)), or Layer A
-   when no peer is in budget. The root is never the delegate's backup.
-   An acknowledgement that waits for the log (`ack=s3`, or a backup that
-   lags) counts the log by its index of the generation — the highest row a
-   segment this replica applied carries — never by "the row left this
-   journal", which a strand does too. A row that has left the journal
-   without the log carrying it (a recall's or a takeover's strand, a
-   rebuild) was dropped: its acknowledgement is aborted (`Busy`, the
-   requester retries by rid; `deleg_acks_dropped`), and so is every park
-   for a row past the cut of a generation that ends here;
+2. acknowledges once its **group** holds the row (plan 43 C2,
+   [ADR-33](../../explanation/DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)):
+   - With no backup recorded for the generation the group is the delegate
+     and the root: the answer leaves when the root has *journaled its
+     append* of the row — the root's `DelegateStreamAck.through` reaches the
+     row's index — so the delegate sends the row at once rather than on the
+     stream tick, and a node's op costs one round trip to the root.
+   - With a backup recorded (a `DelegGroup` record naming it) the group is
+     the delegate and that backup, chosen by RTT to the delegate, exactly
+     like the root's (see [Durability and failover](durability-and-failover.md)).
+     The root is never the delegate's backup. The delegate counts the backup
+     only once *its own replica's table* records it — the record is
+     committed in the log — never from a message; until a change it asked
+     for is recorded, an acknowledgement needs the members of both versions;
+     and a backup leaves the record only once every index answered through it
+     is at or below the root's cursor or in the log.
+   - A **lone** delegate — its table records no backup, none is requested or
+     appended to, and no peer, the root included, is a backup candidate
+     (linked, within `CONSTELLATION_BACKUP_RTT_BUDGET_MS`, stable for
+     `CONSTELLATION_BACKUP_STABLE_MS`) — answers its own node's client from
+     its disk (Layer A, the one speculation the design keeps); another node's
+     forward still waits for the root's append.
+   - A designation's rows are non-stealable and answer at once; `ack=s3` waits
+     for the log.
+
+   The class an answer waits for is fixed when the row is journaled. A
+   retry of a rid whose earlier row is still uncommitted waits for that row
+   exactly as the first answer did. An acknowledgement that waits for the log
+   (`ack=s3`, or a backup that lags) counts the log by its index of the
+   generation — the highest row a segment this replica applied carries —
+   never by "the row left this journal", which a strand does too. A row that
+   has left the journal without the log carrying it (a recall's or a
+   takeover's strand, a rebuild) was dropped: its acknowledgement is aborted
+   (`Busy`, the requester retries by rid; `deleg_acks_dropped`), and so is
+   every park for a row past the cut of a generation that ends here;
 3. streams its transactions to the root in index order
    (`DelegateStream`, one batch in flight per generation).
 
 The delegate's own FUSE writes under its delegation take the local fast
-path. Its journal rows retire when a root segment carries them, and are
-stranded (rolled back, replayed by rid through the new owner) if the
-generation ends first. A delegate refusal is journaled into the stream
-like any other outcome.
+path only while the delegate is lone (or the delegation is a designation):
+otherwise they go through the core and park for the group like a forwarded
+op (`deleg_fast_path_gated`; the fast path will write first and wait after,
+plan 43 C2d). Its journal rows retire when a root segment carries them. If
+the generation ends first, the rows past the cut are stranded: rolled back,
+and — a lone delegate's rows, answered on its disk — replayed by rid through
+the new owner, or — rows that waited for a group, whose clients were never
+answered — dropped, their clients retrying by rid
+(`speculation.deleg_dropped`). A delegate refusal is journaled into the
+stream like any other outcome, and waits for its commit like an
+acceptance.
 
 ### The append path and dependencies
 
@@ -458,7 +488,8 @@ generations:
 2. the delegate answers `DelegRecalled { through }` and stops executing;
 3. the root waits for the stream to catch up to `through`, or, if the
    delegate is unreachable, for the grant to expire (if the delegate
-   reported a backup, the root first asks the backup to seal);
+   recorded a backup in its `DelegGroup` record, the root first asks the
+   backup to seal and does not end the generation without its answer);
 4. the root journals `RecallCut { dir, gen, through }`, which ends the
    generation and carries its cut (below); later stream records of it are
    refused.
@@ -572,11 +603,17 @@ designations create no delegation.
 
 ### Failures
 
-- **Delegate crashes, no backup**: the root reclaims the grant after
-  `ttl + margin` and ends the generation. Requesters replay their
-  acknowledged ops by rid through the root.
-- **Delegate crashes, with a backup**: the root has the backup seal,
-  drains what it holds, and continues (`delegate-crash`).
+- **Delegate crashes, no backup recorded**: the root reclaims the grant after
+  `ttl + margin` and ends the generation. Every row the delegate answered to
+  another node is in the root's journal (the answer waited for the append);
+  the clients of the rows it had not answered retry by rid through the root.
+  A lone delegate's own node's ops, answered on its disk, are replayed by
+  their rid.
+- **Delegate crashes, with a recorded backup**: the root has the backup seal,
+  drains what it holds, and continues (`delegate-crash-backup`). The
+  generation is not ended before the backup answers (rows acknowledged through
+  the group may be nowhere else): the seal is asked again every window
+  (`deleg_seal_waits`, a warning once per generation) until it does.
 - **The delegate's backup is new or lost rows**: the delegate re-sends
   only what it has not seen in the log. The backup's acknowledgement
   covers every row it has from the log (its applied stream index), plus
@@ -585,8 +622,9 @@ designations create no delegation.
   stream tick, not on every answer. A node that stops backing the root
   discards only the root's tail, never the delegate streams it backs.
 - **Delegate partitioned from the root**: it stops at `sent + ttl −
-  margin`, before the root may reclaim; its unstreamed rows are stranded
-  and replayed.
+  margin`, before the root may reclaim; its unstreamed rows past the cut are
+  stranded: the ones nobody was answered for are dropped (their clients retry
+  by rid), a lone delegate's own are replayed.
 - **Delegate's core stalled behind a slow disk** (a store write that holds
   the writer lock for seconds on a loaded btrfs or network volume, a log
   write blocked the same way): the delegate keeps its grant for as long as

@@ -56735,6 +56735,124 @@ Docs: `delegations.md` (the generation's end and its cut; how a delegate execute
 Re-tag note (C1): C2a/C2b do not touch the gate or a row's tagging; the class they record is read from today's gating when
 the answer leaves, so a row whose gate went off already counts as `Lone`.
 
+
+## Plan 43 C2c: a delegate acknowledges once its group holds the row (2026-10-24)
+
+Third of C2's commits (spec §2.1, §3.1-3.5, §3.8, D6, `GenState.group`, §7.3, §8.1; the delegate's core path only).
+
+### What landed
+
+- **`LogRecord::DelegGroup { dir, gen, version, backups }`** (postcard tag 30, appended). The table's persisted row is
+  unchanged: a key of its own per generation (`DelegGroupRow { version, backups, named }`, the same funnel: dirty-tracked,
+  captured, rolled back with the table, deleted with `Recall`/`RecallCut`); a version at or below the row's is ignored.
+  `Meta::deleg_group`, `Replica::deleg_group`, `Meta::outcome_row` (the journal transaction behind a rid's `completed` row).
+- **The class of a delegate's answer** (`Core::deleg_ack_class(now, gen, Asker)`): designation `NonStealable`, `ack=s3`
+  `Archive`, a lone delegate's own client `Lone`, otherwise `DelegGroup`. Fixed at journal time (`PendingClass`), so the row's
+  strand follows it. **Lone** (`deleg_lone`): no recorded backup, none requested or appended to, and `backup_candidates(now)`
+  empty — the root included (D10). `deleg_fast_path_gated(now)` is the interim: the fast path is open only while lone (C2d).
+- **The commit predicate** (`deleg_stream_state_with`): the log carries the row, or every member of the applied group *and*
+  of a requested one holds it — a recorded backup by its acknowledgement, the root (no backup recorded) by its journaled
+  cursor (`DelegateStreamAck.through`, so `on_delegate_stream_ack` releases the parks and the row is streamed at once, not on
+  the tick). D4: the delegate learns its group from its own table only (`deleg_group_refresh`, from `delegation_sync`; segments
+  carrying a `DelegGroup` trigger it), requests a change in `DelegRenew.backup` (`deleg_group_maintain`: add when the new backup
+  holds everything answered, remove when the root's cursor or the log covers it), the root journals the next version
+  (`deleg_journal_group`; `GenState.group` replaces `GenState.backup`).
+- **D6**: a retry whose rid has a row still in the delegate's own journal waits for it (`deleg_dedup_wait`, `outcome_row`);
+  `settled_outcome` answers a delegate's row only once committed.
+- **§3.8**: a recall's strand drops (rolls back, does not queue) a delegate's gated row past the cut (`Strand.recall`,
+  `Stranded.deleg_dropped`, `speculation.deleg_dropped`); a lone delegate's row is replayed as before; a root's appended row
+  (lease epoch != 0) keeps today's rule.
+- **§7.3**: `note_rollbacks` back to `Ok(None)`; `regression_delegated_long_delegation_rolled_back_refusals_are_tentative`
+  is `regression_delegated_long_delegation_no_refusal_for_an_op_that_lands` (seeds 11, 86, 200; no `deleg-group/*` answer
+  uncommitted). The oracle reads the answerer's table for the group and judges a lone delegate's own `Lone` (§7.1 items 3-4).
+  The rebuild-stub control runs the program-order check again. New config `delegated-no-backup-root-near`.
+- **Model §8.1**: `DelegModel.ack_via_root` (design true): the root answers an append with `Msg::StreamAck`, the delegate's
+  awaiting entries leave on it, a generation's end sends them `NotOwner`; witness `retry_landed`. Renamed (authorized):
+  `design_unreachable_delegate_is_outwaited_and_replayed` -> `..._and_fails_unacked_ops`,
+  `design_delegate_crash_without_backup_replays_by_rid` -> `..._loses_no_acked_op` (both with `check_acked_replay`, which
+  `assert_clean` now asserts). The four large `design_*` configs and the hand-built counterexample paths of other rules keep
+  `ack_via_root: false` (state budget / path shape); `today_a_delegate_without_a_backup_acks_alone` too.
+
+### Two things C2c needed that the spec puts later
+
+- **The end waits for a recorded backup's tail (a slice of C2e, Q1).** Dropping the rows past the cut instead of replaying
+  them, with answers that now say "committed", turns the old hole into a loss: a root that ends a generation at the seal
+  window's end without the backup's tail loses rows the backup alone held and the delegate answered (`long-delegated-backup`
+  seed 358, the pinned 78172: the seal answered 700 ms after the window). A generation whose latest record names a backup is
+  now not ended before that backup answers: the seal is asked again every window (`GenState.waiting_for_group`,
+  `deleg_seal_waits`, a warning once). A backup that answers "I hold nothing" (`sealed: false`) ends it: the spec says
+  keep waiting, but a backup chosen and requested before any row was appended holds nothing and has acknowledged nothing,
+  and waiting for it would wedge an idle generation. **There is no operator escape yet** (`abandon-group --gen` is C2e): a
+  recorded backup that never comes back holds its subtree until C2e. C2e keeps: the older versions' best-effort seal, D8
+  (the drain to the tail's end), the escape, `waiting_for_group` in status.
+- **Request ids carry the incarnation.** A delegate's answer waits for its group now, so an answer to a request of a
+  requester's previous incarnation can arrive after the new one reused the id (`OpId`s restarted at 1 per process):
+  `locks-unlinked-delegated` seed 494 (a create answered with the old incarnation's acceptance, the new one's refused in the
+  log), `-hcrash` seed 438 (a refusal). `next_op` starts at `incarnation << 40 | 1` (22 bits, below the lanes' reserved
+  bits); `deleg_new_round` masks the counter.
+
+### Evidence
+
+Fail-before (on the parent, or the change reverted; the box and the workstation agree):
+
+| Test | Before |
+|---|---|
+| `regression_delegated_long_delegation_no_refusal_for_an_op_that_lands` (11, 86, 200) | all three fail ("refused but completed 1 times in the log") |
+| `delegated-no-backup-root-near` 0..100 | 3 239 `deleg-group/*` answers uncommitted (every seed); 0 of them after (2 in 0..500) |
+| dcrash 3037, 3294 (F2) | `deleg-group/ok` uncommitted 1 each; 0 after. 2945 (`late-answers+rebuild-stub+unclocked`, program order on) fails; passes |
+| core: `a_delegate_without_a_recorded_backup_waits_for_the_roots_append`, `a_delegate_counts_a_backup_only_after_its_deleg_group_record`, `a_pending_group_change_needs_both_versions`, `a_removed_backup_is_needed_until_the_record_without_it_is_applied`, `a_lone_delegate_acks_its_own_node_and_waits_for_the_root_for_others`, `a_delegates_dedup_answer_waits_for_its_rows_commit`, `settled_outcome_does_not_answer_an_uncommitted_delegate_row`, `a_backup_is_dropped_from_the_record_only_once_its_rows_are_covered`, `a_root_journals_the_group_its_delegate_requests`, `an_unanswered_seal_of_the_recorded_backup_holds_the_end` | each fails with the rule it pins put back (mutations M1-M10 in the review notes: no wait for the root, a backup counted without its record, no union, no D6, lone for all, removal always safe, lone ignoring candidates) |
+| meta: `a_deleg_group_record_updates_the_table_row`, `a_stale_deleg_group_record_is_ignored`, `a_recalled_delegates_gated_rows_are_dropped_and_its_lone_rows_replayed` | fail with the drop off / the version check off / `named` forgotten |
+| model: `design_unreachable_delegate_is_outwaited_and_fails_unacked_ops`, `design_delegate_crash_without_backup_loses_no_acked_op` | fail with `ack_via_root: false` |
+| oracle: `i1_deleg_group_reads_the_record_not_the_append_target` | new API |
+
+Sweeps (devbox 2, release, 8 threads, flags off; main `8321049a` against this tree; 500 seeds, `backup*` 300; one run each):
+**no failing seed that main does not fail**: every configuration 0 failing on both except the negative controls (`-unaware`,
+`-unlaned`: identical), `locks-delegated-partition-skew` (main 92, 97, 452, 483; here 97, 452) and
+`long-delegated-late-answers` (main: 12 "setup: delegations were not installed" seeds — a root change inside the 20 s setup
+window; here the setup ends quietly on a root change, 0). `backup*`: identical on every counter. Oracle counts, main -> here:
+
+| Config | I1 `deleg-group/*` | I1 other (the root's `archive/*`, C2f) | I2c | I4 | I5 |
+|---|---|---|---|---|---|
+| `long-delegated` | 12 403 -> 0 | 8 505 -> 8 898 | 0 -> 0 | 0 -> 1 | 40 -> 19 |
+| `long-delegated-backup` | 401 -> 1 | 61 -> 90 | 122 -> 141 | 13 -> 20 | 27 -> 25 |
+| `long-delegated-late-answers` | 1 050 -> 0 | 82 -> 111 | 274 -> 219 | 43 -> 62 | 107 -> 68 |
+| `delegated-backup` | 155 -> 0 | 9 -> 7 | 36 -> 22 | 3 -> 3 | 4 -> 5 |
+| `delegated-crash` / `-partition` / `-root-crash` / `-root-gone` | 9 300 / 7 633 / 9 835 / 9 029 -> 0 | +38 / +104 / +114 / +260 | 0 | 0 | 14 -> 13 / 294 -> 51 / 0 -> 12 / 29 -> 1 |
+| `delegated-holder-cut` | 98 -> 1 | 21 -> 18 | 103 -> 97 | 12 -> 19 | 477 -> 443 |
+| `delegated-long-delegation` | 24 469 -> 0 | 53 707 -> 53 437 | 0 | 95 -> 71 | 326 -> 113 |
+| `locks-delegated*` (3) | 10 487 / 10 607 / 12 472 -> 0 | +88 / +142 / +432 | 0 | 0 | 0 |
+| `locks-unlinked-delegated` / `-dcrash` / `-hcrash` / `-random` | 18 191 / 4 774 / 15 642 / 16 285 -> 0 | +259 / -8 / +296 / +302 | 0 / 9 -> 0 / 0 / 0 | 0 / 1 / 1 / 0 -> 1 | 0 / 15 -> 0 / 0 / 20 -> 3 |
+| `delegated-no-backup-root-near` | — -> 2 | 20 | 0 | 7 | 1 |
+
+Unjournaled landed 0, kind mismatches 0, unverified relays 0 everywhere. **`dcrash` 2000..4000**: `deleg-group/*` 18 556 -> 0,
+`i1-mismatched` 0, 0 failing; I2 0 -> 1 (not strict). What remains of the `deleg-group` answers (5 in 76 configurations:
+`holder-cut` 35, `root-near` 203 and 446, `dbackup-random` 153, `long-delegated-backup` 65) are answers given in a window
+where the group changed hands (the takeover re-ship of an adopted delegate row judged as the delegate's; a root restart
+between its acknowledgement and the answer): one traced (`holder-cut` 35), not the rest. The I1 `other` column is the lone
+root answering forwards (C2f); it moves with the trajectories. I4 rises where a forward now waits for the root and its
+client goes in doubt first (C2g's settle); I5 `delegated-root-crash` 0 -> 12 is the lone root's own `archive/*` answers
+rolled back at its crash (seed 7: "a forward's reply; class none").
+
+Pinned seeds that moved (re-pinned from sweeps on the box, unclocked as the tests run them): `c0_i4_finds_a_late_landing`
+(40, 43, 69 -> 5, 6, 21), `locks_writer_hold_delegated_without_the_settle_is_caught` (767, 2369, 2741 -> 556, 2027, 2570),
+`regression_a_grant_handed_back_during_a_release_is_renewed` (4196, 7730, 4550 -> 1043, 2764; tight 1351). Rewritten:
+`c0_i1_finds_a_delegate_acknowledging_alone` -> `c2c_a_delegate_never_acknowledges_alone` (no `deleg-group/*` uncommitted on
+its seeds; it asserted today's states). `delegated_root_loss_hands_the_writes_to_a_ttl_successor` no longer asserts
+`dead_root_acquires > 0`: no op sits `AwaitingLog` behind the dead root any more (the requester's own retry takes the lease
+path; `inherited` witnesses the takeover). The simulation's setup ends quietly when the root changed inside its window.
+
+### Gates
+
+`cargo fmt --check`, `clippy --workspace --all-targets -D warnings`; meta 363 + integration, authority lib 709 + 2 new
+modules' tests, sim suite (release, devbox 2) 269 passed / 11 ignored, `meta_repro` 4, engine lib 926, control 146
+(schema re-blessed: `speculation.deleg_dropped`), the model crate (`--release`, `--test-threads=2`) green.
+
+### Not done here
+
+C2d (the fast path writes, then waits; this commit closes it unless lone), the rest of C2e (older versions' best-effort seal, D8,
+the escape, `waiting_for_group` and `mine[]`'s class in status), C2f, C2g, C2h. Performance (G1: a delegate without a backup
+now costs a round trip to the root; not measured here). The harness scenarios and `status.ack.lone` (C2h).
+
 ## Plan 43 C1-1 — The root group's commit holds across a listing and a removal
 
 The first commit of plan 43 C1 ([the commit rule](wip/43-commit-rule.md), the coder

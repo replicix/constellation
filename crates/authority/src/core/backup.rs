@@ -1009,6 +1009,15 @@ pub enum AckClass {
     Lone,
 }
 
+/// Plan 43 C2 (§2.1): who an answer goes to — plan 43 §5.1's two columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Asker {
+    /// The answering node's own client.
+    Own,
+    /// Another node (a forward's requester).
+    Remote,
+}
+
 impl AckClass {
     /// Q12's rule: the classes whose answer waited for a group or the
     /// archive, so what it says is committed. Not `NonStealable` and not

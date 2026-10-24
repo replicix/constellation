@@ -562,16 +562,31 @@ pub struct Stranded {
     /// Plan 43 C1-4: gated rows of the root's own journal a deposition
     /// queued for replay (must stay 0; also in `locals`).
     pub gated_queued: usize,
+    /// Plan 43 C2 (§3.8): a delegate's gated (uncommitted) rows past the cut
+    /// of the generation a recall ended, rolled back and dropped instead of
+    /// queued for replay (`speculation.deleg_dropped`). Not in `locals`.
+    pub deleg_dropped: usize,
 }
 
 impl Stranded {
     pub fn any(&self) -> bool {
-        self.shadows + self.hints + self.locals + self.member_copied + self.superseded > 0
+        self.shadows
+            + self.hints
+            + self.locals
+            + self.member_copied
+            + self.superseded
+            + self.deleg_dropped
+            > 0
     }
 
     /// Entries rolled back, of any kind.
     pub fn total(&self) -> usize {
-        self.shadows + self.hints + self.locals + self.member_copied + self.superseded
+        self.shadows
+            + self.hints
+            + self.locals
+            + self.member_copied
+            + self.superseded
+            + self.deleg_dropped
     }
 }
 
@@ -585,6 +600,9 @@ enum Stranding {
     /// A gated row queued for replay in a pass that must not (counted,
     /// `Stranded::gated_queued`; a debug build asserts).
     GatedQueued,
+    /// Plan 43 C2 (§3.8): a delegate's gated row past its generation's cut,
+    /// rolled back and not queued (`Stranded::deleg_dropped`).
+    Dropped,
 }
 
 /// Plan 43 C1-4: how a stranding pass treats the committed work it meets.
@@ -598,6 +616,14 @@ struct Strand<'a> {
     /// Entries (by `spec_seq`) rolled back and not queued: committed
     /// entries a takeover gate's tail re-applies.
     quiet: Option<&'a HashSet<u64>>,
+    /// Plan 43 C2 (§3.8): the pass is a generation's recall. A delegate's
+    /// gated row (`gen` != 0) it strands is dropped, not replayed: its
+    /// client was never answered (the answer waits for the row's commit,
+    /// and a row at or below the cut is in the log, not stranded), so it
+    /// retries by rid at the generation's new owner. An ungated (`Lone`)
+    /// row was answered on the delegate's disk alone and is replayed as
+    /// before.
+    recall: bool,
 }
 
 impl Strand<'static> {
@@ -605,6 +631,7 @@ impl Strand<'static> {
     const PLAIN: Strand<'static> = Strand {
         member: false,
         quiet: None,
+        recall: false,
     };
 }
 
@@ -1199,6 +1226,7 @@ fn derive_replay_op(records: &[LogRecord]) -> Option<MutateOp> {
                     | LogRecord::Delegate { .. }
                     | LogRecord::Recall { .. }
                     | LogRecord::RecallCut { .. }
+                    | LogRecord::DelegGroup { .. }
                     // Plan 43 C1-4: bookkeeping of a re-shipped tail, no
                     // effect to redo.
                     | LogRecord::TailOf { .. }
@@ -1256,8 +1284,9 @@ fn strand_local_tx(
     key: u64,
     before: &Before,
     undone: &HashSet<u64>,
-    member: bool,
+    strand: Strand<'_>,
 ) -> Result<Stranding, MetaError> {
+    let (member, recall) = (strand.member, strand.recall);
     let Some(row) = local::get_journal_tx(&*tx, meta, first)? else {
         return Ok(Stranding::Queued);
     };
@@ -1360,6 +1389,16 @@ fn strand_local_tx(
             },
         )?;
         return Ok(Stranding::Member);
+    }
+    // Plan 43 C2 (§3.8): a delegate's row whose client was told nothing
+    // (gated: the answer waits for the row's commit) and which the log's
+    // cut leaves out is dropped: rolled back above, nothing queued. The
+    // client retries by rid at the generation's new owner; the park that
+    // waited for the row was aborted at the end (`drop_delegate_state`).
+    // (A row with a lease epoch is a root's append of a delegate's row, not
+    // this node's own execution as the delegate: it keeps today's rule.)
+    if recall && row.class.gated() && row.gen != 0 && row.epoch == 0 {
+        return Ok(Stranding::Dropped);
     }
     // (A gated row of this node's own tenure that a deposition queues for
     // replay is a bug: it would be re-executed by a node whose client was
@@ -1715,21 +1754,14 @@ fn redo_row_tx(
                 }
             }
             SpecKind::Local { first, .. } => {
-                match strand_local_tx(
-                    tx,
-                    meta,
-                    first,
-                    row.origin,
-                    &row.before,
-                    undone,
-                    strand.member,
-                )? {
+                match strand_local_tx(tx, meta, first, row.origin, &row.before, undone, strand)? {
                     Stranding::Member => out.member_copied += 1,
                     Stranding::Queued => out.locals += 1,
                     Stranding::GatedQueued => {
                         out.locals += 1;
                         out.gated_queued += 1;
                     }
+                    Stranding::Dropped => out.deleg_dropped += 1,
                 }
             }
             SpecKind::Streamed { gated, .. } if quiet => {
@@ -2392,6 +2424,7 @@ fn strand_tx(
     staged: &UsageTracker,
     strands: impl Fn(&LiveEntry) -> bool,
     member: bool,
+    recall: bool,
     quiet: impl Fn(&LiveEntry) -> bool,
 ) -> Result<Stranded, MetaError> {
     let live: HashMap<u64, LiveEntry> = read_live(tx, meta)?.into_iter().collect();
@@ -2411,6 +2444,7 @@ fn strand_tx(
     let strand = Strand {
         member,
         quiet: Some(&quiet),
+        recall,
     };
     Ok(rewind_tx(tx, meta, staged, &live, &stranded, cutoff, strand, None)?.0)
 }
@@ -2876,7 +2910,19 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
             },
             None => (next_spec_seq_tx(tx, &meta.local)?, Vec::new()),
         };
-        strand_local_tx(tx, meta, first, key, &before, &undone, true)?;
+        strand_local_tx(
+            tx,
+            meta,
+            first,
+            key,
+            &before,
+            &undone,
+            Strand {
+                member: true,
+                quiet: None,
+                recall: false,
+            },
+        )?;
     }
     // The committed entries, in their spec order, on the rebuilt namespace.
     kept.sort_by_key(|(seq, _)| *seq);
@@ -3754,6 +3800,7 @@ impl Meta {
                     if *e == epoch && through >= *last && !rows.contains(last))
             },
             true,
+            false,
             |_| false,
         )?;
         if !refused.is_empty() && stranded.shadows > 0 {
@@ -4125,11 +4172,13 @@ impl Meta {
                 &staged,
                 |entry| entry.stranded_by_recall(&recalled),
                 false,
+                true,
                 |_| false,
             )?;
             stranded.shadows += more.shadows;
             stranded.hints += more.hints;
             stranded.locals += more.locals;
+            stranded.deleg_dropped += more.deleg_dropped;
             // Phase 2b: stranding a delegate's own transaction drops its
             // rid's `completed` row (it never reached the log *as that
             // transaction*) — but this very segment may carry the rid's
@@ -4216,6 +4265,7 @@ impl Meta {
             &staged,
             |entry| entry.stranded_by(epoch),
             true,
+            false,
             |_| false,
         )?;
         if !stranded.any() {
@@ -4306,6 +4356,7 @@ impl Meta {
                     || abandons(entry)
             },
             true,
+            false,
             |entry| entry.superseded_by_takeover(epoch) && !abandons(entry),
         )?;
         if !stranded.any() && own_gens.is_empty() {
@@ -4364,6 +4415,7 @@ impl Meta {
                 )
             },
             false,
+            false,
             |_| false,
         )?;
         if !stranded.any() {
@@ -4407,6 +4459,7 @@ impl Meta {
                 self,
                 &staged,
                 |entry| matches!(entry, LiveEntry::Shadow { rid: r, .. } if *r == rid),
+                false,
                 false,
                 |_| false,
             )?

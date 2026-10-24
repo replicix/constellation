@@ -381,6 +381,25 @@ pub enum LogRecord {
     /// on; `TailFollows` stays decodable and keeps its meaning for logs
     /// written before (`through` unknown: nothing is dropped by it).
     TailFollowsThrough { prev_epoch: u64, through: u64 },
+    /// Plan 43 C2: the configuration of delegation generation `gen` on
+    /// `dir` at `version` (strictly increasing per generation from 1; no
+    /// record is version 0, no backup: the group is the delegate and the
+    /// root, whose journaled append of a row is its second copy). Journaled
+    /// by the root only, while the generation lives, when the delegate asks
+    /// for a different backup (`DelegRenew.backup`). A delegate counts a
+    /// backup's acknowledgements only once its own replica's table records
+    /// this version, i.e. once the record is committed (vertical Paxos: a
+    /// configuration is used only when its master holds it durably).
+    /// Touches no inode or dentry.
+    ///
+    /// Appended at the end of the enum, as the postcard ordering comment on
+    /// this type requires.
+    DelegGroup {
+        dir: u64,
+        gen: u64,
+        version: u64,
+        backups: Vec<u64>,
+    },
 }
 
 impl LogRecord {

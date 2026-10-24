@@ -1577,6 +1577,13 @@ impl Core {
             let Some(p) = self.rd.parked.remove(&id) else {
                 continue;
             };
+            // Plan 43 C2 (§3.3): an index answered under the delegation's
+            // group: what `removal_safe` must keep covered.
+            if let Some((g, i)) = p.stream_need {
+                if let Some(d) = self.dl.mine.get_mut(&g) {
+                    d.acked_max = d.acked_max.max(i);
+                }
+            }
             let waited = now.wait.since(p.since).max(0) as u64;
             // Plan 43 C1-2 (D4): a gated answer released because the gate
             // went off (the group is gone and no peer is eligible, or an

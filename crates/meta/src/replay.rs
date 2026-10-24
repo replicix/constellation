@@ -119,6 +119,7 @@ impl TouchSet {
             | LogRecord::Delegate { .. }
             | LogRecord::Recall { .. }
             | LogRecord::RecallCut { .. }
+            | LogRecord::DelegGroup { .. }
             | LogRecord::GroupAbandoned { .. }
             | LogRecord::TailOf { .. }
             | LogRecord::TailFollowsThrough { .. }
@@ -823,6 +824,7 @@ fn apply_one(
                 gen: *gen,
             });
             crate::delegation::write_table_tx(tx, meta, dirty, &table)?;
+            crate::delegation::remove_group_tx(tx, meta, dirty, *gen)?;
             // M12 round 2 (623da2c's holder-cut shape with delegations):
             // the generation is void from here for *every* replica — the
             // rule the record states (its rows not before it in the log
@@ -853,6 +855,7 @@ fn apply_one(
                 gen: *gen,
             });
             crate::delegation::write_table_tx(tx, meta, dirty, &table)?;
+            crate::delegation::remove_group_tx(tx, meta, dirty, *gen)?;
             // As `Recall`: only from the durable log (a streamed-ahead
             // install of the record may strand, and the generation would
             // then be live again under the successor) — the void, and the
@@ -864,6 +867,19 @@ fn apply_one(
                 meta.session().note_void_cut(*gen, *through);
                 crate::store::local::bump_void_cut_tx(tx, &meta.local, *gen, *through)?;
             }
+            Ok(Applied::Done)
+        }
+        // Plan 43 C2: the generation's configuration, a key of its own
+        // beside the table's row (same funnel: dirty-tracked, captured, so
+        // an unshipped record strands with the rows around it). A stale or
+        // replayed version changes nothing.
+        LogRecord::DelegGroup {
+            gen,
+            version,
+            backups,
+            ..
+        } => {
+            crate::delegation::apply_group_tx(tx, meta, dirty, *gen, *version, backups)?;
             Ok(Applied::Done)
         }
         // The replica's session state reads it (`SessionState::owe`).

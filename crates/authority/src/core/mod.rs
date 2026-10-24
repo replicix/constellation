@@ -76,7 +76,7 @@ use constellation_store_s3::inbox::InboxKey;
 use constellation_types::Code;
 use std::collections::{BTreeMap, VecDeque};
 
-pub use backup::{beat_sent_ms, liveness_fresh, AckClass, AckView, SealRecord};
+pub use backup::{beat_sent_ms, liveness_fresh, AckClass, AckView, Asker, SealRecord};
 pub use client::ClientPhase;
 pub use deleg_windows::{
     decide, DelegWindows, Refusal, RootLease, Window, WindowStats, WindowsClock,
@@ -989,6 +989,14 @@ pub struct Stats {
     /// Plan 43 C2 (D7): parked delegate acknowledgements aborted because
     /// their row left the journal without the log carrying it.
     pub deleg_acks_dropped: u64,
+    /// Plan 43 C2: `DelegGroup` records this root journaled for a delegate's
+    /// request; delegate rows (gated, uncommitted) a recall of their
+    /// generation dropped instead of replaying (`speculation.deleg_dropped`).
+    pub deleg_group_records: u64,
+    pub deleg_dropped: u64,
+    /// Plan 43 C2 (Q1): seals asked again because the recorded backup had
+    /// not answered (the generation is not ended without its tail).
+    pub deleg_seal_waits: u64,
     /// Backup of a delegate: transactions persisted, seals.
     pub deleg_backup_persisted: u64,
     pub deleg_backup_seals: u64,
@@ -1741,6 +1749,13 @@ pub struct Core {
 
 impl Core {
     pub fn new(cfg: Config) -> Self {
+        // Plan 43 C2: request ids carry the incarnation in their high bits (22
+        // of them, below the lanes' reserved bits), so an answer to a request
+        // of an earlier incarnation of this node — a delegate's parked answer
+        // released after the requester rebooted, now that answers wait for a
+        // group — names no request of this one (locks-unlinked-delegated
+        // seed 494, -hcrash seed 438).
+        let next_op = (u64::from(cfg.incarnation) & 0x3f_ffff) << 40 | 1;
         Self {
             lease: {
                 let mut lease = LeaseState::default();
@@ -1748,7 +1763,7 @@ impl Core {
                 lease
             },
             ship: ShipState::default(),
-            next_op: 1,
+            next_op,
             next_timer: 1,
             job: None,
             queued_jobs: VecDeque::new(),

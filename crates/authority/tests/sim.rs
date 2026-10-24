@@ -358,6 +358,7 @@ fn replay_seed() {
         Ok("delegated-delegate-restart") => delegated_delegate_restart_config(),
         Ok("delegated-two-gens-root-crash") => delegated_two_gens_root_crash_config(),
         Ok("delegated-backup") => delegated_backup_config(),
+        Ok("delegated-no-backup-root-near") => delegated_no_backup_root_near_config(),
         Ok("delegated-backup-crash") => delegated_backup_crash_config(),
         Ok("delegated-designated") => delegated_designated_config(),
         Ok("delegated-placement") => delegated_placement_config(),
@@ -5178,6 +5179,7 @@ fn sweep_config() {
         "long-sessions" => long_sessions_config(),
         "long-strict" => long_strict_config(),
         "delegated-backup" => delegated_backup_config(),
+        "delegated-no-backup-root-near" => delegated_no_backup_root_near_config(),
         // Plan 43 C2: the M11 configurations the sweep did not name.
         "delegated-crash" => delegated_crash_config(),
         "delegated-partition" => delegated_partition_config(),
@@ -6067,6 +6069,22 @@ fn delegated_two_gens_root_crash_config() -> SimConfig {
 fn delegated_backup_config() -> SimConfig {
     SimConfig {
         core: std::sync::Arc::new(sim::run::deleg_backup_core_config),
+        ..delegated_config()
+    }
+}
+
+/// Plan 43 C2: delegates whose only in-budget peer is the root (the
+/// backup configuration with a budget of 50 ms; the root is 10 ms from each
+/// delegate, the delegates 80 ms from each other): no backup can be chosen
+/// (never the root), and the delegate is not lone — a peer is within reach —
+/// so every acknowledgement waits for the root's journaled append of its
+/// row (the group is the delegate and the root, Q16). Before C2 the
+/// delegate answered on its own disk alone (`Layer A`), and `+commit`
+/// failed.
+fn delegated_no_backup_root_near_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(sim::run::backup_core_config),
+        rtts: vec![((1, 2), 10), ((1, 3), 10), ((2, 3), 80)],
         ..delegated_config()
     }
 }
@@ -7353,10 +7371,10 @@ fn delegated_root_loss_hands_the_writes_to_a_ttl_successor() {
         66_500..66_530,
     );
     assert!(t.lapsed > 0, "no delegate's grant lapsed: {t:?}");
-    assert!(
-        t.dead_root_acquires > 0,
-        "no op waiting for the dead root's append took the root over: {t:?}"
-    );
+    // (Plan 43 C2: a delegate answers a forward only once the root's append
+    // holds it, so no op sits `AwaitingLog` behind the dead root any more;
+    // the requester's own retry takes the lease path, and `inherited` below
+    // witnesses the takeover. `dead_root_acquires` counted the old case.)
     assert!(
         t.inherited > 0,
         "no successor inherited a generation: {t:?}"
@@ -7416,6 +7434,36 @@ fn delegated_two_generations_re_stream_after_a_root_failover() {
         "no successor inherited a generation: {t:?}"
     );
     assert!(t.restreams > 0, "no delegate re-streamed: {t:?}");
+}
+
+/// Plan 43 C2: a delegate with no backup it can have (the root is its only
+/// peer within the budget) answers once the root's append holds the row —
+/// never from its own disk alone. `+commit` fails before C2 on every seed
+/// that delegates anything (`deleg-group/*` answers with no copy elsewhere; the
+/// test judges those keys — the root's `archive/*` ones are C2f's).
+#[test]
+fn delegated_no_backup_root_near_acknowledges_through_the_root() {
+    let mut waited = 0usize;
+    for seed in 0..30u64 {
+        let r = c0_run(
+            "delegated-no-backup-root-near",
+            seed,
+            delegated_no_backup_root_near_config(),
+        );
+        // (The root's own `archive/*` answers to forwards in its bring-up
+        // window are C2f's.)
+        let deleg: Vec<_> = r
+            .uncommitted_acks
+            .iter()
+            .filter(|(k, _)| k.starts_with("deleg-group/"))
+            .collect();
+        assert!(
+            deleg.is_empty(),
+            "delegated-no-backup-root-near seed {seed}: a delegate answered outside its group: {deleg:?}"
+        );
+        waited += c0_count(&r.acks_by_class, "deleg-group");
+    }
+    assert!(waited > 0, "no delegate answer waited for the root");
 }
 
 /// Phase 2b: delegates with backups; acknowledgements wait for them.
@@ -11476,7 +11524,10 @@ fn locks_writer_hold_delegated_without_the_settle_is_caught() {
     // The lane's giving up on an unanswered owner shifted those two in turn:
     // 767, 2369 and 2741 are the three of seeds 0 to 3 000 that show it now,
     // with the settle clean on all 3 000.)
-    let seeds = [767, 2369, 2741];
+    // (Plan 43 C2c: 767, 2369 and 2741 shifted to none; 556, 2027 and 2570 are
+    // the three of seeds 0 to 3 000 that show it now, unclocked, the settle
+    // clean on all 3 000.)
+    let seeds = [556, 2027, 2570];
     let mut caught = 0;
     for seed in seeds {
         if let Err(e) = run_seed(seed, locks_writer_hold_delegated_unsettled_config()) {
@@ -11938,19 +11989,23 @@ fn regression_locks_unlinked_delegated_blips_seed_230() {
 #[test]
 fn regression_a_grant_handed_back_during_a_release_is_renewed() {
     for (label, seed, cfg) in [
+        // (Plan 43 C2 moved the trajectories of 4196, 7730 and 4550 to no
+        // grant handed back during a release; 1043 and 2764 of
+        // `locks-unlinked-delegated-blips` and 1351 of
+        // `locks-blips-tight-delegated` hand one back now.)
         (
             "locks-unlinked-delegated-blips",
-            4196,
+            1043,
             locks_unlinked_blips_config(),
         ),
         (
             "locks-unlinked-delegated-blips",
-            7730,
+            2764,
             locks_unlinked_blips_config(),
         ),
         (
             "locks-blips-tight-delegated",
-            4550,
+            1351,
             locks_blips_tight_delegated_config(),
         ),
     ] {
@@ -12534,24 +12589,38 @@ fn regression_locks_faults_dropped_refusals_are_tentative() {
     }
 }
 
-/// `delegated-long-delegation` seeds 11, 86 and 200 (fix "a refusal whose rid
-/// the log carries executed is tentative", PROGRESS.md; a simulation fix):
-/// the delegate of `d1` is cut from the root past its delegation. A
-/// requester forwarded an op to the root, which parked it behind the
-/// generation's recall; the client's call went in doubt and its
-/// resubmission reached the delegate, which refused it (`EEXIST`/`ENOENT`)
-/// in a stream position the generation never carried. When the generation
-/// ended the root ran the parked copy: the log carries the rid executed,
-/// so the rolled-back refusal kept a `completed` row and was not tentative.
+/// `delegated-long-delegation` seeds 11, 86 and 200 (plan 43 C2): the
+/// delegate of `d1` is cut from the root past its delegation. A requester
+/// forwarded an op to the root, which parked it behind the generation's
+/// recall; the client's call went in doubt and its resubmission reached the
+/// delegate, which refused it (`EEXIST`/`ENOENT`) in a stream position the
+/// generation never carried. When the generation ended the root ran the
+/// parked copy: the log carries the rid executed. The refusal was an
+/// answer outside the group (`9ff33bb` called it tentative, with the
+/// delegate's rolled-back rows). A delegate now answers a remote requester
+/// only once its group holds the row, and its own client's `Lone` row only
+/// when no peer is within reach: no refusal for an op that lands, and no
+/// uncommitted answer (`+commit`).
 #[test]
-fn regression_delegated_long_delegation_rolled_back_refusals_are_tentative() {
+fn regression_delegated_long_delegation_no_refusal_for_an_op_that_lands() {
     for seed in [11, 86, 200] {
-        run_seed(seed, delegated_long_delegation_config()).unwrap_or_else(|e| {
+        let r = run_seed(seed, delegated_long_delegation_config()).unwrap_or_else(|e| {
             panic!(
                 "delegated-long-delegation seed {seed}: {e}\n  replay with \
                  AUTHORITY_SIM_CONFIG=delegated-long-delegation"
             )
         });
+        // No delegate answer outside its group. (The lone root's answers to
+        // forwards — `archive/*` — are C2f's: `+commit` stays off.)
+        let deleg: Vec<_> = r
+            .uncommitted_acks
+            .iter()
+            .filter(|(k, _)| k.starts_with("deleg-group/"))
+            .collect();
+        assert!(
+            deleg.is_empty(),
+            "delegated-long-delegation seed {seed}: a delegate answered outside its group: {deleg:?}"
+        );
     }
 }
 
@@ -13056,28 +13125,28 @@ fn c0_the_real_rebuild_recovers_a_deposed_root() {
 // ---- fail-before: each oracle finds today's states (plan 43 C0 §10.2) ----
 // Each pinned seed names the configuration and the counter it was found by.
 
-/// I1, `long-delegated`: a delegate with no backup acknowledges alone
-/// (`uncommitted_acks["deleg-group/ok"] > 0`); `+commit` fails with the I1
-/// text. (Not `delegated-backup`, which the plan names too: every delegate
-/// there has a backup, and ×2000 seeds give no such answer — PROGRESS,
-/// plan 43 C0, "Found, not fixed here".)
+/// I1, `long-delegated`: a delegate acknowledges once its group holds the
+/// row — the root's append when no backup is recorded, the recorded backup
+/// after its `DelegGroup` record — never on its own disk alone for another
+/// node's request (plan 43 C2). C0 pinned the seeds where a delegate with no
+/// backup acknowledged alone (`uncommitted_acks["deleg-group/ok"] > 0`) and
+/// `+commit` failed on them; here none of them counts a `deleg-group/*`
+/// answer uncommitted. (The root's own `archive/*` answers to forwards stay
+/// C2f's, which is why `+commit` is not asserted.) Fails on the parent.
 #[test]
-fn c0_i1_finds_a_delegate_acknowledging_alone() {
-    {
-        let (label, cfg, seeds) = ("long-delegated", long_delegated_config(), I1_LONG_DELEGATED);
-        for &seed in seeds {
-            let r = c0_run(label, seed, cfg.clone());
-            assert!(
-                c0_count(&r.uncommitted_acks, "deleg-group/ok") > 0,
-                "{label} seed {seed}: {:?}",
-                r.uncommitted_acks
-            );
-            let e = run_seed(seed, strict(cfg.clone(), "commit")).expect_err("+commit must fail");
-            assert!(
-                e.contains("I1 acked_implies_committed"),
-                "{label} seed {seed}: {e}"
-            );
-        }
+fn c2c_a_delegate_never_acknowledges_alone() {
+    let (label, cfg, seeds) = ("long-delegated", long_delegated_config(), I1_LONG_DELEGATED);
+    for &seed in seeds {
+        let r = c0_run(label, seed, cfg.clone());
+        let alone: Vec<_> = r
+            .uncommitted_acks
+            .iter()
+            .filter(|(k, _)| k.starts_with("deleg-group/"))
+            .collect();
+        assert!(
+            alone.is_empty(),
+            "{label} seed {seed}: a delegate answered outside its group: {alone:?}"
+        );
     }
 }
 
@@ -13334,7 +13403,11 @@ const I4_SEEDS: &[I4Seeds] = &[(
     // trajectories plan 41 R2's early renewal resend shifted to none, gave
     // their places to 40, 43 and 69: 2, 2 and 1 late landings, `+settle`
     // fails with I4; 24 of seeds 0 to 300 qualify.)
-    &[40, 43, 69],
+    // (Plan 43 C2c moved 40, 43 and 69 (a delegate's answer waits for its
+    // group: the in-doubt answers fall elsewhere): 5, 6 and 21 are three of
+    // the seeds of 0 to 300 that show a late landing now, unclocked; `+settle`
+    // fails with I4 on each.)
+    &[5, 6, 21],
 )];
 
 /// Plan 45 follow-up: hard links (`NsOp::Link`) and exchanges

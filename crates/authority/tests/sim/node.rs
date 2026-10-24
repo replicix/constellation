@@ -19,9 +19,7 @@ use constellation_authority::{
     UploadResult,
 };
 use constellation_meta::locks::LockTag;
-use constellation_meta::{
-    CompletedOutcome, Meta, MutateOp, MutateOutcome, PublishBasis, Rid, TouchSet,
-};
+use constellation_meta::{Meta, MutateOp, MutateOutcome, PublishBasis, Rid, TouchSet};
 use constellation_store_s3::commits::{CommitChain, CommitPayload};
 use constellation_store_s3::heartbeat::HeartbeatStore;
 use constellation_store_s3::inbox::InboxStore;
@@ -189,11 +187,10 @@ pub struct Shared {
     /// never carried — tentative, like a rolled-back write (`locks-faults`
     /// seeds 196041, 204913: `Local` holders cut off or crashed past
     /// their lease; the generic tester could not place their refusals).
-    /// So is one whose rid the log carries executed after the rollback:
-    /// the same rid, forwarded to the root earlier and parked there, ran
-    /// once the generation that refused it ended (`delegated-long-
-    /// delegation`: a delegate cut from its root past its delegation
-    /// refused a requester's resubmission).
+    /// (Plan 43 C2: a refusal whose rid the log carries executed is no
+    /// longer one of these; a delegate's refusal to a remote waits for its
+    /// group, and a `Lone` refusal is answered only to the delegate's own
+    /// client.)
     pub journaled_refusals: Mutex<BTreeSet<Rid>>,
     pub commits: Arc<Mutex<Vec<CommitRecord>>>,
     /// Plan 30 §M10.
@@ -2071,9 +2068,14 @@ impl Driver {
             .lock()
             .unwrap()
             .retain(|rid| match self.meta.completed_outcome(*rid) {
-                // The refusal's row is gone, or the log now carries the rid
-                // executed: the refusal was rolled back either way.
-                Ok(None | Some(CompletedOutcome::Executed { .. })) => {
+                // The refusal's row is gone: the refusal was rolled back.
+                // (Plan 43 C2 removed `9ff33bb`'s second case, the log now
+                // carrying the rid executed: a delegate's refusal to a remote
+                // waits for its group, and a `Lone` refusal is answered only
+                // to the delegate's own client, so a refusal whose rid the log
+                // carries executed is no longer tentative — it is an
+                // acknowledgement outside the group, which I1 judges.)
+                Ok(None) => {
                     // Plan 43 C1-4: a committed refusal the deposition moved
                     // to the member copy is held, not rolled back: the
                     // successor re-ships it.
@@ -2424,6 +2426,12 @@ impl Driver {
         if self.shared.hold_next.lock().unwrap().is_none() {
             return None;
         }
+        // Plan 43 C2 (interim, until the fast path writes and then waits):
+        // the delegate's fast path is open only while its own node's ops
+        // are answered from its disk (`Lone`, or a designation's).
+        if self.core.deleg_fast_path_gated(now) {
+            return None;
+        }
         let constellation_meta::delegation::Ownership::Delegated(d) =
             self.meta.resolve_ownership(&TouchSet::from_op(op))
         else {
@@ -2580,7 +2588,10 @@ impl Driver {
         deleg: Option<u64>,
     ) -> Vec<Action> {
         let mut class = match deleg {
-            Some(gen) => self.core.deleg_ack_class(gen),
+            Some(gen) => {
+                self.core
+                    .deleg_ack_class(now, gen, constellation_authority::core::Asker::Own)
+            }
             None => self.core.root_ack_class(),
         };
         if self.plant_claim_root_group_on_lone

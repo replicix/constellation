@@ -848,11 +848,13 @@ lease and one log
 ([ADR-23](DECISIONS.md#adr-23-delegated-sub-sequencers-over-one-log),
 [Delegations](../reference/features/delegations.md)):
 
-- `Delegate { dir, node, gen }` and `RecallCut { dir, gen, through }`
-  records keep a replicated delegation table; the end of a generation
-  carries its cut (`through`: the rows the root appended), so every
-  replica reads it from the log and none infers it. Delegations never
-  overlap and never nest.
+- `Delegate { dir, node, gen }`, `DelegGroup { dir, gen, version, backups }`
+  and `RecallCut { dir, gen, through }` records keep a replicated
+  delegation table: who sequences a subtree, the generation's
+  configuration (its recorded backups, versions rising from 1), and the end
+  of a generation, which carries its cut (`through`: the rows the root
+  appended), so every replica reads it from the log and none infers it.
+  Delegations never overlap and never nest.
   A grant lasts `CONSTELLATION_DELEGATION_TTL_MS` (5 s), is renewed by the
   delegate, and is capped by the root lease. A core stuck in one step (a
   store write behind a slow disk) does not lapse it: the delegate's lane
@@ -867,13 +869,36 @@ lease and one log
   containing its primary link's parent. An op whose keys have two owners
   is cross-subtree.
 - The delegate validates against its replica (authoritative for the
-  subtree, since every write there goes through it), journals as
-  speculation, acknowledges under its own durability layer (a backup
-  chosen by RTT to *it*), and streams its transactions in order to the
-  root. The root appends them without re-validating, in order, and only
-  once each transaction's `deps` (the delegate stream positions the
-  requester had observed) are in its replica: no replica ever holds a
-  record whose causes are missing.
+  subtree, since every write there goes through it), journals the row, and
+  streams its transactions in order to the root. The root appends them
+  without re-validating, in order, and only once each transaction's `deps`
+  (the delegate stream positions the requester had observed) are in its
+  replica: no replica ever holds a record whose causes are missing.
+- **A delegate acknowledges once its group holds the row** (plan 43 C2,
+  [ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)).
+  The generation's group is the delegate and the root — the root's
+  journaled append of the row is the second copy — until a `DelegGroup`
+  record names a backup (chosen by RTT to *the delegate*, never the root):
+  then the delegate and that backup. The delegate counts a backup only once
+  its own replica's table records it, i.e. once the record is committed in
+  the log; while a change it asked for is not recorded yet, an
+  acknowledgement needs the members of both versions, and a backup leaves
+  the record only once every index acknowledged through it is at or below
+  the root's cursor or in the log (the transposition of the lease's
+  add-then-record and remove-when-covered rules). The class of an answer
+  is fixed when the row is journaled, and a retry of a rid whose row is
+  still uncommitted waits for the row like the first answer did. The one
+  speculation place is a *lone* delegate — no recorded backup and no peer,
+  the root included, within `CONSTELLATION_BACKUP_RTT_BUDGET_MS` — which
+  answers its own node's client from its disk; another node's forward still
+  waits for the root. A delegate whose fast path would answer before the
+  group holds the row is closed to it (the fast path stays open only while
+  the delegate is lone). At the end of a generation the rows past its cut
+  that nobody was answered for are dropped, not replayed (their clients retry
+  by rid at the new owner); a lone delegate's own rows are replayed as
+  before; and a generation whose latest record names a backup is not ended
+  before that backup answers its seal, since rows acknowledged through it
+  may be nowhere else.
 - **Cross-subtree ops** (renames and hard links across delegations,
   `rmdir` or rename of a delegated root) go to the root, which *recalls*
   the delegations involved first (the delegate drains and stops, or is
@@ -1196,8 +1221,8 @@ op executes and is acknowledged; "EROFS" means it is refused at once.
 | Holder dies, a backup within the RTT budget | — | write again in ≈ 1.5 s in the harness, 2.3–4.7 s on EC2 (seal-based takeover), nothing acknowledged lost |
 | Holder dies, `ack=s3` | — | write again in ≈ 1.5 s in the harness, not measured on EC2 (any peer takes over), nothing acknowledged lost |
 | Holder dies, no backup (`Local`) | — | write again after the lease TTL (60 s) plus margin; acknowledged forwards are replayed by their requesters; with `f > 0` the taker needs `f` promises |
-| Delegate dies | — | writes under its subtree wait for the root to reclaim it (TTL + margin ≈ 6 s), or for its backup's seal |
-| Delegate cut from the root | stops sequencing at `sent + ttl − margin`; its unstreamed ops are replayed through the root | write through the root once it reclaims the subtree |
+| Delegate dies | — | writes under its subtree wait for the root to reclaim it (TTL + margin ≈ 6 s), or for its recorded backup's seal, which the root waits for |
+| Delegate cut from the root | stops sequencing at `sent + ttl − margin`; the rows past the cut that were never answered are dropped and their clients retry through the root (a lone delegate's own node's rows are replayed as before) | write through the root once it reclaims the subtree |
 | Designee isolated | write | `EROFS` under the path |
 | S3 down, at least `N − f` write-eligible nodes connected | write (epoch) | write (epoch) |
 | S3 down, fewer than `N − f` connected | writes until its lease's TTL, then refuses | cannot acquire; reads work |
@@ -1668,14 +1693,20 @@ latency.
 
 ### Delegates
 
-- **Crash, no backup**: the root reclaims the grant after `ttl + margin`
-  (≈ 6 s) and ends the generation; requesters replay their acknowledged
-  ops by rid through the root.
-- **Crash, with a backup**: the root has the delegate's backup seal,
-  drains what it holds, and continues.
+- **Crash, no backup recorded**: the root reclaims the grant after
+  `ttl + margin` (≈ 6 s) and ends the generation; every row a delegate
+  answered to another node is already in the root's journal (its answer
+  waited for the append), and the clients of the rows it had not answered
+  retry by rid through the root. A lone delegate's own client's ops, answered
+  on its disk, are the one thing replayed by rid.
+- **Crash, with a recorded backup**: the root has the delegate's backup seal,
+  drains what it holds, and continues; until the backup answers the
+  generation is not ended (the seal is asked again every window).
 - **Partitioned from the root**: the delegate stops at
   `sent + ttl − margin`, before the root may reclaim; its unstreamed
-  transactions are stranded and replayed by rid.
+  transactions past the cut are stranded: the ones nobody was answered for
+  are dropped (their clients retry by rid), a lone delegate's own are
+  replayed by rid.
 - **Root fails over**: the new root inherits the live generations, whose
   grants were capped by the old lease. After a TTL takeover they are
   already dead; after a fast takeover the delegates re-stream from what
