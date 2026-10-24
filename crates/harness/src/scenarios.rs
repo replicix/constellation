@@ -1677,7 +1677,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "readdirplus-strict",
-        desc: "plan 40 P9: --cto strict: a lone sequencer hands attributes with its plus pages; once a second node joins every plus entry is name-only (reason view) and cto-strict's visibility holds under ls -l loops",
+        desc: "plan 40 P9: --cto strict: a lone sequencer hands attributes with its plus pages; once a second node joins every plus entry is name-only (reason view) and cto-strict's visibility holds under ls -l loops; then the second node leaves and the restarted sequencer hands attributes again",
         requires: &[],
         caps: &[],
         run: readdirplus::strict,

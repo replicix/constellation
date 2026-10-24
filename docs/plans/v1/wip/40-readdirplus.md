@@ -1350,10 +1350,21 @@ Open, decided by measurement or later:
       per-name `KernelEntries` records, resumed sessions (R6).
 - [ ] Status/metrics/schema (with per-view `unlinked_refs`), configuration
       and TESTING docs, proposed DESIGN text recorded (R7).
-- [ ] Harness scenarios 3× green; xcheckfs runs with zero findings from this
-      plan; §8 acceptance met on every host file system and kernel
-      measured, or the default left `off` / R3a–R3b held back with the
-      numbers reported (R8).
+- [x] Harness scenarios 3× green on both transports (P9, 2026-10-24; PROGRESS
+      "Plan 40 P9"). One intermittent `--cto strict` visibility failure under
+      load with plus on is open there.
+- [ ] xcheckfs runs with zero findings from this plan (R8): **partial.** One
+      hour, `auto`, one node: zero mismatches, zero differences by `xcheckfs
+      verify` before and after (without the `stress-ng` step, a typo found
+      after the run). The `off` run and both two-node runs did not finish:
+      the build host became unreachable (PROGRESS "Plan 40 P9").
+- [ ] §8 acceptance met on every host file system and kernel measured, or the
+      default left `off` / R3a–R3b held back with the numbers reported (R8):
+      **pending, box.** `bench/readdirplus/` is written and smoke-tested; the
+      benchmark box was held by plan 42's benchmarks (its
+      `LOAD-IN-PROGRESS` line `cst-p42-8`), so nothing was measured. §9's
+      measure-later items (default `auto` against `always`, strict mode, the
+      handoff size) go with the same run.
 - [ ] Every CONVENTIONS gate green; pjdfstest 8798/8798.
 
 ## 11. PROGRESS.md

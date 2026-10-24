@@ -1162,10 +1162,8 @@ fn names_of(dir: &Path) -> Result<Vec<String>> {
 /// `--cto strict`: a lone sequencer hands attributes; once a second node is
 /// in the cluster every plus entry is name-only (the view cannot vouch for
 /// attributes the other node may change), and the strict visibility holds
-/// under `ls -l` loops. (The plan's order, the second node leaving and the
-/// sequencer lone again, is not reproduced: after `leave` and a restart the
-/// sequencer still counts another node as having shown itself, see
-/// PROGRESS.)
+/// under `ls -l` loops; then the second node leaves and the restarted
+/// sequencer is lone again.
 pub fn strict(_seed: u64) -> Result<()> {
     const NAME: &str = "readdirplus-strict";
     let strict_env = [("CONSTELLATION_CTO", "strict")];
@@ -1268,6 +1266,44 @@ pub fn strict(_seed: u64) -> Result<()> {
         );
         Ok(())
     })();
+    if r.is_ok() {
+        // The plan's last step: the second node leaves and the sequencer,
+        // restarted, is lone again. A lone strict kernel cache also needs
+        // the lease held (`reads_locally`), which a restarted node takes
+        // with its first write.
+        let r2 = (|| -> Result<()> {
+            b.leave(None, false)?;
+            fx.clients[0].unmount()?;
+            fx.clients[0].mount()?;
+            let a = &fx.clients[0];
+            let adir = a.mnt.join("s");
+            std::fs::write(adir.join("lone"), b"a")?;
+            let mut last = String::new();
+            let m0 = mount_status(a)?;
+            let ok = eventually(
+                "the restarted sequencer hands attributes again",
+                Duration::from_secs(60),
+                || {
+                    let m = mount_status(a)?;
+                    let out = Command::new("ls").arg("-l").arg(&adir).output()?;
+                    ensure!(out.status.success(), "ls -l failed");
+                    let m2 = mount_status(a)?;
+                    let de = num(&m2, "readdirplus_entries") - num(&m, "readdirplus_entries");
+                    last = format!("+{de} with attributes, name-only {}", why(&m2));
+                    ensure!(de >= 300, "{last}");
+                    Ok(())
+                },
+            );
+            eprintln!(
+                "    {NAME}: after the second node left and A restarted: {last} (readdirplus_entries {} before)",
+                num(&m0, "readdirplus_entries")
+            );
+            ok
+        })();
+        let _ = b.unmount();
+        fx.unmount_all();
+        return r2;
+    }
     let _ = b.unmount();
     fx.unmount_all();
     r

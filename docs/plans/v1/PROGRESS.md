@@ -59754,3 +59754,147 @@ as one that answered a beat always did.
   sets are identical apart from 259. They are the negative controls
   `backup-lag-in-margin-unaware` (181) and `backup-runtime-lag-unaware` (497).
 - Gates: fmt, clippy (authority, all targets), authority lib 680, sim 262.
+
+## Plan 40 P9: harness scenarios, xcheckfs and the after-benchmark (R8, 2026-10-24)
+
+Host for the scenarios and xcheckfs: the build host (16 cores, load 5 to 25
+from other work), kernel 7.3.0-0.rc4.260925g165768bb7026.42.fc46, `enable_uring`
+`Y`, Docker S3 (floci). Scenarios are
+`crates/harness/src/scenarios/{readdirplus,readdir_pins}.rs` plus the
+`fuse-inval-storm-plus` and `kernel-race-*-plus` rows; sizes are `READDIR*_*`
+environment knobs (TESTING, "Directory listing and `READDIRPLUS`").
+
+### What landed
+
+| Item | State | Where |
+|---|---|---|
+| `readdirplus-attrs-match`, `-local-appender`, `-orphan-forget`, `-strict`, `-handover` | done, 3x green on both transports (see the intermittent strict failure below) | `scenarios/readdirplus.rs` |
+| `readdir-huge-delete` (1M entries), `readdir-seekdir-after-delete` (200k), `readdir-many-open-dirs` (5,000 streams) | done, 3x green on both transports | `scenarios/readdir_pins.rs` |
+| `fuse-inval-storm-plus`, `kernel-race-{dir-version,rename-ctime,dir-version-remote}-plus` (each with `-dev-fuse`) | done, 3x green | `scenarios/inval_storm.rs`, `scenarios/kernel_races.rs`, `kernel_races.rs` |
+| k8s parity table and file | done | `k8s/parity.rs`, `tests/platform-parity.toml` |
+| xcheckfs, `off` and `auto`, one node and two | **partial** (below) | `bench/readdirplus/xcheckfs/` |
+| After-benchmark `bench/readdirplus/` | **pending, box**: written, smoke-tested on tmpfs, not run | `bench/readdirplus/` |
+
+### Harness runs
+
+Every scenario passed with seeds 42, 43 and 44 on `CONSTELLATION_FUSE_TRANSPORT`
+`dev-fuse` and `auto` (a ring session; `readdirplus-handover` pins `/dev/fuse`
+as every handover scenario does; the `-dev-fuse` rows of the kernel races pin
+it themselves): 72 runs, rc 0. Numbers worth keeping:
+
+- `readdirplus-orphan-forget`: phase 1 `forgets_partial` 0 to 1, `fstat` of
+  the `O_PATH` descriptor `nlink 0`, then the orphan is reaped once a lookup
+  finds `m` gone (the stale dentry holds Y until then); phase 2, 220 descriptors
+  found through `ls -l` answer `nlink 0` after unlink and `rmdir`, 220
+  `unlinked_refs`, 0 after the descriptors close, no `holds/` key left. Its
+  fail-before is R2's wire test (`a_late_partial_forget_leaves_the_orphan_the_kernel_still_references`);
+  this scenario was not run against a pre-R2 build.
+- `readdirplus-handover`: a quiet upgrade 235 to 243 ms, `kernel_refs` 1041 to
+  1041; two upgrades under `ls -lR` loops 250 to 265 ms, 167 listings, no error; a
+  stream paused after 2,084 of 6,000 names with its resume name deleted completes
+  across the upgrade with 3,916 more names, none repeated or lost, `cold_scans` 0.
+- `readdir-huge-delete`: 1,000,000 + 20 x 20,000 entries created in 178 to 213
+  s; `rm -rf` 150 to 183 s with 495 to 580 rounds of the fillers listed beside
+  it and a hint cache of 1 MiB; `lost_cookies` 0, `cold_scans` 0, 90,000 to
+  106,000 hint hits, `pinned_dirs` and `open_streams` 0 after. The fillers are 20,000 entries, not the plan's 200,000
+  (`READDIR_HUGE_FILLER_ENTRIES`).
+- `readdir-seekdir-after-delete`: phase 1, 200 saved positions after deleting 179,968
+  of 200,000 names with the stream open: all 200 resumes exact, 5.7 MB pinned. Phase 2 after `kill -9`
+  and remount: 50 surviving names resume exactly (`cold_scans` +53), 50 deleted ones answer
+  `ENOENT` (`lost_cookies` +50). The `ENOENT` is read with `getdents64`: glibc's
+  `readdir` turns `ENOENT` into the end of the directory.
+- `readdir-many-open-dirs`: 5,000 streams over 100 directories (340,000 to
+  361,000 entries; the plan has one directory per process, which would be tens of millions of
+  files) with `PIN_BYTES_PER_DIR` 32 KiB, `PIN_BYTES` 256 KiB, hint cache 1 MiB:
+  `pinned_bytes` at most 258,989 (cap 262,144), `exempt_bytes` 52.7 to 55.4 MB, `pin_overflows` 3,576
+  to 3,639, RSS +20 to +36 MiB (allowed 119 to 121), all 5,000 continuations exact, `lost_cookies` 0.
+- `readdirplus-attrs-match`: 360 seeded changes in 30 steps in a 2,000-entry
+  directory, the other node's `ls -l` equal to the oracle after each, 195,068 plus entries.
+- `readdirplus-local-appender`: four writers, 27,000 to 28,500 records each in `back` and `through`, two
+  listers (14,900 and 1,000 loops) and a `chmod`er, no listing below a completed size, every file in order.
+- `fuse-inval-storm-plus`: 44,383 ops in three rounds, max 1.7 s, no stall warning,
+  the killed holder exits in 20 ms, 30 of 30 trials of the check that a plus-installed name is
+  invalidated by another node's removal pass.
+- `kernel-race-*-plus`: `dir-version-plus` is a real row: with
+  `CONSTELLATION_FUSE_DIR_CHANGE_NOTIFY=off` it fails (6 of 20 stale at
+  `dir_attr_ttl=entry`), and passes with the notice. `rename-ctime-plus` is a guard: it passes even with the
+  notice off (the kernel does not install the late plus entry's ctime), where the non-plus row fails 20 of 20.
+  The three kernel verdicts on this host were all `not_fixed`.
+
+### Open: `readdirplus-strict` failed once in 14 runs under load
+
+In one run (the `auto` leg, seed 43) the strict visibility loop failed:
+node B read an empty file after node A's `write` returned (`b read "" after
+"round-7"`). A diagnostic variant of the loop (the strict loop alone, 600
+iterations, an `ls -l` loop on node A) then showed, in two of three runs made
+at a load of 13 to 16, 36 and 37 stale reads, all after iteration 380, every
+one on the node that runs the lister, reading either `""` or the previous
+round's content; at a load of 5 it showed none in 16 runs (8 with plus
+`auto`, 8 with `off`), and none in 3 runs with no lister or 3 with plus `off`
+at the load of the first batch. That makes the failure load-dependent and, in
+the data in hand, specific to plus `auto` with a concurrent `ls -l`; not
+established: whether `off` fails under the same load (the comparison under
+CPU hogs was not made; the host went away first), nor the mechanism. `degraded`
+was 0 in the runs that were inspected. It is reported, not fixed: a `--cto
+strict` reader must see a completed close. Suspects, unverified: a late
+attribute reply installed in the kernel after the write (this kernel's
+`attrs_valid_after_store` verdict is `not_fixed`), or a plus page delaying the
+invalidation of the file (`inflight.enter` holds the directory's
+notifications while a page is in flight). Next step: the same 600-iteration
+loop, plus `auto` against `off`, under `stress-ng --cpu 16`, 8 runs each.
+
+`readdirplus-strict` also taught two things: a lone strict sequencer's kernel
+cache needs its lease (`reads_locally`), which a restarted node takes with its
+first write (before that, plus entries are name-only with reason `view`), so
+the plan's "the second node leaves" step writes a file after the restart; and
+the latch that another node showed itself is per process.
+
+### xcheckfs (plan 40 section 7)
+
+Setup: primary an ext4 loop file system, secondary a constellation mount
+(file store) at `.../mnt1/xc`, `xcheckfs mount -c basic -m log` over both (xcheckfs
+at `dd18db3`); a 200,000-file tree (2,000 directories of 100 files) mirrored and
+verified before; the mix of the plan in a loop for one hour (git clone and
+status/checkout loops of a 5,000-file repository, `rsync -a` of a 5,000-file
+tree there and back, `find -ls`, `ls -lR`, `du -s`, `tar c | tar x`, `rm -rf`
+and `find -delete` of 100,000-entry directories, `stress-ng --dir --dirmany
+--getdent --link --rename`). The repository and trees are smaller than the
+plan's because the same mix through a lockstep mount ran at about 100 files/s.
+
+- `auto`, one node, 1 hour (00:53 to 01:57 on the host's clock): 10
+  iterations of the mix, **0 mismatches**, `xcheckfs verify` before 0
+  differences (200,000 files) and after 0 differences (205,635 files, 2,243
+  directories). Without the `stress-ng` step: the option was misspelt
+  (`--getdents`) and the step failed in 0 s each iteration; fixed in the scripts afterwards.
+- `off`, one node: started, the host's results were not read before the host
+  went away. `auto` and `off` with two nodes, and a repeat of the first run with
+  the `stress-ng` step: not run. The build host became unreachable at about
+  03:10 UTC (the hosts were due to be stopped that morning); the scripts and
+  all logs are on it. **The plan's xcheckfs criterion is therefore not met**;
+  no finding was seen in the one complete run, and the other three
+  runs remain to be done.
+
+### After-benchmark: pending, box
+
+`bench/readdirplus/` (`cell.py`, `abba.sh`, `summarize.py`, `listtool.py`,
+`gen-tree.py`, `RESULTS.md`) compares the build before the listing commits
+(`73ea9987`) with main in `off`, `auto` and `always`, on ext4, xfs, btrfs and
+tmpfs, kernel-cold and warm, at 1k, 10k and 100k entries and the 50k-file tree,
+with the write path (storm, `tar x`) in both write modes, and a big-directory
+phase (RSS, pins, cold resume, `releasedir`, the handover with a pinned
+directory). The benchmark box's `LOAD-IN-PROGRESS` had the plan 42 line
+`cst-p42-8` (cells running) when this was written, so, as agreed, nothing was
+run and the item is "pending, box". Plan 40 section 10 and section 9's
+measure-later items (default `auto` against `always`; strict mode; the
+handoff size) are marked the same.
+
+### Gates
+
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D
+warnings` and `cargo test -p constellation-harness --lib` (152 tests,
+including the parity tests, which caught the table's order) passed on the build
+host for the scenarios as committed in the first commit; the leave step of
+`readdirplus-strict` was added afterwards and checked with `clippy -p
+constellation-harness --all-targets -D warnings` on the workstation. Not run
+here: the rest of the harness (the plan's full `harness run`), pjdfstest, the
+workspace tests: nothing in this commit touches product code.
