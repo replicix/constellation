@@ -1159,6 +1159,32 @@ fn names_of(dir: &Path) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// A node's strict-read and session counters, for a failure report: they
+/// tell a degraded, tailed or timed-out read from a wrong position.
+fn strict_status(c: &Client) -> String {
+    c.control_status()
+        .map(|s| {
+            format!(
+                "cto {} session {} lease {}",
+                s["cto"], s["session"], s["lease"]
+            )
+        })
+        .unwrap_or_else(|e| format!("{e:#}"))
+}
+
+/// After a strict lookup missed a name change: how long until `path`
+/// exists (`exists`) or is gone, re-checked for up to 3 s.
+fn strict_name_settles(path: &Path, exists: bool) -> Option<Duration> {
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(3) {
+        if std::fs::symlink_metadata(path).is_ok() == exists {
+            return Some(started.elapsed());
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    None
+}
+
 /// `--cto strict`: a lone sequencer hands attributes; once a second node is
 /// in the cluster every plus entry is name-only (the view cannot vouch for
 /// attributes the other node may change), and the strict visibility holds
@@ -1257,32 +1283,38 @@ pub fn strict(_seed: u64) -> Result<()> {
                     }
                     std::thread::sleep(Duration::from_millis(2));
                 }
-                let cto = |c: &Client| {
-                    c.control_status()
-                        .map(|s| format!("cto {} session {}", s["cto"], s["session"]))
-                        .unwrap_or_else(|e| format!("{e:#}"))
-                };
                 bail!(
                     "{} read {got:?} after {content:?} (round {i}); re-reads {seen:?}, \
                      right after {caught_up:?}; reader {}; writer {}",
                     r.name,
-                    cto(r),
-                    cto(w)
+                    strict_status(r),
+                    strict_status(w)
                 );
             }
             let n = w.mnt.join("s").join(format!("new-{i}"));
+            let seen_by_r = r.mnt.join("s").join(format!("new-{i}"));
             std::fs::write(&n, b"n")?;
-            ensure!(
-                std::fs::symlink_metadata(r.mnt.join("s").join(format!("new-{i}"))).is_ok(),
-                "{} does not see the new name at once",
-                r.name
-            );
+            if std::fs::symlink_metadata(&seen_by_r).is_err() {
+                let caught_up = strict_name_settles(&seen_by_r, true);
+                bail!(
+                    "{} does not see the new name at once (round {i}); seen after {caught_up:?}; \
+                     reader {}; writer {}",
+                    r.name,
+                    strict_status(r),
+                    strict_status(w)
+                );
+            }
             std::fs::remove_file(&n)?;
-            ensure!(
-                std::fs::symlink_metadata(r.mnt.join("s").join(format!("new-{i}"))).is_err(),
-                "{} still sees the removed name",
-                r.name
-            );
+            if std::fs::symlink_metadata(&seen_by_r).is_ok() {
+                let caught_up = strict_name_settles(&seen_by_r, false);
+                bail!(
+                    "{} still sees the removed name (round {i}); gone after {caught_up:?}; \
+                     reader {}; writer {}",
+                    r.name,
+                    strict_status(r),
+                    strict_status(w)
+                );
+            }
         }
         let looped = lister.finish().context("A's ls -l loop")?;
         let m1 = mount_status(a)?;
