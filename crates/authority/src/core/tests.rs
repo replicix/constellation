@@ -37770,6 +37770,51 @@ mod deleg_windows_tests {
         );
     }
 
+    /// Plan 43 C2: a backup asked to seal a generation it holds nothing of
+    /// answers so (`sealed: false`, and the root ends the generation at its
+    /// cursor) and is sealed all the same: the old delegate's batch that
+    /// reaches it afterwards is refused, not persisted and acknowledged —
+    /// rows the delegate would answer and the log would never carry. Before,
+    /// only a backup holding rows sealed.
+    #[test]
+    fn a_backup_that_holds_nothing_is_sealed_against_later_appends() {
+        let mut h = Harness::new(4);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegSeal {
+                req: OpId(11),
+                gen: 7,
+            },
+        });
+        let answered = sends(&out).iter().find_map(|(to, m)| match m {
+            PeerMsg::DelegSealed { sealed, txs, .. } if *to == 1 => Some((*sealed, txs.len())),
+            _ => None,
+        });
+        assert_eq!(answered, Some((false, 0)), "{out:?}");
+        let tx = constellation_meta::DelegateTx {
+            idx: 1,
+            rid: None,
+            records: Vec::new(),
+            deps: constellation_meta::Position::ZERO,
+        };
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegBackupAppend {
+                req: OpId(12),
+                gen: 7,
+                txs: vec![tx],
+            },
+        });
+        let ack = sends(&out).iter().find_map(|(to, m)| match m {
+            PeerMsg::DelegBackupAck { acked, sealed, .. } if *to == 3 => Some((*acked, *sealed)),
+            _ => None,
+        });
+        assert_eq!(ack, Some((0, true)), "{out:?}");
+        assert!(!Replica::deleg_backup_holds_any(&h.meta, 7));
+    }
+
     /// A generation without a recorded backup keeps the plain reclaim: the
     /// root's cursor covers everything acknowledged through the group.
     #[test]

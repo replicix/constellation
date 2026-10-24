@@ -1913,13 +1913,19 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         self.note_foreign(now, replica, out);
-        let backing = (self.dl.backing.contains_key(&gen) || replica.deleg_backup_holds_any(gen))
-            // Persisted (and synced) before it is acknowledged; not
-            // persisted: answered unsealed, and the root falls back to
-            // its plain reclaim.
-            && replica.deleg_backup_seal(gen);
+        let backing = self.dl.backing.contains_key(&gen) || replica.deleg_backup_holds_any(gen);
+        // Plan 43 C2: sealed whether or not it holds anything, persisted
+        // (and synced) before it is answered. "I hold nothing" (`sealed:
+        // false`) ends the generation at the root's cursor, so this node
+        // must not take the old delegate's appends afterwards — a batch
+        // still in flight, or one from a delegate that outlived its grant —
+        // and acknowledge rows the log will never carry. Not persisted: no
+        // answer; the root asks again while the record names this node.
+        if !replica.deleg_backup_seal(gen) {
+            return;
+        }
+        self.dl.sealed.insert(gen);
         let txs = if backing {
-            self.dl.sealed.insert(gen);
             self.stats.deleg_backup_seals += 1;
             replica.deleg_backup_tail(gen)
         } else {
