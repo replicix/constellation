@@ -25199,6 +25199,71 @@ mod locks {
         );
     }
 
+    /// A successor whose predecessor's lock table is not installed yet
+    /// answers a renewal `NotOwner` naming itself ("ask again"). The holder
+    /// asks again after `lock_resume_retry_ms`, not at once: the grant is
+    /// due again at once, and the tick re-armed for it sent the renewal
+    /// back to the successor every millisecond until its mirror was in.
+    #[test]
+    fn a_renewal_the_owner_asks_to_send_again_waits_a_retry() {
+        let mut r = requester();
+        let req = lock_control(&mut r, 50, 42, true);
+        r.advance(10);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: grant_msg(1),
+            },
+        });
+        assert!(matches!(lock_answer(&out, 50), LockAnswer::Granted { .. }));
+        let mut tick = timer_of(&out, TimerKind::LockRenewTick);
+        let renew = loop {
+            r.now = r.core.timer_ms(tick).expect("armed");
+            let out = r.step(Event::Timer { id: tick });
+            if let Some(req) = sends(&out).into_iter().find_map(|(to, m)| match m {
+                PeerMsg::LockRenew { req, .. } if to == 1 => Some(*req),
+                _ => None,
+            }) {
+                break req;
+            }
+            tick = timer_of(&out, TimerKind::LockRenewTick);
+        };
+        r.advance(5);
+        let answered = r.now;
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockRenewed {
+                req: renew,
+                results: vec![(
+                    42,
+                    GrantId { node: 1, seq: 1 },
+                    LockRenewResult::NotOwner { owner: 1 },
+                )],
+            },
+        });
+        assert_eq!(r.core.lease.cached_holder, Some(1), "{out:?}");
+        let retry = r.core.lock_resume_retry_ms() as i64;
+        let mut tick = timer_of(&out, TimerKind::LockRenewTick);
+        for _ in 0..1_000 {
+            r.now = r.core.timer_ms(tick).expect("armed");
+            let out = r.step(Event::Timer { id: tick });
+            if sends(&out)
+                .iter()
+                .any(|(to, m)| *to == 1 && matches!(m, PeerMsg::LockRenew { .. }))
+            {
+                let after = r.now.0 - answered.0;
+                assert!(
+                    after >= retry,
+                    "asked the owner again {after} ms after its \"ask again\" (retry {retry} ms)"
+                );
+                return;
+            }
+            tick = timer_of(&out, TimerKind::LockRenewTick);
+        }
+        panic!("never asked the owner again");
+    }
+
     /// Plan 41 L0 (review M1): after a fast takeover the successor
     /// outwaits a generation it inherits past the predecessor's last
     /// delegation renewal. That renewal was decided under

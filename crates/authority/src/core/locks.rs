@@ -342,6 +342,11 @@ pub(crate) struct LockState {
     pub(crate) release_unmarked: bool,
     /// A lease read to relearn the owner for renewals is in flight.
     relearning: bool,
+    /// An owner answered a renewal `NotOwner` naming itself (a successor
+    /// whose predecessor's lock table is not installed yet: "ask again"):
+    /// the renewal tick fires no earlier than this
+    /// ([`Core::lock_relearn_floor`]).
+    ask_again_at: Option<HonourMs>,
     /// Plan 43 C7-F F-b N3: the lease read shared by the lock requests
     /// that need to know who holds the root (`Core::lock_read_holder`):
     /// the one in flight with the requests it will answer, and the last
@@ -5137,12 +5142,17 @@ impl Core {
     /// So, too, while the predecessor's lock table is not installed yet
     /// (`lock_mirror_pending`): its own grants' renewals are answered
     /// `NotOwner` naming this node until then.
+    /// And after an owner asked to be asked again (`NotOwner` naming
+    /// itself, `ask_again_at`): the grant is due again at once, and the
+    /// tick re-armed for it sent the renewal back to that owner every
+    /// millisecond until its mirror was in.
     fn lock_relearn_floor(&self, now: Now) -> HonourMs {
-        if self.lk.relearning || self.lock_mirror_pending() {
+        let floor = if self.lk.relearning || self.lock_mirror_pending() {
             now.honour.plus(self.lock_resume_retry_ms())
         } else {
             now.honour
-        }
+        };
+        self.lk.ask_again_at.map_or(floor, |at| floor.max(at))
     }
 
     /// A successor that backed its predecessor installs the predecessor's
@@ -5322,6 +5332,12 @@ impl Core {
                     // again, and the tick re-armed for it fired every
                     // millisecond at the old root.
                     self.lease.cached_holder = None;
+                }
+                if owner == from && from != self.cfg.node_id {
+                    // "Ask again" (`lock_renew_one`: a successor whose
+                    // predecessor's lock table is not installed yet): after
+                    // a retry, not at once.
+                    self.lk.ask_again_at = Some(now.honour.plus(self.lock_resume_retry_ms()));
                 }
                 self.lock_note_not_owner(from, ino, owner, replica);
                 replica.locks().clear_route(ino, id, from);
