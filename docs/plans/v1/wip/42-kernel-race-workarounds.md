@@ -1680,6 +1680,26 @@ the base by more than the larger of 3 % and twice the base's spread.
 | database-style: one long-lived read-write handle, 4 KiB random reads and writes 50/50 over a 1 GiB file, 4 threads, 60 s | neutral (recording is always on here: one shard lookup per read and write; ambiguous hits only set S5) |
 | commit-heavy multi-view: two views, many small files written and closed in one | report the cost of Q3's one notification per commit |
 
+**Outcome (K7, `bench/kernel-races/RESULTS.md`, "§8 acceptance").** Base
+`c3bda7ea`, final `5964fd68`, 3 interleaved runs per configuration, ext4, xfs,
+btrfs (off and `zstd`) and tmpfs. Met: reopen-read (daemon `read`s in passes 2
+and 3: 10 000 to 0; their wall time 0.54 to 0.69 of the base), the tree
+workloads (requests equal to 0.2 %), untar and `cp -a` (requests equal; the narrowed
+notice wrote none), `fio`, `pc_race` without an opener, open latency, database
+style. Not met: **(1)** the W2 worst case: writes per second 11x lower,
+p99 106 to 108 ms against 0.3 ms, on every store (stale read-backs 480 to 570 per
+run on the base and with the repair off, 0 with it); first look: `TAIL_GRACE` (100 ms) on
+partial-page writes with the two-thread repair lane queueing behind it
+(about 10 % of the 1 700 repairs per run are "released" by the grace). **(2)** commit-heavy:
+per-commit p50 17 to 50 % higher on all four disk stores with one view as
+well as two, so not Q3's notification; the second view's requests double
+(its thread looks every file up again) and its lag behind the writer shrinks;
+the cause of the single-view rise is not attributed (the builds differ by 106 commits;
+control build `63c8790d`, K1 to F2 alone, and a final with W1, W2, W3b off are the next
+runs). **(3)** xfs untar 1.10x (one of three final runs equals the base; not repeated).
+**(4)** tmpfs: complete only up to the fio phase (first attempt filled the
+host's memory; rerun not fetched).
+
 ### 8.1 Quiet-host measurement for Q1 (run 2026-10-20 without the quiet-host gate; decided option B)
 
 The numbers of Appendix A.2 were taken on a host shared with other
@@ -1793,7 +1813,12 @@ decided on this measurement:
       build (`repairs_late` 0 in every profile); §7.5 on a patched kernel
       (run; recorded in §7.5: probes, every row, the exit fix and the F10 stall met;
       the moved inode's notice stays on with 0003, F16);
-      §8 acceptance met on every backing store; §8.1 recorded.
+      §8 acceptance run on ext4, xfs, btrfs (off and `zstd`) and tmpfs
+      (`bench/kernel-races/RESULTS.md`, "§8 acceptance"), **not met**: W2's
+      worst case costs 11x in writes/s and 100 ms at p99 (TAIL_GRACE, first look
+      there), the commit-heavy row's per-commit p50 is 17 to 50 % up on all four
+      disk stores and is not attributed, and tmpfs is incomplete (rerun not
+      fetched); §8.1 recorded.
 - [ ] Every CONVENTIONS gate green; pjdfstest 8798/8798; `stress-ng-fs`
       within its baseline.
 

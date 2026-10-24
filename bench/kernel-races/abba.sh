@@ -30,6 +30,7 @@ while read -r store ver run; do
   f="$OUT/cell-$store-$ver-r$run.txt"
   rm -f "$f"
   echo "$(date +%T) start $key (load $(cut -d' ' -f1 /proc/loadavg))" >> "$OUT/driver.log"
+  FRESH=$([ "$store" = tmpfs ] && echo 1 || echo 0) CACHE=$([ "$store" = tmpfs ] && echo 2G || echo 4G) \
   FINAL=$([ "$ver" = final ] && echo 1 || echo 0) \
     timeout --kill-after=30s 14400 "$D/cell.sh" "$D/bin/cst-$ver" "$dir" "$store-$ver-r$run" "$f" > "$OUT/cell-$store-$ver-r$run.log" 2>&1
   rc=$?

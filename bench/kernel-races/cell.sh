@@ -35,7 +35,7 @@ gate() { # NAME
 mount_fs() { # [ENV=VAL ...]  : mount view 1 at MNT
   mkdir -p "$MNT"
   env "$@" HOME=$ROOT/home timeout --kill-after=10s 7200 "$BIN" mount / "$MNT" --s3 file://$ROOT/backend \
-    --state-dir $ROOT/state --cache-size 4G --foreground > $ROOT/mount.log 2>&1 &
+    --state-dir $ROOT/state --cache-size ${CACHE:-4G} --foreground > $ROOT/mount.log 2>&1 &
   MPID=$!
   local i
   for i in $(seq 1 240); do mountpoint -q "$MNT" && return 0; sleep 0.5; done
@@ -53,6 +53,19 @@ umount_fs() {
   for i in $(seq 1 120); do kill -0 $MPID 2>/dev/null || break; sleep 0.5; done
   if kill -0 $MPID 2>/dev/null; then kill $MPID; sleep 2; fi
   wait $MPID 2>/dev/null
+}
+# FRESH=1 (tmpfs, whose space is the host's memory): a new, empty file system before the phases that write
+# much, so the backend of one phase is not kept for the next
+newfs() {
+  mkdir -p $ROOT/home $ROOT/state $ROOT/backend $MNT $MNT2
+  HOME=$ROOT/home "$BIN" fs create bench --s3 file://$ROOT/backend --chunk-size 1048576 > $ROOT/create.log 2>&1 || { say "ERROR fs create"; cat $ROOT/create.log >> "$OUT"; return 1; }
+}
+wipefs_() { local i; for i in 1 2 3 4 5 6; do rm -rf $ROOT/home $ROOT/state $ROOT/backend; [ -e $ROOT/state ] || [ -e $ROOT/backend ] || return 0; sleep 2; done; }
+fresh() {
+  [ "${FRESH:-0}" = 1 ] || return 0
+  umount_fs
+  wipefs_
+  newfs && mount_fs
 }
 dropc() { sudo -n sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'; }
 snap() { python3 $HERE/snap.py "$BIN" $ROOT/state 2>/dev/null; }
@@ -112,6 +125,7 @@ umount_fs
 
 # ---- 3. reopen-read, open latency, fio, database-style, commit-heavy, pc_race without opener
 phase misc
+if [ "${FRESH:-0}" = 1 ]; then wipefs_; newfs || exit 1; fi
 mount_fs || exit 1
 NF=5000; [ $FAST = 1 ] && NF=500
 $KB reopen-prep "$MNT/ro" $NF 16384 >> /dev/null
@@ -128,12 +142,13 @@ done
 say "KEEPCACHE $(python3 $HERE/snap.py --fuse $ROOT/s1.json)"
 rm -rf "$MNT/ro"
 
-f1=$(find "$MNT/t1/a00/b0/c0" -name 'f00.c' | head -1)
+if [ "${FRESH:-0}" = 1 ]; then f1=$MNT/ol.dat; head -c 8192 /dev/zero | tr '\0' 'x' > "$f1"; else f1=$(find "$MNT/t1/a00/b0/c0" -name 'f00.c' | head -1); fi
 cat "$f1" > /dev/null
 ON=100000; [ $FAST = 1 ] && ON=5000
 snap > $ROOT/s0.json
 say "$($KB openlat "$f1" $ON) $(snap > $ROOT/s1.json; python3 $HERE/snap.py --diff $ROOT/s0.json $ROOT/s1.json)"
 
+fresh
 phase fio
 mkdir -p "$MNT/fio"
 FS=256M; RT=20; [ $FAST = 1 ] && { FS=16M; RT=3; }
@@ -150,6 +165,7 @@ for job in "seqwrite write 1M" "randwrite randwrite 4k" "randrw randrw 4k"; do
 done
 rm -rf "$MNT/fio"
 
+fresh
 phase db
 DBB=1073741824; DT=60; [ $FAST = 1 ] && { DBB=67108864; DT=3; }
 $KB dbprep "$MNT/db.dat" $DBB > /dev/null
@@ -159,6 +175,7 @@ snap > $ROOT/s1.json
 say "$r $(python3 $HERE/snap.py --diff $ROOT/s0.json $ROOT/s1.json)"
 rm -f "$MNT/db.dat"
 
+fresh
 phase commit
 CN=5000; [ $FAST = 1 ] && CN=300
 mkdir -p "$MNT/c1" "$MNT/c1v"
@@ -172,6 +189,7 @@ if mount_view2; then
   say "$r views=2 $(python3 $HERE/snap.py --diff $ROOT/s0.json $ROOT/s1.json) $(python3 $HERE/snap.py --fuse $ROOT/s1.json)"
 fi
 
+fresh
 phase pcrace
 PS=20; [ $FAST = 1 ] && PS=3
 snap > $ROOT/s0.json
