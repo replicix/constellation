@@ -1686,19 +1686,19 @@ btrfs (off and `zstd`) and tmpfs. Met: reopen-read (daemon `read`s in passes 2
 and 3: 10 000 to 0; their wall time 0.54 to 0.69 of the base), the tree
 workloads (requests equal to 0.2 %), untar and `cp -a` (requests equal; the narrowed
 notice wrote none), `fio`, `pc_race` without an opener, open latency, database
-style. Not met: **(1)** the W2 worst case: writes per second 11x lower,
+style. Not met: **(1)** the W2 worst case: writes per second 11 to 16x lower,
 p99 106 to 108 ms against 0.3 ms, on every store (stale read-backs 480 to 570 per
 run on the base and with the repair off, 0 with it); first look: `TAIL_GRACE` (100 ms) on
 partial-page writes with the two-thread repair lane queueing behind it
 (about 10 % of the 1 700 repairs per run are "released" by the grace). **(2)** commit-heavy:
-per-commit p50 17 to 50 % higher on all four disk stores with one view as
+per-commit p50 17 to 50 % higher on the four disk stores in the full cell, with one view as
 well as two, so not Q3's notification; the second view's requests double
-(its thread looks every file up again) and its lag behind the writer shrinks;
-the cause of the single-view rise is not attributed (the builds differ by 106 commits;
-control build `63c8790d`, K1 to F2 alone, and a final with W1, W2, W3b off are the next
-runs). **(3)** xfs untar 1.10x (one of three final runs equals the base; not repeated).
-**(4)** tmpfs: complete only up to the fio phase (first attempt filled the
-host's memory; rerun not fetched).
+(its thread looks every file up again) and its lag behind the writer shrinks.
+Not reproduced standalone: on a fresh file system base, K1-F2 alone (`63c8790d`),
+final and final with W1, W2, W3b off all give the same p50 (btrfs, ext4, xfs, 4 rounds),
+so the rise needs the state the cell's earlier fio and database phases leave, and is not
+attributed to a plan 42 commit. **(3)** xfs untar 1.10x: a standalone repeat shows a
+17 % spread and no effect.
 
 ### 8.1 Quiet-host measurement for Q1 (run 2026-10-20 without the quiet-host gate; decided option B)
 
@@ -1815,10 +1815,11 @@ decided on this measurement:
       the moved inode's notice stays on with 0003, F16);
       §8 acceptance run on ext4, xfs, btrfs (off and `zstd`) and tmpfs
       (`bench/kernel-races/RESULTS.md`, "§8 acceptance"), **not met**: W2's
-      worst case costs 11x in writes/s and 100 ms at p99 (TAIL_GRACE, first look
-      there), the commit-heavy row's per-commit p50 is 17 to 50 % up on all four
-      disk stores and is not attributed, and tmpfs is incomplete (rerun not
-      fetched); §8.1 recorded.
+      worst case costs 11 to 16x in writes/s and 100 ms at p99 (TAIL_GRACE, first
+      look there), and the commit-heavy row's per-commit p50 is 17 to 50 % up on
+      the disk stores in the full cell, though not on a fresh file system with
+      any of base, K1-F2 alone, final, or final with the workarounds off;
+      everything else met; §8.1 recorded.
 - [ ] Every CONVENTIONS gate green; pjdfstest 8798/8798; `stress-ng-fs`
       within its baseline.
 
