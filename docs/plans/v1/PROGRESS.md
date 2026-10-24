@@ -56853,6 +56853,57 @@ C2d (the fast path writes, then waits; this commit closes it unless lone), the r
 the escape, `waiting_for_group` and `mine[]`'s class in status), C2f, C2g, C2h. Performance (G1: a delegate without a backup
 now costs a round trip to the root; not measured here). The harness scenarios and `status.ack.lone` (C2h).
 
+### Review (2026-10-24)
+
+Three holes closed, each an acknowledgement the group need not hold, each with a fail-before test (on the parent, or the
+code reverted):
+
+- **A backup that holds nothing is sealed too** (`a_backup_that_holds_nothing_is_sealed_against_later_appends`). Its
+  `sealed: false` answer ends the generation at the root's cursor, but it stayed unsealed and persisted and acknowledged a
+  later batch of the old delegate (acked 1 on the parent), rows the delegate could answer and the log never carries. Now
+  the seal is persisted first, rows held or not; an unpersisted seal is not answered (the root asks again).
+- **The end waits for the sealed tail's end** (`a_sealed_tail_drained_short_does_not_end_the_generation`; the part of D8
+  this commit's drop needs). A drain that stopped at a row whose dependencies the root lacks (or a newer tenure's row, an
+  append error), or a seal answered while the root could not end the recall, still ended the generation: the rows past
+  the break, perhaps answered through the backup, were dropped on the delegate where they used to be replayed. The
+  generation stays `Sealing` and the window's end asks the seal again. C2e keeps the retry from `deleg_after_event`.
+- **A dedup answer waits for its row in whichever generation journaled it**
+  (`a_dedup_answer_waits_for_its_row_in_another_generation`). D6 waited only for a row of the generation the retry reached;
+  a row of another generation of the same node was answered at once, `committed: true`.
+
+Sweeps (rebased on `origin/main`, release, workstation, 6 threads; `delegated-*`, `locks-delegated*`, `long-delegated*`,
+`*dcrash*` 0..500, `backup*` 0..300, 67 configurations): every failing seed and every oracle counter equal to the C2c run
+above (the three paths are not reached by these seeds); failing only the negative controls and
+`locks-delegated-partition-skew` 97, 452 (main fails them too).
+
+The five `deleg-group/*` stragglers: `delegated-holder-cut` 35 and `locks-unlinked-delegated-dbackup-random` 153 answer a
+row a takeover re-shipped (153: the delegate became the root by sealing its predecessor and released the park on its own
+re-applied tail; the row is in the predecessor's root group, the oracle checks only the delegate's group) — C3.
+`delegated-no-backup-root-near` 203: the delegate counted the append of a root whose epoch its backup had already sealed;
+the next root's log lacks the row and the delegate re-streams it (Q16's journaled cursor) — C3. `root-near` 446 and
+`long-delegated-backup` 65: the core answered its own client `Lone` just after a peer restarted, while the oracle's
+stability window already counted that peer — the D10 alignment, C5.
+
+The setup's quiet end on a root change: main fails `long-delegated-late-answers` 33, 51, 75, 108 of 0..120 on this host as
+on the box (seed 33: node 2 takes the root over at 1.7 s and itself ends generation 1 at 14 s, so no delegate holds it at
+the setup's check); the setup's own expectation, not an oracle. It does hide such seeds from the count: worth a counted line.
+
+G1 (`ack-latency`, release, loopback, the workstation with other jobs running, its state on the scratch dataset; 3 runs
+of 200 samples each, base and this tree interleaved; medians, µs). Topology 3's delegate (root near, no backup) against
+topology 2's holder (budget: holder + 500):
+
+| op | delegate p50 base -> here | p90 base -> here | holder p50 / p90 here | p50 / p90 budget |
+|---|---|---|---|---|
+| create | 68 -> 754 | 155 -> 942 | 590 / 713 | met / met |
+| write+fsync | 310 -> 1053 | 444 -> 1462 | 826 / 1110 | met / met |
+| rename | 77 -> 848 | 106 -> 1464 | 535 / 732 | met / **over by 232** |
+| unlink | 79 -> 821 | 162 -> 2202 | 605 / 1855 | met / met |
+| chmod | 39 -> 972 | 57 -> 2313 | 444 / 594 | **over by 28** / **over by 1219** |
+
+Topology 3's forwards rise by 0.4-1.2 ms at p50 (they wait for the root's append now); topology 4 (a recorded backup) moves
+within noise. A noisy host and three runs: the p90 overruns need the box's quiet run (C2d's gate) before Q4's fallback
+is weighed.
+
 ## Plan 43 C1-1 — The root group's commit holds across a listing and a removal
 
 The first commit of plan 43 C1 ([the commit rule](wip/43-commit-rule.md), the coder
