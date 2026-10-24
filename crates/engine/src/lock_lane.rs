@@ -479,6 +479,7 @@ mod tests {
                     sent: HonourMs(77),
                     results: Vec::new(),
                 },
+                LaneAction::Unanswered { to: 4 },
             ],
         );
         assert!(matches!(
@@ -492,6 +493,10 @@ mod tests {
                 sent: 77,
                 ..
             })
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SyncRequest::LaneUnanswered { to: 4 })
         ));
     }
 }

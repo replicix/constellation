@@ -22,10 +22,13 @@
 //!
 //! It never grants, upgrades, reclaims, answers `Lost` or `NotOwner`,
 //! releases, flushes, drops a held grant, installs a mirror, changes
-//! routing, writes or reads the store, or logs (a unit test greps this
-//! source for a tracing macro). What it cannot decide goes to the core,
-//! which decides as before when its step gets there: every result, `Ok`
-//! included, is reported to it ([`LaneAction::Report`]).
+//! routing (but for dropping the route of a renewal its owner did not
+//! answer, as the core does on a `NotOwner`), writes or reads the store,
+//! or logs (a unit test greps this source for a tracing macro). What it
+//! cannot decide goes to the core, which decides as before when its step
+//! gets there: every result, `Ok` included, is reported to it
+//! ([`LaneAction::Renewed`]), and so is an owner that did not answer
+//! ([`LaneAction::Unanswered`]: the core reads the lease for the owner).
 //!
 //! # Why every extension is one the core could have made
 //!

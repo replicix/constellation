@@ -486,7 +486,9 @@ drivers run it) does exactly three things:
 
 It never: grants, upgrades, reclaims (an unknown id), answers `Lost` or
 `NotOwner`, releases, flushes, drops a held grant, installs a mirror,
-changes routing state, writes the store, reads the store, or logs. A
+changes routing state (but for dropping the route of a renewal its owner
+did not answer, see Route in §5.4), writes the store, reads the store, or
+logs. A
 case it cannot decide goes to the core, which decides it as today when
 its step gets there.
 
@@ -634,7 +636,13 @@ For a grant with owner record `g` (this node's table), with
   §5.3. Otherwise the owner is, in order: the node the held grant's last
   `Ok` came from (`HeldGrant.route`, new, set by `renewed` and by the
   core's `lock_apply_renew_result`; cleared by a `NotOwner` the core
-  applies), `LeaseView`'s `lock_owner`, and (L6 only) the lane's
+  applies, and by the lane when its renewal there goes unanswered: it
+  then tells the core, `LaneAction::Unanswered`, which reads the lease
+  for the owner as after its own renewal's timeout. Kept, a dead root's
+  lockers renewed at it every forward timeout, holding the grants'
+  `renewing` marks so the core's tick never read the lease, until their
+  windows ended: the harness's `lock-failover` under a forward wall step,
+  EIO), `LeaseView`'s `lock_owner`, and (L6 only) the lane's
   `owner_hint` (§5.5). None: `renewal_failed`
   (clears the mark; the core relearns when it runs). Node-side routing
   is liveness only: a wrong owner answers `NotOwner` (`lock_route_answering`
