@@ -4772,12 +4772,19 @@ impl Core {
     ) -> bool {
         let acked = replica.backup_acked(role.epoch);
         // (Not what the log carries already: rows of the epoch this replica
-        // applied through — a tail that outlived a crash before its trim.)
+        // applied through — a tail that outlived a crash before its trim.
+        // Nor a delegate's row the root appended, `origin` of a generation:
+        // its identity is `(gen, idx)`, no re-ship names it with a `TailOf`
+        // and the delegate re-streams it to the next root — C3's, as in the
+        // successor's own copy, `apply_backup_tail`. Kept, it outlived every
+        // segment that carried it: delegated-holder-cut seed 170.)
         let shipped = replica.applied_jseq_of(role.epoch);
         let txs: Vec<BackupTx> = replica
             .backup_tail(role.epoch)
             .into_iter()
-            .filter(|t| t.last <= acked && t.last > shipped && !t.records.is_empty())
+            .filter(|t| {
+                t.last <= acked && t.last > shipped && !t.records.is_empty() && t.origin == (0, 0)
+            })
             .collect();
         if txs.is_empty() {
             return true;

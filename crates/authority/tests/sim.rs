@@ -13253,6 +13253,32 @@ fn c1_a_committed_entry_is_never_rolled_back() {
     }
 }
 
+/// Plan 43 C1-4 review: a backup whose holder's lease moved on keeps the
+/// root's own rows of its tail as a member copy, not the delegates' rows the
+/// root appended (their identity is `(gen, idx)`, no re-ship names them with
+/// a `TailOf`): at convergence no member copy is left. Fails on the parent:
+/// in `delegated-holder-cut` seed 170 (the default clock mix) node 2 kept six
+/// delegate rows of epoch 1 for good.
+#[test]
+fn c1_a_backups_member_copy_holds_no_delegate_rows() {
+    let r = run_seed(170, delegated_holder_cut_config()).unwrap_or_else(|e| {
+        panic!("seed 170: {e}\n  replay with AUTHORITY_SIM_CONFIG=delegated-holder-cut")
+    });
+    assert!(r.converged_checked, "seed 170 did not converge");
+    assert_eq!(
+        r.member_copy_rows_left, 0,
+        "member copies left at convergence"
+    );
+    assert!(
+        r.stats
+            .values()
+            .map(|s| s.tails_kept_as_member_copy)
+            .sum::<u64>()
+            > 0,
+        "no backup kept a tail: the seed no longer exercises the path"
+    );
+}
+
 /// I5 still finds what C1 does not change: a delegate's acknowledged op
 /// (DelegGroup until C2) rolled back by a root change, in
 /// `delegated-holder-cut` (the first seed of 0..60 that counts one fails
