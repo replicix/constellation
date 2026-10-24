@@ -1358,6 +1358,26 @@ Open, decided by measurement or later:
       verify` before and after (without the `stress-ng` step, a typo found
       after the run). The `off` run and both two-node runs did not finish:
       the build host became unreachable (PROGRESS "Plan 40 P9").
+      **Rerun, 2026-10-24** (xcheckfs `dd18db3`, kernel 7.3.0-0.rc4): `off`
+      one node (30 min, 6.3 M operations), `auto` and `off` with two nodes
+      (22 min of the mix each, on a floci S3, which has `If-Match`; the two
+      nodes have their own keys; trees of 129,400 and 119,200 files): **0
+      mismatches** in each, `xcheckfs verify` 0 differences before and after,
+      `ctl episodes` 0. The stress lane (`auto`, write-through and write-back,
+      about 26 min each, 46.6 M and 43.3 M operations) is also clean; its
+      `READDIRPLUS` pages were 1.7 M and 1.3 M. Together with P9's first `auto` run, no xcheckfs
+      run found anything from this plan; the runs were 22 to 30 minutes, not
+      the plan's hour, so the box stays unticked until a full-length repeat
+      or the maintainer accepts these. The two-node runs show a
+      problem that is not a finding of xcheckfs and is present with `off`
+      too, so not from this plan: the second node's replica lags the first
+      node's log by tens of thousands of entries under the 100,000-entry
+      `rm -rf` and `mkdir` mix, and its own `unlink` waits up to 1,230 s
+      (`fuse_requests.oldest_s`, "FUSE request is stalled" warnings), which
+      ended the sibling's 100,000-entry `rm -rf` step by its 20 minute bound.
+      Reported separately. A first attempt with two nodes on a file store (no
+      `If-Match`: the daemon warns "mount ... from ONE node only") is not a
+      valid run and is not counted.
 - [ ] §8 acceptance met on every host file system and kernel measured, or the
       default left `off` / R3a–R3b held back with the numbers reported (R8):
       **pending, box.** `bench/readdirplus/` is written and smoke-tested; the

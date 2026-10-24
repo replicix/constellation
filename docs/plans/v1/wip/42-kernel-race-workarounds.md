@@ -1820,6 +1820,19 @@ decided on this measurement:
       the disk stores in the full cell, though not on a fresh file system with
       any of base, K1-F2 alone, final, or final with the workarounds off;
       everything else met; §8.1 recorded.
+      **§7.3 (a) met, 2026-10-24:** the stress lane (xcheckfs `dd18db3`,
+      `--check thorough`, 47 stages, `stress-ng` 40 s per stressor, `--link 1` in
+      the mix) plus one thread opening and closing the files it writes, on an
+      ext4 primary and a Constellation secondary (file store, `READDIRPLUS`
+      `auto`, kernel 7.3.0-0.rc4, `enable_uring` `Y`), about 26 min each:
+      write-through 46.6 M operations, write-back 43.3 M operations (the opener
+      4.0 M and 3.4 M opens), **0 mismatches**, `xcheckfs verify` 0 differences,
+      `ctl episodes` empty at all 79 polls of each run. The host ran at load 9
+      to 14 from other runs of the same session. The lane skips `fallocate`,
+      `fpunch`, `iomix` and `xattr` when the trees are on different file
+      systems (its own rule). **§7.3 (b)** (`pc_race` and `nlink_race` through
+      the xcheckfs mount) and the base build's run were **not** part of this
+      pass; the item stays open for them.
 - [ ] Every CONVENTIONS gate green; pjdfstest 8798/8798; `stress-ng-fs`
       within its baseline.
 
