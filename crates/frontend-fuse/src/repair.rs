@@ -73,6 +73,10 @@ const LANE_THREADS: usize = 2;
 /// The watchdog's tick.
 const TICK: Duration = Duration::from_millis(10);
 
+/// The watchdog's tick while a job is on its last page ([`TAIL_GRACE`]
+/// is a few ticks of it; the 10 ms tick would add up to 20 ms to it).
+const TAIL_TICK: Duration = Duration::from_millis(1);
+
 /// The default bound (`CONSTELLATION_FUSE_WRITE_REPAIR_WAIT_MS`).
 pub const DEFAULT_WAIT: Duration = Duration::from_millis(1000);
 
@@ -84,7 +88,19 @@ pub const DEFAULT_WAIT: Duration = Duration::from_millis(1000);
 /// daemon has answered and the kernel not yet processed — so the grace is
 /// what such a reader may stay unscheduled, and past it the inode is
 /// marked S5 all the same.
-const TAIL_GRACE: Duration = Duration::from_millis(100);
+///
+/// Only a synchronous read can be that reader. Readahead (`READ`s sent in
+/// the background, `FUSE_ASYNC_READ`) unlocks its folios in the reply's
+/// own write, before the reply counts as written and the request leaves
+/// `ops_in_flight`; a `read_folio` (a page present but not uptodate, such
+/// as a partial write's) unlocks after its task wakes up. 10 ms covers
+/// that wake-up on a busy host; it does not cover a reader its cgroup's
+/// CPU quota keeps stopped longer (and 100 ms, one default quota period,
+/// did not cover every such case either). A write blocked on its own
+/// page holds `inode_lock`, so each release costs every writer of the
+/// file the grace: 100 ms made `pc_race` with an opener answer a ninth of
+/// its writes (plan 42 §8).
+const TAIL_GRACE: Duration = Duration::from_millis(10);
 
 /// A late repair is logged at most this often per inode.
 const LATE_LOG_EVERY: Duration = Duration::from_secs(60);
@@ -153,6 +169,8 @@ struct State {
 struct Inner {
     state: Mutex<State>,
     work: Condvar,
+    /// Wakes the watchdog (a job reached its last page).
+    watch: Condvar,
     pc: Arc<PageCacheTable>,
     gate: Arc<OnceLock<Arc<NotifyGate>>>,
     deferred: Arc<Deferred>,
@@ -183,6 +201,7 @@ impl RepairLane {
             inner: Arc::new(Inner {
                 state: Mutex::default(),
                 work: Condvar::new(),
+                watch: Condvar::new(),
                 pc,
                 gate,
                 deferred,
@@ -345,6 +364,7 @@ fn repair(inner: &Inner, job: &Job) {
     }
     if let Some(t) = job.tail {
         job.clock.lock().unwrap().in_tail = true;
+        inner.watch.notify_one();
         let _ = notifier.inval_inode(INodeNo(job.ino), (t * page) as i64, page as i64);
         pages += 1;
     }
@@ -405,14 +425,38 @@ fn repair(inner: &Inner, job: &Job) {
 }
 
 fn watchdog(inner: Weak<Inner>) {
+    let mut sleep = TICK;
     loop {
-        std::thread::sleep(TICK);
         let Some(inner) = inner.upgrade() else {
             return;
         };
+        // Woken early by a lane thread reaching a job's last page.
+        drop(
+            inner
+                .watch
+                .wait_timeout(inner.state.lock().unwrap(), sleep)
+                .unwrap(),
+        );
         if !tick(&inner, Instant::now()) {
             return;
         }
+        sleep = next_tick(&inner);
+    }
+}
+
+/// [`TAIL_TICK`] while a job's write may wait for [`TAIL_GRACE`] (its
+/// lane thread is on its last page and the write is not answered yet),
+/// else [`TICK`].
+fn next_tick(inner: &Inner) -> Duration {
+    let active = inner.state.lock().unwrap().active.clone();
+    let on_tail = active.iter().any(|job| {
+        let c = job.clock.lock().unwrap();
+        c.in_tail && !c.released && job.answer.lock().unwrap().is_some()
+    });
+    if on_tail {
+        TAIL_TICK
+    } else {
+        TICK
     }
 }
 
@@ -583,6 +627,49 @@ mod tests {
         let marks = marked_at_reply.load(Relaxed);
         assert_ne!(marks, u64::MAX, "answered at the bound");
         assert_ne!(marks, 0, "S5 set before the reply");
+    }
+
+    /// A write whose repair is blocked on its last page while nothing else
+    /// of the inode is in flight is answered once [`TAIL_GRACE`] has
+    /// passed, with S5 set, and the watchdog ticks at [`TAIL_TICK`] only
+    /// meanwhile. The writer holds `inode_lock` all that time, so every
+    /// writer of the file waits: the answer must come within 15 ms, not at
+    /// the 100 ms that cut `pc_race` with an opener to a ninth of its writes
+    /// (plan 42 §8; checked to fail with the grace at 100 ms).
+    #[test]
+    fn a_write_alone_on_its_last_page_is_answered_after_the_grace() {
+        let (lane, pc) = lane_without_gate(Duration::from_secs(60));
+        assert!(pc.write_begin(7, 1, false));
+        pc.op_done(7);
+        let answered = Arc::new(AtomicU64::new(0));
+        let job = {
+            let a = answered.clone();
+            Arc::new(Job {
+                ino: 7,
+                ranges: vec![],
+                tail: Some(0),
+                answer: Mutex::new(Some(Box::new(move || {
+                    a.fetch_add(1, Relaxed);
+                }))),
+                clock: Mutex::new(Clock {
+                    entered: true,
+                    in_tail: true,
+                    ..Default::default()
+                }),
+                _hold: lane.inner.deferred.hold_bounded(),
+            })
+        };
+        lane.inner.state.lock().unwrap().active.push(job.clone());
+        assert_eq!(next_tick(&lane.inner), TAIL_TICK);
+        let now = Instant::now();
+        assert!(tick(&lane.inner, now));
+        assert!(tick(&lane.inner, now + TAIL_GRACE / 2));
+        assert_eq!(answered.load(Relaxed), 0, "within the grace");
+        assert!(tick(&lane.inner, now + Duration::from_millis(15)));
+        assert_eq!(answered.load(Relaxed), 1, "answered after the grace");
+        assert_eq!(pc.counts().repairs_released, 1);
+        pc.with_entry(7, |e| assert_ne!(e.unwrap().marks, 0, "S5"));
+        assert_eq!(next_tick(&lane.inner), TICK, "nothing left to release");
     }
 
     /// The clock (module doc): it runs only while the job is entered and
