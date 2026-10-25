@@ -143,6 +143,43 @@ pub struct PendingClassGuard {
     prev: Option<crate::store::local::RowClass>,
 }
 
+thread_local! {
+    static CLASS_AT_JOURNAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Plan 43 C2d (§5.1): the class of the row the delegate's FUSE fast path
+/// journals is decided at the journaling — under the store's writer lock,
+/// from the class the core has published for the generation by then
+/// (`SessionState::deleg_row_class`) — not at the op's admission, which may
+/// be long before it holds the lock. With this set (by
+/// [`crate::Meta::delegate_execute_admitted`]) and no [`PendingClass`],
+/// `Meta::finish_local` reads the published class of the op's generation; a
+/// generation the core no longer publishes refuses the op unwritten
+/// (`MetaError::NotAdmitted`, through the core).
+pub(crate) struct ClassAtJournal;
+
+impl ClassAtJournal {
+    pub(crate) fn set() -> ClassAtJournalGuard {
+        ClassAtJournalGuard {
+            prev: CLASS_AT_JOURNAL.with(|c| c.replace(true)),
+        }
+    }
+
+    pub(crate) fn active() -> bool {
+        CLASS_AT_JOURNAL.with(|c| c.get())
+    }
+}
+
+pub(crate) struct ClassAtJournalGuard {
+    prev: bool,
+}
+
+impl Drop for ClassAtJournalGuard {
+    fn drop(&mut self) {
+        CLASS_AT_JOURNAL.with(|c| c.set(self.prev));
+    }
+}
+
 impl Drop for PendingClassGuard {
     fn drop(&mut self) {
         PENDING_CLASS.with(|c| c.set(self.prev));

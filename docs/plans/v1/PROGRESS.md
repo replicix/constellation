@@ -60348,3 +60348,39 @@ host for the scenarios as committed in the first commit; the leave step of
 constellation-harness --all-targets -D warnings` on the workstation. Not run
 here: the rest of the harness (the plan's full `harness run`), pjdfstest, the
 workspace tests: nothing in this commit touches product code.
+
+## Plan 43 C2d review: the class at the journal, `acked_max` for every answer, a covered row stays durable (2026-10-25)
+
+Three integrity holes of the delegate's fast path (C2d), each with a test that failed before the change.
+
+- **The class is decided when the row is journaled.** `mutate_op_rebasable_with_rid` read the class the core had
+  published at the admission and journaled it with `PendingClass`; the op may then wait for the store's writer lock
+  while the core publishes another (a backup candidate became stable: a `Lone` row answered at once that the group
+  never held). Plan 43 §5.1 says the class is decided at journal time, as the root path does. Now
+  `Meta::delegate_execute_admitted` sets `journal::ClassAtJournal`, and `finish_local`, which holds the writer lock,
+  reads `SessionState::deleg_row_class(gen)` for the row; a generation no longer published refuses the op unwritten
+  (`NotAdmitted`, through the core). The fast path's wait follows the class the row was journaled with
+  (`take_last_journaled`). Test `a_delegates_row_is_classed_when_it_is_journaled_not_when_admitted`.
+- **`acked_max` follows every committed index.** `report_deleg_durable` raised it only while the current class was
+  gated, so a `DelegGroup` row answered after the delegate turned lone left it behind and a backup at
+  `backup_acked == 0` joined the group record without holding it. It now raises to `through` whatever the class. It
+  cannot pin a group change while the delegate is lone: a lone delegate records no backup, so `through` is at most
+  the root's cursor or the log's index, which is what a removal checks (`acked_max <= streamed.max(logged)`), and an
+  addition waits only until the candidate has caught up with a stream that is sent to it regardless of the root.
+  Test `a_group_row_answered_after_the_delegate_turned_lone_keeps_acked_max`.
+- **A covered row stays durable after the generation is withdrawn.** `wait_deleg_durable` answered `Lost` for an
+  index the published watermark had covered once the generation's entry was gone, against its own doc. The session
+  now keeps the highest `through` published per generation (`deleg_covered`); a covered index answers `Durable`
+  whatever became of the delegation, an uncovered one in a withdrawn generation still `Lost`. The high-water of a
+  withdrawn generation is bounded (16 generations, the oldest first; a generation that covered nothing keeps none): a
+  waiter holds one generation for at most the durability wait budget, and one that outlives its tombstone is answered
+  `Lost`, which is in doubt, resubmitted by rid, slower and not wrong. The assertions of
+  `a_delegates_wait_follows_the_published_commit_point` and
+  `the_core_publishes_the_class_and_the_commit_point_to_the_fast_path` that pinned `Lost` for a covered row now pin
+  `Durable`. Tests `a_covered_row_stays_durable_after_the_generation_is_withdrawn`,
+  `withdrawn_generations_keep_a_bounded_high_water`.
+
+Left open: `report_deleg_durable` publishes once per core event, so the class the journal reads can lag the core by one
+event. A row journaled `Lone` just before the event that makes the delegate non-lone is answered at once (and is not in
+`acked_max` until the root's append covers it, as every lone row); a row journaled `DelegGroup` just before it turns
+lone waits for the group, which only costs latency. The window is one core event wide and is not widened by this change.

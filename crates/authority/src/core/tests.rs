@@ -36925,7 +36925,13 @@ mod deleg_group {
             write_eligible: vec![1, 2, 3],
         });
         assert_eq!(h.meta.session().deleg_row_class(7), None);
-        assert_eq!(deleg_wait(&h, 1), constellation_meta::DurableWait::Lost);
+        // Row 1 was covered before the withdrawal: it stays durable; row 2
+        // was not, and is in doubt.
+        assert!(matches!(
+            deleg_wait(&h, 1),
+            constellation_meta::DurableWait::Durable(_)
+        ));
+        assert_eq!(deleg_wait(&h, 2), constellation_meta::DurableWait::Lost);
     }
 
     /// Plan 43 C2d: the published commit point is the predicate the core
@@ -37022,6 +37028,100 @@ mod deleg_group {
         );
         root_acks(&mut h, req, round, last);
         assert_eq!(h.core.dl.mine[&7].group_requested, Some(vec![]));
+    }
+
+    /// Review claim 2 (fail-before): a row journaled `DelegGroup` (root near)
+    /// and answered by the fast path after the delegate turned lone (root
+    /// out of its RTT budget) is an answered row all the same: a backup
+    /// candidate that holds none of it must not be put in the group record
+    /// (`acked_max` is what `deleg_group_maintain` checks).
+    #[test]
+    fn a_group_row_answered_after_the_delegate_turned_lone_keeps_acked_max() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        root_is_near(&mut h);
+        // The FUSE thread's write, journaled DelegGroup (root near).
+        let ino = h.meta.allocate_ino(dir).unwrap();
+        let op = MutateOp::Create {
+            parent: dir,
+            name: "fast".into(),
+            ino,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        {
+            let _class =
+                constellation_meta::PendingClass::set(constellation_meta::RowClass::DelegGroup);
+            h.meta
+                .delegate_execute(
+                    &op,
+                    Some(h.rid(1)),
+                    7,
+                    Default::default(),
+                    &Default::default(),
+                    h.clk(),
+                )
+                .unwrap();
+        }
+        let out = h.step(Event::Roster {
+            write_eligible: vec![1, 2, 3, 4],
+        });
+        let (req, round, last) = batch(&out).expect("streamed to the root");
+        // The root drifts out of the budget: the delegate is lone.
+        h.step(Event::Peers {
+            links: vec![crate::event::PeerLink {
+                node: 1,
+                connected: true,
+                last_seen: None,
+                rtt_ms: Some(500),
+                since: Some(WaitMs(0)),
+            }],
+        });
+        assert!(h.core.deleg_lone(h.clk(), &h.core.dl.mine[&7]));
+        assert_eq!(
+            h.meta.session().deleg_row_class(7),
+            Some(constellation_meta::RowClass::Lone)
+        );
+        // The root appends the row: the fast path's wait ends, it answers.
+        root_acks(&mut h, req, round, last);
+        assert!(
+            matches!(
+                deleg_wait(&h, 1),
+                constellation_meta::DurableWait::Durable(_)
+            ),
+            "precondition: the fast path answers row 1"
+        );
+        let acked_max = h.core.dl.mine[&7].acked_max;
+        // A backup candidate comes up; it holds nothing (`backup_acked` 0).
+        h.step(Event::Peers {
+            links: vec![
+                crate::event::PeerLink {
+                    node: 1,
+                    connected: true,
+                    last_seen: None,
+                    rtt_ms: Some(500),
+                    since: Some(WaitMs(0)),
+                },
+                crate::event::PeerLink {
+                    node: 4,
+                    connected: true,
+                    last_seen: None,
+                    rtt_ms: Some(5),
+                    since: Some(WaitMs(0)),
+                },
+            ],
+        });
+        let mut out = Vec::new();
+        h.core.deleg_after_event(h.clk(), &h.meta, &mut out);
+        let d = &h.core.dl.mine[&7];
+        assert!(
+            acked_max == 1 && d.group_requested.is_none(),
+            "row 1 was answered by the fast path after the delegate turned lone, but acked_max = {acked_max} \
+             and the candidate (backup {:?}, backup_acked {}) was put in the group record: group_requested = {:?}",
+            d.backup,
+            d.backup_acked,
+            d.group_requested,
+        );
     }
 
     /// A retry of a rid whose row is still in the delegate's own uncommitted

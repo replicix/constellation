@@ -1556,3 +1556,66 @@ fn the_delegates_fast_path_resubmits_in_doubt_when_its_generation_is_lost() {
         assert_eq!(meta.session().stats().fast_acks_in_doubt, 1);
     }
 }
+
+/// Review claim 1 (fail-before): the row's class is decided when it is
+/// journaled (plan 43 §5.1), not at the admission. A write admitted while
+/// the core published `Lone`, then waiting for the writer lock while the
+/// core publishes `DelegGroup` (a backup candidate became stable), must be
+/// journaled `DelegGroup` and wait for its group.
+#[test]
+fn a_delegates_row_is_classed_when_it_is_journaled_not_when_admitted() {
+    use constellation_meta::RowClass;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (fs, meta, dir, _tmp, mut core) = delegate_fs(RowClass::Lone, 0);
+    let h = fs.sync.as_ref().unwrap();
+    let (op, rid) = delegate_create(dir, 1);
+    let (stop, submitted) = (AtomicBool::new(false), Mutex::new(Vec::new()));
+    let hook_ran = std::sync::Arc::new(AtomicBool::new(false));
+    let (class, waited) = std::thread::scope(|scope| {
+        let responder = scope.spawn(|| core_answering_in_doubt(&mut core, &stop, &submitted));
+        let write = scope.spawn(|| {
+            // Admitted under `Lone`; while it waits for the writer lock the
+            // core publishes the group's class.
+            let m = meta.clone();
+            let ran = hook_ran.clone();
+            constellation_meta::set_before_write_hook_for_tests(Some(Box::new(move || {
+                ran.store(true, Ordering::Relaxed);
+                m.session().set_deleg_durable(
+                    DELEG_GEN,
+                    Some(constellation_meta::DelegDurable {
+                        class: RowClass::DelegGroup,
+                        through: 0,
+                        lost: false,
+                    }),
+                );
+                true
+            })));
+            let r = fs.mutate_op_rebasable_with_rid(h, dir, &op, rid);
+            constellation_meta::set_before_write_hook_for_tests(None);
+            r
+        });
+        journaled_stream_row(&meta, 1);
+        let class = meta.journal_tx_class(meta.journal_tip().unwrap()).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let waited = !write.is_finished();
+        // The group holds the stream through the row.
+        meta.session().set_deleg_durable(
+            DELEG_GEN,
+            Some(constellation_meta::DelegDurable {
+                class: RowClass::DelegGroup,
+                through: 1,
+                lost: false,
+            }),
+        );
+        let _ = write.join().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        responder.join().unwrap();
+        (class, waited)
+    });
+    assert!(hook_ran.load(Ordering::Relaxed), "the hook never ran");
+    assert!(
+        class == Some(RowClass::DelegGroup) && waited,
+        "the core published DelegGroup before the row was journaled: journaled class {class:?}, \
+         write waited for its group: {waited}"
+    );
+}

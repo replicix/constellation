@@ -1579,10 +1579,15 @@ impl Core {
             let through = self.deleg_committed_through(d, replica.log_stream_idx(d.gen));
             // The fast path answers its own node's clients from the FUSE
             // thread, where the core does not see it: every index committed
-            // while the class waits may have been answered, so
-            // `deleg_group_maintain` lets go of none of them before the
-            // group that is left holds it (`acked_max`).
-            if class.gated() && through > d.acked_max {
+            // may have been answered — as a `DelegGroup` row journaled
+            // before the delegate turned lone is, whatever the class is
+            // now — so `deleg_group_maintain` lets go of none of them
+            // before the group that is left holds it (`acked_max`).
+            // For a lone delegate `through` is at most the root's cursor
+            // or the log's index, so the raise holds back an added backup
+            // only until it has caught up with what is streamed and never
+            // blocks a removal (`acked_max <= streamed.max(logged)`).
+            if through > d.acked_max {
                 raised.push((d.gen, through));
             }
             current.insert(

@@ -521,6 +521,24 @@ impl Meta {
         if end <= local.start {
             return Ok(());
         }
+        // Plan 43 C2d (§5.1): the delegate fast path's row is classed now,
+        // under the writer lock, by what the core has published for the
+        // generation at this moment. Decided before anything is recorded:
+        // a generation no longer published refuses the op unwritten.
+        let class_at_journal = match journal::PendingDelegate::peek() {
+            Some(d)
+                if d.idx.is_none()
+                    && journal::ClassAtJournal::active()
+                    && journal::PendingClass::current().is_none() =>
+            {
+                Some(
+                    self.session()
+                        .deleg_row_class(d.gen)
+                        .ok_or(MetaError::NotAdmitted)?,
+                )
+            }
+            _ => None,
+        };
         let (rid, op) = match journal::PendingLocalOp::take() {
             Some((rid, op)) => (rid, Some(op)),
             None => (None, None),
@@ -579,10 +597,10 @@ impl Meta {
         // rows); the FUSE fast path's threads publish nothing of their own
         // and take the class the core last published with the gate, which
         // is what their wait follows.
-        let class = match journal::PendingClass::current() {
-            Some(c) => c,
-            None if delegated => RowClass::Lone,
-            None => {
+        let class = match (journal::PendingClass::current(), class_at_journal) {
+            (Some(c), _) | (None, Some(c)) => c,
+            (None, None) if delegated => RowClass::Lone,
+            (None, None) => {
                 journal::note_from_session();
                 self.session().published_class()
             }
@@ -654,6 +672,7 @@ impl Meta {
         still_admitted: Box<dyn Fn() -> bool>,
     ) -> Result<(Vec<LogRecord>, u64), MetaError> {
         let _admission = journal::PendingAdmission::set(still_admitted);
+        let _class = journal::ClassAtJournal::set();
         self.delegate_execute(op, rid, gen, deps, tag, now)
     }
 

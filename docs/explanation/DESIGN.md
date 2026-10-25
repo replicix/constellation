@@ -893,7 +893,8 @@ lease and one log
   answers its own node's client from its disk; another node's forward still
   waits for the root. The delegate's own FUSE fast path writes
   first and waits for the group afterwards: it journals the row with the
-  class the core published for the generation and returns once the
+  class the core has published for the generation at the moment the row is
+  journaled, and returns once the
   generation's commit point covers the row (a lone delegate's and a
   designee's rows at once); a delegation lost meanwhile puts the op in doubt
   and it goes back through the core by rid. At the end of a generation the rows past its cut

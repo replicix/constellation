@@ -516,7 +516,21 @@ struct Inner {
     /// core says of the answers to this node's own clients
     /// ([`SessionState::set_deleg_durable`]).
     deleg_durable: std::collections::BTreeMap<u64, DelegDurable>,
+    /// Plan 43 C2d: per generation, the highest `through` ever published
+    /// for it. It outlives the generation's entry in `deleg_durable` (a
+    /// withdrawal) so that a row the group once covered stays `Durable`
+    /// for a waiter that comes or wakes after it; the withdrawn
+    /// generations' share is bounded by [`WITHDRAWN_COVERED_CAP`].
+    deleg_covered: std::collections::BTreeMap<u64, u64>,
 }
+
+/// How many withdrawn generations keep their high-water `through`
+/// ([`SessionState::set_deleg_durable`]). A waiter is on one generation for
+/// at most one `DURABLE_WAIT_BUDGET`; the oldest tombstone is dropped first
+/// (generations only grow), and a waiter that outlives its tombstone is
+/// answered `Lost`, which is in doubt, resubmitted by rid: slower, never
+/// wrong.
+const WITHDRAWN_COVERED_CAP: usize = 16;
 
 /// Disjoint inclusive journal seq ranges, `start -> end`.
 #[derive(Debug, Default, Clone)]
@@ -1403,8 +1417,33 @@ impl SessionState {
     pub fn set_deleg_durable(&self, gen: u64, d: Option<DelegDurable>) {
         let mut g = self.inner.lock().unwrap();
         let changed = match d {
-            Some(d) => g.deleg_durable.insert(gen, d) != Some(d),
-            None => g.deleg_durable.remove(&gen).is_some(),
+            Some(d) => {
+                let covered = g.deleg_covered.entry(gen).or_insert(0);
+                *covered = (*covered).max(d.through);
+                g.deleg_durable.insert(gen, d) != Some(d)
+            }
+            None => {
+                let was_held = g.deleg_durable.remove(&gen).is_some();
+                // Nothing was ever covered: no tombstone to keep.
+                if g.deleg_covered.get(&gen) == Some(&0) {
+                    g.deleg_covered.remove(&gen);
+                }
+                // Bound the tombstones: the oldest withdrawn generation
+                // goes first.
+                loop {
+                    let withdrawn: Vec<u64> = g
+                        .deleg_covered
+                        .keys()
+                        .filter(|k| !g.deleg_durable.contains_key(k))
+                        .copied()
+                        .collect();
+                    if withdrawn.len() <= WITHDRAWN_COVERED_CAP {
+                        break;
+                    }
+                    g.deleg_covered.remove(&withdrawn[0]);
+                }
+                was_held
+            }
         };
         drop(g);
         if changed {
@@ -1428,7 +1467,10 @@ impl SessionState {
     /// journaled stream index `idx` of generation `gen`: `Durable` once the
     /// group has committed the prefix through it (the log, or every member
     /// of the group; a row that is committed is answered whatever became of
-    /// the delegation since); `Lost` if the generation is not held, is
+    /// the delegation since, its withdrawal included: the generation's
+    /// high-water `through` outlives it, within [`WITHDRAWN_COVERED_CAP`]
+    /// withdrawn generations); `Lost` for a row not covered if the
+    /// generation is not held, is
     /// stopped, lapsed or lost its backup (the answer is in doubt: the core
     /// dedups the retry by rid and answers from the row's commit);
     /// `TimedOut` at `budget`. Never `Ungated`: a delegate that turned
@@ -1438,8 +1480,12 @@ impl SessionState {
         let started = Instant::now();
         let mut g = self.inner.lock().unwrap();
         loop {
+            // Covered once, covered for good: the high-water outlives the
+            // generation's withdrawal and its `lost` flag.
+            if g.deleg_covered.get(&gen).is_some_and(|c| *c >= idx) {
+                return DurableWait::Durable(started.elapsed());
+            }
             match g.deleg_durable.get(&gen) {
-                Some(d) if d.through >= idx => return DurableWait::Durable(started.elapsed()),
                 Some(d) if !d.lost => {}
                 _ => return DurableWait::Lost,
             }
@@ -1831,7 +1877,62 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         s.set_deleg_durable(7, None);
         assert_eq!(waiter.join().unwrap(), DurableWait::Lost);
-        assert_eq!(wait(7, 1), DurableWait::Lost);
+        // What the group covered before the withdrawal stays durable; the
+        // rest of the withdrawn generation is in doubt.
+        assert!(matches!(wait(7, 2), DurableWait::Durable(_)));
+        assert_eq!(wait(7, 3), DurableWait::Lost);
+    }
+
+    /// The tombstones of withdrawn generations are bounded: the oldest goes
+    /// first, a generation that covered nothing leaves none, a held one is
+    /// never dropped.
+    #[test]
+    fn withdrawn_generations_keep_a_bounded_high_water() {
+        let s = SessionState::default();
+        let published = |through| DelegDurable {
+            class: RowClass::DelegGroup,
+            through,
+            lost: false,
+        };
+        let wait = |gen, idx| s.wait_deleg_durable(gen, idx, Duration::ZERO);
+        // A held generation, and one that covered nothing before its withdrawal.
+        s.set_deleg_durable(1000, Some(published(1)));
+        s.set_deleg_durable(999, Some(published(0)));
+        s.set_deleg_durable(999, None);
+        assert_eq!(wait(999, 1), DurableWait::Lost);
+        let total = WITHDRAWN_COVERED_CAP as u64 + 4;
+        for gen in 1..=total {
+            s.set_deleg_durable(gen, Some(published(5)));
+            s.set_deleg_durable(gen, None);
+        }
+        assert_eq!(wait(1, 5), DurableWait::Lost, "the oldest was dropped");
+        assert!(matches!(wait(total, 5), DurableWait::Durable(_)));
+        assert!(matches!(wait(1000, 1), DurableWait::Durable(_)));
+        assert!(s.inner.lock().unwrap().deleg_covered.len() <= WITHDRAWN_COVERED_CAP + 1);
+    }
+
+    /// Review claim 3 (fail-before): a row the published watermark covers
+    /// is durable "whatever became of the delegation since"
+    /// (`wait_deleg_durable`'s doc), the withdrawal of the generation
+    /// included. `a_delegates_wait_follows_the_published_commit_point` pins
+    /// the opposite (`Lost` for a covered idx after the withdrawal).
+    #[test]
+    fn a_covered_row_stays_durable_after_the_generation_is_withdrawn() {
+        let s = SessionState::default();
+        s.set_deleg_durable(
+            7,
+            Some(DelegDurable {
+                class: RowClass::DelegGroup,
+                through: 2,
+                lost: false,
+            }),
+        );
+        s.set_deleg_durable(7, None);
+        let got = s.wait_deleg_durable(7, 1, Duration::ZERO);
+        assert!(
+            matches!(got, DurableWait::Durable(_)),
+            "idx 1 was covered (through 2) before the generation was withdrawn: {got:?}"
+        );
     }
 
     /// Plan 43 C1-2: the class the core publishes with the gate is what the
