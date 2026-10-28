@@ -1321,6 +1321,7 @@ pub trait PeerService: Send + Sync + 'static {
         })
     }
     /// Plan 30 §M8: a strict reader's ReadIndex. Default: not the holder.
+    #[allow(clippy::too_many_arguments)]
     fn read_index_requested(
         &self,
         _requester: u64,
@@ -1328,6 +1329,9 @@ pub trait PeerService: Send + Sync + 'static {
         _ino: u64,
         _dir: bool,
         _name: Option<String>,
+        _ahead: u8,
+        _ahead_dir: u64,
+        _ahead_name: String,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
         Box::pin(async move {
             Payload::ReadIndexReply {
@@ -1338,6 +1342,7 @@ pub trait PeerService: Send + Sync + 'static {
                 position_pending: None,
                 grant: None,
                 position_streams: Vec::new(),
+                ahead: None,
             }
         })
     }

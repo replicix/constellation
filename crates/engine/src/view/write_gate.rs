@@ -140,6 +140,20 @@ impl View {
         name: Option<&str>,
         keys: &[ReadKey],
     ) -> bool {
+        self.strict_read_hinted(ino, dir, name, keys, None)
+    }
+
+    /// [`Self::strict_read`] with `scan`: the directory and name this read
+    /// of a child (`ino`, no name) was looked up by, as a hint to the
+    /// sequencer that a scan is under way.
+    fn strict_read_hinted(
+        &self,
+        ino: Ino,
+        dir: bool,
+        name: Option<&str>,
+        keys: &[ReadKey],
+        scan: Option<(Ino, &str)>,
+    ) -> bool {
         let Some(h) = &self.sync else {
             return true;
         };
@@ -174,6 +188,7 @@ impl View {
                     ino,
                     dir,
                     name: name.map(str::to_string),
+                    ahead: constellation_authority::ReadAhead::None,
                     reply,
                 });
             }
@@ -189,6 +204,49 @@ impl View {
             );
             return false;
         }
+        // The ReadIndex is the plain one for `ino`. A directory read (the
+        // listing's first chunk) is the start of a scan: the answer also
+        // delegates the directory's first children. The read of a child a
+        // lookup under the directory's delegation missed (`scan`) tells
+        // the sequencer which directory and name, so that it can delegate
+        // the next children too when it answers for itself.
+        let ahead = match scan {
+            Some((dir, name)) => constellation_authority::ReadAhead::Siblings {
+                dir,
+                name: name.to_string(),
+            },
+            None if dir && name.is_none() => constellation_authority::ReadAhead::Listing,
+            None => constellation_authority::ReadAhead::None,
+        };
+        self.read_index_round(h, ino, dir, name, ahead, keys);
+        true
+    }
+
+    /// The strict read of the child a lookup under `parent`'s delegation
+    /// led to (`strict_read(parent, ..)` answered `false`): the plain
+    /// strict read of the child, under its own delegation or with a
+    /// ReadIndex of it, which for a file also carries the directory and
+    /// name as a hint: a sequencer answering for itself then delegates the
+    /// directory's next children too, so a scan pays a round trip once
+    /// per `CONSTELLATION_READ_AHEAD_GRANTS` entries, not once per entry.
+    pub(crate) fn strict_child_read(&self, parent: Ino, name: &str, child: Ino, dir: bool) {
+        let scan = (!dir).then_some((parent, name));
+        self.strict_read_hinted(child, dir, None, &[ReadKey::Ino(child)], scan);
+    }
+
+    /// One ReadIndex round trip for a strict read and the wait for the
+    /// position it answers (every outcome ends in the session wait,
+    /// bounded as M6's is).
+    fn read_index_round(
+        &self,
+        h: &SyncHandle,
+        ino: Ino,
+        dir: bool,
+        name: Option<&str>,
+        ahead: constellation_authority::ReadAhead,
+        keys: &[ReadKey],
+    ) {
+        let deleg = self.meta.read_delegations();
         let started = std::time::Instant::now();
         constellation_vfs::watch::stage("strict read index (core reply)");
         let (reply, answer) = tokio::sync::oneshot::channel();
@@ -197,6 +255,7 @@ impl View {
                 ino,
                 dir,
                 name: name.map(str::to_string),
+                ahead,
                 reply,
             })
             .is_ok();
@@ -239,7 +298,6 @@ impl View {
                 let _ = self.meta.session_wait(keys);
             }
         }
-        true
     }
 
     /// Plan 30 §M8: a write this node's FUSE fast path executed as the

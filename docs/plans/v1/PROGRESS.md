@@ -60564,3 +60564,84 @@ rounds with the change; it checks that the delegation held through the loop.
 Left open: the missed new name of the earlier campaign (no node logs) fits the same path but is not confirmed; a load
 campaign with this change; a directory's own attributes (mtime, nlink) from a delegate's stream, looked up by its name
 in a root-owned parent, are covered by the session wait only (on every node, not only the holder).
+
+## Perf: a strict cold scan asks for delegations on the next children, not a ReadIndex per child (plan 40 P9, 2026-10-29)
+
+07dee5d1 made a lookup under the parent's read delegation read the child strictly too, and a cold `ls -l` or
+`find | xargs stat` of 1000 files went from 187 ms to 374 ms (one ReadIndex per child, 2 to 1002; warm scans and opens
+unchanged). The cheaper alternative the review proposed (a write to a one-link child also recalls its parent's grants)
+was examined and not built: the parent it derives comes from the store as the write sees it, and a link, rename or
+unlink of the same child that is executed but not yet acknowledged (its ack waits for the very recall of that parent)
+can precede the write, which then recalls the wrong directory and is acknowledged while the reader still honours the
+old one and answers the old attributes from its stale replica. Closing that needs write-write ordering on the recall
+tables (a per-inode tail of the grants earlier link changes wait for, registered with an ordering counter against the
+writer lock), a post-execution re-recall on the inbox and delegate paths (which compute the set before they execute),
+and a change to the model. Not cheap, so not landed.
+
+What is built instead keeps the soundness of the per-child grant: the child's own delegation, which every write to the
+child already recalls. The request of a missed child is the plain ReadIndex of the child inode (`ino = child`, no
+name: what main sends), with one hint, `ReadAhead::Siblings { dir, name }`; a listing's first chunk is the directory's
+own plain ReadIndex with `ReadAhead::Listing`. Every node processes the request as the plain read: the delegate answers
+its own, the holder redirects by the owner of the inode, the reader installs the grant on the inode it asked about. Two
+earlier versions carried the child inside a parent-keyed request (`ino = dir`, `name`) and were wrong for that reason:
+the redirect and the install were keyed on the directory (a delegate's grant on the child landed on the directory's
+key), and the holder redirected by the owner of the entry name, which a plain read of the child never is. Only when
+the answering node is the root holder answering for itself (`on_read_index`'s Ok branch; a redirect clears the hint on
+the reader's side), and neither the directory's entries nor its inode are a delegate's by its table, does
+`Core::grant_ahead` grant ordinary delegations on up to `CONSTELLATION_READ_AHEAD_GRANTS` (128, at most 512) files of
+the directory in name order from the entry looked up, before the position is read (`ReadDelegations::grant_many`, one
+lock), with the single grant's lifetime, lease cap, `epoch_held` check and one persisted grant horizon; the position
+counts the unshipped writes of every inode granted (`unshipped_touches_inos`). Skipped: directories, `rd.blocked` (an
+inbox op waits for a recall), an inode a delegate owns (`deleg_read_owner`), an inode the same node holds a live grant
+on (no second grant, no second recall; its position is still good because a write would have recalled and forgotten
+it), and anything past `CONSTELLATION_READ_GRANTS_PER_NODE` (8192; the single grant is still made; 64 batches, enough
+for a cold scan of an 8000-file directory, and the table `touching` scans on every write stays at a few thousand
+entries per node however many scans run; a bigger directory is read with a round trip per child beyond it until
+earlier grants lapse). The reply carries `(ino, grant id)` pairs with one ttl and epoch (at most 512 pairs, about
+16 KB); the reader installs each through `install` with the request's recall generation, so a recall that overtook the
+answer voids the whole batch (the holder recalls what it granted; a per-inode generation is not done). The wire gained
+`ahead` (with `ahead_dir`, `ahead_name`) on `ReadIndex` and the read-ahead grants on `ReadIndexReply` (no
+compatibility shim).
+
+The listing's hint on the directory's own read has neither hole: a redirect of that read is keyed on the directory
+inode, as its plain read is (no entry name is involved: `name` is `None`), and the delegate's grant is installed on
+`r.ino`, the directory it was granted on; the delegate's answer carries no read-ahead.
+
+Tests: core `a_read_ahead_grants_children_and_a_write_to_one_recalls_its_grant` (a forwarded write to one batched
+child is held for that grant's recall only, a second listing grants only what was recalled, a sibling hint on a
+child's plain read grants the siblings after it), `a_read_ahead_is_bounded_and_skips_blocked_inodes` (the per-node
+bound included), `a_read_ahead_installs_ordinary_delegations_and_an_overtaking_recall_voids_them`,
+`a_redirected_child_read_installs_the_delegates_grant_on_the_child` (the reader sends the hint to the holder, which
+names the delegate; the resend carries no hint; the grant is held on the child, nothing on the directory),
+`a_delegate_ignores_the_read_ahead_hint`, `a_root_owned_child_named_in_a_delegated_directory_is_answered_by_the_root`
+(the plain read of a root-owned child is not sent to the owner of one of its names; no read-ahead in a delegated
+directory, read-ahead in a root-owned one), `a_read_ahead_position_counts_the_siblings_unshipped_writes`; meta
+`grant_many_makes_ordinary_grants_and_is_held_has_no_effects`; the sim's strict reads carry `ReadAhead::Listing`; the
+scenario `cto-scan-ahead` (a cold `ls -l` of 1000 files makes at most ceil(N/K)+2 ReadIndex calls, then rewrites of files
+at the start, the middle, the batch edges and the end are seen by the reader's next stat and read). `readdirplus-strict`,
+`cto-strict`, `cto-delegation-recall`, `cto-strict-delegated-read` and `cto-second-node-joins` pass.
+
+Measured (a 16-core EC2 box, release, 2 nodes, `--cto strict`, state on ext4, 3 passes in alternating order, n = 9 per
+scan cell; main is cba08da6, with the same throwaway measurement scenarios; load below 4):
+
+| | main | read-ahead |
+|---|---|---|
+| `ls -l` cold, 1000 files, ms median [min-max] | 368 [321-386] | 194 [130-221] |
+| `find \| xargs stat` cold | 368 [300-389] | 197 [152-233] |
+| ReadIndex calls, cold scan | 1002 | 9 |
+| warm scans (immediate, +2 s) | 143, 141 | 142, 144 |
+| open after close, new files, p50/p90 us | 3015 / 4163 | 2957 / 4068 |
+| open after close, same file, p50/p90 us | 2765 / 3763 | 2847 / 3823 |
+| writer: 100 overwrites while the reader holds the scan's delegations, p50/p90/p99 us | 1752 / 2369 / 3150 | 1723 / 2480 / 3029 |
+| recalls sent for those 100 writes | 100 | 100 |
+| the same writes with the reader idle, p50/p90 us | 1470 / 2087 | 1548 / 2235 |
+
+The cold scan is back to the cost it had before 07dee5d1 (187 ms); the writer pays the same recalls it paid when the
+reader held a delegation per scanned child (100 for 100 writes), at the same latency. What it costs: after a scan the
+holder carries one live grant per scanned file (as it did), plus up to 127 for files the reader never looked up when a
+scan stops inside a batch; a write to one of those waits for a recall it would not have waited for (one round trip to
+the reader, within its first 5 s). `ReadDelegations::touching` scans the live grants linearly, as before.
+
+Left open: a delegated subtree still pays a round trip per child (the delegate answers, and does not batch); a lookup of
+a single name after a sibling's miss asks for 128 grants, which random access over a big directory does not use; the
+cost of the grant table's linear `touching` with tens of thousands of live grants is not measured.

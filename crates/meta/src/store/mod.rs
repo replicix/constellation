@@ -1565,6 +1565,20 @@ impl Meta {
         *self.unshipped_seqs.lock().unwrap() = UnshippedSeqs::default();
     }
 
+    /// Tests only: every journaled row has shipped (the unshipped set is
+    /// empty), as a ship's acknowledgement with no writer beside it leaves it.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn mark_shipped_for_tests(&self) {
+        self.clear_unshipped_since(self.unshipped_gen());
+    }
+
+    /// Tests only: `ino`'s record was journaled and has not shipped (the
+    /// holder's own manifest commit notes it so).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn note_unshipped_ino_for_tests(&self, ino: u64) {
+        self.note_unshipped_ino(ino);
+    }
+
     /// The epoch this node executes under as holder, 0 when it holds none.
     pub fn holder_epoch(&self) -> u64 {
         self.holder_epoch.load(Ordering::SeqCst)

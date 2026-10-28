@@ -229,8 +229,36 @@ A directory's delegation covers its entries, not its children's
 attributes: a write to a child recalls the child's grants, not the
 directory's. So a lookup served under the directory's delegation also
 reads the child strictly, under the child's own delegation or with a
-ReadIndex that grants one. A cold scan of a directory (`ls -l`, `find`)
-therefore pays one round trip per child not delegated yet.
+ReadIndex that grants one.
+
+A scan would then pay one round trip per child, so the strict read of a
+directory's listing (its first chunk), and the strict read of a child
+that a lookup under a directory delegation the node holds found
+undelegated, carry a read-ahead hint. The read of the child is the plain
+ReadIndex of the child inode, exactly as without the hint (redirected to
+the delegate that owns it, answered with its position, its grant installed
+on it); the hint names the directory and the name it was looked up by.
+Only the sequencer answering for itself acts on it, and only for a
+directory it owns: its answer also carries ordinary delegations on up to
+`CONSTELLATION_READ_AHEAD_GRANTS` (128, at most 512; 0 turns it off)
+files of the directory, in name order from the entry looked up (a
+listing: from the first). Each is a grant like any other: made before the
+position is read (which counts their unshipped writes), with the same
+lifetime, lease cap and persisted horizon, recalled by a write to that
+one child (and waited for like a single grant), installed under the same
+race check. A delegate, or a node answering after a redirect, ignores the
+hint. Not granted: directories (a lookup of one keeps its strict read),
+an inode an inbox op waits on, an inode a delegate owns (its owner grants
+it; a scan of a delegated subtree still pays a round trip per child),
+anything in a continuation epoch, an inode the node already holds a live
+grant on, and anything past `CONSTELLATION_READ_GRANTS_PER_NODE` (8192)
+live grants on that node. A cold scan
+of N files costs about N/128 round trips (`cto-scan-ahead`); a write to
+any file of a scanned batch costs the same recall it did when each was
+read on its own. The first lookup that misses its child's delegation
+asks for read-ahead, so a single lookup in a directory can grant up to
+128 files of it; a write to one of those that nobody looked up pays one
+recall round trip within the grant's lifetime.
 
 - A grant lasts `CONSTELLATION_READ_DELEGATION_TTL_MS` (5 s), capped so
   that it never outlives the lease that backs it.
@@ -352,7 +380,7 @@ EC2 rows (four nodes in one AWS region; see
 | EC2, same region, open on another node than the writer | warm p50 0.15 ms; cold p50 27.4 ms, p99 44.1 ms | warm p50 0.39 ms; cold p50 29.5 ms, p99 76.8 ms |
 | Across continents, file nobody else writes | local | one WAN round trip on the first open, then local |
 | Across continents, write then open | stale until the log arrives | one WAN round trip, the minimum strict close-to-open allows |
-| Cold scan of N files (`ls -l`, `find`) | local | one round trip per file not delegated yet (not yet measured) |
+| Cold scan of 1000 files (`ls -l`, `find`), 16-core EC2 node | local | 9 round trips, 0.19 s (0.37 s without read-ahead, one round trip per file); a warm scan is local, 0.14 s |
 
 A writer's acknowledgement waits for recalls only on inodes another
 node holds a delegation on; a silent delegate costs up to its TTL plus

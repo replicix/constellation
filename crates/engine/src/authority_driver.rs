@@ -673,6 +673,8 @@ pub fn load_config(
             "0" | "off" | "false"
         );
     c.read_delegation_ttl_ms = crate::cto::read_delegation_ttl_ms();
+    c.read_ahead_grants = crate::cto::read_ahead_grants();
+    c.read_grants_per_node = crate::cto::read_grants_per_node();
     c.recall_hold_ms = (c.forward_timeout_ms / 2).max(1);
     // How long a forwarded `back` close may wait on the holder for its
     // own record before its held chunks go up (`Action::UploadAwaited`;
@@ -3365,9 +3367,15 @@ impl Driver {
                 ino,
                 dir,
                 name,
+                ahead,
                 reply,
             } => control(
-                Control::ReadIndex { ino, dir, name },
+                Control::ReadIndex {
+                    ino,
+                    dir,
+                    name,
+                    ahead,
+                },
                 ControlReply::ReadIndex(reply),
             ),
             SyncRequest::Recall { inos, reply } => {
@@ -3378,6 +3386,7 @@ impl Driver {
                 ino,
                 dir,
                 name,
+                ahead,
                 reply,
             } => {
                 let req = self.control_id();
@@ -3389,6 +3398,7 @@ impl Driver {
                         ino,
                         dir,
                         name,
+                        ahead,
                     },
                 }))
             }
@@ -4740,6 +4750,7 @@ impl Driver {
                 ino,
                 dir,
                 name,
+                ahead,
             } => {
                 let tx = self.int_tx.clone();
                 let peers = self.deps.peers.clone();
@@ -4753,6 +4764,19 @@ impl Driver {
                         ino,
                         dir,
                         name,
+                        ahead: match &ahead {
+                            constellation_authority::ReadAhead::None => 0,
+                            constellation_authority::ReadAhead::Listing => 1,
+                            constellation_authority::ReadAhead::Siblings { .. } => 2,
+                        },
+                        ahead_dir: match &ahead {
+                            constellation_authority::ReadAhead::Siblings { dir, .. } => *dir,
+                            _ => 0,
+                        },
+                        ahead_name: match ahead {
+                            constellation_authority::ReadAhead::Siblings { name, .. } => name,
+                            _ => String::new(),
+                        },
                     };
                     if denied {
                         // Fault injection: the link to this peer is cut —
@@ -4778,6 +4802,7 @@ impl Driver {
                             position_pending,
                             grant,
                             position_streams,
+                            ahead: ahead_grants,
                         })) if req_id == req.0 => {
                             let outcome = match status {
                                 0 => ReadIndexOutcome::Ok {
@@ -4792,6 +4817,13 @@ impl Driver {
                                         id,
                                         ttl_ms,
                                         epoch,
+                                    }),
+                                    ahead: ahead_grants.map(|(ttl_ms, epoch, grants)| {
+                                        Box::new(constellation_authority::AheadGrants {
+                                            ttl_ms,
+                                            epoch,
+                                            grants,
+                                        })
                                     }),
                                 },
                                 2 => ReadIndexOutcome::Busy,

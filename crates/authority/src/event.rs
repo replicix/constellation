@@ -326,6 +326,8 @@ pub enum Control {
         ino: Ino,
         dir: bool,
         name: Option<String>,
+        /// Read-ahead wanted with the answer.
+        ahead: ReadAhead,
     },
     /// Plan 30 §M8: a FUSE write this node executed as the sequencer
     /// touched `inos`, which carry read delegations: recall them (or
@@ -578,6 +580,9 @@ pub enum PeerMsg {
         ino: Ino,
         dir: bool,
         name: Option<String>,
+        /// Read-ahead: a hint on this read, which only the sequencer
+        /// answering for itself acts on.
+        ahead: ReadAhead,
     },
     ReadIndexReply {
         req: OpId,
@@ -1093,12 +1098,44 @@ pub enum ReadIndexOutcome {
     Ok {
         position: Position,
         grant: Option<ReadGrantMsg>,
+        /// Delegations on children of the directory (read-ahead), when
+        /// the request asked for them and the sequencer made any.
+        ahead: Option<Box<AheadGrants>>,
     },
     /// Not the holder (`holder`: whom it believes holds, 0 unknown).
     NotHolder { holder: NodeId },
     /// The holder, but fenced (its takeover gate, or a release in
     /// progress): ask again shortly.
     Busy,
+}
+
+/// What a `ReadIndex` asks for besides the read of its own inode: delegations
+/// on children of a directory. A hint: only the sequencer answering for
+/// itself acts on it (a delegate, or a node answering after a redirect,
+/// ignores it), and everything else about the read, its redirects, grants,
+/// position and the reader's install, is keyed on the request's `ino`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ReadAhead {
+    #[default]
+    None,
+    /// The request is a directory's own read (a listing's first chunk):
+    /// delegations on its first children.
+    Listing,
+    /// The request is a plain read of a child inode looked up by `name` in
+    /// directory `dir`: delegations on `dir`'s next children from `name`
+    /// (a scan will look them up one by one).
+    Siblings { dir: Ino, name: String },
+}
+
+/// Read delegations on children of a directory, granted with one
+/// `ReadIndex` answer: one lifetime and epoch for all (they were made
+/// together), each its own grant id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AheadGrants {
+    pub ttl_ms: u64,
+    pub epoch: Epoch,
+    /// `(ino, grant id)`.
+    pub grants: Vec<(Ino, u64)>,
 }
 
 /// A read delegation as granted on the wire: `ttl_ms` counts from when

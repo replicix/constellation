@@ -250,6 +250,17 @@ pub struct Config {
     pub read_delegations: bool,
     /// `CONSTELLATION_READ_DELEGATION_TTL_MS` (default 5000).
     pub read_delegation_ttl_ms: u64,
+    /// `CONSTELLATION_READ_AHEAD_GRANTS` (default 128): the most children
+    /// of a directory one ReadIndex answer grants delegations on besides
+    /// the one asked for (a cold scan then costs one round trip per this
+    /// many entries, not one per entry). 0: none.
+    pub read_ahead_grants: usize,
+    /// `CONSTELLATION_READ_GRANTS_PER_NODE` (default 8192): the most read
+    /// delegations one node may hold live from this sequencer before a
+    /// read-ahead grants nothing more (the single grant a read asks for is
+    /// still made). Bounds the grant table `touching` scans on every write
+    /// and the recalls a write to a much-scanned file fans out to.
+    pub read_grants_per_node: usize,
     /// How long a forwarded op's reply is held for recalls before it is
     /// answered `Held` (below the requester's forward timeout).
     pub recall_hold_ms: u64,
@@ -604,6 +615,8 @@ impl Config {
             stream_retry_max_ms: 5_000,
             read_delegations: true,
             read_delegation_ttl_ms: 5_000,
+            read_ahead_grants: 128,
+            read_grants_per_node: 8192,
             recall_hold_ms: 250,
             own_record_wait_ms: 10_000,
             held_retry_ms: 10,
@@ -837,6 +850,8 @@ pub struct Stats {
     pub read_index_refused: u64,
     /// Holder: read delegations granted.
     pub read_grants: u64,
+    /// Holder: of those, the read-ahead grants on children of a directory.
+    pub read_ahead_grants: u64,
     /// Holder: recalls sent, acked, and outwaited (no ack by the grant's
     /// expiry: an unreachable delegate).
     pub recalls_sent: u64,
@@ -2281,7 +2296,8 @@ impl Core {
                 ino,
                 dir,
                 name,
-            } => self.on_read_index(now, from, req, ino, dir, name, replica, out),
+                ahead,
+            } => self.on_read_index(now, from, req, ino, dir, name, ahead, replica, out),
             PeerMsg::ReadIndexReply { req, outcome } => {
                 self.on_read_index_reply(now, from, req, outcome, replica, out)
             }
@@ -2884,9 +2900,12 @@ impl Core {
                     out,
                 );
             }
-            Control::ReadIndex { ino, dir, name } => {
-                self.on_read_index_control(now, op, ino, dir, name, replica, out)
-            }
+            Control::ReadIndex {
+                ino,
+                dir,
+                name,
+                ahead,
+            } => self.on_read_index_control(now, op, ino, dir, name, ahead, replica, out),
             Control::Recall { inos } => self.on_recall_control(now, op, inos, replica, out),
             Control::Lock {
                 ino,

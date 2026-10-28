@@ -254,6 +254,8 @@ pub enum SyncRequest {
         ino: Ino,
         dir: bool,
         name: Option<String>,
+        /// Read-ahead wanted with the answer.
+        ahead: constellation_authority::ReadAhead,
         reply: tokio::sync::oneshot::Sender<constellation_authority::ReadAnswer>,
     },
     /// Plan 30 §M8: a write the FUSE fast path executed here as the
@@ -439,6 +441,7 @@ pub enum SyncRequest {
         ino: Ino,
         dir: bool,
         name: Option<String>,
+        ahead: constellation_authority::ReadAhead,
         reply: tokio::sync::oneshot::Sender<constellation_authority::ReadIndexOutcome>,
     },
     /// Plan 30 §M8: the sequencer recalls a read delegation this node

@@ -1793,9 +1793,14 @@ async fn handle_stream<S: PeerService>(
                 ino,
                 dir,
                 name,
+                ahead,
+                ahead_dir,
+                ahead_name,
             } => Some(
                 service
-                    .read_index_requested(requester, req_id, ino, dir, name)
+                    .read_index_requested(
+                        requester, req_id, ino, dir, name, ahead, ahead_dir, ahead_name,
+                    )
                     .await,
             ),
             Payload::ReadRecall {

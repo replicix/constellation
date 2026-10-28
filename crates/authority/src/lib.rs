@@ -46,9 +46,9 @@ pub use core::{
     EpochClaimView, EpochState, InboxView, LockView, ShipState, Stats,
 };
 pub use event::{
-    Carrier, CasFailure, Control, Event, LeaseKey, LockOutcome, LockRenewEntry, LockRenewResult,
-    LockTestOutcome, PeerLink, PeerMsg, Policy, ReadGrantMsg, ReadIndexOutcome, S3Failure,
-    S3Result, UploadResult,
+    AheadGrants, Carrier, CasFailure, Control, Event, LeaseKey, LockOutcome, LockRenewEntry,
+    LockRenewResult, LockTestOutcome, PeerLink, PeerMsg, Policy, ReadAhead, ReadGrantMsg,
+    ReadIndexOutcome, S3Failure, S3Result, UploadResult,
 };
 pub use ids::{Epoch, HonourMs, Ms, NodeId, Now, OpId, Seq, TimerId, WaitMs};
 pub use replica::Replica;

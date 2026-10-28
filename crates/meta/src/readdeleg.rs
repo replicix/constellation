@@ -257,6 +257,54 @@ impl ReadDelegations {
         id
     }
 
+    /// [`Self::grant`] for several inodes at once, one lock, all live
+    /// until `until`: the read-ahead of a ReadIndex answer. Each is an
+    /// ordinary grant (a write that touches the inode recalls it like any
+    /// other); like `grant`, it must be called before the position the
+    /// answer carries is read. Returns `(ino, grant id)` in order.
+    ///
+    /// An inode `node` holds a grant on that is live at `now` is left
+    /// out: no write has touched it since (that would have recalled the
+    /// grant, and the recall's ack forgotten it), so the delegation `node`
+    /// got then covers it still, and a second grant would only be a second
+    /// recall for the next write. (A delegation `node` let lapse sooner
+    /// than this table's margin reads strictly, as before.)
+    pub fn grant_many(
+        &self,
+        node: u64,
+        inos: &[u64],
+        until: WaitMs,
+        now: WaitMs,
+    ) -> Vec<(u64, u64)> {
+        let mut g = self.inner.lock().unwrap();
+        let live: std::collections::HashSet<u64> = g
+            .grants
+            .values()
+            .filter(|x| x.node == node && x.until > now)
+            .map(|x| x.ino)
+            .collect();
+        let mut made = Vec::with_capacity(inos.len());
+        for &ino in inos.iter().filter(|ino| !live.contains(ino)) {
+            g.next_grant += 1;
+            let id = g.next_grant;
+            g.grants.insert(
+                id,
+                ReadGrant {
+                    id,
+                    node,
+                    ino,
+                    until,
+                },
+            );
+            made.push((ino, id));
+        }
+        self.live_grants
+            .store(g.grants.len() as u64, Ordering::Relaxed);
+        drop(g);
+        self.stats.lock().unwrap().grants += made.len() as u64;
+        made
+    }
+
     /// What acknowledging a mutation that touched `inos` must wait for,
     /// at `now` (wait clock): every live grant on one of them held by a node other
     /// than `except` (the writer's own delegation is not recalled — its
@@ -285,6 +333,18 @@ impl ReadDelegations {
             grants,
             quarantine_until,
         }
+    }
+
+    /// How many grants `node` holds that are live at `now` (the bound on a
+    /// node's read-ahead).
+    pub fn live_for_node(&self, node: u64, now: WaitMs) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .grants
+            .values()
+            .filter(|x| x.node == node && x.until > now)
+            .count()
     }
 
     /// Every live grant (a release recalls them all first).
@@ -437,6 +497,18 @@ impl ReadDelegations {
             }
         }
         Some((held, renew))
+    }
+
+    /// Whether a delegation on `ino` is honoured at `now`, with none of
+    /// [`Self::valid`]'s effects (no renewal is claimed, a lapsed one is
+    /// kept).
+    pub fn is_held(&self, ino: u64, now: HonourMs) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .held
+            .get(&ino)
+            .is_some_and(|h| now < h.until)
     }
 
     /// A renewal attempt ended without a grant.
@@ -817,6 +889,14 @@ impl crate::store::Meta {
         Ok(())
     }
 
+    /// Whether this node's *unshipped* journal touched the record of any
+    /// of `inos`: the part of a read-ahead answer's position that is not
+    /// yet in a shipped segment, for the children it granted.
+    pub fn unshipped_touches_inos(&self, inos: &[u64]) -> bool {
+        let mine = self.unshipped.lock().unwrap();
+        inos.iter().any(|i| mine.inos.contains(i))
+    }
+
     /// Whether this node's *unshipped* journal touched `ino` (its record;
     /// with `dir`, also any entry in it), or the entry `(ino, name)`: the
     /// part of a ReadIndex position that is not yet in any shipped
@@ -869,6 +949,50 @@ mod tests {
             time_ns: 1,
         }];
         assert_eq!(recall_inos(&unlink), vec![3]);
+    }
+
+    #[test]
+    fn grant_many_makes_ordinary_grants_and_is_held_has_no_effects() {
+        let t = ReadDelegations::default();
+        let made = t.grant_many(2, &[10, 11, 12], WaitMs(1_000), WaitMs(0));
+        assert_eq!(
+            made.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            [10, 11, 12]
+        );
+        assert_eq!(t.live_grants(), 3);
+        // A grant the node holds live is not made twice; another node's
+        // grant, or a lapsed one, is no reason to skip.
+        let again = t.grant_many(2, &[10, 13], WaitMs(1_000), WaitMs(500));
+        assert_eq!(again.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [13]);
+        assert_eq!(t.grant_many(3, &[10], WaitMs(1_000), WaitMs(500)).len(), 1);
+        assert_eq!(
+            t.grant_many(2, &[10], WaitMs(3_000), WaitMs(1_000)).len(),
+            1
+        );
+        // Touching one inode recalls exactly its grant.
+        let need = t.touching(&[11], None, WaitMs(0));
+        assert_eq!(
+            need.grants.iter().map(|g| g.id).collect::<Vec<_>>(),
+            [made[1].1]
+        );
+        // `is_held` neither claims a renewal nor drops a lapsed delegation.
+        let held = HeldDelegation {
+            until: HonourMs(100),
+            position: Position::default(),
+            epoch: 1,
+            holder: 1,
+            grant: 1,
+            renew_at: HonourMs(10),
+        };
+        assert!(t.install(10, held, t.recall_gen()));
+        assert!(t.is_held(10, HonourMs(50)));
+        assert!(!t.is_held(10, HonourMs(100)));
+        assert!(
+            t.valid(10, HonourMs(50)).unwrap().1,
+            "the renewal is still unclaimed"
+        );
+        assert_eq!(t.held_count(), 1, "a lapsed one is kept by is_held");
+        assert!(!t.is_held(10, HonourMs(100)) && t.held_count() == 1);
     }
 
     #[test]

@@ -55,6 +55,9 @@ pub const MAX_LOG_SEGMENT: u64 = 64 * 1024 * 1024;
 /// tags, counters, author, and signature.
 pub const MAX_GOSSIP_DELTA_ADDS: usize = 900;
 
+/// A `ReadIndexReply`'s read-ahead delegations: `(ttl_ms, epoch, [(ino, grant id)])`.
+pub type ReadAheadGrants = (u64, u64, Vec<(u64, u64)>);
+
 /// What a peer can say. Extensible on purpose: phase 5 adds cooperative
 /// chunk serving over the same ALPN.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -362,6 +365,15 @@ pub enum Payload {
         ino: u64,
         dir: bool,
         name: Option<String>,
+        /// The read-ahead asked for besides this read (a hint only the
+        /// sequencer answering for itself acts on): 0 none, 1 the
+        /// directory's own read is a listing's (delegations on its first
+        /// children), 2 a plain read of a child looked up as `ahead_name`
+        /// in directory `ahead_dir` (delegations on that directory's next
+        /// children).
+        ahead: u8,
+        ahead_dir: u64,
+        ahead_name: String,
     },
     /// The sequencer's answer: `status` 0 = the position (and maybe a
     /// read delegation `(id, ttl_ms, epoch)`), 1 = not the holder
@@ -374,6 +386,9 @@ pub enum Payload {
         position_pending: Option<(u64, u64)>,
         grant: Option<(u64, u64, u64)>,
         position_streams: Vec<(u64, u64)>,
+        /// The read-ahead delegations: `(ttl_ms, epoch, [(ino, grant id)])`,
+        /// at most the sequencer's `CONSTELLATION_READ_AHEAD_GRANTS`.
+        ahead: Option<ReadAheadGrants>,
     },
     /// Plan 30 §M11: a delegate streams its transactions of generation
     /// `gen` to the root (`txs`: postcard of

@@ -1570,6 +1570,10 @@ async fn client_read(
                 ino: parent,
                 dir: true,
                 name: Some(leaf.clone()),
+                // With the read-ahead on, the sim's recalls and
+                // quarantines also cover the children a lookup's
+                // answer delegates.
+                ahead: constellation_authority::ReadAhead::Listing,
             })
         };
         match handle.meta.read_delegations().valid(parent, now) {

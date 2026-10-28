@@ -468,6 +468,7 @@ pub const SKIPPED: &[(&str, Skip)] = &[
     ("cto-delegation-recall", Skip::Local(&[CTO_STRICT, NODES3])),
     ("cto-recall-unreachable", Skip::Local(&[STOP, CTO_STRICT, NODES3])),
     ("cto-latency", Skip::Local(&[CTO_STRICT])),
+    ("cto-scan-ahead", Skip::Local(&[CTO_STRICT])),
     ("cto-second-node-joins", Skip::Local(&[CTO_STRICT])),
     ("cto-strict-root", Skip::Local(&[CTO_STRICT])),
     ("cto-strict-delegated-read", Skip::Local(&[CTO_STRICT, PLACEMENT])),

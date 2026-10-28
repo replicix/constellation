@@ -1074,6 +1074,13 @@ pub const SCENARIOS: &[Scenario] = &[
         run: m8::cto_strict,
     },
     Scenario {
+        name: "cto-scan-ahead",
+        desc: "cto-modes.md read-ahead: a cold ls -l of 1000 files on a strict non-sequencer costs at most ceil(N/K)+2 ReadIndex calls (K = CONSTELLATION_READ_AHEAD_GRANTS), and a write to any file of a batch is seen by the reader's very next stat",
+        requires: &[],
+        caps: &[],
+        run: m8::cto_scan_ahead,
+    },
+    Scenario {
         name: "cto-bounded",
         desc: "plan 30 M8: the cto-strict loop under --cto bounded (the default), documenting the staleness strict removes: how many reads right after a close elsewhere miss it, and how long until they see it",
         requires: &[],

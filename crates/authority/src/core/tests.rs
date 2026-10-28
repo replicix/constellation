@@ -7130,7 +7130,7 @@ fn a_lone_node_never_subscribes() {
 mod cto {
     use super::*;
     use crate::action::{ControlOk, ReadAnswer};
-    use crate::event::{Control, ReadGrantMsg, ReadIndexOutcome};
+    use crate::event::{Control, ReadAhead, ReadGrantMsg, ReadIndexOutcome};
     use constellation_fs_core::Ino;
     use constellation_meta::Position;
 
@@ -7166,6 +7166,7 @@ mod cto {
                 ino,
                 dir: false,
                 name: None,
+                ahead: crate::event::ReadAhead::None,
             },
         });
         match sends(&out).as_slice() {
@@ -7309,6 +7310,456 @@ mod cto {
         };
         assert_eq!(h.core.stats.recalls_acked, 1);
         assert_eq!(h.meta.read_delegations().live_grants(), 0);
+    }
+
+    /// A holder with files `a`..`e` and a subdirectory `d` in the root
+    /// (name order: a, b, c, d, e), all unshipped.
+    fn holder_with_files() -> (Harness, Vec<(String, Ino)>) {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        let mut files = Vec::new();
+        for name in ["a", "b", "c", "e"] {
+            let op = h.create(name);
+            let MutateOp::Create { ino, .. } = op else {
+                unreachable!()
+            };
+            constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+            files.push((name.to_string(), ino));
+        }
+        let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
+        constellation_meta::execute_mutate(
+            &h.meta,
+            &MutateOp::Mkdir {
+                parent: ROOT_INO,
+                name: "d".into(),
+                ino,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+            },
+            None,
+        )
+        .unwrap();
+        (h, files)
+    }
+
+    fn ask_ahead(
+        h: &mut Harness,
+        from: NodeId,
+        req: u64,
+        name: Option<&str>,
+        ahead: crate::event::ReadAhead,
+    ) -> ReadIndexOutcome {
+        ask_in(h, from, req, (ROOT_INO, true, name), ahead)
+    }
+
+    /// A ReadIndex of `ino` (its entries with `dir`, the entry `name` in
+    /// it), with `ahead` as the read-ahead hint.
+    fn ask_in(
+        h: &mut Harness,
+        from: NodeId,
+        req: u64,
+        (ino, dir, name): (Ino, bool, Option<&str>),
+        ahead: crate::event::ReadAhead,
+    ) -> ReadIndexOutcome {
+        let out = h.step(Event::Peer {
+            from,
+            msg: PeerMsg::ReadIndex {
+                req: OpId(req),
+                ino,
+                dir,
+                name: name.map(str::to_string),
+                ahead,
+            },
+        });
+        match sends(&out).as_slice() {
+            [(to, PeerMsg::ReadIndexReply { outcome, .. })] if *to == from => outcome.clone(),
+            other => panic!("expected one ReadIndexReply: {other:?}"),
+        }
+    }
+
+    fn ahead_of(outcome: &ReadIndexOutcome) -> crate::event::AheadGrants {
+        match outcome {
+            ReadIndexOutcome::Ok { ahead: Some(a), .. } => (**a).clone(),
+            other => panic!("expected read-ahead grants: {other:?}"),
+        }
+    }
+
+    /// The read-ahead of a ReadIndex: a listing's first chunk (or a lookup
+    /// that misses a child's delegation) is answered with ordinary
+    /// delegations on the directory's files, in name order from the entry
+    /// looked up; never the subdirectory. A write to any one of them is
+    /// not acknowledged until its delegate acks that grant's recall, as
+    /// for a single grant, and a write to a file not granted is not held.
+    #[test]
+    fn a_read_ahead_grants_children_and_a_write_to_one_recalls_its_grant() {
+        let (mut h, files) = holder_with_files();
+        let ino_of = |n: &str| files.iter().find(|(f, _)| f == n).unwrap().1;
+        // None asked, none granted.
+        let plain = ask_ahead(&mut h, 2, 1, None, ReadAhead::None);
+        assert!(matches!(plain, ReadIndexOutcome::Ok { ahead: None, .. }));
+        assert_eq!(h.meta.read_delegations().live_grants(), 1);
+        // A listing: the directory and its four files, not `d`.
+        let outcome = ask_ahead(&mut h, 2, 2, None, ReadAhead::Listing);
+        let dir_grant = grant_of(&outcome);
+        let a = ahead_of(&outcome);
+        assert_eq!(a.ttl_ms, 5_000);
+        assert_eq!(
+            a.grants.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            ["a", "b", "c", "e"].map(ino_of).to_vec()
+        );
+        assert_eq!(h.core.stats.read_ahead_grants, 4);
+        assert_eq!(h.meta.read_delegations().live_grants(), 1 + 1 + 4);
+        let ReadIndexOutcome::Ok { position, .. } = &outcome else {
+            unreachable!()
+        };
+        assert!(
+            position.pending.is_some(),
+            "the unshipped creates are part of the position"
+        );
+        // A write to `b` by node 3 waits for node 2's grant on `b` only.
+        let b_grant = a.grants.iter().find(|(i, _)| *i == ino_of("b")).unwrap().1;
+        let out = forward(&mut h, 3, 9, 1, setattr(ino_of("b")));
+        assert!(mutate_replies(&out).is_empty(), "the reply waits: {out:?}");
+        let rs = recalls(&out);
+        let [(2, recall, rino, grant)] = rs.as_slice() else {
+            panic!("expected one recall to node 2: {out:?}")
+        };
+        assert_eq!((*rino, *grant), (ino_of("b"), b_grant));
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegationRecalled { req: *recall },
+        });
+        let [(3, OpId(9), MutateOutcome::Accepted { .. })] = mutate_replies(&out).as_slice() else {
+            panic!("expected the held reply: {out:?}")
+        };
+        // The other grants stand; the writer's own is not recalled.
+        let out = forward(&mut h, 2, 10, 1, setattr(ino_of("c")));
+        assert!(recalls(&out).is_empty(), "{out:?}");
+        assert_eq!(mutate_replies(&out).len(), 1);
+        let _ = dir_grant;
+        // A second listing by the same node: its live grants are not made
+        // twice (the ones recalled above are).
+        let again = ask_ahead(&mut h, 2, 11, None, ReadAhead::Listing);
+        assert_eq!(
+            ahead_of(&again)
+                .grants
+                .iter()
+                .map(|(i, _)| *i)
+                .collect::<Vec<_>>(),
+            ["b"].map(ino_of).to_vec()
+        );
+        // The read of a child a scan looked up (a plain ReadIndex of the
+        // child, the directory and name as a hint): the child's own grant
+        // as ever, and the siblings after it; the child itself is not
+        // granted twice.
+        let outcome = ask_in(
+            &mut h,
+            4,
+            3,
+            (ino_of("c"), false, None),
+            ReadAhead::Siblings {
+                dir: ROOT_INO,
+                name: "c".into(),
+            },
+        );
+        assert!(grant_of(&outcome).id > 0);
+        assert_eq!(
+            ahead_of(&outcome)
+                .grants
+                .iter()
+                .map(|(i, _)| *i)
+                .collect::<Vec<_>>(),
+            ["e"].map(ino_of).to_vec()
+        );
+    }
+
+    /// A hint does not change the read: a redirected request is answered
+    /// and installed like a plain ReadIndex of the child. The reader sent a
+    /// child read with the sibling hint to the holder, which named the
+    /// delegate that owns the child; the request goes on to the delegate
+    /// without the hint; the delegate's grant is installed on the child (not
+    /// on the directory), and no read-ahead is installed.
+    #[test]
+    fn a_redirected_child_read_installs_the_delegates_grant_on_the_child() {
+        let mut r = reader();
+        let (child, dir) = (42, 7);
+        let out = r.step(Event::Control {
+            op: OpId(50),
+            req: Control::ReadIndex {
+                ino: child,
+                dir: false,
+                name: None,
+                ahead: ReadAhead::Siblings {
+                    dir,
+                    name: "f".into(),
+                },
+            },
+        });
+        let (first, req) = match sends(&out).as_slice() {
+            [(
+                1,
+                PeerMsg::ReadIndex {
+                    req,
+                    ino,
+                    name,
+                    ahead,
+                    ..
+                },
+            )] => {
+                assert_eq!((*ino, name.as_deref()), (child, None));
+                assert!(matches!(ahead, ReadAhead::Siblings { .. }));
+                (*req, *req)
+            }
+            other => panic!("expected a ReadIndex to node 1: {other:?}"),
+        };
+        let _ = req;
+        // The holder: not mine, node 3's.
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::ReadIndexReply {
+                req: first,
+                outcome: ReadIndexOutcome::NotHolder { holder: 3 },
+            },
+        });
+        let second = match sends(&out).as_slice() {
+            [(
+                3,
+                PeerMsg::ReadIndex {
+                    req,
+                    ino,
+                    dir: d,
+                    name,
+                    ahead,
+                },
+            )] => {
+                assert_eq!((*ino, *d, name.as_deref()), (child, false, None));
+                assert_eq!(*ahead, ReadAhead::None, "after a redirect, a plain read");
+                *req
+            }
+            other => panic!("expected the redirect to node 3: {other:?}"),
+        };
+        // The delegate's answer: a grant on the child it was asked about.
+        let out = r.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::ReadIndexReply {
+                req: second,
+                outcome: granted(9),
+            },
+        });
+        assert!(matches!(
+            answer(&out, 50),
+            ReadAnswer::Position {
+                delegated: true,
+                ..
+            }
+        ));
+        let d = r.meta.read_delegations();
+        let (held, _) = d.valid(child, r.honour()).expect("held on the child");
+        assert_eq!((held.grant, held.holder), (9, 3));
+        assert!(
+            d.valid(dir, r.honour()).is_none(),
+            "nothing on the directory"
+        );
+        assert_eq!(d.held_count(), 1);
+    }
+
+    /// The delegate that owns a child answers a child read as a plain
+    /// ReadIndex of it, whatever hint it carries: a grant on the child, no
+    /// read-ahead (and nothing on the directory the hint names).
+    #[test]
+    fn a_delegate_ignores_the_read_ahead_hint() {
+        let (mut h, dir, _t0, _lapse) = super::delegate_renewed_once();
+        let file = h.meta.allocate_ino(dir).unwrap();
+        let op = MutateOp::Create {
+            parent: dir,
+            name: "f".into(),
+            ino: file,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        let outcome = ask_in(
+            &mut h,
+            2,
+            1,
+            (file, false, None),
+            ReadAhead::Siblings {
+                dir,
+                name: "f".into(),
+            },
+        );
+        let ReadIndexOutcome::Ok { grant, ahead, .. } = &outcome else {
+            panic!("{outcome:?}")
+        };
+        assert!(grant.is_some() && ahead.is_none(), "{outcome:?}");
+        let d = h.meta.read_delegations();
+        assert_eq!(d.live_grants(), 1);
+        assert_eq!(d.touching(&[file], None, h.clk().wait).grants.len(), 1);
+        assert!(d.touching(&[dir], None, h.clk().wait).grants.is_empty());
+    }
+
+    /// A root-owned child whose name is in a delegated directory: the
+    /// sequencer answers the child's plain read itself (a plain ReadIndex of
+    /// the child is never sent to the owner of one of its names), and the
+    /// hint naming that directory yields no read-ahead, the directory's
+    /// entries not being its to answer for. (The primary name of `x` is in
+    /// the root, which owns it; `/d`, node 3's, holds a second link.)
+    #[test]
+    fn a_root_owned_child_named_in_a_delegated_directory_is_answered_by_the_root() {
+        let mut h = super::root_with_delegate_backed_by(4);
+        let d = h.meta.child_ino(ROOT_INO, "d").unwrap().unwrap();
+        let x = h.meta.allocate_ino(ROOT_INO).unwrap();
+        for op in [
+            MutateOp::Create {
+                parent: ROOT_INO,
+                name: "x".into(),
+                ino: x,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            MutateOp::Link {
+                ino: x,
+                parent: d,
+                name: "hl".into(),
+            },
+            MutateOp::Create {
+                parent: ROOT_INO,
+                name: "y".into(),
+                ino: h.meta.allocate_ino(ROOT_INO).unwrap(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+        ] {
+            constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        }
+        let clk = h.clk();
+        assert_eq!(h.core.deleg_read_owner(clk, x, None, &h.meta), None);
+        assert_eq!(
+            h.core.deleg_read_owner(clk, d, Some("hl"), &h.meta),
+            Some(3)
+        );
+        let outcome = ask_in(
+            &mut h,
+            2,
+            1,
+            (x, false, None),
+            ReadAhead::Siblings {
+                dir: d,
+                name: "hl".into(),
+            },
+        );
+        let ReadIndexOutcome::Ok { grant, ahead, .. } = &outcome else {
+            panic!("redirected to the owner of a name: {outcome:?}")
+        };
+        assert!(grant.is_some(), "{outcome:?}");
+        assert!(ahead.is_none(), "no read-ahead in a delegated directory");
+        // The same hint for a root-owned directory is acted on.
+        let outcome = ask_in(
+            &mut h,
+            5,
+            2,
+            (x, false, None),
+            ReadAhead::Siblings {
+                dir: ROOT_INO,
+                name: "x".into(),
+            },
+        );
+        assert!(matches!(
+            outcome,
+            ReadIndexOutcome::Ok { ahead: Some(_), .. }
+        ));
+    }
+
+    /// The position of a read-ahead answer counts the unshipped writes of
+    /// the siblings it granted (ordering: grant, then position).
+    #[test]
+    fn a_read_ahead_position_counts_the_siblings_unshipped_writes() {
+        let (mut h, files) = holder_with_files();
+        let ino_of = |n: &str| files.iter().find(|(f, _)| f == n).unwrap().1;
+        h.meta.mark_shipped_for_tests();
+        let hint = || ReadAhead::Siblings {
+            dir: ROOT_INO,
+            name: "c".into(),
+        };
+        let outcome = ask_in(&mut h, 2, 1, (ino_of("c"), false, None), hint());
+        let ReadIndexOutcome::Ok { position, .. } = &outcome else {
+            panic!("{outcome:?}")
+        };
+        assert!(position.pending.is_none(), "nothing unshipped");
+        h.meta.note_unshipped_ino_for_tests(ino_of("e"));
+        let outcome = ask_in(&mut h, 3, 2, (ino_of("c"), false, None), hint());
+        let ReadIndexOutcome::Ok { position, .. } = &outcome else {
+            panic!("{outcome:?}")
+        };
+        assert!(
+            position.pending.is_some(),
+            "an unshipped write to a granted sibling is part of the position"
+        );
+    }
+
+    /// The read-ahead is bounded, skips an inode an inbox op waits on, and
+    /// is not made by a node that cannot grant.
+    #[test]
+    fn a_read_ahead_is_bounded_and_skips_blocked_inodes() {
+        let (mut h, files) = holder_with_files();
+        let ino_of = |n: &str| files.iter().find(|(f, _)| f == n).unwrap().1;
+        h.core.cfg.read_ahead_grants = 3;
+        let outcome = ask_ahead(&mut h, 2, 1, None, ReadAhead::Listing);
+        // Three entries are read (a, b, c), not four.
+        assert_eq!(
+            ahead_of(&outcome)
+                .grants
+                .iter()
+                .map(|(i, _)| *i)
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"].map(ino_of).to_vec()
+        );
+        h.core.cfg.read_ahead_grants = 128;
+        let until = h.clk().wait.plus(60_000);
+        h.core.rd.blocked.insert(ino_of("b"), until);
+        let outcome = ask_ahead(&mut h, 3, 2, None, ReadAhead::Listing);
+        assert_eq!(
+            ahead_of(&outcome)
+                .grants
+                .iter()
+                .map(|(i, _)| *i)
+                .collect::<Vec<_>>(),
+            ["a", "c", "e"].map(ino_of).to_vec()
+        );
+        h.core.rd.blocked.clear();
+        // A node's live grants are bounded: past the bound the read-ahead
+        // grants nothing more, the single grant is still made.
+        h.core.cfg.read_grants_per_node =
+            h.meta.read_delegations().live_for_node(5, h.clk().wait) + 3;
+        let outcome = ask_ahead(&mut h, 5, 4, None, ReadAhead::Listing);
+        assert!(matches!(
+            outcome,
+            ReadIndexOutcome::Ok { grant: Some(_), .. }
+        ));
+        assert_eq!(
+            ahead_of(&outcome).grants.len(),
+            2,
+            "3 less the single grant"
+        );
+        let outcome = ask_ahead(&mut h, 5, 5, None, ReadAhead::Listing);
+        assert!(matches!(
+            outcome,
+            ReadIndexOutcome::Ok {
+                grant: Some(_),
+                ahead: None,
+                ..
+            }
+        ));
+        h.core.cfg.read_grants_per_node = 8192;
+        h.core.cfg.read_ahead_grants = 0;
+        assert!(matches!(
+            ask_ahead(&mut h, 4, 3, None, ReadAhead::Listing),
+            ReadIndexOutcome::Ok { ahead: None, .. }
+        ));
     }
 
     /// M16: an unlink's records name only the parent and the entry, yet
@@ -7612,6 +8063,7 @@ mod cto {
                 ino,
                 dir: false,
                 name: None,
+                ahead: crate::event::ReadAhead::None,
             },
         });
         match sends(&out).as_slice() {
@@ -7644,7 +8096,83 @@ mod cto {
                 ttl_ms: 5_000,
                 epoch: 1,
             }),
+            ahead: None,
         }
+    }
+
+    /// The reader installs a read-ahead's children as ordinary
+    /// delegations (honoured until sent + ttl − margin, under the answer's
+    /// position); a recall of one removes only that one; a recall that
+    /// overtakes the reply voids the whole answer, which the holder then
+    /// recalls.
+    #[test]
+    fn a_read_ahead_installs_ordinary_delegations_and_an_overtaking_recall_voids_them() {
+        let mut r = reader();
+        let sent = r.honour();
+        let reply = |id0: u64| {
+            let mut o = granted(id0);
+            if let ReadIndexOutcome::Ok { ahead, .. } = &mut o {
+                *ahead = Some(Box::new(crate::event::AheadGrants {
+                    ttl_ms: 5_000,
+                    epoch: 1,
+                    grants: vec![(101, id0 + 1), (102, id0 + 2), (103, id0 + 3)],
+                }));
+            }
+            o
+        };
+        let req = read_control(&mut r, 50, 42);
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::ReadIndexReply {
+                req,
+                outcome: reply(10),
+            },
+        });
+        let d = r.meta.read_delegations();
+        for ino in [42, 101, 102, 103] {
+            let (held, _) = d.valid(ino, HonourMs(sent.0 + 3_999)).unwrap();
+            assert_eq!(held.position.seq, 3, "under the answer's position");
+        }
+        assert!(d.valid(102, HonourMs(sent.0 + 4_000)).is_none());
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegationRecall {
+                req: OpId(77),
+                ino: 102,
+                grant: 12,
+            },
+        });
+        let d = r.meta.read_delegations();
+        assert!(d.valid(102, r.honour()).is_none());
+        assert!(d.valid(101, r.honour()).is_some());
+        assert!(d.valid(103, r.honour()).is_some());
+        // A recall overtakes the reply: none of the answer is installed.
+        let req = read_control(&mut r, 51, 50);
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegationRecall {
+                req: OpId(78),
+                ino: 999,
+                grant: 99,
+            },
+        });
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::ReadIndexReply {
+                req,
+                outcome: {
+                    let mut o = reply(20);
+                    if let ReadIndexOutcome::Ok { ahead, .. } = &mut o {
+                        ahead.as_mut().unwrap().grants = vec![(201, 21), (202, 22)];
+                    }
+                    o
+                },
+            },
+        });
+        let d = r.meta.read_delegations();
+        assert!(d.valid(201, r.honour()).is_none());
+        assert!(d.valid(202, r.honour()).is_none());
+        assert!(d.valid(50, r.honour()).is_none());
     }
 
     #[test]
@@ -7657,6 +8185,7 @@ mod cto {
                 ino: ROOT_INO,
                 dir: true,
                 name: Some("x".into()),
+                ahead: crate::event::ReadAhead::None,
             },
         });
         assert_eq!(answer(&out, 5), ReadAnswer::Holder);
@@ -7751,6 +8280,7 @@ mod cto {
                 ino: 42,
                 dir: false,
                 name: None,
+                ahead: crate::event::ReadAhead::None,
             },
         });
         let deadline = timer_of(&out, TimerKind::ReadIndexDeadline);
@@ -11321,6 +11851,7 @@ fn a_reader_treats_an_unobserved_holder_as_live() {
             ino: 42,
             dir: false,
             name: None,
+            ahead: crate::event::ReadAhead::None,
         },
     });
     let (get, req) = only_s3(&out);

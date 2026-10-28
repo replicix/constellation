@@ -312,12 +312,7 @@ impl Vfs for View {
                 if child_covered {
                     self.session_wait(&[ReadKey::Ino(attr.ino)]);
                 } else {
-                    self.strict_read(
-                        attr.ino,
-                        attr.kind == InodeKind::Dir,
-                        None,
-                        &[ReadKey::Ino(attr.ino)],
-                    );
+                    self.strict_child_read(parent, &name, attr.ino, attr.kind == InodeKind::Dir);
                 }
                 // A name looked up while its inode has pending writes
                 // must report the pending size, or the entry reply caches

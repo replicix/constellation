@@ -826,3 +826,90 @@ pub fn cto_strict_delegated_read(_seed: u64) -> Result<()> {
     unmount_all(&mut clients);
     result
 }
+
+/// Read-ahead (cto-modes.md): a cold `ls -l` of N files on a strict reader
+/// that is not the sequencer costs about N/K ReadIndex round trips, not N
+/// (K = `CONSTELLATION_READ_AHEAD_GRANTS`), and the delegations it got
+/// are ordinary: a write to any one of the files, wherever it sits in a
+/// batch, is seen by the reader's very next stat.
+pub fn cto_scan_ahead(_seed: u64) -> Result<()> {
+    use std::process::{Command, Stdio};
+    const NAME: &str = "cto-scan-ahead";
+    const K: usize = 128;
+    const N: usize = 1000;
+    let k = K.to_string();
+    let (_env, _root, mut clients) = cluster(
+        NAME,
+        &["a", "r"],
+        "strict",
+        &[("CONSTELLATION_READ_AHEAD_GRANTS", &k)],
+    )?;
+    let result = (|| -> Result<()> {
+        let (a, r) = (&clients[0], &clients[1]);
+        let d = a.mnt.join("d");
+        std::fs::create_dir(&d)?;
+        for i in 0..N {
+            std::fs::write(d.join(format!("file-{i:05}")), format!("content {i}"))?;
+        }
+        eventually(
+            "the last file visible on r",
+            Duration::from_secs(60),
+            || {
+                anyhow::ensure!(
+                    r.mnt.join("d").join(format!("file-{:05}", N - 1)).is_file(),
+                    "not yet"
+                );
+                Ok(())
+            },
+        )?;
+        // The delegations of that wait lapse (TTL 5 s); the scan is cold.
+        std::thread::sleep(Duration::from_secs(8));
+        let rd = r.mnt.join("d");
+        let ri = |c: &Client| -> Result<u64> { Ok(n(&cto_of(c)?, "read_index")) };
+        let before = ri(r)?;
+        let t = Instant::now();
+        let st = Command::new("ls")
+            .args(["-l", "--color=never"])
+            .arg(&rd)
+            .stdout(Stdio::null())
+            .status()?;
+        anyhow::ensure!(st.success(), "ls -l failed: {st}");
+        let took = t.elapsed();
+        let calls = ri(r)? - before;
+        let bound = (N.div_ceil(K) + 2) as u64;
+        eprintln!("    {NAME}: cold ls -l of {N} files: {took:?}, {calls} ReadIndex calls (bound {bound})");
+        anyhow::ensure!(
+            calls <= bound,
+            "a cold ls -l of {N} files made {calls} ReadIndex calls, more than ceil(N/K)+2 = {bound}; reader {}",
+            cto_of(r)?
+        );
+        // The batch's delegations are ordinary: a write to a file at the
+        // start, the middle, the batch edges and the end is seen at once.
+        let recalls_before = n(&cto_of(a)?, "recalls_sent");
+        let mut changed = 0;
+        for i in [0usize, 1, 63, 127, 128, 129, 500, 999] {
+            let path = format!("file-{i:05}");
+            let content = format!("rewritten {i} with a longer content");
+            std::fs::write(d.join(&path), &content)?;
+            let len = std::fs::metadata(rd.join(&path))?.len();
+            anyhow::ensure!(
+                len == content.len() as u64,
+                "stat {path} on r after a's close: size {len}, want {}; reader {}",
+                content.len(),
+                cto_of(r)?
+            );
+            let got = std::fs::read_to_string(rd.join(&path))?;
+            anyhow::ensure!(got == content, "read {path} on r: {got:?}");
+            changed += 1;
+        }
+        let recalls = n(&cto_of(a)?, "recalls_sent") - recalls_before;
+        eprintln!("    {NAME}: {changed} rewrites, {recalls} recalls sent by the sequencer");
+        anyhow::ensure!(
+            recalls >= 1,
+            "no write recalled a batched delegation (recalls sent {recalls})"
+        );
+        Ok(())
+    })();
+    unmount_all(&mut clients);
+    result
+}

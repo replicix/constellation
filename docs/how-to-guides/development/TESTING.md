@@ -2142,6 +2142,12 @@ relay of its own so requests can be attributed per role):
     same workload (strict must ask no sequencer), and a LAN
     non-sequencer's first strict open of each of 50 files (one ReadIndex
     each) against its repeat opens (none).
+  - `cto-scan-ahead`: read-ahead. R, a strict non-sequencer, lists 1000
+    files A wrote with a cold `ls -l`: at most ceil(N/K)+2 ReadIndex round
+    trips (K = `CONSTELLATION_READ_AHEAD_GRANTS`, 128), not one per file;
+    A then rewrites files from the start, middle, batch edges and end of
+    the scan, and R's very next stat and read of each must show it (the
+    batch's delegations are ordinary: recalled before the close returns).
   - Diagnosis: `RUST_LOG=info,constellation_authority::core::readindex=debug,constellation::cto=debug`
     (with `CHAOS_KEEP_TMP=1`) traces every strict read (how it was
     answered, the position, the wait) and every ReadIndex answer

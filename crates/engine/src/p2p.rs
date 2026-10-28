@@ -817,6 +817,7 @@ impl constellation_net::PeerService for P2pBridge {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn read_index_requested(
         &self,
         requester: u64,
@@ -824,6 +825,9 @@ impl constellation_net::PeerService for P2pBridge {
         ino: u64,
         dir: bool,
         name: Option<String>,
+        ahead: u8,
+        ahead_dir: u64,
+        ahead_name: String,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
@@ -835,6 +839,14 @@ impl constellation_net::PeerService for P2pBridge {
                     ino,
                     dir,
                     name,
+                    ahead: match ahead {
+                        1 => constellation_authority::ReadAhead::Listing,
+                        2 => constellation_authority::ReadAhead::Siblings {
+                            dir: ahead_dir,
+                            name: ahead_name,
+                        },
+                        _ => constellation_authority::ReadAhead::None,
+                    },
                     reply,
                 })
                 .is_ok();
@@ -846,12 +858,22 @@ impl constellation_net::PeerService for P2pBridge {
                 constellation_authority::ReadIndexOutcome::Busy
             };
             use constellation_authority::ReadIndexOutcome as O;
-            let (status, holder, position, grant) = match outcome {
-                O::Ok { position, grant } => {
-                    (0, 0, position, grant.map(|g| (g.id, g.ttl_ms, g.epoch)))
+            let (status, holder, position, grant, ahead_grants) = match outcome {
+                O::Ok {
+                    position,
+                    grant,
+                    ahead,
+                } => (
+                    0,
+                    0,
+                    position,
+                    grant.map(|g| (g.id, g.ttl_ms, g.epoch)),
+                    ahead.map(|a| (a.ttl_ms, a.epoch, a.grants)),
+                ),
+                O::NotHolder { holder } => {
+                    (1, holder, constellation_meta::Position::ZERO, None, None)
                 }
-                O::NotHolder { holder } => (1, holder, constellation_meta::Position::ZERO, None),
-                O::Busy => (2, 0, constellation_meta::Position::ZERO, None),
+                O::Busy => (2, 0, constellation_meta::Position::ZERO, None, None),
             };
             constellation_net::Payload::ReadIndexReply {
                 req_id,
@@ -861,6 +883,7 @@ impl constellation_net::PeerService for P2pBridge {
                 position_pending: position.pending.map(|p| (p.epoch, p.jseq)),
                 grant,
                 position_streams: position.streams_wire(),
+                ahead: ahead_grants,
             }
         })
     }

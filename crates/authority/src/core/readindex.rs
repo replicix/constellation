@@ -75,7 +75,7 @@ use super::client::Phase as ClientPhase;
 use super::AckClass;
 use super::{Core, S3For, Timer};
 use crate::action::{Action, AnswerSource, ControlOk, ReadAnswer, S3Op};
-use crate::event::{PeerMsg, ReadGrantMsg, ReadIndexOutcome, S3Result};
+use crate::event::{PeerMsg, ReadAhead, ReadGrantMsg, ReadIndexOutcome, S3Result};
 use crate::ids::{HonourMs, NodeId, Now, OpId, Seq, TimerId, WaitMs};
 use crate::replica::Replica;
 use constellation_fs_core::Ino;
@@ -91,6 +91,9 @@ struct ReadReq {
     ino: Ino,
     dir: bool,
     name: Option<String>,
+    /// Read-ahead asked for: sent with the first attempt, and not after a
+    /// redirect.
+    ahead: ReadAhead,
     /// The peer request in flight, if any.
     req: Option<OpId>,
     holder: NodeId,
@@ -301,6 +304,7 @@ impl Core {
         ino: Ino,
         dir: bool,
         name: Option<String>,
+        ahead: ReadAhead,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -349,9 +353,37 @@ impl Core {
         } else {
             let epoch = self.lease.epoch().unwrap_or(0);
             let grant = self.maybe_grant(now, from, ino, epoch, replica);
-            // After the grant (see `readdeleg`'s ordering argument).
+            // The children granted besides (a scan's next lookups), made
+            // before the position is read like the grant above. Only here,
+            // where this node answers for itself: the request is the plain
+            // read of `ino` (all the redirects above and the delegate's
+            // answer are keyed on it and carry no read-ahead).
+            let ahead_grants = match &ahead {
+                ReadAhead::Listing if dir => {
+                    self.grant_ahead(now, from, (ino, None), epoch, replica)
+                }
+                ReadAhead::Siblings { dir: parent, name } => {
+                    // The directory's entries are this node's to answer
+                    // for by its table, whatever the requester's says.
+                    let root_owned = self
+                        .deleg_read_owner(now, *parent, Some(name), replica)
+                        .is_none()
+                        && self.deleg_read_owner(now, *parent, None, replica).is_none();
+                    if root_owned {
+                        self.grant_ahead(now, from, (*parent, Some(name)), epoch, replica)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            // After the grants (see `readdeleg`'s ordering argument).
             let child = name.as_deref().map(|n| (n, replica.lookup_ino(ino, n)));
-            let touched = replica.unshipped_touches_read(ino, dir, child);
+            let touched = replica.unshipped_touches_read(ino, dir, child)
+                || ahead_grants.as_ref().is_some_and(|a| {
+                    let inos: Vec<Ino> = a.grants.iter().map(|(i, _)| *i).collect();
+                    replica.unshipped_touches_inos(&inos)
+                });
             let pending = if touched {
                 replica.journal_position(epoch)
             } else {
@@ -372,6 +404,7 @@ impl Core {
                 head = self.ship.head_seq,
                 ?pending,
                 granted = grant.is_some(),
+                ahead_granted = ahead_grants.as_ref().map_or(0, |a| a.grants.len()),
                 "answered a ReadIndex"
             );
             ReadIndexOutcome::Ok {
@@ -381,12 +414,95 @@ impl Core {
                     streams: Default::default(),
                 },
                 grant,
+                ahead: ahead_grants,
             }
         };
         out.push(Action::Send {
             to: from,
             msg: PeerMsg::ReadIndexReply { req, outcome },
         });
+    }
+
+    /// Read delegations on the next children of directory `dir`, for a
+    /// scan that will look them up one by one (`View::lookup` reads each
+    /// child strictly, and a delegation spares it a round trip). At most
+    /// `read_ahead_grants`, taken in name order from `from` (the entry
+    /// looked up) or from the first; each an ordinary grant, so a write to
+    /// any one of them recalls it as it would a single grant. Made before
+    /// the answer's position is read, with the single grant's lifetime
+    /// (capped by the lease) and one persisted grant horizon.
+    ///
+    /// Not granted: directories (a lookup of one keeps its strict read),
+    /// an inode an inbox op waits to execute on (`blocked`), an inode a
+    /// delegate owns (its owner grants it), and nothing at all in a
+    /// continuation epoch or when this node cannot grant.
+    fn grant_ahead(
+        &mut self,
+        now: Now,
+        to: NodeId,
+        (dir, from): (Ino, Option<&String>),
+        epoch: u64,
+        replica: &dyn Replica,
+    ) -> Option<Box<crate::event::AheadGrants>> {
+        let limit = self.cfg.read_ahead_grants;
+        if limit == 0
+            || !self.cfg.read_delegations
+            || self.lease.epoch_held()
+            || to == self.cfg.node_id
+        {
+            return None;
+        }
+        self.lease.held.as_ref()?;
+        let margin = self.cfg.expiry_margin_ms as i64;
+        let cap = self.lease.honour_left_ms(now, &self.cfg)? - margin;
+        let ttl = (self.cfg.read_delegation_ttl_ms as i64).min(cap);
+        if ttl <= 0 {
+            return None;
+        }
+        // At most `read_grants_per_node` live on the node, the single
+        // grant just made included: past it the read-ahead grants nothing.
+        let room = self
+            .cfg
+            .read_grants_per_node
+            .saturating_sub(replica.read_delegations().live_for_node(to, now.wait));
+        if room == 0 {
+            return None;
+        }
+        let limit = limit.min(room);
+        let inos: Vec<Ino> = replica
+            .children_ahead(dir, from.map(String::as_str), limit)
+            .into_iter()
+            .filter(|(_, is_dir)| !*is_dir)
+            .map(|(ino, _)| ino)
+            .filter(|ino| {
+                !self
+                    .rd
+                    .blocked
+                    .get(ino)
+                    .is_some_and(|until| *until > now.wait)
+                    && self.deleg_read_owner(now, *ino, None, replica).is_none()
+            })
+            .collect();
+        if inos.is_empty() {
+            return None;
+        }
+        let until = now.wait.plus((ttl + margin) as u64);
+        if !replica.note_grant_horizon(until, now) {
+            return None;
+        }
+        let grants = replica
+            .read_delegations()
+            .grant_many(to, &inos, until, now.wait);
+        if grants.is_empty() {
+            return None;
+        }
+        self.stats.read_grants += grants.len() as u64;
+        self.stats.read_ahead_grants += grants.len() as u64;
+        Some(Box::new(crate::event::AheadGrants {
+            ttl_ms: ttl as u64,
+            epoch,
+            grants,
+        }))
     }
 
     fn maybe_grant(
@@ -1830,6 +1946,7 @@ impl Core {
         ino: Ino,
         dir: bool,
         name: Option<String>,
+        ahead: ReadAhead,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -1867,6 +1984,7 @@ impl Core {
                 ino,
                 dir,
                 name,
+                ahead,
                 req: None,
                 holder: 0,
                 sent_at: now.honour,
@@ -1933,6 +2051,7 @@ impl Core {
             ino: r.ino,
             dir: r.dir,
             name: r.name.clone(),
+            ahead: r.ahead.clone(),
         };
         self.rd.by_req.insert(req, op);
         self.set_timer_wait(timer_at, Timer::ReadIndexTimeout(req), out);
@@ -2009,7 +2128,11 @@ impl Core {
         };
         r.req = None;
         match outcome {
-            ReadIndexOutcome::Ok { position, grant } => {
+            ReadIndexOutcome::Ok {
+                position,
+                grant,
+                ahead,
+            } => {
                 // Phase 2b: a delegate's answer (its position names its
                 // stream) says nothing about the lease.
                 if position.streams.is_empty() {
@@ -2038,6 +2161,28 @@ impl Core {
                 if !delegated {
                     replica.read_delegations().renewal_done(r.ino);
                 }
+                // The read-ahead: ordinary delegations on children, under
+                // the same position, lifetime and recall-generation check
+                // as the one above (a recall that overtook the answer
+                // refuses the rest: the holder recalls what it granted).
+                if let Some(a) = ahead {
+                    let margin = self.cfg.expiry_margin_ms as i64;
+                    let ttl = a.ttl_ms as i64;
+                    let until = HonourMs(r.sent_at.0 + ttl - margin);
+                    if until > now.honour {
+                        for (child, id) in a.grants {
+                            let held = HeldDelegation {
+                                until,
+                                position,
+                                epoch: a.epoch,
+                                holder: from,
+                                grant: id,
+                                renew_at: HonourMs(r.sent_at.0 + ttl / 2),
+                            };
+                            replica.read_delegations().install(child, held, r.gen);
+                        }
+                    }
+                }
                 self.stats.read_index_answered += 1;
                 self.read_answer(
                     op,
@@ -2056,6 +2201,8 @@ impl Core {
                     holder != 0 && replica.delegation_table().iter().any(|e| e.node == holder);
                 if redirect && !r.redirected {
                     r.redirected = true;
+                    // Whoever answers after a redirect answers the plain read.
+                    r.ahead = ReadAhead::None;
                     if !names_delegate {
                         self.lease.cached_holder = Some(holder);
                     }

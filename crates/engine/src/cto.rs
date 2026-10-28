@@ -16,6 +16,11 @@
 //! - `CONSTELLATION_CTO` supplies the default when the flag is absent.
 //! - `CONSTELLATION_READ_DELEGATION_TTL_MS` (default 5000): how long a
 //!   read delegation lasts; renewed in the background while in use.
+//! - `CONSTELLATION_READ_AHEAD_GRANTS` (default 128, at most 512): how many
+//!   children of a directory one ReadIndex answer grants delegations on
+//!   too (0: none).
+//! - `CONSTELLATION_READ_GRANTS_PER_NODE` (default 8192): the most read
+//!   delegations a node may hold live before read-ahead grants it no more.
 //! - `CONSTELLATION_READ_DELEGATIONS=0`: this node, as sequencer, grants
 //!   none (every strict read then costs a round trip).
 //! - `CONSTELLATION_READ_INDEX_BUDGET_MS` (default 2000, like M6's
@@ -45,6 +50,24 @@ fn env_u64(name: &str, default: u64) -> u64 {
 /// `CONSTELLATION_READ_DELEGATION_TTL_MS` (default 5000).
 pub fn read_delegation_ttl_ms() -> u64 {
     env_u64("CONSTELLATION_READ_DELEGATION_TTL_MS", 5_000).max(1)
+}
+
+/// `CONSTELLATION_READ_AHEAD_GRANTS` (default 128, at most 512): how many
+/// children of a directory the sequencer grants read delegations on with
+/// one ReadIndex answer, so a cold scan costs a round trip per this many
+/// entries and not one per entry. 0 turns it off.
+pub fn read_ahead_grants() -> usize {
+    (env_u64("CONSTELLATION_READ_AHEAD_GRANTS", 128) as usize).min(512)
+}
+
+/// `CONSTELLATION_READ_GRANTS_PER_NODE` (default 8192): the most read
+/// delegations one node may hold live from this sequencer before a
+/// read-ahead grants it nothing more. A scan of a directory bigger than
+/// this still reads each further child strictly (one round trip each)
+/// until earlier grants lapse; the single grant a read asks for is always
+/// made.
+pub fn read_grants_per_node() -> usize {
+    env_u64("CONSTELLATION_READ_GRANTS_PER_NODE", 8_192) as usize
 }
 
 /// The kernel attribute/entry TTL a *lone* strict sequencer answers with

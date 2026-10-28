@@ -491,6 +491,14 @@ pub trait Replica {
         dir: bool,
         child: Option<(&str, Option<Ino>)>,
     ) -> bool;
+    /// Whether the unshipped journal touched the record of any of `inos`
+    /// (the children a read-ahead answer granted).
+    fn unshipped_touches_inos(&self, inos: &[Ino]) -> bool;
+    /// Up to `limit` children of `parent` in name order, `(ino, is a
+    /// directory)`: from the entry `from` itself (when it exists), or from
+    /// the first when `from` is `None`. The read-ahead of a ReadIndex
+    /// answer.
+    fn children_ahead(&self, parent: Ino, from: Option<&str>, limit: usize) -> Vec<(Ino, bool)>;
 
     // ---- plan 30 §M9: backups, streaming, the durability gate ----
 
@@ -1391,6 +1399,33 @@ impl Replica for Meta {
         child: Option<(&str, Option<Ino>)>,
     ) -> bool {
         Meta::unshipped_touches_read(self, ino, dir, child)
+    }
+
+    fn unshipped_touches_inos(&self, inos: &[Ino]) -> bool {
+        Meta::unshipped_touches_inos(self, inos)
+    }
+
+    fn children_ahead(&self, parent: Ino, from: Option<&str>, limit: usize) -> Vec<(Ino, bool)> {
+        use constellation_fs_core::types::InodeKind;
+        let mut out = Vec::with_capacity(limit.min(512));
+        if let Some(name) = from {
+            if let Ok(Some(attr)) = MetaStore::lookup(self, parent, name) {
+                out.push((attr.ino, attr.kind == InodeKind::Dir));
+            }
+        }
+        let rest = limit.saturating_sub(out.len());
+        if rest > 0 {
+            if let Ok(entries) =
+                MetaStore::readdir_after(self, parent, from.map(str::as_bytes), rest)
+            {
+                out.extend(
+                    entries
+                        .into_iter()
+                        .map(|e| (e.ino, e.kind == InodeKind::Dir)),
+                );
+            }
+        }
+        out
     }
 
     fn journal_txs_from(&self, from: u64, max_rows: usize) -> Vec<BackupTx> {
