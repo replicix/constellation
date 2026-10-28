@@ -3089,6 +3089,18 @@ impl Core {
                 permitted
             })
             || (self.cfg.ack_s3 && self.tenure_duty_live(now, replica));
+        // Plan 43 §11.2: the grace `acquire_won` arms for a released lease
+        // that left lock grants is in memory: persisted before the CAS, as
+        // the restart horizon, so a restart anywhere after it keeps it.
+        if self.cfg.locks
+            && takeover_of
+            && prev.released
+            && prev.granted_delegations
+            && !self.lock_persist_released_grace(now, replica)
+        {
+            self.finish_acquire(now, false, replica, out);
+            return;
+        }
         let mut lease = self
             .lease
             .granted_lease(now, &self.cfg, Some(prev), inherits_duty);

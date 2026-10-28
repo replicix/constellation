@@ -6826,7 +6826,7 @@ impl Core {
         seen: WaitMs,
         replica: &dyn Replica,
     ) {
-        let until = seen.plus((self.lock_ttl_ms() + 2 * self.lock_margin_ms()).max(0) as u64);
+        let until = seen.plus(self.lock_released_grace_ms());
         // The barrier is a wall value (row 9, C7b): the record's end mapped
         // from this node's wait clock by the time left on it.
         self.lock_dir_barrier(
@@ -6838,6 +6838,33 @@ impl Core {
         }
         replica.locks().set_quarantine(until);
         self.stats.lock_grace_periods += 1;
+    }
+
+    /// How long after its first sight of a release the taker of a released
+    /// lease waits for the releaser's lock grants: the lock TTL and two
+    /// margins ([`Core::lock_on_released_takeover`]).
+    pub(crate) fn lock_released_grace_ms(&self) -> u64 {
+        (self.lock_ttl_ms() + 2 * self.lock_margin_ms()).max(0) as u64
+    }
+
+    /// Plan 43 §11.2 (`locks-released-takeover`): the grace of a released
+    /// takeover as the restart horizon, persisted before the claim CAS goes
+    /// out. The grace itself is in memory (`LockTables::set_quarantine`),
+    /// and a taker that stopped inside it, or between the CAS and
+    /// `acquire_won`, re-adopted its own lease at its restart, which is no
+    /// takeover: it granted over a grant the releaser's holder still
+    /// honoured (the default clock mix's reboots of the taker). Written
+    /// before the CAS so no point after it is without the grace; from now,
+    /// not from the first sight of the release: the releaser's grants end by
+    /// the release plus the lock TTL, in true time, and the claim is after
+    /// the release. `locks_start` loads it as any restart horizon: the
+    /// quarantine and the barrier on everything, to its end on the same
+    /// boot, the recorded span from the restart on another. Durable on the
+    /// core, as the takeover floor's claim mark is (`acquire_cas`): a
+    /// claim of a released lease that left grants is rare, and each pays
+    /// one write. `false`: not persisted, and the CAS must not go out.
+    pub(crate) fn lock_persist_released_grace(&self, now: Now, replica: &dyn Replica) -> bool {
+        replica.note_lock_grant_horizon(now.wait.plus(self.lock_released_grace_ms()), now)
     }
 
     /// Plan 43 C7-F F-a0: this tenure may have lock grants that are still

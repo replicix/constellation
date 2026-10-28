@@ -552,6 +552,30 @@ pub(crate) const KV_TAKEOVER_FLOOR: &str = "takeover_floor_horizon_ms";
 /// (the format is append-only).
 pub(crate) const KV_TAKEOVER_FLOOR_PENDING: &str = "takeover_floor_pending";
 
+/// Tests only (`test-util`): fail this thread's next `n` writes of a
+/// persisted horizon ([`crate::store::Meta::note_grant_horizon`] and its
+/// kin) with an I/O error, nothing written: a store that cannot record what
+/// a grant or a claim needs to survive a restart.
+#[cfg(any(test, feature = "test-util"))]
+pub fn fail_horizon_writes_on_this_thread_for_tests(n: u32) {
+    horizon_fault::LEFT.with(|c| c.set(n));
+}
+
+#[cfg(any(test, feature = "test-util"))]
+mod horizon_fault {
+    thread_local! {
+        pub(super) static LEFT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn take() -> bool {
+        LEFT.with(|c| {
+            let n = c.get();
+            c.set(n.saturating_sub(1));
+            n > 0
+        })
+    }
+}
+
 impl crate::store::Meta {
     /// This node's read-delegation tables (plan 30 §M8).
     pub fn read_delegations(&self) -> &ReadDelegations {
@@ -588,38 +612,89 @@ impl crate::store::Meta {
 
     /// Covers `until` with a stamped write unless what is already known
     /// (what the previous process left, loaded at start, and what this one
-    /// wrote) covers it. The write is for `until` rounded up a second, and
-    /// since it is made only for an `until` beyond the known horizon it never
-    /// lowers what the stored value required (a crash right after it must
-    /// not forget the previous boot's obligation).
+    /// wrote and synced) covers it. The write is for `until` rounded up a
+    /// second, and since it is made only for an `until` beyond what is
+    /// known and written it never lowers what the stored value required (a
+    /// crash right after it must not forget the previous boot's obligation).
+    ///
+    /// Writes of one key are in value order: the key's writer lock is held
+    /// across the read of the highest value written, the `kv_set` and the
+    /// update of that value, so a writer that decided on a lower `until`
+    /// before another wrote a higher one finds it, and writes nothing over
+    /// it (the lock horizon has two writers, the core and the off-core
+    /// persist lane). The sync is after, outside the lock, and covers every
+    /// write before it; `known` (what a restart can rely on, and the answer)
+    /// moves only once it is done.
     fn note_horizon(
         &self,
         key: &'static str,
         until: WaitMs,
         now: Now,
     ) -> Result<WaitMs, crate::MetaError> {
-        let known = self
-            .horizon_wait
-            .lock()
-            .unwrap()
-            .get(key)
-            .copied()
-            .unwrap_or(WaitMs(0));
+        let known = self.known_horizon(key);
         if until <= known {
             return Ok(known);
         }
-        // Round up so continuous granting writes about once a second.
-        let value = until.plus(1_000);
+        let value = {
+            let mut written = self.horizon_writer(key).lock().unwrap();
+            // What is stored, or on its way: another writer may have moved
+            // it since `known` was read.
+            let stored = (*written).max(self.known_horizon(key));
+            let value = if until <= stored {
+                stored
+            } else {
+                // Round up so continuous granting writes about once a second.
+                let value = until.plus(1_000).max(stored);
+                #[cfg(any(test, feature = "test-util"))]
+                if horizon_fault::take() {
+                    return Err(crate::MetaError::Io(std::io::Error::other(
+                        "injected horizon write fault (testing only)",
+                    )));
+                }
+                #[cfg(test)]
+                {
+                    let hook = self.horizon_write_hook.lock().unwrap().clone();
+                    if let Some(hook) = hook {
+                        hook(key, value);
+                    }
+                }
+                self.kv_set(
+                    key,
+                    &crate::store::horizon::format_stamp(&now.stamp_of_wait(value)),
+                )?;
+                value
+            };
+            *written = value;
+            value
+        };
         // M16: synced — a holder that forgot it on a power loss would
-        // acknowledge writes behind grants still honoured elsewhere.
-        self.kv_set_durable(
-            key,
-            &crate::store::horizon::format_stamp(&now.stamp_of_wait(value)),
-        )?;
+        // acknowledge writes behind grants still honoured elsewhere. One
+        // sync covers every write before it, this thread's and another's.
+        self.sync()?;
         let mut known = self.horizon_wait.lock().unwrap();
         let slot = known.entry(key).or_insert(WaitMs(0));
         *slot = (*slot).max(value);
         Ok(value)
+    }
+
+    /// What is known of `key`'s horizon: loaded, or written and synced.
+    fn known_horizon(&self, key: &str) -> WaitMs {
+        self.horizon_wait
+            .lock()
+            .unwrap()
+            .get(key)
+            .copied()
+            .unwrap_or(WaitMs(0))
+    }
+
+    /// The writer lock of `key` ([`Meta::horizon_written`]).
+    fn horizon_writer(&self, key: &str) -> &std::sync::Mutex<WaitMs> {
+        &self.horizon_written[match key {
+            KV_READ_GRANT_HORIZON => 0,
+            KV_LOCK_GRANT_HORIZON => 1,
+            KV_TAKEOVER_FLOOR => 2,
+            _ => unreachable!("not a horizon key: {key}"),
+        }]
     }
 
     /// Persist that this tenure's takeover floor ends at `until` (on this
@@ -642,7 +717,9 @@ impl crate::store::Meta {
     /// its floor goes with it (the quarantines it set run on). Not synced:
     /// a floor that comes back after a crash only holds a release back.
     pub fn clear_takeover_floor(&self) -> Result<(), crate::MetaError> {
+        let mut written = self.horizon_writer(KV_TAKEOVER_FLOOR).lock().unwrap();
         self.horizon_wait.lock().unwrap().remove(KV_TAKEOVER_FLOOR);
+        *written = WaitMs(0);
         self.kv_del(KV_TAKEOVER_FLOOR)
     }
 
@@ -720,15 +797,17 @@ impl crate::store::Meta {
             KV_LOCK_GRANT_HORIZON,
             KV_TAKEOVER_FLOOR,
         ] {
+            let mut written = self.horizon_writer(key).lock().unwrap();
             let passed = self
                 .horizon_wait
                 .lock()
                 .unwrap()
                 .get(key)
-                .is_some_and(|until| now.wait >= *until);
+                .is_some_and(|until| now.wait >= (*until).max(*written));
             if passed {
                 self.kv_del(key)?;
                 self.horizon_wait.lock().unwrap().remove(key);
+                *written = WaitMs(0);
                 cleared = true;
             }
         }
@@ -937,6 +1016,70 @@ mod tests {
         );
         assert_eq!(meta.locks().quarantine_until(), WaitMs(22_000));
         assert_eq!(meta.load_lock_quarantine(at(23_000), 27_500), None);
+    }
+
+    /// The lock horizon has two writers, the core and the off-core persist
+    /// lane. One that decided on a lower `until` and is held on its way to
+    /// the store while the other writes and syncs a higher one must not
+    /// write its lower value over it: the stored horizon, what a restart
+    /// waits, never decreases, and `known` never claims more than the disk
+    /// holds. Fails on the parent of the monotonic write: the held writer
+    /// (decided on 22 000 from a `known` of 0) overwrites 31 000.
+    #[test]
+    fn a_held_lower_horizon_write_does_not_lower_a_higher_one() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let meta = std::sync::Arc::new(crate::store::Meta::open_in_memory().unwrap());
+        let at = |ms: i64| Now::same_on_boot(ms, 1);
+        let stored = |m: &crate::store::Meta| {
+            let v = m.kv_get(KV_LOCK_GRANT_HORIZON).unwrap().unwrap();
+            at(0)
+                .wait_of_stamp(&crate::store::horizon::parse_stamp(&v, 27_500))
+                .unwrap()
+        };
+        // The first writer is held just before its write reaches the store.
+        let (held_tx, held_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let held_tx = std::sync::Mutex::new(held_tx);
+        let go_rx = std::sync::Mutex::new(go_rx);
+        *meta.horizon_write_hook.lock().unwrap() = Some(std::sync::Arc::new(move |key, v| {
+            if key == KV_LOCK_GRANT_HORIZON && v == WaitMs(22_000) {
+                held_tx.lock().unwrap().send(()).unwrap();
+                let _ = go_rx.lock().unwrap().recv();
+            }
+        }));
+        let first = {
+            let meta = meta.clone();
+            std::thread::spawn(move || meta.note_lock_grant_horizon(WaitMs(21_000), at(0)))
+        };
+        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        // The other writer wants more. Where writes of the key are
+        // serialised it waits for the held one; otherwise it is done at once.
+        let (done_tx, done_rx) = mpsc::channel();
+        let second = {
+            let meta = meta.clone();
+            std::thread::spawn(move || {
+                let r = meta.note_lock_grant_horizon(WaitMs(30_000), at(0));
+                done_tx.send(()).unwrap();
+                r
+            })
+        };
+        let _ = done_rx.recv_timeout(Duration::from_millis(300));
+        go_tx.send(()).unwrap();
+        assert_eq!(first.join().unwrap().unwrap(), WaitMs(22_000));
+        assert_eq!(second.join().unwrap().unwrap(), WaitMs(31_000));
+        assert_eq!(
+            stored(&meta),
+            WaitMs(31_000),
+            "the stored lock horizon was lowered by a writer that had decided earlier"
+        );
+        assert_eq!(meta.known_horizon(KV_LOCK_GRANT_HORIZON), WaitMs(31_000));
+        // A later, lower ask changes nothing.
+        assert_eq!(
+            meta.note_lock_grant_horizon(WaitMs(25_000), at(0)).unwrap(),
+            WaitMs(31_000)
+        );
+        assert_eq!(stored(&meta), WaitMs(31_000));
     }
 }
 

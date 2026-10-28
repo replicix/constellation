@@ -442,6 +442,11 @@ pub trait Replica {
     /// clock; stored as a boot stamp: plan 43 C7a). `false`: it could not
     /// be persisted, and the grant must not be made.
     fn note_grant_horizon(&self, until: WaitMs, now: Now) -> bool;
+    /// [`Replica::note_grant_horizon`] for the lock grants' restart horizon,
+    /// written here, on the core, and durable when it returns: for a grace
+    /// that no grant of this node asks for (`Core::acquire_cas`: the grace
+    /// of a released takeover). `false`: not persisted.
+    fn note_lock_grant_horizon(&self, until: WaitMs, now: Now) -> bool;
     /// M16: the inodes whose read delegations an op not yet executed must
     /// recall (`Meta::recall_inos_of_op_now`: an unlink's or rename's
     /// victims included).
@@ -1308,6 +1313,16 @@ impl Replica for Meta {
             Ok(()) => true,
             Err(error) => {
                 tracing::warn!(%error, "persisting the read-grant horizon failed; not granting");
+                false
+            }
+        }
+    }
+
+    fn note_lock_grant_horizon(&self, until: WaitMs, now: Now) -> bool {
+        match Meta::note_lock_grant_horizon(self, until, now) {
+            Ok(_) => true,
+            Err(error) => {
+                tracing::warn!(%error, "persisting the lock-grant horizon failed");
                 false
             }
         }

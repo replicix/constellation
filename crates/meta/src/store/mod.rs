@@ -503,6 +503,11 @@ fn ns_options() -> KeyspaceCreateOptions {
         .index_block_pinning_policy(PinningPolicy::new([true, true, true, false]))
 }
 
+/// Tests: told `(key, value)` just before a horizon write reaches the store.
+#[cfg(test)]
+pub(crate) type HorizonWriteHook =
+    std::sync::Arc<dyn Fn(&'static str, constellation_types::clock::WaitMs) + Send + Sync>;
+
 /// fjall-backed [`crate::MetaStore`].
 pub struct Meta {
     pub(crate) db: gate::GatedDb,
@@ -697,6 +702,16 @@ pub struct Meta {
     pub(crate) horizon_wait: std::sync::Mutex<
         std::collections::HashMap<&'static str, constellation_types::clock::WaitMs>,
     >,
+    /// The writer of each persisted horizon key (the read-grant, lock-grant
+    /// and takeover-floor keys, in [`Meta::horizon_writer`]'s order): the
+    /// highest value written to it and not cleared, held across the read of
+    /// that value, the `kv_set` and the update, so writes of one key reach
+    /// the store in value order whichever threads make them ([`Meta::note_horizon`]).
+    pub(crate) horizon_written: [std::sync::Mutex<constellation_types::clock::WaitMs>; 3],
+    /// Tests: told `(key, value)` just before a horizon write reaches the
+    /// store, to hold a writer there.
+    #[cfg(test)]
+    pub(crate) horizon_write_hook: std::sync::Mutex<Option<HorizonWriteHook>>,
     /// Plan 30 §M14: lock grants (sequencer side), grants held and local
     /// locks (node side) (`crate::locks`).
     pub(crate) locks: crate::locks::LockTables,
@@ -1167,6 +1182,9 @@ impl Meta {
             read_delegations: crate::readdeleg::ReadDelegations::default(),
             promise_issued_wait: std::sync::Mutex::new(None),
             horizon_wait: std::sync::Mutex::new(std::collections::HashMap::new()),
+            horizon_written: Default::default(),
+            #[cfg(test)]
+            horizon_write_hook: std::sync::Mutex::new(None),
             locks: crate::locks::LockTables::default(),
             foreign_apply_hook: std::sync::OnceLock::new(),
             rollback_hook: std::sync::OnceLock::new(),

@@ -10659,6 +10659,22 @@ fn regression_a_taker_ahead_of_a_released_lease_waits_out_its_grants() {
     );
 }
 
+/// Plan 43 §11.2: `locks-released-takeover` (the control without an offset)
+/// failed 7 of 2 000 seeds on `0cd3877c` under the default clock mix (961,
+/// 973, 1571, 1610, 1695, 1919, 1929; 1253 and 1546 failed on `f7c8fc7`):
+/// each a reboot of the taker (node 2) after it claimed the released lease
+/// (before the CAS's answer, or after `acquire_won`), which re-adopted its own
+/// lease without the lock grace, and granted over node 3's live grant. The
+/// grace is the restart horizon now, written before the claim CAS.
+#[test]
+fn regression_a_released_taker_rebooted_inside_its_grace_still_waits_out_its_grants() {
+    regress(
+        "locks-released-takeover",
+        locks_released_takeover_config(),
+        [961, 973, 1253, 1546, 1571, 1610, 1695, 1919, 1929],
+    );
+}
+
 /// Plan 43 C7b (commit 3, rows 2, 9, 30): the delegated configurations with
 /// an offset. `locks-stall-step-delegated-ahead` failed 2 of 300 (91, 113: a
 /// TTL claim of the root lease), `locks-delegate-ahead` 2 of 300 (266, 295:

@@ -26,6 +26,8 @@ pub use mutate::{
     OwnChunks, OwnRows, OwnTx, OWN_ROWS_CAP,
 };
 pub use prune::{Policy, PolicyError, PRUNE_XATTR};
+#[cfg(any(test, feature = "test-util"))]
+pub use readdeleg::fail_horizon_writes_on_this_thread_for_tests;
 pub use readdeleg::{
     recall_inos, recall_inos_executed, recall_inos_of_op, CtoStats, HeldDelegation,
     ReadDelegations, ReadGrant, RecallNeed,

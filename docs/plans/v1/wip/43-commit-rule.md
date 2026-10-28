@@ -4052,17 +4052,32 @@ to land before C0.
 
 ### 11.2 Open findings (measured, not yet triaged)
 
-- **`locks-released-takeover` fails 5 of 2 000 under the default clock-fault
+- **`locks-released-takeover` failed 5 of 2 000 under the default clock-fault
   mix** (seeds 961, 973, 1253, 1546, 1571 on `f7c8fc7`, with and without
-  C7b; `+unclocked`: 0). Every one is a reboot or a suspend of the taker of
-  a released lease that the mix drew inside the taker's lock grace
-  (`lock_on_released_takeover`); C7b's reading is that the taker loses the
-  quarantine, which lives in memory (the restart horizons cover a node's
-  own grants, not the releaser's: the class of Appendix B row 14's
-  in-memory takeover floor). Found by C7a commit 6's mix. To decide: persist
-  the released-takeover quarantine with the boot-stamped horizons, or
-  re-arm it on restart from the lease's mark. Should be settled before C7b
-  commit 9 puts offsets into the default mix.
+  C7b; `+unclocked`: 0; 7 on `0cd3877c`: 961, 973, 1571, 1610, 1695, 1919,
+  1929). **Settled (2026-10-28): the taker's reboot, never a suspend or a TTL
+  claim.** Every failing seed is a reboot of the taker after it claimed the
+  released lease: before the claim CAS's answer reached `acquire_won` (961,
+  973, 1571, 1610: the lease names the taker and says it granted, and no
+  grace was ever armed), or after it (1695, 1919, 1929: the grace was armed
+  in memory and went with the process). Either way the restart re-adopts its
+  own lease, which is no takeover, and the first request is granted over the
+  releaser's grant its holder still honours. (No TTL claim of the taker's
+  lease was seen: I6 counts none; 1253 and 1546 no longer fail on `0cd3877c`.)
+  Fixed by persisting the grace (option a): `acquire_cas` writes the lock
+  restart horizon, `now + lock_ttl + 2M`, durably before the claim CAS of a
+  released lease whose release says it left grants (`Core::lock_persist_
+  released_grace`); `locks_start` loads it as any restart horizon (quarantine
+  and ROOT barrier, to its end on the same boot, the recorded span from the
+  restart on another). Option b (re-arm on re-adopting a marked own lease)
+  was not taken: the mark cannot tell an inherited duty from the tenure's own
+  (`strict_mounts` marks every lease), so every restart of a marked tenure
+  would wait a lock TTL for nothing. Cost: one durable write on the core per
+  claim of a marked released lease, as `takeover_floor_pending` is. Tests:
+  `a_released_taker_restarted_inside_its_grace_keeps_it`,
+  `a_released_taker_restarted_between_its_cas_and_its_answer_keeps_the_grace`,
+  `regression_a_released_taker_rebooted_inside_its_grace_still_waits_out_
+  its_grants`.
 - **No sim configuration shows what C7b spec commit 6's honour bound fixes**
   (the review of spec commits 4-7). `locks-executor-behind` delays the op
   in transit by more than 2M, outside phase 1's bound, so it passes on the
@@ -4250,7 +4265,7 @@ L = liveness only.
 | 11 | `ack=s3` fast takeover timing — `core/lease.rs:296` | holder's renewal stamp vs taker's W | W↔W | L (the slot CAS fences) | ETag unchanged for `backup_takeover_ms` (**landed, spec commit 3**: the key unchanged for `backup_takeover_ms` on the taker's wait clock) |
 | 12 | Holder liveness (plan 41 L0) — `liveness_fresh`, `note_s3_liveness`, `strict_answer_allowed`, `LeaseView::reads_locally` | own send stamp vs own clock | W | **S on a backward step > 1.5 s** | honour clock (C7-H1 first) **C7-H1 landed** (the local half); **rate half: C7a landed** (commit 2: ρ is in the honour and wait readings) |
 | 13 | Backup seal watch, holder heartbeat, `OffCore::core_responsive`, `note_holder_heard` | own arrival stamps vs own clock | W | L | wait clock (C7-H1) **C7-H1 landed** (the local half); **rate half: C7a landed** (commit 2: ρ is in the honour and wait readings) |
-| 14 | Restart horizons — `KV_READ_GRANT_HORIZON`/`KV_LOCK_GRANT_HORIZON`, `load_*_quarantine` | own earlier W vs own later W across a restart | W (persisted) | **S on a forward step across the restart** | **C7a landed (commit 3):** a boot stamp `<wall> <span> <boot id> <raw until>`, read on `CLOCK_MONOTONIC_RAW` on the same boot and as the full span on another (or unknown, or an older value: the default span); a graceful shutdown deletes a passed horizon; the promise's `issued` likewise; **the takeover floor (commit 4, landed):** persisted at arming as three boot stamps (the read-grant and lock-grant horizons, and `takeover_floor_horizon_ms`, the floor itself, which keeps the lease from being released inside it) and, before a claim CAS that takes over a tenure that granted, the epoch it writes in `takeover_floor_pending`, which a restart's re-adoption of its own lease at that epoch arms again from its own marker. (The text before it: `(boot_id, BOOTTIME until)`, else the full horizon (C7a; C7-H1 writes them as wall and reads them back onto the wait clock, so only a step while the node is down, or a forward step while it is up after the last write followed by a restart, remains). The promise's `issued` (`promise.rs:366-378`, the KV `epoch_promise_issued_ms`, judged by `promise_join_begin`) is the same kind of horizon. Also: a successor's takeover floor (C7-H2) was not persisted at all (`set_quarantine` in memory), so a successor that restarted inside it, or whose upgrade handover gave up its release, forgot it: persisted under these keys, commit 4.) |
+| 14 | Restart horizons — `KV_READ_GRANT_HORIZON`/`KV_LOCK_GRANT_HORIZON`, `load_*_quarantine` | own earlier W vs own later W across a restart | W (persisted) | **S on a forward step across the restart** | **C7a landed (commit 3):** a boot stamp `<wall> <span> <boot id> <raw until>`, read on `CLOCK_MONOTONIC_RAW` on the same boot and as the full span on another (or unknown, or an older value: the default span); a graceful shutdown deletes a passed horizon; the promise's `issued` likewise; **the takeover floor (commit 4, landed):** persisted at arming as three boot stamps (the read-grant and lock-grant horizons, and `takeover_floor_horizon_ms`, the floor itself, which keeps the lease from being released inside it) and, before a claim CAS that takes over a tenure that granted, the epoch it writes in `takeover_floor_pending`, which a restart's re-adoption of its own lease at that epoch arms again from its own marker. (The text before it: `(boot_id, BOOTTIME until)`, else the full horizon (C7a; C7-H1 writes them as wall and reads them back onto the wait clock, so only a step while the node is down, or a forward step while it is up after the last write followed by a restart, remains). The promise's `issued` (`promise.rs:366-378`, the KV `epoch_promise_issued_ms`, judged by `promise_join_begin`) is the same kind of horizon. Also: a successor's takeover floor (C7-H2) was not persisted at all (`set_quarantine` in memory), so a successor that restarted inside it, or whose upgrade handover gave up its release, forgot it: persisted under these keys, commit 4.) **The released-takeover lock grace (§11.2):** the lock restart horizon is written, durably, before the claim CAS of a released lease that left grants. |
 | 15 | Epoch claim views — `epoch_closed_claim`, `epoch_reclaim_pending`, `resolve_epoch_claims` | own lease stamp vs own clock; resolution by epoch | W | L | clock change only; **rate half: C7a landed** (commit 2) |
 | 16 | Singleton leases (`_snapsched`, GC) — `singleton.rs`, `snapsched.rs` | holder: own; claimant: holder's W vs own W | W↔W | L (the CAS on the holder's ETag is the safety) | observation rule if wanted; not required |
 | 17 | GC — `gc.rs:407` `last_modified ≤ now − horizon` (7 d), completion retention, `mtree_gc.rs:653`; holds' `expires_unix_ms` | S3 `Last-Modified` vs W; hold writer's W vs GC's W | S3↔W, W↔W | S only at offsets of days (or the hold slack) | **stays** (documented tolerance) |
@@ -4259,7 +4274,7 @@ L = liveness only.
 | 20 | Kernel attr/entry TTLs, `dentries.rs` filter, session waits, ReadIndex deadlines, forward timeout | kernel / `Instant` | I | L | already monotonic (`Instant` stops in suspend: conservative there) |
 | 21 | Fault hook `CONSTELLATION_FAULT_CLOCK_OFFSET_MS` (reaches `now_unix_ms` and rows 1–17) | — | — | capped at ±500 by the campaign (`load.rs:366`; **cap lifted, spec commit 9**: any offset up to a day, `load::MAX_CLOCK_OFFSET_MS`) | becomes a constant-offset test (harmless at ±5 s); add rate and step hooks (**landed**: `CONSTELLATION_FAULT_CLOCK_RATE_PPM`, C7a commits 1 and 2; the harness's `clock:rate:`, `clock:step:` and `reboot` items, `lock-owner-reboot`, the campaign preset `clock-rate`: commit 6) |
 | 22 | Sim `tests/sim/clock.rs` `Clock::skewed` (constant offset), `SimConfig::clock_skew_ms` (plus `clock_offsets`, C7-H2); models' `max_offset`, `Jump` | — | — | — | add per-node `rate_ppm`, suspend and step (**C7a landed**: commits 1 and 2; the default mix of rates, steps, suspends and reboots, commit 6; `Clock::skewed` is gone, `Clock::for_node`; **C7b spec commit 9**: the mix also draws a constant offset per node in `[-2 TTL, +2 TTL]` and steps up to 10 s, except where directories are delegated and locks taken, until rows 9/30) |
-| 23 | Released-takeover lock grace — `lock_on_released_takeover`'s gate in `acquire_won` (`takeover && p.released && !p.is_expired(now)`) | released lease's `expires_unix_ms` (its W) vs the taker's W | W↔W | **S** (a taker ahead by more than the released lease's remaining TTL gets no lock grace, while the releaser's grants are honoured) | grace by the taker's own observation of the release, or always (the grace is bounded by `lock_ttl`): C7b (**landed, spec commit 3**: the grace ends `lock_ttl + 2M` after the taker's first sight of the release; none for a taker that saw it that long ago, the whole of it for a cold one) |
+| 23 | Released-takeover lock grace — `lock_on_released_takeover`'s gate in `acquire_won` (`takeover && p.released && !p.is_expired(now)`) | released lease's `expires_unix_ms` (its W) vs the taker's W | W↔W | **S** (a taker ahead by more than the released lease's remaining TTL gets no lock grace, while the releaser's grants are honoured) | grace by the taker's own observation of the release, or always (the grace is bounded by `lock_ttl`): C7b (**landed, spec commit 3**: the grace ends `lock_ttl + 2M` after the taker's first sight of the release; none for a taker that saw it that long ago, the whole of it for a cold one); **§11.2 (2026-10-28):** the grace is also persisted, as the lock restart horizon (`now + lock_ttl + 2M`) before the claim CAS, so a taker that reboots after the CAS comes back inside it) |
 | 24 | Seal watch's expiry compares — `on_takeover_get`, `known_expiry`/`lag_discount`, `watch_due_by_expiry` (`backup.rs`) | the holder's `expires` (its W) vs the backup's W | W↔W | L (after C7-H2 an early seal is safe: it gets the whole floor; a late one is latency) | wait clock plus the ETag observation: C7b, with row 13 (landed, spec commit 4: the holder's own durations placed by the least arrival lag; a wall hint once per start for a cold backup) |
 | 25 | `promise_check_needed` — `!prev.is_expired(now)` (`promise.rs`) | predecessor's `expires` vs the taker's W | W↔W | L (a sealed taker ahead does a promise check it would skip; only conservative) | with row 3's anchored promises: C7b (**landed, spec commit 3** with the observation, and spec commit 5 with the anchored promises: a permitted claim before the observation ran out skips the check) |
 | 26 | `acquire_won`'s fast classification — `fast_prev` (`!p.is_expired(now)`) | predecessor's `expires` vs the successor's W | W↔W | was **S** (a sealed backup ahead by more than the lease's remainder took a TTL takeover: no floor) | **fixed (C7-H2)**: a takeover the permit allowed is fast whatever the clock says; the expiry is no longer kept (**spec commit 3**: `fast_prev` is the permit alone) |

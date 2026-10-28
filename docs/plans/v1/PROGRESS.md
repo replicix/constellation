@@ -60408,3 +60408,58 @@ Left open: B answering ENOENT for a name A had just created (one in about 162 00
 by this; a load campaign over io_uring with this change is to show the `""` read gone; the cold-scan cost is not
 measured, and a cheaper sound alternative (recall a directory's grants when a child with one link changes its
 attributes) is not tried.
+
+## Plan 43 §11.2: a released lease's taker keeps its lock grace across a restart (2026-10-28)
+
+`locks-released-takeover` (the control without an offset) failed under the default clock mix: 5 of 2 000 seeds on
+`f7c8fc7` (961, 973, 1253, 1546, 1571) and 7 on `0cd3877c` (961, 973, 1571, 1610, 1695, 1919, 1929; 1253 and 1546
+no longer fail there). Mutual exclusion was violated: node 3 was inside a critical section under a grant node 1 had
+made and then released its lease with; node 2, the taker, granted the same lock to itself.
+
+**Classification.** All seven are a reboot of the taker (node 2) after it claimed the released lease, and none is a
+suspend or a TTL claim (the lease-claim oracle counts none). Two shapes: the reboot came before the claim CAS's answer
+reached `acquire_won` (961, 973, 1571, 1610: the lease names node 2 and says it granted, but the grace
+`lock_on_released_takeover` arms was never armed), or after it (1695, 1919, 1929: the grace was armed and lived in
+memory only). In both, the restarted node re-adopts its own unreleased lease, which is no takeover, so nothing arms the
+grace, and its first lock request is granted at once. The sim keeps the `Meta` across a reboot, and so the in-memory
+quarantine, but the new incarnation's wait clock starts at its wall, so the old value is not comparable and does not
+hold (production loses it outright).
+
+**Fix (plan 43 §11.2, option a).** `acquire_cas` writes the lock restart horizon, `now + lock_ttl + 2M`, durably
+before the claim CAS of a released lease whose release was marked as leaving grants (`lock_persist_released_grace`,
+through a new `Replica::note_lock_grant_horizon`); a write that fails stops the claim, as `takeover_floor_pending`
+does. `locks_start` loads it as any restart horizon: the quarantine and the barrier on everything, to its end on the
+same boot, the recorded span from the restart on another. The horizon counts from the claim, not from the first
+sight of the release, which only ever makes a restart wait longer than the in-memory grace. The cost is one durable
+write on the core per claim of a marked released lease. The alternative (re-arm the grace when a node re-adopts a
+marked own lease) was not taken: the mark cannot tell an inherited duty from the tenure's own (`strict_mounts` marks
+every lease), so every restart of a marked tenure would wait a lock TTL for nothing.
+
+**Review: monotonic horizon writes.** The core's write made the lock horizon a two-writer key (the off-core
+`PersistLockHorizon` lane wrote it alone before): a lane write that had read `known` and waited for the store's writer
+lock could land after the core's higher one, so `known` said the higher value and the disk the lower, and a restart
+waited too short. `Meta::note_horizon` now holds a per-key writer lock (`horizon_written`) across the read of the
+highest value written, the `kv_set` and the update of that value, and writes nothing when that value covers the ask; the
+sync follows outside the lock (one sync covers every write before it) and `known` moves only after it. The read-grant
+horizon and the takeover floor have the core as their only writer and use the same path, unchanged in effect; the clears
+(`clear_takeover_floor`, `clear_passed_horizons`) reset the written value under the same lock. Tests:
+`a_held_lower_horizon_write_does_not_lower_a_higher_one` (meta: a writer held before its `kv_set` while another writes
+a higher value; fails on the parent, the stored value ends at the lower one) and
+`a_failed_grace_write_stops_the_claim_of_a_released_lease_and_leaves_nothing` (core, with a new
+`fail_horizon_writes_on_this_thread_for_tests`: no claim CAS, no pending plan, job, lease held, floor mark, horizon or
+quarantine; the later claim goes through).
+
+**Tests, failing before.** `a_released_taker_restarted_inside_its_grace_keeps_it` and
+`a_released_taker_restarted_between_its_cas_and_its_answer_keeps_the_grace` (core: a new process on the same disk with
+empty lock tables is granted at once on the parent, told to wait with the change, granted after the grace), the
+control `a_taker_of_an_unmarked_released_lease_persists_no_grace` (passes on both), and the sim pin
+`regression_a_released_taker_rebooted_inside_its_grace_still_waits_out_its_grants` (the seven seeds and 1253, 1546;
+fails at seed 961 on the parent).
+
+**Sweeps** (release, default clock mix): `locks-released-takeover` 0 of 10 000 (7 of 2 000 on the parent);
+`locks-released-takeover-ahead` 0 of 1 000 (0 on the parent); 15 other lock configurations of 600 seeds
+(`locks-failover*`, `locks-released-*`, `locks-root-reboot*`, `locks-root-restart-step-forward`,
+`locks-root-step-forward-then-restart`, `locks-restart-reclaim-seal`, `locks-blips-tight`, `locks-faults`,
+`locks-holder-step-back-sealed`, `locks-production-ttl`): failing sets (all empty) and failover latencies identical to
+the parent's. The release sim suite (271 tests) and the authority lib tests (719) pass; fmt and `clippy -D warnings`
+are clean.

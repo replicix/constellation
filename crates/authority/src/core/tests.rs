@@ -20769,6 +20769,219 @@ mod locks {
         );
     }
 
+    /// A new process of `h`'s node on the same disk, `after_ms` later: the
+    /// journal's files and the persisted restart horizon are the old
+    /// process's, the lock tables (and the quarantine in them) are empty, as
+    /// production reopens them; nothing is held yet.
+    fn restart_on_its_disk(h: &Harness, after_ms: u64) -> Harness {
+        let mut r = Harness::new(h.core.node_id());
+        r.core = Core::new(h.core.cfg.clone());
+        r.now = h.now.plus(after_ms);
+        for key in ["lock_grant_horizon_ms", "read_grant_horizon_ms"] {
+            if let Some(v) = h.meta.kv_get(key).unwrap() {
+                r.meta.kv_set_durable(key, &v).unwrap();
+            }
+        }
+        let mut out = Vec::new();
+        r.core.start(r.clk(), &r.meta, &mut out);
+        r.core.handle(
+            r.clk(),
+            Event::Peers {
+                links: (1..=4)
+                    .filter(|n| *n != h.core.node_id())
+                    .map(|node| crate::event::PeerLink {
+                        node,
+                        connected: false,
+                        last_seen: None,
+                        rtt_ms: None,
+                        since: None,
+                    })
+                    .collect(),
+            },
+            &r.meta,
+        );
+        r
+    }
+
+    /// The marked lease node 1 released with a lock grant out.
+    fn released_marked(h: &Harness) -> Lease {
+        let mut prev = lease_of(1, 1, h.now.0 + 5_000);
+        prev.released = true;
+        prev.granted_delegations = true;
+        prev
+    }
+
+    /// Plan 43 §11.2 (`locks-released-takeover`; seeds 961, 973, 1571,
+    /// 1610, 1695, 1919 and 1929 under the default clock mix, 7 of 2 000 on
+    /// the parent): the grace a taker of a marked released lease arms is in
+    /// memory, so a taker that stopped inside it and came back re-adopted
+    /// its own lease with no grace, and granted a lock the releaser's holder
+    /// still honoured. Persisted as the restart horizon, the new process
+    /// keeps it: no grant until the releaser's grants have lapsed, then
+    /// grants again. Fails on the parent: the first request is granted.
+    #[test]
+    fn a_released_taker_restarted_inside_its_grace_keeps_it() {
+        let mut h = Harness::new(2);
+        let op = h.create("f");
+        let MutateOp::Create { ino, .. } = op else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        let prev = released_marked(&h);
+        let grace = h.core.lock_ttl_ms() + 2 * h.core.lock_margin_ms();
+        let claimed_at = h.clk().wait;
+        claim_over(&mut h, &prev, false);
+        assert!(h.meta.locks().quarantine_until() >= claimed_at.plus(grace as u64));
+        // Stopped 300 ms into the grace, back 300 ms later.
+        h.advance(300);
+        let mut r = restart_on_its_disk(&h, 300);
+        assert!(
+            r.meta.locks().quarantine_until() >= claimed_at.plus(grace as u64),
+            "the restarted taker's grace ends at {:?}, not by {:?}",
+            r.meta.locks().quarantine_until(),
+            claimed_at.plus(grace as u64)
+        );
+        // It re-adopts its own lease (no takeover): a peer asks for the lock.
+        r.hold(2, None);
+        let out = request(&mut r, 3, 8, ino, X, false);
+        let [(3, OpId(8), LockOutcome::Waiting { grace: true, .. })] =
+            lock_replies(&out).as_slice()
+        else {
+            panic!("granted inside the releaser's grace: {out:?}")
+        };
+        // Past the grace the lock is granted.
+        r.now = Ms(r.now.0 + grace + 2_000);
+        r.hold(2, None);
+        let out = request(&mut r, 3, 9, ino, X, false);
+        let rs = lock_replies(&out);
+        let [(3, OpId(9), o)] = rs.as_slice() else {
+            panic!("{out:?}")
+        };
+        granted(o);
+    }
+
+    /// A claim of a marked released lease needs its grace durable first
+    /// (`lock_persist_released_grace`); when the write fails the claim must
+    /// not go out, and nothing of it may remain: no claim CAS, no pending
+    /// plan or job, no lease held, no floor mark, no horizon stored or
+    /// quarantine set. The lease is still released, and a claim once the
+    /// store writes again goes through and keeps the grace.
+    #[test]
+    fn a_failed_grace_write_stops_the_claim_of_a_released_lease_and_leaves_nothing() {
+        let mut h = Harness::new(2);
+        let prev = released_marked(&h);
+        let grace = h.core.lock_ttl_ms() + 2 * h.core.lock_margin_ms();
+        let floor_mark = h.core.ack.floor_mark;
+        constellation_meta::fail_horizon_writes_on_this_thread_for_tests(1);
+        let tried = try_claim_over(&mut h, &prev, false, false);
+        constellation_meta::fail_horizon_writes_on_this_thread_for_tests(0);
+        let Err(out) = tried else {
+            panic!("the claim CAS went out over a grace that was not durable")
+        };
+        assert!(
+            s3_ops(&out)
+                .iter()
+                .all(|(_, r)| !matches!(r, S3Op::LeaseSwap { .. })),
+            "a claim CAS in {out:?}"
+        );
+        assert!(h.core.pending_plan.is_none(), "a plan is pending");
+        assert!(h.core.job.is_none(), "the acquisition is still running");
+        assert!(h.core.lease.held.is_none(), "a lease is held");
+        assert_eq!(h.core.ack.floor_mark, floor_mark, "a floor mark was set");
+        assert_eq!(h.meta.kv_get("lock_grant_horizon_ms").unwrap(), None);
+        assert_eq!(h.meta.locks().quarantine_until(), WaitMs(0));
+        // Still released, still claimable: the next try writes the grace and
+        // claims.
+        let claimed_at = h.clk().wait;
+        let claimed = claim_over(&mut h, &prev, false);
+        assert_eq!(claimed.holder, 2);
+        assert!(h.meta.kv_get("lock_grant_horizon_ms").unwrap().is_some());
+        assert!(h.meta.locks().quarantine_until() >= claimed_at.plus(grace as u64));
+    }
+
+    /// The same for a taker that stopped between its claim CAS and the
+    /// CAS's answer: the lease names it and says it granted, and `acquire_won`
+    /// never ran, so no in-memory grace was ever armed. The horizon is
+    /// written before the CAS goes out.
+    #[test]
+    fn a_released_taker_restarted_between_its_cas_and_its_answer_keeps_the_grace() {
+        let mut h = Harness::new(2);
+        let op = h.create("f");
+        let MutateOp::Create { ino, .. } = op else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        let prev = released_marked(&h);
+        let grace = h.core.lock_ttl_ms() + 2 * h.core.lock_margin_ms();
+        let claimed_at = h.clk().wait;
+        let mut out = Vec::new();
+        h.core.enqueue_job(
+            h.clk(),
+            super::super::jobs::JobReq::Acquire {
+                reason: "test",
+                ask_handoff: false,
+            },
+            &h.meta,
+            &mut out,
+        );
+        // The acquisition up to its claim CAS, which goes out unanswered.
+        for _ in 0..8 {
+            let Some((op, req)) = s3_ops(&out)
+                .into_iter()
+                .find(|(_, r)| !matches!(r, S3Op::HeartbeatRead))
+                .map(|(op, r)| (op, r.clone()))
+            else {
+                panic!("the acquisition stalled: {out:?}")
+            };
+            let result = match &req {
+                S3Op::LeaseGet => S3Result::LeaseGet(Ok(Some((prev.clone(), tag())))),
+                S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+                S3Op::LeaseSwap { .. } => break,
+                other => panic!("unexpected request {other:?}"),
+            };
+            out = h.step(Event::S3 { op, result });
+        }
+        assert!(
+            s3_ops(&out)
+                .iter()
+                .any(|(_, r)| matches!(r, S3Op::LeaseSwap { .. })),
+            "no claim CAS: {out:?}"
+        );
+        assert!(
+            h.meta.locks().quarantine_until() <= claimed_at,
+            "armed early"
+        );
+        h.advance(300);
+        let mut r = restart_on_its_disk(&h, 300);
+        r.hold(2, None);
+        let out = request(&mut r, 3, 8, ino, X, false);
+        let [(3, OpId(8), LockOutcome::Waiting { grace: true, .. })] =
+            lock_replies(&out).as_slice()
+        else {
+            panic!("granted inside the releaser's grace: {out:?}")
+        };
+        r.now = Ms(r.now.0 + grace + 2_000);
+        r.hold(2, None);
+        let out = request(&mut r, 3, 9, ino, X, false);
+        let rs = lock_replies(&out);
+        let [(3, OpId(9), o)] = rs.as_slice() else {
+            panic!("{out:?}")
+        };
+        granted(o);
+    }
+
+    /// A released lease that left nothing behind costs its taker no write:
+    /// the horizon is persisted only for a mark.
+    #[test]
+    fn a_taker_of_an_unmarked_released_lease_persists_no_grace() {
+        let mut h = Harness::new(2);
+        let mut prev = released_marked(&h);
+        prev.granted_delegations = false;
+        claim_over(&mut h, &prev, false);
+        assert_eq!(h.meta.kv_get("lock_grant_horizon_ms").unwrap(), None);
+    }
+
     /// The same at the lock request: a file under the tenure that took an
     /// unmarked released lease over is granted at once (the takeover's
     /// gate opened), the marked twin is told `Waiting { grace: true }`.
@@ -21095,6 +21308,19 @@ mod locks {
         permitted: bool,
         permit_in_flight: bool,
     ) -> (Lease, Vec<Action>) {
+        try_claim_over(h, prev, permitted, permit_in_flight)
+            .unwrap_or_else(|out| panic!("the acquisition stalled: {out:?}"))
+    }
+
+    /// [`claim_over_with`] for an acquisition that may end before it sends
+    /// its claim CAS (a write it needs first failed): `Err` with the
+    /// actions of the step that left no request.
+    pub(super) fn try_claim_over(
+        h: &mut Harness,
+        prev: &Lease,
+        permitted: bool,
+        permit_in_flight: bool,
+    ) -> Result<(Lease, Vec<Action>), Vec<Action>> {
         h.core.cfg.takeover_promise_check = false;
         if permitted {
             h.core.lease.takeover_permit = Some((prev.epoch, prev.holder));
@@ -21138,7 +21364,7 @@ mod locks {
                 .find(|(_, r)| !matches!(r, S3Op::HeartbeatRead))
                 .map(|(op, r)| (op, r.clone()))
             else {
-                panic!("the acquisition stalled: {out:?}")
+                return Err(out);
             };
             let result = match &req {
                 S3Op::LeaseGet => S3Result::LeaseGet(Ok(Some((prev.clone(), tag())))),
@@ -21155,7 +21381,7 @@ mod locks {
                         op,
                         result: S3Result::LeasePut(Ok(tag())),
                     });
-                    return (sent, won);
+                    return Ok((sent, won));
                 }
                 other => panic!("unexpected request {other:?}"),
             };
