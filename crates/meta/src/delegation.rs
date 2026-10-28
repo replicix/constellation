@@ -581,6 +581,28 @@ impl Meta {
         Some(RootAdmission(guard))
     }
 
+    /// Plan 30 §M8 under §M11: whether a live delegation owns what a
+    /// strict read of `ino` (or of the entry `name` in it) reads, so the
+    /// root's replica is not its index: the delegate acknowledges its own
+    /// writes once its group holds them, before the root applies its
+    /// stream. The keys are the core's (`Core::read_keys`). Costs one
+    /// atomic load while the table is empty.
+    pub fn read_delegated(&self, ino: Ino, name: Option<&str>) -> bool {
+        if !self.delegations_any() {
+            return false;
+        }
+        let mut keys = TouchSet::default();
+        match name {
+            Some(n) => {
+                keys.dentries.insert((ino, n.to_string()));
+            }
+            None => {
+                keys.inos.insert(ino);
+            }
+        }
+        !matches!(self.resolve_ownership(&keys), Ownership::Root)
+    }
+
     /// Who executes an op touching `keys` (see the module doc).
     pub fn resolve_ownership(&self, keys: &TouchSet) -> Ownership {
         let table = self.delegation_table();

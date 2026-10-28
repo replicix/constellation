@@ -60544,3 +60544,23 @@ think time, 300,000 rows in `completed`, a prune every 5 s with 75,000 newly sta
 
 Not done: an xcheckfs 2-node run of the fixes (the benchmarks stand in for it; the real run's 7 ops/s and its
 0.5 to 1 s tail are not accounted for above, see "What dominates"), F2's ino cursor, F4.
+
+## Fix: the root holder's strict read served a delegated name from its trailing replica (plan 40 P9, 2026-10-28)
+
+A load campaign of `readdirplus-strict` on 07dee5d1 (io_uring, load 31 to 37, about 158 000 rounds) saw no stale `""`
+read and no stale size, but three times "b still sees the removed name", gone after about 5 ms. In each, the root
+lease had moved to the reader B and B's placement had split `s`, delegating a hash range to the writer A. Under
+`--cto strict`, `View::strict_read` answered from the local replica whenever this node held the root lease
+(`reads_locally`); a delegate acknowledges its own fast-path writes once its group holds them, before the root applies
+its stream, so the holder's replica trails what a delegation owns. The core's ReadIndex already routed such a read to
+the delegate (`Core::deleg_read_owner`, d214b1c7); the FUSE shortcut skipped the core.
+
+`Meta::read_delegated(ino, name)` resolves the read's keys as the core does (`Core::read_keys`, one atomic load while
+no delegation exists), and the holder's shortcut is taken only for a root-owned key; a delegated one goes through the
+core to the delegate. The new scenario `cto-strict-delegated-read` (the root holder reads each change the delegate of
+`/s` made: an overwrite, a create, a remove) failed in round 0 three times out of three on the parent and passes 300
+rounds with the change; it checks that the delegation held through the loop.
+
+Left open: the missed new name of the earlier campaign (no node logs) fits the same path but is not confirmed; a load
+campaign with this change; a directory's own attributes (mtime, nlink) from a delegate's stream, looked up by its name
+in a root-owned parent, are covered by the session wait only (on every node, not only the holder).

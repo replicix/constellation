@@ -75,7 +75,7 @@
 //! | Model | Code |
 //! |---|---|
 //! | `ReadLocal` (bounded) | `engine/src/view/ops.rs` `lookup`/`open`/`readdir` → `View::strict_read`, bounded arm: M6's `session_wait` only |
-//! | `ReadLocal` (strict, the usable holder) | `strict_read` → `LeaseView::reads_locally` |
+//! | `ReadLocal` (strict, the usable holder) | `strict_read` → `LeaseView::reads_locally` and `!Meta::read_delegated` (a key a live delegation owns goes to the core, which routes it to the delegate: `Core::deleg_read_owner`) |
 //! | `ReadLocal` (strict, no live holder) | `Core::on_read_holder_learned` (lease claimable) → `read_tail` → `JobReq::TailToHead` → `ReadAnswer::Tailed` |
 //! | `ReadUnderDelegation` / `FinishRead` | `strict_read` → `ReadDelegations::valid` → `Meta::session_wait_at(keys, grant position)` |
 //! | `SendReadIndex` / `ReadIndexTimeout` | `strict_read` → `SyncRequest::ReadIndex` → `Control::ReadIndex` → `Core::on_read_index_control` → `PeerMsg::ReadIndex`; `Timer::ReadIndexTimeout` / `ReadIndexDeadline` |

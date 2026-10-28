@@ -151,7 +151,12 @@ impl View {
         }
         let deleg = self.meta.read_delegations();
         deleg.count(|s| s.strict_reads += 1);
-        if h.lease.reads_locally() {
+        // The holder's replica is the index of what the root owns only:
+        // under a live delegation it trails the delegate's stream, and the
+        // delegate acknowledges before the root applies it (the core's
+        // ReadIndex routes such a read to the delegate,
+        // `Core::deleg_read_owner`).
+        if h.lease.reads_locally() && !self.meta.read_delegated(ino, name) {
             deleg.count(|s| s.holder_local += 1);
             let _ = self.meta.session_wait(keys);
             return true;

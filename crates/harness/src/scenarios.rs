@@ -1116,6 +1116,13 @@ pub const SCENARIOS: &[Scenario] = &[
         run: m8::cto_strict_root,
     },
     Scenario {
+        name: "cto-strict-delegated-read",
+        desc: "plan 30 M8 under M11: the lease holder delegates /s to a second node and reads it: under --cto strict each of the delegate's closes, new names and removals is visible to the holder's very next open or lookup (the delegate acknowledges before the root's replica applies its stream)",
+        requires: &[],
+        caps: &[],
+        run: m8::cto_strict_delegated_read,
+    },
+    Scenario {
         name: "s3-cut-one-node",
         desc: "EC2 finding 1 / R2-1: a non-holder's S3 is black-holed (P2P intact, product S3 retry budget); create+write+close with and without fsync under --write-mode back and through completes during the cut and is visible elsewhere, and unrelated ls -la / stat on that node answer at once while a close is in flight",
         requires: &[],

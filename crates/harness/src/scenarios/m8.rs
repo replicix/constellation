@@ -727,3 +727,102 @@ pub fn cto_strict_root(_seed: u64) -> Result<()> {
     anyhow::ensure!(failures.is_empty(), "{}", failures.join("\n"));
     Ok(())
 }
+
+/// `--cto strict` with the lease holder reading a subtree another node
+/// owns: R holds the root lease and delegates `/s` to D (`constellation
+/// delegate`); D's writes there run on D's own fast path and are
+/// acknowledged once its delegation's group holds them, before R's root
+/// replica applies D's stream. R's very next strict lookup or open must
+/// still see each change — the index of a delegated subtree is the
+/// delegate's, the holder's included (readdirplus-strict's late name
+/// change under load, once the lease moved to the reader and placement
+/// split `s` for the writer).
+pub fn cto_strict_delegated_read(_seed: u64) -> Result<()> {
+    const NAME: &str = "cto-strict-delegated-read";
+    let extra = [
+        ("CONSTELLATION_DELEGATION_PLACEMENT", "off"),
+        ("CONSTELLATION_LEASE_PLACEMENT", "off"),
+        ("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "600000"),
+        ("CONSTELLATION_LEASE_WANTED_GRACE_MS", "600000"),
+    ];
+    let (_env, _root, mut clients) = cluster(NAME, &["r", "d"], "strict", &extra)?;
+    let result = (|| -> Result<()> {
+        let (r, d) = (&clients[0], &clients[1]);
+        std::fs::create_dir(r.mnt.join("s"))?;
+        eventually("s visible on d", Duration::from_secs(20), || {
+            anyhow::ensure!(d.mnt.join("s").is_dir());
+            Ok(())
+        })?;
+        let d_id = super::m11::node_id(d)?;
+        super::m11::delegate(r, "/s", d_id)?;
+        let gen = super::m11::wait_installed(d, "/s", Duration::from_secs(20))?;
+        eprintln!("    {NAME}: r holds the root, d ({d_id}) the delegation of /s (gen {gen})");
+        let rounds = super::readdirplus::env_usize("CTO_STRICT_DELEGATED_ROUNDS", 100);
+        let check_lease = |when: &str| -> Result<()> {
+            let lease = lease_of(r)?;
+            anyhow::ensure!(
+                lease["held"] == true,
+                "r does not hold the lease {when}: {lease}"
+            );
+            Ok(())
+        };
+        check_lease("before the loop")?;
+        let status = |c: &Client| -> String {
+            match c.control_status() {
+                Ok(s) => format!("cto {} delegation {}", s["cto"], s["delegation"]["mine"]),
+                Err(e) => format!("{e:#}"),
+            }
+        };
+        let settles = |path: &Path, exists: bool| -> Option<Duration> {
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(3) {
+                if std::fs::symlink_metadata(path).is_ok() == exists {
+                    return Some(started.elapsed());
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            None
+        };
+        for i in 0..rounds {
+            let content = format!("round-{i}");
+            std::fs::write(d.mnt.join("s/f"), &content)?;
+            let got = std::fs::read_to_string(r.mnt.join("s/f")).unwrap_or_default();
+            anyhow::ensure!(
+                got == content,
+                "r read s/f as {got:?} right after d closed {content:?} (round {i}); r {}",
+                status(r)
+            );
+            let n = d.mnt.join(format!("s/new-{i}"));
+            let seen = r.mnt.join(format!("s/new-{i}"));
+            std::fs::write(&n, b"n")?;
+            if std::fs::symlink_metadata(&seen).is_err() {
+                let after = settles(&seen, true);
+                bail!(
+                    "r does not see the new name at once (round {i}); seen after {after:?}; r {}",
+                    status(r)
+                );
+            }
+            std::fs::remove_file(&n)?;
+            if std::fs::symlink_metadata(&seen).is_ok() {
+                let after = settles(&seen, false);
+                bail!(
+                    "r still sees the removed name (round {i}); gone after {after:?}; r {}",
+                    status(r)
+                );
+            }
+        }
+        check_lease("after the loop")?;
+        // The rounds ran under the same delegation (a lapsed one would make
+        // every key the root's, and the rounds pass without testing it).
+        let after = super::m11::wait_installed(d, "/s", Duration::from_secs(5))?;
+        anyhow::ensure!(
+            after == gen,
+            "d's delegation of /s changed during the loop: gen {gen} -> {after}"
+        );
+        print_cto(NAME, "r", &cto_of(r)?);
+        print_cto(NAME, "d", &cto_of(d)?);
+        Ok(())
+    })();
+    unmount_all(&mut clients);
+    result
+}

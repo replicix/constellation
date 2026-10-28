@@ -470,6 +470,7 @@ pub const SKIPPED: &[(&str, Skip)] = &[
     ("cto-latency", Skip::Local(&[CTO_STRICT])),
     ("cto-second-node-joins", Skip::Local(&[CTO_STRICT])),
     ("cto-strict-root", Skip::Local(&[CTO_STRICT])),
+    ("cto-strict-delegated-read", Skip::Local(&[CTO_STRICT, PLACEMENT])),
     ("s3-cut-one-node", Skip::Local(&[S3_FAULTS])),
     ("s3-cut-create-holder-restart", Skip::Local(&[KILL, S3_FAULTS, P2P_CUT])),
     ("p2p-partition-one-node", Skip::Local(&[P2P_CUT, NODES4])),
