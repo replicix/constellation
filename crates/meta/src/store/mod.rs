@@ -107,14 +107,16 @@ pub use gate::{
 };
 #[cfg(test)]
 mod close_tests;
-#[cfg(test)]
-mod lock_bench;
 pub mod held;
 pub mod inbox;
 pub(crate) mod journal;
 pub(crate) mod local;
+#[cfg(test)]
+mod lock_bench;
 pub(crate) mod misc;
 pub(crate) mod ns;
+#[cfg(test)]
+mod prune_tests;
 mod reads;
 pub mod remote;
 mod scratch;
@@ -264,6 +266,15 @@ pub(crate) type RecentOutcomes = std::collections::HashMap<
 /// another op) pinning memory here forever. Oldest (lowest seq) entries
 /// are dropped first when a bucket would exceed this.
 pub(crate) const MAX_RECENT_PER_INCARNATION: usize = 4096;
+/// How many `completed` rows one write transaction of
+/// [`Meta::prune_completed`] looks at at most: the bound on how long the
+/// prune holds the store's writer lock at a time (a point read and a remove
+/// per row), whatever the table's size.
+pub(crate) const PRUNE_COMPLETED_BATCH: usize = 256;
+/// The least [`Meta::prune_completed`] stays away from the writer lock
+/// between two batches.
+pub(crate) const PRUNE_COMPLETED_PAUSE_MIN: std::time::Duration =
+    std::time::Duration::from_micros(200);
 pub type EpochRow = (
     String,
     Vec<u64>,
@@ -1752,23 +1763,78 @@ impl Meta {
     /// Remove every `completed` row whose value (recorded at apply time)
     /// is older than `retention_ms`. Returns the number of rows removed.
     /// `now_ms` is the caller's clock (unit-testable without sleeping).
+    ///
+    /// Two phases, so that the store's single writer lock is never held
+    /// for a walk of the whole table: every rid the cluster completed in
+    /// the retention window, and the tombstones the last vacuum left. That
+    /// walk used to run in one write transaction, and every writer of a
+    /// root (its FUSE workers, the authority's apply and ack, a backup's
+    /// append) queued behind it for as long as the table is long (80 ms at
+    /// 270,000 rows: `store::lock_bench`). The candidates are
+    /// read from a snapshot, without the lock; they are then removed
+    /// [`PRUNE_COMPLETED_BATCH`] at a time, each row read again under the
+    /// writer lock and removed only if it is still stale. A row a segment
+    /// recorded again since the snapshot (a fresh `recorded_at`) stays, a
+    /// row gone meanwhile is not counted, and a row written after the
+    /// snapshot is no candidate (the next prune looks at it). The rule that
+    /// decides a row is the same as it was, and it is decided where the row
+    /// is removed, so the exactly-once window of a rid ends exactly where
+    /// it did. A failed batch leaves the batches before it removed and the
+    /// rest for the next prune: each row goes on its own, so no prefix of
+    /// them is wrong. A row too short to carry a time is never removed, as
+    /// before.
     pub fn prune_completed(&self, now_ms: i64, retention_ms: i64) -> Result<u64, MetaError> {
-        let mut tx = self.db.write_tx();
-        let stale: Vec<Vec<u8>> = tx
-            .iter(&self.completed)
-            .map(|g| g.into_inner())
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .filter_map(|(k, v)| {
-                let recorded_at = i64::from_be_bytes(v.get(8..16)?.try_into().ok()?);
-                (now_ms.saturating_sub(recorded_at) > retention_ms).then(|| k.to_vec())
-            })
-            .collect();
-        let n = stale.len() as u64;
-        for k in stale {
-            tx.remove(&self.completed, k);
+        let stale = |v: &[u8]| {
+            v.get(8..16)
+                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                .map(i64::from_be_bytes)
+                .is_some_and(|recorded_at| now_ms.saturating_sub(recorded_at) > retention_ms)
+        };
+        let candidates: Vec<Vec<u8>> = {
+            let r = self.db.read_tx();
+            let mut out = Vec::new();
+            for guard in r.iter(&self.completed) {
+                let (k, v) = guard.into_inner()?;
+                if stale(&v) {
+                    out.push(k.to_vec());
+                }
+            }
+            out
+        };
+        #[cfg(test)]
+        prune_hook::fire(self, prune_hook::At::Candidates);
+        let mut n = 0u64;
+        for batch in candidates.chunks(PRUNE_COMPLETED_BATCH) {
+            let mut tx = self.db.write_tx();
+            let held_since = std::time::Instant::now();
+            let mut removed = 0u64;
+            for k in batch {
+                if tx
+                    .get(&self.completed, k.clone())?
+                    .is_some_and(|v| stale(&v))
+                {
+                    tx.remove(&self.completed, k.clone());
+                    removed += 1;
+                }
+            }
+            #[cfg(test)]
+            prune_hook::fire(self, prune_hook::At::Commit(removed));
+            if removed > 0 {
+                tx.commit()?;
+                n += removed;
+            } else {
+                drop(tx);
+            }
+            // The writer lock is not handed to the longest waiter: a thread
+            // that lets go of it and asks again takes it back before the
+            // writers it woke have run (vendor/fjall, `WriterLock`), so
+            // batches in a row would be one long hold with gaps nobody can
+            // use. Stay away for as long as the batch held it (at least
+            // `PRUNE_COMPLETED_PAUSE_MIN`): the writers that queued behind
+            // it get their turn, and the prune takes at most half of the
+            // lock.
+            std::thread::sleep(held_since.elapsed().max(PRUNE_COMPLETED_PAUSE_MIN));
         }
-        tx.commit()?;
         Ok(n)
     }
 
@@ -2140,6 +2206,42 @@ pub(crate) fn reclaim_ino_counter(
         kv_set_tx(tx, local, KV_NEXT_INO, &block_end.to_string());
     }
     Ok(())
+}
+
+/// Test-only: a hook run on the pruning thread once
+/// [`Meta::prune_completed`] has its candidates (outside the writer lock:
+/// where another writer's change of one can land) and right before each
+/// batch commits (with the writer lock held: it must not write).
+#[cfg(test)]
+pub(crate) mod prune_hook {
+    use super::Meta;
+    use std::cell::RefCell;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum At {
+        Candidates,
+        /// A batch about to commit (or be dropped, with nothing to remove),
+        /// with how many rows it removes.
+        Commit(u64),
+    }
+
+    pub(crate) type Hook = Box<dyn FnMut(&Meta, At)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn set(hook: Option<Hook>) {
+        HOOK.with(|h| *h.borrow_mut() = hook);
+    }
+
+    pub(crate) fn fire(meta: &Meta, at: At) {
+        let hook = HOOK.with(|h| h.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook(meta, at);
+            HOOK.with(|h| *h.borrow_mut() = Some(hook));
+        }
+    }
 }
 
 impl Drop for Meta {
