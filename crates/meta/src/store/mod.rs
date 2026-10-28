@@ -107,6 +107,8 @@ pub use gate::{
 };
 #[cfg(test)]
 mod close_tests;
+#[cfg(test)]
+mod lock_bench;
 pub mod held;
 pub mod inbox;
 pub(crate) mod journal;
