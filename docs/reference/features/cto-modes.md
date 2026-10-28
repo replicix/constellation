@@ -225,6 +225,13 @@ holds one, opens and lookups under it are answered locally, with no
 round trip. It is renewed in the background (by another ReadIndex) once
 half its TTL has passed and it is still in use.
 
+A directory's delegation covers its entries, not its children's
+attributes: a write to a child recalls the child's grants, not the
+directory's. So a lookup served under the directory's delegation also
+reads the child strictly, under the child's own delegation or with a
+ReadIndex that grants one. A cold scan of a directory (`ls -l`, `find`)
+therefore pays one round trip per child not delegated yet.
+
 - A grant lasts `CONSTELLATION_READ_DELEGATION_TTL_MS` (5 s), capped so
   that it never outlives the lease that backs it.
 - The sequencer makes the grant before it reads the position, and
@@ -345,6 +352,7 @@ EC2 rows (four nodes in one AWS region; see
 | EC2, same region, open on another node than the writer | warm p50 0.15 ms; cold p50 27.4 ms, p99 44.1 ms | warm p50 0.39 ms; cold p50 29.5 ms, p99 76.8 ms |
 | Across continents, file nobody else writes | local | one WAN round trip on the first open, then local |
 | Across continents, write then open | stale until the log arrives | one WAN round trip, the minimum strict close-to-open allows |
+| Cold scan of N files (`ls -l`, `find`) | local | one round trip per file not delegated yet (not yet measured) |
 
 A writer's acknowledgement waits for recalls only on inodes another
 node holds a delegation on; a silent delegate costs up to its TTL plus

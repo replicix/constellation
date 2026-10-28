@@ -1264,6 +1264,23 @@ pub fn strict(_seed: u64) -> Result<()> {
             let f = w.mnt.join("s").join("f000");
             let content = format!("round-{i}");
             std::fs::write(&f, &content)?;
+            // The other node's lookup by path sees the close's size: a
+            // stat right after (strict lookup under the parent's read
+            // delegation once answered the child's attributes from
+            // before the close; the kernel kept that size for the read
+            // below when a fresh `GETATTR` reply was dropped: `""`).
+            // Every other round only, so the open's own lookup is still
+            // the first one in the rest.
+            if i % 2 == 0 {
+                let len = std::fs::metadata(r.mnt.join("s/f000"))?.len();
+                ensure!(
+                    len == content.len() as u64,
+                    "{} stat s/f000 size {len} after {content:?} (round {i}); reader {}; writer {}",
+                    r.name,
+                    strict_status(r),
+                    strict_status(w)
+                );
+            }
             let got = std::fs::read_to_string(r.mnt.join("s/f000"))?;
             if got != content {
                 // What the strict reads of both nodes did, to tell a

@@ -60384,3 +60384,27 @@ Left open: `report_deleg_durable` publishes once per core event, so the class th
 event. A row journaled `Lone` just before the event that makes the delegate non-lone is answered at once (and is not in
 `acked_max` until the root's append covers it, as every lone row); a row journaled `DelegGroup` just before it turns
 lone waits for the group, which only costs latency. The window is one core event wide and is not widened by this change.
+
+## Fix: a strict lookup under the parent's read delegation answered the child's attributes from before another node's close (plan 40 P9, 2026-10-28)
+
+Under `--cto strict`, node A writes and closes `s/f000`; node B's `stat s/f000` right after returned size 0 in 111 of
+300 rounds of `readdirplus-strict` on `/dev/fuse` with no host load: B's lookup was served under B's read delegation on
+`s`, which covers the directory's entries, while A's truncate and close recall only the grants on the child. The
+kernel took that size into its inode, and with a fresh `GETATTR` reply dropped by a racing notification an open's read
+stopped at it: the rare strict `""` read under load (4 in about 110 000 rounds over io_uring, plan 40 P9). The other
+candidates for that read (the reader's `streamed` mark ahead of its installs, a note before the install's commit,
+stream holes, a mark raised by the backup path) were ruled out by reading `on_stream_ahead` and
+`install_streamed_committed` and by delay hooks at each gap (300 rounds each, 0 stale reads).
+
+`strict_read` now says whether its answer covered the child: a ReadIndex answer does (`unshipped_touches_read` counts
+the child's unshipped writes), as do the sequencer's own replica and the bounded mode; an answer under `ino`'s own
+delegation does not. A lookup served under the parent's delegation then reads the child strictly as well, under the
+child's delegation or with a ReadIndex that grants one. An open by path costs the same (its ReadIndex moves from the
+open to the lookup, and the open finds the child's grant); a cold scan pays one round trip per child not delegated yet
+(`cto-modes.md`). `readdirplus-strict` now stats the file on the reader every other round before the read (fails in
+round 1 on the parent, 300 rounds pass twice with the fix).
+
+Left open: B answering ENOENT for a name A had just created (one in about 162 000 rounds under load) is not explained
+by this; a load campaign over io_uring with this change is to show the `""` read gone; the cold-scan cost is not
+measured, and a cheaper sound alternative (recall a directory's grants when a child with one link changes its
+attributes) is not tried.

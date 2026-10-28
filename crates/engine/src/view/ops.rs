@@ -279,7 +279,7 @@ impl Vfs for View {
         // Plan 30 §M8: under `--cto strict` a lookup sees every entry
         // another node's completed close made (the first step of an
         // open by path).
-        self.strict_read(
+        let child_covered = self.strict_read(
             parent,
             true,
             Some(&name),
@@ -299,7 +299,26 @@ impl Vfs for View {
                 // during the wait is concurrent with this lookup, and the
                 // reply names the inode the name led to; `current_attr`
                 // reads the inode's row anew.
-                self.session_wait(&[ReadKey::Ino(attr.ino)]);
+                //
+                // Under `--cto strict`, a lookup served under the parent's
+                // read delegation has not covered the child's attributes
+                // (`strict_read`'s `false`): another node's close of the
+                // child recalls the child's grants, not the parent's, and
+                // the reply would hand the kernel the size from before
+                // that close (`readdirplus-strict`'s stat; with a fresh
+                // `GETATTR` reply dropped by a racing notification, the
+                // open's read stops at that size: `""`). The child is read
+                // strictly then.
+                if child_covered {
+                    self.session_wait(&[ReadKey::Ino(attr.ino)]);
+                } else {
+                    self.strict_read(
+                        attr.ino,
+                        attr.kind == InodeKind::Dir,
+                        None,
+                        &[ReadKey::Ino(attr.ino)],
+                    );
+                }
                 // A name looked up while its inode has pending writes
                 // must report the pending size, or the entry reply caches
                 // a stale one (`current_attr`). The ino is only known

@@ -124,22 +124,37 @@ impl View {
     /// (`SyncRequest::ReadIndex`) and waits for the position it answers.
     /// Every path ends in the session wait, bounded as M6's is: a
     /// sequencer that does not answer degrades the read, never fails it.
-    pub(crate) fn strict_read(&self, ino: Ino, dir: bool, name: Option<&str>, keys: &[ReadKey]) {
+    ///
+    /// `false`: the read was served under `ino`'s own read delegation,
+    /// which covers `ino` (and, for a directory, its entries) but not the
+    /// attributes of a child `name` leads to: a write that changes only
+    /// the child (a truncate, a close's manifest) recalls the child's
+    /// grants, not the parent's. A lookup then reads the child strictly
+    /// too (`View::lookup`). `true` otherwise: the sequencer's own replica,
+    /// or a ReadIndex position, which counts the child's unshipped writes
+    /// (`unshipped_touches_read`'s `child`), or a mode without the promise.
+    pub(crate) fn strict_read(
+        &self,
+        ino: Ino,
+        dir: bool,
+        name: Option<&str>,
+        keys: &[ReadKey],
+    ) -> bool {
         let Some(h) = &self.sync else {
-            return;
+            return true;
         };
         constellation_vfs::watch::stage("session wait");
         if !h.cto_strict {
             let _ = self.meta.session_wait(keys);
             constellation_vfs::watch::stage("running");
-            return;
+            return true;
         }
         let deleg = self.meta.read_delegations();
         deleg.count(|s| s.strict_reads += 1);
         if h.lease.reads_locally() {
             deleg.count(|s| s.holder_local += 1);
             let _ = self.meta.session_wait(keys);
-            return;
+            return true;
         }
         // On the honour clock, the delegation's (plan 43 C7-H1).
         let honour = constellation_platform::clock::protocol().honour();
@@ -167,7 +182,7 @@ impl View {
                 ?waited,
                 "strict read under a delegation"
             );
-            return;
+            return false;
         }
         let started = std::time::Instant::now();
         constellation_vfs::watch::stage("strict read index (core reply)");
@@ -219,6 +234,7 @@ impl View {
                 let _ = self.meta.session_wait(keys);
             }
         }
+        true
     }
 
     /// Plan 30 §M8: a write this node's FUSE fast path executed as the
