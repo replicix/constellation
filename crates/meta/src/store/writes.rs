@@ -180,7 +180,9 @@ impl Meta {
         self.ack_rows_tx(&mut tx, journal_seqs, applied_seq)?;
         // Plan 30 §M5: with nothing left unshipped, no key is behind an
         // unshipped record any more (`Meta::unshipped_overlaps`).
-        let empty = crate::store::journal::len(&tx, &self.journal_ks, &self.local)? == 0;
+        // One seek, not a count of the backlog: this runs under the writer
+        // lock on every ship.
+        let empty = crate::store::journal::is_empty(&tx, &self.journal_ks, &self.local)?;
         tx.commit()?;
         #[cfg(test)]
         after_ack_commit::fire(self);
@@ -2422,5 +2424,34 @@ mod unshipped_tests {
         meta.ack_journal_rows_at(&rest, 2).unwrap();
         assert!(!meta.unshipped_touches_read(ino(2), false, None));
         assert!(!meta.unshipped_touches_read(ino(1), false, None));
+    }
+
+    /// A ship's acknowledgement asks whether the journal is empty (plan 30
+    /// §M5's clear of the unshipped set) under the store's writer lock: one
+    /// seek, not a count of every row still unshipped behind the ones it
+    /// ships (on a root with a backlog, a walk of thousands of rows on every
+    /// ship, with every writer queued behind it).
+    #[test]
+    fn a_ship_ack_does_not_walk_the_rest_of_the_journal() {
+        use crate::store::journal::ROWS_COUNTED;
+        let meta = Meta::open_in_memory().unwrap();
+        for n in 1..=2000 {
+            create(&meta, n);
+        }
+        let all = journal_seqs(&meta);
+        // The first transaction's `Create` and its `Completed`.
+        let first: Vec<u64> = all.iter().copied().take(2).collect();
+        ROWS_COUNTED.with(|c| c.set(0));
+        meta.ack_journal_rows_at(&first, 1).unwrap();
+        let walked = ROWS_COUNTED.with(|c| c.get());
+        assert!(
+            walked <= 2,
+            "the ack stepped over {walked} journal rows to learn the journal is not empty"
+        );
+        // Still right at the end: the last rows' ack empties it.
+        let rest: Vec<u64> = all.iter().copied().skip(2).collect();
+        meta.ack_journal_rows_at(&rest, 2).unwrap();
+        assert!(journal_seqs(&meta).is_empty());
+        assert!(!meta.unshipped_touches_read(ino(2000), false, None));
     }
 }

@@ -796,9 +796,41 @@ pub(crate) fn len(
     let mut n = 0u64;
     for guard in r.range(journal, seq_key(from)..) {
         guard.key()?;
+        #[cfg(test)]
+        ROWS_COUNTED.with(|c| c.set(c.get() + 1));
         n += 1;
     }
     Ok(n)
+}
+
+/// Whether the journal holds no row: one seek above the acked watermark
+/// (see [`acked_watermark`]), where [`len`] walks the whole backlog. A
+/// ship's acknowledgement asks it under the store's writer lock
+/// (`Meta::ack_journal_rows_at`), and the ack leaves the watermark just
+/// below the oldest row still here (`watermark_after`), so the seek lands
+/// on that row.
+pub(crate) fn is_empty(
+    r: &impl Readable,
+    journal: &SingleWriterTxKeyspace,
+    local: &SingleWriterTxKeyspace,
+) -> Result<bool, MetaError> {
+    let from = acked_watermark(r, local)?.saturating_add(1);
+    match r.range(journal, seq_key(from)..).next() {
+        Some(guard) => {
+            guard.key()?;
+            #[cfg(test)]
+            ROWS_COUNTED.with(|c| c.set(c.get() + 1));
+            Ok(false)
+        }
+        None => Ok(true),
+    }
+}
+
+// Tests: the journal rows `len` and `is_empty` stepped over on this thread
+// (what a question about the journal costs).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ROWS_COUNTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 pub(crate) fn ack_upto(
