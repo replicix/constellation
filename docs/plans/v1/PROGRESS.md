@@ -60463,3 +60463,84 @@ fails at seed 961 on the parent).
 `locks-holder-step-back-sealed`, `locks-production-ttl`): failing sets (all empty) and failover latencies identical to
 the parent's. The release sim suite (271 tests) and the authority lib tests (719) pass; fmt and `clippy -D warnings`
 are clean.
+## Root writer-lock stalls: the completed-table prune in batches, a one-seek ack (2026-10-28)
+
+A 2-node xcheckfs run showed a root at about 7 ops/s with about 1 % of its unlinks taking 0.5 to 1 s behind
+`prune_completed` and `allocate_ino`. An offline reading blamed four things (F1 the prune's whole-table scan and
+delete in one write transaction every ~225 s; F2 `allocate_ino` as a second write transaction per create; F3 the
+journal-backlog count under the lock on every ship's ack; F4 the per-ship sweep of `recent`). They were measured
+first, with the ignored benchmarks of `store::lock_bench` (`bench_prune_cost`, `bench_ack_cost`, `bench_recent_cost`,
+`bench_ino_cost`, `bench_root_model`), on the benchmark box at load below 2, release build, state directory on
+ext4, xfs, btrfs and tmpfs in turn.
+
+### What dominates (measured)
+
+- **F1, the prune: the long stalls.** One write transaction over the whole table: 25 ms at 90,000 rows, 80 ms at
+  270,000, about 0.3 microseconds a row, so 0.5 to 1 s needs 2 to 3 million rows (a cluster doing about 3,000
+  ops/s for the 900 s window). In the root model (4 FUSE workers, 300,000 rows, a prune every 5 s) the ops that
+  met a prune waited 150 to 400 ms: max 350 ms, 20 ops over 50 ms in 30 s.
+- **F3, the ack: the p99 and a tenth of the throughput.** The count is linear in the backlog: 0.8 ms at 8,000
+  rows, 3.2 ms at 32,000, 14 ms at 128,000, per ship, under the lock. In the model (a backlog of 40,000 rows)
+  the ack alone moves the op p99 from 48 microseconds to 1.75 ms and costs 3 % of the throughput.
+- **F2, `allocate_ino`: not it.** The allocation is 1 microsecond of a 20 microsecond create (two lock
+  acquisitions per create, as read). Handing inos out from a counter in memory in the model changed nothing:
+  3,802 against 3,805 ops/s with the passes off, p99 43 against 48 microseconds, and the same 20 ops over 50 ms
+  behind the same prune. The stalled op is the first to ask for the lock, the allocation or the create; the
+  second does not queue again. **Not implemented** (the draft's cursor would trade a crash-reissue risk for
+  nothing measurable).
+- **F4: not the writer lock.** `prune_recent_shipped` is 1.2 ms a ship at one requester incarnation's 4,096
+  entries (23 ms at 65,536) on the authority thread, with no write transaction. Left alone.
+- What the model does not show: a 7 ops/s root has a `completed` table of a few thousand rows, a prune of
+  milliseconds. The 0.5 to 1 s tail of that run is not explained by F1 or F3 at that size (a large backlog or
+  table, or a commit behind an fsync, which was not measured: H1 of the analysis).
+
+### The fixes
+
+- **The prune in bounded batches.** The candidates come from a snapshot without the lock; they are removed 256 at
+  a time, each row read again under the lock and removed only if it is still stale (a row recorded again since
+  keeps its window, a row written since waits for the next prune, a vanished one is not counted). The rule that
+  ends a rid's exactly-once window is unchanged. The vendored fjall writer lock is not fair among ordinary writers
+  (a thread that lets go and asks again takes it back before the writers it woke), so batches in a row were
+  still one long hold: the first version of this change kept a writer out for 70 ms in its unit test and 300 ms in the model. The prune now stays away for
+  as long as each batch held the lock (at least 200 microseconds), so it takes at most half of it. Tests that failed
+  before: `the_prune_takes_the_writer_lock_for_a_bounded_batch_at_a_time` (1 write transaction for 5,000 rows),
+  `a_writer_is_served_while_the_prune_runs` (a writer waited 538 ms, 70 ms with batches and no pause; bound 40 ms).
+  Guards of the new race windows, which fail when the re-check under the lock is removed:
+  `a_row_recorded_again_after_the_snapshot_is_not_removed`,
+  `the_window_ends_where_it_did_and_a_vanished_row_is_not_counted`; and
+  `a_row_written_after_the_snapshot_waits_for_the_next_prune`, `a_row_without_a_time_stays`.
+- **The ack asks one seek.** `journal::is_empty` replaces `journal::len(..) == 0` in `ack_journal_rows_at`. Test
+  that failed before: `a_ship_ack_does_not_walk_the_rest_of_the_journal` (3,998 rows stepped over, now at most 2).
+
+### Before and after
+
+Root model, medians of 3 alternated runs of 30 s per file system (4 workers, a create and an unlink each, 2 ms
+think time, 300,000 rows in `completed`, a prune every 5 s with 75,000 newly stale rows, a ship of 256 rows every
+20 ms over a backlog of 40,000 rows). Latencies of all ops, microseconds:
+
+| fs | | p50 | p90 | p99 | p99.9 | max | ops over 50 ms | ops/s |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| ext4 | before | 24 | 28 | 1820 | 3296 | 350 ms | 20 | 3565 |
+| ext4 | after | 25 | 35 | 241 | 487 | 24 ms | 0 | 3767 |
+| xfs | before | 24 | 28 | 1831 | 3340 | 350 ms | 20 | 3566 |
+| xfs | after | 24 | 32 | 219 | 340 | 26 ms | 0 | 3777 |
+| btrfs | before | 25 | 29 | 1830 | 3368 | 351 ms | 20 | 3561 |
+| btrfs | after | 25 | 31 | 230 | 355 | 23 ms | 0 | 3772 |
+| tmpfs | before | 24 | 27 | 1822 | 3337 | 346 ms | 20 | 3567 |
+| tmpfs | after | 24 | 29 | 236 | 402 | 31 ms | 0 | 3777 |
+
+- The ack of 32,000 backlog rows: 3.2 ms before, 9 microseconds after (p50; p99 3.5 to 5.8 ms before, 11 to 20
+  microseconds after), on every file system, and flat in the backlog.
+- Ops that overlap a prune: 20 ops, p50 155 ms, max 350 ms before; about 7,800 ops, p50 26 microseconds, p90 250,
+  p99 400 after (they now run beside the prune instead of behind it).
+- No regression: the p50 is equal (24 to 25) on all four; the p90 rises by 1 to 7 microseconds because ops now
+  share the lock with the batches during the prune windows (about 8 % of the model's time, against well under 1 % of a root's
+  in production); with the prune and the ship left out the two builds are equal (p50 23, p90 27 and 28,
+  3,802 and 3,801 ops/s on ext4). `allocate_ino` + create (20 microseconds) and the `recent` sweep (1.2 ms) are
+  unchanged on every file system. The prune takes 2.2 times longer in wall time (82 ms to 180 ms for 270,000
+  rows), idle time between batches, once every 225 s.
+- The file system matters little here: the benchmark is the in-process store, whose writes are buffered; the
+  four state directories differ by noise.
+
+Not done: an xcheckfs 2-node run of the fixes (the benchmarks stand in for it; the real run's 7 ops/s and its
+0.5 to 1 s tail are not accounted for above, see "What dominates"), F2's ino cursor, F4.
