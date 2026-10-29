@@ -2460,8 +2460,11 @@ impl Driver {
         if self.shared.hold_next.lock().unwrap().is_none() {
             return None;
         }
+        // The inodes the op takes away or moves count, as in the engine's
+        // fast path (`DelegateView::admit_for`).
+        let keys = TouchSet::from_op_in(op, &|p, n| Replica::lookup_ino(&*self.meta, p, n));
         let constellation_meta::delegation::Ownership::Delegated(d) =
-            self.meta.resolve_ownership(&TouchSet::from_op(op))
+            self.meta.resolve_ownership(&keys)
         else {
             return None;
         };
