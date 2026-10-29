@@ -38796,7 +38796,7 @@ mod deleg_group {
         let (mut h, dir, _, _) = delegate_renewed_once();
         assert!(h.core.deleg_lone(h.clk(), &h.core.dl.mine[&7]));
         assert_eq!(
-            h.core.deleg_ack_class(h.clk(), 7, Asker::Own),
+            h.core.deleg_ack_class(h.clk(), 7, Asker::Own, &h.meta),
             AckClass::Lone,
             "lone: its own client's row is answered at once"
         );
@@ -38817,7 +38817,7 @@ mod deleg_group {
         // The root comes within the budget: the next own op waits.
         root_is_near(&mut h);
         assert_eq!(
-            h.core.deleg_ack_class(h.clk(), 7, Asker::Own),
+            h.core.deleg_ack_class(h.clk(), 7, Asker::Own, &h.meta),
             AckClass::DelegGroup { gen: 7 },
             "not lone: its own client's row waits for the group"
         );
@@ -38833,6 +38833,83 @@ mod deleg_group {
             )),
             "{out:?}"
         );
+    }
+
+    /// A lone delegate answers its own node's rows from its disk only while
+    /// its journal is fewer transactions past what the root holds than a
+    /// stream batch carries records (`delegation_stream_rows`).
+    /// Before, its own node's load ran the journal ahead of the stream
+    /// without bound, and another node's forward, which waits for the root's
+    /// append, waited behind all of it (dirsplit-bench T4, the directory
+    /// delegated whole: 0 creates in 15 s on every other writer, `EIO` at
+    /// the client deadline).
+    #[test]
+    fn a_lone_delegate_holds_its_own_rows_once_a_batch_ahead_of_the_root() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        h.core.cfg.delegation_stream_rows = 4;
+        assert!(h.core.deleg_lone(h.clk(), &h.core.dl.mine[&7]));
+        // Row 1 goes to the root at once; rows 2 to 4 wait for its ack.
+        let mut first = None;
+        for seq in 1..=4 {
+            let (rid, out) = own_create(&mut h, dir, seq);
+            assert_eq!(
+                client_answers(&out),
+                vec![(rid, AnswerSource::Sequenced(AckClass::Lone))],
+                "row {seq}, within a batch of the root: {out:?}"
+            );
+            if seq == 1 {
+                first = batch(&out);
+            }
+        }
+        let (req, round, last) = first.expect("row 1 streams");
+        assert_eq!(last, 1);
+        // Four rows past the root's cursor: the next one waits for the root,
+        // and the fast path journals with that class too.
+        assert_eq!(
+            h.core.deleg_ack_class(h.clk(), 7, Asker::Own, &h.meta),
+            AckClass::DelegGroup { gen: 7 }
+        );
+        assert_eq!(
+            h.meta.session().deleg_row_class(7),
+            Some(constellation_meta::RowClass::DelegGroup)
+        );
+        let (held, out) = own_create(&mut h, dir, 5);
+        assert!(client_answers(&out).is_empty(), "answered alone: {out:?}");
+        // Another node's forward lands behind it.
+        let out = forward_create(&mut h, dir, 6, 500);
+        assert_eq!(answer_to_2(&out, 500), None, "{out:?}");
+        // A batch carries four records, two creates: the root's acks of rows
+        // 1 and 3 send rows 2 and 3, then 4 and 5; its ack of 5 answers the
+        // held own row, and the next batch carries the forward's.
+        let out = root_acks(&mut h, req, round, last);
+        let (req, round, last) = batch(&out).expect("rows 2 and 3");
+        assert_eq!(last, 3);
+        let out = root_acks(&mut h, req, round, last);
+        assert!(client_answers(&out).is_empty(), "{out:?}");
+        let (req, round, last) = batch(&out).expect("rows 4 and 5");
+        assert_eq!(last, 5);
+        let out = root_acks(&mut h, req, round, last);
+        assert_eq!(
+            client_answers(&out),
+            vec![(
+                held,
+                AnswerSource::Sequenced(AckClass::DelegGroup { gen: 7 })
+            )],
+            "{out:?}"
+        );
+        // Within a batch again: its own rows are answered at once.
+        assert_eq!(
+            h.core.deleg_ack_class(h.clk(), 7, Asker::Own, &h.meta),
+            AckClass::Lone
+        );
+        assert_eq!(
+            h.meta.session().deleg_row_class(7),
+            Some(constellation_meta::RowClass::Lone)
+        );
+        let (req, round, last) = batch(&out).expect("the forward's row streams");
+        assert_eq!(last, 6);
+        let out = root_acks(&mut h, req, round, last);
+        assert!(answer_to_2(&out, 500).is_some(), "{out:?}");
     }
 
     /// A backup counts only once the delegate's own table records a

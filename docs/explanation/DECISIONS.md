@@ -1574,7 +1574,15 @@ or below the root's cursor or in the log. A delegate is **lone** when its
 table records no backup, none is requested or appended to, and no peer — the
 root included — is a backup candidate (linked, within the RTT budget, stable);
 it then answers its own node's client from its disk and every other node's
-forward from the root's append, and its fast path stays open only then. The
+forward from the root's append, and its fast path stays open only then. Its own
+node's rows are answered from its disk only while its journal is within a
+bounded lead of what the root holds (as many transactions as a stream batch
+carries records, `delegation_stream_rows`); past the lead they wait for the
+root's append too (2026-10-29: without the bound, its own node's create loop
+ran the journal minutes ahead of a stream that carries one batch per round
+trip, and every other node's forward, answered behind every earlier row,
+starved until the client deadline answered `EIO`; rejected: answering
+forwards from the delegate's disk, the speculation this ADR removed). The
 class is fixed when the row is journaled, a retry's answer waits for its row
 like the first answer did (D6), and the end of a generation drops the
 uncommitted rows past its cut instead of replaying them (their clients were

@@ -128,7 +128,15 @@ through the delegate. It then:
      (linked, within `CONSTELLATION_BACKUP_RTT_BUDGET_MS`, stable for
      `CONSTELLATION_BACKUP_STABLE_MS`) — answers its own node's client from
      its disk (Layer A, the one speculation the design keeps); another node's
-     forward still waits for the root's append.
+     forward still waits for the root's append. Its own node's rows are
+     answered from its disk only while its journal is fewer transactions
+     past the root's cursor (or the log) than a stream batch carries records
+     (`delegation_stream_rows`, 256: two batches of creates); past that they
+     wait for the root's append too (`Core::deleg_lone_lead_full`). The
+     stream carries one batch per round trip to the root, so without the
+     bound a busy delegate's own node ran its journal ahead of the stream
+     without limit and every forward, answered behind every earlier row,
+     waited for all of it.
    - A designation's rows are non-stealable and answer at once; `ack=s3` waits
      for the log.
 

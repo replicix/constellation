@@ -890,8 +890,12 @@ lease and one log
   still uncommitted waits for the row like the first answer did. The one
   speculation place is a *lone* delegate — no recorded backup and no peer,
   the root included, within `CONSTELLATION_BACKUP_RTT_BUDGET_MS` — which
-  answers its own node's client from its disk; another node's forward still
-  waits for the root. The delegate's own FUSE fast path writes
+  answers its own node's client from its disk while its journal is within a
+  bounded lead of the root's cursor (a stream batch's worth; past it its own
+  rows wait for the root as well, so another node's forward, which waits for
+  the root behind every earlier row, waits a few batches at most;
+  [ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3));
+  another node's forward always waits for the root. The delegate's own FUSE fast path writes
   first and waits for the group afterwards: it journals the row with the
   class the core has published for the generation at the moment the row is
   journaled, and returns once the

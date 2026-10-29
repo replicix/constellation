@@ -4450,7 +4450,10 @@ failing seed (`SWEEP-FAIL`), and fails at the end: `long-sessions`
 `metered-shared-unbacked` (chunk metered-own-rows: chunk writes held on
 their writers by a 3 s metered hold, `SimConfig::upload_hold_ms`, across
 other nodes' ops and reads on the same names; the summary counts
-replies excusing own rows and chunks held back), `long-delegated`, and every
+replies excusing own rows and chunks held back), `long-delegated`,
+`long-delegated-lead` (a stream batch of two records, so a lone delegate's
+own rows wait for the root whenever its journal is two transactions
+ahead of it), and every
 lock configuration of `long_locks` (`locks`, `locks-partition`, …,
 `locks-failover-backup-writes`). Use each long test's own start (its
 source) to sweep the same seeds.

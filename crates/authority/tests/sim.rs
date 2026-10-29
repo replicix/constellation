@@ -372,6 +372,7 @@ fn replay_seed() {
         Ok("shared-dir-faults") => shared_dir_faults_config(),
         Ok("long-delegated") => long_delegated_config(),
         Ok("long-delegated-backup") => long_delegated_backup_config(),
+        Ok("long-delegated-lead") => long_delegated_lead_config(),
         Ok("long-delegated-late-answers") => long_delegated_late_answers_config(),
         Ok("delegated-core-stall") => delegated_core_stall_config(),
         Ok("delegated-core-stall-lease6") => delegated_core_stall_lease6_config(),
@@ -5135,6 +5136,7 @@ fn sweep_config() {
     let base_config = |label: &str| match label {
         "delegated-holder-cut" => delegated_holder_cut_config(),
         "long-delegated" => long_delegated_config(),
+        "long-delegated-lead" => long_delegated_lead_config(),
         "long-backup" => long_backup_config(),
         "backup-runtime-lag" => backup_runtime_lag_config(),
         "backup-lag-at-expiry" => backup_lag_at_expiry_config(false),
@@ -6257,6 +6259,21 @@ fn long_delegated_config() -> SimConfig {
         p2p_drop: 0.02,
         marker_pairs: 2,
         ..delegated_config()
+    }
+}
+
+/// `long-delegated` with a stream batch of two records: a lone delegate's
+/// own rows wait for the root once its journal is two transactions past
+/// the root's cursor (`Core::deleg_lone_lead_full`), so its own clients'
+/// rows move between `Lone` and `DelegGroup` as the stream catches up.
+fn long_delegated_lead_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(|node, inc| {
+            let mut c = sim::run::sim_core_config(node, inc);
+            c.delegation_stream_rows = 2;
+            c
+        }),
+        ..long_delegated_config()
     }
 }
 

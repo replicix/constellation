@@ -60909,3 +60909,44 @@ splits with `constellation delegate --range` are unaffected). DESIGN.md §"Hot s
 explicitly, `hash-range-split-merge` sets `CONSTELLATION_DELEGATION_SPLIT=20`, bench configuration `b` already did. New sim
 `shared_dir_is_not_split_by_default` (`AUTHORITY_SIM_CONFIG=shared-dir-default`) runs the split workload under the default
 and asserts `place_splits == 0`.
+
+## Fix: a lone delegate's own rows wait for the root once its journal is a batch ahead (2026-10-29)
+
+The directory-split bench's T4 topology (every node on its own site, the root and every writer 60 ms apart, S3 80 ms)
+with the directory delegated whole to `w0` (config `d`): `w0` ran 7,000 to 8,000 creates a second and every other
+writer 0 in the 15 s window, with `EIO` on a few creates; the same for `rename`. Reproduced on the bench host with the
+daemons' logs kept: `w0` is a lone delegate (no peer within the backup budget), so since plan 43 C2c its own node's
+rows are answered from its disk while another node's forward is answered once the root's journaled append holds its
+row. The stream carries one batch (256 records, 128 creates) per round trip to the root, about 640 rows a second; the
+journal grew at 8,000, and every forward waited behind the backlog: past 92,000 rows journaled, the stream draining
+for 209 s after the window, the remote writers' second creates answered in doubt (`EIO`) at the 120 s client deadline
+(`slow client op ... took_ms=120001 outcome="in doubt"`), their third after 90 s.
+
+`Core::deleg_ack_class` classes a lone delegate's own row `Lone` only while its journal is fewer transactions past the
+committed prefix (the root's cursor, or the log) than a batch carries records (`Core::deleg_lone_lead_full`); past
+that, `DelegGroup`, like a forward. The fast path reads the class the core publishes, so the delegate's own load is
+held to what the stream carries and a forward waits a few batches at most. Integrity: a `DelegGroup` row of a lone
+delegate is the case a delegate that turned lone after journaling already had (waits for its commit; dropped at a
+strand, its client retrying by rid); nothing is answered earlier than before. ADR-33, DESIGN.md and
+delegations.md say so.
+
+Bench, T4 with four writers, `uniform` under `d` (ops/s `w0`, `w1`..`w3`; errors; slowest op; drain after the window):
+before 7,983, 0.07 each, 3 `EIO`, 215 s, 209 s; after 1,139, 4.4 each, none, 1.2 s, 0.6 s (again: 969, 3.8 each,
+none, 1.4 s; eight writers: 1,096, 4.3 each, none, 1.2 s). `rename` under `d` after: 919, 1.1 each, none, 1.3 s. T5
+(writers together, within each other's budget, so not lone) after: 451/296/296/297 and 523/339/327/330, no errors.
+`w0`'s own rate falls to what the stream carries; the stream's rate (one batch in flight) is the next lever.
+
+Test that failed before: a_lone_delegate_holds_its_own_rows_once_a_batch_ahead_of_the_root (a batch of four records:
+the fifth own create was answered `Lone` at once; now it waits for the root's ack and the class returns to `Lone`
+once the stream has caught up). Simulation configuration `long-delegated-lead` (a batch of two records) for
+`sweep_config`: 70000..73000 pass, against `long-delegated` on the same seeds I5 (non-lone rollbacks) 124 → 75 and I4
+(late landings, not strict) 0 → 8 in 8 seeds. The batch of two drives the I4 count, not the lead: the in-doubt rids
+of seeds 70078, 72065 and 70205 are all forwards to the delegate (8.6 s of `NotHolder`/`Held`, then in doubt), none a
+lone delegate's own row, and the same configuration with the lead disabled gives I4 5 and I5 138 on those seeds: the
+known C2 residual of forwards (`long-delegated-backup`), which the lead does not add to and whose I5 it lowers.
+Review follow-ups (open): the fast path classes from the class the core last published, so the lead is soft by the
+fast-path rate times a core step; with the lead flipping, an own `Lone` row can sit behind an uncommitted own
+`DelegGroup` row and be rolled back at a root crash (allowed by I5, new under load; hysteresis would remove it); an
+engine test of the fast path past the lead and a sim oracle for own `Lone` rows past it.
+Gates: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, lib tests of authority,
+meta, engine and harness, the release authority sim suite.

@@ -1304,7 +1304,7 @@ impl Core {
         // now waits for, by who is asked; set for the journaling below (the
         // row's class is fixed there) and for the answer after it.
         let asker = if from == 0 { Asker::Own } else { Asker::Remote };
-        let mut class = self.deleg_ack_class(now, gen, asker);
+        let mut class = self.deleg_ack_class(now, gen, asker, replica);
         let dedup = replica.recent_outcome(rid).is_some()
             || replica.completed_outcome(rid).ok().flatten().is_some();
         if dedup {
@@ -1512,13 +1512,30 @@ impl Core {
     /// Decided at journal time and never again for that row: a delegate
     /// that turns lone after journaling a `DelegGroup` row still waits for
     /// that row's commit, and the row's strand behaviour follows it.
-    pub fn deleg_ack_class(&self, now: Now, gen: u64, asker: Asker) -> AckClass {
+    ///
+    /// A lone delegate's own rows are `Lone` only while its journal is
+    /// within a bounded lead of what the root holds
+    /// ([`Self::deleg_lone_lead_full`]); past it they wait for the root
+    /// too, like every other node's.
+    pub fn deleg_ack_class(
+        &self,
+        now: Now,
+        gen: u64,
+        asker: Asker,
+        replica: &dyn Replica,
+    ) -> AckClass {
         if self.cfg.ack_s3 {
             return AckClass::Archive;
         }
         match self.dl.mine.get(&gen) {
             Some(d) if d.designated => AckClass::NonStealable,
-            Some(d) if self.deleg_lone(now, d) && asker == Asker::Own => AckClass::Lone,
+            Some(d)
+                if asker == Asker::Own
+                    && self.deleg_lone(now, d)
+                    && !self.deleg_lone_lead_full(d, replica) =>
+            {
+                AckClass::Lone
+            }
             Some(_) => AckClass::DelegGroup { gen },
             // The generation ended here: what is left of it is in the log.
             None => AckClass::Archive,
@@ -1570,6 +1587,26 @@ impl Core {
             _ if class == AckClass::NonStealable => (class, None),
             _ => (AckClass::Archive, None),
         }
+    }
+
+    /// A lone delegate's journal of `d`'s generation is as many
+    /// transactions past its committed prefix (the root's cursor, or the
+    /// log) as a stream batch carries records (`delegation_stream_rows`:
+    /// one batch of single-record transactions, two of creates). Its own
+    /// node's rows, answered from its disk, are not held back by the
+    /// stream, which carries one batch per round trip to the root; another
+    /// node's forward is answered once the root holds its row, behind every
+    /// row journaled before it. Under its own node's load (a create loop at
+    /// 7,000 a second against a stream of 640, the root 60 ms away) the
+    /// journal ran ahead of the stream without bound, and every forward
+    /// waited for the backlog: 90,000 rows, minutes, until the client
+    /// deadline answered `EIO`. Past the lead its own rows wait for the root
+    /// too (`DelegGroup`), so its node's load is held to what the stream
+    /// carries and a forward waits for a bounded few batches.
+    pub(crate) fn deleg_lone_lead_full(&self, d: &DelegateState, replica: &dyn Replica) -> bool {
+        let committed = self.deleg_committed_through(d, replica.log_stream_idx(d.gen));
+        replica.delegate_idx(d.gen).saturating_sub(committed)
+            >= (self.cfg.delegation_stream_rows as u64).max(1)
     }
 
     /// Plan 43 C2 (§2.1): this delegate is lone for `d`'s generation: its
@@ -1686,7 +1723,7 @@ impl Core {
         let mut current = BTreeMap::new();
         let mut raised = Vec::new();
         for d in self.dl.mine.values() {
-            let class = self.deleg_ack_class(now, d.gen, Asker::Own);
+            let class = self.deleg_ack_class(now, d.gen, Asker::Own, replica);
             let through = self.deleg_committed_through(d, replica.log_stream_idx(d.gen));
             // The fast path answers its own node's clients from the FUSE
             // thread, where the core does not see it: every index committed
