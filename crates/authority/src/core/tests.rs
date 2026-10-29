@@ -8993,6 +8993,60 @@ mod cto {
         );
         assert!(h.core.dw.until(gen).unwrap() >= before);
     }
+
+    /// A stranded replay (`MutateOp::Records`) resolves its owners as the
+    /// op it came from does: an unlink record of a second link in a
+    /// delegated subtree to a file whose primary link the root owns changes
+    /// that file, so it is cross-subtree. Fails on the parent: the record
+    /// names no inode, and the delegate owns it.
+    #[test]
+    fn a_stranded_unlink_of_a_root_owned_files_link_is_cross_subtree() {
+        let (h, dir, _t0, _lapse) = super::delegate_renewed_once();
+        let x = h.meta.allocate_ino(ROOT_INO).unwrap();
+        for op in [
+            MutateOp::Create {
+                parent: ROOT_INO,
+                name: "x".into(),
+                ino: x,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            MutateOp::Link {
+                ino: x,
+                parent: dir,
+                name: "hl".into(),
+            },
+        ] {
+            constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        }
+        let records = MutateOp::Records {
+            records: vec![LogRecord::Unlink {
+                parent: dir,
+                name: "hl".into(),
+                time_ns: 1,
+            }],
+        };
+        let owner = |op: &MutateOp| {
+            h.meta
+                .resolve_ownership(&crate::core::holder::keys_of_op_in(op, &h.meta))
+        };
+        assert!(
+            matches!(
+                owner(&records),
+                constellation_meta::delegation::Ownership::CrossSubtree { .. }
+            ),
+            "the unlinked file's owner does not count"
+        );
+        let unlink = MutateOp::Unlink {
+            parent: dir,
+            name: "hl".into(),
+        };
+        assert_eq!(
+            format!("{:?}", owner(&records)),
+            format!("{:?}", owner(&unlink))
+        );
+    }
 }
 
 /// Plan 30 §M9 + §M10: the claim rule for continuation epochs and the
@@ -35543,6 +35597,35 @@ fn the_gate_holds_a_create_behind_a_held_unlink_of_the_same_name() {
             mode: 0o644,
             uid: 0,
             gid: 0,
+        },
+    ];
+    the_gate_keeps_a_name_s_order(&mut h, inos, queue);
+}
+
+/// The same queue as stranded replays (`MutateOp::Records`), which resolve
+/// their owners as the ops they came from: the unlink record is held for
+/// the file another node sequences, and the create record behind it.
+#[test]
+fn the_gate_holds_a_create_record_behind_a_held_unlink_record_of_the_same_name() {
+    let (mut h, inos @ [p, _, _, new]) = a_root_name_of_a_delegated_file();
+    let queue = [
+        MutateOp::Records {
+            records: vec![LogRecord::Unlink {
+                parent: p,
+                name: "x".into(),
+                time_ns: 1,
+            }],
+        },
+        MutateOp::Records {
+            records: vec![LogRecord::Create {
+                parent: p,
+                name: "x".into(),
+                ino: new,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 2,
+            }],
         },
     ];
     the_gate_keeps_a_name_s_order(&mut h, inos, queue);

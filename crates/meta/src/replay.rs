@@ -213,7 +213,10 @@ impl TouchSet {
     /// unlink's inode too: its `nlink` and `ctime` change, so a link in a
     /// delegated subtree to a file another sequencer owns (and grants
     /// read delegations on) is cross-subtree, as creating it was. The
-    /// core's `keys_of_op_in` and both FUSE fast paths compute the same.
+    /// core's `keys_of_op_in` and both FUSE fast paths compute the same, and
+    /// so does a stranded replay's `Records` (the dentries they name are
+    /// looked up before they apply, as for the ops they came from; the
+    /// records alone, [`Self::add`], have no inode to name for these).
     pub fn from_op_in(
         op: &crate::mutate::MutateOp,
         lookup: &dyn Fn(u64, &str) -> Option<u64>,
@@ -242,6 +245,42 @@ impl TouchSet {
                 for (p, n) in [(parent, name), (new_parent, new_name)] {
                     if let Some(i) = lookup(*p, n) {
                         set.inos.insert(i);
+                    }
+                }
+            }
+            // A stranded replay (`MutateOp::Records`): the records name
+            // the same dentries as the ops they came from, and the same
+            // inodes are taken away, moved or unlinked.
+            MutateOp::Records { records } => {
+                for rec in records {
+                    match rec {
+                        LogRecord::Unlink { parent, name, .. }
+                        | LogRecord::Rmdir { parent, name, .. } => {
+                            if let Some(i) = lookup(*parent, name) {
+                                set.inos.insert(i);
+                            }
+                        }
+                        LogRecord::Rename {
+                            parent,
+                            name,
+                            new_parent,
+                            new_name,
+                            ..
+                        }
+                        | LogRecord::Exchange {
+                            parent,
+                            name,
+                            new_parent,
+                            new_name,
+                            ..
+                        } => {
+                            for (p, n) in [(parent, name), (new_parent, new_name)] {
+                                if let Some(i) = lookup(*p, n) {
+                                    set.inos.insert(i);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }

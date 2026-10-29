@@ -60791,3 +60791,17 @@ ordering gate (`gated`) holds an op behind every earlier in-flight op on its key
 batches at the first held op, and delegate admission and `deleg_recall_plan` decide one op each (a requester's later op
 on the same keys is gated behind the parked one on its own node). Core test
 `the_gate_holds_a_create_behind_a_held_unlink_of_the_same_name` failed before (the create refused `EEXIST`).
+
+## Fix: a stranded replay's unlink, rmdir or rename resolves its owners with the inodes it takes (plan 30 M8 under M11, 2026-10-29)
+
+`TouchSet::from_op_in` counts the inode an unlink, rmdir or rename takes away or moves (looked up by name before the op
+runs), but a stranded replay is a `MutateOp::Records`, whose keys come from `TouchSet::add`, and a record names no inode
+for these: `from_op_in` handed the records on unchanged, so `Core::replay_locally` resolved the owners of an unlink
+record of a second link to a file whose primary link the root owns as the delegate's alone, and held or replayed it as
+if no other sequencer's file were involved. `from_op_in` now looks up the dentries of such records too (`add` stays
+record-only: it also runs on records already applied, whose dentries are gone). Core test
+`a_stranded_unlink_of_a_root_owned_files_link_is_cross_subtree` failed before (the delegate owns it). Held until the
+takeover gate kept per-key order (the fix above): a held unlink record no longer lets the gate run a later record on its
+name first. Core test `the_gate_holds_a_create_record_behind_a_held_unlink_record_of_the_same_name` (the op form's
+queue as `Records`) failed with this fix and without the gate's: the create record, applied unconditionally, replaced
+the name the held unlink record would then remove.
