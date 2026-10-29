@@ -2389,6 +2389,7 @@ impl Core {
                 backup,
                 stream_head,
                 stream_head_at,
+                first,
             } => {
                 self.lock_note_delegate_head(now, from, gen, stream_head, stream_head_at);
                 self.on_deleg_renew(
@@ -2397,7 +2398,7 @@ impl Core {
                     req,
                     gen,
                     round,
-                    delegate::RenewFrom::Core { backup },
+                    delegate::RenewFrom::Core { backup, first },
                     replica,
                     out,
                 )

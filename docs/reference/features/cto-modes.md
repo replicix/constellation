@@ -317,7 +317,15 @@ which the delegate executes nothing) only once they are recalled or
 outwaited. A designee executes from the moment it installs its
 designation, so the root journals a designation only when none of its
 delegations under the directory is live: it recalls them, grants none
-under the directory meanwhile, and the next sync delegates. In the
+under the directory meanwhile, and the next sync delegates. While the
+root's restart or takeover quarantine runs (delegations it or the
+tenure it took over may have granted that no table lists), a first
+renewal waits for it as well, and no designation is journaled; that
+includes a generation the root inherited, whose delegate says in its
+renewal whether any root granted it yet. A delegate's off-core renewal
+lane (a stuck driver) never renews a generation before its first
+grant, and the root leaves such a renewal unanswered while either wait
+runs. In the
 other direction, a delegate answers the root's recall of its subtree
 only once the delegations it granted are recalled.
 

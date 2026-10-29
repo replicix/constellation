@@ -397,9 +397,10 @@ pub struct DelegRenewCert {
 /// Who sent a renewal the root is answering ([`Core::on_deleg_renew`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RenewFrom {
-    /// The delegate's core: its backup, and (noted by the caller before
+    /// The delegate's core: its backup, whether no renewal of the
+    /// generation was granted to it yet, and (noted by the caller before
     /// this) the stream head it executed by the time it sent.
-    Core { backup: Option<NodeId> },
+    Core { backup: Option<NodeId>, first: bool },
     /// The delegate's off-core lane (`crate::deleg_lane`): the core was
     /// stuck, and the lane knows neither its head nor its current backup.
     /// The root extends the grant, answers as for any renewal, and learns
@@ -2873,6 +2874,8 @@ impl Core {
         let backup = Self::deleg_requested_backup(d);
         d.renew_backup = backup;
         let round = d.stream_round;
+        // Honoured until 0: never granted (a grant sets it).
+        let ungranted = d.until == HonourMs(0);
         tracing::debug!(
             node = self.cfg.node_id,
             gen,
@@ -2891,6 +2894,7 @@ impl Core {
                 // Row 9 (plan 43 Appendix B, C7b): the root compares it with
                 // its own clock; kept apart from the renewal's honour send.
                 stream_head_at: now.wall.0,
+                first: ungranted,
             },
         });
         // The stream step that sends the early resend (`deleg_expire_inflight`)
@@ -2970,7 +2974,7 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        if self.deleg_renew_waits_for_reads(now, from, req, gen, round, source, replica) {
+        if self.deleg_renew_waits_for_reads(now, from, req, gen, round, source, replica, out) {
             return;
         }
         let mut ttl_ms = 0u64;
@@ -3008,7 +3012,7 @@ impl Core {
                     // no longer acknowledged by. A request that differs from
                     // the generation's latest record is journaled as the
                     // next version, below.
-                    if let RenewFrom::Core { backup } = source {
+                    if let RenewFrom::Core { backup, .. } = source {
                         let want: Vec<NodeId> = backup.into_iter().collect();
                         if want != g.group.backups {
                             group_change = Some((g.dir, want));
@@ -3442,8 +3446,11 @@ impl Core {
 
     /// What the off-core lane may renew while the core is stuck: one
     /// certificate per generation of this node's that executes and renews
-    /// (not stopped, not a designation) with a root that is known and is
-    /// not this node. The lane only *sends* from them
+    /// (not stopped, not a designation, granted a renewal before: the
+    /// first grant is the core's to ask for, since the root may hold it,
+    /// for the read delegations under the subtree, and a lane renewal it
+    /// answers would extend an honour end of 0) with a root that is known
+    /// and is not this node. The lane only *sends* from them
     /// ([`Core::on_deleg_renew_sent_off_core`]); nothing here is the grant,
     /// the backup or the stream head: the lane's renewal carries none of
     /// them ([`RenewFrom::OffCore`]).
@@ -3470,7 +3477,7 @@ impl Core {
         self.dl
             .mine
             .values()
-            .filter(move |d| root.is_some() && !d.stopped && !d.designated)
+            .filter(move |d| root.is_some() && !d.stopped && !d.designated && d.until.0 > 0)
             .map(move |d| {
                 let (next_due, period_ms) = Self::deleg_next_renewal(d, timeout);
                 DelegRenewCert {
@@ -3656,7 +3663,7 @@ impl Core {
         let Some(d) = self.dl.mine.get_mut(&gen) else {
             return;
         };
-        if d.stopped || d.designated || d.stream_round != round {
+        if d.stopped || d.designated || d.stream_round != round || d.until.0 == 0 {
             return;
         }
         d.last_renew_sent = d.last_renew_sent.max(sent);
@@ -5180,6 +5187,12 @@ impl Core {
         // delegates. Any other generation is journaled now (nothing more
         // is granted under it from here) and its first renewal waits.
         let read_grants = self.read_grants_under(now, dir, replica);
+        // And the read delegations no table here lists (granted before a
+        // restart, or by the tenure this one took over early, or cached by
+        // a lone node's kernel): while the quarantine that bounds them
+        // runs, the first renewal waits for it too, and a designation is
+        // not journaled.
+        let quarantine = self.first_renewal_quarantine(now, replica);
         if kind == DelegKind::Designated {
             if !read_grants.grants.is_empty() {
                 self.dl.designating.insert(dir, node);
@@ -5187,6 +5200,13 @@ impl Core {
                 self.start_recalls(now, read_grants, out);
                 return Err(format!(
                     "{n} read delegations under directory {dir} are being recalled"
+                ));
+            }
+            if let Some(q) = quarantine {
+                self.dl.designating.insert(dir, node);
+                return Err(format!(
+                    "read delegations granted before this tenure may be honoured for {} ms",
+                    q.since(now.wait)
                 ));
             }
             self.dl.designating.remove(&dir);
@@ -5215,7 +5235,11 @@ impl Core {
             .start_recalls(now, read_grants, out)
             .map(|(ids, _)| ids)
             .unwrap_or_default();
-        let first_until = now.wait.plus(self.reclaim_horizon_ms());
+        // A first renewal that waits out the quarantine must not find the
+        // generation reclaimed for its silence meanwhile.
+        let first_until = quarantine
+            .map_or(now.wait, |q| q.max(now.wait))
+            .plus(self.reclaim_horizon_ms());
         self.dw
             .insert(gen, node, first_until, first_until, !designated);
         self.dl.gens.insert(
@@ -5307,10 +5331,27 @@ impl Core {
                 .any(|dir| is_under(replica.namespace(), ino, *dir))
     }
 
+    /// Until when this root's read-delegation quarantine runs, if it
+    /// does (`ReadDelegations::quarantine_until`): the grants of a
+    /// previous incarnation, of the tenure a fast takeover superseded, and
+    /// what a lone node's kernel cached, none of them in any table a
+    /// delegate's writes recall.
+    fn first_renewal_quarantine(&self, now: Now, replica: &dyn Replica) -> Option<WaitMs> {
+        if !self.cfg.recall_before_ack {
+            return None;
+        }
+        let q = replica.read_delegations().quarantine_until();
+        (q > now.wait).then_some(q)
+    }
+
     /// A delegate's renewal of `gen` must wait for the root's read
     /// delegations on the subtree to be recalled
-    /// ([`GenState::read_recalls`]): `true` if it was set aside, to be
-    /// answered when the last of them is gone.
+    /// ([`GenState::read_recalls`]), or, for a first renewal (the delegate
+    /// was granted none yet, so it executed nothing), for this root's
+    /// read-delegation quarantine to pass: a root does not know whether a
+    /// generation it inherited was granted by its predecessor, whose
+    /// grants under the subtree the quarantine bounds. `true` if it was
+    /// set aside, to be answered when the wait is over.
     #[allow(clippy::too_many_arguments)]
     fn deleg_renew_waits_for_reads(
         &mut self,
@@ -5321,17 +5362,36 @@ impl Core {
         round: u64,
         source: RenewFrom,
         replica: &dyn Replica,
+        out: &mut Vec<Action>,
     ) -> bool {
+        // The lane's renewal of a generation this tenure granted nothing
+        // yet carries no `first`: while either wait runs it is left
+        // unanswered (the delegate's lane never sends one before its first
+        // grant; this is the root's side of that rule), and it does not
+        // take the place of the core's renewal that waits.
+        let off_core_ungranted =
+            source == RenewFrom::OffCore && !self.dl.answered_granting.contains(&gen);
+        let quarantine = match source {
+            RenewFrom::Core { first: true, .. } => self.first_renewal_quarantine(now, replica),
+            RenewFrom::OffCore if off_core_ungranted => self.first_renewal_quarantine(now, replica),
+            _ => None,
+        };
+        let horizon = self.reclaim_horizon_ms();
         let Some(g) = self.dl.gens.get_mut(&gen) else {
             return false;
         };
-        if g.read_recalls.is_empty() {
+        if g.node != from || g.ended {
             return false;
         }
-        let table = replica.read_delegations();
-        g.read_recalls.retain(|id| table.is_live(*id, now.wait));
-        if g.read_recalls.is_empty() || g.node != from {
+        if !g.read_recalls.is_empty() {
+            let table = replica.read_delegations();
+            g.read_recalls.retain(|id| table.is_live(*id, now.wait));
+        }
+        if g.read_recalls.is_empty() && quarantine.is_none() {
             return false;
+        }
+        if off_core_ungranted {
+            return true;
         }
         tracing::debug!(
             node = self.cfg.node_id,
@@ -5339,10 +5399,19 @@ impl Core {
             gen,
             ?req,
             grants = g.read_recalls.len(),
+            quarantine_ms = quarantine.map(|q| q.since(now.wait)),
             "delegation renewal waits for the subtree's read delegations"
         );
         g.renew_waiting = Some((from, req, round, source));
         self.stats.deleg_renew_read_waits += 1;
+        if let Some(q) = quarantine {
+            // Not reclaimed for the silence the wait causes (a generation
+            // inherited before its first grant has the window of any
+            // inherited one): the delegate, granted nothing, honours
+            // nothing, so a later reclaim is safe.
+            self.dw.extend_core(gen, q.plus(horizon), false);
+            self.arm_grant_quarantine(q, out);
+        }
         true
     }
 
@@ -5363,6 +5432,26 @@ impl Core {
                 }
             }
         }
+        for (gen, (from, req, round, source)) in ready {
+            self.on_deleg_renew(now, from, req, gen, round, source, replica, out);
+        }
+    }
+
+    /// The read-delegation quarantine passed: the renewals that waited
+    /// for it, and for no recall, are answered.
+    pub(crate) fn deleg_read_quarantine_over(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let ready: Vec<_> = self
+            .dl
+            .gens
+            .iter_mut()
+            .filter(|(_, g)| g.read_recalls.is_empty())
+            .filter_map(|(gen, g)| g.renew_waiting.take().map(|w| (*gen, w)))
+            .collect();
         for (gen, (from, req, round, source)) in ready {
             self.on_deleg_renew(now, from, req, gen, round, source, replica, out);
         }

@@ -742,6 +742,12 @@ pub enum PeerMsg {
         /// at least everything it executed before then. The root's lock
         /// cut is as of the earliest of these (`Core::lock_cut_here`).
         stream_head_at: i64,
+        /// No renewal of `gen` has been granted to the delegate yet (it
+        /// executes nothing until one is): a root that does not know
+        /// whether its predecessor granted one, and may still be honouring
+        /// that predecessor's read delegations under the subtree, answers
+        /// it only once those are outwaited (`Core::on_deleg_renew`).
+        first: bool,
     },
     /// A delegate's off-core lane renews its grant on `gen` while its
     /// core is stuck in a step (`crate::deleg_lane`). The root answers with

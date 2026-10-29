@@ -1627,6 +1627,7 @@ impl Core {
             return;
         }
         self.complete_ready(now, replica, out);
+        self.deleg_read_quarantine_over(now, replica, out);
         // A takeover gate that waited for the quarantine can finish now.
         self.nudge(now, out);
     }

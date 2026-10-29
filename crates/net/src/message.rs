@@ -436,6 +436,8 @@ pub enum Payload {
         /// and when it sent this (its clock, unix ms).
         stream_head: u64,
         stream_head_at: i64,
+        /// No renewal of `gen` was granted to the delegate yet.
+        first: bool,
     },
     /// Plan 30 §M11, one way: the root's answer to the renewal `req_id`.
     DelegRenewed {

@@ -678,6 +678,7 @@ impl constellation_net::PeerService for P2pBridge {
         backup: u64,
         stream_head: u64,
         stream_head_at: i64,
+        first: bool,
     ) -> Option<constellation_net::Payload> {
         if crate::fault::p2p_denied(from) {
             return None;
@@ -690,6 +691,7 @@ impl constellation_net::PeerService for P2pBridge {
             backup,
             stream_head,
             stream_head_at,
+            first,
         });
         self.root_answer_off_core(from, req_id, gen, round)
     }

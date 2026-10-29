@@ -60717,3 +60717,43 @@ the root recalls the delegation, executes, and recalls its own grants on the fil
 `from_op_in`, looked up on the replica (one dentry read per unlink, rmdir or rename, and only on a node that holds a
 delegation). An unlink of a file the subtree owns resolves as before. Cost: an unlink or rename across a delegation's
 boundary through a hard link recalls the delegation (re-delegated after), which cross-boundary hard links already cost.
+
+## Fix: a delegation's first renewal ignored the read-delegation quarantine (plan 30 M8 under M11, 2026-10-29)
+
+From the same review. The first-renewal wait of the previous-but-one fix covers the grants in the root's table
+(`read_grants_under`), and set `quarantine_until: None`: the grants no table lists, which only the quarantine bounds (a
+previous incarnation's after a restart, the superseded tenure's after a fast takeover, a lone node's kernel cache at the
+first sign of another), were not waited for. With `CONSTELLATION_INBOX=off` the takeover gate does not wait the quarantine
+out (`drained` starts true), so a root could delegate a subtree, and grant the delegate's first renewal, while such a
+grant under it was honoured; the delegate's writes recall none of them. A generation inherited before its first renewal
+was granted (the predecessor still recalling) started with no recalls at all. Core tests
+`a_delegations_first_renewal_waits_out_the_read_grant_quarantine`,
+`an_inherited_generations_first_renewal_waits_out_the_quarantine` and
+`a_designation_waits_out_the_read_grant_quarantine` failed with the wire field below but without the wait (granted, or
+designated, at once).
+
+A delegate's renewal now says whether any root granted it a renewal of the generation yet (`DelegRenew::first`, from
+its honour end still 0; a delegate executes nothing before one). The root leaves a first renewal unanswered while its
+quarantine runs (`Core::first_renewal_quarantine`), answers it when the quarantine timer finds it passed
+(`deleg_read_quarantine_over`), and does not journal a designation meanwhile. A delegation made inside the quarantine
+gets a first window that ends a reclaim horizon after it, so the wait is not taken for silence. A renewal from a
+delegate already granted is never held: that grant came from a root that had recalled its own grants under the subtree
+first. Cost: inside a quarantine (up to the read-delegation TTL plus the margin and 1 s, 7 s at the defaults, once per
+restart or fast takeover; the kernel drain, at most 1 s, once per mount), a new delegation, a designation, or an
+inherited generation not yet granted starts executing at its end instead of at once. Running delegations are not
+affected.
+
+The review of this fix found the off-core lane could bypass both waits (this one and `read_recalls`): the delegate
+published a lane certificate for a generation before its first grant (`deleg_renew_cert_iter` checked neither the honour
+end nor a grant), so with its driver stuck the lane sent `DelegRenewOffCore`, which the root's core answered (only a
+`first` core renewal was held; under `read_recalls` the lane's renewal took the waiting slot of the core's), and the late
+answer (`deleg_extend_late`) raised the honour end from 0: the delegate executed inside the wait. The previous fix's
+"the off-core lane never makes the first one" held only for the root's lane (`settled`). Now the delegate's lane gets
+no certificate, and a registered lane send counts for nothing, before the generation's first grant; the root leaves a
+lane renewal of a generation its tenure has not granted unanswered while either wait runs, without displacing the
+core's waiting renewal; and a held first renewal extends the generation's window to a reclaim horizon past the
+quarantine (an inherited generation's included). Core tests `the_off_core_lane_never_makes_a_delegations_first_renewal`
+and `a_lane_renewal_does_not_replace_a_first_renewal_waiting_for_recalls` failed before, and the quarantine tests'
+lane and window checks too; `deleg_renew_cert_before_the_first_answer_and_after_a_core_renewal` now expects no
+certificate before the first answer. Cost: a delegate whose driver is stuck before its first grant waits for its core,
+which executes nothing before that grant anyway.

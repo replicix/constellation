@@ -8397,6 +8397,7 @@ mod cto {
                 backup: None,
                 stream_head: 0,
                 stream_head_at: 0,
+                first: false,
             },
         });
         assert_eq!(
@@ -8438,6 +8439,7 @@ mod cto {
                 backup: None,
                 stream_head: 0,
                 stream_head_at: 0,
+                first: false,
             },
         });
         assert!(
@@ -8471,6 +8473,7 @@ mod cto {
                 backup: None,
                 stream_head: 0,
                 stream_head_at: 0,
+                first: false,
             },
         });
         assert_eq!(deleg_renewed_ttl(&out, 3, gen), None, "{out:?}");
@@ -8656,6 +8659,216 @@ mod cto {
         // It takes the client's path to the lease's holder instead.
         assert!(replies(&out).is_empty(), "{out:?}");
         assert!(h.core.clients.contains_key(&rid), "{out:?}");
+    }
+
+    /// A holder (delegation on) with directory `p` and no read delegation
+    /// granted, whose read-delegation quarantine runs for 3 s more (a
+    /// restart: grants of the previous incarnation may be honoured).
+    fn holder_in_quarantine() -> (Harness, Ino, WaitMs) {
+        let (mut h, _) = holder_with_file();
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let dir = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let mkdir = MutateOp::Mkdir {
+            parent: ROOT_INO,
+            name: "p".into(),
+            ino: dir,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+        };
+        constellation_meta::execute_mutate(&h.meta, &mkdir, None).unwrap();
+        let q = h.clk().wait.plus(3_000);
+        h.meta.read_delegations().set_quarantine(q);
+        (h, dir, q)
+    }
+
+    fn renewal(req: u64, gen: u64, first: bool) -> Event {
+        Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRenew {
+                req: OpId(req),
+                gen,
+                round: 0,
+                backup: None,
+                stream_head: 0,
+                stream_head_at: 0,
+                first,
+            },
+        }
+    }
+
+    /// The root's read delegations that no table lists (a previous
+    /// incarnation's, the tenure a fast takeover superseded, a lone node's
+    /// kernel cache) are bounded by the quarantine only, and a delegate's
+    /// writes recall none of them: a delegation's first renewal waits for
+    /// the quarantine to pass, and the generation's window covers the
+    /// wait. Fails on the parent: granted at once (with `CONSTELLATION_INBOX`
+    /// off the takeover gate does not wait the quarantine out).
+    #[test]
+    fn a_delegations_first_renewal_waits_out_the_read_grant_quarantine() {
+        let (mut h, dir, q) = holder_in_quarantine();
+        let out = h.step(Event::Control {
+            op: OpId(900),
+            req: Control::Delegate {
+                dir,
+                node: 3,
+                range: (0, 0),
+            },
+        });
+        assert!(
+            out.iter()
+                .any(|a| matches!(a, Action::ControlDone { result: Ok(_), .. })),
+            "not delegated: {out:?}"
+        );
+        let gen = h.meta.delegation_table().get(dir).expect("delegated").gen;
+        let horizon = h.core.cfg.delegation_ttl_ms + h.core.cfg.expiry_margin_ms;
+        assert!(
+            h.core.gen_until(gen) >= q.plus(horizon),
+            "reclaimed for a silence the wait causes"
+        );
+        let out = h.step(renewal(31, gen, true));
+        assert_eq!(
+            deleg_renewed_ttl(&out, 3, gen),
+            None,
+            "granted inside the quarantine: {out:?}"
+        );
+        let t = timer_of(&out, TimerKind::GrantQuarantine);
+        // The delegate's lane (its driver stuck) is not answered either.
+        let out = h.step(off_core_renewal(99, gen));
+        assert_eq!(
+            deleg_renewed_ttl(&out, 3, gen),
+            None,
+            "the lane's renewal granted inside the quarantine: {out:?}"
+        );
+        h.advance(3_001);
+        let out = h.step(Event::Timer { id: t });
+        assert_eq!(
+            deleg_renewed_req(&out, 3, gen),
+            Some((OpId(31), true)),
+            "the waiting renewal is answered once the quarantine passed: {out:?}"
+        );
+    }
+
+    fn off_core_renewal(req: u64, gen: u64) -> Event {
+        Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRenewOffCore {
+                req: OpId(crate::deleg_lane::LANE_REQ_BIT | req),
+                gen,
+                round: 0,
+            },
+        }
+    }
+
+    /// The request a `DelegRenewed` to `to` for `gen` answers, and whether
+    /// it grants.
+    fn deleg_renewed_req(out: &[Action], to: NodeId, gen: u64) -> Option<(OpId, bool)> {
+        sends(out).into_iter().find_map(|(n, m)| match m {
+            PeerMsg::DelegRenewed {
+                req,
+                gen: g,
+                ttl_ms,
+                ..
+            } if n == to && *g == gen => Some((*req, *ttl_ms > 0)),
+            _ => None,
+        })
+    }
+
+    /// The same for the wait on the root's read delegations under the
+    /// subtree: the lane's renewal is left unanswered and does not take the
+    /// place of the core's, which is the one answered when the recalls are
+    /// done. Fails on the parent: the lane's renewal replaces it.
+    #[test]
+    fn a_lane_renewal_does_not_replace_a_first_renewal_waiting_for_recalls() {
+        let (mut h, dir, _file, _grants) = holder_with_scanned_dir();
+        let out = h.step(Event::Control {
+            op: OpId(900),
+            req: Control::Delegate {
+                dir,
+                node: 3,
+                range: (0, 0),
+            },
+        });
+        let rs = recalls(&out);
+        assert_eq!(rs.len(), 2, "{out:?}");
+        let gen = h.meta.delegation_table().get(dir).expect("delegated").gen;
+        let out = h.step(renewal(31, gen, true));
+        assert_eq!(deleg_renewed_ttl(&out, 3, gen), None, "{out:?}");
+        let out = h.step(off_core_renewal(99, gen));
+        assert_eq!(deleg_renewed_ttl(&out, 3, gen), None, "{out:?}");
+        let mut out = Vec::new();
+        for (_, req, _, _) in &rs {
+            out.extend(h.step(Event::Peer {
+                from: 2,
+                msg: PeerMsg::DelegationRecalled { req: *req },
+            }));
+        }
+        assert_eq!(
+            deleg_renewed_req(&out, 3, gen),
+            Some((OpId(31), true)),
+            "{out:?}"
+        );
+    }
+
+    /// A root does not know whether its predecessor granted a generation
+    /// it inherits: a renewal from a delegate granted none yet waits out
+    /// the quarantine (the predecessor's grants under the subtree may be
+    /// live), one from a delegate already granted (whose predecessor had
+    /// recalled them first) is answered at once. Fails on the parent: the
+    /// first is granted at once.
+    #[test]
+    fn an_inherited_generations_first_renewal_waits_out_the_quarantine() {
+        for first in [true, false] {
+            let mut h = Harness::new(1);
+            h.core.cfg.delegation = true;
+            h.core.cfg.p2p = true;
+            h.hold(1, None);
+            let _ = super::delegated_to_me(&h.meta, 3);
+            let q = h.clk().wait.plus(3_000);
+            h.meta.read_delegations().set_quarantine(q);
+            let mut out = Vec::new();
+            h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+            assert!(h.core.dl.gens.contains_key(&7));
+            let out = h.step(renewal(1, 7, first));
+            assert_eq!(
+                deleg_renewed_ttl(&out, 3, 7).is_some(),
+                !first,
+                "first: {first}: {out:?}"
+            );
+            if first {
+                let horizon = h.core.cfg.delegation_ttl_ms + h.core.cfg.expiry_margin_ms;
+                assert!(
+                    h.core.gen_until(7) >= q.plus(horizon),
+                    "reclaimed for a silence the wait causes"
+                );
+            }
+        }
+    }
+
+    /// A designee executes from its install, with no renewal: no
+    /// designation is journaled while the quarantine runs, and the next
+    /// sync after it delegates. Fails on the parent: journaled at once.
+    #[test]
+    fn a_designation_waits_out_the_read_grant_quarantine() {
+        let (mut h, dir, _q) = holder_in_quarantine();
+        let sync = |h: &mut Harness| {
+            h.step(Event::Control {
+                op: OpId(901),
+                req: Control::SyncDesignations {
+                    entries: vec![(dir, 3)],
+                },
+            })
+        };
+        sync(&mut h);
+        assert!(
+            h.meta.delegation_table().get(dir).is_none(),
+            "designated inside the quarantine"
+        );
+        h.advance(3_001);
+        sync(&mut h);
+        let d = h.meta.delegation_table().get(dir).expect("designated");
+        assert!(d.designated && d.node == 3, "{d:?}");
     }
 }
 
@@ -13806,6 +14019,7 @@ mod locks {
                     backup: None,
                     stream_head: 0,
                     stream_head_at: 0,
+                    first: false,
                 },
             });
             (h, dir, f)
@@ -14208,6 +14422,7 @@ mod locks {
                 backup: None,
                 stream_head: 0,
                 stream_head_at: 0,
+                first: false,
             },
         });
         // The delegate's unlink row is applied (from its backup, say),
@@ -17081,6 +17296,7 @@ mod locks {
                 backup: None,
                 stream_head: head,
                 stream_head_at: at,
+                first: false,
             },
         })
     }
@@ -31227,6 +31443,7 @@ fn deleg_renew_from(from: NodeId, req: u64) -> Event {
             backup: None,
             stream_head: 0,
             stream_head_at: 0,
+            first: false,
         },
     }
 }
@@ -32802,6 +33019,31 @@ fn delegate_with_first_renewal_out() -> (Harness, OpId, u64) {
     (h, req, round)
 }
 
+/// The off-core lane never makes a generation's first renewal: the root
+/// may hold it (the read delegations under the subtree being recalled, or
+/// its quarantine), and the delegate executes nothing before a grant. With
+/// the first renewal held and the driver stuck past it, the lane gets no
+/// certificate for the generation, a lane send counts for nothing, and the
+/// answer to one leaves the honour end at 0: nothing executes. Fails on
+/// the parent: the lane renews, and its answer starts the generation.
+#[test]
+fn the_off_core_lane_never_makes_a_delegations_first_renewal() {
+    let (mut h, _req, _round) = delegate_with_first_renewal_out();
+    let dir = h.meta.child_ino(ROOT_INO, "d").unwrap().unwrap();
+    h.advance(9_000);
+    assert!(
+        h.core.deleg_renew_certs().is_empty(),
+        "a certificate before the first grant: {:?}",
+        h.core.deleg_renew_certs()
+    );
+    h.step(lane_sent(&h, 1, h.honour()));
+    h.step(lane_answer(&h, 1, 5_000));
+    assert_eq!(h.core.dl.mine[&7].until, HonourMs(0));
+    let out = create_in(&mut h, dir, 5);
+    assert_eq!(h.core.dl.mine[&7].executed, 0, "executed: {out:?}");
+    assert!(replies(&out).is_empty(), "{out:?}");
+}
+
 /// Sim `locks-delegated-production-ttl-heavy` seed 1434 (R2-3b): a root
 /// that changes (or is lost from view and found again) while the first
 /// renewal of a delegate's generation is in flight. The answer to that
@@ -33486,6 +33728,7 @@ fn a_root_seals_a_delegate_only_on_real_silence() {
             backup: Some(4),
             stream_head: 0,
             stream_head_at: 0,
+            first: false,
         },
     });
     let sub = h.meta.allocate_ino(dir).unwrap();
@@ -34182,8 +34425,10 @@ fn deleg_renew_certs_name_only_what_the_core_would_renew() {
     assert!(h.core.deleg_renew_certs().is_empty());
 }
 
-/// Before its first answer a generation renews at the request timeout,
-/// from its install; the core's own renewal is the latest "sent" too.
+/// Before its first answer a generation has no certificate (the first
+/// grant is the core's to ask for:
+/// `the_off_core_lane_never_makes_a_delegations_first_renewal`); after
+/// it, the core's own renewal is the latest "sent" too.
 #[test]
 fn deleg_renew_cert_before_the_first_answer_and_after_a_core_renewal() {
     let mut h = Harness::new(3);
@@ -34195,9 +34440,7 @@ fn deleg_renew_cert_before_the_first_answer_and_after_a_core_renewal() {
     h.core.delegation_sync(h.clk(), &h.meta, &mut out);
     let req = renew_req(&out, 7).expect("no renewal on install");
     let t0 = h.now;
-    let timeout = h.core.deleg_request_timeout_ms();
-    let c = h.core.deleg_renew_certs().remove(0);
-    assert_eq!((c.next_due, c.period_ms), (hm(t0.plus(timeout)), timeout));
+    assert!(h.core.deleg_renew_certs().is_empty());
     // Answered: the period is the core's (half the ttl).
     h.advance(10);
     h.step(renewed(&h, req, 7, 5_000));
@@ -34240,6 +34483,7 @@ fn root_with_delegate_backed_by(backup: NodeId) -> Harness {
             backup: Some(backup),
             stream_head: 0,
             stream_head_at: 0,
+            first: false,
         },
     });
     h
@@ -34281,6 +34525,7 @@ fn an_off_core_renewal_never_changes_the_roots_backup_of_a_delegate() {
             backup: None,
             stream_head: 0,
             stream_head_at: 0,
+            first: false,
         },
     });
     assert_eq!(h.core.dl.gens[&7].group.backup(), None);
@@ -38438,6 +38683,7 @@ mod deleg_group {
                     backup,
                     stream_head: 0,
                     stream_head_at: 0,
+                    first: false,
                 },
             });
         };
@@ -39038,6 +39284,7 @@ mod deleg_windows_tests {
                 backup: Some(4),
                 stream_head: 0,
                 stream_head_at: 0,
+                first: false,
             },
         })
     }

@@ -1724,6 +1724,7 @@ async fn handle_stream<S: PeerService>(
                 backup,
                 stream_head,
                 stream_head_at,
+                first,
             } => Some(
                 service
                     .deleg_renew(
@@ -1734,6 +1735,7 @@ async fn handle_stream<S: PeerService>(
                         backup,
                         stream_head,
                         stream_head_at,
+                        first,
                     )
                     .unwrap_or(Payload::Ok { req_id }),
             ),

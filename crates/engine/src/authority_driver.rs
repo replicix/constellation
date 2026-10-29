@@ -3149,6 +3149,7 @@ impl Driver {
                 backup,
                 stream_head,
                 stream_head_at,
+                first,
             } => Some(Internal::Event(Event::Peer {
                 from,
                 msg: PeerMsg::DelegRenew {
@@ -3158,6 +3159,7 @@ impl Driver {
                     backup: (backup != 0).then_some(backup),
                     stream_head,
                     stream_head_at,
+                    first,
                 },
             })),
             SyncRequest::PeerDelegRenewOffCore {
@@ -4663,6 +4665,7 @@ impl Driver {
                 backup,
                 stream_head,
                 stream_head_at,
+                first,
             } => {
                 // Dispatched: the lane's next renewal is a period from
                 // here, not from when the core decided on this one (a
@@ -4680,6 +4683,7 @@ impl Driver {
                     backup: backup.unwrap_or(0),
                     stream_head,
                     stream_head_at,
+                    first,
                 };
                 self.one_way_reported(to, req, payload);
             }

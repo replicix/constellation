@@ -1266,6 +1266,7 @@ pub trait PeerService: Send + Sync + 'static {
         _backup: u64,
         _stream_head: u64,
         _stream_head_at: i64,
+        _first: bool,
     ) -> Option<Payload> {
         None
     }

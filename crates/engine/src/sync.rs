@@ -308,6 +308,8 @@ pub enum SyncRequest {
         /// it sent the renewal (its clock).
         stream_head: u64,
         stream_head_at: i64,
+        /// No renewal was granted to the delegate yet.
+        first: bool,
     },
     /// One way: a delegate's off-core renewal (no backup, no head:
     /// `PeerMsg::DelegRenewOffCore`). The core answers with its own
