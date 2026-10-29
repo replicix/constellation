@@ -389,6 +389,17 @@ impl DelegWindows {
         }
     }
 
+    /// The core holds a renewal back and outwaits for it: the window is at
+    /// least `until` (a `max`), and the slot is left as it is. A closed
+    /// slot (a recall, a seal, an epoch or a lost lease closed it, rule 2)
+    /// stays closed: the core grants nothing from here, and the answerer
+    /// must not either.
+    pub fn extend_until(&self, gen: u64, until: WaitMs) {
+        if let Some(w) = self.lock().slots.get_mut(&gen) {
+            w.until = w.until.max(until);
+        }
+    }
+
     /// The expiry decision, one critical section on the table's own clock:
     /// `Err(until)`: the window has not run out (it was extended since the
     /// timer was set, or since the step took its `now`): re-arm for `until`
@@ -539,6 +550,19 @@ mod tests {
         a.extend_core(7, WaitMs(15_000), false);
         assert_eq!(a.until(7), Some(WaitMs(15_000)));
         assert_eq!(a.renewed_until(7), Some(WaitMs(12_000)));
+    }
+
+    #[test]
+    fn a_held_renewals_extension_leaves_a_closed_slot_closed() {
+        let w = windows();
+        w.extend_until(7, WaitMs(12_000));
+        assert_eq!(w.until(7), Some(WaitMs(12_000)));
+        assert!(w.get(7).unwrap().open);
+        w.close(7);
+        w.extend_until(7, WaitMs(11_000));
+        w.extend_until(7, WaitMs(14_000));
+        assert_eq!(w.until(7), Some(WaitMs(14_000)));
+        assert!(!w.get(7).unwrap().open);
     }
 
     #[test]

@@ -2974,6 +2974,12 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        // A delegate is another node: a root that still counts itself
+        // alone (no peer or roster event named it yet) starts the kernel
+        // drain before it grants anything (the first renewal waits on it).
+        if from != self.me() {
+            self.note_foreign(now, replica, out);
+        }
         if self.deleg_renew_waits_for_reads(now, from, req, gen, round, source, replica, out) {
             return;
         }
@@ -5125,6 +5131,10 @@ impl Core {
         if node == self.me() {
             return Err("cannot delegate to the root itself".into());
         }
+        // The delegate is another node: a root that still counts itself
+        // alone starts the kernel drain now, so the first renewal (and a
+        // designation) waits for it with the rest of the quarantine.
+        self.note_foreign(now, replica, out);
         let table = replica.delegation_table();
         if let Some(d) = table.covering(replica.namespace(), dir) {
             return Err(format!(
@@ -5409,7 +5419,9 @@ impl Core {
             // inherited before its first grant has the window of any
             // inherited one): the delegate, granted nothing, honours
             // nothing, so a later reclaim is safe.
-            self.dw.extend_core(gen, q.plus(horizon), false);
+            // (A recall, a seal or a lost lease may have closed the slot:
+            // the wait lengthens the window and reopens nothing, rule 2.)
+            self.dw.extend_until(gen, q.plus(horizon));
             self.arm_grant_quarantine(q, out);
         }
         true

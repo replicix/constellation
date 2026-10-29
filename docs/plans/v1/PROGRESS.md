@@ -60757,3 +60757,20 @@ and `a_lane_renewal_does_not_replace_a_first_renewal_waiting_for_recalls` failed
 lane and window checks too; `deleg_renew_cert_before_the_first_answer_and_after_a_core_renewal` now expects no
 certificate before the first answer. Cost: a delegate whose driver is stuck before its first grant waits for its core,
 which executes nothing before that grant anyway.
+
+## Fix: a delegation and its renewals are a sign of another node, and a held renewal reopens no slot (plan 30 M8 under M11, 2026-10-29)
+
+From the review of the previous fixes. A root that still counts itself alone (no `Peers` or `Roster` event named another
+node yet) is a lone strict node whose kernel cache the first sign of another node drains (`note_foreign`). `delegate_dir`
+and `on_deleg_renew` did not count the delegate as that sign, so such a root could journal a delegation, and grant the
+delegate's first renewal, before the drain began: the first-renewal wait of the previous fix found no quarantine to wait
+out. Both call `note_foreign` now (the delegate is another node), so the drain is on the quarantine before the wait asks
+for it. Core tests `a_delegation_to_another_node_starts_the_lone_nodes_kernel_drain` and
+`a_delegates_renewal_starts_the_lone_nodes_kernel_drain` failed before (no drain, granted at once).
+
+The held first renewal extended the generation's window with `extend_core`, which sets the slot open again
+(`open = eligible`), against rule 2 of `deleg_windows` (a closed slot is extended by a decision to grant, and a held
+renewal grants nothing): after a recall or a seal had closed the slot, the wait reopened it for the off-core answerer.
+The wait now uses `DelegWindows::extend_until`, which moves the window's end (a `max`) and leaves the slot as it is.
+Core test `a_held_first_renewal_does_not_reopen_a_closed_window` and a `DelegWindows` unit test failed/were missing
+before.

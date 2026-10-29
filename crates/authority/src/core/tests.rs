@@ -8870,6 +8870,129 @@ mod cto {
         let d = h.meta.delegation_table().get(dir).expect("designated");
         assert!(d.designated && d.node == 3, "{d:?}");
     }
+
+    /// A root with a kernel cache TTL that no peer or roster event has
+    /// named another node to yet (`is_alone`), with directory `p`.
+    fn lone_holder_with_dir() -> (Harness, Ino) {
+        let (mut h, _) = holder_with_file();
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let dir = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let mkdir = MutateOp::Mkdir {
+            parent: ROOT_INO,
+            name: "p".into(),
+            ino: dir,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+        };
+        constellation_meta::execute_mutate(&h.meta, &mkdir, None).unwrap();
+        h.core.cfg.kernel_cache_ttl_ms = 1_000;
+        assert!(h.meta.read_delegations().is_alone());
+        (h, dir)
+    }
+
+    /// A lone node's kernel cache is bounded by the drain the first sign of
+    /// another node starts, and a delegate's writes recall none of it: a
+    /// delegation to another node is that sign, and the first renewal
+    /// waits the drain out. Fails on the parent: the root still counts
+    /// itself alone, no drain runs, and the first renewal is granted at
+    /// once.
+    #[test]
+    fn a_delegation_to_another_node_starts_the_lone_nodes_kernel_drain() {
+        let (mut h, dir) = lone_holder_with_dir();
+        let out = h.step(Event::Control {
+            op: OpId(900),
+            req: Control::Delegate {
+                dir,
+                node: 3,
+                range: (0, 0),
+            },
+        });
+        assert!(
+            out.iter()
+                .any(|a| matches!(a, Action::ControlDone { result: Ok(_), .. })),
+            "not delegated: {out:?}"
+        );
+        // The drain's timer is armed by the delegation itself.
+        let t = timer_of(&out, TimerKind::GrantQuarantine);
+        assert!(!h.meta.read_delegations().is_alone());
+        let gen = h.meta.delegation_table().get(dir).expect("delegated").gen;
+        let out = h.step(renewal(31, gen, true));
+        assert_eq!(
+            deleg_renewed_ttl(&out, 3, gen),
+            None,
+            "granted inside the kernel drain: {out:?}"
+        );
+        h.advance(1_001);
+        let out = h.step(Event::Timer { id: t });
+        assert_eq!(
+            deleg_renewed_req(&out, 3, gen),
+            Some((OpId(31), true)),
+            "{out:?}"
+        );
+    }
+
+    /// The same for a generation this root did not delegate itself (one it
+    /// inherited): the delegate's renewal is the first sign of it. Fails on
+    /// the parent: granted at once.
+    #[test]
+    fn a_delegates_renewal_starts_the_lone_nodes_kernel_drain() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.cfg.kernel_cache_ttl_ms = 1_000;
+        h.hold(1, None);
+        let _ = super::delegated_to_me(&h.meta, 3);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.gens.contains_key(&7));
+        assert!(h.meta.read_delegations().is_alone());
+        let out = h.step(renewal(1, 7, true));
+        assert!(!h.meta.read_delegations().is_alone());
+        assert_eq!(
+            deleg_renewed_ttl(&out, 3, 7),
+            None,
+            "granted inside the kernel drain: {out:?}"
+        );
+    }
+
+    /// A recall closes the generation's window slot (rule 2 of
+    /// `deleg_windows`): the answerer extends nothing from there. A first
+    /// renewal held for the quarantine lengthens the window and must not
+    /// reopen the slot. Fails on the parent: `extend_core` reopens it.
+    #[test]
+    fn a_held_first_renewal_does_not_reopen_a_closed_window() {
+        let (mut h, dir, _q) = holder_in_quarantine();
+        let out = h.step(Event::Control {
+            op: OpId(900),
+            req: Control::Delegate {
+                dir,
+                node: 3,
+                range: (0, 0),
+            },
+        });
+        assert!(
+            out.iter()
+                .any(|a| matches!(a, Action::ControlDone { result: Ok(_), .. })),
+            "not delegated: {out:?}"
+        );
+        let gen = h.meta.delegation_table().get(dir).expect("delegated").gen;
+        let mut out = Vec::new();
+        h.core.start_recall(h.clk(), gen, &mut out);
+        assert!(
+            !h.core.dw.get(gen).unwrap().open,
+            "a recall closes the slot"
+        );
+        let before = h.core.dw.until(gen).unwrap();
+        let out = h.step(renewal(31, gen, true));
+        assert_eq!(deleg_renewed_ttl(&out, 3, gen), None, "{out:?}");
+        assert!(
+            h.core.dw.get(gen).is_some_and(|w| !w.open),
+            "the held renewal reopened the slot"
+        );
+        assert!(h.core.dw.until(gen).unwrap() >= before);
+    }
 }
 
 /// Plan 30 §M9 + §M10: the claim rule for continuation epochs and the
