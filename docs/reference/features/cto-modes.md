@@ -268,6 +268,10 @@ recall round trip within the grant's lifetime.
   have expired.
 - No grants inside a continuation epoch, and none while an inbox op on
   the inode waits for a recall.
+- No grant on a directory split into name-hash ranges, by the root or
+  by a range's delegate: its entries have a sequencer per range, and
+  each one's writes recall only the grants in its own table. A lookup in
+  a split directory asks the name's sequencer every time.
 - A delegation that races a recall is not installed.
 - `CONSTELLATION_READ_DELEGATIONS=0` turns grants off on this node as
   sequencer: every strict read then costs a round trip. With P2P off
@@ -403,6 +407,11 @@ the margin (6 s at the defaults).
 
 - A directory listing is satisfied only by the applied position, so an
   `ls` after a refusal waits even when speculation covers the entry.
+- A listing of a directory split into ranges is answered by one
+  sequencer (the root, or the delegate of its only delegated range), whose
+  position does not cover the other ranges' streams: an entry another
+  range's delegate acknowledged can be missing from it until the root
+  applies that stream. Lookups in it are strict.
 - A degraded strict read can take the ReadIndex budget plus a session
   wait.
 - `--write-mode back` on the writer: its `close()` returns before the

@@ -4179,6 +4179,7 @@ impl Core {
                     .blocked
                     .get(&ino)
                     .is_some_and(|until| *until > now.wait)
+                && !self.split_directory(ino, replica)
             {
                 let until = now.wait.plus((ttl + margin) as u64);
                 let id = replica.read_delegations().grant(from, ino, until);
@@ -4208,6 +4209,17 @@ impl Core {
             grant,
             ahead: None,
         })
+    }
+
+    /// Plan 30 §M8 under §M12: whether `ino` is a directory split into
+    /// name-hash ranges. Its entries have a sequencer per range (the root
+    /// for the ranges nobody holds), and each one's writes recall only
+    /// the read delegations in its own table, while a delegation on the
+    /// directory covers all its entries. So none is granted on it, by the
+    /// root or by a range's delegate: a lookup in it asks the name's
+    /// sequencer every time.
+    pub(crate) fn split_directory(&self, ino: Ino, replica: &dyn Replica) -> bool {
+        self.cfg.delegation && replica.delegation_table().is_split(ino)
     }
 
     /// Phase 2b: where a strict read of `ino` goes — the delegate owning

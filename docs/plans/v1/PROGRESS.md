@@ -60678,3 +60678,22 @@ both acks, the root then redirects node 2 to the delegate, later renewals are an
 Left open: a split directory's own grant. With its ranges delegated, the directory's inode resolves to every range
 (cross-subtree), so the root still answers and grants a strict read of the directory itself, and a range delegate's
 create there recalls only its own table's grants. Not verified; it needs its own look.
+
+## Fix: a read delegation on a split directory outlived the other ranges' writes (plan 30 M8 under M12, 2026-10-29)
+
+From the review of the previous fix. A read delegation on a directory covers its entries (`View::strict_read` answers a
+lookup under it locally), but a directory split into name-hash ranges has a sequencer per range, and each one's writes
+recall only the grants in its own table. With two or more ranges delegated, a read of the directory's inode resolves
+cross-subtree, so `deleg_read_owner` sent it nowhere and the root's `maybe_grant` granted it; a create a range's delegate
+then acknowledged was missed by lookups under that grant for up to its 5 s. With one range delegated, the read resolves
+to the range, whose delegate granted it (for a lookup of one of its names too), and the root's own creates in the other
+ranges recalled only the root's table. Core tests `the_root_grants_no_read_delegation_on_a_split_directory` and
+`a_range_delegate_grants_no_read_delegation_on_its_directory` failed on the parent (both grant).
+
+Neither the root nor a range's delegate grants a read delegation on a split directory now (`Core::split_directory`, in
+`maybe_grant` and `deleg_read_index`). A lookup in it was already routed by name to that name's sequencer, so it is
+strict, at a round trip per lookup; a split directory is one several writers share, where grants on it were recalled
+constantly anyway. Files in it keep their grants (each resolves to its name's range). Left open, and now listed in
+`cto-modes.md`: a listing of a split directory is answered by one sequencer, whose position does not cover the other
+ranges' streams. Making it strict needs a position per sequencer of the directory (a ReadIndex at each range's delegate
+and at the root, the reader waiting for all of them), a change to the read protocol rather than to the grants.

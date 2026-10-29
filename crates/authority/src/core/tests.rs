@@ -8523,6 +8523,85 @@ mod cto {
         let d = h.meta.delegation_table().get(dir).expect("designated");
         assert!(d.designated && d.node == 3, "{d:?}");
     }
+
+    /// A name in range `idx` of a directory split `1 << bits` ways.
+    fn name_in_range(bits: u8, idx: u32) -> String {
+        (0..)
+            .map(|i| format!("n{i}"))
+            .find(|n| constellation_meta::delegation::Range::of(bits, n).idx == idx)
+            .unwrap()
+    }
+
+    /// A split directory's entries have a sequencer per range (M12), and
+    /// each one's writes recall only the grants in its own table, so a
+    /// read delegation on the directory (which covers its entries) is
+    /// never granted: with both halves of `p` delegated, a read of `p`
+    /// itself resolves to neither, and the root answered it with a grant
+    /// under which node 5 then looked names up locally, missing a create
+    /// node 3 had acknowledged in its range. A lookup of a name asks the
+    /// name's sequencer. Fails on the parent: the root grants.
+    #[test]
+    fn the_root_grants_no_read_delegation_on_a_split_directory() {
+        let (mut h, dir, _file, _grants) = holder_with_scanned_dir();
+        for (op, node, idx) in [(900, 3, 0), (901, 4, 1)] {
+            let out = h.step(Event::Control {
+                op: OpId(op),
+                req: Control::Delegate {
+                    dir,
+                    node,
+                    range: (1, idx),
+                },
+            });
+            assert!(
+                out.iter()
+                    .any(|a| matches!(a, Action::ControlDone { result: Ok(_), .. })),
+                "range {idx} not delegated: {out:?}"
+            );
+        }
+        assert!(h.meta.delegation_table().is_split(dir));
+        for (req, ahead) in [(50, ReadAhead::Listing), (51, ReadAhead::None)] {
+            let outcome = ask_in(&mut h, 5, req, (dir, true, None), ahead);
+            assert!(
+                matches!(outcome, ReadIndexOutcome::Ok { grant: None, .. }),
+                "a read delegation on a split directory: {outcome:?}"
+            );
+        }
+        for (req, idx, holder) in [(52, 0, 3), (53, 1, 4)] {
+            let name = name_in_range(1, idx);
+            let outcome = ask_in(&mut h, 5, req, (dir, true, Some(&name)), ReadAhead::None);
+            assert_eq!(outcome, ReadIndexOutcome::NotHolder { holder }, "{name}");
+        }
+    }
+
+    /// The same at a range's delegate: with one half of `/d` delegated
+    /// here, a read of `/d` resolves to this range, and the delegate
+    /// granted a delegation on the directory (for a lookup of one of its
+    /// names too) that the root's creates in the other half never recall.
+    /// Fails on the parent: both reads are granted.
+    #[test]
+    fn a_range_delegate_grants_no_read_delegation_on_its_directory() {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let dir = delegated_range_to_me(&h.meta, 3, (1, 0));
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let req = renew_req(&out, 7).expect("no renewal on install");
+        h.step(renewed(&h, req, 7, 5_000));
+        let name = name_in_range(1, 0);
+        for (req, name, ahead) in [
+            (1, None, ReadAhead::Listing),
+            (2, Some(name.as_str()), ReadAhead::None),
+        ] {
+            let outcome = ask_in(&mut h, 2, req, (dir, true, name), ahead);
+            assert!(
+                matches!(outcome, ReadIndexOutcome::Ok { grant: None, .. }),
+                "answered here, with a grant on the split directory: {outcome:?}"
+            );
+        }
+        assert_eq!(h.meta.read_delegations().live_grants(), 0);
+    }
 }
 
 /// Plan 30 §M9 + §M10: the claim rule for continuation epochs and the
@@ -31960,6 +32039,12 @@ fn placement_re_reads_the_roster_for_a_connected_writer_it_does_not_list() {
 /// A replica of node `me` whose table delegates `/d` to `me` as
 /// generation 7 (the root is node 1). Returns the directory.
 fn delegated_to_me(meta: &Meta, me: NodeId) -> constellation_fs_core::Ino {
+    delegated_range_to_me(meta, me, (0, 0))
+}
+
+/// [`delegated_to_me`] for the name-hash range `(bits, idx)` of `/d`
+/// (`(0, 0)`: the whole directory).
+fn delegated_range_to_me(meta: &Meta, me: NodeId, range: (u8, u32)) -> constellation_fs_core::Ino {
     let dir = meta.allocate_ino(ROOT_INO).unwrap();
     crate::replica::Replica::apply_segment(
         meta,
@@ -31983,7 +32068,7 @@ fn delegated_to_me(meta: &Meta, me: NodeId) -> constellation_fs_core::Ino {
                 node: me,
                 gen: 7,
                 designated: false,
-                range: (0, 0),
+                range,
             },
         ],
     )
