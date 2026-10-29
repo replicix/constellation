@@ -249,7 +249,7 @@ fn sample_file_counts(
 /// recursively so this works whether `db` is a single file (the legacy
 /// SQLite store) or a directory (the `fjall`-backed `constellation-meta`
 /// store, which is a keyspace directory rather than a single file).
-fn dir_size(path: &Path) -> u64 {
+pub(crate) fn dir_size(path: &Path) -> u64 {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return 0;
     };

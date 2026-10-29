@@ -172,6 +172,7 @@ const NODES4: &str =
 const CHAOS: &str = "drives local mounts with the constellation-chaos tool";
 const KERNEL_RACE: &str = "injects plan 42's kernel-race fault points (CONSTELLATION_FAULT_*) into a local daemon and reads its page-cache counters from node.status";
 const READDIR_KNOBS: &str = "sets the node-wide CONSTELLATION_READDIR_* listing bounds on a local daemon and reads its readdir block from node.status";
+const REPLICA_DISK: &str = "reads the size of a client's replica store (meta.db) on its own disk";
 const HOLDS: &str = "lists the holds/ keys in the filesystem's bucket directly";
 const GIT: &str =
     "runs git in the client's mount namespace (the lane's pods run the driver image: no git)";
@@ -638,6 +639,7 @@ pub const SKIPPED: &[(&str, Skip)] = &[
     ("readdir-huge-delete", Skip::Local(&[READDIR_KNOBS, WRITE_MODE])),
     ("readdir-seekdir-after-delete", Skip::Local(&[KILL, WRITE_MODE])),
     ("readdir-many-open-dirs", Skip::Local(&[READDIR_KNOBS, WRITE_MODE, RSS])),
+    ("hardlink-burst", Skip::Local(&[REPLICA_DISK])),
     (
         "session-handover-idle",
         Skip::Covered(

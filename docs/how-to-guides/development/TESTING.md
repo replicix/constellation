@@ -3249,6 +3249,26 @@ Ad hoc, an engine-level measurement of listing time is the ignored test
 `view::listing_perf` (release mode; its header documents `LP_DIR`,
 `LP_MODE`, `LP_SIZES`).
 
+## Hard links (plan 45)
+
+`hardlink-burst` (`crates/harness/src/scenarios/hardlink.rs`) is the system
+check of plan 45's rule (a dentry carries the attribute copy only while its
+inode has one name; ADR-36). Two nodes: A links one file 8,192 times over two
+directories, with a `chmod` and an append at four points on the way up, then
+unlinks every extra name, with a `chmod` and a truncate at three points on the
+way down; B replays, and meanwhile loops `ls -lai` and `du`. At the top and at
+the bottom, once B has caught up: B's tree equals A's name for name (kind,
+mode, owner, link count, size, inode, mtime, ctime, content), and A's tree is
+what the burst should have produced (so an equal-but-wrong pair fails);
+`ls -lai` prints the same text on both and `du` is equal and counts the file
+once; each `meta.db` is under 64 MiB (before the plan: 150 to 215 MB at the
+top, 773 MB for `stress-ng link`); `fsck` is clean on both; no conflicts; and
+the last 1,024 links average at most 20 times the first 1,024 (the quadratic
+code is 40 times and more). Sizes: `HARDLINK_BURST_LINKS` (8,192),
+`HARDLINK_BURST_META_MIB` (64), `HARDLINK_BURST_RATIO` (20). The comparison
+and the shape check have unit tests (`cargo test -p constellation-harness
+hardlink`). The xcheckfs stress lane keeps `--link 1` in its mix.
+
 ## Linux FUSE client races (plan 42)
 
 Three races in the Linux kernel's FUSE client, reproduced through a real
