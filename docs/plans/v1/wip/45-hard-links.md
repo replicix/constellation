@@ -358,11 +358,13 @@ under a timeout.
   unlinks of one file on node A while node B replays; both roots equal;
   `ls -la` on B equals A; `meta.db` under 64 MB on both; `du` equal. The
   xcheckfs stress lane **keeps `--link 1`** in its mix with the normal bound
-  (decided, §9). *Pending, box.*
+  (decided, §9). *Landed 2026-10-29.*
 - **H5 — Docs.** `DESIGN.md`'s statement of the dentry value forms is
   proposed text recorded in PROGRESS (CONVENTIONS rule 5), plan 28 §P6's
   dated pointer to this plan (done with the plan), `docs/reference`'s
-  listing-cost table, PROGRESS.
+  listing-cost table, PROGRESS. *Landed 2026-10-29* (DESIGN.md and ADR-36 were
+  written 2026-10-23, checked against the code; the listing-cost table is in
+  `features/kernel-cache-coherence.md`).
 
 ## 6. Tests that must fail before
 
@@ -402,10 +404,24 @@ under a timeout.
       tests green, failing before (9 of 9); meta perf gates met (H2).
 - [x] Engine tests, the `inode_reads` gate tests (H3); the authority
       simulation suite green.
-- [ ] `hardlink-burst` and the xcheckfs `--link 1` lane (H4, *pending, box*).
-- [ ] Docs and PROGRESS (H5).
+- [x] `hardlink-burst` and the xcheckfs `--link 1` lane (H4): three local runs
+      green, one more on box 1 under load, and a run with the copy rule undone
+      fails on `meta.db` (PROGRESS "H4, H5 and the close", 2026-10-29); the
+      xcheckfs lane ran clean with `--link 1` (plan 42 §7.3 (a), 0 mismatches).
+- [x] Docs and PROGRESS (H5): DESIGN.md §4 and ADR-36 checked against the code,
+      the listing-cost table in `docs/reference/features/kernel-cache-coherence.md`,
+      PROGRESS.
 - [ ] Every CONVENTIONS gate green; pjdfstest 8798/8798 (`link` and `unlink`
-      are in its suites).
+      are in its suites). **Met so far (2026-10-29):** fmt, clippy, the meta,
+      mtree, authority (lib), harness (lib) and engine (lib) tests, pjdfstest
+      8798/8798, `harness smoke`, `harness run stress-ng-fs`. **Not run:** the
+      full `harness run` matrix, `tests/integration.sh`, and the authority
+      simulation suite in this round (in debug mode inside `cargo test
+      --workspace` it does not finish in an hour; it is a release-mode suite).
+      The plan also still has the box numbers of §7 (`bench/hardlink/`, which
+      was never written: the one-bogo-op `stress-ng link` wall time, remount
+      time, the pnpm-like and rsnapshot-like trees, `create` p99 during a
+      burst).
 
 ## 9. Decided by the maintainer (2026-10-22)
 
@@ -491,7 +507,7 @@ purpose", "Gates"), with these rows:
 | Two dentry forms, every reader, fsck check (H1) | | `crates/mtree/src/record.rs`, `crates/meta/src/store/{ns,writes,reads,scratch}.rs`, `crates/engine/src/{mtree_read,snapwalk,snapshot,fsck}.rs` |
 | The rule and transitions (H2) | | `crates/meta/src/store/{ns,writes,misc,reads,scratch}.rs`, `crates/meta/src/replay.rs` |
 | Engine tests (H3) | | `crates/engine/src/{mtree_read,mtree_publish}.rs`, `view/vfs_tests.rs` |
-| Harness + xcheckfs (H4) | pending, box | `crates/harness/src/scenarios.rs` |
+| Harness + xcheckfs (H4) | landed 2026-10-29 | `crates/harness/src/scenarios/hardlink.rs` |
 | Docs (H5) | | `docs/plans/v1/done/28-…` §P6 note, `docs/reference` |
 
 ## 12. Integrity items of the follow-ups review (2026-10-23)
