@@ -294,7 +294,12 @@ an unlinked file would keep answering a strict open of it by inode (a
 dentry its kernel still caches) from its stale replica after the
 unlink completed. The executed paths take these from the op's own
 transaction; an inbox op and a delegate's write, which recall before
-executing, look them up just before.
+executing, look them up just before. Under a delegation those inodes also decide
+who executes: an unlink or a rename, in a delegated subtree, of a link
+to a file whose primary link is outside it is cross-subtree (the root
+recalls the delegation and executes it, recalling its own delegations
+on the file), as creating that link was, since a delegate's write
+recalls only the delegations in its own table.
 
 The wait is parked, not blocking: other keys, the ship round and other
 requesters proceed. A forwarded op whose reply is held longer than half

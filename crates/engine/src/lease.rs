@@ -573,6 +573,86 @@ mod tests {
                 .unwrap();
         });
     }
+
+    /// The delegate's fast path admits an op only when its delegation
+    /// owns everything the op changes. An unlink of a second link, in the
+    /// subtree, of a file whose primary link is the root's changes the
+    /// file's `nlink` and `ctime`, which the root's read delegations on the
+    /// file cover: the op goes through the core (to the root, which
+    /// recalls them), not through the delegate, whose writes recall only
+    /// its own table. Fails on the parent: admitted.
+    #[test]
+    fn the_delegates_fast_path_leaves_an_unlink_of_a_root_owned_files_link_to_the_core() {
+        use constellation_fs_core::types::ROOT_INO;
+        use constellation_meta::{execute_mutate, LogRecord, Meta, MutateOp};
+        let meta = Meta::open_in_memory().unwrap();
+        let dir = meta.allocate_ino(ROOT_INO).unwrap();
+        meta.apply_records(&[
+            LogRecord::Mkdir {
+                parent: ROOT_INO,
+                name: "d".into(),
+                ino: dir,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            },
+            LogRecord::Delegate {
+                dir,
+                node: 3,
+                gen: 7,
+                designated: false,
+                range: (0, 0),
+            },
+        ])
+        .unwrap();
+        let x = meta.allocate_ino(ROOT_INO).unwrap();
+        let y = meta.allocate_ino(dir).unwrap();
+        for op in [
+            MutateOp::Create {
+                parent: ROOT_INO,
+                name: "x".into(),
+                ino: x,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            MutateOp::Link {
+                ino: x,
+                parent: dir,
+                name: "hl".into(),
+            },
+            MutateOp::Create {
+                parent: dir,
+                name: "y".into(),
+                ino: y,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+        ] {
+            execute_mutate(&meta, &op, None).unwrap();
+        }
+        let view = DelegateView::default();
+        view.mirror(&constellation_authority::core::DelegView {
+            mine: vec![(dir, 7, i64::MAX / 2, false, 0, 0, 0)],
+            ..Default::default()
+        });
+        let now = Now::same(0);
+        let unlink = |name: &str| MutateOp::Unlink {
+            parent: dir,
+            name: name.into(),
+        };
+        assert_eq!(
+            view.admit_for(&meta, &unlink("y"), now).map(|a| a.gen),
+            Some(7),
+            "the subtree's own file"
+        );
+        assert!(
+            view.admit_for(&meta, &unlink("hl"), now).is_none(),
+            "admitted an unlink that changes a root-owned file"
+        );
+    }
 }
 
 /// Plan 30 §M11: the delegations this node holds, mirrored from the
@@ -731,13 +811,13 @@ impl DelegateView {
         stopped.retain(|gen| view.mine.iter().any(|m| m.1 == *gen));
     }
 
-    /// The generation this node executes `keys` under right now, if any:
-    /// the keys' owner is one of this node's live, honoured delegations.
+    /// The generation this node executes `op` under right now, if any:
+    /// its keys' owner is one of this node's live, honoured delegations.
     /// The admission is in flight until dropped.
     pub fn admit_for(
         &self,
         meta: &constellation_meta::Meta,
-        keys: &constellation_meta::TouchSet,
+        op: &constellation_meta::MutateOp,
         now: Now,
     ) -> Option<DelegateAdmission<'_>> {
         let g = self.entries.lock().unwrap();
@@ -745,7 +825,13 @@ impl DelegateView {
             return None;
         }
         drop(g);
-        let constellation_meta::delegation::Ownership::Delegated(d) = meta.resolve_ownership(keys)
+        // The inodes the op takes away or moves count, as at the core
+        // (`keys_of_op_in`): an unlink or a rename of a link in the
+        // subtree to a file the root owns changes that file.
+        let keys = constellation_meta::TouchSet::from_op_in(op, &|p, n| {
+            meta.child_ino(p, n).ok().flatten()
+        });
+        let constellation_meta::delegation::Ownership::Delegated(d) = meta.resolve_ownership(&keys)
         else {
             return None;
         };

@@ -463,10 +463,7 @@ impl View {
         // lease); the core streams them from the journal. A write whose
         // `deps` this replica lacks, or whose grant is not honoured, goes
         // through the core, which parks it.
-        if let Some(admission) =
-            h.delegates
-                .admit_for(&self.meta, &constellation_meta::TouchSet::from_op(op), now)
-        {
+        if let Some(admission) = h.delegates.admit_for(&self.meta, op, now) {
             let gen = admission.gen;
             let session = self.meta.session();
             // The op's `deps` (`observed` plus every position this

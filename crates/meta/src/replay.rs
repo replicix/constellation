@@ -209,8 +209,11 @@ impl TouchSet {
     /// [`Self::from_op`] plus the inodes the op takes away or moves,
     /// looked up through `lookup` (plan 30 §M12: an rmdir or a rename
     /// holds the directory it removes or moves *exclusively* — against
-    /// the creates inside it, and against a delegation of it). The
-    /// core's `keys_of_op_in` and the FUSE fast path compute the same.
+    /// the creates inside it, and against a delegation of it). An
+    /// unlink's inode too: its `nlink` and `ctime` change, so a link in a
+    /// delegated subtree to a file another sequencer owns (and grants
+    /// read delegations on) is cross-subtree, as creating it was. The
+    /// core's `keys_of_op_in` and both FUSE fast paths compute the same.
     pub fn from_op_in(
         op: &crate::mutate::MutateOp,
         lookup: &dyn Fn(u64, &str) -> Option<u64>,
@@ -218,7 +221,7 @@ impl TouchSet {
         use crate::mutate::MutateOp;
         let mut set = TouchSet::from_op(op);
         match op {
-            MutateOp::Rmdir { parent, name } => {
+            MutateOp::Rmdir { parent, name } | MutateOp::Unlink { parent, name } => {
                 if let Some(i) = lookup(*parent, name) {
                     set.inos.insert(i);
                 }

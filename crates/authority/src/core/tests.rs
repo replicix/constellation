@@ -8602,6 +8602,61 @@ mod cto {
         }
         assert_eq!(h.meta.read_delegations().live_grants(), 0);
     }
+
+    /// A delegate's unlink of a second link, in its subtree, to a file whose
+    /// primary link is the root's (so the root, not the delegate, grants
+    /// read delegations on it) changes the file's `nlink` and `ctime`. The
+    /// delegate's writes recall only its own table, so it must not execute
+    /// it: the unlinked inode counts in the op's keys (as a rename's moved
+    /// and replaced ones do), the op is cross-subtree and takes the
+    /// client's path to the root, which recalls the delegation and its own
+    /// grants on the file before it executes. Fails on the parent:
+    /// the delegate executes it.
+    #[test]
+    fn a_delegates_unlink_of_a_root_owned_files_link_goes_to_the_root() {
+        let (mut h, dir, _t0, _lapse) = super::delegate_renewed_once();
+        let x = h.meta.allocate_ino(ROOT_INO).unwrap();
+        for op in [
+            MutateOp::Create {
+                parent: ROOT_INO,
+                name: "x".into(),
+                ino: x,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            MutateOp::Link {
+                ino: x,
+                parent: dir,
+                name: "hl".into(),
+            },
+        ] {
+            constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        }
+        let unlink = MutateOp::Unlink {
+            parent: dir,
+            name: "hl".into(),
+        };
+        let rid = h.rid(3);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: unlink.clone(),
+            tag: Default::default(),
+        });
+        assert_eq!(h.core.dl.mine[&7].executed, 0, "executed here: {out:?}");
+        assert!(
+            matches!(
+                h.meta
+                    .resolve_ownership(&crate::core::holder::keys_of_op_in(&unlink, &h.meta)),
+                constellation_meta::delegation::Ownership::CrossSubtree { .. }
+            ),
+            "the unlinked file's owner does not count"
+        );
+        // It takes the client's path to the lease's holder instead.
+        assert!(replies(&out).is_empty(), "{out:?}");
+        assert!(h.core.clients.contains_key(&rid), "{out:?}");
+    }
 }
 
 /// Plan 30 §M9 + §M10: the claim rule for continuation epochs and the

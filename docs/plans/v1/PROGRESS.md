@@ -60697,3 +60697,23 @@ constantly anyway. Files in it keep their grants (each resolves to its name's ra
 `cto-modes.md`: a listing of a split directory is answered by one sequencer, whose position does not cover the other
 ranges' streams. Making it strict needs a position per sequencer of the directory (a ReadIndex at each range's delegate
 and at the root, the reader waiting for all of them), a change to the read protocol rather than to the grants.
+
+## Fix: a delegate's unlink of a link to a root-owned file left the root's read delegations on it (plan 30 M8 under M11, 2026-10-29)
+
+From the same review. A file's owner under a delegation is its primary link's (`DelegationTable::resolve`), and
+`TouchSet::from_op_in` counted the inodes an rmdir or a rename takes away or moves, but not an unlink's. So the delegate
+of `d` executed `unlink d/hl` of a second link to a file whose primary link is in a directory the root owns: the file's
+`nlink` and `ctime` changed, the delegate's recall (`recall_inos_of_op_now`, which does name the unlinked inode) looked
+only at the delegate's table, and the root's grants on the file stayed live; a strict open of it elsewhere read the old
+attributes for up to 5 s. The delegate's FUSE fast path was wider still: `DelegateView::admit_for` resolved the plain
+`TouchSet::from_op`, without the moved or replaced inodes of a rename either. The root's fast path had the mirror hole
+(an unlink of a root-owned link to a file a delegate owns). Core test
+`a_delegates_unlink_of_a_root_owned_files_link_goes_to_the_root` and engine test
+`the_delegates_fast_path_leaves_an_unlink_of_a_root_owned_files_link_to_the_core` failed on the parent (executed, and
+admitted, by the delegate).
+
+`from_op_in` now counts the unlinked inode, so such an unlink is cross-subtree, as the `link` that made it already was:
+the root recalls the delegation, executes, and recalls its own grants on the file. `admit_for` takes the op and resolves
+`from_op_in`, looked up on the replica (one dentry read per unlink, rmdir or rename, and only on a node that holds a
+delegation). An unlink of a file the subtree owns resolves as before. Cost: an unlink or rename across a delegation's
+boundary through a hard link recalls the delegation (re-delegated after), which cross-boundary hard links already cost.
