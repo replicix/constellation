@@ -583,7 +583,13 @@ impl Core {
 
     /// `recovery::takeover_gate`'s replay half: execute every queued op
     /// locally, in order, as the holder, before the view opens. A refused
-    /// one stays queued for its conflict copy (the drain makes it).
+    /// one stays queued for its conflict copy (the drain makes it). One
+    /// left queued for the drain (see `replay_locally`) holds every later
+    /// entry on its keys too: the drain runs the queue in order, and an
+    /// entry executed here ahead of an earlier one on the same keys
+    /// would not be (an unlink of `x` held for a file another node
+    /// sequences, then the create of a new `x`: refused `EEXIST`, or
+    /// created only for the drain's unlink to remove it).
     pub(crate) fn replay_queue_locally(
         &mut self,
         now: Now,
@@ -601,7 +607,16 @@ impl Core {
             constellation_fs_core::Ino,
             (Vec<u8>, Vec<u8>),
         > = Default::default();
+        // The keys of the entries left queued so far.
+        let mut held_keys: Vec<constellation_meta::TouchSet> = Vec::new();
         for queued in &queue {
+            // The entry's own keys (a folded truncate's too, whatever it
+            // replays as).
+            let keys = super::client::conflict_keys(&queued.op, replica);
+            let held = &mut Held {
+                keys,
+                held: &mut held_keys,
+            };
             // The drain tick's rule, here too (it was the pre-M5
             // `recovery::takeover_gate`'s, lost when the gate moved into
             // the core): a size-only truncate with a manifest commit for
@@ -629,7 +644,7 @@ impl Core {
                         settled_uncut.insert(ino, (cut, pre));
                     }
                 }
-                self.replay_locally(now, &as_folded(queued), true, replica, out)?;
+                self.replay_locally(now, &as_folded(queued), true, held, replica, out)?;
                 continue;
             }
             if let MutateOp::SetManifest {
@@ -644,12 +659,12 @@ impl Core {
                         if let MutateOp::SetManifest { base_manifest, .. } = &mut on_uncut.op {
                             *base_manifest = Some(pre);
                         }
-                        self.replay_locally(now, &on_uncut, false, replica, out)?;
+                        self.replay_locally(now, &on_uncut, false, held, replica, out)?;
                         continue;
                     }
                 }
             }
-            self.replay_locally(now, queued, false, replica, out)?;
+            self.replay_locally(now, queued, false, held, replica, out)?;
         }
         self.replay.in_flight = None;
         Ok(())
@@ -658,16 +673,26 @@ impl Core {
     /// `folded`: `queued` is a truncate folded into the commit after it
     /// (`as_folded`): whatever its outcome, it leaves the queue — its
     /// refusal is journaled as its rid's outcome but makes no conflict copy
-    /// of its own (the commit after it decides).
+    /// of its own (the commit after it decides). An entry it leaves queued
+    /// for the drain (unexecuted, unrefused) adds its keys to `held`.
     fn replay_locally(
         &mut self,
         now: Now,
         queued: &StrandedOp,
         folded: bool,
+        held: &mut Held<'_>,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> Result<(), constellation_meta::MetaError> {
         if queued.refused.is_some() || self.drop_retired_origin(queued, replica) {
+            return Ok(());
+        }
+        // Per-key order: behind an earlier entry left to the drain, the
+        // drain runs this one too, after it (an entry the log already
+        // settled is not executed again: it is forgotten below).
+        if held.overlaps() && completed_as_outcome(replica, queued.rid, 0).is_none() {
+            held.hold();
+            self.stats.replays_held_for_stream += 1;
             return Ok(());
         }
         // Plan 30 §M11 phase 2b round 2: a delegate-accepted shadow stays
@@ -681,6 +706,7 @@ impl Core {
                 .iter()
                 .any(|d| d.gen == queued.gen)
         {
+            held.hold();
             self.stats.replays_held_for_stream += 1;
             return Ok(());
         }
@@ -706,6 +732,7 @@ impl Core {
             && !replica.deps_lost(&deps)
             && completed_as_outcome(replica, queued.rid, 0).is_none()
         {
+            held.hold();
             self.stats.replays_held_for_stream += 1;
             return Ok(());
         }
@@ -718,6 +745,7 @@ impl Core {
             }
         };
         if foreign_owner && completed_as_outcome(replica, queued.rid, 0).is_none() {
+            held.hold();
             self.stats.replays_held_for_stream += 1;
             return Ok(());
         }
@@ -800,5 +828,26 @@ impl Core {
             }
         }
         Ok(())
+    }
+}
+
+/// `replay_queue_locally`'s per-key order: the keys of the entry being
+/// replayed (`keys`) and of the entries left queued for the drain before
+/// it (`held`).
+struct Held<'a> {
+    keys: constellation_meta::TouchSet,
+    held: &'a mut Vec<constellation_meta::TouchSet>,
+}
+
+impl Held<'_> {
+    /// Whether an earlier entry left to the drain shares a key with this one.
+    fn overlaps(&self) -> bool {
+        self.held.iter().any(|h| h.overlaps(&self.keys))
+    }
+
+    /// This entry is left to the drain: the later ones on its keys wait
+    /// for it.
+    fn hold(&mut self) {
+        self.held.push(std::mem::take(&mut self.keys));
     }
 }

@@ -60774,3 +60774,20 @@ renewal grants nothing): after a recall or a seal had closed the slot, the wait 
 The wait now uses `DelegWindows::extend_until`, which moves the window's end (a `max`) and leaves the slot as it is.
 Core test `a_held_first_renewal_does_not_reopen_a_closed_window` and a `DelegWindows` unit test failed/were missing
 before.
+
+## Fix: the takeover gate keeps a held entry's later entries on its keys behind it (plan 30 M8 under M11, 2026-10-29)
+
+`Core::replay_queue_locally` (the takeover gate) leaves an entry to the drain when another node sequences its keys (a
+live delegation), when its delegate-stream deps are not here yet, or while its delegate's generation is live, and went on
+with the later entries. Since an unlink counts the inode it takes (and an rmdir or a rename since M12), two entries on
+one dentry can resolve to different owners: a queued unlink of `p/x`, a second name of a file whose primary link is in
+another node's delegation, was held, and the create of a new `p/x` queued after it ran in the gate, refused `EEXIST` (had
+the name been free, it would have been created for the drain's unlink to remove). The drain runs the queue in order (its
+head blocks every later entry), so only the gate could reorder. The gate now also leaves to the drain every later entry
+whose `conflict_keys` overlap those of an entry it left queued (one the log already settled is still forgotten), so
+per-key order is the queue's. No new wait: the drain reaches such an entry only after the one ahead of it is resolved,
+as it already did. The other users of `keys_of_op_in` order single ops, not a queue run in one pass: the client
+ordering gate (`gated`) holds an op behind every earlier in-flight op on its keys, the inbox drain stops a requester's
+batches at the first held op, and delegate admission and `deleg_recall_plan` decide one op each (a requester's later op
+on the same keys is gated behind the parked one on its own node). Core test
+`the_gate_holds_a_create_behind_a_held_unlink_of_the_same_name` failed before (the create refused `EEXIST`).

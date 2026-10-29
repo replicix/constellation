@@ -35432,6 +35432,122 @@ fn list_generation(h: &Harness, dir: u64, gen: u64) {
         .unwrap();
 }
 
+/// `p/x`, a second name of `d/f`, with `d` delegated to node 3
+/// (generation 5) and `p` the root's: the holder at epoch 1, delegation
+/// on. `d`'s inode is below `p`'s, so `d/f` is the file's primary link
+/// (the first of its names in the reverse index). Returns the harness,
+/// `p`, `d`, the file's inode and a fresh inode for a new `x`.
+fn a_root_name_of_a_delegated_file() -> (Harness, [u64; 4]) {
+    let mut h = Harness::new(1);
+    h.core.cfg.delegation = true;
+    h.hold(1, None);
+    let d = h.meta.allocate_ino(ROOT_INO).unwrap();
+    let p = h.meta.allocate_ino(ROOT_INO).unwrap();
+    assert!(d < p);
+    let f = h.meta.allocate_ino(d).unwrap();
+    let dir = |ino, name: &str| MutateOp::Mkdir {
+        parent: ROOT_INO,
+        name: name.into(),
+        ino,
+        mode: 0o755,
+        uid: 0,
+        gid: 0,
+    };
+    for op in [
+        dir(d, "d"),
+        dir(p, "p"),
+        MutateOp::Create {
+            parent: d,
+            name: "f".into(),
+            ino: f,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        },
+        MutateOp::Link {
+            ino: f,
+            parent: p,
+            name: "x".into(),
+        },
+    ] {
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+    }
+    list_generation(&h, d, 5);
+    let new = h.meta.allocate_ino(p).unwrap();
+    (h, [p, d, f, new])
+}
+
+/// Run the takeover gate's local replay of the queue.
+fn run_the_gate(h: &mut Harness) {
+    let mut out = Vec::new();
+    h.core
+        .replay_queue_locally(h.clk(), &h.meta, &mut out)
+        .unwrap();
+}
+
+/// The gate holds `queue`'s first entry (it changes a file another node
+/// sequences) and keeps the second, on the same name, behind it; once the
+/// delegation ended both run, in order.
+fn the_gate_keeps_a_name_s_order(h: &mut Harness, [p, d, f, new]: [u64; 4], queue: [MutateOp; 2]) {
+    for (seq, op) in (1..).zip(&queue) {
+        h.meta
+            .queue_replay(h.rid(seq), op, &Default::default())
+            .unwrap();
+    }
+    let owner = h
+        .meta
+        .resolve_ownership(&crate::core::holder::keys_of_op_in(&queue[0], &h.meta));
+    assert!(
+        matches!(
+            owner,
+            constellation_meta::delegation::Ownership::CrossSubtree { .. }
+        ),
+        "{owner:?}"
+    );
+    run_the_gate(h);
+    assert_eq!(h.meta.child_ino(p, "x").unwrap(), Some(f));
+    let queued = h.meta.pending_replays().unwrap();
+    assert_eq!(queued_rids(h), vec![h.rid(1), h.rid(2)], "both held");
+    assert!(
+        queued.iter().all(|q| q.refused.is_none()),
+        "the create ran ahead of the unlink: {queued:?}"
+    );
+    h.meta
+        .apply_records_journaled(&[LogRecord::Recall { dir: d, gen: 5 }])
+        .unwrap();
+    run_the_gate(h);
+    assert!(queued_rids(h).is_empty());
+    assert_eq!(h.meta.child_ino(p, "x").unwrap(), Some(new));
+    assert_eq!(h.meta.child_ino(d, "f").unwrap(), Some(f));
+}
+
+/// Since an unlink counts the inode it takes, two queued entries on one
+/// name can resolve to different owners: the takeover gate held an unlink
+/// of `p/x` (a second name of a file in another node's delegation) and ran
+/// the create of a new `p/x` queued after it, refused `EEXIST` (or, had the
+/// name been free, created only for the drain's unlink to remove it). A
+/// later entry whose keys overlap a held one's is held too, so the drain
+/// runs them in queue order.
+#[test]
+fn the_gate_holds_a_create_behind_a_held_unlink_of_the_same_name() {
+    let (mut h, inos @ [p, _, _, new]) = a_root_name_of_a_delegated_file();
+    let queue = [
+        MutateOp::Unlink {
+            parent: p,
+            name: "x".into(),
+        },
+        MutateOp::Create {
+            parent: p,
+            name: "x".into(),
+            ino: new,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        },
+    ];
+    the_gate_keeps_a_name_s_order(&mut h, inos, queue);
+}
+
 /// Submit the marker's replay (`q`) with the recorded `deps`, as the drain
 /// does; it stays in flight (parked on a row of a live generation).
 fn submit_the_replay(
