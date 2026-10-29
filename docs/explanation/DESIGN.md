@@ -2244,7 +2244,12 @@ LIST with offset from the cursor (`LogStore::first_segment_from`):
 nothing at or after it is the head, the cursor itself is a segment that
 landed meanwhile, anything later is a gap. Retention only ever deletes a
 contiguous prefix below a commit's `applied`, so the answer cannot go
-stale in the direction that matters.
+stale in the direction that matters. A LIST is no snapshot of the
+appends it overlaps, though: one running while the holder creates the
+cursor's segment and then the next may show only the second. Every
+appender creates a sequence only after the one before it exists, so a
+later first key is a gap only if a HEAD of the cursor's segment, asked
+once the LIST has answered, still finds nothing.
 
 - **Before a lease claim, always.** The takeover CAS is preceded by the
   check unless the acquisition reached a handoff's reported head, or is

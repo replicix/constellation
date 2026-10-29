@@ -227,11 +227,19 @@ impl LogStore {
     /// settle: "is `from` the head, or was it pruned?" — `None` says
     /// head, `Some(from)` says a segment landed in the meantime, and
     /// `Some(later)` says retention removed `from..later` (DESIGN.md
-    /// §14 "Falling behind segment GC"). Every S3 this project targets
-    /// lists strongly consistently after a write, and a segment is
-    /// never overwritten, so the answer cannot go stale in the direction
-    /// that matters: a `None` or `Some(from)` may become `Some(from)` as
-    /// the holder appends, but a pruned gap never closes.
+    /// §14 "Falling behind segment GC"). A segment is never overwritten,
+    /// so the answer cannot go stale in the direction that matters: a
+    /// `None` or `Some(from)` may become `Some(from)` as the holder
+    /// appends, but a pruned gap never closes.
+    ///
+    /// A LIST shows every write that completed before it began, but it is
+    /// no snapshot of the writes it overlaps: one running while the holder
+    /// creates `from` and then `from + 1` may show the second and not the
+    /// first (the S3 emulator of the two-node load runs did, with a LIST of
+    /// a large log taking half a second). Every appender creates a sequence
+    /// only after the one before it exists, so a later first key is a gap
+    /// only if `from` is still absent once the LIST has answered: one HEAD
+    /// of `from` settles it, and only on this path.
     pub async fn first_segment_from(&self, from: u64) -> Result<Option<u64>, StoreError> {
         let prefix = layout::log_prefix(&self.partition);
         let offset = layout::log_segment(&self.partition, from.saturating_sub(1));
@@ -245,11 +253,33 @@ impl LogStore {
             else {
                 continue; // the `sealed` marker
             };
+            if seq > from && self.segment_exists(from).await? {
+                tracing::info!(
+                    partition = %self.partition,
+                    from,
+                    listed = seq,
+                    "the log LIST skipped a segment that exists: it landed while the LIST ran, \
+                     no retention gap"
+                );
+                return Ok(Some(from));
+            }
             if seq >= from {
                 return Ok(Some(seq));
             }
         }
         Ok(None)
+    }
+
+    async fn segment_exists(&self, seq: u64) -> Result<bool, StoreError> {
+        match self
+            .store
+            .head(&layout::log_segment(&self.partition, seq))
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Mark this partition's stream sealed (after a merge into a parent).
@@ -397,6 +427,144 @@ mod tests {
         assert_eq!(s.first_segment_from(6).await.unwrap(), None);
         assert_eq!(s.first_segment_from(u64::MAX).await.unwrap(), None);
         assert_eq!(ls().first_segment_from(1).await.unwrap(), None);
+    }
+
+    /// A LIST is not a snapshot of the writes it overlaps: S3 promises a
+    /// listing that shows every write completed *before* it began, and
+    /// nothing about ones made while it runs — the S3 emulator the
+    /// two-node load runs use listed `n + 1` and not `n` when the holder
+    /// created both while a LIST of a 130,000-segment log was scanning
+    /// (half a second there). A follower whose GET-next of `n` had just
+    /// answered 404 read that LIST as "retention pruned `n`" and rebuilt
+    /// its replica from the head commit, a few segments behind the head.
+    /// `n + 1` listed means `n` was created first (every appender creates
+    /// a sequence only after the one before it), so the gap is real only
+    /// if `n` is still absent after the LIST.
+    #[tokio::test]
+    async fn first_segment_from_does_not_read_a_list_racing_the_appender_as_a_gap() {
+        use object_store::path::Path;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        /// Creates segments `n` and `n + 1` while the LIST runs, and
+        /// returns a listing that saw the second and not the first.
+        #[derive(Debug)]
+        struct ListRacesAppend {
+            inner: Arc<InMemory>,
+            n: u64,
+            armed: AtomicBool,
+        }
+        impl std::fmt::Display for ListRacesAppend {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "ListRacesAppend")
+            }
+        }
+        #[async_trait::async_trait]
+        impl ObjectStore for ListRacesAppend {
+            async fn put_opts(
+                &self,
+                location: &Path,
+                payload: PutPayload,
+                opts: object_store::PutOptions,
+            ) -> object_store::Result<object_store::PutResult> {
+                self.inner.put_opts(location, payload, opts).await
+            }
+            async fn put_multipart_opts(
+                &self,
+                location: &Path,
+                opts: object_store::PutMultipartOptions,
+            ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+                self.inner.put_multipart_opts(location, opts).await
+            }
+            async fn get_opts(
+                &self,
+                location: &Path,
+                options: object_store::GetOptions,
+            ) -> object_store::Result<object_store::GetResult> {
+                self.inner.get_opts(location, options).await
+            }
+            fn delete_stream(
+                &self,
+                locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+            ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+                self.inner.delete_stream(locations)
+            }
+            fn list(
+                &self,
+                prefix: Option<&Path>,
+            ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+            {
+                if !self.armed.swap(false, Ordering::SeqCst) {
+                    return self.inner.list(prefix);
+                }
+                let inner = self.inner.clone();
+                let prefix = prefix.cloned();
+                let (n, missed) = (self.n, layout::log_segment(PARTITION, self.n));
+                Box::pin(
+                    futures::stream::once(async move {
+                        let appender = LogStore::new(inner.clone());
+                        appender
+                            .put_segment(n, b"landed during the LIST")
+                            .await
+                            .unwrap();
+                        appender
+                            .put_segment(n + 1, b"and the next one")
+                            .await
+                            .unwrap();
+                        let seen: Vec<object_store::ObjectMeta> = inner
+                            .list(prefix.as_ref())
+                            .try_collect::<Vec<_>>()
+                            .await?
+                            .into_iter()
+                            .filter(|meta| meta.location != missed)
+                            .collect();
+                        Ok::<_, object_store::Error>(futures::stream::iter(
+                            seen.into_iter().map(Ok),
+                        ))
+                    })
+                    .try_flatten(),
+                )
+            }
+            async fn list_with_delimiter(
+                &self,
+                prefix: Option<&Path>,
+            ) -> object_store::Result<object_store::ListResult> {
+                self.inner.list_with_delimiter(prefix).await
+            }
+            async fn copy_opts(
+                &self,
+                from: &Path,
+                to: &Path,
+                options: object_store::CopyOptions,
+            ) -> object_store::Result<()> {
+                self.inner.copy_opts(from, to, options).await
+            }
+        }
+        let inner = Arc::new(InMemory::new());
+        let follower = LogStore::new(Arc::new(ListRacesAppend {
+            inner: inner.clone(),
+            n: 4,
+            armed: AtomicBool::new(false),
+        }));
+        for seq in 1..=3u64 {
+            follower.put_segment(seq, b"x").await.unwrap();
+        }
+        // The follower applied 3; its GET-next of 4 answered 404.
+        assert!(follower.get_run(4, 1).await.unwrap().is_empty());
+        let racing = LogStore::new(Arc::new(ListRacesAppend {
+            inner: inner.clone(),
+            n: 4,
+            armed: AtomicBool::new(true),
+        }));
+        assert_eq!(
+            racing.first_segment_from(4).await.unwrap(),
+            Some(4),
+            "segment 4 landed while the LIST ran: a tail to apply, not a pruned gap"
+        );
+        // A real gap still reads as one: 4 pruned, 5 retained.
+        inner
+            .delete(&layout::log_segment(PARTITION, 4))
+            .await
+            .unwrap();
+        assert_eq!(follower.first_segment_from(4).await.unwrap(), Some(5));
     }
 
     #[tokio::test]

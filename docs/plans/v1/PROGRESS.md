@@ -60836,3 +60836,26 @@ Left open: the full xcheckfs two-node mix not rerun; on the delegate `Holds::hel
 keyspace on each refresh during an `rm -rf` (63 % of a worker); one run logged "the log was pruned past this replica's
 position" for a segment less than 900 s old while the replica was a few segments behind, then 4 s unlinks for about a
 minute (not investigated).
+
+## Fix: a LIST that missed the segment landing under it is no retention gap (2026-10-29)
+
+Two nodes on the S3 emulator, the second the delegate of its own directory, each looping a 100,000-file create and
+unlink: the delegate logged "the log was pruned past this replica's position" a few segments behind the head, with
+nothing pruned (GC runs daily, and keeps every segment younger than the 900 s completion window). It rebuilt its
+replica from the head commit under its running workload: the namespace swap held the store's writer lock for 0.6 to
+70 s, unlinks waited 4 s on their session waits for about a minute, one stalled 190 s and returned `EIO` (its op in
+doubt, not applied on either node). No acknowledged write was lost: both nodes' namespaces were identical afterwards.
+
+`LogStore::first_segment_from` took a single LIST as the answer, on the premise that S3 lists strongly consistently.
+A LIST shows the writes that completed before it began, and nothing is promised for the ones it overlaps: with the
+log at 130,000 to 220,000 segments the emulator's LIST took half a second, and one running while the holder created
+`n` and then `n + 1` listed `n + 1` and not `n` (a probe of the emulator: 8 of 1,669 LISTs, with one writer appending
+in order). The follower's GET-next of `n` had just answered 404, so the LIST read as "pruned". A GET of `n` right
+after that LIST found it, and a second LIST listed it. Every appender creates a sequence only after the one before it
+exists, so a later first key is now a gap only if a HEAD of `from`, asked once the LIST answered, finds nothing; the
+mount-time check (`rebuild_if_pruned`) and the takeover's check go through the same call. DESIGN.md §14 says so.
+
+Store test `first_segment_from_does_not_read_a_list_racing_the_appender_as_a_gap` (a LIST that creates `n` and `n + 1`
+while it runs and shows only the second) failed before (`Some(5)` for `from` 4). The load run with a gap check every
+second: before, one false gap in 31 checks, an 85 s rebuild and the `EIO`; after, none in 22 checks, both iterations
+complete, the slowest unlink 282 ms.
