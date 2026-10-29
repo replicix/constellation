@@ -2535,6 +2535,109 @@ fn a_busy_holders_rounds_do_not_probe_the_dirty_keyspace() {
     );
 }
 
+/// The root forgets an ended generation once nothing can still need it:
+/// its window has passed (by the expiry margin). Kept for
+/// good, every recall and re-delegation left one more generation that
+/// every core step walked (the `status` view, the window publication, the
+/// re-delegation scan): after a burst of 1,900 recalls in a directory
+/// split into ranges (the dirsplit bench's renames), 70 % of the root's
+/// core was its `status` view, and the root's own creates went from 2,100
+/// to 260 a second for as long as it ran.
+#[test]
+fn the_root_forgets_ended_generations() {
+    let mut h = Harness::new(1);
+    h.core.cfg.delegation = true;
+    h.core.cfg.p2p = true;
+    h.hold(1, None);
+    let dir = h.meta.allocate_ino(ROOT_INO).unwrap();
+    crate::replica::Replica::apply_segment(
+        &h.meta,
+        1,
+        1,
+        0,
+        &[],
+        &[],
+        &[LogRecord::Mkdir {
+            parent: ROOT_INO,
+            name: "d".into(),
+            ino: dir,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            time_ns: 1,
+        }],
+    )
+    .unwrap();
+    let size = |h: &Harness, what: &str| {
+        h.core
+            .container_sizes()
+            .into_iter()
+            .find(|(k, _)| *k == what)
+            .map(|(_, n)| n)
+            .unwrap_or_else(|| panic!("no size {what}"))
+    };
+    const CYCLES: u64 = 40;
+    for i in 0..CYCLES {
+        let out = h.step(Event::Control {
+            op: OpId(1_000 + 2 * i),
+            req: Control::Delegate {
+                dir,
+                node: 3,
+                range: (0, 0),
+            },
+        });
+        assert!(
+            out.iter()
+                .any(|a| matches!(a, Action::ControlDone { result: Ok(_), .. })),
+            "cycle {i}: not delegated: {out:?}"
+        );
+        let gen = h.meta.delegation_table().get(dir).expect("delegated").gen;
+        let out = h.step(Event::Control {
+            op: OpId(1_001 + 2 * i),
+            req: Control::Undelegate { dir },
+        });
+        let req = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::DelegRecall { req, gen: g, .. } if to == 3 && *g == gen => Some(*req),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("cycle {i}: no recall of {gen}: {out:?}"));
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRecalled {
+                req,
+                gen,
+                through: 0,
+                locks: Default::default(),
+            },
+        });
+        assert!(
+            h.meta.delegation_table().is_empty(),
+            "cycle {i}: {gen} live"
+        );
+        h.advance(10);
+    }
+    // Within their windows the ended generations are still known (and
+    // shown by `status`, as ended).
+    assert!(
+        size(&h, "dl_gens") > 0,
+        "the last generations were forgotten at once"
+    );
+    // Past every window, an event later, none is left.
+    h.advance(2 * h.core.reclaim_horizon_ms() + h.core.cfg.delegation_ttl_ms);
+    h.step(Event::Control {
+        op: OpId(9_999),
+        req: Control::Nudge,
+    });
+    assert_eq!(
+        (size(&h, "dl_gens"), size(&h, "dw_slots")),
+        (0, 0),
+        "{CYCLES} delegations recalled: {:?}",
+        h.core.container_sizes()
+    );
+}
+
 /// An unmount's flush that finds a cadence publish still in flight waits
 /// for it and then publishes what shipped since, before it releases and
 /// stops (`e2e-basic` under load: the flush skipped its publish because

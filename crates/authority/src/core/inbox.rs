@@ -1535,7 +1535,7 @@ impl Core {
                     }
                 }
             }
-            if self.cfg.delegation && !self.dl.gens.is_empty() {
+            if self.cfg.delegation && self.deleg_known() {
                 if let Ok(op) = &decoded {
                     let keys = super::holder::keys_of_op_in(op, replica);
                     match self.deleg_recall_plan(now, &keys, replica, out) {

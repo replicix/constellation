@@ -947,6 +947,9 @@ pub struct Driver {
     loop_thread: Arc<Mutex<constellation_platform::process::ThreadRef>>,
     alive_book: AliveBook,
     step_end: std::time::Instant,
+    /// When `status.delegation`'s root rows were last rebuilt
+    /// ([`DELEG_ROWS_EVERY`]).
+    deleg_rows_at: Option<std::time::Instant>,
     /// Where the core's time goes, per event kind, logged at debug every
     /// [`STEP_PROFILE_EVERY`] ([`StepProfile`]).
     profile: StepProfile,
@@ -971,6 +974,17 @@ pub struct Driver {
 /// long with the replica's log cursor not moving is reported once, in
 /// full: while a job holds the cursor the node applies nothing of the log.
 const STUCK_JOB: Duration = Duration::from_secs(20);
+
+/// `status.delegation`'s root rows (a row per generation the root knows,
+/// for `status` alone) are rebuilt after every step while there are at
+/// most [`DELEG_ROWS_ALWAYS`] generations, and at most this often beyond.
+/// A root keeps an ended generation for as long as its delegate may take
+/// it for live (`Core::deleg_forget_ended`): after a burst of recalls (1,900
+/// in 15 s, a split directory's cross-range renames) the rows, rebuilt
+/// after every step, were 70 % of the root's core for that long.
+const DELEG_ROWS_EVERY: Duration = Duration::from_millis(100);
+/// See [`DELEG_ROWS_EVERY`].
+const DELEG_ROWS_ALWAYS: usize = 64;
 
 /// The targets of the holder's off-core heartbeat ([`holder_alive_loop`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2243,6 +2257,7 @@ impl Driver {
             )),
             alive_book: AliveBook::default(),
             step_end: std::time::Instant::now(),
+            deleg_rows_at: None,
             profile: StepProfile::default(),
             step_tail: StepTail::new(),
             job_since: None,
@@ -2743,7 +2758,16 @@ impl Driver {
         status.read_delegations = cfg.read_delegations;
         status.ack = self.core.ack_view();
         status.ack_s3 = cfg.ack_s3;
-        status.delegation = self.core.deleg_view();
+        let rows_due = self.core.deleg_known_generations() <= DELEG_ROWS_ALWAYS
+            || self
+                .deleg_rows_at
+                .is_none_or(|at| at.elapsed() >= DELEG_ROWS_EVERY);
+        if rows_due {
+            status.delegation = self.core.deleg_view();
+            self.deleg_rows_at = Some(std::time::Instant::now());
+        } else {
+            self.core.deleg_view_local(&mut status.delegation);
+        }
         status.delegation_enabled = cfg.delegation;
         status.delegation_fast_path_executed = self.deps.delegates.executed();
         status.delegation_fast_path_routed = self.deps.delegates.routed();

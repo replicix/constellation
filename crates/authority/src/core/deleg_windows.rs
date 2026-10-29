@@ -323,6 +323,23 @@ impl DelegWindows {
         &self.stats
     }
 
+    /// How many generations have a slot (`container_sizes`).
+    pub fn len(&self) -> usize {
+        self.lock().slots.len()
+    }
+
+    /// Whether no generation has a slot.
+    pub fn is_empty(&self) -> bool {
+        self.lock().slots.is_empty()
+    }
+
+    /// Forget generation `gen`'s slot (the core forgot the generation:
+    /// `Core::deleg_forget_ended`). The answerer then refuses it as one it
+    /// does not know, as it refused it closed.
+    pub fn remove(&self, gen: u64) {
+        self.lock().slots.remove(&gen);
+    }
+
     pub fn get(&self, gen: u64) -> Option<Window> {
         self.lock().slots.get(&gen).copied()
     }

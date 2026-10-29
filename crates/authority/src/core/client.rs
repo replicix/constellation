@@ -2152,7 +2152,7 @@ impl Core {
                 ownership = ?replica.resolve_ownership(&keys),
                 "root executes locally"
             );
-            let wait = if self.dl.gens.is_empty() {
+            let wait = if !self.deleg_known() {
                 Default::default()
             } else {
                 match self.deleg_recall_plan(now, &keys, replica, out) {

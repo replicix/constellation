@@ -60859,3 +60859,32 @@ Store test `first_segment_from_does_not_read_a_list_racing_the_appender_as_a_gap
 while it runs and shows only the second) failed before (`Some(5)` for `from` 4). The load run with a gap check every
 second: before, one false gap in 31 checks, an 85 s rebuild and the `EIO`; after, none in 22 checks, both iterations
 complete, the slowest unlink 282 ms.
+
+## Perf: the root forgets an ended delegation generation once its window has passed (2026-10-29)
+
+The directory-split bench ran its rename phase, in a directory split by hand into four ranges, on the same cluster as
+the other phases: the cross-range renames recalled and re-delegated the ranges 1,900 times in 15 s, and afterwards the
+root's own creates in a fresh directory (`own` with splits off) stayed at 260 to 300 a second against 2,100 before
+(root CPU 130 % against 175 %). Reproduced on one host with the bench's T1 topology (no `tc` delay). A profile of the
+root (pprof in a throwaway build): 70 % of the authority thread in `Core::deleg_view` under the driver's `refresh`,
+after every step, and most of the rest of the growth in `deleg_after_event`'s re-delegation scan,
+`deleg_publish_root` (the window publication over every slot) and `root_progress`. Each walks `DelegationState::gens`,
+which kept every generation the tenure ever ended: nothing removed one, nor its `DelegWindows` slot or its
+`handed_floor`.
+
+`Core::deleg_forget_ended` (after every event; one comparison when nothing is due) now forgets an ended generation
+once its window has passed by the expiry margin, unless a re-delegation still waits on it or the table still names
+it: its delegate's grant and every lock grant made under it have lapsed by then, and a late answer finds it unknown,
+as at a successor root (the handlers treat an unknown generation as an ended one, except that a late recall answer's
+floor and barrier are not noted again: the answer that drained it, or the outwait, noted them). The checks that read `!gens.is_empty()` as "this tenure knew a generation" (the lock lane
+stays off, the recall plan runs) read `Core::deleg_known`, which keeps that meaning. An ended generation stays in the
+status view for as long as its delegate may take it for live (the campaign oracle that looks for stale grants reads
+it there), so the driver now rebuilds the view's per-generation root rows at most every 100 ms once the root knows
+more than 64 generations; the delegate's own rows (`mine`, read by the fast path) still after every step.
+
+Core test `the_root_forgets_ended_generations` (40 delegate and recall cycles, then past every window) failed before
+(40 generations and 40 window slots left; now none); `container_sizes` reports `dw_slots`. Bench, `own` with splits
+off right after the rename phase: 1,820 ops/s (257 to 300 before), root CPU 182 %; 40 s later 1,840; the same phases
+with `own` in place of the renames, 1,760 to 1,860. The drop from 2,100 to about 1,850 after any delegation phase is
+not the renames': the per-op ownership checks the tenure keeps once it delegated, and `Meta::dirty_snapshot` growing
+with the files written (left open).

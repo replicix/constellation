@@ -944,6 +944,8 @@ pub struct Stats {
     pub deleg_recalls_expired: u64,
     pub deleg_reclaimed: u64,
     pub deleg_ended: u64,
+    /// Root: ended generations forgotten (`Core::deleg_forget_ended`).
+    pub deleg_forgotten: u64,
     /// Root: lease releases that waited for a generation's recall in
     /// flight to end it (`Core::release_recall_waits`), and the ones whose
     /// wait reached its bound with a generation not ended
@@ -1929,6 +1931,7 @@ impl Core {
             ("acquire_waiters", self.acquire_waiters.len()),
             ("links", self.links.len()),
             ("inbox_pending", self.inbox.pending.len()),
+            ("dw_slots", self.dw.len()),
         ];
         v.extend(self.stream.container_sizes());
         v.extend(self.rd.container_sizes());

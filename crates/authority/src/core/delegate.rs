@@ -457,8 +457,15 @@ pub(crate) struct DelegationState {
     /// CAS: a generation inherited from it is outwaited that much longer
     /// (`delegation_sync`). 0 after any other acquisition.
     pub(crate) inherit_slack_ms: u64,
-    /// The root's generations (this node holds the lease).
+    /// The root's generations (this node holds the lease): the live ones,
+    /// and the ended ones until [`Core::deleg_forget_ended`] forgets them.
     pub gens: BTreeMap<u64, GenState>,
+    /// The generations this tenure ended, by when they may be forgotten
+    /// ([`Core::deleg_forget_ended`]).
+    forget_at: BTreeSet<(WaitMs, u64)>,
+    /// This tenure forgot an ended generation: `gens` may be empty though
+    /// it knew generations (see [`Core::deleg_known`]).
+    forgot: bool,
     /// Plan 41 R2: the generations this tenure sent a granting answer for,
     /// and the lock floor the latest carried (`Core::deleg_settled`).
     answered_granting: BTreeSet<u64>,
@@ -543,23 +550,7 @@ pub struct DelegView {
 /// The keys `op` touches, as ownership is resolved over them.
 impl Core {
     pub fn deleg_view(&self) -> DelegView {
-        DelegView {
-            mine: self
-                .dl
-                .mine
-                .values()
-                .map(|d| {
-                    (
-                        d.dir,
-                        d.gen,
-                        d.until.0,
-                        d.stopped,
-                        d.streamed_through,
-                        d.executed,
-                        d.parked.len(),
-                    )
-                })
-                .collect(),
+        let mut view = DelegView {
             gens: self
                 .dl
                 .gens
@@ -577,20 +568,54 @@ impl Core {
                     )
                 })
                 .collect(),
-            pending_exec: self.dl.pending_exec.len(),
-            backups: self
-                .dl
-                .mine
-                .values()
-                .filter_map(|d| d.backup.map(|b| (d.gen, b, d.backup_acked)))
-                .collect(),
             kinds: self
                 .dl
                 .gens
                 .iter()
                 .map(|(g, s)| (*g, format!("{:?}", s.kind), s.group.backup().unwrap_or(0)))
                 .collect(),
-        }
+            ..DelegView::default()
+        };
+        self.deleg_view_local(&mut view);
+        view
+    }
+
+    /// [`Self::deleg_view`]'s parts about the generations this node is the
+    /// delegate of (`mine`, `backups`, `pending_exec`), refreshed in
+    /// `view`: what the engine's fast path reads after every step. The
+    /// root's rows (`gens`, `kinds`) walk every generation it knows, the
+    /// ended ones its delegates may still take for live included
+    /// ([`Self::deleg_forget_ended`]), and are for `status` alone.
+    pub fn deleg_view_local(&self, view: &mut DelegView) {
+        view.mine = self
+            .dl
+            .mine
+            .values()
+            .map(|d| {
+                (
+                    d.dir,
+                    d.gen,
+                    d.until.0,
+                    d.stopped,
+                    d.streamed_through,
+                    d.executed,
+                    d.parked.len(),
+                )
+            })
+            .collect();
+        view.pending_exec = self.dl.pending_exec.len();
+        view.backups = self
+            .dl
+            .mine
+            .values()
+            .filter_map(|d| d.backup.map(|b| (d.gen, b, d.backup_acked)))
+            .collect();
+    }
+
+    /// How many generations the root knows, ended ones included (the
+    /// rows of [`Self::deleg_view`]).
+    pub fn deleg_known_generations(&self) -> usize {
+        self.dl.gens.len()
     }
 
     /// Phase 2b: the placement's busiest subtrees (`status`).
@@ -607,6 +632,75 @@ impl Core {
     /// table does not know.
     pub(crate) fn gen_until(&self, gen: u64) -> WaitMs {
         self.dw.until(gen).unwrap_or(WaitMs(0))
+    }
+
+    /// Whether this tenure has known a generation, ended ones included:
+    /// what `!dl.gens.is_empty()` answered before ended generations were
+    /// forgotten ([`Self::deleg_forget_ended`]), for the checks that
+    /// read it so (the lock lane stays off for the rest of the tenure
+    /// once it delegated, as before).
+    pub(crate) fn deleg_known(&self) -> bool {
+        !self.dl.gens.is_empty() || self.dl.forgot
+    }
+
+    /// When ended generation `gen` may be forgotten: once its window
+    /// has passed by the expiry margin. By then its delegate's grant has
+    /// lapsed, and every lock grant it made or renewed with it (capped by
+    /// the window); an answer of its delegate still in flight finds it
+    /// unknown, as it would at a successor, and is dropped as one for an
+    /// ended generation is (`lock_install_returned`: no grants back; the
+    /// floor and barrier a drained answer carried were noted with it, an
+    /// outwait noted its own).
+    fn deleg_forget_due(&self, now: Now, gen: u64) -> WaitMs {
+        now.wait
+            .max(self.gen_until(gen))
+            .plus(self.cfg.expiry_margin_ms)
+    }
+
+    /// Forget the ended generations nothing can need any more
+    /// ([`Self::deleg_forget_due`]), unless a re-delegation still waits
+    /// on one or the table still names it (a row it names is learned again
+    /// by the next sync). Kept for good, every recall and re-delegation
+    /// left one more entry that every step walked — the `status` view
+    /// (`deleg_view`), the window publication, the re-delegation scan,
+    /// `root_progress`: after 1,900 recalls in a split directory a root's
+    /// own creates went from 2,100 to 260 a second for as long as it ran,
+    /// 70 % of its core in `deleg_view`. A step with nothing due costs one
+    /// comparison.
+    pub(crate) fn deleg_forget_ended(&mut self, now: Now, replica: &dyn Replica) {
+        if !self
+            .dl
+            .forget_at
+            .first()
+            .is_some_and(|(at, _)| now.wait >= *at)
+        {
+            return;
+        }
+        let table = replica.delegation_table();
+        let named: BTreeSet<u64> = table.iter().map(|d| d.gen).collect();
+        let mut again = Vec::new();
+        while let Some(&(at, gen)) = self.dl.forget_at.first() {
+            if now.wait < at {
+                break;
+            }
+            self.dl.forget_at.pop_first();
+            let Some(g) = self.dl.gens.get(&gen) else {
+                continue;
+            };
+            if !g.ended {
+                continue;
+            }
+            if g.redelegate || named.contains(&gen) || now.wait < self.gen_until(gen) {
+                again.push((self.deleg_forget_due(now, gen), gen));
+                continue;
+            }
+            self.dl.gens.remove(&gen);
+            self.dw.remove(gen);
+            self.lock_forget_generation(gen);
+            self.dl.forgot = true;
+            self.stats.deleg_forgotten += 1;
+        }
+        self.dl.forget_at.extend(again);
     }
 
     /// Generations this root has not ended.
@@ -844,7 +938,7 @@ impl Core {
             if self.dl.epoch_active {
                 self.recall_all(now, out);
             }
-        } else if !self.dl.gens.is_empty() && (self.lease.held.is_none() || self.lease.lost) {
+        } else if self.deleg_known() && (self.lease.held.is_none() || self.lease.lost) {
             // Only a lease that is gone ends this root's generations. One
             // held but unusable for the moment (a renewal or a gate in
             // flight, S3 away) keeps them, as `on_deleg_expiry` does: the
@@ -2220,7 +2314,8 @@ impl Core {
                 self.deleg_redelegate_after_cross(now, replica, out);
             }
         }
-        if self.dl.mine.is_empty() && self.dl.gens.is_empty() {
+        self.deleg_forget_ended(now, replica);
+        if self.dl.mine.is_empty() && !self.deleg_known() {
             return;
         }
         // Phase 2b: a new root (a failover) gets every unretired
@@ -3220,7 +3315,7 @@ impl Core {
     /// epoch's recall goes out only after the certificate that forbids
     /// answering has been published).
     pub(crate) fn deleg_publish_root(&mut self, replica: &dyn Replica) {
-        if self.dl.gens.is_empty() {
+        if !self.deleg_known() {
             if self.dl.cert_set {
                 self.dw.publish(None, &[]);
                 self.dl.cert_set = false;
@@ -4280,7 +4375,7 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> RecallPlan {
-        if !self.cfg.delegation || self.dl.gens.is_empty() {
+        if !self.cfg.delegation || !self.deleg_known() {
             return RecallPlan::None;
         }
         let (involved, cross): (Vec<u64>, bool) = match replica.resolve_ownership(keys) {
@@ -4866,8 +4961,13 @@ impl Core {
         let Some(g) = self.dl.gens.get_mut(&gen) else {
             return;
         };
+        let first = !g.ended;
         g.ended = true;
         self.dw.close(gen);
+        if first {
+            let due = self.deleg_forget_due(now, gen);
+            self.dl.forget_at.insert((due, gen));
+        }
         self.dl.answered_granting.remove(&gen);
         self.dl.floor_sent.remove(&gen);
         let g = self.dl.gens.get_mut(&gen).expect("present");
@@ -5698,6 +5798,8 @@ impl Core {
         self.dl.floor_sent.clear();
         self.dl.designating.clear();
         self.dl.cert_set = false;
+        self.dl.forget_at.clear();
+        self.dl.forgot = false;
         for (_, g) in std::mem::take(&mut self.dl.gens) {
             if let Some(t) = g.expiry {
                 self.cancel_timer(t, out);

@@ -6198,7 +6198,7 @@ impl Core {
             && !self.epoch.open
             && !self.epoch.active
             && !self.dl.epoch_active
-            && self.dl.gens.is_empty()
+            && !self.deleg_known()
             && !replica.delegations_any()
             && !self.lock_owner_resuming(now)
             && !self.release_unmarked_in_flight()
@@ -6405,6 +6405,13 @@ impl Core {
             .map(|g| (g.id, Self::lock_left(now.wait, g)))
             .collect();
         (grants.iter().map(|g| g.to_wire(now)).collect(), carry)
+    }
+
+    /// Root: the core forgot ended generation `gen`
+    /// (`Core::deleg_forget_ended`): the floor its granting renewals
+    /// carried goes with it.
+    pub(crate) fn lock_forget_generation(&mut self, gen: u64) {
+        self.lk.handed_floor.remove(&gen);
     }
 
     /// Root: generation `gen` ended. What was waiting for its first

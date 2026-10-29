@@ -179,7 +179,7 @@ impl Core {
             // handoff pause closes this node's *own* new writes so a
             // waiter can claim, not a peer's forwarded ones.
             self.deleg_root_sync_due(now, replica, out);
-            if self.cfg.delegation && !self.dl.gens.is_empty() {
+            if self.cfg.delegation && self.deleg_known() {
                 let keys = keys_of_op_in(&op, replica);
                 if let Ownership::Delegated(d) = replica.resolve_ownership(&keys) {
                     if d.node != self.cfg.node_id
