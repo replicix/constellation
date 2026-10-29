@@ -1801,7 +1801,7 @@ election path in `link`, `unlink`, `rename` and replay for a listing win on
 a handful of names).
 
 **Status**: decided by the maintainer 2026-10-22 (plan 45 §9, Q1–Q5, Q7);
-built (plan 45 H1–H3).
+built (plan 45 H1–H4).
 
 **See**: [plan 45](../plans/v1/wip/45-hard-links.md) §4 and
 [§9](../plans/v1/wip/45-hard-links.md#9-decided-by-the-maintainer-2026-10-22);

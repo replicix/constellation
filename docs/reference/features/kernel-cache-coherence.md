@@ -162,6 +162,22 @@ workarounds treat it as the attribute reply it is:
 them). Every entry that goes name-only is counted by reason
 (`fuse.mounts[].readdirplus_name_only_why`).
 
+What a listing costs the metadata store (plan 45, ADR-36). A directory
+entry holds a copy of its inode's attributes only while the inode is a
+directory or has one name; a file with two or more names has a *remote*
+entry (`ino` and `kind`) and its attributes live in the inode record alone.
+
+| Listing | Cost per listed name |
+|---|---|
+| plain `READDIR`, `readdir` pages | the entry's `ino` and `kind`, one range scan, whatever the number of names |
+| `READDIRPLUS` entry, single-name file or directory | the attributes from the entry's copy: no extra read |
+| `READDIRPLUS` entry, hard-linked file | one inode-record read (`0x01` point read, ~0.5 µs warm, one block cold), under the same shard as a `LOOKUP` of the name; `du` reads each inode once |
+| `link`, `unlink`, `rename`, `chmod`, a write's close at *n* names | 1 to 6 keys, flat in *n* (it was *n* + 5) |
+
+A tree without hard links lists exactly as it did before the rule; a tree
+of them (a package manager's content store, `cp -al` backups) pays the one
+read per hard-linked name.
+
 ### Kernels with the fixes
 
 The kernel patches (0001 keeps write-through folios under writeback for

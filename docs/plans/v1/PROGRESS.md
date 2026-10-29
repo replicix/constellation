@@ -57492,8 +57492,8 @@ measured, the four-file-system runs are pending.
 | Two dentry forms, every reader, fsck check (H1) | landed | `crates/mtree/src/record.rs`, `crates/meta/src/store/{ns,writes,reads,scratch}.rs`, `crates/engine/src/{mtree_read,snapwalk,snapshot,fsck}.rs` |
 | The rule and transitions (H2) | landed | `crates/meta/src/store/{ns,writes,misc,reads,scratch}.rs`, `crates/meta/src/replay.rs` |
 | Engine tests (H3) | landed | `crates/engine/src/{mtree_read,mtree_publish}.rs`, `crates/engine/src/view/vfs_tests.rs` |
-| Harness scenario, xcheckfs lane (H4) | pending, box | `crates/harness/src/scenarios.rs` |
-| Docs (H5) | pending | `docs/reference` |
+| Harness scenario, xcheckfs lane (H4) | landed (2026-10-29) | `crates/harness/src/scenarios/hardlink.rs`; xcheckfs `--link 1` lane: see "H4, H5 and the close" |
+| Docs (H5) | landed (2026-10-29) | `DESIGN.md` §4 and ADR-36 (2026-10-23), `docs/reference/features/kernel-cache-coherence.md`, `TESTING.md` |
 
 ### Meta level, before and after (H0, H2)
 
@@ -58657,6 +58657,66 @@ after = 37180aef). Medians, µs:
 Every gate of plan 45 §7 holds on all four (single-name operations within ±5 %); the
 single-name cost is a consistent +1–4 % (the form check on every inode write), the
 same on every file system.
+
+### Plan 45: H4, H5 and the close (2026-10-29)
+
+**H4, `hardlink-burst`** (`crates/harness/src/scenarios/hardlink.rs`). Two nodes;
+A links one file 8,192 times over two directories (a `chmod` and an append at four
+points on the way up), then unlinks every extra name (a `chmod` and a truncate at
+three), while B replays and loops `ls -lai` and `du`. At the top and the bottom,
+once B has caught up: B's tree equals A's name for name (kind, mode, owner, link
+count, size, inode, mtime, ctime, content); A's tree is what the burst should have
+produced (`nlink` 8,193 then 1, the last mode and size), so an equal-but-wrong pair
+fails; `ls -lai` prints the same text on both; `du` (apparent and disk) is equal and
+counts the file once; each `meta.db` is under 64 MiB; `fsck` is clean on both; no
+conflicts; and the last 1,024 links average at most 20 times the first 1,024.
+"Both roots equal" is read as the two mount roots' trees: no control method exposes
+a replica's tree hash, so the equality is of the visible namespace, plus `fsck` on
+the published tree's dentry forms and link counts.
+
+- Three runs on the workstation (docker S3, `/dev/fuse`), release build, all PASSED in
+  6.4 to 10.6 s: 8,192 links in 0.68 to 1.02 s (p50 68 to 102 µs, first 1,024 avg 59 to
+  79 µs, last 1,024 avg 67 to 138 µs), 8,192 unlinks in 0.69 to 0.87 s, `meta.db` at the
+  top 13.3 MB on A and 2.5 MB on B, at the bottom 22.3 MB and 5.1 MB, `du` apparent 6,716
+  bytes at the top and 4,672 at the bottom on both nodes.
+- **Not vacuous.** (1) The same scenario against the code with the copy rule undone
+  (`DentryRecord::carries_copy` returning `true`, so every name keeps a copy and every
+  inode write rewrites all of them, the behaviour before the plan): FAILED after 302 s
+  with `meta.db at the top of the burst: A 152492658 bytes, B 215329898 bytes, bound
+  67108864` (the burst took five minutes instead of one second). (2) The tree
+  comparison and the shape check have unit tests that fail on a changed mode, size,
+  content, link count or a missing name (`the_tree_comparison_sees_a_difference`,
+  `the_shape_check_refuses_a_wrong_link_count`).
+- **The xcheckfs half.** Plan 42 §7.3 (a), 2026-10-24 (xcheckfs `dd18db3`,
+  `--check thorough`, 47 stages, `--link 1` in the mix with the normal 40 s bound,
+  ext4 primary and Constellation secondary, write-through 46.6 M and write-back 43.3 M
+  operations): 0 mismatches. That run is H4's lane requirement ("keeps `--link 1` with
+  the normal bound", decided 2026-10-22) and shows the stressor that took 38.7 s per
+  bogo-op now runs inside its bound, on one Constellation node after H2. It does not
+  show replication (the secondary is one node); that half is `hardlink-burst`.
+
+**H5, docs.** `DESIGN.md` §4 (the `ns` keyspace) states the two dentry forms and what
+decides them, linking ADR-36 (8914e5bc, 2026-10-23); checked against the code
+(`DentryRecord::{carries_copy,for_inode}`, 9 and 57 bytes, the form a function of the
+inode's kind and `nlink` written in the inode's transaction, `fsck` class `dentry_form`)
+and ADR-36's decision, consequences and rejected list: no drift. ADR-36's status reads
+built through H4 (its links follow the plan to `done/`). Plan 28 §P6 carries the dated pointer
+(2026-10-22); its link follows the plan to `done/`. `docs/reference` had no
+listing-cost table; `features/kernel-cache-coherence.md` ("Directory listings with
+`READDIRPLUS`") has one now: plain listings read `ino` and `kind` under either form, a
+single-name plus entry nothing extra, a hard-linked one a point read of the inode record,
+and `link`/`unlink`/`rename`/`chmod`/write flat in the number of names. `TESTING.md`
+has the scenario.
+
+**Gates (2026-10-29, box 1, `TMPDIR` on disk).** `cargo fmt --all -- --check` clean;
+`cargo clippy --workspace --all-targets -- -D warnings` clean (it flagged one
+`is_multiple_of` in the new scenario, fixed); `constellation-meta` all test binaries
+pass (376 library tests, 9 ignored), `constellation-mtree` 74, `constellation-authority`
+`--lib` 749, `constellation-harness --lib` 162 (the catalog-order test among them),
+`constellation-engine --lib` 931 (13 ignored; the five `view::owner_fence_tests` that
+failed in full runs on the workstation passed); no FAILED or panicked in any log.
+pjdfstest (the `compliance` suite, built from this tree, floci S3, `/dev/fuse`): **8798
+passed, 0 failed**, baseline empty. `harness smoke` passed; `harness run stress-ng-fs` PASSED (140.7 s, no stressor outside `tests/stress-ng-baseline.txt`); `hardlink-burst` also passed on box 1 under a host load of about 30 (a fourth run: 8,192 links in 5.9 s, last 1,024 averaging 5.3 times the first, `meta.db` 13.7 MB at the top on A and 22.8 MB at the bottom). The full `harness run` matrix and `tests/integration.sh` were not run for this plan: nothing outside the metadata store's dentry writers and the new scenario changed since the plan's earlier gates.
 
 ## Plan 40 — FUSE READDIRPLUS and name-ordered listings
 
