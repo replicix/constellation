@@ -60818,3 +60818,21 @@ inode to the entry's order keys only; the ownership keys leave it out. The held 
 (an overlap with a union is an overlap with one of its sets). Core tests
 `the_gate_holds_a_create_inside_a_directory_a_held_mkdir_makes` and
 `the_gate_holds_a_setattr_of_the_file_a_held_create_makes` failed before (the later entry refused `ENOENT`).
+
+## Perf: a round asks whether anything is dirty only once the idle publish is due (2026-10-29)
+
+The two-node xcheckfs runs of plan 40 P9 showed a root at about 7 ops/s and a second node whose `rm -rf` of 100,000
+entries ran past its 20 minute bound. Reproduced with two nodes on an S3 emulator, the second the delegate of its own
+directory, each looping a 100,000-file create and unlink: the root's authority core spent 64 % of its samples in
+`Meta::has_dirty` under `Core::round_publish`. `has_dirty` is a `first_key_value` on the `dirty` keyspace, which steps
+over every tombstone the publishes' clears left since the last vacuum, and the round asked it before the cheap test of
+whether an idle publish is due at all. A delegate's ops wait for the root to append and ship them, so the root's core
+set their pace. The time test now comes first (the same value: `has_dirty` has no effect). Node 2 alone: 1,550 to
+1,700 unlinks a second (was 130 to 160), a 100,000-entry unlink in about 60 s (462 s), root core 27 % (90 to 94 %);
+both nodes: about 2,650 ops/s together (about 1,750). Test `a_busy_holders_rounds_do_not_probe_the_dirty_keyspace`
+(64 probes in 96 rounds before, at most 2 after).
+
+Left open: the full xcheckfs two-node mix not rerun; on the delegate `Holds::held_orphans` scans the whole `orphans`
+keyspace on each refresh during an `rm -rf` (63 % of a worker); one run logged "the log was pruned past this replica's
+position" for a segment less than 900 s old while the replica was a few segments behind, then 4 s unlinks for about a
+minute (not investigated).

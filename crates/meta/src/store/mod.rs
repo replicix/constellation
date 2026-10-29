@@ -749,6 +749,8 @@ pub struct Meta {
     /// read, on behalf of this node's outstanding journal
     /// ([`Meta::local_rows_read`]).
     local_rows_read: AtomicU64,
+    /// Probes of the `dirty` keyspace for any entry ([`Meta::dirty_probes`]).
+    dirty_probes: AtomicU64,
     /// Plan 40: dentries decoded by the directory reads (`readdir`,
     /// `readdir_after` and their scratch twins) — what a page costs
     /// ([`Meta::dentries_read`]).
@@ -978,6 +980,14 @@ impl Meta {
         self.local_rows_read.load(Ordering::Relaxed)
     }
 
+    /// How many times [`Self::has_dirty`] looked into the `dirty` keyspace:
+    /// each look steps over every tombstone a publish's clear left at the
+    /// keyspace's start since the last vacuum, so a hot path asks it only
+    /// when its answer matters.
+    pub fn dirty_probes(&self) -> u64 {
+        self.dirty_probes.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn note_local_rows_read(&self, n: usize) {
         self.local_rows_read.fetch_add(n as u64, Ordering::Relaxed);
     }
@@ -1204,6 +1214,7 @@ impl Meta {
             rolled_back: std::sync::Mutex::new(Vec::new()),
             inode_reads: AtomicU64::new(0),
             local_rows_read: AtomicU64::new(0),
+            dirty_probes: AtomicU64::new(0),
             dentries_read: AtomicU64::new(0),
             snapshot_gen: AtomicU64::new(0),
             snapshot_hook: std::sync::RwLock::new(None),
@@ -1979,9 +1990,13 @@ impl Meta {
         Ok(())
     }
 
-    /// Cheap non-emptiness probe: whether a publish has anything to do at
-    /// all, without paying for a full [`Self::dirty_snapshot`].
+    /// Non-emptiness probe: whether a publish has anything to do at all,
+    /// without paying for a full [`Self::dirty_snapshot`]. It still reads
+    /// from the keyspace's start, stepping over every tombstone a publish's
+    /// clear left there since the last vacuum ([`Self::vacuum_churn`]): not
+    /// free on a busy node ([`Self::dirty_probes`]).
     pub fn has_dirty(&self) -> bool {
+        self.dirty_probes.fetch_add(1, Ordering::Relaxed);
         self.dirty.first_key_value().is_some()
     }
 

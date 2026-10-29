@@ -2458,6 +2458,83 @@ fn a_nudge_during_an_in_flight_publish_ships_the_journal_at_once() {
     });
 }
 
+/// A busy holder's rounds do not look into the `dirty` keyspace while the
+/// last publish is recent: `Meta::has_dirty` steps over every tombstone the
+/// publishes' clears left at the keyspace's start, and asked on every round
+/// it was 64 % of a root's core under a delegate's 100,000-entry `rm -rf`
+/// (two nodes, the delegate's unlinks from 1,200 to 110 a second). The
+/// answer matters only once the idle publish is due.
+#[test]
+fn a_busy_holders_rounds_do_not_probe_the_dirty_keyspace() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let rounds = 3 * h.core.cfg.publish_every;
+    let mut publishes = 0;
+    let mut probes_after_first_publish = None;
+    for i in 1..=rounds {
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: h.rid(i),
+            op: h.create(&format!("f{i}")),
+            tag: Default::default(),
+        });
+        assert!(!replies(&out).is_empty());
+        let out = h.step(Event::Control {
+            op: OpId(10_000 + i),
+            req: Control::Nudge,
+        });
+        let mut pending = vec![Event::Timer {
+            id: timers(&out, TimerKind::Poll)[0],
+        }];
+        let mut shipped = false;
+        while let Some(event) = pending.pop() {
+            for a in h.step(event) {
+                match a {
+                    Action::UploadDirtyChunks { op, .. } => pending.push(Event::UploadsDone {
+                        op,
+                        result: UploadResult::Done { held: 0 },
+                    }),
+                    Action::S3 {
+                        op,
+                        req: S3Op::SegmentPut { .. },
+                    } => {
+                        shipped = true;
+                        pending.push(Event::S3 {
+                            op,
+                            result: S3Result::SegmentPut(Ok(())),
+                        })
+                    }
+                    Action::S3 {
+                        op,
+                        req: S3Op::SegmentGap { .. },
+                    } => pending.push(Event::S3 {
+                        op,
+                        result: S3Result::SegmentGap(Ok(None)),
+                    }),
+                    Action::Publish { op, .. } => {
+                        publishes += 1;
+                        pending.push(Event::PublishDone { op, ok: true });
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(shipped, "round {i} ships its create");
+        if publishes > 0 && probes_after_first_publish.is_none() {
+            probes_after_first_publish = Some(h.meta.dirty_probes());
+        }
+        h.advance(10);
+    }
+    assert!(publishes >= 2, "the cadence publishes: {publishes}");
+    let first = probes_after_first_publish.expect("a publish");
+    let probes = h.meta.dirty_probes() - first;
+    assert!(
+        probes <= 2,
+        "{probes} probes of `dirty` in {rounds} rounds, each within {} ms of a publish",
+        h.core.cfg.publish_idle_ms
+    );
+}
+
 /// An unmount's flush that finds a cadence publish still in flight waits
 /// for it and then publishes what shipped since, before it releases and
 /// stops (`e2e-basic` under load: the flush skipped its publish because

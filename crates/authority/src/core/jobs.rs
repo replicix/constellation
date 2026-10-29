@@ -2112,9 +2112,16 @@ impl Core {
         let holder_epoch = self.lease.ship_epoch(now, &self.cfg);
         let cadence_due =
             self.publish_forced || self.ship.shipped_since_publish >= self.cfg.publish_every;
+        // The time first: `has_dirty` reads the `dirty` keyspace from its
+        // start, over every tombstone the publishes' clears left there
+        // since the last vacuum. Asked on every round, it was most of a
+        // busy root's core (two nodes, a delegate's 100,000-entry `rm -rf`:
+        // 64 % of the core's samples, the delegate's unlinks from 1,200 to
+        // 110 a second), and its answer only matters once a publish is
+        // `publish_idle_ms` overdue.
         let idle_due = self.cfg.publisher
-            && replica.has_dirty()
-            && now.wait.since(self.ship.last_publish) >= self.cfg.publish_idle_ms as i64;
+            && now.wait.since(self.ship.last_publish) >= self.cfg.publish_idle_ms as i64
+            && replica.has_dirty();
         if !self.cfg.publisher || self.publishing.is_some() || self.skip_ship {
             self.round_release(now, replica, out);
             return;
