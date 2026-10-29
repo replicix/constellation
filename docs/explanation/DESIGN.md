@@ -917,10 +917,16 @@ lease and one log
   `nlink` changes are deltas, so creates
   in one directory commute and hold their parent only *shared*. A
   directory can be split into up to 16 name-hash ranges (GIGA+), each
-  delegated separately, but only to a node that dominates that range:
-  names hashed uniformly across writers give no range a dominant writer,
-  and splitting such a directory measured slower than leaving it with the
-  root.
+  delegated separately, but only to a node that dominates that range. The
+  placement does **not** split automatically by default
+  (`CONSTELLATION_DELEGATION_SPLIT=0`): on real names a split measured
+  0.01× to 0.91× the throughput of none in every topology, and pays only
+  when each writer's names hash into its own range. Automatic splitting is
+  an opt-in expert setting, not available with `--cto strict` (a strict
+  listing of a split directory asks one sequencer only), and hand splits
+  stay available otherwise; delegating the
+  directory whole is the tool for writers far from the root
+  ([ADR-38](DECISIONS.md#adr-38-automatic-directory-hash-range-splits-are-off-by-default)).
 
 A node writing its own subtree therefore runs at local speed, and S3
 request counts do not change, since there is still one log. Offline

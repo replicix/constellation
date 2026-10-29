@@ -7327,7 +7327,7 @@ mod cto {
     }
 
     /// A holder with a file `f` (created locally, unshipped).
-    fn holder_with_file() -> (Harness, Ino) {
+    fn holder_with_file() -> (Harness, constellation_fs_core::Ino) {
         let mut h = Harness::new(1);
         h.hold(1, None);
         let op = h.create("f");
@@ -9053,7 +9053,7 @@ mod cto {
 
     /// A root with a kernel cache TTL that no peer or roster event has
     /// named another node to yet (`is_alone`), with directory `p`.
-    fn lone_holder_with_dir() -> (Harness, Ino) {
+    fn lone_holder_with_dir() -> (Harness, constellation_fs_core::Ino) {
         let (mut h, _) = holder_with_file();
         h.core.cfg.delegation = true;
         h.core.cfg.p2p = true;
@@ -15271,7 +15271,7 @@ mod locks {
         assert!(h.core.dl.release_wait.is_none());
     }
 
-    fn holder_with_file() -> (Harness, Ino) {
+    fn holder_with_file() -> (Harness, constellation_fs_core::Ino) {
         let mut h = Harness::new(1);
         h.hold(1, None);
         let op = h.create("f");
@@ -18173,7 +18173,7 @@ mod locks {
     /// A root with generation 7 (node 3's) heard from before node 2's
     /// grant on a root file was outwaited, and node 4's request parked
     /// behind the barrier: `(h, ino)`.
-    fn outwaited_beside_gen7() -> (Harness, Ino) {
+    fn outwaited_beside_gen7() -> (Harness, constellation_fs_core::Ino) {
         let mut h = Harness::new(1);
         h.core.cfg.delegation = true;
         h.core.cfg.p2p = true;
@@ -19150,7 +19150,7 @@ mod locks {
 
     /// A delegate (node 3, generation 7) of the directory of the returned
     /// file, at lock ttl `lock_ttl_ms`.
-    fn lock_delegate(lock_ttl_ms: u64) -> (Harness, Ino) {
+    fn lock_delegate(lock_ttl_ms: u64) -> (Harness, constellation_fs_core::Ino) {
         let mut h = Harness::new(3);
         h.core.cfg.delegation = true;
         h.core.cfg.p2p = true;
@@ -27126,7 +27126,7 @@ mod locks {
         assert!(h.core.fast_tenure());
     }
 
-    fn fast_holder_with_file() -> (Harness, Ino) {
+    fn fast_holder_with_file() -> (Harness, constellation_fs_core::Ino) {
         let mut h = Harness::new(1);
         hold_fast(&mut h);
         let op = h.create("f");
@@ -32593,6 +32593,15 @@ fn a_barrier_around_a_deposition_waits_for_the_replay_not_the_strand() {
     assert_eq!(done, Some(Ok(ControlOk::Done)));
 }
 
+/// ADR-38: automatic hash-range splits are off by default; the placement
+/// stays on.
+#[test]
+fn automatic_splits_are_off_by_default() {
+    let c = crate::Config::defaults(1, 0);
+    assert!(c.placement);
+    assert_eq!(c.placement_split_pct, 0);
+}
+
 /// Harness `auto-placement` (2 in 11): the root's roster is read at
 /// mount and every 5 s; a peer that registered after it mounted and
 /// writes at once is connected, forwarding, and dominant, but not in the
@@ -32662,6 +32671,133 @@ fn placement_re_reads_the_roster_for_a_connected_writer_it_does_not_list() {
             .map(|g| (g.dir, g.node))
             .collect::<Vec<_>>(),
         vec![(dir, 2)]
+    );
+}
+
+/// ADR-38: a root (node 1) whose placement sees two connected writers,
+/// nodes 2 and 3, each creating 40 names in `d1` that hash into its own
+/// half of the name space: no node dominates, both write 50 %, and each
+/// half has a local writer. Returns the harness and `d1`.
+fn root_with_two_range_writers(
+    split_pct: u64,
+    strict: bool,
+) -> (Harness, constellation_fs_core::Ino) {
+    let mut h = Harness::new(1);
+    h.core.cfg.delegation = true;
+    h.core.cfg.placement = true;
+    h.core.cfg.placement_min_ops = 20;
+    h.core.cfg.placement_split_pct = split_pct;
+    h.core.cfg.strict_mounts = strict;
+    h.hold(1, None);
+    let op = h.create("d1");
+    constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+    let MutateOp::Create { ino: dir, .. } = op else {
+        unreachable!()
+    };
+    h.step(Event::Roster {
+        write_eligible: vec![1, 2, 3],
+    });
+    h.step(Event::Peers {
+        links: [2, 3]
+            .map(|node| crate::event::PeerLink {
+                node,
+                connected: true,
+                last_seen: Some(w(h.now)),
+                rtt_ms: Some(1),
+                since: Some(w(h.now)),
+            })
+            .to_vec(),
+    });
+    for (node, idx) in [(2, 0), (3, 1)] {
+        let names = (0..)
+            .map(|i| format!("n{i}"))
+            .filter(|n| constellation_meta::delegation::Range::of(1, n).idx == idx)
+            .take(40);
+        for name in names {
+            h.core
+                .place_note(node, [(dir, Some(super::placement::bucket_of(&name)))]);
+        }
+    }
+    (h, dir)
+}
+
+fn placement_tick(h: &mut Harness) -> Vec<Action> {
+    let (now, mut out) = (h.now, Vec::new());
+    h.core
+        .on_placement_timer(Now::same(now.0), &h.meta, &mut out);
+    out
+}
+
+/// The control group of the two tests below: with the split on and no
+/// strict mounts the placement splits the directory.
+#[test]
+fn the_placement_splits_a_hot_directory_when_asked_to() {
+    let (mut h, dir) = root_with_two_range_writers(20, false);
+    placement_tick(&mut h);
+    assert_eq!(h.core.stats.place_splits, 1);
+    assert!(h.meta.delegation_table().is_split(dir));
+}
+
+/// ADR-38: automatic splits are off by default, however hot the directory.
+#[test]
+fn the_placement_does_not_split_by_default() {
+    let (mut h, dir) =
+        root_with_two_range_writers(Config::defaults(1, 0).placement_split_pct, false);
+    placement_tick(&mut h);
+    assert_eq!(h.core.stats.place_splits, 0);
+    assert!(!h.meta.delegation_table().is_split(dir));
+}
+
+/// ADR-38: under `--cto strict` the placement never splits, whatever
+/// `CONSTELLATION_DELEGATION_SPLIT` says (a strict listing of a split
+/// directory asks one sequencer only). Fails before: it splits.
+#[test]
+fn the_placement_never_splits_under_cto_strict() {
+    let (mut h, dir) = root_with_two_range_writers(20, true);
+    placement_tick(&mut h);
+    assert_eq!(h.core.stats.place_splits, 0);
+    assert!(!h.meta.delegation_table().is_split(dir));
+}
+
+/// ADR-38: a hand split is refused under `--cto strict`, a whole
+/// delegation is not. Fails before: the split is accepted.
+#[test]
+fn a_manual_range_split_is_refused_under_cto_strict() {
+    let (mut h, dir) = root_with_two_range_writers(0, true);
+    let delegate = |h: &mut Harness, op: u64, range: (u8, u32)| {
+        let out = h.step(Event::Control {
+            op: OpId(op),
+            req: Control::Delegate {
+                dir,
+                node: 2,
+                range,
+            },
+        });
+        out.into_iter()
+            .find_map(|a| match a {
+                Action::ControlDone { result, .. } => Some(result),
+                _ => None,
+            })
+            .expect("no answer")
+    };
+    let refused = delegate(&mut h, 900, (1, 0)).expect_err("a split under strict");
+    assert!(refused.contains("--cto strict"), "{refused}");
+    assert!(!h.meta.delegation_table().is_split(dir));
+    delegate(&mut h, 901, (0, 0)).expect("a whole delegation is allowed");
+    // Not strict: the same split is accepted.
+    let (mut h, dir) = root_with_two_range_writers(0, false);
+    let out = h.step(Event::Control {
+        op: OpId(902),
+        req: Control::Delegate {
+            dir,
+            node: 2,
+            range: (1, 0),
+        },
+    });
+    assert!(
+        out.iter()
+            .any(|a| matches!(a, Action::ControlDone { result: Ok(_), .. })),
+        "{out:?}"
     );
 }
 

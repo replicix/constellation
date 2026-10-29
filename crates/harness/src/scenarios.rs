@@ -1601,7 +1601,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "hash-range-split-merge",
-        desc: "plan 30 M12: the placement (on by default) splits a hot shared directory written by four nodes into hash ranges delegated to them; when the writers stop the ranges are recalled after the dwell and the directory is whole again; everything converges",
+        desc: "plan 30 M12: the placement, with automatic splits turned on (CONSTELLATION_DELEGATION_SPLIT=20; they are off by default), splits a hot shared directory written by four nodes into hash ranges delegated to them; when the writers stop the ranges are recalled after the dwell and the directory is whole again; everything converges",
         requires: &[],
         caps: &[],
         run: m11::hash_range_split_merge,

@@ -1866,3 +1866,89 @@ the default `auto` stands unless the R8 measurements fail it).
 **See**: [plan 40](../plans/v1/wip/40-readdirplus.md) §4.5, §4.9 and §9;
 `crates/engine/src/view/{listing,cookie,plus}.rs`,
 `crates/frontend-fuse/src/adapter.rs` (`ReaddirPlus`); PROGRESS, "Plan 40".
+
+## ADR-38: Automatic directory hash-range splits are off by default
+
+**Context**: plan 30 §M12 lets the root's placement split a hot shared
+directory into 2 to 16 name-hash ranges (GIGA+) and delegate each range to
+the node that dominates it, with `CONSTELLATION_DELEGATION_SPLIT` (20 %) as
+the share that makes a node a candidate. The split was on by default. The
+directory-split benchmark (`bench/dirsplit`, T1 to T5 with 2, 4 and 8
+writers, a crossover sweep over the root's round trip of 2 to 60 ms at S3
+20 and 80 ms, three repetitions per cell) measured what it buys.
+
+**Decision**: the placement does not split directories by itself:
+`CONSTELLATION_DELEGATION_SPLIT` defaults to `0` (`placement_split_pct`).
+The split stays as an expert setting (`CONSTELLATION_DELEGATION_SPLIT=20`
+turns the automatic split back on) and `constellation delegate --range`
+splits by hand whatever the setting. Whole-directory and subtree
+delegation, which the placement still does by itself, is the recommended
+tool for writers far from the root.
+
+**Evidence** ([results](../../bench/dirsplit/RESULTS.md)):
+- With random names (creates, create and unlink, renames), a hand split
+  ran at 0.01× to 0.91× the throughput of no split in every topology, at
+  every writer count and every root round trip measured, usually below
+  0.2×. At 4 writers: 0.06× in one AZ at S3 20 ms, 0.02× at S3 80 ms,
+  0.34× with every node in its own region, 0.72× with the writers
+  together and the root 60 ms away.
+- The crossover sweep shows the gap narrowing as the root moves away
+  (0.13× at 2 ms, 0.44× at 20 ms, 0.70× at 60 ms, S3 20 ms) but not
+  closing, and a slower S3 widens it (0.04×, 0.15×, 0.38× at S3 80 ms).
+- Why: a create of a random name lands in the writer's own range with
+  probability 1/N, so most creates are forwarded to another delegate, and
+  an op in one range waits for the other ranges' streams through the root's
+  S3 log, about 145 ms at S3 20 ms and about 500 ms at S3 80 ms. A split
+  adds a range-to-range ordering cost and removes nothing.
+- The automatic placement never split a directory of random names (it
+  delegates a range only to a node that dominates it) and measured the same
+  as no split there.
+- A split pays only when every writer's names hash into its own range
+  (synthetic): 1.2× to 3.3× within one AZ, up to 60× far from the root. No
+  application chooses names by their hash.
+- Delegating the directory whole to one writer ran at 12× to 39×
+  (writers together, root far away) and 26× to 209× (every node in its own
+  region) the throughput of no delegation.
+
+**Consequences**: a default mount never splits a directory, so the
+costs above and the split-only behaviours do not apply to it: no read
+delegation on a split directory (every lookup in it asks the name's
+sequencer), and cross-range renames recalling both ranges. They matter
+only to those who enable splits or split by hand.
+
+*No splits under `--cto strict`.* The listing of a split directory is
+answered by one sequencer, whose position does not cover the other
+ranges' streams, so a strict `readdir` can miss a name another range's
+delegate just created
+([cto-modes](../reference/features/cto-modes.md#known-gaps)). The
+maintainer chose to forbid splits in strict mode rather than build a
+fan-out (a ReadIndex at every range's delegate and at the root, the reader
+waiting for all of them), for a feature that does not pay off on real
+names. On a node with a strict mount the placement never splits a
+directory, whatever `CONSTELLATION_DELEGATION_SPLIT` says (one warning at
+mount), and a hand split (`constellation delegate --range`) is refused
+with an error; whole-directory and subtree delegation stay allowed. The
+check is the node's own mounts', so a file system with strict mounts on
+other nodes leaves the setting off on the nodes that can hold the root
+lease. The sims, harness scenarios and the
+benchmark that cover splits set the knob explicitly
+(`hash-range-split-merge`, the `shared-dir-split` sims, bench
+configuration `b`); a sim checks that nothing splits by default. The
+mechanism stays maintained, as an expert setting.
+
+**Rejected**: keeping 20 as the default (a split that never paid off on
+real names, and that a workload with name locality by chance could trigger
+at a measured loss); removing plan 30 §M12 entirely (the synthetic case
+shows a split can win, hand splits have users who know their naming, and
+the sims and model that check ranges guard code shared with the recall and
+cross-subtree paths); off by default with the knob kept (chosen).
+
+**Status**: decided by the maintainer 2026-10-29 (the directory-split
+benchmark's recommendation); built.
+
+**See**: [bench/dirsplit/RESULTS.md](../../bench/dirsplit/RESULTS.md);
+[Delegations](../reference/features/delegations.md#hot-shared-directories);
+[configuration](../reference/configuration.md); plan 30 §M12 in
+[PROGRESS](../plans/v1/PROGRESS.md); `crates/authority/src/core/mod.rs`
+(`placement_split_pct`), `crates/authority/src/core/placement.rs`
+(`place_splits`).

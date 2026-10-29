@@ -430,7 +430,10 @@ pub struct Config {
     pub placement_leave_pct: u64,
     /// Plan 30 §M12: a hot directory several nodes each write at least
     /// this share of (and none dominates) is split into name-hash
-    /// ranges delegated to them (GIGA+); 0 turns splitting off.
+    /// ranges delegated to them (GIGA+). 0, the default, turns automatic
+    /// splitting off: on real names a split ran at 0.01 to 0.91 times the
+    /// throughput of none (ADR-38, `bench/dirsplit/RESULTS.md`); 20 is
+    /// the value the expert setting was tuned with.
     pub placement_split_pct: u64,
     /// `CONSTELLATION_DELEGATION_DWELL_MS` (60 s) and
     /// `CONSTELLATION_DELEGATION_COOLDOWN_MS` (30 s).
@@ -658,7 +661,7 @@ impl Config {
             placement_min_ops: 200,
             placement_dominance_pct: 70,
             placement_leave_pct: 50,
-            placement_split_pct: 20,
+            placement_split_pct: 0,
             placement_dwell_ms: 60_000,
             placement_cooldown_ms: 30_000,
         }

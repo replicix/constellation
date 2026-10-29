@@ -587,26 +587,75 @@ Several writers creating files in one directory (plan 30 M12):
   parent and `setattr` on it hold the parent exclusively. So creates of
   different names in one directory no longer serialize on the parent,
   on the requester or at the sequencer.
-- **Name-hash ranges (GIGA+).** A directory can be split into 2, 4, 8 or
-  16 ranges of its names' hashes, each delegated as its own generation.
+- **Name-hash ranges (GIGA+), by hand or by an opt-in placement.** A
+  directory can be split into 2, 4, 8 or 16 ranges of its names' hashes, each delegated as its own generation.
   A range covers the directory's own names only; the contents of a
   subdirectory resolve past the split directory. A rename across ranges
   is cross-subtree (both ranges recalled, then re-delegated). `readdir`
   is unaffected, since there is one log. Ranges nobody holds stay with
   the root.
 
-Placement splits a directory that is hot (at least the rate floor of ops
-in the directory itself), that no node dominates, and that several nodes
-each write at least `CONSTELLATION_DELEGATION_SPLIT` (20%) of. It uses
-the smallest power of two that gives every such node a range. Each
-range goes only to a node that dominates **that range** (70%). Names
-hashed uniformly across writers give no range a dominant writer, so
-such a directory stays with the root: on a LAN, splitting it measured
-20–40% slower than leaving it (every op gained a hop), and the shared
-parent holds already remove the serialization. In practice automatic
-splits fire only when writers' names fall into distinct hash ranges;
-`constellation delegate --range` does it by hand. A directory whose
-ranges have all been recalled is merged back.
+**Automatic splits are off by default** ([ADR-38](../../explanation/DECISIONS.md#adr-38-automatic-directory-hash-range-splits-are-off-by-default)). They are an
+expert setting: `CONSTELLATION_DELEGATION_SPLIT=20` turns them on, and the
+root's placement then splits a directory that is hot (at least the rate
+floor of ops in the directory itself), that no node dominates, and that
+several nodes each write at least that share (here 20%) of. It uses the
+smallest power of two that gives every such node a range. Each range goes
+only to a node that dominates **that range** (70%). A directory whose
+ranges have all been recalled is merged back. `constellation delegate
+--range` splits a directory by hand, and stays available whatever the
+setting.
+
+*When it can help.* A split pays off only when each writer's names fall
+into the writer's own hash range, so that its creates are local to the
+range's delegate. Ordinary applications do not name files by their hash, so
+this is a property of a special workload, not of a use case. In the
+[directory-split benchmark](../../../bench/dirsplit/RESULTS.md), a
+synthetic workload of that kind ran at 1.2× to 3.3× the throughput of no
+split within one AZ, and up to 60× with the writers far from the root.
+
+*What it costs otherwise.* With random names (creates, create and unlink,
+renames) a split directory ran at 0.01× to 0.91× the throughput of no
+split, in every topology, at every writer count (2, 4, 8) and at every
+root round trip measured (up to 60 ms), usually below 0.2×:
+
+| 4 writers, creates of random names | hand split / no split |
+|---|---|
+| one AZ, S3 20 ms | 0.06 |
+| one AZ, S3 80 ms | 0.02 |
+| half the writers 60 ms from the root | 0.05 |
+| every node in its own region | 0.34 |
+| writers together, root 60 ms away | 0.72 |
+
+The gap narrows as the root moves away (writers together, S3 20 ms: 0.13
+at a root round trip of 2 ms, 0.44 at 20 ms, 0.70 at 60 ms) but does not
+close, and a slower S3 widens it (the same sweep at S3 80 ms: 0.04, 0.15,
+0.38). Two things cost: a create of a random name lands in the writer's
+own range with probability 1/N, so most creates are forwarded to the range's
+delegate, as they would be to the root; and an op in one range waits for
+the other ranges' streams through the root's S3 log, a fixed wait of
+about 145 ms at S3 20 ms and about 500 ms at S3 80 ms. A split adds this
+ordering cost and removes nothing. The figures are those of a split in
+place (a hand split in the benchmark): with the automatic split enabled, the
+placement never split a directory of random names (it gives a range only to
+a node that dominates it), and measured the same as no split there. The
+listing of a split directory is also answered by one sequencer (see
+"Known gaps" in [Close-to-open modes](cto-modes.md#known-gaps)), so a strict
+listing could miss a name another range's delegate just created. For that
+reason **splits are not available with `--cto strict`**: on a node that has
+a strict mount, `CONSTELLATION_DELEGATION_SPLIT` is ignored (one warning
+at mount) and `constellation delegate --range` is refused; delegating the
+directory whole stays allowed. The rule is the node's own mounts', so on a
+file system with strict mounts anywhere, leave the setting off on every
+node that can hold the root lease.
+
+*What to use instead.* Delegating the directory **whole** (or its subtree)
+to the writer that works in it is the tool for writers far from the root:
+in the benchmark it ran at 12× to 39× (writers together, root far away)
+and 26× to 209× (every node in its own region) the throughput of no
+delegation, and 0.9× to 3.6× within one AZ. The placement does this by
+itself when one node dominates the directory (70%), and
+`constellation delegate` does it by hand.
 
 ### Offline designations
 
@@ -733,7 +782,7 @@ designations create no delegation.
 | Command | Meaning |
 |---|---|
 | `constellation delegate TARGET --to NODE` | delegate the directory `TARGET` to node `NODE`. Run it on the root lease holder. Refused if the directory overlaps a live delegation, is the root, or `NODE` already holds a whole delegation |
-| `constellation delegate TARGET --to NODE --range IDX/COUNT` | delegate one of `COUNT` (2, 4, 8 or 16) name-hash ranges of the directory |
+| `constellation delegate TARGET --to NODE --range IDX/COUNT` | delegate one of `COUNT` (2, 4, 8 or 16) name-hash ranges of the directory. Refused on a node with a `--cto strict` mount |
 | `constellation undelegate TARGET` | recall the delegation (all ranges) on a directory. Refused for a designation, which only `constellation online` releases |
 | `constellation delegations TARGET` | list the live table: directory, path, node, generation, designated, range |
 
@@ -745,12 +794,12 @@ designations create no delegation.
 | `CONSTELLATION_DELEGATION_TTL_MS` | lock TTL (20 s), at least `5000` | grant lifetime |
 | `CONSTELLATION_DELEG_LANE` | on | the off-core renewal lane for a stuck core; `off` for A/B runs |
 | `CONSTELLATION_DELEG_ROOT_LANE` | on | the root's off-core answer to a delegate's renewal while its core is stuck; `off` for A/B runs |
-| `CONSTELLATION_DELEGATION_PLACEMENT` | on | automatic placement and splits |
+| `CONSTELLATION_DELEGATION_PLACEMENT` | on | automatic placement of dominated subtrees (and of splits, if enabled) |
 | `CONSTELLATION_DELEGATION_WINDOW_MS` | `30000` | placement window |
 | `CONSTELLATION_DELEGATION_MIN_OPS` | `200` | rate floor per window |
 | `CONSTELLATION_DELEGATION_DOMINANCE` | `70` | percent to be given a subtree or a range |
 | `CONSTELLATION_DELEGATION_LEAVE` | `50` | percent below which a placed delegation is recalled |
-| `CONSTELLATION_DELEGATION_SPLIT` | `20` | percent per writer that makes a hot directory a split candidate |
+| `CONSTELLATION_DELEGATION_SPLIT` | `0` (off) | expert setting: percent per writer that makes a hot directory a split candidate; `20` is the value it was tuned with (see "Hot shared directories"); ignored on a node with a `--cto strict` mount |
 | `CONSTELLATION_DELEGATION_DWELL_MS` | `60000` | recall dwell |
 | `CONSTELLATION_DELEGATION_COOLDOWN_MS` | `30000` | cool-down after a recall |
 

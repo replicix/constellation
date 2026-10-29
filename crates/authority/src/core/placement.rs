@@ -16,7 +16,7 @@
 //!   walk goes from each dominated directory towards the root while the
 //!   condition still holds, so one delegation covers a writer's whole
 //!   working set rather than a swarm of leaves.
-//! - **Split** (M12) a directory `D` that is hot (at least the floor of
+//! - **Split** (M12, off by default: `placement_split_pct` 0, ADR-38) a directory `D` that is hot (at least the floor of
 //!   ops in `D` itself) but has *no* dominant node while several nodes
 //!   each write at least `placement_split_pct` of it: its own names are
 //!   split into `2^bits` hash ranges (`bits` the smallest that gives
@@ -327,7 +327,13 @@ impl Core {
         let min_ops = self.cfg.placement_min_ops;
         let leave = self.cfg.placement_leave_pct;
         let dominance = self.cfg.placement_dominance_pct;
-        let split_pct = self.cfg.placement_split_pct;
+        // ADR-38: never under `cto=strict` (a strict listing of a split
+        // directory asks one sequencer only).
+        let split_pct = if self.cfg.strict_mounts {
+            0
+        } else {
+            self.cfg.placement_split_pct
+        };
         // Status: the busiest subtrees.
         let mut top: Vec<(Ino, NodeId, u64, u64)> = subtree
             .iter()

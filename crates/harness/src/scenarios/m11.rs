@@ -2107,7 +2107,8 @@ pub fn shared_dir_multi_writer(_seed: u64) -> Result<()> {
     result
 }
 
-/// Plan 30 §M12: the placement (on by default) splits a hot shared
+/// Plan 30 §M12: the placement (with `CONSTELLATION_DELEGATION_SPLIT=20`;
+/// splits are off by default) splits a hot shared
 /// directory by itself: four writers, no dominant one, and the root
 /// delegates hash ranges of `shared` to the writers (`place_splits`);
 /// when the writers stop, the ranges are recalled after the dwell
@@ -2120,6 +2121,9 @@ pub fn hash_range_split_merge(_seed: u64) -> Result<()> {
         &["a", "b", "c", "d"],
         &[
             ("CONSTELLATION_DELEGATION_PLACEMENT", ""),
+            // Automatic splits are off by default (ADR-38): this
+            // scenario covers them, so they are turned on.
+            ("CONSTELLATION_DELEGATION_SPLIT", "20"),
             ("CONSTELLATION_DELEGATION_WINDOW_MS", "4000"),
             ("CONSTELLATION_DELEGATION_MIN_OPS", "40"),
             ("CONSTELLATION_DELEGATION_DWELL_MS", "4000"),

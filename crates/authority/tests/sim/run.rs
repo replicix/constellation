@@ -770,6 +770,17 @@ pub fn placement_core_config(node_id: NodeId, incarnation: u32) -> Config {
     c.placement_min_ops = 6;
     c.placement_dwell_ms = 1_500;
     c.placement_cooldown_ms = 1_000;
+    // Automatic hash-range splits are off by default (ADR-38); the
+    // sims that cover them opt in, like the daemon's
+    // `CONSTELLATION_DELEGATION_SPLIT=20`.
+    c.placement_split_pct = 20;
+    c
+}
+
+/// The placement on with the production default for splits: off.
+pub fn placement_default_split_core_config(node_id: NodeId, incarnation: u32) -> Config {
+    let mut c = placement_core_config(node_id, incarnation);
+    c.placement_split_pct = 0;
     c
 }
 

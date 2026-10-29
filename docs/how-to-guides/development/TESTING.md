@@ -2527,9 +2527,12 @@ relay of its own so requests can be attributed per role):
     default** (`CONSTELLATION_DELEGATION_PLACEMENT=off` pins the single
     sequencer; the M11 scenarios above pin it off, `auto-placement`,
     `hash-range-split-merge` and the M12 scenarios name the knob empty
-    to test the default); `CONSTELLATION_DELEGATION_SPLIT` (20) is the
+    to test the default); `CONSTELLATION_DELEGATION_SPLIT` is the
     share of a hot directory's ops several nodes must each write for the
-    root to split its names into hash ranges (0 turns splitting off).
+    root to split its names into hash ranges (0, the default since
+    ADR-38, turns automatic splitting off; `hash-range-split-merge` and
+    the `shared-dir-split` sims set 20, `shared-dir-default` checks that
+    nothing splits by default).
     `constellation delegate <dir> --to <node> --range <idx>/<count>`
     delegates one range by hand (`count` 2, 4, 8 or 16);
     `status.delegation.table` entries carry `range` (`"<idx>/<count>"`,
@@ -2566,7 +2569,8 @@ relay of its own so requests can be attributed per role):
       (commutative parent attributes under an HLC, hash-range ownership,
       the shared/exclusive parent hold, with the naive counterexamples).
     - Sim: `shared_dir_*` (a hot shared directory with the single
-      sequencer, split by the placement, split by hand with cross-range
+      sequencer, split by the placement with `placement_split_pct` set to
+      20, not split by the default configuration, split by hand with cross-range
       renames, and under random faults); a split directory's history is
       checked for linearizability per hash range
       (`SimConfig::check_range_bits`).

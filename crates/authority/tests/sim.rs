@@ -365,6 +365,7 @@ fn replay_seed() {
         Ok("delegated-strict") => delegated_strict_config(),
         Ok("shared-dir") => shared_dir_config(),
         Ok("shared-dir-split") => shared_dir_split_config(),
+        Ok("shared-dir-default") => shared_dir_default_config(),
         Ok("shared-dir-fast-path") => shared_dir_fast_path_config(),
         Ok("shared-dir-fast-path-unchecked") => shared_dir_fast_path_unchecked_config(),
         Ok("shared-dir-ranges") => shared_dir_ranges_config(),
@@ -5188,6 +5189,7 @@ fn sweep_config() {
         "delegated-root-crash" => delegated_root_crash_config(),
         "shared-dir" => shared_dir_config(),
         "shared-dir-split" => shared_dir_split_config(),
+        "shared-dir-default" => shared_dir_default_config(),
         "shared-dir-ranges" => shared_dir_ranges_config(),
         "shared-dir-faults" => shared_dir_faults_config(),
         "delegated-two-gens-root-crash" => delegated_two_gens_root_crash_config(),
@@ -6186,6 +6188,15 @@ fn shared_dir_split_config() -> SimConfig {
         check_range_bits: 2,
         core: std::sync::Arc::new(sim::run::placement_core_config),
         ..shared_dir_config()
+    }
+}
+
+/// The same workload under the production default: automatic hash-range
+/// splits off (ADR-38), the rest of the placement as in the split sims.
+fn shared_dir_default_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(sim::run::placement_default_split_core_config),
+        ..shared_dir_split_config()
     }
 }
 
@@ -7558,6 +7569,19 @@ fn shared_dir_is_split_into_ranges() {
     );
     assert!(t.place_splits > 0, "the placement never split: {t:?}");
     assert!(t.executed > 0, "range delegates never executed: {t:?}");
+}
+
+/// ADR-38: with the default configuration the placement never splits a
+/// hot shared directory, however hot, and the workload still converges
+/// and checks linearizable.
+#[test]
+fn shared_dir_is_not_split_by_default() {
+    let t = run_m11(
+        "shared-dir-default",
+        shared_dir_default_config(),
+        73_100..73_110,
+    );
+    assert_eq!(t.place_splits, 0, "the placement split by default: {t:?}");
 }
 
 /// M12 round 2: the root's fast path executes what the root owns and

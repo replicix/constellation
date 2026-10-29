@@ -1090,6 +1090,15 @@ impl Engine {
             }
         }
         core_config.strict_mounts = cto_strict;
+        // ADR-38: no hash-range splits under `--cto strict` (a strict
+        // listing of a split directory asks one sequencer only).
+        if cto_strict && core_config.placement_split_pct > 0 {
+            tracing::warn!(
+                CONSTELLATION_DELEGATION_SPLIT = core_config.placement_split_pct,
+                "CONSTELLATION_DELEGATION_SPLIT is ignored under --cto strict: a strict listing \
+                 of a split directory would miss names created in the other ranges"
+            );
+        }
         // Plan 31 C8: `LeaseMode::ForwardOnly` from the first op on.
         core_config.forward_only = profile.leases == crate::LeaseMode::ForwardOnly;
         // Plan 30 §M14: cluster locks need a P2P path to the sequencer.

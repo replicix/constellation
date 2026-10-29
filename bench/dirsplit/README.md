@@ -44,7 +44,7 @@ Configurations:
 | config | meaning |
 |---|---|
 | `a` | `CONSTELLATION_DELEGATION_SPLIT=0`: no hash-range split; the placement may still delegate the directory whole to a dominant writer (reported as `whole`) |
-| `b` | the default automatic placement (`SPLIT=20`); reports whether a split fired |
+| `b` | the automatic placement with splits turned on, `CONSTELLATION_DELEGATION_SPLIT=20` set explicitly (splits are off by default); reports whether a split fired |
 | `c` | a hand split, `N` ranges, range `i` delegated to writer `i` (for `own` that is the writer that dominates it) |
 | `d` | the directory delegated whole to `w0` |
 

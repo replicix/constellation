@@ -734,8 +734,9 @@ pub fn load_config(
     );
     // Plan 30 §M11 phase 2b: the placement's knobs.
     // Plan 30 §M12: on by default (a dominant writer's subtree moves to
-    // it, a hot shared directory splits into hash ranges);
-    // `CONSTELLATION_DELEGATION_PLACEMENT=off` pins the single sequencer.
+    // it); `CONSTELLATION_DELEGATION_PLACEMENT=off` pins the single
+    // sequencer. A hot shared directory splits into hash ranges only with
+    // `CONSTELLATION_DELEGATION_SPLIT` set (off by default, ADR-38).
     c.placement = c.delegation
         && !matches!(
             std::env::var("CONSTELLATION_DELEGATION_PLACEMENT")

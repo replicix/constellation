@@ -2,7 +2,7 @@
 # One cell of the directory-split matrix: REPS repetitions of a fresh
 # cluster mounted with SPLIT=0 running configurations a, c, d (their
 # order rotated per repetition), rename on a fresh cluster per
-# configuration, and a fresh cluster on the default SPLIT=20 running b
+# configuration, and a fresh cluster mounted with SPLIT=20 (set explicitly: the default is off) running b
 # (rename last), for every workload. One JSON line per phase goes
 # to $OUT/<label>.jsonl, the harness logs next to it.
 #

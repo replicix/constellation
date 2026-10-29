@@ -424,7 +424,14 @@ the margin (6 s at the defaults).
   sequencer (the root, or the delegate of its only delegated range), whose
   position does not cover the other ranges' streams: an entry another
   range's delegate acknowledged can be missing from it until the root
-  applies that stream. Lookups in it are strict.
+  applies that stream. Lookups in it are strict. Hash-range splits are
+  therefore not available with `--cto strict`
+  ([ADR-38](../../explanation/DECISIONS.md#adr-38-automatic-directory-hash-range-splits-are-off-by-default)):
+  on a node with a strict mount the placement never splits a directory,
+  whatever `CONSTELLATION_DELEGATION_SPLIT` says (a warning at mount
+  says so), and `constellation delegate --range` is refused there.
+  Delegating a directory whole stays allowed. Splits are off by default
+  anyway.
 - A degraded strict read can take the ReadIndex budget plus a session
   wait.
 - `--write-mode back` on the writer: its `close()` returns before the

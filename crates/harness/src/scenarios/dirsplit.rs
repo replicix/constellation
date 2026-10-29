@@ -13,8 +13,9 @@
 //!
 //! - `a`: hash-range splits off (`CONSTELLATION_DELEGATION_SPLIT=0`; the
 //!   placement still delegates subtrees);
-//! - `b`: the default automatic placement (`SPLIT=20`); the phase reports
-//!   whether a split fired;
+//! - `b`: the automatic placement with splits on (`SPLIT=20`, set
+//!   explicitly: splits are off by default); the phase reports whether a
+//!   split fired;
 //! - `c`: a hand split, one range per writer, range `i` to writer `i`;
 //! - `d`: the directory delegated whole to `w0`.
 //!
@@ -974,6 +975,7 @@ fn append(out: &std::path::Path, v: &Value) -> Result<()> {
 pub fn dirsplit_bench(_seed: u64) -> Result<()> {
     let spec = Spec::from_env()?;
     eprintln!("    {NAME}: {spec:?}");
+    // Splits are off by default (ADR-38): `b` turns them on explicitly.
     let split = if spec.configs == ['b'] { "20" } else { "0" };
     let mut cl = build_cluster(&spec, split)?;
     let result = (|| -> Result<()> {

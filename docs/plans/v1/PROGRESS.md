@@ -60888,3 +60888,24 @@ off right after the rename phase: 1,820 ops/s (257 to 300 before), root CPU 182 
 with `own` in place of the renames, 1,760 to 1,860. The drop from 2,100 to about 1,850 after any delegation phase is
 not the renames': the per-op ownership checks the tenure keeps once it delegated, and `Meta::dirty_snapshot` growing
 with the files written (left open).
+
+## Decision: automatic directory hash-range splits are off by default (plan 30 §M12, 2026-10-29)
+
+The directory-split benchmark (`bench/dirsplit/RESULTS.md`) found that a hash-range split of a directory never pays off on
+real names: a hand split ran at 0.01× to 0.91× the throughput of no split in every topology (T1 to T5), at 2, 4 and 8
+writers and at every root round trip up to 60 ms, and the crossover sweep showed the gap narrowing but not closing (and
+widening with a slower S3). Only names that hash into each writer's own range gain (1.2× to 60×), while delegating the
+directory whole gains 12× to 209× for writers far from the root. The maintainer decided to turn the automatic split off
+and keep it as an expert setting ([ADR-38](../../explanation/DECISIONS.md#adr-38-automatic-directory-hash-range-splits-are-off-by-default)).
+
+Under `--cto strict` (`Config::strict_mounts`) no range split exists at all: the placement ignores the knob (a warning at
+mount) and `constellation delegate --range` is refused, because a strict listing of a split directory asks one sequencer
+only and can miss a name another range's delegate just created. Core tests
+`the_placement_never_splits_under_cto_strict` and `a_manual_range_split_is_refused_under_cto_strict` failed before.
+
+`placement_split_pct` now defaults to 0 (`CONSTELLATION_DELEGATION_SPLIT=20` turns the placement's split back on; hand
+splits with `constellation delegate --range` are unaffected). DESIGN.md §"Hot shared directories", `delegations.md` and
+`configuration.md` say so, with the measured cost. Coverage kept: `placement_core_config` (the sims' placement) sets 20
+explicitly, `hash-range-split-merge` sets `CONSTELLATION_DELEGATION_SPLIT=20`, bench configuration `b` already did. New sim
+`shared_dir_is_not_split_by_default` (`AUTHORITY_SIM_CONFIG=shared-dir-default`) runs the split workload under the default
+and asserts `place_splits == 0`.

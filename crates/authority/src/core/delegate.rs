@@ -5190,6 +5190,17 @@ impl Core {
                 result: Err(msg),
             });
         };
+        // ADR-38: a directory split into ranges has no strict listing (one
+        // sequencer answers it, whose position does not cover the other
+        // ranges' streams), so none is split under `cto=strict`.
+        if range.bits > 0 && self.cfg.strict_mounts {
+            return fail(
+                out,
+                "a directory cannot be split into hash ranges under --cto strict \
+                 (delegate it whole instead)"
+                    .into(),
+            );
+        }
         match self.delegate_dir(now, dir, node, DelegKind::Manual, range, replica, out) {
             Ok(gen) => out.push(Action::ControlDone {
                 op,

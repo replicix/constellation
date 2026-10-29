@@ -99,8 +99,9 @@ dependency.
 ## Recommendation
 
 - Set automatic range splits off by default (`CONSTELLATION_DELEGATION_SPLIT=0`).
+  Done: [ADR-38](../../docs/explanation/DECISIONS.md#adr-38-automatic-directory-hash-range-splits-are-off-by-default).
 - Keep the hand split only as an explicit, expert setting, or remove plan 30
-  M12.
+  M12 (kept).
 - Rely on whole-directory and subtree delegation for directories whose
   writers are far from the root.
 
