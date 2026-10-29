@@ -33,6 +33,7 @@ mod ctlplane;
 /// The K5a fix round: a delegate that is the root's backup loses the
 /// root, or is handed off.
 mod delegroot;
+mod dirsplit;
 mod ec2;
 /// Plan 39: `fsync` under S3 outages (hard, soft, interrupted) and
 /// `fsyncdir`.
@@ -2281,6 +2282,13 @@ pub const SCENARIOS: &[Scenario] = &[
 /// The host-load campaign's own scenarios (`tools/load-campaign`): run by
 /// name only, never in the default catalog (nor the parity lanes).
 pub const CAMPAIGN: &[Scenario] = &[
+    Scenario {
+        name: "dirsplit-bench",
+        desc: "directory hash-range split benchmark (bench/dirsplit): a root and N writers placed on sites with per-node S3 latency and per-pair P2P delay; one hot directory per phase under splits off, the automatic placement, a hand split one range per writer, or the directory delegated whole; throughput, op latency, root CPU, S3 requests, errors, appended as JSON to DIRSPLIT_OUT (settings in DIRSPLIT_*; the process S3 backend and sudo tc)",
+        requires: &[],
+        caps: &[],
+        run: dirsplit::dirsplit_bench,
+    },
     Scenario {
         name: "load-probe",
         desc: "load campaign phase 0: two nodes write self-describing files (ledgered), rename, unlink and increment a flock'ed counter under the load profile; every checker runs (data, acknowledged writes after a remount, fsck, exclusion, errno classes (an ENOENT of a rename or unlink on a name the writer certainly owns is one), token order, lease epochs, the bucket log); CONSTELLATION_HARNESS_LOAD_PROBE_BREAK=<checker> breaks one on purpose",

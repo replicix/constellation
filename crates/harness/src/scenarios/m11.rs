@@ -1856,7 +1856,12 @@ pub fn designation_as_delegation(_seed: u64) -> Result<()> {
 // ------------------------------------------------------------ plan 30 M12
 
 /// `constellation delegate <path> --to <node> --range <idx>/<count>`.
-fn delegate_range(root: &Client, path: &str, node: u64, range: &str) -> Result<serde_json::Value> {
+pub(super) fn delegate_range(
+    root: &Client,
+    path: &str,
+    node: u64,
+    range: &str,
+) -> Result<serde_json::Value> {
     root.control(
         "designation.delegate",
         serde_json::json!({"path": path, "node": node, "range": range}),
@@ -1870,7 +1875,7 @@ fn delegate_range(root: &Client, path: &str, node: u64, range: &str) -> Result<s
 }
 
 /// Wait until `delegate` holds a live grant on range `range` of `path`.
-fn wait_installed_range(
+pub(super) fn wait_installed_range(
     delegate: &Client,
     path: &str,
     range: &str,

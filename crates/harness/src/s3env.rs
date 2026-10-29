@@ -481,6 +481,26 @@ impl S3Env {
         Ok(p)
     }
 
+    /// A toxiproxy route of its own to the S3 server, `latency_ms` (with
+    /// `jitter_ms`) added each way: one per node, for benchmarks that
+    /// place nodes at different distances from S3 (`dirsplit-bench`).
+    /// The process backend only (the docker one publishes two ports).
+    /// Returns the `host:port` it listens on.
+    pub fn site_proxy(&self, name: &str, latency_ms: u64, jitter_ms: u64) -> Result<String> {
+        anyhow::ensure!(
+            self.backend == S3Backend::Process,
+            "per-node S3 routes need the process backend (--s3-backend process)"
+        );
+        let listen = format!("127.0.0.1:{}", free_ports(1)?[0]);
+        let p = self
+            .toxiproxy
+            .create_proxy(name, &listen, &self.proxy_upstream)?;
+        if latency_ms > 0 {
+            p.latency(latency_ms, jitter_ms)?;
+        }
+        Ok(listen)
+    }
+
     /// The S3 proxy [`Self::s3_proxy`] created (for toxics on it later).
     pub fn existing_s3_proxy(&self) -> Proxy<'_> {
         self.toxiproxy.proxy("s3")
