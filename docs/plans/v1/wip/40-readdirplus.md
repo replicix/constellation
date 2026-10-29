@@ -1245,7 +1245,8 @@ Acceptance (R8, per host file system and kernel):
 
 Decide before the executor starts:
 
-- **Plain-page semantics under the new listing** (§4.9): listings become
+- **Resolved — plain-page semantics under the new listing** (§4.9; accepted
+  by the maintainer 2026-10-29, as built in R3a/R3b): listings become
   name-ordered (today: cookie order), entries created ahead of a running
   listing appear and behind it do not, a renamed name may appear twice.
   While a directory is open its cookies stay resolvable (pinned), so
@@ -1256,7 +1257,7 @@ Decide before the executor starts:
   handover) whose resume entry was also deleted; an `nfsd` re-export
   cookie whose entry was deleted and whose unpinned hint was evicted; a
   `seekdir` back into a directory's overflowed pin region to a deleted
-  entry. Accept?
+  entry. Accepted.
 - **Resolved — the first upgrade across R2 is a remount, and so is the
   first across R3b; a listing paused across the first upgrade after the
   keyed cookies land gets one error (accepted as "one `ESTALE`"; `ENOENT`
