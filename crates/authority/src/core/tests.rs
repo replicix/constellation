@@ -35631,6 +35631,112 @@ fn the_gate_holds_a_create_record_behind_a_held_unlink_record_of_the_same_name()
     the_gate_keeps_a_name_s_order(&mut h, inos, queue);
 }
 
+/// Queue `queue` on a holder at epoch 1 with `d` delegated to node 3
+/// (generation 5): the gate holds its first entry (`d`'s delegate
+/// sequences it) and the second behind it, unrefused; once the delegation
+/// ended both run, in order.
+fn the_gate_runs_a_held_entry_s_dependent_after_it(
+    queue: impl Fn(&Harness, u64) -> [MutateOp; 2],
+) -> (Harness, u64, [MutateOp; 2]) {
+    let mut h = Harness::new(1);
+    h.core.cfg.delegation = true;
+    h.hold(1, None);
+    let d = h.meta.allocate_ino(ROOT_INO).unwrap();
+    let mkdir = MutateOp::Mkdir {
+        parent: ROOT_INO,
+        name: "d".into(),
+        ino: d,
+        mode: 0o755,
+        uid: 0,
+        gid: 0,
+    };
+    constellation_meta::execute_mutate(&h.meta, &mkdir, None).unwrap();
+    list_generation(&h, d, 5);
+    let queue = queue(&h, d);
+    for (seq, op) in (1..).zip(&queue) {
+        h.meta
+            .queue_replay(h.rid(seq), op, &Default::default())
+            .unwrap();
+    }
+    run_the_gate(&mut h);
+    let queued = h.meta.pending_replays().unwrap();
+    assert_eq!(queued_rids(&h), vec![h.rid(1), h.rid(2)], "both held");
+    assert!(
+        queued.iter().all(|q| q.refused.is_none()),
+        "the second entry ran ahead of the first: {queued:?}"
+    );
+    h.meta
+        .apply_records_journaled(&[LogRecord::Recall { dir: d, gen: 5 }])
+        .unwrap();
+    run_the_gate(&mut h);
+    assert!(queued_rids(&h).is_empty());
+    (h, d, queue)
+}
+
+/// The op form of a create names its new inode but its keys leave it out:
+/// the gate held a mkdir of `d/s` (`d` delegated) and ran the create of
+/// `s/y` queued after it, which resolved to the root (`s` is not there
+/// yet): `ENOENT`, a conflict copy, and the drain made `s` afterwards. The
+/// gate counts the created inode in its order keys.
+#[test]
+fn the_gate_holds_a_create_inside_a_directory_a_held_mkdir_makes() {
+    let (h, d, _) = the_gate_runs_a_held_entry_s_dependent_after_it(|h, d| {
+        let s = h.meta.allocate_ino(d).unwrap();
+        [
+            MutateOp::Mkdir {
+                parent: d,
+                name: "s".into(),
+                ino: s,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+            },
+            MutateOp::Create {
+                parent: s,
+                name: "y".into(),
+                ino: h.meta.allocate_ino(s).unwrap(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+        ]
+    });
+    let s = h.meta.child_ino(d, "s").unwrap().expect("made");
+    assert!(h.meta.child_ino(s, "y").unwrap().is_some());
+}
+
+/// A setattr of the file a held create makes waits for it the same way.
+#[test]
+fn the_gate_holds_a_setattr_of_the_file_a_held_create_makes() {
+    let (h, d, queue) = the_gate_runs_a_held_entry_s_dependent_after_it(|h, d| {
+        let x = h.meta.allocate_ino(d).unwrap();
+        [
+            MutateOp::Create {
+                parent: d,
+                name: "x".into(),
+                ino: x,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            MutateOp::Setattr {
+                ino: x,
+                mode: Some(0o600),
+                uid: None,
+                gid: None,
+                size: None,
+                atime_ns: None,
+                mtime_ns: None,
+            },
+        ]
+    });
+    let MutateOp::Create { ino: x, .. } = queue[0] else {
+        unreachable!()
+    };
+    assert_eq!(h.meta.child_ino(d, "x").unwrap(), Some(x));
+    assert_eq!(h.meta.getattr(x).unwrap().unwrap().mode & 0o7777, 0o600);
+}
+
 /// Submit the marker's replay (`q`) with the recorded `deps`, as the drain
 /// does; it stays in flight (parked on a row of a live generation).
 fn submit_the_replay(

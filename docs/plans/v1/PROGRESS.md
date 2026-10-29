@@ -60805,3 +60805,16 @@ takeover gate kept per-key order (the fix above): a held unlink record no longer
 name first. Core test `the_gate_holds_a_create_record_behind_a_held_unlink_record_of_the_same_name` (the op form's
 queue as `Records`) failed with this fix and without the gate's: the create record, applied unconditionally, replaced
 the name the held unlink record would then remove.
+
+## Fix: the takeover gate's order keys count the inode an entry creates (plan 30 M8 under M11, 2026-10-29)
+
+From the review of the gate's per-key order (above). The op forms of a create, mkdir, symlink or mknod name their new
+inode, but their keys (`TouchSet::from_op`, so `conflict_keys`) leave it out; the `Records` form counts it. So a held
+mkdir of `d/s` (`d` delegated to another node) did not hold a later create in `s`, a rename into it or a mkdir in it,
+and a held create of a file did not hold a later setattr, manifest commit, xattr change or link of it: the later entry
+resolved to the root (an inode not created yet has no delegated parent), ran in the gate, was refused `ENOENT` and
+became a conflict copy, and the drain created the directory or file afterwards. `replay_queue_locally` adds the created
+inode to the entry's order keys only; the ownership keys leave it out. The held keys are kept as one union `TouchSet`
+(an overlap with a union is an overlap with one of its sets). Core tests
+`the_gate_holds_a_create_inside_a_directory_a_held_mkdir_makes` and
+`the_gate_holds_a_setattr_of_the_file_a_held_create_makes` failed before (the later entry refused `ENOENT`).

@@ -607,12 +607,17 @@ impl Core {
             constellation_fs_core::Ino,
             (Vec<u8>, Vec<u8>),
         > = Default::default();
-        // The keys of the entries left queued so far.
-        let mut held_keys: Vec<constellation_meta::TouchSet> = Vec::new();
+        // The keys of the entries left queued so far, as one set (an
+        // overlap with a union is an overlap with one of its sets).
+        let mut held_keys = constellation_meta::TouchSet::default();
         for queued in &queue {
             // The entry's own keys (a folded truncate's too, whatever it
-            // replays as).
-            let keys = super::client::conflict_keys(&queued.op, replica);
+            // replays as), with the inode it creates: a later entry in a
+            // directory, or on a file, that a held entry creates runs after
+            // it. (Only here: an inode not created yet resolves to the root,
+            // so the ownership keys leave it out.)
+            let mut keys = super::client::conflict_keys(&queued.op, replica);
+            keys.inos.extend(created_ino(&queued.op));
             let held = &mut Held {
                 keys,
                 held: &mut held_keys,
@@ -836,18 +841,33 @@ impl Core {
 /// it (`held`).
 struct Held<'a> {
     keys: constellation_meta::TouchSet,
-    held: &'a mut Vec<constellation_meta::TouchSet>,
+    held: &'a mut constellation_meta::TouchSet,
 }
 
 impl Held<'_> {
     /// Whether an earlier entry left to the drain shares a key with this one.
     fn overlaps(&self) -> bool {
-        self.held.iter().any(|h| h.overlaps(&self.keys))
+        self.held.overlaps(&self.keys)
     }
 
     /// This entry is left to the drain: the later ones on its keys wait
     /// for it.
     fn hold(&mut self) {
-        self.held.push(std::mem::take(&mut self.keys));
+        let keys = std::mem::take(&mut self.keys);
+        self.held.dentries.extend(keys.dentries);
+        self.held.inos.extend(keys.inos);
+        self.held.shared.extend(keys.shared);
+    }
+}
+
+/// The inode `op` creates (its new name's): the op form names it, but its
+/// keys leave it out (`TouchSet::from_op`; the `Records` form counts it).
+fn created_ino(op: &MutateOp) -> Option<constellation_fs_core::Ino> {
+    match op {
+        MutateOp::Create { ino, .. }
+        | MutateOp::Mkdir { ino, .. }
+        | MutateOp::Symlink { ino, .. }
+        | MutateOp::Mknod { ino, .. } => Some(*ino),
+        _ => None,
     }
 }
