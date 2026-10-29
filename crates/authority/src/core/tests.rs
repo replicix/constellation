@@ -8304,6 +8304,225 @@ mod cto {
         // 4 s of the lease left on the honour clock, less the 1 s margin.
         assert_eq!(g.ttl_ms, 3_000, "{outcome:?}");
     }
+
+    /// A holder (delegation on) with directory `p` and a file `f` in it;
+    /// node 2 scanned `p` strictly and holds this holder's grants on `p`
+    /// and, by the read-ahead, on `f`.
+    fn holder_with_scanned_dir() -> (Harness, Ino, Ino, Vec<u64>) {
+        let (mut h, _) = holder_with_file();
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let dir = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let mkdir = MutateOp::Mkdir {
+            parent: ROOT_INO,
+            name: "p".into(),
+            ino: dir,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+        };
+        constellation_meta::execute_mutate(&h.meta, &mkdir, None).unwrap();
+        let file = h.meta.allocate_ino(dir).unwrap();
+        let create = MutateOp::Create {
+            parent: dir,
+            name: "f".into(),
+            ino: file,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        constellation_meta::execute_mutate(&h.meta, &create, None).unwrap();
+        let outcome = ask_in(&mut h, 2, 1, (dir, true, None), ReadAhead::Listing);
+        let mut grants = vec![grant_of(&outcome).id];
+        let a = ahead_of(&outcome);
+        assert_eq!(a.grants.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [file]);
+        grants.extend(a.grants.iter().map(|(_, g)| *g));
+        (h, dir, file, grants)
+    }
+
+    fn deleg_renewed_ttl(out: &[Action], to: NodeId, gen: u64) -> Option<u64> {
+        sends(out).into_iter().find_map(|(n, m)| match m {
+            PeerMsg::DelegRenewed { gen: g, ttl_ms, .. } if n == to && *g == gen => Some(*ttl_ms),
+            _ => None,
+        })
+    }
+
+    /// The root's read delegations on a subtree it delegates (strict close-to-open
+    /// across M11): node 2 scanned `p` and holds the root's grants on `p`
+    /// and `f` when the root delegates `p` to node 3. Node 3's writes to
+    /// `f` are its own to acknowledge, and they consult only node 3's
+    /// table, so the root's grants must be gone before node 3 may execute
+    /// anything: they are recalled when the delegation is made, and the
+    /// delegate's first granting renewal waits for the recalls. Fails on
+    /// the parent: no recall, and the renewal is granted at once, so node 3
+    /// acknowledged a write to `f` that node 2 then opened under the
+    /// root's grant (5 s), at the old state.
+    #[test]
+    fn delegating_a_subtree_recalls_the_roots_read_grants_before_the_first_renewal() {
+        let (mut h, dir, file, grants) = holder_with_scanned_dir();
+        let out = h.step(Event::Control {
+            op: OpId(900),
+            req: Control::Delegate {
+                dir,
+                node: 3,
+                range: (0, 0),
+            },
+        });
+        assert!(
+            out.iter().any(|a| matches!(
+                a,
+                Action::ControlDone {
+                    op: OpId(900),
+                    result: Ok(_)
+                }
+            )),
+            "not delegated: {out:?}"
+        );
+        let gen = h.meta.delegation_table().get(dir).expect("delegated").gen;
+        let rs = recalls(&out);
+        let mut recalled: Vec<(NodeId, Ino, u64)> =
+            rs.iter().map(|(to, _, ino, g)| (*to, *ino, *g)).collect();
+        recalled.sort_unstable();
+        let mut want = vec![(2, dir, grants[0]), (2, file, grants[1])];
+        want.sort_unstable();
+        assert_eq!(recalled, want, "the subtree's grants are recalled: {out:?}");
+        // The delegate's first renewal waits for them.
+        h.advance(5);
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRenew {
+                req: OpId(31),
+                gen,
+                round: 0,
+                backup: None,
+                stream_head: 0,
+                stream_head_at: 0,
+            },
+        });
+        assert_eq!(
+            deleg_renewed_ttl(&out, 3, gen),
+            None,
+            "the delegate was granted with the root's read grants live: {out:?}"
+        );
+        // One recall answered: still waiting.
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegationRecalled { req: rs[0].1 },
+        });
+        assert_eq!(deleg_renewed_ttl(&out, 3, gen), None, "{out:?}");
+        // The other: granted, to the renewal that waited.
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegationRecalled { req: rs[1].1 },
+        });
+        assert!(
+            deleg_renewed_ttl(&out, 3, gen).is_some_and(|t| t > 0),
+            "the waiting renewal is answered: {out:?}"
+        );
+        // The root grants nothing more under the subtree: node 2 is sent
+        // to the delegate.
+        assert!(
+            matches!(
+                ask(&mut h, 2, 40, file),
+                ReadIndexOutcome::NotHolder { holder: 3 }
+            ),
+            "the root answered for the delegated file"
+        );
+        // Later renewals are answered at once.
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRenew {
+                req: OpId(32),
+                gen,
+                round: 0,
+                backup: None,
+                stream_head: 0,
+                stream_head_at: 0,
+            },
+        });
+        assert!(
+            deleg_renewed_ttl(&out, 3, gen).is_some_and(|t| t > 0),
+            "{out:?}"
+        );
+    }
+
+    /// The same for a recall that goes unanswered (node 2 cut off): the
+    /// first renewal is answered once the grant is outwaited.
+    #[test]
+    fn a_delegations_first_renewal_outwaits_an_unanswered_read_grant_recall() {
+        let (mut h, dir, _file, _grants) = holder_with_scanned_dir();
+        let out = h.step(Event::Control {
+            op: OpId(900),
+            req: Control::Delegate {
+                dir,
+                node: 3,
+                range: (0, 0),
+            },
+        });
+        let expiries = timers(&out, TimerKind::GrantExpiry);
+        assert_eq!(expiries.len(), 2, "{out:?}");
+        let gen = h.meta.delegation_table().get(dir).expect("delegated").gen;
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRenew {
+                req: OpId(31),
+                gen,
+                round: 0,
+                backup: None,
+                stream_head: 0,
+                stream_head_at: 0,
+            },
+        });
+        assert_eq!(deleg_renewed_ttl(&out, 3, gen), None, "{out:?}");
+        h.advance(6_100);
+        let mut out = h.step(Event::Timer { id: expiries[0] });
+        out.extend(h.step(Event::Timer { id: expiries[1] }));
+        assert!(
+            deleg_renewed_ttl(&out, 3, gen).is_some(),
+            "the waiting renewal is answered once the grants are outwaited: {out:?}"
+        );
+    }
+
+    /// A designation (which its designee honours from the moment it
+    /// installs it, with no renewal) is not journaled while the root's
+    /// grants under the directory are live: they are recalled, the root
+    /// grants nothing more under it, and the next sync delegates. Fails
+    /// on the parent: the designation is journaled at once.
+    #[test]
+    fn a_designation_waits_for_the_roots_read_grants_under_it() {
+        let (mut h, dir, file, _grants) = holder_with_scanned_dir();
+        let sync = |h: &mut Harness| {
+            h.step(Event::Control {
+                op: OpId(901),
+                req: Control::SyncDesignations {
+                    entries: vec![(dir, 3)],
+                },
+            })
+        };
+        let out = sync(&mut h);
+        assert!(
+            h.meta.delegation_table().get(dir).is_none(),
+            "designated with the root's read grants under it live"
+        );
+        let rs = recalls(&out);
+        assert_eq!(rs.len(), 2, "{out:?}");
+        // No new grant under the directory meanwhile.
+        let outcome = ask(&mut h, 4, 41, file);
+        assert!(
+            matches!(outcome, ReadIndexOutcome::Ok { grant: None, .. }),
+            "{outcome:?}"
+        );
+        for (_, req, _, _) in &rs {
+            h.step(Event::Peer {
+                from: 2,
+                msg: PeerMsg::DelegationRecalled { req: *req },
+            });
+        }
+        // Node 4's read granted nothing, so nothing is left to recall.
+        sync(&mut h);
+        let d = h.meta.delegation_table().get(dir).expect("designated");
+        assert!(d.designated && d.node == 3, "{d:?}");
+    }
 }
 
 /// Plan 30 §M9 + §M10: the claim rule for continuation epochs and the

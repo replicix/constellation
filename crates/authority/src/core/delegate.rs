@@ -63,7 +63,7 @@ use constellation_fs_core::Ino;
 use constellation_meta::delegation::{Ownership, Range};
 use constellation_meta::locks::LockTag;
 use constellation_meta::{
-    LogRecord, MetaError, MutateOp, MutateOutcome, OwnChunks, Position, Rid, TouchSet,
+    LogRecord, MetaError, MutateOp, MutateOutcome, OwnChunks, Position, RecallNeed, Rid, TouchSet,
 };
 use constellation_types::Code;
 use std::collections::{BTreeMap, BTreeSet};
@@ -145,6 +145,14 @@ pub(crate) struct GenState {
     pub recall_req: Option<OpId>,
     /// `Undelegate` controls answered when the generation ends.
     pub controls: Vec<OpId>,
+    /// The read delegations (M8) this root granted on the subtree before
+    /// it delegated it, being recalled (`Core::delegate_dir`): the
+    /// delegate's writes recall only its own table's, so no renewal is
+    /// granted while one of these is live.
+    pub read_recalls: BTreeSet<u64>,
+    /// The delegate's renewal that waits for `read_recalls`, answered
+    /// when the last of them is gone.
+    pub renew_waiting: Option<(NodeId, OpId, u64, RenewFrom)>,
 }
 
 /// Plan 43 C2: a generation's configuration as the root knows it (the
@@ -427,6 +435,7 @@ impl DelegationState {
             ),
             ("dl_backing", self.backing.len()),
             ("dl_sealed", self.sealed.len()),
+            ("dl_designating", self.designating.len()),
         ]
     }
 }
@@ -453,6 +462,11 @@ pub(crate) struct DelegationState {
     /// and the lock floor the latest carried (`Core::deleg_settled`).
     answered_granting: BTreeSet<u64>,
     floor_sent: BTreeMap<u64, Position>,
+    /// Designations not journaled yet because this root's read
+    /// delegations under the directory were live (`Core::delegate_dir`):
+    /// directory → designee. No read delegation is granted under one
+    /// meanwhile, so the next sync can journal it.
+    pub designating: BTreeMap<Ino, NodeId>,
     /// Whether a certificate is published (`Core::deleg_publish_root`).
     cert_set: bool,
     /// The generations this node is the delegate of.
@@ -801,6 +815,8 @@ impl Core {
                         expiry: None,
                         recall_req: None,
                         controls: Vec::new(),
+                        read_recalls: BTreeSet::new(),
+                        renew_waiting: None,
                     },
                 );
                 self.stats.deleg_inherited += 1;
@@ -2954,6 +2970,9 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        if self.deleg_renew_waits_for_reads(now, from, req, gen, round, source, replica) {
+            return;
+        }
         let mut ttl_ms = 0u64;
         let mut hold = None;
         let mut group_change: Option<(Ino, Vec<NodeId>)> = None;
@@ -5140,6 +5159,26 @@ impl Core {
                 ));
             }
         }
+        // Plan 30 §M8 under M11: the read delegations this root granted
+        // under `dir` must be gone before the delegate executes, since its
+        // writes recall only the grants in its own table. A designee
+        // executes from the moment it installs the record (no renewal), so
+        // a designation is journaled only once there are none: they are
+        // recalled, nothing more is granted under `dir`, and the next sync
+        // delegates. Any other generation is journaled now (nothing more
+        // is granted under it from here) and its first renewal waits.
+        let read_grants = self.read_grants_under(now, dir, replica);
+        if kind == DelegKind::Designated {
+            if !read_grants.grants.is_empty() {
+                self.dl.designating.insert(dir, node);
+                let n = read_grants.grants.len();
+                self.start_recalls(now, read_grants, out);
+                return Err(format!(
+                    "{n} read delegations under directory {dir} are being recalled"
+                ));
+            }
+            self.dl.designating.remove(&dir);
+        }
         // Above every generation the log ever named (a predecessor's
         // ended ones included): a generation is a stream's identity.
         let highest = table.max_gen();
@@ -5160,6 +5199,10 @@ impl Core {
                 None,
             )
             .map_err(|e| e.to_string())?;
+        let read_recalls = self
+            .start_recalls(now, read_grants, out)
+            .map(|(ids, _)| ids)
+            .unwrap_or_default();
         let first_until = now.wait.plus(self.reclaim_horizon_ms());
         self.dw
             .insert(gen, node, first_until, first_until, !designated);
@@ -5183,6 +5226,8 @@ impl Core {
                 expiry: None,
                 recall_req: None,
                 controls: Vec::new(),
+                read_recalls,
+                renew_waiting: None,
             },
         );
         self.arm_gen_expiry(now, gen, out);
@@ -5217,6 +5262,100 @@ impl Core {
         self.cfg.delegation_ttl_ms + self.cfg.expiry_margin_ms
     }
 
+    /// The live read delegations (M8) this root granted on `dir` or on
+    /// anything under it, to other nodes (a walk up from each grant's
+    /// inode: bounded by the grants, not by the subtree).
+    fn read_grants_under(&self, now: Now, dir: Ino, replica: &dyn Replica) -> RecallNeed {
+        if !self.cfg.read_delegations || !self.cfg.recall_before_ack {
+            return RecallNeed::default();
+        }
+        let ns = replica.namespace();
+        let grants = replica
+            .read_delegations()
+            .all_live(now.wait)
+            .grants
+            .into_iter()
+            .filter(|g| is_under(ns, g.ino, dir))
+            .collect();
+        RecallNeed {
+            grants,
+            quarantine_until: None,
+        }
+    }
+
+    /// Whether `ino` is under a designation waiting for this root's read
+    /// delegations to be recalled ([`DelegationState::designating`]): no
+    /// read delegation is granted on it.
+    pub(crate) fn under_pending_designation(&self, ino: Ino, replica: &dyn Replica) -> bool {
+        !self.dl.designating.is_empty()
+            && self
+                .dl
+                .designating
+                .keys()
+                .any(|dir| is_under(replica.namespace(), ino, *dir))
+    }
+
+    /// A delegate's renewal of `gen` must wait for the root's read
+    /// delegations on the subtree to be recalled
+    /// ([`GenState::read_recalls`]): `true` if it was set aside, to be
+    /// answered when the last of them is gone.
+    #[allow(clippy::too_many_arguments)]
+    fn deleg_renew_waits_for_reads(
+        &mut self,
+        now: Now,
+        from: NodeId,
+        req: OpId,
+        gen: u64,
+        round: u64,
+        source: RenewFrom,
+        replica: &dyn Replica,
+    ) -> bool {
+        let Some(g) = self.dl.gens.get_mut(&gen) else {
+            return false;
+        };
+        if g.read_recalls.is_empty() {
+            return false;
+        }
+        let table = replica.read_delegations();
+        g.read_recalls.retain(|id| table.is_live(*id, now.wait));
+        if g.read_recalls.is_empty() || g.node != from {
+            return false;
+        }
+        tracing::debug!(
+            node = self.cfg.node_id,
+            from,
+            gen,
+            ?req,
+            grants = g.read_recalls.len(),
+            "delegation renewal waits for the subtree's read delegations"
+        );
+        g.renew_waiting = Some((from, req, round, source));
+        self.stats.deleg_renew_read_waits += 1;
+        true
+    }
+
+    /// Read delegation `id` was recalled or outwaited: a renewal that
+    /// waited for it, and for nothing else, is answered.
+    pub(crate) fn deleg_read_grant_gone(
+        &mut self,
+        now: Now,
+        id: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let mut ready = Vec::new();
+        for (gen, g) in self.dl.gens.iter_mut() {
+            if g.read_recalls.remove(&id) && g.read_recalls.is_empty() {
+                if let Some(w) = g.renew_waiting.take() {
+                    ready.push((*gen, w));
+                }
+            }
+        }
+        for (gen, (from, req, round, source)) in ready {
+            self.on_deleg_renew(now, from, req, gen, round, source, replica, out);
+        }
+    }
+
     /// Phase 2b: keep the table in step with the offline designations
     /// (plans 03–05): a live write designation becomes a designated
     /// generation to its designee (unless the designee is this root:
@@ -5233,6 +5372,11 @@ impl Core {
         if !self.cfg.delegation || !self.root_usable(now) {
             return;
         }
+        // A designation waiting for read recalls that is no longer listed
+        // (or names another designee) holds no grant back any more.
+        self.dl
+            .designating
+            .retain(|dir, node| entries.contains(&(*dir, *node)));
         let table = replica.delegation_table();
         for &(dir, node) in entries {
             if node == self.me() {
@@ -5439,6 +5583,7 @@ impl Core {
         self.dw.clear();
         self.dl.answered_granting.clear();
         self.dl.floor_sent.clear();
+        self.dl.designating.clear();
         self.dl.cert_set = false;
         for (_, g) in std::mem::take(&mut self.dl.gens) {
             if let Some(t) = g.expiry {

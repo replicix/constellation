@@ -60645,3 +60645,36 @@ the reader, within its first 5 s). `ReadDelegations::touching` scans the live gr
 Left open: a delegated subtree still pays a round trip per child (the delegate answers, and does not batch); a lookup of
 a single name after a sibling's miss asks for 128 grants, which random access over a big directory does not use; the
 cost of the grant table's linear `touching` with tens of thousands of live grants is not measured.
+
+## Fix: a delegated subtree's writes left the root's read delegations under it live (plan 30 M8 under M11, 2026-10-29)
+
+A code review suspected, and reading confirmed, a strict close-to-open hole at a change of sequencer. `Core::delegate_dir`
+journaled the `Delegate` record and handed the subtree's lock grants over, but left the read delegations the root had
+granted under the directory in the root's table. The delegate's writes recall only the grants in its own table
+(`deleg_read_recall_pending` and the delegate's fast path both ask `replica.read_delegations()` on the delegate), and
+the root, which stops granting under a live delegation (`deleg_read_owner`), never looked at those grants again. So a
+reader that had scanned `p` under `--cto strict` (since 7332731e the read-ahead grants up to 128 of its files at once)
+could open a file the new delegate had just changed and acknowledged, under the root's grant (5 s), and see the old
+state. Placement, range splits, re-delegations after a cross-subtree op and designations all go through `delegate_dir`.
+The other direction was already covered: a delegate answers the root's recall only after recalling every grant it made
+(`on_deleg_recall`), a stopped generation grants nothing (`my_generation_for`), and an outwaited one's grants are capped
+by its window.
+
+The root now recalls its live grants on the directory and on everything under it when it delegates (a walk up from
+each grant's inode, so the cost is the number of live grants, not the size of the subtree), and leaves the delegate's
+first renewal unanswered until they are recalled or outwaited (`GenState::read_recalls`, answered from `grant_done`).
+The delegate executes nothing, on its core or on its fast path, before a granting renewal, and the off-core lane never
+makes the first one. A designee executes from the moment it installs its record, with no renewal, so a designation is
+journaled only when no grant under its directory is live: the root recalls them, grants nothing under the directory
+meanwhile (`DelegationState::designating`), and the next sync (every 10 s) delegates. A delegation with no grant under
+it is not delayed at all.
+
+Tests (core, each failing on the parent): `delegating_a_subtree_recalls_the_roots_read_grants_before_the_first_renewal`
+(a listing's grants on `p` and on `f` by read-ahead are recalled at the delegation, the delegate's renewal waits for
+both acks, the root then redirects node 2 to the delegate, later renewals are answered at once),
+`a_delegations_first_renewal_outwaits_an_unanswered_read_grant_recall`,
+`a_designation_waits_for_the_roots_read_grants_under_it`. `cto-modes.md` gained the rule.
+
+Left open: a split directory's own grant. With its ranges delegated, the directory's inode resolves to every range
+(cross-subtree), so the root still answers and grants a strict read of the directory itself, and a range delegate's
+create there recalls only its own table's grants. Not verified; it needs its own look.

@@ -299,6 +299,19 @@ retries the same rid (see
 [Forwarded mutations](forwarded-mutations.md#wire-messages)). The
 requester's retry is answered from dedup once the wait is over.
 
+A change of sequencer for a subtree keeps the rule. A delegate's writes
+recall only the delegations in its own table, so when the root
+delegates a subtree (an operator, the placement, a range split, a
+re-delegation) it recalls its own delegations on the directory and
+everything under it, and grants the delegate's first renewal (before
+which the delegate executes nothing) only once they are recalled or
+outwaited. A designee executes from the moment it installs its
+designation, so the root journals a designation only when none of its
+delegations under the directory is live: it recalls them, grants none
+under the directory meanwhile, and the next sync delegates. In the
+other direction, a delegate answers the root's recall of its subtree
+only once the delegations it granted are recalled.
+
 A successor that takes the lease over before it expired (a sealed
 backup, or `ack=s3`) waits out the previous tenure's grant horizon
 before it acknowledges a mutation, if that tenure granted any (the

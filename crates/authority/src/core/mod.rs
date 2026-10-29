@@ -897,6 +897,9 @@ pub struct Stats {
     pub deleg_stream_refused: u64,
     pub deleg_renewals: u64,
     pub deleg_renewals_refused: u64,
+    /// Root: first renewals of a generation that waited for the root's
+    /// read delegations on the subtree to be recalled.
+    pub deleg_renew_read_waits: u64,
     /// Renewals the off-core lane sent while the core was stuck in a step
     /// ([`Core::on_deleg_renew_sent_off_core`]).
     pub deleg_renewals_off_core: u64,

@@ -481,6 +481,7 @@ impl Core {
                     .get(ino)
                     .is_some_and(|until| *until > now.wait)
                     && self.deleg_read_owner(now, *ino, None, replica).is_none()
+                    && !self.under_pending_designation(*ino, replica)
             })
             .collect();
         if inos.is_empty() {
@@ -521,6 +522,7 @@ impl Core {
             .blocked
             .get(&ino)
             .is_some_and(|until| *until > now.wait)
+            || self.under_pending_designation(ino, replica)
         {
             return None;
         }
@@ -1637,6 +1639,7 @@ impl Core {
         for p in self.rd.parked.values_mut() {
             p.waiting.remove(&id);
         }
+        self.deleg_read_grant_gone(now, id, replica, out);
         self.complete_ready(now, replica, out);
     }
 
