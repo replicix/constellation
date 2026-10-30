@@ -461,6 +461,24 @@ impl NlinkCounts {
     }
 }
 
+/// Whether a directory's `st_nlink` under `base` counts its
+/// subdirectories (`2 + subdirectories`, as ext4, xfs, tmpfs and
+/// Constellation keep it); btrfs answers 1 for every directory, where
+/// [`nlink_race`]'s check cannot hold. Probed by making a subdirectory in a
+/// fresh directory, removed again.
+pub fn counts_subdirectory_links(base: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let probe = base.join(".nlink-probe");
+    std::fs::create_dir(&probe).with_context(|| format!("mkdir {}", probe.display()))?;
+    let before = std::fs::metadata(&probe)?.nlink();
+    let made = std::fs::create_dir(probe.join("d"));
+    let after = std::fs::metadata(&probe)?.nlink();
+    let _ = std::fs::remove_dir(probe.join("d"));
+    std::fs::remove_dir(&probe)?;
+    made?;
+    Ok(after == before + 1)
+}
+
 /// Directories `nlink_race` works in.
 const NLINK_DIRS: usize = 4;
 
@@ -843,9 +861,39 @@ mod tests {
         }
         let (pages, differing) = reopen_matches_view(&f).unwrap();
         assert_eq!((pages, differing), (PAGES, 0));
+        // `nlink_race`'s check is `st_nlink == 2 + children`, which holds
+        // only where a directory counts its subdirectories' `..` links: btrfs
+        // answers 1 for every directory, and the check then fails on every
+        // `statx` (Constellation, and the ext4 primary of plan 42 §7.3, do
+        // count them).
+        if !counts_subdirectory_links(dir.path()).unwrap() {
+            eprintln!(
+                "skipping nlink_race: {} does not count subdirectory links in st_nlink",
+                dir.path().display()
+            );
+            return;
+        }
         let n = nlink_race(dir.path(), 1, 4, false, 3).unwrap();
         assert!(n.stats > 0 && n.changes > 0);
         assert_eq!(n.mismatches, 0);
+    }
+
+    /// The probe on the test's own temp dir agrees with what a
+    /// subdirectory does to its parent's link count there.
+    #[test]
+    fn the_link_count_probe_matches_the_file_system() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let counts = counts_subdirectory_links(dir.path()).unwrap();
+        let before = std::fs::metadata(dir.path()).unwrap().nlink();
+        std::fs::create_dir(dir.path().join("x")).unwrap();
+        let after = std::fs::metadata(dir.path()).unwrap().nlink();
+        assert_eq!(counts, after == before + 1);
+        assert_eq!(
+            dir.path().read_dir().unwrap().count(),
+            1,
+            "the probe cleans up"
+        );
     }
 }
 
