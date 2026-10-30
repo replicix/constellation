@@ -41703,9 +41703,33 @@ mod deleg_windows_tests {
             "{refused:?}"
         );
         assert!(!h.core.dl.gens[&7].ended);
-        // Confirmed from elsewhere: forced.
+        // The link drops (member 4 is cut from the root only): the driver's
+        // directory forgets its last exchange, this root does not.
+        h.step(Event::Peers {
+            links: vec![crate::event::PeerLink {
+                node: 4,
+                connected: false,
+                last_seen: None,
+                rtt_ms: None,
+                since: None,
+            }],
+        });
+        assert_eq!(
+            h.core.deleg_view().waiting[0].members[0].heard_ms,
+            Some(200)
+        );
+        let refused = ask(&mut h, 905, false);
+        assert!(refused.is_err(), "the cut-off member: {refused:?}");
+        // Confirmed from elsewhere: forced, and counted as forced.
         assert!(ask(&mut h, 901, true).is_ok());
         assert!(h.core.dl.gens[&7].ended);
+        assert_eq!(
+            (
+                h.core.stats.groups_abandoned,
+                h.core.stats.groups_abandoned_forced
+            ),
+            (1, 1)
+        );
         // Heard from longer than a ttl ago: no force needed.
         let mut h = root_with_delegate_backed_by(4);
         h.core.dw.set_until_for_tests(7, w(h.now));
@@ -41715,7 +41739,15 @@ mod deleg_windows_tests {
         let mut out = Vec::new();
         h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
         h.advance(h.core.cfg.delegation_ttl_ms + 1);
+        // A message from member 4 counts as hearing from it (no link known).
+        h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegationRecalled { req: OpId(77) },
+        });
+        assert!(ask(&mut h, 903, false).is_err());
+        h.advance(h.core.cfg.delegation_ttl_ms + 1);
         assert!(ask(&mut h, 902, false).is_ok());
+        assert_eq!(h.core.stats.groups_abandoned_forced, 0);
     }
 
     /// Plan 43 C2e (Q1): the escape. A generation that waits for its group

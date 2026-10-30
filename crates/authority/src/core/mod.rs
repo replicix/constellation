@@ -1330,6 +1330,10 @@ pub struct Stats {
     pub inherited_tail_fetches: u64,
     pub tail_fetch_wait_ms_total: u64,
     pub groups_abandoned: u64,
+    /// Of those, the delegation groups abandoned with `--force` although
+    /// the root had heard from the delegate or a strict member within
+    /// `delegation_ttl_ms` (plan 43 C2e review).
+    pub groups_abandoned_forced: u64,
     pub member_copies_retired: u64,
     /// Plan 43 C1-4: a backup's contiguous tail moved to a member copy when
     /// its holder's lease moved on to a later epoch.
@@ -1761,6 +1765,12 @@ pub struct Core {
     last_recovery: Option<String>,
     roster: Vec<NodeId>,
     links: BTreeMap<NodeId, PeerLink>,
+    /// When this node last heard from each peer (a message, or the driver's
+    /// `PeerLink::last_seen`), on its wait clock. Kept across the link
+    /// table's replacement (`Event::Peers`), which drops a link's last
+    /// exchange once it disconnects: `repair abandon-group` weighs a node
+    /// cut from this one only by it (plan 43 C2e review).
+    peer_heard: BTreeMap<NodeId, WaitMs>,
     /// EC2 campaign 8 A-1: this node's own S3 path (`Event::OwnS3`).
     pub(crate) own_s3: OwnS3,
     /// A-1: no re-adoption of this node's own lease for a forward before
@@ -1861,6 +1871,7 @@ impl Core {
             last_recovery: None,
             roster: Vec::new(),
             links: BTreeMap::new(),
+            peer_heard: BTreeMap::new(),
             own_s3: OwnS3::default(),
             readopt_refused_until: WaitMs(0),
             demand_p2p: BTreeMap::new(),
@@ -2099,7 +2110,10 @@ impl Core {
                 self.note_in_doubt(rid);
                 self.on_submit(now, rid, op, policy, tag, replica, &mut out)
             }
-            Event::Peer { from, msg } => self.on_peer(now, from, msg, replica, &mut out),
+            Event::Peer { from, msg } => {
+                self.note_peer_heard(from, now.wait);
+                self.on_peer(now, from, msg, replica, &mut out)
+            }
             Event::PeerFailed { req, to, outage } => {
                 self.on_peer_failed(now, req, to, outage, replica, &mut out)
             }
@@ -2146,6 +2160,11 @@ impl Core {
                 );
                 if links.iter().any(|l| l.node != self.cfg.node_id) {
                     self.note_foreign(now, replica, &mut out);
+                }
+                for l in &links {
+                    if let Some(at) = l.last_seen {
+                        self.note_peer_heard(l.node, at);
+                    }
                 }
                 self.links = links.into_iter().map(|l| (l.node, l)).collect();
                 self.stream_on_peers(now);

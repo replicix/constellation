@@ -5583,16 +5583,31 @@ impl Core {
             Some(g) => {
                 let known = g.sealed_tail.as_ref().map_or(g.cursor, |t| t.end.max(g.cursor));
                 let cursor = g.cursor;
+                let forced = force && heard.is_some();
+                // The audit of `--force`: who was heard from, and when.
+                let (heard_node, heard_role, heard_ms) = heard.unwrap_or((0, "", 0));
                 tracing::warn!(
                     node = self.me(),
                     gen,
                     cursor,
                     known,
-                    "the operator abandoned the group of a delegation: ending it at the root's cursor; rows only its group held are lost"
+                    forced,
+                    heard_node,
+                    heard_role,
+                    heard_ms,
+                    "the operator abandoned the group of a delegation{}: ending it at the root's cursor; rows only its group held are lost",
+                    if forced {
+                        " with --force, although this root heard from that node within delegation_ttl_ms"
+                    } else {
+                        ""
+                    }
                 );
                 self.end_generation(now, gen, Some(known), replica, out);
                 if self.dl.gens.get(&gen).is_some_and(|g| g.ended) {
                     self.stats.groups_abandoned += 1;
+                    if forced {
+                        self.stats.groups_abandoned_forced += 1;
+                    }
                     Ok(ControlOk::Text(format!(
                         "generation {gen} ended at index {cursor}; rows past it that only its group held are lost"
                     )))
@@ -5606,10 +5621,20 @@ impl Core {
         out.push(Action::ControlDone { op, result });
     }
 
-    /// When this root last heard from `node` on its link (any successful
-    /// exchange, the driver's directory).
+    /// When this root last heard from `node`: a message from it, or a
+    /// successful exchange on its link (the driver's directory, which forgets
+    /// it once the link drops; this table does not).
     fn link_heard(&self, node: NodeId) -> Option<WaitMs> {
-        self.links.get(&node).and_then(|l| l.last_seen)
+        self.peer_heard
+            .get(&node)
+            .copied()
+            .max(self.links.get(&node).and_then(|l| l.last_seen))
+    }
+
+    /// `node` was heard from at `at` (wait clock).
+    pub(crate) fn note_peer_heard(&mut self, node: NodeId, at: WaitMs) {
+        let e = self.peer_heard.entry(node).or_insert(at);
+        *e = (*e).max(at);
     }
 
     /// When this root last heard from `g`'s delegate: a renewal, a stream

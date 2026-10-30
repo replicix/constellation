@@ -61882,3 +61882,12 @@ is never the same boot, the rule a boot stamp follows (`Now::wait_of_stamp`). Te
 stopped)` was `(true, Some(false))`. delegations.md also no longer calls the designee's exemption safe. It is a known gap
 pending a fix: a designee streams like any delegate, and the root skips indices at or below its cursor, so a designee
 that lost the unsynced end of its journal reuses indices.
+
+F2. Item 4's `heard_ms` lost a strict member that was cut off from the root only: the driver drops `last_seen` once a
+link disconnects (`authority_driver.rs`, the link list), and the core replaces its link table wholesale on every
+`Event::Peers`. `heard_ms` was then `null`, and the abandon passed without `--force`. The core now keeps a per-node
+last-heard table (`Core::peer_heard`) that survives the replacement. Any message from the node updates it, and so does
+the link's `last_seen`. A forced abandon is audited: the WARN says `--force` was used and names who was heard and when,
+and `groups_abandoned_forced` counts it. Test: `abandon_group_is_refused_while_the_group_was_heard_from_lately` now also
+drops member 4's link, and checks a message from the member and the counter. Fail-before (the core's table unused):
+`heard_ms` was `None` where `Some(200)` was expected.

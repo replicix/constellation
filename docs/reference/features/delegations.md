@@ -770,9 +770,11 @@ designations create no delegation.
   `constellation status` shows `delegation.gens[].waiting_for_group` for the
   generation and, under `delegation.waiting`, when the root last heard from
   the delegate (`delegate_heard_ms`: a renewal, a stream batch, a recall's
-  answer, or any exchange on its link), and the members of its group with
-  when each was last asked, lost (transport), answered and heard from at all
-  (`heard_ms`); `status` also prints the command below. `deleg_seal_waits` counts the windows and the log
+  answer, any other message, or an exchange on its link), and the members
+  of its group with when each was last asked, lost (transport), answered and
+  heard from at all (`heard_ms`). The root keeps the last time it heard from
+  each node after the link drops, so a node cut from the root only still
+  shows when it was last heard. `status` also prints the command below. `deleg_seal_waits` counts the windows and the log
   warns once a minute. The wait ends by itself as soon as a member answers
   (it may be a restarted node: its disk holds the tail) or the delegate
   renews (it is alive and holds every row it acknowledged; the seal is given
@@ -796,7 +798,9 @@ designations create no delegation.
   the root only, holding rows its clients were told are committed. The root
   alone cannot tell a dead node from a partitioned one, so **confirm from
   elsewhere** (another node, the hosts themselves, your orchestration) that
-  the delegate and every member are down, then pass `--force`:
+  the delegate and every member are down, then pass `--force`. A forced
+  abandon is logged at WARN with the node that was heard from and when, and
+  counted (`groups_abandoned_forced`):
 
   ```
   constellation repair abandon-group TARGET --gen G --force
