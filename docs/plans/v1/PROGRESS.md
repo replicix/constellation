@@ -62196,3 +62196,21 @@ Tests: core `recall_cut::a_row_depending_on_an_ended_generations_lost_row_never_
 `deps` (7, 5)). Fail-before: the delegate sent `DelegateStream { gen: 8, txs: [{ idx: 1, .. }] }`, `(sent, stopped)` was
 `([1], Some(false))`; the root appended it, `(cursor, refused)` was `(1, 0)` for `(0, 1)`. Mutations: the stream's check
 off fails the delegate test the same way; the recall's clamp off answers `through` 1 for 0.
+
+## Review follow-ups of the three delegation fixes, and the sealed tail's lost dependency (2026-10-30)
+
+The review of the three commits above (path B, the designee's synced stream, the row whose dependency was lost) asked
+for two must-fixes and four follow-ups; the maintainer added the sealed tail's known gap, which shares a cause with the
+first must-fix. One commit each.
+
+### 1. A stream answer that takes nothing backs off (must-fix 2)
+
+On a dependency lost with its generation the root stops the batch and answers at the same cursor, not refused, as it
+does for a dependency it does not hold yet. The delegate counted that as the in-flight batch's answer, cleared its
+backoff and sent the same batch again in the same step: the two nodes looped at the round trip until the delegate
+applied the end of the generation (or, for a missing dependency, until it arrived). An answer to the in-flight batch
+that moves the cursor nowhere now backs the stream off as a refusal does (4 ticks, doubling to 2 s;
+`deleg_stream_no_progress`).
+
+Test: core `recall_cut::a_stream_answer_that_takes_nothing_backs_off`. Fail-before (the check off): `(re-sent at once,
+backing off)` was `(true, false)` for `(false, true)`.

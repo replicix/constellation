@@ -39166,7 +39166,61 @@ mod recall_cut {
         assert_eq!(through, Some(0), "{out:?}");
     }
 
-    /// The root's half of the test above (fail-before): generation 7 (node
+    /// Review must-fix 2 (fail-before): the root takes none of a batch (a
+    /// dependency it lacks, or one lost with its generation) and answers
+    /// at the same cursor, not refused. The delegate counted the answer as
+    /// the batch's and sent it again at once: a loop at the round trip.
+    /// It backs off instead.
+    #[test]
+    fn a_stream_answer_that_takes_nothing_backs_off() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        let out = {
+            let rid = h.rid(1);
+            let op = MutateOp::Create {
+                parent: dir,
+                name: "f".into(),
+                ino: h.meta.allocate_ino(dir).unwrap(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            };
+            h.step(Event::Submit {
+                policy: Policy::Client,
+                rid,
+                op,
+                tag: Default::default(),
+            })
+        };
+        let req = sends(&out)
+            .into_iter()
+            .find_map(|(_, m)| match m {
+                PeerMsg::DelegateStream { req, gen: 7, .. } => Some(*req),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no batch: {out:?}"));
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegateStreamAck {
+                req,
+                gen: 7,
+                round: round_of(&h, 7),
+                through: 0,
+                refused: false,
+            },
+        });
+        let resent = sends(&out)
+            .iter()
+            .any(|(_, m)| matches!(m, PeerMsg::DelegateStream { gen: 7, .. }));
+        assert_eq!(
+            (resent, h.core.dl.mine[&7].stream_after.is_some()),
+            (false, true),
+            "(re-sent at once, backing off): {out:?}"
+        );
+        assert_eq!(h.core.stats.deleg_stream_no_progress, 1);
+    }
+
+    /// The root's half of
+    /// `a_row_depending_on_an_ended_generations_lost_row_never_streams` (fail-before): generation 7 (node
     /// 3) ended at cursor 3, generation 8 (node 4, another directory) lives
     /// on, and node 4 streams a row whose `deps` name (7, 5), a row past the
     /// cut. `reaches_streams` counts a dependency on a voided generation as

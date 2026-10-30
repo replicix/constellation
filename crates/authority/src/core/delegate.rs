@@ -3421,6 +3421,21 @@ impl Core {
         if !progressed && !answers_inflight {
             return;
         }
+        if !progressed {
+            // The root took none of the batch: a dependency it does not
+            // hold yet, or one lost with its generation
+            // (`deleg_append_deps_lost`). Back off, as for a refusal: the
+            // next event re-sent the same batch at once, and the two
+            // nodes looped at the round trip until the dependency came
+            // (or, lost, until this node applied the end of its
+            // generation).
+            self.stats.deleg_stream_no_progress += 1;
+            let tick = self.cfg.delegation_stream_tick_ms.max(1);
+            d.stream_backoff_ms = (d.stream_backoff_ms * 2).clamp(tick * 4, 2_000);
+            d.stream_after = Some(now.wait.plus(d.stream_backoff_ms));
+            self.arm_stream_tick(now, out);
+            return;
+        }
         if progressed && !answers_inflight {
             tracing::debug!(
                 node = self.cfg.node_id,

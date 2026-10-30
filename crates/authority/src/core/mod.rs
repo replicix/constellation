@@ -929,6 +929,9 @@ pub struct Stats {
     pub deleg_append_deps_lost: u64,
     pub deleg_streamed_txs: u64,
     pub deleg_stream_refused: u64,
+    /// Delegate: stream acknowledgements that took none of the batch (the
+    /// root lacks, or lost, a dependency): the stream backs off.
+    pub deleg_stream_no_progress: u64,
     pub deleg_renewals: u64,
     pub deleg_renewals_refused: u64,
     /// Root: first renewals of a generation that waited for the root's
