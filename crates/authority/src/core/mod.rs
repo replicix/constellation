@@ -921,6 +921,12 @@ pub struct Stats {
     /// Designee: journal syncs before a stream batch (its rows leave only
     /// once they are on its disk).
     pub deleg_designee_syncs: u64,
+    /// Delegate: generations stopped before a row whose dependency was
+    /// lost with another generation (`DelegateState::lost_from`).
+    pub deleg_lost_deps_stopped: u64,
+    /// Root: delegate rows not appended, a dependency lost with its
+    /// generation.
+    pub deleg_append_deps_lost: u64,
     pub deleg_streamed_txs: u64,
     pub deleg_stream_refused: u64,
     pub deleg_renewals: u64,

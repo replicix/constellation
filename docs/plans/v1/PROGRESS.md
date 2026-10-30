@@ -62169,3 +62169,30 @@ class of `durability-and-failover.md`.
 Test: core `designee_stream::a_designees_stream_carries_only_rows_its_disk_holds` (a designee's row 7:1: the batch and
 one sync; an ordinary delegate's: the batch, no sync). Fail-before (the sync block off): `(batches sent, syncs)` was
 `([(1, 1)], 0)` for `([(1, 1)], 1)`. Mutation (the bookkeeping without `sync_journal`): the same failure.
+
+### 3. A row whose dependency was lost with another generation is never appended
+
+Finding (the variant of 1). A node holds generations 7 and 8, the two name-hash halves of `/d`. Cut off from the root, it
+answers a create in each half, row 7:1 and then row 8:1, whose `deps` name (7, 1) (the node's own position). The stream
+holds 8:1 back while 7 is held and the root has not acknowledged 7:1 (`deleg_stream`'s `acked_here`). The root ends 7 at
+its cursor (0) while 8 lives on. Once 7 is dropped, `acked_here` lets 8:1 go (7 no longer held), and the root appends it:
+`reaches_streams` counts a dependency on the voided generation as satisfied, and `on_delegate_stream` never asked
+`deps_lost`. Row 7:1 strands and is replayed by rid after the end, so the log carries 8:1 ahead of the create it
+followed (the `marker-order` class). New ops with such a dependency were already refused (`deps_lost` at execution); the
+gap was a row executed before the end.
+
+Fix. The delegate never streams a row whose `deps` are lost (`Replica::deps_lost`): the generation stops before it
+(`DelegateState::lost_from`, `deleg_lost_deps_stopped`), its recall is answered at the row before, and the root ends it
+there (or at the cursor when the unrenewed grant runs out), so the row strands with the rest of the stream and is
+replayed by rid after its cause. The root does not append a streamed row with a lost dependency (`deleg_append_deps_lost`;
+the delegate re-sends from the cursor, as for a dependency not yet held), which also covers the window in which the
+delegate has dropped the generation from a speculative table but not yet voided it. Left open: a backup's sealed tail is
+still drained by the void rule; refusing a lost dependency there would hold the generation in `Sealing` for good
+(`a_drain_that_stops_short_keeps_the_generation_sealing` models an arriving dependency as a void); ending it at the row
+before would drop rows the group acknowledged.
+
+Tests: core `recall_cut::a_row_depending_on_an_ended_generations_lost_row_never_streams` (delegate) and
+`recall_cut::the_root_does_not_append_a_row_whose_dependency_was_lost` (root: generation 7 ended at 3, a row of 8 with
+`deps` (7, 5)). Fail-before: the delegate sent `DelegateStream { gen: 8, txs: [{ idx: 1, .. }] }`, `(sent, stopped)` was
+`([1], Some(false))`; the root appended it, `(cursor, refused)` was `(1, 0)` for `(0, 1)`. Mutations: the stream's check
+off fails the delegate test the same way; the recall's clamp off answers `through` 1 for 0.

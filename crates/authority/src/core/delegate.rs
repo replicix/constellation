@@ -414,6 +414,10 @@ pub(crate) struct DelegateState {
     /// A designee: the stream index through which this process synced its
     /// journal; its stream sends nothing past it (`deleg_stream`).
     pub synced_through: u64,
+    /// The first index of this stream whose `deps` name a row its
+    /// generation ended without (`Replica::deps_lost`): never streamed, the
+    /// generation stopped before it (`deleg_stream`).
+    pub lost_from: Option<u64>,
 }
 
 /// A renewal or backup append [`Core::deleg_expire_inflight`] gave up
@@ -1041,6 +1045,7 @@ impl Core {
                     acked_max: 0,
                     held_noted: false,
                     synced_through: 0,
+                    lost_from: None,
                 },
             );
             if d.designated {
@@ -3233,6 +3238,33 @@ impl Core {
             }) {
                 txs.truncate(stop);
             }
+            // A row whose `deps` name a row its generation ended without
+            // (another generation of this node reclaimed below a row this
+            // one followed, that row stranded and replayed by rid after the
+            // end) is not the log's to carry before its cause: appended, it
+            // would land ahead of the replay. The root does not append it
+            // either (`on_delegate_stream`). This generation stops before it:
+            // nothing more executes here, its recall is answered at the row
+            // before, and the root ends it there, so the row strands with
+            // the rest of the stream and is replayed by rid after its cause.
+            if let Some(lost) = txs.iter().position(|t| replica.deps_lost(&t.deps)) {
+                let idx = txs[lost].idx;
+                txs.truncate(lost);
+                let d = self.dl.mine.get_mut(&gen).expect("present");
+                if d.lost_from.is_none_or(|l| idx < l) {
+                    d.lost_from = Some(idx);
+                    d.stopped = true;
+                    self.stats.deleg_lost_deps_stopped += 1;
+                    tracing::warn!(
+                        node = self.cfg.node_id,
+                        gen,
+                        idx,
+                        "a row depends on one its generation ended without: \
+                         the generation stops before it, the row is replayed by rid"
+                    );
+                }
+            }
+            let d = self.dl.mine.get(&gen).expect("present");
             if txs.is_empty() {
                 continue;
             }
@@ -4921,6 +4953,12 @@ impl Core {
             // waits for the cursor to reach `through`.
             self.deleg_stream(now, replica, out);
         }
+        // Not past a row whose dependency was lost (`deleg_stream`): it is
+        // never streamed, and the root ends the generation before it.
+        let through = match self.dl.mine.get(&gen).and_then(|d| d.lost_from) {
+            Some(lost) => through.min(lost - 1),
+            None => through,
+        };
         // Phase 2b (M8): the read delegations this delegate granted are
         // recalled first; the root executes under the subtree only once
         // they are gone (or, past the horizon, expired).
@@ -6022,6 +6060,22 @@ impl Core {
             // and count it; the delegate re-sends after a tick.
             if self.deps_from_a_newer_tenure(&tx.deps) {
                 self.stats.deleg_append_newer_tenure += 1;
+                break;
+            }
+            // A dependency on a row its generation ended without (a
+            // delegate's row past the cut, stranded and replayed by rid
+            // after the end): the void rule would count it as satisfied,
+            // and the row would land ahead of its cause. Not appended; the
+            // delegate stops the generation before it (`deleg_stream`).
+            if replica.deps_lost(&tx.deps) {
+                self.stats.deleg_append_deps_lost += 1;
+                tracing::debug!(
+                    node = self.me(),
+                    gen,
+                    idx = tx.idx,
+                    deps = ?tx.deps,
+                    "delegate batch refused: a dependency was lost with its generation"
+                );
                 break;
             }
             if !replica.reaches_streams(&tx.deps) {

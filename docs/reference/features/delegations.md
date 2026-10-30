@@ -268,7 +268,17 @@ generation's cut (the transaction was acknowledged but never appended,
 so it is being replayed by rid): an op with such a dependency is not
 executed (a delegate or the root answers `Held`; an inbox op stays in
 the inbox and its requester withdraws it), and the requester re-sends
-it with fresh `deps` once its own replays have landed. A node holds its
+it with fresh `deps` once its own replays have landed. The same goes for
+a row already executed: a delegate holding two generations (the ranges
+of a directory) whose row of one followed its row of the other, and the
+other then ended below that row, never streams the dependent row
+(`deleg_lost_deps_stopped`). The generation stops before it, a recall is
+answered at the row before, and the root ends it there, so the row
+strands with the rest of the stream and is replayed by rid after its
+cause. The root does not append a streamed row with such a dependency
+either (`deleg_append_deps_lost`): the void rule would count it as
+satisfied and the log would carry it ahead of its cause. (A backup's
+sealed tail is still drained by the void rule.) A node holds its
 new writes while it has stranded ops of its own to replay, so its
 writes stay in the order it issued them. An op that is itself one of
 the stranded ops (a fast-path write a deposition rolled back after its

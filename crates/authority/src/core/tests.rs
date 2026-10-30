@@ -39014,6 +39014,253 @@ mod recall_cut {
         h.core.delegation_sync(h.clk(), &h.meta, &mut out);
         assert!(h.core.dl.mine.contains_key(&8), "{out:?}");
     }
+
+    /// This node holds both halves of `/d` (name-hash range 0 as generation
+    /// 7, range 1 as 8), renewed; a name of each half.
+    fn two_ranges() -> (Harness, constellation_fs_core::Ino, String, String) {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let dir = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let delegate = |gen: u64, idx: u32| LogRecord::Delegate {
+            dir,
+            node: 3,
+            gen,
+            designated: false,
+            range: (1, idx),
+        };
+        Replica::apply_segment(
+            &h.meta,
+            1,
+            1,
+            0,
+            &[],
+            &[],
+            &[
+                LogRecord::Mkdir {
+                    parent: ROOT_INO,
+                    name: "d".into(),
+                    ino: dir,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 1,
+                },
+                delegate(7, 0),
+                delegate(8, 1),
+            ],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        for gen in [7, 8] {
+            let req = renew_req(&out, gen).expect("no renewal on install");
+            h.step(renewed(&h, req, gen, 5_000));
+        }
+        let name = |idx: u32| {
+            (0..)
+                .map(|i| format!("n{i}"))
+                .find(|n| constellation_meta::delegation::Range::of(1, n).idx == idx)
+                .unwrap()
+        };
+        (h, dir, name(0), name(1))
+    }
+
+    fn create_in(h: &mut Harness, dir: constellation_fs_core::Ino, seq: u64, name: &str) {
+        let rid = h.rid(seq);
+        let op = MutateOp::Create {
+            parent: dir,
+            name: name.into(),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        assert!(replies(&out).iter().any(|(r, _)| *r == rid), "{out:?}");
+    }
+
+    /// Fail-before: this node holds generations 7 and 8, the two halves of
+    /// `/d`. Cut off from the root, it answers a create in each half, row
+    /// 7:1 and then row 8:1, which depends on 7:1 (`deps` (7, 1)). The root
+    /// ends generation 7 at its cursor 0 while 8 lives on. Row 7:1 strands
+    /// (replayed by rid, later), but 8:1 went out once 7 was no longer held
+    /// (the stream's `acked_here`), and the root, counting a dependency on
+    /// generation 7 as void, appended it: the log carries 8:1 ahead of the
+    /// create it followed. A row whose dependency is lost with its
+    /// generation is never streamed: the generation stops there, the root
+    /// ends it at the row before (its recall's answer says so), and the row
+    /// strands with the rest and is replayed by rid after its cause.
+    #[test]
+    fn a_row_depending_on_an_ended_generations_lost_row_never_streams() {
+        let (mut h, dir, low, high) = two_ranges();
+        create_in(&mut h, dir, 1, &low);
+        create_in(&mut h, dir, 2, &high);
+        assert_eq!(
+            (
+                Replica::delegate_idx(&h.meta, 7),
+                Replica::delegate_idx(&h.meta, 8)
+            ),
+            (1, 1)
+        );
+        let row = Replica::delegate_txs_from(&h.meta, 8, 1, 10);
+        assert!(
+            row[0].deps.streams.iter().any(|(g, i)| g == 7 && i == 1),
+            "{:?}",
+            row[0].deps
+        );
+        Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::RecallCut {
+                dir,
+                gen: 7,
+                through: 0,
+            }],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        h.advance(h.core.cfg.delegation_stream_tick_ms.max(1) * 10);
+        let ticks = timers(&out, TimerKind::DelegStream);
+        for t in ticks {
+            out.extend(h.step(Event::Timer { id: t }));
+        }
+        let sent: Vec<u64> = sends(&out)
+            .into_iter()
+            .filter_map(|(_, m)| match m {
+                PeerMsg::DelegateStream { gen: 8, txs, .. } => txs.first().map(|t| t.idx),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            (sent, h.core.dl.mine.get(&8).map(|d| d.stopped)),
+            (vec![], Some(true)),
+            "(gen 8 batches sent, stopped): {out:?}"
+        );
+        // A recall is answered at the row before.
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegRecall {
+                req: OpId(77),
+                dir,
+                gen: 8,
+            },
+        });
+        let through = sends(&out).into_iter().find_map(|(_, m)| match m {
+            PeerMsg::DelegRecalled {
+                gen: 8, through, ..
+            } => Some(*through),
+            _ => None,
+        });
+        assert_eq!(through, Some(0), "{out:?}");
+    }
+
+    /// The root's half of the test above (fail-before): generation 7 (node
+    /// 3) ended at cursor 3, generation 8 (node 4, another directory) lives
+    /// on, and node 4 streams a row whose `deps` name (7, 5), a row past the
+    /// cut. `reaches_streams` counts a dependency on a voided generation as
+    /// satisfied and the root appended it, ahead of the replay of its
+    /// cause. It is not appended.
+    #[test]
+    fn the_root_does_not_append_a_row_whose_dependency_was_lost() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        let (dir, _) = locks::delegated_file(&h.meta);
+        let e = h.meta.allocate_ino(ROOT_INO).unwrap();
+        Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[
+                LogRecord::Mkdir {
+                    parent: ROOT_INO,
+                    name: "e".into(),
+                    ino: e,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 3,
+                },
+                LogRecord::Delegate {
+                    dir: e,
+                    node: 4,
+                    gen: 8,
+                    designated: false,
+                    range: (0, 0),
+                },
+            ],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.gens.contains_key(&8));
+        h.step(Event::Control {
+            op: OpId(1 << 50),
+            req: Control::Undelegate { dir },
+        });
+        h.core.dl.gens.get_mut(&7).unwrap().cursor = 3;
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        assert!(h.core.dl.gens[&7].ended, "not ended: {out:?}");
+        let ino = h.meta.allocate_ino(e).unwrap();
+        let rid = Rid {
+            node: 4,
+            incarnation: 1,
+            seq: 1,
+        };
+        h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegateStream {
+                req: OpId(5),
+                gen: 8,
+                round: 0,
+                txs: vec![constellation_meta::DelegateTx {
+                    idx: 1,
+                    rid: Some(rid),
+                    records: vec![
+                        LogRecord::Create {
+                            parent: e,
+                            name: "g".into(),
+                            ino,
+                            mode: 0o644,
+                            uid: 0,
+                            gid: 0,
+                            time_ns: 9,
+                        },
+                        LogRecord::Completed { rid },
+                    ],
+                    deps: constellation_meta::Position::ZERO.with_streams_wire(&[(7, 5)]),
+                }],
+                leaving: Vec::new(),
+                leaving_barriers: Vec::new(),
+            },
+        });
+        assert_eq!(
+            (
+                h.core.dl.gens[&8].cursor,
+                h.core.stats.deleg_append_deps_lost
+            ),
+            (0, 1),
+            "(cursor of generation 8, refused)"
+        );
+    }
 }
 
 /// Plan 43 C2 (§2.1, §3.1-3.5): a delegate acknowledges once its group holds
