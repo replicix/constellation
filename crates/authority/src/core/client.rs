@@ -2030,9 +2030,13 @@ impl Core {
         // lease read finds out if it renewed meanwhile. Forwarding to it
         // again cost an op on a dead holder's lease its forward retries
         // after the claim fell due (3.4 s of a 6 s lease's 12 s deadline),
-        // and the op went in doubt.
+        // and the op went in doubt. Not while this node's own S3 is stalled
+        // either: the claim it would make needs S3 (the lease read would
+        // wait on a dead path), and a live holder it can reach is the way
+        // out (`s3_less`).
         let claim_due = !self.mode.forwards()
             && !self.cfg.single_writer
+            && !self.s3_less()
             && self
                 .lease
                 .claim_due(&self.cfg)

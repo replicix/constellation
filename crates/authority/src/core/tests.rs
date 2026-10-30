@@ -45025,3 +45025,57 @@ fn a_reconfig_re_read_does_not_cas_beside_a_renewal_that_is_out() {
     );
     assert_eq!(h.core.ack.reconfig_wanted, Some(vec![2]));
 }
+
+// ---- follow-ups of the takeover of a dead holder and the lease reads ----
+
+/// A node whose own S3 is stalled does not skip the forward to a live
+/// holder because the holder's claim has fallen due: the claim it would
+/// make needs S3. (Plan 43 C7b's claim-due retry goes to the lease path
+/// for a node that reaches S3.)
+#[test]
+fn a_claim_due_does_not_send_a_node_without_s3_to_the_lease_path() {
+    let mut h = Harness::new(1);
+    h.core.cfg.ttl_ms = 6_000;
+    h.core.cfg.takeover_promise_check = false;
+    h.core.lease.cached_holder = Some(2);
+    let rid = h.rid(1);
+    let op = h.create("a");
+    let first = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op,
+        tag: Default::default(),
+    });
+    let out = exhaust_forward_retries(&mut h, &first);
+    let body = Lease {
+        ttl_ms: 6_000,
+        ..lease_of(2, 1, h.now.0 + 6_000)
+    };
+    let get = get_in(&out).expect("the lease is read");
+    let mut out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((body, tag())))),
+    });
+    // The handoff ask goes nowhere (its link is down).
+    if let Some(req) = sends(&out).iter().find_map(|(to, m)| match m {
+        PeerMsg::LeaseRequest { req, .. } if *to == 2 => Some(*req),
+        _ => None,
+    }) {
+        out = h.step(Event::PeerFailed {
+            req,
+            to: 2,
+            outage: true,
+        });
+    }
+    let retry = timers(&out, TimerKind::AcquireRetry);
+    assert_eq!(retry.len(), 1, "the op waits to retry: {out:?}");
+    // The claim falls due, and this node's S3 stalls.
+    h.advance(6_000);
+    h.core.own_s3.stalled = true;
+    let out = h.step(Event::Timer { id: retry[0] });
+    assert!(s3_ops(&out).is_empty(), "the lease path was taken: {out:?}");
+    assert!(
+        forwards_to_2(&out, rid),
+        "not forwarded to the holder: {out:?}"
+    );
+}
