@@ -914,6 +914,10 @@ pub struct Stats {
     /// again (plan 43 C2e follow-up: the journal may lack rows it
     /// acknowledged).
     pub deleg_rebooted_holder: u64,
+    /// Delegate: installs of a generation put off because an ended
+    /// generation's rows were still in the journal, its end not yet
+    /// applied from the log (path B).
+    pub deleg_install_waits_end: u64,
     pub deleg_streamed_txs: u64,
     pub deleg_stream_refused: u64,
     pub deleg_renewals: u64,

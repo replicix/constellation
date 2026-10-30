@@ -62117,3 +62117,27 @@ none of plan 42's (`stress-ng-fs` and all 43 `kernel-race-*` rows passed). Rerun
 10 % on both; `session-ryw-after-holder-kill` passed once in four reruns; `lease-claimant-ahead`,
 `holder-crash-phantom-shadow` and `stale-daemon-lock` passed every rerun. Plan 42 stays in `wip/` until the catalogue is
 green on main; its K7 criterion holds.
+## Two delegation integrity holes: a generation taken before an ended one strands, a designee's reused indices (2026-10-30)
+
+### 1. A new generation is not installed before an ended generation's rows strand ("path B")
+
+Finding. A delegate of generation 7, cut off from the root, journals its own create of `/d/f` as row 7:11 (`Lone`,
+answered). The root reclaims the generation at its cursor (10) and delegates `/d` to the same node again as generation 8.
+When the partition heals, the root's stream installs the `RecallCut` and the new `Delegate` ahead of the log
+(`on_stream_ahead`, `durable: false`: the table changes, the generation is not voided), and any `delegation_sync` before
+their segment (a segment with another delegation record, a restart) dropped generation 7 and installed generation 8 on a
+replica that still held row 7:11: the recall's strand runs only when the segment is applied (`apply_segment`). A chmod of
+`/d/f` then executed as row 8:1; the stream let it go (`deleg_stream`'s `acked_here`: generation 7 no longer held) and the
+root appends it (`on_delegate_stream`: `reaches_streams` counts the dependency on (7, 11) as void, `apply_delegate_tx`
+does not re-check). The log carries a change of an inode it never created, which the later strand and replay of 7:11
+cannot repair.
+
+Fix. `delegation_sync` installs no generation while this node's journal holds rows of a generation the table no longer
+lists whose end it has not applied from the log (`Meta::deleg_gens_awaiting_end`: a delegation origin's unshipped rows,
+no `deleg_void_cut` persisted; an unreadable journal counts as such a row). The segment carrying the end strands the rows
+and triggers the sync that installs the new generation (`deleg_install_waits_end` counts the waits). In the usual order
+nothing waits: the new generation is installed at its own segment, after the end's.
+
+Test: core `recall_cut::a_new_generation_waits_for_an_ended_ones_rows_to_strand`. Fail-before (the guard off):
+`(installed, executed through)` of generation 8 was `(true, 1)`, the chmod answered `Lone` and sent in
+`DelegateStream { gen: 8, txs: [DelegateTx { idx: 1, records: [Setattr { .. }], deps: .. (7, 1) .. }] }`.

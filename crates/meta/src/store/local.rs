@@ -953,6 +953,36 @@ impl Meta {
             .and_then(|v| v.parse::<u64>().ok()))
     }
 
+    /// Path B: the generations not in `live` whose transactions this
+    /// journal still holds (a delegation origin, unshipped) and whose end
+    /// this replica has not applied from the log ([`Meta::void_cut`]: no
+    /// cut persisted). A delegate can learn such an end ahead of the log
+    /// (the root's stream installs its `RecallCut` speculatively); its rows
+    /// past the cut leave the journal only when the record's segment is
+    /// applied (the strand), and until then they are in this replica's
+    /// state.
+    pub fn deleg_gens_awaiting_end(
+        &self,
+        live: &std::collections::BTreeSet<u64>,
+    ) -> Result<Vec<u64>, MetaError> {
+        let r = self.db.read_tx();
+        let floor = journal::acked_watermark(&r, &self.local)?;
+        let mut held = std::collections::BTreeSet::new();
+        for guard in r.iter(&self.journal_origin) {
+            let (gen, _, first) = decode_journal_origin_key(&guard.key()?)?;
+            if first > floor && !live.contains(&gen) {
+                held.insert(gen);
+            }
+        }
+        let mut out = Vec::new();
+        for gen in held {
+            if kv_get_tx(&r, &self.local, &deleg_void_cut_key(gen))?.is_none() {
+                out.push(gen);
+            }
+        }
+        Ok(out)
+    }
+
     fn note_log_idx(&self, gen: u64, idx: u64) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
         bump_log_idx_tx(&mut tx, &self.local, gen, idx)?;

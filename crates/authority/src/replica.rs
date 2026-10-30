@@ -363,6 +363,10 @@ pub trait Replica {
     /// generation (`Meta::deleg_held_boot`). An unreadable record counts as
     /// another boot, and so does an unknown one (id 0) on either side.
     fn deleg_held_on_another_boot(&self, gen: u64, boot: u64) -> bool;
+    /// Path B: the generations `live` does not list whose rows this
+    /// journal still holds, their end not yet applied from the log
+    /// (`Meta::deleg_gens_awaiting_end`). `None`: unreadable.
+    fn deleg_gens_awaiting_end(&self, live: &std::collections::BTreeSet<u64>) -> Option<Vec<u64>>;
     /// Generation `gen` ended at `cut` (the void rule).
     fn void_stream(&self, gen: u64, cut: u64);
     /// Whether transaction `(gen, idx)` of this delegate's streams is
@@ -1310,6 +1314,14 @@ impl Replica for Meta {
                 true
             }
         }
+    }
+
+    fn deleg_gens_awaiting_end(&self, live: &std::collections::BTreeSet<u64>) -> Option<Vec<u64>> {
+        Meta::deleg_gens_awaiting_end(self, live)
+            .map_err(
+                |error| tracing::warn!(%error, "reading the journal's ended generations failed"),
+            )
+            .ok()
     }
 
     fn void_stream(&self, gen: u64, cut: u64) {

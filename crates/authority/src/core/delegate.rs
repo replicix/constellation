@@ -916,8 +916,36 @@ impl Core {
             }
             !*seen && now.wait.since(*at) < HANDED_BACK_UNSEEN_MS
         });
+        // Path B: the table here can be ahead of the log (the root's stream
+        // installs its records speculatively), and say that a generation of
+        // this node ended and a new one began before the segment that ends
+        // the old one is applied. The old one's rows past its cut leave the
+        // journal only then (the strand, replayed by rid), and until then
+        // they are in this replica's state: an op of the new generation
+        // executed on that state (a chmod of a file the stranded row
+        // created) depends on a row the log never carries, and the root,
+        // which counts a dependency on the ended generation as void,
+        // appends it. So no generation is installed here while an ended
+        // generation's rows are still in the journal, its end not yet
+        // applied from the log; the segment that applies it syncs again.
+        let mut awaiting_end: Option<Option<Vec<u64>>> = None;
         for d in table.iter().filter(|d| d.node == me) {
             if self.dl.mine.contains_key(&d.gen) || self.dl.epoch_active {
+                continue;
+            }
+            let awaiting = awaiting_end.get_or_insert_with(|| {
+                let live: BTreeSet<u64> = table.iter().map(|d| d.gen).collect();
+                replica.deleg_gens_awaiting_end(&live)
+            });
+            if awaiting.as_ref().is_none_or(|gens| !gens.is_empty()) {
+                self.stats.deleg_install_waits_end += 1;
+                tracing::debug!(
+                    node = me,
+                    dir = d.dir,
+                    gen = d.gen,
+                    ended = ?awaiting,
+                    "delegation not installed yet: an ended generation's rows wait for its end in the log"
+                );
                 continue;
             }
             // A group that cannot be read is not "no record": installed at

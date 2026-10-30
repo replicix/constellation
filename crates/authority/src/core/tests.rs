@@ -38930,6 +38930,90 @@ mod recall_cut {
         );
         assert!(!h.core.has_stream_parks());
     }
+
+    /// Path B (fail-before): the delegate of generation 7, cut off from the
+    /// root, journals its own create of `/d/f` as row 7:1; the root
+    /// reclaims the generation at its cursor (0) and delegates `/d` to the
+    /// same node again as generation 8. The root's stream installs both
+    /// records ahead of the log, and a sync before their segment (another
+    /// segment's delegation record, a restart) installed generation 8 on a
+    /// replica that still held row 7:1: the chmod of `/d/f` executed as row
+    /// 8:1, and the root, counting a dependency on generation 7 as void,
+    /// would append a change of an inode its log never created. The strand
+    /// of 7:1 (at the segment) cannot take 8:1 back. Generation 8 is
+    /// installed only once the segment has ended generation 7 here.
+    #[test]
+    fn a_new_generation_waits_for_an_ended_ones_rows_to_strand() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        let ino = h.meta.allocate_ino(dir).unwrap();
+        let create = h.rid(1);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: create,
+            op: MutateOp::Create {
+                parent: dir,
+                name: "f".into(),
+                ino,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            tag: Default::default(),
+        });
+        assert!(replies(&out).iter().any(|(r, _)| *r == create), "{out:?}");
+        assert_eq!(Replica::delegate_tx_pending(&h.meta, 7, 1), Some(true));
+        let records = [
+            LogRecord::RecallCut {
+                dir,
+                gen: 7,
+                through: 0,
+            },
+            LogRecord::Delegate {
+                dir,
+                node: 3,
+                gen: 8,
+                designated: false,
+                range: (0, 0),
+            },
+        ];
+        h.meta.install_streamed(1, 1, 1, 2, &records).unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        if let Some(req) = renew_req(&out, 8) {
+            h.step(renewed(&h, req, 8, 5_000));
+        }
+        let chmod = h.rid(2);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: chmod,
+            op: MutateOp::Setattr {
+                ino,
+                mode: Some(0o600),
+                uid: None,
+                gid: None,
+                size: None,
+                atime_ns: None,
+                mtime_ns: None,
+            },
+            tag: Default::default(),
+        });
+        assert_eq!(
+            (
+                h.core.dl.mine.contains_key(&8),
+                Replica::delegate_idx(&h.meta, 8)
+            ),
+            (false, 0),
+            "(installed, executed through) of generation 8 before the strand: {out:?}"
+        );
+        assert_eq!(h.core.stats.deleg_install_waits_end, 1);
+        // The segment ends generation 7: row 7:1 strands (replayed by rid),
+        // and the sync the segment's records trigger installs generation 8.
+        Replica::apply_segment(&h.meta, 2, 1, 2, &[1, 2], &[], &records).unwrap();
+        assert_eq!(Replica::delegate_tx_pending(&h.meta, 7, 1), Some(false));
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.mine.contains_key(&8), "{out:?}");
+    }
 }
 
 /// Plan 43 C2 (§2.1, §3.1-3.5): a delegate acknowledges once its group holds

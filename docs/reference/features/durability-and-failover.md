@@ -830,7 +830,11 @@ registers in `wanted_by` nor requests a handoff, even when its own read
 finds the holder renewed. Such an op used to wait for its client
 deadline (2 × TTL) and end in doubt first. A delegate's own writes take
 the lease path once its unrenewed grant lapses (see
-[Delegations](delegations.md#failures)).
+[Delegations](delegations.md#failures)). A delegate whose generation the
+root reclaimed meanwhile takes a new generation only once the segment
+ending the old one has stranded its rows past the cut (replayed by rid),
+even when the root's stream brought the end and the new grant earlier: an
+op of the new generation never executes on a row the log will not carry.
 
 A holder that is deposed (paused or partitioned past its lease while a
 backup or another node took over) answers no application mutation with

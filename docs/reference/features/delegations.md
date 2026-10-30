@@ -200,9 +200,19 @@ the generation ends first, the rows past the cut are stranded: rolled back,
 and — a lone delegate's rows, answered on its disk — replayed by rid through
 the new owner, or — rows that waited for a group, whose clients were never
 answered — dropped, their clients retrying by rid
-(`speculation.deleg_dropped`). A delegate refusal is journaled into the
-stream like any other outcome, and waits for its commit like an
-acceptance.
+(`speculation.deleg_dropped`). The strand runs when the segment carrying
+the generation's end is applied; the root's stream can install the end, and
+a new generation of the same node, ahead of it. A node does not install a
+generation while its journal still holds rows of a generation the table no
+longer lists whose end it has not applied from the log
+(`deleg_install_waits_end`): until the strand, those rows are in its
+replica, and an op of the new generation executed on them (a chmod of the
+file a row past the cut created) would reach the root, which counts a
+dependency on the ended generation as void, and the log would carry a
+change of an inode it never created. The segment that ends the old
+generation syncs the table again and installs the new one. A delegate
+refusal is journaled into the stream like any other outcome, and waits for
+its commit like an acceptance.
 
 ### The append path and dependencies
 
