@@ -38677,6 +38677,57 @@ mod recall_cut {
         assert_eq!(Replica::void_cut(&h.meta, 7), Some(3));
     }
 
+    /// The root's end of a generation voids it here at once; a deposition
+    /// that rolls the journaled end back makes the generation live again
+    /// here too (the log's table still lists it): a dependency on its rows
+    /// past what the log holds waits again (`long-delegated-late-answers`
+    /// seed 259 under slow lease reads: the deposed root, re-elected,
+    /// executed a delegate's op whose deps named the generation's rows it
+    /// had ended it at and lost with the end, before they were appended
+    /// again, and the log broke the delegate's program order).
+    #[test]
+    fn a_stranded_end_of_a_generation_lifts_its_void() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        let (dir, _) = locks::delegated_file(&h.meta);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        h.step(Event::Control {
+            op: OpId(1 << 50),
+            req: Control::Undelegate { dir },
+        });
+        h.core.dl.gens.get_mut(&7).unwrap().cursor = 3;
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        assert!(h.core.dl.gens[&7].ended, "not ended: {out:?}");
+        let mut on_row = constellation_meta::Position::ZERO;
+        assert!(on_row.streams.raise(7, 3));
+        assert_eq!(Replica::void_cut(&h.meta, 7), Some(3));
+        assert!(Replica::reaches_streams(&h.meta, &on_row));
+        // Deposed: the unshipped journal, the end with it, is rolled back.
+        assert!(Replica::holder_capture(&h.meta));
+        Replica::strand_below_epoch(&h.meta, 2).unwrap();
+        assert!(
+            !journal_records(&h)
+                .iter()
+                .any(|r| matches!(r, LogRecord::RecallCut { .. })),
+            "the end is still journaled"
+        );
+        assert_eq!(Replica::void_cut(&h.meta, 7), None, "still voided here");
+        assert!(
+            !Replica::reaches_streams(&h.meta, &on_row),
+            "a dependency on row 3, which the log never carried, passes"
+        );
+        assert_eq!(
+            h.meta.void_cut(7).unwrap(),
+            None,
+            "a restart would void the live generation at the stranded cut"
+        );
+    }
+
     /// A delegate (node 3, backed by node 4) executed a forwarded create
     /// of node 2's and parks its acknowledgement for the backup.
     fn delegate_with_a_parked_ack() -> (Harness, constellation_fs_core::Ino) {

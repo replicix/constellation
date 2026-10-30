@@ -12334,6 +12334,25 @@ fn a_removal_that_empties_the_backup_set_gates_acknowledgements() {
     .unwrap_or_else(|e| panic!("long-backup seed 586 (slow lease reads): {e}"));
 }
 
+/// `long-delegated-late-answers` seed 259 under slow lease reads: a deposed
+/// root ended a generation through its delegate's rows 4 and 5, then lost
+/// them and the end with its journal; its session still held the generation
+/// void, and, re-elected, it executed the delegate's next op (deps on row
+/// 5) before the rows were appended again: the log broke the delegate's
+/// program order. It fails before a stranded end lifts the void
+/// (`SessionState::unvoid`).
+#[test]
+fn a_stranded_end_of_a_generation_does_not_void_it() {
+    run_seed(
+        259,
+        SimConfig {
+            lease_reads: SLOW_LEASE_READS,
+            ..long_delegated_late_answers_config()
+        },
+    )
+    .unwrap_or_else(|e| panic!("long-delegated-late-answers seed 259 (slow lease reads): {e}"));
+}
+
 /// Plan 41 D3 review: the race the send-time dating is for is run, not
 /// assumed. `Report::probe_races` counts the lane answers decided on the
 /// root's own proof (the core's last one stale) after the lease object already

@@ -1093,6 +1093,25 @@ impl SessionState {
         self.cv.notify_all();
     }
 
+    /// The end of `gen` this root journaled (`RecallCut`, voiding it here
+    /// at once) left the journal unshipped with its transaction (a deposed
+    /// root's rollback or rebuild), and the table, as the log has it, still
+    /// lists the generation: it is live again here too. Left voided, a
+    /// dependency on its rows past what the log holds passed at once,
+    /// though those rows had been rolled back with the end and were
+    /// appended again (or replayed by rid) only later, behind the op that
+    /// depended on them (`long-delegated-late-answers` seed 259: a deposed
+    /// root ended a generation through its delegate's rows 4 and 5 and
+    /// lost them with the end; re-elected, it executed the delegate's next
+    /// op, whose deps named row 5, before the delegate re-streamed them,
+    /// and the log broke the delegate's program order). No wake-up:
+    /// lifting a void satisfies no wait.
+    pub fn unvoid(&self, gen: u64) {
+        let mut g = self.inner.lock().unwrap();
+        g.voided.remove(&gen);
+        g.void_cuts.remove(&gen);
+    }
+
     /// What a restart forgets (EC2 campaign 7, the `git-under-flock-
     /// causal` reader): the stream indices and the voided generations
     /// live here in memory, and a replica that opens its store again

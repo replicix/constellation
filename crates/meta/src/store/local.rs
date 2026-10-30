@@ -2438,6 +2438,17 @@ pub(crate) fn retract_log_idx_tx(
     Ok(true)
 }
 
+/// Forget the persisted cut of `gen`: the `RecallCut` that wrote it was
+/// this root's own journaled one, and it stranded with its transaction
+/// while the table still lists the generation (`spec::strand_local_tx`).
+pub(crate) fn clear_void_cut_tx(
+    tx: &mut SingleWriterWriteTx,
+    local: &SingleWriterTxKeyspace,
+    gen: u64,
+) {
+    tx.remove(local, deleg_void_cut_key(gen).into_bytes());
+}
+
 /// Raise the persisted cut of the ended generation `gen` to `through`
 /// (see [`deleg_void_cut_key`]).
 pub(crate) fn bump_void_cut_tx(

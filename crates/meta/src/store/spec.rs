@@ -1310,6 +1310,28 @@ fn strand_local_tx(
     if local::retract_log_idx_tx(tx, &meta.local, row.gen, row.idx)? {
         meta.session.retract_stream(row.gen, row.idx - 1);
     }
+    // This root's end of a generation leaves with the transaction that
+    // journaled it. Unless the log ended it all the same (a successor
+    // re-shipped the row: the table here, rolled back or rebuilt from the
+    // log, no longer lists it), the generation is live again: the void its
+    // journaling set (and the cut kept for a restart) is lifted
+    // (`SessionState::unvoid`). As above, the session side is in memory.
+    let ended: Vec<u64> = rows
+        .iter()
+        .filter_map(|(_, rec)| match rec {
+            LogRecord::RecallCut { gen, .. } | LogRecord::Recall { gen, .. } => Some(*gen),
+            _ => None,
+        })
+        .collect();
+    if !ended.is_empty() {
+        let table = crate::delegation::read_table_tx(&*tx, meta)?;
+        for gen in ended {
+            if table.iter().any(|d| d.gen == gen) {
+                local::clear_void_cut_tx(tx, &meta.local, gen);
+                meta.session.unvoid(gen);
+            }
+        }
+    }
     for (seq, _) in &rows {
         tx.remove(&meta.journal_ks, seq.to_be_bytes().to_vec());
     }
