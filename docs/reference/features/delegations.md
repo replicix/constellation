@@ -1011,12 +1011,23 @@ node's generations; the FUSE fast path waits on the same watermark,
 `DelegDurable::through`). The delegate records each row's dependencies
 on rows of its other generations that are not committed yet when the row
 is read for a batch (the root's stream or the backup's append), which
-every row is before its group can hold it. A dependency whose row is
-lost (`deps_lost`: its generation ended below it) aborts the
-acknowledgement (`Busy`, the requester retries by rid) and stops the
-generation before the row (`deleg_lost_deps_stopped`). `Lone` rows are
-not affected: they are answered from the delegate's disk, and a strand
-replays them by rid.
+every row is before its group can hold it: a generation it holds, and
+one it no longer holds whose rows are still in its journal and whose end
+it has not applied from the log yet (the table installed ahead of the
+log, or the end applied and the row read only later); such a dependency
+is committed once the log carries it. A row whose dependency is lost
+already when it is read (`deps_lost`: its generation ended below it)
+stops the generation before it there, before any member holds it
+(nothing at or past it goes to the backup or the root), and one lost
+later aborts the acknowledgement (`Busy`, the requester retries by rid)
+and stops the generation before the row (`deleg_lost_deps_stopped`). A
+stop at or below a row already answered under the group would drop an
+answered write: it must not happen, and is logged as an error and counted
+(`deleg_lost_after_ack`, which the simulation asserts to be 0). `Lone`
+rows are not affected: they are answered from the delegate's disk, and a
+strand replays them by rid; the `Lone` lead and the rule that a `Lone`
+row never follows an uncommitted gated row count the same capped prefix
+as committed.
 
 So an acknowledged row's dependencies are committed, and a committed
 row is at or below its generation's cut: A's end waits for its group's
@@ -1027,8 +1038,9 @@ on was never acknowledged, and both ends of B stop there:
 - The live path: the delegate never streams such a row, and its recall
   answers the row before it (read from the journal when the stream has
   not reached the row, `Meta::delegate_deps_from`); the root does not
-  append one either (`deleg_append_deps_lost`; the delegate backs off,
-  `deleg_stream_no_progress`).
+  append one either (`deleg_append_deps_lost`; the delegate backs off 4
+  stream ticks, `deleg_stream_no_progress`, and a recall drains at once
+  whatever the back-off).
 - The sealed tail: when B's delegate is gone too and the root ends B by
   its backup's tail, the drain stops at the first row with a lost
   dependency (`deleg_append_deps_lost`) and ends the generation there.

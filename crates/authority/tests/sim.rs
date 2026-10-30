@@ -366,6 +366,7 @@ fn replay_seed() {
         Ok("delegated-backup-crash") => delegated_backup_crash_config(),
         Ok("delegated-two-gens-one-backed") => delegated_two_gens_one_backed_config(),
         Ok("delegated-two-gens-backed") => delegated_two_gens_backed_config(),
+        Ok("delegated-two-gens-backlog") => delegated_two_gens_backlog_config(),
         Ok("delegated-designated") => delegated_designated_config(),
         Ok("delegated-placement") => delegated_placement_config(),
         Ok("delegated-strict") => delegated_strict_config(),
@@ -5215,6 +5216,7 @@ fn sweep_config() {
         "delegated-two-gens-root-crash" => delegated_two_gens_root_crash_config(),
         "delegated-two-gens-one-backed" => delegated_two_gens_one_backed_config(),
         "delegated-two-gens-backed" => delegated_two_gens_backed_config(),
+        "delegated-two-gens-backlog" => delegated_two_gens_backlog_config(),
         "delegated-root-gone" => delegated_root_gone_config(),
         "delegated-delegate-restart" => delegated_delegate_restart_config(),
         "long-delegated-backup" => long_delegated_backup_config(),
@@ -6282,6 +6284,48 @@ fn delegated_two_gens_one_backed_config() -> SimConfig {
     }
 }
 
+/// The review of ADR-39's rule: as `delegated-two-gens-one-backed`, but
+/// node 2 lives on, cut from the root (1 s to 10 s), and its backup (node
+/// 3) is frozen from 1 s to 6.8 s and cut from the root too, so the root
+/// cannot seal it: node 2's appends to it back up, and the rows of `d1`
+/// behind them are first read for a batch only after node 2 has applied
+/// the end of its unbacked range of `d2` (reclaimed at the root's cursor)
+/// and let go of it. Without recording the dependencies on that ended
+/// generation, the backup's acknowledgement answered rows that depended on
+/// its lost rows, and the end of `d1` at the drain of the backup's sealed
+/// tail dropped them (I1).
+fn delegated_two_gens_backlog_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(sim::run::deleg_one_backed_gen_backlog_core_config),
+        faults: vec![
+            ScheduledFault {
+                at_ms: 1_000,
+                kind: FaultKind::Partition {
+                    a: 1,
+                    b: 2,
+                    for_ms: 9_000,
+                },
+            },
+            ScheduledFault {
+                at_ms: 1_000,
+                kind: FaultKind::Partition {
+                    a: 1,
+                    b: 3,
+                    for_ms: 9_000,
+                },
+            },
+            ScheduledFault {
+                at_ms: 1_000,
+                kind: FaultKind::Pause {
+                    node: 3,
+                    for_ms: 5_800,
+                },
+            },
+        ],
+        ..delegated_two_gens_one_backed_config()
+    }
+}
+
 /// The delegate of `d1` dies with a backup: the root seals the backup,
 /// drains its tail, ends the generation and delegates `d1` to the
 /// backup; every backup-acknowledged write is in the log.
@@ -6960,7 +7004,7 @@ struct OracleTotals {
     /// holds (count, total ms, max ms), and the path-B and lost-dependency
     /// counters (installs put off, generations stopped, rows the root
     /// refused, answers that took nothing).
-    xgen: [u64; 14],
+    xgen: [u64; 16],
     /// Plan 43 C1-3: attempts to fetch a group's tail, fetches completed (of
     /// them, of an inherited tail), claims that carried no tail (must be 0
     /// outside an abandon), groups abandoned, runs that ended waiting.
@@ -7025,6 +7069,8 @@ impl OracleTotals {
             self.xgen[11] += st.deleg_stream_no_progress;
             self.xgen[12] += st.deleg_install_wait_ms;
             self.xgen[13] = self.xgen[13].max(st.deleg_install_wait_max_ms);
+            self.xgen[14] += st.deleg_caps_calls;
+            self.xgen[15] += st.deleg_caps_walked;
         }
         for st in r.stats.values() {
             self.downgraded_lone += st.acks_downgraded_lone;
@@ -7196,7 +7242,7 @@ impl OracleTotals {
             "SWEEP-XGEN-TOTALS {label} seeds {}/{seeds}: acks waiting on another generation {} \
              ({} ms, max {} ms) of delegated acks released {} ({} ms waited); prefix holds {} \
              ({} ms, max {} ms); installs put off {} ({} ms, max {} ms), generations stopped at a lost dependency {}, \
-             rows refused at the root {}, answers that took nothing {}",
+             rows refused at the root {}, answers that took nothing {}; caps computed {} times, {} entries visited",
             self.seeds,
             self.xgen[0],
             self.xgen[1],
@@ -7211,7 +7257,9 @@ impl OracleTotals {
             self.xgen[13],
             self.xgen[9],
             self.xgen[10],
-            self.xgen[11]
+            self.xgen[11],
+            self.xgen[14],
+            self.xgen[15]
         );
         eprintln!(
             "SWEEP-CLAIM-TOTALS {label} seeds {}/{seeds}: class-claim-mismatch={} in {} seeds, \
@@ -7968,6 +8016,18 @@ fn delegated_two_gens_one_backed_keep_their_acknowledgements() {
         68_100..68_120,
     );
     assert!(t.seals_sent > 0, "no backup was sealed: {t:?}");
+}
+
+/// The same node keeps going behind a frozen backup and a cut root: rows
+/// of the backed generation first read after the unbacked one ended are
+/// not acknowledged on a lost dependency.
+#[test]
+fn delegated_two_gens_backlog_keep_their_acknowledgements() {
+    let _ = run_m11(
+        "delegated-two-gens-backlog",
+        delegated_two_gens_backlog_config(),
+        68_200..68_220,
+    );
 }
 
 /// Phase 2b: designations are never recalled by time; cross ops touching
@@ -14322,7 +14382,11 @@ const I4_SEEDS: &[I4Seeds] = &[(
     // group: the in-doubt answers fall elsewhere): 5, 6 and 21 are three of
     // the seeds of 0 to 300 that show a late landing now, unclocked; `+settle`
     // fails with I4 on each.)
-    &[5, 6, 21],
+    // (The review of ADR-39 moved 5, 6 and 21: a stream answer that takes
+    // nothing backs off a fixed 4 ticks, and a recall drains at once. 31,
+    // 44 and 58 are three of the 20 seeds of 0 to 300 with a late landing
+    // now, unclocked; `+settle` fails with I4 on each.)
+    &[31, 44, 58],
 )];
 
 /// Plan 45 follow-up: hard links (`NsOp::Link`) and exchanges

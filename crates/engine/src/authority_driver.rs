@@ -7495,11 +7495,11 @@ impl Standalone {
                     })
                 }
                 Action::SyncDelegStream { gen, through } => {
-                    self.queue.push_back(Event::DelegStreamSynced {
-                        gen,
-                        through,
-                        ok: true,
-                    })
+                    // The tools' driver has no core thread to keep free:
+                    // synced here, reported as the event.
+                    let ok = self.meta.sync().is_ok();
+                    self.queue
+                        .push_back(Event::DelegStreamSynced { gen, through, ok })
                 }
                 Action::CancelTimer { .. }
                 | Action::UploadAwaited { .. }

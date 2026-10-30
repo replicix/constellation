@@ -846,6 +846,15 @@ pub fn deleg_one_backed_gen_core_config(node_id: NodeId, incarnation: u32) -> Co
     c
 }
 
+/// [`deleg_one_backed_gen_core_config`] with one row per stream batch and
+/// per backup append: a delegate's batches back up behind a slow or
+/// absent peer (`delegated-two-gens-backlog`).
+pub fn deleg_one_backed_gen_backlog_core_config(node_id: NodeId, incarnation: u32) -> Config {
+    let mut c = deleg_one_backed_gen_core_config(node_id, incarnation);
+    c.delegation_stream_rows = 1;
+    c
+}
+
 /// Plan 30 §M9: `ack=s3` — no backups, every acknowledgement waits for
 /// the segment, fast takeover on holder silence.
 pub fn ack_s3_core_config(node_id: NodeId, incarnation: u32) -> Config {
@@ -4788,6 +4797,12 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // waited for its deps before executing, so the root never sees a
     // batch whose deps it lacks), and no marker without its data.
     for (id, stats) in &report.stats {
+        if stats.deleg_lost_after_ack > 0 {
+            return Err(format!(
+                "node {id} stopped a generation at {} rows it had answered under the group (a lost dependency)\n  stats: {:#?}",
+                stats.deleg_lost_after_ack, report.stats
+            ));
+        }
         if stats.deleg_deps_unsatisfied_at_append > 0 {
             return Err(format!(
                 "node {id} appended {} delegate batches whose deps it lacked (causal cut)\n  stats: {:#?}",

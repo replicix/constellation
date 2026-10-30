@@ -937,6 +937,9 @@ pub struct Stats {
     /// Delegate: generations stopped before a row whose dependency was
     /// lost with another generation (`DelegateState::lost_from`).
     pub deleg_lost_deps_stopped: u64,
+    /// Delegate: of those, a stop at or below a row already answered under
+    /// the group (must be 0: the simulation fails the run).
+    pub deleg_lost_after_ack: u64,
     /// Root: delegate rows not appended, a dependency lost with its
     /// generation.
     pub deleg_append_deps_lost: u64,
@@ -954,6 +957,10 @@ pub struct Stats {
     pub deleg_xgen_holds: u64,
     pub deleg_xgen_hold_ms: u64,
     pub deleg_xgen_hold_max_ms: u64,
+    /// The acknowledgement rule's own cost: computations of the committed
+    /// prefixes and the dependency entries they visited.
+    pub deleg_caps_calls: u64,
+    pub deleg_caps_walked: u64,
     /// Delegate: parked acknowledgements whose row its own group held but
     /// that waited for another generation's row, how long in all and at
     /// most (from when the own group held it to the release).

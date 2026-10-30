@@ -62333,3 +62333,71 @@ passed (11 ignored). Sweeps, seeds 0 to 1,999, none failing: `long-delegated`, `
 `delegated-backup-and-delegate-die`, `-abandon`, `long-delegated-backup`, `delegated-two-gens-one-backed`,
 `delegated-two-gens-backed`. `placement-hot` (500 seeds, locally) fails seeds 15, 68 and 311 with and without these
 commits (I2c, I5; on main b6831653 the same three).
+
+## Review of the follow-ups: an acknowledged row dropped at a lost dependency read late, and the rule's cost (2026-10-31)
+
+### 6. A row read after its dependency's generation left is never acknowledged (must-fix of ADR-39)
+
+`deleg_note_xdeps` recorded a row's dependencies only on generations still held (`dl.mine`), the backup append never
+looked at `deps_lost`, and `deleg_caps` ignored `lost_from`. A row of 8 depending on 7:i, first read for a batch only
+after 7 ended and left `mine` (its stream and backup backed off, or the table installed ahead of the log before 7's void
+was known), had no recorded dependency: 8's backup held it and the delegate answered it. The root stream then found the
+lost dependency and stopped 8 before the row, and the recall and the drain ended 8 there: an answered row dropped.
+
+Fix. A row whose dependency is lost when it is read stops the generation before it, before anything holds it; neither
+the backup append nor the root stream sends anything at or past `lost_from`. A dependency on a generation this node
+no longer holds, whose rows are still in its journal and whose end is not applied yet (path B's
+`deleg_gens_awaiting_end`, read once per batch and only when such a dependency appears; unreadable counts as ours), is
+recorded and committed only when the log carries it, so the acknowledgement waits, and is aborted once the end shows it
+lost. A dependency on another node's generation was reached when the op executed and waits for nothing. `deleg_caps`
+caps the committed prefix at `lost_from - 1` and reports `lost_from` as `lost_at`. A stop at or below a row already
+answered under the group is an error, counted as `deleg_lost_after_ack`; the simulation fails a run where it is not 0.
+
+Tests and fail-before:
+- core `recall_cut::a_row_read_after_its_dependencys_generation_left_is_never_answered` (the review's probe, with the
+  end applied from the log and with the end installed ahead of it). Fail-before (the review's probe on 27c616a0): 8:1
+  answered `Accepted` with `xdeps` empty, then `lost_from` 1. Mutations: without the check at the read, the end applied
+  first lets the backup take 8:1 and answer it; without recording the dependency on the ended generation, the end
+  installed ahead answers 8:1 `Accepted`.
+- the simulation's `delegated-two-gens-backlog` (new: as `delegated-two-gens-one-backed`, one row per batch, node 2 cut
+  from the root from 1 s to 10 s and its backup frozen from 1 s to 6.8 s and cut from the root, so batches back up
+  past the end of the unbacked range), seeds 0 to 199: on 27c616a0 12 seeds fail `returned success but completed 0
+  times in the log`; with the fix none (52 generations stopped at a lost dependency, `deleg_lost_after_ack` 0).
+
+### 7. The rule's cost, the recall's scan, the no-progress back-off (review shoulds), and nits
+
+- S1, the cost of `deleg_caps`: each step's report now prunes every recorded dependency already committed (a held
+  generation's capped prefix, or the log for any other; committed stays committed), so what is left, and walked, is
+  the dependencies still open, not the backlog. Measured with new counters (`deleg_caps_calls`, `deleg_caps_walked`,
+  in `SWEEP-XGEN-TOTALS`), seeds 0 to 199: `delegated-two-gens-backed` 535,904 computations visited 83,888 entries
+  before, 29,222 after (0.16 to 0.05 per computation, the same 239 delayed acknowledgements); `delegated-two-gens-one-backed`
+  56,288 to 37,718; `delegated-two-gens-backlog` 586,980 to 451,971 (0.39 to 0.30). The caps are not cached across a
+  step: every input (a backup's or the root's acknowledgement, a segment's index, a void, a recorded dependency)
+  changes inside one, and a stale cap would release an acknowledgement early; a computation is a store read per
+  generation and the open entries.
+- S2: the recall's journal read (`Meta::delegate_deps_from`) covers only the rows no batch has read yet (past `xrec`);
+  a row read for a batch had its lost dependency seen then, or its open ones recorded, which `deleg_caps` finds lost
+  (`lost_at`). Its doc says what it decodes (the `journal_tx` entry, op included, not the records).
+- S3: an answer that takes nothing backs off a fixed 4 ticks instead of the refusal's doubling to 2 s (nothing wakes
+  the stream when the dependency arrives), and a recall drops the back-off before it drains. Test:
+  `a_stream_answer_that_takes_nothing_backs_off` (extended). Mutations: with the doubling the second back-off was 8
+  ticks for 4; without the reset the recall's drain sent nothing.
+- Nits: the merged doc comments of `delegate_tx_pending`/`delegate_deps_from` are apart again; `delegation_sync` does not
+  count a waiting install as finished when an active epoch skipped the installs; the tools' driver (`Standalone`)
+  syncs the store for `SyncDelegStream`; the `Lone` lead and the hysteresis (`deleg_lone_held`, `deleg_own_limits`, the
+  published horizon, the lone-lead audit) count the capped prefix as committed, as the acknowledgement does, so a `Lone`
+  row never follows a gated row whose acknowledgement waits on another generation.
+
+### Gates (box, round 4)
+
+`cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean. Lib tests: authority 827,
+meta 380, engine 937, control 146, cli 94 (no failures). `cargo test -p constellation-authority --release --test sim`:
+288 passed (11 ignored), after re-pinning `c0_i4_finds_a_late_landing`'s seeds (the fixed 4-tick back-off and the
+recall's drain moved 5, 6 and 21 of `long-delegated-late-answers` to no late landing; with that change reverted they
+are back; 31, 44 and 58 are three of the 20 seeds of 0 to 300 that qualify now, `+settle` failing with I4 on each).
+Sweeps, seeds 0 to 1,999, none failing: `long-delegated`, `delegated-crash`, `delegated-holder-cut`,
+`delegated-backup-and-delegate-die`, `-abandon`, `long-delegated-backup`, `delegated-two-gens-one-backed`,
+`delegated-two-gens-backed` (2,305 acknowledgements of 189,545 waited for the other generation, as before), and
+`delegated-two-gens-backlog` (543 generations stopped at a lost dependency, `deleg_lost_after_ack` 0). The harness's
+`two-gens-ack-cost`, three runs against main's daemon: creates p50 11.5/12.2/11.8 ms against 11.1/11.7/11.5 ms, p99
+17.9/19.5/19.4 ms against 20.8/18.2/19.2 ms.

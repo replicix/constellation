@@ -39402,6 +39402,142 @@ mod recall_cut {
         assert_eq!(h.core.dl.mine[&8].lost_from, Some(1));
     }
 
+    /// The setup of the review's probe: generations 7 (the root's append its
+    /// group) and 8 (backup 5) of this node; node 2's create under 7 (7:1),
+    /// then its create under 8 with `deps` (7, 1), while 8's stream and
+    /// backup are backed off so 8:1 is not read for a batch yet.
+    fn row_unread_behind_a_busy_backup() -> (Harness, constellation_fs_core::Ino) {
+        let (mut h, dir, low, high) = two_ranges();
+        Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::DelegGroup {
+                dir,
+                gen: 8,
+                version: 1,
+                backups: vec![5],
+            }],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        h.core.cfg.backup_rtt_budget_ms = 50;
+        h.core.cfg.backups_max = 1;
+        h.core.cfg.backup_stable_ms = 0;
+        h.step(Event::Roster {
+            write_eligible: vec![1, 2, 3, 5],
+        });
+        h.step(Event::Peers {
+            links: vec![crate::event::PeerLink {
+                node: 5,
+                connected: true,
+                last_seen: None,
+                rtt_ms: Some(5),
+                since: Some(WaitMs(0)),
+            }],
+        });
+        let d8 = h.core.dl.mine.get_mut(&8).unwrap();
+        d8.backup = Some(5);
+        d8.group_requested = None;
+        let out = forward_with_deps(&mut h, dir, &low, 500, constellation_meta::Position::ZERO);
+        assert!(reply_to_2(&out, 500).is_none(), "{out:?}");
+        let d8 = h.core.dl.mine.get_mut(&8).unwrap();
+        d8.stream_after = Some(WaitMs(i64::MAX / 4));
+        d8.backup_after = Some(WaitMs(i64::MAX / 4));
+        let on_7 = constellation_meta::Position::ZERO.with_streams_wire(&[(7, 1)]);
+        let out = forward_with_deps(&mut h, dir, &high, 501, on_7);
+        assert!(reply_to_2(&out, 501).is_none(), "{out:?}");
+        assert!(h.core.dl.mine[&8].xdeps.is_empty(), "read already");
+        (h, dir)
+    }
+
+    /// 8's backup slot frees: what the append and its acknowledgement
+    /// bring (`None` when nothing was appended).
+    fn backup_slot_frees(h: &mut Harness) -> Option<Vec<Action>> {
+        h.core.dl.mine.get_mut(&8).unwrap().backup_after = None;
+        let mut out = Vec::new();
+        h.core.deleg_backup_stream(h.clk(), &h.meta, &mut out);
+        let breq = sends(&out).into_iter().find_map(|(to, m)| match m {
+            PeerMsg::DelegBackupAppend { req, gen: 8, .. } if to == 5 => Some(*req),
+            _ => None,
+        })?;
+        Some(h.step(Event::Peer {
+            from: 5,
+            msg: PeerMsg::DelegBackupAck {
+                req: breq,
+                gen: 8,
+                acked: 1,
+                sealed: false,
+            },
+        }))
+    }
+
+    /// Review of the acknowledgement rule, must-fix (fail-before: the
+    /// review's probe): 8:1 depends on 7:1 but is first read for a batch
+    /// after 7 ended and left this node's generations. Its dependency was
+    /// not recorded (only generations still held were), 8's backup held it
+    /// and the delegate answered it; then the stream found the lost
+    /// dependency and stopped 8 before 8:1, and the end dropped an answered
+    /// row. Now a row whose dependency is lost when it is read stops the
+    /// generation there before anything holds it, and a dependency on an
+    /// ended generation of this node whose end is not applied yet (the
+    /// table ahead of the log) waits like one on a held generation.
+    #[test]
+    fn a_row_read_after_its_dependencys_generation_left_is_never_answered() {
+        // The end applied from the log: the dependency is lost at the read.
+        let (mut h, dir) = row_unread_behind_a_busy_backup();
+        let end = [LogRecord::RecallCut {
+            dir,
+            gen: 7,
+            through: 0,
+        }];
+        Replica::apply_segment(&h.meta, 3, 1, 0, &[], &[], &end).unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(!h.core.dl.mine.contains_key(&7));
+        let out = backup_slot_frees(&mut h);
+        assert!(out.is_none(), "8:1 appended to the backup: {out:?}");
+        assert_eq!(h.core.dl.mine[&8].lost_from, Some(1));
+        let mut out = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        assert_eq!(reply_to_2(&out, 501), Some(&MutateOutcome::Busy), "{out:?}");
+        assert_eq!(h.core.stats.deleg_lost_after_ack, 0);
+        // The end installed ahead of the log: 7 left, its void not known.
+        let (mut h, dir) = row_unread_behind_a_busy_backup();
+        let end = [LogRecord::RecallCut {
+            dir,
+            gen: 7,
+            through: 0,
+        }];
+        h.meta.install_streamed(1, 1, 1, 1, &end).unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(!h.core.dl.mine.contains_key(&7));
+        let out = backup_slot_frees(&mut h).expect("appended to the backup");
+        assert_eq!(
+            reply_to_2(&out, 501),
+            None,
+            "8:1 answered while 7:1 waits for 7's end: {out:?}"
+        );
+        assert_eq!(
+            h.core.dl.mine[&8]
+                .xdeps
+                .get(&7)
+                .map(|r| r.clone().into_iter().collect::<Vec<_>>()),
+            Some(vec![(1, 1)])
+        );
+        Replica::apply_segment(&h.meta, 3, 1, 1, &[1], &[], &end).unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        assert_eq!(reply_to_2(&out, 501), Some(&MutateOutcome::Busy), "{out:?}");
+        assert_eq!(h.core.stats.deleg_lost_after_ack, 0);
+    }
+
     /// Review follow-up (fail-before): the stream finds a row whose
     /// dependency was lost only in a batch it reads. With a batch of
     /// generation 8 in flight when generation 7 ends, the recall answered
@@ -39506,6 +39642,55 @@ mod recall_cut {
             "(re-sent at once, backing off): {out:?}"
         );
         assert_eq!(h.core.stats.deleg_stream_no_progress, 1);
+        // A fixed short delay (4 ticks), not the refusal's doubling to 2 s:
+        // nothing wakes the stream when the dependency arrives.
+        let tick = h.core.cfg.delegation_stream_tick_ms.max(1) as i64;
+        assert_eq!(
+            h.core.dl.mine[&7].stream_after,
+            Some(WaitMs(h.clk().wait.0 + 4 * tick))
+        );
+        // The tick sends the batch again; taking nothing again backs off
+        // by the same delay, not doubled.
+        h.advance(4 * tick as u64 + 1);
+        let t = h.core.dl.stream_timer.expect("the stream tick is armed");
+        let out = h.step(Event::Timer { id: t });
+        let req = sends(&out)
+            .into_iter()
+            .find_map(|(_, m)| match m {
+                PeerMsg::DelegateStream { req, gen: 7, .. } => Some(*req),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("not sent again on the tick: {out:?}"));
+        h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegateStreamAck {
+                req,
+                gen: 7,
+                round: round_of(&h, 7),
+                through: 0,
+                refused: false,
+            },
+        });
+        assert_eq!(
+            h.core.dl.mine[&7].stream_after,
+            Some(WaitMs(h.clk().wait.0 + 4 * tick)),
+            "the second back-off"
+        );
+        // A recall drains at once, whatever the back-off.
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegRecall {
+                req: OpId(78),
+                dir,
+                gen: 7,
+            },
+        });
+        assert!(
+            sends(&out)
+                .iter()
+                .any(|(_, m)| matches!(m, PeerMsg::DelegateStream { gen: 7, .. })),
+            "the recall's drain waited for the back-off: {out:?}"
+        );
     }
 
     /// The root's half of

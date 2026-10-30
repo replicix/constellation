@@ -2055,7 +2055,12 @@ lost with its generation aborts the acknowledgement. Then every row from
 the first one with a lost dependency on was never acknowledged, and both
 the live end (the delegate stops the generation before the row, its
 recall answers the row before, the root appends no such row) and the
-sealed tail's drain end the generation before it. The dependency is the
+sealed tail's drain end the generation before it. The dependencies
+counted include those on a generation the node no longer holds whose
+rows are still in its journal and whose end it has not applied from the
+log (committed only once the log carries them), and a row whose
+dependency is lost when the delegate reads it for a batch stops the
+generation before it, before any member holds it. The dependency is the
 whole session's, not narrowed to the keys the row touches or the rows
 the op read: the narrowing would let a causal dependency through (a read
 of `/a/x` that wrote `/b/marker` shares no key) and the cost of the whole
