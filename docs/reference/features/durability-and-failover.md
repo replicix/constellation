@@ -272,6 +272,12 @@ lose them. So a claimant of a `Backup` lease first asks the group:
    the epoch, it claims its own expired lease at the next epoch with its
    member copy as the tail.
 
+A member whose store cannot be read (what it holds, its tail, its seal, or
+whether its journal holds rows of the epoch) does not answer a seal at all.
+It neither hands over an empty tail nor says it holds nothing. A backup whose
+seal cannot be read after a restart acknowledges no append until the read
+succeeds.
+
 **If no member answers, the claim waits** rather than claim without the
 tail (`status.lease.waiting_for_group`; a warning once a minute; the
 writes behind it wait for the lease). An operator who knows the group is

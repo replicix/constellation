@@ -3672,7 +3672,7 @@ pub fn meta_holds_rid(meta: &Meta, rid: Rid) -> bool {
     let mut epochs: Vec<u64> = (1..=64).collect();
     epochs.extend(Replica::member_copy_epochs(meta));
     epochs.into_iter().any(|e| {
-        carries(&Replica::backup_tail(meta, e))
+        carries(&Replica::backup_tail(meta, e).unwrap_or_default())
             || Replica::member_copy(meta, e).is_some_and(|(_, txs)| carries(&txs))
     })
 }

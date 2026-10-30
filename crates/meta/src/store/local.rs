@@ -770,6 +770,8 @@ impl Meta {
     /// Plan 43 C1-3: whether an unshipped journal transaction was executed
     /// under lease epoch `epoch`.
     pub fn journal_has_epoch_rows(&self, epoch: u64) -> Result<bool, MetaError> {
+        #[cfg(any(test, feature = "test-util"))]
+        super::backup::injected_read_fault()?;
         let r = self.db.read_tx();
         Ok(read_journal_tx_heads(&r, self)?
             .iter()

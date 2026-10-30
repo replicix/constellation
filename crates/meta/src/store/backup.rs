@@ -200,6 +200,8 @@ impl Meta {
 
     /// The highest `last` held for `epoch` (0: nothing).
     pub fn backup_acked(&self, epoch: u64) -> Result<u64, MetaError> {
+        #[cfg(any(test, feature = "test-util"))]
+        read_fault::check()?;
         // The highest `last` reached *contiguously* from the oldest held
         // transaction: the holder pipelines appends, so a batch can be
         // persisted ahead of a gap, and what a restart reports as held
@@ -224,6 +226,8 @@ impl Meta {
 
     /// The tail held for `epoch`, oldest first.
     pub fn backup_tail(&self, epoch: u64) -> Result<Vec<BackupTx>, MetaError> {
+        #[cfg(any(test, feature = "test-util"))]
+        read_fault::check()?;
         let r = self.db.read_tx();
         let mut out = Vec::new();
         for guard in r.range(
@@ -383,6 +387,8 @@ impl Meta {
     /// The highest epoch this node sealed (0: none). A sealed epoch's
     /// holder gets no acknowledgement from this node, ever again.
     pub fn backup_sealed_epoch(&self) -> Result<u64, MetaError> {
+        #[cfg(any(test, feature = "test-util"))]
+        read_fault::check()?;
         let r = self.db.read_tx();
         Ok(kv_get_tx(&r, &self.local, KV_BACKUP_SEALED)?
             .and_then(|s| s.parse().ok())
@@ -435,6 +441,8 @@ impl Meta {
         in_log: u64,
         txs: &[super::DelegateTx],
     ) -> Result<u64, MetaError> {
+        #[cfg(any(test, feature = "test-util"))]
+        read_fault::check()?;
         let mut tx = self.db.write_tx();
         for t in txs {
             let bytes = postcard::to_allocvec(t)
@@ -537,12 +545,30 @@ impl Meta {
 }
 
 /// Tests only (`test-util`): fail this thread's next `n` reads of a
-/// delegation backup's holdings ([`Meta::deleg_backup_holds_any`],
-/// [`Meta::deleg_backup_tail`]) or of its seal flag
-/// ([`Meta::deleg_backup_sealed`]) with an I/O error.
+/// backup's holdings or seal (a delegation backup's: [`Meta::deleg_backup_holds_any`],
+/// [`Meta::deleg_backup_tail`], [`Meta::deleg_backup_sealed`],
+/// [`Meta::deleg_backup_append`]'s acknowledgement; the root's group:
+/// [`Meta::backup_acked`], [`Meta::backup_tail`], [`Meta::backup_sealed_epoch`],
+/// [`Meta::journal_has_epoch_rows`]; and [`Meta::deleg_group`]) with an I/O
+/// error.
 #[cfg(any(test, feature = "test-util"))]
 pub fn fail_deleg_backup_reads_on_this_thread_for_tests(n: u32) {
+    read_fault::SKIP.with(|c| c.set(0));
     read_fault::LEFT.with(|c| c.set(n));
+}
+
+/// [`fail_deleg_backup_reads_on_this_thread_for_tests`] after letting the
+/// next `skip` of those reads through.
+#[cfg(any(test, feature = "test-util"))]
+pub fn fail_store_reads_after_on_this_thread_for_tests(skip: u32, n: u32) {
+    read_fault::SKIP.with(|c| c.set(skip));
+    read_fault::LEFT.with(|c| c.set(n));
+}
+
+/// The test hook's check, for the store's other reads it covers.
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) fn injected_read_fault() -> Result<(), MetaError> {
+    read_fault::check()
 }
 
 #[cfg(any(test, feature = "test-util"))]
@@ -551,9 +577,18 @@ mod read_fault {
 
     thread_local! {
         pub(super) static LEFT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        pub(super) static SKIP: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
 
     pub(super) fn check() -> Result<(), MetaError> {
+        let skipped = SKIP.with(|c| {
+            let n = c.get();
+            c.set(n.saturating_sub(1));
+            n > 0
+        });
+        if skipped {
+            return Ok(());
+        }
         LEFT.with(|c| {
             let n = c.get();
             c.set(n.saturating_sub(1));

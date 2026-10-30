@@ -61891,3 +61891,27 @@ the link's `last_seen`. A forced abandon is audited: the WARN says `--force` was
 and `groups_abandoned_forced` counts it. Test: `abandon_group_is_refused_while_the_group_was_heard_from_lately` now also
 drops member 4's link, and checks a message from the member and the counter. Fail-before (the core's table unused):
 `heard_ms` was `None` where `Some(200)` was expected.
+
+Q3. These sites turned a read error into a default answer, the same class as df30901c. A test hook now covers all of
+them: `fail_store_reads_after_on_this_thread_for_tests(skip, n)` fails the backup's holdings, tail and seal reads,
+`journal_has_epoch_rows` and `deleg_group`.
+- Root-group backup seal answer (`seal_tail_hold`): `backup_acked` and `backup_tail` fell back to 0 and to nothing. The
+  answer then handed over an empty tail with the claim ending the epoch without the acknowledged rows: `(held, 0 rows,
+  through 0)`, or `(held, 0 rows, through 6)` when the tail read failed. Now a read error, and so does a failed
+  `journal_has_epoch_rows`, gives no answer at all (`seal_tail_unreadable`); a refusal still answers `held: false`.
+  Test: `a_backup_that_cannot_read_its_tail_does_not_answer_a_seal`.
+- `backup_sealed_epoch` fell back to 0 at start (`backup_start`), and the restarted backup acknowledged the sealed
+  epoch's holder (`(6, false)` where `(0, true)` was expected). Now the seal is unknown until a read succeeds. Appends,
+  seal answers and claims wait for it (`Core::backup_sealed_known`). Test:
+  `a_restarted_backup_that_cannot_read_its_seal_acknowledges_nothing_of_the_epoch`.
+- `deleg_backup_append` fell back to 0. It answered `acked: 0` and reset what the node backs of the generation to 0
+  (`(Some((0, false)), Some((3, 0)))`). Now it gives no answer and leaves `backing` alone. Test:
+  `a_backup_that_cannot_persist_an_append_does_not_answer_it`.
+- `deleg_group`'s `.ok().flatten()` emptied the group at a refresh, so the delegate was briefly lone (`(0, [])` where
+  `(1, [4])` was expected). Now the known group stays on an error. Install and inheritance wait for a later sync
+  instead of starting from an empty group. Test: `a_failed_read_of_the_group_keeps_the_group_known`.
+
+Other callers take the conservative side. An acknowledgement starts from 0, which only acknowledges less. A claim's
+tail is taken as carrying rows (`tail_to_inherit`, `own_group_tail`). The gate's `tail_through` falls back to the
+in-memory contiguous hold of the role's epoch. A tail that cannot be read keeps the gate pending (`apply_backup_tail`)
+and the member copy unwritten (`keep_tail_as_member_copy`). Mutations: each fix removed fails its test.

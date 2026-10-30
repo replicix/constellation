@@ -537,6 +537,8 @@ impl Meta {
     /// Plan 43 C2: generation `gen`'s configuration as this replica's table
     /// records it (`None`: no `DelegGroup` record applied, version 0).
     pub fn deleg_group(&self, gen: Gen) -> Result<Option<DelegGroupRow>, MetaError> {
+        #[cfg(any(test, feature = "test-util"))]
+        crate::store::backup::injected_read_fault()?;
         let r = self.db.read_tx();
         read_group_tx(&r, self, gen)
     }

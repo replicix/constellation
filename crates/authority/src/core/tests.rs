@@ -39908,6 +39908,30 @@ mod deleg_group {
         );
     }
 
+    /// Review follow-up (fail-before): the generation's group as the table
+    /// records it is read again at every sync; a read that failed took it
+    /// for "no `DelegGroup` record" and emptied the group, so the delegate
+    /// was lone for a moment and answered its own rows from its disk while
+    /// the root ends the generation by the recorded backup's tail. The group
+    /// it knew stays.
+    #[test]
+    fn a_failed_read_of_the_group_keeps_the_group_known() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        record_group(&mut h, dir, 2, 1, vec![4]);
+        assert_eq!(h.core.dl.mine[&7].group_backups, vec![4]);
+        constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(1);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(0);
+        assert_eq!(
+            (
+                h.core.dl.mine[&7].group_version,
+                h.core.dl.mine[&7].group_backups.clone()
+            ),
+            (1, vec![4])
+        );
+    }
+
     /// While a change is requested and not yet recorded, an acknowledgement
     /// needs the members of both versions (D4): the root may end the
     /// generation by either.
@@ -42167,6 +42191,48 @@ mod deleg_windows_tests {
         );
     }
 
+    /// Review follow-up (fail-before): an append the backup cannot persist,
+    /// or whose acknowledgement it cannot read back, is not answered.
+    /// `deleg_backup_append` fell back to 0: the backup answered `acked: 0`
+    /// and reset what it backed of the generation to 0.
+    #[test]
+    fn a_backup_that_cannot_persist_an_append_does_not_answer_it() {
+        let mut h = Harness::new(4);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let append = |h: &mut Harness, req: u64, idx: u64| {
+            h.step(Event::Peer {
+                from: 3,
+                msg: PeerMsg::DelegBackupAppend {
+                    req: OpId(req),
+                    gen: 7,
+                    txs: vec![tail_row(idx)],
+                },
+            })
+        };
+        let acked = |out: &[Action]| {
+            sends(out).iter().find_map(|(to, m)| match m {
+                PeerMsg::DelegBackupAck { acked, sealed, .. } if *to == 3 => {
+                    Some((*acked, *sealed))
+                }
+                _ => None,
+            })
+        };
+        let out = append(&mut h, 20, 1);
+        assert_eq!(acked(&out), Some((1, false)));
+        // The seal flag reads, the append's write or read-back does not.
+        constellation_meta::fail_store_reads_after_on_this_thread_for_tests(1, 1);
+        let out = append(&mut h, 21, 2);
+        constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(0);
+        assert_eq!(
+            (acked(&out), h.core.dl.backing.get(&7).copied()),
+            (None, Some((3, 1))),
+            "{out:?}"
+        );
+        let out = append(&mut h, 22, 2);
+        assert_eq!(acked(&out), Some((2, false)));
+    }
+
     /// The journal row of an operator's end of a generation (`RecallCut`
     /// and `GroupAbandoned { gen }`, one transaction) matches its own
     /// segment when this node recovers it after a crash: only the epoch
@@ -43021,6 +43087,111 @@ mod c1_tail_fetch {
                 from: at,
             },
         })
+    }
+
+    /// Node 2, the backup of holder 1 for epoch 1 (version 2), holding a
+    /// tail of three transactions.
+    fn backup_holding_a_tail() -> (Harness, Vec<BackupTx>) {
+        let mut h = Harness::new(2);
+        let txs = tail_of(3);
+        h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::BackupAppend {
+                req: OpId(1),
+                epoch: 1,
+                holder: 1,
+                config_version: 2,
+                candidacy: 1,
+                from: 1,
+                txs: txs.clone(),
+                through: 0,
+                sent_ms: 0,
+                expires_ms: 0,
+                clock: 0,
+            },
+        });
+        (h, txs)
+    }
+
+    /// Review follow-up (fail-before): a backup whose store cannot be read
+    /// does not answer a claimant's seal. Reading what it holds
+    /// (`backup_acked`) or the rows (`backup_tail`) fell back to 0 and to
+    /// nothing: the answer handed over an empty tail (held, through 0, or
+    /// through the end with no rows), and the claim ended the epoch without
+    /// the rows its group acknowledged. Whether it holds rows of the epoch as
+    /// a restarted holder (`journal_has_epoch_rows`) is read first, and a
+    /// failure there says nothing either. Once the store reads, the tail is
+    /// answered.
+    #[test]
+    fn a_backup_that_cannot_read_its_tail_does_not_answer_a_seal() {
+        // (skipped reads, what the seal answered on the parent)
+        for skip in [0u32, 1, 2] {
+            let (mut h, txs) = backup_holding_a_tail();
+            constellation_meta::fail_store_reads_after_on_this_thread_for_tests(skip, 1);
+            let out = seal_tail(&mut h, 3, 1, 2, 0);
+            constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(0);
+            assert_eq!(sealed(&out), vec![], "read {skip} failed: {out:?}");
+            let out = seal_tail(&mut h, 3, 1, 2, 0);
+            let last = txs.last().unwrap().last;
+            assert_eq!(
+                sealed(&out),
+                vec![(3, true, txs.len(), last, None)],
+                "{out:?}"
+            );
+        }
+    }
+
+    /// Review follow-up (fail-before): a backup that restarts reads the
+    /// epoch it sealed from its store; a read that failed left it at 0, and
+    /// the backup acknowledged the sealed epoch's holder again. The seal
+    /// unknown, it answers no append and reads it again at the next.
+    #[test]
+    fn a_restarted_backup_that_cannot_read_its_seal_acknowledges_nothing_of_the_epoch() {
+        let (mut h, _) = backup_holding_a_tail();
+        let out = seal_tail(&mut h, 3, 1, 2, 0);
+        assert_eq!(sealed(&out).len(), 1);
+        let cfg = h.core.cfg.clone();
+        let mut r = Harness {
+            core: Core::new(cfg),
+            meta: h.meta,
+            now: h.now.plus(1_000),
+            honour_off: 0,
+            wait_off: 0,
+            manual_horizon: false,
+        };
+        constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(1);
+        let mut out = Vec::new();
+        r.core.start(r.clk(), &r.meta, &mut out);
+        constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(0);
+        let acks = |out: &[Action]| -> Vec<(u64, bool)> {
+            sends(out)
+                .into_iter()
+                .filter_map(|(to, m)| match m {
+                    PeerMsg::BackupAck { acked, sealed, .. } if to == 1 => Some((*acked, *sealed)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let append = |r: &mut Harness, req: u64| {
+            r.step(Event::Peer {
+                from: 1,
+                msg: PeerMsg::BackupAppend {
+                    req: OpId(req),
+                    epoch: 1,
+                    holder: 1,
+                    config_version: 2,
+                    candidacy: 1,
+                    from: 1,
+                    txs: Vec::new(),
+                    through: 0,
+                    sent_ms: 0,
+                    expires_ms: 0,
+                    clock: 0,
+                },
+            })
+        };
+        let out = append(&mut r, 2);
+        assert_eq!(acks(&out), vec![(0, true)], "the sealed epoch: {out:?}");
     }
 
     /// A node that is not a listed backup claims a `Backup` lease past the

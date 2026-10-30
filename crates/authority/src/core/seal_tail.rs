@@ -123,7 +123,8 @@ impl Core {
     /// The rows of `epoch` this node can hand a claimant that seals it, and
     /// the last journal seq of its contiguous hold; sealing first. `None`:
     /// not a member of that epoch's group (or the seal could not be
-    /// persisted: the claimant retries).
+    /// persisted: the claimant retries). A store that could not be read sets
+    /// `bk.seal_unreadable`: no answer at all is sent then.
     fn seal_tail_hold(
         &mut self,
         now: Now,
@@ -133,6 +134,13 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> Option<(Vec<BackupTx>, u64)> {
+        // A store that cannot be read is no answer at all: not "I hold
+        // nothing", nor an empty tail (plan 43 C2e review). The claimant
+        // asks again.
+        if !self.backup_sealed_known(replica) {
+            self.bk.seal_unreadable = true;
+            return None;
+        }
         // 1. The holder of `epoch` (or a node that restarted holding rows it
         // executed under it and has not shipped): it answers from its
         // journal, kept as a member copy, and never acknowledges the epoch
@@ -144,7 +152,14 @@ impl Core {
             .map(|(l, _)| (l.epoch, l.config_version));
         let holds_rows = match held_epoch {
             Some((e, cv)) => e == epoch && !self.lease.epoch_held() && config_version >= cv,
-            None => !self.lease.lost && replica.journal_has_epoch_rows(epoch),
+            None if self.lease.lost => false,
+            None => match replica.journal_has_epoch_rows(epoch) {
+                Some(held) => held,
+                None => {
+                    self.bk.seal_unreadable = true;
+                    return None;
+                }
+            },
         };
         if holds_rows {
             if !replica.backup_seal(epoch) {
@@ -186,12 +201,13 @@ impl Core {
                 }
                 self.bk.sealed = epoch;
             }
-            let acked = replica.backup_acked(epoch);
-            let txs: Vec<BackupTx> = replica
-                .backup_tail(epoch)
-                .into_iter()
-                .filter(|t| t.last <= acked)
-                .collect();
+            let (Some(acked), Some(tail)) =
+                (replica.backup_acked(epoch), replica.backup_tail(epoch))
+            else {
+                self.bk.seal_unreadable = true;
+                return None;
+            };
+            let txs: Vec<BackupTx> = tail.into_iter().filter(|t| t.last <= acked).collect();
             self.stats.seal_tail_backup += 1;
             return Some((txs, acked));
         }
@@ -237,6 +253,12 @@ impl Core {
         let Some((txs, through)) =
             self.seal_tail_hold(now, from, epoch, config_version, replica, out)
         else {
+            if std::mem::take(&mut self.bk.seal_unreadable) {
+                // Not "I hold nothing": nothing at all (the claimant asks
+                // again, or another member answers).
+                self.stats.seal_tail_unreadable += 1;
+                return;
+            }
             self.stats.seal_tail_refused += 1;
             reply(false, Vec::new(), 0, None, out);
             return;
@@ -310,6 +332,8 @@ impl Core {
                 // This node's own copy (a member copy of the inherited
                 // epoch, a role of it): asked in place.
                 let own = self.seal_tail_hold(now, node, epoch, config_version, replica, out);
+                // (Unreadable: not chosen; the other members are asked.)
+                self.bk.seal_unreadable = false;
                 if let Some((txs, through)) = own {
                     if let Some(tf) = self.bk.tf.as_mut() {
                         tf.asked.clear();
@@ -569,7 +593,9 @@ impl Core {
         }
         self.bk.sealed = self.bk.sealed.max(ch.epoch);
         self.bk.role = Some(role);
-        self.bk.acked = replica.backup_acked(ch.epoch);
+        // (Unreadable: what it holds counts from 0, which only ever
+        // acknowledges less; the holder sends again.)
+        self.bk.acked = replica.backup_acked(ch.epoch).unwrap_or(0);
         self.bk.held.clear();
         // The members of the old group: who held the tail a later claimant
         // may ask; this node's copy outlives the fetch.
@@ -692,11 +718,12 @@ impl Core {
         prev: &Lease,
         replica: &dyn Replica,
     ) -> Option<InheritedTail> {
+        // (Unreadable: as if it carried rows, so the lease names the tail
+        // and a later claimant fetches it from the members.)
         let carried = |epoch: Epoch| {
             replica
                 .backup_tail(epoch)
-                .iter()
-                .any(|t| !t.records.is_empty())
+                .is_none_or(|tail| tail.iter().any(|t| !t.records.is_empty()))
         };
         if let Some(f) = self.bk.fetched.as_ref().filter(|f| carried(f.epoch)) {
             return Some(InheritedTail {
@@ -739,7 +766,9 @@ impl Core {
     ) -> Option<InheritedTail> {
         if prev.ack_policy != AckPolicy::Backup
             || prev.backups.is_empty()
-            || !replica.journal_has_epoch_rows(prev.epoch)
+            // (Unreadable: as if it held rows, so the group's tail is
+            // fetched rather than given up.)
+            || !replica.journal_has_epoch_rows(prev.epoch).unwrap_or(true)
         {
             return None;
         }
@@ -762,6 +791,9 @@ impl Core {
     /// re-claims with its own member copy as the tail (D7). `false`: could
     /// not (the seal or the copy did not persist): the claim ends.
     pub(crate) fn prepare_tail_for_claim(&mut self, prev: &Lease, replica: &dyn Replica) -> bool {
+        if !self.backup_sealed_known(replica) {
+            return false;
+        }
         let me = self.cfg.node_id;
         if prev.holder == me && self.bk.sealed >= prev.epoch {
             // Self-sealed: the copy of the epoch is the tail.
@@ -787,7 +819,10 @@ impl Core {
                 };
                 replica.set_backup_role(role);
                 self.bk.role = Some(role);
-                self.bk.acked = replica.backup_acked(prev.epoch);
+                let Some(acked) = replica.backup_acked(prev.epoch) else {
+                    return false;
+                };
+                self.bk.acked = acked;
                 let mut members: Vec<NodeId> = prev.backups.clone();
                 members.push(me);
                 members.sort_unstable();

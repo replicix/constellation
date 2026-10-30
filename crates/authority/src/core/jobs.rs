@@ -3410,7 +3410,10 @@ impl Core {
         // Plan 43 C1-4: what this gate re-ships reaches `through` (the
         // sealed tail's contiguous hold: its marker says so), and the group
         // the operator gave up, if any, strands its committed entries too.
-        self.bk.tail_through = backup_tail_epoch.map_or(0, |e| replica.backup_acked(e));
+        // (Unreadable: the contiguous hold this node keeps of its role's
+        // epoch in memory, the same quantity.)
+        self.bk.tail_through =
+            backup_tail_epoch.map_or(0, |e| replica.backup_acked(e).unwrap_or(self.bk.acked));
         self.bk.gate_abandoned = self.bk.abandoned_claim;
         // Plan 30 §M3 takeover gate; M13: every acquisition drains the
         // older epochs' inbox before its view opens.

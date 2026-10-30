@@ -264,8 +264,12 @@ pub trait Replica {
     fn delegation_table(&self) -> DelegationTable;
     /// Plan 43 C2: generation `gen`'s configuration as this replica's table
     /// records it (`None`: no `DelegGroup` record applied: the group is the
-    /// delegate and the root).
-    fn deleg_group(&self, gen: u64) -> Option<constellation_meta::delegation::DelegGroupRow>;
+    /// delegate and the root). `Err`: the table could not be read, which
+    /// is not "no record": the caller keeps what it knew.
+    fn deleg_group(
+        &self,
+        gen: u64,
+    ) -> Result<Option<constellation_meta::delegation::DelegGroupRow>, MetaError>;
     /// Who executes an op touching `keys` (an ancestor walk on this
     /// replica's table; `Root` at once when the table is empty).
     fn resolve_ownership(&self, keys: &TouchSet) -> Ownership;
@@ -368,8 +372,9 @@ pub trait Replica {
     /// Phase 2b: a delegate's backup persists its transactions; returns
     /// the highest index through which every transaction is in the log
     /// as this replica holds it or held here, contiguously above that
-    /// (`Meta::deleg_backup_acked`).
-    fn deleg_backup_append(&self, gen: u64, txs: &[DelegateTx]) -> u64;
+    /// (`Meta::deleg_backup_acked`). `None`: not persisted, or the
+    /// acknowledgement could not be read back; nothing is answered.
+    fn deleg_backup_append(&self, gen: u64, txs: &[DelegateTx]) -> Option<u64>;
     /// `None`: the store could not be read — the caller must not answer
     /// as if it held nothing (plan 43 C2e).
     fn deleg_backup_tail(&self, gen: u64) -> Option<Vec<DelegateTx>>;
@@ -565,8 +570,12 @@ pub trait Replica {
     /// Backup side: persist the holder's transactions (`true` when
     /// committed — the acknowledgement's meaning).
     fn backup_append(&self, epoch: Epoch, txs: &[BackupTx]) -> bool;
-    fn backup_acked(&self, epoch: Epoch) -> u64;
-    fn backup_tail(&self, epoch: Epoch) -> Vec<BackupTx>;
+    /// The highest journal seq held contiguously for `epoch`; `None`: the
+    /// store could not be read (not "nothing held": no answer is built on
+    /// it).
+    fn backup_acked(&self, epoch: Epoch) -> Option<u64>;
+    /// The tail held for `epoch`; `None`: the store could not be read.
+    fn backup_tail(&self, epoch: Epoch) -> Option<Vec<BackupTx>>;
     /// A segment of `epoch` shipped through `through` with journal
     /// `rows`: trim what it confirms (and every older epoch).
     fn backup_trim(&self, epoch: Epoch, through: u64, rows: &[u64]);
@@ -576,7 +585,9 @@ pub trait Replica {
     /// Persist the seal (`true` when durable — only then is a takeover
     /// attempted).
     fn backup_seal(&self, epoch: Epoch) -> bool;
-    fn backup_sealed_epoch(&self) -> Epoch;
+    /// The highest epoch sealed here; `None`: the flag could not be read
+    /// (not "none": the backup acknowledges nothing until it reads).
+    fn backup_sealed_epoch(&self) -> Option<Epoch>;
     /// Plan 43 C1-3: this node's member copy of `epoch` (`Meta::member_copy*`):
     /// the rows a sealed holder handed a claimant, kept for the next claimant
     /// of the same lease. `put` is persisted and synced before it returns
@@ -601,7 +612,8 @@ pub trait Replica {
     /// Plan 43 C1-3: whether the journal holds an unshipped transaction
     /// that was executed under `epoch` (a restarted holder's rows, which it
     /// still owes a claimant that seals them).
-    fn journal_has_epoch_rows(&self, epoch: Epoch) -> bool;
+    /// `None`: the journal could not be read.
+    fn journal_has_epoch_rows(&self, epoch: Epoch) -> Option<bool>;
     /// A takeover re-applies one of the predecessor's transactions into
     /// this node's own journal (plan 30 §M3b's replay-from-records path),
     /// completing `rid` once. Every chunk an applied manifest names is
@@ -1095,8 +1107,13 @@ impl Replica for Meta {
         Meta::delegation_table(self)
     }
 
-    fn deleg_group(&self, gen: u64) -> Option<constellation_meta::delegation::DelegGroupRow> {
-        Meta::deleg_group(self, gen).ok().flatten()
+    fn deleg_group(
+        &self,
+        gen: u64,
+    ) -> Result<Option<constellation_meta::delegation::DelegGroupRow>, MetaError> {
+        Meta::deleg_group(self, gen).inspect_err(|error| {
+            tracing::warn!(%error, gen, "reading a delegation's group failed");
+        })
     }
 
     fn resolve_ownership(&self, keys: &TouchSet) -> Ownership {
@@ -1178,9 +1195,17 @@ impl Replica for Meta {
         Meta::delegate_tx_pending(self, gen, idx).ok()
     }
 
-    fn deleg_backup_append(&self, gen: u64, txs: &[DelegateTx]) -> u64 {
+    fn deleg_backup_append(&self, gen: u64, txs: &[DelegateTx]) -> Option<u64> {
+        // (A log index that cannot be read counts from 0: the
+        // acknowledgement then covers less, never more.)
         let in_log = Meta::log_stream_idx(self, gen).unwrap_or(0);
-        Meta::deleg_backup_append(self, gen, in_log, txs).unwrap_or(0)
+        match Meta::deleg_backup_append(self, gen, in_log, txs) {
+            Ok(acked) => Some(acked),
+            Err(error) => {
+                tracing::warn!(%error, gen, "persisting a delegate backup's append failed; not answering");
+                None
+            }
+        }
     }
 
     fn deleg_backup_tail(&self, gen: u64) -> Option<Vec<DelegateTx>> {
@@ -1560,12 +1585,18 @@ impl Replica for Meta {
         }
     }
 
-    fn backup_acked(&self, epoch: Epoch) -> u64 {
-        Meta::backup_acked(self, epoch).unwrap_or(0)
+    fn backup_acked(&self, epoch: Epoch) -> Option<u64> {
+        Meta::backup_acked(self, epoch)
+            .inspect_err(
+                |error| tracing::warn!(%error, epoch, "reading a backup's holdings failed"),
+            )
+            .ok()
     }
 
-    fn backup_tail(&self, epoch: Epoch) -> Vec<BackupTx> {
-        Meta::backup_tail(self, epoch).unwrap_or_default()
+    fn backup_tail(&self, epoch: Epoch) -> Option<Vec<BackupTx>> {
+        Meta::backup_tail(self, epoch)
+            .inspect_err(|error| tracing::warn!(%error, epoch, "reading a backup's tail failed"))
+            .ok()
     }
 
     fn backup_trim(&self, epoch: Epoch, through: u64, rows: &[u64]) {
@@ -1626,12 +1657,18 @@ impl Replica for Meta {
         let _ = Meta::member_copy_drop(self, epoch);
     }
 
-    fn journal_has_epoch_rows(&self, epoch: Epoch) -> bool {
-        Meta::journal_has_epoch_rows(self, epoch).unwrap_or(false)
+    fn journal_has_epoch_rows(&self, epoch: Epoch) -> Option<bool> {
+        Meta::journal_has_epoch_rows(self, epoch)
+            .inspect_err(
+                |error| tracing::warn!(%error, epoch, "reading the journal's epochs failed"),
+            )
+            .ok()
     }
 
-    fn backup_sealed_epoch(&self) -> Epoch {
-        Meta::backup_sealed_epoch(self).unwrap_or(0)
+    fn backup_sealed_epoch(&self) -> Option<Epoch> {
+        Meta::backup_sealed_epoch(self)
+            .inspect_err(|error| tracing::warn!(%error, "reading a backup's seal failed"))
+            .ok()
     }
 
     fn apply_records_journaled(

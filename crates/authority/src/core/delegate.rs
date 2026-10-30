@@ -917,8 +917,12 @@ impl Core {
             if self.dl.mine.contains_key(&d.gen) || self.dl.epoch_active {
                 continue;
             }
+            // A group that cannot be read is not "no record": installed at
+            // a later sync (plan 43 C2e review).
+            let Ok(group) = replica.deleg_group(d.gen) else {
+                continue;
+            };
             let stream_round = self.deleg_new_round();
-            let group = replica.deleg_group(d.gen);
             tracing::info!(node = me, dir = d.dir, gen = d.gen, "delegation installed");
             self.stats.deleg_installed += 1;
             // Plan 43 C2e follow-up: a process that held this generation
@@ -1021,6 +1025,11 @@ impl Core {
                 if self.dl.gens.contains_key(&d.gen) {
                     continue;
                 }
+                // Its group unreadable: inherited at a later sync (an empty
+                // group would end it at the cursor without its backup).
+                let Ok(group_row) = replica.deleg_group(d.gen) else {
+                    continue;
+                };
                 // Inherited from a predecessor root. Its grant was capped
                 // by that lease (the model's `cap_by_lease`), which a TTL
                 // takeover has outwaited; a seal-based takeover of an
@@ -1071,7 +1080,7 @@ impl Core {
                         } else {
                             DelegKind::Manual
                         },
-                        group: GroupState::of(replica.deleg_group(d.gen)),
+                        group: GroupState::of(group_row),
                         redelegate: false,
                         granted: now.wait,
                         below_since: None,
@@ -2198,9 +2207,12 @@ impl Core {
     /// records it.
     pub(crate) fn deleg_group_refresh(&mut self, replica: &dyn Replica) {
         for d in self.dl.mine.values_mut() {
-            let (version, backups) = replica
-                .deleg_group(d.gen)
-                .map_or((0, Vec::new()), |r| (r.version, r.backups));
+            // A read that failed is not "no record": the group known stays
+            // (plan 43 C2e review: an emptied group made the delegate lone).
+            let Ok(row) = replica.deleg_group(d.gen) else {
+                continue;
+            };
+            let (version, backups) = row.map_or((0, Vec::new()), |r| (r.version, r.backups));
             if version != d.group_version || backups != d.group_backups {
                 d.group_version = version;
                 d.group_backups = backups;
@@ -2467,7 +2479,12 @@ impl Core {
         };
         let mut acked = self.dl.backing.get(&gen).map(|(_, a)| *a).unwrap_or(0);
         if !sealed && !txs.is_empty() {
-            acked = replica.deleg_backup_append(gen, &txs);
+            // Not persisted, or not read back: no answer (it used to answer
+            // `acked: 0` and reset what this node backs of the generation).
+            let Some(a) = replica.deleg_backup_append(gen, &txs) else {
+                return;
+            };
+            acked = a;
             self.stats.deleg_backup_persisted += txs.len() as u64;
         }
         if !sealed {

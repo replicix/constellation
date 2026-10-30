@@ -742,6 +742,13 @@ pub(crate) struct BackupState {
     pub last_heard: WaitMs,
     /// The highest epoch sealed (persisted by the replica too).
     pub sealed: Epoch,
+    /// The persisted seal could not be read at start: `sealed` is not
+    /// known, and nothing is acknowledged or answered until a read succeeds
+    /// ([`Core::backup_sealed_known`]; plan 43 C2e review).
+    pub(crate) sealed_unread: bool,
+    /// The last `seal_tail_hold` could not read the store: its answer is
+    /// none at all, not a refusal.
+    pub(crate) seal_unreadable: bool,
     pub watch_timer: Option<TimerId>,
     takeover_get: Option<OpId>,
     /// When the silence watch issued `takeover_get`: the holder heard
@@ -1216,14 +1223,34 @@ impl Core {
 
     // ------------------------------------------------------------ start
 
+    /// Whether the highest sealed epoch is known: read again if its read
+    /// failed at start (`false`: still unknown, answer nothing).
+    pub(crate) fn backup_sealed_known(&mut self, replica: &dyn Replica) -> bool {
+        if !self.bk.sealed_unread {
+            return true;
+        }
+        match replica.backup_sealed_epoch() {
+            Some(sealed) => {
+                self.bk.sealed = self.bk.sealed.max(sealed);
+                self.bk.sealed_unread = false;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// At start: a persisted backup role (this node backed someone
     /// before it restarted) and a persisted seal are honoured.
     pub(crate) fn backup_start(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
-        self.bk.sealed = replica.backup_sealed_epoch();
+        match replica.backup_sealed_epoch() {
+            Some(sealed) => self.bk.sealed = sealed,
+            None => self.bk.sealed_unread = true,
+        }
         self.bk.member_epochs = replica.member_copy_epochs();
         if let Some(role) = replica.backup_role() {
             self.bk.role = Some(role);
-            self.bk.acked = replica.backup_acked(role.epoch);
+            // (Unreadable: from 0, which only acknowledges less.)
+            self.bk.acked = replica.backup_acked(role.epoch).unwrap_or(0);
             self.bk.last_heard = now.wait;
             self.bk.restarted = true;
             self.lease.cached_holder = Some(role.holder);
@@ -3893,6 +3920,11 @@ impl Core {
             "backup append received"
         );
         self.note_foreign(now, replica, out);
+        // The seal unknown (its read failed at start): no answer, the holder
+        // sends again (plan 43 C2e review).
+        if !self.backup_sealed_known(replica) {
+            return;
+        }
         let reply = |acked: u64, sealed: bool, fresh: bool, out: &mut Vec<Action>| {
             out.push(Action::Send {
                 to: from,
@@ -3951,7 +3983,8 @@ impl Core {
                 };
                 replica.set_backup_role(role);
                 self.bk.role = Some(role);
-                self.bk.acked = replica.backup_acked(epoch);
+                // (Unreadable: from 0, which only acknowledges less.)
+                self.bk.acked = replica.backup_acked(epoch).unwrap_or(0);
                 self.bk.held.clear();
                 self.bk.candidacy = candidacy;
             }
@@ -4921,7 +4954,9 @@ impl Core {
         role: BackupRole,
         replica: &dyn Replica,
     ) -> bool {
-        let acked = replica.backup_acked(role.epoch);
+        let Some(acked) = replica.backup_acked(role.epoch) else {
+            return false;
+        };
         // (Not what the log carries already: rows of the epoch this replica
         // applied through — a tail that outlived a crash before its trim.
         // Nor a delegate's row the root appended, `origin` of a generation:
@@ -4930,8 +4965,10 @@ impl Core {
         // successor's own copy, `apply_backup_tail`. Kept, it outlived every
         // segment that carried it: delegated-holder-cut seed 170.)
         let shipped = replica.applied_jseq_of(role.epoch);
-        let txs: Vec<BackupTx> = replica
-            .backup_tail(role.epoch)
+        let Some(tail) = replica.backup_tail(role.epoch) else {
+            return false;
+        };
+        let txs: Vec<BackupTx> = tail
             .into_iter()
             .filter(|t| {
                 t.last <= acked && t.last > shipped && !t.records.is_empty() && t.origin == (0, 0)
@@ -4964,7 +5001,11 @@ impl Core {
         prev_epoch: Epoch,
         replica: &dyn Replica,
     ) -> Result<(), String> {
-        let tail = replica.backup_tail(prev_epoch);
+        let Some(tail) = replica.backup_tail(prev_epoch) else {
+            return Err(format!(
+                "the backup tail of epoch {prev_epoch} could not be read"
+            ));
+        };
         // Plan 43 C1-4 (D6): the re-ship is the sealed tail's contiguous
         // prefix. Rows past a gap were never acknowledged (the holder counts
         // contiguous acknowledgements); their clients retry by rid.
