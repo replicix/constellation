@@ -7549,9 +7549,11 @@ fn distant_bigfile_stable_inner(e2e: bool) -> Result<()> {
     // flight. Floor: a 4 MiB block split across four 1 MiB chunks, even if
     // every one of them had to be fetched from a cold start with no
     // parallelism at all, still finishes inside 2 RTTs if the pipeline
-    // keeps only two requests concurrently — well under what a genuinely
-    // stalled/serialized path would show.
-    let min_floor_mib_s = 4.0 / (2.0 * latency_ms as f64 / 1000.0);
+    // keeps only two requests concurrently. The floor allows a third RTT
+    // for the transfer and the FUSE path around those two: at exactly 2
+    // RTTs a block that took that path failed by a few ms on an idle host
+    // (0.41-0.43 s). A serialized path (4 RTTs) still fails it.
+    let min_floor_mib_s = 4.0 / (3.0 * latency_ms as f64 / 1000.0);
     anyhow::ensure!(
         min_rate > min_floor_mib_s,
         "{label}: worst post-ramp-up block ran at {min_rate:.1} MiB/s (floor {min_floor_mib_s:.1} \

@@ -363,7 +363,7 @@ pub fn stale_daemon_lock(_seed: u64) -> Result<()> {
             std::fs::read(a.mnt.join("keep"))? == b"keep",
             "the state dir's data is not served after the takeover"
         );
-        let log = std::fs::read_to_string(root.path().join("a").join("mount.log"))?;
+        let log = a.log_text();
         anyhow::ensure!(
             log.contains("took the state dir over"),
             "the takeover was not logged: {}",
