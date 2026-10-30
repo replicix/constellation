@@ -11312,6 +11312,19 @@ fn forward_timeout_reexec(_seed: u64) -> Result<()> {
 /// three mounted clients plus the switch, positioned right after A has
 /// taken the lease and both B and C see its marker — i.e. right before
 /// the caller cuts A's S3 and does the stranding write.
+///
+/// Every node runs with `CONSTELLATION_BACKUPS=0`: the stranding is that
+/// of an unbacked holder, which acknowledges from memory alone. A takes a
+/// backup once its backup tick has run, and under load that tick often
+/// came before the cut. Then the requester's create either waited for an
+/// archive A could no longer reach (a holder still bringing up its backup
+/// acknowledges at the archive) and went `EIO` at its deadline, or was
+/// committed through the backup, which sealed A's epoch and re-shipped its
+/// tail: no shadow was stranded, rolled back or replayed
+/// (`committed_superseded` instead) — at load 50, 10 of 10 runs of
+/// `holder-crash-phantom-new-holder` and `session-ryw-after-holder-kill`
+/// failed so. The backed handover has its own scenarios
+/// (`holder-publishes-log-prefix-backup` and others).
 fn phantom_setup(scenario: &str) -> Result<PhantomRig> {
     phantom_setup_with(scenario, &[])
 }
@@ -11329,8 +11342,7 @@ type PhantomRig = (
 
 /// As [`phantom_setup`], with `extra` environment on all three nodes
 /// (plan 30 M3b: `takeover-marker-strands-promptly` shortens the idle
-/// poll ceiling so its promptness bound does not ride on the P2P push,
-/// and turns backups off so B's takeover is the unbacked one).
+/// poll ceiling so its promptness bound does not ride on the P2P push).
 fn phantom_setup_with(scenario: &str, extra: &[(&str, &str)]) -> Result<PhantomRig> {
     let (env, root) = setup(scenario)?;
     let _proxy = env.s3_proxy()?;
@@ -11339,7 +11351,8 @@ fn phantom_setup_with(scenario: &str, extra: &[(&str, &str)]) -> Result<PhantomR
     let tune = |c: Client| {
         let mut c = c
             .with_own_node_key()
-            .with_env("CONSTELLATION_LEASE_TTL_MS", "6000");
+            .with_env("CONSTELLATION_LEASE_TTL_MS", "6000")
+            .with_env("CONSTELLATION_BACKUPS", "0");
         for (key, value) in extra {
             c = c.with_env(key, value);
         }
@@ -11562,13 +11575,18 @@ fn holder_crash_phantom_new_holder(_seed: u64) -> Result<()> {
 }
 
 /// The envelope of log segment `seq` in partition `part`, straight from
-/// the bucket: `(node, epoch, record count)`. A non-E2E segment is a zstd
-/// postcard `SegmentEnvelope { v, node, epoch, records }`
-/// (`crates/cli/src/shipper.rs`); every field up to the record vector's
-/// length prefix is a plain varint, so the header decodes without the
-/// record types. Plan 30 M3b uses it to identify an epoch marker (an
-/// empty segment at the new holder's epoch).
-fn segment_header(endpoint: &str, prefix: &str, part: &str, seq: u64) -> Result<(u64, u64, u64)> {
+/// the bucket: `(node, epoch, records)`. A non-E2E segment is a zstd
+/// postcard `SegmentEnvelope { v, node, epoch, records, .. }`
+/// (`constellation_authority::segment`); the fields after `records` are
+/// appended ones this prefix decode never reads. Plan 30 M3b uses it to
+/// identify an epoch marker (a segment of no op at the new holder's
+/// epoch).
+fn segment_header(
+    endpoint: &str,
+    prefix: &str,
+    part: &str,
+    seq: u64,
+) -> Result<(u64, u64, Vec<constellation_meta::LogRecord>)> {
     let key = format!("{prefix}/log/{part}/{seq:016x}.zst");
     let mut compressed = Vec::new();
     crate::s3auth::get(&raw_key(endpoint, &key))
@@ -11579,7 +11597,7 @@ fn segment_header(endpoint: &str, prefix: &str, part: &str, seq: u64) -> Result<
     let payload =
         zstd::decode_all(&compressed[..]).with_context(|| format!("decompressing {key}"))?;
     let ((v, node, epoch, records), _) =
-        postcard::take_from_bytes::<(u32, u64, u64, u64)>(&payload)
+        postcard::take_from_bytes::<(u32, u64, u64, Vec<constellation_meta::LogRecord>)>(&payload)
             .with_context(|| format!("decoding {key}'s envelope"))?;
     // Plan 30 §M7 bumped the wire envelope to v3 (`through`) and §M9
     // added `rows`; both are appended fields this prefix decode never
@@ -11628,7 +11646,8 @@ fn read_commit(endpoint: &str, key: &str) -> Result<serde_json::Value> {
 /// is then replayed by rid through B exactly once: B, C and a fresh node
 /// D all see `phantom` as one inode.
 ///
-/// Every node runs with `CONSTELLATION_BACKUPS=0`. A backed holder hands
+/// Every node runs with `CONSTELLATION_BACKUPS=0` ([`phantom_setup`]; this
+/// scenario was the first to need it). A backed holder hands
 /// over a different way (plan 30 §M9): its backup seals A's epoch about
 /// 1.5 s after A falls silent and takes over by itself, before B's `rmdir`
 /// and whatever B does, and it re-ships A's tail. Its marker then carries a
@@ -11647,10 +11666,7 @@ fn takeover_marker_strands_promptly(_seed: u64) -> Result<()> {
     const PROMPT: Duration = Duration::from_secs(5);
     let (env, root, mut a, mut b, mut c, sw) = phantom_setup_with(
         "takeover-marker-strands-promptly",
-        &[
-            ("CONSTELLATION_SYNC_IDLE_MAX_MS", "1000"),
-            ("CONSTELLATION_BACKUPS", "0"),
-        ],
+        &[("CONSTELLATION_SYNC_IDLE_MAX_MS", "1000")],
     )?;
     let prefix = b
         .backend
@@ -11728,7 +11744,10 @@ fn takeover_marker_strands_promptly(_seed: u64) -> Result<()> {
             b_spec["epoch_markers"].as_u64().unwrap_or(0) >= 1,
             "B took over from a holder that never released but shipped no epoch marker: {b_spec}"
         );
-        // The first segment of B's epoch is B's empty marker.
+        // The first segment of B's epoch is B's marker: no op, only the
+        // statement plan 43 C1-4 makes every takeover marker that carries
+        // no tail make — nothing of A's epoch was committed unshipped
+        // (`TailFollowsThrough { through: 0 }`; A had no backup).
         let mut marker = None;
         for seq in log_segment_seqs(&env.direct_endpoint, &prefix, "p0")? {
             let (node, epoch, records) = segment_header(&env.direct_endpoint, &prefix, "p0", seq)?;
@@ -11739,10 +11758,15 @@ fn takeover_marker_strands_promptly(_seed: u64) -> Result<()> {
         }
         let (seq, node, epoch, records) =
             marker.context("no log segment carries an epoch newer than A's")?;
+        let no_tail = [constellation_meta::LogRecord::TailFollowsThrough {
+            prev_epoch: a_epoch,
+            through: 0,
+        }];
         anyhow::ensure!(
-            node == b_node && epoch == b_epoch && records == 0,
-            "the first segment of the new epoch (seq {seq}) must be B's (node {b_node}) empty \
-             epoch-{b_epoch} marker; it is node {node}, epoch {epoch}, {records} record(s)"
+            node == b_node && epoch == b_epoch && records[..] == no_tail[..],
+            "the first segment of the new epoch (seq {seq}) must be B's (node {b_node}) \
+             epoch-{b_epoch} marker, carrying {no_tail:?} only; it is node {node}, epoch \
+             {epoch}, records {records:?}"
         );
         eprintln!(
             "    takeover-marker-strands-promptly: c stranded its shadow {strand_ms} ms after b's \

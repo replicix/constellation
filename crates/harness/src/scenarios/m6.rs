@@ -630,6 +630,14 @@ pub fn session_ryw_after_holder_kill(_seed: u64) -> Result<()> {
 /// anything B can apply. B's reads then wait the whole budget
 /// (`CONSTELLATION_SESSION_WAIT_MS=1500`) and answer from the replica —
 /// no `EIO` — the first logs one warning, the rest only count.
+///
+/// Both nodes run with `CONSTELLATION_BACKUPS=0`. The hold stops A's sync
+/// rounds only; a backup is fed A's journal over P2P, before S3. A takes B
+/// as its backup once its backup tick has run, and under load that tick
+/// fell inside B's reads: B applied `g` from the stream and the rest of
+/// its reads were rightly fast — the scenario failed "a degraded read took
+/// 1.3 s" (the first, cut short by the stream; then µs) in 5 of 5 runs at
+/// load 50.
 pub fn session_wait_degrades(_seed: u64) -> Result<()> {
     const NAME: &str = "session-wait-degrades";
     const BUDGET_MS: u64 = 1_500;
@@ -637,7 +645,10 @@ pub fn session_wait_degrades(_seed: u64) -> Result<()> {
     let hold = tmp.path().join("hold-a");
     let (_env, _root, mut a, mut b) = two_nodes(
         NAME,
-        &[("CONSTELLATION_SESSION_WAIT_MS", "1500")],
+        &[
+            ("CONSTELLATION_SESSION_WAIT_MS", "1500"),
+            ("CONSTELLATION_BACKUPS", "0"),
+        ],
         Some(&hold),
     )?;
     let result = (|| -> Result<()> {

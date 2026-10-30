@@ -1930,7 +1930,17 @@ Reproducing these needed two things no scenario had before:
   instead of the shared `env.endpoint`, so that one node's S3 path can
   drop while its peers' stay up.
 
-Bug B scenarios (plan 30 M3a regression tests, in `SCENARIOS`):
+Bug B scenarios (plan 30 M3a regression tests, in `SCENARIOS`). Every
+node of their rig (`phantom_setup`, shared with the M3b and M6 scenarios
+below) runs with `CONSTELLATION_BACKUPS=0`: the stranding is an unbacked
+holder's. Under load A's backup tick came before the cut; the
+requester's create then either waited for an archive A could not reach
+(a holder still bringing up its backup acknowledges at the archive) and went
+`EIO` at its deadline, or was committed through the backup, which took
+over and re-shipped A's tail, so nothing was stranded — 10 of 10 runs of
+`holder-crash-phantom-new-holder` and `session-ryw-after-holder-kill`
+failed so at load 50 (`takeover-marker-strands-promptly` was pinned
+first):
 
 - **`holder-crash-phantom-shadow`** (third node takes over). Three
   nodes; A's S3 goes through its own `CountingProxy` switch. A takes the
@@ -1965,10 +1975,12 @@ was rewritten for the same milestone):
   returning, C's `speculation.rolled_back` must rise; only B's epoch
   marker can cause that. B's `speculation.epoch_markers >= 1`, and the
   first log segment at an epoch newer than A's, read straight from the
-  bucket (`segment_header` decodes the envelope's `node`/`epoch`/record
-  count without the record types), must be B's, at B's epoch, with zero
-  records. The stranded create then replays by rid through B exactly
-  once: B, C and a fresh D (after C's clean unmount publishes) see
+  bucket (`segment_header` decodes the envelope's `node`, `epoch` and
+  records), must be B's, at B's epoch, and carry no op: only plan 43
+  C1-4's `TailFollowsThrough { prev_epoch: A's, through: 0 }`, which
+  every takeover marker without a tail carries. (The assertion said zero
+  records until the takeover `EIO` fixed with it stopped hiding it.) The
+  stranded create then replays by rid through B exactly once: B, C and a fresh D (after C's clean unmount publishes) see
   `phantom` as one inode, with no replay conflict. All three nodes run
   with `CONSTELLATION_SYNC_IDLE_MAX_MS=1000`, so the 5 s bound does not
   depend on the P2P push alone, and with `CONSTELLATION_BACKUPS=0`. With
@@ -2083,7 +2095,9 @@ relay of its own so requests can be attributed per role):
   - `session-wait-degrades`: with `CONSTELLATION_SESSION_WAIT_MS=1500`
     and A's shipping held after a refusal, B's lookups answer after the
     budget (no `EIO`), one warning, `timeouts` counted, fast again once A
-    ships;
+    ships. With `CONSTELLATION_BACKUPS=0`: the hold stops A's sync rounds
+    only, and a backup is fed A's journal before S3 — under load A took B
+    as its backup during the reads, and they were rightly fast;
   - `session-idle-latency`: after a 3-node write burst an idle read
     phase never waits; a single node never waits.
 - **`visibility-after-burst`** (plan 30 M7; the local form of the EC2
