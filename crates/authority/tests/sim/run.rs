@@ -3809,6 +3809,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         let operator_abandoned = operator_abandoned.clone();
         tokio::spawn(async move {
             let mut done: BTreeSet<(NodeId, u64)> = BTreeSet::new();
+            let mut forced: BTreeSet<(NodeId, u64)> = BTreeSet::new();
             // The generations the operator saw waiting on the root, and
             // since when (C2e).
             let mut gen_since: BTreeMap<(NodeId, u64), u64> = BTreeMap::new();
@@ -3836,16 +3837,27 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                     }
                     for g in view.delegation.gens.iter().filter(|g| g.7 && !g.6) {
                         let since = *gen_since.entry((id, g.2)).or_insert(now_ms);
-                        if now_ms.saturating_sub(since) >= after_ms && done.insert((id, g.2)) {
+                        let waited = now_ms.saturating_sub(since);
+                        // The command is refused while the root heard from
+                        // the delegate or a member lately (a delegate that
+                        // rebooted and stopped is alive, and still talks to
+                        // the root). The operator, having confirmed that
+                        // the group cannot hand its tail over, forces it
+                        // after waiting as long again.
+                        let force = waited >= 2 * after_ms && done.contains(&(id, g.2));
+                        if waited >= after_ms
+                            && (done.insert((id, g.2)) || (force && forced.insert((id, g.2))))
+                        {
                             fault_log.lock().unwrap().push(format!(
-                                "t={now_ms} node {id}: repair abandon-group --gen {}",
-                                g.2
+                                "t={now_ms} node {id}: repair abandon-group --gen {}{}",
+                                g.2,
+                                if force { " --force" } else { "" }
                             ));
                             operator_abandoned.lock().unwrap().push(g.2);
                             drop(n.control(constellation_authority::Control::AbandonGroup {
                                 epoch: 0,
                                 gen: g.2,
-                                force: false,
+                                force,
                             }));
                         }
                     }

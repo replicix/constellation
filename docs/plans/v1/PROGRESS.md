@@ -61915,3 +61915,15 @@ Other callers take the conservative side. An acknowledgement starts from 0, whic
 tail is taken as carrying rows (`tail_to_inherit`, `own_group_tail`). The gate's `tail_through` falls back to the
 in-memory contiguous hold of the role's epoch. A tail that cannot be read keeps the gate pending (`apply_backup_tail`)
 and the member copy unwritten (`keep_tail_as_member_copy`). Mutations: each fix removed fails its test.
+
+F3. The `delegated-*` configurations and the configurations that reboot nodes were swept at 1,000 seeds before
+(5b6a6b1e) and after. The default clock mix reboots a node in about half the seeds of every configuration that injects
+no clock faults of its own, so the reboot path is in nearly all of them. Thirty configurations were swept:
+`locks-root-reboot`, `locks-root-reboot-step-forward`, and every sweepable `delegated-*` except the three that fail by
+design. Every one had 0 failing seeds on both sides, with one exception: `delegated-backup-and-delegate-die-abandon`
+failed seeds 99, 128 and 992 after the change. In those seeds the clock mix's reboot of the delegate (node 2) came
+before its scheduled death, so node 2 survived. After the reboot it stopped its generation (item 3), the backup died,
+and the simulation's operator was refused: the root still heard from the live, stopped delegate (F2 counts its
+messages). The operator never forced, and an op waited forever. The refusal is the rule working. The simulated
+operator now forces the abandon after it has waited as long again, as one who confirmed the group cannot hand its tail
+over would.
