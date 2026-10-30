@@ -646,13 +646,29 @@ impl AckEntry {
 /// durability check excuses — those the oracle itself judged answered as a
 /// lone node's ([`committed_at_answer`]: no stronger class held, the
 /// answerer's group was itself by the lease object it saw, no peer within
-/// its budget), every judged answer of the rid. What the core *claims* is
-/// not consulted: a core that wrongly claims `Lone` (the class-claim check
-/// judges that claim) must not also hide the loss of a committed op.
+/// its budget), every judged answer of the rid that gave the outcome its
+/// client heard. What the core *claims* is not consulted: a core that
+/// wrongly claims `Lone` (the class-claim check judges that claim) must
+/// not also hide the loss of a committed op.
+///
+/// An answer of another outcome is not the one rolled back: the rid run
+/// again after the rollback, by rid, against a namespace without its
+/// effect (`long-backup` seed 1063: a lone root's acknowledged unlink,
+/// rolled back by the takeover of its successor, which refused the replay
+/// `ENOENT`, the name gone meanwhile — a committed refusal the client
+/// never heard). Without a client's answer (it gave up), every judged
+/// answer counts.
 pub fn lone_answered(acks: &[AckEntry]) -> HashSet<Rid> {
+    let mut heard: BTreeMap<Rid, Vec<OutcomeKind>> = BTreeMap::new();
+    for a in acks.iter().filter(|a| !a.reply) {
+        heard.entry(a.rid).or_default().push(a.kind);
+    }
     let mut lone: BTreeMap<Rid, bool> = BTreeMap::new();
     for a in acks.iter().filter(|a| !a.is_relay()) {
         let Some(j) = &a.judged else { continue };
+        if heard.get(&a.rid).is_some_and(|k| !k.contains(&a.kind)) {
+            continue;
+        }
         *lone.entry(a.rid).or_insert(true) &= j.class == Some(AckClass::Lone);
     }
     lone.into_iter()
@@ -1909,6 +1925,7 @@ mod tests {
             mismatch: None,
         };
         let (a, b, c, d) = (rid(1, 1), rid(1, 2), rid(1, 3), rid(1, 4));
+        let (e, f, g) = (rid(1, 5), rid(1, 6), rid(1, 7));
         let acks = vec![
             // Claimed and judged `Lone`: excused.
             AckEntry {
@@ -1937,8 +1954,37 @@ mod tests {
                 judged: Some(judged(Some(AckClass::RootGroup))),
                 ..ack(1, d, 5, OutcomeKind::Ok, false)
             },
+            // Judged `Lone` at its client's answer; the replay after the
+            // rollback refused by the next root, a committed refusal its
+            // client never heard (long-backup seed 1063): excused.
+            AckEntry {
+                claimed: Some(AckClass::Lone),
+                ..ack(1, e, 6, OutcomeKind::Ok, false)
+            },
+            AckEntry {
+                judged: Some(judged(Some(AckClass::RootGroup))),
+                ..ack(3, e, 7, OutcomeKind::Refused(Code::NotFound), true)
+            },
+            // The same, the second answer of the outcome its client heard:
+            // not excused.
+            AckEntry {
+                claimed: Some(AckClass::Lone),
+                ..ack(1, f, 8, OutcomeKind::Ok, false)
+            },
+            AckEntry {
+                judged: Some(judged(Some(AckClass::RootGroup))),
+                ..ack(3, f, 9, OutcomeKind::Ok, true)
+            },
+            // A relayed answer: judged at the sequencer's reply of the
+            // outcome relayed, not at another reply of the rid.
+            AckEntry {
+                judged: Some(judged(Some(AckClass::RootGroup))),
+                ..ack(3, g, 10, OutcomeKind::Ok, true)
+            },
+            relay(1, 3, g, 11, OutcomeKind::Ok),
+            ack(3, g, 12, OutcomeKind::Refused(Code::Exists), true),
         ];
-        assert_eq!(lone_answered(&acks), HashSet::from([a]));
+        assert_eq!(lone_answered(&acks), HashSet::from([a, e]));
     }
 
     #[test]

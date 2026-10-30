@@ -12303,6 +12303,18 @@ fn slow_lease_reads_are_dated_as_served() {
     }
 }
 
+/// `long-backup` seed 1063: a lone root's acknowledged unlink, rolled back
+/// by its successor's takeover (the excuse `Lone` is for), was replayed by
+/// rid and refused `ENOENT` by the successor; that answer, of an outcome the
+/// client never heard, was judged a committed one and withdrew the excuse
+/// ("returned success but completed 0 times in the log"). It fails before
+/// the oracle judges only the answers of the outcome the client heard
+/// (`oracle::lone_answered`).
+#[test]
+fn a_lone_rollback_is_judged_at_the_answer_its_client_heard() {
+    run_seed(1063, long_backup_config()).unwrap_or_else(|e| panic!("long-backup seed 1063: {e}"));
+}
+
 /// Plan 41 D3 review: the race the send-time dating is for is run, not
 /// assumed. `Report::probe_races` counts the lane answers decided on the
 /// root's own proof (the core's last one stale) after the lease object already
