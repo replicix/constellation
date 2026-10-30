@@ -3564,7 +3564,15 @@ node, 800 to 1,000 ms after they are served (`SimConfig::lease_reads`): a node
 handles a read of the object as it was, after its own CASes and others' have
 landed (`slow_lease_reads_are_dated_as_served`); `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`
 sets them in any configuration, `AUTHORITY_SIM_ROOT_PROBE=0` turns the root
-probe (D3) off.
+probe (D3) off. The knob's sweeps of `long-backup`, `delegated-holder-cut` and
+`long-delegated-late-answers` are pinned seed by seed with their slow lease
+reads (`a_removal_that_empties_the_backup_set_gates_acknowledgements`,
+`a_delegate_turned_root_strands_its_own_rows_after_a_restart`,
+`a_stranded_end_of_a_generation_does_not_void_it`,
+`a_rerouted_own_op_is_not_answered_from_its_uncommitted_row`; `long-backup`
+seed 1063 without the knob, `a_lone_rollback_is_judged_at_the_answer_its_client_heard`).
+A failing seed is the same run threaded or alone, and names the same pair of
+rids every time.
 `locks-core-stall*` (plan 41 L2/L4, `locks_survive_core_stalls`,
 `locks_survive_core_stalls_in_every_topology`): the core of a lock holder
 that is not the lease holder is stuck in one step for 2 s (over a grant's

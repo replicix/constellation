@@ -61660,3 +61660,80 @@ either.
 
 `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean. Lib tests: authority 785, engine 935,
 harness 162 (no failures). `cargo test -p constellation-authority --release --test sim`: 279 passed (11 ignored).
+
+## Order violations and lost acknowledgements of the 2,000-seed slow-lease sweeps: five causes (2026-10-30)
+
+The sweeps of the slow-lease commits (seeds 0 to 1,999, with and without `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`) left five
+failing seeds on main with both fixes: `long-backup` 1063 (no knob), and under the knob `long-backup` 586, `delegated-holder-cut`
+1240 and `long-delegated-late-answers` 259 and 272. Each fails the same way on main with the knob ported and on the slow-lease
+fixes' head; none is either of those two bugs. Four are product bugs, one is the oracle's. Each is pinned by its own test, and
+each pin fails with its own fix reverted and passes with any other one reverted (five single-fix reversions, five pins).
+
+The simulation is deterministic per seed: seed 586's log is the same threaded and alone. The pair of rids a failure named was not
+(three different later rids against the same earlier one): the witnessed check walked a `HashMap`. It walks the log order now.
+
+### What was wrong
+
+1. **The oracle judged a replay's answer as the client's** (`long-backup` 1063, "returned success but completed 0 times in the
+   log"; checker). A lone root acknowledged its client's unlink on its own disk and crashed; the successor took over by TTL, the
+   restarted node rolled the unlink back and replayed it by rid, and the successor refused it `ENOENT`. That is the rollback a
+   `Lone` answer may take (§5.7), and the client's answer was judged `Lone`; but `lone_answered` required every judged answer of
+   the rid to be `Lone`, and the replay's committed refusal (which no client heard) withdrew the excuse. Now only the answers of
+   the outcome the client heard count. The narrowed rule still fails seed 586 with fix 2 reverted (a real loss).
+2. **A removal that empties the backup set acknowledged at once** (`long-backup` 586, "returned before ... was invoked but
+   follows it in the log"). The holder, paused past its backup's acknowledgement timeout, removed it on waking. Whether a backup
+   could be had (`ack.eligible`, the gate for an empty set) had been assessed with that backup listed, and
+   `backup_candidates` leaves listed backups out: no. When the removal landed the held create was answered `Lone` with the peer in
+   budget; the holder crashed, the successor took over without it and the replay ran after later ops. `backup_select` now counts
+   the listed backups in budget in that assessment.
+3. **A stranded end of a generation kept it void** (`long-delegated-late-answers` 259, "the log breaks the node's program order").
+   A deposed root, not yet aware, appended rows 4 and 5 of a delegate's generation and ended it through them (`RecallCut`, which
+   voids the generation in its session at once); the deposition rolled the journal back, appends and end with it, but the session
+   kept the void. Re-elected, the root executed the delegate's next op, whose deps named row 5, before the rows were streamed
+   again. `strand_local_tx` now lifts the void (and the persisted cut) of a generation whose end leaves the journal while the
+   table still lists it (`SessionState::unvoid`).
+4. **The takeover gate missed a restarted delegate's own rows** (`delegated-holder-cut` 1240, "returned before ... was invoked
+   but follows it in the log"). A delegate restarted with rows of its generation in its journal and took the root over; the
+   generation's `Delegate` record was in the tail it re-applied, so neither its table nor its core knew it, and the gate (which
+   strands the core's generations, seed 772's rule) shipped the rows ahead of the tail: an unlink of `d1/f1` before the rename
+   that made it. The gate strands every generation the journal holds rows of that this node assigned indices in
+   (`Core::own_journaled_gens`).
+5. **A re-routed own op was answered from its uncommitted delegate row** (`long-delegated-late-answers` 272, "returned success
+   but completed 0 times in the log"). The delegate's gated row of its own client's create was never held by its backup, which
+   sealed the generation short of it; the op went to retry by rid, found the root out of reach and was answered by
+   `inbox_enqueue` from the replica's `completed` row: the delegate's own uncommitted row, which the generation's end dropped.
+   `settled_outcome` already declined such a row (D6); the inbox route and `answer_awaiting_log` now do too
+   (`Core::completed_row_settled`).
+
+Seen in passing, not changed: the holder of seed 586 removed a healthy backup because its own pause outlasted the backup's
+acknowledgement timeout (latency and churn; safe since fix 2).
+
+### Fail-before
+
+Pins (sim): `a_lone_rollback_is_judged_at_the_answer_its_client_heard` (1063), `a_removal_that_empties_the_backup_set_gates_acknowledgements`
+(586), `a_stranded_end_of_a_generation_does_not_void_it` (259), `a_delegate_turned_root_strands_its_own_rows_after_a_restart`
+(1240), `a_rerouted_own_op_is_not_answered_from_its_uncommitted_row` (272). Unit tests, each failing on its parent:
+`only_a_rid_judged_lone_is_excused` (extended), `a_removal_that_empties_the_set_acknowledges_nothing_while_its_peer_is_in_budget`,
+`a_stranded_end_of_a_generation_lifts_its_void`, `the_takeover_gate_strands_own_rows_of_a_generation_the_core_does_not_hold`,
+`a_rerouted_own_op_is_not_answered_from_its_uncommitted_delegate_row` (it fails at the inbox answer without either guard, and at
+the applied-log answer with the inbox guard alone).
+
+### Sweeps, seeds 0 to 1,999 (release, 8 threads; the fixes against the slow-lease head, with and without the knob)
+
+35 configurations: `locks-failover`, `long-backup` and the 33 `delegated-*` / `long-delegated-*` ones of the slow-lease sweeps
+(`long-delegated-backup` without seed 1682, its known memory blowup).
+
+- **With the knob**: the head fails `long-backup` 586, `delegated-holder-cut` 1240, `long-delegated-late-answers` 259 and 272;
+  the fixes none of them. Nothing fails with the fixes that does not fail on the head: `delegated-core-stall-root-backup` 249 seeds
+  on both (the same seeds, the liveness check of a delegation whose root core was stuck), and the three controls built to fail
+  (`-root-backup-unprobed`, `-root-unlaned`, `-stall-unlaned`) every seed on both.
+- **Without the knob**: the head fails `long-backup` 1063, the fixes nothing; the controls as above. `delegated-root-rate-fast`
+  does not finish in 30 minutes on either (as in the slow-lease sweeps' 25), with no failure before that.
+- Wall time: the slow no-knob configurations ran no slower with the fixes on a quiet machine (`delegated-holder-cut`, 2,000 seeds:
+  400 s against 404 s); the shared box's times moved with its load.
+
+### Gates
+
+`cargo fmt --all --check`, `cargo clippy -p constellation-authority -p constellation-meta --all-targets -- -D warnings` clean.
+Lib tests: authority 782, meta 377 (no failures). `cargo test -p constellation-authority --release --test sim`: 284 passed
+(11 ignored).
