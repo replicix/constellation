@@ -13351,6 +13351,72 @@ mod backup_crash {
         assert_eq!(h.core.ack_need(&pos), None);
     }
 
+    /// The same moment, reached from a listed backup: whether a backup could
+    /// be had is assessed by every selection pass, and one that ran while
+    /// node 2 was listed left it out (it is no candidate: it is a backup).
+    /// The removal CAS then empties the set with node 2 still linked within
+    /// the budget, and the rows the removal held are not acknowledged on
+    /// this disk alone (`long-backup` seed 586 under slow lease reads: the
+    /// holder woke from a pause past node 2's acknowledgement timeout,
+    /// removed it, and acknowledged a create `Lone` the moment the removal
+    /// landed; it crashed, and the successor took over without the row).
+    #[test]
+    fn a_removal_that_empties_the_set_acknowledges_nothing_while_its_peer_is_in_budget() {
+        let mut h = Harness::new(1);
+        h.core.cfg.p2p = true;
+        h.core.cfg.backup_rtt_budget_ms = 50;
+        h.core.cfg.backups_max = 1;
+        h.core.cfg.backup_stable_ms = 0;
+        h.step(Event::Roster {
+            write_eligible: vec![1, 2],
+        });
+        h.step(Event::Peers {
+            links: vec![crate::event::PeerLink {
+                node: 2,
+                connected: true,
+                last_seen: None,
+                rtt_ms: Some(5),
+                since: Some(WaitMs(0)),
+            }],
+        });
+        let listed = backup_lease(1, 1, h.now.plus(10_000).0, vec![2]);
+        h.core.lease.adopt(h.clk(), listed, tag(), None);
+        h.meta.set_holder_epoch(1);
+        // A selection pass with node 2 listed.
+        h.advance(1_000);
+        h.step(Event::Peers {
+            links: vec![crate::event::PeerLink {
+                node: 2,
+                connected: true,
+                last_seen: None,
+                rtt_ms: Some(5),
+                since: Some(WaitMs(0)),
+            }],
+        });
+        // The removal of node 2 lands.
+        let mut out = Vec::new();
+        h.core.issue_reconfig(h.clk(), vec![], &h.meta, &mut out);
+        let op = find_s3(&out, |r| matches!(r, S3Op::LeaseSwap { .. }));
+        h.advance(5);
+        h.step(Event::S3 {
+            op,
+            result: S3Result::LeasePut(Ok(tag())),
+        });
+        assert!(h.core.lease.backups().is_empty());
+        assert!(h.core.ack.candidate.is_none());
+        let pos = constellation_meta::Position {
+            seq: 0,
+            pending: Some(constellation_meta::JournalPos { epoch: 1, jseq: 5 }),
+            streams: Default::default(),
+        };
+        assert_eq!(
+            h.core.ack_need(&pos),
+            Some(5),
+            "acknowledged on this disk alone with node 2 in budget"
+        );
+        assert_ne!(h.core.root_ack_class(), AckClass::Lone);
+    }
+
     /// Plan 43 C7-F F-a0 (the ack side of the review's F1): a `Local`
     /// holder's reconfiguration CAS that lists its candidate fails with
     /// its outcome unknown — it may have landed. The candidate is then cut

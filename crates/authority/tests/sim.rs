@@ -12315,6 +12315,25 @@ fn a_lone_rollback_is_judged_at_the_answer_its_client_heard() {
     run_seed(1063, long_backup_config()).unwrap_or_else(|e| panic!("long-backup seed 1063: {e}"));
 }
 
+/// `long-backup` seed 586 under slow lease reads (`SLOW_LEASE_READS`): the
+/// holder, paused past its backup's acknowledgement timeout, removed the
+/// backup on waking; whether a backup could be had had been assessed with
+/// it listed (so not counted), and the moment the removal landed the
+/// create it held was acknowledged `Lone`, the peer still in budget. The
+/// holder crashed; the successor took over without the row. It fails
+/// before the assessment counts the listed backups (`backup_select`).
+#[test]
+fn a_removal_that_empties_the_backup_set_gates_acknowledgements() {
+    run_seed(
+        586,
+        SimConfig {
+            lease_reads: SLOW_LEASE_READS,
+            ..long_backup_config()
+        },
+    )
+    .unwrap_or_else(|e| panic!("long-backup seed 586 (slow lease reads): {e}"));
+}
+
 /// Plan 41 D3 review: the race the send-time dating is for is run, not
 /// assumed. `Report::probe_races` counts the lane answers decided on the
 /// root's own proof (the core's last one stale) after the lease object already

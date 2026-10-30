@@ -2742,27 +2742,38 @@ impl Core {
     /// Eligible peers, best first: in the roster, connected, within the
     /// RTT budget, stable, not us, not already a backup.
     pub(crate) fn backup_candidates(&self, now: Now) -> Vec<NodeId> {
-        if self.cfg.backup_rtt_budget_ms == 0 || self.cfg.backups_max == 0 {
-            return Vec::new();
-        }
-        let mut eligible: Vec<(WaitMs, NodeId)> = self
-            .links
-            .values()
-            .filter(|l| l.node != self.cfg.node_id && l.connected)
-            .filter(|l| self.roster.contains(&l.node))
-            .filter(|l| !self.lease.backups().contains(&l.node))
-            .filter(|l| {
-                l.rtt_ms
-                    .is_some_and(|rtt| rtt <= self.cfg.backup_rtt_budget_ms)
-            })
-            .filter(|l| {
-                l.since
-                    .is_some_and(|since| now.wait.since(since) >= self.cfg.backup_stable_ms as i64)
-            })
-            .map(|l| (l.since.unwrap_or(now.wait), l.node))
-            .collect();
+        self.backup_peers_in_budget(now)
+            .filter(|n| !self.lease.backups().contains(n))
+            .collect()
+    }
+
+    /// The peers that could back this node now, listed ones included:
+    /// linked, on the roster, within the RTT budget and up for the
+    /// stability window, oldest link first ([`Self::backup_candidates`]
+    /// leaves the listed ones out).
+    fn backup_peers_in_budget(&self, now: Now) -> impl Iterator<Item = NodeId> {
+        let mut eligible: Vec<(WaitMs, NodeId)> =
+            if self.cfg.backup_rtt_budget_ms == 0 || self.cfg.backups_max == 0 {
+                Vec::new()
+            } else {
+                self.links
+                    .values()
+                    .filter(|l| l.node != self.cfg.node_id && l.connected)
+                    .filter(|l| self.roster.contains(&l.node))
+                    .filter(|l| {
+                        l.rtt_ms
+                            .is_some_and(|rtt| rtt <= self.cfg.backup_rtt_budget_ms)
+                    })
+                    .filter(|l| {
+                        l.since.is_some_and(|since| {
+                            now.wait.since(since) >= self.cfg.backup_stable_ms as i64
+                        })
+                    })
+                    .map(|l| (l.since.unwrap_or(now.wait), l.node))
+                    .collect()
+            };
         eligible.sort();
-        eligible.into_iter().map(|(_, n)| n).collect()
+        eligible.into_iter().map(|(_, n)| n)
     }
 
     fn backup_select(&mut self, now: Now, _replica: &dyn Replica, _out: &mut Vec<Action>) {
@@ -2776,7 +2787,20 @@ impl Core {
             .into_iter()
             .filter(|n| !self.ack.refused_epoch.contains_key(n))
             .collect();
-        self.ack.eligible = Some(!candidates.is_empty());
+        // Whether a backup could be had counts the listed ones too: it
+        // must still be right once a removal CAS empties the set, before
+        // the next selection pass assesses it again (`durable_jseq_held`).
+        // Assessed while the backup being removed was still listed, it
+        // said no, and the moment the removal landed the ops it held were
+        // acknowledged on this disk alone (`Lone`) with that peer linked
+        // within the budget (long-backup seed 586 under slow lease reads:
+        // the holder, paused past its backup's acknowledgement timeout,
+        // removed it on waking; it crashed 100 ms later, and the successor
+        // took over without the acknowledged create).
+        let listed_in_budget = self
+            .backup_peers_in_budget(now)
+            .any(|n| self.lease.backups().contains(&n) && !self.ack.refused_epoch.contains_key(&n));
+        self.ack.eligible = Some(!candidates.is_empty() || listed_in_budget);
         if self.ack.candidate.is_some()
             || self.ack.reconfig.is_some()
             || self.lease.backups().len() >= self.cfg.backups_max
