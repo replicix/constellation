@@ -4009,6 +4009,20 @@ impl Core {
                     return;
                 };
                 match current {
+                    // Served before a CAS of ours that landed (a
+                    // reconfiguration out beside the renewal): it says
+                    // nothing of the object now. Read again
+                    // (`LeaseState::renewed`).
+                    Some((cur, _)) if self.lease.is_older_than_held(&cur) => {
+                        let op = self.issue_s3(S3Op::LeaseGet, S3For::Job, out);
+                        self.set_phase(
+                            Phase::RenewReread {
+                                final_probe,
+                                mid_ship,
+                            },
+                            Some(op),
+                        );
+                    }
                     Some((cur, tag))
                         if cur.holder == self.cfg.node_id && cur.epoch == mine.epoch =>
                     {

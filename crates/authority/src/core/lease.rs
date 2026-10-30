@@ -713,8 +713,25 @@ impl LeaseState {
         self.reconfig_doubt = None;
     }
 
-    /// `LeaseKeeper::apply_renew`'s `Renewed` arm.
+    /// `LeaseKeeper::apply_renew`'s `Renewed` arm, and the adoption of a
+    /// lease read of this tenure (a re-read after a CAS that lost).
+    ///
+    /// A body of this tenure at an older `config_version` than the one
+    /// held is a read served before a CAS of ours landed and answered
+    /// after it (two of the holder's CASes may be out at once: a renewal
+    /// and a reconfiguration). It is not adopted: the held body and its
+    /// tag are the newer, and S3 holds no older version than they are
+    /// (versions only grow). Adopted, it set the backup set back to what
+    /// the landed reconfiguration replaced: acknowledgements rested on a
+    /// set S3 no longer listed (none: this disk alone) while a backup the
+    /// landed version lists sealed the tenure and took over without them
+    /// (`locks-core-stall-backup-long-slow-lease` seed 458). The rule of
+    /// plan 43 C1-1 on the holder's side (`observe_body`, `on_takeover_get`
+    /// hold it for the observation and the backup role).
     pub fn renewed(&mut self, now: Now, lease: Lease, tag: LeaseTag) {
+        if self.is_older_than_held(&lease) {
+            return;
+        }
         // Union with what inbox batches already told us (M5): a renewal
         // object that predates a batch's flag must not forget it.
         let mut wanted = lease.wanted_by.clone();
@@ -734,6 +751,16 @@ impl LeaseState {
         self.observe_own(now, &lease, &tag);
         self.held = Some((lease, tag));
         self.reconfig_doubt = None;
+    }
+
+    /// Whether `lease` is a body of the held tenure older than the held one
+    /// (see [`Self::renewed`]).
+    pub fn is_older_than_held(&self, lease: &Lease) -> bool {
+        self.held.as_ref().is_some_and(|(h, _)| {
+            h.holder == lease.holder
+                && h.epoch == lease.epoch
+                && lease.config_version < h.config_version
+        })
     }
 
     /// `LeaseKeeper::mark_lost`.
@@ -1008,6 +1035,35 @@ mod tests {
                 .await
                 .unwrap()
         })
+    }
+
+    /// A read of the held tenure older than the held body (served before
+    /// a reconfiguration of ours landed) is not adopted; a newer one is.
+    #[test]
+    fn an_older_read_of_the_tenure_does_not_set_the_held_body_back() {
+        let cfg = cfg();
+        let now = Now::same(1_000_000);
+        let mut st = LeaseState::default();
+        let v4 = st.granted_lease(now, &cfg, None, false);
+        let v5 = v4.reconfigured(vec![2], AckPolicy::Backup);
+        assert!(v5.config_version > v4.config_version);
+        st.adopt(now, v5.clone(), tag(), None);
+        assert!(st.is_older_than_held(&v4));
+        st.renewed(now, v4.clone(), tag());
+        assert_eq!(st.backups(), &[2], "the older read set the backups back");
+        assert_eq!(
+            st.held.as_ref().unwrap().0.config_version,
+            v5.config_version
+        );
+        // Another tenure's body is not "older": it is the caller's to judge.
+        let theirs = Lease {
+            epoch: v4.epoch + 1,
+            ..v4.clone()
+        };
+        assert!(!st.is_older_than_held(&theirs));
+        let v6 = v5.reconfigured(vec![], AckPolicy::Local);
+        st.renewed(now, v6.clone(), tag());
+        assert!(st.backups().is_empty());
     }
 
     #[test]

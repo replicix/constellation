@@ -321,6 +321,10 @@ pub struct SimConfig {
     /// request is served; the reply half of a slow read is what makes the
     /// time a proof is dated at matter.
     pub probe_reads: super::store::SlowReads,
+    /// How much slower than `s3_latency` the lease GETs of every node's
+    /// handle are, before being served and on their way back
+    /// (`Bucket::set_lease_reads`).
+    pub lease_reads: super::store::SlowReads,
     /// Plan 41 D3 review: fail a run in which a lane answered on the root's own
     /// proof of liveness a freshness window or more after the tenure was
     /// taken over (`Bucket::probe_late`).
@@ -885,6 +889,7 @@ impl Default for SimConfig {
             names: 4,
             s3_latency: (5, 40),
             probe_reads: super::store::SlowReads::default(),
+            lease_reads: super::store::SlowReads::default(),
             check_probe_dating: false,
             p2p_delay: (1, 15),
             p2p_drop: 0.0,
@@ -3550,6 +3555,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let clock = Clock::start();
     SIM_START.with(|t| t.set(Some(tokio::time::Instant::now())));
     let bucket = Bucket::new(seed, cfg.s3_latency);
+    bucket.set_lease_reads(cfg.lease_reads);
     let bus = Bus::new(seed, cfg.p2p_delay, cfg.p2p_drop);
     bus.set_stream_faults(cfg.stream_faults.clone());
     bus.set_beats_lost(cfg.beats_lost);

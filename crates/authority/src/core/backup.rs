@@ -2148,6 +2148,12 @@ impl Core {
             return;
         };
         match result {
+            // Served before a CAS of ours that landed: it cannot tell
+            // whether the clear did. Read again (`LeaseState::renewed`).
+            S3Result::LeaseGet(Ok(Some((cur, _)))) if self.lease.is_older_than_held(&cur) => {
+                let op = self.issue_s3(S3Op::LeaseGet, S3For::ClearMarkReread, out);
+                self.ack.unmarking = Some(op);
+            }
             S3Result::LeaseGet(Ok(Some((cur, tag))))
                 if cur.holder == self.cfg.node_id && cur.epoch == mine.epoch =>
             {
@@ -3312,6 +3318,12 @@ impl Core {
             return;
         };
         match result {
+            // Served before a CAS of ours that landed: read again
+            // (`LeaseState::renewed`).
+            S3Result::LeaseGet(Ok(Some((cur, _)))) if self.lease.is_older_than_held(&cur) => {
+                self.issue_s3(S3Op::LeaseGet, S3For::ReconfigReread, out);
+                self.ack.reconfig = Some(r);
+            }
             S3Result::LeaseGet(Ok(Some((cur, tag))))
                 if cur.holder == self.cfg.node_id && cur.epoch == mine.epoch =>
             {

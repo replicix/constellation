@@ -3559,6 +3559,12 @@ successor: the race the send-time dating exists for. Mutual exclusion does not
 see the mutant, whose extra life is hidden by the `3 x expiry margin` the
 successor's floor and the grant caps carry. `AUTHORITY_SIM_PROBE_READS=0:200:300:900`
 sets the slow reads of any configuration.
+`-long-slow-lease` and `backup-slow-lease` hold back the lease GETs of every
+node, 800 to 1,000 ms after they are served (`SimConfig::lease_reads`): a node
+handles a read of the object as it was, after its own CASes and others' have
+landed (`slow_lease_reads_are_dated_as_served`); `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`
+sets them in any configuration, `AUTHORITY_SIM_ROOT_PROBE=0` turns the root
+probe (D3) off.
 `locks-core-stall*` (plan 41 L2/L4, `locks_survive_core_stalls`,
 `locks_survive_core_stalls_in_every_topology`): the core of a lock holder
 that is not the lease holder is stuck in one step for 2 s (over a grant's

@@ -208,6 +208,9 @@ pub struct Bucket {
     /// from the send.
     taken_over: Mutex<std::collections::HashMap<(u64, u64), tokio::time::Instant>>,
     pub probe_late: Mutex<Vec<String>>,
+    /// How much slower the lease GETs of every node's handle are than the
+    /// bucket's latency (`SimConfig::lease_reads`).
+    lease_reads: Mutex<SlowReads>,
 }
 
 impl Bucket {
@@ -224,7 +227,13 @@ impl Bucket {
             probe_races: std::sync::atomic::AtomicU64::new(0),
             taken_over: Mutex::new(std::collections::HashMap::new()),
             probe_late: Mutex::new(Vec::new()),
+            lease_reads: Mutex::new(SlowReads::default()),
         })
+    }
+
+    /// Slow the lease GETs of every node's handle by `reads`.
+    pub fn set_lease_reads(&self, reads: SlowReads) {
+        *self.lease_reads.lock().unwrap() = reads;
     }
 
     /// The backing store, for the checkers (never faulted).
@@ -507,7 +516,12 @@ impl ObjectStore for NodeStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        if let Some(d) = self.bucket.draw(self.reads.before) {
+        let reads = if self.reads == SlowReads::default() && location.as_ref() == "leases/p0.json" {
+            *self.bucket.lease_reads.lock().unwrap()
+        } else {
+            self.reads
+        };
+        if let Some(d) = self.bucket.draw(reads.before) {
             tokio::time::sleep(d).await;
         }
         match self.admit(OpKind::Get, location).await? {
@@ -516,7 +530,7 @@ impl ObjectStore for NodeStore {
                 // (the object may change meanwhile, the caller sees the
                 // state of the serving instant).
                 let served = self.bucket.inner.get_opts(location, options).await;
-                if let Some(d) = self.bucket.draw(self.reads.reply) {
+                if let Some(d) = self.bucket.draw(reads.reply) {
                     tokio::time::sleep(d).await;
                 }
                 served

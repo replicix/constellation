@@ -5325,6 +5325,10 @@ fn sweep_config() {
         "locks-core-stall-backup-long-dated-at-return" => {
             locks_core_stall_backup_long_dated_at_return_config()
         }
+        "locks-core-stall-backup-long-slow-lease" => {
+            locks_core_stall_backup_long_slow_lease_config()
+        }
+        "backup-slow-lease" => backup_slow_lease_config(),
         "locks-core-stall-s3" => locks_core_stall_s3_config(),
         "locks-core-stall-writes" => locks_core_stall_writes_config(),
         "locks-core-stall-blips" => locks_core_stall_blips_config(),
@@ -5439,6 +5443,18 @@ fn sweep_config() {
                 before: (n[0], n[1]),
                 reply: (n[2], n[3]),
             };
+        }
+        // `AUTHORITY_SIM_LEASE_READS=0:0:200:1400`: the same for the lease
+        // GETs of every node's handle.
+        if let Ok(v) = std::env::var("AUTHORITY_SIM_LEASE_READS") {
+            let n: Vec<u64> = v.split(':').map(|x| x.parse().expect("ms")).collect();
+            c.lease_reads = sim::store::SlowReads {
+                before: (n[0], n[1]),
+                reply: (n[2], n[3]),
+            };
+        }
+        if std::env::var("AUTHORITY_SIM_ROOT_PROBE").is_ok_and(|v| v == "0") {
+            c.deleg_root_probe = false;
         }
         // Plan 43 C7a (commit 6): `AUTHORITY_SIM_CLOCK_FAULTS=0` leaves the
         // default clock-fault mix out of any configuration (with
@@ -9548,6 +9564,36 @@ const SLOW_READS: sim::store::SlowReads = sim::store::SlowReads {
     reply: (300, 900),
 };
 
+/// [`locks_core_stall_backup_long_config`] with the lease GETs of every node
+/// held back 800 to 1,000 ms after they are served (`SimConfig::lease_reads`):
+/// a node acts on a lease read that may be older than what it, or anyone,
+/// wrote since. The holder adopted such a read of its own tenure over the
+/// reconfiguration it had just landed (seed 458: an acknowledgement lost).
+/// `slow_lease_reads_are_dated_as_served`.
+fn locks_core_stall_backup_long_slow_lease_config() -> SimConfig {
+    SimConfig {
+        lease_reads: SLOW_LEASE_READS,
+        ..locks_core_stall_backup_long_config()
+    }
+}
+
+/// [`backup_config`] with every node's lease GETs held back after they are
+/// served, as in [`locks_core_stall_backup_long_slow_lease_config`].
+fn backup_slow_lease_config() -> SimConfig {
+    SimConfig {
+        lease_reads: SLOW_LEASE_READS,
+        ..backup_config()
+    }
+}
+
+/// How long every node's lease GETs are held back after being served in the
+/// slow-lease configurations (ms). Within the probe's 1 s window, so the root
+/// probe's reads still count.
+const SLOW_LEASE_READS: sim::store::SlowReads = sim::store::SlowReads {
+    before: (0, 0),
+    reply: (800, 1_000),
+};
+
 /// `ack=s3`: a subscriber takes the lease over after the core's silence
 /// (the stream heartbeat is a core timer). Safety only; the lane is not
 /// expected to add anything here.
@@ -12230,6 +12276,23 @@ fn a_proof_dated_at_the_return_of_the_read_is_caught() {
             e.contains("probe dating violated"),
             "seed {seed}: another failure: {e}"
         );
+    }
+}
+
+/// A lease read is the object as it was when S3 served it, which may be long
+/// before its answer is handled (`locks-core-stall-backup-long-slow-lease`:
+/// every node's lease GETs held back 800 to 1,000 ms on their way back).
+/// Seed 458: the stuck root's renewal re-read was served before its own
+/// reconfiguration (listing a backup) landed and answered after; adopted, it
+/// set the backup set back to none, the root acknowledged an unlink on its
+/// own disk alone, and the listed backup sealed the tenure and took over
+/// without it (returned success, 0 times in the log). It fails before the fix
+/// (the held body is not set back by an older read, `LeaseState::renewed`).
+#[test]
+fn slow_lease_reads_are_dated_as_served() {
+    for seed in [458u64] {
+        run_seed(seed, locks_core_stall_backup_long_slow_lease_config())
+            .unwrap_or_else(|e| panic!("locks-core-stall-backup-long-slow-lease seed {seed}: {e}"));
     }
 }
 
