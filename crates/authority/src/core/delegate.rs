@@ -2224,14 +2224,15 @@ impl Core {
         let caps = self.deleg_caps(&mut |g| replica.log_stream_idx(g), replica);
         let mine: BTreeSet<u64> = self.dl.mine.keys().copied().collect();
         let log_idx = replica.log_stream_idx(gen);
-        // This node's ended generations whose rows are still in its journal,
-        // their end not applied from the log yet (path B's query, read once
-        // and only if a dependency names a generation not held here): a
-        // dependency on one of them is not committed until the log carries
-        // it, and is lost if the end comes below it. A generation of
-        // another node was reached when the op executed and waits for
-        // nothing here. `None` (unreadable): every such dependency waits.
-        let mut own_ended: Option<Option<Vec<u64>>> = None;
+        // A dependency on a generation not held here: this node's own ended
+        // generation (it assigned stream indices in it,
+        // `Replica::delegate_assigned`, one read per generation and batch)
+        // is not committed until the log carries it, and lost if the end
+        // came below it (`deps_lost`, above); past the log's index and not
+        // lost, its end is not applied here yet. A generation of another
+        // node was reached when the op executed and waits for nothing here.
+        // An unreadable answer counts as this node's own.
+        let mut not_held: BTreeMap<u64, (u64, Option<bool>)> = BTreeMap::new();
         let mut lost_at = None;
         let mut entries: Vec<(u64, u64, u64)> = Vec::new();
         for t in txs {
@@ -2250,15 +2251,19 @@ impl Core {
                         continue;
                     }
                 } else {
-                    if i <= replica.log_stream_idx(h) {
+                    let stats = &mut self.stats;
+                    let (h_log, own) = not_held.entry(h).or_insert_with(|| {
+                        stats.deleg_xdeps_log_reads += 1;
+                        (replica.log_stream_idx(h), None)
+                    });
+                    if i <= *h_log {
                         continue;
                     }
-                    let ended = own_ended.get_or_insert_with(|| {
-                        let live: BTreeSet<u64> =
-                            replica.delegation_table().iter().map(|d| d.gen).collect();
-                        replica.deleg_gens_awaiting_end(&live)
+                    let own = *own.get_or_insert_with(|| {
+                        stats.deleg_xdeps_own_checks += 1;
+                        replica.delegate_assigned(h).unwrap_or(true)
                     });
-                    if ended.as_ref().is_some_and(|g| !g.contains(&h)) {
+                    if !own {
                         continue;
                     }
                 }
@@ -2546,7 +2551,26 @@ impl Core {
     /// gated row its group holds but whose dependency on another generation
     /// is open is not committed: a `Lone` row behind it would be replayed
     /// without it if it were dropped).
+    ///
+    /// A generation with no recorded dependency open is capped by nothing
+    /// another generation holds (the fixpoint lowers a prefix only through
+    /// its own entries): its prefix is computed alone, without the others'
+    /// (the own-op path asks this on every row).
     fn deleg_committed_capped(&self, gen: u64, replica: &dyn Replica) -> u64 {
+        let Some(d) = self.dl.mine.get(&gen) else {
+            return replica.log_stream_idx(gen);
+        };
+        if d.xdeps.is_empty() {
+            let log = replica.log_stream_idx(gen);
+            if self.cfg.ack_s3 {
+                return log;
+            }
+            let mut committed = Self::deleg_group_through(d).max(log).min(d.xrec.max(log));
+            if let Some(l) = d.lost_from {
+                committed = committed.min((l - 1).max(log));
+            }
+            return committed;
+        }
         self.deleg_caps(&mut |g| replica.log_stream_idx(g), replica)
             .get(&gen)
             .map_or_else(|| replica.log_stream_idx(gen), |c| c.committed)

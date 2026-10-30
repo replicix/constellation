@@ -62401,3 +62401,26 @@ Sweeps, seeds 0 to 1,999, none failing: `long-delegated`, `delegated-crash`, `de
 `delegated-two-gens-backlog` (543 generations stopped at a lost dependency, `deleg_lost_after_ack` 0). The harness's
 `two-gens-ack-cost`, three runs against main's daemon: creates p50 11.5/12.2/11.8 ms against 11.1/11.7/11.5 ms, p99
 17.9/19.5/19.4 ms against 20.8/18.2/19.2 ms.
+
+### 8. The dependency classification reads one key per generation; the own-op path computes its prefix alone (review follow-up)
+
+- `deleg_note_xdeps` ran path B's query (`deleg_gens_awaiting_end`: the table decoded and a seek per generation of
+  the journal) once per batch whenever a dependency named a generation not held here past the log's index, another
+  node's generation included while the log lagged. It now reads, once per such generation and batch, whether this
+  node assigned stream indices in it (`Replica::delegate_assigned`, one key; unreadable counts as its own) and the log's
+  index of it: only this node's own ended generations can be awaiting their end here, and past the log's index and
+  not lost (the row's `deps_lost` check) the end of one is not applied yet.
+- `deleg_committed_capped` (the `Lone` lead and hysteresis on the own-op path, `deleg_own_limits`) computes a
+  generation's prefix alone when it has no recorded dependency open: the fixpoint lowers a prefix only through the
+  generation's own entries, so the result is the same.
+
+Counters (`SWEEP-XGEN-TOTALS`), seeds 0 to 199, before and after: `delegated-two-gens-backlog` path B's queries 26,486
+to 0 (26,486 single-key reads instead), log-index reads 29,976 both, `deleg_caps` computations 1,520,342 to 1,052,217;
+`delegated-two-gens-backed` queries 0 both, log-index reads 1,225 to 1,196, computations 981,596 to 541,507;
+`long-delegated-backup` queries 0 both, log-index reads 11,357 to 9,401, computations 667,079 to 380,212. The
+acknowledgements that waited on another generation are the same (110, 239, 0).
+
+Test: core `recall_cut::a_dependency_on_another_nodes_generation_waits_for_nothing` (a dependency on node 4's
+generation held here ahead of the log is not recorded, one check; the own ended generation's still is). Mutation (no
+generation not held here recorded): `a_row_read_after_its_dependencys_generation_left_is_never_answered` answers 8:1
+`Accepted` with the end installed ahead of the log.

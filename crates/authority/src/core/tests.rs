@@ -39538,6 +39538,44 @@ mod recall_cut {
         assert_eq!(h.core.stats.deleg_lost_after_ack, 0);
     }
 
+    /// The check that a generation not held here is this node's own (it
+    /// assigned stream indices in it) decides what waits: a dependency on
+    /// another node's generation that this replica holds ahead of its log
+    /// (a forward's reply raised it) waits for nothing, while one on this
+    /// node's own ended generation is recorded (the test above). One read
+    /// per generation and batch, not a query of the journal per batch.
+    #[test]
+    fn a_dependency_on_another_nodes_generation_waits_for_nothing() {
+        let (mut h, dir) = row_unread_behind_a_busy_backup();
+        // 8:1 (deps (7, 1)) is still unread; node 2's next create under 8
+        // depends on node 4's generation 99, held here ahead of the log.
+        Replica::note_stream(&h.meta, 99, 5);
+        assert_eq!(Replica::log_stream_idx(&h.meta, 99), 0);
+        assert_eq!(Replica::delegate_assigned(&h.meta, 99), Some(false));
+        assert_eq!(Replica::delegate_assigned(&h.meta, 7), Some(true));
+        let name = (0..)
+            .map(|i| format!("z{i}"))
+            .find(|n| constellation_meta::delegation::Range::of(1, n).idx == 1)
+            .unwrap();
+        let on_99 = constellation_meta::Position::ZERO.with_streams_wire(&[(99, 5)]);
+        let out = forward_with_deps(&mut h, dir, &name, 502, on_99);
+        assert!(reply_to_2(&out, 502).is_none(), "{out:?}");
+        h.core.dl.mine.get_mut(&8).unwrap().backup_after = None;
+        let mut out = Vec::new();
+        h.core.deleg_backup_stream(h.clk(), &h.meta, &mut out);
+        let xdeps = h.core.dl.mine[&8].xdeps.clone();
+        assert_eq!(
+            (
+                xdeps.get(&7).map(|r| r.keys().copied().collect::<Vec<_>>()),
+                xdeps.contains_key(&99)
+            ),
+            (Some(vec![1]), false),
+            "{xdeps:?}"
+        );
+        // 7 is held here: no read; 99 is not: one check, once.
+        assert_eq!(h.core.stats.deleg_xdeps_own_checks, 1);
+    }
+
     /// Review follow-up (fail-before): the stream finds a row whose
     /// dependency was lost only in a batch it reads. With a batch of
     /// generation 8 in flight when generation 7 ends, the recall answered

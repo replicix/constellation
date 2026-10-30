@@ -1012,10 +1012,12 @@ node's generations; the FUSE fast path waits on the same watermark,
 on rows of its other generations that are not committed yet when the row
 is read for a batch (the root's stream or the backup's append), which
 every row is before its group can hold it: a generation it holds, and
-one it no longer holds whose rows are still in its journal and whose end
-it has not applied from the log yet (the table installed ahead of the
-log, or the end applied and the row read only later); such a dependency
-is committed once the log carries it. A row whose dependency is lost
+one it no longer holds that was its own (it assigned stream indices in
+it: one read per generation and batch) past the log's index, whose end it
+has not applied yet (the table installed ahead of the log, or the end
+applied and the row read only later); such a dependency is committed once
+the log carries it. A dependency on another node's generation was reached
+when the op executed and waits for nothing. A row whose dependency is lost
 already when it is read (`deps_lost`: its generation ended below it)
 stops the generation before it there, before any member holds it
 (nothing at or past it goes to the backup or the root), and one lost

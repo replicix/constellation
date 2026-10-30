@@ -7004,7 +7004,7 @@ struct OracleTotals {
     /// holds (count, total ms, max ms), and the path-B and lost-dependency
     /// counters (installs put off, generations stopped, rows the root
     /// refused, answers that took nothing).
-    xgen: [u64; 16],
+    xgen: [u64; 18],
     /// Plan 43 C1-3: attempts to fetch a group's tail, fetches completed (of
     /// them, of an inherited tail), claims that carried no tail (must be 0
     /// outside an abandon), groups abandoned, runs that ended waiting.
@@ -7071,6 +7071,8 @@ impl OracleTotals {
             self.xgen[13] = self.xgen[13].max(st.deleg_install_wait_max_ms);
             self.xgen[14] += st.deleg_caps_calls;
             self.xgen[15] += st.deleg_caps_walked;
+            self.xgen[16] += st.deleg_xdeps_log_reads;
+            self.xgen[17] += st.deleg_xdeps_own_checks;
         }
         for st in r.stats.values() {
             self.downgraded_lone += st.acks_downgraded_lone;
@@ -7242,7 +7244,7 @@ impl OracleTotals {
             "SWEEP-XGEN-TOTALS {label} seeds {}/{seeds}: acks waiting on another generation {} \
              ({} ms, max {} ms) of delegated acks released {} ({} ms waited); prefix holds {} \
              ({} ms, max {} ms); installs put off {} ({} ms, max {} ms), generations stopped at a lost dependency {}, \
-             rows refused at the root {}, answers that took nothing {}; caps computed {} times, {} entries visited",
+             rows refused at the root {}, answers that took nothing {}; caps computed {} times, {} entries visited; xdeps store reads: log {} own-check {}",
             self.seeds,
             self.xgen[0],
             self.xgen[1],
@@ -7259,7 +7261,9 @@ impl OracleTotals {
             self.xgen[10],
             self.xgen[11],
             self.xgen[14],
-            self.xgen[15]
+            self.xgen[15],
+            self.xgen[16],
+            self.xgen[17]
         );
         eprintln!(
             "SWEEP-CLAIM-TOTALS {label} seeds {}/{seeds}: class-claim-mismatch={} in {} seeds, \

@@ -961,6 +961,11 @@ pub struct Stats {
     /// prefixes and the dependency entries they visited.
     pub deleg_caps_calls: u64,
     pub deleg_caps_walked: u64,
+    /// The store reads `deleg_note_xdeps` makes for dependencies on
+    /// generations not held here, once per generation and batch: the log's
+    /// index of one, and whether this node assigned stream indices in it.
+    pub deleg_xdeps_log_reads: u64,
+    pub deleg_xdeps_own_checks: u64,
     /// Delegate: parked acknowledgements whose row its own group held but
     /// that waited for another generation's row, how long in all and at
     /// most (from when the own group held it to the release).

@@ -334,6 +334,10 @@ pub trait Replica {
     /// assigned the stream indices of, as their delegate
     /// (`Meta::journal_own_gens`); empty when it cannot be read.
     fn journal_own_gens(&self) -> Vec<u64>;
+    /// This node assigned stream indices under `gen`: it is, or was, one of
+    /// its generations as their delegate (`Meta::delegate_idx` above 0).
+    /// `None`: unreadable.
+    fn delegate_assigned(&self, gen: u64) -> Option<bool>;
     /// The highest stream index of `gen` this node, the delegate, journaled
     /// for its own node's client with a class that waits for the group
     /// (0: none).
@@ -1276,6 +1280,10 @@ impl Replica for Meta {
 
     fn delegate_idx(&self, gen: u64) -> u64 {
         Meta::delegate_idx(self, gen).unwrap_or(0)
+    }
+
+    fn delegate_assigned(&self, gen: u64) -> Option<bool> {
+        Meta::delegate_idx(self, gen).ok().map(|i| i > 0)
     }
 
     fn journal_own_gens(&self) -> Vec<u64> {
