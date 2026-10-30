@@ -22,6 +22,7 @@
 
 use crate::core::{DelegRenewCert, DelegWindows, Refusal};
 use crate::ids::{HonourMs, NodeId, Now, WaitMs};
+use crate::root_probe::{RootProbe, Ticket, Waiter, Want};
 use std::collections::HashMap;
 
 /// Request ids of the lane's renewals carry this bit; the core's are
@@ -284,6 +285,63 @@ pub fn answer_root(
     windows.extend_off_core(gen, from, now)
 }
 
+/// What [`answer_root_or_probe`] decided.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RootAnswer {
+    /// Extended: reply with this grant ([`answer_root`]).
+    Granted(u64),
+    /// Not answered here (the reason is counted): the request is the core's.
+    Declined(Refusal),
+    /// Stale liveness only: read the lease object for this ticket, report
+    /// it ([`RootProbe::finish`], `Event::RootProbed`), run the waiters, and
+    /// decide again once ([`answer_root`]). The waiter registered runs then.
+    Probe(Ticket),
+    /// Stale liveness only, and a read is in flight: decide again when the
+    /// waiter registered runs.
+    Wait,
+}
+
+/// [`answer_root`], and for a renewal refused only for stale liveness (a
+/// tenure that can be taken over early, whose core's last proof of liveness
+/// is older than the freshness window: with the core stuck, always, after
+/// `backup_takeover_ms`), ask `probe` for a read of the lease object (plan 41
+/// D3). The caller performs it off the core and decides again.
+///
+/// Reached only past [`answer_root`]'s own gates: the driver has been stuck
+/// for [`stuck_threshold_ms`] of half the grant and not past `hung_ms`
+/// (D5, D6), the slot is open, settled, and the tenure marked with lease left
+/// below the margin: the read is asked for when its answer is the only thing
+/// the renewal lacks. At most one read in flight and one per freshness window
+/// ([`RootProbe::want`]); [`crate::root_probe`] has the argument that its
+/// result is a proof of liveness as of its send, judged by the unchanged
+/// rule.
+#[allow(clippy::too_many_arguments)]
+pub fn answer_root_or_probe(
+    windows: &DelegWindows,
+    probe: &RootProbe,
+    stuck_ms: i64,
+    hung_ms: i64,
+    from: NodeId,
+    gen: u64,
+    now: Now,
+    waiter: impl FnOnce() -> Waiter,
+) -> RootAnswer {
+    match answer_root(windows, stuck_ms, hung_ms, from, gen, now) {
+        Ok(ttl) => RootAnswer::Granted(ttl),
+        Err(Refusal::Stale) => {
+            let Some(cert) = windows.lease_cert() else {
+                return RootAnswer::Declined(Refusal::Lease);
+            };
+            match probe.want(now.honour, cert.epoch, cert.window_ms, waiter) {
+                Want::Start(t) => RootAnswer::Probe(t),
+                Want::Joined => RootAnswer::Wait,
+                Want::No(_) => RootAnswer::Declined(Refusal::Stale),
+            }
+        }
+        Err(r) => RootAnswer::Declined(r),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +354,161 @@ mod tests {
             next_due: HonourMs(next_due),
             period_ms,
         }
+    }
+
+    fn fast_windows() -> (std::sync::Arc<DelegWindows>, std::sync::Arc<RootProbe>) {
+        use crate::core::RootLease;
+        let w = DelegWindows::new();
+        let probe = RootProbe::new();
+        w.set_probe(probe.clone());
+        w.insert(
+            7,
+            3,
+            crate::ids::WaitMs(5_000),
+            crate::ids::WaitMs(5_000),
+            true,
+        );
+        w.publish(
+            Some(RootLease {
+                epoch: 2,
+                honour_until: HonourMs(600_000),
+                margin_ms: 1_000,
+                delegation_ttl_ms: 4_000,
+                extra_ms: 1_000,
+                fast: true,
+                last_s3_fresh: HonourMs(1_000),
+                window_ms: 1_500,
+                marked: true,
+            }),
+            &[7],
+        );
+        (w, probe)
+    }
+
+    /// Plan 41 D3: a renewal refused only for stale liveness, while the core
+    /// is stuck, starts one read; the next one in the round joins it; after the
+    /// read the renewal is decided again and granted. Nothing else starts a
+    /// read.
+    #[test]
+    fn a_stale_renewal_asks_for_one_read_and_is_answered_after_it() {
+        use crate::root_probe::Verdict;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (w, probe) = fast_windows();
+        let woken = std::sync::Arc::new(AtomicUsize::new(0));
+        let waiter = || {
+            let woken = woken.clone();
+            move || -> crate::root_probe::Waiter {
+                Box::new(move || {
+                    woken.fetch_add(1, Ordering::SeqCst);
+                })
+            }
+        };
+        let now = Now::same(10_000);
+        let ask = |now, stuck| answer_root_or_probe(&w, &probe, stuck, 15_000, 3, 7, now, waiter());
+        // The core is not stuck: its own renewal; no read.
+        assert_eq!(ask(now, 0), RootAnswer::Declined(Refusal::NotStuck));
+        // Hung: no read either.
+        assert_eq!(ask(now, 16_000), RootAnswer::Declined(Refusal::Hung));
+        assert_eq!(probe.stats().started.load(Ordering::Relaxed), 0);
+        // Stuck: the proof is 9 s old.
+        let RootAnswer::Probe(t) = ask(now, 2_000) else {
+            panic!("a read is asked for");
+        };
+        assert_eq!((t.epoch, t.sent), (2, HonourMs(10_000)));
+        assert_eq!(ask(Now::same(10_050), 2_050), RootAnswer::Wait);
+        // Another node's renewal is refused before freshness: no read.
+        assert_eq!(
+            answer_root_or_probe(&w, &probe, 2_000, 15_000, 9, 7, now, waiter()),
+            RootAnswer::Declined(Refusal::Node)
+        );
+        for run in probe.finish(t, Verdict::Live) {
+            run();
+        }
+        assert_eq!(woken.load(Ordering::SeqCst), 2, "both renewals are told");
+        assert_eq!(
+            answer_root(&w, 2_100, 15_000, 3, 7, Now::same(10_120)),
+            Ok(4_000)
+        );
+        // Inside the round the proof stands; past it the next renewal reads.
+        assert_eq!(ask(Now::same(10_900), 2_900), RootAnswer::Granted(4_000));
+        let RootAnswer::Probe(t2) = ask(Now::same(11_600), 3_600) else {
+            panic!("the next round reads again");
+        };
+        // A read that showed a successor: this epoch is over, no more reads
+        // and no more answers.
+        for run in probe.finish(t2, Verdict::Deposed) {
+            run();
+        }
+        assert_eq!(
+            ask(Now::same(11_700), 3_700),
+            RootAnswer::Declined(Refusal::Deposed)
+        );
+        assert_eq!(probe.stats().started.load(Ordering::Relaxed), 2);
+    }
+
+    /// Plan 41 D3: a read that failed is not a proof; the renewal is not
+    /// answered, and the round has had its read.
+    #[test]
+    fn a_failed_read_answers_nothing_and_is_not_repeated_inside_the_round() {
+        use crate::root_probe::Verdict;
+        use std::sync::atomic::Ordering;
+        let (w, probe) = fast_windows();
+        let now = Now::same(10_000);
+        let RootAnswer::Probe(t) =
+            answer_root_or_probe(&w, &probe, 2_000, 15_000, 3, 7, now, || Box::new(|| {}))
+        else {
+            panic!("a read is asked for");
+        };
+        let _ = probe.finish(t, Verdict::Unknown);
+        assert_eq!(
+            answer_root(&w, 2_100, 15_000, 3, 7, Now::same(10_100)),
+            Err(Refusal::Stale)
+        );
+        assert_eq!(
+            answer_root_or_probe(&w, &probe, 2_300, 15_000, 3, 7, Now::same(10_300), || {
+                Box::new(|| {})
+            }),
+            RootAnswer::Declined(Refusal::Stale)
+        );
+        assert_eq!(probe.stats().started.load(Ordering::Relaxed), 1);
+        assert_eq!(probe.stats().withheld.load(Ordering::Relaxed), 1);
+    }
+
+    /// Plan 41 D3: the proof is dated at the read's send. A read that took
+    /// longer than the freshness window leaves the renewal that waited for it
+    /// refused, whatever it found.
+    #[test]
+    fn a_slow_read_justifies_no_window() {
+        use crate::root_probe::Verdict;
+        let (w, probe) = fast_windows();
+        let RootAnswer::Probe(t) =
+            answer_root_or_probe(&w, &probe, 2_000, 15_000, 3, 7, Now::same(10_000), || {
+                Box::new(|| {})
+            })
+        else {
+            panic!("a read is asked for");
+        };
+        let _ = probe.finish(t, Verdict::Live);
+        // Back after the window: the decision at the answer's reading finds
+        // the proof of the send too old.
+        assert_eq!(
+            answer_root(&w, 4_000, 15_000, 3, 7, Now::same(11_500)),
+            Err(Refusal::Stale)
+        );
+        assert!(answer_root(&w, 3_900, 15_000, 3, 7, Now::same(11_499)).is_ok());
+        // The mutant that dates the proof at the read's answer instead of its
+        // send accepts exactly this: the test is sensitive to the dating.
+        let (w2, probe2) = fast_windows();
+        let RootAnswer::Probe(t) =
+            answer_root_or_probe(&w2, &probe2, 2_000, 15_000, 3, 7, Now::same(10_000), || {
+                Box::new(|| {})
+            })
+        else {
+            panic!("a read is asked for");
+        };
+        let late = t.dated(HonourMs(11_500));
+        let _ = probe2.finish(late, Verdict::Live);
+        assert!(answer_root(&w2, 4_000, 15_000, 3, 7, Now::same(11_500)).is_ok());
     }
 
     #[test]

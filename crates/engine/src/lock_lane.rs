@@ -205,6 +205,17 @@ fn run(
                     report(actions, &off_core);
                 });
             }
+            // Plan 41 D3: the read of the lease object the own renewals of a
+            // tenure that can be taken over early wait for, on a task of its
+            // own; the core hears of it on the urgent lane when it ends.
+            LaneAction::Probe(ticket) => {
+                let window = off_core
+                    .deleg_windows
+                    .lease_cert()
+                    .map_or(1_500, |l| l.window_ms)
+                    .max(facts.view().window_ms);
+                off_core.spawn_root_probe(ticket, node_id, window);
+            }
             other => report(vec![other], off_core),
         }
     }
@@ -263,7 +274,7 @@ fn send_reports(tx: &mpsc::UnboundedSender<SyncRequest>, actions: Vec<LaneAction
             LaneAction::Unanswered { to } => {
                 let _ = tx.send(SyncRequest::LaneUnanswered { to });
             }
-            LaneAction::Send { .. } => {}
+            LaneAction::Send { .. } | LaneAction::Probe(_) => {}
         }
     }
 }
@@ -352,6 +363,7 @@ mod tests {
         );
         let view = LockLaneView {
             me: 1,
+            epoch: 1,
             root_ok: true,
             cap_until: HonourMs(clk.honour.0 + 60_000),
             fast: false,
@@ -429,6 +441,7 @@ mod tests {
         );
         off_core.lane_cell.publish(LockLaneView {
             me: 1,
+            epoch: 1,
             root_ok: true,
             cap_until: HonourMs(clk.honour.0 + 60_000),
             fast: false,

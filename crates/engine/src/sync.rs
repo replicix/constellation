@@ -360,6 +360,14 @@ pub enum SyncRequest {
         from: u64,
         ttl_ms: u64,
     },
+    /// Plan 41 D3: the root's off-core lease read for the tenure of `epoch`,
+    /// sent at `sent` (honour clock), found `read`: urgent lane,
+    /// `Event::RootProbed`.
+    RootProbed {
+        epoch: u64,
+        sent: i64,
+        read: constellation_authority::root_probe::LeaseRead,
+    },
     /// The off-core lane's request `req_id` to `to` failed at the transport
     /// (urgent lane, behind its registration): the core takes it off its
     /// pending renewals (`Event::PeerFailed`).

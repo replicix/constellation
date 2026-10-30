@@ -61010,3 +61010,140 @@ fast-path rate times a core step; with the lead flipping, an own `Lone` row can 
 engine test of the fast path past the lead and a sim oracle for own `Lone` rows past it.
 Gates: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, lib tests of authority,
 meta, engine and harness, the release authority sim suite.
+
+## Plan 41 D3: the root proves its own liveness off the core (2026-10-29)
+
+Decision D3 of 2026-10-22 (plan 41 §11, "the backed pair" of the review): the root-side lanes confirm that the root still
+holds its lease with an off-core S3 read, at most one per renewal round and only while the core is stuck. Without it a
+root with a backup (a tenure that can be taken over before its lease expires: a listed backup, `ack=s3`) got nothing from
+them. Its renewals need an S3 proof of liveness within `backup_takeover_ms` (plan 41 L0, `liveness_fresh`), and a core
+stuck in one step makes no S3 request: the delegation answerer (R2) and the lock lane's own renewals (L3) found the
+proof stale 1.5 s into every stall and answered nothing more, so the backed pair of `delegate-store-stall` with the root
+stalled lost its delegation (`KNOWN-GAP root core stuck`) and a backed lock holder's own grants lapsed.
+
+### What landed
+
+| Item | State | Where |
+|---|---|---|
+| `RootProbe`: one proof per node, shared by the answerer and the lock lane; the read's verdict (`judge`), the round gate, the deposition | done | `crates/authority/src/root_probe.rs` |
+| The answerer asks for the read for a renewal refused only for stale liveness (`answer_root_or_probe`); `Refusal::Deposed`; the freshness rule takes the later of the core's proof and the probe's, judged last | done | `deleg_lane.rs`, `core/deleg_windows.rs` |
+| The lock lane's own renewals take the same proof; `LockLaneView::epoch`; `LaneAction::Probe` | done | `lane.rs`, `core/locks.rs` |
+| The core hears of every read as its own (`Event::RootProbed`): a live read extends `last_s3_fresh`, a successor deposes it | done | `core/backup.rs` (`on_root_probed`), `event.rs` |
+| Engine: the read through the driver's `LeaseStore` on the shared runtime, the P2P reply waits for it (`PeerService::deleg_renew*` return a future) | done | `authority_driver.rs` (`OffCore::answer_root_probing`, `spawn_root_probe`), `p2p.rs`, `lock_lane.rs`, `crates/net` |
+| Status, knob | done | `delegation.root_probes{,_live,_deposed,_withheld}`, `locks.lane.probes`, `refusal deposed`, `CONSTELLATION_ROOT_PROBE=off` |
+| Sim | done | `ProbeMutant`, `SimConfig::{deleg_root_probe,root_probe_mutant}`, configs below |
+| Harness | done | `delegate-store-stall` with the root stalled runs the backed pair; `CONSTELLATION_ROOT_PROBE=off` is its fail-before |
+| Docs | done | `delegations.md`, `cluster-locks.md`, `configuration.md`, `TESTING.md`, ADR-25 amended, plan 41 §11/§12 |
+
+### The design
+
+1. **Demand, not a timer.** A lane that is refused only for stale liveness (every other rule holds, the core stuck for the
+   lanes' threshold and not past `CONSTELLATION_HOLDER_STALL_MS`: D5, D6) asks `RootProbe::want`. At most one read is in
+   flight (renewals that arrive meanwhile wait for it, at most one freshness window) and at most one is started per
+   freshness window, whatever the last one found: a read serves every renewal of every lane in its round, and none is made
+   without a renewal that needed it. A core that runs, a `Local` tenure and a hung core never read.
+2. **Judged as the core judges its own.** Holder and epoch only (`judge`, the rule of `note_s3_liveness` and
+   `on_renew_probe`); no `expires_unix_ms` is compared with any clock (plan 43 C7). Naming this node at the certificate's
+   epoch, not released: a proof **as of the read's send**, the honour reading taken before the request left. The unchanged
+   `liveness_fresh` judges it at the answer's reading.
+3. **Where it enters.** The freshness rule only: `max(core's last_s3_fresh, probe's proof for this epoch)`. A certificate the
+   core withdrew (a release, an epoch, a gate, a delegation) is not revived by it; the mark, the cap, the slot's `open` and
+   `settled` are unchanged. In the answerer it is judged last, so a read is asked for only when nothing else stands in the way.
+4. **The integrity argument.** A successor takes the tenure only by a lease CAS (a TTL claim, a seal, an `ack=s3` takeover)
+   and quarantines what the root may have answered from its marker on (`marker + backup_takeover_ms + ...`). A read served at
+   or after its send that still names this node precedes that CAS, so an answer decided within the window of the send ends
+   inside the quarantine: L0's argument with the read's send where the core's request's send stood.
+   - *A takeover racing the read.* Before the read is served: it shows (another holder, a later epoch, no lease): the epoch's
+     proof is withdrawn at once (not left to run out), the answerer and the lane refuse it (`deposed`) and no more reads are
+     made for it. After: covered by the quarantine. The lease read is as consistent as the core's own (S3's strong
+     read-after-write; a read older than the tenure's epoch proves nothing).
+   - *The read's latency vs the window it justifies.* Dated at the send; a read that took longer than the window, judged at
+     the answer, justifies nothing (`a_slow_read_justifies_no_window`). The wait of a renewal for the read is bounded by the
+     window; the read itself by the same bound.
+   - *Failed, slow, unreadable, an older body, a released lease.* No proof; nothing is granted, refused or dropped; the
+     renewal is the core's, which answers it in full when it runs (and the round is not read twice).
+   - *A backup that sealed.* The seal is the lease CAS above; a read before it is covered, after it shows the successor. The
+     holder's off-core beat keeps the backups from sealing for `CONSTELLATION_HOLDER_STALL_MS`; the lanes stop at the same
+     bound (D6).
+   - *Another tenure.* A proof names its epoch and counts for a certificate of that epoch only.
+5. **The core is told.** `Event::RootProbed` (urgent lane): a live read extends the core's own `last_s3_fresh` (as its own
+   `LeaseGet`), a read that shows a successor deposes it when it runs (`on_root_probed`, as `on_renew_probe`); a read for a
+   tenure it no longer holds says nothing.
+
+### History traced
+
+`git log -S` on the lane's pieces: the answerer is R2 (`364857ec`, over R1's window table `8df28137`), the lock lane is L2 to L4
+(`0446e927`, `f852b5cd`) with its review fixes (`33ccde81`, `85a239ff`: the freshness rule judged at the extension's own reading, kept
+here: the proof is read inside the same guard); the freshness predicate is L0's (`liveness_fresh`), the honour/wait split is plan 43
+C7-H1 (`28f91b2b`, `b7524526`) and the lease is judged by observation, not by comparing `expires_unix_ms` across nodes, since C7b.
+The decision text is plan 41 §11 ("Decided 2026-10-22"), the spec §5.5 (L6's probe), which this implements without `owner_hint` and
+without routing to a successor (a deposed root's lane stops; the successor's grace covers the rest).
+
+### Tests that fail before
+
+- Sim `delegated-core-stall-root-backup` (a backed root, the stall of 6.5, 9 and 12.5 s; `core_stall_check` now demands what
+  `-root` does: nothing reclaimed, lapsed or ended, root answers off the core): on the tree without D3 (the check alone, origin/main)
+  **300 of 300 seeds fail** (`lapsed 6`); with D3 **0 of 2,000**. `-backup-unprobed` (`SimConfig::deleg_root_probe: false`, the same
+  code with the read off): **2,000 of 2,000** fail. `a_root_stuck_in_a_step_keeps_its_delegations` (24 seeds) pins both: 280 live
+  reads, unprobed lapsed 144 (6 per seed).
+- Sim `locks-core-stall-backup-long-beats` (a backed lock root, beat on, 8 s stall on a 30 s lease): the lane's renewals over 16
+  seeds are 133 with the read, 39 without (`a_backed_lock_root_stuck_in_a_step_keeps_its_own_grants`). The fenced I/O does not tell
+  them apart: the grants the root's peers hold of it lapse either way (L5).
+- Core and lane unit tests (`deleg_lane::tests`, `deleg_windows::tests`, `lane::tests`, `root_probe::tests`,
+  `lock_lane_core_tests`, engine `a_stuck_backed_root_answers_after_reading_its_lease`).
+- `a_run_leaves_no_bus_behind` with `delegated-core-stall-root-backup`: the first version of the sim's tap held the bucket strongly
+  (`RootCtx`), and the bucket's lease hook reaches the bus whose taps hold the context: every run leaked its nodes' stores (120
+  directories for 40 seeds). Weak now, 0.
+
+### Negative controls (the lane must NOT renew)
+
+- Unit: a read that shows another holder, a later epoch of this node, the same epoch under another holder, no lease, a failed read, an
+  older body, a released lease, or another epoch's proof renews nothing and (but for a failed read) ends the epoch's reads
+  (`a_read_that_shows_a_successor_or_failed_renews_nothing`, `the_table_answers_on_the_probes_proof_and_stops_when_a_read_shows_a_successor`,
+  engine `a_stuck_backed_root_whose_lease_is_gone_answers_nothing`, core `a_root_probe_that_found_a_successor_deposes_and_the_rest_say_nothing`);
+  a read slower than the window justifies nothing, and the same sequence with the proof dated at the answer (the mutant) is
+  accepted, so the test is sensitive (`a_slow_read_justifies_no_window`).
+- Sim, the takeover during the stall: `locks-core-stall-backup-long` (the beat off, the backup seals the stuck root at 1.5 s, a 30 s
+  lease): clean. With `ProbeMutant::IgnoresVerdict` (`-long-blind`: whatever the read shows counts as a proof) **26 of 2,000 seeds
+  violate mutual exclusion** (21, 79, 179, ...; `a_probe_that_ignores_what_it_reads_is_caught` pins 21 and 79: the same seeds are
+  clean with the design). The delegation twin (`delegated-core-stall-root-sealed`, with a delegate that hears only its root) cannot
+  show the mutant: a delegate learns of the changed tenure from the log and from its new root, whatever the old root answers (the
+  mutant passes 200 seeds), so the delegation side's controls are the unit tests above.
+
+### Open items
+
+- `locks-core-stall-backup-long` seed 946 (`Control::LockIdle` unanswered after a suspend and a stall): fails the same way on origin/main
+  (with and without the beat); not touched.
+- The stuck root's **peers'** grants (L5) and a lock holder on an `ack=s3` tenure (deposed after 1.5 s of core silence whatever the lane
+  does) are as before.
+- The probe is one read per window for the whole node. A node with many fast-tenure delegations at different phases could read once
+  per window while stuck (up to 10 in 15 s); it never reads for a renewal that is not refused for staleness alone.
+
+### Gates (release where noted; box runs under `timeout`)
+
+- `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- Lib tests: authority 771, meta 376, engine 933, harness 160, control 146 (the schema re-blessed: `CONSTELLATION_BLESS=1 cargo test -p
+  constellation-control schema`; `LockLaneStatus.probes`, `DelegationStatus.root_probes*`).
+- `cargo test -p constellation-authority --release`: lib 771, `meta_repro` 4, the sim suite 274 passed (11 ignored), 141 s.
+- Sim sweeps, seeds 0 to 1,999 each: `delegated-core-stall-root`, `-root-backup`, `-root-lease6`, `-root-recall`, `-root-recall-open`,
+  `-root-hang`, `-both`, `-root-sealed`, `locks-core-stall`, `-root`, `-single`, `-backup`, `-backup-beats`, `-s3`, `-blips`,
+  `-delegated`: 0 failing. `locks-core-stall-backup-long` and `-long-beats`: 1 failing each, seed 946, which fails identically on
+  origin/main (`Control::LockIdle` unanswered after a suspend and a stall), with and without the beat. The controls built to fail:
+  `-root-backup-unprobed` 2,000, `-root-unlaned` 2,000, `locks-core-stall-backup-long-blind` 26.
+- Harness (backed pair, the root's store stalled 5, 9, 12 and 25 s, seed 42): `delegate-store-stall` with
+  `CONSTELLATION_HARNESS_DELEG_STALL_NODE=a` **5 of 5** passed with no `KNOWN-GAP` (the root answered 2, 4 and 5 renewals off its core
+  at 5, 9 and 12 s, declining the others as `not_stuck` and `stale_liveness`; generation 1 kept at 5, 9 and 12 s, ended by its backup's
+  takeover past the bound at 25 s); with `CONSTELLATION_ROOT_PROBE=off` **3 of 3** lost the delegation at 9 and 12 s (`b` lapsed,
+  `KNOWN-GAP root core stuck`, accepted by the scenario only in that mode: the in-scenario fail-before). Also green: the default arm
+  (the delegate stalled), the unbacked pair (`CONSTELLATION_HARNESS_DELEG_BACKED=0`), `both`, `delegate-handoff-renewal`,
+  `lock-stall-lone-node`, `lock-store-stall-holder`, `lock-failover`, `lock-lapse-lone-node`.
+
+The harness scenario's past-the-bound check expected the root to reclaim or the delegate to lapse; on the backed pair the backup seals
+the root that stopped beating at 15 s and takes the lease, so the generation ends at the new root with neither: the check now also
+accepts a generation gone from a backed pair (a lane that renewed without end would leave it live).
+
+### Unchanged on purpose
+
+L5 (peers' renewals at a stalled owner), L6's routing to a successor, `ack=s3`, the root lease's renewal (stays in the core), the
+fencing tokens, the restart horizon. No wire message changed except that `PeerService::deleg_renew*` now return a future (the reply
+may wait for the read); no version bump.

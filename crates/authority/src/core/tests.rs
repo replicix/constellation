@@ -40957,6 +40957,90 @@ mod lock_lane_core_tests {
         assert!(v.own_ok(HonourMs(h.core.last_s3_fresh().0 + v.window_ms - 1)));
     }
 
+    /// A fast root (node 4 listed as its backup) whose last proof of
+    /// liveness is old, at lease epoch `epoch`.
+    fn stale_fast_root() -> (Harness, u64) {
+        let mut h = root();
+        let mut lease = h.core.lease.held.clone().unwrap();
+        lease.0.backups = vec![4];
+        lease.0.ack_policy = constellation_store_s3::AckPolicy::Backup;
+        let epoch = lease.0.epoch;
+        h.core.lease.held = Some(lease);
+        h.core.ack.last_s3_fresh = hm(h.now.minus(10_000));
+        assert!(h.core.fast_tenure() && !h.core.renew_fresh(h.honour()));
+        (h, epoch)
+    }
+
+    /// Plan 41 D3: an off-core read that found the tenure live is a proof
+    /// of liveness as of its send, as a `LeaseGet` of the core's own would be.
+    #[test]
+    fn a_root_probe_that_found_the_tenure_live_is_the_cores_own_proof() {
+        use crate::root_probe::LeaseRead;
+        let (mut h, epoch) = stale_fast_root();
+        let sent = h.honour();
+        h.advance(80);
+        h.step(Event::RootProbed {
+            epoch,
+            sent,
+            read: LeaseRead::Held {
+                holder: 1,
+                epoch,
+                released: false,
+            },
+        });
+        assert_eq!(h.core.stats.root_probes_live, 1);
+        assert_eq!(h.core.last_s3_fresh(), sent);
+        assert!(h.core.renew_fresh(h.honour()));
+        // The same read, older than what the core knows, shortens nothing.
+        let older = HonourMs(sent.0 - 5_000);
+        h.step(Event::RootProbed {
+            epoch,
+            sent: older,
+            read: LeaseRead::Held {
+                holder: 1,
+                epoch,
+                released: false,
+            },
+        });
+        assert_eq!(h.core.last_s3_fresh(), sent);
+    }
+
+    /// Plan 41 D3: a read that shows a successor deposes the core when it
+    /// runs, as its own probe's would; a read for another tenure, a failed
+    /// one and an older body say nothing about this one.
+    #[test]
+    fn a_root_probe_that_found_a_successor_deposes_and_the_rest_say_nothing() {
+        use crate::root_probe::LeaseRead;
+        let (mut h, epoch) = stale_fast_root();
+        let sent = h.honour();
+        let held = |holder, epoch| LeaseRead::Held {
+            holder,
+            epoch,
+            released: false,
+        };
+        for (e, read) in [
+            (epoch + 1, held(4, epoch + 1)),
+            (epoch, LeaseRead::Failed),
+            (epoch, held(4, epoch - 1)),
+        ] {
+            h.step(Event::RootProbed {
+                epoch: e,
+                sent,
+                read,
+            });
+            assert!(!h.core.lease.lost, "{read:?}");
+            assert_eq!(h.core.stats.root_probes_deposed, 0);
+        }
+        assert!(!h.core.renew_fresh(h.honour()), "no proof from any of them");
+        h.step(Event::RootProbed {
+            epoch,
+            sent,
+            read: held(4, epoch + 1),
+        });
+        assert!(h.core.lease.lost);
+        assert_eq!(h.core.stats.root_probes_deposed, 1);
+    }
+
     #[test]
     fn the_lane_own_event_is_bookkeeping_and_never_a_decision() {
         let mut h = root();

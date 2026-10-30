@@ -68,22 +68,27 @@ impl P2pBridge {
     /// step (`constellation_authority::deleg_lane::answer_root` decides and
     /// has the argument). The request was queued to the core already and is
     /// answered there in full; this is its RPC reply, so nothing waits on
-    /// this node's runtime beyond the reply itself. Nothing unless the driver
+    /// this node's runtime beyond the reply itself, and (plan 41 D3) for a
+    /// tenure that can be taken over early, at most one read of the lease
+    /// object ([`OffCore::answer_root_probing`]). Nothing unless the driver
     /// has been stuck (the common case costs one atomic read and a compare).
-    fn root_answer_off_core(
+    async fn root_answer_off_core(
         &self,
         from: u64,
         req_id: u64,
         gen: u64,
         round: u64,
     ) -> Option<constellation_net::Payload> {
-        let ttl_ms = self.off_core.answer_root(
-            crate::authority_driver::deleg_root_lane_on(),
-            crate::authority_driver::holder_stall_ms(),
-            constellation_platform::clock::protocol().now(),
-            from,
-            gen,
-        )?;
+        let ttl_ms = self
+            .off_core
+            .answer_root_probing(
+                crate::authority_driver::deleg_root_lane_on(),
+                crate::authority_driver::holder_stall_ms(),
+                self.node_id,
+                from,
+                gen,
+            )
+            .await?;
         // Bookkeeping for the core, after the request it answers.
         let _ = self
             .urgent
@@ -679,9 +684,11 @@ impl constellation_net::PeerService for P2pBridge {
         stream_head: u64,
         stream_head_at: i64,
         first: bool,
-    ) -> Option<constellation_net::Payload> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<constellation_net::Payload>> + Send + '_>,
+    > {
         if crate::fault::p2p_denied(from) {
-            return None;
+            return Box::pin(async { None });
         }
         let _ = self.urgent.send(sync::SyncRequest::PeerDelegRenew {
             from,
@@ -693,7 +700,7 @@ impl constellation_net::PeerService for P2pBridge {
             stream_head_at,
             first,
         });
-        self.root_answer_off_core(from, req_id, gen, round)
+        Box::pin(self.root_answer_off_core(from, req_id, gen, round))
     }
 
     fn deleg_renew_off_core(
@@ -702,9 +709,11 @@ impl constellation_net::PeerService for P2pBridge {
         req_id: u64,
         gen: u64,
         round: u64,
-    ) -> Option<constellation_net::Payload> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<constellation_net::Payload>> + Send + '_>,
+    > {
         if crate::fault::p2p_denied(from) {
-            return None;
+            return Box::pin(async { None });
         }
         let _ = self.urgent.send(sync::SyncRequest::PeerDelegRenewOffCore {
             from,
@@ -712,7 +721,7 @@ impl constellation_net::PeerService for P2pBridge {
             gen,
             round,
         });
-        self.root_answer_off_core(from, req_id, gen, round)
+        Box::pin(self.root_answer_off_core(from, req_id, gen, round))
     }
 
     fn deleg_renewed(

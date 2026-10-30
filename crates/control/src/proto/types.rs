@@ -373,6 +373,22 @@ pub struct DelegationReport {
     /// a grant already served.
     #[serde(default)]
     pub off_core_answers_applied: u64,
+    // ---- plan 41 D3 (appended) ----
+    /// As the root of a tenure that can be taken over early: the reads of the
+    /// lease object the off-core lane made while the core was stuck (one at
+    /// most per `backup_takeover_ms`, none without a renewal refused for stale
+    /// liveness), those that found the tenure live (a proof as of the read's
+    /// send), those that found it taken over (the lane answers nothing more
+    /// for the epoch), and the renewals that were refused a read of their own
+    /// (one was sent within the window, or the epoch was deposed).
+    #[serde(default)]
+    pub root_probes: u64,
+    #[serde(default)]
+    pub root_probes_live: u64,
+    #[serde(default)]
+    pub root_probes_deposed: u64,
+    #[serde(default)]
+    pub root_probes_withheld: u64,
 }
 
 /// One pinned subtree on this node.
@@ -1969,6 +1985,11 @@ pub struct LockLaneStatus {
     pub max_stuck_ms: u64,
     /// Requests waiting for an answer now.
     pub in_flight: u64,
+    /// Plan 41 D3: reads of the lease object the lane asked for, for the own
+    /// grants of a tenure that can be taken over early whose core was stuck
+    /// (at most one per `backup_takeover_ms`).
+    #[serde(default)]
+    pub probes: u64,
 }
 
 /// One lock owner fenced on this node (`LockStatus::fenced_owners`).

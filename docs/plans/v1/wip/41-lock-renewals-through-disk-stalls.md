@@ -1411,7 +1411,14 @@ nothing for a root with a backup); D5, the lock lane stays always on and the
 root-side lane runs only while the core is stuck; D6, the node-side bound
 for held locks stays 120 s and the root-side lane is bounded at 15 s; D7,
 the fjall change (the journal's `write(2)` outside the single-writer lock)
-lands as its own vendored commit. **D7 was withdrawn on 2026-10-23**
+lands as its own vendored commit. **D3 landed** (the PROGRESS entry "Plan 41 D3: the root proves its own
+liveness off the core"): one `RootProbe` per node, shared by the delegation
+answerer and the lock lane's own renewals (the slice of §5.5's L6 that D3
+decides: the lease read; no `owner_hint`, no routing to a successor), at most
+one read in flight and one per `backup_takeover_ms`, only while the core is
+stuck and not past `CONSTELLATION_HOLDER_STALL_MS` (D5, D6), judged by holder
+and epoch as the core judges its own, dated at its send.
+**D7 was withdrawn on 2026-10-23**
 after its review: the change is dropped (§4 D8). It gains nothing unless
 a commit is visible before its bytes are written, and that is a
 durability regression. Vendored fjall change number 10 stays unused.
@@ -1439,6 +1446,13 @@ durability regression. Vendored fjall change number 10 stays unused.
       baselines recorded before L3.
 - [ ] L5/L6 only if chosen (§11): peers' answers with the in-`lock_answer`
       held set and the opt-in lead; the probe at ≤ 1 per round.
+      (D3, the probe, landed without L5 and without L6's routing to a
+      successor; peers' answers at a stalled owner remain open.)
+- [x] D3: the root-side lanes' read of the lease object (`root_probe.rs`):
+      sim fail-before (`delegated-core-stall-root-backup-unprobed`,
+      `locks-core-stall-backup-long-beats-unprobed`), the negative controls
+      (`locks-core-stall-backup-long-blind`), unit
+      tests, the harness's backed root-stalled arm without the known gap.
 - [ ] L7: status/metrics/schema, configuration, cluster-locks,
       durability-and-failover, host guidance, TESTING docs, ADR-25
       amended, the proposed DESIGN text recorded.

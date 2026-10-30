@@ -185,6 +185,17 @@ pub enum Event {
     /// after the request it answers (which the core still handles, and
     /// answers in full).
     DelegRenewAnsweredOffCore { gen: u64, from: NodeId, ttl_ms: u64 },
+    /// Plan 41 D3: an off-core lane read the lease object for the tenure of
+    /// `epoch` while this core was stuck, the request sent at `sent` (this
+    /// node's honour clock, read before the send), and read `read`
+    /// ([`crate::root_probe`]). The core treats it as a `LeaseGet` of its own
+    /// ([`Core::on_root_probed`]): a tenure seen live is proven live as of
+    /// `sent`, one seen taken over is deposed here. Urgent lane.
+    RootProbed {
+        epoch: Epoch,
+        sent: HonourMs,
+        read: crate::root_probe::LeaseRead,
+    },
     /// Plan 41 L2, the lock lane extended `renewed` of this node's own
     /// grants at its own table while the core was busy
     /// ([`Core::on_lane_own`]): statistics, the mirror, the lease renewal a

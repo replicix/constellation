@@ -760,8 +760,11 @@ model (`Stall`, `LaneRenew`; the lane extending a closed slot, or without the
 cap, violates `recall_safety`, the design is clean), the simulator
 (`delegated-core-stall-root*`) and the harness (`delegate-store-stall` with
 the root stalled). A root with a backup answers only within
-`backup_takeover_ms` of its core's last proof of liveness until the lane can
-prove its own (plan 41 P). Same pattern for lock grants: ADR-25's amendment.
+`backup_takeover_ms` of a proof of liveness, and a stuck core makes none: the
+lane proves its own with one read of the lease object, off the core, dated at
+its send and judged by holder and epoch as the core judges its own (plan 41
+D3; ADR-25's amendment has the argument). Same pattern for lock grants:
+ADR-25's amendment.
 
 ## ADR-24: The hybrid S3 inbox for writes without a P2P path
 
@@ -1089,11 +1092,22 @@ takeovers is clean), the simulator on every lock configuration
 (`lock_lane_core_tests`), and the harness (`lock-stall-lone-node`,
 `lock-store-stall-holder`, `lock-store-stall-past-lease`).
 
+*The root's own proof of liveness (plan 41 D3)*: a tenure that can be taken
+over early answers only within `backup_takeover_ms` of an S3 request that
+proved it live, and a stuck core makes none. While the core is stuck (and
+not hung), the lanes that find only that proof stale (the lock lane's own
+renewals, the delegation answerer) ask for one read of the lease object,
+off the core, at most one in flight and one per window; a read that names
+this node at the certificate's epoch is a proof as of its **send**, judged
+by the unchanged freshness rule at the answer; any other reading withdraws
+the epoch's proof and ends its answers. A successor takes the tenure only
+by a lease CAS and quarantines from its marker, so a read served before
+the CAS, and an answer within the window of its send, is covered exactly
+as the core's own proof is.
+
 *Not covered, on purpose*: a **stalled owner's** peers' grants (answering
 their renewals off the core, and the restart horizon's lead: follow-up L5);
-the lane's own lease probe for fast tenures (L6: until then a fast tenure's
-own grants are renewed only while the core's last proof of liveness is fresh,
-about 1.5 s into a stall); `ack=s3` holders, deposed on the core's silence;
+`ack=s3` holders, deposed on the core's silence;
 a stall past the root lease (the grants end at its usable end); a hung core
 (past the bound). *Rejected*: asynchronous store writes in the core (a
 rewrite of the step discipline), bounding the core's blocking (timeouts

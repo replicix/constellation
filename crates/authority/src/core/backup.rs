@@ -1855,6 +1855,53 @@ impl Core {
         }
     }
 
+    /// Plan 41 D3: an off-core lane read the lease object for the tenure of
+    /// `epoch` while this core was stuck (`Event::RootProbed`), the request
+    /// sent at `sent`. Judged as the core judges a lease read of its own:
+    /// the tenure seen live is proven live as of `sent`
+    /// (`note_s3_liveness`), one seen taken over is deposed here (the finding
+    /// of [`Core::on_renew_probe`]); a read for a tenure this core no longer
+    /// holds, an older body or a failed read say nothing about the one it
+    /// does.
+    pub(crate) fn on_root_probed(
+        &mut self,
+        now: Now,
+        epoch: Epoch,
+        sent: HonourMs,
+        read: crate::root_probe::LeaseRead,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        use crate::root_probe::{judge, LeaseRead, Verdict};
+        self.stats.root_probes += 1;
+        let mine = self
+            .lease
+            .held
+            .as_ref()
+            .filter(|_| !self.lease.lost && !self.lease.epoch_held())
+            .map(|(l, _)| l.epoch);
+        if mine != Some(epoch) {
+            return;
+        }
+        match judge(read, self.cfg.node_id, epoch) {
+            Verdict::Live => {
+                self.stats.root_probes_live += 1;
+                if sent > self.ack.last_s3_fresh {
+                    self.ack.last_s3_fresh = sent;
+                }
+            }
+            Verdict::Deposed => {
+                self.stats.root_probes_deposed += 1;
+                let (holder, at) = match read {
+                    LeaseRead::Held { holder, epoch, .. } => (holder, epoch),
+                    _ => (0, 0),
+                };
+                self.deposed(now, holder, at, epoch, replica, out);
+            }
+            Verdict::Unknown => {}
+        }
+    }
+
     /// Plan 30 §M9: a tenure that serves strict reads says so in the
     /// lease first (one CAS per tenure). `true` when it already does.
     ///

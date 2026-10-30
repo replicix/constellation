@@ -267,6 +267,16 @@ pub enum LagOf {
     NonHolder,
 }
 
+/// Plan 41 D3 non-vacuity: a probe that does not do what the design says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeMutant {
+    /// The design.
+    None,
+    /// Whatever the read shows counts as a proof (a takeover racing the
+    /// read, or already done, is not noticed).
+    IgnoresVerdict,
+}
+
 /// Where a node's off-core heartbeat runs (the daemon's
 /// `holder_alive_loop`), in the simulation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -593,6 +603,13 @@ pub struct SimConfig {
     /// `node.rs`). `false` is the code before it, the non-vacuity knob of
     /// the root-stall configurations (`delegated-core-stall-root-unlaned`).
     pub deleg_root_lane: bool,
+    /// Plan 41 D3: a root refused for stale liveness reads its lease object
+    /// off the core (`root_probe`, the bus tap of `node.rs`). `false` is the
+    /// code before it: the fail-before of the backed-root configurations
+    /// (`delegated-core-stall-root-backup-unprobed`).
+    pub deleg_root_probe: bool,
+    /// Test-only non-vacuity of the probe (never set by the daemon).
+    pub root_probe_mutant: ProbeMutant,
     /// Plan 41 L2: the lock renewal lane (`lock_lane_loop`) renews each
     /// node's grants beside its core, from the certificate the core
     /// publishes. `false` is the code before it: the fail-before of the
@@ -910,6 +927,8 @@ impl Default for SimConfig {
             keeps_backups: false,
             deleg_lane: true,
             deleg_root_lane: true,
+            deleg_root_probe: true,
+            root_probe_mutant: ProbeMutant::None,
             // `AUTHORITY_SIM_NO_LOCK_LANE=1`: the code without the lock lane.
             lock_lane: std::env::var_os("AUTHORITY_SIM_NO_LOCK_LANE").is_none(),
             lock_lane_ignores_freshness: false,
@@ -3526,6 +3545,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         beats_lost_in_lag: cfg.beats_lost_in_lag,
         deleg_lane: cfg.deleg_lane,
         deleg_root_lane: cfg.deleg_root_lane,
+        deleg_root_probe: cfg.deleg_root_probe,
+        root_probe_mutant: cfg.root_probe_mutant,
         lock_lane: cfg.lock_lane,
         lock_lane_ignores_freshness: cfg.lock_lane_ignores_freshness,
         skip_close_on_recall: cfg.skip_close_on_recall,

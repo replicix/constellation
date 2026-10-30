@@ -163,6 +163,9 @@ pub struct CoreStatus {
     /// and the ones it declined while the core was stuck, by reason
     /// (`DelegWindows::stats`; atomics the core's step does not guard).
     pub delegation_root_answers_off_core: u64,
+    /// Plan 41 D3: the root's off-core lease reads: started, found live,
+    /// found deposed, withheld (`RootProbe::stats`).
+    pub delegation_root_probes: [u64; 4],
     /// Plan 41 L3/L4: what the lock lane did, and whether it runs.
     pub lock_lane: constellation_authority::lane::LaneStats,
     pub lock_lane_enabled: bool,
@@ -265,6 +268,7 @@ fn event_kind(event: &Event) -> &'static str {
         Event::LaneOwn { .. } => "LaneOwn",
         Event::LaneRenewed { .. } => "LaneRenewed",
         Event::LaneUnanswered { .. } => "LaneUnanswered",
+        Event::RootProbed { .. } => "RootProbed",
         Event::Control { req, .. } => match req {
             Control::Nudge => "Control(Nudge)",
             Control::Journaled => "Control(Journaled)",
@@ -1103,6 +1107,22 @@ pub(crate) fn deleg_root_lane_on() -> bool {
     )
 }
 
+/// Whether the root's off-core lanes read their lease object when a renewal
+/// finds their proof of liveness stale (plan 41 D3). `CONSTELLATION_ROOT_PROBE=off`
+/// turns it off (A/B runs, the fail-before of `delegate-store-stall` with the
+/// backed root stalled): the lanes then answer a tenure that can be taken over
+/// early only within the freshness window of the core's own last proof.
+pub(crate) fn root_probe_on() -> bool {
+    !matches!(
+        std::env::var("CONSTELLATION_ROOT_PROBE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "off" | "false"
+    )
+}
+
 /// What one tick of [`holder_alive_loop`] does.
 #[derive(Debug, PartialEq, Eq)]
 enum AliveTick {
@@ -1732,6 +1752,27 @@ pub struct OffCore {
     /// shared with the lane's task (`crate::lock_lane`) and with status.
     pub(crate) lane_cell: Arc<constellation_authority::lane::LaneCell>,
     pub(crate) lock_lane: Mutex<constellation_authority::lane::RenewLane>,
+    /// Plan 41 D3: the off-core lanes' proof that this root still holds its
+    /// lease (`constellation_authority::root_probe`), shared with the
+    /// window table the delegation answerer decides on, and the lease store
+    /// the proof's read goes through (the driver's own, set when it is
+    /// built, so the own-S3 watch sees the read).
+    pub(crate) root_probe: Arc<constellation_authority::root_probe::RootProbe>,
+    leases: std::sync::OnceLock<LeaseHandle>,
+    /// The daemon's shared runtime, where the proof's read runs whichever
+    /// thread asked for it (the lock lane's own thread has a runtime of its
+    /// own, which the store's pooled connections must not belong to).
+    runtime: std::sync::OnceLock<tokio::runtime::Handle>,
+}
+
+/// The lease store the root's proof reads through ([`OffCore::set_leases`]).
+#[derive(Clone)]
+struct LeaseHandle(LeaseStore);
+
+impl std::fmt::Debug for LeaseHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LeaseHandle")
+    }
 }
 
 impl OffCore {
@@ -1739,7 +1780,14 @@ impl OffCore {
     /// wake-up and still count as responsive ([`Self::core_responsive`]).
     /// The lag threshold is the default takeover window's (1.5 s / 8).
     pub fn new(responsive_ms: u64) -> Self {
+        let root_probe = constellation_authority::root_probe::RootProbe::new();
+        let root_probe_for_lane = root_probe.clone();
+        let deleg_windows = constellation_authority::core::DelegWindows::new();
+        deleg_windows.set_probe(root_probe.clone());
         Self {
+            root_probe,
+            leases: std::sync::OnceLock::new(),
+            runtime: std::sync::OnceLock::new(),
             busy_since: std::sync::atomic::AtomicI64::new(0),
             heard: Mutex::new(HashMap::new()),
             responsive_ms: responsive_ms.max(1) as i64,
@@ -1753,11 +1801,18 @@ impl OffCore {
             beat_due: std::sync::atomic::AtomicI64::new(0),
             beat_freeze: std::sync::atomic::AtomicU64::new(0),
             granted_ttl: Mutex::new(HashMap::new()),
-            deleg_windows: constellation_authority::core::DelegWindows::new(),
+            deleg_windows,
             lane_cell: constellation_authority::lane::LaneCell::new(),
-            lock_lane: Mutex::new(constellation_authority::lane::RenewLane::new(
-                crate::lock_lane::lock_lane_max_stall_ms(),
-            )),
+            lock_lane: Mutex::new({
+                let lane = constellation_authority::lane::RenewLane::new(
+                    crate::lock_lane::lock_lane_max_stall_ms(),
+                );
+                if root_probe_on() {
+                    lane.with_probe(root_probe_for_lane, holder_stall_ms())
+                } else {
+                    lane
+                }
+            }),
         }
     }
 
@@ -1780,6 +1835,7 @@ impl OffCore {
     /// ([`constellation_authority::deleg_lane::answer_root`] decides, and
     /// has the argument), else `None` and the core answers in full when it
     /// runs. `enabled`: [`deleg_root_lane_on`]; `hung_ms`: [`holder_stall_ms`].
+    #[cfg(test)]
     pub(crate) fn answer_root(
         &self,
         enabled: bool,
@@ -1810,6 +1866,162 @@ impl OffCore {
             clk,
         )
         .ok()
+    }
+
+    /// Plan 41 D3: [`Self::answer_root`], and for a renewal refused only for
+    /// stale liveness (a tenure that can be taken over early, whose core made
+    /// no S3 request lately because it is stuck) one read of the lease object,
+    /// off the core: at most one in flight and one per freshness window
+    /// ([`constellation_authority::root_probe`] has the argument that its
+    /// result is a proof of liveness as of its send). The request then waits
+    /// for the read, bounded by the window, and is decided once more at a
+    /// fresh reading; whatever the read found, the core still answers the
+    /// request in full when it runs.
+    pub(crate) async fn answer_root_probing(
+        self: &Arc<Self>,
+        enabled: bool,
+        hung_ms: i64,
+        node_id: NodeId,
+        from: NodeId,
+        gen: u64,
+    ) -> Option<u64> {
+        use constellation_authority::deleg_lane::{answer_root_or_probe, RootAnswer};
+        let clk = constellation_platform::clock::protocol().now();
+        let stuck_ms = self.stuck_ms(clk.wait.0);
+        if !enabled {
+            return None;
+        }
+        if stuck_ms < constellation_authority::deleg_lane::DELEG_LANE_STUCK_MIN_MS {
+            self.deleg_windows
+                .note_deferred(constellation_authority::core::Refusal::NotStuck);
+            return None;
+        }
+        if !root_probe_on() {
+            return constellation_authority::deleg_lane::answer_root(
+                &self.deleg_windows,
+                stuck_ms,
+                hung_ms,
+                from,
+                gen,
+                clk,
+            )
+            .ok();
+        }
+        let (tx, rx) = oneshot::channel::<()>();
+        let mut tx = Some(tx);
+        let answer = answer_root_or_probe(
+            &self.deleg_windows,
+            &self.root_probe,
+            stuck_ms,
+            hung_ms,
+            from,
+            gen,
+            clk,
+            || {
+                let tx = tx.take();
+                Box::new(move || {
+                    if let Some(tx) = tx {
+                        let _ = tx.send(());
+                    }
+                })
+            },
+        );
+        let window_ms = match answer {
+            RootAnswer::Granted(ttl) => return Some(ttl),
+            RootAnswer::Declined(_) => return None,
+            RootAnswer::Probe(ticket) => {
+                let window = self
+                    .deleg_windows
+                    .lease_cert()
+                    .map_or(1_500, |l| l.window_ms);
+                self.spawn_root_probe(ticket, node_id, window);
+                window
+            }
+            RootAnswer::Wait => self
+                .deleg_windows
+                .lease_cert()
+                .map_or(1_500, |l| l.window_ms),
+        };
+        let _ = tokio::time::timeout(Duration::from_millis(window_ms.max(1) as u64), rx).await;
+        // Decided again, once, at a fresh reading and a fresh look at the
+        // driver (it may be running again: then the core's answer is the
+        // only one).
+        let clk = constellation_platform::clock::protocol().now();
+        let stuck_ms = self.stuck_ms(clk.wait.0);
+        constellation_authority::deleg_lane::answer_root(
+            &self.deleg_windows,
+            stuck_ms,
+            hung_ms,
+            from,
+            gen,
+            clk,
+        )
+        .ok()
+    }
+
+    /// Perform the lease read of `ticket` on a task of its own (a requester
+    /// that goes away does not abandon the waiters behind it), tell the core
+    /// on the urgent lane what it found, and wake the waiters.
+    pub(crate) fn spawn_root_probe(
+        self: &Arc<Self>,
+        ticket: constellation_authority::root_probe::Ticket,
+        node_id: NodeId,
+        window_ms: i64,
+    ) {
+        use constellation_authority::root_probe::{judge, LeaseRead};
+        let off_core = self.clone();
+        let Some(LeaseHandle(leases)) = self.leases.get().cloned() else {
+            // No lease store (a unit test): the read fails.
+            for w in self.root_probe.finish(
+                ticket,
+                constellation_authority::root_probe::Verdict::Unknown,
+            ) {
+                w();
+            }
+            return;
+        };
+        let task = async move {
+            // Bounded by the window the proof could justify: a read that
+            // takes longer proves nothing for a renewal waiting on it.
+            let read = match tokio::time::timeout(
+                Duration::from_millis(window_ms.max(1) as u64),
+                leases.get(),
+            )
+            .await
+            {
+                Ok(Ok(Some((lease, _)))) => LeaseRead::of(&lease),
+                Ok(Ok(None)) => LeaseRead::Absent,
+                _ => LeaseRead::Failed,
+            };
+            let verdict = judge(read, node_id, ticket.epoch);
+            let waiters = off_core.root_probe.finish(ticket, verdict);
+            if let Some(tx) = off_core.urgent.lock().unwrap().as_ref() {
+                let _ = tx.send(SyncRequest::RootProbed {
+                    epoch: ticket.epoch,
+                    sent: ticket.sent.0,
+                    read,
+                });
+            }
+            for w in waiters {
+                w();
+            }
+        };
+        match self.runtime.get() {
+            Some(handle) => {
+                handle.spawn(task);
+            }
+            None => {
+                tokio::spawn(task);
+            }
+        }
+    }
+
+    /// Where the proof's reads go: the driver's own lease store (set once).
+    pub(crate) fn set_leases(&self, leases: LeaseStore) {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let _ = self.runtime.set(handle);
+        }
+        let _ = self.leases.set(LeaseHandle(leases));
     }
 
     /// The core's renewal of `(gen, round)` was dispatched at `at_honour_ms`
@@ -2206,6 +2418,7 @@ impl Driver {
         core.set_lane_cell(deps.off_core.lane_cell.clone());
         core.deleg_windows().set_clock(Arc::new(crate::locks::now));
         let leases = LeaseStore::new(deps.store_inner.clone(), PARTITION, deps.lease_mode);
+        deps.off_core.set_leases(leases.clone());
         let inbox = match &deps.e2e {
             Some(keys) => InboxStore::new_e2e(deps.store_inner.clone(), keys.clone()),
             None => InboxStore::new(deps.store_inner.clone()),
@@ -2782,6 +2995,13 @@ impl Driver {
         {
             let w = self.deps.off_core.deleg_windows.stats();
             status.delegation_root_answers_off_core = w.answered_off_core.load(Ordering::Relaxed);
+            let p = self.deps.off_core.root_probe.stats();
+            status.delegation_root_probes = [
+                p.started.load(Ordering::Relaxed),
+                p.live.load(Ordering::Relaxed),
+                p.deposed.load(Ordering::Relaxed),
+                p.withheld.load(Ordering::Relaxed),
+            ];
             status.delegation_root_answers_deferred = constellation_authority::core::Refusal::ALL
                 .iter()
                 .map(|r| {
@@ -3225,6 +3445,13 @@ impl Driver {
                 sent: HonourMs(sent),
                 results,
             })),
+            SyncRequest::RootProbed { epoch, sent, read } => {
+                Some(Internal::Event(Event::RootProbed {
+                    epoch,
+                    sent: constellation_authority::HonourMs(sent),
+                    read,
+                }))
+            }
             SyncRequest::LaneUnanswered { to } => {
                 Some(Internal::Event(Event::LaneUnanswered { to }))
             }
@@ -7254,6 +7481,8 @@ impl Standalone {
 #[cfg(test)]
 mod tests {
     use super::parse_u64_zero_ok;
+    use super::{LeaseMode, LeaseStore, PARTITION};
+    use std::sync::Arc;
 
     /// Finding 14: a lone node's authority core waited 18 s for the
     /// metadata store's writer lock (a FUSE commit's journal write held up
@@ -7560,6 +7789,117 @@ mod tests {
         );
         assert!(stop.load(Ordering::Relaxed), "the beat thread was not told");
         assert!(alive.lock().unwrap().is_none(), "targets kept");
+    }
+
+    /// A fast root (node 1, epoch 2, a listed backup) whose core is stuck and
+    /// whose proof of liveness is stale, delegating `d` (generation 7) to
+    /// node 3, with the lease object `lease` in an in-memory bucket.
+    async fn stuck_fast_root(
+        lease: Option<constellation_store_s3::Lease>,
+    ) -> std::sync::Arc<super::OffCore> {
+        use constellation_authority::core::RootLease;
+        use constellation_authority::HonourMs;
+        use std::sync::atomic::Ordering;
+        let off = Arc::new(super::OffCore::new(5_000));
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let leases = LeaseStore::new(store, PARTITION, LeaseMode::Cas);
+        if let Some(l) = lease {
+            leases.try_create(&l).await.unwrap();
+        }
+        off.set_leases(leases);
+        let clk = constellation_platform::clock::protocol().now();
+        off.deleg_windows
+            .insert(7, 3, clk.wait.plus(5_000), clk.wait.plus(5_000), true);
+        off.deleg_windows.publish(
+            Some(RootLease {
+                epoch: 2,
+                honour_until: HonourMs(clk.honour.0 + 600_000),
+                margin_ms: 1_000,
+                delegation_ttl_ms: 4_000,
+                extra_ms: 1_000,
+                fast: true,
+                last_s3_fresh: HonourMs(clk.honour.0 - 20_000),
+                window_ms: 1_500,
+                marked: true,
+            }),
+            &[7],
+        );
+        off.busy_since.store(clk.wait.0 - 2_000, Ordering::Relaxed);
+        off
+    }
+
+    /// Plan 41 D3: a stuck root with a backup reads its lease object for the
+    /// renewal that found its proof stale, and answers it when the read shows
+    /// it still holds the tenure at the certificate's epoch. Fail-before: with
+    /// the read off (the code before) it answers nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stuck_backed_root_answers_after_reading_its_lease() {
+        use std::sync::atomic::Ordering;
+        let lease = constellation_store_s3::Lease::granted(PARTITION, 1, 2, 60_000);
+        let off = stuck_fast_root(Some(lease)).await;
+        assert_eq!(
+            off.answer_root_probing(true, 15_000, 1, 3, 7).await,
+            Some(4_000)
+        );
+        let p = off.root_probe.stats();
+        assert_eq!(p.started.load(Ordering::Relaxed), 1);
+        assert_eq!(p.live.load(Ordering::Relaxed), 1);
+        // Inside the round the proof stands: no second read.
+        assert_eq!(
+            off.answer_root_probing(true, 15_000, 1, 3, 7).await,
+            Some(4_000)
+        );
+        assert_eq!(p.started.load(Ordering::Relaxed), 1);
+    }
+
+    /// Plan 41 D3, the negative controls: a lease that names another holder,
+    /// another epoch, no lease at all, and a read that fails answer nothing,
+    /// and a successor ends the epoch's answers for good.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stuck_backed_root_whose_lease_is_gone_answers_nothing() {
+        use std::sync::atomic::Ordering;
+        for (what, lease) in [
+            (
+                "another holder",
+                Some(constellation_store_s3::Lease::granted(
+                    PARTITION, 4, 3, 60_000,
+                )),
+            ),
+            (
+                "another holder, same epoch",
+                Some(constellation_store_s3::Lease::granted(
+                    PARTITION, 4, 2, 60_000,
+                )),
+            ),
+            (
+                "a later epoch of this node",
+                Some(constellation_store_s3::Lease::granted(
+                    PARTITION, 1, 3, 60_000,
+                )),
+            ),
+            ("no lease", None),
+        ] {
+            let off = stuck_fast_root(lease).await;
+            assert_eq!(
+                off.answer_root_probing(true, 15_000, 1, 3, 7).await,
+                None,
+                "{what}"
+            );
+            assert!(off.root_probe.deposed(2), "{what}");
+            assert_eq!(off.root_probe.proof(2), None, "{what}");
+            // No more reads for the epoch, and no answers.
+            assert_eq!(
+                off.answer_root_probing(true, 15_000, 1, 3, 7).await,
+                None,
+                "{what}"
+            );
+            assert_eq!(
+                off.root_probe.stats().started.load(Ordering::Relaxed),
+                1,
+                "{what}"
+            );
+        }
     }
 
     /// Plan 41 R2: the root's P2P service answers a delegation renewal from

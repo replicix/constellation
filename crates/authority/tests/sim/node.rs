@@ -360,6 +360,9 @@ pub struct NodeEnv {
     pub deleg_lane: bool,
     /// See `SimConfig::deleg_root_lane`.
     pub deleg_root_lane: bool,
+    /// See `SimConfig::deleg_root_probe` / `root_probe_mutant`.
+    pub deleg_root_probe: bool,
+    pub root_probe_mutant: super::run::ProbeMutant,
     /// See `SimConfig::lock_lane`.
     pub lock_lane: bool,
     /// See `SimConfig::lock_lane_ignores_freshness`.
@@ -529,18 +532,37 @@ impl NodeHandle {
         // The root's delegation windows, shared with the answerer below
         // (the daemon's `OffCore::deleg_windows`).
         let windows = constellation_authority::core::DelegWindows::new();
+        let probe = constellation_authority::root_probe::RootProbe::new();
+        windows.set_probe(probe.clone());
         windows.skip_closes_for_tests(env.skip_close_on_recall, false);
         // The lock lane's certificate cell (the core publishes it, the lane's
         // task and its answer tap read it).
         let lane_cell = constellation_authority::lane::LaneCell::new();
-        shared
-            .lane
-            .lock()
-            .unwrap()
-            .ignore_freshness_for_tests(env.lock_lane_ignores_freshness);
         {
+            // The lock lane's own renewals rest on the root's proof too
+            // (plan 41 D3), unless the configuration models the code before.
+            let mut lane = shared.lane.lock().unwrap();
+            if env.deleg_root_probe {
+                *lane =
+                    std::mem::replace(&mut *lane, constellation_authority::lane::RenewLane::new(0))
+                        .with_probe(probe.clone(), SIM_HOLDER_STALL_MS);
+            }
+            lane.ignore_freshness_for_tests(env.lock_lane_ignores_freshness);
+        }
+        let root_ctx = Arc::new(RootCtx {
+            id,
+            shared: shared.clone(),
+            windows: windows.clone(),
+            probe: probe.clone(),
+            bus: Arc::downgrade(&env.bus),
+            clock: clock.clone(),
+            bucket: Arc::downgrade(&env.bucket),
+            probing: env.deleg_root_probe,
+            mutant: env.root_probe_mutant,
+        });
+        {
+            let root_ctx = root_ctx.clone();
             let shared = shared.clone();
-            let windows = windows.clone();
             // Weak: the bus stores this tap, and a tap that held its bus
             // kept both (and every node's `Meta`) alive past the run.
             let bus = Arc::downgrade(&env.bus);
@@ -578,38 +600,8 @@ impl NodeHandle {
                             req, gen, round, ..
                         }
                         | PeerMsg::DelegRenewOffCore { req, gen, round } => {
-                            let now = clock.now();
-                            let busy = shared.busy_since.load(Ordering::SeqCst);
-                            let stuck_ms = if busy != 0 { now.wait.0 - busy } else { 0 };
-                            if !root_lane
-                                || stuck_ms
-                                    < constellation_authority::deleg_lane::DELEG_LANE_STUCK_MIN_MS
-                            {
-                                return;
-                            }
-                            if let Ok(ttl_ms) = constellation_authority::deleg_lane::answer_root(
-                                &windows,
-                                stuck_ms,
-                                SIM_HOLDER_STALL_MS,
-                                from,
-                                *gen,
-                                now,
-                            ) {
-                                let _ = shared.urgent.send(Event::DelegRenewAnsweredOffCore {
-                                    gen: *gen,
-                                    from,
-                                    ttl_ms,
-                                });
-                                bus.send(
-                                    id,
-                                    from,
-                                    PeerMsg::DelegRenewedOffCore {
-                                        req: *req,
-                                        gen: *gen,
-                                        round: *round,
-                                        ttl_ms,
-                                    },
-                                );
+                            if root_lane {
+                                answer_deleg_renewal(&root_ctx, from, *req, *gen, *round, true);
                             }
                         }
                         // The lock lane's answers (plan 41 L2/L4): an owner's
@@ -740,6 +732,7 @@ impl NodeHandle {
                 lane_cell,
                 lane_tick_ms,
                 lane_timeout_ms,
+                root_ctx.clone(),
             ));
         }
         if env.holder_beats != super::run::HolderBeats::Off {
@@ -1237,6 +1230,8 @@ fn apply_lane_actions(
             LaneAction::Unanswered { to } => {
                 let _ = shared.urgent.send(Event::LaneUnanswered { to });
             }
+            // (Performed by the lane's loop, which owns the read.)
+            LaneAction::Probe(_) => {}
         }
     }
 }
@@ -1258,6 +1253,7 @@ async fn lock_lane_loop(
     cell: Arc<constellation_authority::lane::LaneCell>,
     every_ms: u64,
     timeout_ms: u64,
+    root: Arc<RootCtx>,
 ) {
     use constellation_authority::lane::LaneEvent;
     let facts = SimLaneFacts { cell, meta };
@@ -1297,6 +1293,12 @@ async fn lock_lane_loop(
             }
         }
         for a in &actions {
+            // Plan 41 D3: the read of the lease object the own renewals wait
+            // for, off the core.
+            if let constellation_authority::lane::LaneAction::Probe(t) = a {
+                let window = root.windows.lease_cert().map_or(1_500, |l| l.window_ms);
+                spawn_root_probe(root.clone(), *t, window);
+            }
             if let constellation_authority::lane::LaneAction::Send { req, .. } = a {
                 let (shared, bus, clock, meta, cell, req) = (
                     shared.clone(),
@@ -1415,6 +1417,143 @@ async fn deleg_lane_loop(
             );
         }
     }
+}
+
+/// What the root's off-core answerer (the bus tap) needs: the daemon's
+/// `OffCore` and `P2pBridge::root_answer_off_core` in the simulation.
+struct RootCtx {
+    id: NodeId,
+    shared: Arc<Shared>,
+    windows: Arc<constellation_authority::core::DelegWindows>,
+    probe: Arc<constellation_authority::root_probe::RootProbe>,
+    /// Weak: see the tap in `NodeHandle::spawn`.
+    bus: std::sync::Weak<Bus>,
+    clock: Clock,
+    /// Weak, like the bus: the bucket's lease hook reaches the bus, whose taps
+    /// hold this context.
+    bucket: std::sync::Weak<Bucket>,
+    /// Plan 41 D3 is modelled (`SimConfig::deleg_root_probe`).
+    probing: bool,
+    mutant: super::run::ProbeMutant,
+}
+
+/// Answer delegate `from`'s renewal of `gen` off this root's stuck core, if
+/// the rules allow ([`constellation_authority::deleg_lane::answer_root_or_probe`]):
+/// a renewal refused only for stale liveness asks for a read of the lease
+/// object, and is decided once more when the read ends (`allow_probe: false`).
+fn answer_deleg_renewal(
+    ctx: &Arc<RootCtx>,
+    from: NodeId,
+    req: OpId,
+    gen: u64,
+    round: u64,
+    allow_probe: bool,
+) {
+    use constellation_authority::deleg_lane::{answer_root, answer_root_or_probe, RootAnswer};
+    let Some(bus) = ctx.bus.upgrade() else {
+        return;
+    };
+    let now = ctx.clock.now();
+    let busy = ctx.shared.busy_since.load(Ordering::SeqCst);
+    let stuck_ms = if busy != 0 { now.wait.0 - busy } else { 0 };
+    if stuck_ms < constellation_authority::deleg_lane::DELEG_LANE_STUCK_MIN_MS {
+        return;
+    }
+    let answer = if allow_probe && ctx.probing {
+        // Weak: the waiter is stored in the probe the context holds; an
+        // unfinished read at the end of a run must not keep both alive.
+        let again = Arc::downgrade(ctx);
+        answer_root_or_probe(
+            &ctx.windows,
+            &ctx.probe,
+            stuck_ms,
+            SIM_HOLDER_STALL_MS,
+            from,
+            gen,
+            now,
+            move || {
+                Box::new(move || {
+                    if let Some(ctx) = again.upgrade() {
+                        answer_deleg_renewal(&ctx, from, req, gen, round, false);
+                    }
+                })
+            },
+        )
+    } else {
+        match answer_root(&ctx.windows, stuck_ms, SIM_HOLDER_STALL_MS, from, gen, now) {
+            Ok(ttl) => RootAnswer::Granted(ttl),
+            Err(r) => RootAnswer::Declined(r),
+        }
+    };
+    match answer {
+        RootAnswer::Granted(ttl_ms) => {
+            let _ = ctx
+                .shared
+                .urgent
+                .send(Event::DelegRenewAnsweredOffCore { gen, from, ttl_ms });
+            bus.send(
+                ctx.id,
+                from,
+                PeerMsg::DelegRenewedOffCore {
+                    req,
+                    gen,
+                    round,
+                    ttl_ms,
+                },
+            );
+        }
+        RootAnswer::Probe(ticket) => {
+            let window = ctx.windows.lease_cert().map_or(1_500, |l| l.window_ms);
+            spawn_root_probe(ctx.clone(), ticket, window);
+        }
+        RootAnswer::Wait | RootAnswer::Declined(_) => {}
+    }
+}
+
+/// The root's off-core read of its lease object (the daemon's
+/// `OffCore::spawn_root_probe`): judged by the sans-IO rule, reported to the
+/// core on the urgent lane, then the renewals that waited for it are decided
+/// again.
+fn spawn_root_probe(
+    ctx: Arc<RootCtx>,
+    ticket: constellation_authority::root_probe::Ticket,
+    window_ms: i64,
+) {
+    use constellation_authority::root_probe::{judge, LeaseRead, Verdict};
+    tokio::spawn(async move {
+        let Some(bucket) = ctx.bucket.upgrade() else {
+            return;
+        };
+        let leases = LeaseStore::new(bucket.handle(ctx.id), "p0", LeaseMode::Cas);
+        let read = match tokio::time::timeout(
+            std::time::Duration::from_millis(window_ms.max(1) as u64),
+            leases.get(),
+        )
+        .await
+        {
+            Ok(Ok(Some((lease, _)))) => LeaseRead::of(&lease),
+            Ok(Ok(None)) => LeaseRead::Absent,
+            _ => LeaseRead::Failed,
+        };
+        let mut verdict = judge(read, ctx.id, ticket.epoch);
+        match ctx.mutant {
+            super::run::ProbeMutant::None => {}
+            // A read that shows a successor, or fails, counts as a proof.
+            super::run::ProbeMutant::IgnoresVerdict => verdict = Verdict::Live,
+        }
+        if !ctx.shared.alive.load(Ordering::SeqCst) {
+            return;
+        }
+        let waiters = ctx.probe.finish(ticket, verdict);
+        let _ = ctx.shared.urgent.send(Event::RootProbed {
+            epoch: ticket.epoch,
+            sent: ticket.sent,
+            read,
+        });
+        for w in waiters {
+            w();
+        }
+    });
 }
 
 /// `holder_stall_ms()`'s default in the daemon: a driver stuck longer is

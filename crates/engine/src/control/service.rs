@@ -536,6 +536,10 @@ impl EngineControl {
                     root_answers_off_core: core.delegation_root_answers_off_core,
                     root_answers_deferred: core.delegation_root_answers_deferred.clone(),
                     off_core_answers_applied: stats.deleg_off_core_answers_applied,
+                    root_probes: core.delegation_root_probes[0],
+                    root_probes_live: core.delegation_root_probes[1],
+                    root_probes_deposed: core.delegation_root_probes[2],
+                    root_probes_withheld: core.delegation_root_probes[3],
                 }
             },
             cto: {
@@ -703,6 +707,7 @@ impl EngineControl {
                         uncovered: core.lock_lane.uncovered,
                         max_stuck_ms: core.lock_lane.max_stuck_ms,
                         in_flight: core.lock_lane_in_flight as u64,
+                        probes: core.lock_lane.probes,
                     },
                 }
             },

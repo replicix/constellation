@@ -1133,6 +1133,13 @@ pub struct Stats {
     pub renew_held: u64,
     pub renew_probes: u64,
     pub renew_refused: u64,
+    /// Plan 41 D3: the lease reads the off-core lanes made while this core
+    /// was stuck (`Event::RootProbed`) and what they found: this tenure live
+    /// (its send is now the core's own proof too), deposed (the core finds
+    /// out here, as after its own probe's), or nothing either way.
+    pub root_probes: u64,
+    pub root_probes_live: u64,
+    pub root_probes_deposed: u64,
     pub lock_reclaimed: u64,
     pub lock_moved: u64,
     /// Of those, the grants that carried what was left of their record
@@ -2172,6 +2179,9 @@ impl Core {
             Event::LaneUnanswered { to } => self.on_lane_unanswered(to, replica, &mut out),
             Event::DelegRenewAnsweredOffCore { gen, from, ttl_ms } => {
                 self.on_deleg_renew_answered_off_core(now, gen, from, ttl_ms, &mut out)
+            }
+            Event::RootProbed { epoch, sent, read } => {
+                self.on_root_probed(now, epoch, sent, read, replica, &mut out)
             }
             Event::BackupAlive { from, at } => self.on_backup_alive(from, at),
             Event::Slack { epoch_slack } => self.on_slack(now, epoch_slack, replica, &mut out),

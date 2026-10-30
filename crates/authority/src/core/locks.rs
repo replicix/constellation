@@ -6206,6 +6206,7 @@ impl Core {
             && honour_end.is_some();
         crate::lane::LockLaneView {
             me,
+            epoch: self.lease.epoch().unwrap_or(0),
             root_ok,
             cap_until: honour_end.map_or(HonourMs(0), |h| h.minus(margin.max(0) as u64)),
             fast: self.may_be_taken_over_early(),

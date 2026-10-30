@@ -384,6 +384,10 @@ fn replay_seed() {
         Ok("delegated-core-stall-root-unlaned") => delegated_core_stall_root_unlaned_config(),
         Ok("delegated-core-stall-root-lease6") => delegated_core_stall_root_lease6_config(),
         Ok("delegated-core-stall-root-backup") => delegated_core_stall_root_backup_config(),
+        Ok("delegated-core-stall-root-backup-unprobed") => {
+            delegated_core_stall_root_backup_unprobed_config()
+        }
+        Ok("delegated-core-stall-root-sealed") => delegated_core_stall_root_sealed_config(),
         Ok("delegated-core-stall-root-hang") => delegated_core_stall_root_hang_config(),
         Ok("delegated-core-stall-both") => delegated_core_stall_both_config(),
         Ok("delegated-core-stall-root-recall") => delegated_core_stall_root_recall_config(),
@@ -5209,6 +5213,10 @@ fn sweep_config() {
         "delegated-core-stall-root-unlaned" => delegated_core_stall_root_unlaned_config(),
         "delegated-core-stall-root-lease6" => delegated_core_stall_root_lease6_config(),
         "delegated-core-stall-root-backup" => delegated_core_stall_root_backup_config(),
+        "delegated-core-stall-root-backup-unprobed" => {
+            delegated_core_stall_root_backup_unprobed_config()
+        }
+        "delegated-core-stall-root-sealed" => delegated_core_stall_root_sealed_config(),
         "delegated-core-stall-root-hang" => delegated_core_stall_root_hang_config(),
         "delegated-core-stall-both" => delegated_core_stall_both_config(),
         "delegated-core-stall-root-recall" => delegated_core_stall_root_recall_config(),
@@ -5294,6 +5302,11 @@ fn sweep_config() {
         "locks-core-stall-backup-unfresh" => locks_core_stall_backup_unfresh_config(),
         "locks-core-stall-backup-long" => locks_core_stall_backup_long_config(),
         "locks-core-stall-backup-long-unfresh" => locks_core_stall_backup_long_unfresh_config(),
+        "locks-core-stall-backup-long-beats" => locks_core_stall_backup_long_beats_config(),
+        "locks-core-stall-backup-long-beats-unprobed" => {
+            locks_core_stall_backup_long_beats_unprobed_config()
+        }
+        "locks-core-stall-backup-long-blind" => locks_core_stall_backup_long_blind_config(),
         "locks-core-stall-s3" => locks_core_stall_s3_config(),
         "locks-core-stall-writes" => locks_core_stall_writes_config(),
         "locks-core-stall-blips" => locks_core_stall_blips_config(),
@@ -6475,9 +6488,11 @@ fn delegated_core_stall_root_lease6_config() -> SimConfig {
 }
 
 /// The usual delegation root has a backup (a fast tenure): the answerer
-/// answers only within `backup_takeover_ms` of the core's last proof of
-/// liveness, and the holder's off-core beat runs (`holder_beats`), so its
-/// backup does not seal it. Safety only (plan 41 P lengthens the answers).
+/// answers within `backup_takeover_ms` of a proof of liveness, and the core,
+/// stuck, makes no S3 request to prove it, so (plan 41 D3) the root reads its
+/// lease object itself, off the core, for the renewal that found its proof
+/// stale (`root_probe`). Its holder's off-core beat runs (`holder_beats`), so
+/// its backup does not seal it. No delegation is reclaimed, lapses or ends.
 fn delegated_core_stall_root_backup_config() -> SimConfig {
     SimConfig {
         core: std::sync::Arc::new(|node, incarnation| {
@@ -6487,6 +6502,65 @@ fn delegated_core_stall_root_backup_config() -> SimConfig {
         }),
         holder_beats: sim::run::HolderBeats::Thread,
         ..delegated_core_stall_root_config()
+    }
+}
+
+/// [`delegated_core_stall_root_backup_config`] without the root's own read
+/// of its lease: what plan 41 R2 did (`KNOWN-GAP root core stuck`): answers
+/// only within the takeover window of the core's last proof, then none, and
+/// the delegations lapse.
+fn delegated_core_stall_root_backup_unprobed_config() -> SimConfig {
+    SimConfig {
+        deleg_root_probe: false,
+        ..delegated_core_stall_root_backup_config()
+    }
+}
+
+/// Plan 41 D3, the negative control: the root's core is stuck and its
+/// holder's off-core beat is not running (`HolderBeats::Off`: a hung process
+/// the lane still runs in, or a link the beats cannot cross), so its backup
+/// seals it 1.5 s into the stall and a successor takes the tenure over. The
+/// stuck root's lease read then shows the successor: it answers no renewal
+/// from there, and whatever it answered before the seal is inside the
+/// successor's quarantine. Safety only (the oracles judge). The probe's
+/// mutants are not caught here: a delegate learns of a changed tenure from
+/// the log and from its new root, whatever the old root answers (the lock
+/// configurations `locks-core-stall-backup-long-blind` and `-late`, where
+/// the stuck root's own clients hold its grants, are the sim's negative
+/// control).
+fn delegated_core_stall_root_sealed_config() -> SimConfig {
+    let at = |at_ms, kind| ScheduledFault { at_ms, kind };
+    SimConfig {
+        holder_beats: sim::run::HolderBeats::Off,
+        clients_per_node: 2,
+        ops_per_client: 30,
+        faults: vec![
+            at(
+                1_500,
+                FaultKind::StallStep {
+                    node: 0,
+                    for_ms: 14_000,
+                },
+            ),
+            // The delegate of `d2` hears only its root: no successor, no
+            // log, no other node tells it the tenure changed hands.
+            at(
+                1_000,
+                FaultKind::Partition {
+                    a: 2,
+                    b: 3,
+                    for_ms: 16_000,
+                },
+            ),
+            at(
+                1_000,
+                FaultKind::CutS3 {
+                    node: 3,
+                    for_ms: 16_000,
+                },
+            ),
+        ],
+        ..delegated_core_stall_root_backup_config()
     }
 }
 
@@ -6935,6 +7009,15 @@ fn core_stall_check(label: &str, r: &Report) -> Result<(), String> {
     let (reclaimed, lapsed) = (sum(|s| s.deleg_reclaimed), sum(|s| s.deleg_lapsed));
     let (ended, off_core) = (sum(|s| s.deleg_ended), sum(|s| s.deleg_renewals_off_core));
     let root_off_core = sum(|s| s.deleg_root_answered_off_core);
+    if std::env::var_os("AUTHORITY_SIM_PROBE_DEBUG").is_some() {
+        eprintln!(
+            "PROBE-DEBUG {label}: root answers {root_off_core}, probes {} live {} deposed {}, \
+             reclaimed {reclaimed}, lapsed {lapsed}, ended {ended}",
+            sum(|s| s.root_probes),
+            sum(|s| s.root_probes_live),
+            sum(|s| s.root_probes_deposed),
+        );
+    }
     let lost = || {
         format!(
             "reclaimed {reclaimed}, lapsed {lapsed}, ended {ended}, lane renewals {off_core}, \
@@ -6967,6 +7050,8 @@ fn core_stall_check(label: &str, r: &Report) -> Result<(), String> {
         // unlaned variant is judged as the laned one: it fails).
         "delegated-core-stall-root"
         | "delegated-core-stall-root-unlaned"
+        | "delegated-core-stall-root-backup"
+        | "delegated-core-stall-root-backup-unprobed"
         | "delegated-core-stall-both"
             if reclaimed + lapsed + ended > 0 || root_off_core == 0 =>
         {
@@ -6979,7 +7064,7 @@ fn core_stall_check(label: &str, r: &Report) -> Result<(), String> {
             ))
         }
         // (A short lease or a backed tenure answers within what it may: safety.)
-        "delegated-core-stall-root-lease6" | "delegated-core-stall-root-backup" => Ok(()),
+        "delegated-core-stall-root-lease6" => Ok(()),
         "delegated-core-stall-root-hang" if reclaimed + lapsed == 0 => Err(format!(
             "a root hung past the bound answered every grant (root answers {root_off_core}, \
              ended {ended})"
@@ -7103,6 +7188,7 @@ fn a_delegate_hung_past_the_bound_is_reclaimed() {
 fn a_root_stuck_in_a_step_keeps_its_delegations() {
     let seeds = 24u64;
     let (mut answers, mut recall_answers, mut unlaned) = (0, 0, (0, 0));
+    let (mut probed, mut unprobed) = (0, (0, 0));
     for seed in 0..seeds {
         let r = run_core_stall(
             "delegated-core-stall-root",
@@ -7124,11 +7210,30 @@ fn a_root_stuck_in_a_step_keeps_its_delegations() {
             delegated_core_stall_root_lease6_config,
             seed,
         );
-        run_core_stall(
+        let r = run_core_stall(
             "delegated-core-stall-root-backup",
             delegated_core_stall_root_backup_config,
             seed,
         );
+        probed += r.stats.values().map(|s| s.root_probes_live).sum::<u64>();
+        // Plan 41 D3's fail-before, the same seeds: a backed root that does
+        // not read its lease answers within the takeover window of its core's
+        // last proof, then none, and the delegations lapse.
+        let r = run_seed(seed, delegated_core_stall_root_backup_unprobed_config()).unwrap_or_else(
+            |e| {
+                panic!(
+                    "seed {seed}: {e}\n  replay with \
+                     AUTHORITY_SIM_CONFIG=delegated-core-stall-root-backup-unprobed"
+                )
+            },
+        );
+        assert_eq!(
+            r.stats.values().map(|s| s.root_probes).sum::<u64>(),
+            0,
+            "the root read its lease with the read off"
+        );
+        unprobed.0 += r.stats.values().map(|s| s.deleg_reclaimed).sum::<u64>();
+        unprobed.1 += r.stats.values().map(|s| s.deleg_lapsed).sum::<u64>();
         // (A recall can end the tenure or the generation before the root is
         // stuck: judged over all seeds, below.)
         let r = run_core_stall(
@@ -7163,6 +7268,13 @@ fn a_root_stuck_in_a_step_keeps_its_delegations() {
         "delegated-core-stall-root: root answers {answers}, unlaned reclaimed/lapsed {unlaned:?}"
     );
     assert!(answers > 0, "the root never answered off the core");
+    eprintln!("delegated-core-stall-root-backup: live reads {probed}, unprobed {unprobed:?}");
+    assert!(probed > 0, "the backed root never read its lease");
+    assert!(
+        unprobed.1 >= seeds,
+        "without the root's read of its lease the backed root's delegations survived: the \
+         configuration is vacuous ({unprobed:?})"
+    );
     assert!(
         recall_answers > 0,
         "no root answered off the core with recalls"
@@ -9147,6 +9259,41 @@ fn locks_core_stall_backup_long_config() -> SimConfig {
 fn locks_core_stall_backup_long_unfresh_config() -> SimConfig {
     SimConfig {
         lock_lane_ignores_freshness: true,
+        ..locks_core_stall_backup_long_config()
+    }
+}
+
+/// Plan 41 D3: [`locks_core_stall_backup_long_config`] with the holder's
+/// off-core beat running, so its backup does not seal it. The core is stuck
+/// 8 s with no S3 request of its own, and the lane's own renewals of its
+/// clients' grants rest on the root's read of its lease object
+/// (`root_probe`): they are renewed through the stall.
+fn locks_core_stall_backup_long_beats_config() -> SimConfig {
+    SimConfig {
+        holder_beats: sim::run::HolderBeats::Thread,
+        ..locks_core_stall_backup_long_config()
+    }
+}
+
+/// [`locks_core_stall_backup_long_beats_config`] without the read: the code
+/// before D3, where the lane renews a backed root's grants for the first
+/// 1.5 s of a stall only.
+fn locks_core_stall_backup_long_beats_unprobed_config() -> SimConfig {
+    SimConfig {
+        deleg_root_probe: false,
+        ..locks_core_stall_backup_long_beats_config()
+    }
+}
+
+/// Plan 41 D3, the negative control: the holder's beat is off, so its backup
+/// seals it 1.5 s into the stall and the successor takes over (its grace
+/// begins), while the stuck root's lane reads its lease object and, with a
+/// probe that counts whatever it reads as a proof, renews its own grants
+/// through the successor's grace. Must find a violation (the honest probe
+/// reads the successor and stops).
+fn locks_core_stall_backup_long_blind_config() -> SimConfig {
+    SimConfig {
+        root_probe_mutant: sim::run::ProbeMutant::IgnoresVerdict,
         ..locks_core_stall_backup_long_config()
     }
 }
@@ -11755,6 +11902,62 @@ fn the_lanes_freshness_rule_is_load_bearing_on_a_long_lease() {
 /// the bus it is stored in, so every seed leaked its nodes' stores; the
 /// full suite ran out of threads (`EAGAIN` from the store's open, 198
 /// tests failing on a 16-CPU box) and of tmpfs inodes.
+/// Plan 41 D3: the lease holder of a backed cluster, its beat running (so its
+/// backup does not seal it) and its core stuck 8 s on a 30 s lease with no S3
+/// request of its own, renews its clients' grants on its own read of its lease
+/// object (`root_probe`): over 16 seeds the lane renews 133 times, against 39
+/// without the read (a fast tenure's proof of liveness is stale after 1 s,
+/// so the lane renewed only at the start of each stall). What the stall
+/// still lapses is the grants its peers hold of it (answering those is plan 41
+/// L5's, not done), so the fenced I/O does not tell the two apart.
+#[test]
+fn a_backed_lock_root_stuck_in_a_step_keeps_its_own_grants() {
+    use pinned::run_m14;
+    let seeds = 232_400..232_416;
+    let t = run_m14(
+        "locks-core-stall-backup-long-beats",
+        locks_core_stall_backup_long_beats_config(),
+        seeds.clone(),
+    );
+    let u = run_m14(
+        "locks-core-stall-backup-long-beats-unprobed",
+        locks_core_stall_backup_long_beats_unprobed_config(),
+        seeds,
+    );
+    assert!(t.grants > 50, "{t:?}");
+    assert!(
+        u.lane_renewals > 0,
+        "the lane never renewed, with or without the read: the configuration is vacuous: {u:?}"
+    );
+    assert!(
+        t.lane_renewals > 2 * u.lane_renewals,
+        "the read added too few of the lane's renewals ({} with it, {} without)",
+        t.lane_renewals,
+        u.lane_renewals
+    );
+}
+
+/// Plan 41 D3, the negative control: the lease holder of a backed cluster,
+/// its beat off, is sealed by its backup while its core is stuck (a 30 s
+/// lease, 8 s). Its lane reads its lease object, sees the successor and
+/// stops (`locks-core-stall-backup-long`, clean). A probe that counts
+/// whatever it reads as a proof renews the root's own grants through the
+/// successor's grace, and the mutual-exclusion ghost catches it (seeds 21 and
+/// 79 of 0 to 100: two nodes in I/O under conflicting locks).
+#[test]
+fn a_probe_that_ignores_what_it_reads_is_caught() {
+    for seed in [21u64, 79] {
+        run_seed(seed, locks_core_stall_backup_long_config())
+            .unwrap_or_else(|e| panic!("locks-core-stall-backup-long seed {seed}: {e}"));
+        let e = run_seed(seed, locks_core_stall_backup_long_blind_config())
+            .expect_err("locks-core-stall-backup-long-blind must fail");
+        assert!(
+            e.contains("mutual exclusion"),
+            "seed {seed}: another failure: {e}"
+        );
+    }
+}
+
 #[test]
 fn a_run_leaves_no_bus_behind() {
     let live = || sim::bus::LIVE_BUSES.with(|n| n.get());
@@ -11764,6 +11967,14 @@ fn a_run_leaves_no_bus_behind() {
         (
             "delegated-core-stall-root",
             delegated_core_stall_root_config(),
+            1,
+        ),
+        // (Plan 41 D3: the root's read of its lease reaches the bucket through
+        // a context the bus's tap holds, and the bucket's lease hook reaches
+        // the bus: a strong reference closed the cycle.)
+        (
+            "delegated-core-stall-root-backup",
+            delegated_core_stall_root_backup_config(),
             1,
         ),
     ] {

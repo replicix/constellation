@@ -1403,7 +1403,7 @@ fn arm_store_stall_all(file: &std::path::Path, ms: u64) -> Result<()> {
 /// writer lock for that long): the delegation is intact and must not be
 /// reported lost, whatever the latency (not judged then).
 /// `CONSTELLATION_HARNESS_DELEG_STALL_NODE=a|b|both` chooses whose store
-/// stalls (default `b`). With `a` the root's core is stuck (the unbacked pair,
+/// stalls (default `b`). With `a` the root's core is stuck (the backed pair,
 /// a 60 s lease, a writer in a root directory of `a`): the root's P2P service
 /// answers the delegate's renewals off the core (plan 41 R), so the same
 /// generation survives, nothing is reclaimed or lapsed, the root counts its
@@ -1411,10 +1411,12 @@ fn arm_store_stall_all(file: &std::path::Path, ms: u64) -> Result<()> {
 /// the delegate; `CONSTELLATION_DELEG_ROOT_LANE=off` is the in-scenario
 /// fail-before (`KNOWN-GAP root core stuck`). `both` stalls the first
 /// commit of each core at once (the root's core is asserted stuck, the
-/// delegate's only if it committed inside the window). `CONSTELLATION_HARNESS_DELEG_BACKED=1` runs `a` / `both` on the
-/// backed pair: a root with a backup answers off the core only within the
-/// takeover window of its last proof of liveness, so until plan 41 P a
-/// loss is possible and accepted only as the known gap.
+/// delegate's only if it committed inside the window). `CONSTELLATION_HARNESS_DELEG_BACKED=0` runs `a` / `both` on the
+/// unbacked pair (the default is the backed one, where the root reads its lease
+/// off the core, plan 41 D3); `CONSTELLATION_ROOT_PROBE=off` on the backed pair
+/// is the in-scenario fail-before: a root with a backup then answers off the
+/// core only within the takeover window of its core's last proof of liveness,
+/// and a loss is accepted only as the known gap.
 pub fn delegate_store_stall(_seed: u64) -> Result<()> {
     const NAME: &str = "delegate-store-stall";
     // `CONSTELLATION_HARNESS_DELEG_STALLS_MS=9000,12000` runs those stalls
@@ -1431,11 +1433,27 @@ pub fn delegate_store_stall(_seed: u64) -> Result<()> {
         .and_then(|v| v.parse().ok())
         .filter(|v| *v > 0);
     let node = stall_node();
-    // The root stalled: the unbacked pair (a root with no backup answers off
-    // its core under the lease's cap alone), unless asked for the backed one.
+    // The root stalled: the backed pair, the usual root (a tenure that can
+    // be taken over early: its off-core answers rest on its own read of the
+    // lease, plan 41 D3), unless asked for the unbacked one
+    // (`CONSTELLATION_HARNESS_DELEG_BACKED=0`: a root with no backup answers
+    // off its core under the lease's cap alone).
     let backed = node == StallNode::B
-        || std::env::var("CONSTELLATION_HARNESS_DELEG_BACKED").as_deref() == Ok("1");
-    let expect_known_gap = backed && node != StallNode::B;
+        || std::env::var("CONSTELLATION_HARNESS_DELEG_BACKED").as_deref() != Ok("0");
+    // Without the root's read (`CONSTELLATION_ROOT_PROBE=off`, the code before
+    // D3) a backed root answers off its core only within the takeover window
+    // of its core's last proof, and a loss past the grant's slack is the
+    // known gap: the in-scenario fail-before.
+    let expect_known_gap = backed
+        && node != StallNode::B
+        && matches!(
+            std::env::var("CONSTELLATION_ROOT_PROBE")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "0" | "off" | "false"
+        );
     let stall_dir = tempfile::tempdir()?;
     let file = stall_dir.path().join("store-stall");
     let file_str = file.display().to_string();
@@ -1594,9 +1612,13 @@ pub fn delegate_store_stall(_seed: u64) -> Result<()> {
                 // (A root hung past the bound answers late, not never: its
                 // core grants the renewals queued meanwhile when it runs, so
                 // the loss shows at the delegate, which lapsed.)
+                // (With a backup, `b` seals the root that stopped beating at the
+                // bound and takes the lease over: the generation ends at `b`
+                // as the new root's own, with no reclaim at `a` and no lapse.)
                 let at_b = delta(&db, &db0, "lapsed");
+                let taken_over = backed && node != StallNode::B && gen_after != Some(gen);
                 anyhow::ensure!(
-                    reclaimed + recalls > 0 || (node != StallNode::B && at_b > 0),
+                    reclaimed + recalls > 0 || (node != StallNode::B && at_b > 0) || taken_over,
                     "the root kept the delegation of a node hung for {recent_step:?}, past \
                      the bound: the lane renewed without end: a {da} b {db}"
                 );
@@ -1605,18 +1627,19 @@ pub fn delegate_store_stall(_seed: u64) -> Result<()> {
             let l = Losses::since(&da, &da0, &db, &db0);
             let lost = gen_after != Some(gen) || l.any();
             if expect_known_gap && Duration::from_millis(ms) > slack {
-                // The root has a backup (a fast tenure): until plan 41 P it
-                // answers off its core only within the takeover window of its
-                // core's last proof of liveness, so a stall past the grant's
-                // slack may lose the delegation, as the known gap. (It need not:
-                // a renewal that reaches the root inside the window of its
-                // core's last proof is answered, and the stall then ends before
-                // the next one is due. A loss must be that gap and nothing
-                // else; a kept delegation is a note, not the proof of P.)
+                // The root has a backup (a fast tenure) and does not read its
+                // lease (`CONSTELLATION_ROOT_PROBE=off`, the code before plan 41
+                // D3): it answers off its core only within the takeover window
+                // of its core's last proof of liveness, so a stall past the
+                // grant's slack may lose the delegation, as the known gap. (It
+                // need not: a renewal that reaches the root inside the window
+                // of its core's last proof is answered, and the stall then ends
+                // before the next one is due. A loss must be that gap and
+                // nothing else; a kept delegation is a note.)
                 if !lost {
                     eprintln!(
                         "    {NAME}: the backed root, stalled {ms} ms, kept the delegation \
-                         (the freshness window held; not the proof of plan 41 P)"
+                         (the freshness window held)"
                     );
                     continue;
                 }
@@ -1625,7 +1648,7 @@ pub fn delegate_store_stall(_seed: u64) -> Result<()> {
                     e.to_string().contains(KNOWN_GAP) || l.excused(Some(gen)).is_some(),
                     "the backed root's loss is not the expected known gap: {e}"
                 );
-                eprintln!("    {NAME}: expected, before plan 41 P: {e}");
+                eprintln!("    {NAME}: expected without the root's read of its lease: {e}");
                 continue;
             }
             if lost {

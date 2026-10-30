@@ -35,6 +35,7 @@ pub mod event;
 pub mod ids;
 pub mod lane;
 pub mod replica;
+pub mod root_probe;
 pub mod segment;
 
 pub use action::{

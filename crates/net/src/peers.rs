@@ -1737,6 +1737,7 @@ async fn handle_stream<S: PeerService>(
                         stream_head_at,
                         first,
                     )
+                    .await
                     .unwrap_or(Payload::Ok { req_id }),
             ),
             Payload::DelegRenewOffCore {
@@ -1747,6 +1748,7 @@ async fn handle_stream<S: PeerService>(
             } => Some(
                 service
                     .deleg_renew_off_core(from, req_id, gen, round)
+                    .await
                     .unwrap_or(Payload::Ok { req_id }),
             ),
             Payload::DelegRenewed {

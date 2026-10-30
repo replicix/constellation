@@ -61,6 +61,7 @@
 
 use crate::event::{LockRenewEntry, LockRenewResult};
 use crate::ids::{HonourMs, NodeId, Now};
+use crate::root_probe::{RootProbe, Ticket, Want};
 use constellation_fs_core::Ino;
 use constellation_meta::locks::{GrantId, LockTables};
 use std::collections::{BTreeMap, HashMap};
@@ -82,6 +83,10 @@ pub const LANE_CORE_STUCK_MS: i64 = 100;
 /// The default bound on remote renewals while the driver is stuck.
 pub const DEFAULT_MAX_STALL_MS: i64 = 120_000;
 
+/// The default bound on the root side (D6): the holder heartbeat's
+/// (`CONSTELLATION_HOLDER_STALL_MS`).
+pub const DEFAULT_HUNG_MS: i64 = 15_000;
+
 /// What the core publishes for the lane after a step (the *certificate*):
 /// the lease mirror the FUSE fast path already reads, plus the few facts
 /// the lane needs. The state at the end of the last finished step, never
@@ -90,6 +95,9 @@ pub const DEFAULT_MAX_STALL_MS: i64 = 120_000;
 pub struct LockLaneView {
     /// This node's id.
     pub me: NodeId,
+    /// The lease epoch the certificate is of (0: none): the epoch a proof
+    /// from the root's own lease read (plan 41 D3) must name.
+    pub epoch: u64,
     /// All of: cluster locks on; the root lease held, usable, not lost, not
     /// fenced (no gate, no release); no continuation epoch open, held or
     /// being re-claimed; this node delegates nothing; not resuming; no
@@ -134,11 +142,32 @@ impl LockLaneView {
     /// simulation's non-vacuity switch: a lane that renews a fast tenure
     /// through its successor's grace).
     pub fn own_ok_with(&self, now: HonourMs, freshness: bool) -> bool {
+        self.own_ok_proved(now, freshness, None)
+    }
+
+    /// [`Self::own_ok_with`], the freshness rule taking the later of the
+    /// core's last proof of liveness and `proof`, the send of the root's own
+    /// read of its lease object that found this tenure live (plan 41 D3,
+    /// [`RootProbe::proof`]).
+    pub fn own_ok_proved(&self, now: HonourMs, freshness: bool, proof: Option<HonourMs>) -> bool {
+        let fresh = proof.map_or(self.last_fresh, |p| self.last_fresh.max(p));
         self.root_ok
             && now < self.cap_until
             && (!freshness
-                || (crate::core::liveness_fresh(self.fast, now, self.last_fresh, self.window_ms)
+                || (crate::core::liveness_fresh(self.fast, now, fresh, self.window_ms)
                     && self.marked))
+    }
+
+    /// The certificate stands in every respect but the core's proof of
+    /// liveness being stale: a read of the lease object (plan 41 D3) would
+    /// make it good.
+    fn awaits_proof(&self, now: HonourMs) -> bool {
+        self.root_ok
+            && self.epoch != 0
+            && self.fast
+            && self.marked
+            && now < self.cap_until
+            && !crate::core::liveness_fresh(self.fast, now, self.last_fresh, self.window_ms)
     }
 }
 
@@ -212,6 +241,10 @@ pub enum LaneAction {
     /// Tell the core that `to` did not answer a renewal in time
     /// (`Event::LaneUnanswered`).
     Unanswered { to: NodeId },
+    /// Read the lease object for this ticket off the core, and report it
+    /// ([`RootProbe::finish`], `Event::RootProbed`): the own grants wait for
+    /// a tenure that can be taken over early to be proven live (plan 41 D3).
+    Probe(Ticket),
 }
 
 /// What the lane did (status).
@@ -223,6 +256,8 @@ pub struct LaneStats {
     pub late_ok: u64,
     pub deferred: u64,
     pub stall_stops: u64,
+    /// Plan 41 D3: reads of the lease object this lane asked for.
+    pub probes: u64,
     /// Ticks that found grants held, and those of them at which the core was
     /// stuck in a step ([`LANE_CORE_STUCK_MS`]); due own grants the
     /// certificate did not cover (`own_ok` false).
@@ -248,6 +283,12 @@ pub struct RenewLane {
     /// Test-only non-vacuity: the freshness rule of a fast tenure is not
     /// applied (`RenewLane::ignore_freshness_for_tests`).
     ignores_freshness: bool,
+    /// Plan 41 D3: the root's proof of liveness the own renewals take
+    /// besides the core's, and the stall past which no read is asked for
+    /// (`CONSTELLATION_HOLDER_STALL_MS`, the hung bound); `None`: the core's
+    /// proof alone.
+    probe: Option<Arc<RootProbe>>,
+    hung_ms: i64,
     inflight: HashMap<u64, Pending>,
     late: HashMap<u64, (NodeId, HonourMs)>,
     pub stats: LaneStats,
@@ -259,10 +300,21 @@ impl RenewLane {
             next: 0,
             max_stall_ms,
             ignores_freshness: false,
+            probe: None,
+            hung_ms: DEFAULT_HUNG_MS,
             inflight: HashMap::new(),
             late: HashMap::new(),
             stats: LaneStats::default(),
         }
+    }
+
+    /// The own renewals of a tenure that can be taken over early also rest
+    /// on `probe`'s proof, which the lane asks for while the driver is stuck
+    /// and not past `hung_ms` (plan 41 D3).
+    pub fn with_probe(mut self, probe: Arc<RootProbe>, hung_ms: i64) -> Self {
+        self.probe = Some(probe);
+        self.hung_ms = hung_ms;
+        self
     }
 
     /// The simulation's non-vacuity switch (never set by the daemon): the lane
@@ -348,17 +400,45 @@ impl RenewLane {
         if due.is_empty() {
             return Vec::new();
         }
-        let own_ok =
-            view.own_ok_with(now.honour, !self.ignores_freshness) && !facts.delegations_any();
+        let freshness = !self.ignores_freshness;
+        // Plan 41 D3: the root's own proof of liveness, besides the core's.
+        // A read that showed the tenure over ends the epoch's renewals.
+        let probe = self.probe.clone();
+        let proof_of = move |v: &LockLaneView| -> Option<Option<HonourMs>> {
+            match &probe {
+                Some(p) if p.deposed(v.epoch) => None,
+                Some(p) => Some(p.proof(v.epoch)),
+                None => Some(None),
+            }
+        };
+        let own_ok = proof_of(&view).is_some_and(|p| view.own_ok_proved(now.honour, freshness, p))
+            && !facts.delegations_any();
         if !own_ok {
             self.stats.uncovered += due.len() as u64;
+        }
+        let mut ticket = None;
+        if !own_ok
+            && core_stuck
+            && stuck_ms <= self.hung_ms
+            && freshness
+            && due.iter().any(|(_, h)| h.owner == view.me)
+            && !facts.delegations_any()
+            && view.awaits_proof(now.honour)
+        {
+            if let Some(p) = &self.probe {
+                if let Want::Start(t) =
+                    p.want(now.honour, view.epoch, view.window_ms, || Box::new(|| {}))
+                {
+                    self.stats.probes += 1;
+                    ticket = Some(t);
+                }
+            }
         }
         let mut own = 0u32;
         let mut by_owner: BTreeMap<
             NodeId,
             Vec<(Ino, GrantId, constellation_meta::locks::LockMode)>,
         > = BTreeMap::new();
-        let freshness = !self.ignores_freshness;
         for (ino, h) in due {
             if own_ok {
                 let cap = view.cap_until;
@@ -379,7 +459,9 @@ impl RenewLane {
                     view.me,
                     |n| {
                         let now_view = facts.view();
-                        if now_view.own_ok_with(n.honour, freshness) {
+                        if proof_of(&now_view)
+                            .is_some_and(|p| now_view.own_ok_proved(n.honour, freshness, p))
+                        {
                             now_view.cap_until.min(cap).since(n.honour)
                         } else {
                             0
@@ -417,6 +499,9 @@ impl RenewLane {
             }
         }
         let mut out = Vec::new();
+        if let Some(t) = ticket {
+            out.push(LaneAction::Probe(t));
+        }
         if own > 0 {
             self.stats.own_renewals += own as u64;
             out.push(LaneAction::OwnRenewed { renewed: own });
@@ -522,6 +607,7 @@ impl RenewLane {
 mod tests {
     use super::*;
     use crate::ids::WaitMs;
+    use crate::root_probe::RootProbe;
     use constellation_meta::locks::{HeldGrant, LockMode};
     use constellation_meta::Position;
 
@@ -542,6 +628,7 @@ mod tests {
     fn view() -> LockLaneView {
         LockLaneView {
             me: 1,
+            epoch: 3,
             root_ok: true,
             cap_until: HonourMs(100_000),
             fast: false,
@@ -673,6 +760,190 @@ mod tests {
             vec![LaneAction::OwnRenewed { renewed: 1 }]
         );
         assert_eq!(t.held(7).unwrap().until, HonourMs(2_400 + 4_000 - 500));
+    }
+
+    fn stuck(
+        lane: &mut RenewLane,
+        t: &LockTables,
+        f: &Facts,
+        ms: i64,
+        stuck_ms: i64,
+    ) -> Vec<LaneAction> {
+        lane.handle(at(ms), LaneEvent::Tick { stuck_ms }, t, f)
+    }
+
+    fn stale_fast() -> LockLaneView {
+        LockLaneView {
+            fast: true,
+            last_fresh: HonourMs(100),
+            ..view()
+        }
+    }
+
+    /// Plan 41 D3: a fast tenure whose core is stuck, its last proof of
+    /// liveness stale, asks for one read of the lease object; the own grant
+    /// is renewed on the tick after the read proved the tenure, from the
+    /// proof's send. Fail-before: the lane without the probe renews nothing
+    /// (`uncovered`), the code before D3.
+    #[test]
+    fn a_stuck_fast_root_reads_its_lease_and_renews_on_the_proof() {
+        use crate::root_probe::Verdict;
+        let t = LockTables::default();
+        let id = own_grant(&t);
+        let probe = RootProbe::new();
+        let mut lane = RenewLane::new(DEFAULT_MAX_STALL_MS).with_probe(probe.clone(), 15_000);
+        let f = facts(stale_fast());
+        // The core is running: its own renewal, no read.
+        assert!(tick(&mut lane, &t, &f, 2_000).is_empty());
+        // Stuck: one read for the certificate's epoch, dated at the tick.
+        let out = stuck(&mut lane, &t, &f, 2_150, 300);
+        let [LaneAction::Probe(ticket)] = out.as_slice() else {
+            panic!("{out:?}");
+        };
+        assert_eq!((ticket.epoch, ticket.sent), (3, HonourMs(2_150)));
+        assert_eq!(t.get(id).unwrap().until, WaitMs(4_500), "not renewed yet");
+        // Not asked again while it is out, nor inside the round.
+        assert!(stuck(&mut lane, &t, &f, 2_300, 450).is_empty());
+        let _ = probe.finish(*ticket, Verdict::Live);
+        assert_eq!(
+            stuck(&mut lane, &t, &f, 2_400, 550),
+            vec![LaneAction::OwnRenewed { renewed: 1 }]
+        );
+        assert_eq!(t.get(id).unwrap().until, WaitMs(2_400 + 4_000 + 500));
+        assert_eq!(lane.stats.probes, 1);
+        // The lane without the probe: nothing, as before D3.
+        let t2 = LockTables::default();
+        let id2 = own_grant(&t2);
+        let mut plain = RenewLane::new(DEFAULT_MAX_STALL_MS);
+        assert!(stuck(&mut plain, &t2, &f, 2_400, 550).is_empty());
+        assert_eq!(t2.get(id2).unwrap().until, WaitMs(4_500));
+        assert_eq!(plain.stats.uncovered, 1);
+    }
+
+    /// Plan 41 D3, the negative control: a read that shows a successor ends
+    /// the epoch's own renewals and its reads; a read that failed is no proof
+    /// and the round is not read twice; a proof taken for another epoch
+    /// counts for nothing; and a proof older than the window is stale.
+    #[test]
+    fn a_read_that_shows_a_successor_or_failed_renews_nothing() {
+        use crate::root_probe::Verdict;
+        let f = facts(stale_fast());
+        let fresh = || {
+            let t = LockTables::default();
+            let id = own_grant(&t);
+            let probe = RootProbe::new();
+            let lane = RenewLane::new(DEFAULT_MAX_STALL_MS).with_probe(probe.clone(), 15_000);
+            (t, id, probe, lane)
+        };
+        let ask = |lane: &mut RenewLane, t: &LockTables, ms| match stuck(lane, t, &f, ms, 400)
+            .as_slice()
+        {
+            [LaneAction::Probe(ticket)] => *ticket,
+            other => panic!("no read asked for at {ms}: {other:?}"),
+        };
+        // A successor.
+        let (t, id, probe, mut lane) = fresh();
+        let ticket = ask(&mut lane, &t, 2_100);
+        let _ = probe.finish(ticket, Verdict::Deposed);
+        assert!(stuck(&mut lane, &t, &f, 2_200, 500).is_empty());
+        assert!(
+            stuck(&mut lane, &t, &f, 5_000, 3_000).is_empty(),
+            "no more reads"
+        );
+        assert_eq!(t.get(id).unwrap().until, WaitMs(4_500));
+        // A failed read: no proof, and the round is not read again.
+        let (t, id, probe, mut lane) = fresh();
+        let ticket = ask(&mut lane, &t, 2_100);
+        let _ = probe.finish(ticket, Verdict::Unknown);
+        assert!(stuck(&mut lane, &t, &f, 2_300, 600).is_empty());
+        assert_eq!(t.get(id).unwrap().until, WaitMs(4_500));
+        // The next round may read again (the grant itself ran out by then).
+        assert!(matches!(
+            probe.want(HonourMs(2_100 + 1_500), 3, 1_500, || Box::new(|| {})),
+            crate::root_probe::Want::Start(_)
+        ));
+        // A proof for another epoch.
+        let (t, id, probe, mut lane) = fresh();
+        let other = match probe.want(HonourMs(2_000), 9, 1_500, || Box::new(|| {})) {
+            crate::root_probe::Want::Start(x) => x,
+            w => panic!("{w:?}"),
+        };
+        let _ = probe.finish(other, Verdict::Live);
+        let out = stuck(&mut lane, &t, &f, 2_100, 400);
+        assert!(matches!(out.as_slice(), [LaneAction::Probe(_)]), "{out:?}");
+        assert_eq!(t.get(id).unwrap().until, WaitMs(4_500));
+        // A proof whose window has run out by the tick.
+        let (t, id, probe, mut lane) = fresh();
+        let ticket = ask(&mut lane, &t, 2_100);
+        let _ = probe.finish(ticket, Verdict::Live);
+        let out = stuck(&mut lane, &t, &f, 2_100 + 1_500, 2_000);
+        assert!(
+            !out.contains(&LaneAction::OwnRenewed { renewed: 1 }),
+            "{out:?}"
+        );
+        assert_eq!(t.get(id).unwrap().until, WaitMs(4_500));
+    }
+
+    /// Plan 41 D3 (D5, D6): no read while the core is running, none past the
+    /// hung bound, none for a `Local` tenure, a certificate that does not
+    /// stand, or with a delegation (the lane's own side is off then).
+    #[test]
+    fn no_read_unless_the_stuck_core_leaves_only_staleness() {
+        let run = |v: LockLaneView, delegations: bool, stuck_ms: i64| {
+            let t = LockTables::default();
+            own_grant(&t);
+            let probe = RootProbe::new();
+            let mut lane = RenewLane::new(DEFAULT_MAX_STALL_MS).with_probe(probe, 15_000);
+            let f = Facts {
+                view: v,
+                delegations,
+            };
+            stuck(&mut lane, &t, &f, 2_100, stuck_ms)
+        };
+        let reads = |out: Vec<LaneAction>| out.iter().any(|a| matches!(a, LaneAction::Probe(_)));
+        assert!(reads(run(stale_fast(), false, 200)));
+        assert!(!reads(run(stale_fast(), false, 0)), "the core is running");
+        assert!(!reads(run(stale_fast(), false, 99)), "merely busy");
+        assert!(reads(run(stale_fast(), false, 15_000)));
+        assert!(!reads(run(stale_fast(), false, 15_001)), "hung");
+        assert!(
+            !reads(run(view(), false, 200)),
+            "a Local tenure needs no proof"
+        );
+        assert!(!reads(run(
+            LockLaneView {
+                root_ok: false,
+                ..stale_fast()
+            },
+            false,
+            200
+        )));
+        assert!(!reads(run(
+            LockLaneView {
+                marked: false,
+                ..stale_fast()
+            },
+            false,
+            200
+        )));
+        assert!(!reads(run(
+            LockLaneView {
+                cap_until: HonourMs(2_000),
+                ..stale_fast()
+            },
+            false,
+            200
+        )));
+        assert!(!reads(run(stale_fast(), true, 200)), "a delegation");
+        // A fresh proof of the core's own needs none.
+        assert!(!reads(run(
+            LockLaneView {
+                last_fresh: HonourMs(2_000),
+                ..stale_fast()
+            },
+            false,
+            200
+        )));
     }
 
     #[test]

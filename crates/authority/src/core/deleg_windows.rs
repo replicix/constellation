@@ -42,6 +42,7 @@
 //! extension are ordered by the same mutex.
 
 use crate::ids::{HonourMs, NodeId, Now, WaitMs};
+use crate::root_probe::RootProbe;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -136,10 +137,13 @@ pub enum Refusal {
     Unmarked,
     /// Nothing is left of the lease below its margin: the cap is zero.
     Cap,
+    /// An off-core read of the lease object showed the tenure over (plan 41
+    /// D3, [`crate::root_probe`]): nothing more is answered for its epoch.
+    Deposed,
 }
 
 impl Refusal {
-    pub const COUNT: usize = 10;
+    pub const COUNT: usize = 11;
     pub const ALL: [Refusal; Refusal::COUNT] = [
         Refusal::NotStuck,
         Refusal::Hung,
@@ -151,6 +155,7 @@ impl Refusal {
         Refusal::Stale,
         Refusal::Unmarked,
         Refusal::Cap,
+        Refusal::Deposed,
     ];
 
     pub fn index(self) -> usize {
@@ -169,6 +174,7 @@ impl Refusal {
             Refusal::Stale => "stale_liveness",
             Refusal::Unmarked => "unmarked",
             Refusal::Cap => "cap",
+            Refusal::Deposed => "deposed",
         }
     }
 }
@@ -177,12 +183,16 @@ impl Refusal {
 /// with a grant of the returned `ttl_ms`, or why not. `now` is the
 /// answerer's own reading, taken when the request arrived; `lease` is the
 /// core's certificate, which holds at least as far as the argument in
-/// `deleg_lane::answer_root` says.
+/// `deleg_lane::answer_root` says. `proof` is the send of the latest off-core
+/// read of the lease object that showed this tenure live (plan 41 D3,
+/// [`RootProbe::proof`]): the freshness rule takes the later of it and the
+/// core's own.
 pub fn decide(
     lease: &RootLease,
     w: &Window,
     from: NodeId,
     now: Now,
+    proof: Option<HonourMs>,
 ) -> Result<(u64, WaitMs), Refusal> {
     if w.node != from {
         return Err(Refusal::Node);
@@ -196,9 +206,6 @@ pub fn decide(
     // The core's freshness rule (`Core::renew_hold`): a tenure that may be
     // taken over before its lease expires answers only within the freshness
     // window of a proof of liveness, and only if its lease is marked.
-    if !crate::core::liveness_fresh(lease.fast, now.honour, lease.last_s3_fresh, lease.window_ms) {
-        return Err(Refusal::Stale);
-    }
     if !lease.marked {
         return Err(Refusal::Unmarked);
     }
@@ -210,6 +217,12 @@ pub fn decide(
         .saturating_sub(lease.margin_ms as i64);
     if cap <= 0 {
         return Err(Refusal::Cap);
+    }
+    // (Last: the one refusal an off-core read of the lease can lift, so a
+    // read is asked for only when nothing else stands in the way.)
+    let fresh = proof.map_or(lease.last_s3_fresh, |p| lease.last_s3_fresh.max(p));
+    if !crate::core::liveness_fresh(lease.fast, now.honour, fresh, lease.window_ms) {
+        return Err(Refusal::Stale);
     }
     let ttl = lease.delegation_ttl_ms.min(cap as u64);
     Ok((ttl, now.wait.plus(ttl + lease.extra_ms)))
@@ -226,6 +239,9 @@ struct Inner {
     /// The lease facts the answerer needs, published by the core after
     /// every step ([`DelegWindows::publish`]); `None`: answer nothing.
     lease: Option<RootLease>,
+    /// The off-core proof of liveness the answerer takes besides the core's
+    /// own (plan 41 D3); `None`: the core's alone.
+    probe: Option<Arc<RootProbe>>,
     /// Test hook: run once just before [`DelegWindows::close_if_expired`]
     /// takes the guard (an extension landing between a step's earlier read
     /// of the window and its decision).
@@ -279,6 +295,16 @@ impl DelegWindows {
     /// step's own `now`.
     pub fn set_clock(&self, clock: WindowsClock) {
         self.lock().clock = Some(clock);
+    }
+
+    /// The off-core proof of liveness the answerer consults (plan 41 D3).
+    pub fn set_probe(&self, probe: Arc<RootProbe>) {
+        self.lock().probe = Some(probe);
+    }
+
+    /// The proof set by [`Self::set_probe`].
+    pub fn probe(&self) -> Option<Arc<RootProbe>> {
+        self.lock().probe.clone()
     }
 
     fn now_or(g: &Inner, fallback: Now) -> Now {
@@ -507,15 +533,31 @@ impl DelegWindows {
     pub fn extend_off_core(&self, gen: u64, from: NodeId, now: Now) -> Result<u64, Refusal> {
         let result = {
             let mut g = self.lock();
-            let Inner { slots, lease, .. } = &mut *g;
+            let Inner {
+                slots,
+                lease,
+                probe,
+                ..
+            } = &mut *g;
             match (lease.as_ref(), slots.get_mut(&gen)) {
                 (None, _) => Err(Refusal::Lease),
                 (_, None) => Err(Refusal::Generation),
-                (Some(lease), Some(w)) => decide(lease, w, from, now).map(|(ttl, until)| {
-                    w.until = w.until.max(until);
-                    w.renewed_until = w.renewed_until.max(until);
-                    ttl
-                }),
+                (Some(lease), Some(w)) => {
+                    // (The probe's own lock is taken inside the table's, and
+                    // never the other way round.)
+                    let (deposed, proof) = probe.as_ref().map_or((false, None), |p| {
+                        (p.deposed(lease.epoch), p.proof(lease.epoch))
+                    });
+                    if deposed {
+                        Err(Refusal::Deposed)
+                    } else {
+                        decide(lease, w, from, now, proof).map(|(ttl, until)| {
+                            w.until = w.until.max(until);
+                            w.renewed_until = w.renewed_until.max(until);
+                            ttl
+                        })
+                    }
+                }
             }
         };
         match result {
@@ -695,61 +737,67 @@ mod tests {
         let now = Now::same(20_000);
         // Far from the lease's end: the full ttl, window to `now + ttl + extra`.
         assert_eq!(
-            decide(&lease(), &window(), 2, now),
+            decide(&lease(), &window(), 2, now, None),
             Ok((5_000, WaitMs(26_000)))
         );
         // The lease ends at 24 s with a 1 s margin: the cap is 3 s.
         let mut l = lease();
         l.honour_until = HonourMs(24_000);
-        assert_eq!(decide(&l, &window(), 2, now), Ok((3_000, WaitMs(24_000))));
+        assert_eq!(
+            decide(&l, &window(), 2, now, None),
+            Ok((3_000, WaitMs(24_000)))
+        );
         // A grant never outlives the cap, by construction: the delegate
         // stops at `sent + ttl - margin`, before the lease's end less margin.
         for left in [1_001i64, 1_500, 4_999, 5_000, 6_000, 30_000] {
             let mut l = lease();
             l.honour_until = HonourMs(20_000 + left + 1_000);
-            let (ttl, _) = decide(&l, &window(), 2, now).unwrap();
+            let (ttl, _) = decide(&l, &window(), 2, now, None).unwrap();
             assert!(ttl as i64 <= left, "ttl {ttl} past the cap {left}");
         }
         // Nothing left below the margin: no answer.
         l.honour_until = HonourMs(21_000);
-        assert_eq!(decide(&l, &window(), 2, now), Err(Refusal::Cap));
+        assert_eq!(decide(&l, &window(), 2, now, None), Err(Refusal::Cap));
         l.honour_until = HonourMs(20_500);
-        assert_eq!(decide(&l, &window(), 2, now), Err(Refusal::Cap));
+        assert_eq!(decide(&l, &window(), 2, now, None), Err(Refusal::Cap));
     }
 
     #[test]
     fn the_answerer_refuses_each_state_the_core_would_not_grant_in() {
         let now = Now::same(20_000);
         let l = lease();
-        assert!(decide(&l, &window(), 2, now).is_ok());
+        assert!(decide(&l, &window(), 2, now, None).is_ok());
         // Another node's renewal.
-        assert_eq!(decide(&l, &window(), 9, now), Err(Refusal::Node));
+        assert_eq!(decide(&l, &window(), 9, now, None), Err(Refusal::Node));
         // A recall, seal or end closed the slot; a designation never opens.
         let mut w = window();
         w.open = false;
-        assert_eq!(decide(&l, &w, 2, now), Err(Refusal::Closed));
+        assert_eq!(decide(&l, &w, 2, now, None), Err(Refusal::Closed));
         let mut w = window();
         w.eligible = false;
-        assert_eq!(decide(&l, &w, 2, now), Err(Refusal::Closed));
+        assert_eq!(decide(&l, &w, 2, now, None), Err(Refusal::Closed));
         // The lock side has something to hand over.
         let mut w = window();
         w.settled = false;
-        assert_eq!(decide(&l, &w, 2, now), Err(Refusal::Unsettled));
+        assert_eq!(decide(&l, &w, 2, now, None), Err(Refusal::Unsettled));
         // A tenure that may be taken over early needs a fresh proof of
         // liveness within the window, and a marked lease.
         let mut fast = lease();
         fast.fast = true;
         fast.last_s3_fresh = HonourMs(18_500);
-        assert_eq!(decide(&fast, &window(), 2, now), Err(Refusal::Stale));
+        assert_eq!(decide(&fast, &window(), 2, now, None), Err(Refusal::Stale));
         fast.last_s3_fresh = HonourMs(18_501);
-        assert!(decide(&fast, &window(), 2, now).is_ok());
+        assert!(decide(&fast, &window(), 2, now, None).is_ok());
         fast.marked = false;
-        assert_eq!(decide(&fast, &window(), 2, now), Err(Refusal::Unmarked));
+        assert_eq!(
+            decide(&fast, &window(), 2, now, None),
+            Err(Refusal::Unmarked)
+        );
         // (A `Local` tenure that cannot be taken over early needs neither
         // freshness nor a proof; the cap is its bound.)
         let mut local = lease();
         local.last_s3_fresh = HonourMs(0);
-        assert!(decide(&local, &window(), 2, now).is_ok());
+        assert!(decide(&local, &window(), 2, now, None).is_ok());
     }
 
     #[test]
@@ -785,6 +833,91 @@ mod tests {
         );
         w.clear();
         assert!(w.lease_cert().is_none());
+    }
+
+    /// Plan 41 D3: an off-core read that proved the tenure live lifts the
+    /// refusal for stale liveness, dated at its send, for its epoch only,
+    /// within the freshness window; and nothing else.
+    #[test]
+    fn a_proof_from_the_probe_lifts_only_the_stale_refusal() {
+        let mut fast = lease();
+        fast.fast = true;
+        fast.last_s3_fresh = HonourMs(10_000);
+        let now = Now::same(20_000);
+        assert_eq!(decide(&fast, &window(), 2, now, None), Err(Refusal::Stale));
+        // Sent 400 ms ago: fresh. At the window's edge: not (the rule is
+        // the core's, unchanged).
+        assert!(decide(&fast, &window(), 2, now, Some(HonourMs(18_600))).is_ok());
+        assert_eq!(
+            decide(&fast, &window(), 2, now, Some(HonourMs(18_500))),
+            Err(Refusal::Stale)
+        );
+        // A proof older than the core's own changes nothing.
+        fast.last_s3_fresh = HonourMs(19_900);
+        assert!(decide(&fast, &window(), 2, now, Some(HonourMs(1_000))).is_ok());
+        // Nothing else is lifted: an unmarked lease, a closed slot, a lease
+        // with nothing left below the margin.
+        let proof = Some(HonourMs(19_950));
+        let mut l = fast;
+        l.marked = false;
+        assert_eq!(decide(&l, &window(), 2, now, proof), Err(Refusal::Unmarked));
+        let mut w = window();
+        w.open = false;
+        assert_eq!(decide(&fast, &w, 2, now, proof), Err(Refusal::Closed));
+        let mut l = fast;
+        l.honour_until = HonourMs(20_500);
+        assert_eq!(decide(&l, &window(), 2, now, proof), Err(Refusal::Cap));
+    }
+
+    /// Plan 41 D3: the table consults the probe inside its guard, for the
+    /// certificate's epoch: a read that showed another holder ends the
+    /// epoch's answers whatever the proof it replaced would have allowed.
+    #[test]
+    fn the_table_answers_on_the_probes_proof_and_stops_when_a_read_shows_a_successor() {
+        use crate::root_probe::{RootProbe, Verdict, Want};
+        let w = windows();
+        let probe = RootProbe::new();
+        w.set_probe(probe.clone());
+        let mut fast = lease();
+        fast.fast = true;
+        fast.last_s3_fresh = HonourMs(0);
+        w.publish(Some(fast), &[7]);
+        let now = Now::same(20_000);
+        assert_eq!(w.extend_off_core(7, 2, now), Err(Refusal::Stale));
+        let Want::Start(t) = probe.want(now.honour, fast.epoch, 1_500, || Box::new(|| {})) else {
+            panic!("a read is asked for");
+        };
+        let _ = probe.finish(t, Verdict::Live);
+        assert_eq!(w.extend_off_core(7, 2, Now::same(20_400)), Ok(5_000));
+        // The proof is for the epoch it was taken for.
+        let mut next = fast;
+        next.epoch += 1;
+        w.publish(Some(next), &[7]);
+        assert_eq!(
+            w.extend_off_core(7, 2, Now::same(20_500)),
+            Err(Refusal::Stale)
+        );
+        w.publish(Some(fast), &[7]);
+        assert!(w.extend_off_core(7, 2, Now::same(20_500)).is_ok());
+        // A later read shows the successor: the earlier proof is withdrawn
+        // at once, though its window has not run out.
+        let Want::Start(t2) = probe.want(HonourMs(21_600), fast.epoch, 1_500, || Box::new(|| {}))
+        else {
+            panic!("the next round reads again");
+        };
+        let _ = probe.finish(t2, Verdict::Deposed);
+        assert_eq!(
+            w.extend_off_core(7, 2, Now::same(21_700)),
+            Err(Refusal::Deposed)
+        );
+        assert_eq!(
+            w.stats().deferred[Refusal::Deposed.index()].load(Ordering::Relaxed),
+            1
+        );
+        // Without the probe wired in, the table is the core's alone.
+        let bare = windows();
+        bare.publish(Some(fast), &[7]);
+        assert_eq!(bare.extend_off_core(7, 2, now), Err(Refusal::Stale));
     }
 
     /// The fail-before of the recall's close: without it (the code before

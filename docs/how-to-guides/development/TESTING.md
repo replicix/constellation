@@ -3520,6 +3520,16 @@ client give up on the held write (in doubt), so the recalled grant takes
 the doubt lapse (`locks_writer_hold_delegated_doubt_lapses_the_grant`).
 Its released twin cannot fail here, because a pinned commit ends at the
 node's next store write. The release decision is pinned in core tests.
+`locks-core-stall-backup-long-beats` and its neighbours (plan 41 D3,
+`a_backed_lock_root_stuck_in_a_step_keeps_its_own_grants`,
+`a_probe_that_ignores_what_it_reads_is_caught`): the lease holder of a backed
+cluster on a 30 s lease, its core stuck 8 s with its beat running, renews its
+own clients' grants on the root's read of its lease object (`root_probe`);
+`-beats-unprobed` (`SimConfig::deleg_root_probe: false`, the code before D3)
+renews them only at the start of each stall (the test compares the lane's renewals: 133 against 39 over 16 seeds; the grants its peers hold of it lapse either way, plan 41 L5); with the beat
+off (`-long-blind`) the backup seals the root and a probe that counts any read
+as a proof (`ProbeMutant::IgnoresVerdict`) renews through the successor's
+grace and must be caught by the ghost.
 `locks-core-stall*` (plan 41 L2/L4, `locks_survive_core_stalls`,
 `locks_survive_core_stalls_in_every_topology`): the core of a lock holder
 that is not the lease holder is stuck in one step for 2 s (over a grant's
@@ -3541,7 +3551,13 @@ renew; the root's P2P service answers off the core (the bus tap of
 `sim/node.rs`, `deleg_lane::answer_root`), so nothing is reclaimed, lapsed or
 ended; `-unlaned` (`SimConfig::deleg_root_lane: false`) loses every
 generation (2000 of 2000 seeds), `-lease6` runs the sim's 6 s lease (the cap),
-`-backup` a backed root (safety), `-hang` a stall past the 15 s bound
+`-backup` a backed root (a fast tenure: plan 41 D3, its own read of the
+lease object, `root_probe`; nothing reclaimed, lapsed or ended),
+`-backup-unprobed` (`SimConfig::deleg_root_probe: false`, the code before D3)
+loses every generation (300 of 300 seeds), `-sealed` the same root with its
+holder's beat off, sealed by its backup 1.5 s into the stall, with a delegate
+that hears only its root (the oracles judge; the probe reads the successor and
+the root answers nothing more), `-hang` a stall past the 15 s bound
 (lost, as for a dead root), `-both` the root and a delegate at once and
 `-recall` cross-subtree recalls during the stall.
 `locks-stall-step` and `locks-stall-step-delegated` (the turns' executor
@@ -3581,7 +3597,7 @@ Harness scenarios (the harness process is the application: it calls
 | `lock-stall-lone-node` | plan 41 L3: `lock-lapse-lone-node`'s workload with one of the core's own metadata commits holding the store's writer lock 5/12/20 s (`CONSTELLATION_FAULT_STORE_STALL_FILE`, `once core-only`) instead of a freeze: the node's lock lane renews its own grant off the stuck core, so no op answers `EIO`, no owner is fenced, the lock is never lost, `locks.lane.own_renewals > 0` and no op parked for a lapsed grant (`lapse_parks` 0, `late_admitted` 0); the tree holds what answered `OK`, fsck is clean also after a remount. `CONSTELLATION_HARNESS_LONE_LANE=off` runs the daemon with `CONSTELLATION_LOCK_LANE=off` and expects the lapse, read from the parking (plan 43's lapse parking keeps the owner from being fenced: the ops park for most of the stall, `lapse_parks > 0`): the in-scenario fail-before, proving the fault point reaches the core |
 | `lock-store-stall-past-lease` | plan 41 L3's cap: a lone node, lease 12 s, one core commit holding the store 20 s (more than is left of the lease): the lane renews the node's own grant up to the lease's usable end and the grant lapses there, never later (read from the lapse parking: `lapse_parks > 0`, the I/O parked for the rest of the stall, then admitted late) |
 | `lock-store-stall-holder` | plan 41 L4: two nodes, B holds an exclusive `flock` granted by A while A's client blocks on it and creates files; one metadata write of B's holds B's store 10 s: B's lane renews the grant at A, so B keeps the lock (its write under it answers `OK`, nothing lost or fenced, `locks.lane.remote_ok > 0`) and A gets it only after B's unlock; `CONSTELLATION_HARNESS_HOLDER_LANE=off` expects B's `EIO` |
-| `delegate-store-stall` with `CONSTELLATION_HARNESS_DELEG_STALL_NODE=a\|b\|both` | plan 41 R2: whose store stalls (default `b`, the delegate: its off-core lane keeps the delegation). With `a` the root's core is stuck (the unbacked pair, a 60 s lease, a writer in a root directory): its P2P service answers the delegate's renewals off the core, so the same generation survives, nothing is reclaimed or lapsed, `delegation.root_answers_off_core > 0` and `b`'s writes still run on the delegate; `CONSTELLATION_DELEG_ROOT_LANE=off` fails with `KNOWN-GAP root core stuck` (the in-scenario fail-before). `both` stalls the first commit of each core (the root's is asserted stuck, the delegate's only if it committed in the window). `CONSTELLATION_HARNESS_DELEG_BACKED=1` runs the backed pair, where a loss is possible until plan 41 P (a root with a backup answers off the core only within the takeover window of its core's last proof of liveness) and is accepted only if it is the known gap; a kept delegation is a note |
+| `delegate-store-stall` with `CONSTELLATION_HARNESS_DELEG_STALL_NODE=a\|b\|both` | plan 41 R2: whose store stalls (default `b`, the delegate: its off-core lane keeps the delegation). With `a` the root's core is stuck (the backed pair, a 60 s lease, a writer in a root directory): its P2P service answers the delegate's renewals off the core, reading its own lease object when its proof of liveness is stale (plan 41 D3), so the same generation survives, nothing is reclaimed or lapsed, `delegation.root_answers_off_core > 0`, `delegation.root_probes > 0` and `b`'s writes still run on the delegate; `CONSTELLATION_DELEG_ROOT_LANE=off` fails with `KNOWN-GAP root core stuck` (the in-scenario fail-before), and so does a loss with `CONSTELLATION_ROOT_PROBE=off` on the backed pair, which accepts it only if it is the known gap (a kept delegation is a note). `both` stalls the first commit of each core (the root's is asserted stuck, the delegate's only if it committed in the window). `CONSTELLATION_HARNESS_DELEG_BACKED=0` runs the unbacked pair (a root with no backup answers off the core under the lease's cap alone) |
 | `lock-lapse-lone-node` | a lone node (`--write-mode back`, ttl 3 s) is frozen (`SIGSTOP`) past a lock grant's window while the lock's owner process has `fsync`ed one write under the lock and left a second one dirty, and creates, links, symlinks and renames from other threads: every op answers OK or `EIO` and the tree holds exactly what answered OK (an op in flight across the stall is applied and answered OK, or not applied), the write and the close after the lapse answer `OK` (plan 43 C7-F F-c: the node asks itself for its grant back and the I/O the freeze held up runs; before, they answered `EIO` and the file held exactly the `fsync`ed write): no op answers `EIO`, the file holds the writes in order, the status counts the parks resumed and no op fenced. After a remount the tree, the file and every write a later `fsync` acknowledged are there, and fsck is clean. The node that sequences its own grants lapses them too: the core that renews them is the one stalled (the xcheckfs run of 2026-10-13) |
 
 On failure `lock-failover`, `lock-holder-killed-contention`,

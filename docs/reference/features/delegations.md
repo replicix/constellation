@@ -417,9 +417,9 @@ delegated directory do not wait for its ship either. Status:
      learned in a running step is published as no certificate before the
      action that makes it effective goes out; the rest the freshness window
      (fast tenures) or the cap (`Local`) bounds, exactly as for the lock
-     lane. A root with a backup, the usual delegation root, answers only
-     within 1.5 s of the core's last proof until the lane learns to prove
-     its own liveness (plan 41 P).
+     lane. A root with a backup, the usual delegation root, answers within
+     1.5 s of a proof of liveness, and a core that is stuck makes no S3
+     request to prove it: see *The root proves its own liveness* below.
   3. *The lock side is settled.* The generation is answered only if the
      core sent it a granting answer in this tenure and since then no lock
      handoff is pending, no outwait barrier is out and the subtree's floor
@@ -434,9 +434,53 @@ delegated directory do not wait for its ship either. Status:
      answer: it stops at `sent + ttl − margin`, the root's window runs to
      `answer + ttl + (margin)`.
   `CONSTELLATION_DELEG_ROOT_LANE=off` turns the answerer off (A/B runs).
+  **The root proves its own liveness** (plan 41 D3). A tenure that can be
+  taken over before its lease expires (it lists a backup, or acks at
+  `ack=s3`) answers only within `backup_takeover_ms` (1.5 s) of the send of
+  an S3 request that proved it live, and a core stuck in a step makes none:
+  the answerer found its proof stale 1.5 s into every stall and answered
+  nothing more (the backed pair of `delegate-store-stall` lost its
+  delegation to stalls past the grant's slack, `KNOWN-GAP root core
+  stuck`). Now a renewal refused **only** for stale liveness (every other
+  rule holds: slot open and settled, lease marked, lease left below the
+  margin; and the driver is stuck and not hung, so never while the core
+  runs and never past `CONSTELLATION_HOLDER_STALL_MS`) asks the root's
+  `RootProbe` for one read of the lease object, which the P2P service
+  performs on a task of its own through the driver's own `LeaseStore` (so
+  the own-S3 watch counts it). At most one read is in flight (renewals that
+  arrive meanwhile wait for it, at most one freshness window) and at most
+  one is started per freshness window, whatever the last one found: a read
+  serves every renewal, of every delegation and of the lock lane's own
+  grants, that arrives in its round. The read is judged as the core judges
+  a `LeaseGet` of its own (`note_s3_liveness`, `on_renew_probe`): holder
+  and epoch only, never an expiry against a clock (plan 43 C7). Naming this
+  node at the certificate's epoch, not released, it is a proof of liveness
+  **as of its send** (the honour reading taken before the request left),
+  and the unchanged freshness rule judges it at the answer: a read slower
+  than the window justifies nothing. Another holder, a later epoch or no
+  lease is a deposition: the epoch's earlier proof is withdrawn, the
+  answerer refuses it from then on (`deposed`) and no more reads are made
+  for it. A failed or timed-out read, an older body or a released lease
+  prove nothing. The core is told of every read on the urgent lane
+  (`Event::RootProbed`) and treats it as its own: a proof extends its
+  `last_s3_fresh`, a deposition deposes it when it runs. Why a read is a
+  proof: a successor takes the tenure only by a lease CAS (a TTL claim, a
+  seal, an `ack=s3` takeover) and quarantines what the root may have
+  answered from its marker on, `marker + backup_takeover_ms + ...`; a read
+  served at or after its send that still names this root precedes that CAS,
+  so an answer decided within the window of the send ends inside the
+  quarantine: the argument of the core's own proof, with the read's send
+  where the request's send stood. A takeover that lands after the read is
+  covered by the quarantine; one that landed before it shows in it. The
+  proof only feeds the freshness rule: a certificate the core withdrew (a
+  release, an epoch, a gate) is not revived by it. `CONSTELLATION_ROOT_PROBE=off`
+  turns the read off (A/B runs). Status: `root_probes` (reads),
+  `root_probes_live`, `root_probes_deposed`, `root_probes_withheld`
+  (renewals refused a read of their own: one was sent within the window, or
+  the epoch is deposed).
   Status: `delegation.root_answers_off_core`, `root_answers_deferred` (by
   reason: `hung`, `lease`, `generation`, `node`, `closed`, `unsettled`,
-  `stale_liveness`, `unmarked`, `cap`) on the root,
+  `stale_liveness`, `unmarked`, `cap`, `deposed`) on the root,
   `off_core_answers_applied` on the delegate. A receive path that is a task
   of the root's shared runtime is held up with it: a runtime blocked for
   seconds answers nothing off the core either (the harness's runtime-hog
@@ -802,6 +846,7 @@ designations create no delegation.
 | `CONSTELLATION_DELEGATION_TTL_MS` | lock TTL (20 s), at least `5000` | grant lifetime |
 | `CONSTELLATION_DELEG_LANE` | on | the off-core renewal lane for a stuck core; `off` for A/B runs |
 | `CONSTELLATION_DELEG_ROOT_LANE` | on | the root's off-core answer to a delegate's renewal while its core is stuck; `off` for A/B runs |
+| `CONSTELLATION_ROOT_PROBE` | on | the root's own read of its lease object when its proof of liveness is stale (a root with a backup); `off` for A/B runs |
 | `CONSTELLATION_DELEGATION_PLACEMENT` | on | automatic placement of dominated subtrees (and of splits, if enabled) |
 | `CONSTELLATION_DELEGATION_WINDOW_MS` | `30000` | placement window |
 | `CONSTELLATION_DELEGATION_MIN_OPS` | `200` | rate floor per window |

@@ -654,6 +654,31 @@ epochs too, and stop once the driver has been stuck for
 `CONSTELLATION_LOCK_LANE_MAX_STALL_MS` (default 120 s): a node whose core is
 hung, not slow, lets its grants lapse as it always did.
 
+**A fast tenure proves itself** (plan 41 D3). For a tenure that can be taken
+over before its lease expires (a listed backup, `ack=s3`) the own renewals
+need an S3 proof of liveness within `backup_takeover_ms`, and a core stuck
+in a step makes no S3 request: the lane renewed such a root's grants only
+for the first 1.5 s of a stall. Now, while the core has been stuck for
+100 ms (never while it runs) and not past `CONSTELLATION_HOLDER_STALL_MS`
+(15 s: past it the holder's heartbeat stops and its backups seal it), a
+due own grant that lacks only that proof makes the lane ask the root's
+`RootProbe` for one read of the lease object (`LaneAction::Probe`; the
+engine performs it on a task of its own through the driver's `LeaseStore`).
+At most one read is in flight and one is started per `backup_takeover_ms`,
+shared with the delegation answerer. The read is judged by holder and epoch
+only, as the core judges its own: naming this node at the certificate's epoch
+(`LockLaneView::epoch`), not released, it is a proof as of its **send**; the
+lane's freshness rule, judged at the table's reading inside the extension's
+critical section, takes the later of it and the core's own; another holder,
+a later epoch or no lease withdraws the epoch's proof and ends its renewals
+and its reads. A failed read proves nothing; the grant waits for the next
+round and, past the window, lapses as it did. The proof is an input to the
+freshness rule only: a withdrawn certificate is not revived by it. Why it is
+a proof is the core's own argument, with the read's send where the request's
+send stood; the delegation answerer's text has it in full
+([Delegations](delegations.md#grants-renewal-and-expiry)).
+`CONSTELLATION_ROOT_PROBE=off` turns the read off.
+
 Why every extension is one the core could have made at that instant: the
 lane and the core run in one process on one clock; the lane extends a
 record only if it is live under the tables' mutex, and every core decision
@@ -673,8 +698,9 @@ clean), the simulator runs it on every lock configuration
 (`locks-core-stall*`).
 
 Status: `locks.lane` (`enabled`, `own_renewals`, `remote_sent`,
-`remote_ok`, `late_ok`, `deferred`, `stall_stops`, `in_flight`, and the
-diagnosis counters `ticks`, `stuck_ticks`, `uncovered`, `max_stuck_ms`).
+`remote_ok`, `late_ok`, `deferred`, `stall_stops`, `in_flight`, `probes`
+(reads of the lease object, D3), and the diagnosis counters `ticks`,
+`stuck_ticks`, `uncovered`, `max_stuck_ms`).
 
 **Host guidance.** A store stall is a property of the host, and the lane
 does not make it free: the application's writes wait for it. Fewer stalls:
@@ -1938,6 +1964,7 @@ WAN numbers are measured separately (`lock-latency`, `bench/remote`).
 | `CONSTELLATION_LOCK_TTL_MS` | `20000` | a grant's lifetime, renewed half-way through the window it is honoured for |
 | `CONSTELLATION_LOCK_CACHE_IDLE_MS` | `30000` | how long a grant with no local lock under it is kept |
 | `CONSTELLATION_LOCK_LANE` | `on` | `off`, `0` or `false` turns the renewal lane off (A/B runs; [Renewals off the core](#renewals-off-the-core)) |
+| `CONSTELLATION_ROOT_PROBE` | `on` | `off`, `0` or `false`: the lane does not read the lease object for a tenure that can be taken over early (A/B runs; [Renewals off the core](#renewals-off-the-core)) |
 | `CONSTELLATION_LOCK_LANE_MAX_STALL_MS` | `120000` | the lane's remote renewals stop once the authority driver has been stuck this long (a hung core is not a slow one) |
 | `CONSTELLATION_LOCK_CLOSE_WAIT_MS` | `100` | how long a non-blocking request may wait for a just-closed description's locks to go, counted from the close, and for an earlier turn's operations still in flight — never longer than this from the request itself ([Close and release](#close-and-release)); `0`: no wait; a single-worker mount never waits for the closed description's locks |
 
