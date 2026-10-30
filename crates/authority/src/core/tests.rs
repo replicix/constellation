@@ -39447,6 +39447,30 @@ mod deleg_group {
         assert_eq!(h.core.stats.deleg_rebooted_holder, 1);
     }
 
+    /// Review follow-up (fail-before): a boot that cannot be named (id 0: no
+    /// boot id on the platform, `/proc` unreadable) is never the same boot,
+    /// as a boot stamp's is: a grant recorded on boot 0 and a restart on
+    /// boot 0 used to compare equal, and the rebooted delegate renewed.
+    #[test]
+    fn an_unknown_boot_is_never_the_boot_the_grant_was_recorded_on() {
+        let (h, _, _, _) = delegate_renewed_once();
+        h.meta.deleg_note_held(7, 0).unwrap();
+        let (h, out) = delegate_restarted_on(h, 0);
+        assert_eq!(
+            (
+                renew_req(&out, 7).is_some(),
+                h.core.dl.mine.get(&7).map(|d| d.stopped)
+            ),
+            (false, Some(true)),
+            "(renewed, stopped) on an unknown boot: {out:?}"
+        );
+        // Nor is a known boot the same as an unknown record's.
+        h.meta.deleg_note_held(7, 0).unwrap();
+        let (h, out) = delegate_restarted_on(h, 1);
+        assert!(renew_req(&out, 7).is_none(), "{out:?}");
+        assert!(h.core.dl.mine[&7].stopped);
+    }
+
     /// This node holds two generations whose keys meet: `/d` split in two,
     /// range of `low` delegated as generation 7 and range of `high` as 8,
     /// both to node 3, with a file linked under both names. `low` sorts

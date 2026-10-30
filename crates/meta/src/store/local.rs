@@ -2641,15 +2641,15 @@ pub(crate) fn deleg_void_cut_key(gen: u64) -> String {
     format!("deleg_void_cut:{gen}")
 }
 
-/// `local` kv: generation `gen`'s stream lost rows to a takeover's
-/// strand (`Meta::strand_for_takeover`); this node, its delegate, never
-/// executes in it again.
 /// `local` kv: the boot on which this node, the delegate of `gen`, was
 /// granted it ([`Meta::deleg_note_held`]).
 fn deleg_held_key(gen: u64) -> String {
     format!("deleg_held_boot:{gen}")
 }
 
+/// `local` kv: generation `gen`'s stream lost rows to a takeover's
+/// strand (`Meta::strand_for_takeover`); this node, its delegate, never
+/// executes in it again.
 fn deleg_stranded_key(gen: u64) -> String {
     format!("deleg_stranded:{gen}")
 }

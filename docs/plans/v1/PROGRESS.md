@@ -61872,3 +61872,13 @@ refused, the view shows it, `force` ends the generation; heard longer than a ttl
 of `--force` and the status line. Fail-before (the test without `force` and without the view on the item 3 commit): the
 abandon answered `Ok("generation 7 ended at index 0; ...")` with member 4 heard 200 ms earlier. Mutation (the refusal
 arm off): the same failure.
+
+### Review follow-ups (5b6a6b1e..661b79af)
+
+F1. A boot id of 0 means the boot is unknown: no boot id from `/proc`, or a platform without one. Two 0s compared
+equal, so with no boot id 6357d3e6 never detected a reboot (`Replica::deleg_held_on_another_boot`). Now 0 on either side
+is never the same boot, the rule a boot stamp follows (`Now::wait_of_stamp`). Test
+`an_unknown_boot_is_never_the_boot_the_grant_was_recorded_on`. Fail-before (the comparison as it was): `(renewed,
+stopped)` was `(true, Some(false))`. delegations.md also no longer calls the designee's exemption safe. It is a known gap
+pending a fix: a designee streams like any delegate, and the root skips indices at or below its cursor, so a designee
+that lost the unsynced end of its journal reuses indices.

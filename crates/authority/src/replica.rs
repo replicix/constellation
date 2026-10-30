@@ -357,7 +357,7 @@ pub trait Replica {
     /// This node held a grant of `gen` on a boot other than `boot`: it
     /// rebooted since, and its journal may have lost the unsynced end of the
     /// generation (`Meta::deleg_held_boot`). An unreadable record counts as
-    /// another boot.
+    /// another boot, and so does an unknown one (id 0) on either side.
     fn deleg_held_on_another_boot(&self, gen: u64, boot: u64) -> bool;
     /// Generation `gen` ended at `cut` (the void rule).
     fn void_stream(&self, gen: u64, cut: u64);
@@ -1276,7 +1276,10 @@ impl Replica for Meta {
 
     fn deleg_held_on_another_boot(&self, gen: u64, boot: u64) -> bool {
         match Meta::deleg_held_boot(self, gen) {
-            Ok(held) => held.is_some_and(|b| b != boot),
+            // Boot id 0 is unknown (no `/proc` boot id, a platform without
+            // one): never the same boot, as a boot stamp's
+            // (`Now::wait_of_stamp`).
+            Ok(held) => held.is_some_and(|b| b == 0 || boot == 0 || b != boot),
             Err(error) => {
                 tracing::warn!(%error, gen, "reading a delegation's grant record failed; taking it as another boot's");
                 true

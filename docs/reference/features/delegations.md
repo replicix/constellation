@@ -873,7 +873,11 @@ designations create no delegation.
   generation recorded on another boot does not take it up again: it does
   not renew (`deleg_rebooted_holder`), and the root ends the generation
   by its backup's sealed tail, or at its cursor when there is no backup.
-  A designee is exempt: it renews nothing.
+  A boot that cannot be named (no boot id) is never the same boot. A
+  designee is not covered, and that is a **known gap** pending a fix: it
+  renews nothing, so the rule does not stop it, yet it streams like any
+  delegate and the root skips the indices at or below its cursor, so a
+  designee that lost the unsynced end of its journal reuses indices.
 - **Root dies and the delegate is no backup** (no backup in budget, or
   the root dropped it before it died): only a TTL takeover replaces the
   root. The delegate's grant lapses unrenewed (above), its writes take
