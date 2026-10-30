@@ -350,6 +350,15 @@ pub trait Replica {
     /// of it (`Meta::delegate_stranded`): the generation is never
     /// executed in here again.
     fn delegate_stranded(&self, gen: u64) -> bool;
+    /// Plan 43 C2e follow-up: record (synced) that this node holds a grant of
+    /// `gen` on boot `boot` (`Meta::deleg_note_held`); `false`: it could not
+    /// be, and the grant must not be used.
+    fn deleg_note_held(&self, gen: u64, boot: u64) -> bool;
+    /// This node held a grant of `gen` on a boot other than `boot`: it
+    /// rebooted since, and its journal may have lost the unsynced end of the
+    /// generation (`Meta::deleg_held_boot`). An unreadable record counts as
+    /// another boot.
+    fn deleg_held_on_another_boot(&self, gen: u64, boot: u64) -> bool;
     /// Generation `gen` ended at `cut` (the void rule).
     fn void_stream(&self, gen: u64, cut: u64);
     /// Whether transaction `(gen, idx)` of this delegate's streams is
@@ -1253,6 +1262,26 @@ impl Replica for Meta {
             tracing::warn!(gen, error = %e, "delegate-stranded mark unreadable; taking it as set");
             true
         })
+    }
+
+    fn deleg_note_held(&self, gen: u64, boot: u64) -> bool {
+        match Meta::deleg_note_held(self, gen, boot) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, gen, "recording a delegation's grant failed");
+                false
+            }
+        }
+    }
+
+    fn deleg_held_on_another_boot(&self, gen: u64, boot: u64) -> bool {
+        match Meta::deleg_held_boot(self, gen) {
+            Ok(held) => held.is_some_and(|b| b != boot),
+            Err(error) => {
+                tracing::warn!(%error, gen, "reading a delegation's grant record failed; taking it as another boot's");
+                true
+            }
+        }
     }
 
     fn void_stream(&self, gen: u64, cut: u64) {

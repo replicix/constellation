@@ -1644,7 +1644,15 @@ uncommitted rows past its cut instead of replaying them (their clients were
 never answered), keeping only a lone delegate's rows for replay. A generation
 whose latest record names a backup is not ended before that backup answers its
 seal: rows acknowledged through the group may be nowhere else (Q1, which C2e
-completes with the operator's escape). Rejected: counting a backup from the
+completes with the operator's escape). A delegate's own copy is its journal,
+whose commits reach the OS but not the disk: a process that held a generation
+before a reboot may lack rows the group acknowledged, so it does not take the
+generation up again (it records, synced, the boot of its first grant), and the
+generation ends by the backup's tail or at the root's cursor; a restart on the
+same boot finds the journal intact and renews (2026-10-30, C2e follow-up: the
+renewal that ends the root's wait for the backup, and any renewal before the
+grant ran out, used to hand such a delegate its generation back, its next rows
+reusing indices the backup held). Rejected: counting a backup from the
 renewal that names it, or from the root's uncommitted record (the record could
 be lost at the root's deposition and the root would seal a different member
 than the one clients were answered by); letting a retry's dedup answer leave at

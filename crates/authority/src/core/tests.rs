@@ -39392,6 +39392,61 @@ mod deleg_group {
         assert_eq!(queued, vec![rename], "the rename is replayed alone");
     }
 
+    /// The delegate of [`delegate_renewed_once`] (granted on boot 1) as a new
+    /// process on the same disk, on boot `boot`, 1 s later: what its
+    /// install of the table's generations sent.
+    fn delegate_restarted_on(h: Harness, boot: u64) -> (Harness, Vec<Action>) {
+        let mut r = Harness {
+            core: Core::new(h.core.cfg.clone()),
+            meta: h.meta,
+            now: h.now.plus(1_000),
+            honour_off: 0,
+            wait_off: 0,
+            manual_horizon: false,
+        };
+        r.core.lease.cached_holder = Some(1);
+        let mut now = r.clk();
+        now.boot.id = boot;
+        let mut out = Vec::new();
+        r.core.delegation_sync(now, &r.meta, &mut out);
+        (r, out)
+    }
+
+    /// C2e follow-up (fail-before): a delegate's commits reach the OS, not the
+    /// disk, so after a reboot (a power loss) its journal may lack the end
+    /// of the generation: rows it acknowledged through its backup, or that
+    /// the root's cursor covers. It used to install the generation from the
+    /// table and renew at once; granted again (by a running grant, or by the
+    /// renewal that ends the root's wait for the backup's tail), its next
+    /// rows took indices the backup holds, overwriting acknowledged rows,
+    /// or that the root skips as appended. Now a process that held the
+    /// generation on another boot does not take it up again: it does not
+    /// renew, and the root ends the generation by its group. A restart on the
+    /// same boot (an upgrade, a crash of the process) finds the journal as it
+    /// was and renews as before.
+    #[test]
+    fn a_delegate_rebooted_since_its_grant_does_not_take_the_generation_up_again() {
+        let (h, _, _, _) = delegate_renewed_once();
+        assert_eq!(
+            h.meta.deleg_held_boot(7).unwrap(),
+            Some(1),
+            "recorded at the grant"
+        );
+        let (h, out) = delegate_restarted_on(h, 1);
+        assert!(renew_req(&out, 7).is_some(), "same boot: renews at once");
+        assert!(!h.core.dl.mine[&7].stopped);
+        let (h, out) = delegate_restarted_on(h, 2);
+        assert_eq!(
+            (
+                renew_req(&out, 7).is_some(),
+                h.core.dl.mine.get(&7).map(|d| d.stopped)
+            ),
+            (false, Some(true)),
+            "(renewed, stopped) after a reboot: {out:?}"
+        );
+        assert_eq!(h.core.stats.deleg_rebooted_holder, 1);
+    }
+
     /// This node holds two generations whose keys meet: `/d` split in two,
     /// range of `low` delegated as generation 7 and range of `high` as 8,
     /// both to node 3, with a file linked under both names. `low` sorts

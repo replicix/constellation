@@ -96,7 +96,12 @@ node acts on it:
   written as boot stamps (plan 43 C7a): the end on the wall clock, the span
   ahead of the write, the boot id and the raw clock's end, so that a restart
   on the same boot reads the time left on the raw clock and one after a reboot
-  waits the span.
+  waits the span;
+- a delegate's record of the boot on which it holds a generation's grant,
+  before it uses the grant: a process that finds the record on another boot
+  (a power loss may have dropped rows it acknowledged) does not take the
+  generation up again, and the root ends it by its group (see
+  [Delegations](delegations.md#failures)).
 
 So a power loss can make a node forget work, never a promise it made.
 

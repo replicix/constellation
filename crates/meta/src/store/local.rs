@@ -908,6 +908,31 @@ impl Meta {
         Ok(kv_get_tx(&r, &self.local, &deleg_stranded_key(gen))?.is_some())
     }
 
+    /// Plan 43 C2e follow-up: this node, the delegate of `gen`, holds a grant
+    /// of it on boot `boot`, synced before it executes under it. A process
+    /// that restarts on the same boot finds its journal as the last one left
+    /// it (commits reach the OS on commit, `Meta::sync`); one that restarts
+    /// after a reboot may have lost its unsynced end, rows it acknowledged,
+    /// and does not take the generation up again
+    /// ([`Meta::deleg_held_boot`]).
+    pub fn deleg_note_held(&self, gen: u64, boot: u64) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        kv_set_tx(
+            &mut tx,
+            &self.local,
+            &deleg_held_key(gen),
+            &boot.to_string(),
+        );
+        tx.commit()?;
+        self.sync()
+    }
+
+    /// The boot this node last held a grant of `gen` on (`None`: never).
+    pub fn deleg_held_boot(&self, gen: u64) -> Result<Option<u64>, MetaError> {
+        let r = self.db.read_tx();
+        Ok(kv_get_tx(&r, &self.local, &deleg_held_key(gen))?.and_then(|v| v.parse::<u64>().ok()))
+    }
+
     /// Phase 2b: the highest index of `gen` in the log as this replica
     /// holds it (see [`deleg_log_idx_key`]).
     pub fn log_stream_idx(&self, gen: u64) -> Result<u64, MetaError> {
@@ -2619,6 +2644,12 @@ pub(crate) fn deleg_void_cut_key(gen: u64) -> String {
 /// `local` kv: generation `gen`'s stream lost rows to a takeover's
 /// strand (`Meta::strand_for_takeover`); this node, its delegate, never
 /// executes in it again.
+/// `local` kv: the boot on which this node, the delegate of `gen`, was
+/// granted it ([`Meta::deleg_note_held`]).
+fn deleg_held_key(gen: u64) -> String {
+    format!("deleg_held_boot:{gen}")
+}
+
 fn deleg_stranded_key(gen: u64) -> String {
     format!("deleg_stranded:{gen}")
 }

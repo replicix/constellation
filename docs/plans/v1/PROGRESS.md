@@ -61820,3 +61820,33 @@ Tests: core `a_backup_that_cannot_read_its_seal_takes_no_appends`, and meta
 `a_delegate_backups_seal_flag_read_fails_as_an_error`. Fail-before (the hook and the test on the item 1 commit): the
 backup acknowledged `DelegBackupAck { acked: 2, sealed: false }` and held rows `[1, 2]` where `None` and `[1]` were
 expected. Mutation (`None => false`): the same failure.
+
+### 3. A delegate that rebooted since its grant does not take the generation up again
+
+Finding (C2e follow-up). The revive (13b209f9, `Core::on_deleg_renew`: a renewal while the root waits in `Sealing`
+with no tail in hand gives the seal up) assumed that the delegate holds every row it acknowledged. A delegate's commits
+reach the OS, not the disk (`PersistMode::Buffer`, `Meta::sync`), so a power loss or a kernel crash can drop the end of
+its journal. After the reboot the delegate installed the generation from the table (`delegation_sync`) and renewed at
+once. If the root granted it, through the revive or through a grant still running, its next rows took indices of the
+lost end: rows acknowledged through the backup were overwritten by idempotent appends under the same keys
+(`deleg_backup_append`), or the root skipped them as already appended (`on_delegate_stream`: `tx.idx <= cursor`),
+answered them, and lost them. The same exposure exists on both pre-C2e paths, because the root cannot tell the
+incarnations apart there either: a restart before the grant runs out, and a seal that fails at the transport and puts
+the generation back to `RecallPhase::None`. The root could have told incarnations apart (a core's request ids carry the
+incarnation in bits 40 to 61, `Core::new`), but refusing every new incarnation would have ended a delegation at every
+restart. That includes an upgrade or a handoff on the same boot (`delegate-handoff-renewal`), where nothing can be lost:
+commits survive a process exit.
+
+Fix, on the delegate's side, which covers all three paths and a root change too. Before a process uses its first grant
+of a generation, it records, synced, the boot it holds the grant on (`Meta::deleg_note_held`; if the record fails, the
+grant is not used and the generation stops). A process that installs a generation recorded on another boot
+(`Replica::deleg_held_on_another_boot`; an unreadable record counts as another boot) installs it stopped. It never
+renews, and the root ends the generation by its backup's sealed tail, or at the cursor when there is no backup
+(`deleg_rebooted_holder`). A restart on the same boot renews as before. A designee is exempt, since it renews nothing.
+
+Test: core `a_delegate_rebooted_since_its_grant_does_not_take_the_generation_up_again` (granted on boot 1, a restart on
+boot 1 renews, a restart on boot 2 is stopped and sends nothing). Fail-before (the core's rule removed and the record
+written by the test): `(renewed, stopped)` was `(true, Some(false))`, and the renewal was sent at once. Mutations: with
+the install's check off, the same failure; with the grant not recorded, the test fails on the record (`None` where
+`Some(1)` was expected). Not modelled: the simulation's reboot keeps the journal, so no configuration loses its
+unsynced end. Its reboots do exercise the new path (a rebooted delegate's generation ends by its group).

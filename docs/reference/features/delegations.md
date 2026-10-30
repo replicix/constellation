@@ -774,7 +774,8 @@ designations create no delegation.
   warns once a minute. The wait ends by itself as soon as a member answers
   (it may be a restarted node: its disk holds the tail) or the delegate
   renews (it is alive and holds every row it acknowledged; the seal is given
-  up and the grant goes on). A root that has just taken the lease learns the
+  up and the grant goes on; a delegate that rebooted since it was granted the
+  generation never renews it, see "Delegate restarts" below). A root that has just taken the lease learns the
   generations from the delegation table, so the wait starts with the first
   write after the claim (the simulation's end-of-run write does that). If
   the members are gone for good, the operator ends the generation:
@@ -848,7 +849,18 @@ designations create no delegation.
   evicted it, and the first write after every resume waited 2.0-2.7 s.
   After a crash nothing says goodbye, and the probe still bounds the
   wait. A generation that ended meanwhile is refused at the renewal and
-  dropped when the log says so.
+  dropped when the log says so. This holds for a restart on the same
+  **boot** only. A delegate's commits reach the OS, not the disk, so a
+  power loss or a kernel crash can drop the end of its journal: rows it
+  acknowledged through its backup, or that the root's cursor covers.
+  Granted again, its next rows would take their indices, overwriting
+  the backup's acknowledged rows, or being skipped by the root as already
+  appended. So before it uses its first grant of a generation, a delegate
+  records (synced) the boot it holds it on, and a process that finds the
+  generation recorded on another boot does not take it up again: it does
+  not renew (`deleg_rebooted_holder`), and the root ends the generation
+  by its backup's sealed tail, or at its cursor when there is no backup.
+  A designee is exempt: it renews nothing.
 - **Root dies and the delegate is no backup** (no backup in budget, or
   the root dropped it before it died): only a TTL takeover replaces the
   root. The delegate's grant lapses unrenewed (above), its writes take

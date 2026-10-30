@@ -916,7 +916,10 @@ lease and one log
   by rid at the new owner); a lone delegate's own rows are replayed as
   before; and a generation whose latest record names a backup is not ended
   before that backup answers its seal, since rows acknowledged through it
-  may be nowhere else.
+  may be nowhere else. A delegate whose journal may have lost its unsynced
+  end (it held the generation before a reboot) does not take it up again,
+  so the end goes through that backup or the root's cursor
+  ([ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)).
 - **Cross-subtree ops** (renames and hard links across delegations,
   `rmdir` or rename of a delegated root) go to the root, which *recalls*
   the delegations involved first (the delegate drains and stops, or is

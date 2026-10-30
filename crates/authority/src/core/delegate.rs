@@ -405,6 +405,9 @@ pub(crate) struct DelegateState {
     pub group_requested: Option<Vec<NodeId>>,
     /// The highest index answered under a group (`removal_safe`'s bound).
     pub acked_max: u64,
+    /// Plan 43 C2e follow-up: this process recorded, synced, that it holds a
+    /// grant of the generation on this boot (`Replica::deleg_note_held`).
+    pub held_noted: bool,
 }
 
 /// A renewal or backup append [`Core::deleg_expire_inflight`] gave up
@@ -907,6 +910,28 @@ impl Core {
             let group = replica.deleg_group(d.gen);
             tracing::info!(node = me, dir = d.dir, gen = d.gen, "delegation installed");
             self.stats.deleg_installed += 1;
+            // Plan 43 C2e follow-up: a process that held this generation
+            // before a reboot may have lost the unsynced end of its journal
+            // (commits reach the OS, not the disk), rows it acknowledged
+            // through its group or that the root's cursor covers. Granted
+            // again, its next rows would take their indices: the backup's
+            // acknowledged rows overwritten, the root skipping them as
+            // appended. It does not take the generation up again: it never
+            // renews, and the root ends the generation by its backup's
+            // sealed tail, or at the cursor. A restart on the same boot finds
+            // the journal as it was and goes on (`delegate-handoff-renewal`);
+            // so does a designee, which renews nothing.
+            let rebooted = !d.designated && replica.deleg_held_on_another_boot(d.gen, now.boot.id);
+            if rebooted {
+                self.stats.deleg_rebooted_holder += 1;
+                tracing::warn!(
+                    node = me,
+                    dir = d.dir,
+                    gen = d.gen,
+                    "this node held the delegation before a reboot and may have lost rows it acknowledged: \
+                     not taken up again; the root ends it by its group"
+                );
+            }
             // A delegate's reply base is the last applied segment that
             // touched the op's keys (`reply_base`), and the window only
             // records segments applied while this node delegates: one
@@ -925,7 +950,7 @@ impl Core {
                     // A takeover's strand left a hole in this stream
                     // (`Meta::strand_for_takeover`): it ends at what the
                     // log holds of it; nothing more executes here.
-                    stopped: replica.delegate_stranded(d.gen),
+                    stopped: replica.delegate_stranded(d.gen) || rebooted,
                     stream_after: None,
                     stream_backoff_ms: 0,
                     refused: false,
@@ -964,6 +989,7 @@ impl Core {
                     group_backups: group.map(|g| g.backups).unwrap_or_default(),
                     group_requested: None,
                     acked_max: 0,
+                    held_noted: false,
                 },
             );
             if d.designated {
@@ -3622,7 +3648,12 @@ impl Core {
             // Plan 43 C2e: a delegate that renews while the root waits for its
             // group's tail is alive, and holds every row it acknowledged on
             // its own disk: the seal that waits is given up (as when its
-            // transport fails) and the grant goes on. Its backup may have
+            // transport fails) and the grant goes on. A renewal says so: the
+            // process that sends it held the generation all along, or took it
+            // up after a restart on the same boot, whose journal is as the
+            // last process left it; one that held it before a reboot (a power
+            // loss can drop the unsynced end of the journal) never renews it
+            // again (`delegation_sync`), and the wait goes on for the backup. Its backup may have
             // been sealed meanwhile; the delegate then loses it and stops,
             // and the next expiry asks again. Not while a tail is in hand.
             let revive = self.dl.gens.get(&gen).is_some_and(|g| {
@@ -4514,6 +4545,9 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        if !self.deleg_note_held_here(now, gen, replica) {
+            return;
+        }
         let d = self.dl.mine.get_mut(&gen).expect("present");
         // Measured from the send (M8's discipline): honoured until
         // `sent + ttl − margin` on this clock.
@@ -4555,6 +4589,32 @@ impl Core {
             self.deleg_renew_now(now, gen, out);
         }
         self.deleg_after_event(now, replica, out);
+    }
+
+    /// Plan 43 C2e follow-up: before the first grant of `gen` this process
+    /// uses, it records (synced) that it holds the generation on this boot,
+    /// so that after a reboot it knows its journal may lack rows it
+    /// acknowledged (`delegation_sync`). `false`: not recorded; the grant is
+    /// not used and the generation stops here (the root ends it by its
+    /// group). A designee needs none (it renews nothing).
+    fn deleg_note_held_here(&mut self, now: Now, gen: u64, replica: &dyn Replica) -> bool {
+        let Some(d) = self.dl.mine.get_mut(&gen) else {
+            return false;
+        };
+        if d.held_noted || d.designated {
+            return true;
+        }
+        if replica.deleg_note_held(gen, now.boot.id) {
+            d.held_noted = true;
+            return true;
+        }
+        d.stopped = true;
+        tracing::warn!(
+            node = self.cfg.node_id,
+            gen,
+            "could not record the delegation's grant: not used, the generation stops here"
+        );
+        false
     }
 
     /// The root's P2P service answered renewal `req` of `gen` off its core
@@ -4693,6 +4753,12 @@ impl Core {
         if until <= d.until {
             return;
         }
+        if !self.deleg_note_held_here(now, gen, replica) {
+            return;
+        }
+        let Some(d) = self.dl.mine.get_mut(&gen) else {
+            return;
+        };
         tracing::debug!(
             node = self.cfg.node_id,
             gen,

@@ -910,6 +910,10 @@ pub struct Stats {
     /// Delegate: delegations installed here, transactions streamed,
     /// batches refused, renewals granted/refused, recalls received.
     pub deleg_installed: u64,
+    /// Delegate: generations this node held before a reboot, not taken up
+    /// again (plan 43 C2e follow-up: the journal may lack rows it
+    /// acknowledged).
+    pub deleg_rebooted_holder: u64,
     pub deleg_streamed_txs: u64,
     pub deleg_stream_refused: u64,
     pub deleg_renewals: u64,
