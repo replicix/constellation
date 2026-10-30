@@ -712,7 +712,7 @@ The registration happens before the engine reads the data, under the same
 shard lock the claim takes, so a read either is recorded before the claim
 or reads after the claim's write was applied.
 
-Three facts the code comments must carry (they are what a later reader
+Four facts the code comments must carry (they are what a later reader
 would "fix"):
 
 - **A claim clears every record, also of pages it does not cover.** Safe:
@@ -720,6 +720,13 @@ would "fix"):
   and a read in flight on a page blocks a writer's
   `__filemap_get_folio(FGP_WRITEBEGIN)` on it, so a recorded read's fetch
   always precedes any later copy into the same page.
+- **The claimed write's reply clears them again** (K7, `answering`, just
+  before the reply bytes are written, by the worker, the repair lane or its
+  watchdog; only for the registered write claimed last, with no other
+  pending). The next write copies after this reply (KF1), so a read that
+  fetched one of its pages stale (after a drop after that copy) registers
+  after it. Kept, the reads made while the lane held a reply were hits of
+  the next write, which then often waited on its own last page (§8).
 - **A multi-request `write(2)`** (larger than `max_write`) is several
   successive candidates, each filled after the previous reply and claimed
   in turn; `pending` holds one at a time.

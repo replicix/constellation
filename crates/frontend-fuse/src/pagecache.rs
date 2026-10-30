@@ -124,6 +124,16 @@
 //!   on a page blocks a writer's `__filemap_get_folio(FGP_WRITEBEGIN)` on
 //!   it, so a recorded read's fetch always precedes any later copy into
 //!   the same page.
+//!   For the same reason **the claimed write's reply clears them again**
+//!   (`PageCacheTable::answering`, just before the reply is written, by
+//!   whoever writes it): a read recorded between a claim and its reply —
+//!   while the repair lane or its watchdog holds the reply — was sent
+//!   before the next write could copy, so it cannot have fetched one of
+//!   that write's pages stale (that needs a drop after the copy, and a
+//!   read after the drop). Kept, such records made the next write wait
+//!   on its own last page whenever a dropping open's drop ran right after
+//!   the reply: plan 42 §8's worst case, where one held reply led to the
+//!   next.
 //! - **A multi-request `write(2)`** (larger than `max_write`) is several
 //!   successive candidates, each filled after the previous one's reply
 //!   and claimed in turn: one is pending at a time.
@@ -431,6 +441,9 @@ pub(crate) struct PcEntry {
     pub(crate) pending: Vec<PendingWrite>,
     /// W2: the pages reads fetched since the last claim.
     pub(crate) reads: ReadSet,
+    /// W2: the registered write claimed last, until its reply is about to
+    /// be written ([`PageCacheTable::answering`]).
+    pub(crate) answer_due: Option<u64>,
     /// W2: the size last handed to the kernel (A3).
     pub(crate) last_size: Option<u64>,
     /// W2: bumped at every whole-file drop announced (A1, A2): what a
@@ -1123,6 +1136,7 @@ impl PageCacheTable {
         let hits = e.reads.hits(start, end);
         e.reads.clear();
         e.drop_done = false;
+        e.answer_due = Some(unique);
         if !ok {
             return Claim::Reply;
         }
@@ -1165,6 +1179,28 @@ impl PageCacheTable {
             .filter(|(s, e)| s < e)
             .collect();
         Claim::Repair { ranges, tail }
+    }
+
+    /// The reply of write `unique` of `ino` is about to be written (its
+    /// claim made; by the worker, the repair lane or its watchdog): if it
+    /// was the registered write claimed last and no other is pending, the
+    /// reads recorded since its claim go as well. Every later write of the
+    /// inode copies its bytes after this reply (module doc), so a read
+    /// that fetched one of its pages stale is sent after the drop that
+    /// follows that copy — after this reply — and is recorded after this
+    /// call. Without it, the reads made while a repair held the reply
+    /// (the lane, the watchdog's grace) were hits of the next write, which
+    /// then waited on its own last page (`crate::repair`, plan 42 §8).
+    pub(crate) fn answering(&self, ino: Ino, unique: u64) {
+        let mut shard = self.shard(ino).lock().unwrap();
+        if let Some(e) = shard.get_mut(&ino) {
+            if e.answer_due == Some(unique) {
+                e.answer_due = None;
+                if e.pending.is_empty() {
+                    e.reads.clear();
+                }
+            }
+        }
     }
 
     /// A registered write whose reply was dropped unanswered (fuser then
@@ -1662,6 +1698,59 @@ mod tests {
         assert!(t.write_begin(42, 10, false));
         assert_eq!(t.claim(42, 10, 0, P, false), Claim::Reply);
         t.with_entry(42, |e| assert!(e.unwrap().reads.0.is_empty()));
+    }
+
+    /// A read recorded after a claim and before its reply is written —
+    /// while the repair lane or its watchdog holds the reply — is cleared
+    /// by that reply (`answering`): the next write copies its bytes after
+    /// the reply, so such a read cannot have fetched one of its pages
+    /// stale, and the next write of that page claims nothing. A read after
+    /// the reply still counts; a reply that is not the last claim's, or
+    /// one with another write pending, clears nothing. (Checked to fail
+    /// with `answering` a no-op: the second claim repairs page 3.)
+    #[test]
+    fn a_reply_clears_the_reads_recorded_while_it_was_held() {
+        let t = table();
+        t.open_reply(OpenFacts {
+            write_access: true,
+            ..facts(1, S)
+        });
+        t.handle_used(42, 1); // the drop is complete: armed
+        t.read_begin(42, 3 * P, P);
+        assert!(t.write_begin(42, 7, false));
+        assert!(matches!(
+            t.claim(42, 7, 3 * P, P / 2, true),
+            Claim::Repair { tail: Some(3), .. }
+        ));
+        // While the reply is held: another dropping open (a new stamp),
+        // and a read of page 3 after it.
+        assert!(!t.open_reply(facts(2, Some(CacheStamp(99)))));
+        t.read_begin(42, 3 * P, P);
+        t.answering(42, 7);
+        assert!(t.write_begin(42, 8, false));
+        assert_eq!(t.claim(42, 8, 3 * P, P / 2, true), Claim::Reply);
+        t.answering(42, 8);
+        // After the reply: recorded (the open's drop is still live) and
+        // repaired.
+        t.read_begin(42, 3 * P, P);
+        assert!(t.write_begin(42, 9, false));
+        assert_eq!(
+            t.claim(42, 9, 3 * P, P / 2, true),
+            Claim::Repair {
+                ranges: vec![],
+                tail: Some(3)
+            }
+        );
+        // Not the last claim's reply (a writeback write, say): kept.
+        t.read_begin(42, 3 * P, P);
+        t.answering(42, 99);
+        // The last claim's, with another write registered meanwhile: kept.
+        assert!(t.write_begin(42, 10, false));
+        t.answering(42, 9);
+        assert!(matches!(
+            t.claim(42, 10, 3 * P, P / 2, true),
+            Claim::Repair { tail: Some(3), .. }
+        ));
     }
 
     /// A RELEASE of a handle no request ever carried: the kernel may have

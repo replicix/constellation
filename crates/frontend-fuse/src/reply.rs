@@ -895,16 +895,32 @@ impl Responder<u32> for WriteReply {
             reg.pc.mark(ino, Mark::S3);
         }
         reg.claimed = true;
-        let claim = reg.pc.claim(ino, reg.unique, offset, u64::from(len), ok);
+        let unique = reg.unique;
+        let claim = reg.pc.claim(ino, unique, offset, u64::from(len), ok);
         match (claim, r) {
             (Claim::Repair { ranges, tail }, Ok(n)) => {
                 // Handed to the lane: no longer in flight here (the
                 // repair's clock runs only while nothing else is).
+                let pc = reg.pc.clone();
                 drop(reg);
-                lane.submit(ino, ranges, tail, Box::new(move || reply.written(n)));
+                lane.submit(
+                    ino,
+                    ranges,
+                    tail,
+                    Box::new(move || {
+                        pc.answering(ino, unique);
+                        reply.written(n)
+                    }),
+                );
             }
-            (_, Ok(n)) => reply.written(n),
-            (_, Err(e)) => reply.error(reply_code(e.code())),
+            (_, Ok(n)) => {
+                reg.pc.answering(ino, unique);
+                reply.written(n)
+            }
+            (_, Err(e)) => {
+                reg.pc.answering(ino, unique);
+                reply.error(reply_code(e.code()))
+            }
         }
     }
 
