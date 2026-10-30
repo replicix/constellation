@@ -1233,6 +1233,28 @@ impl Core {
         self.set_phase(Phase::InboxDrain, Some(op));
     }
 
+    /// The generations this node's journal holds rows of as their
+    /// delegate (it assigned their stream indices), with every generation
+    /// its core holds: what a takeover's strand must take out ahead of the
+    /// predecessor's tail. Not the core's table alone: a restart re-adopts
+    /// only the generations the log's table lists, and the `Delegate`
+    /// record of one may still be in the very tail being re-applied
+    /// (delegated-holder-cut seed 1240: a delegate restarted, took the root
+    /// over with its own rows of the generation in its journal and none in
+    /// its table, and shipped them ahead of the tail's rename they depended
+    /// on). A root's append of another delegate's row records that
+    /// delegate's index and assigns none here.
+    fn own_journaled_gens(&self, replica: &dyn Replica) -> Vec<u64> {
+        let mut gens: std::collections::BTreeSet<u64> = self.dl.mine.keys().copied().collect();
+        for tx in replica.journal_txs_from(0, usize::MAX) {
+            let (gen, _) = tx.origin;
+            if gen != 0 && !gens.contains(&gen) && replica.delegate_idx(gen) > 0 {
+                gens.insert(gen);
+            }
+        }
+        gens.into_iter().collect()
+    }
+
     /// `shipper::complete_gate`: after the marker (or with none needed),
     /// strand what the new epoch supersedes, replay the queue locally,
     /// drain the older epochs' inbox, open the view.
@@ -1258,7 +1280,7 @@ impl Core {
             // cleared below, and a later pass of the gate (waiting for
             // the drain) must not strand the tail's own re-journaled rows.
             let own_gens: Vec<u64> = if gate.backup_tail_epoch.is_some() {
-                self.dl.mine.keys().copied().collect()
+                self.own_journaled_gens(replica)
             } else {
                 Vec::new()
             };

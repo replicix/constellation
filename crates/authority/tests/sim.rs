@@ -12353,6 +12353,26 @@ fn a_stranded_end_of_a_generation_does_not_void_it() {
     .unwrap_or_else(|e| panic!("long-delegated-late-answers seed 259 (slow lease reads): {e}"));
 }
 
+/// `delegated-holder-cut` seed 1240 under slow lease reads: a restarted
+/// delegate took the root over with its own rows of a generation in its
+/// journal and the generation unknown to its core (its `Delegate` record
+/// was in the tail it re-applied); the takeover gate did not strand them,
+/// and they shipped ahead of the tail's rename they depended on (an
+/// unlink of the name before the rename that made it). It fails before the
+/// gate strands every generation the journal holds own rows of
+/// (`Core::own_journaled_gens`).
+#[test]
+fn a_delegate_turned_root_strands_its_own_rows_after_a_restart() {
+    run_seed(
+        1240,
+        SimConfig {
+            lease_reads: SLOW_LEASE_READS,
+            ..delegated_holder_cut_config()
+        },
+    )
+    .unwrap_or_else(|e| panic!("delegated-holder-cut seed 1240 (slow lease reads): {e}"));
+}
+
 /// Plan 41 D3 review: the race the send-time dating is for is run, not
 /// assumed. `Report::probe_races` counts the lane answers decided on the
 /// root's own proof (the core's last one stale) after the lease object already

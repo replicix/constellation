@@ -14461,6 +14461,50 @@ mod locks {
         assert!(h.core.dl.mine[&7].stopped, "the gate left it running");
     }
 
+    /// The same with the generation unknown to the core: a restarted node
+    /// re-adopts only the generations its log's table lists, and the
+    /// `Delegate` record of this one is in the very tail it is about to
+    /// re-apply. Its own rows of the generation are in its journal all the
+    /// same, ahead of the tail, and are stranded with it (the store says
+    /// which generations it assigned stream indices in). Not stranded, they
+    /// shipped ahead of the tail's rows they depended on
+    /// (`delegated-holder-cut` seed 1240 under slow lease reads: an unlink
+    /// of a name before the rename that made it, in the log).
+    #[test]
+    fn the_takeover_gate_strands_own_rows_of_a_generation_the_core_does_not_hold() {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let (dir, _) = delegated_file(&h.meta);
+        two_delegate_rows(&h, dir);
+        // The restart: nothing re-adopted.
+        h.core = Core::new(h.core.cfg.clone());
+        assert!(h.core.dl.mine.is_empty());
+        h.hold(
+            2,
+            Some(PendingGate {
+                epoch: 2,
+                takeover: true,
+                marker_shipped: true,
+                drained: false,
+                fast_prev: false,
+                backup_tail_epoch: Some(1),
+                shippable: true,
+            }),
+        );
+        let mut out = Vec::new();
+        h.core.complete_gate(h.clk(), &h.meta, &mut out);
+        let own_rows = crate::replica::Replica::journal_txs_from(&h.meta, 0, usize::MAX)
+            .into_iter()
+            .filter(|tx| tx.origin.0 == 7)
+            .count();
+        assert_eq!(
+            own_rows, 0,
+            "the delegate's own rows stay ahead of the tail"
+        );
+        assert!(h.meta.delegate_stranded(7).unwrap());
+    }
+
     /// The delegate-restart wedge (plan 43 C7a commit 6's finding 1): a
     /// delegate that takes the root over with its predecessor's backup
     /// tail has its own rows of the generation stranded (replayed by rid
