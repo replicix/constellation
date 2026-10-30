@@ -443,6 +443,9 @@ impl Meta {
         tx.commit()?;
         self.usage_tracker()
             .reseat(usage_bytes.max(0) as u64, usage_files.max(0) as u64);
+        // What the reset's strand rolled back, after the commit (the
+        // session voids it lifted, the rows the hook invalidates).
+        self.report_rolled_back();
         Ok(())
     }
 }

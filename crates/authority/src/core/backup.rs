@@ -2776,6 +2776,17 @@ impl Core {
         eligible.into_iter().map(|(_, n)| n)
     }
 
+    /// Whether a backup could be had (`ack.eligible`, the gate of an empty
+    /// set in `durable_jseq_held`): a peer in budget that has not refused
+    /// the epoch, listed or not. A listed one counts: the assessment must
+    /// still hold once a removal CAS empties the set, before the next
+    /// selection pass (`backup_select`) or the tenure's first
+    /// (`acquire_won`) assesses it again.
+    pub(crate) fn backup_could_be_had(&self, now: Now) -> bool {
+        self.backup_peers_in_budget(now)
+            .any(|n| !self.ack.refused_epoch.contains_key(&n))
+    }
+
     fn backup_select(&mut self, now: Now, _replica: &dyn Replica, _out: &mut Vec<Action>) {
         // EC2 follow-up (e): a node that sealed the epoch held can never
         // back it: neither a candidate nor a reason to hold
@@ -2797,10 +2808,7 @@ impl Core {
         // the holder, paused past its backup's acknowledgement timeout,
         // removed it on waking; it crashed 100 ms later, and the successor
         // took over without the acknowledged create).
-        let listed_in_budget = self
-            .backup_peers_in_budget(now)
-            .any(|n| self.lease.backups().contains(&n) && !self.ack.refused_epoch.contains_key(&n));
-        self.ack.eligible = Some(!candidates.is_empty() || listed_in_budget);
+        self.ack.eligible = Some(self.backup_could_be_had(now));
         if self.ack.candidate.is_some()
             || self.ack.reconfig.is_some()
             || self.lease.backups().len() >= self.cfg.backups_max

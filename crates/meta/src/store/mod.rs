@@ -741,6 +741,10 @@ pub struct Meta {
     /// its commit on the same thread, so another thread's report never
     /// takes rows of a transaction that has not committed.
     rolled_back: std::sync::Mutex<Vec<(std::thread::ThreadId, RolledBack)>>,
+    /// Generations a stranding pass made live again (their journaled end
+    /// rolled back), per thread, until its transaction committed
+    /// ([`Meta::stage_unvoid`], [`Meta::report_rolled_back`]).
+    staged_unvoids: std::sync::Mutex<Vec<(std::thread::ThreadId, u64)>>,
     /// Plan 45: `0x01` point reads made on behalf of a dentry — the read a
     /// hard-linked name's `Remote` entry costs, where a single-name entry
     /// answers from its copy ([`Meta::inode_reads`]).
@@ -867,8 +871,34 @@ impl Meta {
     /// visible. A pass that failed before its commit leaves its rows here,
     /// reported with the thread's next one: an invalidation of something
     /// that did not change costs a refetch, a missing one a stale page.
+    /// A stranding pass rolled back this root's journaled end of `gen`
+    /// (inside its transaction): its session void is lifted
+    /// (`SessionState::unvoid`) at the thread's next
+    /// [`Self::report_rolled_back`], after the commit. A pass that failed
+    /// before its commit leaves it for the thread's next one: lifting a
+    /// void satisfies no wait, it can only make one.
+    pub(crate) fn stage_unvoid(&self, gen: u64) {
+        let me = std::thread::current().id();
+        self.staged_unvoids.lock().unwrap().push((me, gen));
+    }
+
     pub(crate) fn report_rolled_back(&self) {
         let me = std::thread::current().id();
+        let gens: Vec<u64> = {
+            let mut all = self.staged_unvoids.lock().unwrap();
+            if all.is_empty() {
+                Vec::new()
+            } else {
+                let (mine, others): (Vec<_>, Vec<_>) = std::mem::take(&mut *all)
+                    .into_iter()
+                    .partition(|(t, _)| *t == me);
+                *all = others;
+                mine.into_iter().map(|(_, g)| g).collect()
+            }
+        };
+        for gen in gens {
+            self.session.unvoid(gen);
+        }
         let rows: Vec<RolledBack> = {
             let mut all = self.rolled_back.lock().unwrap();
             if all.is_empty() {
@@ -1212,6 +1242,7 @@ impl Meta {
             foreign_apply_hook: std::sync::OnceLock::new(),
             rollback_hook: std::sync::OnceLock::new(),
             rolled_back: std::sync::Mutex::new(Vec::new()),
+            staged_unvoids: std::sync::Mutex::new(Vec::new()),
             inode_reads: AtomicU64::new(0),
             local_rows_read: AtomicU64::new(0),
             dirty_probes: AtomicU64::new(0),

@@ -811,6 +811,31 @@ impl Meta {
         Ok(out)
     }
 
+    /// The generations of the unshipped journal's rows that this node
+    /// assigned stream indices in (its own rows as their delegate; a root's
+    /// append of another delegate's row assigns none), read from the
+    /// transaction heads alone.
+    pub fn journal_own_gens(&self) -> Result<Vec<u64>, MetaError> {
+        let r = self.db.read_tx();
+        let mut gens: Vec<u64> = read_journal_txs(&r, self)?
+            .into_iter()
+            .map(|(_, row)| row.gen)
+            .filter(|g| *g != 0)
+            .collect();
+        gens.sort_unstable();
+        gens.dedup();
+        let mut own = Vec::new();
+        for gen in gens {
+            if kv_get_tx(&r, &self.local, &deleg_idx_key(gen))?
+                .and_then(|v| v.parse::<u64>().ok())
+                .is_some_and(|i| i > 0)
+            {
+                own.push(gen);
+            }
+        }
+        Ok(own)
+    }
+
     /// The highest stream index this node assigned under `gen` (0: none).
     pub fn delegate_idx(&self, gen: u64) -> Result<u64, MetaError> {
         let r = self.db.read_tx();
@@ -2436,17 +2461,6 @@ pub(crate) fn retract_log_idx_tx(
     }
     kv_set_tx(tx, local, &key, &(idx - 1).to_string());
     Ok(true)
-}
-
-/// Forget the persisted cut of `gen`: the `RecallCut` that wrote it was
-/// this root's own journaled one, and it stranded with its transaction
-/// while the table still lists the generation (`spec::strand_local_tx`).
-pub(crate) fn clear_void_cut_tx(
-    tx: &mut SingleWriterWriteTx,
-    local: &SingleWriterTxKeyspace,
-    gen: u64,
-) {
-    tx.remove(local, deleg_void_cut_key(gen).into_bytes());
 }
 
 /// Raise the persisted cut of the ended generation `gen` to `through`

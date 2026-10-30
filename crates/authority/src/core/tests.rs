@@ -40196,6 +40196,93 @@ mod deleg_group {
         assert!(client_answers(&out).is_empty(), "{out:?}");
     }
 
+    /// The delegate's own op of the test above, let go by the backup's seal
+    /// (its row uncommitted), as it would stand once forwarded and accepted
+    /// on a base this node had not applied (`AwaitingLog`) under an epoch
+    /// the log has since moved past: the epoch's end asks the new holder,
+    /// it does not answer from the delegate's own row (D6, as
+    /// `answer_awaiting_log`).
+    #[test]
+    fn an_ended_epochs_wait_is_not_answered_from_an_uncommitted_delegate_row() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        h.core.dl.mine.get_mut(&7).unwrap().backup = Some(4);
+        record_group(&mut h, dir, 2, 1, vec![4]);
+        let (rid, out) = own_create(&mut h, dir, 1);
+        let (breq, _) = backup_append(&out).expect("appended to the backup");
+        h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegBackupAck {
+                req: breq,
+                gen: 7,
+                acked: 0,
+                sealed: true,
+            },
+        });
+        if let Some(t) = h.core.clients.get_mut(&rid).unwrap().timer.take() {
+            h.core.timers.remove(&t);
+        }
+        h.core.clients.get_mut(&rid).unwrap().phase = client::Phase::AwaitingLog {
+            epoch: 1,
+            position: constellation_meta::Position::ZERO,
+        };
+        h.core.ship.max_epoch = 2;
+        let mut out = Vec::new();
+        h.core.reroute_ended_epoch_waits(h.clk(), &h.meta, &mut out);
+        assert!(
+            client_answers(&out).is_empty(),
+            "answered from the delegate's own uncommitted row: {out:?}"
+        );
+        assert!(!matches!(
+            h.core.clients[&rid].phase,
+            client::Phase::AwaitingLog { .. }
+        ));
+    }
+
+    /// The replay drain does not take the delegate's own uncommitted row of
+    /// a queued rid for its outcome (D6): after a restart (the replay that
+    /// journaled the row was in flight, and is gone) the entry is the only
+    /// thing that carries the op, and the generation may end without the
+    /// row. It stays queued until the row commits.
+    #[test]
+    fn the_replay_drain_does_not_settle_an_entry_on_an_uncommitted_delegate_row() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        h.core.dl.mine.get_mut(&7).unwrap().backup = Some(4);
+        record_group(&mut h, dir, 2, 1, vec![4]);
+        let rid = h.rid(1);
+        let op = MutateOp::Create {
+            parent: dir,
+            name: "own1".into(),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: op.clone(),
+            tag: Default::default(),
+        });
+        assert!(client_answers(&out).is_empty(), "answered alone: {out:?}");
+        h.meta.queue_replay(rid, &op, &Default::default()).unwrap();
+        // The restart.
+        let cfg = h.core.cfg.clone();
+        h.core = Core::new(cfg);
+        h.core.lease.cached_holder = Some(1);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert_eq!(h.core.dl.mine[&7].group_backups, vec![4]);
+        let mut out = Vec::new();
+        h.core.on_drain_tick(h.clk(), &h.meta, &mut out);
+        assert!(
+            Replica::pending_replays(&h.meta)
+                .unwrap()
+                .iter()
+                .any(|q| q.rid == rid),
+            "forgotten on the delegate's own uncommitted row: {out:?}"
+        );
+    }
+
     /// The root journals the group a delegate asks for: `DelegGroup` at the
     /// next version when the request differs from the latest record, nothing
     /// when it is the same.

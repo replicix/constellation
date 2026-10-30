@@ -1246,12 +1246,7 @@ impl Core {
     /// delegate's index and assigns none here.
     fn own_journaled_gens(&self, replica: &dyn Replica) -> Vec<u64> {
         let mut gens: std::collections::BTreeSet<u64> = self.dl.mine.keys().copied().collect();
-        for tx in replica.journal_txs_from(0, usize::MAX) {
-            let (gen, _) = tx.origin;
-            if gen != 0 && !gens.contains(&gen) && replica.delegate_idx(gen) > 0 {
-                gens.insert(gen);
-            }
-        }
+        gens.extend(replica.journal_own_gens());
         gens.into_iter().collect()
     }
 
@@ -3272,7 +3267,7 @@ impl Core {
         // ops queued behind this acquisition run before the tenure's first
         // selection pass, and an unassessed tenure holds their
         // acknowledgements until it (`durable_jseq`).
-        self.ack.eligible = Some(!self.backup_candidates(now).is_empty());
+        self.ack.eligible = Some(self.backup_could_be_had(now));
         // Plan 30 §M9: a takeover of an unexpired lease (a seal, or
         // `ack=s3`) is what the permit allowed; the predecessor's
         // strict-read horizon becomes this tenure's acknowledgement floor

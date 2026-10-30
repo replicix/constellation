@@ -204,7 +204,14 @@ impl Core {
             if self.replay.in_flight.is_some() {
                 return;
             }
-            if let Some(outcome) = completed_as_outcome(replica, head.rid, 0) {
+            // Not settled by this delegate's own uncommitted row of the rid
+            // (D6): its generation may end without it, and the entry is
+            // then the only thing that carries the op (a restart lost the
+            // replay in flight that journaled the row). The drain submits
+            // it again; the dedup answers it when the row commits.
+            if let Some(outcome) = completed_as_outcome(replica, head.rid, 0)
+                .filter(|_| self.completed_row_settled(head.rid, replica))
+            {
                 self.replay.stuck_since = None;
                 if folded {
                     // Settled; a refusal of it is no conflict of its own.

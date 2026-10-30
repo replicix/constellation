@@ -326,6 +326,10 @@ pub trait Replica {
     /// The highest stream index this node assigned as the delegate of
     /// `gen`.
     fn delegate_idx(&self, gen: u64) -> u64;
+    /// The generations of this node's unshipped journal rows that it
+    /// assigned the stream indices of, as their delegate
+    /// (`Meta::journal_own_gens`); empty when it cannot be read.
+    fn journal_own_gens(&self) -> Vec<u64>;
     /// The highest stream index of `gen` this node, the delegate, journaled
     /// for its own node's client with a class that waits for the group
     /// (0: none).
@@ -1210,6 +1214,10 @@ impl Replica for Meta {
 
     fn delegate_idx(&self, gen: u64) -> u64 {
         Meta::delegate_idx(self, gen).unwrap_or(0)
+    }
+
+    fn journal_own_gens(&self) -> Vec<u64> {
+        Meta::journal_own_gens(self).unwrap_or_default()
     }
 
     fn delegate_gated_idx(&self, gen: u64) -> u64 {

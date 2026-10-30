@@ -2680,14 +2680,14 @@ impl Core {
             })
             .collect();
         for (rid, epoch, position) in waiting {
+            let Some(outcome) = completed_as_outcome(replica, rid, epoch) else {
+                continue;
+            };
             // Not from this delegate's own uncommitted row (D6): the log's
             // answer is still to come.
             if !self.completed_row_settled(rid, replica) {
                 continue;
             }
-            let Some(outcome) = completed_as_outcome(replica, rid, epoch) else {
-                continue;
-            };
             match position {
                 // Plan 30 §M6: normally already dominated by the applied
                 // position (the segment carrying the completion ships
@@ -2856,7 +2856,11 @@ impl Core {
             if self.own_replays_unsettled_ahead_of(replica, Some(rid)) {
                 continue;
             }
-            if let Some(outcome) = completed_as_outcome(replica, rid, epoch) {
+            // Not from this delegate's own uncommitted row (D6): the op
+            // asks the new holder, as one the log does not carry.
+            if let Some(outcome) = completed_as_outcome(replica, rid, epoch)
+                .filter(|_| self.completed_row_settled(rid, replica))
+            {
                 // Read from the log, as `answer_awaiting_log` does.
                 self.finish_as(
                     now,

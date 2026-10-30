@@ -61737,3 +61737,26 @@ the applied-log answer with the inbox guard alone).
 `cargo fmt --all --check`, `cargo clippy -p constellation-authority -p constellation-meta --all-targets -- -D warnings` clean.
 Lib tests: authority 782, meta 377 (no failures). `cargo test -p constellation-authority --release --test sim`: 284 passed
 (11 ignored).
+
+### Review follow-ups
+
+- **Two more answers from an uncommitted delegate row** (the D6 pattern of fix 5): `reroute_ended_epoch_waits` answered an
+  `AwaitingLog` op of an epoch the log had moved past from its `completed` row, claiming `Archive`, and the replay drain tick
+  forgot a queued entry whose rid's `completed` row was this delegate's own uncommitted one (after a restart, the entry is the only
+  thing that carries the op). Both now ask `completed_row_settled`
+  (`an_ended_epochs_wait_is_not_answered_from_an_uncommitted_delegate_row`,
+  `the_replay_drain_does_not_settle_an_entry_on_an_uncommitted_delegate_row`; each fails without its guard). The gate's local
+  replay (`replay_locally`) is left as it is: it runs inside this node's own takeover gate, where its own delegate rows were
+  stranded by the gate (a predecessor's tail to re-apply) or stay in the journal it now ships itself, after the generation's end
+  (whose cut, when this root was the delegate, is its own stream head).
+- The tenure's first assessment of whether a backup could be had (`acquire_won`) counts listed peers too
+  (`Core::backup_could_be_had`, shared with `backup_select`).
+- A stranded end's session void is lifted after its transaction commits (`Meta::stage_unvoid`, applied by `report_rolled_back`,
+  which the rebuild's swap now calls too); its persisted cut goes with the existing `retract_void_cut_tx`.
+- `own_journaled_gens` reads the journal's transaction heads only (`Meta::journal_own_gens`).
+
+Rebased onto main with the slow-lease fixes and their review follow-ups: fmt and clippy (`-p constellation-authority -p
+constellation-meta -p constellation-engine --all-targets -- -D warnings`) clean; lib tests authority 802, meta 378, engine 937 (no
+failures); the release sim suite 286 passed (11 ignored), the five pins among them. Seeds 0 to 999 of `long-backup`,
+`delegated-holder-cut` and `long-delegated-late-answers`, with and without the knob, against main: main fails 586 (`long-backup`)
+and 259 and 272 (`long-delegated-late-answers`) under the knob, the fixes nothing; nothing else fails on either.
