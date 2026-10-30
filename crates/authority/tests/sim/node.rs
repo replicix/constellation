@@ -29,6 +29,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
+/// The most S3 requests a core may have in flight before the run fails
+/// as a request loop (see `Driver::run`).
+const S3_IN_FLIGHT_BOUND: usize = 10_000;
+
 /// The event each node's driver is handling right now, for the stall
 /// watchdog (`AUTHORITY_SIM_WATCHDOG=1`): a `Core::handle` that never
 /// returns blocks the whole current-thread runtime, so only another OS
@@ -1884,6 +1888,25 @@ impl Driver {
                 *IN_FLIGHT.lock().unwrap() = Some((self.id, text, std::time::Instant::now()));
             }
             self.events_handled += 1;
+            // A core's S3 requests in flight stay bounded. A request loop
+            // (long-delegated-backup seed 1682: a lease read after every
+            // event, each answer issuing the next) grew them past 250,000
+            // while simulated time barely moved, and the run's memory past
+            // 6 GB; it fails the run here instead.
+            if self.events_handled.is_multiple_of(256) {
+                let in_flight = self
+                    .core
+                    .container_sizes()
+                    .into_iter()
+                    .find_map(|(k, n)| (k == "s3_in_flight").then_some(n))
+                    .unwrap_or(0);
+                assert!(
+                    in_flight <= S3_IN_FLIGHT_BOUND,
+                    "node {}: {in_flight} S3 requests in flight at t={} (a request loop)",
+                    self.id,
+                    now.wall.0
+                );
+            }
             if let Event::Peer {
                 from,
                 msg: PeerMsg::MutateRequest { req, rid, .. },

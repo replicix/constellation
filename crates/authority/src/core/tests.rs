@@ -45123,3 +45123,91 @@ fn a_claim_due_does_not_send_a_node_without_s3_to_the_lease_path() {
         "not forwarded to the holder: {out:?}"
     );
 }
+
+/// long-delegated-backup seed 1682: node 2, the delegate of generation 1,
+/// took the root lease over; its own lease named it (the takeover's gate
+/// waiting out a quarantine), so it knew no root to stream to. The
+/// streaming pass, after every event, read the lease for one, the read's
+/// answer an event too: a chain of reads per event, without end, its reads
+/// in flight past 250,000 in 11 simulated seconds and the run's memory
+/// past 6 GB.
+mod deleg_root_read {
+    use super::*;
+
+    #[test]
+    fn a_delegate_without_a_root_reads_the_lease_once_a_tick() {
+        let mut h = Harness::new(2);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let dir = h.meta.allocate_ino(ROOT_INO).unwrap();
+        crate::replica::Replica::apply_segment(
+            &h.meta,
+            1,
+            1,
+            0,
+            &[],
+            &[],
+            &[
+                LogRecord::Mkdir {
+                    parent: ROOT_INO,
+                    name: "d".into(),
+                    ino: dir,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 1,
+                },
+                LogRecord::Delegate {
+                    dir,
+                    node: 2,
+                    gen: 1,
+                    designated: false,
+                    range: (0, 0),
+                },
+            ],
+        )
+        .unwrap();
+        // The lease names this node: no root.
+        h.core.lease.cached_holder = Some(2);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.mine.contains_key(&1), "not installed: {out:?}");
+        assert_eq!(h.core.root_node(), None);
+        let body = lease_of(2, 2, h.now.0 + 60_000);
+        let reads = |out: &[Action]| -> Vec<OpId> {
+            s3_ops(out)
+                .into_iter()
+                .filter(|(_, r)| matches!(r, S3Op::LeaseGet))
+                .map(|(op, _)| op)
+                .collect()
+        };
+        let mut queue = reads(&out);
+        let mut issued = queue.len();
+        // 100 ms with an event every millisecond, every lease read answered
+        // within it: the lease names this node.
+        let ms = 100u64;
+        for _ in 0..ms {
+            h.advance(1);
+            let out = h.step(Event::Peers { links: Vec::new() });
+            queue.extend(reads(&out));
+            issued += reads(&out).len();
+            let mut answered = 0;
+            while let Some(op) = queue.pop() {
+                answered += 1;
+                assert!(answered < 10_000, "a chain of lease reads without end");
+                let out = h.step(Event::S3 {
+                    op,
+                    result: S3Result::LeaseGet(Ok(Some((body.clone(), tag())))),
+                });
+                issued += reads(&out).len();
+                queue.extend(reads(&out));
+            }
+        }
+        let tick = h.core.cfg.delegation_stream_tick_ms;
+        assert!(
+            issued as u64 <= ms / tick + 2,
+            "{issued} lease reads in {ms} ms (one a {tick} ms tick expected)"
+        );
+        assert_eq!(h.core.root_node(), None);
+    }
+}

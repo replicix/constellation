@@ -8129,10 +8129,18 @@ fn regression_long_delegated_seeds() {
 ///   delegate's backup rows with it; the delegate's backup answered
 ///   `acked=0` for good (contiguous from 1, and the delegate re-sends
 ///   only its unshipped suffix), 22k append round trips followed, and the
-///   delegate's client op waited 540 s for a segment no holder shipped.
+///   delegate's client op waited 540 s for a segment no holder shipped;
+/// - 1682: the delegate of a dead root's generation took the root lease
+///   over; its own lease named it while the takeover's gate waited, so it
+///   knew no root to stream to, and read the lease after every event, each
+///   answer issuing the next: S3 reads in flight past 250,000, simulated
+///   time stalled, the run's memory past 6 GB (now one read a stream tick;
+///   the driver's in-flight bound fails such a loop within seconds).
 #[test]
 fn regression_long_delegated_backup_seeds() {
-    for seed in [71_251, 71_792, 75_504, 78_172, 77_901, 74_035, 70_232] {
+    for seed in [
+        71_251, 71_792, 75_504, 78_172, 77_901, 74_035, 70_232, 1_682,
+    ] {
         run_m11(
             "long-delegated-backup",
             long_delegated_backup_config(),

@@ -559,6 +559,9 @@ pub(crate) struct DelegationState {
     /// `finish` is deferred to the parked continuation).
     pub pending_exec: BTreeSet<Rid>,
     stream_timer: Option<TimerId>,
+    /// When a delegate that knows no root may read the lease for it again
+    /// ([`Core::deleg_learn_root`]): once a stream tick.
+    root_read_after: Option<WaitMs>,
     /// The last table sync found this node a usable root (and so learned
     /// the generations the table names): see [`Core::deleg_root_sync_due`].
     root_synced: bool,
@@ -3114,6 +3117,27 @@ impl Core {
         renew_again
     }
 
+    /// A delegate that knows no root reads the lease for one, at most once
+    /// a stream tick: what retries (the stream tick, the renewal timer)
+    /// comes back at that pace. The streaming pass runs after every event,
+    /// the lease read's answer included, and a read issued from each was a
+    /// chain of reads that never ended while no answer named a root — one
+    /// more chain per event: a delegate that took the root lease over (its
+    /// own lease names it, the takeover's gate waits) read the lease
+    /// without pause, its reads in flight growing past 250,000 in 11
+    /// simulated seconds (long-delegated-backup seed 1682).
+    fn deleg_learn_root(&mut self, now: Now, out: &mut Vec<Action>) {
+        if self.dl.root_read_after.is_some_and(|t| now.wait < t) {
+            return;
+        }
+        self.dl.root_read_after = Some(now.wait.plus(self.cfg.delegation_stream_tick_ms.max(1)));
+        self.issue_s3(
+            crate::action::S3Op::LeaseGet,
+            super::S3For::RefreshHolder,
+            out,
+        );
+    }
+
     /// The late answer to `req` ([`LateReq`]), if it is one, of `kind`
     /// for `gen` from `from`.
     fn deleg_take_late(
@@ -3142,12 +3166,8 @@ impl Core {
             self.deleg_renew_now(now, gen, out);
         }
         let Some(root) = self.root_node() else {
-            // Learn the holder; the next event streams.
-            self.issue_s3(
-                crate::action::S3Op::LeaseGet,
-                super::S3For::RefreshHolder,
-                out,
-            );
+            // Learn the holder; the tick streams.
+            self.deleg_learn_root(now, out);
             self.arm_stream_tick(now, out);
             return;
         };
@@ -3501,11 +3521,7 @@ impl Core {
             // renewal of a grant installed from an S3 tail (no P2P
             // exchange with the root yet) must not be the last
             // (long-delegated seed 70067: never renewed, reclaimed).
-            self.issue_s3(
-                crate::action::S3Op::LeaseGet,
-                super::S3For::RefreshHolder,
-                out,
-            );
+            self.deleg_learn_root(now, out);
             if let Some(d) = self.dl.mine.get_mut(&gen) {
                 if d.renew_timer.is_none() && !d.stopped {
                     let t = self.set_timer_honour(

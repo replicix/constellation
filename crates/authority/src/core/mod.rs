@@ -1984,6 +1984,7 @@ impl Core {
             ("links", self.links.len()),
             ("inbox_pending", self.inbox.pending.len()),
             ("dw_slots", self.dw.len()),
+            ("s3_in_flight", self.s3.len()),
         ];
         v.extend(self.stream.container_sizes());
         v.extend(self.rd.container_sizes());
