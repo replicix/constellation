@@ -163,8 +163,13 @@ use std::sync::Mutex;
 const SHARDS: usize = 64;
 
 /// Handle arms kept per entry; past that, one overflow arm that completes
-/// when the inode's last handle is released.
-const MAX_OPEN_ARMS: usize = 4;
+/// when the inode's last handle is released. An overflow arm keeps every
+/// open of the inode dropping (rule 4) for as long as any handle of it is
+/// open, so the bound must exceed the dropping opens a workload answers in
+/// one burst: with 4, the six descriptors `pc_race` opens at its start left
+/// one for the whole run and no open kept the cache (plan 42 §8). An arm
+/// is 24 bytes and lives only until its handle's first request.
+const MAX_OPEN_ARMS: usize = 64;
 
 /// `CONSTELLATION_FUSE_KEEP_CACHE` (plan 42 §5.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1481,28 +1486,50 @@ mod tests {
         assert!(!t.open_reply(facts(2, S)), "no entry");
     }
 
-    /// Past four handle arms one overflow arm completes with the last
-    /// handle.
+    /// Past [`MAX_OPEN_ARMS`] handle arms one overflow arm completes with
+    /// the last handle.
     #[test]
     fn handle_arms_overflow_until_the_last_release() {
         let t = PageCacheTable::new(PageCacheConfig::default());
-        for fh in 1..=6 {
+        let n = MAX_OPEN_ARMS as u64;
+        for fh in 1..=n + 2 {
             assert!(!t.open_reply(facts(fh, S)));
         }
         t.with_entry(42, |e| {
             let e = e.unwrap();
-            assert_eq!(e.arms.len(), 5);
+            assert_eq!(e.arms.len(), MAX_OPEN_ARMS + 1);
             assert!(e.arms.contains(&Arm::OpenOverflow));
         });
-        for fh in 1..=5 {
+        for fh in 1..=n + 1 {
             t.handle_used(42, fh);
             t.released(42, fh, false);
         }
-        assert!(!t.open_reply(facts(7, S)), "the overflow arm lives");
-        t.released(42, 6, false);
-        t.handle_used(42, 7);
-        t.released(42, 7, false);
-        assert!(t.open_reply(facts(8, S)));
+        assert!(!t.open_reply(facts(n + 3, S)), "the overflow arm lives");
+        t.released(42, n + 2, false);
+        t.handle_used(42, n + 3);
+        t.released(42, n + 3, false);
+        assert!(t.open_reply(facts(n + 4, S)));
+    }
+
+    /// A burst of dropping opens — `pc_race`'s six descriptors, opened
+    /// before any of them is used — gets one arm each, so once each handle
+    /// has carried a request the next open keeps the cache while the six
+    /// stay open. (Fails with the bound at 4: the overflow arm lives until
+    /// the last of them is released, and every open drops meanwhile.)
+    #[test]
+    fn a_burst_of_six_dropping_opens_does_not_overflow() {
+        let t = PageCacheTable::new(PageCacheConfig::default());
+        for fh in 1..=6 {
+            assert!(!t.open_reply(OpenFacts {
+                write_access: fh <= 4,
+                ..facts(fh, S)
+            }));
+        }
+        for fh in 1..=6 {
+            t.handle_used(42, fh);
+        }
+        t.with_entry(42, |e| assert!(e.unwrap().arms.is_empty()));
+        assert!(t.open_reply(facts(7, S)), "every drop is complete");
     }
 
     /// The fault knob ignores an S5 mark and only that.
