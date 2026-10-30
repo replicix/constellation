@@ -474,6 +474,32 @@ impl EngineControl {
                         .collect(),
                     mine: v.mine.clone(),
                     gens: v.gens.clone(),
+                    waiting: v
+                        .waiting
+                        .iter()
+                        .map(|w| api::WaitingGenerationStatus {
+                            gen: w.gen,
+                            dir: w.dir,
+                            delegate: w.delegate,
+                            waited_ms: w.waited_ms,
+                            tail: w.tail.map(|(from, cursor, end)| api::TailInHandStatus {
+                                from,
+                                cursor,
+                                end,
+                            }),
+                            members: w
+                                .members
+                                .iter()
+                                .map(|m| api::WaitingMemberStatus {
+                                    node: m.node,
+                                    strict: m.strict,
+                                    asked_ms: m.asked_ms,
+                                    failed_ms: m.failed_ms,
+                                    answered_ms: m.answered_ms,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
                     executed: stats.deleg_executed,
                     fast_path_executed: core.delegation_fast_path_executed,
                     fast_path_routed: core.delegation_fast_path_routed,

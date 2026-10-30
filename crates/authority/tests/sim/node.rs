@@ -3634,16 +3634,19 @@ pub fn meta_holds_rid(meta: &Meta, rid: Rid) -> bool {
     // Plan 43 C2e: the tail a delegation's backup holds of a generation (the
     // generations of a run are few).
     if (1..=64u64).any(|gen| {
-        Replica::deleg_backup_tail(meta, gen).iter().any(|t| {
-            t.records.iter().any(|r| {
-                matches!(
-                    r,
-                    constellation_meta::LogRecord::Completed { rid: x }
-                        | constellation_meta::LogRecord::Refused { rid: x, .. }
-                        if *x == rid
-                )
+        Replica::deleg_backup_tail(meta, gen)
+            .unwrap_or_default()
+            .iter()
+            .any(|t| {
+                t.records.iter().any(|r| {
+                    matches!(
+                        r,
+                        constellation_meta::LogRecord::Completed { rid: x }
+                            | constellation_meta::LogRecord::Refused { rid: x, .. }
+                            if *x == rid
+                    )
+                })
             })
-        })
     }) {
         return true;
     }

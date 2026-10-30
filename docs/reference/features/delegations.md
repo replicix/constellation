@@ -755,9 +755,15 @@ designations create no delegation.
   and the writes under its subtree wait for it (the root recalls before it
   executes in a subtree; nothing is answered from the missing tail).
   `constellation status` shows `delegation.gens[].waiting_for_group` for the
-  generation (and prints the command below), `deleg_seal_waits` counts the
-  windows, and the log warns once a minute. The wait ends by itself as soon as
-  a member answers (it may be a restarted node: its disk holds the tail). If
+  generation and, under `delegation.waiting`, the members of its group with
+  when each was last asked, lost (transport) and heard from; `status` also
+  prints the command below. `deleg_seal_waits` counts the windows and the log
+  warns once a minute. The wait ends by itself as soon as a member answers
+  (it may be a restarted node: its disk holds the tail) or the delegate
+  renews (it is alive and holds every row it acknowledged; the seal is given
+  up and the grant goes on). A root that has just taken the lease learns the
+  generations from the delegation table, so the wait starts with the first
+  write after the claim (the simulation's end-of-run write does that). If
   the members are gone for good, the operator ends the generation:
 
   ```
@@ -766,13 +772,24 @@ designations create no delegation.
 
   Run it on the **root** (the node whose `status` lists the generation under
   `delegation.gens`; elsewhere it is refused), and only for a generation
-  that waits. It ends the generation at the root's cursor and journals
+  that waits. It is refused while a member's tail is in hand and not yet
+  appended (the group answered: it is not lost, and ending the generation
+  would drop the rows of that very tail). Weigh it by `delegation.waiting`:
+  a member heard from lately, or one whose transport is not failing, is not
+  gone. It ends the generation at the root's cursor and journals
   `GroupAbandoned { gen }` next to the `RecallCut`: the log records that the
   decision was an operator's. **Consequence:** every row the delegate
   answered through the group and the root never appended is lost — the
   clients were told it was committed. They are not replayed, and a delegate
   that comes back drops them (its recall strand). Use it only when no member
   can ever come back; wait for one if it can.
+- **A backup that says it holds nothing**: it is sealed, and the generation
+  ends at the root's cursor, because with write-all a member that holds
+  nothing proves nothing was acknowledged through the group. The exceptions
+  are storage faults on the backup (a read error is no answer at all: the
+  root asks again), a disk lost or re-provisioned under the same node id,
+  and a stream cleared by a generation's end that its delegate's disk
+  outlived; none is detected here.
 - **The delegate's backup is new or lost rows**: the delegate re-sends
   only what it has not seen in the log. The backup's acknowledgement
   covers every row it has from the log (its applied stream index), plus
@@ -908,10 +925,13 @@ writer whatever the share, and `MIN_OPS=0` drops the rate floor. See
 
 `constellation status` (JSON, under `delegation`) shows `enabled`, the
 table, `mine` (this node's generations, each row ending with the class its
-own clients' answers wait for: `lone`, `deleg-group`, `archive` or
-`non-stealable`), `gens` (as the root: `[dir, node, gen, cursor, until_ms,
-recall, ended, waiting_for_group]`; `waiting_for_group` says the generation
-cannot end for want of its group's tail, see "Failures"), `kinds`, `backups`, and
+own clients' answers wait for: `lone`, `deleg-group`, `root-group`, `archive` or
+`non-stealable`; the class the core last published to the fast path, so it can
+lag the next answer's by one core event), `gens` (as the root: `[dir, node, gen,
+cursor, until_ms, recall, ended, waiting_for_group]`; `waiting_for_group` says
+the generation cannot end for want of its group's tail, see "Failures"),
+`waiting` (the members of each such generation and when each was last asked,
+lost and heard from), `kinds`, `backups`, and
 `placement`: the busiest subtrees as `(dir, node, node_ops,
 subtree_ops)`. Counters include `executed`, `fast_path_executed`, `lapsed`,
 `fast_path_routed` (ops the root's fast path sent through the core because

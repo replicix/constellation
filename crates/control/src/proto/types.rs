@@ -248,6 +248,47 @@ pub struct DelegationStatus {
     pub range: String,
 }
 
+/// A delegation generation that cannot end for want of its group's tail
+/// (plan 43 C2e).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct WaitingGenerationStatus {
+    pub gen: u64,
+    /// The delegated directory's inode.
+    pub dir: u64,
+    /// The (silent) delegate.
+    pub delegate: u64,
+    /// How long the generation has waited, ms.
+    pub waited_ms: u64,
+    /// A member's tail is in hand and not appended to its end (a
+    /// dependency of one of its rows is not here yet): the node it came from,
+    /// the root's cursor, and where the tail runs to. Such a group is not
+    /// lost and is not abandoned.
+    pub tail: Option<TailInHandStatus>,
+    pub members: Vec<WaitingMemberStatus>,
+}
+
+/// See [`WaitingGenerationStatus::tail`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct TailInHandStatus {
+    pub from: u64,
+    pub cursor: u64,
+    pub end: u64,
+}
+
+/// One member of a waiting generation's group, as the root knows it; the
+/// times are ms ago, `null` for never.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct WaitingMemberStatus {
+    pub node: u64,
+    /// A member of the latest recorded group (the end waits for one of
+    /// these); otherwise only an older record named it.
+    pub strict: bool,
+    pub asked_ms: Option<u64>,
+    /// The last time the transport to it failed (down, or cut from the root).
+    pub failed_ms: Option<u64>,
+    pub answered_ms: Option<u64>,
+}
+
 /// Plan 30 §M11: this node's delegation state.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct DelegationReport {
@@ -268,6 +309,12 @@ pub struct DelegationReport {
     /// --gen` ends it (rows only that group held are lost).
     #[allow(clippy::type_complexity)]
     pub gens: Vec<(u64, u64, u64, u64, i64, String, bool, bool)>,
+    /// As the root: the generations that wait for their group's tail (the
+    /// `gens` rows with `waiting_for_group`), with what this root knows of
+    /// each member it asked to seal. Weigh `constellation repair
+    /// abandon-group --gen` by it: a member heard from lately is not gone.
+    #[serde(default)]
+    pub waiting: Vec<WaitingGenerationStatus>,
     pub executed: u64,
     /// Ops the FUSE fast path executed here as the delegate (not
     /// counted in `executed`, which is the core's).

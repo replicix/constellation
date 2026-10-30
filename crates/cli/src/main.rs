@@ -4150,20 +4150,51 @@ fn render_waiting_for_group(lease: &api::LeaseStatus) -> Option<String> {
 }
 
 /// The `status` lines for delegation generations that cannot end because no
-/// member of their group has handed over the tail (plan 43 C2e).
+/// member of their group has handed over the tail (plan 43 C2e): the
+/// members and when each was last asked, lost, or heard from, and the
+/// command (which loses rows) only for a group none of whose members has
+/// been heard from.
 fn render_waiting_generations(delegation: &api::DelegationReport) -> Vec<String> {
+    let ago = |t: Option<u64>| t.map_or("never".to_string(), |ms| format!("{} s ago", ms / 1000));
     delegation
-        .gens
+        .waiting
         .iter()
-        .filter(|g| g.7 && !g.6)
-        .map(|g| {
-            format!(
-                "delegation generation {} (directory inode {}, delegate node {}) cannot end: its \
-                 recorded backup has not handed over the tail; `constellation repair abandon-group \
-                 --gen {}` (on this node) ends it at index {}, and rows only that group held \
-                 are lost",
-                g.2, g.0, g.1, g.2, g.3
-            )
+        .map(|w| {
+            let members: Vec<String> = w
+                .members
+                .iter()
+                .map(|m| {
+                    format!(
+                        "node {}{} (asked {}, unreachable {}, answered {})",
+                        m.node,
+                        if m.strict { "" } else { ", older record" },
+                        ago(m.asked_ms),
+                        ago(m.failed_ms),
+                        ago(m.answered_ms)
+                    )
+                })
+                .collect();
+            let head = format!(
+                "delegation generation {} (directory inode {}, delegate node {}) cannot end ({} s): members {}",
+                w.gen,
+                w.dir,
+                w.delegate,
+                w.waited_ms / 1000,
+                members.join("; ")
+            );
+            match &w.tail {
+                Some(t) => format!(
+                    "{head}. Node {}'s tail is in hand and appended through {} of {}; it waits for a dependency in the log, \
+                     this group is not lost",
+                    t.from, t.cursor, t.end
+                ),
+                None => format!(
+                    "{head}. If every member is gone for good, `constellation repair abandon-group --gen {}` (on this node) \
+                     ends it at the root's cursor; rows only that group held, acknowledged to their clients, are lost. \
+                     A member that is reachable or was heard from lately is not gone",
+                    w.gen
+                ),
+            }
         })
         .collect()
 }
@@ -4854,14 +4885,41 @@ mod parse_byte_size_tests {
     #[test]
     fn status_line_names_the_waiting_generation() {
         let mut d = api::DelegationReport::default();
-        d.gens
-            .push((5, 2, 9, 41, 0, "Sealing".into(), false, false));
-        d.gens.push((6, 3, 10, 7, 0, "Sealing".into(), false, true));
-        d.gens.push((6, 3, 11, 7, 0, "None".into(), true, true));
+        assert!(render_waiting_generations(&d).is_empty());
+        d.waiting.push(api::WaitingGenerationStatus {
+            gen: 10,
+            dir: 6,
+            delegate: 3,
+            waited_ms: 61_000,
+            tail: None,
+            members: vec![api::WaitingMemberStatus {
+                node: 4,
+                strict: true,
+                asked_ms: Some(2_000),
+                failed_ms: Some(2_000),
+                answered_ms: None,
+            }],
+        });
+        d.waiting.push(api::WaitingGenerationStatus {
+            gen: 11,
+            dir: 7,
+            delegate: 3,
+            waited_ms: 5_000,
+            tail: Some(api::TailInHandStatus {
+                from: 4,
+                cursor: 3,
+                end: 9,
+            }),
+            members: Vec::new(),
+        });
         let lines = render_waiting_generations(&d);
-        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[0].contains("abandon-group --gen 10"), "{}", lines[0]);
-        assert!(lines[0].contains("index 7"), "{}", lines[0]);
+        assert!(lines[0].contains("answered never"), "{}", lines[0]);
+        assert!(lines[0].contains("unreachable 2 s ago"), "{}", lines[0]);
+        // A tail in hand is no lost group: no command offered.
+        assert!(!lines[1].contains("abandon-group"), "{}", lines[1]);
+        assert!(lines[1].contains("appended through 3 of 9"), "{}", lines[1]);
     }
 
     #[test]

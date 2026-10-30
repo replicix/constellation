@@ -473,6 +473,8 @@ impl Meta {
 
     /// Whether any transaction of `gen` is held here.
     pub fn deleg_backup_holds_any(&self, gen: u64) -> Result<bool, MetaError> {
+        #[cfg(any(test, feature = "test-util"))]
+        read_fault::check()?;
         let r = self.db.read_tx();
         let e = deleg_epoch(gen);
         let mut it = r.range(&self.backup_tail, tail_key(e, 0)..=tail_key(e, u64::MAX));
@@ -487,6 +489,8 @@ impl Meta {
 
     /// Every transaction held of generation `gen`, in index order.
     pub fn deleg_backup_tail(&self, gen: u64) -> Result<Vec<super::DelegateTx>, MetaError> {
+        #[cfg(any(test, feature = "test-util"))]
+        read_fault::check()?;
         let r = self.db.read_tx();
         let e = deleg_epoch(gen);
         let mut out = Vec::new();
@@ -527,6 +531,37 @@ impl Meta {
         }
         tx.commit()?;
         Ok(())
+    }
+}
+
+/// Tests only (`test-util`): fail this thread's next `n` reads of a
+/// delegation backup's holdings ([`Meta::deleg_backup_holds_any`],
+/// [`Meta::deleg_backup_tail`]) with an I/O error.
+#[cfg(any(test, feature = "test-util"))]
+pub fn fail_deleg_backup_reads_on_this_thread_for_tests(n: u32) {
+    read_fault::LEFT.with(|c| c.set(n));
+}
+
+#[cfg(any(test, feature = "test-util"))]
+mod read_fault {
+    use crate::MetaError;
+
+    thread_local! {
+        pub(super) static LEFT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn check() -> Result<(), MetaError> {
+        LEFT.with(|c| {
+            let n = c.get();
+            c.set(n.saturating_sub(1));
+            if n > 0 {
+                Err(MetaError::Io(std::io::Error::other(
+                    "injected backup read fault (testing only)",
+                )))
+            } else {
+                Ok(())
+            }
+        })
     }
 }
 

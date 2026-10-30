@@ -57042,7 +57042,9 @@ drain that stops short keeps the generation `Sealing`); this commit finishes the
 - **`sealed: false` from a strict member still ends the generation** (C2c's decision, kept; the spec says keep waiting):
   a backup chosen before the delegate appended anything holds nothing and has acknowledged nothing, and waiting for it
   would wedge an idle generation; with write-all, a member that holds nothing proves nothing was acknowledged through
-  the group.
+  the group. It can be wrong when a member says it holds nothing while rows were acknowledged through it: a storage read
+  error (fixed in the review round below: no answer), a disk lost or re-provisioned under the same node id, a delegate
+  stream cleared at a generation's end that the delegate's disk outlived. The last two are beyond what the root can see.
 - A transport failure of a strict seal still sends a generation that was `None` back to `None` (the delegate may be alive
   and renew; `seal_reqs`/`waiting_for_group` keep the facts) — the spec's "stays Sealing" would stop a live delegate whose
   backup alone is unreachable from the root.
@@ -57083,6 +57085,47 @@ re-blessed), `constellation` bin tests 94; release authority sim suite 280 passe
 ### Not done here
 
 The other families of the spec's 2,000-seed list (five ran at 1,000). C2f-C2h as before.
+
+### Review round (2026-10-30)
+
+Two integrity holes and four smaller ones found reviewing the commit, each with a test that fails with the change reverted
+(mutations of the code, debug):
+
+- **A late answer of a member the group no longer names ended the generation** (`a_late_answer_of_a_member_the_group_no_longer_names_ends_nothing`,
+  `a_group_record_forgets_the_seals_of_the_group_before_it`). The answer's strictness came from the request alone: a seal
+  failing at the transport sent the generation back to `None`, the delegate renewed and the root recorded another backup,
+  and the first backup's answer to an older request — still marked strict — ended the generation with its tail (or at the
+  cursor, "I hold nothing"), dropping rows acknowledged through the new backup. An answer is strict only while the
+  generation is `Sealing` and the member is in the latest group version; otherwise it is a best-effort member's (appended
+  while the generation ends, ending nothing), and a group record or the end of a seal forgets the strict requests.
+- **The operator's end of a generation could not be recovered after a crash** (`an_abandon_segment_is_recovered_as_this_nodes_own`):
+  own-segment recovery stripped every `GroupAbandoned` before matching the journal, but the delegation's
+  `GroupAbandoned { gen }` is a journal row (in the cut's transaction), so the segment no longer matched ("does not match
+  the journal"). Only the marker's `GroupAbandoned { gen: 0 }` is stripped now.
+- **A backup whose store cannot be read says nothing** (`a_backup_that_cannot_read_its_store_does_not_answer_a_seal`,
+  injected read error): `deleg_backup_holds_any` / `deleg_backup_tail` turned a read error into "holds nothing" /
+  an empty tail (since the seal path of 30f8d2a6). Both now return `None` and the backup does not answer.
+- **`abandon-group --gen` is refused while a member's tail is in hand** (`abandon_group_is_refused_while_a_tail_is_in_hand`)
+  and `status.delegation.waiting` lists, per waiting generation, its members with when each was last asked, lost at the
+  transport and heard from, and the tail in hand; the CLI line prints them and offers the command only without a tail. Not
+  as the review asked: the command is not refused when the generation is `None` between attempts (a transport failure of
+  the seal puts it there each window), because that is also what a dead group looks like and the escape would be unusable;
+  the operator is given the evidence instead.
+- **A returning delegate ends the wait** (`a_returning_delegate_ends_the_wait_for_its_group`): a renewal of the delegate while
+  the root waits (a window passed, no tail in hand) gives the seal up and grants, as a failed transport does. Before, the
+  renewal was refused for as long as the seal was outstanding: the delegate's return did not end the wait the docs said
+  it ends, and its disk held the rows.
+- The stalled tail is shared (`Arc`), not cloned per event or per expiry. Docs: `delegations.md` (the class list gains
+  `root-group` and says `mine[]`'s class is the published one; the wait starts with the first write after a claim; when a
+  backup may say "nothing"), `configuration.md`.
+
+Gates after the round (box 1): fmt, clippy `-D warnings`; lib tests authority 786, meta 377, engine 937, control 146 (schema
+re-blessed: `delegation.waiting`), `constellation` bin 94; release sim suite 280 passed / 11 ignored; both new configs 2,000
+seeds each, `delegated-backup` and `long-delegated-backup` 1,000 seeds each: 0 failing. The seven mutations of the round and
+the four of the first commit each fail their test.
+
+Sim: the two failures need a seal that fails and a group record in between; no configuration of this commit reaches it
+(the sim's backups die for good), the core tests drive it.
 
 ## Plan 43 C1-1 — The root group's commit holds across a listing and a removal
 

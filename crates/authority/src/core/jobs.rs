@@ -744,7 +744,10 @@ impl Core {
         );
         let seg = segment::decode(payload)?;
         if seg.node == self.cfg.node_id {
-            // (A marker's `TailFollows` is no journal row.)
+            // (A marker's `TailFollows` is no journal row; nor is its
+            // `GroupAbandoned` of the root group, `gen` 0. A delegation's
+            // `GroupAbandoned { gen }`, `gen` != 0, is: the operator's end
+            // of a generation is journaled with its cut, plan 43 C2e.)
             let rows: Vec<LogRecord> = seg
                 .records
                 .iter()
@@ -753,7 +756,7 @@ impl Core {
                         r,
                         LogRecord::TailFollows { .. }
                             | LogRecord::TailFollowsThrough { .. }
-                            | LogRecord::GroupAbandoned { .. }
+                            | LogRecord::GroupAbandoned { gen: 0, .. }
                     )
                 })
                 .cloned()
@@ -790,7 +793,7 @@ impl Core {
                     r,
                     LogRecord::TailFollows { .. }
                         | LogRecord::TailFollowsThrough { .. }
-                        | LogRecord::GroupAbandoned { .. }
+                        | LogRecord::GroupAbandoned { gen: 0, .. }
                 )
             }) {
                 if let Some(gate) = self.lease.gate.as_mut() {

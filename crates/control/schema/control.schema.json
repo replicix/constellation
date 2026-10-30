@@ -1907,6 +1907,14 @@
             "$ref": "#/$defs/DelegationStatus"
           },
           "type": "array"
+        },
+        "waiting": {
+          "default": [],
+          "description": "As the root: the generations that wait for their group's tail (the\n`gens` rows with `waiting_for_group`), with what this root knows of\neach member it asked to seal. Weigh `constellation repair\nabandon-group --gen` by it: a member heard from lately is not gone.",
+          "items": {
+            "$ref": "#/$defs/WaitingGenerationStatus"
+          },
+          "type": "array"
         }
       },
       "required": [
@@ -9767,6 +9775,32 @@
       ],
       "type": "object"
     },
+    "TailInHandStatus": {
+      "description": "See [`WaitingGenerationStatus::tail`].",
+      "properties": {
+        "cursor": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "end": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "from": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "from",
+        "cursor",
+        "end"
+      ],
+      "type": "object"
+    },
     "UnlockCredentials": {
       "description": "Runtime credentials for `fs.unlock` (plan 31 §9.8). Every field is a\n[`Secret`]; the daemon holds them in memory only.",
       "properties": {
@@ -10202,6 +10236,103 @@
         "epoch",
         "waited_ms",
         "sources"
+      ],
+      "type": "object"
+    },
+    "WaitingGenerationStatus": {
+      "description": "A delegation generation that cannot end for want of its group's tail\n(plan 43 C2e).",
+      "properties": {
+        "delegate": {
+          "description": "The (silent) delegate.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dir": {
+          "description": "The delegated directory's inode.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "gen": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "members": {
+          "items": {
+            "$ref": "#/$defs/WaitingMemberStatus"
+          },
+          "type": "array"
+        },
+        "tail": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TailInHandStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A member's tail is in hand and not appended to its end (a\ndependency of one of its rows is not here yet): the node it came from,\nthe root's cursor, and where the tail runs to. Such a group is not\nlost and is not abandoned."
+        },
+        "waited_ms": {
+          "description": "How long the generation has waited, ms.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "gen",
+        "dir",
+        "delegate",
+        "waited_ms",
+        "members"
+      ],
+      "type": "object"
+    },
+    "WaitingMemberStatus": {
+      "description": "One member of a waiting generation's group, as the root knows it; the\ntimes are ms ago, `null` for never.",
+      "properties": {
+        "answered_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "asked_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "failed_ms": {
+          "description": "The last time the transport to it failed (down, or cut from the root).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "node": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "strict": {
+          "description": "A member of the latest recorded group (the end waits for one of\nthese); otherwise only an older record named it.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "node",
+        "strict"
       ],
       "type": "object"
     },

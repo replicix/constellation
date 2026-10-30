@@ -40642,7 +40642,7 @@ mod deleg_windows_tests {
             _ => None,
         });
         assert_eq!(ack, Some((0, true)), "{out:?}");
-        assert!(!Replica::deleg_backup_holds_any(&h.meta, 7));
+        assert_eq!(Replica::deleg_backup_holds_any(&h.meta, 7), Some(false));
     }
 
     /// Plan 43 C2e (D8): a sealed tail the root cannot drain to its end — a
@@ -40879,6 +40879,347 @@ mod deleg_windows_tests {
         // Twice: it has ended.
         assert!(!ask(&mut h, 904, 0, 7));
         assert_eq!(h.core.stats.groups_abandoned, 1);
+    }
+
+    /// The seal request `to` was sent in `out`.
+    fn seal_to(out: &[Action], to: NodeId) -> Option<OpId> {
+        sends(out).iter().find_map(|(t, m)| match m {
+            PeerMsg::DelegSeal { req, .. } if *t == to => Some(*req),
+            _ => None,
+        })
+    }
+
+    fn tail_row(idx: u64) -> constellation_meta::DelegateTx {
+        constellation_meta::DelegateTx {
+            idx,
+            rid: None,
+            records: Vec::new(),
+            deps: constellation_meta::Position::ZERO,
+        }
+    }
+
+    /// Plan 43 C2e review: an answer to a seal of an earlier group ends
+    /// nothing. The seal asked of backup 4 is answered after a group record
+    /// named backup 5 instead (the transport failed, the delegate renewed
+    /// and asked for another backup): rows acknowledged through 5 are not
+    /// on 4, and the end by 4's tail — or by its "I hold nothing" — would
+    /// drop them. Such an answer is a best-effort member's: its rows are
+    /// appended, the generation stays `Sealing`.
+    #[test]
+    fn a_late_answer_of_a_member_the_group_no_longer_names_ends_nothing() {
+        let mut h = root_with_delegate_backed_by(4);
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        let r1 = seal_to(&out, 4).expect("seal");
+        {
+            let g = h.core.dl.gens.get_mut(&7).unwrap();
+            g.group.backups = vec![5];
+            g.group.named.insert(5);
+            // (A second request of the old group, still known.)
+            g.seal_reqs.insert(OpId(9001), (4, true));
+        }
+        h.core
+            .dl
+            .by_req
+            .insert(OpId(9001), (7, crate::core::delegate::ReqKind::Seal));
+        h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegSealed {
+                req: r1,
+                gen: 7,
+                sealed: true,
+                txs: vec![tail_row(1)],
+            },
+        });
+        assert!(
+            !h.core.dl.gens[&7].ended,
+            "ended by a backup the group no longer names"
+        );
+        assert_eq!(h.core.dl.gens[&7].recall, RecallPhase::Sealing);
+        assert_eq!(h.core.dl.gens[&7].cursor, 1, "its rows only add");
+        h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegSealed {
+                req: OpId(9001),
+                gen: 7,
+                sealed: false,
+                txs: Vec::new(),
+            },
+        });
+        assert!(
+            !h.core.dl.gens[&7].ended,
+            "'I hold nothing' of a backup the group no longer names ended it"
+        );
+        // The member the group names ends it.
+        let r5 = {
+            h.advance((h.core.cfg.forward_timeout_ms * 2).max(h.core.cfg.backup_takeover_ms) + 10);
+            let mut out = Vec::new();
+            h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+            seal_to(&out, 5).expect("the named member is asked")
+        };
+        h.step(Event::Peer {
+            from: 5,
+            msg: PeerMsg::DelegSealed {
+                req: r5,
+                gen: 7,
+                sealed: true,
+                txs: vec![tail_row(1), tail_row(2)],
+            },
+        });
+        assert!(h.core.dl.gens[&7].ended);
+        assert_eq!(h.core.dl.gens[&7].cursor, 2);
+    }
+
+    /// The same through the real sequence: a seal fails at the transport,
+    /// the delegate renews and the root records another backup; the first
+    /// seal's late answer is ignored.
+    #[test]
+    fn a_group_record_forgets_the_seals_of_the_group_before_it() {
+        let mut h = root_with_delegate_backed_by(4);
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        let r1 = seal_to(&out, 4).expect("seal");
+        h.step(Event::PeerFailed {
+            req: r1,
+            to: 4,
+            outage: false,
+        });
+        assert_eq!(h.core.dl.gens[&7].recall, RecallPhase::None);
+        assert!(h.core.dl.gens[&7].waiting_for_group);
+        // (A request of that seal the failure did not touch.)
+        h.core
+            .dl
+            .gens
+            .get_mut(&7)
+            .unwrap()
+            .seal_reqs
+            .insert(OpId(9002), (4, true));
+        // The delegate renews, asking for backup 5: the record is journaled.
+        h.advance(50);
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRenew {
+                req: OpId(40),
+                gen: 7,
+                round: 1,
+                backup: Some(5),
+                stream_head: 0,
+                stream_head_at: 0,
+                first: false,
+            },
+        });
+        assert_eq!(h.core.dl.gens[&7].group.backup(), Some(5));
+        assert!(
+            !h.core.dl.gens[&7]
+                .seal_reqs
+                .values()
+                .any(|(_, strict)| *strict),
+            "{:?}",
+            h.core.dl.gens[&7].seal_reqs
+        );
+    }
+
+    /// A strict member's tail in hand, not appendable yet: the group is
+    /// not lost and `abandon-group` is refused (it would end the generation
+    /// at the cursor and drop the rows of that very tail).
+    #[test]
+    fn abandon_group_is_refused_while_a_tail_is_in_hand() {
+        let mut h = root_with_delegate_backed_by(4);
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        let r1 = seal_to(&out, 4).expect("seal");
+        let mut unreachable = constellation_meta::Position::ZERO;
+        unreachable.streams.raise(99, 5);
+        let mut stuck = tail_row(2);
+        stuck.deps = unreachable;
+        h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegSealed {
+                req: r1,
+                gen: 7,
+                sealed: true,
+                txs: vec![tail_row(1), stuck],
+            },
+        });
+        assert!(!h.core.dl.gens[&7].ended);
+        h.core.dl.gens.get_mut(&7).unwrap().waiting_for_group = true;
+        let view = h.core.deleg_view();
+        assert_eq!(view.waiting.len(), 1);
+        assert_eq!(view.waiting[0].tail, Some((4, 1, 2)));
+        let out = h.step(Event::Control {
+            op: OpId(910),
+            req: Control::AbandonGroup { epoch: 0, gen: 7 },
+        });
+        let refused = out.iter().find_map(|a| match a {
+            Action::ControlDone {
+                op: OpId(910),
+                result: Err(why),
+            } => Some(why.clone()),
+            _ => None,
+        });
+        let why = refused.unwrap_or_else(|| panic!("not refused: {out:?}"));
+        assert!(why.contains("in hand"), "{why}");
+        assert!(!h.core.dl.gens[&7].ended);
+        assert_eq!(h.core.stats.groups_abandoned, 0);
+    }
+
+    /// What status says of a waiting generation: its members and when each
+    /// was asked and lost.
+    #[test]
+    fn a_waiting_generation_reports_its_members_to_the_operator() {
+        let mut h = root_with_delegate_backed_by(4);
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        let r1 = seal_to(&out, 4).expect("seal");
+        h.advance(1_500);
+        h.step(Event::PeerFailed {
+            req: r1,
+            to: 4,
+            outage: false,
+        });
+        h.advance(2_000);
+        h.step(Event::Slack { epoch_slack: 0 });
+        let view = h.core.deleg_view();
+        assert_eq!(view.waiting.len(), 1, "{:?}", view.waiting);
+        let w7 = &view.waiting[0];
+        assert_eq!((w7.gen, w7.delegate, w7.tail), (7, 3, None));
+        assert_eq!(w7.members.len(), 1);
+        let m = &w7.members[0];
+        assert!(m.strict && m.node == 4);
+        assert_eq!(m.answered_ms, None);
+        assert!(m.failed_ms.is_some_and(|ms| ms >= 2_000), "{m:?}");
+        assert!(m.asked_ms.is_some_and(|ms| ms >= 3_000), "{m:?}");
+    }
+
+    /// A delegate that renews while the root waits for its group is alive:
+    /// the wait is given up and the grant goes on (it used to be refused
+    /// as long as the seal was outstanding, a returning delegate waiting
+    /// as long as the backup was gone).
+    #[test]
+    fn a_returning_delegate_ends_the_wait_for_its_group() {
+        let mut h = root_with_delegate_backed_by(4);
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        h.advance((h.core.cfg.forward_timeout_ms * 2).max(h.core.cfg.backup_takeover_ms) + 10);
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        let g = &h.core.dl.gens[&7];
+        assert!(g.waiting_for_group && g.recall == RecallPhase::Sealing);
+        // The seal went out and nothing came back; the delegate is back.
+        let out = renew(&mut h, 41);
+        assert_eq!(granted(&out), Some(1_000), "refused: {out:?}");
+        let g = &h.core.dl.gens[&7];
+        assert!(!g.waiting_for_group);
+        assert_eq!(g.recall, RecallPhase::None);
+        assert!(g.seal_reqs.values().all(|(_, strict)| !*strict));
+        assert!(!g.ended);
+    }
+
+    /// A backup whose store cannot be read says nothing: "I hold nothing"
+    /// would end the generation at the root's cursor and an empty tail
+    /// drains to nothing, while rows acknowledged through it sit unread.
+    #[test]
+    fn a_backup_that_cannot_read_its_store_does_not_answer_a_seal() {
+        let mut h = Harness::new(4);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegBackupAppend {
+                req: OpId(12),
+                gen: 7,
+                txs: vec![tail_row(1)],
+            },
+        });
+        let seal = |h: &mut Harness, req: u64| {
+            h.step(Event::Peer {
+                from: 1,
+                msg: PeerMsg::DelegSeal {
+                    req: OpId(req),
+                    gen: 7,
+                },
+            })
+        };
+        let answered = |out: &[Action]| {
+            sends(out).iter().find_map(|(to, m)| match m {
+                PeerMsg::DelegSealed { sealed, txs, .. } if *to == 1 => Some((*sealed, txs.len())),
+                _ => None,
+            })
+        };
+        constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(1);
+        let out = seal(&mut h, 20);
+        constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(0);
+        assert_eq!(answered(&out), None, "{out:?}");
+        // The root asks again; the store reads: the tail is handed over.
+        let out = seal(&mut h, 21);
+        assert_eq!(answered(&out), Some((true, 1)), "{out:?}");
+        // A node that restarted holds its rows on disk and knows nothing of
+        // them in memory: what it holds is read from the store, and a read
+        // that fails is no "I hold nothing" either.
+        let mut h = Harness::new(4);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        Replica::deleg_backup_append(&h.meta, 7, &[tail_row(1)]);
+        constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(1);
+        let out = seal(&mut h, 30);
+        constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(0);
+        assert_eq!(answered(&out), None, "{out:?}");
+        let out = seal(&mut h, 31);
+        assert_eq!(answered(&out), Some((true, 1)), "{out:?}");
+    }
+
+    /// The journal row of an operator's end of a generation (`RecallCut`
+    /// and `GroupAbandoned { gen }`, one transaction) matches its own
+    /// segment when this node recovers it after a crash: only the epoch
+    /// marker's `GroupAbandoned { gen: 0 }` is no journal row.
+    #[test]
+    fn an_abandon_segment_is_recovered_as_this_nodes_own() {
+        let mut h = root_with_delegate_backed_by(4);
+        h.core.dl.gens.get_mut(&7).unwrap().cursor = 3;
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        h.advance((h.core.cfg.forward_timeout_ms * 2).max(h.core.cfg.backup_takeover_ms) + 10);
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        let out = h.step(Event::Control {
+            op: OpId(920),
+            req: Control::AbandonGroup { epoch: 0, gen: 7 },
+        });
+        assert!(
+            out.iter().any(|a| matches!(
+                a,
+                Action::ControlDone {
+                    op: OpId(920),
+                    result: Ok(_)
+                }
+            )),
+            "{out:?}"
+        );
+        // The root's whole journal, shipped as segment 1 and lost before
+        // its acknowledgement: it comes back from the log.
+        let batch = Replica::take_journal(&h.meta, 10_000).unwrap();
+        let records: Vec<_> = batch.iter().map(|(_, r)| r.clone()).collect();
+        let rows: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
+        assert!(
+            records
+                .iter()
+                .any(|r| matches!(r, LogRecord::GroupAbandoned { gen: 7, .. })),
+            "{records:?}"
+        );
+        let through = *rows.last().unwrap();
+        let payload = crate::segment::encode(1, 1, through, &rows, &[], &records).unwrap();
+        h.core.ship.next_seq = 1;
+        let mut out = Vec::new();
+        h.core
+            .apply_incoming(h.clk(), 1, &payload, &h.meta, &mut out)
+            .unwrap_or_else(|e| panic!("own segment not recovered: {e}"));
+        assert_eq!(h.core.stats.own_recovered, 1);
     }
 
     /// A generation without a recorded backup keeps the plain reclaim: the

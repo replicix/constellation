@@ -135,7 +135,7 @@ pub(crate) struct GenState {
     /// of a newer tenure, an append error, a root that may not end the
     /// recall now): kept, and drained again after every event, until the
     /// cursor reaches the end. The generation stays `Sealing` meanwhile.
-    pub sealed_tail: Option<SealedTail>,
+    pub sealed_tail: Option<std::sync::Arc<SealedTail>>,
     /// Plan 43 C2 (Q1): the generation cannot end: its latest `DelegGroup`
     /// record names a backup, which may hold acknowledged rows the root
     /// does not, and none has answered its seal with a tail drained to its
@@ -145,6 +145,11 @@ pub(crate) struct GenState {
     pub waiting_for_group: bool,
     /// The last WARN about the wait (once a minute).
     pub waiting_warned: Option<WaitMs>,
+    /// Since when the generation has been `waiting_for_group` (status).
+    pub waiting_since: Option<WaitMs>,
+    /// What this root knows of each member it asked to seal (status: the
+    /// operator weighs `abandon-group` by it).
+    pub member_notes: BTreeMap<NodeId, MemberNote>,
     /// Appended through this stream index.
     pub cursor: u64,
     // The window (`until`: the root outwaits the delegate once its **wait**
@@ -167,6 +172,15 @@ pub(crate) struct GenState {
     /// The delegate's renewal that waits for `read_recalls`, answered
     /// when the last of them is gone.
     pub renew_waiting: Option<(NodeId, OpId, u64, RenewFrom)>,
+}
+
+/// When the root last asked, lost the transport to, and heard from one
+/// member of a generation's group (wait clock).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MemberNote {
+    pub asked: Option<WaitMs>,
+    pub failed: Option<WaitMs>,
+    pub answered: Option<WaitMs>,
 }
 
 /// A sealed tail waiting to be drained (see [`GenState::sealed_tail`]).
@@ -453,7 +467,7 @@ pub(crate) enum RenewFrom {
 const LATE_ANSWER_MS: i64 = 60_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReqKind {
+pub(crate) enum ReqKind {
     Stream,
     Renew,
     Recall,
@@ -527,7 +541,7 @@ pub(crate) struct DelegationState {
     /// acked)`, and the ones it sealed.
     pub backing: BTreeMap<u64, (NodeId, u64)>,
     pub sealed: BTreeSet<u64>,
-    by_req: BTreeMap<OpId, (u64, ReqKind)>,
+    pub(crate) by_req: BTreeMap<OpId, (u64, ReqKind)>,
     /// Backup appends and renewals that `deleg_expire_inflight` stopped
     /// waiting for: their answer may still come, and is used when it does
     /// (`LateReq`).
@@ -572,6 +586,31 @@ pub(crate) struct ReleaseWait {
     pub bound_passed: bool,
 }
 
+/// One generation that waits for its group (plan 43 C2e, `status`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WaitingGenView {
+    pub gen: u64,
+    pub dir: Ino,
+    pub delegate: NodeId,
+    pub waited_ms: u64,
+    /// A strict member's tail is in hand but not appended to its end:
+    /// `(member, cursor, end)`.
+    pub tail: Option<(NodeId, u64, u64)>,
+    pub members: Vec<WaitingMemberView>,
+}
+
+/// What the root knows of one member it asked to seal, in ms ago on its
+/// wait clock (`None`: never).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WaitingMemberView {
+    pub node: NodeId,
+    /// Of the latest group version (the end waits for it).
+    pub strict: bool,
+    pub asked_ms: Option<u64>,
+    pub failed_ms: Option<u64>,
+    pub answered_ms: Option<u64>,
+}
+
 /// Plan 30 §M11's view for `status`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DelegView {
@@ -587,6 +626,10 @@ pub struct DelegView {
     /// no member of its group has handed over the tail (plan 43 C2e).
     #[allow(clippy::type_complexity)]
     pub gens: Vec<(Ino, NodeId, u64, u64, i64, String, bool, bool)>,
+    /// Plan 43 C2e: the generations that cannot end for want of their
+    /// group's tail, with what the root knows of each member (what
+    /// `abandon-group --gen` is weighed by).
+    pub waiting: Vec<WaitingGenView>,
     pub pending_exec: usize,
     /// Phase 2b: per generation held here, `(gen, backup, backup_acked)`.
     pub backups: Vec<(u64, NodeId, u64)>,
@@ -621,6 +664,40 @@ impl Core {
                 .gens
                 .iter()
                 .map(|(g, s)| (*g, format!("{:?}", s.kind), s.group.backup().unwrap_or(0)))
+                .collect(),
+            waiting: self
+                .dl
+                .gens
+                .iter()
+                .filter(|(_, g)| g.waiting_for_group && !g.ended)
+                .map(|(gen, g)| {
+                    let ago = |t: Option<WaitMs>| t.map(|t| self.clk.wait.since(t).max(0) as u64);
+                    let members = g
+                        .group
+                        .strict()
+                        .iter()
+                        .map(|n| (*n, true))
+                        .chain(g.group.best_effort().into_iter().map(|n| (n, false)))
+                        .map(|(node, strict)| {
+                            let note = g.member_notes.get(&node).cloned().unwrap_or_default();
+                            WaitingMemberView {
+                                node,
+                                strict,
+                                asked_ms: ago(note.asked),
+                                failed_ms: ago(note.failed),
+                                answered_ms: ago(note.answered),
+                            }
+                        })
+                        .collect();
+                    WaitingGenView {
+                        gen: *gen,
+                        dir: g.dir,
+                        delegate: g.node,
+                        waited_ms: ago(g.waiting_since).unwrap_or(0),
+                        tail: g.sealed_tail.as_ref().map(|t| (t.from, g.cursor, t.end)),
+                        members,
+                    }
+                })
                 .collect(),
             ..DelegView::default()
         };
@@ -965,6 +1042,8 @@ impl Core {
                         sealed_tail: None,
                         waiting_for_group: false,
                         waiting_warned: None,
+                        waiting_since: None,
+                        member_notes: BTreeMap::new(),
                         cursor,
                         recall: RecallPhase::None,
                         recall_before_seal: RecallPhase::None,
@@ -2276,7 +2355,18 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         self.note_foreign(now, replica, out);
-        let backing = self.dl.backing.contains_key(&gen) || replica.deleg_backup_holds_any(gen);
+        // A store that cannot be read is not a store that holds nothing:
+        // "I hold nothing" (`sealed: false`) ends the generation at the
+        // root's cursor, and an empty tail drains to nothing. Neither is
+        // said; no answer, and the root asks again (plan 43 C2e).
+        let backing = if self.dl.backing.contains_key(&gen) {
+            true
+        } else {
+            match replica.deleg_backup_holds_any(gen) {
+                Some(held) => held,
+                None => return,
+            }
+        };
         // Plan 43 C2: sealed whether or not it holds anything, persisted
         // (and synced) before it is answered. "I hold nothing" (`sealed:
         // false`) ends the generation at the root's cursor, so this node
@@ -2289,8 +2379,11 @@ impl Core {
         }
         self.dl.sealed.insert(gen);
         let txs = if backing {
+            let Some(tail) = replica.deleg_backup_tail(gen) else {
+                return;
+            };
             self.stats.deleg_backup_seals += 1;
-            replica.deleg_backup_tail(gen)
+            tail
         } else {
             Vec::new()
         };
@@ -2344,16 +2437,27 @@ impl Core {
         let Some(gs) = self.dl.gens.get_mut(&gen) else {
             return;
         };
-        let Some(&(member, strict)) = gs.seal_reqs.get(&req) else {
+        let Some(&(member, asked_strict)) = gs.seal_reqs.get(&req) else {
             return;
         };
-        if strict {
+        if asked_strict {
             gs.seal_reqs.remove(&req);
         }
         if gs.ended || member != from {
             return;
         }
+        gs.member_notes.entry(from).or_default().answered = Some(now.wait);
+        // Strict only if it still is: an answer to a request of an earlier
+        // seal (the transport failed and the generation went on, a group
+        // record named other backups since) is a best-effort member's. It
+        // ends nothing: the rows acknowledged through the group now in
+        // force are on that group's members, not necessarily on this one.
+        let strict =
+            asked_strict && gs.recall == RecallPhase::Sealing && gs.group.strict().contains(&from);
         if !strict {
+            if gs.recall != RecallPhase::Sealing {
+                return;
+            }
             // Its rows only add to what the root appends; a gap or a
             // missing dependency stops the drain and nothing waits.
             if sealed && self.root_ends_recall(now, gen) {
@@ -2384,7 +2488,7 @@ impl Core {
             },
         );
         if gs.sealed_tail.as_ref().is_none_or(|t| end > t.end) {
-            gs.sealed_tail = Some(SealedTail { from, txs, end });
+            gs.sealed_tail = Some(std::sync::Arc::new(SealedTail { from, txs, end }));
         }
         self.deleg_end_sealed(now, gen, from, true, replica, out);
     }
@@ -3175,9 +3279,15 @@ impl Core {
                 let mut warn = false;
                 if let Some(g) = self.dl.gens.get_mut(&gen) {
                     // (A best-effort member stays asked: once, not per window.)
+                    // (A request no longer known — a group record or the end of
+                    // the seal forgot it — changes nothing.)
+                    let member = g.seal_reqs.get(&req).map(|&(m, _)| m);
+                    if let Some(m) = member {
+                        g.member_notes.entry(m).or_default().failed = Some(now.wait);
+                    }
                     let strict_failed = match g.seal_reqs.get(&req) {
-                        Some(&(_, false)) => false,
-                        _ => {
+                        Some(&(_, false)) | None => false,
+                        Some(&(_, true)) => {
                             g.seal_reqs.remove(&req);
                             true
                         }
@@ -3192,8 +3302,12 @@ impl Core {
                         // The member is unreachable (down, or cut from this
                         // root): the generation cannot end without its tail,
                         // and says so, as when the seal goes unanswered.
+                        // The seals asked of the other strict members are of
+                        // the seal that is over.
+                        g.seal_reqs.retain(|_, (_, strict)| !*strict);
                         if !g.ended {
                             g.waiting_for_group = true;
+                            g.waiting_since.get_or_insert(now.wait);
                             warn = g
                                 .waiting_warned
                                 .is_none_or(|at| now.wait.since(at) >= 60_000);
@@ -3343,6 +3457,10 @@ impl Core {
             g.group.named.extend(backups.iter().copied());
             g.group.version = version;
             g.group.backups = backups;
+            // The seals asked for the group that was are of no use to this
+            // one: an answer to one must not end the generation by a member
+            // the rows are no longer acknowledged through.
+            g.seal_reqs.retain(|_, (_, strict)| !*strict);
         }
     }
 
@@ -3398,6 +3516,31 @@ impl Core {
             hold = self.renew_hold(now);
             let cap = self.grant_cap_ms(now);
             let extra = self.reclaim_horizon_ms() - self.cfg.delegation_ttl_ms;
+            // Plan 43 C2e: a delegate that renews while the root waits for its
+            // group's tail is alive, and holds every row it acknowledged on
+            // its own disk: the seal that waits is given up (as when its
+            // transport fails) and the grant goes on. Its backup may have
+            // been sealed meanwhile; the delegate then loses it and stops,
+            // and the next expiry asks again. Not while a tail is in hand.
+            let revive = self.dl.gens.get(&gen).is_some_and(|g| {
+                g.node == from
+                    && !g.ended
+                    && g.recall == RecallPhase::Sealing
+                    && g.waiting_for_group
+                    && g.sealed_tail.is_none()
+            });
+            if revive {
+                if let Some(g) = self.dl.gens.get_mut(&gen) {
+                    g.recall = match g.recall_before_seal {
+                        RecallPhase::Sealing => RecallPhase::None,
+                        before => before,
+                    };
+                    g.seal_reqs.retain(|_, (_, strict)| !*strict);
+                    if g.recall == RecallPhase::None {
+                        self.dw.reopen(gen);
+                    }
+                }
+            }
             if let Some(g) = self.dl.gens.get_mut(&gen) {
                 if g.node == from && !g.ended && g.recall == RecallPhase::None {
                     ttl_ms = self.cfg.delegation_ttl_ms.min(cap);
@@ -3405,6 +3548,7 @@ impl Core {
                         // The delegate is alive after all: nothing waits
                         // for its group's tail any more.
                         g.waiting_for_group = false;
+                        g.waiting_since = None;
                         // (A `max` in the shared window table: it commutes
                         // with any extension made off the core.)
                         self.dw
@@ -4967,8 +5111,10 @@ impl Core {
     fn deleg_send_seal(&mut self, gen: u64, member: NodeId, strict: bool, out: &mut Vec<Action>) {
         let req = self.op_id();
         self.dl.by_req.insert(req, (gen, ReqKind::Seal));
+        let now = self.clk.wait;
         if let Some(g) = self.dl.gens.get_mut(&gen) {
             g.seal_reqs.insert(req, (member, strict));
+            g.member_notes.entry(member).or_default().asked = Some(now);
         }
         self.stats.deleg_seals_sent += 1;
         out.push(Action::Send {
@@ -5107,6 +5253,7 @@ impl Core {
                 let warn = {
                     let gs = self.dl.gens.get_mut(&gen).expect("present");
                     gs.waiting_for_group = true;
+                    gs.waiting_since.get_or_insert(now.wait);
                     let due = gs
                         .waiting_warned
                         .is_none_or(|at| now.wait.since(at) >= 60_000);
@@ -5211,6 +5358,18 @@ impl Core {
             Some(g) if !g.waiting_for_group => Err(format!(
                 "generation {gen} is not waiting for its group (delegation.gens[].waiting_for_group)"
             )),
+            // A member answered: its tail is here, the group is not lost.
+            // The root appends it as its dependencies allow; ending the
+            // generation now would drop the rows past the cursor that the
+            // group acknowledged and that are in this very tail.
+            Some(g) if g.sealed_tail.is_some() => {
+                let t = g.sealed_tail.as_ref().expect("checked");
+                Err(format!(
+                    "node {}'s tail of generation {gen} is in hand (appended through {} of {}) and is appended as soon as its \
+                     dependencies are here; this group is not lost, so it is not abandoned (see delegation.waiting)",
+                    t.from, g.cursor, t.end
+                ))
+            }
             Some(_) if !self.root_ends_recall(now, gen) => Err(format!(
                 "this node cannot end generation {gen} now (it is not a usable root)"
             )),
@@ -5359,6 +5518,7 @@ impl Core {
         let first = !g.ended;
         g.ended = true;
         g.waiting_for_group = false;
+        g.waiting_since = None;
         g.sealed_tail = None;
         g.seal_reqs.clear();
         self.dw.close(gen);
@@ -5776,6 +5936,8 @@ impl Core {
                 sealed_tail: None,
                 waiting_for_group: false,
                 waiting_warned: None,
+                waiting_since: None,
+                member_notes: BTreeMap::new(),
                 cursor: 0,
                 recall: RecallPhase::None,
                 recall_before_seal: RecallPhase::None,
