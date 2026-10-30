@@ -259,6 +259,10 @@ pub struct WaitingGenerationStatus {
     pub delegate: u64,
     /// How long the generation has waited, ms.
     pub waited_ms: u64,
+    /// When the root last heard from the delegate, ms ago (a renewal, a
+    /// stream batch, a recall's answer, or any exchange on its link); `null`:
+    /// never.
+    pub delegate_heard_ms: Option<u64>,
     /// A member's tail is in hand and not appended to its end (a
     /// dependency of one of its rows is not here yet): the node it came from,
     /// the root's cursor, and where the tail runs to. Such a group is not
@@ -287,6 +291,9 @@ pub struct WaitingMemberStatus {
     /// The last time the transport to it failed (down, or cut from the root).
     pub failed_ms: Option<u64>,
     pub answered_ms: Option<u64>,
+    /// The last time the root heard from it at all: its seal's answer, or any
+    /// exchange on its link.
+    pub heard_ms: Option<u64>,
 }
 
 /// Plan 30 §M11: this node's delegation state.
@@ -3059,6 +3066,11 @@ pub struct AbandonGroupParams {
     pub epoch: u64,
     #[serde(default)]
     pub gen: u64,
+    /// A delegation's group even though the root heard from its delegate or
+    /// a strict member within `delegation_ttl_ms` (refused otherwise: such a
+    /// node may be alive and cut from the root only).
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// `node.logs.tail`: the most recent `lines` log lines, then (with

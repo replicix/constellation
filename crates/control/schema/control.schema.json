@@ -8,6 +8,11 @@
           "minimum": 0,
           "type": "integer"
         },
+        "force": {
+          "default": false,
+          "description": "A delegation's group even though the root heard from its delegate or\na strict member within `delegation_ttl_ms` (refused otherwise: such a\nnode may be alive and cut from the root only).",
+          "type": "boolean"
+        },
         "gen": {
           "default": 0,
           "format": "uint64",
@@ -10248,6 +10253,15 @@
           "minimum": 0,
           "type": "integer"
         },
+        "delegate_heard_ms": {
+          "description": "When the root last heard from the delegate, ms ago (a renewal, a\nstream batch, a recall's answer, or any exchange on its link); `null`:\nnever.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "dir": {
           "description": "The delegated directory's inode.",
           "format": "uint64",
@@ -10313,6 +10327,15 @@
         },
         "failed_ms": {
           "description": "The last time the transport to it failed (down, or cut from the root).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "heard_ms": {
+          "description": "The last time the root heard from it at all: its seal's answer, or any\nexchange on its link.",
           "format": "uint64",
           "minimum": 0,
           "type": [

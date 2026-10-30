@@ -3845,8 +3845,13 @@ impl Driver {
                     .store(true, Ordering::Relaxed);
                 control(Control::Reintegrate, ControlReply::Text(reply))
             }
-            SyncRequest::AbandonGroup { epoch, gen, reply } => control(
-                Control::AbandonGroup { epoch, gen },
+            SyncRequest::AbandonGroup {
+                epoch,
+                gen,
+                force,
+                reply,
+            } => control(
+                Control::AbandonGroup { epoch, gen, force },
                 ControlReply::Text(reply),
             ),
             SyncRequest::Leave { force, reply } => {

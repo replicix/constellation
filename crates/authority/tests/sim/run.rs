@@ -3830,6 +3830,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                             drop(n.control(constellation_authority::Control::AbandonGroup {
                                 epoch: w.epoch,
                                 gen: 0,
+                                force: false,
                             }));
                         }
                     }
@@ -3844,6 +3845,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                             drop(n.control(constellation_authority::Control::AbandonGroup {
                                 epoch: 0,
                                 gen: g.2,
+                                force: false,
                             }));
                         }
                     }

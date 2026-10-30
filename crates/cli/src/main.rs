@@ -592,6 +592,12 @@ enum RepairCommand {
         /// waiting for its group; run it on that status's node (the root).
         #[arg(long, conflicts_with = "epoch", required_unless_present = "epoch")]
         gen: Option<u64>,
+        /// With `--gen`: abandon the group although the root heard from its
+        /// delegate or a member within the delegation's ttl (refused
+        /// otherwise). Confirm from elsewhere that those nodes are down
+        /// first: a node cut from the root only may hold the rows.
+        #[arg(long, conflicts_with = "epoch")]
+        force: bool,
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
@@ -1905,6 +1911,7 @@ fn run() -> Result<()> {
                     target,
                     epoch,
                     gen,
+                    force,
                     state_dir,
                 },
         } => {
@@ -1915,6 +1922,7 @@ fn run() -> Result<()> {
                 api::AbandonGroupParams {
                     epoch: epoch.unwrap_or(0),
                     gen: gen.unwrap_or(0),
+                    force,
                 },
                 print_ack,
             )
@@ -4165,20 +4173,22 @@ fn render_waiting_generations(delegation: &api::DelegationReport) -> Vec<String>
                 .iter()
                 .map(|m| {
                     format!(
-                        "node {}{} (asked {}, unreachable {}, answered {})",
+                        "node {}{} (asked {}, unreachable {}, answered {}, heard {})",
                         m.node,
                         if m.strict { "" } else { ", older record" },
                         ago(m.asked_ms),
                         ago(m.failed_ms),
-                        ago(m.answered_ms)
+                        ago(m.answered_ms),
+                        ago(m.heard_ms)
                     )
                 })
                 .collect();
             let head = format!(
-                "delegation generation {} (directory inode {}, delegate node {}) cannot end ({} s): members {}",
+                "delegation generation {} (directory inode {}, delegate node {}, heard {}) cannot end ({} s): members {}",
                 w.gen,
                 w.dir,
                 w.delegate,
+                ago(w.delegate_heard_ms),
                 w.waited_ms / 1000,
                 members.join("; ")
             );
@@ -4191,7 +4201,9 @@ fn render_waiting_generations(delegation: &api::DelegationReport) -> Vec<String>
                 None => format!(
                     "{head}. If every member is gone for good, `constellation repair abandon-group --gen {}` (on this node) \
                      ends it at the root's cursor; rows only that group held, acknowledged to their clients, are lost. \
-                     A member that is reachable or was heard from lately is not gone",
+                     A node that is reachable or was heard from lately is not gone: confirm from another node that the \
+                     delegate and the members are down (it is refused, without --force, while one of them was heard from \
+                     within the delegation's ttl)",
                     w.gen
                 ),
             }
@@ -4873,10 +4885,21 @@ mod parse_byte_size_tests {
         }
         match parse(&["--gen", "2"]).unwrap().command {
             Command::Repair {
-                command: RepairCommand::AbandonGroup { epoch, gen, .. },
-            } => assert_eq!((epoch, gen), (None, Some(2))),
+                command:
+                    RepairCommand::AbandonGroup {
+                        epoch, gen, force, ..
+                    },
+            } => assert_eq!((epoch, gen, force), (None, Some(2), false)),
             _ => panic!("expected repair abandon-group"),
         }
+        match parse(&["--gen", "2", "--force"]).unwrap().command {
+            Command::Repair {
+                command: RepairCommand::AbandonGroup { gen, force, .. },
+            } => assert_eq!((gen, force), (Some(2), true)),
+            _ => panic!("expected repair abandon-group"),
+        }
+        // `--force` is for a delegation's group.
+        assert!(parse(&["--epoch", "7", "--force"]).is_err());
         // Exactly one of them: a lease claim's group or a delegation's.
         assert!(parse(&[]).is_err());
         assert!(parse(&["--epoch", "7", "--gen", "2"]).is_err());
@@ -4891,6 +4914,7 @@ mod parse_byte_size_tests {
             dir: 6,
             delegate: 3,
             waited_ms: 61_000,
+            delegate_heard_ms: Some(70_000),
             tail: None,
             members: vec![api::WaitingMemberStatus {
                 node: 4,
@@ -4898,6 +4922,7 @@ mod parse_byte_size_tests {
                 asked_ms: Some(2_000),
                 failed_ms: Some(2_000),
                 answered_ms: None,
+                heard_ms: None,
             }],
         });
         d.waiting.push(api::WaitingGenerationStatus {
@@ -4905,6 +4930,7 @@ mod parse_byte_size_tests {
             dir: 7,
             delegate: 3,
             waited_ms: 5_000,
+            delegate_heard_ms: None,
             tail: Some(api::TailInHandStatus {
                 from: 4,
                 cursor: 3,
@@ -4917,6 +4943,17 @@ mod parse_byte_size_tests {
         assert!(lines[0].contains("abandon-group --gen 10"), "{}", lines[0]);
         assert!(lines[0].contains("answered never"), "{}", lines[0]);
         assert!(lines[0].contains("unreachable 2 s ago"), "{}", lines[0]);
+        assert!(
+            lines[0].contains("delegate node 3, heard 70 s ago"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[0].contains("heard never"), "{}", lines[0]);
+        assert!(
+            lines[0].contains("confirm from another node"),
+            "{}",
+            lines[0]
+        );
         // A tail in hand is no lost group: no command offered.
         assert!(!lines[1].contains("abandon-group"), "{}", lines[1]);
         assert!(lines[1].contains("appended through 3 of 9"), "{}", lines[1]);

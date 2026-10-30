@@ -326,8 +326,11 @@ pub enum Control {
     /// at its cursor and journals `GroupAbandoned` (C2e)
     /// (`constellation repair abandon-group`). Answered with
     /// `ControlOk::Text`; refused unless a claim, or a generation, is
-    /// waiting for that group.
-    AbandonGroup { epoch: Epoch, gen: u64 },
+    /// waiting for that group. A generation's is also refused, unless
+    /// `force`, while this root has heard from its delegate or a strict
+    /// member of its group within `delegation_ttl_ms`: such a node may not be
+    /// gone.
+    AbandonGroup { epoch: Epoch, gen: u64, force: bool },
     /// Flush the journal, publish if the holder, release the lease, and
     /// answer — without stopping (`leave`).
     Flush,

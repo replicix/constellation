@@ -2876,8 +2876,8 @@ impl Core {
                 self.round_waiters.push((op, req));
                 self.nudge(now, out);
             }
-            Control::AbandonGroup { epoch, gen } => {
-                self.on_control_abandon_group(now, op, epoch, gen, replica, out)
+            Control::AbandonGroup { epoch, gen, force } => {
+                self.on_control_abandon_group(now, op, epoch, gen, force, replica, out)
             }
             Control::Reintegrate => {
                 if replica.lost_persisted() && !self.lease.lost {

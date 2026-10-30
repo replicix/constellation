@@ -61850,3 +61850,25 @@ written by the test): `(renewed, stopped)` was `(true, Some(false))`, and the re
 the install's check off, the same failure; with the grant not recorded, the test fails on the record (`None` where
 `Some(1)` was expected). Not modelled: the simulation's reboot keeps the journal, so no configuration loses its
 unsynced end. Its reboots do exercise the new path (a rebooted delegate's generation ends by its group).
+
+### 4. `repair abandon-group --gen` waits for proof that the group is gone
+
+Finding (C2e follow-up): `Core::on_control_abandon_generation` ended any waiting generation without a tail in hand.
+The only guard was the operator reading `status.delegation.waiting`, which named the members but not the delegate.
+A delegate or a member cut from the root only (a partition) may be alive and hold rows its clients were told are
+committed, and the abandon loses them.
+
+Fix: the root notes when it last heard from the delegate (`GenState::delegate_heard`: a renewal, a stream batch, a
+recall's answer). `status.delegation.waiting` shows it as `delegate_heard_ms` (also counting any exchange on the link,
+the driver's `PeerLink::last_seen`), and shows each member's `heard_ms` (its seal answer or any exchange on its link).
+The control (`Control::AbandonGroup { force }`, `lease.abandon_group`'s `force`, the CLI's `--force`, which requires
+`--gen`) is refused without `force` while the root heard from the delegate or a strict member within
+`delegation_ttl_ms`. The answer names the node and tells the operator to confirm from elsewhere that the nodes are
+down. delegations.md, configuration.md and durability-and-failover.md say so, and so do the `status` line and the CLI's
+help.
+
+Test: core `abandon_group_is_refused_while_the_group_was_heard_from_lately` (member 4 heard on its link 200 ms ago:
+refused, the view shows it, `force` ends the generation; heard longer than a ttl ago: no force needed). CLI: the parse
+of `--force` and the status line. Fail-before (the test without `force` and without the view on the item 3 commit): the
+abandon answered `Ok("generation 7 ended at index 0; ...")` with member 4 heard 200 ms earlier. Mutation (the refusal
+arm off): the same failure.

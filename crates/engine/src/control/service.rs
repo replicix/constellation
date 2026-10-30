@@ -482,6 +482,7 @@ impl EngineControl {
                             dir: w.dir,
                             delegate: w.delegate,
                             waited_ms: w.waited_ms,
+                            delegate_heard_ms: w.delegate_heard_ms,
                             tail: w.tail.map(|(from, cursor, end)| api::TailInHandStatus {
                                 from,
                                 cursor,
@@ -496,6 +497,7 @@ impl EngineControl {
                                     asked_ms: m.asked_ms,
                                     failed_ms: m.failed_ms,
                                     answered_ms: m.answered_ms,
+                                    heard_ms: m.heard_ms,
                                 })
                                 .collect(),
                         })
@@ -1127,10 +1129,16 @@ impl EngineControl {
         &self,
         epoch: u64,
         gen: u64,
+        force: bool,
     ) -> std::result::Result<String, String> {
         let (reply, receive) = tokio::sync::oneshot::channel();
         self.sync_tx
-            .send(sync::SyncRequest::AbandonGroup { epoch, gen, reply })
+            .send(sync::SyncRequest::AbandonGroup {
+                epoch,
+                gen,
+                force,
+                reply,
+            })
             .map_err(|_| "sync task is not running".to_string())?;
         tokio::task::block_in_place(|| {
             self.rt

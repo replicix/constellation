@@ -41619,6 +41619,81 @@ mod deleg_windows_tests {
         assert!(h.core.dl.gens[&7].ended, "{out:?}");
     }
 
+    /// C2e follow-up (fail-before): `abandon-group --gen` loses the rows only
+    /// the group held, and a node cut from the root only (the delegate, or a
+    /// member) may be alive and hold them. While this root has heard from
+    /// the delegate or a strict member within `delegation_ttl_ms` it is
+    /// refused without `--force`; `status` shows when the delegate was last
+    /// heard from, and each member's last exchange.
+    #[test]
+    fn abandon_group_is_refused_while_the_group_was_heard_from_lately() {
+        let mut h = root_with_delegate_backed_by(4);
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        h.advance((h.core.cfg.forward_timeout_ms * 2).max(h.core.cfg.backup_takeover_ms) + 10);
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        assert!(h.core.dl.gens[&7].waiting_for_group);
+        h.advance(h.core.cfg.delegation_ttl_ms + 1);
+        // Member 4 answered on its link 200 ms ago (the seal itself is lost).
+        let heard = WaitMs(h.clk().wait.0 - 200);
+        h.step(Event::Peers {
+            links: vec![crate::event::PeerLink {
+                node: 4,
+                connected: true,
+                last_seen: Some(heard),
+                rtt_ms: Some(1),
+                since: Some(heard),
+            }],
+        });
+        let ask = |h: &mut Harness, op: u64, force: bool| {
+            let out = h.step(Event::Control {
+                op: OpId(op),
+                req: Control::AbandonGroup {
+                    epoch: 0,
+                    gen: 7,
+                    force,
+                },
+            });
+            out.iter()
+                .find_map(|a| match a {
+                    Action::ControlDone { op: o, result } if *o == OpId(op) => Some(result.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no answer: {out:?}"))
+        };
+        let view = h.core.deleg_view();
+        let w7 = &view.waiting[0];
+        assert!(
+            w7.delegate_heard_ms
+                .is_some_and(|ms| ms > h.core.cfg.delegation_ttl_ms),
+            "{w7:?}"
+        );
+        assert_eq!(w7.members[0].heard_ms, Some(200), "{w7:?}");
+        let refused = ask(&mut h, 900, false);
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.contains("node 4") && e.contains("--force")),
+            "{refused:?}"
+        );
+        assert!(!h.core.dl.gens[&7].ended);
+        // Confirmed from elsewhere: forced.
+        assert!(ask(&mut h, 901, true).is_ok());
+        assert!(h.core.dl.gens[&7].ended);
+        // Heard from longer than a ttl ago: no force needed.
+        let mut h = root_with_delegate_backed_by(4);
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        h.advance((h.core.cfg.forward_timeout_ms * 2).max(h.core.cfg.backup_takeover_ms) + 10);
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        h.advance(h.core.cfg.delegation_ttl_ms + 1);
+        assert!(ask(&mut h, 902, false).is_ok());
+    }
+
     /// Plan 43 C2e (Q1): the escape. A generation that waits for its group
     /// is ended at the root's cursor by the operator's
     /// `abandon-group --gen`, which journals `GroupAbandoned` with the cut;
@@ -41630,7 +41705,11 @@ mod deleg_windows_tests {
         let ask = |h: &mut Harness, op: u64, epoch: u64, gen: u64| {
             let out = h.step(Event::Control {
                 op: OpId(op),
-                req: Control::AbandonGroup { epoch, gen },
+                req: Control::AbandonGroup {
+                    epoch,
+                    gen,
+                    force: false,
+                },
             });
             out.iter()
                 .find_map(|a| match a {
@@ -41854,7 +41933,11 @@ mod deleg_windows_tests {
         assert_eq!(view.waiting[0].tail, Some((4, 1, 2)));
         let out = h.step(Event::Control {
             op: OpId(910),
-            req: Control::AbandonGroup { epoch: 0, gen: 7 },
+            req: Control::AbandonGroup {
+                epoch: 0,
+                gen: 7,
+                force: false,
+            },
         });
         let refused = out.iter().find_map(|a| match a {
             Action::ControlDone {
@@ -42044,7 +42127,11 @@ mod deleg_windows_tests {
         h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
         let out = h.step(Event::Control {
             op: OpId(920),
-            req: Control::AbandonGroup { epoch: 0, gen: 7 },
+            req: Control::AbandonGroup {
+                epoch: 0,
+                gen: 7,
+                force: false,
+            },
         });
         assert!(
             out.iter().any(|a| matches!(
@@ -43008,7 +43095,11 @@ mod c1_tail_fetch {
         // The operator: the group is gone for good.
         let out = h.step(Event::Control {
             op: OpId(800),
-            req: Control::AbandonGroup { epoch: 1, gen: 0 },
+            req: Control::AbandonGroup {
+                epoch: 1,
+                gen: 0,
+                force: false,
+            },
         });
         assert!(
             out.iter().any(|a| matches!(
@@ -43082,7 +43173,11 @@ mod c1_tail_fetch {
         assert_eq!(seal_tails(&out).len(), 2);
         let out = h.step(Event::Control {
             op: OpId(800),
-            req: Control::AbandonGroup { epoch: 1, gen: 0 },
+            req: Control::AbandonGroup {
+                epoch: 1,
+                gen: 0,
+                force: false,
+            },
         });
         assert!(out.iter().any(|a| matches!(
             a,
@@ -43188,7 +43283,11 @@ mod c1_tail_fetch {
         };
         let out = h.step(Event::Control {
             op: OpId(800),
-            req: Control::AbandonGroup { epoch: 1, gen: 0 },
+            req: Control::AbandonGroup {
+                epoch: 1,
+                gen: 0,
+                force: false,
+            },
         });
         assert!(refused(&out), "{out:?}");
         // Waiting for epoch 1's group: another epoch is refused, and a
@@ -43197,12 +43296,20 @@ mod c1_tail_fetch {
         let (mut h, _) = claimant(3, &lease);
         let out = h.step(Event::Control {
             op: OpId(801),
-            req: Control::AbandonGroup { epoch: 2, gen: 0 },
+            req: Control::AbandonGroup {
+                epoch: 2,
+                gen: 0,
+                force: false,
+            },
         });
         assert!(refused(&out), "{out:?}");
         let out = h.step(Event::Control {
             op: OpId(802),
-            req: Control::AbandonGroup { epoch: 1, gen: 3 },
+            req: Control::AbandonGroup {
+                epoch: 1,
+                gen: 3,
+                force: false,
+            },
         });
         assert!(
             out.iter()

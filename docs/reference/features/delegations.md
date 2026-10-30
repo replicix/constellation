@@ -768,9 +768,11 @@ designations create no delegation.
   and the writes under its subtree wait for it (the root recalls before it
   executes in a subtree; nothing is answered from the missing tail).
   `constellation status` shows `delegation.gens[].waiting_for_group` for the
-  generation and, under `delegation.waiting`, the members of its group with
-  when each was last asked, lost (transport) and heard from; `status` also
-  prints the command below. `deleg_seal_waits` counts the windows and the log
+  generation and, under `delegation.waiting`, when the root last heard from
+  the delegate (`delegate_heard_ms`: a renewal, a stream batch, a recall's
+  answer, or any exchange on its link), and the members of its group with
+  when each was last asked, lost (transport), answered and heard from at all
+  (`heard_ms`); `status` also prints the command below. `deleg_seal_waits` counts the windows and the log
   warns once a minute. The wait ends by itself as soon as a member answers
   (it may be a restarted node: its disk holds the tail) or the delegate
   renews (it is alive and holds every row it acknowledged; the seal is given
@@ -788,9 +790,20 @@ designations create no delegation.
   `delegation.gens`; elsewhere it is refused), and only for a generation
   that waits. It is refused while a member's tail is in hand and not yet
   appended (the group answered: it is not lost, and ending the generation
-  would drop the rows of that very tail). Weigh it by `delegation.waiting`:
-  a member heard from lately, or one whose transport is not failing, is not
-  gone. It ends the generation at the root's cursor and journals
+  would drop the rows of that very tail). It is also refused while the root
+  has heard from the delegate or from a member of the latest group within
+  `CONSTELLATION_DELEGATION_TTL_MS`: such a node may be alive and cut from
+  the root only, holding rows its clients were told are committed. The root
+  alone cannot tell a dead node from a partitioned one, so **confirm from
+  elsewhere** (another node, the hosts themselves, your orchestration) that
+  the delegate and every member are down, then pass `--force`:
+
+  ```
+  constellation repair abandon-group TARGET --gen G --force
+  ```
+
+  Weigh it by `delegation.waiting` in any case: a member heard from lately,
+  or one whose transport is not failing, is not gone. It ends the generation at the root's cursor and journals
   `GroupAbandoned { gen }` next to the `RecallCut`: the log records that the
   decision was an operator's. **Consequence:** every row the delegate
   answered through the group and the root never appended is lost — the
@@ -1010,7 +1023,9 @@ over the tail the root needs to end the generation (see "Failures"). Writes
 under the subtree wait. Bring the delegate or its backup back (their disks
 hold the tail), or, if they are gone for good,
 `constellation repair abandon-group TARGET --gen G` on the root: rows only
-that group held are lost.
+that group held are lost. It is refused while the root heard from the delegate
+or a member within the delegation's ttl; confirm from another node that they
+are down, then add `--force`.
 
 ### The root lease never moves
 

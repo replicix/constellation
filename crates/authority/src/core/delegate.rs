@@ -150,6 +150,9 @@ pub(crate) struct GenState {
     /// What this root knows of each member it asked to seal (status: the
     /// operator weighs `abandon-group` by it).
     pub member_notes: BTreeMap<NodeId, MemberNote>,
+    /// When this root last heard from the delegate about this generation (a
+    /// renewal, a stream batch, a recall's answer), on its wait clock.
+    pub delegate_heard: Option<WaitMs>,
     /// Appended through this stream index.
     pub cursor: u64,
     // The window (`until`: the root outwaits the delegate once its **wait**
@@ -596,6 +599,9 @@ pub struct WaitingGenView {
     pub dir: Ino,
     pub delegate: NodeId,
     pub waited_ms: u64,
+    /// When this root last heard from the delegate, ms ago: a renewal, a
+    /// stream batch, or any exchange on its link (`None`: never).
+    pub delegate_heard_ms: Option<u64>,
     /// A strict member's tail is in hand but not appended to its end:
     /// `(member, cursor, end)`.
     pub tail: Option<(NodeId, u64, u64)>,
@@ -612,6 +618,9 @@ pub struct WaitingMemberView {
     pub asked_ms: Option<u64>,
     pub failed_ms: Option<u64>,
     pub answered_ms: Option<u64>,
+    /// When this root last heard from it at all: its seal's answer, or any
+    /// exchange on its link.
+    pub heard_ms: Option<u64>,
 }
 
 /// Plan 30 §M11's view for `status`.
@@ -689,6 +698,7 @@ impl Core {
                                 asked_ms: ago(note.asked),
                                 failed_ms: ago(note.failed),
                                 answered_ms: ago(note.answered),
+                                heard_ms: ago(self.deleg_member_heard(g, node)),
                             }
                         })
                         .collect();
@@ -697,6 +707,7 @@ impl Core {
                         dir: g.dir,
                         delegate: g.node,
                         waited_ms: ago(g.waiting_since).unwrap_or(0),
+                        delegate_heard_ms: ago(self.deleg_delegate_heard(g)),
                         tail: g.sealed_tail.as_ref().map(|t| (t.from, g.cursor, t.end)),
                         members,
                     }
@@ -1070,6 +1081,7 @@ impl Core {
                         waiting_warned: None,
                         waiting_since: None,
                         member_notes: BTreeMap::new(),
+                        delegate_heard: None,
                         cursor,
                         recall: RecallPhase::None,
                         recall_before_seal: RecallPhase::None,
@@ -3623,6 +3635,9 @@ impl Core {
         if from != self.me() {
             self.note_foreign(now, replica, out);
         }
+        if let Some(g) = self.dl.gens.get_mut(&gen).filter(|g| g.node == from) {
+            g.delegate_heard = Some(now.wait);
+        }
         if self.deleg_renew_waits_for_reads(now, from, req, gen, round, source, replica, out) {
             return;
         }
@@ -5476,6 +5491,7 @@ impl Core {
             return;
         };
         gs.recall_req = None;
+        gs.delegate_heard = Some(now.wait);
         if gs.recall == RecallPhase::Sent {
             gs.recall = RecallPhase::Drained(through);
         }
@@ -5507,15 +5523,22 @@ impl Core {
     /// (the audit), and the rows only the group held — acknowledged to
     /// their clients — are lost (the delegate's, if it comes back, are
     /// dropped by the recall's strand).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_control_abandon_generation(
         &mut self,
         now: Now,
         op: OpId,
         epoch: Epoch,
         gen: u64,
+        force: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        let heard = self
+            .dl
+            .gens
+            .get(&gen)
+            .and_then(|g| self.deleg_group_heard_lately(now, g));
         let result = match self.dl.gens.get(&gen) {
             _ if epoch != 0 => Err(
                 "a delegation's group is named by --gen alone (no --epoch)".to_string(),
@@ -5537,6 +5560,21 @@ impl Core {
                     "node {}'s tail of generation {gen} is in hand (appended through {} of {}) and is appended as soon as its \
                      dependencies are here; this group is not lost, so it is not abandoned (see delegation.waiting)",
                     t.from, g.cursor, t.end
+                ))
+            }
+            // The discriminator (C2e follow-up): a delegate or a strict
+            // member this root heard from within a grant's ttl may be alive
+            // and cut from it only; its tail, or the delegate's rows, are not
+            // lost. The operator confirms from elsewhere that the nodes are
+            // down, and forces.
+            Some(_) if !force && heard.is_some() => {
+                let (node, role, ago) = heard.expect("checked");
+                Err(format!(
+                    "this root heard from node {node} ({role} of generation {gen}) {ago} ms ago, within \
+                     delegation_ttl_ms ({} ms): it may be alive and cut from this node only, holding rows its \
+                     clients were told are committed. Confirm from elsewhere that the delegate and the members \
+                     of its group are down, then run the command again with --force",
+                    self.cfg.delegation_ttl_ms
                 ))
             }
             Some(_) if !self.root_ends_recall(now, gen) => Err(format!(
@@ -5566,6 +5604,50 @@ impl Core {
             }
         };
         out.push(Action::ControlDone { op, result });
+    }
+
+    /// When this root last heard from `node` on its link (any successful
+    /// exchange, the driver's directory).
+    fn link_heard(&self, node: NodeId) -> Option<WaitMs> {
+        self.links.get(&node).and_then(|l| l.last_seen)
+    }
+
+    /// When this root last heard from `g`'s delegate: a renewal, a stream
+    /// batch, a recall's answer, or any exchange on its link.
+    pub(crate) fn deleg_delegate_heard(&self, g: &GenState) -> Option<WaitMs> {
+        g.delegate_heard.max(self.link_heard(g.node))
+    }
+
+    /// When this root last heard from `member` of `g`'s group: its seal's
+    /// answer, or any exchange on its link.
+    pub(crate) fn deleg_member_heard(&self, g: &GenState, member: NodeId) -> Option<WaitMs> {
+        g.member_notes
+            .get(&member)
+            .and_then(|n| n.answered)
+            .max(self.link_heard(member))
+    }
+
+    /// Plan 43 C2e follow-up (`repair abandon-group` without `--force`): the
+    /// node of `g`'s group this root heard from within `delegation_ttl_ms`
+    /// most lately — the delegate, or a strict member — as `(node, role, ms
+    /// ago)`.
+    fn deleg_group_heard_lately(
+        &self,
+        now: Now,
+        g: &GenState,
+    ) -> Option<(NodeId, &'static str, u64)> {
+        let ago = |t: Option<WaitMs>| t.map(|t| now.wait.since(t).max(0) as u64);
+        std::iter::once((g.node, "the delegate", ago(self.deleg_delegate_heard(g))))
+            .chain(g.group.strict().iter().map(|m| {
+                (
+                    *m,
+                    "a member of its group",
+                    ago(self.deleg_member_heard(g, *m)),
+                )
+            }))
+            .filter_map(|(node, role, ago)| ago.map(|a| (node, role, a)))
+            .filter(|(_, _, a)| *a < self.cfg.delegation_ttl_ms)
+            .min_by_key(|(_, _, a)| *a)
     }
 
     /// End `gen` here and now: the `RecallCut` record journaled (the table
@@ -5793,6 +5875,9 @@ impl Core {
             self.stats.deleg_stream_refusals += 1;
             refuse(out, g.cursor);
             return;
+        }
+        if let Some(g) = self.dl.gens.get_mut(&gen) {
+            g.delegate_heard = Some(now.wait);
         }
         self.deleg_live_by_stream(now, gen);
         let g = self.dl.gens.get(&gen).expect("present");
@@ -6107,6 +6192,7 @@ impl Core {
                 waiting_warned: None,
                 waiting_since: None,
                 member_notes: BTreeMap::new(),
+                delegate_heard: None,
                 cursor: 0,
                 recall: RecallPhase::None,
                 recall_before_seal: RecallPhase::None,

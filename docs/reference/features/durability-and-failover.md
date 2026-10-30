@@ -1559,7 +1559,10 @@ generation of a silent delegate without the tail of its recorded backup
 shows `status.delegation.gens[].waiting_for_group`, and
 `constellation repair abandon-group myfs --gen G` (on the root) ends it at the
 root's cursor, with `GroupAbandoned` in the log and the same cost: rows only
-that group held are lost. See [Delegations](delegations.md#failures).
+that group held are lost. While the root has heard from the delegate or a
+member within the delegation's ttl, it is refused without `--force`: confirm
+from another node that they are down first. See
+[Delegations](delegations.md#failures).
 
 ### Writes got slower after a second node joined
 

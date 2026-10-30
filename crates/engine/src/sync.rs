@@ -554,6 +554,9 @@ pub enum SyncRequest {
     AbandonGroup {
         epoch: u64,
         gen: u64,
+        /// A delegation's group even though its delegate or a strict member
+        /// was heard from within `delegation_ttl_ms` (`--force`).
+        force: bool,
         reply: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
     /// Permanently leave the cluster (self). Flushes, tombstones the
