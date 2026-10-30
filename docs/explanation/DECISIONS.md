@@ -1866,8 +1866,8 @@ a handful of names).
 **Status**: decided by the maintainer 2026-10-22 (plan 45 §9, Q1–Q5, Q7);
 built (plan 45 H1–H4).
 
-**See**: [plan 45](../plans/v1/wip/45-hard-links.md) §4 and
-[§9](../plans/v1/wip/45-hard-links.md#9-decided-by-the-maintainer-2026-10-22);
+**See**: [plan 45](../plans/v1/done/45-hard-links.md) §4 and
+[§9](../plans/v1/done/45-hard-links.md#9-decided-by-the-maintainer-2026-10-22);
 plan 28 [§P6](../plans/v1/done/28-s3-native-metadata-store.md#p6--key-encoding-the-most-load-bearing-table-in-this-plan);
 `crates/mtree/src/record.rs` (`DentryRecord::for_inode`),
 `crates/meta/src/store/ns.rs` (`put_inode_record`),

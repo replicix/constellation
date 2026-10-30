@@ -274,7 +274,8 @@ under a timeout.
 - **H0 — Baseline.** Meta level (done locally, recorded in PROGRESS):
   `crates/meta/tests/hardlink_perf.rs`, an `#[ignore]`d release measurement
   of the research's scenario, run A/B/B/A against the binary built before H1.
-  Box (*pending, box*): `bench/hardlink/` (`run.sh`, `RESULTS.md`) through
+  Box (`bench/hardlink/`: `abba.sh`, `cell.py`, `summarize.py`, `README.md`,
+  `RESULTS.md`, done 2026-10-30) through
   dev-fuse on ext4, xfs, btrfs and tmpfs: `link()`/`unlink()` p50 at
   250/500/1,000/2,000/8,192 names; `chmod` and a 4 KiB `write`+`close` at
   *n* = 1 and 2,000; one `stress-ng --link 1 --link-ops 1` bogo-op's wall
@@ -378,7 +379,7 @@ under a timeout.
 | `a_listing_of_hard_linked_entries_reads_each_inode_once_per_entry` | a `recursive_size`/listing that re-reads per name |
 | replica convergence | a form decided by something other than `nlink` (e.g. the `0x04` count at write time) |
 
-## 7. Perf gates (meta level, release, A/B/B/A, local; four file systems *pending, box*)
+## 7. Perf gates (meta level, release, A/B/B/A, local; the box, four file systems)
 
 - `link()`/`unlink()` p50 at 2,000 names ≤ 1.5× the p50 at *n* = 1
   (today ~13×).
@@ -386,17 +387,43 @@ under a timeout.
 - nlink-1 `create`, `setattr`, `set_manifest`, `unlink`: within ±5 % of H0.
 - A warm listing of an nlink-1 directory (readdir plus a `lookup` per entry,
   what plus entries do) reads zero `0x01` records (`Meta::inode_reads`).
-- Box (*pending*): one `stress-ng link` bogo-op ≤ 5 s through dev-fuse,
-  `meta.db` ≤ 64 MB after it, remount ≤ 2 s; cold and warm `ls -la`,
-  `find`, `du` of the nlink-1 directory within noise of H0 on all four file
-  systems; pnpm-like and rsnapshot-like `ls -la` warm within 2× of H0, cold
-  reported, not gated; concurrent `create` p99 ≤ 1 ms during a link burst
-  (today 37 ms).
+- Box (measured 2026-10-30, `bench/hardlink/`, [RESULTS.md](../../../../bench/hardlink/RESULTS.md)):
+  one `stress-ng link` bogo-op ≤ 5 s through dev-fuse, `meta.db` ≤ 64 MB after
+  it, remount ≤ 2 s; cold and warm `ls -la`, `find`, `du` of the nlink-1
+  directory within noise of H0 on all four file systems (read against a build
+  that lists as H0 does, see the box result below); pnpm-like and
+  rsnapshot-like `ls -la` warm within 2× of H0, cold reported, not gated;
+  concurrent `create` p99 during a link burst **within 1.2× of the control, the
+  same burst with single-name creates and unlinks** (restated by the
+  maintainer on 2026-10-30; the first text said ≤ 1 ms, which the control
+  itself misses on ext4: 2.5 ms).
+
+**Box result (2026-10-30; the build of `ac897d7`, the baseline `1bc76d4`,
+A B B A on the quiet timing host; `bench/hardlink/RESULTS.md` has every
+number).** All gates hold on ext4, xfs, btrfs and tmpfs:
+
+| | baseline | now | gate |
+|---|---|---|---|
+| one `stress-ng link` bogo-op | 480-567 s | 1.1-2.0 s (max 2.6 s, btrfs) | 5 s |
+| `meta.db` after it | 159-176 MB, 2 journal files | 27-28 MB (max 29.9), 1 | 64 MB |
+| remount after `kill -9` | 2.1-2.8 s | 0.40-0.46 s (max 0.78 s; one 3.6 s on ext4 at host load 3.6, not reproduced in nine other runs) | 2 s |
+| `link`/`unlink` p50, 8,192 names against the first 100 | 170× | 1.1-1.4× | 1.5× |
+| concurrent `create` p99 during the links / the unlinks, against the control | 38-360× | 0.90-1.14× / 0.33-1.09× | 1.2× |
+| warm `ls -laR`, pnpm-like / rsnapshot-like tree | 1× | 0.57-0.73× / 0.56-0.61× | 2× |
+| listings of the 1,000-file nlink-1 directory, plain `readdir` (`CONSTELLATION_FUSE_READDIRPLUS=off`) | 1× | 0.84-1.00× | noise |
+
+With plus entries on (the default since plan 40, which landed after this
+plan's baseline commit) the same listings are 0.43-0.59× cold and 1.1-2.0×
+warm (1.5 ms more for 1,000 files: `readdirplus` fills the kernel's attribute
+cache that `du` never asked for); that difference is plan 40's, and a
+single-name listing under either dentry form reads no `0x01` record (the
+engine tests count it).
 
 ## 8. Exit criteria
 
 - [x] H0 baseline recorded at meta level (2026-10-22, PROGRESS "Meta level,
-      before and after"); the box numbers *pending*.
+      before and after") and at the box on all four file systems (2026-10-30,
+      `bench/hardlink/RESULTS.md`); every §7 gate holds.
 - [x] `DentryRecord` two forms, every reader, fsck `dentry_form` check, the
       form tests (H1).
 - [x] The rule and transitions in every writer, local and replay;
@@ -411,17 +438,19 @@ under a timeout.
 - [x] Docs and PROGRESS (H5): DESIGN.md §4 and ADR-36 checked against the code,
       the listing-cost table in `docs/reference/features/kernel-cache-coherence.md`,
       PROGRESS.
-- [ ] Every CONVENTIONS gate green; pjdfstest 8798/8798 (`link` and `unlink`
-      are in its suites). **Met so far (2026-10-29):** fmt, clippy, the meta,
-      mtree, authority (lib), harness (lib) and engine (lib) tests, pjdfstest
-      8798/8798, `harness smoke`, `harness run stress-ng-fs`. **Not run:** the
-      full `harness run` matrix, `tests/integration.sh`, and the authority
-      simulation suite in this round (in debug mode inside `cargo test
-      --workspace` it does not finish in an hour; it is a release-mode suite).
-      The plan also still has the box numbers of §7 (`bench/hardlink/`, which
-      was never written: the one-bogo-op `stress-ng link` wall time, remount
-      time, the pnpm-like and rsnapshot-like trees, `create` p99 during a
-      burst).
+- [x] Every CONVENTIONS gate green; pjdfstest 8798/8798 (`link` and `unlink`
+      are in its suites). 2026-10-29: fmt, clippy, the meta, mtree, authority
+      (lib), harness (lib) and engine (lib) tests, pjdfstest 8798/8798,
+      `harness smoke`, `harness run stress-ng-fs`. 2026-10-30, box 1: the
+      full `harness run` catalogue (seed 42, 294 scenarios; run in two parts
+      on the build of `ac897d7`, 116 and 178 scenarios, and six of the second
+      part failed there and were fixed on
+      `main` (takeover EIO and scenario assumptions, `fd5d7e30`, `6d53adde`),
+      all six and `hardlink-burst` pass on `main` at `f5d9c341`), and
+      `tests/integration.sh` (it first failed with `NoSuchBucket` on the box:
+      floci answers its health check before its init hook has created the
+      bucket and the box's `docker compose` stand-in did not wait for it; a
+      property of the stand-in, not of the product). The authority simulation suite (release, `--test sim`, box 1, `main` at `f5d9c341`): 286 passed, 0 failed, 11 ignored, 9,364 s.
 
 ## 9. Decided by the maintainer (2026-10-22)
 
@@ -448,10 +477,10 @@ day it was accepted:
 
 Open, decided by measurement or later:
 
-- Box numbers for the four file systems (H0, §7). If the pnpm-like warm
-  `ls -la` is beyond 2× the H0 number, the options are the research's
-  partial copy (c′) or a batched `0x01` read per page; neither is part of
-  this plan.
+- Box numbers for the four file systems (H0, §7): measured 2026-10-30. The
+  pnpm-like warm `ls -laR` is 0.57-0.73× the H0 number (gate 2×), so the
+  research's partial copy (c′) and a batched `0x01` read per page stay
+  unneeded.
 - A state directory written before this plan holds `Full` dentries on
   hard-linked inodes; it is rebuilt (accepted: no backward compatibility).
   fsck reports it as `dentry_form`.
@@ -503,7 +532,7 @@ purpose", "Gates"), with these rows:
 
 | Item | State | Where |
 |---|---|---|
-| Baseline (H0) | meta level landed, box pending | `crates/meta/tests/hardlink_perf.rs`; `bench/hardlink/` |
+| Baseline (H0) | landed (meta level 2026-10-22, box 2026-10-30) | `crates/meta/tests/hardlink_perf.rs`; `bench/hardlink/` |
 | Two dentry forms, every reader, fsck check (H1) | | `crates/mtree/src/record.rs`, `crates/meta/src/store/{ns,writes,reads,scratch}.rs`, `crates/engine/src/{mtree_read,snapwalk,snapshot,fsck}.rs` |
 | The rule and transitions (H2) | | `crates/meta/src/store/{ns,writes,misc,reads,scratch}.rs`, `crates/meta/src/replay.rs` |
 | Engine tests (H3) | | `crates/engine/src/{mtree_read,mtree_publish}.rs`, `view/vfs_tests.rs` |

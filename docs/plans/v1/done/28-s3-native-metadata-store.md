@@ -371,7 +371,7 @@ rules rather than cells:
   deltas.
 
   **Amended 2026-10-22 (plan 45,
-  `wip/45-hard-links.md`):** "`nlink` is 1 for all but a rounding error of
+  `done/45-hard-links.md`):** "`nlink` is 1 for all but a rounding error of
   files" is the premise, and it is the premise that fails for hard-linked
   inodes: with *n* names every `link`, `unlink`, `chmod` and write commit
   rewrote *n* copies (7.4 ms per `link()` at 2,000 names; one `stress-ng

@@ -57596,7 +57596,7 @@ also a gated answer of the rid (§6.6); the harness scenarios asserting `strande
 
 ## Plan 45 — Hard links: dentry attribute copies only for single-name inodes
 
-Plan 45 (`docs/plans/v1/wip/45-hard-links.md`) removes the O(n) cost of an
+Plan 45 (`docs/plans/v1/done/45-hard-links.md`) removes the O(n) cost of an
 inode's n names. Plan 28 §P6 gives every `0x02` dentry a copy of its inode's
 attributes and plan 29 M3c rewrites every copy on every `0x01` write, so
 `link`, `unlink`, `rename`, `chmod`, `utimes` and every write commit on an
@@ -57617,8 +57617,8 @@ measured, the four-file-system runs are pending.
 
 | Item | State | Where |
 |---|---|---|
-| Plan document, plan 28 §P6 note, index | landed | `docs/plans/v1/wip/45-hard-links.md`, `README.md`, `done/28-…` |
-| Baseline (H0) | meta level landed (numbers under Gates); box pending | `crates/meta/tests/hardlink_perf.rs`; box: `bench/hardlink/` |
+| Plan document, plan 28 §P6 note, index | landed | `docs/plans/v1/done/45-hard-links.md`, `README.md`, `done/28-…` |
+| Baseline (H0) | landed: meta level 2026-10-22, box 2026-10-30 | `crates/meta/tests/hardlink_perf.rs`; box: `bench/hardlink/` |
 | Two dentry forms, every reader, fsck check (H1) | landed | `crates/mtree/src/record.rs`, `crates/meta/src/store/{ns,writes,reads,scratch}.rs`, `crates/engine/src/{mtree_read,snapwalk,snapshot,fsck}.rs` |
 | The rule and transitions (H2) | landed | `crates/meta/src/store/{ns,writes,misc,reads,scratch}.rs`, `crates/meta/src/replay.rs` |
 | Engine tests (H3) | landed | `crates/engine/src/{mtree_read,mtree_publish}.rs`, `crates/engine/src/view/vfs_tests.rs` |
@@ -58847,6 +58847,49 @@ pass (376 library tests, 9 ignored), `constellation-mtree` 74, `constellation-au
 failed in full runs on the workstation passed); no FAILED or panicked in any log.
 pjdfstest (the `compliance` suite, built from this tree, floci S3, `/dev/fuse`): **8798
 passed, 0 failed**, baseline empty. `harness smoke` passed; `harness run stress-ng-fs` PASSED (140.7 s, no stressor outside `tests/stress-ng-baseline.txt`); `hardlink-burst` also passed on box 1 under a host load of about 30 (a fourth run: 8,192 links in 5.9 s, last 1,024 averaging 5.3 times the first, `meta.db` 13.7 MB at the top on A and 22.8 MB at the bottom). The full `harness run` matrix and `tests/integration.sh` were not run for this plan: nothing outside the metadata store's dentry writers and the new scenario changed since the plan's earlier gates.
+
+### Plan 45: the box numbers and the close (2026-10-30)
+
+**`bench/hardlink/`** (`cell.py`, `abba.sh`, `summarize.py`, `README.md`, `RESULTS.md`,
+`tables.md`): one cell is one binary on one backing file system through a plain
+`/dev/fuse` mount; the phases are one `stress-ng link` bogo-op (wall, `meta.db`,
+remount after `kill -9`), a burst of 8,192 links and unlinks with a concurrent
+`create` loop and its control (the same burst with single-name creates and unlinks),
+and cold and warm listings of a 1,000-file nlink-1 directory, a pnpm-like and an
+rsnapshot-like tree. The baseline (`1bc76d4`) and the build of `ac897d7` ran A B B A
+on the quiet timing host on ext4, xfs, btrfs and tmpfs.
+
+**Every box gate holds on all four.** The bogo-op takes 1.1 to 2.0 s (480 to 567 s on
+the baseline; gate 5 s), `meta.db` after it 27 to 28 MB (159 to 176 MB; gate 64 MB),
+the remount after `kill -9` 0.40 to 0.46 s (2.1 to 2.8 s; gate 2 s), `link` and
+`unlink` p50 at 8,192 names 1.1 to 1.4 times the first hundred's (the baseline's grew
+170 times), the pnpm-like and rsnapshot-like warm `ls -laR` 0.57 to 0.73 and 0.56 to
+0.61 of the baseline's (gate 2).
+
+- **The `create` p99 gate was restated** (maintainer, 2026-10-30) from an absolute
+  1 ms to 1.2 times the control: the control burst already puts a concurrent
+  `create`'s p99 at 2.5 ms on ext4. During the link burst it is 0.90 to 1.14 times
+  the control's, during the unlinks 0.33 to 1.09; the baseline's was 38 to 360 times.
+- **Listings against H0.** With plus entries (plan 40, after the baseline) a warm
+  `ls -la`, `find`, `du` of the nlink-1 directory are 1.1, 1.4 to 1.6 and 1.7 to 2.0
+  times H0's (1.5 ms more per 1,000 files) and the cold ones 0.4 to 0.6; with
+  `CONSTELLATION_FUSE_READDIRPLUS=off` (the baseline's `readdir`) all are within
+  0.84 to 1.00, so the difference is plan 40's, not plan 45's.
+- **One outlier:** a remount after `kill -9` on ext4 took 3.6 s at a host load of 3.6;
+  nine other ext4 runs took 0.41 to 0.71 s.
+- **Harness fixes found on the way:** `cell.py` repeats `rm -rf` of a phase's
+  directory (a closing daemon of the phase before can recreate files in it on tmpfs).
+
+**Gates (2026-10-30, box 1, `TMPDIR` on ext4, `main` at `f5d9c341`).** The six
+scenarios that failed in the first run of the catalogue (`holder-crash-phantom-shadow`,
+`holder-crash-phantom-new-holder`, `takeover-marker-strands-promptly`,
+`session-ryw-after-holder-kill`, `session-wait-degrades`, `lock-grace-wait`; fixed on
+`main` by `fd5d7e30` and `6d53adde`) and `hardlink-burst` pass; with the 116 scenarios
+of the first run and the other 172 of the second (178 in all, these six failed in it)
+that passed, the full catalogue (294) has passed. `tests/integration.sh` passed once the box's `docker compose` stand-in
+waited for floci's init hook (floci answers its health check before the hook has
+created the bucket, hence the earlier `NoSuchBucket`: the stand-in's, not the
+product's). The authority simulation suite (release, `--test sim`, box 1, `main` at `f5d9c341`): 286 passed, 0 failed, 11 ignored, 9,364 s.
 
 ## Plan 40 — FUSE READDIRPLUS and name-ordered listings
 
