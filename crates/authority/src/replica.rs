@@ -367,9 +367,6 @@ pub trait Replica {
     /// journal still holds, their end not yet applied from the log
     /// (`Meta::deleg_gens_awaiting_end`). `None`: unreadable.
     fn deleg_gens_awaiting_end(&self, live: &std::collections::BTreeSet<u64>) -> Option<Vec<u64>>;
-    /// Put every commit so far on the disk (`Meta::sync`); `false`: the
-    /// sync failed.
-    fn sync_journal(&self) -> bool;
     /// The `deps` of this delegate's journaled transactions of `gen` from
     /// index `from` on (`Meta::delegate_deps_from`); `None`: unreadable.
     fn delegate_deps_from(&self, gen: u64, from: u64) -> Option<Vec<(u64, Position)>>;
@@ -1326,16 +1323,6 @@ impl Replica for Meta {
         Meta::delegate_deps_from(self, gen, from)
             .map_err(|error| tracing::warn!(%error, gen, "reading a stream's dependencies failed"))
             .ok()
-    }
-
-    fn sync_journal(&self) -> bool {
-        match Meta::sync(self) {
-            Ok(()) => true,
-            Err(error) => {
-                tracing::warn!(%error, "syncing the store failed");
-                false
-            }
-        }
     }
 
     fn deleg_gens_awaiting_end(&self, live: &std::collections::BTreeSet<u64>) -> Option<Vec<u64>> {

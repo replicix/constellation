@@ -422,6 +422,10 @@ pub struct DelegationReport {
     pub lost_deps_stopped: u64,
     pub append_deps_lost: u64,
     pub drain_deps_waits: u64,
+    /// A designee's journal syncs before its stream sends rows (off the
+    /// core), and those that failed (the stream waits and asks again).
+    pub designee_syncs: u64,
+    pub designee_sync_failures: u64,
     pub backup_persisted: u64,
     pub backup_seals: u64,
     pub place_evaluations: u64,

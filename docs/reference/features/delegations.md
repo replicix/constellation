@@ -766,8 +766,10 @@ the disk, so a power loss can drop the end of its journal. Nothing ends
 the designation then (it renews nothing and the root never reclaims it):
 after the reboot the designee journals on from what its disk kept. Its
 stream therefore sends a row only once a sync has put it on the disk (one
-sync per batch that holds rows no sync covered yet,
-`deleg_designee_syncs`), so the root's cursor never passes what a restart
+sync per batch that holds rows no sync covered yet, a full flush of the
+store done off the core thread; `status.delegation.designee_syncs`, and
+`designee_sync_failures` for a sync that failed, after which the stream
+backs off and asks again), so the root's cursor never passes what a restart
 finds, and the next rows never take an index the root already appended
 (the root skips an index at or below its cursor as appended: the log and
 the designee would part). Rows lost before they streamed are lost as a

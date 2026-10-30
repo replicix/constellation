@@ -557,6 +557,8 @@ impl EngineControl {
                     lost_deps_stopped: stats.deleg_lost_deps_stopped,
                     append_deps_lost: stats.deleg_append_deps_lost,
                     drain_deps_waits: stats.deleg_drain_deps_waits,
+                    designee_syncs: stats.deleg_designee_syncs,
+                    designee_sync_failures: stats.deleg_designee_sync_failures,
                     backup_persisted: stats.deleg_backup_persisted,
                     backup_seals: stats.deleg_backup_seals,
                     place_evaluations: stats.place_evaluations,

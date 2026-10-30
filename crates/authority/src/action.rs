@@ -137,6 +137,12 @@ pub enum Action {
     /// action is internal, never serialised); the store stamps it with the
     /// boot.
     PersistLockHorizon { until: WaitMs },
+    /// A designee's stream sends a row only once its disk holds it: sync
+    /// the store (`Meta::sync`) off the core, then report
+    /// `Event::DelegStreamSynced`. Every row of `gen` through `through`
+    /// was committed before the action was issued. At most one is in
+    /// flight per generation.
+    SyncDelegStream { gen: u64, through: u64 },
     /// A sync round finished (`failed` says how), for the driver's spool
     /// counters, pin refresh and continuation-epoch bookkeeping.
     RoundDone { failed: Option<String> },

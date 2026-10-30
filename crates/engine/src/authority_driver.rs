@@ -253,6 +253,7 @@ fn event_kind(event: &Event) -> &'static str {
         Event::RebuildDone { .. } => "RebuildDone",
         Event::LockFlushed { .. } => "LockFlushed",
         Event::LockHorizonPersisted { .. } => "LockHorizonPersisted",
+        Event::DelegStreamSynced { .. } => "DelegStreamSynced",
         Event::Roster { .. } => "Roster",
         Event::Slack { .. } => "Slack",
         Event::Peers { .. } => "Peers",
@@ -308,6 +309,7 @@ fn action_kind(action: &Action) -> &'static str {
         Action::RebuildReplica { .. } => "RebuildReplica",
         Action::LockFlush { .. } => "LockFlush",
         Action::PersistLockHorizon { .. } => "PersistLockHorizon",
+        Action::SyncDelegStream { .. } => "SyncDelegStream",
         Action::RoundDone { .. } => "RoundDone",
         Action::RefreshRoster => "RefreshRoster",
         Action::EpochClose => "EpochClose",
@@ -4381,6 +4383,27 @@ impl Driver {
                         }));
                     });
                 }
+                Action::SyncDelegStream { gen, through } => {
+                    // A full flush of the store (seconds on a loaded disk):
+                    // on the blocking pool, never the driver loop or the
+                    // core. The designee's stream sends the rows once done.
+                    let tx = self.int_tx.clone();
+                    let meta = self.deps.meta.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let ok = match meta.sync() {
+                            Ok(()) => true,
+                            Err(error) => {
+                                tracing::warn!(%error, gen, "syncing a designee's journal failed");
+                                false
+                            }
+                        };
+                        let _ = tx.send(Internal::Event(Event::DelegStreamSynced {
+                            gen,
+                            through,
+                            ok,
+                        }));
+                    });
+                }
                 Action::RefreshRoster => {
                     let store = self.deps.store_inner.clone();
                     let sync_tx = self.sync_tx.clone();
@@ -7469,6 +7492,13 @@ impl Standalone {
                     self.queue.push_back(Event::LockHorizonPersisted {
                         until,
                         durable: Some(until),
+                    })
+                }
+                Action::SyncDelegStream { gen, through } => {
+                    self.queue.push_back(Event::DelegStreamSynced {
+                        gen,
+                        through,
+                        ok: true,
                     })
                 }
                 Action::CancelTimer { .. }

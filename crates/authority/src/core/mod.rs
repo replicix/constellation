@@ -928,6 +928,9 @@ pub struct Stats {
     /// Designee: journal syncs before a stream batch (its rows leave only
     /// once they are on its disk).
     pub deleg_designee_syncs: u64,
+    /// Designee: those syncs that failed (the stream backs off and asks
+    /// again).
+    pub deleg_designee_sync_failures: u64,
     /// Delegate: generations stopped before a row whose dependency was
     /// lost with another generation (`DelegateState::lost_from`).
     pub deleg_lost_deps_stopped: u64,
@@ -2173,6 +2176,9 @@ impl Core {
             }
             Event::LockFlushed { ino, grant, ok } => {
                 self.on_lock_flushed(now, ino, grant, ok, replica, &mut out)
+            }
+            Event::DelegStreamSynced { gen, through, ok } => {
+                self.on_deleg_stream_synced(now, gen, through, ok, replica, &mut out)
             }
             Event::LockHorizonPersisted { until, durable } => {
                 self.on_lock_horizon_persisted(now, until, durable, replica, &mut out)

@@ -3235,6 +3235,12 @@ impl Driver {
                         .ok();
                     let _ = self.tx.send(Event::LockHorizonPersisted { until, durable });
                 }
+                Action::SyncDelegStream { gen, through } => {
+                    // Synced here, answered as an event: the rows it covers
+                    // stream one event later.
+                    let ok = self.meta.sync().is_ok();
+                    let _ = self.tx.send(Event::DelegStreamSynced { gen, through, ok });
+                }
                 Action::EpochClose | Action::EpochFlushed => {
                     // `EpochManager::close` / `finish_flushing`.
                     let req = {

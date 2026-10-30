@@ -1472,6 +1472,17 @@
           "minimum": 0,
           "type": "integer"
         },
+        "designee_sync_failures": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "designee_syncs": {
+          "description": "A designee's journal syncs before its stream sends rows (off the\ncore), and those that failed (the stream waits and asks again).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "drain_deps_waits": {
           "format": "uint64",
           "minimum": 0,
@@ -2012,6 +2023,8 @@
         "lost_deps_stopped",
         "append_deps_lost",
         "drain_deps_waits",
+        "designee_syncs",
+        "designee_sync_failures",
         "backup_persisted",
         "backup_seals",
         "place_evaluations",

@@ -62281,3 +62281,19 @@ Tests and fail-before:
   dependency not seen): the acknowledgement waited instead of `Busy`.
 - `delegated-two-gens-one-backed`, seeds 0 to 199: with the cap off, 40 seeds failed `returned success but completed 0
   times in the log`; with it, none.
+
+### 4. A designee's journal sync runs off the core (follow-up of the designee's synced stream)
+
+The sync before a designee's stream batch was `Meta::sync`, a full flush of the store, on the core thread: on a loaded
+disk seconds in which the core answered nothing (the plan 41 failure class). It is an action now,
+`Action::SyncDelegStream { gen, through }`, done on the blocking pool (the engine) or by the simulation's node, and
+reported as `Event::DelegStreamSynced { gen, through, ok }` (as `PersistLockHorizon` is). The index it covers is read
+before the action is issued, so every row through it was committed before the flush. One sync is in flight per
+generation; the stream sends only the rows a finished sync covers and asks for the next one meanwhile. A failed sync
+sends nothing, backs the stream off and is asked again on the tick (`deleg_designee_sync_failures`; with
+`deleg_designee_syncs` in `status.delegation`). `Replica::sync_journal` is gone.
+
+Tests: core `designee_stream::a_designees_stream_carries_only_rows_its_disk_holds` (the row waits for the sync action;
+the driver's report sends it; an ordinary delegate asks for none) and
+`designee_stream::a_designees_failed_sync_streams_nothing`. Mutation (the stream not held to the synced index): the batch
+went out with the sync still in flight, `(batches, syncs)` `([(1, 1)], [1])` for `([], [1])`.

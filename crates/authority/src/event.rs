@@ -91,6 +91,9 @@ pub enum Event {
         until: WaitMs,
         durable: Option<WaitMs>,
     },
+    /// `Action::SyncDelegStream { gen, through }` finished: `ok` the sync
+    /// succeeded (the rows through `through` are on the disk).
+    DelegStreamSynced { gen: u64, through: u64, ok: bool },
     /// The membership poll read the write-eligible roster (M13's inbox
     /// polls it; M9 picks backups from it).
     Roster { write_eligible: Vec<NodeId> },

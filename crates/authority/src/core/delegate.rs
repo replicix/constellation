@@ -442,6 +442,9 @@ pub(crate) struct DelegateState {
     /// A designee: the stream index through which this process synced its
     /// journal; its stream sends nothing past it (`deleg_stream`).
     pub synced_through: u64,
+    /// A designee: the index a sync in flight covers
+    /// (`Action::SyncDelegStream`).
+    pub sync_inflight: Option<u64>,
     /// The first index of this stream whose `deps` name a row its
     /// generation ended without (`Replica::deps_lost`): never streamed, the
     /// generation stopped before it (`deleg_stream`).
@@ -608,7 +611,7 @@ pub(crate) struct DelegationState {
     /// Local ops whose execution waits for a recall or for `deps` (their
     /// `finish` is deferred to the parked continuation).
     pub pending_exec: BTreeSet<Rid>,
-    stream_timer: Option<TimerId>,
+    pub(crate) stream_timer: Option<TimerId>,
     /// When a delegate that knows no root may read the lease for it again
     /// ([`Core::deleg_learn_root`]): once a stream tick.
     root_read_after: Option<WaitMs>,
@@ -1088,6 +1091,7 @@ impl Core {
                     acked_max: 0,
                     held_noted: false,
                     synced_through: 0,
+                    sync_inflight: None,
                     lost_from: None,
                     xdeps: BTreeMap::new(),
                     xrec: 0,
@@ -3493,6 +3497,44 @@ impl Core {
         self.dl.late.remove(&req)
     }
 
+    /// `Action::SyncDelegStream { gen, through }` finished: a designee's
+    /// rows through `through` are on its disk and may stream; a failed
+    /// sync backs the stream off and is asked again on the tick.
+    pub(crate) fn on_deleg_stream_synced(
+        &mut self,
+        now: Now,
+        gen: u64,
+        through: u64,
+        ok: bool,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(d) = self.dl.mine.get_mut(&gen) else {
+            return;
+        };
+        if d.sync_inflight != Some(through) {
+            return;
+        }
+        d.sync_inflight = None;
+        if ok {
+            d.synced_through = d.synced_through.max(through);
+        } else {
+            self.stats.deleg_designee_sync_failures += 1;
+            tracing::warn!(
+                node = self.cfg.node_id,
+                gen,
+                through,
+                "a designee's journal sync failed: its stream waits and asks again"
+            );
+            let tick = self.cfg.delegation_stream_tick_ms.max(1);
+            d.stream_backoff_ms = (d.stream_backoff_ms * 2).clamp(tick * 4, 2_000);
+            d.stream_after = Some(now.wait.plus(d.stream_backoff_ms));
+            self.arm_stream_tick(now, out);
+            return;
+        }
+        self.deleg_stream(now, replica, out);
+    }
+
     /// Row `idx` of `gen` depends on a row its generation ended without
     /// (`Replica::deps_lost`): the generation stops before it
     /// (`DelegateState::lost_from`, see `deleg_stream`).
@@ -3599,7 +3641,7 @@ impl Core {
             if txs.is_empty() {
                 continue;
             }
-            let last = txs.last().map(|t| t.idx).unwrap_or(from);
+            let mut last = txs.last().map(|t| t.idx).unwrap_or(from);
             // A designee answers its rows at once and its commits reach
             // the OS, not the disk: a power loss can drop the end of its
             // journal. Nothing ends a designation then (it renews nothing,
@@ -3610,18 +3652,23 @@ impl Core {
             // its cursor) and the log and the designee would part. So a
             // designee's rows leave in its stream only once they are on its
             // disk, and the root's cursor never passes what a restart finds.
-            if d.designated && last > d.synced_through {
-                let through = replica.delegate_idx(gen);
-                if !replica.sync_journal() {
-                    let tick = self.cfg.delegation_stream_tick_ms.max(1);
-                    let d = self.dl.mine.get_mut(&gen).expect("present");
-                    d.stream_backoff_ms = (d.stream_backoff_ms * 2).clamp(tick * 4, 2_000);
-                    d.stream_after = Some(now.wait.plus(d.stream_backoff_ms));
-                    continue;
+            // The sync is a full flush of the store: off the core
+            // (`Action::SyncDelegStream`), the rows it covers sent once it
+            // is done (`Core::on_deleg_stream_synced`).
+            if d.designated {
+                if last > d.synced_through && d.sync_inflight.is_none() {
+                    let through = replica.delegate_idx(gen);
+                    self.stats.deleg_designee_syncs += 1;
+                    self.dl.mine.get_mut(&gen).expect("present").sync_inflight = Some(through);
+                    out.push(Action::SyncDelegStream { gen, through });
                 }
-                self.stats.deleg_designee_syncs += 1;
-                let d = self.dl.mine.get_mut(&gen).expect("present");
-                d.synced_through = d.synced_through.max(through);
+                let synced = self.dl.mine[&gen].synced_through;
+                let keep = txs.iter().take_while(|t| t.idx <= synced).count();
+                txs.truncate(keep);
+                let Some(l) = txs.last().map(|t| t.idx) else {
+                    continue;
+                };
+                last = l;
             }
             let leaving = self.deleg_leaving_grants(now, gen, replica);
             let leaving_barriers = self.deleg_leaving_barriers(now, gen, &leaving, replica);

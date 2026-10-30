@@ -41394,6 +41394,16 @@ mod designee_stream {
         out
     }
 
+    /// The sync actions of generation 7 in `out`, as their `through`.
+    fn syncs(out: &[Action]) -> Vec<u64> {
+        out.iter()
+            .filter_map(|a| match a {
+                Action::SyncDelegStream { gen: 7, through } => Some(*through),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Fail-before: a designee answers its rows at once, and its commits
     /// reach the OS, not the disk. Its stream sent them as they were
     /// journaled; after a power loss that dropped the end of its journal,
@@ -41401,31 +41411,64 @@ mod designee_stream {
     /// reclaims it), its next rows took the lost indices, and the root,
     /// which had appended the lost rows, skipped the new ones as appended
     /// (at or below its cursor): the log and the designee parted. Now a
-    /// batch leaves only after a sync that covers it, so the root's cursor
-    /// never passes what a restart finds on the disk. A delegate that is no
-    /// designee does not sync (it does not take a generation up again after
-    /// a reboot, and its group holds what it acknowledged).
+    /// batch leaves only after a sync that covers it, done off the core
+    /// (`Action::SyncDelegStream`, a full flush of the store), so the
+    /// root's cursor never passes what a restart finds on the disk. A
+    /// delegate that is no designee does not sync (it does not take a
+    /// generation up again after a reboot, and its group holds what it
+    /// acknowledged).
     #[test]
     fn a_designees_stream_carries_only_rows_its_disk_holds() {
         let (mut h, dir) = designee();
-        let synced = h.meta.sync_count();
         let out = create(&mut h, dir, 1, "f");
         assert_eq!(
-            (batches(&out), h.meta.sync_count() - synced),
-            (vec![(1, 1)], 1),
-            "(batches sent, syncs) for row 7:1: {out:?}"
+            (batches(&out), syncs(&out)),
+            (vec![], vec![1]),
+            "(batches sent, syncs asked) for row 7:1: {out:?}"
         );
+        // The driver syncs the store and reports it: the row streams.
+        let synced = h.meta.sync_count();
+        h.meta.sync().unwrap();
+        assert_eq!(h.meta.sync_count(), synced + 1);
+        let out = h.step(Event::DelegStreamSynced {
+            gen: 7,
+            through: 1,
+            ok: true,
+        });
+        assert_eq!(batches(&out), vec![(1, 1)], "{out:?}");
         assert_eq!(h.core.dl.mine[&7].synced_through, 1);
         assert_eq!(h.core.stats.deleg_designee_syncs, 1);
         // The ordinary delegate streams without one.
         let (mut h, dir, _, _) = delegate_renewed_once();
-        let synced = h.meta.sync_count();
         let out = create(&mut h, dir, 1, "f");
         assert_eq!(
-            (batches(&out), h.meta.sync_count() - synced),
-            (vec![(1, 1)], 0),
+            (batches(&out), syncs(&out)),
+            (vec![(1, 1)], vec![]),
             "{out:?}"
         );
+    }
+
+    /// A failed sync sends nothing: the stream backs off, and the tick
+    /// asks for the sync again.
+    #[test]
+    fn a_designees_failed_sync_streams_nothing() {
+        let (mut h, dir) = designee();
+        let out = create(&mut h, dir, 1, "f");
+        assert_eq!(syncs(&out), vec![1]);
+        let out = h.step(Event::DelegStreamSynced {
+            gen: 7,
+            through: 1,
+            ok: false,
+        });
+        assert_eq!(batches(&out), vec![], "{out:?}");
+        let d = &h.core.dl.mine[&7];
+        assert_eq!((d.synced_through, d.sync_inflight), (0, None));
+        assert!(d.stream_after.is_some());
+        assert_eq!(h.core.stats.deleg_designee_sync_failures, 1);
+        let t = h.core.dl.stream_timer.expect("the stream tick is armed");
+        h.advance(2_001);
+        let out = h.step(Event::Timer { id: t });
+        assert_eq!(syncs(&out), vec![1], "asked again on the tick: {out:?}");
     }
 }
 
