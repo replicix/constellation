@@ -40136,6 +40136,66 @@ mod deleg_group {
         assert!(h.core.settled_outcome(rid, &h.meta).is_some());
     }
 
+    /// D6 on the ordinary route: the delegate's own client op, journaled as a
+    /// gated row its backup never acknowledged, is let go when the backup
+    /// answers that it sealed the generation (the root drains it from the
+    /// backup, short of the row). Re-routed by rid, the op reads the lease;
+    /// the root is out of reach and the op goes to the inbox — not answered
+    /// from its own uncommitted row, which the generation's end drops
+    /// (`long-delegated-late-answers` seed 272 under slow lease reads: the
+    /// client heard success for a create the log never carried). The row
+    /// stays this delegate's; the inbox op waits for the log.
+    #[test]
+    fn a_rerouted_own_op_is_not_answered_from_its_uncommitted_delegate_row() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        h.core.cfg.inbox = true;
+        h.core.dl.mine.get_mut(&7).unwrap().backup = Some(4);
+        record_group(&mut h, dir, 2, 1, vec![4]);
+        let (rid, out) = own_create(&mut h, dir, 1);
+        assert!(client_answers(&out).is_empty(), "answered alone: {out:?}");
+        let (breq, _) = backup_append(&out).expect("appended to the backup");
+        let out = h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegBackupAck {
+                req: breq,
+                gen: 7,
+                acked: 0,
+                sealed: true,
+            },
+        });
+        assert!(client_answers(&out).is_empty(), "{out:?}");
+        let backoff = timers(&out, TimerKind::ForwardBackoff);
+        assert_eq!(backoff.len(), 1, "not re-routed: {out:?}");
+        h.advance(1_000);
+        let out = h.step(Event::Timer { id: backoff[0] });
+        learns_the_holder(&h, &out, rid);
+        let read = s3_ops(&out)
+            .into_iter()
+            .find_map(|(op, r)| matches!(r, S3Op::LeaseGet).then_some(op))
+            .expect("read");
+        let out = h.step(Event::S3 {
+            op: read,
+            result: S3Result::LeaseGet(Ok(Some((lease_of(1, 1, h.now.0 + 60_000), tag())))),
+        });
+        assert!(
+            client_answers(&out).is_empty(),
+            "answered from the delegate's own uncommitted row: {out:?}"
+        );
+        assert!(
+            matches!(
+                h.core.clients[&rid].phase,
+                client::Phase::InboxQueued { .. }
+            ),
+            "{:?}",
+            h.core.clients[&rid].phase
+        );
+        // The applied log does not answer it either while the row is only
+        // this disk's.
+        let mut out = Vec::new();
+        h.core.answer_awaiting_log(h.clk(), &h.meta, &mut out);
+        assert!(client_answers(&out).is_empty(), "{out:?}");
+    }
+
     /// The root journals the group a delegate asks for: `DelegGroup` at the
     /// next version when the request differs from the latest record, nothing
     /// when it is the same.

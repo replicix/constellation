@@ -391,8 +391,11 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         // An earlier attempt (P2P, or a previous epoch's batch) may have
-        // executed it already.
-        if let Some(outcome) = super::client::completed_as_outcome(replica, rid, epoch) {
+        // executed it already — not this delegate's own uncommitted row of
+        // it (D6): its generation may end without the row.
+        if let Some(outcome) = super::client::completed_as_outcome(replica, rid, epoch)
+            .filter(|_| self.completed_row_settled(rid, replica))
+        {
             let (outcome, source) = Self::eio_unless_recorded(
                 outcome,
                 self.completed_source(replica, rid),

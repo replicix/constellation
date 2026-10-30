@@ -2680,6 +2680,11 @@ impl Core {
             })
             .collect();
         for (rid, epoch, position) in waiting {
+            // Not from this delegate's own uncommitted row (D6): the log's
+            // answer is still to come.
+            if !self.completed_row_settled(rid, replica) {
+                continue;
+            }
             let Some(outcome) = completed_as_outcome(replica, rid, epoch) else {
                 continue;
             };
@@ -2987,6 +2992,21 @@ impl Core {
         self.finish_in_doubt(now, rid, replica, out);
     }
 
+    /// Plan 43 C2 (D6): whether `rid`'s `completed` row here is an outcome
+    /// its client may hear. Not while it is this node's own row of a
+    /// delegated generation that waits for its group (gated) and the
+    /// group does not hold it: the generation may end without it (the
+    /// backup sealed it short of the row, the root's drain drops what is
+    /// past the cut), and the rid then runs again at the generation's new
+    /// owner. Settled once the group or the log holds it, or when it is
+    /// this node's own client's `Lone` row.
+    pub(crate) fn completed_row_settled(&self, rid: Rid, replica: &dyn Replica) -> bool {
+        replica
+            .outcome_row(rid)
+            .filter(|r| r.gen != 0)
+            .is_none_or(|r| !r.class.gated() || self.deleg_stream_durable(r.gen, r.idx, replica))
+    }
+
     /// What this replica can answer for `rid` without running it, at a
     /// point where the op would otherwise go in doubt: its `completed`
     /// row, if that row is an outcome a client may hear now.
@@ -3031,15 +3051,8 @@ impl Core {
             {
                 return None;
             }
-            // Plan 43 C2 (D6): the outcome is in this node's own journal as a
-            // delegate's row of a generation: settled once its group holds
-            // it (or when it is this node's own client's `Lone` row), not
-            // while the row is the delegate's disk alone — the generation
-            // may end without it.
-            if let Some(r) = replica.outcome_row(rid).filter(|r| r.gen != 0) {
-                if r.class.gated() && !self.deleg_stream_durable(r.gen, r.idx, replica) {
-                    return None;
-                }
+            if !self.completed_row_settled(rid, replica) {
+                return None;
             }
             return completed_as_outcome(replica, rid, self.ship.max_epoch);
         }

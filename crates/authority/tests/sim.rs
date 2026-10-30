@@ -12373,6 +12373,25 @@ fn a_delegate_turned_root_strands_its_own_rows_after_a_restart() {
     .unwrap_or_else(|e| panic!("delegated-holder-cut seed 1240 (slow lease reads): {e}"));
 }
 
+/// `long-delegated-late-answers` seed 272 under slow lease reads: a
+/// delegate's own create, journaled as a row its group never held, was let
+/// go when the backup sealed the generation short of it; re-routed to the
+/// inbox, it was answered from that row (`Accepted`), which the
+/// generation's end dropped ("returned success but completed 0 times in the
+/// log"). It fails before the inbox route and the applied-log answer leave
+/// an uncommitted delegate row alone (`Core::completed_row_settled`).
+#[test]
+fn a_rerouted_own_op_is_not_answered_from_its_uncommitted_row() {
+    run_seed(
+        272,
+        SimConfig {
+            lease_reads: SLOW_LEASE_READS,
+            ..long_delegated_late_answers_config()
+        },
+    )
+    .unwrap_or_else(|e| panic!("long-delegated-late-answers seed 272 (slow lease reads): {e}"));
+}
+
 /// Plan 41 D3 review: the race the send-time dating is for is run, not
 /// assumed. `Report::probe_races` counts the lane answers decided on the
 /// root's own proof (the core's last one stale) after the lease object already
