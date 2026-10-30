@@ -1,10 +1,10 @@
 #!/bin/bash
 # Plan 42 section 8: run the cells of a job list, one at a time, resumable.
 # usage: abba.sh JOBS OUTDIR     JOBS lines: "STORE VERSION RUN" (STORE: ext4 xfs btrfs btrfs-zstd tmpfs; VERSION: base final)
-# Needs ~/cst-p42-8/{bin/cst-base,bin/cst-final,kb,tree.tar}. A cell is skipped when OUTDIR/done has its line.
+# Needs $D (default ~/cst-p42-8) with {bin/cst-base,bin/cst-final,kb,tree.tar} and these scripts. A cell is skipped when OUTDIR/done has its line.
 set -u
 JOBS=$1; OUT=$2
-D=$HOME/cst-p42-8
+D=${D:-$HOME/cst-p42-8}
 mkdir -p "$OUT"; touch "$OUT/done"
 export KB=$D/kb TREE=$D/tree.tar HERE=$D
 btrfs_mode=none
