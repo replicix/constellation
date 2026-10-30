@@ -61222,3 +61222,76 @@ The review of D3 found the design sound and asked for five things.
   `delegated-core-stall-root`, `-root-backup`, `-root-lease6`, `-root-recall`, `-root-recall-open`, `-root-hang`, `-both`,
   `-root-sealed`: 0 failing; `locks-core-stall-backup-long` and `-long-beats`: seed 946 only (open item); `-root-backup-unprobed`
   2,000 (the control built to fail).
+
+## Perf: a plus page hands a name the kernel holds from a lookup name-only (plan 40, 2026-10-30)
+
+Plan 40 P9's after-benchmark kept `CONSTELLATION_FUSE_READDIRPLUS=auto` the default and left two slowdowns to
+investigate: `git status` of the 50k-file tree 29 % slower than without `READDIRPLUS`, and a plain `ls` of a
+1,000-entry directory 2 to 2.3 times slower. Both reproduced on one node, kernel-cold (a daemon restart per run),
+with the FUSE requests by op and the daemon's service time per op (`vfs_ops` `sum_ns`).
+
+**`git status`: fixed.** `git status` lstats every tracked name (each a `LOOKUP`, kernel-cold), then reads every
+directory for untracked files. Under `auto` the kernel asks `READDIRPLUS` for the first chunk of every directory
+(`fuse_use_readdirplus`: `pos == 0`, and the lookups set the directory's advise bit), so the 2,224 directories took
+2,446 plus pages and 53,045 entries with attributes, every one a repeat of a lookup the kernel had made a moment
+before: an attribute read in the view, a lookup count, a dentry record and an attribute mark in the adapter, and
+in the kernel a dentry walk, `nlookup++` and an attribute update. The request counts were otherwise those of `off`
+(`readdir` 2,004 + `readdirplus` 2,446 against 4,449 plain pages); the plus page took 69 µs of daemon time against
+16 µs for a plain one, and that difference and the kernel's work were the 29 %.
+
+`KernelEntries` now records, beside each name's expiry, the inode the last lookup-like reply (`LOOKUP`, `CREATE`,
+`MKDIR`, ...: an `EntryGuard`) handed and until when the kernel surely still holds that dentry: the reply's TTL
+less a margin of a quarter of it (at least 100 ms), never the slack. `DirSink::holds` (vfs, default `false`) asks
+it before a plus entry is made; a held name is added through `DirSink::add_held`, name-only, with no attribute
+read and no session wait (`plus` step 0), and counted as name-only reason `held`. A name-only record leaves the
+kernel's dentry as it is, exactly as a plain page does, so nothing a plus entry guarantees is lost: no lookup count
+is taken (ADR-31), no attribute is installed that a notice would have to chase, and strict mode is name-only
+anyway. A plus entry never makes a name held (a page after a page hands its entries again, so the
+`kernel-race-*-plus` rows still hold a plus page in every round and a resent page is as before); a listing, a
+rename, a failed request and a written entry or delete notice forget it, and a hold must name the inode the page
+lists. A forgotten inode or a dentry the kernel dropped by itself still counts, which costs one `LOOKUP` when the
+name is next used.
+
+**`ls` of 1k: the kernel's `auto` heuristic, not fixed.** `ls` without `-l` stats nothing, and the kernel still
+asks plus for the first chunk of every listing (`pos == 0`): one `READDIRPLUS` page of 721 entries with
+attributes, then two plain pages, against two plain pages for `off`. That page cost 2.0 ms of daemon time (about
+2.3 µs an entry more than a plain one: each entry is a lookup's replica read, the dentry and `atime` point reads
+under a snapshot, plus the adapter's records), and the kernel about 1.1 ms more for instantiating 721 inodes and
+dentries (wall time less daemon time: 2.7 ms against 1.4 ms). Constellation cannot tell `ls` from `ls -l` when the
+first chunk is asked: answering it name-only, or shorter, would take most of `ls -l`'s win at 1k (one page of
+plus entries, 1,001 `LOOKUP`s to 1) and `find -ls`/`du`'s first chunk. The same heuristic explains the two other
+P9 notes: `du -s` and `find -ls` (fts reads the whole directory before it stats a name, so no advise bit is set
+after the first chunk) get plus for the first chunk only, and `ls -la`'s `listxattr` per name cannot be answered by
+a plus page. A cheaper entry (one replica snapshot per batch instead of one per name) is the only lever left on
+the daemon's share; not done here.
+
+Tests: wire `readdirplus_hands_a_name_the_kernel_holds_name_only` (a looked-up name is name-only with no second
+reference; a listed one, one an entry notice dropped and one that leads to another inode are handed) and engine
+`a_plus_page_makes_no_entry_for_a_name_the_platform_holds` (no attribute read for a held hard-linked name) both
+fail before (the names are handed with attributes); `dentries` unit tests for the hold rules (inode, TTL margin,
+listing, failure, rename, notice, resumed session). The mock VFS asks `holds` when `readdir_asks_holds` is set.
+Two harness checks that listed names right after making them now wait out the hold first: `readdirplus-strict`'s
+lone-sequencer check (its 300 fresh `CREATE`s made 49 of 300 entries `held`, below its `>= 300` with attributes)
+and the `kernel-race-dir-version-plus` rows (the `MKDIR`'s hold would have left the first rounds with no
+directory attributes to hold). Harness runs (seed 42, `/dev/fuse`): `readdirplus-attrs-match` (633 `held`, every
+listing equal to the oracle), `-orphan-forget`, `-strict`, `-local-appender`, `-handover`, `fuse-inval-storm-plus`
+and the three `kernel-race-*-plus` rows pass. Not shown on this host: that the `dir-version-plus` row still fails
+with `CONSTELLATION_FUSE_DIR_CHANGE_NOTIFY=off` (P9: 6 of 20 stale); the build before this change shows 0 of 20
+there too (3 runs each, both builds, a loaded host).
+
+Benchmark (`bench/readdirplus` cells, quiet host, one node, kernel-cold, median of 6 runs for `git status` (the
+first run of each cell refreshes the index and is left out) and 7 for the listings, ms; `main` before, `fix`
+after, both `auto` unless `off`):
+
+| State dir | `git status`: `off` / `main` / `fix` | `ls` of 1k: `off` / `main` / `fix` | `ls -l` of 1k: `off` / `main` / `fix` |
+|---|---|---|---|
+| ext4 | 576 / 778 / 600 | 2.0 / 4.7 / 4.9 | 47.5 / 18.7 / 18.7 |
+| xfs | 601 / 779 / 600 | 2.0 / 4.8 / 4.9 | 48.5 / 18.6 / 20.8 |
+| btrfs | 599 / 788 / 583 | 2.0 / 4.8 / 4.8 | 45.1 / 19.1 / 20.3 |
+| tmpfs | 581 / 790 / 593 | 1.9 / 4.9 / 4.9 | 44.3 / 15.6 / 18.7 |
+
+Request counts per run (ext4; the other state dirs the same): `git status` plus entries 53,045 to 3 (about 53,040
+`held`), the same 4,450 listing requests, daemon time per plus page 69 to 30 µs (a plain one 14 to 16); `ls -l`
+and `ls` of 1k unchanged (3 plus pages with 1,000 entries and one `LOOKUP`; one plus page of 721 entries and two
+plain pages). The `fix` column's `ls -l` medians are within the runs' spread of `main`'s (ranges 16-22 against
+15-21 ms); nothing in the change runs for a name nobody looked up but one hash-table read.

@@ -32,11 +32,15 @@ pub enum NameOnly {
     /// huge directory, plan 40 Q2): the kernel looks the name up when it
     /// needs it.
     Watch,
+    /// The kernel already holds the name's dentry from a lookup, leading
+    /// to the listed inode, with time to spare (`KernelEntries::holds`):
+    /// an entry would only repeat it.
+    Held,
 }
 
 impl NameOnly {
     /// Every reason, in the order [`PlusCounts::name_only`] lists them.
-    pub const ALL: [NameOnly; 4] = [Self::Knob, Self::Dots, Self::View, Self::Watch];
+    pub const ALL: [NameOnly; 5] = [Self::Knob, Self::Dots, Self::View, Self::Watch, Self::Held];
 
     /// The label `node.status` and `/metrics` carry.
     pub fn as_str(self) -> &'static str {
@@ -45,6 +49,7 @@ impl NameOnly {
             Self::Dots => "dots",
             Self::View => "view",
             Self::Watch => "watch_full",
+            Self::Held => "held",
         }
     }
 
@@ -57,7 +62,7 @@ impl NameOnly {
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct PageTally {
     pub attr: u64,
-    pub name_only: [u64; 4],
+    pub name_only: [u64; NameOnly::ALL.len()],
 }
 
 impl PageTally {
@@ -72,7 +77,7 @@ impl PageTally {
 pub struct PlusCounters {
     pages: AtomicU64,
     attr: AtomicU64,
-    name_only: [AtomicU64; 4],
+    name_only: [AtomicU64; NameOnly::ALL.len()],
 }
 
 /// A snapshot of [`PlusCounters`].
@@ -146,7 +151,13 @@ mod tests {
         assert_eq!((n.pages, n.entries, n.name_only_total()), (2, 5, 3));
         assert_eq!(
             n.name_only,
-            vec![("knob_off", 0), ("dots", 2), ("view", 0), ("watch_full", 1)]
+            vec![
+                ("knob_off", 0),
+                ("dots", 2),
+                ("view", 0),
+                ("watch_full", 1),
+                ("held", 0)
+            ]
         );
     }
 }

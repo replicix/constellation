@@ -270,6 +270,8 @@ impl FrontendEvents for FuseNotifySink {
                     Ok(())
                 }
                 Invalidation::Entry { parent, name } => {
+                    // Before the write: the kernel drops the dentry.
+                    entries.dropped(*parent, name.as_bytes());
                     notifier.inval_entry(INodeNo(*parent), OsStr::from_bytes(name.as_bytes()))
                 }
                 // Offset -1: the attributes only.
@@ -282,11 +284,14 @@ impl FrontendEvents for FuseNotifySink {
                     ino,
                     range: Some((offset, len)),
                 } => notifier.inval_inode(INodeNo(*ino), *offset as i64, *len as i64),
-                Invalidation::Deleted { parent, name, ino } => notifier.delete(
-                    INodeNo(*parent),
-                    INodeNo(*ino),
-                    OsStr::from_bytes(name.as_bytes()),
-                ),
+                Invalidation::Deleted { parent, name, ino } => {
+                    entries.dropped(*parent, name.as_bytes());
+                    notifier.delete(
+                        INodeNo(*parent),
+                        INodeNo(*ino),
+                        OsStr::from_bytes(name.as_bytes()),
+                    )
+                }
                 _ => Ok(()),
             };
             if let (Some(ino), Err(e)) = (data, &result) {

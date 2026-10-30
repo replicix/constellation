@@ -1535,6 +1535,8 @@ impl View {
         let mut emitted: Vec<u64> = Vec::with_capacity(BATCH * 3);
         let mut in_page = Cookies::with_capacity_and_hasher(BATCH * 3, Default::default());
         let mut last: Option<Vec<u8>> = None;
+        // Per name of the batch: whether the platform holds its entry.
+        let mut held: Vec<bool> = Vec::new();
         loop {
             let batch_len = batch.len();
             if batch_len == 0 {
@@ -1544,15 +1546,21 @@ impl View {
             // whether the page is over.
             let mut added = None;
             let mut over = false;
+            held.clear();
             if let Some(page) = &page {
-                // What a lookup of each name of the batch waits for
+                // The names the platform holds already get no entry
+                // (`plus` step 0), so they need no wait either.
+                held.extend(batch.iter().map(|e| r.holds(e.ino, &wire_name(&e.name))));
+                // What a lookup of each other name of the batch waits for
                 // (`Dentry(dir, name)` and `Ino(child)`). Stored names are
                 // UTF-8 (escaped, `constellation_vfs::name`); one that is
                 // not gets no entry, so it needs no wait.
                 page.wait(
                     batch
                         .iter()
-                        .filter_map(|e| Some((e.ino, std::str::from_utf8(&e.name).ok()?))),
+                        .zip(&held)
+                        .filter(|(_, held)| !**held)
+                        .filter_map(|(e, _)| Some((e.ino, std::str::from_utf8(&e.name).ok()?))),
                 );
             }
             for (i, e) in batch.iter().enumerate() {
@@ -1582,6 +1590,8 @@ impl View {
                 let kind = kind_out(e.kind);
                 let name = wire_name(&e.name);
                 let full = match page.as_mut() {
+                    // An entry the platform already holds is not made again.
+                    Some(_) if held[i] => r.add_held(e.ino, c, kind, &name),
                     Some(page) => {
                         let entry = page.entry(e.ino, &e.name);
                         r.add_entry(e.ino, c, kind, &name, entry.as_ref())

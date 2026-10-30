@@ -2572,6 +2572,110 @@ fn plus_entries_of_hard_links_are_what_lookup_answers() {
     c.close(f, o.fh).unwrap();
 }
 
+/// A sink whose platform holds the names of `held` (each with the inode
+/// it leads to there): what the FUSE adapter answers for dentries its
+/// kernel has.
+struct HoldingSink {
+    inner: CollectDir,
+    held: Vec<(Ino, &'static str)>,
+    asked: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl constellation_vfs::DirSink for HoldingSink {
+    fn add(&mut self, ino: Ino, next: u64, kind: FileKind, name: &[u8]) -> bool {
+        self.inner.add(ino, next, kind, name)
+    }
+
+    fn add_entry(
+        &mut self,
+        ino: Ino,
+        next: u64,
+        kind: FileKind,
+        name: &[u8],
+        entry: Option<&Entry>,
+    ) -> bool {
+        self.inner.add_entry(ino, next, kind, name, entry)
+    }
+
+    fn holds(&mut self, ino: Ino, name: &[u8]) -> bool {
+        self.asked
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.held
+            .iter()
+            .any(|(i, n)| *i == ino && n.as_bytes() == name)
+    }
+}
+
+impl constellation_vfs::Responder<()> for HoldingSink {
+    fn done(self, r: VfsResult<()>) {
+        self.inner.done(r)
+    }
+}
+
+/// A name the platform already holds, leading to the inode the listing
+/// says, is added name-only and its attributes are not read (a
+/// hard-linked name's would cost an inode read); a held name that leads
+/// to another inode now, and every other name, get their entries. What
+/// `git status` makes: it looks every tracked name up, then lists every
+/// directory.
+#[test]
+fn a_plus_page_makes_no_entry_for_a_name_the_platform_holds() {
+    let c = client();
+    let d = c.mkdir(ROOT_INO, "d").unwrap().attr.ino;
+    let f = c.put(d, "f", b"data");
+    let other = c.put(d, "other", b"x");
+    for name in ["h1", "h2"] {
+        Blocking::run(|r| c.view.link(&c.cx(OpKind::Link), f, d, Name::new(name), r)).unwrap();
+    }
+    let page = |held: Vec<(Ino, &'static str)>| {
+        let (inner, wait) = CollectDir::pair(100);
+        let asked = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sink = HoldingSink {
+            inner,
+            held,
+            asked: asked.clone(),
+        };
+        let reads = c._meta.inode_reads();
+        c.view
+            .readdir(&c.cx(OpKind::Readdirplus), d, Fh(0), 0, true, sink);
+        let by: std::collections::BTreeMap<String, Option<Entry>> = wait
+            .wait()
+            .unwrap()
+            .into_iter()
+            .map(|e| (String::from_utf8(e.name.into_bytes()).unwrap(), e.entry))
+            .collect();
+        (
+            by,
+            c._meta.inode_reads() - reads,
+            asked.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    };
+    // Nothing held: every name has its entry, the linked ones from the
+    // inode.
+    let (all, reads, asked) = page(vec![]);
+    assert!(["f", "h1", "h2", "other"].iter().all(|n| all[*n].is_some()));
+    assert_eq!(
+        (reads, asked),
+        (3, 4),
+        "one inode read per linked name, `.`/`..` not asked"
+    );
+    // The linked names held (and `other` held as another inode's).
+    let (listed, reads, _) = page(vec![
+        (f, "f"),
+        (f, "h1"),
+        (f, "h2"),
+        (other + 1000, "other"),
+    ]);
+    for name in ["f", "h1", "h2"] {
+        assert_eq!(listed[name], None, "{name} is held");
+    }
+    assert_eq!(
+        listed["other"], all["other"],
+        "held as another inode: handed"
+    );
+    assert_eq!(reads, 0, "no attributes read for a held name");
+}
+
 /// A page that fills makes one entry more than it adds (the sink cannot be
 /// asked for room first): a hard-linked name costs its read again on the
 /// next page, but the cost is at most one entry a page, and a single name

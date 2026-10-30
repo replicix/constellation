@@ -77,6 +77,18 @@
 //! each a write that parks the notification thread on that lock. A
 //! name-only entry installs nothing and is not recorded.
 //!
+//! **Held names.** The same records answer the opposite question for a
+//! `READDIRPLUS` page: is the name's dentry surely still valid in the
+//! kernel, leading to the inode the page lists ([`KernelEntries::holds`])?
+//! Then the page hands it name-only, as a plain page would: `git status`
+//! looks every tracked name up and then lists every directory, and before
+//! this each of its plus entries repeated a lookup the kernel had just
+//! made, for an attribute read here and a lookup count, dentry walk and
+//! attribute update in the kernel. Only a lookup-like reply makes a name
+//! held, never a plus entry, and that answer errs the other way: only the
+//! reply's own TTL less a margin counts, never the slack, and a listing,
+//! a rename, a failed request or a written notification forgets it.
+//!
 //! Names are keyed by a 64-bit hash: a collision only makes a name look
 //! cached, which costs one notification, never a missed one.
 //!
@@ -123,6 +135,9 @@ struct Slot {
     inflight: u32,
     /// When the last reply's dentry expires in the kernel.
     expires: Option<Instant>,
+    /// Until when the kernel surely still holds the dentry the last
+    /// reply handed it, and the inode it leads to ([`KernelEntries::holds`]).
+    held: Option<(Instant, u64)>,
 }
 
 impl Slot {
@@ -227,8 +242,11 @@ impl KernelEntries {
         }
     }
 
-    fn end(&self, key: Key, ttl: Option<Duration>) {
+    /// `reply`: the node id and entry TTL the reply handed the kernel
+    /// (`None`: it failed and installed nothing).
+    fn end(&self, key: Key, reply: Option<(u64, Duration)>) {
         let now = Instant::now();
+        let ttl = reply.map(|(_, ttl)| ttl);
         if let Some(ttl) = ttl {
             let ns = u64::try_from(ttl.as_nanos()).unwrap_or(u64::MAX);
             self.longest_ttl_ns.fetch_max(ns, Ordering::Relaxed);
@@ -240,6 +258,9 @@ impl KernelEntries {
                 let expires = expiry_after(now, ttl);
                 slot.expires = Some(slot.expires.map_or(expires, |e| e.max(expires)));
             }
+            // A failed request (a revalidation answered `ENOENT` makes
+            // the kernel drop the dentry) leaves nothing held either.
+            slot.held = reply.and_then(|(ino, ttl)| held_after(now, ino, ttl));
         }
         shard.sweep_if_due(now);
     }
@@ -250,20 +271,75 @@ impl KernelEntries {
     /// there is no in-flight count to give back — a listing does not
     /// register its names when it starts (module doc). Called before the
     /// page's bytes are written, on success only; a zero TTL installs a
-    /// dentry that is never valid, so it records nothing.
+    /// dentry that is never valid, so it records nothing. Either way the name
+    /// is no longer [held](Self::holds).
     pub(crate) fn listed(&self, parent: u64, name: &[u8], ttl: Duration) {
         let ns = u64::try_from(ttl.as_nanos()).unwrap_or(u64::MAX);
         self.longest_ttl_ns.fetch_max(ns, Ordering::Relaxed);
+        let key = self.key(parent, name);
         if ttl.is_zero() {
+            self.forget_held(key);
             return;
         }
         let now = Instant::now();
-        let key = self.key(parent, name);
         let mut shard = self.shard(&key).lock().unwrap();
         let expires = expiry_after(now, ttl);
         let slot = shard.slots.entry(key).or_default();
         slot.expires = Some(slot.expires.map_or(expires, |e| e.max(expires)));
+        // A listing makes nothing held (see `holds`), and what was held
+        // may lead elsewhere now.
+        slot.held = None;
         shard.sweep_if_due(now);
+    }
+
+    /// Whether the kernel surely still holds a valid dentry for `name` in
+    /// `parent` that leads to `ino`, with time to spare: the last reply
+    /// that handed the name out was a `LOOKUP` (or a `CREATE`, `MKDIR`,
+    /// ...: an [`EntryGuard`]) that handed `ino`, and its TTL has more
+    /// than a [`held_margin`] left. A `READDIRPLUS` entry is never held:
+    /// a page after a page hands its entries again, so the kernel-race
+    /// rows that hold a plus page (`kernel-race-*-plus`) still have one
+    /// to hold in every round, and a resent page (K5) is as before. A `READDIRPLUS` page hands such a name
+    /// name-only (plan 40, the `held` reason): an entry would only repeat
+    /// what the kernel has, for the attribute read it costs here and the
+    /// lookup count, dentry walk and attribute update it costs the kernel
+    /// (`git status` lists every directory right after it looked up every
+    /// name in it). A name-only record leaves the kernel's dentry as it
+    /// is, exactly as a plain `READDIR` page does.
+    ///
+    /// Errs towards `false` (the entry is handed out): a resumed session
+    /// has no record of what the previous server handed; a rename or a
+    /// written invalidation forgets the name; a forgotten inode or a
+    /// dentry the kernel dropped by itself still counts here, which only
+    /// costs a `LOOKUP` when the name is next used.
+    #[cfg(test)]
+    pub(crate) fn holds(&self, parent: u64, name: &[u8], ino: u64) -> bool {
+        self.holds_at(parent, name, ino, Instant::now())
+    }
+
+    /// [`Self::holds`] as of `now` (a page asks for each of its names
+    /// with the one clock reading).
+    pub(crate) fn holds_at(&self, parent: u64, name: &[u8], ino: u64, now: Instant) -> bool {
+        let key = self.key(parent, name);
+        self.shard(&key)
+            .lock()
+            .unwrap()
+            .slots
+            .get(&key)
+            .and_then(|s| s.held)
+            .is_some_and(|(until, held)| held == ino && now < until)
+    }
+
+    /// The kernel was told to drop `name` in `parent` (an entry or delete
+    /// notification was written): it no longer [`Self::holds`] it.
+    pub(crate) fn dropped(&self, parent: u64, name: &[u8]) {
+        self.forget_held(self.key(parent, name));
+    }
+
+    fn forget_held(&self, key: Key) {
+        if let Some(slot) = self.shard(&key).lock().unwrap().slots.get_mut(&key) {
+            slot.held = None;
+        }
     }
 
     /// The longest TTL a reply may carry: [`MAX_TTL`], or a longer one a
@@ -336,6 +412,25 @@ fn expiry_after(now: Instant, ttl: Duration) -> Instant {
         .unwrap_or(now + Duration::from_secs(365 * 24 * 3600))
 }
 
+/// How much of a reply's TTL must be left for the kernel to count as
+/// holding its dentry ([`KernelEntries::holds`]): a quarter of it, and at
+/// least [`MIN_SLACK`]. It covers the jiffy the kernel's clock lags by, a
+/// reply recorded a little after the kernel stamped it, and the time
+/// between a listing and the use of the names it lists (`ls -l` stats
+/// each name right after its page; a name whose dentry expires anyway is
+/// one `LOOKUP`, as after a plain page).
+fn held_margin(ttl: Duration) -> Duration {
+    (ttl / 4).max(MIN_SLACK)
+}
+
+/// What a reply handing `ino` with entry TTL `ttl` at `now` lets the
+/// kernel hold ([`Slot::held`]); `None` for a TTL no longer than its
+/// margin.
+fn held_after(now: Instant, ino: u64, ttl: Duration) -> Option<(Instant, u64)> {
+    let left = ttl.checked_sub(held_margin(ttl)).filter(|d| !d.is_zero())?;
+    Some((now.checked_add(left)?, ino))
+}
+
 /// One request that can install a dentry ([`KernelEntries::begin`]):
 /// [`Self::replied`] with the entry TTL the reply carried, or dropped
 /// (an error, a dropped responder) to install nothing.
@@ -353,10 +448,11 @@ impl EntryGuard {
         self.entries.refs.took(ino);
     }
 
-    /// The reply handed the kernel this name with `ttl`.
-    pub(crate) fn replied(mut self, ttl: Duration) {
+    /// The reply handed the kernel this name, leading to node id `ino`,
+    /// with `ttl`.
+    pub(crate) fn replied(mut self, ino: u64, ttl: Duration) {
         self.done = true;
-        self.entries.end(self.key, Some(ttl));
+        self.entries.end(self.key, Some((ino, ttl)));
     }
 
     /// The request failed: it installs nothing, and `answer` (the error
@@ -424,6 +520,10 @@ impl RenameGuard {
             }
         };
         let (from_expiry, to_expiry) = (moved(&from), moved(&to));
+        // Which inode each name leads to now is not known here: neither
+        // is held any more.
+        entries.forget_held(from);
+        entries.forget_held(to);
         if let Some(e) = from_expiry {
             entries.extend(to, e);
         }
@@ -474,7 +574,7 @@ mod tests {
         assert!(!e.may_be_cached(2, b"x"));
         let ttl = Duration::from_millis(150);
         let replied = Instant::now();
-        g.replied(ttl);
+        g.replied(1, ttl);
         // The kernel may stamp the TTL as late as a whole TTL after the
         // reply (a descheduled caller): still cached up to then.
         std::thread::sleep(ttl + ttl / 2);
@@ -490,7 +590,7 @@ mod tests {
         let e = KernelEntries::new();
         drop(e.begin(1, b"x"));
         assert!(!e.may_be_cached(1, b"x"));
-        e.begin(1, b"y").replied(Duration::ZERO);
+        e.begin(1, b"y").replied(1, Duration::ZERO);
         assert!(!e.may_be_cached(1, b"y"));
     }
 
@@ -506,7 +606,7 @@ mod tests {
             "the kernel has its answer: a notification decided now has nothing to drop"
         );
         // An earlier reply's dentry is still the kernel's.
-        e.begin(1, b"y").replied(Duration::from_secs(60));
+        e.begin(1, b"y").replied(1, Duration::from_secs(60));
         e.begin(1, b"y")
             .failed(|| assert!(e.may_be_cached(1, b"y"), "still within its TTL"));
     }
@@ -514,8 +614,8 @@ mod tests {
     #[test]
     fn a_later_shorter_reply_does_not_shorten_an_earlier_longer_one() {
         let e = KernelEntries::new();
-        e.begin(1, b"x").replied(Duration::from_secs(60));
-        e.begin(1, b"x").replied(Duration::ZERO);
+        e.begin(1, b"x").replied(1, Duration::from_secs(60));
+        e.begin(1, b"x").replied(1, Duration::ZERO);
         assert!(e.may_be_cached(1, b"x"));
     }
 
@@ -533,7 +633,7 @@ mod tests {
     #[test]
     fn a_rename_carries_the_moved_dentrys_expiry_to_the_new_name() {
         let e = KernelEntries::new();
-        e.begin(1, b"old").replied(Duration::from_secs(60));
+        e.begin(1, b"old").replied(1, Duration::from_secs(60));
         let r = RenameGuard::new(&e, (1, b"old"), (2, b"new"));
         assert!(e.may_be_cached(2, b"new"), "in flight");
         r.renamed(false);
@@ -542,7 +642,7 @@ mod tests {
         RenameGuard::new(&e, (1, b"cold"), (2, b"target")).renamed(false);
         assert!(!e.may_be_cached(2, b"target"));
         // An exchange moves both ways.
-        e.begin(3, b"b").replied(Duration::from_secs(60));
+        e.begin(3, b"b").replied(1, Duration::from_secs(60));
         RenameGuard::new(&e, (3, b"a"), (3, b"b")).renamed(true);
         assert!(e.may_be_cached(3, b"a"));
         // A failed rename moves nothing.
@@ -559,7 +659,7 @@ mod tests {
         let e = KernelEntries::new();
         let lookup = e.begin(1, b"old");
         RenameGuard::new(&e, (1, b"old"), (2, b"new")).renamed(false);
-        lookup.replied(MAX_TTL);
+        lookup.replied(1, MAX_TTL);
         assert!(e.may_be_cached(2, b"new"));
         let key = e.key(2, b"new");
         let expires = e.expiry(&key).expect("an expiry carried over");
@@ -572,12 +672,72 @@ mod tests {
         RenameGuard::new(&e, (3, b"cold"), (3, b"target")).renamed(false);
         assert!(!e.may_be_cached(3, b"target"));
         // A longer TTL some reply carried counts as the longest.
-        e.begin(5, b"long").replied(Duration::from_secs(30));
+        e.begin(5, b"long").replied(1, Duration::from_secs(30));
         let lookup = e.begin(5, b"old");
         RenameGuard::new(&e, (5, b"old"), (5, b"new")).renamed(false);
         drop(lookup);
         let left = e.expiry(&e.key(5, b"new")).unwrap() - Instant::now();
         assert!(left > Duration::from_secs(50), "{left:?}");
+    }
+
+    /// Held (a plus page hands the name name-only): the last reply was a
+    /// lookup's, handed the listed inode and has more than its margin
+    /// left. Anything that may have changed what the kernel holds forgets
+    /// it.
+    #[test]
+    fn a_name_is_held_for_its_ttl_less_the_margin_and_only_for_its_inode() {
+        let e = KernelEntries::new();
+        let ttl = Duration::from_secs(60);
+        e.begin(1, b"x").replied(7, ttl);
+        assert!(e.holds(1, b"x", 7));
+        assert!(!e.holds(1, b"x", 8), "the name leads to another inode now");
+        assert!(!e.holds(1, b"y", 7) && !e.holds(2, b"x", 7));
+        e.listed(1, b"l", ttl);
+        assert!(!e.holds(1, b"l", 9), "a plus entry makes nothing held");
+        e.begin(1, b"l").replied(9, ttl);
+        assert!(e.holds(1, b"l", 9));
+        // A later reply decides: another inode, a zero TTL, a failure.
+        e.begin(1, b"x").replied(8, ttl);
+        assert!(e.holds(1, b"x", 8) && !e.holds(1, b"x", 7));
+        e.listed(1, b"l", Duration::ZERO);
+        assert!(!e.holds(1, b"l", 9), "stamped expired");
+        e.begin(1, b"x").failed(|| {});
+        assert!(
+            !e.holds(1, b"x", 8),
+            "a failed revalidation drops the dentry"
+        );
+        assert!(e.may_be_cached(1, b"x"), "still cached for notifications");
+        // A listing, a written notification and a rename forget it.
+        e.begin(1, b"l").replied(9, ttl);
+        e.listed(1, b"l", ttl);
+        assert!(!e.holds(1, b"l", 9), "a listing forgets it");
+        e.begin(1, b"n").replied(3, ttl);
+        e.dropped(1, b"n");
+        assert!(!e.holds(1, b"n", 3) && e.may_be_cached(1, b"n"));
+        e.begin(1, b"from").replied(4, ttl);
+        e.begin(1, b"to").replied(5, ttl);
+        RenameGuard::new(&e, (1, b"from"), (1, b"to")).renamed(false);
+        assert!(!e.holds(1, b"from", 4) && !e.holds(1, b"to", 4) && !e.holds(1, b"to", 5));
+        // Held for the TTL less a quarter of it (at least `MIN_SLACK`):
+        // a TTL no longer than that holds nothing.
+        e.begin(1, b"short").replied(1, MIN_SLACK);
+        assert!(!e.holds(1, b"short", 1));
+        let ttl = Duration::from_millis(400);
+        let at = Instant::now();
+        e.begin(1, b"t").replied(1, ttl);
+        if at.elapsed() < Duration::from_millis(200) {
+            assert!(e.holds(1, b"t", 1));
+        }
+        std::thread::sleep(ttl - held_margin(ttl) + Duration::from_millis(20));
+        assert!(!e.holds(1, b"t", 1), "within its margin of expiry");
+        assert!(e.may_be_cached(1, b"t"));
+    }
+
+    #[test]
+    fn a_resumed_connection_holds_nothing_it_did_not_hand_out() {
+        let e = KernelEntries::new();
+        e.resumed();
+        assert!(!e.holds(1, b"handed out by the previous server", 7));
     }
 
     #[test]

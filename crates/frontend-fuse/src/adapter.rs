@@ -2085,6 +2085,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
                 handed: HandedList::default(),
                 knob_off: self.tuning.readdirplus == ReaddirPlus::Off,
                 tally: Default::default(),
+                asked_at: None,
             }),
         );
     }

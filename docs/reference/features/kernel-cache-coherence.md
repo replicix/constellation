@@ -266,7 +266,9 @@ or `always`, `readdirplus_entries` should rise by about one per listed name
 and the `lookup` operations of `constellation_vfs_ops_total` should not.
 `readdirplus_name_only_why` says why entries did not carry attributes:
 mostly `dots`; `view` in numbers on a `--cto strict` mount that is not a lone sequencer; `watch_full` for
-a pid-0 lister of a very large directory.
+a pid-0 lister of a very large directory; `held` for names the kernel already holds from a lookup
+within its TTL (a directory listed right after its names were looked up, as `git status` does),
+which the page leaves as the kernel has them.
 
 ## FAQ
 

@@ -7,6 +7,13 @@
 //! so a page is one batch), for one session wait ([`PlusPage::wait`]) and
 //! then, per name it adds, for its entry ([`PlusPage::entry`]):
 //!
+//! 0. **Held names.** A name whose entry the platform already holds,
+//!    leading to the listed inode, is added name-only
+//!    (`DirSink::add_held`) and nothing below runs for it, not even the
+//!    wait: an entry would repeat the platform's. The FUSE
+//!    adapter answers [`DirSink::holds`](constellation_vfs::DirSink::holds)
+//!    from the lookups its kernel was answered, within their TTL; `git
+//!    status` lists each directory right after it looked up its names.
 //! 1. **Zero TTL** (`--cto strict` on a node that is not a lone
 //!    sequencer): every entry is name-only and nothing below runs. An
 //!    attribute with timeout 0 is pure overhead for the kernel, which

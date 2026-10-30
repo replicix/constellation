@@ -858,8 +858,11 @@ pub struct FuseMountStatus {
     /// `CONSTELLATION_FUSE_READDIRPLUS=off` on a connection that still asks
     /// for plus), `dots` (`.` and `..`), `view` (the view could not vouch
     /// for the attributes: a strict mount, or a change between the name
-    /// batch and the attribute read) and `watch_full` (the attribute
-    /// reply-mark table is full: a pid-0 lister of a huge directory).
+    /// batch and the attribute read), `watch_full` (the attribute
+    /// reply-mark table is full: a pid-0 lister of a huge directory) and
+    /// `held` (the kernel already holds the name's dentry, leading to the
+    /// listed inode, from a lookup within its TTL: a listing right after
+    /// the names were looked up).
     pub readdirplus_name_only_why: std::collections::BTreeMap<String, u64>,
     /// Plan 42: the Linux FUSE kernel-race workarounds' counters.
     pub kernel_cache: FuseKernelCacheStatus,

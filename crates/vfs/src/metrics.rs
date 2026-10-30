@@ -288,6 +288,19 @@ impl<R: DirSink> DirSink for Timed<R> {
             None => true,
         }
     }
+
+    fn holds(&mut self, ino: Ino, name: &[u8]) -> bool {
+        self.inner
+            .as_mut()
+            .is_some_and(|sink| sink.holds(ino, name))
+    }
+
+    fn add_held(&mut self, ino: Ino, next: u64, kind: FileKind, name: &[u8]) -> bool {
+        match self.inner.as_mut() {
+            Some(sink) => sink.add_held(ino, next, kind, name),
+            None => true,
+        }
+    }
 }
 
 /// One (frontend, view, transport, op) as scraped: the counters of every

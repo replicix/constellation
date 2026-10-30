@@ -3548,18 +3548,18 @@ fn readdirplus_counts_pages_entries_and_name_only_by_reason() {
     let PlusSession {
         mut k, mock, plus, ..
     } = plus_session();
-    // (pages, attr entries, [knob_off, dots, view, watch_full]).
+    // (pages, attr entries, [knob_off, dots, view, watch_full, held]).
     let counts = || {
         let c = plus.counts();
         assert_eq!(
             c.name_only.iter().map(|(w, _)| *w).collect::<Vec<_>>(),
-            ["knob_off", "dots", "view", "watch_full"]
+            ["knob_off", "dots", "view", "watch_full", "held"]
         );
         let by: Vec<u64> = c.name_only.iter().map(|(_, n)| *n).collect();
         assert_eq!(by.iter().sum::<u64>(), c.name_only_total());
         (c.pages, c.entries, by)
     };
-    assert_eq!(counts(), (0, 0, vec![0; 4]));
+    assert_eq!(counts(), (0, 0, vec![0; 5]));
     mock.always_readdir(Script::ok(vec![
         dirent(1, 1, FileKind::Dir, "."),
         // A view that hands the dots with attributes: still name-only.
@@ -3570,22 +3570,90 @@ fn readdirplus_counts_pages_entries_and_name_only_by_reason() {
         plus_dirent(23, 6, FileKind::File, "cc"),
     ]));
     parse_plus(k.call(READDIRPLUS, 1, &plus_body(0, 8192)).ok());
-    assert_eq!(counts(), (1, 3, vec![0, 2, 1, 0]));
+    assert_eq!(counts(), (1, 3, vec![0, 2, 1, 0, 0]));
     // A buffer that takes three records (160 bytes each): `.`, `..`, `sub`.
     parse_plus(k.call(READDIRPLUS, 1, &plus_body(0, 480)).ok());
-    assert_eq!(counts(), (2, 4, vec![0, 4, 1, 0]), "what the buffer took");
+    assert_eq!(
+        counts(),
+        (2, 4, vec![0, 4, 1, 0, 0]),
+        "what the buffer took"
+    );
     // Two records: the entries it refused are counted as nothing.
     parse_plus(k.call(READDIRPLUS, 1, &plus_body(0, 479)).ok());
-    assert_eq!(counts(), (3, 4, vec![0, 6, 1, 0]));
+    assert_eq!(counts(), (3, 4, vec![0, 6, 1, 0, 0]));
     // A page that fails after it offered its entries counts nothing.
     mock.abandon_readdir(true);
     let r = k.call(READDIRPLUS, 1, &plus_body(0, 8192));
     assert_eq!(r.errno(), libc::EIO);
     mock.abandon_readdir(false);
-    assert_eq!(counts(), (3, 4, vec![0, 6, 1, 0]));
+    assert_eq!(counts(), (3, 4, vec![0, 6, 1, 0, 0]));
     // A plain READDIR is not a plus page.
     k.call(op::READDIR, 1, &plus_body(0, 8192)).ok();
-    assert_eq!(counts(), (3, 4, vec![0, 6, 1, 0]));
+    assert_eq!(counts(), (3, 4, vec![0, 6, 1, 0, 0]));
+    k.finish();
+}
+
+/// A name whose dentry the kernel holds from a lookup still well within
+/// its TTL, leading to the inode the page lists, goes out name-only (the
+/// `held` reason) and takes no reference: `git status` lists every
+/// directory right after it looked up every name, and each entry only
+/// repeated that lookup. A name the kernel was not handed, one that leads
+/// to another inode now, and one an entry notification dropped are
+/// handed with attributes.
+#[test]
+fn readdirplus_hands_a_name_the_kernel_holds_name_only() {
+    let PlusSession {
+        mut k,
+        mock,
+        refs,
+        sink,
+        plus,
+    } = plus_session();
+    mock.readdir_asks_holds(true);
+    mock.always_lookup(Script::ok(entry(21, FileKind::File)));
+    k.call(op::LOOKUP, 5, &Body::new().cstr("a")).ok();
+    assert_eq!(refs.count(21), 1);
+    let held = || {
+        plus.counts()
+            .name_only
+            .iter()
+            .find(|(w, _)| *w == "held")
+            .map(|(_, n)| *n)
+            .unwrap()
+    };
+    let page = |k: &mut Kernel| -> Vec<(String, u64)> {
+        parse_plus(k.call(READDIRPLUS, 5, &plus_body(0, 8192)).ok())
+            .into_iter()
+            .map(|r| (r.name, r.nodeid))
+            .collect()
+    };
+    let named = |v: &[(&str, u64)]| -> Vec<(String, u64)> {
+        v.iter().map(|(n, i)| (n.to_string(), *i)).collect()
+    };
+    mock.always_readdir(Script::ok(vec![
+        dirent(5, 1, FileKind::Dir, "."),
+        plus_dirent(21, 2, FileKind::File, "a"),
+        plus_dirent(23, 3, FileKind::File, "cc"),
+    ]));
+    assert_eq!(page(&mut k), named(&[(".", 0), ("a", 0), ("cc", 23)]));
+    assert_eq!((refs.count(21), refs.count(23), held()), (1, 1, 1));
+    // Listed again: a plus entry makes nothing held, so `cc` is handed
+    // again (the kernel-race rows hold such a page in every round).
+    assert_eq!(page(&mut k), named(&[(".", 0), ("a", 0), ("cc", 23)]));
+    assert_eq!((refs.count(21), refs.count(23), held()), (1, 2, 2));
+    // The kernel is told to drop `a`: handed again.
+    sink.invalidate(&[Invalidation::Entry {
+        parent: 5,
+        name: "a".into(),
+    }]);
+    assert_eq!(inval_entry(&k.recv()), (5, "a".into()));
+    assert_eq!(page(&mut k), named(&[(".", 0), ("a", 21), ("cc", 23)]));
+    assert_eq!((refs.count(21), held()), (2, 2));
+    // Looked up again, but the name leads to another inode now.
+    k.call(op::LOOKUP, 5, &Body::new().cstr("a")).ok();
+    mock.always_readdir(Script::ok(vec![plus_dirent(22, 2, FileKind::File, "a")]));
+    assert_eq!(page(&mut k), named(&[("a", 22)]));
+    assert_eq!((refs.count(21), refs.count(22), held()), (3, 1, 2));
     k.finish();
 }
 

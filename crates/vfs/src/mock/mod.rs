@@ -472,6 +472,9 @@ struct Inner {
     /// Whether a `readdir` drops its responder after it filled the sink
     /// instead of completing it ([`MockVfs::abandon_readdir`]).
     abandon_readdir: AtomicBool,
+    /// Whether a scripted plus page asks the sink which names it holds
+    /// ([`MockVfs::readdir_asks_holds`]).
+    readdir_asks_holds: AtomicBool,
 }
 
 /// A recording, scriptable [`Vfs`]; see the module doc.
@@ -524,16 +527,30 @@ impl<R: DirSink> DirSink for Tap<R> {
     ) -> bool {
         self.r.add_entry(ino, next, kind, name, entry)
     }
+
+    fn holds(&mut self, ino: Ino, name: &[u8]) -> bool {
+        self.r.holds(ino, name)
+    }
+
+    fn add_held(&mut self, ino: Ino, next: u64, kind: crate::types::FileKind, name: &[u8]) -> bool {
+        self.r.add_held(ino, next, kind, name)
+    }
 }
 
 /// A scripted `readdir` reply into `sink`: under `plus` through
 /// [`DirSink::add_entry`] with the scripted entries' `entry`, else
 /// through [`DirSink::add`], until the sink is full.
-fn replay(sink: &mut dyn DirSink, plus: bool, entries: Vec<DirEntry>) {
+/// With `asks`, an entry the sink [holds](DirSink::holds) goes name-only,
+/// as a view's does.
+fn replay(sink: &mut dyn DirSink, plus: bool, asks: bool, entries: Vec<DirEntry>) {
     for e in entries {
         let name = e.name.as_bytes();
         let full = if plus {
-            sink.add_entry(e.ino, e.next, e.kind, name, e.entry.as_ref())
+            if asks && e.entry.is_some() && sink.holds(e.ino, name) {
+                sink.add_held(e.ino, e.next, e.kind, name)
+            } else {
+                sink.add_entry(e.ino, e.next, e.kind, name, e.entry.as_ref())
+            }
         } else {
             sink.add(e.ino, e.next, e.kind, name)
         };
@@ -600,6 +617,7 @@ impl MockVfs {
                 forget_delay: Mutex::new(None),
                 lock_grace: Mutex::new(None),
                 abandon_readdir: AtomicBool::new(false),
+                readdir_asks_holds: AtomicBool::new(false),
             }),
         }
     }
@@ -631,6 +649,14 @@ impl MockVfs {
     /// then goes out for a page whose entries were offered.
     pub fn abandon_readdir(&self, on: bool) {
         self.inner.abandon_readdir.store(on, Ordering::SeqCst);
+    }
+
+    /// Make a scripted plus page ask its sink, per entry with attributes,
+    /// whether the platform already holds it ([`DirSink::holds`]) and
+    /// hand a held one name-only, as the engine's view does. Off by
+    /// default: a script hands exactly its entries.
+    pub fn readdir_asks_holds(&self, on: bool) {
+        self.inner.readdir_asks_holds.store(on, Ordering::SeqCst);
     }
 
     /// Make a non-blocking `lock_acquire` wait `grace` first (`None`: none
@@ -1251,16 +1277,17 @@ impl Vfs for MockVfs {
             call: call.clone(),
         };
         let script = self.inner.scripts.readdir.lock().unwrap().next(&call);
+        let asks = self.inner.readdir_asks_holds.load(Ordering::SeqCst);
         let result = match script {
             None | Some(Script::Reference) => match &self.inner.view {
                 Some(view) => view.readdir(ino, cookie, plus, &mut tap),
                 None => Err(VfsError::new(Code::NotImplemented)),
             },
             Some(Script::Reply(entries)) => entries.map(|entries| {
-                replay(&mut tap, plus, entries);
+                replay(&mut tap, plus, asks, entries);
             }),
             Some(Script::With(f)) => f(&call).map(|entries| {
-                replay(&mut tap, plus, entries);
+                replay(&mut tap, plus, asks, entries);
             }),
             Some(script @ (Script::Defer { .. } | Script::DeferWith { .. })) => {
                 let inner = self.inner.clone();
@@ -1283,7 +1310,7 @@ impl Vfs for MockVfs {
                             };
                             let mut tap = tap;
                             let result = result.map(|entries| {
-                                replay(&mut tap, plus, entries);
+                                replay(&mut tap, plus, asks, entries);
                             });
                             tap.done(result);
                             inner.deferred.fetch_sub(1, Ordering::AcqRel);

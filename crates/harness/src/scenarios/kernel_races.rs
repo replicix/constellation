@@ -758,6 +758,16 @@ twice!(
 
 const HOLD: Duration = Duration::from_millis(200);
 
+/// A plus row's directory was just made on this node: wait until the
+/// kernel no longer holds its name from the `MKDIR` reply, which a plus
+/// page hands name-only (`held`), so that from the first round on the
+/// page carries the directory's attributes to hold.
+fn past_the_mkdir_hold(plus: bool) {
+    if plus {
+        std::thread::sleep(Duration::from_millis(1500));
+    }
+}
+
 /// The mount's `READDIRPLUS` entries handed with attributes so far.
 fn plus_entries(c: &Client) -> Result<u64> {
     Ok(mount_status(c, None)?["readdirplus_entries"]
@@ -786,6 +796,7 @@ fn race_dir_version(name: &str, wire: Wire, plus: bool) -> Result<()> {
         let r = (|| -> Result<_> {
             let dir = c.mnt.join("dv");
             std::fs::create_dir(&dir)?;
+            past_the_mkdir_hold(plus);
             let before = plus_entries(&c)?;
             let counts = dir_version(&dir, 20, HOLD, None, plus.then_some(c.mnt.as_path()))?;
             if plus {
@@ -899,6 +910,7 @@ fn race_dir_version_remote(name: &str, wire: Wire, plus: bool) -> Result<()> {
                 Ok(())
             },
         )?;
+        past_the_mkdir_hold(plus);
         let before = plus_entries(a)?;
         let counts = dir_version(
             &dir,

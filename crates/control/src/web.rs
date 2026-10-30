@@ -1444,7 +1444,7 @@ fn readdirplus_metrics(output: &mut String, fuse: &FuseStatus) {
         }
     }
     output.push_str(
-        "# HELP constellation_fuse_readdirplus_name_only_total Name-only READDIRPLUS entries by reason: knob_off, dots, view (the view could not vouch for the attributes), watch_full.\n\
+        "# HELP constellation_fuse_readdirplus_name_only_total Name-only READDIRPLUS entries by reason: knob_off, dots, view (the view could not vouch for the attributes), watch_full, held (the kernel already holds the dentry).\n\
          # TYPE constellation_fuse_readdirplus_name_only_total counter\n",
     );
     for m in &fuse.mounts {

@@ -276,7 +276,7 @@ impl Responder<Entry> for EntryReply {
                     &fuse_attr(&e.attr),
                     Generation(e.generation),
                 );
-                name.replied(e.attr.ttl);
+                name.replied(e.attr.ino, e.attr.ttl);
             }
             Err(e) => name.failed(|| reply.error(reply_code(e.code()))),
         }
@@ -784,7 +784,7 @@ impl Responder<(Entry, Opened)> for CreateReply {
                         // Counted before the bytes go, as an entry reply's.
                         name.hands_out(e.attr.ino);
                         reply.created(&e.attr.ttl, &attr, generation, fh, flags);
-                        name.replied(e.attr.ttl);
+                        name.replied(e.attr.ino, e.attr.ttl);
                     }
                     Some((flags, Some(id))) => {
                         cx.keeps(e.attr.ino, o.fh, o.cache, flags, true, true);
@@ -800,7 +800,7 @@ impl Responder<(Entry, Opened)> for CreateReply {
                             &backing,
                         );
                         let _ = backing.into_raw();
-                        name.replied(e.attr.ttl);
+                        name.replied(e.attr.ino, e.attr.ttl);
                     }
                     None => {
                         (cx.undo)(e.attr.ino, o.fh);
@@ -1202,6 +1202,12 @@ pub(crate) struct DirPlusReply {
     /// What the buffer took, by kind: added to the connection's counters
     /// when the page succeeds ([`crate::plus_stats`]).
     pub tally: PageTally,
+    /// When the page first asked whether the kernel holds a name: every
+    /// name of the page is asked as of then, one clock reading a page. A
+    /// name whose hold ends while the page runs still counts as held; the
+    /// margin `holds` keeps before the kernel's expiry is far longer than
+    /// a page takes, and past it the cost is a `LOOKUP` of the name.
+    pub asked_at: Option<std::time::Instant>,
 }
 
 impl DirPlusReply {
@@ -1234,6 +1240,17 @@ impl DirPlusReply {
 impl DirSink for DirPlusReply {
     fn add(&mut self, ino: Ino, next: u64, kind: FileKind, name: &[u8]) -> bool {
         self.add_name_only(ino, next, kind, name, NameOnly::View)
+    }
+
+    /// The kernel holds `name`'s dentry, leading to `ino`, with time to
+    /// spare ([`KernelEntries::holds`]): the view makes no entry for it.
+    fn holds(&mut self, ino: Ino, name: &[u8]) -> bool {
+        let now = *self.asked_at.get_or_insert_with(std::time::Instant::now);
+        ino != ROOT_INO && self.entries.holds_at(self.parent, name, ino, now)
+    }
+
+    fn add_held(&mut self, ino: Ino, next: u64, kind: FileKind, name: &[u8]) -> bool {
+        self.add_name_only(ino, next, kind, name, NameOnly::Held)
     }
 
     fn add_entry(

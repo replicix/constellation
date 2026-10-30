@@ -1208,7 +1208,11 @@ pub fn strict(_seed: u64) -> Result<()> {
         for i in 0..300 {
             std::fs::write(adir.join(format!("f{i:03}")), format!("v{i}"))?;
         }
-        // A is alone: a lone strict sequencer hands attributes.
+        // A is alone: a lone strict sequencer hands attributes. Past the
+        // entry TTL of the creates first: a name the kernel still holds
+        // from its `CREATE` is handed name-only (`held`), whatever the
+        // view would vouch for.
+        std::thread::sleep(Duration::from_millis(1500));
         let m0 = mount_status(&fx.clients[0])?;
         let out = Command::new("ls").arg("-l").arg(&adir).output()?;
         ensure!(out.status.success(), "ls -l failed");

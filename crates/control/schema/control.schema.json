@@ -3223,7 +3223,7 @@
             "minimum": 0,
             "type": "integer"
           },
-          "description": "Name-only entries by why: `knob_off` (this image's\n`CONSTELLATION_FUSE_READDIRPLUS=off` on a connection that still asks\nfor plus), `dots` (`.` and `..`), `view` (the view could not vouch\nfor the attributes: a strict mount, or a change between the name\nbatch and the attribute read) and `watch_full` (the attribute\nreply-mark table is full: a pid-0 lister of a huge directory).",
+          "description": "Name-only entries by why: `knob_off` (this image's\n`CONSTELLATION_FUSE_READDIRPLUS=off` on a connection that still asks\nfor plus), `dots` (`.` and `..`), `view` (the view could not vouch\nfor the attributes: a strict mount, or a change between the name\nbatch and the attribute read), `watch_full` (the attribute\nreply-mark table is full: a pid-0 lister of a huge directory) and\n`held` (the kernel already holds the name's dentry, leading to the\nlisted inode, from a lookup within its TTL: a listing right after\nthe names were looked up).",
           "type": "object"
         },
         "readdirplus_pages": {

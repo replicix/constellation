@@ -210,6 +210,25 @@ pub trait DirSink {
         let _ = entry;
         self.add(ino, next, kind, name)
     }
+
+    /// Whether the platform already holds a valid entry for `name` (the
+    /// wire form [`Self::add_entry`] takes) that leads to `ino`, with
+    /// time to spare. A `plus` listing then adds the name only, through
+    /// [`Self::add_held`]: an entry would repeat what the platform has,
+    /// and the view spares itself the attribute read and its wait. Asked
+    /// only under `plus`, before the entry is made. The default (`false`)
+    /// holds nothing, so every entry is made; a sink that wraps another
+    /// one must forward it and `add_held`.
+    fn holds(&mut self, ino: Ino, name: &[u8]) -> bool {
+        let _ = (ino, name);
+        false
+    }
+
+    /// A name [`Self::holds`] answered `true` for, added name-only (as
+    /// [`Self::add`], which the default is). Returns `true` when full.
+    fn add_held(&mut self, ino: Ino, next: u64, kind: FileKind, name: &[u8]) -> bool {
+        self.add(ino, next, kind, name)
+    }
 }
 
 /// One directory entry, as [`CollectDir`] collects them.
