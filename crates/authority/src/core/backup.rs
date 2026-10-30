@@ -551,6 +551,8 @@ pub(crate) struct Reconfig {
     /// The node being added or removed (for the counters).
     add: Option<NodeId>,
     remove: Option<NodeId>,
+    /// `LeaseState::held_gen` when the re-read of this CAS's loss was sent.
+    read_gen: u64,
 }
 
 /// The holder's side: backups, the durability watermarks, the
@@ -593,6 +595,10 @@ pub(crate) struct AckState {
     pub s3_rtt_ms: u64,
     /// The `MarkGranting` CAS in flight.
     marking: Option<OpId>,
+    /// The body that CAS carries: its answer adopts this one, never one
+    /// built from what is held by then (a renewal may have been adopted
+    /// since: `LeaseState::advances_held`).
+    marking_sent: Option<Lease>,
     /// Plan 43 C7-F F-a0 (b): the lease's mark is one the tenure inherited
     /// (its claim CAS, the mark `acquire_won` or the reconfiguration wrote
     /// for a duty it stood on), and none of it is for something this
@@ -606,6 +612,10 @@ pub(crate) struct AckState {
     pub(crate) mark_own: bool,
     /// The `ClearMark` CAS (or the re-read that settles it) in flight.
     pub(crate) unmarking: Option<OpId>,
+    /// The body the `ClearMark` CAS carries (see `marking_sent`).
+    unmark_sent: Option<Lease>,
+    /// `LeaseState::held_gen` when the re-read of `unmarking` was sent.
+    unmark_gen: u64,
     /// A `ClearMark` CAS whose outcome is not known (in doubt, or its
     /// re-read failed): the lease is read before anything is answered,
     /// granted or marked, whatever the in-memory mark says.
@@ -1944,15 +1954,17 @@ impl Core {
             && !self.ack.unmark_unsettled
             && !self.lease_cas_in_flight()
         {
+            let sent = lease.with_granted_delegations();
             let op = self.issue_s3(
                 S3Op::LeaseSwap {
-                    lease: lease.with_granted_delegations(),
+                    lease: sent.clone(),
                     tag,
                 },
                 S3For::MarkGranting,
                 out,
             );
             self.ack.marking = Some(op);
+            self.ack.marking_sent = Some(sent);
         }
         false
     }
@@ -1967,9 +1979,13 @@ impl Core {
         self.ack.marking = None;
         match result {
             S3Result::LeasePut(Ok(tag)) => {
-                if let Some((lease, _)) = self.lease.held.clone() {
-                    self.lease
-                        .renewed(now, lease.with_granted_delegations(), tag);
+                // The body that was sent, and only while it is the newer: a
+                // renewal may have been adopted since (its CAS lost to this
+                // one and re-read it), which already holds the mark.
+                if let Some(sent) = self.ack.marking_sent.take() {
+                    if self.lease.advances_held(&sent) {
+                        self.lease.renewed(now, sent, tag);
+                    }
                 }
             }
             S3Result::LeasePut(Err(crate::event::CasFailure::Conflict)) => {
@@ -2054,8 +2070,7 @@ impl Core {
                 && now.wait.since(self.ack.last_clear_try) >= CLEAR_RETRY_MS
             {
                 self.ack.last_clear_try = now.wait;
-                let op = self.issue_s3(S3Op::LeaseGet, S3For::ClearMarkReread, out);
-                self.ack.unmarking = Some(op);
+                self.issue_clear_reread(out);
             }
             return;
         }
@@ -2090,16 +2105,25 @@ impl Core {
             epoch = lease.epoch,
             "nothing the inherited mark stands on is live any more: clearing it"
         );
+        let sent = lease.without_granted_delegations();
         let op = self.issue_s3(
             S3Op::LeaseSwap {
-                lease: lease.without_granted_delegations(),
+                lease: sent.clone(),
                 tag,
             },
             S3For::ClearMark,
             out,
         );
         self.ack.unmarking = Some(op);
+        self.ack.unmark_sent = Some(sent);
         self.stats.mark_clears += 1;
+    }
+
+    /// Read the lease to settle a `ClearMark` (`unmarking` is the read).
+    fn issue_clear_reread(&mut self, out: &mut Vec<Action>) {
+        let op = self.issue_s3(S3Op::LeaseGet, S3For::ClearMarkReread, out);
+        self.ack.unmarking = Some(op);
+        self.ack.unmark_gen = self.lease.held_gen();
     }
 
     pub(crate) fn on_clear_mark_put(
@@ -2115,9 +2139,10 @@ impl Core {
         self.ack.unmarking = None;
         match result {
             S3Result::LeasePut(Ok(tag)) => {
-                if let Some((lease, _)) = self.lease.held.clone() {
-                    self.lease
-                        .renewed(now, lease.without_granted_delegations(), tag);
+                if let Some(sent) = self.ack.unmark_sent.take() {
+                    if self.lease.advances_held(&sent) {
+                        self.lease.renewed(now, sent, tag);
+                    }
                 }
                 self.ack.mark_inherited = false;
             }
@@ -2125,8 +2150,7 @@ impl Core {
             // either version. The lease is read before anything else.
             _ => {
                 self.ack.unmark_unsettled = true;
-                let op = self.issue_s3(S3Op::LeaseGet, S3For::ClearMarkReread, out);
-                self.ack.unmarking = Some(op);
+                self.issue_clear_reread(out);
             }
         }
     }
@@ -2143,16 +2167,20 @@ impl Core {
             return;
         }
         self.ack.unmarking = None;
+        let older = matches!(
+            &result,
+            S3Result::LeaseGet(Ok(Some((cur, tag))))
+                if self.lease.older_read(now, cur, tag, self.ack.unmark_gen)
+        );
         let Some((mine, _)) = self.lease.held.clone() else {
             self.ack.unmark_unsettled = false;
             return;
         };
         match result {
             // Served before a CAS of ours that landed: it cannot tell
-            // whether the clear did. Read again (`LeaseState::renewed`).
-            S3Result::LeaseGet(Ok(Some((cur, _)))) if self.lease.is_older_than_held(&cur) => {
-                let op = self.issue_s3(S3Op::LeaseGet, S3For::ClearMarkReread, out);
-                self.ack.unmarking = Some(op);
+            // whether the clear did. Read again (`LeaseState::older_read`).
+            S3Result::LeaseGet(Ok(Some(_))) if older => {
+                self.issue_clear_reread(out);
             }
             S3Result::LeaseGet(Ok(Some((cur, tag))))
                 if cur.holder == self.cfg.node_id && cur.epoch == mine.epoch =>
@@ -3181,6 +3209,7 @@ impl Core {
             tag,
             add,
             remove,
+            read_gen: 0,
         });
     }
 
@@ -3269,7 +3298,10 @@ impl Core {
             }
             S3Result::LeasePut(Err(crate::event::CasFailure::Conflict)) => {
                 self.issue_s3(S3Op::LeaseGet, S3For::ReconfigReread, out);
-                self.ack.reconfig = Some(r);
+                self.ack.reconfig = Some(Reconfig {
+                    read_gen: self.lease.held_gen(),
+                    ..r
+                });
             }
             _ => {
                 // Plan 43 C7-F F-a0 L3: an answer lost may hide a CAS that
@@ -3314,15 +3346,23 @@ impl Core {
         let Some(r) = self.ack.reconfig.take() else {
             return;
         };
+        let older = matches!(
+            &result,
+            S3Result::LeaseGet(Ok(Some((cur, tag))))
+                if self.lease.older_read(now, cur, tag, r.read_gen)
+        );
         let Some((mine, _)) = self.lease.held.clone() else {
             return;
         };
         match result {
             // Served before a CAS of ours that landed: read again
-            // (`LeaseState::renewed`).
-            S3Result::LeaseGet(Ok(Some((cur, _)))) if self.lease.is_older_than_held(&cur) => {
+            // (`LeaseState::older_read`).
+            S3Result::LeaseGet(Ok(Some(_))) if older => {
                 self.issue_s3(S3Op::LeaseGet, S3For::ReconfigReread, out);
-                self.ack.reconfig = Some(r);
+                self.ack.reconfig = Some(Reconfig {
+                    read_gen: self.lease.held_gen(),
+                    ..r
+                });
             }
             S3Result::LeaseGet(Ok(Some((cur, tag))))
                 if cur.holder == self.cfg.node_id && cur.epoch == mine.epoch =>
@@ -3330,7 +3370,18 @@ impl Core {
                 // Lost the CAS to our own renewal or a `wanted_by` edit:
                 // retry against the fresh object.
                 self.lease.renewed(now, cur.clone(), tag.clone());
-                if r.attempts < RECONFIG_ATTEMPTS {
+                if self.lease_cas_in_flight() || self.ack.unmarking.is_some() {
+                    // A CAS of the lease's own is out (a renewal started
+                    // beside this reconfiguration, which gates on the same):
+                    // two on one version would lose one to the other. The
+                    // set is asked for again when it settles
+                    // (`issue_reconfig` holds it back as it does a first
+                    // attempt).
+                    self.ack
+                        .reconfig_wanted
+                        .get_or_insert(r.lease.backups.clone());
+                    self.reconcile_peers_with_lease();
+                } else if r.attempts < RECONFIG_ATTEMPTS {
                     let mut new = cur.reconfigured(r.lease.backups.clone(), r.lease.ack_policy);
                     let marks =
                         lease_fast(&new) && (r.marks || self.tenure_duty_live(now, replica));

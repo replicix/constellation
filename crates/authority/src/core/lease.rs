@@ -174,8 +174,15 @@ pub struct LeaseState {
     /// outcome unknown (an answer lost: each may have landed) while this
     /// version was held: S3 may hold one of them instead. Until a version
     /// is next adopted from S3 (`renewed`: a renewal, a re-read, a mark
-    /// CAS; `adopt`), which settles the question.
+    /// CAS; `adopt`), which settles the question. A read that carries the
+    /// held version's own tag does not: it may have been served before the
+    /// CAS landed.
     pub reconfig_doubt: Option<ReconfigDoubt>,
+    /// Counts every change of the held body (adoption, renewal, release,
+    /// loss): a lease read issued at one count and answered at the same one
+    /// was sent after the held body was taken, so S3 held it (or a newer one)
+    /// when the read was served (`Self::older_read`).
+    held_gen: u64,
 }
 
 /// What the reconfigurations in doubt (`LeaseState::reconfig_doubt`) may
@@ -230,6 +237,7 @@ impl LeaseState {
     pub fn release_local(&mut self) {
         self.epoch_hold = None;
         self.held = None;
+        self.held_gen += 1;
         self.held_since = None;
         self.gate = None;
         self.releasing = false;
@@ -710,6 +718,7 @@ impl LeaseState {
         self.observe_own(now, &lease, &tag);
         self.cached_holder = Some(lease.holder);
         self.held = Some((lease, tag));
+        self.held_gen += 1;
         self.reconfig_doubt = None;
     }
 
@@ -732,6 +741,10 @@ impl LeaseState {
         if self.is_older_than_held(&lease) {
             return;
         }
+        self.renewed_unchecked(now, lease, tag);
+    }
+
+    fn renewed_unchecked(&mut self, now: Now, lease: Lease, tag: LeaseTag) {
         // Union with what inbox batches already told us (M5): a renewal
         // object that predates a batch's flag must not forget it.
         let mut wanted = lease.wanted_by.clone();
@@ -749,8 +762,48 @@ impl LeaseState {
         }
         self.last_seen = Some(lease.clone());
         self.observe_own(now, &lease, &tag);
+        // A read that carries the held tag is the held version again: if a
+        // reconfiguration CAS of ours was answered lost, the read may have
+        // been served before it landed, and says nothing of it. Only a
+        // version other than the held one settles the doubt.
+        let same_version = self.held.as_ref().is_some_and(|(_, t)| *t == tag);
         self.held = Some((lease, tag));
-        self.reconfig_doubt = None;
+        self.held_gen += 1;
+        if !same_version {
+            self.reconfig_doubt = None;
+        }
+    }
+
+    /// The count of changes of the held body (see the field).
+    pub fn held_gen(&self) -> u64 {
+        self.held_gen
+    }
+
+    /// A lease read of this tenure at an older `config_version` than the
+    /// held one, answered for a read issued at `issued_gen` of
+    /// [`Self::held_gen`]: `true` when it is a read served before a CAS of
+    /// ours that landed, to be asked for again (see [`Self::renewed`]).
+    ///
+    /// A read issued at the current count was sent after the held body was
+    /// taken: S3 held that version (or a newer one) when it was served, so
+    /// an older body proves the held one is not a version S3 ever had (an
+    /// answer applied to a body it was not sent with). It is adopted then,
+    /// as the read of the object, and `false` is returned: asking again
+    /// would never end.
+    pub fn older_read(&mut self, now: Now, lease: &Lease, tag: &LeaseTag, issued_gen: u64) -> bool {
+        if !self.is_older_than_held(lease) {
+            return false;
+        }
+        if issued_gen != self.held_gen {
+            return true;
+        }
+        tracing::warn!(
+            held = self.held.as_ref().map(|(h, _)| h.config_version),
+            read = lease.config_version,
+            "a lease read sent after the held body is older than it: the held body was not S3's; adopting the read"
+        );
+        self.renewed_unchecked(now, lease.clone(), tag.clone());
+        false
     }
 
     /// Whether `lease` is a body of the held tenure older than the held one
@@ -763,9 +816,21 @@ impl LeaseState {
         })
     }
 
+    /// Whether `lease` is a body of the held tenure newer than the held one:
+    /// what the answer of a CAS of ours adopts only while that is so (the
+    /// held body may be a newer one by then).
+    pub fn advances_held(&self, lease: &Lease) -> bool {
+        self.held.as_ref().is_some_and(|(h, _)| {
+            h.holder == lease.holder
+                && h.epoch == lease.epoch
+                && lease.config_version > h.config_version
+        })
+    }
+
     /// `LeaseKeeper::mark_lost`.
     pub fn mark_lost(&mut self, holder: NodeId, epoch: Epoch, my_epoch: Epoch) {
         self.held = None;
+        self.held_gen += 1;
         self.epoch_hold = None;
         self.gate = None;
         self.releasing = false;
@@ -776,6 +841,7 @@ impl LeaseState {
 
     pub fn force_lost(&mut self) {
         self.held = None;
+        self.held_gen += 1;
         self.epoch_hold = None;
         self.gate = None;
         self.releasing = false;
@@ -794,6 +860,7 @@ impl LeaseState {
         self.wanted_since = None;
         self.held_since = None;
         self.held = None;
+        self.held_gen += 1;
         self.gate = None;
         self.releasing = false;
         self.epoch_hold = None;
@@ -1017,6 +1084,24 @@ mod tests {
         c
     }
 
+    /// The tag of the second version of an object: `tag()` is its first.
+    fn tag2() -> LeaseTag {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+            let leases = constellation_store_s3::LeaseStore::new(
+                store,
+                "p0",
+                constellation_store_s3::LeaseMode::Cas,
+            );
+            let first = Lease::granted("p0", 1, 1, 1000);
+            let t = leases.try_create(&first).await.unwrap();
+            leases.try_swap(&first, &t).await.unwrap()
+        })
+    }
+
     fn tag() -> LeaseTag {
         // Built through the store so the private field stays private: a
         // create on an in-memory store yields a tag.
@@ -1064,6 +1149,54 @@ mod tests {
         let v6 = v5.reconfigured(vec![], AckPolicy::Local);
         st.renewed(now, v6.clone(), tag());
         assert!(st.backups().is_empty());
+    }
+
+    /// A read that carries the held tag does not settle a reconfiguration
+    /// CAS whose answer was lost (it may have been served before that CAS
+    /// landed); a version other than the held one does.
+    #[test]
+    fn a_read_with_the_held_tag_does_not_settle_a_reconfig_doubt() {
+        let cfg = cfg();
+        let now = Now::same(1_000_000);
+        let mut st = LeaseState::default();
+        let v4 = st.granted_lease(now, &cfg, None, false);
+        st.adopt(now, v4.clone(), tag(), None);
+        st.reconfig_doubt = Some(ReconfigDoubt::default());
+        st.renewed(now, v4.clone(), tag());
+        assert!(st.reconfig_doubt.is_some(), "the held version, read again");
+        let v5 = v4.reconfigured(vec![2], AckPolicy::Backup);
+        st.renewed(now, v5, tag2());
+        assert!(st.reconfig_doubt.is_none(), "another version settles it");
+    }
+
+    /// A read sent after the held body was taken that is older than it
+    /// proves the held body was not S3's: it is adopted. One sent before the
+    /// body was last taken is asked for again.
+    #[test]
+    fn an_older_read_is_asked_again_once_and_adopted_if_sent_after_the_held_body() {
+        let cfg = cfg();
+        let now = Now::same(1_000_000);
+        let mut st = LeaseState::default();
+        let v4 = st.granted_lease(now, &cfg, None, false);
+        st.adopt(now, v4.clone(), tag(), None);
+        let sent_at = st.held_gen();
+        let v5 = v4.reconfigured(vec![2], AckPolicy::Backup);
+        st.renewed(now, v5.clone(), tag2());
+        // Sent before v5 was taken: served before it landed, perhaps.
+        assert!(st.older_read(now, &v4, &tag(), sent_at));
+        assert_eq!(
+            st.held.as_ref().unwrap().0.config_version,
+            v5.config_version
+        );
+        // Sent after: S3 cannot have held less than the held body.
+        let again = st.held_gen();
+        assert!(!st.older_read(now, &v4, &tag(), again));
+        assert_eq!(
+            st.held.as_ref().unwrap().0.config_version,
+            v4.config_version
+        );
+        // A body that is not older is never "older".
+        assert!(!st.older_read(now, &v5, &tag2(), st.held_gen()));
     }
 
     #[test]

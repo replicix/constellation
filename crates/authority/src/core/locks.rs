@@ -4095,6 +4095,12 @@ impl Core {
         self.lease.obs.as_ref().map(|o| (o.key, o.since, o.read_at))
     }
 
+    /// The ops this node's lock requests are tracked as (for the tests).
+    #[cfg(test)]
+    pub(crate) fn lock_op_ids(&self) -> Vec<OpId> {
+        self.lk.ops.keys().copied().collect()
+    }
+
     fn lock_retry(&mut self, now: Now, op: OpId, replica: &dyn Replica, out: &mut Vec<Action>) {
         let Some(o) = self.lk.ops.get(&op) else {
             return;
@@ -4172,7 +4178,16 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        if !self.lk.ops.contains_key(&op) {
+        // Only an op still waiting for the read: a lock request is not
+        // idempotent, and one whose request went out meanwhile (a retry
+        // timer, another read it waited for) or that waits in this node's
+        // own list is not routed again by a read that comes back late.
+        if !self
+            .lk
+            .ops
+            .get(&op)
+            .is_some_and(|o| o.req.is_none() && !o.local_wait)
+        {
             return;
         }
         if let HolderRead::Lease(lease) = read {

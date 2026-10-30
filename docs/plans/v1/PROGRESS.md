@@ -61567,6 +61567,7 @@ for 100 seeds) still fail on the core-stall check, not the oracle. `long-delegat
 gated mark alone 14 times in 2,000 seeds (the non-vacuity of the hysteresis); the simulation cannot provoke a `Lone`
 decision made `DelegGroup` at the journaling.
 
+
 ## Two integrity bugs found with slow lease reads: an acknowledgement lost, a refusal that landed (2026-10-30)
 
 The sim's lease GETs could be held back before they were served (`probe_reads`, root probe only). New: `SimConfig::lease_reads`
@@ -61622,7 +61623,40 @@ guard in `renewed`.
   time is the generic linearizability tester (`check_linearizable`, exponential in overlapping ops); with it skipped both finish at once.
   Not a hang of the product.
 
+### Review follow-ups
+
+The review of the two fixes found the first one could make the renewal loop, and asked for the same care in four more places.
+
+1. **The guard could loop.** A mark CAS (or the clear of a mark) built the held body from what was held when its answer came, not
+   from the body it carried. With a renewal out beside it (it loses to the mark, re-reads the marked object, renews it) the late
+   answer set the held body to a version S3 never had; every re-read of the object then read as "older" and the renewal asked again
+   for ever. The answers now adopt the body that was sent, and only while it is newer than the held one
+   (`LeaseState::advances_held`). As a backstop a re-read that was sent after the held body was taken, and is still older, proves the
+   held body was not S3's and is adopted (`LeaseState::older_read`, `held_gen`; the renewal, reconfiguration and clear-mark re-reads).
+   Tests: `a_mark_answered_after_a_renewal_re_read_it_leaves_the_held_version_alone`, `an_older_renewal_re_read_is_read_again_and_never_ends_in_a_loop`
+   (each fails with its part reverted).
+2. **A read at the held tag does not settle a reconfiguration in doubt.** A reconfiguration CAS whose answer was lost may have
+   landed; a read served before it carries the held tag and said nothing of it, but cleared the doubt, so acknowledgements rested on
+   the old backup set. Only another version settles it (`a_read_with_the_held_tag_does_not_settle_a_reconfig_doubt`). The
+   reconfiguration's own re-read no longer puts a second CAS beside a renewal of ours that is out: the set is asked for again
+   (`a_reconfig_re_read_does_not_cas_beside_a_renewal_that_is_out`). Two older tests simulated "a renewal that lands" with the held
+   tag; they use a second tag now.
+3. **Late holder reads, lock requests and strict reads.** A shared lock holder read applied to a request whose message was out, or
+   that waited in this node's own list, sent it again, and lock requests are not idempotent: only a request still waiting for the
+   read is routed (`a_late_holder_read_does_not_route_a_lock_request_that_is_out`). The same for a ReadIndex waiting for its holder
+   (latency only). `a_late_holder_read_routes_no_op_that_left_learn_holder` pins the first fix's mechanism, not its seeds.
+
+Sweeps again, seeds 0 to 1,999, 100 configurations (every `locks-*`, `backup`, `long-backup` and the two `-slow-lease`; patched
+against origin/main with the same knob, with and without it): no seed fails with the changes that does not fail on main, except
+`locks-delegated-production-ttl-heavy` seed 493 with the knob (a lock not acquired in 60 s). That class fails on main with the knob
+too (seeds 2666, 5689, 5973 of the first 10,000, and `locks-production-ttl-heavy` 509 on both); with the lock guard reverted 493 passes
+and the rest are the same, so the guard moves a timeline into the same class, it does not add to it (4 against 3 in 10,000). With
+the knob fewer seeds fail with the changes: `locks-core-stall-backup-beats` 0 against 2, `-backup-long` and `-long-slow-lease`
+2 against 6 (458, 671, 891, 1088 gone), `-long-unfresh` 2 against 4, `locks-failover-backup-writes` 0 against 3. Without the knob the
+same seeds fail on both (946 and the controls built to fail); `locks-unlinked-delegated-hcrash-backup` does not finish in 15 minutes on
+either.
+
 ### Gates
 
-`cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean. Lib tests: authority 775, engine 935,
-harness 162 (no failures). `cargo test -p constellation-authority --release --test sim`: 277 passed (11 ignored).
+`cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean. Lib tests: authority 785, engine 935,
+harness 162 (no failures). `cargo test -p constellation-authority --release --test sim`: 279 passed (11 ignored).

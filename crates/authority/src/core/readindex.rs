@@ -2072,7 +2072,9 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        if !self.rd.reads.contains_key(&op) {
+        // Only a read still waiting for this answer (its request not out):
+        // a late one is not sent again.
+        if !self.rd.reads.get(&op).is_some_and(|r| r.req.is_none()) {
             return;
         }
         let object = match result {

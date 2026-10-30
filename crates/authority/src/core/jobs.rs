@@ -169,7 +169,12 @@ enum Phase {
     },
     /// `LeaseGet` after a lost renewal CAS (`final_probe`: the second
     /// swap lost too, so this read is the deposition probe).
-    RenewReread { final_probe: bool, mid_ship: bool },
+    /// `gen`: `LeaseState::held_gen` when the read was sent.
+    RenewReread {
+        final_probe: bool,
+        mid_ship: bool,
+        gen: u64,
+    },
     /// The gate's epoch-marker `SegmentPut` outstanding.
     Marker { attempts: u32 },
     /// M13: the gate's `InboxDrain` outstanding.
@@ -3982,6 +3987,7 @@ impl Core {
                     Phase::RenewReread {
                         final_probe: retry,
                         mid_ship,
+                        gen: self.lease.held_gen(),
                     },
                     Some(op),
                 );
@@ -4001,9 +4007,14 @@ impl Core {
                 Phase::RenewReread {
                     final_probe,
                     mid_ship,
+                    gen,
                 },
                 S3Result::LeaseGet(Ok(current)),
             ) => {
+                let older = matches!(
+                    &current,
+                    Some((cur, tag)) if self.lease.older_read(now, cur, tag, gen)
+                );
                 let Some((mine, _)) = self.lease.held.clone() else {
                     self.lease_gone_mid_job(now, kind, replica, out);
                     return;
@@ -4012,13 +4023,14 @@ impl Core {
                     // Served before a CAS of ours that landed (a
                     // reconfiguration out beside the renewal): it says
                     // nothing of the object now. Read again
-                    // (`LeaseState::renewed`).
-                    Some((cur, _)) if self.lease.is_older_than_held(&cur) => {
+                    // (`LeaseState::older_read`).
+                    Some(_) if older => {
                         let op = self.issue_s3(S3Op::LeaseGet, S3For::Job, out);
                         self.set_phase(
                             Phase::RenewReread {
                                 final_probe,
                                 mid_ship,
+                                gen: self.lease.held_gen(),
                             },
                             Some(op),
                         );

@@ -7547,7 +7547,7 @@ mod cto {
         );
         assert_eq!(h.core.stats.stale_liveness_refusals, refused + 1);
         // A renewal of the `Local` version lands: the CAS did not.
-        h.core.lease.renewed(h.clk(), held, tag());
+        h.core.lease.renewed(h.clk(), held, tag2());
         assert!(matches!(
             ask(&mut h, 2, 3, ino),
             ReadIndexOutcome::Ok { .. }
@@ -13435,7 +13435,7 @@ mod backup_crash {
         // Settled by a renewal that lands: the CAS did not land, and the
         // tenure is the `Local` one it was (nobody in budget: no gate).
         let (mut h, held, _) = in_doubt();
-        h.core.lease.renewed(h.clk(), held, tag());
+        h.core.lease.renewed(h.clk(), held, tag2());
         alone(&mut h);
         assert_eq!(h.core.ack_need(&pos(5)), None);
 
@@ -23387,7 +23387,7 @@ mod locks {
         h.advance(10);
         let out = h.step(Event::S3 {
             op: reread,
-            result: S3Result::LeaseGet(Ok(Some((listed.clone(), tag())))),
+            result: S3Result::LeaseGet(Ok(Some((listed.clone(), tag2())))),
         });
         assert!(h.core.fast_tenure(), "the reconfiguration had landed");
         assert!(
@@ -24188,6 +24188,47 @@ mod locks {
             "{out:?}"
         );
         assert_eq!(r.core.stats.lock_holder_reads, 2);
+    }
+
+    /// A shared lease read that comes back late is applied only to the
+    /// requests still waiting for it. A lock request whose message is out
+    /// (a retry timer or a read it waited for sent it meanwhile) is not
+    /// routed again: lock requests are not idempotent, and a second one
+    /// to the holder the late read names would queue the same wait twice.
+    #[test]
+    fn a_late_holder_read_does_not_route_a_lock_request_that_is_out() {
+        let mut r = requester();
+        let out = r.step(Event::Control {
+            op: OpId(100),
+            req: Control::Lock {
+                ino: 42,
+                mode: X,
+                blocking: false,
+                waited_ms: 0,
+            },
+        });
+        assert!(
+            matches!(
+                sends(&out).as_slice(),
+                [(1, PeerMsg::LockRequest { ino: 42, .. })]
+            ),
+            "{out:?}"
+        );
+        let ops = r.core.lock_op_ids();
+        assert_eq!(ops.len(), 1);
+        let expires = r.now.0 + 10_000;
+        let mut out = Vec::new();
+        r.core.on_lock_holder_learned(
+            r.clk(),
+            ops[0],
+            S3Result::LeaseGet(Ok(Some((lease_of(3, 2, expires), tag())))),
+            &r.meta,
+            &mut out,
+        );
+        assert!(
+            sends(&out).is_empty() && s3_ops(&out).is_empty(),
+            "a request that is out was routed again: {out:?}"
+        );
     }
 
     /// Plan 43 C7b with N3: a lease read the lock requests share, or take
@@ -43816,4 +43857,203 @@ mod c1_member_copy {
             }
         }
     }
+}
+
+// ---- slow lease reads: an answer is applied to what it was sent with, a late
+// read to the op that still waits for it ----
+
+/// The tag of the second version of a lease object (`tag()` is the first).
+fn tag2() -> constellation_store_s3::LeaseTag {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let leases = LeaseStore::new(store, "p0", LeaseMode::Cas);
+        let first = Lease::granted("p0", 1, 1, 1000);
+        let t = leases.try_create(&first).await.unwrap();
+        leases.try_swap(&first, &t).await.unwrap()
+    })
+}
+
+/// The first round after half a TTL: its lease CAS (the renewal) and its id.
+fn renewal_cas(h: &mut Harness) -> (OpId, Lease) {
+    h.advance(6_000);
+    let mut out = Vec::new();
+    h.core.start(h.clk(), &h.meta, &mut out);
+    let poll = timers(&out, TimerKind::Poll)[0];
+    let mut out = h.step(Event::Timer { id: poll });
+    if let Some(op) = out.iter().find_map(|a| match a {
+        Action::UploadDirtyChunks { op, .. } => Some(*op),
+        _ => None,
+    }) {
+        out = h.step(Event::UploadsDone {
+            op,
+            result: UploadResult::Done { held: 0 },
+        });
+    }
+    swap_in(&out).unwrap_or_else(|| panic!("no renewal CAS in {out:?}"))
+}
+
+fn swap_in(out: &[Action]) -> Option<(OpId, Lease)> {
+    s3_ops(out).into_iter().find_map(|(op, r)| match r {
+        S3Op::LeaseSwap { lease, .. } => Some((op, lease.clone())),
+        _ => None,
+    })
+}
+
+fn get_in(out: &[Action]) -> Option<OpId> {
+    s3_ops(out)
+        .into_iter()
+        .find(|(_, r)| matches!(r, S3Op::LeaseGet))
+        .map(|(op, _)| op)
+}
+
+/// A mark CAS and a renewal out at once, the renewal losing to the mark and
+/// re-reading the marked object: when the mark's own answer comes, the
+/// held body is the marked one the renewal re-read (a version S3 has), not
+/// the held one marked again (a version S3 never had, after which every
+/// re-read of the object reads as "older" and the renewal never ends).
+#[test]
+fn a_mark_answered_after_a_renewal_re_read_it_leaves_the_held_version_alone() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    h.core.lease.held.as_mut().unwrap().0.granted_delegations = false;
+    let base = h.core.lease.held.as_ref().unwrap().0.config_version;
+    let mut out = Vec::new();
+    h.core.ensure_granting_marked(&mut out);
+    let (mark, marked) = swap_in(&out).expect("the mark CAS");
+    assert!(marked.granted_delegations);
+    assert_eq!(marked.config_version, base + 1);
+    // The renewal goes out beside it; the mark lands first and it loses.
+    let (renew, _) = renewal_cas(&mut h);
+    let out = h.step(Event::S3 {
+        op: renew,
+        result: S3Result::LeasePut(Err(CasFailure::Conflict)),
+    });
+    let reread = get_in(&out).expect("the renewal re-reads");
+    let out = h.step(Event::S3 {
+        op: reread,
+        result: S3Result::LeaseGet(Ok(Some((marked.clone(), tag2())))),
+    });
+    let (renew2, renewed) = swap_in(&out).expect("renewed against the marked object");
+    assert_eq!(renewed.config_version, base + 1);
+    h.step(Event::S3 {
+        op: renew2,
+        result: S3Result::LeasePut(Ok(tag2())),
+    });
+    // The mark's answer, late.
+    h.step(Event::S3 {
+        op: mark,
+        result: S3Result::LeasePut(Ok(tag())),
+    });
+    let (held, held_tag) = h.core.lease.held.clone().unwrap();
+    assert_eq!(held.config_version, base + 1, "a version S3 never had");
+    assert!(held.granted_delegations);
+    assert_eq!(held_tag, tag2(), "the renewal's tag, not the mark's");
+}
+
+/// An older body than the held one, answered to a re-read of the renewal, is
+/// read again, not renewed on; one sent after the held body was taken
+/// proves that body was not S3's and is adopted.
+#[test]
+fn an_older_renewal_re_read_is_read_again_and_never_ends_in_a_loop() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    h.core.lease.held.as_mut().unwrap().0.config_version = 5;
+    let older = h.core.lease.held.as_ref().unwrap().0.clone();
+    let (renew, _) = renewal_cas(&mut h);
+    let out = h.step(Event::S3 {
+        op: renew,
+        result: S3Result::LeasePut(Err(CasFailure::Conflict)),
+    });
+    let reread = get_in(&out).expect("the renewal re-reads");
+    // A reconfiguration of ours lands meanwhile.
+    let mut newer = older.clone();
+    newer.config_version = 6;
+    h.core.lease.renewed(h.clk(), newer, tag2());
+    // The read was served before it: read again, no CAS.
+    let out = h.step(Event::S3 {
+        op: reread,
+        result: S3Result::LeaseGet(Ok(Some((older.clone(), tag())))),
+    });
+    assert!(swap_in(&out).is_none(), "renewed on an older body: {out:?}");
+    let again = get_in(&out).expect("read again");
+    assert_eq!(h.core.lease.held.as_ref().unwrap().0.config_version, 6);
+    // Sent after the held body was taken and still older: that body was not
+    // S3's. Adopted, and the renewal goes on.
+    let out = h.step(Event::S3 {
+        op: again,
+        result: S3Result::LeaseGet(Ok(Some((older, tag())))),
+    });
+    assert_eq!(h.core.lease.held.as_ref().unwrap().0.config_version, 5);
+    assert!(swap_in(&out).is_some(), "{out:?}");
+}
+
+/// A holder read that comes back after its op left `LearnHolder` (it was
+/// forwarded, answered in doubt, resubmitted, executed) routes nothing: the
+/// op would otherwise execute a second time.
+#[test]
+fn a_late_holder_read_routes_no_op_that_left_learn_holder() {
+    let mut h = Harness::new(1);
+    let rid = h.rid(1);
+    let op = h.create("a");
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op,
+        tag: Default::default(),
+    });
+    let get = get_in(&out).expect("the holder is read");
+    let expires = h.now.plus(10_000).0;
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((lease_of(3, 2, expires), tag())))),
+    });
+    assert!(
+        sends(&out)
+            .iter()
+            .any(|(to, m)| *to == 3 && matches!(m, PeerMsg::MutateRequest { .. })),
+        "{out:?}"
+    );
+    // The same read, again, late.
+    let mut out = Vec::new();
+    h.core.on_holder_learned(
+        h.clk(),
+        rid,
+        S3Result::LeaseGet(Ok(Some((lease_of(3, 2, expires), tag())))),
+        &h.meta,
+        &mut out,
+    );
+    assert!(out.is_empty(), "routed again: {out:?}");
+}
+
+/// A reconfiguration that lost its CAS to a renewal of ours, and finds a
+/// renewal CAS of ours out when its re-read comes back, does not put a second
+/// CAS on the same version beside it: the set is asked for again when the
+/// renewal settles.
+#[test]
+fn a_reconfig_re_read_does_not_cas_beside_a_renewal_that_is_out() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let mut out = Vec::new();
+    h.core.issue_reconfig(h.clk(), vec![2], &h.meta, &mut out);
+    let (cas, listed) = swap_in(&out).expect("the reconfiguration CAS");
+    assert_eq!(listed.backups, vec![2]);
+    let (_renew, _) = renewal_cas(&mut h);
+    let out = h.step(Event::S3 {
+        op: cas,
+        result: S3Result::LeasePut(Err(CasFailure::Conflict)),
+    });
+    let reread = get_in(&out).expect("the reconfiguration re-reads");
+    let fresh = h.core.lease.held.as_ref().unwrap().0.clone();
+    let out = h.step(Event::S3 {
+        op: reread,
+        result: S3Result::LeaseGet(Ok(Some((fresh, tag2())))),
+    });
+    assert!(
+        swap_in(&out).is_none(),
+        "a second CAS beside the renewal: {out:?}"
+    );
+    assert_eq!(h.core.ack.reconfig_wanted, Some(vec![2]));
 }
