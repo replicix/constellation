@@ -523,17 +523,29 @@ impl Meta {
         }
         // Plan 43 C2d (§5.1): the delegate fast path's row is classed now,
         // under the writer lock, by what the core has published for the
-        // generation at this moment. Decided before anything is recorded:
-        // a generation no longer published refuses the op unwritten.
+        // generation at this moment, and by the row's own place in the
+        // stream: a `Lone` class is the core's for a row within the lead
+        // it published (`SessionState::deleg_row_class_at`), and one behind
+        // a gated row of this node's own that has not committed is
+        // `DelegGroup` (`Meta::delegate_gated_idx`). Decided before anything
+        // is recorded: a generation no longer published refuses the op
+        // unwritten.
         let class_at_journal = match journal::PendingDelegate::peek() {
             Some(d)
                 if d.idx.is_none()
                     && journal::ClassAtJournal::active()
                     && journal::PendingClass::current().is_none() =>
             {
+                let next = kv_get_tx(tx, &self.local, &deleg_idx_key(d.gen))?
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0)
+                    + 1;
+                let gated = kv_get_tx(tx, &self.local, &deleg_gated_key(d.gen))?
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
                 Some(
                     self.session()
-                        .deleg_row_class(d.gen)
+                        .deleg_row_class_at(d.gen, next, gated)
                         .ok_or(MetaError::NotAdmitted)?,
                 )
             }
@@ -605,6 +617,19 @@ impl Meta {
                 self.session().published_class()
             }
         };
+        // Plan 43 C2 (hysteresis): a gated row of this delegate's own node's
+        // clients is the generation's gated high-water: its `Lone` rows
+        // are journaled only after it has committed (`deleg_gated_key`).
+        if gen != 0 && class.gated() && (class_at_journal.is_some() || journal::PendingClass::own())
+        {
+            let key = deleg_gated_key(gen);
+            let held = kv_get_tx(tx, &self.local, &key)?
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            if idx > held {
+                kv_set_tx(tx, &self.local, &key, &idx.to_string());
+            }
+        }
         journal::note_journaled(journal::JournaledRow {
             first: local.start,
             last: end - 1,
@@ -776,6 +801,36 @@ impl Meta {
         Ok(kv_get_tx(&r, &self.local, &deleg_idx_key(gen))?
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0))
+    }
+
+    /// Plan 43 C2 (hysteresis): the highest stream index of `gen` this node,
+    /// the delegate, journaled for its own node's client with a class that
+    /// waits for the group (0: none). Its `Lone` rows follow only once the
+    /// prefix through it has committed: a root crash drops an uncommitted
+    /// gated row at the strand and replays the later `Lone` one, which then
+    /// runs without the effect it was answered on top of.
+    pub fn delegate_gated_idx(&self, gen: u64) -> Result<u64, MetaError> {
+        let r = self.db.read_tx();
+        Ok(kv_get_tx(&r, &self.local, &deleg_gated_key(gen))?
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0))
+    }
+
+    /// Testing only (the simulation's oracles): every unretired journal row
+    /// of generation `gen` as `(idx, class, rid)`, in index order.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn delegate_rows_for_audit(
+        &self,
+        gen: u64,
+    ) -> Result<Vec<(u64, RowClass, Option<Rid>)>, MetaError> {
+        let r = self.db.read_tx();
+        let mut rows: Vec<(u64, RowClass, Option<Rid>)> = read_journal_txs(&r, self)?
+            .into_iter()
+            .filter(|(_, row)| row.gen == gen)
+            .map(|(_, row)| (row.idx, row.class, row.rid))
+            .collect();
+        rows.sort_by_key(|(idx, ..)| *idx);
+        Ok(rows)
     }
 
     /// Whether a takeover's strand took rows of this node's stream `gen`
@@ -2184,6 +2239,13 @@ mod root_substitution_tests {
 /// generation.
 fn deleg_idx_key(gen: u64) -> String {
     format!("deleg_idx:{gen}")
+}
+
+/// `local` kv: the highest index of generation `gen` this node, its
+/// delegate, journaled for its own node's client with a gated class
+/// (`Meta::delegate_gated_idx`).
+fn deleg_gated_key(gen: u64) -> String {
+    format!("deleg_gated:{gen}")
 }
 
 /// `local` kv: the highest index of generation `gen` this replica holds

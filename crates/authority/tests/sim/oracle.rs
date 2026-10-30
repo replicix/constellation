@@ -70,6 +70,93 @@ pub struct Oracles {
     pub acks_unsourced: AtomicU64,
     /// Plan 43 C7b, I6: the lease-claim oracle (see [`LeaseClaims`]).
     pub leases: Arc<LeaseClaims>,
+    /// Review follow-ups of the lone lead: own `Lone` rows of a lone
+    /// delegate past the lead, or behind an uncommitted gated row of its own
+    /// (see [`LoneLead`]).
+    pub lone_lead: Mutex<LoneLead>,
+}
+
+/// The lone delegate's lead oracle (`Core::deleg_lone_held`): a row of its
+/// own node's clients is `Lone` only when its journal is fewer transactions
+/// past the committed prefix than the lead, and when no gated row of its
+/// own node's clients is uncommitted before it. Checked after every step
+/// against the delegate's journal and what it knows to be committed: a
+/// `Lone` row past `committed + lead` could not have been within the lead
+/// when it was journaled (the prefix only grows), and a `Lone` row behind a
+/// gated row that is still uncommitted was journaled while it was.
+#[derive(Default)]
+pub struct LoneLead {
+    /// `(node, gen, idx)` of own `Lone` rows more than the lead past the
+    /// committed prefix.
+    pub past_lead: BTreeSet<(NodeId, u64, u64)>,
+    /// `(node, gen, idx)` of own `Lone` rows behind an uncommitted own gated
+    /// row.
+    pub behind_gated: BTreeSet<(NodeId, u64, u64)>,
+    /// The first violations, described.
+    pub examples: Vec<String>,
+    /// Rows judged (distinct `(node, gen, idx)` of own `Lone` rows seen),
+    /// so a run that never exercised the rule shows.
+    pub lone_rows_seen: BTreeSet<(NodeId, u64, u64)>,
+    /// Own gated rows seen the same way.
+    pub gated_rows_seen: BTreeSet<(NodeId, u64, u64)>,
+    /// The highest prefix each delegate has known committed: the group's
+    /// own count can dip while it changes (a requested backup holds
+    /// nothing yet), the commit point of a row already journaled does not.
+    high_water: BTreeMap<(NodeId, u64), u64>,
+}
+
+impl LoneLead {
+    /// Judge the rows of `node`'s generation `gen`: `rows` are its
+    /// unretired journal rows `(idx, class, rid)`, `committed` the prefix
+    /// the delegate knows committed, `lead` the lead in transactions.
+    pub fn judge(
+        &mut self,
+        node: NodeId,
+        gen: u64,
+        rows: &[(u64, constellation_meta::RowClass, Option<Rid>)],
+        committed: u64,
+        lead: u64,
+    ) {
+        let hw = self.high_water.entry((node, gen)).or_default();
+        *hw = (*hw).max(committed);
+        let committed = *hw;
+        let own = |rid: &Option<Rid>| rid.is_some_and(|r| r.node == node);
+        let mut open_gated: Option<u64> = None;
+        for (idx, class, rid) in rows {
+            if !own(rid) {
+                continue;
+            }
+            let key = (node, gen, *idx);
+            if class.gated() {
+                self.gated_rows_seen.insert(key);
+                if *idx > committed && open_gated.is_none() {
+                    open_gated = Some(*idx);
+                }
+            } else if *class == constellation_meta::RowClass::Lone {
+                self.lone_rows_seen.insert(key);
+                if *idx > committed.saturating_add(lead) && self.past_lead.insert(key) {
+                    self.note(format!(
+                        "node {node} gen {gen}: own Lone row {idx} is more than the lead \
+                         ({lead}) past the committed prefix ({committed})"
+                    ));
+                }
+                if let Some(g) = open_gated {
+                    if self.behind_gated.insert(key) {
+                        self.note(format!(
+                            "node {node} gen {gen}: own Lone row {idx} follows own gated row {g}, \
+                             not committed (committed prefix {committed})"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    fn note(&mut self, what: String) {
+        if self.examples.len() < 5 {
+            self.examples.push(what);
+        }
+    }
 }
 
 impl Oracles {
@@ -95,6 +182,7 @@ impl Oracles {
             acks_unmapped: AtomicU64::new(0),
             i1_violations: Mutex::new(Vec::new()),
             claim_violations: Mutex::new(Vec::new()),
+            lone_lead: Mutex::new(LoneLead::default()),
             acks_unsourced: AtomicU64::new(0),
         })
     }

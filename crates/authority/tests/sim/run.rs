@@ -654,6 +654,11 @@ pub struct SimConfig {
     /// was not of class Lone fails the run (`strict_durability` turns it
     /// on from C1).
     pub strict_lone: bool,
+    /// A lone delegate's own `Lone` rows are within the lead of the
+    /// committed prefix and behind no uncommitted gated row of its own
+    /// (`Core::deleg_lone_held`, oracle `LoneLead`): a run with one that is
+    /// not fails. On everywhere; counted either way.
+    pub strict_lone_lead: bool,
     /// I6 `no_ttl_claim_of_a_live_lease` (plan 43 C7b): a lease CAS that
     /// takes another node's unreleased, unfenced lease without a permit
     /// while the old holder's own process still honours it (its
@@ -953,6 +958,7 @@ impl Default for SimConfig {
             strict_identity: false,
             strict_settle: false,
             strict_lone: false,
+            strict_lone_lead: true,
             strict_lease_claims: true,
             rebuild_stub: false,
             plant_ungated_fast_path: false,
@@ -1145,6 +1151,13 @@ pub struct Report {
     pub max_backups: usize,
     /// The first five violations of each oracle.
     pub oracle_examples: Vec<String>,
+    /// A lone delegate's own `Lone` rows more than the lead past the
+    /// committed prefix, and behind an uncommitted gated row of its own
+    /// (`LoneLead`); and the distinct own rows judged, `Lone` and gated.
+    pub lone_past_lead: usize,
+    pub lone_behind_gated: usize,
+    pub lone_rows_judged: usize,
+    pub gated_rows_judged: usize,
 }
 
 pub struct Cluster {
@@ -4818,6 +4831,14 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.seals_of_a_live_holder = oracles.leases.seals_of_a_live_holder.load(ord);
         report.permitted_claims = oracles.leases.permitted_claims.load(ord);
     }
+    let lone_lead_examples = {
+        let ll = oracles.lone_lead.lock().unwrap();
+        report.lone_past_lead = ll.past_lead.len();
+        report.lone_behind_gated = ll.behind_gated.len();
+        report.lone_rows_judged = ll.lone_rows_seen.len();
+        report.gated_rows_judged = ll.gated_rows_seen.len();
+        ll.examples.clone()
+    };
     report.oracle_examples = found.examples();
     let counters = format!(
         "oracle counters: acks by class {:?}, uncommitted {:?}, unjournaled refusals {:?}, \
@@ -4853,6 +4874,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         (cfg.strict_settle, "I4", &found.i4),
         (cfg.strict_settle, "I4", &found.unjournaled_landed),
         (cfg.strict_lone || cfg.strict_durability, "I5", &found.i5),
+        (cfg.strict_lone_lead, "lone lead", &lone_lead_examples),
         // Last: a seed that also fails another check reports that one, so
         // the failing seeds without the oracle are the ones it does not
         // head.

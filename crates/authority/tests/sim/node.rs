@@ -711,6 +711,7 @@ impl NodeHandle {
             beats_lost_in_lag: env.beats_lost_in_lag,
             oracles: env.oracles.clone(),
             forwards: HashMap::new(),
+            lone_audit_seen: BTreeMap::new(),
             rebuild_stub: env.rebuild_stub,
             plant_ungated_fast_path: env.plant_ungated_fast_path,
             plant_claim_root_group_on_lone: env.plant_claim_root_group_on_lone,
@@ -978,6 +979,10 @@ struct Driver {
     /// `MutateReply`'s emission.
     oracles: Arc<super::oracle::Oracles>,
     forwards: HashMap<(NodeId, OpId), Rid>,
+    /// Per generation this node is the delegate of: the journal tip and the
+    /// committed prefix the lone-lead oracle last judged, so a step that
+    /// changed neither is not judged again.
+    lone_audit_seen: BTreeMap<u64, (u64, u64)>,
     rebuild_stub: bool,
     plant_ungated_fast_path: bool,
     plant_claim_root_group_on_lone: bool,
@@ -1025,6 +1030,10 @@ struct HeldWrite {
     /// the core had published when the write was admitted), which its
     /// answer says and waits by.
     class: Option<constellation_authority::core::AckClass>,
+    /// A delegate's write: the class `Meta::finish_local` journaled its row
+    /// with (`Meta::delegate_execute_admitted`: decided at the journaling,
+    /// as the engine's fast path does), once its transaction is over.
+    journaled: Arc<Mutex<Option<constellation_meta::RowClass>>>,
     tag: LockTag,
     shared: Arc<Shared>,
     release_at: tokio::time::Instant,
@@ -2003,6 +2012,7 @@ impl Driver {
             self.note_rollbacks();
             self.note_journaled_refusals();
             self.note_identity();
+            self.note_lone_rows();
             self.dispatch(actions);
             self.poll_fast_waits();
             self.refresh_view();
@@ -2382,6 +2392,34 @@ impl Driver {
         );
     }
 
+    /// The lone delegate's lead oracle ([`super::oracle::LoneLead`]): this
+    /// node's own `Lone` rows of each generation it is the delegate of, judged
+    /// against the prefix its core knows committed.
+    fn note_lone_rows(&mut self) {
+        let mut view = constellation_authority::core::DelegView::default();
+        self.core.deleg_view_local(&mut view);
+        let lead = (self.core.config().delegation_stream_rows as u64).max(1);
+        for m in &view.mine {
+            let gen = m.1;
+            let Some(committed) = self.core.deleg_committed_for_audit(gen, &*self.meta) else {
+                continue;
+            };
+            let tip = self.meta.journal_tip().unwrap_or(0);
+            if self.lone_audit_seen.get(&gen) == Some(&(tip, committed)) {
+                continue;
+            }
+            self.lone_audit_seen.insert(gen, (tip, committed));
+            let Ok(rows) = self.meta.delegate_rows_for_audit(gen) else {
+                continue;
+            };
+            self.oracles
+                .lone_lead
+                .lock()
+                .unwrap()
+                .judge(self.id, gen, &rows, committed, lead);
+        }
+    }
+
     /// Plan 43 C0, I1: an answer leaves this node (a `MutateReply` to a
     /// requester when `source` is `None`, else its own client's reply, which
     /// the core says the source of: plan 43 C2a). A sequencer's answer is
@@ -2633,6 +2671,7 @@ impl Driver {
             epoch,
             deleg: None,
             class: None,
+            journaled: Default::default(),
             tag: tag.clone(),
             shared: self.shared.clone(),
             release_at: tokio::time::Instant::now() + std::time::Duration::from_millis(write_ms),
@@ -2710,6 +2749,7 @@ impl Driver {
         // with it and the answer says it and waits by it.
         let row_class = session.deleg_row_class(gen)?;
         let class = ack_class_of(row_class, gen);
+        let journaled: Arc<Mutex<Option<constellation_meta::RowClass>>> = Default::default();
         let (_, write_ms) = self.shared.hold_next.lock().unwrap().take()?;
         let epoch = self.core.ship().max_epoch.max(1);
         let (phase_tx, phase) = std::sync::mpsc::channel();
@@ -2718,6 +2758,7 @@ impl Driver {
         let rt = tokio::runtime::Handle::current();
         let thread = {
             let (meta, op, tag) = (self.meta.clone(), op.clone(), tag.clone());
+            let journaled = journaled.clone();
             let checked = phase_tx.clone();
             let mut go_rx = Some(go_rx);
             let clock = self.clock.clone();
@@ -2730,9 +2771,23 @@ impl Driver {
                     let _ = checked.send(HeldPhase::Checked);
                     go_rx.take().is_none_or(|rx| rx.recv().unwrap_or(false))
                 })));
+                // As the engine's fast path journals it: the row is classed
+                // under the writer lock, by what the core has published and
+                // by the row's own place in the stream.
                 let r = {
-                    let _class = constellation_meta::PendingClass::set(row_class);
-                    meta.delegate_execute(&op, Some(rid), gen, deps, &tag, now)
+                    constellation_meta::clear_last_journaled();
+                    let r = meta.delegate_execute_admitted(
+                        &op,
+                        Some(rid),
+                        gen,
+                        deps,
+                        &tag,
+                        now,
+                        Box::new(|| true),
+                    );
+                    *journaled.lock().unwrap() =
+                        constellation_meta::take_last_journaled().map(|j| j.class);
+                    r
                 };
                 constellation_meta::write_check_hook::set(None);
                 let at = clock.elapsed_ms();
@@ -2752,6 +2807,7 @@ impl Driver {
             epoch,
             deleg: Some(gen),
             class: Some(class),
+            journaled: journaled.clone(),
             tag: tag.clone(),
             shared: self.shared.clone(),
             release_at: tokio::time::Instant::now() + std::time::Duration::from_millis(write_ms),
@@ -2803,6 +2859,10 @@ impl Driver {
                 if let Some(idx) = idx {
                     session.note_stream(gen, idx);
                 }
+                let class = journaled
+                    .lock()
+                    .unwrap()
+                    .map_or(class, |c| ack_class_of(c, gen));
                 Some(self.delegate_done(now, rid, op, tag, outcome, gen, idx, class))
             }
             Err(_) => panic!("held write thread vanished"),
@@ -2817,9 +2877,19 @@ impl Driver {
         let (rid, op) = (held.rid, held.op.clone());
         let _ = held.epoch;
         let deleg = held.deleg;
+        let journaled = held.journaled.clone();
         let class = held.class;
         let tag = held.tag.clone();
         let (outcome, idx, landed_at) = held.finish();
+        let class = match (deleg, class) {
+            (Some(gen), Some(class)) => Some(
+                journaled
+                    .lock()
+                    .unwrap()
+                    .map_or(class, |c| ack_class_of(c, gen)),
+            ),
+            _ => class,
+        };
         match &outcome {
             MutateOutcome::LockLapsed => {
                 self.shared.held_refused.fetch_add(1, Ordering::Relaxed);

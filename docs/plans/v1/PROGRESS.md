@@ -61295,3 +61295,64 @@ Request counts per run (ext4; the other state dirs the same): `git status` plus 
 and `ls` of 1k unchanged (3 plus pages with 1,000 entries and one `LOOKUP`; one plus page of 721 entries and two
 plain pages). The `fix` column's `ls -l` medians are within the runs' spread of `main`'s (ranges 16-22 against
 15-21 ms); nothing in the change runs for a name nobody looked up but one hash-table read.
+
+## Review follow-ups of the lone delegate's lead: an exact lead, hysteresis, oracle (2026-10-30)
+
+F1 (the lead was soft). The fast path classed its row under the writer lock from the class the core published at the end
+of its last step, but the stream index advances between steps, so a busy core let the fast path journal about
+fast-path rate x core-step latency of `Lone` rows past the lead. The core now publishes a horizon with the class
+(`DelegDurable::horizon` = committed prefix + lead, `Core::deleg_lone_horizon`) and `Meta::finish_local` classes each row
+by its own index against it (`SessionState::deleg_row_class_at`): a `Lone` class holds only for an index at or below the
+horizon. The published prefix lags the commit and the published class lags the journal; both only make the class stronger.
+
+F2 (hysteresis). With the lead flipping, an own `Lone` row could sit behind an uncommitted own `DelegGroup` row of the
+same generation (and so could one of a delegate that turned lone after journaling `DelegGroup` rows). At a root crash the
+end of the generation drops the `DelegGroup` row (its client was not answered) and replays the `Lone` one, which then
+runs without the effect it was answered on top of: a create of `f`, then a rename of `f` to `g`, the rename fails after
+its client was told it succeeded. Now `Lone` returns only once every gated row journaled for the delegate's own node's
+clients (`Meta::delegate_gated_idx`, a persisted per-generation high-water set in `finish_local` for a row journaled
+under `PendingClass::set_own` or by the fast path) has committed (`Core::deleg_lone_held`, and on the fast path the same
+test against the published prefix). Against plan 43's I5: the answer was class `Lone`, so I5 allowed the rollback and the
+`non_lone_rollbacks` oracle never counted it (it is a lone-branch replay that fails); the rule removes the case, and the
+new oracle checks it directly. Decision: another node's forward is not such a row. It is `DelegGroup` by design, a lone
+delegate that serves remote nodes always has one in flight, and holding its own rows behind it would end the
+speculation for it; the forward case stays the known C2 residual of `long-delegated-backup`. Counting forwards too is
+dropping the own-row test in `finish_local` (the cost to measure: the dirsplit bench T4).
+
+F4 (tests). Engine: a_delegates_row_past_the_lead_waits_while_the_core_still_publishes_lone (F1: a row past the horizon
+is journaled `DelegGroup` and waits while the published class is still `Lone`; rows 1 and 2 `Lone`, row 3 waits,
+row 4 `Lone` after the horizon moves), a_delegates_lone_row_follows_only_a_committed_gated_row (F2). Meta:
+a_lone_class_holds_only_within_the_horizon_and_behind_no_open_gated_row. Core:
+a_lone_row_does_not_follow_an_uncommitted_gated_row_of_the_generation (create, lead flips back, rename, root crash:
+the rename waits and both rows are dropped) and its twin without_the_hysteresis_the_rename_is_answered_lone_and_replayed_alone
+(`delegation_lone_hysteresis` off: the rename is answered `Lone` and replayed alone, which is what the parent did).
+Simulation: oracle `LoneLead` (`tests/sim/oracle.rs`) judges after every step the delegate's own journal rows against the
+prefix it knows committed (high-water): an own `Lone` row more than the lead past it, or behind an uncommitted own gated
+row, fails the run (`SimConfig::strict_lone_lead`, on); `SWEEP-LONE-LEAD-TOTALS` counts the rows judged. The sim's
+delegate fast path (`delegate_hold`, writes held under a lock) now journals through `Meta::delegate_execute_admitted`,
+the engine's own path, so it classes at the journaling; the sim still does not run the fast path otherwise
+(`journal-class-from-session=0`), so the F1 fail-before is the engine test. Negative controls `long-delegated-lead-off`
+(`Config::delegation_lone_lead` off) and `long-delegated-hysteresis-off` (`delegation_lone_hysteresis` off) fail by
+design: in 300 seeds the lead control trips on dozens (seeds 0, 3, 4, 6, 7, ...), the hysteresis control on seeds 57 and 103
+(`the_lone_lead_oracle_catches_a_disabled_lead_and_a_disabled_hysteresis`); `long-delegated-lead` passes its seeds with
+own `Lone` and gated rows judged (a_lone_delegates_own_lone_rows_stay_within_the_lead_and_behind_no_open_gated_row).
+
+Verification (rebased on 6d53adde). Each fix removed alone, tests kept: without F1 (no horizon test in
+`deleg_row_class_at`) the meta test a_lone_class_holds_only_within_the_horizon_and_behind_no_open_gated_row and the engine
+test a_delegates_row_past_the_lead_waits_while_the_core_still_publishes_lone fail; without F2 (the core and fast-path
+tests of the gated row) the same meta test, the engine test a_delegates_lone_row_follows_only_a_committed_gated_row and the
+core test a_lone_row_does_not_follow_an_uncommitted_gated_row_of_the_generation fail. The negative controls fail with
+their mechanism off: in 300 seeds `long-delegated-lead-off` trips the oracle on dozens, `long-delegated-hysteresis-off` on
+exactly seeds 57 and 103. Gates: fmt, clippy `-D warnings` (workspace, all targets), lib tests of authority (777), engine
+(937), meta (377) and harness (162), the release authority sim suite (278 passed, 11 ignored). 2,000-seed sweeps of
+`long-delegated`, `long-delegated-lead` and every `delegated-*` family: no failure and `LoneLead` at 0 and 0 with own Lone
+and gated rows judged, except the three variants that fail on every seed by design (`delegated-core-stall-unlaned`,
+`delegated-core-stall-root-unlaned`, `delegated-core-stall-root-backup-unprobed`; the same on `main`). Seed 1682 of
+`long-delegated-backup` grows past 9 GB without finishing, on `main` and on this change alike; its other 1,999 seeds pass.
+Cost of F2, dirsplit bench T4 with `d`, four writers, uniform, three runs each on a loaded 16-core host (ops/s of w0, then
+each other writer; no errors): `main` 1,102, 1,088 and 1,088 with 4.3 each; this change 1,145, 1,077 and 1,105 with 4.2
+to 4.8.
+
+Not done: k stream batches in flight with lead = k x batch (it changes the stream's protocol, not a class rule). ADR-33,
+DESIGN.md, delegations.md and TESTING.md say the new rule.
+

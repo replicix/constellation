@@ -408,6 +408,18 @@ pub struct Config {
     pub lock_cache_idle_ms: u64,
     /// Rows per `DelegateStream` batch.
     pub delegation_stream_rows: usize,
+    /// A lone delegate's own rows are `Lone` only while its journal is
+    /// fewer transactions past the committed prefix than a stream batch
+    /// carries records (`Core::deleg_lone_lead_full`). Always on in
+    /// production; the simulation turns it off as the negative control of
+    /// the oracle that counts own `Lone` rows past the lead.
+    pub delegation_lone_lead: bool,
+    /// A lone delegate's own row is `Lone` only once every gated row of the
+    /// generation journaled for its own node's clients has committed
+    /// (`Core::deleg_lone_held_by_gated`). Always on in production; the
+    /// simulation turns it off as the negative control of the oracle that
+    /// counts own `Lone` rows behind an uncommitted gated one.
+    pub delegation_lone_hysteresis: bool,
     /// The delegate's stream/renew retry tick.
     pub delegation_stream_tick_ms: u64,
     /// The root reclaims a grant nobody renewed (a crashed delegate).
@@ -654,6 +666,8 @@ impl Config {
             lock_ttl_ms: 20_000,
             lock_cache_idle_ms: 30_000,
             delegation_stream_rows: 256,
+            delegation_lone_lead: true,
+            delegation_lone_hysteresis: true,
             delegation_stream_tick_ms: 50,
             delegation_reclaim_expired: true,
             placement: true,

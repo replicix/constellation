@@ -1318,7 +1318,15 @@ impl Core {
                 (wait_gen, exec_idx) = (g, Some(idx));
             }
         }
-        let _row_class = (!dedup).then(|| constellation_meta::PendingClass::set(class.into()));
+        let _row_class = (!dedup).then(|| {
+            // The delegate's own node's rows are the ones its `Lone` rows
+            // follow ([`Self::deleg_lone_held_by_gated`]).
+            if asker == Asker::Own {
+                constellation_meta::PendingClass::set_own(class.into())
+            } else {
+                constellation_meta::PendingClass::set(class.into())
+            }
+        });
         let outcome = if let Some(records) = replica.recent_outcome(rid) {
             self.stats.forward_dedup_hits += 1;
             MutateOutcome::Accepted { epoch, records }
@@ -1515,8 +1523,10 @@ impl Core {
     ///
     /// A lone delegate's own rows are `Lone` only while its journal is
     /// within a bounded lead of what the root holds
-    /// ([`Self::deleg_lone_lead_full`]); past it they wait for the root
-    /// too, like every other node's.
+    /// ([`Self::deleg_lone_lead_full`]) and no gated row of its own node's
+    /// clients is uncommitted ahead of them
+    /// ([`Self::deleg_lone_held_by_gated`]); otherwise they wait for the
+    /// root too, like every other node's.
     pub fn deleg_ack_class(
         &self,
         now: Now,
@@ -1532,7 +1542,7 @@ impl Core {
             Some(d)
                 if asker == Asker::Own
                     && self.deleg_lone(now, d)
-                    && !self.deleg_lone_lead_full(d, replica) =>
+                    && !self.deleg_lone_held(d, replica) =>
             {
                 AckClass::Lone
             }
@@ -1603,10 +1613,69 @@ impl Core {
     /// deadline answered `EIO`. Past the lead its own rows wait for the root
     /// too (`DelegGroup`), so its node's load is held to what the stream
     /// carries and a forward waits for a bounded few batches.
-    pub(crate) fn deleg_lone_lead_full(&self, d: &DelegateState, replica: &dyn Replica) -> bool {
+    fn deleg_lone_lead_full(
+        &self,
+        d: &DelegateState,
+        replica: &dyn Replica,
+        committed: u64,
+    ) -> bool {
+        self.cfg.delegation_lone_lead
+            && replica.delegate_idx(d.gen).saturating_sub(committed)
+                >= (self.cfg.delegation_stream_rows as u64).max(1)
+    }
+
+    /// A lone delegate's own row is not `Lone` now: its journal is a lead
+    /// ahead of the committed prefix ([`Self::deleg_lone_lead_full`]), or a
+    /// gated row of its own node's clients is uncommitted ahead of it
+    /// ([`Self::deleg_lone_held_by_gated`]).
+    pub(crate) fn deleg_lone_held(&self, d: &DelegateState, replica: &dyn Replica) -> bool {
         let committed = self.deleg_committed_through(d, replica.log_stream_idx(d.gen));
-        replica.delegate_idx(d.gen).saturating_sub(committed)
-            >= (self.cfg.delegation_stream_rows as u64).max(1)
+        self.deleg_lone_lead_full(d, replica, committed)
+            || self.deleg_lone_held_by_gated(d, replica, committed)
+    }
+
+    /// The highest stream index a `Lone` row of `d`'s generation may take:
+    /// the committed prefix plus the lead. The row that takes index `n` is
+    /// within the lead exactly when `n <= horizon`
+    /// ([`Self::deleg_lone_lead_full`] asked about the index before it).
+    /// Published with the class ([`Self::report_deleg_durable`]) so the
+    /// fast path classes each row by its own index, under the writer lock,
+    /// instead of by the class the core published at the end of its last
+    /// step: the journal moves between the steps of a busy core.
+    fn deleg_lone_horizon(&self, through: u64) -> u64 {
+        if self.cfg.delegation_lone_lead {
+            through.saturating_add((self.cfg.delegation_stream_rows as u64).max(1))
+        } else {
+            u64::MAX
+        }
+    }
+
+    /// An own `Lone` row of `d`'s generation would follow a gated row of
+    /// its own node's clients that has not committed. At a root crash the
+    /// strand drops the uncommitted gated row (its client was not answered
+    /// and retries by rid) and replays the `Lone` one after it, which then
+    /// runs without the effect it was answered on top of (a create of `f`,
+    /// then a rename of `f`: the rename fails). The lead flips a lone
+    /// delegate's class back and forth, and a delegate that turned lone
+    /// after journaling `DelegGroup` rows has such rows too: `Lone` returns
+    /// only once every one of them has committed. Another node's forward is
+    /// no such row (its client is not answered by this node's disk).
+    fn deleg_lone_held_by_gated(
+        &self,
+        d: &DelegateState,
+        replica: &dyn Replica,
+        committed: u64,
+    ) -> bool {
+        self.cfg.delegation_lone_hysteresis && replica.delegate_gated_idx(d.gen) > committed
+    }
+
+    /// The committed prefix of `gen`'s stream as this delegate knows it
+    /// (`None`: not held here), for the simulation's oracles.
+    pub fn deleg_committed_for_audit(&self, gen: u64, replica: &dyn Replica) -> Option<u64> {
+        self.dl
+            .mine
+            .get(&gen)
+            .map(|d| self.deleg_committed_through(d, replica.log_stream_idx(gen)))
     }
 
     /// Plan 43 C2 (§2.1): this delegate is lone for `d`'s generation: its
@@ -1743,6 +1812,7 @@ impl Core {
                 constellation_meta::DelegDurable {
                     class: class.into(),
                     through,
+                    horizon: self.deleg_lone_horizon(through),
                     lost: d.stopped || d.lapsed || d.backup_sealed,
                 },
             );

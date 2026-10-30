@@ -373,6 +373,8 @@ fn replay_seed() {
         Ok("long-delegated") => long_delegated_config(),
         Ok("long-delegated-backup") => long_delegated_backup_config(),
         Ok("long-delegated-lead") => long_delegated_lead_config(),
+        Ok("long-delegated-lead-off") => long_delegated_lead_off_config(),
+        Ok("long-delegated-hysteresis-off") => long_delegated_hysteresis_off_config(),
         Ok("long-delegated-late-answers") => long_delegated_late_answers_config(),
         Ok("delegated-core-stall") => delegated_core_stall_config(),
         Ok("delegated-core-stall-lease6") => delegated_core_stall_lease6_config(),
@@ -5141,6 +5143,8 @@ fn sweep_config() {
         "delegated-holder-cut" => delegated_holder_cut_config(),
         "long-delegated" => long_delegated_config(),
         "long-delegated-lead" => long_delegated_lead_config(),
+        "long-delegated-lead-off" => long_delegated_lead_off_config(),
+        "long-delegated-hysteresis-off" => long_delegated_hysteresis_off_config(),
         "long-backup" => long_backup_config(),
         "backup-runtime-lag" => backup_runtime_lag_config(),
         "backup-lag-at-expiry" => backup_lag_at_expiry_config(false),
@@ -6323,6 +6327,38 @@ fn long_delegated_lead_config() -> SimConfig {
     }
 }
 
+/// `long-delegated-lead` with the lead disabled
+/// (`Config::delegation_lone_lead`): the negative control of the oracle that
+/// counts a lone delegate's own `Lone` rows past the lead. It fails by
+/// design (`the_lone_lead_oracle_catches_a_disabled_lead`).
+fn long_delegated_lead_off_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(|node, inc| {
+            let mut c = sim::run::sim_core_config(node, inc);
+            c.delegation_stream_rows = 2;
+            c.delegation_lone_lead = false;
+            c
+        }),
+        ..long_delegated_config()
+    }
+}
+
+/// `long-delegated-lead` with the hysteresis disabled
+/// (`Config::delegation_lone_hysteresis`): the negative control of the
+/// oracle that counts a lone delegate's own `Lone` rows behind an
+/// uncommitted gated row of its own. It fails by design.
+fn long_delegated_hysteresis_off_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(|node, inc| {
+            let mut c = sim::run::sim_core_config(node, inc);
+            c.delegation_stream_rows = 2;
+            c.delegation_lone_hysteresis = false;
+            c
+        }),
+        ..long_delegated_config()
+    }
+}
+
 /// `long-delegated` with backups in budget for the root and every
 /// delegate: the root streams its journal — its appends of the delegate
 /// streams included — ahead of S3, and a delegate's reply a requester
@@ -6800,6 +6836,10 @@ struct OracleTotals {
     /// Plan 43 C7b: tokens judged exactly and by their window, per path.
     tokens_exact: [u64; 4],
     tokens_window: [u64; 4],
+    /// The lone delegate's lead oracle: [own `Lone` rows past the lead,
+    /// behind an uncommitted gated row of their own, own `Lone` rows judged,
+    /// own gated rows judged].
+    lone_lead: [u64; 4],
 }
 
 impl OracleTotals {
@@ -6860,6 +6900,14 @@ impl OracleTotals {
             for (c, n) in self.claimed.iter_mut().zip(st.ack_classes) {
                 *c += n;
             }
+        }
+        for (t, n) in self.lone_lead.iter_mut().zip([
+            r.lone_past_lead,
+            r.lone_behind_gated,
+            r.lone_rows_judged,
+            r.gated_rows_judged,
+        ]) {
+            *t += n as u64;
         }
         self.i2 += r.identity_copies;
         self.i2c += r.non_verbatim;
@@ -6970,6 +7018,11 @@ impl OracleTotals {
             self.unsourced,
             self.unjournaled_landed,
             constellation_authority::core::AckClass::NAMES.iter().zip(self.claimed).collect::<Vec<_>>()
+        );
+        eprintln!(
+            "SWEEP-LONE-LEAD-TOTALS {label} seeds {}/{seeds}: own Lone rows past the lead {}, \
+             behind an uncommitted gated row {}; own rows judged: Lone {}, gated {}",
+            self.seeds, self.lone_lead[0], self.lone_lead[1], self.lone_lead[2], self.lone_lead[3]
         );
         eprintln!(
             "SWEEP-CLAIM-TOTALS {label} seeds {}/{seeds}: class-claim-mismatch={} in {} seeds, \
@@ -14005,4 +14058,75 @@ fn regression_delegated_backup_links_stalebase_seed_138() {
              AUTHORITY_SIM_CONFIG=delegated-backup+{variants}"
         )
     });
+}
+
+/// The lone delegate's lead oracle (`LoneLead`): over seeds of
+/// `long-delegated-lead` (a stream batch of two records, so the class
+/// flips between `Lone` and `DelegGroup` as the stream catches up) a
+/// lone delegate's own `Lone` rows are never more than the lead past the
+/// committed prefix and never behind an uncommitted gated row of its own;
+/// the rule is exercised (own `Lone` and gated rows were judged).
+#[test]
+fn a_lone_delegates_own_lone_rows_stay_within_the_lead_and_behind_no_open_gated_row() {
+    let (mut lone, mut gated) = (0, 0);
+    for seed in LONE_LEAD_SEEDS {
+        let r = run_seed(seed, long_delegated_lead_config()).unwrap_or_else(|e| {
+            panic!(
+                "long-delegated-lead seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=long-delegated-lead"
+            )
+        });
+        assert_eq!(
+            (r.lone_past_lead, r.lone_behind_gated),
+            (0, 0),
+            "seed {seed}"
+        );
+        lone += r.lone_rows_judged;
+        gated += r.gated_rows_judged;
+    }
+    assert!(
+        lone > 0 && gated > 0,
+        "the oracle judged {lone} own Lone and {gated} own gated rows: the lead never flipped"
+    );
+}
+
+const LONE_LEAD_SEEDS: [u64; 6] = [1, 2, 3, 4, 5, 6];
+
+/// The oracle's negative controls: with the lead disabled
+/// (`Config::delegation_lone_lead`) a lone delegate journals `Lone` rows past
+/// it, and with the hysteresis disabled (`Config::delegation_lone_hysteresis`)
+/// behind an uncommitted gated row; the run fails with the oracle's message.
+#[test]
+fn the_lone_lead_oracle_catches_a_disabled_lead_and_a_disabled_hysteresis() {
+    // Seeds a sweep of 300 found each to trip (the hysteresis control needs
+    // a gated row of its own and a `Lone` one after it, which is rarer).
+    type Control = (
+        &'static str,
+        fn() -> SimConfig,
+        &'static str,
+        &'static [u64],
+    );
+    let controls: [Control; 2] = [
+        (
+            "long-delegated-lead-off",
+            long_delegated_lead_off_config,
+            "more than the lead",
+            &[0, 3],
+        ),
+        (
+            "long-delegated-hysteresis-off",
+            long_delegated_hysteresis_off_config,
+            "follows own gated row",
+            &[57, 103],
+        ),
+    ];
+    for (label, config, needle, seeds) in controls {
+        let tripped = seeds.iter().all(|&seed| {
+            run_seed(seed, config()).is_err_and(|e| e.contains("lone lead") && e.contains(needle))
+        });
+        assert!(
+            tripped,
+            "{label}: a seed of {seeds:?} did not trip the oracle ({needle})"
+        );
+    }
 }

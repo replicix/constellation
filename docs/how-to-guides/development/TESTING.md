@@ -4518,7 +4518,12 @@ other nodes' ops and reads on the same names; the summary counts
 replies excusing own rows and chunks held back), `long-delegated`,
 `long-delegated-lead` (a stream batch of two records, so a lone delegate's
 own rows wait for the root whenever its journal is two transactions
-ahead of it), and every
+ahead of it, or an earlier row of its own node's clients still waits for
+it), `long-delegated-lead-off` and `long-delegated-hysteresis-off` (the
+negative controls of the `LoneLead` oracle, which fails every run in which a
+lone delegate's own `Lone` row is more than the lead past the committed
+prefix or behind an uncommitted gated row of its own: they fail by design,
+`SWEEP-LONE-LEAD-TOTALS` counts the rows judged), and every
 lock configuration of `long_locks` (`locks`, `locks-partition`, …,
 `locks-failover-backup-writes`). Use each long test's own start (its
 source) to sweep the same seeds.

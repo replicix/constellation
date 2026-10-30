@@ -1597,6 +1597,22 @@ ran the journal minutes ahead of a stream that carries one batch per round
 trip, and every other node's forward, answered behind every earlier row,
 starved until the client deadline answered `EIO`; rejected: answering
 forwards from the delegate's disk, the speculation this ADR removed). The
+lead is exact, not approximate: the core publishes the horizon (the committed
+prefix plus the lead) with the class, and the fast path classes each row by
+its own stream index against it under the writer lock, so what the fast path
+journals between two core steps cannot pass the lead (the error only ever
+goes toward the stronger class). The lead flips a lone delegate between `Lone`
+and `DelegGroup`, so a `Lone` row also waits for the gated rows before it:
+while a gated row journaled for the delegate's own node's clients is
+uncommitted, its later rows are `DelegGroup` too (2026-10-29: a create that
+waited for the root, then a rename of it answered from the disk, and a root
+crash drops the create at the strand and replays the rename, which fails on a
+name never created; I5 allows this, the answer was `Lone`, but nothing is
+gained by it; the same held for a delegate that turned lone after journaling
+`DelegGroup` rows). Another node's forward is not such a row: it is
+`DelegGroup` by design, and holding the delegate's own rows behind every
+forward would take the speculation from a delegate that serves remote nodes at
+all. The
 class is fixed when the row is journaled, a retry's answer waits for its row
 like the first answer did (D6), and the end of a generation drops the
 uncommitted rows past its cut instead of replaying them (their clients were

@@ -103,6 +103,7 @@ thread_local! {
     static LAST_JOURNALED: std::cell::Cell<Option<JournaledRow>> =
         const { std::cell::Cell::new(None) };
     static FROM_SESSION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PENDING_OWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// How many rows this thread journaled with the session's published class
@@ -131,16 +132,33 @@ impl PendingClass {
     pub fn set(class: crate::store::local::RowClass) -> PendingClassGuard {
         PendingClassGuard {
             prev: PENDING_CLASS.with(|c| c.replace(Some(class))),
+            prev_own: PENDING_OWN.with(|c| c.replace(false)),
+        }
+    }
+
+    /// [`Self::set`] for a row of a delegate's own node's client, executed
+    /// by the delegate (not another node's forward). A gated one is
+    /// recorded against its generation (`Meta::delegate_gated_idx`): the
+    /// delegate's `Lone` rows wait for it to commit.
+    pub fn set_own(class: crate::store::local::RowClass) -> PendingClassGuard {
+        PendingClassGuard {
+            prev: PENDING_CLASS.with(|c| c.replace(Some(class))),
+            prev_own: PENDING_OWN.with(|c| c.replace(true)),
         }
     }
 
     pub(crate) fn current() -> Option<crate::store::local::RowClass> {
         PENDING_CLASS.with(|c| c.get())
     }
+
+    pub(crate) fn own() -> bool {
+        PENDING_OWN.with(|c| c.get())
+    }
 }
 
 pub struct PendingClassGuard {
     prev: Option<crate::store::local::RowClass>,
+    prev_own: bool,
 }
 
 thread_local! {
@@ -183,6 +201,7 @@ impl Drop for ClassAtJournalGuard {
 impl Drop for PendingClassGuard {
     fn drop(&mut self) {
         PENDING_CLASS.with(|c| c.set(self.prev));
+        PENDING_OWN.with(|c| c.set(self.prev_own));
     }
 }
 

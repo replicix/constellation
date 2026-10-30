@@ -731,6 +731,12 @@ pub struct DelegDurable {
     /// it, or every member of the group (and of a requested change) holds
     /// it (`Core::deleg_committed_through`).
     pub through: u64,
+    /// The highest stream index a `Lone` row may take: the committed
+    /// prefix plus the lead (`Core::deleg_lone_lead_full`). The fast path
+    /// classes each row by its own index against it under the writer lock,
+    /// not by the class published at the end of the core's last step: the
+    /// journal moves between the core's steps.
+    pub horizon: u64,
     /// The generation is stopped, lapsed or lost its backup: nothing more
     /// will commit under it from here, the op's answer is in doubt.
     pub lost: bool,
@@ -1463,6 +1469,26 @@ impl SessionState {
             .map(|d| d.class)
     }
 
+    /// [`Self::deleg_row_class`] for the row that takes stream index `idx`,
+    /// given the highest index of a gated row of this node's own clients
+    /// journaled under the generation (`gated`). A `Lone` class holds for a
+    /// row within the published horizon (`DelegDurable::horizon`) and past
+    /// every such gated row that the published committed prefix covers;
+    /// otherwise the row waits for the group like a `DelegGroup` one. What
+    /// is published lags the journal and the commit (the core publishes at
+    /// the end of a step), and both lags only ever make the class stronger.
+    pub fn deleg_row_class_at(&self, gen: u64, idx: u64, gated: u64) -> Option<RowClass> {
+        let g = self.inner.lock().unwrap();
+        let d = g.deleg_durable.get(&gen)?;
+        Some(
+            if d.class == RowClass::Lone && (idx > d.horizon || gated > d.through) {
+                RowClass::DelegGroup
+            } else {
+                d.class
+            },
+        )
+    }
+
     /// Plan 43 C2d: the delegate fast path's wait for its group. The op
     /// journaled stream index `idx` of generation `gen`: `Durable` once the
     /// group has committed the prefix through it (the log, or every member
@@ -1844,6 +1870,7 @@ mod tests {
         let published = |class, through, lost| DelegDurable {
             class,
             through,
+            horizon: u64::MAX,
             lost,
         };
         let wait = |gen, idx| s.wait_deleg_durable(gen, idx, Duration::ZERO);
@@ -1892,6 +1919,7 @@ mod tests {
         let published = |through| DelegDurable {
             class: RowClass::DelegGroup,
             through,
+            horizon: u64::MAX,
             lost: false,
         };
         let wait = |gen, idx| s.wait_deleg_durable(gen, idx, Duration::ZERO);
@@ -1924,6 +1952,7 @@ mod tests {
             Some(DelegDurable {
                 class: RowClass::DelegGroup,
                 through: 2,
+                horizon: u64::MAX,
                 lost: false,
             }),
         );
@@ -1932,6 +1961,45 @@ mod tests {
         assert!(
             matches!(got, DurableWait::Durable(_)),
             "idx 1 was covered (through 2) before the generation was withdrawn: {got:?}"
+        );
+    }
+
+    /// The class of a fast-path row is the published one, made stronger by
+    /// the row's own place: a `Lone` class holds only for an index within
+    /// the published horizon (committed prefix plus the lead) and behind no
+    /// gated row of its own that the published prefix has not covered. The
+    /// published values lag the journal, which only makes the class
+    /// stronger; a class that waits is never weakened.
+    #[test]
+    fn a_lone_class_holds_only_within_the_horizon_and_behind_no_open_gated_row() {
+        let s = SessionState::default();
+        let publish = |class, through, horizon| {
+            s.set_deleg_durable(
+                7,
+                Some(DelegDurable {
+                    class,
+                    through,
+                    horizon,
+                    lost: false,
+                }),
+            );
+        };
+        assert_eq!(s.deleg_row_class_at(7, 1, 0), None, "not published");
+        // Committed 10, a lead of 4: indexes up to 14 are within it.
+        publish(RowClass::Lone, 10, 14);
+        assert_eq!(s.deleg_row_class_at(7, 14, 0), Some(RowClass::Lone));
+        assert_eq!(s.deleg_row_class_at(7, 15, 0), Some(RowClass::DelegGroup));
+        // A gated row of its own at or below the committed prefix is behind
+        // it; one above is not.
+        assert_eq!(s.deleg_row_class_at(7, 12, 10), Some(RowClass::Lone));
+        assert_eq!(s.deleg_row_class_at(7, 12, 11), Some(RowClass::DelegGroup));
+        // The class that waits stays whatever the index.
+        publish(RowClass::DelegGroup, 10, 14);
+        assert_eq!(s.deleg_row_class_at(7, 1, 0), Some(RowClass::DelegGroup));
+        publish(RowClass::NonStealable, 10, 14);
+        assert_eq!(
+            s.deleg_row_class_at(7, 99, 99),
+            Some(RowClass::NonStealable)
         );
     }
 

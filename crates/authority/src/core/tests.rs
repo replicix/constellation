@@ -39062,6 +39062,134 @@ mod deleg_group {
         assert!(answer_to_2(&out, 500).is_some(), "{out:?}");
     }
 
+    /// The delegate's own client renames `from` to `to` in `dir`.
+    fn own_rename(h: &mut Harness, dir: Ino, seq: u64, from: &str, to: &str) -> (Rid, Vec<Action>) {
+        let rid = h.rid(seq);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: MutateOp::Rename {
+                parent: dir,
+                name: from.into(),
+                new_parent: dir,
+                new_name: to.into(),
+                noreplace: false,
+            },
+            tag: Default::default(),
+        });
+        (rid, out)
+    }
+
+    /// A create, then a rename of what it created, with the lead flipping
+    /// between them and the root crashing before the create commits:
+    /// returns the rename's answer (`None`: not answered), and what the end
+    /// of the generation (`RecallCut` at the root's cursor) dropped and
+    /// queued for replay.
+    ///
+    /// A batch of two records (one create): rows 1 and 2 are `Lone` (within
+    /// the lead of the root's cursor), the create of `moved` (row 3) is
+    /// `DelegGroup` (two rows past it); the root's acks of rows 1 and 2
+    /// bring the lead back, with row 3 not yet committed.
+    fn create_then_rename_at_a_root_crash(
+        hysteresis: bool,
+    ) -> (Option<AnswerSource>, usize, Vec<Rid>, Rid) {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        h.core.cfg.delegation_stream_rows = 2;
+        h.core.cfg.delegation_lone_hysteresis = hysteresis;
+        let (_, out) = own_create(&mut h, dir, 1);
+        let (req, round, last) = batch(&out).expect("row 1 streams");
+        assert_eq!(last, 1);
+        let (_, out) = own_create(&mut h, dir, 2);
+        assert_eq!(
+            client_answers(&out)[0].1,
+            AnswerSource::Sequenced(AckClass::Lone)
+        );
+        // Row 3 is two past the root's cursor: it waits for the root.
+        let ino = h.meta.allocate_ino(dir).unwrap();
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: h.rid(3),
+            op: MutateOp::Create {
+                parent: dir,
+                name: "moved".into(),
+                ino,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            tag: Default::default(),
+        });
+        assert!(client_answers(&out).is_empty(), "the create waits: {out:?}");
+        // The root's acks of rows 1 and 2: the lead is back (row 3 is one
+        // past the cursor), row 3 is not committed.
+        let out = root_acks(&mut h, req, round, last);
+        let (req, round, last) = batch(&out).expect("row 2 streams");
+        assert_eq!(last, 2);
+        let out = root_acks(&mut h, req, round, last);
+        assert!(batch(&out).is_some(), "row 3 streams: {out:?}");
+        let (rename, out) = own_rename(&mut h, dir, 4, "moved", "renamed");
+        let answered = client_answers(&out)
+            .into_iter()
+            .find(|(rid, _)| *rid == rename)
+            .map(|(_, source)| source);
+        // The root crashes before it appends row 3: the generation ends
+        // with the cut at the root's cursor.
+        let applied = Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::RecallCut {
+                dir,
+                gen: 7,
+                through: 2,
+            }],
+        )
+        .unwrap();
+        // (Rows 1 and 2 are below the cut: the log carries them, in a real
+        // run; this segment does not, so they queue too and are left out.)
+        let queued: Vec<Rid> = h
+            .meta
+            .pending_replays()
+            .unwrap()
+            .into_iter()
+            .map(|q| q.rid)
+            .filter(|rid| rid.seq > 2)
+            .collect();
+        (answered, applied.stranded.deleg_dropped, queued, rename)
+    }
+
+    /// Review follow-up F2 (fail-before): with the lead flipping back, a
+    /// `Lone` row must not sit behind an uncommitted `DelegGroup` row of the
+    /// same generation. A create of `moved` waited for the root, and the
+    /// rename of `moved` that follows it, journaled once the lead is back,
+    /// was answered `Lone`: at a root crash the strand dropped the create
+    /// (its client was not answered) and replayed the rename, which then
+    /// failed on a name that was never created, after its client was told
+    /// it had succeeded. Now `Lone` returns once every gated row of the
+    /// generation has committed: the rename waits for the root like the
+    /// create, and both are dropped.
+    #[test]
+    fn a_lone_row_does_not_follow_an_uncommitted_gated_row_of_the_generation() {
+        let (answered, dropped, queued, _) = create_then_rename_at_a_root_crash(true);
+        assert_eq!(answered, None, "the rename waits for the root");
+        assert_eq!(dropped, 2, "the create and the rename are dropped");
+        assert!(queued.is_empty(), "nothing is replayed: {queued:?}");
+    }
+
+    /// The same without the hysteresis (`Config::delegation_lone_hysteresis`
+    /// off, the negative control of the simulation's oracle): the rename is
+    /// answered `Lone` behind the create, and replayed alone at the crash.
+    #[test]
+    fn without_the_hysteresis_the_rename_is_answered_lone_and_replayed_alone() {
+        let (answered, dropped, queued, rename) = create_then_rename_at_a_root_crash(false);
+        assert_eq!(answered, Some(AnswerSource::Sequenced(AckClass::Lone)));
+        assert_eq!(dropped, 1, "the create is dropped");
+        assert_eq!(queued, vec![rename], "the rename is replayed alone");
+    }
+
     /// A backup counts only once the delegate's own table records a
     /// `DelegGroup` naming it (D4): its acknowledgements before that are not
     /// the delegate's commit; after, they are, and the root's append is not

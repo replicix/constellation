@@ -132,11 +132,19 @@ through the delegate. It then:
      answered from its disk only while its journal is fewer transactions
      past the root's cursor (or the log) than a stream batch carries records
      (`delegation_stream_rows`, 256: two batches of creates); past that they
-     wait for the root's append too (`Core::deleg_lone_lead_full`). The
+     wait for the root's append too (`Core::deleg_lone_held`). The
      stream carries one batch per round trip to the root, so without the
      bound a busy delegate's own node ran its journal ahead of the stream
      without limit and every forward, answered behind every earlier row,
-     waited for all of it.
+     waited for all of it. The lead is judged for each row by its own stream
+     index against the horizon the core publishes (the committed prefix plus
+     the lead), so the FUSE fast path cannot journal past it between two
+     steps of the core. A row is also not answered from the disk while an
+     earlier row of its own node's clients still waits for the root (it was
+     journaled past the lead, or before the delegate turned lone): were the
+     root to crash, the earlier row would be dropped and the later one
+     replayed without the effect it rests on (a create, then a rename of it).
+     Another node's forward is not such a row.
    - A designation's rows are non-stealable and answer at once; `ack=s3` waits
      for the log.
 
