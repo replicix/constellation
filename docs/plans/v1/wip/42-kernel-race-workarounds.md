@@ -1716,6 +1716,27 @@ measurable step is `7e6e5cb3` (a clean close flushes the replica, journals bound
 4.6 to 7.8 %). Accepted: without it 300 000 creates left 493 MB of journal and a 13 s
 open, and a crash replays at most about 200 MB of journal instead of 512 MiB.
 
+**Rerun on main (K7, 2026-10-30; RESULTS.md, "§8 acceptance on main").** A quiet host used for timing only, base
+`c3bda7ea` against main `c8e4861f` (with the 10 ms grace) plus two fixes found here, 3 ABBA runs per store on ext4,
+xfs, btrfs (off and `zstd`) and tmpfs. **(1)** Main still answered the W2 worst case 2.4 times slower than the base,
+p99 11.8 ms: about 980 writes per 20 s were answered by `TAIL_GRACE` while holding `inode_lock`. Cause, from a
+diagnostic build: the write's own partial last page had a recorded read (fetched just before a dropping open's drop
+removed it), the drop's completion evidence (`FLUSH`) queues behind `inode_lock` in `fuse_flush`, so the record was not
+superseded, and the repair waited on the writer's own lock; and a burst of six dropping opens left an overflow arm (at
+most 4 open arms) for the whole run, so every open dropped even with W1 on. Fixed: the open-arm bound is 64, and a
+write's reply clears the reads recorded since its claim (§5.2.2's fourth fact). With KEEP_CACHE at its default the
+final writes 3.3 to 3.6 times as much as main and 1.4 times the base, keeping the cache on its opens (p50 26 to 28 us,
+0 repairs); with KEEP_CACHE=off it gains 7 to 11 % and stays about 2 times below the base, p99 11.8 ms. That remainder is
+the repair's own cost at today's drop rate: the daemon cannot tell the writer's lock on its last page from a reader's
+whose task has not run (no lock-free probe of a folio exists short of `FUSE_NOTIFY_RETRIEVE`, which the fuser fork does
+not support), and a shorter grace weakens the repair. **(2)** Commit-heavy: no store beyond noise in the cells; on a
+newly made and on an aged mount (the cell's fio and database writes first) base, main and final are within the runs'
+spread, the aging raising the per-commit p50 2.3 to 4.7 times on every build alike. Every other row neutral or better
+for plan 42; the tree workloads' `git status`, `find`, `make -q` (1.1 to 2.0 times slower, `ls -lR` and `rsync -n`
+2 to 4 times faster) follow plan 40's `READDIRPLUS` request mix and show on main without the fixes, and `cp -a`'s rise
+(tmpfs, btrfs `zstd`) comes with the commits of `c3bda7ea..5964fd68` outside plan 42 (plan 42 alone: the base's daemon
+CPU and wall times).
+
 ### 8.1 Quiet-host measurement for Q1 (run 2026-10-20 without the quiet-host gate; decided option B)
 
 The numbers of Appendix A.2 were taken on a host shared with other
@@ -1825,7 +1846,7 @@ decided on this measurement:
       `-dir-*` and `-rename-ctime` rows met.
 - [x] K6: detection table, the 0001 and 0003 probes and their tests,
       status, metrics, docs, ADR.
-- [ ] K7: §7.3 xcheckfs runs clean; §7.4 campaign passes on the final
+- [x] K7: §7.3 xcheckfs runs clean; §7.4 campaign passes on the final
       build (`repairs_late` 0 in every profile); §7.5 on a patched kernel
       (run; recorded in §7.5: probes, every row, the exit fix and the F10 stall met;
       the moved inode's notice stays on with 0003, F16);
@@ -1849,8 +1870,29 @@ decided on this measurement:
       systems (its own rule). **§7.3 (b)** (`pc_race` and `nlink_race` through
       the xcheckfs mount) and the base build's run were **not** part of this
       pass; the item stays open for them.
+      **K7 completed, 2026-10-30** (RESULTS.md, last sections): §8 rerun on main (above: W2's
+      worst case found and fixed where the evidence allows, the rest reported with its cause;
+      commit-heavy not reproduced; nothing else of plan 42 beyond noise); **§7.3 (b)** on the
+      final and the base build, write-through and write-back, 15 min of each workload through
+      xcheckfs: 0 mismatches and no episode on either build, `verify` 0 differences on the final
+      (base: 3 directory `mtime`s), race 1 directly on the mount 0 stale on the final against
+      474 and 749; **§7.4** on the final build, two seeds, five profiles, both transport names:
+      120 of 120 passed, `repairs_late` 0.
+
 - [ ] Every CONVENTIONS gate green; pjdfstest 8798/8798; `stress-ng-fs`
       within its baseline.
+      2026-10-30, the final build: fmt and clippy clean; the lib tests of frontend-fuse,
+      harness, engine, meta and authority pass (on main `8f5af546`); pjdfstest 8798/8798 on
+      `/dev/fuse` and on the ring; smoke passed; `stress-ng-fs` passed and every
+      `kernel-race-*` row passed in the full `harness run` catalogue: 264 passed, 20 skipped
+      (no root, no `sqlite3`, no ring on that host), **10 failed**. Rerun twice each with the
+      final and with main: `git-under-flock-faults`, `holder-crash-phantom-new-holder`,
+      `idle-cluster-is-quiet`, `session-wait-degrades` and `takeover-marker-strands-promptly`
+      fail on main as on the final (lease, takeover and recovery paths, outside plan 42);
+      `distant-bigfile-stable` misses its floor by under 10 % on both builds;
+      `session-ryw-after-holder-kill` passed once in two reruns on the final and never on main;
+      the other three passed every rerun. Open until
+      the catalogue is green on main.
 
 ## 12. PROGRESS.md
 

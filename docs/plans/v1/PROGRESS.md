@@ -55620,7 +55620,7 @@ are recorded per run).
 | Directory attributes (K5) | landed; bounded-mode default `entry` (Q1 decided: option B) | `crates/frontend-fuse/src/{reply,adapter,notify,workarounds}.rs`, `crates/vfs/src/vfs.rs` |
 | Detection, status, docs (K6) | landed | `crates/frontend-fuse/src/kernel_fixes.rs`, `kernel_fixes/probe.rs`, `crates/control/src/proto/types.rs`, `docs/reference/features/kernel-cache-coherence.md`, `docs/explanation/DECISIONS.md` |
 | W3b's notice narrowed in bounded mode (F21) | landed (replaces an interim "off in bounded mode") | `crates/frontend-fuse/src/{attrwatch,reply,pagecache}.rs` |
-| Campaigns, xcheckfs, benchmarks (K7) | partly: §7.4 reduced, §7.3 shorter than planned, §8 request counts only, §7.5 not run; §8.1 run (Q1 decided), F21's cost measured | `bench/kernel-races/RESULTS.md` |
+| Campaigns, xcheckfs, benchmarks (K7) | done 2026-10-30 (section "Plan 42 K7: §8 on main" below): §7.3 (a) and (b), §7.4 on the final build, §7.5, §8 on a quiet host, §8.1 | `bench/kernel-races/RESULTS.md` |
 
 ### K1: base counts (fail-before)
 
@@ -56077,10 +56077,8 @@ On the test host, `origin/main` `b4fe2e6` plus the plan's commits:
 - [x] K5: landed; bounded default of W3a `entry` (Q1), W3b narrowed in
   bounded mode (F21)
 - [x] K6
-- [ ] K7: §7.4 reduced (one seed), §7.3 shorter and with nlink
-  mismatches left (2a in bounded mode), §7.5 not run, §8 not established
-  on wall times (request counts only; the F21 cost has its own ABBA
-  measurement)
+- [x] K7 (2026-10-30, section "Plan 42 K7: §8 on main" below; W2's worst case reported with
+  its cause, the rest of §8 met)
 - [ ] Every CONVENTIONS gate: fmt, clippy, workspace tests, conformance,
   pjdfstest 8798/8798, smoke, `stress-ng-fs` green; the full `harness
   run` catalogue not run
@@ -62040,3 +62038,82 @@ failed after 16 s at 50 MB). After: the seed passes in 0.14 s at 17 MB. Mutation
 fmt and clippy (authority, all targets, `-D warnings`) clean. Lib tests: authority 816 passed (2 ignored). Release sim suite: 286
 passed (11 ignored). Sweeps, from seed 1000: `long-delegated-backup` 2,000 seeds (1682 among them), `long-delegated` 1,000 and
 `delegated-backup` 1,000: no failures.
+
+## Plan 42 K7: §8 on main, W2's worst case, §7.3 (b), §7.4 and the gates (2026-10-30)
+
+Plan 42's last milestone, run on a newly provisioned host used only for timing (taken in turns with one other agent's
+timing batches) and on the shared build host for everything else. Tables in `bench/kernel-races/RESULTS.md`, "§8
+acceptance on main" and the sections after it; the plan's §8 and §11 say what each means.
+
+| Item | State | Where |
+|---|---|---|
+| §8 rerun: base `c3bda7ea` against main `c8e4861f` plus the two fixes below, ext4, xfs, btrfs (off, `zstd`), tmpfs, 3 ABBA runs | done | `bench/kernel-races/RESULTS.md` |
+| W2's worst case: cause found (a dropping open's evidence queues behind `inode_lock`; an overflow arm kept every open dropping) | fixed where the evidence allows; the rest reported | `crates/frontend-fuse/src/{pagecache,reply}.rs` |
+| W1: open-arm bound 4 to 64 (`MAX_OPEN_ARMS`) | landed | `crates/frontend-fuse/src/pagecache.rs` |
+| W2: a write's reply clears the reads recorded since its claim (`PageCacheTable::answering`) | landed, reviewed | `crates/frontend-fuse/src/{pagecache,reply}.rs` |
+| Commit-heavy rise | not reproduced: fresh and aged mounts, base, main and final within spread | RESULTS.md |
+| §7.3 (b): `pc_race` and `nlink_race` through xcheckfs, final and base, write-through and write-back | met | RESULTS.md |
+| §7.4 on the final build: two seeds, five profiles, both transport names | 120 of 120 passed | RESULTS.md |
+| `nlink_race`'s local test on btrfs (directories' `st_nlink` is always 1 there) | fixed (skips with a note) | `crates/harness/src/kernel_races.rs` |
+| `micro.sh` counters, `commit-aged`, `cpa`; `abba.sh` directory | landed | `bench/kernel-races/` |
+
+**W2's worst case.** After the 10 ms grace (`605db505`) main still answered `pc_race` with an opener 2.4 times slower
+than the base (195 000 to 205 000 writes in 20 s against 485 000 to 490 000, p99 11.8 ms against 0.22 ms; stale 0 against
+266 to 309 with the repair off). About 980 writes per run were answered by `TAIL_GRACE`, each holding `inode_lock` for
+11.8 ms while every other writer waited. A diagnostic build (not committed) logged each claim whose repair included the
+write's partial last page: the page had a read recorded 20 to 100 us before the claim, fetched just before a dropping
+open's drop removed it, so the writer re-created the page and held it locked, and the repair waited on that lock. The read
+was not superseded because the open's completion evidence, its `FLUSH`, is sent only after `fuse_flush` takes
+`inode_lock`, behind the writers. And the six descriptors pc_race opens at once had left an overflow arm (the bound was 4
+open arms) that lives until the inode's last handle closes: every open dropped (`drop_in_flight`, 114 000 of 115 000)
+even with W1 on.
+
+- `perf(frontend-fuse): plan 42 W1, a burst of dropping opens no longer keeps every open of the file dropping`: the
+  bound is 64. KEEP_CACHE at its default: 669 000 to 715 000 writes (3.3 to 3.6 times main, 1.4 times the base),
+  p50 26 to 28 us, p99 1.4 to 2.3 ms, about 525 000 kept opens, 0 to 1 repairs, stale 0, on ext4, xfs, btrfs and tmpfs.
+  Test `a_burst_of_six_dropping_opens_does_not_overflow` (fails with 4).
+- `perf(frontend-fuse): plan 42 W2, a write's reply clears the reads recorded while it was held`: the next write copies
+  after this reply, so a read before it cannot have fetched one of its pages stale. KEEP_CACHE=off: +7 to 11 % writes,
+  fewer releases (830 to 960), stale 0, `repairs_late` 0. Reviewed independently (sound on every reply path). Test
+  `a_reply_clears_the_reads_recorded_while_it_was_held` (fails with the clear a no-op).
+- Not fixed, reported: with KEEP_CACHE=off (every open drops, the plan's worst case) the final stays about 2 times below
+  the base, p99 11.8 ms, in the cells as in the micro runs. The daemon cannot tell the writer's own lock on its last page
+  from a reader's whose reply it wrote and whose task the kernel has not run (the case the grace covers); no probe of a
+  folio's lock or content exists that does not take the lock, short of `FUSE_NOTIFY_RETRIEVE`, which the fuser fork does
+  not support; a shorter grace would weaken the repair.
+
+**The cells** (final over base): reopen-read passes 2 and 3 0.50 to 1.02 (`READ`s 0 against 10 000); untar 0.74 to 0.88;
+`fio`, `pc_race` without an opener, open latency, database style within noise (xfs open p50 32 against 35 us beyond its
+4.6 % spread); commit-heavy within noise everywhere. Outside plan 42, both visible on main without the fixes: `git status`,
+`find` and `make -q` 1.1 to 2.0 times slower and `ls -lR`, `rsync -n` 2 to 4 times faster, with plan 40's `READDIRPLUS`
+request mix (warm `git status`: daemon time 230 against 111 ms for 4 450 directory pages either way); `cp -a` 1.18 to
+1.70 (beyond noise on tmpfs and btrfs `zstd`) with equal requests, which plan 42's own commits do not show (`63c8790d`:
+the base's daemon CPU, 386 to 420 against 390 s, and wall times overlapping the base's) and which comes with the other
+commits of `c3bda7ea..5964fd68`.
+
+**Commit-heavy**, `micro.sh commit` on a new file system and `commit-aged` after the cell's fio and database writes, 3
+rounds of base, main and final per store: fresh 235 to 278 us per-commit p50 on every build, aged 587 to 1 269 us, base the
+highest on ext4 and xfs; no build slower than the base beyond spread. The rise recorded before was the cell's aging of a
+shared, saturated device.
+
+**§7.3 (b)**: 0 mismatches and no episode through xcheckfs on either build in either mode (34.9 M to 100.9 M operations),
+`xcheckfs verify` 0 differences on the final (the base: 3 directory `mtime`s); directly on the mount `pc_race` 0 stale on
+the final against 474 and 749 on the base; `nlink_race` mismatches on both builds (race 2a, open in bounded mode by
+decision).
+
+**§7.4** (the final build, the shared host): 120 of 120 cells passed, `repairs_late` 0 in all, `stale_after_reopen` 0,
+stale read-backs only in `kernel-race-unseen-drop` (allowed, R1).
+
+### Gates
+
+On `origin/main` `8f5af546` plus these commits: `cargo fmt --all -- --check` clean, `cargo clippy --workspace
+--all-targets -- -D warnings` clean; lib tests: frontend-fuse 158, harness 164, engine 935, meta 376, authority 774, 0
+failed (the harness test also with `TMPDIR` on btrfs: it skips the link-count check there). On the measured final
+(`c8e4861f` plus the commits): pjdfstest 8798/8798 on `/dev/fuse` (twice) and on the ring; `tests/smoke.sh` passed; the
+full `harness run` catalogue 264 passed, 20 skipped (no root, no `sqlite3`, no ring on the build host), 10 failed, among them
+none of plan 42's (`stress-ng-fs` and all 43 `kernel-race-*` rows passed). Rerun twice with the final and twice with main:
+`git-under-flock-faults`, `holder-crash-phantom-new-holder`, `idle-cluster-is-quiet`, `session-wait-degrades` and
+`takeover-marker-strands-promptly` fail on main as on the final; `distant-bigfile-stable` misses its 10 MiB/s floor by under
+10 % on both; `session-ryw-after-holder-kill` passed once in four reruns; `lease-claimant-ahead`,
+`holder-crash-phantom-shadow` and `stale-daemon-lock` passed every rerun. Plan 42 stays in `wip/` until the catalogue is
+green on main; its K7 criterion holds.

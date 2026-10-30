@@ -533,3 +533,270 @@ Two cells had other work of just above 1 core in the `misc` phase. The tmpfs row
 | commit-heavy, 2 views, per commit p50 | 1941 us / 2062 us | 1354 us / 1572 us | 585 us / 861 us | 570 us / 841 us | 249 us / 240 us |
 | commit-heavy, 2 views, per commit p99 | 8.9 ms / 6.9 ms | 3175 us / 3276 us | 1011 us / 1040 us | 954 us / 1007 us | 1462 us / 876 us |
 | commit-heavy, 2 views, all seen in the other | 15.2 / 13.4 | 7.14 / 8.32 | 5.11 / 5.39 | 3.14 / 4.3 | 2.11 / 1.76 |
+
+## §8 acceptance on main, and W2's worst case found (K7, 2026-10-30)
+
+**Builds.** Base `c3bda7ea` (the parent of K1, as above). Main `c8e4861f`, origin/main when this run started (it carries
+the TAIL_GRACE cut `605db505`, 100 to 10 ms, which landed after the run above). Final: main plus the two commits found
+here (W1's open-arm bound, W2's reply-time clear; the plan's PROGRESS, "Plan 42 K7: §8 on main"). Release mode,
+`--cto bounded`, write-through, io_uring, Linux 7.3.0 rc4 (unpatched: W1, W2 and W3b in effect), 16 cores, 30 GiB.
+
+**Host.** A newly provisioned host used for nothing else but timing runs, taken in turns with one other agent's timing
+batches (never at once): the 1-minute load was below 4 at the start of every phase and the sampler saw at most 1.1 cores of
+other work in any phase (one tmpfs base cell's commit phase; its rows are kept, the cell is flagged). Stores: one NVMe
+device, an ext4, an xfs and a btrfs partition, each newly made; btrfs `zstd` by remount of the btrfs one; tmpfs `/dev/shm`
+(16 GiB). The same `cell.sh`, `abba.sh` (ABBA order per store, 3 runs per build), `agg.py` and `report.py` as above.
+
+### W2's worst case: the cause
+
+`kb pcrace` with an opener, 20 s, ext4, 3 ABBA rounds (`micro.sh opener:20`, counters from `node.status`):
+
+| build, variant | writes | write p50 | write p99 | repairs | released by TAIL_GRACE |
+|---|---|---|---|---|---|
+| base | 485 244-489 987 | 144-146 us | 219-223 us | - | - |
+| main, defaults | 198 667-204 880 | 152-155 us | 11.8 ms | 11 800-12 000 | 973-986 |
+| main, KEEP_CACHE=off | 197 963-202 380 | 153-154 us | 11.8 ms | 11 700-12 050 | 980-997 |
+| main, KEEP_CACHE=off, repair off | 467 029-477 009 | 148-152 us | 222-228 us | - | - |
+
+Main (after the 10 ms grace) still answers 2.4 times fewer writes than the base, p99 at the grace plus the watchdog's
+1 ms tick; stale read-backs 0 against 266 to 309 with the repair off; `repairs_late` 0. About 980 writes per 20 s are
+answered by the grace, and each holds `inode_lock` for 11.8 ms, during which every other writer of the file waits: 980 x
+11.8 ms x 4 writers is about the 45 of the 80 writer-seconds the run loses. Where the time goes, from a diagnostic build
+that logged every claim with a partial last page (`tail`) and every release (not committed):
+
+- Every released write had a hit on its own last page `t` from a read recorded 20 to 100 us before the claim, and the
+  page was absent when the writer copied into it: the writer created it partial and holds it locked until its reply, so
+  the repair's invalidation of `t` waits for the very reply it holds — the case `TAIL_GRACE` exists for. The reads were
+  recorded either just before or just after the latest dropping open's arm (`gen` equal to the current one or one less),
+  and that open's drop had already removed the page the read fetched before the writer copied.
+- They were not superseded, because the dropping open's completion (its `FLUSH`) was still to come: `fuse_flush` takes
+  `inode_lock` before it sends `FLUSH`, so the opener's evidence queues behind the very writers the drop raced.
+- The entry also carried an overflow arm for the whole run: pc_race opens its six descriptors at once, an entry kept four
+  open arms, and the fifth and sixth shared an overflow arm that completes only when the inode's last handle closes. With it
+  every open dropped (rule 4, `drop_in_flight`: 114 000 of 115 000 opens with KEEP_CACHE at its default), which is why the
+  default variant cost the same as KEEP_CACHE=off.
+- The repair cannot tell the writer's own lock from a reader's: a read whose reply the daemon wrote and whose task the
+  kernel has not run yet holds the same lock on a page that may be stale (the residual `TAIL_GRACE` covers). The kernel
+  offers no probe of a folio's lock or content that does not take the lock (`FUSE_NOTIFY_RETRIEVE` reads content without
+  it, but the fuser fork has no support for it), and the drop's completion evidence is the request that `inode_lock`
+  delays. So the remaining releases are not fixed here; a shorter grace would weaken the repair (rejected before at 2 ms).
+
+**Fixes** (both with fail-before unit tests; the second reviewed independently against §5.2.5):
+
+1. The open-arm bound is 64 instead of 4 (`MAX_OPEN_ARMS`): six concurrent dropping opens get one arm each, each completes
+   at its handle's first request, and later opens keep the cache.
+2. A write's reply clears the reads recorded since its claim (`PageCacheTable::answering`): the next write copies after
+   this reply, so a read before it cannot have fetched one of that write's pages stale.
+
+Main against final, the same workload, 3 ABBA rounds per store (`micro.sh opener:20`; base above):
+
+| store | main, defaults | final, defaults | main, KEEP_CACHE=off | final, KEEP_CACHE=off |
+|---|---|---|---|---|
+| ext4 | 195 138-199 557 writes, p99 11.8 ms | 689 934-712 204, p50 26-28 us, p99 1.4-1.9 ms, 0-1 repairs | 193 627-202 820, p99 11.8 ms | 212 604-220 271, p99 11.8 ms, 903-945 released |
+| xfs | 202 167-207 302, p99 11.8 ms | 688 889-701 107, p99 1.4-2.0 ms | 195 811-211 964 | 220 873-228 863 |
+| btrfs | 207 691-214 683, p99 11.8 ms | 669 030-680 488, p99 1.4-2.3 ms | 204 444-210 365 | 213 491-232 089 |
+| tmpfs | 192 261-194 461, p99 11.8 ms | 700 427-714 831, p99 1.9-2.1 ms | 196 404-198 896 | 209 198-218 850 |
+
+Stale read-backs 0 and `repairs_late` 0 in every run. With KEEP_CACHE at its default the final keeps the cache on about
+525 000 opens per run and repairs nothing; it writes 1.4 times as much as the base. With KEEP_CACHE=off (every open drops,
+the plan's worst case) the reply-time clear gains 7 to 11 %, and the rest of the cost stays as described above.
+
+### The cells: final against base on every store
+
+(The ratio and the absolute-median tables, `report.py`, final = main plus the two fixes; 3 runs per build and store.)
+
+#### Ratio final over base (more than 1 is worse; `*` beyond noise; medians of 3 runs)
+
+| Benchmark | ext4 | xfs | btrfs | btrfs-zstd | tmpfs |
+|---|---|---|---|---|---|
+| untar 50k files | 0.88 | 0.74 | 0.79 | 0.75 | 0.76 |
+| cp -a of it | 1.18 | 1.70 | 1.26 | 1.42* | 1.34* |
+| ls -lR cold | 0.58 | 0.54 | 0.62 | 0.48 | 0.36 |
+| ls -lR warm | 0.42 | 0.38 | 0.38 | 0.36 | 0.34 |
+| find cold | 1.32 | 1.34 | 1.29 | 1.20* | 1.22 |
+| find warm | 1.32* | 1.23* | 1.60 | 1.18 | 1.46 |
+| git status cold | 1.22* | 1.28* | 1.29* | 1.22* | 1.21* |
+| git status warm | 1.78* | 2.03* | 1.74* | 1.64* | 1.74* |
+| make -q cold | 1.12* | 0.81 | 0.94 | 1.01 | 1.05 |
+| make -q warm | 1.49* | 1.37 | 0.80 | 1.36* | 1.31 |
+| rsync -n cold | 0.36 | 0.35 | 0.35 | 0.37 | 0.26 |
+| rsync -n warm | 0.27 | 0.26 | 0.26 | 0.27 | 0.26 |
+| reopen-read pass 1 | 1.07 | 1.02 | 1.05 | 1.12 | 1.25 |
+| reopen-read pass 2 | 0.50 | 1.00 | 0.64 | 1.19 | 0.69 |
+| reopen-read pass 3 | 0.82 | 0.63 | 0.75 | 1.02 | 0.68 |
+| open+close mean | 1.05 | 1.15 | 0.97 | 1.03 | 0.92 |
+| open+close p50 | 1.02 | 1.10* | 0.92 | 1.04 | 0.85 |
+| open+close p99 | 1.02 | 1.10 | 1.01 | 1.04 | 0.98 |
+| fio seq write 1M, MiB/s | 1.00 | 1.00 | 0.98 | 0.99 | 0.98 |
+| fio rand write 4k, IOPS | 1.00 | 1.00 | 0.97 | 1.02 | 0.94 |
+| fio rand rw 70/30, read IOPS | 1.10 | 1.05 | 0.94 | 1.09 | n/a |
+| fio rand rw 70/30, write IOPS | 1.10 | 1.06 | 0.93 | 1.08 | n/a |
+| pc_race no opener, writes | 1.03 | 0.83 | 1.14 | 1.00 | 0.98 |
+| pc_race no opener, write p50 | 1.02 | 0.79 | 1.12 | 1.03 | 0.97 |
+| pc_race no opener, write p99 | 1.33 | 0.95 | 1.79 | 0.92 | 0.99 |
+| db 4 threads, ops/s | 0.96 | 0.96 | 1.00 | 1.00 | n/a |
+| db read p50 | 0.93 | 0.94 | 0.95 | 1.03 | n/a |
+| db read p99 | 0.99 | 1.06 | 1.38 | 0.69 | n/a |
+| db write p50 | 0.99 | 0.95 | 0.95 | 1.03 | n/a |
+| db write p99 | 0.99 | 0.95 | 1.04 | 1.00 | n/a |
+| commit-heavy, 1 view, per commit mean | 0.68 | 0.80 | 0.96 | 0.97 | 0.95 |
+| commit-heavy, 1 view, per commit p50 | 0.95 | 1.11 | 1.35 | 0.92 | 1.01 |
+| commit-heavy, 1 view, per commit p99 | 0.85 | 0.55 | 0.98 | 0.73 | 0.71 |
+| commit-heavy, 2 views, per commit mean | 0.72 | 0.81 | 1.12 | 0.76 | 0.84 |
+| commit-heavy, 2 views, per commit p50 | 0.89 | 1.13 | 1.39 | 0.88 | 1.02 |
+| commit-heavy, 2 views, per commit p99 | 0.78 | 0.56 | 0.91 | 0.73 | 0.29 |
+| commit-heavy, 2 views, all seen in the other | 0.68 | 0.76 | 1.02 | 0.61 | 0.63 |
+
+#### Absolute medians (base / final)
+
+| Metric | ext4 | xfs | btrfs | btrfs-zstd | tmpfs |
+|---|---|---|---|---|---|
+| untar 50k files | 349 / 306 | 302 / 225 | 315 / 248 | 319 / 241 | 88.6 / 67 |
+| cp -a of it | 190 / 223 | 187 / 317 | 239 / 300 | 202 / 287 | 238 / 320 |
+| ls -lR cold | 4.58 / 2.64 | 4.51 / 2.45 | 3.85 / 2.4 | 3.71 / 1.77 | 3.21 / 1.16 |
+| ls -lR warm | 3.08 / 1.3 | 2.95 / 1.11 | 3.11 / 1.17 | 2.89 / 1.04 | 3.2 / 1.08 |
+| find cold | 0.299 / 0.394 | 0.296 / 0.396 | 0.302 / 0.391 | 0.314 / 0.378 | 0.323 / 0.395 |
+| find warm | 0.272 / 0.358 | 0.268 / 0.329 | 0.205 / 0.329 | 0.272 / 0.322 | 0.239 / 0.35 |
+| git status cold | 0.679 / 0.829 | 0.661 / 0.846 | 0.632 / 0.818 | 0.66 / 0.806 | 0.604 / 0.733 |
+| git status warm | 0.249 / 0.443 | 0.231 / 0.468 | 0.268 / 0.467 | 0.257 / 0.422 | 0.265 / 0.462 |
+| make -q cold | 0.866 / 0.969 | 0.969 / 0.788 | 0.957 / 0.901 | 0.875 / 0.888 | 0.889 / 0.932 |
+| make -q warm | 0.506 / 0.755 | 0.528 / 0.723 | 0.941 / 0.749 | 0.491 / 0.667 | 0.52 / 0.68 |
+| rsync -n cold | 5.54 / 1.99 | 5.38 / 1.89 | 5.61 / 1.94 | 4.92 / 1.82 | 4.51 / 1.17 |
+| rsync -n warm | 4.23 / 1.13 | 4.21 / 1.09 | 4.19 / 1.07 | 4.23 / 1.16 | 4.35 / 1.11 |
+| reopen-read pass 1 | 0.439 / 0.468 | 0.398 / 0.404 | 0.441 / 0.461 | 0.427 / 0.48 | 0.354 / 0.442 |
+| reopen-read pass 2 | 0.339 / 0.171 | 0.207 / 0.208 | 0.263 / 0.169 | 0.191 / 0.227 | 0.256 / 0.176 |
+| reopen-read pass 3 | 0.204 / 0.166 | 0.271 / 0.17 | 0.228 / 0.171 | 0.189 / 0.193 | 0.256 / 0.175 |
+| open+close mean | 36 us / 38 us | 33 us / 38 us | 39 us / 38 us | 39 us / 41 us | 41 us / 38 us |
+| open+close p50 | 33 us / 34 us | 32 us / 35 us | 38 us / 35 us | 38 us / 39 us | 42 us / 35 us |
+| open+close p99 | 59 us / 60 us | 56 us / 62 us | 60 us / 61 us | 59 us / 61 us | 59 us / 58 us |
+| fio seq write 1M, MiB/s | 125 / 125 | 129 / 129 | 63 / 65 | 64 / 65 | 909 / 928 |
+| fio rand write 4k, IOPS | 266 / 266 | 186 / 186 | 29 / 30 | 41 / 40 | 3 638 / 3 868 |
+| fio rand rw 70/30, read IOPS | 518 / 470 | 385 / 365 | 83 / 88 | 87 / 80 | n/a / n/a |
+| fio rand rw 70/30, write IOPS | 232 / 210 | 173 / 163 | 38 / 41 | 40 / 37 | n/a / n/a |
+| pc_race no opener, writes | 444 184 / 430 766 | 454 267 / 544 802 | 507 962 / 445 528 | 468 826 / 467 250 | 1 221 753 / 1 249 998 |
+| pc_race no opener, write p50 | 46 us / 47 us | 43 us / 34 us | 40 us / 44 us | 41 us / 42 us | 15 us / 15 us |
+| pc_race no opener, write p99 | 3307 us / 4396 us | 4275 us / 4074 us | 2699 us / 4844 us | 4552 us / 4194 us | 1707 us / 1694 us |
+| db 4 threads, ops/s | 255 / 265 | 163 / 170 | 45 / 45 | 46 / 46 | n/a / n/a |
+| db read p50 | 195 us / 181 us | 205 us / 194 us | 213 us / 203 us | 203 us / 209 us | n/a / n/a |
+| db read p99 | 67.4 ms / 66.5 ms | 117.4 ms / 124.5 ms | 809.1 ms / 1114.3 ms | 1324.0 ms / 908.6 ms | n/a / n/a |
+| db write p50 | 1078 us / 1066 us | 937 us / 890 us | 660 us / 629 us | 644 us / 666 us | n/a / n/a |
+| db write p99 | 494.1 ms / 488.3 ms | 983.0 ms / 933.6 ms | 2390.7 ms / 2480.7 ms | 2243.6 ms / 2243.0 ms | n/a / n/a |
+| commit-heavy, 1 view, per commit mean | 2822 us / 1928 us | 1901 us / 1519 us | 6.3 ms / 6.0 ms | 6.2 ms / 6.0 ms | 259 us / 247 us |
+| commit-heavy, 1 view, per commit p50 | 2109 us / 2011 us | 1362 us / 1506 us | 665 us / 898 us | 664 us / 613 us | 237 us / 241 us |
+| commit-heavy, 1 view, per commit p99 | 8.6 ms / 7.3 ms | 3071 us / 1692 us | 1240 us / 1217 us | 1226 us / 895 us | 660 us / 468 us |
+| commit-heavy, 2 views, per commit mean | 3665 us / 2627 us | 1912 us / 1546 us | 936 us / 1047 us | 828 us / 628 us | 308 us / 258 us |
+| commit-heavy, 2 views, per commit p50 | 2283 us / 2041 us | 1365 us / 1537 us | 668 us / 926 us | 684 us / 600 us | 247 us / 252 us |
+| commit-heavy, 2 views, per commit p99 | 9.3 ms / 7.3 ms | 3118 us / 1744 us | 1202 us / 1091 us | 1226 us / 899 us | 1678 us / 483 us |
+| commit-heavy, 2 views, all seen in the other | 19.2 / 13.1 | 10.1 / 7.73 | 5.14 / 5.24 | 5.12 / 3.14 | 2.12 / 1.33 |
+
+#### pc_race with an opener (20 s, a file system aged by the earlier phases)
+
+| Store | variant | writes | stale read-backs | write p50 | write p99 | repairs | repairs released |
+|---|---|---|---|---|---|---|---|
+| ext4 | base (no W1/W2) | 340 364 | 625 | 213 us | 304 us | - | - |
+| ext4 | final, defaults | 407 032 | 0 | 47 us | 3591 us | - | - |
+| ext4 | final, KEEP_CACHE=off, repair on | 163 025 | 0 | 250 us | 11.9 ms | 7 828 | 792 |
+| ext4 | final, KEEP_CACHE=off, repair off | 303 541 | 628 | 241 us | 332 us | - | - |
+| xfs | base (no W1/W2) | 357 300 | 518 | 201 us | 291 us | - | - |
+| xfs | final, defaults | 407 480 | 0 | 47 us | 3310 us | - | - |
+| xfs | final, KEEP_CACHE=off, repair on | 168 625 | 0 | 246 us | 11.9 ms | 7 927 | 759 |
+| xfs | final, KEEP_CACHE=off, repair off | 306 464 | 606 | 240 us | 331 us | - | - |
+| btrfs | base (no W1/W2) | 370 765 | 466 | 194 us | 280 us | - | - |
+| btrfs | final, defaults | 466 539 | 0 | 42 us | 1952 us | 1 | - |
+| btrfs | final, KEEP_CACHE=off, repair on | 187 017 | 0 | 217 us | 11.9 ms | 8 345 | 779 |
+| btrfs | final, KEEP_CACHE=off, repair off | 341 994 | 518 | 212 us | 300 us | - | - |
+| btrfs-zstd | base (no W1/W2) | 362 165 | 479 | 198 us | 285 us | - | - |
+| btrfs-zstd | final, defaults | 477 072 | 0 | 40 us | 3159 us | 1 | - |
+| btrfs-zstd | final, KEEP_CACHE=off, repair on | 181 473 | 0 | 218 us | 11.9 ms | 8 214 | 781 |
+| btrfs-zstd | final, KEEP_CACHE=off, repair off | 342 758 | 515 | 212 us | 299 us | - | - |
+| tmpfs | base (no W1/W2) | 484 319 | 285 | 146 us | 221 us | - | - |
+| tmpfs | final, defaults | 705 597 | 0 | 27 us | 1866 us | - | - |
+| tmpfs | final, KEEP_CACHE=off, repair on | 224 299 | 0 | 158 us | 11.8 ms | 9 841 | 851 |
+| tmpfs | final, KEEP_CACHE=off, repair off | 458 203 | 269 | 153 us | 232 us | - | - |
+
+Against §8's table, row by row (final over base):
+
+- **reopen-read**: faster (passes 2 and 3 0.50 to 1.02, `READ`s 0 against 10 000 on every store; the two ratios
+  above 1, btrfs `zstd` pass 2 and xfs pass 2 at 1.00, are 0.19 / 0.23 s and 0.21 / 0.21 s).
+- **`ls -lR`, `rsync -n`**: 0.26 to 0.62, **`find`, `git status`, `make -q`**: 0.80 to 2.03, `git status` warm 1.64 to 2.03
+  on every store (beyond noise). Not plan 42: main without the two fixes shows the same (ext4, one cell: `git status` warm
+  0.441 s against the final's 0.432 to 0.452 and the base's 0.234 to 0.250), and the request mix is plan 40's (warm `git
+  status`: 2 004 `READDIR` and 2 446 `READDIRPLUS` against the base's 4 449 `READDIR`, the same `GETATTR`/`LOOKUP` counts,
+  daemon time 230 against 111 ms; `ls -lR`: 66 000 requests against 119 000). W3a's `entry` default and F21's narrowed
+  notice cost nothing here: `GETATTR` 1 to 3 per run on both builds, notices skipped. Open for plan 40, not plan 42.
+- **untar**: 0.74 to 0.88 (faster). **`cp -a`**: 1.18 to 1.70 (beyond noise on btrfs `zstd` and tmpfs), with the
+  same requests on every build. Attribution on tmpfs (`micro.sh cpa`, the tree untarred, then `cp -a` of it timed; each
+on a new file system and mount; seconds): base 209, 219, 227, 240, 243, 252, 259; plan 42 alone (`63c8790d`, K1 to F2 on
+the base) 191, 211, 271, 291, 361; plan 42's end as first measured (`5964fd68`) 286, 303, 304, 305, 323; main 288, 344;
+final 334, 340. The daemon's CPU time over a whole `cp -a` (on-CPU, two runs each): base 390.6 and 389.9 s, plan 42
+alone 420.4 and 386.6 s. Plan 42's own commits therefore cost no daemon CPU beyond the runs' spread and their wall times
+overlap the base's; the step to about 300 s comes with the other commits of `c3bda7ea..5964fd68` (plans 40, 41, 43
+and 45: the same requests, more time per request in the daemon) and is not attributed further here. The same request
+mix holds on every build (784 000 requests on the base and plan 42's builds, 738 000 from plan 40's `READDIRPLUS` on).
+- **`fio`**: 0.93 to 1.10, none beyond noise. **`pc_race` without an opener**: 0.79 to 1.79 in p99 (spreads 31 to
+  66 %), writes 0.83 to 1.14, none beyond noise. **open latency**: 0.85 to 1.15 (xfs p50 1.10, beyond noise by
+  its 4.6 % base spread: 32 / 35 us). **database style**: 0.96 to 1.00 in ops/s, p50s within 7 %.
+- **commit-heavy**: no store beyond noise (per-commit p50 0.88 to 1.39 with base spreads of 12 to 29 %; means 0.68 to
+  1.12). The rise recorded above (17 to 50 % in the full cell) does not reproduce: see the fresh and aged runs below.
+- **pc_race with an opener, defaults**: writes 1.20 to 1.46 times the base's, p50 a fifth (27 to 47 us), p99 1.9 to
+  3.6 ms against 0.2 to 0.3 ms: with W1 working the opener's opens keep the cache, so the workload runs as `pc_race`
+  without an opener does on the same build (p99 1.7 to 4.8 ms on both builds); the base's lower p99 comes with its
+  dropped pages (every read-back goes to the daemon). 0 stale read-backs against 285 to 625 on the base.
+- **W2's worst case** (KEEP_CACHE=off): writes 0.45 to 0.51 of the base's in the aged cells, p99 11.8 to 11.9 ms against
+  0.2 to 0.3 ms; 0 stale against 269 to 628 with the repair off. This is the cost of the repair at today's drop rate
+  that §8 asks to report, with the cause above.
+
+### Commit-heavy on a fresh and on an aged mount (same builds)
+
+`micro.sh commit` (5 000 files written and closed, one view, on a newly made file system and mount) and `commit-aged`
+(the same after the cell's fio and database-style writes, about 3 GiB, on that mount), 3 rounds of base, main and final in
+turn per store. Per-commit p50, median (min-max) in us:
+
+| store | test | base | main | final |
+|---|---|---|---|---|
+| ext4 | fresh | 268 (262-274) | 259 (246-265) | 256 (256-258) |
+| ext4 | aged | 1 269 (1 261-1 269) | 1 129 (1 125-1 133) | 1 147 (1 124-1 179) |
+| xfs | fresh | 235 (231-240) | 247 (232-250) | 238 (232-239) |
+| xfs | aged | 1 077 (1 047-1 095) | 1 005 (997-1 008) | 1 048 (1 028-1 110) |
+| btrfs | fresh | 276 (264-278) | 278 (268-283) | 275 (266-289) |
+| btrfs | aged | 645 (638-702) | 625 (604-683) | 587 (580-684) |
+
+The aging raises the per-commit p50 2.3 to 4.7 times on every build alike, and on either mount no build is slower than
+the base beyond the runs' spread. So the commit-heavy rise of the run above was the cell's aging of a shared, saturated
+device (and, per the follow-up, `7e6e5cb3`'s accepted cost), not a property of the final build.
+
+### §7.3 (b): the race workloads through the lockstep mount (2026-10-29/30)
+
+xcheckfs `dd18db3` (`--check thorough --on-mismatch log`), an ext4 primary tree and a Constellation secondary
+(`file://` backend on ext4), write-through and write-back, `pc_race` with an opener (900 s) and `nlink_race` with 8
+threads (900 s) through the xcheckfs mount, then 60 s of each directly on the Constellation mount; on a host shared with
+other agents' builds (load 25 to 85). The workloads are the harness's (`kernel_races::pc_race`, `nlink_race`).
+
+| build | mode | through xcheckfs: ops, mismatches, episodes | `xcheckfs verify` | direct: `pc_race` stale / writes | direct: `nlink_race` mismatches / stats |
+|---|---|---|---|---|---|
+| base | write-through | 74.8 M, 0, none | 3 differences | 749 / 839 887 | 36 / 1 411 252 |
+| base | write-back | 57.0 M, 0, none | 3 differences | 474 / 946 262 | 20 / 892 222 |
+| final | write-through | 100.9 M, 0, none | 0 differences | 0 / 1 289 176 | 8 / 841 144 |
+| final | write-back | 34.9 M, 0, none | 0 differences | 0 / 378 981 | 82 / 1 781 740 |
+
+- No mismatch attributed to the secondary in any run, and no episode at any poll (every 30 s). The base's `verify`
+  differences are directory `mtime`s of `nlink_race`'s directories (the secondary 1.2 s later than the primary on the
+  last changes); the final has none.
+- Race 1 directly on the mount: 0 stale reads on the final against 474 and 749 on the base. Through xcheckfs the
+  workload reads xcheckfs's own page cache, so its stale reads there (base 27 and 10, final 20 and 27, every one with the
+  daemon's answer correct, `stale_server_correct`) are xcheckfs's own mount meeting race 1, not the secondary's.
+- `nlink_race`'s mismatches are race 2a, open in bounded mode by decision (Q1, option B), on both builds; through
+  xcheckfs (116 to 433) they are xcheckfs's own mount's (the application sees the primary's answers), not attributed to the
+  secondary.
+- The final's write-through run kept the cache on 9.4 M opens and repaired nothing; its write-back run repaired 20 848
+  writes, 0 late.
+
+### §7.4 on the final build (2026-10-30)
+
+`tools/load-campaign/run.py`, the six rows of §7.4 on both transport names (`/dev/fuse` on that host, whose kernel has
+`enable_uring` off, so the ring rows ran with the `auto` ladder's fallback), five profiles (none; `hogs:cpu=16:load=100`;
+`cpu:50`; `pause:50:300`; `hogs:vm=2:vmbytes=25%`), seeds 42 and 43, 60 s each, deadlines scaled 4x, on the shared build
+host: **120 of 120 passed**. `repairs_late` 0 in every run (140 reports), `stale_after_reopen` 0 in every run,
+`st_nlink` mismatches 0, every `dir-version` round current. Stale read-backs only in `kernel-race-unseen-drop` (1 to 6 in
+9 of its 20 runs: unannounced drops, allowed by R1, each followed by a dropping open). Not run: the plan's ten seeds and its
+75 % memory hog (the host is shared).

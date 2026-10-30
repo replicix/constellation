@@ -2,7 +2,8 @@
 # Plan 42 section 8, attribution runs: one benchmark on several builds, alternating, on one backing store.
 # usage: micro.sh STOREDIR OUT TEST ROUNDS label=bin[,ENV=VAL...] ...
 #   TEST: commit (5,000 small files written and closed, one view), commit-aged (the same after the cell's fio and
-#   database-style writes on the same mount), untar (the 50k-file tree), opener (pc_race with an opener, 10 s)
+#   database-style writes on the same mount), untar (the 50k-file tree), cpa (cp -a of the untarred tree),
+#   opener (pc_race with an opener, 10 s)
 # The order alternates: round 1 in the given order, round 2 reversed, and so on.
 #   TEST may carry a duration: opener:20 (default 10 s)
 # Each MICRO line carries the requests and kernel-cache counters of the test (snap.py), as cell.sh's do.
@@ -51,6 +52,9 @@ while [ $r -lt "$ROUNDS" ]; do
         python3 $HERE/snap.py "$bin" $ROOT/state > $ROOT/s0.json 2>/dev/null
         mkdir "$MNT/c1"; res=$($KB commit "$MNT/c1" - 5000) ;;
       untar) mkdir "$MNT/t1"; TIMEFORMAT='%R'; res="untar_secs=$( { time tar -xf "$TREE" --strip-components=1 -C "$MNT/t1" > /dev/null 2>&1; } 2>&1 )" ;;
+      cpa) mkdir "$MNT/t1"; TIMEFORMAT='%R'; tar -xf "$TREE" --strip-components=1 -C "$MNT/t1" > /dev/null 2>&1
+        python3 $HERE/snap.py "$bin" $ROOT/state > $ROOT/s0.json 2>/dev/null
+        res="cpa_secs=$( { time cp -a "$MNT/t1" "$MNT/t2" > /dev/null 2>&1; } 2>&1 )" ;;
       opener) secs=10; [ "$TEST" != opener ] && secs=${TEST#*:}; res=$($KB pcrace "$MNT/pc.dat" $secs 1) ;;
     esac
     python3 $HERE/snap.py "$bin" $ROOT/state > $ROOT/s1.json 2>/dev/null
