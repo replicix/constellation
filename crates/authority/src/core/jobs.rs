@@ -3570,6 +3570,17 @@ impl Core {
         // back through S3 once its pause ran out (`visibility-s3-
         // latency`: a claim queued 12 s behind a round's ship loop under
         // slow S3, served while this node was the one writing).
+        // (The timeout is the longest the requester waits, not always how
+        // long it does: an ask made for a sooner lease than its own claim
+        // ends at the instant that claim falls due, when that is earlier
+        // (`acquire_classified`). The request does not say when: a
+        // wait-clock reading means nothing on this node, and a duration
+        // would be one more field through the peer message, the payload and
+        // the handler trait, to cut a window of at most the difference
+        // between the two. A request queued longer than its requester
+        // waited but shorter than the timeout is served: the release then
+        // lands beside the requester's own claim, and whichever CAS loses
+        // reads the object again.)
         let stale = now.wait.since(at) >= self.cfg.handoff_request_timeout_ms as i64;
         if stale {
             tracing::info!(
