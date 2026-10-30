@@ -3804,12 +3804,15 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // Plan 43 C1-3: the operator who abandons a group a claim has waited
     // for too long.
     let operator_abandoned: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    // Plan 43 C2e review: abandons the root refused, or forced, where the
+    // group was not gone: a seed failure.
+    let operator_failures: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     if let Some(after_ms) = cfg.abandon_after_ms {
         let (cluster, stop, fault_log) = (cluster.clone(), sampler_stop.clone(), fault_log.clone());
         let operator_abandoned = operator_abandoned.clone();
+        let operator_failures = operator_failures.clone();
         tokio::spawn(async move {
             let mut done: BTreeSet<(NodeId, u64)> = BTreeSet::new();
-            let mut forced: BTreeSet<(NodeId, u64)> = BTreeSet::new();
             // The generations the operator saw waiting on the root, and
             // since when (C2e).
             let mut gen_since: BTreeMap<(NodeId, u64), u64> = BTreeMap::new();
@@ -3835,30 +3838,85 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                             }));
                         }
                     }
-                    for g in view.delegation.gens.iter().filter(|g| g.7 && !g.6) {
-                        let since = *gen_since.entry((id, g.2)).or_insert(now_ms);
-                        let waited = now_ms.saturating_sub(since);
-                        // The command is refused while the root heard from
-                        // the delegate or a member lately (a delegate that
-                        // rebooted and stopped is alive, and still talks to
-                        // the root). The operator, having confirmed that
-                        // the group cannot hand its tail over, forces it
-                        // after waiting as long again.
-                        let force = waited >= 2 * after_ms && done.contains(&(id, g.2));
-                        if waited >= after_ms
-                            && (done.insert((id, g.2)) || (force && forced.insert((id, g.2))))
-                        {
-                            fault_log.lock().unwrap().push(format!(
-                                "t={now_ms} node {id}: repair abandon-group --gen {}{}",
-                                g.2,
-                                if force { " --force" } else { "" }
-                            ));
-                            operator_abandoned.lock().unwrap().push(g.2);
-                            drop(n.control(constellation_authority::Control::AbandonGroup {
+                    let gens: Vec<(NodeId, u64)> = view
+                        .delegation
+                        .gens
+                        .iter()
+                        .filter(|g| g.7 && !g.6)
+                        .map(|g| (g.1, g.2))
+                        .collect();
+                    for (delegate, gen) in gens {
+                        let since = *gen_since.entry((id, gen)).or_insert(now_ms);
+                        if now_ms.saturating_sub(since) < after_ms || !done.insert((id, gen)) {
+                            continue;
+                        }
+                        fault_log.lock().unwrap().push(format!(
+                            "t={now_ms} node {id}: repair abandon-group --gen {gen}"
+                        ));
+                        let answer = |force| {
+                            n.control(constellation_authority::Control::AbandonGroup {
                                 epoch: 0,
-                                gen: g.2,
+                                gen,
                                 force,
-                            }));
+                            })
+                        };
+                        let wait = |rx| tokio::time::timeout(Duration::from_secs(5), rx);
+                        let result = match wait(answer(false)).await {
+                            Ok(Ok(r)) => r,
+                            _ => continue,
+                        };
+                        let result = match result {
+                            Err(e) if e.contains("--force") => {
+                                // Refused: the root heard from the delegate or
+                                // a strict member lately. The operator forces
+                                // only once it has confirmed what the command
+                                // says to confirm: the delegate is dead, or
+                                // alive with the generation stopped (it
+                                // rebooted since its grant), and every strict
+                                // member is dead. Any other refusal of this
+                                // kind is the rule misjudging, a failure.
+                                let dead = |node: NodeId| !cluster.get(node).alive();
+                                let delegate_gone = dead(delegate)
+                                    || cluster
+                                        .get(delegate)
+                                        .view()
+                                        .delegation
+                                        .mine
+                                        .iter()
+                                        .any(|m| m.1 == gen && m.3);
+                                let members_dead = view
+                                    .delegation
+                                    .waiting
+                                    .iter()
+                                    .filter(|w| w.gen == gen)
+                                    .flat_map(|w| w.members.iter())
+                                    .filter(|m| m.strict)
+                                    .all(|m| dead(m.node));
+                                if !(delegate_gone && members_dead) {
+                                    operator_failures.lock().unwrap().push(format!(
+                                        "t={now_ms} node {id}: abandon-group --gen {gen} refused while the group \
+                                         is not gone (delegate {delegate} gone: {delegate_gone}, strict members \
+                                         dead: {members_dead}): {e}"
+                                    ));
+                                    continue;
+                                }
+                                fault_log.lock().unwrap().push(format!(
+                                    "t={now_ms} node {id}: repair abandon-group --gen {gen} --force (refused: {e})"
+                                ));
+                                match wait(answer(true)).await {
+                                    Ok(Ok(r)) => r,
+                                    _ => continue,
+                                }
+                            }
+                            r => r,
+                        };
+                        match result {
+                            // The run-wide allowance: only an abandon that
+                            // ended the generation.
+                            Ok(_) => operator_abandoned.lock().unwrap().push(gen),
+                            Err(e) => operator_failures.lock().unwrap().push(format!(
+                                "t={now_ms} node {id}: abandon-group --gen {gen} refused: {e}"
+                            )),
                         }
                     }
                 }
@@ -4564,6 +4622,15 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // the command costs, and what it says it costs; these runs count them
     // (`operator_lost`) and judge them tentative. Only runs the operator
     // acted in get the allowance.
+    {
+        let failures = operator_failures.lock().unwrap();
+        if !failures.is_empty() {
+            return Err(format!(
+                "operator_abandon: {failures:?}\n  faults: {:?}",
+                report.faults
+            ));
+        }
+    }
     if !operator_abandoned.lock().unwrap().is_empty() {
         let lost: Vec<Rid> = history
             .returned()
