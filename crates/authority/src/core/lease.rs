@@ -1022,23 +1022,35 @@ impl LeaseState {
         if b.holder == 0 || b.holder == cfg.node_id || b.released || b.is_fenced() {
             return None;
         }
-        let grace = if b.ack_policy == AckPolicy::Backup
+        Some(
+            o.since
+                .plus(Self::ttl_of(b, cfg) + Self::claim_grace_ms(b, cfg)),
+        )
+    }
+
+    /// How long past its TTL a foreign lease body is not this node's to
+    /// claim: the backups' claim grace of a `Backup` lease this node is not
+    /// a listed backup of (`classify`'s second `Busy`), nothing otherwise.
+    fn claim_grace_ms(b: &Lease, cfg: &Config) -> u64 {
+        if b.ack_policy == AckPolicy::Backup
             && !b.backups.is_empty()
             && !b.backups.contains(&cfg.node_id)
         {
             backup_claim_grace_ms(cfg) as u64
         } else {
             0
-        };
-        Some(o.since.plus(Self::ttl_of(b, cfg) + grace))
+        }
     }
 
     /// The earliest instant a `Busy` classification of `prev` may change by
-    /// this node's own clock alone: its TTL claim, or the `ack=s3` permit's
-    /// window (when this node holds the permit).
+    /// this node's own clock alone: its TTL claim (past the backups' claim
+    /// grace, for a node that is not one of a `Backup` lease's), or the
+    /// `ack=s3` permit's window (when this node holds the permit).
     fn retry_at_for(&self, prev: &Lease, cfg: &Config) -> Option<WaitMs> {
         let o = self.obs_for(prev)?;
-        let ttl_at = o.since.plus(Self::ttl_of(&o.body, cfg));
+        let ttl_at = o
+            .since
+            .plus(Self::ttl_of(&o.body, cfg) + Self::claim_grace_ms(&o.body, cfg));
         let permit_at = self
             .takeover_permit
             .filter(|(epoch, holder)| {
@@ -1604,6 +1616,44 @@ mod tests {
     /// port narrowed it to a lease the wall read as live, and a forward step
     /// of the wall (or a restart after the expiry) re-claimed it without the
     /// gate. A tracked lease is `Held` while live, as before; one the wall
+    /// The first `Busy` of a non-backup's look at a `Backup` lease names the
+    /// instant its claim can first be made: the TTL and the backups' grace
+    /// (not the TTL alone, at which the retry would find the lease `Busy`
+    /// again and cost another read and ask). A listed backup claims at the
+    /// TTL.
+    #[test]
+    fn a_non_backups_first_busy_retries_when_the_grace_is_over() {
+        let cfg = cfg();
+        let t0 = Now::same(1_000_000);
+        let mut body = foreign(&cfg, t0, 10_000);
+        body.ack_policy = AckPolicy::Backup;
+        body.backups = vec![4];
+        let obj = (body.clone(), tag());
+        let mut st = LeaseState::default();
+        st.observe(t0, Some(&obj));
+        let grace = backup_claim_grace_ms(&cfg) as u64;
+        let soon = t0.plus(1);
+        assert_eq!(
+            busy_retry(st.classify(soon, &cfg, Some(obj.clone()), 0)),
+            Some(t0.wait.plus(10_000 + grace)),
+            "a non-backup's claim is due after the grace"
+        );
+        assert_eq!(
+            st.claim_due(&cfg),
+            Some(t0.wait.plus(10_000 + grace)),
+            "the same instant `claim_due` names"
+        );
+        // This node is a listed backup: no grace.
+        body.backups = vec![cfg.node_id];
+        let obj = (body, tag());
+        let mut st = LeaseState::default();
+        st.observe(t0, Some(&obj));
+        assert_eq!(
+            busy_retry(st.classify(soon, &cfg, Some(obj), 0)),
+            Some(t0.wait.plus(10_000))
+        );
+    }
+
     /// reads as expired while tracked takes the generic path, as before.
     /// Fails before: `takeover: false, marker: false` for the expired one.
     #[test]
