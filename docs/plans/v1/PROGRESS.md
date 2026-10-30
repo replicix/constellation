@@ -61803,3 +61803,20 @@ against `([(1, DelegGroup)], None, false, 3)`: the `removexattr` was journaled a
 while only the two rows of generation 7 were dropped. Mutations, with the tests kept: with the store's check switched
 off, the meta test fails (`(1, Lone)` where `(1, DelegGroup)` was expected); with the core's check switched off, the
 core test fails on `deleg_lone_demoted` (1 where 0 was expected), because the store demotes the row as the second line.
+
+### 2. A delegate backup's unreadable seal flag is not "not sealed"
+
+Finding (C2e follow-up): `Replica::deleg_backup_sealed` turned a read error into `false`
+(`unwrap_or(false)`, `crates/authority/src/replica.rs`). After a restart only the store knows the seal
+(`Core::dl.sealed` is in memory), so a backup whose seal flag could not be read took the old delegate's appends again
+and acknowledged them `sealed: false`. These are rows the end of the generation at the sealed tail never carries.
+`deleg_backup_holds_any` and `deleg_backup_tail` already return `None` for a read error (13b209f9).
+
+Fix: `deleg_backup_sealed` returns `Option<bool>`, and `Core::on_deleg_backup_append` answers nothing and takes nothing
+on `None`; the delegate sends again. The meta test hook (`fail_deleg_backup_reads_on_this_thread_for_tests`) now also
+fails the read of the flag.
+
+Tests: core `a_backup_that_cannot_read_its_seal_takes_no_appends`, and meta
+`a_delegate_backups_seal_flag_read_fails_as_an_error`. Fail-before (the hook and the test on the item 1 commit): the
+backup acknowledged `DelegBackupAck { acked: 2, sealed: false }` and held rows `[1, 2]` where `None` and `[1]` were
+expected. Mutation (`None => false`): the same failure.

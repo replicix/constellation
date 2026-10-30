@@ -41921,6 +41921,58 @@ mod deleg_windows_tests {
         assert_eq!(answered(&out), Some((true, 1)), "{out:?}");
     }
 
+    /// C2e follow-up (fail-before): a backup's seal is persisted, and after a
+    /// restart only the store knows it. A seal flag that cannot be read is
+    /// not "not sealed": the backup used to take the old delegate's appends
+    /// again and acknowledge them (`sealed: false`), rows the end of the
+    /// generation at the sealed tail never carries. It says nothing, takes
+    /// nothing, and the delegate sends again.
+    #[test]
+    fn a_backup_that_cannot_read_its_seal_takes_no_appends() {
+        let mut h = Harness::new(4);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        // Sealed before the restart, holding row 1.
+        Replica::deleg_backup_append(&h.meta, 7, &[tail_row(1)]);
+        assert!(Replica::deleg_backup_seal(&h.meta, 7));
+        let append = |h: &mut Harness, req: u64| {
+            h.step(Event::Peer {
+                from: 3,
+                msg: PeerMsg::DelegBackupAppend {
+                    req: OpId(req),
+                    gen: 7,
+                    txs: vec![tail_row(2)],
+                },
+            })
+        };
+        let acked = |out: &[Action]| {
+            sends(out).iter().find_map(|(to, m)| match m {
+                PeerMsg::DelegBackupAck { acked, sealed, .. } if *to == 3 => {
+                    Some((*acked, *sealed))
+                }
+                _ => None,
+            })
+        };
+        let held = |h: &Harness| {
+            Replica::deleg_backup_tail(&h.meta, 7)
+                .unwrap()
+                .iter()
+                .map(|t| t.idx)
+                .collect::<Vec<_>>()
+        };
+        constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(1);
+        let out = append(&mut h, 20);
+        constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(0);
+        assert_eq!((acked(&out), held(&h)), (None, vec![1]), "{out:?}");
+        // The flag reads: sealed, and still nothing taken.
+        let out = append(&mut h, 21);
+        assert_eq!(
+            (acked(&out), held(&h)),
+            (Some((0, true)), vec![1]),
+            "{out:?}"
+        );
+    }
+
     /// The journal row of an operator's end of a generation (`RecallCut`
     /// and `GroupAbandoned { gen }`, one transaction) matches its own
     /// segment when this node recovers it after a crash: only the epoch

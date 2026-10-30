@@ -514,6 +514,8 @@ impl Meta {
     }
 
     pub fn deleg_backup_sealed(&self, gen: u64) -> Result<bool, MetaError> {
+        #[cfg(any(test, feature = "test-util"))]
+        read_fault::check()?;
         let r = self.db.read_tx();
         Ok(kv_get_tx(&r, &self.local, &deleg_sealed_key(gen))?.is_some())
     }
@@ -536,7 +538,8 @@ impl Meta {
 
 /// Tests only (`test-util`): fail this thread's next `n` reads of a
 /// delegation backup's holdings ([`Meta::deleg_backup_holds_any`],
-/// [`Meta::deleg_backup_tail`]) with an I/O error.
+/// [`Meta::deleg_backup_tail`]) or of its seal flag
+/// ([`Meta::deleg_backup_sealed`]) with an I/O error.
 #[cfg(any(test, feature = "test-util"))]
 pub fn fail_deleg_backup_reads_on_this_thread_for_tests(n: u32) {
     read_fault::LEFT.with(|c| c.set(n));
@@ -846,6 +849,18 @@ mod tests {
         assert_eq!(backup.deleg_backup_acked(9, 0).unwrap(), 3);
         assert!(backup.deleg_backup_holds_any(9).unwrap());
         assert!(!backup.deleg_backup_holds_any(8).unwrap());
+    }
+
+    /// The seal flag persists, and a read of it that fails is an error, not
+    /// "not sealed" (the test hook fails the next read).
+    #[test]
+    fn a_delegate_backups_seal_flag_read_fails_as_an_error() {
+        let backup = Meta::open_in_memory().unwrap();
+        backup.deleg_backup_seal(9).unwrap();
+        super::fail_deleg_backup_reads_on_this_thread_for_tests(1);
+        assert!(backup.deleg_backup_sealed(9).is_err());
+        assert!(backup.deleg_backup_sealed(9).unwrap());
+        assert!(!backup.deleg_backup_sealed(8).unwrap());
     }
 
     /// A delegate re-sends only what it has not seen in the log: a backup

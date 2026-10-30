@@ -800,7 +800,9 @@ designations create no delegation.
   ends at the root's cursor, because with write-all a member that holds
   nothing proves nothing was acknowledged through the group. The exceptions
   are storage faults on the backup (a read error is no answer at all: the
-  root asks again), a disk lost or re-provisioned under the same node id,
+  root asks again; nor does a backup whose persisted seal flag cannot be
+  read, after a restart, take or acknowledge the old delegate's appends:
+  it does not answer them), a disk lost or re-provisioned under the same node id,
   and a stream cleared by a generation's end that its delegate's disk
   outlived; none is detected here.
 - **The delegate's backup is new or lost rows**: the delegate re-sends

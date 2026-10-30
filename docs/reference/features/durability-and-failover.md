@@ -89,7 +89,9 @@ node acts on it:
 - a continuation epoch's persisted state (the promise to a proposer,
   its membership, the hold) whenever it changes;
 - a backup's seal (and a delegate backup's), before the backup refuses
-  an append, starts its takeover, or acknowledges the seal;
+  an append, starts its takeover, or acknowledges the seal (a delegate
+  backup that cannot read its seal flag back takes no append and answers
+  none);
 - the read-grant and lock-grant horizons a restarted holder quarantines on,
   written as boot stamps (plan 43 C7a): the end on the wall clock, the span
   ahead of the write, the boot id and the raw clock's end, so that a restart

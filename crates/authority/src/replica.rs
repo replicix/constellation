@@ -370,7 +370,10 @@ pub trait Replica {
     /// Whether this node holds anything of `gen` as its backup; `None`: the
     /// store could not be read (not "nothing", plan 43 C2e).
     fn deleg_backup_holds_any(&self, gen: u64) -> Option<bool>;
-    fn deleg_backup_sealed(&self, gen: u64) -> bool;
+    /// Whether `gen` is sealed here (persisted, so a restart keeps it);
+    /// `None`: the flag could not be read (not "not sealed": the caller
+    /// takes no append, plan 43 C2e).
+    fn deleg_backup_sealed(&self, gen: u64) -> Option<bool>;
     fn deleg_backup_clear(&self, gen: u64);
     /// The session watermark (what this node's client has observed).
     fn observed(&self) -> Position;
@@ -1201,8 +1204,14 @@ impl Replica for Meta {
         }
     }
 
-    fn deleg_backup_sealed(&self, gen: u64) -> bool {
-        Meta::deleg_backup_sealed(self, gen).unwrap_or(false)
+    fn deleg_backup_sealed(&self, gen: u64) -> Option<bool> {
+        match Meta::deleg_backup_sealed(self, gen) {
+            Ok(sealed) => Some(sealed),
+            Err(error) => {
+                tracing::warn!(%error, gen, "reading a delegate backup's seal failed");
+                None
+            }
+        }
     }
 
     fn deleg_backup_clear(&self, gen: u64) {

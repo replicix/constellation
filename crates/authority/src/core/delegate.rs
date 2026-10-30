@@ -2414,7 +2414,19 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         self.note_foreign(now, replica, out);
-        let sealed = self.dl.sealed.contains(&gen) || replica.deleg_backup_sealed(gen);
+        // A seal flag that cannot be read is not "not sealed": after a
+        // restart only the store knows the seal, and an append taken over it
+        // is acknowledged to the old delegate as held by its group while the
+        // end of the generation at the sealed tail never carries it. No
+        // answer; the delegate sends again (plan 43 C2e).
+        let sealed = if self.dl.sealed.contains(&gen) {
+            true
+        } else {
+            match replica.deleg_backup_sealed(gen) {
+                Some(sealed) => sealed,
+                None => return,
+            }
+        };
         let mut acked = self.dl.backing.get(&gen).map(|(_, a)| *a).unwrap_or(0);
         if !sealed && !txs.is_empty() {
             acked = replica.deleg_backup_append(gen, &txs);
