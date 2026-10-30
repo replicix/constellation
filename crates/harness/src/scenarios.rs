@@ -11758,8 +11758,11 @@ fn takeover_marker_strands_promptly(_seed: u64) -> Result<()> {
         }
         let (seq, node, epoch, records) =
             marker.context("no log segment carries an epoch newer than A's")?;
+        // The statement names the epoch the gate's takeover found
+        // (`jobs::marker_records`: `gate.epoch - 1`), which is A's only when
+        // B's epoch directly follows it.
         let no_tail = [constellation_meta::LogRecord::TailFollowsThrough {
-            prev_epoch: a_epoch,
+            prev_epoch: b_epoch - 1,
             through: 0,
         }];
         anyhow::ensure!(
