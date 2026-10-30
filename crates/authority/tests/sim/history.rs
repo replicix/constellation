@@ -541,17 +541,19 @@ pub fn check_linearizable_witnessed(
         .enumerate()
         .map(|(i, rid)| (*rid, i))
         .collect();
-    // 1. Real-time order among successes.
-    for (a, ia) in &index_of {
+    // 1. Real-time order among successes, in log order: a failing run
+    // names the same pair every time (`index_of` is a `HashMap`, whose
+    // order is the process's).
+    for (ia, a) in successes.iter().enumerate() {
         let Some((ret_a, _)) = return_at.get(a) else {
             continue;
         };
         if tentative.contains(a) {
             continue;
         }
-        for (b, ib) in &index_of {
+        for b in &successes[..ia] {
             let (inv_b, _) = &invoke_at[b];
-            if ret_a < inv_b && ia > ib {
+            if ret_a < inv_b {
                 return Err(format!(
                     "rid {a:?} returned before rid {b:?} was invoked but follows it in the log"
                 ));
@@ -708,7 +710,9 @@ pub fn check_session_order(
         .enumerate()
         .map(|(i, rid)| (rid, (i as u64, 0)))
         .collect();
-    let mut sessions: HashMap<(u64, u32), Vec<Op>> = HashMap::new();
+    // In session order, for the same reason as the real-time check's.
+    let mut sessions: std::collections::BTreeMap<(u64, u32), Vec<Op>> =
+        std::collections::BTreeMap::new();
     for (rid, pos) in &order {
         if tentative.contains(rid) {
             continue;
