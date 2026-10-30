@@ -57,7 +57,7 @@ use super::backup::{FreshHold, FreshVerdict};
 use super::{AckClass, Asker, Core, Timer};
 use crate::action::{Action, AnswerSource, ControlOk};
 use crate::event::PeerMsg;
-use crate::ids::{HonourMs, NodeId, Now, OpId, TimerId, WaitMs};
+use crate::ids::{Epoch, HonourMs, NodeId, Now, OpId, TimerId, WaitMs};
 use crate::replica::Replica;
 use constellation_fs_core::Ino;
 use constellation_meta::delegation::{Ownership, Range};
@@ -123,14 +123,28 @@ pub(crate) struct GenState {
     /// Placement: since when the delegate's share has been below the
     /// leave threshold (`None`: it is not).
     pub below_since: Option<WaitMs>,
-    /// Phase 2b: seals asked of the backup (one; then the plain reclaim —
-    /// for a generation whose latest record names no backup).
-    pub seal_attempts: u8,
+    /// Plan 43 C2e (§3.7): the seals asked of the group's members, by request
+    /// id: `(member, strict)`. A *strict* member is one of the latest
+    /// `DelegGroup` version (the end waits for one of them); a best-effort
+    /// one is named only by an older record (sealed once, its tail drained
+    /// when it comes while the generation is still ending, never waited
+    /// for). A late answer to any earlier request is as good as the latest's.
+    pub seal_reqs: BTreeMap<OpId, (NodeId, bool)>,
+    /// Plan 43 C2e (Q1, D8): a strict member's sealed tail the root has not
+    /// drained to its end (a row whose dependencies are not here yet, a row
+    /// of a newer tenure, an append error, a root that may not end the
+    /// recall now): kept, and drained again after every event, until the
+    /// cursor reaches the end. The generation stays `Sealing` meanwhile.
+    pub sealed_tail: Option<SealedTail>,
     /// Plan 43 C2 (Q1): the generation cannot end: its latest `DelegGroup`
     /// record names a backup, which may hold acknowledged rows the root
-    /// does not, and it has not answered the seal. Asked again every window
-    /// until it does (counted in `Stats::deleg_seal_waits`).
+    /// does not, and none has answered its seal with a tail drained to its
+    /// end. Asked again every window until one does (counted in
+    /// `Stats::deleg_seal_waits`), `status.delegation.gens[].waiting_for_group`;
+    /// `constellation repair abandon-group --gen` ends it at the cursor.
     pub waiting_for_group: bool,
+    /// The last WARN about the wait (once a minute).
+    pub waiting_warned: Option<WaitMs>,
     /// Appended through this stream index.
     pub cursor: u64,
     // The window (`until`: the root outwaits the delegate once its **wait**
@@ -153,6 +167,17 @@ pub(crate) struct GenState {
     /// The delegate's renewal that waits for `read_recalls`, answered
     /// when the last of them is gone.
     pub renew_waiting: Option<(NodeId, OpId, u64, RenewFrom)>,
+}
+
+/// A sealed tail waiting to be drained (see [`GenState::sealed_tail`]).
+#[derive(Debug, Clone)]
+pub(crate) struct SealedTail {
+    /// The member that sealed and sent it.
+    pub from: NodeId,
+    pub txs: Vec<constellation_meta::DelegateTx>,
+    /// Where the tail runs to without a gap, counted from the cursor at
+    /// the time it arrived: what the drain must reach.
+    pub end: u64,
 }
 
 /// Plan 43 C2: a generation's configuration as the root knows it (the
@@ -179,6 +204,22 @@ impl GroupState {
     /// The backup to seal (delegates keep at most one).
     pub(crate) fn backup(&self) -> Option<NodeId> {
         self.backups.first().copied()
+    }
+
+    /// Plan 43 C2e (D3): the members the generation's end waits for — the
+    /// latest version's backups.
+    pub(crate) fn strict(&self) -> &[NodeId] {
+        &self.backups
+    }
+
+    /// Plan 43 C2e (D3): the backups only an older record named: sealed
+    /// once at the end, never waited for.
+    pub(crate) fn best_effort(&self) -> Vec<NodeId> {
+        self.named
+            .iter()
+            .copied()
+            .filter(|n| !self.backups.contains(n))
+            .collect()
     }
 }
 
@@ -534,12 +575,18 @@ pub(crate) struct ReleaseWait {
 /// Plan 30 §M11's view for `status`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DelegView {
-    /// `(dir, gen, until, stopped, streamed_through, executed, parked)`:
-    /// `until` a reading of this node's honour clock (plan 43 C7-H1; the
-    /// engine's `DelegView` judges it on that clock).
-    pub mine: Vec<(Ino, u64, i64, bool, u64, u64, usize)>,
-    /// `(dir, node, gen, cursor, until_ms (wall, for status), recall, ended)`.
-    pub gens: Vec<(Ino, NodeId, u64, u64, i64, String, bool)>,
+    /// `(dir, gen, until, stopped, streamed_through, executed, parked,
+    /// class)`: `until` a reading of this node's honour clock (plan 43
+    /// C7-H1; the engine's `DelegView` judges it on that clock); `class`
+    /// the name of the class this node's own clients' answers wait for
+    /// (plan 43 C2e: `AckClass::name`).
+    #[allow(clippy::type_complexity)]
+    pub mine: Vec<(Ino, u64, i64, bool, u64, u64, usize, String)>,
+    /// `(dir, node, gen, cursor, until_ms (wall, for status), recall, ended,
+    /// waiting_for_group)`: the last says the generation cannot end because
+    /// no member of its group has handed over the tail (plan 43 C2e).
+    #[allow(clippy::type_complexity)]
+    pub gens: Vec<(Ino, NodeId, u64, u64, i64, String, bool, bool)>,
     pub pending_exec: usize,
     /// Phase 2b: per generation held here, `(gen, backup, backup_acked)`.
     pub backups: Vec<(u64, NodeId, u64)>,
@@ -565,6 +612,7 @@ impl Core {
                         self.clk.wall_of_wait(self.gen_until(*gen)).0,
                         format!("{:?}", g.recall),
                         g.ended,
+                        g.waiting_for_group && !g.ended,
                     )
                 })
                 .collect(),
@@ -600,6 +648,18 @@ impl Core {
                     d.streamed_through,
                     d.executed,
                     d.parked.len(),
+                    // The class published at the last event
+                    // ([`Self::report_deleg_durable`]), not decided again
+                    // for every step's view.
+                    match self.dl.reported.get(&d.gen).map(|r| r.class) {
+                        Some(constellation_meta::RowClass::Lone) => "lone",
+                        Some(constellation_meta::RowClass::Archive) => "archive",
+                        Some(constellation_meta::RowClass::RootGroup) => "root-group",
+                        Some(constellation_meta::RowClass::DelegGroup) => "deleg-group",
+                        Some(constellation_meta::RowClass::NonStealable) => "non-stealable",
+                        None => "",
+                    }
+                    .to_string(),
                 )
             })
             .collect();
@@ -901,8 +961,10 @@ impl Core {
                         redelegate: false,
                         granted: now.wait,
                         below_since: None,
-                        seal_attempts: 0,
+                        seal_reqs: BTreeMap::new(),
+                        sealed_tail: None,
                         waiting_for_group: false,
+                        waiting_warned: None,
                         cursor,
                         recall: RecallPhase::None,
                         recall_before_seal: RecallPhase::None,
@@ -918,7 +980,7 @@ impl Core {
                 if d.node == me {
                     // A predecessor delegated this subtree to the node
                     // that is now the root: the root executes it itself.
-                    self.end_generation(now, d.gen, replica, out);
+                    self.end_generation(now, d.gen, None, replica, out);
                     continue;
                 }
                 self.arm_gen_expiry(now, d.gen, out);
@@ -2251,8 +2313,16 @@ impl Core {
         });
     }
 
-    /// Phase 2b: the backup's answer to a seal: append its tail, end the
+    /// Phase 2b: a member's answer to a seal: append its tail, end the
     /// generation, delegate the directory to the backup.
+    ///
+    /// Plan 43 C2e (§3.7, D3, D8): a *strict* member (of the latest
+    /// `DelegGroup` version) ends the generation once its tail is drained to
+    /// its end — the rows acknowledged through the group are on every
+    /// member, so one member's tail is the group's — and until then the
+    /// generation stays `Sealing` ([`Self::deleg_end_sealed`]). A
+    /// best-effort member (named only by an older record) is drained when it
+    /// answers in time and never holds anything.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_deleg_sealed(
         &mut self,
@@ -2271,16 +2341,39 @@ impl Core {
         if g != gen {
             return;
         }
-        let Some(gs) = self.dl.gens.get(&gen) else {
+        let Some(gs) = self.dl.gens.get_mut(&gen) else {
             return;
         };
-        if gs.ended || gs.group.backup() != Some(from) {
+        let Some(&(member, strict)) = gs.seal_reqs.get(&req) else {
+            return;
+        };
+        if strict {
+            gs.seal_reqs.remove(&req);
+        }
+        if gs.ended || member != from {
             return;
         }
-        let (dir, kind, range) = (gs.dir, gs.kind, gs.range);
+        if !strict {
+            // Its rows only add to what the root appends; a gap or a
+            // missing dependency stops the drain and nothing waits.
+            if sealed && self.root_ends_recall(now, gen) {
+                self.deleg_drain_tail(now, gen, &txs, true, replica, out);
+            }
+            return;
+        }
+        if !sealed {
+            // The member holds nothing of the generation (and is sealed
+            // against later appends): no row was acknowledged through it,
+            // so the root's cursor covers what the group acknowledged. The
+            // spec asks to keep waiting; a backup chosen before the
+            // delegate appended anything holds nothing, and waiting for it
+            // would wedge an idle generation (C2c).
+            self.deleg_end_sealed(now, gen, from, true, replica, out);
+            return;
+        }
         // Where the tail runs to without a gap from the cursor: what the
-        // drain must reach before the generation may end (below).
-        let tail_end = txs.iter().fold(
+        // drain must reach before the generation may end.
+        let end = txs.iter().fold(
             gs.cursor,
             |end, tx| {
                 if tx.idx == end + 1 {
@@ -2290,80 +2383,64 @@ impl Core {
                 }
             },
         );
-        let ends_recall = self.root_ends_recall(now, gen);
-        let mut drained_to = gs.cursor;
-        if sealed && ends_recall {
-            let mut cursor = gs.cursor;
-            let mut drained = 0u64;
-            for tx in txs {
-                if tx.idx <= cursor {
-                    continue;
-                }
-                if tx.idx != cursor + 1 {
-                    break;
-                }
-                if self.deps_from_a_newer_tenure(&tx.deps) {
-                    self.stats.deleg_append_newer_tenure += 1;
-                    break;
-                }
-                if !replica.reaches_streams(&tx.deps) {
-                    self.stats.deleg_deps_unsatisfied_at_append += 1;
-                    break;
-                }
-                match replica.apply_delegate_tx(&tx.records, tx.rid, gen, tx.idx, tx.deps) {
-                    Ok(_) => {
-                        replica.note_foreign_executed(&tx.records);
-                        cursor = tx.idx;
-                        drained += 1;
-                    }
-                    Err(error) => {
-                        tracing::warn!(node = self.me(), gen, idx = tx.idx, %error, "could not append a sealed transaction");
-                        break;
-                    }
-                }
-            }
-            if let Some(gs) = self.dl.gens.get_mut(&gen) {
-                gs.cursor = cursor;
-            }
-            drained_to = cursor;
-            self.stats.deleg_sealed_drained += drained;
-            if drained > 0 {
-                self.answer_awaiting_log(now, replica, out);
-                self.release_exec_parks_completed(now, replica, out);
-                self.nudge(now, out);
-            }
-            tracing::info!(
-                node = self.me(),
-                gen,
-                backup = from,
-                drained,
-                cursor,
-                "drained a sealed delegation"
-            );
+        if gs.sealed_tail.as_ref().is_none_or(|t| end > t.end) {
+            gs.sealed_tail = Some(SealedTail { from, txs, end });
         }
-        // Plan 43 C2 (D8, interim until C2e): rows of the sealed tail past
-        // the drain's break (a dependency not here yet, a row of a newer
-        // tenure, an append error) — or the whole tail, when this root may
-        // not end the recall now — may have been answered through the
-        // backup, and the recall that ends the generation drops them on the
-        // delegate rather than replaying them. So the generation stays
-        // `Sealing`: the window's end asks the seal again (the backup is
-        // sealed and answers with its tail) and the drain resumes from the
-        // cursor.
-        if sealed && (!ends_recall || drained_to < tail_end) {
-            self.stats.deleg_seal_waits += 1;
-            tracing::warn!(
-                node = self.me(),
-                gen,
-                backup = from,
-                cursor = drained_to,
-                tail_end,
-                ends_recall,
-                "a sealed delegation's tail is not drained to its end: the generation is not ended yet"
-            );
+        self.deleg_end_sealed(now, gen, from, true, replica, out);
+    }
+
+    /// Plan 43 C2e (D8): end `gen` if the strict member `from` answered
+    /// ("holds nothing", or its sealed tail, kept in `sealed_tail`, drained
+    /// to its end) and this root may end the recall. Otherwise the
+    /// generation stays `Sealing`: rows past the drain's break (a
+    /// dependency not here yet, a row of a newer tenure, an append error)
+    /// — or the whole tail, when this root may not end the recall now — may
+    /// have been answered through the backup, and the recall that ends the
+    /// generation drops them on the delegate rather than replaying them.
+    /// The drain is retried after every event ([`Self::deleg_after_event`])
+    /// and at the window's end; the seal is not asked again.
+    fn deleg_end_sealed(
+        &mut self,
+        now: Now,
+        gen: u64,
+        from: NodeId,
+        first: bool,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(gs) = self.dl.gens.get(&gen) else {
+            return;
+        };
+        if gs.ended {
             return;
         }
-        self.end_generation(now, gen, replica, out);
+        let (dir, kind, range) = (gs.dir, gs.kind, gs.range);
+        let tail = gs.sealed_tail.clone();
+        let ends_recall = self.root_ends_recall(now, gen);
+        let mut sealed = false;
+        if let Some(tail) = tail {
+            sealed = true;
+            let mut drained_to = self.dl.gens[&gen].cursor;
+            if ends_recall {
+                drained_to = self.deleg_drain_tail(now, gen, &tail.txs, first, replica, out);
+            }
+            if !ends_recall || drained_to < tail.end {
+                if first {
+                    self.stats.deleg_seal_waits += 1;
+                }
+                tracing::debug!(
+                    node = self.me(),
+                    gen,
+                    backup = from,
+                    cursor = drained_to,
+                    tail_end = tail.end,
+                    ends_recall,
+                    "a sealed delegation's tail is not drained to its end: the generation is not ended yet"
+                );
+                return;
+            }
+        }
+        self.end_generation(now, gen, None, replica, out);
         if sealed && kind != DelegKind::Designated {
             match self.delegate_dir(now, dir, from, kind, range, replica, out) {
                 Ok(new_gen) => {
@@ -2381,6 +2458,75 @@ impl Core {
                 }
             }
         }
+    }
+
+    /// Append the contiguous rows of a sealed tail (`txs`) that follow the
+    /// generation's cursor and whose dependencies the root holds; returns the
+    /// cursor. `count`: the stop reasons and the drain are counted (a retry of
+    /// the same tail is not).
+    fn deleg_drain_tail(
+        &mut self,
+        now: Now,
+        gen: u64,
+        txs: &[constellation_meta::DelegateTx],
+        count: bool,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> u64 {
+        let Some(gs) = self.dl.gens.get(&gen) else {
+            return 0;
+        };
+        let mut cursor = gs.cursor;
+        let mut drained = 0u64;
+        for tx in txs {
+            if tx.idx <= cursor {
+                continue;
+            }
+            if tx.idx != cursor + 1 {
+                break;
+            }
+            if self.deps_from_a_newer_tenure(&tx.deps) {
+                if count {
+                    self.stats.deleg_append_newer_tenure += 1;
+                }
+                break;
+            }
+            if !replica.reaches_streams(&tx.deps) {
+                if count {
+                    self.stats.deleg_deps_unsatisfied_at_append += 1;
+                }
+                break;
+            }
+            match replica.apply_delegate_tx(&tx.records, tx.rid, gen, tx.idx, tx.deps) {
+                Ok(_) => {
+                    replica.note_foreign_executed(&tx.records);
+                    cursor = tx.idx;
+                    drained += 1;
+                }
+                Err(error) => {
+                    tracing::warn!(node = self.me(), gen, idx = tx.idx, %error, "could not append a sealed transaction");
+                    break;
+                }
+            }
+        }
+        if drained == 0 {
+            return cursor;
+        }
+        if let Some(gs) = self.dl.gens.get_mut(&gen) {
+            gs.cursor = cursor;
+        }
+        self.stats.deleg_sealed_drained += drained;
+        self.answer_awaiting_log(now, replica, out);
+        self.release_exec_parks_completed(now, replica, out);
+        self.nudge(now, out);
+        tracing::info!(
+            node = self.me(),
+            gen,
+            drained,
+            cursor,
+            "drained a sealed delegation"
+        );
+        cursor
     }
 
     /// The root learns the generations its table names when the table
@@ -2422,6 +2568,20 @@ impl Core {
             }
         }
         self.deleg_forget_ended(now, replica);
+        // Plan 43 C2e (D8): a strict member's sealed tail that the drain
+        // stopped short of (a dependency the log brings, a root that could
+        // not end the recall) is drained again; the generation ends once the
+        // cursor reaches the tail's end.
+        let stalled: Vec<(u64, NodeId)> = self
+            .dl
+            .gens
+            .iter()
+            .filter(|(_, g)| !g.ended)
+            .filter_map(|(gen, g)| g.sealed_tail.as_ref().map(|t| (*gen, t.from)))
+            .collect();
+        for (gen, from) in stalled {
+            self.deleg_end_sealed(now, gen, from, false, replica, out);
+        }
         if self.dl.mine.is_empty() && !self.deleg_known() {
             return;
         }
@@ -2999,7 +3159,8 @@ impl Core {
             }
             ReqKind::Seal => {
                 // Phase 2b: the backup did not answer the seal: the
-                // grant's expiry ends the generation without its tail.
+                // grant's expiry asks again (a recorded backup's tail is
+                // never given up, C2e) or ends the generation without it.
                 // Back to the phase the seal replaced: a recall under way
                 // stays one, so no renewal revives the grant (long-
                 // delegated-backup seed 71251: the backup had crashed,
@@ -3007,15 +3168,48 @@ impl Core {
                 // renewals were granted again and again, and the root's
                 // own op parked on the recall waited past its deadline —
                 // `EIO` for a write the log carried).
+                //
+                // Only a strict member's failure, and only while no tail is
+                // in hand: a best-effort member's changes nothing.
                 let mut granting = false;
+                let mut warn = false;
                 if let Some(g) = self.dl.gens.get_mut(&gen) {
-                    if g.recall == RecallPhase::Sealing {
+                    // (A best-effort member stays asked: once, not per window.)
+                    let strict_failed = match g.seal_reqs.get(&req) {
+                        Some(&(_, false)) => false,
+                        _ => {
+                            g.seal_reqs.remove(&req);
+                            true
+                        }
+                    };
+                    if strict_failed && g.sealed_tail.is_none() && g.recall == RecallPhase::Sealing
+                    {
                         g.recall = match g.recall_before_seal {
                             RecallPhase::Sealing => RecallPhase::None,
                             before => before,
                         };
                         granting = g.recall == RecallPhase::None && !g.ended;
+                        // The member is unreachable (down, or cut from this
+                        // root): the generation cannot end without its tail,
+                        // and says so, as when the seal goes unanswered.
+                        if !g.ended {
+                            g.waiting_for_group = true;
+                            warn = g
+                                .waiting_warned
+                                .is_none_or(|at| now.wait.since(at) >= 60_000);
+                            if warn {
+                                g.waiting_warned = Some(now.wait);
+                            }
+                        }
                     }
+                }
+                if warn {
+                    tracing::warn!(
+                        node = self.cfg.node_id,
+                        gen,
+                        "a delegation's recorded backup cannot be reached for its seal: the generation is not ended without its tail \
+                         (`constellation repair abandon-group --gen {gen}` ends it at the root's cursor; rows only the group holds are lost)"
+                    );
                 }
                 if granting && !self.dl.epoch_active {
                     // The core grants again (and so may the answerer).
@@ -3208,6 +3402,9 @@ impl Core {
                 if g.node == from && !g.ended && g.recall == RecallPhase::None {
                     ttl_ms = self.cfg.delegation_ttl_ms.min(cap);
                     if ttl_ms > 0 {
+                        // The delegate is alive after all: nothing waits
+                        // for its group's tail any more.
+                        g.waiting_for_group = false;
                         // (A `max` in the shared window table: it commutes
                         // with any extension made off the core.)
                         self.dw
@@ -4765,6 +4962,21 @@ impl Core {
         self.dl.gens.get_mut(&gen).expect("present").expiry = Some(t);
     }
 
+    /// Plan 43 C2e: ask `member` to seal `gen`. `strict`: it is one of the
+    /// latest version's members, whose tail the end waits for.
+    fn deleg_send_seal(&mut self, gen: u64, member: NodeId, strict: bool, out: &mut Vec<Action>) {
+        let req = self.op_id();
+        self.dl.by_req.insert(req, (gen, ReqKind::Seal));
+        if let Some(g) = self.dl.gens.get_mut(&gen) {
+            g.seal_reqs.insert(req, (member, strict));
+        }
+        self.stats.deleg_seals_sent += 1;
+        out.push(Action::Send {
+            to: member,
+            msg: PeerMsg::DelegSeal { req, gen },
+        });
+    }
+
     pub(crate) fn on_deleg_expiry(
         &mut self,
         now: Now,
@@ -4808,52 +5020,50 @@ impl Core {
         // it may still be honoured with this root's windows: a grace on
         // the subtree (the seal path re-delegates; the grace stands).
         let outwaited_dir = (g.recall != RecallPhase::Sealing).then_some(g.dir);
-        // Plan 43 C2 (Q1, interim until C2e): a generation whose latest
-        // record names a backup is not ended without that member's tail —
-        // rows acknowledged through the group may be nowhere else — so its
-        // seal is asked again until it answers (below), however many times
-        // the window passed. Without a record (the group is the delegate and
-        // the root) the root's cursor covers everything acknowledged, and the
-        // seal stays a single attempt.
-        let recorded = g.group.backup().is_some();
-        let seal = match (
-            g.group.backup(),
-            g.seal_attempts,
-            g.recall != RecallPhase::Drained(0),
-        ) {
-            (Some(backup), 0, true) => Some(backup),
-            (Some(backup), _, true) if recorded && g.recall != RecallPhase::Sealing => Some(backup),
-            _ => None,
-        };
+        // Plan 43 C2e (Q1, D3): the seal set. A generation whose latest
+        // record names backups (the strict members) is not ended without
+        // one member's tail — rows acknowledged through the group may be
+        // nowhere else — so a seal is asked of each until one answers with
+        // a tail the root drains to its end, however many windows pass.
+        // Without a record (the group is the delegate and the root) the
+        // root's cursor covers everything acknowledged and nothing is
+        // waited for. Backups only an older record named are sealed once,
+        // without waiting (the union rule and `removal_safe` leave every row
+        // acknowledged under an older version at or below the cursor or on
+        // the later version's members: the belt keeps them from taking more
+        // appends, and their tails are drained if they come in time).
+        let strict: Vec<NodeId> = g.group.strict().to_vec();
+        let recorded = !strict.is_empty();
         if let Some(dir) = outwaited_dir {
             self.lock_on_generation_outwaited(now, dir);
         }
-        // Phase 2b: a silent delegate with a backup — ask the backup to
-        // seal and hand over what it holds first (once; the answer, or
-        // its absence, ends the generation either way).
-        if let Some(backup) = seal {
-            let req = self.op_id();
-            let g = self.dl.gens.get_mut(&gen).expect("present");
-            g.seal_attempts = 1;
-            g.recall_before_seal = g.recall;
-            g.recall = RecallPhase::Sealing;
+        for member in g.group.best_effort() {
+            if member == self.me() || g.seal_reqs.values().any(|(n, _)| *n == member) {
+                continue;
+            }
+            self.deleg_send_seal(gen, member, false, out);
+        }
+        // Phase 2b: a silent delegate with a backup — ask its backups to
+        // seal and hand over what they hold first.
+        if recorded && g.recall != RecallPhase::Sealing {
+            if let Some(g) = self.dl.gens.get_mut(&gen) {
+                g.recall_before_seal = g.recall;
+                g.recall = RecallPhase::Sealing;
+            }
             // Closed already (the expiry decision), and nothing reopens it
             // until the seal is answered or gives up: the seal's own window.
             self.dw.close(gen);
             self.dw
                 .set_until_closed(gen, now.wait.plus(self.cfg.forward_timeout_ms * 2));
-            self.dl.by_req.insert(req, (gen, ReqKind::Seal));
-            self.stats.deleg_seals_sent += 1;
-            tracing::info!(
-                node = self.me(),
-                gen,
-                backup,
-                "delegate silent: sealing its backup"
-            );
-            out.push(Action::Send {
-                to: backup,
-                msg: PeerMsg::DelegSeal { req, gen },
-            });
+            for member in strict {
+                tracing::info!(
+                    node = self.me(),
+                    gen,
+                    backup = member,
+                    "delegate silent: sealing its backup"
+                );
+                self.deleg_send_seal(gen, member, true, out);
+            }
             self.arm_gen_expiry(now, gen, out);
             return;
         }
@@ -4877,25 +5087,40 @@ impl Core {
                 );
             }
             RecallPhase::Sealing if recorded => {
-                // Plan 43 C2 (Q1): the recorded backup did not answer in
-                // time: the generation is not ended without its tail. Ask
-                // again (the first request stays known: a late answer to it
-                // is as good), and wait.
-                let Some(backup) = g.group.backup() else {
-                    return;
-                };
-                let req = self.op_id();
-                self.dl.by_req.insert(req, (gen, ReqKind::Seal));
-                self.stats.deleg_seals_sent += 1;
+                // Plan 43 C2 (Q1): no strict member has answered with a tail
+                // drained to its end in time: the generation is not ended
+                // without it. A tail in hand is drained again (its
+                // dependencies may have come); otherwise the seals are asked
+                // again (the earlier requests stay known: a late answer to
+                // one is as good), and we wait.
+                if let Some(from) = g.sealed_tail.as_ref().map(|t| t.from) {
+                    self.deleg_end_sealed(now, gen, from, false, replica, out);
+                    if self.dl.gens.get(&gen).is_none_or(|g| g.ended) {
+                        return;
+                    }
+                } else {
+                    for member in strict {
+                        self.deleg_send_seal(gen, member, true, out);
+                    }
+                }
                 self.stats.deleg_seal_waits += 1;
-                let gs = self.dl.gens.get_mut(&gen).expect("present");
-                if !gs.waiting_for_group {
+                let warn = {
+                    let gs = self.dl.gens.get_mut(&gen).expect("present");
                     gs.waiting_for_group = true;
+                    let due = gs
+                        .waiting_warned
+                        .is_none_or(|at| now.wait.since(at) >= 60_000);
+                    if due {
+                        gs.waiting_warned = Some(now.wait);
+                    }
+                    due
+                };
+                if warn {
                     tracing::warn!(
                         node = self.me(),
                         gen,
-                        backup,
-                        "a delegation's recorded backup has not answered its seal: the generation is not ended without its tail"
+                        "a delegation's recorded backup has not answered its seal: the generation is not ended without its tail \
+                         (`constellation repair abandon-group --gen {gen}` ends it at the root's cursor; rows only the group holds are lost)"
                     );
                 }
                 self.dw.close(gen);
@@ -4904,29 +5129,16 @@ impl Core {
                     now.wait
                         .plus(self.cfg.backup_takeover_ms.max(self.cfg.forward_timeout_ms)),
                 );
-                out.push(Action::Send {
-                    to: backup,
-                    msg: PeerMsg::DelegSeal { req, gen },
-                });
                 self.arm_gen_expiry(now, gen, out);
                 return;
             }
             RecallPhase::Sealing => {
                 // The seal was not answered in time.
-                if let Some(req) = self
-                    .dl
-                    .by_req
-                    .iter()
-                    .find(|(_, (g, k))| *g == gen && *k == ReqKind::Seal)
-                    .map(|(r, _)| *r)
-                {
-                    self.dl.by_req.remove(&req);
-                }
                 self.stats.deleg_reclaimed += 1;
             }
             _ => self.stats.deleg_recalls_expired += 1,
         }
-        self.end_generation(now, gen, replica, out);
+        self.end_generation(now, gen, None, replica, out);
     }
 
     pub(crate) fn on_deleg_recalled(
@@ -4967,14 +5179,84 @@ impl Core {
             .collect();
         for gen in done {
             self.stats.deleg_recalls_drained += 1;
-            self.end_generation(now, gen, replica, out);
+            self.end_generation(now, gen, None, replica, out);
         }
+    }
+
+    /// Plan 43 C2e (Q1, `constellation repair abandon-group --gen G`): the
+    /// operator accepts that the group of generation `gen` is gone for good.
+    /// Valid on the root of a generation that waits for its group
+    /// (`status.delegation.gens[].waiting_for_group`): it is ended at the
+    /// cursor now, with `LogRecord::GroupAbandoned` journaled with the cut
+    /// (the audit), and the rows only the group held — acknowledged to
+    /// their clients — are lost (the delegate's, if it comes back, are
+    /// dropped by the recall's strand).
+    pub(crate) fn on_control_abandon_generation(
+        &mut self,
+        now: Now,
+        op: OpId,
+        epoch: Epoch,
+        gen: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let result = match self.dl.gens.get(&gen) {
+            _ if epoch != 0 => Err(
+                "a delegation's group is named by --gen alone (no --epoch)".to_string(),
+            ),
+            None => Err(format!(
+                "this node is not the root of generation {gen} (run it on the node whose `status` lists it under delegation.gens)"
+            )),
+            Some(g) if g.ended => Err(format!("generation {gen} has ended already")),
+            Some(g) if !g.waiting_for_group => Err(format!(
+                "generation {gen} is not waiting for its group (delegation.gens[].waiting_for_group)"
+            )),
+            Some(_) if !self.root_ends_recall(now, gen) => Err(format!(
+                "this node cannot end generation {gen} now (it is not a usable root)"
+            )),
+            Some(g) => {
+                let known = g.sealed_tail.as_ref().map_or(g.cursor, |t| t.end.max(g.cursor));
+                let cursor = g.cursor;
+                tracing::warn!(
+                    node = self.me(),
+                    gen,
+                    cursor,
+                    known,
+                    "the operator abandoned the group of a delegation: ending it at the root's cursor; rows only its group held are lost"
+                );
+                self.end_generation(now, gen, Some(known), replica, out);
+                if self.dl.gens.get(&gen).is_some_and(|g| g.ended) {
+                    self.stats.groups_abandoned += 1;
+                    Ok(ControlOk::Text(format!(
+                        "generation {gen} ended at index {cursor}; rows past it that only its group held are lost"
+                    )))
+                } else {
+                    Err(format!(
+                        "could not journal the end of generation {gen}; try again"
+                    ))
+                }
+            }
+        };
+        out.push(Action::ControlDone { op, result });
     }
 
     /// End `gen` here and now: the `RecallCut` record journaled (the table
     /// row changes with it), later stream records of it refused, every
     /// parked execution waiting on it released.
-    fn end_generation(&mut self, now: Now, gen: u64, replica: &dyn Replica, out: &mut Vec<Action>) {
+    ///
+    /// `abandoned`: the operator gave the generation's group up
+    /// (`constellation repair abandon-group --gen`): the end is journaled
+    /// with a [`LogRecord::GroupAbandoned`] (`through_known`: the highest
+    /// index of the group the root knew of), the log's permanent record that
+    /// rows the group may have acknowledged past the cut are lost.
+    fn end_generation(
+        &mut self,
+        now: Now,
+        gen: u64,
+        abandoned: Option<u64>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
         let Some(g) = self.dl.gens.get(&gen) else {
             return;
         };
@@ -5007,9 +5289,15 @@ impl Core {
             cursor
         };
         let _class = self.journal_class();
-        if let Err(error) =
-            replica.apply_records_journaled(&[LogRecord::RecallCut { dir, gen, through }], None)
-        {
+        let mut records = vec![LogRecord::RecallCut { dir, gen, through }];
+        if let Some(through_known) = abandoned {
+            records.push(LogRecord::GroupAbandoned {
+                epoch: 0,
+                gen,
+                through_known,
+            });
+        }
+        if let Err(error) = replica.apply_records_journaled(&records, None) {
             tracing::warn!(node = self.me(), gen, %error, "could not journal the recall record");
             self.arm_gen_expiry(now.plus(500), gen, out);
             return;
@@ -5070,6 +5358,9 @@ impl Core {
         };
         let first = !g.ended;
         g.ended = true;
+        g.waiting_for_group = false;
+        g.sealed_tail = None;
+        g.seal_reqs.clear();
         self.dw.close(gen);
         if first {
             let due = self.deleg_forget_due(now, gen);
@@ -5481,8 +5772,10 @@ impl Core {
                 redelegate: false,
                 granted: now.wait,
                 below_since: None,
-                seal_attempts: 0,
+                seal_reqs: BTreeMap::new(),
+                sealed_tail: None,
                 waiting_for_group: false,
+                waiting_warned: None,
                 cursor: 0,
                 recall: RecallPhase::None,
                 recall_before_seal: RecallPhase::None,

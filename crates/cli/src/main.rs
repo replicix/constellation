@@ -578,16 +578,20 @@ enum RepairCommand {
         state_dir: Option<PathBuf>,
     },
     /// Let a lease claim that waits for the tail of a lost group go on
-    /// without it (`status.lease.waiting_for_group`). Rows that group
-    /// acknowledged may be lost.
+    /// without it (`status.lease.waiting_for_group`, `--epoch`), or the
+    /// root end a delegation whose group has not handed over its tail
+    /// (`status.delegation.gens[].waiting_for_group`, `--gen`, on the root).
+    /// Rows that group acknowledged may be lost: the clients were told they
+    /// were committed. The log records the decision.
     AbandonGroup {
         target: String,
         /// The epoch `status.lease.waiting_for_group` names.
-        #[arg(long)]
-        epoch: u64,
-        /// The group within the epoch; only 0 (the default) is accepted yet.
-        #[arg(long, default_value_t = 0)]
-        gen: u64,
+        #[arg(long, conflicts_with = "gen", required_unless_present = "gen")]
+        epoch: Option<u64>,
+        /// The delegation generation `status.delegation.gens` lists as
+        /// waiting for its group; run it on that status's node (the root).
+        #[arg(long, conflicts_with = "epoch", required_unless_present = "epoch")]
+        gen: Option<u64>,
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
@@ -1796,6 +1800,9 @@ fn run() -> Result<()> {
             if let Some(line) = render_waiting_for_group(&s.lease) {
                 eprintln!("{line}");
             }
+            for line in render_waiting_generations(&s.delegation) {
+                eprintln!("{line}");
+            }
             eprint!(
                 "{}",
                 sched_cli::render_node_summary(&s.snapsched, &s.snapacct)
@@ -1905,7 +1912,10 @@ fn run() -> Result<()> {
             ctl::<cm::LeaseAbandonGroup>(
                 &rt,
                 &dir,
-                api::AbandonGroupParams { epoch, gen },
+                api::AbandonGroupParams {
+                    epoch: epoch.unwrap_or(0),
+                    gen: gen.unwrap_or(0),
+                },
                 print_ack,
             )
         }
@@ -4139,6 +4149,25 @@ fn render_waiting_for_group(lease: &api::LeaseStatus) -> Option<String> {
     ))
 }
 
+/// The `status` lines for delegation generations that cannot end because no
+/// member of their group has handed over the tail (plan 43 C2e).
+fn render_waiting_generations(delegation: &api::DelegationReport) -> Vec<String> {
+    delegation
+        .gens
+        .iter()
+        .filter(|g| g.7 && !g.6)
+        .map(|g| {
+            format!(
+                "delegation generation {} (directory inode {}, delegate node {}) cannot end: its \
+                 recorded backup has not handed over the tail; `constellation repair abandon-group \
+                 --gen {}` (on this node) ends it at index {}, and rows only that group held \
+                 are lost",
+                g.2, g.0, g.1, g.2, g.3
+            )
+        })
+        .collect()
+}
+
 fn print_ack(ack: api::Ack) -> Result<()> {
     println!("{}", ack.detail);
     Ok(())
@@ -4800,40 +4829,39 @@ mod parse_byte_size_tests {
 
     #[test]
     fn repair_abandon_group_parses() {
-        let cli = Cli::try_parse_from([
-            "constellation",
-            "repair",
-            "abandon-group",
-            "fs",
-            "--epoch",
-            "7",
-        ])
-        .unwrap();
-        match cli.command {
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["constellation", "repair", "abandon-group", "fs"];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args)
+        };
+        match parse(&["--epoch", "7"]).unwrap().command {
             Command::Repair {
                 command: RepairCommand::AbandonGroup { epoch, gen, .. },
-            } => assert_eq!((epoch, gen), (7, 0)),
+            } => assert_eq!((epoch, gen), (Some(7), None)),
             _ => panic!("expected repair abandon-group"),
         }
-        let cli = Cli::try_parse_from([
-            "constellation",
-            "repair",
-            "abandon-group",
-            "fs",
-            "--epoch",
-            "7",
-            "--gen",
-            "2",
-        ])
-        .unwrap();
-        match cli.command {
+        match parse(&["--gen", "2"]).unwrap().command {
             Command::Repair {
                 command: RepairCommand::AbandonGroup { epoch, gen, .. },
-            } => assert_eq!((epoch, gen), (7, 2)),
+            } => assert_eq!((epoch, gen), (None, Some(2))),
             _ => panic!("expected repair abandon-group"),
         }
-        // The epoch is required.
-        assert!(Cli::try_parse_from(["constellation", "repair", "abandon-group", "fs"]).is_err());
+        // Exactly one of them: a lease claim's group or a delegation's.
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["--epoch", "7", "--gen", "2"]).is_err());
+    }
+
+    #[test]
+    fn status_line_names_the_waiting_generation() {
+        let mut d = api::DelegationReport::default();
+        d.gens
+            .push((5, 2, 9, 41, 0, "Sealing".into(), false, false));
+        d.gens.push((6, 3, 10, 7, 0, "Sealing".into(), false, true));
+        d.gens.push((6, 3, 11, 7, 0, "None".into(), true, true));
+        let lines = render_waiting_generations(&d);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("abandon-group --gen 10"), "{}", lines[0]);
+        assert!(lines[0].contains("index 7"), "{}", lines[0]);
     }
 
     #[test]

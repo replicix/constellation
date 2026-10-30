@@ -4167,6 +4167,10 @@ to land before C0.
       ledger's late allowance only for lone topologies;
       `takeover-loss-two-node` green; the `load-probe` cell that found
       the loss green ×20.
+      *C2a–C2e landed* (PROGRESS, "Plan 43 C2a" … "C2e": the oracle, the cut,
+      the delegate's group, its fast path, and the end of a delegation waiting
+      for its group: the seal set, the strict wait, `waiting_for_group`,
+      `abandon-group --gen`); C2f–C2h open.
 - [ ] C3: I2c (verbatim) strict on every config; the delegate-turned-root
       rule (move, apply verbatim, re-append deduped by origin, end);
       the fold, `Records` copies, holed generations and the deposed-root

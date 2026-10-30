@@ -634,7 +634,9 @@ impl Core {
     }
 
     /// `Control::AbandonGroup`: valid while a claim waits for `epoch`'s
-    /// group and none of its members has answered.
+    /// group and none of its members has answered. With `gen != 0` it
+    /// abandons a delegation's group instead (C2e,
+    /// [`Core::on_control_abandon_generation`]).
     pub(crate) fn on_control_abandon_group(
         &mut self,
         now: Now,
@@ -644,13 +646,13 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        if gen != 0 {
+            self.on_control_abandon_generation(now, op, epoch, gen, replica, out);
+            return;
+        }
         let waiting = self.bk.group_wait.as_ref().map(|w| w.epoch);
         let chosen = self.bk.tf.as_ref().is_some_and(|t| t.chosen.is_some());
-        let result = if gen != 0 {
-            Err(format!(
-                "only the root group (gen 0) can be abandoned here, not generation {gen}"
-            ))
-        } else if waiting != Some(epoch) || chosen {
+        let result = if waiting != Some(epoch) || chosen {
             Err(format!("not waiting for epoch {epoch}'s group"))
         } else {
             Ok(crate::action::ControlOk::Text(format!(

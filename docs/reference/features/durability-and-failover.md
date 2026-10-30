@@ -270,7 +270,10 @@ tail (`status.lease.waiting_for_group`; a warning once a minute; the
 writes behind it wait for the lease). An operator who knows the group is
 gone for good ends the wait with `constellation repair abandon-group
 --epoch E`: the claim goes on without the tail and its marker carries
-`GroupAbandoned`. The rows that group acknowledged are then lost.
+`GroupAbandoned`. The rows that group acknowledged are then lost. A
+generation of a delegation whose delegate and recorded backup are both gone
+waits the same way, and ends only by a member's tail or by
+`abandon-group --gen G` on the root (see [Delegations](delegations.md#failures)).
 
 **An inherited tail stays reachable.** A takeover that re-ships a
 predecessor's tail journals its rows as its own, and until their segments
@@ -1542,7 +1545,14 @@ goes on by itself as soon as one answers. If those members are gone for
 good, `constellation repair abandon-group myfs --epoch E` (admin) lets
 the claim go on without the tail. Rows that group acknowledged and no
 other copy holds are lost; the command refuses unless a claim waits for
-exactly that epoch's group. `--gen` is accepted but must be 0.
+exactly that epoch's group.
+
+The same wait exists for a delegation: a root that cannot end the
+generation of a silent delegate without the tail of its recorded backup
+shows `status.delegation.gens[].waiting_for_group`, and
+`constellation repair abandon-group myfs --gen G` (on the root) ends it at the
+root's cursor, with `GroupAbandoned` in the log and the same cost: rows only
+that group held are lost. See [Delegations](delegations.md#failures).
 
 ### Writes got slower after a second node joined
 

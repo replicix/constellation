@@ -359,6 +359,10 @@ fn replay_seed() {
         Ok("delegated-two-gens-root-crash") => delegated_two_gens_root_crash_config(),
         Ok("delegated-backup") => delegated_backup_config(),
         Ok("delegated-no-backup-root-near") => delegated_no_backup_root_near_config(),
+        Ok("delegated-backup-and-delegate-die") => delegated_backup_and_delegate_die_config(),
+        Ok("delegated-backup-and-delegate-die-abandon") => {
+            delegated_backup_and_delegate_die_abandon_config()
+        }
         Ok("delegated-backup-crash") => delegated_backup_crash_config(),
         Ok("delegated-designated") => delegated_designated_config(),
         Ok("delegated-placement") => delegated_placement_config(),
@@ -5193,6 +5197,10 @@ fn sweep_config() {
         "long-strict" => long_strict_config(),
         "delegated-backup" => delegated_backup_config(),
         "delegated-no-backup-root-near" => delegated_no_backup_root_near_config(),
+        "delegated-backup-and-delegate-die" => delegated_backup_and_delegate_die_config(),
+        "delegated-backup-and-delegate-die-abandon" => {
+            delegated_backup_and_delegate_die_abandon_config()
+        }
         // Plan 43 C2: the M11 configurations the sweep did not name.
         "delegated-crash" => delegated_crash_config(),
         "delegated-partition" => delegated_partition_config(),
@@ -6144,6 +6152,51 @@ fn delegated_no_backup_root_near_config() -> SimConfig {
         core: std::sync::Arc::new(sim::run::backup_core_config),
         rtts: vec![((1, 2), 10), ((1, 3), 10), ((2, 3), 80)],
         ..delegated_config()
+    }
+}
+
+/// Plan 43 C2e (Q1, strict): the delegate of `d1` (node 2) and its backup
+/// (node 3, the only peer within budget) die for good at 2 s, taking with
+/// them whatever only the group held. The root cannot end either
+/// generation without a member's tail: the run ends `waiting_for_group`
+/// (`status.delegation.gens[].waiting_for_group`), every acknowledged row is
+/// still on a surviving disk, and no check fails. (Before C2e's wait the root
+/// ended the generation at the window's end without the tail: rows the
+/// delegate had answered through its backup were lost.)
+fn delegated_backup_and_delegate_die_config() -> SimConfig {
+    SimConfig {
+        cross_ratio: 0.0,
+        await_dead_delegates: true,
+        faults: vec![
+            ScheduledFault {
+                at_ms: 2_000,
+                kind: FaultKind::CrashNode {
+                    node: 2,
+                    restart_ms: None,
+                    keep_journal: true,
+                },
+            },
+            ScheduledFault {
+                at_ms: 2_000,
+                kind: FaultKind::CrashNode {
+                    node: 3,
+                    restart_ms: None,
+                    keep_journal: true,
+                },
+            },
+        ],
+        ..delegated_backup_config()
+    }
+}
+
+/// The same with the operator: `repair abandon-group --gen G` after 5 s of
+/// waiting ends each generation at the root's cursor (`GroupAbandoned` in
+/// the log); the rows only the dead group held are lost, counted
+/// (`operator_lost`) and judged tentative, and the run converges.
+fn delegated_backup_and_delegate_die_abandon_config() -> SimConfig {
+    SimConfig {
+        abandon_after_ms: Some(5_000),
+        ..delegated_backup_and_delegate_die_config()
     }
 }
 
@@ -7694,6 +7747,48 @@ fn delegated_no_backup_root_near_acknowledges_through_the_root() {
         waited += c0_count(&r.acks_by_class, "deleg-group");
     }
     assert!(waited > 0, "no delegate answer waited for the root");
+}
+
+/// Plan 43 C2e (Q1, strict): the delegate and its backup die for good; the
+/// root does not end their generations without a member's tail. The runs end
+/// `waiting_for_group` and every acknowledged row is still held somewhere
+/// (the run checks it); none ends a generation of the dead group.
+#[test]
+fn delegated_backup_and_delegate_die_waits_for_the_group() {
+    let mut waiting = 0usize;
+    for seed in 0..8u64 {
+        let r = c0_run(
+            "delegated-backup-and-delegate-die",
+            seed,
+            delegated_backup_and_delegate_die_config(),
+        );
+        waiting += usize::from(r.waiting_for_group);
+        let abandoned: u64 = r.stats.values().map(|s| s.groups_abandoned).sum();
+        assert_eq!(abandoned, 0, "seed {seed}: nobody abandons here");
+    }
+    assert!(
+        waiting > 0,
+        "no run ended with a generation waiting for its group"
+    );
+}
+
+/// The same with the operator: the generations end at the root's cursor by
+/// `abandon-group --gen`, the run converges, what only the dead group held
+/// is counted as lost to the operator.
+#[test]
+fn delegated_backup_and_delegate_die_ends_by_the_operators_escape() {
+    let (mut abandoned, mut waiting) = (0u64, 0usize);
+    for seed in 0..8u64 {
+        let r = c0_run(
+            "delegated-backup-and-delegate-die-abandon",
+            seed,
+            delegated_backup_and_delegate_die_abandon_config(),
+        );
+        waiting += usize::from(r.waiting_for_group);
+        abandoned += r.stats.values().map(|s| s.groups_abandoned).sum::<u64>();
+    }
+    assert_eq!(waiting, 0, "a generation was left waiting after the escape");
+    assert!(abandoned > 0, "the operator never abandoned a group");
 }
 
 /// Phase 2b: delegates with backups; acknowledgements wait for them.

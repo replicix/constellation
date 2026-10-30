@@ -677,9 +677,17 @@ pub struct SimConfig {
     /// Plan 43 C1-3 (§5.8, Q1): the operator abandons the group a claim has
     /// waited for this long (simulated ms), as `constellation repair
     /// abandon-group --epoch E` does (`Control::AbandonGroup` on the node
-    /// that waits). `None`: nobody does; a claim whose group is gone for good
-    /// then ends the run `waiting_for_group`.
+    /// that waits); C2e: and the group of a delegation generation the root
+    /// cannot end (`--gen G`, on the root). `None`: nobody does; a claim or a
+    /// generation whose group is gone for good then ends the run
+    /// `waiting_for_group`.
     pub abandon_after_ms: Option<u64>,
+    /// Plan 43 C2e: the run is not quiescent while the root has a generation
+    /// whose delegate is dead and which has neither ended nor been found
+    /// waiting for its group (`delegation.gens[].waiting_for_group`; with an
+    /// operator, `abandon_after_ms`, until it has ended): the settle lasts
+    /// until the root has decided.
+    pub await_dead_delegates: bool,
     /// Test-only (`c1_the_claim_check_catches_a_planted_commit_claim`): the
     /// sim's fast path claims `RootGroup` for a row that waited for nothing
     /// (a lone one).
@@ -964,6 +972,7 @@ impl Default for SimConfig {
             plant_ungated_fast_path: false,
             plant_claim_root_group_on_lone: false,
             abandon_after_ms: None,
+            await_dead_delegates: false,
         }
     }
 }
@@ -983,6 +992,9 @@ pub struct Report {
     /// acknowledged rid must be held somewhere instead
     /// (`acked_held_somewhere`).
     pub waiting_for_group: bool,
+    /// Plan 43 C2e: acknowledged rows missing from the log in a run where
+    /// the operator abandoned a delegation's group (`abandon_after_ms`).
+    pub operator_lost: usize,
     pub ops_invoked: usize,
     pub ops_returned: usize,
     /// Plan 45 follow-up (`SimConfig::link_ratio`): links and exchanges
@@ -3780,10 +3792,15 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let stall_violations: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     // Plan 43 C1-3: the operator who abandons a group a claim has waited
     // for too long.
+    let operator_abandoned: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
     if let Some(after_ms) = cfg.abandon_after_ms {
         let (cluster, stop, fault_log) = (cluster.clone(), sampler_stop.clone(), fault_log.clone());
+        let operator_abandoned = operator_abandoned.clone();
         tokio::spawn(async move {
             let mut done: BTreeSet<(NodeId, u64)> = BTreeSet::new();
+            // The generations the operator saw waiting on the root, and
+            // since when (C2e).
+            let mut gen_since: BTreeMap<(NodeId, u64), u64> = BTreeMap::new();
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 for id in cluster.ids() {
@@ -3791,19 +3808,33 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                     if !n.alive() {
                         continue;
                     }
-                    let Some(w) = n.view().ack.waiting_for_group else {
-                        continue;
-                    };
-                    if w.waited_ms >= after_ms && done.insert((id, w.epoch)) {
-                        fault_log.lock().unwrap().push(format!(
-                            "t={} node {id}: repair abandon-group --epoch {}",
-                            cluster.env.clock.elapsed_ms(),
-                            w.epoch
-                        ));
-                        drop(n.control(constellation_authority::Control::AbandonGroup {
-                            epoch: w.epoch,
-                            gen: 0,
-                        }));
+                    let now_ms = cluster.env.clock.elapsed_ms();
+                    let view = n.view();
+                    if let Some(w) = view.ack.waiting_for_group {
+                        if w.waited_ms >= after_ms && done.insert((id, w.epoch)) {
+                            fault_log.lock().unwrap().push(format!(
+                                "t={now_ms} node {id}: repair abandon-group --epoch {}",
+                                w.epoch
+                            ));
+                            drop(n.control(constellation_authority::Control::AbandonGroup {
+                                epoch: w.epoch,
+                                gen: 0,
+                            }));
+                        }
+                    }
+                    for g in view.delegation.gens.iter().filter(|g| g.7 && !g.6) {
+                        let since = *gen_since.entry((id, g.2)).or_insert(now_ms);
+                        if now_ms.saturating_sub(since) >= after_ms && done.insert((id, g.2)) {
+                            fault_log.lock().unwrap().push(format!(
+                                "t={now_ms} node {id}: repair abandon-group --gen {}",
+                                g.2
+                            ));
+                            operator_abandoned.lock().unwrap().push(g.2);
+                            drop(n.control(constellation_authority::Control::AbandonGroup {
+                                epoch: 0,
+                                gen: g.2,
+                            }));
+                        }
                     }
                 }
             }
@@ -3898,6 +3929,20 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         match tokio::time::timeout(client_cap, c).await {
             Ok(r) => r.expect("client task"),
             Err(_) => {
+                // Plan 43 C2e (Q1): a root that cannot end a delegation's
+                // generation without its group's tail makes the writes under
+                // the subtree wait, an op of its own clients' included: that
+                // is the rule, and the run ends `waiting_for_group` (no
+                // operator acts in it). Anywhere else it is a hang.
+                let gen_waits = cfg.abandon_after_ms.is_none()
+                    && cluster
+                        .ids()
+                        .into_iter()
+                        .map(|id| cluster.get(id))
+                        .any(|n| n.alive() && n.view().delegation.gens.iter().any(|g| g.7 && !g.6));
+                if gen_waits {
+                    break;
+                }
                 failures.lock().unwrap().push(format!(
                     "a client op was never answered within {client_cap:?} of simulated time; \
                      waiting: {:?}",
@@ -4038,11 +4083,57 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         let all = live.iter().all(|n| {
             let v = n.view();
             v.clients_in_flight == 0
+                && (!cfg.await_dead_delegates
+                    || v.delegation.gens.iter().all(|g| {
+                        g.6 || (g.7 && cfg.abandon_after_ms.is_none()) || cluster.get(g.1).alive()
+                    }))
                 && v.job.is_none()
                 && super::node::is_quiescent(&n.meta)
                 && constellation_authority::Replica::applied_seq(&*n.meta).unwrap_or(0) >= head
         });
-        if all {
+        // Plan 43 C2e: a delegation of a dead node that no live node knows as
+        // a generation yet (the lease is nobody's: the root went away or
+        // never claimed it back): the next op of any client would claim it
+        // and find the generation waiting. The run asks for that claim,
+        // and is not quiescent until a root has decided about it.
+        let undecided = cfg.await_dead_delegates
+            && !live
+                .iter()
+                .any(|n| n.view().ack.waiting_for_group.is_some())
+            && live.first().is_some_and(|first| {
+                first.meta.delegation_table().iter().any(|d| {
+                    !cluster.get(d.node).alive()
+                        && !live.iter().any(|n| {
+                            n.view().delegation.gens.iter().any(|g| {
+                                g.2 == d.gen && (g.6 || (g.7 && cfg.abandon_after_ms.is_none()))
+                            })
+                        })
+                })
+            });
+        if undecided && waited.is_multiple_of(4_000) {
+            // A write at a live node: it claims the root lease, learns the
+            // generations its table lists, and finds them waiting. Bounded:
+            // the op may be parked behind the wait itself.
+            if let Some(n) = live.first() {
+                extra_settles += 1;
+                let handle = n.clone();
+                let rid = handle.next_rid();
+                let op = NsOp::Create(format!("settle-{extra_settles}"));
+                let mop = mutate_op(&handle.meta, &op).expect("a create");
+                history.invoke(settle_thread + extra_settles, rid, op);
+                match tokio::time::timeout(Duration::from_secs(3), handle.submit(rid, mop)).await {
+                    Ok(Ok(ClientReply::Outcome(o))) => {
+                        if let Ok(ret) = ns_ret(&o) {
+                            history.ret(settle_thread + extra_settles, rid, ret);
+                        }
+                    }
+                    _ => {
+                        abandoned.lock().unwrap().insert(rid);
+                    }
+                }
+            }
+        }
+        if all && !undecided {
             quiescent = true;
             break;
         }
@@ -4386,12 +4477,38 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // every rid a client was acknowledged is carried by the log, a
     // journal, a backup tail or a member copy somewhere — nothing was
     // answered that no copy holds.
+    if std::env::var_os("AUTHORITY_SIM_ORACLE_DEBUG").is_some() {
+        for id in cluster.ids() {
+            let n = cluster.get(id);
+            if n.alive() {
+                let v = n.view();
+                eprintln!(
+                    "END-VIEW node {id}: gens {:?} lease-wait {:?} held_epoch {:?} lost {} s3_held {:?} table {:?}",
+                    v.delegation.gens,
+                    v.ack.waiting_for_group,
+                    v.held_epoch,
+                    v.lost,
+                    v.s3_held,
+                    n.meta
+                        .delegation_table()
+                        .iter()
+                        .map(|d| (d.gen, d.node))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
     let waiting_for_group = cluster
         .ids()
         .into_iter()
         .map(|id| cluster.get(id))
         .filter(|n| n.alive())
-        .any(|n| n.view().ack.waiting_for_group.is_some());
+        .any(|n| {
+            let v = n.view();
+            // A claim waits for the tail of its lease's group, or a root
+            // for the tail of a delegation's (plan 43 C2e).
+            v.ack.waiting_for_group.is_some() || v.delegation.gens.iter().any(|g| g.7 && !g.6)
+        });
     if waiting_for_group {
         report.waiting_for_group = true;
         let nowhere: Vec<Rid> = history
@@ -4415,6 +4532,22 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             ));
         }
         return Ok(report);
+    }
+    // Plan 43 C2e: the operator ended a delegation generation whose group
+    // had not handed over its tail (`abandon-group --gen`): the rows only
+    // that group held were acknowledged and are not in the log. That is what
+    // the command costs, and what it says it costs; these runs count them
+    // (`operator_lost`) and judge them tentative. Only runs the operator
+    // acted in get the allowance.
+    if !operator_abandoned.lock().unwrap().is_empty() {
+        let lost: Vec<Rid> = history
+            .returned()
+            .into_iter()
+            .map(|(rid, _)| rid)
+            .filter(|rid| !oracle.completed_at.contains_key(rid))
+            .collect();
+        report.operator_lost = lost.len();
+        tentative.extend(lost);
     }
     report.segments = oracle.segments;
     report.fenced = oracle.fenced;

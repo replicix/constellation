@@ -40368,6 +40368,15 @@ mod c1_counted {
 mod deleg_windows_tests {
     use super::*;
     use crate::core::delegate::RecallPhase;
+    use crate::replica::Replica;
+
+    /// The journal's records, in order.
+    fn journal_records(h: &Harness) -> Vec<LogRecord> {
+        Replica::journal_txs_from(&h.meta, 0, usize::MAX)
+            .into_iter()
+            .flat_map(|tx| tx.records)
+            .collect()
+    }
 
     fn slot_open(h: &Harness) -> bool {
         h.core.dw.get(7).expect("slot").open
@@ -40505,10 +40514,15 @@ mod deleg_windows_tests {
             slot_open(&h),
             "the core grants again after an unanswered seal"
         );
+        // The recorded backup could not be reached: nothing ends the
+        // generation without its tail, and status says so (until the
+        // delegate renews).
+        assert!(h.core.dl.gens[&7].waiting_for_group);
+        assert!(!h.core.dl.gens[&7].ended);
     }
 
-    /// Plan 43 C2 (Q1, the interim of C2e): a generation whose latest record
-    /// names a backup is not ended without that member's tail. The seal
+    /// Plan 43 C2 (Q1): a generation whose latest record names a backup is
+    /// not ended without that member's tail. The seal
     /// that went unanswered for its window is asked again, however many
     /// windows pass (the generation stays `Sealing`, `waiting_for_group`);
     /// the backup's late answer drains the tail and ends it. Before, the
@@ -40516,7 +40530,7 @@ mod deleg_windows_tests {
     /// backup held — acknowledged — were lost (long-delegated-backup 358 and
     /// the pinned 78172).
     #[test]
-    fn an_unanswered_seal_of_the_recorded_backup_holds_the_end() {
+    fn an_unanswered_seal_of_the_latest_member_holds_the_end() {
         let mut h = root_with_delegate_backed_by(4);
         assert_eq!(h.core.dl.gens[&7].group.backup(), Some(4));
         h.core.dw.set_until_for_tests(7, w(h.now));
@@ -40550,6 +40564,16 @@ mod deleg_windows_tests {
             );
         }
         assert_eq!(h.core.stats.deleg_seal_waits, 2);
+        // Status says so (`delegation.gens[].waiting_for_group`).
+        assert!(
+            h.core
+                .deleg_view()
+                .gens
+                .iter()
+                .any(|g| g.2 == 7 && g.7 && !g.6),
+            "{:?}",
+            h.core.deleg_view().gens
+        );
         // The first request's late answer is as good as the latest's.
         let tail = vec![constellation_meta::DelegateTx {
             idx: 1,
@@ -40569,6 +40593,10 @@ mod deleg_windows_tests {
         assert!(
             h.core.dl.gens[&7].ended,
             "the tail arrived: the generation ends"
+        );
+        assert!(
+            !h.core.deleg_view().gens.iter().any(|g| g.7),
+            "an ended generation waits for nothing"
         );
     }
 
@@ -40617,26 +40645,27 @@ mod deleg_windows_tests {
         assert!(!Replica::deleg_backup_holds_any(&h.meta, 7));
     }
 
-    /// Plan 43 C2 (D8, the part C2c's drop needs): a sealed tail the root
-    /// cannot drain to its end — a row whose dependencies it does not hold
-    /// yet — does not end the generation: rows past the break may have been
-    /// answered through the backup, and the recall that ends the generation
-    /// drops them on the delegate instead of replaying them. The generation
-    /// stays `Sealing`; the seal is asked again at the window's end, and the
-    /// drain resumes from the cursor.
+    /// Plan 43 C2e (D8): a sealed tail the root cannot drain to its end — a
+    /// row whose dependencies it does not hold yet — does not end the
+    /// generation: rows past the break may have been answered through the
+    /// backup, and the recall that ends the generation drops them on the
+    /// delegate instead of replaying them. The generation stays `Sealing`
+    /// holding the tail; the drain resumes from the cursor after the next
+    /// event once the dependency is here (the seal is not asked again), and
+    /// the generation ends when the cursor reaches the tail's end.
     #[test]
-    fn a_sealed_tail_drained_short_does_not_end_the_generation() {
+    fn a_drain_that_stops_short_keeps_the_generation_sealing() {
         let mut h = root_with_delegate_backed_by(4);
         h.core.dw.set_until_for_tests(7, w(h.now));
         let mut out = Vec::new();
         h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
-        let seal_req = |out: &[Action]| {
-            sends(out).iter().find_map(|(to, m)| match m {
+        let first = sends(&out)
+            .iter()
+            .find_map(|(to, m)| match m {
                 PeerMsg::DelegSeal { req, .. } if *to == 4 => Some(*req),
                 _ => None,
             })
-        };
-        let first = seal_req(&out).unwrap_or_else(|| panic!("no seal: {out:?}"));
+            .unwrap_or_else(|| panic!("no seal: {out:?}"));
         let row = |idx: u64, deps: constellation_meta::Position| constellation_meta::DelegateTx {
             idx,
             rid: None,
@@ -40650,38 +40679,206 @@ mod deleg_windows_tests {
             row(2, unreachable),
             row(3, constellation_meta::Position::ZERO),
         ];
-        h.step(Event::Peer {
+        let out = h.step(Event::Peer {
             from: 4,
             msg: PeerMsg::DelegSealed {
                 req: first,
-                gen: 7,
-                sealed: true,
-                txs: tail.clone(),
-            },
-        });
-        let g = &h.core.dl.gens[&7];
-        assert!(!g.ended, "ended with the tail drained through 1 of 3");
-        assert_eq!(g.cursor, 1);
-        assert_eq!(g.recall, RecallPhase::Sealing);
-        // The window's end asks again; the dependency arrived meanwhile.
-        h.advance((h.core.cfg.forward_timeout_ms * 2).max(h.core.cfg.backup_takeover_ms) + 10);
-        let mut out = Vec::new();
-        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
-        let again = seal_req(&out).unwrap_or_else(|| panic!("not asked again: {out:?}"));
-        let mut tail = tail;
-        tail[1].deps = constellation_meta::Position::ZERO;
-        h.step(Event::Peer {
-            from: 4,
-            msg: PeerMsg::DelegSealed {
-                req: again,
                 gen: 7,
                 sealed: true,
                 txs: tail,
             },
         });
         let g = &h.core.dl.gens[&7];
+        assert!(!g.ended, "ended with the tail drained through 1 of 3");
+        assert_eq!(g.cursor, 1);
+        assert_eq!(g.recall, RecallPhase::Sealing);
+        assert_eq!(g.sealed_tail.as_ref().map(|t| t.end), Some(3));
+        assert_eq!(h.core.stats.deleg_seal_waits, 1);
+        assert!(
+            !sends(&out)
+                .iter()
+                .any(|(_, m)| matches!(m, PeerMsg::DelegSeal { .. })),
+            "{out:?}"
+        );
+        // Another event: still short, nothing moves and nothing is counted
+        // twice.
+        h.step(Event::Slack { epoch_slack: 0 });
+        assert!(!h.core.dl.gens[&7].ended);
+        assert_eq!(h.core.dl.gens[&7].cursor, 1);
+        assert_eq!(h.core.stats.deleg_seal_waits, 1);
+        // The dependency arrives (the log brings its stream): the next event
+        // drains the held tail and ends the generation, without the backup
+        // being asked again.
+        Replica::void_stream(&h.meta, 99, 0);
+        let out = h.step(Event::Slack { epoch_slack: 0 });
+        let g = &h.core.dl.gens[&7];
         assert!(g.ended, "the whole tail drained: the generation ends");
         assert_eq!(g.cursor, 3);
+        assert!(g.sealed_tail.is_none());
+        assert!(
+            !sends(&out)
+                .iter()
+                .any(|(_, m)| matches!(m, PeerMsg::DelegSeal { .. })),
+            "{out:?}"
+        );
+    }
+
+    /// Plan 43 C2e (§3.7, D3): the end seals every backup a record named.
+    /// The latest version's members are sealed strictly (the end waits for
+    /// one of them); a backup only an older record named is sealed once,
+    /// without waiting — its answer neither ends the generation nor is it
+    /// asked again — and its tail is drained if it comes in time. With no
+    /// strict member the older ones are still sealed and the generation
+    /// ends at once.
+    #[test]
+    fn the_generation_end_seals_every_backup_a_record_named() {
+        let row = |idx: u64| constellation_meta::DelegateTx {
+            idx,
+            rid: None,
+            records: Vec::new(),
+            deps: constellation_meta::Position::ZERO,
+        };
+        let seals = |out: &[Action]| {
+            sends(out)
+                .iter()
+                .filter_map(|(to, m)| match m {
+                    PeerMsg::DelegSeal { req, .. } => Some((*to, *req)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut h = root_with_delegate_backed_by(4);
+        // Version 2 names backup 4; version 1 had named 5.
+        {
+            let g = h.core.dl.gens.get_mut(&7).unwrap();
+            g.group.named.insert(5);
+            assert_eq!(g.group.backups, vec![4]);
+        }
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        let asked = seals(&out);
+        let strict = asked.iter().find(|(to, _)| *to == 4).expect("strict").1;
+        let loose = asked.iter().find(|(to, _)| *to == 5).expect("older").1;
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        assert_eq!(h.core.dl.gens[&7].recall, RecallPhase::Sealing);
+        // The older backup answers first, with rows 1..2: drained, nothing
+        // ends.
+        h.step(Event::Peer {
+            from: 5,
+            msg: PeerMsg::DelegSealed {
+                req: loose,
+                gen: 7,
+                sealed: true,
+                txs: vec![row(1), row(2)],
+            },
+        });
+        let g = &h.core.dl.gens[&7];
+        assert!(!g.ended, "an older backup's answer ended the generation");
+        assert_eq!(g.cursor, 2);
+        // The window passes: only the strict member is asked again.
+        h.advance((h.core.cfg.forward_timeout_ms * 2).max(h.core.cfg.backup_takeover_ms) + 10);
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        let again = seals(&out);
+        assert_eq!(again.len(), 1, "{again:?}");
+        assert_eq!(again[0].0, 4);
+        assert!(!h.core.dl.gens[&7].ended);
+        // The strict member's tail ends it.
+        h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegSealed {
+                req: strict,
+                gen: 7,
+                sealed: true,
+                txs: vec![row(1), row(2), row(3)],
+            },
+        });
+        let g = &h.core.dl.gens[&7];
+        assert!(g.ended);
+        assert_eq!(g.cursor, 3);
+
+        // No strict member (the latest record names none): the older
+        // backup is sealed, nothing is waited for.
+        let mut h = root_with_delegate_backed_by(4);
+        {
+            let g = h.core.dl.gens.get_mut(&7).unwrap();
+            g.group.backups.clear();
+            g.group.named.insert(4);
+        }
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        assert_eq!(
+            seals(&out).iter().map(|(to, _)| *to).collect::<Vec<_>>(),
+            vec![4]
+        );
+        assert!(h.core.dl.gens[&7].ended, "{out:?}");
+    }
+
+    /// Plan 43 C2e (Q1): the escape. A generation that waits for its group
+    /// is ended at the root's cursor by the operator's
+    /// `abandon-group --gen`, which journals `GroupAbandoned` with the cut;
+    /// it is refused for a generation that does not wait, for an unknown or
+    /// an ended one, and when an `--epoch` is given with it.
+    #[test]
+    fn abandon_group_ends_a_waiting_generation_at_its_cursor_and_says_so_in_the_log() {
+        let mut h = root_with_delegate_backed_by(4);
+        let ask = |h: &mut Harness, op: u64, epoch: u64, gen: u64| {
+            let out = h.step(Event::Control {
+                op: OpId(op),
+                req: Control::AbandonGroup { epoch, gen },
+            });
+            out.iter()
+                .find_map(|a| match a {
+                    Action::ControlDone { op: o, result } if *o == OpId(op) => Some(result.is_ok()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no answer: {out:?}"))
+        };
+        // Not waiting yet.
+        assert!(!ask(&mut h, 900, 0, 7));
+        h.core.dl.gens.get_mut(&7).unwrap().cursor = 3;
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        h.advance((h.core.cfg.forward_timeout_ms * 2).max(h.core.cfg.backup_takeover_ms) + 10);
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        assert!(h.core.dl.gens[&7].waiting_for_group);
+        assert!(!h.core.dl.gens[&7].ended);
+        // An epoch does not go with a generation; an unknown generation.
+        assert!(!ask(&mut h, 901, 2, 7));
+        assert!(!ask(&mut h, 902, 0, 99));
+        assert!(!h.core.dl.gens[&7].ended);
+        assert_eq!(h.core.stats.groups_abandoned, 0);
+        // The operator abandons it.
+        assert!(ask(&mut h, 903, 0, 7));
+        let g = &h.core.dl.gens[&7];
+        assert!(g.ended);
+        assert!(!g.waiting_for_group);
+        assert_eq!(h.core.stats.groups_abandoned, 1);
+        let records = journal_records(&h);
+        let dir = g.dir;
+        assert!(
+            records.contains(&LogRecord::RecallCut {
+                dir,
+                gen: 7,
+                through: 3
+            }),
+            "{records:?}"
+        );
+        assert!(
+            records.contains(&LogRecord::GroupAbandoned {
+                epoch: 0,
+                gen: 7,
+                through_known: 3
+            }),
+            "{records:?}"
+        );
+        // Twice: it has ended.
+        assert!(!ask(&mut h, 904, 0, 7));
+        assert_eq!(h.core.stats.groups_abandoned, 1);
     }
 
     /// A generation without a recorded backup keeps the plain reclaim: the
@@ -41798,8 +41995,8 @@ mod c1_tail_fetch {
             req: Control::AbandonGroup { epoch: 1, gen: 0 },
         });
         assert!(refused(&out), "{out:?}");
-        // Waiting for epoch 1's group: another epoch is refused, a
-        // generation of a delegation is C2's.
+        // Waiting for epoch 1's group: another epoch is refused, and a
+        // delegation's generation is named by `--gen` alone.
         let lease = expired(&h, vec![2]);
         let (mut h, _) = claimant(3, &lease);
         let out = h.step(Event::Control {

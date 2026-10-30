@@ -1239,7 +1239,7 @@ op executes and is acknowledged; "EROFS" means it is refused at once.
 | Holder dies, a backup within the RTT budget | — | write again in ≈ 1.5 s in the harness, 2.3–4.7 s on EC2 (seal-based takeover), nothing acknowledged lost |
 | Holder dies, `ack=s3` | — | write again in ≈ 1.5 s in the harness, not measured on EC2 (any peer takes over), nothing acknowledged lost |
 | Holder dies, no backup (`Local`) | — | write again after the lease TTL (60 s) plus margin; acknowledged forwards are replayed by their requesters; with `f > 0` the taker needs `f` promises |
-| Delegate dies | — | writes under its subtree wait for the root to reclaim it (TTL + margin ≈ 6 s), or for its recorded backup's seal, which the root waits for |
+| Delegate dies | — | writes under its subtree wait for the root to reclaim it (TTL + margin ≈ 6 s), or for its recorded backup's seal and tail, which the root waits for without a bound: with the backup gone too, until a member answers or the operator ends the generation (`repair abandon-group --gen`, which loses the rows only that group held; [ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)) |
 | Delegate cut from the root | stops sequencing at `sent + ttl − margin`; the rows past the cut that were never answered are dropped and their clients retry through the root (a lone delegate's own node's rows are replayed as before) | write through the root once it reclaims the subtree |
 | Designee isolated | write | `EROFS` under the path |
 | S3 down, at least `N − f` write-eligible nodes connected | write (epoch) | write (epoch) |

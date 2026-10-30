@@ -56997,6 +56997,93 @@ C2e, C2f, C2g, C2h as before. The failing-sets claim covers the configurations a
 the two new configurations only (the hold fault is the sim's only delegate fast path). Q4's fallback (the root as the
 delegate's backup) was not weighed: G1's p50/p90 are met.
 
+## Plan 43 C2e: the end of a delegation waits for its group (2026-10-30)
+
+Fifth of C2's commits (spec §3.7, D3, D8). C2c had landed a slice (the strict wait on the one recorded backup's seal, the
+drain that stops short keeps the generation `Sealing`); this commit finishes the section.
+
+### What landed
+
+- **The seal set (D3).** A generation's end seals every backup any `DelegGroup` record of it named: the latest version's
+  members are *strict* (`GroupState::strict`), the backups only an older record named are *best effort*
+  (`GroupState::best_effort`, from the table's `named` set). `GenState.seal_reqs: request -> (member, strict)` replaces
+  `seal_attempts`. A best-effort member is asked once per generation (it stays in `seal_reqs`, also after a transport
+  failure), its tail is appended if it answers while the generation is still ending, and nothing ever waits for it; with
+  no strict member the older ones are sealed and the generation ends at once. A strict member's request is asked again
+  every `max(backup_takeover_ms, forward_timeout_ms)` until a tail is in hand.
+- **The drain is held, not re-asked (D8).** The strict member's sealed tail is kept in `GenState.sealed_tail`
+  (`from`, rows, where it runs to) and appended again after every event (`deleg_after_event`) and at the window's end,
+  until the cursor reaches its end; only then does the generation end (and the directory is re-delegated to the member).
+  Before, the seal was asked again at the window's end and the tail travelled again. `deleg_end_sealed` /
+  `deleg_drain_tail` factor the drain; a retry counts nothing twice.
+- **`waiting_for_group`.** `status.delegation.gens[]` gains a last element, `waiting_for_group` (a window passed with no
+  strict member's tail in hand, or the member could not be reached at all: the transport failure used to send the
+  generation back to `None` and ask again every window without saying so, 360 seals in 90 s of a dead backup), cleared
+  by a granted renewal (the delegate lives) or the end; `delegation.mine[]` gains the class the node's own clients'
+  answers wait for (the class the core last published to the fast path). WARN once a minute, `deleg_seal_waits`.
+  The control schema is re-blessed. The CLI `status` prints a line per waiting generation with the command below.
+- **The escape.** `constellation repair abandon-group TARGET --gen G` (exactly one of `--epoch` and `--gen`; `lease.abandon_group`
+  already carried `gen`): on the root, for a generation that waits, it ends the generation at the root's cursor and journals
+  `GroupAbandoned { epoch: 0, gen: G, through_known }` in the same transaction as the `RecallCut` (the log's audit);
+  refused for an unknown, ended or not-waiting generation, with an `--epoch`, or on a node that cannot end the recall.
+  Counted in `groups_abandoned`. Documented with its consequence (every row the group alone held and the delegate answered
+  is lost; a delegate that comes back drops them): `delegations.md` ("Failures", troubleshooting, status),
+  `durability-and-failover.md`, `configuration.md` (CLI table), DESIGN.md's availability matrix, ADR-33.
+- **Sim.** `delegated-backup-and-delegate-die` (`d1`'s delegate and its backup crash for good at 2 s) and `-abandon`
+  (`abandon_after_ms` 5 s; the operator acts on `delegation.gens[].waiting_for_group` as it does on the lease claim).
+  `SimConfig.await_dead_delegates`: the settle lasts until the root has decided about a generation whose delegate is dead
+  (ended, or found waiting; with an operator, ended). A run with a waiting generation ends `waiting_for_group` (the
+  client-op cap does not fail it: the writes under the subtree wait, that is the rule), and owes that every acknowledged
+  rid is held somewhere: `meta_holds_rid` now also reads a delegation backup's tail. A run with nobody holding the root lease at its end (the root rebooted, or a delegate-turned-root died) is not quiescent until a write at a live node has claimed it and the root has decided about the dead delegates' generations (the 2,000-seed run found seeds 439 and 1838 ending that way: the checks ran with no root to wait). In the `-abandon` runs the
+  acknowledged rows missing from the log are counted (`Report.operator_lost`) and judged tentative.
+
+### Decisions and deviations
+
+- **`sealed: false` from a strict member still ends the generation** (C2c's decision, kept; the spec says keep waiting):
+  a backup chosen before the delegate appended anything holds nothing and has acknowledged nothing, and waiting for it
+  would wedge an idle generation; with write-all, a member that holds nothing proves nothing was acknowledged through
+  the group.
+- A transport failure of a strict seal still sends a generation that was `None` back to `None` (the delegate may be alive
+  and renew; `seal_reqs`/`waiting_for_group` keep the facts) — the spec's "stays Sealing" would stop a live delegate whose
+  backup alone is unreachable from the root.
+- Delegates keep one backup, so today a strict set has one member; the code takes any number.
+
+### Evidence
+
+Fail-before (mutations of the code on a copy of the tree, debug; each fails its test): best-effort seal removed ->
+`the_generation_end_seals_every_backup_a_record_named`; the window's-end reclaim put back (`Sealing if false`) ->
+`an_unanswered_seal_of_the_latest_member_holds_the_end`; no retry from the event tail ->
+`a_drain_that_stops_short_keeps_the_generation_sealing`; the `gen != 0` dispatch removed ->
+`abandon_group_ends_a_waiting_generation_at_its_cursor_and_says_so_in_the_log`. The CLI parses/refuses the argument forms
+(`repair_abandon_group_parses`) and prints the waiting line (`status_line_names_the_waiting_generation`).
+
+Sim `delegated-backup-and-delegate-die` (box 1, release; `main` = the parent with this commit's sim-side changes, inert
+for the old configurations): seeds 0..100 on main: **96 fail** (92 "did not reach quiescence": nothing ends the generation
+and nothing says why; seed 13 an acknowledged `Eexist` refusal whose row only the dead group held, absent from the log;
+seed 47 an acknowledged rid held nowhere; seed 99 a client op never answered); the `-abandon` variant 96 of 100 fail the
+same way (13, 99 among them). After (rebased on 5008d56a): **0 of 2,000 fail** in each (the first 2,000-seed run found seeds
+439 and 1838, fixed in the sim as described above; earlier 300-seed runs failed 7 before two sim-side fixes: `meta_holds_rid`
+did not read a delegation backup's tail, and the client-op cap treated the rule's wait as a hang).
+
+Sweeps against main (box 1, release, 1,000 seeds each, flags off; main = the parent, `origin/main` for the last two):
+`delegated-backup`, `delegated-crash`, `long-delegated-backup`, `delegated-holder-cut`, `delegated-root-crash`: **0 failing
+seeds on both, every `SWEEP-ORACLES` line equal seed by seed** (no difference to report).
+
+`streams_carry_the_log_and_save_tail_gets` (the default configuration, no delegation): 35-37 s on the rebased tree and on
+`origin/main` alike, three alternating runs each at the same load; the 2 h+ run of the first attempt was a btrfs `TMPDIR` on a
+box at a load average of 90, not the change.
+
+### Gates
+
+Rebased on `origin/main` (5008d56a; no conflicts): `cargo fmt --all --check`; `clippy --workspace --all-targets -D warnings`;
+lib tests authority 779, meta 377, engine 937, harness 162 (an ext4 `TMPDIR`; one test fails on btrfs), control 146 (schema
+re-blessed), `constellation` bin tests 94; release authority sim suite 280 passed / 11 ignored; `long-delegated` and
+`long-delegated-lead`, 1,000 seeds each: 0 failing. The four mutations above failed their tests on the 6d53adde rebase.
+
+### Not done here
+
+The other families of the spec's 2,000-seed list (five ran at 1,000). C2f-C2h as before.
+
 ## Plan 43 C1-1 — The root group's commit holds across a listing and a removal
 
 The first commit of plan 43 C1 ([the commit rule](wip/43-commit-rule.md), the coder

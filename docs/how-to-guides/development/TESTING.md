@@ -5000,6 +5000,25 @@ seeds that depend on a trajectory (I4's late landings, the writer hold's
 unsettled control, the release-wait regression) are re-pinned from a sweep
 when a change moves them.
 
+**Plan 43 C2e.** The end of a delegation waits for its group. New configurations
+`delegated-backup-and-delegate-die` (`deleg_backup_core_config`, `d1`'s delegate
+and its backup, the only peer within budget, crash for good at 2 s) and
+`delegated-backup-and-delegate-die-abandon` (the same with
+`abandon_after_ms: 5000`). The first ends `waiting_for_group` (a root with a
+generation in `status.delegation.gens` that waits, `Report::waiting_for_group`)
+and owes that every acknowledged rid is held somewhere; the second has the
+operator run `repair abandon-group --gen G` on the root after 5 s
+(`GroupAbandoned` in the log), converges, and counts the acknowledged rows
+the dead group alone held as `Report::operator_lost`, judged tentative
+(only in a run where the operator acted). The core tests
+`the_generation_end_seals_every_backup_a_record_named` (strict members waited
+for, older named backups sealed once and never waited for),
+`an_unanswered_seal_of_the_latest_member_holds_the_end` and
+`a_drain_that_stops_short_keeps_the_generation_sealing` (the sealed tail kept
+and appended again after every event) pin the rule;
+`abandon_group_ends_a_waiting_generation_at_its_cursor_and_says_so_in_the_log`
+the escape.
+
 **Plan 43 C7b: offsets beyond the margin.** The cross-node compares (a claimant
 judging a lease by its own wall against the holder's wall expiry) are safe only
 while every offset is below the margin; the configurations below set offsets of

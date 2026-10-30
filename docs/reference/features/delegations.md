@@ -566,7 +566,8 @@ generations:
 3. the root waits for the stream to catch up to `through`, or, if the
    delegate is unreachable, for the grant to expire (if the delegate
    recorded a backup in its `DelegGroup` record, the root first asks the
-   backup to seal and does not end the generation without its answer);
+   backup to seal and does not end the generation until it has appended the
+   backup's whole tail; see "Failures");
 4. the root journals `RecallCut { dir, gen, through }`, which ends the
    generation and carries its cut (below); later stream records of it are
    refused.
@@ -737,9 +738,41 @@ designations create no delegation.
   their rid.
 - **Delegate crashes, with a recorded backup**: the root has the backup seal,
   drains what it holds, and continues (`delegate-crash-backup`). The
-  generation is not ended before the backup answers (rows acknowledged through
-  the group may be nowhere else): the seal is asked again every window
-  (`deleg_seal_waits`, a warning once per generation) until it does.
+  generation is **not ended before** a member of the latest recorded group
+  has answered its seal **and** the root has appended that member's sealed
+  tail to its end: every row the delegate answered through the group is on
+  every member, so one member's tail is the group's, and it may be nowhere
+  else. A tail the root cannot append to its end yet (a row whose
+  dependencies the log has not brought, a row of a newer tenure) is kept and
+  appended again after every event; the generation stays `Sealing` meanwhile.
+  Backups that only an older version of the group named (the delegate
+  switched backups) are sealed too, once, but never waited for: their rows
+  are covered by the cursor or by the later members, and a removed backup is
+  usually a dead one. A recorded backup that holds nothing of the generation
+  (chosen before the delegate appended anything) answers so, and the
+  generation ends at the root's cursor.
+- **Delegate and its recorded backup both gone**: the generation cannot end,
+  and the writes under its subtree wait for it (the root recalls before it
+  executes in a subtree; nothing is answered from the missing tail).
+  `constellation status` shows `delegation.gens[].waiting_for_group` for the
+  generation (and prints the command below), `deleg_seal_waits` counts the
+  windows, and the log warns once a minute. The wait ends by itself as soon as
+  a member answers (it may be a restarted node: its disk holds the tail). If
+  the members are gone for good, the operator ends the generation:
+
+  ```
+  constellation repair abandon-group TARGET --gen G
+  ```
+
+  Run it on the **root** (the node whose `status` lists the generation under
+  `delegation.gens`; elsewhere it is refused), and only for a generation
+  that waits. It ends the generation at the root's cursor and journals
+  `GroupAbandoned { gen }` next to the `RecallCut`: the log records that the
+  decision was an operator's. **Consequence:** every row the delegate
+  answered through the group and the root never appended is lost — the
+  clients were told it was committed. They are not replayed, and a delegate
+  that comes back drops them (its recall strand). Use it only when no member
+  can ever come back; wait for one if it can.
 - **The delegate's backup is new or lost rows**: the delegate re-sends
   only what it has not seen in the log. The backup's acknowledgement
   covers every row it has from the log (its applied stream index), plus
@@ -874,7 +907,11 @@ writer whatever the share, and `MIN_OPS=0` drops the rate floor. See
 ## Status
 
 `constellation status` (JSON, under `delegation`) shows `enabled`, the
-table, `mine` (this node's generations), `gens`, `kinds`, `backups`, and
+table, `mine` (this node's generations, each row ending with the class its
+own clients' answers wait for: `lone`, `deleg-group`, `archive` or
+`non-stealable`), `gens` (as the root: `[dir, node, gen, cursor, until_ms,
+recall, ended, waiting_for_group]`; `waiting_for_group` says the generation
+cannot end for want of its group's tail, see "Failures"), `kinds`, `backups`, and
 `placement`: the busiest subtrees as `(dir, node, node_ops,
 subtree_ops)`. Counters include `executed`, `fast_path_executed`, `lapsed`,
 `fast_path_routed` (ops the root's fast path sent through the core because
@@ -918,6 +955,15 @@ delegate is unreachable, the rename waits for its grant to expire
 The subtree is designated offline to another node that is unreachable
 (`EROFS`), or the op crosses into a designated subtree (`EXDEV`). See
 `constellation designations`.
+
+### A generation is `waiting_for_group`
+
+The delegate is silent and no member of its recorded backup group has handed
+over the tail the root needs to end the generation (see "Failures"). Writes
+under the subtree wait. Bring the delegate or its backup back (their disks
+hold the tail), or, if they are gone for good,
+`constellation repair abandon-group TARGET --gen G` on the root: rows only
+that group held are lost.
 
 ### The root lease never moves
 

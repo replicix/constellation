@@ -437,7 +437,8 @@ quarter of the lease TTL and logs an error.
 | `constellation delegations TARGET` | list the live delegation table |
 | `constellation reintegrate TARGET` | run a deposed holder's recovery now: roll back the stranded journal and replay it by rid (it also runs on its own) |
 | `constellation repair drop-held TARGET INO` | discard held-back records of an inode into a conflict copy (plan 30 M4, see [Write-path hygiene](features/write-path-hygiene.md)) |
-| `constellation repair abandon-group TARGET --epoch E [--gen G]` | let a lease claim that waits for the tail of a lost group (`status.lease.waiting_for_group`) go on without it; rows that group acknowledged may be lost. `--gen` must be 0 for now. Admin. See [Durability and failover](features/durability-and-failover.md#a-claim-waits-for-a-lost-groups-tail) |
+| `constellation repair abandon-group TARGET --epoch E` | let a lease claim that waits for the tail of a lost group (`status.lease.waiting_for_group`) go on without it; rows that group acknowledged may be lost. Admin. See [Durability and failover](features/durability-and-failover.md#a-claim-waits-for-a-lost-groups-tail) |
+| `constellation repair abandon-group TARGET --gen G` | on the root: end the delegation generation `G` that waits for its group's tail (`status.delegation.gens[].waiting_for_group`) at the root's cursor, and record it in the log (`GroupAbandoned`); rows only that group held, acknowledged to their clients, are lost. Exactly one of `--epoch` and `--gen`. Admin. See [Delegations](features/delegations.md#failures) |
 
 ## Environment variables
 

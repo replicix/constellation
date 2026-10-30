@@ -635,7 +635,7 @@ mod tests {
         }
         let view = DelegateView::default();
         view.mirror(&constellation_authority::core::DelegView {
-            mine: vec![(dir, 7, i64::MAX / 2, false, 0, 0, 0)],
+            mine: vec![(dir, 7, i64::MAX / 2, false, 0, 0, 0, String::new())],
             ..Default::default()
         });
         let now = Now::same(0);
@@ -804,7 +804,7 @@ impl DelegateView {
         let mut stopped = self.stopped.lock().unwrap();
         let mut g = self.entries.lock().unwrap();
         g.clear();
-        for (dir, gen, until, is_stopped, _, _, _) in &view.mine {
+        for (dir, gen, until, is_stopped, _, _, _, _) in &view.mine {
             g.push((*dir, *gen, *until, *is_stopped || stopped.contains(gen)));
         }
         // A generation the core dropped is over: forget the stop.

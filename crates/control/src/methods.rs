@@ -411,8 +411,10 @@ define_methods! {
 
     // ---- lease ----------------------------------------------------------
     /// Let the lease claim that waits for the tail of a lost backup group
-    /// (`status.lease.waiting_for_group`) go on without it (plan 43 C1-3).
-    /// Rows that group acknowledged may be lost.
+    /// (`status.lease.waiting_for_group`) go on without it (plan 43 C1-3), or
+    /// the root end a delegation generation whose group has not handed over
+    /// its tail (`status.delegation.gens[].waiting_for_group`, C2e). Rows
+    /// that group acknowledged may be lost.
     LeaseAbandonGroup { name: "lease.abandon_group", role: Admin, mutating: true, stream: None,
         params: AbandonGroupParams, result: Ack }
 

@@ -319,11 +319,14 @@ pub enum Control {
     /// report what it did (`reintegrate`).
     Reintegrate,
     /// Plan 43 C1-3 (§5.8, Q1): the operator accepts that the group of
-    /// `epoch` (generation `gen`; the root group is `gen` 0, anything else
-    /// is C2's) is gone for good: the claim that waits for its tail
-    /// proceeds without it (`constellation repair abandon-group`).
-    /// Answered with `ControlOk::Text`; refused unless a claim is waiting
-    /// for that group.
+    /// `epoch` (generation `gen` 0, the root group) is gone for good: the
+    /// claim that waits for its tail proceeds without it; or, with `gen`
+    /// != 0 (and `epoch` 0), that of a delegation generation: the root,
+    /// which cannot end it without the tail (`waiting_for_group`), ends it
+    /// at its cursor and journals `GroupAbandoned` (C2e)
+    /// (`constellation repair abandon-group`). Answered with
+    /// `ControlOk::Text`; refused unless a claim, or a generation, is
+    /// waiting for that group.
     AbandonGroup { epoch: Epoch, gen: u64 },
     /// Flush the journal, publish if the holder, release the lease, and
     /// answer — without stopping (`leave`).

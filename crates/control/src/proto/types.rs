@@ -256,10 +256,18 @@ pub struct DelegationReport {
     /// The live table.
     pub table: Vec<DelegationStatus>,
     /// Delegations this node holds: `(dir, gen, until_ms, stopped,
-    /// streamed_through, executed, parked)`.
-    pub mine: Vec<(u64, u64, i64, bool, u64, u64, usize)>,
-    /// As the root: `(dir, node, gen, cursor, until_ms, recall, ended)`.
-    pub gens: Vec<(u64, u64, u64, u64, i64, String, bool)>,
+    /// streamed_through, executed, parked, class)`; `class` is what this
+    /// node's own clients' answers wait for (`lone`, `deleg-group`,
+    /// `archive`, `non-stealable`; plan 43 C2e).
+    #[allow(clippy::type_complexity)]
+    pub mine: Vec<(u64, u64, i64, bool, u64, u64, usize, String)>,
+    /// As the root: `(dir, node, gen, cursor, until_ms, recall, ended,
+    /// waiting_for_group)`. `waiting_for_group`: the generation cannot end
+    /// because its delegate is silent and no member of its recorded backup
+    /// group has handed over the tail; `constellation repair abandon-group
+    /// --gen` ends it (rows only that group held are lost).
+    #[allow(clippy::type_complexity)]
+    pub gens: Vec<(u64, u64, u64, u64, i64, String, bool, bool)>,
     pub executed: u64,
     /// Ops the FUSE fast path executed here as the delegate (not
     /// counted in `executed`, which is the core's).
@@ -2994,9 +3002,11 @@ pub struct DropHeldParams {
     pub remote: bool,
 }
 
-/// `lease.abandon_group` (plan 43 C1-3): the lease claim that waits for the
-/// tail of `epoch`'s backup group goes on without it. `gen` names the group
-/// within the epoch; only 0 (the root group) is accepted for now.
+/// `lease.abandon_group` (plan 43 C1-3, C2e): the lease claim that waits for
+/// the tail of `epoch`'s backup group goes on without it (`gen` 0), or the
+/// root ends delegation generation `gen` (`epoch` 0), which waits for its
+/// group's tail, at its cursor. Rows only that group held are lost; the log
+/// records the decision.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AbandonGroupParams {
     pub epoch: u64,

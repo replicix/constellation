@@ -1,7 +1,7 @@
 {
   "$defs": {
     "AbandonGroupParams": {
-      "description": "`lease.abandon_group` (plan 43 C1-3): the lease claim that waits for the\ntail of `epoch`'s backup group goes on without it. `gen` names the group\nwithin the epoch; only 0 (the root group) is accepted for now.",
+      "description": "`lease.abandon_group` (plan 43 C1-3, C2e): the lease claim that waits for\nthe tail of `epoch`'s backup group goes on without it (`gen` 0), or the\nroot ends delegation generation `gen` (`epoch` 0), which waits for its\ngroup's tail, at its cursor. Rows only that group held are lost; the log\nrecords the decision.",
       "properties": {
         "epoch": {
           "format": "uint64",
@@ -1500,10 +1500,10 @@
           "type": "integer"
         },
         "gens": {
-          "description": "As the root: `(dir, node, gen, cursor, until_ms, recall, ended)`.",
+          "description": "As the root: `(dir, node, gen, cursor, until_ms, recall, ended,\nwaiting_for_group)`. `waiting_for_group`: the generation cannot end\nbecause its delegate is silent and no member of its recorded backup\ngroup has handed over the tail; `constellation repair abandon-group\n--gen` ends it (rows only that group held are lost).",
           "items": {
-            "maxItems": 7,
-            "minItems": 7,
+            "maxItems": 8,
+            "minItems": 8,
             "prefixItems": [
               {
                 "format": "uint64",
@@ -1531,6 +1531,9 @@
               },
               {
                 "type": "string"
+              },
+              {
+                "type": "boolean"
               },
               {
                 "type": "boolean"
@@ -1621,10 +1624,10 @@
           "type": "integer"
         },
         "mine": {
-          "description": "Delegations this node holds: `(dir, gen, until_ms, stopped,\nstreamed_through, executed, parked)`.",
+          "description": "Delegations this node holds: `(dir, gen, until_ms, stopped,\nstreamed_through, executed, parked, class)`; `class` is what this\nnode's own clients' answers wait for (`lone`, `deleg-group`,\n`archive`, `non-stealable`; plan 43 C2e).",
           "items": {
-            "maxItems": 7,
-            "minItems": 7,
+            "maxItems": 8,
+            "minItems": 8,
             "prefixItems": [
               {
                 "format": "uint64",
@@ -1657,6 +1660,9 @@
                 "format": "uint",
                 "minimum": 0,
                 "type": "integer"
+              },
+              {
+                "type": "string"
               }
             ],
             "type": "array"

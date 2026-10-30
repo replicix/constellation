@@ -1545,7 +1545,13 @@ root lease by TTL carries the tail of the old group or waits for it
 member seals the epoch before it answers, so the group commits nothing
 more of it) and the first member's answer is the tail it re-ships. Where
 no member answers the claim waits, and only the operator's `repair
-abandon-group` lets it go on without. A tenure that re-ships a tail names
+abandon-group` lets it go on without. The end of a delegation is the same
+case (C2e): a generation whose latest `DelegGroup` record names backups is
+ended only once one of them has sealed and the root has appended its whole
+tail (older versions' backups are sealed once, never waited for), and when
+none can answer it waits, `waiting_for_group`, until the operator's `repair
+abandon-group --gen` ends it at the root's cursor and writes `GroupAbandoned`
+into the log. A tenure that re-ships a tail names
 the old group in its lease (`inherited_tail`) until the log carries the
 rows, so that a successor's death does not take the last copies of rows
 the old group acknowledged. The lease, the log and the seals are the only
