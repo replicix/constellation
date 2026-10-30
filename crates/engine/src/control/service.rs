@@ -475,6 +475,19 @@ impl EngineControl {
                         .collect(),
                     mine: v.mine.clone(),
                     gens: v.gens.clone(),
+                    install_waiting: v
+                        .install_waiting
+                        .iter()
+                        .map(|(dir, gen, waited_ms, ended)| api::InstallWaitingStatus {
+                            dir: *dir,
+                            gen: *gen,
+                            waited_ms: *waited_ms,
+                            ended: ended.clone(),
+                        })
+                        .collect(),
+                    install_waits: stats.deleg_install_waits_end,
+                    install_wait_ms: stats.deleg_install_wait_ms,
+                    install_wait_max_ms: stats.deleg_install_wait_max_ms,
                     waiting: v
                         .waiting
                         .iter()

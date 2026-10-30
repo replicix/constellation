@@ -39015,6 +39015,88 @@ mod recall_cut {
         assert!(h.core.dl.mine.contains_key(&8), "{out:?}");
     }
 
+    /// The path-B shape of the test above with the end `end` of generation
+    /// 7, holder capture `capture`: 7:1 journaled, the end and a new
+    /// `Delegate` of 8 streamed ahead, a sync. What the segment applies.
+    fn path_b_waiting(capture: bool, end: LogRecord) -> (Harness, [LogRecord; 2]) {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        h.meta.set_holder_capture(capture);
+        let ino = h.meta.allocate_ino(dir).unwrap();
+        let rid = h.rid(1);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: MutateOp::Create {
+                parent: dir,
+                name: "f".into(),
+                ino,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            tag: Default::default(),
+        });
+        assert!(replies(&out).iter().any(|(r, _)| *r == rid), "{out:?}");
+        let records = [
+            end,
+            LogRecord::Delegate {
+                dir,
+                node: 3,
+                gen: 8,
+                designated: false,
+                range: (0, 0),
+            },
+        ];
+        h.meta.install_streamed(1, 1, 1, 2, &records).unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(!h.core.dl.mine.contains_key(&8), "installed: {out:?}");
+        let view = h.core.deleg_view();
+        assert!(
+            matches!(view.install_waiting.as_slice(), [(d, 8, _, ended)] if *d == dir && ended == &vec![7]),
+            "{:?}",
+            view.install_waiting
+        );
+        (h, records)
+    }
+
+    /// Review follow-up: the wait ends when the end is applied from the log,
+    /// not when the rows leave the journal: with holder capture off a
+    /// recall's strand finds no captured row and leaves it in the journal,
+    /// and a legacy `Recall` keeps no cut (fail-before: it waited for ever;
+    /// the cut it keeps now is the log's index of the generation). The
+    /// retry timer syncs again when no segment does.
+    #[test]
+    fn a_waiting_install_ends_at_the_end_in_the_log() {
+        let dir_of = |h: &Harness| h.core.dl.mine[&7].dir;
+        for (capture, legacy) in [(false, false), (false, true), (true, true)] {
+            let (h0, _, _, _) = delegate_renewed_once();
+            let dir = dir_of(&h0);
+            drop(h0);
+            let end = if legacy {
+                LogRecord::Recall { dir, gen: 7 }
+            } else {
+                LogRecord::RecallCut {
+                    dir,
+                    gen: 7,
+                    through: 0,
+                }
+            };
+            let (mut h, records) = path_b_waiting(capture, end);
+            let retry = h.core.dl.install_retry.expect("the retry timer is armed");
+            Replica::apply_segment(&h.meta, 2, 1, 2, &[1, 2], &[], &records).unwrap();
+            h.advance(1_001);
+            h.step(Event::Timer { id: retry });
+            assert!(
+                h.core.dl.mine.contains_key(&8),
+                "(capture {capture}, legacy {legacy}): not installed; journal row of 7 left: {:?}",
+                Replica::delegate_tx_pending(&h.meta, 7, 1)
+            );
+            assert!(h.core.dl.install_waiting.is_empty());
+            assert!(h.core.dl.install_retry.is_none());
+        }
+    }
+
     /// This node holds both halves of `/d` (name-hash range 0 as generation
     /// 7, range 1 as 8), renewed; a name of each half.
     fn two_ranges() -> (Harness, constellation_fs_core::Ino, String, String) {

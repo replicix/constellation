@@ -884,6 +884,7 @@ fn apply_one(
             if durable {
                 let cut = meta.session().stream_applied(*gen);
                 meta.session().void_stream(*gen, cut);
+                crate::store::local::bump_void_cut_at_log_idx_tx(tx, &meta.local, *gen)?;
             }
             Ok(Applied::Done)
         }

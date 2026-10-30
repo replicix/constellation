@@ -1053,6 +1053,12 @@ impl Replica for Meta {
                 LogRecord::RecallCut { gen, through, .. } => {
                     self.session().void_stream(*gen, *through);
                     self.session().note_void_cut(*gen, *through);
+                    // Kept for a restart and for an install that waits for
+                    // this end (`Meta::deleg_gens_awaiting_end`) also when
+                    // the record was installed from the root's stream
+                    // before and the segment did not apply it again (holder
+                    // capture off).
+                    let _ = Meta::persist_void_cut(self, *gen, Some(*through));
                     *gen
                 }
                 // A log written before the cut was in the record: the cut
@@ -1064,6 +1070,7 @@ impl Replica for Meta {
                     // rows are not): a dependency past this is lost.
                     self.session()
                         .note_void_cut(*gen, Meta::log_stream_idx(self, *gen).unwrap_or(0));
+                    let _ = Meta::persist_void_cut(self, *gen, None);
                     *gen
                 }
                 _ => continue,

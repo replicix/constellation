@@ -925,6 +925,9 @@ pub struct Stats {
     /// generation's rows were still in the journal, its end not yet
     /// applied from the log (path B).
     pub deleg_install_waits_end: u64,
+    /// ... and how long those installs waited in all and at most.
+    pub deleg_install_wait_ms: u64,
+    pub deleg_install_wait_max_ms: u64,
     /// Designee: journal syncs before a stream batch (its rows leave only
     /// once they are on its disk).
     pub deleg_designee_syncs: u64,
@@ -1657,6 +1660,9 @@ enum Timer {
         constellation_meta::locks::GrantId,
     ),
     DelegStream,
+    /// Path B: an install that waits for an ended generation's end is
+    /// tried again (`Core::on_deleg_install_retry`).
+    DelegInstallRetry,
     /// Phase 2b: the placement's evaluation tick.
     Placement,
     /// A release's wait for the generations being recalled reached its
@@ -1708,7 +1714,7 @@ impl Timer {
             Timer::LockTestTimeout(_) => TimerKind::LockTestTimeout,
             Timer::DelegRenew(_) => TimerKind::DelegRenew,
             Timer::DelegLapse(_) => TimerKind::DelegLapse,
-            Timer::DelegStream => TimerKind::DelegStream,
+            Timer::DelegStream | Timer::DelegInstallRetry => TimerKind::DelegStream,
             Timer::Placement => TimerKind::Placement,
             Timer::ReleaseRecallBound => TimerKind::DelegExpiry,
         }
@@ -2901,6 +2907,7 @@ impl Core {
             Timer::LockRenewTimeout(req) => self.on_lock_renew_timeout(req, replica, out),
             Timer::LockTestTimeout(req) => self.on_lock_test_timeout(req, out),
             Timer::DelegStream => self.on_deleg_stream_timer(now, replica, out),
+            Timer::DelegInstallRetry => self.on_deleg_install_retry(now, replica, out),
             Timer::Placement => self.on_placement_timer(now, replica, out),
             Timer::ReleaseRecallBound => self.on_release_recall_bound(now, replica, out),
         }

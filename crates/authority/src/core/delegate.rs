@@ -547,6 +547,7 @@ impl DelegationState {
             ("dl_sealed", self.sealed.len()),
             ("dl_designating", self.designating.len()),
             ("dl_xgen_held_at", self.xgen_held_at.len()),
+            ("dl_install_waiting", self.install_waiting.len()),
         ]
     }
 }
@@ -612,6 +613,16 @@ pub(crate) struct DelegationState {
     /// `finish` is deferred to the parked continuation).
     pub pending_exec: BTreeSet<Rid>,
     pub(crate) stream_timer: Option<TimerId>,
+    /// Path B: the generations of this node the table lists that are not
+    /// installed yet because an ended generation's rows wait for its end
+    /// (`delegation_sync`), by generation: since when, the ended
+    /// generations (`None`: the journal could not be read), and when the
+    /// last warning went out.
+    pub(crate) install_waiting: BTreeMap<u64, InstallWait>,
+    /// The timer that runs `delegation_sync` again while an install waits
+    /// (or a group could not be read): a segment's records are not the
+    /// only way the wait ends.
+    pub(crate) install_retry: Option<TimerId>,
     /// When a delegate that knows no root may read the lease for it again
     /// ([`Core::deleg_learn_root`]): once a stream tick.
     root_read_after: Option<WaitMs>,
@@ -698,12 +709,34 @@ pub struct DelegView {
     /// group's tail, with what the root knows of each member (what
     /// `abandon-group --gen` is weighed by).
     pub waiting: Vec<WaitingGenView>,
+    /// Path B: `(dir, gen, waited_ms, ended)` for each generation of this
+    /// node the table lists that is not installed yet, because an ended
+    /// generation's rows still wait for its end in the log (`ended`
+    /// empty: the journal could not be read).
+    pub install_waiting: Vec<(Ino, u64, u64, Vec<u64>)>,
     pub pending_exec: usize,
     /// Phase 2b: per generation held here, `(gen, backup, backup_acked)`.
     pub backups: Vec<(u64, NodeId, u64)>,
     /// Phase 2b: per generation on the root, `(gen, kind, backup)`.
     pub kinds: Vec<(u64, String, NodeId)>,
 }
+
+/// Path B: an install of a generation that waits for an ended
+/// generation's end (`DelegationState::install_waiting`).
+#[derive(Debug, Clone)]
+pub(crate) struct InstallWait {
+    pub dir: Ino,
+    pub since: WaitMs,
+    pub ended: Option<Vec<u64>>,
+    pub warned: Option<WaitMs>,
+}
+
+/// How often `delegation_sync` runs again while an install waits.
+const INSTALL_RETRY_MS: u64 = 1_000;
+/// A waiting install is warned about once it waited this long, and then
+/// at most this often.
+const INSTALL_WAIT_WARN_MS: i64 = 5_000;
+const INSTALL_WAIT_WARN_EVERY_MS: i64 = 60_000;
 
 /// The keys `op` touches, as ownership is resolved over them.
 impl Core {
@@ -767,6 +800,19 @@ impl Core {
                         tail: g.sealed_tail.as_ref().map(|t| (t.from, g.cursor, t.end)),
                         members,
                     }
+                })
+                .collect(),
+            install_waiting: self
+                .dl
+                .install_waiting
+                .iter()
+                .map(|(gen, w)| {
+                    (
+                        w.dir,
+                        *gen,
+                        self.clk.wait.since(w.since).max(0) as u64,
+                        w.ended.clone().unwrap_or_default(),
+                    )
                 })
                 .collect(),
             ..DelegView::default()
@@ -982,6 +1028,8 @@ impl Core {
         // generation's rows are still in the journal, its end not yet
         // applied from the log; the segment that applies it syncs again.
         let mut awaiting_end: Option<Option<Vec<u64>>> = None;
+        let mut waiting_now: BTreeSet<u64> = BTreeSet::new();
+        let mut retry = false;
         for d in table.iter().filter(|d| d.node == me) {
             if self.dl.mine.contains_key(&d.gen) || self.dl.epoch_active {
                 continue;
@@ -991,19 +1039,17 @@ impl Core {
                 replica.deleg_gens_awaiting_end(&live)
             });
             if awaiting.as_ref().is_none_or(|gens| !gens.is_empty()) {
-                self.stats.deleg_install_waits_end += 1;
-                tracing::debug!(
-                    node = me,
-                    dir = d.dir,
-                    gen = d.gen,
-                    ended = ?awaiting,
-                    "delegation not installed yet: an ended generation's rows wait for its end in the log"
-                );
+                let ended = awaiting.clone();
+                self.deleg_note_install_wait(now, d.dir, d.gen, ended);
+                waiting_now.insert(d.gen);
+                retry = true;
                 continue;
             }
             // A group that cannot be read is not "no record": installed at
-            // a later sync (plan 43 C2e review).
+            // a later sync (plan 43 C2e review), which the retry timer
+            // brings if no segment does.
             let Ok(group) = replica.deleg_group(d.gen) else {
+                retry = true;
                 continue;
             };
             let stream_round = self.deleg_new_round();
@@ -1105,6 +1151,15 @@ impl Core {
             }
             self.deleg_renew_now(now, d.gen, out);
             self.arm_deleg_lapse(now, d.gen, out);
+        }
+        self.deleg_install_waits_settle(now, &waiting_now);
+        if retry && self.dl.install_retry.is_none() {
+            let t = self.set_timer_wait(
+                now.wait.plus(INSTALL_RETRY_MS),
+                Timer::DelegInstallRetry,
+                out,
+            );
+            self.dl.install_retry = Some(t);
         }
         // Plan 43 C2 (D4): the group each held generation's table records.
         self.deleg_group_refresh(replica);
@@ -1229,6 +1284,78 @@ impl Core {
             self.deleg_on_lease_gone(now, replica, out);
         }
         self.deleg_after_event(now, replica, out);
+    }
+
+    /// Path B: the install of `gen` waits for the end of `ended` (`None`:
+    /// the journal could not be read): counted, kept for `status`, and
+    /// warned about once it waited [`INSTALL_WAIT_WARN_MS`], then every
+    /// [`INSTALL_WAIT_WARN_EVERY_MS`].
+    fn deleg_note_install_wait(&mut self, now: Now, dir: Ino, gen: u64, ended: Option<Vec<u64>>) {
+        let me = self.me();
+        let w = self.dl.install_waiting.entry(gen).or_insert_with(|| {
+            self.stats.deleg_install_waits_end += 1;
+            tracing::debug!(
+                node = me,
+                dir,
+                gen,
+                ended = ?ended,
+                "delegation not installed yet: an ended generation's rows wait for its end in the log"
+            );
+            InstallWait {
+                dir,
+                since: now.wait,
+                ended: ended.clone(),
+                warned: None,
+            }
+        });
+        w.ended = ended;
+        let waited = now.wait.since(w.since);
+        if waited >= INSTALL_WAIT_WARN_MS
+            && w.warned
+                .is_none_or(|t| now.wait.since(t) >= INSTALL_WAIT_WARN_EVERY_MS)
+        {
+            w.warned = Some(now.wait);
+            tracing::warn!(
+                node = me,
+                dir,
+                gen,
+                waited_ms = waited,
+                ended = ?w.ended,
+                "a delegation still waits to be installed: an ended generation's rows wait for its end in the log \
+                 (unreadable journal: ended None)"
+            );
+        }
+    }
+
+    /// The installs that waited and wait no more (installed, or gone from
+    /// the table): how long they waited.
+    fn deleg_install_waits_settle(&mut self, now: Now, waiting_now: &BTreeSet<u64>) {
+        let done: Vec<u64> = self
+            .dl
+            .install_waiting
+            .keys()
+            .filter(|g| !waiting_now.contains(g))
+            .copied()
+            .collect();
+        for gen in done {
+            if let Some(w) = self.dl.install_waiting.remove(&gen) {
+                let ms = now.wait.since(w.since).max(0) as u64;
+                self.stats.deleg_install_wait_ms += ms;
+                self.stats.deleg_install_wait_max_ms = self.stats.deleg_install_wait_max_ms.max(ms);
+            }
+        }
+    }
+
+    /// The retry timer of a waiting install (or of a group that could not
+    /// be read): sync again.
+    pub(crate) fn on_deleg_install_retry(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        self.dl.install_retry = None;
+        self.delegation_sync(now, replica, out);
     }
 
     pub(crate) fn drop_delegate_state(

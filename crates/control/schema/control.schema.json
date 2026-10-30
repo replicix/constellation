@@ -1586,6 +1586,28 @@
           "minimum": 0,
           "type": "integer"
         },
+        "install_wait_max_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "install_wait_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "install_waiting": {
+          "description": "Generations delegated to this node that wait to be installed\n(`install_waiting`: an ended generation's rows wait for its end),\nwith the installs put off so far and how long they waited.",
+          "items": {
+            "$ref": "#/$defs/InstallWaitingStatus"
+          },
+          "type": "array"
+        },
+        "install_waits": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "installed": {
           "format": "uint64",
           "minimum": 0,
@@ -1975,6 +1997,10 @@
         "table",
         "mine",
         "gens",
+        "install_waiting",
+        "install_waits",
+        "install_wait_ms",
+        "install_wait_max_ms",
         "executed",
         "fast_path_executed",
         "fast_path_routed",
@@ -4264,6 +4290,42 @@
         "mtime_ns",
         "ctime_ns",
         "rdev"
+      ],
+      "type": "object"
+    },
+    "InstallWaitingStatus": {
+      "description": "A generation delegated to this node that is not installed yet: an\nended generation of this node still has rows in its journal and its end\nis not applied from the log yet (the strand of those rows comes first).",
+      "properties": {
+        "dir": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ended": {
+          "description": "The ended generations it waits for; empty when the journal could\nnot be read.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "gen": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "waited_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "dir",
+        "gen",
+        "waited_ms",
+        "ended"
       ],
       "type": "object"
     },

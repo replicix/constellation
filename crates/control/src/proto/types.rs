@@ -248,6 +248,19 @@ pub struct DelegationStatus {
     pub range: String,
 }
 
+/// A generation delegated to this node that is not installed yet: an
+/// ended generation of this node still has rows in its journal and its end
+/// is not applied from the log yet (the strand of those rows comes first).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct InstallWaitingStatus {
+    pub dir: u64,
+    pub gen: u64,
+    pub waited_ms: u64,
+    /// The ended generations it waits for; empty when the journal could
+    /// not be read.
+    pub ended: Vec<u64>,
+}
+
 /// A delegation generation that cannot end for want of its group's tail
 /// (plan 43 C2e).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -322,6 +335,13 @@ pub struct DelegationReport {
     /// abandon-group --gen` by it: a member heard from lately is not gone.
     #[serde(default)]
     pub waiting: Vec<WaitingGenerationStatus>,
+    /// Generations delegated to this node that wait to be installed
+    /// (`install_waiting`: an ended generation's rows wait for its end),
+    /// with the installs put off so far and how long they waited.
+    pub install_waiting: Vec<InstallWaitingStatus>,
+    pub install_waits: u64,
+    pub install_wait_ms: u64,
+    pub install_wait_max_ms: u64,
     pub executed: u64,
     /// Ops the FUSE fast path executed here as the delegate (not
     /// counted in `executed`, which is the core's).

@@ -210,7 +210,20 @@ replica, and an op of the new generation executed on them (a chmod of the
 file a row past the cut created) would reach the root, which counts a
 dependency on the ended generation as void, and the log would carry a
 change of an inode it never created. The segment that ends the old
-generation syncs the table again and installs the new one. A delegate
+generation syncs the table again and installs the new one, and a timer
+syncs it again every second while an install waits (the segment's records
+are not the only way the wait ends: a journal that could not be read waits
+too). The end counts as applied once the cut it carries is kept
+(`deleg_void_cut`), which applying the segment does also when the record
+was installed from the stream before and not applied again (holder capture
+off), and for an older `Recall` without a cut (kept at the log's index of
+the generation). `status.delegation.install_waiting` lists a waiting
+install with what it waits for, `install_waits` and `install_wait_ms` count
+them, and a warning goes out after 5 s of waiting and every minute after.
+In the simulation's sweeps without a partition the wait is rare and short
+(`long-delegated-backup`: 7 waits in 500 seeds, 33 ms at most), so it
+covers every new generation of the node rather than only those whose keys
+could meet the ended one's rows. A delegate
 refusal is journaled into the stream like any other outcome, and waits for
 its commit like an acceptance.
 

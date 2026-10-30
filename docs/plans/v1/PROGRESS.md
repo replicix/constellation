@@ -62297,3 +62297,39 @@ Tests: core `designee_stream::a_designees_stream_carries_only_rows_its_disk_hold
 the driver's report sends it; an ordinary delegate asks for none) and
 `designee_stream::a_designees_failed_sync_streams_nothing`. Mutation (the stream not held to the synced index): the batch
 went out with the sync still in flight, `(batches, syncs)` `([(1, 1)], [1])` for `([], [1])`.
+
+### 5. A waiting install ends at the end in the log, is retried, shown and warned about (follow-ups of path B)
+
+- Holder capture off: a recall's strand finds no captured row (`strand_tx` walks live entries), so the row stays in the
+  journal, and a `RecallCut` installed from the root's stream before its segment is not applied again by the segment, so
+  no cut was kept (`deleg_void_cut`): the install waited for ever. Applying a segment now keeps the cut of every
+  `RecallCut` (and `Recall`) it carries (`Meta::persist_void_cut`, from `Replica::apply_segment`), whatever applied the
+  record first.
+- A legacy `Recall` keeps no cut: kept now at the log's index of the generation, as the session voids it (also in the
+  durable apply, `bump_void_cut_at_log_idx_tx`).
+- A retry: the install was tried again only at a segment with delegation records; a journal that could not be read (or
+  a group that could not be read) waited for one. A timer runs `delegation_sync` again every second while an install
+  waits (`Timer::DelegInstallRetry`).
+- `status.delegation.install_waiting` (dir, generation, waited ms, the ended generations it waits for),
+  `install_waits`, `install_wait_ms`, `install_wait_max_ms`; a warning after 5 s of waiting, then every minute.
+- `Meta::deleg_gens_awaiting_end` seeks once per generation instead of walking every outstanding row.
+- Not narrowed to the generations whose keys could meet the ended one's rows: in sweeps without a partition the wait is
+  rare and short (seeds 0 to 499: `long-delegated`, `shared-dir-split`, `placement-hot` none; `long-delegated-backup` 7
+  waits, 121 ms in all, 33 ms at most; `delegated-two-gens-backed` 2, 21 ms at most).
+
+With capture off a delegate's recall strand rolls nothing back (pre-existing; the switch is the performance gate's
+internal fallback, and only a deposed holder has the rebuild): the row past the cut stays in the replica. The fix makes
+the wait end; it does not make capture off safe for delegations.
+
+Test: core `recall_cut::a_waiting_install_ends_at_the_end_in_the_log` (capture off with a `RecallCut`, capture off and on
+with a legacy `Recall`; the end applied by a segment no sync follows, the retry timer installs). Fail-before (the cut not
+kept by the segment): with capture off it stayed uninstalled, `journal row of 7 left: Some(true)`.
+
+### Gates (box, the tree of item 5)
+
+`cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean. Lib tests: authority 826,
+meta 380, engine 937, control 146, cli 94 (no failures). `cargo test -p constellation-authority --release --test sim`: 287
+passed (11 ignored). Sweeps, seeds 0 to 1,999, none failing: `long-delegated`, `delegated-crash`, `delegated-holder-cut`,
+`delegated-backup-and-delegate-die`, `-abandon`, `long-delegated-backup`, `delegated-two-gens-one-backed`,
+`delegated-two-gens-backed`. `placement-hot` (500 seeds, locally) fails seeds 15, 68 and 311 with and without these
+commits (I2c, I5; on main b6831653 the same three).
