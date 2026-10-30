@@ -896,9 +896,12 @@ lease and one log
   core's alike; past it its own rows wait
   for the root as well, so another node's forward, which waits for the root
   behind every earlier row, waits a few batches at most) and no earlier row of
-  its own node's clients is still waiting for the root (a `Lone` row behind
+  its own node's clients is still waiting for the root, in any generation
+  the node holds (a `Lone` row behind
   an uncommitted `DelegGroup` row would be replayed alone, without its
-  effect, after a root crash dropped the row it rests on; another node's
+  effect, after a root crash dropped the row it rests on, and one node's
+  generations can share keys: an unlink of a file's primary link moves the
+  file's keys to the generation of its next link; another node's
   forward does not count, which I5 would allow, to spare a delegate that
   serves remote nodes the cost;
   [ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3));

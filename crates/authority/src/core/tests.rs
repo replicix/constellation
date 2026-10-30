@@ -39392,6 +39392,220 @@ mod deleg_group {
         assert_eq!(queued, vec![rename], "the rename is replayed alone");
     }
 
+    /// This node holds two generations whose keys meet: `/d` split in two,
+    /// range of `low` delegated as generation 7 and range of `high` as 8,
+    /// both to node 3, with a file linked under both names. `low` sorts
+    /// first, so the file's primary link is `low` and its own keys are
+    /// generation 7's until that link is unlinked. Both generations renewed;
+    /// returns `(dir, file, low, high)`.
+    fn two_ranges_one_file(h: &mut Harness) -> (Ino, Ino, String, String) {
+        use constellation_meta::delegation::Range;
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let names: Vec<String> = (0..64).map(|i| format!("n{i:02}")).collect();
+        let low = names[0].clone();
+        let high = names
+            .iter()
+            .find(|n| Range::of(1, n) != Range::of(1, &low))
+            .expect("a name in the other range")
+            .clone();
+        assert!(low < high);
+        let dir = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let file = h.meta.allocate_ino(dir).unwrap();
+        let range = |n: &str| {
+            let r = Range::of(1, n);
+            (r.bits, r.idx)
+        };
+        Replica::apply_segment(
+            &h.meta,
+            1,
+            1,
+            0,
+            &[],
+            &[],
+            &[
+                LogRecord::Mkdir {
+                    parent: ROOT_INO,
+                    name: "d".into(),
+                    ino: dir,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 1,
+                },
+                LogRecord::Create {
+                    parent: dir,
+                    name: low.clone(),
+                    ino: file,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 1,
+                },
+                LogRecord::Link {
+                    ino: file,
+                    parent: dir,
+                    name: high.clone(),
+                    time_ns: 1,
+                },
+                LogRecord::Delegate {
+                    dir,
+                    node: 3,
+                    gen: 7,
+                    designated: false,
+                    range: range(&low),
+                },
+                LogRecord::Delegate {
+                    dir,
+                    node: 3,
+                    gen: 8,
+                    designated: false,
+                    range: range(&high),
+                },
+            ],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        for gen in [7, 8] {
+            let req = renew_req(&out, gen).expect("no renewal on install");
+            h.step(renewed(h, req, gen, 5_000));
+        }
+        (dir, file, low, high)
+    }
+
+    /// The delegate's own client's op `op` (`seq`), and its answer.
+    fn own_op(h: &mut Harness, seq: u64, op: MutateOp) -> (Rid, Option<AnswerSource>) {
+        let rid = h.rid(seq);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        let answer = client_answers(&out)
+            .into_iter()
+            .find(|(r, _)| *r == rid)
+            .map(|(_, source)| source);
+        (rid, answer)
+    }
+
+    /// Review follow-up of 5b6a6b1e (fail-before): the gated mark is the
+    /// generation's, and one node's generations can share keys without
+    /// either ending. Generation 7 journals a `setxattr` of the file past
+    /// the lead (gated, not committed) and the unlink of its primary link;
+    /// the file's own keys are generation 8's from then on, and its
+    /// `removexattr`, generation 8's first row, was answered `Lone`. At the
+    /// root's crash the end of both generations drops the open rows of 7 and
+    /// replays the `removexattr` alone, which fails on an attribute that was
+    /// never set, after its client was told it succeeded. Now an open gated
+    /// row of any generation of this node holds the `Lone` rows of the
+    /// others: the `removexattr` waits for the root, and is dropped with the
+    /// rows it rests on.
+    #[test]
+    fn a_lone_row_does_not_follow_an_open_gated_row_of_another_generation() {
+        use constellation_meta::RowClass;
+        let mut h = Harness::new(3);
+        let (dir, file, low, _) = two_ranges_one_file(&mut h);
+        // A lead of one row: the first own row of a generation is `Lone`.
+        h.core.cfg.delegation_stream_rows = 1;
+        let set = |name: &str| MutateOp::SetXattr {
+            ino: file,
+            name: name.into(),
+            value: b"v".to_vec(),
+            mode: 0,
+        };
+        let (_, a) = own_op(&mut h, 1, set("user.pad"));
+        assert_eq!(a, Some(AnswerSource::Sequenced(AckClass::Lone)));
+        let (_, a) = own_op(&mut h, 2, set("user.k"));
+        assert_eq!(a, None, "past the lead: waits for the root");
+        let (_, a) = own_op(
+            &mut h,
+            3,
+            MutateOp::Unlink {
+                parent: dir,
+                name: low,
+            },
+        );
+        assert_eq!(a, None);
+        let classes = |h: &Harness, gen| -> Vec<(u64, RowClass)> {
+            h.meta
+                .delegate_rows_for_audit(gen)
+                .unwrap()
+                .into_iter()
+                .map(|(idx, c, _)| (idx, c))
+                .collect()
+        };
+        assert_eq!(
+            classes(&h, 7),
+            vec![
+                (1, RowClass::Lone),
+                (2, RowClass::DelegGroup),
+                (3, RowClass::DelegGroup)
+            ]
+        );
+        // The file's keys are generation 8's now.
+        let (remove, a) = own_op(
+            &mut h,
+            4,
+            MutateOp::RemoveXattr {
+                ino: file,
+                name: "user.k".into(),
+            },
+        );
+        let classes8 = classes(&h, 8);
+        // The core decided it so itself (the store's check at the journaling
+        // is the second line, for the fast path's rows).
+        assert_eq!(h.core.stats.deleg_lone_demoted, 0);
+        // The root crashes holding nothing of either: both end at its cursor.
+        let applied = Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[
+                LogRecord::RecallCut {
+                    dir,
+                    gen: 7,
+                    through: 0,
+                },
+                LogRecord::RecallCut {
+                    dir,
+                    gen: 8,
+                    through: 0,
+                },
+            ],
+        )
+        .unwrap();
+        let queued: Vec<Rid> = h
+            .meta
+            .pending_replays()
+            .unwrap()
+            .into_iter()
+            .map(|q| q.rid)
+            .collect();
+        // The removexattr is generation 8's, waits for the root, and is
+        // dropped with the rows it rests on.
+        assert_eq!(
+            (
+                classes8,
+                a,
+                queued.contains(&remove),
+                applied.stranded.deleg_dropped
+            ),
+            (vec![(1, RowClass::DelegGroup)], None, false, 3),
+            "(rows of generation 8, the removexattr's answer, replayed, dropped)"
+        );
+        // What a replay of it would have found: the attribute never set.
+        assert_eq!(
+            constellation_meta::MetaStore::get_xattr(&h.meta, file, "user.k").unwrap(),
+            None
+        );
+    }
+
     /// The fast path's write of `name` in `dir` as the delegate's FUSE
     /// thread does it: classed under the writer lock by what the core has
     /// published ([`Meta::delegate_execute_admitted`]).

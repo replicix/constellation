@@ -61760,3 +61760,46 @@ constellation-meta -p constellation-engine --all-targets -- -D warnings`) clean;
 failures); the release sim suite 286 passed (11 ignored), the five pins among them. Seeds 0 to 999 of `long-backup`,
 `delegated-holder-cut` and `long-delegated-late-answers`, with and without the knob, against main: main fails 586 (`long-backup`)
 and 259 and 272 (`long-delegated-late-answers`) under the knob, the fixes nothing; nothing else fails on either.
+
+## Delegation integrity follow-ups: the hysteresis across generations, the backup's seal flag, a restarted delegate, the abandon discriminator (plan 43, 2026-10-30)
+
+### 1. The hysteresis spans the node's generations
+
+Finding (review of 5b6a6b1e, whose "Cross-generation: checked, nothing to fix" above was wrong). The gated mark was
+the generation's (`deleg_gated_key(gen)`, `Core::deleg_lone_held_by_gated`), and a node can hold two generations whose
+keys meet without either ending. `Core::delegate_dir` lets one node hold several ranges of a split directory, or a range
+beside its whole delegation (only a second *whole* delegation is refused). An inode's own keys follow its primary link,
+the first `0x04` entry (`Namespace::primary_dentry`), whose parent's range owns them (`DelegationTable::resolve`). An
+unlink of the primary link is an op of that link's generation alone, and afterwards the file's keys are the generation
+of its next link's: keys moved from generation 7 to 8 of the same node, neither ended. The dedup comment of D6
+(`deleg_dedup_wait`, d2179fbb) names this path rightly. The second path it names, the directory delegated here again
+before the first generation's strand, also exists in principle: a delegate applies the root's pre-S3 stream
+(`StreamAhead`, on by default under `Backup`) as speculation, which updates its delegation table (`apply_one` applies
+`RecallCut` and `Delegate` with `durable: false`), while the recall strand runs only when the segment applies
+(`apply_segment`). So the core can install the new generation (`delegation_sync`) while rows of the old one past its cut
+are still in the journal. Not reproduced here. The hold below covers both paths, because it counts a generation that
+left the table as long as its marked row is still in the journal.
+
+At a takeover the strand ends every own generation together: generation 7's open `setxattr` of the file (journaled past
+the lead) and the unlink of its primary link are dropped (their clients were never answered), and generation 8's
+`removexattr` of the attribute, answered `Lone`, is replayed alone and fails on an attribute that was never set, after
+its client was told it succeeded.
+
+Fix. A `Lone` own row of one generation also waits while a gated row of another generation of this node is open, that
+is, journaled for its own clients, above the prefix the core published as committed, and still in the journal. The store
+keeps the generations whose mark may be open (`deleg_gated_open`, a few entries) and checks them under the writer lock in
+`Meta::finish_local`, the fast path's rows and the core's own alike, and forgets a generation once its mark is committed
+or its row has left the journal. The core checks the same thing when it decides
+(`Replica::delegate_gated_open_elsewhere` in `Core::deleg_lone_held_by_gated`). The cost falls only on a node that holds
+two generations.
+
+Tests. Core: `a_lone_row_does_not_follow_an_open_gated_row_of_another_generation` (two ranges of `/d` at one node, a
+file linked in both, `setxattr` past the lead, unlink of the primary link, then `removexattr` under the other
+generation, both generations ended at the root's cursor). Meta: `an_own_lone_row_waits_for_an_open_gated_row_of_another_generation`
+(the limits, the open list's pruning, a mark whose row has left the journal, the hysteresis off).
+
+Fail-before (the test alone on 5b6a6b1e): the core test fails with `([(1, Lone)], Some(Sequenced(Lone)), true, 2)`
+against `([(1, DelegGroup)], None, false, 3)`: the `removexattr` was journaled and answered `Lone`, and replayed alone
+while only the two rows of generation 7 were dropped. Mutations, with the tests kept: with the store's check switched
+off, the meta test fails (`(1, Lone)` where `(1, DelegGroup)` was expected); with the core's check switched off, the
+core test fails on `deleg_lone_demoted` (1 where 0 was expected), because the store demotes the row as the second line.

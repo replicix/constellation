@@ -1624,7 +1624,15 @@ waited for the root, then a rename of it answered from the disk, and a root
 crash drops the create at the strand and replays the rename, which fails on a
 name never created; I5 allows this, the answer was `Lone`, but nothing is
 gained by it; the same held for a delegate that turned lone after journaling
-`DelegGroup` rows). Another node's forward is not counted among those rows,
+`DelegGroup` rows). The rule spans the node's generations, not one: a node
+can hold two generations whose keys meet with neither ending (two ranges of a
+split directory, or a range and a whole subtree: an unlink of a file's primary
+link moves the file's own keys to the generation of its next link), and a
+takeover ends all of them together, so an open gated row of any of them holds
+the `Lone` rows of the others (2026-10-30: found by review; a `setxattr` past
+the lead, the unlink of the primary link, then a `removexattr` answered `Lone`
+under the other generation, replayed alone at a root crash). Another node's
+forward is not counted among those rows,
 though holding the own rows behind it would be safe too: I5 allows rolling a
 `Lone` answer back, so excluding forwards is a choice, made for cost. A
 forward is `DelegGroup` by design, a delegate that serves remote nodes always

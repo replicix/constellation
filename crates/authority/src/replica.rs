@@ -334,6 +334,11 @@ pub trait Replica {
     /// for its own node's client with a class that waits for the group
     /// (0: none).
     fn delegate_gated_idx(&self, gen: u64) -> u64;
+    /// Plan 43 C2 (hysteresis across generations): a gated row of this
+    /// node's own clients is open in a generation of this node other than
+    /// `gen` (`Meta::delegate_gated_open_elsewhere`). A store that cannot
+    /// be read says yes: the error only makes the class stronger.
+    fn delegate_gated_open_elsewhere(&self, gen: u64) -> bool;
     /// F1: wait until every tagged write that passed its fencing-token
     /// check at the write here, under a grant no longer live in this
     /// node's table, has committed (`Meta::settle_tagged_writes`) — before
@@ -1222,6 +1227,10 @@ impl Replica for Meta {
 
     fn delegate_gated_idx(&self, gen: u64) -> u64 {
         Meta::delegate_gated_idx(self, gen).unwrap_or(0)
+    }
+
+    fn delegate_gated_open_elsewhere(&self, gen: u64) -> bool {
+        Meta::delegate_gated_open_elsewhere(self, gen).unwrap_or(true)
     }
 
     fn settle_tagged_writes(&self) -> bool {

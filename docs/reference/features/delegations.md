@@ -147,6 +147,14 @@ through the delegate. It then:
      journaled past the lead, or before the delegate turned lone): were the
      root to crash, the earlier row would be dropped and the later one
      replayed without the effect it rests on (a create, then a rename of it).
+     The rule spans every generation the node holds: one node can hold two
+     generations whose keys meet without either ending (two ranges of a
+     split directory, or a range and a whole subtree), since unlinking a
+     file's primary link moves the file's own keys to the generation of its
+     next link, and a takeover ends all of them together. While an own row
+     of one generation waits for the root, the own rows of the others wait
+     too (a `setxattr`, the unlink of the primary link, then a `removexattr`
+     under the other link's generation would otherwise be replayed alone).
      Another node's forward does not count: I5 would allow holding the rows
      behind it, and it is left out for cost (a delegate that serves remote
      nodes always has one in flight).

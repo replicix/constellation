@@ -1881,13 +1881,24 @@ impl Core {
     /// left out: I5 would allow rolling back a `Lone` answer behind it, and
     /// counting it would hold a delegate that serves remote nodes back for
     /// good, for cost.
+    ///
+    /// The rule spans this node's generations: a gated row of another of
+    /// them that is open holds a `Lone` row of `d`'s back too
+    /// ([`Replica::delegate_gated_open_elsewhere`]). One node can hold two
+    /// generations whose keys meet (two ranges of a split directory, or a
+    /// range and a whole subtree): an unlink of a file's primary link moves
+    /// the file's own keys to the generation of its next link, with neither
+    /// generation ending, and a takeover's strand ends every own generation
+    /// together.
     fn deleg_lone_held_by_gated(
         &self,
         d: &DelegateState,
         replica: &dyn Replica,
         committed: u64,
     ) -> bool {
-        self.cfg.delegation_lone_hysteresis && replica.delegate_gated_idx(d.gen) > committed
+        self.cfg.delegation_lone_hysteresis
+            && (replica.delegate_gated_idx(d.gen) > committed
+                || replica.delegate_gated_open_elsewhere(d.gen))
     }
 
     /// The committed prefix of `gen`'s stream as this delegate knows it

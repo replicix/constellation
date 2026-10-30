@@ -1515,6 +1515,14 @@ impl SessionState {
             .map(|d| d.class)
     }
 
+    /// The highest stream index of `gen` the core published as committed
+    /// (`DelegDurable::through`, kept a while after the generation is
+    /// withdrawn; 0: none known). It only lags the truth.
+    pub(crate) fn deleg_covered(&self, gen: u64) -> u64 {
+        let g = self.inner.lock().unwrap();
+        g.deleg_covered.get(&gen).copied().unwrap_or(0)
+    }
+
     /// [`Self::deleg_row_class`] for the row that takes stream index `idx`,
     /// given the highest index of a gated row of this node's own clients
     /// journaled under the generation (`gated`). A `Lone` class holds for a
