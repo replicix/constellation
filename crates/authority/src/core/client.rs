@@ -2011,8 +2011,25 @@ impl Core {
             return;
         }
         // Before re-asking S3, one more look at forwarding: the holder may
-        // simply have changed (the lease read told us who).
-        if self.cfg.forwarding || self.mode.forwards() {
+        // simply have changed (the lease read told us who). Not to a holder
+        // whose lease this node has itself watched go unrenewed for its TTL
+        // (plan 43 C7b's claim is due): that holder is claimed, and the
+        // lease read finds out if it renewed meanwhile. Forwarding to it
+        // again cost an op on a dead holder's lease its forward retries
+        // after the claim fell due (3.4 s of a 6 s lease's 12 s deadline),
+        // and the op went in doubt.
+        let claim_due = !self.mode.forwards()
+            && !self.cfg.single_writer
+            && self
+                .lease
+                .claim_due(&self.cfg)
+                .is_some_and(|due| due <= now.wait)
+            && self
+                .lease
+                .obs
+                .as_ref()
+                .is_some_and(|o| Some(o.body.holder) == self.lease.cached_holder);
+        if (self.cfg.forwarding || self.mode.forwards()) && !claim_due {
             if let Some(holder) = self.lease.cached_holder {
                 if holder != self.cfg.node_id && self.reaches(now, holder) {
                     let c = self.clients.get_mut(&rid).expect("present");

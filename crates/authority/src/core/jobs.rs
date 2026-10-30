@@ -2917,11 +2917,18 @@ impl Core {
                         },
                         None,
                     );
-                    self.set_timer_wait(
-                        now.wait.plus(self.cfg.handoff_request_timeout_ms),
-                        super::Timer::JobRequestTimeout(req),
-                        out,
-                    );
+                    // The ask is for a sooner lease than this node's own
+                    // claim: it waits for the holder's answer no longer
+                    // than the instant that claim falls due (`retry_at`).
+                    // A holder dead since the read never answers, and a
+                    // 6 s lease's claim fell due 2.4 s into the 5 s
+                    // request timeout: the op behind it went in doubt
+                    // before the claim was made (the late answer of a live
+                    // holder finds no request and is dropped; its release
+                    // is in the lease object the retry reads).
+                    let until = now.wait.plus(self.cfg.handoff_request_timeout_ms);
+                    let until = retry_at.map_or(until, |at| until.min(at.max(now.wait)));
+                    self.set_timer_wait(until, super::Timer::JobRequestTimeout(req), out);
                     out.push(Action::Send {
                         to: holder,
                         msg: PeerMsg::LeaseRequest {

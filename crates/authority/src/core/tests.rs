@@ -529,6 +529,156 @@ fn a_cold_claim_of_a_longer_lived_lease_is_not_cut_off_by_the_client_deadline() 
     assert_eq!(replies(&out).len(), 1, "{out:?}");
 }
 
+/// What a test bucket answers `req` with: the lease reads `body` until this
+/// node wins it (`won`); every write lands; the log, the inbox and the
+/// heartbeats are empty.
+fn answer_from_bucket(req: &S3Op, body: &Lease, won: &mut Option<Lease>) -> S3Result {
+    match req {
+        S3Op::LeaseGet => S3Result::LeaseGet(Ok(Some((
+            won.clone().unwrap_or_else(|| body.clone()),
+            tag(),
+        )))),
+        S3Op::LeaseCreate { lease } | S3Op::LeaseSwap { lease, .. } => {
+            if lease.holder != body.holder {
+                *won = Some(lease.clone());
+            }
+            S3Result::LeasePut(Ok(tag()))
+        }
+        S3Op::SegmentPut { .. } => S3Result::SegmentPut(Ok(())),
+        S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+        S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+        S3Op::InboxPut { .. } => S3Result::InboxPut(Ok(())),
+        S3Op::InboxRun { .. } => S3Result::InboxRun(Ok(Vec::new())),
+        S3Op::InboxDrain { .. } => S3Result::InboxDrain(Ok(Vec::new())),
+        S3Op::InboxDelete { .. } => S3Result::InboxDelete(Ok(())),
+        S3Op::InboxTombstone { .. } => S3Result::InboxTombstone(Ok(())),
+        S3Op::InboxLastN { .. } => S3Result::InboxLastN(Ok(None)),
+        S3Op::HeartbeatRead => S3Result::Heartbeats(Ok(Vec::new())),
+        S3Op::HeartbeatPut { .. } => S3Result::HeartbeatPut(Ok(())),
+    }
+}
+
+/// `takeover-marker-strands-promptly` and `holder-crash-phantom-new-holder`
+/// (harness, linux-fuse, 6 s lease TTL): the holder was killed, and the
+/// next op of a node that reaches S3 went `EIO` at its 12 s deadline in 20
+/// runs of 20 — the claim of the dead holder's lease was due 9.2 s into the
+/// op, and the node never made it. The op's forwards to the dead holder ran
+/// out (3.2 s) and its lease read found the lease live; the handoff ask that
+/// followed failed at once (the link was evicted as dead); the retry
+/// forwarded again — four more timeouts (3.4 s); the second lease read
+/// asked the holder for a handoff again and waited the whole 5 s request
+/// timeout for an answer, 2.4 s past the claim's instant; the retry after
+/// it forwarded once more and the deadline fell in the middle. Now an ask
+/// waits no longer than the instant this node may claim by itself, and a
+/// retry whose claim is due goes to S3, not back to the silent holder: the
+/// op is executed here within a retry backoff of its claim falling due.
+/// (Fails before: answered in doubt 12 s after the submission.)
+#[test]
+fn a_dead_holders_lease_is_claimed_when_due_not_after_asks_and_forwards() {
+    let mut h = Harness::new(1);
+    h.core.cfg.ttl_ms = 6_000;
+    h.core.cfg.acquire_deadline_ms = 12_000;
+    h.core.cfg.forward_retries = 3;
+    h.core.cfg.forward_backoff_ms = 200;
+    // (Plan 30 §M10's promise check is its own machinery; not here.)
+    h.core.cfg.takeover_promise_check = false;
+    h.core.lease.cached_holder = Some(2);
+    // Node 2 renewed its 6 s lease just now and died: the body never moves,
+    // its link neither answers nor fails a send — but the first handoff
+    // ask, which meets the link's eviction.
+    let body = Lease {
+        ttl_ms: 6_000,
+        ..lease_of(2, 1, h.now.0 + 6_000)
+    };
+    let rid = h.rid(1);
+    let op = h.create("a");
+    let submitted = h.clk().wait;
+    let mut pending: std::collections::VecDeque<Event> = std::collections::VecDeque::new();
+    pending.push_back(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op,
+        tag: Default::default(),
+    });
+    let mut due: Vec<(WaitMs, TimerId)> = Vec::new();
+    let mut won = None;
+    let mut asks = 0;
+    let mut first_read = None;
+    let answer = loop {
+        let Some(event) = pending.pop_front() else {
+            // Nothing in flight: the next timer.
+            due.sort();
+            let (at, id) = due.remove(0);
+            assert!(
+                at.since(submitted) <= 20_000,
+                "the op is neither answered nor in doubt after 20 s"
+            );
+            h.advance(at.since(h.clk().wait).max(0) as u64);
+            pending.push_back(Event::Timer { id });
+            continue;
+        };
+        let out = h.step(event);
+        let mut reply = None;
+        for action in out {
+            match action {
+                Action::SetTimer { id, after_ms, .. } => {
+                    due.push((h.clk().wait.plus(after_ms), id))
+                }
+                Action::CancelTimer { id } => due.retain(|(_, t)| *t != id),
+                Action::Reply {
+                    rid: r,
+                    reply: answer,
+                    ..
+                } if r == rid => reply = Some(answer),
+                Action::S3 { op, req } => {
+                    if req == S3Op::LeaseGet && first_read.is_none() {
+                        first_read = Some(h.clk().wait);
+                    }
+                    let result = answer_from_bucket(&req, &body, &mut won);
+                    pending.push_back(Event::S3 { op, result });
+                }
+                Action::Send {
+                    to: 2,
+                    msg: PeerMsg::LeaseRequest { req, .. },
+                } => {
+                    asks += 1;
+                    if asks == 1 {
+                        pending.push_back(Event::PeerFailed {
+                            req,
+                            to: 2,
+                            outage: true,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(reply) = reply {
+            break (h.clk().wait, reply);
+        }
+    };
+    let (at, reply) = answer;
+    assert!(
+        matches!(reply, ClientReply::Outcome(MutateOutcome::Accepted { .. })),
+        "answered {reply:?} {} ms after the submission",
+        at.since(submitted)
+    );
+    // This node's own observation lets it claim one TTL after its first
+    // read of the lease.
+    let claimable = first_read.expect("the lease was read").plus(6_000);
+    assert!(
+        at.since(claimable) <= h.core.cfg.acquire_retry_max_ms as i64,
+        "executed {} ms after the claim fell due ({} ms after the submission)",
+        at.since(claimable),
+        at.since(submitted)
+    );
+    assert_eq!(
+        h.core.lease().epoch(),
+        Some(2),
+        "this node took the lease over"
+    );
+}
+
 #[test]
 fn the_lease_path_resolves_an_in_doubt_rid_from_the_log() {
     let mut h = Harness::new(1);
