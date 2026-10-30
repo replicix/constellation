@@ -964,6 +964,155 @@ holder's own unsynced writes are (a forwarded op's requester replays it).
 - While any generation is live, the root does not release its lease when
   idle and declines a cooperative handoff.
 
+#### Known gap: a sealed tail can carry a row whose cause was lost
+
+Status: open, documented 2026-10-30, not fixed. The reproduction is an
+ignored core test (below).
+
+**What happens.** One node holds two live generations, A and B. A row of
+B can depend on a row of A: its `deps` name `(A, i)`. A ends at a cut
+below `i` (the root reclaims it at its cursor, or drains A's own sealed
+tail and the row is not in it), so row `A:i` strands and is replayed by
+rid after the end, or never, if its node is gone. The live path is
+closed: a delegate never streams a row whose dependency was lost
+(`deleg_lost_deps_stopped`), and the root does not append one
+(`deleg_append_deps_lost`). The gap is B's end when B's delegate is gone
+too. The root then seals B's backup and drains the sealed tail
+(`deleg_drain_tail`). The drain checks dependencies with the void rule
+(`reaches_streams`), which counts a dependency on an ended generation as
+satisfied. So the dependent row is appended ahead of its cause, or
+without it. That breaks the log's causal order (the `marker-order`
+class). When the two rows touch the same keys, the log carries a change
+whose cause it never got, for example a `removexattr` of an attribute
+the log never set.
+
+**Which configurations can trigger it.** Hash-range splits are not
+needed, so turning splits off (the default, ADR-38) does **not** make a
+default mount safe from it. Two conditions are needed:
+
+- One node holds two generations at once. Two whole delegations of
+  different directories to the same node are enough, and the automatic
+  placement makes those by itself. Every op of that node carries the
+  node's whole session as its `deps` (`Core::fresh_deps`,
+  `SessionState::deps`), including its own rows in every generation it
+  holds, so a row of B names A's latest row even when the two writes are
+  unrelated. The dependency is real when the later write read the earlier
+  one's effect: a process saw `/a/x`, which is visible on the delegate
+  before it commits, and then wrote `/b/marker`. It is also real when the
+  keys meet: an inode's keys follow its primary link, so with a file
+  linked as `/a/f` (primary) and `/b/g`, an unlink of `/a/f` (a row of A)
+  moves the file's keys to B, and a later `removexattr` through `/b/g` is
+  a row of B that depends on A. Two ranges of a split directory, or a
+  range beside a whole delegation, give the same shape.
+- A's row is past A's eventual cut while B's row is committed through
+  B's group. That happens when the row of A had not been committed when
+  B's row executed (two processes on the node writing at once, A's
+  backup behind or missing), or when it was answered `Lone`. Then B's
+  delegate dies, or is cut off, and B ends by its backup's sealed tail.
+
+A re-delegation of the same directory to the same node does not trigger
+it. The new generation is installed only after the old one's rows have
+stranded (`deleg_install_waits_end`), and an op whose dependency is
+already lost is not executed (`deps_lost_refused`), so no row of the new
+generation is executed on a lost dependency.
+
+**How to reproduce.** Run the ignored core test, which fails until the
+fix lands:
+
+```
+cargo test -p constellation-authority --lib -- --ignored a_sealed_tail_never_appends_a_row_whose_dependency_was_lost
+```
+
+Node 3 holds `/d` as generation 7 (no backup) and `/e` as generation 8
+(backup 5). The root ends 7 at its cursor 0, then seals 8's backup, whose
+tail is 8:1, 8:2 (depending on the lost 7:1) and 8:3. Today the drain
+appends all three: `(true, 3, 3)` for `(true, 1, 1)`.
+
+**The options at the drain**, each with its cost:
+
+1. Append the row anyway. This is what the code does today. The log's
+   causal order breaks, and the namespace can diverge when the keys meet.
+2. Stop and wait for the dependency. The dependency never arrives,
+   because nothing is appended at a voided position. The generation stays
+   `Sealing` for good (`a_drain_that_stops_short_keeps_the_generation_sealing`
+   models a dependency that does arrive), its subtree's writes wait, and
+   only `repair abandon-group` gets out, which loses every row the group
+   acknowledged.
+3. End the generation before the row. Today this drops the later rows of
+   the tail, and those may have been acknowledged to their clients
+   through the backup. Clients were told those writes committed.
+
+**Recommended fix (to verify while implementing).** Make option 3 safe.
+A `DelegGroup` acknowledgement waits until the row's cross-generation
+dependencies are committed, so an acknowledged row can never depend on a
+lost one. Then a sealed tail's first row with a lost dependency, and
+every row after it, were never acknowledged, and the root can end the
+generation before that row. Clients that were not answered retry by rid,
+as for any stranded row. This holds because a committed row of A is at or
+below A's cut: A's end waits for its group's tail (Q1), and with no
+backup it ends at the root's cursor, which a committed row is under.
+The implementer's steps:
+
+1. At the delegate's execution (`delegate_execute_now`), take the
+   entries of the row's `deps` that name another generation this node
+   holds (`(h, i)`, `h != gen`, `h` in `dl.mine`). Keep them per
+   generation and index while they are not committed.
+2. Release a gated acknowledgement of `(gen, idx)` only when
+   `deleg_stream_durable(gen, idx)` holds **and** every kept dependency
+   of every row of `gen` at or below `idx` is committed
+   (`deleg_stream_durable(h, i)`). The rule is a prefix rule, because a
+   later row of the stream is committed only with the rows before it.
+   Apply it wherever a gated answer is released: the park in
+   `delegate_execute_now`, the release of parked answers in
+   `complete_ready` (`deleg_stream_state_cached`), the settled check of a
+   completed row (`completed_row_settled`), and the FUSE fast path's
+   answer of a gated row.
+3. A kept dependency whose row was dropped (`deps_lost` now holds)
+   aborts the acknowledgement, as `StreamState::Dropped` does for the
+   row's own generation: the requester retries by rid.
+4. At the root, `deleg_drain_tail` stops at the first row with
+   `replica.deps_lost(&tx.deps)` (count it as `deleg_append_deps_lost`),
+   and `on_deleg_sealed` takes the tail's end as the row before. Then
+   `deleg_end_sealed` ends the generation there instead of waiting. A
+   dependency that is only not here yet (its generation not voided)
+   still waits, as today.
+5. Remove `#[ignore]` from the core test.
+
+`Lone` rows are not affected: they are answered from the delegate's
+disk, and a strand replays them by rid.
+
+**Expected cost and how to measure it.** An acknowledgement waits only
+when a row depends on a row of another generation of the same node that
+is not committed yet. A client that issues its writes one after another
+already waited for the earlier write's acknowledgement, so it pays
+nothing. Concurrent writers in two directories held by one node wait for
+the slower of the two groups, and the two waits overlap. Expect no change
+at the median and a small rise at the tail when the two generations'
+backups differ. To measure it, add a counter of acknowledgements that
+waited on another generation and the wait's histogram. Then compare the
+latency (median and p99) and throughput of creates before and after,
+with two whole delegations to one node, a backup each, and several
+writers alternating between the two directories (the load campaign, or
+`stress-ng-fs-nodes` pointed at two directories).
+
+**What to test.**
+
+- The core test above, with `#[ignore]` removed. Add a delegate-side
+  core test: a row of 8 whose `deps` name an uncommitted row of 7 is not
+  answered when 8's backup acknowledges it, only once 7's group holds
+  7's row (and is aborted if 7 ends below it).
+- A sim configuration that has one node hold two generations with a
+  backup each and concurrent writers on that node, then kills the
+  delegate and one generation's backup before it acknowledges. Run one
+  variant with two whole delegations and one with a split
+  (`CONSTELLATION_DELEGATION_SPLIT=20`, as `shared-dir-split` does). The
+  `marker-order` check and I1 (no acknowledged write lost) must hold.
+- Sweep the families that end generations with backups:
+  `long-delegated`, `long-delegated-backup`,
+  `delegated-backup-and-delegate-die` (and its `-abandon` variant),
+  `delegated-two-gens-root-crash`, `shared-dir-split`,
+  `shared-dir-ranges` and `shared-dir-faults`.
+
 ### What stays with the root
 
 - Cross-subtree operations, and everything not under a delegation.

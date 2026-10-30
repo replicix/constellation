@@ -4052,6 +4052,16 @@ to land before C0.
 
 ### 11.2 Open findings (measured, not yet triaged)
 
+- **A sealed tail can carry a row whose dependency was lost** (left open by
+  the fix that keeps such a row off the live stream, 2026-10-30). When a
+  node holds two generations and the one a row depends on ends below that
+  row, the root's drain of the other's sealed backup tail appends the row
+  anyway: the void rule counts the dependency as met. Splits are not needed
+  (two whole delegations at one node are enough). Recommended fix: a
+  `DelegGroup` acknowledgement waits for the row's cross-generation
+  dependencies to commit, so the drain may end the generation before the
+  row. Reproduction (an ignored core test), options, steps, cost and tests:
+  [delegations.md](../../../reference/features/delegations.md#known-gap-a-sealed-tail-can-carry-a-row-whose-cause-was-lost).
 - **`locks-released-takeover` failed 5 of 2 000 under the default clock-fault
   mix** (seeds 961, 973, 1253, 1546, 1571 on `f7c8fc7`, with and without
   C7b; `+unclocked`: 0; 7 on `0cd3877c`: 961, 973, 1571, 1610, 1695, 1919,

@@ -1985,7 +1985,11 @@ tool for writers far from the root.
 costs above and the split-only behaviours do not apply to it: no read
 delegation on a split directory (every lookup in it asks the name's
 sequencer), and cross-range renames recalling both ranges. They matter
-only to those who enable splits or split by hand.
+only to those who enable splits or split by hand. Turning splits off does
+not close the sealed-tail gap, where a backup's drained tail carries a row
+whose dependency was lost with another generation: two whole delegations
+at one node trigger it too
+([known gap](../reference/features/delegations.md#known-gap-a-sealed-tail-can-carry-a-row-whose-cause-was-lost)).
 
 *No splits under `--cto strict`.* The listing of a split directory is
 answered by one sequencer, whose position does not cover the other

@@ -42024,6 +42024,135 @@ mod deleg_windows_tests {
         );
     }
 
+    /// Known gap, ignored until it is fixed: see "Known gap: a sealed tail
+    /// can carry a row whose cause was lost" in
+    /// `docs/reference/features/delegations.md`. Run it with
+    /// `cargo test -p constellation-authority --lib -- --ignored
+    /// a_sealed_tail_never_appends_a_row_whose_dependency_was_lost`; it
+    /// fails until the fix lands.
+    ///
+    /// Node 3 holds two whole delegations, no split: generation 7 (`/d`,
+    /// no backup) and generation 8 (`/e`, backup 5). Row 8:2 followed the
+    /// node's own row 7:1 (its `deps` name (7, 1)). The root ends 7 at its
+    /// cursor 0, so 7:1 strands and is replayed by rid after the end, if at
+    /// all. Node 3 then falls silent; the root seals 8's backup, whose tail
+    /// is 8:1 (acknowledged through the backup), 8:2, and 8:3. The drain
+    /// counts the dependency on the voided generation as satisfied
+    /// (`reaches_streams`) and appends 8:2 ahead of (or without) its cause.
+    ///
+    /// The outcome asserted is the fix's: 8:1 is appended (no acknowledged
+    /// row is dropped), 8:2 is not (its dependency was lost), and the
+    /// generation ends at 1 instead of staying `Sealing` for good. Ending
+    /// before 8:2 drops 8:3 too; that is safe only once a group
+    /// acknowledgement waits for the row's cross-generation dependencies to
+    /// be committed, so 8:2 and 8:3 (behind it in the stream) cannot have
+    /// been acknowledged.
+    #[test]
+    #[ignore = "known gap: a sealed tail's row whose dependency was lost is appended; see delegations.md"]
+    fn a_sealed_tail_never_appends_a_row_whose_dependency_was_lost() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.cfg.delegation_ttl_ms = 1_000;
+        h.hold(1, None);
+        let _ = delegated_to_me(&h.meta, 3);
+        let e = h.meta.allocate_ino(ROOT_INO).unwrap();
+        Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[
+                LogRecord::Mkdir {
+                    parent: ROOT_INO,
+                    name: "e".into(),
+                    ino: e,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 3,
+                },
+                LogRecord::Delegate {
+                    dir: e,
+                    node: 3,
+                    gen: 8,
+                    designated: false,
+                    range: (0, 0),
+                },
+            ],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.gens.contains_key(&7) && h.core.dl.gens.contains_key(&8));
+        // Generation 8 names backup 5; generation 7 none.
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRenew {
+                req: OpId(1),
+                gen: 8,
+                round: 1,
+                backup: Some(5),
+                stream_head: 0,
+                stream_head_at: 0,
+                first: false,
+            },
+        });
+        assert_eq!(h.core.dl.gens[&8].group.backup(), Some(5));
+        assert_eq!(h.core.dl.gens[&7].group.backup(), None);
+        // Generation 7 ends at its cursor 0, while 8 lives on: row 7:1 is
+        // lost to the log.
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        assert!(h.core.dl.gens[&7].ended, "not ended: {out:?}");
+        assert!(!h.core.dl.gens[&8].ended);
+        let on_7 = constellation_meta::Position::ZERO.with_streams_wire(&[(7, 1)]);
+        assert!(
+            Replica::deps_lost(&h.meta, &on_7),
+            "(7, 1) is past generation 7's cut"
+        );
+        // Node 3 falls silent: the root seals generation 8's backup.
+        h.core.dw.set_until_for_tests(8, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 8, &h.meta, &mut out);
+        let seal = sends(&out)
+            .iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::DelegSeal { req, gen: 8 } if *to == 5 => Some(*req),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no seal: {out:?}"));
+        let row = |idx: u64, deps: constellation_meta::Position| constellation_meta::DelegateTx {
+            idx,
+            rid: None,
+            records: Vec::new(),
+            deps,
+        };
+        h.step(Event::Peer {
+            from: 5,
+            msg: PeerMsg::DelegSealed {
+                req: seal,
+                gen: 8,
+                sealed: true,
+                txs: vec![
+                    row(1, constellation_meta::Position::ZERO),
+                    row(2, on_7),
+                    row(3, constellation_meta::Position::ZERO),
+                ],
+            },
+        });
+        let g = &h.core.dl.gens[&8];
+        assert_eq!(
+            (g.ended, g.cursor, Replica::stream_applied(&h.meta, 8)),
+            (true, 1, 1),
+            "(generation 8 ended, its cursor, the stream the root holds): \
+             8:1 appended, 8:2 (deps on the lost 7:1) not, the generation ended"
+        );
+    }
+
     /// Plan 43 C2e (§3.7, D3): the end seals every backup a record named.
     /// The latest version's members are sealed strictly (the end waits for
     /// one of them); a backup only an older record named is sealed once,
