@@ -61937,3 +61937,38 @@ Any other refusal is a seed failure (`operator_abandon`). With these changes `de
 earlier. Also: `status.ack.sealed_unread` shows a backup whose persisted seal could not be read since the start, and
 the warning of the read's retry at each append is rate-limited to the 1st, 2nd, 4th, 8th... failure
 (`backup_seal_unread_reads`).
+## Follow-ups of the takeover of a dead holder and the lease reads (2026-10-30)
+
+Five small fixes from the reviews of `fd5d7e30` (a dead holder's lease is claimed when the claim falls due) and `a5ebcc68` (lease
+answers applied to the body they were sent with). One commit each; a core unit test that fails on the parent for every code change.
+
+1. **A queued handoff request is declined at the full request timeout, not the requester's wait** (`begin_handoff`). Since
+   `fd5d7e30` an ask for a sooner lease than the requester's own claim ends when that claim falls due, which may be earlier. Not
+   changed in behaviour: carrying the wait would be a duration (a wait-clock instant means nothing on the holder) through the peer
+   message, the payload and the handler trait, to cut a window of at most the difference of the two; the cost of that window is a
+   release beside the requester's own claim, where one CAS loses and reads again. The comment says so.
+2. **`claim_due` in `on_acquire_retry` ignored `s3_less()`.** With this node's S3 stalled, an op whose claim was due took the lease
+   path (a lease read on a dead path) instead of forwarding to a holder it reaches. `a_claim_due_does_not_send_a_node_without_s3_to_the_lease_path`.
+3. **The first `Busy` of a `Backup` lease seen by a non-backup left the backups' claim grace out of `retry_at`.** The retry fell due
+   within the grace, read the lease and asked again for nothing. `claim_grace_ms` is shared with `claim_due`.
+   `a_non_backups_first_busy_retries_when_the_grace_is_over`.
+4. **Harness**: `takeover-marker-strands-promptly` checked the marker's `prev_epoch` against A's epoch; the gate writes
+   `gate.epoch - 1`. It uses `b_epoch - 1`. (A scenario; it cannot fail before while the epochs are consecutive.)
+5. **A stale read of the held version under another tag set the held tag back and settled a reconfiguration in doubt.** A renewal
+   of ours lands (same `config_version`, its own tag), a reconfiguration CAS conditioned on it is answered lost, and a read served
+   before the renewal (the mark CAS's re-read, which had no guard at all) comes back: not the held tag, so it cleared
+   `reconfig_doubt`. `LeaseState::older_read` now asks again for such a sibling when the read was sent before the held body was taken
+   (`held_gen`); only a read sent after it, which shows the object moved on from the held tag, settles the doubt. The mark's re-read
+   records its count (`AckState::marking_gen`) and goes through `older_read` like the renewal's, the reconfiguration's and the
+   clear-mark's. The release job's re-read is left (a release job holds off new lease CASes of ours).
+   `a_stale_read_of_the_held_version_under_another_tag_settles_nothing`, `a_mark_re_read_served_before_a_renewal_settles_no_reconfig_doubt`.
+
+### Gates
+
+fmt and clippy (workspace, all targets, `-D warnings`) clean. Lib tests: authority 806, harness 162 (no failures). Release sim
+suite: 286 passed (11 ignored). Sweeps, seeds 0 to 999, `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`, the follow-ups against main:
+`locks-failover`, `long-backup`, `backup`, `delegated-holder-cut` (the sweep's name for the holder-cut one) and `backup-slow-lease`
+pass on both; `locks-core-stall-backup-long-slow-lease` fails seed 946 (lock fairness) on both. `backup` seed 562 takes 5 minutes
+with the follow-ups and 0.04 s on main: the schedule differs after the first divergence, and the time is the generic
+linearizability tester after the run (as the slow-lease sweeps' note on seeds 562 and 1643; it passes). `takeover-marker-strands-promptly`
+×3 in the harness at a box load of 38: passed, the shadow stranded 3 to 254 ms after B's refused op.
