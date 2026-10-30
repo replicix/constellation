@@ -2229,6 +2229,11 @@ pub struct AckStatus {
     /// C1-3).
     #[serde(default)]
     pub member_copies: u64,
+    /// The persisted backup seal could not be read since the start: the
+    /// sealed epoch is unknown, and this node acknowledges and answers
+    /// nothing as a backup until it reads.
+    #[serde(default)]
+    pub sealed_unread: bool,
     /// The latest seal this node made, as its watch measured the holder's
     /// silence.
     #[serde(default)]

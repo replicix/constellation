@@ -396,6 +396,7 @@ impl EngineControl {
                     backing_acked: a.backing_acked,
                     sealed_epoch: a.sealed_epoch,
                     member_copies: a.member_copies as u64,
+                    sealed_unread: a.sealed_unread,
                     longest_step_ms: core.longest_step_ms,
                     longest_step_kind: core.longest_step_kind.to_string(),
                     recent_longest_step_ms: core.recent_longest_step_ms,

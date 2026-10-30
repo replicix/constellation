@@ -1324,6 +1324,9 @@ pub struct Stats {
     /// Seals of a claimant left unanswered: this node's store could not be
     /// read (plan 43 C2e review: not an empty tail, not "I hold nothing").
     pub seal_tail_unreadable: u64,
+    /// Reads of the persisted backup seal that failed after a start that
+    /// could not read it (`status.ack.sealed_unread` while it lasts).
+    pub backup_seal_unread_reads: u64,
     pub seal_tail_backup: u64,
     pub seal_tail_refused: u64,
     /// A listed backup that claimed at the expiry and sealed its role first.

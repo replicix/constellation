@@ -61927,3 +61927,13 @@ and the simulation's operator was refused: the root still heard from the live, s
 messages). The operator never forced, and an op waited forever. The refusal is the rule working. The simulated
 operator now forces the abandon after it has waited as long again, as one who confirmed the group cannot hand its tail
 over would.
+
+Re-review of the harness change: forcing must not hide a wrong refusal. The simulated operator now awaits the
+control's answer. Only an abandon that answered `Ok` grants the run-wide allowance (`operator_abandoned`); before, the
+generation was pushed as the command was sent. The operator forces only when the cluster shows what the command asks
+the operator to confirm: the delegate is dead, or alive with the generation stopped, and every strict member is dead.
+Any other refusal is a seed failure (`operator_abandon`). With these changes `delegated-backup-and-delegate-die` and its
+`-abandon` pass 2,000 seeds. Seed 99 takes the forced path, refused first because the stopped delegate was heard 102 ms
+earlier. Also: `status.ack.sealed_unread` shows a backup whose persisted seal could not be read since the start, and
+the warning of the read's retry at each append is rate-limited to the 1st, 2nd, 4th, 8th... failure
+(`backup_seal_unread_reads`).

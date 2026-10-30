@@ -1133,6 +1133,10 @@ pub struct AckView {
     /// node keeps of epochs it sealed.
     pub waiting_for_group: Option<super::seal_tail::WaitingForGroup>,
     pub member_copies: usize,
+    /// The persisted seal could not be read since the start: `sealed_epoch`
+    /// is not known, and nothing is acknowledged or answered as a backup
+    /// until it reads (plan 43 C2e review).
+    pub sealed_unread: bool,
 }
 
 impl Core {
@@ -1218,6 +1222,7 @@ impl Core {
                 .collect(),
             waiting_for_group: self.waiting_for_group(self.clk),
             member_copies: self.bk.member_epochs.len(),
+            sealed_unread: self.bk.sealed_unread,
         }
     }
 
@@ -1235,7 +1240,20 @@ impl Core {
                 self.bk.sealed_unread = false;
                 true
             }
-            None => false,
+            None => {
+                // Every append asks again: warned at the 1st, 2nd, 4th, 8th...
+                // failed read, not at each.
+                self.stats.backup_seal_unread_reads += 1;
+                let n = self.stats.backup_seal_unread_reads;
+                if n.is_power_of_two() {
+                    tracing::warn!(
+                        node = self.cfg.node_id,
+                        failed_reads = n,
+                        "the persisted backup seal still cannot be read: answering nothing as a backup"
+                    );
+                }
+                false
+            }
         }
     }
 
@@ -1244,7 +1262,14 @@ impl Core {
     pub(crate) fn backup_start(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         match replica.backup_sealed_epoch() {
             Some(sealed) => self.bk.sealed = sealed,
-            None => self.bk.sealed_unread = true,
+            None => {
+                self.bk.sealed_unread = true;
+                tracing::warn!(
+                    node = self.cfg.node_id,
+                    "the persisted backup seal could not be read: acknowledging and answering nothing \
+                     as a backup until it reads"
+                );
+            }
         }
         self.bk.member_epochs = replica.member_copy_epochs();
         if let Some(role) = replica.backup_role() {

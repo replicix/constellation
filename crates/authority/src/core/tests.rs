@@ -43190,8 +43190,13 @@ mod c1_tail_fetch {
                 },
             })
         };
+        assert!(
+            r.core.ack_view().sealed_unread,
+            "status shows the unknown seal"
+        );
         let out = append(&mut r, 2);
         assert_eq!(acks(&out), vec![(0, true)], "the sealed epoch: {out:?}");
+        assert!(!r.core.ack_view().sealed_unread);
     }
 
     /// A node that is not a listed backup claims a `Backup` lease past the

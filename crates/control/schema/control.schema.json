@@ -306,6 +306,11 @@
           "minimum": 0,
           "type": "integer"
         },
+        "sealed_unread": {
+          "default": false,
+          "description": "The persisted backup seal could not be read since the start: the\nsealed epoch is unknown, and this node acknowledges and answers\nnothing as a backup until it reads.",
+          "type": "boolean"
+        },
         "seals": {
           "format": "uint64",
           "minimum": 0,

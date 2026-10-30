@@ -1666,8 +1666,10 @@ impl Replica for Meta {
     }
 
     fn backup_sealed_epoch(&self) -> Option<Epoch> {
+        // (The core warns, rate-limited: every append reads it again while
+        // it fails.)
         Meta::backup_sealed_epoch(self)
-            .inspect_err(|error| tracing::warn!(%error, "reading a backup's seal failed"))
+            .inspect_err(|error| tracing::debug!(%error, "reading a backup's seal failed"))
             .ok()
     }
 
