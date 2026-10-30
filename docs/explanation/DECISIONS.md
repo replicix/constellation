@@ -1986,10 +1986,11 @@ costs above and the split-only behaviours do not apply to it: no read
 delegation on a split directory (every lookup in it asks the name's
 sequencer), and cross-range renames recalling both ranges. They matter
 only to those who enable splits or split by hand. Turning splits off does
-not close the sealed-tail gap, where a backup's drained tail carries a row
-whose dependency was lost with another generation: two whole delegations
-at one node trigger it too
-([known gap](../reference/features/delegations.md#known-gap-a-sealed-tail-can-carry-a-row-whose-cause-was-lost)).
+not by itself rule out a node holding two generations (a hand split, or a
+whole directory beside a range): a row of one that depends on a row the
+other ended without is never acknowledged, appended or drained
+([ADR-39](#adr-39-a-delegates-group-acknowledgement-waits-for-the-rows-dependencies-on-its-other-generations),
+[delegations](../reference/features/delegations.md#a-row-whose-cause-was-lost-with-another-generation)).
 
 *No splits under `--cto strict`.* The listing of a split directory is
 answered by one sequencer, whose position does not cover the other
@@ -2027,3 +2028,68 @@ benchmark's recommendation); built.
 [PROGRESS](../plans/v1/PROGRESS.md); `crates/authority/src/core/mod.rs`
 (`placement_split_pct`), `crates/authority/src/core/placement.rs`
 (`place_splits`).
+
+## ADR-39: A delegate's group acknowledgement waits for the row's dependencies on its other generations
+
+**Context**: one node can hold two generations (the ranges of a split
+directory, or a whole directory beside a range of another), and every op
+of the node carries the node's whole session as its `deps`, its own rows
+in every generation included. A `DelegGroup` acknowledgement waited for
+the row's own generation's group only
+([ADR-33](#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)).
+So a row of B could be acknowledged through B's backup while it depended
+on a row of A that was not committed, and when A then ended below that
+row (reclaimed at the root's cursor; the row strands and is replayed by
+rid, or never), B's end had no right answer: appending the row puts it in
+the log ahead of its cause, or without it (the root's drain of B's sealed
+tail did, by the void rule), and ending B before it drops rows the backup
+acknowledged (the live recall did, once the stream stopped at such a row).
+Waiting for the dependency waits for ever: nothing is appended at a voided
+position.
+
+**Decision**: a `DelegGroup` acknowledgement of row `(B, k)` waits until
+B's group holds it and every row of B up to `k` has its dependencies on
+the node's other generations committed by the same rule, computed to a
+fixpoint over the node's generations (`Core::deleg_caps`); a dependency
+lost with its generation aborts the acknowledgement. Then every row from
+the first one with a lost dependency on was never acknowledged, and both
+the live end (the delegate stops the generation before the row, its
+recall answers the row before, the root appends no such row) and the
+sealed tail's drain end the generation before it. The dependency is the
+whole session's, not narrowed to the keys the row touches or the rows
+the op read: the narrowing would let a causal dependency through (a read
+of `/a/x` that wrote `/b/marker` shares no key) and the cost of the whole
+session is small (below).
+
+**Evidence** (the simulation, release build; the harness on one box):
+- `delegated-two-gens-one-backed` (node 2 holds `d1` backed and a range of
+  `d2` unbacked, writes in both at once, loses the root and dies): with
+  the rule off, 40 of 200 seeds answered a write the log never carried
+  (`returned success but completed 0 times`); with it, none of 2,000.
+- The cost in the simulation, `delegated-two-gens-backed` (the same node,
+  both generations backed by one node, four writers per node, no fault),
+  seeds 0 to 1,999: 2,306 of 189,551 delegated acknowledgements (1.2 %)
+  waited for the other generation's row, 12 ms on average (27,721 ms in
+  all, 0.77 % of the 3,609,653 ms the acknowledgements waited
+  altogether), 1,017 ms at most.
+- The cost on real processes, the harness's `two-gens-ack-cost` (b holds
+  `/d1` and range 0/2 of `/d2`, both backed by c; four threads on b create
+  150 files each, two per directory), three runs against the same
+  scenario with the previous daemon: creates p50 11.2, 11.2, 11.7 ms
+  against 11.5, 11.6, 11.3 ms, p99 18.1, 18.0, 17.9 ms against 19.4, 19.5,
+  17.2 ms. No difference above the run-to-run spread.
+- A node with one generation, or with generations whose writers do not
+  overlap in time, pays nothing: the rows' dependencies on the other
+  generation are committed before they are read.
+
+**Consequences**: the acknowledgement of a row on a node that writes two
+generations at once can take the slower of the two groups; `status.delegation`
+counts those (`xgen_acks_delayed`, `xgen_ack_delay_ms`,
+`xgen_ack_delay_max_ms`). The delegate records the dependencies of each
+row as it reads it for a batch and forgets them once the log carries the
+row. The drain of a sealed tail still waits for a dependency that is only
+not here yet. `Lone` and non-stealable rows are unchanged.
+
+See: [Delegations](../reference/features/delegations.md#a-row-whose-cause-was-lost-with-another-generation);
+`crates/authority/src/core/delegate.rs` (`deleg_caps`, `deleg_note_xdeps`,
+`deleg_drain_tail`).

@@ -574,6 +574,10 @@ pub const SKIPPED: &[(&str, Skip)] = &[
     ),
     ("root-failover-with-delegates", Skip::Local(&[KILL, NODES4])),
     ("delegate-crash-backup", Skip::Local(&[KILL, NODES3])),
+    (
+        "two-gens-ack-cost",
+        Skip::Local(&[NODES3, "compares against a binary without the rule (CONSTELLATION_BIN)"]),
+    ),
     ("delegate-root-loss", Skip::Local(&[KILL])),
     ("delegate-root-blackhole", Skip::Local(&[STOP])),
     (

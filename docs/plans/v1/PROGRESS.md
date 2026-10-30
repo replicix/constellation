@@ -62225,3 +62225,59 @@ the journal's rows not yet streamed (`Meta::delegate_deps_from`, no records) and
 
 Test: core `recall_cut::a_recall_answers_before_a_lost_dependency_the_stream_has_not_read` (8:1 in flight, then 7:1 and
 8:2 depending on it, 7 ends at 0). Fail-before (the journal read off): `through` was 2 for 1.
+
+### 3. A group acknowledgement waits for the row's dependencies on the node's other generations; a sealed tail ends before a lost one (must-fix 1, the sealed-tail gap; ADR-39)
+
+Must-fix 1 (of the lost-dependency fix): the backup stream checks no `deps`, so a row of generation 8 that depends on an
+uncommitted row of 7 (`deps` (7, i); every op carries the node's whole session) was acknowledged once 8's backup held
+it. When 7 then ended below `i`, the delegate stopped 8 before that row and its recall answered the row before; the root
+ended 8 there, and the strand dropped the gated rows past the cut, the acknowledged one among them. The sealed-tail gap
+(documented the same day, `a_sealed_tail_never_appends_a_row_whose_dependency_was_lost`, ignored) is the other end of it:
+with 8's delegate gone too, the root's drain of 8's sealed tail counted the dependency on the voided 7 as met
+(`reaches_streams`) and appended the row ahead of its cause, or without it.
+
+Fix (ADR-39; DESIGN.md says so). A `DelegGroup` acknowledgement of `(gen, idx)` waits until the group holds it and every
+row of `gen` up to `idx` has its dependencies on the node's other generations committed (`Core::deleg_caps`: a prefix
+rule, computed to a fixpoint over the node's generations). The delegate records the dependencies of each row it reads for
+a batch, the root's stream or the backup's append, that are not committed yet (`DelegateState::xdeps`, through `xrec`;
+a row past `xrec` is not committed); they are forgotten once the log carries the row. The rule applies wherever a gated
+answer is released: the park at execution and `complete_ready` (`deleg_stream_state_with`), the settled check of a
+completed row, and the FUSE fast path's watermark (`report_deleg_durable` publishes the capped `through`; the `Lone`
+horizon stays the uncapped one). A dependency lost with its generation aborts the acknowledgement (`Dropped`, the
+requester retries by rid) and stops the generation there. At the root, `deleg_drain_tail` stops at a row with
+`deps_lost` and `deleg_end_sealed` ends the generation before it; a dependency only not here yet still waits (now
+`deleg_drain_deps_waits`, no longer the live stream's `deleg_deps_unsatisfied_at_append`, which the simulation asserts
+to be 0: a sealed tail can carry a row that followed a row of the dead delegate's other generation the root does not
+hold yet). `a_drain_that_stops_short_keeps_the_generation_sealing` modelled the arriving dependency as a void of its
+generation; the log's index of it now (a dependency past a voided generation's cut is lost).
+
+Measured (the choice of the whole session as the dependency, not a narrower one): `delegated-two-gens-backed`, seeds 0
+to 199, node 2 holding `d1` and a range of `d2` with one backup, four writers per node, no fault: 239 of 18,809 delegated
+acknowledgements (1.3 %) waited for the other generation, 12.5 ms on average, 692 ms at most, 0.84 % of all the time
+acknowledgements waited. The sims that hold two generations without backups (`delegated-two-gens-root-crash`,
+`shared-dir-split`, `shared-dir-ranges`) and `long-delegated-backup` count no wait: without a backup the stream to the
+root already waits for the other generation's acknowledgement (`acked_here`). A narrower dependency (the keys the row
+touches) would let a causal one through (a read of `/a/x`, then a write of `/b/marker`), for a cost this small. On the
+box, 2,000 seeds: 2,306 of 189,551 acknowledgements (1.2 %) waited, 12 ms on average, 1,017 ms at most; and the
+harness's new `two-gens-ack-cost` (b holds `/d1` and range 0/2 of `/d2`, both backed by c, four writers on b), three runs
+against the previous daemon: creates p50 11.2/11.2/11.7 ms against 11.5/11.6/11.3 ms, p99 18.1/18.0/17.9 ms against
+19.4/19.5/17.2 ms, no difference above the spread (the fast path's waits are not in the core's counter, which read 0).
+
+New: `delegation_backed_gens_max` (core config, unlimited; the simulation's knob for a backed generation beside an
+unbacked one), the simulation's `delegated-two-gens-backed` and `delegated-two-gens-one-backed` (node 2 loses the root
+at 1.2 s and dies at 1.5 s: the unbacked range ends at the root's cursor, `d1` by its backup's tail), the suite test
+`delegated_two_gens_one_backed_keep_their_acknowledgements`, the sweep line `SWEEP-XGEN-TOTALS`, and in
+`status.delegation` `xgen_acks_delayed`, `xgen_ack_delay_ms`, `xgen_ack_delay_max_ms`, `lost_deps_stopped`,
+`append_deps_lost`, `drain_deps_waits`. A second whole delegation to a node that holds one is refused (`delegate_dir`),
+so the shape needs a split directory or a whole directory beside a range, not two whole delegations as the gap's
+write-up said.
+
+Tests and fail-before:
+- `deleg_windows_tests::a_sealed_tail_never_appends_a_row_whose_dependency_was_lost`, un-ignored: `(ended, cursor,
+  stream held)` was `(true, 3, 3)` for `(true, 1, 1)` (also with only the drain's check off).
+- `recall_cut::a_group_acknowledgement_waits_for_the_rows_other_generation_dependencies` (node 2's create under 8
+  with `deps` (7, 1), 8 backed by 5, 7 by the root's append; 8's backup acknowledges; then 7 ends at 0). Fail-before
+  (the cap off: committed is the group's): 8:1 was answered `Accepted` while 7:1 was uncommitted. Mutation (the lost
+  dependency not seen): the acknowledgement waited instead of `Busy`.
+- `delegated-two-gens-one-backed`, seeds 0 to 199: with the cap off, 40 seeds failed `returned success but completed 0
+  times in the log`; with it, none.

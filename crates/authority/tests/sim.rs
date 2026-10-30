@@ -364,6 +364,8 @@ fn replay_seed() {
             delegated_backup_and_delegate_die_abandon_config()
         }
         Ok("delegated-backup-crash") => delegated_backup_crash_config(),
+        Ok("delegated-two-gens-one-backed") => delegated_two_gens_one_backed_config(),
+        Ok("delegated-two-gens-backed") => delegated_two_gens_backed_config(),
         Ok("delegated-designated") => delegated_designated_config(),
         Ok("delegated-placement") => delegated_placement_config(),
         Ok("delegated-strict") => delegated_strict_config(),
@@ -5211,6 +5213,8 @@ fn sweep_config() {
         "shared-dir-ranges" => shared_dir_ranges_config(),
         "shared-dir-faults" => shared_dir_faults_config(),
         "delegated-two-gens-root-crash" => delegated_two_gens_root_crash_config(),
+        "delegated-two-gens-one-backed" => delegated_two_gens_one_backed_config(),
+        "delegated-two-gens-backed" => delegated_two_gens_backed_config(),
         "delegated-root-gone" => delegated_root_gone_config(),
         "delegated-delegate-restart" => delegated_delegate_restart_config(),
         "long-delegated-backup" => long_delegated_backup_config(),
@@ -6223,6 +6227,61 @@ fn delegated_backup_and_delegate_die_abandon_config() -> SimConfig {
     }
 }
 
+/// One node holds two generations with a backup each: `d1` whole and
+/// range 0 of `d2` to node 2 (a second whole delegation to a node is
+/// refused), node 3 the backup of both, and node 2's clients write in both
+/// at once. No fault: the cost of the cross-generation acknowledgement rule
+/// (`SWEEP-XGEN-TOTALS`: acknowledgements that waited for the other
+/// generation's row).
+fn delegated_two_gens_backed_config() -> SimConfig {
+    SimConfig {
+        delegations: vec![("d1".into(), 2)],
+        range_delegations: vec![("d2".into(), 2, (1, 0))],
+        check_range_bits: 1,
+        cross_ratio: 0.0,
+        clients_per_node: 4,
+        ops_per_client: 16,
+        ..delegated_backup_config()
+    }
+}
+
+/// The review of the cross-generation acknowledgement rule: node 2 holds
+/// `d1` whole, backed by node 3, and range 0 of `d2` with no backup (its
+/// group is the delegate and the root: `delegation_backed_gens_max` 1), and
+/// its clients write in both at once, so a row of `d1` follows rows of
+/// `d2` the root has not appended (every op carries the node's session as
+/// its `deps`). Node 2 loses the root at 1.2 s and dies at 1.5 s: the root
+/// ends `d2`'s range at its cursor (its later rows strand), and `d1` by its
+/// backup's sealed tail. A row of `d1` past one of `d2` the log never got
+/// is never appended (the drain ends before it), and none such was
+/// acknowledged: an acknowledgement through the backup waits for the row's
+/// dependencies on the node's other generations. Without that rule the
+/// drain dropped rows the backup had acknowledged (I1).
+fn delegated_two_gens_one_backed_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(sim::run::deleg_one_backed_gen_core_config),
+        faults: vec![
+            ScheduledFault {
+                at_ms: 1_200,
+                kind: FaultKind::Partition {
+                    a: 1,
+                    b: 2,
+                    for_ms: 2_000,
+                },
+            },
+            ScheduledFault {
+                at_ms: 1_500,
+                kind: FaultKind::CrashNode {
+                    node: 2,
+                    restart_ms: Some(9_000),
+                    keep_journal: true,
+                },
+            },
+        ],
+        ..delegated_two_gens_backed_config()
+    }
+}
+
 /// The delegate of `d1` dies with a backup: the root seals the backup,
 /// drains its tail, ends the generation and delegates `d1` to the
 /// backup; every backup-acknowledged write is in the log.
@@ -6895,6 +6954,13 @@ struct OracleTotals {
     class_claim_seeds: Vec<u64>,
     downgraded_lone: u64,
     class_from_session: u64,
+    /// The cross-generation acknowledgement rule: acknowledgements that
+    /// waited for another generation's row (count, total ms, max ms), all
+    /// delegated acknowledgements released (count, total wait ms), prefix
+    /// holds (count, total ms, max ms), and the path-B and lost-dependency
+    /// counters (installs put off, generations stopped, rows the root
+    /// refused, answers that took nothing).
+    xgen: [u64; 12],
     /// Plan 43 C1-3: attempts to fetch a group's tail, fetches completed (of
     /// them, of an inherited tail), claims that carried no tail (must be 0
     /// outside an abandon), groups abandoned, runs that ended waiting.
@@ -6943,6 +7009,20 @@ impl OracleTotals {
         self.class_claim.1 += u64::from(r.class_claim_mismatch > 0);
         if r.class_claim_mismatch > 0 && self.class_claim_seeds.len() < 30 {
             self.class_claim_seeds.push(seed);
+        }
+        for st in r.stats.values() {
+            self.xgen[0] += st.deleg_xgen_acks_delayed;
+            self.xgen[1] += st.deleg_xgen_ack_delay_ms;
+            self.xgen[2] = self.xgen[2].max(st.deleg_xgen_ack_delay_max_ms);
+            self.xgen[3] += st.deleg_stream_acks_released;
+            self.xgen[4] += st.deleg_stream_ack_wait_ms;
+            self.xgen[5] += st.deleg_xgen_holds;
+            self.xgen[6] += st.deleg_xgen_hold_ms;
+            self.xgen[7] = self.xgen[7].max(st.deleg_xgen_hold_max_ms);
+            self.xgen[8] += st.deleg_install_waits_end;
+            self.xgen[9] += st.deleg_lost_deps_stopped;
+            self.xgen[10] += st.deleg_append_deps_lost;
+            self.xgen[11] += st.deleg_stream_no_progress;
         }
         for st in r.stats.values() {
             self.downgraded_lone += st.acks_downgraded_lone;
@@ -7109,6 +7189,25 @@ impl OracleTotals {
             self.lone_lead[3],
             self.lone_lead[4],
             self.lone_lead[5]
+        );
+        eprintln!(
+            "SWEEP-XGEN-TOTALS {label} seeds {}/{seeds}: acks waiting on another generation {} \
+             ({} ms, max {} ms) of delegated acks released {} ({} ms waited); prefix holds {} \
+             ({} ms, max {} ms); installs put off {}, generations stopped at a lost dependency {}, \
+             rows refused at the root {}, answers that took nothing {}",
+            self.seeds,
+            self.xgen[0],
+            self.xgen[1],
+            self.xgen[2],
+            self.xgen[3],
+            self.xgen[4],
+            self.xgen[5],
+            self.xgen[6],
+            self.xgen[7],
+            self.xgen[8],
+            self.xgen[9],
+            self.xgen[10],
+            self.xgen[11]
         );
         eprintln!(
             "SWEEP-CLAIM-TOTALS {label} seeds {}/{seeds}: class-claim-mismatch={} in {} seeds, \
@@ -7852,6 +7951,19 @@ fn delegated_delegate_crash_drains_the_backup() {
     );
     assert!(t.seals_sent > 0, "no backup was sealed: {t:?}");
     assert!(t.sealed_drained > 0, "no sealed tail was drained: {t:?}");
+}
+
+/// One node's backed and unbacked generations die together: the backup's
+/// tail is drained up to the first row whose dependency on the unbacked
+/// generation was lost, and no acknowledged row is dropped.
+#[test]
+fn delegated_two_gens_one_backed_keep_their_acknowledgements() {
+    let t = run_m11(
+        "delegated-two-gens-one-backed",
+        delegated_two_gens_one_backed_config(),
+        68_100..68_120,
+    );
+    assert!(t.seals_sent > 0, "no backup was sealed: {t:?}");
 }
 
 /// Phase 2b: designations are never recalled by time; cross ops touching

@@ -257,6 +257,34 @@ pub(crate) enum StreamState {
 pub(crate) struct StreamCache {
     log_idx: BTreeMap<u64, u64>,
     pending: std::collections::HashMap<(u64, u64), bool>,
+    caps: Option<BTreeMap<u64, XCap>>,
+}
+
+impl StreamCache {
+    /// Row `(gen, idx)` is held by its group but not committed for its
+    /// acknowledgement: it waits for another generation's row (computed
+    /// caps only; `false` before any).
+    pub(crate) fn xgen_held(&self, gen: u64, idx: u64) -> bool {
+        self.caps
+            .as_ref()
+            .and_then(|c| c.get(&gen))
+            .is_some_and(|c| {
+                idx > c.committed && idx <= c.group && c.lost_at.is_none_or(|l| idx < l)
+            })
+    }
+}
+
+/// What a generation this node delegates has committed for its
+/// acknowledgements ([`Core::deleg_caps`]): the prefix the log carries, or
+/// its group holds with every row's dependencies on this node's other
+/// generations committed; and the first row whose such dependency was lost
+/// with its generation (its acknowledgement, and every later one, never
+/// comes).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct XCap {
+    pub committed: u64,
+    pub group: u64,
+    pub lost_at: Option<u64>,
 }
 
 /// An op a delegate holds until its `deps` are here or its grant is
@@ -418,6 +446,16 @@ pub(crate) struct DelegateState {
     /// generation ended without (`Replica::deps_lost`): never streamed, the
     /// generation stopped before it (`deleg_stream`).
     pub lost_from: Option<u64>,
+    /// The dependencies of this stream's rows on rows of this node's other
+    /// generations not committed when the row was read for a batch
+    /// (`h -> idx -> i`: row `idx` depends on `(h, i)`), and the index
+    /// through which every row's are recorded: a `DelegGroup`
+    /// acknowledgement waits for them ([`Core::deleg_caps`]).
+    pub xdeps: BTreeMap<u64, BTreeMap<u64, u64>>,
+    pub xrec: u64,
+    /// Since when the committed prefix has been held below the group's by
+    /// another generation's uncommitted row (the measurement).
+    pub xheld_since: Option<WaitMs>,
 }
 
 /// A renewal or backup append [`Core::deleg_expire_inflight`] gave up
@@ -505,6 +543,7 @@ impl DelegationState {
             ("dl_backing", self.backing.len()),
             ("dl_sealed", self.sealed.len()),
             ("dl_designating", self.designating.len()),
+            ("dl_xgen_held_at", self.xgen_held_at.len()),
         ]
     }
 }
@@ -518,6 +557,10 @@ const FREEZES_KEPT: usize = 8;
 
 #[derive(Debug, Default)]
 pub(crate) struct DelegationState {
+    /// The measurement of the acknowledgement rule (`Core::deleg_caps`):
+    /// parked acknowledgements whose row its own group holds but that wait
+    /// for another generation's row, by park id, since when.
+    pub(crate) xgen_held_at: BTreeMap<u64, WaitMs>,
     /// Plan 41 L0: this tenure took an unexpired lease over (a seal, or
     /// `ack=s3`; `note_fast_takeover`), so a predecessor's last delegation
     /// renewal may have been decided up to `backup_takeover_ms` after its
@@ -1046,6 +1089,9 @@ impl Core {
                     held_noted: false,
                     synced_through: 0,
                     lost_from: None,
+                    xdeps: BTreeMap::new(),
+                    xrec: 0,
+                    xheld_since: None,
                 },
             );
             if d.designated {
@@ -2021,12 +2067,200 @@ impl Core {
         }
     }
 
+    /// Record the dependencies of `txs` (rows of `gen` read for a batch) on
+    /// rows of this node's other generations that are not committed yet,
+    /// for the acknowledgement rule ([`Self::deleg_caps`]). Every row of a
+    /// stream is read for a batch before its group can hold it (the root
+    /// by the stream, a backup by its appends), so a row the group holds
+    /// has its dependencies recorded, or it lies past `xrec` and waits.
+    fn deleg_note_xdeps(
+        &mut self,
+        gen: u64,
+        txs: &[constellation_meta::DelegateTx],
+        replica: &dyn Replica,
+    ) {
+        let (Some(first), Some(last)) = (txs.first().map(|t| t.idx), txs.last().map(|t| t.idx))
+        else {
+            return;
+        };
+        let caps = self.deleg_caps(&mut |g| replica.log_stream_idx(g), replica);
+        let mine: BTreeSet<u64> = self.dl.mine.keys().copied().collect();
+        let log_idx = replica.log_stream_idx(gen);
+        let Some(d) = self.dl.mine.get_mut(&gen) else {
+            return;
+        };
+        for t in txs {
+            for (h, i) in t.deps.streams.iter() {
+                if h == gen || h == 0 || i == 0 || !mine.contains(&h) {
+                    continue;
+                }
+                // Committed already stays committed: nothing to wait for.
+                if caps.get(&h).is_some_and(|c| i <= c.committed) {
+                    continue;
+                }
+                let e = d.xdeps.entry(h).or_default().entry(t.idx).or_insert(0);
+                *e = (*e).max(i);
+            }
+        }
+        let rec = d.xrec.max(log_idx);
+        if first <= rec + 1 {
+            d.xrec = rec.max(last);
+        }
+    }
+
+    /// What each generation this node delegates has committed for its
+    /// `DelegGroup` acknowledgements ([`XCap`]). A row is committed when
+    /// the log carries it, or when its group holds it **and** every row of
+    /// the stream up to it has its dependencies on this node's other
+    /// generations committed (a prefix rule: a later row is committed only
+    /// with the rows before it). One node's op carries the node's whole
+    /// session as its `deps`, its own rows in every generation it holds;
+    /// were a row of B acknowledged while it depended on a row of A that A
+    /// then ended without (reclaimed below it, the row replayed by rid
+    /// later or never), B's end could neither append the row (ahead of its
+    /// cause) nor end before it (dropping an acknowledged row). With this
+    /// rule an acknowledged row's dependencies are committed, so they are
+    /// at or below their generation's cut, and every row from the first
+    /// with a lost dependency on was never acknowledged: the delegate stops
+    /// the generation before it, and the root's drain of a sealed tail
+    /// ends there. Computed to a fixpoint over this node's generations (a
+    /// dependency is committed by the same rule, `deleg_stream_state_with`).
+    /// `ack=s3` commits only through the log.
+    pub(crate) fn deleg_caps(
+        &self,
+        log_idx: &mut dyn FnMut(u64) -> u64,
+        replica: &dyn Replica,
+    ) -> BTreeMap<u64, XCap> {
+        let mut caps: BTreeMap<u64, XCap> = BTreeMap::new();
+        let mut logs: BTreeMap<u64, u64> = BTreeMap::new();
+        for d in self.dl.mine.values() {
+            let log = log_idx(d.gen);
+            logs.insert(d.gen, log);
+            let group = if self.cfg.ack_s3 {
+                log
+            } else {
+                Self::deleg_group_through(d).max(log)
+            };
+            // A row past `xrec` was not read for a batch by this process
+            // (a backup's answer can cover rows a previous one sent): its
+            // dependencies are not known, so it is not committed yet.
+            let committed = if self.cfg.ack_s3 {
+                group
+            } else {
+                group.min(d.xrec.max(log))
+            };
+            caps.insert(
+                d.gen,
+                XCap {
+                    committed,
+                    group,
+                    lost_at: None,
+                },
+            );
+        }
+        if self.cfg.ack_s3 {
+            return caps;
+        }
+        let mut other_log: BTreeMap<u64, u64> = BTreeMap::new();
+        for _ in 0..=self.dl.mine.len() {
+            let mut changed = false;
+            for d in self.dl.mine.values() {
+                let log = logs[&d.gen];
+                for (h, rows) in &d.xdeps {
+                    let h_log = match logs.get(h) {
+                        Some(l) => *l,
+                        None => *other_log.entry(*h).or_insert_with(|| log_idx(*h)),
+                    };
+                    let bound = caps.get(h).map_or(h_log, |c| c.committed.max(h_log));
+                    let mut run = 0;
+                    for (idx, i) in rows.range(log + 1..) {
+                        run = run.max(*i);
+                        if run > bound {
+                            let c = caps.get_mut(&d.gen).expect("present");
+                            let to = (idx - 1).max(log);
+                            if to < c.committed {
+                                c.committed = to;
+                                changed = true;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        // A dependency lost with its generation: the row and every later
+        // one are never appended.
+        for d in self.dl.mine.values() {
+            let log = logs[&d.gen];
+            for (h, rows) in &d.xdeps {
+                let Some(cut) = replica.void_cut(*h) else {
+                    continue;
+                };
+                let h_log = *other_log.entry(*h).or_insert_with(|| log_idx(*h));
+                let mut run = 0;
+                for (idx, i) in rows.range(log + 1..) {
+                    run = run.max(*i);
+                    if run > cut.max(h_log) {
+                        let c = caps.get_mut(&d.gen).expect("present");
+                        if c.lost_at.is_none_or(|l| *idx < l) {
+                            c.lost_at = Some(*idx);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        caps
+    }
+
+    /// The measurement of the acknowledgement rule ([`Self::deleg_caps`]):
+    /// how often, and for how long, a generation's committed prefix was
+    /// held below what its group holds by a dependency on another
+    /// generation's uncommitted row (`deleg_xgen_holds`,
+    /// `deleg_xgen_hold_ms`, `deleg_xgen_hold_max_ms`). Also prunes what
+    /// the log carries, and stops a generation at a lost dependency.
+    fn deleg_xgen_measure(&mut self, now: Now, caps: &BTreeMap<u64, XCap>, replica: &dyn Replica) {
+        let mut lost = Vec::new();
+        for d in self.dl.mine.values_mut() {
+            let Some(c) = caps.get(&d.gen) else {
+                continue;
+            };
+            let log = replica.log_stream_idx(d.gen);
+            for rows in d.xdeps.values_mut() {
+                *rows = rows.split_off(&(log + 1));
+            }
+            d.xdeps.retain(|_, rows| !rows.is_empty());
+            let held = c.committed < c.group;
+            match (held, d.xheld_since) {
+                (true, None) => d.xheld_since = Some(now.wait),
+                (false, Some(since)) => {
+                    let ms = now.wait.since(since).max(0) as u64;
+                    d.xheld_since = None;
+                    self.stats.deleg_xgen_holds += 1;
+                    self.stats.deleg_xgen_hold_ms += ms;
+                    self.stats.deleg_xgen_hold_max_ms = self.stats.deleg_xgen_hold_max_ms.max(ms);
+                }
+                _ => {}
+            }
+            if let Some(l) = c.lost_at {
+                lost.push((d.gen, l));
+            }
+        }
+        for (gen, idx) in lost {
+            self.deleg_note_lost(gen, idx);
+        }
+    }
+
     /// Plan 43 C2 (§3.4): transaction `(gen, idx)` is committed — the answer
     /// of a row of the class `DelegGroup` may leave — from what this
     /// delegate knows: the log carries it, or every member of the group
     /// holds it. See [`Self::deleg_stream_state_with`].
     pub(crate) fn deleg_stream_durable(&self, gen: u64, idx: u64, replica: &dyn Replica) -> bool {
-        self.deleg_stream_state_with(gen, idx, || replica.log_stream_idx(gen), || true)
+        let caps = self.deleg_caps(&mut |g| replica.log_stream_idx(g), replica);
+        self.deleg_stream_state_with(gen, idx, &caps, || replica.log_stream_idx(gen), || true)
             == StreamState::Committed
     }
 
@@ -2043,10 +2277,27 @@ impl Core {
         replica: &dyn Replica,
         cache: &mut StreamCache,
     ) -> StreamState {
-        let StreamCache { log_idx, pending } = cache;
+        if cache.caps.is_none() {
+            let log_idx = &mut cache.log_idx;
+            let caps = self.deleg_caps(
+                &mut |g| {
+                    *log_idx
+                        .entry(g)
+                        .or_insert_with(|| replica.log_stream_idx(g))
+                },
+                replica,
+            );
+            cache.caps = Some(caps);
+        }
+        let StreamCache {
+            log_idx,
+            pending,
+            caps,
+        } = cache;
         self.deleg_stream_state_with(
             gen,
             idx,
+            caps.as_ref().expect("computed"),
             || {
                 *log_idx
                     .entry(gen)
@@ -2109,11 +2360,14 @@ impl Core {
         if self.dl.mine.is_empty() && self.dl.reported.is_empty() {
             return;
         }
+        let caps = self.deleg_caps(&mut |g| replica.log_stream_idx(g), replica);
+        self.deleg_xgen_measure(now, &caps, replica);
         let mut current = BTreeMap::new();
         let mut raised = Vec::new();
         for d in self.dl.mine.values() {
             let class = self.deleg_ack_class(now, d.gen, Asker::Own, replica);
-            let through = self.deleg_committed_through(d, replica.log_stream_idx(d.gen));
+            let uncapped = self.deleg_committed_through(d, replica.log_stream_idx(d.gen));
+            let through = caps.get(&d.gen).map_or(uncapped, |c| c.committed);
             // The fast path answers its own node's clients from the FUSE
             // thread, where the core does not see it: every index committed
             // may have been answered — as a `DelegGroup` row journaled
@@ -2132,7 +2386,7 @@ impl Core {
                 constellation_meta::DelegDurable {
                     class: class.into(),
                     through,
-                    horizon: self.deleg_lone_horizon(through),
+                    horizon: self.deleg_lone_horizon(uncapped),
                     lost: d.stopped || d.lapsed || d.backup_sealed,
                 },
             );
@@ -2175,15 +2429,21 @@ impl Core {
         &self,
         gen: u64,
         idx: u64,
+        caps: &BTreeMap<u64, XCap>,
         log_idx: impl FnOnce() -> u64,
         pending: impl FnOnce() -> bool,
     ) -> StreamState {
-        let committed = match self.dl.mine.get(&gen) {
-            Some(d) if !self.cfg.ack_s3 => idx <= Self::deleg_group_through(d) || idx <= log_idx(),
-            _ => idx <= log_idx(),
+        let cap = caps.get(&gen);
+        let committed = match cap {
+            Some(c) => idx <= c.committed,
+            None => idx <= log_idx(),
         };
         if committed {
             StreamState::Committed
+        } else if cap.and_then(|c| c.lost_at).is_some_and(|l| idx >= l) {
+            // A row at or past one whose dependency was lost is never
+            // appended: the generation ends before it.
+            StreamState::Dropped
         } else if pending() {
             StreamState::Waiting
         } else {
@@ -2274,11 +2534,16 @@ impl Core {
         let root = self.root_node();
         let candidates = self.backup_candidates(now);
         let mut chosen = Vec::new();
+        let mut backed = self.dl.mine.values().filter(|d| d.backup.is_some()).count();
         for d in self.dl.mine.values_mut() {
             if d.backup.is_some() || d.backup_sealed || d.stopped {
                 continue;
             }
+            if backed >= self.cfg.delegation_backed_gens_max {
+                continue;
+            }
             if let Some(b) = candidates.iter().find(|n| Some(**n) != root).copied() {
+                backed += 1;
                 d.backup = Some(b);
                 d.backup_acked = 0;
                 d.backup_sent_through = 0;
@@ -2327,6 +2592,7 @@ impl Core {
             if txs.is_empty() {
                 continue;
             }
+            self.deleg_note_xdeps(gen, &txs, replica);
             let last = txs.last().map(|t| t.idx).unwrap_or(from);
             let req = self.op_id();
             self.dl.by_req.insert(req, (gen, ReqKind::BackupAppend));
@@ -2660,7 +2926,7 @@ impl Core {
             // Its rows only add to what the root appends; a gap or a
             // missing dependency stops the drain and nothing waits.
             if sealed && self.root_ends_recall(now, gen) {
-                self.deleg_drain_tail(now, gen, &txs, true, replica, out);
+                let _ = self.deleg_drain_tail(now, gen, &txs, true, replica, out);
             }
             return;
         }
@@ -2724,10 +2990,28 @@ impl Core {
         if let Some(tail) = tail {
             sealed = true;
             let mut drained_to = self.dl.gens[&gen].cursor;
+            let mut lost = false;
             if ends_recall {
-                drained_to = self.deleg_drain_tail(now, gen, &tail.txs, first, replica, out);
+                (drained_to, lost) =
+                    self.deleg_drain_tail(now, gen, &tail.txs, first, replica, out);
             }
-            if !ends_recall || drained_to < tail.end {
+            // The drain stopped at a row whose dependency was lost with its
+            // generation: no row from there on was acknowledged (a
+            // `DelegGroup` acknowledgement waits for the row's dependencies
+            // on the delegate's other generations, `Core::deleg_caps`), so
+            // the generation ends before it; the rows strand and are
+            // replayed by rid (or dropped, unanswered) on the delegate.
+            if lost && drained_to < tail.end {
+                tracing::info!(
+                    node = self.me(),
+                    gen,
+                    cursor = drained_to,
+                    tail_end = tail.end,
+                    "a sealed tail's row depends on one lost with its generation: \
+                     the generation ends before it"
+                );
+            }
+            if !ends_recall || (drained_to < tail.end && !lost) {
                 if first {
                     self.stats.deleg_seal_waits += 1;
                 }
@@ -2765,8 +3049,11 @@ impl Core {
 
     /// Append the contiguous rows of a sealed tail (`txs`) that follow the
     /// generation's cursor and whose dependencies the root holds; returns the
-    /// cursor. `count`: the stop reasons and the drain are counted (a retry of
-    /// the same tail is not).
+    /// cursor, and whether the drain stopped at a row whose dependency was
+    /// lost with its generation (`Replica::deps_lost`: the void rule would
+    /// count it as met, and the row would land ahead of its cause, or
+    /// without it). `count`: the stop reasons and the drain are counted (a
+    /// retry of the same tail is not).
     fn deleg_drain_tail(
         &mut self,
         now: Now,
@@ -2775,12 +3062,13 @@ impl Core {
         count: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
-    ) -> u64 {
+    ) -> (u64, bool) {
         let Some(gs) = self.dl.gens.get(&gen) else {
-            return 0;
+            return (0, false);
         };
         let mut cursor = gs.cursor;
         let mut drained = 0u64;
+        let mut lost = false;
         for tx in txs {
             if tx.idx <= cursor {
                 continue;
@@ -2794,9 +3082,22 @@ impl Core {
                 }
                 break;
             }
-            if !replica.reaches_streams(&tx.deps) {
+            if replica.deps_lost(&tx.deps) {
                 if count {
-                    self.stats.deleg_deps_unsatisfied_at_append += 1;
+                    self.stats.deleg_append_deps_lost += 1;
+                }
+                lost = true;
+                break;
+            }
+            if !replica.reaches_streams(&tx.deps) {
+                // A sealed tail can carry a row that followed a row of the
+                // dead delegate's other generation the root does not hold
+                // yet (the backup acknowledged the appends, nothing waited
+                // for the root): the drain waits for that generation's
+                // end, or its rows. Not the live stream's causal cut, which
+                // never sends such a row (`acked_here`).
+                if count {
+                    self.stats.deleg_drain_deps_waits += 1;
                 }
                 break;
             }
@@ -2813,7 +3114,7 @@ impl Core {
             }
         }
         if drained == 0 {
-            return cursor;
+            return (cursor, lost);
         }
         if let Some(gs) = self.dl.gens.get_mut(&gen) {
             gs.cursor = cursor;
@@ -2829,7 +3130,7 @@ impl Core {
             cursor,
             "drained a sealed delegation"
         );
-        cursor
+        (cursor, lost)
     }
 
     /// The root learns the generations its table names when the table
@@ -3258,6 +3559,7 @@ impl Core {
             }
             let from = d.streamed_through + 1;
             let mut txs = replica.delegate_txs_from(gen, from, self.cfg.delegation_stream_rows);
+            self.deleg_note_xdeps(gen, &txs, replica);
             // Plan 30 §M12: a node holds several generations (the ranges
             // of a directory, a subtree); a transaction of one may depend
             // on this node's own execution under another (it reached it

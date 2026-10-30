@@ -1570,6 +1570,106 @@ pub fn delegate_crash_with_backup(_seed: u64) -> Result<()> {
     result
 }
 
+/// ADR-39's cost: b holds two generations, `/d1` whole and range 0/2 of
+/// `/d2`, both backed by c, and writes in both at once (two threads in
+/// each, creates of names in b's half of `/d2`). A `DelegGroup`
+/// acknowledgement of a row waits for the row's dependencies on b's other
+/// generation (every op carries the node's whole session as its `deps`).
+/// Prints the create latencies (all four writers, then a phase with the
+/// four in `/d1` only, which no other generation's row can hold back) and
+/// b's counters of acknowledgements that waited for the other generation.
+/// Run it against a binary without the rule (`CONSTELLATION_BIN`) for the
+/// comparison.
+pub fn two_gens_ack_cost(_seed: u64) -> Result<()> {
+    const NAME: &str = "two-gens-ack-cost";
+    const PER_WRITER: usize = 150;
+    let (_env, _root, mut clients, _) = cluster(
+        NAME,
+        &["a", "b", "c"],
+        &[("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "50")],
+        0,
+    )?;
+    let result = (|| -> Result<()> {
+        let a = &clients[0];
+        let b = &clients[1];
+        let b_id = node_id(b)?;
+        for d in ["d1", "d2"] {
+            std::fs::create_dir(a.mnt.join(d))?;
+        }
+        eventually("dirs visible on b", Duration::from_secs(20), || {
+            anyhow::ensure!(b.mnt.join("d1").is_dir() && b.mnt.join("d2").is_dir());
+            Ok(())
+        })?;
+        delegate(a, "/d1", b_id)?;
+        wait_installed(b, "/d1", Duration::from_secs(20))?;
+        delegate_range(a, "/d2", b_id, "0/2")?;
+        wait_installed_range(b, "/d2", "0/2", Duration::from_secs(20))?;
+        eventually("b backs both generations", Duration::from_secs(30), || {
+            let d = deleg_of(b)?;
+            let backed = d["backups"].as_array().map_or(0, |v| v.len());
+            anyhow::ensure!(backed >= 2, "backups: {d}");
+            Ok(())
+        })?;
+        let run = |dirs: [&str; 4], tag: &str| -> Result<Vec<Duration>> {
+            let handles: Vec<_> = dirs
+                .iter()
+                .enumerate()
+                .map(|(w, dir)| {
+                    let mnt = b.mnt.clone();
+                    let dir = dir.to_string();
+                    let tag = format!("{tag}{w}");
+                    std::thread::spawn(move || -> Result<Vec<Duration>> {
+                        let mut lat = Vec::new();
+                        let mut i = 0usize;
+                        let mut written = 0;
+                        while written < PER_WRITER {
+                            let name = format!("{tag}-{i}");
+                            i += 1;
+                            if dir == "d2"
+                                && constellation_meta::delegation::Range::of(1, &name).idx != 0
+                            {
+                                continue;
+                            }
+                            let path = mnt.join(&dir).join(&name);
+                            lat.push(write_timed(&path, name.as_bytes())?);
+                            written += 1;
+                        }
+                        Ok(lat)
+                    })
+                })
+                .collect();
+            let mut all = Vec::new();
+            for h in handles {
+                all.extend(h.join().map_err(|_| anyhow::anyhow!("writer panicked"))??);
+            }
+            Ok(all)
+        };
+        let before = deleg_of(b)?;
+        let both = run(["d1", "d2", "d1", "d2"], "x")?;
+        let mid = deleg_of(b)?;
+        let one = run(["d1", "d1", "d1", "d1"], "y")?;
+        let after = deleg_of(b)?;
+        let delta =
+            |x: &serde_json::Value, y: &serde_json::Value, k: &str| n(y, k).saturating_sub(n(x, k));
+        eprintln!(
+            "    {NAME}: two generations at once: {}; acks that waited for the other generation {} ({} ms, max {} ms)",
+            dist(both),
+            delta(&before, &mid, "xgen_acks_delayed"),
+            delta(&before, &mid, "xgen_ack_delay_ms"),
+            n(&mid, "xgen_ack_delay_max_ms"),
+        );
+        eprintln!(
+            "    {NAME}: one generation: {}; acks that waited for the other generation {}",
+            dist(one),
+            delta(&mid, &after, "xgen_acks_delayed"),
+        );
+        Ok(())
+    })();
+    dump_logs_on_failure(NAME, &clients, &result);
+    unmount_all(&mut clients);
+    result
+}
+
 /// Phase 2b: automatic placement. b dominates the writes under `d1` for
 /// a window: the root delegates `d1` to b by itself; then c takes the
 /// writes over and b stops: after the dwell the placement recalls b's

@@ -39166,6 +39166,160 @@ mod recall_cut {
         assert_eq!(through, Some(0), "{out:?}");
     }
 
+    /// Node 2's forward of a create of `name` under `dir` (request `req`)
+    /// with `deps`; what the delegate sent.
+    fn forward_with_deps(
+        h: &mut Harness,
+        dir: constellation_fs_core::Ino,
+        name: &str,
+        req: u64,
+        deps: constellation_meta::Position,
+    ) -> Vec<Action> {
+        let ino = h.meta.allocate_ino(dir).unwrap();
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(req),
+                rid: Rid {
+                    node: 2,
+                    incarnation: 1,
+                    seq: req,
+                },
+                op: MutateOp::Create {
+                    parent: dir,
+                    name: name.into(),
+                    ino,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+                acked_through: 0,
+                deps,
+                applied: 0,
+                tag: Default::default(),
+            },
+        })
+    }
+
+    fn reply_to_2(out: &[Action], req: u64) -> Option<&MutateOutcome> {
+        sends(out).into_iter().find_map(|(to, m)| match m {
+            PeerMsg::MutateReply {
+                req: r, outcome, ..
+            } if to == 2 && *r == OpId(req) => Some(outcome),
+            _ => None,
+        })
+    }
+
+    /// Review must-fix 1 (fail-before): this node holds generations 7 (no
+    /// backup: its group is the root's append) and 8 (backup 5). Node 2's
+    /// create under 8 depends on its create under 7 (`deps` (7, 1)). 8's
+    /// backup held the row and the delegate answered it, while 7:1 was not
+    /// committed. 7 then ended at 0: 7:1 strands, so 8 stops before 8:1 and
+    /// ends there, and the strand drops 8:1 though node 2 was told it
+    /// committed. A `DelegGroup` acknowledgement now waits for the row's
+    /// dependencies on the node's other generations, and is aborted (node 2
+    /// retries by rid) when one of them is lost.
+    #[test]
+    fn a_group_acknowledgement_waits_for_the_rows_other_generation_dependencies() {
+        let (mut h, dir, low, high) = two_ranges();
+        Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::DelegGroup {
+                dir,
+                gen: 8,
+                version: 1,
+                backups: vec![5],
+            }],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        // Node 5 is near: a backup candidate, so 8's group stays as recorded.
+        h.core.cfg.backup_rtt_budget_ms = 50;
+        h.core.cfg.backups_max = 1;
+        h.core.cfg.backup_stable_ms = 0;
+        h.step(Event::Roster {
+            write_eligible: vec![1, 2, 3, 5],
+        });
+        h.step(Event::Peers {
+            links: vec![crate::event::PeerLink {
+                node: 5,
+                connected: true,
+                last_seen: None,
+                rtt_ms: Some(5),
+                since: Some(WaitMs(0)),
+            }],
+        });
+        let d8 = h.core.dl.mine.get_mut(&8).unwrap();
+        d8.backup = Some(5);
+        d8.group_requested = None;
+        let out = forward_with_deps(&mut h, dir, &low, 500, constellation_meta::Position::ZERO);
+        assert!(reply_to_2(&out, 500).is_none(), "{out:?}");
+        let on_7 = constellation_meta::Position::ZERO.with_streams_wire(&[(7, 1)]);
+        let out = forward_with_deps(&mut h, dir, &high, 501, on_7);
+        assert!(reply_to_2(&out, 501).is_none(), "{out:?}");
+        let breq = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::DelegBackupAppend { req, gen: 8, .. } if to == 5 => Some(*req),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("not appended to 8's backup: {out:?}"));
+        let out = h.step(Event::Peer {
+            from: 5,
+            msg: PeerMsg::DelegBackupAck {
+                req: breq,
+                gen: 8,
+                acked: 1,
+                sealed: false,
+            },
+        });
+        assert_eq!(
+            reply_to_2(&out, 501),
+            None,
+            "8:1 answered while the row of 7 it depends on was not committed"
+        );
+        // The fast path's watermark says the same.
+        assert!(
+            !matches!(
+                h.meta
+                    .session()
+                    .wait_deleg_durable(8, 1, std::time::Duration::ZERO),
+                constellation_meta::DurableWait::Durable(_)
+            ),
+            "the fast path's watermark covers 8:1"
+        );
+        // Generation 7 ends at 0: 7:1 is lost to the log, and so is 8:1.
+        Replica::apply_segment(
+            &h.meta,
+            3,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::RecallCut {
+                dir,
+                gen: 7,
+                through: 0,
+            }],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        assert_eq!(
+            reply_to_2(&out, 501),
+            Some(&MutateOutcome::Busy),
+            "the acknowledgement of 8:1 is aborted: {out:?}"
+        );
+        assert_eq!(h.core.dl.mine[&8].lost_from, Some(1));
+    }
+
     /// Review follow-up (fail-before): the stream finds a row whose
     /// dependency was lost only in a batch it reads. With a batch of
     /// generation 8 in flight when generation 7 ends, the recall answered
@@ -42116,8 +42270,10 @@ mod deleg_windows_tests {
         assert_eq!(h.core.stats.deleg_seal_waits, 1);
         // The dependency arrives (the log brings its stream): the next event
         // drains the held tail and ends the generation, without the backup
-        // being asked again.
-        Replica::void_stream(&h.meta, 99, 0);
+        // being asked again. (Voiding generation 99 at 0 stood for the
+        // arrival before; a dependency past a voided generation's cut is
+        // lost now, and the drain ends before it.)
+        Replica::note_stream(&h.meta, 99, 5);
         let out = h.step(Event::Slack { epoch_slack: 0 });
         let g = &h.core.dl.gens[&7];
         assert!(g.ended, "the whole tail drained: the generation ends");
@@ -42155,7 +42311,6 @@ mod deleg_windows_tests {
     /// be committed, so 8:2 and 8:3 (behind it in the stream) cannot have
     /// been acknowledged.
     #[test]
-    #[ignore = "known gap: a sealed tail's row whose dependency was lost is appended; see delegations.md"]
     fn a_sealed_tail_never_appends_a_row_whose_dependency_was_lost() {
         let mut h = Harness::new(1);
         h.core.cfg.delegation = true;

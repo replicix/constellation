@@ -838,6 +838,14 @@ pub fn deleg_backup_core_config(node_id: NodeId, incarnation: u32) -> Config {
     backup_core_config(node_id, incarnation)
 }
 
+/// The backup configuration with at most one backed generation per node
+/// (`delegation_backed_gens_max`): `delegated-two-gens-one-backed`.
+pub fn deleg_one_backed_gen_core_config(node_id: NodeId, incarnation: u32) -> Config {
+    let mut c = deleg_backup_core_config(node_id, incarnation);
+    c.delegation_backed_gens_max = 1;
+    c
+}
+
 /// Plan 30 §M9: `ack=s3` — no backups, every acknowledgement waits for
 /// the segment, fast takeover on holder silence.
 pub fn ack_s3_core_config(node_id: NodeId, incarnation: u32) -> Config {

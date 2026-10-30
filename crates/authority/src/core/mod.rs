@@ -302,6 +302,12 @@ pub struct Config {
     pub backup_rtt_budget_ms: u64,
     /// `CONSTELLATION_BACKUPS` (default 1): at most this many backups.
     pub backups_max: usize,
+    /// At most this many of the generations a node delegates pick a backup
+    /// (the lowest first; the others' group is the delegate and the root).
+    /// Unlimited in production; the simulation's
+    /// `delegated-two-gens-one-backed` gives one node a backed generation
+    /// beside an unbacked one.
+    pub delegation_backed_gens_max: usize,
     /// Appends in flight per backup (pipelined; acknowledged
     /// cumulatively by journal position). Rows journaled while every
     /// slot is taken ride the next append: the group commit.
@@ -641,6 +647,7 @@ impl Config {
             ack_s3: false,
             backup_rtt_budget_ms: 5,
             backups_max: 1,
+            delegation_backed_gens_max: usize::MAX,
             backup_max_inflight: 8,
             stream_ahead_holdoff_ms: 5,
             backup_ack_timeout_ms: 1_000,
@@ -927,11 +934,30 @@ pub struct Stats {
     /// Root: delegate rows not appended, a dependency lost with its
     /// generation.
     pub deleg_append_deps_lost: u64,
+    /// Root: a sealed tail's drain stopped at a row whose dependency it
+    /// does not hold yet (another generation of the dead delegate).
+    pub deleg_drain_deps_waits: u64,
     pub deleg_streamed_txs: u64,
     pub deleg_stream_refused: u64,
     /// Delegate: stream acknowledgements that took none of the batch (the
     /// root lacks, or lost, a dependency): the stream backs off.
     pub deleg_stream_no_progress: u64,
+    /// Delegate: times a generation's committed prefix was held below its
+    /// group's by a dependency on another generation's uncommitted row,
+    /// their total and longest duration (the acknowledgement rule's cost).
+    pub deleg_xgen_holds: u64,
+    pub deleg_xgen_hold_ms: u64,
+    pub deleg_xgen_hold_max_ms: u64,
+    /// Delegate: parked acknowledgements whose row its own group held but
+    /// that waited for another generation's row, how long in all and at
+    /// most (from when the own group held it to the release).
+    pub deleg_xgen_acks_delayed: u64,
+    pub deleg_xgen_ack_delay_ms: u64,
+    pub deleg_xgen_ack_delay_max_ms: u64,
+    /// Delegate: parked acknowledgements of a delegated row released, and
+    /// how long they waited in all (the base the delay compares with).
+    pub deleg_stream_acks_released: u64,
+    pub deleg_stream_ack_wait_ms: u64,
     pub deleg_renewals: u64,
     pub deleg_renewals_refused: u64,
     /// Root: first renewals of a generation that waited for the root's

@@ -2404,6 +2404,13 @@ relay of its own so requests can be attributed per role):
       mid-burst; the root seals the backup (`seals_sent`), drains its
       tail (`sealed_drained`), ends the generation and delegates `d1` to
       `c`, which writes locally; `b` remounts and converges.
+    - `two-gens-ack-cost` (ADR-39's cost): `b` holds `/d1` whole and range
+      0/2 of `/d2`, both backed by `c`; four threads on `b` create files in
+      both at once, then in `/d1` only. Prints the create latencies and the
+      acknowledgements that waited for the other generation
+      (`xgen_acks_delayed`, `xgen_ack_delay_ms`); with `CONSTELLATION_BIN`
+      pointing at a binary without the rule it gives the comparison. It
+      asserts nothing beyond the setup.
     - The K5a fix round's delegation findings (`delegroot.rs`): two
       nodes, `a` the root and `b` the delegate of `/d1` writing,
       `fsync`ing and closing files there; production timings (60 s

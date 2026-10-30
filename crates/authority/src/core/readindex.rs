@@ -1684,6 +1684,31 @@ impl Core {
             })
             .map(|(id, _)| *id)
             .collect();
+        // The acknowledgement rule's measurement: since when each parked
+        // acknowledgement has waited only for another generation's row.
+        if self.cfg.delegation && !self.dl.mine.is_empty() {
+            for (id, p) in &self.rd.parked {
+                if let Some((g, i)) = p.stream_need {
+                    if cache.xgen_held(g, i) {
+                        self.dl.xgen_held_at.entry(*id).or_insert(now.wait);
+                    }
+                }
+            }
+        }
+        for id in &ready {
+            if let Some(since) = self.dl.xgen_held_at.remove(id) {
+                let ms = now.wait.since(since).max(0) as u64;
+                self.stats.deleg_xgen_acks_delayed += 1;
+                self.stats.deleg_xgen_ack_delay_ms += ms;
+                self.stats.deleg_xgen_ack_delay_max_ms =
+                    self.stats.deleg_xgen_ack_delay_max_ms.max(ms);
+            }
+        }
+        for id in &dropped {
+            self.dl.xgen_held_at.remove(id);
+        }
+        let parked = &self.rd.parked;
+        self.dl.xgen_held_at.retain(|id, _| parked.contains_key(id));
         // Plan 43 C2 (D7): a row that left the journal without the log
         // carrying it was dropped; its acknowledgement is never given.
         for id in dropped {
@@ -1706,6 +1731,10 @@ impl Core {
                 }
             }
             let waited = now.wait.since(p.since).max(0) as u64;
+            if p.stream_need.is_some() {
+                self.stats.deleg_stream_acks_released += 1;
+                self.stats.deleg_stream_ack_wait_ms += waited;
+            }
             // Plan 43 C1-2 (D4): a gated answer released because the gate
             // went off (the group is gone and no peer is eligible, or an
             // epoch hold took over), not because the row is committed, is

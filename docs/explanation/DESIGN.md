@@ -885,7 +885,13 @@ lease and one log
   acknowledgement needs the members of both versions, and a backup leaves
   the record only once every index acknowledged through it is at or below
   the root's cursor or in the log (the transposition of the lease's
-  add-then-record and remove-when-covered rules). The class of an answer
+  add-then-record and remove-when-covered rules). A node that holds
+  several generations acknowledges a row only once the row's dependencies
+  on its other generations are committed too, so no acknowledged row rests
+  on a row another generation ended without, and a generation ends before
+  the first row with such a lost dependency
+  ([ADR-39](DECISIONS.md#adr-39-a-delegates-group-acknowledgement-waits-for-the-rows-dependencies-on-its-other-generations)).
+  The class of an answer
   is fixed when the row is journaled, and a retry of a rid whose row is
   still uncommitted waits for the row like the first answer did. The one
   speculation place is a *lone* delegate — no recorded backup and no peer,

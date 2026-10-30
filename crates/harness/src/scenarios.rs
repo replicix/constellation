@@ -1504,6 +1504,13 @@ pub const SCENARIOS: &[Scenario] = &[
         run: m11::delegate_crash_with_backup,
     },
     Scenario {
+        name: "two-gens-ack-cost",
+        desc: "ADR-39's cost: b holds /d1 whole and range 0/2 of /d2, both backed by c, and four threads on b create files in both at once, then in /d1 only; prints the create latencies and the acknowledgements that waited for the other generation (run with CONSTELLATION_BIN for a binary without the rule)",
+        requires: &[],
+        caps: &[],
+        run: m11::two_gens_ack_cost,
+    },
+    Scenario {
         name: "delegate-root-loss",
         desc: "two nodes, b the root's backup and the delegate of /d1, writing and fsyncing \
                there; the root is kill -9ed: b takes the root over and no write + fsync waits \

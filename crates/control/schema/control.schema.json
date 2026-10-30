@@ -1386,6 +1386,11 @@
           "minimum": 0,
           "type": "integer"
         },
+        "append_deps_lost": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "appended_txs": {
           "format": "uint64",
           "minimum": 0,
@@ -1463,6 +1468,11 @@
           "type": "integer"
         },
         "designated": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "drain_deps_waits": {
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -1629,6 +1639,12 @@
         "last_silent_gen": {
           "default": 0,
           "description": "The generation of the latest of those.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lost_deps_stopped": {
+          "description": "Generations stopped before a row whose dependency was lost with\nanother generation; rows the root did not append for such a\ndependency (a stream's or a sealed tail's); stops of a sealed\ntail's drain at a dependency the root did not hold yet.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -1925,6 +1941,22 @@
             "$ref": "#/$defs/WaitingGenerationStatus"
           },
           "type": "array"
+        },
+        "xgen_ack_delay_max_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "xgen_ack_delay_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "xgen_acks_delayed": {
+          "description": "Acknowledgements whose row its own group held but that waited for a\nrow of another generation this node delegates (a `DelegGroup`\nacknowledgement waits for the row's dependencies on the node's other\ngenerations), with the total and the longest of those waits in ms.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
@@ -1974,6 +2006,12 @@
         "backup_appends",
         "backup_acks",
         "acks_parked",
+        "xgen_acks_delayed",
+        "xgen_ack_delay_ms",
+        "xgen_ack_delay_max_ms",
+        "lost_deps_stopped",
+        "append_deps_lost",
+        "drain_deps_waits",
         "backup_persisted",
         "backup_seals",
         "place_evaluations",
