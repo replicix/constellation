@@ -9568,8 +9568,9 @@ const SLOW_READS: sim::store::SlowReads = sim::store::SlowReads {
 /// held back 800 to 1,000 ms after they are served (`SimConfig::lease_reads`):
 /// a node acts on a lease read that may be older than what it, or anyone,
 /// wrote since. The holder adopted such a read of its own tenure over the
-/// reconfiguration it had just landed (seed 458: an acknowledgement lost).
-/// `slow_lease_reads_are_dated_as_served`.
+/// reconfiguration it had just landed (seed 458: an acknowledgement lost), and
+/// a late read for an op routed it again after it had executed (seed 671: a
+/// refusal answered, the op landed after). `slow_lease_reads_are_dated_as_served`.
 fn locks_core_stall_backup_long_slow_lease_config() -> SimConfig {
     SimConfig {
         lease_reads: SLOW_LEASE_READS,
@@ -12286,11 +12287,17 @@ fn a_proof_dated_at_the_return_of_the_read_is_caught() {
 /// reconfiguration (listing a backup) landed and answered after; adopted, it
 /// set the backup set back to none, the root acknowledged an unlink on its
 /// own disk alone, and the listed backup sealed the tenure and took over
-/// without it (returned success, 0 times in the log). It fails before the fix
-/// (the held body is not set back by an older read, `LeaseState::renewed`).
+/// without it (returned success, 0 times in the log). Seed 671: a holder read
+/// for an op came back after the op had gone in doubt, been resubmitted,
+/// executed (refused `EEXIST`) and parked for its answer's durability; it
+/// routed the op to the lease path, which executed it again once the name
+/// was gone (refused, 1 time in the log). 891 and 1088 are the second, with
+/// `ENOENT` and `EEXIST`. All four fail before the fix (the held body is
+/// not set back by an older read, `LeaseState::renewed`; a late holder read
+/// routes only an op still waiting for it, `Core::on_holder_learned`).
 #[test]
 fn slow_lease_reads_are_dated_as_served() {
-    for seed in [458u64] {
+    for seed in [458u64, 671, 891, 1088] {
         run_seed(seed, locks_core_stall_backup_long_slow_lease_config())
             .unwrap_or_else(|e| panic!("locks-core-stall-backup-long-slow-lease seed {seed}: {e}"));
     }

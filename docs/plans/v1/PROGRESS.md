@@ -61566,3 +61566,63 @@ every `delegated-*` configuration and `long-delegated-backup` (seeds 0 to 1681 a
 for 100 seeds) still fail on the core-stall check, not the oracle. `long-delegated-lead` held an own op back for the
 gated mark alone 14 times in 2,000 seeds (the non-vacuity of the hysteresis); the simulation cannot provoke a `Lone`
 decision made `DelegGroup` at the journaling.
+
+## Two integrity bugs found with slow lease reads: an acknowledgement lost, a refusal that landed (2026-10-30)
+
+The sim's lease GETs could be held back before they were served (`probe_reads`, root probe only). New: `SimConfig::lease_reads`
+holds back the lease GETs of **every** node's handle for 800 to 1,000 ms after they are served, so a node acts on a read that is
+older than what it or anyone wrote since (`AUTHORITY_SIM_LEASE_READS=0:0:800:1000` for any configuration;
+`locks-core-stall-backup-long-slow-lease` and `backup-slow-lease` are the named ones). The first sweeps found two bugs, both
+product code, both fixed here.
+
+### What was wrong
+
+1. **A read older than the held body was adopted** (`locks-core-stall-backup-long-slow-lease` seed 458). A holder can have two CASes
+   out at once, a renewal and a reconfiguration. A re-read of the lease object served before the reconfiguration landed and handled
+   after it was adopted by `LeaseState::renewed`; it set the backup set back to none. The root acknowledged an unlink on its own
+   disk alone, and the backup the landed version listed sealed the tenure and took over without it: `returned success but completed
+   0 times in the log`. Now a body of the held tenure at an older `config_version` is never adopted (`is_older_than_held`); the three
+   places that read the object after a CAS that lost (the renewal re-read, the reconfiguration re-read, the clear-mark re-read) read
+   again instead. Versions only grow in S3, so the held body is never older than what S3 holds.
+2. **A late holder read routed an op that was no longer waiting for it** (seeds 671, 891, 1088: `refused (Enoent/Eexist) but
+   completed 1 times in the log`). An op's holder read came back after the op had gone in doubt at its deadline, been resubmitted by
+   rid, executed (refused) and parked for its answer's durability. `on_holder_learned` routed it again by the late read, it took the
+   lease path and executed a second time, not in doubt, and the client heard the first outcome while the log carried the second.
+   Now only an op still in `Phase::LearnHolder` is routed by the read.
+
+### Fail-before
+
+`slow_lease_reads_are_dated_as_served` pins 458, 671, 891 and 1088 on `locks-core-stall-backup-long-slow-lease`. With the first
+fix reverted (the second kept) 458 fails and 671, 891, 1088 pass; with the second reverted 671, 891 and 1088 fail and 458 passes;
+with both reverted all four fail. The unit test `an_older_read_of_the_tenure_does_not_set_the_held_body_back` fails without the
+guard in `renewed`.
+
+### Sweeps, seeds 0 to 1,999 (release; patched against origin/main with the same sim knob and no fixes)
+
+`locks-failover`, `long-backup` and 33 `delegated-*` / `long-delegated-*` configurations (35 in all; 3 of them, `-root-backup-unprobed`,
+`-root-unlaned` and `-stall-unlaned`, are controls built to fail: 2,000 each, every time).
+
+- **Without the knob**: patched and main fail the same seeds. `long-backup` seed 1063 (both) and `long-delegated-backup` seed 1682
+  and `delegated-root-rate-fast` (a seed each does not finish in the 25 minutes the sweep was given, both; the rest of
+  `long-delegated-backup` is clean in 250-seed pieces) are on main; nothing else.
+- **With the knob**: no seed fails with the fixes that does not fail without them. Fewer fail with them: `delegated-holder-cut` 1
+  against 5, `long-delegated-backup` 0 against 2, `long-delegated-late-answers` 2 against 4, `delegated-root-rate-fast` 0 against 1.
+  Failing on both, left open: `long-backup` 586, `delegated-holder-cut` 1240 and `long-delegated-late-answers` (2 seeds), each
+  an order violation in the history (a success that returned before another op was invoked follows it in the log, or the node's
+  program order is broken); and `delegated-core-stall-root-backup` 249 (`a delegation whose root core was stuck below the hung
+  bound was lost`): a probe read that takes 800 to 1,000 ms misses the 1 s window, a liveness result of the root probe (D3), not a
+  lost write.
+
+### Looked at, not integrity
+
+- `locks-core-stall-backup-long` seed 1838 with the knob (`Control::LockIdle` unanswered): the same as seed 946, which fails on
+  main without the knob. It needs the clock faults (off, it passes), and passes with the sim's 10 s wait for the answer made 120 s,
+  so the answer comes late, it is not lost. Fails identically on main with the knob.
+- `backup` seeds 562 and 1643 with the knob run very long (562 past 10 minutes, 1643 about 90 s) on main and with the fixes alike. The
+  time is the generic linearizability tester (`check_linearizable`, exponential in overlapping ops); with it skipped both finish at once.
+  Not a hang of the product.
+
+### Gates
+
+`cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean. Lib tests: authority 775, engine 935,
+harness 162 (no failures). `cargo test -p constellation-authority --release --test sim`: 277 passed (11 ignored).

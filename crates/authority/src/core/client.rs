@@ -1012,7 +1012,20 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        if !self.clients.contains_key(&rid) {
+        // Only an op still waiting for this read is routed by it. The read
+        // may come back long after it was sent (the response held up on
+        // its way), the op meanwhile answered in doubt at its deadline and
+        // resubmitted by rid, executed here and parked for its answer's
+        // durability: routed again by the late read, it took the lease path
+        // and executed a second time, not in doubt (`completed` was not
+        // asked), and the client heard the first outcome while the log
+        // carried the second (`locks-core-stall-backup-long-slow-lease`
+        // seed 671: refused `EEXIST`, then created once the name was gone).
+        if !self
+            .clients
+            .get(&rid)
+            .is_some_and(|c| c.phase == Phase::LearnHolder)
+        {
             return;
         }
         let object = match result {
