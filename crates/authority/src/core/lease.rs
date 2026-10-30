@@ -779,10 +779,20 @@ impl LeaseState {
         self.held_gen
     }
 
-    /// A lease read of this tenure at an older `config_version` than the
-    /// held one, answered for a read issued at `issued_gen` of
+    /// A lease read of this tenure that is not the held version and cannot
+    /// be told newer than it, answered for a read issued at `issued_gen` of
     /// [`Self::held_gen`]: `true` when it is a read served before a CAS of
     /// ours that landed, to be asked for again (see [`Self::renewed`]).
+    ///
+    /// - An older `config_version` than the held one is such a read, if it
+    ///   was issued before the held body was taken.
+    /// - So is the held `config_version` under another tag: a renewal of
+    ///   ours (same version, its own tag) may have landed since, and the read
+    ///   shows the object as it was before it. Adopted, it would set the
+    ///   held tag back to a version S3 no longer has, and settle a
+    ///   reconfiguration in doubt (`LeaseState::reconfig_doubt`) on a
+    ///   sighting that predates the CAS in doubt. Only a read sent after
+    ///   the held body was taken shows that the object moved on from it.
     ///
     /// A read issued at the current count was sent after the held body was
     /// taken: S3 held that version (or a newer one) when it was served, so
@@ -792,7 +802,7 @@ impl LeaseState {
     /// would never end.
     pub fn older_read(&mut self, now: Now, lease: &Lease, tag: &LeaseTag, issued_gen: u64) -> bool {
         if !self.is_older_than_held(lease) {
-            return false;
+            return issued_gen != self.held_gen && self.is_sibling_of_held(lease, tag);
         }
         if issued_gen != self.held_gen {
             return true;
@@ -804,6 +814,18 @@ impl LeaseState {
         );
         self.renewed_unchecked(now, lease.clone(), tag.clone());
         false
+    }
+
+    /// Whether `lease` is of the held tenure and version under another tag
+    /// than the held one: a renewal of the held version, or the held version
+    /// before one (which of the two a read shows is not told by its body).
+    fn is_sibling_of_held(&self, lease: &Lease, tag: &LeaseTag) -> bool {
+        self.held.as_ref().is_some_and(|(h, t)| {
+            h.holder == lease.holder
+                && h.epoch == lease.epoch
+                && h.config_version == lease.config_version
+                && t != tag
+        })
     }
 
     /// Whether `lease` is a body of the held tenure older than the held one
@@ -1211,6 +1233,45 @@ mod tests {
         assert!(!st.older_read(now, &v5, &tag2(), st.held_gen()));
     }
 
+    /// A read of the held version (the same `config_version`) under another
+    /// tag that was sent before the held body was taken was perhaps served
+    /// before a renewal of ours landed: it is asked for again, not adopted,
+    /// and it settles no reconfiguration in doubt. One sent after the held
+    /// body was taken shows a version S3 has moved on to, and settles it.
+    #[test]
+    fn a_stale_read_of_the_held_version_under_another_tag_settles_nothing() {
+        let cfg = cfg();
+        let now = Now::same(1_000_000);
+        let mut st = LeaseState::default();
+        let v4 = st.granted_lease(now, &cfg, None, false);
+        st.adopt(now, v4.clone(), tag(), None);
+        // A read goes out; then a renewal of ours lands (same version, its
+        // own tag), and a reconfiguration CAS conditioned on that tag is lost.
+        let sent_at = st.held_gen();
+        let mut renewed = v4.clone();
+        renewed.holder_wait_ms += 1_000;
+        st.renewed(now, renewed.clone(), tag2());
+        st.reconfig_doubt = Some(ReconfigDoubt::default());
+        // The read comes back with the object as it was before the renewal.
+        assert!(
+            st.older_read(now, &v4, &tag(), sent_at),
+            "a read sent before the held body was taken is asked for again"
+        );
+        assert_eq!(st.held.as_ref().unwrap().1, tag2(), "the held tag stands");
+        assert_eq!(st.held.as_ref().unwrap().0, renewed);
+        assert!(st.reconfig_doubt.is_some(), "the doubt stands");
+        // Asked again after the held body was taken: another tag settles.
+        assert!(!st.older_read(now, &v4, &tag(), st.held_gen()));
+        st.renewed(now, v4.clone(), tag());
+        assert!(st.reconfig_doubt.is_none());
+        // The held tag itself is never "stale".
+        let mut st = LeaseState::default();
+        st.adopt(now, v4.clone(), tag(), None);
+        let sent_at = st.held_gen();
+        st.renewed(now, v4.clone(), tag2());
+        assert!(!st.older_read(now, &v4, &tag2(), sent_at));
+    }
+
     #[test]
     fn classify_mirrors_the_keeper() {
         let cfg = cfg();
@@ -1555,6 +1616,44 @@ mod tests {
         ));
     }
 
+    /// The first `Busy` of a non-backup's look at a `Backup` lease names the
+    /// instant its claim can first be made: the TTL and the backups' grace
+    /// (not the TTL alone, at which the retry would find the lease `Busy`
+    /// again and cost another read and ask). A listed backup claims at the
+    /// TTL.
+    #[test]
+    fn a_non_backups_first_busy_retries_when_the_grace_is_over() {
+        let cfg = cfg();
+        let t0 = Now::same(1_000_000);
+        let mut body = foreign(&cfg, t0, 10_000);
+        body.ack_policy = AckPolicy::Backup;
+        body.backups = vec![4];
+        let obj = (body.clone(), tag());
+        let mut st = LeaseState::default();
+        st.observe(t0, Some(&obj));
+        let grace = backup_claim_grace_ms(&cfg) as u64;
+        let soon = t0.plus(1);
+        assert_eq!(
+            busy_retry(st.classify(soon, &cfg, Some(obj.clone()), 0)),
+            Some(t0.wait.plus(10_000 + grace)),
+            "a non-backup's claim is due after the grace"
+        );
+        assert_eq!(
+            st.claim_due(&cfg),
+            Some(t0.wait.plus(10_000 + grace)),
+            "the same instant `claim_due` names"
+        );
+        // This node is a listed backup: no grace.
+        body.backups = vec![cfg.node_id];
+        let obj = (body, tag());
+        let mut st = LeaseState::default();
+        st.observe(t0, Some(&obj));
+        assert_eq!(
+            busy_retry(st.classify(soon, &cfg, Some(obj), 0)),
+            Some(t0.wait.plus(10_000))
+        );
+    }
+
     /// Under `ack=s3` the permit's "no renewal for `backup_takeover_ms`" is
     /// this node's own observation of the key: a renewal restarts it.
     #[test]
@@ -1616,44 +1715,6 @@ mod tests {
     /// port narrowed it to a lease the wall read as live, and a forward step
     /// of the wall (or a restart after the expiry) re-claimed it without the
     /// gate. A tracked lease is `Held` while live, as before; one the wall
-    /// The first `Busy` of a non-backup's look at a `Backup` lease names the
-    /// instant its claim can first be made: the TTL and the backups' grace
-    /// (not the TTL alone, at which the retry would find the lease `Busy`
-    /// again and cost another read and ask). A listed backup claims at the
-    /// TTL.
-    #[test]
-    fn a_non_backups_first_busy_retries_when_the_grace_is_over() {
-        let cfg = cfg();
-        let t0 = Now::same(1_000_000);
-        let mut body = foreign(&cfg, t0, 10_000);
-        body.ack_policy = AckPolicy::Backup;
-        body.backups = vec![4];
-        let obj = (body.clone(), tag());
-        let mut st = LeaseState::default();
-        st.observe(t0, Some(&obj));
-        let grace = backup_claim_grace_ms(&cfg) as u64;
-        let soon = t0.plus(1);
-        assert_eq!(
-            busy_retry(st.classify(soon, &cfg, Some(obj.clone()), 0)),
-            Some(t0.wait.plus(10_000 + grace)),
-            "a non-backup's claim is due after the grace"
-        );
-        assert_eq!(
-            st.claim_due(&cfg),
-            Some(t0.wait.plus(10_000 + grace)),
-            "the same instant `claim_due` names"
-        );
-        // This node is a listed backup: no grace.
-        body.backups = vec![cfg.node_id];
-        let obj = (body, tag());
-        let mut st = LeaseState::default();
-        st.observe(t0, Some(&obj));
-        assert_eq!(
-            busy_retry(st.classify(soon, &cfg, Some(obj), 0)),
-            Some(t0.wait.plus(10_000))
-        );
-    }
-
     /// reads as expired while tracked takes the generic path, as before.
     /// Fails before: `takeover: false, marker: false` for the expired one.
     #[test]

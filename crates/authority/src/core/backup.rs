@@ -595,6 +595,8 @@ pub(crate) struct AckState {
     pub s3_rtt_ms: u64,
     /// The `MarkGranting` CAS in flight.
     marking: Option<OpId>,
+    /// `LeaseState::held_gen` when the re-read of `marking`'s loss was sent.
+    marking_gen: u64,
     /// The body that CAS carries: its answer adopts this one, never one
     /// built from what is held by then (a renewal may have been adopted
     /// since: `LeaseState::advances_held`).
@@ -2041,12 +2043,19 @@ impl Core {
                 }
             }
             S3Result::LeasePut(Err(crate::event::CasFailure::Conflict)) => {
-                let op = self.issue_s3(S3Op::LeaseGet, S3For::MarkGrantingReread, out);
-                self.ack.marking = Some(op);
+                self.issue_mark_reread(out);
             }
             _ => {}
         }
         let _ = replica;
+    }
+
+    /// Read the lease to settle a `MarkGranting` that lost (`marking` is the
+    /// read).
+    fn issue_mark_reread(&mut self, out: &mut Vec<Action>) {
+        let op = self.issue_s3(S3Op::LeaseGet, S3For::MarkGrantingReread, out);
+        self.ack.marking = Some(op);
+        self.ack.marking_gen = self.lease.held_gen();
     }
 
     pub(crate) fn on_mark_granting_reread(
@@ -2061,6 +2070,16 @@ impl Core {
             return;
         };
         match result {
+            // Served before a CAS of ours that landed (a renewal beside the
+            // mark): it says nothing of the object now. Read again
+            // (`LeaseState::older_read`).
+            S3Result::LeaseGet(Ok(Some((cur, tag))))
+                if cur.holder == self.cfg.node_id
+                    && cur.epoch == mine.epoch
+                    && self.lease.older_read(now, &cur, &tag, self.ack.marking_gen) =>
+            {
+                self.issue_mark_reread(out);
+            }
             S3Result::LeaseGet(Ok(Some((cur, tag))))
                 if cur.holder == self.cfg.node_id && cur.epoch == mine.epoch =>
             {

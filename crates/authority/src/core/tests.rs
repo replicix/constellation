@@ -45028,6 +45028,50 @@ fn a_reconfig_re_read_does_not_cas_beside_a_renewal_that_is_out() {
 
 // ---- follow-ups of the takeover of a dead holder and the lease reads ----
 
+/// A mark CAS that lost to a renewal re-reads the object; the read was
+/// served before a renewal of ours landed (same version, its own tag) and
+/// answered after a reconfiguration CAS conditioned on that renewal was
+/// lost. It says nothing of the reconfiguration: it must neither set the
+/// held tag back to the renewed-over one nor settle the doubt, which made
+/// acknowledgements rest on the old backup set. It is asked for again.
+#[test]
+fn a_mark_re_read_served_before_a_renewal_settles_no_reconfig_doubt() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    h.core.lease.held.as_mut().unwrap().0.granted_delegations = false;
+    let before = h.core.lease.held.as_ref().unwrap().0.clone();
+    let mut out = Vec::new();
+    h.core.ensure_granting_marked(&mut out);
+    let (mark, _) = swap_in(&out).expect("the mark CAS");
+    let out = h.step(Event::S3 {
+        op: mark,
+        result: S3Result::LeasePut(Err(CasFailure::Conflict)),
+    });
+    let reread = get_in(&out).expect("the mark CAS re-reads");
+    // A renewal of ours lands meanwhile, and a reconfiguration CAS
+    // conditioned on it is answered lost.
+    let mut renewed = before.clone();
+    renewed.holder_wait_ms += 1_000;
+    h.core.lease.renewed(h.clk(), renewed.clone(), tag2());
+    h.core.lease.reconfig_doubt = Some(crate::core::lease::ReconfigDoubt {
+        backups: vec![2],
+        sets: vec![vec![2]],
+        unmarked_sealable: true,
+    });
+    let out = h.step(Event::S3 {
+        op: reread,
+        result: S3Result::LeaseGet(Ok(Some((before, tag())))),
+    });
+    let (held, held_tag) = h.core.lease.held.clone().unwrap();
+    assert_eq!(held_tag, tag2(), "the held tag was set back");
+    assert_eq!(held, renewed, "the held body was set back");
+    assert!(
+        h.core.lease.reconfig_doubt.is_some(),
+        "a read served before the renewal settled the doubt"
+    );
+    assert!(get_in(&out).is_some(), "asked for again: {out:?}");
+}
+
 /// A node whose own S3 is stalled does not skip the forward to a live
 /// holder because the holder's claim has fallen due: the claim it would
 /// make needs S3. (Plan 43 C7b's claim-due retry goes to the lease path
