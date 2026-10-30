@@ -61972,3 +61972,28 @@ pass on both; `locks-core-stall-backup-long-slow-lease` fails seed 946 (lock fai
 with the follow-ups and 0.04 s on main: the schedule differs after the first divergence, and the time is the generic
 linearizability tester after the run (as the slow-lease sweeps' note on seeds 562 and 1643; it passes). `takeover-marker-strands-promptly`
 ×3 in the harness at a box load of 38: passed, the shadow stranded 3 to 254 ms after B's refused op.
+## A delegate that knew no root read the lease after every event (long-delegated-backup seed 1682, 2026-10-30)
+
+`long-delegated-backup` seed 1682 never finished: its memory passed 6 GB in 18 s of wall time (9 GB in the first report), on main
+and patched builds alike. A product request loop, not the checker. Node 2, the delegate of generation 1, took the root lease over
+from the dead root; while its takeover's gate waited out the read-delegation quarantine, its own lease named it, and `root_node()`
+leaves this node out, so it knew no root to stream to. `deleg_stream` runs after every event (`deleg_after_event`) and read the
+lease (`RefreshHolder`) each time it found no root; the read's answer is an event too, so each read issued the next, and every
+other event meanwhile started one more such chain. Node 2's S3 requests in flight passed 250,000 by 23.6 simulated seconds, and
+simulated time slowed to a few milliseconds a wall second. `deleg_renew_now`'s read had the same shape.
+
+- Both go through `Core::deleg_learn_root`, which reads the lease at most once a delegation stream tick; the stream tick and the
+  renewal timer, which retry at that pace already, bring the next read. A root learned any other way is used at once.
+- The simulation driver fails a run whose core has more than 10,000 S3 requests in flight (`Core::container_sizes` reports
+  `s3_in_flight`): a request loop ends the run within seconds instead of exhausting memory. Seed 1682 joins
+  `regression_long_delegated_backup_seeds`.
+
+Tests that failed before: `a_delegate_without_a_root_reads_the_lease_once_a_tick` (a chain of lease reads without end within one
+millisecond), and `regression_long_delegated_backup_seeds` with the bound (node 2 past 10,000 S3 requests in flight, the run
+failed after 16 s at 50 MB). After: the seed passes in 0.14 s at 17 MB. Mutation: the pacing check disabled fails the unit test.
+
+### Gates
+
+fmt and clippy (authority, all targets, `-D warnings`) clean. Lib tests: authority 816 passed (2 ignored). Release sim suite: 286
+passed (11 ignored). Sweeps, from seed 1000: `long-delegated-backup` 2,000 seeds (1682 among them), `long-delegated` 1,000 and
+`delegated-backup` 1,000: no failures.
