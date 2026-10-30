@@ -195,6 +195,19 @@ pub struct Bucket {
     rules: Mutex<Vec<Rule>>,
     cut: Mutex<HashSet<u64>>,
     counts: Mutex<Counts>,
+    /// Plan 41 D3 review: lane answers decided on the root's own proof of
+    /// liveness after the lease object already named a successor
+    /// (`node::note_probe_race`): the race the send-time dating exists for.
+    pub probe_races: std::sync::atomic::AtomicU64,
+    /// Plan 41 D3 review, the probe-dating oracle: when each tenure `(holder,
+    /// epoch)` was taken over (the instant the CAS that replaced it landed),
+    /// and the lane answers decided on the root's own proof a freshness
+    /// window or more after it (`node::note_probe_race`). A proof dated at
+    /// its read's send cannot justify one: the read was served before the
+    /// CAS, so the send precedes it, and the proof is good for one window
+    /// from the send.
+    taken_over: Mutex<std::collections::HashMap<(u64, u64), tokio::time::Instant>>,
+    pub probe_late: Mutex<Vec<String>>,
 }
 
 impl Bucket {
@@ -208,6 +221,9 @@ impl Bucket {
             rules: Mutex::new(Vec::new()),
             cut: Mutex::new(HashSet::new()),
             counts: Mutex::new(Counts::default()),
+            probe_races: std::sync::atomic::AtomicU64::new(0),
+            taken_over: Mutex::new(std::collections::HashMap::new()),
+            probe_late: Mutex::new(Vec::new()),
         })
     }
 
@@ -257,7 +273,19 @@ impl Bucket {
         if let Some(prev) = prev {
             let hook = self.lease_hook.lock().unwrap().clone();
             let body: bytes::Bytes = payload.clone().into();
-            if let (Some(hook), Ok(new)) = (hook, serde_json::from_slice(&body)) {
+            if let (Some(hook), Ok(new)) = (
+                hook,
+                serde_json::from_slice::<constellation_store_s3::Lease>(&body),
+            ) {
+                if let Some(old) = &prev {
+                    if old.holder != new.holder || old.epoch != new.epoch {
+                        self.taken_over
+                            .lock()
+                            .unwrap()
+                            .entry((old.holder, old.epoch))
+                            .or_insert_with(tokio::time::Instant::now);
+                    }
+                }
                 hook(node, prev, new);
             }
         }
@@ -272,11 +300,44 @@ impl Bucket {
         }
     }
 
+    /// How long ago the tenure `(holder, epoch)` was taken over, if it was.
+    pub fn since_takeover(&self, holder: u64, epoch: u64) -> Option<Duration> {
+        self.taken_over
+            .lock()
+            .unwrap()
+            .get(&(holder, epoch))
+            .map(|t| t.elapsed())
+    }
+
     pub fn handle(self: &Arc<Self>, node: u64) -> Arc<dyn ObjectStore> {
         Arc::new(NodeStore {
             bucket: self.clone(),
             node,
+            reads: SlowReads::default(),
         })
+    }
+
+    /// A handle for `node`'s root probe, whose GETs are slower than the
+    /// bucket's by `reads`: held up before they are served, and, once
+    /// served, held back on their way to the caller (plan 41 D3 review).
+    pub fn probe_handle(self: &Arc<Self>, node: u64, reads: SlowReads) -> Arc<dyn ObjectStore> {
+        Arc::new(NodeStore {
+            bucket: self.clone(),
+            node,
+            reads,
+        })
+    }
+
+    fn draw(&self, (lo, hi): (u64, u64)) -> Option<Duration> {
+        if hi == 0 {
+            return None;
+        }
+        let ms = if hi > lo {
+            self.rng.lock().unwrap().random_range(lo..=hi)
+        } else {
+            lo
+        };
+        Some(Duration::from_millis(ms))
     }
 
     pub fn script(&self, rule: Rule) {
@@ -357,10 +418,22 @@ impl Bucket {
     }
 }
 
+/// How much slower than the bucket's latency a handle's GETs are (ms, ranges;
+/// `(0, 0)`: not at all): `before` is added ahead of the request being served,
+/// `reply` holds the response back after it was served. A response carries the
+/// state of the serving instant, whatever has happened to the object since,
+/// which is what makes the time a read is dated at matter (plan 41 D3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SlowReads {
+    pub before: (u64, u64),
+    pub reply: (u64, u64),
+}
+
 /// One node's view of the bucket.
 pub struct NodeStore {
     bucket: Arc<Bucket>,
     node: u64,
+    reads: SlowReads,
 }
 
 impl std::fmt::Debug for NodeStore {
@@ -434,9 +507,19 @@ impl ObjectStore for NodeStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        if let Some(d) = self.bucket.draw(self.reads.before) {
+            tokio::time::sleep(d).await;
+        }
         match self.admit(OpKind::Get, location).await? {
             None | Some(Fault::AppliedThen(_)) | Some(Fault::AppliedThenTimeout) => {
-                self.bucket.inner.get_opts(location, options).await
+                // Served now; the response is on its way back for a while
+                // (the object may change meanwhile, the caller sees the
+                // state of the serving instant).
+                let served = self.bucket.inner.get_opts(location, options).await;
+                if let Some(d) = self.bucket.draw(self.reads.reply) {
+                    tokio::time::sleep(d).await;
+                }
+                served
             }
             Some(Fault::Status(404)) => Err(object_store::Error::NotFound {
                 path: location.to_string(),

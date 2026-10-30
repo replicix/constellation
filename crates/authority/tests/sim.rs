@@ -5307,6 +5307,12 @@ fn sweep_config() {
             locks_core_stall_backup_long_beats_unprobed_config()
         }
         "locks-core-stall-backup-long-blind" => locks_core_stall_backup_long_blind_config(),
+        "locks-core-stall-backup-long-slow-reads" => {
+            locks_core_stall_backup_long_slow_reads_config()
+        }
+        "locks-core-stall-backup-long-dated-at-return" => {
+            locks_core_stall_backup_long_dated_at_return_config()
+        }
         "locks-core-stall-s3" => locks_core_stall_s3_config(),
         "locks-core-stall-writes" => locks_core_stall_writes_config(),
         "locks-core-stall-blips" => locks_core_stall_blips_config(),
@@ -5410,6 +5416,17 @@ fn sweep_config() {
                 .map(|(_, p)| p.unsigned_abs() as u32)
                 .max()
                 .unwrap_or(0);
+        }
+        // Plan 41 D3 review: `AUTHORITY_SIM_PROBE_READS=0:300:200:900` holds
+        // the root probe's lease GETs up by a draw from the first range (ms)
+        // before they are served and their responses back by a draw from the
+        // second after, in any configuration.
+        if let Ok(v) = std::env::var("AUTHORITY_SIM_PROBE_READS") {
+            let n: Vec<u64> = v.split(':').map(|x| x.parse().expect("ms")).collect();
+            c.probe_reads = sim::store::SlowReads {
+                before: (n[0], n[1]),
+                reply: (n[2], n[3]),
+            };
         }
         // Plan 43 C7a (commit 6): `AUTHORITY_SIM_CLOCK_FAULTS=0` leaves the
         // default clock-fault mix out of any configuration (with
@@ -5552,6 +5569,12 @@ fn sweep_config() {
     // (`SWEEP-FAILOVER`).
     let failover_all = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
     let guard_rises = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Plan 41 D3 review: lane answers decided on the root's own proof after
+    // a successor's lease CAS, and the seeds with any (`SWEEP-PROBE-RACES`).
+    let probe_races = std::sync::Arc::new([
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+    ]);
     let guard_base_rises = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     // The lock configurations, per seed `(seed, longest acquisition,
     // longest handoff gap, overtakes, asks, passed over, reserved)`: the
@@ -5577,6 +5600,7 @@ fn sweep_config() {
         let (floors, floor_ms) = (floors.clone(), floor_ms.clone());
         let failover_all = failover_all.clone();
         let guard_rises = guard_rises.clone();
+        let probe_races = probe_races.clone();
         let guard_base_rises = guard_base_rises.clone();
         let superseded = superseded.clone();
         let lock_seeds = lock_seeds.clone();
@@ -5624,6 +5648,8 @@ fn sweep_config() {
                         .unwrap()
                         .extend(report.failover_ms.iter().copied());
                     guard_rises.fetch_add(report.guard_rises, ord);
+                    probe_races[0].fetch_add(report.probe_races, ord);
+                    probe_races[1].fetch_add((report.probe_races > 0) as u64, ord);
                     guard_base_rises.fetch_add(report.guard_base_rises, ord);
                     if report.guard_rises > 0 {
                         eprintln!(
@@ -5876,6 +5902,13 @@ fn sweep_config() {
         lengths.len(),
         guard_rises.load(ord),
         guard_base_rises.load(ord),
+    );
+    eprintln!(
+        "SWEEP-PROBE-RACES {label} seeds {}/{seeds}: {} lane answers rested on the root's own proof \
+         after a successor's lease CAS, in {} seeds",
+        seeds - f.len() as u64,
+        probe_races[0].load(ord),
+        probe_races[1].load(ord),
     );
     assert!(f.is_empty(), "failing seeds: {f:?}");
 }
@@ -6525,9 +6558,9 @@ fn delegated_core_stall_root_backup_unprobed_config() -> SimConfig {
 /// successor's quarantine. Safety only (the oracles judge). The probe's
 /// mutants are not caught here: a delegate learns of a changed tenure from
 /// the log and from its new root, whatever the old root answers (the lock
-/// configurations `locks-core-stall-backup-long-blind` and `-late`, where
-/// the stuck root's own clients hold its grants, are the sim's negative
-/// control).
+/// configurations `locks-core-stall-backup-long-blind` and
+/// `-long-dated-at-return`, where the stuck root's own clients hold its
+/// grants, are the sim's negative controls).
 fn delegated_core_stall_root_sealed_config() -> SimConfig {
     let at = |at_ms, kind| ScheduledFault { at_ms, kind };
     SimConfig {
@@ -9298,6 +9331,58 @@ fn locks_core_stall_backup_long_blind_config() -> SimConfig {
     }
 }
 
+/// Plan 41 D3 review: [`locks_core_stall_backup_long_config`] with the stuck
+/// root's lease reads slow (`SLOW_READS`): held up before they are served, and
+/// the response held back after, so a read served before its backup seals the
+/// root can return after the successor's CAS. The probe gives up on a read at
+/// the window, and a read that is back counts as a proof from its **send**, so
+/// no answer resting on it is decided a window after the takeover (the
+/// probe-dating oracle, `check_probe_dating`). Clock faults are off: the oracle
+/// compares the true time since the takeover with the window, and the
+/// configuration the sweeps of this plan share has an unrelated failure of its
+/// own under them (`locks-core-stall-backup-long` seed 946). The expiry margin
+/// is 100 ms, not the sim's 500: the lane's grants then have more window to
+/// renew in, and four times as many of its answers fall after a takeover.
+fn locks_core_stall_backup_long_slow_reads_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(|node, incarnation| {
+            let mut c = sim::run::backup_core_config(node, incarnation);
+            c.ttl_ms = 30_000;
+            c.expiry_margin_ms = 100;
+            c
+        }),
+        probe_reads: SLOW_READS,
+        check_probe_dating: true,
+        clock_faults: false,
+        ..locks_core_stall_backup_long_config()
+    }
+}
+
+/// [`locks_core_stall_backup_long_slow_reads_config`] with a probe that dates
+/// its proof at the read's return, not at its send: the proof outlives the
+/// window past the successor's takeover by the time the response spent on its
+/// way back, and the stuck root answers on it. Must fail the probe-dating
+/// oracle (`a_proof_dated_at_the_return_of_the_read_is_caught`). Mutual
+/// exclusion does not fail: the successor's floor and the root's caps carry
+/// `3 x expiry margin` beyond the window, and a conflicting request would have
+/// to arrive in the few hundred ms that are left.
+fn locks_core_stall_backup_long_dated_at_return_config() -> SimConfig {
+    SimConfig {
+        root_probe_mutant: sim::run::ProbeMutant::DatedAtReturn,
+        ..locks_core_stall_backup_long_slow_reads_config()
+    }
+}
+
+/// How slow the root probe's lease GETs are in the slow-read configurations
+/// (ms): up to 200 ms more before they are served, and 300 to 900 ms between
+/// being served and returning. The probe gives up on a read at the freshness
+/// window (1 s in these configurations), so a read counts only if the whole
+/// takes less.
+const SLOW_READS: sim::store::SlowReads = sim::store::SlowReads {
+    before: (0, 200),
+    reply: (300, 900),
+};
+
 /// `ack=s3`: a subscriber takes the lease over after the core's silence
 /// (the stream heartbeat is a core timer). Safety only; the lane is not
 /// expected to add anything here.
@@ -11956,6 +12041,66 @@ fn a_probe_that_ignores_what_it_reads_is_caught() {
             "seed {seed}: another failure: {e}"
         );
     }
+}
+
+/// Plan 41 D3 review, the key property of the probe: its proof is dated at
+/// the read's **send**. The stuck root of `locks-core-stall-backup-long`
+/// reads its lease with the read held up before it is served and its response
+/// held back after (`SLOW_READS`), so a read served before its backup seals it
+/// returns after the successor's CAS; a proof dated at the return (`ProbeMutant::DatedAtReturn`)
+/// would justify answers up to a window after that, past the successor's
+/// takeover, and the probe-dating oracle fails the run. Seeds 28, 54, 78 and
+/// 80 of 0 to 1,999 are four of the 40 that fail with the mutant; the design
+/// passes all 2,000. (Mutual exclusion does not fail with the mutant, even in
+/// 22,000 seeds: the successor's floor and the grant caps carry `3 x expiry
+/// margin` beyond the window.)
+#[test]
+fn a_proof_dated_at_the_return_of_the_read_is_caught() {
+    for seed in [28u64, 54, 78, 80] {
+        run_seed(seed, locks_core_stall_backup_long_slow_reads_config())
+            .unwrap_or_else(|e| panic!("locks-core-stall-backup-long-slow-reads seed {seed}: {e}"));
+        let e = run_seed(seed, locks_core_stall_backup_long_dated_at_return_config())
+            .expect_err("locks-core-stall-backup-long-dated-at-return must fail");
+        assert!(
+            e.contains("probe dating violated"),
+            "seed {seed}: another failure: {e}"
+        );
+    }
+}
+
+/// Plan 41 D3 review: the race the send-time dating is for is run, not
+/// assumed. `Report::probe_races` counts the lane answers decided on the
+/// root's own proof (the core's last one stale) after the lease object already
+/// named a successor: the proof's read was served before the successor's CAS
+/// and the answer is decided after it. The original configuration hits it
+/// (`locks-core-stall-backup-long`: 593 answers in 413 of 2,000 seeds;
+/// `locks-core-stall-backup`: 482 in 314), the slow reads add to it (95 in 91
+/// seeds, the answers that would have been past the window with a proof dated
+/// at the return among them), and it is not hit where the beat keeps the
+/// backup from sealing (`-beats`, `-long-beats`: 0) or in the delegation
+/// configurations (`-root-backup`, `-root-sealed`: 0 of 2,000 seeds: a
+/// delegate's renewals are a period apart, and the read, a round at most).
+#[test]
+fn answers_on_a_proof_read_before_the_takeover_are_decided_after_it() {
+    let races = |cfg: fn() -> SimConfig, seeds: std::ops::Range<u64>| -> u64 {
+        seeds
+            .map(|seed| {
+                run_seed(seed, cfg())
+                    .unwrap_or_else(|e| panic!("seed {seed}: {e}"))
+                    .probe_races
+            })
+            .sum()
+    };
+    // (Seed 946 of the first fails on its own: plan 41 D3's open item.)
+    let original = races(locks_core_stall_backup_long_config, 0..100);
+    assert!(
+        original > 0,
+        "the original D3 configuration never hit the race"
+    );
+    let slow = races(locks_core_stall_backup_long_slow_reads_config, 0..100);
+    assert!(slow > 0, "the slow reads never hit the race");
+    let beats = races(locks_core_stall_backup_long_beats_config, 0..20);
+    assert_eq!(beats, 0, "nothing takes over a root whose beat runs");
 }
 
 #[test]

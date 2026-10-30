@@ -3529,7 +3529,22 @@ own clients' grants on the root's read of its lease object (`root_probe`);
 renews them only at the start of each stall (the test compares the lane's renewals: 133 against 39 over 16 seeds; the grants its peers hold of it lapse either way, plan 41 L5); with the beat
 off (`-long-blind`) the backup seals the root and a probe that counts any read
 as a proof (`ProbeMutant::IgnoresVerdict`) renews through the successor's
-grace and must be caught by the ghost.
+grace and must be caught by the ghost. `-long-slow-reads`
+(`a_proof_dated_at_the_return_of_the_read_is_caught`, plan 41 D3 review) holds
+the stuck root's lease reads up before they are served and their responses back
+after (`SimConfig::probe_reads`, `Bucket::probe_handle`; every other request
+keeps `s3_latency`, all of which lies before the request is served): a read
+served before the successor's CAS returns after it. The probe-dating oracle
+(`check_probe_dating`) fails a run in which a lane answers on the root's own
+proof a freshness window or more after the takeover, which a proof dated at its
+send cannot justify; `-long-dated-at-return` (`ProbeMutant::DatedAtReturn`, the
+proof dated when the response arrived) fails it, the design does not. The
+counter `Report::probe_races` (`SWEEP-PROBE-RACES`) is the number of lane
+answers resting on the root's own proof after the lease already named a
+successor: the race the send-time dating exists for. Mutual exclusion does not
+see the mutant, whose extra life is hidden by the `3 x expiry margin` the
+successor's floor and the grant caps carry. `AUTHORITY_SIM_PROBE_READS=0:200:300:900`
+sets the slow reads of any configuration.
 `locks-core-stall*` (plan 41 L2/L4, `locks_survive_core_stalls`,
 `locks_survive_core_stalls_in_every_topology`): the core of a lock holder
 that is not the lease holder is stuck in one step for 2 s (over a grant's

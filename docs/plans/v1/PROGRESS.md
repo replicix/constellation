@@ -61063,8 +61063,9 @@ stalled lost its delegation (`KNOWN-GAP root core stuck`) and a backed lock hold
    - *Failed, slow, unreadable, an older body, a released lease.* No proof; nothing is granted, refused or dropped; the
      renewal is the core's, which answers it in full when it runs (and the round is not read twice).
    - *A backup that sealed.* The seal is the lease CAS above; a read before it is covered, after it shows the successor. The
-     holder's off-core beat keeps the backups from sealing for `CONSTELLATION_HOLDER_STALL_MS`; the lanes stop at the same
-     bound (D6).
+     holder's off-core beat keeps the backups from sealing for `CONSTELLATION_HOLDER_STALL_MS`; the answerer stops at the same
+     bound (D6). (The lock lane's own renewals had no such check: a proof read at 14.9 s carried them to about 16.5 s. They take
+     the probe's proof only while the driver is not past the bound since the review follow-up below.)
    - *Another tenure.* A proof names its epoch and counts for a certificate of that epoch only.
 5. **The core is told.** `Event::RootProbed` (urgent lane): a live read extends the core's own `last_s3_fresh` (as its own
    `LeaseGet`), a read that shows a successor deposes it when it runs (`on_root_probed`, as `on_renew_probe`); a read for a
@@ -61147,3 +61148,77 @@ accepts a generation gone from a backed pair (a lane that renewed without end wo
 L5 (peers' renewals at a stalled owner), L6's routing to a successor, `ack=s3`, the root lease's renewal (stays in the core), the
 fencing tokens, the restart horizon. No wire message changed except that `PeerService::deleg_renew*` now return a future (the reply
 may wait for the read); no version bump.
+
+## Plan 41 D3 review follow-ups: the dating of the proof is tested, a late read wakes its own waiters (2026-10-30)
+
+The review of D3 found the design sound and asked for five things.
+
+### What landed
+
+| Item | State | Where |
+|---|---|---|
+| The send-time dating is tested: the sim's lease reads can be held up before they are served and their responses held back after (`SimConfig::probe_reads`, `Bucket::probe_handle`, `SlowReads`); `ProbeMutant::DatedAtReturn` dates the proof at the response; the probe-dating oracle (`SimConfig::check_probe_dating`) fails a run that answers on the root's own proof a freshness window after the takeover | done | `tests/sim/store.rs`, `node.rs`, `run.rs`, `sim.rs` |
+| The race is counted: `Report::probe_races` (`SWEEP-PROBE-RACES`) | done | `node.rs` (`note_probe_race`), `sim.rs` sweep |
+| An engine test where the core runs again during the wait | done | `authority_driver.rs` (`a_core_that_runs_again_during_the_wait_answers_the_renewal_itself`) |
+| `RootProbe::finish` wakes the waiters of its own read only | done | `root_probe.rs` |
+| The lock lane's own renewals take the probe's proof only while the driver is not past the hung bound (D6) | done | `lane.rs` (`proof_stalled`) |
+| Docs: the "lanes stop at the same bound" line, the `-late` comment | done | this file, `cluster-locks.md`, `TESTING.md`, `sim.rs` |
+
+### Findings and fixes
+
+1. **The dating.** `locks-core-stall-backup-long-slow-reads` is the `-long` configuration (the beat off, the backup seals the stuck
+   root 1.5 s into a stall, a 30 s lease) with the root probe's lease reads slowed: up to 200 ms more before they are served and 300
+   to 900 ms between being served and returning (the probe gives up at the 1 s window), a 100 ms expiry margin (the lane's grants then
+   have more window to renew in: four times as many answers fall after a takeover), clock faults off. A read served before the
+   successor's CAS returns after it. The oracle: no answer resting on the root's own proof (the core's last one stale) is decided a
+   window or more after the takeover of its epoch, which a proof dated at the send cannot be (the read was served before the CAS, the
+   send before the read, the proof is good for one window from the send). Design: **0 of 2,000 seeds** fail. `-long-dated-at-return`
+   (`ProbeMutant::DatedAtReturn`): **40 of 2,000** (28, 54, 78, 80, 84, 132, 151, ...; 342 of the 20,000 seeds from 2,000 on); `a_proof_dated_at_the_return_of_the_read_is_caught` pins 28, 54, 78 and 80: clean with the design, failing with the
+   mutant. **Mutual exclusion does not see this mutant**, in none of 22,000 seeds: the successor's floor (`note_marker_landed`) and the
+   grants' caps carry `3 x expiry margin` beyond the window, and a conflicting request would have to arrive in the few hundred ms
+   left. The oracle is the sim's catch for the dating (the `-blind` mutant, which renews without end, stays the catch for the verdict).
+2. **The race is run.** `probe_races` counts lane answers decided on the root's own proof after the lease object already named a
+   successor. The D3 configurations over seeds 0 to 1,999: `locks-core-stall-backup-long` **593 answers in 413 seeds**,
+   `locks-core-stall-backup` **482 in 314**, `-backup-beats` and `-long-beats` 0 (the beat keeps the backup from sealing),
+   `delegated-core-stall-root-backup` and `-root-sealed` 0 (a delegate's renewals are a period apart: the answerer has no renewal in
+   the window between the read and the end of its proof; a sealed delegation twin with slow reads: 0 of 300 seeds), the slow reads
+   **95 in 91**. `answers_on_a_proof_read_before_the_takeover_are_decided_after_it` pins that the original and the slow
+   configuration hit it and the beat configuration does not.
+3. **The core runs again during the wait** (engine): the renewal waits for a read (600 ms), the core's step ends meanwhile, the
+   renewal is decided again at a fresh look at the driver and is the core's (`None`, nothing counted as answered off the core), the read
+   still counts as a proof, and the core stuck again inside the window of the read's send is answered on it with no second read.
+4. **`RootProbe::finish` took every waiter**, so the late end of an abandoned read (one that hung past its window and was replaced)
+   woke the waiters of the newer read, which decided before that read was back and declined. The waiters are kept with the read they
+   wait for and a read's end wakes its own (`a_late_abandoned_read_wakes_only_its_own_waiters`; fails before: the newer read's two
+   waiters were told by the older read's end). An abandoned read always ends, bounded by the window, so its waiters are not left behind.
+5. **The hung bound for the lock lane's own renewals.** The line "the lanes stop at the same bound (D6)" in the D3 entry held for the
+   answerer (`answer_root` refuses a stall past `CONSTELLATION_HOLDER_STALL_MS`) but not for the lane's own renewals: the read is asked
+   for only up to the bound, but a proof read at 14.9 s carried the renewals to about 16.5 s. The check is the lane's own and
+   consistent with §11 D6 (the root-side lane is bounded at 15 s): the proof counts only while the stall is not past the bound
+   (`a_proof_carries_no_own_renewal_past_the_hung_bound`; fails before: renewed at 15.1 s). The core's own proof and a lane without a
+   probe are unchanged. The stale `-late` configuration named in the comment of `delegated-core-stall-root-sealed` never existed:
+   the comment names `-blind` and the new `-dated-at-return`.
+
+### Open items
+
+- `locks-core-stall-backup-long` seed 946 (`Control::LockIdle` unanswered after a suspend and a stall) fails on origin/main and at the
+  parent of D3 alike (the same message), as the D3 entry said; the new configurations switch the clock faults off and do not reach it.
+  With the clock faults on, the slow-reads variant fails 7 of 10,000 seeds the same way (946, 2377, 4112, ...): not D3's, not looked
+  into.
+- A lease read slow on **every** node's handle (an earlier version of the sim's knob, 200 to 1,400 ms after the request was served)
+  failed other oracles in a few of 2,000 seeds of `-long` with the probe on (`LockIdle` unanswered; at 800 to 1,000 ms also `rid ...
+  returned success but completed 0 times in the log` and `was refused ... but completed 1 times` in 6 seeds). Not checked with the
+  probe off, not looked into; the knob is therefore the probe's own handle, and the rest of the system keeps the bucket's latency.
+
+### Gates (release where noted; box runs under `timeout`)
+
+- `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- Lib tests: authority 774, meta 376, engine 934, harness 162, control 146 (no `FAILED`, no `panicked` in any log).
+- `cargo test -p constellation-authority --release`: lib 774, `meta_repro` 4, the sim suite 276 passed (11 ignored), 123 s.
+- Fail-before (the fix reverted, the test kept): `a_late_abandoned_read_wakes_only_its_own_waiters` and
+  `a_proof_carries_no_own_renewal_past_the_hung_bound` fail.
+- Sim sweeps, seeds 0 to 1,999 each: `locks-core-stall-backup-long-slow-reads` 0 failing; `-long-dated-at-return` 40; `-long-blind` 26
+  (as in D3); `locks-core-stall`, `-root`, `-single`, `-backup`, `-backup-beats`, `-s3`, `-blips`, `-delegated`,
+  `delegated-core-stall-root`, `-root-backup`, `-root-lease6`, `-root-recall`, `-root-recall-open`, `-root-hang`, `-both`,
+  `-root-sealed`: 0 failing; `locks-core-stall-backup-long` and `-long-beats`: seed 946 only (open item); `-root-backup-unprobed`
+  2,000 (the control built to fail).

@@ -363,6 +363,8 @@ pub struct NodeEnv {
     /// See `SimConfig::deleg_root_probe` / `root_probe_mutant`.
     pub deleg_root_probe: bool,
     pub root_probe_mutant: super::run::ProbeMutant,
+    /// See `SimConfig::probe_reads`.
+    pub probe_reads: super::store::SlowReads,
     /// See `SimConfig::lock_lane`.
     pub lock_lane: bool,
     /// See `SimConfig::lock_lane_ignores_freshness`.
@@ -559,6 +561,7 @@ impl NodeHandle {
             bucket: Arc::downgrade(&env.bucket),
             probing: env.deleg_root_probe,
             mutant: env.root_probe_mutant,
+            probe_reads: env.probe_reads,
         });
         {
             let root_ctx = root_ctx.clone();
@@ -1293,6 +1296,18 @@ async fn lock_lane_loop(
             }
         }
         for a in &actions {
+            if let constellation_authority::lane::LaneAction::OwnRenewed { renewed } = a {
+                let v = facts.cell.view();
+                note_probe_race(
+                    &root,
+                    v.epoch,
+                    v.fast,
+                    v.last_fresh,
+                    v.window_ms,
+                    now.honour,
+                    *renewed as u64,
+                );
+            }
             // Plan 41 D3: the read of the lease object the own renewals wait
             // for, off the core.
             if let constellation_authority::lane::LaneAction::Probe(t) = a {
@@ -1435,6 +1450,7 @@ struct RootCtx {
     /// Plan 41 D3 is modelled (`SimConfig::deleg_root_probe`).
     probing: bool,
     mutant: super::run::ProbeMutant,
+    probe_reads: super::store::SlowReads,
 }
 
 /// Answer delegate `from`'s renewal of `gen` off this root's stuck core, if
@@ -1487,6 +1503,17 @@ fn answer_deleg_renewal(
     };
     match answer {
         RootAnswer::Granted(ttl_ms) => {
+            if let Some(l) = ctx.windows.lease_cert() {
+                note_probe_race(
+                    ctx,
+                    l.epoch,
+                    l.fast,
+                    l.last_s3_fresh,
+                    l.window_ms,
+                    now.honour,
+                    1,
+                );
+            }
             let _ = ctx
                 .shared
                 .urgent
@@ -1510,6 +1537,52 @@ fn answer_deleg_renewal(
     }
 }
 
+/// Plan 41 D3 review: count `answers` that a lane decided at `at` on the
+/// root's own proof of liveness (the core's last one, `last_fresh`, is stale
+/// at `at`, so the answer rests on the read) while the lease object in the
+/// bucket already names another holder or epoch than the certificate's: the
+/// read the proof stands on was served before the successor's CAS and the
+/// answer is decided after it. The send-time dating of the proof is what
+/// keeps such an answer inside the successor's quarantine.
+fn note_probe_race(
+    ctx: &RootCtx,
+    epoch: u64,
+    fast: bool,
+    last_fresh: constellation_authority::HonourMs,
+    window_ms: i64,
+    at: constellation_authority::HonourMs,
+    answers: u64,
+) {
+    if !ctx.probing
+        || !fast
+        || constellation_authority::core::liveness_fresh(fast, at, last_fresh, window_ms)
+    {
+        return;
+    }
+    let Some(bucket) = ctx.bucket.upgrade() else {
+        return;
+    };
+    let lease = bucket.peek_lease();
+    let successor = lease.is_none_or(|l| l.holder != ctx.id || l.epoch != epoch);
+    if successor {
+        bucket.probe_races.fetch_add(answers, Ordering::Relaxed);
+        // The oracle: a proof dated at its read's send is good for one window
+        // from it, and the read was served before the takeover, so no
+        // answer resting on it is decided a window after the takeover.
+        if let Some(since) = bucket.since_takeover(ctx.id, epoch) {
+            if since >= std::time::Duration::from_millis(window_ms.max(0) as u64) {
+                bucket.probe_late.lock().unwrap().push(format!(
+                    "n{}: {answers} lane answer(s) decided {} ms after the takeover of its epoch \
+                     {epoch}, on a proof of liveness good for {window_ms} ms from a read sent \
+                     before it",
+                    ctx.id,
+                    since.as_millis()
+                ));
+            }
+        }
+    }
+}
+
 /// The root's off-core read of its lease object (the daemon's
 /// `OffCore::spawn_root_probe`): judged by the sans-IO rule, reported to the
 /// core on the urgent lane, then the renewals that waited for it are decided
@@ -1524,7 +1597,11 @@ fn spawn_root_probe(
         let Some(bucket) = ctx.bucket.upgrade() else {
             return;
         };
-        let leases = LeaseStore::new(bucket.handle(ctx.id), "p0", LeaseMode::Cas);
+        let leases = LeaseStore::new(
+            bucket.probe_handle(ctx.id, ctx.probe_reads),
+            "p0",
+            LeaseMode::Cas,
+        );
         let read = match tokio::time::timeout(
             std::time::Duration::from_millis(window_ms.max(1) as u64),
             leases.get(),
@@ -1536,15 +1613,22 @@ fn spawn_root_probe(
             _ => LeaseRead::Failed,
         };
         let mut verdict = judge(read, ctx.id, ticket.epoch);
+        // What the probe records; the core is told the true send below.
+        let mut proof_ticket = ticket;
         match ctx.mutant {
             super::run::ProbeMutant::None => {}
             // A read that shows a successor, or fails, counts as a proof.
             super::run::ProbeMutant::IgnoresVerdict => verdict = Verdict::Live,
+            // The proof is dated when the response arrived, not when the
+            // request left.
+            super::run::ProbeMutant::DatedAtReturn => {
+                proof_ticket = ticket.dated(ctx.clock.now().honour);
+            }
         }
         if !ctx.shared.alive.load(Ordering::SeqCst) {
             return;
         }
-        let waiters = ctx.probe.finish(ticket, verdict);
+        let waiters = ctx.probe.finish(proof_ticket, verdict);
         let _ = ctx.shared.urgent.send(Event::RootProbed {
             epoch: ticket.epoch,
             sent: ticket.sent,

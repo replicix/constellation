@@ -275,6 +275,10 @@ pub enum ProbeMutant {
     /// Whatever the read shows counts as a proof (a takeover racing the
     /// read, or already done, is not noticed).
     IgnoresVerdict,
+    /// The proof is dated at the read's return, not at its send (a read
+    /// served before a takeover and returned long after it would justify a
+    /// window that outlasts the successor's quarantine).
+    DatedAtReturn,
 }
 
 /// Where a node's off-core heartbeat runs (the daemon's
@@ -311,6 +315,16 @@ pub struct SimConfig {
     pub ops_per_client: u64,
     pub names: usize,
     pub s3_latency: (u64, u64),
+    /// Plan 41 D3 review: how much slower the root probe's lease GETs are
+    /// than the bucket's `s3_latency`, before being served and on their way
+    /// back (`Bucket::probe_handle`). All of `s3_latency` lies before the
+    /// request is served; the reply half of a slow read is what makes the
+    /// time a proof is dated at matter.
+    pub probe_reads: super::store::SlowReads,
+    /// Plan 41 D3 review: fail a run in which a lane answered on the root's own
+    /// proof of liveness a freshness window or more after the tenure was
+    /// taken over (`Bucket::probe_late`).
+    pub check_probe_dating: bool,
     pub p2p_delay: (u64, u64),
     pub p2p_drop: f64,
     /// Plan 43 C7-F F-c: the probability that a lock mirror (any, the old
@@ -857,6 +871,8 @@ impl Default for SimConfig {
             ops_per_client: 6,
             names: 4,
             s3_latency: (5, 40),
+            probe_reads: super::store::SlowReads::default(),
+            check_probe_dating: false,
             p2p_delay: (1, 15),
             p2p_drop: 0.0,
             lock_mirror_drop: 0.0,
@@ -975,6 +991,10 @@ pub struct Report {
     pub fenced: usize,
     pub commits: usize,
     pub s3_puts: u64,
+    /// Plan 41 D3 review: lane answers decided on the root's own proof of
+    /// liveness after the lease object named a successor (the race the
+    /// send-time dating of the proof exists for).
+    pub probe_races: u64,
     pub s3_gets: u64,
     pub p2p_sent: u64,
     pub converged_checked: bool,
@@ -3547,6 +3567,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         deleg_root_lane: cfg.deleg_root_lane,
         deleg_root_probe: cfg.deleg_root_probe,
         root_probe_mutant: cfg.root_probe_mutant,
+        probe_reads: cfg.probe_reads,
         lock_lane: cfg.lock_lane,
         lock_lane_ignores_freshness: cfg.lock_lane_ignores_freshness,
         skip_close_on_recall: cfg.skip_close_on_recall,
@@ -4109,6 +4130,18 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             cluster.locks.trace().join("\n    ")
         ));
     }
+    // Plan 41 D3 review: no lane answer rests on the root's own proof of
+    // liveness a freshness window after its takeover.
+    {
+        let late = bucket.probe_late.lock().unwrap();
+        if let Some(what) = late.first().filter(|_| cfg.check_probe_dating) {
+            return Err(format!(
+                "probe dating violated (plan 41 D3): {what} ({} violation(s))\n  faults: {:?}",
+                late.len(),
+                fault_log.lock().unwrap(),
+            ));
+        }
+    }
     let gaps = cluster.locks.visibility_gaps();
     if !gaps.is_empty() && std::env::var_os("AUTHORITY_SIM_VISIBILITY").is_some() {
         return Err(format!(
@@ -4554,6 +4587,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     }
     let counts = bucket.counts();
     report.s3_puts = counts.puts;
+    report.probe_races = bucket
+        .probe_races
+        .load(std::sync::atomic::Ordering::Relaxed);
     report.s3_gets = counts.gets;
     report.p2p_sent = *bus.sent.lock().unwrap();
     let context = format!(

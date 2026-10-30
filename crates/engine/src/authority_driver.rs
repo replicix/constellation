@@ -7797,17 +7797,39 @@ mod tests {
     async fn stuck_fast_root(
         lease: Option<constellation_store_s3::Lease>,
     ) -> std::sync::Arc<super::OffCore> {
+        stuck_fast_root_reading_in(lease, std::time::Duration::ZERO).await
+    }
+
+    /// [`stuck_fast_root`], each read of its lease object taking `get` to
+    /// come back.
+    async fn stuck_fast_root_reading_in(
+        lease: Option<constellation_store_s3::Lease>,
+        get: std::time::Duration,
+    ) -> std::sync::Arc<super::OffCore> {
         use constellation_authority::core::RootLease;
         use constellation_authority::HonourMs;
         use std::sync::atomic::Ordering;
         let off = Arc::new(super::OffCore::new(5_000));
-        let store: Arc<dyn object_store::ObjectStore> =
+        let inner: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
-        let leases = LeaseStore::new(store, PARTITION, LeaseMode::Cas);
         if let Some(l) = lease {
-            leases.try_create(&l).await.unwrap();
+            LeaseStore::new(inner.clone(), PARTITION, LeaseMode::Cas)
+                .try_create(&l)
+                .await
+                .unwrap();
         }
-        off.set_leases(leases);
+        let store: Arc<dyn object_store::ObjectStore> = if get.is_zero() {
+            inner
+        } else {
+            Arc::new(object_store::throttle::ThrottledStore::new(
+                inner,
+                object_store::throttle::ThrottleConfig {
+                    wait_get_per_call: get,
+                    ..Default::default()
+                },
+            ))
+        };
+        off.set_leases(LeaseStore::new(store, PARTITION, LeaseMode::Cas));
         let clk = constellation_platform::clock::protocol().now();
         off.deleg_windows
             .insert(7, 3, clk.wait.plus(5_000), clk.wait.plus(5_000), true);
@@ -7846,6 +7868,56 @@ mod tests {
         assert_eq!(p.started.load(Ordering::Relaxed), 1);
         assert_eq!(p.live.load(Ordering::Relaxed), 1);
         // Inside the round the proof stands: no second read.
+        assert_eq!(
+            off.answer_root_probing(true, 15_000, 1, 3, 7).await,
+            Some(4_000)
+        );
+        assert_eq!(p.started.load(Ordering::Relaxed), 1);
+    }
+
+    /// Plan 41 D3: the core runs again while a renewal waits for the root's
+    /// read of its lease. The renewal is decided once more at a fresh look at
+    /// the driver, which is no longer stuck, so the off-core answer is not
+    /// given (the core answers the request in full, and a grant made off the
+    /// core is the stuck core's alone); the read still counts, and a core
+    /// stuck again inside the window of its send is answered on it, with no
+    /// second read. (Deciding on the look taken before the wait would answer
+    /// off a running core: the assertion that fails for that code.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_core_that_runs_again_during_the_wait_answers_the_renewal_itself() {
+        use std::sync::atomic::Ordering;
+        let lease = constellation_store_s3::Lease::granted(PARTITION, 1, 2, 60_000);
+        let off =
+            stuck_fast_root_reading_in(Some(lease), std::time::Duration::from_millis(600)).await;
+        let asking = {
+            let off = off.clone();
+            tokio::spawn(async move { off.answer_root_probing(true, 15_000, 1, 3, 7).await })
+        };
+        // The read is out; the core's step ends meanwhile.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let p = off.root_probe.stats();
+        assert_eq!(p.started.load(Ordering::Relaxed), 1, "the read is out");
+        assert_eq!(p.live.load(Ordering::Relaxed), 0, "and not back");
+        off.busy_since.store(0, Ordering::Relaxed);
+        assert_eq!(
+            asking.await.unwrap(),
+            None,
+            "the core answers, not the lane"
+        );
+        assert_eq!(p.live.load(Ordering::Relaxed), 1, "the read still counts");
+        assert!(off.root_probe.proof(2).is_some());
+        assert_eq!(
+            off.deleg_windows
+                .stats()
+                .answered_off_core
+                .load(Ordering::Relaxed),
+            0,
+            "nothing was answered off a running core"
+        );
+        // Stuck again inside the window of the read's send: answered on the
+        // proof, with no second read.
+        let clk = constellation_platform::clock::protocol().now();
+        off.busy_since.store(clk.wait.0 - 2_000, Ordering::Relaxed);
         assert_eq!(
             off.answer_root_probing(true, 15_000, 1, 3, 7).await,
             Some(4_000)
