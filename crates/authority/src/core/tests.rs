@@ -40802,6 +40802,125 @@ mod deleg_group {
     }
 }
 
+/// A designee's stream carries only rows its disk holds.
+mod designee_stream {
+    use super::*;
+    use crate::replica::Replica;
+
+    /// A designee of `/d` (generation 7, root node 1), installed.
+    fn designee() -> (Harness, constellation_fs_core::Ino) {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let dir = h.meta.allocate_ino(ROOT_INO).unwrap();
+        Replica::apply_segment(
+            &h.meta,
+            1,
+            1,
+            0,
+            &[],
+            &[],
+            &[
+                LogRecord::Mkdir {
+                    parent: ROOT_INO,
+                    name: "d".into(),
+                    ino: dir,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 1,
+                },
+                LogRecord::Delegate {
+                    dir,
+                    node: 3,
+                    gen: 7,
+                    designated: true,
+                    range: (0, 0),
+                },
+            ],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.mine[&7].designated);
+        (h, dir)
+    }
+
+    /// The stream batches of generation 7 in `out`, as (first, last) index.
+    fn batches(out: &[Action]) -> Vec<(u64, u64)> {
+        sends(out)
+            .into_iter()
+            .filter_map(|(_, m)| match m {
+                PeerMsg::DelegateStream { gen: 7, txs, .. } => Some((
+                    txs.first().map_or(0, |t| t.idx),
+                    txs.last().map_or(0, |t| t.idx),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn create(
+        h: &mut Harness,
+        dir: constellation_fs_core::Ino,
+        seq: u64,
+        name: &str,
+    ) -> Vec<Action> {
+        let rid = h.rid(seq);
+        let op = MutateOp::Create {
+            parent: dir,
+            name: name.into(),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        assert!(replies(&out).iter().any(|(r, _)| *r == rid), "{out:?}");
+        out
+    }
+
+    /// Fail-before: a designee answers its rows at once, and its commits
+    /// reach the OS, not the disk. Its stream sent them as they were
+    /// journaled; after a power loss that dropped the end of its journal,
+    /// nothing ends the designation (it renews nothing, the root never
+    /// reclaims it), its next rows took the lost indices, and the root,
+    /// which had appended the lost rows, skipped the new ones as appended
+    /// (at or below its cursor): the log and the designee parted. Now a
+    /// batch leaves only after a sync that covers it, so the root's cursor
+    /// never passes what a restart finds on the disk. A delegate that is no
+    /// designee does not sync (it does not take a generation up again after
+    /// a reboot, and its group holds what it acknowledged).
+    #[test]
+    fn a_designees_stream_carries_only_rows_its_disk_holds() {
+        let (mut h, dir) = designee();
+        let synced = h.meta.sync_count();
+        let out = create(&mut h, dir, 1, "f");
+        assert_eq!(
+            (batches(&out), h.meta.sync_count() - synced),
+            (vec![(1, 1)], 1),
+            "(batches sent, syncs) for row 7:1: {out:?}"
+        );
+        assert_eq!(h.core.dl.mine[&7].synced_through, 1);
+        assert_eq!(h.core.stats.deleg_designee_syncs, 1);
+        // The ordinary delegate streams without one.
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        let synced = h.meta.sync_count();
+        let out = create(&mut h, dir, 1, "f");
+        assert_eq!(
+            (batches(&out), h.meta.sync_count() - synced),
+            (vec![(1, 1)], 0),
+            "{out:?}"
+        );
+    }
+}
+
 /// Plan 43 C1-1: the root group's commit holds across a listing and a
 /// removal. What a backup counts for is what it acknowledged to an append
 /// that carried a version listing it (`BackupPeer::counted`), and while a

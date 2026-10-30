@@ -411,6 +411,9 @@ pub(crate) struct DelegateState {
     /// Plan 43 C2e follow-up: this process recorded, synced, that it holds a
     /// grant of the generation on this boot (`Replica::deleg_note_held`).
     pub held_noted: bool,
+    /// A designee: the stream index through which this process synced its
+    /// journal; its stream sends nothing past it (`deleg_stream`).
+    pub synced_through: u64,
 }
 
 /// A renewal or backup append [`Core::deleg_expire_inflight`] gave up
@@ -966,7 +969,8 @@ impl Core {
             // renews, and the root ends the generation by its backup's
             // sealed tail, or at the cursor. A restart on the same boot finds
             // the journal as it was and goes on (`delegate-handoff-renewal`);
-            // so does a designee, which renews nothing.
+            // a designee is exempt: it renews nothing, and its stream
+            // sends only rows a sync put on its disk (`deleg_stream`).
             let rebooted = !d.designated && replica.deleg_held_on_another_boot(d.gen, now.boot.id);
             if rebooted {
                 self.stats.deleg_rebooted_holder += 1;
@@ -1036,6 +1040,7 @@ impl Core {
                     group_requested: None,
                     acked_max: 0,
                     held_noted: false,
+                    synced_through: 0,
                 },
             );
             if d.designated {
@@ -3232,6 +3237,29 @@ impl Core {
                 continue;
             }
             let last = txs.last().map(|t| t.idx).unwrap_or(from);
+            // A designee answers its rows at once and its commits reach
+            // the OS, not the disk: a power loss can drop the end of its
+            // journal. Nothing ends a designation then (it renews nothing,
+            // the root never reclaims it), and the designee journals on
+            // from what its disk kept, so its next rows take the lost
+            // indices. Had the root appended the lost rows, it would skip
+            // the new ones as appended (`on_delegate_stream`: at or below
+            // its cursor) and the log and the designee would part. So a
+            // designee's rows leave in its stream only once they are on its
+            // disk, and the root's cursor never passes what a restart finds.
+            if d.designated && last > d.synced_through {
+                let through = replica.delegate_idx(gen);
+                if !replica.sync_journal() {
+                    let tick = self.cfg.delegation_stream_tick_ms.max(1);
+                    let d = self.dl.mine.get_mut(&gen).expect("present");
+                    d.stream_backoff_ms = (d.stream_backoff_ms * 2).clamp(tick * 4, 2_000);
+                    d.stream_after = Some(now.wait.plus(d.stream_backoff_ms));
+                    continue;
+                }
+                self.stats.deleg_designee_syncs += 1;
+                let d = self.dl.mine.get_mut(&gen).expect("present");
+                d.synced_through = d.synced_through.max(through);
+            }
             let leaving = self.deleg_leaving_grants(now, gen, replica);
             let leaving_barriers = self.deleg_leaving_barriers(now, gen, &leaving, replica);
             let req = self.op_id();

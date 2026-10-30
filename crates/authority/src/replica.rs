@@ -367,6 +367,9 @@ pub trait Replica {
     /// journal still holds, their end not yet applied from the log
     /// (`Meta::deleg_gens_awaiting_end`). `None`: unreadable.
     fn deleg_gens_awaiting_end(&self, live: &std::collections::BTreeSet<u64>) -> Option<Vec<u64>>;
+    /// Put every commit so far on the disk (`Meta::sync`); `false`: the
+    /// sync failed.
+    fn sync_journal(&self) -> bool;
     /// Generation `gen` ended at `cut` (the void rule).
     fn void_stream(&self, gen: u64, cut: u64);
     /// Whether transaction `(gen, idx)` of this delegate's streams is
@@ -1312,6 +1315,16 @@ impl Replica for Meta {
             Err(error) => {
                 tracing::warn!(%error, gen, "reading a delegation's grant record failed; taking it as another boot's");
                 true
+            }
+        }
+    }
+
+    fn sync_journal(&self) -> bool {
+        match Meta::sync(self) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, "syncing the store failed");
+                false
             }
         }
     }

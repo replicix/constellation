@@ -918,6 +918,9 @@ pub struct Stats {
     /// generation's rows were still in the journal, its end not yet
     /// applied from the log (path B).
     pub deleg_install_waits_end: u64,
+    /// Designee: journal syncs before a stream batch (its rows leave only
+    /// once they are on its disk).
+    pub deleg_designee_syncs: u64,
     pub deleg_streamed_txs: u64,
     pub deleg_stream_refused: u64,
     pub deleg_renewals: u64,

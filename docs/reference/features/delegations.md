@@ -751,6 +751,18 @@ root is refused with `EROFS`, and a cross-subtree op involving one with
 `EXDEV`; a designation is never recalled to execute one. `--ro`
 designations create no delegation.
 
+A designee answers its rows at once, and its commits reach the OS, not
+the disk, so a power loss can drop the end of its journal. Nothing ends
+the designation then (it renews nothing and the root never reclaims it):
+after the reboot the designee journals on from what its disk kept. Its
+stream therefore sends a row only once a sync has put it on the disk (one
+sync per batch that holds rows no sync covered yet,
+`deleg_designee_syncs`), so the root's cursor never passes what a restart
+finds, and the next rows never take an index the root already appended
+(the root skips an index at or below its cursor as appended: the log and
+the designee would part). Rows lost before they streamed are lost as a
+holder's own unsynced writes are (a forwarded op's requester replays it).
+
 ### Failures
 
 - **Delegate crashes, no backup recorded**: the root reclaims the grant after
@@ -890,10 +902,11 @@ designations create no delegation.
   not renew (`deleg_rebooted_holder`), and the root ends the generation
   by its backup's sealed tail, or at its cursor when there is no backup.
   A boot that cannot be named (no boot id) is never the same boot. A
-  designee is not covered, and that is a **known gap** pending a fix: it
-  renews nothing, so the rule does not stop it, yet it streams like any
-  delegate and the root skips the indices at or below its cursor, so a
-  designee that lost the unsynced end of its journal reuses indices.
+  designee is exempt (it renews nothing, so the rule would not stop it,
+  and nothing ends a designation): its stream sends only rows a sync has
+  put on its disk, so the root's cursor never passes what it finds after
+  a reboot and its next rows never reuse an index the root appended (see
+  [Offline designations](#offline-designations)).
 - **Root dies and the delegate is no backup** (no backup in budget, or
   the root dropped it before it died): only a TTL takeover replaces the
   root. The delegate's grant lapses unrenewed (above), its writes take

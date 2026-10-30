@@ -101,7 +101,13 @@ node acts on it:
   before it uses the grant: a process that finds the record on another boot
   (a power loss may have dropped rows it acknowledged) does not take the
   generation up again, and the root ends it by its group (see
-  [Delegations](delegations.md#failures)).
+  [Delegations](delegations.md#failures));
+- a designee's journal, before its stream sends the rows (one sync per
+  batch that holds rows no sync covered yet): nothing ends a designation
+  after a power loss, and the designee journals on from what its disk kept,
+  so the root's cursor must never pass that, or the designee's next rows
+  would take indices the root already appended and be skipped (see
+  [Delegations](delegations.md#offline-designations)).
 
 So a power loss can make a node forget work, never a promise it made.
 

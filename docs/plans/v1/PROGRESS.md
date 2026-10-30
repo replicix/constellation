@@ -62141,3 +62141,31 @@ nothing waits: the new generation is installed at its own segment, after the end
 Test: core `recall_cut::a_new_generation_waits_for_an_ended_ones_rows_to_strand`. Fail-before (the guard off):
 `(installed, executed through)` of generation 8 was `(true, 1)`, the chmod answered `Lone` and sent in
 `DelegateStream { gen: 8, txs: [DelegateTx { idx: 1, records: [Setattr { .. }], deps: .. (7, 1) .. }] }`.
+
+### 2. A designee's stream sends only rows on its disk
+
+Finding. A designee streams to the root like any delegate (`deleg_stream` covers every held generation), and the root
+skips an index at or below its cursor as appended (`on_delegate_stream`). A designee's rows are answered at once
+(`NonStealable`) and its commits reach the OS, not the disk, so a power loss can drop the end of its journal, rows the root
+had already appended. Nothing ends a designation then: the reboot rule of the C2e follow-up (a delegate that held a
+generation on another boot installs it stopped, never renews, and the root ends it by its group or at the cursor) works
+through the renewal and the reclaim, and a designee renews nothing and is never reclaimed, so it was exempted ("it
+renews nothing"). Taking the same
+rule would stop the designation for good at every reboot of the designee, the designation's ordinary life (an offline
+laptop), with `EROFS` under the path until an operator's `online`. So after the reboot the designee journaled on from
+what its disk kept, its next rows took the lost indices, and the root skipped them as appended and acknowledged them:
+the log holds the lost rows, the designee the new ones.
+
+Fix. The designee's stream sends a row only once a sync of this process covers it (`DelegateState::synced_through`, set
+from the stream index read before `Replica::sync_journal`; a failed sync backs the stream off). One sync per batch that
+holds rows no sync covered yet (`deleg_designee_syncs`), on the designee only; the root's cursor then never passes what a
+restart finds, so its next index is past everything the root appended. Rows lost before they streamed are lost as a
+holder's own unsynced writes are. The root-side alternative (a per-index content check or a stream epoch) detects the
+reuse only after the designee executed and answered the new rows; refusing them would stall the designation for good,
+and accepting them is the divergence. The known gap `delegations.md` recorded for designees (220832f8) is closed.
+Not a design decision change: the sync joins the "safety state is always synced"
+class of `durability-and-failover.md`.
+
+Test: core `designee_stream::a_designees_stream_carries_only_rows_its_disk_holds` (a designee's row 7:1: the batch and
+one sync; an ordinary delegate's: the batch, no sync). Fail-before (the sync block off): `(batches sent, syncs)` was
+`([(1, 1)], 0)` for `([(1, 1)], 1)`. Mutation (the bookkeeping without `sync_journal`): the same failure.
