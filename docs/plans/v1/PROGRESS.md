@@ -62214,3 +62214,14 @@ that moves the cursor nowhere now backs the stream off as a refusal does (4 tick
 
 Test: core `recall_cut::a_stream_answer_that_takes_nothing_backs_off`. Fail-before (the check off): `(re-sent at once,
 backing off)` was `(true, false)` for `(false, true)`.
+
+### 2. A recall answers before a lost dependency the stream has not read (follow-up)
+
+`lost_from` was found only in a batch the stream reads: with a batch of the generation in flight, or the row past the
+batch's window, a recall answered the whole stream (`delegate_idx`), a cursor the root can never reach because the
+row is never streamed, and the generation waited for its grant to run out. The recall's answer now reads the `deps` of
+the journal's rows not yet streamed (`Meta::delegate_deps_from`, no records) and stops before the first lost one
+(`Core::deleg_find_lost`), stopping the generation there as the stream does.
+
+Test: core `recall_cut::a_recall_answers_before_a_lost_dependency_the_stream_has_not_read` (8:1 in flight, then 7:1 and
+8:2 depending on it, 7 ends at 0). Fail-before (the journal read off): `through` was 2 for 1.

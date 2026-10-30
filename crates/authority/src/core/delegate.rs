@@ -3192,6 +3192,47 @@ impl Core {
         self.dl.late.remove(&req)
     }
 
+    /// Row `idx` of `gen` depends on a row its generation ended without
+    /// (`Replica::deps_lost`): the generation stops before it
+    /// (`DelegateState::lost_from`, see `deleg_stream`).
+    fn deleg_note_lost(&mut self, gen: u64, idx: u64) {
+        let Some(d) = self.dl.mine.get_mut(&gen) else {
+            return;
+        };
+        if d.lost_from.is_some_and(|l| l <= idx) {
+            return;
+        }
+        d.lost_from = Some(idx);
+        d.stopped = true;
+        self.stats.deleg_lost_deps_stopped += 1;
+        tracing::warn!(
+            node = self.cfg.node_id,
+            gen,
+            idx,
+            "a row depends on one its generation ended without: \
+             the generation stops before it, the row is replayed by rid"
+        );
+    }
+
+    /// The first row of `gen` not yet streamed whose dependency was lost
+    /// with another generation, read from the journal: the stream finds it
+    /// only in a batch it reads, and not while a batch is in flight or for
+    /// a row past the batch's window. A recall answers before it.
+    fn deleg_find_lost(&mut self, gen: u64, replica: &dyn Replica) -> Option<u64> {
+        let d = self.dl.mine.get(&gen)?;
+        if let Some(l) = d.lost_from {
+            return Some(l);
+        }
+        let from = d.streamed_through.max(replica.log_stream_idx(gen)) + 1;
+        let idx = replica
+            .delegate_deps_from(gen, from)?
+            .into_iter()
+            .find(|(_, deps)| replica.deps_lost(deps))
+            .map(|(idx, _)| idx)?;
+        self.deleg_note_lost(gen, idx);
+        Some(idx)
+    }
+
     /// Send the next batch of every generation without one in flight.
     fn deleg_stream(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         if self.dl.mine.is_empty() {
@@ -3250,19 +3291,7 @@ impl Core {
             if let Some(lost) = txs.iter().position(|t| replica.deps_lost(&t.deps)) {
                 let idx = txs[lost].idx;
                 txs.truncate(lost);
-                let d = self.dl.mine.get_mut(&gen).expect("present");
-                if d.lost_from.is_none_or(|l| idx < l) {
-                    d.lost_from = Some(idx);
-                    d.stopped = true;
-                    self.stats.deleg_lost_deps_stopped += 1;
-                    tracing::warn!(
-                        node = self.cfg.node_id,
-                        gen,
-                        idx,
-                        "a row depends on one its generation ended without: \
-                         the generation stops before it, the row is replayed by rid"
-                    );
-                }
+                self.deleg_note_lost(gen, idx);
             }
             let d = self.dl.mine.get(&gen).expect("present");
             if txs.is_empty() {
@@ -4968,9 +4997,10 @@ impl Core {
             // waits for the cursor to reach `through`.
             self.deleg_stream(now, replica, out);
         }
-        // Not past a row whose dependency was lost (`deleg_stream`): it is
-        // never streamed, and the root ends the generation before it.
-        let through = match self.dl.mine.get(&gen).and_then(|d| d.lost_from) {
+        // Not past a row whose dependency was lost (`deleg_stream`, or the
+        // journal read here): it is never streamed, and the root ends the
+        // generation before it.
+        let through = match self.deleg_find_lost(gen, replica) {
             Some(lost) => through.min(lost - 1),
             None => through,
         };

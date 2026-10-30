@@ -1240,6 +1240,28 @@ impl Meta {
     /// delegate's stream is still in the journal (not yet carried by a
     /// segment the replica applied). One seek (`journal_origin`) for a
     /// delegation origin.
+    /// The `deps` of this delegate's transactions of `gen` still in the
+    /// journal from index `from` on, in index order (no records read):
+    /// where a dependency lost with another generation first appears
+    /// (`Core::deleg_find_lost`).
+    pub fn delegate_deps_from(
+        &self,
+        gen: u64,
+        from: u64,
+    ) -> Result<Vec<(u64, crate::session::Position)>, MetaError> {
+        let r = self.db.read_tx();
+        let mut out = Vec::new();
+        for found in journal_origins_from(&r, self, gen, from)? {
+            let (idx, first) = found?;
+            if let Some(row) = get_journal_tx(&r, self, first)? {
+                if row.gen == gen {
+                    out.push((idx, row.deps));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub fn delegate_tx_pending(&self, gen: u64, idx: u64) -> Result<bool, MetaError> {
         let r = self.db.read_tx();
         if gen == 0 {

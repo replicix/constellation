@@ -370,6 +370,9 @@ pub trait Replica {
     /// Put every commit so far on the disk (`Meta::sync`); `false`: the
     /// sync failed.
     fn sync_journal(&self) -> bool;
+    /// The `deps` of this delegate's journaled transactions of `gen` from
+    /// index `from` on (`Meta::delegate_deps_from`); `None`: unreadable.
+    fn delegate_deps_from(&self, gen: u64, from: u64) -> Option<Vec<(u64, Position)>>;
     /// Generation `gen` ended at `cut` (the void rule).
     fn void_stream(&self, gen: u64, cut: u64);
     /// Whether transaction `(gen, idx)` of this delegate's streams is
@@ -1317,6 +1320,12 @@ impl Replica for Meta {
                 true
             }
         }
+    }
+
+    fn delegate_deps_from(&self, gen: u64, from: u64) -> Option<Vec<(u64, Position)>> {
+        Meta::delegate_deps_from(self, gen, from)
+            .map_err(|error| tracing::warn!(%error, gen, "reading a stream's dependencies failed"))
+            .ok()
     }
 
     fn sync_journal(&self) -> bool {

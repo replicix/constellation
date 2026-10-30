@@ -39166,6 +39166,59 @@ mod recall_cut {
         assert_eq!(through, Some(0), "{out:?}");
     }
 
+    /// Review follow-up (fail-before): the stream finds a row whose
+    /// dependency was lost only in a batch it reads. With a batch of
+    /// generation 8 in flight when generation 7 ends, the recall answered
+    /// the whole stream (`delegate_idx`), which the root's cursor can never
+    /// reach: the generation waited for its grant to run out. The answer
+    /// reads the journal and stops before the row.
+    #[test]
+    fn a_recall_answers_before_a_lost_dependency_the_stream_has_not_read() {
+        let (mut h, dir, low, high) = two_ranges();
+        create_in(&mut h, dir, 1, &high);
+        assert!(h.core.dl.mine[&8].inflight.is_some(), "8:1 in flight");
+        create_in(&mut h, dir, 2, &low);
+        let high2 = (0..)
+            .map(|i| format!("m{i}"))
+            .find(|n| constellation_meta::delegation::Range::of(1, n).idx == 1)
+            .unwrap();
+        create_in(&mut h, dir, 3, &high2);
+        assert_eq!(Replica::delegate_idx(&h.meta, 8), 2);
+        Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::RecallCut {
+                dir,
+                gen: 7,
+                through: 0,
+            }],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.mine[&8].inflight.is_some(), "still in flight");
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegRecall {
+                req: OpId(77),
+                dir,
+                gen: 8,
+            },
+        });
+        let through = sends(&out).into_iter().find_map(|(_, m)| match m {
+            PeerMsg::DelegRecalled {
+                gen: 8, through, ..
+            } => Some(*through),
+            _ => None,
+        });
+        assert_eq!(through, Some(1), "{out:?}");
+        assert_eq!(h.core.dl.mine[&8].lost_from, Some(2));
+    }
+
     /// Review must-fix 2 (fail-before): the root takes none of a batch (a
     /// dependency it lacks, or one lost with its generation) and answers
     /// at the same cursor, not refused. The delegate counted the answer as
