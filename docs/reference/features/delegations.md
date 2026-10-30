@@ -138,13 +138,18 @@ through the delegate. It then:
      without limit and every forward, answered behind every earlier row,
      waited for all of it. The lead is judged for each row by its own stream
      index against the horizon the core publishes (the committed prefix plus
-     the lead), so the FUSE fast path cannot journal past it between two
-     steps of the core. A row is also not answered from the disk while an
+     the lead), where the row is journaled and under the store's writer
+     lock, so the FUSE fast path cannot journal past it between two steps of
+     the core, nor can the core's own ops, which decide their class before
+     they wait for that lock: the store classes them again, and the core
+     answers by the class the row got. A row is also not answered from the disk while an
      earlier row of its own node's clients still waits for the root (it was
      journaled past the lead, or before the delegate turned lone): were the
      root to crash, the earlier row would be dropped and the later one
      replayed without the effect it rests on (a create, then a rename of it).
-     Another node's forward is not such a row.
+     Another node's forward does not count: I5 would allow holding the rows
+     behind it, and it is left out for cost (a delegate that serves remote
+     nodes always has one in flight).
    - A designation's rows are non-stealable and answer at once; `ack=s3` waits
      for the log.
 

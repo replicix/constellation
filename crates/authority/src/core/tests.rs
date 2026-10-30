@@ -39190,6 +39190,191 @@ mod deleg_group {
         assert_eq!(queued, vec![rename], "the rename is replayed alone");
     }
 
+    /// The fast path's write of `name` in `dir` as the delegate's FUSE
+    /// thread does it: classed under the writer lock by what the core has
+    /// published ([`Meta::delegate_execute_admitted`]).
+    fn fast_create(meta: &Meta, now: Now, dir: Ino, seq: u64, name: &str) {
+        let ino = meta.allocate_ino(dir).unwrap();
+        let rid = Rid {
+            node: 3,
+            incarnation: 1,
+            seq,
+        };
+        meta.delegate_execute_admitted(
+            &MutateOp::Create {
+                parent: dir,
+                name: name.into(),
+                ino,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            Some(rid),
+            7,
+            Default::default(),
+            &Default::default(),
+            now,
+            Box::new(|| true),
+        )
+        .unwrap();
+    }
+
+    /// What came of a core-path rename ([`core_rename_amid_fast_path_rows`]).
+    struct RenameRace {
+        /// The rename's answer (`None`: not answered).
+        answered: Option<AnswerSource>,
+        /// The journal's `(idx, class, rid)` rows of the generation.
+        rows: Vec<(u64, constellation_meta::RowClass, Option<Rid>)>,
+        /// What the end of the generation at the root's cursor (row 1)
+        /// dropped, and the rids it queued for replay.
+        dropped: usize,
+        queued: Vec<Rid>,
+        rename: Rid,
+        /// Rows the store journaled `DelegGroup` that the core had decided
+        /// `Lone`.
+        demoted: u64,
+    }
+
+    impl RenameRace {
+        fn classes(&self) -> Vec<(u64, constellation_meta::RowClass)> {
+            self.rows.iter().map(|(idx, c, _)| (*idx, *c)).collect()
+        }
+    }
+
+    /// A core-path rename of the delegate's own client while the fast path
+    /// journals rows between the core's decision of its class and the write
+    /// (the core waits for the store's writer lock): the lead is two rows,
+    /// row 1 is journaled and not committed, and `fast` runs right before
+    /// the rename's write, as the FUSE threads' writes do
+    /// (`before_delegate_write_hook`).
+    fn core_rename_amid_fast_path_rows(fast: impl FnOnce(&Meta, Now, Ino) + 'static) -> RenameRace {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        h.core.cfg.delegation_stream_rows = 2;
+        let (_, out) = own_create(&mut h, dir, 1);
+        assert_eq!(
+            client_answers(&out)[0].1,
+            AnswerSource::Sequenced(AckClass::Lone)
+        );
+        let now = h.clk();
+        constellation_meta::before_delegate_write_hook::set(Some(Box::new(move |meta| {
+            fast(meta, now, dir)
+        })));
+        let (rename, out) = own_rename(&mut h, dir, 4, "f", "g");
+        constellation_meta::before_delegate_write_hook::set(None);
+        let answered = client_answers(&out)
+            .into_iter()
+            .find(|(rid, _)| *rid == rename)
+            .map(|(_, source)| source);
+        let rows = h.meta.delegate_rows_for_audit(7).unwrap();
+        // The root crashes holding row 1: the generation ends with the cut
+        // there, and what is left of it strands.
+        let applied = Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::RecallCut {
+                dir,
+                gen: 7,
+                through: 1,
+            }],
+        )
+        .unwrap();
+        let queued: Vec<Rid> = h
+            .meta
+            .pending_replays()
+            .unwrap()
+            .into_iter()
+            .map(|q| q.rid)
+            .filter(|rid| rid.seq > 1)
+            .collect();
+        RenameRace {
+            answered,
+            rows,
+            dropped: applied.stranded.deleg_dropped,
+            queued,
+            rename,
+            demoted: h.core.stats.deleg_lone_demoted,
+        }
+    }
+
+    /// Review follow-up of F1/F2 (fail-before): the core decides an own op's
+    /// class from the journal as it stands, then waits for the store's
+    /// writer lock; the fast path journals meanwhile. Here the lead is two
+    /// rows past the root's cursor (nothing committed, row 1 journaled): the
+    /// core finds room for one `Lone` row and decides the rename `Lone`; the
+    /// fast path then journals `x` (row 2, the last within the lead) and the
+    /// create of `f` (row 3, past it: `DelegGroup`, its client waits), and
+    /// the rename was journaled as row 4, past the lead and behind the open
+    /// create, and answered `Lone`. At the root's crash the create is
+    /// dropped and the rename replayed without it: it fails, after its
+    /// client was told it succeeded. Now `Meta::finish_local` classes the
+    /// core's own row too, under the writer lock, and the core answers by the
+    /// class the row was journaled with: the rename waits for the root like
+    /// the create, and both are dropped.
+    #[test]
+    fn a_core_path_lone_row_is_not_journaled_past_the_lead_and_behind_an_open_gated_row() {
+        use constellation_meta::RowClass;
+        let r = core_rename_amid_fast_path_rows(|meta, now, dir| {
+            fast_create(meta, now, dir, 2, "x");
+            fast_create(meta, now, dir, 3, "f");
+        });
+        assert_eq!(
+            r.classes(),
+            vec![
+                (1, RowClass::Lone),
+                (2, RowClass::Lone),
+                (3, RowClass::DelegGroup),
+                (4, RowClass::DelegGroup),
+            ],
+            "the rename's row waits for the root: {:?}",
+            r.rows
+        );
+        assert_eq!(r.answered, None, "the rename waits for the root");
+        assert_eq!(r.demoted, 1);
+        assert_eq!(r.dropped, 2, "the create and the rename are dropped");
+        assert_eq!(r.queued.len(), 1, "only x is replayed: {:?}", r.queued);
+        assert!(!r.queued.contains(&r.rename));
+    }
+
+    /// The same inside the lead: the published class lags the core's
+    /// decision (the core publishes at the end of a step), so a write the
+    /// fast path journals in between is still `DelegGroup` (the delegate
+    /// had a backup candidate a step ago), and the rename the core decided
+    /// `Lone` was journaled behind that open row.
+    #[test]
+    fn a_core_path_lone_row_is_not_journaled_behind_an_open_gated_row_within_the_lead() {
+        use constellation_meta::RowClass;
+        let r = core_rename_amid_fast_path_rows(|meta, now, dir| {
+            meta.session().set_deleg_durable(
+                7,
+                Some(constellation_meta::DelegDurable {
+                    class: RowClass::DelegGroup,
+                    through: 0,
+                    horizon: u64::MAX,
+                    lost: false,
+                }),
+            );
+            fast_create(meta, now, dir, 2, "f");
+        });
+        assert_eq!(
+            r.classes(),
+            vec![
+                (1, RowClass::Lone),
+                (2, RowClass::DelegGroup),
+                (3, RowClass::DelegGroup),
+            ],
+            "{:?}",
+            r.rows
+        );
+        assert_eq!(r.answered, None, "the rename waits for the root");
+        assert_eq!(r.demoted, 1);
+        assert_eq!(r.dropped, 2, "the create and the rename are dropped");
+        assert!(r.queued.is_empty(), "nothing is replayed: {:?}", r.queued);
+    }
+
     /// A backup counts only once the delegate's own table records a
     /// `DelegGroup` naming it (D4): its acknowledgements before that are not
     /// the delegate's commit; after, they are, and the root's append is not

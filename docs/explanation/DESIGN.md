@@ -892,12 +892,15 @@ lease and one log
   the root included, within `CONSTELLATION_BACKUP_RTT_BUDGET_MS` — which
   answers its own node's client from its disk while its journal is within a
   bounded lead of the root's cursor (a stream batch's worth, applied to each
-  row by its own index, the fast path's included; past it its own rows wait
+  row by its own index where the row is journaled, the fast path's and the
+  core's alike; past it its own rows wait
   for the root as well, so another node's forward, which waits for the root
   behind every earlier row, waits a few batches at most) and no earlier row of
   its own node's clients is still waiting for the root (a `Lone` row behind
   an uncommitted `DelegGroup` row would be replayed alone, without its
-  effect, after a root crash dropped the row it rests on;
+  effect, after a root crash dropped the row it rests on; another node's
+  forward does not count, which I5 would allow, to spare a delegate that
+  serves remote nodes the cost;
   [ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3));
   another node's forward always waits for the root. The delegate's own FUSE fast path writes
   first and waits for the group afterwards: it journals the row with the

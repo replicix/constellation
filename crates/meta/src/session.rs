@@ -396,6 +396,17 @@ pub enum SessionWait {
 /// everything from 2^(N-2) ms up.
 pub const WAIT_BUCKETS: usize = 14;
 
+/// A `Lone` class holds for the row that takes stream index `idx` only
+/// within the horizon (the committed prefix plus the lead,
+/// [`DelegDurable::horizon`]) and behind no gated row of the delegate's own
+/// node's clients that the committed prefix `committed` does not cover
+/// (`gated`: the highest such index journaled). The row waits for the group
+/// otherwise. `committed` and `horizon` are what the caller knew, which lags
+/// the truth: the error only ever makes the class stronger.
+pub(crate) fn lone_row_holds(idx: u64, gated: u64, committed: u64, horizon: u64) -> bool {
+    idx > horizon || gated > committed
+}
+
 /// Counters for `status` (plan 30 §M6's read-latency measurement).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionStats {
@@ -440,6 +451,12 @@ pub struct SessionStats {
     /// Plan 43 C1-2 (D4): fast-path answers given with the gate off whose
     /// rows were re-tagged `Lone`.
     pub fast_acks_downgraded: u64,
+    /// Own rows of a lone delegate that were `Lone` by the class the core
+    /// decided or published and went `DelegGroup` when journaled, under the
+    /// writer lock (`Meta::finish_local`, `lone_row_holds`): past the lead,
+    /// and behind a gated row of the generation that had not committed.
+    pub lone_demoted_past_lead: u64,
+    pub lone_demoted_behind_gated: u64,
 }
 
 #[derive(Default)]
@@ -912,6 +929,16 @@ impl SessionState {
 
     pub fn count_fast_ack_downgraded(&self) {
         self.stats.lock().unwrap().fast_acks_downgraded += 1;
+    }
+
+    /// A `Lone` row went `DelegGroup` at the journaling.
+    pub(crate) fn note_lone_demoted(&self, past_lead: bool) {
+        let mut s = self.stats.lock().unwrap();
+        if past_lead {
+            s.lone_demoted_past_lead += 1;
+        } else {
+            s.lone_demoted_behind_gated += 1;
+        }
     }
 
     pub fn count_fast_ack_in_doubt(&self) {
@@ -1478,15 +1505,16 @@ impl SessionState {
     /// is published lags the journal and the commit (the core publishes at
     /// the end of a step), and both lags only ever make the class stronger.
     pub fn deleg_row_class_at(&self, gen: u64, idx: u64, gated: u64) -> Option<RowClass> {
-        let g = self.inner.lock().unwrap();
-        let d = g.deleg_durable.get(&gen)?;
-        Some(
-            if d.class == RowClass::Lone && (idx > d.horizon || gated > d.through) {
-                RowClass::DelegGroup
-            } else {
-                d.class
-            },
-        )
+        let (class, horizon, through) = {
+            let g = self.inner.lock().unwrap();
+            let d = g.deleg_durable.get(&gen)?;
+            (d.class, d.horizon, d.through)
+        };
+        if class == RowClass::Lone && lone_row_holds(idx, gated, through, horizon) {
+            self.note_lone_demoted(idx > horizon);
+            return Some(RowClass::DelegGroup);
+        }
+        Some(class)
     }
 
     /// Plan 43 C2d: the delegate fast path's wait for its group. The op

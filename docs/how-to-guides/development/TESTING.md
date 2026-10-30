@@ -4522,8 +4522,11 @@ ahead of it, or an earlier row of its own node's clients still waits for
 it), `long-delegated-lead-off` and `long-delegated-hysteresis-off` (the
 negative controls of the `LoneLead` oracle, which fails every run in which a
 lone delegate's own `Lone` row is more than the lead past the committed
-prefix or behind an uncommitted gated row of its own: they fail by design,
-`SWEEP-LONE-LEAD-TOTALS` counts the rows judged), and every
+prefix or behind an uncommitted gated row of its own, judging each row once,
+the step it first shows in the journal, against the prefix known then: they
+fail by design, `SWEEP-LONE-LEAD-TOTALS` counts the rows judged, the ops the
+gated mark alone held back from `Lone`, and the `Lone` decisions the store made
+`DelegGroup` where it journaled the row), and every
 lock configuration of `long_locks` (`locks`, `locks-partition`, …,
 `locks-failover-backup-writes`). Use each long test's own start (its
 source) to sweep the same seeds.

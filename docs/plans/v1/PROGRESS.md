@@ -61486,3 +61486,83 @@ to 4.8.
 Not done: k stream batches in flight with lead = k x batch (it changes the stream's protocol, not a class rule). ADR-33,
 DESIGN.md, delegations.md and TESTING.md say the new rule.
 
+
+## Review follow-up: the core's own ops are classed where they are journaled (2026-10-30)
+
+The gap 5008d56a named. The core decides an own op's class (`Core::deleg_ack_class`) from the journal as it stands, in
+read transactions, and journals the op later, once it holds the store's writer lock; `Meta::finish_local` classed only
+the fast path's rows by their place in the stream, and took a class the core had set as it was. The FUSE threads' rows
+that went in between could therefore put a core-path `Lone` row past the lead or behind an open gated row. Core-path own
+ops are common (deps not reached, a refusal at the write, keys of another owner or of two generations). The sequence:
+lead L, committed c, `delegate_idx` c+L-1; the core decides B's `rename f` `Lone` and waits for the lock; the fast path
+journals c+L `Lone`, then A's `create f` at c+L+1 `DelegGroup` (gated mark set); the core journals the rename at c+L+2
+`Lone` and answers; the root crashes; the recall strand drops the gated create and replays the rename, which fails: an
+acknowledged rename lost. A published class that lags (it flips `DelegGroup` to `Lone` at the end of a core step) is
+the same race with no lead involved, and on the fast path it was already covered (the fast path classes each row at
+the write from the published values, which lag the truth on the safe side).
+
+Fix. `PendingClass::set_own` carries the committed prefix and the horizon the core knew when it decided (`OwnLimits`;
+`u64::MAX` for both where the decision is not `Lone`, and for the committed prefix with the hysteresis off). In
+`finish_local`, under the writer lock, an own `Lone` row is journaled `DelegGroup` when its index is past the horizon or
+a gated row of the generation above the committed prefix exists (`session::lone_row_holds`, the one test the fast path
+uses too); both inputs lag the truth, so the error only goes toward the stronger class, and the demoted row sets the
+gated mark like any gated row. The core clears the thread's last-journaled row before it executes and reads the class
+the row got afterwards (`take_last_journaled`): a `Lone` decision whose row came out gated becomes `DelegGroup { gen }`,
+so the answer parks on the row's commit (`deleg_lone_demoted`). The refusal rows the core journals go through the same
+guard. Counters: `Core::stats.deleg_lone_held_by_gate` (the core decided `DelegGroup` for a lone delegate for the
+gated mark alone, the lead having room), `deleg_lone_demoted`, and in `SessionStats` `lone_demoted_past_lead` and
+`lone_demoted_behind_gated` (both paths).
+
+Oracle. `LoneLead` now judges each own `Lone` row once, the step it first shows in the journal, against the prefix known
+then (the prefix at the journaling; a later look weakens both rules, the prefix only grows and a gated row commits), and
+counts non-vacuity of the gated mark: `held_by_gate` and `demoted_at_journal`, printed with `SWEEP-LONE-LEAD-TOTALS`
+and per seed as `SWEEP-LONE-GATE`. The test a_lone_delegates_own_lone_rows_stay_within_the_lead_and_behind_no_open_gated_row
+asserts `held_by_gate > 0` and now runs seeds 57 and 103 as well, which hold an own op back for the mark alone (so do
+235 and 377 of the first 400); the other six seeds never do, so the assertion needed them. The simulation's fast path
+journals through `delegate_execute_admitted` but never between the core's decision and its write, so
+`demoted_at_journal` stays 0 there; the race is the unit tests' (below).
+
+Tests. `Meta::delegate_execute` runs a test-only hook (`before_delegate_write_hook`, `test-util`) once on the calling
+thread before the op's transaction: it stands for the FUSE threads' writes between the core's decision and its write.
+Core: a_core_path_lone_row_is_not_journaled_past_the_lead_and_behind_an_open_gated_row (lead 2, row 1 journaled; the
+hook journals `x` as row 2 `Lone` and the create of `f` as row 3 `DelegGroup`; the core's rename, decided `Lone`, is row
+4: it must be `DelegGroup`, parked, and at the root's crash both the create and the rename are dropped and only `x` is
+replayed) and a_core_path_lone_row_is_not_journaled_behind_an_open_gated_row_within_the_lead (the published class is a
+step old, `DelegGroup`: the hook's create is gated within the lead, the rename follows). Meta:
+an_own_lone_row_is_classed_again_where_it_is_journaled (the limits, the mark, a forward's row left alone, the counters).
+
+Fail-before (log `fb1`, on 5008d56a plus the hook alone): both core tests fail. The first journals rows
+`[(1, Lone), (2, Lone), (3, DelegGroup), (4, Lone)]`, the rename past the lead and behind the open create and answered
+`Lone`; the second `[(1, Lone), (2, DelegGroup), (3, Lone)]`. With the fix they pass. Mutations of the fix, tests
+kept: with the demotion in `finish_local` switched off the two core tests and the meta test fail (logs `mut1`, `mut1b`);
+with the core's read-back removed (the row is journaled `DelegGroup` and answered `Lone`) the two core tests fail on
+the answer (`mut2`).
+
+Cross-generation. Checked, no fix: a second generation of this node (a delegation of another directory, or of this one
+again) cannot hold an own `Lone` row that rests on an uncommitted gated row of the first. An op whose keys touch two
+delegations (or a delegation and the root) is `CrossSubtree` and goes to the root, which recalls both, so a row of the
+second generation touches only keys of its own subtree, which the first generation's rows do not write. A re-delegation of
+the same directory follows the first generation's `RecallCut` in the log; the node applies the segment that carries the
+cut, and strands the rows of that generation past it (the gated ones dropped; the strand takes the recalled
+generation's rows only, `LiveEntry::stranded_by_recall`), before it can apply the later `Delegate` record and the core
+execute under the new generation. The wait of a dedup answer across generations
+(`deleg_dedup_wait`) is for a retry whose rid's row is in the older generation and is unchanged. The gated mark stays
+per generation: a per-node mark would hold the lone rows of every other generation behind one generation's
+backlog, for a dependency that cannot exist.
+
+Docs: ADR-33, DESIGN.md, delegations.md and TESTING.md say where an own row is classed. Their wording on forwards is
+corrected: leaving another node's forward out of the hysteresis is allowed by I5 (a `Lone` answer may be rolled back)
+and is held for cost (a delegate that serves remote nodes always has one in flight), not because a forward's client is
+not answered by this node's disk.
+
+Gates (rebased on 13b209f9, on the change as committed): fmt, clippy `-D warnings` (workspace, all targets), lib tests of
+authority (788 passed, 2 ignored; two new), engine (937) and meta (378; one new), the release authority sim suite (280
+passed, 11 ignored). The two mutations fail the same tests again. 2,000-seed sweeps of `long-delegated`,
+`long-delegated-lead`, `delegated-backup-and-delegate-die` and its `-abandon`, and 1,000 of `delegated-backup`: no
+failure, `LoneLead` at 0 and 0. Before the rebase (on 5008d56a): the harness lib tests (162), `long-delegated-late-answers`,
+every `delegated-*` configuration and `long-delegated-backup` (seeds 0 to 1681 and 1683 to 1999; seed 1682 grows past
+9 GB without finishing, on `main` too) at 2,000 seeds, no failure; the three variants that fail on every seed by design
+(`delegated-core-stall-unlaned`, `delegated-core-stall-root-unlaned`, `delegated-core-stall-root-backup-unprobed`, run
+for 100 seeds) still fail on the core-stall check, not the oracle. `long-delegated-lead` held an own op back for the
+gated mark alone 14 times in 2,000 seeds (the non-vacuity of the hysteresis); the simulation cannot provoke a `Lone`
+decision made `DelegGroup` at the journaling.

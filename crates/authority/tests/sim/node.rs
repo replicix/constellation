@@ -712,6 +712,7 @@ impl NodeHandle {
             oracles: env.oracles.clone(),
             forwards: HashMap::new(),
             lone_audit_seen: BTreeMap::new(),
+            lone_stats_seen: None,
             rebuild_stub: env.rebuild_stub,
             plant_ungated_fast_path: env.plant_ungated_fast_path,
             plant_claim_root_group_on_lone: env.plant_claim_root_group_on_lone,
@@ -983,6 +984,9 @@ struct Driver {
     /// committed prefix the lone-lead oracle last judged, so a step that
     /// changed neither is not judged again.
     lone_audit_seen: BTreeMap<u64, (u64, u64)>,
+    /// The counters of the lone-lead oracle's non-vacuity (`LoneLead`)
+    /// as this driver last read them: `(held_by_gate, demoted)`.
+    lone_stats_seen: Option<(u64, u64)>,
     rebuild_stub: bool,
     plant_ungated_fast_path: bool,
     plant_claim_root_group_on_lone: bool,
@@ -2399,6 +2403,21 @@ impl Driver {
         let mut view = constellation_authority::core::DelegView::default();
         self.core.deleg_view_local(&mut view);
         let lead = (self.core.config().delegation_stream_rows as u64).max(1);
+        // The counters that show the rule was exercised: read as deltas (a
+        // restart brings a new core, whose counters start again).
+        let session = self.meta.session().stats();
+        let now = (
+            self.core.stats.deleg_lone_held_by_gate,
+            self.core.stats.deleg_lone_demoted
+                + session.lone_demoted_past_lead
+                + session.lone_demoted_behind_gated,
+        );
+        if let Some(seen) = self.lone_stats_seen {
+            let mut ll = self.oracles.lone_lead.lock().unwrap();
+            ll.held_by_gate += now.0.saturating_sub(seen.0);
+            ll.demoted_at_journal += now.1.saturating_sub(seen.1);
+        }
+        self.lone_stats_seen = Some(now);
         for m in &view.mine {
             let gen = m.1;
             let Some(committed) = self.core.deleg_committed_for_audit(gen, &*self.meta) else {

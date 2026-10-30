@@ -1607,7 +1607,16 @@ lead is exact, not approximate: the core publishes the horizon (the committed
 prefix plus the lead) with the class, and the fast path classes each row by
 its own stream index against it under the writer lock, so what the fast path
 journals between two core steps cannot pass the lead (the error only ever
-goes toward the stronger class). The lead flips a lone delegate between `Lone`
+goes toward the stronger class). The core's own ops are classed the same way
+where they are journaled: the core decides an op's class from the journal as
+it stands and then waits for the writer lock, and the fast path's rows go in
+meanwhile, so the store classes the core's own row again by its place in the
+stream against the committed prefix and horizon the core knew (which only lag
+the truth), journals `DelegGroup` where the decision no longer holds, and the
+core answers by the class the row was journaled with, parking it like any
+`DelegGroup` row (2026-10-30: found by review; a rename the core decided
+`Lone` was journaled past the lead and behind a create the fast path had
+journaled `DelegGroup`). The lead flips a lone delegate between `Lone`
 and `DelegGroup`, so a `Lone` row also waits for the gated rows before it:
 while a gated row journaled for the delegate's own node's clients is
 uncommitted, its later rows are `DelegGroup` too (2026-10-29: a create that
@@ -1615,10 +1624,12 @@ waited for the root, then a rename of it answered from the disk, and a root
 crash drops the create at the strand and replays the rename, which fails on a
 name never created; I5 allows this, the answer was `Lone`, but nothing is
 gained by it; the same held for a delegate that turned lone after journaling
-`DelegGroup` rows). Another node's forward is not such a row: it is
-`DelegGroup` by design, and holding the delegate's own rows behind every
-forward would take the speculation from a delegate that serves remote nodes at
-all. The
+`DelegGroup` rows). Another node's forward is not counted among those rows,
+though holding the own rows behind it would be safe too: I5 allows rolling a
+`Lone` answer back, so excluding forwards is a choice, made for cost. A
+forward is `DelegGroup` by design, a delegate that serves remote nodes always
+has one in flight, and holding its own rows behind every forward would take
+the speculation from it altogether. The
 class is fixed when the row is journaled, a retry's answer waits for its row
 like the first answer did (D6), and the end of a generation drops the
 uncommitted rows past its cut instead of replaying them (their clients were

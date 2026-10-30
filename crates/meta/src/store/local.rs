@@ -609,7 +609,7 @@ impl Meta {
         // rows); the FUSE fast path's threads publish nothing of their own
         // and take the class the core last published with the gate, which
         // is what their wait follows.
-        let class = match (journal::PendingClass::current(), class_at_journal) {
+        let mut class = match (journal::PendingClass::current(), class_at_journal) {
             (Some(c), _) | (None, Some(c)) => c,
             (None, None) if delegated => RowClass::Lone,
             (None, None) => {
@@ -620,13 +620,27 @@ impl Meta {
         // Plan 43 C2 (hysteresis): a gated row of this delegate's own node's
         // clients is the generation's gated high-water: its `Lone` rows
         // are journaled only after it has committed (`deleg_gated_key`).
-        if gen != 0 && class.gated() && (class_at_journal.is_some() || journal::PendingClass::own())
-        {
+        //
+        // The core's own op arrives with the class the core decided before
+        // it waited for this writer lock (`PendingClass::set_own`), and the
+        // FUSE fast path's rows may have gone in since. It is classed here
+        // as the fast path's is, by its own place in the stream, against
+        // what the core knew then (which only lags): `DelegGroup` where it
+        // is past the lead or follows a gated row that has not committed.
+        // The core reads the class the row got.
+        let own = journal::PendingClass::own();
+        if gen != 0 && (class_at_journal.is_some() || own.is_some()) {
             let key = deleg_gated_key(gen);
             let held = kv_get_tx(tx, &self.local, &key)?
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(0);
-            if idx > held {
+            if let (RowClass::Lone, Some(limits)) = (class, own) {
+                if crate::session::lone_row_holds(idx, held, limits.committed, limits.horizon) {
+                    self.session().note_lone_demoted(idx > limits.horizon);
+                    class = RowClass::DelegGroup;
+                }
+            }
+            if class.gated() && idx > held {
                 kv_set_tx(tx, &self.local, &key, &idx.to_string());
             }
         }
@@ -676,6 +690,8 @@ impl Meta {
         tag: &crate::locks::LockTag,
         now: constellation_types::clock::Now,
     ) -> Result<(Vec<LogRecord>, u64), MetaError> {
+        #[cfg(any(test, feature = "test-util"))]
+        journal::before_delegate_write_hook::fire(self);
         let _d = journal::PendingDelegate::set(gen, None, deps);
         let records = crate::mutate::execute_tagged(self, op, rid, tag, now)?;
         let idx = self.delegate_idx(gen)?;
@@ -2103,6 +2119,96 @@ mod root_substitution_tests {
             (root.attr.uid, root.attr.gid),
             (1000, 1000),
             "the log-prefix root carries the shipped owner"
+        );
+    }
+
+    /// The core decides an own op's class before it waits for the writer
+    /// lock, and the fast path's rows may go in meanwhile: the store classes
+    /// the core's row again where it journals it (`PendingClass::set_own`),
+    /// against what the core knew: `Lone` stays only within the horizon and
+    /// behind no gated row of the node's own that the committed prefix does
+    /// not cover, and the class only ever goes to the stronger one. A row
+    /// that is not the node's own client's (a forward) is left as it was
+    /// decided.
+    #[test]
+    fn an_own_lone_row_is_classed_again_where_it_is_journaled() {
+        use crate::store::journal::{
+            clear_last_journaled, take_last_journaled, OwnLimits, PendingClass,
+        };
+        let meta = Meta::open_in_memory().unwrap();
+        let mut n = 0;
+        let mut journal = |class: Option<(RowClass, Option<OwnLimits>)>| -> (u64, RowClass) {
+            n += 1;
+            let _class = class.map(|(c, limits)| match limits {
+                Some(l) => PendingClass::set_own(c, l),
+                None => PendingClass::set(c),
+            });
+            clear_last_journaled();
+            let (_, idx) = meta
+                .delegate_execute(
+                    &MutateOp::Create {
+                        parent: ROOT_INO,
+                        name: format!("f{n}"),
+                        ino: (3 << 40) | n,
+                        mode: 0o644,
+                        uid: 0,
+                        gid: 0,
+                    },
+                    Some(Rid {
+                        node: 3,
+                        incarnation: 1,
+                        seq: n,
+                    }),
+                    5,
+                    Default::default(),
+                    &crate::locks::LockTag::NONE,
+                    Now::same(0),
+                )
+                .unwrap();
+            (idx, take_last_journaled().unwrap().class)
+        };
+        let lim =
+            |committed, horizon| Some((RowClass::Lone, Some(OwnLimits { committed, horizon })));
+        // Committed 0, horizon 2: rows 1 and 2 are within it.
+        assert_eq!(journal(lim(0, 2)), (1, RowClass::Lone));
+        assert_eq!(journal(lim(0, 2)), (2, RowClass::Lone));
+        assert_eq!(meta.delegate_gated_idx(5).unwrap(), 0);
+        // Row 3 is past it: it waits for the group, and is the gated mark.
+        assert_eq!(journal(lim(0, 2)), (3, RowClass::DelegGroup));
+        assert_eq!(meta.delegate_gated_idx(5).unwrap(), 3);
+        // A forward's row is the class the core decided, whatever its place,
+        // and sets no mark.
+        assert_eq!(
+            journal(Some((RowClass::Lone, None))),
+            (4, RowClass::Lone),
+            "not an own row"
+        );
+        // Within a horizon that has moved, behind the open row 3: held.
+        assert_eq!(journal(lim(2, 50)), (5, RowClass::DelegGroup));
+        assert_eq!(meta.delegate_gated_idx(5).unwrap(), 5);
+        // Once the prefix covers the mark the row is `Lone` again.
+        assert_eq!(journal(lim(5, 50)), (6, RowClass::Lone));
+        // A class that waits stays, and a limit that says nothing holds
+        // nothing back (the hysteresis and the lead off).
+        assert_eq!(
+            journal(Some((
+                RowClass::DelegGroup,
+                Some(OwnLimits {
+                    committed: 99,
+                    horizon: 99
+                })
+            ))),
+            (7, RowClass::DelegGroup)
+        );
+        assert_eq!(meta.delegate_gated_idx(5).unwrap(), 7);
+        assert_eq!(journal(lim(u64::MAX, u64::MAX)), (8, RowClass::Lone));
+        let stats = meta.session().stats();
+        assert_eq!(
+            (
+                stats.lone_demoted_past_lead,
+                stats.lone_demoted_behind_gated
+            ),
+            (1, 1)
         );
     }
 

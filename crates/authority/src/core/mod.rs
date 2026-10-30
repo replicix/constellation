@@ -1023,6 +1023,13 @@ pub struct Stats {
     pub deleg_backup_appends: u64,
     pub deleg_backup_acks: u64,
     pub deleg_acks_parked: u64,
+    /// A lone delegate's own op that a gated row of its own, not committed,
+    /// kept from being `Lone` when its class was decided (not the lead:
+    /// `Core::deleg_lone_held_by_gated`), and one the store journaled
+    /// `DelegGroup` that the core had decided `Lone`
+    /// (`Meta::finish_local`: the fast path's rows went in meanwhile).
+    pub deleg_lone_held_by_gate: u64,
+    pub deleg_lone_demoted: u64,
     /// Plan 43 C2 (D7): parked delegate acknowledgements aborted because
     /// their row left the journal without the log carrying it.
     pub deleg_acks_dropped: u64,

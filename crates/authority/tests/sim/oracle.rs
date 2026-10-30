@@ -79,11 +79,13 @@ pub struct Oracles {
 /// The lone delegate's lead oracle (`Core::deleg_lone_held`): a row of its
 /// own node's clients is `Lone` only when its journal is fewer transactions
 /// past the committed prefix than the lead, and when no gated row of its
-/// own node's clients is uncommitted before it. Checked after every step
-/// against the delegate's journal and what it knows to be committed: a
-/// `Lone` row past `committed + lead` could not have been within the lead
-/// when it was journaled (the prefix only grows), and a `Lone` row behind a
-/// gated row that is still uncommitted was journaled while it was.
+/// own node's clients is uncommitted before it.
+///
+/// A row is judged once, the step it first shows in the journal, against the
+/// prefix the delegate knew committed then: the prefix at the journaling
+/// (the class is decided under the writer lock, and the step that journaled
+/// a row moved the prefix no further). A later look would weaken both
+/// rules: the prefix only grows, and a gated row commits.
 #[derive(Default)]
 pub struct LoneLead {
     /// `(node, gen, idx)` of own `Lone` rows more than the lead past the
@@ -99,6 +101,14 @@ pub struct LoneLead {
     pub lone_rows_seen: BTreeSet<(NodeId, u64, u64)>,
     /// Own gated rows seen the same way.
     pub gated_rows_seen: BTreeSet<(NodeId, u64, u64)>,
+    /// Non-vacuity of the gated mark: decisions of a lone delegate's own
+    /// op that an uncommitted gated row of its own alone held back from
+    /// `Lone` (the lead had room), and `Lone` decisions the store made
+    /// `DelegGroup` where it journaled the row (past the lead, or behind
+    /// such a gated row). A run that never held a row for the mark never
+    /// exercised the hysteresis, whatever the rows say.
+    pub held_by_gate: u64,
+    pub demoted_at_journal: u64,
     /// The highest prefix each delegate has known committed: the group's
     /// own count can dip while it changes (a requested backup holds
     /// nothing yet), the commit point of a row already journaled does not.
@@ -133,7 +143,10 @@ impl LoneLead {
                     open_gated = Some(*idx);
                 }
             } else if *class == constellation_meta::RowClass::Lone {
-                self.lone_rows_seen.insert(key);
+                // Judged the once, when it first shows.
+                if !self.lone_rows_seen.insert(key) {
+                    continue;
+                }
                 if *idx > committed.saturating_add(lead) && self.past_lead.insert(key) {
                     self.note(format!(
                         "node {node} gen {gen}: own Lone row {idx} is more than the lead \

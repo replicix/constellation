@@ -103,7 +103,7 @@ thread_local! {
     static LAST_JOURNALED: std::cell::Cell<Option<JournaledRow>> =
         const { std::cell::Cell::new(None) };
     static FROM_SESSION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static PENDING_OWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PENDING_OWN: std::cell::Cell<Option<OwnLimits>> = const { std::cell::Cell::new(None) };
 }
 
 /// How many rows this thread journaled with the session's published class
@@ -132,7 +132,7 @@ impl PendingClass {
     pub fn set(class: crate::store::local::RowClass) -> PendingClassGuard {
         PendingClassGuard {
             prev: PENDING_CLASS.with(|c| c.replace(Some(class))),
-            prev_own: PENDING_OWN.with(|c| c.replace(false)),
+            prev_own: PENDING_OWN.with(|c| c.replace(None)),
         }
     }
 
@@ -140,10 +140,19 @@ impl PendingClass {
     /// by the delegate (not another node's forward). A gated one is
     /// recorded against its generation (`Meta::delegate_gated_idx`): the
     /// delegate's `Lone` rows wait for it to commit.
-    pub fn set_own(class: crate::store::local::RowClass) -> PendingClassGuard {
+    ///
+    /// A `Lone` class is the core's decision from the journal as it stood
+    /// then; the row is journaled later, once the op holds the writer lock,
+    /// and the FUSE fast path's rows may have gone in between.
+    /// `Meta::finish_local` classes the row again by its own place in the
+    /// stream, against `limits` (what the core knew then, which only lags
+    /// the truth), and journals `DelegGroup` where the decision no longer
+    /// holds; the core reads the class the row got
+    /// ([`take_last_journaled`]).
+    pub fn set_own(class: crate::store::local::RowClass, limits: OwnLimits) -> PendingClassGuard {
         PendingClassGuard {
             prev: PENDING_CLASS.with(|c| c.replace(Some(class))),
-            prev_own: PENDING_OWN.with(|c| c.replace(true)),
+            prev_own: PENDING_OWN.with(|c| c.replace(Some(limits))),
         }
     }
 
@@ -151,14 +160,31 @@ impl PendingClass {
         PENDING_CLASS.with(|c| c.get())
     }
 
-    pub(crate) fn own() -> bool {
+    /// Set for a row of the delegate's own node's client (the limits the
+    /// core decided its class under).
+    pub(crate) fn own() -> Option<OwnLimits> {
         PENDING_OWN.with(|c| c.get())
     }
 }
 
+/// What the core knew of a generation's stream when it decided the class of
+/// an own op ([`PendingClass::set_own`]): the committed prefix and the
+/// highest index a `Lone` row may take (`DelegDurable::horizon`). Both are
+/// read before the op waits for the writer lock and only lag the truth (the
+/// prefix only grows), so a class judged against them is never weaker than
+/// one judged at the write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnLimits {
+    /// A gated row of this node's own clients at or below this index has
+    /// committed (`u64::MAX`: no row holds a `Lone` one back).
+    pub committed: u64,
+    /// The highest index a `Lone` row may take (`u64::MAX`: no limit).
+    pub horizon: u64,
+}
+
 pub struct PendingClassGuard {
     prev: Option<crate::store::local::RowClass>,
-    prev_own: bool,
+    prev_own: Option<OwnLimits>,
 }
 
 thread_local! {
@@ -358,6 +384,39 @@ pub mod write_check_hook {
         let go = hook(at);
         HOOK.with(|h| *h.borrow_mut() = Some(hook));
         go
+    }
+}
+
+/// Tests only (`test-util`): a closure run once on the calling thread at the
+/// start of [`crate::Meta::delegate_execute`], before the op's transaction
+/// takes the writer lock: what another thread (the FUSE fast path) journals
+/// while a core-path op waits for the lock, between the class the core
+/// decided and the row's journaling. It runs with the core's pending class
+/// out of the way, as another thread would see it.
+#[cfg(any(test, feature = "test-util"))]
+pub mod before_delegate_write_hook {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnOnce(&crate::Meta)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Install (or, `None`, remove) this thread's hook; it fires once.
+    pub fn set(hook: Option<Hook>) {
+        HOOK.with(|h| *h.borrow_mut() = hook);
+    }
+
+    pub(crate) fn fire(meta: &crate::Meta) {
+        let Some(hook) = HOOK.with(|h| h.borrow_mut().take()) else {
+            return;
+        };
+        let class = super::PENDING_CLASS.with(|c| c.take());
+        let own = super::PENDING_OWN.with(|c| c.take());
+        hook(meta);
+        super::PENDING_CLASS.with(|c| c.set(class));
+        super::PENDING_OWN.with(|c| c.set(own));
     }
 }
 

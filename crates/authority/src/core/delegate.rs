@@ -1238,6 +1238,7 @@ impl Core {
         deps: Position,
         replica: &dyn Replica,
     ) {
+        constellation_meta::clear_last_journaled();
         if let Err(error) = replica.delegate_refusal(rid, code, gen, deps) {
             tracing::warn!(node = self.me(), ?rid, %code, %error, "could not journal a delegate refusal");
             return;
@@ -1459,15 +1460,34 @@ impl Core {
                 (wait_gen, exec_idx) = (g, Some(idx));
             }
         }
+        // (Only a `Lone` decision can be undone at the journaling.)
+        let limits = if class == AckClass::Lone {
+            self.deleg_own_limits(gen, replica)
+        } else {
+            constellation_meta::OwnLimits {
+                committed: u64::MAX,
+                horizon: u64::MAX,
+            }
+        };
         let _row_class = (!dedup).then(|| {
             // The delegate's own node's rows are the ones its `Lone` rows
-            // follow ([`Self::deleg_lone_held_by_gated`]).
+            // follow ([`Self::deleg_lone_held_by_gated`]), and the ones the
+            // store classes again where it journals them: the fast path's
+            // rows may go in between (see below).
             if asker == Asker::Own {
-                constellation_meta::PendingClass::set_own(class.into())
+                constellation_meta::PendingClass::set_own(class.into(), limits)
             } else {
                 constellation_meta::PendingClass::set(class.into())
             }
         });
+        if !dedup
+            && asker == Asker::Own
+            && matches!(class, AckClass::DelegGroup { .. })
+            && self.deleg_lone_held_by_gate_alone(now, gen, replica)
+        {
+            self.stats.deleg_lone_held_by_gate += 1;
+        }
+        constellation_meta::clear_last_journaled();
         let outcome = if let Some(records) = replica.recent_outcome(rid) {
             self.stats.forward_dedup_hits += 1;
             MutateOutcome::Accepted { epoch, records }
@@ -1550,6 +1570,22 @@ impl Core {
                 }
             }
         };
+        // The class the row was journaled with is its class. The store
+        // classed the row again where it journaled it, under the writer
+        // lock (`Meta::finish_local`): the FUSE fast path's rows go in
+        // while this core waits for it, and a `Lone` decision made before
+        // that no longer holds for a row past the lead or behind a gated
+        // row that has not committed. Only ever to the stronger class: the
+        // row waits for its group (below) like a `DelegGroup` row the core
+        // decided itself.
+        if !dedup && exec_idx.is_some() && class == AckClass::Lone {
+            if let Some(row) = constellation_meta::take_last_journaled() {
+                if row.class.gated() {
+                    class = AckClass::DelegGroup { gen };
+                    self.stats.deleg_lone_demoted += 1;
+                }
+            }
+        }
         let position = Position {
             seq: replica.applied_seq().unwrap_or(0),
             pending: None,
@@ -1782,13 +1818,55 @@ impl Core {
     /// Published with the class ([`Self::report_deleg_durable`]) so the
     /// fast path classes each row by its own index, under the writer lock,
     /// instead of by the class the core published at the end of its last
-    /// step: the journal moves between the steps of a busy core.
+    /// step: the journal moves between the steps of a busy core. The
+    /// core's own ops carry it with the committed prefix
+    /// ([`Self::deleg_own_limits`]): they wait for the writer lock after
+    /// their class is decided.
     fn deleg_lone_horizon(&self, through: u64) -> u64 {
         if self.cfg.delegation_lone_lead {
             through.saturating_add((self.cfg.delegation_stream_rows as u64).max(1))
         } else {
             u64::MAX
         }
+    }
+
+    /// What the store needs to class an own row again where it journals it
+    /// ([`constellation_meta::PendingClass::set_own`]): the committed prefix
+    /// and the horizon as this core knows them now, which only lag the
+    /// store's truth by the time the row waits for the writer lock. With the
+    /// hysteresis off (the simulation's negative control) no gated row holds
+    /// a `Lone` row back.
+    fn deleg_own_limits(&self, gen: u64, replica: &dyn Replica) -> constellation_meta::OwnLimits {
+        let Some(d) = self.dl.mine.get(&gen) else {
+            return constellation_meta::OwnLimits {
+                committed: u64::MAX,
+                horizon: u64::MAX,
+            };
+        };
+        let committed = self.deleg_committed_through(d, replica.log_stream_idx(gen));
+        constellation_meta::OwnLimits {
+            committed: if self.cfg.delegation_lone_hysteresis {
+                committed
+            } else {
+                u64::MAX
+            },
+            horizon: self.deleg_lone_horizon(committed),
+        }
+    }
+
+    /// The only thing that keeps a lone delegate's next own row from being
+    /// `Lone` is a gated row of its own that has not committed (not the
+    /// lead): for the counter that shows the rule was exercised.
+    fn deleg_lone_held_by_gate_alone(&self, now: Now, gen: u64, replica: &dyn Replica) -> bool {
+        let Some(d) = self.dl.mine.get(&gen) else {
+            return false;
+        };
+        if self.cfg.ack_s3 || d.designated || !self.deleg_lone(now, d) {
+            return false;
+        }
+        let committed = self.deleg_committed_through(d, replica.log_stream_idx(gen));
+        !self.deleg_lone_lead_full(d, replica, committed)
+            && self.deleg_lone_held_by_gated(d, replica, committed)
     }
 
     /// An own `Lone` row of `d`'s generation would follow a gated row of
@@ -1800,7 +1878,9 @@ impl Core {
     /// delegate's class back and forth, and a delegate that turned lone
     /// after journaling `DelegGroup` rows has such rows too: `Lone` returns
     /// only once every one of them has committed. Another node's forward is
-    /// no such row (its client is not answered by this node's disk).
+    /// left out: I5 would allow rolling back a `Lone` answer behind it, and
+    /// counting it would hold a delegate that serves remote nodes back for
+    /// good, for cost.
     fn deleg_lone_held_by_gated(
         &self,
         d: &DelegateState,

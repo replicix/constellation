@@ -1170,6 +1170,11 @@ pub struct Report {
     pub lone_behind_gated: usize,
     pub lone_rows_judged: usize,
     pub gated_rows_judged: usize,
+    /// Non-vacuity of the gated mark: own ops it alone held back from
+    /// `Lone` at the core's decision, and `Lone` decisions the store made
+    /// `DelegGroup` where it journaled the row.
+    pub lone_held_by_gate: u64,
+    pub lone_demoted_at_journal: u64,
 }
 
 pub struct Cluster {
@@ -4970,6 +4975,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.lone_behind_gated = ll.behind_gated.len();
         report.lone_rows_judged = ll.lone_rows_seen.len();
         report.gated_rows_judged = ll.gated_rows_seen.len();
+        report.lone_held_by_gate = ll.held_by_gate;
+        report.lone_demoted_at_journal = ll.demoted_at_journal;
         ll.examples.clone()
     };
     report.oracle_examples = found.examples();

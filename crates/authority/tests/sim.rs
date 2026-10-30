@@ -5641,6 +5641,13 @@ fn sweep_config() {
                 }
                 Ok(report) => {
                     let ord = std::sync::atomic::Ordering::Relaxed;
+                    if report.lone_held_by_gate + report.lone_demoted_at_journal > 0 {
+                        eprintln!(
+                            "SWEEP-LONE-GATE {label} seed {seed}: held back by the gated mark {}, \
+                             made DelegGroup at the journaling {}",
+                            report.lone_held_by_gate, report.lone_demoted_at_journal
+                        );
+                    }
                     oracle_totals.lock().unwrap().add(&label, seed, &report);
                     for s in report.stats.values() {
                         streamed.fetch_add(s.awaited_log_streamed, ord);
@@ -6891,8 +6898,9 @@ struct OracleTotals {
     tokens_window: [u64; 4],
     /// The lone delegate's lead oracle: [own `Lone` rows past the lead,
     /// behind an uncommitted gated row of their own, own `Lone` rows judged,
-    /// own gated rows judged].
-    lone_lead: [u64; 4],
+    /// own gated rows judged, ops the gated mark held back from `Lone`, `Lone`
+    /// decisions made `DelegGroup` where the row was journaled].
+    lone_lead: [u64; 6],
 }
 
 impl OracleTotals {
@@ -6959,6 +6967,8 @@ impl OracleTotals {
             r.lone_behind_gated,
             r.lone_rows_judged,
             r.gated_rows_judged,
+            r.lone_held_by_gate as usize,
+            r.lone_demoted_at_journal as usize,
         ]) {
             *t += n as u64;
         }
@@ -7074,8 +7084,15 @@ impl OracleTotals {
         );
         eprintln!(
             "SWEEP-LONE-LEAD-TOTALS {label} seeds {}/{seeds}: own Lone rows past the lead {}, \
-             behind an uncommitted gated row {}; own rows judged: Lone {}, gated {}",
-            self.seeds, self.lone_lead[0], self.lone_lead[1], self.lone_lead[2], self.lone_lead[3]
+             behind an uncommitted gated row {}; own rows judged: Lone {}, gated {}; held back \
+             by the gated mark {}, made DelegGroup at the journaling {}",
+            self.seeds,
+            self.lone_lead[0],
+            self.lone_lead[1],
+            self.lone_lead[2],
+            self.lone_lead[3],
+            self.lone_lead[4],
+            self.lone_lead[5]
         );
         eprintln!(
             "SWEEP-CLAIM-TOTALS {label} seeds {}/{seeds}: class-claim-mismatch={} in {} seeds, \
@@ -14163,7 +14180,7 @@ fn regression_delegated_backup_links_stalebase_seed_138() {
 /// the rule is exercised (own `Lone` and gated rows were judged).
 #[test]
 fn a_lone_delegates_own_lone_rows_stay_within_the_lead_and_behind_no_open_gated_row() {
-    let (mut lone, mut gated) = (0, 0);
+    let (mut lone, mut gated, mut held) = (0, 0, 0);
     for seed in LONE_LEAD_SEEDS {
         let r = run_seed(seed, long_delegated_lead_config()).unwrap_or_else(|e| {
             panic!(
@@ -14178,14 +14195,23 @@ fn a_lone_delegates_own_lone_rows_stay_within_the_lead_and_behind_no_open_gated_
         );
         lone += r.lone_rows_judged;
         gated += r.gated_rows_judged;
+        held += r.lone_held_by_gate;
     }
     assert!(
         lone > 0 && gated > 0,
         "the oracle judged {lone} own Lone and {gated} own gated rows: the lead never flipped"
     );
+    // Non-vacuity of the gated mark itself: an own op that a gated row of
+    // its own, uncommitted, held back from `Lone` while the lead had room.
+    assert!(
+        held > 0,
+        "no own op was held back from Lone by the gated mark alone: the hysteresis was never exercised"
+    );
 }
 
-const LONE_LEAD_SEEDS: [u64; 6] = [1, 2, 3, 4, 5, 6];
+/// (Seeds 57 and 103 hold an own op back from `Lone` for the gated mark alone,
+/// as do 235 and 377 of the first 400: the non-vacuity of the hysteresis.)
+const LONE_LEAD_SEEDS: [u64; 8] = [1, 2, 3, 4, 5, 6, 57, 103];
 
 /// The oracle's negative controls: with the lead disabled
 /// (`Config::delegation_lone_lead`) a lone delegate journals `Lone` rows past
