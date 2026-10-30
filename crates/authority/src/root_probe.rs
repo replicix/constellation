@@ -140,10 +140,12 @@ pub struct Ticket {
 }
 
 impl Ticket {
-    /// The same read, dated `sent` (a test of the dating: the proof taken at
-    /// the answer instead of the send).
-    #[cfg(test)]
-    pub(crate) fn dated(self, sent: HonourMs) -> Ticket {
+    /// The same read, dated `sent`: the proof taken at the answer instead of
+    /// the send. The simulation's non-vacuity switch for the dating
+    /// (`ProbeMutant::DatedAtReturn`) and the unit tests'; the daemon never
+    /// calls it.
+    #[doc(hidden)]
+    pub fn dated(self, sent: HonourMs) -> Ticket {
         Ticket { sent, ..self }
     }
 }
@@ -176,7 +178,11 @@ struct Inner {
     proof: Option<(u64, HonourMs)>,
     /// The read in flight.
     inflight: Option<Ticket>,
-    waiters: Vec<Waiter>,
+    /// The renewals waiting for a read, by the read's ticket: a read that
+    /// ends wakes its own and no others (an abandoned read's late end must not
+    /// wake the waiters of the newer read, which would decide before it is
+    /// back).
+    waiters: Vec<(u64, Waiter)>,
     /// The send and epoch of the latest read started (the round gate).
     last_sent: Option<(u64, HonourMs)>,
     /// The latest epoch a read showed deposed.
@@ -265,7 +271,7 @@ impl RootProbe {
         }
         if let Some(t) = g.inflight {
             if t.epoch == epoch && now.since(t.sent) < window_ms {
-                g.waiters.push(waiter());
+                g.waiters.push((t.seq, waiter()));
                 self.stats.joined.fetch_add(1, Ordering::Relaxed);
                 return Want::Joined;
             }
@@ -288,14 +294,15 @@ impl RootProbe {
         };
         g.inflight = Some(ticket);
         g.last_sent = Some((epoch, now));
-        g.waiters.push(waiter());
+        g.waiters.push((ticket.seq, waiter()));
         self.stats.started.fetch_add(1, Ordering::Relaxed);
         Want::Start(ticket)
     }
 
-    /// The read for `ticket` ended with `verdict`. Returns the waiters to run
-    /// (outside any lock of the caller's). A late end of an abandoned read
-    /// still records what it proved: the proof is dated at its own send.
+    /// The read for `ticket` ended with `verdict`. Returns the waiters of
+    /// that read to run (outside any lock of the caller's): those of a newer
+    /// read are not woken by it. A late end of an abandoned read still records
+    /// what it proved: the proof is dated at its own send.
     #[must_use]
     pub fn finish(&self, ticket: Ticket, verdict: Verdict) -> Vec<Waiter> {
         let mut g = self.lock();
@@ -323,7 +330,11 @@ impl RootProbe {
         if g.inflight.is_some_and(|t| t.seq == ticket.seq) {
             g.inflight = None;
         }
-        std::mem::take(&mut g.waiters)
+        let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut g.waiters)
+            .into_iter()
+            .partition(|(seq, _)| *seq == ticket.seq);
+        g.waiters = rest;
+        mine.into_iter().map(|(_, w)| w).collect()
     }
 }
 
@@ -434,6 +445,40 @@ mod tests {
         // The slow one ends at last: its proof is dated at its own, earlier
         // send and never shortens the newer.
         let _ = p.finish(slow, Verdict::Live);
+        assert_eq!(p.proof(7), Some(HonourMs(10_000 + W)));
+    }
+
+    /// A read abandoned for hanging past its window ends late, after a newer
+    /// read started: it wakes the renewals that waited for it, and not those
+    /// waiting for the newer read, which would decide before that read is
+    /// back (and decline for want of the proof it brings). Fail-before: the
+    /// probe took every waiter at any read's end.
+    #[test]
+    fn a_late_abandoned_read_wakes_only_its_own_waiters() {
+        let p = RootProbe::new();
+        let (old_n, old_w) = counter();
+        let (new_n, new_w) = counter();
+        let slow = start(&p, 10_000, 7, &old_w);
+        assert_eq!(p.want(HonourMs(10_200), 7, W, &old_w), Want::Joined);
+        // Past the window the slow read could justify: a new read starts, and
+        // a renewal joins it.
+        let fresh = start(&p, 10_000 + W, 7, &new_w);
+        assert_eq!(
+            p.want(HonourMs(10_000 + W + 100), 7, W, &new_w),
+            Want::Joined
+        );
+        for run in p.finish(slow, Verdict::Unknown) {
+            run();
+        }
+        assert_eq!(old_n.load(Ordering::SeqCst), 2, "its own two are told");
+        assert_eq!(new_n.load(Ordering::SeqCst), 0, "the newer read's are not");
+        assert_eq!(p.proof(7), None);
+        // The newer read, back at last, tells its own and records its proof.
+        for run in p.finish(fresh, Verdict::Live) {
+            run();
+        }
+        assert_eq!(new_n.load(Ordering::SeqCst), 2);
+        assert_eq!(old_n.load(Ordering::SeqCst), 2, "none twice");
         assert_eq!(p.proof(7), Some(HonourMs(10_000 + W)));
     }
 

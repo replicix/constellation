@@ -402,11 +402,17 @@ impl RenewLane {
         }
         let freshness = !self.ignores_freshness;
         // Plan 41 D3: the root's own proof of liveness, besides the core's.
-        // A read that showed the tenure over ends the epoch's renewals.
+        // A read that showed the tenure over ends the epoch's renewals. The
+        // proof is the stall's, and the stall is bounded as the answerer's is
+        // (`CONSTELLATION_HOLDER_STALL_MS`, D6): past the hung bound it
+        // carries no renewal, so a proof read at 14.9 s does not carry the
+        // own renewals to 16.4 s.
         let probe = self.probe.clone();
+        let proof_stalled = stuck_ms > self.hung_ms;
         let proof_of = move |v: &LockLaneView| -> Option<Option<HonourMs>> {
             match &probe {
                 Some(p) if p.deposed(v.epoch) => None,
+                Some(_) if proof_stalled => Some(None),
                 Some(p) => Some(p.proof(v.epoch)),
                 None => Some(None),
             }
@@ -882,6 +888,39 @@ mod tests {
             "{out:?}"
         );
         assert_eq!(t.get(id).unwrap().until, WaitMs(4_500));
+    }
+
+    /// Plan 41 D3 (D6): the proof carries the own renewals only while the
+    /// driver is not past the hung bound, as it carries the answerer's. A
+    /// proof read just inside the bound does not carry a renewal made just
+    /// past it. Fail-before: the own renewals took the proof at any stall
+    /// (to the bound plus the window, 16.5 s).
+    #[test]
+    fn a_proof_carries_no_own_renewal_past_the_hung_bound() {
+        use crate::root_probe::Verdict;
+        let f = facts(stale_fast());
+        let run = |renew_stuck_ms: i64| {
+            let t = LockTables::default();
+            let id = own_grant(&t);
+            let probe = RootProbe::new();
+            let mut lane = RenewLane::new(DEFAULT_MAX_STALL_MS).with_probe(probe.clone(), 15_000);
+            let out = stuck(&mut lane, &t, &f, 2_100, 14_900);
+            let [LaneAction::Probe(ticket)] = out.as_slice() else {
+                panic!("{out:?}");
+            };
+            let _ = probe.finish(*ticket, Verdict::Live);
+            let out = stuck(&mut lane, &t, &f, 2_300, renew_stuck_ms);
+            (out, t.get(id).unwrap().until)
+        };
+        let (out, until) = run(14_950);
+        assert_eq!(out, vec![LaneAction::OwnRenewed { renewed: 1 }]);
+        assert_eq!(until, WaitMs(2_300 + 4_000 + 500));
+        let (out, until) = run(15_100);
+        assert!(
+            !out.contains(&LaneAction::OwnRenewed { renewed: 1 }),
+            "{out:?}"
+        );
+        assert_eq!(until, WaitMs(4_500), "not renewed");
     }
 
     /// Plan 41 D3 (D5, D6): no read while the core is running, none past the

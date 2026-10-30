@@ -671,8 +671,11 @@ only, as the core judges its own: naming this node at the certificate's epoch
 lane's freshness rule, judged at the table's reading inside the extension's
 critical section, takes the later of it and the core's own; another holder,
 a later epoch or no lease withdraws the epoch's proof and ends its renewals
-and its reads. A failed read proves nothing; the grant waits for the next
-round and, past the window, lapses as it did. The proof is an input to the
+and its reads. The proof carries the own renewals only while the driver is
+not past `CONSTELLATION_HOLDER_STALL_MS` either (the answerer's bound): a
+proof read at 14.9 s does not renew a grant at 16 s. A failed read proves
+nothing; the grant waits for the next round and, past the window, lapses as
+it did. The proof is an input to the
 freshness rule only: a withdrawn certificate is not revived by it. Why it is
 a proof is the core's own argument, with the read's send where the request's
 send stood; the delegation answerer's text has it in full
