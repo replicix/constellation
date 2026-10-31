@@ -3657,6 +3657,77 @@ fn readdirplus_hands_a_name_the_kernel_holds_name_only() {
     k.finish();
 }
 
+/// `FUSE_NOTIFY_DELETE`.
+const NOTIFY_DELETE: i32 = 6;
+
+/// A delete notification off the wire: its parent, child and name.
+fn inval_delete(n: &Reply) -> (u64, u64, String) {
+    assert_eq!((n.unique, n.error), (0, NOTIFY_DELETE), "{n:?}");
+    let len = n.u32_at(16) as usize;
+    (
+        n.u64_at(0),
+        n.u64_at(8),
+        String::from_utf8(n.body[24..24 + len].to_vec()).unwrap(),
+    )
+}
+
+/// A delete notification forgets a held name as an entry notification
+/// does: the kernel drops the dentry of the name, so a page that lists it
+/// (leading to the same inode, as through a link) hands it with
+/// attributes, while the other name of that inode stays held. (The engine
+/// produces no `Deleted` yet; this is the adapter's side of it.)
+#[test]
+fn readdirplus_hands_a_name_the_kernel_was_told_was_deleted() {
+    let PlusSession {
+        mut k,
+        mock,
+        refs,
+        sink,
+        plus,
+    } = plus_session();
+    mock.readdir_asks_holds(true);
+    mock.always_lookup(Script::ok(entry(21, FileKind::File)));
+    k.call(op::LOOKUP, 5, &Body::new().cstr("a")).ok();
+    k.call(op::LOOKUP, 5, &Body::new().cstr("b")).ok();
+    assert_eq!(refs.count(21), 2);
+    let held = || {
+        plus.counts()
+            .name_only
+            .iter()
+            .find(|(w, _)| *w == "held")
+            .map(|(_, n)| *n)
+            .unwrap()
+    };
+    let page = |k: &mut Kernel| -> Vec<(String, u64)> {
+        parse_plus(k.call(READDIRPLUS, 5, &plus_body(0, 8192)).ok())
+            .into_iter()
+            .map(|r| (r.name, r.nodeid))
+            .collect()
+    };
+    let named = |v: &[(&str, u64)]| -> Vec<(String, u64)> {
+        v.iter().map(|(n, i)| (n.to_string(), *i)).collect()
+    };
+    mock.always_readdir(Script::ok(vec![
+        dirent(5, 1, FileKind::Dir, "."),
+        plus_dirent(21, 2, FileKind::File, "a"),
+        plus_dirent(21, 3, FileKind::File, "b"),
+    ]));
+    // Both names are held: name-only (`b` is `a`'s hard link).
+    assert_eq!(page(&mut k), named(&[(".", 0), ("a", 0), ("b", 0)]));
+    assert_eq!((refs.count(21), held()), (2, 2));
+    // `a` is deleted under the kernel (a remote unlink): the notice is
+    // written, and the page hands `a` again, while `b` stays held.
+    sink.invalidate(&[Invalidation::Deleted {
+        parent: 5,
+        name: "a".into(),
+        ino: 21,
+    }]);
+    assert_eq!(inval_delete(&k.recv()), (5, 21, "a".into()));
+    assert_eq!(page(&mut k), named(&[(".", 0), ("a", 21), ("b", 0)]));
+    assert_eq!((refs.count(21), held()), (3, 3));
+    k.finish();
+}
+
 /// Plan 40 §4.7: accounting is on success only, before the bytes go. A
 /// page whose responder is dropped after entries were offered (fuser
 /// answers `EIO`) takes no reference and records no name; a good one takes
