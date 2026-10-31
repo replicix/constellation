@@ -3456,27 +3456,19 @@ fn no_peer_in_budget_is_todays_behaviour() {
         t.acks_waited > 0,
         "no forward waited for the archive: {t:?}"
     );
-    // A reply already on its way when the holder died counts as an
-    // acknowledgement after the crash (within a round trip or two: the
-    // RTTs here are 120 ms); the rest wait for the TTL. (Stated per
-    // failover since EC2 campaign 8 A-1's fix: every node now reads the
-    // lease at start, and the shifted schedule gave 3 of the 20 seeds
-    // such an in-flight reply, one more than the "at most 10 % early"
-    // this used to allow.) Plan 43 C2: so does a forward whose segment
-    // landed just before the crash, answered from the log the requester
-    // applied once its forward timed out (seeds 1004 and 1007: an `ENOENT`
-    // refusal ~300 ms after the crash, judged committed). A takeover is
-    // the TTL's here (no seal, asserted above), well past a second.
-    let ttl = sim::run::backup_core_config(1, 1).ttl_ms;
-    let early: Vec<u64> = t
-        .failovers
-        .iter()
-        .copied()
-        .filter(|ms| *ms >= 1_000 && *ms < ttl / 2)
-        .collect();
+    // Every takeover is the TTL's: no seal (above), no fast takeover, and
+    // each run's failover is a TTL claim's (C7b's lease-claim oracle). Plan
+    // 43 C2: this replaces a bound on the time from the crash to the first
+    // answer, which an answer no sequencer gave can end early now that a
+    // forward waits for the log: a requester's own refusal once its forward
+    // timed out, or the log's answer to a forward whose segment landed just
+    // before the crash (seeds 1004 and 1007: an `ENOENT` or `EEXIST` 0.3 to
+    // 1.4 s after the crash).
+    assert_eq!(t.s3_fast_takeovers, 0, "{t:?}");
+    assert_eq!(t.backup_takeovers, 0, "{t:?}");
     assert!(
-        early.is_empty(),
-        "failovers happened before the TTL: {} (early: {early:?})",
+        t.other_failovers.is_empty() && t.ttl_failovers.len() == t.failovers.len(),
+        "failovers other than by TTL: {t:?} ({})",
         t.failover_dist()
     );
 }
