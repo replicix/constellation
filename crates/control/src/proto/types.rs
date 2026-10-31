@@ -2272,6 +2272,17 @@ pub struct AckStatus {
     /// nothing as a backup until it reads.
     #[serde(default)]
     pub sealed_unread: bool,
+    /// This node answers its own clients as a lone sequencer (no peer in
+    /// the RTT budget): the root lease's, or a delegation's it holds (plan
+    /// 43 C2).
+    #[serde(default)]
+    pub lone: bool,
+    /// FUSE fast-path writes whose durability wait found the gate off on a
+    /// node that is neither lone nor holding a continuation epoch (a
+    /// release or a handoff after the write): resubmitted in doubt (plan 43
+    /// C2).
+    #[serde(default)]
+    pub ungated_unexpected: u64,
     /// The latest seal this node made, as its watch measured the holder's
     /// silence.
     #[serde(default)]

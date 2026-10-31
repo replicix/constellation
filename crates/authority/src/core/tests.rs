@@ -47766,3 +47766,63 @@ mod deleg_root_read {
         assert_eq!(h.core.root_node(), None);
     }
 }
+
+/// Plan 43 C2 (§5, the commit split's C2f): `Ungated` only where the node is
+/// lone or holds an epoch.
+mod c2f_lone_root {
+    use super::c1_counted::listed_holder;
+    use super::*;
+
+    /// The listed backup is gone and no peer is in budget: the root is lone.
+    fn gate_goes_off(h: &mut Harness) {
+        h.core.lease.held.as_mut().unwrap().0.backups.clear();
+        h.core.ack.peers.clear();
+        h.core.ack.candidate = None;
+        h.core.ack.eligible = Some(false);
+        assert_eq!(h.core.durable_jseq(), u64::MAX);
+        assert!(h.core.root_lone());
+    }
+
+    fn lone_root() -> Harness {
+        let (mut h, _) = listed_holder();
+        gate_goes_off(&mut h);
+        h
+    }
+
+    /// §5.4 (D5): what the core publishes for the fast path's `Ungated`
+    /// answer. In a continuation epoch's hold the fast path answers at once
+    /// (never a wait for the archive: S3 is what the epoch is without); a
+    /// lone root answers too; a released lease does not (the gate off there
+    /// is in doubt). Fails on the parent: every gate off with the lease kept
+    /// answered (the release included).
+    #[test]
+    fn an_ungated_wait_in_an_epoch_hold_answers_at_once() {
+        let wait = |h: &Harness| {
+            h.meta
+                .session()
+                .wait_durable(u64::MAX - 1, std::time::Duration::from_secs(30))
+        };
+        let after_event = |h: &mut Harness| {
+            let mut out = Vec::new();
+            h.core.backup_after_event(h.clk(), &h.meta, &mut out);
+        };
+        // The epoch's hold.
+        let (mut h, _) = listed_holder();
+        let started = std::time::Instant::now();
+        let epoch = h.core.lease.epoch().unwrap();
+        h.core.lease.adopt_epoch_hold(h.clk(), epoch);
+        after_event(&mut h);
+        assert_eq!(wait(&h), constellation_meta::DurableWait::Ungated);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // A lone root.
+        let mut h = lone_root();
+        after_event(&mut h);
+        assert_eq!(wait(&h), constellation_meta::DurableWait::Ungated);
+        // Released: neither lone nor an epoch.
+        let (mut h, _) = listed_holder();
+        h.core.lease.held = None;
+        after_event(&mut h);
+        assert_eq!(wait(&h), constellation_meta::DurableWait::Unexpected);
+        assert!(!h.core.ack_view().lone);
+    }
+}

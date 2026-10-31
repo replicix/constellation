@@ -3156,7 +3156,8 @@ impl Driver {
                     self.dispatch(actions);
                 }
                 constellation_meta::DurableWait::Lost
-                | constellation_meta::DurableWait::Ungated => self.resubmit_in_doubt(now, w),
+                | constellation_meta::DurableWait::Ungated
+                | constellation_meta::DurableWait::Unexpected => self.resubmit_in_doubt(now, w),
                 constellation_meta::DurableWait::TimedOut if expired => {
                     self.resubmit_in_doubt(now, w)
                 }

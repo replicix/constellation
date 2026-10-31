@@ -564,6 +564,7 @@ impl View {
                                     session.count_fast_ack(waited);
                                 }
                                 constellation_meta::DurableWait::Ungated
+                                | constellation_meta::DurableWait::Unexpected
                                 | constellation_meta::DurableWait::Lost
                                 | constellation_meta::DurableWait::TimedOut => {
                                     session.count_fast_ack_in_doubt();
@@ -725,7 +726,8 @@ impl View {
                 Ok(true)
             }
             // Plan 43 C1-2 (D4): the gate went off with the lease still this
-            // node's: the answer is a lone node's, so the row is re-tagged
+            // node's, and the node is lone or holds an epoch (plan 43 C2,
+            // §5.4): the answer is a lone node's, so the row is re-tagged
             // `Lone` before it is given — what a deposition does with it
             // must match what the client was told. A re-tag that fails
             // leaves the row gated-class: no answer is given on it.
@@ -740,6 +742,16 @@ impl View {
                     session.count_fast_ack_downgraded();
                 }
                 Ok(true)
+            }
+            // Plan 43 C2 (§5.4, D5): the gate went off on a node that is
+            // neither lone nor holding an epoch (a release or a handoff after
+            // the write): nothing committed the row and nothing lets this node
+            // answer on its disk alone. Counted, and in doubt: the core
+            // answers from the row's commit or the rid's re-execution.
+            constellation_meta::DurableWait::Unexpected => {
+                session.count_ungated_unexpected();
+                session.count_fast_ack_in_doubt();
+                Ok(false)
             }
             constellation_meta::DurableWait::Lost | constellation_meta::DurableWait::TimedOut => {
                 session.count_fast_ack_in_doubt();

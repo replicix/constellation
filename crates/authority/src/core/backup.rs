@@ -635,7 +635,7 @@ pub(crate) struct AckState {
     /// in the order they were made.
     pub(crate) renew_held_deleg: Vec<(FreshHold, NodeId, PeerMsg)>,
     /// What the replica's durability gate was last told.
-    reported: Option<(bool, u64, bool, constellation_meta::RowClass)>,
+    reported: Option<(bool, u64, bool, constellation_meta::RowClass, bool)>,
     /// A fast takeover of a tenure that served strict reads is waiting for
     /// its marker, where the successor's floor starts (see the module
     /// doc); `false` after the floor was set or when none is due.
@@ -1152,6 +1152,11 @@ pub struct AckView {
     /// is not known, and nothing is acknowledged or answered as a backup
     /// until it reads (plan 43 C2e review).
     pub sealed_unread: bool,
+    /// Plan 43 C2 (D9): this node answers its own clients as a lone
+    /// sequencer — the root lease's (`Core::root_lone`), or a delegation's
+    /// it holds (the class it last published for the generation's own
+    /// clients is `Lone`).
+    pub lone: bool,
 }
 
 impl Core {
@@ -1238,6 +1243,12 @@ impl Core {
             waiting_for_group: self.waiting_for_group(self.clk),
             member_copies: self.bk.member_epochs.len(),
             sealed_unread: self.bk.sealed_unread,
+            lone: self.root_lone()
+                || self
+                    .dl
+                    .reported
+                    .values()
+                    .any(|r| r.class == constellation_meta::RowClass::Lone),
         }
     }
 
@@ -1489,6 +1500,20 @@ impl Core {
         (!self.durable_covers(jseq)).then_some(jseq)
     }
 
+    /// Plan 43 C2 (§2.1): this node holds the root lease, usably, as a lone
+    /// sequencer: not lost, no continuation epoch, not under `ack=s3`, and
+    /// nothing gates its answers (`durable_jseq` is `u64::MAX`: no listed or
+    /// doubted backup, no candidate, no eligible or unassessed peer). Its
+    /// own node's clients are answered from its disk (`Lone`), every other
+    /// node from the archive.
+    pub(crate) fn root_lone(&self) -> bool {
+        self.lease.held.is_some()
+            && !self.lease.lost
+            && !self.lease.epoch_held()
+            && self.lease.ack_policy() != AckPolicy::S3
+            && self.durable_jseq() == u64::MAX
+    }
+
     /// Plan 43 §5.1: the class of an answer this node gives as the root
     /// sequencer, by what the answer waits for *today* (C2a records it; C2c
     /// and C2f change what some of them wait for): a continuation epoch's
@@ -1682,9 +1707,14 @@ impl Core {
         // clients, published with the gate: the FUSE fast path journals
         // its rows with it and waits by it.
         let class: constellation_meta::RowClass = self.root_ack_class().into();
-        if self.ack.reported != Some((gate, jseq, lost, class)) {
-            self.ack.reported = Some((gate, jseq, lost, class));
-            replica.set_durable(gate, jseq, lost, class);
+        // Plan 43 C2 (§5.4, D5): with the gate off, the fast path answers its
+        // own clients on this disk only where this node is lone or holds an
+        // epoch; the gate off for any other reason (a release, a handoff) is
+        // in doubt there.
+        let lone_ok = self.root_lone() || self.lease.epoch_held();
+        if self.ack.reported != Some((gate, jseq, lost, class, lone_ok)) {
+            self.ack.reported = Some((gate, jseq, lost, class, lone_ok));
+            replica.set_durable(gate, jseq, lost, class, lone_ok);
         }
     }
 

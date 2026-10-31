@@ -670,8 +670,16 @@ pub trait Replica {
     /// already here.
     fn streamed_tip(&self, epoch: Epoch) -> Result<Option<u64>, MetaError>;
     /// The holder's durability watermark for its own reads
-    /// (`Meta::durability_pending`).
-    fn set_durable(&self, gate: bool, jseq: u64, lost: bool, class: constellation_meta::RowClass);
+    /// (`Meta::durability_pending`). `lone_ok` (plan 43 C2, §5.4): with the
+    /// gate off, the node may answer its own clients on its disk alone.
+    fn set_durable(
+        &self,
+        gate: bool,
+        jseq: u64,
+        lost: bool,
+        class: constellation_meta::RowClass,
+        lone_ok: bool,
+    );
     /// Plan 43 C2d: what the core knows of the delegation `gen` this node
     /// holds, for the delegate's FUSE fast path (`None`: not held).
     fn set_deleg_durable(&self, gen: u64, d: Option<constellation_meta::DelegDurable>);
@@ -1768,8 +1776,15 @@ impl Replica for Meta {
         Meta::streamed_tip(self, epoch)
     }
 
-    fn set_durable(&self, gate: bool, jseq: u64, lost: bool, class: constellation_meta::RowClass) {
-        self.session().set_durable(gate, jseq, lost, class)
+    fn set_durable(
+        &self,
+        gate: bool,
+        jseq: u64,
+        lost: bool,
+        class: constellation_meta::RowClass,
+        lone_ok: bool,
+    ) {
+        self.session().set_durable(gate, jseq, lost, class, lone_ok)
     }
 
     fn set_deleg_durable(&self, gen: u64, d: Option<constellation_meta::DelegDurable>) {

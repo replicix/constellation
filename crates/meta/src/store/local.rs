@@ -2036,7 +2036,7 @@ mod tests {
         create(&meta, 1);
         // The session publishes the gate with a class: the fast path's rows.
         let session: &SessionState = meta.session();
-        session.set_durable(true, 0, false, RowClass::RootGroup);
+        session.set_durable(true, 0, false, RowClass::RootGroup, false);
         create(&meta, 2);
         // The core's own class wins, scoped to its call.
         {

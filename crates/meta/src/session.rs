@@ -451,6 +451,11 @@ pub struct SessionStats {
     /// Plan 43 C1-2 (D4): fast-path answers given with the gate off whose
     /// rows were re-tagged `Lone`.
     pub fast_acks_downgraded: u64,
+    /// Plan 43 C2 (§5.4, D5): fast-path waits that found the gate off on a
+    /// node that is neither lone nor holding an epoch
+    /// (`DurableWait::Unexpected`), resubmitted in doubt
+    /// (`status.ack.ungated_unexpected`).
+    pub ungated_unexpected: u64,
     /// Own rows of a lone delegate that were `Lone` by the class the core
     /// decided or published and went `DelegGroup` when journaled, under the
     /// writer lock (`Meta::finish_local`, `lone_row_holds`): past the lead,
@@ -732,6 +737,13 @@ pub enum DurableWait {
     /// The gate is off because the lease was lost.
     Lost,
     TimedOut,
+    /// Plan 43 C2 (§5.4, D5): the gate is off while the lease is still this
+    /// node's, but the node is neither lone nor holding a continuation
+    /// epoch (a release or a handoff after the fast-path write, a tenure
+    /// that is not usable): nothing says the row is committed and nothing
+    /// lets this node answer on its disk alone. In doubt: the op is
+    /// resubmitted by rid and the core answers from the row's commit.
+    Unexpected,
 }
 
 /// Plan 43 C2d (C2 spec §4): per generation this node is the delegate of,
@@ -784,6 +796,11 @@ pub struct SessionState {
     /// (`Meta::finish_local`). Stored before the gate so a reader that sees
     /// the gate has seen the class.
     durable_class: AtomicU8,
+    /// Plan 43 C2 (§5.4, D5): with the gate off, this node may answer its
+    /// own clients on its disk alone — it is a lone root, or holds a
+    /// continuation epoch (`Core::root_lone`, `epoch_held`). Published with
+    /// the gate, stored before it.
+    durable_lone_ok: AtomicBool,
 }
 
 fn budget_default() -> u64 {
@@ -813,6 +830,7 @@ impl Default for SessionState {
             durable_lost: AtomicBool::new(false),
             durable_jseq: AtomicU64::new(0),
             durable_class: AtomicU8::new(RowClass::Lone.to_u8()),
+            durable_lone_ok: AtomicBool::new(false),
         }
     }
 }
@@ -929,6 +947,12 @@ impl SessionState {
 
     pub fn count_fast_ack_downgraded(&self) {
         self.stats.lock().unwrap().fast_acks_downgraded += 1;
+    }
+
+    /// Plan 43 C2 (D5): a fast-path wait found the gate off on a node that
+    /// may not answer on its disk alone.
+    pub fn count_ungated_unexpected(&self) {
+        self.stats.lock().unwrap().ungated_unexpected += 1;
     }
 
     /// A `Lone` row went `DelegGroup` at the journaling.
@@ -1424,9 +1448,12 @@ impl SessionState {
 
     /// Plan 30 §M9: the core's durability watermark for this holder's
     /// journal (`gate`: a non-`Local` policy is in force). Every advance
-    /// wakes the waiters.
-    pub fn set_durable(&self, gate: bool, jseq: u64, lost: bool, class: RowClass) {
+    /// wakes the waiters. `lone_ok` (plan 43 C2, §5.4): with the gate off,
+    /// the node may answer its own clients on its disk alone (it is lone,
+    /// or holds an epoch).
+    pub fn set_durable(&self, gate: bool, jseq: u64, lost: bool, class: RowClass, lone_ok: bool) {
         self.durable_lost.store(lost, Ordering::Relaxed);
+        self.durable_lone_ok.store(lone_ok, Ordering::Relaxed);
         self.durable_class.store(class.to_u8(), Ordering::Release);
         self.durable_gate.store(gate, Ordering::Release);
         let before = self.durable_jseq.swap(jseq, Ordering::Relaxed);
@@ -1438,17 +1465,21 @@ impl SessionState {
     /// Plan 30 §M9: the FUSE fast path's acknowledgement wait under a
     /// durability gate. The op is journaled at or below `jseq`; return
     /// once the core's durable watermark covers it, or once the gate is
-    /// off — because the policy is `Local` again (`Ungated`: the row is
-    /// this node's, acknowledged as under `Local`), or because the lease
-    /// was lost (`Lost`: in doubt, resubmitted by rid).
+    /// off — because the lease was lost (`Lost`: in doubt, resubmitted by
+    /// rid), because the node is lone or holds an epoch (`Ungated`: the
+    /// row is this node's, answered on its disk; plan 43 C2 §5.4: never a
+    /// wait for the archive in an epoch), or for any other reason
+    /// (`Unexpected`: in doubt, counted and resubmitted, D5).
     pub fn wait_durable(&self, jseq: u64, budget: Duration) -> DurableWait {
         let started = Instant::now();
         loop {
             if !self.durable_gate.load(Ordering::Relaxed) {
                 return if self.durable_lost.load(Ordering::Relaxed) {
                     DurableWait::Lost
-                } else {
+                } else if self.durable_lone_ok.load(Ordering::Relaxed) {
                     DurableWait::Ungated
+                } else {
+                    DurableWait::Unexpected
                 };
             }
             if self.durable_jseq.load(Ordering::Relaxed) >= jseq {
@@ -2065,18 +2096,51 @@ mod tests {
     fn the_session_publishes_the_class_with_the_gate() {
         let s = SessionState::default();
         assert_eq!(s.published_class(), RowClass::Lone, "nothing published");
-        s.set_durable(true, 7, false, RowClass::RootGroup);
+        s.set_durable(true, 7, false, RowClass::RootGroup, false);
         assert_eq!(s.published_class(), RowClass::RootGroup);
         assert!(s.durable_gated());
-        s.set_durable(true, 7, false, RowClass::Archive);
+        s.set_durable(true, 7, false, RowClass::Archive, false);
         assert_eq!(s.published_class(), RowClass::Archive);
         // The gate goes off: the class the core publishes with it is the
         // lone node's, and a waiter finds the gate off.
-        s.set_durable(false, u64::MAX, false, RowClass::Lone);
+        s.set_durable(false, u64::MAX, false, RowClass::Lone, true);
         assert_eq!(s.published_class(), RowClass::Lone);
         assert_eq!(
             s.wait_durable(9, Duration::from_millis(1)),
             DurableWait::Ungated
+        );
+    }
+
+    /// Plan 43 C2 (§5.4, D5): with the gate off, a fast-path wait is
+    /// answered on this disk only where the core said the node may (lone,
+    /// or an epoch's hold: at once, never a wait for the archive); the gate
+    /// off anywhere else (a release or a handoff after the write) is in
+    /// doubt, and a lost lease stays `Lost`. Fails on the parent: every gate
+    /// off with the lease kept was `Ungated`.
+    #[test]
+    fn an_ungated_wait_is_answered_only_where_the_node_may_answer_alone() {
+        let s = SessionState::default();
+        s.set_durable(true, 3, false, RowClass::RootGroup, false);
+        // An epoch's hold: the gate is off and the node may answer — at
+        // once, whatever the budget.
+        s.set_durable(false, u64::MAX, false, RowClass::NonStealable, true);
+        let started = Instant::now();
+        assert_eq!(
+            s.wait_durable(9, Duration::from_secs(30)),
+            DurableWait::Ungated
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // Released (or handed off): the gate is off, the node not lone.
+        s.set_durable(false, u64::MAX, false, RowClass::Lone, false);
+        assert_eq!(
+            s.wait_durable(9, Duration::from_secs(30)),
+            DurableWait::Unexpected
+        );
+        // Lost wins.
+        s.set_durable(false, u64::MAX, true, RowClass::Lone, false);
+        assert_eq!(
+            s.wait_durable(9, Duration::from_millis(1)),
+            DurableWait::Lost
         );
     }
 
@@ -2667,7 +2731,7 @@ mod tests {
         };
         let dentry = |name: &str| [ReadKey::Dentry(root, name.into())];
         let s = meta.session();
-        s.set_durable(true, 0, false, RowClass::RootGroup);
+        s.set_durable(true, 0, false, RowClass::RootGroup, false);
         crate::mutate::execute(&meta, &create("a"), None).unwrap();
         assert!(meta.durability_pending(&dentry("a")));
         s.set_durable(
@@ -2675,6 +2739,7 @@ mod tests {
             meta.journal_tip().unwrap(),
             false,
             RowClass::RootGroup,
+            false,
         );
         crate::mutate::execute(&meta, &create("b"), None).unwrap();
         // `a` is durable although `b`'s row (a different key) is not.
@@ -2690,15 +2755,16 @@ mod tests {
             meta.journal_tip().unwrap(),
             false,
             RowClass::RootGroup,
+            false,
         );
         assert!(!meta.durability_pending(&[ReadKey::Dir(root)]));
 
         // Gate off: `c` is journaled untracked; with the gate back on it
         // is compared against the tip (and `a` stays exact).
-        s.set_durable(false, u64::MAX, false, RowClass::Lone);
+        s.set_durable(false, u64::MAX, false, RowClass::Lone, true);
         let before = meta.journal_tip().unwrap();
         crate::mutate::execute(&meta, &create("c"), None).unwrap();
-        s.set_durable(true, before, false, RowClass::RootGroup);
+        s.set_durable(true, before, false, RowClass::RootGroup, false);
         assert!(meta.durability_pending(&dentry("c")));
         assert!(!meta.durability_pending(&dentry("a")));
         assert!(
@@ -2710,6 +2776,7 @@ mod tests {
             meta.journal_tip().unwrap(),
             false,
             RowClass::RootGroup,
+            false,
         );
         assert!(!meta.durability_pending(&dentry("c")));
         assert!(!meta.durability_pending(&[ReadKey::Dir(root)]));

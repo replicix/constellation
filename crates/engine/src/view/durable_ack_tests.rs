@@ -308,6 +308,7 @@ fn a_gated_holders_close_returns_once_its_manifest_row_is_durable() {
         meta.journal_tip().unwrap(),
         false,
         constellation_meta::RowClass::RootGroup,
+        false,
     );
     let (fs, _dir, _core) = holder_fs(meta.clone(), true);
     fs.do_write(file.ino, 0, b"hello").unwrap();
@@ -338,7 +339,13 @@ fn a_gated_holders_close_returns_once_its_manifest_row_is_durable() {
         );
         assert!(meta.durability_pending(&keys));
         // The backups acknowledge it: the close returns.
-        session.set_durable(true, tip, false, constellation_meta::RowClass::RootGroup);
+        session.set_durable(
+            true,
+            tip,
+            false,
+            constellation_meta::RowClass::RootGroup,
+            false,
+        );
         assert_eq!(close.join().unwrap(), Ok(()));
     });
     // Read-your-writes without a wait: nothing of the file's is
@@ -365,6 +372,7 @@ fn ungated_fast_path_answer_retags_the_row_lone() {
         meta.journal_tip().unwrap(),
         false,
         RowClass::RootGroup,
+        false,
     );
     let (fs, _dir, _core) = holder_fs(meta.clone(), true);
     fs.do_write(file.ino, 0, b"hello").unwrap();
@@ -390,7 +398,7 @@ fn ungated_fast_path_answer_retags_the_row_lone() {
         std::thread::sleep(Duration::from_millis(100));
         assert!(!close.is_finished(), "the close waits for the group");
         // The gate goes off, the lease still this node's.
-        session.set_durable(false, u64::MAX, false, RowClass::Lone);
+        session.set_durable(false, u64::MAX, false, RowClass::Lone, true);
         assert_eq!(close.join().unwrap(), Ok(()));
         assert_eq!(meta.journal_tx_class(tip).unwrap(), Some(RowClass::Lone));
     });
@@ -432,6 +440,7 @@ fn a_failed_retag_fails_the_fast_path_close() {
         meta.journal_tip().unwrap(),
         false,
         RowClass::RootGroup,
+        false,
     );
     let (fs, _dir, _core) = holder_fs(meta.clone(), true);
     fs.do_write(file.ino, 0, b"hello").unwrap();
@@ -445,7 +454,7 @@ fn a_failed_retag_fails_the_fast_path_close() {
         let tip = journaled_past_durable(&meta);
         std::thread::sleep(Duration::from_millis(100));
         assert!(!close.is_finished(), "the close waits for the group");
-        session.set_durable(false, u64::MAX, false, RowClass::Lone);
+        session.set_durable(false, u64::MAX, false, RowClass::Lone, true);
         assert_eq!(close.join().unwrap(), Err(Code::Io));
         assert_eq!(
             meta.journal_tx_class(tip).unwrap(),
@@ -467,6 +476,7 @@ fn a_failed_retag_fails_the_fast_path_op() {
         meta.journal_tip().unwrap(),
         false,
         RowClass::RootGroup,
+        false,
     );
     let (fs, _dir, _core) = holder_fs(meta.clone(), true);
     let ino = meta.allocate_ino(ROOT_INO).unwrap();
@@ -490,7 +500,7 @@ fn a_failed_retag_fails_the_fast_path_op() {
         let tip = journaled_past_durable(&meta);
         std::thread::sleep(Duration::from_millis(100));
         assert!(!op.is_finished(), "the op waits for the group");
-        session.set_durable(false, u64::MAX, false, RowClass::Lone);
+        session.set_durable(false, u64::MAX, false, RowClass::Lone, true);
         assert_eq!(
             op.join().unwrap(),
             Err(Code::Io),
@@ -501,6 +511,70 @@ fn a_failed_retag_fails_the_fast_path_op() {
             Some(RowClass::RootGroup)
         );
     });
+    assert_eq!(session.stats().fast_acks_downgraded, 0);
+}
+
+/// Plan 43 C2 (§5.4, D5): the gate goes off while a fast-path op waits, on
+/// a node that is neither lone nor holding a continuation epoch (a release
+/// or a handoff after the write): nothing committed the row and nothing lets
+/// this node answer on its disk alone. The op is counted and resubmitted in
+/// doubt by rid; its row keeps its class. Fails on the parent: the op was
+/// answered `Ok` and its row re-tagged `Lone`.
+#[test]
+fn an_unexpected_ungated_wait_is_counted_and_resubmitted() {
+    use constellation_meta::RowClass;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let session = meta.session();
+    session.set_durable(
+        true,
+        meta.journal_tip().unwrap(),
+        false,
+        RowClass::RootGroup,
+        false,
+    );
+    let (fs, _dir, mut core) = holder_fs(meta.clone(), true);
+    let ino = meta.allocate_ino(ROOT_INO).unwrap();
+    let (stop, submitted) = (AtomicBool::new(false), Mutex::new(Vec::new()));
+    let result = std::thread::scope(|scope| {
+        let responder = scope.spawn(|| core_answering_in_doubt(&mut core, &stop, &submitted));
+        let op = scope.spawn(|| {
+            fs.mutate_op(
+                ROOT_INO,
+                constellation_meta::MutateOp::Create {
+                    parent: ROOT_INO,
+                    name: "u".into(),
+                    ino,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+            )
+        });
+        let waiting = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let tip = journaled_past_durable(&meta);
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!op.is_finished(), "the op waits for the group");
+            // Released: the gate is off, the node may not answer alone.
+            session.set_durable(false, u64::MAX, false, RowClass::Lone, false);
+            tip
+        }));
+        let result = op.join().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        responder.join().unwrap();
+        let tip = waiting.unwrap_or_else(|e| std::panic::resume_unwind(e));
+        assert_eq!(
+            meta.journal_tx_class(tip).unwrap(),
+            Some(RowClass::RootGroup),
+            "not answered as a lone node's"
+        );
+        result
+    });
+    assert!(result.is_err(), "not answered OK: {result:?}");
+    let submitted = submitted.lock().unwrap();
+    assert_eq!(submitted.len(), 1, "resubmitted once: {submitted:?}");
+    assert!(submitted[0].1, "in doubt");
+    assert_eq!(session.stats().ungated_unexpected, 1);
     assert_eq!(session.stats().fast_acks_downgraded, 0);
 }
 

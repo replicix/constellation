@@ -233,6 +233,11 @@
           "default": null,
           "description": "The latest seal this node made, as its watch measured the holder's\nsilence."
         },
+        "lone": {
+          "default": false,
+          "description": "This node answers its own clients as a lone sequencer (no peer in\nthe RTT budget): the root lease's, or a delegation's it holds (plan\n43 C2).",
+          "type": "boolean"
+        },
         "longest_step_kind": {
           "default": "",
           "type": "string"
@@ -388,6 +393,13 @@
           "type": "integer"
         },
         "unacked_replays_refused": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ungated_unexpected": {
+          "default": 0,
+          "description": "FUSE fast-path writes whose durability wait found the gate off on a\nnode that is neither lone nor holding a continuation epoch (a\nrelease or a handoff after the write): resubmitted in doubt (plan 43\nC2).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
