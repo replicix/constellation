@@ -48254,6 +48254,54 @@ mod c2f_lone_root {
         assert_eq!(classes_of(&h, forwarded(3)), vec![RowClass::Archive]);
     }
 
+    /// The maintainer's answer to C2f's first question: a non-stealable
+    /// answer stays uncommitted, and the requester counts its shadow apart —
+    /// in an open continuation epoch the answer is the hold owner's — so
+    /// only another sequencer's uncommitted answer is the one `strict_commit`
+    /// fails on. Fails on the parent: one counter for both.
+    #[test]
+    fn a_non_stealable_sequencers_uncommitted_shadow_is_counted_apart() {
+        for in_epoch in [true, false] {
+            let (mut holder, mut requester) = pair();
+            requester.core.epoch.open = in_epoch;
+            let rid = requester.rid(1);
+            let out = requester.step(Event::Submit {
+                policy: Policy::Client,
+                rid,
+                op: requester.create("s"),
+                tag: Default::default(),
+            });
+            let sent = sends(&out);
+            let [(1, request)] = sent.as_slice() else {
+                panic!("expected one forward to node 1: {sent:?}")
+            };
+            let answer = holder.step_archived(Event::Peer {
+                from: 2,
+                msg: (*request).clone(),
+            });
+            let mut reply = sends(&answer)
+                .into_iter()
+                .find(|(to, m)| *to == 2 && matches!(m, PeerMsg::MutateReply { .. }))
+                .expect("a reply")
+                .1
+                .clone();
+            if let PeerMsg::MutateReply { committed, .. } = &mut reply {
+                *committed = false;
+            }
+            requester.step(Event::Peer {
+                from: 1,
+                msg: reply,
+            });
+            let s = &requester.core.stats;
+            assert_eq!(s.shadows_installed, 1, "in_epoch {in_epoch}");
+            assert_eq!(
+                (s.ungated_shadows_non_stealable, s.ungated_shadows),
+                if in_epoch { (1, 0) } else { (0, 1) },
+                "in_epoch {in_epoch}"
+            );
+        }
+    }
+
     /// A row of another node's op journaled `Lone` (a lone root before C2)
     /// that another node asks for again is answered from the archive, and
     /// re-tagged `Archive` first so that its strand follows the answer.
