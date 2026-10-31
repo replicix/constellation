@@ -63023,3 +63023,16 @@ ones), with and without the knob, against main wherever one failed: `locks-upgra
 `long-delegated-backup` pass both ways; every failing set is a control's or a class that fails on main, with the same
 counts per class where it is not a control (`locks-delegate-ahead`, `locks-delegated-partition-skew`,
 `locks-core-stall-backup-long*` 946 and 1838).
+
+### Rebased onto main: the dated-at-return pin (2026-10-31)
+
+On main with the lease-probe and placement-hot fixes, the lock commits moved `a_proof_dated_at_the_return_of_the_read_is_caught`'s
+seed 609 to no failure. `locks-core-stall-backup-long-slow-reads`, seeds 0 to 1,999: the design passes all 2,000; the
+`-dated-at-return` mutant fails 5 (28, 54, 117, 828, 1457, each "probe dating violated"); 28, 54, 117 and 828 are pinned.
+The review's suggestion to start the shared-waiter bound at every park (a request parked behind a grant that later went
+away) was tried and left out: it lets readers past a waiting writer whenever the queue is long, and
+`locks-delegated-production-ttl-heavy` seed 565 then failed (a writer waiting past 60 s; 49 s without it); it also moved
+the stale-mirror control's seed 76. Gates: fmt, clippy, authority lib 847, meta lib 381, release sim suite 300 passed (11
+ignored). Sweeps, seeds 0 to 1,999, the 105 lock configurations plus `placement-hot`, with and without the knob, against
+main wherever one failed: the same classes and per-class counts as the review entry; `placement-hot` 593 with the knob
+fails on main too (an I5 oracle class).
