@@ -812,9 +812,14 @@ What a sequencer's acknowledgement means is the tenure's `ack_policy`,
 chosen per filesystem and topology
 ([ADR-21](DECISIONS.md#adr-21-layered-durability-and-seal-based-failover)):
 
-- **`Local`** (Layer A, always, free): the op is on the sequencer's disk;
-  its requester keeps it as speculation and replays it by rid if the
-  sequencer dies.
+- **`Local`** (Layer A, always, free): the sequencer is lone (no peer in
+  budget). Its own node's op is acknowledged once it is on the
+  sequencer's disk, the one speculation a deposition may roll back (it
+  replays by rid). Another node's forward is acknowledged once its segment
+  is in the log: its row is journaled `Archive`, a deposition keeps it as
+  a member copy, and the requester's retry by rid is its only other copy
+  ([ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3),
+  plan 43 C2).
 - **`Backup`** (Layer B, automatic when a peer is within
   `CONSTELLATION_BACKUP_RTT_BUDGET_MS`, 5 ms): the holder streams whole
   journal transactions to its backup and acknowledges only what every
@@ -838,7 +843,8 @@ chosen per filesystem and topology
   segment is in the log, group-committed per sync round.
 
 A cluster whose peers are all far away picks no backup and stays at local
-speed (hard constraint 4). §9 has the failover rules.
+speed for each node's own writes (hard constraint 4); a write another node
+forwards waits for one S3 commit. §9 has the failover rules.
 
 ### Delegated sub-sequencers
 
@@ -1665,7 +1671,7 @@ Layer B's single-failure contract below
 | Topology | Policy | Added acknowledgement latency | Holder crashes and returns before a takeover | Holder away past a takeover | Failover |
 |---|---|---|---|---|---|
 | Single node | `Local` | none | nothing lost | n/a | n/a |
-| Only distant peers (no backup in budget) | `Local` (Layer A) | none | nothing lost | forwarded ops replayed by their requesters; the holder's own unshipped writes come back as a replay when it returns | lease TTL (60 s) + margin |
+| Only distant peers (no backup in budget) | `Local` (Layer A) | none for the holder's own writes; one S3 commit for a forwarded write | nothing lost | nothing forwarded lost (answered only once in the log); the holder's own unshipped writes come back as a replay when it returns | lease TTL (60 s) + margin |
 | A peer within the RTT budget | `Backup` (Layer B) | one round trip to the backup | nothing lost | nothing lost | detection + one CAS: ≈ 1.5 s in the harness, 2.3–4.7 s on EC2 ([RESULTS](../../bench/remote/RESULTS.md#failover-time)) |
 | `fs create --ack-policy s3` | `S3` (Layer C) | one S3 round trip per group commit | nothing lost | nothing lost | detection + one CAS with P2P; the TTL without |
 

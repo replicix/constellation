@@ -1911,6 +1911,29 @@ availability matrix, §6 session guarantees, §9 (Nobody observes,
 Delegates), §14, GOALS untouched yet (C5); reference pages; ADR-33
 amended, ADR-2/14/18/23 amended; PROGRESS.
 
+*As landed (C2f, 2026-10-31; PROGRESS, "Plan 43 C2f").* §5.3 items 3 and 4
+as the coder spec's §5 has them: `Core::root_lone`, `root_ack_class_for(Asker)`
+(a lone root's answer to another node is `Archive`), `journal_class_for`
+(the holder's execution of a forward, its refusals and an inbox batch of
+another node are journaled with the asker's class), `answer_need` /
+`park_durable` / `archive_covers` (a remote's answer never takes the lone
+shortcut: a forward parked for the root group when the group empties waits
+for the archive; an epoch's hold never waits for S3), a remote's dedup of a
+gated row keeps its class and a `Lone` row of another node's op is re-tagged
+`Archive`; `set_durable(.., lone_ok)` and `DurableWait::Unexpected` (D5:
+counted, resubmitted in doubt); `Stats.ungated_shadows`; status
+`ack.lone`, `ack.ungated_shadows`, `ack.ungated_unexpected`. Kept as C1
+landed (not as the spec's §5.1 sentence "committed for every class but
+`Lone`"): a non-stealable answer still says `committed: false` (Q12's
+`gated()`), so `ungated_shadows` counts a designee's or a hold owner's
+answers; a maintainer question. `far` runs `strict_commit` and
+`strict_identity`; the `strict_durability` configurations keep
+`strict_commit` off: what remains of their `archive/*` count is the
+holder's *own* clients' answers in the first ~200 ms of a tenure, judged
+`Lone` by the core and not by the oracle (a peer whose link passed the
+stability window before the core's next housekeeping assessed it: the D10
+alignment, C5), none of them an answer to another node.
+
 ### C3 — Verbatim re-ship; no re-execution of a committed row
 
 **Code** (§5.4, §5.6): `Origin` in the segment envelope
@@ -4189,10 +4212,11 @@ to land before C0.
       ledger's late allowance only for lone topologies;
       `takeover-loss-two-node` green; the `load-probe` cell that found
       the loss green ×20.
-      *C2a–C2e landed* (PROGRESS, "Plan 43 C2a" … "C2e": the oracle, the cut,
-      the delegate's group, its fast path, and the end of a delegation waiting
+      *C2a–C2f landed* (PROGRESS, "Plan 43 C2a" … "C2f": the oracle, the cut,
+      the delegate's group, its fast path, the end of a delegation waiting
       for its group: the seal set, the strict wait, `waiting_for_group`,
-      `abandon-group --gen`); C2f–C2h open.
+      `abandon-group --gen`; and the lone root answering other nodes from the
+      archive, `Ungated` only where lone); C2g–C2h open.
 - [ ] C3: I2c (verbatim) strict on every config; the delegate-turned-root
       rule (move, apply verbatim, re-append deduped by origin, end);
       the fold, `Records` copies, holed generations and the deposed-root

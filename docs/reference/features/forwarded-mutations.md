@@ -260,14 +260,17 @@ acknowledgement policy (plan 30 M9, see
 
 | Policy | The reply leaves the sequencer once |
 |---|---|
-| `Local` (no peer within the RTT budget) | the op is committed to the sequencer's local journal |
+| `Local` (no peer within the RTT budget: a lone sequencer) | its own node's op: the op is committed to the sequencer's local journal; another node's forward: the segment carrying the op is in the bucket (plan 43 C2) |
 | `Backup` (a peer within the budget) | every backup listed in the lease object holds the journal through the op |
 | `S3` (`fs create --ack-policy s3`) | the segment carrying the op is in the bucket |
 
 In every case the requester applies the returned records at once, so
-read-your-writes does not wait for shipping, and it keeps them as
-speculation with the op and its rid, so an op acknowledged under
-`Local` is replayed by rid if the sequencer dies before shipping it.
+read-your-writes does not wait for shipping. Every answer to a forward
+says it is committed (`MutateReply.committed`), except a non-stealable
+sequencer's (an epoch's hold owner, a designee), and the requester's
+shadow of a committed answer is not speculation: it survives a takeover
+and retires when the log carries the row. A shadow installed for an answer
+not said to be committed is counted (`status.ack.ungated_shadows`).
 
 `--fsync-mode s3` makes `fsync()` wait for the inode's dirty chunks and
 records to reach S3. The default `--fsync-mode local` forces the node's

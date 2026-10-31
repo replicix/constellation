@@ -59,7 +59,7 @@ opt-in.
 | Topology | Policy | Added ack latency | Holder crashes and comes back before a takeover | Holder away past a takeover | Failover |
 |---|---|---|---|---|---|
 | Single node | `Local` | none | nothing lost | n/a | n/a |
-| Only distant peers | `Local` | none | nothing lost | forwarded ops are replayed by their requesters; the holder's own un-shipped writes come back when it returns, as a replay | lease TTL (60 s default) |
+| Only distant peers | `Local` | none for the holder's own writes; one S3 commit for a write another node forwards | nothing lost | nothing forwarded lost (it was answered only once in the bucket); the holder's own un-shipped writes come back when it returns, as a replay | lease TTL (60 s default) |
 | A peer within the RTT budget | `Backup` (automatic) | one round trip to the backup | nothing lost | nothing lost | detection + one CAS (≈ 1.5 s in the harness; 2.3–4.7 s from `kill -9` to a new holder on EC2, with one unexplained 60 s first failover on a fresh filesystem; see [RESULTS.md](../../../bench/remote/RESULTS.md#failover-time)) |
 | `fs create --ack-policy s3`, any topology | `S3` | one S3 round trip per group commit | nothing lost | nothing lost | detection + one CAS (needs P2P) |
 
@@ -117,7 +117,7 @@ survives before its segment is in the bucket:
 
 | Policy | Survives | Can be lost |
 |---|---|---|
-| `Local` | any failure of the *requester* of a forwarded op (it is on the holder), a holder process crash, and a holder machine failure for forwarded ops (their requesters replay them, Layer A) | the holder's *own* clients' unshipped writes, if the holder machine loses power or its kernel crashes (they are lost together with the clients that wrote them); a forwarded op if its requester and the holder both lose power |
+| `Local` | everything short of losing the bucket for a forwarded op (the holder answers it once its segment is in the bucket, plan 43 C2); a holder process crash for its own clients' writes | the holder's *own* clients' unshipped writes, if the holder machine loses power or its kernel crashes (they are lost together with the clients that wrote them) |
 | `Backup` | any failure of the holder (process, kernel, power), any failure of a backup (the holder still has it, and removes the backup by lease CAS), a backup's process crash at any time | writes acknowledged within the OS write-back window if the holder **and every backup** lose power (or their kernels crash) together: a correlated failure, such as one power domain. A backup commits an append before acknowledging it but does not fsync it (an fsync per append would put a disk flush on every acknowledgement, the latency Layer B exists to avoid) |
 | `S3` | everything short of losing the bucket | nothing |
 
@@ -128,14 +128,18 @@ correlated power loss.
 
 ### Layer A: requesters keep what they were acknowledged
 
-Always on, and free. A requester keeps the records of every forwarded op
-it was acknowledged as speculation, with the op and its rid. If the
-holder dies before shipping, the next holder's epoch strands that
-speculation and the requester replays each op by rid through the new
-holder; exactly-once identity makes the replay safe (see
+Always on, and free for the holder's own writes. A holder with no backup
+in budget is a *lone* sequencer: it answers its own node's clients once
+the op is on its disk, and those writes that never shipped come back when
+it returns, through the rollback and a replay by rid (see
 [Forwarded mutations](forwarded-mutations.md#speculation-and-stranded-op-recovery)).
-The holder's own writes that never shipped come back when it returns,
-through the same rollback and replay. Failover waits for the lease TTL.
+Another node's forwarded op is answered only once the segment carrying it
+is in the bucket (plan 43 C2: one S3 commit of latency, nothing of it on
+the holder's disk alone): the holder journals its row `Archive`, a
+deposition keeps the row as a member copy instead of replaying it, and a
+requester that heard nothing retries the op by rid at the next holder,
+which executes it once. `status.ack.lone` says whether a node answers as
+a lone sequencer. Failover waits for the lease TTL.
 
 ### Layer B: a backup within the RTT budget
 
@@ -1536,8 +1540,15 @@ See [Configuration](../configuration.md) for parsing rules.
   another node's answer passed on) by what they waited for, as
   `[name, count]` pairs for `archive`, `root-group`, `deleg-group`,
   `non-stealable` and `lone` — the class a row has under today's gating
-  (`Core::root_ack_class`, `Core::deleg_ack_class`); a `lone` answer to
-  another node's forward is the speculation plan 43 C2 removes;
+  (`Core::root_ack_class_for`, `Core::deleg_ack_class`); a `lone` answer
+  is only ever to the node's own client (plan 43 C2); `lone` (plan 43 C2):
+  this node answers its own clients as a lone sequencer, the root lease's
+  or a delegation's it holds; `ungated_shadows`: shadows and hints this
+  node installed for an answer its sequencer did not say is committed (a
+  non-stealable sequencer's; 0 otherwise); `ungated_unexpected`: FUSE
+  fast-path writes whose durability wait found the gate off on a node
+  neither lone nor holding an epoch (a release or a handoff after the
+  write), resubmitted in doubt;
 - `lease`: `held`, `holder`, `epoch`, `expires_in_ms`, `lost`, and
   `waiting_for_group` (`epoch`, `waited_ms`, `sources`; `null` when
   nothing waits): a claim of the lease is waiting for the tail of

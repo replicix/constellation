@@ -1531,12 +1531,12 @@ recommendation, and the latency gates G1–G6), built in steps. Landed: C0
 holds across a listing and a removal; the class at journal time; the TTL
 claimant's sealed tail and the inherited tail; member copies, committed
 shadows and streams, tail identity: nothing committed is re-executed), C2's
-C2a, C2b and C2c (the answer's source; a generation's end carries its cut; a
-delegate acknowledges once its group holds the row). Not yet: the rest of C2
-(the delegate's fast path writing and then waiting, the end of a generation
-waiting for every member a record named, the lone root answering other nodes
-from the archive, settling before `EIO`), C3–C5. Each milestone amends this record; C1's
-rejected options are below.
+C2a to C2f (the answer's source; a generation's end carries its cut; a
+delegate acknowledges once its group holds the row; its fast path writes and
+then waits; the end of a generation waits for its group; a lone root answers
+other nodes from the archive). Not yet: the rest of C2 (settling before
+`EIO`, the scenarios and strict flags), C3–C5. Each milestone amends this
+record; C1's rejected options are below.
 DESIGN.md states each part in the milestone that makes it true (plan 43
 §6).
 
@@ -1706,6 +1706,30 @@ again by rid, and reached the log as root rows of the new tenure. (Found by
 the `placement-hot` sweeps: I2c, I5.) Not yet: a deposed root rebuilt from
 the log still queues the rows it appended for other generations as
 `Records` replays (C3 §5.4 item 4).
+
+**C2f (plan 43, 2026-10-31)**: a lone root answers other nodes from the
+archive, and the fast path answers on its disk only where it is lone. The
+class of a root's answer depends on who asked: a lone root (no listed or
+doubted backup, no candidate, no eligible or unassessed peer, no epoch,
+not `ack=s3`) answers its own node's client `Lone` and every other node's
+forward, inbox op or retry `Archive`: the row is journaled `Archive`, so a
+deposition keeps it as a member copy instead of queueing a replay beside the
+requester's retry by rid (one identity per op), and the answer leaves once a
+segment carries the row, `committed`. An answer parked for the root group
+whose backup set empties while it waits is never released to another node on
+the root's disk alone (no `Lone` re-tag for a remote): it waits for the
+archive too; a continuation epoch's hold still answers at once (never a wait
+for S3 there). A row of another node's op journaled `Lone` before this rule
+is re-tagged `Archive` when another node asks for it again. The FUSE fast
+path's gate-off answer (`Ungated`) is given only where the core published
+that the node is lone or holds an epoch; the gate off for any other reason (a
+release, a handoff after the write) is in doubt, counted
+(`ack.ungated_unexpected`) and resubmitted by rid. The cost is one S3 commit
+on every write another node forwards to a lone root (plan 43 §11 Q2,
+accepted). Rejected: answering the forward from the disk and keeping the
+requester's replayable shadow (Layer A as it was: the answer rests on one
+disk, and the deposed root's replay and the requester's retry are two copies
+of one op, queued at once on two nodes).
 
 
 ## ADR-34: Kernel FUSE race workarounds
