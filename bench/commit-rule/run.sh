@@ -33,7 +33,7 @@ while [ $# -gt 0 ]; do
 done
 
 unset CARGO_TARGET_DIR
-cargo build --release -p constellation-cli -p constellation-harness
+cargo build --release -p constellation -p constellation-harness
 HARNESS="${HARNESS_BIN:-target/release/harness}"
 
 results=$(mktemp -d)

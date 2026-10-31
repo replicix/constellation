@@ -6,6 +6,9 @@
 //! acknowledgement mode it is supposed to measure is not the one the node
 //! reports), or an op fails.
 //!
+//! `ACK_LATENCY_TOPOLOGIES` (a comma-separated list of the numbers below)
+//! runs only those topologies.
+//!
 //! Per topology, actor and op, `ACK_LATENCY_SAMPLES` (default 300) samples
 //! of `create` (`O_CREAT|O_EXCL`), `write` (4 KiB + `fsync`), `rename`,
 //! `unlink` and `chmod`, each on a target prepared untimed; and the first
@@ -47,6 +50,17 @@ fn samples() -> usize {
         .and_then(|v| v.parse().ok())
         .unwrap_or(300)
 }
+
+/// `ACK_LATENCY_TOPOLOGIES` (e.g. `2,3`): run only these topologies, by
+/// number (G1 compares topology 3's delegate with topology 2's holder);
+/// unset, every topology the load profile allows.
+fn topologies() -> Option<Vec<u32>> {
+    let v = std::env::var("ACK_LATENCY_TOPOLOGIES").ok()?;
+    Some(v.split(',').filter_map(|t| t.trim().parse().ok()).collect())
+}
+
+/// A topology's run: its rows for `n` samples per op and actor.
+type Topology = fn(usize) -> Result<Rows>;
 
 /// One topology's results, accumulated as JSON rows.
 struct Rows {
@@ -238,15 +252,26 @@ pub fn ack_latency(_seed: u64) -> Result<()> {
     let n = samples();
     let load = crate::load::label();
     let wan = load.as_deref() == Some("net-wan");
+    let only = topologies();
+    let want = |t: u32| only.as_ref().is_none_or(|o| o.contains(&t));
     let mut all: Vec<Rows> = Vec::new();
     if wan {
-        all.push(topology_wan(n)?);
+        if want(5) {
+            all.push(topology_wan(n)?);
+        }
     } else {
-        all.push(topology_single(n)?);
-        all.push(topology_backup(n)?);
-        all.push(topology_delegated(n)?);
-        all.push(topology_delegated_backup(n)?);
-        all.push(topology_ack_s3(n)?);
+        let runs: [(u32, Topology); 5] = [
+            (1, topology_single),
+            (2, topology_backup),
+            (3, topology_delegated),
+            (4, topology_delegated_backup),
+            (6, topology_ack_s3),
+        ];
+        for (t, run) in runs {
+            if want(t) {
+                all.push(run(n)?);
+            }
+        }
     }
     finish(all, load);
     Ok(())
