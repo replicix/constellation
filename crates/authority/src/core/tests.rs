@@ -48136,6 +48136,160 @@ mod c2f_lone_root {
         assert_eq!(classes_of(&h, forwarded(1)), vec![RowClass::NonStealable]);
     }
 
+    /// The C2f review, MUST 1 (a): a lone root's answer to another node,
+    /// parked for the log, is released when a continuation epoch's hold is
+    /// adopted (never a wait for S3 in an epoch, §5.2): it leaves as the
+    /// hold's (non-stealable), and its row keeps its class. Fails on the
+    /// parent: answered `Lone` and the row re-tagged `Lone` (queued for
+    /// replay at a deposition, beside the requester's retry).
+    #[test]
+    fn a_remote_answer_released_by_a_hold_is_the_holds() {
+        let mut h = lone_root();
+        let out = h.step(forward(&h, 71, 1, "f"));
+        assert!(answers(&out).is_empty(), "waits for the archive: {out:?}");
+        let epoch = h.core.lease.epoch().unwrap();
+        h.core.lease.adopt_epoch_hold(h.clk(), epoch);
+        let before = h.core.stats.ack_classes;
+        let out = release(&mut h);
+        assert!(
+            matches!(
+                answers(&out).as_slice(),
+                [(MutateOutcome::Accepted { .. }, false)]
+            ),
+            "{out:?}"
+        );
+        let ns = AckClass::NonStealable.index();
+        assert_eq!(h.core.stats.ack_classes[ns], before[ns] + 1);
+        assert_eq!(classes_of(&h, forwarded(1)), vec![RowClass::Archive]);
+        assert_eq!(h.core.stats.acks_downgraded_lone, 0);
+    }
+
+    /// MUST 1 (b): another node's retry of a row journaled `Archive` before
+    /// the hold, answered inside it (at once: the hold), is the hold's — not
+    /// an `Archive` answer for a row the log does not carry. Fails on the
+    /// parent: answered `Archive`, `committed`.
+    #[test]
+    fn a_remote_retry_in_a_hold_is_answered_as_the_holds() {
+        let mut h = lone_root();
+        h.step(forward(&h, 71, 1, "f"));
+        let mut out = Vec::new();
+        h.core.abort_durable_parks(h.clk(), &h.meta, &mut out);
+        let epoch = h.core.lease.epoch().unwrap();
+        h.core.lease.adopt_epoch_hold(h.clk(), epoch);
+        let before = h.core.stats.ack_classes;
+        let out = h.step(forward(&h, 72, 1, "f"));
+        assert!(
+            matches!(
+                answers(&out).as_slice(),
+                [(MutateOutcome::Accepted { .. }, false)]
+            ),
+            "{out:?}"
+        );
+        let ns = AckClass::NonStealable.index();
+        assert_eq!(h.core.stats.ack_classes[ns], before[ns] + 1);
+        assert_eq!(classes_of(&h, forwarded(1)), vec![RowClass::Archive]);
+    }
+
+    /// MUST 2 (D5): a node that holds no lease, or lost it, is no lone
+    /// sequencer: what it publishes for its own clients is no `Lone` class,
+    /// and before the replica stops being the holder's it says it may not
+    /// answer alone. Fails on the parent: `Lone` with the lease lost.
+    #[test]
+    fn a_node_that_is_not_lone_publishes_no_lone_class() {
+        let mut h = lone_root();
+        assert_eq!(h.core.root_ack_class(), AckClass::Lone);
+        h.core.lease.lost = true;
+        assert_eq!(h.core.root_ack_class(), AckClass::Archive);
+        h.core.lease.lost = false;
+        h.core.clear_holder_epoch(&h.meta);
+        let session = h.meta.session();
+        assert!(!session.durable_lone_ok());
+        assert_eq!(session.published_class(), RowClass::Archive);
+        assert_eq!(
+            session.wait_durable(u64::MAX - 1, std::time::Duration::from_millis(1)),
+            constellation_meta::DurableWait::Unexpected
+        );
+    }
+
+    /// SHOULD 4: this node's own client's retry of a row journaled in a hold,
+    /// answered after the hold, is answered as the node is now: alone (the
+    /// row re-tagged `Lone`) only if it is lone, else from the archive. Fails
+    /// on the parent: `NonStealable` after the hold.
+    #[test]
+    fn an_own_retry_of_a_hold_row_after_the_hold_is_the_nodes_now() {
+        let journal = |h: &Harness, name: &str, rid: Rid| {
+            let _class = constellation_meta::PendingClass::set(RowClass::NonStealable);
+            constellation_meta::execute_mutate(&h.meta, &h.create(name), Some(rid)).unwrap();
+        };
+        let h = lone_root();
+        journal(&h, "ha", h.rid(5));
+        assert_eq!(
+            h.core.journaled_answer_class(&h.meta, h.rid(5)).unwrap(),
+            AckClass::Lone
+        );
+        assert_eq!(classes_of(&h, h.rid(5)), vec![RowClass::Lone]);
+        let (h, _) = listed_holder();
+        journal(&h, "hb", h.rid(6));
+        assert_eq!(
+            h.core.journaled_answer_class(&h.meta, h.rid(6)).unwrap(),
+            AckClass::Archive
+        );
+        assert_eq!(classes_of(&h, h.rid(6)), vec![RowClass::NonStealable]);
+    }
+
+    /// SHOULD 5: a journaled refusal of another node's forward starts a sync
+    /// round at once, as an acceptance does: a lone root's answer to it
+    /// waits for the log. Fails on the parent: the round waited for the
+    /// poll's idle backoff.
+    #[test]
+    fn a_journaled_refusal_of_a_forward_nudges_a_round() {
+        let mut h = lone_root();
+        let out = h.step(Event::Peer {
+            from: FROM,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(81),
+                rid: forwarded(9),
+                op: MutateOp::Unlink {
+                    parent: ROOT_INO,
+                    name: "missing".into(),
+                },
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+            },
+        });
+        assert!(answers(&out).is_empty(), "waits for the archive: {out:?}");
+        assert!(
+            out.iter().any(|a| matches!(
+                a,
+                Action::SetTimer {
+                    after_ms: 0,
+                    kind: TimerKind::Poll,
+                    ..
+                }
+            )) || h.core.nudged,
+            "no round asked for: {out:?}"
+        );
+    }
+
+    /// SHOULD 6: a lone root's replay of another node's rid (the takeover
+    /// gate's, `replay_queue_locally`) is journaled as that node's
+    /// (`Archive`), not as its own client's (`Lone`). Fails on the parent:
+    /// `Lone`.
+    #[test]
+    fn a_replay_of_another_nodes_rid_is_journaled_as_that_nodes() {
+        let mut h = lone_root();
+        h.meta
+            .queue_replay(forwarded(3), &h.create("r"), &Default::default())
+            .unwrap();
+        let mut out = Vec::new();
+        h.core
+            .replay_queue_locally(h.clk(), &h.meta, &mut out)
+            .unwrap();
+        assert_eq!(classes_of(&h, forwarded(3)), vec![RowClass::Archive]);
+    }
+
     /// A row of another node's op journaled `Lone` (a lone root before C2)
     /// that another node asks for again is answered from the archive, and
     /// re-tagged `Archive` first so that its strand follows the answer.

@@ -1658,7 +1658,7 @@ impl Core {
             "LEASE LOST: another node took write authority"
         );
         self.lease.mark_lost(holder, epoch, my_epoch);
-        replica.set_holder_epoch(0);
+        self.clear_holder_epoch(replica);
         let _ = replica.persist_lost(true);
         self.inbox.holder = None;
         self.fail_barriers(out);
@@ -4663,7 +4663,7 @@ impl Core {
                         self.lease.released();
                         self.owe_given_up_move(carried_mine, replica);
                         self.deleg_on_lease_gone(now, replica, out);
-                        replica.set_holder_epoch(0);
+                        self.clear_holder_epoch(replica);
                         self.inbox.holder = None;
                         if self.epoch_refuses_writes() {
                             // Nobody holds the epoch now: what waits for
@@ -4920,7 +4920,7 @@ impl Core {
         }
         self.lease.released();
         self.deleg_on_lease_gone(now, replica, out);
-        replica.set_holder_epoch(0);
+        self.clear_holder_epoch(replica);
         self.stats.releases += 1;
         self.inbox.holder = None;
         tracing::info!(node = self.cfg.node_id, epoch, "released the lease");

@@ -830,7 +830,10 @@ impl Default for SessionState {
             durable_lost: AtomicBool::new(false),
             durable_jseq: AtomicU64::new(0),
             durable_class: AtomicU8::new(RowClass::Lone.to_u8()),
-            durable_lone_ok: AtomicBool::new(false),
+            // (Nothing published yet: a replica no core drives answers as
+            // before. The core publishes `false` at its start, before the
+            // mount serves, and the truth at every step after.)
+            durable_lone_ok: AtomicBool::new(true),
         }
     }
 }
@@ -1615,6 +1618,12 @@ impl SessionState {
     /// fast path's rows are journaled with it and its wait follows it.
     pub fn published_class(&self) -> RowClass {
         RowClass::from_u8(self.durable_class.load(Ordering::Acquire))
+    }
+
+    /// Plan 43 C2 (§5.4, D5): with the gate off, the core said this node may
+    /// answer its own clients alone (it is lone, or holds an epoch).
+    pub fn durable_lone_ok(&self) -> bool {
+        self.durable_lone_ok.load(Ordering::Relaxed)
     }
 
     /// Whether the durability gate is on (one atomic load: the fast

@@ -768,10 +768,19 @@ impl View {
     /// gate is on (its answer may rest on rows not yet durable).
     pub(super) fn fast_ack_target(&self, h: &SyncHandle) -> Option<AckTarget> {
         match constellation_meta::take_last_journaled() {
-            Some(row) => row.class.gated().then_some(AckTarget {
-                first: row.first,
-                last: row.last,
-            }),
+            // Plan 43 C2f review (D5): a row journaled `Lone` or
+            // non-stealable is answered at once only while the core says the
+            // node may answer alone (lone, or in an epoch's hold). Journaled
+            // under a class published before that ended (a release, a handoff,
+            // a deposition, the hold's close: the lease mirror lags), it waits
+            // like a gated row: for the group, or in doubt
+            // (`DurableWait::Unexpected`) with the gate off.
+            Some(row) => {
+                (row.class.gated() || !self.meta.session().durable_lone_ok()).then_some(AckTarget {
+                    first: row.first,
+                    last: row.last,
+                })
+            }
             None => h.lease.ack_gated().then(|| {
                 let tip = self.meta.journal_tip().unwrap_or(u64::MAX);
                 AckTarget {

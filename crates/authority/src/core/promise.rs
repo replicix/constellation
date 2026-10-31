@@ -811,7 +811,7 @@ impl Core {
             self.lock_keep_grants_at_close();
         }
         self.deleg_on_lease_gone(now, replica, out);
-        replica.set_holder_epoch(0);
+        self.clear_holder_epoch(replica);
     }
 
     /// This node holds again — by an acquisition whose CAS replaced

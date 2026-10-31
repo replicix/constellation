@@ -227,7 +227,11 @@ impl Core {
                     super::delegate::RecallPlan::Wait(w) => w,
                     super::delegate::RecallPlan::Refuse(code) => {
                         if req != OpId(0) {
-                            let class = self.root_ack_class_for(self.asker_of(from));
+                            // Plan 43 C2f review: nothing is journaled for
+                            // this refusal; it is the designation's (a
+                            // designee holds the keys, non-stealable), not an
+                            // answer the archive carries.
+                            let class = super::AckClass::NonStealable;
                             self.send_answer(
                                 from,
                                 PeerMsg::MutateReply {
@@ -809,6 +813,14 @@ impl Core {
                 MutateOutcome::Errno(code)
             }
         };
+        // Plan 43 C2f review: a lone root's journaled refusal of another
+        // node's op starts a round at once, as an acceptance does (above):
+        // its answer waits for the log, and waited for the idle backoff's
+        // next round (up to 10 s on an idle root). (A backed root's answer
+        // waits for its group, appended on every event.)
+        if super::backup::is_answer(&outcome) && asker == super::Asker::Remote && self.root_lone() {
+            self.nudge(now, out);
+        }
         (outcome, None)
     }
 
@@ -948,7 +960,7 @@ impl Core {
             // The hold owner now: this node follows its log stream.
             self.lease.cached_holder = Some(from);
             self.deleg_on_lease_gone(now, replica, out);
-            replica.set_holder_epoch(0);
+            self.clear_holder_epoch(replica);
             self.stats.handoffs_served += 1;
             out.push(Action::Send {
                 to: from,

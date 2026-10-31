@@ -2143,7 +2143,7 @@ impl Core {
     /// is honoured (`recover_deposed` at mount).
     pub fn start(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         self.clk = now;
-        replica.set_holder_epoch(0);
+        self.clear_holder_epoch(replica);
         self.ship.last_publish = now.wait;
         let applied = replica.applied_seq().unwrap_or(0);
         self.ship.next_seq = applied + 1;

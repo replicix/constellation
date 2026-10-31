@@ -1802,12 +1802,23 @@ impl Core {
             // be answered on this node's disk alone. The answer is counted
             // and sourced as the lone node's it is (`Lone`), not as the
             // class it was parked for.
-            let downgraded = p.durable.is_some_and(|j| {
+            let unarchived = p.durable.is_some_and(|j| {
                 !self.archive_covers(j, shipped) && self.durable_jseq() == u64::MAX
-            }) && match &p.what {
-                ParkedWhat::Reply { class, .. } | ParkedWhat::Finish { class, .. } => class.gated(),
-                _ => false,
-            };
+            });
+            // Plan 43 C2f review (§5.2, Q3): another node's answer released by
+            // a continuation epoch's hold (the only way one leaves with the
+            // gate off before the log carries it) is the hold's: non-stealable,
+            // and its row keeps its class (no `Lone` re-tag: that would queue
+            // it for replay beside the requester's retry).
+            let held_for_remote = unarchived && p.what.to_remote(self.cfg.node_id);
+            let downgraded = unarchived
+                && !held_for_remote
+                && match &p.what {
+                    ParkedWhat::Reply { class, .. } | ParkedWhat::Finish { class, .. } => {
+                        class.gated()
+                    }
+                    _ => false,
+                };
             // A re-tag the store fails leaves the row gated-class: the
             // answer can claim neither that class (nothing committed the
             // row) nor `Lone` (not recorded), so the op is answered `EIO`
@@ -1862,7 +1873,13 @@ impl Core {
                     completed: _,
                     class,
                 } => {
-                    let class = if downgraded { AckClass::Lone } else { class };
+                    let class = if downgraded {
+                        AckClass::Lone
+                    } else if held_for_remote {
+                        AckClass::NonStealable
+                    } else {
+                        class
+                    };
                     self.rd.parked_rids.remove(&rid);
                     if let Some(t) = held_timer {
                         self.cancel_timer(t, out);

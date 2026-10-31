@@ -799,7 +799,10 @@ impl Core {
         // Plan 30 §M14 phase 2: with the op's fencing token — a replay
         // under a grant that has ended is refused (`LockLapsed`) and
         // becomes a conflict copy below, as any refusal does.
-        let _class = self.journal_class();
+        // (Plan 43 C2f review: another node's rid is journaled with that
+        // node's class: a lone root's row of it is `Archive`.)
+        let asker = self.asker_of(queued.rid.node);
+        let _class = self.journal_class_for(asker);
         match constellation_meta::locks::TokenPath::Replay
             .scope(|| replica.execute(&queued.op, Some(queued.rid), &queued.lock_tag, now))
         {
@@ -828,13 +831,7 @@ impl Core {
                 // (`NotAdmitted` is no outcome: nothing ran, and it never
                 // answers anyone.)
                 if !matches!(error, constellation_meta::MetaError::NotAdmitted) {
-                    self.record_refusal(
-                        queued.rid,
-                        code,
-                        Some(&queued.op),
-                        super::Asker::Own,
-                        replica,
-                    );
+                    self.record_refusal(queued.rid, code, Some(&queued.op), asker, replica);
                 }
                 if folded || queued.foreign || refusal_is_satisfied(&queued.op, error.code()) {
                     self.note_unacked_refused(queued);

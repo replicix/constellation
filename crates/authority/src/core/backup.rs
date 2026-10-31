@@ -1590,7 +1590,10 @@ impl Core {
             AckClass::Archive
         } else if !self.lease.backups().is_empty() || self.doubted_backups().next().is_some() {
             AckClass::RootGroup
-        } else if self.durable_jseq() != u64::MAX {
+        } else if self.durable_jseq() != u64::MAX || !self.root_lone() {
+            // (Plan 43 C2f review, D5: nothing gating but the node not lone —
+            // the lease released, lost, not held — is no `Lone` answer: a
+            // fast-path row journaled now waits, and finds the gate off.)
             AckClass::Archive
         } else {
             AckClass::Lone
@@ -1661,6 +1664,26 @@ impl Core {
             Some((_, constellation_meta::RowClass::Lone)) => AckClass::Lone,
             Some((_, constellation_meta::RowClass::Archive)) => AckClass::Archive,
             Some((_, constellation_meta::RowClass::RootGroup)) => AckClass::RootGroup,
+            // Plan 43 C2f review: a row of a continuation epoch's hold is
+            // non-stealable only while the hold lasts. After it, this node's
+            // own client is answered as the node is now: on its disk alone
+            // only if it is lone (the row re-tagged `Lone`, so its strand
+            // follows the answer), from the archive otherwise (`flex-crash`
+            // seed 39's shape, for the own client).
+            Some((first, constellation_meta::RowClass::NonStealable))
+                if !self.lease.epoch_held() =>
+            {
+                if self.root_lone() {
+                    replica
+                        .reclass_journal_tx(first, constellation_meta::RowClass::Lone)
+                        .inspect_err(|error| {
+                            tracing::warn!(node = self.cfg.node_id, ?rid, %error, "could not re-tag a hold's row answered alone: EIO");
+                        })?;
+                    AckClass::Lone
+                } else {
+                    AckClass::Archive
+                }
+            }
             Some((_, constellation_meta::RowClass::NonStealable)) => AckClass::NonStealable,
             Some((_, constellation_meta::RowClass::DelegGroup)) | None => self.root_ack_class(),
         })
@@ -1685,6 +1708,13 @@ impl Core {
     ) -> Result<AckClass, constellation_meta::MetaError> {
         if asker == Asker::Own {
             return self.journaled_answer_class(replica, rid);
+        }
+        // Plan 43 C2f review (§5.2, Q3): in a continuation epoch's hold the
+        // answer leaves at once (never a wait for S3 there) and the hold
+        // vouches for it: non-stealable, whatever class the row was
+        // journaled with before the hold, and nothing re-tagged.
+        if self.lease.epoch_held() {
+            return Ok(AckClass::NonStealable);
         }
         Ok(match replica.journal_class_of_rid(rid) {
             Some((first, constellation_meta::RowClass::Lone)) => {
@@ -1842,6 +1872,21 @@ impl Core {
             self.ack.reported = Some((gate, jseq, lost, class, lone_ok));
             replica.set_durable(gate, jseq, lost, class, lone_ok);
         }
+    }
+
+    /// Plan 43 C2f review (D5): the replica stops being the holder's
+    /// (`set_holder_epoch(0)`, at a release, a handoff, a deposition, an
+    /// epoch's close, the mount). First the FUSE fast path is told that this
+    /// node may not answer its own clients alone: a write the engine's lease
+    /// mirror still admits in the window, journaled under the class published
+    /// before, is in doubt (`DurableWait::Unexpected`), never answered as a
+    /// lone node's.
+    pub(crate) fn clear_holder_epoch(&mut self, replica: &dyn Replica) {
+        let lost = self.lease.lost;
+        let class = constellation_meta::RowClass::Archive;
+        self.ack.reported = Some((false, u64::MAX, lost, class, false));
+        replica.set_durable(false, u64::MAX, lost, class, false);
+        replica.set_holder_epoch(0);
     }
 
     /// A successful S3 result proves liveness as of the request's send

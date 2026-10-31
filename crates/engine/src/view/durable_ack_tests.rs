@@ -578,6 +578,49 @@ fn an_unexpected_ungated_wait_is_counted_and_resubmitted() {
     assert_eq!(session.stats().fast_acks_downgraded, 0);
 }
 
+/// Plan 43 C2f review (D5): the core published that this node may no longer
+/// answer alone (a release, a handoff, a deposition: published before the
+/// replica stops being the holder's), while the engine's lease mirror still
+/// admits the write and the class it journals with is the stale `Lone`. The
+/// row is not answered at once on this disk: the op is in doubt, by rid
+/// through the core. Fails on the parent: a `Lone` row was answered `Ok` at
+/// once, whatever the core said.
+#[test]
+fn a_lone_row_journaled_after_the_node_stopped_being_lone_is_in_doubt() {
+    use constellation_meta::RowClass;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let session = meta.session();
+    session.set_durable(false, u64::MAX, false, RowClass::Lone, false);
+    let (fs, _dir, mut core) = holder_fs(meta.clone(), false);
+    let ino = meta.allocate_ino(ROOT_INO).unwrap();
+    let (stop, submitted) = (AtomicBool::new(false), Mutex::new(Vec::new()));
+    let result = std::thread::scope(|scope| {
+        let responder = scope.spawn(|| core_answering_in_doubt(&mut core, &stop, &submitted));
+        let result = fs.mutate_op(
+            ROOT_INO,
+            constellation_meta::MutateOp::Create {
+                parent: ROOT_INO,
+                name: "w".into(),
+                ino,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+        );
+        stop.store(true, Ordering::Relaxed);
+        responder.join().unwrap();
+        result
+    });
+    assert!(result.is_err(), "not answered OK: {result:?}");
+    let tip = meta.journal_tip().unwrap();
+    assert_eq!(meta.journal_tx_class(tip).unwrap(), Some(RowClass::Lone));
+    let submitted = submitted.lock().unwrap();
+    assert_eq!(submitted.len(), 1, "resubmitted once: {submitted:?}");
+    assert!(submitted[0].1, "in doubt");
+    assert_eq!(session.stats().ungated_unexpected, 1);
+}
+
 /// Plan 43 C1-2: the fast path's wait follows the class the row was
 /// journaled under, not the gate as it stands after the execution: a row
 /// journaled `Lone` (the gate was off) is answered at once, whatever the

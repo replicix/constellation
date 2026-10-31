@@ -2765,12 +2765,33 @@ impl Driver {
                 return Some(self.hold_write(now, *rid, op, tag, epoch, core_ms, write_ms));
             }
         }
+        constellation_meta::clear_last_journaled();
         let outcome = outcome_of(
             constellation_meta::locks::TokenPath::Local
                 .scope(|| constellation_meta::execute_tagged(&self.meta, op, Some(*rid), tag, now)),
             epoch,
         );
+        let journaled = constellation_meta::take_last_journaled();
         drop(admission);
+        // Plan 43 C2f review (D5), as the engine's fast path
+        // (`fast_ack_target`): a row journaled `Lone` or non-stealable is
+        // answered at once only while the core says the node may answer
+        // alone; otherwise the op is in doubt, by rid through the core.
+        let session = self.meta.session();
+        if journaled.is_some_and(|r| !r.class.gated()) && !session.durable_lone_ok() {
+            session.count_ungated_unexpected();
+            self.step_now = now;
+            return Some(self.core.handle(
+                now,
+                Event::SubmitInDoubt {
+                    rid: *rid,
+                    op: op.clone(),
+                    policy: Policy::Client,
+                    tag: tag.clone(),
+                },
+                &*self.meta,
+            ));
+        }
         Some(self.fast_path_done(now, *rid, op, outcome, None))
     }
 
