@@ -223,6 +223,10 @@ struct Waiter {
     /// pushed grant; it was asked to re-send (see [`Ask`]). `None` at
     /// park and whenever its request re-attaches.
     ask: Option<Ask>,
+    /// Parked by first come, first served alone (`lock_queued_behind`, no
+    /// grant in its way then), when: past [`Core::lock_queue_bound_ms`] it
+    /// is served as soon as no grant is in its way, whatever waits ahead.
+    queued_behind: Option<WaitMs>,
 }
 
 /// An "ask again" sent to a parked remote waiter (the "ask again" rule,
@@ -1782,7 +1786,20 @@ impl Core {
         // the way of.
         if blocking && self.lock_queued_behind(now, from, ino, mode, replica) {
             self.stats.lock_queued_behind += 1;
+            // Parked by the queue's order alone (no grant in its way): the
+            // bound applies (`lock_queue_bound_ms`).
+            let own = replica.locks().own_grant(ino, from, now.wait);
+            let eff = own.map_or(mode, |g| g.mode.max(mode));
+            let order_alone = replica
+                .locks()
+                .conflicting(ino, from, eff, now.wait)
+                .is_empty();
             self.lock_park(now, from, ino, mode, req, op, sent, waited_ms, out);
+            if order_alone {
+                if let Some(w) = self.lk.waiters.last_mut() {
+                    w.queued_behind = Some(now.wait);
+                }
+            }
             self.lock_serve_waiters(now, ino, replica, out);
             return Served::Parked;
         }
@@ -1842,6 +1859,17 @@ impl Core {
     fn lock_grace_retry_ms(&mut self, now: Now, ino: Ino, replica: &dyn Replica) -> u64 {
         let left = self.lock_grace_end(now, ino, replica).since(now.wait);
         (left + 1).clamp(10, 1_000) as u64
+    }
+
+    /// How long a blocking request parked by first come, first served alone
+    /// (no grant in its way) waits behind the older waiters before it is
+    /// served anyway: one lock grace, `lock_ttl + margin`, what the queue
+    /// already waits for an outwaited holder. Within it, a writer ahead
+    /// keeps its turn against the readers that come after it; past it, a
+    /// reader whose wait could be part of a cycle the queue made (see
+    /// `lock_serve_waiters`) goes on, as it would on one host.
+    pub(crate) fn lock_queue_bound_ms(&self) -> i64 {
+        (self.lock_ttl_ms() + self.lock_margin_ms()).max(0)
     }
 
     /// A waiter of another node is parked on `ino` in a mode that
@@ -3005,6 +3033,7 @@ impl Core {
             held_timer,
             since,
             ask: None,
+            queued_behind: None,
         });
         if let Some(op) = op {
             if let Some(o) = self.lk.ops.get_mut(&op) {
@@ -3121,6 +3150,7 @@ impl Core {
         let margin = self.lock_margin_ms();
         let mut done = Vec::new();
         let mut gone = Vec::new();
+        let order = idx.clone();
         for i in idx {
             let (node, mode, req, op, sent, recv) = {
                 let w = &self.lk.waiters[i];
@@ -3267,6 +3297,53 @@ impl Core {
                         Some(_) => continue,
                     }
                 }
+            }
+        }
+        // The bound on first come, first served: a waiter parked behind an
+        // older one only by the queue's order, longer than the bound, is
+        // served now if no grant is in its way (nothing is recalled for
+        // it). The queue can hold such a request in a wait Linux would not
+        // make: owner P on node A holds a read lock on X and waits for Y,
+        // which owner Q on C holds while it asks for a read lock on X behind
+        // a writer on B, whose turn waits for A's release, which waits for
+        // P. Past the bound Q reads as it would on one host.
+        let bound = self.lock_queue_bound_ms();
+        for i in order {
+            if done.contains(&i) || gone.contains(&i) {
+                continue;
+            }
+            let (node, mode, req, op, sent, recv, queued) = {
+                let w = &self.lk.waiters[i];
+                (w.node, w.mode, w.req, w.op, w.sent, w.recv, w.queued_behind)
+            };
+            if !queued.is_some_and(|q| now.wait.since(q) >= bound) {
+                continue;
+            }
+            let own = replica.locks().own_grant(ino, node, now.wait);
+            let eff = own.map_or(mode, |g| g.mode.max(mode));
+            if own.is_some_and(|g| g.recalled)
+                || !replica
+                    .locks()
+                    .conflicting(ino, node, eff, now.wait)
+                    .is_empty()
+            {
+                continue;
+            }
+            let base = if op.is_some() { now.wait } else { recv };
+            let push = op.is_none() && req.is_none();
+            if let Again::Answer(outcome) =
+                self.lock_serve_again(now, base, node, ino, mode, push, replica, out)
+            {
+                self.stats.lock_queue_bound_served += 1;
+                done.push(i);
+                if let (None, LockOutcome::Granted { id, .. }) = (op, &outcome) {
+                    let since = self.lk.waiters[i].since;
+                    self.lk.served.insert((node, ino), since);
+                    let locks = replica.locks();
+                    self.lk.unproven.retain(|g| locks.get(*g).is_some());
+                    self.lk.unproven.insert(*id);
+                }
+                self.lock_deliver(now, node, ino, req, op, sent, outcome, replica, out);
             }
         }
         if !gone.is_empty() {

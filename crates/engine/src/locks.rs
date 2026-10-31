@@ -82,7 +82,10 @@
 //!
 //! Not supported: POSIX deadlock detection (`EDEADLK`) — two owners
 //! waiting on each other wait until a signal ends one wait, as they do
-//! with `flock`.
+//! with `flock`. The sequencer's queue (first come, first served) adds no
+//! such wait for good: a request parked only behind an older waiter is
+//! served after one lock grace, and an owner converting its read lock
+//! under a recalled grant is upgraded in place (DESIGN.md, Cluster locks).
 
 use crate::sync::SyncRequest;
 use anyhow::{bail, Result};

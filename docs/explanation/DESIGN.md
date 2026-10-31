@@ -1380,8 +1380,14 @@ of another node's `close()` out of band, with no lock between them
   amended by plan 41).
 - **Conflicts** recall the other grants; a recalled node flushes the
   file's dirty data to the log before it releases. Blocking requests park
-  first-in first-out at the sequencer; non-blocking ones get `EAGAIN` and
-  the recall still goes out.
+  first-in first-out at the sequencer, one parked only by that order (no
+  grant in its way) for at most one lock grace (`lock_ttl + margin`):
+  past it, it is served as soon as no grant is in its way, so a reader
+  waits behind an older writer, but not in a cycle the queue alone made
+  (a reader whose host holds what the writer's turn waits for). An
+  upgrade of a recalled grant (an owner converting its read lock) goes
+  first and is made in place. Non-blocking ones get `EAGAIN` and the
+  recall still goes out.
 - **Close.** The kernel drops nothing itself at close: the close's
   `FLUSH` drops the closing process's POSIX locks, and the description's
   `RELEASE` its OFD and `flock` locks. `RELEASE` comes after `close(2)`

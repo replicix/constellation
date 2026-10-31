@@ -1176,6 +1176,9 @@ pub struct Stats {
     /// node whose mode conflicts with theirs, though no grant was in the
     /// way (`Core::lock_serve`'s first come, first served).
     pub lock_queued_behind: u64,
+    /// Owner: such requests served past the bound with older waiters still
+    /// parked (`Core::lock_queue_bound_ms`).
+    pub lock_queue_bound_served: u64,
     /// Node: ops told to wait whose waiter a grant to another op of the
     /// node had served, sent again at once (`Core::lock_op_outcome`).
     pub lock_sibling_resends: u64,

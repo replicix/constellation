@@ -11274,8 +11274,10 @@ fn regression_locks_writer_hold_delegated_doubt_older_id_seeds_279_344_1324() {
 /// `locks-delegated-upgrade`, where the delegate's own client upgrades: 61).
 /// The node sends an upgrade under a recalled grant that local locks pin, the
 /// owner upgrades the grant in place, still recalled, and serves it first; a
-/// node's upgrading op is answered by its grant once that covers it; a
-/// renewal's answer carries the mode of the owner's record.
+/// node's upgrading op is answered by its grant once that covers it (seed
+/// 540 of `locks-upgrade` at the node, 4 of `locks-delegated-upgrade` for
+/// the owner's own ops); a renewal's answer carries the mode of the owner's
+/// record (719).
 #[test]
 fn an_owner_upgrades_its_read_lock_while_another_node_waits() {
     let mut upgraded = 0;
@@ -11283,15 +11285,15 @@ fn an_owner_upgrades_its_read_lock_while_another_node_waits() {
         (
             "locks-upgrade",
             locks_upgrade_config as fn() -> SimConfig,
-            [5u64, 24, 28],
+            &[5u64, 24, 28, 540, 719][..],
         ),
         (
             "locks-delegated-upgrade",
             locks_delegated_upgrade_config,
-            [4, 13, 19],
+            &[4, 13, 19][..],
         ),
     ] {
-        for seed in seeds {
+        for &seed in seeds {
             let report = run_seed(seed, cfg()).unwrap_or_else(|e| {
                 panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
             });

@@ -62979,3 +62979,47 @@ passed (11 ignored). `locks-upgrade` and `locks-delegated-upgrade`, seeds 0 to 1
 failures. The 103 configurations of the lock-liveness entry, with and without the knob, against main wherever one
 failed: the same classes as there (the controls, `locks-delegate-ahead` and `locks-delegated-partition-skew` with the
 same counts per class, `locks-core-stall-backup-long*` 946 and 1838), seeds moved.
+
+## Review of the three lock commits: the renewal's renaming, the lineage's lifetime, the queue's bound (2026-10-31)
+
+1. **The renewal renamed a held grant without its lineage** (must-fix). `LockTables::renewed` takes the owner's newer id of
+   the grant (`now_id`: the owner minted it for this node and its answer was lost) and tombstoned the old one, with no
+   `note_superseded`: a write in doubt under the old id, the owner's recall of the new one, and the release went out (two
+   exclusive holders, as before af4fdfd6). It records the renaming now. Audit of every place a held grant's id changes in
+   `crates/meta/src/locks.rs`: `install_held`'s continuing branch, `recall_held`'s adoption and `renewed` (all three
+   record it); `install_held`'s other replacement is a fresh grant (after a lapse, or from another owner), which its owner
+   minted after the old record ended, so the old id's ops do not hold it; every other site removes the held grant.
+   Test: core `a_renewal_or_a_recall_under_a_newer_id_keeps_the_older_ids_ops` (fails without the note in `renewed`, and
+   without the one in `recall_held`).
+2. **The rename map was evicted by count.** `superseded` dropped its oldest entries past 4,096 renamings, a held grant's
+   with an op in doubt among them. It is `lineages` now: per inode, the held grant's current id and its older ids, valid
+   while that inode's held grant has the current id, pruned at each renaming once the grant is gone; never evicted
+   while held, at most one per held grant. `lineage` and `current_id` look up the held grants' entries, not a chain
+   over every renaming. Test: meta `a_held_grants_lineage_is_kept_while_it_is_held_and_only_then` (on the old map it
+   fails: "the held grant's lineage was evicted").
+3. **First come, first served could make a cycle Linux does not.** Owner P on node A holds a read lock on X and waits for
+   Y; Q on C holds Y and asks for a read lock on X behind a writer on B, whose turn waits for A's release, which waits for
+   P. A blocking request parked by the queue's order alone (no grant in its way when it came, `Waiter::queued_behind`) is
+   served after one lock grace (`lock_ttl + margin`, 21 s at the production TTL; `Core::lock_queue_bound_ms`) as soon as
+   no grant is in its way, nothing recalled for it. The grace is what the queue already waits for an outwaited holder,
+   and a writer ahead keeps its turn for that long against every reader after it; a reader is not held longer than a
+   failover would hold it. DESIGN.md (Cluster locks) and the engine's `EDEADLK` note say so. Test: core
+   `a_reader_queued_behind_a_writer_is_served_after_one_lock_grace` (within the bound the writer keeps its turn; past it
+   the reader is served beside the other reader, the writer still waiting; fails with the bound's pass removed).
+4. **Mutants nothing caught.** `recall_held`'s note (item 1's test, the recall case); the `on_lock_flushed` remap to the
+   newer id (`a_release_under_way_when_the_grant_goes_on_under_a_newer_id_releases_that_id`: without it the release
+   ends nothing and the grant sits releasing); the upgrade-first order of `lock_serve_waiters`
+   (`an_upgrade_of_a_recalled_grant_is_served_before_the_waiter_it_is_recalled_for`). The node's answer to a covered
+   upgrade and the owner's own covered ops: mutants fail `locks-upgrade` seed 540 and `locks-delegated-upgrade` seed 4
+   (the latter was pinned in `an_owner_upgrades_its_read_lock_while_another_node_waits`, which now pins 540 and 719 too;
+   without the renewal's mode, 719 fails).
+
+### Gates and sweeps
+
+fmt and clippy (workspace, all targets, `-D warnings`) clean. Lib tests: authority 840, meta 381. Release sim suite: 292
+passed (11 ignored). Seeds 0 to 1,999 of the 105 configurations (the 103 of the lock-liveness entry and the two upgrade
+ones), with and without the knob, against main wherever one failed: `locks-upgrade`, `locks-delegated-upgrade`,
+`locks-writer-hold-delegated-doubt`, `locks-s3-cut-holder-alive`, the heavy production-TTL ones, `long-delegated` and
+`long-delegated-backup` pass both ways; every failing set is a control's or a class that fails on main, with the same
+counts per class where it is not a control (`locks-delegate-ahead`, `locks-delegated-partition-skew`,
+`locks-core-stall-backup-long*` 946 and 1838).

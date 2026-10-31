@@ -15941,6 +15941,105 @@ mod locks {
         assert_eq!(h.core.lock_waiters(), 0, "everyone served");
     }
 
+    /// The bound on first come, first served (review of the rule): a
+    /// reader parked behind a writer only by the queue's order, nothing in
+    /// its own way, keeps its place for one lock grace (`lock_ttl +
+    /// margin`), then is served with the writer still waiting. Unbounded,
+    /// a reader on C behind a writer on B, whose turn waits for A's shared
+    /// grant, which waits for A's owner, which waits for C, waited for
+    /// ever, where one host would have granted the read lock.
+    #[test]
+    fn a_reader_queued_behind_a_writer_is_served_after_one_lock_grace() {
+        let (mut h, ino) = holder_with_file();
+        h.core.cfg.lock_ttl_ms = 20_000;
+        uncap(&mut h);
+        let bound = h.core.lock_queue_bound_ms();
+        assert_eq!(bound, 21_000);
+        let out = request(&mut h, 2, 7, ino, S, true);
+        let (g2, _) = granted(&lock_replies(&out)[0].2);
+        h.advance(10);
+        let out = request(&mut h, 3, 8, ino, X, true);
+        assert!(lock_replies(&out).is_empty(), "parked: {out:?}");
+        h.advance(10);
+        let t0 = h.now;
+        let out = request(&mut h, 4, 9, ino, S, true);
+        assert!(grants_to(&out).is_empty(), "queued: {out:?}");
+        // Node 2 keeps its read grant (renewed: its owner's lock is under
+        // it); node 4 re-sends, as a waiter does, within the bound: the
+        // writer keeps its turn.
+        h.now = t0.plus(10_000);
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::LockRenew {
+                req: OpId(20),
+                entries: vec![LockRenewEntry {
+                    ino,
+                    grant: g2,
+                    mode: S,
+                    late: false,
+                }],
+                sent: HonourMs(h.now.0),
+                clock: 1,
+            },
+        });
+        assert!(
+            matches!(
+                renewed(&out, 2).as_deref(),
+                Some([LockRenewResult::Ok { .. }])
+            ),
+            "{out:?}"
+        );
+        h.now = t0.plus(bound as u64 - 1);
+        let out = request(&mut h, 4, 10, ino, S, true);
+        assert!(grants_to(&out).is_empty(), "within the bound: {out:?}");
+        // Past it the reader is served beside node 2's read grant; the
+        // writer still waits.
+        h.now = t0.plus(bound as u64);
+        let out = request(&mut h, 4, 11, ino, S, true);
+        let gs: Vec<NodeId> = grants_to(&out).iter().map(|(to, _)| *to).collect();
+        assert_eq!(gs, vec![4], "{out:?}");
+        assert_eq!(h.core.stats.lock_queue_bound_served, 1);
+        assert_eq!(h.core.lock_waiters(), 1, "the writer still waits");
+    }
+
+    /// An upgrade of a recalled grant is served ahead of the older waiter
+    /// its grant is recalled for: node 2's shared grant is recalled for
+    /// node 3's writer, node 2 asks for the exclusive mode (an owner of it
+    /// converts its read lock) and waits for node 4's shared grant; when
+    /// node 4 lets go, node 2 is upgraded. In arrival order node 3 came
+    /// first and held the queue, waiting for node 2's release, which waited
+    /// for the upgrade.
+    #[test]
+    fn an_upgrade_of_a_recalled_grant_is_served_before_the_waiter_it_is_recalled_for() {
+        let (mut h, ino) = holder_with_file();
+        let out = request(&mut h, 2, 7, ino, S, true);
+        granted(&lock_replies(&out)[0].2);
+        let out = request(&mut h, 4, 17, ino, S, true);
+        let (g4, _) = granted(&lock_replies(&out)[0].2);
+        h.advance(10);
+        let out = request(&mut h, 3, 8, ino, X, true);
+        assert!(lock_replies(&out).is_empty(), "parked: {out:?}");
+        h.advance(10);
+        let out = request(&mut h, 2, 9, ino, X, true);
+        assert!(
+            lock_replies(&out).is_empty(),
+            "node 4's grant is in the way: {out:?}"
+        );
+        h.advance(100);
+        let out = h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: g4,
+                position: constellation_meta::Position::ZERO,
+            },
+        });
+        let rs = lock_replies(&out);
+        let [(2, OpId(9), LockOutcome::Granted { mode: X, .. })] = rs.as_slice() else {
+            panic!("the upgrade first: {out:?}")
+        };
+    }
+
     /// First come, first served (`locks-delegated-production-ttl-heavy`:
     /// one node kept taking the lock while clients of the other two waited
     /// 40 s and more): a blocking shared request that comes while an
@@ -27188,6 +27287,163 @@ mod locks {
         assert!(!released(&out), "released after the doubt: {out:?}");
         assert!(r.meta.locks().held(42).is_none(), "dropped here");
         assert_eq!(r.core.stats.lock_doubt_lapses, 1);
+    }
+
+    /// The other two ways a held grant goes on under its owner's newer id
+    /// (review of the fix above): a renewal answered under the newer id
+    /// (the owner minted it for this node and its answer was lost), and a
+    /// recall naming it (`recall_held` adopts it). The write in doubt under
+    /// the older id holds the newer id's release either way.
+    #[test]
+    fn a_renewal_or_a_recall_under_a_newer_id_keeps_the_older_ids_ops() {
+        for by_recall in [false, true] {
+            let mut r = requester();
+            let req = lock_control(&mut r, 50, 42, true);
+            r.step(Event::Peer {
+                from: 1,
+                msg: PeerMsg::LockReply {
+                    req,
+                    outcome: grant_msg(3),
+                },
+            });
+            let g3 = GrantId { node: 1, seq: 3 };
+            let g4 = GrantId { node: 1, seq: 4 };
+            let tag = token(g3, r.meta.locks().held(42).unwrap().until.0);
+            let local = LocalLock {
+                owner: 9,
+                pid: 1,
+                pid_start: 0,
+                write: true,
+                start: 0,
+                end: u64::MAX,
+            };
+            assert_eq!(
+                r.meta.locks().local_set(42, local, r.clk()),
+                constellation_meta::locks::LocalOutcome::Done
+            );
+            r.meta.locks().tag_begin(&tag, r.clk());
+            r.advance(10);
+            let out = if by_recall {
+                r.step(Event::Peer {
+                    from: 1,
+                    msg: PeerMsg::LockRecall {
+                        req: OpId(77),
+                        ino: 42,
+                        grant: g4,
+                    },
+                });
+                assert_eq!(r.meta.locks().held(42).map(|h| h.id), Some(g4));
+                r.meta.locks().tag_end(&tag, true, r.clk());
+                assert!(r.meta.locks().local_unlock(42, 9, 0, u64::MAX, r.clk()));
+                r.step(Event::Control {
+                    op: OpId(60),
+                    req: Control::LockIdle { ino: 42 },
+                })
+            } else {
+                r.meta
+                    .locks()
+                    .renewed(42, g3, g4, X, r.honour(), 5_000, 1_000, false, 1, r.clk());
+                assert_eq!(r.meta.locks().held(42).map(|h| h.id), Some(g4));
+                r.meta.locks().tag_end(&tag, true, r.clk());
+                assert!(r.meta.locks().local_unlock(42, 9, 0, u64::MAX, r.clk()));
+                r.step(Event::Peer {
+                    from: 1,
+                    msg: PeerMsg::LockRecall {
+                        req: OpId(77),
+                        ino: 42,
+                        grant: g4,
+                    },
+                })
+            };
+            assert!(
+                out.iter()
+                    .any(|a| matches!(a, Action::LockFlush { ino: 42, grant } if *grant == g4)),
+                "recall {by_recall}: {out:?}"
+            );
+            let out = r.step(Event::LockFlushed {
+                ino: 42,
+                grant: g4,
+                ok: true,
+            });
+            assert!(
+                !released(&out),
+                "recall {by_recall}: released while an op tagged with its older id is in \
+                 doubt: {out:?}"
+            );
+            let wait = timer_of(&out, TimerKind::LockReleaseWait);
+            r.now = Ms(r.meta.locks().held(42).unwrap().until.0);
+            let out = r.step(Event::Timer { id: wait });
+            assert!(!released(&out), "recall {by_recall}: {out:?}");
+            assert!(r.meta.locks().held(42).is_none(), "dropped here");
+            assert_eq!(r.core.stats.lock_doubt_lapses, 1);
+        }
+    }
+
+    /// A newer id of the grant installed while its release is under way
+    /// (the answer to another op of the node, installed over the grant
+    /// with the release): the release ends under the newer id. Ended under
+    /// the old one, it found the grant renamed, ended nothing, and the
+    /// grant sat releasing until it lapsed.
+    #[test]
+    fn a_release_under_way_when_the_grant_goes_on_under_a_newer_id_releases_that_id() {
+        let mut r = requester();
+        let req = lock_control(&mut r, 50, 42, true);
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: grant_msg(3),
+            },
+        });
+        let g3 = GrantId { node: 1, seq: 3 };
+        let g4 = GrantId { node: 1, seq: 4 };
+        // Its first use came and went.
+        let local = LocalLock {
+            owner: 9,
+            pid: 1,
+            pid_start: 0,
+            write: true,
+            start: 0,
+            end: u64::MAX,
+        };
+        r.meta.locks().local_set(42, local, r.clk());
+        assert!(r.meta.locks().local_unlock(42, 9, 0, u64::MAX, r.clk()));
+        r.advance(10);
+        let req = lock_control(&mut r, 51, 42, true);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockRecall {
+                req: OpId(77),
+                ino: 42,
+                grant: g3,
+            },
+        });
+        assert!(out
+            .iter()
+            .any(|a| matches!(a, Action::LockFlush { ino: 42, grant } if *grant == g3)));
+        // The other op's answer: the grant under seq 4, while the flush runs.
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: grant_msg(4),
+            },
+        });
+        assert_eq!(r.meta.locks().held(42).map(|h| h.id), Some(g4));
+        let out = r.step(Event::LockFlushed {
+            ino: 42,
+            grant: g3,
+            ok: true,
+        });
+        let rel: Vec<GrantId> = sends(&out)
+            .iter()
+            .filter_map(|(_, m)| match m {
+                PeerMsg::LockReleased { grant, .. } => Some(*grant),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rel, vec![g4], "{out:?}");
+        assert!(r.meta.locks().held(42).is_none());
     }
 
     /// Review nit: the release waiting for a tagged op is woken by the

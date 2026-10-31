@@ -967,16 +967,18 @@ struct Inner {
     /// long one left in doubt may still execute somewhere — the grant is
     /// not released before both are over ([`LockTables::release_blocked`]).
     inflight: BTreeMap<GrantId, Inflight>,
-    /// Node side: a held grant that went on under a newer id of its owner
-    /// (a re-affirmation installed over it, a recall that adopted the
-    /// newer id), old id → new id. The ops tagged with the old id are in
-    /// flight, pinned or in doubt under the old id's entries (`inflight`,
-    /// `doubted`), and the grant they hold back is the new one: the
-    /// release, the doubt lapse and the next turn's predecessor wait look
-    /// at every id of the grant's [`Inner::lineage`]. Bounded like
-    /// `doubted`; an entry lost only matters past `ENDED_KEPT` renamings.
-    superseded: BTreeMap<GrantId, GrantId>,
-    superseded_order: std::collections::VecDeque<GrantId>,
+    /// Node side, per inode: the held grant's current id and the older
+    /// ids it went on from under its owner's newer ones (a re-affirmation
+    /// installed over it, a recall that adopted the newer id, a renewal
+    /// answered under it), newest first. The ops tagged with an old id
+    /// are in flight, pinned or in doubt under that id's entries
+    /// (`inflight`, `doubted`), and the grant they hold back is the
+    /// current one: the release, the doubt lapse and the next turn's
+    /// predecessor wait look at every id of its [`Inner::lineage`]. An
+    /// entry is valid while its inode's held grant has the current id; it
+    /// goes once that grant ends (pruned at the next renaming), never
+    /// while it is held, so at most one per held grant and none evicted.
+    lineages: BTreeMap<u64, (GrantId, Vec<GrantId>)>,
     /// Sequencer side (phase 2): how long past the end of its record an
     /// ended grant stays in `ended` ([`LockTables::set_token_memory_ms`]:
     /// `TTL + 2 × margin`, so an outwaited grant — whose record has
@@ -1099,48 +1101,53 @@ pub const PARK_LOOKAHEAD_MS: i64 = 50;
 pub const WRAP_LOOKAHEAD_MS: i64 = 1_000;
 
 impl Inner {
-    /// Node side: `old`, held here, goes on as `new` (`superseded`).
-    fn note_superseded(&mut self, old: GrantId, new: GrantId) {
+    /// Node side: the grant held on `ino` as `old` goes on as `new`
+    /// (`lineages`). Called once `held` names `new`. Entries of grants no
+    /// longer held go here, so the map holds the held grants' lineages
+    /// alone.
+    fn note_superseded(&mut self, ino: u64, old: GrantId, new: GrantId) {
         if old == new {
             return;
         }
-        if self.superseded.insert(old, new).is_none() {
-            self.superseded_order.push_back(old);
-        }
-        while self.superseded_order.len() > ENDED_KEPT {
-            if let Some(o) = self.superseded_order.pop_front() {
-                self.superseded.remove(&o);
+        let olds = match self.lineages.remove(&ino) {
+            Some((cur, mut olds)) if cur == old => {
+                olds.insert(0, old);
+                olds
             }
-        }
+            _ => vec![old],
+        };
+        self.lineages.insert(ino, (new, olds));
+        let held = &self.held;
+        self.lineages
+            .retain(|ino, (cur, _)| held.get(ino).is_some_and(|h| h.id == *cur));
     }
 
-    /// Node side: `id` and every older id of the same held grant
-    /// (`superseded`), newest first.
+    /// The valid lineage entry of the held grant whose current id is `id`.
+    fn lineage_entry(&self, id: GrantId) -> Option<(&u64, &Vec<GrantId>)> {
+        self.lineages
+            .iter()
+            .find(|(ino, (cur, _))| *cur == id && self.held.get(ino).is_some_and(|h| h.id == id))
+            .map(|(ino, (_, olds))| (ino, olds))
+    }
+
+    /// Node side: `id` and, when it is a held grant's current id, every
+    /// older id of that grant (`lineages`), newest first.
     fn lineage(&self, id: GrantId) -> Vec<GrantId> {
         let mut ids = vec![id];
-        let mut i = 0;
-        while i < ids.len() {
-            let cur = ids[i];
-            for (old, new) in &self.superseded {
-                if *new == cur && !ids.contains(old) {
-                    ids.push(*old);
-                }
-            }
-            i += 1;
+        if let Some((_, olds)) = self.lineage_entry(id) {
+            ids.extend(olds.iter().copied());
         }
         ids
     }
 
-    /// The newest id `id` went on as (itself if none).
+    /// The current id of the held grant `id` is an id of (itself if none).
     fn current_id(&self, id: GrantId) -> GrantId {
-        let mut cur = id;
-        for _ in 0..64 {
-            match self.superseded.get(&cur) {
-                Some(n) => cur = *n,
-                None => break,
-            }
-        }
-        cur
+        self.lineages
+            .iter()
+            .find(|(ino, (cur, olds))| {
+                olds.contains(&id) && self.held.get(ino).is_some_and(|h| h.id == *cur)
+            })
+            .map_or(id, |(_, (cur, _))| *cur)
     }
 
     /// Node side: the in-flight state of `id`'s whole lineage, merged.
@@ -3064,8 +3071,12 @@ impl LockTables {
         }
         if let Some(old) = g.held.insert(ino, held) {
             if old.id != held.id {
-                // Replaced (an upgrade, a fresh grant after a lapse): the
-                // old id is dead here.
+                // Replaced: the old id is dead here. Either the same grant
+                // under the owner's newer id (the continuing branch above:
+                // a re-affirmation, an upgrade made in place), or a fresh
+                // grant (after a lapse, from another owner), which ops
+                // tagged with the old id do not hold back: its owner
+                // outwaited the old record before minting it.
                 g.tombstone(old.id);
                 // The same grant under the owner's newer id (the branch
                 // above): what is tagged with the old id holds back the
@@ -3074,7 +3085,7 @@ impl LockTables {
                 // in doubt under the old id, the new id released, and the
                 // write landed inside the next holder's section).
                 if continued {
-                    g.note_superseded(old.id, held.id);
+                    g.note_superseded(ino, old.id, held.id);
                 }
             }
         }
@@ -3173,7 +3184,7 @@ impl LockTables {
             // duplicate renewal is harmless).
             h.renewing = None;
             g.tombstone(old);
-            g.note_superseded(old, id);
+            g.note_superseded(ino, old, id);
             g.stats.recalled_superseded += 1;
             // The owner keeps one record per node and inode and mints a
             // fresh id per answer, so every id of its below the adopted
@@ -3480,8 +3491,14 @@ impl LockTables {
             // `locks-upgrade` seed 719).
             h.mode = h.mode.max(mode);
             if h.id != now_id {
+                // The owner's newer id of this grant (its answer to a
+                // request of this node lost, or not installed): the third
+                // way a held grant goes on under a newer id, and its ops
+                // tagged with the old one hold the new one's release too.
+                let old = h.id;
                 h.id = now_id;
-                g.tombstone(id);
+                g.tombstone(old);
+                g.note_superseded(ino, old, now_id);
             }
             g.stats.renewals += 1;
             if let Some(l) = resumed {
@@ -4948,6 +4965,48 @@ mod tests {
             t.take_outwaited().iter().map(|g| g.id).collect::<Vec<_>>(),
             vec![b]
         );
+    }
+
+    /// The lineage of a held grant lives as long as the grant and no
+    /// longer: thousands of renamings of other grants do not evict it (an
+    /// op in doubt under its old id held the release back only until the
+    /// count-bounded map dropped the entry), and once the grant ends its
+    /// entry goes.
+    #[test]
+    fn a_held_grants_lineage_is_kept_while_it_is_held_and_only_then() {
+        let t = LockTables::default();
+        let now = Now::same(0);
+        let mk = |seq, until| HeldGrant {
+            id: GrantId { node: 2, seq },
+            ..held(LockMode::Exclusive, until)
+        };
+        t.install_held(7, mk(1, i64::MAX));
+        // An op tagged with seq 1 ends in doubt; the grant goes on as 2.
+        t.note_doubted(GrantId { node: 2, seq: 1 }, WaitMs(0), None);
+        t.install_held(7, mk(2, i64::MAX));
+        let cur = GrantId { node: 2, seq: 2 };
+        assert!(t.was_doubted(cur));
+        // Many other grants, each renamed once, then ended.
+        for ino in 100..(100 + 2 * ENDED_KEPT as u64) {
+            t.install_held(ino, mk(10 * ino, i64::MAX));
+            t.install_held(ino, mk(10 * ino + 1, i64::MAX));
+            assert!(t.drop_held(
+                ino,
+                GrantId {
+                    node: 2,
+                    seq: 10 * ino + 1
+                }
+            ));
+        }
+        assert!(t.was_doubted(cur), "the held grant's lineage was evicted");
+        assert_eq!(t.lineage(cur).len(), 2);
+        assert!(t.lock().lineages.len() <= 2, "ended grants' lineages kept");
+        // The grant ends: its lineage goes with the next renaming.
+        assert!(t.drop_held(7, cur));
+        t.install_held(8, mk(3, i64::MAX));
+        t.install_held(8, mk(4, i64::MAX));
+        assert!(!t.lock().lineages.contains_key(&7));
+        let _ = now;
     }
 
     #[test]
