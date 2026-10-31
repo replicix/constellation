@@ -189,6 +189,14 @@ pub struct Shared {
     /// the answers given before it (a lone row's replay answered by the
     /// group afterwards was not rolled back).
     pub rolled_back_at: Mutex<BTreeMap<Rid, u64>>,
+    /// The replay queue's entries (`(rid, queue_seq)`) the oracle has dated
+    /// in `rolled_back_at`, across this node's incarnations: a restart that
+    /// keeps its journal keeps its queue, and an entry queued before it is
+    /// dated when it was queued, not again at the restart's first scan (plan
+    /// 43 C2f: a rebooted delegate's stranded rows, replayed through a root
+    /// that answers them from the archive, read as rolled back after that
+    /// answer).
+    pub queued_seen: Mutex<BTreeSet<(Rid, u64)>>,
     /// The rids whose `Refused` rows this node's unshipped journal held
     /// after its last event. A rollback drops a stranded refusal (its
     /// `completed` row goes with it; it is never replayed), so one that
@@ -501,6 +509,7 @@ impl NodeHandle {
             guard_base_rises: AtomicU64::new(0),
             tentative: Mutex::new(BTreeSet::new()),
             rolled_back_at: Mutex::new(BTreeMap::new()),
+            queued_seen: Mutex::new(BTreeSet::new()),
             journaled_refusals: Mutex::new(BTreeSet::new()),
             commits: env.commits.clone(),
             epoch: Mutex::new(epoch),
@@ -699,8 +708,9 @@ impl NodeHandle {
             rx,
             urgent_rx,
             shared: shared.clone(),
-            rolled_back_seen: (0, 0, 0),
-            queued_seen: BTreeSet::new(),
+            // (Never a counter's value: a restarted node reads its queue at
+            // its first event, so what its recovery stranded is dated then.)
+            rolled_back_seen: (u64::MAX, u64::MAX, u64::MAX),
             journal_seen: None,
             timers: HashSet::new(),
             timer_kinds: HashMap::new(),
@@ -949,9 +959,6 @@ struct Driver {
     urgent_rx: mpsc::UnboundedReceiver<Event>,
     shared: Arc<Shared>,
     rolled_back_seen: (u64, u64, u64),
-    /// The replay queue's entries `(rid, queue_seq)` as `note_rollbacks`
-    /// last read it.
-    queued_seen: BTreeSet<(Rid, u64)>,
     /// `(journal tip, journal length)` when `Shared::journaled_refusals`
     /// was last taken.
     journal_seen: Option<(u64, u64)>,
@@ -2441,7 +2448,8 @@ impl Driver {
                 }
                 t.insert(q.rid);
             }
-            for rid in super::oracle::newly_queued(&mut self.queued_seen, &entries) {
+            let mut seen = self.shared.queued_seen.lock().unwrap();
+            for rid in super::oracle::newly_queued(&mut seen, &entries) {
                 at.insert(rid, tick);
             }
         }
