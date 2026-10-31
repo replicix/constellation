@@ -1926,11 +1926,37 @@ hold lasts, and a parked answer whose row was rolled back (`repair
 drop-held`) is aborted (found by `flex-crash`'s I1 oracle);
 `set_durable(.., lone_ok)` and `DurableWait::Unexpected` (D5:
 counted, resubmitted in doubt); `Stats.ungated_shadows`; status
-`ack.lone`, `ack.ungated_shadows`, `ack.ungated_unexpected`. Kept as C1
-landed (not as the spec's §5.1 sentence "committed for every class but
-`Lone`"): a non-stealable answer still says `committed: false` (Q12's
-`gated()`), so `ungated_shadows` counts a designee's or a hold owner's
-answers; a maintainer question. `far` runs `strict_commit` and
+`ack.lone`, `ack.ungated_shadows`, `ack.ungated_unexpected`. *Decided
+(maintainer, 2026-10-31): a non-stealable answer stays uncommitted, as C1
+landed (Q12's `gated()`); the coder spec's §5.1 sentence "the reply carries
+`committed: true` for every class but `Lone`" is amended to "for every gated
+class" (the spec file is not in the repository: this note is the
+amendment).* The requester counts a non-stealable sequencer's uncommitted
+shadows apart (`ack.ungated_shadows_non_stealable`), so a hold configuration
+can run `strict_commit`. *Decided too, not landed:* `repair drop-held` not
+queueing another node's unanswered `Archive` row again (the requester's retry
+its one copy, as H1). Implemented as a dependent rolled back and dropped, it
+made four `flex-crash` seeds of 2,000 fail (502, 839, 1526, 1845: monotonic
+reads, and an `EEXIST` no state explains): the held transaction's later
+dependents, this node's own and queued again, replay without the dropped op's
+effect and ahead of the requester's retry, so the replay order no longer
+matches what was observed. The rule needs the later dependents' order (drop
+them with it, or hold them behind the retry): back to the maintainer. The
+review round (2026-10-31): in an epoch's hold another
+node's answer is the hold's (`NonStealable`, its row re-tagged so; parked
+answers released by the hold and retries inside it alike); `Lone` only for a
+lone root (`root_ack_class`), "may not answer alone" published before the
+replica stops being the holder's (`clear_holder_epoch`), and the fast path
+answers a `Lone` or non-stealable row at once only while `lone_ok`; a
+designation's unjournaled refusal is non-stealable; an own retry of a hold's
+row after the hold is answered as the node is now; the takeover gate's
+replay of another node's rid is journaled with that node's class. Not
+landed: nudging a round at a lone root's journaled refusal of a forward (an
+idle root answers it up to 10 s late): the earlier ship moved two seeds onto
+latent failures (`placement-hot` 616, the C3 §5.4 item 4 I5 shape main shows
+at 593; `flex-crash` 807, a hold's shadow outliving the `repair drop-held`
+refusal of its row while a later answer is observed, a monotonic-reads
+violation), which must be fixed first. `far` runs `strict_commit` and
 `strict_identity` (every pair far now, the ids fresh joins take included);
 the `strict_durability` configurations keep
 `strict_commit` off: what remains of their `archive/*` count is the

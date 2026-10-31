@@ -63317,3 +63317,53 @@ re-blessed), release sim suite 300 passed / 11 ignored.
 C2g (settle before `EIO`), C2h (scenarios, strict flags elsewhere: the delegated configurations whose I1 is now 0 are
 candidates), the whole-C2 review. Performance: topology 5's forwarded ops now wait one archive commit (§11 Q2,
 accepted), not measured here. The own clients' bring-up `Lone` answers the oracle does not judge lone (C5's D10).
+
+### Review round (2026-10-31)
+
+Rebased on 33093565 (the holder-append series: no code conflict; PROGRESS merged by hand). New commits:
+
+- **MUST 1, an epoch hold's answer to another node is the hold's.** A forward parked for the log when a hold was
+  adopted left `Lone`, its row re-tagged `Lone`; a retry inside the hold of a row journaled `Archive` before it was
+  answered `Archive`, committed, though the log did not carry the row. Both are now `NonStealable` (uncommitted),
+  the row re-tagged so (kept `Archive`, the class-claim oracle failed most `flex*+commit` seeds).
+- **MUST 2, only a lone node answers alone.** `root_ack_class` falls through to `Lone` only for `root_lone()` (else
+  `Archive`; a node's own unjournaled refusal is sourced `Lone` explicitly); `clear_holder_epoch` publishes "may not
+  answer alone" before every `set_holder_epoch(0)`; the fast path answers a `Lone` or non-stealable row at once only
+  while `lone_ok` (`fast_ack_target`), else it waits and with the gate off is in doubt. The simulation's fast path
+  does the same.
+- **Shoulds landed**: a designation's unjournaled refusal is `NonStealable`; an own retry of a hold's row after the
+  hold is answered as the node is now (`Lone` and re-tagged if lone, else `Archive`); the takeover gate's replay of
+  another node's rid is journaled with that node's class. **Not landed**: the sync-round nudge at a lone root's
+  journaled refusal of a forward (SHOULD 5). Nudging every refusal moved eight pinned simulation schedules; nudging
+  only a lone root's moved `placement-hot` 616 (I5: the C3 §5.4 item 4 shape main shows at `-lr` 593) and
+  `flex-crash` 807 (monotonic reads after `repair drop-held`) onto failures, and with the then drop-held rule
+  `flex-crash` 1807 (an acknowledged write the log does not carry). Withdrawn until those are understood.
+- **The maintainer's answers.** Q1, landed: non-stealable answers stay uncommitted (the coder spec's §5.1 sentence
+  amended in the plan's C2f note); the requester counts such shadows apart (`ungated_shadows_non_stealable`, this
+  node in an open epoch or the generation a designation). Inferred at the requester, it misses a hold's answer to a
+  node outside the epoch: `flex`, `flex-crash`, `flex-tight` under `+commit` still fail 36 to 81 of 2,000 seeds,
+  each on one such shadow, so `strict_commit` stays off there; carrying the class on `MutateReply` closes it.
+  Q2, not landed: `repair drop-held` not queueing another node's unanswered `Archive` row again. Done as a dependent
+  rolled back and dropped, it failed `flex-crash` 502, 839, 1526, 1845 (monotonic reads; an `EEXIST` no state
+  explains): the held transaction's later dependents replay without the dropped op's effect and ahead of the
+  requester's retry. The rule needs those dependents' order; back to the maintainer.
+- **Nits**: `epoch_liveness_gap_fault_seeds` pins seed 400 instead of exempting 409; `session_wait_off_is_found` runs
+  `long-delegated` (20 of 400 seeds still violate with the wait off; the default configuration 6); `ungated_shadows`
+  and the I5 dating state are carried across a node's incarnations (c66fc461's state was per process).
+
+Evidence (box 1, after the rebase): each new test fails with its rule reverted (mutations: the hold's class for a
+retry and for a release, the `Lone` fallthrough, the fast path's `lone_ok`, the own hold row, the replay's asker, the
+shadow split). Gates: fmt, clippy `-D warnings`; authority lib 867 and `meta_repro` 4, meta (lib 382, `held` 16),
+engine (lib 940), control 146 (schema re-blessed), release sim suite 300 passed / 11 ignored. Sweeps, seeds 0..1,999
+(`shared-dir*` 0..499), with and without the lease-read knob, against 33093565 with the same `far` topology and I5
+dating: no failing seed main does not fail but `long-backup` 743 (the `member_copies_drained` shape main shows at
+4333 and 6613 of 2,000..9,999); I1 as in the table above (0 for every configuration the archive rule reaches); I2 0
+but `flex-crash` 777 (Q2 above) and `long-delegated-late-answers-lr` 3 (C3 §5.4 item 4); I4 within ±4; I5 equal or
+lower.
+
+Topology 5 (`ack-latency`, `net-wan`: 60 ms ± 20 ms each way on the P2P ports, the harness's local S3; 100 samples,
+ABBA, box 1 with other jobs, indicative), p50 / p90 ms, main -> here: forwarded `create` 120.8 / 144.4 and 118.3 /
+140.7 -> 123.5 / 141.9 and 122.5 / 140.7; `write`+`fsync` 125.4 / 142.4 and 123.3 / 144.6 -> 128.2 / 147.9 and 128.3 /
+150.5; `rename` 113.7 / 138.5 and 114.3 / 141.5 -> 111.9 / 140.6 and 108.2 / 137.4; the root's own ops equal (create
+0.06 / 0.08, write 3.1 / 3.4-4.1). The archive wait adds a few milliseconds to a WAN round trip against a local S3;
+against a remote bucket it is one S3 PUT (§11 Q2's 28-190 ms).

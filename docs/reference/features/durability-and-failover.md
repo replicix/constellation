@@ -1544,8 +1544,10 @@ See [Configuration](../configuration.md) for parsing rules.
   is only ever to the node's own client (plan 43 C2); `lone` (plan 43 C2):
   this node answers its own clients as a lone sequencer, the root lease's
   or a delegation's it holds; `ungated_shadows`: shadows and hints this
-  node installed for an answer its sequencer did not say is committed (a
-  non-stealable sequencer's; 0 otherwise); `ungated_unexpected`: FUSE
+  node installed for an answer its sequencer did not say is committed (must
+  stay 0); `ungated_shadows_non_stealable`: the same from a non-stealable
+  sequencer (a hold owner in an open epoch, a designee), uncommitted by
+  design; `ungated_unexpected`: FUSE
   fast-path writes whose durability wait found the gate off on a node
   neither lone nor holding an epoch (a release or a handoff after the
   write), resubmitted in doubt;

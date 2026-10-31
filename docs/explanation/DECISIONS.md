@@ -1725,7 +1725,12 @@ retry answered from an earlier execution waits for that execution's own row
 in the log, not for the journal's tip (rows ship past a deferred one); a row
 of a continuation epoch's hold is non-stealable only while the hold lasts;
 and an answer parked for the log whose row was rolled back meanwhile (`repair
-drop-held`) is aborted, not released, when the log covers its seq. The FUSE fast
+drop-held`) is aborted, not released, when the log covers its seq. In a
+continuation epoch's hold an answer to another node is the hold's
+(non-stealable, uncommitted: a non-stealable answer is never said to be
+committed, the maintainer's decision), its row re-tagged so. A node answers its own clients alone only while it is a
+lone root or holds an epoch: the core says so with its gate, and says it no
+longer may before the replica stops being the holder's. The FUSE fast
 path's gate-off answer (`Ungated`) is given only where the core published
 that the node is lone or holds an epoch; the gate off for any other reason (a
 release, a handoff after the write) is in doubt, counted
