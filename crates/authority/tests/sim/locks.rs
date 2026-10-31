@@ -51,6 +51,11 @@ pub struct LockStep {
     /// Write a turn number into the lock file's mtime under the lock
     /// (`SimConfig::lock_writes`).
     pub write: bool,
+    /// A shared step that, after its I/O, converts its lock to an
+    /// exclusive one in place (`F_SETLKW` with `F_WRLCK` over the owner's
+    /// own `F_RDLCK`), performs one more I/O step under it and unlocks
+    /// (`SimConfig::lock_upgrade_ratio`).
+    pub upgrade: bool,
 }
 
 /// A lock acquisition that has not completed within this much simulated
@@ -86,6 +91,10 @@ pub struct LockCounters {
     /// A `Granted` after which `local_set` still needed a grant (it had
     /// lapsed or been taken back meanwhile).
     pub regrants: u64,
+    /// Upgrades of a shared lock to exclusive begun (`LockStep::upgrade`),
+    /// and those done.
+    pub upgrades: u64,
+    pub upgraded: u64,
     /// `Control::LockIdle` sent (the unlock left a recalled grant idle).
     pub idle_sent: u64,
     /// The session wait at a grant's position ran out of budget.
@@ -868,6 +877,92 @@ impl Drop for WaitGuard {
 }
 
 /// One lock step (see the module doc).
+enum Upgraded {
+    Yes,
+    Died,
+    Failed,
+}
+
+/// Convert `thread`'s shared lock on `ino` to an exclusive one in place, as
+/// the FUSE layer does for an owner's `F_SETLKW` with `F_WRLCK` over its own
+/// read lock: `local_set` of the write lock by the same owner; another
+/// local owner in the way waits locally, a grant the node does not have is
+/// asked for (`Control::Lock`, blocking). The owner keeps its read lock all
+/// the while. A conversion not done within [`LOCK_WAIT_CAP_MS`] fails the
+/// seed (and unlocks, so the run goes on).
+async fn upgrade_lock(
+    cluster: &Arc<Cluster>,
+    node: NodeId,
+    inc: u32,
+    thread: u64,
+    ino: u64,
+    name: &str,
+    failures: &Arc<Mutex<Vec<String>>>,
+) -> Upgraded {
+    let ghost = cluster.locks.clone();
+    let clock = cluster.env.clock.clone();
+    let lock = LocalLock {
+        owner: thread,
+        pid: thread as u32,
+        pid_start: 0,
+        write: true,
+        start: 0,
+        end: u64::MAX,
+    };
+    let t0 = clock.elapsed_ms();
+    let deadline = t0 + LOCK_WAIT_CAP_MS;
+    ghost.count(|c| c.upgrades += 1);
+    loop {
+        let Some(h) = same(cluster, node, inc) else {
+            return Upgraded::Died;
+        };
+        if clock.elapsed_ms() > deadline {
+            failures.lock().unwrap().push(format!(
+                "lock client t{thread} on node {node}: upgrade of its shared lock on {name} \
+                 ({ino:#x}) to exclusive not done within {LOCK_WAIT_CAP_MS}ms of simulated time \
+                 (from t={t0}); held here: {:?}\n  lock trace (last {TRACE_LEN}):\n    {}",
+                h.meta.locks().held(ino),
+                ghost.trace().join("\n    ")
+            ));
+            h.meta
+                .locks()
+                .local_unlock(ino, thread, 0, u64::MAX, h.clock.now());
+            return Upgraded::Failed;
+        }
+        match h.meta.locks().local_set(ino, lock, h.clock.now()) {
+            LocalOutcome::Done => {
+                ghost.count(|c| c.upgraded += 1);
+                ghost.note(
+                    clock.elapsed_ms(),
+                    format!("node {node} t{thread} upgraded to Exclusive on {ino:#x}"),
+                );
+                return Upgraded::Yes;
+            }
+            LocalOutcome::NeedGrant(mode) => {
+                let rx = h.control(Control::Lock {
+                    ino,
+                    mode,
+                    blocking: true,
+                    waited_ms: clock.elapsed_ms().saturating_sub(t0),
+                });
+                match await_control(cluster, node, inc, deadline, rx).await {
+                    Awaited::Answer(Ok(ControlOk::Lock(LockAnswer::Granted { position }))) => {
+                        h.meta.session().raise_observed(position);
+                    }
+                    Awaited::Answer(_) => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    Awaited::Died => return Upgraded::Died,
+                    Awaited::Late => {}
+                }
+            }
+            LocalOutcome::Parked | LocalOutcome::Conflict(_) | LocalOutcome::Predecessor => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+}
+
 pub async fn client_lock(
     cluster: Arc<Cluster>,
     node: NodeId,
@@ -1404,6 +1499,33 @@ pub async fn client_lock(
         }
         ghost.count(|c| c.ios += 1);
         tokio::time::sleep(Duration::from_millis(step.io_ms)).await;
+    }
+    if step.upgrade && step.blocking && !fenced {
+        if entered {
+            ghost.leave(ino, node, thread, clock.elapsed_ms(), "upgrading");
+            entered = false;
+        }
+        match upgrade_lock(&cluster, node, inc, thread, ino, &name, &failures).await {
+            Upgraded::Yes => {
+                let Some(h) = same(&cluster, node, inc) else {
+                    ghost.count(|c| c.abandoned += 1);
+                    return;
+                };
+                if h.meta.locks().fenced(ino, h.clock.now()) == Fence::Ok {
+                    ghost.enter(ino, node, thread, LockMode::Exclusive, clock.elapsed_ms());
+                    ghost.count(|c| c.ios += 1);
+                    tokio::time::sleep(Duration::from_millis(step.io_ms)).await;
+                    entered = true;
+                } else {
+                    ghost.count(|c| c.fenced_ios += 1);
+                }
+            }
+            Upgraded::Died => {
+                ghost.count(|c| c.abandoned += 1);
+                return;
+            }
+            Upgraded::Failed => return,
+        }
     }
     let Some(h) = same(&cluster, node, inc) else {
         if entered && !fenced {

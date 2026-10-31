@@ -26949,6 +26949,167 @@ mod locks {
             .any(|(to, m)| *to == 1 && matches!(m, PeerMsg::LockReleased { .. }))
     }
 
+    fn shared_grant_msg(seq: u64) -> LockOutcome {
+        LockOutcome::Granted {
+            id: GrantId { node: 1, seq },
+            mode: S,
+            ttl_ms: 5_000,
+            position: Position {
+                seq: 3,
+                pending: None,
+                streams: Default::default(),
+            },
+        }
+    }
+
+    /// A requester holding a shared grant (seq 3) on inode 42 with owner
+    /// 9's read lock under it, the grant recalled for another node's
+    /// waiter.
+    fn reader_recalled(r: &mut Harness) {
+        let out = r.step(Event::Control {
+            op: OpId(50),
+            req: Control::Lock {
+                ino: 42,
+                mode: S,
+                blocking: true,
+                waited_ms: 0,
+            },
+        });
+        let req = match sends(&out).as_slice() {
+            [(1, PeerMsg::LockRequest { req, .. })] => *req,
+            other => panic!("{other:?}"),
+        };
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: shared_grant_msg(3),
+            },
+        });
+        let read = LocalLock {
+            owner: 9,
+            pid: 1,
+            pid_start: 0,
+            write: false,
+            start: 0,
+            end: u64::MAX,
+        };
+        assert_eq!(
+            r.meta.locks().local_set(42, read, r.clk()),
+            constellation_meta::locks::LocalOutcome::Done
+        );
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockRecall {
+                req: OpId(77),
+                ino: 42,
+                grant: GrantId { node: 1, seq: 3 },
+            },
+        });
+        assert!(r.meta.locks().held(42).is_some_and(|h| h.recalled));
+    }
+
+    /// Sim `locks-upgrade`: an owner converts its read lock to a write lock
+    /// in place while its node's shared grant is recalled for another
+    /// node's waiter. The release waits for that owner's unlock, so the
+    /// request is sent (it was held back for the release, and the node, the
+    /// owner and the waiter waited on each other), and the owner's answer,
+    /// the grant upgraded under a newer id, is installed over the recalled
+    /// one: still recalled, and the converting owner takes the write lock.
+    #[test]
+    fn an_upgrade_under_a_recalled_grant_goes_to_the_owner() {
+        let mut r = requester();
+        reader_recalled(&mut r);
+        let write = LocalLock {
+            owner: 9,
+            pid: 1,
+            pid_start: 0,
+            write: true,
+            start: 0,
+            end: u64::MAX,
+        };
+        assert_eq!(
+            r.meta.locks().local_set(42, write, r.clk()),
+            constellation_meta::locks::LocalOutcome::NeedGrant(X)
+        );
+        r.advance(10);
+        let req = lock_control(&mut r, 51, 42, true);
+        assert_eq!(r.core.stats.lock_recalled_upgrade_requests, 1);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: grant_msg(4),
+            },
+        });
+        assert!(matches!(lock_answer(&out, 51), LockAnswer::Granted { .. }));
+        let h = r.meta.locks().held(42).unwrap();
+        assert_eq!((h.id.seq, h.mode, h.recalled), (4, X, true));
+        assert_eq!(
+            r.meta.locks().local_set(42, write, r.clk()),
+            constellation_meta::locks::LocalOutcome::Done
+        );
+    }
+
+    /// The owner's side: a node whose shared grant is recalled for a waiter
+    /// asks for the exclusive mode (an upgrade its local locks need): the
+    /// grant is upgraded in place, at once (no other node holds the lock),
+    /// and recalled again under its new id; the waiter is served when the
+    /// node lets it go. It was parked behind its own recalled grant, whose
+    /// release waited for it.
+    #[test]
+    fn a_recalled_grant_is_upgraded_in_place_for_its_holder() {
+        let (mut h, ino) = holder_with_file();
+        let out = request(&mut h, 2, 7, ino, S, true);
+        let (g2, _) = granted(&lock_replies(&out)[0].2);
+        h.advance(10);
+        let out = request(&mut h, 3, 8, ino, X, true);
+        assert!(lock_replies(&out).is_empty(), "parked: {out:?}");
+        assert_eq!(recalls(&out).len(), 1, "node 2 recalled: {out:?}");
+        h.advance(10);
+        let out = request(&mut h, 2, 9, ino, X, true);
+        let rs = lock_replies(&out);
+        let [(2, OpId(9), o)] = rs.as_slice() else {
+            panic!("the upgrade is answered: {out:?}")
+        };
+        let (g2x, _) = granted(o);
+        assert_ne!(g2x, g2);
+        assert!(
+            recalls(&out)
+                .iter()
+                .any(|(to, _, _, g)| *to == 2 && *g == g2x),
+            "recalled again under its new id: {out:?}"
+        );
+        assert_eq!(h.core.stats.lock_recalled_upgrades, 1);
+        h.advance(100);
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: g2x,
+                position: constellation_meta::Position::ZERO,
+            },
+        });
+        let [(3, OpId(8), LockOutcome::Granted { .. })] = lock_replies(&out).as_slice() else {
+            panic!("the waiter after it: {out:?}")
+        };
+    }
+
+    /// A renewal's answer carries the mode of the owner's record: a grant
+    /// upgraded in place under the id this node holds (the upgrade's own
+    /// answer lost, the id adopted by a recall onto the shared grant) is
+    /// exclusive here too.
+    #[test]
+    fn a_renewal_answer_carries_the_mode_of_the_owners_record() {
+        let mut r = requester();
+        reader_recalled(&mut r);
+        let g = GrantId { node: 1, seq: 3 };
+        r.meta
+            .locks()
+            .renewed(42, g, g, X, r.honour(), 5_000, 1_000, true, 1, r.clk());
+        assert_eq!(r.meta.locks().held(42).unwrap().mode, X);
+    }
+
     /// Sim `locks-writer-hold-delegated-doubt` seeds 279, 344 and 1324
     /// under slow lease reads (two exclusive holders): a write tagged with
     /// the grant's id when it went out, and the grant then went on under

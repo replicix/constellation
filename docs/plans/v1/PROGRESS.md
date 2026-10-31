@@ -62932,3 +62932,50 @@ fmt and clippy (workspace, all targets, `-D warnings`) clean. Lib tests: authori
 passed (11 ignored). Seeds 0 to 1,999 of the same 103 configurations as the lock-liveness entry, with and without the
 knob, against main wherever one failed: `locks-writer-hold-delegated-doubt` passes both ways (main: 279 and 344 with
 the knob), and every other failing set is a control's or a class failing on main, as in that entry.
+
+## A blocking lock upgrade under a recalled grant deadlocked (2026-10-31)
+
+An owner converting its read lock to a write lock in place (`F_SETLKW` with `F_WRLCK` over its own `F_RDLCK`; POSIX
+converts it as soon as no other owner holds a lock) while its node's shared grant was recalled for another node's waiter
+waited for ever: `lock_route_op` held the request back until the recalled grant was released, the release waited for that
+owner's unlock, and the waiter for the release. The simulation's clients never upgraded, so no sweep could see it.
+
+### The simulation
+
+`LockStep::upgrade`: a blocking shared step that, after its I/O, converts its lock (`local_set` of the write lock by the
+same owner; a grant the node lacks is asked for with `Control::Lock`), performs one more I/O step under it and unlocks;
+a conversion not done within 60 s fails the seed. `SimConfig::lock_upgrade_ratio` and `lock_upgrader`: one upgrading
+client in the cluster (two owners that each hold a read lock and each ask for the write lock deadlock on a local file
+system too); no draw without them, so every other configuration's schedules are unchanged. `locks-upgrade` (node 3's
+first client upgrades, the lock files at the root, node 1) and `locks-delegated-upgrade` (the delegate's own client,
+node 2: the owner's own grant). Before: 35 and 61 of the first 300 seeds failed.
+
+### Fixes
+
+1. The node sends an upgrade under a recalled grant that local locks pin (`lock_route_op`), and the owner upgrades a
+   recalled grant in place for its holder when no other node's grant conflicts, recalled again under its new id
+   (`lock_try_grant`). Such a waiter is served first (`lock_serve_waiters`): the waiters it conflicts with wait for its
+   grant's release.
+2. An op that was an upgrade when it reached the core (`LockOp::upgrade`: the held grant did not cover its mode, local
+   locks under it) is answered by the held grant once that covers it, recalled or not (made in place for another op of
+   the node, whose answer woke no other op), at the node (`lock_route_op`) and for the owner's own parked ops
+   (`lock_serve_waiters`, served ahead of the queue).
+3. A renewal's answer carries the mode of the owner's record, and the node takes it whatever the id
+   (`LockTables::renewed`): an upgrade whose own answer arrived lapsed, under the id a recall had adopted onto the
+   shared grant, left the node holding it shared while its owner had it exclusive (`locks-upgrade` seed 719).
+4. A grant that went on under a newer id while its release was under way releases the newer id (`on_lock_flushed`).
+
+### Tests
+
+Core `an_upgrade_under_a_recalled_grant_goes_to_the_owner` (fails with fix 1's node side reverted),
+`a_recalled_grant_is_upgraded_in_place_for_its_holder` (its owner side), `a_renewal_answer_carries_the_mode_of_the_owners_record`
+(fix 3). Sim `an_owner_upgrades_its_read_lock_while_another_node_waits` (seeds 5, 24, 28 of `locks-upgrade` and 4, 13, 19
+of `locks-delegated-upgrade`, each failing before; it checks that upgrades happened).
+
+### Gates and sweeps
+
+fmt and clippy (workspace, all targets, `-D warnings`) clean. Lib tests: authority 836, meta 380. Release sim suite: 292
+passed (11 ignored). `locks-upgrade` and `locks-delegated-upgrade`, seeds 0 to 1,999 with and without the knob: 0
+failures. The 103 configurations of the lock-liveness entry, with and without the knob, against main wherever one
+failed: the same classes as there (the controls, `locks-delegate-ahead` and `locks-delegated-partition-skew` with the
+same counts per class, `locks-core-stall-backup-long*` 946 and 1838), seeds moved.

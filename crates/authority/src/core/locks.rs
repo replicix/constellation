@@ -140,6 +140,14 @@ struct LockOp {
     /// node: named back by that one, the next attempt reads the lease
     /// (`lock_op_outcome`).
     not_owner_from: Option<NodeId>,
+    /// An upgrade: when the call reached the core, this node held a grant
+    /// on the inode that did not cover `mode`, with local locks under it
+    /// (an owner converting its read lock: one whose own lock is in the way
+    /// of another owner's request waits locally and asks nothing). Such an
+    /// op is answered by the grant once it covers `mode`, recalled or not:
+    /// its owner's lock pins the grant, so its release waits for the op.
+    /// Judged at its first route (`None` until then).
+    upgrade: Option<bool>,
 }
 
 /// Why `lock_try_grant` did not grant.
@@ -2054,7 +2062,12 @@ impl Core {
             return Err(Blocked::NotYet(NotYet::TenureFloor));
         }
         let own = replica.locks().own_grant(ino, from, now.wait);
-        if own.is_some_and(|g| g.recalled) {
+        // An upgrade of a recalled grant (its node sends one only while
+        // local locks are under it: `lock_route_op`) is made in place, and
+        // stays recalled: the owner asking for more may be the one whose
+        // lock the release waits for.
+        let upgrade_recalled = own.is_some_and(|g| g.recalled && !g.mode.covers(mode));
+        if own.is_some_and(|g| g.recalled) && !upgrade_recalled {
             // Recalled: the node gives it up once its local locks are
             // gone; nothing is granted meanwhile (a re-affirmation kept
             // the id, and the release then dropped a grant with locks
@@ -2210,6 +2223,14 @@ impl Core {
         }
         self.stats.lock_grants += 1;
         self.lk.mirror_dirty = true;
+        if upgrade_recalled {
+            // Still recalled under its new id: the waiter the recall was
+            // for is served once the node lets the upgraded grant go.
+            self.stats.lock_recalled_upgrades += 1;
+            if let Some(g) = replica.locks().get(id) {
+                self.lock_recall(now, g, replica, out);
+            }
+        }
         let position = self.lock_grant_position(from, ino, replica);
         // `minter`/`seq` name the grant as the fencing token's
         // `tagged op executed` lines do (a load campaign's token-order
@@ -3071,7 +3092,31 @@ impl Core {
         let mut idx: Vec<usize> = (0..self.lk.waiters.len())
             .filter(|i| self.lk.waiters[*i].ino == ino)
             .collect();
-        idx.sort_by_key(|i| (self.lk.waiters[*i].since, self.lk.waiters[*i].id));
+        // An upgrade of a recalled grant first: the waiters that conflict
+        // with it wait for that grant's release, which waits for it. So do
+        // this node's own ops that the grant it holds covers, recalled
+        // (answered with it, below): nothing is granted for them, and a
+        // waiter ahead that holds the queue must not keep them.
+        let locks = replica.locks();
+        let held = locks.held(ino);
+        let covered: std::collections::BTreeSet<u64> = idx
+            .iter()
+            .map(|i| &self.lk.waiters[*i])
+            .filter(|w| {
+                w.op.is_some_and(|o| self.lk.ops.get(&o).is_some_and(|o| o.upgrade == Some(true)))
+                    && held.is_some_and(|h| {
+                        h.recalled && !h.releasing && h.until > now.honour && h.mode.covers(w.mode)
+                    })
+            })
+            .map(|w| w.id)
+            .collect();
+        idx.sort_by_key(|i| {
+            let w = &self.lk.waiters[*i];
+            let upgrade = locks
+                .own_grant(ino, w.node, now.wait)
+                .is_some_and(|g| g.recalled && !g.mode.covers(w.mode));
+            (!(upgrade || covered.contains(&w.id)), w.since, w.id)
+        });
         let ttl = self.lock_ttl_ms();
         let margin = self.lock_margin_ms();
         let mut done = Vec::new();
@@ -3081,6 +3126,29 @@ impl Core {
                 let w = &self.lk.waiters[i];
                 (w.node, w.mode, w.req, w.op, w.sent, w.recv)
             };
+            // This node's own op, parked here, whose mode the grant this
+            // node holds covers now, recalled (an upgrade made in place for
+            // another op of the node: a grant that arrives recalled wakes
+            // no other op, `lock_op_outcome`): answered with that grant, as
+            // `lock_wake_covered` answers a remote op. Its owner may be the
+            // upgrader whose lock the release waits for; left parked, the
+            // waiter was `Blocked::Recalled` for ever (sim
+            // `locks-delegated-upgrade` seed 4: the delegate's own client).
+            // An owner that cannot use it asks again, behind the release.
+            if let (Some(o), Some(h)) = (op, held) {
+                if covered.contains(&self.lk.waiters[i].id) {
+                    done.push(i);
+                    self.lk.ops.remove(&o);
+                    self.stats.lock_covered_woken += 1;
+                    out.push(Action::ControlDone {
+                        op: o,
+                        result: Ok(ControlOk::Lock(LockAnswer::Granted {
+                            position: h.position,
+                        })),
+                    });
+                    continue;
+                }
+            }
             // A remote waiter not heard from within its window (a live
             // one re-sends every `(ttl - margin) / 2`) would find a grant lapsed on
             // arrival and ask again anyway — or it is gone (killed while
@@ -3869,6 +3937,7 @@ impl Core {
                 reread: false,
                 ask_lease: false,
                 not_owner_from: None,
+                upgrade: None,
             },
         );
         self.lock_route_op(now, op, replica, out);
@@ -3892,7 +3961,14 @@ impl Core {
         // its own `LockReleased` and reinstall a forgotten grant — sim
         // seeds 90000/90004). A non-blocking request while local locks
         // still pin the recalled grant would block: say so.
-        if let Some(h) = replica.locks().held(ino) {
+        let held = replica.locks().held(ino);
+        let upgrade = match self.lk.ops.get_mut(&op) {
+            Some(o) => *o.upgrade.get_or_insert_with(|| {
+                held.is_some_and(|h| !h.mode.covers(mode)) && !replica.locks().local_idle(ino)
+            }),
+            None => false,
+        };
+        if let Some(h) = held {
             if h.until <= now.honour && replica.locks().lapse_pending(ino, now) {
                 // Plan 43 C7-F F-c: lapsing — its late renewal is asked
                 // for; a fresh grant would replace it and fence its owners.
@@ -3911,6 +3987,36 @@ impl Core {
                     self.set_timer_wait(now.wait.plus(10), Timer::LockRetry(op), out);
                     return;
                 }
+            } else if upgrade && h.recalled && !h.releasing && h.mode.covers(mode) {
+                // An upgrade the grant covers now, recalled (made in place
+                // for another op of this node, whose answer woke no other
+                // op): answered with it. Its owner's read lock pins the
+                // grant; held back for the release, the op, the release and
+                // the waiter the recall is for waited on each other (sim
+                // `locks-upgrade` seed 540).
+                self.stats.lock_covered_woken += 1;
+                self.lk.ops.remove(&op);
+                out.push(Action::ControlDone {
+                    op,
+                    result: Ok(ControlOk::Lock(LockAnswer::Granted {
+                        position: h.position,
+                    })),
+                });
+                return;
+            } else if h.recalled
+                && !h.releasing
+                && !h.mode.covers(mode)
+                && !replica.locks().local_idle(ino)
+            {
+                // An upgrade under the recalled grant: an owner holding a
+                // lock under it asks for more (POSIX converts an owner's
+                // read lock to a write lock in place). The release waits
+                // for that owner's unlock, and the owner for this request:
+                // held back here, the node, the waiter the recall is for
+                // and the owner waited on each other for ever (sim
+                // `locks-upgrade`). It goes to the owner, which upgrades
+                // the grant in place, still recalled (`lock_try_grant`).
+                self.stats.lock_recalled_upgrade_requests += 1;
             } else if h.recalled || h.releasing {
                 if !blocking && !replica.locks().local_idle(ino) {
                     self.stats.lock_would_block += 1;
@@ -5768,6 +5874,17 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        // The grant went on under the owner's newer id while its release
+        // was under way (an upgrade's answer, a re-affirmation, installed
+        // over it with the release): the release is the newer id's, or it
+        // never ended and the grant sat releasing until it lapsed.
+        let grant = replica
+            .locks()
+            .held(ino)
+            .filter(|h| {
+                h.releasing && h.id != grant && replica.locks().lineage(h.id).contains(&grant)
+            })
+            .map_or(grant, |h| h.id);
         if !ok {
             let attempts = self.lk.flushing.entry(ino).or_insert(0);
             *attempts += 1;

@@ -1182,6 +1182,11 @@ pub struct Stats {
     /// Node: `NotOwner` answers naming back the node that had sent the op
     /// (two non-holders naming each other): the next attempt read the lease.
     pub lock_not_owner_bounces: u64,
+    /// Node: upgrade requests sent under a recalled grant that local locks
+    /// pin (`lock_route_op`); owner: recalled grants upgraded in place
+    /// (`lock_try_grant`).
+    pub lock_recalled_upgrade_requests: u64,
+    pub lock_recalled_upgrades: u64,
     /// Node: ops woken by a grant installed for another op of the node
     /// (`lock_wake_covered`), and `LockCancel`s sent for the waiters they
     /// and ghost waiters left; owner: waiters dropped by one.

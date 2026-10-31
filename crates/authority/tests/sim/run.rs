@@ -503,6 +503,14 @@ pub struct SimConfig {
     pub lock_ratio: f64,
     pub lock_shared_ratio: f64,
     pub lock_nonblocking_ratio: f64,
+    /// Of the blocking shared lock steps of the first client of
+    /// `lock_upgrader`, the share that convert their lock to exclusive in
+    /// place before unlocking (`LockStep::upgrade`). One upgrading owner in
+    /// the cluster: two owners that each hold a read lock and each ask for
+    /// the write lock deadlock on a local file system too. 0: no draw is
+    /// made, so the other configurations' schedules are unchanged.
+    pub lock_upgrade_ratio: f64,
+    pub lock_upgrader: Option<NodeId>,
     pub lock_ios: (u32, u32),
     /// Below twice the expiry margin, so a lapse between two I/O steps is
     /// seen before any other node can be granted.
@@ -959,6 +967,8 @@ impl Default for SimConfig {
             lock_ratio: 0.0,
             lock_shared_ratio: 0.25,
             lock_nonblocking_ratio: 0.1,
+            lock_upgrade_ratio: 0.0,
+            lock_upgrader: None,
             lock_ios: (2, 6),
             lock_io_ms: (5, 60),
             lock_dir: None,
@@ -2248,7 +2258,7 @@ fn write_op(cluster: &Cluster, node: NodeId, rid: Rid, name: &str) -> Option<Mut
 
 /// Plan 30 §M14: interleave lock steps with `steps` (after each op, with
 /// `lock_ratio`); a config without locks draws nothing.
-fn with_locks(rng: &mut StdRng, steps: Vec<Step>, cfg: &SimConfig) -> Vec<Step> {
+fn with_locks(rng: &mut StdRng, steps: Vec<Step>, cfg: &SimConfig, upgrader: bool) -> Vec<Step> {
     if cfg.lock_files == 0 || cfg.lock_ratio <= 0.0 {
         return steps;
     }
@@ -2263,13 +2273,22 @@ fn with_locks(rng: &mut StdRng, steps: Vec<Step>, cfg: &SimConfig) -> Vec<Step> 
                 constellation_meta::locks::LockMode::Exclusive
             };
             let file = rng.random_range(0..cfg.lock_files);
+            let blocking = !rng.random_bool(cfg.lock_nonblocking_ratio.clamp(0.0, 1.0));
+            let ios = rng.random_range(cfg.lock_ios.0..=cfg.lock_ios.1);
+            let io_ms = rng.random_range(cfg.lock_io_ms.0..=cfg.lock_io_ms.1);
+            let upgrade = cfg.lock_upgrade_ratio > 0.0
+                && upgrader
+                && blocking
+                && mode == constellation_meta::locks::LockMode::Shared
+                && rng.random_bool(cfg.lock_upgrade_ratio.min(1.0));
             out.push(Step::Lock(super::locks::LockStep {
                 file,
                 mode,
-                blocking: !rng.random_bool(cfg.lock_nonblocking_ratio.clamp(0.0, 1.0)),
-                ios: rng.random_range(cfg.lock_ios.0..=cfg.lock_ios.1),
-                io_ms: rng.random_range(cfg.lock_io_ms.0..=cfg.lock_io_ms.1),
+                blocking,
+                ios,
+                io_ms,
                 write: cfg.lock_writes && mode == constellation_meta::locks::LockMode::Exclusive,
+                upgrade,
             }));
             if cfg.lock_unlink_ratio > 0.0 && rng.random_bool(cfg.lock_unlink_ratio.min(1.0)) {
                 out.push(Step::Op(NsOp::Unlink(lock_file_name(cfg, file))));
@@ -3756,7 +3775,12 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             // Plan 30 §M14: locks from their own generator too.
             let mut lock_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0x10c5);
             let mut steps = if cfg.lock_nodes.is_empty() || cfg.lock_nodes.contains(&node) {
-                with_locks(&mut lock_rng, steps, &cfg)
+                with_locks(
+                    &mut lock_rng,
+                    steps,
+                    &cfg,
+                    cfg.lock_upgrader == Some(node) && k == 0,
+                )
             } else {
                 steps
             };

@@ -5368,6 +5368,8 @@ fn sweep_config() {
         "locks-blips-tight-delegated" => locks_blips_tight_delegated_config(),
         "locks-pause" => locks_pause_config(),
         "locks-delegated" => locks_delegated_config(),
+        "locks-upgrade" => locks_upgrade_config(),
+        "locks-delegated-upgrade" => locks_delegated_upgrade_config(),
         "locks-delegated-production-ttl" => locks_delegated_production_ttl_config(),
         "locks-delegated-production-ttl-heavy" => locks_delegated_production_ttl_heavy_config(),
         "locks-production-ttl" => locks_production_ttl_config(),
@@ -10372,6 +10374,33 @@ fn locks_delegated_config() -> SimConfig {
     }
 }
 
+/// Upgrades: half the locks shared, and half the blocking shared steps of
+/// one client (node 3's first, the lock files' owner being node 1) convert
+/// their lock to exclusive in place before unlocking (an owner's `F_SETLKW`
+/// write lock over its own read lock), while every other client takes the
+/// same files. A local file system converts the lock as soon as no other
+/// owner holds one; here the node holding the read lock may have its shared
+/// grant recalled for another node's waiter meanwhile.
+fn locks_upgrade_config() -> SimConfig {
+    SimConfig {
+        lock_shared_ratio: 0.5,
+        lock_upgrade_ratio: 0.5,
+        lock_upgrader: Some(3),
+        ..locks_config()
+    }
+}
+
+/// [`locks_upgrade_config`] with the lock files at a delegate (node 2),
+/// whose own client upgrades: the owner's own grant.
+fn locks_delegated_upgrade_config() -> SimConfig {
+    SimConfig {
+        lock_shared_ratio: 0.5,
+        lock_upgrade_ratio: 0.5,
+        lock_upgrader: Some(2),
+        ..locks_delegated_config()
+    }
+}
+
 /// `locks-delegated` at the production lock TTL (20 s, margin 1 s; the
 /// delegation's default 5 s): a delegate's grants are capped at about 2–3 s
 /// while waiters re-send every 9.5 s (the ask-again rule).
@@ -11234,6 +11263,42 @@ fn regression_locks_writer_hold_delegated_doubt_older_id_seeds_279_344_1324() {
             )
         });
     }
+}
+
+/// An owner converts its read lock to a write lock in place (`F_SETLKW` with
+/// `F_WRLCK` over its own `F_RDLCK`) while other nodes' clients take the same
+/// file: the conversion completes, and so does every other client's lock.
+/// Before, a node whose shared grant was recalled for another node's waiter
+/// held the upgrade back for the grant's release, which waited for the
+/// upgrading owner's unlock (`locks-upgrade`: 35 of the first 300 seeds,
+/// `locks-delegated-upgrade`, where the delegate's own client upgrades: 61).
+/// The node sends an upgrade under a recalled grant that local locks pin, the
+/// owner upgrades the grant in place, still recalled, and serves it first; a
+/// node's upgrading op is answered by its grant once that covers it; a
+/// renewal's answer carries the mode of the owner's record.
+#[test]
+fn an_owner_upgrades_its_read_lock_while_another_node_waits() {
+    let mut upgraded = 0;
+    for (label, cfg, seeds) in [
+        (
+            "locks-upgrade",
+            locks_upgrade_config as fn() -> SimConfig,
+            [5u64, 24, 28],
+        ),
+        (
+            "locks-delegated-upgrade",
+            locks_delegated_upgrade_config,
+            [4, 13, 19],
+        ),
+    ] {
+        for seed in seeds {
+            let report = run_seed(seed, cfg()).unwrap_or_else(|e| {
+                panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
+            });
+            upgraded += report.locks.upgraded;
+        }
+    }
+    assert!(upgraded > 0, "no lock was upgraded");
 }
 
 /// `locks-s3-cut-holder-alive` seeds 1889 and 7882 under slow lease reads,

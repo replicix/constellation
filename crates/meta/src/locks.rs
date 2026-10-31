@@ -3471,12 +3471,17 @@ impl LockTables {
                 }
                 _ => None,
             };
+            // The owner's record names the mode: a grant upgraded in place
+            // under this very id (its answer lost or arrived lapsed, the id
+            // adopted by a recall onto the weaker grant) is the stronger one
+            // here too. Held weaker, the node and its owner disagreed on the
+            // mode of one grant for as long as it was renewed, and an owner
+            // converting its read lock waited for a grant it had (sim
+            // `locks-upgrade` seed 719).
+            h.mode = h.mode.max(mode);
             if h.id != now_id {
                 h.id = now_id;
-                h.mode = h.mode.max(mode);
                 g.tombstone(id);
-            } else if now_id != id {
-                h.mode = h.mode.max(mode);
             }
             g.stats.renewals += 1;
             if let Some(l) = resumed {
