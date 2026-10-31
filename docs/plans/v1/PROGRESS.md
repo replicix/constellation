@@ -62670,3 +62670,38 @@ meta 380, meta `member_copy` 18, engine `authority_driver` 35 (no failures). `ca
 --release --test sim`: 295 passed (11 ignored). (`holder_capture`'s `an_old_recall_record_keeps_the_inferred_cut`
 fails on main as with the fix: the path B follow-ups (item 5) persist a legacy `Recall`'s cut, the test still expects
 none.)
+
+### Review of the `placement-hot` fixes
+
+- **The re-append never saw the tail's end of a generation (must-fix).** `apply_backup_tail` clears the tail's extent
+  (`bk.tail_through`) before `reappend_own_delegate_rows` read it, so the tail's `Recall`/`RecallCut` and its carried
+  origins were never looked at: rows of a generation the tail ended were re-appended past its cut. The extent is read
+  before the apply now. Test: core `the_takeover_gate_re_appends_nothing_past_a_tails_end_of_the_generation` (a
+  `RecallCut` and an older log's `Recall`; on the parent both rows were re-appended).
+- **A lost dependency judged from memory only.** The halt used `lost_from`, which a restart forgets and no batch may
+  have set. Each row's `deps` are captured with the rows (the strand takes the journal heads that record them), and a
+  row whose deps are lost, or name another own generation's row not in the log, halts the re-append. Test: core
+  `the_takeover_gate_re_appends_no_row_whose_dependency_is_lost` (after a restart; re-appended on the parent).
+- **A committed stream entry of a refusal.** `completed_streams` matches a segment's `Refused` rids too (such an entry
+  already retired by the segment's rewind; now by its rid). Test: meta
+  `a_committed_stream_entry_retires_by_its_rid_without_a_tail_identity` (the completion's fails on main).
+- **I5's dating.** The oracle's last-read queue is keyed by `(rid, queue_seq)`: a rid queued, answered, gone and queued
+  again between two reads is a new rollback (`oracle::newly_queued`, test `i5_dates_a_second_rollback_of_a_rid_by_its_new_entry`).
+- A re-appended row's replay that cannot leave the queue is counted (`own_deleg_reappend_forget_failed`) and logged.
+
+### The gate hole: `holder_capture` (2026-10-31)
+
+`an_old_recall_record_keeps_the_inferred_cut` failed on main since the path B review (only `--lib` was gated). The
+code is right, the test stale: a legacy `Recall`'s rows not before it in the log never take effect, so its cut is what
+the log holds of the generation, which the review keeps and `Replica::apply_segment` gave the session all along. The
+store's own durable apply still voided the session at the replica's head (a delegate's unappended rows in it), so a
+dependency on such a row was not lost there; it notes the kept cut now. The test is
+`an_old_recall_record_cuts_at_what_the_log_holds` (fails on main: the session's cut 3, not 0). Every test target of
+authority (but the sim suite), meta, engine and control, on the tree of that commit: authority 836 (lib and
+`meta_repro`), meta 534, engine 948, control 146, no failures.
+
+Gates of the review fixes (box): fmt and clippy (`-D warnings`, workspace) clean; authority lib and `meta_repro` 838,
+meta (every target) 535, engine `authority_driver` 35, no failures; release sim suite 296 passed (11 ignored). Sweeps,
+seeds 0 to 1,999, with and without the knob: `placement-hot` 0 and 1 (593, open), `long-delegated`,
+`long-delegated-backup`, `shared-dir-split`, the four `delegated-two-gens-*`, `delegated-holder-cut`,
+`delegated-backup` 0.
