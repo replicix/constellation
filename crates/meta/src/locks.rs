@@ -967,6 +967,16 @@ struct Inner {
     /// long one left in doubt may still execute somewhere — the grant is
     /// not released before both are over ([`LockTables::release_blocked`]).
     inflight: BTreeMap<GrantId, Inflight>,
+    /// Node side: a held grant that went on under a newer id of its owner
+    /// (a re-affirmation installed over it, a recall that adopted the
+    /// newer id), old id → new id. The ops tagged with the old id are in
+    /// flight, pinned or in doubt under the old id's entries (`inflight`,
+    /// `doubted`), and the grant they hold back is the new one: the
+    /// release, the doubt lapse and the next turn's predecessor wait look
+    /// at every id of the grant's [`Inner::lineage`]. Bounded like
+    /// `doubted`; an entry lost only matters past `ENDED_KEPT` renamings.
+    superseded: BTreeMap<GrantId, GrantId>,
+    superseded_order: std::collections::VecDeque<GrantId>,
     /// Sequencer side (phase 2): how long past the end of its record an
     /// ended grant stays in `ended` ([`LockTables::set_token_memory_ms`]:
     /// `TTL + 2 × margin`, so an outwaited grant — whose record has
@@ -1089,6 +1099,64 @@ pub const PARK_LOOKAHEAD_MS: i64 = 50;
 pub const WRAP_LOOKAHEAD_MS: i64 = 1_000;
 
 impl Inner {
+    /// Node side: `old`, held here, goes on as `new` (`superseded`).
+    fn note_superseded(&mut self, old: GrantId, new: GrantId) {
+        if old == new {
+            return;
+        }
+        if self.superseded.insert(old, new).is_none() {
+            self.superseded_order.push_back(old);
+        }
+        while self.superseded_order.len() > ENDED_KEPT {
+            if let Some(o) = self.superseded_order.pop_front() {
+                self.superseded.remove(&o);
+            }
+        }
+    }
+
+    /// Node side: `id` and every older id of the same held grant
+    /// (`superseded`), newest first.
+    fn lineage(&self, id: GrantId) -> Vec<GrantId> {
+        let mut ids = vec![id];
+        let mut i = 0;
+        while i < ids.len() {
+            let cur = ids[i];
+            for (old, new) in &self.superseded {
+                if *new == cur && !ids.contains(old) {
+                    ids.push(*old);
+                }
+            }
+            i += 1;
+        }
+        ids
+    }
+
+    /// The newest id `id` went on as (itself if none).
+    fn current_id(&self, id: GrantId) -> GrantId {
+        let mut cur = id;
+        for _ in 0..64 {
+            match self.superseded.get(&cur) {
+                Some(n) => cur = *n,
+                None => break,
+            }
+        }
+        cur
+    }
+
+    /// Node side: the in-flight state of `id`'s whole lineage, merged.
+    fn inflight_of(&self, id: GrantId) -> Option<Inflight> {
+        let mut out: Option<Inflight> = None;
+        for g in self.lineage(id) {
+            if let Some(e) = self.inflight.get(&g) {
+                let o = out.get_or_insert_with(Inflight::default);
+                o.active += e.active;
+                o.publishing += e.publishing;
+                o.pinned_until = o.pinned_until.max(e.pinned_until);
+            }
+        }
+        out
+    }
+
     fn tombstone(&mut self, id: GrantId) {
         if self.released.len() >= RELEASED_KEPT {
             self.released.pop_front();
@@ -2605,10 +2673,17 @@ impl LockTables {
     /// each resolved once its outcome is known
     /// ([`Self::resolve_doubt`]).
     pub fn doubt_of(&self, grant: GrantId) -> Option<(bool, Vec<crate::rid::Rid>)> {
-        self.lock()
-            .doubted
-            .get(&grant)
-            .map(|d| (d.anon, d.rids.iter().copied().collect()))
+        let g = self.lock();
+        let mut out: Option<(bool, Vec<crate::rid::Rid>)> = None;
+        // The doubts of the grant's older ids are its own (`superseded`).
+        for id in g.lineage(grant) {
+            if let Some(d) = g.doubted.get(&id) {
+                let o = out.get_or_insert_with(|| (false, Vec::new()));
+                o.0 |= d.anon;
+                o.1.extend(d.rids.iter().copied());
+            }
+        }
+        out
     }
 
     /// The in-doubt op `rid` under `grant` has a definitive outcome (it
@@ -2616,17 +2691,27 @@ impl LockTables {
     /// doubt. The grant is released normally once none is left.
     pub fn resolve_doubt(&self, grant: GrantId, rid: crate::rid::Rid) {
         let mut g = self.lock();
-        if let Some(d) = g.doubted.get_mut(&grant) {
-            d.rids.remove(&rid);
-            if d.rids.is_empty() && !d.anon {
-                g.doubted.remove(&grant);
+        for id in g.lineage(grant) {
+            if let Some(d) = g.doubted.get_mut(&id) {
+                d.rids.remove(&rid);
+                if d.rids.is_empty() && !d.anon {
+                    g.doubted.remove(&id);
+                }
             }
         }
     }
 
     /// Whether any doubt is noted on `grant` (resolved or not).
     pub fn was_doubted(&self, grant: GrantId) -> bool {
-        self.lock().doubted.contains_key(&grant)
+        let g = self.lock();
+        g.lineage(grant).iter().any(|id| g.doubted.contains_key(id))
+    }
+
+    /// Node side: `grant` and the older ids of the same held grant (it
+    /// went on under the owner's newer id), newest first: the tokens a
+    /// mutation of this node may carry for it.
+    pub fn lineage(&self, grant: GrantId) -> Vec<GrantId> {
+        self.lock().lineage(grant)
     }
 
     /// Whether a mutation this node issued under `grant` may still land
@@ -2635,9 +2720,8 @@ impl LockTables {
     /// grant meanwhile has not got it in its release floor.
     pub fn tagged_unsettled(&self, grant: GrantId) -> bool {
         let g = self.lock();
-        g.doubted.contains_key(&grant)
-            || g.inflight
-                .get(&grant)
+        g.lineage(grant).iter().any(|id| g.doubted.contains_key(id))
+            || g.inflight_of(grant)
                 .is_some_and(|e| e.active > 0 || e.publishing > 0)
     }
 
@@ -2931,6 +3015,7 @@ impl LockTables {
         // FUSE thread ran). A lapsed unused grant is dropped by the
         // renewal tick.
         held.first_use = true;
+        let mut continued = false;
         if let Some(old) = g.held.get(&ino).copied().filter(|o| o.id == held.id) {
             held.mode = old.mode.max(held.mode);
             held.until = old.until.max(held.until);
@@ -2956,6 +3041,7 @@ impl LockTables {
             // grant it would sit `first_use` until a local lock came, and
             // its release would name an id the owner no longer had (the
             // grant was outwaited then).
+            continued = true;
             held.until = old.until.max(held.until);
             held.recalled |= old.recalled;
             held.releasing = old.releasing;
@@ -2981,6 +3067,15 @@ impl LockTables {
                 // Replaced (an upgrade, a fresh grant after a lapse): the
                 // old id is dead here.
                 g.tombstone(old.id);
+                // The same grant under the owner's newer id (the branch
+                // above): what is tagged with the old id holds back the
+                // new one's release (sim `locks-writer-hold-delegated-doubt`
+                // seeds 279, 344 and 1324 under slow lease reads: a write
+                // in doubt under the old id, the new id released, and the
+                // write landed inside the next holder's section).
+                if continued {
+                    g.note_superseded(old.id, held.id);
+                }
             }
         }
         g.stats.granted += 1;
@@ -3078,6 +3173,7 @@ impl LockTables {
             // duplicate renewal is harmless).
             h.renewing = None;
             g.tombstone(old);
+            g.note_superseded(old, id);
             g.stats.recalled_superseded += 1;
             // The owner keeps one record per node and inode and mints a
             // fresh id per answer, so every id of its below the adopted
@@ -3795,10 +3891,11 @@ impl LockTables {
                 g.inflight.remove(&t.grant);
                 // A recalled grant's release may be waiting for this (an
                 // idle one's too: `idle_before` marks it recalled).
+                let id = g.current_id(t.grant);
                 if let Some(ino) = g
                     .held
                     .iter()
-                    .find(|(_, h)| h.id == t.grant && h.recalled)
+                    .find(|(_, h)| h.id == id && h.recalled && g.inflight_of(id).is_none())
                     .map(|(ino, _)| *ino)
                 {
                     wake.push(ino);
@@ -3856,10 +3953,11 @@ impl LockTables {
             return;
         }
         g.inflight.remove(&grant);
+        let id = g.current_id(grant);
         let wake = g
             .held
             .iter()
-            .find(|(_, h)| h.id == grant && h.recalled)
+            .find(|(_, h)| h.id == id && h.recalled && g.inflight_of(id).is_none())
             .map(|(ino, _)| *ino);
         let hook = g.release_wake.clone();
         drop(g);
@@ -3958,7 +4056,9 @@ impl LockTables {
     /// only; `None` with ops in flight: when they are answered).
     pub fn release_blocked(&self, grant: GrantId, now: Now) -> Option<Option<WaitMs>> {
         let mut g = self.lock();
-        let e = g.inflight.get(&grant).copied()?;
+        // Every id of the grant (`superseded`): an op tagged with an older
+        // one holds this release back as much as one tagged with this id.
+        let e = g.inflight_of(grant)?;
         // A close publishing the file may be tagged with another file's
         // grant (`Inflight::publishing`): counted here on its own.
         if e.active > 0 || e.publishing > 0 {
@@ -3967,7 +4067,9 @@ impl LockTables {
         if e.pinned_until > now.wait {
             return Some(Some(e.pinned_until));
         }
-        g.inflight.remove(&grant);
+        for id in g.lineage(grant) {
+            g.inflight.remove(&id);
+        }
         None
     }
 
@@ -4239,8 +4341,7 @@ impl LockTables {
         if new_turn {
             let id = g.held.get(&ino).map(|h| h.id);
             if id.is_some_and(|id| {
-                g.inflight
-                    .get(&id)
+                g.inflight_of(id)
                     .is_some_and(|e| e.publishing > 0 || e.pinned_until > now.wait)
             }) {
                 // Counted once per request by the caller, which may ask

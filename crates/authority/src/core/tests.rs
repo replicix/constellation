@@ -26949,6 +26949,86 @@ mod locks {
             .any(|(to, m)| *to == 1 && matches!(m, PeerMsg::LockReleased { .. }))
     }
 
+    /// Sim `locks-writer-hold-delegated-doubt` seeds 279, 344 and 1324
+    /// under slow lease reads (two exclusive holders): a write tagged with
+    /// the grant's id when it went out, and the grant then went on under
+    /// the owner's newer id (its answer to another op of the node). The
+    /// write ended in doubt; the release of the newer id looked for ops
+    /// tagged with that id only, found none, and went out; the owner
+    /// granted the next node, and the write landed in its section. The
+    /// older id's ops hold the newer id's release as its own do: the doubt
+    /// lapse drops it unreleased, left to the owner's outwait.
+    #[test]
+    fn an_op_tagged_with_an_older_id_of_the_grant_holds_its_release() {
+        let mut r = requester();
+        let req = lock_control(&mut r, 50, 42, true);
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: grant_msg(3),
+            },
+        });
+        let g3 = GrantId { node: 1, seq: 3 };
+        let tag = token(g3, r.meta.locks().held(42).unwrap().until.0);
+        let local = LocalLock {
+            owner: 9,
+            pid: 1,
+            pid_start: 0,
+            write: true,
+            start: 0,
+            end: u64::MAX,
+        };
+        assert_eq!(
+            r.meta.locks().local_set(42, local, r.clk()),
+            constellation_meta::locks::LocalOutcome::Done
+        );
+        r.meta.locks().tag_begin(&tag, r.clk());
+        // Another op of the node: the owner's answer re-affirms the grant
+        // under a newer id, which the held grant goes on as.
+        r.advance(10);
+        let req = lock_control(&mut r, 51, 42, true);
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: grant_msg(4),
+            },
+        });
+        let g4 = GrantId { node: 1, seq: 4 };
+        assert_eq!(r.meta.locks().held(42).map(|h| h.id), Some(g4));
+        // The write ends in doubt, the application unlocks, the owner
+        // recalls the grant.
+        r.meta.locks().tag_end(&tag, true, r.clk());
+        assert!(r.meta.locks().local_unlock(42, 9, 0, u64::MAX, r.clk()));
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockRecall {
+                req: OpId(77),
+                ino: 42,
+                grant: g4,
+            },
+        });
+        assert!(out
+            .iter()
+            .any(|a| matches!(a, Action::LockFlush { ino: 42, .. })));
+        let out = r.step(Event::LockFlushed {
+            ino: 42,
+            grant: g4,
+            ok: true,
+        });
+        assert!(
+            !released(&out),
+            "released while an op tagged with its older id is in doubt: {out:?}"
+        );
+        let wait = timer_of(&out, TimerKind::LockReleaseWait);
+        r.now = Ms(r.meta.locks().held(42).unwrap().until.0);
+        let out = r.step(Event::Timer { id: wait });
+        assert!(!released(&out), "released after the doubt: {out:?}");
+        assert!(r.meta.locks().held(42).is_none(), "dropped here");
+        assert_eq!(r.core.stats.lock_doubt_lapses, 1);
+    }
+
     /// Review nit: the release waiting for a tagged op is woken by the
     /// op's end (`Control::LockReleaseWake`, which the FUSE thread's
     /// `tag_end` sends), not found by a 10 ms poll; the poll stays only

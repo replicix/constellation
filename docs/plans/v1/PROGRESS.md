@@ -62894,3 +62894,41 @@ meta 380 (no failures). `cargo test -p constellation-authority --release --test 
   though the delegate's own grants were capped by its delegation: most of the heavy configuration's 26 s p90 handoff
   gap is this.
 - `locks-writer-hold-delegated-doubt` under slow lease reads violates mutual exclusion on main (279, 344): not looked at.
+
+## Two exclusive holders: a write in doubt under an older id of the grant (2026-10-31)
+
+`locks-writer-hold-delegated-doubt` under `AUTHORITY_SIM_LEASE_READS=0:0:800:1000` violated mutual exclusion on main
+(seeds 279 and 344 of 2,000) and on the lock-liveness commit (1324 too): node 3's held write landed inside node 2's
+critical section on the same lock file.
+
+### What was wrong
+
+Node 3's client wrote under its grant (id 782; the write's token named it), and the grant then went on under the owner's
+newer id (783: the owner's answer to the node's other client, installed over the held grant by `install_held`'s
+re-affirmation branch, or a recall that adopts the newer id, `recall_held`). The write ended in doubt (the client gave up on
+it after 700 ms, `tag_end(in_doubt)`), so 782 was pinned and noted doubted. The recall of 783 then released it:
+`release_blocked`, `was_doubted` and the replay checks looked for ops tagged with 783 alone (`crates/meta/src/locks.rs`,
+`release_blocked` and `was_doubted`; `crates/authority/src/core/locks.rs` `on_lock_flushed`), found none, and sent
+`LockReleased`. The owner granted node 2 at once, and the held write, past its check at the executor, landed in node 2's
+section. The doubt lapse (drop unreleased, leave the grant to the owner's outwait and its barrier) never ran.
+
+### Fix
+
+The node's lock table records an id the held grant went on as (`Inner::superseded`, old → new, at both renamings), and
+the release (`release_blocked`), the doubt (`was_doubted`, `doubt_of`, `resolve_doubt`), `tagged_unsettled`, the next
+turn's predecessor wait (`local_set`) and the replay pins (`replay_blocks_release`, `replay_unresolved`) look at the
+grant's whole lineage (`LockTables::lineage`). The release wake of `tag_end` and `publish_end` finds the held grant by
+its newest id.
+
+### Tests
+
+Core `an_op_tagged_with_an_older_id_of_the_grant_holds_its_release` (fails without the lineage: the newer id is released
+with the write in doubt). Sim `regression_locks_writer_hold_delegated_doubt_older_id_seeds_279_344_1324` (slow lease
+reads; fails without it).
+
+### Gates and sweeps
+
+fmt and clippy (workspace, all targets, `-D warnings`) clean. Lib tests: authority 833, meta 380. Release sim suite: 291
+passed (11 ignored). Seeds 0 to 1,999 of the same 103 configurations as the lock-liveness entry, with and without the
+knob, against main wherever one failed: `locks-writer-hold-delegated-doubt` passes both ways (main: 279 and 344 with
+the knob), and every other failing set is a control's or a class failing on main, as in that entry.

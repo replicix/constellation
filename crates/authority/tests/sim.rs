@@ -11208,6 +11208,34 @@ fn regression_locks_delegated_production_ttl_heavy_grace_handoffs_seeds_969_1123
     }
 }
 
+/// `locks-writer-hold-delegated-doubt` seeds 279, 344 and 1324 under slow
+/// lease reads: two exclusive holders. Node 3's write went out tagged with
+/// its grant's id, and the grant then went on under the owner's newer id
+/// (the owner's answer to another op of the node). The write ended in
+/// doubt, and the release of the newer id, which looked for ops tagged
+/// with that id alone, went out; the owner granted node 2, and the held
+/// write landed inside its section. An op tagged with an older id of a
+/// grant holds the newer id's release (`LockTables::lineage`).
+#[test]
+fn regression_locks_writer_hold_delegated_doubt_older_id_seeds_279_344_1324() {
+    for seed in [279, 344, 1324] {
+        run_seed(
+            seed,
+            SimConfig {
+                lease_reads: SLOW_LEASE_READS,
+                ..locks_writer_hold_delegated_doubt_config()
+            },
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "locks-writer-hold-delegated-doubt seed {seed} (slow lease reads): {e}\n  \
+                 replay with AUTHORITY_SIM_CONFIG=locks-writer-hold-delegated-doubt \
+                 AUTHORITY_SIM_LEASE_READS=0:0:800:1000"
+            )
+        });
+    }
+}
+
 /// `locks-s3-cut-holder-alive` seeds 1889 and 7882 under slow lease reads,
 /// once blocking lock requests queue behind older waiters: the holder handed
 /// the lease to a node that wanted it, which did not claim it; each named the

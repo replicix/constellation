@@ -5643,10 +5643,12 @@ impl Core {
         replica: &dyn Replica,
     ) -> Option<WaitMs> {
         self.lock_note_replay_pins(now, replica);
+        // The grant's older ids too (it went on under a newer id).
+        let ids = replica.locks().lineage(grant);
         self.lk
             .replay_pins
             .iter()
-            .filter(|((g, _), until)| *g == grant && **until > now.wait)
+            .filter(|((g, _), until)| ids.contains(g) && **until > now.wait)
             .map(|(_, until)| *until)
             .max()
     }
@@ -5711,11 +5713,12 @@ impl Core {
     /// release waited for that): it may be executing at its new sequencer
     /// already, as an op in doubt may.
     fn replay_unresolved(grant: GrantId, replica: &dyn Replica) -> bool {
+        let ids = replica.locks().lineage(grant);
         replica.pending_replays().is_ok_and(|queued| {
             queued
                 .iter()
                 .filter(|q| q.refused.is_none() && !q.foreign)
-                .any(|q| q.lock_tag.0.iter().any(|t| t.grant == grant))
+                .any(|q| q.lock_tag.0.iter().any(|t| ids.contains(&t.grant)))
         })
     }
 
