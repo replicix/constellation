@@ -778,6 +778,9 @@ pub struct Stats {
     /// after the predecessor's tail, verbatim under their stream origin
     /// (`Core::reappend_own_delegate_rows`).
     pub own_deleg_rows_reappended: u64,
+    /// Plan 43 C3: answers waiting for such a row that were made to wait for
+    /// its re-appended journal row's commit too.
+    pub own_deleg_reappended_parks_held: u64,
     /// Plan 43 C3: a re-appended row's queued replay that could not be
     /// forgotten (it is then dropped by the replay, its rid completed).
     pub own_deleg_reappend_forget_failed: u64,

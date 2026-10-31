@@ -41089,6 +41089,56 @@ mod deleg_group {
         assert!(answer_to_2(&out, 500).is_some(), "{out:?}");
     }
 
+    /// A delegate whose root never acknowledged its row takes the root over
+    /// (it was the root's backup): the takeover gate re-appends the row into
+    /// the new tenure's journal under its origin, which raises the
+    /// generation's log index here. The forward waiting for the row is
+    /// answered once that journal row is committed by the root's rule (here
+    /// shipped: a backup could be had, none is listed yet), not at the gate.
+    /// Fails on the parent: answered at the gate, on this disk alone
+    /// (`delegated-holder-cut +commit` seeds 124, 214, 348: I1).
+    #[test]
+    fn a_re_appended_rows_answer_waits_for_the_new_tenures_commit() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        let out = forward_create(&mut h, dir, 1, 500);
+        assert_eq!(answer_to_2(&out, 500), None, "answered alone: {out:?}");
+        assert!(h.core.has_stream_parks());
+        // The root never acknowledges; this node seals it and takes over.
+        h.hold(
+            2,
+            Some(PendingGate {
+                epoch: 2,
+                takeover: true,
+                marker_shipped: true,
+                drained: false,
+                fast_prev: false,
+                backup_tail_epoch: Some(1),
+                shippable: true,
+            }),
+        );
+        h.core.ack.eligible = Some(true);
+        let mut out = Vec::new();
+        h.core.complete_gate(h.clk(), &h.meta, &mut out);
+        assert_eq!(h.core.stats.own_deleg_rows_reappended, 1);
+        assert_eq!(h.meta.log_stream_idx(7).unwrap(), 1);
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        assert_eq!(
+            answer_to_2(&out, 500),
+            None,
+            "answered before the new tenure committed the row: {out:?}"
+        );
+        assert_eq!(h.core.stats.own_deleg_reappended_parks_held, 1);
+        // The gate's segment ships.
+        h.core.ack.shipped_through = h.meta.journal_tip().unwrap();
+        let mut out = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        let (outcome, _) = answer_to_2(&out, 500).expect("answered once shipped");
+        assert!(
+            matches!(outcome, MutateOutcome::Accepted { .. }),
+            "{outcome:?}"
+        );
+    }
+
     /// The delegate's own client renames `from` to `to` in `dir`.
     fn own_rename(h: &mut Harness, dir: Ino, seq: u64, from: &str, to: &str) -> (Rid, Vec<Action>) {
         let rid = h.rid(seq);

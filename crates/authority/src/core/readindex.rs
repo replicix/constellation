@@ -710,6 +710,22 @@ impl Core {
         self.rd.parked.values().any(|p| p.stream_need.is_some())
     }
 
+    /// Plan 43 C3: the parks waiting on row `(gen, idx)` of this node's own
+    /// stream wait for journal seq `jseq` to be durable as well (on every
+    /// committed backup, or shipped), as a holder's own row's do: a takeover
+    /// gate re-appended the row into this tenure's journal
+    /// (`Core::reappend_own_delegate_rows`). How many.
+    pub(crate) fn stream_parks_wait_for_journal(&mut self, gen: u64, idx: u64, jseq: u64) -> usize {
+        let mut n = 0;
+        for p in self.rd.parked.values_mut() {
+            if p.stream_need == Some((gen, idx)) {
+                p.durable = Some(p.durable.map_or(jseq, |d| d.max(jseq)));
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// Phase 2b: answer a parked acknowledgement `Busy` (the requester,
     /// or this node's client, retries by rid).
     pub(crate) fn abort_park_busy(

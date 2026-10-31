@@ -63036,3 +63036,60 @@ the stale-mirror control's seed 76. Gates: fmt, clippy, authority lib 847, meta 
 ignored). Sweeps, seeds 0 to 1,999, the 105 lock configurations plus `placement-hot`, with and without the knob, against
 main wherever one failed: the same classes and per-class counts as the review entry; `placement-hot` 593 with the knob
 fails on main too (an I5 oracle class).
+
+## A delegate taking the root over answered a re-appended row before its new tenure committed it (plan 43 C3, 2026-10-31)
+
+`delegated-holder-cut +commit` (not in the gate list) fails I1 with `deleg-group/*` answers. Seeds 0 to 1,999 on main:
+32 seeds (19 with slow lease reads, `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`: 4). Every one is an answer at the
+takeover gate of a delegate that was the root's backup and sealed it. Two shapes:
+
+1. **The row was not committed (integrity; 19 seeds, 3 with the knob: 124, 214, 228, 348, 391, 435, 555, 746, 763, 894,
+   1013, 1025, 1625, 1693, 1707, 1849, 1900, 1920, 1997; 132, 228, 1963).** Its recorded backup lacked it and the
+   predecessor's tail did not carry it (`carried=false`). `Core::reappend_own_delegate_rows` (`57d243eb`) re-appends it
+   into the new tenure's journal, which raises the generation's log index here; the park waiting for the row reads that
+   index as the group's copy (`deleg_stream_state_with`, a generation's commit by `idx <= log_stream_idx`), so the
+   answer left at the gate with the row on this disk alone, 20 to 100 ms before the gate's segment shipped. A crash of
+   that disk then (or a reboot losing the unsynced end of the journal) loses an acknowledged write. Introduced by
+   `57d243eb`: on its parent the same sweeps fail only shape 2's seeds (such a row was replayed by rid, its park aborted
+   at the gate's end of the generation, its client's retry answered by the root's rule).
+2. **The row was committed by the predecessor's root group (the oracle; 13 seeds: 35, 501, 511, 658, 689, 863, 947,
+   1149, 1199, 1235, 1237, 1284, 1441; with the knob 511).** The old root appended it and its listed backup, this very
+   node, held it in its backup tail; the gate re-ships that tail. The oracle judges `RootGroup` only for root rows
+   (`origin (0, 0)`) and only against the lease in the bucket (the new epoch's, no backup), so it finds no class. The
+   same 13 fail on `57d243eb`'s parent. Left to C3's oracle work (judge a carried row by the predecessor's group).
+
+Fix: a park still waiting for a row the gate re-appends also waits for the re-appended journal row's commit by the
+root's own rule (`Core::stream_parks_wait_for_journal`: the archive, this tenure's backups, or, with no backup to be
+had, the lone root's answer, re-tagged `Lone` as any gated answer released with the gate off). Rows stay re-appended
+verbatim (I2c unchanged). An earlier variant that left uncommitted rows to the replay instead raised I2c (8 and 29
+answers): what a group held when it answered is not what the delegate's current group state says once its backup was
+replaced. Test: core `a_re_appended_rows_answer_waits_for_the_new_tenures_commit` (fails on the parent: answered at the
+gate, `committed: true`).
+
+After, seeds 0 to 1,999 (`+commit`): `deleg-group` failures 32 -> 18 (13 of shape 2, and 5 answers the new root gave
+its own client as a lone root, re-tagged `Lone`, which the oracle judges by the delegation's group: 124, 228, 763,
+1849, 1900); with the knob 4 -> 1 (228, the same). Flags off: `deleg-group` uncommitted 40 -> 26 (4 -> 1 with the
+knob), I2c 0, I2 0, I4 and I5 unchanged; `acks-downgraded-lone` 1 -> 11. The `archive/*` failures are C2f's (the
+root's answers to forwards), unchanged. With the knob, four seeds (1069, 1434, 1464, 1531) fail I1 `root-group/*` on
+main, on `57d243eb`'s parent (eleven there) and after alike: open, not traced here.
+
+Residual (not reached by these seeds): after a restart no park waits, but a retry's dedup answer of a re-appended row
+reads the same log index (`deleg_dedup_wait`), so it can still leave before the new tenure ships the row.
+
+**Holder capture off (measured alongside; no change).** `CONSTELLATION_HOLDER_CAPTURE=0` (default on; an internal
+fallback of plan 30 M3b, not a tuning knob): a delegate's recall strand finds no captured row, so a row past the cut
+stays in its journal and replica. Seeds 0 to 499, failing seeds with capture off (all 0 with it on): `backup-crash` 426,
+`delegated-holder-cut` 435, `delegated-partition` 399, `long-delegated-late-answers` 119, `long-delegated` 44,
+`delegated-backup` 26, `delegated-crash` 25, `delegated-root-crash` 25, `long-backup` 21. Signatures: a rid completed
+twice in the log, effects the client was told failed, a holder's publish that is not a log prefix, replicas that do
+not converge, a journal that never drains. `delegated-partition` seed 10: the delegate's own client heard `OK` for a
+create (`(2,1,5)`, answered at once on its disk, its row past the recall cut) that the log never carries, and a later create of the same name
+`EEXIST` from the row left in the delegate's replica. The switch is not safe on main, for delegations or for a root.
+
+### Gates
+
+fmt and clippy (workspace, all targets, `-D warnings`) clean. Lib tests: authority 848, meta 381. Release sim suite: 300
+passed (11 ignored). Seeds 0 to 1,999, with and without the knob: `delegated-holder-cut` (flags off) 0 both ways;
+`placement-hot`, `long-delegated`, `long-delegated-backup`, `long-delegated-late-answers`, `delegated-backup`,
+`delegated-root-crash`, `shared-dir-split` and the four `delegated-two-gens-*` 0, but `placement-hot` 593 with the knob
+(open on main, above).
