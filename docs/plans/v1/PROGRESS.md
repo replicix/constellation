@@ -55596,7 +55596,7 @@ is C6's add window.
 
 ## Plan 42 — Kernel FUSE race workarounds
 
-Plan 42 (`docs/plans/v1/wip/42-kernel-race-workarounds.md`) makes the Linux
+Plan 42 (`docs/plans/v1/done/42-kernel-race-workarounds.md`) makes the Linux
 FUSE frontend correct on today's kernels against three races in the
 kernel's FUSE client: a stale page after a write-through write (race 1),
 directory attributes marked valid before they are stored (2a), and a reply
@@ -56079,9 +56079,9 @@ On the test host, `origin/main` `b4fe2e6` plus the plan's commits:
 - [x] K6
 - [x] K7 (2026-10-30, section "Plan 42 K7: §8 on main" below; W2's worst case reported with
   its cause, the rest of §8 met)
-- [ ] Every CONVENTIONS gate: fmt, clippy, workspace tests, conformance,
+- [x] Every CONVENTIONS gate: fmt, clippy, workspace tests, conformance,
   pjdfstest 8798/8798, smoke, `stress-ng-fs` green; the full `harness
-  run` catalogue not run
+  run` catalogue run on 2026-10-30 (see "Plan 42 closed", at the end)
 
 ## Sim: a copy cut from S3 counts against one backup's failure budget (plan 43 C7a, 2026-10-21)
 
@@ -62048,7 +62048,7 @@ acceptance on main" and the sections after it; the plan's §8 and §11 say what 
 | Item | State | Where |
 |---|---|---|
 | §8 rerun: base `c3bda7ea` against main `c8e4861f` plus the two fixes below, ext4, xfs, btrfs (off, `zstd`), tmpfs, 3 ABBA runs | done | `bench/kernel-races/RESULTS.md` |
-| W2's worst case: cause found (a dropping open's evidence queues behind `inode_lock`; an overflow arm kept every open dropping) | fixed where the evidence allows; the rest reported | `crates/frontend-fuse/src/{pagecache,reply}.rs` |
+| W2's worst case: cause found (a dropping open's own page drop waits on the writer's locked tail, so its evidence comes late; an overflow arm kept every open dropping) | fixed where the evidence allows; the rest reported | `crates/frontend-fuse/src/{pagecache,reply}.rs` |
 | W1: open-arm bound 4 to 64 (`MAX_OPEN_ARMS`) | landed | `crates/frontend-fuse/src/pagecache.rs` |
 | W2: a write's reply clears the reads recorded since its claim (`PageCacheTable::answering`) | landed, reviewed | `crates/frontend-fuse/src/{pagecache,reply}.rs` |
 | Commit-heavy rise | not reproduced: fresh and aged mounts, base, main and final within spread | RESULTS.md |
@@ -62063,8 +62063,8 @@ than the base (195 000 to 205 000 writes in 20 s against 485 000 to 490 000, p99
 11.8 ms while every other writer waited. A diagnostic build (not committed) logged each claim whose repair included the
 write's partial last page: the page had a read recorded 20 to 100 us before the claim, fetched just before a dropping
 open's drop removed it, so the writer re-created the page and held it locked, and the repair waited on that lock. The read
-was not superseded because the open's completion evidence, its `FLUSH`, is sent only after `fuse_flush` takes
-`inode_lock`, behind the writers. And the six descriptors pc_race opens at once had left an overflow arm (the bound was 4
+was not superseded because the open's completion evidence, its next request, is sent only after the open's own
+`invalidate_inode_pages2` (`fs/fuse/file.c:297`) returns, and that blocks on the same locked tail. And the six descriptors pc_race opens at once had left an overflow arm (the bound was 4
 open arms) that lives until the inode's last handle closes: every open dropped (`drop_in_flight`, 114 000 of 115 000)
 even with W1 on.
 
@@ -62515,3 +62515,30 @@ Gates (box): fmt and clippy (`-D warnings`, workspace) clean; lib tests authorit
 `authority_driver` 35; release sim suite 291 passed (11 ignored). Sweeps, seeds 0 to 1,999, with and without the knob,
 of the 12 configurations above: clean but `delegated-core-stall-root-backup` with the knob, seed 300 (as before);
 `locks-core-stall-backup-long-slow-reads` clean, its dated-at-return mutant still caught (5 seeds, 44 with the knob).
+
+## Plan 42 closed: the catalogue, W2's remaining cost, a correction (2026-10-31)
+
+Docs only. Plan 42 moves to `docs/plans/v1/done/42-kernel-race-workarounds.md`; its links (the plans README, DECISIONS
+ADR-34, `docs/reference/features/kernel-cache-coherence.md`, the plan's PROGRESS section) are updated, and the plan's
+last exit criterion is ticked.
+
+- **The gates.** The full `harness run` catalogue on `77bf428e`, with the two harness fixes after it (`64a4bad1`,
+  `b4f8aecf`): 275 passed, 19 skipped (no `sqlite3`, no FUSE io_uring, no root for passthrough and zero-copy), 1 failed:
+  `idle-cost`, ENOSPC on the test box's disk during co-located load; it passed 2 of 2 alone. The failures of
+  the earlier runs were a harness build from before `6d53adde` (four scenarios) and harness bugs fixed in `77bf428e`,
+  `64a4bad1` and `b4f8aecf`; none was in plan 42.
+- **W2's remaining cost is accepted** (§8). With keep-cache off, `pc_race` with an opener stays about 2 times below the
+  base (p99 11.8 ms). A read of kernel 7.3-rc4 (the same as mainline for these files) shows why the daemon cannot remove
+  it: the writer's partial last folio stays locked and not uptodate from `fuse_fill_write_pages` until
+  `fuse_send_write_pages` unlocks it after the `WRITE` reply; the repair's `invalidate_inode_pages2_range` blocks in
+  `folio_lock`; a synchronous reader holds a folio in the same state, and `FUSE_NOTIFY_RETRIEVE` stops at the first folio
+  that is not uptodate, so the writer's lock and a stale reader's look alike without weakening R1. A change in the fork
+  cannot help. The route is kernel fix 0001, with which W2 is off. A write flag marking the locked folio would help only
+  kernels without that fix and was not pursued; the Constellation-only partial fix (skip a tail superseded by a completed
+  whole-file drop) measured within noise and was not merged.
+- **A correction.** The plan's §8, `bench/kernel-races/RESULTS.md` and the K7 entry above said that the opener's `FLUSH`
+  queues behind `inode_lock`. In 7.3 `fuse_flush` (`fs/fuse/file.c:467`) takes no `inode_lock`: the late evidence comes
+  from the dropping open's own `invalidate_inode_pages2` (`file.c:297`), which blocks on the same locked tail. The
+  numbers and the fixes are unchanged.
+- **Follow-up, not an open criterion.** The kernel-release table of §5.4 stays empty until the patch package is merged
+  upstream.

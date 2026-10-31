@@ -1750,7 +1750,7 @@ writer's read-back wins the race); TTL 0 for files' attributes; repairing
 ambiguous reads; a wall-clock-only repair bound; holding the first
 post-change directory reply.
 
-**See**: [plan 42](../plans/v1/wip/42-kernel-race-workarounds.md);
+**See**: [plan 42](../plans/v1/done/42-kernel-race-workarounds.md);
 `crates/frontend-fuse/src/{pagecache,repair,kernel_fixes}.rs`,
 `crates/engine/src/view/kernel_cache.rs`; PROGRESS, "Plan 42".
 

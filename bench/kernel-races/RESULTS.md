@@ -569,8 +569,10 @@ that logged every claim with a partial last page (`tail`) and every release (not
   the repair's invalidation of `t` waits for the very reply it holds — the case `TAIL_GRACE` exists for. The reads were
   recorded either just before or just after the latest dropping open's arm (`gen` equal to the current one or one less),
   and that open's drop had already removed the page the read fetched before the writer copied.
-- They were not superseded, because the dropping open's completion (its `FLUSH`) was still to come: `fuse_flush` takes
-  `inode_lock` before it sends `FLUSH`, so the opener's evidence queues behind the very writers the drop raced.
+- They were not superseded, because the dropping open's completion was still to come: the open's own
+  `invalidate_inode_pages2` (`fuse_finish_open`, `fs/fuse/file.c:297`) blocks on the same locked tail page, so the opener's
+  next request, the evidence, is not sent until the writer replies. (`fuse_flush`, `file.c:467`, takes no `inode_lock` in
+  7.3.)
 - The entry also carried an overflow arm for the whole run: pc_race opens its six descriptors at once, an entry kept four
   open arms, and the fifth and sixth shared an overflow arm that completes only when the inode's last handle closes. With it
   every open dropped (rule 4, `drop_in_flight`: 114 000 of 115 000 opens with KEEP_CACHE at its default), which is why the
@@ -578,8 +580,19 @@ that logged every claim with a partial last page (`tail`) and every release (not
 - The repair cannot tell the writer's own lock from a reader's: a read whose reply the daemon wrote and whose task the
   kernel has not run yet holds the same lock on a page that may be stale (the residual `TAIL_GRACE` covers). The kernel
   offers no probe of a folio's lock or content that does not take the lock (`FUSE_NOTIFY_RETRIEVE` reads content without
-  it, but the fuser fork has no support for it), and the drop's completion evidence is the request that `inode_lock`
+  it, but the fuser fork has no support for it), and the drop's completion evidence is the request that the locked tail
   delays. So the remaining releases are not fixed here; a shorter grace would weaken the repair (rejected before at 2 ms).
+
+**Accepted (2026-10-31).** The remainder with KEEP_CACHE=off (about 2 times below the base, p99 11.8 ms) stays. From a
+read of kernel 7.3-rc4 (the same as mainline for these files): the writer's partial last folio is locked and not uptodate
+from `fuse_fill_write_pages` (`fs/fuse/file.c:1323`) until `fuse_send_write_pages` unlocks it after the `WRITE` reply
+(`file.c:1244`); the repair's `invalidate_inode_pages2_range` blocks in `folio_lock` (`mm/truncate.c:719`); a synchronous
+reader (`fuse_read_folio`, `fuse_do_readfolio`) holds a folio in the same state, and `FUSE_NOTIFY_RETRIEVE` stops at the
+first folio that is not uptodate. The daemon cannot tell the writer's lock from a stale reader's without weakening R1,
+and a change in the fork cannot help (an asynchronous notify or another channel only moves which thread waits). The
+route is kernel fix 0001 (folios under writeback during the `WRITE`), with which W2 is off. A write flag marking the
+locked last folio would help only kernels without 0001's fix and was not pursued. A Constellation-only partial fix (skip
+a tail that a completed whole-file drop has superseded) measured within noise and was not merged.
 
 **Fixes** (both with fail-before unit tests; the second reviewed independently against §5.2.5):
 

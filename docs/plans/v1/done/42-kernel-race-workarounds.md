@@ -1721,8 +1721,9 @@ open, and a crash replays at most about 200 MB of journal instead of 512 MiB.
 xfs, btrfs (off and `zstd`) and tmpfs. **(1)** Main still answered the W2 worst case 2.4 times slower than the base,
 p99 11.8 ms: about 980 writes per 20 s were answered by `TAIL_GRACE` while holding `inode_lock`. Cause, from a
 diagnostic build: the write's own partial last page had a recorded read (fetched just before a dropping open's drop
-removed it), the drop's completion evidence (`FLUSH`) queues behind `inode_lock` in `fuse_flush`, so the record was not
-superseded, and the repair waited on the writer's own lock; and a burst of six dropping opens left an overflow arm (at
+removed it), the dropping open's own `invalidate_inode_pages2` (`fuse_finish_open`, `fs/fuse/file.c:297`) blocks on the
+same locked tail, so the opener's evidence of completion (its next request) came late and the record was not superseded,
+and the repair waited on the writer's own lock; and a burst of six dropping opens left an overflow arm (at
 most 4 open arms) for the whole run, so every open dropped even with W1 on. Fixed: the open-arm bound is 64, and a
 write's reply clears the reads recorded since its claim (§5.2.2's fourth fact). With KEEP_CACHE at its default the
 final writes 3.3 to 3.6 times as much as main and 1.4 times the base, keeping the cache on its opens (p50 26 to 28 us,
@@ -1736,6 +1737,23 @@ for plan 42; the tree workloads' `git status`, `find`, `make -q` (1.1 to 2.0 tim
 2 to 4 times faster) follow plan 40's `READDIRPLUS` request mix and show on main without the fixes, and `cp -a`'s rise
 (tmpfs, btrfs `zstd`) comes with the commits of `c3bda7ea..5964fd68` outside plan 42 (plan 42 alone: the base's daemon
 CPU and wall times).
+
+**W2's remaining cost: accepted (2026-10-31).** With keep-cache off the W2 worst case stays about 2 times below the
+base (`pc_race` with an opener, p99 11.8 ms). It is not fixable in the daemon. From a read of kernel 7.3-rc4 (the same as
+mainline for these files):
+
+- The writer's partial last folio stays locked and not uptodate from `fuse_fill_write_pages` (`fs/fuse/file.c:1323`)
+  until `fuse_send_write_pages` unlocks it after the `WRITE` reply (`file.c:1244`).
+- The repair's `invalidate_inode_pages2_range` blocks in `folio_lock` on that folio (`mm/truncate.c:719`).
+- A synchronous reader (`fuse_read_folio`, `fuse_do_readfolio`) holds a folio in the same state, and
+  `FUSE_NOTIFY_RETRIEVE` stops at the first folio that is not uptodate. So the daemon cannot tell the writer's lock from
+  a stale reader's without weakening R1.
+- A change in the fork cannot help: an asynchronous notify or another channel only moves which thread waits.
+
+The way out is kernel fix 0001 (folios under writeback for the `WRITE`'s duration), with which W2 is off (§5.4). A write
+flag that marks the locked last folio would help only kernels that lack 0001's fix, and was not pursued. A partial fix in
+Constellation alone (skip a tail that a completed whole-file drop has superseded) measured within noise and was not
+merged.
 
 ### 8.1 Quiet-host measurement for Q1 (run 2026-10-20 without the quiet-host gate; decided option B)
 
@@ -1851,12 +1869,9 @@ decided on this measurement:
       (run; recorded in §7.5: probes, every row, the exit fix and the F10 stall met;
       the moved inode's notice stays on with 0003, F16);
       §8 acceptance run on ext4, xfs, btrfs (off and `zstd`) and tmpfs
-      (`bench/kernel-races/RESULTS.md`, "§8 acceptance"), **not met**: W2's
-      worst case costs 11 to 16x in writes/s and 100 ms at p99 (TAIL_GRACE, first
-      look there), and the commit-heavy row's per-commit p50 is 17 to 50 % up on
-      the disk stores in the full cell, though not on a fresh file system with
-      any of base, K1-F2 alone, final, or final with the workarounds off;
-      everything else met; §8.1 recorded.
+      (`bench/kernel-races/RESULTS.md`, "§8 acceptance" and "§8 acceptance on
+      main"): met but for W2's worst case with keep-cache off, accepted (§8);
+      the commit-heavy row's rise did not reproduce; §8.1 recorded.
       **§7.3 (a) met, 2026-10-24:** the stress lane (xcheckfs `dd18db3`,
       `--check thorough`, 47 stages, `stress-ng` 40 s per stressor, `--link 1` in
       the mix) plus one thread opening and closing the files it writes, on an
@@ -1869,7 +1884,7 @@ decided on this measurement:
       `fpunch`, `iomix` and `xattr` when the trees are on different file
       systems (its own rule). **§7.3 (b)** (`pc_race` and `nlink_race` through
       the xcheckfs mount) and the base build's run were **not** part of this
-      pass; the item stays open for them.
+      pass; they ran on 2026-10-30 (below).
       **K7 completed, 2026-10-30** (RESULTS.md, last sections): §8 rerun on main (above: W2's
       worst case found and fixed where the evidence allows, the rest reported with its cause;
       commit-heavy not reproduced; nothing else of plan 42 beyond noise); **§7.3 (b)** on the
@@ -1879,20 +1894,24 @@ decided on this measurement:
       474 and 749; **§7.4** on the final build, two seeds, five profiles, both transport names:
       120 of 120 passed, `repairs_late` 0.
 
-- [ ] Every CONVENTIONS gate green; pjdfstest 8798/8798; `stress-ng-fs`
+- [x] Every CONVENTIONS gate green; pjdfstest 8798/8798; `stress-ng-fs`
       within its baseline.
       2026-10-30, the final build: fmt and clippy clean; the lib tests of frontend-fuse,
-      harness, engine, meta and authority pass (on main `8f5af546`); pjdfstest 8798/8798 on
-      `/dev/fuse` and on the ring; smoke passed; `stress-ng-fs` passed and every
-      `kernel-race-*` row passed in the full `harness run` catalogue: 264 passed, 20 skipped
-      (no root, no `sqlite3`, no ring on that host), **10 failed**. Rerun twice each with the
-      final and with main: `git-under-flock-faults`, `holder-crash-phantom-new-holder`,
-      `idle-cluster-is-quiet`, `session-wait-degrades` and `takeover-marker-strands-promptly`
-      fail on main as on the final (lease, takeover and recovery paths, outside plan 42);
-      `distant-bigfile-stable` misses its floor by under 10 % on both builds;
-      `session-ryw-after-holder-kill` passed once in two reruns on the final and never on main;
-      the other three passed every rerun. Open until
-      the catalogue is green on main.
+      harness, engine, meta and authority pass; pjdfstest 8798/8798 on `/dev/fuse` and on
+      the ring; smoke passed; `stress-ng-fs` passed and every `kernel-race-*` row passed.
+      The full `harness run` catalogue on main `77bf428e`, with the two harness fixes
+      after it (`64a4bad1`, `b4f8aecf`): 275 passed, 19 skipped (no `sqlite3`, no FUSE
+      io_uring, no root for passthrough and zero-copy), 1 failed: `idle-cost`,
+      ENOSPC on the test box's disk during co-located load; it passed 2 of 2 alone. The
+      earlier failures were a harness build from before `6d53adde` (four scenarios) and
+      harness bugs fixed in `77bf428e`, `64a4bad1` and `b4f8aecf`; none was in plan 42.
+
+Follow-ups (not criteria of this plan):
+
+- The kernel-release table of §5.4 stays empty until the patch package is merged
+  upstream; until then detection is by the probes and the overrides. On a kernel
+  with 0001's fix W2 is off and its worst-case cost (§8) is gone.
+- The 2a exposure in bounded mode is a decision (Q1), not an open item.
 
 ## 12. PROGRESS.md
 
