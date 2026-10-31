@@ -1684,6 +1684,26 @@ once (it would acknowledge a row the generation's end may still drop). The
 format is append-only: `DelegGroup` is a new `LogRecord` variant and the
 table's persisted row is unchanged (a key of its own per generation).
 
+**C2c follow-up and C3, in part (plan 43, 2026-10-31)**: a delegate's
+committed answer is committed wherever it is held, and the delegate taking
+the root over re-appends its own rows verbatim. A requester's shadow or hint
+of a delegate's committed answer is a committed entry, as a root's is: a
+root takeover does not roll it back (the delegate re-streams the row to the
+next root, whose append takes the shadow out in place), and the takeover gate
+takes the successor's own such shadow out only if the tail it re-applies
+carries the row. A subscriber's stream entry of the root's append of a
+delegate's row is committed as the root's own rows are, and the successor's
+re-ship of such a row leads with its `TailOf` too, which the stream entry and
+a deposed root's member copy retire by. A delegate that seals the root and
+takes it over re-appends the rows of its own generations that the tail does
+not carry after the tail, under their stream origin and in index order (C3
+§5.4 item 3, without the member-copy move: the strand still rolls them back
+first, and a generation the tail ends keeps the replay); they were executed
+again by rid, and reached the log as root rows of the new tenure. (Found by
+the `placement-hot` sweeps: I2c, I5.) Not yet: a deposed root rebuilt from
+the log still queues the rows it appended for other generations as
+`Records` replays (C3 §5.4 item 4).
+
 
 ## ADR-34: Kernel FUSE race workarounds
 

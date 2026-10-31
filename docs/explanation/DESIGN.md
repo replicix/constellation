@@ -926,6 +926,13 @@ lease and one log
   end (it held the generation before a reboot) does not take it up again,
   so the end goes through that backup or the root's cursor
   ([ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)).
+  A delegate's committed answer stays committed across a root takeover: the
+  requester's shadow of it is not rolled back (the delegate re-streams the
+  row to the next root), a subscriber's stream entry of the root's append of
+  it retires by the successor's re-ship, which names it (`TailOf`), and a
+  delegate that takes the root over re-appends its own rows the tail lacks,
+  verbatim under their stream origin, before its generation ends
+  ([ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)).
 - **Cross-subtree ops** (renames and hard links across delegations,
   `rmdir` or rename of a delegated root) go to the root, which *recalls*
   the delegations involved first (the delegate drains and stops, or is

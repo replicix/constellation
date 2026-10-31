@@ -62591,3 +62591,82 @@ and `--tests` (158 + 66), vfs (69), engine lib (938, after a full disk had faile
 `platform-parity.toml` and the parity list carry the new scenario) pass. Harness, three runs each, all green:
 `kernel-race-{dir-version,rename-ctime,dir-version-remote}` and their `-plus` rows, each on both transports, and
 `readdirplus-held-remote` (one `redone=1` in 48 row results, under load).
+## The `placement-hot` seeds: a delegate's committed rows across a root takeover (2026-10-31)
+
+`placement-hot` (four nodes, two directories placed by the root, backups, renames across them) failed seeds 15, 68 and
+311 on main. Swept over seeds 0 to 1,999 at `cb73633d`: 16 failing seeds without the knob and 13 with
+`AUTHORITY_SIM_LEASE_READS=0:0:800:1000`, under four signatures. Every other configuration of the gate list was clean.
+
+### What was wrong
+
+1. **I2c, a delegate taking the root over (integrity; 10 seeds without the knob, 9 with).** A delegate that is also
+   the root's backup seals the root and takes it over with its own rows of the generation still in its journal, rows
+   its group committed and the clients were answered (`DelegGroup`). The gate strands them ahead of the predecessor's
+   tail (`Meta::strand_for_takeover`, delegated-holder-cut seed 772) and re-executed them by rid after it: the log
+   carried them as root rows of the new tenure, re-stamped, not under their stream origin (seed 15: the delegate's
+   `unlink f0`, answered at `(12, 6)`, completed in segment 77 with origin `(0, 0)`). Now
+   (`Core::reappend_own_delegate_rows`, plan 43 C3 §5.4 item 3 without the member-copy move) the rows are re-appended
+   after the tail, verbatim under their origin, in journal order, skipping what the tail or the log carries; from the
+   first row that does not continue its stream (a generation the tail ends, an index gap, a lost dependency, a row
+   without an outcome, an apply error) the rest is left to the replay as before. Their replays leave the queue; the
+   generation still ends at the gate, at the log's index, which now includes them.
+2. **I5, a delegate's committed answer rolled back at a root takeover (integrity; seeds 539, 1746, 1798; 675 and 1326
+   with the knob).** A requester's shadow of a delegate's committed answer was not a committed entry (`gated:
+   committed && gen == 0`, plan 43 C1-4 predates the delegate's group acknowledgement), so the next root's first segment
+   rolled the acknowledged row back on the requester and queued it. It is committed now; the successor's own gate takes
+   such a shadow out only if the tail it re-applies carries the row (`superseded_by_takeover`'s `carried`), else the
+   delegate's re-stream replaces it in place. Likewise a subscriber's stream entry of the root's append of a delegate's
+   row was never committed (`committed && tx.origin == (0, 0)`): it takes the batch's flag now, the successor's re-ship
+   of such a row leads with its `TailOf` too, and a committed stream entry of an earlier tenure whose rid a segment
+   completes under no identity it names (the next root appended the delegate's re-stream) is retired by it (review). A
+   namespace rebuild queues a delegate's committed shadow as before (its generation may have ended in the rebuilt log).
+3. **`member_copies_drained` (cleanup; seeds 904, 1430; 593 with the knob).** A deposed root that rebuilds its namespace
+   from the log adopts what that log says of each epoch's tail but ran no drop rule for the member copy it already held
+   (seed 904: two refusals of epoch 1 its successor had re-shipped). `Meta::replace_ns_from_rebuilt` now drops the rows
+   the adopted facts settle (`member::drop_settled_rows_tx`). Seeds 1430 and 593 (the root's appends of delegate rows
+   in the copy) are covered by the `TailOf` of item 2.
+4. **I5, the oracle (sim; seed 68; 209 and 1654 with the knob).** I5 took a rid for a rolled-back group answer when its
+   rollback came *before* the answer: a lone root's own row rolled back by its deposition and its replay answered by the
+   next root's group, or a journaled refusal gone before another node's answer. The rollback of each rid is dated
+   (`Shared::rolled_back_at`, the oracle tick at which the rid enters the replay queue or its refusal leaves the
+   journal); I5 judges the answers given before it.
+
+Open (known gap, C3 §5.4 item 4): a deposed root rebuilt from the log still queues the rows it appended for other
+generations as `Records` replays: seed 593 with the knob (I5, its member-copy failure on main hid it).
+
+### Fail-before
+
+- Sim, on main: the pinned seeds of `regression_a_delegate_taking_the_root_over_re_appends_its_rows` (15, 311, 590),
+  `regression_committed_delegate_rows_survive_a_root_takeover` (539, 1746, 1798; 675 with slow lease reads) and
+  `regression_placement_hot_rollback_order_and_rebuilt_member_copies` (68, 904; 209 with slow lease reads) all fail
+  (the sweeps above). `delegated-holder-cut`, unclocked, seeds 0 to 299: `+identity` fails 29 seeds with I2c on main,
+  `+lone` 142 with I5; none with the fix (`c3_a_delegates_rows_complete_verbatim`,
+  `c2_a_delegates_committed_answer_is_never_rolled_back`, which replace the two C0 tests that asserted those
+  violations still existed). Oracle totals over seeds 0 to 299 (clocked): `delegated-holder-cut` i2c 60 → 0, i5
+  272 → 0; `long-delegated-late-answers` i2c 125 → 0.
+- Core: `the_takeover_gate_strands_own_rows_of_a_generation_the_core_does_not_hold` (the tail first, then the own rows
+  verbatim under their origin, nothing queued; on main the journal held none of them) and
+  `a_root_ending_a_generation_its_takeover_stranded_cuts_it_at_the_log` (the cut is the log's index, 2 now; a dependency
+  on a re-appended row is not lost).
+- Meta (`member_copy.rs`): `a_delegates_committed_shadow_survives_a_root_takeover`,
+  `the_takeover_gate_keeps_a_delegates_committed_shadow_its_tail_lacks`,
+  `a_rebuild_drops_the_member_rows_its_log_re_shipped`; the first and the third fail on main, the second's not-carried
+  half too (with `strand_for_takeover`).
+- Oracle: `i5_judges_only_the_answers_before_the_rollback`.
+- `c0_i4_finds_a_late_landing`: 58 moved (no late landing now); its place is 98 (18 of seeds 0 to 300 qualify,
+  unclocked).
+
+### Sweeps, seeds 0 to 1,999 (release, 8 threads; main and the fix, with and without the knob)
+
+`placement-hot`: main 16 and 13 failing seeds, the fix 0 and 1 (593, the open item above). `long-delegated`,
+`long-delegated-backup`, `shared-dir-split`, `delegated-two-gens-backed`, `-backlog`, `-one-backed`, `-root-crash`,
+`delegated-holder-cut`, `delegated-backup`: 0 on both, both ways. `backup`, `backup-crash`, `long-backup`,
+`long-acks3`, `backup-hot` (the fix, without the knob): 0.
+
+### Gates (box)
+
+`cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean. Lib tests: authority 832,
+meta 380, meta `member_copy` 18, engine `authority_driver` 35 (no failures). `cargo test -p constellation-authority
+--release --test sim`: 295 passed (11 ignored). (`holder_capture`'s `an_old_recall_record_keeps_the_inferred_cut`
+fails on main as with the fix: the path B follow-ups (item 5) persist a legacy `Recall`'s cut, the test still expects
+none.)
