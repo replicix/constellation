@@ -1309,6 +1309,26 @@ impl Meta {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Plan 43 C3: this node's unshipped transactions of delegation origin
+    /// `gen` journaled as a lease holder, as `(idx, last journal seq)` in
+    /// index order: one range read over `journal_origin`, a head per row.
+    pub fn holder_appends(&self, gen: u64) -> Result<Vec<(u64, u64)>, MetaError> {
+        if gen == 0 {
+            return Ok(Vec::new());
+        }
+        let r = self.db.read_tx();
+        let mut out = Vec::new();
+        for found in journal_origins_from(&r, self, gen, 0)? {
+            let (idx, first) = found?;
+            if let Some(head) = get_journal_tx_head(&r, self, first)? {
+                if head.epoch != 0 {
+                    out.push((idx, head.last));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// At open: the tip from the unshipped journal's heads.
     pub(crate) fn refresh_holder_append_tip(&self) -> Result<(), MetaError> {
         let r = self.db.read_tx();

@@ -274,6 +274,16 @@ impl StreamCache {
     }
 }
 
+/// What [`Core::holder_append_cap`] of a generation was computed from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HolderCapStamp {
+    tip: u64,
+    shipped: u64,
+    out_of_order: (usize, u64),
+    durable: u64,
+    holds: bool,
+}
+
 /// What a generation this node delegates has committed for its
 /// acknowledgements ([`Core::deleg_caps`]): the prefix the log carries, or
 /// its group holds with every row's dependencies on this node's other
@@ -598,6 +608,11 @@ pub(crate) struct DelegationState {
     cert_set: bool,
     /// The generations this node is the delegate of.
     pub mine: BTreeMap<u64, DelegateState>,
+    /// Plan 43 C3: per generation, the highest index below this node's
+    /// first holder append its tenure has not committed, with what it was
+    /// computed from (`Core::holder_append_cap`): recomputed only when one
+    /// of those changed.
+    pub holder_caps: BTreeMap<u64, (HolderCapStamp, u64)>,
     /// Plan 43 C2d: what [`Core::report_deleg_durable`] last told the
     /// replica's session, per generation.
     pub reported: BTreeMap<u64, constellation_meta::DelegDurable>,
@@ -2510,33 +2525,67 @@ impl Core {
         }
         match replica.holder_append_of(gen, idx) {
             Ok(None) => false,
-            Ok(Some(last)) => {
-                let holds = self.lease.held.is_some() && !self.lease.lost;
-                let durable = self.durable_jseq();
-                let backed = holds
-                    && (self.ack.shipped_rows.contains(&last)
-                        || (durable != u64::MAX && last <= durable));
-                !(last <= shipped || backed)
-            }
+            Ok(Some(last)) => !self.holder_append_committed(last, shipped),
             Err(_) => true,
         }
     }
 
-    /// `through` of generation `gen`'s stream lowered below the first of
-    /// this node's holder appends of it that its tenure has not committed
-    /// ([`Self::holder_append_uncommitted`]): those form a suffix (a
-    /// journal commits in order, and the appends are in index order).
-    pub(crate) fn below_holder_appends(
-        &self,
-        gen: u64,
-        through: u64,
-        replica: &dyn Replica,
-    ) -> u64 {
-        let mut t = through;
-        while t > 0 && self.holder_append_uncommitted(gen, t, replica) {
-            t -= 1;
+    /// Whether this tenure committed its journal row ending at `last`
+    /// (shipped through `shipped`, or out of order, or on every committed
+    /// backup of a tenure that still holds and is not lone).
+    fn holder_append_committed(&self, last: u64, shipped: u64) -> bool {
+        let holds = self.lease.held.is_some() && !self.lease.lost;
+        let durable = self.durable_jseq();
+        last <= shipped
+            || holds
+                && (self.ack.shipped_rows.contains(&last)
+                    || (durable != u64::MAX && last <= durable))
+    }
+
+    /// The highest index of generation `gen` below this node's first holder
+    /// append of it, in index order, that its tenure has not committed
+    /// (`u64::MAX`: none). Not a walk down from a prefix: rows ship out of
+    /// order (`ack.shipped_rows`), so a higher row may be in the log while a
+    /// lower one is held (a chunk upload it waits for); the scan goes up
+    /// from the log's floor. Cached per generation and recomputed only when
+    /// what it is computed from changed (the appends' tip, the shipped
+    /// watermark and out-of-order set, the durable watermark, the lease):
+    /// the fast path's report asks it every event for a generation a
+    /// takeover stopped. A store error caps at 0 for this call, uncached.
+    pub(crate) fn holder_append_cap(&mut self, gen: u64, replica: &dyn Replica) -> u64 {
+        let tip = replica.holder_append_tip();
+        if tip == 0 {
+            return u64::MAX;
         }
-        t
+        let shipped = replica.journal_acked_seq().unwrap_or(0);
+        if tip <= shipped {
+            self.dl.holder_caps.remove(&gen);
+            return u64::MAX;
+        }
+        let stamp = HolderCapStamp {
+            tip,
+            shipped,
+            out_of_order: (
+                self.ack.shipped_rows.len(),
+                self.ack.shipped_rows.last().copied().unwrap_or(0),
+            ),
+            durable: self.durable_jseq(),
+            holds: self.lease.held.is_some() && !self.lease.lost,
+        };
+        if let Some((s, cap)) = self.dl.holder_caps.get(&gen) {
+            if *s == stamp {
+                return *cap;
+            }
+        }
+        let Ok(appends) = replica.holder_appends(gen) else {
+            return 0;
+        };
+        let cap = appends
+            .iter()
+            .find(|(_, last)| !self.holder_append_committed(*last, shipped))
+            .map_or(u64::MAX, |(idx, _)| idx.saturating_sub(1));
+        self.dl.holder_caps.insert(gen, (stamp, cap));
+        cap
     }
 
     /// [`Self::deleg_stream_state_with`] with what it reads cached across
@@ -2673,6 +2722,12 @@ impl Core {
         }
         let caps = self.deleg_caps(&mut |g| replica.log_stream_idx(g), replica);
         self.deleg_xgen_measure(now, &caps, replica);
+        let gens: Vec<u64> = self.dl.mine.keys().copied().collect();
+        self.dl.holder_caps.retain(|g, _| gens.contains(g));
+        let holder_caps: BTreeMap<u64, u64> = gens
+            .into_iter()
+            .map(|g| (g, self.holder_append_cap(g, replica)))
+            .collect();
         self.stats.deleg_caps_calls = self
             .dl
             .caps_calls
@@ -2689,9 +2744,11 @@ impl Core {
             let through = caps.get(&d.gen).map_or(uncapped, |c| c.committed);
             // The prefix is floored at the log's index, which this node's own
             // holder appends raise (a takeover gate's re-append): the fast
-            // path's waiter, whose high-water outlives `lost`, would take
-            // such a row on this disk alone for committed.
-            let through = self.below_holder_appends(d.gen, through, replica);
+            // path's waiter, whose high-water (`deleg_covered`) outlives
+            // `lost` and the generation's withdrawal, would take such a row
+            // on this disk alone for committed, now or after the report
+            // that withdraws the generation.
+            let through = through.min(holder_caps.get(&d.gen).copied().unwrap_or(u64::MAX));
             // The fast path answers its own node's clients from the FUSE
             // thread, where the core does not see it: every index committed
             // may have been answered — as a `DelegGroup` row journaled
@@ -5687,7 +5744,9 @@ impl Core {
         // a node deposed before its gate's segment ships): the next root's
         // log would lack a row the cut covers.
         let through = if replica.delegate_stranded(gen) {
-            self.below_holder_appends(gen, replica.log_stream_idx(gen), replica)
+            replica
+                .log_stream_idx(gen)
+                .min(self.holder_append_cap(gen, replica))
         } else {
             replica.delegate_idx(gen)
         };

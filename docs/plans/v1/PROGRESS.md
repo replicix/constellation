@@ -63189,3 +63189,33 @@ engine (every target) 948, control 146, release sim suite 300 passed. Seeds 0 to
 `delegated-holder-cut +commit`: no `deleg-group` failure either way (the lone-root answers now wait for the archive);
 what fails is the `archive/*` class (C2f) and, with the knob, `root-group` 1069, 1434, 1464, 1531 (open on main). Flags
 off: `deleg-group` uncommitted 0 both ways, I2, I2c, I4, I5 unchanged.
+
+### Re-review: out-of-order shipping, the cap's cost, the uncaptured window (2026-10-31)
+
+- **Out-of-order shipping (over-cover).** The watermark's and the recall cut's walk down from the prefix assumed holder
+  appends commit in journal order, but rows ship out of order (`ack.shipped_rows`): with a lower re-appended row still
+  held and a higher one shipped, the walk stopped at the higher one and covered the lower. `Core::holder_append_cap`
+  now scans the generation's unshipped holder appends upward once (`Meta::holder_appends`, one range read) and caps at
+  the first one not committed. Test: core `a_higher_row_shipped_out_of_order_does_not_cover_a_lower_re_appended_one`
+  (fails on `a759bf3a`: `Durable` for the lower row).
+- **Cost.** The cap is cached per generation with what it was computed from (the appends' tip, the shipped watermark,
+  the out-of-order set's size and top, the durable watermark, the lease) and recomputed only when one changes; a node
+  whose appends all shipped, or that never made one, pays one atomic load.
+- **The uncaptured window, by reading.** `set_holder_epoch(0)` (deposition `jobs.rs` `mark_lost` path, the releases,
+  the continuation epoch's close in `promise.rs`, the start) runs inside the core's step; the same step ends with
+  `backup_after_event` → `report_durable` (the session's gate, watermark and `lost`) and `report_deleg_durable`, and the
+  driver refreshes the lease view's mirror right after `Core::handle`, before dispatching, inside one
+  `priority_writes` (`authority_driver.rs`, `step`). `priority_writes` only orders writers; it excludes none, so a
+  fast-path write admitted before the deposing step can still journal after `set_holder_epoch(0)`, uncaptured. Its answer: a gated row waits in `wait_durable` for a watermark that cannot cover a
+  row journaled after it, and the deposition's report says `lost` (in doubt, resubmitted by rid); a release is fenced
+  by its releasing flag and quiescence before the step that clears the epoch; with the gate off (a lone holder, or a
+  continuation epoch's close) the answer is re-tagged `Lone` (`local_ack_durable`'s `Ungated` arm), the lone branch's
+  contract, and a deposition's rebuild replays the row by rid. So no gated answer leaves on that row alone; no code
+  change. Not tested: the race is between a FUSE thread and the core's step, which the core harness and the
+  simulation do not interleave.
+- Nit: `report_deleg_durable`'s note says the waiter's high-water outlives the generation's withdrawal too.
+
+Gates: fmt, clippy (workspace, all targets, `-D warnings`); authority lib and `meta_repro` 857, meta (every target) 536,
+engine (every target) 948, control 146, release sim suite 300 passed. Seeds 0 to 1,999, with and without the knob: the
+25 configurations 0, but `placement-hot` 593 with the knob (open on main). `delegated-holder-cut +commit`: no
+`deleg-group` failure either way; flags off, I2, I2c, I4, I5 as before.

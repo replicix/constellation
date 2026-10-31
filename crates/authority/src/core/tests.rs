@@ -41228,6 +41228,66 @@ mod deleg_group {
         );
     }
 
+    /// Two re-appended rows, the higher one's segment landed first (rows
+    /// ship out of order: the lower one waits, for a chunk say): neither the
+    /// fast path's watermark nor a recall's cut may cover the lower one.
+    /// Fails on `a759bf3a` (its walk down from the prefix stopped at the
+    /// shipped higher row: `Durable` for (7, 1), cut 2).
+    #[test]
+    fn a_higher_row_shipped_out_of_order_does_not_cover_a_lower_re_appended_one() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        let _ = forward_create(&mut h, dir, 1, 500);
+        let _ = forward_create(&mut h, dir, 2, 501);
+        h.hold(
+            2,
+            Some(PendingGate {
+                epoch: 2,
+                takeover: true,
+                marker_shipped: true,
+                drained: false,
+                fast_prev: false,
+                backup_tail_epoch: Some(1),
+                shippable: true,
+            }),
+        );
+        h.core.ack.eligible = Some(true);
+        let mut out = Vec::new();
+        h.core.complete_gate(h.clk(), &h.meta, &mut out);
+        assert_eq!(h.core.stats.own_deleg_rows_reappended, 2);
+        assert_eq!(h.meta.log_stream_idx(7).unwrap(), 2);
+        let last = |h: &Harness, idx| h.meta.holder_append_of(7, idx).unwrap().expect("appended");
+        let (last1, last2) = (last(&h, 1), last(&h, 2));
+        assert!(last1 < last2);
+        h.core.ack.shipped_rows.insert(last2);
+        h.core.report_deleg_durable(h.clk(), &h.meta);
+        let wait = |h: &Harness, idx| {
+            h.meta
+                .session()
+                .wait_deleg_durable(7, idx, std::time::Duration::ZERO)
+        };
+        assert!(
+            !matches!(wait(&h, 1), constellation_meta::DurableWait::Durable(_)),
+            "the lower, unshipped row covered: {:?}",
+            wait(&h, 1)
+        );
+        let dir = h.core.dl.mine[&7].dir;
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegRecall {
+                req: OpId(78),
+                dir,
+                gen: 7,
+            },
+        });
+        let cut = sends(&out).into_iter().find_map(|(to, m)| match m {
+            PeerMsg::DelegRecalled {
+                gen: 7, through, ..
+            } if to == 1 => Some(*through),
+            _ => None,
+        });
+        assert_eq!(cut, Some(0), "{out:?}");
+    }
+
     /// A recall of the stopped generation answered before the new tenure
     /// commits the re-appended row cuts below it: the next root's log may
     /// never get the row (this node deposed before its gate's segment
