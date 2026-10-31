@@ -62705,3 +62705,70 @@ meta (every target) 535, engine `authority_driver` 35, no failures; release sim 
 seeds 0 to 1,999, with and without the knob: `placement-hot` 0 and 1 (593, open), `long-delegated`,
 `long-delegated-backup`, `shared-dir-split`, the four `delegated-two-gens-*`, `delegated-holder-cut`,
 `delegated-backup` 0.
+
+## Plan 43 G1's p90: the per-append ship nudge and the late stream acknowledgement (2026-10-31)
+
+The maintainer's decision on G1's p90 miss (C2d: rename and unlink over the budget by 0.33 ms, chmod by 13 us): fix
+the per-append ship nudge and the late `DelegateStreamAck`, re-measure on the quiet box, accept what remains. Both
+delays are found and measured below; **neither change lands**: the nudge's fix is the one that pays, and it widens
+the open C3 §5.4 item 4 gap (a deposed root's appends of other generations' rows), so it waits for C3. What lands is
+the measurement tooling.
+
+### The two delays (main `62fa6c7f`)
+
+- **The per-append ship nudge** (`Core::on_delegate_stream`, `delegate.rs:6815`): every appended batch arms the poll
+  at 0, so a backed root runs a sync round, one segment PUT, per delegate op. The completions take the root's core
+  ahead of the next batch (S3 results are on the driver's internal lane, which the biased select of
+  `authority_driver.rs:2623` takes before the request lane), and each segment comes back to the delegate (a
+  log-stream subscriber) as a `LogStream` frame its core applies.
+- **The late acknowledgement**: `PeerDelegateStreamAck` goes to the delegate's core on the request lane
+  (`p2p.rs:667`), the lane taken last, behind those frames and the root's backup appends (topology 3's delegate is
+  also the root's backup): the ack is sent when the row is journaled, but handled after the frames of the rounds
+  the nudge started.
+
+Box 1, main, release with debug logging, topology 3, 200 samples: per 5 s the root's core handled 1,776 `SegmentPut`
+completions (733 ms busy) beside 2,203 `DelegateStream` batches (661 ms); the delegate's core 1,792 `LogStream` frames
+(375 ms, up to 3 ms each), 2,114 `BackupAppend` (299 ms) and 2,114 acknowledgements (37 ms). Of 3,803 batches, the
+delegate's send to the root's handling took p50 133 / p90 173 us, the root's handling to the delegate's handling of
+the acknowledgement p50 188 / p90 1,478 us: the tail is after the root takes the batch.
+
+### What each fix does (ABBA on box 1 against main, 8 rounds each, 200 samples, `bench/commit-rule/g1-abba.sh`)
+
+Medians of the runs' p50 / p90, us, topology 3's delegate (topology 2's holder in brackets, main):
+
+| op | ack on the urgent lane only (load < 1 from round 4) | the round deferred (load 18-21) |
+|---|---|---|
+| create | 499 / 1,120 -> 494 / 1,022 (383 / 717) | 1,222 / 2,367 -> 790 / 1,164 (784 / 1,814) |
+| rename | 490 / 1,301 -> 488 / 1,421 (267 / 468) | 1,202 / 2,508 -> 741 / 1,129 (390 / 1,095) |
+| unlink | 495 / 1,356 -> 482 / 1,407 (265 / 380) | 1,252 / 2,556 -> 714 / 1,064 (364 / 844) |
+| chmod | 451 / 630 -> 432 / 757 (228 / 373) | 1,114 / 2,256 -> 665 / 1,005 (305 / 788) |
+
+- **The acknowledgement on the urgent lane** (`hand_stream_ack`): no gain. The ack waits for the frame being
+  applied, not for the queue.
+- **A backed root ships appended rows with its next regular round** (within one sync interval; at once under
+  `ack=s3` or without a listed backup): p90 down by 51-58 % under load (a first run with both changes at load 2-36:
+  rename 541 / 2,254 -> 426 / 1,443, unlink 549 / 2,155 -> 395 / 1,402, chmod 477 / 2,050 -> 353 / 1,258). Its
+  core test fails before (every batch armed the poll at 0).
+
+### Why the deferral does not land
+
+Sweeps, seeds 0 to 1,999, main / the deferral: `placement-hot` with `AUTHORITY_SIM_LEASE_READS=0:0:800:1000` **1 / 3**
+(593 / 928, 937, 953: I5, a `deleg-group` answer rolled back at a root takeover, the shape of the open C3 §5.4 item 4
+gap the `placement-hot` entry above names); without the knob 0 / 0; `long-delegated`, `long-delegated-backup`, the four
+`delegated-two-gens-*`, both ways, 0 / 0. `delegated-no-backup-root-near` (`c0_run`, seeds 0 to 5,999), `deleg-group`
+answers committed by none: 36 / 48 (0-1,999: 10 / 20, 2,000-5,999: 26 / 28), the known C3 and C5 (D10 alignment)
+shapes. Two pinned sim tests move with it (`c0_i4_finds_a_late_landing` 31, 75, 98 -> 8, 10, 70; seed 13 of
+`delegated_no_backup_root_near_acknowledges_through_the_root`, a `Lone` answer the oracle's stability window
+judges). The prompt ship is what narrows the window in which a root that is about to be deposed holds acknowledged
+delegate rows only in its journal. The deferral can land with C3 §5.4 item 4 (re-run `placement-hot` with the knob).
+
+### What lands
+
+- `ack-latency`: `ACK_LATENCY_TOPOLOGIES` (e.g. `2,3`) runs only the named topologies.
+- `bench/commit-rule/g1-abba.sh`: two daemon builds in ABBA order with a load gate, its own docker prefix, and the G1
+  verdict per op (delegate p50 / p90 against the holder's + 500 us).
+- `bench/commit-rule/run.sh` built a package that does not exist (`constellation-cli`; the binary's package is
+  `constellation`).
+
+Gates: `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean; the authority,
+meta and engine crates are main's (their lib tests and the sim suite unchanged by construction).
