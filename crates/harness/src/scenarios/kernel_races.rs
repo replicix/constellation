@@ -25,7 +25,7 @@ use super::{eventually, setup, ts};
 use crate::client::Client;
 use crate::kernel_races::{
     dir_version, flock_turns, nlink_race, one_write, pc_prepare, pc_race, read_then_write,
-    rename_ctime, reopen_matches_view, Dropper, PcConfig, PcCounts, WriteShape,
+    rename_ctime, reopen_matches_view, Dropper, Listing, PcConfig, PcCounts, WriteShape,
 };
 use crate::s3env::{S3Env, BUCKET};
 use anyhow::{ensure, Context, Result};
@@ -758,21 +758,24 @@ twice!(
 
 const HOLD: Duration = Duration::from_millis(200);
 
-/// A plus row's directory was just made on this node: wait until the
-/// kernel no longer holds its name from the `MKDIR` reply, which a plus
-/// page hands name-only (`held`), so that from the first round on the
-/// page carries the directory's attributes to hold.
-fn past_the_mkdir_hold(plus: bool) {
-    if plus {
-        std::thread::sleep(Duration::from_millis(1500));
-    }
-}
-
 /// The mount's `READDIRPLUS` entries handed with attributes so far.
 fn plus_entries(c: &Client) -> Result<u64> {
     Ok(mount_status(c, None)?["readdirplus_entries"]
         .as_u64()
         .unwrap_or(0))
+}
+
+/// The mount's `(READDIRPLUS entries with attributes, name-only entries
+/// handed as held)` so far: a plus row's page must carry the attributes of
+/// the name it holds, and a name the kernel holds from a lookup within its
+/// TTL is handed name-only instead (plan 40). The listing is `dir`'s, the
+/// rounds' wait out of the hold is `Listing::settle`'s.
+fn plus_seen(c: &Client) -> Result<(u64, u64)> {
+    let m = mount_status(c, None)?;
+    Ok((
+        m["readdirplus_entries"].as_u64().unwrap_or(0),
+        m["readdirplus_name_only_why"]["held"].as_u64().unwrap_or(0),
+    ))
 }
 
 /// `plus` (plan 40 P9): the held reply is a `READDIRPLUS` page of the
@@ -796,9 +799,18 @@ fn race_dir_version(name: &str, wire: Wire, plus: bool) -> Result<()> {
         let r = (|| -> Result<_> {
             let dir = c.mnt.join("dv");
             std::fs::create_dir(&dir)?;
-            past_the_mkdir_hold(plus);
             let before = plus_entries(&c)?;
-            let counts = dir_version(&dir, 20, HOLD, None, plus.then_some(c.mnt.as_path()))?;
+            let seen = || plus_seen(&c);
+            let counts = dir_version(
+                &dir,
+                20,
+                HOLD,
+                None,
+                plus.then_some(Listing {
+                    dir: c.mnt.as_path(),
+                    seen: &seen,
+                }),
+            )?;
             if plus {
                 ensure!(
                     plus_entries(&c)? > before,
@@ -813,8 +825,9 @@ fn race_dir_version(name: &str, wire: Wire, plus: bool) -> Result<()> {
         result(
             name,
             &format!(
-                "dir_attr_ttl={ttl} {} {}",
+                "dir_attr_ttl={ttl} {} {} {}",
                 counts.line(),
+                m.as_ref().map(plus_line).unwrap_or_default(),
                 m.map(|m| counters_line(&m)).unwrap_or_default()
             ),
         );
@@ -830,6 +843,11 @@ fn race_dir_version(name: &str, wire: Wire, plus: bool) -> Result<()> {
 twice!(dir_version_hold, dir_version_hold_dev_fuse, |n: &str, w| {
     race_dir_version(&name(n).replace("-hold", ""), w, false)
 });
+// On a 7.3-rc4 kernel this row is a guard, not a fail-before: with
+// `CONSTELLATION_FUSE_DIR_CHANGE_NOTIFY=off` it still passes (0 stale in 360
+// rounds, every round's page carrying the directory's attributes), where
+// `kernel-race-dir-version` fails 20 of 20 under the same setting; the
+// kernel does not install the late page's link count there.
 twice!(dir_version_plus, dir_version_plus_dev_fuse, |n: &str, w| {
     race_dir_version(&name(n), w, true)
 });
@@ -850,7 +868,12 @@ fn race_rename_ctime(name: &str, wire: Wire, plus: bool) -> Result<()> {
     c.set_env("CONSTELLATION_FAULT_GETATTR_DELAY_INO", &ino.to_string());
     c.mount()?;
     let before = plus_entries(&c)?;
-    let r = rename_ctime(&dir, 20, HOLD, plus).and_then(|counts| {
+    let seen = || plus_seen(&c);
+    let listing = plus.then_some(Listing {
+        dir: &dir,
+        seen: &seen,
+    });
+    let r = rename_ctime(&dir, 20, HOLD, listing).and_then(|counts| {
         if plus {
             ensure!(
                 plus_entries(&c)? > before,
@@ -910,14 +933,17 @@ fn race_dir_version_remote(name: &str, wire: Wire, plus: bool) -> Result<()> {
                 Ok(())
             },
         )?;
-        past_the_mkdir_hold(plus);
         let before = plus_entries(a)?;
+        let seen = || plus_seen(a);
         let counts = dir_version(
             &dir,
             20,
             HOLD,
             Some(&other),
-            plus.then_some(a.mnt.as_path()),
+            plus.then_some(Listing {
+                dir: a.mnt.as_path(),
+                seen: &seen,
+            }),
         )?;
         if plus {
             ensure!(

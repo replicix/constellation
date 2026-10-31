@@ -28,7 +28,7 @@
 //!   cached for the attribute TTL. The same for a renamed file's
 //!   `ctime`.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use rand::{Rng, SeedableRng};
 use std::ffi::CString;
 use std::fs::File;
@@ -582,11 +582,96 @@ pub fn nlink_race(
 pub struct RoundCounts {
     pub rounds: u64,
     pub stale: u64,
+    /// Attempts whose listing did not hand its name with attributes (a
+    /// held reply that carried none tests nothing), made again.
+    pub redone: u64,
 }
 
 impl RoundCounts {
     pub fn line(&self) -> String {
-        format!("rounds={} stale={}", self.rounds, self.stale)
+        format!(
+            "rounds={} stale={} redone={}",
+            self.rounds, self.stale, self.redone
+        )
+    }
+}
+
+/// How long to wait after the last lookup the harness made before a
+/// listing may carry the looked-up names' attributes. A `READDIRPLUS` page
+/// hands a name the kernel holds from a lookup name-only (`held`, plan 40):
+/// the dentry of a reply with a 1 s entry TTL is held for 3/4 of it.
+pub const PAST_THE_HOLD: Duration = Duration::from_millis(1500);
+
+/// A round whose held reply is a `READDIRPLUS` page (plan 40 P9): the
+/// listing of `dir` from its start, and the mount's counters to check that
+/// the page did carry the name's attributes.
+pub struct Listing<'a> {
+    pub dir: &'a Path,
+    /// The mount's `(READDIRPLUS entries handed with attributes, entries
+    /// handed name-only as held)` so far.
+    pub seen: &'a dyn Fn() -> Result<(u64, u64)>,
+}
+
+impl Listing<'_> {
+    /// Wait out the hold of the lookups made so far (the descriptors
+    /// opened, the directory made), then check that a listing now carries
+    /// the name's attributes: from the first round on the page must. The
+    /// wait follows the last lookup, so it follows the opens: a path walk
+    /// after it holds the names again, and a wait that is missing leaves
+    /// them held, which the check fails on (no rounds are needed to see
+    /// it: a round's own lookups, a load-delayed page, can make a later
+    /// round's page name-only, and that one is made again).
+    fn settle(&self) -> Result<()> {
+        std::thread::sleep(PAST_THE_HOLD);
+        let before = (self.seen)()?;
+        for e in std::fs::read_dir(self.dir)? {
+            e?;
+        }
+        let (entries, held) = (self.seen)()?;
+        ensure!(
+            entries > before.0 && held == before.1,
+            "the listing of {} right after the wait out of the hold handed {} entries with \
+             attributes and {} name-only as held: a lookup the wait does not follow holds the \
+             names, and no round would test the plus page",
+            self.dir.display(),
+            entries.saturating_sub(before.0),
+            held.saturating_sub(before.1)
+        );
+        Ok(())
+    }
+
+    fn start(&self) -> Result<(u64, u64)> {
+        (self.seen)()
+    }
+
+    /// Whether the attempt that began at `before` listed its name with
+    /// attributes and left none name-only: the race it means to hit was
+    /// open. An attempt that did not is made again, once; two in a row
+    /// mean the listing never carries attributes, and the row tests
+    /// nothing.
+    fn exercised(
+        &self,
+        before: (u64, u64),
+        c: &mut RoundCounts,
+        in_a_row: &mut u32,
+    ) -> Result<bool> {
+        let (entries, held) = (self.seen)()?;
+        if entries > before.0 && held == before.1 {
+            *in_a_row = 0;
+            return Ok(true);
+        }
+        c.redone += 1;
+        *in_a_row += 1;
+        ensure!(
+            *in_a_row < 2,
+            "the listing of {} handed no attributes in {} attempts in a row ({} entries with \
+             attributes, {} held since the attempt began): the round tests nothing",
+            self.dir.display(),
+            in_a_row,
+            entries.saturating_sub(before.0),
+            held.saturating_sub(before.1)
+        );
+        Ok(false)
     }
 }
 
@@ -676,14 +761,14 @@ impl Drop for Fd {
 /// The request a round holds: a forced `statx` of `fd`, or a listing of
 /// `listing` from its start (the first chunk of which the kernel asks
 /// `READDIRPLUS` for under `auto`).
-fn held(fd: &Arc<Fd>, listing: Option<&Path>) -> std::thread::JoinHandle<std::io::Result<()>> {
+fn held(fd: &Arc<Fd>, listing: Option<&Listing>) -> std::thread::JoinHandle<std::io::Result<()>> {
     match listing {
         None => {
             let fd = fd.clone();
             std::thread::spawn(move || fd.statx(true).map(|_| ()))
         }
-        Some(parent) => {
-            let parent = parent.to_path_buf();
+        Some(l) => {
+            let parent = l.dir.to_path_buf();
             std::thread::spawn(move || {
                 for e in std::fs::read_dir(parent)? {
                     e?;
@@ -707,21 +792,29 @@ fn held(fd: &Arc<Fd>, listing: Option<&Path>) -> std::thread::JoinHandle<std::io
 /// `listing`: the held reply is a `READDIRPLUS` page instead (plan 40
 /// P9): a thread lists that directory (`dir`'s parent) from the start,
 /// so the page carries `dir`'s attributes as of the read, and the daemon
-/// holds the page for `delay`.
+/// holds the page for `delay`. The page must carry `dir`'s attributes
+/// ([`Listing::exercised`]): the wait out of the hold of the lookups the
+/// opens made comes after them, and a round whose page did not is made
+/// again.
 pub fn dir_version(
     dir: &Path,
     rounds: u64,
     delay: Duration,
     remote: Option<&Path>,
-    listing: Option<&Path>,
+    listing: Option<Listing>,
 ) -> Result<RoundCounts> {
     let d = Arc::new(Fd::open(dir)?);
     let other = remote.map(Fd::open).transpose()?;
+    if let Some(l) = &listing {
+        l.settle()?;
+    }
     let mut c = RoundCounts::default();
-    for _ in 0..rounds {
+    let mut in_a_row = 0;
+    while c.rounds < rounds {
+        let before = listing.as_ref().map(Listing::start).transpose()?;
         let a = d.toggle("a")?;
         d.statx(false)?;
-        let t = held(&d, listing);
+        let t = held(&d, listing.as_ref());
         std::thread::sleep(delay / 2);
         let b = other.as_ref().unwrap_or(&*d).toggle("b")?;
         t.join()
@@ -741,10 +834,14 @@ pub fn dir_version(
             std::thread::sleep(delay + Duration::from_millis(50));
         }
         let st = d.statx(false)?;
-        c.rounds += 1;
-        if st.stx_nlink != 2 + a as u32 + b as u32 {
-            c.stale += 1;
+        let stale = st.stx_nlink != 2 + a as u32 + b as u32;
+        c.stale += stale as u64;
+        if let (Some(l), Some(before)) = (&listing, before) {
+            if !l.exercised(before, &mut c, &mut in_a_row)? {
+                continue;
+            }
         }
+        c.rounds += 1;
     }
     Ok(c)
 }
@@ -759,31 +856,38 @@ pub fn dir_version(
 /// `ctime` a forced one answers. The file is stated through a descriptor
 /// ([`Fd`]), the rename made in the directory's.
 /// `listing`: as for [`dir_version`], the held reply is a listing of
-/// `dir` (the file's directory) from the start.
+/// `dir` (the file's directory) from the start. No round looks a name up
+/// by path before its listing (the rename's own `ENOENT` says a name is
+/// gone): a lookup would hold the name, and the page would hand it
+/// name-only.
 pub fn rename_ctime(
     dir: &Path,
     rounds: u64,
     delay: Duration,
-    listing: bool,
+    listing: Option<Listing>,
 ) -> Result<RoundCounts> {
     let d = Fd::open(dir)?;
     let f = Arc::new(Fd::open(&dir.join("f"))?);
+    if let Some(l) = &listing {
+        l.settle()?;
+    }
     let mut c = RoundCounts::default();
-    for round in 0..rounds {
-        let (src, dst) = if round % 2 == 0 {
+    let mut in_a_row = 0;
+    let mut attempt = 0u64;
+    while c.rounds < rounds {
+        let (src, dst) = if attempt.is_multiple_of(2) {
             ("f", "g")
         } else {
             ("g", "f")
         };
+        attempt += 1;
         let csrc = CString::new(src).unwrap();
         let cdst = CString::new(dst).unwrap();
-        if !d.has(src) {
-            bail!("{src} is gone");
-        }
+        let before = listing.as_ref().map(Listing::start).transpose()?;
         f.statx(false)?;
         // Past the ctime the last change stamped (the clock's granularity).
         std::thread::sleep(Duration::from_millis(5));
-        let t = held(&f, listing.then_some(dir));
+        let t = held(&f, listing.as_ref());
         std::thread::sleep(delay / 2);
         // SAFETY: an open directory descriptor and NUL-terminated names.
         if unsafe { libc::renameat(d.0, csrc.as_ptr(), d.0, cdst.as_ptr()) } != 0 {
@@ -794,12 +898,14 @@ pub fn rename_ctime(
             .context("the forced statx")?;
         let cached = f.statx(false)?;
         let truth = f.statx(true)?;
-        c.rounds += 1;
-        if (cached.stx_ctime.tv_sec, cached.stx_ctime.tv_nsec)
-            != (truth.stx_ctime.tv_sec, truth.stx_ctime.tv_nsec)
-        {
-            c.stale += 1;
+        c.stale += ((cached.stx_ctime.tv_sec, cached.stx_ctime.tv_nsec)
+            != (truth.stx_ctime.tv_sec, truth.stx_ctime.tv_nsec)) as u64;
+        if let (Some(l), Some(before)) = (&listing, before) {
+            if !l.exercised(before, &mut c, &mut in_a_row)? {
+                continue;
+            }
         }
+        c.rounds += 1;
     }
     Ok(c)
 }
