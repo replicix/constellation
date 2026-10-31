@@ -1358,7 +1358,12 @@ of another node's `close()` out of band, with no lock between them
   in-memory lock tables, only as the core could have extended them at
   that moment, under a certificate the core publishes after every step
   (the lease held, usable and not fenced, no epoch or delegation, the
-  freshness rule of a tenure that can be taken over early). It renews
+  freshness rule of a tenure that can be taken over early; with the core
+  stuck, the lane proves that freshness itself by reads of the lease
+  object, dated at their send, overlapping at one per quarter window while
+  a renewal waits, so one slow GET does not cost a grant:
+  [ADR-25](DECISIONS.md#adr-25-cluster-locks-are-leased-grants-from-the-owning-sequencer),
+  amended 2026-10-31). It renews
   this node's own grants at its own table (no later than the lease's
   usable end) and the grants it holds at another owner (until the core has
   been stuck past a bound, 120 s), and never grants, refuses, releases or

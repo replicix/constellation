@@ -593,6 +593,12 @@ pub struct SimConfig {
     /// daemon's usual order: the handlers' stamps first
     /// (`Driver::hand_heard`), as unnumbered beats.
     pub timers_first_after_lag: bool,
+    /// The driver before it handed the core its own pauses and stuck steps
+    /// as lapses (`Event::OwnLag`, the daemon's lag probe and long-step
+    /// hand-off): a holder that wakes from one takes its backups' queued
+    /// acknowledgements for silence and removes them. For a pin whose
+    /// scenario is such a removal.
+    pub own_lapses_unreported: bool,
     /// Plan 43 C7-F F-a's negative control: every numbered beat's arrival
     /// stamp is replaced by its credit, `min(at, sent + M)` (what the seal
     /// watch counts: an instant of the *holder's* clock), before the core
@@ -973,6 +979,7 @@ impl Default for SimConfig {
             live_holder: false,
             beats_lost: false,
             timers_first_after_lag: false,
+            own_lapses_unreported: false,
             beats_credited: false,
             beats_lost_in_lag: false,
             keeps_backups: false,
@@ -3614,6 +3621,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         settle_tagged_writes: cfg.settle_tagged_writes,
         holder_beats: cfg.holder_beats,
         timers_first_after_lag: cfg.timers_first_after_lag,
+        own_lapses_unreported: cfg.own_lapses_unreported,
         beats_credited: cfg.beats_credited,
         beats_lost_in_lag: cfg.beats_lost_in_lag,
         deleg_lane: cfg.deleg_lane,

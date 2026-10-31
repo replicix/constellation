@@ -3579,7 +3579,15 @@ reads (`a_removal_that_empties_the_backup_set_gates_acknowledgements`,
 `a_rerouted_own_op_is_not_answered_from_its_uncommitted_row`; `long-backup`
 seed 1063 without the knob, `a_lone_rollback_is_judged_at_the_answer_its_client_heard`).
 A failing seed is the same run threaded or alone, and names the same pair of
-rids every time.
+rids every time. `delegated-core-stall-root-backup` under the knob is pinned by
+`a_stuck_roots_delegations_survive_slow_lease_reads` (the root probe's
+overlapping reads, ADR-25 amended 2026-10-31, and the renewal that waits for
+the holder's own lease CAS); a holder's own stuck step or pause is handed to its
+core as a lapse and keeps its backup (`a_holder_stuck_in_a_step_keeps_its_backup`,
+`a_paused_holder_keeps_its_backup`; `SimConfig::own_lapses_unreported` is the
+driver before, for a pin whose scenario is such a removal). The sweep prints
+`SWEEP-FAIL <config> seed`, and also `SWEEP-FAILOVER` on every run: count the
+former with the label (`grep -c "^SWEEP-FAIL <config> seed"`).
 `locks-core-stall*` (plan 41 L2/L4, `locks_survive_core_stalls`,
 `locks_survive_core_stalls_in_every_topology`): the core of a lock holder
 that is not the lease holder is stuck in one step for 2 s (over a grant's

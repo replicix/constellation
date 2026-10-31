@@ -62424,3 +62424,74 @@ Test: core `recall_cut::a_dependency_on_another_nodes_generation_waits_for_nothi
 generation held here ahead of the log is not recorded, one check; the own ended generation's still is). Mutation (no
 generation not held here recorded): `a_row_read_after_its_dependencys_generation_left_is_never_answered` answers 8:1
 `Accepted` with the end installed ahead of the log.
+
+## The liveness seeds of the slow-lease sweeps: a stuck root's proof reads, its renewal beside its own CAS, its own lapses (2026-10-31)
+
+Three open items of the slow-lease sweeps (`AUTHORITY_SIM_LEASE_READS=0:0:800:1000`, the five causes above), checked
+against main at `7ea30f8e` first.
+
+### What was wrong
+
+1. **One proof read per window** (`delegated-core-stall-root-backup` under the knob, 249 of 2,000 seeds on main: "a
+   delegation whose root core was stuck below the hung bound was lost"; a product liveness bug). A backed root whose
+   core is stuck answers its delegates' renewals off the core only within `backup_takeover_ms` of the send of a read of
+   its lease object (plan 41 D3), and `RootProbe` allowed one read in flight and one per window. A lease GET of 0.8 to
+   1 s against the 1 s window misses it about one time in eight (the sim's read times out at the window); between a
+   delegate's first renewal (half its grant) and the grant's end that left two or three reads, and two misses in a row
+   lapsed the grant (seed 911: reads at 26.5 s and 27.7 s timed out, the third was back at 29.9 s, 0.4 s after the
+   lapse). Now (ADR-25 amended): a read starts at most once per *stagger*, a quarter of the window; a renewal joins the
+   newest read younger than a stagger and otherwise starts the next; while renewals wait the next read follows a stagger
+   after the last whether or not another renewal arrives (`RootProbe::follow_up`, scheduled by the sim's and the
+   daemon's `spawn_root_probe`); a read that proves nothing hands its renewals to the next one still out (if it was sent
+   within a window of their ask), and one that proves the tenure live wakes the older reads' renewals too. At most four
+   reads are out, a GET per stagger, only while the core is stuck and a renewal waits. Each read is dated at its own send
+   and judged by the unchanged rule.
+2. **A renewal beside the holder's own lease CAS** (seeds 14 and 114 once item 1 was fixed, product). Waking from a stuck
+   step, the root removed its backup (item 3) and its due renewal went out beside the reconfiguration CAS on the same
+   tag: it lost, read the object twice (the failed CAS's body check, then the re-read: two slow GETs) and landed 16 ms
+   after the core had stalled again; the lease it never extended capped every grant to nothing (`Refusal::Cap`) and both
+   delegations lapsed. A due renewal now waits for the holder's own reconfiguration, mark or mark-clear CAS (and their
+   re-reads) while more than a quarter of the TTL is left, and goes on its tag the round after it lands
+   (`Core::renew_waits_for_own_cas`, `renew_after_own_cas`; `lease_renewals_after_own_cas`).
+3. **A holder's own pause or stuck step taken for its backup's silence** (`long-backup` 586's removal of a healthy
+   backup, and every `delegated-core-stall-root-backup` seed). The acknowledgement timeout discounts this node's own
+   lapses (`Event::OwnLag`), but only the shared runtime's lag probe reported any. A driver stuck in one step (the store
+   behind a slow journal write) holds the core up while the probe, on another worker, ticks on: the daemon now hands a
+   step that ran for the lag threshold or longer as an own lapse before the next wake-up (`Driver::step_lapse`,
+   `hand_lag`; product). The simulation's pause (`FaultKind::Pause`, a stopped process, whose lag probe the daemon finds
+   overdue on resuming) reported nothing either (sim model); its driver now hands both, as the daemon does.
+
+`delegated-root-rate-fast` (the seed that "does not finish in 30 minutes"): no longer reproduces. Run alone under a
+120 s timeout per seed, the 2,000 seeds of the parent of `e86d3ab8` all finish but take up to 17.9 s each (main: at most
+0.13 s), and 8 threads did not finish them in 15 minutes: the delegate's lease-read loop `e86d3ab8` fixed (seed 1682),
+here in every seed. Main finishes the sweep in 28 s, with and without the knob.
+
+### Fail-before
+
+Sim: `a_stuck_roots_delegations_survive_slow_lease_reads` (seeds 4, 7, 911, 922 and 936 fail on main; 14 and 114 with
+item 1's fix alone), `a_holder_stuck_in_a_step_keeps_its_backup` (68 ack timeouts and 36 removals in its 12 seeds with
+the sim driver's own-lapse hand-off reverted; it also runs that driver, `SimConfig::own_lapses_unreported`, as its
+control), `a_paused_holder_keeps_its_backup` (main removes the backup). `a_removal_that_empties_the_backup_set_gates_acknowledgements`
+runs with `own_lapses_unreported`, which its scenario (the removal) needs, and asserts the removal. Unit:
+`a_due_renewal_waits_for_the_holders_own_reconfiguration_cas` (fails with the wait disabled: the renewal CAS goes out
+beside the reconfiguration's), `root_probe::a_round_starts_one_read_per_stagger_and_they_overlap`,
+`a_waiting_renewal_has_a_read_follow_every_stagger`, `a_live_read_wakes_its_own_and_the_older_reads_waiters`. Re-pinned
+for the moved trajectories: `a_proof_dated_at_the_return_of_the_read_is_caught` (28, 54, 609 and 828: the mutant now
+fails 5 of 2,000 seeds, not 40, as overlapping reads see a successor sooner), `c0_i4_finds_a_late_landing` (75 for 44).
+
+### Sweeps, seeds 0 to 1,999 (release, 6 threads; main and the fix, with and without the knob)
+
+`delegated-core-stall-root-backup`, `delegated-root-rate-fast`, `long-backup`, `long-delegated`, `long-delegated-backup`,
+`delegated-two-gens-root-crash`, `-one-backed`, `-backed`, `-backlog`, `delegated-core-stall-root`,
+`delegated-core-stall`, `delegated-core-freeze`: 48 sweeps, every one clean on both but `delegated-core-stall-root-backup`
+with the knob, 249 seeds on main and 1 with the fix (300, failing on main too: the root's core stalled within a second of
+its delegate's first renewal, the core held its own answer for a slow lease read of its own, and the lane's first two
+reads missed; the grant was renewed 0.56 s after it lapsed). Not closed: a lease GET slower than the window every time
+proves nothing, by design; a proof that does not ride the GET (the backup's answers to the holder's off-core beats) is
+the follow-up.
+
+### Gates (box)
+
+`cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean. Lib tests: authority 831,
+meta 380, engine `authority_driver` 34 (no failures; `a_core_that_runs_again_during_the_wait_answers_the_renewal_itself`
+now counts the follow-up read). `cargo test -p constellation-authority --release --test sim`: 291 passed (11 ignored).

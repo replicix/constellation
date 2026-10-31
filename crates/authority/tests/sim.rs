@@ -7511,6 +7511,82 @@ fn a_delegate_hung_past_the_bound_is_reclaimed() {
 /// keeps its delegations: its P2P service answers the renewals from outside
 /// the core, so nothing is reclaimed, lapsed or ended; the same seeds without
 /// the answerer lose them (`KNOWN-GAP root core stuck`).
+/// `delegated-core-stall-root-backup` under slow lease reads
+/// (`SLOW_LEASE_READS`, `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`: 249 of
+/// 2,000 seeds lost a delegation on the parent). Seeds 4, 7, 911, 922 and
+/// 936 fail on the parent: with one lease read per freshness window, reads
+/// that missed the 1 s window (a GET of 0.8 to 1 s) lapsed the grant
+/// (`root_probe`: reads now overlap, one per stagger, follow one another
+/// while a renewal waits, and a renewal rides the next read when its own
+/// misses). Seeds 14 and 114 fail with the overlapping reads alone: the
+/// holder, waking from a stuck step, removed its healthy backup (its queued
+/// acknowledgements taken for silence), and the lease renewal that went out
+/// beside the reconfiguration CAS lost it, re-read twice and landed after the
+/// core had stalled again; the lease it never extended capped every grant to
+/// nothing. Either fix closes them: the long step is the node's own lapse
+/// (`a_holder_stuck_in_a_step_keeps_its_backup`), and the renewal waits for
+/// the holder's own CAS (`a_due_renewal_waits_for_the_holders_own_reconfiguration_cas`).
+#[test]
+fn a_stuck_roots_delegations_survive_slow_lease_reads() {
+    let slow = || SimConfig {
+        lease_reads: SLOW_LEASE_READS,
+        ..delegated_core_stall_root_backup_config()
+    };
+    for seed in [4u64, 7, 14, 114, 911, 922, 936] {
+        let label = "delegated-core-stall-root-backup";
+        let r = run_seed(seed, slow())
+            .unwrap_or_else(|e| panic!("{label} seed {seed} (slow lease reads): {e}"));
+        core_stall_check(label, &r).unwrap_or_else(|e| {
+            panic!(
+                "{label} seed {seed} (slow lease reads): {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG={label} AUTHORITY_SIM_LEASE_READS=0:0:800:1000 \
+                 AUTHORITY_SIM_START={seed} AUTHORITY_SIM_SEEDS=1 ... sweep_config"
+            )
+        });
+    }
+}
+
+/// A holder whose core is stuck in one step (6.5, 9 and 12.5 s) keeps its
+/// healthy backup: the backup's acknowledgements queued behind the step, and
+/// the step is this node's own lapse (`Event::OwnLag`, handed by the driver
+/// as the daemon's `Driver::hand_lag` does), which the acknowledgement
+/// timeout discounts. Fail-before: the driver told the core of runtime lags
+/// only (`SimConfig::own_lapses_unreported`, run beside as the control); on
+/// waking, the holder found its backup silent for the whole step and removed
+/// it ("no acknowledgement progress": a reconfiguration CAS, a re-sync from
+/// scratch, and the CAS raced the lease renewal), in every seed.
+#[test]
+fn a_holder_stuck_in_a_step_keeps_its_backup() {
+    use pinned::run_seed;
+    let (mut timeouts, mut removed, mut unreported) = (0u64, 0u64, 0u64);
+    for seed in 0..12u64 {
+        let r = run_seed(seed, delegated_core_stall_root_backup_config())
+            .unwrap_or_else(|e| panic!("delegated-core-stall-root-backup seed {seed}: {e}"));
+        timeouts += r.stats.values().map(|s| s.backup_ack_timeouts).sum::<u64>();
+        removed += r.stats.values().map(|s| s.backups_removed).sum::<u64>();
+        // The driver before, the same seeds: the backup goes.
+        let r = run_seed(
+            seed,
+            SimConfig {
+                own_lapses_unreported: true,
+                ..delegated_core_stall_root_backup_config()
+            },
+        )
+        .unwrap_or_else(|e| panic!("delegated-core-stall-root-backup seed {seed}: {e}"));
+        unreported += r.stats.values().map(|s| s.backups_removed).sum::<u64>();
+    }
+    assert_eq!(
+        (timeouts, removed),
+        (0, 0),
+        "a holder stuck in a step took its backup's queued acknowledgements for silence"
+    );
+    assert!(
+        unreported >= 12,
+        "the holder kept its backup with its stuck steps unreported: the test is vacuous \
+         ({unreported})"
+    );
+}
+
 #[test]
 fn a_root_stuck_in_a_step_keeps_its_delegations() {
     let seeds = 24u64;
@@ -12449,14 +12525,16 @@ fn a_probe_that_ignores_what_it_reads_is_caught() {
 /// held back after (`SLOW_READS`), so a read served before its backup seals it
 /// returns after the successor's CAS; a proof dated at the return (`ProbeMutant::DatedAtReturn`)
 /// would justify answers up to a window after that, past the successor's
-/// takeover, and the probe-dating oracle fails the run. Seeds 28, 54, 78 and
-/// 80 of 0 to 1,999 are four of the 40 that fail with the mutant; the design
-/// passes all 2,000. (Mutual exclusion does not fail with the mutant, even in
+/// takeover, and the probe-dating oracle fails the run. Seeds 28, 54, 609 and
+/// 828 of 0 to 1,999 are four of the 5 that fail with the mutant; the design
+/// passes all 2,000. (They were 40, 78 and 80 among them, with one read per
+/// window: overlapping reads see a successor's CAS sooner, and the epoch's
+/// answers end there, mutant or not.) (Mutual exclusion does not fail with the mutant, even in
 /// 22,000 seeds: the successor's floor and the grant caps carry `3 x expiry
 /// margin` beyond the window.)
 #[test]
 fn a_proof_dated_at_the_return_of_the_read_is_caught() {
-    for seed in [28u64, 54, 78, 80] {
+    for seed in [28u64, 54, 609, 828] {
         run_seed(seed, locks_core_stall_backup_long_slow_reads_config())
             .unwrap_or_else(|e| panic!("locks-core-stall-backup-long-slow-reads seed {seed}: {e}"));
         let e = run_seed(seed, locks_core_stall_backup_long_dated_at_return_config())
@@ -12510,9 +12588,38 @@ fn a_lone_rollback_is_judged_at_the_answer_its_client_heard() {
 /// create it held was acknowledged `Lone`, the peer still in budget. The
 /// holder crashed; the successor took over without the row. It fails
 /// before the assessment counts the listed backups (`backup_select`).
+/// The pause is now this node's own lapse (`Event::OwnLag`, as the daemon's
+/// lag probe reports a stopped process) and the backup is kept
+/// (`a_paused_holder_keeps_its_backup`): the removal is the scenario, so
+/// this pin runs the driver that did not report it
+/// (`SimConfig::own_lapses_unreported`).
 #[test]
 fn a_removal_that_empties_the_backup_set_gates_acknowledgements() {
-    run_seed(
+    let r = run_seed(
+        586,
+        SimConfig {
+            lease_reads: SLOW_LEASE_READS,
+            own_lapses_unreported: true,
+            ..long_backup_config()
+        },
+    )
+    .unwrap_or_else(|e| panic!("long-backup seed 586 (slow lease reads): {e}"));
+    assert!(
+        r.stats.values().map(|s| s.backups_removed).sum::<u64>() > 0,
+        "the holder kept its backup: the pin no longer runs its removal"
+    );
+}
+
+/// `long-backup` seed 586 under slow lease reads, with the driver that hands
+/// a pause to the core as the node's own lapse (the daemon's lag probe,
+/// stopped with the process, is overdue when it resumes): the holder, paused
+/// past its backup's acknowledgement timeout, keeps the backup whose answers
+/// queued meanwhile. Fail-before: the simulated pause was not reported, the
+/// holder found its backup silent on waking and removed it (a
+/// reconfiguration CAS and a re-sync from scratch, for its own pause).
+#[test]
+fn a_paused_holder_keeps_its_backup() {
+    let r = run_seed(
         586,
         SimConfig {
             lease_reads: SLOW_LEASE_READS,
@@ -12520,6 +12627,11 @@ fn a_removal_that_empties_the_backup_set_gates_acknowledgements() {
         },
     )
     .unwrap_or_else(|e| panic!("long-backup seed 586 (slow lease reads): {e}"));
+    assert_eq!(
+        r.stats.values().map(|s| s.backups_removed).sum::<u64>(),
+        0,
+        "a paused holder removed its backup for its own pause"
+    );
 }
 
 /// `long-delegated-late-answers` seed 259 under slow lease reads: a deposed
@@ -14390,7 +14502,10 @@ const I4_SEEDS: &[I4Seeds] = &[(
     // nothing backs off a fixed 4 ticks, and a recall drains at once. 31,
     // 44 and 58 are three of the 20 seeds of 0 to 300 with a late landing
     // now, unclocked; `+settle` fails with I4 on each.)
-    &[31, 44, 58],
+    // (The root probe's overlapping reads and the own lapses the driver now
+    // hands the core moved 44: 75 is one of the 19 seeds of 0 to 300 with a
+    // late landing now, unclocked, 2 of them; `+settle` fails with I4.)
+    &[31, 58, 75],
 )];
 
 /// Plan 45 follow-up: hard links (`NsOp::Link`) and exchanges

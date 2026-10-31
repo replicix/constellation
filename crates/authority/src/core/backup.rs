@@ -594,7 +594,7 @@ pub(crate) struct AckState {
     /// scales with it (`Core::begin_handoff_pause`).
     pub s3_rtt_ms: u64,
     /// The `MarkGranting` CAS in flight.
-    marking: Option<OpId>,
+    pub(crate) marking: Option<OpId>,
     /// `LeaseState::held_gen` when the re-read of `marking`'s loss was sent.
     marking_gen: u64,
     /// The body that CAS carries: its answer adopts this one, never one

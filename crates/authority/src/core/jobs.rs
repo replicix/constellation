@@ -1888,11 +1888,57 @@ impl Core {
     }
 
     fn round_renew(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
-        if self.renew_due(now) {
+        if self.renew_due(now) && !self.renew_waits_for_own_cas(now) {
             self.issue_renew(now, false, out);
             return;
         }
         self.round_gate(now, replica, out);
+    }
+
+    /// Whether a due renewal waits for this holder's own other CAS of the
+    /// lease (a reconfiguration of the backup set, a mark, or the clear of
+    /// an inherited mark, with their re-reads): both swap on the tag the
+    /// renewal would, so the one that lands second always loses, re-reads
+    /// the object and goes again: two lease reads, each a full S3 round trip.
+    /// Under slow lease reads that put the renewal seconds late, landing
+    /// after the core had stalled again: its lease then capped every grant
+    /// to nothing (`delegated-core-stall-root-backup` under
+    /// `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`: the root dropped a backup
+    /// after a stall, and a delegation lapsed at the cap of the lease the
+    /// renewal never extended). The renewal goes once the other CAS has
+    /// landed (`renew_after_own_cas`), on its tag. Not past a quarter of the
+    /// TTL left: then the renewal races as before rather than wait on a CAS
+    /// that may itself be slow.
+    pub(crate) fn renew_waits_for_own_cas(&mut self, now: Now) -> bool {
+        let cas_out = self.own_lease_cas_out();
+        let waits = cas_out
+            && self
+                .lease
+                .honour_left_ms(now, &self.cfg)
+                .is_some_and(|left| left > (self.cfg.ttl_ms / 4) as i64);
+        if waits && !self.ship.renew_after_cas {
+            self.ship.renew_after_cas = true;
+            self.stats.lease_renewals_after_own_cas += 1;
+        }
+        waits
+    }
+
+    /// A lease CAS of this holder's other than the renewal's is out (or its
+    /// re-read): a reconfiguration, a mark, a mark's clear.
+    fn own_lease_cas_out(&self) -> bool {
+        self.ack.reconfig.is_some() || self.ack.marking.is_some() || self.ack.unmarking.is_some()
+    }
+
+    /// After every event: a renewal that waited for this holder's own
+    /// other lease CAS (`renew_waits_for_own_cas`) goes in the next round
+    /// once that CAS is no longer out.
+    pub(crate) fn renew_after_own_cas(&mut self, now: Now, out: &mut Vec<Action>) {
+        if self.ship.renew_after_cas && !self.own_lease_cas_out() {
+            self.ship.renew_after_cas = false;
+            if self.renew_due(now) {
+                self.nudge(now, out);
+            }
+        }
     }
 
     /// Where a round goes after its renewal: the gate (the renewal
@@ -4234,7 +4280,11 @@ impl Core {
                     // a live, writing holder — its backups stopped
                     // hearing from it at expiry and sealed it. Renew
                     // between two segments once half the TTL is gone.
-                    ShipPurpose::Journal if kind == JobKind::Round && self.renew_due(now) => {
+                    ShipPurpose::Journal
+                        if kind == JobKind::Round
+                            && self.renew_due(now)
+                            && !self.renew_waits_for_own_cas(now) =>
+                    {
                         self.issue_renew(now, true, out);
                     }
                     // A job waits for the slot (a lease request above

@@ -501,11 +501,20 @@ delegated directory do not wait for its ship either. Status:
   runs and never past `CONSTELLATION_HOLDER_STALL_MS`) asks the root's
   `RootProbe` for one read of the lease object, which the P2P service
   performs on a task of its own through the driver's own `LeaseStore` (so
-  the own-S3 watch counts it). At most one read is in flight (renewals that
-  arrive meanwhile wait for it, at most one freshness window) and at most
-  one is started per freshness window, whatever the last one found: a read
-  serves every renewal, of every delegation and of the lock lane's own
-  grants, that arrives in its round. The read is judged as the core judges
+  the own-S3 watch counts it). A read is started at most once per
+  *stagger*, a quarter of the freshness window: a renewal that arrives
+  within a stagger of the newest read joins it, a later one starts the next,
+  and while renewals wait the next read follows a stagger after the last
+  one whether or not another renewal arrives; a read that proves nothing
+  hands its renewals on to the next one still out. So up to four reads
+  overlap (one out a whole window is abandoned), each a separate chance to
+  come back within the window: with one read per window, a lease GET whose
+  round trip neared the window (a slow S3) left a delegate two or three
+  chances before its grant ran out, and two misses in a row lapsed it
+  (`delegated-core-stall-root-backup` under slow lease reads, 249 of 2,000
+  seeds; [ADR-25](../../explanation/DECISIONS.md#adr-25-cluster-locks-are-leased-grants-from-the-owning-sequencer),
+  amended 2026-10-31). A read serves every renewal, of every delegation
+  and of the lock lane's own grants, that waits on it. The read is judged as the core judges
   a `LeaseGet` of its own (`note_s3_liveness`, `on_renew_probe`): holder
   and epoch only, never an expiry against a clock (plan 43 C7). Naming this
   node at the certificate's epoch, not released, it is a proof of liveness

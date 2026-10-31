@@ -311,8 +311,9 @@ pub enum RootAnswer {
 /// for [`stuck_threshold_ms`] of half the grant and not past `hung_ms`
 /// (D5, D6), the slot is open, settled, and the tenure marked with lease left
 /// below the margin: the read is asked for when its answer is the only thing
-/// the renewal lacks. At most one read in flight and one per freshness window
-/// ([`RootProbe::want`]); [`crate::root_probe`] has the argument that its
+/// the renewal lacks. At most one read started per stagger of the freshness
+/// window ([`RootProbe::want`], [`RootProbe::follow_up`]); [`crate::root_probe`]
+/// has the bounds and the argument that its
 /// result is a proof of liveness as of its send, judged by the unchanged
 /// rule.
 #[allow(clippy::too_many_arguments)]

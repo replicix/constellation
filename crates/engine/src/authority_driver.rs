@@ -946,6 +946,12 @@ pub struct Driver {
     /// The end of the latest own lapse handed to the core
     /// ([`Driver::hand_lag`]).
     lag_handed: i64,
+    /// The driver's own latest step that ran for the lag threshold or
+    /// longer, `(from, until)` on the wait clock (`(0, 0)`: none), for
+    /// [`Driver::hand_lag`]: a step stuck in the store holds the core up
+    /// as a held runtime does, but the lag probe, on another worker, keeps
+    /// ticking and never sees it.
+    step_lapse: (i64, i64),
     /// The latest freeze of the heartbeat thread handed to the core
     /// ([`Driver::hand_freeze`]), `(from, until)`.
     freeze_handed: (i64, i64),
@@ -1873,12 +1879,13 @@ impl OffCore {
     /// Plan 41 D3: [`Self::answer_root`], and for a renewal refused only for
     /// stale liveness (a tenure that can be taken over early, whose core made
     /// no S3 request lately because it is stuck) one read of the lease object,
-    /// off the core: at most one in flight and one per freshness window
-    /// ([`constellation_authority::root_probe`] has the argument that its
-    /// result is a proof of liveness as of its send). The request then waits
-    /// for the read, bounded by the window, and is decided once more at a
-    /// fresh reading; whatever the read found, the core still answers the
-    /// request in full when it runs.
+    /// off the core: at most one started per stagger of the freshness window,
+    /// overlapping, the next following while renewals wait
+    /// ([`constellation_authority::root_probe`] has the bounds, and the
+    /// argument that its result is a proof of liveness as of its send). The
+    /// request then waits for the read, bounded by the window, and is decided
+    /// once more at a fresh reading; whatever the read found, the core still
+    /// answers the request in full when it runs.
     pub(crate) async fn answer_root_probing(
         self: &Arc<Self>,
         enabled: bool,
@@ -1972,6 +1979,18 @@ impl OffCore {
     ) {
         use constellation_authority::root_probe::{judge, LeaseRead};
         let off_core = self.clone();
+        // The next read follows a stagger after this one while renewals
+        // still wait for a read in flight (`RootProbe::follow_up`): reads go
+        // on at one per stagger, not only as fast as renewals arrive.
+        let follow = self.clone();
+        let follow_up = async move {
+            let stagger = constellation_authority::root_probe::probe_stagger_ms(window_ms);
+            tokio::time::sleep(Duration::from_millis(stagger.max(1) as u64)).await;
+            let now = constellation_platform::clock::protocol().now().honour;
+            if let Some(next) = follow.root_probe.follow_up(now, ticket.epoch, window_ms) {
+                follow.spawn_root_probe(next, node_id, window_ms);
+            }
+        };
         let Some(LeaseHandle(leases)) = self.leases.get().cloned() else {
             // No lease store (a unit test): the read fails.
             for w in self.root_probe.finish(
@@ -2011,9 +2030,11 @@ impl OffCore {
         match self.runtime.get() {
             Some(handle) => {
                 handle.spawn(task);
+                handle.spawn(follow_up);
             }
             None => {
                 tokio::spawn(task);
+                tokio::spawn(follow_up);
             }
         }
     }
@@ -2467,6 +2488,7 @@ impl Driver {
             urgent_rx,
             heard_handed: HashMap::new(),
             lag_handed: 0,
+            step_lapse: (0, 0),
             freeze_handed: (0, 0),
             loop_thread: Arc::new(Mutex::new(
                 constellation_platform::process::ThreadRef::unknown(),
@@ -2705,15 +2727,30 @@ impl Driver {
     /// was not told of. The probe's own staleness counts, so a wake-up
     /// right after the runtime was held up hands the lapse over even when
     /// the probe has not run yet. Costs a core step only per lapse.
+    ///
+    /// The driver's own long step counts too ([`Driver::step_lapse`]): the
+    /// core took nothing meanwhile, so its backups' answers queued behind it
+    /// and its holder's beats were not looked at, the same as under a held
+    /// runtime; told nothing, a holder whose step was stuck past its
+    /// backup's acknowledgement timeout removed a healthy backup on waking
+    /// (a reconfiguration CAS, and a re-sync from scratch), before the
+    /// backlog of its acknowledgements was in.
     fn hand_lag(&mut self) {
         let off = &self.deps.off_core;
-        let (from, until) = off.lapse(wait_now_ms());
-        if until > self.lag_handed + off.lag_threshold_ms / 2 {
-            self.lag_handed = until;
-            self.step(Internal::Event(Event::OwnLag {
-                from: WaitMs(from),
-                until: WaitMs(until),
-            }));
+        let threshold = off.lag_threshold_ms;
+        let mut lapses = [
+            off.lapse(wait_now_ms()),
+            std::mem::take(&mut self.step_lapse),
+        ];
+        lapses.sort_by_key(|&(_, until)| until);
+        for (from, until) in lapses {
+            if until > self.lag_handed + threshold / 2 {
+                self.lag_handed = until;
+                self.step(Internal::Event(Event::OwnLag {
+                    from: WaitMs(from),
+                    until: WaitMs(until),
+                }));
+            }
         }
     }
 
@@ -2784,7 +2821,8 @@ impl Driver {
             .store(crate::prune::wait_ms(), Ordering::Relaxed);
         let kind = event_kind(&event);
         // Progress (a wake-up may run several steps).
-        self.deps.off_core.set_busy(wait_now_ms());
+        let started_wait = wait_now_ms();
+        self.deps.off_core.set_busy(started_wait);
         let started = std::time::Instant::now();
         let int_pending = self.int_rx.len();
         let sync_pending = self.sync_rx.len();
@@ -2844,6 +2882,10 @@ impl Driver {
             "core step"
         );
         let step_us = handled_us + refreshed_us + dispatched_us;
+        let step_ms = (step_us / 1_000) as i64;
+        if step_ms >= self.deps.off_core.lag_threshold_ms {
+            self.step_lapse = (started_wait, started_wait + step_ms);
+        }
         self.profile.note(
             kind,
             step_us,
@@ -7916,8 +7958,8 @@ mod tests {
     /// given (the core answers the request in full, and a grant made off the
     /// core is the stuck core's alone); the read still counts, and a core
     /// stuck again inside the window of its send is answered on it, with no
-    /// second read. (Deciding on the look taken before the wait would answer
-    /// off a running core: the assertion that fails for that code.)
+    /// read of its own. (Deciding on the look taken before the wait would
+    /// answer off a running core: the assertion that fails for that code.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_core_that_runs_again_during_the_wait_answers_the_renewal_itself() {
         use std::sync::atomic::Ordering;
@@ -7957,7 +7999,10 @@ mod tests {
             off.answer_root_probing(true, 15_000, 1, 3, 7).await,
             Some(4_000)
         );
-        assert_eq!(p.started.load(Ordering::Relaxed), 1);
+        // (One read followed the first a stagger after it while the renewal
+        // waited: `RootProbe::follow_up`.)
+        assert_eq!(p.followed.load(Ordering::Relaxed), 1);
+        assert_eq!(p.started.load(Ordering::Relaxed), 2);
     }
 
     /// Plan 41 D3, the negative controls: a lease that names another holder,

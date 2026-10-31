@@ -356,6 +356,8 @@ pub struct NodeEnv {
     pub holder_beats: super::run::HolderBeats,
     /// See `SimConfig::timers_first_after_lag`.
     pub timers_first_after_lag: bool,
+    /// See `SimConfig::own_lapses_unreported`.
+    pub own_lapses_unreported: bool,
     /// See `SimConfig::beats_credited`.
     pub beats_credited: bool,
     /// See `SimConfig::beats_lost_in_lag`.
@@ -708,6 +710,8 @@ impl NodeHandle {
             lag_queue: Vec::new(),
             lag_pending: None,
             freeze_handed: (0, 0),
+            own_lapse: None,
+            own_lapses_unreported: env.own_lapses_unreported,
             stamps_first: !env.timers_first_after_lag,
             credit_margin: env
                 .beats_credited
@@ -971,6 +975,15 @@ struct Driver {
     lag_pending: Option<tokio::time::Instant>,
     /// The latest freeze of the lane thread handed to the core.
     freeze_handed: (i64, i64),
+    /// This node's own lapse the core has not been told of yet
+    /// (`Event::OwnLag`, wait clock): a pause (the daemon's lag probe,
+    /// stopped with the process, is overdue when it resumes:
+    /// `OffCore::lapse`), or a step stuck past the lag threshold (the
+    /// daemon's `Driver::hand_lag` hands the driver's own long step).
+    /// Handed before the next event.
+    own_lapse: Option<(i64, i64)>,
+    /// `SimConfig::own_lapses_unreported`: no such lapse is handed.
+    own_lapses_unreported: bool,
     /// After a lag, what the daemon's P2P handlers stamped meanwhile goes
     /// to the core before the timers ([`Driver::finish_lag`]).
     stamps_first: bool,
@@ -1609,7 +1622,21 @@ fn spawn_root_probe(
     ticket: constellation_authority::root_probe::Ticket,
     window_ms: i64,
 ) {
-    use constellation_authority::root_probe::{judge, LeaseRead, Verdict};
+    use constellation_authority::root_probe::{judge, probe_stagger_ms, LeaseRead, Verdict};
+    // The daemon's `OffCore::spawn_root_probe`: the next read follows a
+    // stagger after this one while renewals wait (`RootProbe::follow_up`).
+    let follow = ctx.clone();
+    tokio::spawn(async move {
+        let stagger = probe_stagger_ms(window_ms).max(1) as u64;
+        tokio::time::sleep(std::time::Duration::from_millis(stagger)).await;
+        if !follow.shared.alive.load(Ordering::SeqCst) {
+            return;
+        }
+        let now = follow.clock.now().honour;
+        if let Some(next) = follow.probe.follow_up(now, ticket.epoch, window_ms) {
+            spawn_root_probe(follow, next, window_ms);
+        }
+    });
     tokio::spawn(async move {
         let Some(bucket) = ctx.bucket.upgrade() else {
             return;
@@ -1768,8 +1795,30 @@ impl Driver {
                     tokio::time::sleep_until(until).await;
                 }
                 *self.shared.paused_until.lock().unwrap() = None;
+                // Stopped since the pause began, not since this event.
+                let stopped_ms = self.shared.paused_since.lock().unwrap().map_or(0, |t| {
+                    tokio::time::Instant::now()
+                        .saturating_duration_since(t)
+                        .as_millis() as i64
+                });
+                self.note_own_lapse(self.clock.now().wait.0 - stopped_ms);
             }
             let now = self.clock.now();
+            // The daemon's `Driver::hand_lag`: this node's own lapse, before
+            // the wake-up is handled (its silence watches and its backups'
+            // acknowledgement timeouts discount it).
+            if let Some((from, until)) = self.own_lapse.take() {
+                self.step_now = now;
+                let actions = self.core.handle(
+                    now,
+                    Event::OwnLag {
+                        from: constellation_authority::WaitMs(from),
+                        until: constellation_authority::WaitMs(until),
+                    },
+                    &*self.meta,
+                );
+                self.dispatch(actions);
+            }
             // The daemon's `Driver::hand_freeze`: a freeze of the lane thread
             // the driver sees as it wakes, before the thread has run again.
             for (from, until) in constellation_authority::deleg_lane::freezes(
@@ -1808,6 +1857,7 @@ impl Driver {
                 self.shared.busy_since.store(now.wait.0, Ordering::SeqCst);
                 tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                 self.shared.busy_since.store(0, Ordering::SeqCst);
+                self.note_own_lapse(now.wait.0);
             }
             // A beat's arrival stamp: when this node got to it (the
             // daemon stamps it in its P2P handler; a lag delays both).
@@ -2043,6 +2093,21 @@ impl Driver {
             self.dispatch(actions);
             self.poll_fast_waits();
             self.refresh_view();
+        }
+    }
+
+    /// A lapse of this node from `from` (wait clock) to now, if it reaches
+    /// the lag threshold (an eighth of `backup_takeover_ms`, the daemon's
+    /// `OffCore::for_config`): handed to the core before the next event.
+    fn note_own_lapse(&mut self, from: i64) {
+        if self.own_lapses_unreported {
+            return;
+        }
+        let until = self.clock.now().wait.0;
+        let threshold = (self.core.config().backup_takeover_ms as i64 / 8).max(1);
+        if until - from >= threshold {
+            let from = self.own_lapse.map_or(from, |(f, _)| f.min(from));
+            self.own_lapse = Some((from, until));
         }
     }
 

@@ -46035,7 +46035,18 @@ fn tag2() -> constellation_store_s3::LeaseTag {
 
 /// The first round after half a TTL: its lease CAS (the renewal) and its id.
 fn renewal_cas(h: &mut Harness) -> (OpId, Lease) {
-    h.advance(6_000);
+    renewal_cas_after(h, 6_000)
+}
+
+/// [`renewal_cas`] with less than a quarter of the TTL left: a renewal that
+/// goes out beside the holder's own other lease CAS rather than wait for it
+/// (`Core::renew_waits_for_own_cas`).
+fn renewal_cas_racing(h: &mut Harness) -> (OpId, Lease) {
+    renewal_cas_after(h, 7_600)
+}
+
+fn renewal_cas_after(h: &mut Harness, ms: u64) -> (OpId, Lease) {
+    h.advance(ms);
     let mut out = Vec::new();
     h.core.start(h.clk(), &h.meta, &mut out);
     let poll = timers(&out, TimerKind::Poll)[0];
@@ -46083,7 +46094,7 @@ fn a_mark_answered_after_a_renewal_re_read_it_leaves_the_held_version_alone() {
     assert!(marked.granted_delegations);
     assert_eq!(marked.config_version, base + 1);
     // The renewal goes out beside it; the mark lands first and it loses.
-    let (renew, _) = renewal_cas(&mut h);
+    let (renew, _) = renewal_cas_racing(&mut h);
     let out = h.step(Event::S3 {
         op: renew,
         result: S3Result::LeasePut(Err(CasFailure::Conflict)),
@@ -46197,7 +46208,7 @@ fn a_reconfig_re_read_does_not_cas_beside_a_renewal_that_is_out() {
     h.core.issue_reconfig(h.clk(), vec![2], &h.meta, &mut out);
     let (cas, listed) = swap_in(&out).expect("the reconfiguration CAS");
     assert_eq!(listed.backups, vec![2]);
-    let (_renew, _) = renewal_cas(&mut h);
+    let (_renew, _) = renewal_cas_racing(&mut h);
     let out = h.step(Event::S3 {
         op: cas,
         result: S3Result::LeasePut(Err(CasFailure::Conflict)),
@@ -46213,6 +46224,77 @@ fn a_reconfig_re_read_does_not_cas_beside_a_renewal_that_is_out() {
         "a second CAS beside the renewal: {out:?}"
     );
     assert_eq!(h.core.ack.reconfig_wanted, Some(vec![2]));
+}
+
+/// A renewal that falls due while the holder's own reconfiguration CAS is out
+/// waits for it, and goes on the reconfiguration's tag once it has landed,
+/// rather than race it: the one landing second always lost, re-read the
+/// object and went again (two lease reads: under slow lease reads the
+/// renewal landed seconds late, after the core had stalled again, and the
+/// lease it never extended capped every grant to nothing,
+/// `delegated-core-stall-root-backup` seeds 14 and 114). Fail-before: the
+/// renewal CAS went out beside the reconfiguration's on the same tag.
+#[test]
+fn a_due_renewal_waits_for_the_holders_own_reconfiguration_cas() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let mut out = Vec::new();
+    h.core.issue_reconfig(h.clk(), vec![2], &h.meta, &mut out);
+    let (cas, listed) = swap_in(&out).expect("the reconfiguration CAS");
+    // Half the TTL gone: due. The round does not renew beside the CAS.
+    h.advance(6_000);
+    let mut out = Vec::new();
+    h.core.start(h.clk(), &h.meta, &mut out);
+    let poll = timers(&out, TimerKind::Poll)[0];
+    let mut out = h.step(Event::Timer { id: poll });
+    if let Some(op) = out.iter().find_map(|a| match a {
+        Action::UploadDirtyChunks { op, .. } => Some(*op),
+        _ => None,
+    }) {
+        out = h.step(Event::UploadsDone {
+            op,
+            result: UploadResult::Done { held: 0 },
+        });
+    }
+    assert!(swap_in(&out).is_none(), "a renewal beside the CAS: {out:?}");
+    assert_eq!(h.core.stats.lease_renewals_after_own_cas, 1);
+    // The reconfiguration lands: the next round renews, on its tag.
+    let out = h.step(Event::S3 {
+        op: cas,
+        result: S3Result::LeasePut(Ok(tag2())),
+    });
+    assert_eq!(
+        h.core.lease.held.as_ref().unwrap().0.backups,
+        listed.backups
+    );
+    let mut out = out;
+    let mut renewal = None;
+    for _ in 0..4 {
+        if let Some(r) = s3_ops(&out).into_iter().find_map(|(op, r)| match r {
+            S3Op::LeaseSwap { lease, tag } => Some((op, lease.clone(), tag.clone())),
+            _ => None,
+        }) {
+            renewal = Some(r);
+            break;
+        }
+        let Some(poll) = timers(&out, TimerKind::Poll).first().copied() else {
+            break;
+        };
+        out = h.step(Event::Timer { id: poll });
+        if let Some(op) = out.iter().find_map(|a| match a {
+            Action::UploadDirtyChunks { op, .. } => Some(*op),
+            _ => None,
+        }) {
+            out = h.step(Event::UploadsDone {
+                op,
+                result: UploadResult::Done { held: 0 },
+            });
+        }
+    }
+    let (_, renewed, on) = renewal.expect("the renewal follows the reconfiguration");
+    assert_eq!(on, tag2(), "swapped on the reconfiguration's tag");
+    assert_eq!(renewed.backups, listed.backups);
+    assert!(renewed.expires_unix_ms > listed.expires_unix_ms);
 }
 
 // ---- follow-ups of the takeover of a dead holder and the lease reads ----

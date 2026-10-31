@@ -56,16 +56,44 @@
 //!
 //! # Bounds
 //!
-//! One read in flight; one new read at most per freshness window
-//! (`backup_takeover_ms`, the *round*: a read serves every renewal of every
-//! lane that arrives inside its window, and none is made without a renewal
-//! that was refused for staleness); none once a read showed the epoch
-//! deposed; none unless the core has been stuck for the lanes' own
-//! threshold and not past the hung bound (the caller's gate, D5/D6).
-
+//! One new read at most per *stagger* ([`PROBE_READS_PER_WINDOW`] per
+//! freshness window, `backup_takeover_ms`): a renewal refused for staleness
+//! joins the newest read in flight when that read left less than a stagger
+//! ago, and starts the next one otherwise; and while renewals wait for a read
+//! in flight, the next read follows a stagger after the last one started
+//! ([`RootProbe::follow_up`]), whether or not another renewal arrives. So at
+//! most that many reads are out at once (a read out for a whole window is
+//! abandoned), and none is made but for a renewal that was refused for
+//! staleness and waits (a window at most after it asked: a renewal whose read
+//! proved nothing waits for the next one only if that one was sent within a
+//! window of its ask). None once a read showed the epoch deposed; none unless
+//! the core has been stuck for the lanes' own threshold and not past the hung
+//! bound (the caller's gate, D5/D6, which every renewal that waits passed).
+//!
+//! *Why staggered.* A proof is good for the window from its read's send, so a
+//! read is worth something only if it is back within the window, with what is
+//! left of it. When the lease GET's round trip nears the window (a slow S3
+//! against a 1.5 s takeover window), a read misses it often, and one read per
+//! window (the rule before) left a delegate two or three attempts between its
+//! first renewal and its grant's end: two misses in a row lapsed a grant that
+//! the root still held (`delegated-core-stall-root-backup` under
+//! `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`, 249 of 2,000 seeds). Reads that
+//! overlap give the round several independent chances, at most one GET per
+//! stagger, and only while the core is stuck and a renewal waits.
+//!
 use crate::ids::{HonourMs, NodeId};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+
+/// How many reads a freshness window may start (see the module doc's
+/// *Bounds*): a new read starts at most once per `window / this`.
+pub const PROBE_READS_PER_WINDOW: i64 = 4;
+
+/// The least time between two reads' sends for a freshness window of
+/// `window_ms` ([`PROBE_READS_PER_WINDOW`]).
+pub fn probe_stagger_ms(window_ms: i64) -> i64 {
+    (window_ms / PROBE_READS_PER_WINDOW).max(1)
+}
 
 /// What to run when a read ends (whatever its outcome): the lane that asked
 /// retries its decision then.
@@ -155,8 +183,9 @@ impl Ticket {
 pub enum NoProbe {
     /// A read showed the epoch deposed.
     Deposed,
-    /// A read was sent less than a freshness window ago and did not prove
-    /// the tenure (it failed, or is not back): the round has had its read.
+    /// A read was sent less than a stagger ago ([`probe_stagger_ms`]) and
+    /// did not prove the tenure (it failed): the next read waits for the
+    /// stagger.
     Spaced,
 }
 
@@ -176,25 +205,35 @@ pub enum Want {
 struct Inner {
     /// The latest read that showed a tenure live: its epoch and send.
     proof: Option<(u64, HonourMs)>,
-    /// The read in flight.
-    inflight: Option<Ticket>,
+    /// The reads in flight, oldest first (at most [`PROBE_READS_PER_WINDOW`]
+    /// younger than a window).
+    inflight: Vec<Ticket>,
     /// The renewals waiting for a read, by the read's ticket: a read that
-    /// ends wakes its own and no others (an abandoned read's late end must not
-    /// wake the waiters of the newer read, which would decide before it is
-    /// back).
-    waiters: Vec<(u64, Waiter)>,
-    /// The send and epoch of the latest read started (the round gate).
+    /// ends wakes its own, and if it proved the tenure live (or deposed)
+    /// those of the older reads too (whose proofs could only be older); never
+    /// those of a newer read, which would decide before that read is back (an
+    /// abandoned read's late end, whose proof is stale by then). One that
+    /// proved nothing passes its own to the next newer read still out, if
+    /// that one was sent within a window of the renewal's ask (the second
+    /// field): a renewal rides the reads of one window at most.
+    waiters: Vec<(u64, HonourMs, Waiter)>,
+    /// The send and epoch of the latest read started (the stagger gate).
     last_sent: Option<(u64, HonourMs)>,
     /// The latest epoch a read showed deposed.
     deposed: Option<u64>,
+    /// The freshness window of the latest ask (`want`, `follow_up`): how
+    /// far a renewal rides the reads after its own (`finish`).
+    window_ms: i64,
     next: u64,
 }
 
 /// What the probe did (`status`).
 #[derive(Debug, Default)]
 pub struct ProbeStats {
-    /// Reads started.
+    /// Reads started (follow-ups included).
     pub started: AtomicU64,
+    /// Of them, follow-ups ([`RootProbe::follow_up`]).
+    pub followed: AtomicU64,
     /// Renewals that joined a read in flight.
     pub joined: AtomicU64,
     /// Renewals refused a read: spaced or deposed.
@@ -254,9 +293,10 @@ impl RootProbe {
 
     /// A renewal of the tenure of `epoch` was refused for stale liveness at
     /// `now` (honour clock): ask for a read. `window_ms` is the freshness
-    /// window (`backup_takeover_ms`), also the round: at most one read is
-    /// started per window. `waiter` (built only when it is used) runs when the
-    /// read ends, whatever it found.
+    /// window (`backup_takeover_ms`): a read is started at most once per
+    /// stagger of it ([`probe_stagger_ms`]), and a renewal joins the newest
+    /// read in flight younger than that. `waiter` (built only when it is
+    /// used) runs when the read ends, whatever it found.
     pub fn want(
         &self,
         now: HonourMs,
@@ -269,19 +309,22 @@ impl RootProbe {
             self.stats.withheld.fetch_add(1, Ordering::Relaxed);
             return Want::No(NoProbe::Deposed);
         }
-        if let Some(t) = g.inflight {
-            if t.epoch == epoch && now.since(t.sent) < window_ms {
-                g.waiters.push((t.seq, waiter()));
+        // A read out longer than the window it could still justify (a
+        // request that hangs) is abandoned: its waiters have their own bound,
+        // and its late end still counts (`finish`).
+        g.inflight
+            .retain(|t| t.epoch != epoch || now.since(t.sent) < window_ms);
+        g.window_ms = window_ms;
+        let stagger = probe_stagger_ms(window_ms);
+        if let Some(t) = g.inflight.iter().rev().find(|t| t.epoch == epoch).copied() {
+            if now.since(t.sent) < stagger {
+                g.waiters.push((t.seq, now, waiter()));
                 self.stats.joined.fetch_add(1, Ordering::Relaxed);
                 return Want::Joined;
             }
-            // A read that has been out longer than the window it could still
-            // justify (a request that hangs): abandoned. Its waiters have
-            // their own bound; its late end still counts (`finish`).
-            g.inflight = None;
         }
         if let Some((e, sent)) = g.last_sent {
-            if e == epoch && now.since(sent) < window_ms {
+            if e == epoch && now.since(sent) < stagger {
                 self.stats.withheld.fetch_add(1, Ordering::Relaxed);
                 return Want::No(NoProbe::Spaced);
             }
@@ -292,17 +335,68 @@ impl RootProbe {
             epoch,
             sent: now,
         };
-        g.inflight = Some(ticket);
+        g.inflight.push(ticket);
         g.last_sent = Some((epoch, now));
-        g.waiters.push((ticket.seq, waiter()));
+        g.waiters.push((ticket.seq, now, waiter()));
         self.stats.started.fetch_add(1, Ordering::Relaxed);
         Want::Start(ticket)
     }
 
-    /// The read for `ticket` ended with `verdict`. Returns the waiters of
-    /// that read to run (outside any lock of the caller's): those of a newer
-    /// read are not woken by it. A late end of an abandoned read still records
-    /// what it proved: the proof is dated at its own send.
+    /// A stagger after a read of the tenure of `epoch` was started: the next
+    /// read, if renewals still wait for a read in flight (none has proved the
+    /// tenure live since they asked: a live end wakes the older reads'
+    /// waiters too), asked within the window, and none was started within the
+    /// stagger. Without a
+    /// waiter of its own: renewals that arrive within its stagger join it, and
+    /// its live end wakes the older reads' waiters. The caller schedules it
+    /// after every read it starts, so reads go on at one per stagger while
+    /// renewals wait, not only as fast as the delegates' renewals arrive; and
+    /// stop a window after the last renewal that asked (its read ends by then
+    /// and takes its waiters with it).
+    pub fn follow_up(&self, now: HonourMs, epoch: u64, window_ms: i64) -> Option<Ticket> {
+        let mut g = self.lock();
+        if g.deposed == Some(epoch) {
+            return None;
+        }
+        g.inflight
+            .retain(|t| t.epoch != epoch || now.since(t.sent) < window_ms);
+        g.window_ms = window_ms;
+        let Inner {
+            inflight, waiters, ..
+        } = &*g;
+        let waiting = waiters.iter().any(|(seq, asked, _)| {
+            now.since(*asked) < window_ms
+                && inflight.iter().any(|t| t.seq == *seq && t.epoch == epoch)
+        });
+        if !waiting {
+            return None;
+        }
+        if g.last_sent
+            .is_some_and(|(e, sent)| e == epoch && now.since(sent) < probe_stagger_ms(window_ms))
+        {
+            return None;
+        }
+        g.next += 1;
+        let ticket = Ticket {
+            seq: g.next,
+            epoch,
+            sent: now,
+        };
+        g.inflight.push(ticket);
+        g.last_sent = Some((epoch, now));
+        self.stats.started.fetch_add(1, Ordering::Relaxed);
+        self.stats.followed.fetch_add(1, Ordering::Relaxed);
+        Some(ticket)
+    }
+
+    /// The read for `ticket` ended with `verdict`. Returns the waiters to run
+    /// (outside any lock of the caller's): that read's, and if it settled the
+    /// question (live, or deposed) those of the older reads still out too;
+    /// those of a newer read are not woken by it. A read that proved nothing
+    /// while a newer read of the tenure is out hands its waiters to the next
+    /// such read, those it may carry (asked within a window of that read's
+    /// send). A late end of an abandoned read still records what it proved:
+    /// the proof is dated at its own send.
     #[must_use]
     pub fn finish(&self, ticket: Ticket, verdict: Verdict) -> Vec<Waiter> {
         let mut g = self.lock();
@@ -327,14 +421,37 @@ impl RootProbe {
                 self.stats.unknown.fetch_add(1, Ordering::Relaxed);
             }
         }
-        if g.inflight.is_some_and(|t| t.seq == ticket.seq) {
-            g.inflight = None;
+        g.inflight.retain(|t| t.seq != ticket.seq);
+        // A read that proved nothing hands its renewals to the next read of
+        // the tenure still out, if a newer one is: they are decided when that
+        // one ends, or a later one proves the tenure live first (and so on
+        // while reads follow), not refused at once for a miss that a read
+        // already on its way may make up for.
+        let next = (verdict == Verdict::Unknown)
+            .then(|| {
+                g.inflight
+                    .iter()
+                    .filter(|t| t.epoch == ticket.epoch && t.seq > ticket.seq)
+                    .min_by_key(|t| t.seq)
+                    .copied()
+            })
+            .flatten();
+        let window = g.window_ms;
+        let settled = verdict != Verdict::Unknown;
+        let mut woken = Vec::new();
+        for (seq, asked, w) in std::mem::take(&mut g.waiters) {
+            if seq == ticket.seq {
+                match next {
+                    Some(t) if t.sent.since(asked) < window => g.waiters.push((t.seq, asked, w)),
+                    _ => woken.push(w),
+                }
+            } else if settled && seq < ticket.seq {
+                woken.push(w);
+            } else {
+                g.waiters.push((seq, asked, w));
+            }
         }
-        let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut g.waiters)
-            .into_iter()
-            .partition(|(seq, _)| *seq == ticket.seq);
-        g.waiters = rest;
-        mine.into_iter().map(|(_, w)| w).collect()
+        woken
     }
 }
 
@@ -403,12 +520,15 @@ mod tests {
     }
 
     #[test]
-    fn one_read_in_flight_and_the_renewals_that_arrive_meanwhile_join_it() {
+    fn the_renewals_that_arrive_within_a_stagger_of_a_read_join_it() {
         let p = RootProbe::new();
         let (n, w) = counter();
         let t = start(&p, 10_000, 7, &w);
         assert_eq!(p.want(HonourMs(10_100), 7, W, &w), Want::Joined);
-        assert_eq!(p.want(HonourMs(10_400), 7, W, &w), Want::Joined);
+        assert_eq!(
+            p.want(HonourMs(10_000 + probe_stagger_ms(W) - 1), 7, W, &w),
+            Want::Joined
+        );
         assert_eq!(p.stats().started.load(Ordering::Relaxed), 1);
         for run in p.finish(t, Verdict::Live) {
             run();
@@ -416,21 +536,157 @@ mod tests {
         assert_eq!(n.load(Ordering::SeqCst), 3, "all three are told");
     }
 
+    /// The fix of `delegated-core-stall-root-backup` under slow lease reads:
+    /// a round whose reads may each miss the window (a GET's round trip near
+    /// `backup_takeover_ms`) gets [`PROBE_READS_PER_WINDOW`] overlapping
+    /// reads, one per stagger, not one. Fail-before: one read per window, the
+    /// renewals of the round joined it or were refused (`Spaced`), and two
+    /// misses in a row lapsed a grant.
     #[test]
-    fn at_most_one_read_per_window_whatever_the_last_one_found() {
+    fn a_round_starts_one_read_per_stagger_and_they_overlap() {
         let p = RootProbe::new();
         let (_n, w) = counter();
-        let t = start(&p, 10_000, 7, &w);
-        let _ = p.finish(t, Verdict::Unknown);
-        // The round has had its read.
+        let s = probe_stagger_ms(W);
+        let mut out = vec![start(&p, 10_000, 7, &w)];
+        // A renewal every 100 ms, none back yet: one new read per stagger.
+        for at in (10_100..10_000 + W).step_by(100) {
+            match p.want(HonourMs(at), 7, W, &w) {
+                Want::Start(t) => out.push(t),
+                Want::Joined => {}
+                other => panic!("at {at}: {other:?}"),
+            }
+        }
+        assert_eq!(out.len() as i64, PROBE_READS_PER_WINDOW);
+        for (i, t) in out.iter().enumerate() {
+            assert!(t.sent.0 >= 10_000 + s * i as i64, "{t:?}");
+        }
+        // A read that failed leaves the next one to the stagger.
+        let q = RootProbe::new();
+        let t = start(&q, 10_000, 7, &w);
+        let _ = q.finish(t, Verdict::Unknown);
         assert_eq!(
-            p.want(HonourMs(10_000 + W - 1), 7, W, &w),
+            q.want(HonourMs(10_000 + s - 1), 7, W, &w),
             Want::No(NoProbe::Spaced)
         );
-        // The next round may ask again.
-        let t2 = start(&p, 10_000 + W, 7, &w);
-        let _ = p.finish(t2, Verdict::Live);
-        assert_eq!(p.proof(7), Some(HonourMs(10_000 + W)));
+        let t2 = start(&q, 10_000 + s, 7, &w);
+        let _ = q.finish(t2, Verdict::Live);
+        assert_eq!(q.proof(7), Some(HonourMs(10_000 + s)));
+    }
+
+    /// Overlapping reads: one that proves the tenure live wakes its own
+    /// waiters and the older reads' (whose proofs could only be older), not
+    /// the newer reads'; one that proves nothing hands its own to the next
+    /// newer read still out, and wakes none.
+    #[test]
+    fn a_live_read_wakes_its_own_and_the_older_reads_waiters() {
+        let p = RootProbe::new();
+        let s = probe_stagger_ms(W);
+        let (a_n, a_w) = counter();
+        let (b_n, b_w) = counter();
+        let (c_n, c_w) = counter();
+        let (d_n, d_w) = counter();
+        let a = start(&p, 10_000, 7, &a_w);
+        let b = start(&p, 10_000 + s, 7, &b_w);
+        let c = start(&p, 10_000 + 2 * s, 7, &c_w);
+        let d = start(&p, 10_000 + 3 * s, 7, &d_w);
+        assert!(p.finish(b, Verdict::Unknown).is_empty(), "handed to c");
+        for run in p.finish(c, Verdict::Live) {
+            run();
+        }
+        assert_eq!(a_n.load(Ordering::SeqCst), 1, "the older read's waiter");
+        assert_eq!(b_n.load(Ordering::SeqCst), 1, "the one handed to it");
+        assert_eq!(c_n.load(Ordering::SeqCst), 1);
+        assert_eq!(d_n.load(Ordering::SeqCst), 0, "not the newer read's");
+        assert_eq!(p.proof(7), Some(HonourMs(10_000 + 2 * s)));
+        // The older read's late end tells no one twice and keeps the newer
+        // proof.
+        assert!(p.finish(a, Verdict::Live).is_empty());
+        assert_eq!(p.proof(7), Some(HonourMs(10_000 + 2 * s)));
+        for run in p.finish(d, Verdict::Live) {
+            run();
+        }
+        assert_eq!(d_n.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            (a_n.load(Ordering::SeqCst), b_n.load(Ordering::SeqCst)),
+            (1, 1),
+            "none twice"
+        );
+        assert_eq!(p.proof(7), Some(HonourMs(10_000 + 3 * s)));
+    }
+
+    /// While a renewal waits for a read in flight, the next read follows a
+    /// stagger after the last one started, whether or not another renewal
+    /// arrives; the renewal rides it when its own read misses, and is told
+    /// when it proves the tenure. Not within the stagger, not once nothing
+    /// waits, not for a deposed epoch. Fail-before: reads came only as fast as
+    /// renewals arrived (the lane's, a few hundred ms apart), each renewal
+    /// was refused at its own read's miss, and four or five misses in a row
+    /// lapsed a grant (`delegated-core-stall-root-backup` seeds 232, 1219,
+    /// 1581 and 1762 under slow lease reads, with the stagger alone).
+    #[test]
+    fn a_waiting_renewal_has_a_read_follow_every_stagger() {
+        let p = RootProbe::new();
+        let s = probe_stagger_ms(W);
+        let (n, w) = counter();
+        let first = start(&p, 10_000, 7, &w);
+        assert_eq!(p.follow_up(HonourMs(10_000 + s - 1), 7, W), None);
+        let second = p
+            .follow_up(HonourMs(10_000 + s), 7, W)
+            .expect("a follow-up");
+        assert_eq!(second.sent, HonourMs(10_000 + s));
+        assert_eq!(p.stats().followed.load(Ordering::Relaxed), 1);
+        assert_eq!(p.follow_up(HonourMs(10_000 + s + 1), 7, W), None, "spaced");
+        // The first misses: its renewal waits for the follow-up, which
+        // proves the tenure and tells it.
+        assert!(p.finish(first, Verdict::Unknown).is_empty());
+        assert!(
+            p.follow_up(HonourMs(10_000 + 2 * s), 7, W).is_some(),
+            "it still waits: the reads go on"
+        );
+        for run in p.finish(second, Verdict::Live) {
+            run();
+        }
+        assert_eq!(n.load(Ordering::SeqCst), 1);
+        assert_eq!(p.proof(7), Some(HonourMs(10_000 + s)));
+        // Nothing waits for a read in flight any more: no follow-up.
+        assert_eq!(p.follow_up(HonourMs(10_000 + 4 * s), 7, W), None);
+        // A miss with no newer read out tells its renewal (refused).
+        let r = RootProbe::new();
+        let (m, w2) = counter();
+        let t = start(&r, 10_000, 7, &w2);
+        for run in r.finish(t, Verdict::Unknown) {
+            run();
+        }
+        assert_eq!(m.load(Ordering::SeqCst), 1);
+        assert_eq!(r.follow_up(HonourMs(10_000 + s), 7, W), None);
+        // Reads that keep failing (S3 out of reach) carry a renewal for a
+        // window from its ask, no longer: then the follow-ups stop.
+        let f = RootProbe::new();
+        let (k, w3) = counter();
+        let mut t = start(&f, 10_000, 7, &w3);
+        let mut at = 10_000;
+        loop {
+            at += s;
+            let Some(next) = f.follow_up(HonourMs(at), 7, W) else {
+                break;
+            };
+            for run in f.finish(t, Verdict::Unknown) {
+                run();
+            }
+            t = next;
+        }
+        assert!(at <= 10_000 + W, "followed past a window: {at}");
+        for run in f.finish(t, Verdict::Unknown) {
+            run();
+        }
+        assert_eq!(k.load(Ordering::SeqCst), 1, "told once, refused");
+        // A deposed epoch has no follow-up either.
+        let q = RootProbe::new();
+        let t = start(&q, 10_000, 7, &w);
+        let t2 = q.follow_up(HonourMs(10_000 + s), 7, W).unwrap();
+        let _ = q.finish(t2, Verdict::Deposed);
+        assert_eq!(q.follow_up(HonourMs(10_000 + 2 * s), 7, W), None);
+        let _ = q.finish(t, Verdict::Unknown);
     }
 
     #[test]
@@ -449,10 +705,13 @@ mod tests {
     }
 
     /// A read abandoned for hanging past its window ends late, after a newer
-    /// read started: it wakes the renewals that waited for it, and not those
-    /// waiting for the newer read, which would decide before that read is
-    /// back (and decline for want of the proof it brings). Fail-before: the
-    /// probe took every waiter at any read's end.
+    /// read started: whatever it found, it wakes no renewal waiting for the
+    /// newer read, which would decide before that read is back (and decline
+    /// for want of the proof it brings). Proving nothing, it hands its own to
+    /// the newer read, those that asked within a window of that read's send
+    /// (the others are told); proving the tenure live (a stale proof by now),
+    /// it wakes its own. Fail-before: the probe took every waiter at any read's
+    /// end.
     #[test]
     fn a_late_abandoned_read_wakes_only_its_own_waiters() {
         let p = RootProbe::new();
@@ -467,19 +726,37 @@ mod tests {
             p.want(HonourMs(10_000 + W + 100), 7, W, &new_w),
             Want::Joined
         );
+        // The renewal that asked a whole window before the newer read was
+        // sent is told (refused); the later one rides on.
         for run in p.finish(slow, Verdict::Unknown) {
             run();
         }
-        assert_eq!(old_n.load(Ordering::SeqCst), 2, "its own two are told");
-        assert_eq!(new_n.load(Ordering::SeqCst), 0, "the newer read's are not");
+        assert_eq!(old_n.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            new_n.load(Ordering::SeqCst),
+            0,
+            "the newer read's are not told"
+        );
         assert_eq!(p.proof(7), None);
-        // The newer read, back at last, tells its own and records its proof.
+        // The newer read, back at last, tells the other three and records
+        // its proof.
         for run in p.finish(fresh, Verdict::Live) {
             run();
         }
         assert_eq!(new_n.load(Ordering::SeqCst), 2);
         assert_eq!(old_n.load(Ordering::SeqCst), 2, "none twice");
         assert_eq!(p.proof(7), Some(HonourMs(10_000 + W)));
+        // A late live end: its own alone.
+        let q = RootProbe::new();
+        let (o, ow) = counter();
+        let (f, fw) = counter();
+        let slow = start(&q, 10_000, 7, &ow);
+        let fresh = start(&q, 10_000 + W, 7, &fw);
+        for run in q.finish(slow, Verdict::Live) {
+            run();
+        }
+        assert_eq!((o.load(Ordering::SeqCst), f.load(Ordering::SeqCst)), (1, 0));
+        let _ = q.finish(fresh, Verdict::Unknown);
     }
 
     #[test]

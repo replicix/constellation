@@ -1096,14 +1096,38 @@ takeovers is clean), the simulator on every lock configuration
 over early answers only within `backup_takeover_ms` of an S3 request that
 proved it live, and a stuck core makes none. While the core is stuck (and
 not hung), the lanes that find only that proof stale (the lock lane's own
-renewals, the delegation answerer) ask for one read of the lease object,
-off the core, at most one in flight and one per window; a read that names
+renewals, the delegation answerer) ask for a read of the lease object,
+off the core, at most one started per stagger (a quarter of the window),
+overlapping, the next following a stagger after the last while a renewal
+waits (amended 2026-10-31, below); a read that names
 this node at the certificate's epoch is a proof as of its **send**, judged
 by the unchanged freshness rule at the answer; any other reading withdraws
 the epoch's proof and ends its answers. A successor takes the tenure only
 by a lease CAS and quarantines from its marker, so a read served before
 the CAS, and an answer within the window of its send, is covered exactly
 as the core's own proof is.
+
+*Amendment (2026-10-31): the proof's reads overlap.* One read per window
+made the proof as likely to fail as one lease GET is to miss the window,
+twice or three times in a row: when the GET's round trip nears
+`backup_takeover_ms` (a slow S3), a root whose core stalled lost its
+delegates' grants although it held its lease throughout (the simulator's
+`delegated-core-stall-root-backup` under lease GETs of 0.8 to 1 s against a
+1 s window: 249 of 2,000 seeds). Now a read is started at most once per
+*stagger*, a quarter of the window: a renewal that arrives within a stagger
+of the newest read joins it and a later one starts the next; while renewals
+wait, the next read follows a stagger after the last whether or not another
+renewal arrives (`RootProbe::follow_up`); a read that proves nothing hands
+its renewals to the next one still out, and one that proves the tenure live
+also wakes the older reads' renewals. At most four reads are out at once, a
+GET per stagger at most and only while the core is stuck and a renewal
+waits (a window at most after the last one asked). The argument is
+unchanged: each read is dated at its own send and judged by the same rule,
+so more reads change how often a proof is had, never what it proves. Not
+closed: a GET slower than the window every time proves nothing, by design;
+the residue is a grant renewed a few hundred ms late (1 of 2,000 seeds), and
+a proof that does not ride the lease GET (the backup's answers to the
+holder's off-core beats) is the follow-up.
 
 *Not covered, on purpose*: a **stalled owner's** peers' grants (answering
 their renewals off the core, and the restart horizon's lead: follow-up L5);

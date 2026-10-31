@@ -1267,6 +1267,10 @@ pub struct Stats {
     /// was capped by the lease below what its holder needs
     /// (`Core::lease_renew_for_grants`).
     pub lease_renewals_for_grants: u64,
+    /// Holder: due lease renewals that waited for its own other lease CAS
+    /// (a reconfiguration, a mark's clear) to land rather than race it
+    /// (`Core::renew_waits_for_own_cas`).
+    pub lease_renewals_after_own_cas: u64,
     /// Node side.
     pub lock_requests: u64,
     pub lock_unavailable: u64,
@@ -1491,6 +1495,10 @@ pub struct ShipState {
     /// The epoch of the last segment this node shipped (a commit carries
     /// its author's epoch).
     pub last_ship_epoch: Epoch,
+    /// A due renewal waited for this holder's own other lease CAS
+    /// (`Core::renew_waits_for_own_cas`): the next round renews once it
+    /// has landed (`Core::renew_after_own_cas`).
+    pub renew_after_cas: bool,
     /// The last round's error, if it failed (`SpoolInfo::last_error`).
     pub last_error: Option<String>,
     /// Plan 30 §M9: the next round must read this holder's own stream
@@ -1510,6 +1518,7 @@ impl Default for ShipState {
             held_tail_at: None,
             renew_now: false,
             renew_early_of: None,
+            renew_after_cas: false,
             last_ship_epoch: 0,
             last_error: None,
             probe_now: false,
@@ -2310,6 +2319,7 @@ impl Core {
         self.inbox_after_event(now, &mut out);
         self.stream_after_event(now, &mut out);
         self.backup_after_event(now, replica, &mut out);
+        self.renew_after_own_cas(now, &mut out);
         self.promise_after_event(now, replica, &mut out);
         self.deleg_after_event(now, replica, &mut out);
         self.report_deleg_durable(now, replica);
