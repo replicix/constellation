@@ -352,8 +352,21 @@ impl RootProbe {
     /// after every read it starts, so reads go on at one per stagger while
     /// renewals wait, not only as fast as the delegates' renewals arrive; and
     /// stop a window after the last renewal that asked (its read ends by then
-    /// and takes its waiters with it).
-    pub fn follow_up(&self, now: HonourMs, epoch: u64, window_ms: i64) -> Option<Ticket> {
+    /// and takes its waiters with it). The caller's gate is judged again with
+    /// `stuck_ms`, how long the driver has been stuck now: none once the core
+    /// runs again (below the lanes' least stall,
+    /// [`crate::deleg_lane::DELEG_LANE_STUCK_MIN_MS`]) or past `hung_ms`.
+    pub fn follow_up(
+        &self,
+        now: HonourMs,
+        epoch: u64,
+        window_ms: i64,
+        stuck_ms: i64,
+        hung_ms: i64,
+    ) -> Option<Ticket> {
+        if stuck_ms < crate::deleg_lane::DELEG_LANE_STUCK_MIN_MS || stuck_ms > hung_ms {
+            return None;
+        }
         let mut g = self.lock();
         if g.deposed == Some(epoch) {
             return None;
@@ -462,6 +475,9 @@ mod tests {
     use std::sync::Arc;
 
     const W: i64 = 1_500;
+    /// A driver stuck for a while, and the hung bound (`follow_up`'s gate).
+    const STUCK: i64 = 2_000;
+    const HUNG: i64 = 15_000;
 
     fn counter() -> (Arc<AtomicUsize>, impl Fn() -> Waiter) {
         let n = Arc::new(AtomicUsize::new(0));
@@ -629,18 +645,26 @@ mod tests {
         let s = probe_stagger_ms(W);
         let (n, w) = counter();
         let first = start(&p, 10_000, 7, &w);
-        assert_eq!(p.follow_up(HonourMs(10_000 + s - 1), 7, W), None);
+        assert_eq!(
+            p.follow_up(HonourMs(10_000 + s - 1), 7, W, STUCK, HUNG),
+            None
+        );
         let second = p
-            .follow_up(HonourMs(10_000 + s), 7, W)
+            .follow_up(HonourMs(10_000 + s), 7, W, STUCK, HUNG)
             .expect("a follow-up");
         assert_eq!(second.sent, HonourMs(10_000 + s));
         assert_eq!(p.stats().followed.load(Ordering::Relaxed), 1);
-        assert_eq!(p.follow_up(HonourMs(10_000 + s + 1), 7, W), None, "spaced");
+        assert_eq!(
+            p.follow_up(HonourMs(10_000 + s + 1), 7, W, STUCK, HUNG),
+            None,
+            "spaced"
+        );
         // The first misses: its renewal waits for the follow-up, which
         // proves the tenure and tells it.
         assert!(p.finish(first, Verdict::Unknown).is_empty());
         assert!(
-            p.follow_up(HonourMs(10_000 + 2 * s), 7, W).is_some(),
+            p.follow_up(HonourMs(10_000 + 2 * s), 7, W, STUCK, HUNG)
+                .is_some(),
             "it still waits: the reads go on"
         );
         for run in p.finish(second, Verdict::Live) {
@@ -649,7 +673,10 @@ mod tests {
         assert_eq!(n.load(Ordering::SeqCst), 1);
         assert_eq!(p.proof(7), Some(HonourMs(10_000 + s)));
         // Nothing waits for a read in flight any more: no follow-up.
-        assert_eq!(p.follow_up(HonourMs(10_000 + 4 * s), 7, W), None);
+        assert_eq!(
+            p.follow_up(HonourMs(10_000 + 4 * s), 7, W, STUCK, HUNG),
+            None
+        );
         // A miss with no newer read out tells its renewal (refused).
         let r = RootProbe::new();
         let (m, w2) = counter();
@@ -658,7 +685,7 @@ mod tests {
             run();
         }
         assert_eq!(m.load(Ordering::SeqCst), 1);
-        assert_eq!(r.follow_up(HonourMs(10_000 + s), 7, W), None);
+        assert_eq!(r.follow_up(HonourMs(10_000 + s), 7, W, STUCK, HUNG), None);
         // Reads that keep failing (S3 out of reach) carry a renewal for a
         // window from its ask, no longer: then the follow-ups stop.
         let f = RootProbe::new();
@@ -667,7 +694,7 @@ mod tests {
         let mut at = 10_000;
         loop {
             at += s;
-            let Some(next) = f.follow_up(HonourMs(at), 7, W) else {
+            let Some(next) = f.follow_up(HonourMs(at), 7, W, STUCK, HUNG) else {
                 break;
             };
             for run in f.finish(t, Verdict::Unknown) {
@@ -680,12 +707,31 @@ mod tests {
             run();
         }
         assert_eq!(k.load(Ordering::SeqCst), 1, "told once, refused");
+        // Nor once the core runs again, or past the hung bound, while a
+        // renewal still waits.
+        let g = RootProbe::new();
+        let (_gn, gw) = counter();
+        let t = start(&g, 10_000, 7, &gw);
+        assert_eq!(g.follow_up(HonourMs(10_000 + s), 7, W, 0, HUNG), None);
+        assert_eq!(
+            g.follow_up(HonourMs(10_000 + s), 7, W, HUNG + 1, HUNG),
+            None
+        );
+        assert!(g
+            .follow_up(HonourMs(10_000 + s), 7, W, STUCK, HUNG)
+            .is_some());
+        let _ = g.finish(t, Verdict::Unknown);
         // A deposed epoch has no follow-up either.
         let q = RootProbe::new();
         let t = start(&q, 10_000, 7, &w);
-        let t2 = q.follow_up(HonourMs(10_000 + s), 7, W).unwrap();
+        let t2 = q
+            .follow_up(HonourMs(10_000 + s), 7, W, STUCK, HUNG)
+            .unwrap();
         let _ = q.finish(t2, Verdict::Deposed);
-        assert_eq!(q.follow_up(HonourMs(10_000 + 2 * s), 7, W), None);
+        assert_eq!(
+            q.follow_up(HonourMs(10_000 + 2 * s), 7, W, STUCK, HUNG),
+            None
+        );
         let _ = q.finish(t, Verdict::Unknown);
     }
 

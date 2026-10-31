@@ -62495,3 +62495,23 @@ the follow-up.
 `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean. Lib tests: authority 831,
 meta 380, engine `authority_driver` 34 (no failures; `a_core_that_runs_again_during_the_wait_answers_the_renewal_itself`
 now counts the follow-up read). `cargo test -p constellation-authority --release --test sim`: 291 passed (11 ignored).
+
+### Review follow-ups
+
+- **A waiting renewal could go late.** The renewal that waits for the holder's own CAS was judged against its guard
+  (a quarter of the TTL left) only when a poll fired, and once a renewal is due nothing armed one: with the CAS never
+  answered, a 10 s lease was renewed at 1 s left (idle polls back off to a quarter of the TTL), near 0 at worst, where
+  before it went at 4 s. `renew_due_in_ms` now arms the poll for the guard while a renewal waits
+  (`ShipState::renew_after_cas`, cleared when the renewal is issued). Test:
+  `a_renewal_waiting_for_a_cas_that_never_lands_goes_at_the_guard` (fails before: renewed at 1,000 ms left against the
+  2,500 ms guard).
+- `RootProbe::follow_up` judges the caller's gate again (`stuck_ms` at least `DELEG_LANE_STUCK_MIN_MS`, not past the
+  hung bound): no read follows once the core runs again. The engine's
+  `a_core_that_runs_again_during_the_wait_answers_the_renewal_itself` counts no follow-up again.
+- The daemon's dating of a proof at its read's send has a deterministic test,
+  `a_root_probe_proof_is_dated_before_its_read_leaves` (a 600 ms GET; fails with the proof dated at the return).
+
+Gates (box): fmt and clippy (`-D warnings`, workspace) clean; lib tests authority 832, meta 380, engine
+`authority_driver` 35; release sim suite 291 passed (11 ignored). Sweeps, seeds 0 to 1,999, with and without the knob,
+of the 12 configurations above: clean but `delegated-core-stall-root-backup` with the knob, seed 300 (as before);
+`locks-core-stall-backup-long-slow-reads` clean, its dated-at-return mutant still caught (5 seeds, 44 with the knob).

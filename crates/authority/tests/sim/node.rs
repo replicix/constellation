@@ -1632,8 +1632,16 @@ fn spawn_root_probe(
         if !follow.shared.alive.load(Ordering::SeqCst) {
             return;
         }
-        let now = follow.clock.now().honour;
-        if let Some(next) = follow.probe.follow_up(now, ticket.epoch, window_ms) {
+        let now = follow.clock.now();
+        let busy = follow.shared.busy_since.load(Ordering::SeqCst);
+        let stuck_ms = if busy != 0 { now.wait.0 - busy } else { 0 };
+        if let Some(next) = follow.probe.follow_up(
+            now.honour,
+            ticket.epoch,
+            window_ms,
+            stuck_ms,
+            SIM_HOLDER_STALL_MS,
+        ) {
             spawn_root_probe(follow, next, window_ms);
         }
     });

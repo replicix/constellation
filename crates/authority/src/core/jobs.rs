@@ -1812,7 +1812,10 @@ impl Core {
 
     /// How long until [`Self::renew_due`] turns true by the clock alone
     /// (`None`: it never will, or it is due already). The poll is armed
-    /// for that moment (`next_poll_ms`).
+    /// for that moment (`next_poll_ms`). A due renewal that waits for the
+    /// holder's own other lease CAS ([`Self::renew_waits_for_own_cas`]) is
+    /// due again when that wait ends by the clock, at a quarter of the TTL
+    /// left: nothing else wakes the core for it while the CAS stays out.
     pub(crate) fn renew_due_in_ms(&self, now: Now) -> Option<u64> {
         if self.lease.lost || self.lease.epoch_held() || self.ship.renew_now {
             return None;
@@ -1823,8 +1826,13 @@ impl Core {
         }
         // The honour remainder: a duration, armed as a wait-clock poll
         // (`next_poll_ms`); no honour end is due already (`None`).
-        let left = self.lease.honour_left_ms(now, &self.cfg)? - (self.cfg.ttl_ms / 2) as i64;
-        (left > 0).then_some(left as u64)
+        let honour_left = self.lease.honour_left_ms(now, &self.cfg)?;
+        let left = honour_left - (self.cfg.ttl_ms / 2) as i64;
+        if left > 0 {
+            return Some(left as u64);
+        }
+        let guard = honour_left - (self.cfg.ttl_ms / 4) as i64;
+        (self.ship.renew_after_cas && guard > 0).then_some(guard as u64)
     }
 
     /// A grant this root answered (a delegation's renewal, a lock grant
@@ -1866,6 +1874,7 @@ impl Core {
     }
 
     fn issue_renew(&mut self, now: Now, mid_ship: bool, out: &mut Vec<Action>) {
+        self.ship.renew_after_cas = false;
         let (mine, tag) = self.lease.held.clone().expect("held");
         let mut renewed = self.lease.renewed_lease(now, &self.cfg, &mine);
         self.clear_covered_tail(&mut renewed);

@@ -1986,8 +1986,15 @@ impl OffCore {
         let follow_up = async move {
             let stagger = constellation_authority::root_probe::probe_stagger_ms(window_ms);
             tokio::time::sleep(Duration::from_millis(stagger.max(1) as u64)).await;
-            let now = constellation_platform::clock::protocol().now().honour;
-            if let Some(next) = follow.root_probe.follow_up(now, ticket.epoch, window_ms) {
+            let clk = constellation_platform::clock::protocol().now();
+            let stuck_ms = follow.stuck_ms(clk.wait.0);
+            if let Some(next) = follow.root_probe.follow_up(
+                clk.honour,
+                ticket.epoch,
+                window_ms,
+                stuck_ms,
+                holder_stall_ms(),
+            ) {
                 follow.spawn_root_probe(next, node_id, window_ms);
             }
         };
@@ -7928,6 +7935,31 @@ mod tests {
         off
     }
 
+    /// Plan 41 D3, the dating rule as the daemon applies it: the proof a read
+    /// leaves is dated at the reading taken before its GET left, never at the
+    /// GET's return (the simulator's `ProbeMutant::DatedAtReturn` is this
+    /// mistake). The GET takes 600 ms here: a proof dated at the return would
+    /// be that much later than the reading before the request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_root_probe_proof_is_dated_before_its_read_leaves() {
+        let lease = constellation_store_s3::Lease::granted(PARTITION, 1, 2, 60_000);
+        let get = std::time::Duration::from_millis(600);
+        let off = stuck_fast_root_reading_in(Some(lease), get).await;
+        let before = constellation_platform::clock::protocol().now().honour;
+        assert_eq!(
+            off.answer_root_probing(true, 15_000, 1, 3, 7).await,
+            Some(4_000)
+        );
+        let after = constellation_platform::clock::protocol().now().honour;
+        let proof = off.root_probe.proof(2).expect("the read proved the tenure");
+        assert!(proof >= before, "dated before the renewal asked: {proof:?}");
+        assert!(
+            proof.0 < before.0 + 600,
+            "dated at the read's return, not its send: {proof:?} (asked at {before:?})"
+        );
+        assert!(after.0 - proof.0 >= 600, "the GET did not take its time");
+    }
+
     /// Plan 41 D3: a stuck root with a backup reads its lease object for the
     /// renewal that found its proof stale, and answers it when the read shows
     /// it still holds the tenure at the certificate's epoch. Fail-before: with
@@ -7999,10 +8031,10 @@ mod tests {
             off.answer_root_probing(true, 15_000, 1, 3, 7).await,
             Some(4_000)
         );
-        // (One read followed the first a stagger after it while the renewal
-        // waited: `RootProbe::follow_up`.)
-        assert_eq!(p.followed.load(Ordering::Relaxed), 1);
-        assert_eq!(p.started.load(Ordering::Relaxed), 2);
+        // (No read followed the first: the core ran again before the
+        // stagger, `RootProbe::follow_up`'s gate.)
+        assert_eq!(p.followed.load(Ordering::Relaxed), 0);
+        assert_eq!(p.started.load(Ordering::Relaxed), 1);
     }
 
     /// Plan 41 D3, the negative controls: a lease that names another holder,

@@ -46297,6 +46297,71 @@ fn a_due_renewal_waits_for_the_holders_own_reconfiguration_cas() {
     assert!(renewed.expires_unix_ms > listed.expires_unix_ms);
 }
 
+/// A renewal waiting for the holder's own CAS that never lands still goes at
+/// the guard (a quarter of the TTL left), not whenever an idle poll happens to
+/// fire: the waiting arms the poll for that moment (`renew_due_in_ms`).
+/// Fail-before: nothing armed it, the next polls backed off, and the renewal
+/// went out at 1 s left of a 10 s lease against the 2.5 s guard (with 1 s
+/// lease GETs, a healthy holder's lease lapsed).
+#[test]
+fn a_renewal_waiting_for_a_cas_that_never_lands_goes_at_the_guard() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let mut out = Vec::new();
+    h.core.issue_reconfig(h.clk(), vec![2], &h.meta, &mut out);
+    assert!(
+        swap_in(&out).is_some(),
+        "the reconfiguration CAS, never answered"
+    );
+    h.advance(6_000);
+    let mut out = Vec::new();
+    h.core.start(h.clk(), &h.meta, &mut out);
+    let left = |h: &Harness| {
+        h.core
+            .lease
+            .honour_left_ms(h.clk(), h.core.config())
+            .expect("an honour end")
+    };
+    let mut sent_at_left = None;
+    for _ in 0..40 {
+        let Some((id, after)) = out
+            .iter()
+            .filter_map(|a| match a {
+                Action::SetTimer {
+                    id,
+                    after_ms,
+                    kind: TimerKind::Poll,
+                } => Some((*id, *after_ms)),
+                _ => None,
+            })
+            .min_by_key(|(_, after)| *after)
+        else {
+            break;
+        };
+        h.advance(after);
+        out = h.step(Event::Timer { id });
+        if let Some(op) = out.iter().find_map(|a| match a {
+            Action::UploadDirtyChunks { op, .. } => Some(*op),
+            _ => None,
+        }) {
+            out = h.step(Event::UploadsDone {
+                op,
+                result: UploadResult::Done { held: 0 },
+            });
+        }
+        if swap_in(&out).is_some() {
+            sent_at_left = Some(left(&h));
+            break;
+        }
+    }
+    let at = sent_at_left.expect("the renewal never went");
+    let guard = (h.core.config().ttl_ms / 4) as i64;
+    assert!(
+        at >= guard - 50 && at <= guard,
+        "the renewal went at {at} ms left, the guard is {guard} ms"
+    );
+}
+
 // ---- follow-ups of the takeover of a dead holder and the lease reads ----
 
 /// A mark CAS that lost to a renewal re-reads the object; the read was
