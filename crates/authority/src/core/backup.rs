@@ -1699,7 +1699,16 @@ impl Core {
             }
             Some((_, constellation_meta::RowClass::Archive)) => AckClass::Archive,
             Some((_, constellation_meta::RowClass::RootGroup)) => AckClass::RootGroup,
-            Some((_, constellation_meta::RowClass::NonStealable)) => AckClass::NonStealable,
+            // A row of a continuation epoch's hold is non-stealable while
+            // the hold lasts; once it ended, the row is one more unshipped
+            // row of this tenure, and another node's answer waits for the
+            // log (`flex-crash` seed 39: a rename journaled in the hold and
+            // held back behind a dead member's chunk, answered at a retry
+            // after the hold as the hold's).
+            Some((_, constellation_meta::RowClass::NonStealable)) if self.lease.epoch_held() => {
+                AckClass::NonStealable
+            }
+            Some((_, constellation_meta::RowClass::NonStealable)) => AckClass::Archive,
             Some((_, constellation_meta::RowClass::DelegGroup)) | None => {
                 self.root_ack_class_for(asker)
             }

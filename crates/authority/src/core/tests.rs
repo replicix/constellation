@@ -48032,6 +48032,110 @@ mod c2f_lone_root {
         ));
     }
 
+    /// An answer parked for the archive whose row is rolled back while it
+    /// waits (here a strand; in the simulation `repair drop-held`, which
+    /// strands a held transaction and queues its op again) is not released
+    /// when the log later covers the journal seq it waited for — that seq is
+    /// another row's now — but aborted: the requester retries by rid. Fails
+    /// on the parent: the stale `Accepted` left (`flex-crash`, I1:
+    /// "expected unjournaled, committed by none").
+    #[test]
+    fn a_parked_answer_whose_row_is_rolled_back_is_aborted() {
+        let mut h = lone_root();
+        let out = h.step(forward(&h, 71, 1, "f"));
+        assert!(answers(&out).is_empty(), "waits for the archive: {out:?}");
+        let epoch = h.core.lease.epoch().unwrap();
+        h.meta.strand_below_epoch(epoch + 1).unwrap();
+        assert!(h.meta.completed_outcome(forwarded(1)).unwrap().is_none());
+        // Another row, and the log covers everything journaled.
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: h.rid(2),
+            op: h.create("o"),
+            tag: Default::default(),
+        });
+        let out = h.archive_lands();
+        assert!(answers(&out).is_empty(), "not released: {out:?}");
+        assert!(
+            sends(&out).iter().any(|(to, m)| *to == FROM
+                && matches!(
+                    m,
+                    PeerMsg::MutateReply {
+                        outcome: MutateOutcome::Busy,
+                        ..
+                    }
+                )),
+            "aborted: {out:?}"
+        );
+        assert_eq!(h.core.stats.acks_row_gone, 1);
+    }
+
+    /// Another node's retry answered from the dedup waits for the rid's own
+    /// row in the log, not for the journal's tip: rows ship past a deferred
+    /// one, so a tip in the log says nothing of the row (`flex-crash` seed
+    /// 39: a rename's row held back behind a dead member's chunk, the retry
+    /// answered `Accepted` once a later row had shipped). Fails on the
+    /// parent: answered at once.
+    #[test]
+    fn a_retry_answered_from_the_dedup_waits_for_its_own_row() {
+        let mut h = lone_root();
+        h.step(forward(&h, 71, 1, "f"));
+        let own_row = h.meta.journal_tip().unwrap();
+        let first = h.meta.outcome_row(forwarded(1)).unwrap().unwrap().jseq;
+        // The first answer's park is given up (here: aborted as at a lease
+        // loss), and a later row ships ahead of the forward's.
+        let mut out = Vec::new();
+        h.core.abort_durable_parks(h.clk(), &h.meta, &mut out);
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: h.rid(2),
+            op: h.create("o"),
+            tag: Default::default(),
+        });
+        let later = h.meta.journal_tip().unwrap();
+        assert!(later > own_row);
+        h.core.note_shipped(&[later], 0);
+        let out = h.step(forward(&h, 72, 1, "f"));
+        assert!(answers(&out).is_empty(), "waits for its own row: {out:?}");
+        let rows: Vec<u64> = (first..=own_row).collect();
+        h.core.note_shipped(&rows, 0);
+        let out = release(&mut h);
+        assert!(
+            matches!(
+                answers(&out).as_slice(),
+                [(MutateOutcome::Accepted { .. }, true)]
+            ),
+            "{out:?}"
+        );
+    }
+
+    /// A row journaled in a continuation epoch's hold is non-stealable only
+    /// while the hold lasts: another node's retry answered after it waits
+    /// for the log (`flex-crash` seed 39: answered as the hold's after the
+    /// hold had ended, the row held back behind a dead member's chunk).
+    /// Fails on the parent: `NonStealable` whatever the hold.
+    #[test]
+    fn a_hold_row_answered_after_the_hold_waits_for_the_archive() {
+        let (mut h, _) = listed_holder();
+        let epoch = h.core.lease.epoch().unwrap();
+        h.core.lease.adopt_epoch_hold(h.clk(), epoch);
+        {
+            let _class = constellation_meta::PendingClass::set(RowClass::NonStealable);
+            constellation_meta::execute_mutate(&h.meta, &h.create("f"), Some(forwarded(1)))
+                .unwrap();
+        }
+        let class = |h: &Harness| {
+            h.core
+                .journaled_answer_class_for(&h.meta, forwarded(1), Asker::Remote)
+                .unwrap()
+        };
+        assert_eq!(class(&h), AckClass::NonStealable, "in the hold");
+        h.core.lease.release_local();
+        assert!(!h.core.lease.epoch_held());
+        assert_eq!(class(&h), AckClass::Archive, "after it");
+        assert_eq!(classes_of(&h, forwarded(1)), vec![RowClass::NonStealable]);
+    }
+
     /// A row of another node's op journaled `Lone` (a lone root before C2)
     /// that another node asks for again is answered from the archive, and
     /// re-tagged `Archive` first so that its strand follows the answer.

@@ -363,7 +363,12 @@ impl Core {
             )
         };
         let shipped = replica.journal_acked_seq().unwrap_or(0);
-        let durable = self.answer_need(&position, class, asker, shipped);
+        let durable =
+            if executed || asker == super::Asker::Own || !super::backup::is_answer(&outcome) {
+                self.answer_need(&position, class, asker, shipped)
+            } else {
+                self.dedup_answer_need(rid, &position, class, shipped, replica)
+            };
         if wait.is_some() || durable.is_some() {
             // Only an acknowledgement's wait for durability says now what
             // it waits for (`held_for_upload`); the rest is worked out
@@ -392,6 +397,9 @@ impl Core {
             );
             if let Some(b) = blockers {
                 self.keep_parked_blockers(now, rid, b);
+            }
+            if durable.is_some() {
+                self.keep_parked_completed(rid, replica);
             }
             if durable.is_some() && upload && req != OpId(0) {
                 self.held_for_upload(rid, own_chunks, out);
@@ -436,6 +444,35 @@ impl Core {
             class,
             out,
         );
+    }
+
+    /// Plan 43 C2f: what an answer to another node's retry, given from the
+    /// rid's earlier execution here (the dedup), waits for: that execution's
+    /// own journal row, not the journal's tip. The ship plan sends rows past
+    /// a deferred one (`shipped_rows`), so the tip in the log says nothing of
+    /// an earlier row still held back (behind a chunk only a dead node had,
+    /// `flex-crash`: an `Accepted` left for a rename whose row had not
+    /// shipped). A row that left the journal shipped (its `completed` row
+    /// stays; a strand takes it and the in-memory `recent` answer with it).
+    /// A delegate's row (`gen` != 0) the root appended waits as the tip does.
+    fn dedup_answer_need(
+        &self,
+        rid: Rid,
+        position: &Position,
+        class: super::AckClass,
+        shipped: u64,
+        replica: &dyn Replica,
+    ) -> Option<u64> {
+        if class == super::AckClass::NonStealable {
+            return None;
+        }
+        match replica.outcome_row(rid) {
+            Some(row) if row.gen == 0 => {
+                (!self.park_durable(row.jseq, true, shipped)).then_some(row.jseq)
+            }
+            Some(_) => self.answer_need(position, class, super::Asker::Remote, shipped),
+            None => None,
+        }
     }
 
     /// EC2 campaign 8 A-1: a peer forwarded an op to this node (or renewed

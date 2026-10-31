@@ -1409,6 +1409,10 @@ pub struct Stats {
     /// so; a lone root answers it from the archive. Warned once
     /// (`status.ack.ungated_shadows`).
     pub ungated_shadows: u64,
+    /// Plan 43 C2f: answers parked for durability whose row was rolled back
+    /// while they waited (`repair drop-held`), aborted instead of released
+    /// when the log covered the seq they waited for.
+    pub acks_row_gone: u64,
     /// Plan 43 C1-3: the tail fetch. `SealTail`s answered by this node as a
     /// holder (it sealed its own epoch), as a backup, and refused;
     /// attempts of a claim to fetch, fetches completed (of those, of a

@@ -1918,6 +1918,7 @@ impl Core {
                         gen,
                         held_timer: None,
                         blockers: None,
+                        completed: None,
                         class,
                     }
                 };

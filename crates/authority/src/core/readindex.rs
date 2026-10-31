@@ -136,6 +136,13 @@ pub(crate) enum ParkedWhat {
         /// Plan 43 C2a: what the answer waits for (the class the row was
         /// journaled under), counted when it leaves.
         class: AckClass,
+        /// Plan 43 C2f: the rid's `completed` row when the answer parked for
+        /// durability. A row rolled back meanwhile (`repair drop-held`
+        /// strands a held transaction and queues its op again) leaves the
+        /// journal seq the answer waits for to another row: the answer is
+        /// then not released when the log covers that seq, but aborted (the
+        /// requester retries by rid).
+        completed: Option<constellation_meta::CompletedOutcome>,
     },
     /// A local client op's `finish`, as the sequencer that decided it
     /// (`class`: what the answer waits for).
@@ -1196,6 +1203,7 @@ impl Core {
                 class,
                 held_timer: None,
                 blockers: None,
+                completed: None,
             },
         );
         self.rd.parked_rids.insert(rid, id);
@@ -1230,6 +1238,21 @@ impl Core {
         }) = self.rd.parked.get_mut(id)
         {
             *blockers = Some((now.wait, b));
+        }
+    }
+
+    /// Plan 43 C2f: keep `rid`'s `completed` row with its reply parked for
+    /// durability (`ParkedWhat::Reply::completed`).
+    pub(crate) fn keep_parked_completed(&mut self, rid: Rid, replica: &dyn Replica) {
+        let Some(id) = self.rd.parked_rids.get(&rid) else {
+            return;
+        };
+        if let Some(Parked {
+            what: ParkedWhat::Reply { completed, .. },
+            ..
+        }) = self.rd.parked.get_mut(id)
+        {
+            *completed = replica.completed_outcome(rid).ok().flatten();
         }
     }
 
@@ -1670,12 +1693,13 @@ impl Core {
         // of them.
         let mut cache = super::delegate::StreamCache::default();
         let mut dropped: Vec<u64> = Vec::new();
+        let mut gone: Vec<u64> = Vec::new();
         let ready: Vec<u64> = self
             .rd
             .parked
             .iter()
             .filter(|(id, p)| {
-                p.waiting.is_empty()
+                let ready = p.waiting.is_empty()
                     && p.quarantine.is_none_or(|q| q <= now.wait)
                     && p.durable.is_none_or(|j| {
                         self.park_durable(j, p.what.to_remote(self.cfg.node_id), shipped)
@@ -1690,7 +1714,25 @@ impl Core {
                                 false
                             }
                         }
-                    })
+                    });
+                // Plan 43 C2f: an answer about to leave whose row was rolled
+                // back while it waited (read once, at the release).
+                if let (
+                    true,
+                    Some(_),
+                    ParkedWhat::Reply {
+                        rid,
+                        completed: Some(c),
+                        ..
+                    },
+                ) = (ready, p.durable, &p.what)
+                {
+                    if replica.completed_outcome(*rid).ok().flatten() != Some(*c) {
+                        gone.push(**id);
+                        return false;
+                    }
+                }
+                ready
             })
             .map(|(id, _)| *id)
             .collect();
@@ -1723,6 +1765,10 @@ impl Core {
         // carrying it was dropped; its acknowledgement is never given.
         for id in dropped {
             self.stats.deleg_acks_dropped += 1;
+            self.abort_park_busy(now, id, replica, out);
+        }
+        for id in gone {
+            self.stats.acks_row_gone += 1;
             self.abort_park_busy(now, id, replica, out);
         }
         for id in ready {
@@ -1813,6 +1859,7 @@ impl Core {
                     held_timer,
                     // Worked out afresh: the reply leaves once.
                     blockers: _,
+                    completed: _,
                     class,
                 } => {
                     let class = if downgraded { AckClass::Lone } else { class };
