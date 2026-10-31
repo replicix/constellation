@@ -10368,7 +10368,8 @@ fn idle_cluster_is_quiet(_seed: u64) -> Result<()> {
 
     let (env, root) = setup("idle-cluster-quiet")?;
     let _proxy = env.s3_proxy()?;
-    let backend = format!("s3://{BUCKET}/idle-quiet-{}", ts());
+    let prefix = format!("idle-quiet-{}", ts());
+    let backend = format!("s3://{BUCKET}/{prefix}");
     let counters = [
         env.counting_proxy()?,
         env.counting_proxy()?,
@@ -10409,6 +10410,42 @@ fn idle_cluster_is_quiet(_seed: u64) -> Result<()> {
     eventually("writer's journal drains", Duration::from_secs(60), || {
         journal_drained(&a)
     })?;
+    // A node that has not yet seen any commit is still catching up: its
+    // first follow of the head finds nothing known and falls back to one
+    // `LIST commits/` (`CommitChain::discover_head`). The holder's first
+    // publish comes tens of seconds after the mount, so a follower's first
+    // idle follow can run before it. Wait for the first commit, then for
+    // each follower to have read the commit chain after it exists; from
+    // then on a follow probes with GETs.
+    eventually("first commit published", Duration::from_secs(150), || {
+        anyhow::ensure!(
+            count_commit_objects(&env.direct_endpoint, &prefix)? > 0,
+            "no commit object yet"
+        );
+        Ok(())
+    })?;
+    let seen_before: Vec<usize> = counters.iter().map(|k| k.requests().len()).collect();
+    for (i, follower) in [&b, &c].into_iter().enumerate() {
+        let (counter, from) = (&counters[i + 1], seen_before[i + 1]);
+        eventually(
+            &format!(
+                "{} reads the commit chain after the first commit",
+                follower.name
+            ),
+            Duration::from_secs(120),
+            || {
+                anyhow::ensure!(
+                    counter
+                        .requests()
+                        .iter()
+                        .skip(from)
+                        .any(|r| !r.is_list() && r.touches("/commits/")),
+                    "no commit read since the first commit appeared"
+                );
+                Ok(())
+            },
+        )?;
+    }
     // Let the backoff start from a clean slate, then measure.
     for counter in &counters {
         counter.reset();
