@@ -1511,14 +1511,16 @@ impl Core {
             // stops there, ADR-39), whether or not a batch found it before
             // (`lost_from`, in memory only): judged by the row's own deps, as
             // captured. A dependency on another of this node's generations
-            // must be in the log or re-appended already.
+            // must be in the log or re-appended already. A row whose deps
+            // were not captured (no journal head recorded them) is not judged
+            // safe: it and the rest are replayed by rid.
             let lost = self
                 .dl
                 .mine
                 .get(&gen)
                 .and_then(|d| d.lost_from)
                 .is_some_and(|l| idx >= l)
-                || deps.as_ref().is_some_and(|d| {
+                || deps.as_ref().is_none_or(|d| {
                     replica.deps_lost(d)
                         || d.streams.iter().any(|(g, i)| {
                             g != gen && own_gens.contains(&g) && i > replica.log_stream_idx(g)

@@ -914,6 +914,13 @@ seal path, `on_deleg_sealed`, before the end).
    tail's rename of a name out of `d1`, which needed the recall) is
    ordered correctly by construction. A row that still does not apply is
    `TailDiverged` (gate closed, the sim fails the seed).
+   *As landed in part (2026-10-31, `Core::reappend_own_delegate_rows`): the
+   re-append halts at a row whose captured `deps` are lost or missing, or
+   name another of this node's generations past the log; it does not judge
+   `deps.pending` (a root position of the old tenure, past `tail_through`)
+   nor other nodes' generations. That is the causal gap the replay by rid it
+   replaces had too, not a regression, and the keys of live generations are
+   disjoint.*
    Deleted: `strand_for_takeover`'s re-execution of `own_gens` rows by
    rid (`spec.rs:3181-3215`), the `holed` generations,
    `mark_deleg_stranded_tx`, `delegate_stranded`, the stopped-at-install

@@ -14628,6 +14628,48 @@ mod locks {
         }
     }
 
+    /// A row whose `deps` were not captured (no journal head recorded them)
+    /// is not re-appended, nor is anything after it: the rows replay by rid.
+    /// Fails on the parent (an uncaptured row skipped the dependency check
+    /// and was re-appended).
+    #[test]
+    fn the_takeover_gate_re_appends_no_row_whose_deps_were_not_captured() {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let (dir, _) = delegated_file(&h.meta);
+        two_delegate_rows(&h, dir);
+        let rows: Vec<_> = crate::replica::Replica::journal_txs_from(&h.meta, 0, usize::MAX)
+            .into_iter()
+            .filter(|tx| tx.origin.0 == 7)
+            .map(|tx| (tx, None))
+            .collect();
+        assert_eq!(rows.len(), 2);
+        h.core = Core::new(h.core.cfg.clone());
+        h.hold(
+            2,
+            Some(PendingGate {
+                epoch: 2,
+                takeover: true,
+                marker_shipped: true,
+                drained: false,
+                fast_prev: false,
+                backup_tail_epoch: Some(1),
+                shippable: true,
+            }),
+        );
+        // The capture as if no head had recorded the rows' deps.
+        h.core.bk.gate_own_rows = Some((2, rows));
+        let mut out = Vec::new();
+        h.core.complete_gate(h.clk(), &h.meta, &mut out);
+        assert_eq!(h.core.stats.own_deleg_rows_reappended, 0);
+        let own = crate::replica::Replica::journal_txs_from(&h.meta, 0, usize::MAX)
+            .into_iter()
+            .filter(|tx| tx.origin.0 == 7)
+            .count();
+        assert_eq!(own, 0, "re-appended without its deps");
+    }
+
     /// A row whose dependency is lost (another generation ended below it,
     /// ADR-39) is not re-appended, though this node, restarted, never read
     /// a batch of it (`lost_from` is in memory only): the gate judges each
