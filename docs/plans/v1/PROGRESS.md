@@ -62542,3 +62542,52 @@ last exit criterion is ticked.
   numbers and the fixes are unchanged.
 - **Follow-up, not an open criterion.** The kernel-release table of §5.4 stays empty until the patch package is merged
   upstream.
+
+## Review follow-ups of the held-names change: the guard tests that guarded nothing (plan 40, 2026-10-31)
+
+The review of `8f5af546` ("a plus page hands a name the kernel holds from a lookup name-only") said some of its
+guard tests might pass whether or not the code they guard works. Five items; each test below was run against a
+mutant of the guarded code (the harness rows on a ring-less `/dev/fuse` transport, kernel 7.3-rc4, one node or two).
+
+**1. `kernel-race-dir-version-plus`: the wait came before the open.** The row waited 1.5 s after its `MKDIR` so the
+page would carry the directory's attributes, and then `dir_version` opened its descriptors: the open's path walk was
+a `LOOKUP`, which held the name again, so the first rounds listed it name-only. The helpers (`dir_version`,
+`rename_ctime`) now take a `Listing`: the wait follows the opens, then a probe listing must hand the name with
+attributes (it fails at once otherwise, naming the cause), and a round counts only when its own page handed
+attributes and left none `held` (else it is made again, twice in a row fail the row; `redone` is printed).
+Fail-before (mutants of the helper): the wait placed before the opens, as it was: all three plus rows with a
+listing (`dir-version-plus`, `-remote-plus`, and `rename-ctime-plus` with no wait at all) fail in the probe ("handed
+0 entries with attributes and 1 name-only as held"); with the wait after the opens they pass with `redone=0`.
+
+**2. `kernel-race-rename-ctime-plus`, round 1.** Its first round listed the file the open had just looked up, so the
+page handed it name-only; and each round began with a path lookup of the source (`has`), which held it again
+whenever its dentry had expired. The wait and probe above fix round 1; `rename_ctime` no longer looks a name up by
+path before its listing (the rename's own `ENOENT` says a name is gone). Same mutant, same result.
+
+**3. Delete notice, at the wire.** Only the entry notice had a wire test. New:
+`readdirplus_hands_a_name_the_kernel_was_told_was_deleted` (two names of one inode held; a `FUSE_NOTIFY_DELETE`
+for one is written; its page entry carries attributes, the other name stays held). Fail-before: with the delete
+arm's `dropped` removed it fails (`left [("a",0)..]`, `right [("a",21)..]`); passes with it. The engine produces no
+`Deleted` yet, so this is the adapter's side only.
+
+**4. The two-node hold: `readdirplus-held-remote` (new).** Node A's kernel holds four names from lookups; node B
+`chmod`s one, replaces one (a new inode) and renames one away and back; A lists within the entry TTL (the
+attempt is made again when slower than 600 ms after the lookups; 8 attempts): the untouched and the `chmod`ed name
+are handed name-only (`held` +2), the replaced and the renamed one with attributes (+2), and each name then
+answers what B made of it. Mutants: A's entry notice no longer forgets the hold: entries 1 held 3 in all 8
+attempts, fails; `holds` stubbed to false: entries 4 held 0, fails; the inode check dropped alone: passes (the
+notice already forgot the replaced name; the inode check is the wire test's, `readdirplus_hands_a_name_the_kernel_holds_name_only`), dropped together with the notice's forget: fails (entries 0 held 4).
+
+**5. `dir-version-plus` fail-before: not shown, and not showable on this kernel.** With
+`CONSTELLATION_FUSE_DIR_CHANGE_NOTIFY=off`, with every round's page carrying the directory's attributes
+(`plus_entries` 20, `held` 0, `redone` 0), the plus row has 0 stale rounds in 360 (nine runs, both transports,
+both directory TTLs), where `kernel-race-dir-version` fails 20 of 20 under the same setting: this kernel does not
+install the late plus entry's link count. The earlier line "`dir-version-plus` is a real row ... 6 of 20 stale"
+(P9 results) does not reproduce, before or after this change: the row is a guard here, like `rename-ctime-plus`,
+and a comment in the scenario says so. What the row now proves is that its pages carry the attributes it holds.
+
+Gates: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`; frontend-fuse lib (158)
+and `--tests` (158 + 66), vfs (69), engine lib (938, after a full disk had failed two tests), harness lib (163,
+`platform-parity.toml` and the parity list carry the new scenario) pass. Harness, three runs each, all green:
+`kernel-race-{dir-version,rename-ctime,dir-version-remote}` and their `-plus` rows, each on both transports, and
+`readdirplus-held-remote` (one `redone=1` in 48 row results, under load).
