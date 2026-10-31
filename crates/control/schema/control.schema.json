@@ -3943,7 +3943,7 @@
           ]
         },
         "opaque": {
-          "description": "An uncaptured transaction (holder capture off) was held, so every\ntransaction after it is held too.",
+          "description": "An uncaptured transaction (one without before-images) was held, so every\ntransaction after it is held too.",
           "type": "boolean"
         },
         "records": {

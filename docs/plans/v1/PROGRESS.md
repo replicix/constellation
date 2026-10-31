@@ -63117,3 +63117,33 @@ Gates: fmt, clippy (workspace, `-D warnings`), authority lib 849, meta lib 382, 
 suite 300 passed. Seeds 0 to 1,999 with and without the knob: `delegated-holder-cut`, `placement-hot`, `long-delegated`,
 `-backup`, `-late-answers`, `delegated-backup`, `-crash`, `-partition`, `-root-crash`, `-root-gone`, `shared-dir-split`
 and the four `delegated-two-gens-*` 0, but `placement-hot` 593 with the knob (open on main).
+
+## Holder capture's off mode removed (maintainer's decision, 2026-10-31)
+
+Measured above: with `CONSTELLATION_HOLDER_CAPTURE=0` the simulation lost and duplicated acknowledged writes, for a root
+and for a delegation. The switch is gone, without a shim: the variable (`holder_capture_default`), `Meta::holder_capture`
+and `set_holder_capture`, `Replica::holder_capture`, the switch's term in `Meta::begin_local`'s capture condition, the
+deposition's capture branch (`Core::recover_deposed` always strands by epoch), and the held proptest's capture-toggling
+step. Tests converted (none dropped): meta `a_rebuild_replaces_the_namespace_and_queues_the_journal` (was
+`with_capture_off_a_holder_defers_publishing_and_rebuilds_on_deposition`, its rebuild half) and
+`a_rebuild_keeps_the_outcomes_the_rebuilt_log_carries`; core `a_deposition_rebuild_moves_the_cursor_to_the_rebuilt_position`
+(the rebuild now from a delegation row the deposed root appended) and `a_waiting_install_ends_at_the_end_in_the_log`
+(its capture-off cases dropped, both ends kept). No sim configuration ran with capture off.
+
+Kept, because capture on still reaches them: the deposition rebuild (`Action::RebuildReplica`, `replace_ns_from_rebuilt`)
+for the rows a strand by epoch leaves — a delegation's rows this root appended (`delegated-holder-cut`, seeds 0 to 1,999,
+counts 2 rebuilds on main, capture on); C3's member copy replaces it. And the handling of a transaction journaled without
+before-images (`uncaptured_tx_count`, the publish deferral, the ship plan's opaque rule, `drop-held`'s refusal):
+capture applies to a holder, a delegate, or while speculation exists, so a non-holder's write outside all three is
+still uncaptured (the tree publisher's unit tests publish such writes). Their comments and the error now say so instead
+of naming the switch. Docs: `configuration.md` (the row and the parsing note removed), `forwarded-mutations.md`,
+`delegations.md`, `write-path-hygiene.md`, ADR-19's consequences, plan 43 C3 item 4.
+
+Gates: fmt and clippy (workspace, all targets, `-D warnings`) clean; authority lib and `meta_repro` 853, meta (every
+target) 536, engine (every target) 948, control 146 (schema re-blessed: the `opaque` field's description), release sim
+suite 300 passed (11 ignored). Seeds 0 to 1,999, with and without the knob: `delegated-holder-cut`, `delegated-backup`,
+`-crash`, `-partition`, `-root-crash`, `-root-gone`, the four `delegated-two-gens-*`, `long-delegated`, `-backup`,
+`-late-answers`, `placement-hot`, `shared-dir-split`, `backup`, `backup-crash`, `backup-strict`, `backup-hot`,
+`backup-two`, `long-backup`, `long-acks3`, `far`, `flex-crash` 0, but `placement-hot` 593 with the knob (open on main).
+`delegated-holder-cut +commit`: as after the previous commit (`deleg-group` 124, 228, 501, 763, 1849, 1900; with the
+knob 228).

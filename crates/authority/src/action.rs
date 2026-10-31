@@ -116,8 +116,10 @@ pub enum Action {
         /// something to the application the lock serves.
         locked: bool,
     },
-    /// A deposition recovery found journal rows with no before-images
-    /// (holder capture off): rebuild the namespace from the shared log
+    /// A deposition recovery found journal rows its strand by epoch left
+    /// (rows of a delegation generation this node appended as the root,
+    /// or journaled without before-images): rebuild the namespace from the
+    /// shared log
     /// (`Meta::replace_ns_from_rebuilt` over a bootstrapped side replica)
     /// and report `Event::RebuildDone`.
     RebuildReplica { op: OpId },

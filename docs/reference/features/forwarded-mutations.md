@@ -290,10 +290,10 @@ always a prefix of the durable log plus speculation it can take back:
   too: each journaled transaction writes, in its own fjall transaction, a
   `journal_tx` row (where it ends in the journal, the op and rid a replay
   re-executes, the epoch it ran under) and a `Local` speculation row with
-  its before-images. Capture is on by default; the internal switch
-  `CONSTELLATION_HOLDER_CAPTURE=0` turns the before-images off (the
-  milestone's performance-gate fallback, see "Publishing" and
-  "Deposition").
+  its before-images. Capture is always on. (The milestone's
+  performance-gate fallback that turned it off, `CONSTELLATION_HOLDER_CAPTURE=0`,
+  was removed on 2026-10-31: with it off acknowledged writes were lost or
+  applied twice.)
 - **Transactions ship whole.** A shipped segment never splits a journaled
   transaction: batches end on a transaction boundary and the byte cap cuts
   before one. An op's records and its `Completed { rid }` therefore reach
@@ -440,10 +440,11 @@ always a prefix of the durable log plus speculation it can take back:
   before-images and queued for replay by rid through the new holder.
   Only a genuine overlap then becomes a conflict copy. This replaced
   reintegration's classify-against-a-side-replica pass; the `reintegrate`
-  command still exists and runs the same recovery at once. With holder
-  capture off, the namespace is instead rebuilt from the shared log (a
-  side replica bootstrapped from the head commit) and the journal's ops
-  queued the same way.
+  command still exists and runs the same recovery at once. Rows the
+  strand by epoch leaves (a delegation's rows this root appended, which
+  belong to their generation) have the namespace rebuilt from the shared
+  log instead (a side replica bootstrapped from the head commit) and the
+  journal's ops queued the same way.
   A mutation an application issues on the deposed node before that
   recovery has run is not refused: it goes through the authority core
   like any other op that misses the fast path. It waits for the recovery
@@ -451,10 +452,9 @@ always a prefix of the durable log plus speculation it can take back:
   journal holds rows no holder has it is not forwarded), is then held
   until this node's own stranded ops queued ahead of it have landed, and
   is forwarded to the new holder under the same rid. How long the
-  recovery takes depends on the case: with holder capture on it is a
-  tail to head and a rollback from before-images; with capture off, or
-  for rows capture did not cover, a replica rebuilt from the log, as long
-  as that read takes. A deposed node whose recovery cannot complete (the
+  recovery takes depends on the case: a tail to head and a rollback from
+  before-images; for rows the strand leaves, a replica rebuilt from the
+  log, as long as that read takes. A deposed node whose recovery cannot complete (the
   log is unreadable) used to answer each mutation with `EIO` at once;
   each now waits for the client deadline (twice the lease TTL) and ends
   in doubt.
@@ -478,8 +478,9 @@ always a prefix of the durable log plus speculation it can take back:
   holder with an unshipped journal publishes with every key that journal
   touched replaced by its earliest before-image — exactly its value at the
   last shipped position — and leaves those keys dirty for the publish
-  after the journal ships. With holder capture off, a holder does not
-  publish while its journal is non-empty. A snapshot (which needs a commit
+  after the journal ships. A journal holding a transaction without
+  before-images (a write from before this node held the lease) is not
+  published until it ships. A snapshot (which needs a commit
   reflecting the replica as it stands) ships first and retries while any
   of this is outstanding.
 - **Releases are fenced exactly.** A release or handoff raises a

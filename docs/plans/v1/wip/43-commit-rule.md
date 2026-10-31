@@ -951,9 +951,10 @@ seal path, `on_deleg_sealed`, before the end).
    (§5.6) instead of the `RebuildReplica` → `reset_for_rebuilt_ns_tx`
    → `Records` replays path. `recover_deposed` (`jobs.rs:1381-1410`)
    never emits `RebuildReplica` for captured journals;
-   `reset_for_rebuilt_ns_tx` keeps only the uncaptured fallback
-   (`CONSTELLATION_HOLDER_CAPTURE=0`), where it queues nothing for gated
-   rows. *(C3 spec D12, D13: the rebuild criterion is
+   `reset_for_rebuilt_ns_tx` keeps only the uncaptured case (the
+   `CONSTELLATION_HOLDER_CAPTURE=0` fallback was removed on 2026-10-31,
+   unsafe; what is left is a row journaled without before-images), where
+   it queues nothing for gated rows. *(C3 spec D12, D13: the rebuild criterion is
    `uncaptured_tx_count() > 0`, not `journal_len() > 0` — a deposed root
    that is also a delegate keeps its own delegate rows, its live stream;
    the uncaptured fallback keeps today's replay of a node's own delegate

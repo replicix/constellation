@@ -387,9 +387,12 @@ phantom state and answered `EEXIST` for a name that never existed.
 stranded branch against a side replica: it is rollback plus replay by
 rid, and only true overlaps become conflict copies. Holder capture costs
 a before-image write per journaled transaction. It passed the milestone's
-10% performance gate and stays on. `CONSTELLATION_HOLDER_CAPTURE=0` is
-the internal fallback, which rebuilds a deposed holder from the shared
-log instead. The Stateright model's `commits_are_log_prefixes` and
+10% performance gate and stays on. `CONSTELLATION_HOLDER_CAPTURE=0` was
+the internal fallback, which rebuilt a deposed holder from the shared log
+instead; it was removed on 2026-10-31 (plan 43) because the off path no
+longer kept the invariants: in the simulation it lost and duplicated
+acknowledged writes, for a root and for a delegation. Capture is always
+on; the rebuild remains for the rows a deposition's strand leaves. The Stateright model's `commits_are_log_prefixes` and
 `converged_at_quiescence` properties hold under the `Recovery` variant.
 
 **Rejected**: rebuilding the replica from the head commit after every

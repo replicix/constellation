@@ -215,8 +215,7 @@ syncs it again every second while an install waits (the segment's records
 are not the only way the wait ends: a journal that could not be read waits
 too). The end counts as applied once the cut it carries is kept
 (`deleg_void_cut`), which applying the segment does also when the record
-was installed from the stream before and not applied again (holder capture
-off), and for an older `Recall` without a cut (kept at the log's index of
+was installed from the stream before and not applied again, and for an older `Recall` without a cut (kept at the log's index of
 the generation). `status.delegation.install_waiting` lists a waiting
 install with what it waits for, `install_waits` and `install_wait_ms` count
 them, and a warning goes out after 5 s of waiting and every minute after.

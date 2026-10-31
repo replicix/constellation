@@ -49,17 +49,20 @@
 //!
 //! # When capture applies
 //!
-//! Capture is on (`Meta::holder_capture`, `CONSTELLATION_HOLDER_CAPTURE`)
-//! and either this node holds the lease (`Meta::holder_epoch` is set) or
-//! the speculation log is not empty. The second arm keeps M3a's invariant
+//! Capture applies when this node holds the lease (`Meta::holder_epoch`
+//! is set), executes as a delegate, or the speculation log is not empty.
+//! (There is no switch: the plan 30 §M3b performance-gate fallback that
+//! turned it off, `CONSTELLATION_HOLDER_CAPTURE`, was removed on
+//! 2026-10-31 — with it off the commit rule lost and duplicated
+//! acknowledged writes.) The second arm keeps M3a's invariant
 //! — while any `spec` row exists, every `ns` write is captured, so a
 //! rollback can never wipe an uncaptured write — for the rare local write
 //! a non-holder makes (an offline designation's `Proceed`). Such a row
 //! carries epoch 0 and never strands by epoch; it only retires when it
-//! ships. With capture off, the `journal_tx` row is still written (the
-//! transaction boundary and the op for a replay), and the fallback applies:
-//! a holder with an unshipped journal defers its publishes, and a deposed
-//! holder rebuilds its namespace from the head commit.
+//! ships. A write outside all three (a non-holder's, nothing speculative)
+//! journals its `journal_tx` row without before-images, counted
+//! (`uncaptured_tx_count`): a journal holding one is not published, and
+//! the ship plan holds everything after it.
 //!
 //! # Cost
 //!
@@ -70,8 +73,8 @@
 //! `spec_seq` counter — plus the `local_spec_count` counter's read and
 //! write. The usage delta comes from a thread-local note
 //! (`store::usage_note_begin`), not from reading the persisted counters.
-//! With capture off: the two journal-counter reads, the `journal_tx` row,
-//! and the `uncaptured_tx_count` counter. Shipping deletes the rows again
+//! Uncaptured: the two journal-counter reads, the `journal_tx` row, and
+//! the `uncaptured_tx_count` counter. Shipping deletes the rows again
 //! at a cost proportional to what shipped: the retirement and the `spec`
 //! compaction range from the acked watermark and the `spec` floor, never
 //! from the start of a keyspace, whose retired history the LSM keeps as
@@ -490,11 +493,10 @@ impl Meta {
         // Plan 30 §M11: a delegate's transactions are speculation like a
         // holder's (retired by the log, stranded by a recall), so they
         // are captured too.
-        let capturing = self.holder_capture()
-            && (epoch != 0
-                || journal::PendingDelegate::peek().is_some()
-                || counter_get(tx, &self.local, KV_SPEC_LIVE_COUNT)? > 0
-                || counter_get(tx, &self.local, KV_LOCAL_SPEC_COUNT)? > 0);
+        let capturing = epoch != 0
+            || journal::PendingDelegate::peek().is_some()
+            || counter_get(tx, &self.local, KV_SPEC_LIVE_COUNT)? > 0
+            || counter_get(tx, &self.local, KV_LOCAL_SPEC_COUNT)? > 0;
         let capture = if capturing {
             usage_note_begin();
             Some(spec::Capture::new())
@@ -1486,7 +1488,7 @@ impl Meta {
     }
 
     /// How many unshipped transactions were journaled without
-    /// before-images (holder capture off, or from before it was on): one
+    /// before-images (a non-holder's write outside speculation): one
     /// counter read. With any, the ship plan holds everything after the
     /// first held or deferred transaction (`store::held`'s opaque rule)
     /// and the publisher defers. A continuation epoch's hold owner
@@ -1786,8 +1788,8 @@ pub enum PublishBasis {
     Substituted(LogPrefixView),
     /// No commit can reflect this replica right now: requester speculation
     /// (a shadow or hint) is outstanding, or this node's unshipped journal
-    /// was not captured (holder capture off — the fallback — a transaction
-    /// from before it was switched on, or a continuation epoch's hold).
+    /// holds a transaction journaled without before-images (a non-holder's
+    /// write outside speculation).
     Defer,
 }
 

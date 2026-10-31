@@ -387,8 +387,8 @@ impl TreePublisher {
     /// before-image instead — exactly its value at `applied_seq`, the
     /// position the commit claims (`Meta::publish_basis_at`) — and stays
     /// dirty, so the publish after the journal ships carries the real
-    /// value. With holder capture off (the performance-gate fallback) the
-    /// journal is uncaptured and a holder defers until it is empty.
+    /// value. A journal holding a transaction without before-images (a
+    /// write from before this node held the lease) defers until it ships.
     pub async fn publish(&mut self, epoch: u64) -> Result<Option<Commit>> {
         if !self.meta.has_dirty() {
             return Ok(None);

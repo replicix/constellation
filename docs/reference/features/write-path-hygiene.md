@@ -117,7 +117,7 @@ through it.
 |---|---|
 | `transactions`, `records` | what the last ship round held back |
 | `oldest_seq` | the oldest held journal sequence |
-| `opaque` | holder capture is off, so a held transaction's keys are unknown and everything after it is held too |
+| `opaque` | a held transaction was journaled without before-images (a write from before this node held the lease), so its keys are unknown and everything after it is held too |
 | `inodes[]` | each inode with unrecoverable chunks: `ino`, `path`, `missing_chunks` (hex), `seeds` |
 | `deferred` | transactions waiting (not held) for a chunk still uploading — this node's, or one another node forwarded as pending |
 | `remote[]` | each chunk another node is expected to upload: `ino`, `path`, `node`, `chunk` (hex), `age_s` |
@@ -148,8 +148,8 @@ example during an S3 outage) is retried with backoff (250 ms doubling to
 10 s) without holding up later replays; after 10 s the node asks for the
 lease to make it locally, and `status.speculation.copies_pending` /
 `copies_stalled` (and the `constellation_speculation_copies_stalled`
-metric, and a red dashboard note) show it. A copy is never dropped. It needs holder capture on (the default); with it off the
-command refuses, because uncaptured records cannot be rolled back.
+metric, and a red dashboard note) show it. A copy is never dropped. A held transaction journaled without before-images
+(a write from before this node held the lease) makes the command refuse: it cannot be rolled back.
 
 The dropped op's outcome is journaled as a refusal (`Refused`, `EIO`)
 and ships with the log: a node that still holds the write as

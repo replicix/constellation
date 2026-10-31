@@ -2387,8 +2387,10 @@ fn a_lost_renewal_deposes_and_the_round_recovers() {
     );
 }
 
-/// Holder capture off: the deposition recovery rebuilds the namespace
-/// from the shared log (`Action::RebuildReplica`), and the rebuilt
+/// A deposed root whose journal holds a delegation's row it appended
+/// (which the strand by epoch leaves: it belongs to its generation):
+/// the deposition recovery rebuilds the namespace from the shared log
+/// (`Action::RebuildReplica`), and the rebuilt
 /// replica holds whatever the log had when the rebuild read it — here
 /// segments 1..=3, which the new holder shipped after the recovery's
 /// tail to head. The cursor must restart from the rebuilt replica's
@@ -2399,9 +2401,37 @@ fn a_lost_renewal_deposes_and_the_round_recovers() {
 #[test]
 fn a_deposition_rebuild_moves_the_cursor_to_the_rebuilt_position() {
     let mut h = Harness::new(1);
-    h.meta.set_holder_capture(false);
     let out = lose_renewal_with_an_unshipped_create(&mut h);
     assert!(h.core.lease().lost);
+    // A row of generation 7 this root appended from its delegate's stream.
+    crate::replica::Replica::apply_backup_tx_journaled(
+        &h.meta,
+        &[
+            LogRecord::Create {
+                parent: ROOT_INO,
+                name: "appended".into(),
+                ino: h.meta.allocate_ino(ROOT_INO).unwrap(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 3,
+            },
+            LogRecord::Completed {
+                rid: Rid {
+                    node: 2,
+                    incarnation: 1,
+                    seq: 1,
+                },
+            },
+        ],
+        Some(Rid {
+            node: 2,
+            incarnation: 1,
+            seq: 1,
+        }),
+        (7, 1),
+    )
+    .unwrap();
     let (tail, req) = s3_ops(&out)[0];
     assert!(matches!(req, S3Op::SegmentRun { from: 1, .. }), "{req:?}");
     let out = h.step(Event::S3 {
@@ -2415,7 +2445,7 @@ fn a_deposition_rebuild_moves_the_cursor_to_the_rebuilt_position() {
             Action::RebuildReplica { op } => Some(*op),
             _ => None,
         })
-        .expect("an uncaptured journal row is rebuilt from the log");
+        .expect("a journal row the strand left is rebuilt from the log");
     assert_eq!(h.core.ship.next_seq, 1);
     // The driver's swap (`Meta::replace_ns_from_rebuilt`) adopts the side
     // replica's applied position: three segments landed meanwhile.
@@ -39680,7 +39710,6 @@ mod recall_cut {
         assert_eq!(Replica::void_cut(&h.meta, 7), Some(3));
         assert!(Replica::reaches_streams(&h.meta, &on_row));
         // Deposed: the unshipped journal, the end with it, is rolled back.
-        assert!(Replica::holder_capture(&h.meta));
         Replica::strand_below_epoch(&h.meta, 2).unwrap();
         assert!(
             !journal_records(&h)
@@ -39944,11 +39973,10 @@ mod recall_cut {
     }
 
     /// The path-B shape of the test above with the end `end` of generation
-    /// 7, holder capture `capture`: 7:1 journaled, the end and a new
+    /// 7: 7:1 journaled, the end and a new
     /// `Delegate` of 8 streamed ahead, a sync. What the segment applies.
-    fn path_b_waiting(capture: bool, end: LogRecord) -> (Harness, [LogRecord; 2]) {
+    fn path_b_waiting(end: LogRecord) -> (Harness, [LogRecord; 2]) {
         let (mut h, dir, _, _) = delegate_renewed_once();
-        h.meta.set_holder_capture(capture);
         let ino = h.meta.allocate_ino(dir).unwrap();
         let rid = h.rid(1);
         let out = h.step(Event::Submit {
@@ -39989,15 +40017,14 @@ mod recall_cut {
     }
 
     /// Review follow-up: the wait ends when the end is applied from the log,
-    /// not when the rows leave the journal: with holder capture off a
-    /// recall's strand finds no captured row and leaves it in the journal,
-    /// and a legacy `Recall` keeps no cut (fail-before: it waited for ever;
-    /// the cut it keeps now is the log's index of the generation). The
-    /// retry timer syncs again when no segment does.
+    /// not when the rows leave the journal, and a legacy `Recall` keeps a
+    /// cut (fail-before: it waited for ever; the cut it keeps now is the
+    /// log's index of the generation). The retry timer syncs again when no
+    /// segment does.
     #[test]
     fn a_waiting_install_ends_at_the_end_in_the_log() {
         let dir_of = |h: &Harness| h.core.dl.mine[&7].dir;
-        for (capture, legacy) in [(false, false), (false, true), (true, true)] {
+        for legacy in [false, true] {
             let (h0, _, _, _) = delegate_renewed_once();
             let dir = dir_of(&h0);
             drop(h0);
@@ -40010,14 +40037,14 @@ mod recall_cut {
                     through: 0,
                 }
             };
-            let (mut h, records) = path_b_waiting(capture, end);
+            let (mut h, records) = path_b_waiting(end);
             let retry = h.core.dl.install_retry.expect("the retry timer is armed");
             Replica::apply_segment(&h.meta, 2, 1, 2, &[1, 2], &[], &records).unwrap();
             h.advance(1_001);
             h.step(Event::Timer { id: retry });
             assert!(
                 h.core.dl.mine.contains_key(&8),
-                "(capture {capture}, legacy {legacy}): not installed; journal row of 7 left: {:?}",
+                "(legacy {legacy}): not installed; journal row of 7 left: {:?}",
                 Replica::delegate_tx_pending(&h.meta, 7, 1)
             );
             assert!(h.core.dl.install_waiting.is_empty());

@@ -1707,8 +1707,11 @@ impl Core {
     }
 
     /// `recovery::recover_deposed` after the tail to head: roll back from
-    /// the before-images; journal rows without any (holder capture off)
-    /// need the namespace rebuilt from the log, which the driver does.
+    /// the before-images; journal rows the strand by epoch leaves (a
+    /// delegation generation's rows this root appended, which belong to
+    /// their generation, or a row journaled without before-images) need
+    /// the namespace rebuilt from the log, which the driver does (plan 43
+    /// C3 replaces this with the member copy).
     /// `Ok(true)` when the recovery is complete now.
     fn recover_deposed(
         &mut self,
@@ -1718,16 +1721,14 @@ impl Core {
         let floor = self.lease.lost_floor.max(1);
         let mut rolled = 0u64;
         replica.clear_streamed();
-        if replica.holder_capture() {
-            let stranded = replica
-                .strand_below_epoch(floor)
-                .map_err(|e| e.to_string())?;
-            rolled += (stranded.locals + stranded.member_copied) as u64;
-            self.stats.speculation_rolled_back += (stranded.shadows + stranded.hints) as u64;
-            self.note_committed_stranded(&stranded);
-            let clk = self.clk;
-            self.lock_note_replay_pins(clk, replica);
-        }
+        let stranded = replica
+            .strand_below_epoch(floor)
+            .map_err(|e| e.to_string())?;
+        rolled += (stranded.locals + stranded.member_copied) as u64;
+        self.stats.speculation_rolled_back += (stranded.shadows + stranded.hints) as u64;
+        self.note_committed_stranded(&stranded);
+        let clk = self.clk;
+        self.lock_note_replay_pins(clk, replica);
         if let Some(Job {
             what: What::Round { recover_rolled, .. },
             ..
@@ -1735,8 +1736,8 @@ impl Core {
         {
             *recover_rolled = rolled;
         }
-        let uncaptured = replica.journal_len().map_err(|e| e.to_string())?;
-        if uncaptured > 0 {
+        let left = replica.journal_len().map_err(|e| e.to_string())?;
+        if left > 0 {
             let op = self.op_id();
             self.set_phase(Phase::Recover { op }, Some(op));
             out.push(Action::RebuildReplica { op });
@@ -1807,10 +1808,10 @@ impl Core {
         self.ship.next_seq = applied + 1;
         self.ship.head_seq = self.ship.head_seq.max(applied);
         self.ship.max_epoch = self.ship.max_epoch.max(replica.applied_epoch());
-        let uncaptured = replica.journal_len().unwrap_or(0);
+        let left = replica.journal_len().unwrap_or(0);
         match self.finish_recovery(
-            rolled + uncaptured,
-            "rolled back (rebuilt from the shared log where uncaptured)",
+            rolled + left,
+            "rolled back (rebuilt from the shared log where the strand left rows)",
             replica,
         ) {
             Ok(()) => self.round_renew(now, replica, out),

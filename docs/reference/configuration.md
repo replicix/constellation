@@ -509,7 +509,6 @@ Plan 30 M2–M3. See [Forwarded mutations](features/forwarded-mutations.md).
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
 | `CONSTELLATION_COMPLETION_RETENTION_S` | `900` | seconds | how long the node-local `completed` keyspace keeps a rid, and the age below which log GC never prunes a segment (the coverage rule; see [Garbage collection](#garbage-collection)). It also sets the `completed` prune cadence (a quarter of it, clamped to 30–3600 s) and caps an inbox op's in-doubt deadline at half of it |
-| `CONSTELLATION_HOLDER_CAPTURE` | on | exact `0`, `off` or `false` (case-sensitive) disable it | internal switch: capture a holder's own journaled writes as speculation (before-images). Off is the M3b performance-gate fallback: a holder with an unshipped journal then defers publishing, and a deposed holder rebuilds its namespace from the shared log instead of rolling back. Not a tuning knob |
 
 ### Sessions, close-to-open, and log streams
 
@@ -1365,8 +1364,6 @@ Most boolean switches are enabled when unset, and `off`, `0`, and
   exactly `1` or `true`.
 - `CONSTELLATION_P2P_RELAY` defaults off (see its row).
 - `CONSTELLATION_PRUNE` is disabled only by exactly `0` or `false`.
-- `CONSTELLATION_HOLDER_CAPTURE` is disabled only by exactly `0`,
-  `off` or `false` (case-sensitive, not trimmed).
 - `CONSTELLATION_NO_DAEMONIZE` is enabled by its presence, whatever the
   value.
 

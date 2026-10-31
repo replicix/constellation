@@ -2186,7 +2186,7 @@ pub struct HeldStatus {
     pub records: u64,
     /// The oldest held journal seq.
     pub oldest_seq: Option<u64>,
-    /// An uncaptured transaction (holder capture off) was held, so every
+    /// An uncaptured transaction (one without before-images) was held, so every
     /// transaction after it is held too.
     pub opaque: bool,
     /// Plan 30 §M7: transactions deferred (not held) because a chunk their

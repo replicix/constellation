@@ -1344,14 +1344,13 @@ fn a_stranded_manifest_commit_replays_as_an_optimistic_set_manifest() {
     assert_eq!(meta.manifest(f).unwrap().as_deref(), Some(&b"base"[..]));
 }
 
-/// With capture off (the performance gate's fallback), a holder's writes
-/// still record their transaction (boundary and op) but carry no
-/// speculation; its publish defers while the journal is non-empty, and a
-/// wholesale rebuild queues the journal for replay.
+/// A wholesale rebuild (a deposed root whose strand left journal rows)
+/// replaces the namespace with the log's and queues this node's unshipped
+/// journal for replay by rid. (Before 2026-10-31 this ran with holder
+/// capture off, where it was that fallback's only deposition path.)
 #[test]
-fn with_capture_off_a_holder_defers_publishing_and_rebuilds_on_deposition() {
+fn a_rebuild_replaces_the_namespace_and_queues_the_journal() {
     let meta = Meta::open_in_memory().unwrap();
-    meta.set_holder_capture(false);
     meta.set_holder_epoch(1);
     execute_mutate(
         &meta,
@@ -1366,8 +1365,7 @@ fn with_capture_off_a_holder_defers_publishing_and_rebuilds_on_deposition() {
         Some(rid(1)),
     )
     .unwrap();
-    assert_eq!(meta.speculation_counts().unwrap().local, 0);
-    assert_eq!(basis(&meta), PublishBasis::Defer);
+    assert_eq!(meta.speculation_counts().unwrap().local, 1);
 
     let side = Meta::open_in_memory().unwrap();
     side.mkdir(ROOT_INO, "from-the-log", 0o755, 0, 0).unwrap();
@@ -1383,7 +1381,7 @@ fn with_capture_off_a_holder_defers_publishing_and_rebuilds_on_deposition() {
 }
 
 /// A rebuild carries the log's outcomes into `completed`, as a tail
-/// would. The deposed holder's uncaptured transaction was re-shipped by
+/// would. The deposed holder's unshipped transaction was re-shipped by
 /// its successor (from the backup tail), so the rebuilt range of the log
 /// completes its rid: the swap keeps that knowledge, and the rid's
 /// replay dedups instead of executing a second time. Before, the strand
@@ -1391,7 +1389,6 @@ fn with_capture_off_a_holder_defers_publishing_and_rebuilds_on_deposition() {
 #[test]
 fn a_rebuild_keeps_the_outcomes_the_rebuilt_log_carries() {
     let meta = Meta::open_in_memory().unwrap();
-    meta.set_holder_capture(false);
     meta.set_holder_epoch(1);
     let op = MutateOp::Mkdir {
         parent: ROOT_INO,

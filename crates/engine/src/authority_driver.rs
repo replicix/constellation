@@ -7103,8 +7103,8 @@ impl ChunkHandoff {
 
 /// Rebuild the namespace from the shared log through a side replica
 /// bootstrapped from the head commit, and swap it in (`Action::
-/// RebuildReplica`): a deposition recovery with uncaptured journal rows
-/// (holder capture off), or a replica the log was pruned past (`Core::
+/// RebuildReplica`): a deposition recovery with journal rows its strand
+/// left, or a replica the log was pruned past (`Core::
 /// after_gap_check`). Node-local state — identity, the journal, pending
 /// uploads, `completed` — stays; the replicated namespace is replaced.
 /// `keep_orphans` is asked right before the swap for the orphans some

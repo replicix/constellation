@@ -74,7 +74,7 @@ pub enum Event {
     /// not be made yet (no holder took the steps).
     ConflictCopyDone { queue_seq: u64, ok: bool },
     /// `Action::RebuildReplica` finished (a deposition recovery with
-    /// uncaptured journal rows).
+    /// journal rows its strand left).
     RebuildDone { op: OpId, ok: bool },
     /// Plan 30 §M14: `Action::LockFlush` finished (`ok`: the file's dirty
     /// data and its manifest are acknowledged).

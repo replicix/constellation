@@ -472,19 +472,6 @@ fn kv_get_i64(
     }
 }
 
-/// `CONSTELLATION_HOLDER_CAPTURE` (plan 30 §M3b): `0`/`off`/`false`
-/// turns holder-side speculation capture off (see `Meta::holder_capture`);
-/// anything else, or unset, leaves it on. An internal switch for the
-/// milestone's performance gate, not a tuning knob.
-fn holder_capture_default() -> bool {
-    !matches!(
-        std::env::var("CONSTELLATION_HOLDER_CAPTURE")
-            .ok()
-            .as_deref(),
-        Some("0" | "off" | "false")
-    )
-}
-
 /// `CONSTELLATION_META_CACHE_BYTES`, default 256 MiB (plan 29's
 /// benchmarked configuration).
 fn cache_bytes() -> u64 {
@@ -620,13 +607,6 @@ pub struct Meta {
     /// install a forward reply accepted at a lower epoch (the op is
     /// queued for replay instead).
     pub(crate) holder_epoch: Arc<AtomicU64>,
-    /// Plan 30 §M3b's internal switch for holder-side capture
-    /// (`CONSTELLATION_HOLDER_CAPTURE`, default on). Off is the plan's
-    /// performance-gate fallback: a holder's own writes carry no
-    /// before-images, a holder with an unshipped journal does not publish,
-    /// and a deposed holder rebuilds its namespace from the head commit
-    /// instead of rolling back (`cli::recovery::recover_deposed`).
-    pub(crate) holder_capture: AtomicBool,
     /// Unit tests of the tree publisher only: publish `ns` as it stands
     /// though this node's unshipped journal holds uncaptured writes
     /// (`Meta::publish_basis_at`). Never set by the daemon.
@@ -1217,7 +1197,6 @@ impl Meta {
             backup_tail,
             recent: std::sync::Mutex::new(std::collections::HashMap::new()),
             holder_epoch: Arc::new(AtomicU64::new(0)),
-            holder_capture: AtomicBool::new(holder_capture_default()),
             publish_unshipped: AtomicBool::new(false),
             deleg_any: AtomicBool::new(false),
             deleg_gate: std::sync::RwLock::new(()),
@@ -1630,19 +1609,6 @@ impl Meta {
     /// through [`Self::holder_epoch_cell`]; tests use this.
     pub fn set_holder_epoch(&self, epoch: u64) {
         self.holder_epoch.store(epoch, Ordering::SeqCst);
-    }
-
-    /// Whether holder-side capture is on (see the field's doc).
-    pub fn holder_capture(&self) -> bool {
-        self.holder_capture.load(Ordering::Relaxed)
-    }
-
-    /// Switch holder-side capture. Only meant for tests and for the
-    /// performance gate's fallback; flipping it while this node holds a
-    /// non-empty journal leaves that journal partly captured, which the
-    /// publisher treats as uncaptured (it defers).
-    pub fn set_holder_capture(&self, on: bool) {
-        self.holder_capture.store(on, Ordering::Relaxed);
     }
 
     /// For unit tests of the tree publisher, which publish local writes

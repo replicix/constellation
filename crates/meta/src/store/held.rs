@@ -32,8 +32,9 @@
 //! Only earlier transactions can be depended on, and a shipped
 //! transaction touches no held key, so shipping it ahead of the held ones
 //! yields the same state as shipping in journal order would once they
-//! ship: the two commute. An **uncaptured** transaction (holder capture
-//! off) has no known key set: once anything is held, it and everything
+//! ship: the two commute. An **uncaptured** transaction (journaled
+//! without before-images: a holder always captures, so only a write from
+//! before this node held the lease) has no known key set: once anything is held, it and everything
 //! after it is held — the pre-M4 behaviour, from that point on.
 //!
 //! # How held work stays speculative and consistent (M3b)
@@ -1145,9 +1146,8 @@ impl Meta {
             }
             let (Some(spec_seq), Some(keys)) = (t.spec_seq, keys) else {
                 return Err(MetaError::Invalid(format!(
-                    "held transaction at journal seq {} was not captured (holder capture \
-                     off), so it cannot be rolled back; turn CONSTELLATION_HOLDER_CAPTURE on \
-                     and remount, or rebuild this replica",
+                    "held transaction at journal seq {} was journaled without before-images, \
+                     so it cannot be rolled back; rebuild this replica",
                     t.first
                 )));
             };
@@ -1397,7 +1397,6 @@ mod tests {
                 f: usize,
                 node: usize,
             },
-            Capture(bool),
             /// Ack the `k`-th pending row enrolled so far.
             Ack(usize),
             /// Record the `k`-th pending row as unrecoverable.
@@ -1422,7 +1421,6 @@ mod tests {
                 2 => (f.clone(), 0..FILES, 0..3usize)
                     .prop_map(|(f, to, node)| Step::Rename { f, to, node }),
                 1 => (f, 0..3usize).prop_map(|(f, node)| Step::Refuse { f, node }),
-                1 => any::<bool>().prop_map(Step::Capture),
                 2 => (0..16usize).prop_map(Step::Ack),
                 1 => (0..16usize).prop_map(Step::Poison),
                 1 => Just(Step::Ship),
@@ -1561,7 +1559,6 @@ mod tests {
                         meta.journal_refusal(r, constellation_types::Code::Exists, Some(&op))
                             .unwrap();
                     }
-                    Step::Capture(on) => meta.set_holder_capture(*on),
                     Step::Ack(k) => {
                         if let Some((hash, ino)) = rows.get(*k) {
                             meta.ack_upload(hash, *ino).unwrap();

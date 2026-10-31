@@ -295,7 +295,9 @@ impl Meta {
         Ok(())
     }
 
-    /// Plan 30 §M3b's fallback deposition (holder capture off): replace
+    /// Plan 30 §M3b's deposition rebuild (journal rows the strand by epoch
+    /// left: a delegation's rows this root appended, or rows without
+    /// before-images): replace
     /// this replica's namespace wholesale with `side`'s — a replica
     /// bootstrapped from the shared log, i.e. exactly the log-prefix state
     /// — and queue every outstanding shadow and every one of this node's

@@ -205,9 +205,6 @@ pub trait Replica {
     /// Plan 30 §M9: a queued replay of an op this node executed but never
     /// acknowledged: refused, it is forgotten, not copied.
     fn mark_replay_unacked(&self, queue_seq: u64) -> Result<(), MetaError>;
-    /// Whether the holder captures before-images (a deposition then
-    /// rolls back from them; without them the namespace is rebuilt).
-    fn holder_capture(&self) -> bool;
 
     // ---- the journal and the applied position (ship / tail) ----
 
@@ -977,10 +974,6 @@ impl Replica for Meta {
         )
     }
 
-    fn holder_capture(&self) -> bool {
-        Meta::holder_capture(self)
-    }
-
     fn applied_seq(&self) -> Result<Seq, MetaError> {
         Meta::applied_seq(self)
     }
@@ -1068,8 +1061,8 @@ impl Replica for Meta {
                     // Kept for a restart and for an install that waits for
                     // this end (`Meta::deleg_gens_awaiting_end`) also when
                     // the record was installed from the root's stream
-                    // before and the segment did not apply it again (holder
-                    // capture off).
+                    // before and the segment did not apply it again (a
+                    // strand that found no captured row to roll back).
                     let _ = Meta::persist_void_cut(self, *gen, Some(*through));
                     *gen
                 }
