@@ -721,7 +721,8 @@ delegations over the one log instead, below.)
   for the lease (`wanted_by`), its journal is empty, it has held the lease
   for 5 s, and it has been idle for 30 s or the request is 5 s old. It
   never releases while a delegation or a lock grant is live (both are
-  capped by the lease), or while the only nodes asking are across a P2P
+  capped by the lease), inside a lock grace (its taker would wait the
+  whole grace again), or while the only nodes asking are across a P2P
   partition from a side that is using it (they are served through the
   inbox instead). The holder may also move the lease to the
   write-rate-weighted medoid of the writers

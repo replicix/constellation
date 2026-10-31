@@ -1172,6 +1172,16 @@ pub struct Stats {
     pub lock_ask_again_passed_over: u64,
     pub lock_reserved_waits: u64,
     pub lock_asks_answered: u64,
+    /// Owner: blocking requests parked behind an older waiter of another
+    /// node whose mode conflicts with theirs, though no grant was in the
+    /// way (`Core::lock_serve`'s first come, first served).
+    pub lock_queued_behind: u64,
+    /// Node: ops told to wait whose waiter a grant to another op of the
+    /// node had served, sent again at once (`Core::lock_op_outcome`).
+    pub lock_sibling_resends: u64,
+    /// Node: `NotOwner` answers naming back the node that had sent the op
+    /// (two non-holders naming each other): the next attempt read the lease.
+    pub lock_not_owner_bounces: u64,
     /// Node: ops woken by a grant installed for another op of the node
     /// (`lock_wake_covered`), and `LockCancel`s sent for the waiters they
     /// and ghost waiters left; owner: waiters dropped by one.

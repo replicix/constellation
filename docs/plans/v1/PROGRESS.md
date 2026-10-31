@@ -62800,3 +62800,97 @@ Ratios are medians of the wall time, ext4 / xfs / btrfs / tmpfs unless a range i
   2,000 directories without a lookup first, so each first chunk is a plus page (53,080 entries with attributes for
   `find`), which the kernel asks for by itself.
 - Not run: item 2 (write path), item 6 (pins, handover), 10M, `always`, two nodes, an LTS kernel.
+## Lock liveness: no lease handoff inside a lock grace, first come first served, two re-send stalls (2026-10-31)
+
+The triage's `locks-delegated-production-ttl-heavy` seed 493 under `AUTHORITY_SIM_LEASE_READS=0:0:800:1000` (a node's
+exclusive request held back behind its own recalled shared grant until about 64 s) passes on main now, in 55 s. A sweep of
+the configuration (seeds 0 to 1,999) found its class on main: 969 and 1123 fail with the knob (a lock not acquired in 60 s),
+and 5689 and 5973 of the earlier 10,000 still do; without the knob none fail, but the longest acquisition of a seed is
+20 s at the median and 48 s at p99. Three causes, and a fourth that the second fix's schedules reached; each is pinned by
+a test that fails with its fix reverted.
+
+### What was wrong
+
+1. **A tenure handed its lease over inside a lock grace** (969, 1123, 5689, 5973). The root, suspended or partitioned,
+   did not renew its delegates; it reclaimed their subtrees by TTL (a subtree grace on each, `lock_ttl + margin`) and,
+   idle, handed the lease to a node whose lock requests wanted it. The release was marked (`lock_duty_live`), so the
+   taker quarantined the whole namespace for a grace from its first sight of the release, and, idle inside it, handed the
+   lease on in turn: three takeovers in 969, no lock granted from 6.6 s to 53.4 s. `round_release` keeps the lease while
+   any lock duty is live (a quarantine, a subtree grace, grants moved to a delegate), as it already did while the table
+   held a grant: the grace ends once, where it began. DESIGN.md's "Leases are sticky" says so.
+2. **A blocking request was granted ahead of older parked waiters.** `lock_serve` granted any request that no live grant
+   conflicted with, whatever was parked: every shared request that came while an exclusive waiter waited for the shared
+   holders to go went ahead of it, and a node whose grant the waiter was about to recall was granted again and recalled at
+   once (969 at 63 s: node 1's upgrade granted and recalled in one step, node 3's waiter ahead of it). DESIGN.md says
+   blocking requests park first in, first out; now they do: a blocking request with an older waiter of another node in a
+   conflicting mode parks and the queue's pass serves it in order (`lock_queued_behind`). A request its own live grant
+   covers, or one under its own recalled grant, is not queued; nor is a non-blocking one (`F_SETLK` takes a lock no
+   holder is in the way of).
+3. **An op told to wait after a sibling's grant waited a whole re-send** (`locks-delegated-production-ttl+nomove` seed
+   28 once fix 2 queued requests behind older waiters: a handoff idled 8.4 s, `capped_grants_hand_a_lock_over_within_a_round_trip`).
+   Two ops of one node in one mode share one waiter at the owner. The grant served for one of them arrived recalled, so it
+   woke no other op (`lock_resend_idle` routes only the ops with no request out); the other's request was out, and its
+   answer, `Waiting`, came after the grant: the waiter it named was the one just served, and the op waited 9.5 s for its
+   re-send. An op answered `Waiting` after a grant covering its mode was installed for another op asks again at once,
+   behind the grant's release (`lock_sibling_resends`).
+4. **Two non-holders named each other** (`locks-s3-cut-holder-alive` seeds 1889 and 7882 with the knob, once fix 2 moved
+   their schedules; 0 of 10,000 on main). The holder handed the lease to a node that wanted it, and that node did not claim
+   it: the old holder answered lock requests `NotOwner { owner: wanter }`, the wanter `NotOwner { owner: old holder }`, and
+   the third node's request went round the two until the 60 s cap (the delegated form of this was fixed by
+   `lock_delegated_dead_end`). A `NotOwner` that names back the node which sent the op there sends the next attempt to
+   the lease (`LockOp::not_owner_from`, `lock_not_owner_bounces`), which it takes if nobody holds it.
+
+The own-grant spin itself is bounded on main: with the spin instrumented, 8 continuous spins over 5 s in 4,000 seed runs
+of the configuration (with and without the knob), the longest 5.1 s, each behind another local owner's section. Not
+reached by the simulation (its clients never upgrade): a blocking upgrade of an owner's shared lock (`F_SETLKW` write
+lock over its read lock) under a grant recalled for another node's waiter spins in `lock_route_op` until the grant is
+released, which waits for that owner's unlock; follow-up below.
+
+### Tests
+
+- Core `a_tenure_inside_a_lock_grace_is_not_idle_released` (fails with fix 1 reverted),
+  `a_blocking_request_queues_behind_an_older_conflicting_waiter` (fix 2), `an_op_told_to_wait_after_its_siblings_grant_asks_again_now`
+  (fix 3), `two_non_holders_naming_each_other_send_the_request_to_the_lease` (fix 4). Three asked-waiter tests count
+  the parked request as `lock_queued_behind` instead of `lock_reserved_waits`.
+- Sim `regression_locks_delegated_production_ttl_heavy_grace_handoffs_seeds_969_1123` (slow lease reads; fails with fix 1
+  reverted, passes with fix 2 reverted). `capped_grants_hand_a_lock_over_within_a_round_trip` fails with fix 3 reverted.
+- Sim `regression_locks_s3_cut_holder_alive_not_owner_bounce_seeds_1889_7882` (slow lease reads; fails with fix 4
+  reverted).
+- `a_late_renewal_against_a_stale_mirror_is_refused_and_the_naive_successor_violates`: its control seed 203 does not
+  violate any more under fix 2 (27 of the first 500 seeds do, 28 on main); 202 is pinned instead.
+
+### Sweeps
+
+Seeds 0 to 1,999 of 103 configurations (every `locks-*`, `backup`, `backup-locks-ahead`, `delegated-holder-cut`,
+`long-backup`, `long-delegated`, `long-delegated-backup`), with and without the knob, against main for every one that
+failed: no failure in a configuration or class that passes on main. `locks-delegated-production-ttl-heavy` and
+`locks-production-ttl-heavy`: 0 failures either way (main: 969 and 1123 with the knob). Where main fails, the classes are
+the same, with seeds moved: the controls built to fail (`-blind`, `-dated-at-return`, `-unfresh`, `-naive`,
+`-unchecked`, `-unsettled`), `locks-delegate-ahead` and `locks-delegated-partition-skew` (stale reads past the margin's
+offset, rows 9/30: 1801, 296, 1477 and 764 new, 318 and 179 gone; delegate-ahead's 5 mutual-exclusion seeds on main are
+gone), `locks-core-stall-backup-long*` 946 and 1838 (the late `LockIdle` answer, as on main), and
+`locks-writer-hold-delegated-doubt` with the knob (mutual exclusion violated by a held write in doubt: 279 and 344 on
+main, and 1324). `locks-s3-cut-holder-alive` with the knob, seeds 2,000 to 9,999: 3062 on both (a directory oracle),
+7882 failed before fix 4.
+
+Heavy delegated configuration, longest acquisition per seed p50/p90/p99/max (ms), main → now: without the knob
+20,151/37,475/48,569/56,406 → 18,450/36,738/46,522/53,680, overtakes 3,725 → 1,685; with it 20,163/38,605/52,048/58,997
+→ 18,862/37,324/48,100/54,375, overtakes 3,687 → 1,910, the longest handoff gap 47.1 s → 36.8 s.
+`locks-production-ttl-heavy` with the knob: max 59.4 s → 42.5 s, overtakes 2,033 → 1,413.
+
+### Gates
+
+`cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean. Lib tests: authority 832,
+meta 380 (no failures). `cargo test -p constellation-authority --release --test sim`: 290 passed (11 ignored).
+
+### Follow-ups
+
+- A blocking upgrade of an owner's shared lock to exclusive while its node's shared grant is recalled for another node's
+  waiter deadlocks: `lock_route_op` holds the request until the grant is released, the release waits for the owner's
+  unlock, and the waiter waits for the release (a local file system converts the lock at once). Needs `local_set` to
+  say that an owner holding locks under the grant asks for more, the request to go out, and the owner to upgrade the
+  recalled grant in place (kept recalled) and serve such a waiter first. The simulation's clients never upgrade.
+- An outwaited delegate's subtree grace is a whole `lock_ttl + margin` from the reclaim (21 s at the production TTL),
+  though the delegate's own grants were capped by its delegation: most of the heavy configuration's 26 s p90 handoff
+  gap is this.
+- `locks-writer-hold-delegated-doubt` under slow lease reads violates mutual exclusion on main (279, 344): not looked at.

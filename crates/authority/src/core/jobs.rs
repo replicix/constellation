@@ -2531,6 +2531,21 @@ impl Core {
             self.finish_round(now, None, replica, out);
             return;
         }
+        // Nor inside a lock grace (the quarantine of a released or
+        // restarted predecessor's grants, an outwaited delegate's subtree
+        // grace), or with any other lock duty live: the release would be
+        // marked, and its taker grants nothing for a whole grace from its
+        // first sight of it (`lock_on_released_takeover`). Handed over
+        // inside the grace, the grace started again at every handoff, and
+        // the nodes whose lock requests wanted the lease passed it round
+        // inside theirs: no lock was granted for 40 s and more after a
+        // suspended root's delegation was reclaimed
+        // (`locks-delegated-production-ttl-heavy` seeds 969 and 1123 with
+        // slow lease reads). Kept, the grace ends here once.
+        if self.lock_duty_live(now, replica) {
+            self.finish_round(now, None, replica, out);
+            return;
+        }
         // EC2 finding 2: the wanters are across a P2P partition from a
         // holder its own side is using: the lease stays (they keep being
         // served through the inbox).

@@ -136,6 +136,10 @@ struct LockOp {
     /// `NotOwner` with nowhere new to go (`Core::lock_delegated_dead_end`):
     /// the next attempt reads the lease instead, once.
     ask_lease: bool,
+    /// The node that last answered this op `NotOwner` naming another
+    /// node: named back by that one, the next attempt reads the lease
+    /// (`lock_op_outcome`).
+    not_owner_from: Option<NodeId>,
 }
 
 /// Why `lock_try_grant` did not grant.
@@ -1752,6 +1756,28 @@ impl Core {
                 },
             );
         }
+        // First come, first served: a blocking request that an older
+        // waiter of another node, in a mode that conflicts with it, is
+        // parked ahead of joins the queue behind it, even when no grant is
+        // in its own way (the waiter may wait for recalls of shared grants
+        // that this one would join, for a grace's end or for a re-send),
+        // and its recalls go out when its turn comes. Granted
+        // at once, every shared request that came while an exclusive waiter
+        // waited for the shared holders to go went ahead of it, and so did
+        // every request of a node whose grant the waiter was about to
+        // recall — the waiter's next pass recalled it again at once: in
+        // `locks-delegated-production-ttl-heavy` one node kept taking the
+        // lock while clients of the other two waited 40 s and more. The
+        // queue's pass decides (`lock_serve_waiters`), in the order the
+        // applications began to wait. A non-blocking request is not queued:
+        // nothing conflicts, and `F_SETLK` takes a lock no holder is in
+        // the way of.
+        if blocking && self.lock_queued_behind(now, from, ino, mode, replica) {
+            self.stats.lock_queued_behind += 1;
+            self.lock_park(now, from, ino, mode, req, op, sent, waited_ms, out);
+            self.lock_serve_waiters(now, ino, replica, out);
+            return Served::Parked;
+        }
         let blocked = match self.lock_try_grant(
             now, now.wait, from, ino, mode, cap_ms, gen, false, out, replica,
         ) {
@@ -1808,6 +1834,33 @@ impl Core {
     fn lock_grace_retry_ms(&mut self, now: Now, ino: Ino, replica: &dyn Replica) -> u64 {
         let left = self.lock_grace_end(now, ino, replica).since(now.wait);
         (left + 1).clamp(10, 1_000) as u64
+    }
+
+    /// A waiter of another node is parked on `ino` in a mode that
+    /// conflicts with `mode` (`lock_serve`'s first come, first served).
+    /// Never for a request its own live grant covers already (a
+    /// re-affirmation takes nothing from anyone), nor for one under its own
+    /// recalled grant, which waits for that grant's release
+    /// (`Blocked::Recalled`) whatever the queue holds.
+    fn lock_queued_behind(
+        &self,
+        now: Now,
+        from: NodeId,
+        ino: Ino,
+        mode: LockMode,
+        replica: &dyn Replica,
+    ) -> bool {
+        if replica
+            .locks()
+            .own_grant(ino, from, now.wait)
+            .is_some_and(|g| g.recalled || g.mode.covers(mode))
+        {
+            return false;
+        }
+        self.lk
+            .waiters
+            .iter()
+            .any(|w| w.ino == ino && w.node != from && w.mode.conflicts(mode))
     }
 
     /// When the grace on `ino` ends: the whole-namespace quarantine or
@@ -3815,6 +3868,7 @@ impl Core {
                 local_wait: false,
                 reread: false,
                 ask_lease: false,
+                not_owner_from: None,
             },
         );
         self.lock_route_op(now, op, replica, out);
@@ -4807,8 +4861,28 @@ impl Core {
                 // it, as `Busy`.
                 let late =
                     !o.blocking && now.wait.0 - o.created.0 >= self.cfg.s3_less_deadline_ms as i64;
+                // A grant covering this op's mode was installed here for
+                // another op after this request went out: the owner's
+                // waiter of this node in the mode (ops of one mode share
+                // one) is the one its answer served, so nothing waits there
+                // for this op any more, and its re-send is a whole retry
+                // away (9.5 s at the production lock ttl). A grant that
+                // arrives recalled wakes none of the other ops
+                // (`lock_resend_idle` routes only those with no request
+                // out): this one asks again now, from where its wait
+                // began, behind the grant's release (sim
+                // `locks-delegated-production-ttl+nomove` seed 28 once
+                // requests queued behind older waiters: a handoff idled
+                // 8.4 s). A re-send that finds the waiter re-attaches to it.
+                let served_sibling = replica
+                    .locks()
+                    .held(o.ino)
+                    .is_some_and(|h| h.mode.covers(o.mode) && h.installed >= o.sent_at);
                 if late {
                     self.lock_retry(now, op, replica, out);
+                } else if served_sibling {
+                    self.stats.lock_sibling_resends += 1;
+                    self.set_timer_wait(now.wait.plus(10), Timer::LockRetry(op), out);
                 } else {
                     self.set_timer_wait(now.wait.plus(retry_ms), Timer::LockRetry(op), out);
                 }
@@ -4822,7 +4896,19 @@ impl Core {
             }
             LockOutcome::NotOwner { owner } => {
                 let ino = o.ino;
-                if self.lock_delegated_dead_end(from, ino, owner, replica) {
+                // Two nodes that each name the other (`from` names the
+                // node that sent this op to `from`): neither holds the
+                // lease, and their caches say the other does (a holder
+                // that handed the lease to a wanter which never claimed it
+                // names the wanter; the wanter still names the holder).
+                // The op went round the two for 60 s, until the wanter
+                // claimed the lease for a write of its own
+                // (`locks-s3-cut-holder-alive` seeds 1889 and 7882 with slow
+                // lease reads). The next attempt reads the lease, and
+                // takes it if nobody holds it.
+                let bounced = owner != 0 && owner != from && o.not_owner_from == Some(owner);
+                o.not_owner_from = (owner != 0 && owner != from).then_some(from);
+                if bounced || self.lock_delegated_dead_end(from, ino, owner, replica) {
                     if let Some(o) = self.lk.ops.get_mut(&op) {
                         o.ask_lease = true;
                     }
@@ -4844,6 +4930,12 @@ impl Core {
                     // delegates the inode to this node: see
                     // `lock_delegated_here`.)
                     self.lease.cached_holder = None;
+                }
+                if bounced {
+                    self.stats.lock_not_owner_bounces += 1;
+                    if self.lease.cached_holder == Some(owner) {
+                        self.lease.cached_holder = None;
+                    }
                 }
                 self.lock_retry(now, op, replica, out);
             }

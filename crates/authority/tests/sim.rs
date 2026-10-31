@@ -11180,6 +11180,60 @@ fn regression_locks_delegated_production_ttl_heavy_moved_lapsed_grants_seed_2() 
     });
 }
 
+/// Seeds 969 and 1123 of the heavy configuration under slow lease reads
+/// (`SLOW_LEASE_READS`): the root, suspended, could not renew its delegates;
+/// it reclaimed their subtrees by TTL (a subtree grace) and, idle, handed the
+/// lease to a node whose lock requests wanted it. The release was marked, so
+/// the taker quarantined the namespace for a whole grace, and idle in it
+/// handed the lease on in turn: three takeovers, no lock granted for 47 s,
+/// and a client never got its lock in 60 s. A tenure inside a lock grace is
+/// not idle-released now (`Core::round_release`).
+#[test]
+fn regression_locks_delegated_production_ttl_heavy_grace_handoffs_seeds_969_1123() {
+    for seed in [969, 1123] {
+        run_seed(
+            seed,
+            SimConfig {
+                lease_reads: SLOW_LEASE_READS,
+                ..locks_delegated_production_ttl_heavy_config()
+            },
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "locks-delegated-production-ttl-heavy seed {seed} (slow lease reads): {e}\n  \
+                 replay with AUTHORITY_SIM_CONFIG=locks-delegated-production-ttl-heavy \
+                 AUTHORITY_SIM_LEASE_READS=0:0:800:1000"
+            )
+        });
+    }
+}
+
+/// `locks-s3-cut-holder-alive` seeds 1889 and 7882 under slow lease reads,
+/// once blocking lock requests queue behind older waiters: the holder handed
+/// the lease to a node that wanted it, which did not claim it; each named the
+/// other as the owner, and a client's lock request went round the two until
+/// the 60 s cap. A `NotOwner` naming back the node that sent the op there
+/// sends its next attempt to the lease (`LockOp::not_owner_from`).
+#[test]
+fn regression_locks_s3_cut_holder_alive_not_owner_bounce_seeds_1889_7882() {
+    for seed in [1889, 7882] {
+        run_seed(
+            seed,
+            SimConfig {
+                lease_reads: SLOW_LEASE_READS,
+                ..locks_s3_cut_holder_alive_config()
+            },
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "locks-s3-cut-holder-alive seed {seed} (slow lease reads): {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=locks-s3-cut-holder-alive \
+                 AUTHORITY_SIM_LEASE_READS=0:0:800:1000"
+            )
+        });
+    }
+}
+
 /// Two waiters of one node on one file, served in one pass, the second
 /// re-affirming the first one's grant in place from an older request: the
 /// owner's record of the node's grant never ends before the window the
@@ -11730,12 +11784,13 @@ fn a_locker_keeps_its_grant_across_a_seal_and_a_forward_step() {
 /// run with a successor that trusts such a mirror
 /// (`Config::lock_trust_nonfinal_mirror`; `-naive`) violates mutual
 /// exclusion — in 8 of the first 500 seeds, which were pinned (19 since plan
-/// 43 C1-1's listed-acknowledgement count: 34, 76, 98, 106, 113, 203, 318 and
-/// 336 are pinned).
+/// 43 C1-1's listed-acknowledgement count, 28 later; 27 once blocking lock
+/// requests queue behind older waiters, which moved 203 to no violation: 34,
+/// 76, 98, 106, 113, 202, 318 and 336 are pinned).
 #[test]
 fn a_late_renewal_against_a_stale_mirror_is_refused_and_the_naive_successor_violates() {
     use pinned::run_seed;
-    for seed in [34u64, 76, 98, 106, 113, 203, 318, 336] {
+    for seed in [34u64, 76, 98, 106, 113, 202, 318, 336] {
         run_seed(seed, locks_late_stale_mirror_config())
             .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         let e = run_seed(seed, locks_late_stale_mirror_naive_config())
