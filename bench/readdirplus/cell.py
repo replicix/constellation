@@ -19,6 +19,8 @@ Environment (all optional):
   LOAD_MAX    1-minute load gate before each phase, default 4 (the shared hosts' rule for benchmarks)
   PHASE_WAIT  seconds a gate waits before it records `gate_ok=false` and goes on, default 900
   STORM       entries of the create/unlink/rename storm directory, default 100000
+  TREE2       tree.tar for the `trees` phase (plan 42's tree workloads, cold and warm; TREE_REPS repetitions)
+  BIG_LISTS_ONLY  set: the `big` phase measures the listings and the cold resume only (no pins, no handover)
   WRITE_MODES write modes of the `write` phase, default "through back"
 
 Workloads are the plan's (`ls -f`, `ls`, `find -name`, `ls -l`, `ls -la`, `find -ls`, `find -newer`, `find -size`,
@@ -53,13 +55,17 @@ class Cell:
         self.tag = a.tag
         self.root = os.path.join(os.path.abspath(a.store), "p40-8-" + a.tag)
         self.out = open(a.out, "a", buffering=1)
-        self.mode = a.mode
+        # one mode, or a list ("off,auto"): a pair cell alternates the modes within one populated state dir, A B then
+        # B A on the next repetition (ABBA), which cancels the host's drift at the grain of one run
+        self.modes = a.mode.split(",")
+        self.mode = self.modes[0]
         self.mnt = os.path.join(self.root, "mnt")
         self.state = os.path.join(self.root, "state")
         self.backend = os.path.join(self.root, "backend")
         self.home = os.path.join(self.root, "home")
         self.log = os.path.join(self.root, "mount.log")
         self.proc = None
+        self.mounted_mode = None
         self.load_max = float(os.environ.get("LOAD_MAX", "4"))
         self.phase_wait = int(os.environ.get("PHASE_WAIT", "900"))
         self.reps = int(os.environ.get("REPS", "7"))
@@ -68,6 +74,7 @@ class Cell:
 
     # ------------------------------------------------------------ records
     def emit(self, kind, **kw):
+        kw.setdefault("mode", self.mode)
         kw.update(kind=kind, tag=self.tag, t=int(time.time()))
         self.out.write(json.dumps(kw, sort_keys=True) + "\n")
 
@@ -104,6 +111,7 @@ class Cell:
         if self.write_mode:
             cmd += ["--write-mode", self.write_mode]
         cmd += list(args)
+        self.mounted_mode = self.mode
         self.proc = subprocess.Popen(["timeout", "--kill-after=10s", "7200"] + cmd, env=self.env(extra),
                                      stdout=open(self.log, "ab"), stderr=subprocess.STDOUT)
         for _ in range(240):
@@ -137,13 +145,15 @@ class Cell:
     def snap(self):
         st = self.status()
         ops = {}
+        ns = {}
         for s in st["vfs_ops"]["series"]:
             if s["frontend"] == "fuse":
                 ops[s["op"]] = ops.get(s["op"], 0) + sum(s["outcomes"].values())
+                ns[s["op"]] = ns.get(s["op"], 0) + s.get("sum_ns", 0)
         m = (st["fuse"]["mounts"] or [{}])[0]
         keep = ("kernel_refs", "readdirplus", "readdirplus_pages", "readdirplus_entries", "readdirplus_name_only",
                 "unlinked_refs")
-        return {"ops": ops, "mount": {k: m.get(k) for k in keep}, "readdir": st.get("readdir", {})}
+        return {"ops": ops, "ns": ns, "mount": {k: m.get(k) for k in keep}, "readdir": st.get("readdir", {})}
 
     def cpu(self):
         f = open(f"/proc/{self.pid}/stat").read()
@@ -163,10 +173,17 @@ class Cell:
         return 0
 
     # ------------------------------------------------------------ measure
+    def rep_modes(self, reps):
+        """(rep, mode) pairs: the modes in order on even repetitions, reversed on odd ones."""
+        for rep in range(reps):
+            for m in (self.modes if rep % 2 == 0 else self.modes[::-1]):
+                yield rep, m
+
     def measure(self, name, cmd, size, cold=True, warm_first=None, shell=False, extra=None):
         """REPS runs of `cmd`: a fresh mount per run when `cold`; `warm_first` runs once before the timed run."""
-        for rep in range(self.reps):
-            if cold:
+        for rep, mode in self.rep_modes(self.reps):
+            self.mode = mode
+            if cold or self.mounted_mode != mode:
                 self.remount()
             if warm_first:
                 subprocess.run(warm_first, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=shell)
@@ -178,8 +195,10 @@ class Cell:
             c1, s1 = self.cpu(), self.snap()
             reqs = {k: s1["ops"].get(k, 0) - s0["ops"].get(k, 0) for k in set(s1["ops"]) | set(s0["ops"])}
             reqs = {k: v for k, v in reqs.items() if v}
+            nsd = {k: s1["ns"].get(k, 0) - s0["ns"].get(k, 0) for k in set(s1["ns"]) | set(s0["ns"])}
+            nsd = {k: v for k, v in nsd.items() if v}
             self.emit("run", name=name, size=size, rep=rep, wall=round(wall, 4), rc=r.returncode,
-                      daemon_cpu=round(c1 - c0, 3), rss_peak_kb=self.rss_peak_kb(), reqs=reqs,
+                      daemon_cpu=round(c1 - c0, 3), rss_peak_kb=self.rss_peak_kb(), reqs=reqs, ns_by_op=nsd,
                       requests=sum(reqs.values()), mount=s1["mount"],
                       plus_entries=(s1["mount"].get("readdirplus_entries") or 0) - (s0["mount"].get("readdirplus_entries") or 0),
                       readdir=s1["readdir"])
@@ -269,6 +288,55 @@ class Cell:
                 self.measure(name, cmd, 50000)
             self.umount()
 
+    def phase_trees(self):
+        """The tree workloads of plan 42 section 8 (bench/kernel-races/cell.sh), kernel-cold and warm, per mode.
+        t1 is the 50k-file tree (gen-tree.py, with its git repository and 5,000-target Makefile), t2 a copy of it
+        for `rsync -an --delete t1/ t2/`. Each repetition: fresh mount (the host's page cache is not dropped: replica warm), the cold run, then the same
+        command again at once (warm: the replica and the kernel's caches hold what the first run read)."""
+        tree = os.environ["TREE2"]
+        self.gate("trees-populate")
+        self.write_mode = "back"  # the populate only; the measured mounts use the default mode
+        self.create_fs()
+        self.mount()
+        t1, t2 = os.path.join(self.mnt, "t1"), os.path.join(self.mnt, "t2")
+        os.makedirs(t1)
+        subprocess.run(["tar", "-xf", tree, "--strip-components=1", "-C", t1], check=True)
+        subprocess.run(["cp", "-a", t1, t2], check=True)
+        env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null")
+        subprocess.run(["git", "-C", t1, "update-index", "-q", "--refresh"], env=env, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "-C", t1, "status", "--porcelain"], env=env, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+        subprocess.run(["sync"])
+        self.umount()
+        self.write_mode = None
+        self.gate("trees")
+        work = [("ls_lR", ["ls", "-lR", t1]), ("find_f", ["find", t1, "-type", "f"]),
+                ("git_status", ["git", "-C", t1, "status", "--porcelain"]),
+                ("make_q", ["make", "-q", "-C", t1, "all"]),
+                ("rsync_n", ["rsync", "-an", "--delete", t1 + "/", t2 + "/"])]
+        reps = int(os.environ.get("TREE_REPS", self.reps))
+        for name, cmd in work:
+            for rep, mode in self.rep_modes(reps):
+                self.mode = mode
+                self.remount()
+                for state in ("cold", "warm"):
+                    self.rss_reset()
+                    s0, c0 = self.snap(), self.cpu()
+                    t0 = time.time()
+                    r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+                    wall = time.time() - t0
+                    c1, s1 = self.cpu(), self.snap()
+                    reqs = {k: s1["ops"].get(k, 0) - s0["ops"].get(k, 0) for k in set(s1["ops"]) | set(s0["ops"])}
+                    reqs = {k: v for k, v in reqs.items() if v}
+                    nsd = {k: s1["ns"].get(k, 0) - s0["ns"].get(k, 0) for k in set(s1["ns"]) | set(s0["ns"])}
+                    nsd = {k: v for k, v in nsd.items() if v}
+                    self.emit("run", name=f"tree_{name}_{state}", size=50000, rep=rep, wall=round(wall, 4),
+                              rc=r.returncode, daemon_cpu=round(c1 - c0, 3), reqs=reqs, ns_by_op=nsd,
+                              requests=sum(reqs.values()),
+                              plus_entries=(s1["mount"].get("readdirplus_entries") or 0) - (s0["mount"].get("readdirplus_entries") or 0),
+                              name_only=(s1["mount"].get("readdirplus_name_only") or 0) - (s0["mount"].get("readdirplus_name_only") or 0))
+        self.umount()
+
     def phase_write(self):
         modes = os.environ.get("WRITE_MODES", "through back").split()
         storm = int(os.environ.get("STORM", "100000"))
@@ -325,6 +393,14 @@ class Cell:
             self.mount()
             self.measure("big_ls_f", ["ls", "-f", d], n, cold=False)
             self.measure("big_ls_l", ["ls", "-l", d], n, cold=True)
+            if os.environ.get("BIG_LISTS_ONLY"):
+                # the listings and the cold resume only (item 7); the pins and the handover are not measured
+                self.remount()
+                r = subprocess.run([sys.executable, lt, "coldresume", d, str(n // 2)], capture_output=True, text=True)
+                self.emit("result", name="cold_resume", size=n, line=r.stdout.strip())
+                self.measure("big_ls_f_cold_scan_ref", ["ls", "-f", d], n, cold=True)
+                self.umount()
+                continue
             # pins: rm -rf-like walk (a held stream) and ls hold a directory open; RSS and bytes per listed name
             # the handover below needs a /dev/fuse session (a ring session refuses to detach)
             self.umount()
@@ -376,13 +452,15 @@ class Cell:
         self.write_mode = None
 
     def run(self, phases):
-        self.emit("cell", bin=self.bin, mode=self.mode, kernel=os.uname().release, store=self.root,
+        self.emit("cell", bin=self.bin, mode=",".join(self.modes), kernel=os.uname().release, store=self.root,
                   uring=open("/sys/module/fuse/parameters/enable_uring").read().strip()
                   if os.path.exists("/sys/module/fuse/parameters/enable_uring") else "n/a")
         self.create_fs()
         try:
             if "list" in phases:
                 self.phase_list()
+            if "trees" in phases:
+                self.phase_trees()
             if "write" in phases:
                 self.phase_write()
             if "big" in phases:
@@ -405,7 +483,7 @@ if __name__ == "__main__":
     ap.add_argument("store")
     ap.add_argument("tag")
     ap.add_argument("out")
-    ap.add_argument("--mode", default="none", choices=["off", "auto", "always", "none"])
+    ap.add_argument("--mode", default="none", help="none, or a mode, or modes separated by commas")
     ap.add_argument("--phases", default="list,write")
     a = ap.parse_args()
     Cell(a).run(a.phases.split(","))

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Plan 40 section 8: run the cells of a job list one at a time, resumable.
 # usage: abba.sh JOBS OUTDIR
-#   JOBS lines: "STORE VERSION RUN"   STORE: ext4 xfs btrfs tmpfs   VERSION: base off auto always
+#   JOBS lines: "STORE VERSION RUN"   STORE: ext4 xfs btrfs tmpfs   VERSION: base off auto always pair
 #   base = bin/base with no knob (the build before plan 40's listing commits); off|auto|always = bin/main with
 #   CONSTELLATION_FUSE_READDIRPLUS set. Interleave the versions in the job list (ABBA) so the host's drift cancels.
 # Needs $D (default ~/cst-p40-8) with bin/base, bin/main, tree.tar (gen-tree.py), and this directory's cell.py/listtool.py.
@@ -26,6 +26,7 @@ while read -r store ver run; do
   case $ver in
     base) bin=$D/bin/base; mode=none ;;
     off|auto|always) bin=$D/bin/main; mode=$ver ;;
+    pair) bin=$D/bin/main; mode=off,auto ;;   # one cell, both modes alternated (ABBA) within one populated state dir
     *) echo "bad version $ver" >> "$OUT/driver.log"; continue ;;
   esac
   f="$OUT/cell-$store-$ver-r$run.jsonl"

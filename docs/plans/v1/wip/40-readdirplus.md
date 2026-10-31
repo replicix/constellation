@@ -1241,6 +1241,44 @@ Acceptance (R8, per host file system and kernel):
    1k (O(page)); a cold resume at 10M is reported (one scan) and must not
    exceed the time of one R0 page at 10M.
 
+### 8.1 Measured (2026-10-31) and proposed amendment
+
+R8 was run in part on the quiet timing host (ext4, xfs, btrfs, tmpfs; one node; kernel 7.3.0-rc4 with the ring
+transport; `base` = `73ea9987`, the build under test `7538c07f`; `off` and `auto` alternated within one cell). Tables,
+method and what was not run (items 2 and 6, 10M, `always`, two nodes): `bench/readdirplus/RESULTS.md`. Items 1, 3 and
+4 are **not met as worded**; items 5 (CPU) and 7 (O(page)) are met in substance. Per the maintainer's decision
+`auto` stays the default and the items are restated to what the kernel's use of `READDIRPLUS` allows. The wording
+below is a **proposed amendment, not yet accepted**; its numbers are the measured ones (ratios are the wall-time
+medians over the four file systems; below 1 is faster):
+
+1. **Plain listing**: `ls -f`, `ls` and `find -name` faster than R0 at 10k entries and above with `off` and with
+   `auto` (measured, `auto`: 0.49-0.53 of R0 at 10k, 0.05-0.09 at 100k; `off` 0.35-0.40 and 0.05-0.09); at 1k `off`
+   within the noise band of R0 (measured 0.79-0.90) and `auto` within +3 ms of R0 (measured +2.5 to +2.8 ms, 2.0-2.5
+   times of a 2 ms listing: the kernel asks plus for the first chunk of every listing, `pos == 0`, and `ls` and
+   `find -name` discard the attributes).
+3. **Request reduction**: `ls -l`/`ls -la` of the 1k and 10k directories, kernel-cold, `auto`: at least 90 % fewer FUSE
+   requests than R0, **not counting the one `listxattr` per name that `ls` sends** and no plus page can answer
+   (measured 99.4 % at 1k, 99.8 % at 10k, 99.9 % at 100k; counting them 49.8-49.9 %, which is the bound). `find -ls`
+   and `du -s` are reported, not judged: the kernel asks plus for their first chunk only (71.5 % fewer at 1k, 7 % at
+   10k, 0.7 % at 100k).
+4. **Time**: `ls -l`, `ls -la` and `rsync --dry-run`, kernel-cold, faster than R0 at 1k, 10k and 100k and at least 2
+   times faster at 10k and 100k (measured 0.37-0.44 and 0.34-0.39 for `ls -l`, 0.27-0.29 and 0.16-0.17 for `rsync`);
+   `find -ls` and `du -s` at least 1.15 times faster at 100k (measured 0.71-0.77 and 0.69-0.84) and not more than 1.3
+   times R0 at 10k (measured 0.86-1.02 and 0.84-1.30); the second `ls -l` within 1.4 times R0 at 1k and 10k (measured
+   1.03-1.12 and 1.04-1.35: a repeated listing asks plus again) and at least 2.8 times faster at 100k (measured
+   0.27-0.35); tree walks of many small directories (`find`, `make -q`, `git status`, `ls -lR`, `rsync -n`) reported
+   as `auto`/`off` ratios, cold and warm: at most 1.1 for `git status` cold, 1.25 warm, at most 1.75 for `find -type f`
+   and `make -q` warm (measured: `git status` 1.01-1.03 cold and 1.10-1.23 warm, `find -type f` 1.66-1.71 and `make -q`
+   1.40-1.64 warm) and faster than `off` for `ls -lR` and
+   `rsync -n` (0.47-0.55, 0.27-0.35).
+
+The held-names change (`8f5af546`) removed the `git status` slowdown (cold 1.29 to 1.01-1.03, warm daemon time 230 to
+123-149 ms against `off`'s 105-110 ms) but not `find -type f` or `make -q`: they never look a name up before reading
+its directory, so nothing is held and the plus first chunk of each of 2,000 directories (53,000 entries with
+attributes nobody reads) stays. Only a kernel that does not ask plus for a first chunk the reader will not stat, or an
+answer that is name-only for exactly those readers, would remove it; neither exists, and the daemon cannot tell
+`find -type f` from `find -ls` at that request.
+
 ## 9. Risks and open questions for the maintainer
 
 Decide before the executor starts:

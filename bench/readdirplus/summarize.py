@@ -28,7 +28,8 @@ def load(outdir):
         for line in open(f):
             r = json.loads(line)
             if r["kind"] == "run":
-                runs[(store, ver, r["name"], r.get("size"))].append(r)
+                v = r["mode"] if r.get("mode") in ("off", "auto", "always") else ver
+                runs[(store, v, r["name"], r.get("size"))].append(r)
             elif r["kind"] == "result":
                 results.append((store, ver, r))
     return runs, results

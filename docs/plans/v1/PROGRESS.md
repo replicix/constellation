@@ -62772,3 +62772,31 @@ delegate rows only in its journal. The deferral can land with C3 §5.4 item 4 (r
 
 Gates: `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean; the authority,
 meta and engine crates are main's (their lib tests and the sim suite unchanged by construction).
+## Plan 40 section 8 measured on the quiet box (2026-10-31)
+
+`bench/readdirplus` run against `7538c07f` (the build before plan 40's listing commits, `73ea9987`, as R0) on the quiet
+timing host: ext4, xfs, btrfs and tmpfs state dirs, one node, kernel 7.3.0-rc4 with the ring transport, load below 4 at
+every phase (72 gates, highest 3.54). New: `pair` cells (`off` and `auto` alternated, ABBA at the grain of one run,
+inside one populated state dir), a `trees` phase (plan 42's tree workloads, cold and warm), per-op service time in
+the run records, `BIG_LISTS_ONLY`, and `report.py`. About 3.8 hours of measurement; the numbers and tables are in
+`bench/readdirplus/RESULTS.md`, the proposed restated wording in the plan's section 8.1 (a proposal, not accepted).
+
+Ratios are medians of the wall time, ext4 / xfs / btrfs / tmpfs unless a range is given; below 1 is faster.
+
+- **Listings** (1k / 10k / 100k): `auto` over `off`: `ls -l` 0.32-0.45 / 0.33-0.48 / 0.38-0.49, `rsync -n` 0.67 / 0.28-0.32 / 0.21-0.25;
+  `ls -f`, `ls`, `find -name` 2.5-2.9 / 1.3-1.4 / 1.02-1.06 (the plus request for the first chunk of every listing);
+  `find -ls` and `du -s` 0.41-0.47 / 0.93-1.11 / 0.85-1.11; the second `ls -l` 1.08-1.45 / 1.18-1.23 / 0.34-0.40.
+  Over R0: plain listings 2.0-2.5 times slower at 1k, 0.49-0.53 at 10k, 0.05-0.09 at 100k; `ls -l` 0.29-0.39 / 0.37-0.44 / 0.34-0.39;
+  `find -ls` 0.41-0.46 / 0.86-1.02 / 0.71-0.77; the second `ls -l` 1.03-1.12 / 1.04-1.35 / 0.27-0.35.
+- **Requests**: `ls -l` of 1k and 10k: 1,007 and 10,019 against 2,004 and 20,008 (49.8 %, 49.9 % fewer); without the one
+  `listxattr` per name `ls` sends, 6 and 18 against 1,003 and 10,007 (99.4 %, 99.8 %). `find -ls`/`du -s`: 286 / 9,290 /
+  99,329 against 1,004 / 10,008 / 100,047.
+- **Page cost**: daemon service time per directory page 0.24 / 0.62 / 0.79 / 0.83 ms at 1k / 10k / 100k / 1M (`off`, ext4) against
+  R0's 0.31 / 2.5 / 22.5 / 261 ms; a cold resume at 1M 1.4-1.5 ms against R0's 275 ms; `ls -l` of 1M: daemon CPU 15.0 s
+  (`auto`) against 149.9 s (R0), wall 18-22 s against 158 s.
+- **Tree workloads, `auto` over `off`** (50k files, 2,000 directories, 18 runs each): `ls -lR` 0.47-0.55, `rsync -an` 0.27-0.35,
+  `git status` 1.01-1.03 cold and 1.10-1.23 warm, `make -q` 1.02-1.10 cold and 1.40-1.64 warm, `find -type f` 1.53-1.59 cold and
+  1.66-1.71 warm. The held names (`8f5af546`) removed `git status`'s slowdown, not `find`'s or `make -q`'s: those walk
+  2,000 directories without a lookup first, so each first chunk is a plus page (53,080 entries with attributes for
+  `find`), which the kernel asks for by itself.
+- Not run: item 2 (write path), item 6 (pins, handover), 10M, `always`, two nodes, an LTS kernel.
