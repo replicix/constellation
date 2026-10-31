@@ -1988,7 +1988,10 @@ impl Core {
         }
         if !sent {
             // This node's own refusal (nothing journaled).
-            let source = AnswerSource::Sequenced(self.root_ack_class());
+            // (Nothing journaled, nothing to commit: this node's own answer,
+            // as a lone node's. Not `root_ack_class`, which since the C2f
+            // review is `Archive` for a node that holds no lease.)
+            let source = AnswerSource::Sequenced(AckClass::Lone);
             self.finish_as(now, rid, MutateOutcome::Errno(code), source, replica, out);
             return;
         }

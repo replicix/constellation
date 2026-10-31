@@ -48139,9 +48139,9 @@ mod c2f_lone_root {
     /// The C2f review, MUST 1 (a): a lone root's answer to another node,
     /// parked for the log, is released when a continuation epoch's hold is
     /// adopted (never a wait for S3 in an epoch, §5.2): it leaves as the
-    /// hold's (non-stealable), and its row keeps its class. Fails on the
-    /// parent: answered `Lone` and the row re-tagged `Lone` (queued for
-    /// replay at a deposition, beside the requester's retry).
+    /// hold's (non-stealable), its row re-tagged so: what a deposition or
+    /// `repair drop-held` does with it follows the answer. Fails on the
+    /// parent: answered `Lone` and the row re-tagged `Lone`.
     #[test]
     fn a_remote_answer_released_by_a_hold_is_the_holds() {
         let mut h = lone_root();
@@ -48160,7 +48160,7 @@ mod c2f_lone_root {
         );
         let ns = AckClass::NonStealable.index();
         assert_eq!(h.core.stats.ack_classes[ns], before[ns] + 1);
-        assert_eq!(classes_of(&h, forwarded(1)), vec![RowClass::Archive]);
+        assert_eq!(classes_of(&h, forwarded(1)), vec![RowClass::NonStealable]);
         assert_eq!(h.core.stats.acks_downgraded_lone, 0);
     }
 
@@ -48187,7 +48187,7 @@ mod c2f_lone_root {
         );
         let ns = AckClass::NonStealable.index();
         assert_eq!(h.core.stats.ack_classes[ns], before[ns] + 1);
-        assert_eq!(classes_of(&h, forwarded(1)), vec![RowClass::Archive]);
+        assert_eq!(classes_of(&h, forwarded(1)), vec![RowClass::NonStealable]);
     }
 
     /// MUST 2 (D5): a node that holds no lease, or lost it, is no lone
@@ -48235,42 +48235,6 @@ mod c2f_lone_root {
             AckClass::Archive
         );
         assert_eq!(classes_of(&h, h.rid(6)), vec![RowClass::NonStealable]);
-    }
-
-    /// SHOULD 5: a journaled refusal of another node's forward starts a sync
-    /// round at once, as an acceptance does: a lone root's answer to it
-    /// waits for the log. Fails on the parent: the round waited for the
-    /// poll's idle backoff.
-    #[test]
-    fn a_journaled_refusal_of_a_forward_nudges_a_round() {
-        let mut h = lone_root();
-        let out = h.step(Event::Peer {
-            from: FROM,
-            msg: PeerMsg::MutateRequest {
-                req: OpId(81),
-                rid: forwarded(9),
-                op: MutateOp::Unlink {
-                    parent: ROOT_INO,
-                    name: "missing".into(),
-                },
-                acked_through: 0,
-                deps: constellation_meta::Position::ZERO,
-                applied: 0,
-                tag: Default::default(),
-            },
-        });
-        assert!(answers(&out).is_empty(), "waits for the archive: {out:?}");
-        assert!(
-            out.iter().any(|a| matches!(
-                a,
-                Action::SetTimer {
-                    after_ms: 0,
-                    kind: TimerKind::Poll,
-                    ..
-                }
-            )) || h.core.nudged,
-            "no round asked for: {out:?}"
-        );
     }
 
     /// SHOULD 6: a lone root's replay of another node's rid (the takeover

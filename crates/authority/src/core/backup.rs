@@ -1716,8 +1716,18 @@ impl Core {
         // Plan 43 C2f review (§5.2, Q3): in a continuation epoch's hold the
         // answer leaves at once (never a wait for S3 there) and the hold
         // vouches for it: non-stealable, whatever class the row was
-        // journaled with before the hold, and nothing re-tagged.
+        // journaled with before the hold, and the row re-tagged so (what a
+        // deposition or `repair drop-held` does with it follows the answer).
         if self.lease.epoch_held() {
+            if let Some((first, class)) = replica.journal_class_of_rid(rid) {
+                if class != constellation_meta::RowClass::NonStealable {
+                    replica
+                        .reclass_journal_tx(first, constellation_meta::RowClass::NonStealable)
+                        .inspect_err(|error| {
+                            tracing::warn!(node = self.cfg.node_id, ?rid, %error, "could not re-tag a row answered in a hold: EIO");
+                        })?;
+                }
+            }
             return Ok(AckClass::NonStealable);
         }
         Ok(match replica.journal_class_of_rid(rid) {

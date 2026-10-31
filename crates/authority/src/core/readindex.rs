@@ -1807,9 +1807,10 @@ impl Core {
             });
             // Plan 43 C2f review (§5.2, Q3): another node's answer released by
             // a continuation epoch's hold (the only way one leaves with the
-            // gate off before the log carries it) is the hold's: non-stealable,
-            // and its row keeps its class (no `Lone` re-tag: that would queue
-            // it for replay beside the requester's retry).
+            // gate off before the log carries it) is the hold's: non-stealable
+            // and uncommitted, its row re-tagged so (never `Lone`): what a
+            // deposition or `repair drop-held` does with the row then follows
+            // the answer, which was given.
             let held_for_remote = unarchived && p.what.to_remote(self.cfg.node_id);
             let downgraded = unarchived
                 && !held_for_remote
@@ -1824,6 +1825,18 @@ impl Core {
             // row) nor `Lone` (not recorded), so the op is answered `EIO`
             // (the C1-2/C1-3 review).
             let mut p = p;
+            if held_for_remote {
+                if let Some(j) = p.durable {
+                    if let Err(error) =
+                        replica.reclass_journal_tx(j, constellation_meta::RowClass::NonStealable)
+                    {
+                        tracing::warn!(node = self.cfg.node_id, %error, "could not re-tag a row answered in a hold: EIO");
+                        if let ParkedWhat::Reply { outcome, .. } = &mut p.what {
+                            *outcome = MutateOutcome::Errno(Code::Io);
+                        }
+                    }
+                }
+            }
             if downgraded {
                 if let Some(j) = p.durable {
                     if let Err(error) =

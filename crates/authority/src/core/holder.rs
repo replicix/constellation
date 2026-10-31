@@ -813,14 +813,6 @@ impl Core {
                 MutateOutcome::Errno(code)
             }
         };
-        // Plan 43 C2f review: a lone root's journaled refusal of another
-        // node's op starts a round at once, as an acceptance does (above):
-        // its answer waits for the log, and waited for the idle backoff's
-        // next round (up to 10 s on an idle root). (A backed root's answer
-        // waits for its group, appended on every event.)
-        if super::backup::is_answer(&outcome) && asker == super::Asker::Remote && self.root_lone() {
-            self.nudge(now, out);
-        }
         (outcome, None)
     }
 
