@@ -1720,7 +1720,12 @@ whose backup set empties while it waits is never released to another node on
 the root's disk alone (no `Lone` re-tag for a remote): it waits for the
 archive too; a continuation epoch's hold still answers at once (never a wait
 for S3 there). A row of another node's op journaled `Lone` before this rule
-is re-tagged `Archive` when another node asks for it again. The FUSE fast
+is re-tagged `Archive` when another node asks for it again. Another node's
+retry answered from an earlier execution waits for that execution's own row
+in the log, not for the journal's tip (rows ship past a deferred one); a row
+of a continuation epoch's hold is non-stealable only while the hold lasts;
+and an answer parked for the log whose row was rolled back meanwhile (`repair
+drop-held`) is aborted, not released, when the log covers its seq. The FUSE fast
 path's gate-off answer (`Ungated`) is given only where the core published
 that the node is lone or holds an epoch; the gate off for any other reason (a
 release, a handoff after the write) is in doubt, counted

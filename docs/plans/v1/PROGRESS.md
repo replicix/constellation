@@ -63219,3 +63219,101 @@ Gates: fmt, clippy (workspace, all targets, `-D warnings`); authority lib and `m
 engine (every target) 948, control 146, release sim suite 300 passed. Seeds 0 to 1,999, with and without the knob: the
 25 configurations 0, but `placement-hot` 593 with the knob (open on main). `delegated-holder-cut +commit`: no
 `deleg-group` failure either way; flags off, I2, I2c, I4, I5 as before.
+## Plan 43 C2f: a lone root answers other nodes from the archive; `Ungated` only where lone (2026-10-31)
+
+Sixth of C2's commits (coder spec §5: plan §5.3 items 3 and 4), with three holes the new wait opened and an oracle
+dating fix, found by the sweeps below.
+
+### What landed
+
+- **`Ungated` only where lone (D5)**: `set_durable(.., lone_ok)` publishes whether the node may answer its own
+  clients alone (`Core::root_lone`, or a continuation epoch's hold); `wait_durable` answers `Ungated` only then (at
+  once in an epoch: never a wait for S3 there), otherwise `DurableWait::Unexpected`: counted
+  (`ack.ungated_unexpected`), resubmitted in doubt, no assertion. `status.ack.lone` (D9).
+- **The class of a root's answer depends on who asked** (`root_ack_class_for(Asker)`): a lone root answers its own
+  node's client `Lone` and every other node `Archive`. The row is journaled with the asker's class (the holder's
+  execution of a forward, its refusals, an inbox batch of another node), so a deposition keeps it as a member copy,
+  not a replay (H1). The answer leaves once a segment carries the row (`answer_need`, `archive_covers`),
+  `committed`.
+- **Park release** (`park_durable`): an answer to another node never takes the lone shortcut; a forward parked for the
+  root group whose backup set empties waits for the archive (no `Lone` re-tag); an epoch's hold answers at once.
+- **Dedup**: another node's retry keeps a gated row's class with the gate off, re-tags a `Lone` row of another node's
+  op `Archive`, waits for **the rid's own row** (not the tip: the ship plan sends rows past a deferred one), and
+  answers a row journaled in a hold as the hold's only while the hold lasts.
+- **A parked answer whose row was rolled back** (`repair drop-held` strands a held transaction and queues its op
+  again) is aborted (`Busy`, the requester retries by rid) instead of released when the log covers its seq, which is
+  another row's by then (`ParkedWhat::Reply::completed`, `Stats::acks_row_gone`).
+- **Requester**: `Stats::ungated_shadows` (`status.ack.ungated_shadows`, warned once); a `strict_commit` run fails
+  with one.
+- **Sim**: `far` runs `strict_commit` and `strict_identity`, and makes every pair far, the ids fresh joins take
+  included (a joined node 4 had the default RTT). I5 dates a restarted node's queued rows by when they were queued
+  (the oracle's memory of the queue was per process: a rebooted delegate's stranded rows, replayed through a root
+  that answers from the archive, read as rolled back after that answer; `delegated-long-delegation` 31 -> 0).
+
+### Decisions and deviations (maintainer questions)
+
+- **A non-stealable answer still says `committed: false`** (C1-2's `gated()`, Q12), not the spec §5.1 sentence
+  "committed for every class but `Lone`": `ungated_shadows` therefore counts a designee's or an epoch hold owner's
+  answers (seen in `locks-blips-tight-faults`). No `strict_commit` configuration has holds or designations today.
+- **`strict_commit` stays off in the `strict_durability` configurations.** What remains of their `archive/*` count
+  is the holder's own clients' answers in a tenure's first ~200 ms, which the core judges `Lone` and the oracle does
+  not (the D10 alignment, C5); none is an answer to another node any more (oracle debug, every sweep below).
+- `flex-crash` counts 777 I2 (b) copies (main 0): `repair drop-held` (the simulation's operator for the dead
+  member's chunk) requeues the held transaction's rows, which are `Archive`-class now, beside the requester's
+  retry; none of them was answered (their answers waited for the log the held chunk blocked); the rid dedups. Not
+  strict there; the operator path and the commit rule are C3/C5's (or the oracle's: judge a queued copy only when
+  its answer was given).
+
+### Evidence
+
+Fail-before: each new test fails with its rule reverted (mutations on box 1): core
+`a_lone_root_answers_a_forward_from_the_archive`, `a_lone_roots_forwarded_row_never_enters_the_replay_queue`,
+`a_root_group_park_for_a_remote_waits_for_the_archive_once_lone`,
+`a_lone_row_of_another_nodes_op_is_answered_from_the_archive`, `an_ungated_wait_in_an_epoch_hold_answers_at_once`,
+`a_parked_answer_whose_row_is_rolled_back_is_aborted`, `a_retry_answered_from_the_dedup_waits_for_its_own_row`,
+`a_hold_row_answered_after_the_hold_waits_for_the_archive`; meta
+`an_ungated_wait_is_answered_only_where_the_node_may_answer_alone`; engine
+`an_unexpected_ungated_wait_is_counted_and_resubmitted`; sim `c2f_a_lone_root_answers_other_nodes_from_the_archive`
+(C0's `c0_i1_finds_lone_answers_to_remote_requesters` asserted `+commit` failed there). `far+commit` 0..2000 with
+the same topology on main: **every seed fails** (47,456 answers to other nodes uncommitted); here 0 under
+`+commit+identity`, both lease-read settings.
+
+Sweeps (box 1, release; seeds 0..1,999, `shared-dir*` 0..499; each with and without
+`AUTHORITY_SIM_LEASE_READS=0:0:800:1000` (`-lr`); main = f2cd77a4 with `far`'s topology and the I5 dating fix applied,
+so the counters compare): **no failing seed main does not fail** except `long-backup` 743 (`member_copies_drained`:
+two `RootGroup` rows journaled under a reconfiguration in doubt outlive the archive after the holder's crash), a
+shape main shows too (seeds 4333 and 6613 of 2,000..9,999; here 5209 and 7743); `placement-hot-lr` 593 fails on
+both. I1 uncommitted answers, main -> here (answers to another node in brackets):
+
+| Configs | I1 |
+|---|---|
+| `far`, `far-lr` | 47,456 / 41,878 -> 0 / 0 |
+| `backup`, `-crash`, `-strict`, `-hot`, `-two`, `long-backup` | 3,322 / 4,021 / 3,782 / 5,266 / 3,364 / 4,346 -> 1,433 / 1,593 / 2,047 / 1,582 / 1,422 / 1,842 (remote 1,801-3,711 -> 0) |
+| `placement-hot` | 727 -> 240 (489 -> 3) |
+| `long-delegated`, `delegated-crash`, `-partition`, `-root-crash`, `-root-gone`, `-delegate-restart`, `-two-gens-root-crash`, `-long-delegation`, `locks-delegated`, `long-sessions`, `flex-crash`, `shared-dir*` (both lease-read settings) | 8,007 to 221,941 each -> **0** |
+| `long-delegated-backup`, `-late-answers`, `delegated-backup`, `-holder-cut`, `-no-backup-root-near` | 397 / 478 / 40 / 125 / 78 -> 325 / 376 / 38 / 125 / 74 (the C2c stragglers: C3, C5) |
+
+I4 within ±4 of main everywhere but `flex-crash` (10 -> 3); I5 equal or lower everywhere (`flex-crash` 4,181 ->
+2,619; `long-sessions` 40 -> 0); I2 0 everywhere but `flex-crash` (above) and `long-delegated-late-answers-lr` 3
+(seeds 291, 413: a deposed root rebuilt from the log queues a delegate's row as a `Records` replay, the open C3 §5.4
+item 4).
+
+Pinned seeds that moved: `session_wait_off_is_found` (the archive wait closes most windows the session wait covers:
+22 of 0..2,999 still violate with it off, 264 on main; range 600..1,700), `epoch_liveness_gap_fault_seeds`'
+`locks-blips-tight-faults` 409 (a grant lost to the seed's holder crash, as a third of that configuration's seeds lose
+one on main), `no_peer_in_budget_is_todays_behaviour` (its takeovers judged by how they claimed, not by the time of
+the first answer, which an answer no sequencer gave can end early now). Tests that used an unbacked holder for a
+forward answered at once let the archive land (`Harness::archive_lands`); the own-chunk tests that study an answer
+given ahead of the log use a backed holder (`holding_backed`).
+
+### Gates
+
+Rebased on f2cd77a4 (the lock-liveness branch; no conflicts). `cargo fmt --all --check`, `clippy --workspace
+--all-targets -D warnings`; authority lib 855 and `meta_repro` 4, meta (lib 382), engine (lib 939), control 146 (schema
+re-blessed), release sim suite 300 passed / 11 ignored.
+
+### Not done here
+
+C2g (settle before `EIO`), C2h (scenarios, strict flags elsewhere: the delegated configurations whose I1 is now 0 are
+candidates), the whole-C2 review. Performance: topology 5's forwarded ops now wait one archive commit (§11 Q2,
+accepted), not measured here. The own clients' bring-up `Lone` answers the oracle does not judge lone (C5's D10).

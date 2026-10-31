@@ -1920,14 +1920,19 @@ another node are journaled with the asker's class), `answer_need` /
 shortcut: a forward parked for the root group when the group empties waits
 for the archive; an epoch's hold never waits for S3), a remote's dedup of a
 gated row keeps its class and a `Lone` row of another node's op is re-tagged
-`Archive`; `set_durable(.., lone_ok)` and `DurableWait::Unexpected` (D5:
+`Archive`; a remote's dedup answer waits for the rid's own row (not the tip:
+rows ship past a deferred one), a hold's row is non-stealable only while the
+hold lasts, and a parked answer whose row was rolled back (`repair
+drop-held`) is aborted (found by `flex-crash`'s I1 oracle);
+`set_durable(.., lone_ok)` and `DurableWait::Unexpected` (D5:
 counted, resubmitted in doubt); `Stats.ungated_shadows`; status
 `ack.lone`, `ack.ungated_shadows`, `ack.ungated_unexpected`. Kept as C1
 landed (not as the spec's §5.1 sentence "committed for every class but
 `Lone`"): a non-stealable answer still says `committed: false` (Q12's
 `gated()`), so `ungated_shadows` counts a designee's or a hold owner's
 answers; a maintainer question. `far` runs `strict_commit` and
-`strict_identity`; the `strict_durability` configurations keep
+`strict_identity` (every pair far now, the ids fresh joins take included);
+the `strict_durability` configurations keep
 `strict_commit` off: what remains of their `archive/*` count is the
 holder's *own* clients' answers in the first ~200 ms of a tenure, judged
 `Lone` by the core and not by the oracle (a peer whose link passed the
