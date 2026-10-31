@@ -63147,3 +63147,45 @@ suite 300 passed (11 ignored). Seeds 0 to 1,999, with and without the knob: `del
 `backup-two`, `long-backup`, `long-acks3`, `far`, `flex-crash` 0, but `placement-hot` 593 with the knob (open on main).
 `delegated-holder-cut +commit`: as after the previous commit (`deleg-group` 124, 228, 501, 763, 1849, 1900; with the
 knob 228).
+
+## Review of the three commits: the fast path's watermark, a lone tenure, a recall's cut (2026-10-31)
+
+- **The FUSE fast path's watermark (must-fix).** `report_deleg_durable` published `through`, the generation's committed
+  prefix, which is floored at `log_stream_idx`; for the generation the gate stopped that index includes the
+  re-appended rows, and the session's high-water (`deleg_covered`) outlives `lost`: the delegate's own FUSE waiter for
+  such a row heard `Durable` with the row on this disk alone. `through` now stops below the first holder append its
+  tenure has not committed (`Core::below_holder_appends`; those are a suffix). Test: core
+  `the_fast_paths_watermark_does_not_cover_a_re_appended_row_before_its_commit` (fails without the cap).
+- **A lone tenure.** With nothing gating its own rows (`durable_jseq` is `u64::MAX`), the predicate counted the row
+  committed, and only a park carrying a journal seq was re-tagged `Lone`; a deadline's or a dedup's
+  `completed_row_settled` answer was not. A holder append now counts as committed by its tenure only once shipped or
+  on every committed backup, never by a lone `durable_jseq`: such answers wait for the archive (the takeovers measured
+  above are rare and short). The park hook of `88ef8f9a` (`stream_parks_wait_for_journal`) was then redundant and is
+  gone. Test: `a_re_appended_rows_answer_waits_for_the_new_tenures_commit`, now with a lone case (fails with the lone
+  `durable_jseq` counted).
+- **A deposed tenure** counts only what shipped. Test: `a_deposed_tenures_re_appended_row_is_committed_only_once_shipped`
+  (fails with the lease check taken as true).
+- **A recall's cut.** A recall of the generation the gate stopped was answered at `log_stream_idx`, which covered an
+  unshipped re-appended row; deposed before its gate's segment ships, this node leaves the next root a cut its log
+  lacks a row below. The answer stops below the uncommitted holder appends too. Test:
+  `a_recall_answer_does_not_cut_past_an_uncommitted_re_appended_row` (cut 1 without it).
+- **Cost.** `Meta::holder_append_tip` (an atomic, raised where a holder journals a delegation row, recomputed from the
+  journal at open) gates the seek: a node that never appended as a holder, or whose appends all shipped, pays one load.
+- **Uncaptured rows (investigated, kept).** A probe that panics on any journal write without before-images found none in
+  the release sim suite's runs (only its oracle unit tests, which write stores directly), in 300 seeds each of 15
+  configurations (`flex`, `flex-crash`, `long-sessions`, `long-delegated`, `-late-answers`, `delegated-crash`,
+  `-partition`, `-root-crash`, `-backup`, `backup-crash`, `long-backup`, `placement-hot`, `shared-dir-split`, `far`,
+  `long-acks3`), or in the daemon crate's tests; 426 engine unit tests hit it, each writing through a view with no lease
+  keeper. Not excluded in production: the engine's lease view admits a fast-path write on a mirror refreshed after the
+  core's event, and the core clears the holder epoch inside the event (a release, a deposition), so a write admitted in
+  between journals uncaptured (the same lag `begin_local`'s note gives for delegations). The uncaptured handling stays;
+  closing that window (capturing whatever the lease view admitted) would let it go.
+- Nits: the publish rule's note on continuation epochs, and the capture-off wording left in tests and in the control
+  schema's `depositions`.
+
+Gates: fmt, clippy (workspace, all targets, `-D warnings`); authority lib and `meta_repro` 856, meta (every target) 536,
+engine (every target) 948, control 146, release sim suite 300 passed. Seeds 0 to 1,999, with and without the knob: the
+25 configurations of the removal entry 0, but `placement-hot` 593 with the knob (open on main).
+`delegated-holder-cut +commit`: no `deleg-group` failure either way (the lone-root answers now wait for the archive);
+what fails is the `archive/*` class (C2f) and, with the knob, `root-group` 1069, 1434, 1464, 1531 (open on main). Flags
+off: `deleg-group` uncommitted 0 both ways, I2, I2c, I4, I5 unchanged.

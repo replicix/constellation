@@ -1562,8 +1562,8 @@ pub struct SpeculationStatus {
     /// Plan 30 §M3b: this node's own unshipped transactions rolled back
     /// because it was deposed (and queued for replay by rid), since start.
     pub local_rolled_back: u64,
-    /// Plan 30 §M3b: deposition recoveries run (rollback plus replay, or
-    /// the capture-off rebuild), since start.
+    /// Plan 30 §M3b: deposition recoveries run (rollback plus replay, and a
+    /// rebuild from the log for the rows the rollback leaves), since start.
     pub depositions: u64,
     /// Plan 30 §M3b: epoch-marker segments this node shipped right after a
     /// takeover, since start.

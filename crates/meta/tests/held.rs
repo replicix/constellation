@@ -469,7 +469,7 @@ fn an_acked_pending_row_stops_poisoning() {
     assert_eq!(s.meta.held_summary().transactions, 0);
 }
 
-/// Without capture (holder capture off, or not holding) a transaction has
+/// Without capture (journaled while not holding) a transaction has
 /// no known key set: once one is held, everything after it is held too —
 /// the pre-M4 behaviour from that point on.
 #[test]

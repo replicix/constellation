@@ -1548,17 +1548,6 @@ impl Core {
                 continue;
             }
             self.stats.own_deleg_rows_reappended += 1;
-            // An answer still waiting for this row was never given under
-            // the group, which has not committed it: its commit is now this
-            // tenure's. The append raised the generation's log index on this
-            // node's own journal, which the park takes for the group's copy
-            // (`deleg_stream_state_with`): it also waits for the journal row
-            // to be committed by the root's rule (the archive, or this
-            // tenure's backups), else the answer left on this disk alone
-            // before the gate's segment shipped (`delegated-holder-cut
-            // +commit` seeds 124, 214, 348: I1).
-            self.stats.own_deleg_reappended_parks_held +=
-                self.stream_parks_wait_for_journal(gen, idx, replica.journal_tip()) as u64;
             appended.extend(outcome);
         }
         if !appended.is_empty() {

@@ -384,6 +384,9 @@ pub trait Replica {
     /// append of delegation row `(gen, idx)` (`Meta::holder_append_of`);
     /// `Err` when it cannot be read.
     fn holder_append_of(&self, gen: u64, idx: u64) -> Result<Option<u64>, MetaError>;
+    /// Plan 43 C3: an upper bound of the journal seqs of this node's holder
+    /// appends of delegation rows, 0 for none (`Meta::holder_append_tip`).
+    fn holder_append_tip(&self) -> u64;
     /// Phase 2b: a delegate's backup persists its transactions; returns
     /// the highest index through which every transaction is in the log
     /// as this replica holds it or held here, contiguously above that
@@ -1216,6 +1219,10 @@ impl Replica for Meta {
 
     fn holder_append_of(&self, gen: u64, idx: u64) -> Result<Option<u64>, MetaError> {
         Meta::holder_append_of(self, gen, idx)
+    }
+
+    fn holder_append_tip(&self) -> u64 {
+        Meta::holder_append_tip(self)
     }
 
     fn deleg_backup_append(&self, gen: u64, txs: &[DelegateTx]) -> Option<u64> {

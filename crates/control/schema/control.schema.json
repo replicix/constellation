@@ -9286,7 +9286,7 @@
           "type": "integer"
         },
         "depositions": {
-          "description": "Plan 30 §M3b: deposition recoveries run (rollback plus replay, or\nthe capture-off rebuild), since start.",
+          "description": "Plan 30 §M3b: deposition recoveries run (rollback plus replay, and a\nrebuild from the log for the rows the rollback leaves), since start.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"

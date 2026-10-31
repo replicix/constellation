@@ -687,6 +687,11 @@ impl Meta {
             },
         )?;
         put_journal_origin(tx, self, gen, idx, local.start);
+        if gen != 0 && local.epoch != 0 {
+            // (Raised before the commit: an over-estimate only costs a seek.)
+            self.holder_append_tip
+                .fetch_max(end - 1, std::sync::atomic::Ordering::SeqCst);
+        }
         if gen != 0 {
             spec::note_deleg_tx(self, local.start, gen, deleg_first);
         }
@@ -1296,6 +1301,28 @@ impl Meta {
         Ok(out)
     }
 
+    /// Plan 43 C3: [`Meta::holder_append_tip`]'s value: an upper bound of
+    /// the journal seqs of this node's delegation rows journaled as a lease
+    /// holder (0: none). One atomic load.
+    pub fn holder_append_tip(&self) -> u64 {
+        self.holder_append_tip
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// At open: the tip from the unshipped journal's heads.
+    pub(crate) fn refresh_holder_append_tip(&self) -> Result<(), MetaError> {
+        let r = self.db.read_tx();
+        let tip = read_journal_tx_heads(&r, self)?
+            .into_iter()
+            .filter(|(_, h)| h.gen != 0 && h.epoch != 0)
+            .map(|(_, h)| h.last)
+            .max()
+            .unwrap_or(0);
+        self.holder_append_tip
+            .fetch_max(tip, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
     /// Plan 43 C3: the last journal seq of this node's unshipped
     /// transaction of delegation origin `(gen, idx)` that it journaled as a
     /// lease holder (`epoch` set: the root's append of the row, a takeover
@@ -1804,10 +1831,12 @@ impl Meta {
             // Unshipped work with no before-images: no commit can be the
             // log prefix. (This used to publish `ns` as it stands when
             // `holder_epoch` was 0, taking such writes for a non-holder's
-            // pre-M3b leftovers — but a continuation epoch's hold owner
-            // journals uncaptured with `holder_epoch` 0 too: flex-crash
-            // seed 11719 published its epoch journal as the prefix at the
-            // last shipped seq.)
+            // pre-M3b leftovers; flex-crash seed 11719 published a
+            // continuation epoch's journal, then uncaptured, as the prefix
+            // at the last shipped seq. A hold owner captures now, under the
+            // epoch it will ship: what is left is a write the engine's
+            // lease view admitted while the core had just cleared the
+            // holder epoch, at a release or a deposition.)
             if self.publish_unshipped.load(Ordering::Relaxed) && self.holder_epoch() == 0 {
                 return Ok(PublishBasis::AsIs);
             }

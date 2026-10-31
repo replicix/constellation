@@ -607,6 +607,12 @@ pub struct Meta {
     /// install a forward reply accepted at a lower epoch (the op is
     /// queued for replay instead).
     pub(crate) holder_epoch: Arc<AtomicU64>,
+    /// Plan 43 C3: at least the last journal seq of any delegation row this
+    /// node journaled as a lease holder (a root's append, a takeover gate's
+    /// re-applied tail or re-append), 0 when it never did since the open
+    /// and its journal held none then. A cheap gate for
+    /// [`Self::holder_append_of`]: a plain delegate never pays its seek.
+    pub(crate) holder_append_tip: AtomicU64,
     /// Unit tests of the tree publisher only: publish `ns` as it stands
     /// though this node's unshipped journal holds uncaptured writes
     /// (`Meta::publish_basis_at`). Never set by the daemon.
@@ -1197,6 +1203,7 @@ impl Meta {
             backup_tail,
             recent: std::sync::Mutex::new(std::collections::HashMap::new()),
             holder_epoch: Arc::new(AtomicU64::new(0)),
+            holder_append_tip: AtomicU64::new(0),
             publish_unshipped: AtomicBool::new(false),
             deleg_any: AtomicBool::new(false),
             deleg_gate: std::sync::RwLock::new(()),
@@ -1238,6 +1245,7 @@ impl Meta {
         meta.check_format()?;
         meta.bootstrap()?;
         meta.refresh_member_copy_flag()?;
+        meta.refresh_holder_append_tip()?;
         meta.build_pending_by_ino()?;
         meta.verify_mark_counts()?;
         let table = meta.delegation_table();

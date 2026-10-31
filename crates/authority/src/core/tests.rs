@@ -41116,21 +41116,16 @@ mod deleg_group {
         assert!(answer_to_2(&out, 500).is_some(), "{out:?}");
     }
 
-    /// A delegate whose root never acknowledged its row takes the root over
-    /// (it was the root's backup): the takeover gate re-appends the row into
-    /// the new tenure's journal under its origin, which raises the
-    /// generation's log index here. The forward waiting for the row is
-    /// answered once that journal row is committed by the root's rule (here
-    /// shipped: a backup could be had, none is listed yet), not at the gate.
-    /// Fails on the parent: answered at the gate, on this disk alone
-    /// (`delegated-holder-cut +commit` seeds 124, 214, 348: I1).
-    #[test]
-    fn a_re_appended_rows_answer_waits_for_the_new_tenures_commit() {
+    /// A delegate whose root never acknowledged its row (7, 1) takes the root
+    /// over (it was the root's backup): the takeover gate re-appends the row
+    /// into the new tenure's journal under its origin, which raises the
+    /// generation's log index here. `eligible`: whether a backup could be
+    /// had (else nothing gates the lone root's own rows).
+    fn take_over_with_a_re_appended_row(eligible: bool) -> Harness {
         let (mut h, dir, _, _) = delegate_renewed_once();
         let out = forward_create(&mut h, dir, 1, 500);
         assert_eq!(answer_to_2(&out, 500), None, "answered alone: {out:?}");
         assert!(h.core.has_stream_parks());
-        // The root never acknowledges; this node seals it and takes over.
         h.hold(
             2,
             Some(PendingGate {
@@ -41143,27 +41138,121 @@ mod deleg_group {
                 shippable: true,
             }),
         );
-        h.core.ack.eligible = Some(true);
+        h.core.ack.eligible = Some(eligible);
         let mut out = Vec::new();
         h.core.complete_gate(h.clk(), &h.meta, &mut out);
         assert_eq!(h.core.stats.own_deleg_rows_reappended, 1);
         assert_eq!(h.meta.log_stream_idx(7).unwrap(), 1);
-        h.core.complete_ready(h.clk(), &h.meta, &mut out);
-        assert_eq!(
-            answer_to_2(&out, 500),
-            None,
-            "answered before the new tenure committed the row: {out:?}"
-        );
-        assert_eq!(h.core.stats.own_deleg_reappended_parks_held, 1);
-        // The gate's segment ships.
-        h.core.ack.shipped_through = h.meta.journal_tip().unwrap();
+        h
+    }
+
+    /// The forward waiting for the re-appended row is answered once the new
+    /// tenure ships it, not at the gate: with a backup to be had, and as a
+    /// lone root too (whose answer on its disk would be a `Lone` one that no
+    /// reader re-tags). Fails on `88ef8f9a`'s parent (answered at the gate,
+    /// on this disk alone: `delegated-holder-cut +commit` seeds 124, 214,
+    /// 348, I1), and in its lone case on `1df86d54` (the predicate counted a
+    /// lone root's `durable_jseq`, `u64::MAX`, as committing the row).
+    #[test]
+    fn a_re_appended_rows_answer_waits_for_the_new_tenures_commit() {
+        for eligible in [true, false] {
+            let mut h = take_over_with_a_re_appended_row(eligible);
+            let mut out = Vec::new();
+            h.core.complete_ready(h.clk(), &h.meta, &mut out);
+            assert_eq!(
+                answer_to_2(&out, 500),
+                None,
+                "(eligible {eligible}) answered before the new tenure committed the row: {out:?}"
+            );
+            // The gate's segment ships.
+            h.core
+                .ack
+                .shipped_rows
+                .insert(h.meta.journal_tip().unwrap());
+            let mut out = Vec::new();
+            h.core.complete_ready(h.clk(), &h.meta, &mut out);
+            let (outcome, _) = answer_to_2(&out, 500).expect("answered once shipped");
+            assert!(
+                matches!(outcome, MutateOutcome::Accepted { .. }),
+                "{outcome:?}"
+            );
+        }
+    }
+
+    /// The same, the new tenure deposed before its gate's segment ships: what
+    /// its backups held counts no more (a successor reads its own group),
+    /// only what shipped. Fails with the predicate's `holds` taken as true.
+    #[test]
+    fn a_deposed_tenures_re_appended_row_is_committed_only_once_shipped() {
+        let mut h = take_over_with_a_re_appended_row(true);
+        let tip = h.meta.journal_tip().unwrap();
+        // Held by the backups the tenure had...
+        h.core.ack.shipped_through = tip;
+        assert!(h.core.deleg_stream_durable(7, 1, &h.meta));
+        // ...and then deposed.
+        h.core.lease.lost = true;
+        assert!(!h.core.deleg_stream_durable(7, 1, &h.meta));
         let mut out = Vec::new();
         h.core.complete_ready(h.clk(), &h.meta, &mut out);
-        let (outcome, _) = answer_to_2(&out, 500).expect("answered once shipped");
+        assert_eq!(answer_to_2(&out, 500), None, "{out:?}");
+    }
+
+    /// The FUSE fast path's waiter for the row: the published watermark of
+    /// the stopped generation must not cover it before the new tenure
+    /// commits it (the waiter's high-water outlives `lost`). Fails on
+    /// `1df86d54`: `Durable` at the gate, unshipped.
+    #[test]
+    fn the_fast_paths_watermark_does_not_cover_a_re_appended_row_before_its_commit() {
+        let mut h = take_over_with_a_re_appended_row(true);
+        h.core.report_deleg_durable(h.clk(), &h.meta);
+        let w = h
+            .meta
+            .session()
+            .wait_deleg_durable(7, 1, std::time::Duration::ZERO);
         assert!(
-            matches!(outcome, MutateOutcome::Accepted { .. }),
-            "{outcome:?}"
+            !matches!(w, constellation_meta::DurableWait::Durable(_)),
+            "the fast path's waiter took the row for committed: {w:?}"
         );
+        h.core
+            .ack
+            .shipped_rows
+            .insert(h.meta.journal_tip().unwrap());
+        h.core.report_deleg_durable(h.clk(), &h.meta);
+        let w = h
+            .meta
+            .session()
+            .wait_deleg_durable(7, 1, std::time::Duration::ZERO);
+        assert!(
+            matches!(w, constellation_meta::DurableWait::Durable(_)),
+            "{w:?}"
+        );
+    }
+
+    /// A recall of the stopped generation answered before the new tenure
+    /// commits the re-appended row cuts below it: the next root's log may
+    /// never get the row (this node deposed before its gate's segment
+    /// ships). Fails on `1df86d54` (the cut was the log index, 1).
+    #[test]
+    fn a_recall_answer_does_not_cut_past_an_uncommitted_re_appended_row() {
+        let mut h = take_over_with_a_re_appended_row(true);
+        let dir = h.core.dl.mine[&7].dir;
+        let recalled = |out: &[Action]| {
+            sends(out).into_iter().find_map(|(to, m)| match m {
+                PeerMsg::DelegRecalled {
+                    gen: 7, through, ..
+                } if to == 1 => Some(*through),
+                _ => None,
+            })
+        };
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegRecall {
+                req: OpId(77),
+                dir,
+                gen: 7,
+            },
+        });
+        assert_eq!(recalled(&out), Some(0), "{out:?}");
     }
 
     /// The same takeover, the forward's park gone (its answer aborted, or a

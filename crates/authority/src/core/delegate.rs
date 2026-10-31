@@ -2483,26 +2483,60 @@ impl Core {
     /// counts as the log or the root's copy; on this node it is neither,
     /// only this disk. A row so held is not committed yet, whoever waits
     /// for it: a park, a retry's dedup answer (`deleg_dedup_wait`), a
-    /// `completed` row answered at a deadline (`completed_row_settled`).
-    /// Before, a delegate that took the root over answered such a row at
-    /// the gate on its own disk alone (`delegated-holder-cut +commit`
-    /// seeds 124, 214, 348: I1). A store error counts as not committed (the
-    /// check runs again at the next event).
+    /// `completed` row answered at a deadline (`completed_row_settled`), the
+    /// fast path's published watermark (`report_deleg_durable`), a recall's
+    /// answer. Before, a delegate that took the root over answered such a
+    /// row at the gate on its own disk alone (`delegated-holder-cut
+    /// +commit` seeds 124, 214, 348: I1). A deposed (or released) tenure
+    /// counts only what shipped; a lone one (nothing gates its own rows,
+    /// `durable_jseq` is `u64::MAX`) too: its answer would be a `Lone` one,
+    /// which no reader of this re-tags, so it waits for the archive. A
+    /// store error counts as not committed (the check runs again at the
+    /// next event).
     pub(crate) fn holder_append_uncommitted(
         &self,
         gen: u64,
         idx: u64,
         replica: &dyn Replica,
     ) -> bool {
+        // One atomic load for a node that never appended as a holder.
+        let tip = replica.holder_append_tip();
+        if tip == 0 {
+            return false;
+        }
+        let shipped = replica.journal_acked_seq().unwrap_or(0);
+        if tip <= shipped {
+            return false;
+        }
         match replica.holder_append_of(gen, idx) {
             Ok(None) => false,
             Ok(Some(last)) => {
-                let shipped = replica.journal_acked_seq().unwrap_or(0);
                 let holds = self.lease.held.is_some() && !self.lease.lost;
-                !(last <= shipped || holds && self.durable_covers(last))
+                let durable = self.durable_jseq();
+                let backed = holds
+                    && (self.ack.shipped_rows.contains(&last)
+                        || (durable != u64::MAX && last <= durable));
+                !(last <= shipped || backed)
             }
             Err(_) => true,
         }
+    }
+
+    /// `through` of generation `gen`'s stream lowered below the first of
+    /// this node's holder appends of it that its tenure has not committed
+    /// ([`Self::holder_append_uncommitted`]): those form a suffix (a
+    /// journal commits in order, and the appends are in index order).
+    pub(crate) fn below_holder_appends(
+        &self,
+        gen: u64,
+        through: u64,
+        replica: &dyn Replica,
+    ) -> u64 {
+        let mut t = through;
+        while t > 0 && self.holder_append_uncommitted(gen, t, replica) {
+            t -= 1;
+        }
+        t
     }
 
     /// [`Self::deleg_stream_state_with`] with what it reads cached across
@@ -2653,6 +2687,11 @@ impl Core {
             let class = self.deleg_ack_class(now, d.gen, Asker::Own, replica);
             let uncapped = self.deleg_committed_through(d, replica.log_stream_idx(d.gen));
             let through = caps.get(&d.gen).map_or(uncapped, |c| c.committed);
+            // The prefix is floored at the log's index, which this node's own
+            // holder appends raise (a takeover gate's re-append): the fast
+            // path's waiter, whose high-water outlives `lost`, would take
+            // such a row on this disk alone for committed.
+            let through = self.below_holder_appends(d.gen, through, replica);
             // The fast path answers its own node's clients from the FUSE
             // thread, where the core does not see it: every index committed
             // may have been answered — as a `DelegGroup` row journaled
@@ -5643,8 +5682,12 @@ impl Core {
     ) {
         // A stream a takeover's strand holed has nothing past what the
         // log holds of it: its counter's later indices were root rows'.
+        // Not past this node's own holder appends its tenure has not
+        // committed (a takeover gate's re-append, unshipped, perhaps never:
+        // a node deposed before its gate's segment ships): the next root's
+        // log would lack a row the cut covers.
         let through = if replica.delegate_stranded(gen) {
-            replica.log_stream_idx(gen)
+            self.below_holder_appends(gen, replica.log_stream_idx(gen), replica)
         } else {
             replica.delegate_idx(gen)
         };

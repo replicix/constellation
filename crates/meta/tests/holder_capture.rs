@@ -7,7 +7,7 @@
 //! per key. The rest pin down one rule each: retirement on ship,
 //! deposition, a tailed segment inserted before local work, publish
 //! substitution, a forward reply older than the held epoch, transaction
-//! boundaries, and the capture-off fallback.
+//! boundaries, and the deposition rebuild.
 
 use constellation_fs_core::types::ROOT_INO;
 use constellation_fs_core::InodeKind;
