@@ -1195,6 +1195,10 @@ pub struct Report {
     pub late_landings: usize,
     /// I5: acknowledged, rolled-back ops whose answer was not Lone.
     pub non_lone_rollbacks: usize,
+    /// Plan 43 C2 (§5.3): shadows and hints installed for an answer not
+    /// said to be committed (`Stats::ungated_shadows`, every node's last
+    /// incarnation). Fails the run under `strict_commit`.
+    pub ungated_shadows: u64,
     /// Deposition rebuilds run, `(succeeded, failed)`, over every
     /// incarnation of every node.
     pub rebuilds: (u64, u64),
@@ -5205,6 +5209,18 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 ));
             }
         }
+    }
+    // Plan 43 C2 (§5.3): a requester's shadow stands for a committed answer;
+    // one installed for an answer its sequencer did not say is committed is
+    // an answer outside the commit rule that the I1 oracle judged at the
+    // sequencer (or a non-stealable one's: none in a `strict_commit` run).
+    report.ungated_shadows = report.stats.values().map(|s| s.ungated_shadows).sum();
+    if cfg.strict_commit && report.ungated_shadows > 0 {
+        return Err(format!(
+            "I1 acked_implies_committed: {} shadow(s) installed for an answer not said to be \
+             committed\n  {counters}\n  faults: {:?}",
+            report.ungated_shadows, report.faults
+        ));
     }
     Ok(report)
 }

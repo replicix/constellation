@@ -2273,10 +2273,15 @@ pub struct AckStatus {
     #[serde(default)]
     pub sealed_unread: bool,
     /// This node answers its own clients as a lone sequencer (no peer in
-    /// the RTT budget): the root lease's, or a delegation's it holds (plan
-    /// 43 C2).
+    /// the RTT budget): the root lease's, or a delegation's it holds. Other
+    /// nodes' requests are then answered once in the log (plan 43 C2).
     #[serde(default)]
     pub lone: bool,
+    /// Shadows and hints installed for an answer its sequencer did not say
+    /// is committed (plan 43 C2: a lone root answers other nodes from the
+    /// log, so only a non-stealable sequencer's answers count here).
+    #[serde(default)]
+    pub ungated_shadows: u64,
     /// FUSE fast-path writes whose durability wait found the gate off on a
     /// node that is neither lone nor holding a continuation epoch (a
     /// release or a handoff after the write): resubmitted in doubt (plan 43

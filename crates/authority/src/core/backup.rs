@@ -1157,6 +1157,9 @@ pub struct AckView {
     /// it holds (the class it last published for the generation's own
     /// clients is `Lone`).
     pub lone: bool,
+    /// Plan 43 C2 (§5.3): shadows and hints installed for an answer not
+    /// said to be committed (`Stats::ungated_shadows`).
+    pub ungated_shadows: u64,
 }
 
 impl Core {
@@ -1249,6 +1252,7 @@ impl Core {
                     .reported
                     .values()
                     .any(|r| r.class == constellation_meta::RowClass::Lone),
+            ungated_shadows: self.stats.ungated_shadows,
         }
     }
 
@@ -1500,6 +1504,51 @@ impl Core {
         (!self.durable_covers(jseq)).then_some(jseq)
     }
 
+    /// Plan 43 C2 (§5.1): journal seq `jseq` is in the log — at or below the
+    /// shipped watermark (the core's, or the replica's `shipped`), or one of
+    /// the rows shipped past it. What an `Archive` answer waits for.
+    pub(crate) fn archive_covers(&self, jseq: u64, shipped: u64) -> bool {
+        jseq <= self.ack.shipped_through.max(shipped) || self.ack.shipped_rows.contains(&jseq)
+    }
+
+    /// Plan 43 C2 (§5.2): an answer resting on journal seq `jseq` may leave
+    /// now. The archive carries it, or this node holds a continuation
+    /// epoch (never wait for S3 there: the hold is non-stealable, §11 Q3,
+    /// and S3 is what the epoch is without), or the gate is on and the
+    /// group holds it. With the gate off the root is lone: its own client's
+    /// answer leaves (as `Lone`), another node's (`remote`) waits for the
+    /// archive — the lone shortcut is never taken for a remote, whatever
+    /// class the row was parked under (a `RootGroup` row whose backup set
+    /// emptied while it waited included).
+    pub(crate) fn park_durable(&self, jseq: u64, remote: bool, shipped: u64) -> bool {
+        if self.archive_covers(jseq, shipped) || self.lease.epoch_held() {
+            return true;
+        }
+        if self.durable_jseq() != u64::MAX {
+            return self.durable_covers(jseq);
+        }
+        !remote
+    }
+
+    /// Plan 43 C2 (§5.1): the journal seq an answer of class `class` to
+    /// `asker`, evaluated at `position`, must wait for, or `None` when it may
+    /// leave now: [`Self::ack_need`] for this node's own client, and for
+    /// another node the same except that a lone root's answer waits for the
+    /// archive ([`Self::park_durable`]). A non-stealable answer never waits.
+    pub(crate) fn answer_need(
+        &self,
+        position: &constellation_meta::Position,
+        class: AckClass,
+        asker: Asker,
+        shipped: u64,
+    ) -> Option<u64> {
+        if class == AckClass::NonStealable {
+            return None;
+        }
+        let jseq = position.pending.map(|p| p.jseq)?;
+        (!self.park_durable(jseq, asker == Asker::Remote, shipped)).then_some(jseq)
+    }
+
     /// Plan 43 C2 (§2.1): this node holds the root lease, usably, as a lone
     /// sequencer: not lost, no continuation epoch, not under `ack=s3`, and
     /// nothing gates its answers (`durable_jseq` is `u64::MAX`: no listed or
@@ -1514,15 +1563,26 @@ impl Core {
             && self.durable_jseq() == u64::MAX
     }
 
+    /// Plan 43 C2 (§2.1): [`Self::root_ack_class`] for an answer to `asker`.
+    /// A lone root answers its own node's client as `Lone` and every other
+    /// node's forward from the archive (`Archive`): a remote is never
+    /// answered on the lone root's disk alone (§5.1's table, the `Remote`
+    /// column).
+    pub fn root_ack_class_for(&self, asker: Asker) -> AckClass {
+        match self.root_ack_class() {
+            AckClass::Lone if asker == Asker::Remote => AckClass::Archive,
+            class => class,
+        }
+    }
+
     /// Plan 43 §5.1: the class of an answer this node gives as the root
-    /// sequencer, by what the answer waits for *today* (C2a records it; C2c
-    /// and C2f change what some of them wait for): a continuation epoch's
-    /// hold is non-stealable; under `ack=s3` the archive; with a listed (or
-    /// doubted) backup the root group; while a backup is being had (a
-    /// candidate, an eligible or not yet assessed peer) the archive; and
-    /// otherwise nothing but this node's disk — `Lone`, whoever is
-    /// answered. The same decision as [`Self::ack_need`] (`durable_jseq`),
-    /// named.
+    /// sequencer to its own node's client, by what the answer waits for: a
+    /// continuation epoch's hold is non-stealable; under `ack=s3` the
+    /// archive; with a listed (or doubted) backup the root group; while a
+    /// backup is being had (a candidate, an eligible or not yet assessed
+    /// peer) the archive; and otherwise nothing but this node's disk —
+    /// `Lone`. The same decision as [`Self::ack_need`] (`durable_jseq`),
+    /// named. Another node's answer: [`Self::root_ack_class_for`].
     pub fn root_ack_class(&self) -> AckClass {
         if self.lease.epoch_held() {
             AckClass::NonStealable
@@ -1539,12 +1599,29 @@ impl Core {
 
     /// Plan 43 C1-2: the class a journal row this node writes now is tagged
     /// with, for the scope of the journaling call (the guard): what an answer
-    /// to the row's own client waits for ([`Self::root_ack_class`]). A
-    /// forward executed here is journaled as an own op until C2 gives it the
-    /// archive. The class is fixed at the journaling; only a row answered
-    /// with the gate off is re-tagged `Lone` (`complete_ready`).
+    /// to the row's own client waits for ([`Self::root_ack_class`]). The
+    /// class is fixed at the journaling; only a row answered with the gate
+    /// off is re-tagged `Lone` (`complete_ready`). Another node's op:
+    /// [`Self::journal_class_for`].
     pub(crate) fn journal_class(&self) -> constellation_meta::PendingClassGuard {
-        constellation_meta::PendingClass::set(self.root_ack_class().into())
+        self.journal_class_for(Asker::Own)
+    }
+
+    /// Plan 43 C2 (§2.1): [`Self::journal_class`] for a row whose answer goes
+    /// to `asker`: a lone root journals another node's op `Archive`, so that
+    /// at its deposition the row goes to the member copy, never to the
+    /// replay queue (the requester's retry by rid is the op's one copy, H1).
+    pub(crate) fn journal_class_for(&self, asker: Asker) -> constellation_meta::PendingClassGuard {
+        constellation_meta::PendingClass::set(self.root_ack_class_for(asker).into())
+    }
+
+    /// Who an answer to `node`'s request goes to.
+    pub(crate) fn asker_of(&self, node: NodeId) -> Asker {
+        if node == self.cfg.node_id {
+            Asker::Own
+        } else {
+            Asker::Remote
+        }
     }
 
     /// Plan 43 C1-2: the class of an answer to a rid this node already
@@ -1586,6 +1663,46 @@ impl Core {
             Some((_, constellation_meta::RowClass::RootGroup)) => AckClass::RootGroup,
             Some((_, constellation_meta::RowClass::NonStealable)) => AckClass::NonStealable,
             Some((_, constellation_meta::RowClass::DelegGroup)) | None => self.root_ack_class(),
+        })
+    }
+
+    /// Plan 43 C2 (§5.1): [`Self::journaled_answer_class`] for an answer to
+    /// `asker`. Another node is never answered on this disk alone: a gated
+    /// row keeps its class with the gate off (its answer waits for the
+    /// archive, [`Self::park_durable`], instead of a `Lone` re-tag), and a
+    /// `Lone` row — another node's op journaled while nothing gated, before
+    /// C2 — is answered from the archive, re-tagged `Archive` first when the
+    /// op is another node's (so its strand follows the answer: a member
+    /// copy, not a replay). A row of this node's own op answered to another
+    /// node (a relay) keeps its `Lone` tag: its own client was answered on
+    /// it.
+    /// `Err`: the store failed the re-tag ([`Self::eio_unless_recorded`]).
+    pub(crate) fn journaled_answer_class_for(
+        &self,
+        replica: &dyn Replica,
+        rid: Rid,
+        asker: Asker,
+    ) -> Result<AckClass, constellation_meta::MetaError> {
+        if asker == Asker::Own {
+            return self.journaled_answer_class(replica, rid);
+        }
+        Ok(match replica.journal_class_of_rid(rid) {
+            Some((first, constellation_meta::RowClass::Lone)) => {
+                if rid.node != self.cfg.node_id {
+                    replica
+                        .reclass_journal_tx(first, constellation_meta::RowClass::Archive)
+                        .inspect_err(|error| {
+                            tracing::warn!(node = self.cfg.node_id, ?rid, %error, "could not re-tag a row answered from the archive: EIO");
+                        })?;
+                }
+                AckClass::Archive
+            }
+            Some((_, constellation_meta::RowClass::Archive)) => AckClass::Archive,
+            Some((_, constellation_meta::RowClass::RootGroup)) => AckClass::RootGroup,
+            Some((_, constellation_meta::RowClass::NonStealable)) => AckClass::NonStealable,
+            Some((_, constellation_meta::RowClass::DelegGroup)) | None => {
+                self.root_ack_class_for(asker)
+            }
         })
     }
 

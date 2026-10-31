@@ -1148,6 +1148,25 @@ impl Core {
 
     // ---- the forward's outcomes ----
 
+    /// Plan 43 C2 (§5.3): a shadow or hint installed for an answer its
+    /// sequencer did not say is committed. A C2 root never sends one (a
+    /// lone root answers another node from the archive); counted, and
+    /// warned once, so a sequencer that still does is seen.
+    fn note_ungated_shadow(&mut self, from: NodeId, rid: Rid, committed: bool) {
+        if committed {
+            return;
+        }
+        self.stats.ungated_shadows += 1;
+        if self.stats.ungated_shadows == 1 {
+            tracing::warn!(
+                node = self.cfg.node_id,
+                from,
+                ?rid,
+                "installed a shadow for an answer its sequencer did not say is committed"
+            );
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_mutate_reply(
         &mut self,
@@ -1298,6 +1317,7 @@ impl Core {
                     Ok(true) => {
                         tracing::debug!(node = self.cfg.node_id, ?rid, epoch, "shadow installed");
                         self.stats.shadows_installed += 1;
+                        self.note_ungated_shadow(from, rid, committed);
                         // Plan 30 §M6 (coordinator decision 2): installed
                         // effects do not raise `observed`; the shadow
                         // covers its keys (the parent directory's
@@ -1435,6 +1455,7 @@ impl Core {
                     match replica.install_hint(rid, records, position, epoch, gen, committed) {
                         Ok(true) => {
                             self.stats.hints_installed += 1;
+                            self.note_ungated_shadow(from, rid, committed);
                             replica.note_covering(KeySet::from_records(records), position);
                             hinted = true;
                         }
@@ -2245,7 +2266,7 @@ impl Core {
             // run it.
             Err(MetaError::Conflict) => {
                 if matches!(op, MutateOp::SetManifest { .. }) {
-                    self.record_refusal(rid, Code::Stale, Some(&op), replica);
+                    self.record_refusal(rid, Code::Stale, Some(&op), super::Asker::Own, replica);
                 }
                 (MutateOutcome::Conflict { manifest: None }, None)
             }
@@ -2253,7 +2274,7 @@ impl Core {
             // but the refusal's row, so there is nothing to wait for.
             Err(MetaError::LockLapsed) => {
                 self.stats.lock_lapsed_refusals += 1;
-                self.record_refusal(rid, LAPSED_CODE, Some(&op), replica);
+                self.record_refusal(rid, LAPSED_CODE, Some(&op), super::Asker::Own, replica);
                 return MutateOutcome::LockLapsed;
             }
             Err(error) => {
@@ -2268,7 +2289,7 @@ impl Core {
                 // (long-acks3 seed 50277: EEXIST for a name a newer
                 // holder had already renamed away).
                 let code = error.code();
-                self.record_refusal(rid, code, Some(&op), replica);
+                self.record_refusal(rid, code, Some(&op), super::Asker::Own, replica);
                 (MutateOutcome::Errno(code), None)
             }
         };

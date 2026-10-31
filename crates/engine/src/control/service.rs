@@ -398,6 +398,7 @@ impl EngineControl {
                     member_copies: a.member_copies as u64,
                     sealed_unread: a.sealed_unread,
                     lone: a.lone,
+                    ungated_shadows: a.ungated_shadows,
                     ungated_unexpected: s.ungated_unexpected,
                     longest_step_ms: core.longest_step_ms,
                     longest_step_kind: core.longest_step_kind.to_string(),

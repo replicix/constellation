@@ -136,6 +136,25 @@ impl Harness {
         out
     }
 
+    /// Plan 43 C2: the log carries everything journaled so far (the
+    /// segment landed) and the answers waiting for it leave: what a lone
+    /// holder's answer to another node's forward waits for.
+    fn archive_lands(&mut self) -> Vec<Action> {
+        let tip = self.meta.journal_tip().unwrap();
+        self.core.note_shipped(&[], tip);
+        let mut out = Vec::new();
+        self.core.complete_ready(self.clk(), &self.meta, &mut out);
+        out
+    }
+
+    /// [`Self::step`], then the archive lands: a lone holder's answer to a
+    /// forward, which waits for the log (plan 43 C2), in the same step.
+    fn step_archived(&mut self, event: Event) -> Vec<Action> {
+        let mut out = self.step(event);
+        out.extend(self.archive_lands());
+        out
+    }
+
     fn advance(&mut self, ms: u64) {
         self.now = self.now.plus(ms);
     }
@@ -867,7 +886,7 @@ fn a_peers_forward_is_busy_while_fenced_and_executes_once_the_gate_opens() {
     ));
     // The gate completes (nothing queued): the same request executes.
     h.core.lease.gate = None;
-    let out = h.step(Event::Peer {
+    let out = h.step_archived(Event::Peer {
         from: 2,
         msg: request.clone(),
     });
@@ -926,7 +945,7 @@ fn a_reply_base_names_the_unshipped_overlap() {
             parent: ROOT_INO,
             name: name.into(),
         };
-        let out = h.step(Event::Peer {
+        let out = h.step_archived(Event::Peer {
             from: 2,
             msg: PeerMsg::MutateRequest {
                 req: OpId(req),
@@ -987,7 +1006,7 @@ fn a_reply_base_counts_an_unshipped_link_of_the_inode_a_name_leaves() {
     };
     constellation_meta::execute_mutate(&h.meta, &link, None).unwrap();
     let mut ask = |op: MutateOp, req: u64| {
-        let out = h.step(Event::Peer {
+        let out = h.step_archived(Event::Peer {
             from: 2,
             msg: PeerMsg::MutateRequest {
                 req: OpId(req),
@@ -2985,7 +3004,7 @@ fn a_reply_base_is_the_last_shipped_touch_not_the_head() {
             parent: ROOT_INO,
             name: name.into(),
         };
-        let out = h.step(Event::Peer {
+        let out = h.step_archived(Event::Peer {
             from: 2,
             msg: PeerMsg::MutateRequest {
                 req: OpId(req),
@@ -3231,11 +3250,18 @@ fn forward_through(
     let [(1, request)] = sent.as_slice() else {
         panic!("expected one forward to node 1: {sent:?}")
     };
-    let answer = holder.step(Event::Peer {
+    // (A lone holder answers another node's forward once the log carries
+    // it: plan 43 C2.)
+    let answer = holder.step_archived(Event::Peer {
         from: 2,
         msg: (*request).clone(),
     });
-    let reply = sends(&answer)[0].1.clone();
+    let reply = sends(&answer)
+        .into_iter()
+        .find(|(to, m)| *to == 2 && matches!(m, PeerMsg::MutateReply { .. }))
+        .unwrap_or_else(|| panic!("no reply to node 2: {answer:?}"))
+        .1
+        .clone();
     requester.step(Event::Peer {
         from: 1,
         msg: reply,
@@ -3613,7 +3639,7 @@ fn appended_truncate_of(ino: constellation_fs_core::Ino) -> MutateOp {
 /// `from`'s replay of `op` by `rid`, forwarded to the holder `h`. A
 /// delegate answers a forward once the root's append holds the row (Plan 43
 /// C2): the root's stream acknowledgement is delivered when the reply waits
-/// for it.
+/// for it; a lone root once the log carries it (the archive lands).
 fn replay_copy_at(h: &mut Harness, from: NodeId, rid: Rid, op: MutateOp) -> MutateOutcome {
     let reply_in = |out: &[Action]| {
         sends(out).into_iter().find_map(|(to, msg)| match msg {
@@ -3639,7 +3665,9 @@ fn replay_copy_at(h: &mut Harness, from: NodeId, rid: Rid, op: MutateOp) -> Muta
         return outcome;
     }
     let Some((req, round, _, last)) = stream_batch(&out, 1) else {
-        panic!("no reply to the copy: {out:?}");
+        // A lone root answers another node's copy once the log carries it.
+        let landed = h.archive_lands();
+        return reply_in(&landed).unwrap_or_else(|| panic!("no reply to the copy: {out:?}"));
     };
     let out = h.step(stream_ack(1, req, round, last));
     reply_in(&out).unwrap_or_else(|| panic!("no reply to the copy after the root's ack: {out:?}"))
@@ -3774,7 +3802,7 @@ fn the_drains_fold_settles_the_truncates_rid_at_the_holder() {
             };
             assert_eq!(to, 1);
             forwarded.push((*rid, op.clone()));
-            let answer = holder.step(Event::Peer {
+            let answer = holder.step_archived(Event::Peer {
                 from: 2,
                 msg: msg.clone(),
             });
@@ -4336,7 +4364,7 @@ fn a_remote_refusal_of_a_replay_is_its_rids_outcome() {
                 continue;
             };
             assert_eq!(to, 1);
-            let answer = holder.step(Event::Peer {
+            let answer = holder.step_archived(Event::Peer {
                 from: 2,
                 msg: msg.clone(),
             });
@@ -5097,6 +5125,40 @@ mod own_chunks {
         (holder, requester)
     }
 
+    /// A holder that answers a forward before the log carries it: backed
+    /// (node 3 listed) by a backup that holds every row at once, never
+    /// sent anything and never due a heartbeat. Plan 43 C2: an unbacked
+    /// (lone) holder answers another node only from the archive, so what an
+    /// answer given ahead of the log owes its requester — the chunks to
+    /// upload, its own rows to excuse — is a backed holder's (or a
+    /// delegate's) to work out.
+    fn holding_backed() -> (Harness, Harness) {
+        let (mut holder, requester) = holding(AckPolicy::Backup, vec![3]);
+        let now = w(holder.now);
+        holder.core.ack.peers.insert(
+            3,
+            crate::core::backup::BackupPeer {
+                candidacy: 0,
+                alive_at: now,
+                short_since_progress: false,
+                short_since: now,
+                unreachable: false,
+                answered: true,
+                acked: u64::MAX / 2,
+                listed_at: Some(0),
+                counted: u64::MAX / 2,
+                sent_through: u64::MAX / 2,
+                inflight: Default::default(),
+                last_sent: WaitMs(i64::MAX / 2),
+                last_progress: now,
+                committed: true,
+            },
+        );
+        assert_ne!(holder.core.durable_jseq(), u64::MAX);
+        assert!(!holder.core.root_lone());
+        (holder, requester)
+    }
+
     /// Node 1 creates `f` (unshipped: a forward touching it is answered
     /// on a base node 2 has not applied), and node 2's close of it names
     /// one chunk — pending on node 2, enrolled on node 1 when `pending`.
@@ -5160,15 +5222,23 @@ mod own_chunks {
         let [(1, request)] = sent.as_slice() else {
             panic!("expected one forward to node 1: {sent:?}")
         };
-        let answer = holder.step(Event::Peer {
+        let mut answer = holder.step(Event::Peer {
             from: 2,
             msg: (*request).clone(),
         });
-        let replies: Vec<PeerMsg> = sends(&answer)
-            .into_iter()
-            .filter(|(to, m)| *to == 2 && matches!(m, PeerMsg::MutateReply { .. }))
-            .map(|(_, m)| m.clone())
-            .collect();
+        let to_node_2 = |answer: &[Action]| -> Vec<PeerMsg> {
+            sends(answer)
+                .into_iter()
+                .filter(|(to, m)| *to == 2 && matches!(m, PeerMsg::MutateReply { .. }))
+                .map(|(_, m)| m.clone())
+                .collect()
+        };
+        // A lone holder answers another node's forward once the log carries
+        // it (plan 43 C2); one held for node 2's upload is `Held` at once.
+        if to_node_2(&answer).is_empty() {
+            answer = holder.archive_lands();
+        }
+        let replies = to_node_2(&answer);
         let [reply] = replies.as_slice() else {
             panic!("expected one reply to node 2: {answer:?}")
         };
@@ -5194,7 +5264,9 @@ mod own_chunks {
     /// record back before its chunk is up, and the ship waits for that
     /// chunk. Node 1 says `Upload`, node 2 uploads at once. Before the
     /// fix nothing did: the close waited out the forward deadline and was
-    /// answered in doubt.
+    /// answered in doubt. (Plan 43 C2: the lone node 1 answers node 2 once
+    /// the log carries the close, as under `ack=s3`: the `Upload` comes with
+    /// a `Held` at once, `held_for_upload`.)
     #[test]
     fn an_unbacked_holder_asks_for_the_upload_and_the_forwarder_uploads_at_once() {
         let (mut holder, mut requester) = holding(AckPolicy::Local, Vec::new());
@@ -5205,26 +5277,17 @@ mod own_chunks {
         let rid = requester.rid(1);
         let (reply, out) = forward(&mut holder, &mut requester, rid, op);
         let (own, outcome) = own_chunks_of(&reply);
-        assert!(
-            matches!(outcome, MutateOutcome::Accepted { .. }),
+        assert_eq!(
+            outcome,
+            &MutateOutcome::Held {
+                retry_ms: holder.core.cfg.held_retry_ms
+            },
             "{reply:?}"
         );
         assert_eq!(own, OwnChunks::Upload(vec![ino]));
-        assert_eq!(
-            requester.core.clients().collect::<Vec<_>>(),
-            vec![(rid, ClientPhase::AwaitingLog)]
-        );
+        assert_eq!(holder.core.stats.held_for_upload, 1);
         assert_eq!(uploads_awaited(&out), vec![ino]);
         assert_eq!(requester.core.stats.own_record_uploads, 1);
-        // The safety timer repeats it while the op still waits (a pass
-        // that failed).
-        let [again] = timers(&out, TimerKind::OwnRecordWait)[..] else {
-            panic!("one safety timer: {out:?}")
-        };
-        requester.advance(requester.core.cfg.own_record_wait_ms);
-        let out = requester.step(Event::Timer { id: again });
-        assert_eq!(uploads_awaited(&out), vec![ino]);
-        assert_eq!(requester.core.stats.own_record_uploads, 2);
     }
 
     /// Should-fix 2: a forward whose manifest names nothing pending on
@@ -5554,13 +5617,17 @@ mod own_chunks {
     /// but node 1's ship plan defers it with the close (plan 30 §M4's key
     /// dependence), and its reply comes on a base node 2 has not applied:
     /// it waits for the log, which waits for node 2's chunk. Node 1 says
-    /// `Upload` naming `f`, and node 2 uploads `f`'s chunks at once —
-    /// under `Local` with no backup, and as a `Held` under `ack=s3`.
+    /// `Upload` naming `f`, and node 2 uploads `f`'s chunks at once — as a
+    /// `Held` under `ack=s3`, and under `Local` with no backup too (plan 43
+    /// C2: the lone holder answers another node from the archive).
     /// Before, the answer was `None` and the chmod stalled 120 s, EIO.
     #[test]
     fn an_op_depending_on_a_held_close_asks_for_the_close_chunks() {
-        for policy in [AckPolicy::Local, AckPolicy::S3] {
-            let (mut holder, mut requester) = holding(policy, Vec::new());
+        for policy in [AckPolicy::Local, AckPolicy::S3, AckPolicy::Backup] {
+            let (mut holder, mut requester) = match policy {
+                AckPolicy::Backup => holding_backed(),
+                _ => holding(policy, Vec::new()),
+            };
             let (close, _, _) = back_close(&mut holder, true);
             let MutateOp::SetManifest { ino, .. } = close else {
                 unreachable!()
@@ -5573,10 +5640,7 @@ mod own_chunks {
             let (own, outcome) = own_chunks_of(&reply);
             assert_eq!(own, OwnChunks::Upload(vec![ino]), "{policy:?}: {reply:?}");
             match policy {
-                AckPolicy::S3 => {
-                    assert!(matches!(outcome, MutateOutcome::Held { .. }), "{reply:?}")
-                }
-                _ => {
+                AckPolicy::Backup => {
                     assert!(
                         matches!(outcome, MutateOutcome::Accepted { .. }),
                         "{reply:?}"
@@ -5586,9 +5650,12 @@ mod own_chunks {
                         vec![(rid, ClientPhase::AwaitingLog)]
                     );
                 }
+                // (Plan 43 C2: the lone `Local` holder answers node 2 once
+                // the log carries the chmod, as under `ack=s3`.)
+                _ => assert!(matches!(outcome, MutateOutcome::Held { .. }), "{reply:?}"),
             }
             assert_eq!(uploads_awaited(&out), vec![ino], "{policy:?}");
-            if policy == AckPolicy::S3 {
+            if policy != AckPolicy::Backup {
                 // (Every acknowledgement waits for a segment there.)
                 continue;
             }
@@ -5718,7 +5785,7 @@ mod own_chunks {
     /// with a chunk pending on it each.
     #[test]
     fn a_reply_the_requester_installs_at_once_skips_the_walk() {
-        let (mut holder, _requester) = holding(AckPolicy::Local, Vec::new());
+        let (mut holder, _requester) = holding_backed();
         let files: Vec<u64> = ["g1", "g2"]
             .into_iter()
             .map(|name| {
@@ -5793,7 +5860,7 @@ mod own_chunks {
     /// close's inode for the position, and node 2 uploads it.
     #[test]
     fn an_observed_position_behind_a_held_close_asks_for_its_upload() {
-        let (mut holder, mut requester) = holding(AckPolicy::Local, Vec::new());
+        let (mut holder, mut requester) = holding_backed();
         let (close, _, _) = back_close(&mut holder, true);
         let MutateOp::SetManifest { ino, .. } = close else {
             unreachable!()
@@ -6009,7 +6076,7 @@ mod own_chunks {
     /// releases it: `g` is uploaded.
     #[test]
     fn a_position_behind_only_own_rows_is_excused() {
-        let (mut holder, mut requester) = holding(AckPolicy::Local, Vec::new());
+        let (mut holder, mut requester) = holding_backed();
         let g = shipped_file(&mut holder, &requester, "g");
         let close = requester.rid(1);
         let op = held_close(&holder, g);
@@ -6109,7 +6176,7 @@ mod own_chunks {
     /// the close until the watermark's TTL (10 s).
     #[test]
     fn a_dedup_answer_still_says_what_its_position_waits_for() {
-        let (mut holder, mut requester) = holding(AckPolicy::Local, Vec::new());
+        let (mut holder, mut requester) = holding_backed();
         let g = shipped_file(&mut holder, &requester, "g");
         let x = requester.rid(1);
         let out = requester.step(Event::Submit {
@@ -6291,7 +6358,7 @@ mod own_chunks {
     /// unreached (a pass that failed), and stops once it is reached.
     #[test]
     fn an_observed_upload_is_repeated_until_the_watermark_is_reached() {
-        let (mut holder, mut requester) = holding(AckPolicy::Local, Vec::new());
+        let (mut holder, mut requester) = holding_backed();
         let (close, _, _) = back_close(&mut holder, true);
         let MutateOp::SetManifest { ino, .. } = close else {
             unreachable!()
@@ -7592,7 +7659,7 @@ mod cto {
     }
 
     fn forward(h: &mut Harness, from: NodeId, req: u64, seq: u64, op: MutateOp) -> Vec<Action> {
-        h.step(Event::Peer {
+        h.step_archived(Event::Peer {
             from,
             msg: PeerMsg::MutateRequest {
                 req: OpId(req),
@@ -11154,7 +11221,7 @@ mod refusal_outcomes {
     use super::*;
 
     fn forward(h: &mut Harness, from: NodeId, req: u64, seq: u64, op: MutateOp) -> Vec<Action> {
-        h.step(Event::Peer {
+        h.step_archived(Event::Peer {
             from,
             msg: PeerMsg::MutateRequest {
                 req: OpId(req),
@@ -26421,7 +26488,9 @@ mod locks {
         op: MutateOp,
         tag: LockTag,
     ) -> Vec<Action> {
-        h.step(Event::Peer {
+        // (A lone holder answers another node's forward once the log
+        // carries it: plan 43 C2.)
+        h.step_archived(Event::Peer {
             from,
             msg: PeerMsg::MutateRequest {
                 req: OpId(req),
@@ -33318,7 +33387,7 @@ mod portable_codes {
         let [(1, request)] = sent.as_slice() else {
             panic!("expected one forward to node 1: {sent:?}")
         };
-        let answer = holder.step(Event::Peer {
+        let answer = holder.step_archived(Event::Peer {
             from: 2,
             msg: (*request).clone(),
         });
@@ -39566,7 +39635,7 @@ mod answer_sources {
         let mut h = Harness::new(1);
         h.hold(1, None);
         let class = h.core.root_ack_class();
-        let out = h.step(Event::Peer {
+        let out = h.step_archived(Event::Peer {
             from: 2,
             msg: PeerMsg::MutateRequest {
                 req: OpId(77),
@@ -39589,10 +39658,12 @@ mod answer_sources {
                 ..
             }
         ));
-        // (Journaled as the archive's, answered once the first assessment
-        // of peers found none: the lone node's answer, D4.)
+        // (Journaled as the archive's; answered, once the first assessment
+        // of peers found none, from the archive all the same: another node
+        // is never answered on a lone node's disk, plan 43 C2.)
         assert_eq!(class, AckClass::Archive);
-        assert_eq!(h.core.stats.ack_classes[AckClass::Lone.index()], 1);
+        assert_eq!(h.core.stats.ack_classes[AckClass::Archive.index()], 1);
+        assert_eq!(h.core.stats.ack_classes[AckClass::Lone.index()], 0);
         // A hold on a retry (`Busy`, `NotHolder`) is no answer.
         let before = h.core.stats.ack_classes;
         h.core.lease.gate = Some(PendingGate {
@@ -46881,10 +46952,13 @@ mod c1_class {
     }
 
     /// The same at a dedup: a forward's retry finds its gated row with the
-    /// gate off, and the store fails the re-tag: `EIO`, not an `Accepted`
-    /// that claims `Lone`. Fails on the parent: the error was ignored.
+    /// gate off. Plan 43 C2: another node is never answered on this disk
+    /// alone, so nothing is re-tagged (a re-tag the store would fail is
+    /// never attempted: no `EIO`) and the retry waits for the archive with
+    /// the parked answer. (C1-2's case — the store failing the `Lone`
+    /// re-tag — is now this node's own client's: `a_failed_retag_at_the_gate_off_answers_eio`.)
     #[test]
-    fn a_failed_retag_at_a_dedup_answers_eio() {
+    fn a_forwards_retry_with_the_gate_off_waits_for_the_archive() {
         let request = |h: &Harness, req: u64| Event::Peer {
             from: 3,
             msg: PeerMsg::MutateRequest {
@@ -46918,19 +46992,21 @@ mod c1_class {
         constellation_meta::fail_reclass_on_this_thread_for_tests(1);
         let out = h.step(request(&h, 72));
         constellation_meta::fail_reclass_on_this_thread_for_tests(0);
-        assert!(
-            replies(&out)
-                .iter()
-                .all(|o| matches!(o, MutateOutcome::Errno(Code::Io))),
-            "{out:?}"
-        );
-        assert!(!replies(&out).is_empty(), "answered: {out:?}");
+        assert!(replies(&out).is_empty(), "waits for the archive: {out:?}");
         let rid = Rid {
             node: 3,
             incarnation: 1,
             seq: 1,
         };
         assert_eq!(classes_of(&h, rid), vec![RowClass::RootGroup]);
+        let tip = h.meta.journal_tip().unwrap();
+        h.core.note_shipped(&[], tip);
+        let mut out = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        assert!(
+            matches!(replies(&out).as_slice(), [MutateOutcome::Accepted { .. }]),
+            "{out:?}"
+        );
     }
 
     /// A row released because it *is* committed keeps its class.
@@ -46959,7 +47035,9 @@ mod c1_class {
     }
 
     /// A forward's reply says whether it waited for a group: committed when
-    /// the backup held the row, not when the gate went off first.
+    /// the backup held the row; when the gate went off first, the answer
+    /// waits for the archive and is committed too (plan 43 C2: a remote is
+    /// never answered on the root's disk alone, nor its row re-tagged).
     #[test]
     fn a_forward_reply_says_committed() {
         let request = |h: &Harness, n: u64| Event::Peer {
@@ -47004,13 +47082,18 @@ mod c1_class {
         gate_goes_off(&mut h);
         let mut out = Vec::new();
         h.core.complete_ready(h.clk(), &h.meta, &mut out);
-        assert_eq!(committed(&out), vec![false], "{out:?}");
+        assert!(committed(&out).is_empty(), "waits for the archive: {out:?}");
         let second = Rid {
             node: 3,
             incarnation: 1,
             seq: 2,
         };
-        assert_eq!(classes_of(&h, second), vec![RowClass::Lone]);
+        assert_eq!(classes_of(&h, second), vec![RowClass::RootGroup]);
+        let tip = h.meta.journal_tip().unwrap();
+        h.core.note_shipped(&[], tip);
+        let mut out = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        assert_eq!(committed(&out), vec![true], "{out:?}");
         // A non-answer is no commit either.
         h.core.lease.gate = Some(PendingGate {
             epoch: 1,
@@ -47767,11 +47850,57 @@ mod deleg_root_read {
     }
 }
 
-/// Plan 43 C2 (§5, the commit split's C2f): `Ungated` only where the node is
-/// lone or holds an epoch.
+/// Plan 43 C2 (§5, the commit split's C2f): a lone root answers other nodes
+/// from the archive; `Ungated` only where the node is lone or holds an
+/// epoch.
 mod c2f_lone_root {
     use super::c1_counted::listed_holder;
     use super::*;
+    use crate::core::backup::is_answer;
+    use crate::AnswerSource;
+    use constellation_meta::RowClass;
+
+    const FROM: NodeId = 3;
+
+    fn forwarded(seq: u64) -> Rid {
+        Rid {
+            node: FROM,
+            incarnation: 1,
+            seq,
+        }
+    }
+
+    fn forward(h: &Harness, req: u64, seq: u64, name: &str) -> Event {
+        Event::Peer {
+            from: FROM,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(req),
+                rid: forwarded(seq),
+                op: h.create(name),
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+            },
+        }
+    }
+
+    /// The definitive answers to `FROM` in `out`: (outcome, committed).
+    fn answers(out: &[Action]) -> Vec<(MutateOutcome, bool)> {
+        sends(out)
+            .into_iter()
+            .filter_map(|(to, m)| match m {
+                PeerMsg::MutateReply {
+                    outcome, committed, ..
+                } if to == FROM && is_answer(outcome) => Some((outcome.clone(), *committed)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn classes_of(h: &Harness, rid: Rid) -> Vec<RowClass> {
+        h.meta.journal_classes_of_rid(rid).unwrap()
+    }
 
     /// The listed backup is gone and no peer is in budget: the root is lone.
     fn gate_goes_off(h: &mut Harness) {
@@ -47787,6 +47916,138 @@ mod c2f_lone_root {
         let (mut h, _) = listed_holder();
         gate_goes_off(&mut h);
         h
+    }
+
+    fn release(h: &mut Harness) -> Vec<Action> {
+        let mut out = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        out
+    }
+
+    /// The log carries everything journaled so far.
+    fn ship_all(h: &mut Harness) {
+        let tip = h.meta.journal_tip().unwrap();
+        h.core.note_shipped(&[], tip);
+    }
+
+    /// §5.1: a lone root journals another node's forward `Archive` and
+    /// answers it once the log carries it, `committed`; its own node's
+    /// client is answered at once, `Lone`. Fails on the parent: the forward
+    /// was answered at once from the root's disk alone (`Lone`, not
+    /// committed), its row journaled `Lone`.
+    #[test]
+    fn a_lone_root_answers_a_forward_from_the_archive() {
+        let mut h = lone_root();
+        let out = h.step(forward(&h, 71, 1, "f"));
+        assert!(answers(&out).is_empty(), "waits for the archive: {out:?}");
+        assert_eq!(classes_of(&h, forwarded(1)), vec![RowClass::Archive]);
+        // Its own client: at once, the lone node's answer.
+        let own = h.rid(2);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: own,
+            op: h.create("o"),
+            tag: Default::default(),
+        });
+        assert!(
+            out.iter().any(|a| matches!(
+                a,
+                Action::Reply { rid, source: AnswerSource::Sequenced(AckClass::Lone), .. }
+                    if *rid == own
+            )),
+            "{out:?}"
+        );
+        assert_eq!(classes_of(&h, own), vec![RowClass::Lone]);
+        // Nothing for the forward until the log carries it.
+        assert!(answers(&release(&mut h)).is_empty());
+        let archived = h.core.stats.ack_classes[AckClass::Archive.index()];
+        ship_all(&mut h);
+        let out = release(&mut h);
+        assert!(
+            matches!(
+                answers(&out).as_slice(),
+                [(MutateOutcome::Accepted { .. }, true)]
+            ),
+            "{out:?}"
+        );
+        assert_eq!(
+            h.core.stats.ack_classes[AckClass::Archive.index()],
+            archived + 1
+        );
+        assert_eq!(h.core.stats.acks_downgraded_lone, 0);
+    }
+
+    /// H1: the lone root's row of another node's op is a member copy at its
+    /// deposition, never a replay — the requester's retry by rid is the op's
+    /// one copy (I2 (b)). Its own client's `Lone` row is the lone branch and
+    /// replays as before. Fails on the parent: the forwarded row was `Lone`
+    /// and queued for replay beside the requester's retry.
+    #[test]
+    fn a_lone_roots_forwarded_row_never_enters_the_replay_queue() {
+        let mut h = lone_root();
+        h.step(forward(&h, 71, 1, "f"));
+        let own = h.rid(2);
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: own,
+            op: h.create("o"),
+            tag: Default::default(),
+        });
+        let epoch = h.core.lease.epoch().unwrap();
+        h.meta.strand_below_epoch(epoch + 1).unwrap();
+        let queued: Vec<Rid> = h
+            .meta
+            .pending_replays()
+            .unwrap()
+            .iter()
+            .map(|q| q.rid)
+            .collect();
+        assert!(!queued.contains(&forwarded(1)), "queued: {queued:?}");
+        assert!(queued.contains(&own), "the lone branch replays: {queued:?}");
+        assert!(h.meta.member_copy_rows_total().unwrap() >= 1);
+    }
+
+    /// §5.2: a forward's answer parked for the root group, when the backup
+    /// set empties and the root turns lone, waits for the archive: it is
+    /// never released on the root's disk alone (no `Lone` re-tag), and the
+    /// archive answers it, committed. Fails on the parent: it was released
+    /// at once as `Lone`, not committed, its row re-tagged.
+    #[test]
+    fn a_root_group_park_for_a_remote_waits_for_the_archive_once_lone() {
+        let (mut h, _) = listed_holder();
+        let out = h.step(forward(&h, 71, 1, "f"));
+        assert!(answers(&out).is_empty(), "parked for the backup: {out:?}");
+        assert_eq!(classes_of(&h, forwarded(1)), vec![RowClass::RootGroup]);
+        gate_goes_off(&mut h);
+        assert!(answers(&release(&mut h)).is_empty());
+        // A retry re-attaches and waits on.
+        let out = h.step(forward(&h, 72, 1, "f"));
+        assert!(answers(&out).is_empty(), "{out:?}");
+        assert_eq!(classes_of(&h, forwarded(1)), vec![RowClass::RootGroup]);
+        assert_eq!(h.core.stats.acks_downgraded_lone, 0);
+        ship_all(&mut h);
+        assert!(matches!(
+            answers(&release(&mut h)).as_slice(),
+            [(MutateOutcome::Accepted { .. }, true)]
+        ));
+    }
+
+    /// A row of another node's op journaled `Lone` (a lone root before C2)
+    /// that another node asks for again is answered from the archive, and
+    /// re-tagged `Archive` first so that its strand follows the answer.
+    /// Fails on the parent: it was answered `Lone` from the disk.
+    #[test]
+    fn a_lone_row_of_another_nodes_op_is_answered_from_the_archive() {
+        let mut h = lone_root();
+        h.step(forward(&h, 71, 1, "f"));
+        let first = h.meta.journal_tip().unwrap();
+        assert!(h.meta.reclass_journal_tx(first, RowClass::Lone).unwrap());
+        let class = h
+            .core
+            .journaled_answer_class_for(&h.meta, forwarded(1), Asker::Remote)
+            .unwrap();
+        assert_eq!(class, AckClass::Archive);
+        assert_eq!(classes_of(&h, forwarded(1)), vec![RowClass::Archive]);
     }
 
     /// §5.4 (D5): what the core publishes for the fast path's `Ungated`

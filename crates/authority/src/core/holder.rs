@@ -227,7 +227,7 @@ impl Core {
                     super::delegate::RecallPlan::Wait(w) => w,
                     super::delegate::RecallPlan::Refuse(code) => {
                         if req != OpId(0) {
-                            let class = self.root_ack_class();
+                            let class = self.root_ack_class_for(self.asker_of(from));
                             self.send_answer(
                                 from,
                                 PeerMsg::MutateReply {
@@ -287,7 +287,16 @@ impl Core {
                 return;
             }
             base = self.reply_base(&op, replica);
-            let (outcome, executed) = self.holder_execute(now, epoch, rid, &op, &tag, replica, out);
+            let (outcome, executed) = self.holder_execute(
+                now,
+                epoch,
+                rid,
+                &op,
+                &tag,
+                self.asker_of(from),
+                replica,
+                out,
+            );
             fresh = executed;
             // Plan 30 §M6: the state the op was evaluated against, its
             // own rows included — everything shipped through `head_seq`,
@@ -338,18 +347,23 @@ impl Core {
             Some(inos) => self.recall_needed(now, &inos, Some(from), replica, out),
             None => None,
         };
-        let durable = self.ack_need(&position);
         // Plan 43 C2a: what this answer waits for, whether it parks or not;
         // an answer from the dedup is the class of the row it names (C1-2).
+        // Plan 43 C2 (§5.1): a lone root answers another node's forward from
+        // the archive — the row is journaled `Archive` and the answer waits
+        // until the log carries it — and never on its own disk alone.
+        let asker = self.asker_of(from);
         let (outcome, class) = if executed {
-            (outcome, self.root_ack_class())
+            (outcome, self.root_ack_class_for(asker))
         } else {
             Self::eio_unless_recorded(
                 outcome,
-                self.journaled_answer_class(replica, rid),
+                self.journaled_answer_class_for(replica, rid, asker),
                 super::AckClass::Lone,
             )
         };
+        let shipped = replica.journal_acked_seq().unwrap_or(0);
+        let durable = self.answer_need(&position, class, asker, shipped);
         if wait.is_some() || durable.is_some() {
             // Only an acknowledgement's wait for durability says now what
             // it waits for (`held_for_upload`); the rest is worked out
@@ -659,6 +673,7 @@ impl Core {
         rid: Rid,
         op: &MutateOp,
         tag: &LockTag,
+        asker: super::Asker,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> (MutateOutcome, Option<Vec<u64>>) {
@@ -689,7 +704,7 @@ impl Core {
             rseq = rid.seq,
             "holder: executing a forwarded op"
         );
-        let _class = self.journal_class();
+        let _class = self.journal_class_for(asker);
         let outcome = match constellation_meta::locks::TokenPath::P2p
             .scope(|| replica.execute(op, Some(rid), tag, now))
         {
@@ -717,7 +732,7 @@ impl Core {
             // over the newer write the refusal had protected.
             Err(MetaError::Conflict) => match op {
                 MutateOp::SetManifest { ino, .. } => {
-                    self.record_refusal(rid, Code::Stale, Some(op), replica);
+                    self.record_refusal(rid, Code::Stale, Some(op), asker, replica);
                     MutateOutcome::Conflict {
                         manifest: replica.manifest(*ino),
                     }
@@ -729,7 +744,7 @@ impl Core {
             // refusal is journaled as the rid's outcome (see above).
             Err(MetaError::LockLapsed) => {
                 self.stats.lock_lapsed_refusals += 1;
-                self.record_refusal(rid, super::client::LAPSED_CODE, Some(op), replica);
+                self.record_refusal(rid, super::client::LAPSED_CODE, Some(op), asker, replica);
                 tracing::info!(
                     node = self.cfg.node_id,
                     ?rid,
@@ -739,7 +754,7 @@ impl Core {
                 MutateOutcome::LockLapsed
             }
             Err(MetaError::Exists) => {
-                self.record_refusal(rid, Code::Exists, Some(op), replica);
+                self.record_refusal(rid, Code::Exists, Some(op), asker, replica);
                 match named_child(op) {
                     Some((parent, name)) => match replica.entry_as_record(parent, name) {
                         Some(record) => MutateOutcome::Exists {
@@ -753,7 +768,7 @@ impl Core {
             }
             Err(e) => {
                 let code = e.code();
-                self.record_refusal(rid, code, Some(op), replica);
+                self.record_refusal(rid, code, Some(op), asker, replica);
                 MutateOutcome::Errno(code)
             }
         };
@@ -773,15 +788,17 @@ impl Core {
     /// it.
     /// `op`: the refused op, so the row records what it observed
     /// (`JournalTx::observed`) and the ship plan keeps the refusal behind
-    /// a deferred transaction that produced that state.
+    /// a deferred transaction that produced that state. `asker`: who the
+    /// refusal answers (its row's class, as an execution's).
     pub(crate) fn record_refusal(
         &mut self,
         rid: Rid,
         code: Code,
         op: Option<&MutateOp>,
+        asker: super::Asker,
         replica: &dyn Replica,
     ) {
-        let _class = self.journal_class();
+        let _class = self.journal_class_for(asker);
         if let Err(error) = replica.journal_refusal(rid, code, op) {
             tracing::warn!(node = self.cfg.node_id, ?rid, %code, %error, "could not journal a refusal");
             return;

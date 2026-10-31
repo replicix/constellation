@@ -828,7 +828,13 @@ impl Core {
                 // (`NotAdmitted` is no outcome: nothing ran, and it never
                 // answers anyone.)
                 if !matches!(error, constellation_meta::MetaError::NotAdmitted) {
-                    self.record_refusal(queued.rid, code, Some(&queued.op), replica);
+                    self.record_refusal(
+                        queued.rid,
+                        code,
+                        Some(&queued.op),
+                        super::Asker::Own,
+                        replica,
+                    );
                 }
                 if folded || queued.foreign || refusal_is_satisfied(&queued.op, error.code()) {
                     self.note_unacked_refused(queued);

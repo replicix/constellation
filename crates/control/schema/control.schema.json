@@ -235,7 +235,7 @@
         },
         "lone": {
           "default": false,
-          "description": "This node answers its own clients as a lone sequencer (no peer in\nthe RTT budget): the root lease's, or a delegation's it holds (plan\n43 C2).",
+          "description": "This node answers its own clients as a lone sequencer (no peer in\nthe RTT budget): the root lease's, or a delegation's it holds. Other\nnodes' requests are then answered once in the log (plan 43 C2).",
           "type": "boolean"
         },
         "longest_step_kind": {
@@ -393,6 +393,13 @@
           "type": "integer"
         },
         "unacked_replays_refused": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ungated_shadows": {
+          "default": 0,
+          "description": "Shadows and hints installed for an answer its sequencer did not say\nis committed (plan 43 C2: a lone root answers other nodes from the\nlog, so only a non-stealable sequencer's answers count here).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"

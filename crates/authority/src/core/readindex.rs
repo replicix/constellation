@@ -179,6 +179,15 @@ pub(crate) enum ParkedWhat {
     },
 }
 
+impl ParkedWhat {
+    /// Plan 43 C2 (§5.2): the answer goes to another node than `me` (a
+    /// forward's requester): it may not leave on a lone root's disk alone
+    /// (`Core::park_durable`).
+    pub(crate) fn to_remote(&self, me: NodeId) -> bool {
+        matches!(self, ParkedWhat::Reply { to, .. } if *to != me)
+    }
+}
+
 #[derive(Debug)]
 struct Parked {
     waiting: BTreeSet<u64>,
@@ -1668,8 +1677,9 @@ impl Core {
             .filter(|(id, p)| {
                 p.waiting.is_empty()
                     && p.quarantine.is_none_or(|q| q <= now.wait)
-                    && p.durable
-                        .is_none_or(|j| j <= shipped || self.durable_covers(j))
+                    && p.durable.is_none_or(|j| {
+                        self.park_durable(j, p.what.to_remote(self.cfg.node_id), shipped)
+                    })
                     && p.deps.as_ref().is_none_or(|d| replica.reaches_streams(d))
                     && p.stream_need.is_none_or(|(g, i)| {
                         match self.deleg_stream_state_cached(g, i, replica, &mut cache) {
@@ -1747,9 +1757,7 @@ impl Core {
             // and sourced as the lone node's it is (`Lone`), not as the
             // class it was parked for.
             let downgraded = p.durable.is_some_and(|j| {
-                j > shipped
-                    && self.durable_jseq() == u64::MAX
-                    && !self.ack.shipped_rows.contains(&j)
+                !self.archive_covers(j, shipped) && self.durable_jseq() == u64::MAX
             }) && match &p.what {
                 ParkedWhat::Reply { class, .. } | ParkedWhat::Finish { class, .. } => class.gated(),
                 _ => false,

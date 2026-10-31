@@ -1402,6 +1402,13 @@ pub struct Stats {
     /// Plan 43 C1-2 (D4): gated answers released with the gate off, whose
     /// rows were re-tagged `Lone` (answered as a lone node would).
     pub acks_downgraded_lone: u64,
+    /// Plan 43 C2 (§5.3): shadows and hints this node installed for a
+    /// definitive answer its sequencer did not say is committed
+    /// (`MutateReply.committed` false). After C2 only a non-stealable
+    /// sequencer (an epoch's hold owner, a designee) answers another node
+    /// so; a lone root answers it from the archive. Warned once
+    /// (`status.ack.ungated_shadows`).
+    pub ungated_shadows: u64,
     /// Plan 43 C1-3: the tail fetch. `SealTail`s answered by this node as a
     /// holder (it sealed its own epoch), as a backup, and refused;
     /// attempts of a claim to fetch, fetches completed (of those, of a

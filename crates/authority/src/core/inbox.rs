@@ -1445,8 +1445,12 @@ impl Core {
         out: &mut Vec<Action>,
     ) -> Result<u64, Halt> {
         // Plan 43 C1-2: every row of the batch is journaled under the class
-        // the node's own answers wait for now.
-        let _class = self.journal_class();
+        // the answers to the batch's node wait for now. Plan 43 C2 (§2.1):
+        // another node's — its requester learns the outcome from the log, and
+        // a lone root's row of it is `Archive`, so its deposition keeps the
+        // row as a member copy instead of queueing a second copy of the op
+        // beside the batch the next holder drains.
+        let _class = self.journal_class_for(self.asker_of(batch.node));
         for (i, op) in batch.ops.iter().enumerate() {
             let rid = rid_of(op);
             let ack = InboxAck {
