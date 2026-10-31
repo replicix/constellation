@@ -1248,14 +1248,15 @@ impl Findings {
 
 /// Tally the run's answers and run the end-of-run oracles: I2 (c) over the
 /// answers' transactions and the log, I4 over the in-doubt answers and the
-/// invocations, I5 over the rolled-back set. `converged`: the run reached
-/// quiescence, so a group-answered rid the log never completed is absent
-/// for good.
+/// invocations, I5 over the rolled-back set (each rid with the tick of its
+/// latest rollback: only an answer given before it was rolled back).
+/// `converged`: the run reached quiescence, so a group-answered rid the log
+/// never completed is absent for good.
 pub fn end_of_run(
     o: &Oracles,
     log: &super::check::Oracle,
     in_doubt: &[(NodeId, Rid, u64, u64)],
-    rolled_back: &HashSet<Rid>,
+    rolled_back: &HashMap<Rid, u64>,
     converged: bool,
 ) -> Findings {
     let mut f = Findings {
@@ -1271,7 +1272,8 @@ pub fn end_of_run(
         f.i2_ungated = ledger.ungated.values().cloned().collect();
     }
     let acks = o.acks.lock().unwrap();
-    let mut non_lone_ok: BTreeSet<Rid> = BTreeSet::new();
+    // Each rid's first OK answer judged other than `Lone` (its tick).
+    let mut non_lone_ok: BTreeMap<Rid, u64> = BTreeMap::new();
     let mut verbatim: BTreeMap<Rid, String> = BTreeMap::new();
     for a in acks.iter().filter(|a| !a.is_relay()) {
         let Some(j) = &a.judged else { continue };
@@ -1319,7 +1321,8 @@ pub fn end_of_run(
             }
         }
         if a.kind == OutcomeKind::Ok && j.class != Some(AckClass::Lone) {
-            non_lone_ok.insert(a.rid);
+            let t = non_lone_ok.entry(a.rid).or_insert(a.tick);
+            *t = (*t).min(a.tick);
         }
         // I2 (c): an OK answered under a group class names a transaction
         // the log must carry as it was committed.
@@ -1398,14 +1401,20 @@ pub fn end_of_run(
     // I4.
     let invokes = o.invokes.lock().unwrap().clone();
     f.i4 = super::check::no_late_landing(in_doubt, &invokes, log).1;
-    // I5: acknowledged OK, rolled back, and not a Lone answer.
-    for rid in rolled_back {
-        if non_lone_ok.contains(rid) {
-            let Some(a) = acks
-                .iter()
-                .rev()
-                .find(|a| a.rid == *rid && a.judged.is_some() && a.kind == OutcomeKind::Ok)
-            else {
+    // I5: acknowledged OK, not as a Lone answer, and rolled back after.
+    // (A rollback before the answer is not of it: a lone node's row rolled
+    // back by its deposition, then its replay answered by the group.)
+    for (rid, at) in rolled_back {
+        if non_lone_ok.get(rid).is_some_and(|t| t < at) {
+            let Some(a) = acks.iter().rev().find(|a| {
+                a.rid == *rid
+                    && a.tick < *at
+                    && !a.is_relay()
+                    && a.kind == OutcomeKind::Ok
+                    && a.judged
+                        .as_ref()
+                        .is_some_and(|j| j.class != Some(AckClass::Lone))
+            }) else {
                 continue;
             };
             let class = a
@@ -1872,15 +1881,60 @@ mod tests {
 
     /// The `Findings` of `acks` over a log that completes `completed`.
     fn findings(acks: Vec<AckEntry>, completed: &[(Rid, (u64, usize))]) -> Findings {
+        findings_rolled_back(acks, completed, &HashMap::new())
+    }
+
+    /// The same, with `rolled_back` (each rid's latest rollback's tick).
+    fn findings_rolled_back(
+        acks: Vec<AckEntry>,
+        completed: &[(Rid, (u64, usize))],
+        rolled_back: &HashMap<Rid, u64>,
+    ) -> Findings {
         let o = Oracles::new(Bucket::new(1, (0, 0)));
         *o.acks.lock().unwrap() = acks;
         end_of_run(
             &o,
             &log_with(seg(1, &[]), completed),
             &[],
-            &HashSet::new(),
+            rolled_back,
             true,
         )
+    }
+
+    /// I5 judges the answers given before the rollback (placement-hot seed
+    /// 68): a lone root answered its own client, its deposition rolled the
+    /// row back and queued it, and the replay was answered by the next
+    /// root's group. That answer came after the rollback; nothing it
+    /// acknowledged was rolled back. A group answer before the rollback is
+    /// still a violation. (The parent's rule judged every OK answer of a
+    /// rolled-back rid: the first case was a violation.)
+    #[test]
+    fn i5_judges_only_the_answers_before_the_rollback() {
+        let group = |a: AckEntry| AckEntry {
+            judged: Some(Judgement {
+                class: Some(AckClass::RootGroup),
+                expected: Expected::Class(AckClass::RootGroup),
+                tx: None,
+                detail: String::new(),
+                mismatch: None,
+            }),
+            ..a
+        };
+        let r = rid(1, 1);
+        let acks = vec![
+            ack(1, r, 1, OutcomeKind::Ok, false),
+            group(ack(2, r, 5, OutcomeKind::Ok, true)),
+        ];
+        let f = findings_rolled_back(acks.clone(), &[], &HashMap::from([(r, 3)]));
+        assert!(f.i5.is_empty(), "{:?}", f.i5);
+        // Rolled back again after the group's answer: a violation.
+        let f = findings_rolled_back(acks.clone(), &[], &HashMap::from([(r, 6)]));
+        assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
+        assert!(f.i5[0].contains("by node 2"), "{:?}", f.i5);
+        // A rid whose rollback the queue never dated is judged against
+        // every answer.
+        let f = findings_rolled_back(acks, &[], &HashMap::from([(r, u64::MAX)]));
+        assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
     }
 
     fn ack(node: u64, r: Rid, tick: u64, kind: OutcomeKind, reply: bool) -> AckEntry {

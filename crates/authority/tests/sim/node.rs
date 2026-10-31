@@ -184,6 +184,11 @@ pub struct Shared {
     /// `history.rs`): read from the replay queue whenever the core's
     /// rollback counters move.
     pub tentative: Mutex<BTreeSet<Rid>>,
+    /// The oracle tick (`Oracles::tick`) of each rid's latest rollback: the
+    /// first event after which it is in the replay queue again. I5 judges
+    /// the answers given before it (a lone row's replay answered by the
+    /// group afterwards was not rolled back).
+    pub rolled_back_at: Mutex<BTreeMap<Rid, u64>>,
     /// The rids whose `Refused` rows this node's unshipped journal held
     /// after its last event. A rollback drops a stranded refusal (its
     /// `completed` row goes with it; it is never replayed), so one that
@@ -495,6 +500,7 @@ impl NodeHandle {
             guard_rises: AtomicU64::new(0),
             guard_base_rises: AtomicU64::new(0),
             tentative: Mutex::new(BTreeSet::new()),
+            rolled_back_at: Mutex::new(BTreeMap::new()),
             journaled_refusals: Mutex::new(BTreeSet::new()),
             commits: env.commits.clone(),
             epoch: Mutex::new(epoch),
@@ -694,6 +700,7 @@ impl NodeHandle {
             urgent_rx,
             shared: shared.clone(),
             rolled_back_seen: (0, 0, 0),
+            queued_seen: BTreeSet::new(),
             journal_seen: None,
             timers: HashSet::new(),
             timer_kinds: HashMap::new(),
@@ -942,6 +949,8 @@ struct Driver {
     urgent_rx: mpsc::UnboundedReceiver<Event>,
     shared: Arc<Shared>,
     rolled_back_seen: (u64, u64, u64),
+    /// The replay queue's rids as `note_rollbacks` last read it.
+    queued_seen: BTreeSet<Rid>,
     /// `(journal tip, journal length)` when `Shared::journaled_refusals`
     /// was last taken.
     journal_seen: Option<(u64, u64)>,
@@ -2417,16 +2426,25 @@ impl Driver {
         self.rolled_back_seen = now;
         let mut t = self.shared.tentative.lock().unwrap();
         let debug = std::env::var_os("AUTHORITY_SIM_ORACLE_DEBUG").is_some();
+        let tick = self.oracles.tick.load(Ordering::SeqCst);
         if let Ok(queue) = self.meta.pending_replays() {
+            let mut queued = BTreeSet::new();
+            let mut at = self.shared.rolled_back_at.lock().unwrap();
             for q in queue {
                 if debug {
                     eprintln!(
-                        "ORACLE-ROLLBACK node {} replay queue: {:?} class {:?} foreign {}",
+                        "ORACLE-ROLLBACK node {} tick {tick} replay queue: {:?} class {:?} \
+                         foreign {}",
                         self.id, q.rid, q.class, q.foreign
                     );
                 }
                 t.insert(q.rid);
+                if !self.queued_seen.contains(&q.rid) {
+                    at.insert(q.rid, tick);
+                }
+                queued.insert(q.rid);
             }
+            self.queued_seen = queued;
         }
         self.shared
             .journaled_refusals
@@ -2458,11 +2476,18 @@ impl Driver {
                     if answered_here && !self.meta.member_copy_carries(*rid).unwrap_or(false) {
                         if debug {
                             eprintln!(
-                                "ORACLE-ROLLBACK node {} journaled refusal gone: {:?}",
+                                "ORACLE-ROLLBACK node {} tick {tick} journaled refusal gone: {:?}",
                                 self.id, rid
                             );
                         }
                         t.insert(*rid);
+                        self.shared
+                            .rolled_back_at
+                            .lock()
+                            .unwrap()
+                            .entry(*rid)
+                            .and_modify(|at| *at = (*at).max(tick))
+                            .or_insert(tick);
                     }
                     false
                 }

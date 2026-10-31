@@ -4898,9 +4898,22 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             }
             let rows = constellation_authority::Replica::member_copy_rows(&*n.meta);
             if rows > 0 {
+                let epochs = constellation_authority::Replica::member_copy_epochs(&*n.meta);
+                // Which rows: their journal place, origin and records.
+                let what: Vec<String> = epochs
+                    .iter()
+                    .filter_map(|e| n.meta.member_copy_rows(*e).ok().flatten())
+                    .flat_map(|(_, rows)| rows)
+                    .map(|m| {
+                        format!(
+                            "rows {}..={} origin {:?} class {:?} {:?}",
+                            m.tx.first, m.tx.last, m.tx.origin, m.class, m.tx.records
+                        )
+                    })
+                    .collect();
                 left.push(format!(
-                    "node {id}: {rows} row(s) of epoch(s) {:?}",
-                    constellation_authority::Replica::member_copy_epochs(&*n.meta)
+                    "node {id}: {rows} row(s) of epoch(s) {epochs:?}: {}",
+                    what.join("; ")
                 ));
             }
         }
@@ -5042,11 +5055,32 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // run only under its strict flag (the counters of a violating seed are
     // in the report's failure text).
     let in_doubt_answers = in_doubt.lock().unwrap().clone();
+    // Each rolled-back rid's latest rollback (I5 judges the answers before
+    // it); one the replay queue never named (a journaled refusal's) is
+    // judged against every answer.
+    let rolled_back_at: HashMap<Rid, u64> = {
+        let mut at: HashMap<Rid, u64> = rolled_back.iter().map(|r| (*r, 0)).collect();
+        let mut named: HashSet<Rid> = HashSet::new();
+        for id in cluster.ids() {
+            for (rid, tick) in cluster.get(id).shared.rolled_back_at.lock().unwrap().iter() {
+                if let Some(t) = at.get_mut(rid) {
+                    *t = (*t).max(*tick);
+                    named.insert(*rid);
+                }
+            }
+        }
+        for (rid, t) in at.iter_mut() {
+            if !named.contains(rid) {
+                *t = u64::MAX;
+            }
+        }
+        at
+    };
     let found = super::oracle::end_of_run(
         &oracles,
         &oracle,
         &in_doubt_answers,
-        &rolled_back,
+        &rolled_back_at,
         converged_checkable,
     );
     // `AUTHORITY_SIM_ORACLE_DEBUG=1`: what the end of the run found (the
