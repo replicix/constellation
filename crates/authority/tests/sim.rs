@@ -744,17 +744,19 @@ fn session_guarantees_hold() {
 /// wait off (reads never wait, as before M6) must violate a session
 /// guarantee somewhere — the checker finds what the wait prevents. (Plan 43
 /// C2: a lone root's answer to another node now waits for the log, which
-/// closes most of the windows the wait covered — 22 of seeds 0..3000 still
-/// violate with it off, 264 before — so the range reaches 764.)
+/// closes most of the windows the wait covered in the default
+/// configuration — 6 of seeds 0..400 still violate with it off;
+/// `long-delegated`, whose delegates answer forwards ahead of the log, 20
+/// of 400: the seeds run there.)
 #[test]
 fn session_wait_off_is_found() {
     let cfg = SimConfig {
         read_ratio: 0.9,
         session_wait: false,
-        ..SimConfig::default()
+        ..long_delegated_config()
     };
     let mut found = None;
-    for seed in 600..1700 {
+    for seed in 0..200 {
         let report = run_seed(seed, cfg.clone()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         if let Some(v) = report.sessions.violations.first() {
             found = Some((seed, v.clone()));
@@ -12482,7 +12484,12 @@ fn locks_blips_tight_seeds_8_66_and_568_no_grant_lapses() {
 fn epoch_liveness_gap_fault_seeds() {
     for (config, seed) in [
         ("flex-tight", 1913),
-        ("locks-blips-tight-faults", 409),
+        // (Plan 43 C2 shifted 409's schedule: its restarted holder now
+        // refuses node 2's late renewal at its takeover, one grant lost to
+        // the seed's holder crash, as a third of this configuration's seeds
+        // lose one on main. 400 replaces it: two open epochs replaced by
+        // their closed carrier's, nothing lost.)
+        ("locks-blips-tight-faults", 400),
         ("locks-blips-tight-faults", 945),
         ("locks-blips-tight-faults", 5379),
     ] {
@@ -12495,14 +12502,7 @@ fn epoch_liveness_gap_fault_seeds() {
         });
         let mut t = M14Totals::default();
         t.add(&report);
-        // (Since plan 43 C2 shifted its schedule, seed 409's restarted
-        // holder takes the lease back at 11 s and refuses node 2's late
-        // renewal, its continuity not proven: one grant lost to the seed's
-        // holder crash, as about a third of this configuration's seeds lose
-        // one on main. The run's own checks hold.)
-        if (config, seed) != ("locks-blips-tight-faults", 409) {
-            assert_eq!(t.lost, 0, "{config} seed {seed}: grants lost: {t:?}");
-        }
+        assert_eq!(t.lost, 0, "{config} seed {seed}: grants lost: {t:?}");
     }
 }
 

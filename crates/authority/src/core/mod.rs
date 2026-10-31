@@ -1404,11 +1404,14 @@ pub struct Stats {
     pub acks_downgraded_lone: u64,
     /// Plan 43 C2 (§5.3): shadows and hints this node installed for a
     /// definitive answer its sequencer did not say is committed
-    /// (`MutateReply.committed` false). After C2 only a non-stealable
-    /// sequencer (an epoch's hold owner, a designee) answers another node
-    /// so; a lone root answers it from the archive. Warned once
-    /// (`status.ack.ungated_shadows`).
+    /// (`MutateReply.committed` false) by a sequencer that is not
+    /// non-stealable: none after C2 (a lone root answers other nodes from
+    /// the archive). Warned once (`status.ack.ungated_shadows`).
     pub ungated_shadows: u64,
+    /// The same for a non-stealable sequencer's answers (a hold owner's in
+    /// an open continuation epoch, a designee's): uncommitted by design
+    /// (`status.ack.ungated_shadows_non_stealable`).
+    pub ungated_shadows_non_stealable: u64,
     /// Plan 43 C2f: answers parked for durability whose row was rolled back
     /// while they waited (`repair drop-held`), aborted instead of released
     /// when the log covered the seq they waited for.

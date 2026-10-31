@@ -2278,10 +2278,14 @@ pub struct AckStatus {
     #[serde(default)]
     pub lone: bool,
     /// Shadows and hints installed for an answer its sequencer did not say
-    /// is committed (plan 43 C2: a lone root answers other nodes from the
-    /// log, so only a non-stealable sequencer's answers count here).
+    /// is committed, the sequencer not a non-stealable one (plan 43 C2: a
+    /// lone root answers other nodes from the log; must stay 0).
     #[serde(default)]
     pub ungated_shadows: u64,
+    /// The same for a non-stealable sequencer's answers (a continuation
+    /// epoch's hold owner, a designee): uncommitted by design.
+    #[serde(default)]
+    pub ungated_shadows_non_stealable: u64,
     /// FUSE fast-path writes whose durability wait found the gate off on a
     /// node that is neither lone nor holding a continuation epoch (a
     /// release or a handoff after the write): resubmitted in doubt (plan 43

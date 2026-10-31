@@ -399,7 +399,14 @@
         },
         "ungated_shadows": {
           "default": 0,
-          "description": "Shadows and hints installed for an answer its sequencer did not say\nis committed (plan 43 C2: a lone root answers other nodes from the\nlog, so only a non-stealable sequencer's answers count here).",
+          "description": "Shadows and hints installed for an answer its sequencer did not say\nis committed, the sequencer not a non-stealable one (plan 43 C2: a\nlone root answers other nodes from the log; must stay 0).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ungated_shadows_non_stealable": {
+          "default": 0,
+          "description": "The same for a non-stealable sequencer's answers (a continuation\nepoch's hold owner, a designee): uncommitted by design.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"

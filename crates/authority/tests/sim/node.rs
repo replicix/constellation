@@ -190,13 +190,16 @@ pub struct Shared {
     /// group afterwards was not rolled back).
     pub rolled_back_at: Mutex<BTreeMap<Rid, u64>>,
     /// The replay queue's entries (`(rid, queue_seq)`) the oracle has dated
-    /// in `rolled_back_at`, across this node's incarnations: a restart that
-    /// keeps its journal keeps its queue, and an entry queued before it is
-    /// dated when it was queued, not again at the restart's first scan (plan
+    /// in `rolled_back_at`, carried with it across this node's incarnations
+    /// (`Cluster::restart`): a restart that keeps its journal keeps its
+    /// queue, and an entry queued before it is dated when it was queued,
+    /// not again at the restart's first scan (plan
     /// 43 C2f: a rebooted delegate's stranded rows, replayed through a root
     /// that answers them from the archive, read as rolled back after that
     /// answer).
     pub queued_seen: Mutex<BTreeSet<(Rid, u64)>>,
+    /// `Stats::ungated_shadows` of this node's earlier incarnations.
+    pub ungated_shadows_before: AtomicU64,
     /// The rids whose `Refused` rows this node's unshipped journal held
     /// after its last event. A rollback drops a stranded refusal (its
     /// `completed` row goes with it; it is never replayed), so one that
@@ -510,6 +513,7 @@ impl NodeHandle {
             tentative: Mutex::new(BTreeSet::new()),
             rolled_back_at: Mutex::new(BTreeMap::new()),
             queued_seen: Mutex::new(BTreeSet::new()),
+            ungated_shadows_before: AtomicU64::new(0),
             journaled_refusals: Mutex::new(BTreeSet::new()),
             commits: env.commits.clone(),
             epoch: Mutex::new(epoch),

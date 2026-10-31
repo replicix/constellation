@@ -1196,8 +1196,9 @@ pub struct Report {
     /// I5: acknowledged, rolled-back ops whose answer was not Lone.
     pub non_lone_rollbacks: usize,
     /// Plan 43 C2 (§5.3): shadows and hints installed for an answer not
-    /// said to be committed (`Stats::ungated_shadows`, every node's last
-    /// incarnation). Fails the run under `strict_commit`.
+    /// said to be committed by a sequencer that is not non-stealable
+    /// (`Stats::ungated_shadows`, over every incarnation of every node).
+    /// Fails the run under `strict_commit`.
     pub ungated_shadows: u64,
     /// Deposition rebuilds run, `(succeeded, failed)`, over every
     /// incarnation of every node.
@@ -1455,6 +1456,26 @@ impl Cluster {
                 )
             })
             .unwrap_or_default();
+        // Plan 43 C2f: the oracle's dating of the rolled-back rows (the
+        // replay queue survives with the journal: an entry queued before the
+        // crash keeps its date) and the shadows counted outside the commit
+        // rule, over every incarnation.
+        let (rolled_back_at, queued_seen, ungated_before) = self
+            .nodes
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|old| {
+                (
+                    old.shared.rolled_back_at.lock().unwrap().clone(),
+                    old.shared.queued_seen.lock().unwrap().clone(),
+                    old.shared
+                        .ungated_shadows_before
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        + old.view().stats.ungated_shadows,
+                )
+            })
+            .unwrap_or_default();
         let rebuilds = self.nodes.lock().unwrap().get(&id).map(|old| {
             (
                 old.shared
@@ -1473,6 +1494,14 @@ impl Cluster {
         }
         handle.shared.tentative.lock().unwrap().extend(tentative);
         *handle.shared.floor_ms.lock().unwrap() = floors;
+        *handle.shared.rolled_back_at.lock().unwrap() = rolled_back_at;
+        if meta_kept {
+            *handle.shared.queued_seen.lock().unwrap() = queued_seen;
+        }
+        handle
+            .shared
+            .ungated_shadows_before
+            .store(ungated_before, std::sync::atomic::Ordering::Relaxed);
         // (Kept only with the journal: a fresh replica has none to drop.)
         if meta_kept {
             *handle.shared.journaled_refusals.lock().unwrap() = refusals;
@@ -5214,7 +5243,22 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // one installed for an answer its sequencer did not say is committed is
     // an answer outside the commit rule that the I1 oracle judged at the
     // sequencer (or a non-stealable one's: none in a `strict_commit` run).
-    report.ungated_shadows = report.stats.values().map(|s| s.ungated_shadows).sum();
+    report.ungated_shadows = report
+        .stats
+        .values()
+        .map(|s| s.ungated_shadows)
+        .sum::<u64>()
+        + cluster
+            .ids()
+            .into_iter()
+            .map(|id| {
+                cluster
+                    .get(id)
+                    .shared
+                    .ungated_shadows_before
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+            .sum::<u64>();
     if cfg.strict_commit && report.ungated_shadows > 0 {
         return Err(format!(
             "I1 acked_implies_committed: {} shadow(s) installed for an answer not said to be \

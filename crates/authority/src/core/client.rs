@@ -1149,11 +1149,31 @@ impl Core {
     // ---- the forward's outcomes ----
 
     /// Plan 43 C2 (§5.3): a shadow or hint installed for an answer its
-    /// sequencer did not say is committed. A C2 root never sends one (a
-    /// lone root answers another node from the archive); counted, and
-    /// warned once, so a sequencer that still does is seen.
-    fn note_ungated_shadow(&mut self, from: NodeId, rid: Rid, committed: bool) {
+    /// sequencer did not say is committed. A non-stealable sequencer's — an
+    /// open continuation epoch's hold owner (this node is in the epoch), or a
+    /// designee (`gen` names a designation) — is one by design (its answers
+    /// stay uncommitted, the maintainer's decision on C2f) and counted
+    /// apart; any other is an answer outside the commit rule: counted and
+    /// warned once, so a sequencer that still gives one is seen.
+    fn note_ungated_shadow(
+        &mut self,
+        from: NodeId,
+        rid: Rid,
+        committed: bool,
+        gen: u64,
+        replica: &dyn Replica,
+    ) {
         if committed {
+            return;
+        }
+        let non_stealable = self.epoch.open
+            || (gen != 0
+                && replica
+                    .delegation_table()
+                    .iter()
+                    .any(|d| d.gen == gen && d.designated));
+        if non_stealable {
+            self.stats.ungated_shadows_non_stealable += 1;
             return;
         }
         self.stats.ungated_shadows += 1;
@@ -1317,7 +1337,7 @@ impl Core {
                     Ok(true) => {
                         tracing::debug!(node = self.cfg.node_id, ?rid, epoch, "shadow installed");
                         self.stats.shadows_installed += 1;
-                        self.note_ungated_shadow(from, rid, committed);
+                        self.note_ungated_shadow(from, rid, committed, gen, replica);
                         // Plan 30 §M6 (coordinator decision 2): installed
                         // effects do not raise `observed`; the shadow
                         // covers its keys (the parent directory's
@@ -1455,7 +1475,7 @@ impl Core {
                     match replica.install_hint(rid, records, position, epoch, gen, committed) {
                         Ok(true) => {
                             self.stats.hints_installed += 1;
-                            self.note_ungated_shadow(from, rid, committed);
+                            self.note_ungated_shadow(from, rid, committed, gen, replica);
                             replica.note_covering(KeySet::from_records(records), position);
                             hinted = true;
                         }

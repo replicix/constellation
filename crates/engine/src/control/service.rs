@@ -399,6 +399,7 @@ impl EngineControl {
                     sealed_unread: a.sealed_unread,
                     lone: a.lone,
                     ungated_shadows: a.ungated_shadows,
+                    ungated_shadows_non_stealable: a.ungated_shadows_non_stealable,
                     ungated_unexpected: s.ungated_unexpected,
                     longest_step_ms: core.longest_step_ms,
                     longest_step_kind: core.longest_step_kind.to_string(),

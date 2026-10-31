@@ -1160,6 +1160,9 @@ pub struct AckView {
     /// Plan 43 C2 (§5.3): shadows and hints installed for an answer not
     /// said to be committed (`Stats::ungated_shadows`).
     pub ungated_shadows: u64,
+    /// ... and for a non-stealable sequencer's answers, uncommitted by
+    /// design (`Stats::ungated_shadows_non_stealable`).
+    pub ungated_shadows_non_stealable: u64,
 }
 
 impl Core {
@@ -1253,6 +1256,7 @@ impl Core {
                     .values()
                     .any(|r| r.class == constellation_meta::RowClass::Lone),
             ungated_shadows: self.stats.ungated_shadows,
+            ungated_shadows_non_stealable: self.stats.ungated_shadows_non_stealable,
         }
     }
 
