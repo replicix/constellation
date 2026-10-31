@@ -1098,10 +1098,16 @@ fn a_stranded_recall_record_takes_its_persisted_cut_with_it() {
 }
 
 /// Plan 43 C2 (D1): a `Recall` already in a log (written before the cut was
-/// in the record) keeps its meaning: every replica infers the cut from what
-/// it holds of the generation, and persists none.
+/// in the record) keeps its meaning: its generation's rows not before it in
+/// the log never take effect. The cut is what the log holds of the
+/// generation, kept (the path B review: a restart and a waiting install find
+/// the end applied) and the session's, not the replica's own head, which
+/// counts a delegate's unappended rows: a dependency on one is lost. (The
+/// test expected no kept cut and the delegate's head, 3, as the session's
+/// cut, as before the review; `Replica::apply_segment` noted the log's
+/// index all along.)
 #[test]
-fn an_old_recall_record_keeps_the_inferred_cut() {
+fn an_old_recall_record_cuts_at_what_the_log_holds() {
     let (meta, d) = delegate_of_three_rows();
     let gen = 7;
     let end = vec![LogRecord::Recall { dir: d, gen }];
@@ -1109,14 +1115,18 @@ fn an_old_recall_record_keeps_the_inferred_cut() {
         .unwrap();
     let session = meta.session();
     assert!(session.is_voided(gen));
-    assert_eq!(meta.void_cut(gen).unwrap(), None, "no cut in the record");
+    assert_eq!(
+        meta.void_cut(gen).unwrap(),
+        Some(0),
+        "the log's index, kept"
+    );
     assert_eq!(
         session.void_cut(gen),
-        Some(3),
-        "the replica's own head, as before"
+        Some(0),
+        "the log holds none of the delegate's three rows"
     );
-    assert!(!session.deps_lost(&deps_on(gen, 3)));
-    assert!(session.deps_lost(&deps_on(gen, 4)));
+    assert!(session.deps_lost(&deps_on(gen, 1)));
+    assert!(session.deps_lost(&deps_on(gen, 3)));
 }
 
 /// The publish rule: a holder with unshipped work publishes the log

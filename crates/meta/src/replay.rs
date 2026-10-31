@@ -884,7 +884,13 @@ fn apply_one(
             if durable {
                 let cut = meta.session().stream_applied(*gen);
                 meta.session().void_stream(*gen, cut);
-                crate::store::local::bump_void_cut_at_log_idx_tx(tx, &meta.local, *gen)?;
+                // A dependency past what the log holds of the generation is
+                // lost (a delegate's own unappended rows never take effect):
+                // the session's cut is the one kept, as `Replica::
+                // apply_segment` notes it too. (The store alone used to keep
+                // the replica's own head, a delegate's unappended rows in it.)
+                let log = crate::store::local::bump_void_cut_at_log_idx_tx(tx, &meta.local, *gen)?;
+                meta.session().note_void_cut(*gen, log);
             }
             Ok(Applied::Done)
         }

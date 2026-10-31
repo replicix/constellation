@@ -1009,7 +1009,9 @@ impl Meta {
         let mut tx = self.db.write_tx();
         match cut {
             Some(cut) => bump_void_cut_tx(&mut tx, &self.local, gen, cut)?,
-            None => bump_void_cut_at_log_idx_tx(&mut tx, &self.local, gen)?,
+            None => {
+                bump_void_cut_at_log_idx_tx(&mut tx, &self.local, gen)?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -2818,16 +2820,18 @@ pub(crate) fn bump_void_cut_tx(
 /// the log: the cut kept is what the log holds of the generation, as the
 /// session voids it (`Replica::apply_segment`), so a restart, and a
 /// delegate's install that waits for the end of its old generation
-/// ([`Meta::deleg_gens_awaiting_end`]), find the end applied.
+/// ([`Meta::deleg_gens_awaiting_end`]), find the end applied. Returns that
+/// cut.
 pub(crate) fn bump_void_cut_at_log_idx_tx(
     tx: &mut SingleWriterWriteTx,
     local: &SingleWriterTxKeyspace,
     gen: u64,
-) -> Result<(), MetaError> {
+) -> Result<u64, MetaError> {
     let log = kv_get_tx(tx, local, &deleg_log_idx_key(gen))?
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
-    bump_void_cut_tx(tx, local, gen, log)
+    bump_void_cut_tx(tx, local, gen, log)?;
+    Ok(log)
 }
 
 /// Forget the persisted cut of `gen` set by a `RecallCut { through }` that
