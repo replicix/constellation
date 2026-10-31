@@ -41139,6 +41139,71 @@ mod deleg_group {
         );
     }
 
+    /// The same takeover, the forward's park gone (its answer aborted, or a
+    /// restart): what answers a retry of the rid from its `completed` row —
+    /// the dedup's wait for the row (`deleg_dedup_wait`, a park on `(7,
+    /// 1)`) and the deadline's settled check (`completed_row_settled`) —
+    /// reads the generation's log index the re-append raised, and took the
+    /// row on this disk alone for committed. It is committed once the new
+    /// tenure ships it (or its backups hold it). Fails on the parent: both
+    /// said committed at the gate.
+    #[test]
+    fn a_re_appended_row_is_not_committed_for_a_dedup_until_the_new_tenure_commits_it() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        let out = forward_create(&mut h, dir, 1, 500);
+        assert_eq!(answer_to_2(&out, 500), None);
+        // The park is gone: what is left is the row and its `completed` row.
+        let ids = h.core.stream_parks_of(7);
+        assert_eq!(ids.len(), 1);
+        let mut out = Vec::new();
+        h.core.abort_park_busy(h.clk(), ids[0], &h.meta, &mut out);
+        h.hold(
+            2,
+            Some(PendingGate {
+                epoch: 2,
+                takeover: true,
+                marker_shipped: true,
+                drained: false,
+                fast_prev: false,
+                backup_tail_epoch: Some(1),
+                shippable: true,
+            }),
+        );
+        h.core.ack.eligible = Some(true);
+        h.core.complete_gate(h.clk(), &h.meta, &mut out);
+        assert_eq!(h.core.stats.own_deleg_rows_reappended, 1);
+        assert_eq!(h.meta.log_stream_idx(7).unwrap(), 1);
+        let rid = rid_of(2, 1);
+        let row = h
+            .meta
+            .outcome_row(rid)
+            .unwrap()
+            .expect("the re-appended row");
+        assert_eq!((row.gen, row.idx), (7, 1));
+        assert!(
+            !h.core.deleg_stream_durable(7, 1, &h.meta),
+            "the re-appended row counted as committed on this disk alone"
+        );
+        assert!(!h.core.completed_row_settled(rid, &h.meta));
+        // The dedup's park on the row is not released either.
+        let parks =
+            h.core
+                .park_stream_need(h.clk(), 7, 1, crate::core::readindex::ParkedWhat::Release);
+        let mut out = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        assert_eq!(h.core.stream_parks_of(7), vec![parks], "released: {out:?}");
+        // The gate's segment ships.
+        h.core.ack.shipped_through = h.meta.journal_tip().unwrap();
+        assert!(h.core.deleg_stream_durable(7, 1, &h.meta));
+        assert!(h.core.completed_row_settled(rid, &h.meta));
+        let mut out = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        assert!(
+            h.core.stream_parks_of(7).is_empty(),
+            "not released once shipped"
+        );
+    }
+
     /// The delegate's own client renames `from` to `to` in `dir`.
     fn own_rename(h: &mut Harness, dir: Ino, seq: u64, from: &str, to: &str) -> (Rid, Vec<Action>) {
         let rid = h.rid(seq);

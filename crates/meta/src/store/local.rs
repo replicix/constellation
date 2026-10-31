@@ -1294,6 +1294,32 @@ impl Meta {
         Ok(out)
     }
 
+    /// Plan 43 C3: the last journal seq of this node's unshipped
+    /// transaction of delegation origin `(gen, idx)` that it journaled as a
+    /// lease holder (`epoch` set: the root's append of the row, a takeover
+    /// gate's re-applied tail or re-append of its own rows), if any. Such a
+    /// row raised [`Meta::log_stream_idx`] here without the log or the
+    /// delegation's group holding it: what commits it is this node's root
+    /// tenure. One seek (`journal_origin`).
+    pub fn holder_append_of(&self, gen: u64, idx: u64) -> Result<Option<u64>, MetaError> {
+        if gen == 0 {
+            return Ok(None);
+        }
+        let r = self.db.read_tx();
+        for found in journal_origins_from(&r, self, gen, idx)? {
+            let (i, first) = found?;
+            if i != idx {
+                break;
+            }
+            if let Some(head) = get_journal_tx_head(&r, self, first)? {
+                if head.epoch != 0 {
+                    return Ok(Some(head.last));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Plan 30 §M11 phase 2b: whether transaction `(gen, idx)` of this
     /// delegate's stream is still in the journal (not yet carried by a
     /// segment the replica applied). One seek (`journal_origin`) for a

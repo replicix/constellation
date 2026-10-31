@@ -383,6 +383,10 @@ pub trait Replica {
     /// still in its journal (no applied segment carries it), in one seek;
     /// `None` when it cannot be read (it counts as pending).
     fn delegate_tx_pending(&self, gen: u64, idx: u64) -> Option<bool>;
+    /// Plan 43 C3: the last journal seq of this node's unshipped holder
+    /// append of delegation row `(gen, idx)` (`Meta::holder_append_of`);
+    /// `Err` when it cannot be read.
+    fn holder_append_of(&self, gen: u64, idx: u64) -> Result<Option<u64>, MetaError>;
     /// Phase 2b: a delegate's backup persists its transactions; returns
     /// the highest index through which every transaction is in the log
     /// as this replica holds it or held here, contiguously above that
@@ -1215,6 +1219,10 @@ impl Replica for Meta {
 
     fn delegate_tx_pending(&self, gen: u64, idx: u64) -> Option<bool> {
         Meta::delegate_tx_pending(self, gen, idx).ok()
+    }
+
+    fn holder_append_of(&self, gen: u64, idx: u64) -> Result<Option<u64>, MetaError> {
+        Meta::holder_append_of(self, gen, idx)
     }
 
     fn deleg_backup_append(&self, gen: u64, txs: &[DelegateTx]) -> Option<u64> {

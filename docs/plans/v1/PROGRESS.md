@@ -63093,3 +63093,27 @@ passed (11 ignored). Seeds 0 to 1,999, with and without the knob: `delegated-hol
 `placement-hot`, `long-delegated`, `long-delegated-backup`, `long-delegated-late-answers`, `delegated-backup`,
 `delegated-root-crash`, `shared-dir-split` and the four `delegated-two-gens-*` 0, but `placement-hot` 593 with the knob
 (open on main, above).
+
+### Follow-up: every reader of the re-appended row's commit (2026-10-31)
+
+The residual above, and its siblings: a delegation row this node journaled as a lease holder (a takeover gate's
+re-append of its own rows, or its re-applied predecessor's tail) raises `log_stream_idx`, which the commit predicate
+counts as the log or the root's copy. `Core::holder_append_uncommitted` (one `journal_origin` seek,
+`Meta::holder_append_of`) now makes such a row committed only once this tenure commits it (shipped, or held by every
+committed backup), in both predicates: `deleg_stream_durable` (the delegate's park decision, the dedup's
+`deleg_dedup_wait`, `completed_row_settled` behind the inbox, deadline and replay answers) and
+`deleg_stream_state_cached` (`complete_ready`'s parks). Audited and not changed: `deleg_caps`' prefix and its users (the
+cross-generation caps, the lone lead and horizon, the fast path's published `through`, `removal_safe`,
+`deleg_find_lost`, the stream's `acked_here`) judge generations this node holds as the delegate, and a takeover stops
+every own generation (the fast path is told `lost`); the root's cursors (`streamed_through`, the inherited cursor, the
+re-append's own) are append positions, not commits. Test: core
+`a_re_appended_row_is_not_committed_for_a_dedup_until_the_new_tenure_commits_it` (fails on the parent: committed at the
+gate, for the dedup and the deadline alike).
+
+`delegated-holder-cut +commit`, seeds 0 to 1,999: `deleg-group` failures 18 -> 6 (501, and the five lone-root answers
+above); with the knob 1 (228). Flags off: `deleg-group` uncommitted 26 -> 6 (1 with the knob), I2, I2c, I4, I5
+unchanged. The predecessor's-root-group rows (shape 2) now wait for the gate's segment and are answered `Archive`.
+Gates: fmt, clippy (workspace, `-D warnings`), authority lib 849, meta lib 382, meta `holder_capture` 29, release sim
+suite 300 passed. Seeds 0 to 1,999 with and without the knob: `delegated-holder-cut`, `placement-hot`, `long-delegated`,
+`-backup`, `-late-answers`, `delegated-backup`, `-crash`, `-partition`, `-root-crash`, `-root-gone`, `shared-dir-split`
+and the four `delegated-two-gens-*` 0, but `placement-hot` 593 with the knob (open on main).

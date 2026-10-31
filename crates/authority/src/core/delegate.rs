@@ -2471,6 +2471,38 @@ impl Core {
         let caps = self.deleg_caps(&mut |g| replica.log_stream_idx(g), replica);
         self.deleg_stream_state_with(gen, idx, &caps, || replica.log_stream_idx(gen), || true)
             == StreamState::Committed
+            && !self.holder_append_uncommitted(gen, idx, replica)
+    }
+
+    /// Plan 43 C3: whether this node's own unshipped journal holds row
+    /// `(gen, idx)` as a lease holder's append that its root tenure has not
+    /// committed (shipped, or held by every committed backup). Such an
+    /// append — a takeover gate's re-append of this node's own rows as the
+    /// delegate, or its re-applied predecessor's tail — raised
+    /// `log_stream_idx` here, which [`Self::deleg_stream_state_with`]
+    /// counts as the log or the root's copy; on this node it is neither,
+    /// only this disk. A row so held is not committed yet, whoever waits
+    /// for it: a park, a retry's dedup answer (`deleg_dedup_wait`), a
+    /// `completed` row answered at a deadline (`completed_row_settled`).
+    /// Before, a delegate that took the root over answered such a row at
+    /// the gate on its own disk alone (`delegated-holder-cut +commit`
+    /// seeds 124, 214, 348: I1). A store error counts as not committed (the
+    /// check runs again at the next event).
+    pub(crate) fn holder_append_uncommitted(
+        &self,
+        gen: u64,
+        idx: u64,
+        replica: &dyn Replica,
+    ) -> bool {
+        match replica.holder_append_of(gen, idx) {
+            Ok(None) => false,
+            Ok(Some(last)) => {
+                let shipped = replica.journal_acked_seq().unwrap_or(0);
+                let holds = self.lease.held.is_some() && !self.lease.lost;
+                !(last <= shipped || holds && self.durable_covers(last))
+            }
+            Err(_) => true,
+        }
     }
 
     /// [`Self::deleg_stream_state_with`] with what it reads cached across
@@ -2503,7 +2535,7 @@ impl Core {
             pending,
             caps,
         } = cache;
-        self.deleg_stream_state_with(
+        let state = self.deleg_stream_state_with(
             gen,
             idx,
             caps.as_ref().expect("computed"),
@@ -2517,7 +2549,13 @@ impl Core {
                     .entry((gen, idx))
                     .or_insert_with(|| replica.delegate_tx_pending(gen, idx).unwrap_or(true))
             },
-        )
+        );
+        // (Read only for a row about to be released: one seek.)
+        if state == StreamState::Committed && self.holder_append_uncommitted(gen, idx, replica) {
+            StreamState::Waiting
+        } else {
+            state
+        }
     }
 
     /// Plan 43 C2 (§3.4): the highest index of `d`'s stream that every
