@@ -535,6 +535,59 @@ fn a_rebuild_drops_the_member_rows_its_log_re_shipped() {
     assert_eq!(meta.member_copy(1).unwrap(), None);
 }
 
+/// A committed stream entry of an earlier tenure retires by the segment that
+/// completes (or refuses) its rid under no identity it names: the next root
+/// appended the delegate's re-stream of a row the old root had appended and
+/// streamed, from no tail of the old tenure (a claimant's tail fetched from a
+/// member copy holds none of a delegate's rows). The segment's copy is
+/// applied once. The completion's fails on main (the entry was redone over
+/// the segment and stayed outstanding for good); the refusal's retired by the
+/// segment's rewind already, and is matched by its rid now too.
+#[test]
+fn a_committed_stream_entry_retires_by_its_rid_without_a_tail_identity() {
+    for refusal in [false, true] {
+        let tx1 = if refusal {
+            vec![LogRecord::Refused {
+                rid: rid(1),
+                code: constellation_types::Code::Exists,
+            }]
+        } else {
+            vec![create("a", ino(1), 10), completed(rid(1))]
+        };
+        let rows: Vec<u64> = (1..=tx1.len() as u64).collect();
+        let reference = Meta::open_in_memory().unwrap();
+        apply_rows(&reference, 1, 2, rows.len() as u64, &rows, &tx1);
+        let meta = Meta::open_in_memory().unwrap();
+        meta.install_streamed_committed(1, HOLDER, 5, 4 + tx1.len() as u64, &tx1, true)
+            .unwrap();
+        apply_rows(&meta, 1, 2, 0, &[], &[]);
+        assert!(meta.has_outstanding_speculation(), "refusal {refusal}");
+        let origins = vec![(7u64, 1u64); tx1.len()];
+        meta.apply_segment_rows(
+            2,
+            2,
+            rows.len() as u64,
+            &rows,
+            &origins,
+            &tx1,
+            &TouchSet::default(),
+        )
+        .unwrap();
+        assert!(!meta.has_outstanding_speculation(), "refusal {refusal}");
+        assert!(meta.pending_replays().unwrap().is_empty());
+        // (The root's own times are the wall clock of the apply; the
+        // namespace below it is what the log alone produces.)
+        let names = |m: &Meta| -> Vec<(String, u64)> {
+            m.readdir(ROOT_INO)
+                .unwrap()
+                .into_iter()
+                .map(|e| (e.name, e.ino))
+                .collect()
+        };
+        assert_eq!(names(&meta), names(&reference), "refusal {refusal}");
+    }
+}
+
 // -------------------------------------------------------- the drop rules
 
 fn put(meta: &Meta, rows: &[MemberTx]) {

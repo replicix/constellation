@@ -14565,6 +14565,128 @@ mod locks {
         assert!(h.meta.delegate_stranded(7).unwrap());
     }
 
+    /// The gate on the same delegate with a tail that ends the generation
+    /// (`RecallCut`, or an older log's `Recall`): every replica voids it at
+    /// the tail's cut, so the rows past it are not re-appended; they are
+    /// replayed by rid. Fails on the parent of the review fix: the extent of
+    /// the tail was read after `apply_backup_tail` had cleared it, the
+    /// tail's records were never looked at, and both rows were re-appended
+    /// past the cut.
+    #[test]
+    fn the_takeover_gate_re_appends_nothing_past_a_tails_end_of_the_generation() {
+        for legacy in [false, true] {
+            let mut h = Harness::new(3);
+            h.core.cfg.delegation = true;
+            h.core.cfg.p2p = true;
+            let (dir, _) = delegated_file(&h.meta);
+            two_delegate_rows(&h, dir);
+            let end = if legacy {
+                LogRecord::Recall { dir, gen: 7 }
+            } else {
+                LogRecord::RecallCut {
+                    dir,
+                    gen: 7,
+                    through: 0,
+                }
+            };
+            h.meta
+                .backup_append(
+                    1,
+                    &[constellation_meta::BackupTx {
+                        first: 1,
+                        last: 1,
+                        records: vec![end],
+                        origin: (0, 0),
+                    }],
+                )
+                .unwrap();
+            h.core = Core::new(h.core.cfg.clone());
+            h.hold(
+                2,
+                Some(PendingGate {
+                    epoch: 2,
+                    takeover: true,
+                    marker_shipped: true,
+                    drained: false,
+                    fast_prev: false,
+                    backup_tail_epoch: Some(1),
+                    shippable: true,
+                }),
+            );
+            h.core.bk.tail_through = 1;
+            let mut out = Vec::new();
+            h.core.complete_gate(h.clk(), &h.meta, &mut out);
+            assert_eq!(
+                h.core.stats.own_deleg_rows_reappended, 0,
+                "legacy {legacy}: re-appended past the tail's end"
+            );
+            let own = crate::replica::Replica::journal_txs_from(&h.meta, 0, usize::MAX)
+                .into_iter()
+                .filter(|tx| tx.origin.0 == 7)
+                .count();
+            assert_eq!(own, 0, "legacy {legacy}");
+        }
+    }
+
+    /// A row whose dependency is lost (another generation ended below it,
+    /// ADR-39) is not re-appended, though this node, restarted, never read
+    /// a batch of it (`lost_from` is in memory only): the gate judges each
+    /// row's own `deps`, captured before the strand takes the journal heads
+    /// that record them. Fails on the parent of the review fix (re-appended
+    /// verbatim, a row whose cause the log lacks).
+    #[test]
+    fn the_takeover_gate_re_appends_no_row_whose_dependency_is_lost() {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let (dir, _) = delegated_file(&h.meta);
+        let mut deps = Position::ZERO;
+        assert!(deps.streams.raise(5, 3));
+        let op = MutateOp::Create {
+            parent: dir,
+            name: "r1".into(),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let rid = Rid {
+            node: 3,
+            incarnation: 1,
+            seq: 1,
+        };
+        let tag = constellation_meta::locks::LockTag::NONE;
+        h.meta
+            .delegate_execute(&op, Some(rid), 7, deps, &tag, Now::same(0))
+            .unwrap();
+        // Generation 5 ended at 2: a dependency on its row 3 is lost.
+        crate::replica::Replica::void_stream(&h.meta, 5, 2);
+        crate::replica::Replica::note_void_cut(&h.meta, 5, 2);
+        assert!(crate::replica::Replica::deps_lost(&h.meta, &deps));
+        // The restart: nothing in memory says the stream is lost.
+        h.core = Core::new(h.core.cfg.clone());
+        h.hold(
+            2,
+            Some(PendingGate {
+                epoch: 2,
+                takeover: true,
+                marker_shipped: true,
+                drained: false,
+                fast_prev: false,
+                backup_tail_epoch: Some(1),
+                shippable: true,
+            }),
+        );
+        let mut out = Vec::new();
+        h.core.complete_gate(h.clk(), &h.meta, &mut out);
+        assert_eq!(h.core.stats.own_deleg_rows_reappended, 0);
+        let own = crate::replica::Replica::journal_txs_from(&h.meta, 0, usize::MAX)
+            .into_iter()
+            .filter(|tx| tx.origin.0 == 7)
+            .count();
+        assert_eq!(own, 0, "re-appended with a lost dependency");
+    }
+
     /// The delegate-restart wedge (plan 43 C7a commit 6's finding 1): a
     /// delegate that takes the root over with its predecessor's backup
     /// tail has its own rows of the generation stranded; when it then ends

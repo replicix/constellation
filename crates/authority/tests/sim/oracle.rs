@@ -1439,6 +1439,21 @@ pub fn end_of_run(
     f
 }
 
+/// The rids of replay-queue entries `queue` (`(rid, queue_seq)`) that were
+/// not queued when the queue was last read (`seen`, which becomes `queue`):
+/// the rollbacks I5 dates now. Keyed by the entry, not the rid: a rid whose
+/// replay left the queue and that was queued again (a new entry) between two
+/// reads is rolled back again.
+pub fn newly_queued(seen: &mut BTreeSet<(Rid, u64)>, queue: &[(Rid, u64)]) -> Vec<Rid> {
+    let new: Vec<Rid> = queue
+        .iter()
+        .filter(|e| !seen.contains(e))
+        .map(|(rid, _)| *rid)
+        .collect();
+    *seen = queue.iter().copied().collect();
+    new
+}
+
 /// Why the log does not carry `t` as it was committed (`None`: it does).
 ///
 /// Plan 43 C1-4 (D9): a transaction a takeover re-ships carries its identity
@@ -1899,6 +1914,24 @@ mod tests {
             rolled_back,
             true,
         )
+    }
+
+    /// A rollback is dated by the queue entry: a rid queued, answered, gone
+    /// from the queue unread (no rollback counter moved) and queued again as
+    /// a new entry is a new rollback. (Keyed by the rid, as before, the third
+    /// read found nothing new: the second rollback kept the first one's tick,
+    /// and the answer between them was never judged.)
+    #[test]
+    fn i5_dates_a_second_rollback_of_a_rid_by_its_new_entry() {
+        let r = rid(1, 1);
+        let mut seen = BTreeSet::new();
+        assert_eq!(newly_queued(&mut seen, &[(r, 3)]), vec![r]);
+        assert!(
+            newly_queued(&mut seen, &[(r, 3)]).is_empty(),
+            "the same entry"
+        );
+        assert_eq!(newly_queued(&mut seen, &[(r, 9)]), vec![r], "a new entry");
+        assert!(newly_queued(&mut seen, &[]).is_empty());
     }
 
     /// I5 judges the answers given before the rollback (placement-hot seed

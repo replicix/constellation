@@ -1284,10 +1284,26 @@ impl Core {
             if !own_gens.is_empty()
                 && !matches!(self.bk.gate_own_rows, Some((e, _)) if e == gate.epoch)
             {
-                let rows: Vec<constellation_meta::BackupTx> = replica
+                // With each row's dependencies, read now: the strand takes
+                // the journal heads that record them.
+                let mut deps: std::collections::HashMap<(u64, u64), constellation_meta::Position> =
+                    Default::default();
+                for gen in &own_gens {
+                    for (idx, d) in replica.delegate_deps_from(*gen, 0).unwrap_or_default() {
+                        deps.insert((*gen, idx), d);
+                    }
+                }
+                let rows: Vec<(
+                    constellation_meta::BackupTx,
+                    Option<constellation_meta::Position>,
+                )> = replica
                     .journal_txs_from(0, usize::MAX)
                     .into_iter()
                     .filter(|t| !t.records.is_empty() && own_gens.contains(&t.origin.0))
+                    .map(|t| {
+                        let d = deps.get(&t.origin).copied();
+                        (t, d)
+                    })
                     .collect();
                 self.bk.gate_own_rows = Some((gate.epoch, rows));
             }
@@ -1352,12 +1368,13 @@ impl Core {
         // goes into its own journal now, in journal order — before the
         // replay of anything stranded, so the replay finds it completed.
         if let Some(prev_epoch) = gate.backup_tail_epoch {
-            // (Read before the apply trims it.)
+            // (Read before the apply trims it and clears its extent.)
             let tail = replica.backup_tail(prev_epoch).unwrap_or_default();
+            let through = self.bk.tail_through;
             if let Err(e) = self.apply_backup_tail(prev_epoch, replica) {
                 return GateStep::Failed(e);
             }
-            if let Err(e) = self.reappend_own_delegate_rows(gate.epoch, &tail, replica) {
+            if let Err(e) = self.reappend_own_delegate_rows(gate.epoch, &tail, through, replica) {
                 return GateStep::Failed(e);
             }
             if let Some(g) = self.lease.gate.as_mut() {
@@ -1426,6 +1443,7 @@ impl Core {
         &mut self,
         epoch: Epoch,
         tail: &[constellation_meta::BackupTx],
+        through: u64,
         replica: &dyn Replica,
     ) -> Result<(), String> {
         // Once per gate: the capture stays (emptied) until the gate ends, so
@@ -1438,7 +1456,8 @@ impl Core {
         if rows.is_empty() {
             return Ok(());
         }
-        let through = self.bk.tail_through;
+        let own_gens: std::collections::BTreeSet<u64> =
+            rows.iter().map(|(t, _)| t.origin.0).collect();
         let mut carried: std::collections::HashSet<(u64, u64)> = Default::default();
         let mut ended: std::collections::BTreeSet<u64> = Default::default();
         for t in tail
@@ -1463,7 +1482,7 @@ impl Core {
         // (ADR-39), which the replay then re-executes after it.
         let mut halted = false;
         let mut appended: std::collections::HashSet<constellation_meta::Rid> = Default::default();
-        for t in &rows {
+        for (t, deps) in &rows {
             let (gen, idx) = t.origin;
             let cursor = replica.log_stream_idx(gen);
             tracing::debug!(
@@ -1489,13 +1508,22 @@ impl Core {
                 _ => None,
             });
             // Past a lost dependency the row was never committed (the stream
-            // stops there, ADR-39).
+            // stops there, ADR-39), whether or not a batch found it before
+            // (`lost_from`, in memory only): judged by the row's own deps, as
+            // captured. A dependency on another of this node's generations
+            // must be in the log or re-appended already.
             let lost = self
                 .dl
                 .mine
                 .get(&gen)
                 .and_then(|d| d.lost_from)
-                .is_some_and(|l| idx >= l);
+                .is_some_and(|l| idx >= l)
+                || deps.as_ref().is_some_and(|d| {
+                    replica.deps_lost(d)
+                        || d.streams.iter().any(|(g, i)| {
+                            g != gen && own_gens.contains(&g) && i > replica.log_stream_idx(g)
+                        })
+                });
             if halted || ended.contains(&gen) || idx != cursor + 1 || outcome.is_none() || lost {
                 halted = true;
                 continue;
@@ -1523,9 +1551,17 @@ impl Core {
         if !appended.is_empty() {
             let queue = replica.pending_replays().map_err(|e| e.to_string())?;
             for q in queue.iter().filter(|q| appended.contains(&q.rid)) {
-                replica
-                    .forget_replay(q.queue_seq)
-                    .map_err(|e| e.to_string())?;
+                // (Left queued, the replay finds its rid completed and drops
+                // it; counted, as it then waits on the queue's order.)
+                if let Err(e) = replica.forget_replay(q.queue_seq) {
+                    self.stats.own_deleg_reappend_forget_failed += 1;
+                    tracing::warn!(
+                        node = self.cfg.node_id,
+                        rid = ?q.rid,
+                        error = %e,
+                        "a re-appended row's replay could not leave the queue"
+                    );
+                }
             }
             tracing::info!(
                 node = self.cfg.node_id,

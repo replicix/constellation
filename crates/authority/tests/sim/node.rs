@@ -949,8 +949,9 @@ struct Driver {
     urgent_rx: mpsc::UnboundedReceiver<Event>,
     shared: Arc<Shared>,
     rolled_back_seen: (u64, u64, u64),
-    /// The replay queue's rids as `note_rollbacks` last read it.
-    queued_seen: BTreeSet<Rid>,
+    /// The replay queue's entries `(rid, queue_seq)` as `note_rollbacks`
+    /// last read it.
+    queued_seen: BTreeSet<(Rid, u64)>,
     /// `(journal tip, journal length)` when `Shared::journaled_refusals`
     /// was last taken.
     journal_seen: Option<(u64, u64)>,
@@ -2428,9 +2429,9 @@ impl Driver {
         let debug = std::env::var_os("AUTHORITY_SIM_ORACLE_DEBUG").is_some();
         let tick = self.oracles.tick.load(Ordering::SeqCst);
         if let Ok(queue) = self.meta.pending_replays() {
-            let mut queued = BTreeSet::new();
             let mut at = self.shared.rolled_back_at.lock().unwrap();
-            for q in queue {
+            let entries: Vec<(Rid, u64)> = queue.iter().map(|q| (q.rid, q.queue_seq)).collect();
+            for q in &queue {
                 if debug {
                     eprintln!(
                         "ORACLE-ROLLBACK node {} tick {tick} replay queue: {:?} class {:?} \
@@ -2439,12 +2440,10 @@ impl Driver {
                     );
                 }
                 t.insert(q.rid);
-                if !self.queued_seen.contains(&q.rid) {
-                    at.insert(q.rid, tick);
-                }
-                queued.insert(q.rid);
             }
-            self.queued_seen = queued;
+            for rid in super::oracle::newly_queued(&mut self.queued_seen, &entries) {
+                at.insert(rid, tick);
+            }
         }
         self.shared
             .journaled_refusals

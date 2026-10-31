@@ -778,6 +778,9 @@ pub struct Stats {
     /// after the predecessor's tail, verbatim under their stream origin
     /// (`Core::reappend_own_delegate_rows`).
     pub own_deleg_rows_reappended: u64,
+    /// Plan 43 C3: a re-appended row's queued replay that could not be
+    /// forgotten (it is then dropped by the replay, its rid completed).
+    pub own_deleg_reappend_forget_failed: u64,
     /// Ops held (per check) because their `deps` named a transaction its
     /// generation ended without, while this node's replays settled; and
     /// ops re-sent with fresh `deps` after that

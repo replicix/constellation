@@ -4181,7 +4181,8 @@ impl Meta {
             }
         }
         // Plan 43 C3: a committed streamed transaction of an earlier tenure
-        // that this segment completes by its rid under no identity it names:
+        // that this segment completes (or refuses) by its rid under no
+        // identity it names:
         // a root's append of a delegate's row that the next root appended
         // again from the delegate's re-stream (a successor's tail without
         // it: the tail a claimant fetched from a member copy). It is the
@@ -4189,7 +4190,7 @@ impl Meta {
         // applied in its place, and retired (left, it was redone over the
         // segment's own copy and waited for a `TailOf` for ever).
         let mut completed_streams: HashSet<u64> = HashSet::new();
-        if !completes.is_empty() {
+        if !completes.is_empty() || !refused.is_empty() {
             for (spec_seq, entry) in &live {
                 let LiveEntry::Streamed {
                     epoch: e,
@@ -4205,9 +4206,12 @@ impl Meta {
                 }
                 if let Some(v) = tx.get(&self.spec, seq_key(*spec_seq))? {
                     let row: SpecRow = postcard::from_bytes(&v)?;
-                    if row.records.iter().any(
-                        |r| matches!(r, LogRecord::Completed { rid } if completes.contains(rid)),
-                    ) {
+                    // (A refusal's row too: its outcome is the record.)
+                    if row.records.iter().any(|r| match r {
+                        LogRecord::Completed { rid } => completes.contains(rid),
+                        LogRecord::Refused { rid, .. } => refused.contains(rid),
+                        _ => false,
+                    }) {
                         completed_streams.insert(*spec_seq);
                     }
                 }
