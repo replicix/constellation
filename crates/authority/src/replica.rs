@@ -172,12 +172,15 @@ pub trait Replica {
     /// node's own transactions as the delegate of `own_gens`
     /// (`Meta::strand_for_takeover`). `abandoned`: the epoch of a group the
     /// operator gave up (this claim's marker says so): its committed
-    /// entries strand and replay too (plan 43 C1-4).
+    /// entries strand and replay too (plan 43 C1-4). `carried`: the rids of
+    /// the delegate rows the tail the gate re-applies carries
+    /// (`Meta::strand_for_takeover_carrying`).
     fn strand_for_takeover(
         &self,
         epoch: Epoch,
         own_gens: &[u64],
         abandoned: Option<Epoch>,
+        carried: &std::collections::HashSet<Rid>,
     ) -> Result<Stranded, MetaError>;
     /// The pre-S3 stream installed the holder's journal through `pos`
     /// (`SessionState::note_streamed`).
@@ -918,8 +921,9 @@ impl Replica for Meta {
         epoch: Epoch,
         own_gens: &[u64],
         abandoned: Option<Epoch>,
+        carried: &std::collections::HashSet<Rid>,
     ) -> Result<Stranded, MetaError> {
-        Meta::strand_for_takeover(self, epoch, own_gens, abandoned)
+        Meta::strand_for_takeover_carrying(self, epoch, own_gens, abandoned, carried)
     }
 
     fn strand_recalled_speculation(&self, gen: u64) -> Result<Stranded, MetaError> {

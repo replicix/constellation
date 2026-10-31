@@ -1279,7 +1279,41 @@ impl Core {
             } else {
                 Vec::new()
             };
-            match replica.strand_for_takeover(gate.epoch, &own_gens, self.bk.gate_abandoned) {
+            // Plan 43 C3: what the strand takes of them, as journaled (their
+            // records and stream indices), to re-append after the tail.
+            if !own_gens.is_empty()
+                && !matches!(self.bk.gate_own_rows, Some((e, _)) if e == gate.epoch)
+            {
+                let rows: Vec<constellation_meta::BackupTx> = replica
+                    .journal_txs_from(0, usize::MAX)
+                    .into_iter()
+                    .filter(|t| !t.records.is_empty() && own_gens.contains(&t.origin.0))
+                    .collect();
+                self.bk.gate_own_rows = Some((gate.epoch, rows));
+            }
+            // The delegate rows the tail re-applies (its contiguous prefix,
+            // `apply_backup_tail`): a committed shadow of one of them here
+            // would apply twice; one of a row the tail does not carry stays
+            // until the delegate's re-stream is appended.
+            let carried: std::collections::HashSet<constellation_meta::Rid> = gate
+                .backup_tail_epoch
+                .and_then(|e| replica.backup_tail(e))
+                .unwrap_or_default()
+                .iter()
+                .filter(|t| t.origin.0 != 0 && t.last <= self.bk.tail_through)
+                .flat_map(|t| t.records.iter())
+                .filter_map(|r| match r {
+                    constellation_meta::LogRecord::Completed { rid }
+                    | constellation_meta::LogRecord::Refused { rid, .. } => Some(*rid),
+                    _ => None,
+                })
+                .collect();
+            match replica.strand_for_takeover(
+                gate.epoch,
+                &own_gens,
+                self.bk.gate_abandoned,
+                &carried,
+            ) {
                 Ok(stranded) => {
                     self.lock_note_replay_pins(now, replica);
                     if stranded.any() {
@@ -1318,7 +1352,12 @@ impl Core {
         // goes into its own journal now, in journal order — before the
         // replay of anything stranded, so the replay finds it completed.
         if let Some(prev_epoch) = gate.backup_tail_epoch {
+            // (Read before the apply trims it.)
+            let tail = replica.backup_tail(prev_epoch).unwrap_or_default();
             if let Err(e) = self.apply_backup_tail(prev_epoch, replica) {
+                return GateStep::Failed(e);
+            }
+            if let Err(e) = self.reappend_own_delegate_rows(gate.epoch, &tail, replica) {
                 return GateStep::Failed(e);
             }
             if let Some(g) = self.lease.gate.as_mut() {
@@ -1356,7 +1395,145 @@ impl Core {
         }
         self.lease.gate = None;
         self.bk.gate_abandoned = None;
+        self.bk.gate_own_rows = None;
         GateStep::Done
+    }
+
+    /// Plan 43 C3 (§5.4 item 3, a delegate that takes the root over): this
+    /// node's own rows as the delegate of a generation, which the gate's
+    /// strand took out ahead of the predecessor's tail, go back into the
+    /// journal after it, verbatim and under their stream origin `(gen,
+    /// idx)`, in index order: the root's append of its own stream. A row
+    /// the tail carries already (the predecessor appended it) is skipped,
+    /// by origin. Re-executed by rid instead, as before, they reached the
+    /// log under a new identity (a root row of this tenure, re-stamped):
+    /// not the row the group committed and the clients were answered
+    /// (placement-hot seeds 15, 311: I2c).
+    ///
+    /// Why they apply as they did (the ownership argument): the root
+    /// executes nothing on the keys of a live generation, so no tail row
+    /// but the generation's own touches them — unless the tail ends the
+    /// generation (`Recall`/`RecallCut` of it), after which root rows may.
+    /// Such a generation's rows are left to the replay: those above the cut
+    /// were never committed (the end waits for the group), and their
+    /// clients retry. So is everything of a generation from a row that
+    /// does not continue the stream (the index after the log's).
+    ///
+    /// The rids re-appended leave the replay queue; the generation still
+    /// ends at this gate (`Meta::strand_for_takeover`'s mark), at what the
+    /// log then holds of it, which now includes them.
+    pub(super) fn reappend_own_delegate_rows(
+        &mut self,
+        epoch: Epoch,
+        tail: &[constellation_meta::BackupTx],
+        replica: &dyn Replica,
+    ) -> Result<(), String> {
+        // Once per gate: the capture stays (emptied) until the gate ends, so
+        // a pass of the gate retried after a failure neither captures again
+        // nor re-appends twice.
+        let rows = match self.bk.gate_own_rows.as_mut() {
+            Some((e, rows)) if *e == epoch => std::mem::take(rows),
+            _ => return Ok(()),
+        };
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let through = self.bk.tail_through;
+        let mut carried: std::collections::HashSet<(u64, u64)> = Default::default();
+        let mut ended: std::collections::BTreeSet<u64> = Default::default();
+        for t in tail
+            .iter()
+            .filter(|t| !t.records.is_empty() && t.last <= through)
+        {
+            if t.origin.0 != 0 {
+                carried.insert(t.origin);
+            }
+            for r in &t.records {
+                match r {
+                    LogRecord::Recall { gen, .. } | LogRecord::RecallCut { gen, .. } => {
+                        ended.insert(*gen);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // In journal order (which is each generation's index order), and from
+        // the first row that cannot go back, nothing more of any generation:
+        // a row of one generation may depend on an earlier row of another
+        // (ADR-39), which the replay then re-executes after it.
+        let mut halted = false;
+        let mut appended: std::collections::HashSet<constellation_meta::Rid> = Default::default();
+        for t in &rows {
+            let (gen, idx) = t.origin;
+            let cursor = replica.log_stream_idx(gen);
+            tracing::debug!(
+                node = self.cfg.node_id,
+                gen,
+                idx,
+                first = t.first,
+                last = t.last,
+                cursor,
+                carried = carried.contains(&t.origin),
+                ended = ended.contains(&gen),
+                halted,
+                "own delegate row at the gate"
+            );
+            if carried.contains(&t.origin) || idx <= cursor {
+                // The tail or the log carries it already.
+                continue;
+            }
+            // Its outcome's rid: a row without one could not leave the
+            // replay queue by it.
+            let outcome = t.records.iter().find_map(|r| match r {
+                LogRecord::Completed { rid } | LogRecord::Refused { rid, .. } => Some(*rid),
+                _ => None,
+            });
+            // Past a lost dependency the row was never committed (the stream
+            // stops there, ADR-39).
+            let lost = self
+                .dl
+                .mine
+                .get(&gen)
+                .and_then(|d| d.lost_from)
+                .is_some_and(|l| idx >= l);
+            if halted || ended.contains(&gen) || idx != cursor + 1 || outcome.is_none() || lost {
+                halted = true;
+                continue;
+            }
+            // (The rid the transaction completes, as `apply_backup_tail`
+            // passes it; a refusal's row carries its outcome as a record.)
+            let completes = t.records.iter().find_map(|r| match r {
+                LogRecord::Completed { rid } => Some(*rid),
+                _ => None,
+            });
+            if let Err(e) = replica.apply_backup_tx_journaled(&t.records, completes, t.origin) {
+                tracing::warn!(
+                    node = self.cfg.node_id,
+                    gen,
+                    idx,
+                    error = %e,
+                    "re-appending this node's own delegate row failed: it and the rows after it are replayed by rid"
+                );
+                halted = true;
+                continue;
+            }
+            self.stats.own_deleg_rows_reappended += 1;
+            appended.extend(outcome);
+        }
+        if !appended.is_empty() {
+            let queue = replica.pending_replays().map_err(|e| e.to_string())?;
+            for q in queue.iter().filter(|q| appended.contains(&q.rid)) {
+                replica
+                    .forget_replay(q.queue_seq)
+                    .map_err(|e| e.to_string())?;
+            }
+            tracing::info!(
+                node = self.cfg.node_id,
+                rows = appended.len(),
+                "re-appended this node's own delegate rows after the predecessor's tail"
+            );
+        }
+        Ok(())
     }
 
     fn marker_landed(

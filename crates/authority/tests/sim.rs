@@ -4434,6 +4434,91 @@ fn regression_streamed_reorder_keeps_hints_in_place() {
     }
 }
 
+/// `placement-hot` with the lease GETs of every node's handle slow (the
+/// sweeps' `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`).
+fn placement_hot_slow_lease_reads_config() -> SimConfig {
+    SimConfig {
+        lease_reads: sim::store::SlowReads {
+            before: (0, 0),
+            reply: (800, 1_000),
+        },
+        ..placement_hot_config()
+    }
+}
+
+/// `placement-hot` seeds 15, 311 and 590 (I2c). A delegate that is also the
+/// root's backup seals the root and takes it over with its own rows of the
+/// generation in its journal, rows its group committed and the clients
+/// were answered (`DelegGroup`). The gate strands them ahead of the
+/// predecessor's tail and used to re-execute them by rid after it: the log
+/// carried them as root rows of the new tenure, re-stamped, not under the
+/// identity they were committed with. They are re-appended verbatim under
+/// their stream origin now (`Core::reappend_own_delegate_rows`).
+#[test]
+fn regression_a_delegate_taking_the_root_over_re_appends_its_rows() {
+    let mut reappended = 0;
+    for seed in [15, 311, 590] {
+        let report = run_seed(seed, placement_hot_config()).unwrap_or_else(|e| {
+            panic!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=placement-hot")
+        });
+        reappended += report
+            .stats
+            .values()
+            .map(|s| s.own_deleg_rows_reappended)
+            .sum::<u64>();
+    }
+    assert!(reappended > 0, "no own delegate row was re-appended");
+}
+
+/// `placement-hot` seeds 539, 1746 and 1798 (I5), and 675 with slow lease
+/// reads: a delegate's committed answer is committed for the requester and
+/// the subscribers too. A requester's shadow of it was not marked committed
+/// (only a root's answer was), so the next root's first segment rolled the
+/// acknowledged row back on the requester and queued it for replay; and a
+/// subscriber's stream entry of the root's append of a delegate's row
+/// stranded with the root's tenure (the successor's re-ship of it now names
+/// its identity, `TailOf`).
+#[test]
+fn regression_committed_delegate_rows_survive_a_root_takeover() {
+    for (seed, cfg, alias) in [
+        (539u64, placement_hot_config(), "placement-hot"),
+        (1746, placement_hot_config(), "placement-hot"),
+        (1798, placement_hot_config(), "placement-hot"),
+        (
+            675,
+            placement_hot_slow_lease_reads_config(),
+            "placement-hot AUTHORITY_SIM_LEASE_READS=0:0:800:1000",
+        ),
+    ] {
+        run_seed(seed, cfg).unwrap_or_else(|e| {
+            panic!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={alias}")
+        });
+    }
+}
+
+/// `placement-hot` seeds 68 and 209 (I5, the oracle): a lone root's row
+/// rolled back by its deposition and its replay answered by the next root's
+/// group afterwards, and a journaled refusal gone before another node's
+/// answer of the rid, were taken for rollbacks of the group's answers.
+/// Seed 904 (`member_copies_drained`): a deposed root rebuilt from the log
+/// kept the member copy of rows its successor had re-shipped.
+#[test]
+fn regression_placement_hot_rollback_order_and_rebuilt_member_copies() {
+    for (seed, cfg, alias) in [
+        (68u64, placement_hot_config(), "placement-hot"),
+        (904, placement_hot_config(), "placement-hot"),
+        (
+            209,
+            placement_hot_slow_lease_reads_config(),
+            "placement-hot AUTHORITY_SIM_LEASE_READS=0:0:800:1000",
+        ),
+    ] {
+        run_seed(seed, cfg).unwrap_or_else(|e| {
+            panic!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={alias}")
+        });
+    }
+}
+
 /// The `backup-hot` sweep: `cargo test -p constellation-authority
 /// --release --test sim -- --ignored long_backup_hot`
 /// (`AUTHORITY_SIM_SEEDS`, `AUTHORITY_SIM_START`; replay one with
@@ -14320,12 +14405,11 @@ fn c1_a_committed_rid_is_queued_on_one_node_only() {
                 "{label} seed {seed}: {:?}",
                 r.oracle_examples
             );
-            // (`+identity` also judges I2 (c), which a delegate's rows still
-            // fail until C3: only the backup configuration is held to it.)
-            if label == "backup-crash" {
-                run_seed(seed, strict(cfg.clone(), "identity"))
-                    .unwrap_or_else(|e| panic!("{label} seed {seed}: {e}"));
-            }
+            // (`+identity` also judges I2 (c), which a delegate's rows pass
+            // since plan 43 C3's re-ship of them: both configurations are
+            // held to it.)
+            run_seed(seed, strict(cfg.clone(), "identity"))
+                .unwrap_or_else(|e| panic!("{label} seed {seed}: {e}"));
         }
     }
 }
@@ -14351,20 +14435,21 @@ fn c1_a_re_shipped_tail_is_the_transaction_the_client_was_told() {
     }
 }
 
-/// I2 (c) still finds what C1 does not change: a delegate's row the root
-/// appended and re-journals is not verbatim (C3's), in `delegated-holder-cut`
-/// (the first seed of 0..60 that counts one fails `+identity`).
+/// I2 (c) for a delegate's rows (plan 43 C3, in part): a delegate's row the
+/// root appended and a successor re-journals, and a delegate's own rows when
+/// it takes the root over, complete in the log under the identity they were
+/// committed with. In `delegated-holder-cut` (the root's backup is also a
+/// delegate) `+identity` holds on the seeds that failed it with I2c on the
+/// parent (29 of seeds 0 to 299 there, unclocked; none now).
 #[test]
-fn c0_i2c_finds_a_delegate_row_not_verbatim() {
+fn c3_a_delegates_rows_complete_verbatim() {
     use pinned::{c0_run, run_seed};
-    let seed = (0..60)
-        .find(|&seed| {
-            c0_run("delegated-holder-cut", seed, delegated_holder_cut_config()).non_verbatim > 0
-        })
-        .expect("no seed of 0..60 counts a row that is not verbatim");
-    let e =
-        run_seed(seed, strict(delegated_holder_cut_config(), "identity")).expect_err("+identity");
-    assert!(e.contains("I2c verbatim"), "seed {seed}: {e}");
+    for seed in [5, 32, 35] {
+        let r = c0_run("delegated-holder-cut", seed, delegated_holder_cut_config());
+        assert_eq!(r.non_verbatim, 0, "seed {seed}: {:?}", r.oracle_examples);
+        run_seed(seed, strict(delegated_holder_cut_config(), "identity"))
+            .unwrap_or_else(|e| panic!("delegated-holder-cut seed {seed}: {e}"));
+    }
 }
 
 /// I4: an op answered in doubt lands after an op its node invoked later.
@@ -14439,22 +14524,27 @@ fn c1_a_backups_member_copy_holds_no_delegate_rows() {
     );
 }
 
-/// I5 still finds what C1 does not change: a delegate's acknowledged op
-/// (DelegGroup until C2) rolled back by a root change, in
-/// `delegated-holder-cut` (the first seed of 0..60 that counts one fails
-/// `+lone`).
+/// I5 for a delegate's answers (plan 43 C2c follow-up): a delegate's
+/// committed answer is not rolled back by a root change, on the requester
+/// (its shadow is a committed entry, as a root's answer's is), on a
+/// subscriber of the root's stream (the successor's re-ship names the
+/// root's append of it, `TailOf`) or on the delegate taking the root over
+/// (it re-appends its own rows). In `delegated-holder-cut` `+lone` holds on
+/// the seeds that failed it with I5 on the parent (142 of seeds 0 to 299
+/// there, unclocked; none now).
 #[test]
-fn c0_i5_finds_a_delegates_rolled_back_acknowledgement() {
+fn c2_a_delegates_committed_answer_is_never_rolled_back() {
     use pinned::{c0_run, run_seed};
-    let seed = (0..60)
-        .find(|&seed| {
-            c0_run("delegated-holder-cut", seed, delegated_holder_cut_config()).non_lone_rollbacks
-                > 0
-        })
-        .expect("no seed of 0..60 counts a rolled-back acknowledgement");
-    let e =
-        run_seed(seed, strict(delegated_holder_cut_config(), "lone")).expect_err("+lone must fail");
-    assert!(e.contains("I5 speculation_only_lone"), "seed {seed}: {e}");
+    for seed in [0, 4, 5] {
+        let r = c0_run("delegated-holder-cut", seed, delegated_holder_cut_config());
+        assert_eq!(
+            r.non_lone_rollbacks, 0,
+            "seed {seed}: {:?}",
+            r.oracle_examples
+        );
+        run_seed(seed, strict(delegated_holder_cut_config(), "lone"))
+            .unwrap_or_else(|e| panic!("delegated-holder-cut seed {seed}: {e}"));
+    }
 }
 
 // Pinned seeds, each found by the sweep of its configuration with the counter
@@ -14505,7 +14595,9 @@ const I4_SEEDS: &[I4Seeds] = &[(
     // (The root probe's overlapping reads and the own lapses the driver now
     // hands the core moved 44: 75 is one of the 19 seeds of 0 to 300 with a
     // late landing now, unclocked, 2 of them; `+settle` fails with I4.)
-    &[31, 58, 75],
+    // (Plan 43 C3's re-ship of a delegate's rows moved 58: 98 is one of the
+    // 18 seeds of 0 to 300 that fail `+settle` with I4 now, unclocked.)
+    &[31, 75, 98],
 )];
 
 /// Plan 45 follow-up: hard links (`NsOp::Link`) and exchanges

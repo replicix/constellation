@@ -834,6 +834,12 @@ pub(crate) struct BackupState {
     /// Plan 43 C1-4: the extent of the tail the open gate re-ships (its
     /// marker's `TailFollowsThrough.through`).
     pub(crate) tail_through: u64,
+    /// Plan 43 C3 (a delegate that takes the root over): this node's own
+    /// rows as the delegate of the generations the open gate strands, as
+    /// its journal held them, until the gate re-appends them after the
+    /// tail (`Core::reappend_own_delegate_rows`), with the gate's epoch (a
+    /// later gate captures its own).
+    pub(crate) gate_own_rows: Option<(Epoch, Vec<constellation_meta::BackupTx>)>,
     pub(crate) member_epochs: Vec<Epoch>,
 }
 
@@ -5004,10 +5010,11 @@ impl Core {
         // (Not what the log carries already: rows of the epoch this replica
         // applied through — a tail that outlived a crash before its trim.
         // Nor a delegate's row the root appended, `origin` of a generation:
-        // its identity is `(gen, idx)`, no re-ship names it with a `TailOf`
-        // and the delegate re-streams it to the next root — C3's, as in the
-        // successor's own copy, `apply_backup_tail`. Kept, it outlived every
-        // segment that carried it: delegated-holder-cut seed 170.)
+        // the delegate re-streams it to the next root, whose append names no
+        // `TailOf` (a successor's re-ship of it does) — as in the successor's
+        // own copy, `apply_backup_tail`. Kept, it outlived every segment that
+        // carried it: delegated-holder-cut seed 170. A subscriber's committed
+        // stream entry of it retires by its rid then.)
         let shipped = replica.applied_jseq_of(role.epoch);
         let Some(tail) = replica.backup_tail(role.epoch) else {
             return false;
@@ -5098,20 +5105,22 @@ impl Core {
                 // it, as its first record: the journal that first held it.
                 // One that carries one already keeps it (re-shipped twice,
                 // A to B to C, it is A's still).
-                let records: std::borrow::Cow<'_, [constellation_meta::LogRecord]> = if tx.origin
-                    == (0, 0)
-                    && constellation_meta::tail_identity(&tx.records).is_none()
-                {
-                    let mut r = Vec::with_capacity(tx.records.len() + 1);
-                    r.push(constellation_meta::LogRecord::TailOf {
-                        epoch: prev_epoch,
-                        jseq: tx.first,
-                    });
-                    r.extend(tx.records.iter().cloned());
-                    std::borrow::Cow::Owned(r)
-                } else {
-                    std::borrow::Cow::Borrowed(&tx.records)
-                };
+                // A root's append of a delegate's row too: its origin is the
+                // delegation's identity, the `TailOf` the tenure's (what a
+                // subscriber's committed stream entry and a member copy of
+                // the deposed group retire by).
+                let records: std::borrow::Cow<'_, [constellation_meta::LogRecord]> =
+                    if constellation_meta::tail_identity(&tx.records).is_none() {
+                        let mut r = Vec::with_capacity(tx.records.len() + 1);
+                        r.push(constellation_meta::LogRecord::TailOf {
+                            epoch: prev_epoch,
+                            jseq: tx.first,
+                        });
+                        r.extend(tx.records.iter().cloned());
+                        std::borrow::Cow::Owned(r)
+                    } else {
+                        std::borrow::Cow::Borrowed(&tx.records)
+                    };
                 // Under the row's delegation origin: a root's append of a
                 // delegate's stream row stays one (delegated-holder-cut
                 // seed 1719).
@@ -5346,10 +5355,13 @@ impl Core {
                 });
                 continue;
             }
-            // A delegate's row the root appended (`origin` of a generation) is no
-            // committed row of the root's group at C1 (its class is the
-            // delegation's, C2/C3): it strands with its tenure as before.
-            let committed = committed && tx.origin == (0, 0);
+            // A delegate's row the root appended (`origin` of a generation) is
+            // committed as the root's own rows are: its group held it when
+            // the holder streamed it, and the successor re-ships it under
+            // its identity (`TailOf`, `apply_backup_tail`); without a tail the
+            // delegate re-streams it to the next root. Stranded with the
+            // tenure, it was rolled back here and queued as a `Records`
+            // replay of an acknowledged row (placement-hot seed 675: I5).
             match replica.install_streamed(epoch, from, tx.first, tx.last, &tx.records, committed) {
                 Ok(()) => {
                     replica.note_foreign_executed(&tx.records);

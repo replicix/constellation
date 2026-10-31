@@ -175,7 +175,10 @@ pub enum SpecKind {
         /// when it answered). A committed shadow is not stranded by a
         /// takeover of its epoch: the successor re-ships the row, and the
         /// shadow retires by the segment that completes its rid; only an
-        /// operator's abandon of the group strands it.
+        /// operator's abandon of the group strands it. A delegate's
+        /// committed answer (`gen` != 0, its generation's group held the
+        /// row) is the same: the delegate re-streams the row to the next
+        /// root, and only the end of the generation strands the shadow.
         gated: bool,
     },
     /// The `Exists` early install: retires once the applied state
@@ -328,8 +331,20 @@ impl LiveEntry {
     /// predecessor's tail (which carries the row, write-all), so an entry of
     /// this node's own that applied it already would apply it twice. Rolled
     /// back and not queued ([`Self::stranded_by`] is false for it).
-    fn superseded_by_takeover(&self, epoch: u64) -> bool {
-        self.gated() && self.epoch() < epoch
+    ///
+    /// A shadow of a delegate's committed answer (`gen` != 0) is the
+    /// generation's row, not the root tenure's: the tail carries it only if
+    /// the predecessor appended it (`carried`, the rids of the tail's
+    /// delegate rows). One it does not carry stays: the delegate re-streams
+    /// the row to this node, whose append takes the shadow out in its place
+    /// (`unwind_shadow_for_append_tx`).
+    fn superseded_by_takeover(&self, epoch: u64, carried: &HashSet<Rid>) -> bool {
+        match self {
+            LiveEntry::Shadow { rid, gen, .. } if *gen != 0 => {
+                self.gated() && self.epoch() < epoch && carried.contains(rid)
+            }
+            _ => self.gated() && self.epoch() < epoch,
+        }
     }
 
     /// Plan 43 C1-4: the operator abandoned the group of root epoch `e`
@@ -3099,7 +3114,16 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
     // epoch's tail (`member::log_carries_tx`).
     let mut kept: Vec<(u64, LiveEntry)> = Vec::new();
     for (seq, entry) in &live {
-        if entry.gated() && matches!(entry, LiveEntry::Shadow { .. } | LiveEntry::Streamed { .. }) {
+        // (Not a delegate's committed answer's shadow, `gen` != 0: the
+        // rebuilt log may have ended its generation below the row already,
+        // and no later segment would then strand it; it is queued as
+        // before, held while the generation is live.)
+        if entry.gated()
+            && matches!(
+                entry,
+                LiveEntry::Shadow { gen: 0, .. } | LiveEntry::Streamed { .. }
+            )
+        {
             kept.push((*seq, *entry));
             continue;
         }
@@ -3569,7 +3593,7 @@ impl Meta {
             op: op.clone(),
             gen,
             lock_tag: tag.clone(),
-            gated: committed && gen == 0,
+            gated: committed,
         };
         self.install_speculative_tx(tx, kind, records)?;
         Ok(true)
@@ -3665,7 +3689,7 @@ impl Meta {
                 at,
                 epoch,
                 gen,
-                gated: committed && gen == 0,
+                gated: committed,
             },
             records,
         )?;
@@ -4156,6 +4180,39 @@ impl Meta {
                 }
             }
         }
+        // Plan 43 C3: a committed streamed transaction of an earlier tenure
+        // that this segment completes by its rid under no identity it names:
+        // a root's append of a delegate's row that the next root appended
+        // again from the delegate's re-stream (a successor's tail without
+        // it: the tail a claimant fetched from a member copy). It is the
+        // segment's record now, as one its `TailOf` names: rolled back and
+        // applied in its place, and retired (left, it was redone over the
+        // segment's own copy and waited for a `TailOf` for ever).
+        let mut completed_streams: HashSet<u64> = HashSet::new();
+        if !completes.is_empty() {
+            for (spec_seq, entry) in &live {
+                let LiveEntry::Streamed {
+                    epoch: e,
+                    ident,
+                    gated: true,
+                    ..
+                } = entry
+                else {
+                    continue;
+                };
+                if *e >= epoch || tail_ids.contains(ident) {
+                    continue;
+                }
+                if let Some(v) = tx.get(&self.spec, seq_key(*spec_seq))? {
+                    let row: SpecRow = postcard::from_bytes(&v)?;
+                    if row.records.iter().any(
+                        |r| matches!(r, LogRecord::Completed { rid } if completes.contains(rid)),
+                    ) {
+                        completed_streams.insert(*spec_seq);
+                    }
+                }
+            }
+        }
         // Plan 30 §M11: with a `Local` row outstanding the segment is
         // inserted by a rewind (below), which rolls back every row from
         // the oldest one on. A streamed or own-delegate transaction that
@@ -4259,7 +4316,11 @@ impl Meta {
                     // successor re-ships (its `TailOf` names it) is its
                     // segment's record now: rolled back and applied in its
                     // place, as a shadow this segment completes.
-                    LiveEntry::Streamed { ident, .. } if tail_ids.contains(ident) => true,
+                    LiveEntry::Streamed { ident, .. }
+                        if tail_ids.contains(ident) || completed_streams.contains(spec_seq) =>
+                    {
+                        true
+                    }
                     _ => match tx.get(&self.spec, seq_key(*spec_seq))? {
                         Some(v) => {
                             let row: SpecRow = postcard::from_bytes(&v)?;
@@ -4339,6 +4400,7 @@ impl Meta {
                     LiveEntry::Streamed { ident, .. } => {
                         !confirmed.iter().any(|(s, _, _)| s == *spec_seq)
                             && !tail_ids.contains(ident)
+                            && !completed_streams.contains(*spec_seq)
                     }
                     LiveEntry::Local { .. } => !own_spec.contains(spec_seq),
                 })
@@ -4394,7 +4456,9 @@ impl Meta {
             let LiveEntry::Streamed { ident, .. } = entry else {
                 continue;
             };
-            if tail_ids.contains(ident) && tx.get(&self.spec_live, seq_key(*spec_seq))?.is_some() {
+            if (tail_ids.contains(ident) || completed_streams.contains(spec_seq))
+                && tx.get(&self.spec_live, seq_key(*spec_seq))?.is_some()
+            {
                 tx.remove(&self.spec_live, seq_key(*spec_seq));
                 counter_add_tx(&mut tx, &self.local, KV_SPEC_LIVE_COUNT, -1)?;
                 retired += 1;
@@ -4596,6 +4660,20 @@ impl Meta {
         own_gens: &[u64],
         abandoned: Option<u64>,
     ) -> Result<Stranded, MetaError> {
+        self.strand_for_takeover_carrying(epoch, own_gens, abandoned, &HashSet::new())
+    }
+
+    /// [`Self::strand_for_takeover`], with the rids of the delegate rows the
+    /// tail the gate re-applies carries (`carried`): a committed shadow of
+    /// a delegate's answer is taken out only if the tail carries its row
+    /// ([`LiveEntry::superseded_by_takeover`]).
+    pub fn strand_for_takeover_carrying(
+        &self,
+        epoch: u64,
+        own_gens: &[u64],
+        abandoned: Option<u64>,
+        carried: &HashSet<Rid>,
+    ) -> Result<Stranded, MetaError> {
         let mut tx = self.db.write_tx();
         let staged = UsageTracker::staging();
         let own = |entry: &LiveEntry| match entry {
@@ -4616,12 +4694,12 @@ impl Meta {
             |entry| {
                 entry.stranded_by(epoch)
                     || own(entry).is_some()
-                    || entry.superseded_by_takeover(epoch)
+                    || entry.superseded_by_takeover(epoch, carried)
                     || abandons(entry)
             },
             true,
             false,
-            |entry| entry.superseded_by_takeover(epoch) && !abandons(entry),
+            |entry| entry.superseded_by_takeover(epoch, carried) && !abandons(entry),
         )?;
         if !stranded.any() && own_gens.is_empty() {
             return Ok(stranded);

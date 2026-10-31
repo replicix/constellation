@@ -411,6 +411,130 @@ fn a_rebuild_retires_a_committed_streamed_entry_the_log_carries() {
     assert!(meta.lookup(ROOT_INO, "a").unwrap().is_some());
 }
 
+/// A delegate's committed answer (`gen` != 0: its generation's group held
+/// the row) installs a committed shadow too: a later root epoch's segment
+/// does not strand it (the delegate re-streams the row to the next root),
+/// and the segment that completes its rid retires it. Fails on the parent
+/// (placement-hot seeds 539, 1746, 1798: only a root's answer made a
+/// committed shadow, and the requester rolled the acknowledged row back and
+/// queued it at the root's takeover).
+#[test]
+fn a_delegates_committed_shadow_survives_a_root_takeover() {
+    let meta = Meta::open_in_memory().unwrap();
+    let recs = vec![create("a", ino(1), 10), completed(rid(1))];
+    assert!(meta
+        .install_shadow_committed(
+            rid(1),
+            1,
+            7,
+            &create_op("a", ino(1)),
+            &Default::default(),
+            &recs,
+            true
+        )
+        .unwrap());
+    let other = vec![create("b", ino(2), 11), completed(rid(2))];
+    apply_rows(&meta, 1, 2, 2, &[1, 2], &other);
+    assert!(meta.has_outstanding_speculation(), "not stranded");
+    assert!(meta.pending_replays().unwrap().is_empty());
+    assert!(meta.lookup(ROOT_INO, "a").unwrap().is_some());
+    // The next root appends the delegate's re-streamed row.
+    meta.apply_segment_rows(
+        2,
+        2,
+        4,
+        &[3, 4],
+        &[(7, 1), (7, 1)],
+        &recs,
+        &TouchSet::default(),
+    )
+    .unwrap();
+    assert!(!meta.has_outstanding_speculation());
+    assert!(meta.pending_replays().unwrap().is_empty());
+    assert!(meta.lookup(ROOT_INO, "a").unwrap().is_some());
+}
+
+/// The takeover gate takes a delegate's committed shadow out only when the
+/// tail it re-applies carries the row (the predecessor appended it); one it
+/// does not carry stays, for the delegate's re-stream to replace in place.
+/// Fails on the parent (the shadow was stranded and queued).
+#[test]
+fn the_takeover_gate_keeps_a_delegates_committed_shadow_its_tail_lacks() {
+    for carried in [false, true] {
+        let meta = Meta::open_in_memory().unwrap();
+        let recs = vec![create("a", ino(1), 10), completed(rid(1))];
+        meta.install_shadow_committed(
+            rid(1),
+            1,
+            7,
+            &create_op("a", ino(1)),
+            &Default::default(),
+            &recs,
+            true,
+        )
+        .unwrap();
+        let tail: std::collections::HashSet<Rid> = if carried {
+            [rid(1)].into()
+        } else {
+            Default::default()
+        };
+        let stranded = meta
+            .strand_for_takeover_carrying(2, &[], None, &tail)
+            .unwrap();
+        assert!(
+            meta.pending_replays().unwrap().is_empty(),
+            "carried {carried}"
+        );
+        if carried {
+            assert_eq!(stranded.superseded, 1);
+            assert!(!meta.has_outstanding_speculation());
+        } else {
+            assert!(!stranded.any());
+            assert!(meta.has_outstanding_speculation());
+            assert!(meta.lookup(ROOT_INO, "a").unwrap().is_some());
+        }
+    }
+}
+
+/// A rebuild of the namespace from a log that re-shipped rows of an epoch
+/// (`TailOf`) drops the member copy this node already held of them: no
+/// segment applied here runs the drop rules for that re-ship. Fails on the
+/// parent (placement-hot seed 904: the copy outlived the archive).
+#[test]
+fn a_rebuild_drops_the_member_rows_its_log_re_shipped() {
+    let meta = Meta::open_in_memory().unwrap();
+    put(
+        &meta,
+        &[
+            mtx(4, 4, RowClass::RootGroup, vec![create("a", ino(1), 10)]),
+            mtx(5, 5, RowClass::RootGroup, vec![create("b", ino(2), 11)]),
+        ],
+    );
+    let side = Meta::open_in_memory().unwrap();
+    let reship = vec![
+        LogRecord::TailOf { epoch: 1, jseq: 4 },
+        create("a", ino(1), 10),
+    ];
+    apply_rows(&side, 1, 2, 2, &[1, 2], &reship);
+    meta.replace_ns_from_rebuilt(&side, &Default::default())
+        .unwrap();
+    let (_, rows) = meta.member_copy_rows(1).unwrap().expect("one row is left");
+    assert_eq!(
+        rows.iter().map(|r| r.tx.first).collect::<Vec<_>>(),
+        [5],
+        "the re-shipped row left, the other stays"
+    );
+    let reship = vec![
+        LogRecord::TailOf { epoch: 1, jseq: 5 },
+        create("b", ino(2), 11),
+    ];
+    let side2 = Meta::open_in_memory().unwrap();
+    apply_rows(&side2, 1, 2, 2, &[1, 2], &reship);
+    meta.replace_ns_from_rebuilt(&side2, &Default::default())
+        .unwrap();
+    assert_eq!(meta.member_copy(1).unwrap(), None);
+}
+
 // -------------------------------------------------------- the drop rules
 
 fn put(meta: &Meta, rows: &[MemberTx]) {

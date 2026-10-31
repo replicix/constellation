@@ -418,6 +418,8 @@ impl Meta {
         // judged by that log (`member::log_carries_tx`): the applied
         // position is installed below, after the reset.
         crate::store::member::adopt_log_tail_facts_tx(&mut tx, self, &side_snap, side)?;
+        // ... and the member copies already here are judged by it.
+        crate::store::member::drop_settled_rows_tx(&mut tx, self)?;
         let side_pos = crate::store::applied_pos_at(&side_snap, &side.local);
         crate::store::spec::reset_for_rebuilt_ns_tx(&mut tx, self, side_pos)?;
         if let Some(v) = side_snap.get(&side.local, KV_APPLIED_SEQ.as_bytes())? {
@@ -441,6 +443,7 @@ impl Meta {
             usage_files.to_string().into_bytes(),
         );
         tx.commit()?;
+        let _ = self.refresh_member_copy_flag();
         self.usage_tracker()
             .reseat(usage_bytes.max(0) as u64, usage_files.max(0) as u64);
         // What the reset's strand rolled back, after the commit (the

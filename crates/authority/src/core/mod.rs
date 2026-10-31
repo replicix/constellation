@@ -774,6 +774,10 @@ pub struct Stats {
     /// observes less rows of its own whose effects it carries
     /// (`Core::settle_own_rows`): no wait, and no upload, for them.
     pub own_rows_excused: u64,
+    /// Plan 43 C3: this node's own delegate rows a takeover gate re-appended
+    /// after the predecessor's tail, verbatim under their stream origin
+    /// (`Core::reappend_own_delegate_rows`).
+    pub own_deleg_rows_reappended: u64,
     /// Ops held (per check) because their `deps` named a transaction its
     /// generation ended without, while this node's replays settled; and
     /// ops re-sent with fresh `deps` after that

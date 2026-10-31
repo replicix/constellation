@@ -169,6 +169,39 @@ pub(crate) fn log_carries_tx(
     Ok(kv_u64(r, meta, &reship_key(ident.0))?.is_some_and(|m| ident.1 <= m))
 }
 
+/// The rows of every member copy the log, as this replica now knows it,
+/// settles ([`log_settled_tx`]) leave, in the caller's transaction: a
+/// namespace rebuilt from the log adopted what that log says of each epoch's
+/// tail ([`adopt_log_tail_facts_tx`]) without applying its segments here, so
+/// no segment ran the drop rules for the re-ship it carries. A copy a
+/// deposed holder made at its seal, whose successor re-shipped it before the
+/// rebuild read the log, stayed for good (placement-hot seed 904: two
+/// refusals of epoch 1 left at convergence).
+pub(crate) fn drop_settled_rows_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+) -> Result<usize, MetaError> {
+    if !meta.has_member_copies() {
+        return Ok(0);
+    }
+    let mut dropped = 0usize;
+    for e in epochs_in(&*tx, meta)? {
+        let mut left = 0usize;
+        for row in rows_in(&*tx, meta, e)? {
+            if log_settled_tx(&*tx, meta, e, &row)? {
+                tx.remove(&meta.backup_tail, tail_key(member_epoch(e), row.tx.first));
+                dropped += 1;
+            } else {
+                left += 1;
+            }
+        }
+        if left == 0 {
+            tx.remove(&meta.local, member_info_key(e).into_bytes());
+        }
+    }
+    Ok(dropped)
+}
+
 /// Take over what the log told `side` of every epoch's tail (module doc's
 /// `member_shipped`/`member_reship`/`member_through`, each raised, never
 /// lowered): a namespace rebuilt from `side` is a replica that applied that

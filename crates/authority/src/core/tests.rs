@@ -14469,7 +14469,12 @@ mod locks {
     /// which generations it assigned stream indices in). Not stranded, they
     /// shipped ahead of the tail's rows they depended on
     /// (`delegated-holder-cut` seed 1240 under slow lease reads: an unlink
-    /// of a name before the rename that made it, in the log).
+    /// of a name before the rename that made it, in the log). Plan 43 C3:
+    /// they come back after the tail, verbatim under their stream origin
+    /// (`Core::reappend_own_delegate_rows`), and leave the replay queue;
+    /// executed again by rid, they reached the log as root rows of the new
+    /// tenure (placement-hot seeds 15, 311: I2c). Fails on the parent: the
+    /// journal held no row of the generation after the gate.
     #[test]
     fn the_takeover_gate_strands_own_rows_of_a_generation_the_core_does_not_hold() {
         let mut h = Harness::new(3);
@@ -14477,6 +14482,42 @@ mod locks {
         h.core.cfg.p2p = true;
         let (dir, _) = delegated_file(&h.meta);
         two_delegate_rows(&h, dir);
+        let own_before: Vec<Vec<LogRecord>> =
+            crate::replica::Replica::journal_txs_from(&h.meta, 0, usize::MAX)
+                .into_iter()
+                .filter(|tx| tx.origin.0 == 7)
+                .map(|tx| tx.records)
+                .collect();
+        assert_eq!(own_before.len(), 2);
+        // The predecessor's tail: one root row, unrelated to the subtree.
+        let tail_rid = Rid {
+            node: 1,
+            incarnation: 1,
+            seq: 9,
+        };
+        let tail = vec![
+            LogRecord::Create {
+                parent: ROOT_INO,
+                name: "t".into(),
+                ino: h.meta.allocate_ino(ROOT_INO).unwrap(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 5,
+            },
+            LogRecord::Completed { rid: tail_rid },
+        ];
+        h.meta
+            .backup_append(
+                1,
+                &[constellation_meta::BackupTx {
+                    first: 1,
+                    last: 2,
+                    records: tail.clone(),
+                    origin: (0, 0),
+                }],
+            )
+            .unwrap();
         // The restart: nothing re-adopted.
         h.core = Core::new(h.core.cfg.clone());
         assert!(h.core.dl.mine.is_empty());
@@ -14492,29 +14533,50 @@ mod locks {
                 shippable: true,
             }),
         );
+        h.core.bk.tail_through = 2;
         let mut out = Vec::new();
         h.core.complete_gate(h.clk(), &h.meta, &mut out);
-        let own_rows = crate::replica::Replica::journal_txs_from(&h.meta, 0, usize::MAX)
-            .into_iter()
-            .filter(|tx| tx.origin.0 == 7)
-            .count();
+        let journal = crate::replica::Replica::journal_txs_from(&h.meta, 0, usize::MAX);
+        let at_tail = journal
+            .iter()
+            .position(|tx| tx.records.ends_with(&tail))
+            .expect("the tail is in the journal");
+        let own: Vec<(usize, &constellation_meta::BackupTx)> = journal
+            .iter()
+            .enumerate()
+            .filter(|(_, tx)| tx.origin.0 == 7)
+            .collect();
         assert_eq!(
-            own_rows, 0,
-            "the delegate's own rows stay ahead of the tail"
+            own.iter().map(|(_, tx)| tx.origin).collect::<Vec<_>>(),
+            vec![(7, 1), (7, 2)],
+            "the delegate's own rows under their origin: {journal:?}"
+        );
+        assert!(
+            own.iter().all(|(i, _)| *i > at_tail),
+            "the tail first, then the delegate's own rows: {journal:?}"
+        );
+        let own_after: Vec<Vec<LogRecord>> = own.iter().map(|(_, tx)| tx.records.clone()).collect();
+        assert_eq!(own_after, own_before, "re-appended verbatim");
+        assert_eq!(h.core.stats.own_deleg_rows_reappended, 2);
+        assert!(
+            h.meta.pending_replays().unwrap().is_empty(),
+            "nothing is executed again by rid"
         );
         assert!(h.meta.delegate_stranded(7).unwrap());
     }
 
     /// The delegate-restart wedge (plan 43 C7a commit 6's finding 1): a
     /// delegate that takes the root over with its predecessor's backup
-    /// tail has its own rows of the generation stranded (replayed by rid
-    /// as root rows); when it then ends the generation as the root, its
-    /// void cut is the log's (the cursor), as the `Recall` gives every
-    /// other replica: a dependency on a stranded row is lost here too.
-    /// With its own stream head as the cut, its client re-sent an op
-    /// depending on such a row with the same deps, and the next root
-    /// answered `Held` (deps lost) forever (`delegated-holder-cut` under
-    /// the clock mix: no op answered for 540 s).
+    /// tail has its own rows of the generation stranded; when it then ends
+    /// the generation as the root, its void cut is the log's (the cursor),
+    /// as the `Recall` gives every other replica. With its own stream head
+    /// as the cut while the stranded rows were replayed by rid as root rows,
+    /// its client re-sent an op depending on such a row with the same deps,
+    /// and the next root answered `Held` (deps lost) forever
+    /// (`delegated-holder-cut` under the clock mix: no op answered for
+    /// 540 s). Plan 43 C3: the gate re-appends those rows under their
+    /// origin, so the log's index of the stream, the cursor and the cut
+    /// reach them, and a dependency on one is reached, not lost.
     #[test]
     fn a_root_ending_a_generation_its_takeover_stranded_cuts_it_at_the_log() {
         let mut h = Harness::new(3);
@@ -14542,6 +14604,7 @@ mod locks {
         );
         h.core.complete_gate(h.clk(), &h.meta, &mut out);
         assert!(h.meta.delegate_stranded(7).unwrap());
+        assert_eq!(h.meta.log_stream_idx(7).unwrap(), 2, "re-appended");
         // The root side: it inherits the generation it delegated to
         // itself and ends it.
         h.core.delegation_sync(h.clk(), &h.meta, &mut out);
@@ -14552,7 +14615,7 @@ mod locks {
         // Plan 43 C2: the `RecallCut` record carries the same cut, the
         // cursor, so every other replica voids where this one does.
         let cursor = h.core.dl.gens[&7].cursor;
-        assert!(cursor < 2, "cursor {cursor}");
+        assert_eq!(cursor, 2, "cursor {cursor}");
         let cuts: Vec<u64> = crate::replica::Replica::journal_txs_from(&h.meta, 0, usize::MAX)
             .into_iter()
             .flat_map(|tx| tx.records)
@@ -14570,8 +14633,8 @@ mod locks {
             deps
         };
         assert!(
-            crate::replica::Replica::deps_lost(&h.meta, &on_row(2)),
-            "a dependency on a stranded row of the generation is not lost at its own root"
+            !crate::replica::Replica::deps_lost(&h.meta, &on_row(2)),
+            "a dependency on a re-appended row of the generation is lost at its own root"
         );
         assert!(!crate::replica::Replica::deps_lost(&h.meta, &on_row(0)));
     }
