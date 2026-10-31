@@ -1891,13 +1891,17 @@ fn master_ref(repo: &Path) -> String {
 }
 
 fn mount_live(c: &mut Client) -> Result<()> {
+    mount_retrying(c)?;
+    mark_alive(c)
+}
+
+/// Mount `c`, retrying a mount that fails (a node restarting right after
+/// a kill can lose a race with its predecessor's teardown).
+fn mount_retrying(c: &mut Client) -> Result<()> {
     let mut last = None;
     for _ in 0..5 {
         match c.mount() {
-            Ok(()) => {
-                std::fs::write(c.mnt.join(ALIVE), b"")?;
-                return Ok(());
-            }
+            Ok(()) => return Ok(()),
             Err(e) => {
                 last = Some(e);
                 std::thread::sleep(Duration::from_secs(2));
@@ -1905,6 +1909,15 @@ fn mount_live(c: &mut Client) -> Result<()> {
         }
     }
     Err(last.unwrap().context(format!("remounting {}", c.name)))
+}
+
+/// Mark `c` live for its worker. Creating the marker needs the lease on
+/// the mounted tree, and a node that is alone cannot claim it: the claim
+/// waits for its group's tail, so after a whole-cluster kill every node
+/// must be mounted before the first marker is written.
+fn mark_alive(c: &Client) -> Result<()> {
+    std::fs::write(c.mnt.join(ALIVE), b"")?;
+    Ok(())
 }
 
 /// Mark `c` dead for its worker before a kill: the worker re-checks
@@ -2024,11 +2037,16 @@ impl Fleet<'_> {
                     self.crash(c)?;
                 }
                 std::thread::sleep(Duration::from_millis(rng.random_range(500..2000)));
+                // All nodes first: the markers need the lease, which a
+                // lone survivor cannot claim without its group.
                 for c in clients.iter_mut() {
-                    mount_live(c)?;
+                    mount_retrying(c)?;
                 }
                 let refs: Vec<&Client> = clients.iter().collect();
                 wait_for_p2p(&refs)?;
+                for c in clients.iter() {
+                    mark_alive(c)?;
+                }
                 format!("#{n} kill -9 of the whole cluster")
             }
             45..=59 => {
