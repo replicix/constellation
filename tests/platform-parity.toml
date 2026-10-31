@@ -136,6 +136,12 @@ outcome = "skipped"
 reason = "Not yet ported (F6): two pods on an RWX PV, a seeded change stream on one and ls -l/find -ls with an oracle on the other, and the pod's per-mount READDIRPLUS counters from the engine's node.status."
 
 [[expect]]
+scenario = "readdirplus-held-remote"
+lanes = ["linux-csi"]
+outcome = "skipped"
+reason = "Not yet ported (F6): two pods on an RWX PV, one changing names the other's kernel holds from lookups within the entry TTL, and the other pod's per-mount READDIRPLUS held/entries counters from the engine's node.status."
+
+[[expect]]
 scenario = "scratch-publish"
 lanes = ["linux-csi"]
 outcome = "skipped"

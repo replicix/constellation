@@ -1147,6 +1147,155 @@ pub fn orphan_forget(_seed: u64) -> Result<()> {
     r
 }
 
+// ------------------------------------------------ readdirplus-held-remote
+
+/// `(READDIRPLUS entries handed with attributes, entries handed name-only
+/// as held)` of a node's first mount so far.
+fn plus_and_held(c: &Client) -> Result<(u64, u64)> {
+    let m = mount_status(c)?;
+    Ok((
+        num(&m, "readdirplus_entries"),
+        m["readdirplus_name_only_why"]["held"].as_u64().unwrap_or(0),
+    ))
+}
+
+/// Plan 40 P9, the held names with a second node (review of the held
+/// change). Node A's kernel holds four names of a directory from lookups
+/// (they are listed within the entry TTL, so a plus page hands a held
+/// name name-only, reason `held`). Meanwhile node B, once the lookups are
+/// made, changes them: `chmod` of one (same inode and name), `unlink` and
+/// create of another (a new inode), and a rename away and back of a
+/// third (the same inode, but A's kernel was told to drop both names); the
+/// fourth is left alone. After A's view applies B's changes, A lists the
+/// directory:
+///
+/// - the left alone name and the `chmod`ed one are still held
+///   (name-only: the kernel keeps its dentry, and the attribute change
+///   reaches it by its own notification, as with a plain page);
+/// - the replaced name and the renamed one are handed with attributes: one
+///   leads to another inode now, the other's dentry was dropped;
+///
+/// and every name then answers what B made of it. Within the entry TTL
+/// of the lookups only: an attempt that is too slow for that (a loaded
+/// host) is made again, and the run needs one that was not.
+pub fn held_remote(_seed: u64) -> Result<()> {
+    const NAME: &str = "readdirplus-held-remote";
+    let mut fx = Fixture::new(NAME, &["a", "b"], &[], None, &[])?;
+    let r = (|| -> Result<()> {
+        let (a, b) = (&fx.clients[0], &fx.clients[1]);
+        let attempts = env_usize("READDIRPLUS_HELD_ATTEMPTS", 8);
+        // The hold of a lookup is 3/4 of the 1 s entry TTL; the listing
+        // must come well within it.
+        let window = Duration::from_millis(600);
+        let names = ["c", "k", "r", "t"];
+        let mut conforming = false;
+        let mut tally = Vec::new();
+        for n in 0..attempts {
+            let adir = a.mnt.join(format!("h{n}"));
+            let bdir = b.mnt.join(format!("h{n}"));
+            std::fs::create_dir(&adir)?;
+            for name in names {
+                std::fs::write(adir.join(name), name)?;
+            }
+            eventually("B lists the names", Duration::from_secs(60), || {
+                for name in names {
+                    ensure!(bdir.join(name).exists(), "{name} not yet");
+                }
+                Ok(())
+            })?;
+            // Past the holds of A's creates.
+            std::thread::sleep(Duration::from_millis(1500));
+            // B's own lookups first, so that its changes below send none.
+            for name in names {
+                std::fs::symlink_metadata(bdir.join(name))?;
+            }
+            let mut before = BTreeMap::new();
+            for name in names {
+                before.insert(name, std::fs::symlink_metadata(adir.join(name))?.ino());
+            }
+            let looked_up = std::time::Instant::now();
+            // B's changes.
+            std::fs::set_permissions(bdir.join("c"), std::fs::Permissions::from_mode(0o600))?;
+            std::fs::remove_file(bdir.join("r"))?;
+            std::fs::write(bdir.join("r"), b"")?;
+            std::fs::rename(bdir.join("t"), bdir.join("t2"))?;
+            std::fs::rename(bdir.join("t2"), bdir.join("t"))?;
+            let marker = format!("held-marker-{n}");
+            std::fs::write(b.mnt.join(&marker), b"")?;
+            // A has applied them once it sees the marker: polled tightly,
+            // by a name nothing else uses.
+            let seen = std::time::Instant::now();
+            while std::fs::symlink_metadata(a.mnt.join(&marker)).is_err() {
+                ensure!(
+                    seen.elapsed() < Duration::from_secs(60),
+                    "A never saw {marker}"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // The notifications that follow the applied changes are written
+            // by the notifier thread.
+            std::thread::sleep(Duration::from_millis(100));
+            let (e0, h0) = plus_and_held(a)?;
+            let late = looked_up.elapsed();
+            let mut listed: Vec<String> = std::fs::read_dir(&adir)?
+                .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
+                .collect::<std::io::Result<_>>()?;
+            listed.sort();
+            let (e1, h1) = plus_and_held(a)?;
+            let (entries, held) = (e1 - e0, h1 - h0);
+            ensure!(
+                listed == names,
+                "attempt {n}: A lists {listed:?}, want {names:?}"
+            );
+            // What B made of the names, as A's kernel answers it now (its
+            // attribute notification may be a moment behind the view).
+            let want_r = std::fs::symlink_metadata(bdir.join("r"))?.ino();
+            ensure!(
+                want_r != before["r"],
+                "attempt {n}: r kept its inode on B: no replacement"
+            );
+            eventually("A sees B's changes", Duration::from_secs(60), || {
+                let m = |name: &str| std::fs::symlink_metadata(adir.join(name));
+                ensure!(
+                    m("c")?.mode() & 0o777 == 0o600,
+                    "c has mode {:o}",
+                    m("c")?.mode() & 0o777
+                );
+                ensure!(m("r")?.ino() == want_r, "r still the old inode");
+                ensure!(m("t")?.ino() == before["t"], "t is another inode");
+                ensure!(m("k")?.ino() == before["k"], "k is another inode");
+                Ok(())
+            })?;
+            // The replaced name leads to another inode, so it is never
+            // held, whatever notice arrived.
+            ensure!(
+                entries >= 1,
+                "attempt {n}: the replaced name was not handed with attributes \
+                 (entries {entries}, held {held})"
+            );
+            let in_time = late < window;
+            eprintln!(
+                "    {NAME}: attempt {n}: listed {} ms after the lookups: entries {entries} held {held}{}",
+                late.as_millis(),
+                if in_time { "" } else { " (too late)" }
+            );
+            tally.push((late.as_millis(), entries, held));
+            if in_time && (entries, held) == (2, 2) {
+                conforming = true;
+                break;
+            }
+        }
+        ensure!(
+            conforming,
+            "no attempt in time listed exactly the replaced and the renamed names with \
+             attributes and held the other two: (ms, entries, held) {tally:?}"
+        );
+        Ok(())
+    })();
+    fx.unmount_all();
+    r
+}
+
 // ---------------------------------------------------- readdirplus-strict
 
 /// The directory listing of a path as names.

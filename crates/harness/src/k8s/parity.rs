@@ -638,6 +638,10 @@ pub const SKIPPED: &[(&str, Skip)] = &[
     ),
     ("readdirplus-local-appender", Skip::Local(&[WRITE_MODE])),
     ("readdirplus-orphan-forget", Skip::Local(&[HOLDS])),
+    (
+        "readdirplus-held-remote",
+        Skip::Unported("two nodes, one changing names the other's kernel holds from lookups within the entry TTL, and the other mount's node.status held/entries counters"),
+    ),
     ("readdirplus-strict", Skip::Local(&[CTO_STRICT, KILL])),
     ("readdirplus-handover", Skip::Local(&[UPGRADE])),
     ("readdir-huge-delete", Skip::Local(&[READDIR_KNOBS, WRITE_MODE])),

@@ -1700,6 +1700,13 @@ pub const SCENARIOS: &[Scenario] = &[
         run: readdirplus::orphan_forget,
     },
     Scenario {
+        name: "readdirplus-held-remote",
+        desc: "plan 40 P9 (review of the held names): node A's kernel holds four names from lookups; node B chmods one, replaces one (a new inode) and renames one away and back; A lists the directory within the entry TTL: the untouched and the chmoded name are handed name-only (held), the replaced and the renamed one with attributes, and every name answers what B made of it",
+        requires: &[],
+        caps: &[],
+        run: readdirplus::held_remote,
+    },
+    Scenario {
         name: "readdirplus-strict",
         desc: "plan 40 P9: --cto strict: a lone sequencer hands attributes with its plus pages; once a second node joins every plus entry is name-only (reason view) and cto-strict's visibility holds under ls -l loops; then the second node leaves and the restarted sequencer hands attributes again",
         requires: &[],
