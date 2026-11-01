@@ -193,7 +193,16 @@ impl ParkedWhat {
     /// forward's requester): it may not leave on a lone root's disk alone
     /// (`Core::park_durable`).
     pub(crate) fn to_remote(&self, me: NodeId) -> bool {
-        matches!(self, ParkedWhat::Reply { to, .. } if *to != me)
+        match self {
+            ParkedWhat::Reply { to, outcome, .. } => {
+                *to != me || *outcome == MutateOutcome::Abandoned
+            }
+            // Plan 43 C2g's review: a settle's refusal is answered once
+            // committed, also to this node's own client (never the lone
+            // shortcut: `Core::settle_refusal`).
+            ParkedWhat::Finish { outcome, .. } => *outcome == MutateOutcome::Abandoned,
+            _ => false,
+        }
     }
 }
 

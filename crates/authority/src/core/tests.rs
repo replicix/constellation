@@ -41277,6 +41277,70 @@ mod deleg_group {
         assert_eq!(h.core.stats.settled_local, 0);
     }
 
+    /// C2g's review, SHOULD 2: a lone delegate settling its own node's op
+    /// journals the refusal for the group, never `Lone`, and answers it once
+    /// the root's append holds it. Fails on the parent: journaled `Lone` and
+    /// answered at once.
+    #[test]
+    fn a_lone_delegates_own_settle_waits_for_its_group() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        assert!(h.core.deleg_lone(h.clk(), &h.core.dl.mine[&7]));
+        // A client op of this node, not executed anywhere yet (sent to the
+        // root for a name it owns), then settled here as the delegate.
+        let rid = h.rid(1);
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: h.create("elsewhere"),
+            tag: Default::default(),
+        });
+        let c = h.core.clients.get_mut(&rid).expect("in flight");
+        c.settle = true;
+        c.forwarded = true;
+        let op = MutateOp::Create {
+            parent: dir,
+            name: "s".into(),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let mut out = Vec::new();
+        let tag = Default::default();
+        let clk = h.clk();
+        assert!(h.core.delegate_try_execute(
+            clk,
+            0,
+            None,
+            rid,
+            &op,
+            constellation_meta::Position::ZERO,
+            0,
+            &tag,
+            true,
+            &h.meta,
+            &mut out,
+        ));
+        assert!(client_answers(&out).is_empty(), "answered alone: {out:?}");
+        assert_eq!(
+            h.meta.journal_classes_of_rid(rid).unwrap(),
+            vec![constellation_meta::RowClass::DelegGroup]
+        );
+        let (req, round, last) = batch(&out).expect("the refusal streams to the root");
+        let out = root_acks(&mut h, req, round, last);
+        assert!(
+            out.iter().any(|a| matches!(
+                a,
+                Action::Reply {
+                    rid: r,
+                    reply: ClientReply::Outcome(MutateOutcome::Abandoned),
+                    source: AnswerSource::Sequenced(AckClass::DelegGroup { gen: 7 }),
+                } if *r == rid
+            )),
+            "{out:?}"
+        );
+    }
+
     /// Lone: nobody within reach, no backup recorded. Its own client is
     /// answered from its disk (`Lone`), other nodes' forwards wait for the
     /// root. Not lone (the root within the budget): its own client waits for
@@ -49107,6 +49171,53 @@ mod c2g_settle {
             h.meta.lookup(dir, "late").unwrap().is_none(),
             "the delayed copy ran"
         );
+    }
+
+    /// C2g's review, SHOULD 2: a lone root settling its own node's op (its
+    /// lease path) journals the refusal `Archive`, never `Lone`, and answers
+    /// it once the log carries it. Fails on the parent: journaled `Lone`
+    /// and answered at once.
+    #[test]
+    fn a_lone_roots_own_settle_waits_for_the_archive() {
+        let mut h = Harness::new(1);
+        h.core.lease.cached_holder = Some(2);
+        let rid = h.rid(1);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: h.create("own"),
+            tag: Default::default(),
+        });
+        assert!(
+            sends(&out).iter().any(|(to, _)| *to == 2),
+            "forwarded: {out:?}"
+        );
+        // The op is lost on the way; this node becomes the root, lone.
+        h.hold(1, None);
+        h.core.ack.peers.clear();
+        h.core.ack.candidate = None;
+        h.core.ack.eligible = Some(false);
+        assert!(h.core.root_lone());
+        let deadline = h.core.clients[&rid].deadline;
+        let out = h.step(Event::Timer { id: deadline });
+        assert!(replies(&out).is_empty(), "answered alone: {out:?}");
+        assert_eq!(
+            h.meta.journal_classes_of_rid(rid).unwrap(),
+            vec![constellation_meta::RowClass::Archive]
+        );
+        let out = h.archive_lands();
+        assert!(
+            out.iter().any(|a| matches!(
+                a,
+                Action::Reply {
+                    rid: r,
+                    reply: ClientReply::Outcome(MutateOutcome::Abandoned),
+                    source: crate::AnswerSource::Sequenced(AckClass::Archive),
+                } if *r == rid
+            )),
+            "{out:?}"
+        );
+        assert!(h.meta.lookup(ROOT_INO, "own").unwrap().is_none());
     }
 
     /// The inbox drain settles like a forward: a settle op with no outcome is

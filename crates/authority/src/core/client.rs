@@ -2181,6 +2181,40 @@ impl Core {
             (c.forwarded || c.attempts > 0 || c.settle, c.settle)
         });
         if in_doubt {
+            if let Some(outcome) =
+                completed_as_outcome(replica, rid, epoch).filter(|o| *o == MutateOutcome::Abandoned)
+            {
+                // The rid's settle refusal (an earlier settle of it here): it
+                // is answered once committed, as when it was journaled — never
+                // re-tagged `Lone` for this node's own client
+                // (`Core::settle_refusal`).
+                self.stats.forward_indoubt_resolved += 1;
+                let position = Position {
+                    seq: self.ship.head_seq,
+                    pending: replica.journal_position(epoch),
+                    streams: Default::default(),
+                };
+                let class = if replica.outcome_from_log(rid) {
+                    Ok(AckClass::Archive)
+                } else {
+                    self.journaled_answer_class_for(replica, rid, super::Asker::Remote)
+                };
+                let (outcome, class) = Self::eio_unless_recorded(outcome, class, AckClass::Lone);
+                if !replica.outcome_from_log(rid) {
+                    let shipped = replica.journal_acked_seq().unwrap_or(0);
+                    if let Some(need) =
+                        self.answer_need(&position, class, super::Asker::Remote, shipped)
+                    {
+                        self.rd
+                            .parked_local
+                            .insert(rid, (Default::default(), Some(need)));
+                    }
+                }
+                if let Some(c) = self.clients.get_mut(&rid) {
+                    c.answered_by = Some(AnswerSource::Sequenced(class));
+                }
+                return outcome;
+            }
             if let Some(outcome) = completed_as_outcome(replica, rid, epoch) {
                 self.stats.forward_indoubt_resolved += 1;
                 // Plan 30 §M9: a completion found in this node's own
@@ -2380,7 +2414,15 @@ impl Core {
             pending: replica.journal_position(epoch),
             streams: Default::default(),
         };
-        let durable = self.ack_need(&position);
+        // (A settle's refusal waits for its commit like another node's
+        // answer: never the lone shortcut, `settle_refusal`.)
+        let durable = if settle {
+            let shipped = replica.journal_acked_seq().unwrap_or(0);
+            let class = self.root_ack_class_for(super::Asker::Remote);
+            self.answer_need(&position, class, super::Asker::Remote, shipped)
+        } else {
+            self.ack_need(&position)
+        };
         let (outcome, wait) = outcome;
         if wait.is_some() || durable.is_some() {
             self.rd

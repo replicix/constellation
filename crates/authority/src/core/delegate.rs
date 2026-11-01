@@ -1769,7 +1769,10 @@ impl Core {
         // now waits for, by who is asked; set for the journaling below (the
         // row's class is fixed there) and for the answer after it.
         let asker = if from == 0 { Asker::Own } else { Asker::Remote };
-        let mut class = self.deleg_ack_class(now, gen, asker, replica);
+        // (A settle's refusal is never `Lone`: it waits for the group, also
+        // for this node's own client — see `Core::settle_refusal`.)
+        let class_asker = if settle { Asker::Remote } else { asker };
+        let mut class = self.deleg_ack_class(now, gen, class_asker, replica);
         let dedup = replica.recent_outcome(rid).is_some()
             || replica.completed_outcome(rid).ok().flatten().is_some();
         if dedup {

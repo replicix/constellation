@@ -900,11 +900,18 @@ impl Core {
     /// it before anything executes there (the takeover gate), and an
     /// unjournaled settle (the journal write failed) is answered `Busy`
     /// (the requester retries the settle).
+    ///
+    /// Never `Lone`, whoever asks (plan 43 C2g's review): a settled `EIO`
+    /// promises the op never takes effect, which a refusal resting on this
+    /// disk alone cannot promise (a deposition rolls it back). The row is
+    /// journaled with the class another node's answer would get — a lone
+    /// root's is `Archive` — and its answer waits for that commit, also to
+    /// this node's own client (`ParkedWhat::to_remote`).
     pub(crate) fn settle_refusal(
         &mut self,
         rid: Rid,
         op: Option<&MutateOp>,
-        asker: super::Asker,
+        _asker: super::Asker,
         replica: &dyn Replica,
     ) -> MutateOutcome {
         tracing::debug!(
@@ -912,7 +919,8 @@ impl Core {
             ?rid,
             "settle: no outcome here; refused for good"
         );
-        if !self.record_refusal(rid, super::client::ABANDONED_CODE, op, asker, replica) {
+        let committed = super::Asker::Remote;
+        if !self.record_refusal(rid, super::client::ABANDONED_CODE, op, committed, replica) {
             return MutateOutcome::Busy;
         }
         self.stats.settles_refused += 1;
