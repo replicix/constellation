@@ -844,6 +844,39 @@ impl Core {
     /// the write delegations first, or waits for `deps`); the requester
     /// is answered `Held` before its RPC times out and re-attaches.
     #[allow(clippy::type_complexity)]
+    /// Plan 46 M0.2 (R4): `rid`'s answer, executed here and parked for
+    /// durability, belongs to a row `repair drop-held` rolled back (its
+    /// placeholder is queued): it can never be given. Answered `Busy` now
+    /// — C2f's abort, which waited for the log to pass the row's journal
+    /// seq (the next ship round, up to the idle backoff) — so the
+    /// requester retries at once, to the placeholder's place.
+    pub(crate) fn abort_parked_answer_of(
+        &mut self,
+        now: Now,
+        rid: Rid,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(&id) = self.rd.parked_rids.get(&rid) else {
+            return;
+        };
+        if !matches!(
+            self.rd.parked.get(&id),
+            Some(Parked {
+                durable: Some(_),
+                what: ParkedWhat::Reply {
+                    completed: Some(_),
+                    ..
+                },
+                ..
+            })
+        ) {
+            return;
+        }
+        self.stats.acks_row_gone += 1;
+        self.abort_park_busy(now, id, replica, out);
+    }
+
     /// Whether an op is parked behind the replay queue (plan 46 M0.2, R3).
     pub(crate) fn queue_parks(&self) -> bool {
         self.rd.parked.values().any(|p| p.queue_gated)

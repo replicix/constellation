@@ -204,6 +204,9 @@ impl Core {
             if let Some(placeholder) = &head.await_retry {
                 if !self.resolve_placeholder(head, replica) {
                     absorb_keys(&mut behind, &placeholder.keys);
+                    // (R4: an answer parked for the dropped row is aborted
+                    // now, and its requester retries.)
+                    self.abort_parked_answer_of(now, head.rid, replica, out);
                 }
                 continue;
             }

@@ -49939,4 +49939,58 @@ mod await_retry {
         assert!(h.meta.lookup(ROOT_INO, "a").unwrap().is_none());
         assert_eq!(queue(&h).len(), 1, "{:?}", queue(&h));
     }
+
+    /// R4: the requester of a dropped row is told at once. Its answer was
+    /// parked for the archive (the row never reached it); the drop rolled
+    /// the row back, so the answer is aborted — `Busy`, C2f's rule — and
+    /// the requester retries by rid, to the placeholder's place. Without
+    /// the abort the retry's reattachment waited for a ship round to pass
+    /// the row's journal seq.
+    #[test]
+    fn a_parked_answer_of_a_dropped_row_is_aborted_and_the_retry_arrives() {
+        let (mut h, broken) = holder_with_a_seed();
+        let p = rid_of(2, 1);
+        // Executed, its answer parked for the archive (not archived here).
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(60),
+                rid: p,
+                op: rename_in_root("broken", "moved"),
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+                settle: false,
+            },
+        });
+        assert_eq!(
+            reply_to(&out, 60),
+            None,
+            "the answer waits for the archive: {out:?}"
+        );
+        assert_eq!(h.core.parked_durable_count(), 1);
+        drop_held(&h, broken);
+        assert!(queue(&h).contains(&(2, 1, true)));
+
+        // The drain finds the placeholder's answer parked: aborted.
+        h.advance(250);
+        let out = drain(&mut h);
+        assert_eq!(
+            reply_to(&out, 60),
+            Some(MutateOutcome::Busy),
+            "the requester is told to retry: {out:?}"
+        );
+        assert_eq!(h.core.parked_durable_count(), 0);
+        assert_eq!(h.core.stats.acks_row_gone, 1);
+
+        // Its retry executes in the dropped row's place.
+        let out = forward_of(&mut h, 2, 61, p, &rename_in_root("broken", "moved"));
+        assert!(
+            matches!(reply_to(&out, 61), Some(MutateOutcome::Accepted { .. })),
+            "{out:?}"
+        );
+        assert!(h.meta.lookup(ROOT_INO, "moved").unwrap().is_some());
+        assert!(queue(&h).iter().all(|(n, _, _)| *n != 2), "{:?}", queue(&h));
+    }
 }
