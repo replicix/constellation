@@ -63466,3 +63466,40 @@ simulation's 3 s window (the `-lr` variants, `delegated-holder-cut`, `long-deleg
 fmt, clippy `-D warnings` (workspace); authority lib 880 and `meta_repro` 4, meta (lib 382 and the rest), engine
 940, control 146 (schema re-blessed), net 126, store-s3 237, model (release); release sim suite 302 passed / 11
 ignored.
+
+### Review round (2026-11-01)
+
+Rebased on 733c16e (docs only). Nothing at MUST; SHOULD 1 blocking. New commits, each with its fail-before test
+(the five fail on the previous tip, pass now):
+
+- **SHOULD 1**, an `EIO` for an op that took effect: the deadline settled an own op "that never left this node"
+  locally although it had executed here — `abort_park_busy` re-routed an executed op parked for its delegate group
+  without marking it in doubt, and a system op's lease path raises no attempt. The abort marks it in doubt, and the
+  deadline also requires no row of the rid here (`an_executed_own_op_whose_park_was_aborted_is_not_settled_locally`).
+- **SHOULD 2**, a settled `EIO` resting on one disk: a settle of this node's own op journaled its refusal `Lone`
+  (a lone root's lease path, a lone delegate) and answered at once. The refusal now takes another node's class (a
+  lone root's `Archive`, the delegate's group) and its answer waits for that commit, also to the own client
+  (`a_lone_roots_own_settle_waits_for_the_archive`, `a_lone_delegates_own_settle_waits_for_its_group`).
+- **SHOULD 3**: a lost dependency was answered `Held` with no generation by any node; only the root answers so now
+  (`a_non_root_answers_a_lost_dependency_not_held`).
+- **SHOULD 4**: a system op gave up in doubt, unsettled and uncounted (lease lost at submission, its one
+  acquisition failed); it is settled like a client's (`a_system_op_is_settled_not_answered_in_doubt`).
+- Nits: the settle's route in `submit`'s order; the model's abandon test first finds the knob-off counterexample
+  under its bounds; a genuine re-stream is still asserted — `delegated_two_generations_re_stream_after_a_root_failover`
+  (sim suite, gated; seed 32: node 3 takes the lease at epoch 2 and delegate 2 re-streams both generations to it)
+  and the core's `a_late_stream_ack_from_an_earlier_tenure_of_the_same_root_is_not_credited`.
+- The simulation's settle window is half the lease TTL (as production's 30 s of 60 s) unless a configuration
+  sets one: unchanged at the default 6 s TTL, 6 s (half the 12 s deadline) for the 30 s-TTL configurations. A
+  mutant-dating pin moved (`a_proof_dated_at_the_return_of_the_read_is_caught`: 247, 373 for 28, 117).
+
+Sweeps (0..1,999, `shared-dir*` 0..499, with and without the lease-read knob): failing seeds as main (`long-backup`
+743 only); settled landings 0 everywhere. `long-delegated-late-answers+settle` fails 48 seeds (`-lr` 137), every
+one an unsettled `EIO` landing late (`I4 unacked_fails_never_lands_late`), none a settled one. Unsettled `EIO`s per
+2,000 seeds are unchanged by the window (it is still 3 s at the 6 s TTL): `long-delegated-late-answers` 1,446
+(`-lr` 3,267), `delegated-holder-cut` 1,053 (2,071), `long-delegated-backup` 1,022 (2,108), `long-delegated` 15
+(109), `delegated-long-delegation` 3,822 (4,137; its late landings 460 → 30/64 with the 6 s window), `-prod` 0. They
+are ops whose sequencer the faults keep out of reach longer than half a TTL; C2h's strict I4 needs either those
+classified as isolated requesters or faults bounded relative to the window.
+
+Gates: fmt, clippy `-D warnings`; authority lib 885 and `meta_repro` 4, meta 382 and the rest, engine 940, control
+146, net 126, store-s3 237, model `today_bugs` (release); release sim suite 302 passed / 11 ignored.

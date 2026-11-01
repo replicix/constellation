@@ -2017,7 +2017,11 @@ root's restart). *C2f follow-ups*: `durable_lone_ok` Release/Acquire;
 `repair reintegrate` clears the holder epoch; the refusal nudge restored
 (its sweeps in PROGRESS). Not here: `strict_settle` on every configuration
 and the ledger's late allowance (C2h, plan 46 M0.1's exit), the harness
-scenario.
+scenario. *Review round (2026-11-01)*: an own op executed here is never settled
+locally as if it had not left; a settle's refusal is never `Lone` and is
+answered once committed, also to the own client; only the root answers a
+lost dependency `Held`; a system op is settled; the simulation's window is
+half its TTL, as production's.
 
 ### C3 — Verbatim re-ship; no re-execution of a committed row
 
