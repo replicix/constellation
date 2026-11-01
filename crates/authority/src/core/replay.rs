@@ -180,14 +180,33 @@ impl Core {
             self.replay.stuck_since = None;
             return;
         }
+        // The keys of the entries left behind so far (plan 46 M0.2, R2): a
+        // placeholder whose requester's retry has not executed, and every
+        // entry held behind one. The queue runs in order, but only on a
+        // shared key: an entry on other keys commutes with them.
+        let mut behind = constellation_meta::TouchSet::default();
         for head in &queued {
             if self.drop_retired_origin(head, replica) {
                 continue;
             }
-            // Plan 46 M0.2 (R1): a placeholder (`repair drop-held` rolled
-            // back another node's unanswered row) is no op to run: its
-            // requester's retry is the one copy.
-            if head.is_await_retry() {
+            // Plan 46 M0.2 (R1, R2): a placeholder (`repair drop-held`
+            // rolled back another node's unanswered row) is no op to run:
+            // its requester's retry is the one copy. Done once its rid has
+            // an outcome here; until then it holds the later entries on its
+            // keys.
+            if let Some(placeholder) = &head.await_retry {
+                if !self.resolve_placeholder(head, replica) {
+                    absorb_keys(&mut behind, &placeholder.keys);
+                }
+                continue;
+            }
+            // Behind a placeholder on a shared key: the dependents of a
+            // row wait for its retry, so they run on the state it leaves
+            // (not on one without it, ahead of it). An entry the log has
+            // settled is not held: it is forgotten below.
+            if head.refused.is_none() && overlaps_queue_keys(&behind, head, replica) {
+                absorb_keys(&mut behind, &entry_keys(head, replica));
+                self.stats.replays_held_for_placeholder += 1;
                 continue;
             }
             // The fold: a size-only truncate with a manifest commit of the
@@ -334,6 +353,53 @@ impl Core {
                 out,
             );
             return;
+        }
+    }
+
+    /// Plan 46 M0.2 (R2): a placeholder (`StrandedOp::await_retry`) whose
+    /// rid has an outcome here is done — its requester's retry executed
+    /// (or was refused), or the rid was settled — and is forgotten.
+    /// `true`: forgotten. A settle this node journaled itself
+    /// (`Refused { rid, ABANDONED }`) is an outcome once its row is
+    /// committed, like any refusal's answer: until then the placeholder
+    /// keeps its place (a deposition that rolled the row back would leave
+    /// the rid unowned with its dependents already run).
+    pub(crate) fn resolve_placeholder(
+        &mut self,
+        entry: &StrandedOp,
+        replica: &dyn Replica,
+    ) -> bool {
+        let Some(outcome) = completed_as_outcome(replica, entry.rid, 0)
+            .filter(|_| self.completed_row_settled(entry.rid, replica))
+        else {
+            return false;
+        };
+        if matches!(outcome, MutateOutcome::Abandoned)
+            && self.outcome_uncommitted(entry.rid, replica)
+        {
+            return false;
+        }
+        tracing::info!(
+            node = self.cfg.node_id,
+            rid = ?entry.rid,
+            ?outcome,
+            "a dropped row's placeholder is resolved: its rid has an outcome"
+        );
+        self.stats.await_retry_resolved += 1;
+        let _ = replica.forget_replay(entry.queue_seq);
+        true
+    }
+
+    /// Whether `rid`'s `completed` row is this node's own journal row
+    /// that its commit point (the group or the archive, as for a remote
+    /// asker) does not hold yet.
+    fn outcome_uncommitted(&self, rid: Rid, replica: &dyn Replica) -> bool {
+        match replica.outcome_row(rid) {
+            Some(row) if row.gen == 0 => {
+                let shipped = replica.journal_acked_seq().unwrap_or(0);
+                !self.park_durable(row.jseq, true, shipped)
+            }
+            _ => false,
         }
     }
 
@@ -645,6 +711,15 @@ impl Core {
         // overlap with a union is an overlap with one of its sets).
         let mut held_keys = constellation_meta::TouchSet::default();
         for queued in &queue {
+            // Plan 46 M0.2 (R1, R2): a placeholder is no op to run here
+            // either; until its rid has an outcome it holds the later
+            // entries on its keys, which the drain runs after it.
+            if let Some(placeholder) = &queued.await_retry {
+                if !self.resolve_placeholder(queued, replica) {
+                    absorb_keys(&mut held_keys, &placeholder.keys);
+                }
+                continue;
+            }
             // The entry's own keys (a folded truncate's too, whatever it
             // replays as), with the inode it creates: a later entry in a
             // directory, or on a file, that a held entry creates runs after
@@ -723,10 +798,7 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> Result<(), constellation_meta::MetaError> {
-        if queued.refused.is_some()
-            || queued.is_await_retry()
-            || self.drop_retired_origin(queued, replica)
-        {
+        if queued.refused.is_some() || self.drop_retired_origin(queued, replica) {
             return Ok(());
         }
         // Per-key order: behind an earlier entry left to the drain, the
@@ -900,15 +972,50 @@ impl Held<'_> {
     /// for it.
     fn hold(&mut self) {
         let keys = std::mem::take(&mut self.keys);
-        self.held.dentries.extend(keys.dentries);
-        self.held.inos.extend(keys.inos);
-        self.held.shared.extend(keys.shared);
+        absorb_keys(self.held, &keys);
     }
+}
+
+/// `into` plus `keys` (an overlap with the union is an overlap with one
+/// of its sets).
+fn absorb_keys(into: &mut constellation_meta::TouchSet, keys: &constellation_meta::TouchSet) {
+    into.dentries.extend(keys.dentries.iter().cloned());
+    into.inos.extend(keys.inos.iter().copied());
+    into.shared.extend(keys.shared.iter().copied());
+}
+
+/// The keys a queue entry touches: a placeholder's own, else its op's
+/// (with the inode it creates: a later entry in a directory, or on a file,
+/// that a queued entry creates runs after it).
+pub(super) fn entry_keys(
+    entry: &StrandedOp,
+    replica: &dyn Replica,
+) -> constellation_meta::TouchSet {
+    if let Some(placeholder) = &entry.await_retry {
+        return placeholder.keys.clone();
+    }
+    let mut keys = super::client::conflict_keys(&entry.op, replica);
+    keys.inos.extend(created_ino(&entry.op));
+    keys
+}
+
+/// Whether `entry` shares a key with `behind` and is not already settled
+/// in the log (a settled entry is forgotten, not held).
+fn overlaps_queue_keys(
+    behind: &constellation_meta::TouchSet,
+    entry: &StrandedOp,
+    replica: &dyn Replica,
+) -> bool {
+    if behind.dentries.is_empty() && behind.inos.is_empty() && behind.shared.is_empty() {
+        return false;
+    }
+    behind.overlaps(&entry_keys(entry, replica))
+        && completed_as_outcome(replica, entry.rid, 0).is_none()
 }
 
 /// The inode `op` creates (its new name's): the op form names it, but its
 /// keys leave it out (`TouchSet::from_op`; the `Records` form counts it).
-fn created_ino(op: &MutateOp) -> Option<constellation_fs_core::Ino> {
+pub(super) fn created_ino(op: &MutateOp) -> Option<constellation_fs_core::Ino> {
     match op {
         MutateOp::Create { ino, .. }
         | MutateOp::Mkdir { ino, .. }

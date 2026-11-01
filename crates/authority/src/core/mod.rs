@@ -1092,6 +1092,17 @@ pub struct Stats {
     /// Phase 2b round 2: drain ticks that held a delegate-accepted
     /// shadow's replay while its generation was live.
     pub replays_held_for_stream: u64,
+    /// Plan 46 M0.2 (C2g′), the replay queue's placeholders
+    /// (`StrandedOp::await_retry`: another node's row `repair drop-held`
+    /// rolled back, awaiting its requester's retry): entries held behind
+    /// one by the drain (R2) and ops parked behind an entry of the queue
+    /// ahead of them (R3); placeholders resolved because their rid has an
+    /// outcome (the retry executed, or it was settled) and settled by the
+    /// bound (`drop_held_await_ms`, R5: `status.ack.await_retry_settled`).
+    pub replays_held_for_placeholder: u64,
+    pub ops_parked_behind_queue: u64,
+    pub await_retry_resolved: u64,
+    pub await_retry_settled: u64,
     /// Phase 2b: stream batches, backup appends re-sent after a lost
     /// answer.
     pub deleg_stream_timeouts: u64,

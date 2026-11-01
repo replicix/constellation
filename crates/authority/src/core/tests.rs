@@ -49564,6 +49564,82 @@ mod await_retry {
         out
     }
 
+    pub(super) fn create_in(parent: Ino, name: &str, ino: Ino) -> MutateOp {
+        MutateOp::Create {
+            parent,
+            name: name.into(),
+            ino,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        }
+    }
+
+    pub(super) fn rename_in_root(from: &str, to: &str) -> MutateOp {
+        MutateOp::Rename {
+            parent: ROOT_INO,
+            name: from.into(),
+            new_parent: ROOT_INO,
+            new_name: to.into(),
+            noreplace: false,
+        }
+    }
+
+    pub(super) fn unlink_in_root(name: &str) -> MutateOp {
+        MutateOp::Unlink {
+            parent: ROOT_INO,
+            name: name.into(),
+        }
+    }
+
+    /// `rid`'s forward to the holder, as its requester's retry sends it.
+    pub(super) fn forward_of(
+        h: &mut Harness,
+        from: NodeId,
+        req: u64,
+        rid: Rid,
+        op: &MutateOp,
+    ) -> Vec<Action> {
+        h.step_archived(Event::Peer {
+            from,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(req),
+                rid,
+                op: op.clone(),
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+                settle: false,
+            },
+        })
+    }
+
+    /// The outcome the reply to forward `req` carries, if one was sent.
+    pub(super) fn reply_to(out: &[Action], req: u64) -> Option<MutateOutcome> {
+        out.iter().find_map(|a| match a {
+            Action::Send {
+                msg:
+                    PeerMsg::MutateReply {
+                        req: r, outcome, ..
+                    },
+                ..
+            } if *r == OpId(req) => Some(outcome.clone()),
+            _ => None,
+        })
+    }
+
+    /// `n` drain ticks, 250 ms apart (the executions the drain starts
+    /// finish in the same step, on a holder).
+    pub(super) fn ticks(h: &mut Harness, n: usize) {
+        for _ in 0..n {
+            h.advance(250);
+            drain(h);
+            // (The answers that wait for the archive leave when it lands.)
+            h.archive_lands();
+        }
+    }
+
     /// R1: the placeholder is no copy of its op. The drain does not
     /// execute it, whatever the lease: its rid has no outcome after a
     /// tick, nor after the takeover gate's local replay; its op is not
@@ -49599,5 +49675,113 @@ mod await_retry {
             "the takeover gate executed it"
         );
         assert!(queue(&h).contains(&(2, 1, true)), "it keeps its place");
+    }
+
+    /// R2: the drain stops at a placeholder. The entries on its keys wait
+    /// for its requester's retry, so they run on the state it leaves, not
+    /// on one without it and ahead of it; the entries on other keys run.
+    #[test]
+    fn the_drain_holds_dependents_behind_a_placeholder() {
+        let (mut h, broken) = holder_with_a_seed();
+        let ino_z = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let p = rid_of(2, 1);
+        let (e, d) = (rid_of(1, 6), rid_of(1, 7));
+        // The remote rename of the poisoned file, then this node's own
+        // create of an unrelated name (a dependent by the directory's
+        // inode, on other keys) and its unlink of the renamed name (on the
+        // rename's).
+        exec_as(&h, RowClass::Archive, p, &rename_in_root("broken", "moved"));
+        exec_as(&h, RowClass::Lone, e, &create_in(ROOT_INO, "z", ino_z));
+        exec_as(&h, RowClass::Lone, d, &unlink_in_root("moved"));
+        drop_held(&h, broken);
+        assert_eq!(
+            queue(&h),
+            vec![
+                (1, h.meta.pending_replays().unwrap()[0].rid.seq, false),
+                (2, 1, true),
+                (1, 6, false),
+                (1, 7, false)
+            ]
+        );
+
+        // The drain: the unrelated create runs; the unlink waits behind the
+        // placeholder, however many ticks pass.
+        ticks(&mut h, 4);
+        assert!(
+            h.meta.lookup(ROOT_INO, "z").unwrap().is_some(),
+            "the unrelated entry runs"
+        );
+        assert_eq!(
+            h.meta.completed_outcome(d).unwrap(),
+            None,
+            "the dependent ran ahead of the placeholder it depends on"
+        );
+        assert!(queue(&h).contains(&(1, 7, false)) && queue(&h).contains(&(2, 1, true)));
+        assert!(h.core.stats.replays_held_for_placeholder > 0);
+
+        // The requester's retry executes where the row stood ...
+        let out = forward_of(&mut h, 2, 9, p, &rename_in_root("broken", "moved"));
+        assert!(
+            matches!(reply_to(&out, 9), Some(MutateOutcome::Accepted { .. })),
+            "{out:?}"
+        );
+        // ... and the dependent follows: the unlink removes what the rename
+        // named.
+        ticks(&mut h, 4);
+        assert!(
+            h.meta.completed_outcome(d).unwrap().is_some(),
+            "{:?}",
+            queue(&h)
+        );
+        assert!(
+            h.meta.lookup(ROOT_INO, "moved").unwrap().is_none(),
+            "the unlink ran before the rename, or not at all"
+        );
+        assert!(h.meta.lookup(ROOT_INO, "broken").unwrap().is_none());
+        assert_eq!(h.core.stats.replay_conflicts, 0, "no conflict copy");
+        assert!(
+            queue(&h).iter().all(|(n, _, _)| *n != 2),
+            "the placeholder is gone: {:?}",
+            queue(&h)
+        );
+    }
+
+    /// R2 at the takeover gate: its local replay leaves the placeholder's
+    /// dependents queued for the drain, as it leaves any entry it cannot
+    /// run, and runs the entries on other keys.
+    #[test]
+    fn the_takeover_gate_holds_dependents_behind_a_placeholder() {
+        let (mut h, broken) = holder_with_a_seed();
+        let ino_z = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let (p, e, d) = (rid_of(2, 1), rid_of(1, 6), rid_of(1, 7));
+        exec_as(&h, RowClass::Archive, p, &rename_in_root("broken", "moved"));
+        exec_as(&h, RowClass::Lone, e, &create_in(ROOT_INO, "z", ino_z));
+        exec_as(&h, RowClass::Lone, d, &unlink_in_root("moved"));
+        drop_held(&h, broken);
+
+        let mut out = Vec::new();
+        h.core
+            .replay_queue_locally(h.clk(), &h.meta, &mut out)
+            .unwrap();
+        assert!(
+            h.meta.lookup(ROOT_INO, "z").unwrap().is_some(),
+            "the unrelated entry runs"
+        );
+        assert_eq!(
+            h.meta.completed_outcome(d).unwrap(),
+            None,
+            "the gate ran a dependent ahead of the placeholder it depends on"
+        );
+        assert!(queue(&h).contains(&(1, 7, false)) && queue(&h).contains(&(2, 1, true)));
+
+        // The retry executed (here, by the gate's own owner): the next pass
+        // forgets the placeholder and runs the dependent.
+        forward_of(&mut h, 2, 9, p, &rename_in_root("broken", "moved"));
+        h.core
+            .replay_queue_locally(h.clk(), &h.meta, &mut out)
+            .unwrap();
+        assert!(h.meta.completed_outcome(d).unwrap().is_some());
+        assert!(h.meta.lookup(ROOT_INO, "moved").unwrap().is_none());
+        assert!(queue(&h).iter().all(|(n, _, _)| *n != 2));
     }
 }
