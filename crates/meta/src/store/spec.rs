@@ -321,14 +321,30 @@ impl LiveEntry {
     /// gate's own rule, [`LiveEntry::stranded_by_abandon`] the operator's).
     fn stranded_by(&self, epoch: u64) -> bool {
         match self {
-            LiveEntry::Local { epoch: 0, .. } => false,
-            LiveEntry::Local { gen, .. } if *gen != 0 => false,
-            // Plan 46 M0.2 (R7): an uncommitted answer of a non-stealable
-            // sequencer is its owner's to replay, not this node's.
+            // Plan 46 M0.2 (R7): another node's takeover (a tailed segment
+            // of a later epoch) does not strand an uncommitted answer of a
+            // non-stealable sequencer: it is its owner's to replay, and the
+            // shadow retires by the rid's outcome in the log.
             LiveEntry::Shadow {
                 non_stealable: true,
                 ..
             } => false,
+            _ => self.stranded_by_takeover(epoch),
+        }
+    }
+
+    /// [`Self::stranded_by`] for this node's own takeover (the gate, a
+    /// deposition's recovery, the drain's leftovers): the replica must be
+    /// the log prefix before this node sequences, so a non-stealable
+    /// shadow is rolled back and replayed like any other (R7 keeps it only
+    /// for a takeover by another node: a holder that evaluated new ops on
+    /// the phantom effect of an answer its predecessor's lost journal
+    /// never carried would log them where the spec refuses them —
+    /// `flex-tight` seed 188 under the lease-read knob).
+    fn stranded_by_takeover(&self, epoch: u64) -> bool {
+        match self {
+            LiveEntry::Local { epoch: 0, .. } => false,
+            LiveEntry::Local { gen, .. } if *gen != 0 => false,
             entry if entry.gated() => false,
             entry => entry.epoch() < epoch,
         }
@@ -4760,7 +4776,7 @@ impl Meta {
             &mut tx,
             self,
             &staged,
-            |entry| entry.stranded_by(epoch),
+            |entry| entry.stranded_by_takeover(epoch),
             true,
             false,
             |_| false,
@@ -4861,7 +4877,7 @@ impl Meta {
             self,
             &staged,
             |entry| {
-                entry.stranded_by(epoch)
+                entry.stranded_by_takeover(epoch)
                     || own(entry).is_some()
                     || entry.superseded_by_takeover(epoch, carried)
                     || abandons(entry)

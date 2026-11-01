@@ -3388,6 +3388,7 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 note(format!("t={} crash-non-holder: no such node", fault.at_ms));
                 return;
             };
+            let world = cluster.env.world.clone();
             Box::pin(run_fault(
                 cluster,
                 ScheduledFault {
@@ -3401,6 +3402,11 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 log.clone(),
             ))
             .await;
+            if restart_ms.is_none() {
+                // Gone for good, its dirty chunks with it: what the
+                // operator concludes from `status` (`operator_drop_hopeless`).
+                world.gone.lock().unwrap().insert(node);
+            }
         }
         FaultKind::LoseDirtyChunks { node } => {
             let node = if node == 0 {

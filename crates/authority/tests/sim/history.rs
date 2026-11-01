@@ -509,6 +509,11 @@ pub fn witness_order(
     out
 }
 
+/// The most tentative ops (invoked before a refusal returned) the witnessed
+/// check tries every subset of when it explains a refusal by tentative
+/// effects.
+const TENTATIVE_SUBSET_MAX: usize = 14;
+
 /// Linearizability with the log as the witness. Every op that took effect
 /// has a `Completed { rid }` at one log position, and the log is the
 /// holder's execution order, so the successes' linearization order is
@@ -631,9 +636,9 @@ pub fn check_linearizable_witnessed(
         }
         // Tentative effects the holder may have shown this op before they
         // were rolled back: every tentative op invoked before it returned,
-        // in invocation order, alone, together, or as a prefix of that
-        // order (a chain: an op acked on top of another's unshipped effect,
-        // and a later one the holder had not executed yet when it refused).
+        // in invocation order, alone, together, or any subset of them (a
+        // chain: an op acked on top of another's unshipped effect, and later
+        // ones the holder had not executed yet when it refused).
         let mut early: Vec<(usize, &NsOp)> = invoke_at
             .iter()
             .filter(|(t, (inv_t, _))| tentative.contains(*t) && inv_t < ret_i)
@@ -648,19 +653,28 @@ pub fn check_linearizable_witnessed(
                 }
                 st.is_valid_step(op, ret)
             };
-            let prefix = || {
-                let mut st = states[i].clone();
-                early.iter().any(|(_, t)| {
-                    st.invoke(t);
-                    st.clone().is_valid_step(op, ret)
-                })
+            // A subset, in invocation order: the holder executed the ones
+            // it had when it refused, and not the ones that reached it
+            // later (a forward invoked early, executed late). A few
+            // tentative ops at most in practice; a long list keeps the
+            // cheaper tries above.
+            let subset = || {
+                early.len() <= TENTATIVE_SUBSET_MAX
+                    && (1u32..(1u32 << early.len())).any(|mask| {
+                        let mut st = states[i].clone();
+                        for (k, (_, t)) in early.iter().enumerate() {
+                            if mask & (1 << k) != 0 {
+                                st.invoke(t);
+                            }
+                        }
+                        st.is_valid_step(op, ret)
+                    })
             };
-            all || prefix()
-                || early.iter().any(|(_, t)| {
-                    let mut st = states[i].clone();
-                    st.invoke(t);
-                    st.is_valid_step(op, ret)
-                })
+            all || early.iter().any(|(_, t)| {
+                let mut st = states[i].clone();
+                st.invoke(t);
+                st.is_valid_step(op, ret)
+            }) || subset()
         });
         if explained {
             witness.observed_tentative += 1;
@@ -953,14 +967,15 @@ mod tests {
     }
 
     /// A chain of tentative effects (plan 46 M0.2's `drop-held-chain`
-    /// seed 66): t1's create of `f3` is acked and rolled back, t2's rename
-    /// of it to `f2` is acked on top of it and rolled back too, and a
-    /// rename of `f2` back (t3) had not run yet when t4's create of `f2`
-    /// was refused on the strength of the first two. Neither all of them
-    /// together nor any one alone shows `f2`; the first two (a prefix of
-    /// their invocation order) do.
+    /// seeds 66 and 993): t1's create of `f3` is acked and rolled back,
+    /// t2's rename of it to `f2` is acked on top of it and rolled back too,
+    /// and a rename of `f2` back (t3) had not run yet when t4's create of
+    /// `f2` was refused on the strength of the first two. Neither all of
+    /// them together nor any one alone shows `f2`; the first two do. And
+    /// an unlink of `f3` invoked between them (t5, a forward the holder
+    /// executed late) is left out as well: a subset of the invocation order.
     #[test]
-    fn a_refusal_that_observed_a_chain_of_tentative_effects_is_explained_by_a_prefix() {
+    fn a_refusal_that_observed_a_chain_of_tentative_effects_is_explained_by_a_subset() {
         let inv = |thread, r, op| HistEvt::Invoke {
             thread,
             rid: rid(r),
@@ -973,13 +988,14 @@ mod tests {
         };
         let events = vec![
             inv(1, 1, NsOp::Create("f3".into())),
+            inv(4, 5, NsOp::Unlink("f3".into())),
             inv(2, 2, NsOp::Rename("f3".into(), "f2".into())),
             ret(2, 2, NsRet::Ok),
             inv(1, 3, NsOp::Rename("f2".into(), "f3".into())),
             inv(3, 4, NsOp::Create("f2".into())),
             ret(3, 4, NsRet::Eexist),
         ];
-        let tentative: HashSet<Rid> = [rid(1), rid(2), rid(3)].into_iter().collect();
+        let tentative: HashSet<Rid> = [rid(1), rid(2), rid(3), rid(5)].into_iter().collect();
         let w = check_linearizable_witnessed(
             &events,
             &tentative,
