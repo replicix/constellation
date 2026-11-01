@@ -167,7 +167,9 @@ impl Core {
                             },
                             base: None,
                             position: Position::ZERO,
-                            gen: 0,
+                            // A delegate's: it says nothing about the lease
+                            // (the requester caches no holder from it).
+                            gen: d.gen,
                             own_chunks: OwnChunks::None,
                             own_rows: None,
                             committed: false,

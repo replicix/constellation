@@ -48692,3 +48692,87 @@ mod c2g_settle {
         assert_eq!(h.core.stats.settles_refused, 1);
     }
 }
+
+/// Plan 43 C2g's sweeps (`delegated-root-gone` seed 66511): a delegate whose
+/// grant is not honoured answers a forward `Held`, and that answer says
+/// nothing about the lease. It carried no generation, so its requester
+/// cached the delegate as the root: every later forward and retry of the op
+/// went to the delegate, which answered `NotHolder` naming the requester,
+/// whose lease path then found the live root's lease and routed back to the
+/// delegate — a loop for the op's whole deadline, and the next. The answer
+/// names its generation now, and the requester keeps the root it knew.
+/// Fails on the parent: the cached holder became the delegate.
+#[test]
+fn a_delegates_held_answer_is_not_the_roots() {
+    let (mut h, dir, _rid, lapse) = delegate_parked_on_a_silent_root();
+    h.step(Event::Timer { id: lapse });
+    assert!(h.core.dl.mine[&7].lapsed);
+    let out = h.step(Event::Peer {
+        from: 2,
+        msg: PeerMsg::MutateRequest {
+            req: OpId(7),
+            rid: Rid {
+                node: 2,
+                incarnation: 1,
+                seq: 1,
+            },
+            op: MutateOp::Create {
+                parent: dir,
+                name: "x".into(),
+                ino: h.meta.allocate_ino(dir).unwrap(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            acked_through: 0,
+            deps: constellation_meta::Position::ZERO,
+            applied: 0,
+            tag: Default::default(),
+            settle: false,
+        },
+    });
+    let held = sends(&out).into_iter().find_map(|(to, m)| match m {
+        PeerMsg::MutateReply {
+            outcome: MutateOutcome::Held { .. },
+            gen,
+            ..
+        } if to == 2 => Some(*gen),
+        _ => None,
+    });
+    assert_eq!(held, Some(7), "{out:?}");
+    // The requester's side.
+    let (_root, mut r) = pair();
+    let rid = r.rid(1);
+    let op = r.create("y");
+    let out = r.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op,
+        tag: Default::default(),
+    });
+    let req = sends(&out)
+        .into_iter()
+        .find_map(|(_, m)| match m {
+            PeerMsg::MutateRequest { req, .. } => Some(*req),
+            _ => None,
+        })
+        .expect("forwarded");
+    r.step(Event::Peer {
+        from: 3,
+        msg: PeerMsg::MutateReply {
+            req,
+            outcome: MutateOutcome::Held { retry_ms: 10 },
+            base: None,
+            position: constellation_meta::Position::ZERO,
+            gen: 7,
+            own_chunks: OwnChunks::None,
+            own_rows: None,
+            committed: false,
+        },
+    });
+    assert_eq!(
+        r.core.lease.cached_holder,
+        Some(1),
+        "the delegate taken for the root"
+    );
+}

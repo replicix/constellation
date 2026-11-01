@@ -1262,6 +1262,8 @@ impl Core {
         tracing::debug!(
             node = self.cfg.node_id,
             ?rid,
+            from,
+            gen,
             ?base,
             ?position,
             applied,

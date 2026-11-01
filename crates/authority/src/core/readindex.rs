@@ -1363,6 +1363,7 @@ impl Core {
                     to,
                     req,
                     held_timer,
+                    gen,
                     ..
                 },
             ..
@@ -1373,7 +1374,7 @@ impl Core {
         let Some(req) = req.take() else {
             return;
         };
-        let to = *to;
+        let (to, gen) = (*to, *gen);
         let old = held_timer.take();
         if let Some(old) = old {
             self.cancel_timer(old, out);
@@ -1389,7 +1390,8 @@ impl Core {
                 },
                 base: None,
                 position: Position::ZERO,
-                gen: 0,
+                // (A delegate's: see `on_held_reply_timer`.)
+                gen,
                 own_chunks,
                 own_rows: None,
                 committed: false,
@@ -1462,18 +1464,24 @@ impl Core {
                 *blockers = Some((now.wait, b));
             }
         }
-        let (to, req, held_timer, durable) = match self.rd.parked.get_mut(&id) {
+        // (The generation of a delegate's parked answer goes with the
+        // `Held`: a delegate's answer says nothing about the lease, and the
+        // requester caches no holder from it. Plan 43 C2g's sweeps: a
+        // requester settling at a delegate cut from its dead root took the
+        // delegate for the root and never took the lease over.)
+        let (to, req, held_timer, durable, gen) = match self.rd.parked.get_mut(&id) {
             Some(Parked {
                 what:
                     ParkedWhat::Reply {
                         to,
                         req,
                         held_timer,
+                        gen,
                         ..
                     },
                 durable,
                 ..
-            }) => (to, req, held_timer, durable),
+            }) => (to, req, held_timer, durable, *gen),
             Some(Parked {
                 what:
                     ParkedWhat::ExecuteReply {
@@ -1484,7 +1492,7 @@ impl Core {
                     },
                 durable,
                 ..
-            }) => (from, req, held_timer, durable),
+            }) => (from, req, held_timer, durable, 0),
             _ => return,
         };
         // A durability wait (an S3 round trip) is longer than a LAN
@@ -1505,7 +1513,7 @@ impl Core {
                     outcome: MutateOutcome::Held { retry_ms },
                     base: None,
                     position: Position::ZERO,
-                    gen: 0,
+                    gen,
                     own_chunks,
                     own_rows: None,
                     committed: false,

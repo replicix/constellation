@@ -1734,7 +1734,8 @@ impl Core {
                         },
                         base: None,
                         position: Position::ZERO,
-                        gen: 0,
+                        // A delegate's: no lease holder to cache from it.
+                        gen,
                         own_chunks: OwnChunks::None,
                         own_rows: None,
                         committed: false,
