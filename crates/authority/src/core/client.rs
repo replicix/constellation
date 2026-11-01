@@ -1251,6 +1251,20 @@ impl Core {
     /// stay uncommitted, the maintainer's decision on C2f) and counted
     /// apart; any other is an answer outside the commit rule: counted and
     /// warned once, so a sequencer that still gives one is seen.
+    /// Plan 46 M0.2 (R7): whether an answer (not `committed`) came from a
+    /// non-stealable sequencer: an open continuation epoch's hold owner
+    /// (this node is in the epoch), or a designee (`gen` names a
+    /// designation).
+    fn answered_non_stealable(&self, committed: bool, gen: u64, replica: &dyn Replica) -> bool {
+        !committed
+            && (self.epoch.open
+                || (gen != 0
+                    && replica
+                        .delegation_table()
+                        .iter()
+                        .any(|d| d.gen == gen && d.designated)))
+    }
+
     fn note_ungated_shadow(
         &mut self,
         from: NodeId,
@@ -1262,13 +1276,7 @@ impl Core {
         if committed {
             return;
         }
-        let non_stealable = self.epoch.open
-            || (gen != 0
-                && replica
-                    .delegation_table()
-                    .iter()
-                    .any(|d| d.gen == gen && d.designated));
-        if non_stealable {
+        if self.answered_non_stealable(committed, gen, replica) {
             self.stats.ungated_shadows_non_stealable += 1;
             return;
         }
@@ -1431,7 +1439,11 @@ impl Core {
                 else {
                     return;
                 };
-                match replica.install_shadow(rid, epoch, gen, &op, &tag, &records, committed) {
+                let answer = (
+                    committed,
+                    self.answered_non_stealable(committed, gen, replica),
+                );
+                match replica.install_shadow(rid, epoch, gen, &op, &tag, &records, answer) {
                     Ok(true) => {
                         tracing::debug!(node = self.cfg.node_id, ?rid, epoch, "shadow installed");
                         self.stats.shadows_installed += 1;

@@ -1428,6 +1428,19 @@ pub fn end_of_run(
             }) else {
                 continue;
             };
+            // Plan 46 M0.2 (R7, variant 3 (i)): a non-stealable sequencer's
+            // OK (an epoch hold's) is uncommitted by design, and its owner's
+            // queue is the rid's one copy: the requester's shadow of it is
+            // rolled back when the owner's replay lands and retires it, not
+            // lost. The rollback is a violation only if the log never
+            // completes the rid (its replay refused, or nobody's).
+            if a.judged
+                .as_ref()
+                .is_some_and(|j| j.class == Some(AckClass::NonStealable))
+                && log.completed_at.contains_key(rid)
+            {
+                continue;
+            }
             let class = a
                 .judged
                 .as_ref()
@@ -1978,6 +1991,41 @@ mod tests {
         // A rid whose rollback the queue never dated is judged against
         // every answer.
         let f = findings_rolled_back(acks, &[], &HashMap::from([(r, u64::MAX)]));
+        assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
+    }
+
+    /// Plan 46 M0.2 (R7): a non-stealable sequencer's OK (an epoch hold's)
+    /// that is rolled back is a violation only if the log never completes
+    /// the rid: its owner's replay landing is what retires the requester's
+    /// shadow. (A group's OK rolled back stays a violation either way.)
+    #[test]
+    fn i5_excuses_a_non_stealable_ok_whose_rid_the_log_completes() {
+        let judged = |class| {
+            Some(Judgement {
+                class: Some(class),
+                expected: Expected::Class(class),
+                tx: None,
+                detail: String::new(),
+                mismatch: None,
+            })
+        };
+        let r = rid(1, 1);
+        let acks = |class| {
+            vec![AckEntry {
+                judged: judged(class),
+                ..ack(2, r, 5, OutcomeKind::Ok, true)
+            }]
+        };
+        let rolled = HashMap::from([(r, 6)]);
+        // Never completed in the log (its replay refused, or nobody's): a
+        // violation.
+        let f = findings_rolled_back(acks(AckClass::NonStealable), &[], &rolled);
+        assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
+        // Completed by the owner's replay: not.
+        let f = findings_rolled_back(acks(AckClass::NonStealable), &[(r, (3, 0))], &rolled);
+        assert!(f.i5.is_empty(), "{:?}", f.i5);
+        // A group's OK is a violation whatever the log says.
+        let f = findings_rolled_back(acks(AckClass::RootGroup), &[(r, (3, 0))], &rolled);
         assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
     }
 

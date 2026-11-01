@@ -180,6 +180,17 @@ pub enum SpecKind {
         /// row) is the same: the delegate re-streams the row to the next
         /// root, and only the end of the generation strands the shadow.
         gated: bool,
+        /// Plan 46 M0.2 (R7, the drop-held proposal's variant 3 (i)): the
+        /// answer was a non-stealable sequencer's — an epoch's hold owner
+        /// (this node is a member), or a designee — uncommitted by design.
+        /// Its owner's journal carries the row, and the owner's own queue
+        /// is the one copy that executes it after the hold; a copy queued
+        /// here as well by the next epoch's strand would be a second. So
+        /// the shadow is not stranded by an epoch: it retires by the
+        /// `Completed`/`Refused` of its rid that comes from the log.
+        /// (Plan 46 M1.4 removes this state: the hold's answers wait for
+        /// a member.)
+        non_stealable: bool,
     },
     /// The `Exists` early install: retires once the applied state
     /// reaches `at`, the position the refusal was evaluated at
@@ -262,6 +273,8 @@ enum LiveEntry {
         epoch: u64,
         gen: u64,
         gated: bool,
+        /// See [`SpecKind::Shadow::non_stealable`].
+        non_stealable: bool,
     },
     Hint {
         at: Position,
@@ -310,6 +323,12 @@ impl LiveEntry {
         match self {
             LiveEntry::Local { epoch: 0, .. } => false,
             LiveEntry::Local { gen, .. } if *gen != 0 => false,
+            // Plan 46 M0.2 (R7): an uncommitted answer of a non-stealable
+            // sequencer is its owner's to replay, not this node's.
+            LiveEntry::Shadow {
+                non_stealable: true,
+                ..
+            } => false,
             entry if entry.gated() => false,
             entry => entry.epoch() < epoch,
         }
@@ -1026,12 +1045,14 @@ fn record_tx(
             epoch,
             gen,
             gated,
+            non_stealable,
             ..
         } => Some(LiveEntry::Shadow {
             rid: *rid,
             epoch: *epoch,
             gen: *gen,
             gated: *gated,
+            non_stealable: *non_stealable,
         }),
         SpecKind::Hint {
             at,
@@ -3638,6 +3659,31 @@ impl Meta {
         self.install_shadow_committed(rid, epoch, gen, op, tag, records, false)
     }
 
+    /// [`Self::install_shadow_from`] for a reply the sequencer answered as
+    /// `committed`, and, `non_stealable`, as a non-stealable sequencer's
+    /// (plan 46 M0.2, R7): see [`SpecKind::Shadow::non_stealable`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn install_shadow_answered(
+        &self,
+        rid: Rid,
+        epoch: u64,
+        gen: u64,
+        op: &MutateOp,
+        tag: &LockTag,
+        records: &[LogRecord],
+        (committed, non_stealable): (bool, bool),
+    ) -> Result<bool, MetaError> {
+        self.install_shadow_inner(
+            rid,
+            epoch,
+            gen,
+            op,
+            tag,
+            records,
+            (committed, non_stealable),
+        )
+    }
+
     /// [`Self::install_shadow_from`] for a reply the holder answered as
     /// committed (`committed`, plan 43 C1-4: its group or the archive held
     /// the row): the shadow is not stranded by a takeover of its epoch.
@@ -3651,6 +3697,20 @@ impl Meta {
         tag: &LockTag,
         records: &[LogRecord],
         committed: bool,
+    ) -> Result<bool, MetaError> {
+        self.install_shadow_inner(rid, epoch, gen, op, tag, records, (committed, false))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn install_shadow_inner(
+        &self,
+        rid: Rid,
+        epoch: u64,
+        gen: u64,
+        op: &MutateOp,
+        tag: &LockTag,
+        records: &[LogRecord],
+        (committed, non_stealable): (bool, bool),
     ) -> Result<bool, MetaError> {
         let mut tx = self.db.write_tx();
         if tx.get(&self.completed, rid.to_key())?.is_some() {
@@ -3698,6 +3758,7 @@ impl Meta {
             gen,
             lock_tag: tag.clone(),
             gated: committed,
+            non_stealable,
         };
         self.install_speculative_tx(tx, kind, records)?;
         Ok(true)

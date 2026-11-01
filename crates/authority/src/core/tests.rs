@@ -50206,4 +50206,83 @@ mod await_retry {
         assert!(queue(&h).iter().all(|(n, _, _)| *n != 2), "{:?}", queue(&h));
         assert_eq!(h.core.stats.await_retry_settled, 1);
     }
+
+    /// R7 (variant 3 (i)): the requester's shadow of a non-stealable
+    /// sequencer's uncommitted answer — here an open continuation epoch's
+    /// hold owner — is not stranded by the next epoch into this node's own
+    /// queue: the owner's queue is the one copy, and the shadow retires by
+    /// the rid's `Completed` from the log. Any other uncommitted shadow is
+    /// stranded and replayed as before (the control).
+    #[test]
+    fn a_non_stealable_shadow_is_not_stranded_by_an_epoch() {
+        for non_stealable in [true, false] {
+            let (mut holder, mut requester) = pair();
+            requester.core.epoch.open = non_stealable;
+            let rid = requester.rid(1);
+            let out = requester.step(Event::Submit {
+                policy: Policy::Client,
+                rid,
+                op: requester.create("s"),
+                tag: Default::default(),
+            });
+            let sent = sends(&out);
+            let [(1, request)] = sent.as_slice() else {
+                panic!("expected one forward to node 1: {sent:?}")
+            };
+            let answer = holder.step_archived(Event::Peer {
+                from: 2,
+                msg: (*request).clone(),
+            });
+            let mut reply = sends(&answer)
+                .into_iter()
+                .find(|(to, m)| *to == 2 && matches!(m, PeerMsg::MutateReply { .. }))
+                .expect("a reply")
+                .1
+                .clone();
+            let records = match &mut reply {
+                PeerMsg::MutateReply {
+                    committed,
+                    outcome: MutateOutcome::Accepted { records, .. },
+                    ..
+                } => {
+                    *committed = false;
+                    records.clone()
+                }
+                other => panic!("{other:?}"),
+            };
+            requester.step(Event::Peer {
+                from: 1,
+                msg: reply,
+            });
+            assert_eq!(requester.core.stats.shadows_installed, 1);
+            assert!(requester.meta.has_outstanding_speculation());
+
+            // The next epoch's takeover: strands what an epoch strands.
+            let stranded = requester.meta.strand_below_epoch(9).unwrap();
+            assert_eq!(
+                stranded.shadows,
+                usize::from(!non_stealable),
+                "non_stealable {non_stealable}: {stranded:?}"
+            );
+            assert_eq!(
+                requester.meta.pending_replays().unwrap().len(),
+                usize::from(!non_stealable),
+                "a second copy of the rid beside its owner's"
+            );
+            assert_eq!(
+                requester.meta.has_outstanding_speculation(),
+                non_stealable,
+                "kept until the log carries the rid"
+            );
+            if non_stealable {
+                // The log carries it: the shadow retires.
+                let applied = requester
+                    .meta
+                    .apply_segment(1, 9, &records, &Default::default())
+                    .unwrap();
+                assert_eq!(applied.retired, 1, "{applied:?}");
+                assert!(!requester.meta.has_outstanding_speculation());
+            }
+        }
+    }
 }

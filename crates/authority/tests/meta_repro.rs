@@ -139,7 +139,7 @@ fn shadows_installed_on_the_holders_base_converge() {
                 op,
                 &LockTag::NONE,
                 records,
-                false
+                (false, false)
             )
             .unwrap());
         }
@@ -174,7 +174,7 @@ fn a_shadow_survives_an_unrelated_rename_tailed_under_it() {
         op18,
         &LockTag::NONE,
         records18,
-        false
+        (false, false)
     )
     .unwrap());
     apply(&requester, &segments, 17);
@@ -284,7 +284,7 @@ fn forwarded_rename_flags_are_decided_by_the_holder_and_converge() {
         op3,
         &LockTag::NONE,
         records3,
-        false
+        (false, false)
     )
     .unwrap());
     apply(&requester, &segments, 3);

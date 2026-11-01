@@ -136,6 +136,11 @@ pub trait Replica {
     /// group (or the archive) held the row when it answered: such a shadow
     /// survives a takeover of its epoch and retires by the successor's
     /// re-ship.
+    ///
+    /// Plan 46 M0.2 (R7): `non_stealable`: the answer was a non-stealable
+    /// sequencer's (an epoch's hold owner, a designee), uncommitted by
+    /// design: the shadow is not stranded by an epoch, and retires by the
+    /// rid's outcome from the log.
     #[allow(clippy::too_many_arguments)]
     fn install_shadow(
         &self,
@@ -145,7 +150,7 @@ pub trait Replica {
         op: &MutateOp,
         tag: &LockTag,
         records: &[LogRecord],
-        committed: bool,
+        answer: (bool, bool),
     ) -> Result<bool, MetaError>;
     /// The pre-S3 stream installed `rid`'s transaction here already:
     /// adopt it as this node's own op (`Meta::adopt_streamed`).
@@ -906,9 +911,9 @@ impl Replica for Meta {
         op: &MutateOp,
         tag: &LockTag,
         records: &[LogRecord],
-        committed: bool,
+        answer: (bool, bool),
     ) -> Result<bool, MetaError> {
-        Meta::install_shadow_committed(self, rid, epoch, gen, op, tag, records, committed)
+        Meta::install_shadow_answered(self, rid, epoch, gen, op, tag, records, answer)
     }
 
     fn install_hint(
