@@ -184,6 +184,12 @@ impl Core {
             if self.drop_retired_origin(head, replica) {
                 continue;
             }
+            // Plan 46 M0.2 (R1): a placeholder (`repair drop-held` rolled
+            // back another node's unanswered row) is no op to run: its
+            // requester's retry is the one copy.
+            if head.is_await_retry() {
+                continue;
+            }
             // The fold: a size-only truncate with a manifest commit of the
             // inode queued after it goes out as `as_folded` (computed here,
             // from the queue, every tick: the row keeps the truncate and its
@@ -717,7 +723,10 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> Result<(), constellation_meta::MetaError> {
-        if queued.refused.is_some() || self.drop_retired_origin(queued, replica) {
+        if queued.refused.is_some()
+            || queued.is_await_retry()
+            || self.drop_retired_origin(queued, replica)
+        {
             return Ok(());
         }
         // Per-key order: behind an earlier entry left to the drain, the

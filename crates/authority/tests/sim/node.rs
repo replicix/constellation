@@ -2517,7 +2517,16 @@ impl Driver {
     /// execution — its replay queue and the core's client map (its own
     /// clients' submissions and its in-flight replays, one entry per rid).
     fn note_identity(&self) {
-        let replays = self.meta.pending_replays().unwrap_or_default();
+        // Plan 46 M0.2: a placeholder (`AwaitRetry`: a dropped row of
+        // another node, whose requester retries it) is not an executable
+        // copy of the rid, so the union leaves it out by its kind.
+        let replays: Vec<_> = self
+            .meta
+            .pending_replays()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| !s.is_await_retry())
+            .collect();
         let queued: BTreeSet<Rid> = replays.iter().map(|s| s.rid).collect();
         let queued_gated: BTreeSet<Rid> = replays
             .iter()

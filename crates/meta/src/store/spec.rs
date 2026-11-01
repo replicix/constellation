@@ -421,6 +421,29 @@ struct QueuedReplay {
     /// operator's abandon of its group; every other entry is the lone
     /// branch's. The simulation's oracle (I2 (b)) judges the former.
     class: RowClass,
+    /// Plan 46 M0.2 (R1): this entry is a placeholder, not a copy of an
+    /// op: see [`AwaitRetry`]. Its `op` is inert and never executed.
+    await_retry: Option<AwaitRetry>,
+}
+
+/// Plan 46 M0.2 (R1, the drop-held proposal's option B): what `repair
+/// drop-held` leaves in the replay queue for another node's row whose
+/// answer was never given. The row is rolled back and the op is *not*
+/// queued again: its requester still holds the one copy that may execute
+/// (its client entry retries by rid until its deadline), so a second
+/// copy here would run twice. The placeholder keeps the row's *place* in
+/// the queue, in journal order, with the keys it touched: the drain holds
+/// every later entry on those keys behind it, an op arriving here on
+/// them waits for it, and its requester's retry executes where the row
+/// stood (`authority::core::replay`). A bound settles the rid when the
+/// retry never comes (`Core::settle_await_retry`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AwaitRetry {
+    /// The dentries and inodes the dropped row touched.
+    pub keys: TouchSet,
+    /// When the row was dropped, in wall-clock ms (what `status.held`
+    /// ages it by; the bound itself runs on the core's own clock).
+    pub since_ms: i64,
 }
 
 /// Plan 43 C1-4: the operator abandoned the group of this member copy's
@@ -514,9 +537,17 @@ pub struct StrandedOp {
     pub truncate_base: Option<Vec<u8>>,
     /// See `QueuedReplay::class`.
     pub class: RowClass,
+    /// See [`AwaitRetry`]: set for a placeholder, whose `op` is inert.
+    pub await_retry: Option<AwaitRetry>,
 }
 
 impl StrandedOp {
+    /// Whether this entry is a placeholder ([`AwaitRetry`]): it holds a
+    /// place in the queue, and has no op to execute.
+    pub fn is_await_retry(&self) -> bool {
+        self.await_retry.is_some()
+    }
+
     /// A size-only truncate as a base-checked commit: the manifest its
     /// inode had just before it (`truncate_base`) to the manifest it cut
     /// that to, at its size. The replay drain and the takeover gate send
@@ -1161,6 +1192,7 @@ fn enqueue_replay_as_tx(
         lock_tag,
         deps,
         class: RowClass::Lone,
+        await_retry: None,
     };
     if tx.get(&meta.pending_replay, seq_key(key))?.is_none() {
         counter_add_tx(tx, &meta.local, KV_PENDING_REPLAY_COUNT, 1)?;
@@ -3315,6 +3347,76 @@ pub(crate) fn strand_seqs_tx(
     Ok(out)
 }
 
+/// Plan 46 M0.2 (R1): turn the queued replay at `key` — the stranded
+/// transaction whose records are `records` — into a placeholder
+/// ([`AwaitRetry`]) when it stands for another node's op whose answer was
+/// never given. Returns whether it did.
+///
+/// *Never given* is read from what the store knows, and only what it can
+/// know for certain:
+/// - the rid has no outcome anywhere: the strand removed the `completed`
+///   row of the rolled-back transaction (`strand_local_tx`), and a row an
+///   applied segment carries (position 0) stays: the log has the rid, the
+///   drain finds it done, and nothing needs a place;
+/// - the row was journaled `Archive`: a lone sequencer's answer to another
+///   node waits for an applied segment, and a held transaction (the only
+///   kind an operator drops) never ships. A `RootGroup`/`DelegGroup` row's
+///   answer leaves once the group has the row, which only the core knows
+///   (the group's acknowledgements are its memory): it may have left, so
+///   the entry stays the only copy that can execute, as before. A
+///   `NonStealable` (hold) answer left at once; a `Lone` one is the
+///   node's own. Those keep their op. A reclassed row
+///   (`reclass_journal_tx`: the answer left with the gate off) is no
+///   longer `Archive`, so it is kept too.
+///
+/// The entry keeps its place (`key`) in the queue, its rid, and the keys
+/// its records touched; its op becomes inert and its class `Lone`, so it
+/// is never an executable copy (the simulation's I2 (b) union, the
+/// drain's execution) nor a gated one.
+pub(crate) fn mark_await_retry_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    key: u64,
+    records: &[LogRecord],
+    since_ms: i64,
+) -> Result<bool, MetaError> {
+    let Some(v) = tx.get(&meta.pending_replay, seq_key(key))? else {
+        return Ok(false);
+    };
+    let mut row: QueuedReplay = postcard::from_bytes(&v)?;
+    let node: u64 = kv_get_tx(&*tx, &meta.local, KV_NODE_PREFIX)?
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if row.rid.node == node
+        || row.class != RowClass::Archive
+        || row.refused.is_some()
+        || row.await_retry.is_some()
+        || tx.get(&meta.completed, row.rid.to_key())?.is_some()
+    {
+        return Ok(false);
+    }
+    row.op = MutateOp::Records {
+        records: Vec::new(),
+    };
+    row.await_retry = Some(AwaitRetry {
+        keys: TouchSet::from_records(records.iter()),
+        since_ms,
+    });
+    row.class = RowClass::Lone;
+    row.truncate_base = None;
+    row.lock_tag = LockTag::NONE;
+    row.deps = Streams::NONE;
+    row.gen = 0;
+    row.foreign = false;
+    row.source = None;
+    tx.insert(
+        &meta.pending_replay,
+        seq_key(key),
+        postcard::to_allocvec(&row)?,
+    );
+    Ok(true)
+}
+
 /// Replace the queued replay at `key` with `op`, already refused for
 /// `refusal`: the drain then materializes `op`'s conflict copy instead of
 /// replaying it (`cli::recovery`). Used by `repair drop-held`, whose
@@ -3341,6 +3443,7 @@ pub(crate) fn refuse_queued_tx(
         lock_tag: LockTag::NONE,
         deps: Streams::NONE,
         class: RowClass::Lone,
+        await_retry: None,
     };
     tx.insert(
         &meta.pending_replay,
@@ -3408,6 +3511,7 @@ pub(crate) fn read_pending_replays(
             deps: row.deps,
             truncate_base: row.truncate_base,
             class: row.class,
+            await_retry: row.await_retry,
         });
     }
     Ok(out)

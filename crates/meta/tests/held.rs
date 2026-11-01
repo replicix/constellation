@@ -814,3 +814,226 @@ fn a_no_op_record_ships_behind_the_deferred_transaction_of_its_name() {
     );
     assert!(r.is_some() && u.is_some() && r < u, "{recs:?}");
 }
+
+// ---------------------------------------------------------------------
+// Plan 46 M0.2 (R1): `repair drop-held` and another node's unanswered row.
+// ---------------------------------------------------------------------
+
+fn rid_of(node: u64, seq: u64) -> constellation_meta::Rid {
+    constellation_meta::Rid {
+        node,
+        incarnation: 1,
+        seq,
+    }
+}
+
+fn chmod(ino: Ino, mode: u32) -> MutateOp {
+    MutateOp::Setattr {
+        ino,
+        mode: Some(mode),
+        uid: None,
+        gid: None,
+        size: None,
+        atime_ns: None,
+        mtime_ns: None,
+    }
+}
+
+/// Execute `op` as `rid`, journaled under `class` (what the core sets
+/// around its call).
+fn exec_as(
+    meta: &Meta,
+    class: constellation_meta::RowClass,
+    rid: constellation_meta::Rid,
+    op: &MutateOp,
+) {
+    let _class = constellation_meta::PendingClass::set(class);
+    constellation_meta::execute_mutate(meta, op, Some(rid)).unwrap();
+}
+
+/// A node 1 holder with `broken` created (ships), its manifest naming a
+/// lost chunk (the seed), and the chunk marked unrecoverable.
+fn node_one_with_a_seed() -> (Meta, Ino) {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_node_prefix(1).unwrap();
+    meta.set_holder_epoch(1);
+    let lost = ChunkHash::of(b"bytes that are gone");
+    let broken = meta.create(ROOT_INO, "broken", 0o644, 0, 0).unwrap().ino;
+    let rows = batch(&meta);
+    ship(&meta, &rows, 1);
+    meta.set_manifest_dirty(
+        broken,
+        None,
+        &manifest_naming(lost, 19),
+        19,
+        None,
+        None,
+        &[lost],
+    )
+    .unwrap();
+    meta.note_unrecoverable_chunks(&[(lost, broken)], true)
+        .unwrap();
+    (meta, broken)
+}
+
+/// R1: a rolled-back row of another node whose answer was never given is
+/// not queued as a copy of its op — its requester holds the one copy that
+/// may execute — but as a placeholder keeping its place, the keys it
+/// touched and the time it was dropped. The rows whose answer may have
+/// been given (a group's), this node's own, and the seed keep what they
+/// had.
+#[test]
+fn drop_held_marks_remote_rows_await_retry() {
+    use constellation_meta::RowClass::{Archive, Lone, RootGroup};
+    let (meta, broken) = node_one_with_a_seed();
+    // Another node's unanswered rows: gated by the archive, which a held
+    // (unshipped) row never reaches.
+    exec_as(&meta, Archive, rid_of(7, 1), &chmod(broken, 0o600));
+    // Another node's row its group held: answered, perhaps.
+    exec_as(&meta, RootGroup, rid_of(8, 1), &chmod(broken, 0o640));
+    // This node's own client.
+    exec_as(&meta, Lone, rid_of(1, 5), &chmod(broken, 0o660));
+    // Another node's row on keys nothing held touches: ships, not dropped.
+    let other = meta.create(ROOT_INO, "other", 0o644, 0, 0).unwrap().ino;
+    exec_as(&meta, Archive, rid_of(7, 2), &chmod(other, 0o600));
+
+    let dropped = meta.drop_held(broken, 1234).unwrap();
+    assert_eq!((dropped.dropped, dropped.requeued), (1, 3), "{dropped:?}");
+
+    let queue = meta.pending_replays().unwrap();
+    let by = |rid| {
+        queue
+            .iter()
+            .find(|q| q.rid == rid)
+            .unwrap_or_else(|| panic!("{rid:?} not queued: {queue:?}"))
+    };
+    // The unanswered remote row: a placeholder.
+    let p = by(rid_of(7, 1));
+    let await_retry = p
+        .await_retry
+        .as_ref()
+        .unwrap_or_else(|| panic!("an unanswered remote row stays a copy of its op: {p:?}"));
+    assert!(await_retry.keys.inos.contains(&broken), "{await_retry:?}");
+    assert_eq!(await_retry.since_ms, 1_234_000, "wall ms of the drop");
+    assert!(p.is_await_retry() && p.refused.is_none());
+    assert!(
+        !p.class.gated(),
+        "a placeholder is never a gated copy: {p:?}"
+    );
+    assert!(!p.foreign);
+    assert_eq!(
+        meta.completed_outcome(p.rid).unwrap(),
+        None,
+        "the rid has no outcome: its requester's retry executes it"
+    );
+    // A group's row, this node's own: executable, as before.
+    let g = by(rid_of(8, 1));
+    assert!(g.await_retry.is_none(), "{g:?}");
+    assert!(
+        matches!(
+            &g.op,
+            MutateOp::Setattr {
+                mode: Some(0o640),
+                ..
+            }
+        ),
+        "{g:?}"
+    );
+    assert_eq!(g.class, RootGroup);
+    let own = by(rid_of(1, 5));
+    assert!(own.await_retry.is_none(), "{own:?}");
+    assert!(
+        matches!(
+            &own.op,
+            MutateOp::Setattr {
+                mode: Some(0o660),
+                ..
+            }
+        ),
+        "{own:?}"
+    );
+    // The seed is still the refused replay of its conflict copy.
+    let seed = queue
+        .iter()
+        .find(|q| q.refused.is_some())
+        .expect("the seed is refused");
+    assert!(seed.await_retry.is_none());
+    // The independent row was never held.
+    assert!(!queue.iter().any(|q| q.rid == rid_of(7, 2)), "{queue:?}");
+    assert_eq!(queue.len(), 4, "{queue:?}");
+}
+
+/// R1: the queue keeps every rolled-back row in journal order — the
+/// placeholders among the executable entries — so the drain can run the
+/// dependents of a remote row behind it.
+#[test]
+fn drop_held_keeps_dependents_in_journal_order() {
+    use constellation_meta::RowClass::{Archive, Lone};
+    let (meta, broken) = node_one_with_a_seed();
+    let rename = MutateOp::Rename {
+        parent: ROOT_INO,
+        name: "broken".into(),
+        new_parent: ROOT_INO,
+        new_name: "moved".into(),
+        noreplace: false,
+    };
+    let create = |name: &str, ino| MutateOp::Create {
+        parent: ROOT_INO,
+        name: name.into(),
+        ino,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    // seed, an own chmod, a remote rename (rid 7/1), an own create in the
+    // directory the rename touched, a remote create in it (rid 8/1), and
+    // an own chmod of the renamed file.
+    exec_as(&meta, Lone, rid_of(1, 5), &chmod(broken, 0o600));
+    exec_as(&meta, Archive, rid_of(7, 1), &rename);
+    exec_as(&meta, Lone, rid_of(1, 6), &create("x", 1 << 40));
+    exec_as(&meta, Archive, rid_of(8, 1), &create("y", (1 << 40) + 1));
+    exec_as(&meta, Lone, rid_of(1, 7), &chmod(broken, 0o640));
+
+    let dropped = meta.drop_held(broken, 1).unwrap();
+    assert_eq!((dropped.dropped, dropped.requeued), (1, 5), "{dropped:?}");
+    let queue = meta.pending_replays().unwrap();
+    let order: Vec<_> = queue
+        .iter()
+        .map(|q| {
+            (
+                q.rid.node,
+                q.rid.seq,
+                q.is_await_retry(),
+                q.refused.is_some(),
+            )
+        })
+        .collect();
+    // The seed's rid is the journal seq of its transaction on this node.
+    let seed = queue.iter().find(|q| q.refused.is_some()).unwrap().rid;
+    assert_eq!(
+        order,
+        vec![
+            (seed.node, seed.seq, false, true),
+            (1, 5, false, false),
+            (7, 1, true, false),
+            (1, 6, false, false),
+            (8, 1, true, false),
+            (1, 7, false, false),
+        ],
+        "journal order, the placeholders in their place: {queue:?}"
+    );
+    assert!(
+        queue.windows(2).all(|w| w[0].queue_seq < w[1].queue_seq),
+        "queue order is the journal's"
+    );
+    // The rename's placeholder names both dentries and the directory.
+    let keys = &queue[2].await_retry.as_ref().expect("placeholder").keys;
+    assert!(keys.dentries.contains(&(ROOT_INO, "broken".to_string())));
+    assert!(keys.dentries.contains(&(ROOT_INO, "moved".to_string())));
+    assert!(keys.shared.contains(&ROOT_INO));
+    // A read of a name only a placeholder stands for waits like a read of
+    // a queued replay's: the requester's retry writes it again.
+    use constellation_meta::ReadKey;
+    assert!(meta.replay_touches(&[ReadKey::Dentry(ROOT_INO, "y".into())]));
+    assert!(!meta.replay_touches(&[ReadKey::Dentry(ROOT_INO, "unrelated".into())]));
+}

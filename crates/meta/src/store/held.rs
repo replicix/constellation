@@ -70,6 +70,23 @@
 //! unrecoverable chunks as holes — the replay drain materializes under
 //! `.constellation-conflict/`. The unrecoverable pending rows go with it.
 //!
+//! The queue keeps every rolled-back transaction in journal order, but
+//! not every entry is a copy of its op (plan 46 M0.2, the drop-held
+//! proposal's option B). An operator's drop re-executes only this node's
+//! own rows: another node's row whose answer was never given (journaled
+//! `Archive`, which a held, unshipped row never reaches, and with no
+//! outcome in the log — [`spec::mark_await_retry_tx`]) belongs to its
+//! requester, whose client entry retries it by rid. Queued as well, it
+//! would run twice, and its dependents would run without its effect and
+//! ahead of the retry. It becomes a *placeholder* (`spec::AwaitRetry`)
+//! instead: its place in the queue, its rid and the keys its records
+//! touched, no op. The replay drain holds every later entry on those keys
+//! behind it; an op arriving on them waits for it; its requester's retry
+//! executes in its place; after `drop_held_await_ms` the sequencer
+//! settles the rid (`Refused { rid, ABANDONED }`). A row of another node
+//! whose answer may have been given (a group's, a hold's) keeps its op:
+//! its client is not retrying it, and this queue is its only copy.
+//!
 //! # Deferred: chunks still uploading (plan 30 §M7)
 //!
 //! The same planner defers a transaction whose manifest names a chunk
@@ -305,6 +322,10 @@ pub struct DroppedHeld {
     pub dropped: usize,
     /// Dependent transactions rolled back and queued for replay by rid.
     pub requeued: usize,
+    /// Plan 46 M0.2: of `requeued`, those of another node whose answer
+    /// was never given: queued as placeholders awaiting their requester's
+    /// retry (`AwaitRetry`), not as copies of their op.
+    pub await_retry: usize,
     /// Unrecoverable pending-upload rows removed.
     pub pending_removed: usize,
     /// Queued replays (from an earlier deposition) of this inode's
@@ -1135,7 +1156,8 @@ impl Meta {
         // them (key overlap, transitively, in journal order).
         let mut tainted: HashSet<Vec<u8>> = HashSet::new();
         let mut seeds: Vec<(Tx, u64, u64)> = Vec::new(); // (tx, spec_seq, origin)
-        let mut dependents: Vec<u64> = Vec::new(); // spec_seqs
+                                                         // (spec_seq, origin, records)
+        let mut dependents: Vec<(u64, u64, Vec<LogRecord>)> = Vec::new();
         for (t, seed_inos, keys) in held.held {
             let is_seed = seed_inos.contains(&ino);
             let depends = keys
@@ -1158,13 +1180,29 @@ impl Meta {
             if is_seed {
                 seeds.push((t, spec_seq, origin));
             } else {
-                dependents.push(spec_seq);
+                let records = t.rows.iter().map(|(_, rec)| rec.clone()).collect();
+                dependents.push((spec_seq, origin, records));
             }
         }
-        let mut seqs: HashSet<u64> = dependents.iter().copied().collect();
+        let mut seqs: HashSet<u64> = dependents.iter().map(|(seq, _, _)| *seq).collect();
         seqs.extend(seeds.iter().map(|(_, seq, _)| *seq));
         let staged = UsageTracker::staging();
         spec::strand_seqs_tx(&mut tx, self, &staged, &seqs)?;
+        // Plan 46 M0.2 (R1): another node's dependent whose answer was
+        // never given is no copy of its op any more, but a placeholder in
+        // its place: its requester's retry is the one copy that executes.
+        let mut await_retry = 0;
+        for (_, origin, records) in &dependents {
+            if spec::mark_await_retry_tx(
+                &mut tx,
+                self,
+                *origin,
+                records,
+                now_unix.saturating_mul(1000),
+            )? {
+                await_retry += 1;
+            }
+        }
         // The rids whose ops are dropped: their outcome goes in the log
         // (`Refused`), so a requester's shadow of one is rolled back
         // and a retry by rid is answered the same way everywhere.
@@ -1321,6 +1359,7 @@ impl Meta {
             ino,
             dropped = seeds.len(),
             requeued = dependents.len(),
+            await_retry,
             queued_dropped,
             pending_removed,
             "held records dropped into conflict copies"
@@ -1328,6 +1367,7 @@ impl Meta {
         Ok(DroppedHeld {
             dropped: seeds.len(),
             requeued: dependents.len(),
+            await_retry,
             pending_removed,
             queued_dropped,
         })

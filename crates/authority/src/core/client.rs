@@ -914,6 +914,9 @@ impl Core {
     ) -> bool {
         own.is_none_or(|own| entry.queue_seq < own)
             && entry.refused.is_none()
+            // (A placeholder is another node's row awaiting its requester's
+            // retry, not a replay of this node's.)
+            && !entry.is_await_retry()
             && !entry.foreign
             && !self.clients.contains_key(&entry.rid)
             && (entry.gen == 0 || !table.iter().any(|d| d.gen == entry.gen))

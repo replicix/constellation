@@ -49478,3 +49478,126 @@ fn a_delegates_held_answer_is_not_the_roots() {
         "the delegate taken for the root"
     );
 }
+
+/// Plan 46 M0.2 (C2g′, the drop-held proposal's option B): what `repair
+/// drop-held` leaves of another node's unanswered row — a placeholder
+/// that keeps its place in the replay queue and holds what depends on it
+/// behind its requester's retry — and what the core does with it.
+mod await_retry {
+    use super::*;
+    use constellation_fs_core::types::ROOT_INO;
+    use constellation_fs_core::{ChunkHash, ChunkInfo, ChunkLayout, Ino, Manifest};
+    use constellation_meta::RowClass;
+
+    pub(super) fn rid_of(node: NodeId, seq: u64) -> Rid {
+        Rid {
+            node,
+            incarnation: 1,
+            seq,
+        }
+    }
+
+    pub(super) fn chmod(ino: Ino, mode: u32) -> MutateOp {
+        MutateOp::Setattr {
+            ino,
+            mode: Some(mode),
+            uid: None,
+            gid: None,
+            size: None,
+            atime_ns: None,
+            mtime_ns: None,
+        }
+    }
+
+    /// Execute `op` on `h` as `rid` (another node's forward, or this
+    /// node's own client), journaled under `class`.
+    pub(super) fn exec_as(h: &Harness, class: RowClass, rid: Rid, op: &MutateOp) {
+        let _class = constellation_meta::PendingClass::set(class);
+        constellation_meta::execute_mutate(&h.meta, op, Some(rid)).unwrap();
+    }
+
+    /// Node 1 holds the lease at epoch 1; its journal carries a *seed*
+    /// (the manifest of `broken`, naming a chunk that is gone, marked
+    /// unrecoverable) after the creation of `broken` (shipped). Whatever
+    /// the test executes on `broken` or in the root directory after this
+    /// depends on the seed by key, and is held with it.
+    pub(super) fn holder_with_a_seed() -> (Harness, Ino) {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        let broken = h.meta.create(ROOT_INO, "broken", 0o644, 0, 0).unwrap().ino;
+        let rows = MetaStore::take_journal(&h.meta, usize::MAX).unwrap();
+        let seqs: Vec<u64> = rows.iter().map(|(s, _)| *s).collect();
+        h.meta.ack_journal_rows_at(&seqs, 1).unwrap();
+        let lost = ChunkHash::of(b"bytes that are gone");
+        let manifest = Manifest {
+            layout: ChunkLayout::new(4096),
+            file_len: 19,
+            chunks: ChunkInfo::Inline([(0u64, lost)].into_iter().collect()),
+        }
+        .encode();
+        h.meta
+            .set_manifest_dirty(broken, None, &manifest, 19, None, None, &[lost])
+            .unwrap();
+        h.meta
+            .note_unrecoverable_chunks(&[(lost, broken)], true)
+            .unwrap();
+        (h, broken)
+    }
+
+    pub(super) fn drop_held(h: &Harness, ino: Ino) {
+        h.meta.drop_held(ino, h.now.0 / 1000).unwrap();
+    }
+
+    /// The queue as `(node, seq, placeholder)`, in order.
+    pub(super) fn queue(h: &Harness) -> Vec<(NodeId, u64, bool)> {
+        h.meta
+            .pending_replays()
+            .unwrap()
+            .iter()
+            .map(|q| (q.rid.node, q.rid.seq, q.is_await_retry()))
+            .collect()
+    }
+
+    pub(super) fn drain(h: &mut Harness) -> Vec<Action> {
+        let mut out = Vec::new();
+        h.core.on_drain_tick(h.clk(), &h.meta, &mut out);
+        out
+    }
+
+    /// R1: the placeholder is no copy of its op. The drain does not
+    /// execute it, whatever the lease: its rid has no outcome after a
+    /// tick, nor after the takeover gate's local replay; its op is not
+    /// sent anywhere.
+    #[test]
+    fn a_dropped_remote_row_becomes_a_placeholder_not_a_copy() {
+        let (mut h, broken) = holder_with_a_seed();
+        let r = rid_of(2, 1);
+        exec_as(&h, RowClass::Archive, r, &chmod(broken, 0o600));
+        drop_held(&h, broken);
+        assert!(
+            queue(&h).contains(&(2, 1, true)),
+            "the dropped remote row is a placeholder: {:?}",
+            h.meta.pending_replays().unwrap()
+        );
+
+        let out = drain(&mut h);
+        assert!(sends(&out).is_empty(), "nothing is sent: {out:?}");
+        assert_eq!(
+            h.meta.completed_outcome(r).unwrap(),
+            None,
+            "the drain executed the dropped remote row: a second copy beside its requester's"
+        );
+        assert_eq!(h.core.stats.stranded_replayed, 0);
+
+        let mut out = Vec::new();
+        h.core
+            .replay_queue_locally(h.clk(), &h.meta, &mut out)
+            .unwrap();
+        assert_eq!(
+            h.meta.completed_outcome(r).unwrap(),
+            None,
+            "the takeover gate executed it"
+        );
+        assert!(queue(&h).contains(&(2, 1, true)), "it keeps its place");
+    }
+}

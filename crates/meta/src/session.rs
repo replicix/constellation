@@ -300,6 +300,16 @@ impl KeySet {
         }
     }
 
+    /// A placeholder's keys (`AwaitRetry`): the dentries and inodes the
+    /// dropped row touched, the directories it changed among them (as
+    /// `from_op` counts a name's parent).
+    pub fn from_touch_set(t: &TouchSet) -> KeySet {
+        KeySet {
+            dentries: t.dentries.iter().cloned().collect(),
+            inos: t.inos.iter().chain(t.shared.iter()).copied().collect(),
+        }
+    }
+
     /// The keys `op` will touch (for a queued replay: no records yet).
     pub fn from_op(op: &MutateOp) -> KeySet {
         let mut k = KeySet::default();
@@ -1918,7 +1928,13 @@ impl crate::store::Meta {
         }
         self.pending_replays().is_ok_and(|queue| {
             queue.iter().any(|q| {
-                let ks = KeySet::from_op(&q.op);
+                // A placeholder (plan 46 M0.2) has no op: the keys of the
+                // row it stands for, which its requester's retry will
+                // write again.
+                let ks = match &q.await_retry {
+                    Some(a) => KeySet::from_touch_set(&a.keys),
+                    None => KeySet::from_op(&q.op),
+                };
                 keys.iter().any(|k| ks.touches(k))
             })
         })

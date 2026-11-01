@@ -32,7 +32,7 @@ use std::collections::BTreeSet;
 /// the whole schedule after it) changed from process to process, and
 /// the authority sim's `locks-delegated` seed 196102 replayed its
 /// failure only about one run in two.
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TouchSet {
     pub dentries: BTreeSet<(u64, String)>,
     /// Inodes held *exclusively*: their own attributes change, or (a
