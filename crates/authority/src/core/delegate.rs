@@ -1853,11 +1853,11 @@ impl Core {
             // (the settle did not wait for the op's), and a root appends a
             // stream row only once it holds what the row names.
             let none = Position::ZERO;
-            if self.record_delegate_refusal(rid, super::client::ABANDONED_CODE, gen, none, replica)
-            {
+            let code = super::client::settle_code(rid, Some(op));
+            if self.record_delegate_refusal(rid, code, gen, none, replica) {
                 self.stats.settles_refused += 1;
                 exec_idx = Some(replica.delegate_idx(gen));
-                MutateOutcome::Abandoned
+                super::client::refused_as_outcome(code)
             } else {
                 MutateOutcome::Busy
             }

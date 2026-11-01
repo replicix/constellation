@@ -1127,6 +1127,11 @@ pub struct Stats {
     /// Settles of placeholders started (one per attempt: not while one is in
     /// flight).
     pub await_retry_settles_sent: u64,
+    /// Defect C: settles of refused entries' rids started before their
+    /// conflict copy (`Core::copy_after_settle`), and entries the log
+    /// showed completed (the write survived: forgotten, no copy).
+    pub refused_entry_settles_sent: u64,
+    pub refused_entries_survived: u64,
     /// Review (R7): shadows of non-stealable answers rolled back after the
     /// bound because the owner's row never reached the log.
     pub stale_non_stealable_shadows: u64,

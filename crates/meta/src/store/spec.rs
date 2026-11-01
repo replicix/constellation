@@ -461,6 +461,11 @@ struct QueuedReplay {
     /// Plan 46 M0.2 (R1): this entry is a placeholder, not a copy of an
     /// op: see [`AwaitRetry`]. Its `op` is inert and never executed.
     await_retry: Option<AwaitRetry>,
+    /// The refusal is `repair drop-held`'s own (`refuse_queued_tx`): the
+    /// rid's `Refused` row was journaled by the dropper, and is in the log
+    /// only if that journal shipped. Every other refusal here is a
+    /// sequencer's answer, journaled where it was given.
+    dropped: bool,
 }
 
 /// Plan 46 M0.2 (R1, the drop-held proposal's option B): what `repair
@@ -576,6 +581,8 @@ pub struct StrandedOp {
     pub class: RowClass,
     /// See [`AwaitRetry`]: set for a placeholder, whose `op` is inert.
     pub await_retry: Option<AwaitRetry>,
+    /// See `QueuedReplay::dropped`.
+    pub dropped: bool,
 }
 
 impl StrandedOp {
@@ -1233,6 +1240,7 @@ fn enqueue_replay_as_tx(
         deps,
         class: RowClass::Lone,
         await_retry: None,
+        dropped: false,
     };
     if tx.get(&meta.pending_replay, seq_key(key))?.is_none() {
         counter_add_tx(tx, &meta.local, KV_PENDING_REPLAY_COUNT, 1)?;
@@ -3476,6 +3484,7 @@ pub(crate) fn refuse_queued_tx(
     rid: Rid,
     op: MutateOp,
     refusal: Refusal,
+    dropped: bool,
 ) -> Result<(), MetaError> {
     if tx.get(&meta.pending_replay, seq_key(key))?.is_none() {
         counter_add_tx(tx, &meta.local, KV_PENDING_REPLAY_COUNT, 1)?;
@@ -3492,6 +3501,7 @@ pub(crate) fn refuse_queued_tx(
         deps: Streams::NONE,
         class: RowClass::Lone,
         await_retry: None,
+        dropped,
     };
     tx.insert(
         &meta.pending_replay,
@@ -3562,6 +3572,7 @@ pub(crate) fn read_pending_replays(
             truncate_base: row.truncate_base,
             class: row.class,
             await_retry: row.await_retry,
+            dropped: row.dropped,
         });
     }
     Ok(out)
@@ -5299,7 +5310,7 @@ impl Meta {
     ) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
         let key = next_spec_seq_tx(&mut tx, &self.local)?;
-        refuse_queued_tx(&mut tx, self, key, rid, op.clone(), refusal)?;
+        refuse_queued_tx(&mut tx, self, key, rid, op.clone(), refusal, false)?;
         tx.commit()?;
         Ok(())
     }

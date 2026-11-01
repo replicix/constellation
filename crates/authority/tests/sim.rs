@@ -4844,18 +4844,29 @@ fn drop_held_chain_backed_config() -> SimConfig {
 }
 
 /// `drop-held-chain-backed` on the seeds that failed on `aa8466f9`
-/// without the lease-read knob (the four defects of the drop on a backed
-/// root, one commit each): every seed passes.
+/// without the lease-read knob (the defects of the drop on a backed root,
+/// one commit each): every seed passes.
 ///
 /// - 1476: the drop removed the pending row of a chunk an op of the node
 ///   still named (a close behind a handoff pause): its manifest shipped
 ///   naming a chunk S3 never received.
+/// - 592, 1864 (I2c): the drop ran on a node that had been deposed
+///   meanwhile (suspended past its seal): its refusals never shipped, and
+///   the refused entry made a conflict copy of an acknowledged op the log
+///   had no outcome of. The entry now settles its rid first.
 #[test]
 fn drop_held_chain_backed_regression_seeds() {
-    for (seed, why) in [(
-        1476u64,
-        "a chunk gap: the drop took a live op's chunk for durable",
-    )] {
+    for (seed, why) in [
+        (
+            1476u64,
+            "a chunk gap: the drop took a live op's chunk for durable",
+        ),
+        (
+            592,
+            "I2c: a deposed dropper's copy had no outcome in the log",
+        ),
+        (1864, "I2c: the same, a third node"),
+    ] {
         run_seed(seed, drop_held_chain_backed_config()).unwrap_or_else(|e| {
             panic!(
                 "drop-held-chain-backed seed {seed} ({why}): {e}\n  replay with \

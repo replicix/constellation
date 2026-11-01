@@ -256,8 +256,14 @@ impl Core {
                 head
             };
             if let Some(refusal) = &head.refused {
-                let reason = refusal.reason.clone();
-                self.try_copy(now, head, reason, replica, out);
+                if head.dropped {
+                    self.copy_after_settle(now, head, replica, out);
+                } else {
+                    // (A sequencer's refusal: its row is journaled where
+                    // it was given.)
+                    let reason = refusal.reason.clone();
+                    self.try_copy(now, head, reason, replica, out);
+                }
                 continue;
             }
             if self.replay.in_flight.is_some() {
@@ -388,6 +394,69 @@ impl Core {
             );
             return;
         }
+    }
+
+    /// A refused queue entry of `repair drop-held` (`StrandedOp::dropped`:
+    /// an acknowledged op whose effect is kept aside as a conflict copy;
+    /// the refusals a sequencer gave are journaled where it gave them)
+    /// makes its copy only once its rid's refusal is *in the log* (plan 46 M0.2 follow-up, defect C). A node `repair drop-held`
+    /// ran on after it had been deposed (suspended past its seal) rolled
+    /// the rows back and journaled their `Refused` rows, which are fenced
+    /// and never ship: the entry would make its copy and the acknowledged
+    /// op would have no outcome in the log at all, so a requester's retry
+    /// of the rid, or a successor re-shipping the original, would run it
+    /// beside the copy. So:
+    ///
+    /// - the rid has an outcome here that is a refusal (and, when it is
+    ///   this node's own journal row, committed): the copy, as before;
+    /// - an outcome that accepted it: a successor completed the original
+    ///   from its tail, the write survived in the log, and the entry is
+    ///   forgotten with no copy;
+    /// - none: the rid is settled through the sequencer in force, the way
+    ///   a placeholder's is (`submit_settle`, C2g's `Core::settle_refusal`),
+    ///   with the dropped code in place of the abandoned one; the answer
+    ///   (`replay_outcome`) decides between the two above. Not while the
+    ///   epoch refuses writes (nothing could answer), nor while the rid is
+    ///   in flight.
+    fn copy_after_settle(
+        &mut self,
+        now: Now,
+        entry: &StrandedOp,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let reason = entry
+            .refused
+            .as_ref()
+            .map(|r| r.reason.clone())
+            .unwrap_or_default();
+        if let Some(outcome) = completed_as_outcome(replica, entry.rid, 0)
+            .filter(|_| self.completed_row_settled(entry.rid, replica))
+        {
+            if self.outcome_uncommitted(entry.rid, replica) {
+                return;
+            }
+            match outcome {
+                MutateOutcome::Accepted { .. } => {
+                    self.stats.refused_entries_survived += 1;
+                    let _ = replica.forget_replay(entry.queue_seq);
+                    self.wake_queue_parks(now, replica, out);
+                }
+                _ => self.try_copy(now, entry, reason, replica, out),
+            }
+            return;
+        }
+        if self.clients.contains_key(&entry.rid) || self.epoch_refuses_writes() {
+            return;
+        }
+        self.stats.refused_entry_settles_sent += 1;
+        self.submit_settle(
+            now,
+            (entry.rid, entry.queue_seq),
+            super::client::dropped_settle_op(entry.rid),
+            replica,
+            out,
+        );
     }
 
     /// Plan 46 M0.2 (R3): whether an op arriving at this sequencer from
@@ -701,7 +770,10 @@ impl Core {
             "a dropped row's requester never retried: settling the rid as abandoned"
         );
         self.stats.await_retry_settles_sent += 1;
-        self.submit_settle(now, entry.rid, entry.queue_seq, replica, out);
+        let inert = MutateOp::Records {
+            records: Vec::new(),
+        };
+        self.submit_settle(now, (entry.rid, entry.queue_seq), inert, replica, out);
     }
 
     /// Whether `rid`'s `completed` row is this node's own journal row
@@ -957,6 +1029,37 @@ impl Core {
                         self.stats.await_retry_resolved += 1;
                     }
                     let _ = replica.forget_replay(queue_seq);
+                }
+            }
+            return;
+        }
+        // Defect C: the answer to a refused entry's settle
+        // (`copy_after_settle`): the rid's refusal is in the log now (its
+        // copy is made), or the original was completed there (the write
+        // survived: no copy); no answer leaves it for a later tick.
+        if queued.dropped && queued.refused.is_some() {
+            match outcome {
+                None
+                | Some(MutateOutcome::Busy)
+                | Some(MutateOutcome::NotHolder { .. })
+                | Some(MutateOutcome::Held { .. }) => {}
+                Some(MutateOutcome::Accepted { .. }) => {
+                    self.stats.refused_entries_survived += 1;
+                    let _ = replica.forget_replay(queue_seq);
+                    self.replay.stuck_since = None;
+                }
+                Some(_) => {
+                    // (A sequencer answers the settle once its refusal is
+                    // committed; one this node journaled itself is waited
+                    // for by the next tick, which finds the row.)
+                    if !self.outcome_uncommitted(rid, replica) {
+                        let reason = queued
+                            .refused
+                            .as_ref()
+                            .map(|r| r.reason.clone())
+                            .unwrap_or_default();
+                        self.try_copy(now, &queued, reason, replica, out);
+                    }
                 }
             }
             return;

@@ -1837,6 +1837,7 @@ impl Core {
             replica.completed_outcome(rid),
             Ok(Some(constellation_meta::CompletedOutcome::Refused { code }))
                 if code == super::client::ABANDONED_CODE
+                    || code == constellation_meta::DROPPED_CODE
         );
         Ok(AnswerSource::Sequenced(if replica.outcome_from_log(rid) {
             AckClass::Archive

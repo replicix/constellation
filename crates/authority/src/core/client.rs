@@ -350,6 +350,35 @@ pub(crate) const LAPSED_CODE: Code = Code::NoLock;
 /// portable code: the errno table has no hole, and the client hears `EIO`.
 pub const ABANDONED_CODE: Code = Code::Canceled;
 
+/// The inert op of a settle of a rid `repair drop-held` dropped: the
+/// refusal the settle journals if the rid has no outcome (plan 46 M0.2
+/// follow-up, defect C), spelled as a record. The op travels with every
+/// settle request, wherever it goes (the holder, a delegate, an inbox
+/// batch); it executes nothing and touches no key.
+pub(crate) fn dropped_settle_op(rid: Rid) -> MutateOp {
+    MutateOp::Records {
+        records: vec![LogRecord::Refused {
+            rid,
+            code: constellation_meta::DROPPED_CODE,
+        }],
+    }
+}
+
+/// The code a settle of `rid` journals when the rid has no outcome:
+/// [`ABANDONED_CODE`] (a requester's op nobody heard of), or the dropped
+/// code when the settle's op says so ([`dropped_settle_op`]: the op was
+/// acknowledged and then dropped by an operator, and its conflict copy is
+/// made once the refusal is the rid's outcome).
+pub(crate) fn settle_code(rid: Rid, op: Option<&MutateOp>) -> Code {
+    match op {
+        Some(MutateOp::Records { records }) => match records.as_slice() {
+            [LogRecord::Refused { rid: r, code }] if *r == rid => *code,
+            _ => ABANDONED_CODE,
+        },
+        _ => ABANDONED_CODE,
+    }
+}
+
 /// A journaled refusal (`Refused { rid, code }`) as the outcome the
 /// sequencer gave: a stale base is the `Conflict` a client rebases on, an
 /// ended grant `LockLapsed`, a settled op `Abandoned`, anything else its
@@ -473,20 +502,22 @@ impl Core {
     /// and executes nothing (its op is inert and `settle` is set before
     /// anything routes it). Its outcome reaches `replay_outcome` as a
     /// replay's does.
+    ///
+    /// `op`: the inert op the settle carries: empty for a placeholder's
+    /// (the refusal is the `ABANDONED_CODE` one), [`dropped_settle_op`] for
+    /// a refused entry's (`Core::copy_after_settle`).
     pub(crate) fn submit_settle(
         &mut self,
         now: Now,
-        rid: Rid,
-        queue_seq: u64,
+        (rid, queue_seq): (Rid, u64),
+        op: MutateOp,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
         self.submit_as(
             now,
             rid,
-            MutateOp::Records {
-                records: Vec::new(),
-            },
+            op,
             Policy::Client,
             LockTag::NONE,
             (
@@ -2468,13 +2499,14 @@ impl Core {
         // good, answered once the refusal's row is committed (below).
         let outcome = if settle {
             match self.settle_refusal(rid, Some(&op), super::Asker::Own, replica) {
-                MutateOutcome::Abandoned => {
+                // (Not journaled: the requester retries the settle.)
+                MutateOutcome::Busy => return MutateOutcome::Busy,
+                settled => {
                     // Its answer waits for the log: start a round now, not
                     // at the idle backoff's next one.
                     self.nudge(now, out);
-                    (MutateOutcome::Abandoned, None)
+                    (settled, None)
                 }
-                other => return other,
             }
         } else {
             match constellation_meta::locks::TokenPath::Local

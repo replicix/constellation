@@ -49,6 +49,7 @@ pub use store::backup::{
 pub use store::backup::{BackupRole, BackupTx};
 pub use store::held::{
     manifest_names, op_manifests_of, DroppedHeld, HeldInode, HeldSummary, LiveSessions,
+    DROPPED_CODE,
 };
 pub use store::inbox::{CompletedOutcome, InboxAck, InboxAckArmed, OutcomeRow};
 #[cfg(any(test, feature = "test-util"))]

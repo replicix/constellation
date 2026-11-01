@@ -984,11 +984,14 @@ impl Core {
             "settle: no outcome here; refused for good"
         );
         let committed = super::Asker::Remote;
-        if !self.record_refusal(rid, super::client::ABANDONED_CODE, op, committed, replica) {
+        // (`ABANDONED_CODE`, or the dropped code of a settle that
+        // `repair drop-held`'s refused entry sends: `client::settle_code`.)
+        let code = super::client::settle_code(rid, op);
+        if !self.record_refusal(rid, code, op, committed, replica) {
             return MutateOutcome::Busy;
         }
         self.stats.settles_refused += 1;
-        MutateOutcome::Abandoned
+        super::client::refused_as_outcome(code)
     }
 
     /// `SyncRequest::HandOff`: a peer wants the lease. If this node holds

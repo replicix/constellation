@@ -148,7 +148,7 @@ const POISON_PREFIX: &[u8] = b"poisoned/";
 /// The code a dropped op's `Refused` record carries (`EIO`): the write
 /// was acknowledged and then lost with its chunk; its conflict copy is
 /// the artifact.
-const DROPPED_CODE: constellation_types::Code = constellation_types::Code::Io;
+pub const DROPPED_CODE: constellation_types::Code = constellation_types::Code::Io;
 
 /// Plan 30 §M9 × §M4: a spilled manifest adopted from a predecessor's
 /// backup tail whose chunk list is not expanded into pending rows yet:
@@ -1431,7 +1431,7 @@ impl Meta {
                 mtime_ns: None,
                 ctime_ns: None,
             };
-            spec::refuse_queued_tx(&mut tx, self, *origin, rid, op, refusal(&missing))?;
+            spec::refuse_queued_tx(&mut tx, self, *origin, rid, op, refusal(&missing), true)?;
             refused_rids.push(rid);
             rolled_back.push(rid);
         }
@@ -1475,6 +1475,7 @@ impl Meta {
                 queued.rid,
                 op,
                 refusal(&missing),
+                true,
             )?;
             refused_rids.push(queued.rid);
             rolled_back.push(queued.rid);

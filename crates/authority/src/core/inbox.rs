@@ -1604,7 +1604,7 @@ impl Core {
                 let _settle_class = self.journal_class_for(super::Asker::Remote);
                 replica.journal_inbox_refusal(
                     rid,
-                    super::client::ABANDONED_CODE,
+                    super::client::settle_code(rid, decoded.as_ref().ok()),
                     ack,
                     decoded.as_ref().ok(),
                 )?;

@@ -50452,6 +50452,162 @@ mod await_retry {
         assert!(h.meta.completed_outcome(d2).unwrap().is_some());
     }
 
+    /// Defect C (seeds 592, 1864): `repair drop-held` ran on a node that
+    /// had already been deposed (suspended past its seal). The refused
+    /// entry of the dropped seed has no outcome in the log: its `Refused`
+    /// row was fenced and never shipped. `(h, rid)`: that node, a refused
+    /// entry of `rid` queued, nothing journaled of `rid`, the lease at node 2.
+    fn deposed_after_a_drop() -> (Harness, Rid) {
+        let (mut h, broken) = holder_with_a_seed();
+        drop_held(&h, broken);
+        let seed = h
+            .meta
+            .pending_replays()
+            .unwrap()
+            .into_iter()
+            .find(|q| q.refused.is_some())
+            .expect("the seed is refused");
+        h.meta.strand_below_epoch(2).unwrap();
+        h.core.lease.held = None;
+        h.core.lease.cached_holder = Some(2);
+        assert_eq!(
+            h.meta.completed_outcome(seed.rid).unwrap(),
+            None,
+            "the drop's refusal went with the deposition"
+        );
+        assert!(h
+            .meta
+            .pending_replays()
+            .unwrap()
+            .iter()
+            .any(|q| q.rid == seed.rid && q.refused.is_some()));
+        (h, seed.rid)
+    }
+
+    fn settle_sent(out: &[Action], rid: Rid) -> Option<(NodeId, OpId, MutateOp)> {
+        sends(out).into_iter().find_map(|(to, m)| match m {
+            PeerMsg::MutateRequest {
+                req,
+                rid: r,
+                op,
+                settle: true,
+                ..
+            } if *r == rid => Some((to, *req, op.clone())),
+            _ => None,
+        })
+    }
+
+    fn copy_started(out: &[Action]) -> bool {
+        out.iter().any(|a| matches!(a, Action::ConflictCopy { .. }))
+    }
+
+    fn reply_for(req: OpId, outcome: MutateOutcome) -> Event {
+        Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome,
+                base: None,
+                position: constellation_meta::Position::ZERO,
+                gen: 0,
+                own_chunks: OwnChunks::None,
+                own_rows: None,
+                committed: true,
+            },
+        }
+    }
+
+    /// A refused entry makes its conflict copy only once its rid's refusal
+    /// is in the log: with no outcome here, the rid is settled through the
+    /// sequencer in force, with the dropped code (not the abandoned one: the
+    /// op was acknowledged, and its copy is the artifact), and the copy waits
+    /// for the answer.
+    #[test]
+    fn a_deposed_droppers_refused_entry_settles_before_its_copy() {
+        let (mut h, r) = deposed_after_a_drop();
+        let out = drain(&mut h);
+        let (to, req, op) = settle_sent(&out, r).unwrap_or_else(|| panic!("no settle: {out:?}"));
+        assert_eq!(to, 2, "to the sequencer in force");
+        assert_eq!(
+            op,
+            MutateOp::Records {
+                records: vec![LogRecord::Refused {
+                    rid: r,
+                    code: constellation_meta::DROPPED_CODE
+                }]
+            },
+            "a settle with the dropped code"
+        );
+        assert!(!copy_started(&out), "no copy before the rid is settled");
+        // One settle in flight; no copy on the next tick either.
+        h.advance(250);
+        let again = drain(&mut h);
+        assert!(settle_sent(&again, r).is_none() && !copy_started(&again));
+        assert_eq!(h.core.stats.refused_entry_settles_sent, 1);
+
+        // The sequencer in force journaled the refusal: the copy is made.
+        let out = h.step(reply_for(req, MutateOutcome::Errno(Code::Io)));
+        assert!(copy_started(&out), "{out:?}");
+    }
+
+    /// The sequencer in force completed the original from its tail: the
+    /// write survived, the entry is forgotten and no copy is made.
+    #[test]
+    fn a_refused_entry_whose_rid_the_successor_completed_makes_no_copy() {
+        let (mut h, r) = deposed_after_a_drop();
+        let out = drain(&mut h);
+        let (_, req, _) = settle_sent(&out, r).unwrap_or_else(|| panic!("no settle: {out:?}"));
+        let out = h.step(reply_for(
+            req,
+            MutateOutcome::Accepted {
+                epoch: 2,
+                records: Vec::new(),
+            },
+        ));
+        assert!(!copy_started(&out), "{out:?}");
+        // The reply came on a base this replica has not applied: the rid's
+        // completion arrives through the log. When it has, the entry is
+        // forgotten, with no copy.
+        h.meta
+            .apply_records(&[LogRecord::Completed { rid: r }])
+            .unwrap();
+        h.advance(250);
+        let out = drain(&mut h);
+        assert!(!copy_started(&out), "{out:?}");
+        assert!(
+            h.meta.pending_replays().unwrap().iter().all(|q| q.rid != r),
+            "forgotten: {:?} {out:?}",
+            h.meta.pending_replays().unwrap()
+        );
+        assert_eq!(h.core.stats.refused_entries_survived, 1);
+        let out = drain(&mut h);
+        assert!(!copy_started(&out));
+    }
+
+    /// The settle executed at this node as the sequencer in force journals
+    /// the dropped code as the rid's outcome, and the copy follows once that
+    /// row is committed.
+    #[test]
+    fn a_refused_entry_settled_at_the_sequencer_in_force_here_journals_the_dropped_code() {
+        let (mut h, r) = deposed_after_a_drop();
+        // The lease is this node's again (a fresh epoch).
+        h.hold(3, None);
+        let mut out = drain(&mut h);
+        assert_eq!(
+            h.meta.completed_outcome(r).unwrap(),
+            Some(constellation_meta::CompletedOutcome::Refused {
+                code: constellation_meta::DROPPED_CODE
+            }),
+            "{out:?}"
+        );
+        for _ in 0..4 {
+            h.advance(250);
+            out.extend(drain(&mut h));
+            out.extend(h.archive_lands());
+        }
+        assert!(copy_started(&out), "{out:?}");
+    }
+
     /// R5 at a node that is not the sequencer in force (deposed, or the
     /// lease moved after the drop): the settle goes where the op itself
     /// would, to the holder, as a settle of the rid; the sequencer there

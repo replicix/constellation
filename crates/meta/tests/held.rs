@@ -272,6 +272,7 @@ fn drop_held_turns_the_seed_into_a_conflict_copy_and_replays_the_rest() {
     let seed = &queued[0];
     let refusal = seed.refused.as_ref().expect("the seed is refused");
     assert!(refusal.reason.contains("drop-held"), "{refusal:?}");
+    assert!(seed.dropped, "the drop's own refusal: {seed:?}");
     assert_eq!(refusal.ts_unix, 1234);
     let MutateOp::SetManifest { ino, manifest, .. } = &seed.op else {
         panic!("{:?}", seed.op);
