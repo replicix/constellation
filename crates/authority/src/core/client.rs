@@ -1515,6 +1515,18 @@ impl Core {
                 // rid, no attempt spent) — the holder answers from its
                 // dedup, or holds the retry until the recalls are done.
                 self.stats.held_retries += 1;
+                // Plan 46 M0.2 review: a holder answering `Held` is alive
+                // and holding the op by design (behind its replay queue, up
+                // to the placeholder's bound, or for a recall): a replay it
+                // holds is not stuck, and the lease fallback
+                // (`replay_lease_fallback_ms`) does not count the time.
+                if self
+                    .clients
+                    .get(&rid)
+                    .is_some_and(|c| matches!(c.origin, Origin::Replay { .. }))
+                {
+                    self.replay.stuck_since = None;
+                }
                 let timer =
                     self.set_timer_wait(now.wait.plus(retry_ms), Timer::ForwardBackoff(rid), out);
                 if let Some(c) = self.clients.get_mut(&rid) {

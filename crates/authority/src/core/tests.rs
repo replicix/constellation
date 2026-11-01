@@ -50491,4 +50491,87 @@ mod await_retry {
             "not executed once the queue let go"
         );
     }
+
+    /// Review item 4: a deposed holder answers the forwards it parked
+    /// behind its queue `Busy` — they were never executed — and no longer
+    /// holds them, so a retry does not re-attach to a park that can never
+    /// be released.
+    #[test]
+    fn a_deposed_holder_aborts_the_ops_parked_behind_its_queue() {
+        let (mut h, broken) = holder_with_a_seed();
+        let (p, d) = (rid_of(2, 1), rid_of(1, 7));
+        exec_as(&h, RowClass::Archive, p, &rename_in_root("broken", "moved"));
+        exec_as(&h, RowClass::Lone, d, &unlink_in_root("moved"));
+        drop_held(&h, broken);
+        let n3 = rid_of(3, 1);
+        let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let create = create_in(ROOT_INO, "moved", ino);
+        let out = forward_of(&mut h, 3, 30, n3, &create);
+        assert_eq!(reply_to(&out, 30), None);
+        assert!(h.core.queue_parks());
+
+        let mut out = Vec::new();
+        h.core.deposed(h.clk(), 2, 5, 1, &h.meta, &mut out);
+        assert_eq!(
+            reply_to(&out, 30),
+            Some(MutateOutcome::Busy),
+            "the requester is told to retry: {out:?}"
+        );
+        assert!(!h.core.queue_parks(), "still parked");
+        // A retry is not re-attached to a dead park.
+        let out = forward_of(&mut h, 3, 31, n3, &create);
+        assert!(reply_to(&out, 31).is_some(), "{out:?}");
+        assert_eq!(h.meta.completed_outcome(n3).unwrap(), None);
+    }
+
+    /// Review item 5: a replay the holder keeps parked behind its own queue
+    /// (it answers `Held`) is not stuck: the waiting node does not count the
+    /// time toward `replay_lease_fallback_ms` and does not ask for the lease
+    /// (the churn would be a lease acquisition per bound).
+    #[test]
+    fn a_replay_the_holder_holds_does_not_start_the_lease_fallback() {
+        let (_holder, mut requester) = pair();
+        let rid = requester.rid(5);
+        let ino = requester.meta.allocate_ino(ROOT_INO).unwrap();
+        requester
+            .meta
+            .queue_replay(rid, &create_in(ROOT_INO, "r", ino), &Default::default())
+            .unwrap();
+        // The drain sends it to the holder.
+        let out = drain(&mut requester);
+        let req = sends(&out)
+            .into_iter()
+            .find_map(|(_, m)| match m {
+                PeerMsg::MutateRequest { req, rid: r, .. } if *r == rid => Some(*req),
+                _ => None,
+            })
+            .expect("the replay was forwarded");
+        // The holder holds it behind its queue.
+        requester.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome: MutateOutcome::Held { retry_ms: 100 },
+                base: None,
+                position: constellation_meta::Position::ZERO,
+                gen: 0,
+                own_chunks: OwnChunks::None,
+                own_rows: None,
+                committed: false,
+            },
+        });
+        assert!(requester.core.replay.stuck_since.is_none());
+        // Its deadline passes unanswered; the drain looks again, long after
+        // the fallback interval: no lease request.
+        let mut out = Vec::new();
+        requester
+            .core
+            .finish_in_doubt(requester.clk(), rid, &requester.meta, &mut out);
+        requester.advance(11_000);
+        let out = drain(&mut requester);
+        assert!(
+            s3_ops(&out).is_empty(),
+            "the waiting node asked for the lease: {out:?}"
+        );
+    }
 }

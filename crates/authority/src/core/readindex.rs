@@ -1168,7 +1168,10 @@ impl Core {
             .rd
             .parked
             .iter()
-            .filter(|(_, p)| p.durable.is_some())
+            // (Plan 46 M0.2 review: an op parked behind the replay queue
+            // waits for this node's queue, which a lost lease hands to the
+            // recovery; its requester retries at the new holder.)
+            .filter(|(_, p)| p.durable.is_some() || p.queue_gated)
             .map(|(id, _)| *id)
             .collect();
         let mut n = 0;
@@ -1236,11 +1239,31 @@ impl Core {
                 ParkedWhat::Release => {}
                 ParkedWhat::InboxRepoll { .. } => {}
                 ParkedWhat::ExecuteReply {
-                    rid, held_timer, ..
+                    from,
+                    req,
+                    rid,
+                    held_timer,
+                    ..
                 } => {
                     self.rd.parked_rids.remove(&rid);
                     if let Some(t) = held_timer {
                         self.cancel_timer(t, out);
+                    }
+                    // (Not executed: the requester retries by rid.)
+                    if let Some(req) = req {
+                        out.push(Action::Send {
+                            to: from,
+                            msg: PeerMsg::MutateReply {
+                                req,
+                                outcome: MutateOutcome::Busy,
+                                base: None,
+                                position: Position::ZERO,
+                                gen: 0,
+                                own_chunks: OwnChunks::None,
+                                own_rows: None,
+                                committed: false,
+                            },
+                        });
                     }
                 }
                 ParkedWhat::ExecuteLocal { rid } => {
