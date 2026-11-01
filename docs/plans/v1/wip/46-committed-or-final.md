@@ -1,0 +1,731 @@
+# Plan 46 — Committed or final: one stream per node, the commit rule per configuration, no server-side replay
+
+Read `docs/plans/v1/CONVENTIONS.md` first. This plan changes the
+*direction* of the acknowledgement and ordering-node work that plan 43
+carries, on the maintainer's decisions of 2026-11-01
+([ADR-40](../../../explanation/DECISIONS.md#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)).
+Plan 43's rules stand (S3 is the configuration master; nothing is
+acknowledged that the configured group has not committed; nothing
+committed is re-executed; authority state lives in the log; stranded
+unacknowledged ops are settled before `EIO`). What changes is the
+*structure* that enforces them:
+
+1. **Every acknowledgement is committed or final.** A row is either
+   *committed when answered* (its configuration's group holds it, or the
+   archive does) or *final without a group* (answered by a non-stealable
+   authority: a designee, a sticky grant, an epoch hold with one member).
+   Nothing acknowledged is ever rolled back. The one exception is a
+   **singleton** (no write-eligible peer in the roster), whose
+   acknowledgement rests on its disk because nobody else can take its
+   lease while it lives and its own restart re-adopts its journal.
+2. **The commit rule is a property of the configuration, not of the
+   row.** A sequencer's tenure (a root epoch, a node generation) has one
+   commit rule, recorded in its configuration object and changed only by
+   a reconfiguration record that commits under the old and the new
+   configuration together. A row carries its configuration version. The
+   five acknowledgement classes decided per row go.
+3. **One stream per delegate node.** A delegation grant is to a *node*
+   and covers a set of subtrees; the node has one stream, one group, one
+   cut. Hash-range splits, per-range generations and the cross-generation
+   dependency machinery go. No delegate is lone: a node is delegated only
+   with a group (a backup within budget or the root within budget) or
+   under a sticky, non-stealable grant.
+4. **Far writers hold sticky grants.** A node with no peer within the RTT
+   budget writes its subtrees under a non-stealable grant released only by
+   the holder itself (idle, unmount, suspend, planned network-down, a
+   cooperative handover, `constellation release`) or by the operator's
+   `abandon`. The root takes sticky grants on the subtrees *it* writes
+   when it has write-eligible peers and no group, never on `/`.
+5. **The server never re-executes.** The replay queue, the fold,
+   `derive_replay_op`, `Origin::Replay`, the replay half of drop-held and
+   `ack=local` are deleted. A requester's in-doubt retry by rid is the
+   one copy of an unacknowledged op; a rolled-back row that *was*
+   acknowledged exists only on a singleton, and it becomes a conflict copy
+   made by the node that holds its data, not a replay.
+6. **Then C4 as specified**, on records that no longer meet a generation
+   end that does not exist, and C7b-8's root-anchored cut after it.
+
+Every milestone leaves `main` correct and shippable. Each stage deletes
+the states the next stage would otherwise have to handle; the order is
+chosen for that, not for size.
+
+## Dependencies
+
+- Plan 43 C0–C2f (committed): the oracles I1–I6, the sim rebuild, the
+  operator escape, the root group's commit, the delegate's group, the
+  generation's cut, a lone root answering other nodes from the archive.
+  This plan keeps all of it.
+- Plan 43 C2g, C2g′ and C2h's scenarios land first (stage 0 below); they
+  are plan 43 milestones, executed as written, with the one narrowing
+  stated under stage 0.
+- Plan 41 L0 and the F1 fix (committed; the rules stay). Plan 44
+  (committed). Plan 45 (committed; hard links no longer move keys between
+  generations once there is one stream per node, §5.3).
+- The campaign tooling, the `+commit` strict flags, the sim's lease-read
+  knob (committed): this plan's fail-before evidence.
+- Coordinates with plan 41 L5/L6 (renewal lane follow-ups): a
+  delegation's renewal is unchanged; the grant it renews is a node
+  stream's. Coordinates with plan 40 R8 and plan 42's campaigns only
+  through the harness catalogue. Nothing else is in flight in the
+  authority core.
+
+## 1. History
+
+| When | What | Where |
+|---|---|---|
+| 2026-09-24 | Plan 30 M9: backups, seals, `AckPolicy`, `ack=s3` | `0e1017b` |
+| 2026-09-26..10-07 | Plan 30 M11/M12: delegations, generations, recall, hash-range splits, placement | PROGRESS "Plan 30 M11", "M12" |
+| 2026-10-16/17 | The arbiter study (ten acknowledged, fsynced files read empty after a takeover) | `docs/explanation/ARBITER-STUDY.md` |
+| 2026-10-17 | ADR-33: commit is the configured group's acknowledgement; plan 43 accepted | ADR-33 |
+| 2026-10-22..10-31 | Plan 43 C0, C1-1..C1-4, C2a..C2f landed; ADR-38 (splits off), ADR-39 (cross-generation dependencies) | PROGRESS "Plan 43 …" |
+| 2026-11-01 | The acknowledgement area reviewed structurally: 55 bug rows, the mechanism inventory, the survey of other systems, four options; the maintainer decides the staged direction | ADR-40, this plan |
+
+## 2. Diagnosis
+
+The figures are from the review of 2026-11-01 (one row per cluster of
+causes, read from PROGRESS, the triage and the commits; not an
+exhaustive audit).
+
+- **55 bug rows since 2026-09-25, 41 of them integrity.** Primary
+  mechanism: delegations 12, speculation 10, answer classes 8. As *any*
+  label, delegations appear in 25 rows, the takeover gate in 13; the
+  densest interaction is delegation × takeover gate (8 rows, plus an open
+  one). 239 `fix` commits touched `crates/authority` or `crates/meta`
+  since 2026-09-18, 94 of them since 10-23.
+- **19 of 51 closed rows (37 %) were introduced by changes in this
+  area**: 6 regressions from landed commits, 11 defects in a fix caught by
+  its own review, 2 earlier fixes incomplete. 9 of 13 first reviews did
+  not clear; each HOLD named a MUST defect inside new code. Two fix
+  series dropped acknowledged rows before landing (ADR-39's, twice; the
+  re-append answered before commit, 19 seeds).
+- **16 rows were found by review or reading with no oracle firing**, 11
+  of them reproducible only by a hand-written unit test: the sim's
+  configurations do not reach the states ("sim configs never flip
+  lone↔group").
+- **Non-test authority core code grew 22.4k → 46.5k lines in five weeks
+  of fixing**; `core/tests.rs` 6.4k → 48.4k; `meta/src` 22.7k → 51.9k.
+- **Nothing in the rules is wrong.** Invariants I1–I5 are the right ones.
+  The bugs come from four structural choices: (1) commit decided *per
+  row* by a five-way class function over mutable state (`AckClass`:
+  Archive, RootGroup, DelegGroup{gen}, NonStealable, Lone; chosen at
+  journal time from inputs that change underneath it — rows 24, 29, 38,
+  39, 48, 51 of the review are the class, the lock, the lead and the
+  published horizon disagreeing by one step); (2) an acknowledgement the
+  *server* can take back, so the server keeps a second executable copy of
+  every op (rows 8, 10, 11, 13, 14, 25, 26, 35, 36, 50, 52 are copies
+  racing; member copies with four drop rules exist to *exempt* committed
+  rows from a rollback that should not apply to them); (3) a delegate as
+  a second sequencer whose configuration lives in an uncommitted log tip,
+  with one node running several generations with causal dependencies
+  across them (ADR-39's fixpoint is the admission; rows 39, 41, 42, 43,
+  part of 49/53); (4) authority state travelling in messages (plan 43 C4
+  is the fix and is unbuilt).
+- **No surveyed system acknowledges and later rolls the acknowledgement
+  back.** Systems either acknowledge after a durable quorum with epoch
+  fencing and truncation (Aurora, FoundationDB, HDFS QJM, Spanner, Raft),
+  or reply early and let the *client* keep and replay the request while
+  the server only truncates at recovery (Lustre's transno and
+  `last_committed`, CephFS's unsafe replies and `clientreplay`), or make
+  commit a provable function of durable state (CockroachDB's parallel
+  commits, whose TLA+ property is "a client is never acknowledged before
+  the transaction is committed"). Calvin's authors name asynchronous
+  replication of the ordering log as the mode with "significant
+  complexity in failover". In every surveyed system the commit rule is a
+  property of the configuration (epoch, replica set), fixed for a tenure
+  and changed by a reconfiguration that commits under old ∪ new. Sources
+  in §13.
+
+What forces early acknowledgement is hard constraints 3 and 4 together
+with ADR-23: answer from the writer's own disk, scale writers by
+delegation, never wait for S3. Constraint 3 forces it only for a
+*singleton*, whose lone answer no other node can roll back. The rollback
+states exist only because the `Lone` class was extended to nodes that
+*have* peers: a root with distant peers, and a delegate with no backup
+and the root beyond the budget. A sticky non-stealable grant gives such a
+node the same zero latency with a final answer, at the failure mode the
+maintainer has already accepted for groups (plan 43 G4: a claim waits for
+its group without bound; `repair abandon-group`) and for designees (a
+dead designee blocks its subtree until it returns or is released).
+
+## 3. Decisions (the maintainer, 2026-11-01), with their reasons
+
+| # | Decision | Reason |
+|---|---|---|
+| D1 | **Direction**: the staged recommendation of the review (stage 0 settle items; stage 1 one stream per node, classes per configuration, no lone delegates, sticky placement, the hold as a group, with C3's verbatim re-ship folded in; stage 2 delete server-side replay; stage 3 C4, then C7b-8). | Each stage deletes the states the next would have to handle; total effort ≈ 12–18 coder-weeks against 8–12 for finishing plan 43 as specified, for two row states instead of five, one sequencer per node instead of several, no server-side re-execution, and 10–14k fewer lines in the area that produced 41 integrity bugs in six weeks. |
+| D2 (Q1) | **Far writers hold automatic sticky grants**, with holder-side idle release (default ≈ 60 s, configurable) and the release always initiated by the holder; release on clean unmount, on suspend/hibernate/shutdown (a systemd-logind delay inhibitor), on planned network-down (a NetworkManager pre-down dispatcher), by cooperative handover when another node wants the subtree, by `constellation release <fs> [--wait]`; operator `abandon` as the last resort; an optional self-fencing timeout as a setting, **off** by default. | A far writer keeps local speed with a *final* answer; the root never times a grant out, so no acknowledged row can be rolled back by a reclaim; the failure mode (a node lost mid-write blocks its subtree until it returns or the operator abandons) is the one already accepted for groups and designees. `sync`/`syncfs` never reach a plain FUSE daemon (DESIGN §3), so there is no sync hook; the lifecycle hooks above are where a holder can still act. |
+| D3 (Q2) | **The root takes sticky grants on the subtrees it writes itself** (never on `/`) when it has write-eligible peers and no group, so no node with write-eligible peers ever answers from its disk alone; every acknowledgement is committed or final; nothing acknowledged is ever rolled back. A **singleton** still answers from its disk. The model covers the transition when the first peer joins. | Removes the last rollback of an acknowledged row on a node with peers, and with it the whole server-side replay. The singleton's answer cannot be rolled back by anyone else; its own restart re-adopts its journal. |
+| D4 | **Drop `ack=local`.** The lease's `AckPolicy::Local` and the lone-root branch go; `fs create --ack-policy s3` stays (§5.6 says what replaces the flag's `local` value). Stage 2 is a *deletion* of server-side replay, without a client-owned replay list, provided the requester's existing in-doubt retry covers every unacknowledged row (§5.5 verifies it against the code and names the one small piece missing). | Designations cover offline laptops; nothing else needs a lone branch on a node with peers. A client-owned replay list would keep a rollback-and-replay path alive for one opt-in. |
+| D5 (Q3) | **Delete hash-range splits** (the mechanism, not only the default). | ADR-38 measured 0.01×–0.91× on real names; splits are the main source of multi-generation nodes and of the cross-generation dependency machinery (ADR-39). |
+| D6 (Q4) | **The epoch hold waits for one member**: the hold is a group {owner, one member}; its answers to other nodes wait for one member's acknowledgement of the stream-ahead. | Removes the hold's uncommitted `NonStealable` answers to members (rows 51, 52's variant 3) at one LAN round trip inside an epoch, whose members are on the LAN by construction. |
+| D7 (Q5) | **Fold C3 into stage 1**, with a two-week timebox on the Stateright model; if the model is not proven by then, finish C3 as written first and start stage 1 after it. | One stream per node makes C3's items 1–3 smaller; the timebox bounds the risk of doing the recall path twice. |
+| D8 (Q6) | **Keep conflict copies** as the artifact of a refused or stranded acknowledged row; the node that holds the data makes the copy. | GOALS promise them; the requester has the bytes. |
+| D9 (Q7) | **Stop**: plan 43 C6, C7b-8 (until after C4), the G1 p90 nudge (the patch is saved; re-measure after stage 1), C2h's flex strict flags, C3 and C5 as specified; do not start C5. | C6 is not needed for correctness and the knob exists; C7b-8 moves with C4 and stage 1 changes the cut; the nudge is 0.33 ms on rename/unlink p90 and stage 1 removes one stream wait; the flex strict flags fail 36–81 of 2,000 seeds on states stage 1 changes (the hold's class); C3's items 1–3 are redone under one stream, item 4 (the open placement-hot seed) is folded into stage 1; C5 isolates a branch that stage 2 deletes. |
+
+## 4. What the code does today (what each milestone replaces)
+
+- **Classes per row.** `AckClass` (`crates/authority/src/core/backup.rs`)
+  has five values; `root_ack_class_for` (`backup.rs`), `deleg_ack_class`
+  (`core/delegate.rs`) and `RowClass` (`crates/meta/src/store/local.rs`)
+  decide it when a row is journaled, from whether a peer is within budget
+  and stable, whether a backup is listed, requested or removed, whether
+  the delegate's journal is within `delegation_stream_rows` (256) of the
+  root's cursor, which generation owns the keys and who asked. The fast
+  path falls back to `journaled_class` (`crates/engine/src/view/write_gate.rs`);
+  the store re-classes the core's row under the writer lock (ADR-33, C2c).
+  `status.ack.classes` counts five classes; the sim's `LoneLead` oracle
+  checks the lead.
+- **The server rolls back and re-executes.** `strand_below_epoch`,
+  `strand_for_takeover`, `strand_local_tx` (`crates/meta/src/store/spec.rs`)
+  roll rows back from before-images and enqueue them (`pending_replay`);
+  `crates/authority/src/core/replay.rs` (883 lines) drains the queue by
+  rid through the forward path with `Origin::Replay`;
+  `crates/meta/src/replay.rs` (1,755 lines) and `derive_replay_op`
+  (`spec.rs`) rebuild ops from rows; `ReplayState.unacked` marks the rows
+  whose reply was still parked when the tenure ended (`abort_durable_parks`,
+  `core/readindex.rs`) so a refused replay is the client's answer. Member
+  copies (`crates/meta/src/store/member.rs`, four drop rules) exempt
+  committed rows from this. `repair drop-held` (`store/held.rs`) replays
+  dependents by rid.
+- **Delegation as a second sequencer with ranges and generations.**
+  `Delegate { dir, node, gen, designated, range }`, `DelegGroup { dir, gen,
+  version, backups }`, `RecallCut { dir, gen, through }`
+  (`crates/meta/src/record.rs`); `GenState`/`DelegateState`, the per-range
+  windows (`core/deleg_windows.rs`), `place_splits` and the 16-bucket name
+  histograms (`core/placement.rs`), the lead (`delegation_stream_rows`),
+  `deleg_caps`/`deleg_note_xdeps`/`deleg_covered` (ADR-39), the "unlink
+  moves the file's keys to the next link's generation" rule, the
+  lone↔`DelegGroup` hysteresis per generation, `deleg_lost_after_ack`,
+  `deleg_xgen_acks_delayed`. Placement proposes and recalls on 30 s
+  windows (70 %/50 %, a dwell, a cool-down). Designations are
+  `Delegate { designated: true }` (`crates/engine/src/designation.rs`).
+- **The lone root.** `AckPolicy::Local` (`crates/store-s3/src/lease.rs`)
+  is the lease's state when no backup is listed; a root with distant peers
+  answers its own node from its disk (`Lone`), other nodes from the
+  archive (C2f). `fs create --ack-policy local|s3` and `CONSTELLATION_ACK`
+  choose `Local` or `S3` at creation (`parse_ack_policy`,
+  `crates/engine/src/authority_driver.rs`); `Local` becomes `Backup` when
+  a backup is listed.
+- **The epoch hold** answers members `NonStealable`, uncommitted (plan 43
+  Q3, Q12); `hold_owner_never_deposed_except_by_retire` is the flex model's
+  guard (`crates/model/src/flex.rs`).
+
+## 5. Design
+
+### 5.1 Two row states, decided by the configuration
+
+A sequencer's **configuration** is the versioned object the reconfigurer
+reads: for the root, the lease (`backups`, `config_version`,
+`ack_policy`); for a delegate node, its generation's group record
+(`DelegateNodeGroup`, §5.3). Each configuration has one **commit rule**:
+
+- *group*: committed once every member of the configuration holds the
+  row (the root's holder and listed backups; the delegate node and its
+  recorded backup, or the root's appended row when none is recorded);
+  with no member listed, committed once the archive carries it;
+- *final*: a non-stealable configuration (a designation, a sticky grant,
+  an epoch hold with one member): the answer is final when the holder's
+  disk has the row, because no one can replace the holder without its
+  own release record or the operator's abandon.
+
+A row carries its **configuration version**, not a class:
+`RowCommit::Group { config_version }` or `RowCommit::Final` replaces
+`RowClass` and `AckClass`. A change of configuration is a reconfiguration
+record that commits under old ∪ new: the lease's add-then-record and
+remove-when-covered rules (plan 30 M9, plan 43 C1) applied uniformly to
+the node stream's group. The per-row decision sites
+(`root_ack_class_for`, `deleg_ack_class`, the under-lock re-class, the
+published horizon with class, `journaled_class`) become one lookup of the
+configuration in force at the row's journal position. The fast path
+writes under the configuration version the core published and waits for
+that configuration's commit point; a configuration change between the
+publish and the journal is caught where it is today (the writer lock),
+but it now compares two version numbers, not two class decisions.
+
+`Lone` survives only as the **singleton** case: a root whose roster
+(`nodes/`) holds no write-eligible peer answers from its disk; the sim and
+model name it `Singleton`, and a counter (`status.ack.singleton_acks`)
+replaces `lone_acks`. The singleton's rows are speculation in ADR-19's
+sense only towards its own restart (which re-adopts its journal) and
+towards the archive (which it reaches alone). §5.5 says what happens if a
+singleton dies with unshipped rows and a new node joins before it
+returns.
+
+`Archive` is not a class: it is the group commit of a configuration with
+no members (a root with no backup in budget answering a forward, plan 43
+C2f). `AnswerSource` stays as what it is, the record of what the answer
+waited for, for `status` and the oracles.
+
+### 5.2 One stream per delegate node
+
+A delegation grant is to a **node**, covering a set of subtrees. The
+records (`crates/meta/src/record.rs`; the old ones go, §10):
+
+```
+DelegateNode      { node, gen, dirs: Vec<SubtreeGrant> }   // root record: a generation opens or its set grows
+SubtreeGrant      { dir, kind: Placed | Sticky | Designated }
+SubtreeReleased   { node, gen, dir, at: idx }              // delegate's stream: the holder releases one subtree
+StreamReleased    { node, gen, through: idx }              // delegate's stream: the holder releases every subtree (unmount, suspend, `release`)
+DelegateNodeGroup { node, gen, version, backups }          // root record: the stream's configuration (DelegGroup's successor)
+DelegateNodeEnded { node, gen, through }                   // root record: the generation's end and cut (RecallCut's successor)
+```
+
+- The node has **one stream** `(gen, idx)`, one group, one cut. Its rows
+  in every subtree it holds are one total order; a rename between two of
+  its subtrees is an ordinary op. The ownership walk (`crates/meta/src/delegation.rs`)
+  resolves a dentry to the delegation containing its parent as today, and
+  then to the *node* holding that subtree; the table's row is keyed by
+  `node` with the subtree set folded from the records.
+- **Growing the set** is a root record (`DelegateNode` with the new
+  `dirs`; the delegate learns it from its table, never from a message —
+  the C2 spec's D4 rule). **Shrinking it** is a row *in the delegate's
+  stream*: `SubtreeReleased { dir, at }` names the last index of the
+  stream that touched `dir`, so the root sequences ops in `dir` only after
+  appending through `at`. A recall by the root (a cross-subtree op, a
+  placement decision, a handover) is a *request* to the delegate, answered
+  by that record; a placed grant whose holder is unreachable ends by TTL
+  as today (`DelegateNodeEnded` with the cut at the root's cursor, after
+  the recorded backup's seal when one exists, plan 43 C2e); a sticky grant
+  never ends by TTL (§5.4).
+- **No lone delegate.** `DelegateNode` is written only for a node with a
+  group within budget (a backup, or the root) or for a `Sticky` or
+  `Designated` grant. The lead (`delegation_stream_rows` as a commit
+  input), the lone↔group hysteresis, the delegate's `Lone` paths and
+  `deleg_lost_after_ack` go. A far writer with neither is forwarded (WAN
+  RTT, as a non-delegated writer today) until placement gives it a sticky
+  grant (§5.4).
+- **ADR-39 goes.** With one total order per node and one group, nothing
+  is acknowledged past the cut without being in the sealed tail, so a lost
+  dependency across generations cannot exist: `deleg_caps`,
+  `deleg_note_xdeps`, `deleg_covered`, the xgen counters, and plan 45's
+  "unlink moves the file's keys to the next link's generation" rule go.
+- **C3's verbatim re-ship, under one stream.** The root appends the
+  stream's rows verbatim under `(gen, idx)` (landed in part); the tail of
+  a sealed stream is applied verbatim in one transaction
+  (`MetaError::TailDiverged`); a delegate taking the root over re-appends
+  its own stream's rows the tail lacks, verbatim, before ending its
+  generation; a deposed root keeps another node's appended rows as a
+  member copy and the next root seals the predecessor's stream (C3 §5.4
+  item 4; the open `placement-hot` seed). The fold, `MutateOp::Records`
+  copies, holed generations and the deposed root's rebuild-replay go here,
+  not in stage 2, because with no lone delegate nothing a delegate answers
+  is ever replayed.
+
+The model decides the one open design point before code: whether a
+subtree-set stream keeps `recall_safety` with one cut per stream. If it
+needs a per-subtree cut that re-creates cross-cut dependencies, the
+fallback is **one subtree per node** (a node dominating two trees gets
+one grant on their common ancestor or one of them) with the rest of §5
+unchanged.
+
+### 5.3 Sticky placement
+
+Placement (`core/placement.rs`) proposes a delegation once and recalls
+only for a cross-subtree op, an explicit command, a handover request, or
+after a long dwell (`CONSTELLATION_PLACEMENT_DWELL_MS` raised to minutes;
+the 30 s windows and 70 %/50 % thresholds stay as the *proposal* input
+only). The split side (`place_splits`, the histograms, `--range`) goes.
+Reconfigurations are where the delegation × takeover bugs live; sticky
+placement reduces their frequency, as CephFS does by shipping its
+balancer off and offering pins.
+
+### 5.4 Sticky grants (D2, D3)
+
+A `SubtreeGrant { kind: Sticky }` is a non-stealable grant with
+cooperative release, the same machinery as a designation (which is
+`kind: Designated`: released only by `online`). Its answers are
+`RowCommit::Final`.
+
+**Who gets one.** (a) Placement gives a sticky grant to a node that
+dominates a subtree and has no peer within `CONSTELLATION_BACKUP_RTT_BUDGET_MS`
+(5 ms), the root included (today's lone delegate). (b) The root takes a
+sticky grant on each subtree *it* writes when it has write-eligible peers
+and no group: placement's proposal walk applied to the root's own
+origin, the topmost directory it dominates, never `/`. The grant record
+commits by the archive (the root has no group), so the root's first op in
+a new subtree waits one S3 round trip; afterwards its ops in that subtree
+are final at local speed. The root's ops outside any sticky subtree (a
+file directly in `/`, a subtree another node holds) wait for the archive
+or are forwarded, as today's forwards to a lone root do. (c) By hand:
+`constellation delegate --sticky <path>`.
+
+**Release is the holder's.** The root never times a sticky grant out. The
+holder releases by draining its stream, waiting until the root has
+appended through its last row (the stream's commit), and writing
+`SubtreeReleased` or `StreamReleased` in its stream; the root appends it
+and writes `DelegateNodeEnded` (or the shrunken `DelegateNode`). Triggers,
+all in the engine's `sticky` module (`crates/engine/src/sticky.rs`, new):
+
+- *idle*: no op in the subtree for `CONSTELLATION_STICKY_IDLE_RELEASE_MS`
+  (default 60,000; 0 disables);
+- *clean unmount*: the view's close drains and releases before the
+  daemon's handover or exit;
+- *suspend, hibernate, shutdown*: a systemd-logind delay inhibitor
+  (`Inhibit("sleep:shutdown", …, "delay")`, acting on `PrepareForSleep`
+  and `PrepareForShutdown`), releasing within the inhibitor's window;
+  the package ships a logind drop-in raising `InhibitDelayMaxSec` if the
+  default is too short for a drain (`crates/platform`, Linux);
+  macOS and Windows per their ports (plans 34, 35), best-effort;
+- *planned network-down*: a NetworkManager pre-down dispatcher script
+  calling `constellation release --wait` (shipped in the package, Linux);
+- *cooperative handover*: the root's recall request on behalf of another
+  node that wants to write the subtree (placement sees the other node's
+  forwards; the holder releases when idle for a short grace or at once
+  when it has no op in flight);
+- *by hand*: `constellation release <fs> [--wait]`, a holder-side
+  command releasing every sticky grant the node holds on `<fs>`
+  (`--wait` blocks until the root has recorded the end; non-zero exit if
+  not released). It is a top-level command, distinct from
+  `snapshot release`.
+
+**A node lost mid-write.** Its subtree is blocked for other writers
+(`EROFS` at the root, `EXDEV` for cross-subtree ops, as under a
+designation) until it returns and releases or the operator runs
+`constellation repair abandon --node <id> [--gen <g>]` (the existing
+`abandon-group`'s sibling: the root ends the generation at its cursor;
+rows the holder acknowledged past the cut are *lost for others and kept
+by the holder* as conflict copies on its return, §5.5). Nothing the
+holder's clients were told is rolled back by anyone but the operator, and
+the operator's action is documented as the loss it is (I5's clause (b)).
+
+**Self-fencing (optional, off).** `CONSTELLATION_STICKY_SELF_FENCE_MS=Y`
+(default 0): a holder that has not heard the root for `Y` ms stops
+admitting local writes in its sticky subtrees (`EROFS` to its own
+applications) and keeps the ones acknowledged in the last `Y` ms
+unstreamed marked; the root may reclaim after `X ≫ Y`
+(`CONSTELLATION_STICKY_RECLAIM_MS`, honour-clock terms per ADR-35), and
+the holder, on return, rolls back exactly the marked rows into conflict
+copies. With the setting on, an acknowledged row *can* be rolled back
+within the last `Y` ms before a partition; that is the setting's
+documented contract and why it is off by default.
+
+### 5.5 Stage 2: no server-side replay, and what the requester already covers
+
+**Rule.** A deposed, sealed or ended sequencer never re-executes
+anything. On deposition it *truncates*: committed rows stay as a member
+copy (C1-4, unchanged); uncommitted rows are rolled back from their
+before-images (`strand_below_epoch`'s undo half stays) and deleted, with
+no queue entry. `core/replay.rs`, `meta/replay.rs`, `derive_replay_op`,
+the fold and conditional truncate, `pending_replay`, `Origin::Replay`,
+`ReplayState`, `mark_unacked_replays`, the replay half of `held.rs`, the
+sim's `Origin::Replay` paths and the model's replay queue go.
+
+**Verification against the code (to be re-done as stage 2's first
+milestone, M2.0, before any deletion).** Who holds the one copy of an op
+whose row is rolled back uncommitted?
+
+- *Another node's forward* (`PeerMsg::Mutate`): its `ClientOp` entry
+  (`core/client.rs`: `submit`, `on_client_deadline`) keeps the op until a
+  definitive outcome; a parked reply aborted at the tenure's end is
+  answered `Busy` (`abort_durable_parks`) and the requester retries by rid
+  within its backoff; `completed` dedups; `in_doubt_rids` marks a
+  resubmission in doubt; the split deadline settles it (C2g). Covered.
+- *An inbox op*: durable in the batch, re-submitted by the inbox path
+  under the next epoch (`InboxWaiting`, `InboxWithdraw`). Covered.
+- *A delegate's own fast-path op whose generation is lost*: the write
+  gate resubmits it in doubt by rid through the core
+  (`write_gate.rs`, "leaves the op in doubt: resubmitted by rid through
+  the core"; `the_delegates_fast_path_resubmits_in_doubt_when_its_generation_is_lost`).
+  Covered.
+- *A root's own op (fast path or core) parked for its group when the
+  tenure ends*: **not covered by a client-path retry today.**
+  `abort_durable_parks` answers remote parks `Busy` but puts the own
+  node's rids into `ReplayState.unacked`, and the recovery that follows
+  *queues their rows for replay by rid*; a refused replay is the client's
+  answer. With the queue gone, the own-node op must take the same path
+  the delegate's fast path takes: `abort_durable_parks` resubmits the
+  own rid in doubt through `submit` (`Origin::Client`, `in_doubt_rids`),
+  and the core-path own op keeps its `ClientOp` entry across the
+  deposition instead of being answered from the queue. This is the one
+  **minimal piece** stage 2 adds: no list, no persistence (the op is in
+  the FUSE request that is still waiting; a daemon crash loses the
+  request with its application, as any unacknowledged op), about the
+  size of the delegate fast path's existing rule.
+- *A row that was acknowledged and is rolled back*: only a singleton's
+  (D3), or a sticky holder's past an operator's abandon or a self-fence
+  (§5.4). These are not replayed either. The holder **exports** them as
+  conflict copies: `conflict_export` (beside today's `conflict_copy` in
+  `crates/engine/src/recovery.rs`, which stays as the writer) submits, for each rolled-back
+  acknowledged row in journal order, a fresh create under
+  `.constellation-conflict/` with the row's after-image (the manifest and
+  chunks are the holder's own) through the normal client path, as a new
+  op with a new rid. It is not a replay: it never re-executes the
+  original op, never touches the original name, and refuses nothing (a
+  copy's name is unique). D8 keeps the artifact; the producer changes.
+- *A singleton that dies with unshipped acknowledged rows while a new
+  node joins and claims the lease after the TTL*: on return the singleton
+  finds its epoch superseded; its unshipped rows are exported as above.
+  This is the one window where an acknowledged row is not in the
+  namespace it was acknowledged into, and it is the single-node contract
+  as today (ADR-21: a lone node's unsynced rows are lost with its
+  clients; here they survive as copies). The model covers the join
+  (`first_peer_join`): a root with a newly write-eligible peer answers
+  nothing alone until its grant or group record is committed.
+
+**Drop-held after stage 2.** Option B's placeholder (C2g′) exists to
+order server-side re-executions behind a requester's retry; with none,
+`repair drop-held` rolls back the held row and its dependents, journals
+the seed's refusal (a conflict copy with holes, as today) and lets the
+requesters retry; own acknowledged dependents (a singleton's) are
+exported. The `AwaitRetry` kind and the park rule are deleted with the
+queue; the bound (`Refused { rid, ABANDONED }` after 2 × TTL) stays as
+the executor's settle for an absent requester (C2g).
+
+### 5.6 `ack=local` and the `--ack-policy` flag (D4)
+
+Today `fs create --ack-policy local|s3` (`CONSTELLATION_ACK` the default)
+stores `local` or `s3` in the filesystem's meta; `ack_s3_of` turns it
+into the lease's `AckPolicy::S3`, and anything else into
+`AckPolicy::Local`, which becomes `Backup` when a backup is listed.
+`local` therefore means "Layer A alone, Layer B with a peer in budget".
+After stage 2 the lease's `Local` state has no behaviour of its own: a
+root with no backup commits by the archive (its forwards already do,
+C2f), by a sticky grant (its own subtrees), or alone only as a singleton
+(derived from the roster, not configured). So `AckPolicy::Local` is
+deleted; `AckPolicy::{Backup, S3}` stay (`Backup` with an empty set is the
+archive rule). The flag keeps one value: `fs create --ack-policy s3`
+(Layer C: every acknowledgement waits for the archive, no backups, fast
+takeover by any peer — plan 39's recommendation for fsync-to-S3, plan
+37's pool filesystems); a creation without it stores no policy, as today.
+`local` is no longer accepted (no alias: no shims). The `cto`, `fsync`
+and `write-mode` knobs are untouched.
+
+### 5.7 The epoch hold as a group (D6)
+
+The hold's configuration is {owner, one member}: an epoch with two or
+more members commits a row when one member acknowledges the owner's
+stream-ahead of it (`StreamAheadAck { epoch, through }`, a new P2P
+message; members are on the LAN by construction). A one-member epoch's
+hold is `Final` (non-stealable, as today; nobody else is in the epoch).
+Row 51's hold classes and row 52's variant 3 go; `hold_owner_never_deposed_except_by_retire`
+stays as the guard for the retire path.
+
+### 5.8 Stage 3: C4 as specified, then C7b-8
+
+Plan 43 §5.5 and its coder spec, unchanged in substance: `LockGrant`,
+`LockRelease`, `LockExpire`, `LockMove` in the log, grants answered after
+the record commits (G3), the mirror and handoff machinery deleted, I3
+strict. What stage 1 changes for it: a lock follows a *node stream*, not a
+generation of a directory (`LockMove { to: node, gen }`), and no lock
+record can meet a generation end that strands part of a node's rows (the
+review's H4 reason for ordering C4 after C3 holds by construction). Then
+C7b-8 (barriers and cuts on the wait clock, the root-anchored cut, the
+echo of the root's send stamp) on the new records.
+
+### 5.9 The integrity argument, restated
+
+I1 (no definitive answer without a committed row) becomes CockroachDB's
+property, stated in the model as `ack_implies_committed_by_config`: "a
+client is never acknowledged before the row is committed by the
+configuration in force at its journal position, or that configuration is
+final". I2 (one identity, one executable copy) holds because the only
+executable copy of an unsettled op is its requester's entry (no server
+queue exists). I4 (`EIO` only after settlement) is C2g's, unchanged. I5
+("a rollback of an acknowledged OK only if lone, or by operator action")
+becomes "only on a singleton, or by operator action, or under
+self-fencing", each a counted event with its export. I3 is C4's. The
+oracles that check the deleted states (`LoneLead`, the queue's I2(b)
+union) go; `strict_durability`, `strict_identity`, `strict_commit`,
+`strict_settle` and `member_copies_drained` stay and run strict on every
+configuration, flex configurations included (which D9 stops short of
+today precisely because stage 1 changes the hold).
+
+## 6. Milestones
+
+Each milestone: fail-before evidence first; the model before the code
+where the design is new; a fable review before the next starts; the
+"Deleted" table in PROGRESS per removed mechanism (its introducing
+commit, the bug it was for, the test that now shows the state cannot
+arise), as plan 43 §15 prescribes.
+
+### Stage 0 — settle (plan 43's C2g, C2g′, C2h scenarios; ≈ 1.5 weeks)
+
+| M | Scope | Deletions | Fail-before | Oracles / sims / scenarios / model | Exit |
+|---|---|---|---|---|---|
+| **M0.1 C2g** | As plan 43 §5.3 item 5 and the C2 spec §6: `settle` on `MutateRequest` and `InboxOp`, the executor journals `Refused { rid, ABANDONED }`, the requester's split deadline. | — | I4 (zero hits today because the fix is unbuilt): `load-probe-takeover` seed 46's shape under `strict_settle`. | Model `eio_never_lands_late` (`protocol.rs`); sim `strict_settle` on every config; harness `takeover-loss-two-node`. | I4 strict everywhere; the ledger's late-landing allowance removed for non-singleton topologies. |
+| **M0.2 C2g′** | Drop-held option B (the drop-held proposal's R1–R8): `AwaitRetry` placeholders, the drain stops at one, overlapping forwards parked, the bound settles with C2g's record; variant 3(i) for `NonStealable` shadows. | — | `flex-crash` ×2,000 under `strict_identity`: 777 I2(b) copies today; seeds 502/839/1526/1845 (the drop variant), 807 and 39 (I5). | New sim config `drop-held-chain` (and its requester-dies variant); harness `drop-held-remote-dependents`; I2(b) excludes `AwaitRetry` by kind. | Zero I2(b) copies; row 52 closed. (The placeholder is deleted again in M2.2; it is correct meanwhile.) |
+| **M0.3 C2h scenarios** | `takeover-loss-two-node`, `tloss-two-node`, `delegated-group-switch`, the die/abandon pair; docs; `bench/commit-rule/RESULTS.md`'s C2 rows. **Not** the strict flags on flex configs (D9). | — | Each scenario fails against a build before its fix. | Harness catalogue; the campaign cell that found the loss ×20. | Scenarios green; the flex strict flags recorded as deferred to M1.4. |
+| **M0.4** | Whole-C2 fable review (plan 43's "C2 review"). | — | — | — | Required changes landed. |
+
+### Stage 1 — one stream per node, the rule per configuration (6–10 weeks)
+
+| M | Scope | Deletions | Fail-before | Oracles / sims / scenarios / model | Exit |
+|---|---|---|---|---|---|
+| **M1.0 Model** (two-week timebox, D7) | `crates/model/src/delegation.rs`: the range dimension removed; a node holds a *set* of subtrees under one stream `(gen, idx)` with one group and one cut; `SubtreeReleased`/`StreamReleased` as stream rows; sticky grants (never ended by TTL; ended by the holder's record or `abandon`); the root's own sticky grants; the singleton and `first_peer_join`. Properties: `recall_safety`, `causal_cut`, `per_key_linearizable`, `exactly_once`, `designation_final` (re-proved), new `ack_implies_committed_by_config`, `released_subtree_sequenced_after_cut`, `sticky_ends_only_by_holder_or_operator`, `no_lone_answer_with_peer`, `two_subtrees_one_order` (a rename between a node's two subtrees needs no recall). `flex.rs`: the hold as {owner, one member}. | The model's `Range`, `split`, xgen knobs. | Knobs that re-introduce each deleted mechanism must violate: `lone_delegate` (a delegate answers without a group), `per_row_class`, `ttl_reclaims_sticky`. | Stateright exhaustive on the small topologies the model uses today; counterexamples checked in. | Properties proven, or at the timebox the fallback decided (one subtree per node) or C3 as written started first (D7). |
+| **M1.1 Classes at the configuration** | `RowCommit::{Group{config_version}, Final}` replaces `RowClass`/`AckClass`; one lookup of the configuration in force replaces `root_ack_class_for`, `deleg_ack_class`, the under-lock re-class, the published horizon-with-class and `journaled_class`; the fast path carries the version; the lease's and the stream's reconfiguration records commit under old ∪ new uniformly; `status.ack.classes` becomes `{group, final, singleton, archive_waits}`. | The five classes; `LoneLead` oracle; the lead as a commit input. | Sims whose seeds fail today under `+commit` on the class decided one step early (`delegated-holder-cut +commit` seeds 124, 228, 501, 763, 1849, 1900; the C2f far seeds): pass with the rule; a knob `AUTHORITY_SIM_PER_ROW_CLASS=1` re-enabling the old decision must fail. | I1 strict (`strict_commit`) on **every** delegated config; new oracle `row_version_matches_config` (every acknowledged row's version is the configuration in force at its position). | Zero I1 on every config ×2,000; `status` and docs updated. |
+| **M1.2 One stream per node, no lone delegate, C3 verbatim** | The records of §5.2; `DelegationTable` keyed by node with the folded subtree set; the ownership walk resolves to the node; recall becomes a request answered by `SubtreeReleased`; TTL end for placed grants writes `DelegateNodeEnded`; a node with no group and no sticky grant is forwarded, not delegated; C3 items 1–4 under one stream (verbatim root append, verbatim tail in one transaction, the delegate taking the root re-appends verbatim, the deposed root's member copy and predecessor seal); plan 45's key-move rule removed (one stream owns every link's parent or the op is cross-subtree). | `Delegate`, `Recall`, `RecallCut`, `DelegGroup`; `range`, `place_splits`, the histograms, `deleg_windows.rs`' per-range state, `delegate --range`, `CONSTELLATION_DELEGATION_SPLIT`; `deleg_caps`, `deleg_note_xdeps`, `deleg_covered`, `deleg_xgen_*`; `delegation_stream_rows` as a commit input (kept as the batch size); the lone↔group hysteresis; `deleg_lost_after_ack`; the fold, `MutateOp::Records`, holed generations, the deposed root's rebuild-replay, `Action::RebuildReplica`'s delegation branch; `Delegate.designated` (now `SubtreeGrant.kind`). | `delegated-two-gens-one-backed` (ADR-39's 40 of 200 seeds with the rule off) must pass with `deleg_caps` deleted, re-expressed as `delegated-two-dirs-one-backed` (one node, two subtrees, one stream); `placement-hot` ×2,000 including seed 593 (C3 item 4); `delegated-holder-cut` ×2,000; `long-delegated-late-answers-lr`'s 3 I2 copies. | New oracle `acked_at_or_below_cut` (every acknowledged row of a node generation is at or below its cut); I2c strict on every config; `member_copies_drained`; harness `placement-hot`, `delegate-backup-handoff-failover`, `delegated-group-switch`, new `two-subtrees-one-stream-rename` (a rename between a node's two subtrees under a root crash); `two-gens-ack-cost`, `hash-range-split-merge`, `shared-dir-split*` and bench config `b` retired. | Zero I1/I2/I2c/I5 on every config ×2,000; the harness catalogue green; the "Deleted" table complete. |
+| **M1.3 Sticky grants and sticky placement** | §5.3 and §5.4: `SubtreeGrant::Sticky`, placement's sticky proposal for far writers and for the root's own subtrees (never `/`), the long dwell, the handover request; `crates/engine/src/sticky.rs` (idle release, unmount, logind inhibitor, NetworkManager dispatcher, `constellation release`), `repair abandon --node`; the self-fence setting (off); `status.delegation.sticky` (holders, age, last release reason). | The automatic recall on 30 s windows; the lone root's `Lone` answers for a node with write-eligible peers (its own subtrees now hold grants; the rest waits for the archive). | Sim: `far` and `far-root-writes` (the root with distant peers writing its own subtree) under `strict_durability` with non-singleton rollbacks counted: today's lone rollbacks must be zero after; a knob `AUTHORITY_SIM_TTL_RECLAIMS_STICKY=1` must violate `sticky_ends_only_by_holder_or_operator`. | Model M1.0's properties; sims `sticky-idle-release`, `sticky-holder-dies` (the subtree blocks; `abandon` ends it; the returned holder exports copies), `first-peer-join`; harness `sticky-release-on-unmount`, `sticky-release-cmd`, `sticky-suspend-inhibitor` (a fake logind on the test bus), `sticky-abandon`; `ack-latency` topology 5 (the far writer's own ops at local speed, final). | Zero non-singleton rollbacks on every config; G1/G2 re-measured (the G1 p90 nudge decision re-taken on the new numbers, D9). |
+| **M1.4 The hold as a group** | §5.7: `StreamAheadAck`, the hold's answers wait for one member; a one-member epoch's hold is `Final`. | The hold's uncommitted `NonStealable` answers; variant 3(i)'s special case from M0.2. | `flex-crash` and the `flex*` configs under the strict flags D9 deferred (36–81 of 2,000 seeds fail today): zero after. | The flex model's property with the group; `strict_commit`, `strict_identity` on every flex config; harness `epoch-member-dies-with-chunk`, `flex-crash`'s scenario ×3. | The flex strict flags on; the C2h deferral closed. |
+| **M1.5 Docs and gates** | DESIGN §4 "Delegated sub-sequencers", §4 "Acknowledgement and durability", §5.2, §9 "Delegates" and the failover table rewritten for the new records; `delegations.md`, `durability-and-failover.md`, `configuration.md`, `lease-placement.md`; ADR-40 amended with what landed; TESTING.md. | — | — | Full CONVENTIONS gates (pjdfstest 8798/8798); the four-file-system perf gates of §8. | All green; the stage reviewed. |
+
+### Stage 2 — no server-side replay (4–6 weeks)
+
+| M | Scope | Deletions | Fail-before | Oracles / sims / scenarios / model | Exit |
+|---|---|---|---|---|---|
+| **M2.0 Verify coverage** | Re-do §5.5's verification on the tree as it stands after stage 1; land the minimal piece: `abort_durable_parks` resubmits own rids in doubt through `submit`; a core-path own `ClientOp` survives the deposition; `conflict_export` for rolled-back acknowledged rows (singleton; abandon; self-fence). | — | Sim `backup-crash`, `long-backup` with the queue disabled by a knob (`AUTHORITY_SIM_NO_REPLAY_QUEUE=1`): own ops parked at a deposition must still get an answer (today they hang or are lost without the queue); `singleton-dies-peer-joins` (new): the returned singleton's rows appear as copies, byte-exact. | New oracle `every_submitted_op_settles` (liveness: no `ClientOp` and no FUSE request outlives 2 × TTL + the deadline without an outcome); `check_in_doubt_answers`; harness `takeover-loss-two-node`, `holder-kill-rejoin`, new `singleton-return-exports-copies`. | The knob's runs green on every config. |
+| **M2.1 Delete the replay** | `core/replay.rs`, `meta/replay.rs`, `derive_replay_op`, the fold's remains, the conditional truncate, `pending_replay`, `Origin::Replay`, `ReplayState`, `mark_unacked_replays`, `QueuedReplay`, `Held` as a replay state, `settled_outcome`'s "a deposed journal will be rolled back" branch, the sim's `Origin::Replay` paths, the model's replay queue (`protocol.rs` `Recovery` becomes undo-only). `strand_*` keep the undo half and delete the rows. | ≈ 4–5k lines. | Every test that pinned a replay path converted to "the state cannot arise" (plan 43 §7.5's rule) or deleted with its mechanism; none weakened. | I2(b) over client entries only; I5 counts singleton/operator/self-fence rollbacks with their exports; `strict_durability` with the sim's `tentative` set equal to the singleton's unshipped rows. | Zero I2/I5 on every config ×2,000; the "Deleted" table. |
+| **M2.2 Drop-held as refuse-and-retry** | §5.5's last paragraph: roll back, journal the seed's refusal (conflict copy with holes), requesters retry, own acknowledged dependents exported; the bound stays. | `AwaitRetry`, the drain's stop rule, the park rule (M0.2's), `replay_touches` waits. | `drop-held-chain` ×2,000 (from M0.2) stays green with the placeholder gone. | Harness `poison-record-isolation`, `drop-held-remote-dependents`, `backup-takeover-holds-missing-chunks*`. | Green; `status.held` lists only held rows. |
+| **M2.3 `ack=local` removed** | §5.6: `AckPolicy::Local` deleted; `parse_ack_policy` accepts `s3` only; the singleton derived from the roster; `CONSTELLATION_ACK` documented with its one value. | `AckPolicy::Local`, `ack_policy()`'s `Local` fallbacks (the hold's is `Final` now), `lone_ok`, `Ungated`'s lone branch (`DurableWait::Ungated` stays for the singleton and `Final`). | A creation with `--ack-policy local` fails with a clear error (test); the singleton sims unchanged. | Sim `single` and `singleton-first-peer`; harness `single-node-baseline` within ±3 % (hard constraint 3). | Green; docs. |
+| **M2.4 Docs and gates** | DESIGN §4 "The replica is a log prefix plus explicit speculation" rewritten (speculation is a requester's shadow and a singleton's unshipped journal, retired by the log, never replayed by the server); §9 "Nobody observes a tentative effect", "Poison records", the failover table; `forwarded-mutations.md` ("Speculation and stranded-op recovery"), `write-path-hygiene.md`; ADR-19 amended, ADR-40 amended. | — | — | Full CONVENTIONS gates; perf gates. | All green; the stage reviewed. |
+
+### Stage 3 — authority state in the log
+
+| M | Scope | Deletions | Fail-before | Oracles / sims / scenarios / model | Exit |
+|---|---|---|---|---|---|
+| **M3.1 C4** | Plan 43 §5.5 and its coder spec on the new records (§5.8). | The lock mirror and handoff machinery, floors and barriers in messages. | Plan 43 C4's: rows 05, 06, 23, 30, 47's shapes under `strict_locks`. | I3 strict on every lock config; `long_locks` ×1,000; the lock model's `lock_state_in_log`. | Plan 43 C4's exit items. |
+| **M3.2 C7b-8** | Barriers and cuts on the wait clock, the root-anchored cut, the echo of the root's send stamp. | — | Rows 9/30's stale reads (row 54). | The clock sims; `strict_reads`. | Plan 43 C7b's exit items. |
+
+## 7. Latency and outage behaviour per topology
+
+Figures: LAN RTT 0.2–1 ms, backup budget 5 ms, WAN 60–200 ms, S3
+conditional PUT 28–190 ms by distance; measured forwards at topology 5
+p50 ≈ 120 ms with 60 ms each way.
+
+| Topology | Today | After stage 1 | After stage 2 | Outage / failure |
+|---|---|---|---|---|
+| Single node | own ops from disk | unchanged (singleton) | unchanged | a crash loses unsynced rows with their clients (ADR-21); a death followed by a new node's join: the returned singleton's unshipped rows become conflict copies (§5.5) |
+| Same AZ, peer in budget | one LAN RTT (root group); delegate G1 ≤ holder + 0.5 ms | unchanged (the root's append or the backup is the group; one stream per node removes one stream wait) | unchanged | failover ≈ 1.5 s harness / 2.3–4.7 s EC2; nothing acknowledged lost; a delegate's crash: its backup's seal or the TTL end, rows past the cut unacknowledged → requesters retry |
+| Cross-region, far writer (no peer in budget) | own ops 0 ms under a lone delegation, **rolled back** on root loss; forwards WAN RTT | own ops 0 ms under a sticky grant, **final**; the first op in a new subtree waits for the grant record's archive (28–190 ms, once); forwards into its subtree WAN RTT, final; cross-subtree ops recall by request | unchanged | the far writer dies holding a grant: its subtrees block for others (`EROFS`) until it returns and releases, or `repair abandon` (then its post-cut acknowledged rows return as its conflict copies); the root dies: the sticky holder keeps writing (its answers are final; its stream resumes at the next root, which inherits the grant from the log) |
+| Cross-region, the root itself far from every peer | own ops 0 ms (`Lone`, rolled back on a TTL takeover); forwards wait for the archive (C2f) | own ops 0 ms under the root's own sticky grants, final, after one archive wait per new subtree; ops directly in `/` or in others' subtrees wait for the archive; forwards to no grant wait for the archive | unchanged | root death: a TTL claim (60 s + margin) by a peer; the dead root's sticky subtrees block until it returns or `abandon` (today: its lone rows come back as a replay with conflict copies) |
+| S3 outage (continuation epoch) | members' forwards answered by the hold at once, uncommitted | + one LAN RTT (one member's `StreamAheadAck`); a one-member epoch's hold final | unchanged | as today (ADR-22); the hold is never deposed except by retire |
+| Root death while delegates hold grants | placed grants die with the lease after a TTL takeover; after a fast takeover they re-stream | placed grants: unchanged; sticky grants and designations survive the root (they are log records; the next root honours them) | unchanged | a fast takeover re-streams every node stream from what the log has; verbatim, one stream each |
+| Host load | only latency degrades (plan 44, 41) | unchanged | unchanged | a false seal costs a reconfiguration, never a rollback |
+
+Gates kept: G1–G6 as accepted (plan 43 §9/§10); hard constraint 3 within
+±3 % on topology 1; `vfs-bench` dispatch < 1 µs. New: the sticky
+holder's own ops at the delegate's G1 budget; the first-op archive wait
+measured and documented.
+
+## 8. Performance gates (per milestone where §6 says so)
+
+`bench/commit-rule/RESULTS.md` continues: `ack-latency` topologies 1–5
+A/B/B/A on the box, on ext4, xfs, btrfs and tmpfs (the maintainer's
+no-regression rule across file systems), after M1.2, M1.3, M2.1 and
+M3.1; `two-gens-ack-cost` retired and `two-subtrees-one-stream` added;
+`placement-hot`'s throughput before and after sticky placement (fewer
+reconfigurations expected; a writer that moves waits a dwell for its
+subtree to follow — measured and documented). Topology 1 within ±3 % at
+every milestone.
+
+## 9. Risks and fallbacks
+
+| Risk | Where | Fallback |
+|---|---|---|
+| The subtree-set stream cannot keep `recall_safety` with one cut (a released subtree's rows interleave with kept ones so that the root's cursor cannot be split cleanly). | M1.0 | One subtree per node (a node dominating two trees gets one grant); the rest of §5 unchanged. Decided at the timebox (D7). |
+| The ownership walk and the recall plan are rewritten; the recall-by-request path is new. | M1.2 | The model first; the fail-before sims above with the xgen machinery deleted; fable review before M1.3. |
+| A far writer's product promise becomes conditional on a sticky grant; a holder lost mid-write blocks a subtree for others for as long as it is away. | M1.3 | Automatic grants by placement (D2), the release triggers, `release --wait` in lifecycle hooks, `abandon` documented; the optional self-fence for operators who prefer a bounded block to a final answer. |
+| The logind inhibitor's window is shorter than a drain under load. | M1.3 | The shipped drop-in raising `InhibitDelayMaxSec`; a drain that cannot finish releases what it has and the rest is a lost-holder case on resume (its rows stay final and stream on resume; nothing is rolled back). |
+| An own op parked at a deposition is lost without the replay queue. | M2.0 | The minimal piece of §5.5 lands and is sim-proven (`every_submitted_op_settles`) *before* M2.1 deletes anything. |
+| Deleting records changes the log's wire ordering (postcard appends at the end of the enum): existing logs are unreadable. | M1.2, M3.1 | No reader for the old records (no shims, no version bump, the maintainer's rule); development filesystems are recreated; `fsck` reports an unreadable record as such. Mixed versions are unsupported as always. |
+| Verification depends on the sim reaching the new states (the review found 16 rows the sim never reached). | all | Every milestone adds the configuration that reaches its state (named above) and a knob that re-enables the deleted mechanism and must fail; coverage counters (`saw` bits in the model, `status` counters in the sim) are exit items. |
+
+## 10. Migration
+
+No compatibility shims, no version bumps (the maintainer's rule). In
+each milestone's commit: the old records (`Delegate`, `Recall`,
+`RecallCut`, `DelegGroup`) are removed from `LogRecord` and the new ones
+appended; `AckPolicy::Local` removed; `--ack-policy local` and
+`delegate --range` refused; the sim and harness fixtures regenerated;
+DESIGN.md updated in the same commit (CONVENTIONS rule 5) with the ADR
+link. A cluster upgrades with every node stopped; a filesystem created
+before M1.2 is recreated (as plan 29 required when partitions went).
+
+## 11. Open questions for the maintainer
+
+- **Q1 — The flag's spelling.** `fs create --ack-policy s3` as the one
+  remaining value (§5.6), or rename the flag to `--ack s3` since it is a
+  boolean now? *Recommended: keep `--ack-policy s3`; fewer doc changes.*
+- **Q2 — Self-fence defaults when enabled.** `Y` (holder stops) and `X`
+  (root may reclaim): *recommended* `Y` = 30 s, `X` = 10 × `Y`, both in
+  honour-clock terms (ADR-35).
+- **Q3 — Sticky grant for the root: proposal threshold.** The root takes
+  a grant on the topmost directory it dominates by placement's rule
+  (70 %, the ops floor) or on the first write into any subtree? *Recommended:
+  placement's rule; a first-write rule would grant on every touched
+  directory.*
+- **Q4 — Handover grace.** How long a sticky holder keeps a subtree after
+  another node starts forwarding into it: *recommended* release when idle
+  for 5 s, or at once when the holder has no op in flight in that subtree.
+- **Q5 — `abandon`'s spelling.** `repair abandon --node` beside
+  `repair abandon-group --epoch|--gen`, or fold the three into one
+  `repair abandon` with a target. *Recommended: fold, in M1.3.*
+- **Q6 — The singleton's death-then-join window** (§5.5): accept the
+  export-as-copies contract, or make a joining node refuse to claim a
+  lease whose holder's last heartbeat is younger than the roster's join
+  grace? *Recommended: accept; the refusal would need a liveness rule we
+  do not want (hard constraint 5).*
+- **Q7 — G1 after stage 1.** Re-measure rename/unlink p90 at M1.3; apply
+  the saved nudge patch only if the miss remains.
+- **Q8 — The flex strict flags' owner.** M1.4 turns them on; if M1.0's
+  timebox sends C3-as-written first, do they wait for stage 1 or go on
+  with variant 3(i) alone? *Recommended: wait.*
+
+## 12. Exit criteria
+
+- [ ] Stage 0: C2g, C2g′ and C2h's scenarios landed with their
+      fail-before evidence; I4 strict; `flex-crash` zero I2(b); the C2
+      review's changes landed.
+- [ ] Stage 1: the model's properties proven (or the fallback decided and
+      recorded at the timebox); `RowCommit` with two states and no per-row
+      class decision site left; one stream per node with the records of
+      §5.2 and no range, generation-set or xgen code left; no lone
+      delegate; sticky grants with every release trigger of §5.4 and
+      `constellation release`; the root's own sticky grants; the hold as a
+      group; I1/I2/I2c/I5 strict on every config including flex ×2,000;
+      the harness catalogue green with the retired scenarios removed; G1–G6
+      re-measured on four file systems; DESIGN, the feature docs and
+      ADR-40 updated; the "Deleted" tables complete.
+- [ ] Stage 2: the coverage verification recorded with the minimal piece
+      landed and proven; no `Origin::Replay`, no replay queue, no fold, no
+      `derive_replay_op`, no `AckPolicy::Local`; conflict copies only from
+      `conflict_export`; drop-held as refuse-and-retry; topology 1 within
+      ±3 %; I2/I5 strict everywhere; docs and ADR-19/ADR-40 amended.
+- [ ] Stage 3: plan 43 C4's and C7b-8's exit items.
+- [ ] The full CONVENTIONS gates at the end of every stage (pjdfstest
+      8798/8798, empty baseline).
+- [ ] Every milestone reviewed (fable) before the next started.
+
+## 13. PROGRESS.md
+
+One section per milestone, plan 43 §15's style: intro, "What landed",
+"Deleted" (per mechanism: introducing commit, the bug it was for, the
+test that shows the state cannot arise), "Unchanged on purpose", "Gates"
+(dates, kernel, host file systems), and the baseline table of plan 43 C0
+(I1/I2/I2c/I4/I5 per config) after each milestone, so the progression to
+zero on every configuration is the plan's evidence.
+
+## Sources
+
+- Plan 43 (`docs/plans/v1/wip/43-commit-rule.md`), ADR-33, ADR-38,
+  ADR-39, the arbiter study (`docs/explanation/ARBITER-STUDY.md`).
+- CockroachDB parallel commits (the "never acknowledged before committed"
+  TLA+ property): https://www.cockroachlabs.com/blog/parallel-commits/
+- TiKV async commit: https://tikv.github.io/sig-transaction/design/async-commit
+- Lustre recovery (transno, `last_committed`, the client replay list,
+  version-based recovery, commit-on-share):
+  https://wiki.lustre.org/Lustre_Recovery_Overview
+- CephFS early replies and client replay: `src/mds/Server.cc`
+  (`journal_and_reply`, `early_reply`) and the kernel client
+  `fs/ceph/mds_client.c`; MDS states (`clientreplay`):
+  https://docs.ceph.com/en/latest/cephfs/mds-states/ ; the balancer off
+  by default and pins: https://docs.ceph.com/en/latest/cephfs/multimds/
+- Raft client sessions and exactly-once (Ongaro, PhD thesis §6.3):
+  https://web.stanford.edu/~ouster/cgi-bin/papers/OngaroPhD.pdf
+- NFSv4.1 sessions and the reply cache (RFC 8881 §2.10.6):
+  https://www.rfc-editor.org/rfc/rfc8881
+- Calvin (asynchronous replication of the sequencer log: "significant
+  complexity in failover"):
+  http://cs.yale.edu/homes/thomson/publications/calvin-sigmod12.pdf
+- Aurora (quorum commit, epoch truncation):
+  https://www.cs.purdue.edu/homes/csjgwang/CS592DisaggregatedDB/AuroraSIGMOD17.pdf ;
+  FoundationDB: https://www.foundationdb.org/files/fdb-paper.pdf ;
+  HDFS QJM epoch fencing: https://issues.apache.org/jira/browse/HDFS-3077
+- Speculator and external synchrony (an early reply is safe only while
+  it has not escaped the party that can be rolled back):
+  https://web.eecs.umich.edu/~pmchen/papers/nightingale05.pdf ,
+  https://web.eecs.umich.edu/~pmchen/papers/nightingale06.pdf
+- Leases need fencing tokens:
+  https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html
+- systemd-logind inhibitor locks (delay inhibitors, `PrepareForSleep`,
+  `PrepareForShutdown`, `InhibitDelayMaxSec`):
+  https://www.freedesktop.org/wiki/Software/systemd/inhibit/ ;
+  NetworkManager dispatcher (`pre-down`): `NetworkManager-dispatcher(8)`.

@@ -63367,3 +63367,26 @@ ABBA, box 1 with other jobs, indicative), p50 / p90 ms, main -> here: forwarded 
 150.5; `rename` 113.7 / 138.5 and 114.3 / 141.5 -> 111.9 / 140.6 and 108.2 / 137.4; the root's own ops equal (create
 0.06 / 0.08, write 3.1 / 3.4-4.1). The archive wait adds a few milliseconds to a WAN round trip against a local S3;
 against a remote bucket it is one S3 PUT (§11 Q2's 28-190 ms).
+
+## Plan 46 — the direction of the acknowledgement area (maintainer's decisions, 2026-11-01)
+
+Docs only. After the structural review of the acknowledgement and ordering-node-change area (55 bug rows since
+2026-09-25, 41 integrity; 19 of 51 closed rows introduced by changes in the area; 16 found by review with no oracle
+firing; non-test core code 22.4k to 46.5k lines in five weeks), the maintainer chose the staged direction recorded in
+[ADR-40](../../explanation/DECISIONS.md#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)
+and specified in [plan 46](wip/46-committed-or-final.md): every acknowledgement committed or final (two row states,
+decided by the configuration; a singleton alone answers from its disk); one stream per delegate node over a set of
+subtrees, no lone delegates, hash-range splits and ADR-39's cross-generation machinery deleted; sticky placement and
+automatic sticky non-stealable grants for far writers and for the root's own subtrees, released by the holder (idle,
+unmount, logind inhibitor, network pre-down, handover, `constellation release`) or abandoned by the operator; the
+epoch hold as a group waiting for one member; the Stateright model first (two-week timebox) with C3's verbatim
+re-ship folded in; then server-side replay, the fold and `ack=local` deleted (the requester's in-doubt retry is the
+one copy of an unacknowledged op; the root's own op parked at a deposition takes the delegate fast path's in-doubt
+route; conflict copies exported by the node that holds the data); then plan 43's C4 and C7b-8.
+
+Plan 43: C2g, C2g′ (drop-held option B) and C2h's scenarios continue as stage 0; C4 and C7b-8 continue as stage 3;
+C3 as specified, C5, C6, the G1 p90 nudge and C2h's flex strict flags are superseded (status note at the top of the
+plan and in its §14). ADR-19, ADR-21, ADR-23, ADR-33, ADR-38 and ADR-39 carry "superseded in part" notes; DESIGN.md
+carries pointers where it describes mechanisms scheduled for removal (the text itself changes with the code, rule 5).
+Rejected alternatives recorded in the ADR: finishing plan 43 as specified, a majority log, S3 Express, Calvin-style
+ordering, a client-owned replay list with `ack=local` kept.
