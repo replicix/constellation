@@ -641,11 +641,18 @@ pub(super) fn poison_record_isolation(seed: u64) -> Result<()> {
 /// placeholders, their dependents wait behind them, and B's retries
 /// execute in their place.
 ///
+/// A also makes `d/sub/inner` and writes `d/sub/inner/g` into B's
+/// directory, once it has executed B's `mkdir`: A's own acknowledged
+/// writes, dependents of B's row. They replay behind B's placeholder, on the
+/// state B's retry leaves; replayed ahead of the retry the `mkdir` is
+/// refused (no `d/sub`) and becomes a second conflict copy.
+///
 /// Checked:
 /// - **B's writes succeed**: `mkdir d/sub` and `write d/sub/f` return `Ok`
 ///   (a refusal or an `EIO` would be a lost write), once the drop is run;
 /// - **byte-exact convergence**: A, B and a fresh node D see the same tree,
-///   every file's bytes included, and `d/sub/f` is B's payload;
+///   every file's bytes included, `d/sub/f` is B's payload and
+///   `d/sub/inner/g` A's;
 /// - **exactly one conflict copy**: the seed's, the full length of the lost
 ///   file with zeros for the lost chunk;
 /// - **no late landing**: nothing changes on A or B in the seconds after the
@@ -688,6 +695,7 @@ pub(super) fn drop_held_remote_dependents(seed: u64) -> Result<()> {
     let lost = super::pattern(seed, 64 * 1024);
     let lost_hex = blake3::hash(&lost).to_hex().to_string();
     let payload = super::pattern(seed ^ 0x5eed, 96 * 1024);
+    let own = super::pattern(seed ^ 0xa11ce, 8 * 1024);
     let hold = root.path().join("hold-sync");
     let held_marker = root.path().join("hold-sync.held");
     let mut a = Client::new(root.path(), "dhrd-a", &env.endpoint, &backend)?
@@ -734,7 +742,14 @@ pub(super) fn drop_held_remote_dependents(seed: u64) -> Result<()> {
         std::fs::write(bmnt.join("d/sub/f"), &payload_b).context("B's write d/sub/f")?;
         Ok(())
     });
-    std::thread::sleep(Duration::from_secs(1));
+    // A's own write into B's directory, once A has executed B's mkdir: a
+    // dependent of B's row by key, acknowledged to A's application.
+    eventually("A executes B's mkdir", Duration::from_secs(30), || {
+        anyhow::ensure!(a.mnt.join("d/sub").is_dir(), "d/sub is not on A yet");
+        Ok(())
+    })?;
+    std::fs::create_dir(a.mnt.join("d/sub/inner"))?;
+    std::fs::write(a.mnt.join("d/sub/inner/g"), &own)?;
     std::fs::write(a.mnt.join("after"), b"written after the broken file")?;
     std::fs::remove_file(&hold)?;
 
@@ -808,6 +823,10 @@ pub(super) fn drop_held_remote_dependents(seed: u64) -> Result<()> {
     anyhow::ensure!(
         on_a.get("d/sub/f").and_then(|c| c.as_ref()) == Some(&payload),
         "d/sub/f is not B's payload byte for byte"
+    );
+    anyhow::ensure!(
+        on_a.get("d/sub/inner/g").and_then(|c| c.as_ref()) == Some(&own),
+        "A's own write into B's directory did not survive the drop byte for byte"
     );
     anyhow::ensure!(
         on_a.contains_key("d/renamed") && !on_a.contains_key("d/broken"),
