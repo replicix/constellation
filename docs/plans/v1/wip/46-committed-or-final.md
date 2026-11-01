@@ -594,6 +594,20 @@ arise), as plan 43 §15 prescribes.
 | **M0.3 C2h scenarios** | `takeover-loss-two-node`, `tloss-two-node`, `delegated-group-switch`, the die/abandon pair; docs; `bench/commit-rule/RESULTS.md`'s C2 rows. **Not** the strict flags on flex configs (D9). | — | Each scenario fails against a build before its fix. | Harness catalogue; the campaign cell that found the loss ×20. | Scenarios green; the flex strict flags recorded as deferred to M1.4. |
 | **M0.4** | Whole-C2 fable review (plan 43's "C2 review"). | — | — | — | Required changes landed. |
 
+*As landed (M0.2, 2026-11-01; PROGRESS, "Plan 43 C2g′"):* the drop-held
+proposal's R1–R8 as plan 43's C2g′ note records them. `flex-crash` ×2,000
+under `strict_identity`: 677 I2 (b) copies in 493 failing seeds on
+`92624175`, 0 after; the new sim configs `drop-held-chain` (420 of 500 seeds
+failing before, 0 of 2,000 after) and `drop-held-chain-requester-dies` (298
+of 500, 0 of 2,000); harness `drop-held-remote-dependents`. Seeds 502, 839,
+1526 and 1845 (the drop variant the C2f note did not land) pass. `flex-crash`
+807 stays an I5 finding under `strict_lone`: the operator's `drop-held` of an
+acknowledged hold answer, which the oracle does not class as operator action
+yet (`flex-crash+lone` fails 779 of 2,000 seeds on `92624175` and 778
+after, 732 of them on a non-stealable OK; M1.4's flags). Seed 39 does not
+fail on `92624175` in any `flex*` or `placement-hot` configuration under the
+strict flags. The placeholder is deleted again in M2.2.
+
 ### Stage 1 — one stream per node, the rule per configuration (6–10 weeks)
 
 | M | Scope | Deletions | Fail-before | Oracles / sims / scenarios / model | Exit |

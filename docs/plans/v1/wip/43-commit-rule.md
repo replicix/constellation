@@ -2023,6 +2023,48 @@ answered once committed, also to the own client; only the root answers a
 lost dependency `Held`; a system op is settled; the simulation's window is
 half its TTL, as production's.
 
+*As landed (C2g′, 2026-11-01; PROGRESS, "Plan 43 C2g′"; plan 46 M0.2).* The
+open question of the C2f note (`repair drop-held` and another node's
+unanswered row), answered by option B of the drop-held proposal, R1–R8. R1:
+a rolled-back row of another node whose answer was never given is queued as
+an `AwaitRetry` placeholder (its rid, the keys its records touched, no op,
+class `Lone`) instead of a copy of its op; *never given* is read as: the
+row was journaled `Archive` (a lone sequencer's answer to another node waits
+for an applied segment, which a held row never reaches; a group's row may
+have been answered, which only the core knows, and keeps its replay, as a
+hold's row and this node's own do) and no outcome of the rid is left (the
+strand removed the `completed` row; one an applied segment carries stays and
+the drain finds the rid done). R2: the drain and the takeover gate's local
+replay forget a placeholder whose rid has an outcome (a settle this node
+journaled itself counts once its row is committed) and hold the later
+entries on its keys behind it; entries on other keys run. R3: a forward or
+inbox op whose keys overlap a queue entry ahead of its place (its own
+placeholder's, else the whole queue) is parked as an unexecuted
+`ExecuteReply` (`Held` after the park budget; an inbox op halts); the rule
+cannot deadlock (every wait goes to a strictly smaller place of the queue, a
+total order, or to the retry of a smaller place's own placeholder:
+`Core::queue_gate_blocks`). R4: C2f's abort of a parked answer whose row was
+rolled back also runs when the drain finds the placeholder, so the requester
+retries within a tick, not at the next ship round. R5: after
+`drop_held_await_ms` (default `acquire_deadline_ms`; clock paused while the
+epoch refuses writes; `CONSTELLATION_DROP_HELD_AWAIT_MS`) the placeholder is
+settled through C2g's record (`Core::settle_refusal`, by a settle client
+entry of the placeholder's rid that goes where the op would, the root or a
+holder) and forgotten when its outcome is back; `status.ack.await_retry_settled`.
+R6 needed no code. R7 (variant 3 (i)): a requester's shadow of a
+non-stealable answer survives *another node's* takeover (a tailed later-epoch
+segment) and retires by the rid's outcome in the log; this node's own
+takeover strands it as before (kept, a holder evaluated new ops on the
+phantom effect of a row its predecessor's lost journal never carried:
+`flex-tight` under the lease-read knob). R8: `status.held.awaiting[]`,
+`constellation_held_awaiting_retry`, the docs. *Decided on the way*: the
+I2 (b) union leaves placeholders out by their kind; I5 excuses a
+non-stealable OK the log completes; the history witness explains a refusal
+by any subset of the tentative ops invoked before it returned (chains of
+acknowledged-then-dropped effects). *Not in the rules*: a delegate executing
+forwards of its subtree is not gated by its own queue (the root's path and
+the inbox are).
+
 ### C3 — Verbatim re-ship; no re-execution of a committed row
 
 **Code** (§5.4, §5.6): `Origin` in the segment envelope

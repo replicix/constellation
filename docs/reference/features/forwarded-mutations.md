@@ -252,7 +252,10 @@ within the rest of the deadline (an isolated requester), the application
 hears the *unsettled* `EIO`: in doubt as before, retryable by rid, and the
 op may still land. `status.ack` counts `settles_sent`, `settled_abandoned`,
 `settled_late_success`, `settled_local`, `client_unsettled_eio` and the
-engine's `settled_eio`.
+engine's `settled_eio`; as a sequencer it counts `await_retry_settled`, the
+dropped rows of other nodes (`repair drop-held`) settled by the same record
+after `CONSTELLATION_DROP_HELD_AWAIT_MS` because their requesters never
+retried.
 
 **Coverage rule.** Resolving an in-doubt op against `completed` is only
 valid if this replica has tailed every segment since the op was first

@@ -63514,3 +63514,100 @@ frozen epoch refuses is counted as an unsettled `EIO`. Authority lib 887 and `me
 suite 302; sweeps of every C2 configuration ×2,000 with and without the knob: failing seeds as main (`long-backup`
 743), settled landings 0, I1/I2/I4/I5 unchanged within ±2; unsettled `EIO`s unchanged except `flex-crash` (1,312
 → 3,916: the frozen epoch's refusals of sent ops, now counted).
+
+## Plan 43 C2g′: drop-held keeps another node's unanswered row for its requester (2026-11-01; plan 46 M0.2)
+
+On main 92624175 (C2g and its re-check). The drop-held proposal's option B, rules R1-R8, as plan 43's C2g′ note
+records them. `repair drop-held` queued every rolled-back row for replay by rid, another node's unanswered row
+included: two live copies of one rid (the requester's retry and this queue's), the dependents of a dropped row
+replaying without its effect, and a read or an op seeing the order change.
+
+### What landed (one commit each; the fail-before is the test named, run with the rule off)
+
+1. **R1** (meta, `held.rs`, `spec.rs`): a rolled-back row of another node whose answer was never given is queued as
+   an `AwaitRetry` placeholder (`StrandedOp::await_retry`: the keys its records touched and the drop's wall time; an
+   inert op that nothing executes; class `Lone`, so it is never gated) in its journal place. *Never given* is read
+   from what the store knows for certain: the row was journaled `Archive` (a lone sequencer's answer to another node
+   waits for an applied segment, and a held row never ships) and the rid has no outcome left (the strand removed the
+   `completed` row; one a segment carries stays and the drain finds the rid done). A group's row (its answer may have
+   left, which only the core knows), a hold's, this node's own and the seed keep their op. Reads of a placeholder's
+   keys wait as for a queued replay; the sim's I2 (b) union leaves placeholders out by their kind. Fail-before:
+   `drop_held_marks_remote_rows_await_retry`, `drop_held_keeps_dependents_in_journal_order` (queue entry still a copy
+   of its op), core `a_dropped_remote_row_becomes_a_placeholder_not_a_copy` (the drain executed it).
+2. **R2** (drain and takeover gate): a placeholder whose rid has an outcome is forgotten; until then the later
+   entries on its keys wait behind it, the others run. Fail-before: `the_drain_holds_dependents_behind_a_placeholder`
+   (the dependent ran ahead: `Refused(ENOENT)`), `the_takeover_gate_holds_dependents_behind_a_placeholder`.
+3. **R3** (`Core::queue_gate_blocks`, `holder.rs`, `inbox.rs`): a forward or inbox op whose keys overlap a queue entry
+   ahead of its place is parked (a forward as an unexecuted `ExecuteReply`, `Held` after the park budget; an inbox op
+   halts). Its place is its own placeholder's, else the whole queue. The doc comment and
+   `the_park_rule_never_waits_on_an_entry_behind_the_op` say why it cannot deadlock. Fail-before:
+   `a_forward_overlapping_a_queued_entry_is_parked`, `a_requesters_retry_executes_in_the_dropped_rows_place` (the retry
+   ran ahead of the entry before it and was refused ENOENT, the refusal its rid's outcome), the no-deadlock test.
+4. **R4**: C2f's abort of a parked answer whose row was rolled back waited for the log to pass the row's seq (the next
+   ship round, up to the idle backoff); the drain now aborts it when it finds the placeholder
+   (`abort_parked_answer_of`). Fail-before: `a_parked_answer_of_a_dropped_row_is_aborted_and_the_retry_arrives`.
+5. **R5, R6**: `drop_held_await_ms` (default the client deadline; `CONSTELLATION_DROP_HELD_AWAIT_MS`,
+   `reference/configuration.md`): a placeholder that waited the bound (wait clock, paused while the epoch refuses
+   writes, started from the wall time since the drop) is settled by a settle client entry of its rid (executed here
+   when this node is the sequencer, else sent to the holder), which journals C2g's `Refused { rid, ABANDONED }` under
+   the remote asker's class through `Core::settle_refusal`; forgotten when its commit is back. `status.ack.
+   await_retry_settled`. Fail-before: `a_placeholder_past_the_bound_is_settled_as_abandoned`,
+   `a_settled_placeholder_never_lands_the_retry`, `the_bound_does_not_advance_while_the_epoch_refuses_writes`,
+   `after_the_settle_the_dependents_run_as_before` (R6: a refusal that is a conflict copy for an acknowledged own op,
+   a success for the next), `a_placeholder_is_settled_at_the_holder_when_this_node_is_not_it`.
+6. **R7**: a requester's shadow of a non-stealable sequencer's answer is not stranded by *another node's* takeover (a
+   tailed later-epoch segment); it retires by the rid's outcome in the log. Fail-before:
+   `a_non_stealable_shadow_is_not_stranded_by_an_epoch`. I5 excuses a non-stealable OK the log completes.
+7. **Sim**: `drop-held-chain` and `drop-held-chain-requester-dies` (`LoseDirtyChunks`, `CrashNonHolder`,
+   `SimConfig::drop_held_after_ms`), `drop_held_chain_regression_seeds`.
+8. **R8**: `status.held.awaiting[]`, `constellation_held_awaiting_retry`, the docs (write-path-hygiene, forwarded-
+   mutations, DESIGN §9, ADR-33, plans 43 and 46); harness `drop-held-remote-dependents`.
+
+### Deviations from the proposal, and what was found
+
+- **R3 is not `hold_for_lost_deps`**: that function holds this node's own ops for this node's replays. The gate for
+  another node's op belongs to the executor, so it is a new park flag on `ExecuteReply` (and a halt in the inbox
+  drain). A delegate executing its subtree's forwards is not gated by its own queue (a drop on a delegate is not
+  exercised).
+- **R7 first exempted every strand by an epoch and broke `flex-tight` under the lease-read knob** (seeds 188, 893,
+  1082, 1321, 1666, 1867; none fails on 92624175): a node that takes the lease itself kept the shadow's phantom effect
+  (an unlink of a name the log still has, answered by a hold owner whose journal never reached the log) and logged
+  its new ops where the spec refuses them. The exemption is for another node's takeover only; this node's own
+  takeover (gate, deposition's recovery, drain leftovers) strands as before.
+- **Sim configs**: on the lone root's core (`sim_core_config`), not `backup_core_config` (a group's row may have been
+  answered, so it keeps its copy and nothing is a placeholder); the workload is the random create/unlink/rename on the
+  four shared names (the simulation has no `mkdir`; the harness scenario has the mkdir shape). The requester that dies
+  is the highest non-root node, and a node crashed for good marks its chunks gone for the operator
+  (`drop-held-chain-requester-dies` 1136, 1614).
+- **The linearizability witness** explained a refusal by tentative effects applied all together or one alone; a chain
+  (an op acked on top of another's unshipped effect, both dropped, a later tentative op the holder had not executed
+  when it refused: seeds 66, 993) needs any subset, in invocation order. It tries every subset of up to 14 tentative
+  ops. A relaxation of an oracle, for the maintainer to veto.
+- **I5 and `flex-crash` 807**: the rolled-back OK is a hold's answer to a write of a dead member's chunk, dropped by the
+  operator (`drop-held --remote`): operator action, which the I5 oracle does not class as such yet (`flex-crash+lone`
+  fails 779 of 2,000 seeds on 92624175, 778 after, 732 of them on a non-stealable OK). Seed 39 does not fail on
+  92624175 in any `flex*`/`placement-hot` configuration under the strict flags I could name.
+- The harness scenario passes on 92624175 too except for its placeholder checks (the drop's detail, `held.awaiting`,
+  `ack.await_retry_settled`): the FUSE fast path's rows replay as blind `Records`, so the order the rules keep does not
+  change the end state there; the sim and the unit tests are the fail-before.
+
+### Sweeps (seeds 0..1,999; with and without `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`)
+
+| configuration | 92624175 | now |
+|---|---|---|
+| `flex-crash+identity` | 493 seeds fail, 677 I2 (b) copies (no knob) | 0 (both) |
+| `drop-held-chain` | 420 of 500 fail (no knob) | 0 of 2,000 (both) |
+| `drop-held-chain-requester-dies` | 298 of 500 fail (no knob) | 0 of 2,000 (both) |
+| `flex`, `flex-tight`, `placement-hot`, `backup-crash`, `delegated-holder-cut`, `long-delegated-late-answers` | 0 | 0 (both) |
+| `long-backup` | seed 743 | seed 743 (no knob only; not this work) |
+
+### Gates
+
+fmt, clippy `-D warnings` (workspace); authority lib 900 and `meta_repro` 4, meta 382 and the rest, engine 940, control
+146 (schema re-blessed), harness unit tests; release sim suite 305 passed / 11 ignored. Harness, three runs each, all
+green: `poison-record-isolation`, `backup-takeover-holds-missing-chunks`, `backup-takeover-drops-held-chunks`,
+`epoch-member-dies-with-chunk`, `drop-held-remote-dependents`. Sweeps as the table above (2,000 seeds, both
+knob settings); `flex-crash+identity` with the knob is 0 on 92624175 too (the delayed lease reads change the
+schedules: no I2 (b) pair in 2,000 seeds), so the 677 are the no-knob count. `drop_held_chain_regression_seeds`
+pins seeds 0, 1, 2, 3, 5 of both configurations, each an I2 (b) pair (a dropped row queued here and executing at its
+requester) on 92624175.
