@@ -1121,6 +1121,9 @@ pub struct Stats {
     pub ops_parked_behind_queue: u64,
     pub await_retry_resolved: u64,
     pub await_retry_settled: u64,
+    /// Inbox batches halted at an op behind the replay queue (the ops
+    /// behind it in the batch wait too: the batch is executed in order).
+    pub inbox_halted: u64,
     /// Settles of placeholders started (one per attempt: not while one is in
     /// flight).
     pub await_retry_settles_sent: u64,

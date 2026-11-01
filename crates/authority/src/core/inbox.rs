@@ -1501,11 +1501,18 @@ impl Core {
             }
             // Plan 46 M0.2 (R3): behind the replay queue on its keys, as a
             // forwarded op is (`Core::queue_gate_blocks`): the batch halts
-            // here and is polled again at the halted cadence.
+            // here and is polled again at the halted cadence. Every op of
+            // the batch behind this one waits with it, up to the
+            // placeholder's bound: a requester's batch is executed in
+            // order (the order is the requester's program order, and the
+            // batch is acknowledged by position), so it is not reordered
+            // to let the later ops past. Counted
+            // (`status.ack.inbox_halted`).
             if !op.settle {
                 if let Ok(decoded_op) = &decoded {
                     if self.queue_gate_blocks(rid, decoded_op, replica) {
                         self.stats.ops_parked_behind_queue += 1;
+                        self.stats.inbox_halted += 1;
                         return Err(Halt::Recall);
                     }
                 }

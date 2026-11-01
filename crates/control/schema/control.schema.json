@@ -234,6 +234,13 @@
           "minimum": 0,
           "type": "integer"
         },
+        "inbox_halted": {
+          "default": 0,
+          "description": "Inbox batches halted at an op behind the replay queue (the ops\nbehind it in the batch wait with it: a batch runs in order).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "last_seal": {
           "anyOf": [
             {

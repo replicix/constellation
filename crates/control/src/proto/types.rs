@@ -2339,6 +2339,10 @@ pub struct AckStatus {
     /// settled as abandoned (`drop_held_await_ms`; plan 46 M0.2).
     #[serde(default)]
     pub await_retry_settled: u64,
+    /// Inbox batches halted at an op behind the replay queue (the ops
+    /// behind it in the batch wait with it: a batch runs in order).
+    #[serde(default)]
+    pub inbox_halted: u64,
     /// The latest seal this node made, as its watch measured the holder's
     /// silence.
     #[serde(default)]

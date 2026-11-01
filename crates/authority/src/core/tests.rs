@@ -50655,4 +50655,33 @@ mod await_retry {
         assert!(!requester.meta.has_outstanding_speculation());
         assert_eq!(requester.meta.pending_replays().unwrap()[0].rid, rid);
     }
+
+    /// Review item 11: an inbox batch whose op overlaps the replay queue
+    /// halts there — in order, nothing past it is executed — and is counted;
+    /// it runs once the queue lets go.
+    #[test]
+    fn an_inbox_op_behind_the_queue_halts_its_batch_in_order_and_is_counted() {
+        let (mut h, broken) = holder_with_a_seed();
+        let (p, d) = (rid_of(2, 1), rid_of(1, 7));
+        exec_as(&h, RowClass::Archive, p, &rename_in_root("broken", "moved"));
+        exec_as(&h, RowClass::Lone, d, &unlink_in_root("moved"));
+        drop_held(&h, broken);
+        let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let batch = inbox_batch(3, 0, 1, &create_in(ROOT_INO, "moved", ino));
+        let mut out = Vec::new();
+        h.core
+            .inbox_drain(h.clk(), vec![batch.clone()], &h.meta, &mut out)
+            .unwrap();
+        assert_eq!(h.core.stats.inbox_halted, 1);
+        assert!(h.meta.lookup(ROOT_INO, "moved").unwrap().is_none());
+        // The retry of the dropped rename, then the queue's own unlink,
+        // then the batch goes.
+        forward_of(&mut h, 2, 80, p, &rename_in_root("broken", "moved"));
+        ticks(&mut h, 4);
+        h.core
+            .inbox_drain(h.clk(), vec![batch], &h.meta, &mut out)
+            .unwrap();
+        assert!(h.meta.lookup(ROOT_INO, "moved").unwrap().is_some());
+        assert_eq!(h.core.stats.inbox_halted, 1);
+    }
 }

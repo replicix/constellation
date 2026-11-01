@@ -1178,6 +1178,8 @@ pub struct AckView {
     /// drop-held`) whose requester never retried, settled by the bound
     /// (`Stats::await_retry_settled`).
     pub await_retry_settled: u64,
+    /// Inbox batches halted behind the replay queue (`Stats::inbox_halted`).
+    pub inbox_halted: u64,
 }
 
 impl Core {
@@ -1278,6 +1280,7 @@ impl Core {
             settled_local: self.stats.settled_local,
             client_unsettled_eio: self.stats.client_unsettled_eio,
             await_retry_settled: self.stats.await_retry_settled,
+            inbox_halted: self.stats.inbox_halted,
         }
     }
 

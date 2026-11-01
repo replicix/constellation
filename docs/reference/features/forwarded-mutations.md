@@ -255,7 +255,9 @@ op may still land. `status.ack` counts `settles_sent`, `settled_abandoned`,
 engine's `settled_eio`; as a sequencer it counts `await_retry_settled`, the
 dropped rows of other nodes (`repair drop-held`) settled by the same record
 after `CONSTELLATION_DROP_HELD_AWAIT_MS` because their requesters never
-retried.
+retried. An S3 inbox batch whose op waits behind that queue halts there, in order (the batch is the
+requester's program order, acknowledged by position, so nothing is reordered past
+it) and is counted in `status.ack.inbox_halted`.
 
 **Coverage rule.** Resolving an in-doubt op against `completed` is only
 valid if this replica has tailed every segment since the op was first
