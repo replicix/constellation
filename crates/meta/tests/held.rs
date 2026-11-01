@@ -1153,3 +1153,32 @@ fn a_read_of_a_sibling_under_a_placeholders_shared_parent_is_not_blocked() {
         "the shared parent's own attributes"
     );
 }
+
+/// Review item 9: a placeholder holds the planner's keys — what its row
+/// wrote, not only what its records name: an unlink names a dentry and its
+/// directory, but writes the inode it takes a name from too, and a later
+/// `chmod` of that inode waits behind it.
+#[test]
+fn a_placeholder_holds_the_keys_its_row_wrote_not_only_the_ones_it_names() {
+    use constellation_meta::RowClass::Archive;
+    let (meta, broken) = node_one_with_a_seed();
+    let unlink = MutateOp::Unlink {
+        parent: ROOT_INO,
+        name: "broken".into(),
+    };
+    exec_as(&meta, Archive, rid_of(7, 1), &unlink);
+    meta.drop_held(broken, 1).unwrap();
+    let queue = meta.pending_replays().unwrap();
+    let keys = &queue
+        .iter()
+        .find(|q| q.rid == rid_of(7, 1))
+        .and_then(|q| q.await_retry.as_ref())
+        .expect("a placeholder")
+        .keys;
+    assert!(keys.dentries.contains(&(ROOT_INO, "broken".to_string())));
+    assert!(keys.shared.contains(&ROOT_INO));
+    assert!(
+        keys.inos.contains(&broken),
+        "the inode the unlink wrote is missing: {keys:?}"
+    );
+}

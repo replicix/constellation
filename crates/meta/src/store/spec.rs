@@ -3418,7 +3418,7 @@ pub(crate) fn mark_await_retry_tx(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
     key: u64,
-    records: &[LogRecord],
+    keys: TouchSet,
     since_ms: i64,
 ) -> Result<bool, MetaError> {
     let Some(v) = tx.get(&meta.pending_replay, seq_key(key))? else {
@@ -3439,10 +3439,7 @@ pub(crate) fn mark_await_retry_tx(
     row.op = MutateOp::Records {
         records: Vec::new(),
     };
-    row.await_retry = Some(AwaitRetry {
-        keys: TouchSet::from_records(records.iter()),
-        since_ms,
-    });
+    row.await_retry = Some(AwaitRetry { keys, since_ms });
     row.class = RowClass::Lone;
     row.truncate_base = None;
     row.lock_tag = LockTag::NONE;

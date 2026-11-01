@@ -598,6 +598,33 @@ fn tx_keys_and_row(r: &impl Readable, meta: &Meta, tx: &Tx) -> Result<KeysAndRow
     Ok((tx_keys(tx, keys, row.as_ref()), row))
 }
 
+/// The keys a placeholder of `tx` holds (`AwaitRetry::keys`): what the
+/// planner held it on (`keys`: what the transaction wrote, what its rows
+/// name, what a completion alone observed — [`tx_keys`]) as dentries and
+/// inodes, not only what its records name ([`TouchSet::from_records`]): the
+/// inode an unlink takes away or a rename moves is written without being
+/// named, and a no-op completion (a rename onto another name of the same
+/// inode) names nothing at all. A directory the transaction names as a
+/// parent stays *shared* (its attributes change by a commutative merge); any
+/// other inode it wrote is exclusive.
+fn placeholder_keys(tx: &Tx, keys: &[Vec<u8>]) -> crate::replay::TouchSet {
+    use constellation_mtree::keys::Key;
+    let mut out = crate::replay::TouchSet::from_records(tx.rows.iter().map(|(_, rec)| rec));
+    for key in keys {
+        match Key::parse(key) {
+            Ok(Key::Inode { ino }) if !out.shared.contains(&ino) => {
+                out.inos.insert(ino);
+            }
+            Ok(Key::Dentry { parent_ino, name }) => {
+                out.dentries
+                    .insert((parent_ino, String::from_utf8_lossy(name).into_owned()));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// A captured transaction's keys for the ship rule: what it wrote, plus
 /// what its rows name, plus — for a completion alone — what it observed.
 ///
@@ -1156,8 +1183,8 @@ impl Meta {
         // them (key overlap, transitively, in journal order).
         let mut tainted: HashSet<Vec<u8>> = HashSet::new();
         let mut seeds: Vec<(Tx, u64, u64)> = Vec::new(); // (tx, spec_seq, origin)
-                                                         // (spec_seq, origin, records)
-        let mut dependents: Vec<(u64, u64, Vec<LogRecord>)> = Vec::new();
+                                                         // (spec_seq, origin, the keys a placeholder of it holds)
+        let mut dependents: Vec<(u64, u64, crate::replay::TouchSet)> = Vec::new();
         for (t, seed_inos, keys) in held.held {
             let is_seed = seed_inos.contains(&ino);
             let depends = keys
@@ -1173,6 +1200,7 @@ impl Meta {
                     t.first
                 )));
             };
+            let placeholder = placeholder_keys(&t, &keys);
             tainted.extend(keys);
             let origin = spec::row_keys_and_origin(&tx, self, spec_seq)?
                 .map(|(_, origin)| origin)
@@ -1180,8 +1208,7 @@ impl Meta {
             if is_seed {
                 seeds.push((t, spec_seq, origin));
             } else {
-                let records = t.rows.iter().map(|(_, rec)| rec.clone()).collect();
-                dependents.push((spec_seq, origin, records));
+                dependents.push((spec_seq, origin, placeholder));
             }
         }
         let mut seqs: HashSet<u64> = dependents.iter().map(|(seq, _, _)| *seq).collect();
@@ -1192,12 +1219,12 @@ impl Meta {
         // never given is no copy of its op any more, but a placeholder in
         // its place: its requester's retry is the one copy that executes.
         let mut await_retry = 0;
-        for (_, origin, records) in &dependents {
+        for (_, origin, keys) in &dependents {
             if spec::mark_await_retry_tx(
                 &mut tx,
                 self,
                 *origin,
-                records,
+                keys.clone(),
                 now_unix.saturating_mul(1000),
             )? {
                 await_retry += 1;
