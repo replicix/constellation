@@ -631,33 +631,35 @@ before M1.2 is recreated (as plan 29 required when partitions went).
 
 ## 11. Open questions for the maintainer
 
+All eight answered by the maintainer on 2026-11-01: each as recommended below.
+
 - **Q1 — The flag's spelling.** `fs create --ack-policy s3` as the one
   remaining value (§5.6), or rename the flag to `--ack s3` since it is a
-  boolean now? *Recommended: keep `--ack-policy s3`; fewer doc changes.*
+  boolean now? *Decided: keep `--ack-policy s3`.*
 - **Q2 — Self-fence defaults when enabled.** `Y` (holder stops) and `X`
-  (root may reclaim): *recommended* `Y` = 30 s, `X` = 10 × `Y`, both in
+  (root may reclaim): *decided* `Y` = 30 s, `X` = 10 × `Y`, both in
   honour-clock terms (ADR-35).
 - **Q3 — Sticky grant for the root: proposal threshold.** The root takes
   a grant on the topmost directory it dominates by placement's rule
-  (70 %, the ops floor) or on the first write into any subtree? *Recommended:
+  (70 %, the ops floor) or on the first write into any subtree? *Decided:
   placement's rule; a first-write rule would grant on every touched
   directory.*
 - **Q4 — Handover grace.** How long a sticky holder keeps a subtree after
-  another node starts forwarding into it: *recommended* release when idle
+  another node starts forwarding into it: *decided*: release when idle
   for 5 s, or at once when the holder has no op in flight in that subtree.
 - **Q5 — `abandon`'s spelling.** `repair abandon --node` beside
   `repair abandon-group --epoch|--gen`, or fold the three into one
-  `repair abandon` with a target. *Recommended: fold, in M1.3.*
+  `repair abandon` with a target. *Decided: fold, in M1.3.*
 - **Q6 — The singleton's death-then-join window** (§5.5): accept the
   export-as-copies contract, or make a joining node refuse to claim a
   lease whose holder's last heartbeat is younger than the roster's join
-  grace? *Recommended: accept; the refusal would need a liveness rule we
+  grace? *Decided: accept; the refusal would need a liveness rule we
   do not want (hard constraint 5).*
 - **Q7 — G1 after stage 1.** Re-measure rename/unlink p90 at M1.3; apply
   the saved nudge patch only if the miss remains.
 - **Q8 — The flex strict flags' owner.** M1.4 turns them on; if M1.0's
   timebox sends C3-as-written first, do they wait for stage 1 or go on
-  with variant 3(i) alone? *Recommended: wait.*
+  with variant 3(i) alone? *Decided: wait.*
 
 ## 12. Exit criteria
 
