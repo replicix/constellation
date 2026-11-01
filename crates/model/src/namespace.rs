@@ -66,6 +66,9 @@ pub fn with_presence(dir: DirState, name: Name, on: bool) -> DirState {
 pub enum Errno {
     Eexist,
     Enoent,
+    /// Plan 43 C2: the code a settled op's refusal is recorded under
+    /// (`Refused { rid, ABANDONED_CODE }`); no namespace op refuses with it.
+    Abandoned,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -93,6 +96,12 @@ pub enum NsRet {
     /// (an in-flight op that need not linearize); kept distinct so a
     /// history reads as what happened.
     Conflicted,
+    /// Plan 43 C2 (`abandon`): the op was settled at its deadline — the
+    /// sequencer in force had no outcome for it and refused it for good —
+    /// and the client heard `EIO`. It had no effect and never will:
+    /// `prop_linearizable` leaves it out, `eio_never_lands_late` checks it
+    /// is never in the log.
+    Abandoned,
 }
 
 /// A durable record: what actually happened, applied unconditionally

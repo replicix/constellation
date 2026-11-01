@@ -156,6 +156,11 @@ pub struct ClientOp {
     /// multiple of `Today`'s instead of growing with every extra tick the
     /// checker is willing to spend retrying the same op.
     pub attempts: u8,
+    /// Plan 43 C2 (`abandon`): the deadline passed and the op is being
+    /// settled — every forward of it from now on (`MutateReq::settle`), and
+    /// its lease-path execution, asks for the rid's outcome or its refusal
+    /// for good instead of executing it.
+    pub settle: bool,
 }
 
 /// Plan 30 §M2: "the same holder, with backoff (three attempts or 2s)".
@@ -233,6 +238,8 @@ pub enum MsgBody {
         corr: MsgId,
         op: NsOp,
         rid: Rid,
+        /// Plan 43 C2: a settle of `rid` (see [`ClientOp::settle`]).
+        settle: bool,
     },
     MutateRep {
         to: NodeId,
@@ -689,8 +696,12 @@ pub struct AuthorityModel {
     /// existing configurations are unchanged. With it on, the property
     /// `eio_never_lands_late` is checked.
     pub deadlines: bool,
-    /// Plan 43 C2: an in-doubt answer waits until the rid is *settled*
-    /// (`Abandon`). Not implemented before C2: the model refuses `true`.
+    /// Plan 43 C2 (§5.3 item 5, `deadlines` only): the deadline settles the
+    /// op instead of answering it in doubt ([`Action::Deadline`]): the
+    /// sequencer in force answers the rid's outcome, or records `Refused {
+    /// rid, Abandoned }` (dedup'd like any outcome, shipped like an inbox
+    /// refusal) and the client hears `EIO`, settled. With it on,
+    /// `eio_never_lands_late` requires a settled rid never to be in the log.
     pub abandon: bool,
 }
 
@@ -729,7 +740,7 @@ impl AuthorityModel {
         self
     }
 
-    /// Plan 43 C2's knob; the model asserts it is `false` until then.
+    /// Plan 43 C2's knob (see [`AuthorityModel::abandon`]).
     pub fn with_abandon(mut self, b: bool) -> Self {
         self.abandon = b;
         self
@@ -997,6 +1008,36 @@ fn has_unshipped(node: &Node) -> bool {
 /// arm, folded into the same pass since nothing here ever needs the two
 /// separately).
 #[allow(clippy::type_complexity)]
+/// Plan 43 C2: `id`, the holder at `epoch`, records the settle refusal of
+/// `rid` (`Refused { rid, Abandoned }`): an unshipped refusal like an inbox
+/// op's (it ships with the next segment and is dropped with the tenure's
+/// unshipped work), and from now on the rid's outcome here.
+fn settle_refusal(s: &mut State, id: NodeId, rid: Rid, epoch: Epoch) {
+    s.nodes[id as usize]
+        .inbox_mut()
+        .refusals
+        .push((rid, Errno::Abandoned, epoch));
+}
+
+impl AuthorityModel {
+    /// Plan 43 C2: settle `rid` at `id`, which holds at `epoch`: the rid's
+    /// recorded outcome if there is one (the late success, a refusal), else
+    /// its refusal for good (`Abandoned`).
+    fn settle_here(&self, s: &mut State, id: NodeId, rid: Rid, epoch: Epoch) -> NsRet {
+        if rid_completed_record(s, id, rid, self.protocol).is_some() {
+            return NsRet::Ok;
+        }
+        match crate::inbox::rid_refused(s, id, rid, true) {
+            Some(Errno::Abandoned) => NsRet::Abandoned,
+            Some(e) => NsRet::Err(e),
+            None => {
+                settle_refusal(s, id, rid, epoch);
+                NsRet::Abandoned
+            }
+        }
+    }
+}
+
 pub(crate) fn log_fold(
     log: &[Option<Segment>],
     upto: Seq,
@@ -1467,10 +1508,6 @@ impl Model for AuthorityModel {
 
     fn init_states(&self) -> Vec<State> {
         assert!(
-            !self.abandon,
-            "AuthorityModel::abandon is plan 43 C2's: not implemented before it"
-        );
-        assert!(
             self.n_nodes as usize <= MAX_NODES,
             "at most {MAX_NODES} nodes (protocol::MAX_NODES)"
         );
@@ -1571,6 +1608,7 @@ impl Model for AuthorityModel {
             }
             if let Some(cop) = &node.client_op {
                 if self.deadlines
+                    && !cop.settle
                     && matches!(
                         cop.phase,
                         Phase::WaitingReply { .. }
@@ -1788,6 +1826,7 @@ impl Model for AuthorityModel {
                         phase: Phase::NeedsLease,
                         rid,
                         attempts: 0,
+                        settle: false,
                     });
                     if claim_kind(&s, id).is_none() {
                         crate::inbox::submit(&mut s, id, op, rid);
@@ -1805,6 +1844,7 @@ impl Model for AuthorityModel {
                             corr,
                             op,
                             rid,
+                            settle: false,
                         },
                     });
                     s.nodes[id as usize].client_op = Some(ClientOp {
@@ -1812,6 +1852,7 @@ impl Model for AuthorityModel {
                         phase: Phase::WaitingReply { corr, holder: h },
                         rid,
                         attempts: 0,
+                        settle: false,
                     });
                 } else {
                     // No known holder to forward to at all: straight to
@@ -1821,20 +1862,22 @@ impl Model for AuthorityModel {
                         phase: Phase::NeedsLease,
                         rid,
                         attempts: 0,
+                        settle: false,
                     });
                 }
             }
             Action::DeliverForwardRequest(mid) => {
                 let idx = s.network.iter().position(|e| e.id == mid)?;
                 let env = s.network.remove(idx);
-                let (from, to, op, rid, corr) = match env.body {
+                let (from, to, op, rid, corr, settle) = match env.body {
                     MsgBody::MutateReq {
                         from,
                         to,
                         op,
                         rid,
                         corr,
-                    } => (from, to, op, rid, corr),
+                        settle,
+                    } => (from, to, op, rid, corr, settle),
                     _ => return None,
                 };
                 // Plan 30 §M2 holder dedup: a retried rid (same holder or
@@ -1865,8 +1908,17 @@ impl Model for AuthorityModel {
                 // rid against a stale replica, followed by the old
                 // holder's replay of the same rid succeeding here, gave
                 // one rid two outcomes).
-                let refused = if cached.is_none() && self.inbox && held.is_some() {
-                    crate::inbox::rid_refused(&s, to, rid, self.inbox_record_refusals)
+                // Plan 43 C2 (`abandon`): so is a settle's refusal, from any
+                // path (the settle may have reached this holder before a
+                // delayed copy of the op, or a replay of it by rid).
+                let refused = if cached.is_none() && (self.inbox || self.abandon) && held.is_some()
+                {
+                    crate::inbox::rid_refused(
+                        &s,
+                        to,
+                        rid,
+                        self.inbox_record_refusals || self.abandon,
+                    )
                 } else {
                     None
                 };
@@ -1885,6 +1937,12 @@ impl Model for AuthorityModel {
                     Outcome::Accepted(rec, epoch)
                 } else if let Some(e) = refused {
                     Outcome::Errno(e)
+                } else if let (Some(epoch), true) = (held, settle) {
+                    // Plan 43 C2: no outcome here — refused for good,
+                    // journaled like any refusal (it ships with the next
+                    // segment) and answered.
+                    settle_refusal(&mut s, to, rid, epoch);
+                    Outcome::Errno(Errno::Abandoned)
                 } else if let Some(epoch) = held {
                     let base = node_replica(&s, to);
                     let (ret, _) = eval(base, op);
@@ -1897,7 +1955,7 @@ impl Model for AuthorityModel {
                             Outcome::Accepted(op, epoch)
                         }
                         NsRet::Err(e) => Outcome::Errno(e),
-                        NsRet::Tentative | NsRet::Conflicted => unreachable!(
+                        NsRet::Tentative | NsRet::Conflicted | NsRet::Abandoned => unreachable!(
                             "eval() never returns Tentative/Conflicted; only mark_tentative/\
                              mark_conflicted rewrite an already-recorded Return to them"
                         ),
@@ -1986,6 +2044,10 @@ impl Model for AuthorityModel {
                                         completed = Some(NsRet::Ok);
                                     }
                                 }
+                                // Plan 43 C2: settled.
+                                Outcome::Errno(Errno::Abandoned) => {
+                                    completed = Some(NsRet::Abandoned)
+                                }
                                 Outcome::Errno(e) => completed = Some(NsRet::Err(e)),
                                 Outcome::NotHolder => {
                                     s.nodes[to as usize].client_op.as_mut().unwrap().phase =
@@ -2007,6 +2069,10 @@ impl Model for AuthorityModel {
                         .expect("completed only with a client op")
                         .op
                         .name();
+                    if ret == NsRet::Abandoned {
+                        let at = s.history.len() as u8;
+                        s.eio.get_or_insert_with(Default::default).push((rid, at));
+                    }
                     s.history.push(HistEvt::Return(to, ret, rid));
                     s.nodes[to as usize].client_op = None;
                     // Plan 30 §M6: the client has now observed the
@@ -2054,6 +2120,11 @@ impl Model for AuthorityModel {
                                 s.nodes[to as usize].replays.remove(i);
                                 self.install_shadow(&mut s, to, entry.rid, epoch, rec, at.pos());
                             }
+                        }
+                        // Plan 43 C2: the rid was settled; nothing of it
+                        // runs and nobody heard it took effect.
+                        Outcome::Errno(Errno::Abandoned) => {
+                            s.nodes[to as usize].replays.remove(i);
                         }
                         Outcome::Errno(_) => {
                             // Refused: the real code materializes a
@@ -2106,6 +2177,7 @@ impl Model for AuthorityModel {
                         corr,
                         op: cop.op,
                         rid: cop.rid,
+                        settle: cop.settle,
                     },
                 });
                 let cop_mut = s.nodes[id as usize].client_op.as_mut().unwrap();
@@ -2344,7 +2416,10 @@ impl Model for AuthorityModel {
                     } else {
                         None
                     };
-                    let ret = if let Some(e) = refused {
+                    let ret = if cop.settle {
+                        // Plan 43 C2: the settle on the lease path.
+                        self.settle_here(&mut s, id, cop.rid, new_epoch)
+                    } else if let Some(e) = refused {
                         NsRet::Err(e)
                     } else if cached.is_some() {
                         NsRet::Ok
@@ -2356,6 +2431,12 @@ impl Model for AuthorityModel {
                         }
                         ret
                     };
+                    if ret == NsRet::Abandoned {
+                        let at = s.history.len() as u8;
+                        s.eio
+                            .get_or_insert_with(Default::default)
+                            .push((cop.rid, at));
+                    }
                     s.history.push(HistEvt::Return(id, ret, cop.rid));
                     s.nodes[id as usize].client_op = None;
                 }
@@ -2399,6 +2480,7 @@ impl Model for AuthorityModel {
                             corr,
                             op: entry.op,
                             rid: entry.rid,
+                            settle: false,
                         },
                     });
                     let head = &mut s.nodes[id as usize].replays[0];
@@ -2467,6 +2549,48 @@ impl Model for AuthorityModel {
             }
             Action::DropMessage(mid) => {
                 s.network.retain(|e| e.id != mid);
+            }
+            Action::Deadline(id) if self.abandon => {
+                // Plan 43 C2 (§5.3 item 5): the op's own attempts end; it is
+                // settled under the same rid, from the same client op: here
+                // as the holder, else by a settle forwarded to the holder the
+                // register names, else on the lease path (`AcquireLease`).
+                // The client hears the outcome (the late success, a refusal)
+                // or, settled, `EIO`. No second deadline: the isolated
+                // requester's escape is a liveness device the bounded search
+                // does not need.
+                let mut cop = s.nodes[id as usize].client_op.take()?;
+                cop.settle = true;
+                cop.attempts = 0;
+                if let Some(epoch) = authority(&s, id, self.protocol) {
+                    let ret = self.settle_here(&mut s, id, cop.rid, epoch);
+                    if ret == NsRet::Abandoned {
+                        let at = s.history.len() as u8;
+                        s.eio
+                            .get_or_insert_with(Default::default)
+                            .push((cop.rid, at));
+                    }
+                    s.history.push(HistEvt::Return(id, ret, cop.rid));
+                } else if let Some(h) = s.lease.holder.filter(|h| *h != id) {
+                    let corr = s.next_id;
+                    s.next_id += 1;
+                    s.network.push(Envelope {
+                        id: corr,
+                        body: MsgBody::MutateReq {
+                            from: id,
+                            to: h,
+                            corr,
+                            op: cop.op,
+                            rid: cop.rid,
+                            settle: true,
+                        },
+                    });
+                    cop.phase = Phase::WaitingReply { corr, holder: h };
+                    s.nodes[id as usize].client_op = Some(cop);
+                } else {
+                    cop.phase = Phase::NeedsLease;
+                    s.nodes[id as usize].client_op = Some(cop);
+                }
             }
             Action::Deadline(id) => {
                 let cop = s.nodes[id as usize].client_op.take()?;
@@ -2559,11 +2683,24 @@ fn prop_linearizable(m: &AuthorityModel, s: &State) -> bool {
             _ => None,
         })
         .collect();
+    // Plan 43 C2: a settled op had no effect: it is left out (that it never
+    // lands is `eio_never_lands_late`'s).
+    let abandoned: Vec<Rid> = s
+        .history
+        .iter()
+        .filter_map(|e| match e {
+            HistEvt::Return(_, NsRet::Abandoned, rid) => Some(*rid),
+            _ => None,
+        })
+        .collect();
     let mut tester = LinearizabilityTester::<NodeId, NamespaceSpec>::new(NamespaceSpec {
         present: m.genesis_dir(),
     });
     for (idx, evt) in s.history.iter().enumerate() {
         let r = match evt {
+            HistEvt::Invoke(_, _, rid) | HistEvt::Return(_, _, rid) if abandoned.contains(rid) => {
+                continue
+            }
             HistEvt::Invoke(_, op, rid) if tentative.contains(rid) => {
                 tester.on_invoke(TENTATIVE_THREAD_BASE + idx as NodeId, *op)
             }
@@ -2585,7 +2722,7 @@ fn prop_linearizable(m: &AuthorityModel, s: &State) -> bool {
 /// EIO'd rid `r` that is in the log at position `p` (its place in the
 /// unfenced log's completions), no op `r'` of the same node, invoked after
 /// the answer's history index, completes at a position before `p`.
-fn prop_eio_never_lands_late(_m: &AuthorityModel, s: &State) -> bool {
+fn prop_eio_never_lands_late(m: &AuthorityModel, s: &State) -> bool {
     let Some(eio) = s.eio.as_deref() else {
         return true;
     };
@@ -2595,6 +2732,11 @@ fn prop_eio_never_lands_late(_m: &AuthorityModel, s: &State) -> bool {
         let Some(p) = position(*rid) else {
             return true;
         };
+        // Plan 43 C2 (`abandon`): a settled `EIO` means "did not, and will
+        // not, happen": the rid is never in the log at all.
+        if m.abandon {
+            return false;
+        }
         s.history.iter().enumerate().all(|(idx, e)| match e {
             HistEvt::Invoke(n, _, later)
                 if *n == rid.node && idx > *at as usize && later != rid =>

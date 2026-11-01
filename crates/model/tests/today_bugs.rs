@@ -652,10 +652,100 @@ fn today_an_in_doubt_op_lands_after_its_eio() {
     checker.assert_discovery("eio_never_lands_late", path);
 }
 
-/// The knob C2 will implement is refused until then.
+/// Plan 43 C2 (§5.3 item 5): with `abandon`, the deadline of
+/// `today_an_in_doubt_op_lands_after_its_eio`'s configuration settles the
+/// op instead of answering it in doubt: the holder in force has its
+/// outcome, or refuses it for good and every later copy of it (the deposed
+/// holder's replay by rid, a delayed forward) dedups to that refusal. Clean
+/// on `eio_never_lands_late` (a settled rid is never in the log),
+/// `linearizable` and `no_rid_executes_twice` within the bounds the
+/// counterexample search above uses (5M states, depth 40, 40 s: there it
+/// finds the violation; the full space is beyond the 60M safety net).
 #[test]
-#[should_panic(expected = "plan 43 C2")]
-fn the_abandon_knob_is_not_implemented_before_c2() {
-    let model = AuthorityModel::new(2).with_abandon(true);
-    let _ = model.init_states();
+fn abandon_settles_before_eio_is_clean() {
+    let model = AuthorityModel::new(2)
+        .with_protocol(Protocol::Recovery)
+        .with_forward_retries(0)
+        .with_initial_holder(0, 1)
+        .with_lease_ttl(1)
+        .with_max_seq(3)
+        .with_lossy(false)
+        .with_deadlines(true)
+        .with_abandon(true)
+        .with_op(1, NsOp::CreateExcl(name(0)))
+        .with_op(1, NsOp::CreateExcl(name(1)));
+    assert_abandon_clean(
+        "abandon (in-doubt op, 2 nodes)",
+        model,
+        Some((5_000_000, 40, Duration::from_secs(40))),
+    );
+}
+
+/// `recovery_fixes_bug_b_third_node_takeover`'s configuration with the
+/// deadline settling (bounded, like its parent).
+#[test]
+fn recovery_with_abandon_is_clean_third_node_takeover() {
+    let model = AuthorityModel::new(3)
+        .with_protocol(Protocol::Recovery)
+        .with_forward_retries(0)
+        .with_initial_holder(0, 1)
+        .with_max_tick(6)
+        .with_lease_ttl(2)
+        .with_max_seq(3)
+        .with_max_crashes(1)
+        .with_deadlines(true)
+        .with_abandon(true)
+        .with_op(1, NsOp::CreateExcl(name(0)))
+        .with_op(2, NsOp::CreateExcl(name(1)));
+    assert_abandon_clean(
+        "abandon (bug B, third node takes over)",
+        model,
+        Some((200_000, 20, Duration::from_secs(15))),
+    );
+}
+
+/// [`assert_recovery_bounded`] plus the settle's own properties.
+fn assert_abandon_clean(label: &str, model: AuthorityModel, cap: Option<(usize, usize, Duration)>) {
+    let started = Instant::now();
+    let mut builder = model.checker();
+    builder = if let Some((states, depth, timeout)) = cap {
+        builder
+            .target_state_count(states)
+            .target_max_depth(depth)
+            .timeout(timeout)
+    } else {
+        safety_net_cap(builder)
+    };
+    let checker = builder.spawn_bfs().join();
+    println!(
+        "{label}: {} states ({} unique), max depth {}, is_done={}, {:?}",
+        checker.state_count(),
+        checker.unique_state_count(),
+        checker.max_depth(),
+        checker.is_done(),
+        started.elapsed()
+    );
+    if cap.is_none() {
+        assert!(
+            checker.is_done(),
+            "expected exhaustive exploration ({label})"
+        );
+    }
+    for prop in [
+        "linearizable",
+        "converged_at_quiescence",
+        "commits_are_log_prefixes",
+        "no_rid_executes_twice",
+        "eio_never_lands_late",
+    ] {
+        assert!(
+            checker.discovery(prop).is_none(),
+            "abandon must not violate {prop} ({label}): {:?}",
+            checker.discovery(prop).map(|p| p.into_actions())
+        );
+    }
+    assert!(
+        checker.discovery("progress").is_some(),
+        "expected at least one run where every op completes ({label})"
+    );
 }

@@ -184,7 +184,7 @@ fn execute_one(m: &AuthorityModel, s: &mut State, h: NodeId, batch: InboxBatch, 
             .inbox_mut()
             .refusals
             .push((batch.rid, e, epoch)),
-        NsRet::Tentative | NsRet::Conflicted => unreachable!(
+        NsRet::Tentative | NsRet::Conflicted | NsRet::Abandoned => unreachable!(
             "eval() never returns Tentative/Conflicted; only mark_tentative/mark_conflicted \
              rewrite an already-recorded Return to them"
         ),
