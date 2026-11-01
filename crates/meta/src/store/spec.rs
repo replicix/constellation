@@ -121,8 +121,8 @@ use crate::store::local::{self, LogPrefixView, RowClass};
 use crate::store::{
     adjust_usage_tx, counter_add_tx, counter_get, counter_set_tx, kv_get_tx, kv_set_tx, misc, ns,
     Meta, UsageTracker, KV_APPLIED_SEQ, KV_DELEG_SPEC_COUNT, KV_LOCAL_SPEC_COUNT, KV_NEXT_SPEC_SEQ,
-    KV_NODE_PREFIX, KV_PENDING_REPLAY_COUNT, KV_SPEC_FLOOR, KV_SPEC_LIVE_COUNT,
-    KV_UNCAPTURED_TX_COUNT,
+    KV_NODE_PREFIX, KV_PENDING_REPLAY_COUNT, KV_PENDING_REPLAY_GEN, KV_SPEC_FLOOR,
+    KV_SPEC_LIVE_COUNT, KV_UNCAPTURED_TX_COUNT,
 };
 use constellation_mtree::keys;
 use constellation_mtree::record::{InodeRecord, Payload};
@@ -1195,6 +1195,7 @@ fn mark_queued_class_tx(
             seq_key(key),
             postcard::to_allocvec(&row)?,
         );
+        counter_add_tx(tx, &meta.local, KV_PENDING_REPLAY_GEN, 1)?;
     }
     Ok(())
 }
@@ -1239,6 +1240,7 @@ fn enqueue_replay_as_tx(
         seq_key(key),
         postcard::to_allocvec(&row)?,
     );
+    counter_add_tx(tx, &meta.local, KV_PENDING_REPLAY_GEN, 1)?;
     Ok(())
 }
 
@@ -3451,6 +3453,7 @@ pub(crate) fn mark_await_retry_tx(
         seq_key(key),
         postcard::to_allocvec(&row)?,
     );
+    counter_add_tx(tx, &meta.local, KV_PENDING_REPLAY_GEN, 1)?;
     Ok(true)
 }
 
@@ -3487,6 +3490,7 @@ pub(crate) fn refuse_queued_tx(
         seq_key(key),
         postcard::to_allocvec(&row)?,
     );
+    counter_add_tx(tx, &meta.local, KV_PENDING_REPLAY_GEN, 1)?;
     Ok(())
 }
 
@@ -3501,6 +3505,7 @@ pub(crate) fn drop_queued_of_rids_tx(
     for queued in read_pending_replays(&*tx, meta)? {
         if rids.contains(&queued.rid) {
             tx.remove(&meta.pending_replay, seq_key(queued.queue_seq));
+            counter_add_tx(tx, &meta.local, KV_PENDING_REPLAY_GEN, 1)?;
             counter_add_tx(tx, &meta.local, KV_PENDING_REPLAY_COUNT, -1)?;
             dropped += 1;
         }
@@ -3552,6 +3557,103 @@ pub(crate) fn read_pending_replays(
         });
     }
     Ok(out)
+}
+
+/// Plan 46 M0.2 review: the replay queue, decoded once per generation of
+/// the queue (`KV_PENDING_REPLAY_GEN`, bumped in the transaction of every
+/// change), with the keys each entry touches. A forward, an own op and a
+/// fast-path write ask the queue whether it holds an entry ahead of them on
+/// their keys; decoding the whole queue and computing every entry's keys on
+/// each such question cost O(queue) per op for as long as any queue
+/// existed (an ordinary post-deposition queue included).
+///
+/// The keys are the entry's own except for an op whose keys depend on the
+/// namespace as it stands now (an unlink's or rename's target inode, which
+/// the keys name when it resolves): those are computed at the question
+/// ([`QueueSnapshot::keys_of`]), the rest are fixed with the entry.
+#[derive(Debug, Default)]
+pub struct QueueSnapshot {
+    /// The generation this was read at.
+    pub gen: u64,
+    pub entries: Vec<StrandedOp>,
+    keys: Vec<TouchSet>,
+    lookup_dependent: Vec<bool>,
+}
+
+impl QueueSnapshot {
+    fn build(gen: u64, entries: Vec<StrandedOp>) -> Self {
+        let mut keys = Vec::with_capacity(entries.len());
+        let mut lookup_dependent = Vec::with_capacity(entries.len());
+        for e in &entries {
+            let (k, dep) = match &e.await_retry {
+                Some(a) => (a.keys.clone(), false),
+                None => {
+                    let mut k = TouchSet::from_op(&e.op);
+                    k.inos.extend(created_ino_of(&e.op));
+                    (k, op_keys_depend_on_lookup(&e.op))
+                }
+            };
+            keys.push(k);
+            lookup_dependent.push(dep);
+        }
+        QueueSnapshot {
+            gen,
+            entries,
+            keys,
+            lookup_dependent,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The keys entry `i` touches; `lookup` resolves a name to its inode
+    /// for the ops whose keys name what they take away or move.
+    pub fn keys_of(
+        &self,
+        i: usize,
+        lookup: &dyn Fn(u64, &str) -> Option<u64>,
+    ) -> std::borrow::Cow<'_, TouchSet> {
+        if !self.lookup_dependent[i] {
+            return std::borrow::Cow::Borrowed(&self.keys[i]);
+        }
+        let e = &self.entries[i];
+        let mut k = TouchSet::from_op_in(&e.op, lookup);
+        k.inos.extend(created_ino_of(&e.op));
+        std::borrow::Cow::Owned(k)
+    }
+}
+
+/// The inode `op` creates (its new name's): the op form names it, but its
+/// keys leave it out (`TouchSet::from_op`; the `Records` form counts it).
+pub fn created_ino_of(op: &MutateOp) -> Option<constellation_fs_core::Ino> {
+    match op {
+        MutateOp::Create { ino, .. }
+        | MutateOp::Mkdir { ino, .. }
+        | MutateOp::Symlink { ino, .. }
+        | MutateOp::Mknod { ino, .. } => Some(*ino),
+        _ => None,
+    }
+}
+
+fn op_keys_depend_on_lookup(op: &MutateOp) -> bool {
+    match op {
+        MutateOp::Unlink { .. }
+        | MutateOp::Rmdir { .. }
+        | MutateOp::Rename { .. }
+        | MutateOp::Exchange { .. } => true,
+        MutateOp::Records { records } => records.iter().any(|r| {
+            matches!(
+                r,
+                LogRecord::Unlink { .. }
+                    | LogRecord::Rmdir { .. }
+                    | LogRecord::Rename { .. }
+                    | LogRecord::Exchange { .. }
+            )
+        }),
+        _ => false,
+    }
 }
 
 // ------------------------------------------------------------ Meta API
@@ -5071,6 +5173,52 @@ impl Meta {
         })
     }
 
+    /// The replay queue as a [`QueueSnapshot`], decoded once per
+    /// generation of the queue. One counter read when it is empty.
+    pub fn queue_snapshot(&self) -> Result<std::sync::Arc<QueueSnapshot>, MetaError> {
+        let r = self.db.read_tx();
+        if counter_get(&r, &self.local, KV_PENDING_REPLAY_COUNT)? == 0 {
+            return Ok(std::sync::Arc::new(QueueSnapshot::default()));
+        }
+        let gen = counter_get(&r, &self.local, KV_PENDING_REPLAY_GEN)?;
+        if let Some(cached) = &*self.queue_cache.lock().unwrap() {
+            if cached.gen == gen {
+                return Ok(cached.clone());
+            }
+        }
+        let snap = std::sync::Arc::new(QueueSnapshot::build(gen, read_pending_replays(&r, self)?));
+        *self.queue_cache.lock().unwrap() = Some(snap.clone());
+        Ok(snap)
+    }
+
+    /// Whether the replay queue holds an entry, not refused and not already
+    /// completed in the log, that touches a key of `op`: an own op (a FUSE
+    /// write, the fast path) must not run ahead of it. The fast path asks
+    /// before it executes (`root_fast_path`); a refused answer sends the op
+    /// through the core, which parks it behind the entries ahead of it.
+    pub fn queue_overlaps_op(&self, op: &MutateOp) -> bool {
+        let Ok(snap) = self.queue_snapshot() else {
+            return false;
+        };
+        if snap.is_empty() {
+            return false;
+        }
+        let lookup = |p: u64, n: &str| {
+            crate::MetaStore::lookup(self, p, n)
+                .ok()
+                .flatten()
+                .map(|a| a.ino)
+        };
+        let mut keys = TouchSet::from_op_in(op, &lookup);
+        keys.inos.extend(created_ino_of(op));
+        (0..snap.entries.len()).any(|i| {
+            let e = &snap.entries[i];
+            e.refused.is_none()
+                && snap.keys_of(i, &lookup).overlaps(&keys)
+                && !matches!(self.completed_outcome(e.rid), Ok(Some(_)))
+        })
+    }
+
     /// Every queued replay, oldest (original acceptance order) first. The
     /// replay drain asks every 250 ms; an empty queue is one counter read.
     pub fn pending_replays(&self) -> Result<Vec<StrandedOp>, MetaError> {
@@ -5121,6 +5269,7 @@ impl Meta {
             seq_key(queue_seq),
             postcard::to_allocvec(&row)?,
         );
+        counter_add_tx(&mut tx, &self.local, KV_PENDING_REPLAY_GEN, 1)?;
         tx.commit()?;
         Ok(())
     }
@@ -5144,6 +5293,7 @@ impl Meta {
             seq_key(queue_seq),
             postcard::to_allocvec(&row)?,
         );
+        counter_add_tx(&mut tx, &self.local, KV_PENDING_REPLAY_GEN, 1)?;
         tx.commit()?;
         Ok(())
     }
@@ -5154,6 +5304,7 @@ impl Meta {
         let mut tx = self.db.write_tx();
         if tx.get(&self.pending_replay, seq_key(queue_seq))?.is_some() {
             tx.remove(&self.pending_replay, seq_key(queue_seq));
+            counter_add_tx(&mut tx, &self.local, KV_PENDING_REPLAY_GEN, 1)?;
             counter_add_tx(&mut tx, &self.local, KV_PENDING_REPLAY_COUNT, -1)?;
         }
         tx.commit()?;

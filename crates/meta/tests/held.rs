@@ -1037,3 +1037,72 @@ fn drop_held_keeps_dependents_in_journal_order() {
     assert!(meta.replay_touches(&[ReadKey::Dentry(ROOT_INO, "y".into())]));
     assert!(!meta.replay_touches(&[ReadKey::Dentry(ROOT_INO, "unrelated".into())]));
 }
+
+/// Review item 8: the queue is decoded once per generation of the queue,
+/// and every change to it — an entry queued, refused, marked, forgotten —
+/// is a new generation.
+#[test]
+fn the_queue_snapshot_is_cached_and_every_change_invalidates_it() {
+    use constellation_meta::RowClass::Archive;
+    use std::sync::Arc;
+    let (meta, broken) = node_one_with_a_seed();
+    assert!(meta.queue_snapshot().unwrap().is_empty());
+    exec_as(&meta, Archive, rid_of(7, 1), &chmod(broken, 0o600));
+    meta.drop_held(broken, 5).unwrap();
+    let first = meta.queue_snapshot().unwrap();
+    assert_eq!(first.entries.len(), 2);
+    assert!(
+        Arc::ptr_eq(&first, &meta.queue_snapshot().unwrap()),
+        "cached"
+    );
+    // Queued again: a new generation.
+    meta.queue_replay(rid_of(1, 50), &chmod(broken, 0o640), &Default::default())
+        .unwrap();
+    let second = meta.queue_snapshot().unwrap();
+    assert!(!Arc::ptr_eq(&first, &second));
+    assert_eq!(second.entries.len(), 3);
+    // Refused in place: the count is the same, the generation is not.
+    let seq = second.entries[2].queue_seq;
+    meta.mark_replay_refused(
+        seq,
+        constellation_meta::Refusal {
+            reason: "x".into(),
+            ts_unix: 1,
+        },
+    )
+    .unwrap();
+    let third = meta.queue_snapshot().unwrap();
+    assert!(!Arc::ptr_eq(&second, &third));
+    assert!(third.entries[2].refused.is_some());
+    // Marked unacked in place.
+    meta.mark_replay_unacked(second.entries[1].queue_seq)
+        .unwrap();
+    let fourth = meta.queue_snapshot().unwrap();
+    assert!(!Arc::ptr_eq(&third, &fourth));
+    // Forgotten.
+    meta.forget_replay(seq).unwrap();
+    let fifth = meta.queue_snapshot().unwrap();
+    assert!(!Arc::ptr_eq(&fourth, &fifth));
+    assert_eq!(fifth.entries.len(), 2);
+}
+
+/// Review MUST 1 (a), the FUSE fast path: an own write on keys the queue
+/// holds an entry for does not take the fast path (the core parks it
+/// behind the queue); one on other keys does.
+#[test]
+fn the_fast_path_refuses_an_op_on_keys_the_queue_holds() {
+    use constellation_meta::RowClass::Archive;
+    let (meta, broken) = node_one_with_a_seed();
+    let other = meta.create(ROOT_INO, "other", 0o644, 0, 0).unwrap().ino;
+    exec_as(&meta, Archive, rid_of(7, 1), &chmod(broken, 0o600));
+    assert!(
+        meta.root_fast_path(&chmod(broken, 0o700)).is_some(),
+        "empty queue"
+    );
+    meta.drop_held(broken, 5).unwrap();
+    assert!(
+        meta.root_fast_path(&chmod(broken, 0o700)).is_none(),
+        "behind the placeholder and the seed"
+    );
+    assert!(meta.root_fast_path(&chmod(other, 0o700)).is_some());
+}

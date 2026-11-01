@@ -580,6 +580,12 @@ impl Meta {
                 return None;
             }
         }
+        // Plan 46 M0.2 review: not ahead of a replay-queue entry on its
+        // keys (a dropped row's placeholder, or an acknowledged op queued
+        // behind one): the core parks the op behind the queue.
+        if self.queue_overlaps_op(op) {
+            return None;
+        }
         Some(RootAdmission(guard))
     }
 

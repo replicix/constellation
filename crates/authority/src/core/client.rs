@@ -2379,6 +2379,22 @@ impl Core {
             // the outcome goes to `finish`, which drops it.
             return MutateOutcome::Errno(Code::Io);
         };
+        // Plan 46 M0.2 (review MUST 1): this node's own op stands behind the
+        // replay queue on its keys as another node's does (R3): what the
+        // queue holds ran before it, and a placeholder's requester is
+        // retrying a row that stood ahead of it. A replay is the queue's
+        // own and a settle executes nothing; both go on.
+        if !settle
+            && !matches!(
+                self.clients.get(&rid).map(|c| c.origin),
+                Some(Origin::Replay { .. })
+            )
+            && self.queue_gate_blocks(rid, &op, replica)
+        {
+            self.stats.ops_parked_behind_queue += 1;
+            self.park_exec_local(now, Default::default(), None, rid, true);
+            return MutateOutcome::Busy;
+        }
         // Plan 30 §M11: as the root, recall the write delegations the
         // op's keys fall under first, and wait for its `deps`; `finish`
         // skips this rid until the parked continuation executes it.
@@ -2416,7 +2432,7 @@ impl Core {
                     applied = ?replica.applied_position(),
                     "root parks a local execution"
                 );
-                self.park_exec_local(now, wait, deps_wait, rid);
+                self.park_exec_local(now, wait, deps_wait, rid, false);
                 return MutateOutcome::Busy;
             }
         }

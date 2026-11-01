@@ -205,6 +205,11 @@ pub trait Replica {
     /// voided here (`SessionState::void_cut`).
     fn void_cut(&self, gen: u64) -> Option<u64>;
     fn pending_replays(&self) -> Result<Vec<StrandedOp>, MetaError>;
+    /// The replay queue decoded once per generation of the queue, with
+    /// each entry's keys (`Meta::queue_snapshot`): what the park rules ask.
+    fn queue_snapshot(
+        &self,
+    ) -> Result<std::sync::Arc<constellation_meta::QueueSnapshot>, MetaError>;
     fn forget_replay(&self, queue_seq: u64) -> Result<(), MetaError>;
     fn mark_replay_refused(&self, queue_seq: u64, reason: String) -> Result<(), MetaError>;
     /// Plan 30 §M9: a queued replay of an op this node executed but never
@@ -968,6 +973,12 @@ impl Replica for Meta {
 
     fn clear_streamed(&self) {
         self.session().clear_streamed()
+    }
+
+    fn queue_snapshot(
+        &self,
+    ) -> Result<std::sync::Arc<constellation_meta::QueueSnapshot>, MetaError> {
+        Meta::queue_snapshot(self)
     }
 
     fn pending_replays(&self) -> Result<Vec<StrandedOp>, MetaError> {

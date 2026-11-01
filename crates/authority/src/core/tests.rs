@@ -50330,4 +50330,68 @@ mod await_retry {
         assert_eq!(applied.retired, 1, "{applied:?}");
         assert!(!requester.meta.has_outstanding_speculation());
     }
+
+    /// Review MUST 1 (a): the sequencer's own ops stand behind the queue
+    /// too (a lone root, delegation off). Queue: node 2's unanswered
+    /// `rename broken -> a` (a placeholder), then this node's own
+    /// acknowledged `unlink a`. The application's `create a` must not run
+    /// ahead of them: executed at once, node 2's retry would then replace
+    /// `a` and the queued unlink remove it — an acknowledged create gone.
+    #[test]
+    fn an_own_op_stands_behind_the_queue_on_its_keys() {
+        let (mut h, broken) = holder_with_a_seed();
+        h.core.cfg.delegation = false;
+        let (p, d) = (rid_of(2, 1), rid_of(1, 7));
+        exec_as(&h, RowClass::Archive, p, &rename_in_root("broken", "a"));
+        exec_as(&h, RowClass::Lone, d, &unlink_in_root("a"));
+        drop_held(&h, broken);
+
+        let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let mine = h.rid(9);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: mine,
+            op: create_in(ROOT_INO, "a", ino),
+            tag: Default::default(),
+        });
+        assert!(
+            replies(&out).is_empty(),
+            "the create ran ahead of the queue: {out:?}"
+        );
+        assert_eq!(h.meta.completed_outcome(mine).unwrap(), None);
+
+        // An unrelated own op is not held.
+        let other = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let out = h.step_archived(Event::Submit {
+            policy: Policy::Client,
+            rid: h.rid(10),
+            op: create_in(ROOT_INO, "unrelated", other),
+            tag: Default::default(),
+        });
+        assert!(
+            matches!(
+                replies(&out)[0].1,
+                ClientReply::Outcome(MutateOutcome::Accepted { .. })
+            ),
+            "{out:?}"
+        );
+
+        // The retry runs in the dropped row's place, the unlink follows, then
+        // the create: the acknowledged create survives.
+        let out = forward_of(&mut h, 2, 80, p, &rename_in_root("broken", "a"));
+        assert!(
+            matches!(reply_to(&out, 80), Some(MutateOutcome::Accepted { .. })),
+            "{out:?}"
+        );
+        let out = ticks(&mut h, 4);
+        assert!(
+            replies(&out).iter().any(|(r, rep)| *r == mine
+                && matches!(rep, ClientReply::Outcome(MutateOutcome::Accepted { .. }))),
+            "the create was not answered OK after the queue: {out:?}"
+        );
+        assert!(
+            h.meta.lookup(ROOT_INO, "a").unwrap().is_some(),
+            "the create vanished"
+        );
+    }
 }

@@ -973,19 +973,23 @@ impl Core {
         wait: BTreeSet<u64>,
         deps: Option<Position>,
         rid: Rid,
+        queue_gated: bool,
     ) {
         self.stats.deleg_exec_parked += 1;
         self.dl.pending_exec.insert(rid);
         if let Some(c) = self.clients.get_mut(&rid) {
             c.phase = ClientPhase::Recalling;
         }
-        self.park_with_deps(
+        let id = self.park_with_deps(
             now,
             (wait, None),
             None,
             deps,
             ParkedWhat::ExecuteLocal { rid },
         );
+        if let Some(p) = self.rd.parked.get_mut(&id) {
+            p.queue_gated = queue_gated;
+        }
     }
 
     /// Whether any parked continuation waits for a position.
@@ -1818,6 +1822,10 @@ impl Core {
                             ParkedWhat::ExecuteReply { rid, op, .. } => {
                                 !self.queue_gate_blocks(*rid, op, replica)
                             }
+                            ParkedWhat::ExecuteLocal { rid } => self
+                                .clients
+                                .get(rid)
+                                .is_none_or(|c| !self.queue_gate_blocks(*rid, &c.op, replica)),
                             _ => true,
                         })
                     && p.stream_need.is_none_or(|(g, i)| {

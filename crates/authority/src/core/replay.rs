@@ -404,24 +404,29 @@ impl Core {
     /// answers it), nor is a settle (it executes nothing). One counter read
     /// when the queue is empty.
     pub(crate) fn queue_gate_blocks(&self, rid: Rid, op: &MutateOp, replica: &dyn Replica) -> bool {
-        let Ok(queue) = replica.pending_replays() else {
+        let Ok(snap) = replica.queue_snapshot() else {
             return false;
         };
-        if queue.is_empty() {
+        if snap.is_empty() {
             return false;
         }
         if replica.recent_outcome(rid).is_some() || completed_as_outcome(replica, rid, 0).is_some()
         {
             return false;
         }
-        let own = queue.iter().find(|q| q.rid == rid).map(|q| q.queue_seq);
+        let own = snap
+            .entries
+            .iter()
+            .find(|q| q.rid == rid)
+            .map(|q| q.queue_seq);
+        let lookup = |p, n: &str| replica.lookup_ino(p, n);
         let mut keys = super::client::conflict_keys(op, replica);
         keys.inos.extend(created_ino(op));
-        queue.iter().any(|ahead| {
+        snap.entries.iter().enumerate().any(|(i, ahead)| {
             own.is_none_or(|own| ahead.queue_seq < own)
                 && ahead.rid != rid
                 && ahead.refused.is_none()
-                && entry_keys(ahead, replica).overlaps(&keys)
+                && snap.keys_of(i, &lookup).overlaps(&keys)
                 && completed_as_outcome(replica, ahead.rid, 0).is_none()
         })
     }

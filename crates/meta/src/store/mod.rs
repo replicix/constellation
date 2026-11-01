@@ -218,6 +218,9 @@ pub(crate) const KV_USAGE_FILES: &str = "usage_files";
 ///   `journal_tx` scans start past the shipped history's tombstones.
 pub(crate) const KV_SPEC_LIVE_COUNT: &str = "spec_live_count";
 pub(crate) const KV_PENDING_REPLAY_COUNT: &str = "pending_replay_count";
+/// Bumped, in the same transaction, by every change to `pending_replay`:
+/// what the queue snapshot cache ([`spec::QueueSnapshot`]) is valid for.
+pub(crate) const KV_PENDING_REPLAY_GEN: &str = "pending_replay_gen";
 pub(crate) const KV_LOCAL_SPEC_COUNT: &str = "local_spec_count";
 pub(crate) const KV_UNCAPTURED_TX_COUNT: &str = "uncaptured_tx_count";
 pub(crate) const KV_DELEG_SPEC_COUNT: &str = "deleg_spec_count";
@@ -638,6 +641,9 @@ pub struct Meta {
     /// Whether `held` may be non-default, so a ship with nothing poisoned
     /// does not take its lock (plan 30 §M4 round 2).
     pub(crate) held_any: AtomicBool,
+    /// The decoded replay queue at its last read generation
+    /// (`Meta::queue_snapshot`).
+    pub(crate) queue_cache: std::sync::Mutex<Option<std::sync::Arc<spec::QueueSnapshot>>>,
     /// Plan 30 §M5: the dentries and inodes this node's *unshipped*
     /// journal touched, kept in memory so a forward reply can say whether
     /// the holder evaluated the op behind unshipped work on the same keys
@@ -1209,6 +1215,7 @@ impl Meta {
             deleg_gate: std::sync::RwLock::new(()),
             held: std::sync::Mutex::new(held::HeldSummary::default()),
             held_any: AtomicBool::new(false),
+            queue_cache: std::sync::Mutex::new(None),
             unshipped: std::sync::Mutex::new(crate::replay::TouchSet::default()),
             unshipped_gen: AtomicU64::new(0),
             unshipped_seqs: std::sync::Mutex::new(UnshippedSeqs::default()),
