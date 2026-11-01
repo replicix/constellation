@@ -755,7 +755,9 @@ impl Core {
             None => {}
         }
         if settle {
-            return (self.settle_refusal(rid, Some(op), asker, replica), None);
+            let outcome = self.settle_refusal(rid, Some(op), asker, replica);
+            self.nudge_for_remote_refusal(now, &outcome, asker, out);
+            return (outcome, None);
         }
         tracing::debug!(
             node = self.cfg.node_id,
@@ -831,7 +833,26 @@ impl Core {
                 MutateOutcome::Errno(code)
             }
         };
+        self.nudge_for_remote_refusal(now, &outcome, asker, out);
         (outcome, None)
+    }
+
+    /// Plan 43 C2f review (SHOULD 5), withdrawn in C2f and restored in C2g:
+    /// a lone root's journaled refusal of another node's op starts a round
+    /// at once, as an acceptance does (`holder_execute`): its answer waits
+    /// for the log, and waited for the idle backoff's next round (up to
+    /// `idle_max`, 10 s on an idle root). (A backed root's answer waits for
+    /// its group, appended on every event.)
+    fn nudge_for_remote_refusal(
+        &mut self,
+        now: Now,
+        outcome: &MutateOutcome,
+        asker: super::Asker,
+        out: &mut Vec<Action>,
+    ) {
+        if super::backup::is_answer(outcome) && asker == super::Asker::Remote && self.root_lone() {
+            self.nudge(now, out);
+        }
     }
 
     /// Plan 30 §M9: a definitive refusal of an op executed by rid is an

@@ -48362,6 +48362,45 @@ mod c2f_lone_root {
         assert_eq!(classes_of(&h, forwarded(1)), vec![RowClass::NonStealable]);
     }
 
+    /// SHOULD 5 (restored in C2g): a journaled refusal of another node's
+    /// forward — a settle's too — starts a sync round at once, as an
+    /// acceptance does: a lone root's answer to it waits for the log. Fails
+    /// on the parent: the round waited for the poll's idle backoff.
+    #[test]
+    fn a_journaled_refusal_of_a_forward_nudges_a_round() {
+        for (seq, settle) in [(9, false), (10, true)] {
+            let mut h = lone_root();
+            let out = h.step(Event::Peer {
+                from: FROM,
+                msg: PeerMsg::MutateRequest {
+                    req: OpId(81),
+                    rid: forwarded(seq),
+                    op: MutateOp::Unlink {
+                        parent: ROOT_INO,
+                        name: "missing".into(),
+                    },
+                    acked_through: 0,
+                    deps: constellation_meta::Position::ZERO,
+                    applied: 0,
+                    tag: Default::default(),
+                    settle,
+                },
+            });
+            assert!(answers(&out).is_empty(), "waits for the archive: {out:?}");
+            assert!(
+                out.iter().any(|a| matches!(
+                    a,
+                    Action::SetTimer {
+                        after_ms: 0,
+                        kind: TimerKind::Poll,
+                        ..
+                    }
+                )) || h.core.nudged,
+                "no round asked for (settle {settle}): {out:?}"
+            );
+        }
+    }
+
     /// MUST 2 (D5): a node that holds no lease, or lost it, is no lone
     /// sequencer: what it publishes for its own clients is no `Lone` class,
     /// and before the replica stops being the holder's it says it may not
