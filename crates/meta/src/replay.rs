@@ -123,6 +123,7 @@ impl TouchSet {
             | LogRecord::GroupAbandoned { .. }
             | LogRecord::TailOf { .. }
             | LogRecord::TailFollowsThrough { .. }
+            | LogRecord::RolledBack { .. }
             | LogRecord::TailFollows { .. } => {}
             LogRecord::Clone { nodes, .. } => {
                 for node in nodes {
@@ -935,6 +936,7 @@ fn apply_one(
         LogRecord::TailFollows { .. }
         | LogRecord::TailFollowsThrough { .. }
         | LogRecord::TailOf { .. }
+        | LogRecord::RolledBack { .. }
         | LogRecord::GroupAbandoned { .. } => Ok(Applied::Done),
     }
 }

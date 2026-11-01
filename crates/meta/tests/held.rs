@@ -254,8 +254,8 @@ fn drop_held_turns_the_seed_into_a_conflict_copy_and_replays_the_rest() {
     );
     assert_eq!(
         s.meta.journal_len().unwrap(),
-        1,
-        "the dropped op's refusal waits to ship"
+        2,
+        "the drop's RolledBack record and the dropped op's refusal wait to ship"
     );
     assert!(s.meta.pending_uploads().unwrap().is_empty());
     assert!(s.meta.unrecoverable_chunks().unwrap().is_empty());
@@ -297,8 +297,12 @@ fn drop_held_turns_the_seed_into_a_conflict_copy_and_replays_the_rest() {
     // requester's shadow of it rolls back on it).
     let recs = records(&batch(&s.meta));
     assert!(
-        matches!(recs.as_slice(), [LogRecord::Refused { rid, code: Code::Io }] if *rid == seed.rid),
-        "{recs:?}"
+        matches!(
+            recs.as_slice(),
+            [LogRecord::RolledBack { idents }, LogRecord::Refused { rid, code: Code::Io }]
+                if *rid == seed.rid && idents.len() == 2
+        ),
+        "the record of what was rolled back ahead of the refusal: {recs:?}"
     );
     assert!(
         s.meta.drop_held(s.broken, 1).is_err(),
@@ -358,7 +362,11 @@ fn drop_held_remote_drops_a_transaction_deferred_on_a_departed_nodes_chunk() {
         (dropped.dropped, dropped.requeued, dropped.pending_removed),
         (1, 1, 1)
     );
-    assert_eq!(meta.journal_len().unwrap(), 1, "the refusal waits to ship");
+    assert_eq!(
+        meta.journal_len().unwrap(),
+        2,
+        "the RolledBack record and the refusal wait to ship"
+    );
     assert!(meta.pending_uploads().unwrap().is_empty());
     assert!(meta.remote_chunks().unwrap().is_empty());
     assert!(meta.unrecoverable_chunks().unwrap().is_empty());
@@ -381,8 +389,12 @@ fn drop_held_remote_drops_a_transaction_deferred_on_a_departed_nodes_chunk() {
     // shadow of it is rolled back by it, and a retry by rid is refused.
     let recs = records(&batch(&meta));
     assert!(
-        matches!(recs.as_slice(), [LogRecord::Refused { rid, code: Code::Io }] if *rid == queued[0].rid),
-        "{recs:?}"
+        matches!(
+            recs.as_slice(),
+            [LogRecord::RolledBack { idents }, LogRecord::Refused { rid, code: Code::Io }]
+                if *rid == queued[0].rid && idents.len() == 2
+        ),
+        "the record of what was rolled back ahead of the refusal: {recs:?}"
     );
     assert!(meta.drop_held_remote(file, 1).is_err(), "nothing left");
 }

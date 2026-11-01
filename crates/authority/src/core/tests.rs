@@ -50066,6 +50066,67 @@ mod await_retry {
         })
     }
 
+    /// Defect B: the drop journals one `RolledBack` record naming the
+    /// identity of every transaction it rolled back — the seed and its
+    /// dependent — as the first record of the transaction that carries the
+    /// drop's `Refused` rows: ahead of every refusal, so a holder that dies
+    /// mid-drop leaves a successor with the record or none of the drop's
+    /// effects.
+    #[test]
+    fn drop_held_journals_rolled_back_ahead_of_its_refusals() {
+        let (mut h, broken) = holder_with_a_seed();
+        let own = rid_of(1, 6);
+        exec_as(&h, RowClass::Lone, own, &chmod(broken, 0o600));
+        let txs = h.meta.journal_txs_from(0, usize::MAX).unwrap();
+        let first_of = |pred: fn(&LogRecord) -> bool| {
+            txs.iter()
+                .find(|t| t.records.iter().any(pred))
+                .map(|t| t.first)
+                .expect("a transaction")
+        };
+        let seed = first_of(|r| matches!(r, LogRecord::WriteManifest { .. }));
+        let dependent = first_of(|r| matches!(r, LogRecord::Setattr { .. }));
+        let out = drop_held_via_core(&mut h, broken);
+        assert!(
+            out.iter().any(|a| matches!(
+                a,
+                Action::ControlDone {
+                    result: Ok(ControlOk::DroppedHeld(_)),
+                    ..
+                }
+            )),
+            "{out:?}"
+        );
+        let after = h.meta.journal_txs_from(0, usize::MAX).unwrap();
+        let drop_tx = after
+            .iter()
+            .find(|t| {
+                t.records
+                    .iter()
+                    .any(|r| matches!(r, LogRecord::RolledBack { .. }))
+            })
+            .unwrap_or_else(|| panic!("no RolledBack journaled: {after:?}"));
+        let LogRecord::RolledBack { idents } = &drop_tx.records[0] else {
+            panic!("RolledBack is not first: {:?}", drop_tx.records)
+        };
+        let mut idents = idents.clone();
+        idents.sort();
+        assert_eq!(idents, vec![(1, seed), (1, dependent)]);
+        assert!(
+            drop_tx.records[1..]
+                .iter()
+                .all(|r| matches!(r, LogRecord::Refused { .. }))
+                && drop_tx.records.len() >= 2,
+            "the refusals follow in the same transaction: {:?}",
+            drop_tx.records
+        );
+        // (And nothing of the dropped rows is left to ship around it.)
+        assert!(!after.iter().any(|t| t.records.iter().any(|r| matches!(
+            r,
+            LogRecord::WriteManifest { .. } | LogRecord::Setattr { .. }
+        ))));
+    }
+
     /// A manifest op of this node that has not executed yet (forwarded to
     /// the holder, and not answered), naming a chunk the upload pass lost.
     fn node_with_a_manifest_in_flight() -> (Harness, Ino, ChunkHash, Rid, Vec<u8>, OpId) {

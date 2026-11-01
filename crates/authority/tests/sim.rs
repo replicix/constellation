@@ -4854,6 +4854,10 @@ fn drop_held_chain_backed_config() -> SimConfig {
 ///   meanwhile (suspended past its seal): its refusals never shipped, and
 ///   the refused entry made a conflict copy of an acknowledged op the log
 ///   had no outcome of. The entry now settles its rid first.
+/// - 42, 76, 132, 196, 240, 316 and 1851 (quiescence): a member kept the
+///   committed streamed copy of a row the holder's drop rolled back, for
+///   good (and a successor re-shipped what a backup's tail still held);
+///   `RolledBack` retracts it. (1851 also had the chunk gap above.)
 #[test]
 fn drop_held_chain_backed_regression_seeds() {
     for (seed, why) in [
@@ -4866,6 +4870,16 @@ fn drop_held_chain_backed_regression_seeds() {
             "I2c: a deposed dropper's copy had no outcome in the log",
         ),
         (1864, "I2c: the same, a third node"),
+        (42, "quiescence: a streamed committed copy of a dropped row"),
+        (76, "quiescence: the same"),
+        (132, "quiescence: the same"),
+        (
+            196,
+            "quiescence: epoch-1 rows a successor re-appended, then dropped",
+        ),
+        (240, "quiescence: 16 streamed copies of a drop's dependents"),
+        (316, "quiescence: the same"),
+        (1851, "a chunk gap, then the quiescence of its dropped rows"),
     ] {
         run_seed(seed, drop_held_chain_backed_config()).unwrap_or_else(|e| {
             panic!(

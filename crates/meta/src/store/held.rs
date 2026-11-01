@@ -1339,6 +1339,9 @@ impl Meta {
         let mut dependents: Vec<(u64, u64, crate::replay::TouchSet)> = Vec::new();
         let mut rolled_back: Vec<crate::rid::Rid> = Vec::new();
         let mut placeholders: Vec<crate::rid::Rid> = Vec::new();
+        // The identity of every transaction the drop rolls back, as a
+        // member keys it (`LogRecord::RolledBack`).
+        let mut idents: Vec<(u64, u64)> = Vec::new();
         for (t, seed_inos, keys) in held.held {
             let is_seed = seed_inos.contains(&ino);
             let depends = keys
@@ -1355,6 +1358,12 @@ impl Meta {
                 )));
             };
             let placeholder = placeholder_keys(&t, &keys);
+            let records: Vec<LogRecord> = t.rows.iter().map(|(_, rec)| rec.clone()).collect();
+            if let Some(epoch) =
+                super::local::get_journal_tx_head(&tx, self, t.first)?.map(|head| head.epoch)
+            {
+                idents.push(super::member::tail_identity(&records).unwrap_or((epoch, t.first)));
+            }
             tainted.extend(keys);
             let origin = spec::row_keys_and_origin(&tx, self, spec_seq)?
                 .map(|(_, origin)| origin)
@@ -1486,9 +1495,25 @@ impl Meta {
         // whose epoch write the owner dropped, or a deposed owner that
         // replayed it) kept its shadow for good: no `Completed` was ever
         // coming, and only a takeover would have stranded it.
-        if !refused_rids.is_empty() {
+        if !refused_rids.is_empty() || !idents.is_empty() {
             let local = self.begin_local(&tx)?;
             let now_ms = now_unix.saturating_mul(1000);
+            // The members' and the backups' copies of what was rolled back
+            // are retracted by this record (defect B): the first record of
+            // the transaction, ahead of every refusal. Its place in the
+            // journal is what makes a holder's death mid-drop safe: a
+            // successor has the record or none of the drop's effects.
+            if !idents.is_empty() {
+                journal::append_tx(
+                    &mut tx,
+                    &self.journal_ks,
+                    &self.local,
+                    &self.completed,
+                    &LogRecord::RolledBack {
+                        idents: idents.clone(),
+                    },
+                )?;
+            }
             for rid in &refused_rids {
                 let position = journal::append_tx(
                     &mut tx,

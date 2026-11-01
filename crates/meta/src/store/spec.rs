@@ -4036,6 +4036,13 @@ impl Meta {
         records: &[LogRecord],
         committed: bool,
     ) -> Result<(), MetaError> {
+        // Defect B: a transaction that says the holder rolled others back
+        // (`repair drop-held`) retracts what this replica was streamed of
+        // them, ahead of installing itself.
+        let rolled = super::member::rolled_back_idents(records);
+        if !rolled.is_empty() {
+            self.retract_rolled_back(&rolled)?;
+        }
         let mut tx = self.db.write_tx();
         // Fix "capture under an epoch hold": already installed here —
         // the holder streams its journal from the start again for a
@@ -4187,6 +4194,60 @@ impl Meta {
         )
     }
 
+    /// Plan 46 M0.2 follow-up (defect B): the holder's `repair drop-held`
+    /// rolled back the journal transactions `idents` names
+    /// (`LogRecord::RolledBack`). What this replica holds of them is
+    /// retracted, in the caller's transaction: its live `Streamed` entry of
+    /// each identity — committed (`gated`) or not, `own` or not — is rolled
+    /// back from its before-images, and not queued for replay (the holder's
+    /// queue owns the replay or the refusal, and a copy here would be the
+    /// second one); its member-copy row and its backup-tail transaction
+    /// become holes, so that no successor re-ships a dropped row. An
+    /// identity nobody holds is a no-op.
+    fn retract_rolled_back_tx(
+        tx: &mut SingleWriterWriteTx,
+        meta: &Meta,
+        staged: &UsageTracker,
+        idents: &std::collections::BTreeSet<(u64, u64)>,
+    ) -> Result<Stranded, MetaError> {
+        let stranded = strand_tx(
+            tx,
+            meta,
+            staged,
+            |entry| matches!(entry, LiveEntry::Streamed { ident, .. } if idents.contains(ident)),
+            false,
+            false,
+            |_| true,
+        )?;
+        super::member::hole_rolled_back_tx(tx, meta, idents)?;
+        super::backup::hole_tail_rolled_back_tx(tx, meta, idents)?;
+        Ok(stranded)
+    }
+
+    /// [`Self::retract_rolled_back_tx`] in a transaction of its own (the
+    /// stream's install).
+    fn retract_rolled_back(
+        &self,
+        idents: &std::collections::BTreeSet<(u64, u64)>,
+    ) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        let staged = UsageTracker::staging();
+        let stranded = Self::retract_rolled_back_tx(&mut tx, self, &staged, idents)?;
+        let (bytes, files) = staged.raw_delta();
+        adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
+        tx.commit()?;
+        self.report_rolled_back();
+        staged.drain_into(self.usage_tracker());
+        if stranded.any() {
+            tracing::info!(
+                superseded = stranded.superseded,
+                "streamed copies of rows the holder's drop rolled back were retracted"
+            );
+        }
+        let _ = self.refresh_member_copy_flag();
+        Ok(())
+    }
+
     fn install_speculative_tx(
         &self,
         mut tx: SingleWriterWriteTx,
@@ -4312,6 +4373,9 @@ impl Meta {
         // Plan 43 C1-4: the identities of re-shipped transactions this
         // segment carries (`TailOf`), and the groups it says the operator
         // abandoned.
+        // Defect B: the transactions the holder's `repair drop-held` says it
+        // rolled back (`RolledBack`).
+        let rolled = super::member::rolled_back_idents(records);
         let tail_ids: HashSet<(u64, u64)> = records
             .iter()
             .filter_map(|rec| match rec {
@@ -4335,6 +4399,7 @@ impl Meta {
                 && !matches!(entry, LiveEntry::Shadow { rid, .. } if completes.contains(rid)))
                 || abandoned.iter().any(|a| entry.stranded_by_abandon(*a))
                 || matches!(entry, LiveEntry::Shadow { rid, .. } if refused.contains(rid))
+                || matches!(entry, LiveEntry::Streamed { ident, .. } if rolled.contains(ident))
                 // A streamed transaction of this tenure the segment ships
                 // *past* (`through` at or beyond its last row) without
                 // naming its rows is gone from the holder's journal: it
@@ -4369,7 +4434,17 @@ impl Meta {
                 .iter()
                 .any(|(_, entry)| strands(entry))
         {
-            strand_tx(&mut tx, self, &staged, strands, true, false, |_| false)?
+            // (What the holder rolled back is not queued for replay here:
+            // its queue owns the replay or the refusal.)
+            strand_tx(
+                &mut tx,
+                self,
+                &staged,
+                strands,
+                true,
+                false,
+                |entry| matches!(entry, LiveEntry::Streamed { ident, .. } if rolled.contains(ident)),
+            )?
         } else {
             Stranded::default()
         };
@@ -4840,6 +4915,8 @@ impl Meta {
         // Plan 43 C1-4: what the log delivered tells the member copies
         // (coverage, `TailFollowsThrough`, an abandon, a newer marker).
         super::member::note_log_tail_tx(&mut tx, self, epoch, records, prev_applied)?;
+        super::member::hole_rolled_back_tx(&mut tx, self, &rolled)?;
+        super::backup::hole_tail_rolled_back_tx(&mut tx, self, &rolled)?;
         let member = super::member::member_rules_tx(
             &mut tx,
             self,

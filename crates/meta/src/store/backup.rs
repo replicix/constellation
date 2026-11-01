@@ -69,6 +69,53 @@ pub struct BackupTx {
     pub origin: (u64, u64),
 }
 
+/// Plan 46 M0.2 follow-up (defect B): the backup-tail transactions of the
+/// identities `idents` (`LogRecord::RolledBack`: the holder's `repair
+/// drop-held` rolled them back) become holes, in the caller's transaction:
+/// the same journal seqs and no records, as the holder's own stream steps
+/// over rows its journal no longer has, so the tail stays contiguous and a
+/// successor applying it re-ships nothing of them. A transaction's
+/// identity is its `TailOf` if it begins with one, else its place
+/// `(epoch, first)` in the tail. The member copies are in the same
+/// keyspace, past [`super::member::MEMBER_COPY_BASE`], and are dealt with
+/// by `member::hole_rolled_back_tx`. Returns how many became holes.
+pub(crate) fn hole_tail_rolled_back_tx(
+    tx: &mut fjall::SingleWriterWriteTx,
+    meta: &Meta,
+    idents: &std::collections::BTreeSet<(u64, u64)>,
+) -> Result<usize, MetaError> {
+    if idents.is_empty() {
+        return Ok(0);
+    }
+    let mut doomed: Vec<(Vec<u8>, BackupTx)> = Vec::new();
+    for guard in tx.range(
+        &meta.backup_tail,
+        tail_key(0, 0)..tail_key(super::member::MEMBER_COPY_BASE, 0),
+    ) {
+        let (k, v) = guard.into_inner()?;
+        let t: BackupTx = postcard::from_bytes(&v)?;
+        if t.records.is_empty() {
+            continue;
+        }
+        let (epoch, first) = decode_tail_key(&k)?;
+        let ident = super::member::tail_identity(&t.records).unwrap_or((epoch, first));
+        if idents.contains(&ident) {
+            doomed.push((k.to_vec(), t));
+        }
+    }
+    let holed = doomed.len();
+    for (k, t) in doomed {
+        let hole = BackupTx {
+            first: t.first,
+            last: t.last,
+            records: Vec::new(),
+            origin: t.origin,
+        };
+        tx.insert(&meta.backup_tail, k, postcard::to_allocvec(&hole)?);
+    }
+    Ok(holed)
+}
+
 /// Whom this node backs (persisted).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BackupRole {
@@ -186,6 +233,11 @@ impl Meta {
                 postcard::to_allocvec(t)?,
             );
         }
+        // A holder's `repair drop-held` rolled back transactions this tail
+        // holds (defect B): they are holes from here on. Only a batch that
+        // carries the record scans the tail.
+        let rolled = super::member::rolled_back_idents(txs.iter().flat_map(|t| t.records.iter()));
+        hole_tail_rolled_back_tx(&mut tx, self, &rolled)?;
         tx.commit()?;
         // A resend can land below the floor (from the contiguous
         // acknowledgement, under a batch held ahead of a gap).

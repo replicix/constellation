@@ -52,7 +52,7 @@ use std::collections::BTreeSet;
 
 /// The `backup_tail` key space of the member copies: `epoch` slots above this
 /// base hold the copy of lease epoch `epoch - base`.
-const MEMBER_COPY_BASE: u64 = 2 << 48;
+pub(super) const MEMBER_COPY_BASE: u64 = 2 << 48;
 
 fn member_epoch(epoch: u64) -> u64 {
     MEMBER_COPY_BASE + epoch
@@ -683,6 +683,65 @@ pub(crate) fn member_rules_tx(
         }
     }
     Ok(out)
+}
+
+/// The identities a record list retracts (`LogRecord::RolledBack`).
+pub(crate) fn rolled_back_idents<'a>(
+    records: impl IntoIterator<Item = &'a LogRecord>,
+) -> BTreeSet<(u64, u64)> {
+    records
+        .into_iter()
+        .filter_map(|rec| match rec {
+            LogRecord::RolledBack { idents } => Some(idents.iter().copied()),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+/// Plan 46 M0.2 follow-up (defect B): the member-copy rows of the
+/// transactions `idents` names (`LogRecord::RolledBack`: the holder's
+/// `repair drop-held` rolled them back) become holes, in the caller's
+/// transaction: a hole spans the same journal seqs and carries nothing, so
+/// the copy stays contiguous for the claimant that seals it and no
+/// successor re-ships a dropped row. A row is kept by its identity as
+/// [`member_rules_tx`] keys it. Returns how many rows became holes.
+pub(crate) fn hole_rolled_back_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    idents: &BTreeSet<(u64, u64)>,
+) -> Result<usize, MetaError> {
+    if idents.is_empty() || !meta.has_member_copies() {
+        return Ok(0);
+    }
+    let mut holed = 0;
+    for e in epochs_in(&*tx, meta)? {
+        for row in rows_in(&*tx, meta, e)? {
+            let ident = tail_identity(&row.tx.records).unwrap_or((e, row.tx.first));
+            if !idents.contains(&ident) || row.tx.records.is_empty() {
+                continue;
+            }
+            let hole = MemberTx {
+                tx: BackupTx {
+                    first: row.tx.first,
+                    last: row.tx.last,
+                    records: Vec::new(),
+                    origin: row.tx.origin,
+                },
+                class: row.class,
+                rid: None,
+                op: None,
+                lock_tag: LockTag::NONE,
+            };
+            tx.insert(
+                &meta.backup_tail,
+                tail_key(member_epoch(e), row.tx.first),
+                postcard::to_allocvec(&hole)?,
+            );
+            holed += 1;
+        }
+    }
+    Ok(holed)
 }
 
 impl Meta {

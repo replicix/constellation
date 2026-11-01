@@ -811,3 +811,197 @@ fn a_member_copy_is_ruled_after_a_restart() {
     assert_eq!(meta.member_copy(1).unwrap(), None);
     let _ = shipped(0);
 }
+
+// ------------------------------------------- a holder's drop retracts its copies
+
+/// The copies a member holds of a transaction the holder's `repair
+/// drop-held` rolled back (`RolledBack`): a successor re-appended node 2's
+/// op as `TailOf { 1, 3 }` and streamed it to the forwarder as committed;
+/// the drop rolled it back and the forwarder applies the record in the
+/// segment that carries it. The streamed entry is rolled back and not
+/// queued, its member-copy row becomes a hole (the copy stays contiguous),
+/// and a row the record does not name is kept. Without the record the
+/// committed entry stays for good (`strand`s only run for `gated: false`
+/// entries and earlier epochs): the member is diverged and never quiesces.
+#[test]
+fn a_streamed_committed_row_named_by_rolled_back_is_retracted() {
+    let meta = Meta::open_in_memory().unwrap();
+    let before = raw_ns(&meta);
+    let reship = vec![
+        LogRecord::TailOf { epoch: 1, jseq: 3 },
+        create("a", ino(1), 10),
+        completed(rid(1)),
+    ];
+    meta.install_streamed_committed(2, HOLDER, 1, 3, &reship, true)
+        .unwrap();
+    assert!(meta.has_outstanding_speculation());
+    // Its member copy of epoch 1, and a row of the same copy nobody rolled back.
+    meta.member_copy_put_rows(
+        1,
+        1,
+        &[
+            mtx(
+                3,
+                3,
+                RowClass::RootGroup,
+                vec![create("a", ino(1), 10), completed(rid(1))],
+            ),
+            mtx(
+                4,
+                4,
+                RowClass::RootGroup,
+                vec![create("k", ino(7), 13), completed(rid(7))],
+            ),
+        ],
+    )
+    .unwrap();
+
+    // The successor's segment: the record, then its later rows.
+    let seg = vec![
+        LogRecord::RolledBack {
+            idents: vec![(1, 3), (9, 9)],
+        },
+        create("b", ino(2), 11),
+        completed(rid(2)),
+    ];
+    apply_rows(&meta, 1, 2, 6, &[4, 5, 6], &seg);
+
+    assert!(
+        !meta.has_outstanding_speculation(),
+        "the entry is retracted"
+    );
+    assert!(
+        meta.lookup(ROOT_INO, "a").unwrap().is_none(),
+        "its effect is rolled back"
+    );
+    assert!(meta.lookup(ROOT_INO, "b").unwrap().is_some());
+    assert!(
+        meta.pending_replays().unwrap().is_empty(),
+        "no replay of it here: the holder's queue owns it: {:?}",
+        meta.pending_replays().unwrap()
+    );
+    assert!(
+        raw_ns(&meta).len() > before.len(),
+        "b is new (and nothing of a is left)"
+    );
+    let (_, rows) = meta.member_copy_rows(1).unwrap().expect("the copy stays");
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.tx.first, r.tx.records.len()))
+            .collect::<Vec<_>>(),
+        vec![(3, 0), (4, 2)],
+        "the rolled-back row is a hole of the same span; the other is kept"
+    );
+    assert!(!meta.member_copy_carries(rid(1)).unwrap());
+    assert!(meta.member_copy_carries(rid(7)).unwrap());
+}
+
+/// The same record, streamed (the transaction that carries the drop's
+/// `Refused` rows reaches the forwarder before any segment does): the
+/// committed entry is retracted at the install, an own op's entry included,
+/// and an uncommitted one too.
+#[test]
+fn a_streamed_rolled_back_record_retracts_committed_and_own_entries() {
+    let meta = Meta::open_in_memory().unwrap();
+    let a = vec![create("a", ino(1), 10), completed(rid(1))];
+    let b = vec![create("b", ino(2), 11), completed(rid(2))];
+    meta.install_streamed_committed(1, HOLDER, 1, 2, &a, true)
+        .unwrap();
+    meta.install_streamed_committed(1, HOLDER, 3, 4, &b, false)
+        .unwrap();
+    // Node 2's own op (a shadow its reply installed), adopted by the stream.
+    let c = vec![create("c", ino(3), 12), completed(rid(3))];
+    meta.install_shadow_committed(
+        rid(3),
+        1,
+        0,
+        &create_op("c", ino(3)),
+        &Default::default(),
+        &c,
+        true,
+    )
+    .unwrap();
+    meta.install_streamed_committed(1, HOLDER, 5, 6, &c, true)
+        .unwrap();
+    assert!(meta.has_outstanding_speculation());
+
+    let drop_tx = vec![
+        LogRecord::RolledBack {
+            idents: vec![(1, 1), (1, 3), (1, 5)],
+        },
+        LogRecord::Refused {
+            rid: rid(9),
+            code: constellation_types::Code::Io,
+        },
+    ];
+    meta.install_streamed_committed(1, HOLDER, 7, 8, &drop_tx, true)
+        .unwrap();
+    for name in ["a", "b", "c"] {
+        assert!(meta.lookup(ROOT_INO, name).unwrap().is_none(), "{name}");
+    }
+    assert!(
+        meta.pending_replays().unwrap().is_empty(),
+        "{:?}",
+        meta.pending_replays().unwrap()
+    );
+    // Only the record's own transaction is left outstanding.
+    meta.install_streamed_committed(1, HOLDER, 9, 10, &[create("d", ino(4), 14)], true)
+        .unwrap();
+    assert!(meta.lookup(ROOT_INO, "d").unwrap().is_some());
+}
+
+/// A backup's tail: the record, appended, turns the tail transactions of
+/// the identities it names into holes, whether named by their place or by
+/// their `TailOf`; the acknowledgement stays contiguous.
+#[test]
+fn an_appended_rolled_back_record_turns_the_tail_transactions_into_holes() {
+    let meta = Meta::open_in_memory().unwrap();
+    let tx = |first: u64, last: u64, records: Vec<LogRecord>| BackupTx {
+        first,
+        last,
+        records,
+        origin: (0, 0),
+    };
+    meta.backup_append(
+        2,
+        &[
+            tx(1, 2, vec![create("a", ino(1), 10), completed(rid(1))]),
+            tx(
+                3,
+                4,
+                vec![
+                    LogRecord::TailOf { epoch: 1, jseq: 7 },
+                    create("b", ino(2), 11),
+                    completed(rid(2)),
+                ],
+            ),
+            tx(5, 6, vec![create("c", ino(3), 12), completed(rid(3))]),
+        ],
+    )
+    .unwrap();
+    meta.backup_append(
+        2,
+        &[tx(
+            7,
+            8,
+            vec![
+                LogRecord::RolledBack {
+                    idents: vec![(2, 1), (1, 7)],
+                },
+                LogRecord::Refused {
+                    rid: rid(9),
+                    code: constellation_types::Code::Io,
+                },
+            ],
+        )],
+    )
+    .unwrap();
+    let tail = meta.backup_tail(2).unwrap();
+    assert_eq!(
+        tail.iter()
+            .map(|t| (t.first, t.last, t.records.len()))
+            .collect::<Vec<_>>(),
+        vec![(1, 2, 0), (3, 4, 0), (5, 6, 2), (7, 8, 2)],
+    );
+    assert_eq!(meta.backup_acked(2).unwrap(), 8, "contiguous still");
+}
