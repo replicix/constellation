@@ -63503,3 +63503,14 @@ classified as isolated requesters or faults bounded relative to the window.
 
 Gates: fmt, clippy `-D warnings`; authority lib 885 and `meta_repro` 4, meta 382 and the rest, engine 940, control
 146, net 126, store-s3 237, model `today_bugs` (release); release sim suite 302 passed / 11 ignored.
+
+### Re-check (2026-11-01)
+
+Four more commits: the second deadline's own check (`settled_outcome`) no longer answers a lone root's settle
+refusal before the archive holds it (`a_lone_roots_own_settle_the_archive_never_held_is_unsettled`, the reviewer's
+probe; `Abandoned` sourced `Lone` on the parent); an inbox settle is never journaled `Lone`, this node's own batch
+included (`an_own_inbox_settle_is_never_journaled_lone`); a lone root's own settle nudges a round; a sent op a
+frozen epoch refuses is counted as an unsettled `EIO`. Authority lib 887 and `meta_repro` 4, meta 382, release sim
+suite 302; sweeps of every C2 configuration ×2,000 with and without the knob: failing seeds as main (`long-backup`
+743), settled landings 0, I1/I2/I4/I5 unchanged within ±2; unsettled `EIO`s unchanged except `flex-crash` (1,312
+→ 3,916: the frozen epoch's refusals of sent ops, now counted).
