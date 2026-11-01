@@ -2178,6 +2178,33 @@ impl Engine {
         }
     }
 
+    /// `repair drop-held`: the lost chunks every open view's write session
+    /// of `ino` has sealed (`View::live_write_sessions`).
+    pub fn live_write_sessions(&self, ino: u64) -> constellation_meta::LiveSessions {
+        let mut live = constellation_meta::LiveSessions::default();
+        for view in self.lifecycle.open_views() {
+            let one = view.live_write_sessions(ino);
+            live.hashes.extend(one.hashes);
+            live.in_flight |= one.in_flight;
+        }
+        live
+    }
+
+    /// `repair drop-held` dropped `lost`: the write sessions of `ino` that
+    /// sealed one of them fail (`View::fail_write_session_naming`).
+    /// Returns how many.
+    pub fn fail_write_sessions_naming(
+        &self,
+        ino: u64,
+        lost: &std::collections::BTreeSet<constellation_fs_core::ChunkHash>,
+    ) -> usize {
+        self.lifecycle
+            .open_views()
+            .iter()
+            .filter(|view| view.fail_write_session_naming(ino, lost))
+            .count()
+    }
+
     /// Whether [`Self::shutdown`] has begun (new views are refused).
     pub fn is_shutting_down(&self) -> bool {
         self.shutdown_started.load(Ordering::SeqCst)

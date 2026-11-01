@@ -879,6 +879,15 @@ impl Core {
         .then_some(id)
     }
 
+    /// The forwarded ops parked here unexecuted (`ExecuteReply`): their
+    /// rids and ops (`repair drop-held` asks which chunks they name).
+    pub(crate) fn parked_exec_ops(&self) -> impl Iterator<Item = (Rid, &MutateOp)> {
+        self.rd.parked.values().filter_map(|p| match &p.what {
+            ParkedWhat::ExecuteReply { rid, op, .. } => Some((*rid, op)),
+            _ => None,
+        })
+    }
+
     /// Whether an op is parked behind the replay queue (plan 46 M0.2, R3).
     pub(crate) fn queue_parks(&self) -> bool {
         self.rd.parked.values().any(|p| p.queue_gated)

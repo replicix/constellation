@@ -798,3 +798,77 @@ fn a_failed_fallocate_stamps_nothing() {
         (before.ctime_ns, before.mtime_ns, before.size)
     );
 }
+
+// ---- `repair drop-held` and the write sessions that name a lost chunk ----
+
+/// A write session that sealed a chunk `repair drop-held` then gave up on
+/// would, on its next close, compose a manifest naming a chunk S3 never
+/// received (a permanent `EIO` for every reader, the writer told OK). The
+/// drop names the session's sealed chunks to the core (kept held) and
+/// then fails the session: its bytes are gone, every open description
+/// reports `EIO` once at its next close or `fsync`, and nothing is
+/// published.
+#[test]
+fn a_reattached_session_naming_a_dropped_chunk_fails_its_next_close() {
+    use constellation_vfs::{Blocking, Caller, OpCtx, OpKind, OpenFlags, OpenOwner, Vfs};
+    let e = env();
+    let file = e.meta.create(ROOT_INO, "lost", 0o644, 0, 0).unwrap().ino;
+    let caller = Caller::new(0, 0, None);
+    let opened = Blocking::run(|r| {
+        e.fs.open(
+            &OpCtx::new(OpKind::Open, &caller),
+            file,
+            OpenFlags::READ | OpenFlags::WRITE,
+            OpenOwner::NONE,
+            r,
+        )
+    })
+    .unwrap();
+    let sealed = chunk(b'L');
+    let hash = ChunkHash::of(&sealed);
+    e.fs.do_write(file, 0, &sealed).unwrap();
+    e.fs.do_write(file, u64::from(CHUNK), b"x").unwrap();
+
+    // What the drop is told: the session sealed the chunk; no flush runs.
+    let live = e.fs.live_write_sessions(file);
+    assert_eq!(live.hashes, [hash].into());
+    assert!(!live.in_flight);
+    assert!(e.fs.live_write_sessions(file + 1).hashes.is_empty());
+
+    // A drop of another chunk touches nothing; of this one, ends the session.
+    let other: std::collections::BTreeSet<ChunkHash> = [ChunkHash::of(b"other")].into();
+    assert!(!e.fs.fail_write_session_naming(file, &other));
+    assert!(e.fs.writes.has_session(file));
+    assert_eq!(e.meta.locks().error_seq(file), 0);
+    let lost: std::collections::BTreeSet<ChunkHash> = [hash].into();
+    assert!(e.fs.fail_write_session_naming(file, &lost));
+    assert!(!e.fs.writes.has_session(file), "the session is gone");
+    assert!(!e.fs.fail_write_session_naming(file, &lost), "once");
+
+    // Every description open reports EIO once; nothing was published.
+    let seq = e.meta.locks().error_seq(file);
+    assert_ne!(seq, 0);
+    assert!(e.fs.handles.take_error(opened.fh, file, seq));
+    assert!(!e.fs.handles.take_error(opened.fh, file, seq), "once");
+    e.fs.flush_inode(file, false).unwrap();
+    assert!(
+        e.meta.manifest(file).unwrap().is_none(),
+        "no manifest naming the lost chunk"
+    );
+}
+
+/// A flush in flight has the session detached: the drop cannot read the
+/// manifest it composes, so it keeps every lost chunk of the inode.
+#[test]
+fn a_session_in_a_flush_keeps_every_lost_chunk_of_its_inode_held() {
+    let e = env();
+    let file = e.meta.create(ROOT_INO, "busy", 0o644, 0, 0).unwrap().ino;
+    e.fs.do_write(file, 0, &chunk(b'B')).unwrap();
+    e.fs.do_write(file, u64::from(CHUNK), b"x").unwrap();
+    let ws = e.fs.writes.detach(file).unwrap();
+    let live = e.fs.live_write_sessions(file);
+    assert!(live.in_flight);
+    assert!(live.names(&ChunkHash::of(b"any lost chunk of the inode")));
+    e.fs.writes.reattach(file, ws);
+    assert!(!e.fs.live_write_sessions(file).in_flight);
+}

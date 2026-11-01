@@ -211,13 +211,17 @@ pub trait Replica {
     /// node retired). Rolled back and queued for replay like any strand.
     fn strand_stale_shadows(&self, before_ms: i64) -> Result<Stranded, MetaError>;
     /// `constellation repair drop-held` (`Meta::drop_held_knowing`);
-    /// `unanswered(rid)`: the core knows the answer of `rid` has not left.
+    /// `unanswered(rid)`: the core knows the answer of `rid` has not left;
+    /// `live_ops(hash)`: the ops in flight here whose manifest of `ino`
+    /// names `hash`; `sessions`: what the engine's write sessions name.
     fn drop_held(
         &self,
         ino: Ino,
         now_unix: i64,
         remote: bool,
         unanswered: &dyn Fn(Rid) -> bool,
+        live_ops: &dyn Fn(&constellation_fs_core::ChunkHash) -> Vec<Rid>,
+        sessions: &constellation_meta::LiveSessions,
     ) -> Result<constellation_meta::DroppedHeld, MetaError>;
     /// The replay queue decoded once per generation of the queue, with
     /// each entry's keys (`Meta::queue_snapshot`): what the park rules ask.
@@ -1005,8 +1009,10 @@ impl Replica for Meta {
         now_unix: i64,
         remote: bool,
         unanswered: &dyn Fn(Rid) -> bool,
+        live_ops: &dyn Fn(&constellation_fs_core::ChunkHash) -> Vec<Rid>,
+        sessions: &constellation_meta::LiveSessions,
     ) -> Result<constellation_meta::DroppedHeld, MetaError> {
-        Meta::drop_held_knowing(self, ino, now_unix, remote, unanswered)
+        Meta::drop_held_knowing(self, ino, now_unix, remote, unanswered, live_ops, sessions)
     }
 
     fn pending_replays(&self) -> Result<Vec<StrandedOp>, MetaError> {

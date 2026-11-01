@@ -567,7 +567,10 @@ pub enum SyncRequest {
     DropHeld {
         ino: Ino,
         remote: bool,
-        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+        /// What the node's open write sessions of `ino` name
+        /// (`Engine::live_write_sessions`).
+        sessions: constellation_meta::LiveSessions,
+        reply: tokio::sync::oneshot::Sender<Result<constellation_meta::DroppedHeld, String>>,
     },
     /// Permanently leave the cluster (self). Flushes, tombstones the
     /// registry record, marks the state dir spent, then the caller

@@ -931,6 +931,40 @@ impl View {
         }
     }
 
+    /// `repair drop-held`: the chunks `ino`'s write session has sealed
+    /// (`View::drop_writes` ends it), see [`constellation_meta::LiveSessions`].
+    pub(crate) fn live_write_sessions(&self, ino: Ino) -> constellation_meta::LiveSessions {
+        self.writes.live_sessions(ino)
+    }
+
+    /// `repair drop-held` dropped the lost chunks `lost` of `ino`: an
+    /// attached write session that sealed one would compose a manifest
+    /// naming what S3 never received on its next close. It is discarded
+    /// like a lapsed lock's writes (`discard_lock_writes`): the bytes are
+    /// gone with the chunk, every open description reports `EIO` once at
+    /// its next close or `fsync`. `true` if there was such a session. A
+    /// flush in flight holds the session detached and the inode's lock: it
+    /// is not touched (the drop kept its chunks held for it).
+    pub(crate) fn fail_write_session_naming(
+        &self,
+        ino: Ino,
+        lost: &std::collections::BTreeSet<ChunkHash>,
+    ) -> bool {
+        let Some(_op) = self.inode_ops.try_lock(ino) else {
+            return false;
+        };
+        if !self.writes.names_any_of(ino, lost) || !self.discard_lock_writes(ino) {
+            return false;
+        }
+        self.meta.locks().note_discard(ino);
+        tracing::error!(
+            ino,
+            "discarded the write session of a file whose chunk `repair drop-held` dropped: \
+             the chunk is lost, the bytes cannot be published (EIO)"
+        );
+        true
+    }
+
     /// Drop `ino`'s unpublished write session: its staged bytes, and the
     /// pending-upload claims of the chunks it sealed. `true` if there was
     /// one. For content that must never be published (a lapsed lock

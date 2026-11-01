@@ -340,7 +340,15 @@ pub enum Control {
     /// becomes a placeholder, and its parked answer is aborted
     /// (`Busy`) in the same step — the requester's retry reaches the
     /// placeholder's place at once. Answered with `ControlOk::DroppedHeld`.
-    DropHeld { ino: Ino, remote: bool },
+    ///
+    /// `sessions`: what the engine's open write sessions of the inode
+    /// name — the lost chunks they sealed keep their pending rows (the
+    /// drop's "A lost chunk an op still names keeps its row").
+    DropHeld {
+        ino: Ino,
+        remote: bool,
+        sessions: constellation_meta::LiveSessions,
+    },
     /// Flush the journal, publish if the holder, release the lease, and
     /// answer — without stopping (`leave`).
     Flush,

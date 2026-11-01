@@ -3625,7 +3625,11 @@ async fn operator_drop_hopeless(
             // still parked.
             let dropped = match tokio::time::timeout(
                 Duration::from_secs(5),
-                n.control(constellation_authority::Control::DropHeld { ino, remote }),
+                n.control(constellation_authority::Control::DropHeld {
+                    ino,
+                    remote,
+                    sessions: Default::default(),
+                }),
             )
             .await
             {

@@ -1206,3 +1206,167 @@ fn a_remote_row_the_log_completed_is_not_a_placeholder() {
     assert!(!entry(rid_of(7, 1)).is_await_retry(), "{queue:?}");
     assert!(entry(rid_of(7, 2)).is_await_retry());
 }
+
+// ---------------------------------------------------------------------
+// A drop keeps the pending row of a lost chunk an op in flight names.
+// ---------------------------------------------------------------------
+
+/// A holder with `file` created and shipped, one pending upload of `lost`
+/// for it and the chunk recorded as unrecoverable: the state the upload
+/// pass leaves while the close that will name the chunk has not journaled
+/// its manifest yet (a handoff pause, a parked forward, a reattached write
+/// session).
+fn lost_chunk_before_its_manifest() -> (Meta, Ino, ChunkHash) {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_node_prefix(1).unwrap();
+    meta.set_holder_epoch(1);
+    let lost = ChunkHash::of(b"bytes that are gone");
+    let file = meta.create(ROOT_INO, "file", 0o644, 0, 0).unwrap().ino;
+    let rows = batch(&meta);
+    ship(&meta, &rows, 1);
+    meta.add_pending_upload(&lost, file).unwrap();
+    meta.note_unrecoverable_chunks(&[(lost, file)], true)
+        .unwrap();
+    (meta, file, lost)
+}
+
+/// The op executes after the drop: its manifest must still be held, not
+/// shipped naming a chunk S3 never received.
+fn assert_the_manifest_is_held(meta: &Meta, file: Ino, lost: ChunkHash) {
+    meta.set_manifest_with_base(file, None, &manifest_naming(lost, 19), 19, None, None)
+        .unwrap();
+    let recs = records(&batch(meta));
+    assert!(
+        !recs
+            .iter()
+            .any(|r| matches!(r, LogRecord::WriteManifest { .. })),
+        "the manifest naming the lost chunk shipped: {recs:?}"
+    );
+    assert_eq!(meta.held_summary().transactions, 1);
+}
+
+#[test]
+fn a_drop_keeps_the_pending_row_of_a_lost_chunk_a_live_op_names() {
+    let (meta, file, lost) = lost_chunk_before_its_manifest();
+    let live = rid_of(1, 14);
+    let dropped = meta
+        .drop_held_knowing(
+            file,
+            1234,
+            false,
+            &|_| false,
+            &|h| if *h == lost { vec![live] } else { Vec::new() },
+            &constellation_meta::LiveSessions::default(),
+        )
+        .unwrap();
+    assert_eq!(dropped.dropped, 0);
+    assert_eq!(dropped.pending_removed, 0, "the row stays: {dropped:?}");
+    assert_eq!(dropped.kept_pending, vec![lost]);
+    assert_eq!(dropped.kept_for, vec![live]);
+    assert!(dropped.describe().contains("run drop-held again"));
+    assert_eq!(meta.pending_uploads().unwrap(), vec![(lost, file)]);
+    assert_eq!(meta.unrecoverable_chunks().unwrap(), vec![(lost, file)]);
+    assert_the_manifest_is_held(&meta, file, lost);
+
+    // Once the op has journaled, the next drop is the seed's: the row goes.
+    let dropped = meta.drop_held(file, 1235).unwrap();
+    assert_eq!((dropped.dropped, dropped.pending_removed), (1, 1));
+    assert!(dropped.kept_pending.is_empty());
+    assert!(meta.pending_uploads().unwrap().is_empty());
+    assert!(meta.unrecoverable_chunks().unwrap().is_empty());
+}
+
+/// An op that is no longer in flight (it settled, or was refused) keeps
+/// nothing; a chunk no op names goes as before.
+#[test]
+fn a_drop_removes_the_row_of_a_lost_chunk_no_op_names() {
+    let (meta, file, lost) = lost_chunk_before_its_manifest();
+    let dropped = meta
+        .drop_held_knowing(
+            file,
+            1,
+            false,
+            &|_| false,
+            &|_| Vec::new(),
+            &constellation_meta::LiveSessions::default(),
+        )
+        .unwrap();
+    assert_eq!(dropped.pending_removed, 1);
+    assert!(dropped.kept_pending.is_empty() && dropped.kept_for.is_empty());
+    assert!(meta.pending_uploads().unwrap().is_empty());
+    assert!(meta.unrecoverable_chunks().unwrap().is_empty());
+    let _ = lost;
+}
+
+/// An open write session of the inode (the engine's `WriteState` that
+/// sealed the chunk) keeps it as well, with no rid to name; so does a
+/// session whose flush is in flight (the engine cannot read its manifest).
+#[test]
+fn a_drop_keeps_the_pending_row_of_a_chunk_a_write_session_names() {
+    for sessions in [
+        constellation_meta::LiveSessions {
+            hashes: [ChunkHash::of(b"bytes that are gone")].into(),
+            in_flight: false,
+        },
+        constellation_meta::LiveSessions {
+            hashes: Default::default(),
+            in_flight: true,
+        },
+    ] {
+        let (meta, file, lost) = lost_chunk_before_its_manifest();
+        let dropped = meta
+            .drop_held_knowing(file, 1, false, &|_| false, &|_| Vec::new(), &sessions)
+            .unwrap();
+        assert_eq!(dropped.pending_removed, 0, "{dropped:?}");
+        assert_eq!(dropped.kept_pending, vec![lost]);
+        assert!(dropped.kept_for.is_empty());
+        assert!(dropped.missing.contains(&lost));
+        assert_the_manifest_is_held(&meta, file, lost);
+    }
+}
+
+/// An op the drop itself rolled back is a seed, refused with its conflict
+/// copy: it keeps nothing held.
+#[test]
+fn an_op_the_drop_rolled_back_does_not_keep_its_chunk() {
+    use constellation_meta::RowClass::Lone;
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_node_prefix(1).unwrap();
+    meta.set_holder_epoch(1);
+    let lost = ChunkHash::of(b"bytes that are gone");
+    let file = meta.create(ROOT_INO, "file", 0o644, 0, 0).unwrap().ino;
+    let rows = batch(&meta);
+    ship(&meta, &rows, 1);
+    meta.add_pending_upload(&lost, file).unwrap();
+    let seed = rid_of(1, 9);
+    exec_as(
+        &meta,
+        Lone,
+        seed,
+        &MutateOp::SetManifest {
+            ino: file,
+            base_manifest: None,
+            manifest: manifest_naming(lost, 19),
+            size: 19,
+            mtime_ns: None,
+            ctime_ns: None,
+        },
+    );
+    meta.note_unrecoverable_chunks(&[(lost, file)], true)
+        .unwrap();
+    // The core still lists the executed op among its clients (it awaits
+    // its reply): the drop's own seed, not a reason to keep the chunk.
+    let dropped = meta
+        .drop_held_knowing(
+            file,
+            1,
+            false,
+            &|_| false,
+            &|_| vec![seed],
+            &constellation_meta::LiveSessions::default(),
+        )
+        .unwrap();
+    assert_eq!(dropped.rolled_back, vec![seed], "{dropped:?}");
+    assert!(dropped.kept_pending.is_empty(), "{dropped:?}");
+    assert_eq!(dropped.pending_removed, 1);
+}

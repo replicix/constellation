@@ -47,7 +47,9 @@ pub use store::backup::{
     fail_store_reads_after_on_this_thread_for_tests,
 };
 pub use store::backup::{BackupRole, BackupTx};
-pub use store::held::{DroppedHeld, HeldInode, HeldSummary};
+pub use store::held::{
+    manifest_names, op_manifests_of, DroppedHeld, HeldInode, HeldSummary, LiveSessions,
+};
 pub use store::inbox::{CompletedOutcome, InboxAck, InboxAckArmed, OutcomeRow};
 #[cfg(any(test, feature = "test-util"))]
 pub use store::journal::{before_delegate_write_hook, write_check_hook};

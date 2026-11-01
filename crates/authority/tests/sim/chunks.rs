@@ -356,8 +356,17 @@ impl ChunkWorld {
                 .into_iter()
                 .find(|r| r.hash == *hash)
             {
-                // Its own: it uploads once its S3 is back.
-                None => return false,
+                // Its own: it uploads once its S3 is back -- unless its
+                // pass found the chunk gone from its disk (marked
+                // unrecoverable, `repair drop-held`'s seed): no upload is
+                // coming, and a forward that waits on it waits for good.
+                None => {
+                    return meta
+                        .unrecoverable_chunks()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|(h, _)| h == hash)
+                }
                 Some(r) => node = r.node,
             }
         }

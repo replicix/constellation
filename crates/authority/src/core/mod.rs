@@ -3096,9 +3096,11 @@ impl Core {
             Control::AbandonGroup { epoch, gen, force } => {
                 self.on_control_abandon_group(now, op, epoch, gen, force, replica, out)
             }
-            Control::DropHeld { ino, remote } => {
-                self.on_control_drop_held(now, op, ino, remote, replica, out)
-            }
+            Control::DropHeld {
+                ino,
+                remote,
+                sessions,
+            } => self.on_control_drop_held(now, op, ino, remote, sessions, replica, out),
             Control::Reintegrate => {
                 if replica.lost_persisted() && !self.lease.lost {
                     self.lease.force_lost();

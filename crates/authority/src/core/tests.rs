@@ -50058,8 +50058,135 @@ mod await_retry {
     fn drop_held_via_core(h: &mut Harness, ino: Ino) -> Vec<Action> {
         h.step(Event::Control {
             op: OpId(900),
-            req: Control::DropHeld { ino, remote: false },
+            req: Control::DropHeld {
+                ino,
+                remote: false,
+                sessions: Default::default(),
+            },
         })
+    }
+
+    /// A manifest op of this node that has not executed yet (forwarded to
+    /// the holder, and not answered), naming a chunk the upload pass lost.
+    fn node_with_a_manifest_in_flight() -> (Harness, Ino, ChunkHash, Rid, Vec<u8>, OpId) {
+        let mut h = Harness::new(1);
+        h.core.lease.cached_holder = Some(2);
+        let file = h.meta.create(ROOT_INO, "file", 0o644, 0, 0).unwrap().ino;
+        let rows = MetaStore::take_journal(&h.meta, usize::MAX).unwrap();
+        let seqs: Vec<u64> = rows.iter().map(|(s, _)| *s).collect();
+        h.meta.ack_journal_rows_at(&seqs, 1).unwrap();
+        let lost = ChunkHash::of(b"bytes that are gone");
+        let manifest = Manifest {
+            layout: ChunkLayout::new(4096),
+            file_len: 19,
+            chunks: ChunkInfo::Inline([(0u64, lost)].into_iter().collect()),
+        }
+        .encode();
+        h.meta.add_pending_upload(&lost, file).unwrap();
+        h.meta
+            .note_unrecoverable_chunks(&[(lost, file)], true)
+            .unwrap();
+        let rid = h.rid(14);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: MutateOp::SetManifest {
+                ino: file,
+                base_manifest: None,
+                manifest: manifest.clone(),
+                size: 19,
+                mtime_ns: None,
+                ctime_ns: None,
+            },
+            tag: Default::default(),
+        });
+        assert_eq!(sends(&out).len(), 1, "forwarded to the holder: {out:?}");
+        let PeerMsg::MutateRequest { req, .. } = sends(&out)[0].1 else {
+            panic!("{out:?}")
+        };
+        let req = *req;
+        (h, file, lost, rid, manifest, req)
+    }
+
+    /// Defect A (seeds 1476, 1851): the drop removed the pending row and
+    /// the poison mark of a lost chunk although an op of this node that
+    /// names it had not executed yet (a close behind a handoff pause, a
+    /// forward the holder had not answered): the manifest then shipped
+    /// naming a chunk S3 never received. The chunk stays held while the
+    /// op is in flight, and the manifest, once executed, is a seed.
+    #[test]
+    fn an_unexecuted_manifest_keeps_its_lost_chunk_held_through_a_drop() {
+        let (mut h, file, lost, rid, manifest, _) = node_with_a_manifest_in_flight();
+        let out = drop_held_via_core(&mut h, file);
+        let dropped = out
+            .iter()
+            .find_map(|a| match a {
+                Action::ControlDone {
+                    result: Ok(ControlOk::DroppedHeld(d)),
+                    ..
+                } => Some(d.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{out:?}"));
+        assert_eq!(dropped.kept_pending, vec![lost], "{dropped:?}");
+        assert_eq!(dropped.kept_for, vec![rid]);
+        assert_eq!(dropped.pending_removed, 0);
+        assert_eq!(h.meta.pending_uploads().unwrap(), vec![(lost, file)]);
+        assert_eq!(h.meta.unrecoverable_chunks().unwrap(), vec![(lost, file)]);
+
+        // The op executes (this node takes the lease, the op runs): its
+        // manifest is held, not shipped.
+        h.meta
+            .set_manifest_with_base(file, None, &manifest, 19, None, None)
+            .unwrap();
+        let shipped: Vec<(u64, LogRecord)> = h
+            .meta
+            .take_journal_grouped(usize::MAX)
+            .unwrap()
+            .into_iter()
+            .flat_map(|(_, rows)| rows)
+            .collect();
+        assert!(
+            !shipped
+                .iter()
+                .any(|(_, r)| matches!(r, LogRecord::WriteManifest { .. })),
+            "the manifest naming the lost chunk is shippable: {shipped:?}"
+        );
+        assert_eq!(h.meta.held_summary().transactions, 1);
+    }
+
+    /// The op is answered (refused here): nothing in flight names the
+    /// chunk any more, and the next drop removes the row as before.
+    #[test]
+    fn a_finished_manifest_op_no_longer_keeps_its_lost_chunk() {
+        let (mut h, file, lost, _, _, req) = node_with_a_manifest_in_flight();
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome: MutateOutcome::Errno(Code::Invalid),
+                base: Some(0),
+                position: constellation_meta::Position::ZERO,
+                gen: 0,
+                own_chunks: OwnChunks::None,
+                own_rows: None,
+                committed: false,
+            },
+        });
+        assert_eq!(replies(&out).len(), 1, "{out:?}");
+        let out = drop_held_via_core(&mut h, file);
+        assert!(
+            out.iter().any(|a| matches!(
+                a,
+                Action::ControlDone {
+                    result: Ok(ControlOk::DroppedHeld(d)),
+                    ..
+                } if d.kept_pending.is_empty() && d.pending_removed == 1
+            )),
+            "{out:?}"
+        );
+        assert!(h.meta.pending_uploads().unwrap().is_empty());
+        let _ = lost;
     }
 
     /// Item 2 (backed root): another node's row journaled `RootGroup`

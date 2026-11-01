@@ -253,6 +253,16 @@ impl Lifecycle {
         self.views.lock().unwrap().insert(id, view);
     }
 
+    /// The views that are open now.
+    pub(crate) fn open_views(&self) -> Vec<Arc<View>> {
+        self.views
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect()
+    }
+
     pub(crate) fn unregister_view(&self, id: u64) {
         self.views.lock().unwrap().remove(&id);
     }

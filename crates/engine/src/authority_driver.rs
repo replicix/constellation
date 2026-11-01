@@ -551,7 +551,7 @@ enum ControlReply {
     Text(oneshot::Sender<std::result::Result<String, String>>),
     Leave(oneshot::Sender<std::result::Result<String, String>>),
     /// `repair drop-held`: what the core's drop did, in words.
-    DropHeld(oneshot::Sender<std::result::Result<String, String>>),
+    DropHeld(oneshot::Sender<std::result::Result<constellation_meta::DroppedHeld, String>>),
     /// Plan 30 §M8.
     ReadIndex(oneshot::Sender<ReadAnswer>),
     Recall(oneshot::Sender<()>),
@@ -3914,8 +3914,17 @@ impl Driver {
                 Control::AbandonGroup { epoch, gen, force },
                 ControlReply::Text(reply),
             ),
-            SyncRequest::DropHeld { ino, remote, reply } => control(
-                Control::DropHeld { ino, remote },
+            SyncRequest::DropHeld {
+                ino,
+                remote,
+                sessions,
+                reply,
+            } => control(
+                Control::DropHeld {
+                    ino,
+                    remote,
+                    sessions,
+                },
                 ControlReply::DropHeld(reply),
             ),
             SyncRequest::Leave { force, reply } => {
@@ -6152,9 +6161,9 @@ impl Driver {
                 }));
             }
             ControlReply::DropHeld(tx) => {
-                let _ = tx.send(result.map(|ok| match ok {
-                    ControlOk::DroppedHeld(dropped) => dropped.describe(),
-                    _ => "done".to_string(),
+                let _ = tx.send(result.and_then(|ok| match ok {
+                    ControlOk::DroppedHeld(dropped) => Ok(dropped),
+                    _ => Err("the core answered a drop with something else".to_string()),
                 }));
             }
             ControlReply::Acquire(tx) => {

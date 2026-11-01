@@ -426,6 +426,36 @@ impl WriteShards {
         self.pending(&shard, ino).is_some()
     }
 
+    /// What `repair drop-held` must keep held for `ino`'s session: the
+    /// chunks an attached session has sealed (its next close re-flushes
+    /// them), and whether a flush has the session detached (it is composing
+    /// or committing a manifest this cannot read).
+    pub(super) fn live_sessions(&self, ino: Ino) -> constellation_meta::LiveSessions {
+        let shard = self.lock(ino);
+        constellation_meta::LiveSessions {
+            hashes: shard
+                .get(&ino)
+                .map(|ws| ws.sealed.values().copied().collect())
+                .unwrap_or_default(),
+            in_flight: self.detached[ino as usize % WRITE_SHARDS]
+                .lock()
+                .unwrap()
+                .contains_key(&ino),
+        }
+    }
+
+    /// Whether `ino`'s attached session has sealed a chunk of `lost`.
+    pub(super) fn names_any_of(
+        &self,
+        ino: Ino,
+        lost: &std::collections::BTreeSet<ChunkHash>,
+    ) -> bool {
+        let shard = self.lock(ino);
+        shard
+            .get(&ino)
+            .is_some_and(|ws| ws.sealed.values().any(|h| lost.contains(h)))
+    }
+
     /// Every inode with a write session, attached or detached
     /// (`View::sync_view`'s flush list).
     pub(super) fn pending_inos(&self) -> Vec<Ino> {

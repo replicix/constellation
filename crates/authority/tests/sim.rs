@@ -4843,6 +4843,28 @@ fn drop_held_chain_backed_config() -> SimConfig {
     }
 }
 
+/// `drop-held-chain-backed` on the seeds that failed on `aa8466f9`
+/// without the lease-read knob (the four defects of the drop on a backed
+/// root, one commit each): every seed passes.
+///
+/// - 1476: the drop removed the pending row of a chunk an op of the node
+///   still named (a close behind a handoff pause): its manifest shipped
+///   naming a chunk S3 never received.
+#[test]
+fn drop_held_chain_backed_regression_seeds() {
+    for (seed, why) in [(
+        1476u64,
+        "a chunk gap: the drop took a live op's chunk for durable",
+    )] {
+        run_seed(seed, drop_held_chain_backed_config()).unwrap_or_else(|e| {
+            panic!(
+                "drop-held-chain-backed seed {seed} ({why}): {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=drop-held-chain-backed AUTHORITY_SIM_SEED={seed}"
+            )
+        });
+    }
+}
+
 /// Chunk epoch-liveness-gap (sweep only): `flex`'s two-member outages
 /// (`f = 1`, the third node keeps S3) in `locks-blips-tight`'s
 /// back-to-back pairs, so a closed hold owner's fresh epoch replaces the

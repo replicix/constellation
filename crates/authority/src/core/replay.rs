@@ -545,17 +545,33 @@ impl Core {
     /// that can execute if its answer left); the parked answer of each
     /// placeholder is aborted in the same step (R4), so the requester's
     /// retry arrives at once and meets the placeholder's place.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_control_drop_held(
         &mut self,
         now: Now,
         op: OpId,
         ino: Ino,
         remote: bool,
+        sessions: constellation_meta::LiveSessions,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
         let unanswered = |rid: Rid| self.answer_parked(rid).is_some();
-        let dropped = replica.drop_held(ino, now.wall.0 / 1000, remote, &unanswered);
+        let live = self.ops_naming_manifests_of(ino);
+        let live_ops = |hash: &constellation_fs_core::ChunkHash| -> Vec<Rid> {
+            live.iter()
+                .filter(|(_, manifest)| constellation_meta::manifest_names(manifest, hash))
+                .map(|(rid, _)| *rid)
+                .collect()
+        };
+        let dropped = replica.drop_held(
+            ino,
+            now.wall.0 / 1000,
+            remote,
+            &unanswered,
+            &live_ops,
+            &sessions,
+        );
         match dropped {
             Ok(dropped) => {
                 for rid in dropped.placeholders.clone() {
@@ -571,6 +587,43 @@ impl Core {
                 result: Err(e.to_string()),
             }),
         }
+    }
+
+    /// The ops of this node that have not journaled yet and would write a
+    /// manifest of `ino`, with those manifests: `repair drop-held` keeps
+    /// the lost chunks they name held (`Meta::drop_held_knowing`).
+    ///
+    /// - this node's client ops that are not finished (an op in
+    ///   `AwaitingLog` was executed by another sequencer: its row comes
+    ///   through the log, whatever it names is not this node's to hold);
+    /// - the forwards parked here unexecuted (`ExecuteReply`);
+    /// - the ops a delegate parked here.
+    ///
+    /// An op the drop rolls back itself (a journaled row, a seed) is
+    /// excluded by the drop. Other nodes' inbox batches are not listed: a
+    /// foreign op names this node's pending chunks only through the
+    /// forwarded-pending list (`--remote`'s case).
+    fn ops_naming_manifests_of(&self, ino: Ino) -> Vec<(Rid, Vec<u8>)> {
+        let mut out: Vec<(Rid, Vec<u8>)> = Vec::new();
+        let mut add = |rid: Rid, op: &MutateOp| {
+            for manifest in constellation_meta::op_manifests_of(op, ino) {
+                out.push((rid, manifest.to_vec()));
+            }
+        };
+        for (rid, client) in &self.clients {
+            if !matches!(client.phase, super::client::Phase::AwaitingLog { .. }) {
+                add(*rid, &client.op);
+            }
+        }
+        for (rid, op) in self.parked_exec_ops() {
+            add(rid, op);
+        }
+        for d in self.dl.mine.values() {
+            for parked in &d.parked {
+                add(parked.rid, &parked.op);
+            }
+        }
+        out
     }
 
     /// Plan 46 M0.2 (R5): count the time each placeholder in `queue` has

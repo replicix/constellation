@@ -1741,14 +1741,36 @@ impl EngineControl {
 
     pub(crate) fn drop_held(&self, ino: u64, remote: bool) -> std::result::Result<String, String> {
         let (reply, receive) = tokio::sync::oneshot::channel();
+        // The open write sessions of the inode: the core cannot see them.
+        // A lost chunk one has sealed keeps its pending row (the drop's
+        // "A lost chunk an op still names keeps its row").
+        let sessions = self.engine.live_write_sessions(ino);
         self.sync_tx
-            .send(sync::SyncRequest::DropHeld { ino, remote, reply })
+            .send(sync::SyncRequest::DropHeld {
+                ino,
+                remote,
+                sessions,
+                reply,
+            })
             .map_err(|_| "sync task is not running".to_string())?;
-        tokio::task::block_in_place(|| {
+        let dropped = tokio::task::block_in_place(|| {
             self.rt
                 .block_on(receive)
                 .map_err(|_| "sync task stopped".to_string())?
-        })
+        })?;
+        // A session that sealed a chunk the drop gave up on would publish a
+        // manifest naming it on its next close: it fails instead (`EIO`
+        // once at the next close or `fsync` of each open description).
+        let failed = self
+            .engine
+            .fail_write_sessions_naming(ino, &dropped.missing);
+        let mut text = dropped.describe();
+        if failed > 0 {
+            text.push_str(&format!(
+                "; {failed} open write session(s) naming a lost chunk discarded (EIO at their next close); run drop-held again to release their chunks"
+            ));
+        }
+        Ok(text)
     }
 
     pub(crate) fn doctor(&self) -> std::result::Result<api::DoctorStatus, String> {

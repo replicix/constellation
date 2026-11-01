@@ -70,6 +70,22 @@
 //! unrecoverable chunks as holes — the replay drain materializes under
 //! `.constellation-conflict/`. The unrecoverable pending rows go with it.
 //!
+//! **A lost chunk an op still names keeps its row.** "No pending row"
+//! means *durable* to the ship plan, to the pending list a forward
+//! carries, and to the composition of a manifest by a write session that
+//! re-flushes the hashes it sealed. The drop removes a row believing every
+//! reference to the chunk became a hole — but it can see only the journal
+//! and the replay queue, not an op of this node that has not executed yet
+//! (a client op behind a handoff pause, a parked forward, a delegate's
+//! parked op) or a write session that will commit later. Such a manifest
+//! would ship naming a chunk S3 never received: a permanent `EIO` on every
+//! node, an acknowledged write silently lost, no conflict copy. So the
+//! core (the ops) and the engine (the sessions) name the chunks they
+//! still use ([`LiveSessions`], `drop_held_knowing`'s `live_ops`), and the
+//! drop keeps those chunks' pending rows and poison marks (the remote
+//! mark too). The op that executes later is a seed of the next drop; the
+//! engine fails a session naming a dropped chunk (`EIO` once).
+//!
 //! The queue keeps every rolled-back transaction in journal order, but
 //! not every entry is a copy of its op (plan 46 M0.2, the drop-held
 //! proposal's option B). An operator's drop re-executes only this node's
@@ -339,12 +355,68 @@ pub struct DroppedHeld {
     pub rolled_back: Vec<crate::rid::Rid>,
     /// Of `rolled_back`, the rids queued as placeholders (`await_retry`).
     pub placeholders: Vec<crate::rid::Rid>,
+    /// The inode's unrecoverable chunks when the drop ran.
+    pub missing: BTreeSet<ChunkHash>,
+    /// Of `missing`, the chunks whose pending row and poison mark the drop
+    /// kept because an op or a write session of this node still names them
+    /// (the module doc's "Dropping").
+    pub kept_pending: Vec<ChunkHash>,
+    /// The ops in flight here that keep those chunks held.
+    pub kept_for: Vec<crate::rid::Rid>,
+}
+
+/// The write sessions of one inode that are open on this node (the engine
+/// knows them, the core does not): `repair drop-held` keeps the lost
+/// chunks they name held (`Meta::drop_held_knowing`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LiveSessions {
+    /// The chunks the attached sessions have sealed.
+    pub hashes: BTreeSet<ChunkHash>,
+    /// A session is detached: its flush is composing or committing a
+    /// manifest the engine cannot read. Every lost chunk is kept.
+    pub in_flight: bool,
+}
+
+impl LiveSessions {
+    /// Whether a session may name `hash`.
+    pub fn names(&self, hash: &ChunkHash) -> bool {
+        self.in_flight || self.hashes.contains(hash)
+    }
+}
+
+/// Whether `manifest` (the bytes of a `SetManifest`, `Publish` or
+/// `WriteManifest`) names `hash`; a spilled or undecodable manifest is
+/// taken to name every chunk, as the ship plan does.
+pub fn manifest_names(manifest: &[u8], hash: &ChunkHash) -> bool {
+    names_any(manifest, &BTreeSet::from([*hash]))
+}
+
+/// The manifests `op` would write into `ino`.
+pub fn op_manifests_of(op: &MutateOp, ino: Ino) -> Vec<&[u8]> {
+    match op {
+        MutateOp::SetManifest {
+            ino: m, manifest, ..
+        }
+        | MutateOp::Publish {
+            ino: m, manifest, ..
+        } if *m == ino => vec![manifest.as_slice()],
+        MutateOp::Records { records } => records
+            .iter()
+            .filter_map(|r| match r {
+                LogRecord::WriteManifest {
+                    ino: m, manifest, ..
+                } if *m == ino => Some(manifest.as_slice()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 impl DroppedHeld {
     /// The operator's one-line account of the drop (`repair drop-held`).
     pub fn describe(&self) -> String {
-        format!(
+        let mut text = format!(
             "inode {}: {} held transaction(s) dropped into a conflict copy under \
              {}/ (lost chunks become holes), {} dependent transaction(s) rolled back and queued \
              for replay ({} of them another node's unanswered row, kept as a placeholder for that \
@@ -356,7 +428,21 @@ impl DroppedHeld {
             self.await_retry,
             self.queued_dropped,
             self.pending_removed
-        )
+        );
+        if !self.kept_pending.is_empty() {
+            let rids: Vec<String> = self.kept_for.iter().map(|r| format!("{r:?}")).collect();
+            text.push_str(&format!(
+                "; {} lost chunk(s) are still named by op(s) or write session(s) in flight here \
+                 (rids: {}): kept held; run drop-held again once they have journaled",
+                self.kept_pending.len(),
+                if rids.is_empty() {
+                    "none, an open write session".to_string()
+                } else {
+                    rids.join(", ")
+                }
+            ));
+        }
+        text
     }
 }
 
@@ -1151,7 +1237,14 @@ impl Meta {
     /// `constellation repair drop-held <ino>` (see the module doc's
     /// "Dropping"). `now_unix` stamps the conflict copies' names.
     pub fn drop_held(&self, ino: Ino, now_unix: i64) -> Result<DroppedHeld, MetaError> {
-        self.drop_held_knowing(ino, now_unix, false, &|_| false)
+        self.drop_held_knowing(
+            ino,
+            now_unix,
+            false,
+            &|_| false,
+            &|_| Vec::new(),
+            &LiveSessions::default(),
+        )
     }
 
     /// `constellation repair drop-held <ino> --remote`: the same for a
@@ -1166,7 +1259,14 @@ impl Meta {
     /// rows go. Nothing is dropped silently: the requester's op is a
     /// refusal or a conflict copy, never lost.
     pub fn drop_held_remote(&self, ino: Ino, now_unix: i64) -> Result<DroppedHeld, MetaError> {
-        self.drop_held_knowing(ino, now_unix, true, &|_| false)
+        self.drop_held_knowing(
+            ino,
+            now_unix,
+            true,
+            &|_| false,
+            &|_| Vec::new(),
+            &LiveSessions::default(),
+        )
     }
 
     /// `drop_held` / `drop_held_remote` with what only the core knows
@@ -1176,12 +1276,25 @@ impl Meta {
     /// may become a placeholder like an `Archive` one. The offline forms
     /// above know nothing: such a row keeps its op, the only copy that can
     /// execute if the answer left.
+    ///
+    /// `live_ops(hash)`: the rids of the ops in flight on this node (not
+    /// journaled yet, or not executed) whose manifest of `ino` names
+    /// `hash`; `sessions`: the chunks the node's open write sessions of
+    /// `ino` have sealed. A lost chunk either names keeps its pending row,
+    /// poison mark and remote mark (see "Dropping" in the module doc): no
+    /// row means *durable* to every ship plan, forward list and manifest
+    /// composition, so dropping it under such an op would let the op's
+    /// manifest ship naming a chunk S3 never received. The offline forms
+    /// have no op in flight.
+    #[allow(clippy::too_many_arguments)]
     pub fn drop_held_knowing(
         &self,
         ino: Ino,
         now_unix: i64,
         remote: bool,
         unanswered: &dyn Fn(crate::rid::Rid) -> bool,
+        live_ops: &dyn Fn(&ChunkHash) -> Vec<crate::rid::Rid>,
+        sessions: &LiveSessions,
     ) -> Result<DroppedHeld, MetaError> {
         // The `Refused` records the drop journals are answered by the log
         // alone — nobody is told of them, and a retry meets the record —
@@ -1396,7 +1509,19 @@ impl Meta {
         }
         let mut pending_removed = 0;
         let mut marks_removed = 0i64;
+        let mut kept_pending: Vec<ChunkHash> = Vec::new();
+        let mut kept_for: Vec<crate::rid::Rid> = Vec::new();
         for hash in &missing {
+            // An op in flight here, or an open session, still names the
+            // chunk: its row and marks stay. (An op this drop rolled back
+            // is not in flight any more: its row is a seed, refused above.)
+            let mut live = live_ops(hash);
+            live.retain(|rid| !rolled_back.contains(rid));
+            if !live.is_empty() || sessions.names(hash) {
+                kept_pending.push(*hash);
+                kept_for.extend(live);
+                continue;
+            }
             if tx
                 .get(&self.pending_upload, pending_key(hash, ino))?
                 .is_some()
@@ -1437,8 +1562,11 @@ impl Meta {
             await_retry,
             queued_dropped,
             pending_removed,
+            kept = kept_pending.len(),
             "held records dropped into conflict copies"
         );
+        kept_for.sort();
+        kept_for.dedup();
         Ok(DroppedHeld {
             ino,
             dropped: seeds.len(),
@@ -1448,6 +1576,9 @@ impl Meta {
             queued_dropped,
             rolled_back,
             placeholders,
+            missing,
+            kept_pending,
+            kept_for,
         })
     }
 }
