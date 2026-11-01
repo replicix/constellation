@@ -49251,6 +49251,31 @@ mod c2g_settle {
         assert_eq!(h.core.stats.client_unsettled_eio, 1);
     }
 
+    /// C2g's re-check: a node draining its own inbox batch (its takeover
+    /// gate does) journals a settle's refusal as another node's answer
+    /// would be, never `Lone` (what a deposition does with the row follows
+    /// its class). Fails on the parent: `Lone`.
+    #[test]
+    fn an_own_inbox_settle_is_never_journaled_lone() {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        h.core.ack.peers.clear();
+        h.core.ack.candidate = None;
+        h.core.ack.eligible = Some(false);
+        assert!(h.core.root_lone());
+        let op = h.create("i");
+        let mut batch = inbox_batch(1, 0, 1, &op);
+        batch.ops[0].settle = true;
+        let mut out = Vec::new();
+        h.core
+            .inbox_drain(h.clk(), vec![batch], &h.meta, &mut out)
+            .unwrap();
+        assert_eq!(
+            h.meta.journal_classes_of_rid(h.rid(1)).unwrap(),
+            vec![constellation_meta::RowClass::Archive]
+        );
+    }
+
     /// C2g's review, SHOULD 3: a node that is not the root answers a forward
     /// whose `deps` were lost `NotHolder`, not a `Held` with no generation
     /// (which its requester reads as the root's answer and caches the

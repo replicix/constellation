@@ -1581,6 +1581,9 @@ impl Core {
             // outcome here (above): refused for good, like any refusal of an
             // inbox op (its requester learns it from the log).
             if op.settle {
+                // Never `Lone`, even for this node's own batch (its takeover
+                // gate drains it): `Core::settle_refusal`.
+                let _settle_class = self.journal_class_for(super::Asker::Remote);
                 replica.journal_inbox_refusal(
                     rid,
                     super::client::ABANDONED_CODE,
