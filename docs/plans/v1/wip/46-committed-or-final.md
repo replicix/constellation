@@ -63,11 +63,49 @@ chosen for that, not for size.
   generations once there is one stream per node, §5.3).
 - The campaign tooling, the `+commit` strict flags, the sim's lease-read
   knob (committed): this plan's fail-before evidence.
-- Coordinates with plan 41 L5/L6 (renewal lane follow-ups): a
-  delegation's renewal is unchanged; the grant it renews is a node
-  stream's. Coordinates with plan 40 R8 and plan 42's campaigns only
-  through the harness catalogue. Nothing else is in flight in the
-  authority core.
+- **Plan 41** (lock renewals through disk stalls, open). The lane stays;
+  what it renews changes. A sticky grant never times out, so it needs no
+  renewal: the lane's delegation path applies to placed grants only, and
+  plan 41's role table (§5) is updated in M1.3. The lock-table helpers
+  plan 41 L1 fixed (`lock_on_delegated`, `lock_take_generation`,
+  `deleg_drop_left`) are keyed by delegation generation and are rewritten
+  by M1.2 (one stream per node) and M3.1 (C4). Plan 41's open
+  measurements (the stall sweep, the real-device runs, `long_locks`
+  ×1,000, the xcheckfs lock run) validate the lane and may run on today's
+  code; their lock and delegation scenarios are re-run at M1.2's and
+  M3.1's exits. Plan 41's L5/L6 follow-ups (peers' renewals at a stalled
+  owner; the lane's own lease probe) wait until after M3.1, since lock
+  state in the log changes their design.
+- **Plan 40** (READDIRPLUS, open). Its "lone strict sequencer" kernel
+  TTL (`cto::lone_kernel_ttl`, `lone_kernel_drain_ms`) means *no other
+  node has shown itself* (`ReadDelegations::leave_alone`), i.e. this
+  plan's singleton; it is unaffected, and a sticky holder (which sees
+  other nodes) keeps TTL 0. M1.1 renames the ack-side "lone" so that the
+  two meanings no longer share a word. The split-directory strict-readdir
+  gap disappears with the splits (M1.2). Plan 40's remaining items run on
+  today's code; its harness rows are part of M1.2's and M1.3's exits.
+- **Plan 45** (hard links, done). M1.2 deletes its key-move rule (one
+  stream owns every link's parent, or the op is cross-subtree). New
+  behaviour: a `link()` or `rename()` across subtrees held by different
+  nodes needs both grants, and while one holder is lost mid-write it
+  fails with `EXDEV` (`mv` falls back to copy and delete; `ln` fails, as
+  POSIX allows) until the holder returns or `repair abandon` runs;
+  `hard-links.md` and `delegations.md` say so in M1.3. `hardlink-burst`
+  and plan 45's box gates on four file systems are re-run at M1.2's exit.
+- **Plan 42** (kernel race workarounds, done). Its invalidations follow
+  applied log and stream entries, which this plan does not change; the
+  `kernel-race-*` harness rows are part of M1.2's and M1.3's exits.
+- **Plan 44** (non-blocking log writer, done): no interaction; the new
+  `sticky.rs` logs through it.
+- **Plan 33** (control plane and UI): `status.ack.classes` becomes
+  `{group, final, singleton, archive_waits}` (M1.1) and
+  `status.delegation.sticky` is new (M1.3); the UI and dashboard follow in
+  the same milestones.
+- **Plans 34–36** (ports). The suspend release is per platform: macOS's
+  system-will-sleep notification allows a delay; Windows gives about 2 s
+  (best effort); an Android node holds no sticky grant, or releases it
+  whenever the app goes to the background (plan 36 records which).
+- Nothing else is in flight in the authority core.
 
 ## 1. History
 
@@ -391,7 +429,9 @@ designation) until it returns and releases or the operator runs
 `constellation repair abandon --node <id> [--gen <g>]` (the existing
 `abandon-group`'s sibling: the root ends the generation at its cursor;
 rows the holder acknowledged past the cut are *lost for others and kept
-by the holder* as conflict copies on its return, §5.5). Nothing the
+by the holder* as conflict copies on its return, §5.5). Meanwhile a
+`link()` or `rename()` between its subtree and another node's fails with
+`EXDEV` (see Dependencies, plan 45). Nothing the
 holder's clients were told is rolled back by anyone but the operator, and
 the operator's action is documented as the loss it is (I5's clause (b)).
 
@@ -685,7 +725,10 @@ All eight answered by the maintainer on 2026-11-01: each as recommended below.
       delegate; sticky grants with every release trigger of §5.4 and
       `constellation release`; the root's own sticky grants; the hold as a
       group; I1/I2/I2c/I5 strict on every config including flex ×2,000;
-      the harness catalogue green with the retired scenarios removed; G1–G6
+      the harness catalogue green with the retired scenarios removed,
+      including plan 40's, 41's, 42's (`kernel-race-*`) and 45's
+      (`hardlink-burst`, its box gates on four file systems) rows re-run at
+      M1.2's and M1.3's exits; G1–G6
       re-measured on four file systems; DESIGN, the feature docs and
       ADR-40 updated; the "Deleted" tables complete.
 - [ ] Stage 2: the coverage verification recorded with the minimal piece
@@ -693,7 +736,9 @@ All eight answered by the maintainer on 2026-11-01: each as recommended below.
       `derive_replay_op`, no `AckPolicy::Local`; conflict copies only from
       `conflict_export`; drop-held as refuse-and-retry; topology 1 within
       ±3 %; I2/I5 strict everywhere; docs and ADR-19/ADR-40 amended.
-- [ ] Stage 3: plan 43 C4's and C7b-8's exit items.
+- [ ] Stage 3: plan 43 C4's and C7b-8's exit items; plan 41's lock
+      scenarios re-run at M3.1's exit; plan 41 L5/L6 re-planned on the
+      new lock records.
 - [ ] The full CONVENTIONS gates at the end of every stage (pjdfstest
       8798/8798, empty baseline).
 - [ ] Every milestone reviewed (fable) before the next started.
