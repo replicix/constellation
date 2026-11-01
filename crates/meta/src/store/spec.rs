@@ -188,9 +188,11 @@ pub enum SpecKind {
         /// here as well by the next epoch's strand would be a second. So
         /// the shadow is not stranded by an epoch: it retires by the
         /// `Completed`/`Refused` of its rid that comes from the log.
-        /// (Plan 46 M1.4 removes this state: the hold's answers wait for
-        /// a member.)
-        non_stealable: bool,
+        /// `Some(wall ms)` it was installed; `Meta::strand_stale_shadows`
+        /// strands it once that is older than the bound (its owner's journal
+        /// may be lost, its owner retired). (Plan 46 M1.4 removes this state:
+        /// the hold's answers wait for a member.)
+        non_stealable: Option<i64>,
     },
     /// The `Exists` early install: retires once the applied state
     /// reaches `at`, the position the refusal was evaluated at
@@ -274,7 +276,7 @@ enum LiveEntry {
         gen: u64,
         gated: bool,
         /// See [`SpecKind::Shadow::non_stealable`].
-        non_stealable: bool,
+        non_stealable: Option<i64>,
     },
     Hint {
         at: Position,
@@ -326,7 +328,7 @@ impl LiveEntry {
             // non-stealable sequencer: it is its owner's to replay, and the
             // shadow retires by the rid's outcome in the log.
             LiveEntry::Shadow {
-                non_stealable: true,
+                non_stealable: Some(_),
                 ..
             } => false,
             _ => self.stranded_by_takeover(epoch),
@@ -3789,7 +3791,7 @@ impl Meta {
         op: &MutateOp,
         tag: &LockTag,
         records: &[LogRecord],
-        (committed, non_stealable): (bool, bool),
+        (committed, non_stealable): (bool, Option<i64>),
     ) -> Result<bool, MetaError> {
         self.install_shadow_inner(
             rid,
@@ -3816,7 +3818,7 @@ impl Meta {
         records: &[LogRecord],
         committed: bool,
     ) -> Result<bool, MetaError> {
-        self.install_shadow_inner(rid, epoch, gen, op, tag, records, (committed, false))
+        self.install_shadow_inner(rid, epoch, gen, op, tag, records, (committed, None))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3828,7 +3830,7 @@ impl Meta {
         op: &MutateOp,
         tag: &LockTag,
         records: &[LogRecord],
-        (committed, non_stealable): (bool, bool),
+        (committed, non_stealable): (bool, Option<i64>),
     ) -> Result<bool, MetaError> {
         let mut tx = self.db.write_tx();
         if tx.get(&self.completed, rid.to_key())?.is_some() {
@@ -5171,6 +5173,47 @@ impl Meta {
             pending_replay: counter_get(&r, &self.local, KV_PENDING_REPLAY_COUNT)?,
             local: counter_get(&r, &self.local, KV_LOCAL_SPEC_COUNT)?,
         })
+    }
+
+    /// Plan 46 M0.2 review (R7): strand the shadows of non-stealable
+    /// answers installed before `before_ms` (wall clock of the installing
+    /// core). A non-stealable shadow ends by the rid's outcome in the log or
+    /// this node's own takeover; if its owner's journal was lost, or the
+    /// owner retired, neither comes. After the bound it is rolled back and
+    /// queued for replay by rid like any strand. A read of the live entries
+    /// first: nothing is written unless one is that old.
+    pub fn strand_stale_shadows(&self, before_ms: i64) -> Result<Stranded, MetaError> {
+        let stale = |entry: &LiveEntry| matches!(entry, LiveEntry::Shadow { non_stealable: Some(at), .. } if *at < before_ms);
+        {
+            let r = self.db.read_tx();
+            if counter_get(&r, &self.local, KV_SPEC_LIVE_COUNT)? == 0 {
+                return Ok(Stranded::default());
+            }
+            let floor = counter_get(&r, &self.local, KV_SPEC_FLOOR)?;
+            let mut any = false;
+            for guard in r.range(&self.spec_live, seq_key(floor)..) {
+                let (_, v) = guard.into_inner()?;
+                let entry: LiveEntry = postcard::from_bytes(&v)?;
+                any |= stale(&entry);
+            }
+            if !any {
+                return Ok(Stranded::default());
+            }
+        }
+        let mut tx = self.db.write_tx();
+        let staged = UsageTracker::staging();
+        let stranded = strand_tx(&mut tx, self, &staged, stale, true, false, |_| false)?;
+        if !stranded.any() {
+            return Ok(stranded);
+        }
+        let from = journal_from(&tx, self)?;
+        compact_tx(&mut tx, self, from)?;
+        let (bytes, files) = staged.raw_delta();
+        adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
+        tx.commit()?;
+        self.report_rolled_back();
+        staged.drain_into(self.usage_tracker());
+        Ok(stranded)
     }
 
     /// The replay queue as a [`QueueSnapshot`], decoded once per

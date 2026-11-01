@@ -178,6 +178,22 @@ impl Core {
                 }
             }
         }
+        // Plan 46 M0.2 review (R7): a requester's shadow of a non-stealable
+        // answer lives until the rid's outcome reaches the log; if its
+        // owner's row never does, it is rolled back and replayed after the
+        // bound (`drop_held_await_ms`).
+        if replica.has_outstanding_speculation() {
+            let cutoff = now.wall.0 - self.cfg.drop_held_await() as i64;
+            if let Ok(stranded) = replica.strand_stale_shadows(cutoff) {
+                if stranded.any() {
+                    self.stats.speculation_rolled_back +=
+                        (stranded.shadows + stranded.hints) as u64;
+                    self.stats.stale_non_stealable_shadows += stranded.shadows as u64;
+                    self.note_committed_stranded(&stranded);
+                    replica.clear_streamed();
+                }
+            }
+        }
         let queued = match replica.pending_replays() {
             Ok(q) => q,
             Err(error) => {

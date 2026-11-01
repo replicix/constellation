@@ -50574,4 +50574,55 @@ mod await_retry {
             "the waiting node asked for the lease: {out:?}"
         );
     }
+
+    /// Review item 6: a non-stealable shadow whose owner's row never reaches
+    /// the log (its journal lost, the node retired) does not live for ever:
+    /// after the bound (`drop_held_await_ms`) the drain rolls it back and
+    /// queues the rid for replay here.
+    #[test]
+    fn a_non_stealable_shadow_is_stranded_after_the_bound() {
+        let (mut holder, mut requester) = pair();
+        requester.core.epoch.open = true;
+        let rid = requester.rid(1);
+        let out = requester.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: requester.create("s"),
+            tag: Default::default(),
+        });
+        let sent = sends(&out);
+        let [(1, request)] = sent.as_slice() else {
+            panic!("expected one forward to node 1: {sent:?}")
+        };
+        let answer = holder.step_archived(Event::Peer {
+            from: 2,
+            msg: (*request).clone(),
+        });
+        let mut reply = sends(&answer)
+            .into_iter()
+            .find(|(to, m)| *to == 2 && matches!(m, PeerMsg::MutateReply { .. }))
+            .expect("a reply")
+            .1
+            .clone();
+        if let PeerMsg::MutateReply { committed, .. } = &mut reply {
+            *committed = false;
+        }
+        requester.step(Event::Peer {
+            from: 1,
+            msg: reply,
+        });
+        assert!(requester.meta.has_outstanding_speculation());
+        requester.core.cfg.drop_held_await_ms = 5_000;
+        // Inside the bound: kept.
+        requester.advance(4_000);
+        drain(&mut requester);
+        assert!(requester.meta.has_outstanding_speculation());
+        assert_eq!(requester.meta.pending_replays().unwrap().len(), 0);
+        // Past it: rolled back and queued by rid.
+        requester.advance(2_000);
+        drain(&mut requester);
+        assert_eq!(requester.core.stats.stale_non_stealable_shadows, 1);
+        assert!(!requester.meta.has_outstanding_speculation());
+        assert_eq!(requester.meta.pending_replays().unwrap()[0].rid, rid);
+    }
 }

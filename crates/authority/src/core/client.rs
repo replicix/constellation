@@ -1450,7 +1450,8 @@ impl Core {
                 };
                 let answer = (
                     committed,
-                    self.answered_non_stealable(committed, gen, replica),
+                    self.answered_non_stealable(committed, gen, replica)
+                        .then_some(now.wall.0),
                 );
                 match replica.install_shadow(rid, epoch, gen, &op, &tag, &records, answer) {
                     Ok(true) => {

@@ -150,7 +150,7 @@ pub trait Replica {
         op: &MutateOp,
         tag: &LockTag,
         records: &[LogRecord],
-        answer: (bool, bool),
+        answer: (bool, Option<i64>),
     ) -> Result<bool, MetaError>;
     /// The pre-S3 stream installed `rid`'s transaction here already:
     /// adopt it as this node's own op (`Meta::adopt_streamed`).
@@ -205,6 +205,11 @@ pub trait Replica {
     /// voided here (`SessionState::void_cut`).
     fn void_cut(&self, gen: u64) -> Option<u64>;
     fn pending_replays(&self) -> Result<Vec<StrandedOp>, MetaError>;
+    /// Plan 46 M0.2 review (R7): strand the shadows of non-stealable
+    /// answers installed before `before_ms` (wall): the owner's row has not
+    /// reached the log in the bound, so it may never (its journal lost, the
+    /// node retired). Rolled back and queued for replay like any strand.
+    fn strand_stale_shadows(&self, before_ms: i64) -> Result<Stranded, MetaError>;
     /// The replay queue decoded once per generation of the queue, with
     /// each entry's keys (`Meta::queue_snapshot`): what the park rules ask.
     fn queue_snapshot(
@@ -916,7 +921,7 @@ impl Replica for Meta {
         op: &MutateOp,
         tag: &LockTag,
         records: &[LogRecord],
-        answer: (bool, bool),
+        answer: (bool, Option<i64>),
     ) -> Result<bool, MetaError> {
         Meta::install_shadow_answered(self, rid, epoch, gen, op, tag, records, answer)
     }
@@ -979,6 +984,10 @@ impl Replica for Meta {
         &self,
     ) -> Result<std::sync::Arc<constellation_meta::QueueSnapshot>, MetaError> {
         Meta::queue_snapshot(self)
+    }
+
+    fn strand_stale_shadows(&self, before_ms: i64) -> Result<Stranded, MetaError> {
+        Meta::strand_stale_shadows(self, before_ms)
     }
 
     fn pending_replays(&self) -> Result<Vec<StrandedOp>, MetaError> {
