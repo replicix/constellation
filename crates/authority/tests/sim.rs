@@ -7142,6 +7142,8 @@ struct OracleTotals {
     i2: usize,
     i2c: usize,
     i4: usize,
+    /// Plan 43 C2: of `i4`, settled `EIO`s whose rid completed.
+    i4_settled: usize,
     i5: usize,
     seeds_with: [u64; 7],
     unmapped: usize,
@@ -7292,6 +7294,7 @@ impl OracleTotals {
         self.i2 += r.identity_copies;
         self.i2c += r.non_verbatim;
         self.i4 += r.late_landings;
+        self.i4_settled += r.settled_landings;
         self.i5 += r.non_lone_rollbacks;
         for (i, n) in [
             uncommitted,
@@ -7372,8 +7375,8 @@ impl OracleTotals {
              rebuilds={}/{} (in {} seeds) max-backups={}; acks by class {:?}; \
              i1-mismatched={mismatched} {:?} (in {} seeds) unverified-relays={} (in {} seeds) \
              class-mismatch={} unsourced={} unjournaled-landed={}; settles \
-             (sent/abandoned/late-success/local/unsettled-eio) {:?}; cores' sequenced answers by \
-             class {:?}",
+             (sent/abandoned/late-success/local/unsettled-eio) {:?} i4-settled={}; cores' \
+             sequenced answers by class {:?}",
             self.seeds,
             self.uncommitted,
             self.seeds_with[0],
@@ -7400,6 +7403,7 @@ impl OracleTotals {
             self.unsourced,
             self.unjournaled_landed,
             self.settles,
+            self.i4_settled,
             constellation_authority::core::AckClass::NAMES.iter().zip(self.claimed).collect::<Vec<_>>()
         );
         eprintln!(

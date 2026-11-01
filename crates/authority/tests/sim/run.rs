@@ -1195,6 +1195,10 @@ pub struct Report {
     pub non_verbatim: usize,
     /// I4: in-doubt rids that landed after an op invoked later.
     pub late_landings: usize,
+    /// Plan 43 C2: of those, a settled `EIO`'s rid the log completes
+    /// (`check::no_settled_landing`); the rest are unsettled ones landing
+    /// late (I4's isolated-requester exception when it is one).
+    pub settled_landings: usize,
     /// I5: acknowledged, rolled-back ops whose answer was not Lone.
     pub non_lone_rollbacks: usize,
     /// Plan 43 C2 (§5.3): shadows and hints installed for an answer not
@@ -5184,6 +5188,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.identity_copies_ungated = found.i2_ungated.len();
     report.non_verbatim = found.i2c.len();
     report.late_landings = found.i4.len();
+    report.settled_landings = found.i4.iter().filter(|m| m.starts_with("I4: rid")).count();
     report.non_lone_rollbacks = found.i5.len();
     {
         let ord = std::sync::atomic::Ordering::Relaxed;

@@ -484,6 +484,7 @@ pub fn outcome_kind(outcome: &MutateOutcome) -> Option<OutcomeKind> {
         MutateOutcome::Exists { .. } => Some(OutcomeKind::Exists),
         MutateOutcome::Conflict { .. } => Some(OutcomeKind::Conflict),
         MutateOutcome::LockLapsed => Some(OutcomeKind::LockLapsed),
+        MutateOutcome::Abandoned => Some(OutcomeKind::Abandoned),
         // `Busy`, `NotHolder`, `Held`: not an answer.
         _ => None,
     }
@@ -496,6 +497,9 @@ pub enum OutcomeKind {
     Exists,
     Conflict,
     LockLapsed,
+    /// Plan 43 C2 (§5.3 item 5): settled — refused for good
+    /// (`Refused { rid, ABANDONED_CODE }`); the client hears `EIO`.
+    Abandoned,
 }
 
 impl OutcomeKind {
@@ -506,13 +510,15 @@ impl OutcomeKind {
             OutcomeKind::Exists => "exists".into(),
             OutcomeKind::Conflict => "conflict".into(),
             OutcomeKind::LockLapsed => "lock-lapsed".into(),
+            OutcomeKind::Abandoned => "abandoned".into(),
         }
     }
 
     /// The outcome record the sequencer journals for this answer: `None`
     /// for a completion (`Completed`), `Some(code)` for a refusal
     /// (`Refused { code }`; an `Exists` hint is `EEXIST`, a conflict
-    /// `ESTALE`, a lapsed grant `ENOLCK`: `core::client::LAPSED_CODE`).
+    /// `ESTALE`, a lapsed grant `ENOLCK`: `core::client::LAPSED_CODE`, a
+    /// settled op `ECANCELED`: `ABANDONED_CODE`).
     pub fn record_code(&self) -> Option<Code> {
         match self {
             OutcomeKind::Ok => None,
@@ -520,6 +526,7 @@ impl OutcomeKind {
             OutcomeKind::Exists => Some(Code::Exists),
             OutcomeKind::Conflict => Some(Code::Stale),
             OutcomeKind::LockLapsed => Some(Code::NoLock),
+            OutcomeKind::Abandoned => Some(constellation_authority::ABANDONED_CODE),
         }
     }
 
@@ -536,6 +543,7 @@ impl OutcomeKind {
             OutcomeKind::Exists => "exists-hint".into(),
             OutcomeKind::Conflict => "conflict".into(),
             OutcomeKind::LockLapsed => "lock-lapsed".into(),
+            OutcomeKind::Abandoned => "abandoned".into(),
         }
     }
 }
@@ -1401,6 +1409,9 @@ pub fn end_of_run(
     // I4.
     let invokes = o.invokes.lock().unwrap().clone();
     f.i4 = super::check::no_late_landing(in_doubt, &invokes, log).1;
+    // Plan 43 C2 (§7.1 item 6): a settled answer promises the op never
+    // takes effect: no completion of the rid in the log, wherever it lands.
+    f.i4.extend(super::check::no_settled_landing(&acks, log));
     // I5: acknowledged OK, not as a Lone answer, and rolled back after.
     // (A rollback before the answer is not of it: a lone node's row rolled
     // back by its deposition, then its replay answered by the group.)
@@ -2535,6 +2546,37 @@ mod tests {
             super::super::check::no_late_landing(&in_doubt, &invokes, &log).0,
             0
         );
+    }
+
+    /// Plan 43 C2 (§7.1 item 6): a settled answer (`Abandoned`, to a client)
+    /// whose rid the log completes — anywhere, not just after a later op —
+    /// is an I4 violation; a sequencer's `Abandoned` reply to a requester is
+    /// not the client's answer. Fails on the C0 oracle: no such check.
+    #[test]
+    fn i4_a_settled_eio_whose_rid_completes_is_a_violation() {
+        let (r1, r2) = (rid(1, 1), rid(1, 2));
+        let entry = |rid: Rid, reply: bool| AckEntry {
+            node: 1,
+            rid,
+            tick: 3,
+            at_ms: 9_000,
+            kind: OutcomeKind::Abandoned,
+            reply,
+            relay_from: None,
+            claimed: None,
+            judged: None,
+        };
+        let acks = vec![entry(r1, false), entry(r2, true)];
+        let log = log_with(seg(1, &[]), &[(r1, (5, 0)), (r2, (3, 0))]);
+        let why = super::super::check::no_settled_landing(&acks, &log);
+        assert_eq!(why.len(), 1, "{why:?}");
+        assert!(
+            why[0].contains("I4: rid") && why[0].contains("answered Abandoned"),
+            "{why:?}"
+        );
+        // Not in the log: settled indeed.
+        let log = log_with(seg(1, &[]), &[(r2, (3, 0))]);
+        assert!(super::super::check::no_settled_landing(&acks, &log).is_empty());
     }
 
     #[test]

@@ -334,6 +334,26 @@ pub fn check_in_doubt_answers(
     Ok(())
 }
 
+/// Plan 43 C2 (§5.3 item 5, the coder spec's §7.1 item 6): a client told its
+/// op was settled (`Abandoned`, the settled `EIO`) for a rid the log
+/// completes, at any position: "failed" turned out to mean "not yet". (The
+/// unsettled `EIO`, `InDoubt`, keeps [`no_late_landing`]'s weaker check.)
+/// One description per rid.
+pub fn no_settled_landing(acks: &[super::oracle::AckEntry], oracle: &Oracle) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    acks.iter()
+        .filter(|a| !a.reply && a.kind == super::oracle::OutcomeKind::Abandoned)
+        .filter(|a| seen.insert(a.rid))
+        .filter_map(|a| {
+            let at = oracle.completed_at.get(&a.rid)?;
+            Some(format!(
+                "I4: rid {:?} answered Abandoned on node {} at t={} ms but completed at {at:?}",
+                a.rid, a.node, a.at_ms
+            ))
+        })
+        .collect()
+}
+
 /// Plan 43 I4 `unacked_fails_never_lands_late`: a client told `EIO` (the
 /// first in-doubt answer for the rid) for an op that then lands in the log
 /// after an op its node invoked later — "failed" turned out to mean "not
