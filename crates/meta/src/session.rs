@@ -300,13 +300,16 @@ impl KeySet {
         }
     }
 
-    /// A placeholder's keys (`AwaitRetry`): the dentries and inodes the
-    /// dropped row touched, the directories it changed among them (as
-    /// `from_op` counts a name's parent).
+    /// A placeholder's keys (`AwaitRetry`): the dentries and exclusive
+    /// inodes the dropped row touched.
     pub fn from_touch_set(t: &TouchSet) -> KeySet {
+        // The shared directories are the parents of the names: a listing of
+        // one is waited for through the names (`touches` of `Dir`), but a
+        // read of another name in it, or of its own attributes, does not
+        // wait for a row that changes them only by a commutative merge.
         KeySet {
             dentries: t.dentries.iter().cloned().collect(),
-            inos: t.inos.iter().chain(t.shared.iter()).copied().collect(),
+            inos: t.inos.iter().copied().collect(),
         }
     }
 

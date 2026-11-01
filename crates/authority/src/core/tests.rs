@@ -50394,4 +50394,48 @@ mod await_retry {
             "the create vanished"
         );
     }
+
+    /// Review MUST 1 (b): with delegation on, an own op was held for every
+    /// own replay queued ahead of it whatever its keys
+    /// (`own_replays_unsettled_ahead_of`). A replay the drain holds behind a
+    /// placeholder (R2) can wait for the bound, so an unrelated own create
+    /// after a drop waited for it too — until its client deadline. It waits
+    /// now only for the entries it shares a key with.
+    #[test]
+    fn an_unrelated_own_op_is_not_held_for_replays_waiting_behind_a_placeholder() {
+        let (mut h, broken) = holder_with_a_seed();
+        assert!(h.core.cfg.delegation);
+        let (p, d) = (rid_of(2, 1), rid_of(1, 7));
+        exec_as(&h, RowClass::Archive, p, &rename_in_root("broken", "a"));
+        exec_as(&h, RowClass::Lone, d, &unlink_in_root("a"));
+        drop_held(&h, broken);
+        // The unlink is held behind the placeholder (the requester is not
+        // retrying).
+        ticks(&mut h, 2);
+        assert_eq!(h.meta.completed_outcome(d).unwrap(), None);
+
+        let other = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let out = h.step_archived(Event::Submit {
+            policy: Policy::Client,
+            rid: h.rid(10),
+            op: create_in(ROOT_INO, "unrelated", other),
+            tag: Default::default(),
+        });
+        assert!(
+            matches!(
+                replies(&out).first().map(|r| r.1),
+                Some(ClientReply::Outcome(MutateOutcome::Accepted { .. }))
+            ),
+            "an unrelated own op was held for the queue: {out:?}"
+        );
+        // One that shares a key with the held entry still waits for it.
+        let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let out = h.step_archived(Event::Submit {
+            policy: Policy::Client,
+            rid: h.rid(11),
+            op: create_in(ROOT_INO, "a", ino),
+            tag: Default::default(),
+        });
+        assert!(replies(&out).is_empty(), "{out:?}");
+    }
 }

@@ -949,6 +949,15 @@ impl Core {
             return self.replay.in_flight.is_some();
         };
         let own = rid.and_then(|rid| queue.iter().find(|s| s.rid == rid).map(|s| s.queue_seq));
+        // Plan 46 M0.2 review (MUST 1 b): an entry the drain holds behind a
+        // placeholder (R2) can wait for the placeholder's bound; an op
+        // waits for it only if it shares a key with it.
+        let held = super::replay::held_behind_placeholders(&queue, replica);
+        let keys = rid.and_then(|rid| self.clients.get(&rid)).map(|c| &c.keys);
+        let held_unrelated = |s: &constellation_meta::StrandedOp| {
+            held.contains(&s.queue_seq)
+                && keys.is_some_and(|k| !super::replay::entry_keys(s, replica).overlaps(k))
+        };
         if self
             .replay
             .in_flight
@@ -962,7 +971,7 @@ impl Core {
         let table = replica.delegation_table();
         queue
             .iter()
-            .any(|s| self.is_unsettled_replay_ahead(s, own, &table))
+            .any(|s| self.is_unsettled_replay_ahead(s, own, &table) && !held_unrelated(s))
     }
 
     /// The hold's rule for one queue entry: an op whose own entry has

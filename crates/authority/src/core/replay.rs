@@ -1218,6 +1218,32 @@ pub(super) fn entry_keys(
     keys
 }
 
+/// The `queue_seq`s of the entries the drain holds behind a placeholder
+/// (R2): not refused, not settled in the log, on a key a placeholder ahead
+/// of them (or an entry held for one) touches.
+pub(super) fn held_behind_placeholders(
+    queue: &[StrandedOp],
+    replica: &dyn Replica,
+) -> std::collections::BTreeSet<u64> {
+    let mut held = std::collections::BTreeSet::new();
+    if !queue.iter().any(|q| q.is_await_retry()) {
+        return held;
+    }
+    let mut behind = constellation_meta::TouchSet::default();
+    for e in queue {
+        if completed_as_outcome(replica, e.rid, 0).is_some() {
+            continue;
+        }
+        if let Some(p) = &e.await_retry {
+            absorb_keys(&mut behind, &p.keys);
+        } else if e.refused.is_none() && overlaps_queue_keys(&behind, e, replica) {
+            absorb_keys(&mut behind, &entry_keys(e, replica));
+            held.insert(e.queue_seq);
+        }
+    }
+    held
+}
+
 /// Whether `entry` shares a key with `behind` and is not already settled
 /// in the log (a settled entry is forgotten, not held).
 fn overlaps_queue_keys(

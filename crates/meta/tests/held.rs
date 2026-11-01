@@ -1106,3 +1106,50 @@ fn the_fast_path_refuses_an_op_on_keys_the_queue_holds() {
     );
     assert!(meta.root_fast_path(&chmod(other, 0o700)).is_some());
 }
+
+/// Review MUST 1 (b): a read waits for a placeholder's names and its
+/// directory's listing, not for the shared parent's attributes or for a
+/// sibling name.
+#[test]
+fn a_read_of_a_sibling_under_a_placeholders_shared_parent_is_not_blocked() {
+    use constellation_meta::ReadKey;
+    use constellation_meta::RowClass::Archive;
+    let (meta, broken) = node_one_with_a_seed();
+    let rename = MutateOp::Rename {
+        parent: ROOT_INO,
+        name: "broken".into(),
+        new_parent: ROOT_INO,
+        new_name: "moved".into(),
+        noreplace: false,
+    };
+    exec_as(&meta, Archive, rid_of(7, 1), &rename);
+    let create = MutateOp::Create {
+        parent: ROOT_INO,
+        name: "y".into(),
+        ino: 1 << 40,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    exec_as(&meta, Archive, rid_of(8, 1), &create);
+    meta.drop_held(broken, 1).unwrap();
+    let queue = meta.pending_replays().unwrap();
+    assert_eq!(
+        queue.iter().filter(|q| q.is_await_retry()).count(),
+        2,
+        "{queue:?}"
+    );
+    assert!(meta.replay_touches(&[ReadKey::Dentry(ROOT_INO, "y".into())]));
+    assert!(
+        meta.replay_touches(&[ReadKey::Dir(ROOT_INO)]),
+        "the listing changes"
+    );
+    assert!(
+        !meta.replay_touches(&[ReadKey::Dentry(ROOT_INO, "sibling".into())]),
+        "a sibling name"
+    );
+    assert!(
+        !meta.replay_touches(&[ReadKey::Ino(ROOT_INO)]),
+        "the shared parent's own attributes"
+    );
+}
