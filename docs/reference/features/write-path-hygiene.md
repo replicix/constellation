@@ -121,9 +121,11 @@ through it.
 | `inodes[]` | each inode with unrecoverable chunks: `ino`, `path`, `missing_chunks` (hex), `seeds` |
 | `deferred` | transactions waiting (not held) for a chunk still uploading — this node's, or one another node forwarded as pending |
 | `remote[]` | each chunk another node is expected to upload: `ino`, `path`, `node`, `chunk` (hex), `age_s` |
+| `awaiting[]` | each row of another node that `repair drop-held` rolled back and whose answer was never given, waiting for its requester's retry (see below): `node`, `rid`, `age_s`, `keys` |
 
 The web UI shows a red "held" line with the paths, and
-`constellation_held_transactions` is exported as a metric.
+`constellation_held_transactions` (and `constellation_held_awaiting_retry`)
+are exported as metrics.
 
 ### `constellation repair drop-held`
 
@@ -137,9 +139,11 @@ Discards an inode's held records:
   `<dir>/.constellation-conflict/<name>@<node>-<ts>-<seq>`, full length, with
   the lost chunks as holes (zeros); a spilled manifest's copy keeps only
   the length;
-- every held transaction that depended on it is rolled back and replayed
-  by its request id, exactly like a deposed holder's journal; a replay
-  the namespace no longer admits becomes a conflict copy as well;
+- every held transaction that depended on it is rolled back, and this
+  node's own are replayed by their request ids, exactly like a deposed
+  holder's journal; a replay the namespace no longer admits becomes a
+  conflict copy as well. Another node's row is not replayed here (see
+  below);
 - the unrecoverable pending uploads are removed.
 
 The copies and replays are made by the replay drain within a fraction of
@@ -157,6 +161,39 @@ speculation — its requester's shadow, or a copy streamed ahead of the
 log — rolls it back when the refusal arrives, and a retry by request id
 is answered refused everywhere. Nothing is lost silently: the copy is
 the artifact.
+
+### Another node's rows
+
+An operator's drop re-executes only this node's own rows. A row of another
+node that the drop rolled back and whose answer was never given (a lone
+sequencer answers another node only once the log carries its row, and a
+held row never ships) belongs to its requester: that node's client entry
+retries the request id until its deadline, and a second copy queued here
+would run twice. It stays in the replay queue instead, in the place it had,
+as a *placeholder* (`status.held.awaiting[]`): its request id, the keys it
+touched, no op to run.
+
+- What depends on it waits. The replay drain holds every later entry on
+  those keys behind the placeholder (entries on other keys run), and an op
+  that arrives from another node on those keys waits for the queue entries
+  ahead of it, answered `Held` meanwhile.
+- The requester's retry executes in the dropped row's place — after the
+  entries before it, before the ones after — and resolves the placeholder;
+  what waited goes on. The abort of the answer that was parked for the
+  dropped row (`Busy`) is what sends the retry at once.
+- If the retry never comes (the requester is gone, or gave up and settled),
+  after `CONSTELLATION_DROP_HELD_AWAIT_MS` (default twice the lease TTL; the
+  clock stands still while a continuation epoch refuses writes) the
+  sequencer in force settles the request id: `Refused { rid, ECANCELED }`
+  in the log, committed like any refusal, counted in
+  `status.ack.await_retry_settled`. The op never takes effect (a late retry
+  is answered as the settled `EIO`), and the dependents go on: a success
+  on the state without the dropped row, or a refusal that is a conflict copy
+  for an acknowledged op of this node.
+
+A row whose answer may have been given (its backup group's, an epoch hold's)
+keeps its replayable copy: its requester heard the answer and is not
+retrying.
 
 ### A chunk only a departed node had
 

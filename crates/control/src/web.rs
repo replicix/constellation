@@ -563,6 +563,11 @@ pub fn render_metrics(status: &StatusReport, sched: Option<&SnapSchedReport>) ->
         status.held.transactions
     );
     gauge!(
+        "constellation_held_awaiting_retry",
+        "Rows of other nodes `repair drop-held` rolled back that wait for their requester's retry.",
+        status.held.awaiting.len()
+    );
+    gauge!(
         "constellation_inbox_submitted_ops_total",
         "Mutations this node forwarded through the S3 inbox (plan 30 M13).",
         status.inbox.submitted_ops

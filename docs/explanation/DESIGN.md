@@ -1874,7 +1874,7 @@ successor, bounded (§6, Failover), and a blocking one keeps retrying.
 roll back, refuse and let the requesters retry with
 [plan 46](../plans/v1/wip/46-committed-or-final.md) stage 2
 ([ADR-40](DECISIONS.md#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay));
-until then plan 43 C2g′'s placeholders order them.*
+until then plan 43 C2g′'s placeholders order them (below).*
 
 A pending upload whose chunk is gone from the local cache (a disk fault,
 a manual deletion) cannot ever reach S3. It no longer blocks the node's
@@ -1885,6 +1885,20 @@ names such a chunk and every later transaction that touches the same keys
 turns a held manifest into a conflict copy with the lost chunks as holes
 and replays its dependents by rid
 ([Write-path hygiene](../reference/features/write-path-hygiene.md#held-records-statusheld)).
+
+An operator's drop re-executes only this node's own rows. Another node's
+unanswered row — one whose answer was never given, because its answer waits
+for a log the held rows block — is not queued as a second copy beside its
+requester's retry (two live copies of one request id): it stays in the replay
+queue as a *placeholder* in its journal place, with the keys it touched and no
+op. The replay drain holds every later entry on those keys behind it, an op
+arriving from another node waits for the queue entries ahead of it, and the
+requester's retry executes in the dropped row's place; so that node's retry
+re-executes it, or, if the retry never comes, the sequencer in force
+settles the request id as abandoned after 2 × TTL (`Refused { rid,
+ABANDONED }`, `drop_held_await_ms`) and what waited goes on. An answer
+that may have been given (a group's, an epoch hold's) keeps its replayable
+copy: its requester is not retrying it.
 
 ### What an S3 outage blocks
 

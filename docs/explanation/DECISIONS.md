@@ -1785,7 +1785,14 @@ retry answered from an earlier execution waits for that execution's own row
 in the log, not for the journal's tip (rows ship past a deferred one); a row
 of a continuation epoch's hold is non-stealable only while the hold lasts;
 and an answer parked for the log whose row was rolled back meanwhile (`repair
-drop-held`) is aborted, not released, when the log covers its seq. In a
+drop-held`) is aborted, not released, when the log covers its seq (C2g′: at
+once, when the drain finds the dropped row's placeholder). An operator's
+drop re-executes only this node's own rows; another node's unanswered row
+is re-executed by that node's retry, in the dropped row's place, or
+abandoned after 2 × TTL (C2g′, plan 46 M0.2: the row stays in the replay
+queue as a placeholder, the drain holds what depends on it behind it, an op
+arriving on its keys waits behind the queue, and the bound settles the rid
+with C2g's record). In a
 continuation epoch's hold an answer to another node is the hold's
 (non-stealable, uncommitted: a non-stealable answer is never said to be
 committed, the maintainer's decision), its row re-tagged so. A node answers its own clients alone only while it is a

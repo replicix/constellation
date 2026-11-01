@@ -371,6 +371,20 @@ always a prefix of the durable log plus speculation it can take back:
   paths that apply a durable transaction over speculation of their own,
   such as a root appending a delegate's transaction over its shadow of
   the same op.
+- **A dropped row of another node is a placeholder.** `repair drop-held`
+  rolls back the held rows and everything on their keys. This node's own are
+  replayed by rid as below. Another node's row whose answer was never given
+  (its answer waited for a log the held rows block) is not: its requester
+  retries it, so it stays in the queue as a placeholder (its request id, its
+  keys, no op), the drain holds the entries behind it on those keys, an op
+  arriving on them from another node waits for the queue entries ahead of it
+  (the retry for those before its own place only: the queue is a total order,
+  so no wait can cycle), and the retry executes in the dropped row's place.
+  An operator's drop re-executes only this node's own rows; another node's
+  unanswered row is re-executed by that node's retry, in the dropped row's
+  place, or abandoned after 2 × TTL (`Refused { rid, ECANCELED }` journaled
+  by the sequencer in force, `status.ack.await_retry_settled`). See
+  [write-path hygiene](write-path-hygiene.md#another-nodes-rows).
 - **Replay by rid.** Each stranded op is queued, in original order, and
   sent again with its original rid down the ordinary forward path to
   whoever holds the lease now; if a queued op cannot reach a holder for

@@ -33,6 +33,22 @@ pub fn status(meta: &Meta) -> constellation_control::proto::types::HeldStatus {
             age_s: (now_ms - r.enrolled_ms).max(0) as u64 / 1000,
         })
         .collect();
+    let awaiting = meta
+        .pending_replays()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|q| {
+            let placeholder = q.await_retry?;
+            Some(constellation_control::proto::types::AwaitingRetryStatus {
+                node: q.rid.node,
+                rid: format!("{}.{}.{}", q.rid.node, q.rid.incarnation, q.rid.seq),
+                age_s: (now_ms - placeholder.since_ms).max(0) as u64 / 1000,
+                keys: (placeholder.keys.dentries.len()
+                    + placeholder.keys.inos.len()
+                    + placeholder.keys.shared.len()) as u64,
+            })
+        })
+        .collect();
     constellation_control::proto::types::HeldStatus {
         transactions: summary.transactions,
         records: summary.records,
@@ -40,6 +56,7 @@ pub fn status(meta: &Meta) -> constellation_control::proto::types::HeldStatus {
         opaque: summary.opaque,
         deferred: summary.deferred,
         remote,
+        awaiting,
         inodes: inodes
             .into_iter()
             .map(

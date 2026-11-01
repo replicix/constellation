@@ -572,6 +572,40 @@
       ],
       "type": "object"
     },
+    "AwaitingRetryStatus": {
+      "description": "One dropped row of another node, waiting for its requester's retry.",
+      "properties": {
+        "age_s": {
+          "description": "Seconds since the row was dropped.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "keys": {
+          "description": "Dentries and inodes the dropped row touched: what its dependents\nwait behind.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "node": {
+          "description": "The requester (the node the dropped op came from).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rid": {
+          "description": "The op's request id, `node.incarnation.seq`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "node",
+        "rid",
+        "age_s",
+        "keys"
+      ],
+      "type": "object"
+    },
     "BrowseReadParams": {
       "description": "`browse.read`: `length: None` reads to end of file. The bytes arrive as\n`Chunk` frames.",
       "properties": {
@@ -3991,6 +4025,14 @@
     "HeldStatus": {
       "description": "Plan 30 §M4: records held back behind unrecoverable pending chunks.",
       "properties": {
+        "awaiting": {
+          "default": [],
+          "description": "Plan 46 M0.2: rows of other nodes that `repair drop-held` rolled back\nwhose answer was never given: each keeps its place in this node's\nreplay queue as a placeholder, waiting for its requester's retry\n(which executes it again in the dropped row's place) and holding\nwhat depends on it behind it. After `drop_held_await_ms` (default\ntwice the lease TTL) the sequencer in force settles the rid as\nabandoned (`ack.await_retry_settled`).",
+          "items": {
+            "$ref": "#/$defs/AwaitingRetryStatus"
+          },
+          "type": "array"
+        },
         "deferred": {
           "description": "Plan 30 §M7: transactions deferred (not held) because a chunk their\nmanifest names is still uploading; they ship once it is up.",
           "format": "uint64",

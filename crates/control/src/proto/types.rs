@@ -2202,6 +2202,29 @@ pub struct HeldStatus {
     /// them in S3. If the node is gone for good, `constellation repair
     /// drop-held <ino> --remote` drops them.
     pub remote: Vec<RemoteChunkStatus>,
+    /// Plan 46 M0.2: rows of other nodes that `repair drop-held` rolled back
+    /// whose answer was never given: each keeps its place in this node's
+    /// replay queue as a placeholder, waiting for its requester's retry
+    /// (which executes it again in the dropped row's place) and holding
+    /// what depends on it behind it. After `drop_held_await_ms` (default
+    /// twice the lease TTL) the sequencer in force settles the rid as
+    /// abandoned (`ack.await_retry_settled`).
+    #[serde(default)]
+    pub awaiting: Vec<AwaitingRetryStatus>,
+}
+
+/// One dropped row of another node, waiting for its requester's retry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AwaitingRetryStatus {
+    /// The requester (the node the dropped op came from).
+    pub node: u64,
+    /// The op's request id, `node.incarnation.seq`.
+    pub rid: String,
+    /// Seconds since the row was dropped.
+    pub age_s: u64,
+    /// Dentries and inodes the dropped row touched: what its dependents
+    /// wait behind.
+    pub keys: u64,
 }
 
 /// One chunk the sequencer waits for another node to upload.
