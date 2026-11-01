@@ -3287,11 +3287,8 @@ impl Core {
     /// lease path). Retries (`Busy`, a timeout, `NotHolder`) go on as the
     /// op's did until the second deadline.
     fn settle_route(&mut self, now: Now, rid: Rid, replica: &dyn Replica, out: &mut Vec<Action>) {
-        if let Some(epoch) = self.lease.new_mutation_epoch(now, &self.cfg) {
-            let outcome = self.resolve_in_doubt_then_execute(now, rid, epoch, replica, out);
-            self.finish(now, rid, outcome, replica, out);
-            return;
-        }
+        // (In `submit`'s order: this node as the op's delegate, a live
+        // delegate of its keys, this node as the root, the route.)
         let Some((op, deps, tag)) = self
             .clients
             .get(&rid)
@@ -3314,6 +3311,11 @@ impl Core {
                     }
                 }
             }
+        }
+        if let Some(epoch) = self.lease.new_mutation_epoch(now, &self.cfg) {
+            let outcome = self.resolve_in_doubt_then_execute(now, rid, epoch, replica, out);
+            self.finish(now, rid, outcome, replica, out);
+            return;
         }
         if let Some(c) = self.clients.get_mut(&rid) {
             c.phase = Phase::Backoff;
