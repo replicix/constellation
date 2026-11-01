@@ -49631,13 +49631,15 @@ mod await_retry {
 
     /// `n` drain ticks, 250 ms apart (the executions the drain starts
     /// finish in the same step, on a holder).
-    pub(super) fn ticks(h: &mut Harness, n: usize) {
+    pub(super) fn ticks(h: &mut Harness, n: usize) -> Vec<Action> {
+        let mut all = Vec::new();
         for _ in 0..n {
             h.advance(250);
-            drain(h);
+            all.extend(drain(h));
             // (The answers that wait for the archive leave when it lands.)
-            h.archive_lands();
+            all.extend(h.archive_lands());
         }
+        all
     }
 
     /// R1: the placeholder is no copy of its op. The drain does not
@@ -49783,5 +49785,158 @@ mod await_retry {
         assert!(h.meta.completed_outcome(d).unwrap().is_some());
         assert!(h.meta.lookup(ROOT_INO, "moved").unwrap().is_none());
         assert!(queue(&h).iter().all(|(n, _, _)| *n != 2));
+    }
+
+    /// R3: an op arriving from another node stands behind the queue: it
+    /// waits for the entries ahead of it that touch its keys — what was
+    /// acknowledged and is queued ran before it — and runs when the queue
+    /// has let go of them.
+    #[test]
+    fn a_forward_overlapping_a_queued_entry_is_parked() {
+        let (mut h, broken) = holder_with_a_seed();
+        let (p, d) = (rid_of(2, 1), rid_of(1, 7));
+        exec_as(&h, RowClass::Archive, p, &rename_in_root("broken", "moved"));
+        exec_as(&h, RowClass::Lone, d, &unlink_in_root("moved"));
+        drop_held(&h, broken);
+
+        // A new op of node 3 on the name the queue is about to rename and
+        // unlink: parked, not executed ahead of them.
+        let n3 = rid_of(3, 1);
+        let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let create = create_in(ROOT_INO, "moved", ino);
+        let out = forward_of(&mut h, 3, 30, n3, &create);
+        assert_eq!(reply_to(&out, 30), None, "answered, so executed: {out:?}");
+        assert_eq!(h.meta.completed_outcome(n3).unwrap(), None);
+        assert_eq!(h.core.stats.ops_parked_behind_queue, 1);
+        // An op on other keys is not held by the queue.
+        let other = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let out = forward_of(
+            &mut h,
+            3,
+            31,
+            rid_of(3, 2),
+            &create_in(ROOT_INO, "free", other),
+        );
+        assert!(
+            matches!(reply_to(&out, 31), Some(MutateOutcome::Accepted { .. })),
+            "{out:?}"
+        );
+
+        // The requester's retry of the dropped rename runs in its place; the
+        // queue's own unlink follows; then the parked create goes.
+        let out = forward_of(&mut h, 2, 32, p, &rename_in_root("broken", "moved"));
+        assert!(
+            matches!(reply_to(&out, 32), Some(MutateOutcome::Accepted { .. })),
+            "{out:?}"
+        );
+        assert_eq!(
+            h.meta.completed_outcome(n3).unwrap(),
+            None,
+            "still behind the unlink"
+        );
+        let out = ticks(&mut h, 3);
+        assert!(
+            matches!(reply_to(&out, 30), Some(MutateOutcome::Accepted { .. })),
+            "the parked create ran once the queue let go: {out:?}"
+        );
+        assert!(
+            h.meta.lookup(ROOT_INO, "moved").unwrap().is_some(),
+            "it landed after the unlink"
+        );
+        assert!(h.meta.lookup(ROOT_INO, "broken").unwrap().is_none());
+        assert!(queue(&h).iter().all(|(_, _, placeholder)| !placeholder));
+    }
+
+    /// R3: the retry of a dropped row executes where the row stood — after
+    /// the entries before it, which may still be queued when it arrives
+    /// (a retry is prompt: the abort of the parked answer sends it at
+    /// once). Executed ahead of them it would run on a state without their
+    /// effects and be refused, its refusal the rid's outcome.
+    #[test]
+    fn a_requesters_retry_executes_in_the_dropped_rows_place() {
+        let (mut h, broken) = holder_with_a_seed();
+        let (a, p, d) = (rid_of(1, 6), rid_of(2, 1), rid_of(1, 7));
+        exec_as(&h, RowClass::Lone, a, &rename_in_root("broken", "tmp"));
+        exec_as(&h, RowClass::Archive, p, &rename_in_root("tmp", "moved"));
+        exec_as(&h, RowClass::Lone, d, &unlink_in_root("moved"));
+        drop_held(&h, broken);
+        assert_eq!(queue(&h)[1..], [(1, 6, false), (2, 1, true), (1, 7, false)]);
+
+        // The retry arrives before the drain has replayed this node's own
+        // rename of the file ahead of it: it waits.
+        let out = forward_of(&mut h, 2, 40, p, &rename_in_root("tmp", "moved"));
+        assert_eq!(
+            reply_to(&out, 40),
+            None,
+            "ran ahead of the entry before it: {out:?}"
+        );
+        assert_eq!(h.meta.completed_outcome(p).unwrap(), None);
+        assert_eq!(h.core.stats.ops_parked_behind_queue, 1);
+
+        // The drain replays the rename; the retry follows at once, and the
+        // unlink behind it after that.
+        let out = ticks(&mut h, 4);
+        assert!(
+            matches!(reply_to(&out, 40), Some(MutateOutcome::Accepted { .. })),
+            "the retry: {out:?}"
+        );
+        assert_eq!(h.core.stats.replay_conflicts, 0);
+        assert!(
+            h.meta.lookup(ROOT_INO, "moved").unwrap().is_none(),
+            "the unlink ran last"
+        );
+        assert!(h.meta.lookup(ROOT_INO, "tmp").unwrap().is_none());
+        assert!(h.meta.lookup(ROOT_INO, "broken").unwrap().is_none());
+        assert!(h.meta.completed_outcome(d).unwrap().is_some());
+        assert_eq!(
+            queue(&h).len(),
+            1,
+            "only the seed's conflict copy is left: {:?}",
+            queue(&h)
+        );
+    }
+
+    /// R3, why it cannot deadlock: two remote requesters' placeholders
+    /// adjacent in the queue, the later one's retry arriving first. It
+    /// waits for the placeholder ahead of it; the earlier retry waits for
+    /// nothing behind its place (the later placeholder, the entry after
+    /// it), so it runs, resolves its placeholder and releases the later
+    /// retry. The queue is a total order and every wait goes to a strictly
+    /// smaller place, so there is no cycle to find; this is the shape in
+    /// which one would be looked for.
+    #[test]
+    fn the_park_rule_never_waits_on_an_entry_behind_the_op() {
+        let (mut h, broken) = holder_with_a_seed();
+        let (p1, p2, d) = (rid_of(2, 1), rid_of(3, 1), rid_of(1, 7));
+        exec_as(&h, RowClass::Archive, p1, &rename_in_root("broken", "a"));
+        exec_as(&h, RowClass::Archive, p2, &rename_in_root("a", "b"));
+        exec_as(&h, RowClass::Lone, d, &unlink_in_root("b"));
+        drop_held(&h, broken);
+        assert_eq!(queue(&h)[1..], [(2, 1, true), (3, 1, true), (1, 7, false)]);
+
+        // The later retry first: behind the earlier placeholder.
+        let out = forward_of(&mut h, 3, 50, p2, &rename_in_root("a", "b"));
+        assert_eq!(reply_to(&out, 50), None, "{out:?}");
+        // The earlier retry: nothing ahead of its place; nothing after it
+        // is waited for (not the parked retry, not the unlink).
+        let out = forward_of(&mut h, 2, 51, p1, &rename_in_root("broken", "a"));
+        assert!(
+            matches!(reply_to(&out, 51), Some(MutateOutcome::Accepted { .. })),
+            "the head of the queue waited for what stands behind it: {out:?}"
+        );
+        // Its placeholder resolved at once, so the later retry went on its
+        // heels, in the same step.
+        assert!(
+            matches!(reply_to(&out, 50), Some(MutateOutcome::Accepted { .. })),
+            "{out:?}"
+        );
+        assert_eq!(queue(&h)[1..], [(1, 7, false)]);
+        ticks(&mut h, 3);
+        assert!(
+            h.meta.lookup(ROOT_INO, "b").unwrap().is_none(),
+            "the unlink ran last"
+        );
+        assert!(h.meta.lookup(ROOT_INO, "a").unwrap().is_none());
+        assert_eq!(queue(&h).len(), 1, "{:?}", queue(&h));
     }
 }

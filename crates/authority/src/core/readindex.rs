@@ -218,6 +218,10 @@ struct Parked {
     /// Phase 2b: a delegate's `(gen, idx)` that must be on its backup or
     /// in an applied segment first.
     stream_need: Option<(u64, u64)>,
+    /// Plan 46 M0.2 (R3): an `ExecuteReply` parked behind the replay queue
+    /// — it executes once no entry ahead of it overlaps its keys
+    /// (`Core::queue_gate_blocks`), re-read at every release.
+    queue_gated: bool,
     since: WaitMs,
     what: ParkedWhat,
 }
@@ -675,6 +679,7 @@ impl Core {
                 durable,
                 deps,
                 stream_need: None,
+                queue_gated: false,
                 since: now.wait,
                 what,
             },
@@ -705,6 +710,7 @@ impl Core {
                 durable: None,
                 deps: None,
                 stream_need: Some((gen, idx)),
+                queue_gated: false,
                 since: now.wait,
                 what,
             },
@@ -838,6 +844,12 @@ impl Core {
     /// the write delegations first, or waits for `deps`); the requester
     /// is answered `Held` before its RPC times out and re-attaches.
     #[allow(clippy::type_complexity)]
+    /// Whether an op is parked behind the replay queue (plan 46 M0.2, R3).
+    pub(crate) fn queue_parks(&self) -> bool {
+        self.rd.parked.values().any(|p| p.queue_gated)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn park_exec_reply(
         &mut self,
         now: Now,
@@ -852,6 +864,7 @@ impl Core {
             constellation_meta::locks::LockTag,
             bool,
         ),
+        queue_gated: bool,
         out: &mut Vec<Action>,
     ) {
         self.stats.deleg_exec_parked += 1;
@@ -878,12 +891,11 @@ impl Core {
             Timer::HeldReply(id),
             out,
         );
-        if let Some(Parked {
-            what: ParkedWhat::ExecuteReply { held_timer, .. },
-            ..
-        }) = self.rd.parked.get_mut(&id)
-        {
-            *held_timer = Some(timer);
+        if let Some(parked) = self.rd.parked.get_mut(&id) {
+            parked.queue_gated = queue_gated;
+            if let ParkedWhat::ExecuteReply { held_timer, .. } = &mut parked.what {
+                *held_timer = Some(timer);
+            }
         }
     }
 
@@ -1768,6 +1780,13 @@ impl Core {
                         self.park_durable(j, p.what.to_remote(self.cfg.node_id), shipped)
                     })
                     && p.deps.as_ref().is_none_or(|d| replica.reaches_streams(d))
+                    && (!p.queue_gated
+                        || match &p.what {
+                            ParkedWhat::ExecuteReply { rid, op, .. } => {
+                                !self.queue_gate_blocks(*rid, op, replica)
+                            }
+                            _ => true,
+                        })
                     && p.stream_need.is_none_or(|(g, i)| {
                         match self.deleg_stream_state_cached(g, i, replica, &mut cache) {
                             super::delegate::StreamState::Committed => true,

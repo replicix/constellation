@@ -149,6 +149,13 @@ impl Core {
     /// after `replay_lease_fallback_ms` without progress this node asks
     /// for the lease itself, whose gate replays locally.
     pub(crate) fn on_drain_tick(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
+        self.drain_tick(now, replica, out);
+        // (Whatever the tick forgot, the ops parked behind the queue look
+        // again: plan 46 M0.2, R3.)
+        self.wake_queue_parks(now, replica, out);
+    }
+
+    fn drain_tick(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         // A holder never tails the later-epoch segment that would strand
         // speculation from an older tenure left on it: strand it here.
         if let Some(epoch) = self.lease.ship_epoch(now, &self.cfg) {
@@ -353,6 +360,92 @@ impl Core {
                 out,
             );
             return;
+        }
+    }
+
+    /// Plan 46 M0.2 (R3): whether an op arriving at this sequencer from
+    /// another node (a forward, an inbox op) must wait for the replay
+    /// queue: some entry *ahead of it* touches a key it touches.
+    ///
+    /// The queue is a total order (`StrandedOp::queue_seq`, the journal's
+    /// own order of the rolled-back rows). An op whose rid has an entry —
+    /// its requester's retry of a dropped row, whose entry is a placeholder
+    /// — stands at that entry's place: it waits for the entries before it
+    /// and for nothing after it, so it executes exactly where the dropped
+    /// row stood, on the state the rows before it leave. An op with no
+    /// entry (a new op) stands behind the whole queue: whatever was
+    /// acknowledged and is queued ran before it.
+    ///
+    /// **This cannot deadlock.** An op waits only for entries ahead of its
+    /// place (smaller `queue_seq`), and nothing in the queue waits for an
+    /// op arriving here except a placeholder, for the retry of its *own*
+    /// rid — which stands at its own place and so waits only for entries
+    /// before it again. The drain holds an entry only behind placeholders
+    /// ahead of it (R2). Every wait goes to a strictly smaller place or to
+    /// the retry of a smaller place's own placeholder, so the waits-for
+    /// relation has no cycle. The head of the queue waits for nothing:
+    /// its placeholder is resolved by its requester's retry (which waits
+    /// for nothing ahead of it), by the bound (R5), or by the drain
+    /// executing it. A refused entry (a conflict copy to make) never
+    /// executes on its keys and holds nothing; an entry whose rid the log
+    /// has settled is about to be forgotten and holds nothing.
+    ///
+    /// An op whose rid already has an outcome here is not held (the dedup
+    /// answers it), nor is a settle (it executes nothing). One counter read
+    /// when the queue is empty.
+    pub(crate) fn queue_gate_blocks(&self, rid: Rid, op: &MutateOp, replica: &dyn Replica) -> bool {
+        let Ok(queue) = replica.pending_replays() else {
+            return false;
+        };
+        if queue.is_empty() {
+            return false;
+        }
+        if replica.recent_outcome(rid).is_some() || completed_as_outcome(replica, rid, 0).is_some()
+        {
+            return false;
+        }
+        let own = queue.iter().find(|q| q.rid == rid).map(|q| q.queue_seq);
+        let mut keys = super::client::conflict_keys(op, replica);
+        keys.inos.extend(created_ino(op));
+        queue.iter().any(|ahead| {
+            own.is_none_or(|own| ahead.queue_seq < own)
+                && ahead.rid != rid
+                && ahead.refused.is_none()
+                && entry_keys(ahead, replica).overlaps(&keys)
+                && completed_as_outcome(replica, ahead.rid, 0).is_none()
+        })
+    }
+
+    /// Plan 46 M0.2 (R3): the queue changed (an entry was forgotten, or
+    /// executed): the ops parked behind it look again.
+    pub(crate) fn wake_queue_parks(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if self.queue_parks() {
+            self.complete_ready(now, replica, out);
+        }
+    }
+
+    /// Plan 46 M0.2 (R2): the retry of a dropped row executed here just
+    /// now (or was refused, or was settled): its placeholder is resolved
+    /// at once, not at the drain's next tick, and whatever waited behind it
+    /// looks again.
+    pub(crate) fn rid_executed_here(
+        &mut self,
+        now: Now,
+        rid: Rid,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Ok(queue) = replica.pending_replays() else {
+            return;
+        };
+        if let Some(entry) = queue.iter().find(|q| q.rid == rid && q.is_await_retry()) {
+            self.resolve_placeholder(entry, replica);
+            self.wake_queue_parks(now, replica, out);
         }
     }
 
@@ -570,13 +663,13 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let _ = out;
         if self.replay.copy_in_flight == Some(queue_seq) {
             self.replay.copy_in_flight = None;
         }
         if ok {
             let _ = replica.forget_replay(queue_seq);
             self.replay.copies.remove(&queue_seq);
+            self.wake_queue_parks(now, replica, out);
             return;
         }
         let retry = self.replay.copies.entry(queue_seq).or_insert(CopyRetry {
@@ -598,6 +691,19 @@ impl Core {
 
     /// The forward path answered (or gave up on) a replayed op.
     pub(crate) fn on_replay_outcome(
+        &mut self,
+        now: Now,
+        queue_seq: u64,
+        rid: Rid,
+        outcome: Option<MutateOutcome>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        self.replay_outcome(now, queue_seq, rid, outcome, replica, out);
+        self.wake_queue_parks(now, replica, out);
+    }
+
+    fn replay_outcome(
         &mut self,
         now: Now,
         queue_seq: u64,

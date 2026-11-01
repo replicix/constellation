@@ -66,6 +66,42 @@ impl Core {
         rid: Rid,
         op: MutateOp,
         acked_through: u64,
+        deps_applied: (Position, Seq),
+        tag: LockTag,
+        settle: bool,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        self.mutate_request(
+            now,
+            from,
+            req,
+            rid,
+            op,
+            acked_through,
+            deps_applied,
+            tag,
+            settle,
+            replica,
+            out,
+        );
+        // Plan 46 M0.2 (R2): the retry of a row `repair drop-held` rolled
+        // back has an outcome now (executed, refused or settled): its
+        // placeholder is done, and what waited behind it may go. (After the
+        // reply, not in the middle of it: an op released here executes
+        // after this one and is answered by itself.)
+        self.rid_executed_here(now, rid, replica, out);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mutate_request(
+        &mut self,
+        now: Now,
+        from: NodeId,
+        req: OpId,
+        rid: Rid,
+        op: MutateOp,
+        acked_through: u64,
         (deps, applied): (Position, Seq),
         tag: LockTag,
         settle: bool,
@@ -288,6 +324,7 @@ impl Core {
                             deps_wait,
                             from,
                             (req, rid, op, acked_through, tag, settle),
+                            false,
                             out,
                         );
                     }
@@ -302,6 +339,28 @@ impl Core {
                         Some(deps),
                         from,
                         (req, rid, op, acked_through, tag, settle),
+                        false,
+                        out,
+                    );
+                }
+                return;
+            }
+            // Plan 46 M0.2 (R3): behind the replay queue on its keys.
+            if !settle && self.queue_gate_blocks(rid, &op, replica) {
+                self.stats.ops_parked_behind_queue += 1;
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    ?rid,
+                    "a forwarded op overlaps an entry of the replay queue ahead of it: parked"
+                );
+                if req != OpId(0) {
+                    self.park_exec_reply(
+                        now,
+                        Default::default(),
+                        None,
+                        from,
+                        (req, rid, op, acked_through, tag, settle),
+                        true,
                         out,
                     );
                 }

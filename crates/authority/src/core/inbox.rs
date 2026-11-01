@@ -1499,6 +1499,17 @@ impl Core {
             {
                 return Err(Halt::Recall);
             }
+            // Plan 46 M0.2 (R3): behind the replay queue on its keys, as a
+            // forwarded op is (`Core::queue_gate_blocks`): the batch halts
+            // here and is polled again at the halted cadence.
+            if !op.settle {
+                if let Ok(decoded_op) = &decoded {
+                    if self.queue_gate_blocks(rid, decoded_op, replica) {
+                        self.stats.ops_parked_behind_queue += 1;
+                        return Err(Halt::Recall);
+                    }
+                }
+            }
             // M16: the op's `deps`, as a forward's: a delegate's stream
             // it depends on (a marker written after data the delegate
             // acknowledged) must be here before the op executes, or the
