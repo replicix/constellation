@@ -769,8 +769,14 @@ impl Core {
                 }
             }
             ParkedWhat::Finish { rid, .. } => {
+                // Executed here, never answered: in doubt from now on (a
+                // later execution must find its row, and the deadline must
+                // not take it for an op that never left this node — plan 43
+                // C2g's review: it settled such an op locally `Abandoned`
+                // while its row still landed).
                 if let Some(c) = self.clients.get_mut(&rid) {
                     c.phase = ClientPhase::WaitingLease;
+                    c.forwarded = true;
                 }
                 self.retry_or_lease(now, rid, replica, out);
             }

@@ -3169,7 +3169,16 @@ impl Core {
             self.finish_in_doubt(now, rid, replica, out);
             return;
         }
-        if !c.forwarded && c.attempts == 0 && c.inbox_keys.is_empty() {
+        // (Nothing of it executed here either: no row of the rid in this
+        // node's journal or `recent`, no `completed` row — a belt over
+        // `forwarded`, which every path that executes the op here sets.)
+        if !c.forwarded
+            && c.attempts == 0
+            && c.inbox_keys.is_empty()
+            && replica.recent_outcome(rid).is_none()
+            && replica.completed_outcome(rid).ok().flatten().is_none()
+            && !journal_carries_outcome(replica, rid)
+        {
             // Never sent anywhere, and nothing of it executed here: no copy
             // of it exists, so nothing can ever execute it. Settled here, by
             // no sequencer (no row records it: nothing to commit).

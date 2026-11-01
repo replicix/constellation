@@ -41228,6 +41228,55 @@ mod deleg_group {
         assert_eq!(h.core.stats.settles_refused, 1);
     }
 
+    /// C2g's review, SHOULD 1: this node's own system op, executed here and
+    /// parked for its group, whose park is aborted (`abort_park_busy`) and
+    /// re-routed: at its deadline it is not "an op that never left this
+    /// node" — its row is in the stream and may still land — so it is not
+    /// answered `Abandoned` on the spot. Fails on the parent: `Abandoned`,
+    /// by no sequencer, for an op that took effect.
+    #[test]
+    fn an_executed_own_op_whose_park_was_aborted_is_not_settled_locally() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        root_is_near(&mut h);
+        let rid = h.rid(1);
+        let ino = h.meta.allocate_ino(dir).unwrap();
+        let out = h.step(Event::Submit {
+            policy: Policy::System,
+            rid,
+            op: MutateOp::Create {
+                parent: dir,
+                name: "sys".into(),
+                ino,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            tag: Default::default(),
+        });
+        assert!(
+            client_answers(&out).is_empty(),
+            "waits for its group: {out:?}"
+        );
+        assert!(
+            h.meta.lookup(dir, "sys").unwrap().is_some(),
+            "executed here"
+        );
+        let ids = h.core.stream_parks_of(7);
+        assert_eq!(ids.len(), 1);
+        let mut out = Vec::new();
+        h.core.abort_park_busy(h.clk(), ids[0], &h.meta, &mut out);
+        let deadline = h.core.clients[&rid].deadline;
+        let out = h.step(Event::Timer { id: deadline });
+        assert!(
+            !replies(&out)
+                .iter()
+                .any(|(r, a)| *r == rid
+                    && matches!(a, ClientReply::Outcome(MutateOutcome::Abandoned))),
+            "answered Abandoned for an op that took effect: {out:?}"
+        );
+        assert_eq!(h.core.stats.settled_local, 0);
+    }
+
     /// Lone: nobody within reach, no backup recorded. Its own client is
     /// answered from its disk (`Lone`), other nodes' forwards wait for the
     /// root. Not lone (the root within the budget): its own client waits for
