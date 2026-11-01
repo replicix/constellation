@@ -12861,9 +12861,10 @@ fn a_probe_that_ignores_what_it_reads_is_caught() {
 /// held back after (`SLOW_READS`), so a read served before its backup seals it
 /// returns after the successor's CAS; a proof dated at the return (`ProbeMutant::DatedAtReturn`)
 /// would justify answers up to a window after that, past the successor's
-/// takeover, and the probe-dating oracle fails the run. Seeds 28, 54, 117 and
-/// 828 of 0 to 1,999 are four of the 5 that fail with the mutant; the design
-/// passes all 2,000. (28, 54, 609 and 828 before the lock-liveness fixes moved
+/// takeover, and the probe-dating oracle fails the run. Seeds 54, 247, 373 and
+/// 828 of 0 to 999 are four of the 5 that fail with the mutant; the design
+/// passes all of them. (28, 54, 117 and 828 before plan 43 C2g's review
+/// moved the schedules; 28, 54, 609 and 828 before the lock-liveness fixes moved
 /// the schedules; 40, 78 and 80 among them earlier, with one read per
 /// window: overlapping reads see a successor's CAS sooner, and the epoch's
 /// answers end there, mutant or not.) (Mutual exclusion does not fail with the mutant, even in
@@ -12871,7 +12872,7 @@ fn a_probe_that_ignores_what_it_reads_is_caught() {
 /// margin` beyond the window.)
 #[test]
 fn a_proof_dated_at_the_return_of_the_read_is_caught() {
-    for seed in [28u64, 54, 117, 828] {
+    for seed in [54u64, 247, 373, 828] {
         run_seed(seed, locks_core_stall_backup_long_slow_reads_config())
             .unwrap_or_else(|e| panic!("locks-core-stall-backup-long-slow-reads seed {seed}: {e}"));
         let e = run_seed(seed, locks_core_stall_backup_long_dated_at_return_config())

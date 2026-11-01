@@ -734,8 +734,8 @@ pub fn sim_core_config(node_id: NodeId, incarnation: u32) -> Config {
     c.forward_retries = 3;
     c.forward_backoff_ms = 150;
     c.acquire_deadline_ms = 12_000;
-    // Plan 43 C2: the op tries for 9 s, then settles for 3 s.
-    c.settle_window_ms = 3_000;
+    // (Plan 43 C2: `settle_window_ms` unset: the node derives half the TTL,
+    // as production's ratio — 3 s here; see `Driver`'s spawn.)
     c.acquire_retry_min_ms = 50;
     c.acquire_retry_max_ms = 1_000;
     c.handoff_request_timeout_ms = 2_000;
