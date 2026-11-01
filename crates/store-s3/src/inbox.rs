@@ -158,6 +158,11 @@ pub struct InboxOp {
     /// bound, so the time the holder said it had left proves nothing
     /// (plan 43 C7b, row 31).
     pub lock_tag: Vec<(u64, u64, i64, i64, u64, i64)>,
+    /// Plan 43 C2 (§5.3 item 5): a *settle* of `rid`, not an execution: the
+    /// holder's drain answers the rid's outcome if it has one, or journals
+    /// `Refused { rid, ABANDONED_CODE }`. Appended last, `INBOX_VERSION`
+    /// unchanged (§11 Q21 (e): a batch from an older binary is not read).
+    pub settle: bool,
 }
 
 /// One batch object. `epoch`, `node` and `n` are also the key; they are
@@ -1049,6 +1054,7 @@ mod tests {
             op: format!("op-{node}-{seq}").into_bytes(),
             deps: Vec::new(),
             lock_tag: Vec::new(),
+            settle: false,
         }
     }
 
@@ -1066,6 +1072,21 @@ mod tests {
 
     fn mem() -> InboxStore {
         InboxStore::new(Arc::new(InMemory::new()))
+    }
+
+    /// Plan 43 C2: a settle of a rid rides an inbox batch as a flag on the
+    /// op, after every other field.
+    #[test]
+    fn a_settle_op_round_trips() {
+        let mut settle = op(7, 1);
+        settle.settle = true;
+        let b = batch(3, 7, 2, vec![op(7, 0), settle]);
+        let back = InboxBatch::decode(&b.encode().unwrap()).unwrap();
+        assert_eq!(back, b);
+        assert_eq!(
+            back.ops.iter().map(|o| o.settle).collect::<Vec<_>>(),
+            vec![false, true]
+        );
     }
 
     #[test]
@@ -1124,6 +1145,7 @@ mod tests {
                     op: vec![0u8; 64 * 1024],
                     deps: Vec::new(),
                     lock_tag: Vec::new(),
+                    settle: false,
                 })
                 .collect(),
             wants_lease: false,
@@ -1471,6 +1493,7 @@ mod tests {
                             op: vec![1],
                             deps: Vec::new(),
                             lock_tag: Vec::new(),
+                            settle: false,
                         }],
                         1,
                     )
@@ -1495,6 +1518,7 @@ mod tests {
                             op: vec![2],
                             deps: Vec::new(),
                             lock_tag: Vec::new(),
+                            settle: false,
                         }],
                         1,
                     )
@@ -1801,6 +1825,7 @@ mod tests {
                 op: secret.clone(),
                 deps: Vec::new(),
                 lock_tag: Vec::new(),
+                settle: false,
             }],
         );
         s.put_batch(&b).await.unwrap();

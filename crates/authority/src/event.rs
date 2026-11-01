@@ -470,6 +470,14 @@ pub enum PeerMsg {
         applied: Seq,
         /// Plan 30 §M14 phase 2: the op's fencing token (`Event::Submit`).
         tag: LockTag,
+        /// Plan 43 C2 (§5.3 item 5): a *settle* of `rid`, sent once the op's
+        /// own attempts reached their deadline. The executor routes and
+        /// gates it exactly like the op it carries (it never waits for
+        /// `deps`: a refusal has no effect to order) and, where the op
+        /// would execute, answers the rid's outcome if it has one, or
+        /// journals `Refused { rid, ABANDONED_CODE }` and answers
+        /// `MutateOutcome::Abandoned` once that row is committed.
+        settle: bool,
     },
     /// The holder's answer. `base` is the first form of plan 30 §M6's
     /// position on replies: the log position the requester must have

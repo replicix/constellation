@@ -319,6 +319,9 @@ pub enum Payload {
         /// holds no lock (one byte). The executor refuses the op once a
         /// named grant is no longer live.
         lock_tag: Vec<(u64, u64, i64, i64, u64, i64)>,
+        /// Plan 43 C2: a settle of `rid` (answer its outcome, or refuse it
+        /// for good), not an execution (`PeerMsg::MutateRequest::settle`).
+        settle: bool,
     },
     /// Holder's answer: postcard-encoded `MutateOutcome`.
     MutateReply {
@@ -1619,6 +1622,33 @@ mod tests {
             whole[head.len()..],
             postcard::to_stdvec(&(6_500i64, 9u64)).unwrap()[..]
         );
+    }
+
+    /// Plan 43 C2: a forward's `settle` flag crosses the wire.
+    #[test]
+    fn a_settle_request_round_trips() {
+        let k = key();
+        for settle in [false, true] {
+            let payload = Payload::MutateRequest {
+                part: "p".into(),
+                requester: 2,
+                req_id: 3,
+                epoch_seen: 0,
+                op: vec![1, 2, 3],
+                rid: (2, 1, 9),
+                acked_through: 8,
+                deps: Vec::new(),
+                pending: Vec::new(),
+                applied: 4,
+                lock_tag: Vec::new(),
+                settle,
+            };
+            let signed = Signed::new(&k, &payload).unwrap();
+            let frame = signed.encode().unwrap();
+            let back = Signed::decode(&frame[4..]).unwrap();
+            let (_, got) = back.verify().unwrap();
+            assert!(matches!(got, Payload::MutateRequest { settle: s, .. } if s == settle));
+        }
     }
 
     #[test]

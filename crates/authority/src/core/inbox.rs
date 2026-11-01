@@ -498,6 +498,7 @@ impl Core {
                     op,
                     deps: c.deps.to_postcard(),
                     lock_tag: c.tag.to_wire(now.honour),
+                    settle: false,
                 })
             })
             .collect();

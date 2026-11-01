@@ -217,6 +217,9 @@ pub enum SyncRequest {
         applied: u64,
         /// Plan 30 §M14 phase 2: the op's fencing token.
         tag: constellation_meta::locks::LockTag,
+        /// Plan 43 C2: a settle of `rid`, not an execution
+        /// (`PeerMsg::MutateRequest::settle`).
+        settle: bool,
         reply: tokio::sync::oneshot::Sender<crate::authority_driver::MutateReplyParts>,
     },
     /// `from` reports chunks it forwarded as pending durable in S3: ack

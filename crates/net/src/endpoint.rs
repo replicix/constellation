@@ -1123,6 +1123,7 @@ pub trait PeerService: Send + Sync + 'static {
         _pending: Vec<[u8; 32]>,
         _applied: u64,
         _lock_tag: Vec<(u64, u64, i64, i64, u64, i64)>,
+        _settle: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
         Box::pin(async move {
             Payload::MutateReply {

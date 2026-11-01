@@ -506,6 +506,7 @@ impl constellation_net::PeerService for P2pBridge {
         pending: Vec<[u8; 32]>,
         applied: u64,
         lock_tag: Vec<(u64, u64, i64, i64, u64, i64)>,
+        settle: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
@@ -538,6 +539,7 @@ impl constellation_net::PeerService for P2pBridge {
                     pending,
                     applied,
                     tag: constellation_meta::locks::LockTag::from_wire(&lock_tag, Some(recv)),
+                    settle,
                     reply,
                 })
                 .is_ok()

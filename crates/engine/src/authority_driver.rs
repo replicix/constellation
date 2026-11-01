@@ -3319,6 +3319,7 @@ impl Driver {
                 pending,
                 applied,
                 tag,
+                settle,
                 reply,
             } => {
                 let deps = Position::from_postcard(&deps);
@@ -3384,6 +3385,7 @@ impl Driver {
                         deps,
                         applied,
                         tag,
+                        settle,
                     },
                 }))
             }
@@ -5244,6 +5246,7 @@ impl Driver {
                 deps,
                 applied,
                 tag,
+                settle,
             } => {
                 // A manifest naming chunks still uploading here (a `back`
                 // close) says so; the recipient awaits them, and this
@@ -5299,6 +5302,7 @@ impl Driver {
                         pending,
                         applied,
                         lock_tag,
+                        settle,
                     };
                     let started = std::time::Instant::now();
                     if denied {

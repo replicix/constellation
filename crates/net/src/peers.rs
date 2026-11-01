@@ -1237,6 +1237,7 @@ pub async fn run_gossip<S: PeerService>(
                 pending,
                 applied,
                 lock_tag,
+                settle,
             } => {
                 // The request carries `rid`/`acked_through`, which mutate
                 // per-requester exactly-once dedup state: an enrolled peer
@@ -1251,13 +1252,14 @@ pub async fn run_gossip<S: PeerService>(
                     // the reply is discarded here, so run it off the
                     // receive loop.
                     let service = service.clone();
-                    let (requester, req_id, epoch_seen, rid, acked_through, applied) = (
+                    let (requester, req_id, epoch_seen, rid, acked_through, applied, settle) = (
                         *requester,
                         *req_id,
                         *epoch_seen,
                         *rid,
                         *acked_through,
                         *applied,
+                        *settle,
                     );
                     let (part, op, deps, pending, lock_tag) = (
                         part.clone(),
@@ -1280,6 +1282,7 @@ pub async fn run_gossip<S: PeerService>(
                                 pending,
                                 applied,
                                 lock_tag,
+                                settle,
                             )
                             .await;
                     });
@@ -1638,6 +1641,7 @@ async fn handle_stream<S: PeerService>(
                 pending,
                 applied,
                 lock_tag,
+                settle,
             } => {
                 // The request carries `rid`/`acked_through`, which mutate
                 // per-requester exactly-once dedup state: only the node that
@@ -1658,6 +1662,7 @@ async fn handle_stream<S: PeerService>(
                                 pending,
                                 applied,
                                 lock_tag,
+                                settle,
                             )
                             .await,
                     )

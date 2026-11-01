@@ -1151,6 +1151,7 @@ impl Core {
                 deps,
                 applied: replica.applied_seq().unwrap_or(0),
                 tag: c.tag.clone(),
+                settle: false,
             },
         });
     }

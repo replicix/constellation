@@ -870,6 +870,7 @@ fn a_peers_forward_is_busy_while_fenced_and_executes_once_the_gate_opens() {
         deps: constellation_meta::Position::ZERO,
         applied: 0,
         tag: Default::default(),
+        settle: false,
     };
     let out = h.step(Event::Peer {
         from: 2,
@@ -959,6 +960,7 @@ fn a_reply_base_names_the_unshipped_overlap() {
                 deps: constellation_meta::Position::ZERO,
                 applied: 0,
                 tag: Default::default(),
+                settle: false,
             },
         });
         match sends(&out)[0].1 {
@@ -1020,6 +1022,7 @@ fn a_reply_base_counts_an_unshipped_link_of_the_inode_a_name_leaves() {
                 deps: constellation_meta::Position::ZERO,
                 applied: 0,
                 tag: Default::default(),
+                settle: false,
             },
         });
         match sends(&out)[0].1 {
@@ -3018,6 +3021,7 @@ fn a_reply_base_is_the_last_shipped_touch_not_the_head() {
                 deps: constellation_meta::Position::ZERO,
                 applied: 0,
                 tag: Default::default(),
+                settle: false,
             },
         });
         match sends(&out)[0].1 {
@@ -3659,6 +3663,7 @@ fn replay_copy_at(h: &mut Harness, from: NodeId, rid: Rid, op: MutateOp) -> Muta
             deps: Default::default(),
             applied: 0,
             tag: Default::default(),
+            settle: false,
         },
     });
     if let Some(outcome) = reply_in(&out) {
@@ -5840,6 +5845,7 @@ mod own_chunks {
                     deps: constellation_meta::Position::ZERO,
                     applied,
                     tag: Default::default(),
+                    settle: false,
                 },
             });
             let [(2, reply @ PeerMsg::MutateReply { base, .. })] = sends(&out)[..] else {
@@ -5945,6 +5951,7 @@ mod own_chunks {
             deps: constellation_meta::Position::ZERO,
             applied: 0,
             tag: Default::default(),
+            settle: false,
         };
         let tick = |holder: &mut Harness, ms: u64| {
             let out = holder.step(Event::Peer {
@@ -6419,6 +6426,7 @@ mod own_chunks {
                 deps: constellation_meta::Position::ZERO,
                 applied: 0,
                 tag: Default::default(),
+                settle: false,
             }
         }
 
@@ -7673,6 +7681,7 @@ mod cto {
                 deps: constellation_meta::Position::ZERO,
                 applied: 0,
                 tag: Default::default(),
+                settle: false,
             },
         })
     }
@@ -11235,6 +11244,7 @@ mod refusal_outcomes {
                 deps: constellation_meta::Position::ZERO,
                 applied: 0,
                 tag: Default::default(),
+                settle: false,
             },
         })
     }
@@ -26529,6 +26539,7 @@ mod locks {
                 deps: Position::ZERO,
                 tag,
                 applied: 0,
+                settle: false,
             },
         })
     }
@@ -30790,6 +30801,7 @@ fn a_write_into_a_fresh_delegation_is_recalled_until_the_root_sees_the_delegate(
                 deps: constellation_meta::Position::ZERO,
                 applied: 0,
                 tag: Default::default(),
+                settle: false,
             },
         })
     }
@@ -30864,6 +30876,7 @@ fn inbox_batch(
             op: op.to_postcard().unwrap(),
             deps: Vec::new(),
             lock_tag: Vec::new(),
+            settle: false,
         }],
         wants_lease: false,
     }
@@ -31120,6 +31133,7 @@ fn a_delegate_reply_base_covers_what_it_applied_before_the_grant_and_streamed_st
                 deps: constellation_meta::Position::ZERO,
                 applied: 0,
                 tag: Default::default(),
+                settle: false,
             },
         });
         match sends(&out).first().map(|(_, m)| *m) {
@@ -32950,6 +32964,7 @@ fn a_forward_to_a_restarted_holder_readopts_its_own_lease() {
         deps: constellation_meta::Position::ZERO,
         applied: 0,
         tag: Default::default(),
+        settle: false,
     };
     let out = h.step(Event::Peer {
         from: 2,
@@ -33032,6 +33047,7 @@ fn a_readoption_claims_nothing_but_its_own_unreleased_lease() {
                 deps: constellation_meta::Position::ZERO,
                 applied: 0,
                 tag: Default::default(),
+                settle: false,
             },
         });
         let (get, _) = s3_ops(&out)
@@ -33068,6 +33084,7 @@ fn a_readoption_claims_nothing_but_its_own_unreleased_lease() {
                 deps: constellation_meta::Position::ZERO,
                 applied: 0,
                 tag: Default::default(),
+                settle: false,
             },
         });
         assert!(
@@ -33111,6 +33128,7 @@ fn a_released_lease_is_not_readopted_for_a_forward() {
             deps: constellation_meta::Position::ZERO,
             applied: 0,
             tag: Default::default(),
+            settle: false,
         },
     });
     assert!(
@@ -39678,6 +39696,7 @@ mod answer_sources {
                 deps: constellation_meta::Position::ZERO,
                 applied: 0,
                 tag: Default::default(),
+                settle: false,
             },
         });
         assert!(matches!(
@@ -39718,6 +39737,7 @@ mod answer_sources {
                 deps: constellation_meta::Position::ZERO,
                 applied: 0,
                 tag: Default::default(),
+                settle: false,
             },
         });
         assert_eq!(h.core.stats.ack_classes, before);
@@ -39855,6 +39875,7 @@ mod recall_cut {
                 deps: constellation_meta::Position::ZERO,
                 applied: 0,
                 tag: Default::default(),
+                settle: false,
             },
         });
         assert!(
@@ -40334,6 +40355,7 @@ mod recall_cut {
                 deps,
                 applied: 0,
                 tag: Default::default(),
+                settle: false,
             },
         })
     }
@@ -40922,6 +40944,7 @@ mod deleg_group {
                 deps: constellation_meta::Position::ZERO,
                 applied: 0,
                 tag: Default::default(),
+                settle: false,
             },
         })
     }
@@ -42545,6 +42568,7 @@ mod deleg_group {
                     deps: constellation_meta::Position::ZERO,
                     applied: 0,
                     tag: Default::default(),
+                    settle: false,
                 },
             })
         };
@@ -42640,6 +42664,7 @@ mod deleg_group {
                 deps: constellation_meta::Position::ZERO,
                 applied: 0,
                 tag: Default::default(),
+                settle: false,
             },
         });
         assert_eq!(
@@ -46892,6 +46917,7 @@ mod c1_class {
                 deps: constellation_meta::Position::ZERO,
                 applied: 0,
                 tag: Default::default(),
+                settle: false,
             },
         });
         assert!(sends(&out).iter().all(|(_, m)| !matches!(
@@ -47002,6 +47028,7 @@ mod c1_class {
                 deps: constellation_meta::Position::ZERO,
                 applied: 0,
                 tag: Default::default(),
+                settle: false,
             },
         };
         let replies = |out: &[Action]| {
@@ -47083,6 +47110,7 @@ mod c1_class {
                 deps: constellation_meta::Position::ZERO,
                 applied: 0,
                 tag: Default::default(),
+                settle: false,
             },
         };
         let committed = |out: &[Action]| {
@@ -47910,6 +47938,7 @@ mod c2f_lone_root {
                 deps: constellation_meta::Position::ZERO,
                 applied: 0,
                 tag: Default::default(),
+                settle: false,
             },
         }
     }
