@@ -2347,7 +2347,12 @@ impl Core {
         // good, answered once the refusal's row is committed (below).
         let outcome = if settle {
             match self.settle_refusal(rid, Some(&op), super::Asker::Own, replica) {
-                MutateOutcome::Abandoned => (MutateOutcome::Abandoned, None),
+                MutateOutcome::Abandoned => {
+                    // Its answer waits for the log: start a round now, not
+                    // at the idle backoff's next one.
+                    self.nudge(now, out);
+                    (MutateOutcome::Abandoned, None)
+                }
                 other => return other,
             }
         } else {
