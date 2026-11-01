@@ -114,8 +114,13 @@ impl Core {
         // `Replica::deps_lost`): not executed here; the requester re-sends
         // once its own replay of the cause has landed. A retry of an op
         // already done is answered from the dedup below as ever.
+        // (Only the root answers so: a `Held` with no generation reads as the
+        // root's at the requester, which caches the sender as the holder —
+        // plan 43 C2g's review. A node that is not the root goes on to the
+        // ordinary answers below: a delegate's own, or `NotHolder`.)
         if self.cfg.delegation
             && !settle
+            && self.lease.ship_epoch(now, &self.cfg).is_some()
             && replica.deps_lost(&deps)
             && replica.recent_outcome(rid).is_none()
             && replica.completed_outcome(rid).ok().flatten().is_none()

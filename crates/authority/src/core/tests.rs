@@ -49220,6 +49220,48 @@ mod c2g_settle {
         assert!(h.meta.lookup(ROOT_INO, "own").unwrap().is_none());
     }
 
+    /// C2g's review, SHOULD 3: a node that is not the root answers a forward
+    /// whose `deps` were lost `NotHolder`, not a `Held` with no generation
+    /// (which its requester reads as the root's answer and caches the
+    /// sender as the holder). Fails on the parent: `Held`, generation 0.
+    #[test]
+    fn a_non_root_answers_a_lost_dependency_not_held() {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let mut deps = constellation_meta::Position::ZERO;
+        assert!(deps.streams.raise(5, 3));
+        crate::replica::Replica::void_stream(&h.meta, 5, 2);
+        crate::replica::Replica::note_void_cut(&h.meta, 5, 2);
+        assert!(crate::replica::Replica::deps_lost(&h.meta, &deps));
+        let op = h.create("d");
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(4),
+                rid: Rid {
+                    node: 2,
+                    incarnation: 1,
+                    seq: 1,
+                },
+                op,
+                acked_through: 0,
+                deps,
+                applied: 0,
+                tag: Default::default(),
+                settle: false,
+            },
+        });
+        let reply = sends(&out).into_iter().find_map(|(to, m)| match m {
+            PeerMsg::MutateReply { outcome, gen, .. } if to == 2 => Some((outcome.clone(), *gen)),
+            _ => None,
+        });
+        assert!(
+            !matches!(reply, Some((MutateOutcome::Held { .. }, 0))),
+            "a non-root's Held with no generation: {out:?}"
+        );
+    }
+
     /// The inbox drain settles like a forward: a settle op with no outcome is
     /// refused for good (the requester learns it from the log); a settle of
     /// an executed rid journals nothing new. Fails on the parent: executed.
