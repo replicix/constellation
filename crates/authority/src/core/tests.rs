@@ -51009,6 +51009,78 @@ mod await_retry {
         );
     }
 
+    /// The bound leaves an own op its window (plan 46 M0.2 review, the
+    /// reviewer's item): the requester is dead, so the placeholder is never
+    /// retried, and an own op on its keys submitted at the drop waits
+    /// behind it for the bound and for the settle's row to commit, then
+    /// executes. It must be answered before its own client deadline
+    /// (`acquire_deadline_ms - settle_window()`, 90 s in production, 9 s in
+    /// the sim): with the bound at the whole client deadline (120 s, 12 s)
+    /// the op always ended `EIO` first.
+    #[test]
+    fn the_placeholder_bound_leaves_a_dependent_own_op_its_window() {
+        let (mut h, broken) = holder_with_a_seed();
+        h.core.cfg.delegation = false;
+        // (A lease that outlasts the minutes the test lets pass.)
+        h.set_lease_end(h.now.plus(3_600_000));
+        let p = rid_of(2, 1);
+        exec_as(&h, RowClass::Archive, p, &rename_in_root("broken", "a"));
+        drop_held(&h, broken);
+        let cfg = h.core.config().clone();
+        let window = cfg.acquire_deadline_ms - cfg.settle_window();
+
+        let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let mine = h.rid(9);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: mine,
+            op: create_in(ROOT_INO, "a", ino),
+            tag: Default::default(),
+        });
+        assert!(replies(&out).is_empty(), "held behind the placeholder");
+
+        // Nobody retries p. The op is answered before its window ends.
+        let mut answered = None;
+        let mut t = 0;
+        while t < window {
+            let out = ticks(&mut h, 1);
+            t += 250;
+            if let Some((_, reply)) = replies(&out).into_iter().find(|(r, _)| *r == mine) {
+                answered = Some((t, format!("{reply:?}")));
+                break;
+            }
+        }
+        let (at, reply) = answered.unwrap_or_else(|| panic!("never answered in {window} ms"));
+        assert!(
+            reply.contains("Accepted"),
+            "answered at {at} ms (window {window}): {reply}"
+        );
+        assert!(h.meta.lookup(ROOT_INO, "a").unwrap().is_some());
+        assert_eq!(h.core.stats.await_retry_settled, 1, "the bound settled p");
+        // The arithmetic behind it: the bound, then the settle's commit.
+        assert!(
+            cfg.drop_held_await() + cfg.settle_window() <= window,
+            "bound {} + settle window {} must fit the own op's window {window}",
+            cfg.drop_held_await(),
+            cfg.settle_window()
+        );
+    }
+
+    /// A configured bound above the cap is clamped to it; below it, kept.
+    #[test]
+    fn a_configured_bound_above_the_cap_is_clamped() {
+        let mut cfg = Config::defaults(1, 1);
+        let cap = cfg.acquire_deadline_ms - 2 * cfg.settle_window();
+        assert_eq!(cfg.drop_held_await(), cap, "the default is the cap");
+        cfg.drop_held_await_ms = cap * 4;
+        assert_eq!(cfg.drop_held_await(), cap);
+        cfg.drop_held_await_ms = cap / 2;
+        assert_eq!(cfg.drop_held_await(), cap / 2);
+        // The production defaults: 120 s deadline, 30 s settle window.
+        assert_eq!(Config::defaults(1, 1).acquire_deadline_ms, 120_000);
+        assert_eq!(Config::defaults(1, 1).drop_held_await(), 60_000);
+    }
+
     /// Review MUST 1 (b): with delegation on, an own op was held for every
     /// own replay queued ahead of it whatever its keys
     /// (`own_replays_unsettled_ahead_of`). A replay the drain holds behind a

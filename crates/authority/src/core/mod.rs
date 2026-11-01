@@ -199,9 +199,12 @@ pub struct Config {
     /// back another node's unanswered row; `StrandedOp::await_retry`)
     /// waits for its requester's retry before the sequencer in force
     /// settles the rid (`Refused { rid, ABANDONED }`). `0` (the default) is
-    /// `acquire_deadline_ms`, twice the lease TTL: by then the requester
-    /// has retried, settled or abandoned the op itself. The clock does not
-    /// run while the epoch refuses writes. `CONSTELLATION_DROP_HELD_AWAIT_MS`.
+    /// the cap, `acquire_deadline_ms - 2 * settle_window()` (60 s at the
+    /// defaults): a larger value is clamped to it
+    /// ([`Config::drop_held_await`]) so that an own op on the placeholder's
+    /// keys still has its window left when the requester is dead. The clock
+    /// does not run while the epoch refuses writes.
+    /// `CONSTELLATION_DROP_HELD_AWAIT_MS`.
     pub drop_held_await_ms: u64,
     pub held_tail_staleness_ms: u64,
     pub segment_batch: usize,
@@ -501,11 +504,23 @@ impl Config {
     }
 
     /// Plan 46 M0.2 (R5): the bound a placeholder waits for its requester's
-    /// retry: `drop_held_await_ms`, else the client deadline.
+    /// retry: `drop_held_await_ms`, else the cap -- and never more than the
+    /// cap, `acquire_deadline_ms - 2 * settle_window()` (60 s at the
+    /// defaults, 6 s in the simulation). An own op on a placeholder's keys
+    /// waits behind it, then for the settle's row to commit (one settle
+    /// window), and must still execute inside its own window,
+    /// `acquire_deadline_ms - settle_window()` (`Core::submit_as`): with a
+    /// bound at the whole client deadline it never could, and with the
+    /// requester gone every such op ended in `EIO`. A live requester is
+    /// nudged at once (R4's `Busy`) and retries within its forward backoff;
+    /// one partitioned for longer than the bound meets the settled refusal.
     pub fn drop_held_await(&self) -> u64 {
+        let cap = self
+            .acquire_deadline_ms
+            .saturating_sub(2 * self.settle_window());
         match self.drop_held_await_ms {
-            0 => self.acquire_deadline_ms,
-            ms => ms,
+            0 => cap,
+            ms => ms.min(cap),
         }
     }
 
