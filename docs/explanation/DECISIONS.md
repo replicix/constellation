@@ -318,7 +318,8 @@ WAN jitter) was enough to trigger it.
   `CONSTELLATION_COMPLETION_RETENTION_S` (default 900 s), whatever the
   head commit says. The client deadline (twice the lease TTL) keeps an
   in-doubt op far inside that window; an op still in doubt at its
-  deadline fails with `EIO`, never with a re-execution.
+  deadline fails with `EIO`, never with a re-execution — *settled* first
+  since plan 43 C2 (below).
 
 **Consequences**: every mutation carries a rid, and every executed op
 adds one small `Completed` record to its segment. A definitive refusal
@@ -330,6 +331,28 @@ stale manifest base) is not recorded; the requester rebases and retries
 under a new rid. The same identity makes stranded-op replay (ADR-19),
 backup re-shipping (ADR-21), inbox drains (ADR-24) and delegate replay
 (ADR-23) exactly-once without further machinery.
+
+**Amended (plan 43 C2g, 2026-11-01; §5.3 item 5, §11 Q9, Q15, Q21 (b),
+(e), (j))**: an op settles before its client hears `EIO`. Its own attempts
+end a settle window before the deadline (a quarter of it, derived: no knob);
+then a *settle* of the rid — a `settle` flag on the forward, the inbox op and
+the lease path, not a new op — goes the op's ordinary route from its one
+client entry. Every sequencer treats it like the op it carries (ownership,
+recall, a delegate's grant, the takeover gate), never waits for its `deps`,
+and answers the rid's outcome, or journals `Refused { rid, ABANDONED_CODE }`
+(`ABANDONED_CODE = Code::Canceled`: no new portable code, the errno table has
+no hole) and answers `MutateOutcome::Abandoned` once the row is committed.
+Every dedup site maps the refusal to `Abandoned`; the engine answers `EIO`.
+A settled `EIO` means the op did not and will not take effect: any other
+copy executes only at a later sequencer in force for its keys, which holds
+the refusal first (its `completed`, a takeover's re-shipped tail, a
+delegation's drained stream). No answer within the window is the unsettled
+`EIO` (in doubt, as before; counted). An op that never left its node is
+settled there at once. An answer in a continuation epoch's hold is the
+hold's, uncommitted (C2f): its settled `EIO` is as strong as the hold.
+Rejected: a second full deadline for the settle (240 s to an `EIO`), and a
+`MutateOp::Abandon` (it would reach the fast path, the replay queue and the
+inbox format).
 
 **Rejected**: a longer forward timeout (it narrows the window but cannot
 close it, and makes a dead holder cost more). Idempotent op rewriting,
@@ -1568,11 +1591,11 @@ recommendation, and the latency gates G1–G6), built in steps. Landed: C0
 holds across a listing and a removal; the class at journal time; the TTL
 claimant's sealed tail and the inherited tail; member copies, committed
 shadows and streams, tail identity: nothing committed is re-executed), C2's
-C2a to C2f (the answer's source; a generation's end carries its cut; a
+C2a to C2g (the answer's source; a generation's end carries its cut; a
 delegate acknowledges once its group holds the row; its fast path writes and
 then waits; the end of a generation waits for its group; a lone root answers
-other nodes from the archive). Not yet: the rest of C2 (settling before
-`EIO`, the scenarios and strict flags), C3–C5. Each milestone amends this
+other nodes from the archive; an op is settled before `EIO`, ADR-18's
+amendment). Not yet: the rest of C2 (the scenarios and strict flags), C3–C5. Each milestone amends this
 record; C1's rejected options are below.
 DESIGN.md states each part in the milestone that makes it true (plan 43
 §6).

@@ -753,10 +753,25 @@ A forward whose reply times out is *in doubt*. The requester retries the
 same rid: the same holder three times with backoff, up to two redirects,
 then the lease path, which tails to head and checks `completed`. Log GC
 keeps every segment younger than `CONSTELLATION_COMPLETION_RETENTION_S`
-(900 s), so the check always covers the op's whole window; an op still in
-doubt at its deadline (twice the lease TTL) fails with `EIO`, never with
-a re-execution. The same identity makes replays, backup re-shipping,
-inbox drains and delegate streams exactly-once without further machinery
+(900 s), so the check always covers the op's whole window. An op still
+unanswered when its own attempts end (1.5 lease TTLs) is *settled* before
+its client hears anything: under the same rid, from the same client entry,
+a settle goes the op's own route (this node as the sequencer, a delegate, a
+forward, the inbox, the lease path), and the sequencer in force answers the
+rid's outcome — the late success, or a refusal — or, having none, journals
+`Refused { rid, ECANCELED }` (`ABANDONED_CODE`) and answers `Abandoned` once
+that row is committed, like any refusal. The client hears `EIO`, and the op
+never takes effect: every later copy of it (a forward delayed in the
+network, a parked execution, an inbox batch, a replay) can execute only at a
+sequencer in force for its keys later, which holds the refusal first — the
+same sequencer's `completed`; a successor, whose takeover gate re-ships the
+committed tail before it executes anything; the root after a delegation's
+end or recall, which drains the delegate's committed rows first — and dedups
+to it. Only when no sequencer answers within the rest of the deadline (twice
+the lease TTL: an isolated requester) does the client hear the *unsettled*
+`EIO`, retryable by rid, which may still land (`client_unsettled_eio`). The
+same identity makes replays, backup re-shipping, inbox drains and delegate
+streams exactly-once without further machinery
 ([ADR-18](DECISIONS.md#adr-18-exactly-once-forwarding-with-request-ids),
 [Forwarded mutations](../reference/features/forwarded-mutations.md#exactly-once-identity-and-in-doubt-handling)).
 

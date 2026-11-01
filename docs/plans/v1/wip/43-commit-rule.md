@@ -1981,6 +1981,44 @@ holder's *own* clients' answers in the first ~200 ms of a tenure, judged
 stability window before the core's next housekeeping assessed it: the D10
 alignment, C5), none of them an answer to another node.
 
+*As landed (C2g, 2026-11-01; PROGRESS, "Plan 43 C2g"; plan 46 M0.1).* §5.3
+item 5 as the coder spec's §6 has it. The record and the answer:
+`Refused { rid, ABANDONED_CODE }` with `ABANDONED_CODE = Code::Canceled`,
+`MutateOutcome::Abandoned` (appended last), `refused_as_outcome` mapping one
+to the other at every dedup site, the engine's `EIO` (counted
+`settled_eio`). The wire: `settle` appended to `PeerMsg::MutateRequest`, the
+net payload and `InboxOp` (no version bump, Q21 (e)). The executor rule at
+every sequencer — the root (`holder_execute`; its own lease path), a
+delegate (a stream row of its own, with no `deps`), the inbox drain: routed
+and gated like the op, never a wait for `deps` or a read recall, an
+unexecuted park of the rid's earlier attempt dropped, then the rid's outcome
+or the refusal, answered once committed like any refusal
+(`Core::settle_refusal` at the root: the helper C2g′'s bound reuses, plan 46
+§5.5). The requester: `settle_window_ms` derived (`0` = a quarter of
+`acquire_deadline_ms`), the op's own attempts ending a window early (an
+inbox op's by the inbox's own deadline, an S3-less op's at its bound), the
+settle from the one client entry along the op's route until the client's
+full deadline (at least one window), `ClientPhase::Settling` in status (the
+routing phase stays the route's), the unsettled `EIO` counted
+(`client_unsettled_eio`). Model `abandon` (§8.2); simulation §7.1 items 1
+and 6, §7.2, `delegated-long-delegation-prod`. *Deviations*: an op that
+never left its node is answered `Abandoned` by no sequencer
+(`AnswerSource::None`; the spec's `Sequenced(Archive)` would be judged
+against a record that does not exist); the meta test
+`settle_answers_an_existing_outcome_and_refuses_otherwise` is a core test
+(the rule lives in the executors); `-prod` runs `strict_settle` only (its
+parent cannot run `+commit`: the D10 alignment above); the model's clean
+test is bounded (the space exceeds the 60M-state safety net; within the
+bounds where the knob-off counterexample is found, none). *Found by the
+settle's timing and fixed (latent)*: a delegate's `Held` named generation
+0, so its requester cached the delegate as the root and, the root dead,
+nobody took the lease over (`delegated-root-gone`: ops waiting for the old
+root's restart). *C2f follow-ups*: `durable_lone_ok` Release/Acquire;
+`repair reintegrate` clears the holder epoch; the refusal nudge restored
+(its sweeps in PROGRESS). Not here: `strict_settle` on every configuration
+and the ledger's late allowance (C2h, plan 46 M0.1's exit), the harness
+scenario.
+
 ### C3 — Verbatim re-ship; no re-execution of a committed row
 
 **Code** (§5.4, §5.6): `Origin` in the segment envelope
@@ -4271,7 +4309,8 @@ plan 46's exit criteria.
       the delegate's group, its fast path, the end of a delegation waiting
       for its group: the seal set, the strict wait, `waiting_for_group`,
       `abandon-group --gen`; and the lone root answering other nodes from the
-      archive, `Ungated` only where lone); C2g–C2h open.
+      archive, `Ungated` only where lone); *C2g landed* (PROGRESS, "Plan 43
+      C2g": the settle before `EIO`); C2h open.
 - [ ] C3: I2c (verbatim) strict on every config; the delegate-turned-root
       rule (move, apply verbatim, re-append deduped by origin, end);
       the fold, `Records` copies, holed generations and the deposed-root

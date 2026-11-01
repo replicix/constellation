@@ -237,6 +237,23 @@ same rid, in order:
    the op already happened, so it returns success without executing;
    not found means it executes locally, with the same rid.
 
+**Settling before `EIO` (plan 43 C2).** The op's own attempts end a
+quarter of the client deadline early (1.5 lease TTLs). It is then
+*settled*: a settle of the same rid, from the same client entry, takes the
+op's route again (this node as the sequencer, a delegate, a forward, the
+inbox, the lease path). The sequencer in force answers the rid's outcome if
+it has one (the late success, or a refusal), or journals `Refused { rid,
+ECANCELED }` and answers `Abandoned` once that row is committed; the
+application hears that outcome, `EIO` for `Abandoned`. A settled `EIO` means
+the op did not happen and never will: every other copy of it dedups to the
+refusal wherever it arrives. An op that never left the node (behind an
+earlier op on its keys) is settled there at once. If no sequencer answers
+within the rest of the deadline (an isolated requester), the application
+hears the *unsettled* `EIO`: in doubt as before, retryable by rid, and the
+op may still land. `status.ack` counts `settles_sent`, `settled_abandoned`,
+`settled_late_success`, `settled_local`, `client_unsettled_eio` and the
+engine's `settled_eio`.
+
 **Coverage rule.** Resolving an in-doubt op against `completed` is only
 valid if this replica has tailed every segment since the op was first
 sent — otherwise an execution sitting in a segment it has not seen yet
@@ -646,12 +663,12 @@ to exactly one execution, never a repeat.
 
 The default request timeout is 500 ms
 (`CONSTELLATION_FORWARD_TIMEOUT_MS`). An op still in doubt at its client
-deadline (twice the lease TTL) fails with `EIO` and is not retried by
-the requester. A stranded execution of it (an executor's journal row,
-queued for replay by rid after a takeover or a deposition) may still be
-replayed and land later, after ops the client issued since (plan 30 §M9:
-an accepted replay of an unacknowledged op lands; only a refused one is
-the client's answer). The rid executes once either way. Setting `CONSTELLATION_FORWARD=off`
+deadline (twice the lease TTL) is settled first (above) and fails with
+`EIO` when that finds no outcome; it is not retried by the requester. Only
+an unsettled one (no sequencer answered the settle) may still land: a
+stranded execution of it (an executor's journal row, queued for replay by
+rid after a takeover or a deposition) may be replayed after ops the client
+issued since. The rid executes once either way. Setting `CONSTELLATION_FORWARD=off`
 disables requester-side forwarding entirely: every non-holder mutation
 takes the lease-acquisition path (P2P handoff, then S3 CAS) directly, with
 no rid retries to attempt first, restoring writer-follows-lease placement.

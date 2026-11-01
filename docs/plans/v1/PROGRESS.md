@@ -63390,3 +63390,79 @@ plan and in its §14). ADR-19, ADR-21, ADR-23, ADR-33, ADR-38 and ADR-39 carry "
 carries pointers where it describes mechanisms scheduled for removal (the text itself changes with the code, rule 5).
 Rejected alternatives recorded in the ADR: finishing plan 43 as specified, a majority log, S3 Express, Calvin-style
 ordering, a client-owned replay list with `ack=local` kept.
+
+## Plan 43 C2g: an op is settled before `EIO` (2026-11-01; plan 46 M0.1)
+
+On main 12769f27 (the base sweeps at eee875d1: the code since is docs only). The coder spec's §6, §7.1 items 1
+and 6, §7.2, §8.2 and `delegated-long-delegation-prod` (D11), as the plan's C2g note records.
+
+### What landed (one commit each)
+
+1. `MutateOutcome::Abandoned`, `ABANDONED_CODE = Code::Canceled`, `refused_as_outcome`; the engine's `EIO`
+   (`settled_eio`); a queued replay of a settled rid is forgotten. Fail-before:
+   `a_settled_rids_refusal_dedups_to_abandoned` (answered `Errno(ECANCELED)`).
+2. `settle` appended to `PeerMsg::MutateRequest`, the net payload (both conversions) and `InboxOp`; no version bump
+   (Q21 (e): a batch from an older binary is not read — today that stops the drain of that requester, and a
+   takeover's drain, as an unknown `INBOX_VERSION` does). Tests: `a_settle_request_round_trips`,
+   `a_settle_op_round_trips`.
+3. The executor rule (root, its lease path, delegate, inbox drain; `Core::settle_refusal`). Fail-before (flag
+   ignored): `settle_answers_an_existing_outcome_and_refuses_otherwise` (a core test: the rule lives in the
+   executors), `the_settles_refusal_waits_for_its_commit`, `a_settle_never_waits_for_deps_and_drops_the_unexecuted_park`,
+   `an_inbox_settle_is_refused_for_good`, `a_delegate_settles_a_rid_into_its_stream_and_answers_once_the_root_holds_it`.
+   (A delegate's settle row names no `deps`: first sweeps, the root's causal-cut check.)
+4. Latent, exposed by the settle's timing: every delegate `Held` (grant not honoured, lost `deps`, a parked answer's
+   hold timer) named generation 0, so the requester cached the delegate as the root and never took a dead root's
+   lease over (`delegated-root-gone` 66504/66511: writes waiting 31-41 s for the old root's restart, one never
+   answered). Fail-before: `a_delegates_held_answer_is_not_the_roots`.
+5. The requester's split deadline (§6.3). Fail-before: `the_deadline_settles_the_rid_before_eio`,
+   `a_settle_after_the_tail_reship_answers_the_late_success`, `the_settle_reuses_the_rids_client_entry`,
+   `a_settle_at_a_new_delegate_dedups_the_delayed_copy_at_the_root` (M7); `c2_a_settled_eio_never_lands_late`
+   (replaces `c0_i4_finds_a_late_landing`; `long-delegated-late-answers` 31, 75, 98). Rewritten (each asserted
+   `InDoubt` at the first deadline): the cold-claim, S3-less and clock-step deadline tests,
+   `a_deposed_holders_journaled_refusal_is_not_answered_at_the_deadline`; renamed
+   `a_delegate_parked_own_op_goes_in_doubt_at_its_deadline` → `..._is_settled_at_its_deadline` (`Abandoned`: it
+   never left the node). Pins moved by the earlier deadline: the holder-cut failover set (1602, 1608 → 1614, 1615:
+   answered at the deadline from the re-shipped tail), the backup-removal pin (586 → 582), the rebuild seeds
+   (2945 → 2924), `flex_a_member_dies_...` (1000..1060); `delegated_root_failover_keeps_every_ack` asserts no
+   re-stream (each one it counted was commit 4's bug). The settle runs until the client's full deadline: an inbox
+   op's own attempts end by the inbox's shorter deadline (the first sweeps settled them in 3 s and left them
+   unsettled behind a TTL takeover).
+6. I4 for a settled `EIO` and the outcome kind (`i4_a_settled_eio_whose_rid_completes_is_a_violation`); the sweeps
+   count settled landings apart (`i4-settled`).
+7. Model `abandon` (§8.2): `abandon_settles_before_eio_is_clean` (bounded as the knob-off counterexample search,
+   5M states / depth 40: the space exceeds the 60M safety net), `recovery_with_abandon_is_clean_third_node_takeover`;
+   `today_an_in_doubt_op_lands_after_its_eio` still violates. The model crate passes in release.
+8. C2f follow-ups: `durable_lone_ok` Release/Acquire; `repair reintegrate` clears the holder epoch (fail-before
+   `a_reintegrate_deposition_clears_the_holder_epoch`); the refusal nudge restored, a settle's refusal included
+   (fail-before `a_journaled_refusal_of_a_forward_nudges_a_round`).
+
+Deviations (maintainer to confirm): an op that never left its node is answered by no sequencer
+(`AnswerSource::None`), not `Sequenced(Archive)` (the I1 oracle would judge a record that does not exist);
+`ClientPhase::Settling` is reported from `ClientOp.settle` (the routing phase stays the route's); `-prod` runs
+`strict_settle` only.
+
+### The nudge
+
+Swept with the nudge (this tree) and without it (its parent), seeds 0..1,999, with and without
+`AUTHORITY_SIM_LEASE_READS=0:0:800:1000`: `flex-crash`, `placement-hot`, `long-delegated-late-answers` fail no
+seed either way; counts equal within noise (`flex-crash` I2 677 vs 730, I5 2487 vs 2558; I1 236 vs 235 and 350 vs
+350). The withdrawal's two seeds (616, 807) do not fail. The nudge stays.
+
+### Sweeps (seeds 0..1,999, `shared-dir*` 0..499; with and without the lease-read knob) against eee875d1
+
+Failing seeds: `long-backup` 743 on both (main's `member_copies_drained` shape); main's `placement-hot-lr` 593
+passes here. No new failure. Settled `EIO`s whose rid lands: 0 in every configuration. I1, I2, I2c and I5 equal
+or within noise of main (I1 now also judges `Abandoned` answers: the few `archive/abandoned` are, like the rest of
+those counts, own clients' answers the core judges lone and the oracle does not, the D10 alignment). I4 (now
+only unsettled `EIO`s landing late) lower in most configurations (`long-delegated-late-answers` 108 → 57, `-lr`
+262 → 165, `delegated-holder-cut` 41 → 16), within ±4 elsewhere, except `delegated-long-delegation` (322/373 →
+460/460: D11, its 12 s deadline ends the window before a 20 s generation is outwaited) — its `-prod` variant is 0
+with no unsettled `EIO`. Unsettled `EIO`s remain where a sequencer is out of reach for longer than the
+simulation's 3 s window (the `-lr` variants, `delegated-holder-cut`, `long-delegated-*`: hundreds to 4,000 per
+2,000 seeds), so `strict_settle` everywhere (plan 46 M0.1's exit) is not met by C2g alone.
+
+### Gates
+
+fmt, clippy `-D warnings` (workspace); authority lib 880 and `meta_repro` 4, meta (lib 382 and the rest), engine
+940, control 146 (schema re-blessed), net 126, store-s3 237, model (release); release sim suite 302 passed / 11
+ignored.
