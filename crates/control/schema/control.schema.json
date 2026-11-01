@@ -80,6 +80,13 @@
           "minimum": 0,
           "type": "integer"
         },
+        "await_retry_settled": {
+          "default": 0,
+          "description": "Placeholders of rows `repair drop-held` rolled back (another node's\nunanswered ops, awaiting their requester's retry) that the bound\nsettled as abandoned (`drop_held_await_ms`; plan 46 M0.2).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "awaited_log": {
           "description": "Accepted forwards of this node that could not install as a\nshadow (the holder ran unshipped work on their keys before them)\nand waited for their transaction, and of those, the ones the\npre-S3 stream answered before the log did.",
           "format": "uint64",

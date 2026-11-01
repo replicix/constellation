@@ -45,6 +45,11 @@ pub(crate) struct ReplayState {
     /// refused replay of one is an outcome for its client, not an effect
     /// to preserve as a conflict copy.
     pub unacked: std::collections::BTreeSet<Rid>,
+    /// Plan 46 M0.2 (R5): how long each placeholder (by `queue_seq`) has
+    /// waited for its requester's retry, on this node's wait clock and
+    /// not while the epoch refuses writes, and the tick that last counted.
+    awaiting: BTreeMap<u64, u64>,
+    awaiting_tick: Option<WaitMs>,
 }
 
 impl ReplayState {
@@ -187,6 +192,7 @@ impl Core {
             self.replay.stuck_since = None;
             return;
         }
+        self.account_placeholders(now, &queued);
         // The keys of the entries left behind so far (plan 46 M0.2, R2): a
         // placeholder whose requester's retry has not executed, and every
         // entry held behind one. The queue runs in order, but only on a
@@ -207,6 +213,7 @@ impl Core {
                     // (R4: an answer parked for the dropped row is aborted
                     // now, and its requester retries.)
                     self.abort_parked_answer_of(now, head.rid, replica, out);
+                    self.settle_placeholder_if_due(now, head, replica, out);
                 }
                 continue;
             }
@@ -486,6 +493,83 @@ impl Core {
         true
     }
 
+    /// Plan 46 M0.2 (R5): count the time each placeholder in `queue` has
+    /// waited since the last tick, on the wait clock — except while the
+    /// epoch refuses writes: nothing can execute the retry then, nor a
+    /// settle, so the requester's wait is not the bound's. A placeholder
+    /// first seen starts from the wall time since it was dropped
+    /// (`AwaitRetry::since_ms`: a restart does not start the bound over).
+    fn account_placeholders(&mut self, now: Now, queue: &[StrandedOp]) {
+        let elapsed = self
+            .replay
+            .awaiting_tick
+            .map_or(0, |last| now.wait.since(last).max(0) as u64);
+        self.replay.awaiting_tick = Some(now.wait);
+        let running = !self.epoch_refuses_writes();
+        let wall_ms = now.wall.0;
+        let live: std::collections::BTreeSet<u64> = queue
+            .iter()
+            .filter(|q| q.is_await_retry())
+            .map(|q| q.queue_seq)
+            .collect();
+        self.replay.awaiting.retain(|seq, _| live.contains(seq));
+        for q in queue {
+            let Some(placeholder) = &q.await_retry else {
+                continue;
+            };
+            match self.replay.awaiting.entry(q.queue_seq) {
+                std::collections::btree_map::Entry::Occupied(mut e) => {
+                    if running {
+                        *e.get_mut() += elapsed;
+                    }
+                }
+                std::collections::btree_map::Entry::Vacant(e) => {
+                    e.insert((wall_ms - placeholder.since_ms).max(0) as u64);
+                }
+            }
+        }
+    }
+
+    /// Plan 46 M0.2 (R5): a placeholder that has waited the bound for its
+    /// requester's retry is settled by the sequencer in force — the rid's
+    /// outcome if it has one by now, else `Refused { rid, ABANDONED }`
+    /// journaled under the remote asker's class (`Core::settle_refusal`,
+    /// C2g's record) and answered once committed, like any refusal — and
+    /// forgotten when the settle's outcome comes back
+    /// (`replay_outcome`). The settle is a client entry of this node under
+    /// the rid (an op nobody will execute: `settle` from the start, the
+    /// op inert), so it goes the way the op itself would: executed here
+    /// when this node is the sequencer, else to the holder, a delegate, or
+    /// the inbox. Not while the epoch refuses writes, and not while one is
+    /// in flight.
+    fn settle_placeholder_if_due(
+        &mut self,
+        now: Now,
+        entry: &StrandedOp,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let waited = self
+            .replay
+            .awaiting
+            .get(&entry.queue_seq)
+            .copied()
+            .unwrap_or(0);
+        if waited < self.cfg.drop_held_await()
+            || self.epoch_refuses_writes()
+            || self.clients.contains_key(&entry.rid)
+        {
+            return;
+        }
+        tracing::warn!(
+            node = self.cfg.node_id,
+            rid = ?entry.rid,
+            waited_ms = waited,
+            "a dropped row's requester never retried: settling the rid as abandoned"
+        );
+        self.submit_settle(now, entry.rid, entry.queue_seq, replica, out);
+    }
+
     /// Whether `rid`'s `completed` row is this node's own journal row
     /// that its commit point (the group or the archive, as for a remote
     /// asker) does not hold yet.
@@ -722,6 +806,27 @@ impl Core {
         let Some(queued) = queue.iter().find(|s| s.queue_seq == queue_seq).cloned() else {
             return;
         };
+        // Plan 46 M0.2 (R5): the answer to a placeholder's settle. The rid
+        // has an outcome — the settle's refusal, or one that came first —
+        // and the placeholder is done; no answer (in doubt, busy, not the
+        // holder) leaves it for a later tick to settle again.
+        if queued.is_await_retry() {
+            match outcome {
+                None
+                | Some(MutateOutcome::Busy)
+                | Some(MutateOutcome::NotHolder { .. })
+                | Some(MutateOutcome::Held { .. }) => {}
+                Some(outcome) => {
+                    if outcome == MutateOutcome::Abandoned {
+                        self.stats.await_retry_settled += 1;
+                    } else {
+                        self.stats.await_retry_resolved += 1;
+                    }
+                    let _ = replica.forget_replay(queue_seq);
+                }
+            }
+            return;
+        }
         // Plan 30 §M9: a foreign entry (another node's op, stranded here
         // as streamed speculation) only ever waits for the successor's
         // verdict; refused, it is simply forgotten — its own requester

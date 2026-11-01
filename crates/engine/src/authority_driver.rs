@@ -623,6 +623,9 @@ pub fn load_config(
     c.acquire_deadline_ms = 2 * ttl_ms;
     // (Plan 43 C2, §11 Q9, Q21 (j): `settle_window_ms` stays derived, a
     // quarter of this; no knob.)
+    // Plan 46 M0.2 (R5): how long a dropped row of another node waits for
+    // its requester's retry (0/unset: the client deadline above).
+    c.drop_held_await_ms = env_ms("CONSTELLATION_DROP_HELD_AWAIT_MS", 0);
     c.s3_less_deadline_ms = env_ms(
         "CONSTELLATION_S3_LESS_OP_DEADLINE_MS",
         c.s3_less_deadline_ms,

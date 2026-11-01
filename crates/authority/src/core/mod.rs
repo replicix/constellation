@@ -195,6 +195,14 @@ pub struct Config {
     pub publish_idle_ms: u64,
     pub replay_drain_ms: u64,
     pub replay_lease_fallback_ms: u64,
+    /// Plan 46 M0.2 (R5): how long a placeholder (`repair drop-held` rolled
+    /// back another node's unanswered row; `StrandedOp::await_retry`)
+    /// waits for its requester's retry before the sequencer in force
+    /// settles the rid (`Refused { rid, ABANDONED }`). `0` (the default) is
+    /// `acquire_deadline_ms`, twice the lease TTL: by then the requester
+    /// has retried, settled or abandoned the op itself. The clock does not
+    /// run while the epoch refuses writes. `CONSTELLATION_DROP_HELD_AWAIT_MS`.
+    pub drop_held_await_ms: u64,
     pub held_tail_staleness_ms: u64,
     pub segment_batch: usize,
     /// Byte ceiling on one shipped segment (`shipper::SEGMENT_MAX_BYTES`).
@@ -492,6 +500,15 @@ impl Config {
             + self.s3_less_deadline_ms
     }
 
+    /// Plan 46 M0.2 (R5): the bound a placeholder waits for its requester's
+    /// retry: `drop_held_await_ms`, else the client deadline.
+    pub fn drop_held_await(&self) -> u64 {
+        match self.drop_held_await_ms {
+            0 => self.acquire_deadline_ms,
+            ms => ms,
+        }
+    }
+
     /// Plan 43 C2 (§5.3 item 5): the settle window actually used: a quarter
     /// of the client deadline unless one is set, and never more than half
     /// of it.
@@ -616,6 +633,7 @@ impl Config {
             publish_idle_ms: 30_000,
             replay_drain_ms: 250,
             replay_lease_fallback_ms: 10_000,
+            drop_held_await_ms: 0,
             held_tail_staleness_ms: 5_000,
             segment_batch: 10_000,
             segment_max_bytes: 4 << 20,

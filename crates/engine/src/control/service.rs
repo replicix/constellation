@@ -407,6 +407,7 @@ impl EngineControl {
                     settled_late_success: a.settled_late_success,
                     settled_local: a.settled_local,
                     client_unsettled_eio: a.client_unsettled_eio,
+                    await_retry_settled: a.await_retry_settled,
                     longest_step_ms: core.longest_step_ms,
                     longest_step_kind: core.longest_step_kind.to_string(),
                     recent_longest_step_ms: core.recent_longest_step_ms,

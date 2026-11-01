@@ -1174,6 +1174,10 @@ pub struct AckView {
     pub settled_late_success: u64,
     pub settled_local: u64,
     pub client_unsettled_eio: u64,
+    /// Plan 46 M0.2 (R5): placeholders of dropped rows (`repair
+    /// drop-held`) whose requester never retried, settled by the bound
+    /// (`Stats::await_retry_settled`).
+    pub await_retry_settled: u64,
 }
 
 impl Core {
@@ -1273,6 +1277,7 @@ impl Core {
             settled_late_success: self.stats.settled_late_success,
             settled_local: self.stats.settled_local,
             client_unsettled_eio: self.stats.client_unsettled_eio,
+            await_retry_settled: self.stats.await_retry_settled,
         }
     }
 

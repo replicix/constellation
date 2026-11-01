@@ -49993,4 +49993,217 @@ mod await_retry {
         assert!(h.meta.lookup(ROOT_INO, "moved").unwrap().is_some());
         assert!(queue(&h).iter().all(|(n, _, _)| *n != 2), "{:?}", queue(&h));
     }
+
+    /// A holder with a seed and the remote rename of `broken` (node 2,
+    /// rid 2/1) dropped into a placeholder, the bound set to 2 s.
+    fn placeholder_with_a_short_bound() -> (Harness, Rid) {
+        let (mut h, broken) = holder_with_a_seed();
+        let p = rid_of(2, 1);
+        exec_as(&h, RowClass::Archive, p, &rename_in_root("broken", "moved"));
+        drop_held(&h, broken);
+        h.core.cfg.drop_held_await_ms = 2_000;
+        (h, p)
+    }
+
+    /// R5: a placeholder whose requester never retries is settled by the
+    /// sequencer in force at the bound: `Refused { rid, ABANDONED }`
+    /// (C2g's record, under the remote asker's class), forgotten once that
+    /// row is committed (the archive landed), counted.
+    #[test]
+    fn a_placeholder_past_the_bound_is_settled_as_abandoned() {
+        let (mut h, r) = placeholder_with_a_short_bound();
+        // Inside the bound nothing happens, however many ticks.
+        for _ in 0..6 {
+            h.advance(250);
+            drain(&mut h);
+            h.archive_lands();
+        }
+        assert_eq!(h.meta.completed_outcome(r).unwrap(), None);
+        assert!(queue(&h).contains(&(2, 1, true)));
+        assert_eq!(h.core.stats.await_retry_settled, 0);
+
+        // Past it: the settle is journaled (not yet committed: the
+        // placeholder keeps its place until the archive lands).
+        h.advance(1_000);
+        drain(&mut h);
+        assert_eq!(
+            h.meta.completed_outcome(r).unwrap(),
+            Some(constellation_meta::CompletedOutcome::Refused {
+                code: crate::ABANDONED_CODE
+            }),
+            "{:?}",
+            queue(&h)
+        );
+        assert!(queue(&h).contains(&(2, 1, true)), "not before the commit");
+        let classes = h.meta.journal_classes_of_rid(r).unwrap();
+        assert!(
+            !classes.is_empty() && classes.iter().all(|c| *c != RowClass::Lone),
+            "never the lone shortcut: {classes:?}"
+        );
+        h.archive_lands();
+        drain(&mut h);
+        assert!(
+            queue(&h).iter().all(|(n, _, _)| *n != 2),
+            "forgotten once committed: {:?}",
+            queue(&h)
+        );
+        assert_eq!(h.core.stats.await_retry_settled, 1);
+        assert_eq!(h.core.stats.settles_refused, 1);
+        assert_eq!(
+            h.core.stats.client_unsettled_eio, 0,
+            "a replay, not a client op"
+        );
+        assert_eq!(h.core.stats.settles_sent, 0);
+        assert!(h.core.clients.is_empty());
+    }
+
+    /// R5: the settle is the rid's outcome. The requester's retry, late,
+    /// dedups to it: answered `Abandoned`, never executed.
+    #[test]
+    fn a_settled_placeholder_never_lands_the_retry() {
+        let (mut h, r) = placeholder_with_a_short_bound();
+        h.advance(2_500);
+        drain(&mut h);
+        h.archive_lands();
+        drain(&mut h);
+        assert_eq!(h.core.stats.await_retry_settled, 1);
+        let out = forward_of(&mut h, 2, 70, r, &rename_in_root("broken", "moved"));
+        assert_eq!(
+            reply_to(&out, 70),
+            Some(MutateOutcome::Abandoned),
+            "{out:?}"
+        );
+        assert!(
+            h.meta.lookup(ROOT_INO, "broken").unwrap().is_some()
+                && h.meta.lookup(ROOT_INO, "moved").unwrap().is_none(),
+            "the settled op landed"
+        );
+    }
+
+    /// R5: the clock does not run while the epoch refuses writes: nothing
+    /// could execute the retry (or a settle) there.
+    #[test]
+    fn the_bound_does_not_advance_while_the_epoch_refuses_writes() {
+        let (mut h, r) = placeholder_with_a_short_bound();
+        // (A lease that outlasts the 10 s the epoch stays frozen.)
+        h.set_lease_end(h.now.plus(60_000));
+        h.core.epoch.frozen = true;
+        assert!(h.core.epoch_refuses_writes());
+        for _ in 0..40 {
+            h.advance(250);
+            drain(&mut h);
+        }
+        assert_eq!(h.meta.completed_outcome(r).unwrap(), None, "10 s frozen");
+        h.core.epoch.frozen = false;
+        // The bound counts from here: 2 s, not 0.
+        for _ in 0..6 {
+            h.advance(250);
+            drain(&mut h);
+        }
+        assert_eq!(h.meta.completed_outcome(r).unwrap(), None);
+        for _ in 0..4 {
+            h.advance(250);
+            drain(&mut h);
+        }
+        assert!(h.meta.completed_outcome(r).unwrap().is_some());
+    }
+
+    /// R6: after the settle, the dependents run as today. Here: this node's
+    /// own acknowledged rename of the name the dropped rename was to make
+    /// is refused (the name never came to be) — a conflict copy, the
+    /// lone branch's rule for an acknowledged own op — and its create of
+    /// the name, behind it, succeeds on the state without the dropped row.
+    #[test]
+    fn after_the_settle_the_dependents_run_as_before() {
+        let (mut h, broken) = holder_with_a_seed();
+        let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let (p, d, d2) = (rid_of(2, 1), rid_of(1, 6), rid_of(1, 7));
+        exec_as(&h, RowClass::Archive, p, &rename_in_root("broken", "moved"));
+        exec_as(&h, RowClass::Lone, d, &rename_in_root("moved", "elsewhere"));
+        exec_as(&h, RowClass::Lone, d2, &create_in(ROOT_INO, "moved", ino));
+        drop_held(&h, broken);
+        h.core.cfg.drop_held_await_ms = 2_000;
+        assert_eq!(queue(&h)[1..], [(2, 1, true), (1, 6, false), (1, 7, false)]);
+
+        // Behind the placeholder until the bound.
+        for _ in 0..4 {
+            h.advance(250);
+            drain(&mut h);
+            h.archive_lands();
+        }
+        assert_eq!(h.meta.completed_outcome(d).unwrap(), None);
+        assert_eq!(h.meta.completed_outcome(d2).unwrap(), None);
+
+        let mut out = Vec::new();
+        for _ in 0..12 {
+            h.advance(250);
+            out.extend(drain(&mut h));
+            out.extend(h.archive_lands());
+        }
+        assert_eq!(h.core.stats.await_retry_settled, 1);
+        // (The seed's copy is in flight, so this one waits its turn: it is
+        // recorded as refused and queued for its copy.)
+        let refused = h.meta.pending_replays().unwrap();
+        assert!(
+            refused.iter().any(|q| q.rid == d
+                && q.refused
+                    .as_ref()
+                    .is_some_and(|r| r.reason.contains("refused"))),
+            "the refused rename of an acknowledged own op is a conflict copy: {refused:?} {out:?}"
+        );
+        assert_eq!(h.core.stats.replay_conflicts, 1);
+        assert!(
+            h.meta.lookup(ROOT_INO, "moved").unwrap().is_some(),
+            "the create ran on the state without the dropped rename"
+        );
+        assert!(h.meta.completed_outcome(d2).unwrap().is_some());
+    }
+
+    /// R5 at a node that is not the sequencer in force (deposed, or the
+    /// lease moved after the drop): the settle goes where the op itself
+    /// would, to the holder, as a settle of the rid; the sequencer there
+    /// journals the refusal, and the reply forgets the placeholder.
+    #[test]
+    fn a_placeholder_is_settled_at_the_holder_when_this_node_is_not_it() {
+        let (mut h, r) = placeholder_with_a_short_bound();
+        // The lease moved to node 2 after the drop.
+        h.core.lease.held = None;
+        h.core.lease.cached_holder = Some(2);
+        h.advance(2_500);
+        let out = drain(&mut h);
+        let (to, req) = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::MutateRequest {
+                    req,
+                    rid,
+                    settle: true,
+                    ..
+                } if *rid == r => Some((to, *req)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no settle sent: {out:?}"));
+        assert_eq!(to, 2);
+        assert_eq!(
+            h.meta.completed_outcome(r).unwrap(),
+            None,
+            "nothing journaled here"
+        );
+        // The holder's answer: the rid is abandoned.
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome: MutateOutcome::Abandoned,
+                base: None,
+                position: constellation_meta::Position::ZERO,
+                gen: 0,
+                own_chunks: OwnChunks::None,
+                own_rows: None,
+                committed: true,
+            },
+        });
+        assert!(queue(&h).iter().all(|(n, _, _)| *n != 2), "{:?}", queue(&h));
+        assert_eq!(h.core.stats.await_retry_settled, 1);
+    }
 }

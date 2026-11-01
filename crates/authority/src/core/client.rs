@@ -463,6 +463,56 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        self.submit_as(now, rid, op, policy, tag, (origin, false), replica, out);
+    }
+
+    /// Plan 46 M0.2 (R5): settle the rid of the placeholder at `queue_seq`
+    /// (`Core::settle_placeholder_if_due`): a client entry under the rid
+    /// that is a *settle* from its first step — it asks for the rid's
+    /// outcome or its refusal for good, wherever the op would have gone,
+    /// and executes nothing (its op is inert and `settle` is set before
+    /// anything routes it). Its outcome reaches `replay_outcome` as a
+    /// replay's does.
+    pub(crate) fn submit_settle(
+        &mut self,
+        now: Now,
+        rid: Rid,
+        queue_seq: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        self.submit_as(
+            now,
+            rid,
+            MutateOp::Records {
+                records: Vec::new(),
+            },
+            Policy::Client,
+            LockTag::NONE,
+            (
+                Origin::Replay {
+                    queue_seq,
+                    deps: Streams::NONE,
+                },
+                true,
+            ),
+            replica,
+            out,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_as(
+        &mut self,
+        now: Now,
+        rid: Rid,
+        op: MutateOp,
+        policy: Policy,
+        tag: LockTag,
+        (origin, settle): (Origin, bool),
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
         if self.clients.contains_key(&rid) {
             let c = self.clients.get_mut(&rid).expect("present");
             if origin == Origin::Client && matches!(c.origin, Origin::Replay { .. }) {
@@ -482,7 +532,11 @@ impl Core {
         }
         // Plan 43 C2 (§5.3 item 5, Q9): a client op's own attempts end a
         // settle window before its deadline; the settle has the rest.
-        let tries_for = if Self::settles(origin, policy) {
+        let tries_for = if settle {
+            // (A placeholder's settle runs for one settle window; unanswered,
+            // it ends in doubt and the drain settles again.)
+            self.cfg.settle_window()
+        } else if Self::settles(origin, policy) {
             self.cfg.acquire_deadline_ms - self.cfg.settle_window()
         } else {
             self.cfg.acquire_deadline_ms
@@ -549,6 +603,15 @@ impl Core {
                 tag,
             },
         );
+        if settle {
+            // Plan 46 M0.2 (R5): settled from the start; nothing of the
+            // op's own is ever routed.
+            if let Some(c) = self.clients.get_mut(&rid) {
+                c.settle = true;
+            }
+            self.settle_route(now, rid, replica, out);
+            return;
+        }
         // Causal order after a generation ended with this node's writes
         // tentative (see `hold_for_lost_deps`).
         if self.hold_for_lost_deps(now, rid, replica, out) {
@@ -3445,7 +3508,7 @@ impl Core {
         let Some(c) = self.clients.remove(&rid) else {
             return;
         };
-        if c.settle {
+        if c.settle && matches!(c.origin, Origin::Client) {
             // Plan 43 C2: no sequencer answered the settle (I4's one
             // exception: an isolated requester).
             self.stats.client_unsettled_eio += 1;
@@ -3583,7 +3646,7 @@ impl Core {
             self.cancel_timer(t, out);
         }
         self.inbox_forget(rid);
-        if c.settle && is_answer(&outcome) {
+        if c.settle && is_answer(&outcome) && matches!(c.origin, Origin::Client) {
             if outcome == MutateOutcome::Abandoned {
                 self.stats.settled_abandoned += 1;
             } else {

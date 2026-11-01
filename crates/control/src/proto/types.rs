@@ -2311,6 +2311,11 @@ pub struct AckStatus {
     pub settled_local: u64,
     #[serde(default)]
     pub client_unsettled_eio: u64,
+    /// Placeholders of rows `repair drop-held` rolled back (another node's
+    /// unanswered ops, awaiting their requester's retry) that the bound
+    /// settled as abandoned (`drop_held_await_ms`; plan 46 M0.2).
+    #[serde(default)]
+    pub await_retry_settled: u64,
     /// The latest seal this node made, as its watch measured the holder's
     /// silence.
     #[serde(default)]
