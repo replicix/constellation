@@ -674,11 +674,23 @@ fn abandon_settles_before_eio_is_clean() {
         .with_abandon(true)
         .with_op(1, NsOp::CreateExcl(name(0)))
         .with_op(1, NsOp::CreateExcl(name(1)));
-    assert_abandon_clean(
-        "abandon (in-doubt op, 2 nodes)",
-        model,
-        Some((5_000_000, 40, Duration::from_secs(40))),
+    let bounds = (5_000_000, 40, Duration::from_secs(40));
+    // The bounds reach the violation with the knob off (the review's check
+    // that the clean run below is not clean for want of depth).
+    let off = model
+        .clone()
+        .with_abandon(false)
+        .checker()
+        .target_state_count(bounds.0)
+        .target_max_depth(bounds.1)
+        .timeout(bounds.2)
+        .spawn_bfs()
+        .join();
+    assert!(
+        off.discovery("eio_never_lands_late").is_some(),
+        "the bounds do not reach the knob-off counterexample"
     );
+    assert_abandon_clean("abandon (in-doubt op, 2 nodes)", model, Some(bounds));
 }
 
 /// `recovery_fixes_bug_b_third_node_takeover`'s configuration with the
