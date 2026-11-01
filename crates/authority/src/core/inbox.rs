@@ -1488,7 +1488,10 @@ impl Core {
                 .as_ref()
                 .map(|op| replica.recall_inos_of_op(op))
                 .unwrap_or_default();
-            if admitted && self.inbox_recall_first(now, batch.node, &touched, replica, out) {
+            if admitted
+                && !op.settle
+                && self.inbox_recall_first(now, batch.node, &touched, replica, out)
+            {
                 return Err(Halt::Recall);
             }
             // M16: the op's `deps`, as a forward's: a delegate's stream
@@ -1502,7 +1505,9 @@ impl Core {
             // the batch waits (`Halt::Recall`: retried at the halted
             // cadence) — the delegate re-streams, or the root reclaims the
             // generation and voids its stream.
-            if self.cfg.delegation && !op.deps.is_empty() {
+            // (Plan 43 C2: a settle has no effect to order: it never waits
+            // for its `deps`.)
+            if self.cfg.delegation && !op.settle && !op.deps.is_empty() {
                 let deps = constellation_meta::Position::from_postcard(&op.deps);
                 if !replica.reaches_streams(&deps) {
                     self.stats.deleg_deps_waits += 1;
@@ -1566,6 +1571,21 @@ impl Core {
                         }
                     }
                 }
+            }
+            // Plan 43 C2 (§5.3 item 5): a settle of the rid, which has no
+            // outcome here (above): refused for good, like any refusal of an
+            // inbox op (its requester learns it from the log).
+            if op.settle {
+                replica.journal_inbox_refusal(
+                    rid,
+                    super::client::ABANDONED_CODE,
+                    ack,
+                    decoded.as_ref().ok(),
+                )?;
+                self.inbox_unblock(now, &touched);
+                self.stats.settles_refused += 1;
+                self.stats.inbox_refused_ops += 1;
+                continue;
             }
             let executed = match &decoded {
                 Ok(decoded_op) => constellation_meta::locks::TokenPath::Inbox.scope(|| {

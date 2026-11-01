@@ -170,6 +170,11 @@ pub(crate) struct ClientOp {
     /// row read from the log) just before `finish`. Unset when `finish`
     /// emits a definitive outcome is a bug.
     pub answered_by: Option<AnswerSource>,
+    /// Plan 43 C2 (§5.3 item 5): the op's own attempts reached their
+    /// deadline and it is being *settled*: every forward, inbox batch and
+    /// lease-path execution of it from now on asks for the rid's outcome,
+    /// or for its refusal for good, instead of executing it.
+    pub settle: bool,
 }
 
 /// Chunk metered-own-rows: an observed position's pending upload
@@ -530,6 +535,7 @@ impl Core {
                 own_record_uploaded: false,
                 excused: Vec::new(),
                 answered_by: None,
+                settle: false,
                 tag,
             },
         );
@@ -548,7 +554,9 @@ impl Core {
                 .get(&rid)
                 .map(|c| (c.op.clone(), c.tag.clone()))
                 .expect("present");
-            if self.delegate_try_execute(now, 0, None, rid, &op_ref, deps, 0, &tag, replica, out) {
+            if self.delegate_try_execute(
+                now, 0, None, rid, &op_ref, deps, 0, &tag, false, replica, out,
+            ) {
                 return;
             }
             if self.cfg.forwarding && self.cfg.p2p {
@@ -1658,14 +1666,19 @@ impl Core {
         // delegate's own op until the delegate's table carries the
         // grant). The delegate path dedups by rid.
         if self.cfg.delegation {
-            let own = self.clients.get(&rid).map(|c| (c.op.clone(), c.deps));
-            if let Some((op, deps)) = own {
+            let own = self
+                .clients
+                .get(&rid)
+                .map(|c| (c.op.clone(), c.deps, c.settle));
+            if let Some((op, deps, settle)) = own {
                 let tag = self
                     .clients
                     .get(&rid)
                     .map(|c| c.tag.clone())
                     .unwrap_or_default();
-                if self.delegate_try_execute(now, 0, None, rid, &op, deps, 0, &tag, replica, out) {
+                if self.delegate_try_execute(
+                    now, 0, None, rid, &op, deps, 0, &tag, settle, replica, out,
+                ) {
                     self.stats.deleg_retry_executed += 1;
                     return;
                 }
@@ -2149,10 +2162,9 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> MutateOutcome {
-        let in_doubt = self
-            .clients
-            .get(&rid)
-            .is_some_and(|c| c.forwarded || c.attempts > 0);
+        let (in_doubt, settle) = self.clients.get(&rid).map_or((false, false), |c| {
+            (c.forwarded || c.attempts > 0 || c.settle, c.settle)
+        });
         if in_doubt {
             if let Some(outcome) = completed_as_outcome(replica, rid, epoch) {
                 self.stats.forward_indoubt_resolved += 1;
@@ -2181,7 +2193,8 @@ impl Core {
                 return outcome;
             }
         }
-        if self.hold_for_lost_deps(now, rid, replica, out) {
+        // (A settle has no effect to order after this node's replays.)
+        if !settle && self.hold_for_lost_deps(now, rid, replica, out) {
             // Held (`finish` leaves a held op alone).
             return MutateOutcome::Held { retry_ms: 0 };
         }
@@ -2220,10 +2233,10 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> MutateOutcome {
-        let Some((op, policy, deps, tag)) = self
+        let Some((op, policy, deps, tag, settle)) = self
             .clients
             .get(&rid)
-            .map(|c| (c.op.clone(), c.policy, c.deps, c.tag.clone()))
+            .map(|c| (c.op.clone(), c.policy, c.deps, c.tag.clone(), c.settle))
         else {
             // Already finished by a nested pass (see `release_gated`);
             // the outcome goes to `finish`, which drops it.
@@ -2253,7 +2266,7 @@ impl Core {
                     }
                 }
             };
-            let deps_wait = (!replica.reaches_streams(&deps)).then_some(deps);
+            let deps_wait = (!settle && !replica.reaches_streams(&deps)).then_some(deps);
             if !wait.is_empty() || deps_wait.is_some() {
                 if deps_wait.is_some() {
                     self.stats.deleg_deps_waits += 1;
@@ -2275,57 +2288,73 @@ impl Core {
             self.place_note(self.cfg.node_id, dirs);
         }
         let _class = self.journal_class();
-        let outcome = match constellation_meta::locks::TokenPath::Local
-            .scope(|| replica.execute(&op, Some(rid), &tag, now))
-        {
-            Ok(records) => {
-                if policy == Policy::Client {
-                    self.lease.touch(now);
+        // Plan 43 C2 (§5.3 item 5): this node settles its own op as the root
+        // (`resolve_in_doubt_then_execute` found no outcome): refused for
+        // good, answered once the refusal's row is committed (below).
+        let outcome = if settle {
+            match self.settle_refusal(rid, Some(&op), super::Asker::Own, replica) {
+                MutateOutcome::Abandoned => (MutateOutcome::Abandoned, None),
+                other => return other,
+            }
+        } else {
+            match constellation_meta::locks::TokenPath::Local
+                .scope(|| replica.execute(&op, Some(rid), &tag, now))
+            {
+                Ok(records) => {
+                    if policy == Policy::Client {
+                        self.lease.touch(now);
+                    }
+                    self.nudge(now, out);
+                    // Plan 30 §M8: the sequencer's own writes recall read
+                    // delegations too; `finish` parks the reply until done.
+                    // (`_executed`: plus what an unlink or rename changed
+                    // that its records do not name.)
+                    let inos = constellation_meta::recall_inos_executed(&records);
+                    let wait = self.recall_needed(now, &inos, None, replica, out);
+                    (MutateOutcome::Accepted { epoch, records }, wait)
                 }
-                self.nudge(now, out);
-                // Plan 30 §M8: the sequencer's own writes recall read
-                // delegations too; `finish` parks the reply until done.
-                // (`_executed`: plus what an unlink or rename changed
-                // that its records do not name.)
-                let inos = constellation_meta::recall_inos_executed(&records);
-                let wait = self.recall_needed(now, &inos, None, replica, out);
-                (MutateOutcome::Accepted { epoch, records }, wait)
-            }
-            // A stale base or an ended grant is a definitive answer (a
-            // client rebases or reissues under a fresh rid; a replay makes
-            // its conflict copy): the rid's outcome, journaled like any
-            // refusal (`Code::Stale`: a dedup answers it as the conflict it
-            // was), as the inbox drain journals it. Unrecorded, a copy of
-            // the op queued by the same rid on another node (as `Records`,
-            // which apply without the base check or the token) could still
-            // run it.
-            Err(MetaError::Conflict) => {
-                if matches!(op, MutateOp::SetManifest { .. }) {
-                    self.record_refusal(rid, Code::Stale, Some(&op), super::Asker::Own, replica);
+                // A stale base or an ended grant is a definitive answer (a
+                // client rebases or reissues under a fresh rid; a replay makes
+                // its conflict copy): the rid's outcome, journaled like any
+                // refusal (`Code::Stale`: a dedup answers it as the conflict it
+                // was), as the inbox drain journals it. Unrecorded, a copy of
+                // the op queued by the same rid on another node (as `Records`,
+                // which apply without the base check or the token) could still
+                // run it.
+                Err(MetaError::Conflict) => {
+                    if matches!(op, MutateOp::SetManifest { .. }) {
+                        self.record_refusal(
+                            rid,
+                            Code::Stale,
+                            Some(&op),
+                            super::Asker::Own,
+                            replica,
+                        );
+                    }
+                    (MutateOutcome::Conflict { manifest: None }, None)
                 }
-                (MutateOutcome::Conflict { manifest: None }, None)
-            }
-            // Plan 30 §M14 phase 2: the op's lock grant ended; nothing ran
-            // but the refusal's row, so there is nothing to wait for.
-            Err(MetaError::LockLapsed) => {
-                self.stats.lock_lapsed_refusals += 1;
-                self.record_refusal(rid, LAPSED_CODE, Some(&op), super::Asker::Own, replica);
-                return MutateOutcome::LockLapsed;
-            }
-            Err(error) => {
-                // Plan 30 §M9: a definitive refusal is journaled as an
-                // outcome (`record_refusal`), for the same reason as a
-                // forwarded op's — and so that the refusal's position is
-                // never "nothing unshipped": under `Backup`/`S3` the
-                // answer then waits for that row to reach the backup /
-                // the log, which is what proves this node still holds.
-                // Without it a holder taken over fast (`ack=s3`, a seal)
-                // could answer a refusal from its stale replica at once
-                // (long-acks3 seed 50277: EEXIST for a name a newer
-                // holder had already renamed away).
-                let code = error.code();
-                self.record_refusal(rid, code, Some(&op), super::Asker::Own, replica);
-                (MutateOutcome::Errno(code), None)
+                // Plan 30 §M14 phase 2: the op's lock grant ended; nothing ran
+                // but the refusal's row, so there is nothing to wait for.
+                Err(MetaError::LockLapsed) => {
+                    self.stats.lock_lapsed_refusals += 1;
+                    self.record_refusal(rid, LAPSED_CODE, Some(&op), super::Asker::Own, replica);
+                    return MutateOutcome::LockLapsed;
+                }
+                Err(error) => {
+                    // Plan 30 §M9: a definitive refusal is journaled as an
+                    // outcome (`record_refusal`), for the same reason as a
+                    // forwarded op's — and so that the refusal's position is
+                    // never "nothing unshipped": under `Backup`/`S3` the
+                    // answer then waits for that row to reach the backup /
+                    // the log, which is what proves this node still holds.
+                    // Without it a holder taken over fast (`ack=s3`, a seal)
+                    // could answer a refusal from its stale replica at once
+                    // (long-acks3 seed 50277: EEXIST for a name a newer
+                    // holder had already renamed away).
+                    let code = error.code();
+                    self.record_refusal(rid, code, Some(&op), super::Asker::Own, replica);
+                    (MutateOutcome::Errno(code), None)
+                }
             }
         };
         // Plan 30 §M9: accepted or refused, the reply observed the

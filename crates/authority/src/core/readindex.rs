@@ -170,6 +170,8 @@ pub(crate) enum ParkedWhat {
         held_timer: Option<TimerId>,
         /// Plan 30 §M14 phase 2: the op's fencing token.
         tag: constellation_meta::locks::LockTag,
+        /// Plan 43 C2: a settle of the rid (`PeerMsg::MutateRequest::settle`).
+        settle: bool,
     },
     /// Plan 30 §M11: a local op of this root, executed (and finished)
     /// once the recall is done and its `deps` are here.
@@ -820,18 +822,21 @@ impl Core {
     /// Plan 30 §M11: park a forwarded op's *execution* (the root recalls
     /// the write delegations first, or waits for `deps`); the requester
     /// is answered `Held` before its RPC times out and re-attaches.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::type_complexity)]
     pub(crate) fn park_exec_reply(
         &mut self,
         now: Now,
         wait: BTreeSet<u64>,
         deps: Option<Position>,
         from: NodeId,
-        req: OpId,
-        rid: Rid,
-        op: MutateOp,
-        acked_through: u64,
-        tag: constellation_meta::locks::LockTag,
+        (req, rid, op, acked_through, tag, settle): (
+            OpId,
+            Rid,
+            MutateOp,
+            u64,
+            constellation_meta::locks::LockTag,
+            bool,
+        ),
         out: &mut Vec<Action>,
     ) {
         self.stats.deleg_exec_parked += 1;
@@ -849,6 +854,7 @@ impl Core {
                 deps: deps.unwrap_or(Position::ZERO),
                 held_timer: None,
                 tag,
+                settle,
             },
         );
         self.rd.parked_rids.insert(rid, id);
@@ -864,6 +870,40 @@ impl Core {
         {
             *held_timer = Some(timer);
         }
+    }
+
+    /// Plan 43 C2 (§5.3 item 5): a settle of `rid` arrived while the rid's
+    /// earlier attempt is parked here *unexecuted* (`ExecuteReply`: waiting
+    /// for a recall or its `deps`): drop that park, so it can never execute
+    /// the op after the settle (`true`). Its requester is the settle's: it
+    /// stopped waiting for the attempt. A parked *answer* (executed, waiting
+    /// for durability or recalls) is left for the settle to re-attach to.
+    pub(crate) fn drop_unexecuted_park(&mut self, rid: Rid, out: &mut Vec<Action>) -> bool {
+        let Some(&id) = self.rd.parked_rids.get(&rid) else {
+            return false;
+        };
+        if !matches!(
+            self.rd.parked.get(&id),
+            Some(Parked {
+                what: ParkedWhat::ExecuteReply { .. },
+                ..
+            })
+        ) {
+            return false;
+        }
+        self.rd.parked_rids.remove(&rid);
+        if let Some(Parked {
+            what:
+                ParkedWhat::ExecuteReply {
+                    held_timer: Some(t),
+                    ..
+                },
+            ..
+        }) = self.rd.parked.remove(&id)
+        {
+            self.cancel_timer(t, out);
+        }
+        true
     }
 
     /// Plan 30 §M11: park a local op's execution.
@@ -1947,6 +1987,7 @@ impl Core {
                     deps,
                     held_timer,
                     tag,
+                    settle,
                 } => {
                     self.rd.parked_rids.remove(&rid);
                     if let Some(t) = held_timer {
@@ -1967,6 +2008,7 @@ impl Core {
                         // `own_chunks` are worked out (`Core::own_chunks_for`).
                         (deps, 0),
                         tag,
+                        settle,
                         replica,
                         out,
                     );

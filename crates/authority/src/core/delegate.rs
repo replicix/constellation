@@ -313,6 +313,8 @@ pub(crate) struct ParkedDeleg {
     pub acked_through: u64,
     /// Plan 30 §M14 phase 2: the op's fencing token.
     pub tag: LockTag,
+    /// Plan 43 C2: a settle of the rid, not an execution.
+    pub settle: bool,
 }
 
 /// This node as the delegate of one generation.
@@ -1524,16 +1526,17 @@ impl Core {
         gen: u64,
         deps: Position,
         replica: &dyn Replica,
-    ) {
+    ) -> bool {
         constellation_meta::clear_last_journaled();
         if let Err(error) = replica.delegate_refusal(rid, code, gen, deps) {
             tracing::warn!(node = self.me(), ?rid, %code, %error, "could not journal a delegate refusal");
-            return;
+            return false;
         }
         self.stats.refusals_journaled += 1;
         if let Some(d) = self.dl.mine.get_mut(&gen) {
             d.executed += 1;
         }
+        true
     }
 
     /// This node's own op `rid`, parked as a delegate before it executed
@@ -1553,6 +1556,12 @@ impl Core {
     /// Execute `op` here as a delegate if it is this node's to execute
     /// (`true`), parking it while its `deps` are missing or the grant is
     /// not honoured. `from == 0` is this node's own client op.
+    ///
+    /// `settle` (plan 43 C2, §5.3 item 5): settle the rid instead — the same
+    /// ownership and grant, never a wait for `deps` or a read recall (a
+    /// refusal has no effect to order, and changes nothing a reader sees);
+    /// an unexecuted park of the rid's earlier attempt here is dropped
+    /// first (left parked it would run the op after the settle).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn delegate_try_execute(
         &mut self,
@@ -1564,6 +1573,7 @@ impl Core {
         deps: Position,
         acked_through: u64,
         tag: &LockTag,
+        settle: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> bool {
@@ -1571,17 +1581,26 @@ impl Core {
         let Some(gen) = self.my_generation_for(&keys, replica) else {
             return false;
         };
+        if settle {
+            for d in self.dl.mine.values_mut() {
+                let before = d.parked.len();
+                d.parked.retain(|p| p.rid != rid || p.settle);
+                self.stats.settle_dropped_parks += (before - d.parked.len()) as u64;
+            }
+        }
         let honoured = self
             .dl
             .mine
             .get(&gen)
             .is_some_and(|d| now.honour < d.until || d.designated);
         // The model's rule 1: the delegate waits for `deps` too.
-        let reaches = replica.reaches(&deps);
+        let reaches = settle || replica.reaches(&deps);
         // Phase 2b (M8): the read delegations this delegate granted on
         // what the op touches are recalled first.
-        let recalling =
-            honoured && reaches && self.deleg_read_recall_pending(now, from, op, replica, out);
+        let recalling = !settle
+            && honoured
+            && reaches
+            && self.deleg_read_recall_pending(now, from, op, replica, out);
         if !honoured || !reaches || recalling {
             tracing::debug!(
                 node = self.me(),
@@ -1610,6 +1629,7 @@ impl Core {
                 deps,
                 acked_through,
                 tag: tag.clone(),
+                settle,
             });
             if from == 0 {
                 if let Some(c) = self.clients.get_mut(&rid) {
@@ -1621,7 +1641,18 @@ impl Core {
             }
             return true;
         }
-        self.delegate_execute_now(now, gen, from, req, rid, op, deps, tag, replica, out);
+        self.delegate_execute_now(
+            now,
+            gen,
+            from,
+            req,
+            rid,
+            op,
+            deps,
+            (tag, settle),
+            replica,
+            out,
+        );
         true
     }
 
@@ -1660,7 +1691,7 @@ impl Core {
         rid: Rid,
         op: &MutateOp,
         deps: Position,
-        tag: &LockTag,
+        (tag, settle): (&LockTag, bool),
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -1668,7 +1699,9 @@ impl Core {
         // acknowledgement, replayed by rid after the end): executing now
         // would put this op in the log ahead of its cause (`marker-order`,
         // long-delegated seed 74189). Not a retry of an op already done.
-        if replica.deps_lost(&deps)
+        // (Nor a settle: its refusal has no effect to order.)
+        if !settle
+            && replica.deps_lost(&deps)
             && replica.recent_outcome(rid).is_none()
             && replica.completed_outcome(rid).ok().flatten().is_none()
         {
@@ -1678,7 +1711,9 @@ impl Core {
                 }
                 let fresh = self.clients.get(&rid).map(|c| c.deps);
                 if let Some(fresh) = fresh.filter(|d| !replica.deps_lost(d)) {
-                    self.delegate_try_execute(now, 0, None, rid, op, fresh, 0, tag, replica, out);
+                    self.delegate_try_execute(
+                        now, 0, None, rid, op, fresh, 0, tag, false, replica, out,
+                    );
                 }
                 return;
             }
@@ -1791,6 +1826,28 @@ impl Core {
                 constellation_meta::CompletedOutcome::Refused { code } => {
                     super::client::refused_as_outcome(code)
                 }
+            }
+        } else if settle {
+            // Plan 43 C2 (§5.3 item 5): no outcome here; refused for good,
+            // a row of the stream like any refusal (its class set above),
+            // answered once its group holds it (below).
+            tracing::debug!(
+                node = self.me(),
+                gen,
+                ?rid,
+                "settle: no outcome here; refused for good"
+            );
+            // No `deps`: the refusal has no effect to order after anything
+            // (the settle did not wait for the op's), and a root appends a
+            // stream row only once it holds what the row names.
+            let none = Position::ZERO;
+            if self.record_delegate_refusal(rid, super::client::ABANDONED_CODE, gen, none, replica)
+            {
+                self.stats.settles_refused += 1;
+                exec_idx = Some(replica.delegate_idx(gen));
+                MutateOutcome::Abandoned
+            } else {
+                MutateOutcome::Busy
             }
         } else {
             match replica.delegate_execute(op, Some(rid), gen, deps, tag, now) {
@@ -3672,16 +3729,16 @@ impl Core {
             if !honoured {
                 continue;
             }
-            let candidates: Vec<(usize, NodeId, MutateOp)> = d
+            let candidates: Vec<(usize, NodeId, MutateOp, bool)> = d
                 .parked
                 .iter()
                 .enumerate()
-                .filter(|(_, p)| replica.reaches(&p.deps))
-                .map(|(i, p)| (i, p.from, p.op.clone()))
+                .filter(|(_, p)| p.settle || replica.reaches(&p.deps))
+                .map(|(i, p)| (i, p.from, p.op.clone(), p.settle))
                 .collect();
             let mut ready = Vec::new();
-            for (i, from, op) in candidates {
-                if !self.deleg_read_recall_pending(now, from, &op, replica, out) {
+            for (i, from, op, settle) in candidates {
+                if settle || !self.deleg_read_recall_pending(now, from, &op, replica, out) {
                     ready.push(i);
                 }
             }
@@ -3699,7 +3756,16 @@ impl Core {
                     continue;
                 }
                 self.delegate_execute_now(
-                    now, gen, p.from, p.req, p.rid, &p.op, p.deps, &p.tag, replica, out,
+                    now,
+                    gen,
+                    p.from,
+                    p.req,
+                    p.rid,
+                    &p.op,
+                    p.deps,
+                    (&p.tag, p.settle),
+                    replica,
+                    out,
                 );
             }
         }

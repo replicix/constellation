@@ -1387,6 +1387,22 @@ pub struct Stats {
     /// acknowledged ops whose refusal was an outcome rather than a
     /// conflict copy.
     pub refusals_journaled: u64,
+    /// Plan 43 C2 (§5.3 item 5), as a sequencer: settles of a rid with no
+    /// outcome here, refused for good (`Refused { rid, ABANDONED_CODE }`),
+    /// and unexecuted parks of a rid's earlier attempt a settle dropped.
+    pub settles_refused: u64,
+    pub settle_dropped_parks: u64,
+    /// Plan 43 C2 (§5.3 item 5), as a requester: ops whose own attempts
+    /// reached their deadline and that were settled — settles sent (one per
+    /// op, however many attempts it takes), answered `Abandoned`, answered
+    /// with the op's own late outcome, settled here because the op never
+    /// left this node (`Abandoned` at once), and those no sequencer answered
+    /// within the settle window (the unsettled `EIO`, I4's one exception).
+    pub settles_sent: u64,
+    pub settled_abandoned: u64,
+    pub settled_late_success: u64,
+    pub settled_local: u64,
+    pub client_unsettled_eio: u64,
     /// Plan 30 §M14 phase 2: ops answered `LockLapsed` — refused here
     /// (as executor) or by the executor that answered this node's
     /// forward, because a cluster-lock grant they were issued under had
@@ -2418,7 +2434,7 @@ impl Core {
                 deps,
                 applied,
                 tag,
-                settle: _,
+                settle,
             } => self.on_mutate_request(
                 now,
                 from,
@@ -2428,6 +2444,7 @@ impl Core {
                 acked_through,
                 (deps, applied),
                 tag,
+                settle,
                 replica,
                 out,
             ),

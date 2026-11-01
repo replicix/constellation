@@ -41114,6 +41114,84 @@ mod deleg_group {
         assert_eq!(h.core.dl.mine[&7].acked_max, 1);
     }
 
+    /// Plan 43 C2 (§5.3 item 5): node 2's settle of a rid the delegate has no
+    /// outcome for is refused for good, a row of the stream like any refusal
+    /// (`Refused { rid, ABANDONED_CODE }`), answered `Abandoned` once its
+    /// group holds it — the root's append, as an execution's answer would
+    /// be — and the op never runs. A settle of a rid the delegate executed
+    /// answers that outcome. Fails on the parent: the settle executed the
+    /// create.
+    #[test]
+    fn a_delegate_settles_a_rid_into_its_stream_and_answers_once_the_root_holds_it() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        let settle = |h: &mut Harness, seq: u64, req: u64, name: &str| {
+            let ino = h.meta.allocate_ino(dir).unwrap();
+            h.step(Event::Peer {
+                from: 2,
+                msg: PeerMsg::MutateRequest {
+                    req: OpId(req),
+                    rid: rid_of(2, seq),
+                    op: MutateOp::Create {
+                        parent: dir,
+                        name: name.into(),
+                        ino,
+                        mode: 0o644,
+                        uid: 0,
+                        gid: 0,
+                    },
+                    acked_through: 0,
+                    deps: constellation_meta::Position::ZERO,
+                    applied: 0,
+                    tag: Default::default(),
+                    settle: true,
+                },
+            })
+        };
+        let out = settle(&mut h, 1, 500, "s");
+        assert_eq!(answer_to_2(&out, 500), None, "answered alone: {out:?}");
+        let (req, round, last) = batch(&out).expect("the refusal streams to the root");
+        let sent = sends(&out).into_iter().any(|(to, m)| {
+            matches!(m, PeerMsg::DelegateStream { txs, .. } if to == 1 && txs.iter().any(|t| {
+                t.records.iter().any(|r| matches!(r, LogRecord::Refused { rid, code }
+                    if *rid == rid_of(2, 1) && *code == crate::ABANDONED_CODE))
+            }))
+        });
+        assert!(sent, "the stream carries the refusal: {out:?}");
+        let out = root_acks(&mut h, req, round, last);
+        let (outcome, committed) = answer_to_2(&out, 500).expect("answered after the root's ack");
+        assert_eq!(outcome, MutateOutcome::Abandoned);
+        assert!(committed);
+        assert!(
+            h.meta.lookup(dir, "s").unwrap().is_none(),
+            "the settle executed"
+        );
+        assert_eq!(h.core.stats.settles_refused, 1);
+        // A copy of the op arriving afterwards dedups to the refusal.
+        let out = forward_create(&mut h, dir, 1, 501);
+        let answer = answer_to_2(&out, 501).map(|a| a.0);
+        assert!(
+            matches!(answer, Some(MutateOutcome::Abandoned) | None),
+            "{out:?}"
+        );
+        assert!(
+            h.meta.lookup(dir, "f1").unwrap().is_none(),
+            "the copy executed"
+        );
+        // A rid it executed: the settle answers the outcome.
+        let out = forward_create(&mut h, dir, 2, 502);
+        let (req, round, last) = batch(&out).expect("streamed");
+        root_acks(&mut h, req, round, last);
+        let out = settle(&mut h, 2, 503, "f2");
+        assert!(
+            matches!(
+                answer_to_2(&out, 503),
+                Some((MutateOutcome::Accepted { .. }, _))
+            ),
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.settles_refused, 1);
+    }
+
     /// Lone: nobody within reach, no backup recorded. Its own client is
     /// answered from its disk (`Lone`), other nodes' forwards wait for the
     /// root. Not lone (the root within the budget): its own client waits for
@@ -48413,5 +48491,204 @@ mod c2f_lone_root {
         after_event(&mut h);
         assert_eq!(wait(&h), constellation_meta::DurableWait::Unexpected);
         assert!(!h.core.ack_view().lone);
+    }
+}
+
+/// Plan 43 C2 (§5.3 item 5, the coder spec's §6.2): the executor rule of a
+/// settle at the root — routed and gated like the op it carries, never a
+/// wait for its `deps`; the rid's outcome if it has one, else
+/// `Refused { rid, ABANDONED_CODE }`, answered once that row is committed.
+mod c2g_settle {
+    use super::c1_counted::{ack, appends, listed_holder};
+    use super::*;
+
+    fn rid3(seq: u64) -> Rid {
+        Rid {
+            node: 3,
+            incarnation: 1,
+            seq,
+        }
+    }
+
+    fn request(req: u64, seq: u64, op: MutateOp, settle: bool) -> Event {
+        Event::Peer {
+            from: 3,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(req),
+                rid: rid3(seq),
+                op,
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+                settle,
+            },
+        }
+    }
+
+    /// The definitive answer to node 3's request `req` in `out`.
+    fn answer(out: &[Action], req: u64) -> Option<(MutateOutcome, bool)> {
+        sends(out).into_iter().find_map(|(to, m)| match m {
+            PeerMsg::MutateReply {
+                req: r,
+                outcome,
+                committed,
+                ..
+            } if to == 3 && *r == OpId(req) && crate::core::backup::is_answer(outcome) => {
+                Some((outcome.clone(), *committed))
+            }
+            _ => None,
+        })
+    }
+
+    /// (The coder spec names it a meta test; the rule lives in the core's
+    /// executors.) A settle of a rid the root executed answers that outcome
+    /// and journals nothing; a settle of a rid it has no outcome for is
+    /// refused for good, and every later copy of the op dedups to that.
+    /// Fails on the parent: the settle executed the create.
+    #[test]
+    fn settle_answers_an_existing_outcome_and_refuses_otherwise() {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        let a = h.create("a");
+        let out = h.step_archived(request(1, 1, a.clone(), false));
+        assert!(matches!(
+            answer(&out, 1),
+            Some((MutateOutcome::Accepted { .. }, _))
+        ));
+        let journaled = h.core.stats.refusals_journaled;
+        let out = h.step_archived(request(2, 1, a, true));
+        assert!(
+            matches!(answer(&out, 2), Some((MutateOutcome::Accepted { .. }, _))),
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.refusals_journaled, journaled);
+        let b = h.create("b");
+        let out = h.step_archived(request(3, 2, b.clone(), true));
+        assert_eq!(
+            answer(&out, 3),
+            Some((MutateOutcome::Abandoned, true)),
+            "{out:?}"
+        );
+        assert!(
+            h.meta.lookup(ROOT_INO, "b").unwrap().is_none(),
+            "the settle executed"
+        );
+        assert!(matches!(
+            h.meta.completed_outcome(rid3(2)),
+            Ok(Some(constellation_meta::CompletedOutcome::Refused { code }))
+                if code == crate::ABANDONED_CODE
+        ));
+        assert_eq!(h.core.stats.settles_refused, 1);
+        // The op itself, late: the refusal is its outcome.
+        let out = h.step_archived(request(4, 2, b, false));
+        assert_eq!(answer(&out, 4).map(|a| a.0), Some(MutateOutcome::Abandoned));
+        assert!(
+            h.meta.lookup(ROOT_INO, "b").unwrap().is_none(),
+            "the copy executed"
+        );
+    }
+
+    /// The settle's refusal is a row like any other: under the root group its
+    /// answer leaves only once the backup holds it (it "waits for its own
+    /// commit"). Fails on the parent: the settle executed (`Accepted`).
+    #[test]
+    fn the_settles_refusal_waits_for_its_commit() {
+        let (mut h, _) = listed_holder();
+        let op = h.create("s");
+        let mut out = h.step(request(7, 1, op, true));
+        assert_eq!(
+            answer(&out, 7),
+            None,
+            "answered before the backup holds it: {out:?}"
+        );
+        if appends(&out).is_empty() {
+            out.extend(h.step(Event::Control {
+                op: OpId(990),
+                req: Control::Journaled,
+            }));
+        }
+        let sent = appends(&out);
+        let (req, _, _) = *sent.last().expect("the refusal is appended to the backup");
+        let tip = h.meta.journal_tip().unwrap();
+        let out = ack(&mut h, req, tip, false);
+        assert_eq!(
+            answer(&out, 7),
+            Some((MutateOutcome::Abandoned, true)),
+            "{out:?}"
+        );
+        assert!(h.meta.lookup(ROOT_INO, "s").unwrap().is_none());
+        assert_eq!(
+            h.core.stats.ack_classes[AckClass::RootGroup.index()],
+            1,
+            "answered as the root group's"
+        );
+    }
+
+    /// A settle never waits for the `deps` its op carried (a refusal has no
+    /// effect to order), and the rid's earlier attempt, parked here
+    /// unexecuted for those `deps`, is dropped: it can never run the op
+    /// after the settle. Fails on the parent: the settle parked behind the
+    /// same `deps`.
+    #[test]
+    fn a_settle_never_waits_for_deps_and_drops_the_unexecuted_park() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        let mut deps = constellation_meta::Position::ZERO;
+        assert!(deps.streams.raise(5, 3));
+        let with_deps = |req: u64, settle: bool, op: MutateOp| Event::Peer {
+            from: 3,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(req),
+                rid: rid3(1),
+                op,
+                acked_through: 0,
+                deps,
+                applied: 0,
+                tag: Default::default(),
+                settle,
+            },
+        };
+        let op = h.create("p");
+        let out = h.step(with_deps(1, false, op.clone()));
+        assert_eq!(answer(&out, 1), None, "{out:?}");
+        assert!(h.core.has_deps_parks(), "parked for its deps");
+        let out = h.step_archived(with_deps(2, true, op));
+        assert_eq!(
+            answer(&out, 2).map(|a| a.0),
+            Some(MutateOutcome::Abandoned),
+            "{out:?}"
+        );
+        assert!(!h.core.has_deps_parks(), "the attempt is still parked");
+        assert_eq!(h.core.stats.settle_dropped_parks, 1);
+        assert!(h.meta.lookup(ROOT_INO, "p").unwrap().is_none());
+    }
+
+    /// The inbox drain settles like a forward: a settle op with no outcome is
+    /// refused for good (the requester learns it from the log); a settle of
+    /// an executed rid journals nothing new. Fails on the parent: executed.
+    #[test]
+    fn an_inbox_settle_is_refused_for_good() {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        let op = h.create("i");
+        let mut batch = inbox_batch(3, 0, 1, &op);
+        batch.ops[0].settle = true;
+        let mut out = Vec::new();
+        h.core
+            .inbox_drain(h.clk(), vec![batch], &h.meta, &mut out)
+            .unwrap();
+        assert!(
+            h.meta.lookup(ROOT_INO, "i").unwrap().is_none(),
+            "the settle executed"
+        );
+        assert!(matches!(
+            h.meta.completed_outcome(rid3(1)),
+            Ok(Some(constellation_meta::CompletedOutcome::Refused { code }))
+                if code == crate::ABANDONED_CODE
+        ));
+        assert_eq!(h.core.stats.settles_refused, 1);
     }
 }

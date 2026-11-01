@@ -45,6 +45,18 @@ impl Core {
     /// `dispatch_mutate`: execute a peer's forwarded op if this node holds
     /// the lease and its view is not fenced; answer `Busy` inside a
     /// release/handoff/gate window, `NotHolder` otherwise.
+    ///
+    /// Plan 43 C2 (§5.3 item 5): a `settle` of `rid` is routed and gated
+    /// exactly like the op it carries — ownership, a live delegation's
+    /// redirect or recall, the takeover gate (the view stays fenced until
+    /// the sealed tail is re-shipped) — but it never waits for `deps` (a
+    /// refusal has no effect to order), and where the op would execute it
+    /// answers the rid's outcome, or journals `Refused { rid,
+    /// ABANDONED_CODE }` and answers `Abandoned` once that row is committed
+    /// (`holder_execute`). An unexecuted park of the rid here (its earlier
+    /// attempt, waiting for a recall or its `deps`) is dropped first: its
+    /// requester has stopped waiting for it, and left parked it would run
+    /// the op after the settle.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_mutate_request(
         &mut self,
@@ -56,6 +68,7 @@ impl Core {
         acked_through: u64,
         (deps, applied): (Position, Seq),
         tag: LockTag,
+        settle: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -67,6 +80,9 @@ impl Core {
         if self.cfg.placement && self.cfg.delegation && self.root_usable(now) {
             let dirs = Core::dirs_of_keys(&keys_of_op(&op), replica);
             self.place_note(from, dirs);
+        }
+        if settle && req != OpId(0) && self.drop_unexecuted_park(rid, out) {
+            self.stats.settle_dropped_parks += 1;
         }
         // Plan 30 §M8: a retry of an op whose reply waits for recalls
         // re-attaches to that wait (its outcome is final; only the
@@ -87,6 +103,7 @@ impl Core {
                 deps,
                 acked_through,
                 &tag,
+                settle,
                 replica,
                 out,
             )
@@ -98,6 +115,7 @@ impl Core {
         // once its own replay of the cause has landed. A retry of an op
         // already done is answered from the dedup below as ever.
         if self.cfg.delegation
+            && !settle
             && replica.deps_lost(&deps)
             && replica.recent_outcome(rid).is_none()
             && replica.completed_outcome(rid).ok().flatten().is_none()
@@ -251,7 +269,7 @@ impl Core {
                         return;
                     }
                 };
-                let deps_wait = (!replica.reaches_streams(&deps)).then_some(deps);
+                let deps_wait = (!settle && !replica.reaches_streams(&deps)).then_some(deps);
                 if !wait.is_empty() || deps_wait.is_some() {
                     if deps_wait.is_some() {
                         self.stats.deleg_deps_waits += 1;
@@ -262,17 +280,13 @@ impl Core {
                             wait,
                             deps_wait,
                             from,
-                            req,
-                            rid,
-                            op,
-                            acked_through,
-                            tag,
+                            (req, rid, op, acked_through, tag, settle),
                             out,
                         );
                     }
                     return;
                 }
-            } else if self.cfg.delegation && !replica.reaches_streams(&deps) {
+            } else if self.cfg.delegation && !settle && !replica.reaches_streams(&deps) {
                 self.stats.deleg_deps_waits += 1;
                 if req != OpId(0) {
                     self.park_exec_reply(
@@ -280,11 +294,7 @@ impl Core {
                         Default::default(),
                         Some(deps),
                         from,
-                        req,
-                        rid,
-                        op,
-                        acked_through,
-                        tag,
+                        (req, rid, op, acked_through, tag, settle),
                         out,
                     );
                 }
@@ -297,7 +307,7 @@ impl Core {
                 rid,
                 &op,
                 &tag,
-                self.asker_of(from),
+                (self.asker_of(from), settle),
                 replica,
                 out,
             );
@@ -706,6 +716,9 @@ impl Core {
     /// to install the existing entry. The second value is set when the op
     /// executed just now: the inodes its records touched (plan 30 §M8's
     /// recall set).
+    ///
+    /// `settle` (plan 43 C2, §5.3 item 5): the rid's outcome from the dedup,
+    /// or else its settle refusal (`settle_refusal`), never an execution.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn holder_execute(
         &mut self,
@@ -714,7 +727,7 @@ impl Core {
         rid: Rid,
         op: &MutateOp,
         tag: &LockTag,
-        asker: super::Asker,
+        (asker, settle): (super::Asker, bool),
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> (MutateOutcome, Option<Vec<u64>>) {
@@ -738,6 +751,9 @@ impl Core {
                 return (super::client::refused_as_outcome(code), None);
             }
             None => {}
+        }
+        if settle {
+            return (self.settle_refusal(rid, Some(op), asker, replica), None);
         }
         tracing::debug!(
             node = self.cfg.node_id,
@@ -838,13 +854,46 @@ impl Core {
         op: Option<&MutateOp>,
         asker: super::Asker,
         replica: &dyn Replica,
-    ) {
+    ) -> bool {
         let _class = self.journal_class_for(asker);
         if let Err(error) = replica.journal_refusal(rid, code, op) {
             tracing::warn!(node = self.cfg.node_id, ?rid, %code, %error, "could not journal a refusal");
-            return;
+            return false;
         }
         self.stats.refusals_journaled += 1;
+        true
+    }
+
+    /// Plan 43 C2 (§5.3 item 5): settle `rid` as the root, which has no
+    /// outcome for it (the caller's dedup found none): journal `Refused {
+    /// rid, ABANDONED_CODE }` under the asker's class, as any refusal of its
+    /// op would be (`record_refusal`), and answer `Abandoned` — once that
+    /// row is committed, like any refusal (the caller's durability wait).
+    /// From then on the refusal is the rid's outcome: every later copy of
+    /// the op dedups to it.
+    ///
+    /// The row's commit is the answer's: answered only once its class's
+    /// group (or the log) holds it, so a successor that takes over re-ships
+    /// it before anything executes there (the takeover gate), and an
+    /// unjournaled settle (the journal write failed) is answered `Busy`
+    /// (the requester retries the settle).
+    pub(crate) fn settle_refusal(
+        &mut self,
+        rid: Rid,
+        op: Option<&MutateOp>,
+        asker: super::Asker,
+        replica: &dyn Replica,
+    ) -> MutateOutcome {
+        tracing::debug!(
+            node = self.cfg.node_id,
+            ?rid,
+            "settle: no outcome here; refused for good"
+        );
+        if !self.record_refusal(rid, super::client::ABANDONED_CODE, op, asker, replica) {
+            return MutateOutcome::Busy;
+        }
+        self.stats.settles_refused += 1;
+        MutateOutcome::Abandoned
     }
 
     /// `SyncRequest::HandOff`: a peer wants the lease. If this node holds
