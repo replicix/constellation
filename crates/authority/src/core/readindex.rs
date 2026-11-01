@@ -840,10 +840,6 @@ impl Core {
         }
     }
 
-    /// Plan 30 §M11: park a forwarded op's *execution* (the root recalls
-    /// the write delegations first, or waits for `deps`); the requester
-    /// is answered `Held` before its RPC times out and re-attaches.
-    #[allow(clippy::type_complexity)]
     /// Plan 46 M0.2 (R4): `rid`'s answer, executed here and parked for
     /// durability, belongs to a row `repair drop-held` rolled back (its
     /// placeholder is queued): it can never be given. Answered `Busy` now
@@ -882,6 +878,11 @@ impl Core {
         self.rd.parked.values().any(|p| p.queue_gated)
     }
 
+    /// Plan 30 §M11: park a forwarded op's *execution* (the root recalls
+    /// the write delegations first, or waits for `deps`); the requester
+    /// is answered `Held` before its RPC times out and re-attaches.
+    /// `queue_gated` (plan 46 M0.2, R3): it waits for the replay queue.
+    #[allow(clippy::type_complexity)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn park_exec_reply(
         &mut self,
