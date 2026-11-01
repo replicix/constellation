@@ -1468,7 +1468,11 @@ impl SessionState {
     /// or holds an epoch).
     pub fn set_durable(&self, gate: bool, jseq: u64, lost: bool, class: RowClass, lone_ok: bool) {
         self.durable_lost.store(lost, Ordering::Relaxed);
-        self.durable_lone_ok.store(lone_ok, Ordering::Relaxed);
+        // Release, read with Acquire after the fast path's journal write
+        // (`durable_lone_ok`, `wait_durable`): a writer that reads the gate
+        // or this flag after its row is journaled sees the core's latest
+        // "may not answer alone" (plan 43 C2f follow-up).
+        self.durable_lone_ok.store(lone_ok, Ordering::Release);
         self.durable_class.store(class.to_u8(), Ordering::Release);
         self.durable_gate.store(gate, Ordering::Release);
         let before = self.durable_jseq.swap(jseq, Ordering::Relaxed);
@@ -1488,10 +1492,10 @@ impl SessionState {
     pub fn wait_durable(&self, jseq: u64, budget: Duration) -> DurableWait {
         let started = Instant::now();
         loop {
-            if !self.durable_gate.load(Ordering::Relaxed) {
+            if !self.durable_gate.load(Ordering::Acquire) {
                 return if self.durable_lost.load(Ordering::Relaxed) {
                     DurableWait::Lost
-                } else if self.durable_lone_ok.load(Ordering::Relaxed) {
+                } else if self.durable_lone_ok.load(Ordering::Acquire) {
                     DurableWait::Ungated
                 } else {
                     DurableWait::Unexpected
@@ -1635,7 +1639,7 @@ impl SessionState {
     /// Plan 43 C2 (§5.4, D5): with the gate off, the core said this node may
     /// answer its own clients alone (it is lone, or holds an epoch).
     pub fn durable_lone_ok(&self) -> bool {
-        self.durable_lone_ok.load(Ordering::Relaxed)
+        self.durable_lone_ok.load(Ordering::Acquire)
     }
 
     /// Whether the durability gate is on (one atomic load: the fast
