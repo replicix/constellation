@@ -1893,12 +1893,17 @@ requester's retry (two live copies of one request id): it stays in the replay
 queue as a *placeholder* in its journal place, with the keys it touched and no
 op. The replay drain holds every later entry on those keys behind it, an op
 arriving from another node waits for the queue entries ahead of it, and the
-requester's retry executes in the dropped row's place; so that node's retry
+requester's retry executes in the dropped row's place (while the dropping
+node remains the sequencer; after a takeover by another node the retry runs
+there ungated, and no acknowledged effect is lost); so that node's retry
 re-executes it, or, if the retry never comes, the sequencer in force
 settles the request id as abandoned after 2 × TTL (`Refused { rid,
-ABANDONED }`, `drop_held_await_ms`) and what waited goes on. An answer
-that may have been given (a group's, an epoch hold's) keeps its replayable
-copy: its requester is not retrying it.
+ABANDONED }`, `drop_held_await_ms`) and what waited goes on. "Never given" is
+what the node's core knows: a lone sequencer's row (its answer waits for the
+log), or a backed row whose answer is still parked for its group — that
+parked answer is aborted in the same step. An answer that may have been given
+(a group's, once released; an epoch hold's) keeps its replayable copy: its
+requester is not retrying it.
 
 ### What an S3 outage blocks
 

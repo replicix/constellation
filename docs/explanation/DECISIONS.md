@@ -1792,7 +1792,10 @@ is re-executed by that node's retry, in the dropped row's place, or
 abandoned after 2 × TTL (C2g′, plan 46 M0.2: the row stays in the replay
 queue as a placeholder, the drain holds what depends on it behind it, an op
 arriving on its keys waits behind the queue, and the bound settles the rid
-with C2g's record). In a
+with C2g's record; a backed root's row is a placeholder only while its answer
+is still parked for the group, which the core, where the drop now runs,
+knows, and the retry takes the dropped row's place only while the dropping
+node remains the sequencer). In a
 continuation epoch's hold an answer to another node is the hold's
 (non-stealable, uncommitted: a non-stealable answer is never said to be
 committed, the maintainer's decision), its row re-tagged so. A node answers its own clients alone only while it is a

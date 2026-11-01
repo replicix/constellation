@@ -63611,3 +63611,102 @@ knob settings); `flex-crash+identity` with the knob is 0 on 92624175 too (the de
 schedules: no I2 (b) pair in 2,000 seeds), so the 677 are the no-knob count. `drop_held_chain_regression_seeds`
 pins seeds 0, 1, 2, 3, 5 of both configurations, each an I2 (b) pair (a dropped row queued here and executing at its
 requester) on 92624175.
+
+## Plan 43 C2g′ review fixes (2026-11-01; plan 46 M0.2)
+
+On the C2g′ commits above (e44ccfa8), after the Opus and fable reviews of R3's park rule. One commit per item, except that
+1a and 8, and 4 and 5, share one each (the log says which). Fail-before is the test named, run with the fix removed.
+
+1. **MUST 1a: the sequencer's own ops stand behind the queue** (`execute_local_outcome`): an own op (not a replay, not a
+   settle) whose keys overlap a queue entry ahead of its place is parked (`park_exec_local`, queue-gated flag,
+   independent of `cfg.delegation`) and answered `Busy`, as a forward is; the FUSE fast path refuses an op on keys the
+   queue holds (`Meta::root_fast_path`, `Meta::queue_overlaps_op`). Fail-before: `an_own_op_stands_behind_the_queue_on_its_keys`
+   (fable's counterexample: a lone root's own `rename` ran ahead of a queued replay on its keys),
+   `the_fast_path_refuses_an_op_on_keys_the_queue_holds`.
+2. **MUST 1b: the own-replay hold is key-aware** (`held_behind_placeholders`): this node's op waits for the replays ahead of it
+   on its keys only where R2 holds the later entries (behind a placeholder); barriers still wait for everything.
+   `KeySet::from_touch_set` takes the exclusive inodes only: a shared parent is not a conflict. Fail-before:
+   `an_unrelated_own_op_is_not_held_for_replays_waiting_behind_a_placeholder` (requester-dies style),
+   `a_read_of_a_sibling_under_a_placeholders_shared_parent_is_not_blocked`.
+3. **Item 3: a delegate's execution of a forward is gated** (`delegate_try_execute`, and the stream-tick candidate filter).
+   Fail-before: `a_delegate_parks_a_forward_behind_its_replay_queue`.
+4. **Item 4: parks behind the queue are aborted on lease loss** (`abort_durable_parks` takes the queue-gated ones, answering
+   `Busy`). Fail-before: `a_deposed_holder_aborts_the_ops_parked_behind_its_queue`.
+5. **Item 5: a replay the holder holds does not start `replay_lease_fallback_ms`** (a `Held` reply to a replay client resets
+   the stuck clock). Fail-before: `a_replay_the_holder_holds_does_not_start_the_lease_fallback`.
+6. **Item 6: a non-stealable shadow is stranded** when its owner's row never reaches the log in `drop_held_await_ms`
+   (`SpecKind::Shadow.non_stealable` carries the install time; `Meta::strand_stale_shadows`, from the drain).
+   Fail-before: `a_non_stealable_shadow_is_stranded_after_the_bound`.
+7. **Item 8: entry keys per queue version** (`KV_PENDING_REPLAY_GEN`, bumped in the transaction of every queue change;
+   `Meta::queue_snapshot` decodes the queue once per generation). Fail-before:
+   `the_queue_snapshot_is_cached_and_every_change_invalidates_it`.
+8. **Item 9: a placeholder holds the planner's keys** (`placeholder_keys` from `tx_keys`: the exclusive inodes and the
+   dentries the row's records wrote, not only the ones they name). Fail-before:
+   `a_placeholder_holds_the_keys_its_row_wrote_not_only_the_ones_it_names`.
+9. **Item 10: guards the mutations did not catch** have tests: `a_remote_row_the_log_completed_is_not_a_placeholder`,
+   `a_settle_in_flight_is_not_started_again`, `an_inbox_op_behind_the_queue_halts_its_batch_in_order_and_is_counted`.
+10. **Item 11: the inbox halt is documented and counted** (`status.ack.inbox_halted`; per-requester order is kept: an op
+    behind a halted one in the same batch waits too).
+11. **Item 2: `repair drop-held` runs in the core and a backed row is a placeholder when its answer is parked.**
+    `Control::DropHeld` (control API → `SyncRequest::DropHeld` → the core) calls `Replica::drop_held` with
+    `answer_parked(rid)`: another node's row journaled `RootGroup`/`DelegGroup` becomes a placeholder only when its answer
+    is still parked for durability in the core (*certainly* unanswered); the parked answer of each placeholder is aborted
+    in the same step (R4, now atomic with the drop). After a restart nothing is parked and nothing is known: the op stays,
+    the only copy that can execute if the answer left. (The proposal's second clause, "the row's jseq above this
+    incarnation's durable watermark", is not used: an answer that no longer sits in the core has left it, and the
+    watermark of a new tenure of the same incarnation does not say what the previous one answered.) `DroppedHeld` now
+    carries the inode, every rid rolled back and the placeholders, and `describe()` words the CLI's line. The `Refused`
+    records the drop journals are `Archive` rows (the core's class check wants one set). Fail-before:
+    `a_group_row_whose_answer_is_parked_becomes_a_placeholder` (no placeholder, parked answer not aborted);
+    `a_group_row_whose_answer_left_keeps_its_op`, `a_group_row_is_kept_when_nothing_says_it_was_not_answered` pin the rest.
+12. **Item 7: the oracles' treatment of an operator's drop is narrowed to the rids it rolled back.** The sim operator now
+    goes through the core and records `DroppedHeld::rolled_back`. I5 and I2c excuse a dropped rid only if the log has an
+    outcome of it (a completion, or its refusal: the drop's own `Io`, whose conflict copy keeps what it wrote, or its
+    replay's), `oracle::survivors_of_drop`; a non-dropped rid, or a dropped one the log has no outcome of, is judged as
+    before. The history witness tries a *subset* of the tentative ops (in any order up to five: the sequencer ran them in
+    the order they reached it) only over the dropped ones, the other tentative ops all applied or none; before it tried
+    every subset of all (seeds 66, 993 of `drop-held-chain` still pass). The tentative set the operator adds is the
+    rolled-back rids, not the whole queue; a rename the log shows took effect is no longer misread as `Same` when its
+    record follows the `Completed` of an adopted tail. A rid the drop kept queued with its op after its answer left is
+    counted with the ungated I2 (b) pairs (`IdentityLedger::kept`), not judged: its requester, who may never have got the
+    answer, retries by the same rid and is gated behind the copy or answered from its outcome. Fail-before (oracle unit
+    tests): `i5_excuses_a_dropped_rid_only_if_its_effect_survives`, the history tests
+    `a_chain_run_in_another_order_than_invoked_explains_a_refusal` and
+    `a_refusal_that_observed_a_chain_of_tentative_effects_is_explained_by_a_subset` (the same chain not dropped is a
+    violation), `i2_a_rid_the_drop_kept_is_counted_not_judged`.
+13. **Item 12: the retry's place.** "The retry executes where the dropped row stood" holds while the dropping node remains
+    the sequencer; after a takeover by another node the retry runs there ungated (no acknowledged effect is lost). In
+    write-path-hygiene.md and the plan 46 M0.2 note.
+14. **NIT**: `park_exec_reply`'s doc comment and `#[allow(clippy::type_complexity)]` are back on it.
+
+### The `drop-held-chain-backed` configuration
+
+`drop-held-chain` on the backup core (`backup_core_config`). On the C2g′ tree (e44ccfa8) 382 of 400 seeds fail, all I2 (b)
+copies (a group row kept with its op queued here and its requester's retry live) and I2c/I5 on the rows the drop rolled back.
+After the fixes and the oracle corrections below: 400 seeds, 10 fail (all "cluster did not reach quiescence"); 2,000 seeds,
+no knob: 51 fail, with `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`: 2 (503, 1004), both quiescence. The 51: 43 quiescence, 2
+I2c ("absent: the log never completed it", 592, 1864), 2 history-witness (422, 1128), 2 "a segment named a chunk S3 does
+not hold" (1476, 1851). **None is closed by this work, and none comes from it**: the same 2,000 seeds with the item-2 rule
+reverted (`unanswered` always false) fail the same seeds, and seeds 132, 196, 240 and 316 fail identically on e44ccfa8; a
+fault-free control (the config without `LoseDirtyChunks`) fails 2 of 400 (132, 233) by quiescence. The quiescence failures
+are a settle write that a backed node journaled and cannot ship (`job Tail`/`Ship` stuck); the chunk-gap pair is a
+successor's segment (epoch 2, after a takeover) shipping a manifest of an inode whose lost chunk the operator's drop had
+already cleared (`DroppedHeld { dropped: 0, rolled_back: [] }`): a pre-existing hole in `drop-held` on a backed root
+(e44ccfa8 fails 1476 and 1851 the same way), to be taken up apart from this review.
+
+**The sim cannot tell item 2 from its absence.** With the fix reverted the sweep fails the same seeds: a kept copy is
+counted, not judged (`IdentityLedger::kept`), because the alternative (judge a kept copy whose answer the oracle never saw
+leave) flags 9 of 400 seeds of rows that are not parked in the core and not answered by the dropping node either (I
+believe a delegate's rows appended to the root's journal, whose answer is the delegate's and which the core cannot
+see; not verified). The fail-before
+of item 2 is the core test `a_group_row_whose_answer_is_parked_becomes_a_placeholder` (it fails with `unanswered` always
+false: no placeholder, the parked answer not aborted in the drop's own step). Seed 7 of the config is the one where a
+parked group answer is a placeholder (`placeholders: [2/2]`).
+
+### Gates
+
+fmt; clippy `-D warnings` over the workspace and all targets; authority lib 911 and `meta_repro` 4, meta 544, engine 950,
+control 146, harness unit tests 167; release sim suite 308 passed / 11 ignored. Sweeps, 2,000 seeds with and without the
+knob: `flex-crash+identity`, `drop-held-chain`, `drop-held-chain-requester-dies`, `flex`, `flex-tight`, `placement-hot`,
+`backup-crash`, `delegated-holder-cut`, `long-delegated-late-answers`: 0 (both); `long-backup`: seed 743 (no knob only; not
+this work); `drop-held-chain-backed`: above. Harness, three runs each: `poison-record-isolation`, `backup-takeover-holds-missing-chunks`, `backup-takeover-drops-held-chunks`, `epoch-member-dies-with-chunk`, `drop-held-remote-dependents` all green (the last through the control API's new core path).

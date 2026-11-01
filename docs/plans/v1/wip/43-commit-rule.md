@@ -2030,9 +2030,10 @@ a rolled-back row of another node whose answer was never given is queued as
 an `AwaitRetry` placeholder (its rid, the keys its records touched, no op,
 class `Lone`) instead of a copy of its op; *never given* is read as: the
 row was journaled `Archive` (a lone sequencer's answer to another node waits
-for an applied segment, which a held row never reaches; a group's row may
-have been answered, which only the core knows, and keeps its replay, as a
-hold's row and this node's own do) and no outcome of the rid is left (the
+for an applied segment, which a held row never reaches), or a group's row
+whose answer is still parked in the core (the drop runs in the core, which
+alone knows: `Control::DropHeld`; a group's row whose answer may have left,
+a hold's row and this node's own keep their replay) and no outcome of the rid is left (the
 strand removed the `completed` row; one an applied segment carries stays and
 the drain finds the rid done). R2: the drain and the takeover gate's local
 replay forget a placeholder whose rid has an outcome (a settle this node
@@ -2061,9 +2062,15 @@ phantom effect of a row its predecessor's lost journal never carried:
 I2 (b) union leaves placeholders out by their kind; I5 excuses a
 non-stealable OK the log completes; the history witness explains a refusal
 by any subset of the tentative ops invoked before it returned (chains of
-acknowledged-then-dropped effects). *Not in the rules*: a delegate executing
-forwards of its subtree is not gated by its own queue (the root's path and
-the inbox are).
+acknowledged-then-dropped effects). *Review fixes* (PROGRESS, "Plan 43 C2g′ review fixes"): the sequencer's own
+ops and a delegate's execution of a forward stand behind the queue too;
+the own-replay hold is key-aware; a group row whose answer is parked is a
+placeholder (`repair drop-held` runs in the core); parks behind the queue
+are aborted on lease loss and do not start the lease fallback; a
+non-stealable shadow is stranded after the bound; the queue is decoded once
+per generation; the retry executes in the dropped row's place only while the
+dropping node remains the sequencer (after a takeover by another node it runs
+there ungated).
 
 ### C3 — Verbatim re-ship; no re-execution of a committed row
 

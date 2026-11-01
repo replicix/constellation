@@ -165,13 +165,24 @@ the artifact.
 ### Another node's rows
 
 An operator's drop re-executes only this node's own rows. A row of another
-node that the drop rolled back and whose answer was never given (a lone
-sequencer answers another node only once the log carries its row, and a
-held row never ships) belongs to its requester: that node's client entry
-retries the request id until its deadline, and a second copy queued here
-would run twice. It stays in the replay queue instead, in the place it had,
-as a *placeholder* (`status.held.awaiting[]`): its request id, the keys it
-touched, no op to run.
+node that the drop rolled back and whose answer was certainly never given
+belongs to its requester: that node's client entry retries the request id
+until its deadline, and a second copy queued here would run twice. It stays
+in the replay queue instead, in the place it had, as a *placeholder*
+(`status.held.awaiting[]`): its request id, the keys it touched, no op to
+run.
+
+*Certainly never given* is what the sequencer can know. The drop runs in the
+node's core (`constellation repair drop-held` is a request to it), which
+knows two things: a lone sequencer answers another node only once the log
+carries its row, and a held row never ships, so the answer of an `Archive`
+row was never given; and a row journaled for the backup group has its answer
+parked in the core until the group holds it, so a group row whose answer is
+still parked has not been answered either (that parked answer is aborted,
+`Busy`, in the same step, so the retry comes at once). Nothing else is known:
+a group row whose answer has left (or may have: the core was restarted since,
+and its parked answers are gone), an epoch hold's row and this node's own
+keep their replayable copy.
 
 - What depends on it waits. The replay drain holds every later entry on
   those keys behind the placeholder (entries on other keys run), and an op
@@ -179,8 +190,13 @@ touched, no op to run.
   ahead of it, answered `Held` meanwhile.
 - The requester's retry executes in the dropped row's place — after the
   entries before it, before the ones after — and resolves the placeholder;
-  what waited goes on. The abort of the answer that was parked for the
-  dropped row (`Busy`) is what sends the retry at once.
+  what waited goes on. That holds while the dropping node remains the
+  sequencer. If another node has taken the lease over by then, the retry
+  goes to it and executes there with no queue of this node's in front of
+  it: ungated, in the order it arrives. No acknowledged effect is lost either
+  way (the placeholder was an unanswered row, and this node's own copies
+  replay by rid to whoever holds the lease); only the position the retry
+  would have taken is not kept.
 - If the retry never comes (the requester is gone, or gave up and settled),
   after `CONSTELLATION_DROP_HELD_AWAIT_MS` (default twice the lease TTL; the
   clock stands still while a continuation epoch refuses writes) the
@@ -191,9 +207,21 @@ touched, no op to run.
   on the state without the dropped row, or a refusal that is a conflict copy
   for an acknowledged op of this node.
 
-A row whose answer may have been given (its backup group's, an epoch hold's)
-keeps its replayable copy: its requester heard the answer and is not
-retrying.
+A row whose answer may have been given (its backup group's, once released; an
+epoch hold's) keeps its replayable copy: its requester heard the answer and
+is not retrying. A copy of another node's op kept this way and the
+requester's own retry (it never got the answer) are one op to the sequencer:
+the retry waits behind the copy where it is queued, and anywhere else is
+answered from the rid's outcome.
+
+An op from another node, or the sequencer's own, that arrives on keys a queue
+entry ahead of it holds waits for the queue (`status.ack.parked_behind_queue`);
+an inbox batch whose op must wait halts at it — the batch is not cut, ops
+behind it in the same requester's order wait too — and the halts are counted
+(`status.ack.inbox_halted`). The wait ends when the entries ahead are done or
+settled; if the node loses the lease, the parked ops are answered `Busy` at
+once and their requesters retry. Time an op spends parked behind the queue
+does not count toward `replay_lease_fallback_ms`.
 
 ### A chunk only a departed node had
 

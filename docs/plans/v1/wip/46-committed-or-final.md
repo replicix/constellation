@@ -608,6 +608,21 @@ after, 732 of them on a non-stealable OK; M1.4's flags). Seed 39 does not
 fail on `92624175` in any `flex*` or `placement-hot` configuration under the
 strict flags. The placeholder is deleted again in M2.2.
 
+*Review fixes (M0.2, 2026-11-01; PROGRESS, "Plan 43 C2g′ review fixes"):* the
+sequencer's own ops and a delegate's forwards stand behind the queue (R3 held
+for forwards only); the own-replay hold is key-aware; `repair drop-held` runs in
+the core, so a backed (group) row whose answer is still parked is a placeholder
+too and its parked answer is aborted in the same step; a non-stealable shadow
+whose owner's row never reaches the log is stranded after the bound; parks
+behind the queue are aborted on lease loss and do not start the lease fallback.
+"The retry executes in the dropped row's place" holds while the dropping node
+remains the sequencer; after a takeover by another node the retry runs ungated
+there (no acknowledged effect is lost). The oracles treat an operator's drop as
+action on the rids it rolled back only (I5, I2c, the history witness); the
+`drop-held-chain-backed` configuration ran 382 of 400 seeds failing before and
+51 of 2,000 after (43 quiescence; the rest fail the same without the fix and
+are not this work's: PROGRESS).
+
 ### Stage 1 — one stream per node, the rule per configuration (6–10 weeks)
 
 | M | Scope | Deletions | Fail-before | Oracles / sims / scenarios / model | Exit |

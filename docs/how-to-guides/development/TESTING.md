@@ -2058,7 +2058,11 @@ was rewritten for the same milestone):
   nothing changes in the seconds after the writes returned (no late
   landing); A's `held.awaiting` is empty and
   `ack.await_retry_settled` is 0 (B retried them all). The sim twins are
-  `drop-held-chain` and `drop-held-chain-requester-dies`.
+  `drop-held-chain`, `drop-held-chain-requester-dies` and
+  `drop-held-chain-backed` (the same on a backed root: another node's rows
+  are group rows, a placeholder only while their answer is parked; not a
+  clean-sweep configuration: 51 of 2,000 seeds fail, 43 by quiescence, none
+  because of the placeholder rule, see PROGRESS, "Plan 43 C2g′ review fixes").
 - **`publish-only-holder`** (plan 30 M4, L8; a measurement). Three nodes,
   each behind its own counting relay, `CONSTELLATION_PUBLISH_IDLE_S=2`,
   lease placement off. A 20 s idle window and a 20 s busy window (all
