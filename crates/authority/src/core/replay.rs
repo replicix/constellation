@@ -4,10 +4,11 @@
 
 use super::client::{completed_as_outcome, Origin};
 use super::Core;
-use crate::action::Action;
+use crate::action::{Action, ControlOk};
 use crate::event::Policy;
-use crate::ids::{Now, WaitMs};
+use crate::ids::{Now, OpId, WaitMs};
 use crate::replica::Replica;
+use constellation_fs_core::Ino;
 use constellation_meta::{MutateOp, MutateOutcome, Position, Rid, StrandedOp};
 use constellation_types::Code;
 use std::collections::BTreeMap;
@@ -534,6 +535,42 @@ impl Core {
         self.stats.await_retry_resolved += 1;
         let _ = replica.forget_replay(entry.queue_seq);
         true
+    }
+
+    /// `Control::DropHeld` (plan 46 M0.2 review): `repair drop-held` run by
+    /// the core, which alone knows which answers of the dropped rows have
+    /// not left — those still parked for durability. Another node's row of
+    /// the group classes is a placeholder only for those (after a restart
+    /// nothing is parked and nothing is known: the op stays, the only copy
+    /// that can execute if its answer left); the parked answer of each
+    /// placeholder is aborted in the same step (R4), so the requester's
+    /// retry arrives at once and meets the placeholder's place.
+    pub(crate) fn on_control_drop_held(
+        &mut self,
+        now: Now,
+        op: OpId,
+        ino: Ino,
+        remote: bool,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let unanswered = |rid: Rid| self.answer_parked(rid).is_some();
+        let dropped = replica.drop_held(ino, now.wall.0 / 1000, remote, &unanswered);
+        match dropped {
+            Ok(dropped) => {
+                for rid in dropped.placeholders.clone() {
+                    self.abort_parked_answer_of(now, rid, replica, out);
+                }
+                out.push(Action::ControlDone {
+                    op,
+                    result: Ok(ControlOk::DroppedHeld(dropped)),
+                });
+            }
+            Err(e) => out.push(Action::ControlDone {
+                op,
+                result: Err(e.to_string()),
+            }),
+        }
     }
 
     /// Plan 46 M0.2 (R5): count the time each placeholder in `queue` has

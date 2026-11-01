@@ -1740,7 +1740,15 @@ impl EngineControl {
     }
 
     pub(crate) fn drop_held(&self, ino: u64, remote: bool) -> std::result::Result<String, String> {
-        held::drop_held(&self.meta, ino, remote)
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.sync_tx
+            .send(sync::SyncRequest::DropHeld { ino, remote, reply })
+            .map_err(|_| "sync task is not running".to_string())?;
+        tokio::task::block_in_place(|| {
+            self.rt
+                .block_on(receive)
+                .map_err(|_| "sync task stopped".to_string())?
+        })
     }
 
     pub(crate) fn doctor(&self) -> std::result::Result<api::DoctorStatus, String> {

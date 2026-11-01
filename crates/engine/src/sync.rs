@@ -562,6 +562,13 @@ pub enum SyncRequest {
         force: bool,
         reply: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
+    /// `repair drop-held` (plan 46 M0.2 review): run by the core, which
+    /// knows which answers of the dropped rows are still parked.
+    DropHeld {
+        ino: Ino,
+        remote: bool,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
     /// Permanently leave the cluster (self). Flushes, tombstones the
     /// registry record, marks the state dir spent, then the caller
     /// unmounts.

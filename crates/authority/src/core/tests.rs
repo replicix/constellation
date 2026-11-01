@@ -49994,6 +49994,162 @@ mod await_retry {
         assert!(queue(&h).iter().all(|(n, _, _)| *n != 2), "{:?}", queue(&h));
     }
 
+    /// A holder backed by node 3 (`group_has`: the journal seq the backup
+    /// holds; 0, every answer waits for it) with a seed, as
+    /// `holder_with_a_seed`.
+    fn backed_holder_with_a_seed(group_has: u64) -> (Harness, Ino) {
+        let (mut h, broken) = holder_with_a_seed();
+        let lease = Lease {
+            ack_policy: constellation_store_s3::AckPolicy::Backup,
+            backups: vec![3],
+            config_version: 2,
+            ..lease_of(1, 1, h.now.plus(10_000).0)
+        };
+        h.core.lease.adopt(h.clk(), lease, tag(), None);
+        h.core.ack.eligible = Some(false);
+        let now = w(h.now);
+        h.core.ack.peers.insert(
+            3,
+            crate::core::backup::BackupPeer {
+                candidacy: 0,
+                alive_at: now,
+                short_since_progress: false,
+                short_since: now,
+                unreachable: false,
+                answered: true,
+                acked: group_has,
+                listed_at: Some(0),
+                counted: group_has,
+                sent_through: group_has,
+                inflight: Default::default(),
+                last_sent: WaitMs(i64::MAX / 2),
+                last_progress: now,
+                committed: true,
+            },
+        );
+        (h, broken)
+    }
+
+    /// `forward_of` without the archive landing: a backed holder's answer
+    /// is the group's, not the archive's.
+    fn forward_raw(
+        h: &mut Harness,
+        from: NodeId,
+        req: u64,
+        rid: Rid,
+        op: &MutateOp,
+    ) -> Vec<Action> {
+        h.step(Event::Peer {
+            from,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(req),
+                rid,
+                op: op.clone(),
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+                settle: false,
+            },
+        })
+    }
+
+    /// `repair drop-held` as the core runs it.
+    fn drop_held_via_core(h: &mut Harness, ino: Ino) -> Vec<Action> {
+        h.step(Event::Control {
+            op: OpId(900),
+            req: Control::DropHeld { ino, remote: false },
+        })
+    }
+
+    /// Item 2 (backed root): another node's row journaled `RootGroup`
+    /// whose answer still waits, parked, for its group is certainly
+    /// unanswered: the drop makes it a placeholder (not a second copy of
+    /// its op, which the requester's retry would run again), and the
+    /// parked answer is aborted in the same step.
+    #[test]
+    fn a_group_row_whose_answer_is_parked_becomes_a_placeholder() {
+        let (mut h, broken) = backed_holder_with_a_seed(0);
+        let p = rid_of(2, 1);
+        let out = forward_raw(&mut h, 2, 60, p, &rename_in_root("broken", "moved"));
+        assert_eq!(
+            reply_to(&out, 60),
+            None,
+            "the group has not got it: {out:?}"
+        );
+        assert_eq!(h.core.parked_durable_count(), 1);
+        assert!(h.core.durable_jseq() < u64::MAX);
+
+        let out = drop_held_via_core(&mut h, broken);
+        assert!(
+            queue(&h).contains(&(2, 1, true)),
+            "a placeholder: {:?}",
+            h.meta.pending_replays().unwrap()
+        );
+        assert_eq!(
+            reply_to(&out, 60),
+            Some(MutateOutcome::Busy),
+            "the parked answer is aborted in the drop's own step: {out:?}"
+        );
+        assert_eq!(h.core.parked_durable_count(), 0);
+        assert!(out.iter().any(|a| matches!(
+            a,
+            Action::ControlDone {
+                result: Ok(ControlOk::DroppedHeld(d)),
+                ..
+            } if d.placeholders == vec![p] && d.rolled_back.contains(&p)
+        )));
+        // The retry executes once, in the dropped row's place; the
+        // placeholder is done with it.
+        let out = forward_raw(&mut h, 2, 61, p, &rename_in_root("broken", "moved"));
+        assert!(
+            h.meta.lookup(ROOT_INO, "moved").unwrap().is_some(),
+            "{out:?}"
+        );
+        h.advance(250);
+        drain(&mut h);
+        assert!(
+            queue(&h).iter().all(|(n, _, _)| *n != 2),
+            "no second copy of the op waits in the queue: {:?}",
+            queue(&h)
+        );
+    }
+
+    /// The same row once its answer has left (the backup holds it): the
+    /// entry keeps its op — the only copy that can execute if the
+    /// requester never retries.
+    #[test]
+    fn a_group_row_whose_answer_left_keeps_its_op() {
+        let (mut h, broken) = backed_holder_with_a_seed(u64::MAX / 2);
+        let p = rid_of(2, 1);
+        let out = forward_raw(&mut h, 2, 60, p, &rename_in_root("broken", "moved"));
+        assert_eq!(h.core.parked_durable_count(), 0, "{out:?}");
+        assert!(
+            matches!(reply_to(&out, 60), Some(MutateOutcome::Accepted { .. })),
+            "{out:?}"
+        );
+        drop_held_via_core(&mut h, broken);
+        assert!(
+            queue(&h).contains(&(2, 1, false)),
+            "an answered group row keeps its op: {:?}",
+            h.meta.pending_replays().unwrap()
+        );
+    }
+
+    /// After a restart nothing is parked and nothing is known: the
+    /// offline form keeps the op of a group row.
+    #[test]
+    fn a_group_row_is_kept_when_nothing_says_it_was_not_answered() {
+        let (h, broken) = holder_with_a_seed();
+        exec_as(&h, RowClass::RootGroup, rid_of(2, 1), &chmod(broken, 0o600));
+        drop_held(&h, broken);
+        assert!(
+            queue(&h).contains(&(2, 1, false)),
+            "{:?}",
+            h.meta.pending_replays().unwrap()
+        );
+    }
+
     /// A holder with a seed and the remote rename of `broken` (node 2,
     /// rid 2/1) dropped into a placeholder, the bound set to 2 s.
     fn placeholder_with_a_short_bound() -> (Harness, Rid) {

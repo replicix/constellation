@@ -550,6 +550,8 @@ enum ControlReply {
     ClaimOffer,
     Text(oneshot::Sender<std::result::Result<String, String>>),
     Leave(oneshot::Sender<std::result::Result<String, String>>),
+    /// `repair drop-held`: what the core's drop did, in words.
+    DropHeld(oneshot::Sender<std::result::Result<String, String>>),
     /// Plan 30 §M8.
     ReadIndex(oneshot::Sender<ReadAnswer>),
     Recall(oneshot::Sender<()>),
@@ -3912,6 +3914,10 @@ impl Driver {
                 Control::AbandonGroup { epoch, gen, force },
                 ControlReply::Text(reply),
             ),
+            SyncRequest::DropHeld { ino, remote, reply } => control(
+                Control::DropHeld { ino, remote },
+                ControlReply::DropHeld(reply),
+            ),
             SyncRequest::Leave { force, reply } => {
                 if let Err(e) = crate::leave::refuse_open_epoch(&self.deps.epochs) {
                     let _ = reply.send(Err(e.to_string()));
@@ -6142,6 +6148,12 @@ impl Driver {
                     .store(false, Ordering::Relaxed);
                 let _ = tx.send(result.map(|ok| match ok {
                     ControlOk::Text(t) => t,
+                    _ => "done".to_string(),
+                }));
+            }
+            ControlReply::DropHeld(tx) => {
+                let _ = tx.send(result.map(|ok| match ok {
+                    ControlOk::DroppedHeld(dropped) => dropped.describe(),
                     _ => "done".to_string(),
                 }));
             }

@@ -210,6 +210,15 @@ pub trait Replica {
     /// reached the log in the bound, so it may never (its journal lost, the
     /// node retired). Rolled back and queued for replay like any strand.
     fn strand_stale_shadows(&self, before_ms: i64) -> Result<Stranded, MetaError>;
+    /// `constellation repair drop-held` (`Meta::drop_held_knowing`);
+    /// `unanswered(rid)`: the core knows the answer of `rid` has not left.
+    fn drop_held(
+        &self,
+        ino: Ino,
+        now_unix: i64,
+        remote: bool,
+        unanswered: &dyn Fn(Rid) -> bool,
+    ) -> Result<constellation_meta::DroppedHeld, MetaError>;
     /// The replay queue decoded once per generation of the queue, with
     /// each entry's keys (`Meta::queue_snapshot`): what the park rules ask.
     fn queue_snapshot(
@@ -988,6 +997,16 @@ impl Replica for Meta {
 
     fn strand_stale_shadows(&self, before_ms: i64) -> Result<Stranded, MetaError> {
         Meta::strand_stale_shadows(self, before_ms)
+    }
+
+    fn drop_held(
+        &self,
+        ino: Ino,
+        now_unix: i64,
+        remote: bool,
+        unanswered: &dyn Fn(Rid) -> bool,
+    ) -> Result<constellation_meta::DroppedHeld, MetaError> {
+        Meta::drop_held_knowing(self, ino, now_unix, remote, unanswered)
     }
 
     fn pending_replays(&self) -> Result<Vec<StrandedOp>, MetaError> {

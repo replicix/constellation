@@ -318,6 +318,8 @@ pub struct HeldInode {
 /// What `repair drop-held` did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DroppedHeld {
+    /// The inode the drop was for.
+    pub ino: Ino,
     /// Seed transactions dropped into conflict copies.
     pub dropped: usize,
     /// Dependent transactions rolled back and queued for replay by rid.
@@ -331,6 +333,31 @@ pub struct DroppedHeld {
     /// Queued replays (from an earlier deposition) of this inode's
     /// manifest, turned into conflict copies as well.
     pub queued_dropped: usize,
+    /// Every rid the drop rolled back or refused: the seeds', the
+    /// dependents' and the queued replays' (what the oracle treats as the
+    /// operator's action, and what a requester's retry may now meet).
+    pub rolled_back: Vec<crate::rid::Rid>,
+    /// Of `rolled_back`, the rids queued as placeholders (`await_retry`).
+    pub placeholders: Vec<crate::rid::Rid>,
+}
+
+impl DroppedHeld {
+    /// The operator's one-line account of the drop (`repair drop-held`).
+    pub fn describe(&self) -> String {
+        format!(
+            "inode {}: {} held transaction(s) dropped into a conflict copy under \
+             {}/ (lost chunks become holes), {} dependent transaction(s) rolled back and queued \
+             for replay ({} of them another node's unanswered row, kept as a placeholder for that \
+             node's retry), {} queued replay(s) dropped, {} unrecoverable pending upload(s) removed",
+            self.ino,
+            self.dropped,
+            crate::CONFLICT_DIR,
+            self.requeued,
+            self.await_retry,
+            self.queued_dropped,
+            self.pending_removed
+        )
+    }
 }
 
 /// One unshipped transaction as the planner sees it.
@@ -1124,7 +1151,7 @@ impl Meta {
     /// `constellation repair drop-held <ino>` (see the module doc's
     /// "Dropping"). `now_unix` stamps the conflict copies' names.
     pub fn drop_held(&self, ino: Ino, now_unix: i64) -> Result<DroppedHeld, MetaError> {
-        self.drop_held_with(ino, now_unix, false)
+        self.drop_held_knowing(ino, now_unix, false, &|_| false)
     }
 
     /// `constellation repair drop-held <ino> --remote`: the same for a
@@ -1139,15 +1166,27 @@ impl Meta {
     /// rows go. Nothing is dropped silently: the requester's op is a
     /// refusal or a conflict copy, never lost.
     pub fn drop_held_remote(&self, ino: Ino, now_unix: i64) -> Result<DroppedHeld, MetaError> {
-        self.drop_held_with(ino, now_unix, true)
+        self.drop_held_knowing(ino, now_unix, true, &|_| false)
     }
 
-    fn drop_held_with(
+    /// `drop_held` / `drop_held_remote` with what only the core knows
+    /// (plan 46 M0.2 review): `unanswered(rid)` says that the answer of
+    /// another node's op, journaled `RootGroup`/`DelegGroup`, is certainly
+    /// not given — it still waits in the core for its group — so the row
+    /// may become a placeholder like an `Archive` one. The offline forms
+    /// above know nothing: such a row keeps its op, the only copy that can
+    /// execute if the answer left.
+    pub fn drop_held_knowing(
         &self,
         ino: Ino,
         now_unix: i64,
         remote: bool,
+        unanswered: &dyn Fn(crate::rid::Rid) -> bool,
     ) -> Result<DroppedHeld, MetaError> {
+        // The `Refused` records the drop journals are answered by the log
+        // alone — nobody is told of them, and a retry meets the record —
+        // so they are `Archive` rows, the class the core's check wants set.
+        let _class = super::journal::PendingClass::set(super::local::RowClass::Archive);
         let mut tx = self.db.write_tx();
         if remote {
             // The inode's remote-pending chunks are unrecoverable from
@@ -1185,6 +1224,8 @@ impl Meta {
         let mut seeds: Vec<(Tx, u64, u64)> = Vec::new(); // (tx, spec_seq, origin)
                                                          // (spec_seq, origin, the keys a placeholder of it holds)
         let mut dependents: Vec<(u64, u64, crate::replay::TouchSet)> = Vec::new();
+        let mut rolled_back: Vec<crate::rid::Rid> = Vec::new();
+        let mut placeholders: Vec<crate::rid::Rid> = Vec::new();
         for (t, seed_inos, keys) in held.held {
             let is_seed = seed_inos.contains(&ino);
             let depends = keys
@@ -1220,14 +1261,19 @@ impl Meta {
         // its place: its requester's retry is the one copy that executes.
         let mut await_retry = 0;
         for (_, origin, keys) in &dependents {
-            if spec::mark_await_retry_tx(
+            if let Some(rid) = spec::queued_at(&tx, self, *origin)?.map(|(rid, _)| rid) {
+                rolled_back.push(rid);
+            }
+            if let Some(rid) = spec::mark_await_retry_tx(
                 &mut tx,
                 self,
                 *origin,
                 keys.clone(),
                 now_unix.saturating_mul(1000),
+                unanswered,
             )? {
                 await_retry += 1;
+                placeholders.push(rid);
             }
         }
         // The rids whose ops are dropped: their outcome goes in the log
@@ -1274,6 +1320,7 @@ impl Meta {
             };
             spec::refuse_queued_tx(&mut tx, self, *origin, rid, op, refusal(&missing))?;
             refused_rids.push(rid);
+            rolled_back.push(rid);
         }
         // Replays of this inode's manifest already queued by an earlier
         // deposition: the same treatment.
@@ -1317,6 +1364,7 @@ impl Meta {
                 refusal(&missing),
             )?;
             refused_rids.push(queued.rid);
+            rolled_back.push(queued.rid);
             queued_dropped += 1;
         }
         // Fix "capture under an epoch hold": the dropped ops' outcome, in
@@ -1392,11 +1440,14 @@ impl Meta {
             "held records dropped into conflict copies"
         );
         Ok(DroppedHeld {
+            ino,
             dropped: seeds.len(),
             requeued: dependents.len(),
             await_retry,
             pending_removed,
             queued_dropped,
+            rolled_back,
+            placeholders,
         })
     }
 }

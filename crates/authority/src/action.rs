@@ -364,6 +364,8 @@ pub enum ControlOk {
     },
     /// `Reintegrate`: what the recovery did.
     Text(String),
+    /// `DropHeld`: what the drop did.
+    DroppedHeld(constellation_meta::DroppedHeld),
     /// Plan 30 §M8: how a strict open or lookup may read.
     ReadIndex(ReadAnswer),
     /// Plan 30 §M14: `Control::Lock`'s answer.

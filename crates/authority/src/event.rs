@@ -334,6 +334,13 @@ pub enum Control {
     /// member of its group within `delegation_ttl_ms`: such a node may not be
     /// gone.
     AbandonGroup { epoch: Epoch, gen: u64, force: bool },
+    /// `constellation repair drop-held <ino> [--remote]` (plan 46 M0.2
+    /// review): the drop runs in the core, which knows which answers of
+    /// the dropped rows are still parked: such a row of another node
+    /// becomes a placeholder, and its parked answer is aborted
+    /// (`Busy`) in the same step — the requester's retry reaches the
+    /// placeholder's place at once. Answered with `ControlOk::DroppedHeld`.
+    DropHeld { ino: Ino, remote: bool },
     /// Flush the journal, publish if the holder, release the lease, and
     /// answer — without stopping (`leave`).
     Flush,

@@ -853,10 +853,19 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let Some(&id) = self.rd.parked_rids.get(&rid) else {
+        let Some(id) = self.answer_parked(rid) else {
             return;
         };
-        if !matches!(
+        self.stats.acks_row_gone += 1;
+        self.abort_park_busy(now, id, replica, out);
+    }
+
+    /// The park of `rid`'s executed answer, waiting for durability: the
+    /// answer has certainly not left this node (plan 46 M0.2 review: what
+    /// makes a group row's drop a placeholder).
+    pub(crate) fn answer_parked(&self, rid: Rid) -> Option<u64> {
+        let &id = self.rd.parked_rids.get(&rid)?;
+        matches!(
             self.rd.parked.get(&id),
             Some(Parked {
                 durable: Some(_),
@@ -866,11 +875,8 @@ impl Core {
                 },
                 ..
             })
-        ) {
-            return;
-        }
-        self.stats.acks_row_gone += 1;
-        self.abort_park_busy(now, id, replica, out);
+        )
+        .then_some(id)
     }
 
     /// Whether an op is parked behind the replay queue (plan 46 M0.2, R3).

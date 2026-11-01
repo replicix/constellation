@@ -70,32 +70,3 @@ pub fn status(meta: &Meta) -> constellation_control::proto::types::HeldStatus {
             .collect(),
     }
 }
-
-/// `constellation repair drop-held <ino> [--remote]`: roll the inode's
-/// held records back, queue what depended on them for replay by rid, and
-/// leave the conflict copies to the replay drain
-/// (`recovery::drain_pending_replays` materializes each refused replay
-/// within a tick or so). `remote`: the records are deferred on chunks
-/// another node forwarded as pending and never uploaded; they are
-/// declared unrecoverable first (`Meta::drop_held_remote`).
-pub fn drop_held(meta: &Meta, ino: u64, remote: bool) -> Result<String, String> {
-    let now = constellation_fs_core::types::now_ns() / 1_000_000_000;
-    let dropped = if remote {
-        meta.drop_held_remote(ino, now)
-    } else {
-        meta.drop_held(ino, now)
-    }
-    .map_err(|e| e.to_string())?;
-    Ok(format!(
-        "inode {ino}: {} held transaction(s) dropped into a conflict copy under \
-         {}/ (lost chunks become holes), {} dependent transaction(s) rolled back and queued \
-         for replay ({} of them another node's unanswered row, kept as a placeholder for that \
-         node's retry), {} queued replay(s) dropped, {} unrecoverable pending upload(s) removed",
-        dropped.dropped,
-        constellation_meta::CONFLICT_DIR,
-        dropped.requeued,
-        dropped.await_retry,
-        dropped.queued_dropped,
-        dropped.pending_removed
-    ))
-}

@@ -3403,8 +3403,11 @@ pub(crate) fn strand_seqs_tx(
 ///   node waits for an applied segment, and a held transaction (the only
 ///   kind an operator drops) never ships. A `RootGroup`/`DelegGroup` row's
 ///   answer leaves once the group has the row, which only the core knows
-///   (the group's acknowledgements are its memory): it may have left, so
-///   the entry stays the only copy that can execute, as before. A
+///   (the group's acknowledgements are its memory): it is a placeholder
+///   only when `unanswered(rid)` says the answer certainly has not left —
+///   it still waits, parked in the core — and otherwise (it may have left;
+///   after a restart nothing says) the entry stays the only copy that can
+///   execute. A
 ///   `NonStealable` (hold) answer left at once; a `Lone` one is the
 ///   node's own. Those keep their op. A reclassed row
 ///   (`reclass_journal_tx`: the answer left with the gate off) is no
@@ -3420,21 +3423,27 @@ pub(crate) fn mark_await_retry_tx(
     key: u64,
     keys: TouchSet,
     since_ms: i64,
-) -> Result<bool, MetaError> {
+    unanswered: &dyn Fn(Rid) -> bool,
+) -> Result<Option<Rid>, MetaError> {
     let Some(v) = tx.get(&meta.pending_replay, seq_key(key))? else {
-        return Ok(false);
+        return Ok(None);
     };
     let mut row: QueuedReplay = postcard::from_bytes(&v)?;
     let node: u64 = kv_get_tx(&*tx, &meta.local, KV_NODE_PREFIX)?
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    let never_given = match row.class {
+        RowClass::Archive => true,
+        RowClass::RootGroup | RowClass::DelegGroup => unanswered(row.rid),
+        _ => false,
+    };
     if row.rid.node == node
-        || row.class != RowClass::Archive
+        || !never_given
         || row.refused.is_some()
         || row.await_retry.is_some()
         || tx.get(&meta.completed, row.rid.to_key())?.is_some()
     {
-        return Ok(false);
+        return Ok(None);
     }
     row.op = MutateOp::Records {
         records: Vec::new(),
@@ -3453,7 +3462,7 @@ pub(crate) fn mark_await_retry_tx(
         postcard::to_allocvec(&row)?,
     );
     counter_add_tx(tx, &meta.local, KV_PENDING_REPLAY_GEN, 1)?;
-    Ok(true)
+    Ok(Some(row.rid))
 }
 
 /// Replace the queued replay at `key` with `op`, already refused for
