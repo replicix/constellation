@@ -1825,8 +1825,17 @@ impl Core {
         replica: &dyn Replica,
         rid: Rid,
     ) -> Result<AnswerSource, constellation_meta::MetaError> {
+        let settled = matches!(
+            replica.completed_outcome(rid),
+            Ok(Some(constellation_meta::CompletedOutcome::Refused { code }))
+                if code == super::client::ABANDONED_CODE
+        );
         Ok(AnswerSource::Sequenced(if replica.outcome_from_log(rid) {
             AckClass::Archive
+        } else if settled {
+            // A settle's refusal is answered as another node's would be,
+            // never re-tagged `Lone` (`Core::settle_refusal`).
+            self.journaled_answer_class_for(replica, rid, Asker::Remote)?
         } else {
             self.journaled_answer_class(replica, rid)?
         }))

@@ -49220,6 +49220,37 @@ mod c2g_settle {
         assert!(h.meta.lookup(ROOT_INO, "own").unwrap().is_none());
     }
 
+    /// C2g's re-check: the same settle, its second deadline before the log
+    /// carries the refusal. The deadline's own check of the rid's outcome
+    /// (`settled_outcome`) does not take the lone shortcut for a settle's
+    /// refusal either: the client hears the unsettled `EIO`, counted. Fails
+    /// on the parent: `Abandoned`, sourced `Lone`, before the archive held it.
+    #[test]
+    fn a_lone_roots_own_settle_the_archive_never_held_is_unsettled() {
+        let mut h = Harness::new(1);
+        h.core.lease.cached_holder = Some(2);
+        let rid = h.rid(1);
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: h.create("own"),
+            tag: Default::default(),
+        });
+        h.hold(1, None);
+        h.core.ack.peers.clear();
+        h.core.ack.candidate = None;
+        h.core.ack.eligible = Some(false);
+        assert!(h.core.root_lone());
+        let deadline = h.core.clients[&rid].deadline;
+        let out = h.step(Event::Timer { id: deadline });
+        assert!(replies(&out).is_empty(), "{out:?}");
+        let second = h.core.clients[&rid].deadline;
+        h.advance(h.core.cfg.settle_window());
+        let out = h.step(Event::Timer { id: second });
+        assert_eq!(replies(&out), vec![(rid, &ClientReply::InDoubt)], "{out:?}");
+        assert_eq!(h.core.stats.client_unsettled_eio, 1);
+    }
+
     /// C2g's review, SHOULD 3: a node that is not the root answers a forward
     /// whose `deps` were lost `NotHolder`, not a `Held` with no generation
     /// (which its requester reads as the root's answer and caches the

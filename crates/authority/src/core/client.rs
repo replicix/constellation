@@ -3406,6 +3406,16 @@ impl Core {
             pending: replica.journal_position(epoch),
             streams: Default::default(),
         };
+        if outcome == MutateOutcome::Abandoned {
+            // A settle's refusal: answered once committed, as another
+            // node's answer (never the lone shortcut, `Core::settle_refusal`).
+            let shipped = replica.journal_acked_seq().unwrap_or(0);
+            let class = self.root_ack_class_for(super::Asker::Remote);
+            return self
+                .answer_need(&position, class, super::Asker::Remote, shipped)
+                .is_none()
+                .then_some(outcome);
+        }
         self.ack_need(&position).is_none().then_some(outcome)
     }
 
