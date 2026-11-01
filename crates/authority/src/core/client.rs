@@ -92,6 +92,9 @@ pub enum ClientPhase {
     AcquireRetry,
     AwaitingLog,
     Recalling,
+    /// Plan 43 C2 (§5.3 item 5): its own attempts reached their deadline;
+    /// a settle of its rid is on its way (whatever route it takes).
+    Settling,
 }
 
 #[derive(Debug)]
@@ -213,6 +216,9 @@ fn slow_op_ms() -> i64 {
 
 impl ClientOp {
     pub fn phase_kind(&self) -> ClientPhase {
+        if self.settle {
+            return ClientPhase::Settling;
+        }
         match self.phase {
             Phase::Gated => ClientPhase::Gated,
             Phase::LearnHolder => ClientPhase::LearnHolder,
@@ -474,11 +480,15 @@ impl Core {
             tracing::warn!(node = self.cfg.node_id, ?rid, "duplicate submit ignored");
             return;
         }
-        let deadline = self.set_timer_wait(
-            now.wait.plus(self.cfg.acquire_deadline_ms),
-            Timer::ClientDeadline(rid),
-            out,
-        );
+        // Plan 43 C2 (§5.3 item 5, Q9): a client op's own attempts end a
+        // settle window before its deadline; the settle has the rest.
+        let tries_for = if Self::settles(origin, policy) {
+            self.cfg.acquire_deadline_ms - self.cfg.settle_window()
+        } else {
+            self.cfg.acquire_deadline_ms
+        };
+        let deadline =
+            self.set_timer_wait(now.wait.plus(tries_for), Timer::ClientDeadline(rid), out);
         let keys = conflict_keys(&op, replica);
         let mut deps = self.fresh_deps(now, replica);
         // Plan 30 §M11: a replay is ordered after this node's session
@@ -1159,7 +1169,7 @@ impl Core {
                 deps,
                 applied: replica.applied_seq().unwrap_or(0),
                 tag: c.tag.clone(),
-                settle: false,
+                settle: c.settle,
             },
         });
     }
@@ -1651,7 +1661,9 @@ impl Core {
             return;
         }
         c.timer = None;
-        if self.hold_for_lost_deps(now, rid, replica, out) {
+        // (A settle has no effect to order after this node's replays.)
+        let settle = c.settle;
+        if !settle && self.hold_for_lost_deps(now, rid, replica, out) {
             return;
         }
         // The view may have opened meanwhile (another op's acquisition
@@ -1756,6 +1768,7 @@ impl Core {
                 .filter(|(_, c)| {
                     c.origin == Origin::Client
                         && c.policy == Policy::Client
+                        && !c.settle
                         && now.wait.since(c.submitted) >= self.cfg.s3_less_deadline_ms as i64
                 })
                 .map(|(rid, _)| *rid)
@@ -1772,7 +1785,7 @@ impl Core {
                     );
                 }
                 self.stats.s3_less_deadlines += 1;
-                self.on_client_deadline(now, rid, replica, out);
+                self.client_deadline(now, rid, true, replica, out);
             }
         }
         if !self.cfg.p2p {
@@ -3027,9 +3040,71 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        self.client_deadline(now, rid, false, replica, out);
+    }
+
+    /// Whether an op of `origin` submitted under `policy` is settled at its
+    /// deadline (plan 43 C2, §5.3 item 5): a client's (FUSE or system) op.
+    /// A replay of a stranded op is the lone branch's (C5), and a
+    /// best-effort batch (atime) is dropped in doubt as ever.
+    pub(crate) fn settles(origin: Origin, policy: Policy) -> bool {
+        origin == Origin::Client && policy != Policy::BestEffort
+    }
+
+    /// The op's deadline (`Timer::ClientDeadline`, or `s3_less` A-1's early
+    /// one while this node's S3 is stalled).
+    ///
+    /// Plan 43 C2 (§5.3 item 5): the first deadline ends the op's own
+    /// attempts. What the log or this node already says of the rid answers
+    /// it; an op that never left this node, with nothing of it executed
+    /// here, has no copy anywhere and is answered `Abandoned` at once;
+    /// otherwise the op is *settled*: under the same rid and the same client
+    /// entry (one submission, I2(b)), a settle goes the ordinary route
+    /// (`settle_route`: this node as the sequencer, a delegate, a forward,
+    /// the inbox, the lease path), and the sequencer in force answers the
+    /// rid's outcome — the late success, a refusal — or journals `Refused
+    /// { rid, ABANDONED_CODE }` and answers `Abandoned` once that row is
+    /// committed. The client hears that outcome (`Abandoned` is `EIO`). The
+    /// second deadline, a settle window later, finds no sequencer answered:
+    /// the client hears the unsettled `EIO` (in doubt, retryable by rid:
+    /// the rid stays in `in_doubt_rids`; `client_unsettled_eio`).
+    ///
+    /// Why a settled `EIO` means "did not, and will not, happen": the
+    /// refusal is a committed row of the sequencer in force for the op's
+    /// keys, and every other copy of the op can execute only at a sequencer
+    /// in force for those keys later, which holds the refusal first and
+    /// dedups the copy to it. Two cases make that the whole of "no
+    /// execution of the rid exists anywhere afterwards":
+    ///
+    /// - *A copy in flight across a routing change.* The op was forwarded
+    ///   to root R and delayed in the network; its directory was delegated
+    ///   to D meanwhile; the settle goes to D, and D journals the refusal;
+    ///   the delayed op arrives at R. R does not execute in a delegated
+    ///   subtree without recalling it first, the recall drains D's stream
+    ///   (which carries the refusal), and `completed` then dedups the op at
+    ///   R. (The other way round, a generation's end drains the delegate's
+    ///   committed rows before anything executes at the root.)
+    /// - *A takeover.* A successor's takeover gate re-ships the sealed tail
+    ///   (the committed rows, the refusal among them) before it executes
+    ///   anything, so a copy executed there after the gate dedups too.
+    ///
+    /// A parked execution of the rid at a sequencer is left to dedup on the
+    /// refusal when it resumes, or is dropped by the settle itself
+    /// (`drop_unexecuted_park`, the delegate's own park). The unsettled
+    /// `EIO` keeps only the older guarantee (retry by rid; an isolated
+    /// requester's op may still land).
+    pub(crate) fn client_deadline(
+        &mut self,
+        now: Now,
+        rid: Rid,
+        s3_less: bool,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
         let Some(c) = self.clients.get(&rid) else {
             return;
         };
+        let second = c.settle;
         // Phase 2b round 2: parked *before* executing (the root waits
         // for a delegation's recall, or this node, the op's delegate,
         // for its grant's renewal or the op's deps): nothing ran, the
@@ -3082,9 +3157,118 @@ impl Core {
             self.finish_as(now, rid, outcome, source, replica, out);
             return;
         }
-        self.stats.in_doubt += 1;
-        tracing::debug!(node = self.cfg.node_id, ?rid, "op goes in doubt");
-        self.finish_in_doubt(now, rid, replica, out);
+        let c = self.clients.get(&rid).expect("present");
+        if second || !Self::settles(c.origin, c.policy) {
+            self.stats.in_doubt += 1;
+            tracing::debug!(
+                node = self.cfg.node_id,
+                ?rid,
+                settle = second,
+                "op goes in doubt"
+            );
+            self.finish_in_doubt(now, rid, replica, out);
+            return;
+        }
+        if !c.forwarded && c.attempts == 0 && c.inbox_keys.is_empty() {
+            // Never sent anywhere, and nothing of it executed here: no copy
+            // of it exists, so nothing can ever execute it. Settled here, by
+            // no sequencer (no row records it: nothing to commit).
+            self.stats.settled_local += 1;
+            tracing::debug!(
+                node = self.cfg.node_id,
+                ?rid,
+                "deadline: never left this node; abandoned"
+            );
+            self.finish_as(
+                now,
+                rid,
+                MutateOutcome::Abandoned,
+                AnswerSource::None,
+                replica,
+                out,
+            );
+            return;
+        }
+        // Settle: until the client's deadline (twice the lease TTL from the
+        // submission), and at least a settle window from here — a deadline
+        // extended for a cold claim keeps its window — but no later than the
+        // full deadline when the early S3-less one started it. (An inbox
+        // op's own attempts end early by the inbox's deadline: its settle
+        // still has the rest of the client's.)
+        let window = self.cfg.settle_window();
+        let full = c.submitted.plus(self.cfg.acquire_deadline_ms);
+        let mut until = now.wait.plus(window);
+        if s3_less {
+            if full > now.wait {
+                until = until.min(full);
+            }
+        } else if full > until {
+            until = full;
+        }
+        let old = c.deadline;
+        self.cancel_timer(old, out);
+        let deadline = self.set_timer_wait(until, Timer::ClientDeadline(rid), out);
+        let c = self.clients.get_mut(&rid).expect("present");
+        c.deadline = deadline;
+        c.settle = true;
+        c.attempts = 0;
+        c.redirected = 0;
+        self.stats.settles_sent += 1;
+        tracing::debug!(
+            node = self.cfg.node_id,
+            ?rid,
+            window,
+            "deadline: settling the op"
+        );
+        self.settle_route(now, rid, replica, out);
+    }
+
+    /// Plan 43 C2 (§5.3 item 5): send a settle of `rid` the way the op itself
+    /// would go now, from wherever it stood — executed here if this node is
+    /// the sequencer for it (the root with its view open, or its delegate),
+    /// forwarded to a live delegate of its keys or to the known holder,
+    /// else the ordinary route (`route`: the lease read, the inbox, the
+    /// lease path). Retries (`Busy`, a timeout, `NotHolder`) go on as the
+    /// op's did until the second deadline.
+    fn settle_route(&mut self, now: Now, rid: Rid, replica: &dyn Replica, out: &mut Vec<Action>) {
+        if let Some(epoch) = self.lease.new_mutation_epoch(now, &self.cfg) {
+            let outcome = self.resolve_in_doubt_then_execute(now, rid, epoch, replica, out);
+            self.finish(now, rid, outcome, replica, out);
+            return;
+        }
+        let Some((op, deps, tag)) = self
+            .clients
+            .get(&rid)
+            .map(|c| (c.op.clone(), c.deps, c.tag.clone()))
+        else {
+            return;
+        };
+        if self.cfg.delegation {
+            if self.delegate_try_execute(now, 0, None, rid, &op, deps, 0, &tag, true, replica, out)
+            {
+                return;
+            }
+            if self.cfg.forwarding && self.cfg.p2p {
+                if let Ownership::Delegated(d) =
+                    replica.resolve_ownership(&super::holder::keys_of_op_in(&op, replica))
+                {
+                    if d.node != self.cfg.node_id && self.reaches(now, d.node) {
+                        self.send_forward(now, rid, d.node, replica, out);
+                        return;
+                    }
+                }
+            }
+        }
+        if let Some(c) = self.clients.get_mut(&rid) {
+            c.phase = Phase::Backoff;
+        }
+        let cached = self.lease.cached_holder.filter(|h| *h != self.cfg.node_id);
+        match cached {
+            Some(holder) if self.reaches(now, holder) && self.cfg.forwarding => {
+                self.send_forward(now, rid, holder, replica, out)
+            }
+            _ => self.route(now, rid, replica, out),
+        }
     }
 
     /// Plan 43 C2 (D6): whether `rid`'s `completed` row here is an outcome
@@ -3180,6 +3364,11 @@ impl Core {
         let Some(c) = self.clients.remove(&rid) else {
             return;
         };
+        if c.settle {
+            // Plan 43 C2: no sequencer answered the settle (I4's one
+            // exception: an isolated requester).
+            self.stats.client_unsettled_eio += 1;
+        }
         self.log_if_slow(now, rid, &c, "in doubt", replica);
         self.cancel_timer(c.deadline, out);
         if let Some(t) = c.timer {
@@ -3313,6 +3502,13 @@ impl Core {
             self.cancel_timer(t, out);
         }
         self.inbox_forget(rid);
+        if c.settle && is_answer(&outcome) {
+            if outcome == MutateOutcome::Abandoned {
+                self.stats.settled_abandoned += 1;
+            } else {
+                self.stats.settled_late_success += 1;
+            }
+        }
         match c.origin {
             Origin::Client => {
                 // Plan 30 §M2 GC: every completion path marks the rid

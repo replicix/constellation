@@ -2292,6 +2292,25 @@ pub struct AckStatus {
     /// C2).
     #[serde(default)]
     pub ungated_unexpected: u64,
+    /// Client mutations answered `EIO` as settled: refused for good by the
+    /// sequencer in force at their deadline, never executed (plan 43 C2).
+    #[serde(default)]
+    pub settled_eio: u64,
+    /// This node's client ops settled at their deadline (plan 43 C2): the
+    /// settles sent, answered `Abandoned` (the op never ran), answered with
+    /// the op's own late outcome, settled locally (the op never left this
+    /// node), and the unsettled `EIO`s — no sequencer answered within the
+    /// settle window (an isolated requester; must be 0 otherwise).
+    #[serde(default)]
+    pub settles_sent: u64,
+    #[serde(default)]
+    pub settled_abandoned: u64,
+    #[serde(default)]
+    pub settled_late_success: u64,
+    #[serde(default)]
+    pub settled_local: u64,
+    #[serde(default)]
+    pub client_unsettled_eio: u64,
     /// The latest seal this node made, as its watch measured the holder's
     /// silence.
     #[serde(default)]

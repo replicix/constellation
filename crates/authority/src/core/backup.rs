@@ -1164,6 +1164,16 @@ pub struct AckView {
     /// ... and for a non-stealable sequencer's answers, uncommitted by
     /// design (`Stats::ungated_shadows_non_stealable`).
     pub ungated_shadows_non_stealable: u64,
+    /// Plan 43 C2 (§5.3 item 5): this node's client ops settled at their
+    /// deadline — settles sent, answered `Abandoned`, answered with the
+    /// op's late outcome, settled here (never left this node), and the
+    /// unsettled `EIO`s (no sequencer answered within the window)
+    /// (`Stats::settles_sent` and the rest).
+    pub settles_sent: u64,
+    pub settled_abandoned: u64,
+    pub settled_late_success: u64,
+    pub settled_local: u64,
+    pub client_unsettled_eio: u64,
 }
 
 impl Core {
@@ -1258,6 +1268,11 @@ impl Core {
                     .any(|r| r.class == constellation_meta::RowClass::Lone),
             ungated_shadows: self.stats.ungated_shadows,
             ungated_shadows_non_stealable: self.stats.ungated_shadows_non_stealable,
+            settles_sent: self.stats.settles_sent,
+            settled_abandoned: self.stats.settled_abandoned,
+            settled_late_success: self.stats.settled_late_success,
+            settled_local: self.stats.settled_local,
+            client_unsettled_eio: self.stats.client_unsettled_eio,
         }
     }
 

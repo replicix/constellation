@@ -1469,6 +1469,7 @@ pub async fn client_lock(
                             | constellation_meta::MutateOutcome::Exists { .. }
                             | constellation_meta::MutateOutcome::Conflict { .. }
                             | constellation_meta::MutateOutcome::LockLapsed
+                            | constellation_meta::MutateOutcome::Abandoned
                     )))
                 );
                 if matches!(

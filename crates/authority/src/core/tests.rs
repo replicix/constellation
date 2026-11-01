@@ -541,10 +541,22 @@ fn a_cold_claim_of_a_longer_lived_lease_is_not_cut_off_by_the_client_deadline() 
     let due = read_at.plus(30_000 + h.core.cfg.acquire_retry_max_ms);
     assert_eq!(moved, vec![due.since(h.clk().wait) as u64]);
     assert_eq!(h.core.stats.client_deadlines_extended, 1);
-    // Once only: the moved deadline answers in doubt.
+    // Once only: the moved deadline ends the op's own attempts — it is
+    // settled (plan 43 C2: a settle to the known holder) — and the settle
+    // window's end, unanswered, answers in doubt.
     let again = timers(&out, TimerKind::ClientDeadline)[0];
     h.advance(due.since(h.clk().wait) as u64);
     let out = h.step(Event::Timer { id: again });
+    assert!(replies(&out).is_empty(), "{out:?}");
+    assert!(
+        sends(&out)
+            .iter()
+            .any(|(to, m)| *to == 2 && matches!(m, PeerMsg::MutateRequest { settle: true, .. })),
+        "{out:?}"
+    );
+    let last = timers(&out, TimerKind::ClientDeadline)[0];
+    h.advance(h.core.cfg.settle_window());
+    let out = h.step(Event::Timer { id: last });
     assert_eq!(replies(&out).len(), 1, "{out:?}");
 }
 
@@ -14183,6 +14195,9 @@ mod backup_crash {
         h.core.deposed(h.clk(), 2, 2, 1, &h.meta, &mut out);
         h.advance(60_000);
         let out = h.step(Event::Timer { id: deadline });
+        // Plan 43 C2: settled first (the deposed journal answers nothing),
+        // in doubt at the window's end with nobody answering.
+        let out = super::settles_then_in_doubt(&mut h, &out, rid);
         let r = replies(&out);
         assert_eq!(r.len(), 1, "{out:?}");
         assert!(
@@ -32739,6 +32754,31 @@ fn stalled(h: &mut Harness, peers_reach_s3: Option<bool>) -> Vec<Action> {
     })
 }
 
+/// Plan 43 C2: `out` is an op's (first) deadline: nothing is answered, a
+/// settle of `rid` goes to node 2, and the settle window's end, with no
+/// answer, is the unsettled in-doubt one.
+fn settles_then_in_doubt(h: &mut Harness, out: &[Action], rid: Rid) -> Vec<Action> {
+    assert!(
+        replies(out).is_empty(),
+        "answered at the first deadline: {out:?}"
+    );
+    assert!(
+        sends(out).iter().any(|(to, m)| *to == 2
+            && matches!(m, PeerMsg::MutateRequest { rid: r, settle: true, .. } if *r == rid)),
+        "no settle: {out:?}"
+    );
+    let at = timers(out, TimerKind::ClientDeadline);
+    assert_eq!(at.len(), 1, "{out:?}");
+    h.advance(h.core.cfg.settle_window());
+    let out = h.step(Event::Timer { id: at[0] });
+    assert!(
+        matches!(replies(&out).as_slice(), [(r, ClientReply::InDoubt)] if *r == rid),
+        "{out:?}"
+    );
+    assert_eq!(h.core.stats.client_unsettled_eio, 1);
+    out
+}
+
 #[test]
 fn a_node_with_its_s3_stalled_keeps_forwarding_past_the_retry_budget() {
     let mut h = Harness::new(1);
@@ -32850,13 +32890,11 @@ fn a_stalled_node_fails_an_unanswered_op_at_the_bound_unless_the_bucket_is_down(
     let out = stalled(&mut h, Some(false));
     assert!(replies(&out).is_empty(), "{out:?}");
     assert_eq!(h.core.stats.s3_less_deadlines, 0);
-    // Only this node lost S3 (or nobody answers): in doubt now, not at
-    // the 2 × TTL deadline.
+    // Only this node lost S3 (or nobody answers): settled now (plan 43
+    // C2), in doubt at the settle window's end, not at the 2 × TTL
+    // deadline.
     let out = stalled(&mut h, Some(true));
-    assert!(
-        matches!(replies(&out).as_slice(), [(r, ClientReply::InDoubt)] if *r == rid),
-        "{out:?}"
-    );
+    settles_then_in_doubt(&mut h, &out, rid);
     assert_eq!(h.core.stats.s3_less_deadlines, 1);
     assert_eq!(h.core.clients().count(), 0);
 }
@@ -32895,13 +32933,10 @@ fn a_forward_step_does_not_fail_a_client_op_early() {
     );
     assert_eq!(h.core.stats.s3_less_deadlines, 0);
     assert_eq!(h.core.clients().count(), 1);
-    // On its own bound it fails.
+    // On its own bound it fails (settled first, plan 43 C2).
     h.advance(bound);
     let out = stalled(&mut h, Some(true));
-    assert!(
-        matches!(replies(&out).as_slice(), [(r, ClientReply::InDoubt)] if *r == rid),
-        "{out:?}"
-    );
+    settles_then_in_doubt(&mut h, &out, rid);
     assert_eq!(h.core.stats.s3_less_deadlines, 1);
 }
 
@@ -32925,10 +32960,7 @@ fn a_backward_step_does_not_extend_a_client_ops_deadline() {
     // The bound has run on this node's clock, whatever the wall says.
     h.advance(bound);
     let out = stalled(&mut h, Some(true));
-    assert!(
-        matches!(replies(&out).as_slice(), [(r, ClientReply::InDoubt)] if *r == rid),
-        "{out:?}"
-    );
+    settles_then_in_doubt(&mut h, &out, rid);
     assert_eq!(h.core.stats.s3_less_deadlines, 1);
 }
 
@@ -35790,18 +35822,22 @@ fn a_delegate_gives_up_a_grant_its_dead_root_never_renews() {
 
 /// The delegate's own op, parked on a renewal its silent root does not
 /// answer, reaches its client deadline: it never executed, so the park
-/// is dropped and the client hears in doubt (and retries by rid). The
-/// deadline used to find no park it knew (only a root's local one) and
-/// was spent: the op stayed parked, and went on with no deadline to the
-/// lease path when the park let it go (the delegate-restart wedge: 540 s
-/// with no answer).
+/// is dropped and — plan 43 C2: the op never left this node, no copy of it
+/// exists anywhere — the client hears it settled, `Abandoned` (`EIO`; it
+/// heard in doubt before C2). The deadline used to find no park it knew
+/// (only a root's local one) and was spent: the op stayed parked, and went
+/// on with no deadline to the lease path when the park let it go (the
+/// delegate-restart wedge: 540 s with no answer).
 #[test]
-fn a_delegate_parked_own_op_goes_in_doubt_at_its_deadline() {
+fn a_delegate_parked_own_op_is_settled_at_its_deadline() {
     let (mut h, _dir, rid, _lapse) = delegate_parked_on_a_silent_root();
     let deadline = h.core.clients[&rid].deadline;
     let out = h.step(Event::Timer { id: deadline });
     assert!(
-        matches!(replies(&out).as_slice(), [(r, ClientReply::InDoubt)] if *r == rid),
+        matches!(
+            replies(&out).as_slice(),
+            [(r, ClientReply::Outcome(MutateOutcome::Abandoned))] if *r == rid
+        ),
         "{out:?}"
     );
     assert!(h.core.dl.mine[&7].parked.is_empty());
@@ -48664,6 +48700,325 @@ mod c2g_settle {
         assert!(!h.core.has_deps_parks(), "the attempt is still parked");
         assert_eq!(h.core.stats.settle_dropped_parks, 1);
         assert!(h.meta.lookup(ROOT_INO, "p").unwrap().is_none());
+    }
+
+    /// The requester's client deadline timer in `out`.
+    fn deadline_timer(h: &Harness, out: &[Action]) -> TimerId {
+        let ids = timers(out, TimerKind::ClientDeadline);
+        assert_eq!(ids.len(), 1, "{out:?}");
+        let id = ids[0];
+        assert!(h.core.timers.contains_key(&id));
+        id
+    }
+
+    /// The forward node 2 sent node 1 in `out`, if any.
+    fn forward_to_1(out: &[Action]) -> Option<PeerMsg> {
+        sends(out)
+            .into_iter()
+            .find(|(to, m)| *to == 1 && matches!(m, PeerMsg::MutateRequest { .. }))
+            .map(|(_, m)| m.clone())
+    }
+
+    /// Deliver node 2's request to the holder and its answer back.
+    fn round_trip(holder: &mut Harness, requester: &mut Harness, msg: PeerMsg) -> Vec<Action> {
+        let answer = holder.step_archived(Event::Peer { from: 2, msg });
+        let reply = sends(&answer)
+            .into_iter()
+            .find(|(to, m)| *to == 2 && matches!(m, PeerMsg::MutateReply { .. }))
+            .unwrap_or_else(|| panic!("no reply to node 2: {answer:?}"))
+            .1
+            .clone();
+        requester.step(Event::Peer {
+            from: 1,
+            msg: reply,
+        })
+    }
+
+    /// A forward whose holder never answered (the request lost): at the
+    /// deadline, a settle window before the old one, the requester settles
+    /// the rid instead of answering in doubt — one settle, under the same
+    /// rid, from the same client entry — and the holder, which never saw
+    /// the op, refuses it for good: the client hears `Abandoned` (`EIO`,
+    /// settled), and a late copy of the op is refused at the holder. Fails
+    /// on the parent: the client heard `InDoubt` at the full deadline.
+    #[test]
+    fn the_deadline_settles_the_rid_before_eio() {
+        let (mut holder, mut requester) = pair();
+        let rid = Rid {
+            node: 2,
+            incarnation: 1,
+            seq: 1,
+        };
+        let op = requester.create("x");
+        let out = requester.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: op.clone(),
+            tag: Default::default(),
+        });
+        let lost = forward_to_1(&out).expect("forwarded");
+        let deadline = deadline_timer(&requester, &out);
+        let cfg = requester.core.config().clone();
+        assert_eq!(cfg.settle_window(), cfg.acquire_deadline_ms / 4);
+        requester.advance(cfg.acquire_deadline_ms - cfg.settle_window());
+        let out = requester.step(Event::Timer { id: deadline });
+        assert!(
+            replies(&out).is_empty(),
+            "answered at the first deadline: {out:?}"
+        );
+        let settle = forward_to_1(&out).expect("the settle is forwarded");
+        assert!(
+            matches!(&settle, PeerMsg::MutateRequest { rid: r, settle: true, .. } if *r == rid),
+            "{settle:?}"
+        );
+        assert_eq!(requester.core.clients.len(), 1, "one client entry");
+        assert_eq!(
+            requester.core.clients[&rid].phase_kind(),
+            ClientPhase::Settling
+        );
+        let out = round_trip(&mut holder, &mut requester, settle);
+        assert_eq!(
+            replies(&out),
+            vec![(rid, &ClientReply::Outcome(MutateOutcome::Abandoned))],
+            "{out:?}"
+        );
+        let st = &requester.core.stats;
+        assert_eq!(
+            (
+                st.settles_sent,
+                st.settled_abandoned,
+                st.client_unsettled_eio,
+                st.in_doubt
+            ),
+            (1, 1, 0, 0)
+        );
+        // The lost request, delivered late, finds the refusal.
+        let late = holder.step_archived(Event::Peer { from: 2, msg: lost });
+        assert!(
+            sends(&late).iter().any(|(_, m)| matches!(
+                m,
+                PeerMsg::MutateReply {
+                    outcome: MutateOutcome::Abandoned,
+                    ..
+                }
+            )),
+            "{late:?}"
+        );
+        assert!(
+            holder.meta.lookup(ROOT_INO, "x").unwrap().is_none(),
+            "the late copy ran"
+        );
+    }
+
+    /// The op executed at the holder and only its reply was lost: the
+    /// settle is answered with the op's outcome (the late success), from
+    /// the rid's one client entry. And at a successor whose log carries the
+    /// rid (the takeover gate re-shipped the tail before it executes
+    /// anything), the settle dedups to the same outcome: nothing runs
+    /// twice. Fails on the parent: `InDoubt`.
+    #[test]
+    fn a_settle_after_the_tail_reship_answers_the_late_success() {
+        let (mut holder, mut requester) = pair();
+        let rid = Rid {
+            node: 2,
+            incarnation: 1,
+            seq: 1,
+        };
+        let op = requester.create("y");
+        let out = requester.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        let request = forward_to_1(&out).expect("forwarded");
+        let deadline = deadline_timer(&requester, &out);
+        // Executed; the reply is lost.
+        holder.step_archived(Event::Peer {
+            from: 2,
+            msg: request,
+        });
+        assert!(holder.meta.lookup(ROOT_INO, "y").unwrap().is_some());
+        let cfg = requester.core.config().clone();
+        requester.advance(cfg.acquire_deadline_ms - cfg.settle_window());
+        let out = requester.step(Event::Timer { id: deadline });
+        let settle = forward_to_1(&out).expect("the settle is forwarded");
+        // A successor whose log carries the rid's transaction answers it.
+        let mut successor = Harness::new(1);
+        let txs = crate::replica::Replica::journal_txs_from(&holder.meta, 0, usize::MAX);
+        let records: Vec<LogRecord> = txs.into_iter().flat_map(|tx| tx.records).collect();
+        crate::replica::Replica::apply_segment(&successor.meta, 1, 1, 0, &[], &[], &records)
+            .unwrap();
+        // (Its core tailed to that head before it took over.)
+        successor.core.ship.head_seq = 1;
+        successor.core.ship.max_epoch = 1;
+        successor.hold(2, None);
+        let answer = successor.step_archived(Event::Peer {
+            from: 2,
+            msg: settle.clone(),
+        });
+        assert!(
+            sends(&answer).iter().any(|(_, m)| matches!(
+                m,
+                PeerMsg::MutateReply {
+                    outcome: MutateOutcome::Accepted { .. },
+                    ..
+                }
+            )),
+            "{answer:?}"
+        );
+        assert_eq!(successor.core.stats.settles_refused, 0);
+        // The holder itself (the same) answers the requester: the late
+        // success, from the dedup (no records), so the requester waits for
+        // the log to carry the transaction, and answers then.
+        let out = round_trip(&mut holder, &mut requester, settle);
+        assert!(replies(&out).is_empty(), "{out:?}");
+        let txs = crate::replica::Replica::journal_txs_from(&holder.meta, 0, usize::MAX);
+        let records: Vec<LogRecord> = txs.into_iter().flat_map(|tx| tx.records).collect();
+        crate::replica::Replica::apply_segment(&requester.meta, 1, 1, 0, &[], &[], &records)
+            .unwrap();
+        let mut out = Vec::new();
+        requester
+            .core
+            .answer_awaiting_log(requester.clk(), &requester.meta, &mut out);
+        assert!(
+            matches!(
+                replies(&out).as_slice(),
+                [(r, ClientReply::Outcome(MutateOutcome::Accepted { .. }))] if *r == rid
+            ),
+            "{out:?}"
+        );
+        assert_eq!(requester.core.stats.settled_late_success, 1);
+    }
+
+    /// An op that never left this node (behind an earlier op on its keys,
+    /// never issued) has no copy anywhere: its deadline settles it here, at
+    /// once, `Abandoned`. And no sequencer answering within the settle
+    /// window is the unsettled `EIO`, counted. Fails on the parent: both
+    /// `InDoubt`.
+    #[test]
+    fn the_settle_reuses_the_rids_client_entry() {
+        let (_holder, mut requester) = pair();
+        let first = Rid {
+            node: 2,
+            incarnation: 1,
+            seq: 1,
+        };
+        let second = Rid { seq: 2, ..first };
+        let op = requester.create("z");
+        let out = requester.step(Event::Submit {
+            policy: Policy::Client,
+            rid: first,
+            op: op.clone(),
+            tag: Default::default(),
+        });
+        let d1 = deadline_timer(&requester, &out);
+        let out = requester.step(Event::Submit {
+            policy: Policy::Client,
+            rid: second,
+            op,
+            tag: Default::default(),
+        });
+        let d2 = deadline_timer(&requester, &out);
+        assert_eq!(
+            requester.core.clients[&second].phase_kind(),
+            ClientPhase::Gated
+        );
+        let cfg = requester.core.config().clone();
+        requester.advance(cfg.acquire_deadline_ms - cfg.settle_window());
+        // The gated one: never sent, abandoned here.
+        let out = requester.step(Event::Timer { id: d2 });
+        assert_eq!(
+            replies(&out),
+            vec![(second, &ClientReply::Outcome(MutateOutcome::Abandoned))],
+            "{out:?}"
+        );
+        assert_eq!(requester.core.stats.settled_local, 1);
+        // The forwarded one settles, from its one entry; nobody answers.
+        let out = requester.step(Event::Timer { id: d1 });
+        assert!(forward_to_1(&out).is_some(), "{out:?}");
+        assert_eq!(requester.core.clients.len(), 1);
+        let again = timers(&out, TimerKind::ClientDeadline);
+        assert_eq!(again.len(), 1, "the settle window's deadline: {out:?}");
+        requester.advance(cfg.settle_window());
+        let out = requester.step(Event::Timer { id: again[0] });
+        assert_eq!(
+            replies(&out),
+            vec![(first, &ClientReply::InDoubt)],
+            "{out:?}"
+        );
+        let st = &requester.core.stats;
+        assert_eq!(
+            (st.settles_sent, st.client_unsettled_eio, st.in_doubt),
+            (1, 1, 1)
+        );
+        assert!(requester.core.clients.is_empty());
+    }
+
+    /// M7: the op was sent to the root and delayed in the network; its
+    /// directory was delegated meanwhile and the settle went to the
+    /// delegate, which refused it for good. The root holds the refusal once
+    /// it appended the delegate's stream, and the generation's end drains
+    /// it; the delayed op, arriving at the root after the end, dedups to
+    /// `Abandoned` and never runs. Fails on the parent: answered
+    /// `Errno(ECANCELED)`.
+    #[test]
+    fn a_settle_at_a_new_delegate_dedups_the_delayed_copy_at_the_root() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        let dir = delegated_to_me(&h.meta, 4);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.gens.contains_key(&7));
+        let r = rid3(1);
+        // The delegate's stream: its settle's refusal.
+        h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegateStream {
+                req: OpId(5),
+                gen: 7,
+                round: 0,
+                txs: vec![constellation_meta::DelegateTx {
+                    idx: 1,
+                    rid: Some(r),
+                    records: vec![LogRecord::Refused {
+                        rid: r,
+                        code: crate::ABANDONED_CODE,
+                    }],
+                    deps: constellation_meta::Position::ZERO,
+                }],
+                leaving: Vec::new(),
+                leaving_barriers: Vec::new(),
+            },
+        });
+        assert_eq!(h.core.dl.gens[&7].cursor, 1, "appended");
+        // The generation ends (outwaited).
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        assert!(h.core.dl.gens[&7].ended, "not ended: {out:?}");
+        // The delayed copy.
+        let ino = h.meta.allocate_ino(dir).unwrap();
+        let op = MutateOp::Create {
+            parent: dir,
+            name: "late".into(),
+            ino,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let out = h.step_archived(request(9, 1, op, false));
+        assert_eq!(
+            answer(&out, 9).map(|a| a.0),
+            Some(MutateOutcome::Abandoned),
+            "{out:?}"
+        );
+        assert!(
+            h.meta.lookup(dir, "late").unwrap().is_none(),
+            "the delayed copy ran"
+        );
     }
 
     /// The inbox drain settles like a forward: a settle op with no outcome is

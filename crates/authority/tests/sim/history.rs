@@ -65,6 +65,9 @@ pub enum NsRet {
     /// `EXDEV` across its boundary): no effect, explained by the table,
     /// not by the namespace.
     Erofs,
+    /// Plan 43 C2 (§5.3 item 5): settled at its deadline — refused for
+    /// good, no effect ever; no namespace precondition explains it.
+    Abandoned,
 }
 
 /// The reference object: the set of names present in the root directory.
@@ -401,9 +404,27 @@ const TENTATIVE_THREAD_BASE: ThreadId = 1 << 40;
 /// Check the history for linearizability against [`NsSpec`], treating
 /// `tentative` rids per the module doc. Returns the reason on failure.
 pub fn check_linearizable(events: &[HistEvt], tentative: &HashSet<Rid>) -> Result<(), String> {
+    // Plan 43 C2: a settled op had no effect and never will (the
+    // exactly-once check fails one the log completes): left out.
+    let abandoned: HashSet<Rid> = events
+        .iter()
+        .filter_map(|e| match e {
+            HistEvt::Return {
+                rid,
+                ret: NsRet::Abandoned,
+                ..
+            } => Some(*rid),
+            _ => None,
+        })
+        .collect();
     let mut tester = LinearizabilityTester::<ThreadId, NsSpec>::new(NsSpec::default());
     for (i, evt) in events.iter().enumerate() {
         let r = match evt {
+            HistEvt::Invoke { rid, .. } | HistEvt::Return { rid, .. }
+                if abandoned.contains(rid) =>
+            {
+                continue
+            }
             HistEvt::Invoke { thread, rid, op } => {
                 let thread = if tentative.contains(rid) {
                     TENTATIVE_THREAD_BASE + i as u64
@@ -578,6 +599,7 @@ pub fn check_linearizable_witnessed(
     for (rid, (ret_i, ret)) in &return_at {
         if *ret == NsRet::Ok
             || *ret == NsRet::Erofs
+            || *ret == NsRet::Abandoned
             || tentative.contains(rid)
             || index_of.contains_key(rid)
         {

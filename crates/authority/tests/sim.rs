@@ -507,6 +507,7 @@ fn replay_seed() {
         Ok("fast-takeover-long-grants") => fast_takeover_long_grants_config(),
         Ok("fast-takeover-capped-grants") => fast_takeover_capped_grants_config(),
         Ok("delegated-long-delegation") => delegated_long_delegation_config(),
+        Ok("delegated-long-delegation-prod") => delegated_long_delegation_prod_config(),
         Ok("strict-isolated-reader-long") => strict_isolated_reader_long_config(),
         Ok("fast-takeover-successor-rate-fast") => fast_takeover_successor_rate_fast_config(),
         Ok("fast-takeover-holder-rate-fast") => fast_takeover_holder_rate_fast_config(),
@@ -2536,6 +2537,31 @@ fn delegated_long_delegation_config() -> SimConfig {
             },
         }],
         ..delegated_config()
+    }
+}
+
+/// Plan 43 C2 (the coder spec's D11): `delegated-long-delegation` with the
+/// production ratio of the client deadline to the TTLs — two lease TTLs
+/// (60 s), the last quarter of it the settle window — so the settle of an
+/// op cut off with its delegate outlasts the generation's outwait: every
+/// `EIO` is settled (`strict_settle`: I4, a settled op never lands; an
+/// unsettled one is none of these). The parent configuration keeps its
+/// 12 s deadline, whose settle window ends before a 20 s generation is
+/// outwaited (its `EIO`s are the unsettled ones, counted). `strict_commit`
+/// stays off as on the parent (its remaining `archive/*` answers are own
+/// clients' that the oracle and the core judge lone differently, C5's D10).
+fn delegated_long_delegation_prod_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(|id, inc| {
+            let mut c = sim::run::sim_core_config(id, inc);
+            c.ttl_ms = 30_000;
+            c.delegation_ttl_ms = 20_000;
+            c.acquire_deadline_ms = 60_000;
+            c.settle_window_ms = 15_000;
+            c
+        }),
+        strict_settle: true,
+        ..delegated_long_delegation_config()
     }
 }
 
@@ -4848,7 +4874,9 @@ fn flex_epochs_survive_crashes_and_faults() {
 /// ships once the member's chunk is up, and everything converges.
 #[test]
 fn flex_a_member_dies_with_the_only_copy_of_a_chunk_and_returns() {
-    let t = run_flex("flex", flex_config(), 1000..1040);
+    // (1000..1040 until plan 43 C2's settle moved the one excusing reply of
+    // that range, 1017's, to later seeds: 1055, 1059.)
+    let t = run_flex("flex", flex_config(), 1000..1060);
     assert!(t.chunk_writes > 0 && t.chunks_uploaded > 0, "{t:?}");
     assert!(
         t.remote_enrolled > 0,
@@ -5147,8 +5175,18 @@ fn a_delegating_root_cut_from_s3_forms_no_epoch_and_fails_over() {
     // on the parent at 1615 and 1628. 1612 takes its place. Plan 43 C1-1's
     // listed-acknowledgement count shifts more of them: 6 of 1600..1630
     // (1604, 1613, 1621, 1624, 1625, 1629: 1.1 to 1.3 s). 1604 leaves the
-    // set; 1613 never joined it.)
-    for seed in (1600..1604).chain(1605..1610).chain(1611..1613) {
+    // set; 1613 never joined it. Plan 43 C2's settle ends an op's own
+    // attempts a settle window before the old deadline: in 1602 and 1608 an
+    // op of the sealing backup's own client is answered at that deadline from
+    // the tail it re-shipped, 8.4 s after the crash and before the floor — no
+    // failover's answer; 1614 and 1615 take their places.)
+    for seed in (1600..1602)
+        .chain(1603..1604)
+        .chain(1605..1608)
+        .chain(1609..1610)
+        .chain(1611..1613)
+        .chain(1614..1616)
+    {
         let report = run_seed(seed, delegated_holder_cut_config()).unwrap_or_else(|e| {
             panic!(
                 "delegated-holder-cut seed {seed}: {e}\n  replay with \
@@ -5475,6 +5513,7 @@ fn sweep_config() {
         "fast-takeover-long-grants" => fast_takeover_long_grants_config(),
         "fast-takeover-capped-grants" => fast_takeover_capped_grants_config(),
         "delegated-long-delegation" => delegated_long_delegation_config(),
+        "delegated-long-delegation-prod" => delegated_long_delegation_prod_config(),
         "strict-isolated-reader-long" => strict_isolated_reader_long_config(),
         "fast-takeover-successor-rate-fast" => fast_takeover_successor_rate_fast_config(),
         "fast-takeover-holder-rate-fast" => fast_takeover_holder_rate_fast_config(),
@@ -7096,6 +7135,9 @@ struct OracleTotals {
     class_mismatch: usize,
     unsourced: usize,
     unjournaled_landed: usize,
+    /// Plan 43 C2: the clients' settles — sent, answered `Abandoned`,
+    /// answered with the late outcome, settled locally, unsettled `EIO`.
+    settles: [u64; 5],
     claimed: [u64; 5],
     i2: usize,
     i2c: usize,
@@ -7219,6 +7261,19 @@ impl OracleTotals {
         self.c14[10] += r.member_copy_rows_left as u64;
         self.unsourced += r.acks_unsourced;
         self.unjournaled_landed += r.unjournaled_landed;
+        let mut unsettled = 0;
+        for st in r.stats.values() {
+            for (c, n) in self.settles.iter_mut().zip([
+                st.settles_sent,
+                st.settled_abandoned,
+                st.settled_late_success,
+                st.settled_local,
+                st.client_unsettled_eio,
+            ]) {
+                *c += n;
+            }
+            unsettled += st.client_unsettled_eio;
+        }
         for st in r.stats.values() {
             for (c, n) in self.claimed.iter_mut().zip(st.ack_classes) {
                 *c += n;
@@ -7285,12 +7340,13 @@ impl OracleTotals {
             + mismatched
             + r.unverified_relays
             + r.unjournaled_landed
+            + unsettled as usize
             > 0
         {
             eprintln!(
                 "SWEEP-ORACLES {label} seed {seed}: i1={uncommitted} {:?} i2={} i2c={} i4={} i5={} \
                  unjournaled={unjournaled} {:?} mismatched={mismatched} {:?} relays={} \
-                 unjournaled-landed={} rebuilds={}/{}",
+                 unjournaled-landed={} unsettled-eio={unsettled} rebuilds={}/{}",
                 r.uncommitted_acks,
                 r.identity_copies,
                 r.non_verbatim,
@@ -7315,7 +7371,8 @@ impl OracleTotals {
              i2c={} (in {}) i4={} (in {}) i5={} (in {}) unjournaled={unjournaled} {:?} unmapped={} \
              rebuilds={}/{} (in {} seeds) max-backups={}; acks by class {:?}; \
              i1-mismatched={mismatched} {:?} (in {} seeds) unverified-relays={} (in {} seeds) \
-             class-mismatch={} unsourced={} unjournaled-landed={}; cores' sequenced answers by \
+             class-mismatch={} unsourced={} unjournaled-landed={}; settles \
+             (sent/abandoned/late-success/local/unsettled-eio) {:?}; cores' sequenced answers by \
              class {:?}",
             self.seeds,
             self.uncommitted,
@@ -7342,6 +7399,7 @@ impl OracleTotals {
             self.class_mismatch,
             self.unsourced,
             self.unjournaled_landed,
+            self.settles,
             constellation_authority::core::AckClass::NAMES.iter().zip(self.claimed).collect::<Vec<_>>()
         );
         eprintln!(
@@ -8017,7 +8075,10 @@ fn delegated_root_failover_keeps_every_ack() {
         t.inherited > 0,
         "no successor inherited a generation: {t:?}"
     );
-    assert!(t.restreams > 0, "no delegate re-streamed: {t:?}");
+    // (No re-stream is asserted since plan 43 C2g: every one this
+    // configuration counted was a delegate taking another delegate for the
+    // root, from a `Held` that named no generation. The root comes back as
+    // itself, and its delegates go on streaming to it.)
 }
 
 /// The root dies with live delegates and no backup (back only after
@@ -12864,18 +12925,20 @@ fn a_lone_rollback_is_judged_at_the_answer_its_client_heard() {
 /// lag probe reports a stopped process) and the backup is kept
 /// (`a_paused_holder_keeps_its_backup`): the removal is the scenario, so
 /// this pin runs the driver that did not report it
-/// (`SimConfig::own_lapses_unreported`).
+/// (`SimConfig::own_lapses_unreported`). (Plan 43 C2's settle moved 586's
+/// trajectory to one that keeps the backup; 582 removes it unreported and
+/// keeps it reported, as 586 did.)
 #[test]
 fn a_removal_that_empties_the_backup_set_gates_acknowledgements() {
     let r = run_seed(
-        586,
+        582,
         SimConfig {
             lease_reads: SLOW_LEASE_READS,
             own_lapses_unreported: true,
             ..long_backup_config()
         },
     )
-    .unwrap_or_else(|e| panic!("long-backup seed 586 (slow lease reads): {e}"));
+    .unwrap_or_else(|e| panic!("long-backup seed 582 (slow lease reads): {e}"));
     assert!(
         r.stats.values().map(|s| s.backups_removed).sum::<u64>() > 0,
         "the holder kept its backup: the pin no longer runs its removal"
@@ -14456,7 +14519,8 @@ fn backup_two_config_runs() {
 /// rebuild failed: "rebuilding the deposed replica from the log failed") the
 /// recovery never finished; with the real rebuild it does, and every
 /// existing check still holds. The seeds are the paused configurations of
-/// `long-delegated-late-answers` that were fixed on main (9287, 2945).
+/// `long-delegated-late-answers` that were fixed on main (9287, 2945; 2924
+/// since plan 43 C2).
 #[test]
 fn c0_the_real_rebuild_recovers_a_deposed_root() {
     use pinned::c0_run;
@@ -14653,24 +14717,45 @@ fn c3_a_delegates_rows_complete_verbatim() {
     }
 }
 
-/// I4: an op answered in doubt lands after an op its node invoked later.
+/// I4: an op answered `EIO` never lands — plan 43 C2 settles it first. On
+/// the C0 baseline (and on C2g's parent) these seeds answered an op in doubt
+/// that then landed after an op its node invoked later; now the deadline
+/// settles each such op (its sequencer answers the late outcome, or refuses
+/// it for good), no late landing is left, and `+settle` holds. Fails on the
+/// parent: each seed's `+settle` run fails with I4.
 #[test]
-fn c0_i4_finds_a_late_landing() {
+fn c2_a_settled_eio_never_lands_late() {
     use pinned::{c0_run, run_seed};
     for &(label, cfg, seeds) in I4_SEEDS {
         for &seed in seeds {
             let r = c0_run(label, seed, cfg());
-            assert!(
-                r.late_landings > 0,
+            assert_eq!(
+                r.late_landings, 0,
                 "{label} seed {seed}: {:?}",
                 r.oracle_examples
             );
-            let e = run_seed(seed, strict(cfg(), "settle")).expect_err("+settle must fail");
             assert!(
-                e.contains("I4 unacked_fails_never_lands_late"),
-                "{label} seed {seed}: {e}"
+                r.stats.values().map(|s| s.settles_sent).sum::<u64>() > 0,
+                "{label} seed {seed}: nothing settled; the seed no longer exercises the path"
             );
+            run_seed(seed, strict(cfg(), "settle"))
+                .unwrap_or_else(|e| panic!("{label}+settle seed {seed}: {e}"));
         }
+    }
+}
+
+/// Plan 43 C2 (D11): `delegated-long-delegation-prod` runs `strict_settle`
+/// clean on a few seeds (the sweeps run 2,000).
+#[test]
+fn c2_delegated_long_delegation_prod_settles_every_eio() {
+    for seed in 0..3u64 {
+        let r = run_seed(seed, delegated_long_delegation_prod_config()).unwrap_or_else(|e| {
+            panic!(
+                "delegated-long-delegation-prod seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=delegated-long-delegation-prod"
+            )
+        });
+        assert_eq!(r.late_landings, 0, "seed {seed}");
     }
 }
 
@@ -14770,8 +14855,10 @@ const I2C_BACKUP_CRASH: &[u64] = &[800, 802, 803];
 /// to no rollback, gave its place to 935: 1 rollback, `+lone` fails with I5.)
 const I5_BACKUP: &[u64] = &[746, 819, 931, 935];
 /// The paused configurations of `long-delegated-late-answers` where the
-/// sim's `RebuildReplica` fires (9287 and 2945 still do).
-const REBUILD_SEEDS: [u64; 2] = [9287, 2945];
+/// sim's `RebuildReplica` fires (9287 still does).
+/// (2945's trajectory, moved by plan 43 C2's settle, no longer rebuilds;
+/// 2924 does.)
+const REBUILD_SEEDS: [u64; 2] = [9287, 2924];
 type I4Seeds = (&'static str, fn() -> SimConfig, &'static [u64]);
 /// `long-delegated-late-answers`: `late_landings`.
 const I4_SEEDS: &[I4Seeds] = &[(

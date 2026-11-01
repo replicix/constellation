@@ -621,6 +621,8 @@ pub fn load_config(
     c.p2p = p2p;
     c.forward_timeout_ms = crate::forward::forward_timeout_ms();
     c.acquire_deadline_ms = 2 * ttl_ms;
+    // (Plan 43 C2, §11 Q9, Q21 (j): `settle_window_ms` stays derived, a
+    // quarter of this; no knob.)
     c.s3_less_deadline_ms = env_ms(
         "CONSTELLATION_S3_LESS_OP_DEADLINE_MS",
         c.s3_less_deadline_ms,

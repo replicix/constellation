@@ -409,18 +409,23 @@ impl Core {
         };
         c.phase = Phase::InboxQueued { epoch };
         c.forwarded = true;
-        if c.inbox_since.is_none() {
+        // (A settle keeps the deadline it was given: the settle window's
+        // end, plan 43 C2.)
+        if c.inbox_since.is_none() && !c.settle {
             c.inbox_since = Some(now.wait);
             // The inbox wait has its own deadline (`min(2×TTL,
             // retention/2)`); the lease path afterwards gets the
             // ordinary one.
             let old = c.deadline;
             self.cancel_timer(old, out);
-            let deadline = self.set_timer_wait(
-                now.wait.plus(self.cfg.inbox_deadline_ms),
-                Timer::ClientDeadline(rid),
-                out,
-            );
+            // Plan 43 C2: the op's own attempts end a settle window early.
+            let tries_for = self
+                .cfg
+                .inbox_deadline_ms
+                .saturating_sub(self.cfg.settle_window())
+                .max(self.cfg.inbox_deadline_ms / 2);
+            let deadline =
+                self.set_timer_wait(now.wait.plus(tries_for), Timer::ClientDeadline(rid), out);
             self.clients.get_mut(&rid).expect("present").deadline = deadline;
         }
         if let Some(t) = self.clients.get_mut(&rid).expect("present").timer.take() {
@@ -498,7 +503,7 @@ impl Core {
                     op,
                     deps: c.deps.to_postcard(),
                     lock_tag: c.tag.to_wire(now.honour),
-                    settle: false,
+                    settle: c.settle,
                 })
             })
             .collect();

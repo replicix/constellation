@@ -188,6 +188,12 @@
           },
           "type": "array"
         },
+        "client_unsettled_eio": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "config_version": {
           "format": "uint64",
           "minimum": 0,
@@ -317,6 +323,38 @@
           "type": "boolean"
         },
         "seals": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "settled_abandoned": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "settled_eio": {
+          "default": 0,
+          "description": "Client mutations answered `EIO` as settled: refused for good by the\nsequencer in force at their deadline, never executed (plan 43 C2).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "settled_late_success": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "settled_local": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "settles_sent": {
+          "default": 0,
+          "description": "This node's client ops settled at their deadline (plan 43 C2): the\nsettles sent, answered `Abandoned` (the op never ran), answered with\nthe op's own late outcome, settled locally (the op never left this\nnode), and the unsettled `EIO`s — no sequencer answered within the\nsettle window (an isolated requester; must be 0 otherwise).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"

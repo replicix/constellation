@@ -149,6 +149,14 @@ pub struct Config {
     pub forward_retries: u32,
     pub forward_backoff_ms: u64,
     pub acquire_deadline_ms: u64,
+    /// Plan 43 C2 (§5.3 item 5, §11 Q9): the end of `acquire_deadline_ms`
+    /// a client op spends *settling* rather than trying: its own attempts
+    /// end this long before the deadline, and a settle of its rid (its
+    /// outcome, or its refusal for good) runs until the deadline. Derived,
+    /// no knob: `0` (the default) is `acquire_deadline_ms / 4` (the op tries
+    /// for 1.5 TTL, settles for 0.5), whatever the deadline is set to; a
+    /// set value is capped at half the deadline ([`Config::settle_window`]).
+    pub settle_window_ms: u64,
     pub acquire_retry_min_ms: u64,
     pub acquire_retry_max_ms: u64,
     /// EC2 campaign 8 A-1: while this node's own S3 path is stalled
@@ -484,6 +492,16 @@ impl Config {
             + self.s3_less_deadline_ms
     }
 
+    /// Plan 43 C2 (§5.3 item 5): the settle window actually used: a quarter
+    /// of the client deadline unless one is set, and never more than half
+    /// of it.
+    pub fn settle_window(&self) -> u64 {
+        match self.settle_window_ms {
+            0 => self.acquire_deadline_ms / 4,
+            ms => ms.min(self.acquire_deadline_ms / 2),
+        }
+    }
+
     /// Plan 43 C7a: the longest a persisted read-grant horizon leads the
     /// write that makes it, ms: a read delegation's TTL, the margin the owner
     /// outwaits it by, and the second the write rounds up by. What a horizon
@@ -582,6 +600,7 @@ impl Config {
             forward_retries: 3,
             forward_backoff_ms: 200,
             acquire_deadline_ms: 2 * ttl_ms,
+            settle_window_ms: 0,
             acquire_retry_min_ms: 100,
             acquire_retry_max_ms: 2_000,
             s3_less_deadline_ms: 20_000,

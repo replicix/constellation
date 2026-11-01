@@ -734,6 +734,8 @@ pub fn sim_core_config(node_id: NodeId, incarnation: u32) -> Config {
     c.forward_retries = 3;
     c.forward_backoff_ms = 150;
     c.acquire_deadline_ms = 12_000;
+    // Plan 43 C2: the op tries for 9 s, then settles for 3 s.
+    c.settle_window_ms = 3_000;
     c.acquire_retry_min_ms = 50;
     c.acquire_retry_max_ms = 1_000;
     c.handoff_request_timeout_ms = 2_000;
@@ -1546,6 +1548,8 @@ fn ns_ret(outcome: &MutateOutcome) -> Result<NsRet, String> {
         MutateOutcome::Errno(Code::Exists) => Ok(NsRet::Eexist),
         MutateOutcome::Errno(Code::NotFound) => Ok(NsRet::Enoent),
         MutateOutcome::Errno(Code::ReadOnly | Code::CrossDevice) => Ok(NsRet::Erofs),
+        // Plan 43 C2: settled at the deadline (definitive, never resubmitted).
+        MutateOutcome::Abandoned => Ok(NsRet::Abandoned),
         other => Err(format!("unexpected client outcome {other:?}")),
     }
 }
@@ -1918,12 +1922,18 @@ async fn client_thread(
                 // A write's outcome is not part of the namespace history
                 // (its effect is checked by convergence and the chunk
                 // rule); any definitive answer ends it.
-                Ok(ClientReply::Outcome(_)) if op.is_none() => {
-                    cluster.note_answered();
+                // (Plan 43 C2: a settled `EIO` is no answer of the
+                // failover's: like an in-doubt one, it says nothing ran.)
+                Ok(ClientReply::Outcome(outcome)) if op.is_none() => {
+                    if outcome != MutateOutcome::Abandoned {
+                        cluster.note_answered();
+                    }
                 }
                 Ok(ClientReply::Outcome(outcome)) => match ns_ret(&outcome) {
                     Ok(ret) => {
-                        cluster.note_answered();
+                        if ret != NsRet::Abandoned {
+                            cluster.note_answered();
+                        }
                         // `AUTHORITY_SIM_TRACE_OPS=1`: every client return
                         // with its simulated time (M12 round 2: the
                         // failover measurement ends at the next `Ok`).
@@ -4676,9 +4686,13 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         });
     if waiting_for_group {
         report.waiting_for_group = true;
+        // (Plan 43 C2: a settled op is no acknowledgement of an effect —
+        // settled at its own node it has no row anywhere — and that it never
+        // lands is the exactly-once and I4 checks'.)
         let nowhere: Vec<Rid> = history
             .returned()
             .into_iter()
+            .filter(|(_, ret)| *ret != NsRet::Abandoned)
             .map(|(rid, _)| rid)
             .filter(|rid| !oracle.completed_at.contains_key(rid))
             .filter(|rid| {

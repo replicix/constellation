@@ -283,6 +283,12 @@ pub fn check_exactly_once(
     }
     for (rid, ret) in returned {
         let n = oracle.completed.get(rid).copied().unwrap_or(0);
+        // Plan 43 C2: a settled op never takes effect, tentative or not.
+        if *ret == NsRet::Abandoned && n != 0 {
+            return Err(format!(
+                "rid {rid:?} was settled (Abandoned) but completed {n} times in the log"
+            ));
+        }
         if tentative.contains(rid) {
             continue;
         }
