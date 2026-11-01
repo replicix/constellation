@@ -431,6 +431,28 @@ impl Core {
         })
     }
 
+    /// Plan 46 M0.2: whether an op that reached this sequencer from `from`
+    /// (0: this node's own client) waits behind the replay queue
+    /// ([`Self::queue_gate_blocks`]). This node's own replays are the
+    /// queue's own and go on.
+    pub(crate) fn gated_by_queue(
+        &self,
+        from: crate::ids::NodeId,
+        rid: Rid,
+        op: &MutateOp,
+        replica: &dyn Replica,
+    ) -> bool {
+        if from == 0
+            && self
+                .clients
+                .get(&rid)
+                .is_some_and(|c| matches!(c.origin, super::client::Origin::Replay { .. }))
+        {
+            return false;
+        }
+        self.queue_gate_blocks(rid, op, replica)
+    }
+
     /// Plan 46 M0.2 (R3): the queue changed (an entry was forgotten, or
     /// executed): the ops parked behind it look again.
     pub(crate) fn wake_queue_parks(

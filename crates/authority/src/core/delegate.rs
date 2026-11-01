@@ -1601,7 +1601,15 @@ impl Core {
             && honoured
             && reaches
             && self.deleg_read_recall_pending(now, from, op, replica, out);
-        if !honoured || !reaches || recalling {
+        // Plan 46 M0.2 (review): behind the replay queue on its keys, as at
+        // the root (R3); under `ack=s3` a delegate's rows for other nodes
+        // are `Archive` and become placeholders too. The parked op is
+        // released by the stream tick when the queue lets go.
+        let queued = !settle && self.gated_by_queue(from, rid, op, replica);
+        if queued {
+            self.stats.ops_parked_behind_queue += 1;
+        }
+        if !honoured || !reaches || recalling || queued {
             tracing::debug!(
                 node = self.me(),
                 gen,
@@ -3737,7 +3745,11 @@ impl Core {
                 .parked
                 .iter()
                 .enumerate()
-                .filter(|(_, p)| p.settle || replica.reaches(&p.deps))
+                .filter(|(_, p)| {
+                    p.settle
+                        || (replica.reaches(&p.deps)
+                            && !self.gated_by_queue(p.from, p.rid, &p.op, replica))
+                })
                 .map(|(i, p)| (i, p.from, p.op.clone(), p.settle))
                 .collect();
             let mut ready = Vec::new();

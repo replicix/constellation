@@ -50438,4 +50438,57 @@ mod await_retry {
         });
         assert!(replies(&out).is_empty(), "{out:?}");
     }
+
+    /// Review item 3: a delegate executing another node's forward in its
+    /// subtree stands behind its own replay queue on the op's keys too (under
+    /// `ack=s3` its rows for other nodes are `Archive` and become
+    /// placeholders). Here a queued replay of `f1` in the subtree holds
+    /// node 2's create of `f1`; once the queue lets go, the stream tick
+    /// executes it.
+    #[test]
+    fn a_delegate_parks_a_forward_behind_its_replay_queue() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        let queued_ino = h.meta.allocate_ino(dir).unwrap();
+        h.meta
+            .queue_replay(
+                rid_of(3, 90),
+                &create_in(dir, "f1", queued_ino),
+                &Default::default(),
+            )
+            .unwrap();
+        let forward = |h: &mut Harness, seq: u64, req: u64, name: &str| {
+            let ino = h.meta.allocate_ino(dir).unwrap();
+            h.step(Event::Peer {
+                from: 2,
+                msg: PeerMsg::MutateRequest {
+                    req: OpId(req),
+                    rid: rid_of(2, seq),
+                    op: create_in(dir, name, ino),
+                    acked_through: 0,
+                    deps: constellation_meta::Position::ZERO,
+                    applied: 0,
+                    tag: Default::default(),
+                    settle: false,
+                },
+            })
+        };
+        forward(&mut h, 1, 500, "f1");
+        assert!(
+            h.meta.lookup(dir, "f1").unwrap().is_none(),
+            "the delegate executed ahead of its queue"
+        );
+        assert_eq!(h.core.stats.ops_parked_behind_queue, 1);
+        // Another name is not held.
+        forward(&mut h, 2, 501, "f2");
+        assert!(h.meta.lookup(dir, "f2").unwrap().is_some());
+        // The queue lets go: the parked forward executes.
+        let q = h.meta.pending_replays().unwrap();
+        h.meta.forget_replay(q[0].queue_seq).unwrap();
+        let mut out = Vec::new();
+        h.core.deleg_after_event(h.clk(), &h.meta, &mut out);
+        assert!(
+            h.meta.lookup(dir, "f1").unwrap().is_some(),
+            "not executed once the queue let go"
+        );
+    }
 }
