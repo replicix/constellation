@@ -90,7 +90,7 @@ chosen for that, not for size.
   nodes needs both grants, and while one holder is lost mid-write it
   fails with `EXDEV` (`mv` falls back to copy and delete; `ln` fails, as
   POSIX allows) until the holder returns or `repair abandon` runs;
-  `hard-links.md` and `delegations.md` say so in M1.3. `hardlink-burst`
+  `delegations.md` (its hard-link section) says so in M1.3. `hardlink-burst`
   and plan 45's box gates on four file systems are re-run at M1.2's exit.
 - **Plan 42** (kernel race workarounds, done). Its invalidations follow
   applied log and stream entries, which this plan does not change; the
