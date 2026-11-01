@@ -3061,6 +3061,11 @@ impl Core {
             Control::Reintegrate => {
                 if replica.lost_persisted() && !self.lease.lost {
                     self.lease.force_lost();
+                    // As every other end of the holder's tenure (plan 43
+                    // C2f review, D5): the fast path is told first that this
+                    // node may not answer its own clients alone, and the
+                    // replica stops being the holder's.
+                    self.clear_holder_epoch(replica);
                     self.fail_barriers(out);
                     self.deleg_on_lease_gone(now, replica, out);
                 }

@@ -49048,6 +49048,33 @@ mod c2g_settle {
     }
 }
 
+/// Plan 43 C2f follow-up: `repair reintegrate` on a node whose deposition
+/// flag is persisted but whose core still holds deposes it like every other
+/// end of a tenure: the FUSE fast path is told it may no longer answer its
+/// own clients alone, and the replica stops being the holder's. Fails on the
+/// parent: the holder epoch stayed set and `lone_ok` stayed published.
+#[test]
+fn a_reintegrate_deposition_clears_the_holder_epoch() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    assert_eq!(h.meta.holder_epoch(), 1);
+    crate::replica::Replica::persist_lost(&h.meta, true).unwrap();
+    h.step(Event::Control {
+        op: OpId(1 << 40),
+        req: Control::Reintegrate,
+    });
+    assert!(h.core.lease.lost, "deposed");
+    assert_eq!(
+        h.meta.holder_epoch(),
+        0,
+        "the replica is still the holder's"
+    );
+    assert!(
+        !h.meta.session().durable_lone_ok(),
+        "the fast path may still answer alone"
+    );
+}
+
 /// Plan 43 C2g's sweeps (`delegated-root-gone` seed 66511): a delegate whose
 /// grant is not honoured answers a forward `Held`, and that answer says
 /// nothing about the lease. It carried no generation, so its requester
