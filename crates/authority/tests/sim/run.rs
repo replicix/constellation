@@ -117,6 +117,17 @@ pub enum FaultKind {
     /// ships), or never (`None`: the run's end applies the operator
     /// procedure, `repair drop-held --remote`).
     CrashEpochMember { restart_ms: Option<u64> },
+    /// Plan 46 M0.2 (`drop-held-chain`): `node` (0: the lease holder)
+    /// loses the chunks only its disk holds (`ChunkWorld::lose_dirty`): the
+    /// manifests naming them are held back by the next upload pass, and the
+    /// operator (`SimConfig::drop_held_after_ms`) drops them with whatever
+    /// depends on them.
+    LoseDirtyChunks { node: NodeId },
+    /// Plan 46 M0.2 (`drop-held-chain-requester-dies`): kill the highest
+    /// live node that is not the lease holder (a requester of the
+    /// holder's), and restart it with its disk after `restart_ms` (`None`:
+    /// never).
+    CrashNonHolder { restart_ms: Option<u64> },
     /// Plan 30 §M9: cut the current holder's path to S3 for `for_ms` (it
     /// keeps acknowledging through its backup; what it journals meanwhile
     /// is the backup's tail).
@@ -461,6 +472,10 @@ pub struct SimConfig {
     /// probability the client writes the file — one fresh chunk, dirty on
     /// its node until its upload pass (`chunks.rs`).
     pub chunk_writes: f64,
+    /// Plan 46 M0.2: how long the simulated operator lets a hopeless held
+    /// write show in `status` before `repair drop-held` (simulated ms);
+    /// 20 s in every configuration but `drop-held-chain`'s.
+    pub drop_held_after_ms: u64,
     /// Plan 45 follow-up: after an op, with this probability the client
     /// also links one of its names to another (`NsOp::Link`) or exchanges
     /// two (`NsOp::Exchange`), in the op's directory: hard links under
@@ -953,6 +968,7 @@ impl Default for SimConfig {
             epoch_slack: 0,
             join_fresh: true,
             chunk_writes: 0.0,
+            drop_held_after_ms: 20_000,
             link_ratio: 0.0,
             cross_links: 0.0,
             link_dirs: Vec::new(),
@@ -3358,6 +3374,52 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
         FaultKind::CrashEpochMember { restart_ms } => {
             crash_epoch_member(&cluster, fault.at_ms, restart_ms, &note).await;
         }
+        FaultKind::CrashNonHolder { restart_ms } => {
+            let Some(lease) = read_lease(&cluster.env.bucket).await else {
+                note(format!("t={} crash-non-holder: no lease yet", fault.at_ms));
+                return;
+            };
+            let Some(node) = cluster
+                .ids()
+                .into_iter()
+                .rev()
+                .find(|id| *id != lease.holder && cluster.get(*id).alive())
+            else {
+                note(format!("t={} crash-non-holder: no such node", fault.at_ms));
+                return;
+            };
+            Box::pin(run_fault(
+                cluster,
+                ScheduledFault {
+                    at_ms: 0,
+                    kind: FaultKind::CrashNode {
+                        node,
+                        restart_ms,
+                        keep_journal: true,
+                    },
+                },
+                log.clone(),
+            ))
+            .await;
+        }
+        FaultKind::LoseDirtyChunks { node } => {
+            let node = if node == 0 {
+                match read_lease(&cluster.env.bucket).await {
+                    Some(lease) => lease.holder,
+                    None => {
+                        note(format!("t={} lose-dirty-chunks: no lease yet", fault.at_ms));
+                        return;
+                    }
+                }
+            } else {
+                node
+            };
+            let lost = cluster.env.world.lose_dirty(node);
+            note(format!(
+                "t={} node {node} lost {lost} chunk(s) only its disk held",
+                cluster.env.clock.elapsed_ms()
+            ));
+        }
     }
 }
 
@@ -4041,7 +4103,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                         &cluster,
                         &world,
                         &fault_log,
-                        Some(20_000),
+                        Some(cfg.drop_held_after_ms),
                         &mut first_seen,
                     );
                 }

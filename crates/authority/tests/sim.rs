@@ -340,6 +340,8 @@ fn replay_seed() {
         Ok("flex") => flex_config(),
         Ok("flex-unchecked") => flex_unchecked_config(),
         Ok("flex-crash") => flex_crash_config(),
+        Ok("drop-held-chain") => drop_held_chain_config(),
+        Ok("drop-held-chain-requester-dies") => drop_held_chain_requester_dies_config(),
         Ok("flex-tight") => flex_tight_config(),
         Ok("flex-long") => flex_config(),
         Ok("flex-backup") => flex_backup_config(),
@@ -4723,6 +4725,108 @@ fn flex_crash_config() -> SimConfig {
     }
 }
 
+/// Plan 46 M0.2 (C2g′, the drop-held proposal's option B): `repair
+/// drop-held` over a lone root. Three nodes on the lone root's core
+/// (no backups: another node's answer waits for the log), all of them
+/// creating, writing, renaming, unlinking and reading the four names of
+/// the root directory — the poisoned file's directory — with the metered
+/// upload hold keeping each chunk on its writer for 4 s. At 1.8 s the
+/// root loses the chunks only its disk holds: the manifests naming them
+/// are held back, and with them every later row on a key they touched —
+/// the other nodes' creates and renames in the directory included, which
+/// the root has journaled and not answered (their answers wait for a log
+/// the held rows block). The simulated operator drops the held write 2 s
+/// after it shows. Before option B the root queued the other nodes' rows
+/// again beside their requesters' retries (two copies of each rid:
+/// `strict_identity`), and replayed their dependents without the dropped
+/// row's effect and ahead of the retries (an `EEXIST` or `ENOENT` no
+/// state explains, a read that goes back: the history checks). With it
+/// each such row is a placeholder, its dependents wait for the requester's
+/// retry, and the retry executes in the row's place.
+fn drop_held_chain_config() -> SimConfig {
+    SimConfig {
+        ops_per_client: 10,
+        random_faults: 0,
+        read_ratio: 0.3,
+        chunk_writes: 0.6,
+        upload_hold_ms: 4_000,
+        drop_held_after_ms: 2_000,
+        strict_identity: true,
+        strict_settle: true,
+        faults: vec![ScheduledFault {
+            at_ms: 1_800,
+            kind: FaultKind::LoseDirtyChunks { node: 0 },
+        }],
+        ..SimConfig::default()
+    }
+}
+
+/// The same, with a requester dying before its retry: the highest node
+/// that is not the root is killed for good at 2.6 s, after the root has
+/// journaled its forwards and
+/// before the drop. Its placeholders are never retried; the bound
+/// (`drop_held_await_ms`, the client deadline) settles each as abandoned,
+/// the dependents go on, and nothing of the dead node's settled ops lands
+/// afterwards (I4, `strict_settle`).
+fn drop_held_chain_requester_dies_config() -> SimConfig {
+    let mut c = drop_held_chain_config();
+    c.faults.push(ScheduledFault {
+        at_ms: 2_600,
+        kind: FaultKind::CrashNonHolder { restart_ms: None },
+    });
+    c
+}
+
+/// Plan 46 M0.2: `drop-held-chain` and its requester-dies variant, on the
+/// seeds that failed before option B (on `92624175`: two live copies of a
+/// dropped row's rid, a dependent replayed ahead of its requester's retry,
+/// an `EEXIST` or `ENOENT` no state explains). Each seed passes, and the
+/// rules ran: placeholders were resolved by their requesters' retries,
+/// dependents were held behind them, ops were parked behind the queue,
+/// and, with the requester dead, the bound settled placeholders as
+/// abandoned.
+#[test]
+fn drop_held_chain_regression_seeds() {
+    let mut totals = [0u64; 4];
+    for (label, cfg, seeds) in [
+        (
+            "drop-held-chain",
+            drop_held_chain_config(),
+            [0u64, 1, 2, 3, 5],
+        ),
+        (
+            "drop-held-chain-requester-dies",
+            drop_held_chain_requester_dies_config(),
+            [0, 1, 2, 3, 5],
+        ),
+    ] {
+        for seed in seeds {
+            let report = run_seed(seed, cfg.clone()).unwrap_or_else(|e| {
+                panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
+            });
+            for s in report.stats.values() {
+                totals[0] += s.await_retry_resolved;
+                totals[1] += s.await_retry_settled;
+                totals[2] += s.replays_held_for_placeholder;
+                totals[3] += s.ops_parked_behind_queue;
+            }
+        }
+    }
+    eprintln!(
+        "drop-held-chain: resolved {} settled {} held {} parked {}",
+        totals[0], totals[1], totals[2], totals[3]
+    );
+    assert!(
+        totals[0] > 0,
+        "no retry ever resolved a placeholder: {totals:?}"
+    );
+    assert!(totals[1] > 0, "the bound never settled one: {totals:?}");
+    assert!(
+        totals[2] + totals[3] > 0,
+        "nothing was ever held behind a placeholder or the queue: {totals:?}"
+    );
+}
+
 /// Chunk epoch-liveness-gap (sweep only): `flex`'s two-member outages
 /// (`f = 1`, the third node keeps S3) in `locks-blips-tight`'s
 /// back-to-back pairs, so a closed hold owner's fresh epoch replaces the
@@ -5395,6 +5499,8 @@ fn sweep_config() {
         "backup-hot" => backup_hot_config(),
         "flex" => flex_config(),
         "flex-crash" => flex_crash_config(),
+        "drop-held-chain" => drop_held_chain_config(),
+        "drop-held-chain-requester-dies" => drop_held_chain_requester_dies_config(),
         "flex-tight" => flex_tight_config(),
         "metered-shared" => metered_shared_config(),
         "metered-shared-unbacked" => metered_shared_unbacked_config(),

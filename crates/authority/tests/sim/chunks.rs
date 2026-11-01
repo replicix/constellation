@@ -117,6 +117,18 @@ impl ChunkWorld {
         self.writes.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// `node` lost the chunks only its disk held (a disk fault, a cache
+    /// wiped under the daemon): their pending-upload rows stay, and the
+    /// next upload pass finds the bytes nowhere and marks them
+    /// unrecoverable (`store::held`). Returns how many it lost.
+    pub fn lose_dirty(&self, node: NodeId) -> usize {
+        self.dirty
+            .lock()
+            .unwrap()
+            .remove(&node)
+            .map_or(0, |lost| lost.len())
+    }
+
     pub fn in_s3(&self, hash: &ChunkHash) -> bool {
         self.s3.lock().unwrap().contains(hash)
     }

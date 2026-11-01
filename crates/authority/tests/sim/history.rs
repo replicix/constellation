@@ -631,7 +631,9 @@ pub fn check_linearizable_witnessed(
         }
         // Tentative effects the holder may have shown this op before they
         // were rolled back: every tentative op invoked before it returned,
-        // in invocation order, alone or together.
+        // in invocation order, alone, together, or as a prefix of that
+        // order (a chain: an op acked on top of another's unshipped effect,
+        // and a later one the holder had not executed yet when it refused).
         let mut early: Vec<(usize, &NsOp)> = invoke_at
             .iter()
             .filter(|(t, (inv_t, _))| tentative.contains(*t) && inv_t < ret_i)
@@ -646,11 +648,19 @@ pub fn check_linearizable_witnessed(
                 }
                 st.is_valid_step(op, ret)
             };
-            all || early.iter().any(|(_, t)| {
+            let prefix = || {
                 let mut st = states[i].clone();
-                st.invoke(t);
-                st.is_valid_step(op, ret)
-            })
+                early.iter().any(|(_, t)| {
+                    st.invoke(t);
+                    st.clone().is_valid_step(op, ret)
+                })
+            };
+            all || prefix()
+                || early.iter().any(|(_, t)| {
+                    let mut st = states[i].clone();
+                    st.invoke(t);
+                    st.is_valid_step(op, ret)
+                })
         });
         if explained {
             witness.observed_tentative += 1;
@@ -940,6 +950,44 @@ mod tests {
         assert!(check_linearizable(&events, &tentative).is_err());
         let in_flight: HashSet<Rid> = tentative.union(&w.observers).copied().collect();
         assert!(check_linearizable(&events, &in_flight).is_ok());
+    }
+
+    /// A chain of tentative effects (plan 46 M0.2's `drop-held-chain`
+    /// seed 66): t1's create of `f3` is acked and rolled back, t2's rename
+    /// of it to `f2` is acked on top of it and rolled back too, and a
+    /// rename of `f2` back (t3) had not run yet when t4's create of `f2`
+    /// was refused on the strength of the first two. Neither all of them
+    /// together nor any one alone shows `f2`; the first two (a prefix of
+    /// their invocation order) do.
+    #[test]
+    fn a_refusal_that_observed_a_chain_of_tentative_effects_is_explained_by_a_prefix() {
+        let inv = |thread, r, op| HistEvt::Invoke {
+            thread,
+            rid: rid(r),
+            op,
+        };
+        let ret = |thread, r, ret| HistEvt::Return {
+            thread,
+            rid: rid(r),
+            ret,
+        };
+        let events = vec![
+            inv(1, 1, NsOp::Create("f3".into())),
+            inv(2, 2, NsOp::Rename("f3".into(), "f2".into())),
+            ret(2, 2, NsRet::Ok),
+            inv(1, 3, NsOp::Rename("f2".into(), "f3".into())),
+            inv(3, 4, NsOp::Create("f2".into())),
+            ret(3, 4, NsRet::Eexist),
+        ];
+        let tentative: HashSet<Rid> = [rid(1), rid(2), rid(3)].into_iter().collect();
+        let w = check_linearizable_witnessed(
+            &events,
+            &tentative,
+            &std::collections::HashMap::new(),
+            &JournalOrder::new(),
+        )
+        .expect("explained by the first two tentative effects");
+        assert_eq!(w.observed_tentative, 1);
     }
 
     #[test]
