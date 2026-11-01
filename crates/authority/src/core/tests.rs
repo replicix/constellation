@@ -1442,6 +1442,90 @@ fn a_backlog_that_cannot_ship_does_not_spin_the_rounds() {
     assert!(h.core.job().is_none(), "no round follows at once");
 }
 
+/// Defect D (the backed drop-held chain's seeds 1476 and 1851): a holder
+/// whose backlog is rows held back (a seed waiting for `repair drop-held`)
+/// while a peer wants its lease renewed the handoff pause at every round --
+/// a round that ships nothing cannot drain a held backlog -- and with the
+/// fast path shut its own ops waited in line for the lease path for as
+/// long as the rows were held (seconds in the sim, hours without an
+/// operator). The peer is served by forwarding either way; the holder's own
+/// ops execute locally.
+#[test]
+fn a_holder_with_a_held_backlog_keeps_admitting_own_ops_while_wanted() {
+    fn round(h: &mut Harness) {
+        let mut out = Vec::new();
+        h.core.start(h.clk(), &h.meta, &mut out);
+        let poll = timers(&out, TimerKind::Poll)[0];
+        let mut acts = h.step(Event::Timer { id: poll });
+        for _ in 0..20 {
+            if let Some(upload) = acts.iter().find_map(|a| match a {
+                Action::UploadDirtyChunks { op, .. } => Some(*op),
+                _ => None,
+            }) {
+                acts = h.step(Event::UploadsDone {
+                    op: upload,
+                    result: UploadResult::Done { held: 1 },
+                });
+                continue;
+            }
+            let Some((op, req)) = s3_ops(&acts).first().map(|(o, r)| (*o, (*r).clone())) else {
+                break;
+            };
+            let result = match req {
+                S3Op::SegmentPut { .. } => S3Result::SegmentPut(Ok(())),
+                S3Op::LeaseSwap { .. } => S3Result::LeasePut(Ok(tag())),
+                S3Op::InboxRun { .. } => S3Result::InboxRun(Ok(Vec::new())),
+                S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+                other => panic!("unexpected S3 op in the round: {other:?}"),
+            };
+            acts = h.step(Event::S3 { op, result });
+        }
+    }
+    let (mut h, _broken) = await_retry::holder_with_a_seed();
+    // Node 2 has wanted the lease for a long while; the dwell and grace passed.
+    let long_ago = WaitMs(h.now.0 - 1_000_000);
+    h.core.lease.wanted = vec![2];
+    h.core.lease.wanted_since = Some(long_ago);
+    h.core.lease.held_since = Some(long_ago);
+    h.core.lease.last_write = long_ago;
+    assert!(h.core.lease.wants_handoff(h.clk(), h.core.config()));
+    for i in 0..4 {
+        round(&mut h);
+        let held = h.meta.held_summary();
+        assert!(
+            held.transactions > 0,
+            "round {i}: the seed is held: {held:?}"
+        );
+        assert!(
+            !h.core.lease.is_paused_for_handoff(h.clk()),
+            "round {i}: a held backlog is not drained by a pause"
+        );
+        assert!(
+            h.core
+                .lease
+                .new_mutation_epoch(h.clk(), h.core.config())
+                .is_some(),
+            "round {i}: an own op is admitted"
+        );
+        h.advance(250);
+    }
+    // An own op executes locally, now.
+    let rid = h.rid(9);
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op: h.create("own"),
+        tag: Default::default(),
+    });
+    assert!(
+        replies(&out).iter().any(|(r, reply)| *r == rid
+            && matches!(reply, ClientReply::Outcome(MutateOutcome::Accepted { .. }))),
+        "{out:?}"
+    );
+    assert!(h.meta.lookup(ROOT_INO, "own").unwrap().is_some());
+}
+
 /// Plan 43 C7-H2 (`delegated-holder-cut` seeds 65 and 97 with the floor
 /// the whole bound): a tenure inside its takeover floor is not
 /// idle-released for a node that wants the lease. The floor stands for the

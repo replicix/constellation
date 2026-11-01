@@ -2579,6 +2579,21 @@ impl Core {
                 self.job.as_ref().map(|j| &j.what),
                 Some(What::Round { head_before, .. }) if self.ship.head_seq != *head_before
             );
+            // A round that moved nothing while rows are held or deferred is
+            // not one a pause can help: the backlog is the held rows
+            // (`store::held`; `repair drop-held`, a chunk only another node
+            // has), which no pause drains. Renewed at every round for as
+            // long as a peer wants the lease -- possibly hours without an
+            // operator -- it kept the fast path shut, and with it this
+            // holder's own ops waiting in line for the lease path
+            // (`new_mutation_epoch` is `None` meanwhile): seconds per op in
+            // drop-held-chain-backed seeds 1476 and 1851. The peer is
+            // served by forwarding as before.
+            let held = replica.held_summary();
+            if !moved && (held.transactions > 0 || held.deferred > 0) {
+                self.finish_round(now, None, replica, out);
+                return;
+            }
             self.begin_handoff_pause(now);
             if moved {
                 self.nudged = true;

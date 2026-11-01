@@ -252,6 +252,8 @@ pub trait Replica {
     /// another epoch).
     fn applied_jseq_of(&self, epoch: Epoch) -> u64;
     fn journal_len(&self) -> Result<u64, MetaError>;
+    /// What the last ship plan held back or deferred (`Meta::held_summary`).
+    fn held_summary(&self) -> constellation_meta::HeldSummary;
     /// The next unshipped journal rows, whole transactions only, at most
     /// `max` rows (plan 30 §M3b: an op's records and its `Completed`
     /// never split; M4: transactions held back behind an unrecoverable
@@ -1054,6 +1056,10 @@ impl Replica for Meta {
         Meta::applied_pos(self)
             .filter(|pos| pos.epoch == epoch)
             .map_or(0, |pos| pos.jseq)
+    }
+
+    fn held_summary(&self) -> constellation_meta::HeldSummary {
+        Meta::held_summary(self)
     }
 
     fn journal_len(&self) -> Result<u64, MetaError> {
