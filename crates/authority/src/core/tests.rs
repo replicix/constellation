@@ -50035,6 +50035,16 @@ mod await_retry {
             queue(&h)
         );
         assert!(queue(&h).contains(&(2, 1, true)), "not before the commit");
+        // (Further ticks before the commit change nothing: a settle this
+        // node journaled is the rid's outcome only once committed.)
+        for _ in 0..2 {
+            h.advance(250);
+            drain(&mut h);
+        }
+        assert!(
+            queue(&h).contains(&(2, 1, true)),
+            "forgotten before its settle was committed"
+        );
         let classes = h.meta.journal_classes_of_rid(r).unwrap();
         assert!(
             !classes.is_empty() && classes.iter().all(|c| *c != RowClass::Lone),
@@ -50205,6 +50215,26 @@ mod await_retry {
         });
         assert!(queue(&h).iter().all(|(n, _, _)| *n != 2), "{:?}", queue(&h));
         assert_eq!(h.core.stats.await_retry_settled, 1);
+    }
+
+    /// One settle in flight per placeholder: the drain does not start
+    /// another on its next tick.
+    #[test]
+    fn a_settle_in_flight_is_not_started_again() {
+        let (mut h, _r) = placeholder_with_a_short_bound();
+        h.core.lease.held = None;
+        h.core.lease.cached_holder = Some(2);
+        h.advance(2_500);
+        drain(&mut h);
+        assert_eq!(h.core.stats.await_retry_settles_sent, 1);
+        h.advance(250);
+        drain(&mut h);
+        h.advance(250);
+        drain(&mut h);
+        assert_eq!(
+            h.core.stats.await_retry_settles_sent, 1,
+            "a second settle was started while the first is in flight"
+        );
     }
 
     /// R7 (variant 3 (i)): the requester's shadow of a non-stealable

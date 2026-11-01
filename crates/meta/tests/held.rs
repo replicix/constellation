@@ -1182,3 +1182,27 @@ fn a_placeholder_holds_the_keys_its_row_wrote_not_only_the_ones_it_names() {
         "the inode the unlink wrote is missing: {keys:?}"
     );
 }
+
+/// Review item 10: a remote row whose rid the log already carries (a
+/// segment completed it) is not a placeholder: the drain finds the rid done
+/// and forgets the entry; nobody is going to retry what completed.
+#[test]
+fn a_remote_row_the_log_completed_is_not_a_placeholder() {
+    use constellation_meta::RowClass::Archive;
+    let (meta, broken) = node_one_with_a_seed();
+    exec_as(&meta, Archive, rid_of(7, 1), &chmod(broken, 0o600));
+    exec_as(&meta, Archive, rid_of(7, 2), &chmod(broken, 0o640));
+    // The log carries the first one's completion (a late segment).
+    meta.apply_segment(
+        1,
+        1,
+        &[LogRecord::Completed { rid: rid_of(7, 1) }],
+        &TouchSet::default(),
+    )
+    .unwrap();
+    meta.drop_held(broken, 1).unwrap();
+    let queue = meta.pending_replays().unwrap();
+    let entry = |rid| queue.iter().find(|q| q.rid == rid).expect("queued");
+    assert!(!entry(rid_of(7, 1)).is_await_retry(), "{queue:?}");
+    assert!(entry(rid_of(7, 2)).is_await_retry());
+}

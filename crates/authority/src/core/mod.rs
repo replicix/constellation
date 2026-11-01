@@ -1121,6 +1121,9 @@ pub struct Stats {
     pub ops_parked_behind_queue: u64,
     pub await_retry_resolved: u64,
     pub await_retry_settled: u64,
+    /// Settles of placeholders started (one per attempt: not while one is in
+    /// flight).
+    pub await_retry_settles_sent: u64,
     /// Review (R7): shadows of non-stealable answers rolled back after the
     /// bound because the owner's row never reached the log.
     pub stale_non_stealable_shadows: u64,

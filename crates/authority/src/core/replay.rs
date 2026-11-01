@@ -610,6 +610,7 @@ impl Core {
             waited_ms = waited,
             "a dropped row's requester never retried: settling the rid as abandoned"
         );
+        self.stats.await_retry_settles_sent += 1;
         self.submit_settle(now, entry.rid, entry.queue_seq, replica, out);
     }
 
