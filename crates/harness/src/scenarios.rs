@@ -986,6 +986,13 @@ pub const SCENARIOS: &[Scenario] = &[
         run: m4::poison_record_isolation,
     },
     Scenario {
+        name: "drop-held-remote-dependents",
+        desc: "plan 46 M0.2: `repair drop-held` on a lone holder whose held chain holds another node's unanswered rows (its mkdir in the directory the dropped file's rename touched): those rows are placeholders, their requester's retries run in their place, its writes succeed, and every node converges byte for byte with exactly one conflict copy and no late landing",
+        requires: &[],
+        caps: &[],
+        run: m4::drop_held_remote_dependents,
+    },
+    Scenario {
         name: "unmount-with-held-records",
         desc: "a final flush that cannot finish (records held behind a lost pending chunk, then also with S3 cut) still lets the daemon exit promptly and non-zero, saying why; the journal and held rows survive for the next mount, where drop-held still recovers and the unmount is clean",
         requires: &[],

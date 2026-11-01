@@ -446,6 +446,7 @@ pub const SKIPPED: &[(&str, Skip)] = &[
     ("holder-publishes-log-prefix", Skip::Local(&[KILL, S3_FAULTS, NODES3])),
     ("holder-publishes-log-prefix-backup", Skip::Local(&[KILL, S3_FAULTS, NODES3])),
     ("poison-record-isolation", Skip::Local(&[HOLD_SYNC, LOSE_CHUNKS])),
+    ("drop-held-remote-dependents", Skip::Local(&[HOLD_SYNC, LOSE_CHUNKS])),
     (
         "unmount-with-held-records",
         Skip::Local(&[LOSE_CHUNKS, S3_FAULTS, "stalls a local daemon's shutdown (CONSTELLATION_SHUTDOWN_STALL_S)"]),

@@ -89,10 +89,12 @@ pub fn drop_held(meta: &Meta, ino: u64, remote: bool) -> Result<String, String> 
     Ok(format!(
         "inode {ino}: {} held transaction(s) dropped into a conflict copy under \
          {}/ (lost chunks become holes), {} dependent transaction(s) rolled back and queued \
-         for replay, {} queued replay(s) dropped, {} unrecoverable pending upload(s) removed",
+         for replay ({} of them another node's unanswered row, kept as a placeholder for that \
+         node's retry), {} queued replay(s) dropped, {} unrecoverable pending upload(s) removed",
         dropped.dropped,
         constellation_meta::CONFLICT_DIR,
         dropped.requeued,
+        dropped.await_retry,
         dropped.queued_dropped,
         dropped.pending_removed
     ))

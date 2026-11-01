@@ -2041,6 +2041,24 @@ was rewritten for the same milestone):
   `/.constellation-conflict/broken@…` (full length, the lost chunk a
   hole of zeros), and leave A's held set, pending conflict copies and
   journal empty.
+- **`drop-held-remote-dependents`** (plan 46 M0.2, C2g′). The same two
+  fault points on a lone holder A (`CONSTELLATION_BACKUPS=0`, so its
+  answers to another node wait for the log), and a second node B that
+  writes into the directory the dropped file's rename touched. With A's
+  rounds held, A writes `d/broken` (the seed) and renames it to
+  `d/renamed`; B makes `d/sub` and writes `d/sub/f`, ops A forwards-
+  executes and cannot answer (their rows depend on the held ones by key).
+  The hold is lifted, the round finds the chunk gone, `status.held` lists
+  at least three held transactions, and `repair drop-held` over the
+  control socket must report B's rows as placeholders for B's retry.
+  Checked: B's writes return `Ok` (a dropped row's retry executes in its
+  place); A, B and a fresh node D converge on the same tree byte for
+  byte, `d/sub/f` is B's payload and A's rename was replayed; exactly one
+  conflict copy exists (the seed's, full length, the lost chunk a hole);
+  nothing changes in the seconds after the writes returned (no late
+  landing); A's `held.awaiting` is empty and
+  `ack.await_retry_settled` is 0 (B retried them all). The sim twins are
+  `drop-held-chain` and `drop-held-chain-requester-dies`.
 - **`publish-only-holder`** (plan 30 M4, L8; a measurement). Three nodes,
   each behind its own counting relay, `CONSTELLATION_PUBLISH_IDLE_S=2`,
   lease placement off. A 20 s idle window and a 20 s busy window (all

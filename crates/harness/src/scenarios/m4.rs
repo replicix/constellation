@@ -8,7 +8,7 @@ use crate::client::Client;
 use crate::s3env::{S3Env, BUCKET};
 use anyhow::{Context, Result};
 use std::io::Read;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ------------------------------------------------------------ bucket reads
 
@@ -617,6 +617,241 @@ pub(super) fn poison_record_isolation(seed: u64) -> Result<()> {
             journal_drained(&a)
         },
     )?;
+    a.unmount()?;
+    b.unmount()?;
+    Ok(())
+}
+
+/// Plan 46 M0.2 (C2g′): `repair drop-held` and another node's rows.
+///
+/// The `poison-record-isolation` fault on a lone holder A (no backups, so
+/// its answers to another node wait for the log; write-back), plus a
+/// second node B that writes into the directory the dropped file's rename
+/// touched. With A's rounds held, A writes `d/broken` (the seed) and
+/// renames it to `d/renamed` (a dependent that touches `d`), and B —
+/// whose ops A forwards — makes `d/sub` and writes `d/sub/f` into it. A's
+/// journal now holds B's `mkdir` (and, once it is answered, the create
+/// inside it) behind the seed by key, unanswered: their answers wait for a
+/// log the held rows block. The hold is lifted, the round finds the chunk
+/// gone, and `repair drop-held` rolls the lot back.
+///
+/// Before option B A queued B's rows again beside B's own retries (two
+/// live copies of B's `mkdir`), replayed the create inside `d/sub` with no
+/// `d/sub`, and B's write failed or landed twice. Now B's rows are
+/// placeholders, their dependents wait behind them, and B's retries
+/// execute in their place.
+///
+/// Checked:
+/// - **B's writes succeed**: `mkdir d/sub` and `write d/sub/f` return `Ok`
+///   (a refusal or an `EIO` would be a lost write), once the drop is run;
+/// - **byte-exact convergence**: A, B and a fresh node D see the same tree,
+///   every file's bytes included, and `d/sub/f` is B's payload;
+/// - **exactly one conflict copy**: the seed's, the full length of the lost
+///   file with zeros for the lost chunk;
+/// - **no late landing**: nothing changes on A or B in the seconds after the
+///   writes returned, A's placeholders are gone and none was settled.
+pub(super) fn drop_held_remote_dependents(seed: u64) -> Result<()> {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+    const NAME: &str = "drop-held-remote-dependents";
+
+    /// Every path under `root` (the conflict directories included) with the
+    /// file's bytes (`None`: a directory).
+    fn tree(root: &Path) -> Result<BTreeMap<String, Option<Vec<u8>>>> {
+        fn walk(
+            root: &Path,
+            dir: &Path,
+            out: &mut BTreeMap<String, Option<Vec<u8>>>,
+        ) -> Result<()> {
+            for e in std::fs::read_dir(dir)? {
+                let e = e?;
+                let path = e.path();
+                let rel = path.strip_prefix(root)?.display().to_string();
+                if e.file_type()?.is_dir() {
+                    out.insert(rel, None);
+                    walk(root, &path, out)?;
+                } else {
+                    out.insert(rel, Some(std::fs::read(&path)?));
+                }
+            }
+            Ok(())
+        }
+        let mut out = BTreeMap::new();
+        walk(root, root, &mut out)?;
+        Ok(out)
+    }
+
+    let (env, root) = setup(NAME)?;
+    let _proxy = env.s3_proxy()?;
+    let prefix = format!("dhrd-{}", ts());
+    let backend = format!("s3://{BUCKET}/{prefix}");
+    let lost = super::pattern(seed, 64 * 1024);
+    let lost_hex = blake3::hash(&lost).to_hex().to_string();
+    let payload = super::pattern(seed ^ 0x5eed, 96 * 1024);
+    let hold = root.path().join("hold-sync");
+    let held_marker = root.path().join("hold-sync.held");
+    let mut a = Client::new(root.path(), "dhrd-a", &env.endpoint, &backend)?
+        .with_own_node_key()
+        .with_write_mode("back")
+        .with_env("CONSTELLATION_LEASE_PLACEMENT", "off")
+        .with_env("CONSTELLATION_BACKUPS", "0")
+        .with_env("CONSTELLATION_PUBLISH_IDLE_S", "1")
+        .with_env("CONSTELLATION_SYNC_IDLE_MAX_MS", "1000")
+        .with_env("CONSTELLATION_FAULT_LOSE_CHUNKS", &lost_hex)
+        .with_env(
+            "CONSTELLATION_FAULT_HOLD_SYNC_FILE",
+            &hold.display().to_string(),
+        );
+    let mut b = Client::new(root.path(), "dhrd-b", &env.endpoint, &backend)?
+        .with_own_node_key()
+        .with_env("CONSTELLATION_BACKUPS", "0");
+    a.fs_create()?;
+    a.mount()?;
+    b.mount()?;
+    wait_for_p2p(&[&a, &b])?;
+    std::fs::create_dir(a.mnt.join("d"))?;
+    std::fs::write(a.mnt.join("d/before"), b"shipped before the hold")?;
+    eventually("A drains", Duration::from_secs(60), || journal_drained(&a))?;
+    eventually("B sees d", Duration::from_secs(60), || {
+        anyhow::ensure!(std::fs::read(b.mnt.join("d/before"))? == b"shipped before the hold");
+        Ok(())
+    })?;
+
+    // Hold A's rounds; the seed and its dependent rename on A.
+    std::fs::write(&hold, b"hold")?;
+    eventually("A's sync rounds are held", Duration::from_secs(30), || {
+        anyhow::ensure!(held_marker.exists(), "no round has seen the hold yet");
+        Ok(())
+    })?;
+    std::fs::write(a.mnt.join("d/broken"), &lost)?;
+    std::fs::rename(a.mnt.join("d/broken"), a.mnt.join("d/renamed"))?;
+
+    // B writes into the directory the rename touched. A forwards-executes
+    // it and cannot answer (the log is held): B's ops wait, off this thread.
+    let (bmnt, payload_b) = (b.mnt.clone(), payload.clone());
+    let writer = std::thread::spawn(move || -> Result<()> {
+        std::fs::create_dir(bmnt.join("d/sub")).context("B's mkdir d/sub")?;
+        std::fs::write(bmnt.join("d/sub/f"), &payload_b).context("B's write d/sub/f")?;
+        Ok(())
+    });
+    std::thread::sleep(Duration::from_secs(1));
+    std::fs::write(a.mnt.join("after"), b"written after the broken file")?;
+    std::fs::remove_file(&hold)?;
+
+    // The round finds the chunk gone: the seed, the rename and B's mkdir
+    // are held.
+    let ino = {
+        let mut found = None;
+        eventually("A reports the held set", Duration::from_secs(60), || {
+            let held = a.control_status()?["held"].clone();
+            let inodes = held["inodes"].as_array().cloned().unwrap_or_default();
+            anyhow::ensure!(
+                held["transactions"].as_u64().unwrap_or(0) >= 3 && inodes.len() == 1,
+                "the seed, the rename and B's mkdir are not all held: {held}"
+            );
+            found = inodes[0]["ino"].as_u64();
+            Ok(())
+        })?;
+        found.context("held inode has no ino")?
+    };
+    anyhow::ensure!(
+        !writer.is_finished(),
+        "B's mkdir was answered while its row was held"
+    );
+
+    // Drop it. B's rows become placeholders; B's retries run in their place.
+    let reply = a
+        .control("locks.drop_held", serde_json::json!({ "ino": ino }))
+        .context("drop-held failed")?;
+    let detail = reply["detail"].as_str().unwrap_or_default().to_string();
+    eprintln!("    {NAME}: {detail}");
+    anyhow::ensure!(detail.contains("another node's unanswered row"), "{detail}");
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while !writer.is_finished() {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "B's writes never returned after the drop"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("B's writer thread panicked"))?
+        .context("B's writes must succeed: the retry of a dropped row runs in its place")?;
+
+    // Convergence, byte-exact, on every node including a fresh one.
+    eventually("A's journal drains", Duration::from_secs(60), || {
+        let status = a.control_status()?;
+        anyhow::ensure!(
+            status["held"]["transactions"].as_u64() == Some(0)
+                && status["held"]["awaiting"]
+                    .as_array()
+                    .is_some_and(|w| w.is_empty())
+                && status["speculation"]["copies_pending"].as_u64() == Some(0),
+            "still held: {} / {}",
+            status["held"],
+            status["speculation"]
+        );
+        journal_drained(&a)
+    })?;
+    eventually("A and B converge", Duration::from_secs(60), || {
+        let (ta, tb) = (tree(&a.mnt)?, tree(&b.mnt)?);
+        anyhow::ensure!(
+            ta == tb,
+            "A and B differ:\n  A {:?}\n  B {:?}",
+            ta.keys(),
+            tb.keys()
+        );
+        Ok(())
+    })?;
+    let on_a = tree(&a.mnt)?;
+    anyhow::ensure!(
+        on_a.get("d/sub/f").and_then(|c| c.as_ref()) == Some(&payload),
+        "d/sub/f is not B's payload byte for byte"
+    );
+    anyhow::ensure!(
+        on_a.contains_key("d/renamed") && !on_a.contains_key("d/broken"),
+        "A's rename was not replayed: {:?}",
+        on_a.keys()
+    );
+    let copies: Vec<(&String, &Vec<u8>)> = on_a
+        .iter()
+        .filter(|(k, _)| k.contains(".constellation-conflict/"))
+        .filter_map(|(k, v)| v.as_ref().map(|v| (k, v)))
+        .collect();
+    anyhow::ensure!(
+        copies.len() == 1,
+        "expected exactly one conflict copy, found {:?}",
+        copies.iter().map(|(k, _)| *k).collect::<Vec<_>>()
+    );
+    anyhow::ensure!(
+        copies[0].1.len() == lost.len() && copies[0].1.iter().all(|x| *x == 0),
+        "the conflict copy must keep the length with the lost chunk as a hole"
+    );
+    let mut d = super::fresh_node(
+        &env,
+        root.path(),
+        &backend,
+        b"written after the broken file",
+    )?;
+    let on_d = eventually("D converges", Duration::from_secs(60), || {
+        anyhow::ensure!(tree(&d.mnt)? == on_a, "D differs from A");
+        Ok(())
+    });
+    d.unmount()?;
+    on_d?;
+
+    // No late landing: nothing moves afterwards, and no placeholder was
+    // ever settled (B retried them all).
+    std::thread::sleep(Duration::from_secs(6));
+    anyhow::ensure!(tree(&a.mnt)? == on_a, "A changed after the writes returned");
+    anyhow::ensure!(tree(&b.mnt)? == on_a, "B changed after the writes returned");
+    let status = a.control_status()?;
+    anyhow::ensure!(
+        status["ack"]["await_retry_settled"].as_u64() == Some(0),
+        "a placeholder was settled as abandoned: {}",
+        status["ack"]
+    );
     a.unmount()?;
     b.unmount()?;
     Ok(())
