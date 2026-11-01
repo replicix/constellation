@@ -1,5 +1,21 @@
 # Plan 43 — The commit rule: acknowledged means committed by the configured group
 
+> **Status note (2026-11-01, the maintainer's direction change;
+> [plan 46](46-committed-or-final.md),
+> [ADR-40](../../../explanation/DECISIONS.md#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)).**
+> The rules of this plan stand; the structure that enforces them changes.
+> *Done*: C0, C1-1..C1-4, C2a..C2f, C7a, C7-F, C7b commits 1–7 and 9.
+> *Continue as written*: C2g, C2g′ (drop-held option B), C2h's
+> **scenarios** (plan 46 stage 0); C4 and then C7b-8 (plan 46 stage 3,
+> after stage 1). *Superseded by plan 46*: C3 as specified (its verbatim
+> re-ship is folded into plan 46 M1.2 under one stream per node, with a
+> two-week model timebox: if the model is not proven, C3 as written goes
+> first), C5 (the lone branch is deleted, not isolated: stage 2), C6 (not
+> needed for correctness; the knob exists), the G1 p90 nudge (saved patch;
+> re-measured after stage 1), C2h's strict flags on flex configurations
+> (plan 46 M1.4). The body below is unchanged; where it and plan 46
+> differ, plan 46 decides.
+
 Read `docs/plans/v1/CONVENTIONS.md` first. This plan implements the
 recommendation of the arbiter study (`docs/explanation/ARBITER-STUDY.md`
 §5, Option B2): **S3 stays the configuration master** (the root lease
@@ -4220,6 +4236,14 @@ to land before C0.
 | Kernel and store (plan 42 races, `FORGET`, `execve` close, fjall stalls) | Not touched | — |
 
 ## 14. Exit criteria
+
+*Status (2026-11-01, see the note at the top):* done — C0, C1, C2a–C2f,
+C7a, C7-F, C7b 1–7 and 9. Continuing under this plan — C2g, C2g′, C2h's
+scenarios (plan 46 stage 0), then C4 and C7b-8 (plan 46 stage 3).
+Superseded by [plan 46](46-committed-or-final.md) — C3 as specified
+(folded into M1.2), C5, C6, the G1 p90 nudge, C2h's flex strict flags.
+The boxes below for the superseded items stay unticked and are closed by
+plan 46's exit criteria.
 
 - [ ] Interim work landed or explicitly deferred by the maintainer (Q7):
       the F2 fix, the takeover-loss fix, the 9287 and 2945 fixes, C7-H2,

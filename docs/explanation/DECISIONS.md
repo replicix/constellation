@@ -356,6 +356,14 @@ could publish them in a commit that a fresh node then bootstrapped from.
 A requester that became the next holder validated new ops against the
 phantom state and answered `EEXIST` for a name that never existed.
 
+**Superseded in part by [ADR-40](#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)
+(plan 46 stage 2)**: the capture and before-images stay (recovery still
+rolls back from them), but the server's *replay by rid* of stranded ops
+goes. An unacknowledged stranded op has one copy, its requester's retry;
+an acknowledged row is never stranded on a node with write-eligible peers,
+and a singleton's or an operator-abandoned row becomes a conflict copy
+exported by the node that holds its data, not a replay.
+
 **Decision**: every effect a node applies ahead of the durable log is
 *speculation*, captured with its before-images so it can be taken back.
 - The one funnel every `ns` write goes through records the before-image
@@ -496,6 +504,14 @@ acknowledged (bug B, fixed by ADR-19 as replay), and every writer waited
 out the lease TTL (30–60 s) before anyone could take over. The fix had
 to respect the topology: a synchronous copy on a peer across an ocean
 would put a WAN round trip on every write (plan 30 §2, constraint 4).
+
+**Superseded in part by [ADR-40](#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)
+(plan 46 stages 1–2)**: Layer A (`Local`, an acknowledgement resting on
+the holder's disk, replayed by rid after a takeover) survives only for a
+singleton. A node with write-eligible peers and no backup in budget
+answers under a sticky non-stealable grant (final) or waits for the
+archive; `AckPolicy::Local` and `ack=local` go. Layers B and C are
+unchanged.
 
 **Decision**: durability comes in layers, matched to the topology.
 - **Layer A (always, no added latency).** Requesters keep what they
@@ -662,6 +678,16 @@ that shipped nothing does not follow itself at once.
 model `crates/model/src/flex.rs`. Amends ADR-12's all-members rule.
 
 ## ADR-23: Delegated sub-sequencers over one log
+
+**Superseded in part by [ADR-40](#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)
+(plan 46 stage 1)**: a grant goes to a *node* and covers a set of
+subtrees under one stream, one group and one cut (`DelegateNode`,
+`SubtreeReleased`, `DelegateNodeGroup`, `DelegateNodeEnded` replace
+`Delegate { dir, node, gen }`, `Recall`, `RecallCut`, `DelegGroup`); no
+delegate is lone; placement is sticky (a long dwell, recall by request)
+and far writers hold non-stealable grants released by the holder. The
+one lease, one log, the ownership walk, cross-subtree recall instead of
+2PC, and the HLC-stamped shared parents stay.
 
 **Context**: one lease and one sequencer for the whole namespace capped
 throughput at one node's store writer, and every other writer paid a
@@ -1525,6 +1551,17 @@ logging never blocks a daemon thread (plan 44)";
 
 ## ADR-33: Commit is the configured group's acknowledgement (Vertical Paxos over S3)
 
+**Superseded in part by [ADR-40](#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)
+(2026-11-01)**: the rule stands; what changes is its enforcement. The
+commit rule becomes a property of the configuration (two row states,
+committed-when-answered and final-without-group, instead of five classes
+decided per row); the *lone* exception shrinks to a singleton (a node with
+write-eligible peers never answers from its disk alone: a sticky grant or
+the archive instead); the epoch hold waits for one member; C3's verbatim
+re-ship is redone under one stream per node, and C5's lone branch is
+deleted rather than isolated. The C1 and C2 paragraphs below describe
+what landed and stays.
+
 **Status**: accepted by the maintainer on 2026-10-17 (plan 43 §11: every
 recommendation, and the latency gates G1–G6), built in steps. Landed: C0
 (the commit point named and checked), C1-1 to C1-4 (the root group's commit
@@ -2021,6 +2058,12 @@ the default `auto` stands unless the R8 measurements fail it).
 
 ## ADR-38: Automatic directory hash-range splits are off by default
 
+**Superseded by [ADR-40](#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)
+(plan 46 M1.2)**: the split mechanism is deleted, not kept as an expert
+setting (`CONSTELLATION_DELEGATION_SPLIT`, `delegate --range`, `range`
+on the record, `place_splits`); it was the main source of a node holding
+several generations. The evidence below stands as the reason.
+
 **Context**: plan 30 §M12 lets the root's placement split a hot shared
 directory into 2 to 16 name-hash ranges (GIGA+) and delegate each range to
 the node that dominates it, with `CONSTELLATION_DELEGATION_SPLIT` (20 %) as
@@ -2112,6 +2155,13 @@ benchmark's recommendation); built.
 
 ## ADR-39: A delegate's group acknowledgement waits for the row's dependencies on its other generations
 
+**Superseded by [ADR-40](#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)
+(plan 46 M1.2)**: with one stream per delegate node there is one total
+order and one group per node, so a dependency across generations of one
+node cannot exist; `deleg_caps`, `deleg_note_xdeps`, `deleg_covered` and
+the xgen counters go. The rule below is right for the state it was built
+for; the state is removed.
+
 **Context**: one node can hold two generations (the ranges of a split
 directory, or a whole directory beside a range of another), and every op
 of the node carries the node's whole session as its `deps`, its own rows
@@ -2179,3 +2229,151 @@ not here yet. `Lone` and non-stealable rows are unchanged.
 See: [Delegations](../reference/features/delegations.md#a-row-whose-cause-was-lost-with-another-generation);
 `crates/authority/src/core/delegate.rs` (`deleg_caps`, `deleg_note_xdeps`,
 `deleg_drain_tail`).
+
+## ADR-40: Every acknowledgement is committed or final; one stream per delegate node; no server-side replay
+
+**Status**: decided by the maintainer on 2026-11-01; to be built in the
+stages of [plan 46](../plans/v1/wip/46-committed-or-final.md). Each stage
+amends this record with what landed.
+
+**Context**: six weeks after ADR-33, the acknowledgement and
+ordering-node-change area had produced 55 bug rows (41 integrity), 239
+`fix` commits in `crates/authority` and `crates/meta` since 2026-09-18, a
+37 % induced-defect rate (19 of 51 closed rows were introduced by changes
+in the area; 9 of 13 first reviews did not clear), 16 rows found by review
+with no oracle firing (the sim never reached the states), and non-test
+core code grown from 22.4k to 46.5k lines. The rules of ADR-33 and plan 43
+are right. The bugs come from the structure that enforces them: (1) the
+commit rule decided *per row* by a five-way class function over mutable
+state (`AckClass`; rows 24, 29, 38, 39, 48, 51 of the review are the class,
+the writer lock, the lead and the published horizon disagreeing by one
+step); (2) an acknowledgement the *server* can take back, so the server
+keeps a second executable copy of every op and member copies with four
+drop rules exist to exempt committed rows from it (11 rows are copies
+racing); (3) a delegate as a second sequencer whose configuration lives in
+an uncommitted log tip, with one node running several generations whose
+rows depend on each other (ADR-39's fixpoint; a fix series dropped
+acknowledged rows twice); (4) authority state in messages (plan 43 C4, the
+right fix, unbuilt). A survey of other systems (Lustre, CephFS, HDFS QJM,
+Aurora, FoundationDB, Spanner, CockroachDB, TiKV, Calvin, Raft, NFSv4.1,
+Speculator) found none that acknowledges and later rolls the
+acknowledgement back: they acknowledge after a durable quorum, or the
+*client* keeps and replays the request while the server only truncates,
+or commit is a provable function of durable state; in all of them the
+commit rule is a property of the configuration, fixed for a tenure.
+
+**Decision**:
+1. **Every acknowledgement is committed or final.** A row is either
+   committed when answered (the configuration's group holds it, or the
+   archive does) or final without a group (a non-stealable authority: a
+   designee, a sticky grant, an epoch hold with one member). Nothing
+   acknowledged is ever rolled back. The one exception is a **singleton**
+   (no write-eligible peer in the roster), which answers from its disk:
+   nobody else can take its lease while it lives, and its restart
+   re-adopts its journal.
+2. **The commit rule is a property of the configuration** (the lease for
+   the root, the node stream's group record for a delegate), changed only
+   by a reconfiguration that commits under old ∪ new. A row carries its
+   configuration version; `RowCommit::{Group{version}, Final}` replaces
+   the five classes and every per-row decision site.
+3. **One stream per delegate node**, covering a set of subtrees:
+   `DelegateNode { node, gen, dirs }`, `SubtreeReleased { node, gen, dir,
+   at }` (a row in the delegate's stream), `StreamReleased`,
+   `DelegateNodeGroup`, `DelegateNodeEnded` replace `Delegate`, `Recall`,
+   `RecallCut`, `DelegGroup`. Hash-range splits and ADR-39's
+   cross-generation machinery are deleted. **No delegate is lone**: a node
+   is delegated only with a group within the RTT budget or under a
+   non-stealable grant.
+4. **Far writers hold sticky, non-stealable grants**, taken automatically
+   by placement; the root takes them on the subtrees it writes itself
+   (never on `/`) when it has write-eligible peers and no group. The root
+   never times a sticky grant out: the holder releases (idle, default
+   about 60 s; clean unmount; suspend, hibernate and shutdown through a
+   systemd-logind delay inhibitor; planned network-down through a
+   NetworkManager pre-down dispatcher; a cooperative handover;
+   `constellation release <fs> [--wait]`), or the operator abandons. An
+   optional self-fencing timeout is a setting, off by default. Placement
+   is sticky (a long dwell; recall by request).
+5. **The epoch hold is a group {owner, one member}**: its answers wait for
+   one member's acknowledgement of the stream-ahead; a one-member epoch's
+   hold is final.
+6. **The server never re-executes.** The replay queue, `core/replay.rs`,
+   `meta/replay.rs`, the fold, `derive_replay_op`, `Origin::Replay`, the
+   replay half of drop-held and `ack=local` (`AckPolicy::Local`) are
+   deleted. The requester's in-doubt retry by rid is the one copy of an
+   unacknowledged op (the root's own op parked at a deposition takes the
+   same in-doubt path the delegate's fast path takes today; plan 46 §5.5).
+   A rolled-back *acknowledged* row exists only on a singleton or after an
+   operator's abandon or a self-fence, and the node that holds its data
+   exports it as a conflict copy (a new op), never as a replay. Conflict
+   copies stay the artifact.
+7. **Stages**: 0 — plan 43's C2g, C2g′ (drop-held option B) and C2h's
+   scenarios without the flex strict flags; 1 — the Stateright model
+   first (two-week timebox; if not proven, C3 as written goes first), then
+   classes at the configuration, one stream per node with C3's verbatim
+   re-ship folded in, sticky grants and placement, the hold as a group;
+   2 — delete server-side replay and `ack=local`; 3 — C4 as specified,
+   then C7b-8's root-anchored cut.
+
+**Consequences**: a far writer's local speed is conditional on a sticky
+grant (automatic), and a node lost mid-write blocks its subtrees for
+other writers until it returns or the operator abandons, the failure mode
+already accepted for groups (plan 43 G4) and designees (ADR-6). The root's
+first op in a new subtree of its own waits one archive round trip for
+the grant record; its ops directly in `/` wait for the archive when it has
+peers and no backup. One LAN round trip inside a continuation epoch. A
+singleton that dies with unshipped rows while a new node joins and takes
+the lease after the TTL finds its rows exported as conflict copies on
+return. Same-AZ latency, G1–G6, failover times and the S3 request counts
+are unchanged. About 10–14k lines go, in the area that produced the bugs.
+Mixed versions stay unsupported; filesystems created before the record
+change are recreated (no shims, no version bump). Plan 43's C3 as
+specified, C5, C6, the G1 p90 nudge and C2h's flex strict flags are
+superseded; C2g, C2g′, C2h's scenarios, C4 and C7b-8 continue. ADR-19,
+ADR-21, ADR-23, ADR-33, ADR-38 and ADR-39 are amended or superseded in
+part as marked on each.
+
+**Rejected**:
+- *Finish plan 43 as specified* (C3, C4, C5, C6, C7b-8): keeps five
+  classes decided per row, the lead and the lone↔group flip, generations
+  with cross-generation dependencies, the server-side replay queue (C5
+  renames it) and member copies with four drop rules; 8–12 coder-weeks
+  inside the densest bug cell at the observed 37 % induced-defect rate,
+  with rows of the 29/39/51 shape still reachable afterwards.
+- *A majority log among backups* (Raft/QJM): no two-node failover without
+  S3 as witness (then it is B2 again), a WAN round trip when voters span
+  continents (hard constraint 4), a second trust root; ADR-2's and the
+  arbiter study's verdict, unchanged.
+- *S3 Express One Zone as the log tier*: AWS-only, one AZ, a second
+  bucket (hard constraints 1–2, ADR-27); even allowed, about 10 ms is ten
+  LAN round trips.
+- *Calvin-style deterministic ordering* (the log carries inputs with
+  read/write sets, replicas execute): Calvin's own authors name the
+  asynchronous replication of the sequencer log, the mode constellation
+  would be in, as the failover problem; no gain over the verbatim
+  re-ship of effects.
+- *A client-owned replay list with `ack=local` kept as an opt-in*
+  (Lustre/Ceph style for a lone root's own clients): correct, but it keeps
+  a rollback-and-replay path, its persistence and its oracles alive for
+  one opt-in that designations already cover for offline laptops; the
+  requester's existing in-doubt retry covers every unacknowledged row
+  once the root's own parked op takes the in-doubt path, so no list is
+  needed.
+- *Keeping lone delegates* (the lead, the flip): the source of rows 29,
+  33, 39; a sticky grant gives the same latency with a final answer.
+- *Hash-range splits as an expert setting* (ADR-38): the only source of
+  multi-generation nodes that is not a hand action; measured to lose on
+  real names.
+
+**See**: [plan 46](../plans/v1/wip/46-committed-or-final.md) (the
+diagnosis, the design, the milestones, the per-topology behaviour, the
+open questions); [plan 43](../plans/v1/wip/43-commit-rule.md) (the
+rules, the invariants I1–I5, what continues); the arbiter study;
+[DESIGN §4](DESIGN.md#metadata-plane) and [§9](DESIGN.md#failure-handling),
+which change with the code in each stage. Public sources: CockroachDB's
+parallel commits (the "never acknowledged before committed" property),
+Lustre's recovery overview (transno, `last_committed`, the client replay
+list), CephFS's `Server.cc` early replies and `clientreplay`, Ongaro's
+Raft thesis §6.3 (client sessions), RFC 8881 §2.10.6 (sessions and the
+reply cache), the Calvin paper (SIGMOD 2012), Speculator (SOSP 2005) and
+Rethink the Sync (OSDI 2006).

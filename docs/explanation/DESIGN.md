@@ -762,6 +762,12 @@ inbox drains and delegate streams exactly-once without further machinery
 
 ### The replica is a log prefix plus explicit speculation
 
+*Being replaced in part: the server's replay of stranded ops by rid (and
+the conflict copies it produces) goes with
+[plan 46](../plans/v1/wip/46-committed-or-final.md) stage 2
+([ADR-40](DECISIONS.md#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay));
+the capture and before-images stay. This text changes with the code.*
+
 A node often applies effects before the log has them: a requester's
 *shadow* of its acknowledged forward, an `Exists` hint from a refusal, the
 holder's own unshipped transactions, records streamed ahead of S3, a
@@ -808,6 +814,14 @@ following it
 
 ### Acknowledgement and durability
 
+*Being replaced in part: `Local`'s lone answer for a node that has
+write-eligible peers, and `ack=local`, go with
+[plan 46](../plans/v1/wip/46-committed-or-final.md) stages 1–2
+([ADR-40](DECISIONS.md#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)):
+a singleton still answers from its disk; everyone else answers under a
+group, a sticky non-stealable grant, or the archive. `Backup` and `S3`
+are unchanged. This text changes with the code.*
+
 What a sequencer's acknowledgement means is the tenure's `ack_policy`,
 chosen per filesystem and topology
 ([ADR-21](DECISIONS.md#adr-21-layered-durability-and-seal-based-failover)):
@@ -847,6 +861,19 @@ speed for each node's own writes (hard constraint 4); a write another node
 forwards waits for one S3 commit. §9 has the failover rules.
 
 ### Delegated sub-sequencers
+
+*Being replaced in part by
+[plan 46](../plans/v1/wip/46-committed-or-final.md) stage 1
+([ADR-40](DECISIONS.md#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)):
+a grant goes to a node and covers a set of subtrees under one stream
+(`DelegateNode`, `SubtreeReleased`, `DelegateNodeGroup`,
+`DelegateNodeEnded` replace `Delegate`, `Recall`, `RecallCut`,
+`DelegGroup`); the lone delegate and its bounded lead, hash-range splits,
+the cross-generation dependency rule
+([ADR-39](DECISIONS.md#adr-39-a-delegates-group-acknowledgement-waits-for-the-rows-dependencies-on-its-other-generations))
+and the 30 s placement windows go; far writers hold sticky non-stealable
+grants released by the holder. The one lease, one log, the ownership walk
+and cross-subtree recall stay. This text changes with the code.*
 
 One lease and one sequencer for the whole namespace would make every
 other writer pay a round trip to it, across an ocean if need be. So the
@@ -1668,6 +1695,13 @@ Layer B's single-failure contract below
 
 ### Failover by topology
 
+*The "only distant peers" row changes with
+[plan 46](../plans/v1/wip/46-committed-or-final.md)
+([ADR-40](DECISIONS.md#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)):
+the holder's own writes go under sticky grants on its subtrees (final,
+no replay on return) or wait for the archive; plan 46 §7 has the full
+per-topology table.*
+
 | Topology | Policy | Added acknowledgement latency | Holder crashes and returns before a takeover | Holder away past a takeover | Failover |
 |---|---|---|---|---|---|
 | Single node | `Local` | none | nothing lost | n/a | n/a |
@@ -1741,6 +1775,11 @@ is never invited back as its backup.
 
 ### Nobody observes a tentative effect
 
+*Being replaced in part: the `Local` window below closes with
+[plan 46](../plans/v1/wip/46-committed-or-final.md)
+([ADR-40](DECISIONS.md#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay));
+it remains only on a singleton, whose effect nobody else can observe.*
+
 Under `Backup` and `S3`, the holder's reads and its answers to other
 clients' ops wait until any unshipped rows they would observe are
 durable, so no client of any node sees an effect a failover could roll
@@ -1750,6 +1789,14 @@ back and replays later; that window is the price of Layer A's zero
 latency.
 
 ### Delegates
+
+*Being replaced in part by
+[plan 46](../plans/v1/wip/46-committed-or-final.md) stages 1–2
+([ADR-40](DECISIONS.md#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)):
+there is no lone delegate, so nothing a delegate answered is replayed by
+rid; a sticky grant is never reclaimed by TTL (its holder releases, or
+the operator abandons); the `Held` wait on an acknowledged-but-unappended
+dependency goes with the replay. This text changes with the code.*
 
 - **Crash, no backup recorded**: the root reclaims the grant after
   `ttl + margin` (≈ 6 s) and ends the generation; every row a delegate
@@ -1807,6 +1854,12 @@ successor, bounded (§6, Failover), and a blocking one keeps retrying.
 | corrupted chunk (local or S3) | hash verification on every read; local → refetch, S3 → error + fsck report (peer copies may heal) |
 
 ### Poison records
+
+*Being replaced in part: `drop-held`'s replay of dependents by rid becomes
+roll back, refuse and let the requesters retry with
+[plan 46](../plans/v1/wip/46-committed-or-final.md) stage 2
+([ADR-40](DECISIONS.md#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay));
+until then plan 43 C2g′'s placeholders order them.*
 
 A pending upload whose chunk is gone from the local cache (a disk fault,
 a manual deletion) cannot ever reach S3. It no longer blocks the node's
