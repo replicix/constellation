@@ -2050,6 +2050,11 @@ impl Core {
             self.finish_as(now, rid, outcome, source, replica, out);
             return;
         }
+        // Sent, and no sequencer can settle it in this epoch: the unsettled
+        // `EIO` (counted here unless `finish_in_doubt` counts a settle's).
+        if self.clients.get(&rid).is_some_and(|c| !c.settle) {
+            self.stats.client_unsettled_eio += 1;
+        }
         self.finish_in_doubt(now, rid, replica, out);
     }
 
