@@ -593,7 +593,9 @@ impl Core {
             return;
         }
         if self.lease.lost && policy != Policy::Client {
-            self.finish_in_doubt(now, rid, replica, out);
+            // As the deadline would (plan 43 C2g's review: a system op is
+            // settled too, never answered in doubt unsettled at once).
+            self.client_deadline(now, rid, false, replica, out);
             return;
         }
         if self.gated(rid) {
@@ -1933,7 +1935,10 @@ impl Core {
                 }
             }
             if policy == Policy::System {
-                self.finish_in_doubt(now, rid, replica, out);
+                // One acquisition and no wait for a live holder: the op's own
+                // attempts end here, and it is settled (plan 43 C2g's review)
+                // — or, already settling, answered in doubt, unsettled.
+                self.client_deadline(now, rid, false, replica, out);
                 continue;
             }
             self.acquire_retry_hint = retry_hint;

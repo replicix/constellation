@@ -49262,6 +49262,29 @@ mod c2g_settle {
         );
     }
 
+    /// C2g's review, SHOULD 4: a system op is settled like a client's, not
+    /// answered in doubt (uncounted) where it used to give up: here a node
+    /// whose lease was lost, with the op never sent anywhere — no copy
+    /// exists, so it is settled at once. Fails on the parent: `InDoubt`.
+    #[test]
+    fn a_system_op_is_settled_not_answered_in_doubt() {
+        let mut h = Harness::new(1);
+        h.core.lease.force_lost();
+        let rid = h.rid(1);
+        let out = h.step(Event::Submit {
+            policy: Policy::System,
+            rid,
+            op: h.create("sys"),
+            tag: Default::default(),
+        });
+        assert_eq!(
+            replies(&out),
+            vec![(rid, &ClientReply::Outcome(MutateOutcome::Abandoned))],
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.settled_local, 1);
+    }
+
     /// The inbox drain settles like a forward: a settle op with no outcome is
     /// refused for good (the requester learns it from the log); a settle of
     /// an executed rid journals nothing new. Fails on the parent: executed.
