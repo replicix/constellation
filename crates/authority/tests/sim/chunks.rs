@@ -66,6 +66,9 @@ pub struct ChunkWorld {
     pub deferred_seen: AtomicU64,
     /// Transactions dropped by the run's end-of-run operator procedure.
     pub remote_dropped: AtomicU64,
+    /// Every rid the operator's drops rolled back (`DroppedHeld::rolled_back`):
+    /// what the oracle treats as the operator's action.
+    pub dropped_rids: Mutex<BTreeSet<constellation_meta::Rid>>,
     /// Own pending rows found without bytes anywhere (a replay's adopted
     /// manifest of a departed node's chunk): marked unrecoverable.
     pub poisoned: AtomicU64,

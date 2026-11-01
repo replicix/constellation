@@ -541,6 +541,7 @@ const TENTATIVE_SUBSET_MAX: usize = 14;
 pub fn check_linearizable_witnessed(
     events: &[HistEvt],
     tentative: &HashSet<Rid>,
+    dropped: &HashSet<Rid>,
     completed_at: &std::collections::HashMap<Rid, (u64, usize)>,
     journal: &JournalOrder,
 ) -> Result<Witness, String> {
@@ -589,12 +590,20 @@ pub fn check_linearizable_witnessed(
     // 2. Values along the log order; the spec states after each success.
     let mut spec = NsSpec::default();
     let mut states: Vec<NsSpec> = vec![spec.clone()];
+    let mut trace: Vec<String> = Vec::new();
     for rid in &successes {
         let (_, op) = &invoke_at[rid];
+        let before = spec.present.clone();
         let ret = spec.invoke(op);
+        trace.push(format!(
+            "{rid:?} {op:?}{} -> {ret:?}",
+            if tentative.contains(rid) { "*" } else { "" }
+        ));
         if ret != NsRet::Ok && !tentative.contains(rid) {
             return Err(format!(
-                "rid {rid:?} ({op:?}) took effect in the log but the spec refuses it there: {ret:?}"
+                "rid {rid:?} ({op:?}) took effect in the log but the spec refuses it there: {ret:?} \
+                 (present: {before:?}; the log's successes before it: {})",
+                trace.join("; ")
             ));
         }
         states.push(spec.clone());
@@ -636,41 +645,85 @@ pub fn check_linearizable_witnessed(
         }
         // Tentative effects the holder may have shown this op before they
         // were rolled back: every tentative op invoked before it returned,
-        // in invocation order, alone, together, or any subset of them (a
-        // chain: an op acked on top of another's unshipped effect, and later
-        // ones the holder had not executed yet when it refused).
-        let mut early: Vec<(usize, &NsOp)> = invoke_at
+        // in invocation order, alone or together; and the ones an
+        // operator's drop rolled back also as any subset of them (a chain:
+        // an op acked on top of another's unshipped effect, and later ones
+        // the holder had not executed yet when it refused).
+        // (A `Same` is a rename the log shows took no effect, because by the
+        // time it was replayed its two names were of one inode; what the
+        // refusing holder saw was its first run, which moved the name.)
+        let first_runs: HashMap<Rid, NsOp> = invoke_at
+            .iter()
+            .filter_map(|(t, (_, op_t))| match op_t {
+                NsOp::Same(a, b) => Some((*t, NsOp::Rename(a.clone(), b.clone()))),
+                _ => None,
+            })
+            .collect();
+        let mut early: Vec<(usize, &NsOp, bool)> = invoke_at
             .iter()
             .filter(|(t, (inv_t, _))| tentative.contains(*t) && inv_t < ret_i)
-            .map(|(_, (inv_t, op_t))| (*inv_t, op_t))
+            .map(|(t, (inv_t, op_t))| {
+                (
+                    *inv_t,
+                    first_runs.get(t).unwrap_or(op_t),
+                    dropped.contains(t),
+                )
+            })
             .collect();
-        early.sort_by_key(|(i, _)| *i);
+        early.sort_by_key(|(i, _, _)| *i);
+        // The ones `repair drop-held` rolled back, and the other tentative
+        // ones (a deposition's), each in invocation order.
+        let by_drop: Vec<(usize, &NsOp)> = early
+            .iter()
+            .filter(|(_, _, d)| *d)
+            .map(|(i, t, _)| (*i, *t))
+            .collect();
+        let others: Vec<(usize, &NsOp)> = early
+            .iter()
+            .filter(|(_, _, d)| !*d)
+            .map(|(i, t, _)| (*i, *t))
+            .collect();
         let explained = (lo..=hi).any(|i| {
             let all = {
                 let mut st = states[i].clone();
-                for (_, t) in &early {
+                for (_, t, _) in &early {
                     st.invoke(t);
                 }
                 st.is_valid_step(op, ret)
             };
-            // A subset, in invocation order: the holder executed the ones
-            // it had when it refused, and not the ones that reached it
-            // later (a forward invoked early, executed late). A few
-            // tentative ops at most in practice; a long list keeps the
-            // cheaper tries above.
+            // A subset of the ops an operator's drop rolled back
+            // (`dropped`), with the other tentative ones (a deposition's)
+            // either all applied or none, in any order when few (the
+            // sequencer executed them in the order they reached it, not
+            // the order they were invoked in): the holder executed the
+            // ones it had when it refused, and not the ones that reached
+            // it later — a chain the drop rolls back whole and replays by
+            // rid, each in its own turn. The other tentative ops are tried
+            // all together or one alone, never as a subset of their own: a
+            // long list of them would explain anything.
             let subset = || {
-                early.len() <= TENTATIVE_SUBSET_MAX
-                    && (1u32..(1u32 << early.len())).any(|mask| {
-                        let mut st = states[i].clone();
-                        for (k, (_, t)) in early.iter().enumerate() {
-                            if mask & (1 << k) != 0 {
-                                st.invoke(t);
+                by_drop.len() <= TENTATIVE_SUBSET_MAX
+                    && (1u32..(1u32 << by_drop.len())).any(|mask| {
+                        [false, true].into_iter().any(|with_others| {
+                            let chain: Vec<&NsOp> = by_drop
+                                .iter()
+                                .enumerate()
+                                .filter(|(k, _)| mask & (1 << k) != 0)
+                                .map(|(_, (_, t))| *t)
+                                .collect();
+                            // (The other tentative ones, if any, are
+                            // in force first, in invocation order.)
+                            let mut base = states[i].clone();
+                            if with_others {
+                                for (_, t) in &others {
+                                    base.invoke(t);
+                                }
                             }
-                        }
-                        st.is_valid_step(op, ret)
+                            any_order(&chain, &base, op, ret)
+                        })
                     })
             };
-            all || early.iter().any(|(_, t)| {
+            all || early.iter().any(|(_, t, _)| {
                 let mut st = states[i].clone();
                 st.invoke(t);
                 st.is_valid_step(op, ret)
@@ -691,13 +744,61 @@ pub fn check_linearizable_witnessed(
         return Err(format!(
             "rid {rid:?} ({op:?}) returned {ret:?} but no state in its window \
              (log positions {lo}..={hi}; before: {}; after: {}) refuses it that way, \
-             even with tentative effects applied",
+             even with tentative effects applied (window states: {}; tentative ops \
+             invoked before it returned: {})",
             at(lo.saturating_sub(1)),
-            at(hi)
+            at(hi),
+            (lo..=hi)
+                .map(|i| format!("{:?}", states[i].present))
+                .collect::<Vec<_>>()
+                .join(" "),
+            early
+                .iter()
+                .map(|(_, t, d)| format!("{t:?}{}", if *d { "*" } else { "" }))
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     Ok(witness)
 }
+
+/// Whether `ops` applied to `base` in some order (every order when there
+/// are at most [`TENTATIVE_ORDER_MAX`] of them, else the given one and its
+/// reverse) leave a state in which `op` returns `ret`.
+fn any_order(ops: &[&NsOp], base: &NsSpec, op: &NsOp, ret: &NsRet) -> bool {
+    fn go(left: &mut Vec<&NsOp>, st: &NsSpec, op: &NsOp, ret: &NsRet) -> bool {
+        if st.clone().is_valid_step(op, ret) {
+            return true;
+        }
+        for k in 0..left.len() {
+            let t = left.remove(k);
+            let mut next = st.clone();
+            next.invoke(t);
+            let found = go(left, &next, op, ret);
+            left.insert(k, t);
+            if found {
+                return true;
+            }
+        }
+        false
+    }
+    if ops.len() <= TENTATIVE_ORDER_MAX {
+        // (Every prefix of every order is tried too: a state reached on the
+        // way is a subset of its own.)
+        return go(&mut ops.to_vec(), base, op, ret);
+    }
+    let apply = |seq: &mut dyn Iterator<Item = &&NsOp>| {
+        let mut st = base.clone();
+        for t in seq {
+            st.invoke(t);
+        }
+        st.is_valid_step(op, ret)
+    };
+    apply(&mut ops.iter()) || apply(&mut ops.iter().rev())
+}
+
+/// The most tentative ops the witnessed check tries in every order.
+const TENTATIVE_ORDER_MAX: usize = 5;
 
 /// What the witnessed check saw besides a pass.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -863,14 +964,19 @@ mod tests {
             .into_iter()
             .collect();
         assert!(check_session_order(&events, &none, &reversed, &deferred).is_ok());
-        assert!(check_linearizable_witnessed(&events, &none, &reversed, &deferred).is_ok());
+        assert!(check_linearizable_witnessed(&events, &none, &none, &reversed, &deferred).is_ok());
         let journaled_reversed: JournalOrder = [(rid(1), (1, 1, 6)), (rid(2), (1, 1, 5))]
             .into_iter()
             .collect();
         assert!(check_session_order(&events, &none, &reversed, &journaled_reversed).is_err());
-        assert!(
-            check_linearizable_witnessed(&events, &none, &reversed, &journaled_reversed).is_err()
-        );
+        assert!(check_linearizable_witnessed(
+            &events,
+            &none,
+            &none,
+            &reversed,
+            &journaled_reversed
+        )
+        .is_err());
         let other_tenure: JournalOrder = [(rid(1), (1, 1, 5)), (rid(2), (2, 2, 6))]
             .into_iter()
             .collect();
@@ -912,6 +1018,7 @@ mod tests {
         assert!(check_linearizable_witnessed(
             &events,
             &HashSet::new(),
+            &HashSet::new(),
             &both,
             &JournalOrder::new()
         )
@@ -920,6 +1027,7 @@ mod tests {
         assert!(check_linearizable_witnessed(
             &events,
             &tentative,
+            &HashSet::new(),
             &second_only,
             &JournalOrder::new()
         )
@@ -957,8 +1065,14 @@ mod tests {
         ];
         let tentative: HashSet<Rid> = [rid(1)].into_iter().collect();
         let log = [(rid(3), (2, 0)), (rid(1), (3, 0))].into_iter().collect();
-        let w = check_linearizable_witnessed(&events, &tentative, &log, &JournalOrder::new())
-            .expect("witnessed");
+        let w = check_linearizable_witnessed(
+            &events,
+            &tentative,
+            &HashSet::new(),
+            &log,
+            &JournalOrder::new(),
+        )
+        .expect("witnessed");
         assert_eq!(w.observed_tentative, 1);
         assert!(w.observers.contains(&rid(2)));
         assert!(check_linearizable(&events, &tentative).is_err());
@@ -996,14 +1110,86 @@ mod tests {
             ret(3, 4, NsRet::Eexist),
         ];
         let tentative: HashSet<Rid> = [rid(1), rid(2), rid(3), rid(5)].into_iter().collect();
+        let none = std::collections::HashMap::new();
+        // Rolled back by an operator's drop: explained by the first two.
         let w = check_linearizable_witnessed(
             &events,
             &tentative,
-            &std::collections::HashMap::new(),
+            &tentative,
+            &none,
             &JournalOrder::new(),
         )
         .expect("explained by the first two tentative effects");
         assert_eq!(w.observed_tentative, 1);
+        // The same chain rolled back by anything else is not: a subset of
+        // tentative ops explains a refusal only for the dropped ones, so a
+        // refusal no state, no single tentative effect and not all of them
+        // together shows is a violation.
+        let err = check_linearizable_witnessed(
+            &events,
+            &tentative,
+            &HashSet::new(),
+            &none,
+            &JournalOrder::new(),
+        )
+        .unwrap_err();
+        assert!(err.contains("no state in its window"), "{err}");
+        // Only the ops that were dropped count: the unlink alone not.
+        let some: HashSet<Rid> = [rid(5)].into_iter().collect();
+        assert!(check_linearizable_witnessed(
+            &events,
+            &tentative,
+            &some,
+            &none,
+            &JournalOrder::new()
+        )
+        .is_err());
+    }
+
+    /// A chain the sequencer ran in the order its ops reached it, not the
+    /// order they were invoked in (`drop-held-chain-backed` seed 364): t2's
+    /// rename of `f3` was invoked before t3's rename of `f2` into `f3`, and
+    /// ran after it; t4's create of `f0` was refused on the strength of both.
+    #[test]
+    fn a_chain_run_in_another_order_than_invoked_explains_a_refusal() {
+        let inv = |thread, r, op| HistEvt::Invoke {
+            thread,
+            rid: rid(r),
+            op,
+        };
+        let ret = |thread, r, ret| HistEvt::Return {
+            thread,
+            rid: rid(r),
+            ret,
+        };
+        let events = vec![
+            inv(1, 1, NsOp::Create("f2".into())),
+            ret(1, 1, NsRet::Ok),
+            inv(2, 2, NsOp::Rename("f3".into(), "f0".into())),
+            inv(3, 3, NsOp::Rename("f2".into(), "f3".into())),
+            inv(4, 4, NsOp::Create("f0".into())),
+            ret(4, 4, NsRet::Eexist),
+        ];
+        let tentative: HashSet<Rid> = [rid(2), rid(3)].into_iter().collect();
+        let log = [(rid(1), (1, 0))].into_iter().collect();
+        let w = check_linearizable_witnessed(
+            &events,
+            &tentative,
+            &tentative,
+            &log,
+            &JournalOrder::new(),
+        )
+        .expect("explained by running t3 then t2");
+        assert_eq!(w.observed_tentative, 1);
+        // Not dropped by an operator: no order of a subset of them counts.
+        assert!(check_linearizable_witnessed(
+            &events,
+            &tentative,
+            &HashSet::new(),
+            &log,
+            &JournalOrder::new()
+        )
+        .is_err());
     }
 
     #[test]
@@ -1045,10 +1231,14 @@ mod tests {
             },
         ];
         let log = [(rid(1), (1, 0))].into_iter().collect();
-        assert!(
-            check_linearizable_witnessed(&events, &HashSet::new(), &log, &JournalOrder::new())
-                .is_ok()
-        );
+        assert!(check_linearizable_witnessed(
+            &events,
+            &HashSet::new(),
+            &HashSet::new(),
+            &log,
+            &JournalOrder::new()
+        )
+        .is_ok());
         // A refusal that no state in its window explains.
         let mut bad = events.clone();
         bad[4] = HistEvt::Return {
@@ -1056,10 +1246,14 @@ mod tests {
             rid: rid(2),
             ret: NsRet::Enoent,
         };
-        assert!(
-            check_linearizable_witnessed(&bad, &HashSet::new(), &log, &JournalOrder::new())
-                .is_err()
-        );
+        assert!(check_linearizable_witnessed(
+            &bad,
+            &HashSet::new(),
+            &HashSet::new(),
+            &log,
+            &JournalOrder::new()
+        )
+        .is_err());
         // A tentative success whose original `Ok` came before t2's
         // invocation but whose replay landed late does not bound t2's
         // window: t2's `Eexist` needs a state with `a` present, and the
@@ -1081,8 +1275,13 @@ mod tests {
         let mut events2 = with_a;
         events2.extend(events.clone());
         let log2 = [(rid(9), (1, 0)), (rid(1), (5, 0))].into_iter().collect();
-        assert!(
-            check_linearizable_witnessed(&events2, &tentative, &log2, &JournalOrder::new()).is_ok()
-        );
+        assert!(check_linearizable_witnessed(
+            &events2,
+            &tentative,
+            &HashSet::new(),
+            &log2,
+            &JournalOrder::new()
+        )
+        .is_ok());
     }
 }

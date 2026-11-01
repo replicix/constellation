@@ -2190,12 +2190,20 @@ fn same_inode_renames(
         let Some(seg) = oracle.unfenced.get(seq) else {
             return true;
         };
-        idx.checked_sub(1)
-            .and_then(|i| seg.records.get(i))
-            .is_some_and(|rec| {
+        let renames = |rec: Option<&LogRecord>| {
+            rec.is_some_and(|rec| {
                 matches!(rec, LogRecord::Rename { name, new_name, .. }
                     if *name == leaf(a) && *new_name == leaf(b))
             })
+        };
+        // (An adopted tail's transaction is `TailOf`, `Completed`, then its
+        // records: the rename follows the completion.)
+        renames(idx.checked_sub(1).and_then(|i| seg.records.get(i)))
+            || (idx
+                .checked_sub(1)
+                .and_then(|i| seg.records.get(i))
+                .is_some_and(|rec| matches!(rec, LogRecord::TailOf { .. }))
+                && renames(seg.records.get(idx + 1)))
     };
     events
         .into_iter()
@@ -3579,7 +3587,7 @@ async fn wait_for_locker(cluster: &Arc<Cluster>) -> Option<NodeId> {
 /// watching `status.held.remote`'s ages would. The dropped writes become
 /// refused replays and conflict copies, their outcome goes in the log,
 /// and everything that waited on them moves on.
-fn operator_drop_hopeless(
+async fn operator_drop_hopeless(
     cluster: &Arc<Cluster>,
     world: &Arc<ChunkWorld>,
     fault_log: &Arc<Mutex<Vec<String>>>,
@@ -3612,14 +3620,36 @@ fn operator_drop_hopeless(
             if after_ms.is_some_and(|after| now_ms < since + after) {
                 continue;
             }
-            let now_unix = n.clock.wall().0 / 1000;
-            let dropped = if remote {
-                n.meta.drop_held_remote(ino, now_unix)
-            } else {
-                n.meta.drop_held(ino, now_unix)
+            // Through the core (`Control::DropHeld`), as the control API
+            // does: it alone knows which answers of the dropped rows are
+            // still parked.
+            let dropped = match tokio::time::timeout(
+                Duration::from_secs(5),
+                n.control(constellation_authority::Control::DropHeld { ino, remote }),
+            )
+            .await
+            {
+                Ok(Ok(Ok(constellation_authority::ControlOk::DroppedHeld(d)))) => Ok(d),
+                Ok(Ok(Ok(other))) => Err(format!("unexpected answer {other:?}")),
+                Ok(Ok(Err(e))) => Err(e),
+                _ => Err("no answer from the core".to_string()),
             };
             match dropped {
                 Ok(d) => {
+                    world
+                        .dropped_rids
+                        .lock()
+                        .unwrap()
+                        .extend(d.rolled_back.iter().copied());
+                    // A row the drop kept with its op (its answer may have
+                    // left) is counted with the ungated I2 (b) pairs, not
+                    // judged: see `IdentityLedger::kept`.
+                    cluster.env.oracles.identity.lock().unwrap().keep(
+                        d.rolled_back
+                            .iter()
+                            .filter(|rid| !d.placeholders.contains(rid))
+                            .copied(),
+                    );
                     world.remote_dropped.fetch_add(
                         (d.dropped + d.queued_dropped) as u64,
                         std::sync::atomic::Ordering::Relaxed,
@@ -3629,12 +3659,11 @@ fn operator_drop_hopeless(
                     // counters do not move for an operator's drop): the
                     // dropped writes (refused replays) and their
                     // dependents, re-executed after later ops.
-                    if let Ok(queue) = n.meta.pending_replays() {
-                        let mut t = n.shared.tentative.lock().unwrap();
-                        for q in queue {
-                            t.insert(q.rid);
-                        }
-                    }
+                    n.shared
+                        .tentative
+                        .lock()
+                        .unwrap()
+                        .extend(d.rolled_back.iter().copied());
                     fault_log.lock().unwrap().push(format!(
                         "t={now_ms} node {id}: repair drop-held {ino:#x}{}: {d:?}",
                         if remote { " --remote" } else { "" }
@@ -4111,7 +4140,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                         &fault_log,
                         Some(cfg.drop_held_after_ms),
                         &mut first_seen,
-                    );
+                    )
+                    .await;
                 }
                 for id in cluster.ids() {
                     let n = cluster.get(id);
@@ -4277,7 +4307,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             // at the settle's cadence for what appeared after the
             // clients finished.
             if waited.is_multiple_of(3_000) {
-                operator_drop_hopeless(&cluster, &world, &fault_log, None, &mut BTreeMap::new());
+                operator_drop_hopeless(&cluster, &world, &fault_log, None, &mut BTreeMap::new())
+                    .await;
             }
         }
         // A hint installed after the settle write (a replayed op refused
@@ -4837,6 +4868,13 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             }
         }
     }
+    // What an operator's drop rolled back and the log still carries an
+    // outcome of is tentative for the checkers: its acknowledgement was
+    // given before the drop, its effect lands after later ops.
+    tentative.extend(super::oracle::survivors_of_drop(
+        &oracle,
+        &world.dropped_rids.lock().unwrap(),
+    ));
     report.tentative = tentative.len();
     let lin_context = |e: String| {
         let listing: Vec<String> = events
@@ -4906,14 +4944,21 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     };
     report.dirs_checked = projections.len();
     let mut witness = super::history::Witness::default();
+    let dropped_rids: HashSet<Rid> = world.dropped_rids.lock().unwrap().iter().copied().collect();
     for (i, proj) in projections.iter().enumerate() {
-        let w = check_linearizable_witnessed(proj, &tentative, &oracle.completed_at, &journal)
-            .map_err(|e| {
-                lin_context(format!(
-                    "[directory {}] {e}",
-                    labels.get(i).cloned().unwrap_or_default()
-                ))
-            })?;
+        let w = check_linearizable_witnessed(
+            proj,
+            &tentative,
+            &dropped_rids,
+            &oracle.completed_at,
+            &journal,
+        )
+        .map_err(|e| {
+            lin_context(format!(
+                "[directory {}] {e}",
+                labels.get(i).cloned().unwrap_or_default()
+            ))
+        })?;
         witness.observed_tentative += w.observed_tentative;
         witness.observers.extend(w.observers);
     }
@@ -5224,6 +5269,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         &oracle,
         &in_doubt_answers,
         &rolled_back_at,
+        &world.dropped_rids.lock().unwrap().clone(),
         converged_checkable,
     );
     // `AUTHORITY_SIM_ORACLE_DEBUG=1`: what the end of the run found (the
@@ -5236,6 +5282,28 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             .chain(&found.unjournaled_landed)
         {
             eprintln!("ORACLE-END {text}");
+        }
+        // What became of each rid an operator's drop rolled back.
+        for rid in world.dropped_rids.lock().unwrap().iter() {
+            let fate: Vec<String> = oracle
+                .unfenced
+                .iter()
+                .flat_map(|(seq, seg)| {
+                    seg.records
+                        .iter()
+                        .enumerate()
+                        .filter_map(move |(i, rec)| match rec {
+                            constellation_meta::LogRecord::Completed { rid: r } if r == rid => {
+                                Some(format!("completed seg{seq}#{i}"))
+                            }
+                            constellation_meta::LogRecord::Refused { rid: r, code } if r == rid => {
+                                Some(format!("refused({code:?}) seg{seq}#{i}"))
+                            }
+                            _ => None,
+                        })
+                })
+                .collect();
+            eprintln!("ORACLE-END dropped {rid:?}: {fate:?}");
         }
     }
     report.acks_by_class = found.acks_by_class.clone();

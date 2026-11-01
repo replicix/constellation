@@ -1123,6 +1123,17 @@ pub struct IdentityLedger {
     /// The same pairs where no copy stands for a committed answer: the lone
     /// branch's and the delegations' (C2/C3 close them); counted, not judged.
     pub ungated: BTreeMap<Rid, String>,
+    /// Plan 46 M0.2 review: rids `repair drop-held` rolled back and left
+    /// queued with their op (a row of the group classes whose answer may
+    /// have left: the entry is the only copy that keeps an acknowledged
+    /// effect). Its requester, whose answer may never have arrived, retries
+    /// by rid: gated behind the entry where it is queued, or answered from
+    /// the entry's execution by the rid's outcome anywhere else — one
+    /// execution either way, which the exactly-once check of the log
+    /// judges (the requester's own queue, if its shadow was rolled back
+    /// too, replays by the same rid). So a pair that includes such a rid is
+    /// counted with the ungated ones, not judged.
+    pub kept: BTreeSet<Rid>,
 }
 
 impl IdentityLedger {
@@ -1170,12 +1181,28 @@ impl IdentityLedger {
                     kinds(&mine),
                     kinds(c)
                 );
-                if mine.queued_gated.contains(&rid) || c.queued_gated.contains(&rid) {
+                if self.kept.contains(&rid) {
+                    // (Counted, not judged: see `kept`.)
+                    self.ungated.entry(rid).or_insert(text);
+                } else if mine.queued_gated.contains(&rid) || c.queued_gated.contains(&rid) {
                     self.violations.insert(rid, text);
                 } else {
                     self.ungated.entry(rid).or_insert(text);
                 }
                 break;
+            }
+        }
+    }
+
+    /// The operator's drop kept `rids` queued with their op ([`Self::kept`]).
+    /// The ledger saw the queue change before the drop's answer reached the
+    /// operator: whatever it judged of these rids in between is counted
+    /// instead.
+    pub fn keep(&mut self, rids: impl IntoIterator<Item = Rid>) {
+        for rid in rids {
+            self.kept.insert(rid);
+            if let Some(text) = self.violations.remove(&rid) {
+                self.ungated.entry(rid).or_insert(text);
             }
         }
     }
@@ -1254,6 +1281,30 @@ impl Findings {
     }
 }
 
+/// The rids of `dropped` (those `repair drop-held` rolled back) whose effect
+/// survives: the log has an outcome of the rid — it completes it, or carries
+/// its refusal, the drop's own (`Io`, the dropped write, whose conflict copy
+/// keeps what it wrote) or its replay's (the state it was replayed on no
+/// longer admits it: replays refused are the existing contract, and a
+/// content-bearing one makes a conflict copy). A dropped rid the log has no
+/// outcome of is an acknowledged effect lost, and is judged as before.
+pub fn survivors_of_drop(log: &super::check::Oracle, dropped: &BTreeSet<Rid>) -> BTreeSet<Rid> {
+    let refused: HashSet<Rid> = log
+        .unfenced
+        .values()
+        .flat_map(|seg| seg.records.iter())
+        .filter_map(|rec| match rec {
+            LogRecord::Refused { rid, .. } => Some(*rid),
+            _ => None,
+        })
+        .collect();
+    dropped
+        .iter()
+        .filter(|rid| log.completed_at.contains_key(rid) || refused.contains(rid))
+        .copied()
+        .collect()
+}
+
 /// Tally the run's answers and run the end-of-run oracles: I2 (c) over the
 /// answers' transactions and the log, I4 over the in-doubt answers and the
 /// invocations, I5 over the rolled-back set (each rid with the tick of its
@@ -1265,8 +1316,16 @@ pub fn end_of_run(
     log: &super::check::Oracle,
     in_doubt: &[(NodeId, Rid, u64, u64)],
     rolled_back: &HashMap<Rid, u64>,
+    dropped: &BTreeSet<Rid>,
     converged: bool,
 ) -> Findings {
+    // `repair drop-held` is the operator's action: it rolls back what
+    // depended on a lost write and replays it by rid after the write's
+    // conflict copy, so a dropped rid is neither verbatim (I2c) nor
+    // spared a rollback (I5) — but only if its effect survives
+    // ([`survivors_of_drop`]).
+    let survivors = survivors_of_drop(log, dropped);
+    let survives = |rid: &Rid| survivors.contains(rid);
     let mut f = Findings {
         i1: o.i1_violations.lock().unwrap().clone(),
         class_claim: o.claim_violations.lock().unwrap().clone(),
@@ -1341,7 +1400,9 @@ pub fn end_of_run(
             )
         {
             if let Some(t) = &j.tx {
-                if let Some(why) = not_verbatim(log, a.rid, t, converged) {
+                if let Some(why) =
+                    not_verbatim(log, a.rid, t, converged).filter(|_| !survives(&a.rid))
+                {
                     verbatim.entry(a.rid).or_insert_with(|| {
                         format!(
                             "I2c verbatim: rid {:?} answered OK by node {} at t={} ms (tick {}) \
@@ -1428,6 +1489,9 @@ pub fn end_of_run(
             }) else {
                 continue;
             };
+            if survives(rid) {
+                continue;
+            }
             // Plan 46 M0.2 (R7, variant 3 (i)): a non-stealable sequencer's
             // OK (an epoch hold's) is uncommitted by design, and its owner's
             // queue is the rid's one copy: the requester's shadow of it is
@@ -1929,6 +1993,16 @@ mod tests {
         completed: &[(Rid, (u64, usize))],
         rolled_back: &HashMap<Rid, u64>,
     ) -> Findings {
+        findings_dropped(acks, completed, rolled_back, &BTreeSet::new())
+    }
+
+    /// The same, with the rids `repair drop-held` rolled back.
+    fn findings_dropped(
+        acks: Vec<AckEntry>,
+        completed: &[(Rid, (u64, usize))],
+        rolled_back: &HashMap<Rid, u64>,
+        dropped: &BTreeSet<Rid>,
+    ) -> Findings {
         let o = Oracles::new(Bucket::new(1, (0, 0)));
         *o.acks.lock().unwrap() = acks;
         end_of_run(
@@ -1936,6 +2010,7 @@ mod tests {
             &log_with(seg(1, &[]), completed),
             &[],
             rolled_back,
+            dropped,
             true,
         )
     }
@@ -2027,6 +2102,60 @@ mod tests {
         // A group's OK is a violation whatever the log says.
         let f = findings_rolled_back(acks(AckClass::RootGroup), &[(r, (3, 0))], &rolled);
         assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
+    }
+
+    /// Plan 46 M0.2 review: a rid `repair drop-held` rolled back is the
+    /// operator's action, excused from I5 only if its effect survives (the
+    /// log completes the rid: a completion, or the refusal that carries
+    /// its conflict copy). The same rid not dropped, or dropped and never
+    /// completed, is a rolled-back acknowledgement as before.
+    #[test]
+    fn i5_excuses_a_dropped_rid_only_if_its_effect_survives() {
+        let judged = Some(Judgement {
+            class: Some(AckClass::RootGroup),
+            expected: Expected::Class(AckClass::RootGroup),
+            tx: None,
+            detail: String::new(),
+            mismatch: None,
+        });
+        let (r, other) = (rid(1, 1), rid(1, 2));
+        let acks = vec![
+            AckEntry {
+                judged: judged.clone(),
+                ..ack(2, r, 5, OutcomeKind::Ok, true)
+            },
+            AckEntry {
+                judged,
+                ..ack(2, other, 5, OutcomeKind::Ok, true)
+            },
+        ];
+        let rolled = HashMap::from([(r, 6), (other, 6)]);
+        let dropped = BTreeSet::from([r]);
+        let log = [(r, (3, 0)), (other, (3, 1))];
+        // The dropped rid, completed in the log: excused; the other, not
+        // dropped: still a violation.
+        let f = findings_dropped(acks.clone(), &log, &rolled, &dropped);
+        assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
+        assert!(f.i5[0].contains(&format!("{other:?}")), "{:?}", f.i5);
+        // Dropped but never completed: its acknowledged effect is lost.
+        let f = findings_dropped(acks.clone(), &[(other, (3, 1))], &rolled, &dropped);
+        assert_eq!(f.i5.len(), 2, "{:?}", f.i5);
+        // Dropped and refused by the drop (the conflict copy keeps the
+        // write): survives.
+        let o = Oracles::new(Bucket::new(1, (0, 0)));
+        *o.acks.lock().unwrap() = acks;
+        let log = log_with(refused_seg(1, r, Code::Io), &[(other, (3, 1))]);
+        let f = end_of_run(&o, &log, &[], &rolled, &dropped, true);
+        assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
+        // Its replay refused: the outcome is the log's.
+        let log = log_with(refused_seg(1, r, Code::NotFound), &[(other, (3, 1))]);
+        let f = end_of_run(&o, &log, &[], &rolled, &dropped, true);
+        assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
+        // A refusal of a rid the drop did not roll back excuses nothing.
+        let log = log_with(refused_seg(1, other, Code::NotFound), &[(r, (3, 0))]);
+        let f = end_of_run(&o, &log, &[], &rolled, &dropped, true);
+        assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
+        assert!(f.i5[0].contains(&format!("{other:?}")), "{:?}", f.i5);
     }
 
     fn ack(node: u64, r: Rid, tick: u64, kind: OutcomeKind, reply: bool) -> AckEntry {
@@ -2664,5 +2793,25 @@ mod tests {
         l.update(2, BTreeSet::new(), BTreeSet::new(), [r].into(), 2);
         assert!(l.violations.is_empty());
         assert_eq!(l.ungated.len(), 1);
+    }
+
+    /// Plan 46 M0.2 review: a rid the operator's drop kept queued with its
+    /// op is counted with the ungated pairs (a requester still waiting, the
+    /// requester's own queue), not judged; the same pairs for a rid the
+    /// drop did not keep are still violations.
+    #[test]
+    fn i2_a_rid_the_drop_kept_is_counted_not_judged() {
+        let (r, other) = (rid(1, 1), rid(1, 2));
+        let mut l = IdentityLedger::default();
+        l.update(1, [r, other].into(), [r, other].into(), BTreeSet::new(), 1);
+        l.update(2, BTreeSet::new(), BTreeSet::new(), [r, other].into(), 2);
+        assert_eq!(l.violations.len(), 2, "{:?}", l.violations);
+        // The drop's answer reaches the operator after the queue changed.
+        l.keep([r]);
+        assert_eq!(l.violations.len(), 1, "{:?}", l.violations);
+        assert!(l.violations.contains_key(&other));
+        assert!(l.ungated.contains_key(&r), "counted");
+        l.update(3, [r].into(), [r].into(), BTreeSet::new(), 3);
+        assert!(!l.violations.contains_key(&r), "the requester's own queue");
     }
 }

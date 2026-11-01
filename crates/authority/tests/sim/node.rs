@@ -2533,7 +2533,17 @@ impl Driver {
             .filter(|s| s.class.gated())
             .map(|s| s.rid)
             .collect();
-        let executing: BTreeSet<Rid> = self.core.clients().map(|(rid, _)| rid).collect();
+        // A client answered (a group's or the archive's) and waiting only
+        // for the log to carry its row executes nothing: the copy another
+        // node queues of it (a held row dropped by `repair drop-held`,
+        // kept with its op) is the one that lands, and retires the
+        // waiter's shadow.
+        let executing: BTreeSet<Rid> = self
+            .core
+            .clients()
+            .filter(|(_, phase)| *phase != constellation_authority::core::ClientPhase::AwaitingLog)
+            .map(|(rid, _)| rid)
+            .collect();
         let tick = self.oracles.tick.load(Ordering::SeqCst);
         self.oracles.identity.lock().unwrap().update(
             self.id,

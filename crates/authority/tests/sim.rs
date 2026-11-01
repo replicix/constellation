@@ -342,6 +342,7 @@ fn replay_seed() {
         Ok("flex-crash") => flex_crash_config(),
         Ok("drop-held-chain") => drop_held_chain_config(),
         Ok("drop-held-chain-requester-dies") => drop_held_chain_requester_dies_config(),
+        Ok("drop-held-chain-backed") => drop_held_chain_backed_config(),
         Ok("flex-tight") => flex_tight_config(),
         Ok("flex-long") => flex_config(),
         Ok("flex-backup") => flex_backup_config(),
@@ -4827,6 +4828,21 @@ fn drop_held_chain_regression_seeds() {
     );
 }
 
+/// Plan 46 M0.2 review, item 2: `drop-held-chain` on a backed root. Another
+/// node's rows are journaled `RootGroup` and their answers leave once the
+/// backup holds them, so a row the drop rolls back may or may not have been
+/// answered: only a row whose answer is still parked in the core is a
+/// placeholder (`repair drop-held` runs in the core, which knows); the rest
+/// keep their replayable copy. The answered rows rolled back are the
+/// operator's action to the oracles (I2c, I5, the history witness, the
+/// identity ledger: see `oracle::survivors_of_drop`).
+fn drop_held_chain_backed_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(sim::run::backup_core_config),
+        ..drop_held_chain_config()
+    }
+}
+
 /// Chunk epoch-liveness-gap (sweep only): `flex`'s two-member outages
 /// (`f = 1`, the third node keeps S3) in `locks-blips-tight`'s
 /// back-to-back pairs, so a closed hold owner's fresh epoch replaces the
@@ -5501,6 +5517,7 @@ fn sweep_config() {
         "flex-crash" => flex_crash_config(),
         "drop-held-chain" => drop_held_chain_config(),
         "drop-held-chain-requester-dies" => drop_held_chain_requester_dies_config(),
+        "drop-held-chain-backed" => drop_held_chain_backed_config(),
         "flex-tight" => flex_tight_config(),
         "metered-shared" => metered_shared_config(),
         "metered-shared-unbacked" => metered_shared_unbacked_config(),
