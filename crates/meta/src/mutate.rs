@@ -247,6 +247,15 @@ pub enum MutateOutcome {
     /// or replays the op (a replay refused this way leaves a conflict
     /// copy, never the op's effect).
     LockLapsed,
+    /// Plan 43 C2 (§5.3 item 5, the coder spec's D2): the op was *settled*
+    /// before its client hears `EIO`. Its requester asked, by the same rid,
+    /// for its outcome (a `settle` request); the sequencer in force found
+    /// none and journaled `Refused { rid, code: ABANDONED_CODE }` — the
+    /// rid's outcome from then on, so every other copy of the op dedups to
+    /// it and nothing of it executes anywhere afterwards. A definitive
+    /// outcome, never retried; the engine answers `EIO`. Appended last: a
+    /// peer too old to decode it falls back to `Busy`.
+    Abandoned,
 }
 
 /// What a forwarded op's transaction waits for from the node that

@@ -842,6 +842,17 @@ impl View {
                 constellation_meta::MutateOutcome::Conflict { manifest } => {
                     Err(MutateFail::Conflict { manifest })
                 }
+                // Plan 43 C2 (§5.3 item 5): settled before the deadline
+                // ended — the sequencer in force refused the rid for good,
+                // so nothing of it runs anywhere afterwards (no token window
+                // to wait for). `EIO`, counted apart from an in-doubt one.
+                constellation_meta::MutateOutcome::Abandoned => {
+                    self.meta.session().count_settled_eio();
+                    crate::fsync_wait::note(crate::fsync_wait::Failure::Transient(
+                        "metadata commit abandoned at its deadline (settled: it never ran)".into(),
+                    ));
+                    Err(MutateFail::Errno(Code::Io))
+                }
                 constellation_meta::MutateOutcome::Busy
                 | constellation_meta::MutateOutcome::NotHolder { .. } => {
                     crate::locks::note_tag_in_doubt(Some(rid));

@@ -332,13 +332,22 @@ pub(crate) fn named_child(op: &MutateOp) -> Option<(Ino, &str)> {
 /// its refused commit as a conflict copy (`refused_as_outcome`).
 pub(crate) const LAPSED_CODE: Code = Code::NoLock;
 
+/// Plan 43 C2 (§5.3 item 5, D2): the code a settled op's refusal is
+/// journaled under (`Refused { rid, code: ABANDONED_CODE }`): `ECANCELED`,
+/// which no mutation refuses with otherwise, so a dedup of the rid answers
+/// [`MutateOutcome::Abandoned`] again (`refused_as_outcome`). Not a new
+/// portable code: the errno table has no hole, and the client hears `EIO`.
+pub const ABANDONED_CODE: Code = Code::Canceled;
+
 /// A journaled refusal (`Refused { rid, code }`) as the outcome the
 /// sequencer gave: a stale base is the `Conflict` a client rebases on, an
-/// ended grant `LockLapsed`, anything else its errno.
+/// ended grant `LockLapsed`, a settled op `Abandoned`, anything else its
+/// errno.
 pub(crate) fn refused_as_outcome(code: Code) -> MutateOutcome {
     match code {
         Code::Stale => MutateOutcome::Conflict { manifest: None },
         LAPSED_CODE => MutateOutcome::LockLapsed,
+        ABANDONED_CODE => MutateOutcome::Abandoned,
         code => MutateOutcome::Errno(code),
     }
 }
@@ -1509,7 +1518,9 @@ impl Core {
                     out,
                 )
             }
-            outcome @ (MutateOutcome::Errno(_) | MutateOutcome::Conflict { .. }) => {
+            outcome @ (MutateOutcome::Errno(_)
+            | MutateOutcome::Conflict { .. }
+            | MutateOutcome::Abandoned) => {
                 // Plan 30 §M6: a refusal observed the holder's state
                 // without installing anything here (this replaces plan 29
                 // M6's per-name causal wait: every later read waits).

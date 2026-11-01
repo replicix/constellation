@@ -77,7 +77,7 @@ use constellation_types::Code;
 use std::collections::{BTreeMap, VecDeque};
 
 pub use backup::{beat_sent_ms, liveness_fresh, AckClass, AckView, Asker, SealRecord};
-pub use client::ClientPhase;
+pub use client::{ClientPhase, ABANDONED_CODE};
 pub use deleg_windows::{
     decide, DelegWindows, Refusal, RootLease, Window, WindowStats, WindowsClock,
 };

@@ -44,7 +44,7 @@ pub use action::{
 };
 pub use core::{
     beat_sent_ms, lease_may_carry, resolve_epoch_claims, Config, Core, DelegRenewCert,
-    EpochClaimView, EpochState, InboxView, LockView, ShipState, Stats,
+    EpochClaimView, EpochState, InboxView, LockView, ShipState, Stats, ABANDONED_CODE,
 };
 pub use event::{
     AheadGrants, Carrier, CasFailure, Control, Event, LeaseKey, LockOutcome, LockRenewEntry,

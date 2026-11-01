@@ -1113,6 +1113,7 @@ pub(crate) fn is_answer(outcome: &MutateOutcome) -> bool {
             | MutateOutcome::Exists { .. }
             | MutateOutcome::Conflict { .. }
             | MutateOutcome::LockLapsed
+            | MutateOutcome::Abandoned
     )
 }
 

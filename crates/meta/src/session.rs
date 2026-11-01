@@ -456,6 +456,12 @@ pub struct SessionStats {
     /// (`DurableWait::Unexpected`), resubmitted in doubt
     /// (`status.ack.ungated_unexpected`).
     pub ungated_unexpected: u64,
+    /// Plan 43 C2 (§5.3 item 5): client mutations answered `EIO` because
+    /// they were settled (`MutateOutcome::Abandoned`: refused for good by
+    /// the sequencer in force, nothing of them ever executes;
+    /// `status.ack.settled_eio`), as opposed to an unsettled in-doubt
+    /// `EIO`.
+    pub settled_eio: u64,
     /// Own rows of a lone delegate that were `Lone` by the class the core
     /// decided or published and went `DelegGroup` when journaled, under the
     /// writer lock (`Meta::finish_local`, `lone_row_holds`): past the lead,
@@ -956,6 +962,12 @@ impl SessionState {
     /// may not answer on its disk alone.
     pub fn count_ungated_unexpected(&self) {
         self.stats.lock().unwrap().ungated_unexpected += 1;
+    }
+
+    /// Plan 43 C2 (§5.3 item 5): a client mutation was answered `EIO` as
+    /// settled (`MutateOutcome::Abandoned`).
+    pub fn count_settled_eio(&self) {
+        self.stats.lock().unwrap().settled_eio += 1;
     }
 
     /// A `Lone` row went `DelegGroup` at the journaling.

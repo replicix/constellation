@@ -11298,6 +11298,35 @@ mod refusal_outcomes {
             "the retry unlinked the new file"
         );
     }
+
+    /// Plan 43 C2 (§5.3 item 5, D2): a settled rid's refusal
+    /// (`Refused { rid, ABANDONED_CODE }`) is its outcome: any copy of the
+    /// op that arrives later dedups to `Abandoned` and never executes. Fails
+    /// on the parent: answered `Errno(ECANCELED)`.
+    #[test]
+    fn a_settled_rids_refusal_dedups_to_abandoned() {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        let rid = Rid {
+            node: 2,
+            incarnation: 1,
+            seq: 1,
+        };
+        h.meta
+            .journal_refusal(rid, crate::ABANDONED_CODE, None)
+            .unwrap();
+        let create = h.create("f");
+        let out = forward(&mut h, 2, 1, 1, create);
+        assert_eq!(outcome_of(&out, 1), MutateOutcome::Abandoned);
+        assert!(
+            h.meta.lookup(ROOT_INO, "f").unwrap().is_none(),
+            "a copy of a settled op executed"
+        );
+        assert_eq!(
+            crate::core::client::refused_as_outcome(crate::ABANDONED_CODE),
+            MutateOutcome::Abandoned
+        );
+    }
 }
 
 /// Plan 30 §M9 round 2: pipelined appends and contiguous acknowledgements.

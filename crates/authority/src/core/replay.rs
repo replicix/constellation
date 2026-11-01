@@ -226,6 +226,16 @@ impl Core {
                     MutateOutcome::Accepted { .. } => {
                         let _ = replica.forget_replay(head.queue_seq);
                     }
+                    // Plan 43 C2 (§5.3 item 5): the rid was settled — its
+                    // requester asked for its outcome and the sequencer in
+                    // force refused it for good. Nothing of it may run: no
+                    // re-execution, no conflict copy (nobody heard it took
+                    // effect).
+                    MutateOutcome::Abandoned => {
+                        self.note_unacked_refused(head);
+                        self.stats.stranded_replayed += 1;
+                        let _ = replica.forget_replay(head.queue_seq);
+                    }
                     // Refused through an inbox (or, plan 30 §M9, by a
                     // holder that journals refusals) before this node saw
                     // it: an outcome, not a re-evaluation. An unacked
@@ -545,6 +555,7 @@ impl Core {
                         | MutateOutcome::Exists { .. }
                         | MutateOutcome::Conflict { .. }
                         | MutateOutcome::LockLapsed
+                        | MutateOutcome::Abandoned
                 )
             )
         {
@@ -582,6 +593,16 @@ impl Core {
             // applied over the next lock holder's writes.
             Some(MutateOutcome::LockLapsed) => {
                 "the lock grant it was issued under has ended".to_string()
+            }
+            // Plan 43 C2 (§5.3 item 5): the rid was settled by its
+            // requester: nothing of it may run, and nobody heard it took
+            // effect (an acknowledged op is never settled).
+            Some(MutateOutcome::Abandoned) => {
+                self.note_unacked_refused(&queued);
+                self.stats.stranded_replayed += 1;
+                let _ = replica.forget_replay(queue_seq);
+                self.replay.stuck_since = None;
+                return;
             }
         };
         self.replay.stuck_since = None;
@@ -772,6 +793,12 @@ impl Core {
             }
             match outcome {
                 MutateOutcome::Accepted { .. } => {
+                    replica.forget_replay(queued.queue_seq)?;
+                }
+                // Settled (see `on_drain_tick`): nothing of it may run.
+                MutateOutcome::Abandoned => {
+                    self.note_unacked_refused(queued);
+                    self.stats.stranded_replayed += 1;
                     replica.forget_replay(queued.queue_seq)?;
                 }
                 MutateOutcome::Errno(code)
