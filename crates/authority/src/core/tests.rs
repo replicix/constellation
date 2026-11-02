@@ -31761,26 +31761,73 @@ mod s3_no_loops {
         assert_eq!(recalls_sent(&out, 3), 0, "a second recall: {out:?}");
     }
 
-    /// A generation the root recalls already is never redirected to: the
-    /// delegate is stopped and would send the op straight back. The op, and a
-    /// settle of one, are parked behind the recall (a settle never waits for
-    /// `deps`). Fails on the parent: `NotHolder { 3 }`.
+    /// A *settle* of an op on a generation the root recalls already is not
+    /// redirected: the delegate is stopped and would send it straight back,
+    /// and a settle executes nothing, so parked here it makes no second copy
+    /// (the cut answers it). Fails on the parent: `NotHolder { 3 }`.
     #[test]
-    fn a_root_parks_a_forward_behind_its_own_recall_instead_of_redirecting() {
-        for settle in [false, true] {
-            let (mut h, dir, gen) = delegated_root();
-            h.core.dl.gens.get_mut(&gen).unwrap().delegate_heard = Some(w(h.now));
-            h.core.start_recall(h.clk(), gen, &mut Vec::new());
-            assert_eq!(h.core.dl.gens[&gen].recall, RecallPhase::Sent);
-            let out = forward(&mut h, 2, 7, dir, settle);
-            assert_eq!(
-                reply_to(&out, 2, 7),
-                None,
-                "settle {settle}: redirected or answered: {out:?}"
-            );
-            assert!(h.core.has_exec_parks(), "settle {settle}: not parked");
-            assert_eq!(recalls_sent(&out, 3), 0, "settle {settle}: recalled again");
-        }
+    fn a_root_parks_a_settle_behind_its_own_recall_instead_of_redirecting() {
+        let (mut h, dir, gen) = delegated_root();
+        h.core.dl.gens.get_mut(&gen).unwrap().delegate_heard = Some(w(h.now));
+        h.core.start_recall(h.clk(), gen, &mut Vec::new());
+        assert_eq!(h.core.dl.gens[&gen].recall, RecallPhase::Sent);
+        let out = forward(&mut h, 2, 7, dir, true);
+        assert_eq!(
+            reply_to(&out, 2, 7),
+            None,
+            "redirected or answered: {out:?}"
+        );
+        assert!(h.core.has_exec_parks(), "not parked");
+        assert_eq!(recalls_sent(&out, 3), 0, "recalled again");
+    }
+
+    /// An *execution* is still redirected to a generation the root recalls:
+    /// parked here it would be a second executable copy beside the one the
+    /// requester may still have parked at the delegate. Passes on the parent.
+    #[test]
+    fn a_root_still_redirects_an_execution_to_a_generation_it_recalls() {
+        let (mut h, dir, gen) = delegated_root();
+        h.core.dl.gens.get_mut(&gen).unwrap().delegate_heard = Some(w(h.now));
+        h.core.start_recall(h.clk(), gen, &mut Vec::new());
+        assert_eq!(h.core.dl.gens[&gen].recall, RecallPhase::Sent);
+        let out = forward(&mut h, 2, 7, dir, false);
+        assert_eq!(
+            reply_to(&out, 2, 7),
+            Some(MutateOutcome::NotHolder { holder: 3 }),
+            "{out:?}"
+        );
+        assert!(!h.core.has_exec_parks(), "parked");
+    }
+
+    /// A designation under recall (`online` released it) is never skipped:
+    /// `deleg_recall_plan` would refuse every op on it (`EROFS`), the
+    /// designee's own included. The designee's op is held, a third node's op
+    /// and settle are redirected, as before the recall. Fails with the
+    /// recall-skip unlimited: `Errno(ReadOnly)` three times.
+    #[test]
+    fn a_designation_under_recall_is_not_refused() {
+        let (mut h, dir, gen) = delegated_root();
+        let g = h.core.dl.gens.get_mut(&gen).unwrap();
+        g.kind = crate::core::delegate::DelegKind::Designated;
+        g.delegate_heard = Some(w(h.now));
+        g.recall = RecallPhase::Sent;
+        let out = forward(&mut h, 3, 7, dir, false);
+        assert!(
+            matches!(reply_to(&out, 3, 7), Some(MutateOutcome::Held { .. })),
+            "the designee's op: {out:?}"
+        );
+        let out = forward(&mut h, 2, 8, dir, false);
+        assert_eq!(
+            reply_to(&out, 2, 8),
+            Some(MutateOutcome::NotHolder { holder: 3 }),
+            "a third node's op: {out:?}"
+        );
+        let out = forward(&mut h, 2, 9, dir, true);
+        assert_eq!(
+            reply_to(&out, 2, 9),
+            Some(MutateOutcome::NotHolder { holder: 3 }),
+            "a third node's settle: {out:?}"
+        );
     }
 
     /// The control: inside the grant's own flight time the delegate's table

@@ -319,8 +319,18 @@ impl Core {
                     if disowned && live.is_some_and(|g| g.recall == RecallPhase::None) {
                         self.stats.deleg_disowned_recalls += 1;
                     }
+                    // A *settle* is not redirected to a generation this root
+                    // recalls (its stopped delegate sends it straight back;
+                    // the cut answers it: dedup or refusal, and a settle
+                    // executes nothing, so it can make no second copy). An
+                    // execution is still redirected as before: parked here it
+                    // would be a second executable copy beside the one the
+                    // requester may still have parked at the delegate. A
+                    // designation is never skipped: `deleg_recall_plan`
+                    // refuses it (`EROFS`) while `online` recalls it.
                     if d.node != self.cfg.node_id
-                        && live.is_some_and(|g| g.recall == RecallPhase::None)
+                        && live
+                            .is_some_and(|g| g.recall == RecallPhase::None || !settle || designated)
                         && !disowned
                     {
                         // Wholly a live delegate's: the requester's table
