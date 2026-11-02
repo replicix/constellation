@@ -2628,7 +2628,7 @@ impl Driver {
         let tick = self.oracles.next_tick();
         let at_ms = self.clock.elapsed_ms();
         let judged = judge.then(|| {
-            let st = AnswererState::of(&self.core, &self.meta, self.id, self.clock.now().wait.0);
+            let st = AnswererState::of(&self.core, &self.meta, self.id);
             let j = committed_at_answer(&self.oracles, &self.bus, self.id, &st, rid, outcome);
             let uncommitted =
                 j.class.is_none() && !(j.expected == Expected::Unjournaled && kind.is_refusal());

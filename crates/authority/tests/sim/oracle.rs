@@ -433,18 +433,10 @@ pub struct AnswererState {
     /// The generations of the delegation table that are designations of
     /// this node (never stolen by the root).
     pub designated_gens: Vec<u64>,
-    /// The answerer's wait clock at the answer (ms): a link counts as a
-    /// candidate once it has been up for the stability window.
-    pub now_wait: i64,
 }
 
 impl AnswererState {
-    pub fn of(
-        core: &constellation_authority::Core,
-        meta: &Meta,
-        id: NodeId,
-        now_wait: i64,
-    ) -> Self {
+    pub fn of(core: &constellation_authority::Core, meta: &Meta, id: NodeId) -> Self {
         let view = core.deleg_view();
         Self {
             epoch: core.lease().epoch(),
@@ -457,7 +449,6 @@ impl AnswererState {
                 .filter(|d| d.node == id && d.designated)
                 .map(|d| d.gen)
                 .collect(),
-            now_wait,
         }
     }
 }
@@ -903,7 +894,7 @@ fn classify(
     if !group_is_itself {
         return None;
     }
-    if let Some(n) = peer_in_budget(o, bus, answerer, st.now_wait) {
+    if let Some(n) = peer_in_budget(o, bus, answerer) {
         detail.push(format!("lone: peer {n} is linked within the budget"));
         return None;
     }
@@ -914,10 +905,12 @@ fn classify(
 }
 
 /// A live node `answerer` is linked to within its RTT budget, if any, as
-/// the node can know: a link that has been up for the stability window
-/// (a peer that has only just come up is not yet one a backup is brought up
-/// from, though the core waits for the archive meanwhile, i1-592), and
-/// judged by the peer directory the core was actually given.
+/// the node can know: judged by the peer directory the core was actually
+/// given, and with no stability term. A link that has only just come up is
+/// already a peer a backup could be had from: the core waits for the archive
+/// meanwhile and never answers alone with a peer linked (i1-592), so an
+/// answer given `Lone` within the stability window of a link coming up is a
+/// violation.
 ///
 /// The core's roster and links come from the driver's last poll, and the bus
 /// is ahead of them: just after a partition healed or the other nodes
@@ -926,11 +919,11 @@ fn classify(
 /// own information (plan 43 Layer A: lone is no *known* peer in budget; the
 /// rollback risk equals a genuine lone answer's, and the roster singleton of
 /// plan 46 M2.3 removes the case). So an answerer with a directory entry
-/// counts only the peers that entry reports up for the stability window; one
-/// with no entry at all was told nothing and counts every bus link (a core
-/// that was told nothing must not judge itself lone).
-fn peer_in_budget(o: &Oracles, bus: &Bus, answerer: NodeId, now_wait: i64) -> Option<NodeId> {
-    let (budget, stable) = o
+/// counts only the peers that entry reports up; one with no entry at all was
+/// told nothing and counts every bus link (a core that was told nothing must
+/// not judge itself lone).
+fn peer_in_budget(o: &Oracles, bus: &Bus, answerer: NodeId) -> Option<NodeId> {
+    let (budget, _) = o
         .budgets
         .lock()
         .unwrap()
@@ -943,12 +936,7 @@ fn peer_in_budget(o: &Oracles, bus: &Bus, answerer: NodeId, now_wait: i64) -> Op
         *n != answerer
             && bus.linked(answerer, *n)
             && bus.rtt(answerer, *n) <= budget
-            && match up {
-                None => true,
-                Some(m) => m
-                    .get(n)
-                    .is_some_and(|since| now_wait - *since >= stable as i64),
-            }
+            && up.is_none_or(|m| m.contains_key(n))
     })
 }
 
@@ -1078,10 +1066,7 @@ fn expected_class(
             .any(|(gen, b)| *gen == g && !b.is_empty());
         return Expected::Class(if st.designated_gens.contains(&g) {
             AckClass::NonStealable
-        } else if rid.node == answerer
-            && !backed
-            && peer_in_budget(o, bus, answerer, st.now_wait).is_none()
-        {
+        } else if rid.node == answerer && !backed && peer_in_budget(o, bus, answerer).is_none() {
             AckClass::Lone
         } else {
             AckClass::DelegGroup { gen: g }
@@ -1099,7 +1084,7 @@ fn expected_class(
     if !l.backups.is_empty() {
         return Expected::Class(AckClass::RootGroup);
     }
-    if peer_in_budget(o, bus, answerer, st.now_wait).is_some() {
+    if peer_in_budget(o, bus, answerer).is_some() {
         // The bring-up rule: while a backup could be had, wait for the
         // archive.
         return Expected::Class(AckClass::Archive);
@@ -2605,15 +2590,14 @@ mod tests {
         let j = w.judge(1, &st, own);
         assert_eq!(j.class, None, "{}", j.detail);
         assert!(j.detail.contains("peer 2 is linked"), "{}", j.detail);
-        // ... unless its link is too young to be a candidate (the stability
-        // window), or it is out of budget, or the link is cut.
+        // A link just up is a peer too (no stability term): an answer given
+        // `Lone` within the window of a link coming up is a violation.
         w.o.note_directory(1, [(2u64, 9_990i64)].into());
         w.o.budgets.lock().unwrap().insert(1, (50, 200));
-        let young = AnswererState {
-            now_wait: 10_000,
-            ..holder_state(1)
-        };
-        assert_eq!(w.judge(1, &young, own).class, Some(AckClass::Lone));
+        let j = w.judge(1, &st, own);
+        assert_eq!(j.class, None, "{}", j.detail);
+        assert!(j.detail.contains("peer 2 is linked"), "{}", j.detail);
+        // ... unless it is out of budget, or the link is cut.
         w.o.budgets.lock().unwrap().insert(1, (50, 0));
         w.bus.set_rtt(1, 2, 120);
         assert_eq!(w.judge(1, &st, own).class, Some(AckClass::Lone));
