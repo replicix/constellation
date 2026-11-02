@@ -15711,6 +15711,60 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// Plan 46 M0.3 (S1 to S3), under the strict form (`+unsettled`): the seeds
+/// whose unsettled `EIO` the three product causes made, with a sequencer
+/// reachable. A takeover gate whose journal work is done answers a settle on
+/// the keys it owns (`backup-strict` 27 and 54, `tloss-two-node` 37,
+/// `delegated-group-switch` 15, 51, 615 and 1170, `delegated-holder-cut` 17,
+/// `delegated-backup` 11, `long-delegated-late-answers` 13); a gated root
+/// leaves a delegation renewal unanswered (`delegated-backup` 129,
+/// `delegated-no-backup-root-near` 297); and the root neither redirects to a
+/// generation it recalls nor outwaits a delegate that disowned its own
+/// (`long-delegated` 1198, `delegated-holder-cut` 6). Each fails with I4 on
+/// the parent of the settle fixes and passes now. (`settle_before_eio_...`
+/// above holds the seeds whose `EIO`, `tloss-two-node` 35, `long-delegated`
+/// 178 and `delegated-two-gens-root-crash` 651, the classifier excuses on the
+/// parent.)
+#[test]
+fn m03_the_settle_causes_s1_to_s3_leave_no_unsettled_eio_in_these_seeds() {
+    let cases: Vec<(&str, SimConfig, Vec<u64>)> = vec![
+        ("backup-strict", backup_strict_config(), vec![27, 54]),
+        ("tloss-two-node", tloss_two_node_config(), vec![37]),
+        (
+            "delegated-group-switch",
+            delegated_group_switch_config(),
+            vec![15, 51, 615, 1170],
+        ),
+        (
+            "delegated-holder-cut",
+            delegated_holder_cut_config(),
+            vec![6, 17],
+        ),
+        ("delegated-backup", delegated_backup_config(), vec![11, 129]),
+        (
+            "delegated-no-backup-root-near",
+            delegated_no_backup_root_near_config(),
+            vec![297],
+        ),
+        ("long-delegated", long_delegated_config(), vec![1198]),
+        (
+            "long-delegated-late-answers",
+            long_delegated_late_answers_config(),
+            vec![13],
+        ),
+    ];
+    for (label, cfg, seeds) in cases {
+        for seed in seeds {
+            run_seed(seed, strict(cfg.clone(), "unsettled")).unwrap_or_else(|e| {
+                panic!(
+                    "{label}+unsettled seed {seed}: {e}\n  replay with \
+                     AUTHORITY_SIM_CONFIG={label}+unsettled"
+                )
+            });
+        }
+    }
+}
+
 /// I5: under `backup` an acknowledged op is rolled back (the transient
 /// shadow rollbacks `backup_no_acked_op_lost`'s comment described) and its
 /// answer was not Lone. Plan 43 C1-4: there are none (a committed requester
