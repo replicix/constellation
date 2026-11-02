@@ -80,6 +80,16 @@ pub struct Oracles {
     pub reach: Arc<super::reach::Reach>,
     pub ops: Mutex<HashMap<Rid, constellation_meta::MutateOp>>,
     pub unsettled: Mutex<Vec<Unsettled>>,
+    /// The delegation table as the lease holder had it, each time it changed
+    /// (`(at_ms, holder, table)`): the generation history (install, recall,
+    /// end) that decides who owns an op's keys at each instant.
+    pub tables: Mutex<
+        Vec<(
+            u64,
+            NodeId,
+            Arc<constellation_meta::delegation::DelegationTable>,
+        )>,
+    >,
 }
 
 /// An unsettled `EIO` (the client was told in doubt after its settle went
@@ -102,6 +112,13 @@ impl Unsettled {
                 "isolated/requester stopped".into()
             }
             super::reach::Verdict::Isolated { .. } => "isolated".into(),
+            super::reach::Verdict::NoSequencerInTime { why } => {
+                if why.contains("no member") {
+                    "no-sequencer-in-time/group tail".into()
+                } else {
+                    "no-sequencer-in-time/claim".into()
+                }
+            }
             super::reach::Verdict::Reachable { via, busy, .. } => {
                 let via = match via {
                     super::reach::Via::Itself => "itself",
@@ -123,6 +140,10 @@ impl Unsettled {
         match &self.verdict {
             super::reach::Verdict::Isolated { why } => format!(
                 "I4: rid {:?} told EIO unsettled by node {} at t={} ms; isolated over {span} ({why})",
+                self.rid, self.node, self.at_ms
+            ),
+            super::reach::Verdict::NoSequencerInTime { why } => format!(
+                "I4: rid {:?} told EIO unsettled by node {} at t={} ms; no sequencer in time over {span} ({why})",
                 self.rid, self.node, self.at_ms
             ),
             super::reach::Verdict::Reachable {
@@ -243,7 +264,15 @@ impl Oracles {
             let leases = leases.clone();
             let reach = reach.clone();
             bucket.set_lease_hook(Arc::new(move |node, prev, new| {
-                reach.lease_landed(new.holder, new.released, new.backups.clone());
+                reach.lease_landed(
+                    new.holder,
+                    new.released,
+                    new.backups.clone(),
+                    new.inherited_tail
+                        .as_ref()
+                        .map(|t| t.members.clone())
+                        .unwrap_or_default(),
+                );
                 leases.landed(node, prev, new)
             }));
         }
@@ -252,6 +281,7 @@ impl Oracles {
             reach,
             ops: Mutex::new(HashMap::new()),
             unsettled: Mutex::new(Vec::new()),
+            tables: Mutex::new(Vec::new()),
             bucket,
             stores: Mutex::new(BTreeMap::new()),
             budgets: Mutex::new(BTreeMap::new()),
@@ -287,17 +317,82 @@ impl Oracles {
         self.ops.lock().unwrap().insert(rid, op.clone());
     }
 
-    /// The delegate of `rid`'s keys, per the lease holder's table at `at`.
-    fn delegate_of(&self, rid: Rid, at: u64) -> Option<(NodeId, u64)> {
-        let op = self.ops.lock().unwrap().get(&rid).cloned()?;
-        let meta = self.store(self.reach.holder_at(at)?)?;
+    /// A lease holder's delegation table, as of now: kept when it differs
+    /// from the last one kept (an empty one counts as none).
+    pub fn note_table(
+        &self,
+        holder: NodeId,
+        table: constellation_meta::delegation::DelegationTable,
+    ) {
+        let mut t = self.tables.lock().unwrap();
+        if t.last()
+            .map_or(table.is_empty(), |(_, _, last)| **last == table)
+        {
+            return;
+        }
+        t.push((self.reach.now_ms(), holder, Arc::new(table)));
+    }
+
+    /// Whether the last table kept names a delegation.
+    pub fn tables_nonempty(&self) -> bool {
+        self.tables
+            .lock()
+            .unwrap()
+            .last()
+            .is_some_and(|(_, _, t)| !t.is_empty())
+    }
+
+    /// Who owned `rid`'s keys at each instant of `[from, to]`: the holder's
+    /// table at that instant resolved over the op's keys (the generation
+    /// history decides, not the table at the `EIO`).
+    fn owner_timeline(
+        &self,
+        node: NodeId,
+        rid: Rid,
+        from: u64,
+        to: u64,
+    ) -> Vec<(u64, super::reach::Owner)> {
+        use super::reach::Owner;
+        let root = vec![(0, Owner::Root)];
+        let Some(op) = self.ops.lock().unwrap().get(&rid).cloned() else {
+            return root;
+        };
+        let Some(meta) = self.store(node) else {
+            return root;
+        };
         let keys = constellation_meta::TouchSet::from_op_in(&op, &|p, n| {
             Replica::lookup_ino(&*meta, p, n)
         });
-        match meta.resolve_ownership(&keys) {
-            constellation_meta::delegation::Ownership::Delegated(d) => Some((d.node, d.gen)),
-            _ => None,
+        let tables = self.tables.lock().unwrap().clone();
+        let mut instants = vec![from];
+        instants.extend(tables.iter().map(|t| t.0).filter(|t| *t > from && *t <= to));
+        let mut out: Vec<(u64, Owner)> = Vec::new();
+        for t in instants {
+            let holder = self.reach.holder_at(t);
+            let table = tables
+                .iter()
+                .rev()
+                .filter(|(at, _, _)| *at <= t)
+                .find(|(_, h, _)| Some(*h) == holder)
+                .or_else(|| tables.iter().rev().find(|(at, _, _)| *at <= t));
+            let owner = match table {
+                None => Owner::Root,
+                Some((_, _, tb)) => match tb.resolve(&*meta, &keys) {
+                    constellation_meta::delegation::Ownership::Root => Owner::Root,
+                    constellation_meta::delegation::Ownership::Delegated(d) => Owner::Delegate {
+                        node: d.node,
+                        gen: d.gen,
+                    },
+                    constellation_meta::delegation::Ownership::CrossSubtree { .. } => {
+                        Owner::Blocked
+                    }
+                },
+            };
+            if out.last().map(|(_, o)| *o) != Some(owner) {
+                out.push((t, owner));
+            }
         }
+        out
     }
 
     /// Plan 46 M0.3: `node`'s core told a client `EIO`, in doubt, at the
@@ -306,14 +401,14 @@ impl Oracles {
     /// isolated (no sequencer reachable in the whole window) or not.
     pub fn note_unsettled(&self, node: NodeId, rid: Rid, window_ms: u64, started: Option<u64>) {
         let at = self.reach.now_ms();
-        let delegate = self.delegate_of(rid, at);
+        // (A settle lasts at least a window; one whose deadline was extended
+        // lasts from the arming of its second deadline.)
+        let from_ms = started.unwrap_or(at).min(at.saturating_sub(window_ms));
         let verdict = self.reach.classify(super::reach::Question {
             requester: node,
-            // (A settle lasts at least a window; one whose deadline was
-            // extended lasts from the arming of its second deadline.)
-            from_ms: started.unwrap_or(at).min(at.saturating_sub(window_ms)),
+            from_ms,
             to_ms: at,
-            delegate,
+            owners: self.owner_timeline(node, rid, from_ms, at),
         });
         self.unsettled.lock().unwrap().push(Unsettled {
             node,

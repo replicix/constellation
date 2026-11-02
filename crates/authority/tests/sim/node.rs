@@ -351,6 +351,10 @@ impl EventKind {
     }
 }
 
+/// The generations (dir, node, gen, recall, ended) the last delegation table
+/// kept was taken at.
+type GensSig = Vec<(u64, u64, u64, String, bool)>;
+
 pub struct NodeHandle {
     pub id: NodeId,
     pub meta: Arc<Meta>,
@@ -775,6 +779,7 @@ impl NodeHandle {
             freeze_handed: (0, 0),
             own_lapse: None,
             unsettled_seen: 0,
+            deleg_sig: Mutex::new(Vec::new()),
             deadline_armed: HashMap::new(),
             step_timer: None,
             own_lapses_unreported: env.own_lapses_unreported,
@@ -1070,6 +1075,8 @@ struct Driver {
     /// Plan 46 M0.3: the unsettled `EIO`s of this incarnation's core
     /// (`Stats::client_unsettled_eio`) already classified.
     unsettled_seen: u64,
+    /// The generations the last delegation table kept was taken at.
+    deleg_sig: Mutex<GensSig>,
     /// Plan 46 M0.3: when each client-deadline timer was armed (true ms),
     /// and the timer the current step fires: the second deadline of an
     /// unsettled `EIO` was armed when its settle began.
@@ -2489,6 +2496,23 @@ impl Driver {
                 busy |= super::reach::BUSY_JOB;
             }
             self.oracles.reach.note_view(self.id, held, grants, busy);
+            // The generation history: this holder's delegation table, kept
+            // when its generations changed (install, recall, end).
+            if held != super::reach::Held::No {
+                let sig: GensSig = view
+                    .delegation
+                    .gens
+                    .iter()
+                    .map(|g| (g.0, g.1, g.2, g.5.clone(), g.6))
+                    .collect();
+                let mut last = self.deleg_sig.lock().unwrap();
+                let changed = sig != *last;
+                if changed || (!self.meta.delegations_any() && self.oracles.tables_nonempty()) {
+                    *last = sig;
+                    self.oracles
+                        .note_table(self.id, self.meta.delegation_table());
+                }
+            }
         }
         let floor = self.core.takeover_floor_until().0;
         if floor != 0 && floor != self.shared.floor_seen.swap(floor, Ordering::SeqCst) {

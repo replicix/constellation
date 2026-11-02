@@ -1250,6 +1250,9 @@ pub struct Report {
     /// failed although a sequencer was there); the violations described
     /// (first five), and the isolated ones' causes by kind.
     pub unsettled_isolated: usize,
+    /// Of the allowed ones, those whose only way to a sequencer was a lease
+    /// claim that could not finish inside the window by design (`no_sequencer_in_time`).
+    pub unsettled_no_sequencer_in_time: usize,
     pub unsettled_violations: usize,
     pub unsettled_examples: Vec<String>,
     pub unsettled_causes: BTreeMap<String, usize>,
@@ -3951,6 +3954,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             core.ttl_ms,
             2 * core.backup_takeover_ms,
             cfg.lease_reads.before.1 + cfg.lease_reads.reply.1,
+            core.acquire_retry_min_ms,
         );
     }
     bus.set_stream_faults(cfg.stream_faults.clone());
@@ -5594,9 +5598,13 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let unsettled_violations: Vec<String> = {
         let all = oracles.unsettled.lock().unwrap();
         report.unsettled_isolated = all.iter().filter(|u| u.verdict.isolated()).count();
+        report.unsettled_no_sequencer_in_time = all
+            .iter()
+            .filter(|u| u.verdict.no_sequencer_in_time())
+            .count();
         let bad: Vec<String> = all
             .iter()
-            .filter(|u| !u.verdict.isolated())
+            .filter(|u| !u.verdict.allowed())
             .map(|u| u.describe())
             .collect();
         report.unsettled_violations = bad.len();

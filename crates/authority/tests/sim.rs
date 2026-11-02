@@ -7474,7 +7474,7 @@ struct OracleTotals {
     /// Plan 46 M0.3: unsettled `EIO`s by isolated requesters (allowed) and
     /// by requesters that could reach a sequencer (I4 violations), and the
     /// seeds with a violation.
-    unsettled_class: [u64; 2],
+    unsettled_class: [u64; 3],
     unsettled_seeds: u64,
     unsettled_causes: std::collections::BTreeMap<String, u64>,
 }
@@ -7568,6 +7568,7 @@ impl OracleTotals {
         }
         self.unsettled_class[0] += r.unsettled_isolated as u64;
         self.unsettled_class[1] += r.unsettled_violations as u64;
+        self.unsettled_class[2] += r.unsettled_no_sequencer_in_time as u64;
         self.unsettled_seeds += u64::from(r.unsettled_violations > 0);
         for (k, n) in &r.unsettled_causes {
             *self.unsettled_causes.entry(k.clone()).or_default() += *n as u64;
@@ -7648,13 +7649,14 @@ impl OracleTotals {
             + r.unverified_relays
             + r.unjournaled_landed
             + r.unsettled_isolated
+            + r.unsettled_no_sequencer_in_time
             + r.unsettled_violations
             > 0
         {
             eprintln!(
                 "SWEEP-ORACLES {label} seed {seed}: i1={uncommitted} {:?} i2={} i2c={} i4={} i5={} \
                  unjournaled={unjournaled} {:?} mismatched={mismatched} {:?} relays={} \
-                 unjournaled-landed={} unsettled-eio={unsettled} (isolated {}, violations {}) rebuilds={}/{}",
+                 unjournaled-landed={} unsettled-eio={unsettled} (isolated {}, no sequencer in time {}, violations {}) rebuilds={}/{}",
                 r.uncommitted_acks,
                 r.identity_copies,
                 r.non_verbatim,
@@ -7665,6 +7667,7 @@ impl OracleTotals {
                 r.unverified_relays,
                 r.unjournaled_landed,
                 r.unsettled_isolated,
+                r.unsettled_no_sequencer_in_time,
                 r.unsettled_violations,
                 r.rebuilds.0,
                 r.rebuilds.1
@@ -7683,7 +7686,7 @@ impl OracleTotals {
              i1-mismatched={mismatched} {:?} (in {} seeds) unverified-relays={} (in {} seeds) \
              class-mismatch={} unsourced={} unjournaled-landed={}; settles \
              (sent/abandoned/late-success/local/unsettled-eio) {:?} i4-settled={}; unsettled EIO \
-             isolated={} violations={} (in {} seeds); cores' sequenced answers by class {:?}",
+             isolated={} violations={} (in {} seeds) no-sequencer-in-time={}; cores' sequenced answers by class {:?}",
             self.seeds,
             self.uncommitted,
             self.seeds_with[0],
@@ -7714,6 +7717,7 @@ impl OracleTotals {
             self.unsettled_class[0],
             self.unsettled_class[1],
             self.unsettled_seeds,
+            self.unsettled_class[2],
             constellation_authority::core::AckClass::NAMES.iter().zip(self.claimed).collect::<Vec<_>>()
         );
         eprintln!(
@@ -15357,6 +15361,46 @@ fn m03_the_configurations_without_an_unsettled_eio_run_strict() {
         assert!(cfg.strict_unsettled, "{label}");
         for seed in 0..6u64 {
             run_seed(seed, cfg.clone()).unwrap_or_else(|e| panic!("{label} seed {seed}: {e}"));
+        }
+    }
+}
+
+/// Plan 46 M0.3, the ratchet: every configuration whose 2,000-seed sweep tells
+/// no unsettled `EIO` that is not allowed (an isolated requester, or none in
+/// time) runs strict, so a change that makes one appear fails here. The sweeps
+/// that set the list are in PROGRESS ("Plan 43 C2h"); with the lease-reads
+/// knob most of them still tell violations, so strict mode is for runs without
+/// it. (The shared base configurations are not changed: derived ones, such as
+/// `backup-strict`, still tell violations.)
+#[test]
+fn m03_the_configurations_at_zero_violations_stay_there() {
+    type Config = fn() -> SimConfig;
+    let configs: [(&str, Config); 12] = [
+        (
+            "delegated-delegate-restart",
+            delegated_delegate_restart_config,
+        ),
+        ("delegated-partition", delegated_partition_config),
+        ("delegated-crash", delegated_crash_config),
+        ("far", far_config),
+        ("backup", backup_config),
+        ("backup-crash", backup_crash_config),
+        ("backup-hot", backup_hot_config),
+        ("locks-delegated", locks_delegated_config),
+        ("shared-dir", shared_dir_config),
+        ("shared-dir-split", shared_dir_split_config),
+        ("shared-dir-default", shared_dir_default_config),
+        ("shared-dir-ranges", shared_dir_ranges_config),
+    ];
+    for (label, cfg) in configs {
+        for seed in 0..120u64 {
+            let strict = SimConfig {
+                strict_unsettled: true,
+                ..cfg()
+            };
+            run_seed(seed, strict).unwrap_or_else(|e| {
+                panic!("{label}+unsettled seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}+unsettled")
+            });
         }
     }
 }

@@ -540,9 +540,16 @@ impl ObjectStore for NodeStore {
                 // Served now; the response is on its way back for a while
                 // (the object may change meanwhile, the caller sees the
                 // state of the serving instant).
+                let served_at = self.bucket.reach.now_ms();
                 let served = self.bucket.inner.get_opts(location, options).await;
                 if let Some(d) = self.bucket.draw(reads.reply) {
                     tokio::time::sleep(d).await;
+                }
+                // Plan 46 M0.3: the claimant's first sight of a lease body.
+                if served.is_ok() && location.as_ref() == "leases/p0.json" {
+                    self.bucket
+                        .reach
+                        .lease_read(self.node, served_at, self.bucket.reach.now_ms());
                 }
                 served
             }
