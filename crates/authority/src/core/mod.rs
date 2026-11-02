@@ -515,12 +515,31 @@ impl Config {
     /// nudged at once (R4's `Busy`) and retries within its forward backoff;
     /// one partitioned for longer than the bound meets the settled refusal.
     pub fn drop_held_await(&self) -> u64 {
+        // (Floored at one settle window: a settle window of half the
+        // deadline would make the cap 0, and a placeholder would be settled
+        // on the first tick, before its requester could retry.)
         let cap = self
             .acquire_deadline_ms
-            .saturating_sub(2 * self.settle_window());
+            .saturating_sub(2 * self.settle_window())
+            .max(self.settle_window());
         match self.drop_held_await_ms {
             0 => cap,
             ms => ms.min(cap),
+        }
+    }
+
+    /// Plan 46 M0.2 review (R7): how long a requester's shadow of a
+    /// non-stealable answer may wait for its rid's outcome in the log, by
+    /// the wall clock, before it is rolled back and replayed
+    /// (`Meta::strand_stale_shadows`): `drop_held_await_ms`, else the client
+    /// deadline. Not the placeholder bound's cap ([`Self::drop_held_await`],
+    /// which the follow-up halved): the shadow's owner may hold its row for a
+    /// whole client deadline, and cutting the wait in half would roll back
+    /// shadows whose rows are still on their way.
+    pub fn stale_shadow_after(&self) -> u64 {
+        match self.drop_held_await_ms {
+            0 => self.acquire_deadline_ms,
+            ms => ms,
         }
     }
 

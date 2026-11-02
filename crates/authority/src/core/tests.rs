@@ -51328,6 +51328,20 @@ mod await_retry {
         assert_eq!(cfg.drop_held_await(), cap);
         cfg.drop_held_await_ms = cap / 2;
         assert_eq!(cfg.drop_held_await(), cap / 2);
+        // A settle window of half the deadline would make the cap 0: it is
+        // floored at one settle window.
+        cfg.drop_held_await_ms = 0;
+        cfg.settle_window_ms = cfg.acquire_deadline_ms / 2;
+        assert_eq!(cfg.drop_held_await(), cfg.settle_window());
+        assert!(cfg.drop_held_await() > 0);
+        // R7's wall-clock cutoff for a non-stealable shadow is not the cap:
+        // it keeps its former value, the whole client deadline.
+        let prod = Config::defaults(1, 1);
+        assert_eq!(prod.drop_held_await(), 60_000);
+        assert_eq!(prod.stale_shadow_after(), 120_000);
+        let mut set = Config::defaults(1, 1);
+        set.drop_held_await_ms = 5_000;
+        assert_eq!(set.stale_shadow_after(), 5_000);
         // The production defaults: 120 s deadline, 30 s settle window.
         assert_eq!(Config::defaults(1, 1).acquire_deadline_ms, 120_000);
         assert_eq!(Config::defaults(1, 1).drop_held_await(), 60_000);

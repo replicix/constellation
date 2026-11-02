@@ -248,7 +248,7 @@ keep their replayable copy.
   replay by rid to whoever holds the lease); only the position the retry
   would have taken is not kept.
 - If the retry never comes (the requester is gone, or gave up and settled),
-  after `CONSTELLATION_DROP_HELD_AWAIT_MS` (default the cap: the client
+  after `CONSTELLATION_DROP_HELD_AWAIT_MS` (default the cap, floored at one settle window: the client
   deadline minus two settle windows, 60 s at the default TTL, and never more;
   this node's own operations on the placeholder's keys wait behind it, and
   must still have their window left when it ends; the clock stands still

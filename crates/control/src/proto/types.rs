@@ -2223,7 +2223,8 @@ pub struct HeldStatus {
     /// replay queue as a placeholder, waiting for its requester's retry
     /// (which executes it again in the dropped row's place) and holding
     /// what depends on it behind it. After `drop_held_await_ms` (default
-    /// twice the lease TTL) the sequencer in force settles the rid as
+    /// the client deadline minus two settle windows, 60 s at the default
+    /// TTL) the sequencer in force settles the rid as
     /// abandoned (`ack.await_retry_settled`).
     #[serde(default)]
     pub awaiting: Vec<AwaitingRetryStatus>,
