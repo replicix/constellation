@@ -1739,6 +1739,10 @@ pub struct OffCore {
     /// The probe's latest lapse of at least `lag_threshold_ms`, `(from,
     /// until)` in unix ms (`(0, 0)`: none).
     lapse: Mutex<(i64, i64)>,
+    /// The end of that lapse, kept beside it as an atomic: the FUSE fast
+    /// path reads it per operation ([`Self::lapse_unhanded`]) and takes no
+    /// lock.
+    lapse_until: std::sync::atomic::AtomicI64,
     /// What counts as a lapse: the core's lag threshold, an eighth of
     /// `backup_takeover_ms`.
     lag_threshold_ms: i64,
@@ -1846,6 +1850,7 @@ impl OffCore {
             responsive_ms: responsive_ms.max(1) as i64,
             probe_tick: std::sync::atomic::AtomicI64::new(0),
             lapse: Mutex::new((0, 0)),
+            lapse_until: std::sync::atomic::AtomicI64::new(0),
             lag_threshold_ms: 1_500 / 8,
             echo_sent: std::sync::atomic::AtomicI64::new(0),
             deleg_certs: Mutex::new(Vec::new()),
@@ -2216,6 +2221,7 @@ impl OffCore {
     pub(crate) fn note_probe(&self, now_wait_ms: i64, late_ms: i64) {
         if late_ms >= self.lag_threshold_ms {
             *self.lapse.lock().unwrap() = (now_wait_ms - late_ms, now_wait_ms);
+            self.lapse_until.store(now_wait_ms, Ordering::Release);
         }
         self.probe_tick.store(now_wait_ms, Ordering::Relaxed);
     }
@@ -2256,8 +2262,17 @@ impl OffCore {
     /// was judged on a directory older than the lapse. The FUSE fast path
     /// does not answer alone meanwhile (`Session::set_lone_guard`): a row
     /// journaled `Lone` takes the in-doubt path through the core.
+    ///
+    /// Per operation on the fast path, so atomics only: no mutex, no lock
+    /// (the probe's lapse is read from [`Self::lapse_until`], not from the
+    /// pair behind the mutex; the lapse in progress is `now_wait_ms`).
     pub(crate) fn lapse_unhanded(&self, now_wait_ms: i64) -> bool {
-        let (_, until) = self.lapse(now_wait_ms);
+        let tick = self.probe_tick.load(Ordering::Relaxed);
+        let until = if tick != 0 && now_wait_ms - tick >= PROBE_EVERY_MS + self.lag_threshold_ms {
+            now_wait_ms
+        } else {
+            self.lapse_until.load(Ordering::Acquire)
+        };
         until > self.lag_handed.load(Ordering::Acquire) + self.lag_threshold_ms / 2
     }
 
@@ -2560,6 +2575,9 @@ impl Driver {
             alive: Arc::default(),
             urgent_rx,
             heard_handed: HashMap::new(),
+            // (One `OffCore` pairs with one `Driver` and its one `Core`: the
+            // lapse counts the snapshots carry and the core's `OwnLag` count
+            // agree because only this driver hands lapses through it.)
             lag_handed: 0,
             step_lapse: (0, 0),
             freeze_handed: (0, 0),
@@ -9487,6 +9505,34 @@ mod tests {
         assert!(off.lapse_unhanded(now + 5_000 + 10_000));
         off.lapse_stepped(now + 5_000 + 10_000);
         assert!(!off.lapse_unhanded(now + 5_000 + 10_000));
+    }
+
+    /// The fast path asks `lapse_unhanded` on every `Lone` operation, from
+    /// every FUSE thread: it reads atomics and takes no lock. Held across the
+    /// call, the mutex behind `OffCore::lapse` (the one the lag probe writes
+    /// and `hand_lag` reads) must not make it wait; the answer is the same
+    /// as without the lock held.
+    #[test]
+    fn the_fast_paths_lapse_guard_takes_no_lock() {
+        use std::sync::mpsc;
+        let off = std::sync::Arc::new(super::OffCore::new(5_000));
+        let now = 1_000_000;
+        off.note_probe(now, 400);
+        let held = off.lapse.lock().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let o = off.clone();
+        let t = std::thread::spawn(move || {
+            let before = o.lapse_unhanded(now);
+            o.lapse_stepped(now);
+            let after = o.lapse_unhanded(now);
+            tx.send((before, after)).unwrap();
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("lapse_unhanded waited for the lapse mutex");
+        assert_eq!(got, (true, false));
+        drop(held);
+        t.join().unwrap();
     }
 
     /// `startup-link-lag`: a peer that enrols shows up connected in the

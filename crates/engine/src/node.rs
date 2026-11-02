@@ -1210,6 +1210,10 @@ impl Engine {
         // service off the core's step (`authority_driver::OffCore`).
         let (urgent_tx, urgent_rx) = tokio::sync::mpsc::unbounded_channel();
         let off_core = Arc::new(crate::authority_driver::OffCore::for_config(&core_config));
+        // One `OffCore` pairs with one `Core` (the driver built below is the
+        // only one that hands lapses and takes snapshots through it): that
+        // is what makes the lapse counts of `Event::Peers` and the core's
+        // `OwnLag` count agree.
         // I1 class 2: the fast path does not answer alone while a lapse of
         // this process has not been handed to its core (a frozen process
         // wakes its FUSE threads before its driver).

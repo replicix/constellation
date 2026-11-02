@@ -1948,3 +1948,51 @@ fn a_delegates_lone_row_follows_only_a_committed_gated_row() {
     );
     assert_eq!(meta.session().stats().fast_acks_waited, 2);
 }
+
+/// Indicative cost of the per-operation lone check, one to eight threads
+/// (`cargo test -p constellation-engine --release --lib -- --ignored
+/// lone_check_cost --nocapture`): the published word alone, as before the
+/// guard, against the guarded check.
+#[test]
+#[ignore]
+fn lone_check_cost() {
+    use constellation_meta::RowClass;
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let session = meta.session();
+    session.set_durable(false, u64::MAX, false, RowClass::Lone, true);
+    let off = Arc::new(crate::authority_driver::OffCore::new(5_000));
+    let n: u64 = 20_000_000;
+    let run = |threads: usize| -> f64 {
+        let started = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    let mut ok = 0u64;
+                    for _ in 0..n {
+                        ok += session.durable_lone_ok() as u64;
+                    }
+                    std::hint::black_box(ok);
+                });
+            }
+        });
+        started.elapsed().as_nanos() as f64 / n as f64
+    };
+    for threads in [1, 4, 8] {
+        eprintln!(
+            "LONECHECK unguarded threads={threads} ns/op {:.1}",
+            run(threads)
+        );
+    }
+    {
+        let off = off.clone();
+        session.set_lone_guard(Arc::new(move || {
+            off.lapse_unhanded(crate::authority_driver::wait_now_ms())
+        }));
+    }
+    for threads in [1, 4, 8] {
+        eprintln!(
+            "LONECHECK guarded threads={threads} ns/op {:.1}",
+            run(threads)
+        );
+    }
+}

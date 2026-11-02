@@ -74,7 +74,7 @@ use crate::replay::TouchSet;
 use crate::store::local::RowClass;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// A point in one tenure's journal: `(epoch, journal seq)`, ordered
@@ -825,7 +825,7 @@ pub struct SessionState {
     /// node has a lapse of its own the core has not been handed (a frozen
     /// process wakes its FUSE threads before its driver). See
     /// [`SessionState::set_lone_guard`].
-    lone_guard: RwLock<Option<LoneGuard>>,
+    lone_guard: OnceLock<LoneGuard>,
 }
 
 /// See [`SessionState::set_lone_guard`].
@@ -862,7 +862,7 @@ impl Default for SessionState {
             // before. The core publishes `false` at its start, before the
             // mount serves, and the truth at every step after.)
             durable_lone_ok: AtomicBool::new(true),
-            lone_guard: RwLock::new(None),
+            lone_guard: OnceLock::new(),
         }
     }
 }
@@ -1667,12 +1667,7 @@ impl SessionState {
     /// published was judged on a directory older than the lapse.
     pub fn durable_lone_ok(&self) -> bool {
         self.durable_lone_ok.load(Ordering::Acquire)
-            && !self
-                .lone_guard
-                .read()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|guard| guard())
+            && !self.lone_guard.get().is_some_and(|guard| guard())
     }
 
     /// Install the driver's veto on [`Self::durable_lone_ok`]: `guard`
@@ -1683,8 +1678,12 @@ impl SessionState {
     /// and a newer directory, and must not answer on the disk alone then. A
     /// row journaled `Lone` meanwhile waits like a gated one and takes the
     /// in-doubt path through the core (D5).
+    ///
+    /// Set once (the first guard stays), read on every fast-path operation
+    /// without a lock; the guard must not take one either
+    /// (`OffCore::lapse_unhanded` reads atomics and a clock).
     pub fn set_lone_guard(&self, guard: LoneGuard) {
-        *self.lone_guard.write().unwrap() = Some(guard);
+        let _ = self.lone_guard.set(guard);
     }
 
     /// Whether the durability gate is on (one atomic load: the fast
