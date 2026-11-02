@@ -13736,8 +13736,8 @@ mod backup_crash {
                 assert!(h.core.root_lone(), "{what}");
             }
         }
-        // A peer that is linked but not on the roster, one not connected, and
-        // one that refused the epoch are no backup.
+        // A peer that is linked but not on the roster, and one not
+        // connected, are no backup.
         let mut h = Harness::new(1);
         backup_node(&mut h, vec![1]);
         link_2(&mut h, true, Some(5), 0);
@@ -13747,8 +13747,10 @@ mod backup_crash {
             write_eligible: vec![1, 2],
         });
         assert!(h.core.backup_could_be_had());
+        // One that sealed the epoch is no candidate but still a peer that
+        // takes over with its tail: it counts.
         h.core.ack.refused_epoch.insert(2, 1);
-        assert!(!h.core.backup_could_be_had(), "refused the epoch");
+        assert!(h.core.backup_could_be_had(), "sealed the epoch");
         h.core.ack.refused_epoch.clear();
         link_2(&mut h, false, Some(5), 0);
         assert!(!h.core.backup_could_be_had(), "not connected");
@@ -32668,8 +32670,11 @@ fn a_member_closes_once_the_carried_lease_has_moved_and_uploads_meanwhile() {
 /// EC2 follow-up (e): a candidate backup that answers `sealed` for the
 /// epoch held (a seal it persisted for it before) is not asked again for
 /// that epoch — before, the next housekeeping tick brought it up again,
-/// every ~100 ms, forever — and does not keep acknowledgements waiting
-/// for a backup that cannot be had.
+/// every ~100 ms, forever. Acknowledgements do not wait for it as a backup
+/// (it is no candidate), but they never leave on this disk alone either
+/// while it is linked: it sealed the epoch to take over with its tail, and
+/// what is acknowledged now would not be in it. They wait for the archive
+/// (oracle I1: `backup` seeds 1245, 498 under `+commit`).
 #[test]
 fn a_candidate_that_sealed_the_epoch_is_not_reinvited() {
     let mut h = Harness::new(1);
@@ -32723,7 +32728,13 @@ fn a_candidate_that_sealed_the_epoch_is_not_reinvited() {
     }
     assert!(sealed_answers >= 1, "the candidate was never streamed to");
     assert_eq!(invited, 1, "re-invited a backup that sealed the epoch");
-    assert_eq!(h.core.ack.eligible, Some(false), "still waiting for it");
+    assert_eq!(h.core.ack.candidate, None);
+    assert_eq!(
+        h.core.ack.eligible,
+        Some(true),
+        "a linked sealer is no lone peer"
+    );
+    assert_eq!(h.core.root_ack_class(), AckClass::Archive);
 }
 
 /// EC2 follow-up (the 4-node `cto-strict-root` EIO): an op that went to

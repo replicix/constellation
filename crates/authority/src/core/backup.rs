@@ -1444,7 +1444,8 @@ impl Core {
             // (`backup_could_be_had`), raised at every event and never
             // stale in the unsafe direction. Only a node with no roster
             // peer linked within the budget — a singleton, a peer measured
-            // out of budget, one that refused the epoch — is lone.
+            // out of budget — is lone. (A peer that sealed the epoch is
+            // linked: it takes over with its tail, and waits for nothing here.)
             let unassessed = self.ack.eligible.is_none() && self.backups_possible();
             return if self.ack.candidate.is_some() || self.ack.eligible == Some(true) || unassessed
             {
@@ -3124,7 +3125,10 @@ impl Core {
 
     /// Whether a backup could be had (`ack.eligible`, the gate of an empty
     /// set in `durable_jseq_held`): a roster peer linked within the RTT
-    /// budget that has not refused the epoch, listed or not. A listed one
+    /// budget, listed or not. One that sealed the epoch counts too (it is no
+    /// candidate, `backup_select`, but it takes over with its tail, and what
+    /// is acknowledged on this disk alone meanwhile is not in it; the
+    /// acknowledgements wait for the archive then). A listed one
     /// counts: the assessment must still hold once a removal CAS empties
     /// the set, before the next selection pass (`backup_select`) or the
     /// tenure's first (`acquire_won`) assesses it again.
@@ -3153,7 +3157,6 @@ impl Core {
                 && self.roster.contains(&l.node)
                 && l.rtt_ms
                     .is_none_or(|rtt| rtt <= self.cfg.backup_rtt_budget_ms)
-                && !self.ack.refused_epoch.contains_key(&l.node)
         })
     }
 
@@ -3175,8 +3178,9 @@ impl Core {
 
     fn backup_select(&mut self, now: Now, _replica: &dyn Replica, _out: &mut Vec<Action>) {
         // EC2 follow-up (e): a node that sealed the epoch held can never
-        // back it: neither a candidate nor a reason to hold
-        // acknowledgements back waiting for one.
+        // back it: not a candidate. (It still counts for whether a backup
+        // could be had: the acknowledgements wait for the archive, not for
+        // it, and never leave on this disk alone while it is linked.)
         let epoch = self.lease.epoch();
         self.ack.refused_epoch.retain(|_, e| Some(*e) == epoch);
         let candidates: Vec<NodeId> = self
