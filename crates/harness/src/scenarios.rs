@@ -945,21 +945,21 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "holder-crash-no-phantom-shadow",
-        desc: "plan 30 M3a (bug B) as a state that cannot arise (plan 43 C2f): a lone holder with S3 cut cannot commit, so a requester's forwarded create is not acknowledged and the requester holds no shadow; the holder is killed, a third node takes over, and b, c and a fresh d agree on the create (present iff it returned success), nothing rolled back or replayed",
+        desc: "plan 30 M3a (bug B) as a state that cannot arise (plan 43 C2f): a lone holder with S3 cut cannot commit, so a requester's forwarded create is not acknowledged and the requester holds no shadow; the holder is killed, a third node takes over, and b, c and a fresh d agree on the create: if b's create returned success it exists, if it returned an error it is absent unless b's core told an unsettled EIO (I4, both directions); nothing rolled back or replayed",
         requires: &[],
         caps: &[],
         run: holder_crash_no_phantom_shadow,
     },
     Scenario {
         name: "holder-crash-no-phantom-new-holder",
-        desc: "plan 30 M3a (bug B) as a state that cannot arise (plan 43 C2f): as holder-crash-no-phantom-shadow, but the requester becomes the next holder; nothing to roll back or replay, b, c and a fresh d agree, another node's O_EXCL create of an acknowledged name gets EEXIST",
+        desc: "plan 30 M3a (bug B) as a state that cannot arise (plan 43 C2f): as holder-crash-no-phantom-shadow, but the requester becomes the next holder; nothing to roll back or replay, b, c and a fresh d agree (a successful create exists, a failed one is absent unless b's core told an unsettled EIO: I4, both directions), another node's O_EXCL create of an acknowledged name gets EEXIST",
         requires: &[],
         caps: &[],
         run: holder_crash_no_phantom_new_holder,
     },
     Scenario {
         name: "takeover-marker-no-stranded-shadow",
-        desc: "plan 30 M3b as a state that cannot arise (plan 43 C2f): a takeover whose own op is refused ships the epoch marker (TailFollowsThrough { through: 0 }, no op) as the first segment of its epoch; the requester of a create the lone root could not commit never held a shadow, so nothing is stranded or replayed and the nodes agree on the name",
+        desc: "plan 30 M3b as a state that cannot arise (plan 43 C2f): a takeover whose own op is refused ships the epoch marker (TailFollowsThrough { through: 0 }, no op) as the first segment of its epoch; the requester of a create the lone root could not commit never held a shadow, so nothing is stranded or replayed; the requester's S3 is cut so the takeover is the refused op's node (asserted: the marker is that node's), and the nodes agree on the name (a successful create exists, a failed one is absent unless the requester's core told an unsettled EIO: I4, both directions)",
         requires: &[],
         caps: &[],
         run: takeover_marker_no_stranded_shadow,
@@ -11411,9 +11411,26 @@ type PhantomRig = (
 /// (plan 30 M3b: `takeover-marker-no-stranded-shadow` shortens the idle
 /// poll ceiling so its promptness bound does not ride on the P2P push).
 fn phantom_setup_with(scenario: &str, extra: &[(&str, &str)]) -> Result<PhantomRig> {
+    Ok(phantom_setup_c(scenario, extra, false)?.0)
+}
+
+/// As [`phantom_setup_with`]; with `c_via_proxy` node C reaches S3 through a
+/// proxy of its own (the second item), so a scenario can cut C's S3 apart
+/// from A's (`takeover-marker-no-stranded-shadow`: C cannot claim the lease,
+/// so B does).
+fn phantom_setup_c(
+    scenario: &str,
+    extra: &[(&str, &str)],
+    c_via_proxy: bool,
+) -> Result<(PhantomRig, Option<CountingProxy>)> {
     let (env, root) = setup(scenario)?;
     let _proxy = env.s3_proxy()?;
     let sw = env.counting_proxy()?;
+    let swc = if c_via_proxy {
+        Some(env.counting_proxy()?)
+    } else {
+        None
+    };
     let backend = format!("s3://{BUCKET}/{scenario}-{}", ts());
     let tune = |c: Client| {
         let mut c = c
@@ -11427,7 +11444,10 @@ fn phantom_setup_with(scenario: &str, extra: &[(&str, &str)]) -> Result<PhantomR
     };
     let mut a = tune(Client::new(root.path(), "a", &sw.endpoint(), &backend)?);
     let mut b = tune(Client::new(root.path(), "b", &env.endpoint, &backend)?);
-    let mut c = tune(Client::new(root.path(), "c", &env.endpoint, &backend)?);
+    let c_endpoint = swc
+        .as_ref()
+        .map_or_else(|| env.endpoint.clone(), |p| p.endpoint());
+    let mut c = tune(Client::new(root.path(), "c", &c_endpoint, &backend)?);
     a.fs_create()?;
     a.mount()?;
     b.mount()?;
@@ -11445,7 +11465,7 @@ fn phantom_setup_with(scenario: &str, extra: &[(&str, &str)]) -> Result<PhantomR
         anyhow::ensure!(c.mnt.join("marker").is_file(), "marker missing on C");
         Ok(())
     })?;
-    Ok((env, root, a, b, c, sw))
+    Ok(((env, root, a, b, c, sw), swc))
 }
 
 /// What the bug-B rig can no longer produce (plan 43 C2f, plan 46 M0.3): a
@@ -11520,6 +11540,48 @@ fn no_shadow_ever(c: &Client, rolled_before: u64) -> Result<()> {
     })
 }
 
+/// The unsettled `EIO`s a node's core has told its clients (plan 43 C2:
+/// no sequencer answered the op's settle within the settle window; the
+/// status's `ack.client_unsettled_eio`).
+fn unsettled_eio_of(c: &Client) -> Result<u64> {
+    Ok(c.control_status()?["ack"]["client_unsettled_eio"]
+        .as_u64()
+        .unwrap_or(0))
+}
+
+/// The bug-B scenarios' check of I4 (plan 43 §4, plan 46 M0.3), in both
+/// directions, once the nodes agree on `phantom` (`exists`) and `created` is
+/// what the requester's create returned; `unsettled` is how many unsettled
+/// `EIO`s the requester's core told during the run:
+///
+/// - the create returned success: `phantom` must exist (on every node: they
+///   agree) — an acknowledged create must not be lost;
+/// - it returned an error: `phantom` must be absent everywhere, unless the
+///   error was an unsettled `EIO` (`unsettled > 0`): an op whose requester
+///   heard "in doubt" may still land later (I4's ordering clause). A settled
+///   error (refused for good, `Abandoned`) must never be followed by the
+///   create's landing.
+fn check_create_outcome(
+    who: &str,
+    created: &std::io::Result<()>,
+    exists: bool,
+    unsettled: u64,
+) -> Result<()> {
+    match created {
+        Ok(()) => anyhow::ensure!(
+            exists,
+            "{who}'s create returned success but phantom does not exist: an acknowledged create \
+             was lost"
+        ),
+        Err(e) => anyhow::ensure!(
+            !exists || unsettled > 0,
+            "{who}'s create returned {e} as a settled answer (its core told {unsettled} unsettled \
+             EIOs) but phantom exists: a create answered as failed landed (I4)"
+        ),
+    }
+    Ok(())
+}
+
 /// Plan 30 M3a's speculation counters from a node's `status`, for the
 /// scenario log and the non-vacuity checks.
 fn speculation_of(c: &Client) -> Result<serde_json::Value> {
@@ -11552,11 +11614,14 @@ fn fresh_node(env: &S3Env, root: &std::path::Path, backend: &str, expect: &[u8])
 /// memory, so the requester (B) holds no shadow to strand ([`unacked_create`]).
 /// A is killed and a third node (C) takes over; B's create ends by its
 /// deadline or is executed by rid through the takeover. B, C and a fresh
-/// node D agree on `phantom` as one inode (present iff B's create returned
-/// success), and B never rolled anything back or replayed anything.
+/// node D agree on `phantom` as one inode, and I4 holds in both directions
+/// ([`check_create_outcome`]): present if B's create returned success; if it
+/// returned an error, absent unless B's core told an unsettled `EIO` (the
+/// create may land later). B never rolled anything back or replayed anything.
 fn holder_crash_no_phantom_shadow(_seed: u64) -> Result<()> {
     let (env, root, mut a, mut b, mut c, sw) = phantom_setup("holder-crash-no-phantom-shadow")?;
     let rolled_before = speculation_of(&b)?["rolled_back"].as_u64().unwrap_or(0);
+    let unsettled_before = unsettled_eio_of(&b)?;
 
     let create = unacked_create(&mut a, &b, &sw)?;
 
@@ -11579,10 +11644,12 @@ fn holder_crash_no_phantom_shadow(_seed: u64) -> Result<()> {
 
     let checked = (|| -> Result<Client> {
         let exists = phantom_agreement(&[("b", &b), ("c", &c)], Duration::from_secs(30))?;
-        anyhow::ensure!(
-            exists || created.is_err(),
-            "b's create returned success but phantom does not exist: an acknowledged create was lost"
-        );
+        check_create_outcome(
+            "b",
+            &created,
+            exists,
+            unsettled_eio_of(&b)?.saturating_sub(unsettled_before),
+        )?;
         no_shadow_ever(&b, rolled_before)?;
         b.unmount()?;
         let d = fresh_node(&env, root.path(), &c.backend, b"c")?;
@@ -11610,11 +11677,14 @@ fn holder_crash_no_phantom_shadow(_seed: u64) -> Result<()> {
 /// arise" test (plan 43 C2f): same rig as [`holder_crash_no_phantom_shadow`],
 /// but the requester (B) becomes the next holder. B's create was never
 /// acknowledged and B has no shadow; its takeover has nothing to roll back
-/// or replay. B, C and a fresh D agree on `phantom` (present iff B's create
-/// returned success, in which case C's `O_EXCL` create of it is `EEXIST`).
+/// or replay. B, C and a fresh D agree on `phantom` (present if B's create
+/// returned success, in which case C's `O_EXCL` create of it is `EEXIST`;
+/// absent if it returned an error, unless B's core told an unsettled `EIO`:
+/// [`check_create_outcome`]).
 fn holder_crash_no_phantom_new_holder(_seed: u64) -> Result<()> {
     let (env, root, mut a, mut b, mut c, sw) = phantom_setup("holder-crash-no-phantom-new-holder")?;
     let rolled_before = speculation_of(&b)?["rolled_back"].as_u64().unwrap_or(0);
+    let unsettled_before = unsettled_eio_of(&b)?;
 
     let create = unacked_create(&mut a, &b, &sw)?;
 
@@ -11637,10 +11707,12 @@ fn holder_crash_no_phantom_new_holder(_seed: u64) -> Result<()> {
 
     let checked = (|| -> Result<Client> {
         let exists = phantom_agreement(&[("b", &b), ("c", &c)], Duration::from_secs(30))?;
-        anyhow::ensure!(
-            exists || created.is_err(),
-            "b's create returned success but phantom does not exist: an acknowledged create was lost"
-        );
+        check_create_outcome(
+            "b",
+            &created,
+            exists,
+            unsettled_eio_of(&b)?.saturating_sub(unsettled_before),
+        )?;
         if created.is_ok() {
             match create_new(&c.mnt, "phantom") {
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -11732,15 +11804,21 @@ fn read_commit(endpoint: &str, key: &str) -> Result<serde_json::Value> {
 /// op that is *refused* — `rmdir` of a non-empty directory, `ENOTEMPTY` (not
 /// `mkdir` of an existing name: the kernel can answer that `EEXIST` from its
 /// dentry cache without ever calling the daemon) — so B's own op ships
-/// nothing. (C's create, still waiting in its lease path, may claim the lease
-/// first: then it is C's takeover; the assertions do not depend on who.)
+/// nothing. C's create, still waiting in its lease path, would claim the lease
+/// first (it had retried before B's op started), and the takeover would then
+/// be C's, through an op that ships something: not the path this scenario is
+/// for. So C's S3 is cut (its own proxy) from the kill until B's `rmdir` has
+/// returned: C cannot claim the lease, B does, and the scenario asserts the
+/// marker's node is B (a takeover through a refused op).
 /// The first segment of the new epoch in the bucket must be the takeover's
 /// marker: no op, only plan 43 C1-4's `TailFollowsThrough { prev_epoch, through:
 /// 0 }` (nothing of A's epoch was committed unshipped: A had no backup and
 /// could not commit anything). Plan 30's strand-and-replay half of this
 /// scenario cannot arise any more: C never rolls back or replays anything
-/// ([`no_shadow_ever`]); `phantom` is on B, C and a fresh D, one inode, iff C's
-/// create returned success, else absent on all of them.
+/// ([`no_shadow_ever`]). I4 is checked in both directions
+/// ([`check_create_outcome`]): `phantom` is on B, C and a fresh D, one inode,
+/// if C's create returned success; if it returned an error, `phantom` is
+/// absent on all of them unless C's core told an unsettled `EIO`.
 ///
 /// Every node runs with `CONSTELLATION_BACKUPS=0` ([`phantom_setup`]). A backed
 /// holder hands over a different way (plan 30 §M9: its backup seals A's epoch
@@ -11748,10 +11826,12 @@ fn read_commit(endpoint: &str, key: &str) -> Result<serde_json::Value> {
 /// record); that has its own scenarios (`holder-publishes-log-prefix-backup`
 /// and others).
 fn takeover_marker_no_stranded_shadow(_seed: u64) -> Result<()> {
-    let (env, root, mut a, mut b, mut c, sw) = phantom_setup_with(
+    let ((env, root, mut a, mut b, mut c, sw), swc) = phantom_setup_c(
         "takeover-marker-no-stranded-shadow",
         &[("CONSTELLATION_SYNC_IDLE_MAX_MS", "1000")],
+        true,
     )?;
+    let swc = swc.context("C's S3 proxy")?;
     let prefix = b
         .backend
         .strip_prefix(&format!("s3://{BUCKET}/"))
@@ -11772,14 +11852,19 @@ fn takeover_marker_no_stranded_shadow(_seed: u64) -> Result<()> {
         },
     )?;
     let rolled_before = speculation_of(&c)?["rolled_back"].as_u64().unwrap_or(0);
+    let unsettled_before = unsettled_eio_of(&c)?;
 
     let create = unacked_create(&mut a, &c, &sw)?;
+    // C can claim nothing from here on: the takeover is B's.
+    swc.cut();
 
     let checked = (|| -> Result<Client> {
         // B's refused op: it forwards to dead A, fails, waits out A's
         // lease and takes over (CAS, epoch marker, takeover gate), then
         // executes locally and is refused. Nothing of its own ships.
-        match std::fs::remove_dir(b.mnt.join("full")) {
+        let refused = std::fs::remove_dir(b.mnt.join("full"));
+        swc.heal();
+        match refused {
             Ok(()) => bail!("B's rmdir of the non-empty `full` succeeded"),
             Err(e) if Code::from_os_error(&e) == Some(Code::NotEmpty) => {}
             Err(e) => bail!("B's rmdir of the non-empty `full` returned {e}, expected ENOTEMPTY"),
@@ -11813,14 +11898,24 @@ fn takeover_marker_no_stranded_shadow(_seed: u64) -> Result<()> {
         eprintln!(
             "    takeover-marker-no-stranded-shadow: marker at seq {seq} (node {node}, epoch {epoch})"
         );
+        // The takeover was B's, through its refused op (the path the marker
+        // exists for): C could not claim the lease.
+        let b_id = m9::node_id(&b)?;
+        anyhow::ensure!(
+            node == b_id,
+            "the epoch marker (seq {seq}, epoch {epoch}) is node {node}'s, not B's ({b_id}): the \
+             takeover did not go through B's refused rmdir"
+        );
 
         // Nothing was stranded: C never speculated.
         no_shadow_ever(&c, rolled_before)?;
         let exists = phantom_agreement(&[("b", &b), ("c", &c)], Duration::from_secs(40))?;
-        anyhow::ensure!(
-            exists || created.is_err(),
-            "c's create returned success but phantom does not exist: an acknowledged create was lost"
-        );
+        check_create_outcome(
+            "c",
+            &created,
+            exists,
+            unsettled_eio_of(&c)?.saturating_sub(unsettled_before),
+        )?;
         // A fresh node bootstraps from the bucket alone (head commit plus
         // the log after it) and must agree too. C's clean unmount
         // publishes a commit first, as in the M3a scenarios.
@@ -13057,6 +13152,21 @@ fn inbox_holder_takeover_pending_batch(_seed: u64) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// The bug-B scenarios' I4 check, both directions: a create that returned
+    /// success must exist; one that returned an error must be absent unless
+    /// the requester told an unsettled `EIO`.
+    #[test]
+    fn create_outcome_is_checked_in_both_directions() {
+        let ok: std::io::Result<()> = Ok(());
+        let err: std::io::Result<()> = Err(std::io::Error::from_raw_os_error(5));
+        assert!(super::check_create_outcome("b", &ok, true, 0).is_ok());
+        assert!(super::check_create_outcome("b", &ok, false, 0).is_err());
+        assert!(super::check_create_outcome("b", &ok, false, 3).is_err());
+        assert!(super::check_create_outcome("b", &err, false, 0).is_ok());
+        assert!(super::check_create_outcome("b", &err, true, 0).is_err());
+        assert!(super::check_create_outcome("b", &err, true, 1).is_ok());
+    }
+
     use constellation_platform::drain::{small_stdio_pipes, DrainedChild};
     use std::process::Command;
     use std::time::Duration;
