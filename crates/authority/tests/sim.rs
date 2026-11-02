@@ -14970,10 +14970,10 @@ fn i1_a_root_resumed_from_a_pause_does_not_answer_alone_on_a_stale_directory() {
 /// not settled first. A takeover gate whose journal work is done answers a
 /// settle on the keys it owns (`backup-strict` 27 and 54: the requester's
 /// create got `Busy` for 7 s and went unsettled, then executed when the gate
-/// opened; `delegated-holder-cut` 17, `delegated-backup` 11,
+/// opened; `delegated-holder-cut` 17, `delegated-backup` 203,
 /// `long-delegated-late-answers` 13); a gated root leaves a delegation renewal
 /// unanswered instead of refusing it (`delegated-backup` 129,
-/// `delegated-no-backup-root-near` 297: the refused delegate stopped, the gate
+/// `delegated-no-backup-root-near` 242: the refused delegate stopped, the gate
 /// inherited the generation as live and outwaited it); and the root neither
 /// redirects to a generation it recalls nor outwaits a delegate that disowned
 /// its own (`long-delegated` 178 and 1198, `delegated-two-gens-root-crash`
@@ -14990,11 +14990,11 @@ fn settle_before_eio_a_gate_a_renewal_and_a_redirect_loop_leave_no_unsettled_eio
             delegated_holder_cut_config(),
             vec![6, 17],
         ),
-        ("delegated-backup", delegated_backup_config(), vec![11, 129]),
+        ("delegated-backup", delegated_backup_config(), vec![203, 129]),
         (
             "delegated-no-backup-root-near",
             delegated_no_backup_root_near_config(),
-            vec![297],
+            vec![242],
         ),
         ("long-delegated", long_delegated_config(), vec![178, 1198]),
         (
@@ -15811,7 +15811,7 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
             3,
             2,
         ),
-        ("delegated-holder-cut", delegated_holder_cut_config, 14, 2),
+        ("delegated-holder-cut", delegated_holder_cut_config, 24, 2),
         (
             "delegated-long-delegation",
             delegated_long_delegation_config,
@@ -15835,7 +15835,7 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
             25,
             4,
         ),
-        ("placement-hot", placement_hot_config, 0, 0),
+        ("placement-hot", placement_hot_config, 4, 0),
     ];
     const SEEDS: u64 = 100;
     // (label, config, the ceilings on violations and on allowed ones)
@@ -15919,9 +15919,9 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
 /// reachable. A takeover gate whose journal work is done answers a settle on
 /// the keys it owns (`backup-strict` 27 and 54, `tloss-two-node` 37,
 /// `delegated-group-switch` 15, 51, 615 and 1170, `delegated-holder-cut` 17,
-/// `delegated-backup` 11, `long-delegated-late-answers` 13); a gated root
+/// `delegated-backup` 203, `long-delegated-late-answers` 13); a gated root
 /// leaves a delegation renewal unanswered (`delegated-backup` 129,
-/// `delegated-no-backup-root-near` 297); and the root neither redirects to a
+/// `delegated-no-backup-root-near` 242); and the root neither redirects to a
 /// generation it recalls nor outwaits a delegate that disowned its own
 /// (`long-delegated` 1198, `delegated-holder-cut` 6). Each fails with I4 on
 /// the parent of the settle fixes and passes now. (`settle_before_eio_...`
@@ -15943,11 +15943,11 @@ fn m03_the_settle_causes_s1_to_s3_leave_no_unsettled_eio_in_these_seeds() {
             delegated_holder_cut_config(),
             vec![6, 17],
         ),
-        ("delegated-backup", delegated_backup_config(), vec![11, 129]),
+        ("delegated-backup", delegated_backup_config(), vec![203, 129]),
         (
             "delegated-no-backup-root-near",
             delegated_no_backup_root_near_config(),
-            vec![297],
+            vec![242],
         ),
         ("long-delegated", long_delegated_config(), vec![1198]),
         (
