@@ -4526,7 +4526,10 @@ fn placement_hot_slow_lease_reads_config() -> SimConfig {
 #[test]
 fn regression_a_delegate_taking_the_root_over_re_appends_its_rows() {
     let mut reappended = 0;
-    for seed in [15, 311, 590] {
+    // (The root's acknowledgement of a delegate's batch carries only what its
+    // own tenure committed, plan 43 Q16, ADR-41; that moved the three
+    // trajectories off the takeover that re-appends. 39 re-appends one row.)
+    for seed in [15, 311, 590, 39] {
         let report = run_seed(seed, placement_hot_config()).unwrap_or_else(|e| {
             panic!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=placement-hot")
         });
@@ -5361,10 +5364,16 @@ fn a_delegating_root_cut_from_s3_forms_no_epoch_and_fails_over() {
     // mutation after the crash came 1.16 s in once i1-592's lone test moved the
     // schedules, leaves; 1616 and 1617 join. Plan 46 M0.3's grant window,
     // derived from the stream tick and the request timeout instead of a fixed
-    // second, moved 1615 to a 1.18 s failover as well: it leaves, 1618 joins.)
+    // second, moved 1615 to a 1.18 s failover as well: it leaves, 1618 joins.
+    // The root's acknowledgement of a delegate's batch carries only what its
+    // own tenure committed (plan 43 Q16, ADR-41), which shifted this set
+    // again: 1607's first mutation after the crash came 1.25 s in, before the
+    // seal (the 1.1 to 1.3 s class); 1608, whose failover is a seal's again,
+    // takes its place.)
     for seed in (1600..1602)
         .chain(1603..1604)
-        .chain(1605..1608)
+        .chain(1605..1607)
+        .chain(1608..1609)
         .chain(1609..1610)
         .chain(1611..1613)
         .chain(1616..1619)
@@ -15146,10 +15155,12 @@ fn i1_a_root_does_not_answer_its_own_forwarded_op_from_its_unshipped_append() {
 
 /// A restarted root that the lease still names re-adopts it when a delegate's
 /// stream batch arrives, as for a forward and a renewal. Seed 789 of
-/// `delegated-no-backup-root-near` had no root for 538 s once the root
-/// acknowledged committed rows only (the design change this build does not
-/// carry): the rebooted root refused every batch and nothing asked it to
-/// acquire. On this build the seed passes either way; the fail-before is
+/// `delegated-no-backup-root-near` had no root for 538 s under the first
+/// prototype of the root acknowledging committed rows only (plan 43 Q16,
+/// ADR-41): the rebooted root refused every batch and nothing asked it to
+/// acquire. With the rule as landed (the root pushes its commit) the seed
+/// passes with and without the re-adoption, on this build and the parent: a
+/// guard. The fail-before is
 /// `a_delegate_stream_to_a_restarted_root_readopts_its_own_lease` in the
 /// core's tests.
 #[test]
@@ -15165,6 +15176,70 @@ fn a_root_the_lease_names_readopts_it_when_its_delegate_streams() {
         r.uncommitted_acks,
         r.oracle_examples
     );
+}
+
+/// I1 (delegate answers without a committed row), a deposed root's journaled
+/// append counted as the second copy (plan 43 Q16, ADR-41): the root
+/// acknowledged a delegate's batch as soon as it had journaled it, while its
+/// backup had sealed its epoch and taken the lease without the row; the
+/// delegate answered its requester on that acknowledgement, and the lease's
+/// holder lacked the row. The acknowledgement carries what the root's own
+/// tenure has committed (`DelegateStreamAck.committed`: shipped, or held by
+/// its backups), and a delegate without a recorded backup counts that.
+/// Replay a seed with `AUTHORITY_SIM_START=<seed> AUTHORITY_SIM_SEEDS=1 ...
+/// sweep_config -- --ignored --exact` (`replay_seed` runs another
+/// interleaving), with `AUTHORITY_SIM_LEASE_READS=0:0:800:1000` for the slow
+/// lease reads. All fail `+commit` on the parent.
+#[test]
+fn i1_a_delegate_counts_the_roots_copy_only_through_what_the_roots_tenure_committed() {
+    let slow = |cfg: SimConfig| SimConfig {
+        lease_reads: SLOW_LEASE_READS,
+        ..cfg
+    };
+    let cases: Vec<(&str, SimConfig, Vec<u64>)> = vec![
+        (
+            "delegated-backup",
+            delegated_backup_config(),
+            vec![192, 436, 451],
+        ),
+        (
+            "long-delegated-backup",
+            long_delegated_backup_config(),
+            vec![340, 1832],
+        ),
+        (
+            "long-delegated-backup (slow lease reads)",
+            slow(long_delegated_backup_config()),
+            vec![20, 1707],
+        ),
+        (
+            "placement-hot (slow lease reads)",
+            slow(placement_hot_config()),
+            vec![1391],
+        ),
+        (
+            "long-delegated-late-answers (slow lease reads)",
+            slow(long_delegated_late_answers_config()),
+            vec![1596],
+        ),
+        (
+            "delegated-two-gens-backlog (slow lease reads)",
+            slow(delegated_two_gens_backlog_config()),
+            vec![1965],
+        ),
+    ];
+    for (label, cfg, seeds) in cases {
+        for seed in seeds {
+            let r = run_seed(seed, strict(cfg.clone(), "commit"))
+                .unwrap_or_else(|e| panic!("{label} seed {seed}: {e}"));
+            assert!(
+                r.uncommitted_acks.is_empty(),
+                "{label} seed {seed}: {:?}: {:?}",
+                r.uncommitted_acks,
+                r.oracle_examples
+            );
+        }
+    }
 }
 
 /// Plan 43 C1-1: a backup counts only from acknowledgements given to an
@@ -15368,7 +15443,7 @@ fn backup_two_config_runs() {
 /// recovery never finished; with the real rebuild it does, and every
 /// existing check still holds. The seeds are the paused configurations of
 /// `long-delegated-late-answers` that were fixed on main (9287, 2945; 2924
-/// since plan 43 C2).
+/// since plan 43 C2, 3036 since plan 43 Q16's interim rule).
 #[test]
 fn c0_the_real_rebuild_recovers_a_deposed_root() {
     use pinned::c0_run;
@@ -15993,8 +16068,10 @@ const I5_BACKUP: &[u64] = &[746, 819, 931, 935];
 /// The paused configurations of `long-delegated-late-answers` where the
 /// sim's `RebuildReplica` fires (9287 still does).
 /// (2945's trajectory, moved by plan 43 C2's settle, no longer rebuilds;
-/// 2924 does.)
-const REBUILD_SEEDS: [u64; 2] = [9287, 2924];
+/// 2924 did. The root's acknowledgement of a delegate's batch carries only
+/// what its own tenure committed (plan 43 Q16, ADR-41), which moved 2924's
+/// trajectory too, to no rebuild; 3036 rebuilds, and the stub fails it.)
+const REBUILD_SEEDS: [u64; 2] = [9287, 3036];
 type I4Seeds = (&'static str, fn() -> SimConfig, &'static [u64]);
 /// `long-delegated-late-answers`: `late_landings`.
 const I4_SEEDS: &[I4Seeds] = &[(
