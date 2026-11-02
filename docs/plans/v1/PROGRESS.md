@@ -64009,14 +64009,16 @@ is allowed only for a requester that could reach no sequencer during its whole s
 violation, and the sim's faults are not bounded to avoid it. Commits on `08a2fe8e`: the oracle, `tloss-two-node`,
 `delegated-group-switch`, the harness scenario `takeover-loss-two-node`, the docs; then a review round (below): the
 classifier's ownership, commit and lease-claim rules, a ratchet, per-seed checks, and the bug-B harness scenarios
-rewritten. Product code is untouched (the traced causes are follow-up fixes).
+rewritten; then a re-check round (below): a generation that outlives its grant no longer makes a connected requester
+"isolated", the ratchet guards every configuration, the bug-B scenarios check I4 in both directions. Product code is
+untouched (the traced causes are follow-up fixes).
 
 **The M0.3 I4 exit is not met.** Plan 46's exit for M0.3 reads "I4 strict everywhere" (the C2 spec: unsettled `EIO`s only for
 an isolated requester). Strict mode is on, as a configuration flag, only for the two configurations that tell no unsettled
-`EIO` at all (`delegated-long-delegation-prod`, `delegated-root-gone`), and in a ratchet test for twelve more at zero
-violations without the lease-reads knob; it enforces nothing on the 20 configurations where the product still fails to settle
-(11,461 of the 28,246 unsettled `EIO`s of the sweeps below are violations: a sequencer was reachable and in force and no
-settle was answered). `delegated-group-switch` seeds 615 and 1170 are real late landings (I4's first clause), not a
+`EIO` at all (`delegated-long-delegation-prod`, `delegated-root-gone`), and in a ratchet test for ten more at zero
+violations without the lease-reads knob; the other 22 configurations, where the product still fails to settle, are guarded by
+a ceiling on their violations in the same test (20,079 of the 28,257 unsettled `EIO`s of the sweeps below are violations: a
+sequencer was reachable, or the root was due to end the op's generation, and no settle was answered). `delegated-group-switch` seeds 615 and 1170 are real late landings (I4's first clause), not a
 classifier question. The product fixes for causes 1 to 3 below (a root in its takeover gate must answer a settle; the new
 root's own settle must reach its execution path; a delegate's own op must not be held by the root for itself) are a gate
 before M1.
@@ -64026,18 +64028,18 @@ before M1.
 | Piece | Where | What it does |
 |---|---|---|
 | Reachability history | `crates/authority/tests/sim/reach.rs`; the bus, the bucket and the nodes record into it | The partitions, each node's attach and detach, the spans in which a node's core handles nothing (`Pause`, `Suspend`, `RuntimeLag`, a stalled step), the cuts of a node's path to S3, every lease body that lands (holder, end, backups), and what each core published after a step: what it holds (the lease, a continuation epoch), its delegation grants, and what it is busy with (takeover gate, floor, lost lease, a job). Never a node's log. |
-| Classifier | `Reach::classify`, `Oracles::note_unsettled`, called where the core's `client_unsettled_eio` rises | For each unsettled `EIO` the window runs from the arming of the second deadline (at least a settle window) to the `EIO`. **Ownership is decided at each instant** from the generation history (the lease holder's delegation table, kept each time it changes, resolved over the op's keys): while a live generation owns the keys its delegate is the only sequencer (the root redirects or parks the op until the generation's end is recorded), every delegate of the window counts while its grant lived, and keys across generations have none until the recall is done. A root counts only if it **can commit** (a lone root with its S3 cut cannot commit even a refusal). A reachable stretch must last the settle's retry interval plus a round trip. **The lease path** counts only if the claim, as the product implements it, could finish inside the window: the claimant's first read of the latest body (the sim bucket records every lease GET), a TTL of its own observation (and the backups' grace), the promise check and the CAS, and, for a tenure with a group (every backup its bodies listed, the tail it inherited, and the holder's own disk), a member that was up since the tenure before began and is reachable for the tail. When no root is in force and no claim can finish the `EIO` is allowed under its own label, **`no_sequencer_in_time`**, apart from `isolated`. |
-| Counters, strict mode | `Report::unsettled_isolated`, `unsettled_no_sequencer_in_time`, `unsettled_violations`, `unsettled_causes`, `unsettled_examples`; `SimConfig::strict_unsettled` (`+unsettled`); `SWEEP-UNSETTLED` and `SWEEP-UNSETTLED-CAUSES` | A violation names the rid, the time, the sequencer that was reachable (`Itself`, `Root(n)`, `Delegate(n)`, `LeasePath`) and what its core was busy with. |
-| Unit tests | `reach.rs` (16), `m03_*` in `sim.rs` (4) | Both directions of each rule: an isolated requester; one that reaches the root or the delegate; a delegate whose grant ran out, the delegate of another generation; the root that does not count while a live generation owns the keys (and counts once its end is recorded), keys across generations, every delegate the keys had in the window; a root that cannot commit (and one that commits through a reachable backup); a sequencer paused across the window (a pause under the retry interval, one that outlasts the lease); a requester stopped; a holder restarted since its lease; the claim's timing (the claimant's own first read, a window too short for the TTL, the claim grace, slow lease reads) and its group (a tenure whose backup was dropped, an inherited tail, a member that crashed since); the busy flags. Seeds: `long-delegated-late-answers` 8 violates (the requester is the new root, inside its gate), `flex-crash` 383 tells seven `EIO`s, all isolated, and passes `+unsettled`; the ratchet test runs strict on twelve configurations. |
+| Classifier | `Reach::classify`, `Oracles::note_unsettled`, called where the core's `client_unsettled_eio` rises | For each unsettled `EIO` the window runs from the arming of the second deadline (at least a settle window) to the `EIO`. **Ownership is decided at each instant** from the generation history (the lease holder's delegation table, kept each time it changes, resolved over the op's keys): while a live generation owns the keys its delegate is the only sequencer (the root redirects or parks the op until the generation's end is recorded), every delegate of the window counts while its grant lived. **A generation that does not live** (its grant ran out and its delegate still lists it, it was never installed or renewed) **and keys across generations** (the root recalls first) leave the op to the root once the *allowance* is over: the root's window for the generation plus one recall round trip, from the core's constants (the grant's end plus two margins and a one-way delay; `ttl + margin` from the birth of a generation never renewed; a successor root's tenure plus the horizon plus `backup_takeover_ms`; the recall `2 x P2P + 2 x S3`). From then on the root is the op's sequencer if it is reachable, can commit and can reach a holder of the generation's tail (the delegate, or a member of its group): a generation that outlives its allowance is the product's lack of progress, not the requester's isolation. Before the allowance is over the op has no sequencer by design (`no_sequencer_in_time`); a generation with a group none of whose holders the root reaches cannot be ended (the strict wait for the tail: **`generation_tail_unreachable`**, its own counter); a generation without a group has no tail elsewhere, the root ends it without one. A root counts only if it **can commit** (a lone root with its S3 cut cannot commit even a refusal). A reachable stretch must last the settle's retry interval plus a round trip. **The lease path** counts only if the claim, as the product implements it, could finish inside the window: the claimant's first read of the latest body (the sim bucket records every lease GET; counted no later than a read at the window's start would have been), a TTL of its own observation (and the backups' grace), the promise check and the CAS, and, for a tenure with a group (every backup its bodies listed, the tail it inherited, and the holder's own disk), a member that was up since the tenure before began (or restarted with its journal, `keep_journal`, from its restart on) and is reachable for the tail. When no root is in force and no claim can finish the `EIO` is allowed under its own label, **`no_sequencer_in_time`**, apart from `isolated`. |
+| Counters, strict mode | `Report::unsettled_isolated`, `unsettled_no_sequencer_in_time`, `unsettled_generation_tail_unreachable`, `unsettled_violations`, `unsettled_causes`, `unsettled_examples`; `SimConfig::strict_unsettled` (`+unsettled`); `SWEEP-UNSETTLED` and `SWEEP-UNSETTLED-CAUSES` | A violation names the rid, the time, the sequencer that was reachable (`Itself`, `Root(n)`, `Delegate(n)`, `LeasePath`) and what its core was busy with. |
+| Unit tests | `reach.rs` (25), `oracle.rs` (1: the owner timeline), `m03_*` in `sim.rs` (4) | Both directions of each rule: an isolated requester; one that reaches the root or the delegate; a delegate whose grant ran out, the delegate of another generation; the root that does not count while a live generation owns the keys (and counts once its end is recorded), keys across generations, every delegate the keys had in the window; a root that cannot commit (and one that commits through a reachable backup); a sequencer paused across the window (a pause under the retry interval, one that outlasts the lease); a requester stopped; a holder restarted since its lease; the claim's timing (the claimant's own first read, a window too short for the TTL, the claim grace, slow lease reads) and its group (a tenure whose backup was dropped, an inherited tail, a member that crashed since, and one that restarted with its journal); the busy flags; the re-check's: an expired grant whose delegate the root reaches (the root counts after the allowance, not before, nor with the root cut or unable to commit), one whose tail the root cannot reach (own label; a reachable member or the delegate holds it; a generation without a group is ended without), a lingering grant that does not postpone the allowance, a grant never renewed, a generation never installed, a successor root's window, keys across generations, a late first lease read; `owner_timeline`'s table history (ended, re-delegated, blocked keys, another node's table). Seeds: `long-delegated-late-answers` 8 violates (the requester is the new root, inside its gate), `flex-crash` 383 tells seven `EIO`s, all isolated, and passes `+unsettled`; the ratchet test runs strict on ten configurations and holds a ceiling on 22. |
 | `tloss-two-node` | `tloss_two_node_config`; `SimConfig::trunc_commit_ratio`, `Step::TruncCommit`, `FaultKind::StallStep { after_event: Some(EventKind::DelegateStream) }`, `history::check_trunc_commits` | The 2026-10-16 trace as plan 43 and the coder spec section 7.4 describe it. The root stalls 8 s right after applying the delegate's rows; its backup (the delegate) seals it and takes over; each file ends in the state of its last acknowledged overwrite, or of an attempt after it. `strict_commit` and `strict_settle`; I2 not strict. |
 | `delegated-group-switch` | `delegated_group_switch_config` | Section 3.3 of the spec: the delegate's backup crashes (1.5 s, back at 5.5 s) and the second is cut off for 2 s; `strict_commit`, `strict_settle`. |
-| The die/abandon pair | `delegated-backup-and-delegate-die` and `-abandon` (C2e, already in the tree) | Swept 2,000 seeds each with and without the knob: 0 failing seeds. |
+| The die/abandon pair | `delegated-backup-and-delegate-die` and `-abandon` (C2e, already in the tree) | Swept 2,000 seeds each with and without the knob: 0 failing seeds (the table shows their unsettled `EIO`s with a sequencer reachable: strict is off there). |
 | `takeover-loss-two-node` | `crates/harness/src/scenarios/delegroot.rs` | Two nodes, `b` the root's backup and the delegate of `/d1`, overwriting ten files (`O_TRUNC`, write, `fsync`) round after round; `b`'s generation acknowledges through its group; `a` is frozen across `b`'s takeover and thawed deposed; every file is byte-exact and equal on both nodes as its last acknowledged overwrite left it, no conflict copy. |
 
 ### I4 strict on every C2 configuration (2,000 seeds each, with and without `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`)
 
-Unsettled `EIO`s, **isolated / no sequencer in time / violations** (seeds with a violation), without the knob, then with it.
-Every configuration has 0 failing seeds without `+unsettled` except `delegated-group-switch` (7 and 21 failing seeds: I1 and I4
+Unsettled `EIO`s, **isolated / no sequencer in time / generation tail unreachable / violations** (seeds with a violation), without the knob, then with it (the re-check round's classifier; the table of the review round counted a generation outliving its grant as "isolated"; its totals were 16,664 isolated, 121 no sequencer in time and 11,461 violations).
+Every configuration has 0 failing seeds without `+unsettled` except `delegated-group-switch` (7 and 11 failing seeds: I1 and I4
 late landings, below). The classifier of the first landing of M0.3 counted the root while a generation owned the keys and
 every lease claim as possible; its counts were 27,703 violations and 578 isolated (earlier, before any classification,
 1,446 / 3,267 for `long-delegated-late-answers`, 1,053 / 2,071 for `delegated-holder-cut`, 1,022 / 2,108 for
@@ -64045,61 +64047,86 @@ every lease claim as possible; its counts were 27,703 violations and 578 isolate
 
 | Configuration | No knob | Knob |
 |---|---|---|
-| `delegated-long-delegation-prod` | 0 / 0 / 0 (0) | 0 / 0 / 0 (0) |
-| `delegated-root-gone` | 0 / 0 / 0 (0) | 0 / 0 / 0 (0) |
-| `delegated-no-backup-root-near` | 234 / 0 / 42 (40) | 328 / 0 / 202 (140) |
-| `delegated-backup-and-delegate-die` | 34 / 0 / 2 (2) | 53 / 0 / 3 (3) |
-| `delegated-backup-and-delegate-die-abandon` | 25 / 0 / 2 (2) | 37 / 0 / 3 (3) |
-| `tloss-two-node` | 41 / 0 / 22 (22) | 96 / 0 / 2 (2) |
-| `delegated-group-switch` | 161 / 1 / 22 (17) | 467 / 1 / 117 (78) |
-| `delegated-delegate-restart` | 0 / 0 / 0 (0) | 1 / 0 / 2 (2) |
-| `delegated-partition` | 0 / 0 / 0 (0) | 12 / 0 / 8 (8) |
-| `delegated-crash` | 1 / 0 / 0 (0) | 18 / 0 / 27 (27) |
-| `delegated-root-crash` | 1 / 0 / 2 (2) | 55 / 0 / 18 (18) |
-| `delegated-two-gens-root-crash` | 18 / 0 / 1 (1) | 55 / 1 / 11 (9) |
-| `long-delegated` | 14 / 1 / 1 (1) | 68 / 1 / 37 (34) |
-| `far` | 0 / 0 / 0 (0) | 0 / 0 / 72 (45) |
-| `backup` | 0 / 0 / 0 (0) | 0 / 2 / 7 (5) |
-| `backup-crash` | 0 / 5 / 0 (0) | 0 / 0 / 7 (5) |
-| `backup-hot` | 0 / 0 / 0 (0) | 0 / 0 / 1 (1) |
-| `backup-two` | 0 / 1 / 2 (1) | 0 / 2 / 10 (7) |
-| `long-backup` | 0 / 0 / 2 (1) | 5 / 9 / 27 (19) |
-| `backup-strict` | 0 / 9 / 133 (87) | 0 / 0 / 260 (159) |
-| `locks-delegated` | 0 / 0 / 0 (0) | 6 / 0 / 3 (3) |
-| `long-sessions` | 1 / 0 / 1 (1) | 3 / 11 / 114 (81) |
-| `flex-crash` | 421 / 28 / 3,704 (932) | 1 / 0 / 60 (43) |
-| `shared-dir` | 0 / 0 / 0 (0) | 0 / 0 / 2 (1) |
-| `shared-dir-split` | 0 / 0 / 0 (0) | 4 / 0 / 0 (0) |
-| `shared-dir-default` | 0 / 0 / 0 (0) | 0 / 0 / 1 (1) |
-| `shared-dir-ranges` | 0 / 0 / 0 (0) | 0 / 0 / 16 (8) |
-| `shared-dir-faults` | 1 / 0 / 1 (1) | 7 / 0 / 70 (43) |
-| `delegated-backup` | 232 / 0 / 44 (38) | 338 / 0 / 177 (131) |
-| `placement-hot` | 93 / 0 / 149 (91) | 111 / 1 / 238 (108) |
-| `delegated-long-delegation` | 3,042 / 0 / 1,089 (1,032) | 3,316 / 1 / 1,126 (1,019) |
-| `long-delegated-backup` | 768 / 2 / 266 (227) | 1,329 / 7 / 724 (512) |
-| `delegated-holder-cut` | 750 / 1 / 216 (194) | 1,525 / 8 / 663 (593) |
-| `long-delegated-late-answers` | 1,042 / 1 / 485 (355) | 1,950 / 28 / 1,267 (754) |
+| `delegated-long-delegation-prod` | 0 / 0 / 0 / 0 (0) | 0 / 0 / 0 / 0 (0) |
+| `delegated-root-gone` | 0 / 0 / 0 / 0 (0) | 0 / 0 / 0 / 0 (0) |
+| `delegated-no-backup-root-near` | 0 / 19 / 0 / 257 (208) | 0 / 47 / 0 / 484 (278) |
+| `delegated-backup-and-delegate-die` | 0 / 0 / 0 / 36 (16) | 0 / 5 / 0 / 51 (17) |
+| `delegated-backup-and-delegate-die-abandon` | 0 / 0 / 0 / 27 (15) | 0 / 4 / 14 / 22 (14) |
+| `tloss-two-node` | 0 / 1 / 0 / 62 (62) | 0 / 1 / 0 / 97 (97) |
+| `delegated-group-switch` | 0 / 4 / 0 / 180 (100) | 5 / 37 / 0 / 554 (254) |
+| `delegated-delegate-restart` | 0 / 0 / 0 / 0 (0) | 0 / 0 / 0 / 3 (3) |
+| `delegated-partition` | 0 / 0 / 0 / 0 (0) | 0 / 1 / 0 / 19 (16) |
+| `delegated-crash` | 0 / 0 / 0 / 1 (1) | 2 / 3 / 0 / 40 (40) |
+| `delegated-root-crash` | 0 / 0 / 0 / 2 (2) | 0 / 0 / 0 / 73 (65) |
+| `delegated-two-gens-root-crash` | 0 / 0 / 0 / 19 (17) | 3 / 8 / 0 / 56 (46) |
+| `long-delegated` | 0 / 8 / 0 / 8 (8) | 0 / 31 / 0 / 75 (65) |
+| `far` | 0 / 0 / 0 / 0 (0) | 0 / 0 / 0 / 72 (45) |
+| `backup` | 0 / 0 / 0 / 0 (0) | 0 / 2 / 0 / 7 (5) |
+| `backup-crash` | 0 / 0 / 0 / 5 (3) | 0 / 0 / 0 / 7 (5) |
+| `backup-hot` | 0 / 0 / 0 / 0 (0) | 0 / 0 / 0 / 1 (1) |
+| `backup-two` | 0 / 0 / 0 / 3 (2) | 0 / 2 / 0 / 10 (7) |
+| `long-backup` | 0 / 0 / 0 / 2 (1) | 5 / 8 / 0 / 28 (19) |
+| `backup-strict` | 0 / 0 / 0 / 142 (93) | 0 / 0 / 0 / 257 (158) |
+| `locks-delegated` | 0 / 0 / 0 / 0 (0) | 0 / 0 / 0 / 8 (7) |
+| `long-sessions` | 1 / 0 / 0 / 1 (1) | 3 / 9 / 0 / 112 (80) |
+| `flex-crash` | 433 / 28 / 0 / 3,710 (932) | 1 / 0 / 0 / 61 (43) |
+| `shared-dir` | 0 / 0 / 0 / 0 (0) | 0 / 0 / 0 / 2 (1) |
+| `shared-dir-split` | 0 / 0 / 0 / 0 (0) | 0 / 2 / 0 / 2 (2) |
+| `shared-dir-default` | 0 / 0 / 0 / 0 (0) | 0 / 0 / 0 / 1 (1) |
+| `shared-dir-ranges` | 0 / 0 / 0 / 0 (0) | 0 / 0 / 0 / 16 (8) |
+| `shared-dir-faults` | 0 / 0 / 0 / 2 (2) | 2 / 3 / 0 / 73 (45) |
+| `delegated-backup` | 0 / 23 / 0 / 253 (204) | 0 / 63 / 0 / 452 (269) |
+| `placement-hot` | 0 / 14 / 0 / 228 (114) | 6 / 30 / 0 / 314 (122) |
+| `delegated-long-delegation` | 1,107 / 1,744 / 0 / 1,279 (1,063) | 1,154 / 1,893 / 0 / 1,396 (1,056) |
+| `long-delegated-backup` | 0 / 154 / 0 / 882 (582) | 15 / 346 / 0 / 1,692 (901) |
+| `delegated-holder-cut` | 0 / 33 / 0 / 934 (706) | 104 / 203 / 0 / 1,890 (1,326) |
+| `long-delegated-late-answers` | 2 / 96 / 0 / 1,430 (773) | 25 / 474 / 0 / 2,741 (1,102) |
 
-Of the 28,246 unsettled `EIO`s: **16,664 isolated** (59 %: 6,358 of them `delegated-long-delegation`, whose 12 s deadline D11 kept
-on purpose; 422 `flex-crash`; 7,364 the `long-delegated-backup`, `delegated-holder-cut` and `long-delegated-late-answers`
-family), **121 no sequencer in
-time** (backup-crash 5 and backup-strict 9 without the knob: their claim waits for the dead group's tail, "no member answered"),
-and **11,461 violations**.
+Of the 28,257 unsettled `EIO`s: **2,868 isolated** (10 %: 2,261 of them `delegated-long-delegation`, a live grant whose delegate
+the requester cannot reach and whose 12 s deadline D11 is kept on purpose; 434 `flex-crash`; 104 `delegated-holder-cut` with the
+knob), **5,296 no sequencer in time** (5,180 the root's outwait of a generation that does not live, 3,637 of them
+`delegated-long-delegation`; 116 a lease claim that cannot finish inside the window; 0 a claim waiting for the dead group's
+tail), **14 generation tail unreachable** (`delegated-backup-and-delegate-die-abandon` with the knob) and **20,079
+violations** (the review round counted 11,461: an expired, never-installed or recalled generation no longer counts as
+isolation).
 
 Strict I4 (`strict_unsettled`) is a flag of **`delegated-long-delegation-prod`** and **`delegated-root-gone`** (0 both ways), and
 the ratchet test `m03_the_configurations_at_zero_violations_stay_there` runs it on `delegated-delegate-restart`,
-`delegated-partition`, `delegated-crash`, `far`, `backup`, `backup-crash`, `backup-hot`, `locks-delegated`, `shared-dir`,
-`shared-dir-split`, `shared-dir-default` and `shared-dir-ranges` (0 violations in 2,000 seeds without the knob; 120 seeds each
-in the test). With the knob most of them still tell violations, so strict mode is for runs without it. The rest keep the old I4
-mode and are the list above.
+`delegated-partition`, `far`, `backup`, `backup-hot`, `locks-delegated`, `shared-dir`, `shared-dir-split`,
+`shared-dir-default` and `shared-dir-ranges` (0 violations in 2,000 seeds without the knob; seeds 0 to 99 each in the test).
+`delegated-crash` (1 violation) and `backup-crash` (5: a member that restarted with its journal now holds the tail, so its claim
+is no longer excused) left the strict list. With the knob most of them still tell violations, so strict mode is for runs
+without it. The other 22 configurations keep the old I4 mode and are guarded by a **ceiling** on their violations in seeds 0 to 99
+(the count of the sweep that set it plus two or a tenth: `backup-crash` 1, `backup-strict` 5, `delegated-backup` 11,
+`delegated-group-switch` 6, `delegated-holder-cut` 47, `delegated-long-delegation` 77, `delegated-no-backup-root-near` 4,
+`delegated-root-crash` 1, `flex-crash` 125, `long-delegated-backup` 46, `long-delegated-late-answers` 65, `placement-hot` 9,
+`tloss-two-node` 3, the others 0), so a change that adds violations fails; a fix of a cause lowers its ceilings. The test runs the
+configurations in parallel and takes about a minute in release.
 
 ### Why the requesters did not settle although a sequencer was reachable
 
-Of the 11,461 violations, by the sequencer that was reachable and what its core was busy with at any moment of the window
-(every sweep line carries it): inside its takeover gate or floor 5,951 (52 %: 5,035 the root, 915 the requester itself, the
-new root, 1 a delegate); the root, not in a gate, holding or re-adopting 2,556 (22 %: `Held` and `NotHolder` loops, ops held
-behind the replay queue); a delegate of the keys 2,235 (19 %); the lease path 655 (6 %); the requester itself, as the root,
-parked behind a recall 64. The causes, each traced in the replays (`AUTHORITY_SIM_CONFIG=<config> AUTHORITY_SIM_START=<seed>
+Of the 20,079 violations (re-check round), by the sequencer that was reachable and what its core was busy with at any moment of
+the window (every sweep line carries it): inside its takeover gate or floor 13,995 (70 %: 9,776 the root, 4,219 the requester
+itself, the new root); the root, not in a gate, 2,667 (13 %: `Held` and `NotHolder` loops, ops held behind the replay queue, and
+now the generations the root did not end after their allowance, below); a delegate of the keys 2,211 (11 %); the lease path
+792 (4 %); the requester itself, as the root, 414 (2 %). (The review round's 11,461: gate or floor 52 %, the root not in a gate
+22 %, a delegate 19 %, the lease path 6 %.) The shares moved little, the gate bucket up, because the generations that outlive
+their grant, which the review round counted as isolation, are mostly reached through a root in its gate (cause 1) or a
+delegate; the sample below (10 per bucket, seed, rid, `EIO` time; `delegated-holder-cut` 838 (3,1,14) 13604, long-delegated-late-answers
+1694 (1,2,1) 17229, `delegated-group-switch` 1025 (1,1,24) 17976, `flex-crash` 309 (1,1,13) 2776, `delegated-holder-cut` 552 (3,1,12)
+13720, `long-delegated-late-answers` 758 (3,1,16) 17553, 161 (3,1,14) 22454, 470 (3,1,7) 15249, `long-delegated-backup` 995 (3,1,13)
+13312, `delegated-holder-cut` 1881 (3,1,11) 17264 for the root in its gate; the requester in its gate: `delegated-backup` 1736 (2,1,9)
+12858, 157 (2,1,10) 14526, `long-delegated-backup` 1940 (2,2,1) 16548, 608 (2,1,22) 15109, 1254 (2,3,2) 18786, `long-delegated-late-answers` 970
+(2,1,9) 15590, `placement-hot` 1898 (2,1,33) 14339, `tloss-two-node` 300 (2,2,1) 14712, `delegated-backup-and-delegate-die-abandon` 654
+(2,2,1) 15572, `long-delegated-late-answers` 1764 (3,1,14) 17454; the root not in a gate: `flex-crash` 1466 (3,2,4) 20612, 817 (3,1,9)
+13348, 647 (3,1,10) 13421, `long-delegated-backup` 510 (1,2,1) 25927, `flex-crash` 231 (3,1,7) 14350, 1012 (3,1,10) 22532,
+`delegated-long-delegation` 1106 (3,1,7) 27276, 512 (3,1,17) 25442, 771 (3,1,14) 26661, `flex-crash` 1835 (2,2,4) 23086; a delegate:
+`delegated-long-delegation` 36 (3,1,21) 13493, 1467 (3,1,7) 13594, 857 (3,1,6) 13496, 1611 (3,1,15) 25479, 88 (3,1,19) 13376, 877 (3,1,10)
+13399, 1677 (3,1,6) 13504, 1886 (3,1,7) 13397, 907 (3,1,9) 13453, 1339 (3,1,24) 13275; the lease path: `flex-crash` 248 (1,1,16) 2856, 1659
+(3,1,7) 21714, 904 (2,2,1) 16705, `backup-crash` 1350 (3,1,11) 20901, `long-delegated-backup` 1754 (1,2,1) 17919) was not replayed
+except `delegated-long-delegation` 1106: the root restarted, generation 5 of node 2 was never installed and the root answered its
+renewals `ttl_ms=0` and the requester's forwards `Held` from 2.1 s to its end at 38.4 s, 16 s after the root's allowance (22.2 s):
+cause 3. The causes, each traced in the replays (`AUTHORITY_SIM_CONFIG=<config> AUTHORITY_SIM_START=<seed>
 AUTHORITY_SIM_SEEDS=1 RUST_LOG=constellation_authority=debug`, with the knob where marked; rids are `node,incarnation,seq` and
 the times the simulated ms of the `EIO`):
 
@@ -64123,7 +64150,8 @@ the times the simulated ms of the `EIO`):
 3. **A delegate's own op held by the root for the delegate that is the requester.** `holder.rs:263-267` answers `Held {
    delegation_stream_tick_ms }` to an op from the node that the table names as the delegate of its keys ("sent before its
    table carried the grant"), and the requester retries every 50 ms with no attempt spent (`client.rs:1544`); the delegate never
-   installs the generation, so the loop runs until the generation ends. `delegated-long-delegation` 4 (3,1,9; 13373), 3 (3,1,32;
+   installs the generation, so the loop runs until the generation ends (since the re-check round that is the root's lack of
+   progress, a violation once the allowance is over, `delegated-long-delegation` 1106 (3,1,7; 27276) among them). `delegated-long-delegation` 4 (3,1,9; 13373), 3 (3,1,32;
    19577), 5 (3,1,6; 13599), 8 (3,1,6; 13696); `delegated-two-gens-root-crash` 1717 (3,1,35; 15686; knob); `long-delegated` 982
    (3,1,17; 17963; knob); `flex-crash` 9 (3,1,10; 22731), 11 (3,1,7; 20444); `long-backup` 589 (2,1,1; 12634; knob); the same
    shape with `Held` from a root's re-adoption of its own lease (`holder.rs:232`, `holder.rs:402`, `recall_hold_ms`): `backup`
@@ -64138,8 +64166,11 @@ the times the simulated ms of the `EIO`):
    187 (3,1,6; 12801: 11 replies); `delegated-two-gens-root-crash` 215 (3,1,28; 17945; knob); `locks-delegated` 772 (2,1,8; 14673;
    knob).
 5. **A root's local execution parked behind a recall** (`client.rs:2467-2492`, `deleg_recall_plan` returning `Wait`): the
-   delegate's grant outlasts the settle window. After the ownership rule most of the `delegated-long-delegation` family is
-   isolated (the root cannot settle while the generation lives; the delegate is out of reach); what is left: `long-delegated-backup`
+   delegate's grant outlasts the settle window. While a live grant owns the keys and the delegate is out of reach the requester is
+   isolated (`delegated-long-delegation`: 2,261 `EIO`s); a generation whose grant ran out, never was installed or is being
+   recalled leaves the op to the root after the allowance, and a root that has not ended it by then is a violation, no longer
+   isolation (the review round called most of the `delegated-long-delegation`, `delegated-holder-cut` and
+   `long-delegated-late-answers` family isolated: 7,364 `EIO`s in the last three); what is left of this cause: `long-delegated-backup`
    375 (3,1,9; 17684), `long-delegated-late-answers` 1749 (2,1,18; 23836), `shared-dir-faults` 1738 (4,1,8; 15454; knob).
 6. **The lease path, the last stretch of the window.** 655 violations reach a sequencer only through the lease, and in the
    ones traced it is the tail of a window whose other requests sat behind a root in its gate (cause 1: `delegated-holder-cut`
@@ -64151,15 +64182,17 @@ the times the simulated ms of the `EIO`):
    the slow reads to the claim's own tail: a residual.
 
 The review of the classifier moved the old cause 6 ("the lease path needs a TTL of the claimant's own observation"): the claim
-that cannot finish inside the window by design is now `no_sequencer_in_time` (121). Of the three samples the review took,
+that cannot finish inside the window by design is now `no_sequencer_in_time` (121 then). Of the three samples the review took,
 `backup-crash` 24 and `backup-strict` 115 wait on the group's tail ("the claim of the lease waits for the tail of its group: no
 member answered", `seal_tail.rs`, the C2e strict wait) and are `no_sequencer_in_time` now, not TTL waits.
 
 ### Fail-before (each scenario against a build before its fix)
 
-- **`tloss-two-node`** (sim, `ae24ef52`, the parent of C2c, with this change's sim side ported): 500 of 500 seeds fail I1
-  (node 2 answers the truncate and the commit on its own disk: "no backup recorded and the root's journal lacks the appended
-  row"); on this tree 0 of 5,000 fail.
+- **`tloss-two-node`** (sim, `ae24ef52`, the parent of C2c, with this change's sim side ported; the shape since the review
+  round: the root's stall armed at 0.4 s, 40 ops, the takeover in every seed): 500 of 500 seeds fail I1 (node 2 answers the
+  truncate and the commit on its own disk: "no backup recorded and the root's journal lacks the appended row"; measured again in
+  the re-check round on that shape; the first measurement, 500 of 500, was of the old shape, a 2 s stall and 24 ops); on this tree
+  0 of 2,000 fail (the table above).
 - **`delegated-group-switch`** (same build): 490 of 500 seeds fail I1 (a backup's delegate tail of the generation lacks the row);
   here 7 of 2,000 fail (the findings below).
 - **`takeover-marker-no-stranded-shadow`, `holder-crash-no-phantom-shadow` and `holder-crash-no-phantom-new-holder`** (the bug-B
@@ -64176,14 +64209,52 @@ member answered", `seal_tail.rs`, the C2e strict wait) and are `no_sequencer_in_
 
 ### Findings, not fixed here
 
-- **`delegated-group-switch` fails 7 of 2,000 seeds (234, 488, 1049, 1084, 1488: I1; 615, 1170: I4, real late landings) and 21 with the knob** (I1
-  mostly; seeds 234 and 615 are pinned in an ignored test): an acknowledgement for which the root's journal lacks the appended row, no backup recorded, while the group's
+- **`delegated-group-switch` fails 7 of 2,000 seeds (234, 488, 1049, 1084, 1488: I1; 615, 1170: I4, real late landings) and 11 with the knob** (I1
+  mostly; seeds 234 and 615 are pinned in an ignored test, which runs both and reports both: 234 I1 as below, 615 I4, "rid (4,1,16) answered in doubt completed after rid (4,1,17)"): an acknowledgement for which the root's journal lacks the appended row, no backup recorded, while the group's
   version is changing (the delegate's `deleg_stream_durable`, `delegate.rs:2555`, and the union rule of the spec's D4). Seed 234:
   the group record names no backup from 3.54 s, version 2 names node 4 (cut from 3 to 5 s) and the delegate answers at 5.51 s
   as the batch leaves, before the root appends. Not traced further.
 - The causes 1 to 6 above (11,461 violations), as follow-up fixes (causes 1 to 3 are a gate before M1): a settle must be
   answered through the gate (an `Abandoned` refusal needs no quarantine, only the row), the own settle of a root in its gate
   must reach the core's execution path, and the `Held` / redirect loops need a bound inside the settle window.
+
+### The re-check round (2026-11-02)
+
+An Opus re-check of the review round found one MUST in the classifier, in the dangerous direction, and fixes of the rest:
+
+- **A generation that outlives its grant is not isolation.** The review round counted the root as a sequencer for delegated
+  keys only once the generation's end was recorded; a root that never ended an expired or never-installed generation (or never
+  recalled keys across generations) therefore made every connected requester "isolated". The re-check measured 146 of 160
+  isolated verdicts of `delegated-holder-cut`, 185 of 209 of `long-delegated-late-answers` and 38 of 47 of
+  `delegated-no-backup-root-near` (400 seeds, no knob) with the root reachable and able to commit and the delegate up and linked
+  to both. Now the root is the op's sequencer after the allowance (the root's window plus a recall, derived from the core's
+  constants in `ReachConfig`; see the classifier row), if it can commit and reaches a holder of the generation's tail; with a
+  group and no reachable holder the verdict is `generation_tail_unreachable`, with the allowance not over it is
+  `no_sequencer_in_time`, and `isolated` is kept for a requester that reached no sequencer. The re-check's own case,
+  `delegated-no-backup-root-near` seed 14, rid (2,1,14) at 14,046 ms, is now a violation (the requester is the new root, in its
+  takeover gate). `reach.rs` carries the unit tests in both directions. A deviation from the re-check's wording, on purpose: a
+  generation without a group has its tail nowhere else (the root ends it without one), so a delegate the root cannot reach does
+  not excuse such a root. The delegate's published grant end is now its true end in ms (a grant that ran out and is still
+  listed keeps the end it had instead of the time of the last view, which would have postponed the allowance for as long as the
+  generation lingered), 0 for a grant never renewed.
+- **The lease claim** counts the claimant's first read no later than a read at the window's start would have been (a product delay
+  before the first lease GET is no longer excused); **a group member that restarted with its journal** (`keep_journal`) holds
+  the tail again from its restart (`backup-crash`: 5 `no_sequencer_in_time` became 5 violations, the claim's tail fetch from
+  the restarted member stalls).
+- **The bug-B scenarios** (`holder-crash-no-phantom-shadow`, `-new-holder`, `takeover-marker-no-stranded-shadow`) check I4 in both
+  directions: a create that returned success exists on every node; one that returned an error is absent everywhere unless the
+  requester's core told an unsettled `EIO` during the run (`ack.client_unsettled_eio` of the status). **`takeover-marker-no-stranded-shadow`**
+  now takes the takeover through B's refused `rmdir`: C's S3 goes through its own proxy and is cut from A's kill until the
+  `rmdir` returned, so C cannot claim the lease, and the scenario asserts the marker's node is B (5 of 5 runs; before, C, whose
+  create was in its lease path, usually took over). The descriptions, the doc comments and TESTING.md say what is checked.
+- **`tloss-two-node`'s fail-before** is measured on the shape it has now (0.4 s stall, 40 ops): 500 of 500 seeds fail I1 on
+  `ae24ef52`. The ignored findings test of `delegated-group-switch` runs both seeds: 234 fails I1, 615 I4. The ratchet covers
+  every configuration (above).
+- **Gates**: fmt and clippy (`--workspace --all-targets -D warnings`) clean; the release sim suite 345 passed, 12 ignored (336 and
+  12 before); harness lib 164 passed (163 and the new `create_outcome` test); the harness scenarios on a release daemon of this
+  tree: `takeover-marker-no-stranded-shadow` 5 of 5 (the marker is node 2, B, in each), `holder-crash-no-phantom-shadow` and
+  `-new-holder` 3 of 3 each; fail-before for the changed scenario, against a daemon of `0121ebf9`: 2 of 2 fail at the first
+  assertion ("c's create returned while the lone root's S3 was cut"). The ratchet test takes about a minute in release.
 
 ### Gates and deferrals
 

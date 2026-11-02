@@ -644,14 +644,19 @@ network and fault history (`sim/reach.rs`: partitions, nodes attached, paused, s
 lease reads, what each core holds and is busy with, the delegation table as it changed): **isolated** (no sequencer reachable
 for a retry interval and a round trip during the whole settle window), **no sequencer in time** (the only way was a lease
 claim that, as the product implements it, could not finish inside the window: its TTL of the claimant's own observation, the
-promise check, the CAS, the group's tail), or a violation. Ownership is decided at each instant from the generation history (the
-root does not count while a live generation owns the keys), and a sequencer counts only if it can commit. `strict_unsettled`
+promise check, the CAS, the group's tail; or the root's outwait of a generation that does not live, its window plus a recall,
+was not over), **generation tail unreachable** (the root is due to end the op's generation but reaches no holder of its tail), or
+a violation. Ownership is decided at each instant from the generation history (the root does not count while a live grant owns
+the keys; once a generation's grant ran out, or it was never installed, or the keys span generations, the root is the op's
+sequencer after the allowance, if it is reachable, can commit and reaches the tail), and a sequencer counts only if it can
+commit. `strict_unsettled`
 (`+unsettled`) fails the run on a violation. 2,000 seeds of every C2 configuration with and without the lease-reads knob: of
-28,246 unsettled `EIO`s 16,664 isolated, 121 no sequencer in time and **11,461 violations**.
+28,257 unsettled `EIO`s 2,868 isolated, 5,296 no sequencer in time, 14 generation tail unreachable and **20,079 violations**
+(the review round counted a generation that outlived its grant as isolation: 16,664 isolated, 11,461 violations).
 
 **The M0.3 exit "I4 strict everywhere" is not met.** Strict mode is a flag of the two configurations with no unsettled `EIO`
-(`delegated-long-delegation-prod`, `delegated-root-gone`) and runs in a ratchet test for twelve more at zero violations without
-the knob; it enforces nothing yet on the 20 configurations where the product still fails to settle. The violations are six
+(`delegated-long-delegation-prod`, `delegated-root-gone`) and runs in a ratchet test for ten more at zero violations without
+the knob; the 22 configurations where the product still fails to settle are guarded there by a ceiling on their violations. The violations are six
 causes in the product (a root in its takeover gate answering a settle `Busy`; the new root's own settle falling to the lease
 path inside its gate; a delegate's own op held by the root for itself; a redirect loop between root and delegate; a local
 execution parked behind a recall; the lease path's last stretch), with seeds and lines in PROGRESS, and `delegated-group-switch`
@@ -659,11 +664,14 @@ execution parked behind a recall; the lease path's last stretch), with seeds and
 sim `tloss-two-node` and `delegated-group-switch` (the latter fails 7 of 2,000 seeds: findings, two pinned in an ignored test),
 the harness `takeover-loss-two-node`, the bug-B harness scenarios rewritten as "the state cannot arise" (plan 43 §7.5;
 `takeover-marker-no-stranded-shadow`, `holder-crash-no-phantom-shadow`, `holder-crash-no-phantom-new-holder`), and
-`bench/commit-rule/RESULTS.md`'s C2 rows. Fail-before: `tloss-two-node` fails I1 on 500 of 500 seeds on C2c's parent,
+`bench/commit-rule/RESULTS.md`'s C2 rows. The scenarios check I4 in both directions: a create that returned success exists
+everywhere, one that returned an error is absent everywhere unless the requester's core told an unsettled `EIO`
+(`client_unsettled_eio` rose); in `takeover-marker-no-stranded-shadow` the requester's S3 is cut so that the takeover is the
+refused `rmdir`'s node (the marker is asserted to be B's). Fail-before: `tloss-two-node` (the stall armed at 0.4 s, 40 ops) fails I1 on 500 of 500 seeds on C2c's parent,
 `delegated-group-switch` on 490 of 500, `takeover-loss-two-node` empties files on the build of the loss in 4 of 6 seeds, the three
 rewritten scenarios fail their first assertion before C2f. **Deferred, as D9 says: the flex strict flags** stay off until M1.4
-(`flex-crash` has 421 isolated and 3,704 violations without the knob). The die/abandon pair is C2e's and swept clean (0 of 2,000
-each). The campaign cell that found the loss ×20: 20 of 20 pass.
+(`flex-crash` has 433 isolated and 3,710 violations without the knob). The die/abandon pair is C2e's and swept clean (0 failing
+seeds in 2,000 each; the table shows 36 + 27 unsettled `EIO`s with a sequencer reachable, strict off). The campaign cell that found the loss ×20: 20 of 20 pass.
 
 ### Stage 1 — one stream per node, the rule per configuration (6–10 weeks)
 

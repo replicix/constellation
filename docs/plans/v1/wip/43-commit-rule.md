@@ -2119,11 +2119,13 @@ left none; the entry now settles the rid first (PROGRESS, "Plan 46 M0.2: the fou
 the delegate and root's backup overwrites files while the root stalls between applying its rows and its own backup stream;
 `SimConfig::trunc_commit_ratio`, `Step::TruncCommit`, `StallStep { after_event }`, `history::check_trunc_commits`;
 `strict_commit` and `strict_settle`, I2 off) and `delegated-group-switch` (the spec's section 3.3; 7 of 2,000 seeds fail
-I1/I4: findings), the harness scenario `takeover-loss-two-node`, the die/abandon pair of C2e swept clean, the C2 rows of
+I1/I4: findings), the harness scenario `takeover-loss-two-node`, the die/abandon pair of C2e swept clean (0 failing seeds in 2,000 each; the sweeps tell 36 and 27 unsettled `EIO`s with a sequencer reachable, strict off), the C2 rows of
 `bench/commit-rule/RESULTS.md`, and I4's strict form: an unsettled `EIO` only for a requester that had no sequencer (isolated),
-or none in time (a lease claim that cannot finish inside the window), classified from the sim's own reachability history
-(`unsettled_isolated`, `unsettled_no_sequencer_in_time`, `unsettled_violations`). **The strict form does not hold yet** (11,461 of
-28,246 unsettled `EIO`s in the C2 sweeps are violations: plan 46 M0.3's note, PROGRESS "Plan 43 C2h"). The bug-B harness
+or none in time (a lease claim, or a root's outwait of a generation that does not live, that cannot finish inside the window),
+or a root that cannot reach the tail of the generation it is due to end, classified from the sim's own reachability history
+(`unsettled_isolated`, `unsettled_no_sequencer_in_time`, `unsettled_generation_tail_unreachable`, `unsettled_violations`). **The
+strict form does not hold yet** (20,079 of 28,257 unsettled `EIO`s in the C2 sweeps are violations: plan 46 M0.3's note, PROGRESS
+"Plan 43 C2h"). The bug-B harness
 scenarios (`holder-crash-phantom-*`, `takeover-marker-strands-promptly`) are rewritten as "the state cannot arise" (§7.5). The
 strict flags on the flex configurations stay off (plan 46 D9; M1.4). The `load-probe` cell under `pause:lock-lapse+500:10000@b` ×20
 (seeds 42 to 61, verification on) passed 20 of 20 on this tree; the four-file-system G1 run is open (RESULTS.md).

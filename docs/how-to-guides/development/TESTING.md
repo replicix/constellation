@@ -1945,10 +1945,13 @@ strand. The scenarios no longer wait for a rollback; they check that none
 happens (`no_shadow_ever`: `rolled_back`, `stranded_replayed`, `outstanding`
 and `pending_replay` stay zero on the requester) and that the nodes agree on
 `phantom` (`phantom_agreement`: one inode on every node, or absent on every
-node; present whenever the create returned success, since an
-acknowledged create is never lost). The create ends by its deadline, or a
-takeover executes it by rid, so presence is not asserted when it returned an
-error (it is in doubt, and the settle needs a sequencer that can commit).
+node) and check I4 in both directions (`check_create_outcome`): when the
+create returned success `phantom` exists (an acknowledged create is never
+lost); when it returned an error `phantom` is absent everywhere, unless the
+requester's core told an unsettled `EIO` during the run (`ack.client_unsettled_eio`
+rose: the create is in doubt and may land later, I4's ordering clause); a settled
+error followed by the create's landing fails. The create ends by its deadline,
+or a takeover executes it by rid.
 They were `holder-crash-phantom-shadow`, `holder-crash-phantom-new-holder`
 and `takeover-marker-strands-promptly`, failing on `main` since C2f.
 
@@ -1962,9 +1965,11 @@ and `takeover-marker-strands-promptly`, failing on `main` since C2f.
   C is the requester. B then takes the expired lease through an op that is
   *refused* (`rmdir` of a non-empty directory, `ENOTEMPTY`; `mkdir` of an
   existing name is not used: the kernel can answer `EEXIST` from its dentry
-  cache without calling the daemon), so its own op ships nothing; C's create,
-  still in its lease path, may claim first, and nothing depends on which node
-  does. The first log segment at an epoch newer than A's, read straight from
+  cache without calling the daemon), so its own op ships nothing. C's create,
+  still in its lease path, would claim first and its takeover would ship an op,
+  so C's S3 goes through its own proxy and is cut from the kill until B's
+  `rmdir` has returned: the takeover is B's, and the scenario asserts the
+  marker is B's. The first log segment at an epoch newer than A's, read straight from
   the bucket (`segment_header` decodes the envelope), must be the takeover's
   marker: no op, only plan 43 C1-4's `TailFollowsThrough { prev_epoch,
   through: 0 }` (A had no backup and committed nothing unshipped). Nothing is
@@ -5093,15 +5098,30 @@ to S3, every lease body that lands and every lease GET it serves, and each
 node's core publishes after a step what it holds (the lease, a continuation
 epoch), its delegation grants and what it is busy with; the lease holder's
 delegation table is kept each time it changes (the generation history).
-Three verdicts: *isolated*, *no sequencer in time* and *reachable* (the
+Four verdicts: *isolated*, *no sequencer in time*, *generation tail
+unreachable* (the three allowed ones, each counted apart) and *reachable* (the
 violation).
 
 - **Who owns the op's keys is decided at each instant** of the window from the
   generation history, not from the table at the `EIO`: while a live generation
   owns the keys its delegate is the only sequencer (the root redirects or
-  parks the op until the generation's end is recorded, so it does not count);
-  every delegate the keys had during the window counts while its grant lived;
-  keys across generations have no sequencer until the recall is done.
+  parks the op while the grant lives, so it does not count); every delegate the
+  keys had during the window counts while its grant lived. A generation that
+  does not live (its grant ran out, it was never installed or renewed) or keys
+  across generations (the recall comes first) leave the op to the root once the
+  allowance is over: the root's window for the generation (the grant's end plus
+  two margins and a one-way delay; `ttl + margin` from the birth of a generation
+  never renewed; a successor root's tenure plus the horizon and
+  `backup_takeover_ms`) plus one recall round trip, all from the sim
+  configuration's constants. From then on the root counts if it is reachable,
+  can commit and can reach a holder of the generation's tail (the delegate or a
+  member of its group); a generation outliving its allowance is the product's
+  lack of progress, never the requester's isolation. Before the allowance is
+  over the op has no sequencer by design (`no_sequencer_in_time`). A
+  generation that has a group, none of whose holders the root can reach, cannot
+  be ended (the strict wait for the tail): `generation_tail_unreachable`. (A
+  generation without a group has no tail elsewhere: the root ends it without
+  one.)
 - **A sequencer counts only if it can commit**: a root with its S3 cut and no
   backup it can reach cannot commit even a refusal.
 - **A reachable stretch** must last the settle's retry interval plus a P2P
@@ -5113,11 +5133,15 @@ violation).
   promise check and the CAS, and, for a lease with a group, a running member it
   can reach for the group's tail. When no root is in force and no such claim
   can finish, the requester is allowed under its own label, `no_sequencer_in_time`
-  (counted apart from *isolated*), as is one that reaches nothing.
+  (counted apart from *isolated*), as is one that reaches nothing. A member
+  that crashed since the tenure began counts again only if it restarted with
+  its journal (`keep_journal`), from its restart on, and a claimant's first
+  read counts no later than a read it would have made at the window's start.
 
-Each `EIO` is counted `isolated`, `no_sequencer_in_time` or a violation
+Each `EIO` is counted `isolated`, `no_sequencer_in_time`,
+`generation_tail_unreachable` or a violation
 (`Report::unsettled_isolated`, `unsettled_no_sequencer_in_time`,
-`unsettled_violations`, the causes in `unsettled_causes`, `SWEEP-UNSETTLED`
+`unsettled_generation_tail_unreachable`, `unsettled_violations`, the causes in `unsettled_causes`, `SWEEP-UNSETTLED`
 lines naming the rid, the time, the sequencer reached and what its core was
 busy with, `SWEEP-UNSETTLED-CAUSES` per sweep); `strict_unsettled` (variant
 `+unsettled`) fails the run on the first violation. The classifier's unit
