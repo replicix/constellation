@@ -63780,7 +63780,7 @@ without the lease-read knob in the measurement below (51 in the earlier count), 
 
 ### Class E, not the drop (seeds 422, 1128; left open)
 
-Both fail on `aa8466f9` and after, are history-witness failures ("took effect in the log but the spec refuses it there";
+Both fail on `aa8466f9`, and 422 after the review fixes (1128 passes there, its trajectory moved), are history-witness failures ("took effect in the log but the spec refuses it there";
 "returned Enoent but no state in its window explains it") of the backed configuration under reboots, clock steps and
 suspends, with no lost chunk (422 has no drop at all, 1128's one drop has `dropped: 0`). A separate item: "backed
 configuration history under reboot and clock step: 422, 1128" (the fault-free control's 132 passes now; 233 was not
@@ -63791,13 +63791,8 @@ re-run).
 `drop-held-chain-backed`: aa8466f9 50 failing without the knob, 2 with it (503, 1004); now [422, 1128] without it (class E),
 0 with it. `drop-held-chain-requester-dies`, `flex-crash+identity`, `flex`, `flex-tight`, `placement-hot`, `backup-crash`,
 `delegated-holder-cut`, `long-delegated-late-answers`: 0 both ways. `long-backup`: seed 743 without the knob (as on main), 0
-with it. `drop-held-chain` without the knob: 0; **with the knob: 208 and 1446 fail** (0 on aa8466f9): "the log stalled
-behind a deferred transaction" (the sim's liveness sampler: a shippable journal row unshipped for 20 consecutive 250 ms
-samples while the node holds a lease record). The node holds an expired lease after a suspend and a clock step and
-recovers it through lease reads of 0.8 to 1 s; the same 3.9 s of stall is there with D removed and ends at 4.1 s,
-under the sampler's 5 s; with D the acquisition that the pause used to refuse starts and holds the round slot for one more
-slow read, and the stall ends at 4.8 s. Replaying the seed alone (`replay_seed`) does not apply the knob; use
-`AUTHORITY_SIM_START=208 AUTHORITY_SIM_SEEDS=1 sweep_config`. On aa8466f9 seed 208 has no deferred transaction at all. Left as found: not a D logic error, a threshold the lease-recovery latency under the slow-read knob sits next to.
+with it. `drop-held-chain` without the knob: 0; with the knob 208 and 1446 failed in the first measurement (see "Review fixes" below:
+the cause predates D, and they pass now).
 
 ### Gates
 
@@ -63805,3 +63800,56 @@ fmt; clippy `-D warnings` (workspace, all targets); authority lib 920 and `meta_
 member_copy 22), engine 942 + 10, control 146, harness unit tests 163; release sim suite 309 passed / 11 ignored.
 Harness, three runs each, all green: `poison-record-isolation`, `backup-takeover-holds-missing-chunks`,
 `backup-takeover-drops-held-chunks`, `epoch-member-dies-with-chunk`, `drop-held-remote-dependents`.
+
+### Review fixes (2026-11-02; Opus review of aa8466f9..718ad894)
+
+One commit each, fail-before the test named.
+
+1. **MUST, B: no retraction on an uncommitted record.** `install_streamed_committed` retracted what a `RolledBack` record named
+   whatever `committed` said, in a transaction of its own. In an epoch hold or a lone tenure the stream is uncommitted: a holder
+   deposed or dead before the drop's transaction commits leaves rows the member's copy alone may carry. Now an uncommitted install
+   retracts nothing (the segment that carries the record does) and a committed one retracts in the install's own transaction.
+   Fail-before: `an_uncommitted_rolled_back_record_retracts_nothing_until_the_log_carries_it` (the reviewer's probe).
+2. **Liveness: 208 and 1446.** The cause predates D: on resume from a suspend the node's own clock says its lease ran out while
+   the lease object still names it, and its own ops fired acquisitions that each read the lease (slowly), got a claim plan against
+   themselves and ended `acquired=false` after ~1.9 s, holding the job slot while its rows waited unshipped (3.2 to 7.1 s in both
+   builds; the handoff pause had happened to refuse the acquisition). `begin_acquire` now, for a node holding its own lease, not
+   released, not lost, outside an epoch, **and unusable by its own clock**, sets `renew_now`, nudges the round and finishes false.
+   (First tried for any held lease: the engine's `shipper::tests`, which call `acquire` each round, fail; a usable lease keeps the
+   acquisition.) Fail-before: `an_own_op_on_a_lease_expired_by_its_own_clock_renews_instead_of_acquiring`; seeds 208 and 1446 with
+   the knob pass. The cut-holder case `a_backup_paused_while_its_holder_is_cut_from_s3_waits_for_the_group` moved with it (the
+   backup's seal lands 13 ms later, inside its pause): re-pinned at 7250 ms, a scan shows the case holds from 6800 to 7250 ms.
+   *Found, not caused by it*: under that double fault `member_copies_drained` fails for a few seeds in the old code too
+   (`backup-lag-in-margin-cut+pause2@7500:3000`, 1,000 seeds: 195, 654, 679, 820, 883 before; 186, 518, 545 at 7550 after): a
+   deposed, S3-cut holder's member copy outlives the archive when the successor releases and the old holder claims again.
+3. **C 1: the copy waits for the log.** The dropped arm of `replay_outcome` copied on any answer but `Accepted`; a refusal answer is
+   a message, the copy waits until the rid's refusal is visible in the log here (`refused_entry_answers_awaiting_log`). A test
+   that made the copy on the answer is converted. Fail-before: `a_refusal_answering_a_settle_makes_no_copy_before_the_log_shows_the_rid`.
+4. **C 2: a hold owner's own row.** Case 1 trusted `park_durable`, true whenever the node holds an epoch: an own row counts only
+   once the archive (or, outside a hold, the group) carries it (`copy_row_committed`). Fail-before:
+   `a_hold_owners_own_refusal_is_no_outcome_until_the_archive_carries_it`.
+5. **C 3: the settle is retried with backoff** (250 ms doubling to 10 s, as the copies are), and
+   `status.speculation.refused_settles_pending` / `refused_settles_stalled` say the entry waits. Fail-before:
+   `a_refused_entrys_settle_is_retried_with_backoff_and_counted`.
+6. **A 4: sessions the drop could not discard** (the file busy, or a flush had the session detached) are said in the command's
+   line and counted (`status.held.drop_sessions_deferred`). Fail-before: `a_busy_session_naming_a_dropped_chunk_is_reported_not_skipped_silently`.
+7. **A 5: the exclusion of the ops the drop rolled back is explicit** (`exclude_rolled_back`): only while the node stays the
+   sequencer (a usable lease or an epoch hold); a deposed dropper's refusals are fenced and the op's retry reaches a successor
+   with no outcome, so its chunk stays held. Fail-before: `an_op_the_drop_rolled_back_on_a_deposed_dropper_keeps_its_chunk_held`,
+   `an_op_the_drop_rolled_back_keeps_its_chunk_when_the_refusal_will_not_ship`.
+8. **B 6: a rolled-back transaction with no journal head** is warned about and counted (`DroppedHeld::unidentified`).
+   `a_rolled_back_transaction_is_named_by_its_tail_or_its_place` (the state is unreachable through the planner, so the identity
+   function is what is tested).
+9. **Bound 7:** the cap is floored at one settle window (a settle window of half the deadline made it 0), and R7's wall-clock
+   shadow cutoff is `Config::stale_shadow_after()` (`drop_held_await_ms`, else the whole client deadline) as before, not the
+   halved cap. Fail-before: `a_configured_bound_above_the_cap_is_clamped` (extended).
+
+Not in scope here: the 592 I1 bug (a locally executed refusal answered before its row is archived in the window after acquiring
+and before the backup set is configured).
+
+Gates after the review fixes: fmt; clippy `-D warnings` (workspace, all targets); authority lib 925 and `meta_repro` 4, meta lib 383
+and every integration target, engine 943, control 146, harness unit tests 163; release sim suite 309 passed / 11 ignored; harness,
+three runs each, all green. Sweeps, 2,000 seeds with and without the knob: `drop-held-chain-backed` [422] without it (1128, class E,
+passes now: its trajectory moved) and 0 with it; `drop-held-chain` 0 and 0 (208 and 1446 pass); `long-backup` [743] without the
+knob (as on main); `drop-held-chain-requester-dies`, `flex-crash+identity`, `flex`, `flex-tight`, `placement-hot`, `backup-crash`,
+`delegated-holder-cut`, `long-delegated-late-answers`: 0 and 0.
