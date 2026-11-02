@@ -571,14 +571,6 @@ impl DelegationState {
 /// not named yet is remembered ([`DelegationState::handed_back`]).
 const HANDED_BACK_UNSEEN_MS: i64 = 60_000;
 
-/// Plan 46 M0.3 (S3): how long after the root granted a generation its
-/// delegate's own op forwarded to the root may still mean "my table has not
-/// carried the grant yet" ([`Core::grant_in_flight`]): the delegate learns it
-/// from the grant's renewal answer and the log's `Delegate` record, within two
-/// stream ticks and a P2P round trip each way. Past it, with the delegate not
-/// heard from, the op says the delegate disowned the generation.
-pub(crate) const GRANT_IN_FLIGHT_MS: i64 = 1_000;
-
 /// How many freezes [`DelegationState::freezes`] keeps.
 const FREEZES_KEPT: usize = 8;
 
@@ -6203,7 +6195,7 @@ impl Core {
     /// Plan 46 M0.3 (S3): whether `gen`'s delegate may not have its grant
     /// yet, so that an op it forwards to this root is one "sent before its
     /// table carried the grant": this tenure granted the generation, not
-    /// longer ago than [`GRANT_IN_FLIGHT_MS`], and has not heard from the
+    /// longer ago than [`Core::grant_in_flight_ms`], and has not heard from the
     /// delegate since. Otherwise the delegate forwarding its own op has
     /// disowned the generation (stopped by a recall, a refused renewal or a
     /// restart): it answers every op of it `NotHolder`, and the root must end
@@ -6212,8 +6204,28 @@ impl Core {
         self.dl.gens.get(&gen).is_some_and(|g| {
             !g.inherited
                 && g.delegate_heard.is_none()
-                && now.wait.since(g.granted) < GRANT_IN_FLIGHT_MS
+                && now.wait.since(g.granted) < self.grant_in_flight_ms()
         })
+    }
+
+    /// Plan 46 M0.3 (S3): how long after the root granted a generation its
+    /// delegate's own op forwarded to the root may still mean "my table has not
+    /// carried the grant yet". The delegate learns the grant from the
+    /// log's `Delegate` record (one stream tick) and from its first
+    /// renewal's answer; each is a P2P round trip the product waits
+    /// [`Core::deleg_request_timeout_ms`] for before it counts the request
+    /// dropped and sends it again. So: two stream ticks plus two such round
+    /// trips (the spec's `2 x delegation_stream_tick_ms + 2 x max P2P RTT`,
+    /// the request timeout being the product's bound on a P2P RTT).
+    ///
+    /// The product has no bound on an answer's *delivery*: one that comes
+    /// after the request timeout is still counted (`LATE_ANSWER_MS`), and the
+    /// simulation's `deleg_answer_delay` delivers some 1.75 s late. A delegate
+    /// whose grant arrives later than this window is taken as having disowned
+    /// the generation and its generation is recalled: that costs liveness
+    /// only, a recall is always safe.
+    pub(crate) fn grant_in_flight_ms(&self) -> i64 {
+        (2 * self.cfg.delegation_stream_tick_ms + 2 * self.deleg_request_timeout_ms()) as i64
     }
 
     pub(crate) fn start_recall(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {

@@ -31853,6 +31853,39 @@ mod s3_no_loops {
         );
     }
 
+    /// The window in which a delegate's own op is still "before its table
+    /// carried the grant" is derived from the config: two stream ticks plus
+    /// two request timeouts (`deleg_request_timeout_ms`), not a fixed second.
+    /// With the defaults (50 ms tick, 500 ms forward timeout) it is 1,100 ms;
+    /// with a slower forward timeout it scales. Fails with a fixed 1,000 ms.
+    #[test]
+    fn the_grant_in_flight_window_follows_the_config() {
+        let (mut h, dir, gen) = delegated_root();
+        assert_eq!(h.core.grant_in_flight_ms(), 1_100);
+        h.advance(1_050);
+        let out = forward(&mut h, 3, 7, dir, false);
+        assert!(
+            matches!(reply_to(&out, 3, 7), Some(MutateOutcome::Held { .. })),
+            "inside 1,100 ms: {out:?}"
+        );
+        assert_eq!(h.core.dl.gens[&gen].recall, RecallPhase::None);
+        // A slower P2P round trip widens it: 2 x 50 + 2 x 2,000.
+        let (mut h, dir, gen) = delegated_root();
+        h.core.cfg.forward_timeout_ms = 2_000;
+        assert_eq!(h.core.grant_in_flight_ms(), 4_100);
+        h.advance(3_000);
+        let out = forward(&mut h, 3, 7, dir, false);
+        assert!(
+            matches!(reply_to(&out, 3, 7), Some(MutateOutcome::Held { .. })),
+            "inside 4,100 ms: {out:?}"
+        );
+        assert_eq!(recalls_sent(&out, 3), 0, "{out:?}");
+        h.advance(1_500);
+        let out = forward(&mut h, 3, 8, dir, false);
+        assert_eq!(recalls_sent(&out, 3), 1, "past it: {out:?}");
+        assert_eq!(h.core.dl.gens[&gen].recall, RecallPhase::Sent);
+    }
+
     /// A designation is never recalled (`deleg_recall_plan` refuses the op
     /// instead): its designee's own op long after the grant is held as it was,
     /// neither recalled nor refused.

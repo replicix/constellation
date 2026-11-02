@@ -5359,13 +5359,15 @@ fn a_delegating_root_cut_from_s3_forms_no_epoch_and_fails_over() {
     // the tail it re-shipped, 8.4 s after the crash and before the floor — no
     // failover's answer; 1614 and 1615 take their places. 1614, whose first
     // mutation after the crash came 1.16 s in once i1-592's lone test moved the
-    // schedules, leaves; 1616 and 1617 join.)
+    // schedules, leaves; 1616 and 1617 join. Plan 46 M0.3's grant window,
+    // derived from the stream tick and the request timeout instead of a fixed
+    // second, moved 1615 to a 1.18 s failover as well: it leaves, 1618 joins.)
     for seed in (1600..1602)
         .chain(1603..1604)
         .chain(1605..1608)
         .chain(1609..1610)
         .chain(1611..1613)
-        .chain(1615..1618)
+        .chain(1616..1619)
     {
         let report = run_seed(seed, delegated_holder_cut_config()).unwrap_or_else(|e| {
             panic!(
