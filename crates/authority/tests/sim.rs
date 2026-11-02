@@ -14573,6 +14573,88 @@ fn i1_the_oracle_judges_a_node_lone_by_the_directory_its_core_was_given() {
     }
 }
 
+/// I1 class 1: a backup acts on a lease read older than its role. The read
+/// its silence watch issued before a new holder listed it returns after that
+/// holder's append, showing an older epoch (or version) than the role the
+/// append gave it. The same-epoch guard (C1-1) did not cover a different
+/// epoch: the catch-all cleared the role and the tail, and the root counted
+/// the acknowledgement it had been given and answered `root-group`; the root
+/// then died before it shipped the row, and no backup held it ("root-group:
+/// listed backup's tail lacks the row"). Every lease read of these runs is
+/// held back 800 to 1,000 ms after it is served (`SLOW_LEASE_READS`,
+/// `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`). All fail `+commit` on the parent.
+#[test]
+fn i1_a_lease_read_older_than_the_backup_role_discards_nothing() {
+    let slow = |cfg: SimConfig| SimConfig {
+        lease_reads: SLOW_LEASE_READS,
+        ..cfg
+    };
+    let cases: Vec<(&str, SimConfig, Vec<u64>)> = vec![
+        ("backup", slow(backup_config()), vec![1373, 1472]),
+        (
+            "backup-crash",
+            slow(backup_crash_config()),
+            vec![52, 156, 334, 366, 1727],
+        ),
+    ];
+    for (label, cfg, seeds) in cases {
+        for seed in seeds {
+            let r = run_seed(seed, strict(cfg.clone(), "commit")).unwrap_or_else(|e| {
+                panic!(
+                    "{label} seed {seed} (slow lease reads): {e}\n  replay with \
+                     AUTHORITY_SIM_CONFIG={label} AUTHORITY_SIM_LEASE_READS=0:0:800:1000"
+                )
+            });
+            assert!(
+                r.uncommitted_acks.is_empty(),
+                "{label} seed {seed}: {:?}: {:?}",
+                r.uncommitted_acks,
+                r.oracle_examples
+            );
+        }
+    }
+}
+
+/// I1 class 2: a root resumed from a pause answered alone on the directory it
+/// held before it (backup 578; long-backup 1942 with slow lease reads): the
+/// peers that came up while it was paused were in the snapshots queued behind
+/// the event that resumed it. Seed 1416 (`backup-crash-slow`): an ack parked
+/// behind a candidate whose bring-up failed in the event that handed the
+/// lapse, released `Lone` by it. The root is lone again only on a snapshot
+/// taken after its last lapse was handed (`Event::Peers`'s `lapses`). All
+/// fail `+commit` on the parent.
+#[test]
+fn i1_a_root_resumed_from_a_pause_does_not_answer_alone_on_a_stale_directory() {
+    let slow = |cfg: SimConfig| SimConfig {
+        lease_reads: SLOW_LEASE_READS,
+        ..cfg
+    };
+    let cases: Vec<(&str, SimConfig, Vec<u64>)> = vec![
+        ("backup", backup_config(), vec![578]),
+        ("long-backup", slow(long_backup_config()), vec![1942]),
+        (
+            "backup-crash-slow",
+            SimConfig {
+                s3_latency: (60, 200),
+                ..backup_crash_config()
+            },
+            vec![1416],
+        ),
+    ];
+    for (label, cfg, seeds) in cases {
+        for seed in seeds {
+            let r = run_seed(seed, strict(cfg.clone(), "commit"))
+                .unwrap_or_else(|e| panic!("{label} seed {seed}: {e}"));
+            assert!(
+                r.uncommitted_acks.is_empty(),
+                "{label} seed {seed}: {:?}: {:?}",
+                r.uncommitted_acks,
+                r.oracle_examples
+            );
+        }
+    }
+}
+
 /// Plan 43 C1-1: a backup counts only from acknowledgements given to an
 /// append that carried a version listing it, and a removal lands covered.
 /// `long-backup` seed 892: a candidate acknowledged rows at the version
