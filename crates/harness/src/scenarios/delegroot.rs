@@ -16,6 +16,10 @@
 //!   which drops `b` across the restart gap, lists it as its backup again
 //!   within seconds (`b` does not seal `a`'s live epoch), and `a`'s
 //!   `kill -9` then fails over by seal, as without the handoff.
+//! - `takeover-loss-two-node` (plan 43 C2h, plan 46 M0.3): the 2026-10-16
+//!   acknowledged-write loss. `b` overwrites ten files (`O_TRUNC`, write,
+//!   `fsync`) under its delegation of `/d1` while `a`, whose backup it is,
+//!   is frozen across `b`'s takeover of the root; `a` returns deposed.
 //! - `delegate-store-stall`: `b`'s core is stuck behind a slow store
 //!   write (the store-stall fault hook) for longer than its grant's
 //!   renewal slack; the off-core renewal lane keeps the delegation, up to
@@ -1727,6 +1731,325 @@ pub fn delegate_store_stall(_seed: u64) -> Result<()> {
         Ok(())
     })();
     dump_logs_on_failure(NAME, &clients, &result);
+    unmount_all(&mut clients);
+    result
+}
+
+/// Files `b` overwrites in `takeover-loss-two-node`.
+const OVERWRITTEN: usize = 10;
+
+/// One overwrite of one file: what the writer sent and whether `fsync`
+/// returned.
+struct Overwrite {
+    payload: Vec<u8>,
+    acked: bool,
+}
+
+/// The payload of `file` in `round`: 8 KiB of text no other pair shares.
+fn overwrite_payload(round: u64, file: usize) -> Vec<u8> {
+    format!("round {round} of f{file}\n")
+        .repeat(400)
+        .into_bytes()
+}
+
+/// `b` overwrites the ten files of `/d1` round after round
+/// (`O_TRUNC`, write, `fsync`, close) until stopped, recording every
+/// attempt in `ledger`.
+fn overwriter(
+    dir: PathBuf,
+    stop: Arc<AtomicBool>,
+    rounds: Arc<AtomicU64>,
+    ledger: Arc<Mutex<Vec<Vec<Overwrite>>>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut round = 0u64;
+        while !stop.load(Ordering::Relaxed) {
+            for file in 0..OVERWRITTEN {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let payload = overwrite_payload(round, file);
+                let at = {
+                    let mut l = ledger.lock().unwrap();
+                    l[file].push(Overwrite {
+                        payload: payload.clone(),
+                        acked: false,
+                    });
+                    l[file].len() - 1
+                };
+                let r = (|| -> std::io::Result<()> {
+                    let mut f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(dir.join(format!("f{file}")))?;
+                    f.write_all(&payload)?;
+                    f.sync_all()?;
+                    Ok(())
+                })();
+                if r.is_ok() {
+                    ledger.lock().unwrap()[file][at].acked = true;
+                } else {
+                    // (The error is not the finding: a write that did not
+                    // return is in doubt, and the ledger allows for it.)
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+            round += 1;
+            rounds.store(round, Ordering::SeqCst);
+        }
+    })
+}
+
+/// The states a file may end in, given its overwrites in order: after the
+/// last acknowledged one or any attempted after it; a truncate that
+/// returned nothing may have emptied it. With none acknowledged, as
+/// created. `Err` names why `content` is none of them.
+fn overwrite_outcome_allowed(file: usize, ledger: &[Overwrite], content: &[u8]) -> Result<()> {
+    let last = ledger.iter().rposition(|o| o.acked);
+    // (Empty: the truncate of an attempt after the last acknowledged one
+    // took effect and its write did not.)
+    let empty_allowed = last.is_none_or(|l| l + 1 < ledger.len());
+    let ok = (content.is_empty() && empty_allowed)
+        || ledger[last.unwrap_or(0)..]
+            .iter()
+            .any(|o| o.payload == content);
+    if ok {
+        return Ok(());
+    }
+    let which = |c: &[u8]| {
+        ledger
+            .iter()
+            .position(|o| o.payload == c)
+            .map_or("no overwrite's".to_string(), |i| format!("overwrite {i}'s"))
+    };
+    anyhow::bail!(
+        "f{file} ends with {} bytes of {} content; its last acknowledged overwrite is {} of {} \
+         (an acknowledged, fsynced write that did not survive)",
+        content.len(),
+        which(content),
+        ledger
+            .iter()
+            .rposition(|o| o.acked)
+            .map_or("none".into(), |i| i.to_string()),
+        ledger.len()
+    )
+}
+
+/// The 2026-10-16 acknowledged-write loss (plan 43 study 2.1; C2h; plan 46
+/// M0.3). Two nodes: `a` holds the root and `b` is its backup and the
+/// delegate of `/d1`, so `b` acknowledges a write only once its group has
+/// the row. `b` overwrites ten files (`O_TRUNC`, write, `fsync`) round after
+/// round; once its acknowledgements are all group ones (`status.delegation.mine[].class`:
+/// `deleg-group`, and `ack.classes` none `lone`), `a` is frozen (`SIGSTOP`), `b` seals it and takes the root over,
+/// and `a` is thawed deposed, with whatever of `b`'s rows it appended to its
+/// journal. After quiescence every file is byte-exact on both nodes as its
+/// last acknowledged overwrite left it (or an attempt after it), and no
+/// conflict copy exists.
+///
+/// Before the delegate's acknowledgement waited for its group (C2c) `b`
+/// acknowledged each truncate and commit on its own disk and `a`, thawed,
+/// replayed what it had appended over the successor's newer state: ten
+/// acknowledged, fsynced files were emptied on both nodes (the campaign cell
+/// `load-probe` under `pause:lock-lapse+500:10000@b`, 10 of 10 runs). The
+/// class assertion fails on every build before C2c.
+pub fn takeover_loss_two_node(seed: u64) -> Result<()> {
+    let name = "takeover-loss-two-node";
+    // The scenario freezes `a` for the length of a seal-based takeover and
+    // thaws it. Under the harness's verification the daemons run with the
+    // stalled-request backtrace diagnostic (`CONSTELLATION_FUSE_STALL_BACKTRACE`,
+    // which signals a stalled FUSE thread and captures a backtrace in the
+    // signal handler); on the thaw it signalled a thread inside `malloc` and
+    // the daemon aborted with "double free or corruption" (1 run of 3). That
+    // is the diagnostic's bug (a signal handler that allocates), not this
+    // scenario's subject: it runs without the diagnostic.
+    let (_env, _root, mut clients) =
+        delegated_pair_with(name, true, &[("CONSTELLATION_FUSE_STALL_BACKTRACE", "0")])?;
+    let result = (|| -> Result<()> {
+        delegate_d1(name, &clients, true)?;
+        let (a, b) = (&clients[0], &clients[1]);
+        let b_id = node_id(b)?;
+        // `b` must be listed, or the takeover is the TTL one (60 s) and
+        // the scenario is another.
+        eventually("a lists b as its backup", Duration::from_secs(60), || {
+            let ack = super::m9::ack_of(a)?;
+            anyhow::ensure!(
+                ack["backups"]
+                    .as_array()
+                    .is_some_and(|v| v.iter().any(|x| x.as_u64() == Some(b_id))),
+                "a's backups: {ack}"
+            );
+            Ok(())
+        })?;
+        let epoch = lease_of(a)?["epoch"].as_u64().unwrap_or(0);
+        let stop = Arc::new(AtomicBool::new(false));
+        let rounds = Arc::new(AtomicU64::new(0));
+        let ledger: Arc<Mutex<Vec<Vec<Overwrite>>>> =
+            Arc::new(Mutex::new((0..OVERWRITTEN).map(|_| Vec::new()).collect()));
+        let writer = overwriter(
+            b.mnt.join("d1"),
+            stop.clone(),
+            rounds.clone(),
+            ledger.clone(),
+        );
+        let stop_writer = |writer: std::thread::JoinHandle<()>| {
+            stop.store(true, Ordering::Relaxed);
+            let _ = writer.join();
+        };
+        let outcome = (|| -> Result<()> {
+            // Three rounds under the delegation, all acknowledged.
+            eventually(
+                "three rounds of overwrites",
+                Duration::from_secs(90),
+                || {
+                    anyhow::ensure!(rounds.load(Ordering::SeqCst) >= 3, "not yet");
+                    Ok(())
+                },
+            )?;
+            // The class assertion: what `b` has answered so far, it
+            // answered after its group held the row. (The status reports
+            // the generation's class since C2e; `…_NO_CLASS_CHECK=1` runs
+            // the data check alone, for a build that predates it.)
+            if std::env::var_os("CONSTELLATION_HARNESS_NO_CLASS_CHECK").is_none() {
+                let classes = super::m9::ack_of(b)?["classes"].clone();
+                let lone = classes
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|c| c[0] == "lone")
+                    .and_then(|c| c[1].as_u64())
+                    .unwrap_or(0);
+                eprintln!("    {name}: b's answers by class before the freeze: {classes}");
+                anyhow::ensure!(
+                    lone == 0,
+                    "b, the delegate of /d1 with a peer in budget, answered {lone} write(s) as a \
+                     lone node (on its own disk); by class: {classes}"
+                );
+                // (The delegate's FUSE fast path answers without the core,
+                // so `classes` does not count its answers: the
+                // generation's own class, `status.delegation.mine[].class`,
+                // is what they wait for.)
+                let d = deleg_of(b)?;
+                let class = d["mine"]
+                    .as_array()
+                    .and_then(|m| m.iter().find(|g| g[3] == false))
+                    .map(|g| g[7].clone());
+                eprintln!(
+                    "    {name}: b's generation of /d1 acknowledges as {class:?}, {} fast-path \
+                     write(s)",
+                    n(&d, "fast_path_executed")
+                );
+                anyhow::ensure!(
+                    class == Some(serde_json::json!("deleg-group")),
+                    "b's generation of /d1 does not acknowledge through its group: {class:?} \
+                     (status.delegation.mine: {})",
+                    d["mine"]
+                );
+                anyhow::ensure!(
+                    n(&d, "fast_path_executed") > 0,
+                    "none of b's writes ran on the delegate's fast path"
+                );
+            }
+            // `a` goes silent across `b`'s takeover, at a moment inside a
+            // round that the seed picks (the loss needed the root to stop
+            // between applying the delegate's rows and backing them up).
+            std::thread::sleep(Duration::from_millis(seed.wrapping_mul(7919) % 900));
+            let frozen_round = rounds.load(Ordering::SeqCst);
+            a.pause()?;
+            let thawed = (|| -> Result<()> {
+                eventually(
+                    "b holds the root",
+                    crate::verify::hang_bound().max(Duration::from_secs(90)),
+                    || {
+                        let l = lease_of(b)?;
+                        anyhow::ensure!(
+                            l["held"] == true && l["epoch"].as_u64().unwrap_or(0) > epoch,
+                            "b's lease: {l}"
+                        );
+                        Ok(())
+                    },
+                )?;
+                // Writes on the new root, then the old one returns.
+                let at = rounds.load(Ordering::SeqCst);
+                eventually(
+                    "two rounds on the new root",
+                    Duration::from_secs(90),
+                    || {
+                        anyhow::ensure!(rounds.load(Ordering::SeqCst) >= at + 2, "not yet");
+                        Ok(())
+                    },
+                )?;
+                Ok(())
+            })();
+            a.resume()?;
+            eprintln!(
+                "    {name}: a frozen at round {frozen_round}, thawed at round {}: {}",
+                rounds.load(Ordering::SeqCst),
+                if thawed.is_ok() {
+                    "b took the root over"
+                } else {
+                    "b did NOT"
+                }
+            );
+            thawed?;
+            // Another two rounds with `a` back (deposed, reintegrating).
+            let at = rounds.load(Ordering::SeqCst);
+            eventually(
+                "two rounds after a's return",
+                Duration::from_secs(90),
+                || {
+                    anyhow::ensure!(rounds.load(Ordering::SeqCst) >= at + 2, "not yet");
+                    Ok(())
+                },
+            )?;
+            Ok(())
+        })();
+        stop_writer(writer);
+        outcome?;
+        // Quiescence: both mounts show one content per file, and it is
+        // one the ledger allows.
+        let ledger = ledger.lock().unwrap();
+        eventually(
+            "every file byte-exact on both nodes",
+            Duration::from_secs(120),
+            || {
+                for (file, entries) in ledger.iter().enumerate() {
+                    let path = format!("d1/f{file}");
+                    let on_a = std::fs::read(a.mnt.join(&path))
+                        .with_context(|| format!("reading {path} on a"))?;
+                    let on_b = std::fs::read(b.mnt.join(&path))
+                        .with_context(|| format!("reading {path} on b"))?;
+                    anyhow::ensure!(
+                        on_a == on_b,
+                        "{path}: a holds {} bytes, b {}",
+                        on_a.len(),
+                        on_b.len()
+                    );
+                    overwrite_outcome_allowed(file, entries, &on_b)?;
+                }
+                Ok(())
+            },
+        )?;
+        let acked: usize = ledger.iter().flatten().filter(|o| o.acked).count();
+        eprintln!(
+            "    {name}: {acked} of {} overwrites acknowledged; every file is byte-exact on both nodes",
+            ledger.iter().map(Vec::len).sum::<usize>()
+        );
+        anyhow::ensure!(acked > 0, "no overwrite was acknowledged");
+        super::ensure_no_conflicts(&[&clients[0], &clients[1]])?;
+        for c in [&clients[0], &clients[1]] {
+            anyhow::ensure!(
+                !c.mnt.join(".constellation-conflict").exists()
+                    || std::fs::read_dir(c.mnt.join(".constellation-conflict"))?
+                        .next()
+                        .is_none(),
+                "{} holds conflict copies",
+                c.name
+            );
+        }
+        Ok(())
+    })();
+    dump_logs_on_failure(name, &clients, &result);
     unmount_all(&mut clients);
     result
 }

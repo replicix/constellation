@@ -1595,6 +1595,13 @@ pub const SCENARIOS: &[Scenario] = &[
         run: delegroot::delegate_backup_handoff_failover,
     },
     Scenario {
+        name: "takeover-loss-two-node",
+        desc: "plan 43 C2h, plan 46 M0.3 (the 2026-10-16 acknowledged-write loss): two nodes, b the root's backup and the delegate of /d1 overwriting ten files (O_TRUNC, write, fsync) round after round; b's generation acknowledges through its group (status.delegation.mine[].class deleg-group); a is frozen (SIGSTOP) across b's takeover of the root and thawed deposed; after quiescence every file is byte-exact on both nodes as its last acknowledged overwrite left it, and there is no conflict copy",
+        requires: &[],
+        caps: &[],
+        run: delegroot::takeover_loss_two_node,
+    },
+    Scenario {
         name: "auto-placement",
         desc: "plan 30 M11 phase 2b: no operator; b dominates the writes under d1 for a window and the root delegates d1 to b by itself; c takes the writes over and b stops; after the dwell the placement recalls b's generation and after the cool-down delegates d1 to c, with no flapping",
         requires: &[],

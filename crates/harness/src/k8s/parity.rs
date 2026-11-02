@@ -608,6 +608,7 @@ pub const SKIPPED: &[(&str, Skip)] = &[
         ]),
     ),
     ("delegate-backup-handoff-failover", Skip::Local(&[UPGRADE, KILL])),
+    ("takeover-loss-two-node", Skip::Local(&[STOP])),
     (
         "auto-placement",
         Skip::Local(&[NODES3, "tunes automatic delegation (CONSTELLATION_DELEGATION_*)"]),
