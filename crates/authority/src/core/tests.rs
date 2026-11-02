@@ -13665,6 +13665,253 @@ mod backup_crash {
         assert_eq!(h.core.ack_need(&pos), None);
     }
 
+    /// The configuration of the backup-sim configs: a backup within 50 ms,
+    /// a link stable after 200 ms.
+    fn backup_node(h: &mut Harness, roster: Vec<NodeId>) {
+        h.core.cfg.p2p = true;
+        h.core.cfg.backup_rtt_budget_ms = 50;
+        h.core.cfg.backups_max = 1;
+        h.core.cfg.backup_stable_ms = 200;
+        h.step(Event::Roster {
+            write_eligible: roster,
+        });
+    }
+
+    /// Node 2 linked (or not), its link up for `age` ms and measured at
+    /// `rtt_ms`.
+    fn link_2(h: &mut Harness, connected: bool, rtt_ms: Option<u64>, age: u64) -> Vec<Action> {
+        let since = w(h.now).minus(age);
+        h.step(Event::Peers {
+            links: vec![crate::event::PeerLink {
+                node: 2,
+                connected,
+                last_seen: None,
+                rtt_ms,
+                since: Some(since),
+            }],
+        })
+    }
+
+    fn pos_5() -> constellation_meta::Position {
+        constellation_meta::Position {
+            seq: 0,
+            pending: Some(constellation_meta::JournalPos { epoch: 1, jseq: 5 }),
+            streams: Default::default(),
+        }
+    }
+
+    /// i1-592 (`drop-held-chain-backed`, `backup`, `backup-crash`,
+    /// `long-backup` under `+commit`: about half the seeds): the tenure's
+    /// first assessment (`acquire_won`) found the peer's link younger than
+    /// the 200 ms stability window, said no backup could be had, and the
+    /// node answered on its disk alone with the peer linked and in budget.
+    /// A linked peer counts, stable and measured or not; one measured out
+    /// of budget does not. (Fails before: `Lone`, `None`.)
+    #[test]
+    fn a_linked_peer_not_yet_stable_or_measured_gates_the_lone_answer() {
+        let pos = pos_5();
+        // (rtt, link age, gated)
+        for (rtt, age, gated) in [
+            (Some(5), 0, true),     // in budget, not yet stable
+            (Some(5), 5_000, true), // stable
+            (None, 0, true),        // not yet measured
+            (None, 5_000, true),
+            (Some(80), 0, false), // measured out of budget
+            (Some(80), 5_000, false),
+        ] {
+            let mut h = Harness::new(1);
+            backup_node(&mut h, vec![1, 2]);
+            link_2(&mut h, true, rtt, age);
+            h.hold(1, None);
+            // As `acquire_won` assesses it.
+            h.core.ack.eligible = Some(h.core.backup_could_be_had());
+            let what = format!("(rtt {rtt:?}, link up {age} ms)");
+            if gated {
+                assert_eq!(h.core.ack_need(&pos), Some(5), "{what}");
+                assert_eq!(h.core.root_ack_class(), AckClass::Archive, "{what}");
+                assert!(!h.core.root_lone(), "{what}");
+            } else {
+                assert_eq!(h.core.ack_need(&pos), None, "{what}");
+                assert_eq!(h.core.root_ack_class(), AckClass::Lone, "{what}");
+                assert!(h.core.root_lone(), "{what}");
+            }
+        }
+        // A peer that is linked but not on the roster, one not connected, and
+        // one that refused the epoch are no backup.
+        let mut h = Harness::new(1);
+        backup_node(&mut h, vec![1]);
+        link_2(&mut h, true, Some(5), 0);
+        h.hold(1, None);
+        assert!(!h.core.backup_could_be_had(), "not on the roster");
+        h.step(Event::Roster {
+            write_eligible: vec![1, 2],
+        });
+        assert!(h.core.backup_could_be_had());
+        h.core.ack.refused_epoch.insert(2, 1);
+        assert!(!h.core.backup_could_be_had(), "refused the epoch");
+        h.core.ack.refused_epoch.clear();
+        link_2(&mut h, false, Some(5), 0);
+        assert!(!h.core.backup_could_be_had(), "not connected");
+    }
+
+    /// A true singleton (nobody else on the roster, or no one linked) is
+    /// still answered at once on its disk: plan 46 D3 keeps the exemption.
+    #[test]
+    fn a_singleton_still_answers_alone() {
+        let pos = pos_5();
+        for (roster, linked) in [(vec![1], false), (vec![1, 2], false), (vec![1], true)] {
+            let mut h = Harness::new(1);
+            backup_node(&mut h, roster.clone());
+            link_2(&mut h, linked, Some(5), 0);
+            h.hold(1, None);
+            h.core.ack.eligible = Some(h.core.backup_could_be_had());
+            let what = format!("(roster {roster:?}, node 2 linked {linked})");
+            assert_eq!(h.core.ack_need(&pos), None, "{what}");
+            assert_eq!(h.core.root_ack_class(), AckClass::Lone, "{what}");
+            assert!(h.core.root_lone(), "{what}");
+        }
+    }
+
+    /// i1-592: the assessment is cached, and a peer that becomes linked
+    /// after it must be counted by the event that tells of it, not by the
+    /// next housekeeping pass (`HOUSEKEEPING_MS` later): the answer given
+    /// in between rested on this disk alone. (Fails before: `None`, `Lone`.)
+    #[test]
+    fn a_lone_assessment_is_upgraded_by_the_event_that_changes_the_links() {
+        let pos = pos_5();
+        let mut h = Harness::new(1);
+        backup_node(&mut h, vec![1, 2]);
+        h.hold(1, None);
+        // Housekeeping runs with nobody linked: assessed, lone.
+        link_2(&mut h, false, None, 0);
+        assert_eq!(h.core.ack.eligible, Some(false));
+        assert_eq!(h.core.ack_need(&pos), None);
+        // Less than a housekeeping period later, the peer is linked.
+        h.advance(10);
+        link_2(&mut h, true, Some(5), 1_000);
+        assert_eq!(h.core.ack_need(&pos), Some(5), "answered alone");
+        assert_ne!(h.core.root_ack_class(), AckClass::Lone);
+
+        // The roster is what changed: node 2 was linked but not listed.
+        let mut h = Harness::new(1);
+        backup_node(&mut h, vec![1]);
+        link_2(&mut h, true, Some(5), 1_000);
+        h.hold(1, None);
+        link_2(&mut h, true, Some(5), 1_000);
+        assert_eq!(h.core.ack.eligible, Some(false));
+        h.advance(10);
+        h.step(Event::Roster {
+            write_eligible: vec![1, 2],
+        });
+        assert_eq!(h.core.ack_need(&pos), Some(5), "answered alone");
+
+        // Any event raises it: the clock alone does not change what a link
+        // is, but a link that was not counted at the assessment is.
+        let mut h = Harness::new(1);
+        backup_node(&mut h, vec![1, 2]);
+        h.hold(1, None);
+        link_2(&mut h, false, None, 0);
+        h.core.links.get_mut(&2).unwrap().connected = true;
+        h.core.links.get_mut(&2).unwrap().rtt_ms = Some(5);
+        assert_eq!(h.core.ack_need(&pos), None, "(no event yet)");
+        h.advance(1);
+        h.step(Event::Activity {
+            last_write: WaitMs(0),
+            acked_seqs: Vec::new(),
+        });
+        assert_eq!(h.core.ack_need(&pos), Some(5));
+
+        // Never lowered by it: a link that went down waits for the
+        // selection pass.
+        let mut h = Harness::new(1);
+        backup_node(&mut h, vec![1, 2]);
+        h.hold(1, None);
+        link_2(&mut h, true, Some(5), 1_000);
+        assert_eq!(h.core.ack.eligible, Some(true));
+        h.advance(10);
+        link_2(&mut h, false, Some(5), 0);
+        assert_eq!(h.core.ack.eligible, Some(true), "lowered by a link event");
+    }
+
+    /// i1-592, the seed's shape: an own op queued behind an acquisition runs
+    /// in the acquisition's own event, 38 ms after the links came up. It is
+    /// answered once the archive holds its row, not before — an accepted op
+    /// and a refusal alike (`record_refusal` journals the refusal tagged by
+    /// the same class). Fails before: answered in that event, `Lone`. A
+    /// singleton's is answered in that event still.
+    #[test]
+    fn an_op_queued_behind_the_acquisition_waits_for_the_archive_with_a_peer_linked() {
+        for refusal in [false, true] {
+            for peer in [true, false] {
+                let mut h = Harness::new(1);
+                backup_node(&mut h, if peer { vec![1, 2] } else { vec![1] });
+                link_2(&mut h, peer, Some(5), 0);
+                let rid = h.rid(1);
+                let op = if refusal {
+                    MutateOp::Unlink {
+                        parent: ROOT_INO,
+                        name: "missing".into(),
+                    }
+                } else {
+                    h.create("a")
+                };
+                let out = h.step(Event::Submit {
+                    policy: Policy::Client,
+                    rid,
+                    op,
+                    tag: Default::default(),
+                });
+                // The lease object is read (to learn the holder, then to
+                // acquire) and there is none: this node creates it.
+                let mut out = out;
+                let (create, req) = loop {
+                    let (op, req) = only_s3(&out);
+                    if matches!(req, S3Op::LeaseCreate { .. }) {
+                        break (op, req);
+                    }
+                    assert!(matches!(req, S3Op::LeaseGet), "{req:?} {out:?}");
+                    out = h.step(Event::S3 {
+                        op,
+                        result: S3Result::LeaseGet(Ok(None)),
+                    });
+                };
+                assert!(matches!(req, S3Op::LeaseCreate { .. }), "{req:?} {out:?}");
+                // The links are 38 ms old when the lease is won: younger
+                // than the stability window.
+                h.advance(38);
+                let out = h.step(Event::S3 {
+                    op: create,
+                    result: S3Result::LeasePut(Ok(tag())),
+                });
+                let (drain, req) = only_s3(&out);
+                assert!(matches!(req, S3Op::InboxDrain { .. }), "{req:?}");
+                let mut out = h.step(Event::S3 {
+                    op: drain,
+                    result: S3Result::InboxDrain(Ok(Vec::new())),
+                });
+                assert_eq!(h.core.lease().epoch(), Some(1));
+                let what = format!("(refusal {refusal}, peer {peer})");
+                if peer {
+                    assert!(
+                        replies(&out).is_empty(),
+                        "{what} answered before the archive held the row: {out:?}"
+                    );
+                    assert_ne!(h.core.root_ack_class(), AckClass::Lone, "{what}");
+                    out = h.archive_lands();
+                }
+                assert_eq!(replies(&out).len(), 1, "{what} {out:?}");
+                let ClientReply::Outcome(outcome) = replies(&out)[0].1 else {
+                    panic!("{what} {out:?}")
+                };
+                assert_eq!(
+                    matches!(outcome, MutateOutcome::Errno(_)),
+                    refusal,
+                    "{what} {outcome:?}"
+                );
+            }
+        }
+    }
+
     /// The same moment, reached from a listed backup: whether a backup could
     /// be had is assessed by every selection pass, and one that ran while
     /// node 2 was listed left it out (it is no candidate: it is a backup).

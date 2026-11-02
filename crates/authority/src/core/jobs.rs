@@ -3594,8 +3594,14 @@ impl Core {
         // Plan 30 §M9: assess now whether a backup could be had — the
         // ops queued behind this acquisition run before the tenure's first
         // selection pass, and an unassessed tenure holds their
-        // acknowledgements until it (`durable_jseq`).
-        self.ack.eligible = Some(self.backup_could_be_had(now));
+        // acknowledgements until it (`durable_jseq`). A linked peer counts
+        // whether or not it is yet stable or measured (it is the lone
+        // test, not candidate selection): the links of a fresh tenure are
+        // often younger than the stability window, and an op answered on
+        // this disk alone here was never held by the backup that came up
+        // a moment later (i1-592). Raised, never lowered, by every event
+        // (`refresh_backup_eligibility`).
+        self.ack.eligible = Some(self.backup_could_be_had());
         // Plan 30 §M9: a takeover of an unexpired lease (a seal, or
         // `ack=s3`) is what the permit allowed; the predecessor's
         // strict-read horizon becomes this tenure's acknowledgement floor

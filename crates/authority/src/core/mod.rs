@@ -2337,6 +2337,7 @@ impl Core {
             return out;
         }
         self.clk = now;
+        self.refresh_backup_eligibility();
         self.deleg_root_sync_due(now, replica, &mut out);
         match event {
             Event::Submit {
@@ -2393,6 +2394,7 @@ impl Core {
                     self.note_foreign(now, replica, &mut out);
                 }
                 self.roster = write_eligible;
+                self.refresh_backup_eligibility();
                 // A holder polls a requester it has just learned of at
                 // once (M13 round 2), not at its next round's end.
                 if self.inbox.holder.is_some() {
@@ -2414,6 +2416,7 @@ impl Core {
                     }
                 }
                 self.links = links.into_iter().map(|l| (l.node, l)).collect();
+                self.refresh_backup_eligibility();
                 self.stream_on_peers(now);
             }
             Event::OwnS3 {

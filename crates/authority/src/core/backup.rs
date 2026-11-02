@@ -1438,6 +1438,13 @@ impl Core {
             // 603322): the ops queued behind an acquisition run in the
             // acquisition's own event, before the tenure's first selection
             // pass, and were acknowledged at once on this disk alone.
+            //
+            // Nor is a peer linked but not yet stable or measured a reason
+            // to answer alone (i1-592): `eligible` is the lone test
+            // (`backup_could_be_had`), raised at every event and never
+            // stale in the unsafe direction. Only a node with no roster
+            // peer linked within the budget — a singleton, a peer measured
+            // out of budget, one that refused the epoch — is lone.
             let unassessed = self.ack.eligible.is_none() && self.backups_possible();
             return if self.ack.candidate.is_some() || self.ack.eligible == Some(true) || unassessed
             {
@@ -1583,6 +1590,12 @@ impl Core {
     /// doubted backup, no candidate, no eligible or unassessed peer). Its
     /// own node's clients are answered from its disk (`Lone`), every other
     /// node from the archive.
+    ///
+    /// Lone means no roster peer is linked within the RTT budget, judged as
+    /// of the current event (plan 46 D3: no node with peers answers from its
+    /// disk alone; a singleton still may). A peer that is linked but not yet
+    /// stable or not yet measured counts as one a backup could be had from
+    /// ([`Self::backup_could_be_had`]).
     pub(crate) fn root_lone(&self) -> bool {
         self.lease.held.is_some()
             && !self.lease.lost
@@ -3110,14 +3123,54 @@ impl Core {
     }
 
     /// Whether a backup could be had (`ack.eligible`, the gate of an empty
-    /// set in `durable_jseq_held`): a peer in budget that has not refused
-    /// the epoch, listed or not. A listed one counts: the assessment must
-    /// still hold once a removal CAS empties the set, before the next
-    /// selection pass (`backup_select`) or the tenure's first
-    /// (`acquire_won`) assesses it again.
-    pub(crate) fn backup_could_be_had(&self, now: Now) -> bool {
-        self.backup_peers_in_budget(now)
-            .any(|n| !self.ack.refused_epoch.contains_key(&n))
+    /// set in `durable_jseq_held`): a roster peer linked within the RTT
+    /// budget that has not refused the epoch, listed or not. A listed one
+    /// counts: the assessment must still hold once a removal CAS empties
+    /// the set, before the next selection pass (`backup_select`) or the
+    /// tenure's first (`acquire_won`) assesses it again.
+    ///
+    /// This is the lone test: a node with a peer to back it is never
+    /// answered on its disk alone (plan 46 D3; only a singleton is). So it
+    /// asks less than candidate selection does ([`Self::backup_candidates`]):
+    /// a link that is not yet up for the stability window, or whose RTT is
+    /// not yet measured, counts as a peer a backup could be had from — the
+    /// root then waits for the archive, or brings the backup up, but never
+    /// answers alone with a peer linked (i1-592: the links of a tenure's
+    /// first 200 ms were younger than the window, the assessment said no,
+    /// and the own ops queued behind the acquisition were answered on the
+    /// disk alone). A peer measured out of budget does not count. Stability
+    /// is a matter of time, not of an event, and the engine's fast path
+    /// answers between events from the published `lone_ok`, so the
+    /// assessment must not change with the clock alone: it changes with
+    /// the links and the roster ([`Self::refresh_backup_eligibility`]).
+    pub(crate) fn backup_could_be_had(&self) -> bool {
+        if self.cfg.backup_rtt_budget_ms == 0 || self.cfg.backups_max == 0 {
+            return false;
+        }
+        self.links.values().any(|l| {
+            l.node != self.cfg.node_id
+                && l.connected
+                && self.roster.contains(&l.node)
+                && l.rtt_ms
+                    .is_none_or(|rtt| rtt <= self.cfg.backup_rtt_budget_ms)
+                && !self.ack.refused_epoch.contains_key(&l.node)
+        })
+    }
+
+    /// The cached assessment ([`Self::backup_could_be_had`]) is raised at
+    /// every event, never lowered: a holder that found no peer (or only a
+    /// stale link) and is told of one — by a `Peers` or `Roster` event, or
+    /// by the next event of any kind — must not answer on its disk alone
+    /// in that event. Lowering stays with the selection pass
+    /// (`backup_select`), which is conservative: a stale `Some(true)` only
+    /// waits for the archive.
+    pub(crate) fn refresh_backup_eligibility(&mut self) {
+        if self.lease.held.is_some()
+            && self.ack.eligible == Some(false)
+            && self.backup_could_be_had()
+        {
+            self.ack.eligible = Some(true);
+        }
     }
 
     fn backup_select(&mut self, now: Now, _replica: &dyn Replica, _out: &mut Vec<Action>) {
@@ -3141,7 +3194,7 @@ impl Core {
         // the holder, paused past its backup's acknowledgement timeout,
         // removed it on waking; it crashed 100 ms later, and the successor
         // took over without the acknowledged create).
-        self.ack.eligible = Some(self.backup_could_be_had(now));
+        self.ack.eligible = Some(self.backup_could_be_had());
         if self.ack.candidate.is_some()
             || self.ack.reconfig.is_some()
             || self.lease.backups().len() >= self.cfg.backups_max
