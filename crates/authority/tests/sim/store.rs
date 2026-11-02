@@ -211,6 +211,10 @@ pub struct Bucket {
     /// How much slower the lease GETs of every node's handle are than the
     /// bucket's latency (`SimConfig::lease_reads`).
     lease_reads: Mutex<SlowReads>,
+    /// Plan 46 M0.3: the run's reachability history (the cuts of a node's
+    /// path to S3 and the lease bodies that land are recorded here; the bus
+    /// and the nodes record the rest).
+    reach: Arc<super::reach::Reach>,
 }
 
 impl Bucket {
@@ -228,7 +232,13 @@ impl Bucket {
             taken_over: Mutex::new(std::collections::HashMap::new()),
             probe_late: Mutex::new(Vec::new()),
             lease_reads: Mutex::new(SlowReads::default()),
+            reach: Arc::new(super::reach::Reach::default()),
         })
+    }
+
+    /// The run's reachability history (plan 46 M0.3).
+    pub fn reach(&self) -> Arc<super::reach::Reach> {
+        self.reach.clone()
     }
 
     /// Slow the lease GETs of every node's handle by `reads`.
@@ -364,6 +374,7 @@ impl Bucket {
 
     /// Cut or heal one node's path to the bucket.
     pub fn set_cut(&self, node: u64, cut: bool) {
+        self.reach.s3_cut(node, cut);
         let mut set = self.cut.lock().unwrap();
         if cut {
             set.insert(node);

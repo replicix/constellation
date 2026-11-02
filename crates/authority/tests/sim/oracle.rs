@@ -74,6 +74,69 @@ pub struct Oracles {
     /// delegate past the lead, or behind an uncommitted gated row of its own
     /// (see [`LoneLead`]).
     pub lone_lead: Mutex<LoneLead>,
+    /// Plan 46 M0.3: the run's reachability history (see `reach.rs`), the
+    /// op each rid submitted (to find the delegate of its keys), and every
+    /// unsettled `EIO` with what the history says of it.
+    pub reach: Arc<super::reach::Reach>,
+    pub ops: Mutex<HashMap<Rid, constellation_meta::MutateOp>>,
+    pub unsettled: Mutex<Vec<Unsettled>>,
+}
+
+/// An unsettled `EIO` (the client was told in doubt after its settle went
+/// unanswered), and whether its requester was isolated (plan 46 M0.3).
+#[derive(Debug, Clone)]
+pub struct Unsettled {
+    pub node: NodeId,
+    pub rid: Rid,
+    pub at_ms: u64,
+    pub window_ms: u64,
+    pub verdict: super::reach::Verdict,
+}
+
+impl Unsettled {
+    /// A key for counting the causes: `isolated`, or how a sequencer was
+    /// reachable and what its core was busy with.
+    pub fn cause(&self) -> String {
+        match &self.verdict {
+            super::reach::Verdict::Isolated { why } if why.starts_with("requester") => {
+                "isolated/requester stopped".into()
+            }
+            super::reach::Verdict::Isolated { .. } => "isolated".into(),
+            super::reach::Verdict::Reachable { via, busy, .. } => {
+                let via = match via {
+                    super::reach::Via::Itself => "itself",
+                    super::reach::Via::Root(_) => "root",
+                    super::reach::Via::Delegate(_) => "delegate",
+                    super::reach::Via::LeasePath => "lease-path",
+                };
+                format!("{via}/{busy}")
+            }
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        let span = format!(
+            "[{}, {}] ms",
+            self.at_ms.saturating_sub(self.window_ms),
+            self.at_ms
+        );
+        match &self.verdict {
+            super::reach::Verdict::Isolated { why } => format!(
+                "I4: rid {:?} told EIO unsettled by node {} at t={} ms; isolated over {span} ({why})",
+                self.rid, self.node, self.at_ms
+            ),
+            super::reach::Verdict::Reachable {
+                via,
+                from_ms,
+                to_ms,
+                busy,
+            } => format!(
+                "I4: rid {:?} told EIO unsettled by node {} at t={} ms although a sequencer was \
+                 reachable over {span}: {via:?} during [{from_ms}, {to_ms}] ms (its core: {busy})",
+                self.rid, self.node, self.at_ms
+            ),
+        }
+    }
 }
 
 /// The lone delegate's lead oracle (`Core::deleg_lone_held`): a row of its
@@ -175,14 +238,20 @@ impl LoneLead {
 impl Oracles {
     pub fn new(bucket: Arc<Bucket>) -> Arc<Self> {
         let leases = Arc::new(LeaseClaims::default());
+        let reach = bucket.reach();
         {
             let leases = leases.clone();
+            let reach = reach.clone();
             bucket.set_lease_hook(Arc::new(move |node, prev, new| {
+                reach.lease_landed(new.holder, new.released, new.backups.clone());
                 leases.landed(node, prev, new)
             }));
         }
         Arc::new(Self {
             leases,
+            reach,
+            ops: Mutex::new(HashMap::new()),
+            unsettled: Mutex::new(Vec::new()),
             bucket,
             stores: Mutex::new(BTreeMap::new()),
             budgets: Mutex::new(BTreeMap::new()),
@@ -210,6 +279,49 @@ impl Oracles {
             let t = self.next_tick();
             self.invokes.lock().unwrap().push((rid, t));
         }
+    }
+
+    /// The op a client submitted under `rid` (plan 46 M0.3: its keys name
+    /// the delegate that would settle it).
+    pub fn note_op(&self, rid: Rid, op: &constellation_meta::MutateOp) {
+        self.ops.lock().unwrap().insert(rid, op.clone());
+    }
+
+    /// The delegate of `rid`'s keys, per the lease holder's table at `at`.
+    fn delegate_of(&self, rid: Rid, at: u64) -> Option<(NodeId, u64)> {
+        let op = self.ops.lock().unwrap().get(&rid).cloned()?;
+        let meta = self.store(self.reach.holder_at(at)?)?;
+        let keys = constellation_meta::TouchSet::from_op_in(&op, &|p, n| {
+            Replica::lookup_ino(&*meta, p, n)
+        });
+        match meta.resolve_ownership(&keys) {
+            constellation_meta::delegation::Ownership::Delegated(d) => Some((d.node, d.gen)),
+            _ => None,
+        }
+    }
+
+    /// Plan 46 M0.3: `node`'s core told a client `EIO`, in doubt, at the
+    /// end of its settle window (`window_ms`, the core's `settle_window`).
+    /// Classified from the reachability history, never from a node's log:
+    /// isolated (no sequencer reachable in the whole window) or not.
+    pub fn note_unsettled(&self, node: NodeId, rid: Rid, window_ms: u64, started: Option<u64>) {
+        let at = self.reach.now_ms();
+        let delegate = self.delegate_of(rid, at);
+        let verdict = self.reach.classify(super::reach::Question {
+            requester: node,
+            // (A settle lasts at least a window; one whose deadline was
+            // extended lasts from the arming of its second deadline.)
+            from_ms: started.unwrap_or(at).min(at.saturating_sub(window_ms)),
+            to_ms: at,
+            delegate,
+        });
+        self.unsettled.lock().unwrap().push(Unsettled {
+            node,
+            rid,
+            at_ms: at,
+            window_ms: window_ms.max(at.saturating_sub(started.unwrap_or(at))),
+            verdict,
+        });
     }
 
     pub fn register(&self, id: NodeId, meta: Arc<Meta>, budget_ms: u64, stable_ms: u64) {

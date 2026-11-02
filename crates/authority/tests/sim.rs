@@ -19,6 +19,7 @@ mod sim {
     pub mod locks;
     pub mod node;
     pub mod oracle;
+    pub mod reach;
     pub mod run;
     pub mod session;
     pub mod store;
@@ -2565,6 +2566,9 @@ fn delegated_long_delegation_prod_config() -> SimConfig {
             c
         }),
         strict_settle: true,
+        // Plan 46 M0.3: and no unsettled `EIO` at all (0 in 2,000 seeds, with
+        // and without the lease-reads knob): the strict form of I4.
+        strict_unsettled: true,
         ..delegated_long_delegation_config()
     }
 }
@@ -6430,6 +6434,10 @@ fn delegated_root_gone_config() -> SimConfig {
             c
         }),
         cross_ratio: 0.0,
+        // Plan 46 M0.3: no unsettled `EIO` in 2,000 seeds, with and without
+        // the lease-reads knob; the strict form of I4 holds.
+        strict_settle: true,
+        strict_unsettled: true,
         faults: vec![ScheduledFault {
             at_ms: 1_500,
             // Back long after the TTL takeover (so its own unshipped
@@ -7364,6 +7372,12 @@ struct OracleTotals {
     /// own gated rows judged, ops the gated mark held back from `Lone`, `Lone`
     /// decisions made `DelegGroup` where the row was journaled].
     lone_lead: [u64; 6],
+    /// Plan 46 M0.3: unsettled `EIO`s by isolated requesters (allowed) and
+    /// by requesters that could reach a sequencer (I4 violations), and the
+    /// seeds with a violation.
+    unsettled_class: [u64; 2],
+    unsettled_seeds: u64,
+    unsettled_causes: std::collections::BTreeMap<String, u64>,
 }
 
 impl OracleTotals {
@@ -7453,6 +7467,20 @@ impl OracleTotals {
             }
             unsettled += st.client_unsettled_eio;
         }
+        self.unsettled_class[0] += r.unsettled_isolated as u64;
+        self.unsettled_class[1] += r.unsettled_violations as u64;
+        self.unsettled_seeds += u64::from(r.unsettled_violations > 0);
+        for (k, n) in &r.unsettled_causes {
+            *self.unsettled_causes.entry(k.clone()).or_default() += *n as u64;
+        }
+        if r.unsettled_violations > 0 {
+            for e in r.unsettled_examples.iter().take(2) {
+                eprintln!("SWEEP-UNSETTLED {label} seed {seed}: {e}");
+            }
+        }
+        // (The cores' `client_unsettled_eio` below counts the last
+        // incarnation of each node only; the classification covers every
+        // incarnation, so its total can exceed it in a run with restarts.)
         for st in r.stats.values() {
             for (c, n) in self.claimed.iter_mut().zip(st.ack_classes) {
                 *c += n;
@@ -7520,13 +7548,14 @@ impl OracleTotals {
             + mismatched
             + r.unverified_relays
             + r.unjournaled_landed
-            + unsettled as usize
+            + r.unsettled_isolated
+            + r.unsettled_violations
             > 0
         {
             eprintln!(
                 "SWEEP-ORACLES {label} seed {seed}: i1={uncommitted} {:?} i2={} i2c={} i4={} i5={} \
                  unjournaled={unjournaled} {:?} mismatched={mismatched} {:?} relays={} \
-                 unjournaled-landed={} unsettled-eio={unsettled} rebuilds={}/{}",
+                 unjournaled-landed={} unsettled-eio={unsettled} (isolated {}, violations {}) rebuilds={}/{}",
                 r.uncommitted_acks,
                 r.identity_copies,
                 r.non_verbatim,
@@ -7536,6 +7565,8 @@ impl OracleTotals {
                 r.mismatched_acks,
                 r.unverified_relays,
                 r.unjournaled_landed,
+                r.unsettled_isolated,
+                r.unsettled_violations,
                 r.rebuilds.0,
                 r.rebuilds.1
             );
@@ -7552,8 +7583,8 @@ impl OracleTotals {
              rebuilds={}/{} (in {} seeds) max-backups={}; acks by class {:?}; \
              i1-mismatched={mismatched} {:?} (in {} seeds) unverified-relays={} (in {} seeds) \
              class-mismatch={} unsourced={} unjournaled-landed={}; settles \
-             (sent/abandoned/late-success/local/unsettled-eio) {:?} i4-settled={}; cores' \
-             sequenced answers by class {:?}",
+             (sent/abandoned/late-success/local/unsettled-eio) {:?} i4-settled={}; unsettled EIO \
+             isolated={} violations={} (in {} seeds); cores' sequenced answers by class {:?}",
             self.seeds,
             self.uncommitted,
             self.seeds_with[0],
@@ -7581,7 +7612,14 @@ impl OracleTotals {
             self.unjournaled_landed,
             self.settles,
             self.i4_settled,
+            self.unsettled_class[0],
+            self.unsettled_class[1],
+            self.unsettled_seeds,
             constellation_authority::core::AckClass::NAMES.iter().zip(self.claimed).collect::<Vec<_>>()
+        );
+        eprintln!(
+            "SWEEP-UNSETTLED-CAUSES {label} seeds {}/{seeds}: {:?}",
+            self.seeds, self.unsettled_causes
         );
         eprintln!(
             "SWEEP-LONE-LEAD-TOTALS {label} seeds {}/{seeds}: own Lone rows past the lead {}, \
@@ -10768,6 +10806,13 @@ fn config_variant(cfg: SimConfig, variant: &str) -> SimConfig {
         },
         "settle" => SimConfig {
             strict_settle: true,
+            ..cfg
+        },
+        // Plan 46 M0.3: I4 strict for the unsettled `EIO` too: only an
+        // isolated requester may be told one (`reach.rs`).
+        "unsettled" => SimConfig {
+            strict_settle: true,
+            strict_unsettled: true,
             ..cfg
         },
         "lone" => SimConfig {
@@ -15090,6 +15135,66 @@ fn c2_delegated_long_delegation_prod_settles_every_eio() {
             )
         });
         assert_eq!(r.late_landings, 0, "seed {seed}");
+    }
+}
+
+/// Plan 46 M0.3, I4 strict: an unsettled `EIO` is allowed only for a
+/// requester that could reach no sequencer in its whole settle window
+/// (`reach.rs`). `long-delegated-late-answers` seed 8: the client of a new
+/// root inside its takeover gate hears `EIO` although the root was
+/// reachable throughout (the gate answers every forward, a settle's
+/// included, `Busy`): counted as a violation always, a failure under
+/// `+unsettled`. Fails on any build before the classification: no counter.
+#[test]
+fn m03_a_reachable_sequencers_requester_is_not_isolated() {
+    let cfg = long_delegated_late_answers_config;
+    let r = run_seed(8, cfg()).unwrap_or_else(|e| panic!("seed 8: {e}"));
+    assert!(
+        r.unsettled_violations > 0,
+        "seed 8 no longer tells a client EIO with a sequencer reachable: {:?}",
+        r.unsettled_causes
+    );
+    assert_eq!(r.unsettled_examples.len(), r.unsettled_violations.min(5));
+    let err = run_seed(8, strict(cfg(), "unsettled")).expect_err("+unsettled must fail");
+    assert!(
+        err.contains("although a sequencer was reachable"),
+        "unexpected failure: {err}"
+    );
+}
+
+/// Plan 46 M0.3: the isolated requesters of `flex-crash` (nodes cut from every
+/// other node and from S3 by an epoch outage) are allowed their unsettled
+/// `EIO`: seed 383 tells seven, every one of an isolated requester, and
+/// passes `+unsettled`.
+#[test]
+fn m03_an_isolated_requesters_eio_is_allowed() {
+    let r = c0_run("flex-crash", 383, flex_crash_config());
+    assert!(
+        r.unsettled_isolated > 0 && r.unsettled_violations == 0,
+        "seed 383: isolated {}, violations {} ({:?})",
+        r.unsettled_isolated,
+        r.unsettled_violations,
+        r.unsettled_causes
+    );
+    run_seed(383, strict(flex_crash_config(), "unsettled"))
+        .unwrap_or_else(|e| panic!("flex-crash+unsettled seed 383: {e}"));
+}
+
+/// Plan 46 M0.3: the configurations whose unsettled `EIO` count is zero in
+/// 2,000 seeds with and without the lease-reads knob run the strict form.
+#[test]
+fn m03_the_configurations_without_an_unsettled_eio_run_strict() {
+    for (label, cfg) in [
+        (
+            "delegated-long-delegation-prod",
+            delegated_long_delegation_prod_config(),
+        ),
+        ("delegated-root-gone", delegated_root_gone_config()),
+    ] {
+        assert!(cfg.strict_unsettled, "{label}");
+        for seed in 0..6u64 {
+            run_seed(seed, cfg.clone()).unwrap_or_else(|e| panic!("{label} seed {seed}: {e}"));
+        }
     }
 }
 

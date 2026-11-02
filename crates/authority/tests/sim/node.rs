@@ -745,6 +745,9 @@ impl NodeHandle {
             lag_pending: None,
             freeze_handed: (0, 0),
             own_lapse: None,
+            unsettled_seen: 0,
+            deadline_armed: HashMap::new(),
+            step_timer: None,
             own_lapses_unreported: env.own_lapses_unreported,
             stamps_first: !env.timers_first_after_lag,
             credit_margin: env
@@ -834,6 +837,7 @@ impl NodeHandle {
             return rx;
         }
         self.oracles.note_invoke(rid);
+        self.oracles.note_op(rid, &op);
         self.shared.replies.lock().unwrap().insert(rid, tx);
         let _ = self.tx.send(Event::Submit {
             rid,
@@ -875,6 +879,12 @@ impl NodeHandle {
     /// A stopped process whose timers keep running: events queue up and
     /// are handled, late, once the pause ends.
     pub fn pause_until(&self, until: tokio::time::Instant) {
+        self.oracles.reach.stopped_for(
+            self.id,
+            until
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_millis() as u64,
+        );
         *self.shared.paused_until.lock().unwrap() = Some(until);
         *self.shared.paused_since.lock().unwrap() = Some(tokio::time::Instant::now());
     }
@@ -937,6 +947,12 @@ impl NodeHandle {
     /// `until`, and leave what peers send it unstamped until
     /// `peers_until`.
     pub fn runtime_lag(&self, until: tokio::time::Instant, peers_until: tokio::time::Instant) {
+        self.oracles.reach.stopped_for(
+            self.id,
+            until
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_millis() as u64,
+        );
         *self.shared.lag.lock().unwrap() = Some((until, peers_until));
         *self.shared.lag_since.lock().unwrap() = Some(tokio::time::Instant::now());
     }
@@ -1016,6 +1032,14 @@ struct Driver {
     /// daemon's `Driver::hand_lag` hands the driver's own long step).
     /// Handed before the next event.
     own_lapse: Option<(i64, i64)>,
+    /// Plan 46 M0.3: the unsettled `EIO`s of this incarnation's core
+    /// (`Stats::client_unsettled_eio`) already classified.
+    unsettled_seen: u64,
+    /// Plan 46 M0.3: when each client-deadline timer was armed (true ms),
+    /// and the timer the current step fires: the second deadline of an
+    /// unsettled `EIO` was armed when its settle began.
+    deadline_armed: HashMap<constellation_authority::TimerId, u64>,
+    step_timer: Option<constellation_authority::TimerId>,
     /// `SimConfig::own_lapses_unreported`: no such lapse is handed.
     own_lapses_unreported: bool,
     /// After a lag, what the daemon's P2P handlers stamped meanwhile goes
@@ -1902,6 +1926,7 @@ impl Driver {
                 // The step is stuck: the delegation renewal lane sees it
                 // (`deleg_lane_loop`) from here.
                 self.shared.busy_since.store(now.wait.0, Ordering::SeqCst);
+                self.oracles.reach.stopped_for(self.id, ms);
                 tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                 self.shared.busy_since.store(0, Ordering::SeqCst);
                 self.note_own_lapse(now.wait.0);
@@ -2031,6 +2056,10 @@ impl Driver {
             };
             self.before_core(&event);
             self.step_now = now;
+            self.step_timer = match &event {
+                Event::Timer { id } => Some(*id),
+                _ => None,
+            };
             let actions = self.core.handle(now, event, &*self.meta);
             if debug && (debug_event.contains("Lock") || lock_timer.is_some()) {
                 let debug_event = match &lock_timer {
@@ -2382,6 +2411,38 @@ impl Driver {
         view.lock_waiters = locks.waiters;
         view.lock_recalls = locks.recalls_in_flight;
         let now = self.clock.now();
+        // Plan 46 M0.3: what this core is, for the reachability history.
+        {
+            let at = self.oracles.reach.now_ms();
+            let held = if lease.epoch_held() {
+                super::reach::Held::Epoch
+            } else if view.held_epoch.is_some() {
+                super::reach::Held::Lease
+            } else {
+                super::reach::Held::No
+            };
+            let grants = view
+                .delegation
+                .mine
+                .iter()
+                .filter(|m| !m.3)
+                .map(|m| (m.1, at + (m.2 - now.honour.0).max(0) as u64))
+                .collect();
+            let mut busy = 0u8;
+            if lease.gate.is_some() {
+                busy |= super::reach::BUSY_GATE;
+            }
+            if self.core.takeover_floor_until().0 > now.wait.0 {
+                busy |= super::reach::BUSY_FLOOR;
+            }
+            if lease.lost {
+                busy |= super::reach::BUSY_LOST;
+            }
+            if view.job.is_some() {
+                busy |= super::reach::BUSY_JOB;
+            }
+            self.oracles.reach.note_view(self.id, held, grants, busy);
+        }
         let floor = self.core.takeover_floor_until().0;
         if floor != 0 && floor != self.shared.floor_seen.swap(floor, Ordering::SeqCst) {
             self.shared
@@ -3267,6 +3328,27 @@ impl Driver {
                                 .lock()
                                 .unwrap()
                                 .push((self.id, rid, applied, tick));
+                            // Plan 46 M0.3: an `EIO` the core counts as unsettled
+                            // (`client_unsettled_eio`: the second deadline came
+                            // with no sequencer's answer) is classified at once,
+                            // from the run's reachability history (I4's isolation
+                            // exception). The other in-doubt replies (a wait
+                            // aborted by a deposition, a policy that does not
+                            // settle) are none of the settle's.
+                            if self.core.stats.client_unsettled_eio > self.unsettled_seen {
+                                self.unsettled_seen += 1;
+                                // (The settle began when the deadline timer this
+                                // step fires was armed.)
+                                let started = self
+                                    .step_timer
+                                    .and_then(|t| self.deadline_armed.get(&t).copied());
+                                self.oracles.note_unsettled(
+                                    self.id,
+                                    rid,
+                                    self.core.config().settle_window(),
+                                    started,
+                                );
+                            }
                         }
                         ClientReply::Outcome(outcome) => {
                             self.note_answer(rid, outcome, Some(source), None)
@@ -3309,6 +3391,9 @@ impl Driver {
                 Action::SetTimer { id, after_ms, kind } => {
                     self.timers.insert(id);
                     self.timer_kinds.insert(id, kind);
+                    if kind == constellation_authority::TimerKind::ClientDeadline {
+                        self.deadline_armed.insert(id, self.oracles.reach.now_ms());
+                    }
                     let tx = self.tx.clone();
                     // Counted from the reading of the step that armed it
                     // (see `step_now`): it fires when the node's wait clock

@@ -683,6 +683,13 @@ pub struct SimConfig {
     /// I4 `unacked_fails_never_lands_late`: an op answered in doubt that
     /// lands in the log after an op its node invoked later fails the run.
     pub strict_settle: bool,
+    /// Plan 46 M0.3, I4 strict: an unsettled `EIO` (the client was told in
+    /// doubt after its settle went unanswered) is allowed only for an
+    /// isolated requester, one that could reach no sequencer for the op
+    /// during its whole settle window (`reach.rs` classifies each from the
+    /// run's network and fault history). Every other one fails the run.
+    /// Always counted (`Report::unsettled_isolated`, `unsettled_violations`).
+    pub strict_unsettled: bool,
     /// I5 `speculation_only_lone`: an answered op rolled back whose answer
     /// was not of class Lone fails the run (`strict_durability` turns it
     /// on from C1).
@@ -1022,6 +1029,7 @@ impl Default for SimConfig {
             strict_commit: false,
             strict_identity: false,
             strict_settle: false,
+            strict_unsettled: false,
             strict_lone: false,
             strict_lone_lead: true,
             strict_lease_claims: true,
@@ -1215,6 +1223,14 @@ pub struct Report {
     /// (`check::no_settled_landing`); the rest are unsettled ones landing
     /// late (I4's isolated-requester exception when it is one).
     pub settled_landings: usize,
+    /// Plan 46 M0.3: unsettled `EIO`s told by an isolated requester (allowed)
+    /// and by one that could reach a sequencer (I4 violations: the settle
+    /// failed although a sequencer was there); the violations described
+    /// (first five), and the isolated ones' causes by kind.
+    pub unsettled_isolated: usize,
+    pub unsettled_violations: usize,
+    pub unsettled_examples: Vec<String>,
+    pub unsettled_causes: BTreeMap<String, usize>,
     /// I5: acknowledged, rolled-back ops whose answer was not Lone.
     pub non_lone_rollbacks: usize,
     /// Plan 43 C2 (§5.3): shadows and hints installed for an answer not
@@ -3748,6 +3764,17 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let bucket = Bucket::new(seed, cfg.s3_latency);
     bucket.set_lease_reads(cfg.lease_reads);
     let bus = Bus::new(seed, cfg.p2p_delay, cfg.p2p_drop);
+    bus.set_reach(bucket.reach());
+    {
+        let core = (cfg.core)(1, 1);
+        bucket.reach().configure(
+            cfg.p2p_delay.1,
+            cfg.s3_latency.1,
+            core.ttl_ms,
+            2 * core.backup_takeover_ms,
+            cfg.lease_reads.before.1 + cfg.lease_reads.reply.1,
+        );
+    }
     bus.set_stream_faults(cfg.stream_faults.clone());
     bus.set_beats_lost(cfg.beats_lost);
     bus.set_mirror_drop(cfg.lock_mirror_drop, cfg.lock_mirror_drop_from_ms);
@@ -5329,6 +5356,21 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.non_verbatim = found.i2c.len();
     report.late_landings = found.i4.len();
     report.settled_landings = found.i4.iter().filter(|m| m.starts_with("I4: rid")).count();
+    let unsettled_violations: Vec<String> = {
+        let all = oracles.unsettled.lock().unwrap();
+        report.unsettled_isolated = all.iter().filter(|u| u.verdict.isolated()).count();
+        let bad: Vec<String> = all
+            .iter()
+            .filter(|u| !u.verdict.isolated())
+            .map(|u| u.describe())
+            .collect();
+        report.unsettled_violations = bad.len();
+        for u in all.iter() {
+            *report.unsettled_causes.entry(u.cause()).or_default() += 1;
+        }
+        report.unsettled_examples = bad.iter().take(5).cloned().collect();
+        bad
+    };
     report.non_lone_rollbacks = found.i5.len();
     {
         let ord = std::sync::atomic::Ordering::Relaxed;
@@ -5381,6 +5423,11 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         ),
         (cfg.strict_settle, "I4", &found.i4),
         (cfg.strict_settle, "I4", &found.unjournaled_landed),
+        (
+            cfg.strict_unsettled,
+            "I4 (unsettled EIO of a requester that was not isolated)",
+            &unsettled_violations,
+        ),
         (cfg.strict_lone || cfg.strict_durability, "I5", &found.i5),
         (cfg.strict_lone_lead, "lone lead", &lone_lead_examples),
         // Last: a seed that also fails another check reports that one, so

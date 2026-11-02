@@ -95,6 +95,9 @@ pub struct Bus {
     /// Plan 43 C7-F F-c (`SimConfig::lock_mirror_drop`): the probability
     /// that a `LockMirror` is lost, whatever the link.
     mirror_drop: Mutex<(f64, Option<tokio::time::Instant>)>,
+    /// Plan 46 M0.3: where partitions and the attach and detach of nodes
+    /// are recorded (`SimConfig` runs set it; a bare bus records nothing).
+    reach: Mutex<Option<Arc<super::reach::Reach>>>,
 }
 
 /// M7: the stream faults (probabilities per frame).
@@ -140,7 +143,17 @@ impl Bus {
             rtts: Mutex::new(HashMap::new()),
             beats_lost: std::sync::atomic::AtomicBool::new(false),
             mirror_drop: Mutex::new((0.0, None)),
+            reach: Mutex::new(None),
         })
+    }
+
+    /// Record the links and the attached nodes in `reach` from now on.
+    pub fn set_reach(&self, reach: Arc<super::reach::Reach>) {
+        *self.reach.lock().unwrap() = Some(reach);
+    }
+
+    fn reach(&self) -> Option<Arc<super::reach::Reach>> {
+        self.reach.lock().unwrap().clone()
     }
 
     /// Lock mirrors are lost with probability `p` from `from_ms` after now
@@ -197,6 +210,9 @@ impl Bus {
     pub fn attach(&self, node: NodeId, tx: mpsc::UnboundedSender<Event>) {
         self.senders.lock().unwrap().insert(node, tx);
         self.dead.lock().unwrap().remove(&node);
+        if let Some(r) = self.reach() {
+            r.attached(node, true);
+        }
     }
 
     /// Replace `node`'s tap (see [`Bus::taps`]).
@@ -207,10 +223,16 @@ impl Bus {
     pub fn detach(&self, node: NodeId) {
         self.senders.lock().unwrap().remove(&node);
         self.dead.lock().unwrap().insert(node);
+        if let Some(r) = self.reach() {
+            r.attached(node, false);
+        }
     }
 
     /// Cut (or heal) both directions between `a` and `b`.
     pub fn set_partition(&self, a: NodeId, b: NodeId, cut: bool) {
+        if let Some(r) = self.reach() {
+            r.partition(a, b, cut);
+        }
         let mut p = self.partitions.lock().unwrap();
         if cut {
             p.insert((a, b));
