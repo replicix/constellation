@@ -932,7 +932,18 @@ impl LeaseState {
             // holder's window did not move) and must not set the body back:
             // the newer backup set, and its tag, stand (`on_takeover_get`
             // ignores such a read for the backup role likewise).
-            Some(o) if o.key == key && lease.config_version < o.body.config_version => false,
+            //
+            // An older epoch is the same case with another key: a read
+            // served before a successor's acquisition (or reconfiguration)
+            // landed and delivered after one of its beats or appends told
+            // this node the newer pair. It must not replace the newer
+            // observation and restart its `since` either (which feeds the
+            // backup watch's `known_end`); liveness only.
+            Some(o)
+                if (lease.epoch, lease.config_version) < (o.body.epoch, o.body.config_version) =>
+            {
+                false
+            }
             Some(o) if o.key == key => {
                 o.body = lease.clone();
                 o.tag = tag;

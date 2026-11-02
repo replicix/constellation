@@ -44555,6 +44555,40 @@ mod c1_counted {
 
     }
 
+    /// The observation (`LeaseState::observe`) is set back by no older
+    /// read either: one of an older epoch has another renewal key, and
+    /// replaced the newer body and restarted its `since`, which feeds the
+    /// backup watch's `known_end`. Liveness only. Fails on the parent.
+    #[test]
+    fn a_stale_read_of_an_older_epoch_does_not_set_back_the_observation() {
+        let (mut h, read) = backup_of_a_newer_epoch_with_a_read_in_flight();
+        let mut newer = root_lease(3, 2, h.now.plus(50_000));
+        newer.config_version = 2;
+        newer.backups = vec![2];
+        newer.ack_policy = constellation_store_s3::AckPolicy::Backup;
+        let seen_at = h.clk();
+        h.core.lease.observe(seen_at, Some(&(newer.clone(), tag())));
+        h.advance(100);
+        let mut before = root_lease(1, 1, h.now.plus(50_000));
+        before.config_version = 1;
+        answer_job_read(&mut h, &read, before);
+        let o = h.core.lease.obs.as_ref().expect("observed");
+        assert_eq!(o.since, seen_at.wait, "the observation restarted");
+        assert_eq!(o.body.epoch, 2, "the observation went back an epoch");
+        assert_eq!(o.body.holder, 3);
+        // A read of a later pair does replace it.
+        h.advance(100);
+        let mut later = newer.clone();
+        later.config_version = 3;
+        assert!(!h.core.lease.observe(h.clk(), Some(&(later, tag()))));
+        assert_eq!(h.core.lease.obs.as_ref().unwrap().body.config_version, 3);
+        let mut next_epoch = newer.clone();
+        next_epoch.epoch = 3;
+        next_epoch.config_version = 1;
+        assert!(h.core.lease.observe(h.clk(), Some(&(next_epoch, tag()))));
+        assert_eq!(h.core.lease.obs.as_ref().unwrap().body.epoch, 3);
+    }
+
     /// A backup that restarts restores its role with its version (written
     /// on every raise), and its restart probe is issued after the restart:
     /// the lease it reads is never older than that role, so the stale-read
