@@ -1244,6 +1244,7 @@ impl Meta {
             &|_| false,
             &|_| Vec::new(),
             &LiveSessions::default(),
+            true,
         )
     }
 
@@ -1266,6 +1267,7 @@ impl Meta {
             &|_| false,
             &|_| Vec::new(),
             &LiveSessions::default(),
+            true,
         )
     }
 
@@ -1295,6 +1297,7 @@ impl Meta {
         unanswered: &dyn Fn(crate::rid::Rid) -> bool,
         live_ops: &dyn Fn(&ChunkHash) -> Vec<crate::rid::Rid>,
         sessions: &LiveSessions,
+        exclude_rolled_back: bool,
     ) -> Result<DroppedHeld, MetaError> {
         // The `Refused` records the drop journals are answered by the log
         // alone — nobody is told of them, and a retry meets the record —
@@ -1542,7 +1545,9 @@ impl Meta {
             // chunk: its row and marks stay. (An op this drop rolled back
             // is not in flight any more: its row is a seed, refused above.)
             let mut live = live_ops(hash);
-            live.retain(|rid| !rolled_back.contains(rid));
+            if exclude_rolled_back {
+                live.retain(|rid| !rolled_back.contains(rid));
+            }
             if !live.is_empty() || sessions.names(hash) {
                 kept_pending.push(*hash);
                 kept_for.extend(live);

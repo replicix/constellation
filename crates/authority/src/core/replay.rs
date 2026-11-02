@@ -675,6 +675,10 @@ impl Core {
     ) {
         let unanswered = |rid: Rid| self.answer_parked(rid).is_some();
         let live = self.ops_naming_manifests_of(ino);
+        // An op this drop rolls back keeps nothing held only while this node
+        // stays the sequencer (its retry meets the shipped refusal): a
+        // deposed dropper's refusals are fenced (`drop_held_knowing`).
+        let sequencer = self.lease.epoch_held() || self.lease.ship_epoch(now, &self.cfg).is_some();
         let live_ops = |hash: &constellation_fs_core::ChunkHash| -> Vec<Rid> {
             live.iter()
                 .filter(|(_, manifest)| constellation_meta::manifest_names(manifest, hash))
@@ -688,6 +692,7 @@ impl Core {
             &unanswered,
             &live_ops,
             &sessions,
+            sequencer,
         );
         match dropped {
             Ok(dropped) => {

@@ -1270,6 +1270,7 @@ fn a_drop_keeps_the_pending_row_of_a_lost_chunk_a_live_op_names() {
             &|_| false,
             &|h| if *h == lost { vec![live] } else { Vec::new() },
             &constellation_meta::LiveSessions::default(),
+            true,
         )
         .unwrap();
     assert_eq!(dropped.dropped, 0);
@@ -1302,6 +1303,7 @@ fn a_drop_removes_the_row_of_a_lost_chunk_no_op_names() {
             &|_| false,
             &|_| Vec::new(),
             &constellation_meta::LiveSessions::default(),
+            true,
         )
         .unwrap();
     assert_eq!(dropped.pending_removed, 1);
@@ -1328,7 +1330,7 @@ fn a_drop_keeps_the_pending_row_of_a_chunk_a_write_session_names() {
     ] {
         let (meta, file, lost) = lost_chunk_before_its_manifest();
         let dropped = meta
-            .drop_held_knowing(file, 1, false, &|_| false, &|_| Vec::new(), &sessions)
+            .drop_held_knowing(file, 1, false, &|_| false, &|_| Vec::new(), &sessions, true)
             .unwrap();
         assert_eq!(dropped.pending_removed, 0, "{dropped:?}");
         assert_eq!(dropped.kept_pending, vec![lost]);
@@ -1377,9 +1379,58 @@ fn an_op_the_drop_rolled_back_does_not_keep_its_chunk() {
             &|_| false,
             &|_| vec![seed],
             &constellation_meta::LiveSessions::default(),
+            true,
         )
         .unwrap();
     assert_eq!(dropped.rolled_back, vec![seed], "{dropped:?}");
     assert!(dropped.kept_pending.is_empty(), "{dropped:?}");
     assert_eq!(dropped.pending_removed, 1);
+}
+
+/// The exclusion of the ops the drop rolled back holds only while the node
+/// stays the sequencer. A deposed dropper's refusals are fenced, and the
+/// op's retry by rid reaches a successor with no outcome of it: the op keeps
+/// its chunk held like any other (`exclude_rolled_back: false`).
+#[test]
+fn an_op_the_drop_rolled_back_keeps_its_chunk_when_the_refusal_will_not_ship() {
+    use constellation_meta::RowClass::Lone;
+    for (exclude, kept) in [(true, false), (false, true)] {
+        let meta = Meta::open_in_memory().unwrap();
+        meta.set_node_prefix(1).unwrap();
+        meta.set_holder_epoch(1);
+        let lost = ChunkHash::of(b"bytes that are gone");
+        let file = meta.create(ROOT_INO, "file", 0o644, 0, 0).unwrap().ino;
+        let rows = batch(&meta);
+        ship(&meta, &rows, 1);
+        meta.add_pending_upload(&lost, file).unwrap();
+        let seed = rid_of(1, 9);
+        exec_as(
+            &meta,
+            Lone,
+            seed,
+            &MutateOp::SetManifest {
+                ino: file,
+                base_manifest: None,
+                manifest: manifest_naming(lost, 19),
+                size: 19,
+                mtime_ns: None,
+                ctime_ns: None,
+            },
+        );
+        meta.note_unrecoverable_chunks(&[(lost, file)], true)
+            .unwrap();
+        let dropped = meta
+            .drop_held_knowing(
+                file,
+                1,
+                false,
+                &|_| false,
+                &|_| vec![seed],
+                &constellation_meta::LiveSessions::default(),
+                exclude,
+            )
+            .unwrap();
+        assert_eq!(dropped.rolled_back, vec![seed]);
+        assert_eq!(!dropped.kept_pending.is_empty(), kept, "{dropped:?}");
+    }
 }

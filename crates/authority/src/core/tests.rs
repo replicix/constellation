@@ -50293,6 +50293,69 @@ mod await_retry {
         ))));
     }
 
+    /// Defect A, the exclusion of an op the drop rolled back: it keeps its
+    /// lost chunk held unless this node stays the sequencer (its retry then
+    /// meets the shipped refusal). On a deposed dropper the refusal is fenced
+    /// and the retry reaches a successor with no outcome of the rid: the chunk
+    /// stays held for the op.
+    #[test]
+    fn an_op_the_drop_rolled_back_on_a_deposed_dropper_keeps_its_chunk_held() {
+        for deposed in [false, true] {
+            // A backed holder: an own manifest op executes and its answer
+            // waits for the group, so the client entry stays in flight.
+            let (mut h, _broken) = backed_holder_with_a_seed(0);
+            let file = h.meta.create(ROOT_INO, "late", 0o644, 0, 0).unwrap().ino;
+            let lost = ChunkHash::of(b"another lost chunk");
+            let manifest = Manifest {
+                layout: ChunkLayout::new(4096),
+                file_len: 19,
+                chunks: ChunkInfo::Inline([(0u64, lost)].into_iter().collect()),
+            }
+            .encode();
+            h.meta.add_pending_upload(&lost, file).unwrap();
+            h.meta
+                .note_unrecoverable_chunks(&[(lost, file)], false)
+                .unwrap();
+            let rid = h.rid(5);
+            let out = h.step(Event::Submit {
+                policy: Policy::Client,
+                rid,
+                op: MutateOp::SetManifest {
+                    ino: file,
+                    base_manifest: None,
+                    manifest,
+                    size: 19,
+                    mtime_ns: None,
+                    ctime_ns: None,
+                },
+                tag: Default::default(),
+            });
+            assert!(replies(&out).is_empty(), "answer parked for the group");
+            assert!(h.core.clients().any(|(r, _)| r == rid), "in flight");
+            if deposed {
+                h.core.lease.held = None;
+                h.core.lease.cached_holder = Some(2);
+            }
+            let out = drop_held_via_core(&mut h, file);
+            let dropped = out
+                .iter()
+                .find_map(|a| match a {
+                    Action::ControlDone {
+                        result: Ok(ControlOk::DroppedHeld(d)),
+                        ..
+                    } => Some(d.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{out:?}"));
+            assert!(dropped.rolled_back.contains(&rid), "{dropped:?}");
+            assert_eq!(
+                !dropped.kept_pending.is_empty(),
+                deposed,
+                "deposed {deposed}: {dropped:?}"
+            );
+        }
+    }
+
     /// A manifest op of this node that has not executed yet (forwarded to
     /// the holder, and not answered), naming a chunk the upload pass lost.
     fn node_with_a_manifest_in_flight() -> (Harness, Ino, ChunkHash, Rid, Vec<u8>, OpId) {

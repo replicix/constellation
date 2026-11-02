@@ -214,6 +214,7 @@ pub trait Replica {
     /// `unanswered(rid)`: the core knows the answer of `rid` has not left;
     /// `live_ops(hash)`: the ops in flight here whose manifest of `ino`
     /// names `hash`; `sessions`: what the engine's write sessions name.
+    #[allow(clippy::too_many_arguments)]
     fn drop_held(
         &self,
         ino: Ino,
@@ -222,6 +223,7 @@ pub trait Replica {
         unanswered: &dyn Fn(Rid) -> bool,
         live_ops: &dyn Fn(&constellation_fs_core::ChunkHash) -> Vec<Rid>,
         sessions: &constellation_meta::LiveSessions,
+        exclude_rolled_back: bool,
     ) -> Result<constellation_meta::DroppedHeld, MetaError>;
     /// The replay queue decoded once per generation of the queue, with
     /// each entry's keys (`Meta::queue_snapshot`): what the park rules ask.
@@ -1013,8 +1015,18 @@ impl Replica for Meta {
         unanswered: &dyn Fn(Rid) -> bool,
         live_ops: &dyn Fn(&constellation_fs_core::ChunkHash) -> Vec<Rid>,
         sessions: &constellation_meta::LiveSessions,
+        exclude_rolled_back: bool,
     ) -> Result<constellation_meta::DroppedHeld, MetaError> {
-        Meta::drop_held_knowing(self, ino, now_unix, remote, unanswered, live_ops, sessions)
+        Meta::drop_held_knowing(
+            self,
+            ino,
+            now_unix,
+            remote,
+            unanswered,
+            live_ops,
+            sessions,
+            exclude_rolled_back,
+        )
     }
 
     fn pending_replays(&self) -> Result<Vec<StrandedOp>, MetaError> {
