@@ -846,6 +846,18 @@ fn apply_one(
             designated,
             range,
         } => {
+            // A generation number is unique in the log, so a grant of `gen`
+            // is preceded by no end of it there: a void on it here is one a
+            // deposed root's own journaled end left (`void_stream` when the
+            // `RecallCut` was journaled), whose row never reached the log
+            // with the grant before it. The successor reused the number the
+            // log never named. Left voided, the new generation's rows would
+            // drop out of this node's `deps` (placement-hot seed 6239: its
+            // own row, and the root executed its next write ahead of it).
+            // Lifting a void satisfies no wait; it can only make one.
+            if meta.session().is_voided(*gen) {
+                meta.session().unvoid(*gen);
+            }
             let mut table = crate::delegation::read_table_tx(tx, meta)?;
             table.apply(crate::delegation::DelegationRecord::Delegate {
                 dir: *dir,

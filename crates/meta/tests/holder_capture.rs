@@ -2060,3 +2060,69 @@ fn a_delegates_stream_reads_take_the_rows_asked_for_not_the_whole_stream() {
         "{calls} rounds of stream reads read {read} rows of a {n}-row stream"
     );
 }
+
+/// placement-hot seed 6239 (lease reads 0:0:800:1000): a root grants a
+/// generation and journals its end, and both rows leave the journal
+/// unshipped when it is deposed (the rebuild drops them). The log never
+/// named the generation, so the successor grants the same number afresh,
+/// here to this node. The void the deposed root's own end left in its
+/// session must not outlive that end: this node's dependency on its own row
+/// of the new generation was dropped from its next write's `deps`, the root
+/// executed that write at once, ahead of the row, and the log broke the
+/// node's program order. Fails before the fix: the generation stays voided
+/// and the `deps` carry no index of it.
+#[test]
+fn a_reused_generation_number_drops_the_void_a_deposed_roots_unshipped_end_left() {
+    let gen = 18;
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    meta.apply_records_journaled(&[LogRecord::Delegate {
+        dir: ROOT_INO,
+        node: 4,
+        gen,
+        designated: false,
+        range: (0, 0),
+    }])
+    .unwrap();
+    meta.apply_records_journaled(&[LogRecord::RecallCut {
+        dir: ROOT_INO,
+        gen,
+        through: 0,
+    }])
+    .unwrap();
+    // As `Core` voids it once the end is journaled (`delegate.rs`).
+    meta.session().void_stream(gen, 0);
+    meta.session().note_void_cut(gen, 0);
+    // Deposed: the rebuild drops both unshipped rows.
+    meta.set_holder_epoch(0);
+    meta.replace_ns_from_rebuilt(&Meta::open_in_memory().unwrap(), &Default::default())
+        .unwrap();
+    assert_eq!(meta.journal_len().unwrap(), 0);
+    // The successor's grant of the same number, to this node, from the log.
+    meta.apply_segment(
+        1,
+        2,
+        &[LogRecord::Delegate {
+            dir: ROOT_INO,
+            node: 1,
+            gen,
+            designated: false,
+            range: (0, 0),
+        }],
+        &TouchSet::default(),
+    )
+    .unwrap();
+    // This node executes its own op in it (row 1, not appended yet).
+    meta.session().note_stream(gen, 1);
+    let session = meta.session();
+    assert!(
+        !session.is_voided(gen),
+        "the log's grant is a live generation"
+    );
+    let deps = session.deps().expect("fits");
+    assert_eq!(
+        deps.streams.get(gen),
+        Some(1),
+        "the next write depends on this node's own row of the new generation"
+    );
+}
