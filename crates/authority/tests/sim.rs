@@ -5351,13 +5351,15 @@ fn a_delegating_root_cut_from_s3_forms_no_epoch_and_fails_over() {
     // attempts a settle window before the old deadline: in 1602 and 1608 an
     // op of the sealing backup's own client is answered at that deadline from
     // the tail it re-shipped, 8.4 s after the crash and before the floor — no
-    // failover's answer; 1614 and 1615 take their places.)
+    // failover's answer; 1614 and 1615 take their places. 1614, whose first
+    // mutation after the crash came 1.16 s in once i1-592's lone test moved the
+    // schedules, leaves; 1616 and 1617 join.)
     for seed in (1600..1602)
         .chain(1603..1604)
         .chain(1605..1608)
         .chain(1609..1610)
         .chain(1611..1613)
-        .chain(1614..1616)
+        .chain(1615..1618)
     {
         let report = run_seed(seed, delegated_holder_cut_config()).unwrap_or_else(|e| {
             panic!(
@@ -11731,7 +11733,8 @@ fn a_second_seal_after_the_grace_arms_no_second_floor() {
 /// t = 3.1 to 3.2 s inside the first failover's floor, none with the real
 /// cap, and three are pinned; with plan 41's lock lane 194557 no longer
 /// fails, the other five do, at t = 3.1 to 3.2 s, and 199719 takes its
-/// pin.) The
+/// pin; the lone-test change of i1-592 moved the trajectories again: 195424,
+/// 199719 and 202419 are pinned, 195339 and 202316 no longer fail.) The
 /// real cap is not clean over every range: it violates at the *second*
 /// failover (about 15 s, a clock beyond the envelope), a different and
 /// older failure (fixed by plan 43 C7b's observation rule:
@@ -11741,7 +11744,7 @@ fn a_second_seal_after_the_grace_arms_no_second_floor() {
 #[test]
 fn a_credited_arrival_cap_splits() {
     use pinned::run_seed;
-    for seed in [195_339, 199_719, 202_316] {
+    for seed in [195_424, 199_719, 202_419] {
         let e = run_seed(seed, fast_takeover_skewed_successor_credited_config())
             .expect_err("a cap counted from the credit never failed: no control");
         assert!(e.contains("mutual exclusion violated"), "seed {seed}: {e}");
@@ -12153,11 +12156,12 @@ fn a_locker_keeps_its_grant_across_a_seal_and_a_forward_step() {
 /// exclusion — in 8 of the first 500 seeds, which were pinned (19 since plan
 /// 43 C1-1's listed-acknowledgement count, 28 later; 27 once blocking lock
 /// requests queue behind older waiters, which moved 203 to no violation: 34,
-/// 76, 98, 106, 113, 202, 318 and 336 are pinned).
+/// 76, 98, 106, 113, 202, 318 and 336 were pinned; i1-592's lone test moved
+/// 76, 98, 113 and 318 to no violation: 12, 18, 20 and 43 took their places).
 #[test]
 fn a_late_renewal_against_a_stale_mirror_is_refused_and_the_naive_successor_violates() {
     use pinned::run_seed;
-    for seed in [34u64, 76, 98, 106, 113, 202, 318, 336] {
+    for seed in [12u64, 18, 20, 34, 43, 106, 202, 336] {
         run_seed(seed, locks_late_stale_mirror_config())
             .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         let e = run_seed(seed, locks_late_stale_mirror_naive_config())
@@ -13016,10 +13020,11 @@ fn a_backed_lock_root_stuck_in_a_step_keeps_its_own_grants() {
 /// stops (`locks-core-stall-backup-long`, clean). A probe that counts
 /// whatever it reads as a proof renews the root's own grants through the
 /// successor's grace, and the mutual-exclusion ghost catches it (seeds 21 and
-/// 79 of 0 to 100: two nodes in I/O under conflicting locks).
+/// 79 of 0 to 100; i1-592 moved 79, and 21, 236 and 277 of 0 to 300 are
+/// pinned: two nodes in I/O under conflicting locks).
 #[test]
 fn a_probe_that_ignores_what_it_reads_is_caught() {
-    for seed in [21u64, 79] {
+    for seed in [21u64, 236, 277] {
         run_seed(seed, locks_core_stall_backup_long_config())
             .unwrap_or_else(|e| panic!("locks-core-stall-backup-long seed {seed}: {e}"));
         let e = run_seed(seed, locks_core_stall_backup_long_blind_config())
@@ -13043,12 +13048,13 @@ fn a_probe_that_ignores_what_it_reads_is_caught() {
 /// moved the schedules; 28, 54, 609 and 828 before the lock-liveness fixes moved
 /// the schedules; 40, 78 and 80 among them earlier, with one read per
 /// window: overlapping reads see a successor's CAS sooner, and the epoch's
-/// answers end there, mutant or not.) (Mutual exclusion does not fail with the mutant, even in
+/// answers end there, mutant or not; 373 and 828 again before i1-592's lone
+/// test moved them: 54 too; 193, 247, 277 and 871 are pinned.) (Mutual exclusion does not fail with the mutant, even in
 /// 22,000 seeds: the successor's floor and the grant caps carry `3 x expiry
 /// margin` beyond the window.)
 #[test]
 fn a_proof_dated_at_the_return_of_the_read_is_caught() {
-    for seed in [54u64, 247, 373, 828] {
+    for seed in [193u64, 247, 277, 871] {
         run_seed(seed, locks_core_stall_backup_long_slow_reads_config())
             .unwrap_or_else(|e| panic!("locks-core-stall-backup-long-slow-reads seed {seed}: {e}"));
         let e = run_seed(seed, locks_core_stall_backup_long_dated_at_return_config())
@@ -15086,8 +15092,10 @@ const I1_LONG_DELEGATED: &[u64] = &[0, 1, 2];
 /// `backup-crash`: `identity_copies`.
 /// (815 and 892, whose trajectories plan 43 C1-1's listed-acknowledgement count
 /// shifted to no copy, gave their places to 927 and 1044: 4 copies each,
-/// `+identity` fails with I2.)
-const I2_BACKUP_CRASH: &[u64] = &[858, 889, 927, 1044];
+/// `+identity` fails with I2. 858, whose rows journaled gated in a takeover's
+/// gate drain, deposed at once, stay a member copy no archive carries
+/// (`member_copies_drained`, i1-592; a finding, see PROGRESS), leaves.)
+const I2_BACKUP_CRASH: &[u64] = &[889, 927, 1044];
 /// `delegated-holder-cut`: `identity_copies`.
 /// (22, whose trajectory plan 43 C7-F F-a0's live-delegation mark shifted to
 /// no copy, gave its place to 3: 3 copies, `+identity` fails with I2. 4, whose
@@ -15129,9 +15137,10 @@ const I4_SEEDS: &[I4Seeds] = &[(
     // (The root probe's overlapping reads and the own lapses the driver now
     // hands the core moved 44: 75 is one of the 19 seeds of 0 to 300 with a
     // late landing now, unclocked, 2 of them; `+settle` fails with I4.)
+    // (I1's lone test, i1-592, moved 75 to no settle: 76 takes its place.)
     // (Plan 43 C3's re-ship of a delegate's rows moved 58: 98 is one of the
     // 18 seeds of 0 to 300 that fail `+settle` with I4 now, unclocked.)
-    &[31, 75, 98],
+    &[31, 76, 98],
 )];
 
 /// Plan 45 follow-up: hard links (`NsOp::Link`) and exchanges
