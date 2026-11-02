@@ -34429,6 +34429,32 @@ fn a_gated_root_leaves_a_renewal_unanswered() {
     }
 }
 
+/// Plan 46 M0.3 (S2): a gated root that is releasing its lease will never be
+/// the root, so a renewal reaching it is refused (`ttl_ms` 0) as for any
+/// root that decided the generation ends, not left unanswered for a gate
+/// that opens for nobody. Fails if the S2 branch ignores `releasing`.
+#[test]
+fn a_releasing_gated_root_still_refuses_a_renewal() {
+    let mut h = Harness::new(1);
+    h.core.cfg.delegation = true;
+    h.hold(
+        2,
+        Some(PendingGate {
+            epoch: 2,
+            takeover: true,
+            marker_shipped: true,
+            drained: false,
+            fast_prev: false,
+            backup_tail_epoch: None,
+            shippable: true,
+        }),
+    );
+    h.core.lease.releasing = true;
+    let out = h.step(deleg_renew_from(2, 79));
+    assert_eq!(deleg_renewed_ttls(&out), vec![0], "{out:?}");
+    assert_eq!(h.core.stats.deleg_renewals_refused, 1);
+}
+
 /// A lock request for an undelegated inode from `from`.
 fn lock_request_from(from: NodeId, req: u64, honour: HonourMs) -> Event {
     Event::Peer {

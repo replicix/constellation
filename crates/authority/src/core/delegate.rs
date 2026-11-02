@@ -4780,7 +4780,11 @@ impl Core {
                 "delegation renewal left unanswered: this node may be the root again"
             );
             return;
-        } else if self.lease.held.is_some() && !self.lease.lost && self.lease.gate.is_some() {
+        } else if self.lease.held.is_some()
+            && !self.lease.lost
+            && !self.lease.releasing
+            && self.lease.gate.is_some()
+        {
             // Plan 46 M0.3 (S2): the takeover gate is pending, and this node
             // is the root as soon as it opens. A refusal (`ttl_ms` 0) stops
             // the generation at its delegate for good (`deleg_renewal_
@@ -4791,7 +4795,7 @@ impl Core {
             // grants it, or the delegate lapses (`on_deleg_lapse`), which is
             // always safe. A refusal is for a root that decided the
             // generation ends: one that recalls it, or whose lease is lost
-            // or released.
+            // or released (a releasing gated root will never be the root).
             tracing::debug!(
                 node = self.me(),
                 from,
