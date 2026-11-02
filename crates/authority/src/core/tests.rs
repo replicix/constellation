@@ -34360,6 +34360,63 @@ fn a_delegation_renewal_to_a_restarted_root_readopts_its_own_lease() {
     assert_eq!(h.core.job(), Some(JobKind::Acquire));
 }
 
+/// A delegate's stream batch reaching a restarted root that the lease
+/// object still names (`delegated-no-backup-root-near` seed 789 once the
+/// root acknowledges only committed rows: the rebooted root refused every
+/// batch for 538 s, nothing asked it to re-adopt the lease; only a forward
+/// or a renewal did). The batch is refused, as before, and starts the
+/// re-adoption; a later batch is answered by the root it became. A lease
+/// that names another node, or that this node released, refuses it without
+/// one. Fails before: refused, no acquisition.
+#[test]
+fn a_delegate_stream_to_a_restarted_root_readopts_its_own_lease() {
+    let batch = |req: u64| Event::Peer {
+        from: 2,
+        msg: PeerMsg::DelegateStream {
+            req: OpId(req),
+            gen: 7,
+            round: 1,
+            txs: Vec::new(),
+            leaving: Vec::new(),
+            leaving_barriers: Vec::new(),
+        },
+    };
+    let refused = |out: &[Action]| {
+        sends(out).iter().any(|(to, m)| {
+            *to == 2 && matches!(m, PeerMsg::DelegateStreamAck { refused: true, .. })
+        })
+    };
+    let mut h = Harness::new(1);
+    h.core.cfg.delegation = true;
+    h.core
+        .lease
+        .note_object(&lease_of(1, 3, h.now.plus(30_000).0));
+    let out = h.step(batch(77));
+    assert!(refused(&out), "{out:?}");
+    assert_eq!(h.core.job(), Some(JobKind::Acquire), "not re-adopting");
+    // A re-sent batch meanwhile: refused again, no second acquisition.
+    let out = h.step(batch(78));
+    assert!(refused(&out), "{out:?}");
+    assert!(s3_ops(&out)
+        .iter()
+        .all(|(_, r)| !matches!(r, S3Op::LeaseGet)));
+    assert_eq!(h.core.job(), Some(JobKind::Acquire));
+    for theirs in [
+        lease_of(3, 4, h.now.plus(30_000).0),
+        Lease {
+            released: true,
+            ..lease_of(1, 3, h.now.plus(30_000).0)
+        },
+    ] {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.lease.note_object(&theirs);
+        let out = h.step(batch(79));
+        assert!(refused(&out), "{theirs:?}: {out:?}");
+        assert_ne!(h.core.job(), Some(JobKind::Acquire), "{theirs:?}");
+    }
+}
+
 /// ... and one that has not read the lease since it started reads it and
 /// leaves the renewal for the next; a lease that names another node, or
 /// that this node released, refuses it as before.

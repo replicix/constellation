@@ -6978,6 +6978,19 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         let usable = self.root_ends_recall(now, gen) && self.cfg.delegation;
+        // A root back from a restart that the lease object still names, and
+        // that holds nothing yet (a restart with nothing of its own to ship
+        // does not acquire on its own), refuses its delegate's batches for as
+        // long as nobody asks it to be the root: the delegate backs off and
+        // re-sends, the forwards that would re-adopt it go to the delegate
+        // instead (`delegated-no-backup-root-near` seed 789: no root for
+        // 538 s). As for a forward and a renewal, the batch re-adopts the
+        // lease (`readopt_own_lease_for_forward` checks that it still names
+        // this node); this one is refused, and the delegate's next re-send is
+        // answered by the root it re-adopted.
+        if !usable && self.cfg.delegation {
+            self.readopt_own_lease_for_forward(now, replica, out);
+        }
         let refuse = |out: &mut Vec<Action>, through: u64| {
             out.push(Action::Send {
                 to: from,
