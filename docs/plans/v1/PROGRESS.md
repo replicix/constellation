@@ -64386,13 +64386,21 @@ fixed; the spec is the gate-before-stage-1 list of plan 46 M0.3. S4 (the recall'
    was live and the delegate connected, and held the delegate's own op whatever its state. A generation the root has begun
    to recall has a stopped delegate, which answers `NotHolder` back; a delegate forwarding its own op long after the grant
    has disowned the generation the same way (`long-delegated` 178: gen 8 granted at 10.868 s and recalled at 10.892 s, node
-   3's settle bounced 1 to 2 from 10.87 to 13.87 s). The redirect skips a generation under recall, so the op or its settle
-   parks behind the recall (`deleg_recall_plan`); a delegate's own op is held only while its grant may still be in flight
-   (this tenure granted it, the delegate not heard from, `GRANT_IN_FLIGHT_MS` = 1 s), otherwise the root recalls and parks.
-   An inherited generation counts as disowned (`GenState::inherited`); a designation is never recalled, its designee's op is
-   held as before. Fail-before: `a_root_recalls_a_generation_whose_delegate_forwards_its_own_op`,
-   `a_root_parks_a_forward_behind_its_own_recall_instead_of_redirecting`, `a_silent_or_inherited_generation_is_recalled_for_its_delegates_own_op`;
-   the controls `a_fresh_grant_still_holds_its_delegates_own_op`, `a_designees_own_op_is_still_held`.
+   3's settle bounced 1 to 2 from 10.87 to 13.87 s). A *settle* is not redirected to a generation under recall, so it parks
+   behind the recall (`deleg_recall_plan`; a settle executes nothing, so parked it can make no second copy). An execution is
+   still redirected (parked at the root it would be a second executable copy beside the requester's own parked one at the
+   delegate), and a designation is never skipped: `deleg_recall_plan` refuses a designation that `online` recalls with
+   `EROFS`, the designee's own op included, so the redirect (`NotHolder`, the designee's op `Held`) stays as it was. A
+   delegate's own op is held only while its grant may still be in flight (this tenure granted it, the delegate not heard
+   from, `Core::grant_in_flight_ms` = two stream ticks plus two request timeouts, 1.1 s by default; the product has no
+   bound on an answer's delivery, a later grant is taken as disowned and its generation recalled, which is safe), otherwise
+   the root recalls and parks. An inherited generation counts as disowned (`GenState::inherited`); a designation is never
+   disowned, its designee's op is held as before. Fail-before: `a_root_recalls_a_generation_whose_delegate_forwards_its_own_op`,
+   `a_root_parks_a_settle_behind_its_own_recall_instead_of_redirecting`, `a_silent_or_inherited_generation_is_recalled_for_its_delegates_own_op`,
+   `the_grant_in_flight_window_follows_the_config`, `a_designation_under_recall_is_not_refused` (fails with the recall skip
+   unlimited: `EROFS` three times); the controls `a_fresh_grant_still_holds_its_delegates_own_op`, `a_designees_own_op_is_still_held`,
+   `a_root_still_redirects_an_execution_to_a_generation_it_recalls`. S2's refusal stays for a gated root that is releasing its
+   lease: `a_releasing_gated_root_still_refuses_a_renewal`.
 4. **Pins.** `settle_before_eio_a_gate_a_renewal_and_a_redirect_loop_leave_no_unsettled_eio` (sim, on main's counter
    `client_unsettled_eio`, which the classifier's exception for an isolated requester does not enter; none of these seeds is
    one): 11 seeds of 7 configurations answer 1 or 2 unsettled `EIO`s on the parent and none now. And
@@ -64429,41 +64437,70 @@ another pin: 1 and 23 stay S5 samples.)
 Main 476f0cc8 with C2h's sim commits, against the same with the three fixes. 2,000 seeds per configuration, with and
 without `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`.
 
-*Plain.* No failing seed on either side, unless noted: `backup-strict`, `tloss-two-node`, `delegated-holder-cut`,
-`long-delegated-backup`, `long-delegated`, `delegated-backup`, `backup`, `backup-crash`, `flex`, `flex-crash`; `delegated-group-switch`
-fails 7 (11 with the knob) on main and 5 (5) on the fix, all I1 (`deleg-group`, dga's class). The fix adds failing seeds in
-two configurations: `long-delegated-late-answers` 952 (no knob), 1324, 1477 and 1495 (knob), `[directory]` and commit-prefix
-history failures, and `placement-hot` 655 (knob), `I2 one_identity_per_op`. All five need S3's recall half (the redirect of an op
-to a recalling generation is a park now); none fails with S1 or S2 alone. They are classes main has at other seeds: over seeds
-2,000 to 10,000 with the knob main fails `long-delegated-late-answers` 5718, 9610, 9955 (two `[directory]`) and `placement-hot` 2177
-(I5) and 8557 (I2 `one_identity_per_op`), the fix 3743 (`[directory]`) and 8748 (commit prefix) and 2177 and 6239 (I2); without the
-knob `long-delegated-late-answers` 4947, 6183 and 7393 (`[directory]`) on main and 4947 on the fix. Seed 952's trace reads: the delegate
-unparks its ops on a late grant (answered 4.63 s) that reaches it after the root's refusal of a later renewal (sent 3.29 s,
-delivered 4.34 s) and streams the rows it then executes to a root that is recalling the generation; the Eexist the history
-check sees has no state that explains it. (Not traced to a root cause: a delegate-side question, not S3's rule.) I1 counters (plain): `delegated-backup`
-2 to 1 (no knob), 0 to 1 (knob); `long-delegated-backup` 7 to 5 and 6 to 7; `long-delegated-late-answers` 3 to 2 and 4 to 2;
-`placement-hot` 9 to 10 and 9 to 9, the one more being a `deleg-group/refused` of a delegate (dga's class). `i4-settled` 0
-everywhere; no run fails for a settled `EIO` that landed.
+*Plain* (the final tree, with the redirect skipped for a settle only; 2,000 seeds per configuration and mode, no knob / knob;
+main = 476f0cc8 with C2h's sim commits). No failing seed on either side: `backup-strict`, `tloss-two-node`,
+`delegated-holder-cut`, `delegated-backup`, `long-delegated-backup`, `long-delegated`, `placement-hot`. `delegated-group-switch`
+fails 7 and 11 on main and 5 and 5 on the fix: the fix's are I1 (`deleg-group`, dga's class, none new), main's extra are I4 late
+landings (615 and 1170; 290, 986, 1058 and 1302 with the knob) that S1 to S3 close. `long-delegated-late-answers` fails 0 / 0 on
+main and 0 / 1 on the fix: seed 1477 with the knob, the only new failing seed. (The first measurement, with the redirect skipped
+for every forward, added five: `long-delegated-late-answers` 952, 1324, 1477, 1495 and `placement-hot` 655; four of them pass
+once an execution is redirected again, and that variant answered a designation under recall `EROFS`. Not repeated here: `backup`,
+`backup-crash`, `flex`, `flex-crash`, measured then with no failing seed.)
 
-*`+commit+settle`* (failing seeds, main to fix, no knob / knob): `backup-strict` 0 to 0 / 4 to 2; `delegated-group-switch` 7 to 5 /
+1477 is not caused by S3. It is a latent integrity bug of a node that was a delegate, which main shows at other seeds (**L1**),
+and it is a separate fix item. When one applied foreign segment carries the node's own rows of an ended generation (retired in
+that apply), the generation's `RecallCut` and a later root row on the same key (an unlink, or a rename over it), the node's
+replica keeps the effect of its own row: it then serves, executes against and commits a state the log removed. In 1477 the
+segment holds the delegate's own `Create f0` of generation 1, the `RecallCut` and the root's `Rename f2 to f0`, and the node's
+commit 6 "is not the log prefix at 25: inode ... only on the left". The same shape is main's seed 6183 (no knob; `Create f3`,
+the `RecallCut`, the root's `Unlink f3`; commit 6 by node 2 "is not the log prefix at 25: inode ... only on the left"). Main's
+7393 (no knob) is the same `[directory]` class (an unlink that took effect where the spec refuses it) and still fails on the fix,
+with 3228 (no knob, an `Eexist` no state explains) and 4125 (knob, a monotonic-reads violation on the stale `d1/f1`) among the
+seeds 2,000 to 10,000. Start at `jobs.rs` (the apply that logs `retired=`) and `meta/src/replay.rs` `apply_foreign` (the
+own-row retire, or the own-row overlay, runs after, or instead of, the root row that follows it in the same segment); a core or
+meta test fits: a delegate executes `Create x` in generation 1, one segment `[own Create x row, RecallCut, root Unlink x]`
+applies, and `lookup(x)` must be `None`. The first measurement's seeds are the same class seen through the history checker:
+`long-delegated-late-answers` 952 (no knob; traced: the delegate's grant renewal arrives 1.75 s late, it executes `Create d1/f1`
+and refuses it `Eexist` citing the inode of an `f1` its replica still holds, which the root unlinked after the `RecallCut` of
+generation 1, in the one segment it applied), 1324 and 1495 (knob). The pin is
+`delegated_settle_findings_l1_replica_divergence_on_a_former_delegate` (sim, ignored).
+
+The other class the first measurement showed is **L2**, I2 on a stranded replay against the requester's re-ask (`placement-hot`
+655 with the knob; main's 8557 with the knob, `one_identity_per_op`): a delegate or the root accepted an op in one epoch, a
+takeover stranded it, the new root queues the stranded row for replay by rid and the requester asks the new holder again (the
+log "moved past the epoch that accepted an op without it"), so that the I2 ledger sees the queued gated copy on one node and the
+executing client on the other. It is plan 46 stage 2's territory (the server-side replay goes away) and is recorded there as the
+known I2 class. No `placement-hot` seed fails it on the final tree (655 and 8557 pass, their schedules having moved), so it has no
+pin here. A third item, **L3** (liveness, for S4): a lost `DelegRecall` is never sent again and a late `ttl 0` refusal is ignored
+by `deleg_late_renewed`, so the root waits out the grant (952: recalled at 2.899 s, the generation never ended before the
+takeover); S4's `DelegCut` should come with a recall resend on the renewal tick.
+
+I1 counters (plain, main to fix; no knob / knob): `delegated-backup` 2 to 1 and 0 to 1; `long-delegated-backup` 7 to 7 and 6 to 4;
+`long-delegated-late-answers` 3 to 2 and 4 to 2; `placement-hot` 9 to 12 and 9 to 8 (the three more are `deleg-group` rows,
+dga's class). `i4-settled` 0 everywhere; no run fails for a settled `EIO` that landed.
+
+*`+commit+settle`* (the first measurement, the redirect skipped for every forward; not repeated; failing seeds, main to fix, no knob / knob): `backup-strict` 0 to 0 / 4 to 2; `delegated-group-switch` 7 to 5 /
 11 to 5; `delegated-holder-cut` 15 to 2 / 59 to 24; `long-delegated-backup` 28 to 13 / 62 to 23; `placement-hot` 12 to 11 /
 13 to 10; `backup`, `backup-crash`, `tloss-two-node` 0 to 0. The failures are I4 (the unsettled `EIO`s, fewer) and I1
 (unchanged to lower except `placement-hot` 7 to 8 without the knob, a `deleg-group` row of seed 1470).
 
 *Unsettled-EIO violations* (`+unsettled`, 1,000 seeds, main to fix; no knob / knob): `backup-strict` 70 to 3 / 123 to 23,
-`tloss-two-node` 28 to 0 / 70 to 0, `delegated-group-switch` 90 to 15 / 293 to 41, `delegated-holder-cut` 483 to 249 / 1,027 to
-498, `delegated-backup` 147 to 86 / 265 to 129, `delegated-no-backup-root-near` 149 to 93 / 262 to 127,
-`long-delegated-late-answers` 696 to 319 / 1,367 to 626, `long-delegated-backup` 497 to 253 / 946 to 452, `placement-hot` 107
-to 27 / 156 to 45, `long-delegated` 6 to 2 / 51 to 40, `delegated-two-gens-root-crash` 5 to 0 / 29 to 5, `flex-crash` 1,989 to 1,988 /
+`tloss-two-node` 28 to 0 / 70 to 0, `delegated-group-switch` 90 to 13 / 293 to 44, `delegated-holder-cut` 483 to 251 / 1,027 to
+501, `delegated-backup` 147 to 89 / 265 to 128, `delegated-no-backup-root-near` 149 to 93 / 267 to 129,
+`long-delegated-late-answers` 696 to 309 / 1,367 to 602, `long-delegated-backup` 497 to 246 / 946 to 439, `placement-hot` 107
+to 26 / 156 to 44, `long-delegated` 6 to 4 / 51 to 37, `delegated-two-gens-root-crash` 5 to 0 / 29 to 5, `flex-crash` 1,989 to 1,988 /
 25 to 25 (cause 6). Seeds fail `+unsettled` on the fix that did not on main (trajectories move, and a settle that a recall holds
 parks now instead of bouncing: `delegated-holder-cut` 13: the root's recall of an inherited generation waits for a delegate's answer
-for 5 s, S4's); the totals fall in every configuration. Only `tloss-two-node` reaches 0 both ways. What remains is S5 (a gate's settle
-on another node's generation), S4, and cause 6.
-`SWEEP-FAILOVER` p50/p90 (plain, main to fix): `backup-strict` 8,181/11,182 to 8,181/11,140 (knob 4,584/13,636 to 4,584/13,059);
-`backup-crash` 1,206/4,186 unchanged (knob 2,990/5,076 unchanged); `long-delegated-backup` 2,956/14,019 to 2,205/13,940 (knob
-2,832/16,472 to 2,871/16,471).
+for 5 s, S4's): 0 to 47 per configuration (`long-delegated-late-answers` 47 and 41, `delegated-holder-cut` 35 and 14,
+`long-delegated-backup` 33 and 19, the rest at most 3); the totals fall in every configuration. Only `tloss-two-node` reaches 0
+both ways, and `delegated-two-gens-root-crash` without the knob. What remains is S5 (a gate's settle on another node's
+generation), S4, and cause 6.
 
-*Gates.* fmt; `clippy --workspace --all-targets -D warnings`; the authority library (952) and `meta_repro`, meta, engine, control
-suites; the release simulation suite (314 passed, 0 failed, 11 ignored). A release build with debug assertions over 10 delegated
+`SWEEP-FAILOVER` p50/p90 (plain, main to fix): `backup-strict` 8,181/11,182 to 8,181/11,140 (knob 4,584/13,636 to 4,584/13,059);
+`long-delegated-backup` 2,956/14,019 to 2,454/13,961 (knob 2,832/16,472 to 2,831/16,502).
+
+*Gates.* fmt; `clippy --workspace --all-targets -D warnings`; the authority library (956) and `meta_repro` (4); the release
+simulation suite (314 passed, 0 failed, 12 ignored, with the findings test `delegated_settle_findings_*`, which fails on its four
+seeds as pinned). Meta, engine and control were green with the first measurement and are untouched since. A release build with debug assertions over 10 delegated
 configurations of 1,000 seeds each never reaches the own-client path's `debug_assert` (a gated root knows no generation of its
 tenure).
