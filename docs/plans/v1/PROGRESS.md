@@ -63853,3 +63853,57 @@ three runs each, all green. Sweeps, 2,000 seeds with and without the knob: `drop
 passes now: its trajectory moved) and 0 with it; `drop-held-chain` 0 and 0 (208 and 1446 pass); `long-backup` [743] without the
 knob (as on main); `drop-held-chain-requester-dies`, `flex-crash+identity`, `flex`, `flex-tight`, `placement-hot`, `backup-crash`,
 `delegated-holder-cut`, `long-delegated-late-answers`: 0 and 0.
+
+## Oracle I1: a root with a peer linked within its budget is never lone (i1-592; 2026-11-02; plan 46 M1.1)
+
+The "D10 own-client shape" (plan 43 C2f/C2g/C5 set it aside as a difference of judgement) was the core's fault. A tenure's first
+assessment of whether a backup could be had (`acquire_won`) counted only peers whose link had been up for the stability window and
+whose RTT was measured; a fresh tenure's links are younger, so `ack.eligible` was cached `Some(false)`, nothing re-assessed it when a
+peer crossed the window, and the ops queued behind the acquisition ran in its own event and were answered `Lone`, on the disk alone,
+with a peer linked within the budget. A takeover that cut the node off before it shipped rolled them back. Under `+commit` about half
+the seeds of every backup configuration failed this way (main: `backup` 1,013 of 2,000, `backup-crash` 1,070, `long-backup` 1,151,
+`delegated-holder-cut` 84).
+
+### What landed (one commit each)
+
+1. `backup_could_be_had` is the lone test: a connected roster peer whose RTT is unmeasured or within the budget counts, whatever the
+   age of its link (candidate selection keeps the window). `refresh_backup_eligibility` raises a cached `Some(false)` at every event
+   and on Peers/Roster, never lowers it. Fail-before core tests: a linked peer not yet stable or measured gates the lone answer; the
+   event that changes the links raises the assessment; an own op (accepted, refused) queued behind an acquisition waits for the
+   archive; a singleton still answers alone (passes before and after).
+2. Found by 1 (long-backup seed 84): `complete_ready` re-tagged the journal tip's row instead of the rid's own when it released a
+   gated answer with the gate off (an in-doubt rid found done waits for the tip), leaving `Lone` answers over `Archive` rows. It
+   re-tags the rid's own transaction.
+3. The sim's lone judgement uses the directory the core was given (an answerer with an entry counts only the peers it reports up; one
+   without counts every bus link). The old core with this oracle still fails the first-tenure seeds.
+4. Pins (`+commit`, 26 seeds of five configurations; all fail on main) and the `archive/*` allowance of the three backup sims is zero.
+5. **A refinement of the first predicate**: a peer that sealed the epoch (`refused_epoch`) still counts as linked for the lone test
+   (it stays no candidate; the acknowledgements wait for the archive). With the first predicate six seeds that main passes by
+   schedule fail `+commit` after the rest, all with the sealer the only peer; this clears them. Revert this commit to get the first predicate back.
+
+### Sweeps (seeds 0..1,999, with and without `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`) against main
+
+Failing seeds under `+commit`, main to fix (no knob / knob): `backup` 1,011 to 1 / 47 to 2; `backup-crash` 1,070 to 0 / 28 to 5;
+`backup-strict` 1,200 to 0 / 23 to 2; `backup-two` 1,010 to 1 / 64 to 12; `long-backup` 1,151 to 0 / 152 to 5;
+`delegated-holder-cut` 84 to 0 / 44 to 8; `placement-hot` 221 to 0 / 4 to 4; `backup-partition` 1,046 to 0 / 3 to 2;
+`backup-reconfig-doubt` 970 to 0 / 1,129 to 0; `delegated-backup` 32 to 2 / 0 to 0; `long-delegated-backup` 244 to 2 / 53 to 11;
+`drop-held-chain-backed` 1,074 to 237 / 24 to 23; `flex` and `flex-crash` unchanged (65, 39: the shadow-for-an-uncommitted-answer
+shape); `long-acks3`, `long-delegated`, `far`: 0 both. Without `+commit` every configuration is 0 on both trees but
+`drop-held-chain-backed` (main 1, seed 422; fix 2, seeds 225 and 1804: quiescence, the settle-write class that main shows on other
+seeds), and `backup-crash-slow` (1 on both). New failing seeds against main (all under `+commit`, in configurations main fails on
+most seeds): `delegated-backup` 192, 451 and `long-delegated-backup` 340, the delegate's `deleg-group` answer before the root's
+append (the delegate-side shape main has on 12 seeds of its sweeps, 7 on the fix; not touched here); `drop-held-chain-backed` 31
+(answers of rows inherited from a predecessor's group, which the oracle judges against the new lease, and the operator's drop-held; both separate findings). The single-node sims are unchanged.
+
+Failover (simulated ms to the first acknowledged mutation after a holder crash; p50/p90/max, no `+commit`, no knob; main to fix):
+`backup` 1205/4649/19322 to 1200/4744/8099; `backup-crash` 1205/4202/18851 to 1206/4186/19082; `long-backup` 1166/4508/8634 to
+1167/4502/12288; `delegated-holder-cut` 13610/15679/23874 to 13600/15650/24176; `backup-crash-slow` 6595/8050/9689 to 6598/8050/9689.
+The `long-backup` maximum moves both ways per seed (the schedules diverge from a tenure's first ms): over 8,000 more seeds
+main p50/p90/p99/p99.9/max 1181/4415/7687/10887/19378, fix 1182/4445/7641/8689/11227. No regression.
+
+### Seeds worth a name
+
+`drop-held-chain-backed` 592 (the seed that started this) passes `+commit` outright on the rebased tree; 470 (a missing S3 chunk after
+`repair drop-held` in the prototype's schedule) passes on the rebased tree too, and its signature (a successor's segment naming a
+chunk the drop cleared) is the latent hole main shows on seeds 1476 and 1851 before the drop-held series; `long-backup` 84 was the
+re-tag above.

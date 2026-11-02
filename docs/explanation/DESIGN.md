@@ -608,8 +608,13 @@ past the **archive** (the S3 log and its slot CAS, which fences a deposed
 sequencer's late segment a second time) are the **sealed tail**, re-shipped by
 the reconfigurer (`backup_tail`, `apply_backup_tail`). A **lone sequencer** is a
 holder or delegate whose group is itself because no peer is within the RTT
-budget; its answers to its own node's clients are the one speculation the
-design keeps. A **non-stealable** authority (an offline designation, a
+budget, judged as of the event it answers in: a roster peer that is linked and
+not measured out of budget counts as one a backup could be had from, whether
+or not its link has yet been up for the stability window or its RTT measured
+(`Core::backup_could_be_had`; the window only paces the choice of a
+candidate). A root with such a peer never answers from its disk alone: it
+waits for the archive, or for the backup it brings up. Its answers to its own
+node's clients are the one speculation the design keeps. A **non-stealable** authority (an offline designation, a
 continuation epoch's hold) is never replaced while its holder lives. The rows a
 node keeps as a **member copy** of a group it no longer sequences for (a
 deposed holder's committed unshipped rows, a backup's tail once its holder's
@@ -841,8 +846,10 @@ What a sequencer's acknowledgement means is the tenure's `ack_policy`,
 chosen per filesystem and topology
 ([ADR-21](DECISIONS.md#adr-21-layered-durability-and-seal-based-failover)):
 
-- **`Local`** (Layer A, always, free): the sequencer is lone (no peer in
-  budget). Its own node's op is acknowledged once it is on the
+- **`Local`** (Layer A, always, free): the sequencer is lone (no roster
+  peer linked within budget, as of the answering event: a peer whose link is
+  younger than `CONSTELLATION_BACKUP_STABLE_MS` or whose RTT is not yet
+  measured is a possible backup, not a reason to answer alone). Its own node's op is acknowledged once it is on the
   sequencer's disk, the one speculation a deposition may roll back (it
   replays by rid). Another node's forward is acknowledged once its segment
   is in the log: its row is journaled `Archive`, a deposition keeps it as

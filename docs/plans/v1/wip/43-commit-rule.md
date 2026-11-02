@@ -1981,6 +1981,18 @@ holder's *own* clients' answers in the first ~200 ms of a tenure, judged
 stability window before the core's next housekeeping assessed it: the D10
 alignment, C5), none of them an answer to another node.
 
+*Closed (i1-592, 2026-11-02).* The "D10 own-client shape" was the core's
+fault, not a difference of judgement: the tenure's first assessment
+(`acquire_won`) counted only peers whose link had been up for the stability
+window, nothing re-assessed it, and the ops queued behind the acquisition
+were answered on the disk alone with a peer linked within the budget (about
+half the seeds of every backup configuration under `+commit`). The lone
+test no longer asks for stability or a measured RTT (`backup_could_be_had`),
+and every event raises the cached assessment; the oracle judges by the
+directory its core was given. The `archive/*` allowance of the sims above
+is zero now, and `+commit` holds on `backup`, `backup-crash`, `long-backup`
+and `delegated-holder-cut` (PROGRESS, "i1-592"; plan 46 M1.1).
+
 *As landed (C2g, 2026-11-01; PROGRESS, "Plan 43 C2g"; plan 46 M0.1).* §5.3
 item 5 as the coder spec's §6 has it. The record and the answer:
 `Refused { rid, ABANDONED_CODE }` with `ABANDONED_CODE = Code::Canceled`,

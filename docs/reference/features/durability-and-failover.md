@@ -128,11 +128,24 @@ correlated power loss.
 
 ### Layer A: requesters keep what they were acknowledged
 
-Always on, and free for the holder's own writes. A holder with no backup
-in budget is a *lone* sequencer: it answers its own node's clients once
-the op is on its disk, and those writes that never shipped come back when
-it returns, through the rollback and a replay by rid (see
+Always on, and free for the holder's own writes. A holder with no roster
+peer linked within the RTT budget is a *lone* sequencer: it answers its own
+node's clients once the op is on its disk, and those writes that never
+shipped come back when it returns, through the rollback and a replay by rid
+(see
 [Forwarded mutations](forwarded-mutations.md#speculation-and-stranded-op-recovery)).
+Lone is judged as of the event that answers. A holder with a roster peer
+linked within the budget is not lone, even while that link is younger than
+the 2 s a backup candidate needs or its RTT is not measured yet: it waits
+for the archive (or for the backup it brings up) and never answers from its
+disk alone. A peer measured out of budget does not count; one that sealed
+the epoch does (it is no backup candidate, but it takes over with its tail,
+which lacks what is acknowledged on this disk alone afterwards). In particular
+the ops a tenure's acquisition releases, which run in the acquisition's own
+event, wait for the archive when a peer is linked: one segment ship instead
+of one disk write. (Before, those were answered on the disk alone in a
+tenure's first 2 s, and a takeover that cut the holder off before it shipped
+rolled them back with a peer that could have held them linked all along.)
 Another node's forwarded op is answered only once the segment carrying it
 is in the bucket (plan 43 C2: one S3 commit of latency, nothing of it on
 the holder's disk alone): the holder journals its row `Archive`, a
@@ -143,7 +156,10 @@ a lone sequencer. Failover waits for the lease TTL.
 
 ### Layer B: a backup within the RTT budget
 
-**Selection.** Candidates are write-eligible peers that are connected,
+**Selection.** (The 2 s paces the choice of a candidate only; a linked peer
+younger than that already keeps the holder from answering alone, see
+[Layer A](#layer-a-requesters-keep-what-they-were-acknowledged).)
+Candidates are write-eligible peers that are connected,
 whose measured RTT to the holder is within
 `CONSTELLATION_BACKUP_RTT_BUDGET_MS` (5 ms), and whose link has been up
 for at least 2 s. The one connected longest is preferred, up to
