@@ -65,6 +65,7 @@ impl Harness {
                         since: None,
                     })
                     .collect(),
+                lapses: 0,
             },
             &meta,
         );
@@ -3465,6 +3466,7 @@ fn pair() -> (Harness, Harness) {
                 since: Some(WaitMs(0)),
             })
             .collect(),
+        lapses: 0,
     });
     requester.core.lease.cached_holder = Some(1);
     requester.meta.session().set_budget_ms(20);
@@ -6484,6 +6486,7 @@ mod own_chunks {
                             since: Some(WaitMs(0)),
                         })
                         .collect(),
+                    lapses: 0,
                 });
                 requester.core.lease.cached_holder = Some(1);
                 let drain = timers(&out, TimerKind::ReplayDrain)[0];
@@ -6832,7 +6835,10 @@ fn stream_pair() -> (Harness, Harness, OpId) {
     holder.hold(1, None);
     let mut sub = Harness::with(2, true);
     sub.core.lease.cached_holder = Some(1);
-    let out = sub.step(Event::Peers { links: Vec::new() });
+    let out = sub.step(Event::Peers {
+        links: Vec::new(),
+        lapses: 0,
+    });
     let sent = sends(&out);
     let [(1, PeerMsg::LogSubscribe { req, from })] = sent.as_slice() else {
         panic!("expected one subscription to node 1: {sent:?}")
@@ -7666,7 +7672,10 @@ fn a_probe_that_beats_a_live_stream_is_followed_by_one_get() {
 fn serving_follows_the_lease() {
     let (mut holder, _sub, req) = stream_pair();
     holder.core.lease.released();
-    let out = holder.step(Event::Peers { links: Vec::new() });
+    let out = holder.step(Event::Peers {
+        links: Vec::new(),
+        lapses: 0,
+    });
     assert!(sends(&out).iter().any(|(to, m)| *to == 2
         && matches!(m, PeerMsg::LogStreamEnd { req: r, refused: false } if *r == req)));
     let out = holder.step(Event::Peer {
@@ -7706,7 +7715,10 @@ fn a_parked_holder_is_asked_again_once_a_hint_shows_the_log_moved() {
     assert_eq!(sub.core.stream_view().upstream, 0, "the stream is gone");
     // Parked: past every backoff, nothing new in the log, no resubscribe.
     sub.advance(sub.core.config().stream_retry_max_ms + 1);
-    let out = sub.step(Event::Peers { links: Vec::new() });
+    let out = sub.step(Event::Peers {
+        links: Vec::new(),
+        lapses: 0,
+    });
     assert_eq!(subscribes(&out), 0, "asked a parked holder again: {out:?}");
     // The holder shipped its next segment (the flush): the hint names it.
     let next = sub.core.ship().next_seq;
@@ -7730,11 +7742,17 @@ fn a_parked_holder_is_asked_again_once_a_hint_shows_the_log_moved() {
 fn a_lone_node_never_subscribes() {
     let mut solo = Harness::with(1, true);
     solo.hold(1, None);
-    let out = solo.step(Event::Peers { links: Vec::new() });
+    let out = solo.step(Event::Peers {
+        links: Vec::new(),
+        lapses: 0,
+    });
     assert!(sends(&out).is_empty());
     solo.core.lease.released();
     solo.core.lease.cached_holder = Some(1);
-    let out = solo.step(Event::Peers { links: Vec::new() });
+    let out = solo.step(Event::Peers {
+        links: Vec::new(),
+        lapses: 0,
+    });
     assert!(sends(&out).is_empty(), "subscribed to itself: {out:?}");
 }
 
@@ -9783,6 +9801,7 @@ mod epoch_rules {
                 rtt_ms: Some(1),
                 since: Some(WaitMs(0)),
             }],
+            lapses: 0,
         });
         let rid = h.rid(1);
         let op = h.create("a");
@@ -9835,6 +9854,7 @@ mod epoch_rules {
                     rtt_ms: Some(1),
                     since: Some(WaitMs(0)),
                 }],
+                lapses: 0,
             });
             let rid = h.rid(1);
             let op = h.create("a");
@@ -11813,6 +11833,7 @@ mod pipelined_appends {
         // Node 2's link is the older one: it is preferred.
         h.step(Event::Peers {
             links: vec![link(2, 0), link(3, 1)],
+            lapses: 0,
         });
         journal(&h, "a", 1);
         journaled(&mut h, 900);
@@ -11831,6 +11852,7 @@ mod pipelined_appends {
                 // The driver's directory refresh, every second.
                 h.step(Event::Peers {
                     links: vec![link(2, 0), link(3, 1)],
+                    lapses: 0,
                 });
             }
             if h.core.ack.candidate != current {
@@ -12635,7 +12657,10 @@ mod m10 {
         assert_eq!(h.meta.promise_issued().unwrap(), 0);
         // An observed expiry does not make it promise either.
         h.seen_expired(&lease_of(2, 3, h.now.0 - 1));
-        let out = h.step(Event::Peers { links: Vec::new() });
+        let out = h.step(Event::Peers {
+            links: Vec::new(),
+            lapses: 0,
+        });
         assert!(s3_ops(&out).is_empty(), "{out:?}");
     }
 
@@ -12645,7 +12670,10 @@ mod m10 {
         // ask, so the node promises on what it observes.
         let mut h = flex(1);
         h.seen_expired(&lease_of(2, 3, h.now.0 - 1));
-        let out = h.step(Event::Peers { links: Vec::new() });
+        let out = h.step(Event::Peers {
+            links: Vec::new(),
+            lapses: 0,
+        });
         let puts = s3_ops(&out)
             .iter()
             .filter(|(_, r)| matches!(r, S3Op::HeartbeatPut { .. }))
@@ -12659,7 +12687,10 @@ mod m10 {
             )),
             "the heartbeat names the key observed: {out:?}"
         );
-        let out = h.step(Event::Peers { links: Vec::new() });
+        let out = h.step(Event::Peers {
+            links: Vec::new(),
+            lapses: 0,
+        });
         assert!(
             !s3_ops(&out)
                 .iter()
@@ -12676,6 +12707,7 @@ mod m10 {
                 rtt_ms: None,
                 since: None,
             }],
+            lapses: 0,
         });
         h.seen_expired(&lease_of(2, 3, h.now.0 - 1));
         let out = h.step(Event::Peers {
@@ -12686,12 +12718,16 @@ mod m10 {
                 rtt_ms: None,
                 since: None,
             }],
+            lapses: 0,
         });
         assert!(s3_ops(&out).is_empty(), "{out:?}");
         // f = 0: never on its own.
         let mut h = flex(0);
         h.seen_expired(&lease_of(2, 3, h.now.0 - 1));
-        let out = h.step(Event::Peers { links: Vec::new() });
+        let out = h.step(Event::Peers {
+            links: Vec::new(),
+            lapses: 0,
+        });
         assert!(s3_ops(&out).is_empty(), "{out:?}");
     }
 
@@ -12872,6 +12908,7 @@ mod m10 {
                 rtt_ms: None,
                 since: None,
             }],
+            lapses: 0,
         });
         h.core.lease.cached_holder = Some(1);
         let expires = h.now.plus(10_000).0;
@@ -13684,6 +13721,18 @@ mod backup_crash {
     /// Node 2 linked (or not), its link up for `age` ms and measured at
     /// `rtt_ms`.
     fn link_2(h: &mut Harness, connected: bool, rtt_ms: Option<u64>, age: u64) -> Vec<Action> {
+        link_2_after(h, connected, rtt_ms, age, 0)
+    }
+
+    /// [`link_2`], a directory snapshot taken when the driver had handed
+    /// `lapses` `OwnLag` events.
+    fn link_2_after(
+        h: &mut Harness,
+        connected: bool,
+        rtt_ms: Option<u64>,
+        age: u64,
+        lapses: u64,
+    ) -> Vec<Action> {
         let since = w(h.now).minus(age);
         h.step(Event::Peers {
             links: vec![crate::event::PeerLink {
@@ -13693,6 +13742,15 @@ mod backup_crash {
                 rtt_ms,
                 since: Some(since),
             }],
+            lapses,
+        })
+    }
+
+    /// The driver hands this node's own lapse of `ms` that ended now.
+    fn own_lapse(h: &mut Harness, ms: i64) -> Vec<Action> {
+        h.step(Event::OwnLag {
+            from: w(h.now).minus(ms as u64),
+            until: w(h.now),
         })
     }
 
@@ -13776,6 +13834,167 @@ mod backup_crash {
             assert_eq!(h.core.root_ack_class(), AckClass::Lone, "{what}");
             assert!(h.core.root_lone(), "{what}");
         }
+    }
+
+    /// I1 class 2 (backup+commit seed 578, long-backup 1942 under slow
+    /// reads): a root resumed from a pause answered alone on the directory
+    /// it held before it. Node 2 came up meanwhile; its link was in the
+    /// snapshots queued behind the event that resumed the root. Knowledge
+    /// older than the node's own lapse is not knowledge at answer time: the
+    /// root is lone again only on a snapshot taken after the lapse was
+    /// handed (`Event::Peers`'s `lapses`), counted, not timed: the wait
+    /// clock does not count a suspend. Fails before: lone throughout.
+    #[test]
+    fn a_root_is_not_lone_across_its_own_lapse_until_a_later_directory() {
+        let pos = pos_5();
+        let mut h = Harness::new(1);
+        backup_node(&mut h, vec![1, 2]);
+        // Genuinely lone: node 2 is on the roster, not linked.
+        link_2(&mut h, false, None, 0);
+        h.hold(1, None);
+        h.core.ack.eligible = Some(h.core.backup_could_be_had());
+        assert_eq!(h.core.ack_need(&pos), None);
+        assert!(h.core.root_lone());
+        // Paused for seconds (the wait clock moved 1 ms), the lapse is
+        // handed with the Submit it held.
+        own_lapse(&mut h, 1);
+        assert!(
+            h.core.ack_need(&pos).is_some(),
+            "answered alone on a directory older than its lapse"
+        );
+        assert!(!h.core.root_lone());
+        assert_ne!(h.core.root_ack_class(), AckClass::Lone);
+        // The snapshots queued during the pause were taken before the lapse
+        // was handed: they show where the peers were, not that none is.
+        h.advance(10);
+        link_2_after(&mut h, false, None, 0, 0);
+        assert!(!h.core.root_lone(), "a snapshot from before the lapse");
+        // Housekeeping does not lower it on that directory either.
+        h.advance(100);
+        link_2_after(&mut h, false, None, 0, 0);
+        assert!(h.core.ack_need(&pos).is_some());
+        // A snapshot taken after the lapse was handed: lone again, once the
+        // selection pass assesses it (housekeeping lowers it, never an event).
+        h.advance(10);
+        link_2_after(&mut h, false, None, 0, 1);
+        h.advance(100);
+        h.step(Event::Activity {
+            last_write: WaitMs(0),
+            acked_seqs: Vec::new(),
+        });
+        assert_eq!(h.core.ack_need(&pos), None, "a singleton waits for ever");
+        assert!(h.core.root_lone());
+        // Another lapse: not lone until the next snapshot after it; and a
+        // snapshot taken during the lapse (it carries the count before it)
+        // does not restore it.
+        own_lapse(&mut h, 1);
+        assert!(!h.core.root_lone());
+        link_2_after(&mut h, false, None, 0, 1);
+        assert!(!h.core.root_lone(), "a snapshot taken during the lapse");
+        h.advance(100);
+        link_2_after(&mut h, false, None, 0, 2);
+        h.step(Event::Activity {
+            last_write: WaitMs(0),
+            acked_seqs: Vec::new(),
+        });
+        assert!(h.core.root_lone());
+    }
+
+    /// Before the first directory snapshot nothing is known of the peers
+    /// (today an empty directory means lone), and a node that never selects
+    /// a backup is lone whatever it was handed.
+    #[test]
+    fn a_root_is_not_lone_before_its_first_directory() {
+        let mut h = Harness::new(1);
+        h.core.cfg.p2p = true;
+        h.core.cfg.backup_rtt_budget_ms = 50;
+        h.core.cfg.backups_max = 1;
+        h.core.peers_seen = false;
+        h.hold(1, None);
+        assert!(h.core.backup_could_be_had(), "no directory yet");
+        link_2_after(&mut h, false, None, 0, 0);
+        assert!(!h.core.backup_could_be_had());
+        // P2P off, no budget, no backups: lone, lapses or not.
+        for off in 0..3 {
+            let mut h = Harness::new(1);
+            backup_node(&mut h, vec![1, 2]);
+            match off {
+                0 => h.core.cfg.p2p = false,
+                1 => h.core.cfg.backup_rtt_budget_ms = 0,
+                _ => h.core.cfg.backups_max = 0,
+            }
+            h.hold(1, None);
+            own_lapse(&mut h, 1);
+            assert!(!h.core.backup_could_be_had(), "configuration {off}");
+        }
+    }
+
+    /// I1 class 2, the shape of backup-crash-slow seed 1416: an ack parked
+    /// behind a candidate that is brought up (the node is gated, its links
+    /// empty) is released by the candidate's loss inside the event that
+    /// hands the lapse: the candidate's bring-up failed while the node was
+    /// paused, the housekeeping the event runs drops it, and with nothing to
+    /// wait for the gate went off and the ack was answered `Lone` — on a
+    /// directory without the peer that came up meanwhile. The lapse raises
+    /// the assessment in that very event. Fails before: the parked reply is
+    /// released in the `OwnLag` event.
+    #[test]
+    fn a_candidate_lost_in_the_lapse_event_does_not_release_a_parked_ack_lone() {
+        let mut h = Harness::new(1);
+        backup_node(&mut h, vec![1, 2]);
+        // (Short enough to run out inside the 10 s lease, and counted on
+        // the wait clock alone: the lapse below is 1 ms of it, the shape
+        // of a suspend, so it discounts nothing either way.)
+        h.core.cfg.backup_ack_timeout_ms = 1_000;
+        h.core.cfg.liveness_lag_aware = false;
+        link_2(&mut h, true, Some(5), 5_000);
+        h.hold(1, None);
+        h.advance(100);
+        let out = link_2(&mut h, true, Some(5), 5_100);
+        let append = sends(&out).into_iter().find_map(|(to, m)| match m {
+            PeerMsg::BackupAppend { req, .. } if to == 2 => Some(*req),
+            _ => None,
+        });
+        assert_eq!(h.core.ack.candidate, Some(2), "{out:?}");
+        // An own op journaled for the group, parked behind the candidate.
+        let rid = h.rid(1);
+        let op = h.create("a");
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        assert!(replies(&out).is_empty(), "answered at once: {out:?}");
+        // The peer goes down (its link is in no snapshot the core holds
+        // yet, as in a pause); the append it was sent failed at the
+        // transport while the node was stopped.
+        link_2(&mut h, false, None, 0);
+        if let Some(req) = append {
+            h.step(Event::PeerFailed {
+                req,
+                to: 2,
+                outage: true,
+            });
+        }
+        assert_eq!(h.core.ack.candidate, Some(2));
+        h.advance(h.core.cfg.backup_ack_timeout_ms + 100);
+        let out = own_lapse(&mut h, 1);
+        assert!(
+            replies(&out).is_empty(),
+            "released `Lone` in the event that handed the lapse: {out:?}"
+        );
+        assert!(h.core.ack_need(&pos_5()).is_some());
+        // A snapshot taken after the lapse shows no peer: the node is lone
+        // again, and what was parked is released as the lone node's.
+        h.advance(10);
+        link_2_after(&mut h, false, None, 0, 1);
+        h.advance(100);
+        let out = h.step(Event::Activity {
+            last_write: WaitMs(0),
+            acked_seqs: Vec::new(),
+        });
+        assert_eq!(replies(&out).len(), 1, "{out:?}");
     }
 
     /// i1-592: the assessment is cached, and a peer that becomes linked
@@ -14082,6 +14301,7 @@ mod backup_crash {
                 rtt_ms: Some(5),
                 since: Some(WaitMs(0)),
             }],
+            lapses: 0,
         });
         let listed = backup_lease(1, 1, h.now.plus(10_000).0, vec![2]);
         h.core.lease.adopt(h.clk(), listed, tag(), None);
@@ -14096,6 +14316,7 @@ mod backup_crash {
                 rtt_ms: Some(5),
                 since: Some(WaitMs(0)),
             }],
+            lapses: 0,
         });
         // The removal of node 2 lands.
         let mut out = Vec::new();
@@ -14614,6 +14835,7 @@ mod backup_crash {
                     since: Some(WaitMs(0)),
                 })
                 .collect(),
+            lapses: 0,
         });
         requester.core.lease.cached_holder = Some(1);
         let drain = timers(&out, TimerKind::ReplayDrain)[0];
@@ -14878,6 +15100,7 @@ mod backup_crash {
                     rtt_ms: None,
                     since: None,
                 }],
+                lapses: 0,
             };
             h.step(links(false));
             let watch = timers(&out, TimerKind::BackupWatch)[0];
@@ -21570,6 +21793,7 @@ mod locks {
                 rtt_ms: Some(150),
                 since: None,
             }],
+            lapses: 0,
         });
         let (t0, g2, tick) = node_3_parked_behind_node_2(&mut h, ino);
         let base = ask_wait(&h);
@@ -22343,6 +22567,7 @@ mod locks {
                     since: None,
                 })
                 .collect(),
+            lapses: 0,
         });
         r
     }
@@ -23656,6 +23881,7 @@ mod locks {
                         since: None,
                     })
                     .collect(),
+                lapses: 0,
             },
             &r.meta,
         );
@@ -25393,6 +25619,7 @@ mod locks {
                     since: None,
                 })
                 .collect(),
+            lapses: 0,
         });
         let lock = |r: &mut Harness, op: u64, ino: Ino| {
             r.step(Event::Control {
@@ -25473,6 +25700,7 @@ mod locks {
                     since: None,
                 })
                 .collect(),
+            lapses: 0,
         });
         let lock = |r: &mut Harness, op: u64, ino: Ino| {
             r.step(Event::Control {
@@ -25597,6 +25825,7 @@ mod locks {
                     since: None,
                 })
                 .collect(),
+            lapses: 0,
         });
         let lock = |r: &mut Harness, op: u64, ino: Ino| {
             r.step(Event::Control {
@@ -25665,6 +25894,7 @@ mod locks {
                     since: None,
                 })
                 .collect(),
+            lapses: 0,
         });
         let lock = |r: &mut Harness, op: u64, ino: Ino| {
             r.step(Event::Control {
@@ -31347,6 +31577,7 @@ fn a_write_into_a_fresh_delegation_is_recalled_until_the_root_sees_the_delegate(
                         since: Some(w(h.now)),
                     })
                     .collect(),
+                lapses: 0,
             });
         }
         h.advance(10);
@@ -31747,6 +31978,7 @@ fn a_wanter_across_a_p2p_partition_does_not_take_the_lease_from_its_users() {
                     since: None,
                 })
                 .collect(),
+            lapses: 0,
         });
     }
     /// Run one round from the poll timer; whether it released the lease.
@@ -32758,6 +32990,7 @@ fn a_candidate_that_sealed_the_epoch_is_not_reinvited() {
             rtt_ms: Some(1),
             since: Some(WaitMs(h.now.0 - 60_000)),
         }],
+        lapses: 0,
     });
     h.hold(1, None);
     let mut invited = 0;
@@ -32861,6 +33094,7 @@ fn an_inbox_op_is_forwarded_once_the_holder_is_reachable() {
             rtt_ms: Some(1),
             since: Some(w(h.now)),
         }],
+        lapses: 0,
     });
     let id = h.core.inbox.recheck_timer.expect("a recheck armed");
     h.advance(1_100);
@@ -32936,6 +33170,7 @@ fn a_flapping_p2p_link_never_polls_an_idle_requester_faster_than_its_backoff() {
                     since: None,
                 })
                 .collect(),
+            lapses: 0,
         });
     }
     /// Two minutes, every link down for 5 s out of every 10 s (a ping
@@ -33065,6 +33300,7 @@ fn an_inbox_poll_is_one_get_until_it_hits() {
             rtt_ms: None,
             since: None,
         }],
+        lapses: 0,
     });
     let full = h.core.cfg.inbox_poll_width;
     assert!(full > 1);
@@ -33255,6 +33491,7 @@ fn a_holder_steps_past_a_withdrawn_batch_to_the_requesters_next_one() {
             rtt_ms: None,
             since: None,
         }],
+        lapses: 0,
     });
     let poll = |out: &[Action]| {
         s3_ops(out).into_iter().find_map(|(op, r)| match r {
@@ -34604,6 +34841,7 @@ fn placement_re_reads_the_roster_for_a_connected_writer_it_does_not_list() {
             rtt_ms: Some(1),
             since: Some(w(h.now)),
         }],
+        lapses: 0,
     });
     for i in 0..40 {
         let bucket = super::placement::bucket_of(&format!("b-{i}"));
@@ -34679,6 +34917,7 @@ fn root_with_two_range_writers(
                 since: Some(w(h.now)),
             })
             .to_vec(),
+        lapses: 0,
     });
     for (node, idx) in [(2, 0), (3, 1)] {
         let names = (0..)
@@ -35656,6 +35895,7 @@ mod redelegated_to_the_requester {
                     since: None,
                 })
                 .collect(),
+            lapses: 0,
         });
         let dir = h.meta.allocate_ino(ROOT_INO).unwrap();
         let f = h.meta.allocate_ino(dir).unwrap();
@@ -35932,6 +36172,7 @@ mod delegated_lock_dead_end {
                     since: None,
                 })
                 .collect(),
+            lapses: 0,
         });
         let dir: Ino = h.meta.allocate_ino(ROOT_INO).unwrap();
         let f: Ino = h.meta.allocate_ino(dir).unwrap();
@@ -41020,6 +41261,7 @@ mod recall_cut {
                 rtt_ms: Some(5),
                 since: Some(WaitMs(0)),
             }],
+            lapses: 0,
         });
         let d8 = h.core.dl.mine.get_mut(&8).unwrap();
         d8.backup = Some(5);
@@ -41123,6 +41365,7 @@ mod recall_cut {
                 rtt_ms: Some(5),
                 since: Some(WaitMs(0)),
             }],
+            lapses: 0,
         });
         let d8 = h.core.dl.mine.get_mut(&8).unwrap();
         d8.backup = Some(5);
@@ -41631,6 +41874,7 @@ mod deleg_group {
                 rtt_ms: Some(5),
                 since: Some(WaitMs(0)),
             }],
+            lapses: 0,
         });
         assert!(!h.core.deleg_lone(h.clk(), &h.core.dl.mine[&7]));
     }
@@ -43280,6 +43524,7 @@ mod deleg_group {
                 rtt_ms: Some(500),
                 since: Some(WaitMs(0)),
             }],
+            lapses: 0,
         });
         assert!(h.core.deleg_lone(h.clk(), &h.core.dl.mine[&7]));
         assert_eq!(
@@ -43314,6 +43559,7 @@ mod deleg_group {
                     since: Some(WaitMs(0)),
                 },
             ],
+            lapses: 0,
         });
         let mut out = Vec::new();
         h.core.deleg_after_event(h.clk(), &h.meta, &mut out);
@@ -44465,7 +44711,11 @@ mod c1_counted {
             ),
             "{out:?}"
         );
-        assert!(h.core.bk.role.is_some_and(|r| r.holder == 3 && r.epoch == 2));
+        assert!(h
+            .core
+            .bk
+            .role
+            .is_some_and(|r| r.holder == 3 && r.epoch == 2));
         h.advance(100);
         (h, read)
     }
@@ -44487,11 +44737,17 @@ mod c1_counted {
         before.config_version = 1;
         let out = answer_job_read(&mut h, &read, before);
         assert!(
-            h.core.bk.role.is_some_and(|r| r.holder == 3 && r.epoch == 2),
+            h.core
+                .bk
+                .role
+                .is_some_and(|r| r.holder == 3 && r.epoch == 2),
             "a read of an older epoch discarded the role: {:?}",
             h.core.bk.role
         );
-        assert_eq!(h.core.bk.acked, 1, "a read of an older epoch discarded the tail");
+        assert_eq!(
+            h.core.bk.acked, 1,
+            "a read of an older epoch discarded the tail"
+        );
         assert_eq!(h.meta.backup_tail(2).unwrap().len(), 1);
         assert_eq!(h.core.bk.sealed, 0);
         assert_ne!(
@@ -44503,7 +44759,6 @@ mod c1_counted {
             h.core.bk.watch_timer.is_some(),
             "the watch is not armed again: {out:?}"
         );
-
     }
 
     /// The same-epoch case the old special arm did not reach: the read
@@ -44544,7 +44799,10 @@ mod c1_counted {
         before.backups = vec![2];
         before.ack_policy = constellation_store_s3::AckPolicy::Backup;
         let out = answer_job_read(&mut h, &read, before);
-        assert_eq!(h.core.stats.seals, 0, "sealed on a read older than the role");
+        assert_eq!(
+            h.core.stats.seals, 0,
+            "sealed on a read older than the role"
+        );
         assert_eq!(h.core.bk.sealed, 0);
         assert!(h.core.bk.role.is_some_and(|r| r.config_version == 3));
         assert!(h.core.lease.takeover_permit.is_none());
@@ -44552,7 +44810,6 @@ mod c1_counted {
             h.core.bk.watch_timer.is_some(),
             "the watch is not armed again: {out:?}"
         );
-
     }
 
     /// The observation (`LeaseState::observe`) is set back by no older
@@ -45244,6 +45501,7 @@ mod deleg_windows_tests {
                 rtt_ms: Some(1),
                 since: Some(heard),
             }],
+            lapses: 0,
         });
         let ask = |h: &mut Harness, op: u64, force: bool| {
             let out = h.step(Event::Control {
@@ -45287,6 +45545,7 @@ mod deleg_windows_tests {
                 rtt_ms: None,
                 since: None,
             }],
+            lapses: 0,
         });
         assert_eq!(
             h.core.deleg_view().waiting[0].members[0].heard_ms,
@@ -48900,7 +49159,10 @@ mod deleg_root_read {
         let ms = 100u64;
         for _ in 0..ms {
             h.advance(1);
-            let out = h.step(Event::Peers { links: Vec::new() });
+            let out = h.step(Event::Peers {
+                links: Vec::new(),
+                lapses: 0,
+            });
             queue.extend(reads(&out));
             issued += reads(&out).len();
             let mut answered = 0;

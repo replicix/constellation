@@ -3150,8 +3150,23 @@ impl Core {
     /// assessment must not change with the clock alone: it changes with
     /// the links and the roster ([`Self::refresh_backup_eligibility`]).
     pub(crate) fn backup_could_be_had(&self) -> bool {
-        if self.cfg.backup_rtt_budget_ms == 0 || self.cfg.backups_max == 0 {
+        if !self.backups_possible() {
             return false;
+        }
+        // I1 class 2: lone needs a directory snapshot taken after this
+        // node's last lapse was handed (plan 46 D3: no node with peers
+        // answers from its disk alone). The links it holds were given
+        // before it stopped; newer snapshots were already queued behind the
+        // event that resumed it (backup+commit seeds 578, 1942;
+        // backup-crash-slow 1416: a root paused for seconds answered on a
+        // directory without the peers that came up meanwhile). Knowledge
+        // older than the node's own lapse is not knowledge at answer time.
+        // Ordered by counters (`Event::Peers`'s `lapses`), not the clock:
+        // the wait clock does not count a suspend, and the assessment
+        // still never changes with the clock alone. Before the first
+        // snapshot nothing is known either.
+        if !self.peers_seen || self.peers_lapses < self.lapses_seen {
+            return true;
         }
         self.links.values().any(|l| {
             l.node != self.cfg.node_id

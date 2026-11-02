@@ -1719,6 +1719,10 @@ impl Drop for AliveTask {
 ///   and the holder's heartbeat ([`alive_tick`]).
 #[derive(Debug)]
 pub struct OffCore {
+    /// I1 class 2: the `OwnLag` events the driver has handed the core, and
+    /// the wake-up of the directory task that follows a lapse
+    /// ([`Driver::hand_lag`], [`peer_links_task`]).
+    pub(crate) lapses: Arc<LapseCount>,
     busy_since: std::sync::atomic::AtomicI64,
     /// holder → (its latest epoch heard, the latest arrival at it, the
     /// latest lease expiry a heartbeat of that epoch named; 0: none).
@@ -1782,6 +1786,30 @@ pub struct OffCore {
     runtime: std::sync::OnceLock<tokio::runtime::Handle>,
 }
 
+/// I1 class 2: how many `Event::OwnLag` the driver has handed the core, and
+/// a wake-up for the directory task. The task reads the count before it takes
+/// a snapshot of the links and sends it with them (`Event::Peers::lapses`);
+/// the core is lone only on a snapshot taken after its last lapse was handed
+/// (`Core::backup_could_be_had`).
+#[derive(Debug, Default)]
+pub(crate) struct LapseCount {
+    handed: AtomicU64,
+    wake: tokio::sync::Notify,
+}
+
+impl LapseCount {
+    /// A lapse is about to be handed to the core: counted before the step,
+    /// so that a snapshot which carries it was taken after it was handed.
+    fn handing(&self) {
+        self.handed.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The count to send with a snapshot: read before taking it.
+    fn handed(&self) -> u64 {
+        self.handed.load(Ordering::SeqCst)
+    }
+}
+
 /// The lease store the root's proof reads through ([`OffCore::set_leases`]).
 #[derive(Clone)]
 struct LeaseHandle(LeaseStore);
@@ -1802,6 +1830,7 @@ impl OffCore {
         let deleg_windows = constellation_authority::core::DelegWindows::new();
         deleg_windows.set_probe(root_probe.clone());
         Self {
+            lapses: Arc::new(LapseCount::default()),
             root_probe,
             leases: std::sync::OnceLock::new(),
             runtime: std::sync::OnceLock::new(),
@@ -2204,6 +2233,12 @@ impl OffCore {
         *self.lapse.lock().unwrap()
     }
 
+    /// The core stepped on a lapse (`Event::OwnLag`): the directory task
+    /// takes a snapshot now, not at the next tick or change.
+    pub(crate) fn lapse_stepped(&self) {
+        self.lapses.wake.notify_one();
+    }
+
     /// How long past its period the lag probe has not ticked (0: it is
     /// ticking, or not started).
     pub(crate) fn runtime_stalled_ms(&self, now_wait_ms: i64) -> i64 {
@@ -2577,7 +2612,12 @@ impl Driver {
             let tx = self.event_tx();
             let peers = self.deps.peers.clone();
             let own_s3 = OwnS3Watch::new(self.deps.upload.clone(), peers.clone());
-            tokio::spawn(peer_links_task(peers, own_s3, tx));
+            tokio::spawn(peer_links_task(
+                peers,
+                own_s3,
+                tx,
+                self.deps.off_core.lapses.clone(),
+            ));
         }
         *self.deps.off_core.urgent.lock().unwrap() = self.deps.urgent_tx.clone();
         let _alive_task = self.core.config().p2p.then(|| {
@@ -2752,7 +2792,7 @@ impl Driver {
     /// (a reconfiguration CAS, and a re-sync from scratch), before the
     /// backlog of its acknowledgements was in.
     fn hand_lag(&mut self) {
-        let off = &self.deps.off_core;
+        let off = self.deps.off_core.clone();
         let threshold = off.lag_threshold_ms;
         let mut lapses = [
             off.lapse(wait_now_ms()),
@@ -2762,10 +2802,18 @@ impl Driver {
         for (from, until) in lapses {
             if until > self.lag_handed + threshold / 2 {
                 self.lag_handed = until;
+                // Counted before the step: the directory task reads the
+                // count before its snapshot, so a snapshot that carries
+                // this lapse was taken after it was handed (and, queued
+                // behind this step, handled after it).
+                off.lapses.handing();
                 self.step(Internal::Event(Event::OwnLag {
                     from: WaitMs(from),
                     until: WaitMs(until),
                 }));
+                // After the step: a snapshot of the directory now, not at
+                // the next tick or change.
+                off.lapse_stepped();
             }
         }
     }
@@ -6568,6 +6616,7 @@ async fn peer_links_task(
     peers: constellation_net::Peers,
     mut own_s3: OwnS3Watch,
     tx: mpsc::UnboundedSender<Internal>,
+    lapses: Arc<LapseCount>,
 ) {
     let mut since: HashMap<u64, WaitMs> = HashMap::new();
     let mut changed = peers.links_changed();
@@ -6591,14 +6640,25 @@ async fn peer_links_task(
         if let Some(rx) = changed.as_mut() {
             rx.borrow_and_update();
         }
+        // The count of lapses handed so far, before the snapshot (never
+        // after): the core is lone on this one only if it was taken after
+        // its last lapse was handed.
+        let handed = lapses.handed();
         let links = peer_links(&peers, &mut since);
-        if tx.send(Internal::Event(Event::Peers { links })).is_err() {
+        if tx
+            .send(Internal::Event(Event::Peers {
+                links,
+                lapses: handed,
+            }))
+            .is_err()
+        {
             return;
         }
         match changed.as_mut() {
             Some(rx) => {
                 tokio::select! {
                     _ = tokio::time::sleep_until(tick) => {}
+                    _ = lapses.wake.notified() => {}
                     r = rx.changed() => {
                         if r.is_err() {
                             changed = None;
@@ -6606,7 +6666,12 @@ async fn peer_links_task(
                     }
                 }
             }
-            None => tokio::time::sleep_until(tick).await,
+            None => {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(tick) => {}
+                    _ = lapses.wake.notified() => {}
+                }
+            }
         }
     }
 }
@@ -9314,6 +9379,65 @@ mod tests {
         );
     }
 
+    /// I1 class 2: a lapse handed to the core wakes the directory task at
+    /// once (a snapshot taken after the lapse reaches the core in a round
+    /// trip, not at the next 1 s tick), and the snapshot carries the count of
+    /// lapses handed, read before it was taken. A snapshot sent before the
+    /// lapse was handed carries the count before it. Fails on the parent:
+    /// no count, no wake-up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lapse_handed_to_the_core_wakes_the_directory_task_with_its_count() {
+        use super::{peer_links_task, Internal, OffCore, OwnS3Watch};
+        use constellation_authority::Event;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let off = OffCore::new(5_000);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let upload = Arc::new(crate::upload::UploadRuntime::for_test(false));
+        let peers = constellation_net::Peers::disabled();
+        let own_s3 = OwnS3Watch::new(upload, peers.clone());
+        tokio::spawn(peer_links_task(peers, own_s3, tx, off.lapses.clone()));
+        async fn next_peers(
+            rx: &mut tokio::sync::mpsc::UnboundedReceiver<Internal>,
+            within: Duration,
+        ) -> Option<u64> {
+            let deadline = tokio::time::Instant::now() + within;
+            loop {
+                match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Ok(Some(Internal::Event(Event::Peers { lapses, .. }))) => return Some(lapses),
+                    Ok(Some(_)) => {}
+                    Ok(None) => panic!("the task stopped"),
+                    Err(_) => return None,
+                }
+            }
+        }
+        // The first snapshot goes out at once, before any lapse.
+        assert_eq!(next_peers(&mut rx, Duration::from_secs(5)).await, Some(0));
+        // Nothing more until the tick (a second away)...
+        assert_eq!(next_peers(&mut rx, Duration::from_millis(300)).await, None);
+        // ...but a lapse the core has been handed and stepped on wakes it.
+        off.lapses.handing();
+        assert_eq!(
+            next_peers(&mut rx, Duration::from_millis(300)).await,
+            None,
+            "woken before the core stepped on the lapse"
+        );
+        off.lapse_stepped();
+        assert_eq!(
+            next_peers(&mut rx, Duration::from_millis(500)).await,
+            Some(1),
+            "no snapshot after the lapse"
+        );
+        // A second lapse: the next snapshot carries two.
+        off.lapses.handing();
+        off.lapse_stepped();
+        assert_eq!(
+            next_peers(&mut rx, Duration::from_millis(500)).await,
+            Some(2)
+        );
+    }
+
     /// `startup-link-lag`: a peer that enrols shows up connected in the
     /// core's links within a round trip, not on the next 1 s link tick
     /// (before, the root's core did not see a delegate that had just
@@ -9373,14 +9497,19 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let upload = Arc::new(crate::upload::UploadRuntime::for_test(false));
         let own_s3 = OwnS3Watch::new(upload, peers_a.clone());
-        tokio::spawn(peer_links_task(peers_a.clone(), own_s3, tx));
+        tokio::spawn(peer_links_task(
+            peers_a.clone(),
+            own_s3,
+            tx,
+            Default::default(),
+        ));
         let up = |links: &[constellation_authority::event::PeerLink]| {
             links.iter().any(|l| l.node == 2 && l.connected)
         };
         // The first links go out at once; node 2 is not enrolled yet.
         loop {
             match rx.recv().await {
-                Some(Internal::Event(Event::Peers { links })) => {
+                Some(Internal::Event(Event::Peers { links, .. })) => {
                     assert!(!up(&links));
                     break;
                 }
@@ -9394,7 +9523,7 @@ mod tests {
         peers_a.refresh_registry(registry);
         let took = loop {
             match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
-                Ok(Some(Internal::Event(Event::Peers { links }))) if up(&links) => {
+                Ok(Some(Internal::Event(Event::Peers { links, .. }))) if up(&links) => {
                     break enrolled.elapsed();
                 }
                 Ok(Some(_)) => {}

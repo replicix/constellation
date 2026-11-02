@@ -2000,6 +2000,18 @@ pub struct Core {
     last_recovery: Option<String>,
     roster: Vec<NodeId>,
     links: BTreeMap<NodeId, PeerLink>,
+    /// I1 class 2: `Event::OwnLag` events this core has handled, and the
+    /// highest count of them the driver had handed when it took the
+    /// directory snapshot `links` was last set from (`Event::Peers`'s
+    /// `lapses`, read before the snapshot). `peers_seen`: a snapshot has
+    /// arrived at all. A snapshot taken before the last lapse was handed may
+    /// predate the lapse (peers that came up meanwhile are queued behind
+    /// the event that resumed this node), so it cannot show that no backup
+    /// could be had (`backup_could_be_had`). Counters, not the clock: the
+    /// wait clock does not count a suspend.
+    lapses_seen: u64,
+    peers_lapses: u64,
+    peers_seen: bool,
     /// When this node last heard from each peer (a message, or the driver's
     /// `PeerLink::last_seen`), on its wait clock. Kept across the link
     /// table's replacement (`Event::Peers`), which drops a link's last
@@ -2106,6 +2118,9 @@ impl Core {
             last_recovery: None,
             roster: Vec::new(),
             links: BTreeMap::new(),
+            lapses_seen: 0,
+            peers_lapses: 0,
+            peers_seen: false,
             peer_heard: BTreeMap::new(),
             own_s3: OwnS3::default(),
             readopt_refused_until: WaitMs(0),
@@ -2401,7 +2416,7 @@ impl Core {
                     self.inbox_holder_tick(now, replica, &mut out);
                 }
             }
-            Event::Peers { links } => {
+            Event::Peers { links, lapses } => {
                 tracing::trace!(
                     node = self.cfg.node_id,
                     links = ?links.iter().map(|l| (l.node, l.connected)).collect::<Vec<_>>(),
@@ -2416,6 +2431,8 @@ impl Core {
                     }
                 }
                 self.links = links.into_iter().map(|l| (l.node, l)).collect();
+                self.peers_seen = true;
+                self.peers_lapses = self.peers_lapses.max(lapses);
                 self.refresh_backup_eligibility();
                 self.stream_on_peers(now);
             }
@@ -2455,7 +2472,16 @@ impl Core {
                 (seq, clock, sent, holder_expires, guard),
                 replica,
             ),
-            Event::OwnLag { from, until } => self.on_own_lag(from, until),
+            Event::OwnLag { from, until } => {
+                self.lapses_seen += 1;
+                self.on_own_lag(from, until);
+                // The directory this node holds may predate the lapse: not
+                // lone again until a snapshot taken after it arrives (a
+                // parked ack waits, or is released by the log, not by the
+                // lone test: backup-crash-slow seed 1416 released one
+                // `Lone` inside this very event).
+                self.refresh_backup_eligibility();
+            }
             Event::OwnFreeze { from, until } => self.on_own_freeze(from, until),
             Event::DelegRenewSentOffCore {
                 gen,

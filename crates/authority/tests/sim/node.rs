@@ -157,6 +157,11 @@ pub struct Shared {
     lag: Mutex<Option<(tokio::time::Instant, tokio::time::Instant)>>,
     /// When the current runtime lag began.
     lag_since: Mutex<Option<tokio::time::Instant>>,
+    /// I1 class 2: how many `Event::OwnLag` this incarnation's driver has
+    /// handed its core. The directory ticker reads it before it takes a
+    /// snapshot (`Event::Peers`'s `lapses`), as the daemon's
+    /// `peer_links_task` does.
+    lapses_handed: AtomicU64,
     /// What the off-core heartbeat beats to (the daemon's
     /// `AliveTargets`): the epoch and end of the lease this node
     /// holds, `Core::beat_guard_wait_ms` and `Core::liveness_targets`,
@@ -503,6 +508,7 @@ impl NodeHandle {
             suspended_until: Mutex::new(None),
             lag: Mutex::new(None),
             lag_since: Mutex::new(None),
+            lapses_handed: AtomicU64::new(0),
             liveness: Mutex::new(None),
             conflict_copies: AtomicU64::new(0),
             floor_ms: Mutex::new(Vec::new()),
@@ -1765,6 +1771,7 @@ impl Driver {
             let oracles = self.oracles.clone();
             let p2p = self.core.config().p2p;
             let clock = self.clock.clone();
+            let shared = self.shared.clone();
             tokio::spawn(async move {
                 // Plan 30 §M9: since when each link has been up without a
                 // break (the directory's `since`).
@@ -1779,6 +1786,9 @@ impl Driver {
                     {
                         return;
                     }
+                    // Before the snapshot, never after: a lapse handed while
+                    // it is taken is then not counted as seen by it.
+                    let lapses = shared.lapses_handed.load(Ordering::SeqCst);
                     let now = clock.now();
                     // With P2P off the directory is empty (`Peers::disabled`).
                     let links: Vec<PeerLink> = nodes
@@ -1808,7 +1818,7 @@ impl Driver {
                             .filter_map(|l| l.since.map(|s| (l.node, s.0)))
                             .collect(),
                     );
-                    if tx.send(Event::Peers { links }).is_err() {
+                    if tx.send(Event::Peers { links, lapses }).is_err() {
                         return;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1844,6 +1854,7 @@ impl Driver {
             // the wake-up is handled (its silence watches and its backups'
             // acknowledgement timeouts discount it).
             if let Some((from, until)) = self.own_lapse.take() {
+                self.shared.lapses_handed.fetch_add(1, Ordering::SeqCst);
                 self.step_now = now;
                 let actions = self.core.handle(
                     now,
@@ -2267,6 +2278,7 @@ impl Driver {
         let lapsed = since.map_or(0, |t| {
             tokio::time::Instant::now().duration_since(t).as_millis() as i64
         });
+        self.shared.lapses_handed.fetch_add(1, Ordering::SeqCst);
         self.ready.push_back(Event::OwnLag {
             from: constellation_authority::WaitMs(now.wait.0 - lapsed),
             until: now.wait,

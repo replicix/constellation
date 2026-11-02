@@ -102,8 +102,11 @@ pub enum Event {
     Slack { epoch_slack: u32 },
     /// The P2P directory's view of the peers (M13's reachability rule,
     /// the holder's inbox poll set, M9's backup liveness). Sent whole,
-    /// whenever the driver refreshes it.
-    Peers { links: Vec<PeerLink> },
+    /// whenever the driver refreshes it. `lapses`: how many `OwnLag`
+    /// events the driver had handed to this core when it took the snapshot
+    /// (read before it, never after): the core is lone on it only if no
+    /// lapse of its own was handed since (`Core::backup_could_be_had`).
+    Peers { links: Vec<PeerLink>, lapses: u64 },
     /// EC2 campaign 8 A-1: this node's own S3 path, as the driver sees it
     /// (sent with every `Peers` refresh). `stalled`: no S3 request of this
     /// node has completed for the driver's stall window
