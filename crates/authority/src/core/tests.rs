@@ -44228,6 +44228,118 @@ mod deleg_group {
         assert!(h.core.settled_outcome(rid, &h.meta).is_some());
     }
 
+    /// I1 (`placement-hot` 1659 under slow lease reads; `long-delegated-late-
+    /// answers` 542, 992, `+commit`): the root's own client op, forwarded to
+    /// the delegate, is answered from the root's own append of the
+    /// delegate's row. The appended row is tagged `Lone`, not gated, so
+    /// `completed_row_settled` passed it and the answer left as `Archive`
+    /// with only this unshipped journal holding the row. A delegation row
+    /// counts once this tenure committed its append (shipped, or held by
+    /// every backup of a tenure that is not lone), whatever its class.
+    /// Fails before: answered with the append unshipped.
+    #[test]
+    fn a_root_does_not_answer_its_own_forwarded_op_from_its_unshipped_append_of_a_delegates_row() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.cfg.delegation_ttl_ms = 1_000;
+        h.hold(1, None);
+        let dir = delegated_to_me(&h.meta, 3);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRenew {
+                req: OpId(1),
+                gen: 7,
+                round: 1,
+                backup: None,
+                stream_head: 0,
+                stream_head_at: 0,
+                first: false,
+            },
+        });
+        // The root's own client op, in flight to the delegate: its outcome
+        // comes through the log (`AwaitingLog`).
+        let rid = h.rid(1);
+        let ino = h.meta.allocate_ino(dir).unwrap();
+        let op = MutateOp::Create {
+            parent: dir,
+            name: "f".into(),
+            ino,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        if let Some(t) = h.core.clients.get_mut(&rid).unwrap().timer.take() {
+            h.core.timers.remove(&t);
+        }
+        h.core.clients.get_mut(&rid).unwrap().phase = client::Phase::AwaitingLog {
+            epoch: 1,
+            position: constellation_meta::Position::ZERO,
+        };
+        // The delegate's batch carries the op's row; the root appends it.
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegateStream {
+                req: OpId(10),
+                gen: 7,
+                round: 1,
+                txs: vec![constellation_meta::DelegateTx {
+                    idx: 1,
+                    rid: Some(rid),
+                    records: vec![
+                        LogRecord::Create {
+                            parent: dir,
+                            name: "f".into(),
+                            ino,
+                            mode: 0o644,
+                            uid: 0,
+                            gid: 0,
+                            time_ns: 1,
+                        },
+                        LogRecord::Completed { rid },
+                    ],
+                    deps: Default::default(),
+                }],
+                leaving: Vec::new(),
+                leaving_barriers: Vec::new(),
+            },
+        });
+        assert!(
+            h.meta.outcome_row(rid).unwrap().is_some_and(|r| r.gen == 7),
+            "the root did not append the row"
+        );
+        assert!(h.core.holder_append_uncommitted(7, 1, &h.meta));
+        assert!(
+            client_answers(&out).is_empty(),
+            "answered from the root's own unshipped append: {out:?}"
+        );
+        assert!(!h.core.completed_row_settled(rid, &h.meta));
+        let mut out = Vec::new();
+        h.core.answer_awaiting_log(h.clk(), &h.meta, &mut out);
+        assert!(client_answers(&out).is_empty(), "{out:?}");
+        // The row ships: the log carries it, and the client hears it.
+        let batch = Replica::take_journal(&h.meta, 100).unwrap();
+        let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
+        Replica::ack_journal(&h.meta, &seqs, 1, None).unwrap();
+        h.core.note_shipped(&seqs, 0);
+        assert!(h.core.completed_row_settled(rid, &h.meta));
+        let mut out = Vec::new();
+        h.core.answer_awaiting_log(h.clk(), &h.meta, &mut out);
+        assert_eq!(
+            client_answers(&out),
+            vec![(rid, AnswerSource::Sequenced(AckClass::Archive))],
+            "{out:?}"
+        );
+    }
+
     /// D6 on the ordinary route: the delegate's own client op, journaled as a
     /// gated row its backup never acknowledged, is let go when the backup
     /// answers that it sealed the generation (the root drains it from the

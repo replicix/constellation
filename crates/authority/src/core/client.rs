@@ -3518,11 +3518,23 @@ impl Core {
     /// past the cut), and the rid then runs again at the generation's new
     /// owner. Settled once the group or the log holds it, or when it is
     /// this node's own client's `Lone` row.
+    ///
+    /// Also not while it is this node's own *append* of a delegate's row
+    /// (this node is the root) that its tenure has not committed
+    /// ([`Core::holder_append_uncommitted`]), whatever the class the row
+    /// carries: a root answers its own forwarded op from the row the
+    /// delegate streamed, and that row, tagged `Lone`, is held by this
+    /// journal alone until it ships or the backups hold it (`placement-hot`
+    /// 1659, `long-delegated-late-answers` 542, 992: answered `Archive`,
+    /// the root then sealed by its backup).
     pub(crate) fn completed_row_settled(&self, rid: Rid, replica: &dyn Replica) -> bool {
         replica
             .outcome_row(rid)
             .filter(|r| r.gen != 0)
-            .is_none_or(|r| !r.class.gated() || self.deleg_stream_durable(r.gen, r.idx, replica))
+            .is_none_or(|r| {
+                (!r.class.gated() || self.deleg_stream_durable(r.gen, r.idx, replica))
+                    && !self.holder_append_uncommitted(r.gen, r.idx, replica)
+            })
     }
 
     /// What this replica can answer for `rid` without running it, at a
