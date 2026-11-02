@@ -992,6 +992,11 @@ pub struct Stats {
     /// ran out (`dead_root_check`).
     pub dead_root_acquires: u64,
     pub deleg_not_owner: u64,
+    /// Plan 46 M0.3 (S3): a delegate's own op forwarded to the root after its
+    /// grant had time to reach it, which the root took as the generation
+    /// disowned and recalled (parking the op behind the recall) instead of
+    /// answering `Held`.
+    pub deleg_disowned_recalls: u64,
     /// Delegate: delegations installed here, transactions streamed,
     /// batches refused, renewals granted/refused, recalls received.
     pub deleg_installed: u64,

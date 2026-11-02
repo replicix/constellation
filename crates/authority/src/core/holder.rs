@@ -4,6 +4,7 @@
 //! and a pushed segment (`SyncRequest::ApplyPushed`).
 
 use super::client::named_child;
+use super::delegate::RecallPhase;
 use super::{Core, S3For};
 use crate::action::{Action, S3Op};
 use crate::event::PeerMsg;
@@ -295,13 +296,32 @@ impl Core {
             if self.cfg.delegation && self.deleg_known() {
                 let keys = keys_of_op_in(&op, replica);
                 if let Ownership::Delegated(d) = replica.resolve_ownership(&keys) {
+                    // Plan 46 M0.3 (S3): not a generation this root is
+                    // recalling (its delegate is stopped and would send the
+                    // op straight back: the recall is what ends it, and the
+                    // op parks behind it below), and not a delegate's own op
+                    // once its grant had time to reach it (it has disowned
+                    // the generation: recalled now, not outwaited).
+                    let live = self.dl.gens.get(&d.gen).filter(|g| {
+                        !g.ended
+                            && now.wait < self.gen_until(d.gen)
+                            && self.links.get(&d.node).is_some_and(|l| l.connected)
+                    });
+                    // (A designation is never recalled: its designee's own op
+                    // is held as it was, and `deleg_recall_plan` refuses.)
+                    let designated = self
+                        .dl
+                        .gens
+                        .get(&d.gen)
+                        .is_some_and(|g| g.kind == super::delegate::DelegKind::Designated);
+                    let disowned =
+                        from == d.node && !designated && !self.grant_in_flight(now, d.gen);
+                    if disowned && live.is_some_and(|g| g.recall == RecallPhase::None) {
+                        self.stats.deleg_disowned_recalls += 1;
+                    }
                     if d.node != self.cfg.node_id
-                        && self
-                            .dl
-                            .gens
-                            .get(&d.gen)
-                            .is_some_and(|g| !g.ended && now.wait < self.gen_until(d.gen))
-                        && self.links.get(&d.node).is_some_and(|l| l.connected)
+                        && live.is_some_and(|g| g.recall == RecallPhase::None)
+                        && !disowned
                     {
                         // Wholly a live delegate's: the requester's table
                         // was stale; send it there. (Phase 2b: only while

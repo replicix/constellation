@@ -120,6 +120,9 @@ pub(crate) struct GenState {
     /// When the root granted it (placement's dwell counts from here; the
     /// cut's designation-online check), on the wait clock.
     pub granted: WaitMs,
+    /// Plan 46 M0.3 (S3): inherited from a predecessor root, never granted
+    /// by this tenure (`granted` is when it was learned).
+    pub inherited: bool,
     /// Placement: since when the delegate's share has been below the
     /// leave threshold (`None`: it is not).
     pub below_since: Option<WaitMs>,
@@ -567,6 +570,14 @@ impl DelegationState {
 /// How long a recall answered for a generation this node's table has
 /// not named yet is remembered ([`DelegationState::handed_back`]).
 const HANDED_BACK_UNSEEN_MS: i64 = 60_000;
+
+/// Plan 46 M0.3 (S3): how long after the root granted a generation its
+/// delegate's own op forwarded to the root may still mean "my table has not
+/// carried the grant yet" ([`Core::grant_in_flight`]): the delegate learns it
+/// from the grant's renewal answer and the log's `Delegate` record, within two
+/// stream ticks and a P2P round trip each way. Past it, with the delegate not
+/// heard from, the op says the delegate disowned the generation.
+pub(crate) const GRANT_IN_FLIGHT_MS: i64 = 1_000;
 
 /// How many freezes [`DelegationState::freezes`] keeps.
 const FREEZES_KEPT: usize = 8;
@@ -1253,6 +1264,7 @@ impl Core {
                         group: GroupState::of(group_row),
                         redelegate: false,
                         granted: now.wait,
+                        inherited: true,
                         below_since: None,
                         seal_reqs: BTreeMap::new(),
                         sealed_tail: None,
@@ -6188,6 +6200,22 @@ impl Core {
         }
     }
 
+    /// Plan 46 M0.3 (S3): whether `gen`'s delegate may not have its grant
+    /// yet, so that an op it forwards to this root is one "sent before its
+    /// table carried the grant": this tenure granted the generation, not
+    /// longer ago than [`GRANT_IN_FLIGHT_MS`], and has not heard from the
+    /// delegate since. Otherwise the delegate forwarding its own op has
+    /// disowned the generation (stopped by a recall, a refused renewal or a
+    /// restart): it answers every op of it `NotHolder`, and the root must end
+    /// it, not wait for it. An inherited generation was never granted here.
+    pub(crate) fn grant_in_flight(&self, now: Now, gen: u64) -> bool {
+        self.dl.gens.get(&gen).is_some_and(|g| {
+            !g.inherited
+                && g.delegate_heard.is_none()
+                && now.wait.since(g.granted) < GRANT_IN_FLIGHT_MS
+        })
+    }
+
     pub(crate) fn start_recall(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
         let Some(g) = self.dl.gens.get_mut(&gen) else {
             return;
@@ -7276,6 +7304,7 @@ impl Core {
                 group: GroupState::default(),
                 redelegate: false,
                 granted: now.wait,
+                inherited: false,
                 below_since: None,
                 seal_reqs: BTreeMap::new(),
                 sealed_tail: None,

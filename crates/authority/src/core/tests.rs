@@ -31636,6 +31636,234 @@ fn a_write_into_a_fresh_delegation_is_recalled_until_the_root_sees_the_delegate(
     );
 }
 
+/// Plan 46 M0.3 (S3): the root's redirect of a forwarded op to the delegate of
+/// its keys (`NotHolder`), and its `Held` to the delegate's own op, were
+/// meant for a grant that is live and a delegate whose table is a moment
+/// behind. A generation the root is recalling, or a delegate that forwards
+/// its own op long after the grant, is neither: the redirect bounced the
+/// requester between the two nodes (the delegate, stopped, answers
+/// `NotHolder` back) until the generation ended by its outwait (long-
+/// delegated seed 178: 6 s).
+mod s3_no_loops {
+    use super::*;
+    use crate::core::delegate::RecallPhase;
+
+    /// Root node 1 with `d1` delegated to node 3 (generation 1 here) a
+    /// moment ago, every peer's link up.
+    fn delegated_root() -> (Harness, constellation_fs_core::Ino, u64) {
+        let (mut h, dir) = root_with_dir();
+        let out = h.step(Event::Control {
+            op: OpId(900),
+            req: Control::Delegate {
+                dir,
+                node: 3,
+                range: (0, 0),
+            },
+        });
+        assert!(
+            out.iter().any(|a| matches!(
+                a,
+                Action::ControlDone {
+                    op: OpId(900),
+                    result: Ok(_)
+                }
+            )),
+            "not delegated: {out:?}"
+        );
+        h.step(Event::Peers {
+            links: (2..=4)
+                .map(|node| crate::event::PeerLink {
+                    node,
+                    connected: true,
+                    last_seen: Some(w(h.now)),
+                    rtt_ms: Some(1),
+                    since: Some(w(h.now)),
+                })
+                .collect(),
+            lapses: 0,
+        });
+        let gen = h.meta.delegation_table().get(dir).expect("delegated").gen;
+        (h, dir, gen)
+    }
+
+    /// `from`'s request `req` for a create (or its settle) of `name` in `dir`.
+    fn forward(
+        h: &mut Harness,
+        from: NodeId,
+        req: u64,
+        dir: constellation_fs_core::Ino,
+        settle: bool,
+    ) -> Vec<Action> {
+        let ino = h.meta.allocate_ino(dir).unwrap();
+        h.step(Event::Peer {
+            from,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(req),
+                rid: Rid {
+                    node: from,
+                    incarnation: 1,
+                    seq: req,
+                },
+                op: MutateOp::Create {
+                    parent: dir,
+                    name: format!("n{req}"),
+                    ino,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+                settle,
+            },
+        })
+    }
+
+    fn reply_to(out: &[Action], to: NodeId, req: u64) -> Option<MutateOutcome> {
+        sends(out).into_iter().find_map(|(n, m)| match m {
+            PeerMsg::MutateReply {
+                req: r, outcome, ..
+            } if n == to && *r == OpId(req) => Some(outcome.clone()),
+            _ => None,
+        })
+    }
+
+    fn recalls_sent(out: &[Action], to: NodeId) -> usize {
+        sends(out)
+            .iter()
+            .filter(|(n, m)| *n == to && matches!(m, PeerMsg::DelegRecall { .. }))
+            .count()
+    }
+
+    /// The generation is granted long ago and the delegate has been heard:
+    /// its own op forwarded to the root says it disowned the generation (a
+    /// stopped delegate answers `NotHolder` to everyone). The root recalls it
+    /// and parks the op behind the recall, instead of answering `Held` and
+    /// outwaiting the generation. Fails on the parent: `Held`, no recall.
+    #[test]
+    fn a_root_recalls_a_generation_whose_delegate_forwards_its_own_op() {
+        let (mut h, dir, gen) = delegated_root();
+        h.core.dl.gens.get_mut(&gen).unwrap().delegate_heard = Some(w(h.now));
+        h.advance(5_000);
+        let out = forward(&mut h, 3, 7, dir, false);
+        assert_eq!(recalls_sent(&out, 3), 1, "no recall: {out:?}");
+        assert_eq!(reply_to(&out, 3, 7), None, "answered: {out:?}");
+        assert!(
+            h.core.has_exec_parks(),
+            "the op is not parked behind the recall"
+        );
+        assert_eq!(h.core.dl.gens[&gen].recall, RecallPhase::Sent);
+        // The delegate's settle of the same op takes the same road.
+        let out = forward(&mut h, 3, 8, dir, true);
+        assert_eq!(reply_to(&out, 3, 8), None, "{out:?}");
+        assert_eq!(recalls_sent(&out, 3), 0, "a second recall: {out:?}");
+    }
+
+    /// A generation the root recalls already is never redirected to: the
+    /// delegate is stopped and would send the op straight back. The op, and a
+    /// settle of one, are parked behind the recall (a settle never waits for
+    /// `deps`). Fails on the parent: `NotHolder { 3 }`.
+    #[test]
+    fn a_root_parks_a_forward_behind_its_own_recall_instead_of_redirecting() {
+        for settle in [false, true] {
+            let (mut h, dir, gen) = delegated_root();
+            h.core.dl.gens.get_mut(&gen).unwrap().delegate_heard = Some(w(h.now));
+            h.core.start_recall(h.clk(), gen, &mut Vec::new());
+            assert_eq!(h.core.dl.gens[&gen].recall, RecallPhase::Sent);
+            let out = forward(&mut h, 2, 7, dir, settle);
+            assert_eq!(
+                reply_to(&out, 2, 7),
+                None,
+                "settle {settle}: redirected or answered: {out:?}"
+            );
+            assert!(h.core.has_exec_parks(), "settle {settle}: not parked");
+            assert_eq!(recalls_sent(&out, 3), 0, "settle {settle}: recalled again");
+        }
+    }
+
+    /// The control: inside the grant's own flight time the delegate's table
+    /// may be a moment behind, and its op is held for a retry. And a third
+    /// node's op is still redirected to a live delegate. Passes on the
+    /// parent.
+    #[test]
+    fn a_fresh_grant_still_holds_its_delegates_own_op() {
+        let (mut h, dir, gen) = delegated_root();
+        h.advance(300);
+        let out = forward(&mut h, 3, 7, dir, false);
+        assert!(
+            matches!(reply_to(&out, 3, 7), Some(MutateOutcome::Held { .. })),
+            "{out:?}"
+        );
+        assert_eq!(recalls_sent(&out, 3), 0, "{out:?}");
+        assert_eq!(h.core.dl.gens[&gen].recall, RecallPhase::None);
+        let out = forward(&mut h, 2, 8, dir, false);
+        assert_eq!(
+            reply_to(&out, 2, 8),
+            Some(MutateOutcome::NotHolder { holder: 3 }),
+            "{out:?}"
+        );
+    }
+
+    /// A designation is never recalled (`deleg_recall_plan` refuses the op
+    /// instead): its designee's own op long after the grant is held as it was,
+    /// neither recalled nor refused.
+    #[test]
+    fn a_designees_own_op_is_still_held() {
+        let (mut h, dir, gen) = delegated_root();
+        let g = h.core.dl.gens.get_mut(&gen).unwrap();
+        g.kind = crate::core::delegate::DelegKind::Designated;
+        g.delegate_heard = Some(w(h.now));
+        h.advance(5_000);
+        let out = forward(&mut h, 3, 7, dir, false);
+        assert!(
+            matches!(reply_to(&out, 3, 7), Some(MutateOutcome::Held { .. })),
+            "{out:?}"
+        );
+        assert_eq!(recalls_sent(&out, 3), 0, "{out:?}");
+        assert_eq!(h.core.dl.gens[&gen].recall, RecallPhase::None);
+    }
+
+    /// Past the grant's flight time with the delegate not heard from at all,
+    /// and for a generation inherited from a predecessor (never granted
+    /// here), the delegate's own op disowns it as well.
+    #[test]
+    fn a_silent_or_inherited_generation_is_recalled_for_its_delegates_own_op() {
+        // Granted here, never heard, the flight time long past.
+        let (mut h, dir, _gen) = delegated_root();
+        h.advance(5_000);
+        let out = forward(&mut h, 3, 7, dir, false);
+        assert_eq!(recalls_sent(&out, 3), 1, "{out:?}");
+        assert_eq!(reply_to(&out, 3, 7), None, "{out:?}");
+        // Inherited: not granted by this tenure, even inside the window.
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(2, None);
+        let dir = delegated_to_me(&h.meta, 3);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.gens.contains_key(&7));
+        h.step(Event::Peers {
+            links: (2..=4)
+                .map(|node| crate::event::PeerLink {
+                    node,
+                    connected: true,
+                    last_seen: Some(w(h.now)),
+                    rtt_ms: Some(1),
+                    since: Some(w(h.now)),
+                })
+                .collect(),
+            lapses: 0,
+        });
+        h.advance(100);
+        let out = forward(&mut h, 3, 8, dir, false);
+        assert_eq!(recalls_sent(&out, 3), 1, "{out:?}");
+        assert_eq!(reply_to(&out, 3, 8), None, "{out:?}");
+    }
+}
+
 /// `fs set epoch-slack` raising `f` from 0 on a mounted node whose
 /// promise TTL exceeds lease TTL / 4 (never validated at mount, since
 /// `f` was 0 then): the core clamps the TTL instead of promising for
