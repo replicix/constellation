@@ -621,6 +621,66 @@ fn a_lone_row_journaled_after_the_node_stopped_being_lone_is_in_doubt() {
     assert_eq!(session.stats().ungated_unexpected, 1);
 }
 
+/// I1 class 2: a root resumed from a process freeze runs its FUSE threads
+/// before its driver can hand the core the lapse (and the directory snapshots
+/// queued behind it). What the core last published, that this node may
+/// answer alone, was judged on a directory older than the lapse: while the
+/// probe reports a lapse the driver has not stepped on, the row journaled
+/// `Lone` is in doubt, by rid through the core (D5); once the driver has
+/// handed it (and the core has published again), the published word stands.
+/// Fails on the parent: the row was answered `Ok` at once on this disk.
+#[test]
+fn a_lone_row_is_in_doubt_while_a_lapse_is_not_handed_to_the_core() {
+    use constellation_meta::RowClass;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let session = meta.session();
+    // The core's last word: lone, the gate off.
+    session.set_durable(false, u64::MAX, false, RowClass::Lone, true);
+    let off = Arc::new(crate::authority_driver::OffCore::new(5_000));
+    {
+        let off = off.clone();
+        session.set_lone_guard(Arc::new(move || {
+            off.lapse_unhanded(crate::authority_driver::wait_now_ms())
+        }));
+    }
+    let (fs, _dir, mut core) = holder_fs(meta.clone(), false);
+    let create = |name: &str| constellation_meta::MutateOp::Create {
+        parent: ROOT_INO,
+        name: name.into(),
+        ino: meta.allocate_ino(ROOT_INO).unwrap(),
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    // No lapse: answered at once, nothing sent to the core.
+    assert_eq!(fs.mutate_op(ROOT_INO, create("before")), Ok(()));
+    // The process was frozen: the probe's tick is overdue by seconds.
+    let now = crate::authority_driver::wait_now_ms();
+    off.note_probe(now, 3_000);
+    assert!(!session.durable_lone_ok());
+    let (stop, submitted) = (AtomicBool::new(false), Mutex::new(Vec::new()));
+    let result = std::thread::scope(|scope| {
+        let responder = scope.spawn(|| core_answering_in_doubt(&mut core, &stop, &submitted));
+        let result = fs.mutate_op(ROOT_INO, create("during"));
+        stop.store(true, Ordering::Relaxed);
+        responder.join().unwrap();
+        result
+    });
+    assert!(result.is_err(), "not answered OK: {result:?}");
+    {
+        let submitted = submitted.lock().unwrap();
+        assert_eq!(submitted.len(), 1, "resubmitted once: {submitted:?}");
+        assert!(submitted[0].1, "in doubt");
+    }
+    assert_eq!(session.stats().ungated_unexpected, 1);
+    // The driver hands the lapse and the core publishes again.
+    off.lapse_stepped(now);
+    assert!(session.durable_lone_ok());
+    assert_eq!(fs.mutate_op(ROOT_INO, create("after")), Ok(()));
+    assert_eq!(session.stats().ungated_unexpected, 1);
+}
+
 /// Plan 43 C1-2: the fast path's wait follows the class the row was
 /// journaled under, not the gate as it stands after the execution: a row
 /// journaled `Lone` (the gate was off) is answered at once, whatever the

@@ -74,7 +74,7 @@ use crate::replay::TouchSet;
 use crate::store::local::RowClass;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 /// A point in one tenure's journal: `(epoch, journal seq)`, ordered
@@ -820,7 +820,16 @@ pub struct SessionState {
     /// continuation epoch (`Core::root_lone`, `epoch_held`). Published with
     /// the gate, stored before it.
     durable_lone_ok: AtomicBool,
+    /// I1 class 2: the driver's veto on `durable_lone_ok`, read at the
+    /// moment of the check, not published by a step: `true` while this
+    /// node has a lapse of its own the core has not been handed (a frozen
+    /// process wakes its FUSE threads before its driver). See
+    /// [`SessionState::set_lone_guard`].
+    lone_guard: RwLock<Option<LoneGuard>>,
 }
+
+/// See [`SessionState::set_lone_guard`].
+pub type LoneGuard = Arc<dyn Fn() -> bool + Send + Sync>;
 
 fn budget_default() -> u64 {
     std::env::var("CONSTELLATION_SESSION_WAIT_MS")
@@ -853,6 +862,7 @@ impl Default for SessionState {
             // before. The core publishes `false` at its start, before the
             // mount serves, and the truth at every step after.)
             durable_lone_ok: AtomicBool::new(true),
+            lone_guard: RwLock::new(None),
         }
     }
 }
@@ -1508,7 +1518,7 @@ impl SessionState {
             if !self.durable_gate.load(Ordering::Acquire) {
                 return if self.durable_lost.load(Ordering::Relaxed) {
                     DurableWait::Lost
-                } else if self.durable_lone_ok.load(Ordering::Acquire) {
+                } else if self.durable_lone_ok() {
                     DurableWait::Ungated
                 } else {
                     DurableWait::Unexpected
@@ -1651,8 +1661,30 @@ impl SessionState {
 
     /// Plan 43 C2 (§5.4, D5): with the gate off, the core said this node may
     /// answer its own clients alone (it is lone, or holds an epoch).
+    ///
+    /// I1 class 2: not while the guard ([`Self::set_lone_guard`]) says this
+    /// node has a lapse its core has not been handed: what the core
+    /// published was judged on a directory older than the lapse.
     pub fn durable_lone_ok(&self) -> bool {
         self.durable_lone_ok.load(Ordering::Acquire)
+            && !self
+                .lone_guard
+                .read()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|guard| guard())
+    }
+
+    /// Install the driver's veto on [`Self::durable_lone_ok`]: `guard`
+    /// returns `true` while this node has a lapse of its own (a process
+    /// freeze, a held runtime) that its core has not been handed yet. A
+    /// root resumed from a freeze is judged lone on the directory it held
+    /// before it; its FUSE threads run before its driver can hand the lapse
+    /// and a newer directory, and must not answer on the disk alone then. A
+    /// row journaled `Lone` meanwhile waits like a gated one and takes the
+    /// in-doubt path through the core (D5).
+    pub fn set_lone_guard(&self, guard: LoneGuard) {
+        *self.lone_guard.write().unwrap() = Some(guard);
     }
 
     /// Whether the durability gate is on (one atomic load: the fast

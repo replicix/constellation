@@ -852,7 +852,7 @@ fn now() -> Now {
 /// driver's wake and lag stamps, the beats' send stamps and every arrival
 /// stamp the core compares with them (plan 43 C7-H1): none of them moves
 /// with a wall step.
-fn wait_now_ms() -> i64 {
+pub(crate) fn wait_now_ms() -> i64 {
     constellation_platform::clock::protocol().wait().0
 }
 
@@ -1723,6 +1723,12 @@ pub struct OffCore {
     /// the wake-up of the directory task that follows a lapse
     /// ([`Driver::hand_lag`], [`peer_links_task`]).
     pub(crate) lapses: Arc<LapseCount>,
+    /// The end of the latest lapse the core has been handed and has
+    /// stepped on (published after the step, so that the `lone_ok` it
+    /// published is the one in force): while the probe's latest lapse
+    /// ends after it, the fast path does not answer alone
+    /// ([`Self::lapse_unhanded`]).
+    lag_handed: std::sync::atomic::AtomicI64,
     busy_since: std::sync::atomic::AtomicI64,
     /// holder → (its latest epoch heard, the latest arrival at it, the
     /// latest lease expiry a heartbeat of that epoch named; 0: none).
@@ -1831,6 +1837,7 @@ impl OffCore {
         deleg_windows.set_probe(root_probe.clone());
         Self {
             lapses: Arc::new(LapseCount::default()),
+            lag_handed: std::sync::atomic::AtomicI64::new(0),
             root_probe,
             leases: std::sync::OnceLock::new(),
             runtime: std::sync::OnceLock::new(),
@@ -2233,10 +2240,25 @@ impl OffCore {
         *self.lapse.lock().unwrap()
     }
 
-    /// The core stepped on a lapse (`Event::OwnLag`): the directory task
-    /// takes a snapshot now, not at the next tick or change.
-    pub(crate) fn lapse_stepped(&self) {
+    /// The core stepped on the lapse ending at `until` (`Event::OwnLag`):
+    /// the lone judgement it published stands for the fast path from here
+    /// on ([`Self::lapse_unhanded`]), and the directory task takes a
+    /// snapshot now, not at the next tick or change.
+    pub(crate) fn lapse_stepped(&self, until: i64) {
+        self.lag_handed.fetch_max(until, Ordering::Release);
         self.lapses.wake.notify_one();
+    }
+
+    /// Whether this node has a lapse the driver has not handed the core
+    /// yet (the same test as [`Driver::hand_lag`]'s): its threads ran again
+    /// (a frozen process wakes all of them together) before the driver did,
+    /// so what the core last published — that this node may answer alone —
+    /// was judged on a directory older than the lapse. The FUSE fast path
+    /// does not answer alone meanwhile (`Session::set_lone_guard`): a row
+    /// journaled `Lone` takes the in-doubt path through the core.
+    pub(crate) fn lapse_unhanded(&self, now_wait_ms: i64) -> bool {
+        let (_, until) = self.lapse(now_wait_ms);
+        until > self.lag_handed.load(Ordering::Acquire) + self.lag_threshold_ms / 2
     }
 
     /// How long past its period the lag probe has not ticked (0: it is
@@ -2811,9 +2833,10 @@ impl Driver {
                     from: WaitMs(from),
                     until: WaitMs(until),
                 }));
-                // After the step: a snapshot of the directory now, not at
-                // the next tick or change.
-                off.lapse_stepped();
+                // After the step: the lone judgement it published stands
+                // for the fast path from here on; and a snapshot of the
+                // directory now, not at the next tick or change.
+                off.lapse_stepped(until);
             }
         }
     }
@@ -9423,7 +9446,7 @@ mod tests {
             None,
             "woken before the core stepped on the lapse"
         );
-        off.lapse_stepped();
+        off.lapse_stepped(1_000);
         assert_eq!(
             next_peers(&mut rx, Duration::from_millis(500)).await,
             Some(1),
@@ -9431,11 +9454,39 @@ mod tests {
         );
         // A second lapse: the next snapshot carries two.
         off.lapses.handing();
-        off.lapse_stepped();
+        off.lapse_stepped(2_000);
         assert_eq!(
             next_peers(&mut rx, Duration::from_millis(500)).await,
             Some(2)
         );
+    }
+
+    /// I1 class 2: the fast path's veto. A lapse the probe reports and the
+    /// driver has not stepped on is pending (the same test as `hand_lag`'s:
+    /// a lapse ending within half a threshold of the last one handed is not
+    /// a new one); a probe overdue by its threshold is a lapse in progress.
+    #[test]
+    fn a_lapse_the_driver_has_not_handed_is_pending() {
+        let off = super::OffCore::new(5_000);
+        let now = 1_000_000;
+        assert!(!off.lapse_unhanded(now), "none yet");
+        off.note_probe(now, 400);
+        assert!(off.lapse_unhanded(now), "a lapse the probe saw");
+        off.lapse_stepped(now);
+        assert!(!off.lapse_unhanded(now), "handed");
+        // The same lapse, grown by less than half a threshold: not new.
+        off.note_probe(now + 10, 410);
+        assert!(!off.lapse_unhanded(now + 10));
+        // A later one is.
+        off.note_probe(now + 5_000, 400);
+        assert!(off.lapse_unhanded(now + 5_000));
+        off.lapse_stepped(now + 5_000);
+        assert!(!off.lapse_unhanded(now + 5_000));
+        // The probe overdue by a period and a threshold: the runtime is
+        // held up right now, and has not said so yet.
+        assert!(off.lapse_unhanded(now + 5_000 + 10_000));
+        off.lapse_stepped(now + 5_000 + 10_000);
+        assert!(!off.lapse_unhanded(now + 5_000 + 10_000));
     }
 
     /// `startup-link-lag`: a peer that enrols shows up connected in the

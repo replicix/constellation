@@ -1210,6 +1210,15 @@ impl Engine {
         // service off the core's step (`authority_driver::OffCore`).
         let (urgent_tx, urgent_rx) = tokio::sync::mpsc::unbounded_channel();
         let off_core = Arc::new(crate::authority_driver::OffCore::for_config(&core_config));
+        // I1 class 2: the fast path does not answer alone while a lapse of
+        // this process has not been handed to its core (a frozen process
+        // wakes its FUSE threads before its driver).
+        {
+            let off_core = off_core.clone();
+            meta.session().set_lone_guard(Arc::new(move || {
+                off_core.lapse_unhanded(crate::authority_driver::wait_now_ms())
+            }));
+        }
         // The core's IO driver: the sync task (plan 30 M5).
         {
             let driver = crate::authority_driver::Driver::new(
