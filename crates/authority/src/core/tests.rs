@@ -13912,6 +13912,78 @@ mod backup_crash {
         }
     }
 
+    /// `long-backup` seed 84 under `+commit` (once the lone test counted a
+    /// linked peer): two ops of a takeover's inbox drain were journaled while
+    /// a peer was linked (`Archive`), and answered in doubt, from the journal,
+    /// waiting for the journal's tip. The gate went off, the answers left as
+    /// the lone node's, and the re-tag the release makes (D4) changed the tip's
+    /// row, not the rids' own: the answers said `Lone` over rows still tagged
+    /// `Archive`. The re-tag is of the rid's own transaction. (Fails before:
+    /// the rid's row stays `Archive` and the tip's is re-tagged.)
+    #[test]
+    fn a_gated_answer_released_with_the_gate_off_retags_its_own_row_not_the_tips() {
+        let mut h = Harness::new(1);
+        backup_node(&mut h, vec![1, 2]);
+        // (Not yet stable: no candidate is brought up.)
+        link_2(&mut h, true, Some(5), 0);
+        h.hold(1, None);
+        h.core.ack.eligible = Some(h.core.backup_could_be_had());
+        assert_eq!(h.core.root_ack_class(), AckClass::Archive);
+        // Two ops of this node journaled as the root (the inbox drain's):
+        // rid 1's row first, rid 2's after it, the tip.
+        let (rid1, rid2) = (h.rid(1), h.rid(2));
+        let (op1, op2) = (h.create("a"), h.create("b"));
+        {
+            let _class = h.core.journal_class();
+            constellation_meta::execute_mutate(&h.meta, &op1, Some(rid1)).unwrap();
+            constellation_meta::execute_mutate(&h.meta, &op2, Some(rid2)).unwrap();
+        }
+        let class_of = |h: &Harness, rid| {
+            crate::replica::Replica::journal_class_of_rid(&h.meta, rid).map(|(_, c)| c)
+        };
+        assert_eq!(
+            class_of(&h, rid1),
+            Some(constellation_meta::RowClass::Archive)
+        );
+        assert_eq!(
+            class_of(&h, rid2),
+            Some(constellation_meta::RowClass::Archive)
+        );
+        // Rid 1's client asks again, in doubt: found done, its answer waits
+        // for the journal's tip.
+        let out = h.step(Event::SubmitInDoubt {
+            rid: rid1,
+            op: op1,
+            policy: Policy::Client,
+            tag: Default::default(),
+        });
+        assert!(replies(&out).is_empty(), "answered at once: {out:?}");
+        // The peer goes away; the next selection pass finds nobody in
+        // budget, the gate is off, and the answer leaves.
+        h.advance(100);
+        let out = link_2(&mut h, false, None, 0);
+        assert_eq!(h.core.durable_jseq(), u64::MAX, "the gate is still on");
+        let replied = replies(&out);
+        assert_eq!(replied.len(), 1, "{out:?}");
+        assert!(matches!(
+            out.iter().find_map(|a| match a {
+                Action::Reply { source, .. } => Some(*source),
+                _ => None,
+            }),
+            Some(crate::AnswerSource::Sequenced(AckClass::Lone))
+        ));
+        assert_eq!(
+            class_of(&h, rid1),
+            Some(constellation_meta::RowClass::Lone),
+            "answered lone over a row still tagged otherwise"
+        );
+        assert_eq!(
+            class_of(&h, rid2),
+            Some(constellation_meta::RowClass::Archive),
+            "another op's row was re-tagged"
+        );
+    }
+
     /// The same moment, reached from a listed backup: whether a backup could
     /// be had is assessed by every selection pass, and one that ran while
     /// node 2 was listed left it out (it is no candidate: it is a backup).
@@ -42266,7 +42338,10 @@ mod deleg_group {
     #[test]
     fn without_the_hysteresis_the_rename_is_answered_lone_and_replayed_alone() {
         let (answered, dropped, queued, rename) = create_then_rename_at_a_root_crash(false);
-        assert_eq!(answered, Some(AnswerSource::Sequenced(AckClass::Lone)));
+        assert_eq!(
+            answered,
+            Some(crate::AnswerSource::Sequenced(AckClass::Lone))
+        );
         assert_eq!(dropped, 1, "the create is dropped");
         assert_eq!(queued, vec![rename], "the rename is replayed alone");
     }
@@ -42475,7 +42550,7 @@ mod deleg_group {
             mode: 0,
         };
         let (_, a) = own_op(&mut h, 1, set("user.pad"));
-        assert_eq!(a, Some(AnswerSource::Sequenced(AckClass::Lone)));
+        assert_eq!(a, Some(crate::AnswerSource::Sequenced(AckClass::Lone)));
         let (_, a) = own_op(&mut h, 2, set("user.k"));
         assert_eq!(a, None, "past the lead: waits for the root");
         let (_, a) = own_op(
