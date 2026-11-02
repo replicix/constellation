@@ -50279,6 +50279,16 @@ mod await_retry {
         idents.sort();
         assert_eq!(idents, vec![(1, seed), (1, dependent)]);
         assert!(
+            out.iter().any(|a| matches!(
+                a,
+                Action::ControlDone {
+                    result: Ok(ControlOk::DroppedHeld(d)),
+                    ..
+                } if d.unidentified == 0
+            )),
+            "every rolled-back transaction was named"
+        );
+        assert!(
             drop_tx.records[1..]
                 .iter()
                 .all(|r| matches!(r, LogRecord::Refused { .. }))

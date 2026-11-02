@@ -363,6 +363,22 @@ pub struct DroppedHeld {
     pub kept_pending: Vec<ChunkHash>,
     /// The ops in flight here that keep those chunks held.
     pub kept_for: Vec<crate::rid::Rid>,
+    /// Rolled-back transactions that could not be named in the `RolledBack`
+    /// record (no journal head): members keep their copies of them.
+    pub unidentified: usize,
+}
+
+/// The identity a member keys a rolled-back transaction by
+/// (`LogRecord::RolledBack`): its `TailOf` pair if it began with one, else
+/// `(its tenure's epoch, first journal seq)`. `None` without the journal
+/// head that says the epoch.
+fn rolled_back_ident(
+    head_epoch: Option<u64>,
+    first: u64,
+    records: &[LogRecord],
+) -> Option<(u64, u64)> {
+    let epoch = head_epoch?;
+    Some(super::member::tail_identity(records).unwrap_or((epoch, first)))
 }
 
 /// The write sessions of one inode that are open on this node (the engine
@@ -429,6 +445,12 @@ impl DroppedHeld {
             self.queued_dropped,
             self.pending_removed
         );
+        if self.unidentified > 0 {
+            text.push_str(&format!(
+                "; {} rolled-back transaction(s) could not be named to the members, which keep their copies",
+                self.unidentified
+            ));
+        }
         if !self.kept_pending.is_empty() {
             let rids: Vec<String> = self.kept_for.iter().map(|r| format!("{r:?}")).collect();
             text.push_str(&format!(
@@ -1345,6 +1367,7 @@ impl Meta {
         // The identity of every transaction the drop rolls back, as a
         // member keys it (`LogRecord::RolledBack`).
         let mut idents: Vec<(u64, u64)> = Vec::new();
+        let mut unidentified = 0usize;
         for (t, seed_inos, keys) in held.held {
             let is_seed = seed_inos.contains(&ino);
             let depends = keys
@@ -1362,10 +1385,21 @@ impl Meta {
             };
             let placeholder = placeholder_keys(&t, &keys);
             let records: Vec<LogRecord> = t.rows.iter().map(|(_, rec)| rec.clone()).collect();
-            if let Some(epoch) =
-                super::local::get_journal_tx_head(&tx, self, t.first)?.map(|head| head.epoch)
-            {
-                idents.push(super::member::tail_identity(&records).unwrap_or((epoch, t.first)));
+            let head_epoch =
+                super::local::get_journal_tx_head(&tx, self, t.first)?.map(|head| head.epoch);
+            match rolled_back_ident(head_epoch, t.first, &records) {
+                Some(ident) => idents.push(ident),
+                // A captured transaction (it has before-images) has its
+                // head; one without cannot be named to the members, which
+                // keep their copy of it. Said, counted, never silent.
+                None => {
+                    unidentified += 1;
+                    tracing::warn!(
+                        first = t.first,
+                        "a transaction the drop rolls back has no journal head: \
+                         members cannot be told to retract it"
+                    );
+                }
             }
             tainted.extend(keys);
             let origin = spec::row_keys_and_origin(&tx, self, spec_seq)?
@@ -1610,6 +1644,7 @@ impl Meta {
             missing,
             kept_pending,
             kept_for,
+            unidentified,
         })
     }
 }
@@ -1617,6 +1652,21 @@ impl Meta {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rolled_back_transaction_is_named_by_its_tail_or_its_place() {
+        let recs = [LogRecord::Completed {
+            rid: crate::rid::Rid {
+                node: 1,
+                incarnation: 1,
+                seq: 1,
+            },
+        }];
+        assert_eq!(rolled_back_ident(Some(3), 7, &recs), Some((3, 7)));
+        let tail = [LogRecord::TailOf { epoch: 1, jseq: 4 }, recs[0].clone()];
+        assert_eq!(rolled_back_ident(Some(3), 7, &tail), Some((1, 4)));
+        assert_eq!(rolled_back_ident(None, 7, &recs), None, "no head: no name");
+    }
 
     #[test]
     fn a_hole_replaces_each_lost_chunk() {
