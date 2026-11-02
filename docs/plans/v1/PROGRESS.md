@@ -64344,3 +64344,126 @@ The flex strict flags (plan 43 C2h's) stay off: plan 46 D9 defers them to M1.4 (
 `delegated-*` and `locks` configurations' strict flags were C2's own. `bench/commit-rule/RESULTS.md` has the C2 rows
 (G1's measurement of C2c and C2d, the p90 delays, C2e to C2g's note); the four-file-system run and C0's baseline remain open
 there.
+
+
+## Plan 46 M0.3: three product causes of an `EIO` that was not settled first (2026-11-02)
+
+On main 476f0cc8 with the C2h commits (`5d996c6b` and the three after it: the I4 strict classifier, `tloss-two-node`,
+`delegated-group-switch`) applied in a scratch tree, which is where the counts below were taken: the classifier is not on
+main yet. The causes came from the classifier's samples (`+unsettled`), each traced to the line in a seed before it was
+fixed; the spec is the gate-before-stage-1 list of plan 46 M0.3. S4 (the recall's cut before its read recalls) and S5
+(a gated root recalling another node's generation) are not here. One commit each; fail-before is the test named.
+
+1. **S1: a gated root answers settles (integrity).** After a takeover the gate keeps the view closed for the read quarantine
+   and the drain, 12 to 20 s, long after its journal work is done (`PendingGate::shippable`: the marker landed, the
+   predecessor's tail applied, its own delegate rows re-appended, the stranded replays run). Every forward got `Busy` for
+   all of it, a settle included, which spent the requester's retries (`backup-strict` 27: node 3's create settles from
+   6.55 s, `Busy` every time, `EIO` in doubt at 13.54 s, the gate opens at 15.77 s and the rid executes at 16.15 s, a late
+   landing in substance); and a requester that was itself the gated root looped in `settle_route` ("the holder is
+   unreachable, routing again") with itself as the holder (`tloss-two-node` 35, `delegated-group-switch` 615). Now
+   `Core::gate_settle`: once `shippable`, a settle on a key this node owns (the root's, a generation delegated to this
+   node, a cross-subtree op whose every generation is this node's; the gate ends those at the cursor, with nothing to wait
+   for) is answered by the gate. A rid with no outcome gets the journaled `Refused { rid, ABANDONED }` (`settle_refusal`,
+   class archive: no backup is formed in the gate), answered once the row has shipped, to the own client too; a rid that
+   took effect (`recent_outcome`, an executed `completed` row, the tail's) is answered `Held`, never `Accepted` before the
+   quarantine (M8: a predecessor's read delegate may still serve the old state) and never `Abandoned`; before `shippable`
+   the answer is `Held`. A settle on another node's generation is unchanged (`Busy`; S5). Safe because every later copy
+   of the rid dedups to the refusal (an older epoch's inbox batch drained after the quarantine, a queued replay, a retry, a
+   park) and a refusal changes nothing a reader sees; a gate that ends in deposition aborts the parked answer `Busy` and
+   the row rolls back unless it shipped. Fail-before (core, `c2g_settle`): `a_gated_root_refuses_an_unknown_rids_settle_and_answers_once_it_ships`,
+   `a_gated_root_holds_a_settle_of_a_rid_that_took_effect`, `a_gated_root_holds_a_settle_until_its_journal_work_is_done`,
+   `the_inbox_drain_after_a_gated_settle_dedups_to_the_refusal`, `a_gated_roots_own_settle_is_refused_locally_and_answered_once_it_ships`,
+   `a_gated_roots_deposition_aborts_an_unshipped_settle_busy`, `a_gated_root_settles_a_rid_on_a_generation_delegated_to_itself`
+   (it answered `Held`: the M12 "grant not installed yet" branch); the control `a_gated_root_still_bounces_a_settle_on_another_nodes_generation`.
+   The own-client path asserts (debug) that a gated root knows no generation of its tenure to recall.
+2. **S2: a gated root leaves a delegation renewal unanswered.** `on_deleg_renew` refused a renewal with `ttl_ms` 0 whenever
+   the root was not usable, a gate included; the delegate took that as "the generation is ending" and stopped, and the
+   gate then opened, inherited the generation as live and outwaited it (`delegated-backup` 129: node 3's renewal at 3.94 s
+   refused by the gated root 2, the generation held node 3's own unlink until 22.99 s). A root that holds a lease it has not
+   lost, with its gate pending, now leaves the renewal unanswered, as a re-adopting root does: the delegate sends it again
+   on its timeout and the opened root grants it, or the delegate lapses (always safe). Fail-before: `a_gated_root_leaves_a_renewal_unanswered`.
+3. **S3: no `Held` or `NotHolder` loop.** The root redirected an op to the delegate of its keys whenever the generation
+   was live and the delegate connected, and held the delegate's own op whatever its state. A generation the root has begun
+   to recall has a stopped delegate, which answers `NotHolder` back; a delegate forwarding its own op long after the grant
+   has disowned the generation the same way (`long-delegated` 178: gen 8 granted at 10.868 s and recalled at 10.892 s, node
+   3's settle bounced 1 to 2 from 10.87 to 13.87 s). The redirect skips a generation under recall, so the op or its settle
+   parks behind the recall (`deleg_recall_plan`); a delegate's own op is held only while its grant may still be in flight
+   (this tenure granted it, the delegate not heard from, `GRANT_IN_FLIGHT_MS` = 1 s), otherwise the root recalls and parks.
+   An inherited generation counts as disowned (`GenState::inherited`); a designation is never recalled, its designee's op is
+   held as before. Fail-before: `a_root_recalls_a_generation_whose_delegate_forwards_its_own_op`,
+   `a_root_parks_a_forward_behind_its_own_recall_instead_of_redirecting`, `a_silent_or_inherited_generation_is_recalled_for_its_delegates_own_op`;
+   the controls `a_fresh_grant_still_holds_its_delegates_own_op`, `a_designees_own_op_is_still_held`.
+4. **Pins.** `settle_before_eio_a_gate_a_renewal_and_a_redirect_loop_leave_no_unsettled_eio` (sim, on main's counter
+   `client_unsettled_eio`, which the classifier's exception for an isolated requester does not enter; none of these seeds is
+   one): 11 seeds of 7 configurations answer 1 or 2 unsettled `EIO`s on the parent and none now. And
+   `a_probe_that_ignores_what_it_reads_is_caught` (the blind lock probe's negative control) is re-pinned: its seeds 236 and 277
+   stopped failing (the schedules moved, as before); 21, 290 and 366 of 0 to 400 fail before and after, the clean
+   configuration passing on each. The classifier-based pins (`+unsettled`: `tloss-two-node` 35 and 37,
+   `delegated-group-switch` 15, 51, 615 and 1170 and the rest) cannot be on main until C2h lands; they are one test on
+   top of it.
+
+### Which commit closes which seed (`+unsettled`, classifier tree)
+
+| config seed | main | S1 | S2 | S3 | S1+S2+S3 |
+|---|---|---|---|---|---|
+| backup-strict 27, 54 | fail | ok | fail | fail | ok |
+| tloss-two-node 35, 37 | fail | ok | fail | fail | ok |
+| delegated-group-switch 15, 51, 615, 1170 (615 and 1170 also plain: the late landings) | fail | ok | fail | fail | ok |
+| delegated-holder-cut 17 | fail | ok | fail | fail | ok |
+| delegated-holder-cut 6 | fail | fail | fail | fail | ok |
+| delegated-backup 11 | fail | ok | fail | fail | ok |
+| delegated-backup 129 | fail | fail | ok | ok | ok |
+| delegated-no-backup-root-near 297 | fail | fail | ok | ok | ok |
+| long-delegated 178 | fail | fail | fail | ok | ok |
+| long-delegated 1198, delegated-two-gens-root-crash 651 | fail | fail | fail | ok | ok |
+| long-delegated-late-answers 13 | fail | ok | ok | fail | ok |
+| delegated-holder-cut 9, 14 | fail | fail | fail | fail (9 ok) | fail: S5 |
+
+(`delegated-holder-cut` 9 and 14 are the S5 samples: the gated root's own settle, or a node's, on another node's generation; the
+trace of 14 reads `root executes locally ... ownership=Delegated(node 3)` at 15.45 s, the first time the gate can recall it.
+`long-delegated-late-answers` 8, the seed `m03_a_reachable_sequencers_requester_is_not_isolated` pins, is closed by S1 and needs
+another pin: 1 and 23 stay S5 samples.)
+
+### Measured
+
+Main 476f0cc8 with C2h's sim commits, against the same with the three fixes. 2,000 seeds per configuration, with and
+without `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`.
+
+*Plain.* No failing seed on either side, unless noted: `backup-strict`, `tloss-two-node`, `delegated-holder-cut`,
+`long-delegated-backup`, `long-delegated`, `delegated-backup`, `backup`, `backup-crash`, `flex`, `flex-crash`; `delegated-group-switch`
+fails 7 (11 with the knob) on main and 5 (5) on the fix, all I1 (`deleg-group`, dga's class). The fix adds failing seeds in
+two configurations: `long-delegated-late-answers` 952 (no knob), 1324, 1477 and 1495 (knob), `[directory]` and commit-prefix
+history failures, and `placement-hot` 655 (knob), `I2 one_identity_per_op`. All five need S3's recall half (the redirect of an op
+to a recalling generation is a park now); none fails with S1 or S2 alone. They are classes main has at other seeds: over seeds
+2,000 to 10,000 with the knob main fails `long-delegated-late-answers` 5718, 9610, 9955 (two `[directory]`) and `placement-hot` 2177
+(I5) and 8557 (I2 `one_identity_per_op`), the fix 3743 (`[directory]`) and 8748 (commit prefix) and 2177 and 6239 (I2); without the
+knob `long-delegated-late-answers` 4947, 6183 and 7393 (`[directory]`) on main and 4947 on the fix. Seed 952's trace reads: the delegate
+unparks its ops on a late grant (answered 4.63 s) that reaches it after the root's refusal of a later renewal (sent 3.29 s,
+delivered 4.34 s) and streams the rows it then executes to a root that is recalling the generation; the Eexist the history
+check sees has no state that explains it. (Not traced to a root cause: a delegate-side question, not S3's rule.) I1 counters (plain): `delegated-backup`
+2 to 1 (no knob), 0 to 1 (knob); `long-delegated-backup` 7 to 5 and 6 to 7; `long-delegated-late-answers` 3 to 2 and 4 to 2;
+`placement-hot` 9 to 10 and 9 to 9, the one more being a `deleg-group/refused` of a delegate (dga's class). `i4-settled` 0
+everywhere; no run fails for a settled `EIO` that landed.
+
+*`+commit+settle`* (failing seeds, main to fix, no knob / knob): `backup-strict` 0 to 0 / 4 to 2; `delegated-group-switch` 7 to 5 /
+11 to 5; `delegated-holder-cut` 15 to 2 / 59 to 24; `long-delegated-backup` 28 to 13 / 62 to 23; `placement-hot` 12 to 11 /
+13 to 10; `backup`, `backup-crash`, `tloss-two-node` 0 to 0. The failures are I4 (the unsettled `EIO`s, fewer) and I1
+(unchanged to lower except `placement-hot` 7 to 8 without the knob, a `deleg-group` row of seed 1470).
+
+*Unsettled-EIO violations* (`+unsettled`, 1,000 seeds, main to fix; no knob / knob): `backup-strict` 70 to 3 / 123 to 23,
+`tloss-two-node` 28 to 0 / 70 to 0, `delegated-group-switch` 90 to 15 / 293 to 41, `delegated-holder-cut` 483 to 249 / 1,027 to
+498, `delegated-backup` 147 to 86 / 265 to 129, `delegated-no-backup-root-near` 149 to 93 / 262 to 127,
+`long-delegated-late-answers` 696 to 319 / 1,367 to 626, `long-delegated-backup` 497 to 253 / 946 to 452, `placement-hot` 107
+to 27 / 156 to 45, `long-delegated` 6 to 2 / 51 to 40, `delegated-two-gens-root-crash` 5 to 0 / 29 to 5, `flex-crash` 1,989 to 1,988 /
+25 to 25 (cause 6). Seeds fail `+unsettled` on the fix that did not on main (trajectories move, and a settle that a recall holds
+parks now instead of bouncing: `delegated-holder-cut` 13: the root's recall of an inherited generation waits for a delegate's answer
+for 5 s, S4's); the totals fall in every configuration. Only `tloss-two-node` reaches 0 both ways. What remains is S5 (a gate's settle
+on another node's generation), S4, and cause 6.
+`SWEEP-FAILOVER` p50/p90 (plain, main to fix): `backup-strict` 8,181/11,182 to 8,181/11,140 (knob 4,584/13,636 to 4,584/13,059);
+`backup-crash` 1,206/4,186 unchanged (knob 2,990/5,076 unchanged); `long-delegated-backup` 2,956/14,019 to 2,205/13,940 (knob
+2,832/16,472 to 2,871/16,471).
+
+*Gates.* fmt; `clippy --workspace --all-targets -D warnings`; the authority library (952) and `meta_repro`, meta, engine, control
+suites; the release simulation suite (314 passed, 0 failed, 11 ignored). A release build with debug assertions over 10 delegated
+configurations of 1,000 seeds each never reaches the own-client path's `debug_assert` (a gated root knows no generation of its
+tenure).

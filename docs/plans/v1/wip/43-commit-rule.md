@@ -2049,7 +2049,15 @@ scenario. *Review round (2026-11-01)*: an own op executed here is never settled
 locally as if it had not left; a settle's refusal is never `Lone` and is
 answered once committed, also to the own client; only the root answers a
 lost dependency `Held`; a system op is settled; the simulation's window is
-half its TTL, as production's.
+half its TTL, as production's. *Gate answers (2026-11-02; plan 46 M0.3; PROGRESS, "Plan 46 M0.3: three product causes of an
+`EIO` that was not settled first")*: the executor rule above holds in a takeover gate too, once its journal work is done
+(`PendingGate::shippable`): the gate answers a settle on the keys it owns (the root's, and a generation delegated to the gated
+node itself, which the gate ends at the cursor) by the same `Core::settle_refusal`, class archive, answered once the row has
+shipped; a rid that took effect is held (`Held`), never accepted before the quarantine; before `shippable` the settle is held.
+The gated root's own client takes the same path in `settle_route`. A gated root also leaves a delegation renewal unanswered
+instead of refusing it, and the root neither redirects to a generation it recalls nor holds a delegate's own op that its grant
+had time to reach (the delegate disowned it: the root recalls and parks the op). A settle on another node's generation inside
+a gate is unchanged (`Busy`; plan 46 M0.3's S5).
 
 *As landed (C2g′, 2026-11-01; PROGRESS, "Plan 43 C2g′"; plan 46 M0.2).* The
 open question of the C2f note (`repair drop-held` and another node's

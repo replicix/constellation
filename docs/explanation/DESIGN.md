@@ -781,7 +781,10 @@ sequencer in force for its keys later, which holds the refusal first — the
 same sequencer's `completed`; a successor, whose takeover gate re-ships the
 committed tail before it executes anything; the root after a delegation's
 end or recall, which drains the delegate's committed rows first — and dedups
-to it. Only when no sequencer answers within the rest of the deadline (twice
+to it. A successor answers a settle on the keys it owns as soon as its gate's
+journal work is done, without waiting out the read quarantine behind it (a rid
+that took effect is held, never accepted before the quarantine). Only when no
+sequencer answers within the rest of the deadline (twice
 the lease TTL: an isolated requester) does the client hear the *unsettled*
 `EIO`, retryable by rid, which may still land (`client_unsettled_eio`). The
 same identity makes replays, backup re-shipping, inbox drains and delegate

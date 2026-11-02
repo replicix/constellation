@@ -638,7 +638,6 @@ handoff pause, which kept the holder's own ops waiting for as long as a peer wan
 requester's placeholder's keys succeeds instead of ending in `EIO`. Not drop-held, left as a separate item: seeds 422, 1128
 (history witness under reboots and clock steps).
 
-
 *As landed (M0.3, 2026-11-02; PROGRESS, "Plan 43 C2h"):* the sim's I4 classifies each unsettled `EIO` from the sim's own
 network and fault history (`sim/reach.rs`: partitions, nodes attached, paused, suspended or stalled, S3 cuts, lease bodies and
 lease reads, what each core holds and is busy with, the delegation table as it changed): **isolated** (no sequencer reachable
@@ -673,6 +672,25 @@ refused `rmdir`'s node (the marker is asserted to be B's). Fail-before: `tloss-t
 rewritten scenarios fail their first assertion before C2f. **Deferred, as D9 says: the flex strict flags** stay off until M1.4
 (`flex-crash` has 433 isolated and 3,710 violations without the knob). The die/abandon pair is C2e's and swept clean (0 failing
 seeds in 2,000 each; the table shows 36 + 27 unsettled `EIO`s with a sequencer reachable, strict off). The campaign cell that found the loss ×20: 20 of 20 pass.
+
+*The gate-before-stage-1 fixes (M0.3, 2026-11-02; PROGRESS, "Plan 46 M0.3: three product causes of an `EIO` that was not
+settled first"):* the I4 classifier (`+unsettled`) found `EIO`s that the requester was never settled for while a sequencer was
+reachable, and three of the causes are product code, not the sim. **S1**: a takeover gate whose journal work is done
+(`PendingGate::shippable`) answers a settle on the keys it owns — the root's, and a generation delegated to the gated node
+itself — instead of `Busy` for the 12 to 20 s of the read quarantine and the drain: an unknown rid gets the journaled
+`Refused { ABANDONED }`, answered once its row has shipped (the requester being the gated root itself takes the same path in
+`settle_route`); a rid that took effect is `Held`, never `Accepted` before the quarantine (M8) and never `Abandoned`.
+**S2**: a gated root leaves a delegation renewal unanswered instead of refusing it with `ttl 0`, which stopped the generation
+at its delegate and made the opened root outwait it. **S3**: the root does not redirect to a generation it is recalling,
+and a delegate's own op forwarded after its grant had time to arrive (it disowned the generation) is recalled and parked,
+not held. Unsettled-EIO violations over 1,000 seeds, `+unsettled`, before and after: `backup-strict` 70 to 3,
+`tloss-two-node` 28 to 0, `delegated-group-switch` 90 to 15 (seed 615's late landing gone), `delegated-holder-cut` 483 to
+249, `delegated-backup` 147 to 86, `delegated-no-backup-root-near` 149 to 93, `long-delegated-late-answers` 696 to 319,
+`long-delegated-backup` 497 to 253, `placement-hot` 107 to 27, `long-delegated` 6 to 2, `delegated-two-gens-root-crash` 5 to 0;
+`flex-crash` 1,989 to 1,988 (cause 6, D9: untouched). What is left is S4 (a recall's cut answered before its read recalls)
+and S5 (a settle on another node's generation inside a gate: the gate builds no generation state until it opens), and
+cause 6, the maintainer's open decision. Not here: S4, S5, the strict flags (`strict_unsettled` goes on where both ways
+reach 0).
 
 ### Stage 1 — one stream per node, the rule per configuration (6–10 weeks)
 
