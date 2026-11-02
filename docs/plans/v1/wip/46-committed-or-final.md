@@ -651,12 +651,13 @@ the keys; once a generation's grant ran out, or it was never installed, or the k
 sequencer after the allowance, if it is reachable, can commit and reaches the tail), and a sequencer counts only if it can
 commit. `strict_unsettled`
 (`+unsettled`) fails the run on a violation. 2,000 seeds of every C2 configuration with and without the lease-reads knob: of
-28,257 unsettled `EIO`s 2,868 isolated, 5,296 no sequencer in time, 14 generation tail unreachable and **20,079 violations**
-(the review round counted a generation that outlived its grant as isolation: 16,664 isolated, 11,461 violations).
+28,256 unsettled `EIO`s 2,688 isolated, 4,988 no sequencer in time (2,457 of them keys across generations), 14 generation tail
+unreachable and **20,566 violations** (the review round counted a generation that outlived its grant as isolation: 16,664 isolated,
+11,461 violations; the first re-check 20,079, before keys across generations became due by their generations' own allowances).
 
 **The M0.3 exit "I4 strict everywhere" is not met.** Strict mode is a flag of the two configurations with no unsettled `EIO`
-(`delegated-long-delegation-prod`, `delegated-root-gone`) and runs in a ratchet test for ten more at zero violations without
-the knob; the 22 configurations where the product still fails to settle are guarded there by a ceiling on their violations. The violations are six
+(`delegated-long-delegation-prod`, `delegated-root-gone`) and runs in a ratchet test for more at zero violations without
+the knob (eleven); the 21 configurations where the product still fails to settle are guarded there by ceilings on their violations and on their allowed unsettled `EIO`s. The violations are six
 causes in the product (a root in its takeover gate answering a settle `Busy`; the new root's own settle falling to the lease
 path inside its gate; a delegate's own op held by the root for itself; a redirect loop between root and delegate; a local
 execution parked behind a recall; the lease path's last stretch), with seeds and lines in PROGRESS, and `delegated-group-switch`

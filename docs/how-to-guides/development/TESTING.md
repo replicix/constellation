@@ -5111,9 +5111,12 @@ violation).
   across generations (the recall comes first) leave the op to the root once the
   allowance is over: the root's window for the generation (the grant's end plus
   two margins and a one-way delay; `ttl + margin` from the birth of a generation
-  never renewed; a successor root's tenure plus the horizon and
-  `backup_takeover_ms`) plus one recall round trip, all from the sim
-  configuration's constants. From then on the root counts if it is reachable,
+  never renewed; for a generation the root inherited, born before its tenure
+  (a tenure starts at every acquisition, the same holder's after a loss or a
+  crash included), the tenure's start plus the horizon, and `backup_takeover_ms`
+  more only after a fast takeover) plus one recall round trip, all from the sim
+  configuration's constants; keys across generations wait for the last of their
+  generations' allowances. From then on the root counts if it is reachable,
   can commit and can reach a holder of the generation's tail (the delegate or a
   member of its group); a generation outliving its allowance is the product's
   lack of progress, never the requester's isolation. Before the allowance is
@@ -5133,7 +5136,9 @@ violation).
   promise check and the CAS, and, for a lease with a group, a running member it
   can reach for the group's tail. When no root is in force and no such claim
   can finish, the requester is allowed under its own label, `no_sequencer_in_time`
-  (counted apart from *isolated*), as is one that reaches nothing. A member
+  (counted apart from *isolated*), as is one that reaches S3 and is cut from nothing while the lease body still names a
+  holder that holds nothing (sealed by a claimant, deposed, restarted, dead):
+  no claim is open before the body runs out. A member
   that crashed since the tenure began counts again only if it restarted with
   its journal (`keep_journal`), from its restart on, and a claimant's first
   read counts no later than a read it would have made at the window's start.

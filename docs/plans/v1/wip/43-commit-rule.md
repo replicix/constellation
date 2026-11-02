@@ -2124,7 +2124,7 @@ I1/I4: findings), the harness scenario `takeover-loss-two-node`, the die/abandon
 or none in time (a lease claim, or a root's outwait of a generation that does not live, that cannot finish inside the window),
 or a root that cannot reach the tail of the generation it is due to end, classified from the sim's own reachability history
 (`unsettled_isolated`, `unsettled_no_sequencer_in_time`, `unsettled_generation_tail_unreachable`, `unsettled_violations`). **The
-strict form does not hold yet** (20,079 of 28,257 unsettled `EIO`s in the C2 sweeps are violations: plan 46 M0.3's note, PROGRESS
+strict form does not hold yet** (20,566 of 28,256 unsettled `EIO`s in the C2 sweeps are violations: plan 46 M0.3's note, PROGRESS
 "Plan 43 C2h"). The bug-B harness
 scenarios (`holder-crash-phantom-*`, `takeover-marker-strands-promptly`) are rewritten as "the state cannot arise" (§7.5). The
 strict flags on the flex configurations stay off (plan 46 D9; M1.4). The `load-probe` cell under `pause:lock-lapse+500:10000@b` ×20
