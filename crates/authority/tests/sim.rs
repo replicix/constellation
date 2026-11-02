@@ -2551,8 +2551,9 @@ fn delegated_long_delegation_config() -> SimConfig {
 /// unsettled one is none of these). The parent configuration keeps its
 /// 12 s deadline, whose settle window ends before a 20 s generation is
 /// outwaited (its `EIO`s are the unsettled ones, counted). `strict_commit`
-/// stays off as on the parent (its remaining `archive/*` answers are own
-/// clients' that the oracle and the core judge lone differently, C5's D10).
+/// stays off as on the parent (its remaining `archive/*` answers were own
+/// clients' that the oracle and the core judged lone differently, C5's D10,
+/// closed by i1-592; the parent's seeds are not re-run under `+commit`).
 fn delegated_long_delegation_prod_config() -> SimConfig {
     SimConfig {
         core: std::sync::Arc::new(|id, inc| {
@@ -8343,8 +8344,9 @@ fn delegated_two_generations_re_stream_after_a_root_failover() {
 /// never from its own disk alone. `+commit` fails before C2 on every seed
 /// that delegates anything (`deleg-group/*` answers with no copy elsewhere; the
 /// test judges those keys — the root answers other nodes from the archive
-/// since C2f, and what `archive/*` keys remain are its own clients' answers
-/// in a tenure's first moments, the D10 alignment of C5).
+/// since C2f; the `archive/*` keys that once remained, its own clients'
+/// answers in a tenure's first moments, were the D10 alignment of C5, closed
+/// by i1-592).
 #[test]
 fn delegated_no_backup_root_near_acknowledges_through_the_root() {
     let mut waited = 0usize;
@@ -8354,8 +8356,8 @@ fn delegated_no_backup_root_near_acknowledges_through_the_root() {
             seed,
             delegated_no_backup_root_near_config(),
         );
-        // (The `archive/*` answers left are the root's own clients' in a
-        // tenure's first moments: C5's D10 alignment.)
+        // (The `archive/*` answers that were left, the root's own clients' in
+        // a tenure's first moments, were C5's D10 alignment: closed by i1-592.)
         let deleg: Vec<_> = r
             .uncommitted_acks
             .iter()
@@ -14215,9 +14217,10 @@ fn regression_delegated_long_delegation_no_refusal_for_an_op_that_lands() {
                  AUTHORITY_SIM_CONFIG=delegated-long-delegation"
             )
         });
-        // No delegate answer outside its group. (`+commit` stays off: what
-        // `archive/*` answers remain are a node's own clients' as the oracle
-        // and the core judge lone differently, C5's D10 alignment.)
+        // No delegate answer outside its group. (`+commit` stays off here:
+        // the `archive/*` answers that remained were a node's own clients' as
+        // the oracle and the core judged lone differently, C5's D10 alignment,
+        // closed by i1-592.)
         let deleg: Vec<_> = r
             .uncommitted_acks
             .iter()
@@ -14465,34 +14468,74 @@ fn c0_i1_is_clean_where_every_answer_waits_for_the_archive() {
 
 /// Plan 43 C0 §10.3, positive control: under `backup` an answer the core
 /// gave on a backup's acknowledgement is committed in fact — no
-/// `root-group` or `deleg-group` answer is ever uncommitted. (What the
-/// oracle does find, and what the baseline counts, are answers of a fresh
-/// tenure that has no backup yet — a holder's first 200 ms, or after a
-/// takeover — counted under `uncommitted_acks["archive/…"]`: before plan 43
-/// C2 to another node's forward, a lone root's Layer-A answer (none since
-/// C2f), and to the holder's own client while the core still judges itself
-/// lone and the oracle's stability window already counts a peer — C5's D10
-/// alignment.)
+/// `root-group` or `deleg-group` answer is ever uncommitted, and none of any
+/// class (what the baseline once counted under `uncommitted_acks["archive/…"]`
+/// were a fresh tenure's own clients' answers given on the disk alone while a
+/// peer was linked within the budget, the "D10 own-client shape", closed by
+/// i1-592: a linked peer is never lone).
 #[test]
 fn c0_i1_finds_no_uncommitted_group_answer_under_backup() {
-    let (mut seen, mut groups) = (0usize, 0usize);
+    let mut groups = 0usize;
     for seed in 700..760 {
         let r = c0_run("backup", seed, backup_config());
         groups += c0_count(&r.acks_by_class, "root-group");
-        for (k, n) in &r.uncommitted_acks {
-            assert!(
-                k.starts_with("archive/"),
-                "backup seed {seed}: an answer expected under {k} was uncommitted ({n}): {:?}",
-                r.oracle_examples
-            );
-            seen += n;
-        }
+        assert!(
+            r.uncommitted_acks.is_empty(),
+            "backup seed {seed}: answers uncommitted: {:?}: {:?}",
+            r.uncommitted_acks,
+            r.oracle_examples
+        );
     }
     assert!(
         groups > 100,
         "the control never judged a root-group answer: {groups}"
     );
-    println!("backup 700..760: {seen} archive-class answers uncommitted, {groups} root-group answers judged");
+    println!("backup 700..760: {groups} root-group answers judged, none uncommitted");
+}
+
+/// I1 (i1-592, the "D10 own-client shape" the notes of C2f/C2g/C5 set aside):
+/// a tenure's own client was answered on the node's disk alone while a peer
+/// was linked within the budget. The links of a fresh tenure are younger than
+/// the 200 ms stability window, the first assessment (`acquire_won`) found no
+/// backup to be had, nothing re-assessed it when a peer crossed the window,
+/// and the ops queued behind the acquisition ran in its own event and were
+/// answered `Lone`; the backup came up afterwards and held none of them (a
+/// takeover that cut the node off before it shipped rolled them back). About
+/// half the seeds of every backup configuration failed `+commit` this way,
+/// mostly in the first 100 ms of a tenure; a node with a peer linked now
+/// waits for the archive (or its backup) instead of answering alone. The
+/// seeds fail `+commit` before (`archive/ok`, `archive/refused:*` answers
+/// the oracle finds a peer for); none is uncommitted now.
+#[test]
+fn i1_a_peer_linked_within_the_budget_gates_the_own_answers_of_a_fresh_tenure() {
+    let cases: Vec<(&str, SimConfig, Vec<u64>)> = vec![
+        ("backup", backup_config(), vec![1, 4, 5, 8, 13]),
+        ("backup-crash", backup_crash_config(), vec![4, 5, 6, 7, 8]),
+        ("long-backup", long_backup_config(), vec![2, 3, 6, 9, 10]),
+        (
+            "delegated-holder-cut",
+            delegated_holder_cut_config(),
+            vec![58, 113, 126, 175, 260],
+        ),
+        (
+            "drop-held-chain-backed",
+            drop_held_chain_backed_config(),
+            vec![592],
+        ),
+    ];
+    for (label, cfg, seeds) in cases {
+        for seed in seeds {
+            let cfg = strict(cfg.clone(), "commit");
+            let r = run_seed(seed, cfg).unwrap_or_else(|e| panic!("{label} seed {seed}: {e}"));
+            assert_eq!(r.acks_unmapped, 0, "{label} seed {seed}");
+            assert!(
+                r.uncommitted_acks.is_empty(),
+                "{label} seed {seed}: {:?}: {:?}",
+                r.uncommitted_acks,
+                r.oracle_examples
+            );
+        }
+    }
 }
 
 /// The oracle judges a node lone by the peer directory its core was given
@@ -14534,23 +14577,20 @@ fn i1_the_oracle_judges_a_node_lone_by_the_directory_its_core_was_given() {
 /// re-invited its old backup, which discarded its old-tenure tail on a
 /// lease read just before the listing landed (`root-group/exists`). Both
 /// carried a `root-group/*` key in `uncommitted_acks` before the fix (and
-/// failed under `+commit` on it); `archive/*` keys (a fresh tenure's own
-/// clients' answers before a backup, which the oracle and the core judge
-/// lone differently: C5's D10 alignment; another node's forward is answered
-/// from the archive since C2f) stay allowed, which is why `+commit` stays
-/// off here.
+/// failed under `+commit` on it); no key of any class is left (the `archive/*`
+/// ones, a fresh tenure's own clients' answers before a backup, were the "D10
+/// own-client shape" i1-592 closed).
 #[test]
 fn c1_a_listing_counts_only_its_own_acknowledgements() {
     use pinned::c0_run;
     for seed in [472u64, 892] {
         let r = c0_run("long-backup", seed, long_backup_config());
-        for (k, n) in &r.uncommitted_acks {
-            assert!(
-                k.starts_with("archive/"),
-                "long-backup seed {seed}: an answer expected under {k} was uncommitted ({n}): {:?}",
-                r.oracle_examples
-            );
-        }
+        assert!(
+            r.uncommitted_acks.is_empty(),
+            "long-backup seed {seed}: answers uncommitted: {:?}: {:?}",
+            r.uncommitted_acks,
+            r.oracle_examples
+        );
     }
 }
 
@@ -14773,8 +14813,8 @@ fn c0_the_real_rebuild_recovers_a_deposed_root() {
 /// backup acknowledged alone (`uncommitted_acks["deleg-group/ok"] > 0`) and
 /// `+commit` failed on them; here none of them counts a `deleg-group/*`
 /// answer uncommitted. (`+commit` is not asserted: the `archive/*` answers
-/// left are a tenure's own clients' in its first moments, C5's D10
-/// alignment.) Fails on the parent.
+/// that were left, a tenure's own clients' in its first moments, were C5's D10
+/// alignment, closed by i1-592.) Fails on the parent.
 #[test]
 fn c2c_a_delegate_never_acknowledges_alone() {
     let (label, cfg, seeds) = ("long-delegated", long_delegated_config(), I1_LONG_DELEGATED);
@@ -14840,14 +14880,12 @@ fn a_reconfig_in_doubt_acknowledges_nothing_its_listed_candidate_lacks() {
             seed,
             backup_reconfig_doubt_config(),
         );
-        for (k, n) in &r.uncommitted_acks {
-            assert!(
-                k.starts_with("archive/"),
-                "backup-reconfig-doubt seed {seed}: an answer expected under {k} was \
-                 uncommitted ({n}): {:?}",
-                r.oracle_examples
-            );
-        }
+        assert!(
+            r.uncommitted_acks.is_empty(),
+            "backup-reconfig-doubt seed {seed}: answers uncommitted: {:?}: {:?}",
+            r.uncommitted_acks,
+            r.oracle_examples
+        );
         sealed += usize::from(r.stats.values().any(|s| s.backup_takeovers > 0));
     }
     assert_eq!(sealed, 20, "the listed candidate did not always take over");
