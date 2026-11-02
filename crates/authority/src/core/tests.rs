@@ -10428,6 +10428,7 @@ mod epoch_rules {
             let mut lease = root_lease(1, 1, if renewed { t0.plus(62_000) } else { expires });
             lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
             lease.backups = vec![2];
+            lease.config_version = 2; // (the role's: an older read is ignored)
             lease.ttl_ms = 2_000;
             let out = answer_job_read(&mut h, &out, lease);
             if renewed {
@@ -10506,6 +10507,7 @@ mod epoch_rules {
         let mut lease = root_lease(1, 1, expires);
         lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
         lease.backups = vec![2];
+        lease.config_version = 2; // (the role's: an older read is ignored)
         let out = answer_job_read(&mut h, &out, lease);
         assert_eq!(h.core.bk.sealed, 1, "did not seal past the expiry: {out:?}");
 
@@ -10966,6 +10968,7 @@ mod epoch_rules {
                 let mut lease = root_lease(1, 1, expires);
                 lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
                 lease.backups = vec![2];
+                lease.config_version = 2; // (the role's: an older read is ignored)
                 let out = answer_job_read(&mut h, &out, lease);
                 assert_eq!(
                     h.core.bk.sealed, 1,
@@ -11165,6 +11168,7 @@ mod epoch_rules {
         let mut lease = root_lease(1, 1, Ms(end));
         lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
         lease.backups = vec![2];
+        lease.config_version = 2; // (the role's: an older read is ignored)
         lease.ttl_ms = 10_000;
         h.core.lease.observe(
             {
@@ -37295,6 +37299,11 @@ fn answer_takeover_read(h: &mut Harness, out: &[Action]) -> Vec<Action> {
     let mut lease = root_lease(1, 1, h.now.plus(5_000));
     lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
     lease.backups = vec![2];
+    // What S3 holds now is never older than the role the appends gave this
+    // node (a read older than the role is ignored: I1 class 1).
+    if let Some(role) = h.core.bk.role {
+        lease.config_version = lease.config_version.max(role.config_version);
+    }
     answer_job_read(h, out, lease)
 }
 
@@ -37424,6 +37433,7 @@ fn a_holder_heard_while_its_expired_lease_is_read_is_sealed() {
     let mut lease = root_lease(1, 1, Ms(h.now.0 - 300));
     lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
     lease.backups = vec![2];
+    lease.config_version = 2; // (the role's: an older read is ignored)
     let out = answer_job_read(&mut h, &read, lease);
     assert_eq!(
         h.core.bk.sealed, 1,
@@ -44404,6 +44414,188 @@ mod c1_counted {
         answer_job_read(&mut h, &read, before);
         assert!(h.core.bk.role.is_some(), "a stale read discarded the role");
         assert_eq!(h.core.bk.acked, 2, "a stale read discarded the tail");
+    }
+
+    /// A backup that listed a new holder's epoch: node 2 was the backup of
+    /// (holder 1, epoch 1); its silence watch has a lease read in flight
+    /// (served at that epoch's last version, delivered late); holder 3 then
+    /// acquires epoch 2, lists node 2 (version 2) and appends row 1, which
+    /// node 2 acknowledges. Returns the harness, the read's actions.
+    fn backup_of_a_newer_epoch_with_a_read_in_flight() -> (Harness, Vec<Action>) {
+        let append = |from, req, epoch, config_version, txs| Event::Peer {
+            from,
+            msg: PeerMsg::BackupAppend {
+                req: OpId(req),
+                epoch,
+                holder: from,
+                config_version,
+                from: 1,
+                txs,
+                through: 0,
+                candidacy: 1,
+                sent_ms: 0,
+                expires_ms: 0,
+                clock: 0,
+            },
+        };
+        let mut h = Harness::new(2);
+        let out = h.step(append(1, 7, 1, 1, Vec::new()));
+        let watch = timers(&out, TimerKind::BackupWatch)[0];
+        h.advance(2_000);
+        let read = h.step(Event::Timer { id: watch });
+        h.advance(100);
+        let row = constellation_meta::BackupTx {
+            first: 1,
+            last: 1,
+            records: vec![constellation_meta::LogRecord::Completed { rid: h.rid(1) }],
+            origin: (0, 0),
+        };
+        let out = h.step(append(3, 8, 2, 2, vec![row]));
+        assert!(
+            matches!(
+                sends(&out).as_slice(),
+                [(
+                    3,
+                    PeerMsg::BackupAck {
+                        acked: 1,
+                        sealed: false,
+                        ..
+                    }
+                )]
+            ),
+            "{out:?}"
+        );
+        assert!(h.core.bk.role.is_some_and(|r| r.holder == 3 && r.epoch == 2));
+        h.advance(100);
+        (h, read)
+    }
+
+    /// I1 class 1 (backup+commit seeds 1373, 1472 with slow lease reads):
+    /// the read the silence watch issued before a new holder listed this
+    /// node returns after that holder's append, showing the previous
+    /// epoch. It is older than the role (the holder sends an epoch only once
+    /// its acquisition landed, and S3's pair only grows), so it says
+    /// nothing about the current listing. The same-epoch guard (C1-1) did
+    /// not cover a different epoch: the catch-all cleared the role and the
+    /// tail, and the root counted the acknowledgement it had been given.
+    /// Fails on the parent: "no longer a listed backup; discarding the
+    /// backup tail".
+    #[test]
+    fn a_lease_read_of_an_older_epoch_does_not_discard_the_tail() {
+        let (mut h, read) = backup_of_a_newer_epoch_with_a_read_in_flight();
+        let mut before = root_lease(1, 1, h.now.plus(50_000));
+        before.config_version = 1;
+        let out = answer_job_read(&mut h, &read, before);
+        assert!(
+            h.core.bk.role.is_some_and(|r| r.holder == 3 && r.epoch == 2),
+            "a read of an older epoch discarded the role: {:?}",
+            h.core.bk.role
+        );
+        assert_eq!(h.core.bk.acked, 1, "a read of an older epoch discarded the tail");
+        assert_eq!(h.meta.backup_tail(2).unwrap().len(), 1);
+        assert_eq!(h.core.bk.sealed, 0);
+        assert_ne!(
+            h.core.lease.cached_holder,
+            Some(1),
+            "the stale read set the holder cache back"
+        );
+        assert!(
+            h.core.bk.watch_timer.is_some(),
+            "the watch is not armed again: {out:?}"
+        );
+
+    }
+
+    /// The same-epoch case the old special arm did not reach: the read
+    /// shows the role's epoch at an older version that lists this node, and
+    /// the holder is silent. The listed arm would seal the epoch on a
+    /// listing that predates the role; the read is ignored and the watch
+    /// reads again.
+    #[test]
+    fn a_lease_read_of_an_older_version_that_lists_the_node_does_not_seal() {
+        let append = |req, config_version| Event::Peer {
+            from: 1,
+            msg: PeerMsg::BackupAppend {
+                req: OpId(req),
+                epoch: 1,
+                holder: 1,
+                config_version,
+                from: 1,
+                txs: Vec::new(),
+                through: 0,
+                candidacy: 1,
+                sent_ms: 0,
+                expires_ms: 0,
+                clock: 0,
+            },
+        };
+        let mut h = Harness::new(2);
+        let out = h.step(append(7, 1));
+        let watch = timers(&out, TimerKind::BackupWatch)[0];
+        h.advance(2_000);
+        let read = h.step(Event::Timer { id: watch });
+        h.advance(100);
+        h.step(append(8, 3));
+        // Long silent, and the lease the read shows has run out: with a
+        // read at the role's version this node seals.
+        h.advance(30_000);
+        let mut before = root_lease(1, 1, Ms(h.now.0 - 1));
+        before.config_version = 2;
+        before.backups = vec![2];
+        before.ack_policy = constellation_store_s3::AckPolicy::Backup;
+        let out = answer_job_read(&mut h, &read, before);
+        assert_eq!(h.core.stats.seals, 0, "sealed on a read older than the role");
+        assert_eq!(h.core.bk.sealed, 0);
+        assert!(h.core.bk.role.is_some_and(|r| r.config_version == 3));
+        assert!(h.core.lease.takeover_permit.is_none());
+        assert!(
+            h.core.bk.watch_timer.is_some(),
+            "the watch is not armed again: {out:?}"
+        );
+
+    }
+
+    /// A backup that restarts restores its role with its version (written
+    /// on every raise), and its restart probe is issued after the restart:
+    /// the lease it reads is never older than that role, so the stale-read
+    /// rule leaves the probe's judgement alone (an expired holder's lease
+    /// is sealed on, as before).
+    #[test]
+    fn the_restart_probe_after_a_role_restore_is_not_stale() {
+        let meta = Meta::open_in_memory().unwrap();
+        meta.set_node_prefix(2).unwrap();
+        crate::replica::Replica::set_backup_role(
+            &meta,
+            constellation_meta::BackupRole {
+                holder: 1,
+                epoch: 2,
+                config_version: 3,
+            },
+        );
+        let mut cfg = Config::defaults(2, 1);
+        cfg.ttl_ms = 10_000;
+        let mut h = Harness {
+            core: Core::new(cfg.clone()),
+            meta,
+            now: Ms(1_000_000),
+            honour_off: 0,
+            wait_off: 0,
+            manual_horizon: false,
+        };
+        let mut out = Vec::new();
+        h.core.start(h.clk(), &h.meta, &mut out);
+        let watch = timers(&out, TimerKind::BackupWatch)[0];
+        h.advance(1_600);
+        let out = h.step(Event::Timer { id: watch });
+        let mut lease = root_lease(1, 2, Ms(h.now.0 - 1));
+        lease.config_version = 3;
+        lease.backups = vec![2];
+        lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+        answer_job_read(&mut h, &out, lease);
+        assert_eq!(
+            h.core.stats.seals, 1,
+            "the probe's read at the role's own pair was ignored"
+        );
     }
 }
 

@@ -5081,6 +5081,37 @@ impl Core {
         let Some(role) = self.bk.role else {
             return;
         };
+        if let Some((lease, _)) = &object {
+            if (lease.epoch, lease.config_version) < (role.epoch, role.config_version) {
+                // Plan 43 C1-1 (review), I1 class 1: a read older than the
+                // role. The role's `(epoch, config_version)` comes from an
+                // append, and a holder sends an epoch only after its
+                // acquisition CAS landed and a version only after its
+                // reconfiguration CAS landed; S3's pair only grows. So the
+                // read was answered before the append was sent (a slow
+                // reply, a read issued before a new holder listed this
+                // node), and what it says about this node's listing is
+                // stale: the holder counts what this node acknowledged
+                // under the role's pair (`BackupPeer::counted`), and
+                // discarding the tail on such a read left rows acknowledged
+                // to clients on no backup's disk (backup+commit seeds 1373,
+                // 1472 with slow lease reads: an older epoch's read took
+                // the "no longer listed" arm below). Not noted either: the
+                // observation keeps the newer body (`observe_body`). The
+                // watch reads again.
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    holder = lease.holder,
+                    epoch = lease.epoch,
+                    read = lease.config_version,
+                    role_epoch = role.epoch,
+                    role = role.config_version,
+                    "a lease read older than the backup role; ignored"
+                );
+                self.arm_backup_watch(now, out);
+                return;
+            }
+        }
         match object {
             Some((lease, _))
                 if lease.holder == role.holder
@@ -5225,32 +5256,6 @@ impl Core {
                     },
                     replica,
                     out,
-                );
-                self.arm_backup_watch(now, out);
-            }
-            Some((lease, _))
-                if lease.holder == role.holder
-                    && lease.epoch == role.epoch
-                    && lease.config_version < role.config_version =>
-            {
-                // Plan 43 C1-1 (review): a version older than one this node
-                // acknowledged an append at. The read was answered by S3
-                // before the holder's later CAS landed and reached us after
-                // that append: S3 holds a version at least the role's
-                // (versions only grow, and the holder sends one only once
-                // its CAS landed), so what it says about this node's
-                // listing is stale. The holder counts what this node
-                // acknowledged under the role's version
-                // (`BackupPeer::counted`): discarding the tail on this
-                // read left rows acknowledged to clients on no backup's
-                // disk. The watch reads again.
-                tracing::debug!(
-                    node = self.cfg.node_id,
-                    holder = lease.holder,
-                    epoch = lease.epoch,
-                    read = lease.config_version,
-                    role = role.config_version,
-                    "a lease read older than the backup role's version; ignored"
                 );
                 self.arm_backup_watch(now, out);
             }
