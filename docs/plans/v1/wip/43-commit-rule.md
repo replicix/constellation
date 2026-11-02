@@ -447,11 +447,13 @@ in the code, in PROGRESS and in failure messages.
   appended and not shipped. **D** (liveness): a delegate's stream batch to a
   restarted root that the lease still names starts the re-adoption
   (`readopt_own_lease_for_forward`), as a forward, a lock request and a
-  renewal do. Not landed: the root acknowledging a delegate's batch only
-  through the rows its own tenure has committed (class A: the seeds that
-  still fail `+commit`, `deleg-group: ... the root's journal lacks the
-  appended row`); that is a change of Q16's rule and waits for the
-  maintainer.
+  renewal do. **A** (landed after the maintainer's decision, 2026-11-02;
+  PROGRESS, "Oracle I1: class A"; [ADR-41](../../../explanation/DECISIONS.md#adr-41-a-delegate-counts-the-roots-copy-only-through-rows-the-roots-tenure-has-committed-interim-rule-for-q16)):
+  the root acknowledges a delegate's batch as committed only through the
+  rows its own tenure has committed (`DelegateStreamAck.committed`), and a
+  delegate without a recorded backup counts that: the seeds that still failed
+  `+commit` (`deleg-group: ... the root's journal lacks the appended row`)
+  are closed; Q16's rule is the recorded alternative until M1.2's member copy.
 - **I2 `one_identity_per_op`.** (a) No rid completes more than once in
   the log (today's `check_exactly_once`). (b) At no instant is a rid
   queued for execution in two places: the union of every node's replay
@@ -552,7 +554,7 @@ pub enum AckClass {
 | Root, lone (no peer in budget) | **Lone** | **Archive** (C2; today: Layer A with a requester shadow) |
 | Delegate with a recorded backup | DelegGroup | DelegGroup |
 | Delegate, no backup recorded, root in budget | DelegGroup (the root is the second member: wait for `DelegateStreamAck` through the row, C2) | DelegGroup |
-| Delegate, lone (no backup, root beyond budget) | **Lone** | DelegGroup (the group `{delegate, root}`: wait for the root's journaled append, `DelegateStreamAck.through ≥ i`; §11 Q16) |
+| Delegate, lone (no backup, root beyond budget) | **Lone** | DelegGroup (the group `{delegate, root}`: wait for the root's append its own tenure committed, `DelegateStreamAck.committed ≥ i`; §11 Q16, ADR-41) |
 | Designee | NonStealable | NonStealable |
 | Epoch hold owner | NonStealable (Q3, decided: non-stealable except by an operator's retire) | NonStealable |
 
@@ -4053,6 +4055,18 @@ to land before C0.
   failure contract). The alternative (the root's committed cursor,
   three copies on a LAN of three, ~2 round trips pipelined) is recorded,
   not planned.
+  **Switched to the alternative, 2026-11-02 (maintainer; interim,
+  [ADR-41](../../../explanation/DECISIONS.md#adr-41-a-delegate-counts-the-roots-copy-only-through-rows-the-roots-tenure-has-committed-interim-rule-for-q16)).**
+  The two-copies argument assumed C3's recovery of a deposed root's
+  journal (§5.4 item 4), which is not built: a root sealed by its backup
+  acknowledged rows no successor held (oracle I1, ten seeds of five
+  configurations). `DelegateStreamAck` carries `committed` beside `through`
+  (the appended cursor, the flow control); the root's `committed` is the
+  prefix its own tenure committed (shipped, or held by every backup it
+  gates on; `durable_jseq`, `u64::MAX` for a lone root), pushed as it
+  rises; a delegate without a recorded backup counts that. One more
+  pipelined root-to-backup round trip for a no-backup delegate's
+  `DelegGroup` answers. May revert once plan 46 M1.2's member copy exists.
 
 - **Q17 — F-a's approach.** *Blocks F-a.* (a) **The beat cap**
   (recommended): the floor ends at the earlier of the bound and the

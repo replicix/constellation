@@ -64626,7 +64626,8 @@ authority lib 938, engine 947, control 146, harness lib 165, sim suite 351 passe
 
 The delegate-side violations of the `+commit` oracle fall into four causes (the investigation's spec). Three are fixed here, each in its own
 commit; class A (the root acknowledging a delegate's batch when its append is journaled, though the root may already be sealed by its
-backup) is a change of Q16's rule and is not landed (below). Replay a seed with `AUTHORITY_SIM_START=<seed> AUTHORITY_SIM_SEEDS=1`
+backup) is a change of Q16's rule and landed afterwards (class A, the next
+section). Replay a seed with `AUTHORITY_SIM_START=<seed> AUTHORITY_SIM_SEEDS=1`
 through `sweep_config`: `replay_seed` runs another interleaving.
 
 ### B: a delegate is lone only when no backup could be had
@@ -64680,7 +64681,7 @@ not lone, as it should be; the test is about re-adoption). Sim pins (`+commit`, 
 1412, 1767), `i1_a_root_does_not_answer_its_own_forwarded_op_from_its_unshipped_append` (placement-hot with slow lease reads 1659;
 long-delegated-late-answers 542, 992), `a_root_the_lease_names_readopts_it_when_its_delegate_streams` (delegated-no-backup-root-near 789).
 
-### Sweeps (2,000 seeds from 0), failing seeds `+commit`, main to fix, no knob / `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`
+### Sweeps without class A (2,000 seeds from 0), failing seeds `+commit`, main to fix, no knob / `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`
 
 placement-hot 7 [136, 165, 262, 472, 948, 966, 1890] to 0 / 6 [383, 472, 948, 1391, 1659, 1890] to 1 [1391]; long-delegated-backup 6
 [92, 340, 457, 1372, 1832, 1836] to 2 [340, 1832] / 6 [20, 457, 1153, 1311, 1412, 1767] to 2 [20, 1707]; long-delegated-late-answers 3 [184,
@@ -64703,3 +64704,84 @@ was added on top of the fix: delegated-backup, long-delegated-backup (both knobs
 Latency only, and only where a delegate had no candidate but a linked peer. Lone answers (cores' sequenced answers by class, 2,000 seeds, no
 `+commit`, no knob), main to fix: placement-hot 21 to 12, long-delegated-backup 319 to 308, delegated-backup 107 to 106, long-delegated
 57,843 to 57,704, long-delegated-late-answers 720 to 726, delegated-holder-cut 297 to 296, delegated-two-gens-backed 26 to 20.
+
+## Oracle I1: class A, the root's copy counts through what its own tenure committed (2026-11-02; plan 43 section 4, Q16; ADR-41)
+
+The maintainer switched Q16 to its recorded alternative as an interim rule, until plan 46 M1.2's member copy exists
+([ADR-41](../../explanation/DECISIONS.md#adr-41-a-delegate-counts-the-roots-copy-only-through-rows-the-roots-tenure-has-committed-interim-rule-for-q16)).
+
+### The trace
+
+`delegated-backup+commit` seed 451. Node 2, the root's backup, seals epoch 1 and takes the lease at 2,785 ms. At 2,787 ms root 1, not yet
+aware, appends row 1 of generation 7 (`on_delegate_stream` checks only `root_ends_recall`, which is `root_usable`) and acknowledges
+`DelegateStreamAck { through: cursor }`. Delegate 3 sets `streamed_through`, `deleg_group_through` returns it (no backup recorded), and the
+answer leaves at 2,796 ms. The lease names node 2, and node 2's journal lacks the row: it reached the log only when root 1's PUT beat node 2's
+marker. This is the window plan 43 C3 section 5.4 item 4 names, which Q16 assumed C3 would recover.
+
+### The rule
+
+The root's acknowledgement counts for the group `{delegate, root}` through the rows whose append its own tenure has committed: shipped
+(`journal_acked_seq`, or in `ack.shipped_rows`), or the root holds the lease, it is not lost, and `last <= durable_jseq()` (`u64::MAX` for a
+lone root or an epoch hold: its journal counts, nothing takes a lone root over before its expiry). `Core::root_append_cap` computes the prefix
+(cached apart from `holder_append_cap`, which excludes a lone tenure and keeps answering C3's `Lone` rows). `DelegateStreamAck` (`PeerMsg`, net
+`Payload`, the engine relay) gains `committed`; `through` stays the appended cursor and the flow control. The root sends `cursor.min(cap)` with
+each batch's acknowledgement and pushes an unsolicited one, on the last batch's round and request, when the prefix rises
+(`Core::root_stream_push`, after `backup_after_event`, while the root is usable). The delegate keeps `DelegateState.root_committed` (installed at
+the log's stream index, reset at a new root beside `streamed_through`), raises it before the checks that drop an acknowledgement that appended
+nothing new, and calls `complete_ready` when it rose. `deleg_group_through` and the removal check of `deleg_group_maintain` read it. Counters:
+`deleg_stream_acks_pushed`, `deleg_root_committed_raised`. One difference from the spec: a store error in the cap acknowledges `committed 0`
+(counted as not committed, recomputed at the next event) rather than sending nothing: `through` still paces the stream.
+
+### Tests
+
+Fail-before (core, each fails with the root acknowledging and the delegate counting the cursor): `a_root_acks_a_delegates_row_as_committed_only_once_its_backups_hold_the_append`,
+`a_delegate_counts_the_roots_copy_only_through_the_committed_prefix`, `a_delegate_asks_to_remove_its_backup_only_once_the_roots_commit_covers_its_answers`;
+the guard `a_lone_root_acks_a_delegates_row_as_committed_at_once` (passes before too). Net: `a_delegate_stream_ack_round_trips_its_committed_prefix`.
+Sim pin `i1_a_delegate_counts_the_roots_copy_only_through_what_the_roots_tenure_committed`: delegated-backup 192, 436, 451; long-delegated-backup
+340, 1832 and, with slow lease reads, 20, 1707; placement-hot with slow lease reads 1391; long-delegated-late-answers with slow lease reads 1596;
+delegated-two-gens-backlog with slow lease reads 1965: every seed fails `+commit` on the parent through `sweep_config` (the message is the
+class's: "deleg-group ... committed by none: archive: not in an applied unfenced segment") and passes now. Seed 789 (D) passes with and without
+the re-adoption: its pin stays a guard.
+
+Re-pins (the acknowledgement shifts trajectories): `a_delegating_root_cut_from_s3_forms_no_epoch_and_fails_over` swaps 1607 (first mutation after
+the crash 1.25 s in, before the seal: the 1.1 to 1.3 s class of the test's comment) for 1608; `c0_the_real_rebuild_recovers_a_deposed_root` swaps
+2924 (no rebuild any more) for 3036; `regression_a_delegate_taking_the_root_over_re_appends_its_rows` adds 39, the only seed of 0..100 that
+re-appends where 15, 311 and 590 no longer do.
+
+Sim suite (release): 353 passed, 1 failed, 12 ignored. The failure is the M0.3 ratchet, which A moves, and which is **not raised**:
+`delegated-holder-cut` 54 unsettled EIOs with a sequencer reachable in seeds 0..100 (ceiling 52 = 48 + margin 4), `placement-hot` 14 (ceiling 12 =
+10 + 2). Over 2,000 seeds the counts of unsettled EIOs of every kind are within 5 % of main's (placement-hot 184 / 202 on main against 175 / 229,
+delegated-holder-cut 920 / 1,882 against 907 / 1,875, no knob / knob): the window of 100 seeds moved with the trajectories, not the class. The
+maintainer decides whether the ceilings follow.
+
+### Sweeps (2,000 seeds from 0, `+commit`, main `055de5f1` against the fix, no knob k0 / `AUTHORITY_SIM_LEASE_READS=0:0:800:1000` k1)
+
+Failing seeds, main to fix: placement-hot 7 to 0 / 6 to 0; long-delegated-backup 6 to 0 / 6 to 0; long-delegated-late-answers 3 to 1 [784] / 3 to 0;
+delegated-backup 2 to 0 / 0 to 0; delegated-two-gens-one-backed 8 to 0 / 10 to 0; delegated-two-gens-backed 0 to 0 / 2 to 0; delegated-two-gens-backlog
+0 to 0 / 1 to 0; delegated-no-backup-root-near 17 to 0 / 3 to 0; delegated-group-switch 7 to 3 / 11 to 8 (all I4, below); flex-crash 39 to 39 (the
+same seeds: the flex strict flags are plan 46 D9's) / 0 to 0; delegated-two-gens-root-crash, delegated-holder-cut, long-delegated, delegated-root-crash,
+backup, backup-crash, backup-strict, shared-dir-split, locks-delegated 0 to 0 / 0 to 0. Every other I1 failure of main is gone.
+
+The criterion "zero seeds that fail on the fix and pass on main" is not met literally: 12 seeds.
+- **long-delegated-late-answers k0 seed 784**: "the cluster did not reach quiescence within 90,000 ms". No delegation is live after 7 s; the holder (node 3,
+  epoch 3 from 10 s to 96 s) is silent to its backups again and again, its ships fail on injected 500s, and the successor acquires at 95.9 s. The class
+  exists on main (2,000..8,000: 4 failing seeds on both builds, 4947 on both); the seed moved with the trajectory.
+- **delegated-group-switch, 3 (k0) and 8 (k1) seeds**, all `I4 unacked_fails_never_lands_late`: a root sealed by its delegate-backup at 2.3 s, a takeover floor of
+  13.5 s, an op answered in doubt at its deadline and landing after the floor (seed 270: the same seal and floor on main, where the op is retried and lands
+  before the next op is invoked). Main fails 7 / 11 seeds there, 5 / 7 of them I1 that the fix closes; over 2,000..4,000 main has 9 I1 + 1 I4, the fix 0 I1 + 2 I4.
+  The late-landing class is plan 46 M0.3's, not the class of A's rows.
+
+Failover (ms to the first acknowledged mutation after a holder crash, p50 / p90, main to fix): unchanged to the millisecond or within 3 % in backup,
+backup-crash, backup-strict (8,181 / 11,182; 4,584 / 13,636), delegated-root-crash, delegated-holder-cut, long-delegated, two-gens-root-crash; long-delegated-backup 2,800 /
+14,019 to 3,835 / 14,024 (k0) and 2,826 / 16,472 to 3,043 / 16,570 (k1); long-delegated-late-answers 2,856 / 13,882 to 3,224 / 13,946 (k0) and 3,220 / 16,341
+to 3,186 / 16,355 (k1). The p50 of the long-delegated runs moves up by 0.2 to 1.0 s: a delegate's answer that waited for the root's append now waits
+for the root's backups, and a root that crashes loses those first.
+
+### Cost (plan 43 G1; `bench/commit-rule/g1-abba.sh`, release, ABBA, 8 rounds, 200 samples, the quiet timing box, topologies 2 and 3)
+
+Topology 3's delegate (no backup, the root on the LAN with one), p50 / p90 in us, main to fix (topology 2's holder: unchanged, 261-367 / 326-477 on both):
+create 464 / 611 to 711 / 847; write 3,462 / 3,801 to 3,829 / 4,055; rename 455 / 579 to 965 / 1,089; unlink 439 / 555 to 998 / 1,124; chmod 397 / 532 to 1,110 /
+1,286. G1 (the holder's p50 / p90 plus 500 us): main met every op in this run (the earlier over-budget p90 of rename and unlink on topology 3 did not
+show); the fix meets it for create and write and is **over for rename (p50 by 207, p90 by 249), unlink (244, 322) and chmod (374, 476)**. The added
+latency is the root's backup round trip with its durable write, one pipelined hop, plus the push; it is the price of the rule, 0.25 to 0.7 ms on a
+metadata op, on a delegate that has no backup of its own. A delegate with a recorded backup, a lone root and an epoch hold are unchanged.

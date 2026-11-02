@@ -734,8 +734,11 @@ deletes `deleg_lone` and the lone delegate with it (a node with no group is
 forwarded or holds a sticky grant), and with it the first fix and the
 delegate half of the guard; nothing here constrains its design. Class A
 (the root acknowledging a delegate's batch through rows its own tenure has
-committed only, an interim form of C3 item 4's member copy) is not landed;
-M1.2's member copy closes the window it covers.
+committed only: `DelegateStreamAck.committed`, `DelegateState.root_committed`,
+the root's push; [ADR-41](../../../explanation/DECISIONS.md#adr-41-a-delegate-counts-the-roots-copy-only-through-rows-the-roots-tenure-has-committed-interim-rule-for-q16))
+landed on 2026-11-02 as an interim form of C3 item 4's member copy: M1.2's
+member copy closes the window it covers, and M1.2 may revert the rule (it
+deletes `root_committed` with the lone delegate and the per-row classes).
 
 ### Stage 2 — no server-side replay (4–6 weeks)
 

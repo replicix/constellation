@@ -947,7 +947,12 @@ lease and one log
 - **A delegate acknowledges once its group holds the row** (plan 43 C2,
   [ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)).
   The generation's group is the delegate and the root — the root's
-  journaled append of the row is the second copy — until a `DelegGroup`
+  append of the row, once its own tenure has committed it (shipped, or held
+  by every backup it gates on; the root's acknowledgement carries that prefix
+  as `committed` beside the appended cursor `through`), is the second copy:
+  a row only the root's journal holds does not survive a root its backup has
+  sealed ([ADR-41](DECISIONS.md#adr-41-a-delegate-counts-the-roots-copy-only-through-rows-the-roots-tenure-has-committed-interim-rule-for-q16),
+  an interim rule until plan 46 M1.2's member copy) — until a `DelegGroup`
   record names a backup (chosen by RTT to *the delegate*, never the root):
   then the delegate and that backup. The delegate counts a backup only once
   its own replica's table records it, i.e. once the record is committed in

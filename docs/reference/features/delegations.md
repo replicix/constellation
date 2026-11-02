@@ -110,10 +110,16 @@ through the delegate. It then:
 2. acknowledges once its **group** holds the row (plan 43 C2,
    [ADR-33](../../explanation/DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)):
    - With no backup recorded for the generation the group is the delegate
-     and the root: the answer leaves when the root has *journaled its
-     append* of the row — the root's `DelegateStreamAck.through` reaches the
-     row's index — so the delegate sends the row at once rather than on the
-     stream tick, and a node's op costs one round trip to the root.
+     and the root: the answer leaves when the root has appended the row and
+     its own tenure has *committed* the append (shipped, or held by every
+     backup it gates on; a lone root's journal counts) — the root's
+     `DelegateStreamAck.committed` reaches the row's index, `through` being
+     the appended cursor that only paces the stream
+     ([ADR-41](../../explanation/DECISIONS.md#adr-41-a-delegate-counts-the-roots-copy-only-through-rows-the-roots-tenure-has-committed-interim-rule-for-q16)).
+     The delegate sends the row at once rather than on the stream tick; a
+     node's op costs one round trip to the root, and one more from the
+     root to its backup when it has one (the root pushes the commit as it
+     rises).
    - With a backup recorded (a `DelegGroup` record naming it) the group is
      the delegate and that backup, chosen by RTT to the delegate, exactly
      like the root's (see [Durability and failover](durability-and-failover.md)).

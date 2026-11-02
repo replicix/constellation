@@ -1574,6 +1574,10 @@ logging never blocks a daemon thread (plan 44)";
 
 ## ADR-33: Commit is the configured group's acknowledgement (Vertical Paxos over S3)
 
+**Amended by [ADR-41](#adr-41-a-delegate-counts-the-roots-copy-only-through-rows-the-roots-tenure-has-committed-interim-rule-for-q16)
+(2026-11-02)**: the root's copy in the group `{delegate, root}` counts only
+through the rows its own tenure has committed, not its journaled cursor.
+
 **Superseded in part by [ADR-40](#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)
 (2026-11-01)**: the rule stands; what changes is its enforcement. The
 commit rule becomes a property of the configuration (two row states,
@@ -2410,3 +2414,104 @@ list), CephFS's `Server.cc` early replies and `clientreplay`, Ongaro's
 Raft thesis §6.3 (client sessions), RFC 8881 §2.10.6 (sessions and the
 reply cache), the Calvin paper (SIGMOD 2012), Speculator (SOSP 2005) and
 Rethink the Sync (OSDI 2006).
+
+## ADR-41: A delegate counts the root's copy only through rows the root's tenure has committed (interim rule for Q16)
+
+**Status**: decided by the maintainer on 2026-11-02, as an interim rule
+until plan 46 M1.2's member copy lands; M1.2 may revert it (below).
+Amends [ADR-33](#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)
+and plan 43 Q16.
+
+**Context**: with no backup recorded for its generation the group of a
+delegate is `{delegate, root}`, and the delegate answered a row once the
+root had *journaled its append* of it (`DelegateStreamAck.through`, plan 43
+Q16: "the delegate cannot observe the root's own backup acknowledgements,
+and does not need to: two copies are the single-failure contract"). The
+second copy has to survive the failure the group is built for, the loss
+of one member, and a root's journal does not always. A root whose backup
+has sealed its epoch (the backup takes the lease at the marker) is deposed
+without knowing it, for as long as the backup's seal takes to reach it. A
+batch it appends in that window and acknowledges lands in a journal that
+nothing recovers: the new holder's log does not carry the row, the
+delegate's group counted it, and the requester was answered
+(`delegated-backup` `+commit` seed 451: node 2 seals epoch 1 and takes the
+lease at 2,785 ms; root 1 appends row 1 of generation 7 at 2,787 ms and
+acknowledges it; the delegate answers at 2,796 ms; the lease's holder
+lacks the row). The rows reach the log only when the deposed root's PUT
+beats the marker, which is luck. Oracle I1 (no answer without a committed
+row) found it in ten seeds of five configurations
+(`delegated-backup`, `long-delegated-backup`, `placement-hot`,
+`long-delegated-late-answers`, `delegated-two-gens-backlog`; the last
+three and two of `long-delegated-backup` with slow lease reads). It is the window plan 43 C3 §5.4 item 4 names
+(a deposed root's journal rows, recovered by C3's member copy); Q16
+assumed that recovery.
+
+**Decision**: the root's acknowledgement counts for the group `{delegate,
+root}` only through the rows whose append **its own tenure has committed**:
+- the row is shipped (`journal_acked_seq`, or in `ack.shipped_rows`), or
+- the root holds the lease, it is not lost, and `last <= durable_jseq()`
+  (every backup the root gates its own answers on holds it; `u64::MAX`
+  for a lone root or an epoch hold, where the root's journal counts: a
+  lone root can only be taken over at the lease's expiry, and nobody seals
+  it).
+
+A root with backups therefore acknowledges only once its backups hold the
+append, so its successor is one of them, or has sealed one, and holds the
+row. The wire carries both numbers: `DelegateStreamAck.through` stays the
+appended cursor (the delegate's flow control: where it re-sends from, what
+it drops from its journal window), and `committed` (at most `through`) is
+the committed prefix (`Core::root_append_cap`). The delegate keeps it as
+`DelegateState.root_committed` and uses it where it used the cursor: the
+group's committed prefix (`deleg_group_through`) and the removal of a
+backup from the record (`deleg_group_maintain`). It raises
+`root_committed` before it drops an acknowledgement that appended nothing
+new, so the root's push (below) is never lost to the echo checks. The root
+pushes: after every event (`Core::root_stream_push`), a generation whose
+committed prefix rose above the last one sent is sent an unsolicited
+acknowledgement, on the round and request of the delegate's last batch,
+while the root is usable; without it the delegate would wait for its own
+next batch. `holder_append_committed` and its use in C3 answers (`Lone`
+excludes a lone tenure's appends) are unchanged.
+
+**Q16's recorded alternative** (the root's committed cursor: three copies
+on a LAN of three, about two round trips pipelined) was "recorded, not
+planned"; this is that alternative, restricted to the root's own
+tenure's commit rule, and not a new copy. The delegate still cannot see
+the root's backups, and does not need to: it counts what the root says.
+
+**Consequences**:
+- A no-backup delegate's `DelegGroup` answers (another node's forwarded
+  op, and its own client's op while the delegate is not lone) take one
+  more root-to-backup round trip, pipelined with the root's own ship,
+  plus the push's hop: the batch goes to the root, the root's append goes
+  to its backup, the backup's acknowledgement raises the root's commit,
+  and the root answers. A root with no backup listed but one that could be
+  had (a candidate being brought up, a peer in budget) waits for the
+  archive, as its own answers do. A lone root, an epoch hold, and
+  a recorded delegate backup are unchanged. Measured (G1's harness,
+  release, topology 3's delegate, p50 / p90): create 464 / 611 us to
+  711 / 847, rename 455 / 579 to 965 / 1,089, unlink 439 / 555 to 998 /
+  1,124, chmod 397 / 532 to 1,110 / 1,286; G1 (the holder plus 500 us)
+  is then over for rename, unlink and chmod. PROGRESS, "Oracle I1:
+  class A".
+- Where the delegate's own backup is the root's backup too (topology 3),
+  the commit takes one local round trip more.
+- The delegate depends on the root's push: a lost push leaves a parked
+  answer until the next batch's acknowledgement carries the commit.
+- No version bump, no shim: both ends change together (the project
+  carries no compatibility for mixed versions).
+- The sim's `+commit` oracle holds on the seeds that failed
+  (`i1_a_delegate_counts_the_roots_copy_only_through_what_the_roots_tenure_committed`).
+
+**May revert**: plan 46 M1.2 gives each delegate node one stream and a
+member copy (C3's verbatim re-ship of a deposed root's rows, folded in),
+so that the root's own tenure no longer has to commit a row before the
+delegate may count it; M1.2 deletes the delegate's lone class and
+`root_committed` with it, and M1.2 may return to the cursor if the member
+copy covers the window.
+
+See: [plan 43](../plans/v1/wip/43-commit-rule.md) (§4 the oracle, Q16),
+[plan 46](../plans/v1/wip/46-committed-or-final.md) M1.2;
+`crates/authority/src/core/delegate.rs` (`root_append_cap`,
+`root_stream_push`, `on_delegate_stream`, `on_delegate_stream_ack`,
+`deleg_group_through`).
