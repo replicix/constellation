@@ -1526,6 +1526,88 @@ fn a_holder_with_a_held_backlog_keeps_admitting_own_ops_while_wanted() {
     assert!(h.meta.lookup(ROOT_INO, "own").unwrap().is_some());
 }
 
+/// A holder whose own clock says its lease ran out (a suspend, a clock
+/// step: honour left below zero) while the lease object still names it, and
+/// that has not released it, needs a renewal. An op of its own that fires an
+/// acquisition used to read the lease (slowly), get a claim plan against
+/// itself and end `acquired=false`, holding the job slot while its journal's
+/// rows waited unshipped (`drop-held-chain` seeds 208 and 1446 under slow
+/// lease reads). Now the acquisition becomes a renewal at the next round.
+#[test]
+fn an_own_op_on_a_lease_expired_by_its_own_clock_renews_instead_of_acquiring() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let mut out = Vec::new();
+    h.core.start(h.clk(), &h.meta, &mut out);
+    let poll = timers(&out, TimerKind::Poll)[0];
+    h.advance(60_000);
+    assert!(
+        h.core.lease.honour_left_ms(h.clk(), h.core.config()) < Some(0),
+        "the lease is out by this node's clock"
+    );
+    assert!(h.core.lease.held.is_some() && !h.core.lease.lost);
+    let rid = h.rid(1);
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op: h.create("a"),
+        tag: Default::default(),
+    });
+    // (The op reads the lease to learn the holder; it names this node, whose
+    // own clock says it ran out.)
+    let (get, req) = only_s3(&out);
+    assert!(matches!(req, S3Op::LeaseGet), "{req:?}");
+    let named = h.core.lease.held.as_ref().unwrap().0.clone();
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((named, tag())))),
+    });
+    assert!(
+        !s3_ops(&out)
+            .iter()
+            .any(|(_, op)| matches!(op, S3Op::LeaseGet)),
+        "no acquisition read of the lease: {out:?}"
+    );
+    assert!(h.core.job().is_none(), "no acquire job holds the slot");
+    assert!(h.core.ship.renew_now, "a renewal is due at the next round");
+    assert_eq!(h.core.stats.acquire_renewed_instead, 1);
+    // The next round (the poll the nudge armed) renews the lease.
+    let poll = timers(&out, TimerKind::Poll)
+        .first()
+        .copied()
+        .unwrap_or(poll);
+    let mut acts = h.step(Event::Timer { id: poll });
+    let mut renewed = false;
+    for _ in 0..10 {
+        if let Some(upload) = acts.iter().find_map(|a| match a {
+            Action::UploadDirtyChunks { op, .. } => Some(*op),
+            _ => None,
+        }) {
+            acts = h.step(Event::UploadsDone {
+                op: upload,
+                result: UploadResult::Done { held: 0 },
+            });
+            continue;
+        }
+        let Some((op, req)) = s3_ops(&acts).first().map(|(o, r)| (*o, (*r).clone())) else {
+            break;
+        };
+        let result = match req {
+            S3Op::LeaseSwap { .. } => {
+                renewed = true;
+                S3Result::LeasePut(Ok(tag()))
+            }
+            S3Op::SegmentPut { .. } => S3Result::SegmentPut(Ok(())),
+            S3Op::InboxRun { .. } => S3Result::InboxRun(Ok(Vec::new())),
+            S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+            S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+            other => panic!("unexpected S3 op in the round: {other:?}"),
+        };
+        acts = h.step(Event::S3 { op, result });
+    }
+    assert!(renewed, "the round renewed the lease");
+}
+
 /// Plan 43 C7-H2 (`delegated-holder-cut` seeds 65 and 97 with the floor
 /// the whole bound): a tenure inside its takeover floor is not
 /// idle-released for a node that wants the lease. The floor stands for the

@@ -1146,6 +1146,9 @@ pub struct Stats {
     /// conflict copy (`Core::copy_after_settle`), and entries the log
     /// showed completed (the write survived: forgotten, no copy).
     pub refused_entry_settles_sent: u64,
+    /// An acquisition asked while this node held its own unreleased lease
+    /// became a renewal at the next round (`Core::begin_acquire`).
+    pub acquire_renewed_instead: u64,
     pub refused_entries_survived: u64,
     /// Review (R7): shadows of non-stealable answers rolled back after the
     /// bound because the owner's row never reached the log.

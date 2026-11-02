@@ -2989,6 +2989,33 @@ impl Core {
             self.finish_acquire(now, false, replica, out);
             return;
         }
+        // This node holds its own lease, not released and not lost, but by
+        // its own clock it has run out (honour left below zero after a
+        // suspend or a clock step) while the lease object still names it:
+        // what it needs is a renewal, not an acquisition. An acquisition
+        // reads the lease (slowly, under load), gets a claim plan against
+        // itself and ends `acquired=false` after seconds, holding the job
+        // slot while the rows of its journal wait unshipped and the ops that
+        // fired it wait for it (`drop-held-chain` seeds 208 and 1446 with
+        // slow lease reads). The renewal goes at the next round, and the
+        // callers retry. A renewal that finds the lease taken is the
+        // deposition path, as ever.
+        if !self.epoch.active
+            && !self.lease.epoch_held()
+            && !self.lease.releasing
+            && !self.lease.usable(now, &self.cfg)
+            && self
+                .lease
+                .held
+                .as_ref()
+                .is_some_and(|(lease, _)| !lease.released)
+        {
+            self.ship.renew_now = true;
+            self.nudged = true;
+            self.stats.acquire_renewed_instead += 1;
+            self.finish_acquire(now, false, replica, out);
+            return;
+        }
         if self.lease.is_paused_for_handoff(now) {
             self.finish_acquire(now, false, replica, out);
             return;
