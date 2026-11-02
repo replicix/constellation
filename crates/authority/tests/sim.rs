@@ -14969,6 +14969,76 @@ fn settle_before_eio_a_gate_a_renewal_and_a_redirect_loop_leave_no_unsettled_eio
     );
 }
 
+/// Plan 46 M0.3: the findings the settle fixes (S1 to S3) leave open, pinned
+/// for the fix items that close them; ignored until they do
+/// (`cargo test -p constellation-authority --release --test sim -- --ignored
+/// delegated_settle_findings`). Every seed runs and every failure is
+/// reported.
+///
+/// **L1, replica divergence on a former delegate (integrity).** When one
+/// applied foreign segment carries a node's own rows of an ended generation
+/// (retired in that apply), the generation's `RecallCut` and a later root row
+/// on the same key (an unlink, or a rename over it), the node's replica keeps
+/// the effect of its own row. The node then serves, executes against or
+/// commits a state the log removed: `[directory]` "returned `Eexist` / took
+/// effect where the spec refuses", "commit N is not the log prefix: inode only
+/// on the left", or a session guarantee on the stale entry. Start at
+/// `jobs.rs` (the apply that logs `retired=`) and `meta/src/replay.rs`
+/// `apply_foreign` (the own-row retire, or the own-row overlay, runs after, or
+/// instead of, the root row that follows it in the same segment). Main fails
+/// the class at `long-delegated-late-answers` 6183 (no knob: the same shape as
+/// 1477 below) and 7393 (no knob; fails here too), and 5718 and 9955 (knob).
+///
+/// Failing on this tree: `long-delegated-late-answers` 1477 (knob) and 3228
+/// (no knob), `[directory]`, the shape above; 7393 (no knob), the same class;
+/// 4125 (knob), a monotonic-reads violation on a stale `d1/f1` (the same
+/// symptom, the segment shape not traced).
+///
+/// Not pinned, because they pass on this tree (their schedules moved with the
+/// fixes, the latent bug is still there): `long-delegated-late-answers` 952
+/// (no knob), 1324, 1495 (knob), 6183 (no knob), and the L2 seeds below.
+///
+/// **L2, I2 on a stranded replay against the requester's re-ask**: a delegate
+/// or root accepted an op in one epoch, a takeover stranded it, the new root
+/// queues the stranded row for replay by rid, and the requester asks the new
+/// holder again (`placement-hot` 8557 with the knob on main, `one_identity_
+/// per_op`: queued on 1 and executing on 4). Plan 46 stage 2 removes the
+/// server-side replay and with it the class; no seed of `placement-hot` fails
+/// it on this tree (655 with the knob, the pin of the first measurement, and
+/// 8557 pass), so there is nothing to pin here.
+#[test]
+#[ignore = "findings of plan 46 M0.3: latent L1 (replica divergence on a former delegate), long-delegated-late-answers 1477, 3228, 4125 and 7393 fail until it is fixed"]
+fn delegated_settle_findings_l1_replica_divergence_on_a_former_delegate() {
+    let mut failures = Vec::new();
+    // (seed, with the slow lease reads knob `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`)
+    for (seed, knob) in [
+        (1_477u64, true),
+        (3_228, false),
+        (4_125, true),
+        (7_393, false),
+    ] {
+        let cfg = SimConfig {
+            lease_reads: if knob {
+                SLOW_LEASE_READS
+            } else {
+                Default::default()
+            },
+            ..long_delegated_late_answers_config()
+        };
+        if let Err(e) = run_seed(seed, cfg) {
+            failures.push(format!(
+                "long-delegated-late-answers seed {seed}{}: {e}",
+                if knob { " (knob)" } else { "" }
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} failing: {failures:#?}",
+        failures.len()
+    );
+}
+
 /// Plan 43 C1-1: a backup counts only from acknowledgements given to an
 /// append that carried a version listing it, and a removal lands covered.
 /// `long-backup` seed 892: a candidate acknowledged rows at the version
