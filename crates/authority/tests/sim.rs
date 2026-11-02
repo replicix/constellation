@@ -14495,6 +14495,35 @@ fn c0_i1_finds_no_uncommitted_group_answer_under_backup() {
     println!("backup 700..760: {seen} archive-class answers uncommitted, {groups} root-group answers judged");
 }
 
+/// The oracle judges a node lone by the peer directory its core was given
+/// (`oracle::peer_in_budget`): the core's roster and links come from the
+/// driver's last poll, and for a moment after the other nodes restarted or a
+/// partition healed the bus has a peer linked that the core was told nothing
+/// of (roster `[self]`, the link reported down). Such an answer is a genuine
+/// lone one by the core's information, not an I1 violation of the core's
+/// rule. These seeds failed `+commit` on that alone once the core waited for
+/// a peer it knew of.
+#[test]
+fn i1_the_oracle_judges_a_node_lone_by_the_directory_its_core_was_given() {
+    let cases: Vec<(&str, SimConfig, Vec<u64>)> = vec![
+        ("backup", backup_config(), vec![0, 113]),
+        ("backup-crash", backup_crash_config(), vec![73, 128]),
+        ("long-backup", long_backup_config(), vec![32]),
+    ];
+    for (label, cfg, seeds) in cases {
+        for seed in seeds {
+            let r = run_seed(seed, strict(cfg.clone(), "commit"))
+                .unwrap_or_else(|e| panic!("{label} seed {seed}: {e}"));
+            assert!(
+                r.uncommitted_acks.is_empty(),
+                "{label} seed {seed}: {:?}: {:?}",
+                r.uncommitted_acks,
+                r.oracle_examples
+            );
+        }
+    }
+}
+
 /// Plan 43 C1-1: a backup counts only from acknowledgements given to an
 /// append that carried a version listing it, and a removal lands covered.
 /// `long-backup` seed 892: a candidate acknowledged rows at the version

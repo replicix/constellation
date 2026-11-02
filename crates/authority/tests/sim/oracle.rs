@@ -913,11 +913,22 @@ fn classify(
     Some(AckClass::Lone)
 }
 
-/// A live node `answerer` is linked to within its RTT budget, if any — a
-/// link that has been up for the stability window, as the core's candidate
-/// selection requires (`Core::backup_candidates`): a peer that has only just
-/// come up is not yet one a backup could be had from, and until it is the
-/// node is alone in the plan's sense.
+/// A live node `answerer` is linked to within its RTT budget, if any, as
+/// the node can know: a link that has been up for the stability window
+/// (a peer that has only just come up is not yet one a backup is brought up
+/// from, though the core waits for the archive meanwhile, i1-592), and
+/// judged by the peer directory the core was actually given.
+///
+/// The core's roster and links come from the driver's last poll, and the bus
+/// is ahead of them: just after a partition healed or the other nodes
+/// restarted the bus has the peer linked while the core was told roster
+/// `[self]` or the link down. A core that was told of nobody is lone by its
+/// own information (plan 43 Layer A: lone is no *known* peer in budget; the
+/// rollback risk equals a genuine lone answer's, and the roster singleton of
+/// plan 46 M2.3 removes the case). So an answerer with a directory entry
+/// counts only the peers that entry reports up for the stability window; one
+/// with no entry at all was told nothing and counts every bus link (a core
+/// that was told nothing must not judge itself lone).
 fn peer_in_budget(o: &Oracles, bus: &Bus, answerer: NodeId, now_wait: i64) -> Option<NodeId> {
     let (budget, stable) = o
         .budgets
@@ -932,9 +943,12 @@ fn peer_in_budget(o: &Oracles, bus: &Bus, answerer: NodeId, now_wait: i64) -> Op
         *n != answerer
             && bus.linked(answerer, *n)
             && bus.rtt(answerer, *n) <= budget
-            && up
-                .and_then(|m| m.get(n))
-                .is_none_or(|since| now_wait - *since >= stable as i64)
+            && match up {
+                None => true,
+                Some(m) => m
+                    .get(n)
+                    .is_some_and(|since| now_wait - *since >= stable as i64),
+            }
     })
 }
 
@@ -2607,6 +2621,14 @@ mod tests {
         w.bus.set_partition(1, 2, true);
         assert_eq!(w.judge(1, &st, own).class, Some(AckClass::Lone));
         w.bus.set_partition(1, 2, false);
+        // ... or the directory its core was given does not report the peer
+        // up (the bus is ahead of the driver's last poll: the core was told
+        // of nobody): lone by its own information. A core with no directory
+        // entry at all was told nothing and counts every link.
+        w.o.note_directory(1, BTreeMap::new());
+        assert_eq!(w.judge(1, &st, own).class, Some(AckClass::Lone));
+        w.o.directory.lock().unwrap().remove(&1);
+        assert_eq!(w.judge(1, &st, own).class, None);
         // A listed backup (even one nobody can reach) makes it a group of two.
         let w2 = world();
         w2.create(1, own, "a");
