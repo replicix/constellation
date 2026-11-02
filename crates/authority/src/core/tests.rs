@@ -50847,6 +50847,43 @@ mod await_retry {
         assert!(copy_started(&out), "{out:?}");
     }
 
+    /// A dropping node that holds a continuation epoch (a hold owner, which
+    /// need not wait for anything to answer) may not yet know it was
+    /// deposed: its own `Refused` row is no outcome in the log until the
+    /// archive carries it, and the copy (which forgets the entry) waits for
+    /// that, not for `park_durable`.
+    #[test]
+    fn a_hold_owners_own_refusal_is_no_outcome_until_the_archive_carries_it() {
+        let (mut h, broken) = holder_with_a_seed();
+        drop_held(&h, broken);
+        let seed = h
+            .meta
+            .pending_replays()
+            .unwrap()
+            .into_iter()
+            .find(|q| q.refused.is_some())
+            .unwrap();
+        h.core.lease.adopt_epoch_hold(h.clk(), 1);
+        assert!(h.core.lease.epoch_held());
+        for _ in 0..3 {
+            h.advance(250);
+            let out = drain(&mut h);
+            assert!(!copy_started(&out), "copied on an uncommitted row: {out:?}");
+        }
+        // The archive carries the journal: now.
+        let rows: Vec<u64> = h
+            .meta
+            .journal_txs_from(0, usize::MAX)
+            .unwrap()
+            .iter()
+            .flat_map(|t| t.first..=t.last)
+            .collect();
+        h.meta.ack_journal_rows_at(&rows, 9).unwrap();
+        h.advance(250);
+        let out = drain(&mut h);
+        assert!(copy_started(&out), "{:?} {out:?}", seed.rid);
+    }
+
     /// The settle executed at this node as the sequencer in force journals
     /// the dropped code as the rid's outcome, and the copy follows once that
     /// row is committed.

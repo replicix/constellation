@@ -433,7 +433,7 @@ impl Core {
         if let Some(outcome) = completed_as_outcome(replica, entry.rid, 0)
             .filter(|_| self.completed_row_settled(entry.rid, replica))
         {
-            if self.outcome_uncommitted(entry.rid, replica) {
+            if !self.copy_row_committed(entry.rid, replica) {
                 return;
             }
             match outcome {
@@ -774,6 +774,29 @@ impl Core {
             records: Vec::new(),
         };
         self.submit_settle(now, (entry.rid, entry.queue_seq), inert, replica, out);
+    }
+
+    /// Whether the refusal (or completion) of `rid` a refused entry's copy
+    /// rests on is committed: not a row of this node's own journal the log
+    /// or the backup group does not hold. Stricter than
+    /// [`Self::outcome_uncommitted`], which trusts `park_durable`: that is
+    /// true whenever this node holds a continuation epoch (an answer needs
+    /// no S3 there), and a deposed hold owner that has not learnt of it
+    /// would make its copy at once and forget the entry, with the row it
+    /// rested on rolled back at the deposition. Here an own row counts once
+    /// the archive carries it, or the group does outside an epoch hold; a
+    /// lone tenure's row, once shipped.
+    fn copy_row_committed(&self, rid: Rid, replica: &dyn Replica) -> bool {
+        match replica.outcome_row(rid) {
+            Some(row) if row.gen == 0 => {
+                let shipped = replica.journal_acked_seq().unwrap_or(0);
+                self.archive_covers(row.jseq, shipped)
+                    || (!self.lease.epoch_held()
+                        && self.durable_jseq() != u64::MAX
+                        && self.durable_covers(row.jseq))
+            }
+            _ => true,
+        }
     }
 
     /// Whether `rid`'s `completed` row is this node's own journal row
