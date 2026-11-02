@@ -15407,21 +15407,25 @@ fn m03_the_configurations_without_an_unsettled_eio_run_strict() {
 /// configuration without the lease-reads knob, the configurations run in
 /// parallel. The sweeps that set the lists are in PROGRESS ("Plan 43 C2h").
 ///
-/// 1. Every configuration whose 2,000-seed sweep tells no unsettled `EIO` that
+/// 1. Every configuration whose 2,000-seed sweep (no knob) tells no unsettled `EIO` that
 ///    is not allowed (an isolated requester, none in time, a generation whose
 ///    tail cannot be reached) runs strict (`+unsettled`): a change that makes
 ///    one appear fails here. (The shared base configurations are not changed:
 ///    derived ones, such as `backup-strict`, still tell violations.)
-/// 2. Every other configuration is guarded by a ceiling on its violations in
-///    those seeds: the count of the sweep that set the list plus a margin of
-///    two or a tenth, whichever is more. The ceilings are not a statement that
-///    the violations are right: each is a cause open in PROGRESS, and a fix
-///    lowers its ceiling (a ceiling above its configuration's count is a
-///    margin that the next fix should take away).
+/// 2. Every other configuration is guarded by two ceilings: on its violations
+///    and on its allowed unsettled `EIO`s (isolated, none in time, a
+///    generation's tail unreachable), each the count of the sweep that set
+///    the list plus a margin of two or a tenth, whichever is more. A product
+///    regression whose new unsettled `EIO`s land in an allowed label fails the
+///    second. The ceilings are not a statement that the counts are right:
+///    each is a cause open in PROGRESS, and a fix lowers its ceiling (a count
+///    above its configuration's is a margin that the next fix should take
+///    away).
 #[test]
 fn m03_the_configurations_at_zero_violations_stay_there() {
     type Config = fn() -> SimConfig;
-    let strict_configs: [(&str, Config); 10] = [
+    let strict_configs: [(&str, Config); 11] = [
+        ("delegated-crash", delegated_crash_config),
         (
             "delegated-delegate-restart",
             delegated_delegate_restart_config,
@@ -15436,70 +15440,90 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
         ("shared-dir-default", shared_dir_default_config),
         ("shared-dir-ranges", shared_dir_ranges_config),
     ];
-    // (label, config, violations in seeds 0..100 when the list was set)
-    let ceilings: [(&str, Config, usize); 22] = [
-        ("backup-crash", backup_crash_config, 1),
-        ("backup-strict", backup_strict_config, 5),
-        ("backup-two", backup_two_config, 0),
+    // (label, config, violations, allowed unsettled EIOs in seeds 0..100 when
+    // the list was set)
+    let ceilings: [(&str, Config, usize, usize); 21] = [
+        ("backup-crash", backup_crash_config, 1, 0),
+        ("backup-strict", backup_strict_config, 5, 0),
+        ("backup-two", backup_two_config, 0, 0),
         (
             "delegated-backup-and-delegate-die",
             delegated_backup_and_delegate_die_config,
+            0,
             0,
         ),
         (
             "delegated-backup-and-delegate-die-abandon",
             delegated_backup_and_delegate_die_abandon_config,
             0,
+            0,
         ),
-        ("delegated-backup", delegated_backup_config, 11),
-        ("delegated-crash", delegated_crash_config, 0),
-        ("delegated-group-switch", delegated_group_switch_config, 6),
-        ("delegated-holder-cut", delegated_holder_cut_config, 47),
+        ("delegated-backup", delegated_backup_config, 11, 0),
+        (
+            "delegated-group-switch",
+            delegated_group_switch_config,
+            6,
+            2,
+        ),
+        ("delegated-holder-cut", delegated_holder_cut_config, 48, 0),
         (
             "delegated-long-delegation",
             delegated_long_delegation_config,
-            77,
+            65,
+            190,
         ),
         (
             "delegated-no-backup-root-near",
             delegated_no_backup_root_near_config,
-            4,
+            5,
+            0,
         ),
-        ("delegated-root-crash", delegated_root_crash_config, 1),
+        ("delegated-root-crash", delegated_root_crash_config, 1, 0),
         (
             "delegated-two-gens-root-crash",
             delegated_two_gens_root_crash_config,
             0,
+            0,
         ),
-        ("flex-crash", flex_crash_config, 125),
-        ("long-backup", long_backup_config, 0),
-        ("long-delegated", long_delegated_config, 0),
-        ("long-delegated-backup", long_delegated_backup_config, 46),
+        ("flex-crash", flex_crash_config, 125, 9),
+        ("long-backup", long_backup_config, 0, 0),
+        ("long-delegated", long_delegated_config, 0, 0),
+        ("long-delegated-backup", long_delegated_backup_config, 52, 5),
         (
             "long-delegated-late-answers",
             long_delegated_late_answers_config,
-            65,
+            63,
+            7,
         ),
-        ("long-sessions", long_sessions_config, 0),
-        ("placement-hot", placement_hot_config, 9),
-        ("shared-dir-faults", shared_dir_faults_config, 0),
-        ("tloss-two-node", tloss_two_node_config, 3),
+        ("long-sessions", long_sessions_config, 0, 0),
+        ("placement-hot", placement_hot_config, 10, 0),
+        ("shared-dir-faults", shared_dir_faults_config, 0, 0),
+        ("tloss-two-node", tloss_two_node_config, 3, 0),
     ];
     const SEEDS: u64 = 100;
-    let mut jobs: Vec<(String, SimConfig, Option<usize>)> = Vec::new();
+    // (label, config, the ceilings on violations and on allowed ones)
+    type Job = (String, SimConfig, Option<(usize, usize)>);
+    let mut jobs: Vec<Job> = Vec::new();
+    // The margin: two, or a tenth when that is more.
+    let with_margin = |n: usize| n + (n / 10).max(2);
     for (label, cfg) in strict_configs {
         let strict = SimConfig {
             strict_unsettled: true,
             ..cfg()
         };
-        jobs.push((format!("{label}+unsettled"), strict, None));
+        // (No violation, and no allowed one but the margin's: the sweep that set
+        // the list told none.)
+        jobs.push((
+            format!("{label}+unsettled"),
+            strict,
+            Some((0, with_margin(0))),
+        ));
     }
-    for (label, cfg, counted) in ceilings {
-        // The margin: two, or a tenth when that is more.
+    for (label, cfg, violations, allowed) in ceilings {
         jobs.push((
             label.to_string(),
             cfg(),
-            Some(counted + (counted / 10).max(2)),
+            Some((with_margin(violations), with_margin(allowed))),
         ));
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -15514,10 +15538,15 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
                 let Some((label, cfg, ceiling)) = jobs.get(i) else {
                     return;
                 };
-                let mut violations = 0usize;
+                let (mut violations, mut allowed) = (0usize, 0usize);
                 for seed in 0..SEEDS {
                     match run_seed(seed, cfg.clone()) {
-                        Ok(r) => violations += r.unsettled_violations,
+                        Ok(r) => {
+                            violations += r.unsettled_violations;
+                            allowed += r.unsettled_isolated
+                                + r.unsettled_no_sequencer_in_time
+                                + r.unsettled_generation_tail_unreachable;
+                        }
                         Err(e) => {
                             failures.lock().unwrap().push(format!(
                                 "{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}"
@@ -15526,11 +15555,18 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
                         }
                     }
                 }
-                if let Some(ceiling) = ceiling {
-                    if violations > *ceiling {
+                if let Some((max_violations, max_allowed)) = ceiling {
+                    if violations > *max_violations {
                         failures.lock().unwrap().push(format!(
                             "{label}: {violations} unsettled EIOs with a sequencer reachable in \
-                             seeds 0..{SEEDS}, above the ceiling {ceiling}"
+                             seeds 0..{SEEDS}, above the ceiling {max_violations}"
+                        ));
+                    }
+                    if allowed > *max_allowed {
+                        failures.lock().unwrap().push(format!(
+                            "{label}: {allowed} allowed unsettled EIOs (isolated, none in time, \
+                             a generation's tail unreachable) in seeds 0..{SEEDS}, above the \
+                             ceiling {max_allowed}"
                         ));
                     }
                 }

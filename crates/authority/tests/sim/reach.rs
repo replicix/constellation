@@ -69,7 +69,9 @@
 //!   exists only by design later than the window's end: the lease claim
 //!   cannot finish inside it (a TTL of its own observation, the group's tail),
 //!   or the root's outwait of a generation that does not live (its window and
-//!   the recall) ends after it;
+//!   the recall) ends after it, or the lease body still names a holder that
+//!   holds nothing (sealed by a claimant, deposed, restarted, dead) and is not
+//!   claimable until it runs out;
 //! - `generation_tail_unreachable` ([`Verdict::GenerationTailUnreachable`]):
 //!   the root is reachable and the generation's allowance is over, but the
 //!   generation has a group and no holder of its tail (the delegate, a member)
@@ -311,8 +313,9 @@ struct Inner {
     /// How long the root outwaits a grant it cannot see renewed: the grant's
     /// ttl plus the margin (`Core::reclaim_horizon_ms`).
     horizon_ms: u64,
-    /// What a successor root adds to the window of a generation it inherits
-    /// (`DelegationState::inherit_slack_ms`: `backup_takeover_ms`).
+    /// What a root adds to the window of a generation it inherits after a fast
+    /// takeover (`DelegationState::inherit_slack_ms`: `backup_takeover_ms`;
+    /// 0 after any other acquisition, see [`tenure_of`]).
     inherit_slack_ms: u64,
     /// One recall round trip: the root asks the generation's group for its
     /// tail (P2P there and back) and records the generation's end (an S3 put:
@@ -341,8 +344,8 @@ pub struct ReachConfig {
     pub delegation_ttl_ms: u64,
     /// `Config::expiry_margin_ms`.
     pub expiry_margin_ms: u64,
-    /// `Config::backup_takeover_ms`: a successor root's slack on the windows
-    /// of the generations it inherits.
+    /// `Config::backup_takeover_ms`: a root's slack on the windows of the
+    /// generations it inherits after a fast takeover.
     pub backup_takeover_ms: u64,
 }
 
@@ -375,9 +378,10 @@ impl Reach {
     /// delegate honours a grant until `sent + ttl - margin`, the root until
     /// `receipt + ttl + margin` (`Core::reclaim_horizon_ms`), a one-way P2P
     /// delay after the request was sent; a generation never installed has the
-    /// window of the root's own grant, `born + ttl + margin`; a successor root
-    /// starts every inherited window anew, `backup_takeover_ms` longer. The
-    /// recall is one round trip on top (`recall_ms`).
+    /// window of the root's own grant, `born + ttl + margin`; a root starts every
+    /// window it inherits (a generation born before its tenure) anew, from its
+    /// tenure's start, and a fast takeover makes it `backup_takeover_ms`
+    /// longer. The recall is one round trip on top (`recall_ms`).
     pub fn configure(&self, c: ReachConfig) {
         let mut g = self.inner.lock().unwrap();
         g.min_p2p_ms = 2 * c.p2p_delay_hi_ms + c.settle_retry_ms;
@@ -687,8 +691,10 @@ enum Seg {
 ///   `born + ttl + margin` (`reclaim_horizon_ms`): the only window of a
 ///   generation never installed, or never renewed (a grant whose end is 0 in
 ///   the views).
-/// - A successor root starts every inherited window anew
-///   (`tenure + reclaim_horizon_ms + inherit_slack_ms`).
+/// - A root whose tenure began after the generation was born inherited it and
+///   started its window anew, `tenure + reclaim_horizon_ms` (plus the takeover
+///   slack after a fast takeover: see [`tenure_of`]). A generation born in the
+///   tenure was never inherited: its window is its own.
 ///
 /// `since` is where an unknown birth is taken to be (the stretch's start).
 fn gen_end_due(g: &Inner, q: &Question, node: NodeId, gen: u64, at: u64, since: u64) -> u64 {
@@ -710,22 +716,21 @@ fn gen_end_due(g: &Inner, q: &Question, node: NodeId, gen: u64, at: u64, since: 
     }
     let born = q.born.get(&gen).copied().or(installed).unwrap_or(since);
     let by_grant = renewed_until.map_or(0, |end| end + 2 * g.margin_ms + g.p2p_hi_ms);
-    successor_window(g, at).max((born + g.horizon_ms).max(by_grant)) + g.recall_ms
+    let inherited = tenure_of(g, at).filter(|t| born < t.start).map_or(0, |t| {
+        t.start + g.horizon_ms + if t.fast { g.inherit_slack_ms } else { 0 }
+    });
+    inherited.max((born + g.horizon_ms).max(by_grant)) + g.recall_ms
 }
 
-/// When a successor root's inherited windows end: its tenure's start plus the
-/// horizon and the inheritance slack (0 with no lease: nothing inherited).
-fn successor_window(g: &Inner, at: u64) -> u64 {
-    if lease_at(g, at).is_none() {
-        return 0;
-    }
-    tenure_start(g, at) + g.horizon_ms + g.inherit_slack_ms
-}
-
-/// When the root is due to have recalled keys across generations: the recall
-/// outwaits the slowest window, `horizon_ms` from the stretch's start.
-fn blocked_due(g: &Inner, at: u64, since: u64) -> u64 {
-    successor_window(g, at).max(since + g.horizon_ms) + g.recall_ms
+/// When the root is due to have recalled keys across generations: it ends
+/// every involved generation, so the last of their allowances. Each is
+/// anchored on its own grant's end, birth or tenure, never on the window or
+/// the stretch (a stretch's start only says since when the keys span them).
+fn blocked_due(g: &Inner, q: &Question, gens: &[(NodeId, u64)], at: u64, since: u64) -> u64 {
+    gens.iter()
+        .map(|(node, gen)| gen_end_due(g, q, *node, *gen, at, since))
+        .max()
+        .unwrap_or(0)
 }
 
 /// The members of generation `gen`'s group, as the nodes published them by
@@ -786,7 +791,12 @@ fn reach_at(g: &Inner, q: &Question, at: u64) -> Seg {
             root_after(g, me, at, due, &[(node, gen)])
         }
         // Keys across generations: the root recalls them first.
-        Owner::Blocked(gens) => root_after(g, me, at, blocked_due(g, at, since), &gens),
+        Owner::Blocked(gens) => {
+            match root_after(g, me, at, blocked_due(g, q, &gens, at, since), &gens) {
+                Seg::NotDue(why) => Seg::NotDue(format!("{why}, keys across generations")),
+                s => s,
+            }
+        }
     }
 }
 
@@ -879,6 +889,73 @@ fn tenure_start(g: &Inner, at: u64) -> u64 {
         .map_or(0, |l| l.at_ms)
 }
 
+/// A root's tenure as the product's delegation state sees it.
+struct Tenure {
+    /// When it began: the landing of the body that acquired the lease.
+    start: u64,
+    /// The acquisition took an unexpired lease of another node over (a seal or
+    /// an `ack=s3` takeover): the product adds the takeover slack to the
+    /// windows it inherits.
+    fast: bool,
+}
+
+/// The tenure the body in force at `at` belongs to. Unlike [`tenure_start`] it
+/// starts anew at every acquisition, the same holder's included: a holder that
+/// lost the lease and acquired it again (same epoch, `takeover=true`) dropped
+/// its delegation state (`Core::deleg_on_lease_gone`, delegate.rs:7660-7708) and
+/// inherits every generation again at its next sync, `now +
+/// reclaim_horizon_ms + inherit_slack_ms` (`delegation_sync`,
+/// delegate.rs:1232-1234). It is seen as a drop of the holder's view from
+/// held to nothing, or a detach, between two of its bodies. (The product's
+/// window runs from the sync, after the tenure's gate; the landing is never
+/// later.)
+fn tenure_of(g: &Inner, at: u64) -> Option<Tenure> {
+    let mut idx = g.leases.iter().rposition(|l| l.at_ms <= at)?;
+    let holder = g.leases[idx].holder;
+    while idx > 0 {
+        let (prev, cur) = (&g.leases[idx - 1], &g.leases[idx]);
+        if prev.holder != holder || lost_between(g, holder, prev.at_ms, cur.at_ms) {
+            break;
+        }
+        idx -= 1;
+    }
+    let first = &g.leases[idx];
+    // The slack only after a takeover of another node's unexpired lease: the
+    // product sets `inherit_slack_ms` in `note_fast_takeover` (backup.rs:2579),
+    // called for a permitted takeover of a lease that is not released and not
+    // its own (`fast_prev`, jobs.rs:3623-3625), and resets it to 0 at every
+    // acquisition (jobs.rs:3626). A body of the same holder
+    // is no such takeover.
+    let fast = idx > 0 && {
+        let p = &g.leases[idx - 1];
+        p.holder != holder && p.holder != 0 && !p.released && p.ends_ms > first.at_ms
+    };
+    Some(Tenure {
+        start: first.at_ms,
+        fast,
+    })
+}
+
+/// Whether `n` let go of what it held, or was detached, in `(from, to]`.
+fn lost_between(g: &Inner, n: NodeId, from: u64, to: u64) -> bool {
+    let detached = g
+        .alive
+        .iter()
+        .any(|(t, node, up)| *node == n && !*up && *t > from && *t <= to);
+    let mut last = Held::No;
+    let mut dropped = false;
+    for v in g.views.get(&n).into_iter().flatten() {
+        if v.at > to {
+            break;
+        }
+        if v.at > from && last != Held::No && v.held == Held::No {
+            dropped = true;
+        }
+        last = v.held;
+    }
+    detached || dropped
+}
+
 /// Whether `n` was detached (crashed) at any moment of `(since, at]` and lost
 /// what it had not synced: a node that restarted with its journal
 /// (`keep_journal`) holds its synced rows again from its bootstrap on (counted
@@ -888,12 +965,25 @@ fn went_down_between(g: &Inner, n: NodeId, since: u64, at: u64) -> bool {
         if *node != n || *up || *t <= since || *t > at {
             return false;
         }
-        // The attach that ended this detach, if it came by `at` with the
-        // journal kept.
+        // The attach that ended this detach, if it came by `at`, and the
+        // journal kept in the same up-period (the restart records it right
+        // after the attach, in the same step): between that attach and the
+        // node's next change of attachment.
         let back = g.alive[i + 1..]
             .iter()
-            .find(|(_, node, up)| *node == n && *up);
-        !back.is_some_and(|(u, _, _)| *u <= at && g.kept.contains(&(*u, n)))
+            .enumerate()
+            .find(|(_, (_, node, up))| *node == n && *up);
+        let kept = back.is_some_and(|(j, (u, _, _))| {
+            let next = g.alive[i + 1 + j + 1..]
+                .iter()
+                .find(|(_, node, _)| *node == n)
+                .map_or(u64::MAX, |(t, _, _)| *t);
+            *u <= at
+                && g.kept
+                    .iter()
+                    .any(|(k, node)| *node == n && *k >= *u && *k < next && *k <= at)
+        });
+        !kept
     })
 }
 
@@ -1031,7 +1121,7 @@ fn classify(g: &Inner, q: Question) -> Verdict {
         let due = match &owner {
             Owner::Root => continue,
             Owner::Delegate { node, gen } => gen_end_due(g, &q, *node, *gen, m, since),
-            Owner::Blocked(_) => blocked_due(g, m, since),
+            Owner::Blocked(gens) => blocked_due(g, &q, gens, m, since),
         };
         if inside(due) {
             dues.push(due);
@@ -1108,12 +1198,48 @@ fn classify(g: &Inner, q: Question) -> Verdict {
     if let Some(why) = tail_blocked {
         return Verdict::GenerationTailUnreachable { why };
     }
-    match claim_blocked.or(not_due) {
+    match claim_blocked
+        .or(not_due)
+        .or_else(|| dead_holders_lease(g, &q))
+    {
         Some(why) => Verdict::NoSequencerInTime { why },
         None => Verdict::Isolated {
             why: why_isolated(g, &q),
         },
     }
+}
+
+/// The requester reaches S3 and nothing is cut from it, yet no sequencer
+/// exists because the lease body still names a holder that holds nothing (a
+/// holder a claimant sealed, deposed or restarted; a dead one): the lease is
+/// not claimable until its body runs out, by design. That is the lease path
+/// not being open in time, not the requester's isolation (plan 46 M0.3
+/// re-check 2, `delegated-holder-cut` seed 41: a claimant sealed the holder,
+/// then lost its CAS to the holder's own late renewal, and the sealed holder's
+/// lease blocked every claim for a TTL).
+fn dead_holders_lease(g: &Inner, q: &Question) -> Option<String> {
+    let at = q.to_ms.saturating_sub(1);
+    let me = q.requester;
+    if !running(g, at, me) || !s3_up(g, at, me) {
+        return None;
+    }
+    // Keys a live delegate owns are that delegate's: the requester's way to
+    // it is what is missing, not the lease.
+    if let Owner::Delegate { node, gen } = q.owner_at(at).1 {
+        if delegate_in_force(g, at, node, gen) {
+            return None;
+        }
+    }
+    let l = lease_at(g, at).filter(|l| l.holder != 0 && !l.released)?;
+    if attached(g, at, l.holder) && root_in_force(g, at, l.holder) {
+        return None;
+    }
+    Some(format!(
+        "the lease still names node {}, which holds nothing (sealed, deposed, restarted or down); \
+         it is claimable from {} ms",
+        l.holder,
+        l.ends_ms + claim_grace_for(g, &l, me)
+    ))
 }
 
 /// What kept the requester from the sequencers at the window's end, in a
@@ -1336,9 +1462,13 @@ mod tests {
         r.stopped_at(2, 3_900, 7_100);
         let v = r.classify(q(3).delegated(2, 7));
         assert!(v.isolated(), "{v:?}");
-        // Keys across generations: nobody until the recall is done (600 ms
-        // and a round trip from the window's start: 4 700); then the root,
-        // here the requester itself.
+        // Keys across generations: nobody until the generation's own
+        // allowance is over (its grant ended at 4 000: 4 000 + 200 + 10, the
+        // recall 100 more: 4 310); then the root, here the requester itself.
+        let r = world();
+        r.lease_landed_at(3_500, 3, 9_000, false);
+        r.note_view_at(3_500, 3, Held::Lease, vec![], vec![], 0);
+        r.note_view_at(3_000, 2, Held::No, vec![(7, 4_000)], vec![], 0);
         let mut across = q(3);
         across.owners = vec![(0, Owner::Blocked(vec![(2, 7)]))];
         let v = r.classify(across.clone());
@@ -1347,14 +1477,14 @@ mod tests {
                 v,
                 Verdict::Reachable {
                     via: Via::Itself,
-                    from_ms: 4_700,
+                    from_ms: 4_310,
                     to_ms: 7_000,
                     ..
                 }
             ),
             "{v:?}"
         );
-        across.to_ms = 4_600;
+        across.to_ms = 4_300;
         let v = r.classify(across);
         assert!(v.no_sequencer_in_time(), "{v:?}");
     }
@@ -1504,13 +1634,15 @@ mod tests {
         // With S3 cut, nothing is reachable.
         r.s3_cut_at(3_100, 3, true);
         assert!(r.classify(q(3)).isolated());
-        // A lease that has not run out blocks the lease path.
+        // A lease that has not run out blocks the lease path: the dead
+        // holder's body runs to 8 000, after the window (the lease path is
+        // not open in time, `dead_holders_lease`).
         let r = world();
         r.lease_landed_at(3_900, 1, 8_000, false);
         r.attached_at(3_950, 1, false);
         let v = r.classify(q(3));
         assert!(
-            v.isolated(),
+            v.no_sequencer_in_time(),
             "{v:?}: the lease runs to 8 000, after the window"
         );
     }
@@ -1674,13 +1806,13 @@ mod tests {
         r.attached_at(3_000, 1, false);
         r.attached_at(3_100, 1, true);
         let v = r.classify(q(3));
-        let Verdict::Isolated { why } = v else {
+        let Verdict::NoSequencerInTime { why } = v else {
             panic!("{v:?}")
         };
-        assert!(why.contains("root 1 holds nothing"), "{why}");
+        assert!(why.contains("node 1, which holds nothing"), "{why}");
         // The restarted node, asked for its own op, is no sequencer either.
         let v = r.classify(q(1));
-        assert!(v.isolated(), "{v:?}");
+        assert!(v.no_sequencer_in_time(), "{v:?}");
         // Once it holds a lease again (a new body, a new view), it is.
         r.lease_landed_at(5_000, 1, 11_000, false);
         r.note_view_at(5_000, 1, Held::Lease, vec![], vec![], 0);
@@ -2034,56 +2166,311 @@ mod tests {
         );
     }
 
+    /// Keys across generations 7 (delegate 2) and 8 (delegate 4), blocked
+    /// since before the window.
+    fn blocked() -> Question {
+        let mut q = q(3).born_at(7, 500).born_at(8, 700);
+        q.owners = vec![(0, Owner::Blocked(vec![(2, 7), (4, 8)]))];
+        q
+    }
+
     #[test]
-    fn keys_across_generations_count_the_root_once_the_recall_is_due() {
-        // Both delegates are reachable from the root: the recall is a round
-        // trip; due 600 ms and one after the stretch began (4 000).
+    fn keys_across_generations_are_the_roots_once_every_generations_own_allowance_is_over() {
+        // Both grants ended long before the window (2 000 and 2 200): the
+        // allowances (grant end + 2 x margin + delay + recall) were over at
+        // 2 310 and 2 510. The root is reachable and linked to the delegates:
+        // the root's from the window's start, however long the keys have
+        // been blocked.
         let r = world();
+        r.attached_at(0, 4, true);
         r.lease_landed_at(3_500, 1, 9_000, false);
-        let mut blocked = q(3);
-        blocked.owners = vec![(0, Owner::Blocked(vec![(2, 7), (3, 8)]))];
-        let v = r.classify(blocked.clone());
+        r.note_view_at(1_000, 2, Held::No, vec![(7, 2_000)], vec![], 0);
+        r.note_view_at(1_000, 4, Held::No, vec![(8, 2_200)], vec![], 0);
+        let v = r.classify(blocked());
         assert!(
             matches!(
                 v,
                 Verdict::Reachable {
                     via: Via::Root(1),
-                    from_ms: 4_700,
+                    from_ms: 4_000,
                     to_ms: 7_000,
                     ..
                 }
             ),
             "{v:?}"
         );
-        // The stretch began at 4 500 (an earlier one was another owner's):
-        // due at 5 200.
-        blocked.owners = vec![
-            (0, Owner::Delegate { node: 2, gen: 7 }),
-            (4_500, Owner::Blocked(vec![(2, 7), (3, 8)])),
-        ];
-        let v = r.classify(blocked);
+        // A delegate cut from the root (no group, so its tail is nowhere
+        // else): the root ends the generation without it, the decision taken
+        // (`tail_reachable`).
+        r.partition_at(3_100, 1, 2, true);
+        let v = r.classify(blocked());
         assert!(
             matches!(
                 v,
                 Verdict::Reachable {
                     via: Via::Root(1),
-                    from_ms: 5_200,
+                    from_ms: 4_000,
                     ..
                 }
             ),
             "{v:?}"
         );
-        // A delegate whose group is out of reach: the root waits for its tail.
+        // One generation still inside its allowance: the root waits for the
+        // last, here 4 800 + 200 + 10 + 100 = 5 110.
         let r = world();
         r.attached_at(0, 4, true);
         r.lease_landed_at(3_500, 1, 9_000, false);
-        r.note_view_at(2_000, 2, Held::No, vec![(7, 9_000)], vec![(7, 4)], 0);
+        r.note_view_at(1_000, 2, Held::No, vec![(7, 2_000)], vec![], 0);
+        r.note_view_at(1_000, 4, Held::No, vec![(8, 4_800)], vec![], 0);
+        let v = r.classify(blocked());
+        assert!(
+            matches!(
+                v,
+                Verdict::Reachable {
+                    via: Via::Root(1),
+                    from_ms: 5_110,
+                    to_ms: 7_000,
+                    ..
+                }
+            ),
+            "{v:?}"
+        );
+        // Inside the window the keys have no sequencer yet, by design.
+        let mut early = Question::new(3, 4_000, 5_000)
+            .born_at(7, 500)
+            .born_at(8, 700);
+        early.owners = blocked().owners;
+        let Verdict::NoSequencerInTime { why } = r.classify(early) else {
+            panic!("not no_sequencer_in_time")
+        };
+        assert!(why.contains("keys across generations"), "{why}");
+    }
+
+    #[test]
+    fn keys_across_generations_whose_tail_cannot_be_reached_are_not_the_roots() {
+        // Generation 7 has a group (node 5, down) and its delegate is cut from
+        // the root; its allowance was over long before the window: the root
+        // cannot end it without its tail.
+        let r = world();
+        r.attached_at(0, 4, true);
+        r.attached_at(0, 5, true);
+        r.lease_landed_at(3_500, 1, 9_000, false);
+        r.note_view_at(1_000, 2, Held::No, vec![(7, 2_000)], vec![(7, 5)], 0);
+        r.note_view_at(1_000, 4, Held::No, vec![(8, 2_200)], vec![], 0);
+        r.attached_at(3_100, 5, false);
         r.partition_at(3_100, 1, 2, true);
-        r.partition_at(3_100, 1, 4, true);
-        let mut blocked = q(3);
-        blocked.owners = vec![(0, Owner::Blocked(vec![(2, 7)]))];
-        let v = r.classify(blocked);
+        let v = r.classify(blocked());
         assert!(v.generation_tail_unreachable(), "{v:?}");
+        // The same group with a member up: the root has its tail.
+        r.attached_at(3_200, 5, true);
+        let v = r.classify(blocked());
+        assert!(matches!(v, Verdict::Reachable { .. }), "{v:?}");
+    }
+
+    #[test]
+    fn a_stretch_that_began_in_the_window_does_not_move_the_allowance() {
+        // The keys became blocked at 4 500 (another owner's before): the
+        // generations' own allowances were over long before, so the root is
+        // the sequencer from the stretch's start, not a horizon after it.
+        let r = world();
+        r.attached_at(0, 4, true);
+        r.lease_landed_at(3_500, 1, 9_000, false);
+        r.note_view_at(1_000, 2, Held::No, vec![(7, 2_000)], vec![], 0);
+        r.note_view_at(1_000, 4, Held::No, vec![(8, 2_200)], vec![], 0);
+        let mut q = blocked();
+        q.owners = vec![
+            (0, Owner::Delegate { node: 2, gen: 7 }),
+            (4_500, Owner::Blocked(vec![(2, 7), (4, 8)])),
+        ];
+        let v = r.classify(q);
+        assert!(
+            matches!(
+                v,
+                Verdict::Reachable {
+                    via: Via::Root(1),
+                    from_ms: 4_000,
+                    ..
+                }
+            ),
+            "{v:?}"
+        );
+    }
+
+    /// `world` with a 300 ms takeover slack.
+    fn world_with_slack() -> Reach {
+        let r = Reach::default();
+        r.configure(ReachConfig {
+            backup_takeover_ms: 300,
+            ..cfg(0, 0)
+        });
+        for n in 1..=3 {
+            r.attached_at(0, n, true);
+        }
+        r.lease_landed_at(0, 1, 1_000, false);
+        r.note_view_at(0, 1, Held::Lease, vec![], vec![], 0);
+        r
+    }
+
+    /// The window [2 000, 5 000] of node 3 on keys of generation 7 (delegate
+    /// 2, its grant ended at 2 000), born at `born`.
+    fn gen7(born: u64) -> Question {
+        Question::new(3, 2_000, 5_000)
+            .delegated(2, 7)
+            .born_at(7, born)
+    }
+
+    #[test]
+    fn the_takeover_slack_is_added_to_the_generations_born_before_a_fast_takeover_only() {
+        // Node 3 held the lease until 2 400; node 1 took it over at 1 900
+        // (a seal: the body had not run out). Generation 7 was born at
+        // 1 000, its grant ended at 2 000. The successor's window:
+        // 1 900 + 600 + 300 (slack) = 2 800, and the recall: 2 900.
+        let r = world_with_slack();
+        r.lease_landed_at(500, 3, 1_500, false);
+        r.lease_landed_at(1_400, 3, 2_400, false);
+        r.lease_landed_at(1_900, 1, 9_000, false);
+        r.note_view_at(1_200, 2, Held::No, vec![(7, 2_000)], vec![], 0);
+        let from = |r: &Reach, born: u64| match r.classify(gen7(born)) {
+            Verdict::Reachable {
+                via: Via::Root(1),
+                from_ms,
+                ..
+            } => from_ms,
+            v => panic!("{v:?}"),
+        };
+        assert_eq!(from(&r, 1_000), 2_900);
+        // A generation born in the tenure was never inherited: its window is
+        // its own, 2 000 + 600 + 100 (the grant's: 2 000 + 210 is less).
+        assert_eq!(from(&r, 2_000), 2_700);
+        // A takeover of a lease that had run out (no seal, no permit) adds no
+        // slack: the predecessor's last body ended at 1 500, before the
+        // landing.
+        let r = world_with_slack();
+        r.lease_landed_at(500, 3, 1_500, false);
+        r.lease_landed_at(1_900, 1, 9_000, false);
+        r.note_view_at(1_200, 2, Held::No, vec![(7, 2_000)], vec![], 0);
+        assert_eq!(from(&r, 1_000), 2_600);
+        // Nor a released lease's.
+        let r = world_with_slack();
+        r.lease_landed_at(500, 3, 2_400, true);
+        r.lease_landed_at(1_900, 1, 9_000, false);
+        r.note_view_at(1_200, 2, Held::No, vec![(7, 2_000)], vec![], 0);
+        assert_eq!(from(&r, 1_000), 2_600);
+    }
+
+    #[test]
+    fn a_holder_that_lost_the_lease_and_acquired_it_again_inherits_every_generation_anew() {
+        // Node 1 held the lease since 0 (generation 7 born at 500, its grant
+        // ended at 1 500), lost it (its view drops at 2 500) and acquired it
+        // again at 3 000, the same epoch. It dropped its delegation state and
+        // inherits the generation at the sync: 3 000 + 600, the recall:
+        // 3 700, and not the 1 810 of the generation's own window. No slack:
+        // the lease it took was its own.
+        let r = world_with_slack();
+        r.lease_landed_at(900, 1, 1_900, false);
+        r.note_view_at(1_000, 2, Held::No, vec![(7, 1_500)], vec![], 0);
+        r.note_view_at(2_500, 1, Held::No, vec![], vec![], 0);
+        r.lease_landed_at(3_000, 1, 9_000, false);
+        r.note_view_at(3_050, 1, Held::Lease, vec![], vec![], 0);
+        let v = r.classify(
+            Question::new(3, 3_000, 6_000)
+                .delegated(2, 7)
+                .born_at(7, 500),
+        );
+        assert!(
+            matches!(
+                v,
+                Verdict::Reachable {
+                    via: Via::Root(1),
+                    from_ms: 3_700,
+                    ..
+                }
+            ),
+            "{v:?}"
+        );
+        // A crash and restart between the bodies is the same.
+        let r = world_with_slack();
+        r.lease_landed_at(900, 1, 1_900, false);
+        r.note_view_at(1_000, 2, Held::No, vec![(7, 1_500)], vec![], 0);
+        r.attached_at(2_500, 1, false);
+        r.attached_at(2_800, 1, true);
+        r.lease_landed_at(3_000, 1, 9_000, false);
+        r.note_view_at(3_050, 1, Held::Lease, vec![], vec![], 0);
+        let v = r.classify(
+            Question::new(3, 3_000, 6_000)
+                .delegated(2, 7)
+                .born_at(7, 500),
+        );
+        assert!(
+            matches!(v, Verdict::Reachable { from_ms: 3_700, .. }),
+            "{v:?}"
+        );
+        // A renewal (the holder never let go) is the same tenure: the
+        // generation, born in it, keeps its own window.
+        let r = world_with_slack();
+        r.lease_landed_at(900, 1, 1_900, false);
+        r.lease_landed_at(1_800, 1, 2_800, false);
+        r.lease_landed_at(2_700, 1, 9_000, false);
+        r.note_view_at(1_000, 2, Held::No, vec![(7, 1_500)], vec![], 0);
+        let v = r.classify(
+            Question::new(3, 3_000, 6_000)
+                .delegated(2, 7)
+                .born_at(7, 500),
+        );
+        assert!(
+            matches!(
+                v,
+                Verdict::Reachable {
+                    via: Via::Root(1),
+                    from_ms: 3_000,
+                    ..
+                }
+            ),
+            "{v:?}"
+        );
+    }
+
+    #[test]
+    fn a_lease_that_names_a_holder_with_nothing_is_the_lease_path_not_open_in_time() {
+        // Node 1 renewed the lease to 9 000, then a claimant sealed it: it
+        // holds nothing from 3 000 on (its view drops), and the body keeps
+        // naming it. Nobody can claim before it runs out: not isolation, the
+        // lease path is not open in time.
+        let r = world();
+        r.lease_landed_at(2_500, 1, 9_000, false);
+        r.note_view_at(3_000, 1, Held::No, vec![], vec![], 0);
+        let v = r.classify(q(3));
+        let Verdict::NoSequencerInTime { why } = v else {
+            panic!("{v:?}")
+        };
+        assert!(
+            why.contains("holds nothing") && why.contains("9000 ms"),
+            "{why}"
+        );
+        // The same holder dead: the same.
+        let r = world();
+        r.lease_landed_at(2_500, 1, 9_000, false);
+        r.attached_at(3_000, 1, false);
+        assert!(r.classify(q(3)).no_sequencer_in_time());
+        // A holder that holds the lease, cut from the requester: isolation.
+        let r = world();
+        r.lease_landed_at(2_500, 1, 9_000, false);
+        r.partition_at(3_000, 3, 1, true);
+        assert!(r.classify(q(3)).isolated());
+        // A requester with its path to S3 cut: isolation, whoever holds.
+        let r = world();
+        r.lease_landed_at(2_500, 1, 9_000, false);
+        r.note_view_at(3_000, 1, Held::No, vec![], vec![], 0);
+        r.s3_cut_at(3_000, 3, true);
+        assert!(r.classify(q(3)).isolated());
+        // Keys of a live delegate the requester cannot reach: the delegate is
+        // the sequencer, the lease has nothing to do with it.
+        let r = world();
+        r.lease_landed_at(2_500, 1, 9_000, false);
+        r.note_view_at(3_000, 1, Held::No, vec![], vec![], 0);
+        r.note_view_at(3_000, 2, Held::No, vec![(7, 9_000)], vec![], 0);
+        r.partition_at(3_000, 3, 2, true);
+        assert!(r.classify(q(3).delegated(2, 7)).isolated());
     }
 
     #[test]
@@ -2145,6 +2532,30 @@ mod tests {
             ),
             "{v:?}"
         );
+        // (The journal recorded a millisecond after the attach, in the same
+        // up-period, counts as well; one from a later up-period does not.)
+        let late = world();
+        late.lease_landed_with(2_000, 1, 3_500, false, vec![2]);
+        late.attached_at(3_000, 1, false);
+        late.attached_at(3_200, 2, false);
+        late.attached_at(3_400, 2, true);
+        late.journal_kept_at(3_401, 2);
+        assert!(matches!(
+            late.classify(q(3)),
+            Verdict::Reachable {
+                via: Via::LeasePath,
+                ..
+            }
+        ));
+        let stale = world();
+        stale.lease_landed_with(2_000, 1, 3_500, false, vec![2]);
+        stale.attached_at(3_000, 1, false);
+        stale.attached_at(3_200, 2, false);
+        stale.attached_at(3_400, 2, true);
+        stale.attached_at(3_450, 2, false);
+        stale.attached_at(3_500, 2, true);
+        stale.journal_kept_at(3_500, 2);
+        assert!(stale.classify(q(3)).no_sequencer_in_time());
         // A second crash, restarted fresh, loses it again.
         kept.attached_at(3_600, 2, false);
         kept.attached_at(3_700, 2, true);

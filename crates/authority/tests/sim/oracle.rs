@@ -113,8 +113,12 @@ impl Unsettled {
             }
             super::reach::Verdict::Isolated { .. } => "isolated".into(),
             super::reach::Verdict::NoSequencerInTime { why } => {
-                if why.contains("no member") {
+                if why.contains("holds nothing") {
+                    "no-sequencer-in-time/lease of a holder with nothing".into()
+                } else if why.contains("no member") {
                     "no-sequencer-in-time/group tail".into()
+                } else if why.contains("keys across generations") {
+                    "no-sequencer-in-time/generation outwait, keys across generations".into()
                 } else if why.contains("ends the generation") {
                     "no-sequencer-in-time/generation outwait".into()
                 } else {
