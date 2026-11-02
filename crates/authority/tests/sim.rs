@@ -3984,7 +3984,11 @@ fn a_backup_paused_while_its_holder_is_cut_from_s3_waits_for_the_group() {
             "pause1@7000:2000",
             true,
         ),
-        ("backup-lag-in-margin-cut", 277, "pause2@7500:3000", true),
+        // (Pinned at 7500 ms before the cut holder's acquisitions became
+        // renewals: the backup's seal then landed 13 ms later, inside the
+        // pause, and the takeover the case needs to see ran after it. 7250
+        // is the same case, the seal and the takeover before the pause.)
+        ("backup-lag-in-margin-cut", 277, "pause2@7250:3000", true),
         // The third node; the cut holder itself.
         (
             "backup-lag-at-expiry-beats-lost",
