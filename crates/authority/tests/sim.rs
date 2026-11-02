@@ -14905,6 +14905,66 @@ fn i1_a_root_resumed_from_a_pause_does_not_answer_alone_on_a_stale_directory() {
     }
 }
 
+/// Plan 46 M0.3 (S1 to S3): the three product causes of an `EIO` that was
+/// not settled first. A takeover gate whose journal work is done answers a
+/// settle on the keys it owns (`backup-strict` 27 and 54: the requester's
+/// create got `Busy` for 7 s and went unsettled, then executed when the gate
+/// opened; `delegated-holder-cut` 17, `delegated-backup` 11,
+/// `long-delegated-late-answers` 13); a gated root leaves a delegation renewal
+/// unanswered instead of refusing it (`delegated-backup` 129,
+/// `delegated-no-backup-root-near` 297: the refused delegate stopped, the gate
+/// inherited the generation as live and outwaited it); and the root neither
+/// redirects to a generation it recalls nor outwaits a delegate that disowned
+/// its own (`long-delegated` 178 and 1198, `delegated-two-gens-root-crash`
+/// 651, `delegated-holder-cut` 6: a settle bounced between the two nodes).
+/// Each seed answers one `EIO` unsettled on the parent (`client_unsettled_eio`
+/// is the counter, here without the classifier that excuses an isolated
+/// requester: none of these seeds is one) and none now.
+#[test]
+fn settle_before_eio_a_gate_a_renewal_and_a_redirect_loop_leave_no_unsettled_eio() {
+    let cases: Vec<(&str, SimConfig, Vec<u64>)> = vec![
+        ("backup-strict", backup_strict_config(), vec![27, 54]),
+        (
+            "delegated-holder-cut",
+            delegated_holder_cut_config(),
+            vec![6, 17],
+        ),
+        ("delegated-backup", delegated_backup_config(), vec![11, 129]),
+        (
+            "delegated-no-backup-root-near",
+            delegated_no_backup_root_near_config(),
+            vec![297],
+        ),
+        ("long-delegated", long_delegated_config(), vec![178, 1198]),
+        (
+            "long-delegated-late-answers",
+            long_delegated_late_answers_config(),
+            vec![13],
+        ),
+        (
+            "delegated-two-gens-root-crash",
+            delegated_two_gens_root_crash_config(),
+            vec![651],
+        ),
+    ];
+    let mut unsettled = Vec::new();
+    for (label, cfg, seeds) in cases {
+        for seed in seeds {
+            let r =
+                run_seed(seed, cfg.clone()).unwrap_or_else(|e| panic!("{label} seed {seed}: {e}"));
+            let n: u64 = r.stats.values().map(|s| s.client_unsettled_eio).sum();
+            if n > 0 {
+                unsettled.push(format!("{label} seed {seed}: {n}"));
+            }
+        }
+    }
+    assert!(
+        unsettled.is_empty(),
+        "ops answered EIO unsettled (replay one with AUTHORITY_SIM_CONFIG=<label> \
+         AUTHORITY_SIM_START=<seed> AUTHORITY_SIM_SEEDS=1): {unsettled:#?}"
+    );
+}
+
 /// Plan 43 C1-1: a backup counts only from acknowledgements given to an
 /// append that carried a version listing it, and a removal lands covered.
 /// `long-backup` seed 892: a candidate acknowledged rows at the version
