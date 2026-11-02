@@ -63917,7 +63917,7 @@ re-pinned (the sim suite fails seven tests on the rebased tree before it, all gr
 `a_delegating_root_cut...` (1614 out, 1616 and 1617 in), and `c1_a_committed_rid_is_queued_on_one_node_only` (backup-crash 858 out).
 
 **Finding (not fixed here): a member copy no archive carries.** backup-crash seed 858 (`+unclocked+identity`, one seed of 2,000; main
-passes it): node 1 takes the lease over at epoch 2, is paused, and the takeover's gate drain finally runs the inbox ops at t=8986;
+passes that seed, but shows the same leak on `backup-crash-slow+commit` seed 840, where node 3 keeps 20 `RootGroup` refusals of epoch 1): node 1 takes the lease over at epoch 2, is paused, and the takeover's gate drain finally runs the inbox ops at t=8986;
 a claimant takes the lease at epoch 3 a few ms later and fetches the epoch-1 group tail. The refusals node 1 journaled in that
 drain are tagged `RootGroup` (a peer is linked, so the rows are gated); the deposed node keeps them as a member copy, and nothing
 re-ships them, because the group that would carry them never held them. The requesters retry by rid and the effects are not lost;

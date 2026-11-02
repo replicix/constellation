@@ -1444,8 +1444,10 @@ impl Core {
             // (`backup_could_be_had`), raised at every event and never
             // stale in the unsafe direction. Only a node with no roster
             // peer linked within the budget — a singleton, a peer measured
-            // out of budget — is lone. (A peer that sealed the epoch is
-            // linked: it takes over with its tail, and waits for nothing here.)
+            // out of budget — is lone. A peer that sealed the epoch counts as
+            // linked: it is no candidate, but it takes over with its tail, so
+            // the acknowledgements wait for the archive (`shipped_through`)
+            // instead of leaving on this disk.
             let unassessed = self.ack.eligible.is_none() && self.backups_possible();
             return if self.ack.candidate.is_some() || self.ack.eligible == Some(true) || unassessed
             {
