@@ -14017,6 +14017,54 @@ fn regression_long_delegated_late_answers_seed_9287() {
     });
 }
 
+/// `long-delegated-late-answers` seeds 3228, 6183 and 7393, and with slow
+/// lease reads 1477, 5718 and 9955 (L1: a former delegate's replica
+/// diverged from the log prefix): the root's pre-S3 stream delivered the append of node 2's
+/// own row of a generation (`create d1/f3`, or a rename to it), the
+/// generation's `RecallCut`, and the root's own `unlink` (or rename) of the
+/// name, while a shadow of node 2's older than its own row was
+/// outstanding. The install of the later rows rolled back from the shadow
+/// and redid the own `Local` row on top of them (the early return for the
+/// own row recorded nothing, and a `Local` row never counted as ordered),
+/// so the name came back; the segment then retired the row with its
+/// effect kept. The node failed as `not the log prefix` or, executing
+/// against the name, as a `[directory]` op that took effect in the log
+/// but was refused by the spec. It fails before the stream marks the own
+/// row it delivered (`deleg_streamed`) and installs later rows after it
+/// (`spec::row_is_ordered_at`).
+///
+/// Which seeds fail before the fix depends on the base, because the settle
+/// fixes moved the schedules: on 055de5f1 (before them) 6183, 7393, 5718 and
+/// 9955 fail; on 5adad3a4 (after them) 1477, 3228 and 7393 fail, and 6183,
+/// 5718 and 9955 pass. All six stay as regression seeds.
+#[test]
+fn l1_a_former_delegates_own_row_keeps_its_log_place() {
+    let mut failed = Vec::new();
+    for (seed, knob) in [
+        (1_477, true),
+        (3_228, false),
+        (6_183, false),
+        (7_393, false),
+        (5_718, true),
+        (9_955, true),
+    ] {
+        let cfg = SimConfig {
+            lease_reads: if knob {
+                SLOW_LEASE_READS
+            } else {
+                Default::default()
+            },
+            ..long_delegated_late_answers_config()
+        };
+        if let Err(e) = run_seed(seed, cfg) {
+            failed.push(format!(
+                "long-delegated-late-answers seed {seed} (slow lease reads: {knob}): {e}"
+            ));
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 /// `locks-unlinked-delegated-dbackup-random` seed 5681 (mutual
 /// exclusion): `d1`'s generation was outwaited while grants the root had
 /// moved to it were still undelivered (the root and the delegate were
@@ -14975,28 +15023,15 @@ fn settle_before_eio_a_gate_a_renewal_and_a_redirect_loop_leave_no_unsettled_eio
 /// delegated_settle_findings`). Every seed runs and every failure is
 /// reported.
 ///
-/// **L1, replica divergence on a former delegate (integrity).** When one
-/// applied foreign segment carries a node's own rows of an ended generation
-/// (retired in that apply), the generation's `RecallCut` and a later root row
-/// on the same key (an unlink, or a rename over it), the node's replica keeps
-/// the effect of its own row. The node then serves, executes against or
-/// commits a state the log removed: `[directory]` "returned `Eexist` / took
-/// effect where the spec refuses", "commit N is not the log prefix: inode only
-/// on the left", or a session guarantee on the stale entry. Start at
-/// `jobs.rs` (the apply that logs `retired=`) and `meta/src/replay.rs`
-/// `apply_foreign` (the own-row retire, or the own-row overlay, runs after, or
-/// instead of, the root row that follows it in the same segment). Main fails
-/// the class at `long-delegated-late-answers` 6183 (no knob: the same shape as
-/// 1477 below) and 7393 (no knob; fails here too), and 5718 and 9955 (knob).
-///
-/// Failing on this tree: `long-delegated-late-answers` 1477 (knob) and 3228
-/// (no knob), `[directory]`, the shape above; 7393 (no knob), the same class;
-/// 4125 (knob), a monotonic-reads violation on a stale `d1/f1` (the same
-/// symptom, the segment shape not traced).
-///
-/// Not pinned, because they pass on this tree (their schedules moved with the
-/// fixes, the latent bug is still there): `long-delegated-late-answers` 952
-/// (no knob), 1324, 1495 (knob), 6183 (no knob), and the L2 seeds below.
+/// **`long-delegated-late-answers` 4125 (knob), a monotonic-reads violation
+/// on a stale `d1/f1`.** Not L1 (a former delegate's replica ordering, fixed
+/// by `spec::row_is_ordered_at`, pinned by
+/// `l1_a_former_delegates_own_row_keeps_its_log_place`): the fix does not
+/// change this failure. Its recall segments carry own rows below the
+/// confirmed streamed rows, and a read at tick 140 sees `d1/f1` present after
+/// the node had observed index 34. Before tracing the replica, check whether
+/// rid (1,1,26), the root's `Create d1/f1` at log rows 92-93, is among the
+/// oracle's `successes`: an oracle gap is possible (spec section 1.4).
 ///
 /// **L2, I2 on a stranded replay against the requester's re-ask**: a delegate
 /// or root accepted an op in one epoch, a takeover stranded it, the new root
@@ -15007,36 +15042,16 @@ fn settle_before_eio_a_gate_a_renewal_and_a_redirect_loop_leave_no_unsettled_eio
 /// it on this tree (655 with the knob, the pin of the first measurement, and
 /// 8557 pass), so there is nothing to pin here.
 #[test]
-#[ignore = "findings of plan 46 M0.3: latent L1 (replica divergence on a former delegate), long-delegated-late-answers 1477, 3228, 4125 and 7393 fail until it is fixed"]
-fn delegated_settle_findings_l1_replica_divergence_on_a_former_delegate() {
-    let mut failures = Vec::new();
-    // (seed, with the slow lease reads knob `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`)
-    for (seed, knob) in [
-        (1_477u64, true),
-        (3_228, false),
-        (4_125, true),
-        (7_393, false),
-    ] {
-        let cfg = SimConfig {
-            lease_reads: if knob {
-                SLOW_LEASE_READS
-            } else {
-                Default::default()
-            },
-            ..long_delegated_late_answers_config()
-        };
-        if let Err(e) = run_seed(seed, cfg) {
-            failures.push(format!(
-                "long-delegated-late-answers seed {seed}{}: {e}",
-                if knob { " (knob)" } else { "" }
-            ));
-        }
+#[ignore = "finding of plan 46 M0.3: long-delegated-late-answers 4125 (knob), a monotonic-reads violation on a stale name, not L1, fails until it is traced"]
+fn delegated_settle_findings_4125_monotonic_reads_on_a_stale_name() {
+    // With the slow lease reads knob `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`.
+    let cfg = SimConfig {
+        lease_reads: SLOW_LEASE_READS,
+        ..long_delegated_late_answers_config()
+    };
+    if let Err(e) = run_seed(4_125, cfg) {
+        panic!("long-delegated-late-answers seed 4125 (knob): {e}");
     }
-    assert!(
-        failures.is_empty(),
-        "{} failing: {failures:#?}",
-        failures.len()
-    );
 }
 
 /// Plan 43 C1-1: a backup counts only from acknowledgements given to an
