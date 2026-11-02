@@ -1005,3 +1005,54 @@ fn an_appended_rolled_back_record_turns_the_tail_transactions_into_holes() {
     );
     assert_eq!(meta.backup_acked(2).unwrap(), 8, "contiguous still");
 }
+
+/// A `RolledBack` record that reaches a member on an uncommitted stream (an
+/// epoch hold's tip, a lone tenure's) retracts nothing: the dropping holder
+/// may be deposed or dead before the transaction commits, and the member's
+/// copy alone may carry the row (its client was told it is committed). The
+/// log's segment that carries the record retracts it then, and in the
+/// install's own transaction when the stream says committed.
+#[test]
+fn an_uncommitted_rolled_back_record_retracts_nothing_until_the_log_carries_it() {
+    let meta = Meta::open_in_memory().unwrap();
+    let reship = vec![
+        LogRecord::TailOf { epoch: 1, jseq: 3 },
+        create("a", ino(1), 10),
+        completed(rid(1)),
+    ];
+    meta.install_streamed_committed(2, HOLDER, 1, 3, &reship, true)
+        .unwrap();
+    meta.member_copy_put_rows(
+        1,
+        1,
+        &[mtx(
+            3,
+            3,
+            RowClass::RootGroup,
+            vec![create("a", ino(1), 10), completed(rid(1))],
+        )],
+    )
+    .unwrap();
+    let drop_tx = vec![
+        LogRecord::RolledBack {
+            idents: vec![(1, 3)],
+        },
+        LogRecord::Refused {
+            rid: rid(9),
+            code: constellation_types::Code::Io,
+        },
+    ];
+    // The uncommitted stream: nothing is given up.
+    meta.install_streamed_committed(2, HOLDER, 4, 5, &drop_tx, false)
+        .unwrap();
+    assert!(meta.has_outstanding_speculation());
+    assert!(meta.lookup(ROOT_INO, "a").unwrap().is_some());
+    assert!(
+        meta.member_copy_carries(rid(1)).unwrap(),
+        "the member's copy still carries the row"
+    );
+    // The log carries the record: now.
+    apply_rows(&meta, 1, 2, 5, &[4, 5], &drop_tx);
+    assert!(meta.lookup(ROOT_INO, "a").unwrap().is_none());
+    assert!(!meta.member_copy_carries(rid(1)).unwrap());
+}

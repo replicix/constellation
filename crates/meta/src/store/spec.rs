@@ -3897,7 +3897,7 @@ impl Meta {
             gated: committed,
             non_stealable,
         };
-        self.install_speculative_tx(tx, kind, records)?;
+        self.install_speculative_tx(tx, UsageTracker::staging(), kind, records)?;
         Ok(true)
     }
 
@@ -3987,6 +3987,7 @@ impl Meta {
         }
         self.install_speculative_tx(
             tx,
+            UsageTracker::staging(),
             SpecKind::Hint {
                 at,
                 epoch,
@@ -4036,13 +4037,6 @@ impl Meta {
         records: &[LogRecord],
         committed: bool,
     ) -> Result<(), MetaError> {
-        // Defect B: a transaction that says the holder rolled others back
-        // (`repair drop-held`) retracts what this replica was streamed of
-        // them, ahead of installing itself.
-        let rolled = super::member::rolled_back_idents(records);
-        if !rolled.is_empty() {
-            self.retract_rolled_back(&rolled)?;
-        }
         let mut tx = self.db.write_tx();
         // Fix "capture under an epoch hold": already installed here —
         // the holder streams its journal from the start again for a
@@ -4066,6 +4060,21 @@ impl Meta {
         // 1402: a shadow retired the ordinary way had the segment's
         // unlink re-applied over a later streamed create) — and a
         // takeover strands it as this node's own op.
+        // Defect B: a transaction the holder streamed as committed (its
+        // group holds it) that says it rolled others back (`repair
+        // drop-held`) retracts what this replica was streamed of them, in
+        // this very transaction. An uncommitted one retracts nothing: a
+        // hold's or a lone tenure's stream is not durable anywhere, and a
+        // holder deposed or dead before the drop's transaction commits
+        // leaves the rows the member's copy alone may carry. The segment
+        // that carries the record (the log) retracts then.
+        let staged = UsageTracker::staging();
+        if committed {
+            let rolled = super::member::rolled_back_idents(records);
+            if !rolled.is_empty() {
+                Self::retract_rolled_back_tx(&mut tx, self, &staged, &rolled)?;
+            }
+        }
         let mut adopt: Option<(u64, Rid, MutateOp, LockTag)> = None;
         for rec in records {
             if let LogRecord::Completed { rid } = rec {
@@ -4131,7 +4140,6 @@ impl Meta {
             (a, b) => a.or(b),
         };
         if let Some(cutoff) = cutoff {
-            let staged = UsageTracker::staging();
             insert_streamed_tx(
                 &mut tx,
                 self,
@@ -4177,11 +4185,16 @@ impl Meta {
                     })?,
                 );
             }
+            let (bytes, files) = staged.raw_delta();
+            adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
             tx.commit()?;
+            self.report_rolled_back();
+            staged.drain_into(self.usage_tracker());
             return Ok(());
         }
         self.install_speculative_tx(
             tx,
+            staged,
             SpecKind::Streamed {
                 epoch,
                 first,
@@ -4224,37 +4237,15 @@ impl Meta {
         Ok(stranded)
     }
 
-    /// [`Self::retract_rolled_back_tx`] in a transaction of its own (the
-    /// stream's install).
-    fn retract_rolled_back(
-        &self,
-        idents: &std::collections::BTreeSet<(u64, u64)>,
-    ) -> Result<(), MetaError> {
-        let mut tx = self.db.write_tx();
-        let staged = UsageTracker::staging();
-        let stranded = Self::retract_rolled_back_tx(&mut tx, self, &staged, idents)?;
-        let (bytes, files) = staged.raw_delta();
-        adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
-        tx.commit()?;
-        self.report_rolled_back();
-        staged.drain_into(self.usage_tracker());
-        if stranded.any() {
-            tracing::info!(
-                superseded = stranded.superseded,
-                "streamed copies of rows the holder's drop rolled back were retracted"
-            );
-        }
-        let _ = self.refresh_member_copy_flag();
-        Ok(())
-    }
-
+    /// `staged` may carry usage the caller's transaction already moved
+    /// (a retraction); it is persisted with this install's.
     fn install_speculative_tx(
         &self,
         mut tx: SingleWriterWriteTx,
+        staged: UsageTracker,
         kind: SpecKind,
         records: &[LogRecord],
     ) -> Result<(), MetaError> {
-        let staged = UsageTracker::staging();
         let capture = Capture::new();
         let (_, applied) = {
             let cx = ApplyCx {
