@@ -2492,12 +2492,20 @@ the root's backups, and does not need to: it counts what the root says.
   release, topology 3's delegate, p50 / p90): create 464 / 611 us to
   711 / 847, rename 455 / 579 to 965 / 1,089, unlink 439 / 555 to 998 /
   1,124, chmod 397 / 532 to 1,110 / 1,286; G1 (the holder plus 500 us)
-  is then over for rename, unlink and chmod. PROGRESS, "Oracle I1:
-  class A".
+  is then over for rename, unlink and chmod (p50 by 207, 244 and 374 us).
+  The maintainer accepted the overrun as temporary, against plan 43's rule
+  that a failing gate stops its milestone: it holds until M1.2's member
+  copy (below), and a follow-up cuts the cost meanwhile (the push on the
+  backup's acknowledgement rather than at the next event). PROGRESS,
+  "Oracle I1: class A".
 - Where the delegate's own backup is the root's backup too (topology 3),
   the commit takes one local round trip more.
-- The delegate depends on the root's push: a lost push leaves a parked
-  answer until the next batch's acknowledgement carries the commit.
+- The delegate depends on the root's push: a lost push, a root restart
+  between the acknowledgement and the commit, or a delegate round change
+  leaves a quiet delegate's parked answer until its deadline and settle
+  (the outcome is still correct, through the holder's committed row). A
+  re-poke (`committed` on `DelegRenewed`, or an empty batch on the stream
+  tick) is the first follow-up.
 - No version bump, no shim: both ends change together (the project
   carries no compatibility for mixed versions).
 - The sim's `+commit` oracle holds on the seeds that failed
