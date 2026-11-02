@@ -15479,22 +15479,24 @@ fn c2_delegated_long_delegation_prod_settles_every_eio() {
 
 /// Plan 46 M0.3, I4 strict: an unsettled `EIO` is allowed only for a
 /// requester that could reach no sequencer in its whole settle window
-/// (`reach.rs`). `long-delegated-late-answers` seed 8: the client of a new
-/// root inside its takeover gate hears `EIO` although the root was
-/// reachable throughout (the gate answers every forward, a settle's
-/// included, `Busy`): counted as a violation always, a failure under
-/// `+unsettled`. Fails on any build before the classification: no counter.
+/// (`reach.rs`). `long-delegated-late-answers` seed 1: node 3 tells a client
+/// `EIO` at t=17119 ms although root 2 was reachable for the whole window, in
+/// its takeover gate: counted as a violation always, a failure under
+/// `+unsettled`. (The seed this test first used, 8, is closed by the settle
+/// fixes, which landed after the classifier; seed 1 is one of the violations
+/// they leave, S4 and S5's open cases.) Fails on any build before the
+/// classification: no counter.
 #[test]
 fn m03_a_reachable_sequencers_requester_is_not_isolated() {
     let cfg = long_delegated_late_answers_config;
-    let r = run_seed(8, cfg()).unwrap_or_else(|e| panic!("seed 8: {e}"));
+    let r = run_seed(1, cfg()).unwrap_or_else(|e| panic!("seed 1: {e}"));
     assert!(
         r.unsettled_violations > 0,
-        "seed 8 no longer tells a client EIO with a sequencer reachable: {:?}",
+        "seed 1 no longer tells a client EIO with a sequencer reachable: {:?}",
         r.unsettled_causes
     );
     assert_eq!(r.unsettled_examples.len(), r.unsettled_violations.min(5));
-    let err = run_seed(8, strict(cfg(), "unsettled")).expect_err("+unsettled must fail");
+    let err = run_seed(1, strict(cfg(), "unsettled")).expect_err("+unsettled must fail");
     assert!(
         err.contains("although a sequencer was reachable"),
         "unexpected failure: {err}"
