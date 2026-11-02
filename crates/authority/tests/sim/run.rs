@@ -57,7 +57,16 @@ pub enum FaultKind {
     /// decides with it — a step that waited for the store's writer lock,
     /// or a process stopped between its clock read and its writes. The
     /// node's other events queue meanwhile.
-    StallStep { node: NodeId, for_ms: u64 },
+    ///
+    /// Plan 46 M0.3: with `after_event`, the stall starts right after the
+    /// node handles the first event of that kind from now on (the root,
+    /// after it applied a delegate's rows and before its own backup stream:
+    /// `tloss-two-node`).
+    StallStep {
+        node: NodeId,
+        for_ms: u64,
+        after_event: Option<super::node::EventKind>,
+    },
     /// F1: on `node` (0: the lease holder), the next fast-path write that
     /// carries a fencing token passes its check and then waits for the
     /// store's writer lock behind a slow writer for `core_ms + after_ms`;
@@ -472,6 +481,15 @@ pub struct SimConfig {
     /// probability the client writes the file — one fresh chunk, dirty on
     /// its node until its upload pass (`chunks.rs`).
     pub chunk_writes: f64,
+    /// Plan 46 M0.3 (`tloss-two-node`, the 2026-10-16 trace): the clients'
+    /// workload is `Create`s of the node's names only, and after each, with
+    /// this probability, the client overwrites the file as an `O_TRUNC`
+    /// open and a close do (`Step::TruncCommit`: a size-only `Setattr`,
+    /// then a `SetManifest`, two ops in sequence). The run ends with
+    /// `history::check_trunc_commits`: each file's final size and manifest
+    /// are those of its last acknowledged commit, or of an op attempted
+    /// after it.
+    pub trunc_commit_ratio: f64,
     /// Plan 46 M0.2: how long the simulated operator lets a hopeless held
     /// write show in `status` before `repair drop-held` (simulated ms);
     /// 20 s in every configuration but `drop-held-chain`'s.
@@ -975,6 +993,7 @@ impl Default for SimConfig {
             epoch_slack: 0,
             join_fresh: true,
             chunk_writes: 0.0,
+            trunc_commit_ratio: 0.0,
             drop_held_after_ms: 20_000,
             link_ratio: 0.0,
             cross_links: 0.0,
@@ -1163,6 +1182,9 @@ pub struct Report {
     /// `InDoubt` answers sent (every one checked against the log by
     /// `check::check_in_doubt_answers`).
     pub in_doubt_answers: usize,
+    /// Plan 46 M0.3: files whose final overwrite state was checked
+    /// (`SimConfig::trunc_commit_ratio`).
+    pub trunc_files_checked: usize,
     /// Plan 30 §M14: what the lock clients saw.
     pub locks: super::locks::LockCounters,
     /// Fix "capture under an epoch hold": the chunk model's counters
@@ -1292,6 +1314,9 @@ pub struct Cluster {
     /// The longest a client's single submit waited for its answer
     /// (simulated ms).
     pub longest_submit_ms: std::sync::atomic::AtomicU64,
+    /// Plan 46 M0.3: every overwrite the clients attempted
+    /// (`Step::TruncCommit`), in order.
+    pub trunc: Mutex<Vec<super::history::TruncRec>>,
 }
 
 impl Cluster {
@@ -1732,6 +1757,10 @@ pub enum Step {
     /// Fix "capture under an epoch hold": write the file (a manifest
     /// naming one fresh chunk, dirty on this node).
     Write(String),
+    /// Plan 46 M0.3: overwrite the file as `O_TRUNC` + `write` + `fsync` +
+    /// close do: a size-only `Setattr`, then a `SetManifest` naming one
+    /// fresh chunk (`SimConfig::trunc_commit_ratio`).
+    TruncCommit(String),
     /// Plan 30 §M14: a lock, a critical section, the unlock.
     Lock(super::locks::LockStep),
 }
@@ -1852,6 +1881,11 @@ async fn client_thread(
         let (op, write) = match step {
             Step::Op(op) => (Some(op), None),
             Step::Write(name) => (None, Some(name)),
+            Step::TruncCommit(name) => {
+                tokio::time::sleep(Duration::from_millis(pace_ms)).await;
+                trunc_commit(&cluster, node, thread, &name, &abandoned).await;
+                continue;
+            }
             Step::Read(name) => {
                 let handle = cluster.get(node);
                 if handle.alive() {
@@ -2143,6 +2177,143 @@ fn with_reads(rng: &mut StdRng, ops: Vec<NsOp>, names: usize, ratio: f64) -> Vec
         }
     }
     out
+}
+
+/// Plan 46 M0.3: after each `Create`, with `ratio`, an overwrite of the
+/// file (`Step::TruncCommit`). Drawn from its own generator.
+fn with_trunc_commits(rng: &mut StdRng, steps: Vec<Step>, ratio: f64) -> Vec<Step> {
+    if ratio <= 0.0 {
+        return steps;
+    }
+    let mut out = Vec::new();
+    for step in steps {
+        let created = match &step {
+            Step::Op(NsOp::Create(n)) => Some(n.clone()),
+            _ => None,
+        };
+        out.push(step);
+        if let Some(name) = created {
+            if rng.random_bool(ratio.min(1.0)) {
+                out.push(Step::TruncCommit(name));
+            }
+        }
+    }
+    out
+}
+
+/// Submit `mop` under `rid` until it is answered: the client of
+/// `client_thread` for an op whose outcome is not part of the namespace
+/// history. `Some(outcome)` is a definitive answer; `None` is an op that
+/// was left in doubt for good, or whose process died with it in flight.
+async fn submit_until_answered(
+    cluster: &Arc<Cluster>,
+    node: NodeId,
+    thread: u64,
+    rid: Rid,
+    mop: MutateOp,
+    abandoned: &Arc<Mutex<HashSet<Rid>>>,
+) -> Option<MutateOutcome> {
+    let mut attempts = 0u32;
+    loop {
+        let handle = cluster.get(node);
+        super::node::note_waiting(
+            &format!("client t{thread}"),
+            format!("submit rid {rid:?} attempt {attempts}"),
+        );
+        if !handle.alive()
+            || handle
+                .shared
+                .incarnation
+                .load(std::sync::atomic::Ordering::SeqCst)
+                != rid.incarnation
+        {
+            abandoned.lock().unwrap().insert(rid);
+            return None;
+        }
+        let answer = handle.submit(rid, mop.clone()).await;
+        super::node::note_waiting(&format!("client t{thread}"), "answered".into());
+        match answer {
+            Ok(ClientReply::Outcome(MutateOutcome::Errno(Code::ReadOnly))) => {
+                attempts += 1;
+                if attempts > MAX_RESUBMITS {
+                    abandoned.lock().unwrap().insert(rid);
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Ok(ClientReply::Outcome(outcome)) => {
+                if outcome != MutateOutcome::Abandoned {
+                    cluster.note_answered();
+                }
+                return Some(outcome);
+            }
+            Ok(ClientReply::InDoubt) | Err(_) => {
+                attempts += 1;
+                if attempts > MAX_RESUBMITS {
+                    abandoned.lock().unwrap().insert(rid);
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+/// Plan 46 M0.3 (`Step::TruncCommit`): the open with `O_TRUNC` (a size-only
+/// `Setattr`) and the close that commits the written file (a `SetManifest`),
+/// two client ops in sequence, both recorded in `Cluster::trunc`.
+async fn trunc_commit(
+    cluster: &Arc<Cluster>,
+    node: NodeId,
+    thread: u64,
+    name: &str,
+    abandoned: &Arc<Mutex<HashSet<Rid>>>,
+) {
+    let mut waited = 0;
+    while !cluster.get(node).alive() && waited < 60_000 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        waited += 100;
+    }
+    let handle = cluster.get(node);
+    if !handle.alive() {
+        return;
+    }
+    let (parent, leaf) = split_name(&handle.meta, name);
+    let Some(ino) = handle.meta.child_ino(parent, &leaf).ok().flatten() else {
+        // The name is not here (its create was refused for good).
+        return;
+    };
+    let truncate = MutateOp::Setattr {
+        ino,
+        mode: None,
+        uid: None,
+        gid: None,
+        size: Some(0),
+        atime_ns: None,
+        mtime_ns: None,
+    };
+    let t_rid = handle.next_rid();
+    let t = submit_until_answered(cluster, node, thread, t_rid, truncate, abandoned).await;
+    let mut rec = super::history::TruncRec {
+        name: name.to_string(),
+        truncated: matches!(t, Some(MutateOutcome::Accepted { .. })),
+        committed: false,
+        manifest: None,
+    };
+    let handle = cluster.get(node);
+    if !handle.alive() {
+        cluster.trunc.lock().unwrap().push(rec);
+        return;
+    }
+    let m_rid = handle.next_rid();
+    if let Some(commit) = write_op(cluster, node, m_rid, name) {
+        if let MutateOp::SetManifest { manifest, .. } = &commit {
+            rec.manifest = Some(manifest.clone());
+        }
+        let m = submit_until_answered(cluster, node, thread, m_rid, commit, abandoned).await;
+        rec.committed = matches!(m, Some(MutateOutcome::Accepted { .. }));
+    }
+    cluster.trunc.lock().unwrap().push(rec);
 }
 
 /// Fix "capture under an epoch hold": after each `Create`, with `ratio`,
@@ -2823,7 +2994,11 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
             let until = tokio::time::Instant::now() + Duration::from_millis(for_ms);
             cluster.get(node).pause_until(until);
         }
-        FaultKind::StallStep { node, for_ms } => {
+        FaultKind::StallStep {
+            node,
+            for_ms,
+            after_event,
+        } => {
             let node = match node {
                 0 => match read_lease(&cluster.env.bucket).await {
                     Some(lease) => lease.holder,
@@ -2842,7 +3017,10 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
             cluster
                 .note_takedown(node, Some(now + for_ms as i64), fault.at_ms)
                 .await;
-            cluster.get(node).stall_next_step(for_ms);
+            match after_event {
+                Some(kind) => cluster.get(node).stall_step_after(kind, for_ms),
+                None => cluster.get(node).stall_next_step(for_ms),
+            }
         }
         FaultKind::WriterLockHold {
             node,
@@ -3839,6 +4017,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         env,
         failovers: Mutex::new(Vec::new()),
         longest_submit_ms: Default::default(),
+        trunc: Mutex::new(Vec::new()),
         budget_exceeded: Mutex::new(Vec::new()),
         down: Mutex::new(BTreeMap::new()),
         s3_cut: Mutex::new(BTreeMap::new()),
@@ -3924,6 +4103,22 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             };
             let plan = cfg.client_plan.iter().find(|(n, _, _)| *n == node);
             let mut ops = ops;
+            if cfg.trunc_commit_ratio > 0.0 {
+                // (The draws above stay as they were: the workload is
+                // replaced after them.)
+                let pool: Vec<String> = (0..cfg.names)
+                    .map(|i| {
+                        if home.is_empty() {
+                            format!("f{i}")
+                        } else {
+                            format!("{home}/f{i}")
+                        }
+                    })
+                    .collect();
+                ops = (0..cfg.ops_per_client as usize)
+                    .map(|i| NsOp::Create(pool[i % pool.len()].clone()))
+                    .collect();
+            }
             if let Some((_, _, n)) = plan {
                 ops.truncate(*n);
             }
@@ -3938,6 +4133,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             };
             let mut write_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0xc4a1);
             let steps = with_writes(&mut write_rng, steps, cfg.chunk_writes);
+            let mut trunc_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0x7c0a);
+            let steps = with_trunc_commits(&mut trunc_rng, steps, cfg.trunc_commit_ratio);
             let mut link_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0x11c4);
             let steps = with_links(
                 &mut link_rng,
@@ -5105,6 +5302,44 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             .collect();
         check::check_convergence(&replicas, &oracle).map_err(|e| lin_context(e.to_string()))?;
         report.converged_checked = true;
+        // Plan 46 M0.3: the overwrites' final state (`tloss-two-node`).
+        if cfg.trunc_commit_ratio > 0.0 {
+            let recs = cluster.trunc.lock().unwrap().clone();
+            let node = cluster
+                .ids()
+                .into_iter()
+                .map(|id| cluster.get(id))
+                .find(|n| n.alive());
+            if let Some(n) = node {
+                let mut finals = BTreeMap::new();
+                for r in &recs {
+                    let (parent, leaf) = split_name(&n.meta, &r.name);
+                    let file = n
+                        .meta
+                        .child_ino(parent, &leaf)
+                        .ok()
+                        .flatten()
+                        .and_then(|ino| {
+                            let size = constellation_meta::MetaStore::getattr(&*n.meta, ino)
+                                .ok()
+                                .flatten()?
+                                .size;
+                            let manifest = n
+                                .meta
+                                .subtree_manifests(parent)
+                                .ok()?
+                                .into_iter()
+                                .find(|(i, _, _)| *i == ino)
+                                .map(|(_, m, _)| m);
+                            Some((size, manifest))
+                        });
+                    finals.insert(r.name.clone(), file);
+                }
+                report.trunc_files_checked =
+                    super::history::check_trunc_commits(&recs, &finals, CHUNK_SIZE as u64)
+                        .map_err(&lin_context)?;
+            }
+        }
         // Plan 43 C1-4 (`member_copies_drained`): at convergence every row a
         // node kept as a member of a group the archive carries is gone. A
         // row of a group-committed transaction left over is either a commit

@@ -235,6 +235,10 @@ pub struct Shared {
     /// waited in the store, or a process stopped between its clock read
     /// and its writes.
     stall_next: Mutex<Option<u64>>,
+    /// Plan 46 M0.3: `stall_next` is armed (for the stated ms) once this
+    /// node handles an event of the kind: `FaultKind::StallStep`'s
+    /// `after_event`.
+    stall_after: Mutex<Option<(EventKind, u64)>>,
     /// F1 (`WriterLockHold`): the next fast-path write here carrying a
     /// fencing token passes its check and then waits `(.1)` ms for the
     /// store's writer lock, while the core's next step waits `(.0)` ms
@@ -322,6 +326,30 @@ fn release_held_ctl(shared: &Shared) {
 /// Plan 43 C0: the fourth field is the oracles' tick of the answer (I4:
 /// "after" is exact against the clients' invocations).
 pub type InDoubtLog = Arc<Mutex<Vec<(NodeId, Rid, u64, u64)>>>;
+
+/// Plan 46 M0.3: an event kind a fault can wait for (`FaultKind::StallStep`'s
+/// `after_event`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventKind {
+    /// A delegate's stream of rows reaching this node as the root (the
+    /// moment after `apply_delegate_tx`, before the root's own backup
+    /// stream).
+    DelegateStream,
+}
+
+impl EventKind {
+    fn matches(&self, event: &Event) -> bool {
+        match self {
+            EventKind::DelegateStream => matches!(
+                event,
+                Event::Peer {
+                    msg: PeerMsg::DelegateStream { .. },
+                    ..
+                }
+            ),
+        }
+    }
+}
 
 pub struct NodeHandle {
     pub id: NodeId,
@@ -529,6 +557,7 @@ impl NodeHandle {
             rebuilds_failed: AtomicU64::new(0),
             max_backups: AtomicU64::new(0),
             stall_next: Mutex::new(None),
+            stall_after: Mutex::new(None),
             hold_next: Mutex::new(None),
             held_writes: AtomicU64::new(0),
             held_refused: AtomicU64::new(0),
@@ -927,6 +956,12 @@ impl NodeHandle {
     /// F1 (`StallStep`): see `Shared::stall_next`.
     pub fn stall_next_step(&self, for_ms: u64) {
         *self.shared.stall_next.lock().unwrap() = Some(for_ms);
+    }
+
+    /// Plan 46 M0.3 (`StallStep` with an `after_event`): the step after the
+    /// next event of `kind` stalls `for_ms`.
+    pub fn stall_step_after(&self, kind: EventKind, for_ms: u64) {
+        *self.shared.stall_after.lock().unwrap() = Some((kind, for_ms));
     }
 
     /// F1 (`WriterLockHold`): see `Shared::hold_next`.
@@ -2008,6 +2043,18 @@ impl Driver {
                     e.1 += 1;
                 }
                 *IN_FLIGHT.lock().unwrap() = Some((self.id, text, std::time::Instant::now()));
+            }
+            // Plan 46 M0.3: the stall `FaultKind::StallStep { after_event }`
+            // armed starts once this event is handled (the next step takes
+            // its `now`, then waits).
+            {
+                let mut armed = self.shared.stall_after.lock().unwrap();
+                if let Some((kind, ms)) = *armed {
+                    if kind.matches(&event) {
+                        *armed = None;
+                        *self.shared.stall_next.lock().unwrap() = Some(ms);
+                    }
+                }
             }
             self.events_handled += 1;
             // A core's S3 requests in flight stay bounded. A request loop

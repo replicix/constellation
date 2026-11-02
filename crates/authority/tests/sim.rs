@@ -363,6 +363,7 @@ fn replay_seed() {
         Ok("delegated-two-gens-root-crash") => delegated_two_gens_root_crash_config(),
         Ok("delegated-backup") => delegated_backup_config(),
         Ok("delegated-no-backup-root-near") => delegated_no_backup_root_near_config(),
+        Ok("tloss-two-node") => tloss_two_node_config(),
         Ok("delegated-backup-and-delegate-die") => delegated_backup_and_delegate_die_config(),
         Ok("delegated-backup-and-delegate-die-abandon") => {
             delegated_backup_and_delegate_die_abandon_config()
@@ -5530,6 +5531,7 @@ fn sweep_config() {
         "long-strict" => long_strict_config(),
         "delegated-backup" => delegated_backup_config(),
         "delegated-no-backup-root-near" => delegated_no_backup_root_near_config(),
+        "tloss-two-node" => tloss_two_node_config(),
         "delegated-backup-and-delegate-die" => delegated_backup_and_delegate_die_config(),
         "delegated-backup-and-delegate-die-abandon" => {
             delegated_backup_and_delegate_die_abandon_config()
@@ -6508,6 +6510,47 @@ fn delegated_backup_config() -> SimConfig {
     }
 }
 
+/// Plan 46 M0.3 (plan 43 C2h): the 2026-10-16 acknowledged-write loss. Two
+/// nodes: node 2 the delegate of `d1` and the root's backup (the only peer
+/// in budget), a lone client on node 2 overwriting the files of `d1` as an
+/// `O_TRUNC` open and a close do (a size-only `Setattr`, then a
+/// `SetManifest`: `Step::TruncCommit`); the root, node 1, is stalled right
+/// after it applied the delegate's rows and before its own backup stream,
+/// for `ttl + 2 x backup_takeover_ms`: node 2 seals and takes the root over,
+/// and node 1 resumes deposed. Every file's final size and manifest are
+/// those of its last acknowledged op (`history::check_trunc_commits`), and
+/// `strict_commit` and `strict_settle` hold (before C2c the delegate
+/// acknowledged the truncate and the commit on its own disk: I1). I2 is not
+/// strict (it passes only after C3).
+fn tloss_two_node_config() -> SimConfig {
+    SimConfig {
+        nodes: 2,
+        clients_per_node: 1,
+        ops_per_client: 24,
+        names: 4,
+        random_faults: 0,
+        read_ratio: 0.0,
+        cross_ratio: 0.0,
+        dirs: vec!["d1".into()],
+        delegations: vec![("d1".into(), 2)],
+        core: std::sync::Arc::new(sim::run::deleg_backup_core_config),
+        // The workload is node 2's alone.
+        client_plan: vec![(1, 0, 0)],
+        trunc_commit_ratio: 1.0,
+        faults: vec![ScheduledFault {
+            at_ms: 2_000,
+            kind: FaultKind::StallStep {
+                node: 1,
+                for_ms: 8_000,
+                after_event: Some(sim::node::EventKind::DelegateStream),
+            },
+        }],
+        strict_commit: true,
+        strict_settle: true,
+        ..SimConfig::default()
+    }
+}
+
 /// Plan 43 C2: delegates whose only in-budget peer is the root (the
 /// backup configuration with a budget of 50 ms; the root is 10 ms from each
 /// delegate, the delegates 80 ms from each other): no backup can be chosen
@@ -6916,7 +6959,11 @@ fn long_delegated_late_answers_config() -> SimConfig {
 fn delegated_core_stall_config() -> SimConfig {
     let stall = |at_ms, node, for_ms| ScheduledFault {
         at_ms,
-        kind: FaultKind::StallStep { node, for_ms },
+        kind: FaultKind::StallStep {
+            node,
+            for_ms,
+            after_event: None,
+        },
     };
     SimConfig {
         // Plan 43 C7a (commit 6): no default clock-fault mix. A stalled, frozen
@@ -7019,6 +7066,7 @@ fn delegated_core_hang_config() -> SimConfig {
             kind: FaultKind::StallStep {
                 node: 2,
                 for_ms: 26_000,
+                after_event: None,
             },
         }],
         settle_ms: 60_000,
@@ -7036,7 +7084,11 @@ fn delegated_core_hang_config() -> SimConfig {
 fn delegated_core_stall_root_config() -> SimConfig {
     let stall = |at_ms, for_ms| ScheduledFault {
         at_ms,
-        kind: FaultKind::StallStep { node: 0, for_ms },
+        kind: FaultKind::StallStep {
+            node: 0,
+            for_ms,
+            after_event: None,
+        },
     };
     SimConfig {
         core: std::sync::Arc::new(|node, incarnation| {
@@ -7128,6 +7180,7 @@ fn delegated_core_stall_root_sealed_config() -> SimConfig {
                 FaultKind::StallStep {
                     node: 0,
                     for_ms: 14_000,
+                    after_event: None,
                 },
             ),
             // The delegate of `d2` hears only its root: no successor, no
@@ -7161,6 +7214,7 @@ fn delegated_core_stall_root_hang_config() -> SimConfig {
             kind: FaultKind::StallStep {
                 node: 0,
                 for_ms: 26_000,
+                after_event: None,
             },
         }],
         settle_ms: 60_000,
@@ -7174,7 +7228,11 @@ fn delegated_core_stall_root_hang_config() -> SimConfig {
 fn delegated_core_stall_both_config() -> SimConfig {
     let stall = |at_ms, node, for_ms| ScheduledFault {
         at_ms,
-        kind: FaultKind::StallStep { node, for_ms },
+        kind: FaultKind::StallStep {
+            node,
+            for_ms,
+            after_event: None,
+        },
     };
     SimConfig {
         faults: vec![
@@ -8377,6 +8435,23 @@ fn delegated_two_generations_re_stream_after_a_root_failover() {
         "no successor inherited a generation: {t:?}"
     );
     assert!(t.restreams > 0, "no delegate re-streamed: {t:?}");
+}
+
+/// Plan 46 M0.3 (the 2026-10-16 trace): the root is stalled between applying
+/// the delegate's rows and its own backup stream, the delegate seals and
+/// takes the root over, the root resumes deposed. Under `strict_commit` and
+/// `strict_settle` no acknowledgement rests on one disk, and every file ends
+/// in the state of its last acknowledged overwrite (the run's check).
+#[test]
+fn tloss_two_node_loses_no_acknowledged_overwrite() {
+    let (mut files, mut takeovers) = (0usize, 0u64);
+    for seed in 0..60u64 {
+        let r = c0_run("tloss-two-node", seed, tloss_two_node_config());
+        files += r.trunc_files_checked;
+        takeovers += r.stats.values().map(|s| s.backup_takeovers).sum::<u64>();
+    }
+    assert!(files > 0, "no overwritten file was checked");
+    assert!(takeovers > 0, "the root was never deposed by its backup");
 }
 
 /// Plan 43 C2: a delegate with no backup it can have (the root is its only
@@ -10016,7 +10091,11 @@ fn locks_writer_hold_unchecked_config() -> SimConfig {
 fn locks_core_stall_config() -> SimConfig {
     let stall = |at_ms, node, for_ms| ScheduledFault {
         at_ms,
-        kind: FaultKind::StallStep { node, for_ms },
+        kind: FaultKind::StallStep {
+            node,
+            for_ms,
+            after_event: None,
+        },
     };
     SimConfig {
         ops_per_client: 10,
@@ -10039,7 +10118,11 @@ fn locks_core_stall_config() -> SimConfig {
 fn locks_core_stall_root_config() -> SimConfig {
     let stall = |at_ms, for_ms| ScheduledFault {
         at_ms,
-        kind: FaultKind::StallStep { node: 0, for_ms },
+        kind: FaultKind::StallStep {
+            node: 0,
+            for_ms,
+            after_event: None,
+        },
     };
     SimConfig {
         faults: vec![stall(500, 2_000), stall(4_500, 2_000), stall(9_000, 2_000)],
@@ -10062,7 +10145,11 @@ fn locks_core_stall_unlaned_config() -> SimConfig {
 fn locks_core_stall_single_config() -> SimConfig {
     let stall = |at_ms, for_ms| ScheduledFault {
         at_ms,
-        kind: FaultKind::StallStep { node: 1, for_ms },
+        kind: FaultKind::StallStep {
+            node: 1,
+            for_ms,
+            after_event: None,
+        },
     };
     SimConfig {
         nodes: 1,
@@ -10080,7 +10167,11 @@ fn locks_core_stall_single_config() -> SimConfig {
 fn locks_core_stall_backup_config() -> SimConfig {
     let stall = |at_ms, node, for_ms| ScheduledFault {
         at_ms,
-        kind: FaultKind::StallStep { node, for_ms },
+        kind: FaultKind::StallStep {
+            node,
+            for_ms,
+            after_event: None,
+        },
     };
     SimConfig {
         core: std::sync::Arc::new(sim::run::backup_core_config),
@@ -10118,7 +10209,11 @@ fn locks_core_stall_backup_unfresh_config() -> SimConfig {
 fn locks_core_stall_backup_long_config() -> SimConfig {
     let stall = |at_ms, node, for_ms| ScheduledFault {
         at_ms,
-        kind: FaultKind::StallStep { node, for_ms },
+        kind: FaultKind::StallStep {
+            node,
+            for_ms,
+            after_event: None,
+        },
     };
     SimConfig {
         core: std::sync::Arc::new(|node, incarnation| {
@@ -10310,7 +10405,11 @@ fn locks_core_stall_delegated_config() -> SimConfig {
 fn locks_stall_step_config() -> SimConfig {
     let stall = |at_ms, node, for_ms| ScheduledFault {
         at_ms,
-        kind: FaultKind::StallStep { node, for_ms },
+        kind: FaultKind::StallStep {
+            node,
+            for_ms,
+            after_event: None,
+        },
     };
     SimConfig {
         strict_lock_turns: true,

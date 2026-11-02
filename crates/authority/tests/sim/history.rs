@@ -901,6 +901,89 @@ pub fn check_session_order(
     Ok(())
 }
 
+/// Plan 46 M0.3: one overwrite a client attempted (`Step::TruncCommit`): the
+/// size-only `Setattr` of an `O_TRUNC` open (`truncated`: it was
+/// acknowledged), then the `SetManifest` of the close (`manifest`: the one it
+/// named, `None` when it was not attempted; `committed`: it was
+/// acknowledged).
+#[derive(Debug, Clone)]
+pub struct TruncRec {
+    pub name: String,
+    pub truncated: bool,
+    pub committed: bool,
+    pub manifest: Option<Vec<u8>>,
+}
+
+/// One op of an overwrite: whether it is the commit, whether it was
+/// acknowledged, and the manifest the commit named.
+type OverwriteOp<'a> = (bool, bool, Option<&'a Vec<u8>>);
+
+/// A file as the converged replicas hold it: its size and its manifest.
+pub type FinalFile = (u64, Option<Vec<u8>>);
+
+/// The 2026-10-16 loss's check (`tloss-two-node`, plan 43 C2): each file's
+/// final size and manifest are those of the last acknowledged op of its
+/// overwrites, or of an op attempted after it. (A file only ever created
+/// and overwritten by one client, in sequence: the truncate leaves size 0,
+/// the commit leaves `chunk_size` bytes and the manifest it named. An
+/// acknowledged commit that the run then ends without, a file left empty
+/// by a truncate that replayed after its commit, is the loss.) Returns the
+/// number of files checked.
+pub fn check_trunc_commits(
+    recs: &[TruncRec],
+    finals: &std::collections::BTreeMap<String, Option<FinalFile>>,
+    chunk_size: u64,
+) -> Result<usize, String> {
+    let mut by_name: std::collections::BTreeMap<&str, Vec<OverwriteOp>> = Default::default();
+    for r in recs {
+        let ops = by_name.entry(r.name.as_str()).or_default();
+        ops.push((false, r.truncated, None));
+        if r.manifest.is_some() {
+            ops.push((true, r.committed, r.manifest.as_ref()));
+        }
+    }
+    for (name, ops) in &by_name {
+        let Some(fin) = finals.get(*name) else {
+            continue;
+        };
+        let Some((size, manifest)) = fin else {
+            if ops.iter().any(|o| o.1) {
+                return Err(format!(
+                    "{name}: an acknowledged overwrite, and the file is gone"
+                ));
+            }
+            continue;
+        };
+        // The states the file may end in: after the last acknowledged op or
+        // any op attempted after it (or, with none acknowledged, as created).
+        let from = ops.iter().rposition(|o| o.1).unwrap_or(0);
+        let ok = ops[from..].iter().any(|(commit, _, m)| {
+            if *commit {
+                *size == chunk_size && manifest.as_ref() == *m
+            } else {
+                *size == 0
+            }
+        }) || (ops.iter().all(|o| !o.1) && *size == 0);
+        if !ok {
+            let last = ops.iter().rposition(|o| o.1);
+            let hash = |m: &Option<Vec<u8>>| {
+                m.as_ref().map_or("none".to_string(), |m| {
+                    format!("{:02x?}", &m[..m.len().min(6)])
+                })
+            };
+            return Err(format!(
+                "TruncCommit: {name} ends with size {size} and manifest {}, but its last \
+                 acknowledged op is {} (op {last:?} of {}); the states an op after it allows \
+                 do not include this one",
+                hash(manifest),
+                last.map_or("none", |i| if ops[i].0 { "a commit" } else { "a truncate" }),
+                ops.len()
+            ));
+        }
+    }
+    Ok(by_name.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1283,5 +1366,41 @@ mod tests {
             &JournalOrder::new()
         )
         .is_ok());
+    }
+
+    #[test]
+    fn a_file_ends_in_its_last_acknowledged_commit_or_a_later_attempt() {
+        let rec = |t: bool, c: Option<bool>, m: u8| TruncRec {
+            name: "d1/f0".into(),
+            truncated: t,
+            committed: c == Some(true),
+            manifest: c.map(|_| vec![m]),
+        };
+        let fin = |size: u64, m: Option<u8>| {
+            [("d1/f0".to_string(), Some((size, m.map(|m| vec![m]))))]
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        // Two overwrites, both acknowledged: the second commit stands.
+        let recs = [rec(true, Some(true), 1), rec(true, Some(true), 2)];
+        assert!(check_trunc_commits(&recs, &fin(4096, Some(2)), 4096).is_ok());
+        // The loss: the first commit or an empty file after two
+        // acknowledged commits.
+        assert!(check_trunc_commits(&recs, &fin(4096, Some(1)), 4096).is_err());
+        assert!(check_trunc_commits(&recs, &fin(0, None), 4096).is_err());
+        // The second commit unacknowledged, its truncate acknowledged: the
+        // file is empty or holds the second commit.
+        let recs = [rec(true, Some(true), 1), rec(true, Some(false), 2)];
+        assert!(check_trunc_commits(&recs, &fin(4096, Some(2)), 4096).is_ok());
+        assert!(check_trunc_commits(&recs, &fin(0, None), 4096).is_ok());
+        assert!(check_trunc_commits(&recs, &fin(4096, Some(1)), 4096).is_err());
+        // The last acknowledged op is a truncate: the commit before it may
+        // not come back.
+        let recs = [rec(true, Some(true), 1), rec(true, None, 0)];
+        assert!(check_trunc_commits(&recs, &fin(0, None), 4096).is_ok());
+        assert!(check_trunc_commits(&recs, &fin(4096, Some(1)), 4096).is_err());
+        // Nothing acknowledged: as created.
+        let recs = [rec(false, Some(false), 1)];
+        assert!(check_trunc_commits(&recs, &fin(0, None), 4096).is_ok());
     }
 }
