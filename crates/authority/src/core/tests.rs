@@ -13986,6 +13986,71 @@ mod backup_crash {
         );
     }
 
+    /// The re-tag at a release is of the rid's own unshipped row. `journal_rows_
+    /// of_rid` sees unshipped rows only: once the rid's row has shipped and the
+    /// journal's tip (which an in-doubt rid's answer waits for) has not, a
+    /// fallback to the tip re-tagged another op's row and answered `Lone` for a
+    /// row the log carries. The answer leaves as the archive's, and the tip's
+    /// row is left alone. (Fails with the tip as the fallback.)
+    #[test]
+    fn a_release_does_not_retag_the_tip_for_a_rid_whose_row_has_shipped() {
+        let mut h = Harness::new(1);
+        backup_node(&mut h, vec![1, 2]);
+        // (Not yet stable: no candidate is brought up.)
+        link_2(&mut h, true, Some(5), 0);
+        h.hold(1, None);
+        h.core.ack.eligible = Some(h.core.backup_could_be_had());
+        let (rid1, rid2) = (h.rid(1), h.rid(2));
+        let (op1, op2) = (h.create("a"), h.create("b"));
+        {
+            let _class = h.core.journal_class();
+            constellation_meta::execute_mutate(&h.meta, &op1, Some(rid1)).unwrap();
+            constellation_meta::execute_mutate(&h.meta, &op2, Some(rid2)).unwrap();
+        }
+        let class_of = |h: &Harness, rid| {
+            crate::replica::Replica::journal_class_of_rid(&h.meta, rid).map(|(_, c)| c)
+        };
+        let out = h.step(Event::SubmitInDoubt {
+            rid: rid1,
+            op: op1,
+            policy: Policy::Client,
+            tag: Default::default(),
+        });
+        assert!(replies(&out).is_empty(), "answered at once: {out:?}");
+        // Rid 1's row ships; the tip (rid 2's) does not.
+        let first = crate::replica::Replica::journal_class_of_rid(&h.meta, rid1)
+            .unwrap()
+            .0;
+        crate::replica::Replica::ack_journal(&h.meta, &[first], 0, None).unwrap();
+        h.core.note_shipped(&[first], 0);
+        assert_eq!(class_of(&h, rid1), None, "the row is still unshipped");
+        assert_eq!(
+            class_of(&h, rid2),
+            Some(constellation_meta::RowClass::Archive)
+        );
+        // The gate goes off: the answer leaves.
+        h.advance(100);
+        let out = link_2(&mut h, false, None, 0);
+        assert_eq!(h.core.durable_jseq(), u64::MAX, "the gate is still on");
+        let sources: Vec<_> = out
+            .iter()
+            .filter_map(|a| match a {
+                Action::Reply { source, .. } => Some(*source),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sources,
+            vec![crate::AnswerSource::Sequenced(AckClass::Archive)],
+            "{out:?}"
+        );
+        assert_eq!(
+            class_of(&h, rid2),
+            Some(constellation_meta::RowClass::Archive),
+            "another op's row was re-tagged"
+        );
+    }
+
     /// The same moment, reached from a listed backup: whether a backup could
     /// be had is assessed by every selection pass, and one that ran while
     /// node 2 was listed left it out (it is no candidate: it is a backup).

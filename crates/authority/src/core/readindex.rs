@@ -1964,7 +1964,24 @@ impl Core {
             // be answered on this node's disk alone. The answer is counted
             // and sourced as the lone node's it is (`Lone`), not as the
             // class it was parked for.
-            let unarchived = p.durable.is_some_and(|j| {
+            //
+            // The row the answer rests on is the rid's own transaction, not
+            // what the answer waited for (`p.durable`): for an in-doubt rid
+            // resolved from the journal (`resolve_in_doubt_then_execute`) that
+            // is the journal's tip, a later op's row (long-backup seed 84
+            // under `+commit`: two inbox ops of a takeover, answered `Lone`
+            // with their rows still tagged `Archive`). `journal_class_of_rid`
+            // sees unshipped rows only: a rid with none has its row in the log
+            // (or gone), so nothing is judged or re-tagged, whatever the tip.
+            let row = match &p.what {
+                ParkedWhat::Reply { rid, .. } | ParkedWhat::Finish { rid, .. }
+                    if p.durable.is_some() =>
+                {
+                    replica.journal_class_of_rid(*rid).map(|(first, _)| first)
+                }
+                _ => p.durable,
+            };
+            let unarchived = row.is_some_and(|j| {
                 !self.archive_covers(j, shipped) && self.durable_jseq() == u64::MAX
             });
             // Plan 43 C2f review (§5.2, Q3): another node's answer released by
@@ -1987,26 +2004,8 @@ impl Core {
             // row) nor `Lone` (not recorded), so the op is answered `EIO`
             // (the C1-2/C1-3 review).
             let mut p = p;
-            // The row the answer rests on is the rid's own transaction. What
-            // the answer waited for (`p.durable`) is the journal's tip for an
-            // in-doubt rid resolved from the journal (`resolve_in_doubt_then_
-            // execute`): a row that a later op's follows, whose class the
-            // re-tag would change instead of the rid's own (long-backup seed
-            // 84 under `+commit`: two inbox ops of a takeover, answered
-            // `Lone` with their rows still tagged `Archive`).
-            let retag_at = match &p.what {
-                ParkedWhat::Reply { rid, .. } | ParkedWhat::Finish { rid, .. }
-                    if held_for_remote || downgraded =>
-                {
-                    replica
-                        .journal_class_of_rid(*rid)
-                        .map(|(first, _)| first)
-                        .or(p.durable)
-                }
-                _ => p.durable,
-            };
             if held_for_remote {
-                if let Some(j) = retag_at {
+                if let Some(j) = row {
                     if let Err(error) =
                         replica.reclass_journal_tx(j, constellation_meta::RowClass::NonStealable)
                     {
@@ -2018,7 +2017,7 @@ impl Core {
                 }
             }
             if downgraded {
-                if let Some(j) = retag_at {
+                if let Some(j) = row {
                     if let Err(error) =
                         replica.reclass_journal_tx(j, constellation_meta::RowClass::Lone)
                     {
