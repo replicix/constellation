@@ -50772,8 +50772,18 @@ mod await_retry {
         assert!(settle_sent(&again, r).is_none() && !copy_started(&again));
         assert_eq!(h.core.stats.refused_entry_settles_sent, 1);
 
-        // The sequencer in force journaled the refusal: the copy is made.
+        // The sequencer in force journaled the refusal and answered; the copy
+        // is made when the log here shows the rid's refusal.
         let out = h.step(reply_for(req, MutateOutcome::Errno(Code::Io)));
+        assert!(!copy_started(&out), "{out:?}");
+        h.meta
+            .apply_records(&[LogRecord::Refused {
+                rid: r,
+                code: constellation_meta::DROPPED_CODE,
+            }])
+            .unwrap();
+        h.advance(250);
+        let out = drain(&mut h);
         assert!(copy_started(&out), "{out:?}");
     }
 
@@ -50809,6 +50819,32 @@ mod await_retry {
         assert_eq!(h.core.stats.refused_entries_survived, 1);
         let out = drain(&mut h);
         assert!(!copy_started(&out));
+    }
+
+    /// A refusal that answers the settle is a message: the copy waits for the
+    /// rid's row to be visible in the log here, whatever the answer's code
+    /// (an `Errno` that is not the rid's outcome makes none).
+    #[test]
+    fn a_refusal_answering_a_settle_makes_no_copy_before_the_log_shows_the_rid() {
+        let (mut h, r) = deposed_after_a_drop();
+        for code in [Code::NotFound, Code::Io] {
+            let out = drain(&mut h);
+            let (_, req, _) = settle_sent(&out, r).unwrap_or_else(|| panic!("no settle: {out:?}"));
+            let out = h.step(reply_for(req, MutateOutcome::Errno(code)));
+            assert!(!copy_started(&out), "{code:?}: {out:?}");
+            h.advance(250);
+        }
+        assert!(h.core.stats.refused_entry_answers_awaiting_log >= 2);
+        // The log carries the refusal: the next tick makes the copy.
+        h.meta
+            .apply_records(&[LogRecord::Refused {
+                rid: r,
+                code: Code::Io,
+            }])
+            .unwrap();
+        h.advance(250);
+        let out = drain(&mut h);
+        assert!(copy_started(&out), "{out:?}");
     }
 
     /// The settle executed at this node as the sequencer in force journals

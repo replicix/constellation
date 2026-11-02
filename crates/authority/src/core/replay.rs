@@ -1034,9 +1034,10 @@ impl Core {
             return;
         }
         // Defect C: the answer to a refused entry's settle
-        // (`copy_after_settle`): the rid's refusal is in the log now (its
-        // copy is made), or the original was completed there (the write
-        // survived: no copy); no answer leaves it for a later tick.
+        // (`copy_after_settle`): the original was completed in the log (the
+        // write survived: no copy), or a refusal answered it, whose row the
+        // tick makes the copy of once the log shows it; no answer leaves it
+        // for a later tick.
         if queued.dropped && queued.refused.is_some() {
             match outcome {
                 None
@@ -1048,18 +1049,14 @@ impl Core {
                     let _ = replica.forget_replay(queue_seq);
                     self.replay.stuck_since = None;
                 }
+                // Any other answer (a refusal of the rid, whatever its code):
+                // the copy waits for the rid's refusal to be *visible in the
+                // log here* (`copy_after_settle`'s first rule), not for the
+                // answer's say-so: an answer is a message, and only the
+                // log's row is the outcome the rid keeps. The next tick
+                // finds the row (or asks again).
                 Some(_) => {
-                    // (A sequencer answers the settle once its refusal is
-                    // committed; one this node journaled itself is waited
-                    // for by the next tick, which finds the row.)
-                    if !self.outcome_uncommitted(rid, replica) {
-                        let reason = queued
-                            .refused
-                            .as_ref()
-                            .map(|r| r.reason.clone())
-                            .unwrap_or_default();
-                        self.try_copy(now, &queued, reason, replica, out);
-                    }
+                    self.stats.refused_entry_answers_awaiting_log += 1;
                 }
             }
             return;

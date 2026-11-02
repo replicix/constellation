@@ -1150,6 +1150,9 @@ pub struct Stats {
     /// became a renewal at the next round (`Core::begin_acquire`).
     pub acquire_renewed_instead: u64,
     pub refused_entries_survived: u64,
+    /// A refusal answered a refused entry's settle before the log here showed
+    /// the rid's row (the copy waits for it).
+    pub refused_entry_answers_awaiting_log: u64,
     /// Review (R7): shadows of non-stealable answers rolled back after the
     /// bound because the owner's row never reached the log.
     pub stale_non_stealable_shadows: u64,
