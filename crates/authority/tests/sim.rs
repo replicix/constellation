@@ -15054,6 +15054,119 @@ fn delegated_settle_findings_4125_monotonic_reads_on_a_stale_name() {
     }
 }
 
+/// I1 (delegate answers without a committed row), the delegate's lone test:
+/// it asked for a backup candidate, which needs a link up for
+/// `backup_stable_ms`, while the root and the oracle count any linked peer
+/// within the RTT budget. A delegate back from a reboot has only young links:
+/// with the root linked and in budget it answered its own client `Lone`, and
+/// the root's journal never held the row. Not lone now:
+/// `Core::backup_could_be_had`, the root's own test. Replay a seed with
+/// `AUTHORITY_SIM_START=<seed> AUTHORITY_SIM_SEEDS=1 ... sweep_config -- --ignored
+/// --exact` (`replay_seed` runs another interleaving), with
+/// `AUTHORITY_SIM_LEASE_READS=0:0:800:1000` for the slow lease reads. All fail
+/// `+commit` on the parent.
+#[test]
+fn i1_a_delegate_with_a_young_link_to_the_root_does_not_answer_alone() {
+    let slow = |cfg: SimConfig| SimConfig {
+        lease_reads: SLOW_LEASE_READS,
+        ..cfg
+    };
+    let cases: Vec<(&str, SimConfig, Vec<u64>)> = vec![
+        (
+            "placement-hot",
+            placement_hot_config(),
+            vec![472, 948, 1890],
+        ),
+        (
+            "placement-hot (slow lease reads)",
+            slow(placement_hot_config()),
+            vec![383],
+        ),
+        (
+            "long-delegated-backup",
+            long_delegated_backup_config(),
+            vec![92, 457, 1372, 1836],
+        ),
+        (
+            "long-delegated-backup (slow lease reads)",
+            slow(long_delegated_backup_config()),
+            vec![457, 1153, 1311, 1412, 1767],
+        ),
+    ];
+    for (label, cfg, seeds) in cases {
+        for seed in seeds {
+            let r = run_seed(seed, strict(cfg.clone(), "commit"))
+                .unwrap_or_else(|e| panic!("{label} seed {seed}: {e}"));
+            assert!(
+                r.uncommitted_acks.is_empty(),
+                "{label} seed {seed}: {:?}: {:?}",
+                r.uncommitted_acks,
+                r.oracle_examples
+            );
+        }
+    }
+}
+
+/// I1, the root answering its own forwarded op from its own unshipped append
+/// of the delegate's row (`Lone`-tagged, so not gated): answered `Archive`
+/// with only the root's journal holding the row, and the root sealed by its
+/// backup meanwhile. `completed_row_settled` also asks that the tenure has
+/// committed the append. All fail `+commit` on the parent.
+#[test]
+fn i1_a_root_does_not_answer_its_own_forwarded_op_from_its_unshipped_append() {
+    let slow = |cfg: SimConfig| SimConfig {
+        lease_reads: SLOW_LEASE_READS,
+        ..cfg
+    };
+    let cases: Vec<(&str, SimConfig, Vec<u64>)> = vec![
+        (
+            "placement-hot (slow lease reads)",
+            slow(placement_hot_config()),
+            vec![1659],
+        ),
+        (
+            "long-delegated-late-answers",
+            long_delegated_late_answers_config(),
+            vec![542, 992],
+        ),
+    ];
+    for (label, cfg, seeds) in cases {
+        for seed in seeds {
+            let r = run_seed(seed, strict(cfg.clone(), "commit"))
+                .unwrap_or_else(|e| panic!("{label} seed {seed}: {e}"));
+            assert!(
+                r.uncommitted_acks.is_empty(),
+                "{label} seed {seed}: {:?}: {:?}",
+                r.uncommitted_acks,
+                r.oracle_examples
+            );
+        }
+    }
+}
+
+/// A restarted root that the lease still names re-adopts it when a delegate's
+/// stream batch arrives, as for a forward and a renewal. Seed 789 of
+/// `delegated-no-backup-root-near` had no root for 538 s once the root
+/// acknowledged committed rows only (the design change this build does not
+/// carry): the rebooted root refused every batch and nothing asked it to
+/// acquire. On this build the seed passes either way; the fail-before is
+/// `a_delegate_stream_to_a_restarted_root_readopts_its_own_lease` in the
+/// core's tests.
+#[test]
+fn a_root_the_lease_names_readopts_it_when_its_delegate_streams() {
+    let r = run_seed(
+        789,
+        strict(delegated_no_backup_root_near_config(), "commit"),
+    )
+    .unwrap_or_else(|e| panic!("delegated-no-backup-root-near seed 789: {e}"));
+    assert!(
+        r.uncommitted_acks.is_empty(),
+        "{:?}: {:?}",
+        r.uncommitted_acks,
+        r.oracle_examples
+    );
+}
+
 /// Plan 43 C1-1: a backup counts only from acknowledgements given to an
 /// append that carried a version listing it, and a removal lands covered.
 /// `long-backup` seed 892: a candidate acknowledged rows at the version
