@@ -944,25 +944,25 @@ pub const SCENARIOS: &[Scenario] = &[
         run: holder_ships_under_forward_load,
     },
     Scenario {
-        name: "holder-crash-phantom-shadow",
-        desc: "plan 30 M3a (fixes bug B): a holder stranded (S3 cut, then killed) after acking a forwarded create; a third node takes over, the requester's shadow is rolled back and replayed by rid, and b, c and a fresh d agree the create exists",
+        name: "holder-crash-no-phantom-shadow",
+        desc: "plan 30 M3a (bug B) as a state that cannot arise (plan 43 C2f): a lone holder with S3 cut cannot commit, so a requester's forwarded create is not acknowledged and the requester holds no shadow; the holder is killed, a third node takes over, and b, c and a fresh d agree on the create (present iff it returned success), nothing rolled back or replayed",
         requires: &[],
         caps: &[],
-        run: holder_crash_phantom_shadow,
+        run: holder_crash_no_phantom_shadow,
     },
     Scenario {
-        name: "holder-crash-phantom-new-holder",
-        desc: "plan 30 M3a (fixes bug B): the requester of a stranded forwarded create becomes the next holder; its takeover gate replays the create before serving, so another node's O_EXCL create of the name gets EEXIST and b, c and a fresh d agree",
+        name: "holder-crash-no-phantom-new-holder",
+        desc: "plan 30 M3a (bug B) as a state that cannot arise (plan 43 C2f): as holder-crash-no-phantom-shadow, but the requester becomes the next holder; nothing to roll back or replay, b, c and a fresh d agree, another node's O_EXCL create of an acknowledged name gets EEXIST",
         requires: &[],
         caps: &[],
-        run: holder_crash_phantom_new_holder,
+        run: holder_crash_no_phantom_new_holder,
     },
     Scenario {
-        name: "takeover-marker-strands-promptly",
-        desc: "plan 30 M3b: a takeover whose own op is refused still strands a third node's shadow promptly (the new holder's epoch marker); the stranded create then replays exactly once",
+        name: "takeover-marker-no-stranded-shadow",
+        desc: "plan 30 M3b as a state that cannot arise (plan 43 C2f): a takeover whose own op is refused ships the epoch marker (TailFollowsThrough { through: 0 }, no op) as the first segment of its epoch; the requester of a create the lone root could not commit never held a shadow, so nothing is stranded or replayed and the nodes agree on the name",
         requires: &[],
         caps: &[],
-        run: takeover_marker_strands_promptly,
+        run: takeover_marker_no_stranded_shadow,
     },
     Scenario {
         name: "holder-publishes-log-prefix",
@@ -4555,7 +4555,7 @@ fn wait_for_peers(clients: &[&Client]) -> Result<()> {
 /// read had admitted C, and a scenario that cut the holder's S3 path
 /// next left it unable ever to admit C: C's forwards were rejected, went
 /// to the S3 inbox, and C took the lease over itself
-/// (`session-ryw-after-holder-kill`, `takeover-marker-strands-promptly`).
+/// (`session-ryw-after-holder-kill`, `takeover-marker-no-stranded-shadow`).
 pub(crate) fn node_peers(p2p: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
     p2p["peers"]
         .as_array()
@@ -11389,7 +11389,7 @@ fn forward_timeout_reexec(_seed: u64) -> Result<()> {
 /// committed through the backup, which sealed A's epoch and re-shipped its
 /// tail: no shadow was stranded, rolled back or replayed
 /// (`committed_superseded` instead) — at load 50, 10 of 10 runs of
-/// `holder-crash-phantom-new-holder` and `session-ryw-after-holder-kill`
+/// `holder-crash-no-phantom-new-holder` (then `-phantom-`) and `session-ryw-after-holder-kill`
 /// failed so. The backed handover has its own scenarios
 /// (`holder-publishes-log-prefix-backup` and others).
 fn phantom_setup(scenario: &str) -> Result<PhantomRig> {
@@ -11408,7 +11408,7 @@ type PhantomRig = (
 );
 
 /// As [`phantom_setup`], with `extra` environment on all three nodes
-/// (plan 30 M3b: `takeover-marker-strands-promptly` shortens the idle
+/// (plan 30 M3b: `takeover-marker-no-stranded-shadow` shortens the idle
 /// poll ceiling so its promptness bound does not ride on the P2P push).
 fn phantom_setup_with(scenario: &str, extra: &[(&str, &str)]) -> Result<PhantomRig> {
     let (env, root) = setup(scenario)?;
@@ -11448,47 +11448,82 @@ fn phantom_setup_with(scenario: &str, extra: &[(&str, &str)]) -> Result<PhantomR
     Ok((env, root, a, b, c, sw))
 }
 
-/// Strand B's forwarded create by cutting A's S3 immediately before B
-/// issues it (A still holds a valid, unexpired lease and acks purely
-/// from memory), then crash A so the ack can never ship.
-fn strand_bs_forwarded_phantom(a: &mut Client, b: &Client, sw: &CountingProxy) -> Result<()> {
+/// What the bug-B rig can no longer produce (plan 43 C2f, plan 46 M0.3): a
+/// requester's forwarded create acknowledged from the memory of a holder
+/// that cannot commit it. A is a lone root (`CONSTELLATION_BACKUPS=0`) with
+/// its S3 cut: it journals the row and answers another node only once the
+/// archive holds it, which A's S3 never will. `requester`'s create of
+/// `phantom` therefore blocks (it runs in a thread); after 2 s, with A's
+/// lease still valid, it has not been acknowledged and the requester holds
+/// no speculation-log shadow of it. A is then killed. The create ends when
+/// its deadline does (or when a takeover executes it by rid): the handle
+/// returns its result.
+fn unacked_create(
+    a: &mut Client,
+    requester: &Client,
+    sw: &CountingProxy,
+) -> Result<std::thread::JoinHandle<std::io::Result<()>>> {
     sw.cut();
-    create_new(&b.mnt, "phantom")
-        .context("B's forwarded create must be acked while A's lease is still valid")?;
-    eventually("phantom visible on B", Duration::from_secs(10), || {
-        anyhow::ensure!(b.mnt.join("phantom").exists(), "phantom not yet on B");
+    let mnt = requester.mnt.clone();
+    let create = std::thread::spawn(move || create_new(&mnt, "phantom"));
+    std::thread::sleep(Duration::from_secs(2));
+    anyhow::ensure!(
+        !create.is_finished(),
+        "{}'s create returned while the lone root's S3 was cut: it was acknowledged from memory \
+         (plan 43 C2f: an answer to another node waits for the archive)",
+        requester.name
+    );
+    let spec = speculation_of(requester)?;
+    anyhow::ensure!(
+        spec["outstanding"].as_u64() == Some(0),
+        "{} holds an outstanding shadow of a create nobody acknowledged: {spec}",
+        requester.name
+    );
+    a.kill9()?;
+    Ok(create)
+}
+
+/// Whether `phantom` exists on every node of `nodes` (as one and the same
+/// inode), or on none: `Err` when they disagree. Waits for agreement.
+fn phantom_agreement(nodes: &[(&str, &Client)], deadline: Duration) -> Result<bool> {
+    let mut exists = false;
+    eventually("the nodes agree on phantom", deadline, || {
+        let seen: Vec<(&str, Option<u64>)> = nodes
+            .iter()
+            .map(|(name, c)| (*name, ino_of(&c.mnt.join("phantom"))))
+            .collect();
+        anyhow::ensure!(
+            seen.iter().all(|(_, ino)| *ino == seen[0].1),
+            "the nodes disagree on phantom: {seen:?}"
+        );
+        exists = seen[0].1.is_some();
         Ok(())
     })?;
-    a.kill9()?;
-    Ok(())
+    Ok(exists)
+}
+
+/// The requester's speculation counters after the run: nothing was ever
+/// rolled back or replayed (no shadow existed to strand), and nothing is
+/// outstanding.
+fn no_shadow_ever(c: &Client, rolled_before: u64) -> Result<()> {
+    eventually("the speculation is quiet", Duration::from_secs(30), || {
+        let spec = speculation_of(c)?;
+        anyhow::ensure!(
+            spec["outstanding"].as_u64() == Some(0)
+                && spec["pending_replay"].as_u64() == Some(0)
+                && spec["rolled_back"].as_u64().unwrap_or(0) == rolled_before
+                && spec["stranded_replayed"].as_u64().unwrap_or(0) == 0,
+            "{} speculated: {spec} (rolled back before: {rolled_before})",
+            c.name
+        );
+        Ok(())
+    })
 }
 
 /// Plan 30 M3a's speculation counters from a node's `status`, for the
 /// scenario log and the non-vacuity checks.
 fn speculation_of(c: &Client) -> Result<serde_json::Value> {
     Ok(c.control_status()?["speculation"].clone())
-}
-
-/// Wait until `phantom` exists on every client in `nodes`, as one and the
-/// same inode.
-fn phantom_everywhere(nodes: &[(&str, &Client)], deadline: Duration) -> Result<()> {
-    eventually(
-        "the stranded create is visible everywhere",
-        deadline,
-        || {
-            let mut inos = Vec::new();
-            for (name, c) in nodes {
-                let ino = ino_of(&c.mnt.join("phantom"))
-                    .with_context(|| format!("phantom missing on {name}"))?;
-                inos.push((*name, ino));
-            }
-            anyhow::ensure!(
-                inos.iter().all(|(_, ino)| *ino == inos[0].1),
-                "nodes disagree on phantom's inode: {inos:?}"
-            );
-            Ok(())
-        },
-    )
 }
 
 /// Mount a fresh node `d` on `backend`, which bootstraps from the head
@@ -11511,24 +11546,28 @@ fn fresh_node(env: &S3Env, root: &std::path::Path, backend: &str, expect: &[u8])
 }
 
 /// Bug B (`docs/plans/v1/done/30-write-path-resilience-and-scale-out.md`
-/// §1.1), third-node-takeover shape, as plan 30 M3a's regression test. A
-/// requester (B) applies an accepted forwarded create ahead of the log
-/// (a speculation-log shadow); the holder (A) dies before shipping it, and
-/// a third node (C) takes over. Before M3a the effect stayed on B for good
-/// and B published it into the commit chain. Now C's first segment
-/// strands B's shadow: B rolls it back and replays the create by rid
-/// through C, so the create B's application was told succeeded becomes
-/// durable, and B, C and a fresh node D bootstrapped from the bucket all
-/// agree it exists — as one inode.
-fn holder_crash_phantom_shadow(_seed: u64) -> Result<()> {
-    let (env, root, mut a, mut b, mut c, sw) = phantom_setup("holder-crash-phantom-shadow")?;
+/// §1.1), third-node-takeover shape, as plan 30 M3a's regression test, and
+/// since plan 43 C2f a "the state cannot arise" test: a lone holder that
+/// cannot commit (S3 cut) acknowledges a forwarded create from nobody's
+/// memory, so the requester (B) holds no shadow to strand ([`unacked_create`]).
+/// A is killed and a third node (C) takes over; B's create ends by its
+/// deadline or is executed by rid through the takeover. B, C and a fresh
+/// node D agree on `phantom` as one inode (present iff B's create returned
+/// success), and B never rolled anything back or replayed anything.
+fn holder_crash_no_phantom_shadow(_seed: u64) -> Result<()> {
+    let (env, root, mut a, mut b, mut c, sw) = phantom_setup("holder-crash-no-phantom-shadow")?;
+    let rolled_before = speculation_of(&b)?["rolled_back"].as_u64().unwrap_or(0);
 
-    strand_bs_forwarded_phantom(&mut a, &b, &sw)?;
+    let create = unacked_create(&mut a, &b, &sw)?;
 
     // C's write forwards to (now-dead) A, fails, and C takes over once
     // A's lease expires — legitimately several seconds (up to the
     // remainder of A's TTL from its last renewal).
     std::fs::write(c.mnt.join("after"), b"c").context("C must take over once A's lease expires")?;
+    let created = create
+        .join()
+        .map_err(|_| anyhow::anyhow!("the create thread panicked"))?;
+    eprintln!("    holder-crash-no-phantom-shadow: b's create returned {created:?}");
     eventually(
         "B sees C's post-takeover write",
         Duration::from_secs(30),
@@ -11539,38 +11578,25 @@ fn holder_crash_phantom_shadow(_seed: u64) -> Result<()> {
     )?;
 
     let checked = (|| -> Result<Client> {
-        phantom_everywhere(&[("b", &b), ("c", &c)], Duration::from_secs(30)).context(
-            "after C's takeover, B's stranded create must be replayed through C (plan 30 bug B)",
-        )?;
-        let spec = speculation_of(&b)?;
-        eprintln!("    holder-crash-phantom-shadow: b speculation after recovery: {spec}");
+        let exists = phantom_agreement(&[("b", &b), ("c", &c)], Duration::from_secs(30))?;
         anyhow::ensure!(
-            spec["rolled_back"].as_u64().unwrap_or(0) >= 1
-                && spec["stranded_replayed"].as_u64().unwrap_or(0) >= 1,
-            "b's status shows no rollback/replay — the recovery path did not engage: {spec}"
+            exists || created.is_err(),
+            "b's create returned success but phantom does not exist: an acknowledged create was lost"
         );
-        anyhow::ensure!(
-            spec["replay_conflicts"].as_u64().unwrap_or(0) == 0,
-            "the replay was refused, but nothing else ever took the name: {spec}"
-        );
-        // The replayed create is itself a shadow on B until C ships it;
-        // wait for it to retire so B's unmount can publish a commit.
-        eventually("b's speculation retires", Duration::from_secs(30), || {
-            let spec = speculation_of(&b)?;
-            anyhow::ensure!(
-                spec["outstanding"].as_u64() == Some(0)
-                    && spec["pending_replay"].as_u64() == Some(0),
-                "b still speculating: {spec}"
-            );
-            Ok(())
-        })?;
-        // Clean unmount of B publishes a metadata commit; a fresh node D
-        // then bootstraps purely from the bucket (head commit + log tail).
+        no_shadow_ever(&b, rolled_before)?;
         b.unmount()?;
         let d = fresh_node(&env, root.path(), &c.backend, b"c")?;
-        phantom_everywhere(&[("c", &c), ("d", &d)], Duration::from_secs(30))
-            .context("a fresh node must see the replayed create exactly as c does")?;
-        eprintln!("    holder-crash-phantom-shadow: b, c and fresh d agree: phantom exists (replayed by rid)");
+        let on_d = phantom_agreement(&[("c", &c), ("d", &d)], Duration::from_secs(30))
+            .context("a fresh node must see phantom exactly as c does")?;
+        anyhow::ensure!(on_d == exists, "d and c disagree on phantom");
+        eprintln!(
+            "    holder-crash-no-phantom-shadow: b, c and fresh d agree: phantom {}",
+            if exists {
+                "exists (executed by rid)"
+            } else {
+                "is absent"
+            }
+        );
         Ok(d)
     })();
 
@@ -11580,22 +11606,24 @@ fn holder_crash_phantom_shadow(_seed: u64) -> Result<()> {
     Ok(())
 }
 
-/// Bug B, requester-takeover shape, as plan 30 M3a's regression test:
-/// same stranding as [`holder_crash_phantom_shadow`], but the *requester*
-/// (B) becomes the next holder. Before M3a, B then validated new creates
-/// against its own phantom entry. Now B's takeover gate rolls the shadow
-/// back and replays the create locally, by rid, before B serves anything
-/// as holder. The create B's application was told succeeded is therefore
-/// durable, so C's `O_EXCL` create of the same name must fail with
-/// `EEXIST` — the linearizable answer — and B, C and a fresh node D agree
-/// the name exists, as one inode.
-fn holder_crash_phantom_new_holder(_seed: u64) -> Result<()> {
-    let (env, root, mut a, mut b, mut c, sw) = phantom_setup("holder-crash-phantom-new-holder")?;
+/// Bug B, requester-takeover shape (plan 30 M3a), as a "the state cannot
+/// arise" test (plan 43 C2f): same rig as [`holder_crash_no_phantom_shadow`],
+/// but the requester (B) becomes the next holder. B's create was never
+/// acknowledged and B has no shadow; its takeover has nothing to roll back
+/// or replay. B, C and a fresh D agree on `phantom` (present iff B's create
+/// returned success, in which case C's `O_EXCL` create of it is `EEXIST`).
+fn holder_crash_no_phantom_new_holder(_seed: u64) -> Result<()> {
+    let (env, root, mut a, mut b, mut c, sw) = phantom_setup("holder-crash-no-phantom-new-holder")?;
+    let rolled_before = speculation_of(&b)?["rolled_back"].as_u64().unwrap_or(0);
 
-    strand_bs_forwarded_phantom(&mut a, &b, &sw)?;
+    let create = unacked_create(&mut a, &b, &sw)?;
 
-    // B (the requester who applied the stranded ack) takes over as the
-    // new holder this time, instead of C.
+    // B (the requester) takes over as the new holder this time: its own
+    // create, in flight, waits for A's lease to expire and claims it.
+    let created = create
+        .join()
+        .map_err(|_| anyhow::anyhow!("the create thread panicked"))?;
+    eprintln!("    holder-crash-no-phantom-new-holder: b's create returned {created:?}");
     std::fs::write(b.mnt.join("after"), b"b")
         .context("B must take over as the new holder once A's lease expires")?;
     eventually(
@@ -11608,29 +11636,29 @@ fn holder_crash_phantom_new_holder(_seed: u64) -> Result<()> {
     )?;
 
     let checked = (|| -> Result<Client> {
-        let spec = speculation_of(&b)?;
-        eprintln!("    holder-crash-phantom-new-holder: b speculation after takeover: {spec}");
+        let exists = phantom_agreement(&[("b", &b), ("c", &c)], Duration::from_secs(30))?;
         anyhow::ensure!(
-            spec["rolled_back"].as_u64().unwrap_or(0) >= 1
-                && spec["stranded_replayed"].as_u64().unwrap_or(0) >= 1,
-            "b's takeover gate did not roll back and replay the stranded create: {spec}"
+            exists || created.is_err(),
+            "b's create returned success but phantom does not exist: an acknowledged create was lost"
         );
-        match create_new(&c.mnt, "phantom") {
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Ok(()) => bail!(
-                "c's O_EXCL create of \"phantom\" succeeded: b's acknowledged create was lost \
-                 instead of replayed at b's takeover (plan 30 bug B)"
-            ),
-            Err(e) => bail!("c's create of \"phantom\" returned {e} (expected EEXIST)"),
+        if created.is_ok() {
+            match create_new(&c.mnt, "phantom") {
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                other => bail!(
+                    "c's O_EXCL create of \"phantom\" after b's acknowledged one returned {other:?} \
+                     (expected EEXIST)"
+                ),
+            }
         }
-        phantom_everywhere(&[("b", &b), ("c", &c)], Duration::from_secs(30))?;
+        no_shadow_ever(&b, rolled_before)?;
         b.unmount()?;
         let d = fresh_node(&env, root.path(), &c.backend, b"b")?;
-        phantom_everywhere(&[("c", &c), ("d", &d)], Duration::from_secs(30))
-            .context("a fresh node must see the replayed create exactly as c does")?;
+        let on_d = phantom_agreement(&[("c", &c), ("d", &d)], Duration::from_secs(30))
+            .context("a fresh node must see phantom exactly as c does")?;
+        anyhow::ensure!(on_d == exists, "d and c disagree on phantom");
         eprintln!(
-            "    holder-crash-phantom-new-holder: c's create got EEXIST; b, c and fresh d agree: \
-             phantom exists (replayed at b's takeover)"
+            "    holder-crash-no-phantom-new-holder: b, c and fresh d agree: phantom {}",
+            if exists { "exists" } else { "is absent" }
         );
         Ok(d)
     })();
@@ -11697,42 +11725,31 @@ fn read_commit(endpoint: &str, key: &str) -> Result<serde_json::Value> {
     serde_json::from_slice(&body).with_context(|| format!("parsing commit {key}"))
 }
 
-/// Plan 30 §M3b's epoch marker, as a regression test. A holds the lease;
-/// C's forwarded create is accepted by A from memory (A's S3 is cut) and
-/// sits on C as a speculation-log shadow; A dies without shipping it. B
-/// then takes the expired lease through an op that is *refused* — `rmdir`
-/// of a non-empty directory, `ENOTEMPTY` — so B's own op ships nothing.
-/// (Not `mkdir` of an existing name: the kernel can answer that `EEXIST`
-/// from its dentry cache without ever calling the daemon, so it might not
-/// take the lease at all. `rmdir`'s emptiness check is the filesystem's.)
-/// Before M3b C's shadow stayed in place until B next happened to write
-/// something; now B's takeover ships an empty segment at its new epoch
-/// right after the CAS, and C must strand the shadow within a few seconds
-/// of B's `rmdir` returning. The first segment of B's epoch in the bucket
-/// must be that marker (B's node, zero records), and the stranded create
-/// is then replayed by rid through B exactly once: B, C and a fresh node
-/// D all see `phantom` as one inode.
+/// Plan 30 §M3b's epoch marker, and since plan 43 C2f a "the state cannot
+/// arise" test. A holds the lease as a lone root with its S3 cut; C's
+/// forwarded create is not acknowledged and C holds no shadow
+/// ([`unacked_create`]); A is killed. B then takes the expired lease through an
+/// op that is *refused* — `rmdir` of a non-empty directory, `ENOTEMPTY` (not
+/// `mkdir` of an existing name: the kernel can answer that `EEXIST` from its
+/// dentry cache without ever calling the daemon) — so B's own op ships
+/// nothing. (C's create, still waiting in its lease path, may claim the lease
+/// first: then it is C's takeover; the assertions do not depend on who.)
+/// The first segment of the new epoch in the bucket must be the takeover's
+/// marker: no op, only plan 43 C1-4's `TailFollowsThrough { prev_epoch, through:
+/// 0 }` (nothing of A's epoch was committed unshipped: A had no backup and
+/// could not commit anything). Plan 30's strand-and-replay half of this
+/// scenario cannot arise any more: C never rolls back or replays anything
+/// ([`no_shadow_ever`]); `phantom` is on B, C and a fresh D, one inode, iff C's
+/// create returned success, else absent on all of them.
 ///
-/// Every node runs with `CONSTELLATION_BACKUPS=0` ([`phantom_setup`]; this
-/// scenario was the first to need it). A backed holder hands
-/// over a different way (plan 30 §M9): its backup seals A's epoch about
-/// 1.5 s after A falls silent and takes over by itself, before B's `rmdir`
-/// and whatever B does, and it re-ships A's tail. Its marker then carries a
-/// `TailFollows` record by design (`jobs::marker_records`), and the
-/// re-shipped tail segments can strand C's shadow as well. A
-/// takes B as its backup once its backup tick has run. Under load that
-/// usually happens before the kill, so the scenario failed "1 record(s)"
-/// in 10 of 10 runs at load 40. The backed handover has its own scenarios
-/// (`holder-publishes-log-prefix-backup` and others).
-fn takeover_marker_strands_promptly(_seed: u64) -> Result<()> {
-    use std::time::Instant;
-    /// How long after B's takeover C may take to strand its shadow. The
-    /// marker is pushed over P2P at once, and the idle poll ceiling is
-    /// lowered to 1 s as the fallback; nothing else B does in this window
-    /// ships anything that could strand it.
-    const PROMPT: Duration = Duration::from_secs(5);
+/// Every node runs with `CONSTELLATION_BACKUPS=0` ([`phantom_setup`]). A backed
+/// holder hands over a different way (plan 30 §M9: its backup seals A's epoch
+/// by itself and re-ships A's tail, and its marker carries a `TailFollows`
+/// record); that has its own scenarios (`holder-publishes-log-prefix-backup`
+/// and others).
+fn takeover_marker_no_stranded_shadow(_seed: u64) -> Result<()> {
     let (env, root, mut a, mut b, mut c, sw) = phantom_setup_with(
-        "takeover-marker-strands-promptly",
+        "takeover-marker-no-stranded-shadow",
         &[("CONSTELLATION_SYNC_IDLE_MAX_MS", "1000")],
     )?;
     let prefix = b
@@ -11741,9 +11758,6 @@ fn takeover_marker_strands_promptly(_seed: u64) -> Result<()> {
         .context("backend is not on the harness bucket")?
         .to_string();
     let a_epoch = lease_of(&a)?["epoch"].as_u64().unwrap_or(0);
-    let b_node = b.control_status()?["node_id"]
-        .as_u64()
-        .context("b reports no node_id")?;
 
     // The non-empty directory B's refused op targets, made while A's S3 is
     // still up so it is ordinary shipped history everywhere.
@@ -11759,22 +11773,7 @@ fn takeover_marker_strands_promptly(_seed: u64) -> Result<()> {
     )?;
     let rolled_before = speculation_of(&c)?["rolled_back"].as_u64().unwrap_or(0);
 
-    // Strand C's forwarded create the way the M3a scenarios strand B's:
-    // cut A's S3 (A still holds a valid lease and acks from memory), then
-    // crash A so the ack can never ship.
-    sw.cut();
-    create_new(&c.mnt, "phantom")
-        .context("C's forwarded create must be acked while A's lease is still valid")?;
-    eventually("phantom visible on C", Duration::from_secs(10), || {
-        anyhow::ensure!(c.mnt.join("phantom").exists(), "phantom not yet on C");
-        Ok(())
-    })?;
-    a.kill9()?;
-    let spec = speculation_of(&c)?;
-    anyhow::ensure!(
-        spec["outstanding"].as_u64().unwrap_or(0) >= 1,
-        "C must hold the accepted create as an outstanding shadow: {spec}"
-    );
+    let create = unacked_create(&mut a, &c, &sw)?;
 
     let checked = (|| -> Result<Client> {
         // B's refused op: it forwards to dead A, fails, waits out A's
@@ -11785,36 +11784,11 @@ fn takeover_marker_strands_promptly(_seed: u64) -> Result<()> {
             Err(e) if Code::from_os_error(&e) == Some(Code::NotEmpty) => {}
             Err(e) => bail!("B's rmdir of the non-empty `full` returned {e}, expected ENOTEMPTY"),
         }
-        let took_over = Instant::now();
-        let lease = lease_of(&b)?;
-        let b_epoch = lease["epoch"].as_u64().unwrap_or(0);
-        anyhow::ensure!(
-            lease["held"] == true && b_epoch > a_epoch,
-            "B's refused op must still have taken the lease at an epoch newer than A's \
-             {a_epoch}: {lease}"
-        );
-        eventually("C's shadow strands after B's takeover", PROMPT, || {
-            let spec = speculation_of(&c)?;
-            anyhow::ensure!(
-                spec["rolled_back"].as_u64().unwrap_or(0) > rolled_before,
-                "C has not rolled its shadow back: {spec}"
-            );
-            Ok(())
-        })
-        .context(
-            "B's own op was refused and shipped nothing, so only B's epoch marker can strand \
-             C's shadow this soon (plan 30 M3b)",
-        )?;
-        let strand_ms = took_over.elapsed().as_millis();
-        let b_spec = speculation_of(&b)?;
-        anyhow::ensure!(
-            b_spec["epoch_markers"].as_u64().unwrap_or(0) >= 1,
-            "B took over from a holder that never released but shipped no epoch marker: {b_spec}"
-        );
-        // The first segment of B's epoch is B's marker: no op, only the
-        // statement plan 43 C1-4 makes every takeover marker that carries
-        // no tail make — nothing of A's epoch was committed unshipped
-        // (`TailFollowsThrough { through: 0 }`; A had no backup).
+        let created = create
+            .join()
+            .map_err(|_| anyhow::anyhow!("the create thread panicked"))?;
+        eprintln!("    takeover-marker-no-stranded-shadow: c's create returned {created:?}");
+        // The first segment of the new epoch is a marker with no tail.
         let mut marker = None;
         for seq in log_segment_seqs(&env.direct_endpoint, &prefix, "p0")? {
             let (node, epoch, records) = segment_header(&env.direct_endpoint, &prefix, "p0", seq)?;
@@ -11826,44 +11800,27 @@ fn takeover_marker_strands_promptly(_seed: u64) -> Result<()> {
         let (seq, node, epoch, records) =
             marker.context("no log segment carries an epoch newer than A's")?;
         // The statement names the epoch the gate's takeover found
-        // (`jobs::marker_records`: `gate.epoch - 1`), which is A's only when
-        // B's epoch directly follows it.
+        // (`jobs::marker_records`: `gate.epoch - 1`).
         let no_tail = [constellation_meta::LogRecord::TailFollowsThrough {
-            prev_epoch: b_epoch - 1,
+            prev_epoch: epoch - 1,
             through: 0,
         }];
         anyhow::ensure!(
-            node == b_node && epoch == b_epoch && records[..] == no_tail[..],
-            "the first segment of the new epoch (seq {seq}) must be B's (node {b_node}) \
-             epoch-{b_epoch} marker, carrying {no_tail:?} only; it is node {node}, epoch \
-             {epoch}, records {records:?}"
+            records[..] == no_tail[..],
+            "the first segment of the new epoch (seq {seq}, node {node}, epoch {epoch}) must be \
+             the takeover's marker, carrying {no_tail:?} only; its records: {records:?}"
         );
         eprintln!(
-            "    takeover-marker-strands-promptly: c stranded its shadow {strand_ms} ms after b's \
-             refused takeover op; marker at seq {seq}"
+            "    takeover-marker-no-stranded-shadow: marker at seq {seq} (node {node}, epoch {epoch})"
         );
 
-        // The stranded create is replayed by rid through B exactly once.
-        phantom_everywhere(&[("b", &b), ("c", &c)], Duration::from_secs(40))
-            .context("C's stranded create must be replayed through B")?;
-        let spec = speculation_of(&c)?;
+        // Nothing was stranded: C never speculated.
+        no_shadow_ever(&c, rolled_before)?;
+        let exists = phantom_agreement(&[("b", &b), ("c", &c)], Duration::from_secs(40))?;
         anyhow::ensure!(
-            spec["stranded_replayed"].as_u64().unwrap_or(0) >= 1,
-            "C's status shows no replay — the recovery path did not engage: {spec}"
+            exists || created.is_err(),
+            "c's create returned success but phantom does not exist: an acknowledged create was lost"
         );
-        anyhow::ensure!(
-            spec["replay_conflicts"].as_u64().unwrap_or(0) == 0,
-            "the replay was refused, but nothing else ever took the name: {spec}"
-        );
-        eventually("c's speculation retires", Duration::from_secs(30), || {
-            let spec = speculation_of(&c)?;
-            anyhow::ensure!(
-                spec["outstanding"].as_u64() == Some(0)
-                    && spec["pending_replay"].as_u64() == Some(0),
-                "c still speculating: {spec}"
-            );
-            Ok(())
-        })?;
         // A fresh node bootstraps from the bucket alone (head commit plus
         // the log after it) and must agree too. C's clean unmount
         // publishes a commit first, as in the M3a scenarios.
@@ -11874,8 +11831,9 @@ fn takeover_marker_strands_promptly(_seed: u64) -> Result<()> {
         })?;
         c.unmount()?;
         let d = fresh_node(&env, root.path(), &b.backend, b"b")?;
-        phantom_everywhere(&[("b", &b), ("d", &d)], Duration::from_secs(30))
-            .context("a fresh node must see the replayed create exactly as b does")?;
+        let on_d = phantom_agreement(&[("b", &b), ("d", &d)], Duration::from_secs(30))
+            .context("a fresh node must see phantom exactly as b does")?;
+        anyhow::ensure!(on_d == exists, "d and b disagree on phantom");
         Ok(d)
     })();
 
