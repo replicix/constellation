@@ -3514,6 +3514,7 @@ impl Driver {
                 gen,
                 round,
                 through,
+                committed,
                 refused,
             } => Some(Internal::Event(Event::Peer {
                 from,
@@ -3522,6 +3523,7 @@ impl Driver {
                     gen,
                     round,
                     through,
+                    committed,
                     refused,
                 },
             })),
@@ -4685,6 +4687,7 @@ impl Driver {
                 gen,
                 round,
                 through,
+                committed,
                 refused,
             } => {
                 let payload = Payload::DelegateStreamAck {
@@ -4693,6 +4696,7 @@ impl Driver {
                     gen,
                     round,
                     through,
+                    committed,
                     refused,
                 };
                 self.one_way(to, payload);

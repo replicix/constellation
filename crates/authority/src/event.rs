@@ -760,11 +760,16 @@ pub enum PeerMsg {
     /// (cumulative: the delegate re-sends from there, whichever batch
     /// `req` names), or `refused` the batch `req` (the generation is
     /// unknown, ended, or not this node's): the delegate backs off.
+    /// `committed` (at most `through`) is how far the root's own tenure has
+    /// committed its appends of the stream: the prefix a delegate without a
+    /// recorded backup counts as the root's copy (plan 43 Q16, ADR-41); an
+    /// ack that rises it is also sent unsolicited, as `through` stays.
     DelegateStreamAck {
         req: OpId,
         gen: u64,
         round: u64,
         through: u64,
+        committed: u64,
         refused: bool,
     },
     /// Plan 30 §M11: a delegate renews its grant on `gen`; the root

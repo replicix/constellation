@@ -16016,6 +16016,7 @@ mod locks {
                     gen: 7,
                     round,
                     through: last,
+                    committed: last,
                     refused: false,
                 },
             });
@@ -16047,6 +16048,7 @@ mod locks {
                 gen: 7,
                 round,
                 through: last,
+                committed: last,
                 refused: false,
             },
         });
@@ -35718,6 +35720,7 @@ fn a_delegates_late_answers_still_count() {
             gen: 7,
             round: round_of(&h, 7),
             through: last,
+            committed: last,
             refused: false,
         },
     });
@@ -35824,6 +35827,7 @@ fn a_late_stream_ack_from_an_earlier_tenure_of_the_same_root_is_not_credited() {
             gen: 7,
             round: sround,
             through: last,
+            committed: last,
             refused: false,
         },
     });
@@ -35839,6 +35843,7 @@ fn a_late_stream_ack_from_an_earlier_tenure_of_the_same_root_is_not_credited() {
             gen: 7,
             round,
             through: last,
+            committed: last,
             refused: false,
         },
     });
@@ -35907,6 +35912,18 @@ fn poke(h: &mut Harness) -> Vec<Action> {
 }
 
 fn stream_ack(from: NodeId, req: OpId, round: u64, through: u64) -> Event {
+    stream_ack_committed(from, req, round, through, through)
+}
+
+/// The root's acknowledgement with its own commit (`committed`, plan 43 Q16):
+/// `stream_ack` is a root whose tenure committed all it appended.
+fn stream_ack_committed(
+    from: NodeId,
+    req: OpId,
+    round: u64,
+    through: u64,
+    committed: u64,
+) -> Event {
     Event::Peer {
         from,
         msg: PeerMsg::DelegateStreamAck {
@@ -35914,6 +35931,7 @@ fn stream_ack(from: NodeId, req: OpId, round: u64, through: u64) -> Event {
             gen: 7,
             round,
             through,
+            committed,
             refused: false,
         },
     }
@@ -42031,6 +42049,7 @@ mod recall_cut {
                 gen: 7,
                 round: round_of(&h, 7),
                 through: 0,
+                committed: 0,
                 refused: false,
             },
         });
@@ -42069,6 +42088,7 @@ mod recall_cut {
                 gen: 7,
                 round: round_of(&h, 7),
                 through: 0,
+                committed: 0,
                 refused: false,
             },
         });
@@ -44395,6 +44415,268 @@ mod deleg_group {
             vec![(rid, AnswerSource::Sequenced(AckClass::Archive))],
             "{out:?}"
         );
+    }
+
+    /// A root's lease with node 2 as its one backup, held at epoch 1: its
+    /// acknowledgements rest on node 2's append of the journal
+    /// (`durable_jseq`), and the backup has acknowledged nothing yet.
+    fn root_backed_by_node_2() -> Harness {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.cfg.delegation_ttl_ms = 1_000;
+        h.hold(1, None);
+        let lease = Lease {
+            ack_policy: constellation_store_s3::AckPolicy::Backup,
+            backups: vec![2],
+            config_version: 2,
+            ..lease_of(1, 1, h.now.plus(10_000).0)
+        };
+        h.core.lease.adopt(h.clk(), lease, tag(), None);
+        h.core.ack.eligible = Some(false);
+        let now = w(h.now);
+        h.core.ack.peers.insert(
+            2,
+            crate::core::backup::BackupPeer {
+                candidacy: 0,
+                alive_at: now,
+                short_since_progress: false,
+                short_since: now,
+                unreachable: false,
+                answered: true,
+                acked: 0,
+                listed_at: Some(0),
+                counted: 0,
+                sent_through: 0,
+                inflight: Default::default(),
+                last_sent: WaitMs(0),
+                last_progress: now,
+                committed: true,
+            },
+        );
+        h.core.cfg.backup_rtt_budget_ms = 50;
+        h.core.cfg.backups_max = 1;
+        h.step(Event::Peers {
+            links: vec![crate::event::PeerLink {
+                node: 2,
+                connected: true,
+                last_seen: None,
+                rtt_ms: Some(5),
+                since: Some(WaitMs(0)),
+            }],
+            lapses: 0,
+        });
+        h.step(Event::Roster {
+            write_eligible: vec![1, 2, 3],
+        });
+        h
+    }
+
+    /// The root `h` (node 1) holds generation 7 of `/d` delegated to node 3,
+    /// renewed once; node 3's batch of one create (stream index 1) goes in.
+    fn root_takes_a_delegates_batch(h: &mut Harness) -> Vec<Action> {
+        let dir = delegated_to_me(&h.meta, 3);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRenew {
+                req: OpId(1),
+                gen: 7,
+                round: 1,
+                backup: None,
+                stream_head: 0,
+                stream_head_at: 0,
+                first: false,
+            },
+        });
+        let rid = rid_of(3, 1);
+        let ino = h.meta.allocate_ino(dir).unwrap();
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegateStream {
+                req: OpId(10),
+                gen: 7,
+                round: 1,
+                txs: vec![constellation_meta::DelegateTx {
+                    idx: 1,
+                    rid: Some(rid),
+                    records: vec![
+                        LogRecord::Create {
+                            parent: dir,
+                            name: "f".into(),
+                            ino,
+                            mode: 0o644,
+                            uid: 0,
+                            gid: 0,
+                            time_ns: 1,
+                        },
+                        LogRecord::Completed { rid },
+                    ],
+                    deps: Default::default(),
+                }],
+                leaving: Vec::new(),
+                leaving_barriers: Vec::new(),
+            },
+        })
+    }
+
+    /// The acknowledgements to node 3 in `out`: `(req, round, through,
+    /// committed, refused)`.
+    fn stream_acks_to_3(out: &[Action]) -> Vec<(OpId, u64, u64, u64, bool)> {
+        sends(out)
+            .into_iter()
+            .filter_map(|(to, m)| match m {
+                PeerMsg::DelegateStreamAck {
+                    req,
+                    round,
+                    through,
+                    committed,
+                    refused,
+                    ..
+                } if to == 3 => Some((*req, *round, *through, *committed, *refused)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// I1 (`delegated-backup` 192, 451; `long-delegated-backup` 340, 1832,
+    /// `+commit`; plan 43 Q16, ADR-41): a root acknowledges a delegate's batch
+    /// as appended (`through`, the delegate's flow control) but as committed
+    /// only through the rows its own tenure committed: with a backup listed,
+    /// those the backup holds. Before, the root's ack counted as the second
+    /// copy at once, and a deposed root's journaled row (its backup had
+    /// sealed and taken over without it) was a copy nobody recovers. The
+    /// backup's acknowledgement then raises the commit, and the root says so
+    /// at once, unsolicited, for the batch it last answered. Fails before:
+    /// no `committed`, no push (the delegate counted the first ack).
+    #[test]
+    fn a_root_acks_a_delegates_row_as_committed_only_once_its_backups_hold_the_append() {
+        let mut h = root_backed_by_node_2();
+        let out = root_takes_a_delegates_batch(&mut h);
+        assert_eq!(h.core.dl.gens[&7].cursor, 1, "the root did not append");
+        assert!(h.core.durable_jseq() < h.meta.journal_tip().unwrap());
+        assert_eq!(
+            stream_acks_to_3(&out),
+            vec![(OpId(10), 1, 1, 0, false)],
+            "appended, not committed: {out:?}"
+        );
+        // The root's journal ships to its backup; the backup holds it.
+        let (breq, tip) = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::BackupAppend { req, txs, .. } if to == 2 => {
+                    Some((*req, txs.last().map_or(0, |t| t.last)))
+                }
+                _ => None,
+            })
+            .expect("the append is not sent to the backup");
+        assert_eq!(tip, h.meta.journal_tip().unwrap());
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::BackupAck {
+                req: breq,
+                epoch: 1,
+                acked: tip,
+                sealed: false,
+                fresh: false,
+            },
+        });
+        assert_eq!(
+            stream_acks_to_3(&out),
+            vec![(OpId(10), 1, 1, 1, false)],
+            "the backup holds the row: pushed on the batch's round and request: {out:?}"
+        );
+        assert_eq!(h.core.stats.deleg_stream_acks_pushed, 1);
+        // Nothing new: nothing pushed again.
+        let out = poke(&mut h);
+        assert!(stream_acks_to_3(&out).is_empty(), "{out:?}");
+    }
+
+    /// The root's journal counts for a root nothing gates (`durable_jseq` is
+    /// `u64::MAX`, a lone root): its successor takes over only at the
+    /// lease's expiry, so no backup's seal can leave the row behind. The
+    /// acknowledgement says committed at once (unlike
+    /// `holder_append_uncommitted`, whose use answers `Lone`).
+    #[test]
+    fn a_lone_root_acks_a_delegates_row_as_committed_at_once() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.cfg.delegation_ttl_ms = 1_000;
+        h.hold(1, None);
+        h.core.ack.eligible = Some(false);
+        assert_eq!(h.core.durable_jseq(), u64::MAX);
+        let out = root_takes_a_delegates_batch(&mut h);
+        assert_eq!(
+            stream_acks_to_3(&out),
+            vec![(OpId(10), 1, 1, 1, false)],
+            "{out:?}"
+        );
+    }
+
+    /// A delegate without a recorded backup counts the root's copy only
+    /// through `committed`: an acknowledgement through the appended cursor
+    /// that commits nothing keeps its answer parked, the root's push (the
+    /// same round and request, no progress in `through`) releases it, and
+    /// neither is dropped as an echo. `committed` is never counted past
+    /// `through`. Fails before: the first acknowledgement answered.
+    #[test]
+    fn a_delegate_counts_the_roots_copy_only_through_the_committed_prefix() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        let out = forward_create(&mut h, dir, 1, 500);
+        assert_eq!(answer_to_2(&out, 500), None, "answered alone: {out:?}");
+        let (req, round, last) = batch(&out).expect("sent to the root");
+        let out = h.step(stream_ack_committed(1, req, round, last, 0));
+        assert_eq!(
+            answer_to_2(&out, 500),
+            None,
+            "the root's append is not committed: {out:?}"
+        );
+        let d = &h.core.dl.mine[&7];
+        assert_eq!((d.streamed_through, d.root_committed), (last, 0));
+        assert!(h.core.has_stream_parks());
+        // The push: the batch's own round and request, `through` unchanged.
+        let out = h.step(stream_ack_committed(1, req, round, last, last + 5));
+        let (outcome, committed) = answer_to_2(&out, 500).expect("released by the push");
+        assert!(matches!(outcome, MutateOutcome::Accepted { .. }));
+        assert!(committed);
+        assert_eq!(
+            h.core.dl.mine[&7].root_committed, last,
+            "counted past what the root appended"
+        );
+    }
+
+    /// The delegate's removal of a backup the record names asks only once
+    /// every index it answered is in the root's committed prefix (or the
+    /// log): the root's appended cursor is not it. Fails before: asked on
+    /// the append.
+    #[test]
+    fn a_delegate_asks_to_remove_its_backup_only_once_the_roots_commit_covers_its_answers() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        h.core.dl.mine.get_mut(&7).unwrap().backup = Some(4);
+        record_group(&mut h, dir, 2, 1, vec![4]);
+        let out = forward_create(&mut h, dir, 1, 500);
+        let (breq, blast) = backup_append(&out).expect("appended to the backup");
+        let (req, round, last) = batch(&out).expect("sent to the root");
+        // The root appended the row; its tenure has not committed it.
+        h.step(stream_ack_committed(1, req, round, last, 0));
+        let out = backup_acks(&mut h, breq, blast);
+        assert!(answer_to_2(&out, 500).is_some(), "{out:?}");
+        assert_eq!(h.core.dl.mine[&7].acked_max, 1);
+        // The backup is gone: its removal is not safe on the append alone.
+        h.core.dl.mine.get_mut(&7).unwrap().backup = None;
+        let mut out = Vec::new();
+        h.core.deleg_after_event(h.clk(), &h.meta, &mut out);
+        assert_eq!(
+            h.core.dl.mine[&7].group_requested, None,
+            "asked to remove the backup on the root's uncommitted append: {out:?}"
+        );
+        // The root's commit rises: the removal is asked for.
+        h.step(stream_ack_committed(1, req, round, last, last));
+        let mut out = Vec::new();
+        h.core.deleg_after_event(h.clk(), &h.meta, &mut out);
+        assert_eq!(h.core.dl.mine[&7].group_requested, Some(vec![]), "{out:?}");
     }
 
     /// D6 on the ordinary route: the delegate's own client op, journaled as a

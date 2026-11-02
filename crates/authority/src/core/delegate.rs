@@ -158,6 +158,14 @@ pub(crate) struct GenState {
     pub delegate_heard: Option<WaitMs>,
     /// Appended through this stream index.
     pub cursor: u64,
+    /// The round and request of the delegate's last stream batch: what a
+    /// pushed [`PeerMsg::DelegateStreamAck`] carries
+    /// ([`Core::root_stream_push`]).
+    pub last_batch: Option<(u64, OpId)>,
+    /// The `committed` of the last acknowledgement sent for this
+    /// generation (plan 43 Q16, ADR-41): the push goes out only when the
+    /// root's committed prefix rises above it.
+    pub committed_sent: u64,
     // The window (`until`: the root outwaits the delegate once its **wait**
     // clock reaches it; plan 43 C7-H1) lives in `Core::dw`, the root's
     // shared window table (plan 41 R1, `DelegWindows`).
@@ -337,8 +345,14 @@ pub(crate) struct DelegateState {
     /// The root refused the stream (the generation is ending or unknown
     /// to it): nothing more is streamed until the log says.
     pub refused: bool,
-    /// The root acknowledged the stream through this index.
+    /// The root acknowledged the stream through this index (appended: it
+    /// drives the flow control, not the commit).
     pub streamed_through: u64,
+    /// The root told this delegate its own tenure has committed its
+    /// appends of the stream through this index (`DelegateStreamAck.committed`,
+    /// at most `streamed_through`): the root's copy a delegate without a
+    /// recorded backup counts for its group (plan 43 Q16, ADR-41).
+    pub root_committed: u64,
     /// The batch in flight: its request id and last index.
     pub inflight: Option<(OpId, u64)>,
     /// A renewal in flight: its request id and this node's honour clock
@@ -618,6 +632,11 @@ pub(crate) struct DelegationState {
     /// computed from (`Core::holder_append_cap`): recomputed only when one
     /// of those changed.
     pub holder_caps: BTreeMap<u64, (HolderCapStamp, u64)>,
+    /// Plan 43 Q16 (ADR-41): the same for [`Core::root_append_cap`], the
+    /// root's own committed prefix of its appends of a delegate's stream
+    /// (kept apart: `holder_append_cap` excludes a lone tenure's appends,
+    /// this one counts them).
+    pub root_caps: BTreeMap<u64, (HolderCapStamp, u64)>,
     /// Plan 43 C2d: what [`Core::report_deleg_durable`] last told the
     /// replica's session, per generation.
     pub reported: BTreeMap<u64, constellation_meta::DelegDurable>,
@@ -1125,6 +1144,7 @@ impl Core {
                     stream_backoff_ms: 0,
                     refused: false,
                     streamed_through: replica.log_stream_idx(d.gen),
+                    root_committed: replica.log_stream_idx(d.gen),
                     inflight: None,
                     renew: None,
                     renew_sent_wait: WaitMs(0),
@@ -1266,6 +1286,8 @@ impl Core {
                         member_notes: BTreeMap::new(),
                         delegate_heard: None,
                         cursor,
+                        last_batch: None,
+                        committed_sent: 0,
                         recall: RecallPhase::None,
                         recall_before_seal: RecallPhase::None,
                         ended: false,
@@ -1966,8 +1988,9 @@ impl Core {
         };
         // Plan 43 C2 (§3.4): `class` is the row's, fixed when it was
         // journaled. A row whose class waits (`DelegGroup`, `Archive`) is
-        // answered once its group holds it: the root's journaled append of
-        // the stream, or the recorded backup's acknowledgement, or the log.
+        // answered once its group holds it: the root's append of the stream
+        // that its own tenure committed, or the recorded backup's
+        // acknowledgement, or the log.
         if let Some(idx) = exec_idx {
             if class.gated() && !self.deleg_stream_durable(wait_gen, idx, replica) {
                 self.stats.deleg_acks_parked += 1;
@@ -2003,8 +2026,9 @@ impl Core {
                     self.held_for_upload(rid, own_chunks, out);
                 }
                 self.deleg_backup_stream(now, replica, out);
-                // The root's append is what a delegate without a recorded
-                // backup waits for: send the row now, not on the tick.
+                // The root's committed append is what a delegate without a
+                // recorded backup waits for: send the row now, not on the
+                // tick.
                 self.deleg_stream(now, replica, out);
                 return;
             }
@@ -2052,8 +2076,8 @@ impl Core {
     /// non-stealable; under `ack=s3` the archive; a lone delegate (below)
     /// answers its own node's client from its disk (`Lone`, the one
     /// speculation place) and every other node's forward from the group of
-    /// the generation — the root, whose journaled append is the second copy
-    /// (Q16); otherwise the group (a recorded backup, or the root).
+    /// the generation — the root, whose append its tenure has committed is
+    /// the second copy (Q16, ADR-41); otherwise the group (a recorded backup, or the root).
     ///
     /// Decided at journal time and never again for that row: a delegate
     /// that turns lone after journaling a `DelegGroup` row still waits for
@@ -2667,6 +2691,117 @@ impl Core {
         cap
     }
 
+    /// Plan 43 Q16 (ADR-41): the highest index of delegate generation `gen`
+    /// below the first row this node, as its root, appended and its tenure
+    /// has not committed (`u64::MAX`: none) — what its
+    /// `DelegateStreamAck.committed` is capped by. The group `{delegate,
+    /// root}` counts the root's copy of a row only once it survives the
+    /// root's deposition: the row is shipped (`journal_acked_seq`, or out of
+    /// order), or this tenure holds the lease, is not lost, and every
+    /// backup it gates on holds it (`durable_jseq`; `u64::MAX` for a lone
+    /// root or an epoch hold, where the journal counts: nothing takes a
+    /// lone root's tenure over before its expiry). A root with backups
+    /// therefore acknowledges only once they hold the append: its successor
+    /// is a backup, or has sealed one, and holds the row. Unlike
+    /// [`Self::holder_append_cap`] (whose use answers `Lone` and so excludes
+    /// a lone tenure) this one counts a lone tenure's journal. Cached like
+    /// it, in `dl.root_caps`; a store error caps at 0, uncached.
+    pub(crate) fn root_append_cap(&mut self, gen: u64, replica: &dyn Replica) -> u64 {
+        let tip = replica.holder_append_tip();
+        if tip == 0 {
+            return u64::MAX;
+        }
+        let shipped = replica.journal_acked_seq().unwrap_or(0);
+        if tip <= shipped {
+            self.dl.root_caps.remove(&gen);
+            return u64::MAX;
+        }
+        let holds = self.lease.held.is_some() && !self.lease.lost;
+        let durable = self.durable_jseq();
+        let stamp = HolderCapStamp {
+            tip,
+            shipped,
+            out_of_order: (
+                self.ack.shipped_rows.len(),
+                self.ack.shipped_rows.last().copied().unwrap_or(0),
+            ),
+            durable,
+            holds,
+        };
+        if let Some((s, cap)) = self.dl.root_caps.get(&gen) {
+            if *s == stamp {
+                return *cap;
+            }
+        }
+        let Ok(appends) = replica.holder_appends(gen) else {
+            return 0;
+        };
+        let cap = appends
+            .iter()
+            .find(|(_, last)| {
+                !(*last <= shipped
+                    || holds && (self.ack.shipped_rows.contains(last) || *last <= durable))
+            })
+            .map_or(u64::MAX, |(idx, _)| idx.saturating_sub(1));
+        self.dl.root_caps.insert(gen, (stamp, cap));
+        cap
+    }
+
+    /// Plan 43 Q16 (ADR-41): as the root, tell each delegate its rows' commit
+    /// as it rises. The acknowledgement of a batch carries what the root's
+    /// tenure has committed then; the backups' acknowledgements, a ship, a
+    /// lease change come later, and a delegate that waits for them would
+    /// otherwise wait for its next batch. Every generation not ended whose
+    /// appended cursor is above the last `committed` sent is recomputed; one
+    /// that rose is sent an acknowledgement of its own last batch (its round
+    /// and request: the delegate drops no acknowledgement of its current
+    /// round, and raises `root_committed` before it looks at the request).
+    pub(crate) fn root_stream_push(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let due: Vec<u64> = self
+            .dl
+            .gens
+            .iter()
+            .filter(|(_, g)| !g.ended && g.last_batch.is_some() && g.cursor > g.committed_sent)
+            .map(|(gen, _)| *gen)
+            .collect();
+        if due.is_empty() || !self.root_usable(now) {
+            return;
+        }
+        self.dl
+            .root_caps
+            .retain(|g, _| self.dl.gens.get(g).is_some_and(|g| !g.ended));
+        for gen in due {
+            let cap = self.root_append_cap(gen, replica);
+            let g = self.dl.gens.get_mut(&gen).expect("present");
+            let committed = g.cursor.min(cap);
+            if committed <= g.committed_sent {
+                continue;
+            }
+            let Some((round, req)) = g.last_batch else {
+                continue;
+            };
+            g.committed_sent = committed;
+            let (to, through) = (g.node, g.cursor);
+            self.stats.deleg_stream_acks_pushed += 1;
+            out.push(Action::Send {
+                to,
+                msg: PeerMsg::DelegateStreamAck {
+                    req,
+                    gen,
+                    round,
+                    through,
+                    committed,
+                    refused: false,
+                },
+            });
+        }
+    }
+
     /// [`Self::deleg_stream_state_with`] with what it reads cached across
     /// calls (`cache`): `complete_ready` checks every parked acknowledgement
     /// on every event, and a read of the store per check was most of a
@@ -2726,8 +2861,10 @@ impl Core {
     /// its acknowledgement of this delegate's appends (a backup that is
     /// not the one appended to holds nothing for it), the root (no backup
     /// recorded: the group is the delegate and the root, Q16) by the
-    /// cursor of its journaled append of the stream (`streamed_through`).
-    /// What the log carries is not counted here.
+    /// prefix of its appends of the stream that its own tenure has committed
+    /// (`root_committed`: shipped, or held by its backups; the appended
+    /// cursor `streamed_through` drives the flow control and is no second
+    /// copy, plan 43 Q16, ADR-41). What the log carries is not counted here.
     fn deleg_group_through(d: &DelegateState) -> u64 {
         let held = |members: &[NodeId]| {
             members
@@ -2740,7 +2877,7 @@ impl Core {
                     }
                 })
                 .min()
-                .unwrap_or(d.streamed_through)
+                .unwrap_or(d.root_committed)
         };
         held(&d.group_backups).min(d.group_requested.as_deref().map_or(u64::MAX, held))
     }
@@ -2876,8 +3013,10 @@ impl Core {
     /// is pending (D4: the root may end the generation by either version) —
     /// holds it: a recorded backup by its acknowledgement of this delegate's
     /// appends, the root (no backup recorded: the group is the delegate and
-    /// the root, Q16) by the cursor of its journaled append of the stream
-    /// (`DelegateStreamAck.through`, `streamed_through`). A generation no
+    /// the root, Q16) by the prefix of its appends of the stream that its own
+    /// tenure has committed (`DelegateStreamAck.committed`, `root_committed`;
+    /// the appended cursor `through` is the flow control's, and a deposed
+    /// root's journal holds a row no successor does: ADR-41). A generation no
     /// longer held here, and `ack=s3`, commit only through the log. Not
     /// committed and still in the journal (`pending`): waiting. Not
     /// committed and gone from the journal: the row was dropped — a
@@ -2937,14 +3076,14 @@ impl Core {
                 continue;
             }
             let adding = want.iter().any(|b| !d.group_backups.contains(b));
-            let (acked_max, backup_acked, streamed) =
-                (d.acked_max, d.backup_acked, d.streamed_through);
+            let (acked_max, backup_acked, root_held) =
+                (d.acked_max, d.backup_acked, d.root_committed);
             let safe = acked_max == 0 || {
                 let logged = replica.log_stream_idx(gen);
                 if adding {
                     backup_acked >= acked_max || acked_max <= logged
                 } else {
-                    acked_max <= streamed.max(logged)
+                    acked_max <= root_held.max(logged)
                 }
             };
             if !safe {
@@ -3717,6 +3856,7 @@ impl Core {
                 }
                 if d.last_root.is_some() && root.is_some() {
                     d.streamed_through = replica.log_stream_idx(d.gen);
+                    d.root_committed = d.streamed_through;
                     d.refused = false;
                     d.stream_after = None;
                     d.stream_backoff_ms = 0;
@@ -4250,6 +4390,7 @@ impl Core {
         gen: u64,
         round: u64,
         through: u64,
+        committed: u64,
         refused: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -4265,8 +4406,10 @@ impl Core {
             gen,
             ?req,
             through,
+            committed,
             refused,
             was = d.streamed_through,
+            was_committed = d.root_committed,
             inflight = ?d.inflight,
             stale,
             "delegate stream acknowledgement"
@@ -4302,6 +4445,23 @@ impl Core {
             self.arm_stream_tick(now, out);
             return;
         }
+        // Plan 43 Q16 (ADR-41): what the root's tenure has committed of its
+        // appends is its copy for this delegate's group. Counted whenever it
+        // comes, before the checks below drop an acknowledgement that
+        // appended nothing new: the root's push (`root_stream_push`) is such
+        // one. Cumulative, and never past what the root appended.
+        let committed = committed.min(through);
+        let committed_rose = committed > d.root_committed;
+        if committed_rose {
+            d.root_committed = committed;
+            self.stats.deleg_root_committed_raised += 1;
+            if self.has_stream_parks() {
+                self.complete_ready(now, replica, out);
+            }
+        }
+        let Some(d) = self.dl.mine.get_mut(&gen) else {
+            return;
+        };
         let progressed = through > d.streamed_through;
         if !progressed && !answers_inflight {
             return;
@@ -4341,12 +4501,6 @@ impl Core {
             self.stats.deleg_stream_acks_unmatched += 1;
         }
         self.deleg_drop_left(gen, replica);
-        // Plan 43 C2 (§3.4): the root's journaled append is the second copy a
-        // delegate without a recorded backup waits for: what waited for
-        // these rows is answered now.
-        if progressed && self.has_stream_parks() {
-            self.complete_ready(now, replica, out);
-        }
         self.deleg_stream(now, replica, out);
     }
 
@@ -6999,6 +7153,7 @@ impl Core {
                     gen,
                     round,
                     through,
+                    committed: 0,
                     refused: true,
                 },
             });
@@ -7119,6 +7274,15 @@ impl Core {
             self.lease.touch(now);
             self.nudge(now, out);
         }
+        // `through` is what the root appended (the delegate's flow control);
+        // `committed` what its own tenure has committed of that, the root's
+        // copy for the delegate's group (ADR-41). The rest follows by a
+        // push when the commit rises (`root_stream_push`).
+        let committed = cursor.min(self.root_append_cap(gen, replica));
+        if let Some(g) = self.dl.gens.get_mut(&gen) {
+            g.last_batch = Some((round, req));
+            g.committed_sent = committed;
+        }
         out.push(Action::Send {
             to: from,
             msg: PeerMsg::DelegateStreamAck {
@@ -7126,6 +7290,7 @@ impl Core {
                 gen,
                 round,
                 through: cursor,
+                committed,
                 refused: false,
             },
         });
@@ -7348,6 +7513,8 @@ impl Core {
                 member_notes: BTreeMap::new(),
                 delegate_heard: None,
                 cursor: 0,
+                last_batch: None,
+                committed_sent: 0,
                 recall: RecallPhase::None,
                 recall_before_seal: RecallPhase::None,
                 ended: false,

@@ -1716,9 +1716,11 @@ async fn handle_stream<S: PeerService>(
                 gen,
                 round,
                 through,
+                committed,
                 refused,
             } => {
-                service.delegate_stream_acked(from, req_id, gen, round, through, refused);
+                service
+                    .delegate_stream_acked(from, req_id, gen, round, through, committed, refused);
                 Some(Payload::Ok { req_id })
             }
             Payload::DelegRenew {

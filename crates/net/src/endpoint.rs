@@ -1193,6 +1193,7 @@ pub trait PeerService: Send + Sync + 'static {
         _gen: u64,
         _round: u64,
         _through: u64,
+        _committed: u64,
         _refused: bool,
     ) {
     }

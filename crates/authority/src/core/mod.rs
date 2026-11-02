@@ -1189,6 +1189,11 @@ pub struct Stats {
     /// or round's.
     pub deleg_stream_acks_unmatched: u64,
     pub deleg_stream_acks_stale: u64,
+    /// Root: acknowledgements sent unsolicited because a delegate's committed
+    /// prefix rose after its batch was answered (plan 43 Q16, ADR-41).
+    pub deleg_stream_acks_pushed: u64,
+    /// Delegate: acknowledgements that raised the root's committed prefix.
+    pub deleg_root_committed_raised: u64,
     /// Delegate: renewal answers dropped as another root's or round's, or
     /// for a generation no longer this node's.
     pub deleg_renewed_stale: u64,
@@ -2526,6 +2531,7 @@ impl Core {
         self.inbox_after_event(now, &mut out);
         self.stream_after_event(now, &mut out);
         self.backup_after_event(now, replica, &mut out);
+        self.root_stream_push(now, replica, &mut out);
         self.renew_after_own_cas(now, &mut out);
         self.promise_after_event(now, replica, &mut out);
         self.deleg_after_event(now, replica, &mut out);
@@ -2731,9 +2737,11 @@ impl Core {
                 gen,
                 round,
                 through,
+                committed,
                 refused,
-            } => self
-                .on_delegate_stream_ack(now, from, req, gen, round, through, refused, replica, out),
+            } => self.on_delegate_stream_ack(
+                now, from, req, gen, round, through, committed, refused, replica, out,
+            ),
             PeerMsg::DelegRenew {
                 req,
                 gen,

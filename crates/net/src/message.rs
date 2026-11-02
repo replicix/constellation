@@ -416,12 +416,15 @@ pub enum Payload {
     },
     /// Plan 30 §M11, one way: the root holds `gen`'s stream through
     /// `through` (cumulative), or `refused` the batch `req_id`.
+    /// `committed` (at most `through`): the prefix of it the root's own
+    /// tenure has committed (shipped, or held by its backups).
     DelegateStreamAck {
         from: u64,
         req_id: u64,
         gen: u64,
         round: u64,
         through: u64,
+        committed: u64,
         refused: bool,
     },
     /// Plan 30 §M11, one way: a delegate renews its grant on `gen`; the
@@ -1732,6 +1735,26 @@ mod tests {
             let back = Signed::decode(&frame[4..]).unwrap();
             assert_eq!(back.verify().unwrap().1, payload);
         }
+    }
+
+    /// Plan 43 Q16 (ADR-41): the root's acknowledgement of a delegate's
+    /// stream carries the appended cursor (`through`) and the prefix its own
+    /// tenure has committed (`committed`) apart.
+    #[test]
+    fn a_delegate_stream_ack_round_trips_its_committed_prefix() {
+        let k = key();
+        let payload = Payload::DelegateStreamAck {
+            from: 6,
+            req_id: 1,
+            gen: 2,
+            round: 7,
+            through: 9,
+            committed: 4,
+            refused: false,
+        };
+        let frame = Signed::new(&k, &payload).unwrap().encode().unwrap();
+        let back = Signed::decode(&frame[4..]).unwrap();
+        assert_eq!(back.verify().unwrap().1, payload);
     }
 
     #[test]

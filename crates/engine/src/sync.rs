@@ -287,6 +287,7 @@ pub enum SyncRequest {
         gen: u64,
         round: u64,
         through: u64,
+        committed: u64,
         refused: bool,
     },
     /// The off-core lane sent a delegation renewal (urgent lane, ahead of
