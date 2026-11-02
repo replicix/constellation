@@ -34084,6 +34084,43 @@ fn a_delegation_renewal_waits_for_the_lease_read_and_a_non_root_refuses_it() {
     }
 }
 
+/// Plan 46 M0.3 (S2): a delegate's renewal reaching the root while its
+/// takeover gate waits out the quarantine is left unanswered, whatever the
+/// gate's progress. Refused (`ttl_ms` 0) it stopped the generation at its
+/// delegate for good, and the gate, which opens a few seconds later,
+/// inherits the generation as live and outwaits it (delegated-backup seed
+/// 129: the delegate's own unlink was held for 6 s after its renewal was
+/// refused). The delegate sends the renewal again on its timeout; the
+/// opened root grants it, or the delegate lapses, which is always safe. A
+/// root that decided the generation ends (a lost lease, a release) still
+/// refuses (`a_delegation_renewal_waits_for_the_lease_read_and_a_non_root_refuses_it`).
+/// Fails on the parent: `ttl_ms` 0.
+#[test]
+fn a_gated_root_leaves_a_renewal_unanswered() {
+    for shippable in [false, true] {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.hold(
+            2,
+            Some(PendingGate {
+                epoch: 2,
+                takeover: true,
+                marker_shipped: true,
+                drained: false,
+                fast_prev: false,
+                backup_tail_epoch: None,
+                shippable,
+            }),
+        );
+        let out = h.step(deleg_renew_from(2, 77));
+        assert!(
+            deleg_renewed_ttls(&out).is_empty(),
+            "shippable {shippable}: {out:?}"
+        );
+        assert_eq!(h.core.stats.deleg_renewals_refused, 0);
+    }
+}
+
 /// A lock request for an undelegated inode from `from`.
 fn lock_request_from(from: NodeId, req: u64, honour: HonourMs) -> Event {
     Event::Peer {
