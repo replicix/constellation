@@ -35555,6 +35555,14 @@ fn a_restarted_delegate_readopts_its_delegation_at_start() {
         h.core.dl.mine[&7].until > h.honour(),
         "the renewal was not honoured"
     );
+    // A directory snapshot with nobody linked: a delegate knows nothing of
+    // its peers before its first one, and does not answer alone then (its
+    // lone test is the root's, `backup_could_be_had`). The test is about
+    // re-adoption, not about being lone.
+    h.step(Event::Peers {
+        links: Vec::new(),
+        lapses: 0,
+    });
     // A write under the subtree executes here, as the delegate.
     let rid = h.rid(1);
     let op = MutateOp::Create {
@@ -42247,7 +42255,7 @@ mod deleg_group {
             }],
             lapses: 0,
         });
-        assert!(!h.core.deleg_lone(h.clk(), &h.core.dl.mine[&7]));
+        assert!(!h.core.deleg_lone(&h.core.dl.mine[&7]));
     }
 
     /// The batch to the root in `out`: `(req, round, last)`.
@@ -42470,7 +42478,7 @@ mod deleg_group {
     #[test]
     fn a_lone_delegates_own_settle_waits_for_its_group() {
         let (mut h, dir, _, _) = delegate_renewed_once();
-        assert!(h.core.deleg_lone(h.clk(), &h.core.dl.mine[&7]));
+        assert!(h.core.deleg_lone(&h.core.dl.mine[&7]));
         // A client op of this node, not executed anywhere yet (sent to the
         // root for a name it owns), then settled here as the delegate.
         let rid = h.rid(1);
@@ -42534,9 +42542,9 @@ mod deleg_group {
     #[test]
     fn a_lone_delegate_acks_its_own_node_and_waits_for_the_root_for_others() {
         let (mut h, dir, _, _) = delegate_renewed_once();
-        assert!(h.core.deleg_lone(h.clk(), &h.core.dl.mine[&7]));
+        assert!(h.core.deleg_lone(&h.core.dl.mine[&7]));
         assert_eq!(
-            h.core.deleg_ack_class(h.clk(), 7, Asker::Own, &h.meta),
+            h.core.deleg_ack_class(7, Asker::Own, &h.meta),
             AckClass::Lone,
             "lone: its own client's row is answered at once"
         );
@@ -42557,7 +42565,7 @@ mod deleg_group {
         // The root comes within the budget: the next own op waits.
         root_is_near(&mut h);
         assert_eq!(
-            h.core.deleg_ack_class(h.clk(), 7, Asker::Own, &h.meta),
+            h.core.deleg_ack_class(7, Asker::Own, &h.meta),
             AckClass::DelegGroup { gen: 7 },
             "not lone: its own client's row waits for the group"
         );
@@ -42575,6 +42583,114 @@ mod deleg_group {
         );
     }
 
+    /// I1 (`placement-hot` 383, 472, 948, 1890; `long-delegated-backup` 92,
+    /// 457, 1372, 1836, `+commit`): the delegate's lone test asked for a
+    /// backup *candidate*, which needs a link up for `backup_stable_ms`,
+    /// while the root and the oracle count any linked peer within the RTT
+    /// budget. A delegate back from a reboot has only young links: with the
+    /// root linked and in budget it answered its own client `Lone`, and the
+    /// root's journal never held the row. Not lone now, stable or not; the
+    /// own op parks until the root's acknowledgement. Fails before: `Lone`.
+    #[test]
+    fn a_delegate_with_a_young_link_to_the_root_is_not_lone() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        h.core.cfg.backup_rtt_budget_ms = 50;
+        h.core.cfg.backups_max = 1;
+        h.core.cfg.backup_stable_ms = 200;
+        h.step(Event::Roster {
+            write_eligible: vec![1, 2, 3],
+        });
+        // The root linked just now, in budget: younger than the window.
+        let since = w(h.now);
+        h.step(Event::Peers {
+            links: vec![crate::event::PeerLink {
+                node: 1,
+                connected: true,
+                last_seen: None,
+                rtt_ms: Some(5),
+                since: Some(since),
+            }],
+            lapses: 0,
+        });
+        assert!(h.core.backup_candidates(h.clk()).is_empty(), "no candidate");
+        assert!(!h.core.deleg_lone(&h.core.dl.mine[&7]), "a root to back it");
+        assert_eq!(
+            h.core.deleg_ack_class(7, Asker::Own, &h.meta),
+            AckClass::DelegGroup { gen: 7 }
+        );
+        assert_eq!(
+            h.meta.session().deleg_row_class(7),
+            Some(constellation_meta::RowClass::DelegGroup),
+            "published: the fast path's rows wait too"
+        );
+        let (rid, out) = own_create(&mut h, dir, 1);
+        assert!(client_answers(&out).is_empty(), "answered alone: {out:?}");
+        let (req, round, last) = batch(&out).expect("the row streams to the root");
+        let out = root_acks(&mut h, req, round, last);
+        assert_eq!(
+            client_answers(&out),
+            vec![(
+                rid,
+                AnswerSource::Sequenced(AckClass::DelegGroup { gen: 7 })
+            )],
+            "{out:?}"
+        );
+    }
+
+    /// I1 class 2 for the delegate (the lapse rule of
+    /// `a_root_is_not_lone_across_its_own_lapse_until_a_later_directory`,
+    /// reached through [`Core::backup_could_be_had`]): the links a delegate
+    /// holds predate its own pause, and the directory snapshots queued
+    /// behind the event that resumed it are older than the lapse. It is lone
+    /// on a snapshot taken after the lapse was handed, and the class changes
+    /// with the event (`OwnLag`), not with a new snapshot or the clock.
+    /// Fails before: `Lone` throughout.
+    #[test]
+    fn a_delegate_is_not_lone_across_its_own_lapse_until_a_later_directory() {
+        let (mut h, _dir, _, _) = delegate_renewed_once();
+        h.core.cfg.backup_rtt_budget_ms = 50;
+        h.core.cfg.backups_max = 1;
+        h.core.cfg.backup_stable_ms = 200;
+        h.step(Event::Roster {
+            write_eligible: vec![1, 2, 3],
+        });
+        let no_links = |h: &mut Harness, lapses| {
+            h.step(Event::Peers {
+                links: Vec::new(),
+                lapses,
+            })
+        };
+        let class = |h: &Harness| h.core.deleg_ack_class(7, Asker::Own, &h.meta);
+        let published = |h: &Harness| h.meta.session().deleg_row_class(7);
+        no_links(&mut h, 0);
+        assert_eq!(class(&h), AckClass::Lone, "nobody linked");
+        assert_eq!(published(&h), Some(constellation_meta::RowClass::Lone));
+        // Paused for seconds: the lapse is handed with the next event.
+        h.step(Event::OwnLag {
+            from: w(h.now).minus(1),
+            until: w(h.now),
+        });
+        assert_eq!(
+            class(&h),
+            AckClass::DelegGroup { gen: 7 },
+            "no snapshot since its lapse"
+        );
+        assert_eq!(
+            published(&h),
+            Some(constellation_meta::RowClass::DelegGroup),
+            "the lapse event publishes it"
+        );
+        // A snapshot taken before the lapse was handed does not restore it.
+        h.advance(100);
+        no_links(&mut h, 0);
+        assert_eq!(class(&h), AckClass::DelegGroup { gen: 7 });
+        // One taken after does.
+        h.advance(100);
+        no_links(&mut h, 1);
+        assert_eq!(class(&h), AckClass::Lone);
+        assert_eq!(published(&h), Some(constellation_meta::RowClass::Lone));
+    }
+
     /// A lone delegate answers its own node's rows from its disk only while
     /// its journal is fewer transactions past what the root holds than a
     /// stream batch carries records (`delegation_stream_rows`).
@@ -42587,7 +42703,7 @@ mod deleg_group {
     fn a_lone_delegate_holds_its_own_rows_once_a_batch_ahead_of_the_root() {
         let (mut h, dir, _, _) = delegate_renewed_once();
         h.core.cfg.delegation_stream_rows = 4;
-        assert!(h.core.deleg_lone(h.clk(), &h.core.dl.mine[&7]));
+        assert!(h.core.deleg_lone(&h.core.dl.mine[&7]));
         // Row 1 goes to the root at once; rows 2 to 4 wait for its ack.
         let mut first = None;
         for seq in 1..=4 {
@@ -42606,7 +42722,7 @@ mod deleg_group {
         // Four rows past the root's cursor: the next one waits for the root,
         // and the fast path journals with that class too.
         assert_eq!(
-            h.core.deleg_ack_class(h.clk(), 7, Asker::Own, &h.meta),
+            h.core.deleg_ack_class(7, Asker::Own, &h.meta),
             AckClass::DelegGroup { gen: 7 }
         );
         assert_eq!(
@@ -42639,7 +42755,7 @@ mod deleg_group {
         );
         // Within a batch again: its own rows are answered at once.
         assert_eq!(
-            h.core.deleg_ack_class(h.clk(), 7, Asker::Own, &h.meta),
+            h.core.deleg_ack_class(7, Asker::Own, &h.meta),
             AckClass::Lone
         );
         assert_eq!(
@@ -43897,7 +44013,7 @@ mod deleg_group {
             }],
             lapses: 0,
         });
-        assert!(h.core.deleg_lone(h.clk(), &h.core.dl.mine[&7]));
+        assert!(h.core.deleg_lone(&h.core.dl.mine[&7]));
         assert_eq!(
             h.meta.session().deleg_row_class(7),
             Some(constellation_meta::RowClass::Lone)

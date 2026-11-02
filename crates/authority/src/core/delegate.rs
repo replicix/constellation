@@ -1784,7 +1784,7 @@ impl Core {
         // (A settle's refusal is never `Lone`: it waits for the group, also
         // for this node's own client — see `Core::settle_refusal`.)
         let class_asker = if settle { Asker::Remote } else { asker };
-        let mut class = self.deleg_ack_class(now, gen, class_asker, replica);
+        let mut class = self.deleg_ack_class(gen, class_asker, replica);
         let dedup = replica.recent_outcome(rid).is_some()
             || replica.completed_outcome(rid).ok().flatten().is_some();
         if dedup {
@@ -1821,7 +1821,7 @@ impl Core {
         if !dedup
             && asker == Asker::Own
             && matches!(class, AckClass::DelegGroup { .. })
-            && self.deleg_lone_held_by_gate_alone(now, gen, replica)
+            && self.deleg_lone_held_by_gate_alone(gen, replica)
         {
             self.stats.deleg_lone_held_by_gate += 1;
         }
@@ -2065,13 +2065,7 @@ impl Core {
     /// clients is uncommitted ahead of them
     /// ([`Self::deleg_lone_held_by_gated`]); otherwise they wait for the
     /// root too, like every other node's.
-    pub fn deleg_ack_class(
-        &self,
-        now: Now,
-        gen: u64,
-        asker: Asker,
-        replica: &dyn Replica,
-    ) -> AckClass {
+    pub fn deleg_ack_class(&self, gen: u64, asker: Asker, replica: &dyn Replica) -> AckClass {
         if self.cfg.ack_s3 {
             return AckClass::Archive;
         }
@@ -2079,7 +2073,7 @@ impl Core {
             Some(d) if d.designated => AckClass::NonStealable,
             Some(d)
                 if asker == Asker::Own
-                    && self.deleg_lone(now, d)
+                    && self.deleg_lone(d)
                     && !self.deleg_lone_held(d, replica) =>
             {
                 AckClass::Lone
@@ -2218,11 +2212,11 @@ impl Core {
     /// The only thing that keeps a lone delegate's next own row from being
     /// `Lone` is a gated row of its own that has not committed (not the
     /// lead): for the counter that shows the rule was exercised.
-    fn deleg_lone_held_by_gate_alone(&self, now: Now, gen: u64, replica: &dyn Replica) -> bool {
+    fn deleg_lone_held_by_gate_alone(&self, gen: u64, replica: &dyn Replica) -> bool {
         let Some(d) = self.dl.mine.get(&gen) else {
             return false;
         };
-        if self.cfg.ack_s3 || d.designated || !self.deleg_lone(now, d) {
+        if self.cfg.ack_s3 || d.designated || !self.deleg_lone(d) {
             return false;
         }
         let committed = self.deleg_committed_capped(gen, replica);
@@ -2273,15 +2267,26 @@ impl Core {
 
     /// Plan 43 C2 (§2.1): this delegate is lone for `d`'s generation: its
     /// replica records no backup for it and none is requested, it appends
-    /// to none, and no peer — the root included — is a backup candidate
-    /// (linked, within `backup_rtt_budget_ms`, up for `backup_stable_ms`:
-    /// the rule `Core::backup_candidates` selects by, D10). The group is
-    /// itself then, and its own node's client is answered from its disk.
-    pub(crate) fn deleg_lone(&self, now: Now, d: &DelegateState) -> bool {
+    /// to none, and no backup could be had from any peer — the root
+    /// included ([`Self::backup_could_be_had`]: a roster peer linked within
+    /// the RTT budget, stable or not, and nothing known of the peers before
+    /// a directory snapshot taken after this node's last lapse). The group
+    /// is itself then, and its own node's client is answered from its disk.
+    ///
+    /// Before, this asked for a backup *candidate* (`backup_candidates`,
+    /// which also needs a link up for `backup_stable_ms`), as the root and
+    /// the oracle did until they dropped the stability term: a delegate
+    /// back from a reboot, its links younger than the window, answered its
+    /// own client `Lone` with the root linked and in budget (oracle I1,
+    /// `placement-hot` 383, `long-delegated-backup` 457), and one resumed
+    /// from a freeze answered on the directory it held before it. The
+    /// judgement now changes with events (links, roster, lapses) only,
+    /// never with the clock.
+    pub(crate) fn deleg_lone(&self, d: &DelegateState) -> bool {
         d.group_backups.is_empty()
             && d.group_requested.is_none()
             && d.backup.is_none()
-            && self.backup_candidates(now).is_empty()
+            && !self.backup_could_be_had()
     }
 
     /// The backup this delegate tells the root it wants (`DelegRenew.backup`,
@@ -2813,7 +2818,7 @@ impl Core {
         let mut current = BTreeMap::new();
         let mut raised = Vec::new();
         for d in self.dl.mine.values() {
-            let class = self.deleg_ack_class(now, d.gen, Asker::Own, replica);
+            let class = self.deleg_ack_class(d.gen, Asker::Own, replica);
             let uncapped = self.deleg_committed_through(d, replica.log_stream_idx(d.gen));
             let through = caps.get(&d.gen).map_or(uncapped, |c| c.committed);
             // The prefix is floored at the log's index, which this node's own
