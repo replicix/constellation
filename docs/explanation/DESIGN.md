@@ -618,7 +618,10 @@ judgement rests on must have been taken after the node's own last lapse (a
 pause, a freeze, a held runtime) was handed to its core: the links it held
 before it stopped cannot show that no peer came up meanwhile, so after a lapse
 even a true singleton waits for the archive until the next snapshot (the
-daemon takes one at once)
+daemon takes one at once). A freeze shorter than the lag
+probe's threshold (about 187 ms) counts as no lapse; that is safe, because the
+directory lives in the process: it cannot change during the freeze, and links
+that went down leave peers listed, which errs towards not answering alone
 ([ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)). Its answers to its own
 node's clients are the one speculation the design keeps. A **non-stealable** authority (an offline designation, a
 continuation epoch's hold) is never replaced while its holder lives. The rows a
