@@ -699,7 +699,7 @@ delegations over the one log instead, below.)
   how far its hold reached; `TailFollows` in older logs), `TailOf` (the
   identity of a re-shipped transaction: the journal that first held it,
   the first record of the re-shipped transaction, kept through any number of
-  re-ships) and `GroupAbandoned` (an operator gave a group's rows up; §9). The set is an append-only registry, like the manifest
+  re-ships), `GroupAbandoned` (an operator gave a group's rows up; §9) and `RolledBack` (the transactions an operator's `repair drop-held` rolled back, which members and backups retract; §9). The set is an append-only registry, like the manifest
   entry types.
 - **The commit chain** (plan 28,
   [28-s3-native-metadata-store.md](../plans/v1/done/28-s3-native-metadata-store.md))
@@ -1897,13 +1897,27 @@ requester's retry executes in the dropped row's place (while the dropping
 node remains the sequencer; after a takeover by another node the retry runs
 there ungated, and no acknowledged effect is lost); so that node's retry
 re-executes it, or, if the retry never comes, the sequencer in force
-settles the request id as abandoned after 2 × TTL (`Refused { rid,
-ABANDONED }`, `drop_held_await_ms`) and what waited goes on. "Never given" is
+settles the request id as abandoned after the bound (`Refused { rid,
+ABANDONED }`, `drop_held_await_ms`: at most the client deadline minus two settle
+windows, 60 s at the defaults, so that this node's own ops on the placeholder's
+keys keep their window) and what waited goes on. "Never given" is
 what the node's core knows: a lone sequencer's row (its answer waits for the
 log), or a backed row whose answer is still parked for its group — that
 parked answer is aborted in the same step. An answer that may have been given
 (a group's, once released; an epoch hold's) keeps its replayable copy: its
 requester is not retrying it.
+
+Three more rules close the drop on a backed root. A lost chunk that an op of
+the node not yet journaled, or an open write session, still names keeps its
+pending row and marks (no row means durable to every manifest composition),
+or its manifest would ship naming a chunk S3 never received. The drop journals
+`RolledBack { idents }` ahead of its refusals, naming each transaction it
+rolled back as a member keys it; a member that was streamed those as committed
+rolls its copy back without a replay, and backups' tails and member copies
+turn the transactions into holes (the tail stays contiguous). And a drop run
+on a node deposed meanwhile settles each refused entry's request id through
+the sequencer in force before making its conflict copy, so the acknowledged
+op has an outcome in the log.
 
 ### What an S3 outage blocks
 

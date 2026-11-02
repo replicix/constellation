@@ -63710,3 +63710,98 @@ control 146, harness unit tests 167; release sim suite 308 passed / 11 ignored. 
 knob: `flex-crash+identity`, `drop-held-chain`, `drop-held-chain-requester-dies`, `flex`, `flex-tight`, `placement-hot`,
 `backup-crash`, `delegated-holder-cut`, `long-delegated-late-answers`: 0 (both); `long-backup`: seed 743 (no knob only; not
 this work); `drop-held-chain-backed`: above. Harness, three runs each: `poison-record-isolation`, `backup-takeover-holds-missing-chunks`, `backup-takeover-drops-held-chunks`, `epoch-member-dies-with-chunk`, `drop-held-remote-dependents` all green (the last through the control API's new core path).
+
+## Plan 46 M0.2: the four defects of `drop-held` on a backed root (2026-11-02)
+
+The 51 seeds `drop-held-chain-backed` left failing on `aa8466f9` (the C2g′ review fixes) were not a takeover and not one
+bug. Replayed one by one they are four defects of the drop, plus a bound that made one outcome unreachable; class E (below)
+is not the drop. One commit each, fail-before is the test named, run with the rule removed. 50 seeds fail on `aa8466f9`
+without the lease-read knob in the measurement below (51 in the earlier count), 2 with it (503, 1004).
+
+1. **A, a chunk gap (integrity; reachable in production; seeds 1476, 1851).** `repair drop-held` removed the pending-upload
+   row and the poison mark of every lost chunk of the inode, believing each reference became a hole. It saw the journal and
+   the replay queue, not an op of the node that had not executed yet (a close behind a handoff pause, an unanswered forward,
+   a parked op) nor a write session that re-flushes the hashes it sealed. "No row" means durable to the ship plan, the
+   forward's pending list and the manifest composition, so the manifest shipped naming a chunk S3 never received: a
+   permanent `EIO` for every reader, the writer told OK, no conflict copy. Now the core names the chunks its unfinished
+   client ops (not `AwaitingLog`), parked forwards and parked delegate ops carry (`SetManifest`, `Publish`, verbatim
+   manifest records), the engine those its attached sessions sealed (a session in a flush in flight keeps every lost chunk
+   of the inode), and the drop keeps the row, the mark and the remote mark of each; the rids the drop rolled back
+   itself are excluded (they are seeds). `DroppedHeld` reports `missing`, `kept_pending`, `kept_for`; the command tells the
+   operator to run it again once they have journaled; after an Ok drop the engine fails each session that sealed a lost chunk
+   (the lapsed-lock discard path: `EIO` once per open description). The sim's `ChunkWorld::hopeless` counts an uploader whose
+   own row is marked unrecoverable as hopeless. Fail-before: meta `a_drop_keeps_the_pending_row_of_a_lost_chunk_a_live_op_names`,
+   `a_drop_keeps_the_pending_row_of_a_chunk_a_write_session_names`; core
+   `an_unexecuted_manifest_keeps_its_lost_chunk_held_through_a_drop`; engine
+   `a_reattached_session_naming_a_dropped_chunk_fails_its_next_close`, `a_session_in_a_flush_keeps_every_lost_chunk_of_its_inode_held`;
+   seed 1476 (S3 gap, then OK), 1851 (the gap goes; it fails on B's quiescence until B).
+2. **C, I2c (seeds 592, 1864).** The drop ran on a node deposed meanwhile (suspended past its seal, the command run on
+   resume): its `Refused` rows were fenced, and the refused entry made its conflict copy at once, so the acknowledged op had
+   no outcome in the log. The refusals a *drop* made (`StrandedOp::dropped`) now copy only once the rid's refusal is in the log
+   (and, if it is this node's own journal row, committed); an outcome that accepted the rid (the successor completed the
+   original from its tail) forgets the entry with no copy; with none the rid is settled through the sequencer in force by
+   the placeholder's settle path, whose inert op spells the dropped code (`dropped_settle_op`, read by
+   `settle_refusal`, the delegate's and the inbox's settle) so the refusal journaled is the drop's own `EIO`, not the
+   abandoned one: the drain would forget an abandoned rid with no copy ("nobody heard it took effect"), and this one was
+   acknowledged. A sequencer's refusal is journaled where it was given and copies as before (a test that pinned that is
+   unchanged). Fail-before: core `a_deposed_droppers_refused_entry_settles_before_its_copy`,
+   `a_refused_entry_whose_rid_the_successor_completed_makes_no_copy`,
+   `a_refused_entry_settled_at_the_sequencer_in_force_here_journals_the_dropped_code`; seeds 592, 1864. *Not done*: the spec's
+   optional narrowing (a lease read in `on_control_drop_held` that refuses a drop on a node the lease no longer names): it
+   makes the control call depend on S3 and would leave 592 and 1864 without the path they pin. *The open point*:
+   592's rid 2:1:12 (answered OK under root-group while stream-ahead stopped before its rows), run with `strict_commit`
+   (`drop-held-chain-backed+commit`, before and after): the I1 oracle flags only rid 2:1:1, a refusal at t=235 ms before
+   the backup is listed (1 violation in all; the same on `aa8466f9`), and not 2:1:12. No I1 violation of 2:1:12.
+3. **B, quiescence (43 seeds including 42, 76).** A member that was streamed a held row as committed kept it for good when
+   the holder rolled it back; backups' tails and the forwarder's member copy kept it too, so a successor re-shipped it.
+   `LogRecord::RolledBack { idents }` (appended to the enum; no shim, no version bump) names each rolled-back transaction
+   as a member keys it (its `TailOf` pair, else its tenure's `(epoch, first)`): the seeds and the dependents. The drop
+   journals it as the first record of the transaction that carries its `Refused` rows. A member that installs it from the
+   stream or applies it in a segment rolls back its live `Streamed` entry of each identity (gated or not, `own` or not)
+   without queueing a replay, and the member-copy row and the backup-tail transaction of it become holes of the same span
+   (not removed: a removed middle transaction would end the contiguous prefix a claimant seals at). The refused queued
+   replays name no identity (their rows were rolled back at the deposition that queued them, and committed rows are never
+   queued). Fail-before: meta `a_streamed_committed_row_named_by_rolled_back_is_retracted`,
+   `a_streamed_rolled_back_record_retracts_committed_and_own_entries`,
+   `an_appended_rolled_back_record_turns_the_tail_transactions_into_holes`; core
+   `drop_held_journals_rolled_back_ahead_of_its_refusals`; seeds 42, 76, 132, 196, 240, 316, 1851. Existing meta tests that
+   counted the drop's journal rows now count the record too (`drop_held_turns_the_seed_into_a_conflict_copy_and_replays_the_rest`,
+   `drop_held_remote_drops_a_transaction_deferred_on_a_departed_nodes_chunk`).
+4. **D, liveness.** A holder whose backlog was held or deferred rows renewed the handoff pause at every round for as long as a
+   peer wanted its lease, and its own ops waited for the lease path. A round that moved nothing while the last ship plan held
+   or deferred rows no longer begins the pause (`Replica::held_summary`). Fail-before: core
+   `a_holder_with_a_held_backlog_keeps_admitting_own_ops_while_wanted`. Seed 1476 with the slow-op log at 300 ms: rids
+   3:1:14 and 3:1:15 took 4,224 ms and 3,561 ms before D and are not slow after.
+5. **The bound.** `drop_held_await = min(configured, acquire_deadline - 2 * settle_window)`, and that cap is the default
+   (60 s in production, 6 s in the sim), so an own op on a dead requester's placeholder's keys (bound, then the settle's
+   commit, inside `acquire_deadline - settle_window`) is answered `OK` instead of `EIO`. Fail-before: core
+   `the_placeholder_bound_leaves_a_dependent_own_op_its_window` (never answered inside its 90 s window before),
+   `a_configured_bound_above_the_cap_is_clamped`. `drop_held_chain_regression_seeds` still sees settles.
+
+### Class E, not the drop (seeds 422, 1128; left open)
+
+Both fail on `aa8466f9` and after, are history-witness failures ("took effect in the log but the spec refuses it there";
+"returned Enoent but no state in its window explains it") of the backed configuration under reboots, clock steps and
+suspends, with no lost chunk (422 has no drop at all, 1128's one drop has `dropped: 0`). A separate item: "backed
+configuration history under reboot and clock step: 422, 1128" (the fault-free control's 132 passes now; 233 was not
+re-run).
+
+### Sweeps (seeds 0..1,999; `AUTHORITY_SIM_LEASE_READS=0:0:800:1000` is "knob")
+
+`drop-held-chain-backed`: aa8466f9 50 failing without the knob, 2 with it (503, 1004); now [422, 1128] without it (class E),
+0 with it. `drop-held-chain-requester-dies`, `flex-crash+identity`, `flex`, `flex-tight`, `placement-hot`, `backup-crash`,
+`delegated-holder-cut`, `long-delegated-late-answers`: 0 both ways. `long-backup`: seed 743 without the knob (as on main), 0
+with it. `drop-held-chain` without the knob: 0; **with the knob: 208 and 1446 fail** (0 on aa8466f9): "the log stalled
+behind a deferred transaction" (the sim's liveness sampler: a shippable journal row unshipped for 20 consecutive 250 ms
+samples while the node holds a lease record). The node holds an expired lease after a suspend and a clock step and
+recovers it through lease reads of 0.8 to 1 s; the same 3.9 s of stall is there with D removed and ends at 4.1 s,
+under the sampler's 5 s; with D the acquisition that the pause used to refuse starts and holds the round slot for one more
+slow read, and the stall ends at 4.8 s. Replaying the seed alone (`replay_seed`) does not apply the knob; use
+`AUTHORITY_SIM_START=208 AUTHORITY_SIM_SEEDS=1 sweep_config`. On aa8466f9 seed 208 has no deferred transaction at all. Left as found: not a D logic error, a threshold the lease-recovery latency under the slow-read knob sits next to.
+
+### Gates
+
+fmt; clippy `-D warnings` (workspace, all targets); authority lib 920 and `meta_repro` 4, meta (lib 382 and every integration target, held 25,
+member_copy 22), engine 942 + 10, control 146, harness unit tests 163; release sim suite 309 passed / 11 ignored.
+Harness, three runs each, all green: `poison-record-isolation`, `backup-takeover-holds-missing-chunks`,
+`backup-takeover-drops-held-chunks`, `epoch-member-dies-with-chunk`, `drop-held-remote-dependents`.

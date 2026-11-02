@@ -109,7 +109,9 @@ node's own replica shows it, published commits show the file as it was
 before it, and a deposition rolls it back and replays it through the new
 holder (where it is held again). While anything is held, the node's
 journal is not empty, so it keeps the lease; other nodes keep writing
-through it.
+through it, and a peer that wants the lease does not pause this node's own
+writes for a backlog that only an operator can drain: a round that ships
+nothing while rows are held or deferred does not renew the handoff pause.
 
 `status.held`:
 
@@ -144,7 +146,8 @@ Discards an inode's held records:
   holder's journal; a replay the namespace no longer admits becomes a
   conflict copy as well. Another node's row is not replayed here (see
   below);
-- the unrecoverable pending uploads are removed.
+- the unrecoverable pending uploads are removed -- except those of a chunk
+  an operation of this node, or a write session, still names (below).
 
 The copies and replays are made by the replay drain within a fraction of
 a second. A copy that cannot be made yet (no reachable holder, for
@@ -161,6 +164,48 @@ speculation — its requester's shadow, or a copy streamed ahead of the
 log — rolls it back when the refusal arrives, and a retry by request id
 is answered refused everywhere. Nothing is lost silently: the copy is
 the artifact.
+
+**A lost chunk an operation still names stays held.** "No pending row" means
+durable to everything that composes or ships a manifest, so the drop does not
+remove the row, the mark and the remote mark of a lost chunk that an
+operation of this node that has not journaled yet still names -- a close
+waiting behind a handoff pause, a forward the holder has not answered, an
+operation parked behind the replay queue, a delegate's parked operation --
+or that an open write session of the file has sealed (a session in a flush
+in flight keeps every lost chunk of the file). Its manifest would otherwise
+ship naming a chunk S3 never received: a permanent `EIO` for every reader,
+the writer told OK, no conflict copy. The command says so ("N lost chunk(s)
+are still named by ... kept held; run drop-held again once they have
+journaled") and the operation that executes later is a seed of the next drop.
+After the drop the node discards each open write session that sealed a lost
+chunk, as a lapsed lock's writes are: its bytes are gone with the chunk, and
+every open description reports `EIO` once at its next close or `fsync`.
+Operations the drop itself rolled back keep nothing held (their rows are the
+seeds). Another node's operation names this node's chunks only through the
+pending list it forwards (`--remote`).
+
+**What the drop tells the rest of the group.** The drop journals one
+`RolledBack` record, the first record of the transaction that carries the
+`Refused` rows, naming each transaction it rolled back as a member keys it
+(the `TailOf` pair if the transaction began with one, else its tenure's
+epoch and first journal sequence). A member that was streamed those
+transactions as committed, or applies the record from a segment, rolls its
+copies back without queueing a replay (this node's queue owns the replay or
+the refusal), and a backup's tail and a member's copy of them become empty
+transactions of the same span, so that no successor re-ships a dropped
+row. Without it the committed copy stayed for good: the member kept the
+dropped write and never quiesced. The record sits ahead of the refusals in the
+journal, so a holder that dies mid-drop leaves a successor with the record or
+with none of the drop's effects.
+
+**A drop on a node that has been deposed.** `repair drop-held` can run on a
+node that lost the lease meanwhile (suspended past its seal; the command
+runs on resume). Its refusals are fenced and never ship, so the refused
+entry in its queue does not make its conflict copy at once: it settles the
+request id through the sequencer in force first, as a placeholder does
+below. The copy follows when the rid has a refusal in the log; if the
+successor completed the original from its tail, the write survived, the
+entry is forgotten and no copy is made.
 
 ### Another node's rows
 
@@ -198,8 +243,11 @@ keep their replayable copy.
   replay by rid to whoever holds the lease); only the position the retry
   would have taken is not kept.
 - If the retry never comes (the requester is gone, or gave up and settled),
-  after `CONSTELLATION_DROP_HELD_AWAIT_MS` (default twice the lease TTL; the
-  clock stands still while a continuation epoch refuses writes) the
+  after `CONSTELLATION_DROP_HELD_AWAIT_MS` (default the cap: the client
+  deadline minus two settle windows, 60 s at the default TTL, and never more;
+  this node's own operations on the placeholder's keys wait behind it, and
+  must still have their window left when it ends; the clock stands still
+  while a continuation epoch refuses writes) the
   sequencer in force settles the request id: `Refused { rid, ECANCELED }`
   in the log, committed like any refusal, counted in
   `status.ack.await_retry_settled`. The op never takes effect (a late retry

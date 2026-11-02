@@ -2072,6 +2072,21 @@ per generation; the retry executes in the dropped row's place only while the
 dropping node remains the sequencer (after a takeover by another node it runs
 there ungated).
 
+*Oracle exemptions by rid (C2g′ review, 2026-11-01; stated 2026-11-02).* The C2g′ narrowing made three of the oracles above
+exempt specific rids, not kinds of row; nothing else about them is loosened. (1) **I2 (b)**: a rid that `repair drop-held`
+rolled back and left queued with its op (`IdentityLedger::kept`: a row of the group classes whose answer may have left, not
+a placeholder) is counted with the ungated pairs, not judged: its requester, who may never have heard the answer, retries
+by the same rid and is gated behind the entry or answered from its outcome, one execution either way, which the log's
+exactly-once check judges. A placeholder is left out of the union by its kind. (2) **I5, clause (b) (operator action)**
+and **I2c**: a rid the operator's drop rolled back (`DroppedHeld::rolled_back`) is excused from a rollback of its
+acknowledged OK and from the verbatim check only if its effect survives (`oracle::survivors_of_drop`): the log has an
+outcome of the rid, its completion or any refusal of it, the drop's own (`EIO`), or a replay's (the state it was replayed
+on no longer admits it, the existing contract of a refused replay, whose conflict copy keeps what it wrote). A refusal
+counts as surviving because the conflict copy is the artifact. A dropped rid with no outcome in the log is an
+acknowledged effect lost and is judged as before. (3) **The history witness** tries a subset of the tentative ops, only
+over the dropped ones. Seeds 592 and 1864 showed the exemption was right to ask for the outcome: a drop on a deposed node
+left none; the entry now settles the rid first (PROGRESS, "Plan 46 M0.2: the four defects").
+
 ### C3 — Verbatim re-ship; no re-execution of a committed row
 
 **Code** (§5.4, §5.6): `Origin` in the segment envelope

@@ -623,6 +623,21 @@ action on the rids it rolled back only (I5, I2c, the history witness); the
 51 of 2,000 after (43 quiescence; the rest fail the same without the fix and
 are not this work's: PROGRESS).
 
+*Follow-up fixes (M0.2, 2026-11-02; PROGRESS, "Plan 46 M0.2: the four defects of `drop-held` on a backed root"):* the 51 seeds
+the `drop-held-chain-backed` note left open were four defects of the drop, not a takeover. **A (integrity, reachable in
+production)**: the drop removed the pending row of a lost chunk that an operation of the node, or a write session, still
+named, so a manifest naming a chunk S3 never received shipped later; a chunk they name now keeps its row and marks, and the
+engine fails a session that sealed a dropped chunk. **C (I2c)**: a drop run on a node deposed meanwhile made its conflict
+copy with no outcome of the rid in the log; the refused entry now settles the rid through the sequencer in force first
+(C2g's settle, with the dropped code), and makes no copy when the successor completed the original. **B (quiescence)**: a
+committed streamed copy of a dropped row was never retracted at a member, and backups' tails still held it; a new log
+record `RolledBack { idents }`, journaled ahead of the drop's refusals, retracts the member's copy and turns the tails'
+transactions into holes. **D (liveness)**: a round that moved nothing while rows are held or deferred no longer renews the
+handoff pause, which kept the holder's own ops waiting for as long as a peer wanted the lease. **The bound**:
+`drop_held_await` is capped at `acquire_deadline - 2 * settle_window` (60 s, 6 s in the sim), so an own op on a dead
+requester's placeholder's keys succeeds instead of ending in `EIO`. Not drop-held, left as a separate item: seeds 422, 1128
+(history witness under reboots and clock steps).
+
 ### Stage 1 — one stream per node, the rule per configuration (6–10 weeks)
 
 | M | Scope | Deletions | Fail-before | Oracles / sims / scenarios / model | Exit |
