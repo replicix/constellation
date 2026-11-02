@@ -63924,3 +63924,81 @@ re-ships them, because the group that would carry them never held them. The requ
 the rows stay in `member_copy` for ever and `member_copies_drained` flags them. The same shape needs a gated row journaled at the
 very end of a tenure, which a lone `Lone` row (replayed instead) did not have; it belongs to plan 46 M1's configuration lookup.
 
+
+## Oracle I1: a stale lease read, a resumed root (classes B1 and B2; 2026-11-02; plan 43 section 4)
+
+Two real violations were left after the lone-test fix (i1-592). Both answer without a committed row.
+
+### B1: a backup acts on a lease read older than its role
+
+`backup+commit` seed 1373 under `AUTHORITY_SIM_LEASE_READS=0:0:800:1000` (and about 35 seeds of the "root-group: listed backup's tail
+lacks the row" shape). A backup's silence watch reads the lease; the read is served at once and delivered 0.8 to 1 s later. A new holder
+acquires the next epoch and lists the backup meanwhile, appends, and the backup acknowledges. The late read then shows the previous epoch
+(seed 1472: the same epoch at an older version). The same-epoch guard (C1-1) did not cover another epoch, so the catch-all arm of
+`on_takeover_get` took "no longer a listed backup", cleared the role and the tail, and reset the holder cache. The root had counted the
+acknowledgement it was given, answered root-group, and died before it shipped the row: no backup held it, and the seal watch was gone.
+
+Rule: a role's `(epoch, config_version)` comes from an append; a holder sends an epoch only after its acquisition CAS landed and a version
+only after its reconfiguration CAS landed; S3's pair only grows. A read below the role's pair was served before the append was sent and
+says nothing about the current listing: ignored, the watch reads again, nothing noted (`on_takeover_get`, at its top; the same-epoch arm
+is deleted, it is a case of the rule). The observation likewise (`observe_body`: an older pair does not replace the newer body or restart
+`since`; liveness only). Unchanged: a genuinely deposed holder (a read at a later epoch: C1-4's member copy, then discard); removal in the
+same epoch (the read's version is at least the role's and does not list the node); a candidate not listed yet (the read is at the same
+version); the node's own takeover CAS and `None`. The restart probe is issued after the restart, so it is never below the persisted role
+(a test pins it). Two existing tests answered the watch's read with a lease of an older version than the appends had given the role and
+needed its version set to the role's (their intent was an object that lists the node).
+
+Not fixed, liveness only (follow-ups): `note_group_wait_lease` (seal_tail.rs) lets a stale read clear a claim's group wait; the
+`RefreshHolder`/`LearnHolder` holder caches take any read.
+
+### B2: a root resumed from a pause answers alone on a pre-pause directory
+
+`backup+commit` seed 578 (no knob), `long-backup` 1942 (knob), `backup-crash-slow` 1416. A root that was genuinely lone (peers crashed)
+is paused for seconds; the peers restart meanwhile. On waking the driver hands `OwnLag` and then the `Submit` it held; the queued
+`Roster` and `Peers` that show the peers come after. `backup_could_be_had` ran on the links the core held from before the pause and the
+op was answered `Lone` with peer 1 linked. Seed 1416: an ack parked behind a candidate whose bring-up failed inside the `OwnLag` event
+itself, released `Lone` there. A clock-based rule cannot see the lapse: the wait clock moved 1 ms across the pause (the sim models a
+suspend the monotonic clock does not count; a wait-clock age rule fixed 578 only).
+
+Rule: lone needs a directory snapshot taken after the node's last lapse was handed, ordered by counters. `Event::Peers` carries `lapses`,
+the number of `OwnLag` events the driver had handed, read before the snapshot; the core counts the `OwnLag` events it handled
+(`lapses_seen`) against the highest `lapses` of a snapshot (`peers_lapses`); `backup_could_be_had` says a backup could be had while a
+snapshot predates the last lapse and before the first snapshot; `refresh_backup_eligibility` runs again after `OwnLag` (the top-of-event
+call runs before the count grows, and 1416 needs the raise inside that event). A snapshot taken during the lapse carries the count before
+it and does not restore lone. P2P off, no budget, no backups: lone as before. Daemon: the count and a `Notify` live in `OffCore`;
+`hand_lag` counts before it steps and wakes `peer_links_task` after, which takes a snapshot at once. The FUSE fast path answers from the
+published `lone_ok` between events, and a frozen process wakes its FUSE threads before its driver: `lone_ok` reads false while the lag
+probe reports a lapse the driver has not stepped the core on (`SessionState::set_lone_guard`), so a row journaled `Lone` meanwhile takes
+the D5 in-doubt path through the core. The sim's fast path runs on the driver loop, so the sim does not exercise that guard (an engine
+test does). Roster lag stays as it was: a peer linked but not yet in the roster (the registry poll) is uncounted (the i1fix choice; out of
+scope).
+
+### Tests
+
+Fail-before on main: core `a_lease_read_of_an_older_epoch_does_not_discard_the_tail`,
+`a_lease_read_of_an_older_version_that_lists_the_node_does_not_seal`, `a_stale_read_of_an_older_epoch_does_not_set_back_the_observation`,
+`a_root_is_not_lone_across_its_own_lapse_until_a_later_directory`, `a_candidate_lost_in_the_lapse_event_does_not_release_a_parked_ack_lone`,
+`a_root_is_not_lone_before_its_first_directory`; engine `a_lapse_handed_to_the_core_wakes_the_directory_task_with_its_count`,
+`a_lone_row_is_in_doubt_while_a_lapse_is_not_handed_to_the_core`. Pass on both: the restart probe, and the existing singleton tests.
+Sim pins (`+commit`, all fail on main): B1 backup 1373, 1472, backup-crash 52, 156, 334, 366, 1727 (knob); B2 backup 578,
+long-backup 1942 (knob), backup-crash-slow 1416.
+
+### Sweeps (2,000 seeds; 1,000 for backup-crash-slow), I1 count (uncommitted answers), main to fix, no knob / knob
+
+backup 2 to 0 / 2 to 0; backup-crash 0 to 0 / 5 to 0; long-backup 0 to 0 / 6 to 0; backup-two 2 to 0 / 12 to 0; backup-strict 0 to 0 /
+2 to 0; backup-hot 0 to 0 / 3 to 0; delegated-holder-cut 0 to 0 / 8 to 0; backup-crash-slow 0 to 0 / 1 to 0; placement-hot 9 to 9 / 11 to
+9; long-delegated-backup 7 to 7 / 16 to 6; flex, flex-crash, long-delegated 0 to 0. With `+commit` the failing seeds go from 1 [578] /
+2 (backup), 0 / 5 (backup-crash), 0 / 5 (long-backup), 1 / 12 (backup-two), 0 / 2, 0 / 3, 0 / 8 to none in any of them; placement-hot
+(7 / 8 on main, 7 / 6 on the fix) and backup-crash-slow seed 840 (member copy, known, separate) are unchanged apart from placement-hot
+819 and 967 (knob), which pass now; no seed fails on the fix that did not fail on main. With `AUTHORITY_SIM_BEATS=thread`: backup
+578 and 581 (knob) fail on main and pass; backup-crash-slow 541 (member copy, the 840 shape) fails on both.
+
+### Cost of the rule: a singleton waits for the archive after a lapse
+
+Latency only, and only after a lapse the driver reports: until a snapshot taken after the lapse arrives (immediate in the daemon with the
+nudge, else the next 1 s tick; the sim's ticker is 500 ms) plus one housekeeping pass (50 ms). Lone answers over 2,000 seeds (no `+commit`,
+no knob), main to fix: backup 257 to 251, backup-crash 1,346 to 1,339, backup-two 305 to 299, long-backup 2,080 to 2,071,
+backup-crash-slow 535 to 532; flex 43,761 to 43,751. A single node with eight random faults (300 seeds, 24,190 answers): 24,190 lone on
+main, 24,053 on the fix; the 137 answers that waited had a p50 of 38 ms, p99 357 ms and a maximum of 367 ms (the sim's 500 ms ticker; the
+daemon's is a round trip). A root's own ack wait on `backup` over 1,000 seeds: 13,361 waits, p50 18 ms, p99 184 ms on main, the same
+distribution on the fix (13,368 waits; p99 184 ms; max 2,895 ms both); `backup-crash-slow`: p99 290 ms both.

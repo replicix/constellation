@@ -413,6 +413,22 @@ in the code, in PROGRESS and in failure messages.
   with `CONSTELLATION_BACKUPS=2` there is one, and `permit_allows` lets
   the new backup seal and claim on that object without the rows the old
   set acknowledged) — C6 fixes it, with its fail-before.
+
+  *As landed (oracle I1, classes B1/B2, 2026-11-02; PROGRESS, "Oracle I1:
+  a stale lease read, a resumed root").* RootGroup also needs the backup to
+  keep its tail. **B1**: a backup ignores a lease read older than its role
+  (`(epoch, config_version)` below the role's, which came from an append the
+  holder sent only after the CAS that made that pair landed; S3's pair only
+  grows): the read says nothing about the current listing, and the catch-all
+  that discarded the tail on it left a counted acknowledgement on no backup's
+  disk (`on_takeover_get`; the observation likewise, `observe_body`). **B2**:
+  Lone needs a directory snapshot taken after the node's own last lapse was
+  handed (`Event::Peers.lapses` against the core's `OwnLag` count): a root
+  resumed from a pause answered alone on the links it held before it, while
+  the snapshots showing the peers that came up meanwhile were queued behind
+  the event that resumed it. A true singleton waits for the archive after a
+  lapse until the next snapshot; the FUSE fast path honours the same rule
+  through a guard on `lone_ok`.
 - **I2 `one_identity_per_op`.** (a) No rid completes more than once in
   the log (today's `check_exactly_once`). (b) At no instant is a rid
   queued for execution in two places: the union of every node's replay

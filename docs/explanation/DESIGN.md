@@ -613,7 +613,13 @@ not measured out of budget counts as one a backup could be had from, whether
 or not its link has yet been up for the stability window or its RTT measured
 (`Core::backup_could_be_had`; the window only paces the choice of a
 candidate). A root with such a peer never answers from its disk alone: it
-waits for the archive, or for the backup it brings up. Its answers to its own
+waits for the archive, or for the backup it brings up. The directory the
+judgement rests on must have been taken after the node's own last lapse (a
+pause, a freeze, a held runtime) was handed to its core: the links it held
+before it stopped cannot show that no peer came up meanwhile, so after a lapse
+even a true singleton waits for the archive until the next snapshot (the
+daemon takes one at once)
+([ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)). Its answers to its own
 node's clients are the one speculation the design keeps. A **non-stealable** authority (an offline designation, a
 continuation epoch's hold) is never replaced while its holder lives. The rows a
 node keeps as a **member copy** of a group it no longer sequences for (a
@@ -849,7 +855,9 @@ chosen per filesystem and topology
 - **`Local`** (Layer A, always, free): the sequencer is lone (no roster
   peer linked within budget, as of the answering event: a peer whose link is
   younger than `CONSTELLATION_BACKUP_STABLE_MS` or whose RTT is not yet
-  measured is a possible backup, not a reason to answer alone). Its own node's op is acknowledged once it is on the
+  measured is a possible backup, not a reason to answer alone; and not on a
+  directory older than the node's own last lapse, nor before the first
+  one). Its own node's op is acknowledged once it is on the
   sequencer's disk, the one speculation a deposition may roll back (it
   replays by rid). Another node's forward is acknowledged once its segment
   is in the log: its row is journaled `Archive`, a deposition keeps it as
