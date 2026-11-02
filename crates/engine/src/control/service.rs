@@ -360,7 +360,11 @@ impl EngineControl {
                     deleg_dropped: stats.deleg_dropped,
                 }
             },
-            held: held::status(&self.meta),
+            held: {
+                let mut status = held::status(&self.meta);
+                status.drop_sessions_deferred = self.engine.drop_sessions_deferred();
+                status
+            },
             session: {
                 let s = self.meta.session().stats();
                 api::SessionStatus {
@@ -1747,6 +1751,7 @@ impl EngineControl {
         // A lost chunk one has sealed keeps its pending row (the drop's
         // "A lost chunk an op still names keeps its row").
         let sessions = self.engine.live_write_sessions(ino);
+        let in_flight_at_start = sessions.in_flight;
         self.sync_tx
             .send(sync::SyncRequest::DropHeld {
                 ino,
@@ -1763,13 +1768,25 @@ impl EngineControl {
         // A session that sealed a chunk the drop gave up on would publish a
         // manifest naming it on its next close: it fails instead (`EIO`
         // once at the next close or `fsync` of each open description).
-        let failed = self
+        let (failed, busy) = self
             .engine
             .fail_write_sessions_naming(ino, &dropped.missing);
+        // A flush in flight had its session detached: the drop kept every
+        // lost chunk for it, and could not discard what it will commit.
+        let in_flight = usize::from(in_flight_at_start);
+        self.engine.note_drop_sessions_deferred(in_flight as u64);
         let mut text = dropped.describe();
         if failed > 0 {
             text.push_str(&format!(
                 "; {failed} open write session(s) naming a lost chunk discarded (EIO at their next close); run drop-held again to release their chunks"
+            ));
+        }
+        if busy + in_flight > 0 {
+            text.push_str(&format!(
+                "; {} write session(s) naming a lost chunk could not be discarded now ({} busy, {} in a flush): their chunks stay held, and the manifest they commit will be held as a seed; run drop-held again",
+                busy + in_flight,
+                busy,
+                in_flight
             ));
         }
         Ok(text)

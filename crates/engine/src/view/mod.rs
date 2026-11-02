@@ -175,6 +175,7 @@ mod vfs_tests;
 #[cfg(test)]
 mod zero_copy_tests;
 
+pub(crate) use flush::SessionFate;
 use kernel_cache::Retired;
 use passthrough::PassthroughHandle;
 use shards::*;

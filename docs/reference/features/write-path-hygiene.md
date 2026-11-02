@@ -121,6 +121,7 @@ nothing while rows are held or deferred does not renew the handoff pause.
 | `oldest_seq` | the oldest held journal sequence |
 | `opaque` | a held transaction was journaled without before-images (a write from before this node held the lease), so its keys are unknown and everything after it is held too |
 | `inodes[]` | each inode with unrecoverable chunks: `ino`, `path`, `missing_chunks` (hex), `seeds` |
+| `drop_sessions_deferred` | open write sessions (or flushes in flight) naming a lost chunk that `repair drop-held` could not discard since start (the file was busy, or a flush had the session detached); their chunks stay held, nothing is lost: run the drop again |
 | `deferred` | transactions waiting (not held) for a chunk still uploading — this node's, or one another node forwarded as pending |
 | `remote[]` | each chunk another node is expected to upload: `ino`, `path`, `node`, `chunk` (hex), `age_s` |
 | `awaiting[]` | each row of another node that `repair drop-held` rolled back and whose answer was never given, waiting for its requester's retry (see below): `node`, `rid`, `age_s`, `keys` |
@@ -179,8 +180,12 @@ are still named by ... kept held; run drop-held again once they have
 journaled") and the operation that executes later is a seed of the next drop.
 After the drop the node discards each open write session that sealed a lost
 chunk, as a lapsed lock's writes are: its bytes are gone with the chunk, and
-every open description reports `EIO` once at its next close or `fsync`.
-Operations the drop itself rolled back keep nothing held (their rows are the
+every open description reports `EIO` once at its next close or `fsync`. A
+session the drop cannot touch at that moment (another thread holds the file's
+operation lock, or a flush has the session detached) is not discarded: the
+command says how many, `status.held.drop_sessions_deferred` counts them, their
+chunks stay held and the manifest they commit is held as a seed of the next
+drop. Operations the drop itself rolled back keep nothing held (their rows are the
 seeds). Another node's operation names this node's chunks only through the
 pending list it forwards (`--remote`).
 

@@ -2189,6 +2189,13 @@ pub struct LogStreamStatus {
 /// Plan 30 §M4: records held back behind unrecoverable pending chunks.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct HeldStatus {
+    /// Open write sessions (and flushes in flight) naming a lost chunk that
+    /// `repair drop-held` could not discard, since start: the file's
+    /// operation lock was busy, or a flush had the session detached. Their
+    /// chunks stay held (nothing is lost; the manifest they commit is held
+    /// as a seed): run the drop again.
+    #[serde(default)]
+    pub drop_sessions_deferred: u64,
     /// Journaled transactions held back (the seeds and everything that
     /// depends on them).
     pub transactions: u64,

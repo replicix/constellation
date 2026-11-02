@@ -217,6 +217,18 @@ fn compose_each<T: Send>(
     Ok(out)
 }
 
+/// What `View::fail_write_session_naming` did to a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionFate {
+    /// None, or one that names none of the lost chunks.
+    Untouched,
+    /// Discarded: `EIO` once per open description.
+    Failed,
+    /// The inode is busy (another thread holds its operation lock): the
+    /// session was not touched, and its chunks stay held.
+    Busy,
+}
+
 impl View {
     pub(super) fn load_manifest(&self, ino: Ino) -> Result<Manifest, Code> {
         match self.meta.manifest(ino) {
@@ -949,12 +961,12 @@ impl View {
         &self,
         ino: Ino,
         lost: &std::collections::BTreeSet<ChunkHash>,
-    ) -> bool {
+    ) -> SessionFate {
         let Some(_op) = self.inode_ops.try_lock(ino) else {
-            return false;
+            return SessionFate::Busy;
         };
         if !self.writes.names_any_of(ino, lost) || !self.discard_lock_writes(ino) {
-            return false;
+            return SessionFate::Untouched;
         }
         self.meta.locks().note_discard(ino);
         tracing::error!(
@@ -962,7 +974,7 @@ impl View {
             "discarded the write session of a file whose chunk `repair drop-held` dropped: \
              the chunk is lost, the bytes cannot be published (EIO)"
         );
-        true
+        SessionFate::Failed
     }
 
     /// Drop `ino`'s unpublished write session: its staged bytes, and the

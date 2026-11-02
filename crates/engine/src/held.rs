@@ -55,6 +55,7 @@ pub fn status(meta: &Meta) -> constellation_control::proto::types::HeldStatus {
         oldest_seq: summary.oldest_seq,
         opaque: summary.opaque,
         deferred: summary.deferred,
+        drop_sessions_deferred: 0,
         remote,
         awaiting,
         inodes: inodes

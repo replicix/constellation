@@ -369,6 +369,8 @@ pub struct Engine {
     /// rotates a static source in place.
     credentials: Arc<CredentialSource>,
     shutdown_started: AtomicBool,
+    /// See [`Self::drop_sessions_deferred`].
+    drop_sessions_deferred: AtomicU64,
     /// Why the shutdown could not ship everything, when it could not.
     shutdown_error: Mutex<Option<String>>,
     /// Plan 31 C8: the host's lifecycle events, applied.
@@ -1824,6 +1826,7 @@ impl Engine {
             views: Mutex::new(HashMap::new()),
             next_view_id: AtomicU64::new(1),
             shutdown_started: AtomicBool::new(false),
+            drop_sessions_deferred: AtomicU64::new(0),
             shutdown_error: Mutex::new(None),
         })
     }
@@ -2197,12 +2200,29 @@ impl Engine {
         &self,
         ino: u64,
         lost: &std::collections::BTreeSet<constellation_fs_core::ChunkHash>,
-    ) -> usize {
-        self.lifecycle
-            .open_views()
-            .iter()
-            .filter(|view| view.fail_write_session_naming(ino, lost))
-            .count()
+    ) -> (usize, usize) {
+        use crate::view::SessionFate;
+        let (mut failed, mut busy) = (0, 0);
+        for view in self.lifecycle.open_views() {
+            match view.fail_write_session_naming(ino, lost) {
+                SessionFate::Failed => failed += 1,
+                SessionFate::Busy => busy += 1,
+                SessionFate::Untouched => {}
+            }
+        }
+        self.drop_sessions_deferred
+            .fetch_add(busy as u64, Ordering::Relaxed);
+        (failed, busy)
+    }
+
+    /// Write sessions (or flushes in flight) `repair drop-held` could not
+    /// discard since start; their lost chunks stay held (`status.held`).
+    pub fn note_drop_sessions_deferred(&self, n: u64) {
+        self.drop_sessions_deferred.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn drop_sessions_deferred(&self) -> u64 {
+        self.drop_sessions_deferred.load(Ordering::Relaxed)
     }
 
     /// Whether [`Self::shutdown`] has begun (new views are refused).

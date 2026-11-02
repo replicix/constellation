@@ -4046,6 +4046,13 @@
           "minimum": 0,
           "type": "integer"
         },
+        "drop_sessions_deferred": {
+          "default": 0,
+          "description": "Open write sessions (and flushes in flight) naming a lost chunk that\n`repair drop-held` could not discard, since start: the file's\noperation lock was busy, or a flush had the session detached. Their\nchunks stay held (nothing is lost; the manifest they commit is held\nas a seed): run the drop again.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "inodes": {
           "description": "Each inode with unrecoverable chunks: `constellation repair\ndrop-held <ino>` discards its held records.",
           "items": {

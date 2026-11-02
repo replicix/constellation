@@ -837,13 +837,23 @@ fn a_reattached_session_naming_a_dropped_chunk_fails_its_next_close() {
 
     // A drop of another chunk touches nothing; of this one, ends the session.
     let other: std::collections::BTreeSet<ChunkHash> = [ChunkHash::of(b"other")].into();
-    assert!(!e.fs.fail_write_session_naming(file, &other));
+    assert_eq!(
+        e.fs.fail_write_session_naming(file, &other),
+        SessionFate::Untouched
+    );
     assert!(e.fs.writes.has_session(file));
     assert_eq!(e.meta.locks().error_seq(file), 0);
     let lost: std::collections::BTreeSet<ChunkHash> = [hash].into();
-    assert!(e.fs.fail_write_session_naming(file, &lost));
+    assert_eq!(
+        e.fs.fail_write_session_naming(file, &lost),
+        SessionFate::Failed
+    );
     assert!(!e.fs.writes.has_session(file), "the session is gone");
-    assert!(!e.fs.fail_write_session_naming(file, &lost), "once");
+    assert_eq!(
+        e.fs.fail_write_session_naming(file, &lost),
+        SessionFate::Untouched,
+        "once"
+    );
 
     // Every description open reports EIO once; nothing was published.
     let seq = e.meta.locks().error_seq(file);
@@ -871,4 +881,40 @@ fn a_session_in_a_flush_keeps_every_lost_chunk_of_its_inode_held() {
     assert!(live.names(&ChunkHash::of(b"any lost chunk of the inode")));
     e.fs.writes.reattach(file, ws);
     assert!(!e.fs.live_write_sessions(file).in_flight);
+}
+
+/// A session the drop cannot touch now (another thread holds the file's
+/// operation lock: a read, a write, a flush's commit) is reported, not
+/// skipped silently: the caller says so and counts it. Nothing is lost -- the
+/// session's chunks stay held, and the manifest it commits is held as a seed.
+#[test]
+fn a_busy_session_naming_a_dropped_chunk_is_reported_not_skipped_silently() {
+    let e = env();
+    let file = e.meta.create(ROOT_INO, "busy2", 0o644, 0, 0).unwrap().ino;
+    let sealed = chunk(b'Q');
+    let hash = ChunkHash::of(&sealed);
+    e.fs.do_write(file, 0, &sealed).unwrap();
+    e.fs.do_write(file, u64::from(CHUNK), b"x").unwrap();
+    let lost: std::collections::BTreeSet<ChunkHash> = [hash].into();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::scope(|scope| {
+        let fs = &e.fs;
+        scope.spawn(move || {
+            let _op = fs.inode_ops.lock(file);
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        locked_rx.recv().unwrap();
+        assert_eq!(
+            e.fs.fail_write_session_naming(file, &lost),
+            SessionFate::Busy
+        );
+        assert!(e.fs.writes.has_session(file), "untouched");
+        release_tx.send(()).unwrap();
+    });
+    assert_eq!(
+        e.fs.fail_write_session_naming(file, &lost),
+        SessionFate::Failed
+    );
 }
