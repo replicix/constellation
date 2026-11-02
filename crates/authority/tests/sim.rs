@@ -368,6 +368,7 @@ fn replay_seed() {
         Ok("delegated-backup-and-delegate-die-abandon") => {
             delegated_backup_and_delegate_die_abandon_config()
         }
+        Ok("delegated-group-switch") => delegated_group_switch_config(),
         Ok("delegated-backup-crash") => delegated_backup_crash_config(),
         Ok("delegated-two-gens-one-backed") => delegated_two_gens_one_backed_config(),
         Ok("delegated-two-gens-backed") => delegated_two_gens_backed_config(),
@@ -5536,6 +5537,7 @@ fn sweep_config() {
         "delegated-backup-and-delegate-die-abandon" => {
             delegated_backup_and_delegate_die_abandon_config()
         }
+        "delegated-group-switch" => delegated_group_switch_config(),
         // Plan 43 C2: the M11 configurations the sweep did not name.
         "delegated-crash" => delegated_crash_config(),
         "delegated-partition" => delegated_partition_config(),
@@ -6609,6 +6611,45 @@ fn delegated_backup_and_delegate_die_abandon_config() -> SimConfig {
     SimConfig {
         abandon_after_ms: Some(5_000),
         ..delegated_backup_and_delegate_die_config()
+    }
+}
+
+/// Plan 46 M0.3 (plan 43 C2h, the coder spec's section 3.3): the backup of
+/// `d1`'s delegate changes and changes back. Four nodes; node 3, the
+/// delegate's first backup, crashes at 1.5 s and returns with its journal at
+/// 5.5 s; node 4 is cut from the delegate for 2 s at 3 s. A delegate counts a
+/// backup only once the `DelegGroup` record naming it is applied, and needs
+/// both versions of the group while a change is pending: no
+/// acknowledgement through a member the applied record does not name
+/// (`strict_commit`, I1), and no acknowledged row lost. I2 is not strict.
+fn delegated_group_switch_config() -> SimConfig {
+    SimConfig {
+        nodes: 4,
+        ops_per_client: 16,
+        cross_ratio: 0.0,
+        dirs: vec!["d1".into()],
+        delegations: vec![("d1".into(), 2)],
+        faults: vec![
+            ScheduledFault {
+                at_ms: 1_500,
+                kind: FaultKind::CrashNode {
+                    node: 3,
+                    restart_ms: Some(4_000),
+                    keep_journal: true,
+                },
+            },
+            ScheduledFault {
+                at_ms: 3_000,
+                kind: FaultKind::Partition {
+                    a: 2,
+                    b: 4,
+                    for_ms: 2_000,
+                },
+            },
+        ],
+        strict_commit: true,
+        strict_settle: true,
+        ..delegated_backup_config()
     }
 }
 
@@ -8485,6 +8526,29 @@ fn delegated_no_backup_root_near_acknowledges_through_the_root() {
         waited += c0_count(&r.acks_by_class, "deleg-group");
     }
     assert!(waited > 0, "no delegate answer waited for the root");
+}
+
+/// Plan 46 M0.3 (the coder spec's section 3.3): `d1`'s delegate loses its
+/// backup and gains another, and the first returns. The group's record
+/// changes at least twice, and no answer rests on a member the applied
+/// record does not name. (Seeds 234, 488, 615, 1049, 1084, 1170 and 1488 of
+/// the 2,000 fail on `08a2fe8e`: PROGRESS, "Plan 43 C2h"; the range here is
+/// the one before the first of them.)
+#[test]
+fn delegated_group_switch_acknowledges_only_through_the_recorded_group() {
+    let mut records = 0u64;
+    for seed in 0..200u64 {
+        let r = c0_run(
+            "delegated-group-switch",
+            seed,
+            delegated_group_switch_config(),
+        );
+        records += r.stats.values().map(|s| s.deleg_group_records).sum::<u64>();
+    }
+    assert!(
+        records > 400,
+        "the group's record barely changed: {records}"
+    );
 }
 
 /// Plan 43 C2e (Q1, strict): the delegate and its backup die for good; the
