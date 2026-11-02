@@ -64748,11 +64748,22 @@ the crash 1.25 s in, before the seal: the 1.1 to 1.3 s class of the test's comme
 2924 (no rebuild any more) for 3036; `regression_a_delegate_taking_the_root_over_re_appends_its_rows` adds 39, the only seed of 0..100 that
 re-appends where 15, 311 and 590 no longer do.
 
-Sim suite (release): 353 passed, 1 failed, 12 ignored. The failure is the M0.3 ratchet, which A moves, and which is **not raised**:
-`delegated-holder-cut` 54 unsettled EIOs with a sequencer reachable in seeds 0..100 (ceiling 52 = 48 + margin 4), `placement-hot` 14 (ceiling 12 =
-10 + 2). Over 2,000 seeds the counts of unsettled EIOs of every kind are within 5 % of main's (placement-hot 184 / 202 on main against 175 / 229,
-delegated-holder-cut 920 / 1,882 against 907 / 1,875, no knob / knob): the window of 100 seeds moved with the trajectories, not the class. The
-maintainer decides whether the ceilings follow.
+Rebased onto e7c728fe (the settle fixes S1 to S3, L4, the lowered M0.3 ceilings and L1 are under it): fmt and clippy clean; authority lib 968 and
+`meta_repro` 4, meta 563 (lib and every suite), engine 958, net 137, control 146, harness lib 165; sim suite (release) 354 passed, 3 failed, 13 ignored.
+The three failures are M0.3's, which A moves, and none is raised or re-pinned:
+- `m03_the_configurations_at_zero_violations_stay_there` (seeds 0..100, no knob): `delegated-holder-cut` 24 unsettled EIOs with a sequencer reachable
+  (ceiling 16 = 14 + margin 2; main 14), `placement-hot` 4 (ceiling 2 = 0 + 2; main 0). The 15 strict configurations stay at 0. Every one of them is the
+  classifier's "takeover gate+takeover floor+job": the requester, or the delegate whose op a root in its takeover gate holds, is told `EIO` 3 s after the
+  gate began. `delegated-holder-cut` fails 23 seeds on A (9 14 18 20 27 28 30 36 39 40 42 45 51 53 54 55 56 58 61 63 86 90 92) against 14 on main
+  (9 10 14 18 27 36 45 51 53 54 56 86 90 92); `placement-hot` fails 2, 28 and 64 against none.
+- `m03_the_settle_causes_s1_to_s3_leave_no_unsettled_eio_in_these_seeds`: `+unsettled` fails `delegated-backup` 11 and `delegated-no-backup-root-near` 297 (the
+  node that took the root over, in its gate); the other 12 seeds of the list pass.
+- `settle_before_eio_a_gate_a_renewal_and_a_redirect_loop_leave_no_unsettled_eio`: the same two seeds answer one unsettled `EIO` each.
+
+The maintainer decides whether the ceilings and these pins follow. The 2,000-seed counts below were measured on 055de5f1, before the settle fixes, and are not
+repeated. Sanity sweep on e7c728fe (`+commit`, 1,000 seeds, k0 / k1; main to fix): placement-hot 6 to 0 / 3 to 0; long-delegated-backup 4 to 0 / 2 to 0;
+delegated-backup 1 to 0 / 1 to 0; delegated-no-backup-root-near 7 to 0 / 1 to 0; delegated-group-switch 2 to 0 / 4 to 1. The one seed that fails on A and not on
+main is `delegated-group-switch` k1 113, `I4 unacked_fails_never_lands_late` (a late landing: M0.3's class, as the seeds below).
 
 ### Sweeps (2,000 seeds from 0, `+commit`, main `055de5f1` against the fix, no knob k0 / `AUTHORITY_SIM_LEASE_READS=0:0:800:1000` k1)
 
