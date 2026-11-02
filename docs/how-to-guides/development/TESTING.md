@@ -1930,66 +1930,54 @@ Reproducing these needed two things no scenario had before:
   instead of the shared `env.endpoint`, so that one node's S3 path can
   drop while its peers' stay up.
 
-Bug B scenarios (plan 30 M3a regression tests, in `SCENARIOS`). Every
-node of their rig (`phantom_setup`, shared with the M3b and M6 scenarios
-below) runs with `CONSTELLATION_BACKUPS=0`: the stranding is an unbacked
-holder's. Under load A's backup tick came before the cut; the
-requester's create then either waited for an archive A could not reach
-(a holder still bringing up its backup acknowledges at the archive) and went
-`EIO` at its deadline, or was committed through the backup, which took
-over and re-shipped A's tail, so nothing was stranded — 10 of 10 runs of
-`holder-crash-phantom-new-holder` and `session-ryw-after-holder-kill`
-failed so at load 50 (`takeover-marker-strands-promptly` was pinned
-first):
+Bug B scenarios (plan 30 M3a and M3b regression tests, in `SCENARIOS`;
+**rewritten for plan 43 C2f in plan 46 M0.3**: "the state cannot arise").
+Their rig (`phantom_setup`, shared with the M6 scenario) runs every node
+with `CONSTELLATION_BACKUPS=0`: A is a lone root. Plan 30 had A, with its S3
+cut, acknowledge a forwarded create from memory, so the requester held a
+speculation-log shadow that a takeover then had to strand, roll back and
+replay by rid. Since C2f a lone root answers another node only once the
+archive holds the row, and with its S3 cut it never does: the requester's
+create blocks (`unacked_create`: the create runs in a thread; after 2 s,
+with A's lease valid, it has not returned and the requester's
+`speculation.outstanding` is 0; A is then killed), and no shadow exists to
+strand. The scenarios no longer wait for a rollback; they check that none
+happens (`no_shadow_ever`: `rolled_back`, `stranded_replayed`, `outstanding`
+and `pending_replay` stay zero on the requester) and that the nodes agree on
+`phantom` (`phantom_agreement`: one inode on every node, or absent on every
+node; present whenever the create returned success, since an
+acknowledged create is never lost). The create ends by its deadline, or a
+takeover executes it by rid, so presence is not asserted when it returned an
+error (it is in doubt, and the settle needs a sequencer that can commit).
+They were `holder-crash-phantom-shadow`, `holder-crash-phantom-new-holder`
+and `takeover-marker-strands-promptly`, failing on `main` since C2f.
 
-- **`holder-crash-phantom-shadow`** (third node takes over). Three
-  nodes; A's S3 goes through its own `CountingProxy` switch. A takes the
-  lease, then its S3 is cut — it still acks a forwarded mutation from
-  memory for a few seconds — B's forwarded `create_new("phantom")` lands
-  and is installed on B's replica as a speculation-log shadow
-  (`forward::apply_accepted`) before A is killed. C takes over once A's
-  lease expires. C's first segment strands B's shadow: B rolls it back
-  and replays the create by rid through C. Passes when B and C see
-  `phantom` as the same inode, B's `status.speculation` shows the
-  rollback and the replay (non-vacuity) and no replay conflict, and a
-  fresh node D — mounted after B cleanly unmounts and publishes — sees it
-  too, as the same inode.
-- **`holder-crash-phantom-new-holder`** (the requester takes over). Same
-  stranding, but B itself becomes the next holder. B's takeover gate
-  rolls the shadow back and replays the create locally before B serves
-  anything, so C's `create_new("phantom")` must fail with `EEXIST` (the
-  create B's application was told succeeded is durable), and B, C and a
-  fresh D agree the name exists, as one inode.
+- **`holder-crash-no-phantom-shadow`** (third node takes over). B is the
+  requester; C takes over once A's lease expires. B, C and a fresh node D
+  (mounted after B's clean unmount) agree on `phantom`.
+- **`holder-crash-no-phantom-new-holder`** (the requester takes over). B's
+  own create claims the expired lease; B, C and a fresh D agree, and when
+  the create returned success, C's `create_new("phantom")` is `EEXIST`.
+- **`takeover-marker-no-stranded-shadow`** (the epoch marker, plan 30 M3b).
+  C is the requester. B then takes the expired lease through an op that is
+  *refused* (`rmdir` of a non-empty directory, `ENOTEMPTY`; `mkdir` of an
+  existing name is not used: the kernel can answer `EEXIST` from its dentry
+  cache without calling the daemon), so its own op ships nothing; C's create,
+  still in its lease path, may claim first, and nothing depends on which node
+  does. The first log segment at an epoch newer than A's, read straight from
+  the bucket (`segment_header` decodes the envelope), must be the takeover's
+  marker: no op, only plan 43 C1-4's `TailFollowsThrough { prev_epoch,
+  through: 0 }` (A had no backup and committed nothing unshipped). Nothing is
+  stranded or replayed on C, and B, C and a fresh D agree on `phantom`. All
+  nodes run with `CONSTELLATION_SYNC_IDLE_MAX_MS=1000` and
+  `CONSTELLATION_BACKUPS=0`. With backups on, A takes B as its backup once its
+  backup tick has run; B then seals A's epoch about 1.5 s after the kill, its
+  marker carries a `TailFollows` record (plan 30 §M9) and it re-ships A's
+  tail: another set of scenarios (`holder-publishes-log-prefix-backup`).
+Plan 30 M3b scenarios (in `SCENARIOS`; `deposed-reintegration` above was
+rewritten for the same milestone; the marker scenario is listed with bug B
+above):
 
-Plan 30 M3b scenarios (in `SCENARIOS`; `deposed-reintegration` above
-was rewritten for the same milestone):
-
-- **`takeover-marker-strands-promptly`** (the epoch marker). The bug-B
-  rig again, with C as the requester: C's forwarded
-  `create_new("phantom")` is acked by A from memory (A's S3 cut) and A is
-  killed. B then takes the expired lease through an op that is
-  *refused* — `rmdir` of a non-empty directory, `ENOTEMPTY` — so B's own
-  op ships nothing. (`mkdir` of an existing name is not used: the kernel
-  can answer `EEXIST` from its dentry cache without calling the daemon,
-  so it might never take the lease.) Within 5 s of B's `rmdir`
-  returning, C's `speculation.rolled_back` must rise; only B's epoch
-  marker can cause that. B's `speculation.epoch_markers >= 1`, and the
-  first log segment at an epoch newer than A's, read straight from the
-  bucket (`segment_header` decodes the envelope's `node`, `epoch` and
-  records), must be B's, at B's epoch, and carry no op: only plan 43
-  C1-4's `TailFollowsThrough { prev_epoch: A's, through: 0 }`, which
-  every takeover marker without a tail carries. (The assertion said zero
-  records until the takeover `EIO` fixed with it stopped hiding it.) The
-  stranded create then replays by rid through B exactly once: B, C and a fresh D (after C's clean unmount publishes) see
-  `phantom` as one inode, with no replay conflict. All three nodes run
-  with `CONSTELLATION_SYNC_IDLE_MAX_MS=1000`, so the 5 s bound does not
-  depend on the P2P push alone, and with `CONSTELLATION_BACKUPS=0`. With
-  backups on, A takes B as its backup once its backup tick has run. B
-  then seals A's epoch on its own about 1.5 s after the kill, before its
-  `rmdir`. Its marker carries a `TailFollows` record (plan 30 §M9), and
-  it re-ships A's tail. Before the pin, the scenario failed "1 record(s)"
-  whenever the tick beat the kill: about 2 runs in 5, and 10 of 10 runs
-  at load 40.
 - **`holder-publishes-log-prefix`** (holder publish). Holder A runs a
   paced `mkdir` burst (~200/s, metadata only: no close nudges, no chunk
   uploads) with `CONSTELLATION_SYNC_INTERVAL_MS=50` under 25 ms of
@@ -5095,33 +5083,48 @@ the escape.
 
 **Plan 46 M0.3: I4 strict, and the C2h configurations.** An unsettled `EIO`
 (`Stats::client_unsettled_eio`: the second deadline came and no sequencer had
-answered the settle) is allowed only for an *isolated* requester, one that
-could reach no sequencer for the op during its settle window. The sim decides it
-from its own network and fault state, never from the requester's logs
-(`sim/reach.rs`): the bus records each partition and each node's attach and
-detach, the nodes the spans in which their core handles nothing (`Pause`,
+answered the settle) is allowed only for a requester that had no sequencer to
+reach during its whole settle window; every other one is a violation. The sim
+decides it from its own network and fault state, never from the requester's
+logs (`sim/reach.rs`): the bus records each partition and each node's attach
+and detach, the nodes the spans in which their core handles nothing (`Pause`,
 `Suspend`, `RuntimeLag`, a stalled step), the bucket the cuts of a node's path
-to S3 and every lease body that lands, and each node's core publishes after a
-step what it holds (the lease, a continuation epoch) and its delegation grants.
-A sequencer is *reachable* in a stretch of the window when the requester is
-running and either is one (it holds the lease the latest body names, or an
-epoch, or is the live delegate of the op's keys: the root's table at the
-`EIO`), or its link to one is up and the sequencer is attached, running and in
-force, or the lease can be taken (S3 reachable and the lease released, or run
-out for the claimant: a TTL past the last body, plus the backups' claim grace
-for a lease with backups it is not listed in). A stretch shorter than a round
-trip of its medium (twice the slowest P2P delay; twice the slowest S3 request
-plus the slow lease reads) does not count. The window is the settle's whole
-span, from the arming of the second deadline (at least a settle window). Each
-`EIO` is counted `isolated` or a violation (`Report::unsettled_isolated`,
+to S3, every lease body that lands and every lease GET it serves, and each
+node's core publishes after a step what it holds (the lease, a continuation
+epoch), its delegation grants and what it is busy with; the lease holder's
+delegation table is kept each time it changes (the generation history).
+Three verdicts: *isolated*, *no sequencer in time* and *reachable* (the
+violation).
+
+- **Who owns the op's keys is decided at each instant** of the window from the
+  generation history, not from the table at the `EIO`: while a live generation
+  owns the keys its delegate is the only sequencer (the root redirects or
+  parks the op until the generation's end is recorded, so it does not count);
+  every delegate the keys had during the window counts while its grant lived;
+  keys across generations have no sequencer until the recall is done.
+- **A sequencer counts only if it can commit**: a root with its S3 cut and no
+  backup it can reach cannot commit even a refusal.
+- **A reachable stretch** must last the settle's retry interval plus a P2P
+  round trip.
+- **The lease path** counts as a sequencer only if the claim, as the product
+  implements it, could finish inside the window: the claimant's first read of
+  the latest body (the bucket's lease GETs), a TTL of its own observation (and
+  the backups' claim grace for a lease with backups it is not among), the
+  promise check and the CAS, and, for a lease with a group, a running member it
+  can reach for the group's tail. When no root is in force and no such claim
+  can finish, the requester is allowed under its own label, `no_sequencer_in_time`
+  (counted apart from *isolated*), as is one that reaches nothing.
+
+Each `EIO` is counted `isolated`, `no_sequencer_in_time` or a violation
+(`Report::unsettled_isolated`, `unsettled_no_sequencer_in_time`,
 `unsettled_violations`, the causes in `unsettled_causes`, `SWEEP-UNSETTLED`
-lines naming the rid, the time, the sequencer reached and what its core was busy
-with, `SWEEP-UNSETTLED-CAUSES` per sweep); `strict_unsettled` (variant
+lines naming the rid, the time, the sequencer reached and what its core was
+busy with, `SWEEP-UNSETTLED-CAUSES` per sweep); `strict_unsettled` (variant
 `+unsettled`) fails the run on the first violation. The classifier's unit
-tests are in `reach.rs`; `m03_*` in `sim.rs` pin a violating seed
-(`long-delegated-late-answers` 8), an isolated one (`flex-crash` 383) and the
-two configurations that run strict
-(`delegated-long-delegation-prod`, `delegated-root-gone`). The other in-doubt
+tests are in `reach.rs` (both directions of the ownership rules, the commit
+rule, the floor, the claim's timing and its group); `m03_*` in `sim.rs` pin a
+violating seed (`long-delegated-late-answers` 8), an isolated one
+(`flex-crash` 383) and the configurations that run strict. The other in-doubt
 replies (a wait aborted by a deposition, a policy that does not settle) are
 none of the settle's and are not classified. The counts per configuration are
 in PROGRESS ("Plan 43 C2h").

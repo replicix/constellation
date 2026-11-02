@@ -639,20 +639,31 @@ requester's placeholder's keys succeeds instead of ending in `EIO`. Not drop-hel
 (history witness under reboots and clock steps).
 
 
-*As landed (M0.3, 2026-11-02; PROGRESS, "Plan 43 C2h"):* the sim's I4 is strict in the maintainer's sense (option A, 2026-11-01):
-each unsettled `EIO` is classified from the sim's own network and fault history (`sim/reach.rs`: partitions, nodes attached,
-paused, suspended or stalled, S3 cuts, lease bodies, what each core holds and is busy with), as isolated (no sequencer
-reachable for a round trip during the whole settle window) or a violation, with `strict_unsettled` (`+unsettled`) failing on the
-first violation. 2,000 seeds of every C2 configuration with and without the lease-reads knob: 578 isolated of 28,281; strict only
-on `delegated-long-delegation-prod` and `delegated-root-gone` (zero both ways); the other configurations keep the old mode and
-are listed. The violations are six causes in the product (a root in its takeover gate answering a settle `Busy`; the new root's
-own settle falling to the lease path inside its gate; a delegate's own op held by the root; a redirect loop between root and
-delegate; a local execution parked behind a recall; the lease path needing a TTL) — follow-up fixes, with seeds and lines in
-PROGRESS. New: sim `tloss-two-node` and `delegated-group-switch` (the latter fails 7 of 2,000 seeds, findings), the harness
-`takeover-loss-two-node`, and `bench/commit-rule/RESULTS.md`'s C2 rows. Fail-before: `tloss-two-node` fails I1 on 500 of 500
-seeds on C2c's parent, `delegated-group-switch` on 490 of 500, `takeover-loss-two-node` empties files on the build of the loss in
-4 of 6 seeds. **Deferred, as D9 says: the flex strict flags** stay off until M1.4 (`flex-crash` is also where most isolated
-requesters are: 107 of 4,153 unsettled `EIO`s without the knob). The die/abandon pair is C2e's and swept clean (0 of 2,000 each). The campaign cell that found the loss ×20: 20 of 20 pass.
+*As landed (M0.3, 2026-11-02; PROGRESS, "Plan 43 C2h"):* the sim's I4 classifies each unsettled `EIO` from the sim's own
+network and fault history (`sim/reach.rs`: partitions, nodes attached, paused, suspended or stalled, S3 cuts, lease bodies and
+lease reads, what each core holds and is busy with, the delegation table as it changed): **isolated** (no sequencer reachable
+for a retry interval and a round trip during the whole settle window), **no sequencer in time** (the only way was a lease
+claim that, as the product implements it, could not finish inside the window: its TTL of the claimant's own observation, the
+promise check, the CAS, the group's tail), or a violation. Ownership is decided at each instant from the generation history (the
+root does not count while a live generation owns the keys), and a sequencer counts only if it can commit. `strict_unsettled`
+(`+unsettled`) fails the run on a violation. 2,000 seeds of every C2 configuration with and without the lease-reads knob: of
+28,246 unsettled `EIO`s 16,664 isolated, 121 no sequencer in time and **11,461 violations**.
+
+**The M0.3 exit "I4 strict everywhere" is not met.** Strict mode is a flag of the two configurations with no unsettled `EIO`
+(`delegated-long-delegation-prod`, `delegated-root-gone`) and runs in a ratchet test for twelve more at zero violations without
+the knob; it enforces nothing yet on the 20 configurations where the product still fails to settle. The violations are six
+causes in the product (a root in its takeover gate answering a settle `Busy`; the new root's own settle falling to the lease
+path inside its gate; a delegate's own op held by the root for itself; a redirect loop between root and delegate; a local
+execution parked behind a recall; the lease path's last stretch), with seeds and lines in PROGRESS, and `delegated-group-switch`
+615 and 1170 are real late landings (I4's first clause). **The product fixes for causes 1 to 3 are a gate before M1.** New:
+sim `tloss-two-node` and `delegated-group-switch` (the latter fails 7 of 2,000 seeds: findings, two pinned in an ignored test),
+the harness `takeover-loss-two-node`, the bug-B harness scenarios rewritten as "the state cannot arise" (plan 43 §7.5;
+`takeover-marker-no-stranded-shadow`, `holder-crash-no-phantom-shadow`, `holder-crash-no-phantom-new-holder`), and
+`bench/commit-rule/RESULTS.md`'s C2 rows. Fail-before: `tloss-two-node` fails I1 on 500 of 500 seeds on C2c's parent,
+`delegated-group-switch` on 490 of 500, `takeover-loss-two-node` empties files on the build of the loss in 4 of 6 seeds, the three
+rewritten scenarios fail their first assertion before C2f. **Deferred, as D9 says: the flex strict flags** stay off until M1.4
+(`flex-crash` has 421 isolated and 3,704 violations without the knob). The die/abandon pair is C2e's and swept clean (0 of 2,000
+each). The campaign cell that found the loss ×20: 20 of 20 pass.
 
 ### Stage 1 — one stream per node, the rule per configuration (6–10 weeks)
 
