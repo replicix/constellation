@@ -64348,9 +64348,9 @@ there.
 
 ## Plan 46 M0.3: three product causes of an `EIO` that was not settled first (2026-11-02)
 
-On main 476f0cc8 with the C2h commits (`5d996c6b` and the three after it: the I4 strict classifier, `tloss-two-node`,
-`delegated-group-switch`) applied in a scratch tree, which is where the counts below were taken: the classifier is not on
-main yet. The causes came from the classifier's samples (`+unsettled`), each traced to the line in a seed before it was
+The C2h commits (`5d996c6b` and the three after it: the I4 strict classifier, `tloss-two-node`, `delegated-group-switch`)
+are on main now, and the fixes below are rebased on them. The counts under "Measured" were taken before that, in a scratch
+tree of main 476f0cc8 with the C2h commits applied; the ratchet's counts (below) are on the rebased tree. The causes came from the classifier's samples (`+unsettled`), each traced to the line in a seed before it was
 fixed; the spec is the gate-before-stage-1 list of plan 46 M0.3. S4 (the recall's cut before its read recalls) and S5
 (a gated root recalling another node's generation) are not here. One commit each; fail-before is the test named.
 
@@ -64406,9 +64406,13 @@ fixed; the spec is the gate-before-stage-1 list of plan 46 M0.3. S4 (the recall'
    one): 11 seeds of 7 configurations answer 1 or 2 unsettled `EIO`s on the parent and none now. And
    `a_probe_that_ignores_what_it_reads_is_caught` (the blind lock probe's negative control) is re-pinned: its seeds 236 and 277
    stopped failing (the schedules moved, as before); 21, 290 and 366 of 0 to 400 fail before and after, the clean
-   configuration passing on each. The classifier-based pins (`+unsettled`: `tloss-two-node` 35 and 37,
-   `delegated-group-switch` 15, 51, 615 and 1170 and the rest) cannot be on main until C2h lands; they are one test on
-   top of it.
+   configuration passing on each. With the classifier on main, the strict pins exist:
+   `m03_the_settle_causes_s1_to_s3_leave_no_unsettled_eio_in_these_seeds` runs `+unsettled` on `backup-strict` 27 and 54,
+   `tloss-two-node` 37, `delegated-group-switch` 15, 51, 615 and 1170, `delegated-holder-cut` 6 and 17, `delegated-backup`
+   11 and 129, `delegated-no-backup-root-near` 297, `long-delegated` 1198 and `long-delegated-late-answers` 13: each fails on
+   main's authority sources and passes on the fixes (checked seed by seed). `tloss-two-node` 35, `long-delegated` 178 and
+   `delegated-two-gens-root-crash` 651 are not failing on main under the classifier (the scratch tree's counter saw them), so
+   they stay in the counter test only.
 
 ### Which commit closes which seed (`+unsettled`, classifier tree)
 
@@ -64429,8 +64433,9 @@ fixed; the spec is the gate-before-stage-1 list of plan 46 M0.3. S4 (the recall'
 
 (`delegated-holder-cut` 9 and 14 are the S5 samples: the gated root's own settle, or a node's, on another node's generation; the
 trace of 14 reads `root executes locally ... ownership=Delegated(node 3)` at 15.45 s, the first time the gate can recall it.
-`long-delegated-late-answers` 8, the seed `m03_a_reachable_sequencers_requester_is_not_isolated` pins, is closed by S1 and needs
-another pin: 1 and 23 stay S5 samples.)
+`long-delegated-late-answers` 8, the seed `m03_a_reachable_sequencers_requester_is_not_isolated` pinned, is closed by S1, so
+the test is re-pinned to seed 1 of that configuration: an unsettled `EIO` at 17,119 ms with the root reachable over the whole
+window, in its takeover gate (2, 7, 20, 23 and 31 tell one too). `delegated-holder-cut` 9 and 14 stay S5 samples.)
 
 ### Measured
 
@@ -64475,6 +64480,19 @@ pin here. A third item, **L3** (liveness, for S4): a lost `DelegRecall` is never
 by `deleg_late_renewed`, so the root waits out the grant (952: recalled at 2.899 s, the generation never ended before the
 takeover); S4's `DelegCut` should come with a recall resend on the renewal tick.
 
+**L4** (integrity of the oracle's program order, fixed here: `fix(meta): a generation number the log grants again lifts the void
+a deposed root's unshipped end left`). A root deposed without knowing it grants a generation and journals its end (a recall's
+cut); `Core` voids the generation in the node's session; both rows stay unshipped when the rebuild or the strand path drops
+them, and the log never names the generation. The successor grants the same number afresh (`max_gen() + 1`), here to this
+node, and the void outlives the rollback: `SessionState::deps` drops the new generation's rows, the node's next write names no
+dependency on its own row and the root executes it ahead of the row (`placement-hot` 6239 with the lease-reads knob: the log
+breaks the node's program order; main's 15418 with the knob drops a requester's dependency the same way). A generation
+number is unique in the log, so a grant of it is preceded by no end of it there: applying a `Delegate` record for a voided
+generation lifts the void (`meta/src/replay.rs`, `apply_one`). Lifting a void satisfies no wait; it can only make one (a wait
+on a stale index is a liveness cost, never an early execution). Fail-before (meta, `holder_capture`):
+`a_reused_generation_number_drops_the_void_a_deposed_roots_unshipped_end_left` fails without the lines ("the log's grant is a
+live generation") and passes with them.
+
 I1 counters (plain, main to fix; no knob / knob): `delegated-backup` 2 to 1 and 0 to 1; `long-delegated-backup` 7 to 7 and 6 to 4;
 `long-delegated-late-answers` 3 to 2 and 4 to 2; `placement-hot` 9 to 12 and 9 to 8 (the three more are `deleg-group` rows,
 dga's class). `i4-settled` 0 everywhere; no run fails for a settled `EIO` that landed.
@@ -64499,8 +64517,25 @@ generation), S4, and cause 6.
 `SWEEP-FAILOVER` p50/p90 (plain, main to fix): `backup-strict` 8,181/11,182 to 8,181/11,140 (knob 4,584/13,636 to 4,584/13,059);
 `long-delegated-backup` 2,956/14,019 to 2,454/13,961 (knob 2,832/16,472 to 2,831/16,502).
 
-*Gates.* fmt; `clippy --workspace --all-targets -D warnings`; the authority library (956) and `meta_repro` (4); the release
-simulation suite (314 passed, 0 failed, 12 ignored, with the findings test `delegated_settle_findings_*`, which fails on its four
-seeds as pinned). Meta, engine and control were green with the first measurement and are untouched since. A release build with debug assertions over 10 delegated
-configurations of 1,000 seeds each never reaches the own-client path's `debug_assert` (a gated root knows no generation of its
-tenure).
+### The ratchet on the rebased tree (seeds 0 to 99, no knob; 2026-11-02)
+
+`m03_the_configurations_at_zero_violations_stay_there`, counts on the final tree (violations, allowed unsettled `EIO`s) against
+the ceiling bases it had: `backup-strict` 0, 0 (5, 0); `delegated-backup` 4, 0 (11, 0); `delegated-group-switch` 3, 2 (6, 2);
+`delegated-holder-cut` 14, 2 (48, 0); `delegated-long-delegation` 65, 187 (65, 190); `delegated-no-backup-root-near` 4, 0
+(5, 0); `long-delegated-backup` 23, 6 (52, 5); `long-delegated-late-answers` 25, 4 (63, 7); `placement-hot` 0, 0 (10, 0);
+`flex-crash` 125, 9, `backup-crash` 1, 0 and `delegated-root-crash` 1, 0 unchanged. The ceilings are those counts, with the
+margin the test adds (two or a tenth). The 2,000-seed sweeps (no knob) of the configurations that told zero in 100 seeds:
+`delegated-two-gens-root-crash`, `long-sessions`, `shared-dir-faults` and `tloss-two-node` tell no violation (only allowed
+ones: 2, 1, 1 and 1), so they run strict (`+unsettled`) now, 15 strict configurations. `backup-strict` (11 violations in 7 of
+2,000 seeds), `backup-two` (3 in 2), `delegated-backup-and-delegate-die` and `-abandon` (10 in 9 each), `long-backup` (2 in 1),
+`long-delegated` (4 in 4) and `placement-hot` (72 in 52) still tell some, and stay on ceilings at their counts. 500 seeds of the other configurations on the final tree: the 11 strict ones tell no violation (one allowed
+`delegated-crash` none-in-time); `delegated-backup` 40 in 37 seeds, `delegated-holder-cut` 122 in 108, `delegated-no-backup-root-near`
+45 in 41, `long-delegated-backup` 107 in 90, `long-delegated-late-answers` 162 in 120, `delegated-group-switch` 5 in 2,
+`backup-crash` and `delegated-root-crash` 1, `delegated-long-delegation` 275 and `flex-crash` 817: the open S5, S4 and cause 6
+families, no new one.
+
+*Gates.* (the final tree, with the L4 fix.) fmt; `clippy --workspace --all-targets -D warnings`; the authority library (956) and
+`meta_repro` (4); meta (all suites, `holder_capture` 30 of 30); engine (947 library tests and the integration suites); control
+(146); the harness library (164); the release simulation suite (352 passed, 0 failed, 13 ignored). A release build with debug
+assertions over 10 delegated configurations of 1,000 seeds each never reaches the own-client path's `debug_assert` (a gated root
+knows no generation of its tenure; measured with the settle fixes alone).

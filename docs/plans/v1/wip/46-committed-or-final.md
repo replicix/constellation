@@ -656,7 +656,7 @@ unreachable and **20,566 violations** (the review round counted a generation tha
 
 **The M0.3 exit "I4 strict everywhere" is not met.** Strict mode is a flag of the two configurations with no unsettled `EIO`
 (`delegated-long-delegation-prod`, `delegated-root-gone`) and runs in a ratchet test for more at zero violations without
-the knob (eleven); the 21 configurations where the product still fails to settle are guarded there by ceilings on their violations and on their allowed unsettled `EIO`s. The violations are six
+the knob (fifteen, after the settle fixes: four more passed a 2,000-seed sweep); the 17 configurations where the product still fails to settle are guarded there by ceilings on their violations and on their allowed unsettled `EIO`s. The violations are six
 causes in the product (a root in its takeover gate answering a settle `Busy`; the new root's own settle falling to the lease
 path inside its gate; a delegate's own op held by the root for itself; a redirect loop between root and delegate; a local
 execution parked behind a recall; the lease path's last stretch), with seeds and lines in PROGRESS, and `delegated-group-switch`
@@ -696,7 +696,7 @@ the node's own rows of an ended generation, the `RecallCut` and a later root row
 replica; start at `jobs.rs` where `retired=` is logged and `meta/src/replay.rs` `apply_foreign`; pinned by
 `delegated_settle_findings_l1_replica_divergence_on_a_former_delegate`); stage 2 inherits the I2 class on a stranded replay
 against the requester's re-ask (**L2**, main's `placement-hot` 8557 with the knob), which the removal of the server-side replay
-closes; S4 takes **L3**, the lost `DelegRecall` that is never sent again.
+closes; S4 takes **L3**, the lost `DelegRecall` that is never sent again. **L4**, a void on a generation number that a deposed root's unshipped end left and that the successor's grant reuses (the node's next write then names no dependency on its own row), is fixed in `meta/src/replay.rs` (a `Delegate` record lifts the void). The ratchet's ceilings were lowered to the counts on the rebased tree (`delegated-holder-cut` 48 to 14, `long-delegated-late-answers` 63 to 25, `long-delegated-backup` 52 to 23, `placement-hot` 10 to 0, among others).
 
 ### Stage 1 — one stream per node, the rule per configuration (6–10 weeks)
 
