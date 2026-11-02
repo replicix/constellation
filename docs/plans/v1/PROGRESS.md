@@ -64452,23 +64452,15 @@ for every forward, added five: `long-delegated-late-answers` 952, 1324, 1477, 14
 once an execution is redirected again, and that variant answered a designation under recall `EROFS`. Not repeated here: `backup`,
 `backup-crash`, `flex`, `flex-crash`, measured then with no failing seed.)
 
-1477 is not caused by S3. It is a latent integrity bug of a node that was a delegate, which main shows at other seeds (**L1**),
-and it is a separate fix item. When one applied foreign segment carries the node's own rows of an ended generation (retired in
-that apply), the generation's `RecallCut` and a later root row on the same key (an unlink, or a rename over it), the node's
-replica keeps the effect of its own row: it then serves, executes against and commits a state the log removed. In 1477 the
-segment holds the delegate's own `Create f0` of generation 1, the `RecallCut` and the root's `Rename f2 to f0`, and the node's
-commit 6 "is not the log prefix at 25: inode ... only on the left". The same shape is main's seed 6183 (no knob; `Create f3`,
-the `RecallCut`, the root's `Unlink f3`; commit 6 by node 2 "is not the log prefix at 25: inode ... only on the left"). Main's
-7393 (no knob) is the same `[directory]` class (an unlink that took effect where the spec refuses it) and still fails on the fix,
-with 3228 (no knob, an `Eexist` no state explains) and 4125 (knob, a monotonic-reads violation on the stale `d1/f1`) among the
-seeds 2,000 to 10,000. Start at `jobs.rs` (the apply that logs `retired=`) and `meta/src/replay.rs` `apply_foreign` (the
-own-row retire, or the own-row overlay, runs after, or instead of, the root row that follows it in the same segment); a core or
-meta test fits: a delegate executes `Create x` in generation 1, one segment `[own Create x row, RecallCut, root Unlink x]`
-applies, and `lookup(x)` must be `None`. The first measurement's seeds are the same class seen through the history checker:
-`long-delegated-late-answers` 952 (no knob; traced: the delegate's grant renewal arrives 1.75 s late, it executes `Create d1/f1`
-and refuses it `Eexist` citing the inode of an `f1` its replica still holds, which the root unlinked after the `RecallCut` of
-generation 1, in the one segment it applied), 1324 and 1495 (knob). The pin is
-`delegated_settle_findings_l1_replica_divergence_on_a_former_delegate` (sim, ignored).
+1477 is not caused by S3. It is a latent integrity bug of a node that was a delegate, which main shows at other seeds (**L1**):
+the root's pre-S3 stream install left the delegate's own row ordered after the root rows streamed behind it, so the node's replica
+kept a name the log removed and it then served, executed against and committed that state (1477: commit 6 "is not the log prefix
+at 25"; main's 6183, 7393, 5718 and 9955 the same class, `[directory]` or the log prefix). It is closed (superseded: PROGRESS
+"L1"; the cause is the stream install, not the segment apply). The first measurement's seeds, `long-delegated-late-answers` 952,
+1324 and 1495, are the same class seen through the history checker, and they pass on the fix's tree. 3228 and 7393 (no knob)
+pass with L1 fixed, and 4125 (knob, a monotonic-reads violation on the stale `d1/f1`) is not L1: it stays a separate finding,
+pinned by the ignored `delegated_settle_findings_4125_monotonic_reads_on_a_stale_name` (its own start: whether the root's
+`Create d1/f1` is among the oracle's successes).
 
 The other class the first measurement showed is **L2**, I2 on a stranded replay against the requester's re-ask (`placement-hot`
 655 with the knob; main's 8557 with the knob, `one_identity_per_op`): a delegate or the root accepted an op in one epoch, a
@@ -64539,3 +64531,93 @@ families, no new one.
 (146); the harness library (164); the release simulation suite (352 passed, 0 failed, 13 ignored). A release build with debug
 assertions over 10 delegated configurations of 1,000 seeds each never reaches the own-client path's `debug_assert` (a gated root
 knows no generation of its tenure; measured with the settle fixes alone).
+
+## L1: a former delegate's replica kept a name the log removed (2026-11-02; plan 46 M0.3 finding)
+
+The M0.3 findings listed a replica divergence on a node that had been a delegate: the node refused with `EEXIST`, or committed
+a state that was not the log prefix. It is one integrity bug in the root's pre-S3 stream install, not in the segment apply. Closed.
+
+### Mechanism
+
+1. Node D, the delegate of generation g, executes `create d/x` as its own row `(g, i)`: a `Local` speculation row, with a
+   shadow of D's older than it still outstanding (in the traces D's own forwarded op, gated).
+2. The root appends `(g, i)`, then writes `RecallCut{g}` and its own `unlink d/x` (or a rename of `x`, or a rename over it), and
+   streams all three ahead of S3.
+3. `install_streamed_committed` returned early for the root's append of D's own row (the rid's `completed` row exists) and
+   recorded nothing. D's row stayed a `Local` row, and a `Local` row means "later in the log than anything the stream delivers":
+   `streamed_out_of_place` assumed it, and `row_is_ordered` never counted a `Local` row as ordered. From here it was false.
+4. The stream's `unlink d/x` therefore overlapped a "misplaced" row. `insert_streamed_tx` rolled back from the shadow and redid
+   the own row on top of the unlink: `x` existed again on D's replica (for a rename, the source name came back).
+5. The segment carrying `[own create, RecallCut, ..., unlink]` skips the own rows as own and the streamed rows as confirmed, so
+   no rewind candidate was left; the own row retired with its effect kept. The wrong order was permanent, and the log has no
+   `x`. The failure shows later: `commit .. by node 2 is not the log prefix`, or, once D executes against its replica, a
+   `[directory]` op that took effect in the log but the spec refuses (`ENOENT`), or an `EEXIST` answer from a replica that
+   still has the name.
+
+Without the stream the segment path is right: the own row overlaps, the rewind starts from it and applies the records in log
+order. Without a recall the root writes nothing on a delegated name after D's row, so a former delegate is needed.
+A lost `DelegRecall` and the late ttl-0 refusal that is ignored are a separate liveness item, not this one.
+
+### Fix
+
+- `deleg_streamed:{g} = epoch:idx` (local kv): written in the transaction that installs the stream's delivery of the root's
+  append of D's own row `(g, i)` (only when D holds that row as outstanding journal; raise-only inside an epoch, a newer epoch
+  replaces, an older one is ignored). The two early returns of `install_streamed_committed` commit when they wrote it.
+  `Replica::install_streamed` takes the transaction's `origin`; `backup.rs` passes `tx.origin`.
+- `row_is_ordered_at(row, epoch)`: a `Local` row of g with `idx <= i` and the mark of the same epoch counts as ordered, so
+  `streamed_out_of_place` and `insert_streamed_tx` put later streamed rows after it. The mark is read only for a live `Local`
+  row of a delegate generation, once per generation per decision. Doc of `streamed_out_of_place` corrected.
+- Cleared only by the log's `Recall`/`RecallCut`: in `apply_one`'s durable branches, and in `apply_segment_rows`' recall strand
+  (a record the stream installed first is skipped as confirmed, so `apply_one` never sees it; found by the unit test). Never by
+  the streamed install: the `RecallCut` arrives on the stream between D's own row and the root's `unlink`, and clearing there
+  brings the bug back. Persisted, because a resubscribed stream skips what the replica holds and does not mark again.
+- A `drop-held` rollback of the append leaves a stale mark; benign (after a recall the row strands, and the strand redoes the
+  streamed rows in log order). Takeover strands D's own generations; a successor's re-ship re-marks under its epoch.
+- No DESIGN.md or ADR change: the fix restores §4 "the replica is a log prefix plus explicit speculation" (ADR-19).
+
+### Tests
+
+`crates/meta/tests/former_delegate.rs` (7): own create, `RecallCut`, root `unlink` / rename streamed then one segment (2),
+the same with a restart between the own row and the rest of the stream, the two segment-only controls, a streamed `RecallCut`
+keeps the mark and the log's clears it, a mark of an older epoch orders nothing. On the build before: the two streamed
+variants and the restart variant fail ("the stream's later root row is under the delegate's own row"), the controls pass.
+Sim pin `l1_a_former_delegates_own_row_keeps_its_log_place`: `long-delegated-late-answers` 3228, 6183 and 7393, and with
+`SLOW_LEASE_READS` 1477, 5718 and 9955; all six pass on the fix. Which fail before depends on the base, through `run_seed`:
+on 055de5f1 (before the settle fixes) 6183 (`not the log prefix` at 25, inode `0x10000000801` only on the left), 7393, 5718
+and 9955 (`[directory]` took effect in the log, refused by the spec); on 5adad3a4 (the base of this branch) 1477 (`not the log
+prefix` at 25), 3228 (`[directory]` `Create d1/f2` returned `Eexist`) and 7393 (`[directory]` `Unlink d1/f1` took effect in
+the log, refused by the spec), while 6183, 5718 and 9955 pass there and stay as regression seeds.
+
+### Sweeps (2,000 seeds; measured on main 055de5f1 against the fix, before the rebase onto 5adad3a4; release sim; with and without `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`)
+
+Plain and `+commit` on `long-delegated-late-answers`, `placement-hot`, `long-delegated`, `delegated-holder-cut`,
+`delegated-backup`, `long-delegated-backup`, `delegated-group-switch`, `backup`, `backup-crash`, and
+`long-delegated-late-answers` over 2000..10000 (plain, both ways). **No seed fails on the fix that passes on main.**
+
+| config | main failing | fix failing |
+|---|---|---|
+| `long-delegated-late-answers` 2000..10000, no knob | 4947, 6183, 7393 | 4947 |
+| `long-delegated-late-answers` 2000..10000, knob | 5718, 9610, 9955 | 9610 |
+| every other sweep | identical sets on both trees (all zero in plain mode except `delegated-group-switch`: 7 and 11 seeds, the known I1 sets) | same |
+
+The `+commit` failures (`placement-hot` 7 / 6, `long-delegated-backup` 6 / 6, `long-delegated-late-answers` 3 / 3,
+`delegated-backup` 2 / 2, `delegated-group-switch` 7 / 11, no knob / knob) are the same seeds on both trees. 4947 (causal cut) and
+9610 (marker without its data, after a clock step and a crash) are not L1. Failover (`SWEEP-FAILOVER`, simulated time to the
+first acknowledged mutation) is identical on both trees: `long-delegated-backup+commit` 1175 crashes, p50 2800 ms, p90 14019 ms
+(knob: 1127, 2826, 16472); `long-delegated-late-answers+commit` 1213, 2856, 13882 (knob: 1161, 3220, 16341). The stream install gains one
+KV write on the delegate and, per streamed transaction of a delegate generation, one `journal_origin` seek on every subscriber.
+`delegate_stream_perf` (`--ignored`, release, three runs each) does not exercise the stream install and is unchanged: 3.83 / 3.83 / 3.84 s
+on the fix, 3.84 / 3.87 / 3.88 s on main. No existing bench covers it; the cost is the per-transaction seek above.
+
+### Not L1
+
+`long-delegated-late-answers` 4125 on the settle-fix tree (monotonic reads): its recall segments carry own rows *below* the
+confirmed streamed rows and the fix does not change it. Tracked on its own. 4947 and 9610 above stay open as before.
+
+### Gates
+
+On the rebased tree (5adad3a4 plus the fix): `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`
+clean. meta (all suites) ok, lib 381 passed, 9 ignored; authority lib 956 passed, 2 ignored; release sim suite 353 passed, 0 failed,
+13 ignored (the M0.3 ratchet `m03_the_configurations_without_an_unsettled_eio_run_strict` unchanged, no ceiling touched).
+`--ignored delegated_settle_findings_4125` still fails (not L1). On 055de5f1, before the rebase: meta 561 passed (lib 383),
+authority lib 938, engine 947, control 146, harness lib 165, sim suite 351 passed, 12 ignored.

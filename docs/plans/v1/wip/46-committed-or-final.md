@@ -691,12 +691,25 @@ not held. Unsettled-EIO violations over 1,000 seeds, `+unsettled`, before and af
 and S5 (a settle on another node's generation inside a gate: the gate builds no generation state until it opens), and
 cause 6, the maintainer's open decision. Not here: S4, S5, the strict flags (`strict_unsettled` goes on where both ways
 reach 0). The plain sweeps (2,000 seeds, both modes) add one failing seed on the fix, `long-delegated-late-answers` 1477 with the
-knob, a latent replica divergence of a former delegate that main shows at 6183 and 7393 (PROGRESS, **L1**: a segment that carries
-the node's own rows of an ended generation, the `RecallCut` and a later root row on the same key leaves the own row's effect in the
-replica; start at `jobs.rs` where `retired=` is logged and `meta/src/replay.rs` `apply_foreign`; pinned by
-`delegated_settle_findings_l1_replica_divergence_on_a_former_delegate`); stage 2 inherits the I2 class on a stranded replay
+knob, a latent replica divergence of a former delegate that main shows at 6183 and 7393 (PROGRESS, **L1**, closed: the cause is
+the root's pre-S3 stream install, see the paragraph after this one; 4125 with the knob is not L1 and stays a separate finding);
+stage 2 inherits the I2 class on a stranded replay
 against the requester's re-ask (**L2**, main's `placement-hot` 8557 with the knob), which the removal of the server-side replay
 closes; S4 takes **L3**, the lost `DelegRecall` that is never sent again. **L4**, a void on a generation number that a deposed root's unshipped end left and that the successor's grant reuses (the node's next write then names no dependency on its own row), is fixed in `meta/src/replay.rs` (a `Delegate` record lifts the void). The ratchet's ceilings were lowered to the counts on the rebased tree (`delegated-holder-cut` 48 to 14, `long-delegated-late-answers` 63 to 25, `long-delegated-backup` 52 to 23, `placement-hot` 10 to 0, among others).
+
+*L1 closed (2026-11-02; PROGRESS, "L1"):* the replica divergence on a former delegate was one integrity bug in the root's pre-S3
+stream install: the early return for the root's append of the delegate's own row recorded nothing, and the delegate's `Local`
+row then counted as later in the log than the root rows streamed after it (own `create x`, `RecallCut`, the root's `unlink x`:
+`x` came back). Fixed by a persisted per-generation mark `deleg_streamed:{g} = epoch:idx` set when the stream delivers the
+append of the own row `(g, i)`: the generation's `Local` rows at or below `i`, same epoch, are ordered ahead of later streamed
+rows (`row_is_ordered_at`); cleared by the log's `Recall`/`RecallCut`, never by a streamed one. Pinned by `former_delegate.rs`
+and the sim pin `l1_a_former_delegates_own_row_keeps_its_log_place` (seeds 3228, 6183, 7393 no knob; 1477, 5718, 9955 knob);
+2,000-seed sweeps of nine configurations plus `long-delegated-late-answers` 2000..10000, measured on 055de5f1 before the rebase: no
+seed fails on the fix that passes on main. **M1.2 must carry the rule.** With one stream per node, a delegate's own
+row and then a root row on the released subtree can still be streamed ahead, so the mark is keyed by the node's stream
+generation, set when the stream delivers the append of the node's own row, and cleared by the durable record that ends the
+stream's `Local` rows (`DelegateNodeEnded`, and `SubtreeReleased` for what it releases), never by the streamed install of
+that record (it arrives between the own row and the later root row). The lost-recall liveness item (L3) stays a separate item.
 
 ### Stage 1 — one stream per node, the rule per configuration (6–10 weeks)
 
