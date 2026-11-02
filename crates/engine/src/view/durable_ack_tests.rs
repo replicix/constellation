@@ -1687,6 +1687,81 @@ fn the_delegates_fast_path_answers_a_lone_row_and_a_committed_row_at_once() {
     assert_eq!(h.delegates.executed(), 2);
 }
 
+/// I1 class 2 for the delegate: a process resumed from a freeze runs its
+/// FUSE threads before its driver can hand the core the lapse. The class the
+/// core published (`Lone`) was judged on links older than the lapse: while
+/// the probe reports a lapse the driver has not stepped on, the delegate's
+/// fast path journals the row `DelegGroup` and waits for the group like a
+/// gated row (in doubt through the core at the wait's budget, D5); once the
+/// lapse is handed, the published word stands. Fails on the parent: the row
+/// was journaled `Lone` and answered at once on this disk.
+#[test]
+fn a_delegates_lone_row_waits_for_its_group_while_a_lapse_is_not_handed_to_the_core() {
+    use constellation_meta::RowClass;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (fs, meta, dir, _tmp, mut core) = delegate_fs(RowClass::Lone, 0);
+    let h = fs.sync.as_ref().unwrap();
+    let session = meta.session();
+    let off = Arc::new(crate::authority_driver::OffCore::new(5_000));
+    {
+        let off = off.clone();
+        session.set_lone_guard(Arc::new(move || {
+            off.lapse_unhanded(crate::authority_driver::wait_now_ms())
+        }));
+    }
+    let (stop, submitted) = (AtomicBool::new(false), Mutex::new(Vec::new()));
+    let (op2, rid2) = delegate_create(dir, 2);
+    std::thread::scope(|scope| {
+        let responder = scope.spawn(|| core_answering_in_doubt(&mut core, &stop, &submitted));
+        // No lapse: journaled `Lone`, answered at once.
+        let (op, rid) = delegate_create(dir, 1);
+        assert!(fs.mutate_op_rebasable_with_rid(h, dir, &op, rid).is_ok());
+        assert_eq!(
+            meta.journal_tx_class(meta.journal_tip().unwrap()).unwrap(),
+            Some(RowClass::Lone)
+        );
+        // The process was frozen: the probe's tick is overdue by seconds.
+        let now = crate::authority_driver::wait_now_ms();
+        off.note_probe(now, 3_000);
+        let write = scope.spawn(|| fs.mutate_op_rebasable_with_rid(h, dir, &op2, rid2));
+        let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            journaled_stream_row(&meta, 2);
+            assert_eq!(
+                meta.journal_tx_class(meta.journal_tip().unwrap()).unwrap(),
+                Some(RowClass::DelegGroup),
+                "journaled for the group"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!write.is_finished(), "answered alone on a stale judgement");
+            // The group holds the stream through the row.
+            session.set_deleg_durable(
+                DELEG_GEN,
+                Some(constellation_meta::DelegDurable {
+                    class: RowClass::Lone,
+                    through: 2,
+                    horizon: u64::MAX,
+                    lost: false,
+                }),
+            );
+        }));
+        let result = write.join().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        responder.join().unwrap();
+        if let Err(e) = checked {
+            std::panic::resume_unwind(e);
+        }
+        assert!(result.is_ok());
+        // The driver hands the lapse: the published word stands again.
+        off.lapse_stepped(now);
+        assert_eq!(session.deleg_row_class(DELEG_GEN), Some(RowClass::Lone));
+    });
+    assert!(
+        submitted.lock().unwrap().is_empty(),
+        "the write went through the core"
+    );
+    assert_eq!(session.stats().fast_acks_waited, 1);
+}
+
 /// A generation the core stops publishing (ended here), or one it marks
 /// lost, is not an answer: the op is in doubt and goes back through the
 /// core under its rid, which answers from the row's commit.

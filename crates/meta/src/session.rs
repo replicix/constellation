@@ -1579,13 +1579,32 @@ impl SessionState {
     /// Plan 43 C2d: the class a delegate's fast-path row of `gen` is
     /// journaled with now; `None`: the core has not published the
     /// generation (the op goes through the core).
+    ///
+    /// I1 class 2: a published `Lone` is `DelegGroup` while the guard
+    /// ([`Self::set_lone_guard`]) says this node has a lapse its core has
+    /// not been handed: the class was judged on links older than the lapse.
     pub fn deleg_row_class(&self, gen: u64) -> Option<RowClass> {
-        self.inner
+        let class = self
+            .inner
             .lock()
             .unwrap()
             .deleg_durable
             .get(&gen)
-            .map(|d| d.class)
+            .map(|d| d.class)?;
+        Some(self.guarded(class))
+    }
+
+    /// `Lone` is not a class to journal under while this node has a lapse
+    /// its core has not been handed ([`Self::set_lone_guard`]): the row
+    /// waits for the group like a `DelegGroup` one, and goes in doubt
+    /// through the core (D5) at the wait's budget. The guard reads atomics
+    /// only, and only a `Lone` class asks it.
+    fn guarded(&self, class: RowClass) -> RowClass {
+        if class == RowClass::Lone && self.lone_guard.get().is_some_and(|guard| guard()) {
+            RowClass::DelegGroup
+        } else {
+            class
+        }
     }
 
     /// The highest stream index of `gen` the core published as committed
@@ -1614,7 +1633,7 @@ impl SessionState {
             self.note_lone_demoted(idx > horizon);
             return Some(RowClass::DelegGroup);
         }
-        Some(class)
+        Some(self.guarded(class))
     }
 
     /// Plan 43 C2d: the delegate fast path's wait for its group. The op
@@ -1677,7 +1696,9 @@ impl SessionState {
     /// before it; its FUSE threads run before its driver can hand the lapse
     /// and a newer directory, and must not answer on the disk alone then. A
     /// row journaled `Lone` meanwhile waits like a gated one and takes the
-    /// in-doubt path through the core (D5).
+    /// in-doubt path through the core (D5). The same holds for a delegate's
+    /// fast path: a `Lone` class it has published is `DelegGroup` while the
+    /// guard fires ([`Self::deleg_row_class`], [`Self::deleg_row_class_at`]).
     ///
     /// Set once (the first guard stays), read on every fast-path operation
     /// without a lock; the guard must not take one either
@@ -2162,6 +2183,56 @@ mod tests {
             s.deleg_row_class_at(7, 99, 99),
             Some(RowClass::NonStealable)
         );
+    }
+
+    /// I1 class 2 for the delegate's fast path: with `Lone` published and
+    /// the lone guard firing (a lapse the core has not been handed), the
+    /// class a row is journaled with is `DelegGroup`, by the row's place too;
+    /// a class that waits is never changed, and the word stands again when
+    /// the guard clears. Fails before: `Lone` throughout.
+    #[test]
+    fn a_published_lone_class_is_a_group_class_while_the_lone_guard_fires() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let s = SessionState::default();
+        let lapse = Arc::new(AtomicBool::new(false));
+        {
+            let lapse = lapse.clone();
+            s.set_lone_guard(Arc::new(move || lapse.load(Ordering::Relaxed)));
+        }
+        s.set_deleg_durable(
+            7,
+            Some(DelegDurable {
+                class: RowClass::Lone,
+                through: 10,
+                horizon: 14,
+                lost: false,
+            }),
+        );
+        assert_eq!(s.deleg_row_class(7), Some(RowClass::Lone));
+        assert_eq!(s.deleg_row_class_at(7, 12, 0), Some(RowClass::Lone));
+        lapse.store(true, Ordering::Relaxed);
+        assert_eq!(s.deleg_row_class(7), Some(RowClass::DelegGroup));
+        assert_eq!(s.deleg_row_class_at(7, 12, 0), Some(RowClass::DelegGroup));
+        assert_eq!(s.deleg_row_class_at(8, 1, 0), None, "not published");
+        lapse.store(false, Ordering::Relaxed);
+        assert_eq!(s.deleg_row_class(7), Some(RowClass::Lone));
+        assert_eq!(s.deleg_row_class_at(7, 12, 0), Some(RowClass::Lone));
+        // The classes that wait or never answer from the disk are untouched.
+        lapse.store(true, Ordering::Relaxed);
+        for class in [RowClass::DelegGroup, RowClass::NonStealable] {
+            s.set_deleg_durable(
+                7,
+                Some(DelegDurable {
+                    class,
+                    through: 10,
+                    horizon: 14,
+                    lost: false,
+                }),
+            );
+            assert_eq!(s.deleg_row_class(7), Some(class));
+            assert_eq!(s.deleg_row_class_at(7, 12, 0), Some(class));
+        }
     }
 
     /// Plan 43 C1-2: the class the core publishes with the gate is what the
