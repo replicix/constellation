@@ -147,7 +147,8 @@ pub trait Process: Send + Sync {
     /// Ask `thread` (of this process) to write its backtrace to stderr
     /// (after [`Process::enable_backtraces`]). A diagnostic: the capture
     /// in the handler allocates, which is fine for a thread parked in a
-    /// futex wait, not for one inside the allocator.
+    /// futex wait, not for one inside the allocator (a process thawed after
+    /// a `SIGSTOP` has such threads: the heap is corrupted).
     fn request_backtrace(&self, thread: ThreadRef) -> io::Result<()>;
 
     /// Arrange for the child `cmd` spawns to be sent `SIGTERM` when its

@@ -227,9 +227,13 @@ static BACKTRACE_LABEL: OnceLock<&'static str> = OnceLock::new();
 
 /// Install the `SIGUSR2` handler that writes the receiving thread's
 /// backtrace to stderr (the daemon log). Not async-signal-safe in the
-/// strict sense (the capture allocates); a diagnostic for a stalled
-/// thread, which sits in a futex wait, never inside the allocator.
-/// `SIGUSR2` is used by nothing else in the daemon.
+/// strict sense (the capture allocates): it is safe only for a thread parked
+/// in a futex wait. A stalled thread is not always one: a process that was
+/// stopped (`SIGSTOP`) and thawed has threads stalled inside `malloc`, and the
+/// handler then corrupts the heap (`double free or corruption`, seen when a
+/// harness scenario thawed a frozen daemon). A diagnostic to leave off for
+/// anything that freezes a daemon. `SIGUSR2` is used by nothing else in the
+/// daemon.
 pub(crate) fn enable_backtraces(label: &'static str, tid: fn() -> u64) -> io::Result<()> {
     static TID: OnceLock<fn() -> u64> = OnceLock::new();
     static INSTALLED: OnceLock<io::Result<()>> = OnceLock::new();
