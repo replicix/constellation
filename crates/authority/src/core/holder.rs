@@ -187,11 +187,22 @@ impl Core {
             }
             return;
         }
+        // Plan 46 M0.3 (S1): a settle on a key this node's takeover gate owns
+        // is answered by the gate (below), not held for a grant that never
+        // comes: the gate ends a generation delegated to this node itself.
+        let gate_settle = if settle && req != OpId(0) {
+            self.gate_settle(&op, replica)
+        } else {
+            None
+        };
         // Plan 30 §M12: the table names this node the owner (a range or
         // a subtree just delegated) but the grant is not installed yet:
         // the requester retries here in a moment rather than bouncing
         // between the root and this node until its redirects run out.
-        if self.cfg.delegation && req != OpId(0) && self.lease.ship_epoch(now, &self.cfg).is_none()
+        if self.cfg.delegation
+            && req != OpId(0)
+            && gate_settle.is_none()
+            && self.lease.ship_epoch(now, &self.cfg).is_none()
         {
             if let Ownership::Delegated(d) = replica.resolve_ownership(&keys_of_op_in(&op, replica))
             {
@@ -223,7 +234,48 @@ impl Core {
         let mut base = None;
         let mut position = Position::ZERO;
         let mut fresh = None;
-        let outcome = if self.lease.fenced() {
+        let outcome = if let Some(plan) = gate_settle {
+            match plan {
+                GateSettle::Held => {
+                    // The marker, the tail's apply and the strand are still
+                    // running: the requester retries without spending an
+                    // attempt (a `Busy` would send it to the lease path).
+                    self.stats.gate_settles_held += 1;
+                    MutateOutcome::Held {
+                        retry_ms: self.cfg.recall_hold_ms.max(50),
+                    }
+                }
+                GateSettle::Answer(_) if took_effect_here(replica, rid) => {
+                    // An acceptance may not leave before the quarantine (M8:
+                    // a predecessor's read delegate may still serve the old
+                    // state), and an `Abandoned` never for an op that ran.
+                    self.stats.gate_settles_held_executed += 1;
+                    MutateOutcome::Held {
+                        retry_ms: self.cfg.recall_hold_ms.max(50),
+                    }
+                }
+                GateSettle::Answer(epoch) => {
+                    self.stats.gate_settles_answered += 1;
+                    base = self.reply_base(&op, replica);
+                    let (outcome, _) = self.holder_execute(
+                        now,
+                        epoch,
+                        rid,
+                        &op,
+                        &tag,
+                        (self.asker_of(from), true),
+                        replica,
+                        out,
+                    );
+                    position = Position {
+                        seq: self.ship.head_seq,
+                        pending: replica.journal_position(epoch),
+                        streams: Default::default(),
+                    };
+                    outcome
+                }
+            }
+        } else if self.lease.fenced() {
             if !self.lease.releasing && req != OpId(0) && self.readopting() {
                 // A-1: the gate of a re-adoption started for a forward;
                 // the requester keeps retrying (a `Busy` would spend its
@@ -1143,5 +1195,67 @@ impl Core {
         }
         self.stream_note_hint(seq);
         self.nudge(now, out);
+    }
+}
+
+/// What a takeover gate does with a settle of a rid on keys it owns
+/// ([`Core::gate_settle`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GateSettle {
+    /// The gate's journal work is not done: the requester retries.
+    Held,
+    /// The journal work is done: answered under this epoch (the rid's
+    /// outcome, or a settle refusal; never an acceptance).
+    Answer(Epoch),
+}
+
+/// Whether `rid` took effect on this replica (a recorded outcome, or an
+/// executed completion in the log or the journal): never settled
+/// `Abandoned`.
+pub(crate) fn took_effect_here(replica: &dyn Replica, rid: Rid) -> bool {
+    replica.recent_outcome(rid).is_some()
+        || matches!(
+            replica.completed_outcome(rid).ok().flatten(),
+            Some(constellation_meta::CompletedOutcome::Executed { .. })
+        )
+}
+
+impl Core {
+    /// Plan 46 M0.3 (S1): what this node's takeover gate does with a settle
+    /// of an op on `op`'s keys, or `None` when the settle is not the gate's
+    /// to answer (it takes the ordinary route: `Busy` while fenced).
+    ///
+    /// The gate keeps the view closed for the read quarantine and the drain
+    /// (12 to 20 s) long after its journal work is done
+    /// ([`PendingGate::shippable`]): the marker landed, the predecessor's
+    /// tail is applied, this node's own delegate rows are re-appended and the
+    /// stranded replays have run. From then on every copy of an op that
+    /// executes nowhere before the gate opens is refused by a refusal that
+    /// dedups it (an older epoch's inbox batch, a queued replay, a retry, a
+    /// park), so a settle can be answered at once on the keys this node
+    /// owns: the root's (`Root`), and its own generations' (`Delegated` to
+    /// this node, or a cross-subtree op whose every generation is this
+    /// node's: the gate ends such a generation at the cursor with nothing to
+    /// wait for, `delegation_sync`). Another node's generation is not, until
+    /// the gate can recall it.
+    ///
+    /// A usable lease the gate is not releasing: a lost or released one is
+    /// no sequencer.
+    pub(crate) fn gate_settle(&self, op: &MutateOp, replica: &dyn Replica) -> Option<GateSettle> {
+        let g = self.lease.gate.as_ref()?;
+        if self.lease.held.is_none() || self.lease.lost || self.lease.releasing {
+            return None;
+        }
+        let me = self.cfg.node_id;
+        let ours = match replica.resolve_ownership(&keys_of_op_in(op, replica)) {
+            Ownership::Root => true,
+            Ownership::Delegated(d) => d.node == me,
+            Ownership::CrossSubtree { involved, .. } => involved.iter().all(|d| d.node == me),
+        };
+        ours.then_some(if g.shippable {
+            GateSettle::Answer(g.epoch)
+        } else {
+            GateSettle::Held
+        })
     }
 }

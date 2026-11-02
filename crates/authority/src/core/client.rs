@@ -3475,6 +3475,29 @@ impl Core {
             self.finish(now, rid, outcome, replica, out);
             return;
         }
+        // Plan 46 M0.3 (S1): this node's own settle, the root in a takeover
+        // gate whose journal work is done: the gate keeps the view closed
+        // (`new_mutation_epoch`) but answers a settle on the keys it owns
+        // (`Core::gate_settle`) — as it answers another node's — instead of
+        // routing it in a loop with this node as the holder. A rid that took
+        // effect is not answered here before the quarantine: it goes on
+        // retrying.
+        if let Some(super::holder::GateSettle::Answer(epoch)) = self.gate_settle(&op, replica) {
+            if !super::holder::took_effect_here(replica, rid) {
+                // (The gate's keys are the root's and this node's own
+                // generations', which the gate ends: no generation of
+                // another node is known here to recall.)
+                debug_assert!(
+                    !self.deleg_known(),
+                    "a gated root knows a generation of its own tenure"
+                );
+                self.stats.gate_settles_answered += 1;
+                let outcome = self.resolve_in_doubt_then_execute(now, rid, epoch, replica, out);
+                self.finish(now, rid, outcome, replica, out);
+                return;
+            }
+            self.stats.gate_settles_held_executed += 1;
+        }
         if let Some(c) = self.clients.get_mut(&rid) {
             c.phase = Phase::Backoff;
         }

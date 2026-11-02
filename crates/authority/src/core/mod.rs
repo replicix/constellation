@@ -1494,6 +1494,14 @@ pub struct Stats {
     /// and unexecuted parks of a rid's earlier attempt a settle dropped.
     pub settles_refused: u64,
     pub settle_dropped_parks: u64,
+    /// Plan 46 M0.3 (S1): settles a takeover gate answered on the keys it
+    /// owns (a refusal journaled, or a dedup'd outcome), settles it left
+    /// `Held` because its journal work was not done yet, and settles of a
+    /// rid that took effect, left `Held` (never `Accepted` before the
+    /// quarantine).
+    pub gate_settles_answered: u64,
+    pub gate_settles_held: u64,
+    pub gate_settles_held_executed: u64,
     /// Plan 43 C2 (§5.3 item 5), as a requester: ops whose own attempts
     /// reached their deadline and that were settled — settles sent (one per
     /// op, however many attempts it takes), answered `Abandoned`, answered

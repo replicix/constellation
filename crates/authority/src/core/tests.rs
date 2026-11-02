@@ -50418,6 +50418,269 @@ mod c2g_settle {
         ));
         assert_eq!(h.core.stats.settles_refused, 1);
     }
+
+    // ---- plan 46 M0.3: a takeover gate whose journal work is done answers settles ----
+
+    /// A root (node 1) in a takeover gate at epoch 2: the marker landed and
+    /// the tail and the stranded replays are journaled (`shippable`), only the
+    /// read quarantine and the drain keep the view closed.
+    fn gated_root(shippable: bool) -> Harness {
+        let mut h = Harness::new(1);
+        h.hold(
+            2,
+            Some(PendingGate {
+                epoch: 2,
+                takeover: true,
+                marker_shipped: true,
+                drained: false,
+                fast_prev: false,
+                backup_tail_epoch: None,
+                shippable,
+            }),
+        );
+        h
+    }
+
+    /// Whatever node 3's request `req` was answered, `Busy` and `Held`
+    /// included.
+    fn reply_to_3(out: &[Action], req: u64) -> Option<MutateOutcome> {
+        sends(out).into_iter().find_map(|(to, m)| match m {
+            PeerMsg::MutateReply {
+                req: r, outcome, ..
+            } if to == 3 && *r == OpId(req) => Some(outcome.clone()),
+            _ => None,
+        })
+    }
+
+    fn abandoned_row(h: &Harness, rid: Rid) -> bool {
+        matches!(
+            h.meta.completed_outcome(rid),
+            Ok(Some(constellation_meta::CompletedOutcome::Refused { code }))
+                if code == crate::ABANDONED_CODE
+        )
+    }
+
+    /// S1: a takeover gate whose journal work is done answers a settle of a
+    /// rid on a key it owns that it has no outcome for: `Refused { rid,
+    /// ABANDONED_CODE }`, journaled, answered once the row has shipped (the
+    /// class is the archive's: no backup is formed in the gate). Fails on the
+    /// parent: `Busy`, until the gate opened and the requester's retries ran
+    /// out (backup-strict seed 27).
+    #[test]
+    fn a_gated_root_refuses_an_unknown_rids_settle_and_answers_once_it_ships() {
+        let mut h = gated_root(true);
+        let op = h.create("s");
+        let out = h.step(request(7, 1, op, true));
+        assert_eq!(
+            reply_to_3(&out, 7),
+            None,
+            "answered before the refusal shipped: {out:?}"
+        );
+        assert!(abandoned_row(&h, rid3(1)), "no refusal journaled: {out:?}");
+        assert_eq!(
+            h.meta.journal_classes_of_rid(rid3(1)).unwrap(),
+            vec![constellation_meta::RowClass::Archive]
+        );
+        assert_eq!(h.core.stats.settles_refused, 1);
+        assert_eq!(h.core.stats.gate_settles_answered, 1);
+        let out = h.archive_lands();
+        assert_eq!(
+            answer(&out, 7),
+            Some((MutateOutcome::Abandoned, true)),
+            "{out:?}"
+        );
+        assert!(h.meta.lookup(ROOT_INO, "s").unwrap().is_none());
+        // The same settle again: the refusal is the outcome, nothing new.
+        let out = h.step_archived(request(8, 1, h.create("s"), true));
+        assert_eq!(answer(&out, 8).map(|a| a.0), Some(MutateOutcome::Abandoned));
+        assert_eq!(h.core.stats.settles_refused, 1);
+    }
+
+    /// S1: a rid that took effect (its row is in the tail the gate applied)
+    /// is never answered `Abandoned` and never `Accepted` before the
+    /// quarantine: `Held`, the requester retries without spending attempts,
+    /// and no row is journaled. Fails on the parent: `Busy`.
+    #[test]
+    fn a_gated_root_holds_a_settle_of_a_rid_that_took_effect() {
+        let mut h = gated_root(true);
+        let op = h.create("x");
+        constellation_meta::execute_mutate(&h.meta, &op, Some(rid3(1))).unwrap();
+        assert!(matches!(
+            h.meta.completed_outcome(rid3(1)),
+            Ok(Some(constellation_meta::CompletedOutcome::Executed { .. }))
+        ));
+        let journaled = h.core.stats.refusals_journaled;
+        let out = h.step_archived(request(7, 1, op, true));
+        assert_eq!(
+            reply_to_3(&out, 7),
+            Some(MutateOutcome::Held {
+                retry_ms: h.core.cfg.recall_hold_ms.max(50)
+            }),
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.gate_settles_held_executed, 1);
+        assert_eq!(h.core.stats.refusals_journaled, journaled);
+        assert!(!abandoned_row(&h, rid3(1)));
+        assert_eq!(h.core.stats.settles_refused, 0);
+    }
+
+    /// S1: before the gate's journal work is done (the marker, the tail's
+    /// apply and the strand are running) a settle waits: `Held`, no row.
+    /// Fails on the parent: `Busy`.
+    #[test]
+    fn a_gated_root_holds_a_settle_until_its_journal_work_is_done() {
+        let mut h = gated_root(false);
+        let out = h.step_archived(request(7, 1, h.create("s"), true));
+        assert!(
+            matches!(reply_to_3(&out, 7), Some(MutateOutcome::Held { .. })),
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.gate_settles_held, 1);
+        assert_eq!(h.meta.completed_outcome(rid3(1)).unwrap(), None);
+        assert_eq!(h.core.stats.settles_refused, 0);
+    }
+
+    /// S1: an older epoch's inbox batch that carries the settled rid, drained
+    /// after the quarantine, finds the refusal: the op is not executed.
+    /// Fails on the parent: the settle was not answered, and the drain ran
+    /// the op.
+    #[test]
+    fn the_inbox_drain_after_a_gated_settle_dedups_to_the_refusal() {
+        let mut h = gated_root(true);
+        let op = h.create("i");
+        let out = h.step_archived(request(7, 1, op.clone(), true));
+        assert_eq!(answer(&out, 7).map(|a| a.0), Some(MutateOutcome::Abandoned));
+        let mut out = Vec::new();
+        h.core
+            .inbox_drain(h.clk(), vec![inbox_batch(3, 0, 1, &op)], &h.meta, &mut out)
+            .unwrap();
+        assert!(
+            h.meta.lookup(ROOT_INO, "i").unwrap().is_none(),
+            "the drained copy executed"
+        );
+        assert!(abandoned_row(&h, rid3(1)));
+    }
+
+    /// S1: this node's own client settling its op, the root in its own
+    /// shippable gate (`new_mutation_epoch` is closed): the refusal is
+    /// journaled here and answered once it ships, not routed in a loop with
+    /// this node as the holder (tloss-two-node seed 35). Fails on the
+    /// parent: no refusal, no answer.
+    #[test]
+    fn a_gated_roots_own_settle_is_refused_locally_and_answered_once_it_ships() {
+        let mut h = Harness::new(1);
+        h.core.lease.cached_holder = Some(2);
+        let rid = h.rid(1);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: h.create("own"),
+            tag: Default::default(),
+        });
+        assert!(
+            sends(&out).iter().any(|(to, _)| *to == 2),
+            "forwarded: {out:?}"
+        );
+        // The op is lost on the way; this node takes the lease over and its
+        // gate's journal work is done.
+        h.hold(
+            2,
+            Some(PendingGate {
+                epoch: 2,
+                takeover: true,
+                marker_shipped: true,
+                drained: false,
+                fast_prev: false,
+                backup_tail_epoch: None,
+                shippable: true,
+            }),
+        );
+        h.core.ack.peers.clear();
+        h.core.ack.candidate = None;
+        h.core.ack.eligible = Some(false);
+        let deadline = h.core.clients[&rid].deadline;
+        let out = h.step(Event::Timer { id: deadline });
+        assert!(
+            replies(&out).is_empty(),
+            "answered before it shipped: {out:?}"
+        );
+        assert!(abandoned_row(&h, rid), "no local refusal: {out:?}");
+        let out = h.archive_lands();
+        assert!(
+            out.iter().any(|a| matches!(
+                a,
+                Action::Reply {
+                    rid: r,
+                    reply: ClientReply::Outcome(MutateOutcome::Abandoned),
+                    ..
+                } if *r == rid
+            )),
+            "{out:?}"
+        );
+        assert!(h.meta.lookup(ROOT_INO, "own").unwrap().is_none());
+    }
+
+    /// S1: a deposition before the refusal shipped answers the parked settle
+    /// `Busy`, never `Abandoned` (the row rolls back unless it shipped, and
+    /// then the successor dedups to it). Fails on the parent: nothing was
+    /// journaled or parked.
+    #[test]
+    fn a_gated_roots_deposition_aborts_an_unshipped_settle_busy() {
+        let mut h = gated_root(true);
+        let out = h.step(request(7, 1, h.create("s"), true));
+        assert_eq!(reply_to_3(&out, 7), None, "{out:?}");
+        assert!(abandoned_row(&h, rid3(1)), "no refusal journaled: {out:?}");
+        let mut out = Vec::new();
+        assert_eq!(h.core.abort_durable_parks(h.clk(), &h.meta, &mut out), 1);
+        assert_eq!(reply_to_3(&out, 7), Some(MutateOutcome::Busy), "{out:?}");
+    }
+
+    /// S1 (a control until S5): a settle of a rid whose keys belong to
+    /// another node's generation is not this node's to answer in its gate:
+    /// still `Busy`, nothing journaled.
+    #[test]
+    fn a_gated_root_still_bounces_a_settle_on_another_nodes_generation() {
+        let mut h = gated_root(true);
+        let dir = delegated_to_me(&h.meta, 4);
+        let ino = h.meta.allocate_ino(dir).unwrap();
+        let op = MutateOp::Create {
+            parent: dir,
+            name: "o".into(),
+            ino,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let out = h.step_archived(request(7, 1, op, true));
+        assert_eq!(reply_to_3(&out, 7), Some(MutateOutcome::Busy), "{out:?}");
+        assert_eq!(h.meta.completed_outcome(rid3(1)).unwrap(), None);
+    }
+
+    /// S1: a generation delegated to this node itself — the predecessor
+    /// delegated to the node that now takes over, and the gate ends the
+    /// generation at the cursor — is the gate's own to settle. Fails on the
+    /// parent: `Held` (the grant "is not installed yet").
+    #[test]
+    fn a_gated_root_settles_a_rid_on_a_generation_delegated_to_itself() {
+        let mut h = gated_root(true);
+        let dir = delegated_to_me(&h.meta, 1);
+        let ino = h.meta.allocate_ino(dir).unwrap();
+        let op = MutateOp::Create {
+            parent: dir,
+            name: "g".into(),
+            ino,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let out = h.step_archived(request(7, 1, op, true));
+        assert_eq!(
+            answer(&out, 7).map(|a| a.0),
+            Some(MutateOutcome::Abandoned),
+            "{out:?}"
+        );
+        assert!(h.meta.lookup(dir, "g").unwrap().is_none());
+    }
 }
 
 /// Plan 43 C2f follow-up: `repair reintegrate` on a node whose deposition
