@@ -63907,3 +63907,20 @@ main p50/p90/p99/p99.9/max 1181/4415/7687/10887/19378, fix 1182/4445/7641/8689/1
 `repair drop-held` in the prototype's schedule) passes on the rebased tree too, and its signature (a successor's segment naming a
 chunk the drop cleared) is the latent hole main shows on seeds 1476 and 1851 before the drop-held series; `long-backup` 84 was the
 re-tag above.
+
+### Seeds that moved, and a finding
+
+The lone-test change moves the first moments of every backed tenure, so seeds that pinned a planted-bug control or a path were
+re-pinned (the sim suite fails seven tests on the rebased tree before it, all green on main): `a_credited_arrival_cap_splits`
+(195339, 202316 to 195424, 202419), the naive stale-mirror control (76, 98, 113, 318 to 12, 18, 20, 43), the blind probe (79 to 236,
+277), the proof dated at the return (54, 373, 828 to 193, 247, 277, 871), `c2_a_settled_eio_never_lands_late` (75 to 76),
+`a_delegating_root_cut...` (1614 out, 1616 and 1617 in), and `c1_a_committed_rid_is_queued_on_one_node_only` (backup-crash 858 out).
+
+**Finding (not fixed here): a member copy no archive carries.** backup-crash seed 858 (`+unclocked+identity`, one seed of 2,000; main
+passes it): node 1 takes the lease over at epoch 2, is paused, and the takeover's gate drain finally runs the inbox ops at t=8986;
+a claimant takes the lease at epoch 3 a few ms later and fetches the epoch-1 group tail. The refusals node 1 journaled in that
+drain are tagged `RootGroup` (a peer is linked, so the rows are gated); the deposed node keeps them as a member copy, and nothing
+re-ships them, because the group that would carry them never held them. The requesters retry by rid and the effects are not lost;
+the rows stay in `member_copy` for ever and `member_copies_drained` flags them. The same shape needs a gated row journaled at the
+very end of a tenure, which a lone `Lone` row (replayed instead) did not have; it belongs to plan 46 M1's configuration lookup.
+
