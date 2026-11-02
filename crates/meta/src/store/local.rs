@@ -960,6 +960,15 @@ impl Meta {
             .and_then(|v| v.parse::<u64>().ok()))
     }
 
+    /// L1: the `(epoch, idx)` of generation `gen`'s newest own row whose root
+    /// append the pre-S3 stream delivered here ([`deleg_streamed_key`]);
+    /// `None` when there is none, or after the log's `Recall`/`RecallCut`
+    /// of the generation (never after a streamed one).
+    pub fn deleg_streamed(&self, gen: u64) -> Result<Option<(u64, u64)>, MetaError> {
+        let r = self.db.read_tx();
+        deleg_streamed_tx(&r, &self.local, gen)
+    }
+
     /// Path B: the generations not in `live` whose transactions this
     /// journal still holds (a delegation origin, unshipped) and whose end
     /// this replica has not applied from the log ([`Meta::void_cut`]: no
@@ -2806,6 +2815,74 @@ pub(crate) fn deleg_log_idx_key(gen: u64) -> String {
 /// then what the replica holds of it from the log (`deleg_log_idx_key`).
 pub(crate) fn deleg_void_cut_key(gen: u64) -> String {
     format!("deleg_void_cut:{gen}")
+}
+
+/// `local` kv: `epoch:idx`, the newest index of generation `gen` whose
+/// root append the pre-S3 stream of root epoch `epoch` delivered here
+/// while this node, the generation's delegate, still held the transaction
+/// as its own `Local` row (L1). In that tenure's log such a row is earlier
+/// than every transaction the stream delivers after it, so a streamed
+/// transaction installed in its log place goes after it, not under it
+/// (`spec::row_is_ordered_at`).
+fn deleg_streamed_key(gen: u64) -> String {
+    format!("deleg_streamed:{gen}")
+}
+
+/// What [`deleg_streamed_key`] holds for `gen`: `(epoch, idx)`.
+pub(crate) fn deleg_streamed_tx(
+    r: &impl Readable,
+    local: &SingleWriterTxKeyspace,
+    gen: u64,
+) -> Result<Option<(u64, u64)>, MetaError> {
+    Ok(
+        kv_get_tx(r, local, &deleg_streamed_key(gen))?.and_then(|v| {
+            let (e, i) = v.split_once(':')?;
+            Some((e.parse().ok()?, i.parse().ok()?))
+        }),
+    )
+}
+
+/// The generation `gen` ended in the log: its [`deleg_streamed_key`] goes.
+pub(crate) fn clear_deleg_streamed_tx(
+    tx: &mut SingleWriterWriteTx,
+    local: &SingleWriterTxKeyspace,
+    gen: u64,
+) {
+    tx.remove(local, deleg_streamed_key(gen).into_bytes());
+}
+
+/// The root's stream of epoch `epoch` delivered its append of delegation
+/// origin `(gen, idx)`: if this node holds that transaction as its own
+/// outstanding `Local` row, raise [`deleg_streamed_key`] to it. True when
+/// it wrote.
+pub(crate) fn note_deleg_streamed_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    epoch: u64,
+    (gen, idx): (u64, u64),
+) -> Result<bool, MetaError> {
+    if gen == 0 {
+        return Ok(false);
+    }
+    let held = match journal_origins_from(&*tx, meta, gen, idx)?.next() {
+        Some(row) => row?.0 == idx,
+        None => false,
+    };
+    if !held {
+        return Ok(false);
+    }
+    match deleg_streamed_tx(&*tx, &meta.local, gen)? {
+        Some((e, _)) if e > epoch => return Ok(false),
+        Some((e, i)) if e == epoch && i >= idx => return Ok(false),
+        _ => {}
+    }
+    kv_set_tx(
+        tx,
+        &meta.local,
+        &deleg_streamed_key(gen),
+        &format!("{epoch}:{idx}"),
+    );
+    Ok(true)
 }
 
 /// `local` kv: the boot on which this node, the delegate of `gen`, was

@@ -904,6 +904,7 @@ fn apply_one(
                 // the replica's own head, a delegate's unappended rows in it.)
                 let log = crate::store::local::bump_void_cut_at_log_idx_tx(tx, &meta.local, *gen)?;
                 meta.session().note_void_cut(*gen, log);
+                crate::store::local::clear_deleg_streamed_tx(tx, &meta.local, *gen);
             }
             Ok(Applied::Done)
         }
@@ -928,6 +929,11 @@ fn apply_one(
                 meta.session().void_stream(*gen, *through);
                 meta.session().note_void_cut(*gen, *through);
                 crate::store::local::bump_void_cut_tx(tx, &meta.local, *gen, *through)?;
+                // L1: none of the generation's `Local` rows outlives this
+                // segment (appended ones retire with it, the rest strand).
+                // Not from the stream: its `RecallCut` arrives between the
+                // delegate's own row and the root's rows after it.
+                crate::store::local::clear_deleg_streamed_tx(tx, &meta.local, *gen);
             }
             Ok(Applied::Done)
         }

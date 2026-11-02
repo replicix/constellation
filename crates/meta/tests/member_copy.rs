@@ -214,7 +214,7 @@ fn a_tail_origin_retires_a_streamed_entry() {
     apply_rows(&reference, 1, 2, 3, &[1, 2, 3], &reship);
 
     let meta = Meta::open_in_memory().unwrap();
-    meta.install_streamed_committed(1, HOLDER, 1, 2, &tx1, true)
+    meta.install_streamed_committed(1, HOLDER, 1, 2, &tx1, true, (0, 0))
         .unwrap();
     assert!(meta.has_outstanding_speculation());
     // A marker of the successor: the entry is not stranded by it.
@@ -292,6 +292,7 @@ fn the_takeover_gate_supersedes_a_committed_entry_without_queueing() {
             6,
             &[create("c", ino(3), 12), completed(rid(3))],
             true,
+            (0, 0),
         )
         .unwrap();
         let stranded = meta.strand_for_takeover(2, &[], abandoned).unwrap();
@@ -387,7 +388,7 @@ fn a_rebuild_retires_a_committed_streamed_entry_the_log_carries() {
     ];
     for (epoch, recs) in [(1u64, tx1.clone()), (2, reship)] {
         let meta = Meta::open_in_memory().unwrap();
-        meta.install_streamed_committed(1, HOLDER, 1, 1, &tx1, true)
+        meta.install_streamed_committed(1, HOLDER, 1, 1, &tx1, true, (0, 0))
             .unwrap();
         let side = Meta::open_in_memory().unwrap();
         apply_rows(&side, 1, epoch, 1, &[1], &recs);
@@ -401,7 +402,7 @@ fn a_rebuild_retires_a_committed_streamed_entry_the_log_carries() {
     }
     // Not carried (the log stops before it): re-installed, as before.
     let meta = Meta::open_in_memory().unwrap();
-    meta.install_streamed_committed(1, HOLDER, 2, 2, &tx1, true)
+    meta.install_streamed_committed(1, HOLDER, 2, 2, &tx1, true, (0, 0))
         .unwrap();
     let side = Meta::open_in_memory().unwrap();
     apply_rows(&side, 1, 1, 1, &[1], &[create("b", ino(2), 9)]);
@@ -558,7 +559,7 @@ fn a_committed_stream_entry_retires_by_its_rid_without_a_tail_identity() {
         let reference = Meta::open_in_memory().unwrap();
         apply_rows(&reference, 1, 2, rows.len() as u64, &rows, &tx1);
         let meta = Meta::open_in_memory().unwrap();
-        meta.install_streamed_committed(1, HOLDER, 5, 4 + tx1.len() as u64, &tx1, true)
+        meta.install_streamed_committed(1, HOLDER, 5, 4 + tx1.len() as u64, &tx1, true, (0, 0))
             .unwrap();
         apply_rows(&meta, 1, 2, 0, &[], &[]);
         assert!(meta.has_outstanding_speculation(), "refusal {refusal}");
@@ -832,7 +833,7 @@ fn a_streamed_committed_row_named_by_rolled_back_is_retracted() {
         create("a", ino(1), 10),
         completed(rid(1)),
     ];
-    meta.install_streamed_committed(2, HOLDER, 1, 3, &reship, true)
+    meta.install_streamed_committed(2, HOLDER, 1, 3, &reship, true, (0, 0))
         .unwrap();
     assert!(meta.has_outstanding_speculation());
     // Its member copy of epoch 1, and a row of the same copy nobody rolled back.
@@ -905,9 +906,9 @@ fn a_streamed_rolled_back_record_retracts_committed_and_own_entries() {
     let meta = Meta::open_in_memory().unwrap();
     let a = vec![create("a", ino(1), 10), completed(rid(1))];
     let b = vec![create("b", ino(2), 11), completed(rid(2))];
-    meta.install_streamed_committed(1, HOLDER, 1, 2, &a, true)
+    meta.install_streamed_committed(1, HOLDER, 1, 2, &a, true, (0, 0))
         .unwrap();
-    meta.install_streamed_committed(1, HOLDER, 3, 4, &b, false)
+    meta.install_streamed_committed(1, HOLDER, 3, 4, &b, false, (0, 0))
         .unwrap();
     // Node 2's own op (a shadow its reply installed), adopted by the stream.
     let c = vec![create("c", ino(3), 12), completed(rid(3))];
@@ -921,7 +922,7 @@ fn a_streamed_rolled_back_record_retracts_committed_and_own_entries() {
         true,
     )
     .unwrap();
-    meta.install_streamed_committed(1, HOLDER, 5, 6, &c, true)
+    meta.install_streamed_committed(1, HOLDER, 5, 6, &c, true, (0, 0))
         .unwrap();
     assert!(meta.has_outstanding_speculation());
 
@@ -934,7 +935,7 @@ fn a_streamed_rolled_back_record_retracts_committed_and_own_entries() {
             code: constellation_types::Code::Io,
         },
     ];
-    meta.install_streamed_committed(1, HOLDER, 7, 8, &drop_tx, true)
+    meta.install_streamed_committed(1, HOLDER, 7, 8, &drop_tx, true, (0, 0))
         .unwrap();
     for name in ["a", "b", "c"] {
         assert!(meta.lookup(ROOT_INO, name).unwrap().is_none(), "{name}");
@@ -945,7 +946,7 @@ fn a_streamed_rolled_back_record_retracts_committed_and_own_entries() {
         meta.pending_replays().unwrap()
     );
     // Only the record's own transaction is left outstanding.
-    meta.install_streamed_committed(1, HOLDER, 9, 10, &[create("d", ino(4), 14)], true)
+    meta.install_streamed_committed(1, HOLDER, 9, 10, &[create("d", ino(4), 14)], true, (0, 0))
         .unwrap();
     assert!(meta.lookup(ROOT_INO, "d").unwrap().is_some());
 }
@@ -1020,7 +1021,7 @@ fn an_uncommitted_rolled_back_record_retracts_nothing_until_the_log_carries_it()
         create("a", ino(1), 10),
         completed(rid(1)),
     ];
-    meta.install_streamed_committed(2, HOLDER, 1, 3, &reship, true)
+    meta.install_streamed_committed(2, HOLDER, 1, 3, &reship, true, (0, 0))
         .unwrap();
     meta.member_copy_put_rows(
         1,
@@ -1043,7 +1044,7 @@ fn an_uncommitted_rolled_back_record_retracts_nothing_until_the_log_carries_it()
         },
     ];
     // The uncommitted stream: nothing is given up.
-    meta.install_streamed_committed(2, HOLDER, 4, 5, &drop_tx, false)
+    meta.install_streamed_committed(2, HOLDER, 4, 5, &drop_tx, false, (0, 0))
         .unwrap();
     assert!(meta.has_outstanding_speculation());
     assert!(meta.lookup(ROOT_INO, "a").unwrap().is_some());

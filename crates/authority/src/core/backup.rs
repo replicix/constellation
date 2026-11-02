@@ -5697,7 +5697,15 @@ impl Core {
             // delegate re-streams it to the next root. Stranded with the
             // tenure, it was rolled back here and queued as a `Records`
             // replay of an acknowledged row (placement-hot seed 675: I5).
-            match replica.install_streamed(epoch, from, tx.first, tx.last, &tx.records, committed) {
+            match replica.install_streamed(
+                epoch,
+                from,
+                tx.first,
+                tx.last,
+                &tx.records,
+                committed,
+                tx.origin,
+            ) {
                 Ok(()) => {
                     replica.note_foreign_executed(&tx.records);
                     tracing::debug!(

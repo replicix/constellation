@@ -687,7 +687,9 @@ pub trait Replica {
         origin: (u64, u64),
     ) -> Result<(), MetaError>;
     /// Install a streamed transaction ahead of the log
-    /// (`SpecKind::Streamed`), streamed by node `source`.
+    /// (`SpecKind::Streamed`), streamed by node `source`. `origin` is the
+    /// transaction's delegation origin `(gen, idx)` (`(0, 0)` for none).
+    #[allow(clippy::too_many_arguments)]
     fn install_streamed(
         &self,
         epoch: Epoch,
@@ -696,6 +698,7 @@ pub trait Replica {
         last: u64,
         records: &[LogRecord],
         committed: bool,
+        origin: (u64, u64),
     ) -> Result<(), MetaError>;
     /// The highest journal seq of `epoch` this replica holds as streamed
     /// speculation (`Meta::streamed_tip`): a stream-ahead below it is
@@ -1836,8 +1839,11 @@ impl Replica for Meta {
         last: u64,
         records: &[LogRecord],
         committed: bool,
+        origin: (u64, u64),
     ) -> Result<(), MetaError> {
-        Meta::install_streamed_committed(self, epoch, source, first, last, records, committed)
+        Meta::install_streamed_committed(
+            self, epoch, source, first, last, records, committed, origin,
+        )
     }
 
     fn streamed_tip(&self, epoch: Epoch) -> Result<Option<u64>, MetaError> {

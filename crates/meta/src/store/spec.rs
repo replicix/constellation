@@ -2046,6 +2046,51 @@ fn row_is_ordered(row: &SpecRow) -> bool {
     )
 }
 
+/// A delegate generation's [`local::deleg_streamed_tx`] marks, read once
+/// per generation for one decision.
+type DelegMarks = HashMap<u64, Option<(u64, u64)>>;
+
+/// [`row_is_ordered`] for a transaction the root's stream of epoch `epoch`
+/// delivers now (L1): also a delegate's own `Local` row whose root append
+/// that stream delivered already ([`local::note_deleg_streamed_tx`]) — it
+/// is earlier in the log, as a streamed row is. Only a `Local` row of a
+/// delegate generation reads anything; `marks` caches the per-generation
+/// read.
+fn row_is_ordered_at(
+    r: &impl Readable,
+    meta: &Meta,
+    row: &SpecRow,
+    epoch: u64,
+    marks: &mut DelegMarks,
+) -> Result<bool, MetaError> {
+    if row_is_ordered(row) {
+        return Ok(true);
+    }
+    let SpecKind::Local { first, .. } = row.kind else {
+        return Ok(false);
+    };
+    let Some(head) = local::get_journal_tx_head(r, meta, first)? else {
+        return Ok(false);
+    };
+    if head.gen == 0 {
+        return Ok(false);
+    }
+    // A stale mark (a `drop-held` rollback of the append, a hold stream that
+    // died with its epoch, a number granted again) is benign: no root row
+    // touches a live generation's keys, because a cross-subtree op recalls the
+    // generation first, and the recall's segment strands every `Local` row
+    // past the cut and redoes the streamed rows in log order. Anything that
+    // lets a root write a delegated inode key while the generation lives
+    // breaks this.
+    let mark = match marks.entry(head.gen) {
+        std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+        std::collections::hash_map::Entry::Vacant(e) => {
+            *e.insert(local::deleg_streamed_tx(r, &meta.local, head.gen)?)
+        }
+    };
+    Ok(mark.is_some_and(|(e, i)| e == epoch && head.idx <= i))
+}
+
 /// The keys a row's application touched (a `Local` row's records are its
 /// journal rows), and every non-directory inode it changed
 /// ([`captured_files`]).
@@ -2341,9 +2386,11 @@ fn incoming_touches(
 /// state. The stream is contiguous from the applied log, so every
 /// outstanding shadow (its reply here, its transaction not streamed yet)
 /// and `Local` row is later in the log than the transaction the stream
-/// delivers now, and everything tailed or streamed is earlier than a
-/// shadow the stream confirms now (hints: see [`row_is_ordered`]). Out of
-/// place:
+/// delivers now, except a delegate's own `Local` row whose append by this
+/// root the stream delivered already (L1: [`row_is_ordered_at`], earlier
+/// than everything the stream delivers after it), and everything tailed or
+/// streamed is earlier than a shadow the stream confirms now (hints: see
+/// [`row_is_ordered`]). Out of place:
 /// - the transaction (not this node's) overlaps an outstanding shadow or
 ///   `Local` row at or after the oldest outstanding shadow;
 /// - the confirmed shadow `adopt` overlaps a tailed, streamed or hint row
@@ -2352,6 +2399,7 @@ fn incoming_touches(
 fn streamed_out_of_place(
     r: &impl Readable,
     meta: &Meta,
+    epoch: u64,
     adopt: Option<u64>,
     records: &[LogRecord],
 ) -> Result<Option<u64>, MetaError> {
@@ -2372,12 +2420,16 @@ fn streamed_out_of_place(
         },
         None => incoming_touches(r, meta, records)?,
     };
+    let mut marks = DelegMarks::new();
     for (seq, row) in &rows {
+        // Lazily: a row's order is read only when the arm needs it, and
+        // the arms that need it for live rows only test those.
         let misplaced = match adopt {
             Some(x) if *seq == x => false,
-            Some(x) if *seq > x => row_is_ordered(row),
-            Some(_) => !row_is_ordered(row) && live.contains_key(seq),
-            None => !row_is_ordered(row) && live.contains_key(seq),
+            Some(x) if *seq > x => row_is_ordered_at(r, meta, row, epoch, &mut marks)?,
+            Some(_) | None => {
+                live.contains_key(seq) && !row_is_ordered_at(r, meta, row, epoch, &mut marks)?
+            }
         };
         if misplaced && row_touches(r, meta, row)?.overlaps(&touches) {
             return Ok(Some(cutoff));
@@ -2431,10 +2483,11 @@ fn insert_streamed_tx(
     let mut adopted = None;
     let mut ahead = Vec::new();
     let mut behind = Vec::new();
+    let mut marks = DelegMarks::new();
     for (seq, row) in rows {
         if Some(seq) == adopt_seq {
             adopted = Some((seq, row));
-        } else if row_is_ordered(&row) {
+        } else if row_is_ordered_at(&*tx, meta, &row, t.epoch, &mut marks)? {
             ahead.push((seq, row));
         } else {
             behind.push((seq, row));
@@ -4021,13 +4074,18 @@ impl Meta {
         last: u64,
         records: &[LogRecord],
     ) -> Result<(), MetaError> {
-        self.install_streamed_committed(epoch, source, first, last, records, false)
+        self.install_streamed_committed(epoch, source, first, last, records, false, (0, 0))
     }
 
     /// [`Self::install_streamed`] for a transaction the holder streamed as
     /// committed (plan 43 C1-4, `StreamAhead.committed`): the entry is not
     /// stranded by a takeover of its epoch, and retires when a segment
-    /// carries the row or its re-shipped `TailOf`.
+    /// carries the row or its re-shipped `TailOf`. `origin` is the
+    /// transaction's delegation origin `(gen, idx)` (`(0, 0)` for none): when
+    /// it names a row this node holds as its own, the stream's delivery of
+    /// that row is recorded, in this transaction (L1:
+    /// [`local::note_deleg_streamed_tx`]).
+    #[allow(clippy::too_many_arguments)]
     pub fn install_streamed_committed(
         &self,
         epoch: u64,
@@ -4036,8 +4094,13 @@ impl Meta {
         last: u64,
         records: &[LogRecord],
         committed: bool,
+        origin: (u64, u64),
     ) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
+        // L1: the root's append of this node's own delegate row (the
+        // stream delivers it, the early return below installs nothing):
+        // from here on, the row is earlier than what the stream delivers.
+        let marked = local::note_deleg_streamed_tx(&mut tx, self, epoch, origin)?;
         // Fix "capture under an epoch hold": already installed here —
         // the holder streams its journal from the start again for a
         // (re)subscriber, and a subscriber that restarted lost the
@@ -4049,6 +4112,9 @@ impl Meta {
         // below the highest installed one of this epoch is one this
         // replica has (or a hole it stepped over).
         if streamed_tip_tx(&tx, self, epoch)?.is_some_and(|tip| first <= tip) {
+            if marked {
+                tx.commit()?;
+            }
             return Ok(());
         }
         // The mirror of `install_shadow`'s rule: this node's own op,
@@ -4086,6 +4152,9 @@ impl Meta {
                 // removed the file the delegate had created after it).
                 // The segment retires it by origin.
                 if tx.get(&self.completed, rid.to_key())?.is_some() {
+                    if marked {
+                        tx.commit()?;
+                    }
                     return Ok(());
                 }
                 if let Some((seq, _, op, tag)) = shadow_row_for(&tx, self, *rid)? {
@@ -4134,7 +4203,8 @@ impl Meta {
         // other replica ended on node 0's). When that order matters (the
         // keys overlap), roll back to the oldest outstanding shadow and
         // redo in the log's order.
-        let out_of_place = streamed_out_of_place(&tx, self, adopt.as_ref().map(|a| a.0), records)?;
+        let out_of_place =
+            streamed_out_of_place(&tx, self, epoch, adopt.as_ref().map(|a| a.0), records)?;
         let cutoff = match (out_of_place, shadow_lacks_effect) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -4879,6 +4949,14 @@ impl Meta {
             stranded.hints += more.hints;
             stranded.locals += more.locals;
             stranded.deleg_dropped += more.deleg_dropped;
+            // L1: the log ended these generations, so no `Local` row of
+            // them is left to order (`local::note_deleg_streamed_tx`). Here
+            // as well as in `replay::apply_one`: a `Recall` the stream
+            // installed first is among the rows skipped above, and the
+            // streamed install must not clear the mark itself.
+            for gen in &recalled {
+                local::clear_deleg_streamed_tx(&mut tx, &self.local, *gen);
+            }
             // Phase 2b: stranding a delegate's own transaction drops its
             // rid's `completed` row (it never reached the log *as that
             // transaction*) — but this very segment may carry the rid's
