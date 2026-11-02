@@ -136,6 +136,8 @@ pub struct CoreStatus {
     pub inbox: InboxView,
     /// Refused replays whose conflict copy is pending / stalled.
     pub copies: (u64, u64),
+    /// A drop's refused entries waiting for their rid's settle: pending / stalled.
+    pub settles: (u64, u64),
     pub rounds_completed: u64,
     pub last_error: Option<String>,
     pub epoch: EpochState,
@@ -3021,6 +3023,7 @@ impl Driver {
         status.clients_in_flight = self.core.clients().count();
         status.inbox = self.core.inbox_view(now);
         status.copies = self.core.replay_copies(now);
+        status.settles = self.core.replay_settles(now);
         status.rounds_completed = self.core.stats.rounds_completed;
         status.last_error = self.core.ship().last_error.clone();
         status.epoch = self.core.epoch_state();

@@ -1578,6 +1578,15 @@ pub struct SpeculationStatus {
     /// at (the node then also asks for the lease to make them locally).
     pub copies_pending: u64,
     pub copies_stalled: u64,
+    /// Plan 46 M0.2 follow-up: refused entries of `repair drop-held` that
+    /// wait for their request id to be settled through the sequencer in
+    /// force before their conflict copy is made (no sequencer reachable, or
+    /// its answer not in the log here yet; retried with backoff), and those
+    /// waiting for at least 10 s.
+    #[serde(default)]
+    pub refused_settles_pending: u64,
+    #[serde(default)]
+    pub refused_settles_stalled: u64,
     /// Plan 43 C1-4: committed entries (answered or streamed as held by the
     /// group or the archive) rolled back and replayed, since start. Only an
     /// operator's `repair abandon-group` may raise it.

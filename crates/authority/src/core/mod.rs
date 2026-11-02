@@ -2235,6 +2235,14 @@ impl Core {
             .copy_counts(now, self.cfg.replay_lease_fallback_ms)
     }
 
+    /// A drop's refused entries waiting for their rid to be settled (no
+    /// sequencer reachable, or its answer not in the log here yet) /
+    /// those waiting for at least the lease-fallback interval.
+    pub fn replay_settles(&self, now: Now) -> (u64, u64) {
+        self.replay
+            .settle_counts(now, self.cfg.replay_lease_fallback_ms)
+    }
+
     /// The core answered its final flush and takes no more events.
     pub fn stopped(&self) -> bool {
         self.stopped

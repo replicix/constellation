@@ -50884,6 +50884,30 @@ mod await_retry {
         assert!(copy_started(&out), "{:?} {out:?}", seed.rid);
     }
 
+    /// With no outcome coming (the answers are no outcome of the rid; here
+    /// the rid's row never reaches the log) the settle is asked again with
+    /// backoff -- 250 ms doubling to 10 s, as the copies are -- not once per
+    /// tick, and `status.speculation.refused_settles_*` says the entry waits.
+    #[test]
+    fn a_refused_entrys_settle_is_retried_with_backoff_and_counted() {
+        let (mut h, r) = deposed_after_a_drop();
+        let mut sent = 0;
+        for _ in 0..40 {
+            let out = drain(&mut h);
+            if let Some((_, req, _)) = settle_sent(&out, r) {
+                sent += 1;
+                let out = h.step(reply_for(req, MutateOutcome::Errno(Code::NotFound)));
+                assert!(!copy_started(&out));
+            }
+            h.advance(250);
+        }
+        // 10 s: asks at about 0, 0.25, 0.75, 1.75, 3.75, 7.75 s.
+        assert!((4..=8).contains(&sent), "settles sent in 10 s: {sent}");
+        assert_eq!(h.core.replay_settles(h.clk()).0, 1);
+        h.advance(20_000);
+        assert_eq!(h.core.replay_settles(h.clk()), (1, 1), "stalled after 10 s");
+    }
+
     /// The settle executed at this node as the sequencer in force journals
     /// the dropped code as the rid's outcome, and the copy follows once that
     /// row is committed.

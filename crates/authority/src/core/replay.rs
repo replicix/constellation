@@ -35,6 +35,11 @@ pub(crate) struct ReplayState {
     pub stuck_since: Option<WaitMs>,
     /// Refused replays whose conflict copy failed at least once.
     copies: BTreeMap<u64, CopyRetry>,
+    /// Defect C: a drop's refused entries whose rid was settled (or asked
+    /// to be) with no outcome back yet, by `queue_seq`: no sequencer
+    /// reachable, or its answer not in the log here. Retried with the
+    /// copies' backoff (250 ms doubling to 10 s), never once per tick.
+    settles: BTreeMap<u64, CopyRetry>,
     /// The conflict copy the driver is making right now.
     copy_in_flight: Option<u64>,
     /// When a stalled copy last asked for the lease.
@@ -54,6 +59,17 @@ pub(crate) struct ReplayState {
 }
 
 impl ReplayState {
+    /// `(pending, stalled)`: refused entries still waiting for their rid's
+    /// settle, and those waiting for at least the lease-fallback interval.
+    pub fn settle_counts(&self, now: Now, fallback_ms: u64) -> (u64, u64) {
+        let stalled = self
+            .settles
+            .values()
+            .filter(|c| now.wait.since(c.since) >= fallback_ms as i64)
+            .count();
+        (self.settles.len() as u64, stalled as u64)
+    }
+
     /// `(pending, stalled)`: copies that failed at least once, and those
     /// failing for at least the lease-fallback interval.
     pub fn copy_counts(&self, now: Now, fallback_ms: u64) -> (u64, u64) {
@@ -204,6 +220,9 @@ impl Core {
         };
         self.replay
             .copies
+            .retain(|seq, _| queued.iter().any(|q| q.queue_seq == *seq));
+        self.replay
+            .settles
             .retain(|seq, _| queued.iter().any(|q| q.queue_seq == *seq));
         if queued.is_empty() {
             self.replay.stuck_since = None;
@@ -448,6 +467,35 @@ impl Core {
         }
         if self.clients.contains_key(&entry.rid) || self.epoch_refuses_writes() {
             return;
+        }
+        // Backed off: with no sequencer reachable a settle ends in doubt
+        // after its window, and asking again once per tick is a storm.
+        if self
+            .replay
+            .settles
+            .get(&entry.queue_seq)
+            .is_some_and(|retry| now.wait < retry.next_at)
+        {
+            return;
+        }
+        let retry = self
+            .replay
+            .settles
+            .entry(entry.queue_seq)
+            .or_insert(CopyRetry {
+                attempts: 0,
+                since: now.wait,
+                next_at: now.wait,
+            });
+        retry.attempts += 1;
+        retry.next_at = now.wait.plus(copy_backoff_ms(retry.attempts));
+        if retry.attempts == 1 || retry.attempts.is_multiple_of(10) {
+            tracing::warn!(
+                node = self.cfg.node_id,
+                rid = ?entry.rid,
+                attempts = retry.attempts,
+                "settling the rid of a dropped row before its conflict copy; no outcome yet"
+            );
         }
         self.stats.refused_entry_settles_sent += 1;
         self.submit_settle(

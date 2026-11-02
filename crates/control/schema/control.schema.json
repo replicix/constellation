@@ -9451,6 +9451,19 @@
           "minimum": 0,
           "type": "integer"
         },
+        "refused_settles_pending": {
+          "default": 0,
+          "description": "Plan 46 M0.2 follow-up: refused entries of `repair drop-held` that\nwait for their request id to be settled through the sequencer in\nforce before their conflict copy is made (no sequencer reachable, or\nits answer not in the log here yet; retried with backoff), and those\nwaiting for at least 10 s.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "refused_settles_stalled": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "replay_conflicts": {
           "description": "Stranded ops whose replay was refused and materialized as a\n`.constellation-conflict/` copy, since start.",
           "format": "uint64",

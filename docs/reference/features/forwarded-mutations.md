@@ -659,6 +659,12 @@ speculation log's rollback assumes shadows were captured in it.
 - `speculation.copies_pending`, `speculation.copies_stalled`: refused
   replays whose conflict copy is still being written (it backs off and
   retries, and is never dropped).
+- `speculation.refused_settles_pending`, `speculation.refused_settles_stalled`:
+  refused entries of `constellation repair drop-held` that wait for their
+  request id to be settled through the sequencer in force before the copy is
+  made (no sequencer reachable, or its answer not in the log here yet); the
+  settle is asked again with backoff (250 ms doubling to 10 s), and `stalled`
+  counts those waiting 10 s or more.
 
 The same counters are exported as `constellation_speculation_*` metrics.
 A rollback logs `segment from a later epoch stranded speculative state`
