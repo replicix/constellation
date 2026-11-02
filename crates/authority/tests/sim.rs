@@ -6528,7 +6528,7 @@ fn tloss_two_node_config() -> SimConfig {
     SimConfig {
         nodes: 2,
         clients_per_node: 1,
-        ops_per_client: 24,
+        ops_per_client: 40,
         names: 4,
         random_faults: 0,
         read_ratio: 0.0,
@@ -6540,7 +6540,7 @@ fn tloss_two_node_config() -> SimConfig {
         client_plan: vec![(1, 0, 0)],
         trunc_commit_ratio: 1.0,
         faults: vec![ScheduledFault {
-            at_ms: 2_000,
+            at_ms: 400,
             kind: FaultKind::StallStep {
                 node: 1,
                 for_ms: 8_000,
@@ -8489,14 +8489,20 @@ fn delegated_two_generations_re_stream_after_a_root_failover() {
 /// in the state of its last acknowledged overwrite (the run's check).
 #[test]
 fn tloss_two_node_loses_no_acknowledged_overwrite() {
-    let (mut files, mut takeovers) = (0usize, 0u64);
+    let mut files = 0usize;
     for seed in 0..60u64 {
         let r = c0_run("tloss-two-node", seed, tloss_two_node_config());
         files += r.trunc_files_checked;
-        takeovers += r.stats.values().map(|s| s.backup_takeovers).sum::<u64>();
+        // Every seed exercises the takeover: the delegate's backup sealed the
+        // stalled root (a permitted claim of the lease, counted by the lease
+        // oracle over every incarnation: a seed without one would test
+        // nothing).
+        assert!(
+            r.permitted_claims > 0,
+            "tloss-two-node seed {seed}: the root was never deposed by its backup"
+        );
     }
     assert!(files > 0, "no overwritten file was checked");
-    assert!(takeovers > 0, "the root was never deposed by its backup");
 }
 
 /// Plan 43 C2: a delegate with no backup it can have (the root is its only
@@ -8553,6 +8559,25 @@ fn delegated_group_switch_acknowledges_only_through_the_recorded_group() {
         records > 400,
         "the group's record barely changed: {records}"
     );
+}
+
+/// Plan 46 M0.3: the findings of `delegated-group-switch`, pinned for the
+/// follow-up fixes: seed 234 acknowledges a row (I1) while the group's version
+/// is changing, with no backup recorded and the root's journal lacking the
+/// appended row; seed 615 is a late landing (I4): an op answered in doubt that
+/// lands after a later one. Both fail today; the test is ignored until they are
+/// fixed (`cargo test --test sim -- --ignored delegated_group_switch_findings`).
+#[test]
+#[ignore = "findings of plan 46 M0.3: delegated-group-switch seeds 234 (I1) and 615 (I4) fail until fixed"]
+fn delegated_group_switch_findings_seeds_234_and_615() {
+    for seed in [234u64, 615] {
+        run_seed(seed, delegated_group_switch_config()).unwrap_or_else(|e| {
+            panic!(
+                "delegated-group-switch seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=delegated-group-switch"
+            )
+        });
+    }
 }
 
 /// Plan 43 C2e (Q1, strict): the delegate and its backup die for good; the
