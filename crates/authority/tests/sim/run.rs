@@ -1250,9 +1250,14 @@ pub struct Report {
     /// failed although a sequencer was there); the violations described
     /// (first five), and the isolated ones' causes by kind.
     pub unsettled_isolated: usize,
-    /// Of the allowed ones, those whose only way to a sequencer was a lease
-    /// claim that could not finish inside the window by design (`no_sequencer_in_time`).
+    /// Of the allowed ones, those whose only way to a sequencer was one that
+    /// could not be had inside the window by design (`no_sequencer_in_time`: a
+    /// lease claim that cannot finish, a root's outwait of a generation that
+    /// does not live).
     pub unsettled_no_sequencer_in_time: usize,
+    /// And those whose root was reachable and due to end the op's generation
+    /// but could reach no holder of its tail (`generation_tail_unreachable`).
+    pub unsettled_generation_tail_unreachable: usize,
     pub unsettled_violations: usize,
     pub unsettled_examples: Vec<String>,
     pub unsettled_causes: BTreeMap<String, usize>,
@@ -1553,6 +1558,10 @@ impl Cluster {
             )
         });
         let handle = NodeHandle::start_with(&self.env, id, meta, epoch);
+        if meta_kept {
+            // (Its synced rows survived: a group member that holds a tail.)
+            self.env.oracles.reach.journal_kept(id);
+        }
         if let Some((ok, failed)) = rebuilds {
             let ord = std::sync::atomic::Ordering::Relaxed;
             handle.shared.rebuilds_ok.store(ok, ord);
@@ -3948,14 +3957,17 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     bus.set_reach(bucket.reach());
     {
         let core = (cfg.core)(1, 1);
-        bucket.reach().configure(
-            cfg.p2p_delay.1,
-            cfg.s3_latency.1,
-            core.ttl_ms,
-            2 * core.backup_takeover_ms,
-            cfg.lease_reads.before.1 + cfg.lease_reads.reply.1,
-            core.acquire_retry_min_ms,
-        );
+        bucket.reach().configure(super::reach::ReachConfig {
+            p2p_delay_hi_ms: cfg.p2p_delay.1,
+            s3_latency_hi_ms: cfg.s3_latency.1,
+            lease_ttl_ms: core.ttl_ms,
+            claim_grace_ms: 2 * core.backup_takeover_ms,
+            lease_read_extra_ms: cfg.lease_reads.before.1 + cfg.lease_reads.reply.1,
+            settle_retry_ms: core.acquire_retry_min_ms,
+            delegation_ttl_ms: core.delegation_ttl_ms,
+            expiry_margin_ms: core.expiry_margin_ms,
+            backup_takeover_ms: core.backup_takeover_ms,
+        });
     }
     bus.set_stream_faults(cfg.stream_faults.clone());
     bus.set_beats_lost(cfg.beats_lost);
@@ -5601,6 +5613,10 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.unsettled_no_sequencer_in_time = all
             .iter()
             .filter(|u| u.verdict.no_sequencer_in_time())
+            .count();
+        report.unsettled_generation_tail_unreachable = all
+            .iter()
+            .filter(|u| u.verdict.generation_tail_unreachable())
             .count();
         let bad: Vec<String> = all
             .iter()

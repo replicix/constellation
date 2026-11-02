@@ -115,9 +115,14 @@ impl Unsettled {
             super::reach::Verdict::NoSequencerInTime { why } => {
                 if why.contains("no member") {
                     "no-sequencer-in-time/group tail".into()
+                } else if why.contains("ends the generation") {
+                    "no-sequencer-in-time/generation outwait".into()
                 } else {
                     "no-sequencer-in-time/claim".into()
                 }
+            }
+            super::reach::Verdict::GenerationTailUnreachable { .. } => {
+                "generation-tail-unreachable".into()
             }
             super::reach::Verdict::Reachable { via, busy, .. } => {
                 let via = match via {
@@ -144,6 +149,10 @@ impl Unsettled {
             ),
             super::reach::Verdict::NoSequencerInTime { why } => format!(
                 "I4: rid {:?} told EIO unsettled by node {} at t={} ms; no sequencer in time over {span} ({why})",
+                self.rid, self.node, self.at_ms
+            ),
+            super::reach::Verdict::GenerationTailUnreachable { why } => format!(
+                "I4: rid {:?} told EIO unsettled by node {} at t={} ms; the root could not end the generation over {span} ({why})",
                 self.rid, self.node, self.at_ms
             ),
             super::reach::Verdict::Reachable {
@@ -324,13 +333,22 @@ impl Oracles {
         holder: NodeId,
         table: constellation_meta::delegation::DelegationTable,
     ) {
+        self.note_table_at(self.reach.now_ms(), holder, table);
+    }
+
+    fn note_table_at(
+        &self,
+        at: u64,
+        holder: NodeId,
+        table: constellation_meta::delegation::DelegationTable,
+    ) {
         let mut t = self.tables.lock().unwrap();
         if t.last()
             .map_or(table.is_empty(), |(_, _, last)| **last == table)
         {
             return;
         }
-        t.push((self.reach.now_ms(), holder, Arc::new(table)));
+        t.push((at, holder, Arc::new(table)));
     }
 
     /// Whether the last table kept names a delegation.
@@ -344,26 +362,34 @@ impl Oracles {
 
     /// Who owned `rid`'s keys at each instant of `[from, to]`: the holder's
     /// table at that instant resolved over the op's keys (the generation
-    /// history decides, not the table at the `EIO`).
+    /// history decides, not the table at the `EIO`), and when each generation
+    /// of the history first showed in a table (the start of the root's window
+    /// of a generation its delegate never installed).
     fn owner_timeline(
         &self,
         node: NodeId,
         rid: Rid,
         from: u64,
         to: u64,
-    ) -> Vec<(u64, super::reach::Owner)> {
+    ) -> (Vec<(u64, super::reach::Owner)>, BTreeMap<u64, u64>) {
         use super::reach::Owner;
         let root = vec![(0, Owner::Root)];
         let Some(op) = self.ops.lock().unwrap().get(&rid).cloned() else {
-            return root;
+            return (root, BTreeMap::new());
         };
         let Some(meta) = self.store(node) else {
-            return root;
+            return (root, BTreeMap::new());
         };
         let keys = constellation_meta::TouchSet::from_op_in(&op, &|p, n| {
             Replica::lookup_ino(&*meta, p, n)
         });
         let tables = self.tables.lock().unwrap().clone();
+        let mut born: BTreeMap<u64, u64> = BTreeMap::new();
+        for (at, _, table) in &tables {
+            for d in table.iter() {
+                born.entry(d.gen).or_insert(*at);
+            }
+        }
         let mut instants = vec![from];
         instants.extend(tables.iter().map(|t| t.0).filter(|t| *t > from && *t <= to));
         let mut out: Vec<(u64, Owner)> = Vec::new();
@@ -383,16 +409,16 @@ impl Oracles {
                         node: d.node,
                         gen: d.gen,
                     },
-                    constellation_meta::delegation::Ownership::CrossSubtree { .. } => {
-                        Owner::Blocked
-                    }
+                    constellation_meta::delegation::Ownership::CrossSubtree {
+                        involved, ..
+                    } => Owner::Blocked(involved.iter().map(|d| (d.node, d.gen)).collect()),
                 },
             };
-            if out.last().map(|(_, o)| *o) != Some(owner) {
+            if out.last().map(|(_, o)| o) != Some(&owner) {
                 out.push((t, owner));
             }
         }
-        out
+        (out, born)
     }
 
     /// Plan 46 M0.3: `node`'s core told a client `EIO`, in doubt, at the
@@ -404,11 +430,13 @@ impl Oracles {
         // (A settle lasts at least a window; one whose deadline was extended
         // lasts from the arming of its second deadline.)
         let from_ms = started.unwrap_or(at).min(at.saturating_sub(window_ms));
+        let (owners, born) = self.owner_timeline(node, rid, from_ms, at);
         let verdict = self.reach.classify(super::reach::Question {
             requester: node,
             from_ms,
             to_ms: at,
-            owners: self.owner_timeline(node, rid, from_ms, at),
+            owners,
+            born,
         });
         self.unsettled.lock().unwrap().push(Unsettled {
             node,
@@ -2100,6 +2128,97 @@ mod tests {
         ) -> Judgement {
             committed_at_answer(&self.o, &self.bus, answerer, st, rid, outcome)
         }
+    }
+
+    fn table(rows: &[(u64, u64, u64)]) -> constellation_meta::delegation::DelegationTable {
+        use constellation_meta::delegation::{DelegationRecord, Range};
+        let mut t = constellation_meta::delegation::DelegationTable::default();
+        for (dir, node, gen) in rows {
+            t.apply(DelegationRecord::Delegate {
+                dir: *dir,
+                node: *node,
+                gen: *gen,
+                designated: false,
+                range: Range::WHOLE,
+            });
+        }
+        t
+    }
+
+    #[test]
+    fn the_owner_timeline_follows_the_holders_table_history() {
+        use super::super::reach::Owner;
+        let w = world();
+        // Node 1 holds the lease from 0; node 2 held another's, in the past.
+        w.o.reach.lease_landed_at(0, 1, 1_000_000, false);
+        let op = MutateOp::Create {
+            parent: ROOT_INO,
+            name: "a".into(),
+            ino: 4_000,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let r1 = rid(1, 1);
+        w.o.note_op(r1, &op);
+        // The root directory is delegated to node 2 (generation 7) at 1 000,
+        // ended at 3 000 (an empty table), delegated to node 3 (generation 8)
+        // at 5 000; a table the holder's, from 100, with no delegation, is
+        // none.
+        w.o.note_table_at(1_000, 1, table(&[(ROOT_INO, 2, 7)]));
+        w.o.note_table_at(3_000, 1, table(&[]));
+        w.o.note_table_at(5_000, 1, table(&[(ROOT_INO, 3, 8)]));
+        let (owners, born) = w.o.owner_timeline(1, r1, 500, 6_000);
+        assert_eq!(
+            owners,
+            vec![
+                (500, Owner::Root),
+                (1_000, Owner::Delegate { node: 2, gen: 7 }),
+                (3_000, Owner::Root),
+                (5_000, Owner::Delegate { node: 3, gen: 8 }),
+            ]
+        );
+        // The generations' births are the first table that lists them, also
+        // the ones before the window.
+        assert_eq!(born, BTreeMap::from([(7, 1_000), (8, 5_000)]));
+        // A window that begins inside a generation starts with its owner.
+        let (owners, _) = w.o.owner_timeline(1, r1, 2_000, 4_000);
+        assert_eq!(
+            owners,
+            vec![
+                (2_000, Owner::Delegate { node: 2, gen: 7 }),
+                (3_000, Owner::Root),
+            ]
+        );
+        // An op unknown to the oracle is the root's.
+        let (owners, born) = w.o.owner_timeline(1, rid(1, 9), 500, 6_000);
+        assert_eq!(owners, vec![(0, Owner::Root)]);
+        assert!(born.is_empty());
+        // Keys under two generations are blocked on both.
+        let w = world();
+        w.o.reach.lease_landed_at(0, 1, 1_000_000, false);
+        let rename = MutateOp::Rename {
+            parent: 100,
+            name: "a".into(),
+            new_parent: 200,
+            new_name: "b".into(),
+            noreplace: false,
+        };
+        let r2 = rid(1, 2);
+        w.o.note_op(r2, &rename);
+        w.o.note_table_at(1_000, 1, table(&[(100, 2, 7), (200, 3, 8)]));
+        let (owners, _) = w.o.owner_timeline(1, r2, 1_500, 2_000);
+        assert_eq!(owners.len(), 1);
+        let Owner::Blocked(mut involved) = owners[0].1.clone() else {
+            panic!("{owners:?}")
+        };
+        involved.sort_unstable();
+        assert_eq!(involved, vec![(2, 7), (3, 8)]);
+        // A table of a node that is not the holder is used only when the
+        // holder has none: node 2's table is ignored while node 1's counts.
+        w.o.note_table_at(1_800, 2, table(&[]));
+        let (owners, _) = w.o.owner_timeline(1, r2, 1_500, 2_000);
+        assert!(matches!(owners[0].1, Owner::Blocked(_)), "{owners:?}");
     }
 
     fn holder_state(epoch: u64) -> AnswererState {

@@ -2480,7 +2480,16 @@ impl Driver {
                 .mine
                 .iter()
                 .filter(|m| !m.3)
-                .map(|m| (m.1, at + (m.2 - now.honour.0).max(0) as u64))
+                // (The end in true ms, in the past when the grant ran out and
+                // the core still lists it; 0 when it was never renewed.)
+                .map(|m| {
+                    let ends = if m.2 > 0 {
+                        (at as i64 + (m.2 - now.honour.0)).max(1) as u64
+                    } else {
+                        0
+                    };
+                    (m.1, ends)
+                })
                 .collect();
             let mut busy = 0u8;
             if lease.gate.is_some() {
@@ -2495,7 +2504,26 @@ impl Driver {
             if view.job.is_some() {
                 busy |= super::reach::BUSY_JOB;
             }
-            self.oracles.reach.note_view(self.id, held, grants, busy);
+            // The groups of the generations this node knows: the backup of
+            // each it is the delegate of, and of each its root table names.
+            let mut members: Vec<(u64, NodeId)> = view
+                .delegation
+                .backups
+                .iter()
+                .map(|b| (b.0, b.1))
+                .chain(
+                    view.delegation
+                        .kinds
+                        .iter()
+                        .filter(|k| k.2 != 0)
+                        .map(|k| (k.0, k.2)),
+                )
+                .collect();
+            members.sort_unstable();
+            members.dedup();
+            self.oracles
+                .reach
+                .note_view(self.id, held, grants, members, busy);
             // The generation history: this holder's delegation table, kept
             // when its generations changed (install, recall, end).
             if held != super::reach::Held::No {
