@@ -13270,11 +13270,13 @@ fn a_backed_lock_root_stuck_in_a_step_keeps_its_own_grants() {
 /// stops (`locks-core-stall-backup-long`, clean). A probe that counts
 /// whatever it reads as a proof renews the root's own grants through the
 /// successor's grace, and the mutual-exclusion ghost catches it (seeds 21 and
-/// 79 of 0 to 100; i1-592 moved 79, and 21, 236 and 277 of 0 to 300 are
-/// pinned: two nodes in I/O under conflicting locks).
+/// 79 of 0 to 100; i1-592 moved 79, and 21, 236 and 277 of 0 to 300 were
+/// pinned: two nodes in I/O under conflicting locks; plan 46 M0.3's settle
+/// fixes moved 236 and 277 and kept 21, so 21, 290 and 366 of 0 to 400, which
+/// fail before and after, are pinned).
 #[test]
 fn a_probe_that_ignores_what_it_reads_is_caught() {
-    for seed in [21u64, 236, 277] {
+    for seed in [21u64, 290, 366] {
         run_seed(seed, locks_core_stall_backup_long_config())
             .unwrap_or_else(|e| panic!("locks-core-stall-backup-long seed {seed}: {e}"));
         let e = run_seed(seed, locks_core_stall_backup_long_blind_config())
