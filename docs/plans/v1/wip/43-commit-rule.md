@@ -429,6 +429,29 @@ in the code, in PROGRESS and in failure messages.
   the event that resumed it. A true singleton waits for the archive after a
   lapse until the next snapshot; the FUSE fast path honours the same rule
   through a guard on `lone_ok`.
+
+  *As landed (oracle I1, delegate answers without a committed row, classes
+  B, C and D, 2026-11-02; PROGRESS, "Oracle I1: the delegate's lone test").*
+  **B**: a delegate's lone test is the root's (`deleg_lone` asks
+  `backup_could_be_had`, not `backup_candidates`, which also needs a link up
+  for `backup_stable_ms`): a delegate back from a reboot has only young
+  links and answered its own client `Lone` with the root linked and in
+  budget. The root's lapse rule comes with it (nothing is known before the
+  first snapshot, none older than the node's own last lapse counts), and the
+  delegate's FUSE fast path honours it through the same `lone_ok` guard
+  (`SessionState::deleg_row_class{,_at}` say `DelegGroup` for a published
+  `Lone` while it fires). **C**: `completed_row_settled` also asks that this
+  tenure committed its own append of a delegate's row
+  (`holder_append_uncommitted`), whatever the class the row carries: a root
+  answered its own forwarded op `Archive` from the `Lone`-tagged row it had
+  appended and not shipped. **D** (liveness): a delegate's stream batch to a
+  restarted root that the lease still names starts the re-adoption
+  (`readopt_own_lease_for_forward`), as a forward, a lock request and a
+  renewal do. Not landed: the root acknowledging a delegate's batch only
+  through the rows its own tenure has committed (class A: the seeds that
+  still fail `+commit`, `deleg-group: ... the root's journal lacks the
+  appended row`); that is a change of Q16's rule and waits for the
+  maintainer.
 - **I2 `one_identity_per_op`.** (a) No rid completes more than once in
   the log (today's `check_exactly_once`). (b) At no instant is a rid
   queued for execution in two places: the union of every node's replay

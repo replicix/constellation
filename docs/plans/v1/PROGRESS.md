@@ -64621,3 +64621,85 @@ clean. meta (all suites) ok, lib 381 passed, 9 ignored; authority lib 956 passed
 13 ignored (the M0.3 ratchet `m03_the_configurations_without_an_unsettled_eio_run_strict` unchanged, no ceiling touched).
 `--ignored delegated_settle_findings_4125` still fails (not L1). On 055de5f1, before the rebase: meta 561 passed (lib 383),
 authority lib 938, engine 947, control 146, harness lib 165, sim suite 351 passed, 12 ignored.
+
+## Oracle I1: the delegate's lone test, the root's answer from its own append, a delegate's batch to a restarted root (classes B, C, D; 2026-11-02; plan 43 section 4)
+
+The delegate-side violations of the `+commit` oracle fall into four causes (the investigation's spec). Three are fixed here, each in its own
+commit; class A (the root acknowledging a delegate's batch when its append is journaled, though the root may already be sealed by its
+backup) is a change of Q16's rule and is not landed (below). Replay a seed with `AUTHORITY_SIM_START=<seed> AUTHORITY_SIM_SEEDS=1`
+through `sweep_config`: `replay_seed` runs another interleaving.
+
+### B: a delegate is lone only when no backup could be had
+
+`long-delegated-backup+commit` seed 457 (also placement-hot 472, 948, 1890; slow lease reads: placement-hot 383, long-delegated-backup 1153,
+1311, 1412, 1767). Node 3 reboots at 924 ms and is back 368 ms later, installs generation 4 at 1,648 ms, and at 1,661 ms answers its own
+rename `Lone`. `deleg_lone` asked `backup_candidates`, which needs a link up for `backup_stable_ms`: every link is younger than that after
+a reboot, so there was no candidate and the delegate was lone, with the root linked and in budget. The root and the oracle had dropped the
+stability term (adba0d19, 1de5ea88) and judged "peer 1 is linked within the budget". The delegate also had none of the root's lapse rule
+(622c311c): a link older than its own pause, a snapshot older than its lapse.
+
+Rule: `deleg_lone` is "no group, none requested or appended to, and `!backup_could_be_had()`", the root's test with its lapse rule (nothing
+is known before the first snapshot, none older than the node's own last lapse counts). The judgement changes with events only, so
+`OwnLag` and `Peers` re-publish the class (`report_deleg_durable`). `deleg_ack_class` and the gate counter lose their `now`.
+
+The delegate's FUSE fast path (item 2): the class a published `Lone` journals under is `DelegGroup` while the same lone guard the root's
+fast path has fires (a lapse the driver has not handed to the core; atomics only): `SessionState::deleg_row_class` and `deleg_row_class_at`.
+Before, a frozen delegate's FUSE threads journaled `Lone` and answered it on a stale directory; the row now waits on `wait_deleg_durable`
+and at the budget goes in doubt through the core (D5).
+
+### C: the root answers its own forwarded op from its own unshipped append
+
+`placement-hot+commit` seed 1659 (slow lease reads), `long-delegated-late-answers` 542, 992. The root appends a delegate's batch; its own
+client op, forwarded to that delegate, is `AwaitingLog`; `answer_awaiting_log` finds the rid's `completed` row in the root's own journal,
+and `completed_row_settled` passes it because the appended row is tagged `Lone`, not gated. The answer left `Archive` with only the root's
+unshipped journal holding the row. `holder_append_uncommitted`'s doc named this waiter, but it was reached only through
+`deleg_stream_durable`, for gated rows. `completed_row_settled` now also requires `!holder_append_uncommitted(gen, idx)` for any
+delegation row (all seven callers). A lone holder's append counts once it ships (right for an `Archive` claim). One atomic load for a node
+that never appended as a holder.
+
+### D: a delegate's batch re-adopts a restarted root's lease
+
+A root that restarted while the lease object still names it holds nothing and does not acquire on its own; a forward, a lock request and
+a renewal each start the re-adoption, a stream batch did not and was only refused, the delegate backing off and re-sending: in
+`delegated-no-backup-root-near` seed 789, once the root acknowledges committed rows only (class A), no root for 538 s. `on_delegate_stream`
+calls `readopt_own_lease_for_forward` when the root is not usable, before it refuses (the batch is still refused; the next re-send finds the
+root it became). `on_deleg_renew` already does this for a root that is not usable (`deleg_renewal_awaits_own_lease`); its other refusals
+concern a generation that ended or is recalled. Seed 789 passes on main and on the fix without class A: the pin is a guard, the core test is
+the fail-before.
+
+### Tests
+
+Fail-before on main: core `a_delegate_with_a_young_link_to_the_root_is_not_lone`,
+`a_delegate_is_not_lone_across_its_own_lapse_until_a_later_directory`,
+`a_root_does_not_answer_its_own_forwarded_op_from_its_unshipped_append_of_a_delegates_row`,
+`a_delegate_stream_to_a_restarted_root_readopts_its_own_lease`; meta `a_published_lone_class_is_a_group_class_while_the_lone_guard_fires`;
+engine `a_delegates_lone_row_waits_for_its_group_while_a_lapse_is_not_handed_to_the_core`. Adapted:
+`a_restarted_delegate_readopts_its_delegation_at_start` gets an empty `Peers` event before its write (with no snapshot yet the delegate is
+not lone, as it should be; the test is about re-adoption). Sim pins (`+commit`, every seed fails on main): `i1_a_delegate_with_a_young_link_to_the_root_does_not_answer_alone`
+(placement-hot 472, 948, 1890; with slow lease reads 383; long-delegated-backup 92, 457, 1372, 1836; with slow lease reads 457, 1153, 1311,
+1412, 1767), `i1_a_root_does_not_answer_its_own_forwarded_op_from_its_unshipped_append` (placement-hot with slow lease reads 1659;
+long-delegated-late-answers 542, 992), `a_root_the_lease_names_readopts_it_when_its_delegate_streams` (delegated-no-backup-root-near 789).
+
+### Sweeps (2,000 seeds from 0), failing seeds `+commit`, main to fix, no knob / `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`
+
+placement-hot 7 [136, 165, 262, 472, 948, 966, 1890] to 0 / 6 [383, 472, 948, 1391, 1659, 1890] to 1 [1391]; long-delegated-backup 6
+[92, 340, 457, 1372, 1832, 1836] to 2 [340, 1832] / 6 [20, 457, 1153, 1311, 1412, 1767] to 2 [20, 1707]; long-delegated-late-answers 3 [184,
+542, 992] to 0 / 3 [1340, 1533, 1596] to 1 [1596]; delegated-two-gens-one-backed 8 to 0 / 10 to 0; delegated-two-gens-backed 0 to 0 / 2 to 0;
+delegated-backup 2 [192, 451] to 3 [192, 436, 451] / 0 to 0; delegated-two-gens-backlog 0 to 0 / 1 [894] to 1 [1965]; long-delegated,
+delegated-holder-cut, delegated-two-gens-root-crash, backup, backup-crash 0 to 0 / 0 to 0. Without `+commit`, every one of these runs fails
+no seed on either build.
+
+What fails on the fix is class A: seeds 192, 451 (delegated-backup), 340, 1832 and knob 20 (long-delegated-backup), knob 1391
+(placement-hot) as the spec lists them, and five more of the same message ("deleg-group: no backup recorded and the root's journal lacks the
+appended row"): 436 (delegated-backup), knob 1707 (long-delegated-backup), knob 1965 (two-gens-backlog, where main fails 894 of the same
+shape), knob 1596 (late-answers, failing on main too). Three of them are not failing seeds on main (436, 1707, 1965): the fix changes
+interleavings, and a seed that did not reach the window now does. To show that none is another cause, the class-A prototype of the spec (the
+root acknowledges `through` only up to the first of its own appends it has not committed; an environment-gated experiment, not in the tree)
+was added on top of the fix: delegated-backup, long-delegated-backup (both knobs), two-gens-backlog, late-answers and placement-hot, `+commit`,
+2,000 seeds each: 0 failing seeds.
+
+### Cost
+
+Latency only, and only where a delegate had no candidate but a linked peer. Lone answers (cores' sequenced answers by class, 2,000 seeds, no
+`+commit`, no knob), main to fix: placement-hot 21 to 12, long-delegated-backup 319 to 308, delegated-backup 107 to 106, long-delegated
+57,843 to 57,704, long-delegated-late-answers 720 to 726, delegated-holder-cut 297 to 296, delegated-two-gens-backed 26 to 20.

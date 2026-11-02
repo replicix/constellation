@@ -722,6 +722,21 @@ that record (it arrives between the own row and the later root row). The lost-re
 | **M1.4 The hold as a group** | §5.7: `StreamAheadAck`, the hold's answers wait for one member; a one-member epoch's hold is `Final`. | The hold's uncommitted `NonStealable` answers; variant 3(i)'s special case from M0.2. | `flex-crash` and the `flex*` configs under the strict flags D9 deferred (36–81 of 2,000 seeds fail today): zero after. | The flex model's property with the group; `strict_commit`, `strict_identity` on every flex config; harness `epoch-member-dies-with-chunk`, `flex-crash`'s scenario ×3. | The flex strict flags on; the C2h deferral closed. |
 | **M1.5 Docs and gates** | DESIGN §4 "Delegated sub-sequencers", §4 "Acknowledgement and durability", §5.2, §9 "Delegates" and the failover table rewritten for the new records; `delegations.md`, `durability-and-failover.md`, `configuration.md`, `lease-placement.md`; ADR-40 amended with what landed; TESTING.md. | — | — | Full CONVENTIONS gates (pjdfstest 8798/8798); the four-file-system perf gates of §8. | All green; the stage reviewed. |
 
+*Pre-M1.2 fixes (oracle I1, 2026-11-02; PROGRESS, "Oracle I1: the delegate's
+lone test"):* three delegate-side defects were closed on the current code
+because M1.2 is weeks away, and M1.2 removes the code they touch. The
+delegate's lone test (`deleg_lone`) is the root's `backup_could_be_had`
+(young links count; the lapse rule applies), with the same guard on the
+delegate's fast path; a root does not answer its own forwarded op from its
+unshipped append of a delegate's row (`completed_row_settled`); a delegate's
+stream batch re-adopts the lease of a restarted root that it names. M1.2
+deletes `deleg_lone` and the lone delegate with it (a node with no group is
+forwarded or holds a sticky grant), and with it the first fix and the
+delegate half of the guard; nothing here constrains its design. Class A
+(the root acknowledging a delegate's batch through rows its own tenure has
+committed only, an interim form of C3 item 4's member copy) is not landed;
+M1.2's member copy closes the window it covers.
+
 ### Stage 2 — no server-side replay (4–6 weeks)
 
 | M | Scope | Deletions | Fail-before | Oracles / sims / scenarios / model | Exit |
