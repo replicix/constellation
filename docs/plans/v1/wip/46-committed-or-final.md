@@ -638,6 +638,22 @@ handoff pause, which kept the holder's own ops waiting for as long as a peer wan
 requester's placeholder's keys succeeds instead of ending in `EIO`. Not drop-held, left as a separate item: seeds 422, 1128
 (history witness under reboots and clock steps).
 
+
+*As landed (M0.3, 2026-11-02; PROGRESS, "Plan 43 C2h"):* the sim's I4 is strict in the maintainer's sense (option A, 2026-11-01):
+each unsettled `EIO` is classified from the sim's own network and fault history (`sim/reach.rs`: partitions, nodes attached,
+paused, suspended or stalled, S3 cuts, lease bodies, what each core holds and is busy with), as isolated (no sequencer
+reachable for a round trip during the whole settle window) or a violation, with `strict_unsettled` (`+unsettled`) failing on the
+first violation. 2,000 seeds of every C2 configuration with and without the lease-reads knob: 578 isolated of 28,281; strict only
+on `delegated-long-delegation-prod` and `delegated-root-gone` (zero both ways); the other configurations keep the old mode and
+are listed. The violations are six causes in the product (a root in its takeover gate answering a settle `Busy`; the new root's
+own settle falling to the lease path inside its gate; a delegate's own op held by the root; a redirect loop between root and
+delegate; a local execution parked behind a recall; the lease path needing a TTL) — follow-up fixes, with seeds and lines in
+PROGRESS. New: sim `tloss-two-node` and `delegated-group-switch` (the latter fails 7 of 2,000 seeds, findings), the harness
+`takeover-loss-two-node`, and `bench/commit-rule/RESULTS.md`'s C2 rows. Fail-before: `tloss-two-node` fails I1 on 500 of 500
+seeds on C2c's parent, `delegated-group-switch` on 490 of 500, `takeover-loss-two-node` empties files on the build of the loss in
+4 of 6 seeds. **Deferred, as D9 says: the flex strict flags** stay off until M1.4 (`flex-crash` is also where most isolated
+requesters are: 107 of 4,153 unsettled `EIO`s without the knob). The die/abandon pair is C2e's and swept clean (0 of 2,000 each). The campaign cell that found the loss ×20: 20 of 20 pass.
+
 ### Stage 1 — one stream per node, the rule per configuration (6–10 weeks)
 
 | M | Scope | Deletions | Fail-before | Oracles / sims / scenarios / model | Exit |

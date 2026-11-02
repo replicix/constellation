@@ -2115,6 +2115,16 @@ acknowledged effect lost and is judged as before. (3) **The history witness** tr
 over the dropped ones. Seeds 592 and 1864 showed the exemption was right to ask for the outcome: a drop on a deposed node
 left none; the entry now settles the rid first (PROGRESS, "Plan 46 M0.2: the four defects").
 
+*As landed (C2h's scenarios, 2026-11-02; PROGRESS, "Plan 43 C2h"; plan 46 M0.3).* Sim `tloss-two-node` (the 2026-10-16 trace:
+the delegate and root's backup overwrites files while the root stalls between applying its rows and its own backup stream;
+`SimConfig::trunc_commit_ratio`, `Step::TruncCommit`, `StallStep { after_event }`, `history::check_trunc_commits`;
+`strict_commit` and `strict_settle`, I2 off) and `delegated-group-switch` (the spec's section 3.3; 7 of 2,000 seeds fail
+I1/I4: findings), the harness scenario `takeover-loss-two-node`, the die/abandon pair of C2e swept clean, the C2 rows of
+`bench/commit-rule/RESULTS.md`, and I4's strict form: an unsettled `EIO` only for a requester isolated during its whole
+settle window, classified from the sim's own reachability history (`unsettled_isolated` / `unsettled_violations`). The
+strict flags on the flex configurations stay off (plan 46 D9; M1.4). The `load-probe` cell under `pause:lock-lapse+500:10000@b` ×20
+(seeds 42 to 61, verification on) passed 20 of 20 on this tree; the four-file-system G1 run is open (RESULTS.md).
+
 ### C3 — Verbatim re-ship; no re-execution of a committed row
 
 **Code** (§5.4, §5.6): `Origin` in the segment envelope

@@ -2521,6 +2521,22 @@ relay of its own so requests can be attributed per role):
         take over by seal, as in `delegate-root-loss`. Before the fix
         `b` sealed `a` about 1.5 s after the removal and was never
         invited back, so the kill was a TTL failover.
+      - `takeover-loss-two-node` (plan 43 C2h, plan 46 M0.3; the
+        2026-10-16 acknowledged-write loss): `b`, `a`'s listed backup and the
+        delegate of `/d1`, overwrites ten files (`O_TRUNC`, write, `fsync`)
+        round after round. After three rounds `b`'s answers must all be
+        group ones (`status.ack.classes`: no `lone`, some `deleg-group`),
+        then `a` is frozen (`SIGSTOP`) across `b`'s takeover of the root and
+        thawed deposed; two rounds on the new root and two more with `a`
+        back. After quiescence each file is byte-exact and equal on both
+        nodes, as its last acknowledged overwrite left it or an attempt
+        after it (a truncate whose write never returned may have emptied
+        it), and neither node holds a conflict copy
+        (`.constellation-conflict`, the `spool` counters). Before C2c `b`
+        acknowledged each truncate and commit on its own disk: the class
+        assertion fails on every such build (`ae24ef52`), and on the build
+        of the loss (`05ef4c9`) the thawed `a` emptied the files on both
+        nodes.
       - In the sim: `delegated_root_loss_hands_the_writes_to_a_ttl_successor`
         (`delegated-root-gone`: the root dies with no backup and comes
         back after 40 s; every submit within 15 s, none in doubt, with
@@ -4965,6 +4981,7 @@ root answers every other node from the archive; C3
 | I2 (c) verbatim | end of run: an OK answered under a group class is completed in the log under the identity it was committed with (the transaction's `LogRecord::TailOf`, kept through any number of re-ships, else epoch, node and journal row; or `(gen, idx)`) and with its records as one run, ignoring the `TailOf` records of either (plan 43 C1-4, D9) | `non_verbatim` | `strict_identity`, `strict_durability` |
 | `member_copies_drained` (plan 43 C1-4) | a converged run: no node still holds a row of a member copy (the archive carries every identity, or a marker said the row was never committed) | `member_copy_rows_left` | `strict_durability` |
 | I4 `unacked_fails_never_lands_late` | end of run: an op answered in doubt (the first `InDoubt` answer; the sim's client resubmits, production answers `EIO` at once) that lands after an op its node invoked later; and (plan 43 C2a) a refusal that journaled no `Refused` row whose rid the log completes | `late_landings`, `unjournaled_landed` | `strict_settle` |
+| I4, strict (plan 46 M0.3) `unsettled_eio_only_when_isolated` | at each unsettled `EIO` the core counts (`client_unsettled_eio`): whether its requester could reach a sequencer for the op during its settle window, from the run's reachability history (`sim/reach.rs`) | `unsettled_isolated`, `unsettled_violations` | `strict_unsettled` (`+unsettled`) |
 | I5 `speculation_only_lone` | end of run: an OK that was rolled back whose answer was not class Lone (a rollback is what the core counts as one: a stranded replay, not a committed row kept as a member copy, and not a refusal this node never answered) | `non_lone_rollbacks` | `strict_lone`, `strict_durability` |
 | I6 `no_ttl_claim_of_a_live_lease` (plan 43 C7b) | at every lease CAS the sim's bucket accepts that replaces another node's unreleased, unfenced lease without a permit (`takeover_permit` of the claimant when it sent the CAS, naming that epoch and holder, with the backup listed or the policy `S3`): the predecessor's own honour end for the body (`holder_expires_ms` less its margin, on the clock `holder_clock` names, read with `ProtocolClock::peek_honour`, which moves no clock) against the predecessor's honour reading now. A claim before that end is a violation ("TTL claim of a live lease: node X took epoch E of node Y at true t ms, which honours it for another u ms"); a predecessor that is dead or restarted since honours nothing | `lease_ttl_claims`, `lease_live_claims` (the violations), `seals_of_a_live_holder` (a permitted claim of a `Backup` lease whose holder still honoured it: count only), `permitted_claims` | `strict_lease_claims` |
 
@@ -5075,6 +5092,52 @@ for, older named backups sealed once and never waited for),
 and appended again after every event) pin the rule;
 `abandon_group_ends_a_waiting_generation_at_its_cursor_and_says_so_in_the_log`
 the escape.
+
+**Plan 46 M0.3: I4 strict, and the C2h configurations.** An unsettled `EIO`
+(`Stats::client_unsettled_eio`: the second deadline came and no sequencer had
+answered the settle) is allowed only for an *isolated* requester, one that
+could reach no sequencer for the op during its settle window. The sim decides it
+from its own network and fault state, never from the requester's logs
+(`sim/reach.rs`): the bus records each partition and each node's attach and
+detach, the nodes the spans in which their core handles nothing (`Pause`,
+`Suspend`, `RuntimeLag`, a stalled step), the bucket the cuts of a node's path
+to S3 and every lease body that lands, and each node's core publishes after a
+step what it holds (the lease, a continuation epoch) and its delegation grants.
+A sequencer is *reachable* in a stretch of the window when the requester is
+running and either is one (it holds the lease the latest body names, or an
+epoch, or is the live delegate of the op's keys: the root's table at the
+`EIO`), or its link to one is up and the sequencer is attached, running and in
+force, or the lease can be taken (S3 reachable and the lease released, or run
+out for the claimant: a TTL past the last body, plus the backups' claim grace
+for a lease with backups it is not listed in). A stretch shorter than a round
+trip of its medium (twice the slowest P2P delay; twice the slowest S3 request
+plus the slow lease reads) does not count. The window is the settle's whole
+span, from the arming of the second deadline (at least a settle window). Each
+`EIO` is counted `isolated` or a violation (`Report::unsettled_isolated`,
+`unsettled_violations`, the causes in `unsettled_causes`, `SWEEP-UNSETTLED`
+lines naming the rid, the time, the sequencer reached and what its core was busy
+with, `SWEEP-UNSETTLED-CAUSES` per sweep); `strict_unsettled` (variant
+`+unsettled`) fails the run on the first violation. The classifier's unit
+tests are in `reach.rs`; `m03_*` in `sim.rs` pin a violating seed
+(`long-delegated-late-answers` 8), an isolated one (`flex-crash` 383) and the
+two configurations that run strict
+(`delegated-long-delegation-prod`, `delegated-root-gone`). The other in-doubt
+replies (a wait aborted by a deposition, a policy that does not settle) are
+none of the settle's and are not classified. The counts per configuration are
+in PROGRESS ("Plan 43 C2h").
+
+`tloss-two-node` (the 2026-10-16 trace; ×5,000): two nodes, node 2 the delegate
+of `d1` and the root's backup, a lone client on node 2 overwriting the files of
+`d1` (`SimConfig::trunc_commit_ratio`, `Step::TruncCommit`: a size-only
+`Setattr`, then a `SetManifest`), and the root stalled right after it applied the
+delegate's rows (`StallStep { after_event: DelegateStream }`, 8 s) so that its
+backup seals it and takes over; `history::check_trunc_commits` owes each file
+the state of its last acknowledged op or of an attempt after it, and
+`strict_commit` and `strict_settle` hold. `delegated-group-switch` (×2,000): four
+nodes, `d1`'s delegate loses its first backup (crash at 1.5 s, back at 5.5 s)
+and has the second cut off for 2 s, under `strict_commit`; on `08a2fe8e` 7 of
+2,000 seeds fail it (I1 and I4: PROGRESS, "Plan 43 C2h"). The pair
+`delegated-backup-and-delegate-die` and `-abandon` are C2e's (above).
 
 **Plan 43 C7b: offsets beyond the margin.** The cross-node compares (a claimant
 judging a lease by its own wall against the holder's wall expiry) are safe only
