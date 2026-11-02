@@ -15560,7 +15560,7 @@ fn m03_the_configurations_without_an_unsettled_eio_run_strict() {
 #[test]
 fn m03_the_configurations_at_zero_violations_stay_there() {
     type Config = fn() -> SimConfig;
-    let strict_configs: [(&str, Config); 11] = [
+    let strict_configs: [(&str, Config); 15] = [
         ("delegated-crash", delegated_crash_config),
         (
             "delegated-delegate-restart",
@@ -15575,12 +15575,19 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
         ("shared-dir-split", shared_dir_split_config),
         ("shared-dir-default", shared_dir_default_config),
         ("shared-dir-ranges", shared_dir_ranges_config),
+        (
+            "delegated-two-gens-root-crash",
+            delegated_two_gens_root_crash_config,
+        ),
+        ("long-sessions", long_sessions_config),
+        ("shared-dir-faults", shared_dir_faults_config),
+        ("tloss-two-node", tloss_two_node_config),
     ];
     // (label, config, violations, allowed unsettled EIOs in seeds 0..100 when
     // the list was set)
-    let ceilings: [(&str, Config, usize, usize); 21] = [
+    let ceilings: [(&str, Config, usize, usize); 17] = [
         ("backup-crash", backup_crash_config, 1, 0),
-        ("backup-strict", backup_strict_config, 5, 0),
+        ("backup-strict", backup_strict_config, 0, 0),
         ("backup-two", backup_two_config, 0, 0),
         (
             "delegated-backup-and-delegate-die",
@@ -15594,47 +15601,38 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
             0,
             0,
         ),
-        ("delegated-backup", delegated_backup_config, 11, 0),
+        ("delegated-backup", delegated_backup_config, 4, 0),
         (
             "delegated-group-switch",
             delegated_group_switch_config,
-            6,
+            3,
             2,
         ),
-        ("delegated-holder-cut", delegated_holder_cut_config, 48, 0),
+        ("delegated-holder-cut", delegated_holder_cut_config, 14, 2),
         (
             "delegated-long-delegation",
             delegated_long_delegation_config,
             65,
-            190,
+            187,
         ),
         (
             "delegated-no-backup-root-near",
             delegated_no_backup_root_near_config,
-            5,
+            4,
             0,
         ),
         ("delegated-root-crash", delegated_root_crash_config, 1, 0),
-        (
-            "delegated-two-gens-root-crash",
-            delegated_two_gens_root_crash_config,
-            0,
-            0,
-        ),
         ("flex-crash", flex_crash_config, 125, 9),
         ("long-backup", long_backup_config, 0, 0),
         ("long-delegated", long_delegated_config, 0, 0),
-        ("long-delegated-backup", long_delegated_backup_config, 52, 5),
+        ("long-delegated-backup", long_delegated_backup_config, 23, 6),
         (
             "long-delegated-late-answers",
             long_delegated_late_answers_config,
-            63,
-            7,
+            25,
+            4,
         ),
-        ("long-sessions", long_sessions_config, 0, 0),
-        ("placement-hot", placement_hot_config, 10, 0),
-        ("shared-dir-faults", shared_dir_faults_config, 0, 0),
-        ("tloss-two-node", tloss_two_node_config, 3, 0),
+        ("placement-hot", placement_hot_config, 0, 0),
     ];
     const SEEDS: u64 = 100;
     // (label, config, the ceilings on violations and on allowed ones)
