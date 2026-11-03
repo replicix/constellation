@@ -435,7 +435,7 @@ pub trait Replica {
     /// as this replica holds it or held here, contiguously above that
     /// (`Meta::deleg_backup_acked`). `None`: not persisted, or the
     /// acknowledgement could not be read back; nothing is answered.
-    fn deleg_backup_append(&self, gen: u64, txs: &[DelegateTx]) -> Option<u64>;
+    fn deleg_backup_append(&self, gen: u64, txs: &[DelegateTx], in_log_cap: u64) -> Option<u64>;
     /// `None`: the store could not be read — the caller must not answer
     /// as if it held nothing (plan 43 C2e).
     fn deleg_backup_tail(&self, gen: u64) -> Option<Vec<DelegateTx>>;
@@ -1326,10 +1326,12 @@ impl Replica for Meta {
         Meta::holder_appends_from(self, gen, from)
     }
 
-    fn deleg_backup_append(&self, gen: u64, txs: &[DelegateTx]) -> Option<u64> {
+    fn deleg_backup_append(&self, gen: u64, txs: &[DelegateTx], in_log_cap: u64) -> Option<u64> {
         // (A log index that cannot be read counts from 0: the
-        // acknowledgement then covers less, never more.)
-        let in_log = Meta::log_stream_idx(self, gen).unwrap_or(0);
+        // acknowledgement then covers less, never more. `in_log_cap`:
+        // below this node's own unshipped appends of the stream, when it
+        // is the generation's root as well.)
+        let in_log = Meta::log_stream_idx(self, gen).unwrap_or(0).min(in_log_cap);
         match Meta::deleg_backup_append(self, gen, in_log, txs) {
             Ok(acked) => Some(acked),
             Err(error) => {

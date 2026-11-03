@@ -2996,7 +2996,28 @@ impl Core {
                 _ => None,
             })
             .collect();
+        // Plan 46 M0.3 (S5, ADR-42): inside a takeover gate the replica's
+        // `completed` also holds what the gate re-appended to its journal
+        // (the predecessor's tail, a delegate's rows): the journal's, not
+        // the log's yet (I1: an inbox op answered from the re-shipped tail
+        // before it shipped). The ship, or the open (`resolve_moot_waits`),
+        // answers it.
+        let gated_journal: Option<std::collections::BTreeSet<Rid>> =
+            (self.lease.gate.is_some() && !waiting.is_empty()).then(|| {
+                replica
+                    .journal_txs_from(0, usize::MAX)
+                    .iter()
+                    .flat_map(|tx| &tx.records)
+                    .filter_map(|rec| match rec {
+                        LogRecord::Completed { rid } | LogRecord::Refused { rid, .. } => Some(*rid),
+                        _ => None,
+                    })
+                    .collect()
+            });
         for (rid, epoch, position) in waiting {
+            if gated_journal.as_ref().is_some_and(|j| j.contains(&rid)) {
+                continue;
+            }
             let Some(outcome) = completed_as_outcome(replica, rid, epoch) else {
                 continue;
             };

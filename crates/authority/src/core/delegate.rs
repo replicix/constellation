@@ -3504,6 +3504,33 @@ impl Core {
 
     // ----------------------------------------------------- the backup
 
+    /// The highest index of `gen`'s stream below this node's own unshipped
+    /// append of it, when it is the generation's root as well as its backup
+    /// (`u64::MAX`: no such append). What a backup's acknowledgement counts
+    /// as "in the log" (`Meta::deleg_backup_acked`) stops there: a row the
+    /// root appended to its journal and nothing has shipped is no copy the
+    /// backup's tail holds, and an acknowledgement of an earlier append
+    /// that claimed it let the delegate answer before the backup's own
+    /// append of it arrived (I1, `delegated-holder-cut` seed 802 inside a
+    /// takeover gate, plan 46 M0.3 S5).
+    fn root_log_floor(&self, gen: u64, replica: &dyn Replica) -> u64 {
+        if !self.dl.gens.get(&gen).is_some_and(|g| !g.ended) {
+            return u64::MAX;
+        }
+        let tip = replica.holder_append_tip();
+        let shipped = replica.journal_acked_seq().unwrap_or(0);
+        if tip == 0 || tip <= shipped {
+            return u64::MAX;
+        }
+        let Ok(appends) = replica.holder_appends(gen) else {
+            return 0;
+        };
+        appends
+            .iter()
+            .find(|(_, last)| *last > shipped && !self.ack.shipped_rows.contains(last))
+            .map_or(u64::MAX, |(idx, _)| idx.saturating_sub(1))
+    }
+
     /// Phase 2b: a delegate's append (this node is its backup).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_deleg_backup_append(
@@ -3534,7 +3561,8 @@ impl Core {
         if !sealed && !txs.is_empty() {
             // Not persisted, or not read back: no answer (it used to answer
             // `acked: 0` and reset what this node backs of the generation).
-            let Some(a) = replica.deleg_backup_append(gen, &txs) else {
+            let floor = self.root_log_floor(gen, replica);
+            let Some(a) = replica.deleg_backup_append(gen, &txs, floor) else {
                 return;
             };
             acked = a;

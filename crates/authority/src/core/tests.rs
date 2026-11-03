@@ -47829,7 +47829,7 @@ mod deleg_windows_tests {
         let mut h = Harness::new(4);
         h.core.cfg.delegation = true;
         h.core.cfg.p2p = true;
-        Replica::deleg_backup_append(&h.meta, 7, &[tail_row(1)]);
+        Replica::deleg_backup_append(&h.meta, 7, &[tail_row(1)], u64::MAX);
         constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(1);
         let out = seal(&mut h, 30);
         constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(0);
@@ -47850,7 +47850,7 @@ mod deleg_windows_tests {
         h.core.cfg.delegation = true;
         h.core.cfg.p2p = true;
         // Sealed before the restart, holding row 1.
-        Replica::deleg_backup_append(&h.meta, 7, &[tail_row(1)]);
+        Replica::deleg_backup_append(&h.meta, 7, &[tail_row(1)], u64::MAX);
         assert!(Replica::deleg_backup_seal(&h.meta, 7));
         let append = |h: &mut Harness, req: u64| {
             h.step(Event::Peer {
@@ -53363,6 +53363,99 @@ mod c2g_settle {
         h.core.lease.gate = None;
         let opened = content(&h.step(renew_4(12, false))).expect("no grant once open");
         assert_eq!(gated, opened);
+    }
+
+    /// S5 (new I1 of the `+commit` sweeps, `delegated-holder-cut` 802): a
+    /// node that is the root of a generation and its recorded backup counts
+    /// as "in the log" what the log holds, not its own unshipped appends of
+    /// the stream: the acknowledgement of the backup append of row 1 said
+    /// `acked: 2` because the root had appended row 2 from the stream, and
+    /// the delegate answered row 2 before the backup's append of it
+    /// arrived. Fails on the parent: `acked` 2.
+    #[test]
+    fn s5_a_backup_that_is_the_root_does_not_count_its_unshipped_appends_as_its_tail() {
+        let (mut h, dir) = gated_root_with_gen_at_4(true);
+        h.step(batch_from_4(&h, dir, 10, 1));
+        h.step(batch_from_4(&h, dir, 11, 2));
+        assert_eq!(h.core.dl.gens[&7].cursor, 2);
+        let tx = |idx: u64| constellation_meta::DelegateTx {
+            idx,
+            rid: Some(rid4(idx)),
+            records: vec![LogRecord::Completed { rid: rid4(idx) }],
+            deps: Default::default(),
+        };
+        let acked = |out: &[Action]| {
+            sends(out).into_iter().find_map(|(_, m)| match m {
+                PeerMsg::DelegBackupAck { acked, .. } => Some(*acked),
+                _ => None,
+            })
+        };
+        let out = h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegBackupAppend {
+                req: OpId(40),
+                gen: 7,
+                txs: vec![tx(1)],
+            },
+        });
+        assert_eq!(acked(&out), Some(1), "{out:?}");
+        // Shipped, the rows are in the log: the backup counts them.
+        ship_all(&mut h);
+        let out = h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegBackupAppend {
+                req: OpId(41),
+                gen: 7,
+                txs: vec![tx(1)],
+            },
+        });
+        assert_eq!(acked(&out), Some(2), "{out:?}");
+    }
+
+    /// S5 (new I1 of the `+commit` sweeps, `delegated-holder-cut` 553): inside
+    /// a takeover gate the replica's `completed` holds what the gate
+    /// re-appended to its journal (the predecessor's tail): an op of this
+    /// node awaiting the log is not answered from it before it ships (a
+    /// delegate's batch appended in the gate ran `answer_awaiting_log`).
+    /// Fails on the parent of the guard: answered at once.
+    #[test]
+    fn s5_a_gated_root_does_not_answer_an_op_awaiting_the_log_from_its_unshipped_journal() {
+        let mut h = Harness::new(1);
+        h.core.lease.cached_holder = Some(2);
+        let rid = h.rid(1);
+        let op = h.create("t");
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: op.clone(),
+            tag: Default::default(),
+        });
+        h.hold(
+            2,
+            Some(PendingGate {
+                epoch: 2,
+                takeover: true,
+                marker_shipped: true,
+                drained: false,
+                fast_prev: false,
+                backup_tail_epoch: None,
+                shippable: true,
+            }),
+        );
+        h.core.clients.get_mut(&rid).unwrap().phase = client::Phase::InboxWaiting { epoch: 1 };
+        // The tail the gate re-appended carries the rid's outcome.
+        constellation_meta::execute_mutate(&h.meta, &op, Some(rid)).unwrap();
+        let mut out = Vec::new();
+        h.core.answer_awaiting_log(h.clk(), &h.meta, &mut out);
+        assert!(
+            replies(&out).is_empty(),
+            "answered from the journal: {out:?}"
+        );
+        // Shipped, it is the log's.
+        ship_all(&mut h);
+        let mut out = Vec::new();
+        h.core.answer_awaiting_log(h.clk(), &h.meta, &mut out);
+        assert_eq!(replies(&out).len(), 1, "{out:?}");
     }
 
     /// S5: the redirect is S3's live test (`on_forward`), and only for a
