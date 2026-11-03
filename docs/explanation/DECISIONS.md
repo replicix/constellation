@@ -2422,6 +2422,10 @@ until plan 46 M1.2's member copy lands; M1.2 may revert it (below).
 Amends [ADR-33](#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)
 and plan 43 Q16.
 
+**Amended by [ADR-42](#adr-42-a-takeover-gate-whose-journal-work-is-done-serves-the-generations-it-inherits)
+(2026-11-03)**: the push runs while the root is usable *or in a takeover
+gate whose journal work is done*.
+
 **Context**: with no backup recorded for its generation the group of a
 delegate is `{delegate, root}`, and the delegate answered a row once the
 root had *journaled its append* of it (`DelegateStreamAck.through`, plan 43
@@ -2567,3 +2571,135 @@ See: [plan 43](../plans/v1/wip/43-commit-rule.md) (§4 the oracle, Q16),
 `crates/authority/src/core/delegate.rs` (`root_append_cap`,
 `root_stream_push`, `deleg_poke_root`, `on_delegate_stream`,
 `on_delegate_stream_ack`, `deleg_group_through`).
+
+
+## ADR-42: A takeover gate whose journal work is done serves the generations it inherits
+
+**Status**: decided by the maintainer on 2026-11-03 (plan 46 M0.3, S5, option
+(a)); interim until plan 46 M1.2. Amends
+[ADR-41](#adr-41-a-delegate-counts-the-roots-copy-only-through-rows-the-roots-tenure-has-committed-interim-rule-for-q16)'s
+push and plan 46 M0.3's S2.
+
+**Context**: a successor's takeover gate keeps its view closed for the
+read-delegation quarantine (12.5 s in the sim) long after its journal work is
+done (`PendingGate::shippable`: the marker landed, the predecessor's tail is
+applied, the node's own delegate rows are re-appended, the replays have run,
+the lock mirror is installed). It learned the delegation table only when it
+opened, so it refused every delegate's batch at `through=0`, left renewals
+unanswered (S2) and bounced settles on their keys. An op on another node's
+subtree outlasted its deadline plus the settle window (9 s + 3 s) and was
+answered `EIO`, and the op then took effect when the gate opened (I4
+`+unsettled`: 216 of 1,000 `delegated-holder-cut` seeds, 77 of
+`delegated-backup`, 26 of `placement-hot`, 81 of
+`delegated-no-backup-root-near`, 185 of `long-delegated-backup`). The
+quarantine protects keys the previous tenure may have read-delegated: the
+grants of a superseded tenure or of a previous incarnation, which no table
+this tenure holds lists, and a lone node's kernel caches. A live generation's
+keys are not among them: every row of the generation touches only the keys it
+owns (a delegate executes only what resolves to its generation; a cross-subtree
+op ends it first), the root grants nothing on them after the `Delegate`
+record, and a delegate executes nothing before a renewal granted after the
+root's earlier grants on the subtree were recalled or outwaited and after that
+root's quarantine (every *first* renewal waits for both).
+
+**Decision**: once `shippable`, the gate takes on the table's generations of
+other nodes (`delegation_sync` at level `RootSync::Gated`; its own are taken on
+and ended at the open, as before):
+- it appends and acknowledges their batches, with `committed` per ADR-41, and
+  pushes rising commits (`root_stream_push`);
+- it answers their renewals; a *first* renewal still waits for the read
+  quarantine (`deleg_renew_waits_for_reads`, answered by
+  `Timer::GrantQuarantine` while the gate is still pending);
+- it redirects a settle on their keys to the delegate, when the generation is
+  live, unrecalled, within its window, the delegate is reachable, the settle is
+  not the delegate's own, and this tenure has granted the generation (else the
+  settle is `Held`: a delegate that lapsed while the gate was not shippable
+  answers `NotHolder { root }` and the two would bounce it).
+It recalls, seals, reclaims and ends nothing while gated: `start_recall` and
+`deleg_recall_plan` (`RecallPlan::Gated`) refuse inside a gate, `root_progress`
+ends no generation (the open ends a drained one), `on_deleg_expiry` re-arms,
+and the gate serves only a generation it took on from the table
+(`GenState::inherited`, not recalled, not ended). A gate that is not shippable
+or is releasing is unchanged. A settle of the gated root's own plans no recall
+(`execute_local_outcome`): the gate ends its own generations at the open, and
+`start_recall` does not know them.
+
+**Two findings of the review, closed here**:
+- *A key can enter a generation through a root-only row* (plan 45's key move):
+  an inode's keys belong to the owner of its primary name's parent (the lowest
+  `RDentry` key), so the unlink of the primary name, in a root directory, of a
+  file also named in a delegated one resolved to the root alone, recalled
+  nothing, and left the file in the delegation with the read delegations the
+  root had made on it still live. `TouchSet::from_op_in_names` holds the name
+  that becomes the primary one (for an unlink, the names a rename or an
+  exchange moves, the name a rename overwrites, a stranded replay's records),
+  so the op is cross-subtree and the root recalls and re-delegates
+  (`delegate_dir`'s read recalls then cover the file). It closes the same race
+  for a usable root. Cost: one `RDentry` range seek per unlink, rename or
+  exchange in `keys_of_op_in` and the FUSE fast paths, only while a delegation
+  exists; the ops it makes cross-subtree are those of an inode with several
+  names whose primary name leaves while another name is in a delegated
+  subtree. A delegate no longer executes the unlink of the primary name of a
+  file whose next name is in another generation of its own (the state a
+  review follow-up of 5b6a6b1e built could not arise any more).
+- *The gate could recall or end a generation once it knew one*: closed at the
+  choke points above.
+
+**Consequences**:
+- Settles on another node's live generation are answered by its delegate
+  within the window, a delegate's grant runs through its root's takeover
+  instead of lapsing, and the gated root's own clients waiting for a
+  delegate's row are answered once the row ships. Windows of inherited
+  generations start at `shippable`, not at the gate's opening (the bound is
+  unchanged: any instant after the tenure began). The off-core lane stays off
+  in the gate (a fenced root publishes no certificate).
+- `committed` inside the gate: a lone gated root (no backup listed) counts its
+  journal at once (`u64::MAX`, as a lone usable root under ADR-41); a backed
+  one raises it when the row ships (nothing is backed before the gate opens).
+- New interaction found by the sweeps, fixed here: inside the gate the
+  replica's `completed` also holds what the gate re-appended to its journal;
+  `answer_awaiting_log` no longer answers an op of this node from it before it
+  ships (I1: an inbox op answered from the re-shipped tail), and a node that is
+  a generation's root and its recorded backup acknowledges a backup append only
+  through what the log holds (`root_log_floor`), not through its own unshipped
+  appends of the stream (I1: a delegate answered a row its backup did not yet
+  hold).
+- What the gate still cannot answer, as before and by this decision: an op that
+  needs a generation recalled or ended (a cross-subtree op, a generation whose
+  delegate rebooted and is stopped), and a delegate that restarted in the gate
+  (its first renewal waits for the quarantine). Over 1,000 seeds (`+commit`,
+  before and after, without and with `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`)
+  the unsettled `EIO`s with a sequencer reachable fall from 252 / 470 to
+  144 / 251 (`delegated-holder-cut`), 85 / 131 to 32 / 74 (`delegated-backup`),
+  35 / 42 to 8 / 30 (`placement-hot`), 91 / 133 to 30 / 57
+  (`delegated-no-backup-root-near`), 236 / 413 to 109 / 199
+  (`long-delegated-backup`); the residual sampled (PROGRESS, "S5") is these
+  classes, not the settle on a live delegate. The classifier's allowed label
+  "no sequencer in time, generation outwait, keys across generations" rises
+  (the gate now knows the windows it must outwait); the totals fall.
+- No version bump, no shim.
+- Residual, not new: a root grant on a directory whose entry names a multi-link
+  inode with its primary link inside the subtree (ADR-36's dentry copy of a
+  directory's attributes, and a remote-dentry lookup of a multi-link inode) is
+  not recalled by the append of a delegate's row; a usable root's own grants
+  have the same shape today. The gate adds the previous tenure's grants to this
+  class for its span. A grant the previous root made only in memory is trusted
+  through a delegate's `first: false` renewal (`until == 0` is the delegate's
+  "never granted in this process"; a same-boot restart sends `first: true`
+  again, conservatively).
+
+**Rejected**: (b) a shippable gate recalls the generations (`DelegCut`): it
+ends grants that plan 46's sticky grants are meant to keep, and it executes a
+recall inside a view that is closed.
+
+**May revert**: under plan 46 M1.2's one stream per node with a member copy and
+sticky grants, the gate's inheritance of a node stream and its handling of
+renewals are re-derived from the node's record. If M1.2's ownership walk or the
+member copy makes the root's append unnecessary inside the gate, this rule goes
+with `GenState`.
+
+See: `crates/authority/src/core/delegate.rs` (`delegation_sync`,
+`root_gated_shippable`, `gated_serves`, `on_delegate_stream`, `on_deleg_renew`,
+`deleg_recall_plan`, `root_log_floor`), `holder.rs` (`gate_settle`),
+`client.rs`, `crates/meta/src/replay.rs` (`TouchSet::from_op_in_names`);
+[plan 46](../plans/v1/wip/46-committed-or-final.md) M0.3 S5; PROGRESS "S5".

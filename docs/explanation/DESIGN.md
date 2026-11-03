@@ -785,7 +785,10 @@ committed tail before it executes anything; the root after a delegation's
 end or recall, which drains the delegate's committed rows first — and dedups
 to it. A successor answers a settle on the keys it owns as soon as its gate's
 journal work is done, without waiting out the read quarantine behind it (a rid
-that took effect is held, never accepted before the quarantine). Only when no
+that took effect is held, never accepted before the quarantine); a settle on a
+live generation of another node is redirected to its delegate, which the gate
+keeps renewed ([ADR-42](DECISIONS.md#adr-42-a-takeover-gate-whose-journal-work-is-done-serves-the-generations-it-inherits)).
+Only when no
 sequencer answers within the rest of the deadline (twice
 the lease TTL: an isolated requester) does the client hear the *unsettled*
 `EIO`, retryable by rid, which may still land (`client_unsettled_eio`). The
@@ -1806,7 +1809,11 @@ a member copy and re-claims at the next epoch.
 
 A fast successor (seal or `ack=s3`) waits out the previous tenure's
 read-delegation and lock grants before it acknowledges a mutation or
-grants a lock, and accepts lock reclaims meanwhile. A TTL successor has
+grants a lock, and accepts lock reclaims meanwhile. (That is for its own keys:
+the rows of a live generation of another node, on keys the previous tenure
+could not have read-delegated, are appended and acknowledged meanwhile,
+[ADR-42](DECISIONS.md#adr-42-a-takeover-gate-whose-journal-work-is-done-serves-the-generations-it-inherits).)
+A TTL successor has
 nothing to wait for: every grant was capped by the lease that expired
 ([Durability and failover](../reference/features/durability-and-failover.md#seal-based-failover)).
 
@@ -1855,8 +1862,14 @@ dependency goes with the replay. This text changes with the code.*
   transactions past the cut are stranded: the ones nobody was answered for
   are dropped (their clients retry by rid), a lone delegate's own are
   replayed by rid.
-- **Root fails over**: the new root inherits the live generations, whose
-  grants were capped by the old lease. After a TTL takeover they are
+- **Root fails over**: the new root inherits the live generations as soon as
+  its takeover gate's journal work is done (`shippable`), not when the gate
+  opens: it appends and acknowledges their streams, answers their renewals (a
+  first renewal still waits out the read quarantine) and redirects a settle on
+  their keys to the delegate, but recalls, seals, reclaims and ends none of
+  them until the gate opens
+  ([ADR-42](DECISIONS.md#adr-42-a-takeover-gate-whose-journal-work-is-done-serves-the-generations-it-inherits)).
+  The grants were capped by the old lease. After a TTL takeover they are
   already dead; after a fast takeover the delegates re-stream from what
   the log has, and a backup that was itself a delegate rolls back its own
   unappended rows and replays them after the predecessor's tail, never

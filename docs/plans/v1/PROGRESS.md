@@ -64903,3 +64903,120 @@ Gates (box 1, rebased on 43dc55d2, final tree; TMPDIR on a tmpfs, the disk made 
 tree before this round), all 0 failed; sim suite (release) 357 passed, 0 failed, 13 ignored, including the M0.3 ratchet
 `m03_the_configurations_at_zero_violations_stay_there` and the item-A pins (the ratchet prints no counts, so a change under its ceilings is not visible;
 nothing was raised).
+
+## S5: a takeover gate whose journal work is done serves the generations it inherits (2026-11-03; plan 46 M0.3; ADR-42)
+
+The maintainer chose option (a), inherit: once `PendingGate::shippable`, the gate takes on the table's generations of other nodes
+(`delegation_sync` at `RootSync::Gated`; its own are ended at the open), appends and acknowledges their batches (`committed` per ADR-41),
+pushes rising commits, answers their renewals (a first renewal still waits for the read quarantine), and redirects a settle on their keys to
+a live, reachable delegate this tenure has granted (`GateSettle::Redirect`; `Held` before). It recalls, seals, reclaims and ends nothing
+(`RecallPlan::Gated`, `start_recall`, `root_progress`; acceptance only for `GenState::inherited`, unrecalled, not ended). Option (b), a
+recall in the gate, was rejected. Counters `deleg_gated_inherited`, `deleg_renewals_gated`, `deleg_appended_gated`,
+`gate_settles_redirected` (sweeps: `SWEEP-S5-GATE`). The spec (d0884c75, written against 43dc55d2) and its fable review are folded in.
+
+### The fable review (SOUND WITH CHANGES): two MUSTs and the SHOULDs
+- **MUST 1, a key can enter a generation through a root-only row** (plan 45's key move). The primary name is the lowest `RDentry` key, so
+  the unlink (rename-over, rename-away) of it in a root directory, of a file also named in a delegated one, resolved to the root alone, recalled
+  nothing and left the file in the delegation with the predecessor's read grants live. `TouchSet::from_op_in_names` holds the name that becomes
+  the primary one, so the op is cross-subtree (the root recalls, executes, re-delegates; `delegate_dir`'s read recalls cover the file); the core's
+  keys, both FUSE fast paths and the sim's models use it; `Meta::names_of_ino` reads the names only while a delegation exists. Own commit.
+  Fail-before: the meta test `removing_the_primary_name_of_a_linked_inode_holds_the_next_name` (keys `{dentries: {(2,"a")}, shared: {2}}`, no
+  next name) and the core test `s5_unlinking_the_primary_name_of_a_file_named_in_a_delegation_recalls_it` (the unlink executed at once, no
+  `DelegRecall`). Cost: one `RDentry` range seek per unlink, rename or exchange key computation while a delegation exists (none otherwise);
+  not measured in ops per second, and it adds a recall only for multi-name inodes whose primary name leaves while another name is in a delegated
+  subtree. Consequence for an old test: `a_lone_row_does_not_follow_an_open_gated_row_of_another_generation` built its state through exactly this
+  move (a delegate executing the unlink of the primary link of a file whose next name was in its other generation); that cannot arise now, and
+  the test became `an_unlink_that_moves_a_files_keys_into_another_generation_is_not_the_delegates`.
+- **MUST 2, the gate must never recall or end a generation.** `deleg_recall_plan` returns `Gated` inside a gate (callers: `Busy`, an inbox
+  batch left for the poll after it), `start_recall` sends nothing, `root_progress` ends nothing (the open runs it). Fail-before:
+  `s5_the_gate_sends_no_recall_for_a_generation_it_took_on` (`Wait`, a `DelegRecall` to node 4) and `s5_a_drained_recall_is_not_ended_inside_the_gate`
+  (ended inside the gate). The two paths the review named are not reachable today by structure (`new_mutation_epoch` and `ship_epoch` are closed in
+  a gate), so these pin the choke points.
+- SHOULDs: redirect only a delegate this tenure granted (`s5_the_gate_redirects_a_settle_only_to_a_live_reachable_delegate`: `Held`, then
+  `NotHolder { 4 }`); a level that changed either way re-syncs (`s5_a_gate_over_a_usable_tenure_syncs_again`); the lock content of a gated answer
+  equals the opened root's (`s5_a_gated_renewal_carries_the_lock_content_of_the_opened_roots`); the gate serves only inherited generations
+  (`s5_the_gate_serves_only_a_generation_it_inherited`); ADR-42 states the residual class, the `until == 0` caveat and `committed` of a lone and a
+  backed gated root; the `+commit` sweeps include `delegated-holder-cut` with the knob.
+
+### Two I1 classes the sweeps found, fixed
+The first `+commit+unsettled` sweep of the change failed I1 in `delegated-holder-cut` (2 seeds; 6 with the knob) and `long-delegated-backup` (3; 3), none
+on main. Both are the gate doing the usable root's work on a state it has not shipped:
+- `answer_awaiting_log` ran when a gated batch appended, and answered an inbox op of this node (`delegated-holder-cut` 553: node 2, root in its gate)
+  from `completed`, which in a gate also holds the predecessor's tail the gate re-appended to its journal: not the log's yet. It skips an op whose
+  outcome is in the unshipped journal while gated. Fail-before: `s5_a_gated_root_does_not_answer_an_op_awaiting_the_log_from_its_unshipped_journal`.
+- A node that is a generation's root and its recorded backup acknowledged a backup append through `log_stream_idx`, which counts the root's own
+  unshipped appends of the stream: the ack of the backup append of row 5 said `acked 6`, the delegate answered row 6 before its backup's append of it
+  arrived (`delegated-holder-cut` 802: node 3's create, 7,052 ms; the tail lacked index 6). `root_log_floor` stops the count below the root's own
+  unshipped appends. Fail-before: `s5_a_backup_that_is_the_root_does_not_count_its_unshipped_appends_as_its_tail` (`acked` 2, not 1). The same hole
+  exists for a usable root that is its generation's backup; the gate made it frequent. `long-delegated-late-answers` 1241 (plain, "node 3 saw
+  marker d2/m2-1-marker without its data d1/m2-1-data") failed on the first build of the change too and passes after the first fix.
+
+### Measured (box 1; main d0884c75 against the change; 1,000 seeds from 0, `+commit`; no knob / `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`)
+Failing seeds under `+commit+unsettled` (all I4; no I1, I2, I5 or history failure on either build), base to change:
+
+| config | failing seeds |
+|---|---|
+| delegated-holder-cut | 216 / 401 to 121 / 221 |
+| delegated-backup | 77 / 97 to 28 / 56 |
+| placement-hot | 26 / 28 to 6 / 20 |
+| delegated-no-backup-root-near | 81 / 99 to 25 / 40 |
+| long-delegated-backup | 185 / 290 to 78 / 153 |
+
+`unsettled_violations` (a sequencer was reachable) and the classifier's allowed "no sequencer in time" (`+commit`, base to change):
+
+| config | violations | allowed |
+|---|---|---|
+| delegated-holder-cut | 252 / 470 to 144 / 251 | 9 / 63 to 25 / 100 |
+| delegated-backup | 85 / 131 to 32 / 74 | 0 / 5 to 8 / 17 |
+| placement-hot | 35 / 42 to 8 / 30 | 1 / 2 to 9 / 7 |
+| delegated-no-backup-root-near | 91 / 133 to 30 / 57 | 0 / 5 to 7 / 11 |
+| long-delegated-backup | 236 / 413 to 109 / 199 | 10 / 76 to 36 / 106 |
+
+`SWEEP-UNSETTLED-CAUSES` (change, no knob): `delegated-backup` `itself/takeover gate+takeover floor+job` 29, `root/...` 3, `no-sequencer-in-time/generation outwait,
+keys across generations` 8 (base: 75, 10, 0); `delegated-holder-cut` `root/takeover gate+takeover floor+job` 91, `itself/...` 43, `no-sequencer-in-time/...keys
+across generations` 18 + `generation outwait` 7, `delegate/job` 7 (base 100, 149, 1 + 8); `placement-hot` 6, 2, 9 (23, 11, 1); `delegated-no-backup-root-near` 27, 3,
+7 (82, 9, 0); `long-delegated-backup` `itself/...` 55, `root/...` 50, `no-sequencer-in-time/...` 36 (149 + 75, 10). The totals fall (violations plus allowed:
+`delegated-backup` 85 to 40, `delegated-holder-cut` 261 to 169, `long-delegated-backup` 246 to 145), but the allowed label rises: the gate now knows
+the windows of the generations it must outwait, so an op that needs one recalled is classified as waiting for a sequencer that is outwaiting, not as one
+that could have answered. Counters (`SWEEP-S5-GATE`, change, no knob / knob): generations taken on 959 / 970 (`delegated-holder-cut`), 351 / 322
+(`delegated-backup`), 136 / 119, 353 / 315, 718 / 682; renewals granted 3,531 / 4,866, 1,396 / 1,130, 637 / 545, 1,755 / 1,405, 2,131 / 2,640; transactions
+appended 1,585 / 1,646, 463 / 292, 104 / 55, 495 / 325, 1,582 / 1,541; settles redirected 0 everywhere but `long-delegated-backup` (1): a requester's settle
+goes to a live delegate by itself (`settle_route`), so the gate's redirect serves only a stale table. `SWEEP-FAILOVER` p50 / p90 (ms to the first
+acknowledged mutation; `delegated-holder-cut` 951 / 942 holder crashes, `long-delegated-backup` 575 / 558), base to change: `delegated-holder-cut` 13,283 /
+15,617 to 8,942 / 14,658 (knob 15,412 / 18,313 to 11,921 / 17,640); `long-delegated-backup` 3,078 / 13,932 to 2,601 / 13,773 (knob 3,204 / 16,529 to 2,971 /
+15,981). Plain, 2,000 seeds, the same configs plus `long-delegated-late-answers`: no failing seed on either build.
+
+What is left is not the settle on a live delegate. The residual failing seeds of `delegated-backup` (28), `placement-hot` (6) and
+`delegated-no-backup-root-near` (25) were classified from their `+commit` replays (`RUST_LOG=constellation_authority=debug`; 31, 8 and 29 failing ops), and
+`delegated-holder-cut` 9 and 39 and `placement-hot` 359 traced by hand: an op on a generation whose delegate rebooted in the gate (its copy is stopped, "held the
+delegation before a reboot"; only the open's recall or seal ends it) 20 of the 31 of `delegated-backup`, 17 of the 29 of `delegated-no-backup-root-near`; an op
+on a generation the gate would have to recall 5 and 5; a cross-subtree op that needs a recall (a `Rename` between `d1` and `d2`) 3 and 4; a delegate that
+restarted and sends `first: true`, whose renewal waits for the quarantine as before (`delegated-holder-cut` 9 and 39, `placement-hot` 359 and the
+`root-key/other` ops of `placement-hot`: their settles are `Held`, the delegate not granted yet by this tenure). The spec expected the class to fall to about 0 (at most 10 for `delegated-backup`); it falls
+by 60 to 80 percent. The classes that remain need a recall inside the gate, which the decision excludes.
+
+### Tests, pins and the ratchet
+- Core (`c2g_settle`): the fail-before core test `s5_a_shippable_gate_serves_another_nodes_generation` (batch, renewal, settle redirect), run on d0884c75 with
+  the tests only (the code of that tree plus the test file): `assertion left == right failed: [Send { to: 4, msg: DelegateStreamAck { ... through: 0,
+  committed: 0, refused: true } }]`, left `[(0, 0, true)]`, right `[(1, 1, false)]`. The six negatives: `s5_a_gate_that_is_not_shippable_serves_nothing`,
+  `s5_a_releasing_shippable_gate_serves_nothing`, `s5_a_first_renewal_waits_for_the_quarantine_inside_the_gate` (answered by `Timer::GrantQuarantine`, gate
+  pending), `s5_a_gate_does_not_reclaim_an_inherited_generation_at_its_expiry`, `s5_the_open_neither_inherits_twice_nor_resets_and_ends_an_own_generation`,
+  `s5_a_gated_roots_own_settle_is_answered_on_every_key_it_owns` (fails without the `client.rs` guard: the second op parks on the unknown generation's wait).
+  Existing tests changed: `a_gated_root_still_bounces_a_settle_on_another_nodes_generation` is the unreachable-delegate control (delegation on, the gate
+  took the generation on, node 4 not connected: `Busy`); `a_gated_root_settles_a_rid_on_a_generation_delegated_to_itself` first syncs and marks this node's
+  own delegate copy lapsed (the gate now syncs the table at `shippable`, which installs the delegate side; in a real takeover the strand stopped it);
+  `a_lone_row_does_not_follow_an_open_gated_row_of_another_generation` (above); the `deleg_backup_append` tests pass `u64::MAX` for the new cap argument.
+  `a_gated_root_leaves_a_renewal_unanswered` stays green (generation 7 is unknown there).
+- Sim: `s5_a_gated_root_serves_another_nodes_generation` pins `placement-hot` 2 and 28, `delegated-backup` 11, `delegated-holder-cut` 14 and 20 (`+unsettled`;
+  each fails with I4 on d0884c75; the spec's `delegated-holder-cut` 9 and 39 stay failing, a restarted delegate, and `delegated-no-backup-root-near` 297 does not
+  fail on main). Ratchet ceilings (violations, seeds 0..99, no knob, measured): `delegated-backup` 4 to 1, `delegated-holder-cut` 24 to 12,
+  `delegated-no-backup-root-near` 4 to 0, `long-delegated-backup` 23 to 5, `long-delegated-late-answers` 25 to 9, `placement-hot` 4 to 0; the allowed ceilings are
+  not raised although the measured allowed counts rose (`delegated-backup` 0 to 2, `delegated-holder-cut` 2 to 3, `delegated-no-backup-root-near` 0 to 1,
+  `long-delegated-late-answers` 1 to 4, `placement-hot` 0 to 1: the relabelling above; each is within its ceiling plus margin). `delegated-root-crash` (0 of 2,000
+  seeds `+unsettled`) moves to the strict list (16 strict, 16 ceilings); no other configuration is at 0 (`backup-strict` 7, `long-backup` 1, `long-delegated` 4,
+  `delegated-no-backup-root-near` 53, `placement-hot` 16 of 2,000). `m03_a_reachable_sequencers_requester_is_not_isolated` is re-pinned to
+  `long-delegated-late-answers` 2 (seed 1 is closed), and `c0_the_real_rebuild_recovers_a_deposed_root` to 270 and 2822 (9287 and 3036 no longer run a rebuild).
+
+Gates (box 1, final tree, TMPDIR on a tmpfs): `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean; authority lib 1,002 and
+`meta_repro` 4, engine 948 (plus its integration tests), meta 385, net 127, control 146, harness lib 164, all 0 failed; sim suite (release) 358 passed, 0 failed,
+13 ignored (357 on d0884c75 plus the S5 pin).

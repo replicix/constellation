@@ -687,9 +687,13 @@ not held. Unsettled-EIO violations over 1,000 seeds, `+unsettled`, before and af
 `tloss-two-node` 28 to 0, `delegated-group-switch` 90 to 13 (seed 615's late landing gone), `delegated-holder-cut` 483 to
 251, `delegated-backup` 147 to 89, `delegated-no-backup-root-near` 149 to 93, `long-delegated-late-answers` 696 to 309,
 `long-delegated-backup` 497 to 246, `placement-hot` 107 to 26, `long-delegated` 6 to 4, `delegated-two-gens-root-crash` 5 to 0;
-`flex-crash` 1,989 to 1,988 (cause 6, D9: untouched). What is left is S4 (a recall's cut answered before its read recalls)
-and S5 (a settle on another node's generation inside a gate: the gate builds no generation state until it opens), and
-cause 6, the maintainer's open decision. Not here: S4, S5, the strict flags (`strict_unsettled` goes on where both ways
+`flex-crash` 1,989 to 1,988 (cause 6, D9: untouched). What was left was S4 (a recall's cut answered before its read recalls)
+and S5 (a settle on another node's generation inside a gate: the gate builds no generation state until it opens; **closed by
+[ADR-42](../../../explanation/DECISIONS.md#adr-42-a-takeover-gate-whose-journal-work-is-done-serves-the-generations-it-inherits)**,
+2026-11-03: a gate whose journal work is done takes on the live generations of other nodes, serves their batches and renewals and
+redirects a settle on their keys to the delegate, and recalls, seals, reclaims and ends nothing; what it still cannot answer is an
+op that needs a generation recalled or ended, and a delegate that restarted in the gate; PROGRESS, "S5"), and
+cause 6, the maintainer's open decision. Not here: S4, the strict flags (`strict_unsettled` goes on where both ways
 reach 0). The plain sweeps (2,000 seeds, both modes) add one failing seed on the fix, `long-delegated-late-answers` 1477 with the
 knob, a latent replica divergence of a former delegate that main shows at 6183 and 7393 (PROGRESS, **L1**, closed: the cause is
 the root's pre-S3 stream install, see the paragraph after this one; 4125 with the knob is not L1 and stays a separate finding);
