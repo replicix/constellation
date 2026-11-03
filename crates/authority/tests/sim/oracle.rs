@@ -1374,6 +1374,12 @@ pub struct IdentityLedger {
     /// too, replays by the same rid). So a pair that includes such a rid is
     /// counted with the ungated ones, not judged.
     pub kept: BTreeSet<Rid>,
+    /// L2: rids another node queued for execution with a gated class (a
+    /// committed answer's entry), once each, with where and when. Counted,
+    /// never judged: a deposed root's rebuild used to queue the gated copy
+    /// of a delegate's row it had appended, which no oracle pair caught
+    /// where no re-ask overlapped it.
+    pub foreign_gated: BTreeMap<Rid, String>,
 }
 
 impl IdentityLedger {
@@ -1397,6 +1403,13 @@ impl IdentityLedger {
         copies.queued_gated = queued_gated;
         copies.executing = executing;
         let mine = copies.clone();
+        for rid in &mine.queued_gated {
+            if rid.node != node && !self.kept.contains(rid) {
+                self.foreign_gated.entry(*rid).or_insert_with(|| {
+                    format!("rid {rid:?} queued gated on {node} at tick {tick}")
+                });
+            }
+        }
         let rids: BTreeSet<Rid> = mine.queued.union(&mine.executing).copied().collect();
         for rid in rids {
             if self.violations.contains_key(&rid) {
@@ -1494,6 +1507,8 @@ pub struct Findings {
     pub i2: Vec<String>,
     /// I2 (b) where no copy stands for a committed answer (counted).
     pub i2_ungated: Vec<String>,
+    /// L2: another node's rid queued with a gated class (counted).
+    pub i2_foreign_gated: Vec<String>,
     /// I2 (c): one description per rid not completed verbatim.
     pub i2c: Vec<String>,
     pub i4: Vec<String>,
@@ -1577,6 +1592,7 @@ pub fn end_of_run(
         let ledger = o.identity.lock().unwrap();
         f.i2 = ledger.violations.values().cloned().collect();
         f.i2_ungated = ledger.ungated.values().cloned().collect();
+        f.i2_foreign_gated = ledger.foreign_gated.values().cloned().collect();
     }
     let acks = o.acks.lock().unwrap();
     // Each rid's first OK answer judged other than `Lone` (its tick).

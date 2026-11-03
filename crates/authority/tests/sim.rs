@@ -4591,6 +4591,33 @@ fn regression_placement_hot_rollback_order_and_rebuilt_member_copies() {
     }
 }
 
+/// L2: `delegated-no-backup-root-near` seed 1680 with slow lease reads: a
+/// deposed root's rebuild queued a gated copy of the delegate's row (3,1,16)
+/// it had appended. Fails before the fix: the counter is 1, and the ledger
+/// judges the pair with the delegate's own execution (`identity_copies` 1;
+/// the seed fails under `+identity`).
+#[test]
+fn l2_a_deposed_roots_rebuild_queues_no_gated_copy_of_a_delegates_row() {
+    let cfg = SimConfig {
+        lease_reads: SLOW_LEASE_READS,
+        ..delegated_no_backup_root_near_config()
+    };
+    let r = run_seed(1680, cfg).unwrap_or_else(|e| {
+        panic!(
+            "seed 1680: {e}\n  replay with AUTHORITY_SIM_CONFIG=delegated-no-backup-root-near \
+             AUTHORITY_SIM_LEASE_READS=0:0:800:1000"
+        )
+    });
+    assert_eq!(
+        r.identity_foreign_gated, 0,
+        "a gated copy of another node's rid was queued"
+    );
+    assert_eq!(
+        r.identity_copies, 0,
+        "a rid was queued on two nodes at once"
+    );
+}
+
 /// The `backup-hot` sweep: `cargo test -p constellation-authority
 /// --release --test sim -- --ignored long_backup_hot`
 /// (`AUTHORITY_SIM_SEEDS`, `AUTHORITY_SIM_START`; replay one with
@@ -7490,8 +7517,9 @@ struct OracleTotals {
     /// takeover's tail, rows moved to a member copy, member rows retired,
     /// dropped, abandoned, tails kept by a backup, tail rows past a gap,
     /// gated rows queued for replay (must be 0), ungated I2 pairs, nodes
-    /// with member rows at convergence (must be 0)].
-    c14: [u64; 11],
+    /// with member rows at convergence (must be 0), L2: rids of another node
+    /// queued with a gated class (counted)].
+    c14: [u64; 12],
     /// Plan 43 C7b: [TTL claims, of a live holder, seals of a live holder,
     /// permitted claims] and the seeds with a claim of a live holder.
     lease: [u64; 4],
@@ -7596,6 +7624,7 @@ impl OracleTotals {
         }
         self.c14[9] += r.identity_copies_ungated as u64;
         self.c14[10] += r.member_copy_rows_left as u64;
+        self.c14[11] += r.identity_foreign_gated as u64;
         self.unsourced += r.acks_unsourced;
         self.unjournaled_landed += r.unjournaled_landed;
         let mut unsettled = 0;
@@ -7862,7 +7891,7 @@ impl OracleTotals {
             "SWEEP-C14-TOTALS {label} seeds {}/{seeds}: committed rolled back {}, superseded by a \
              tail {}, rows to a member copy {}, member rows retired {} dropped {} abandoned {}, \
              tails kept by a backup {}, tail rows past a gap {}, gated rows queued {}, ungated \
-             I2 pairs {}, nodes with member rows at convergence {}",
+             I2 pairs {}, nodes with member rows at convergence {}, foreign gated queued {}",
             self.seeds,
             self.c14[0],
             self.c14[1],
@@ -7874,7 +7903,8 @@ impl OracleTotals {
             self.c14[7],
             self.c14[8],
             self.c14[9],
-            self.c14[10]
+            self.c14[10],
+            self.c14[11]
         );
         eprintln!(
             "SWEEP-LEASE-TOTALS {label} seeds {}/{seeds}: ttl claims {} (of a live holder {} in \

@@ -1235,6 +1235,10 @@ pub struct Report {
     /// Plan 43 C1-4: rids queued on two nodes where no copy stands for a
     /// committed answer (the lone branch's, the delegations': C2/C3).
     pub identity_copies_ungated: usize,
+    /// L2: rids of another node queued with a gated class (counted, not
+    /// judged; a deposed root's rebuild must not queue its appends of a
+    /// delegate's rows).
+    pub identity_foreign_gated: usize,
     /// Plan 43 C1-4: nodes holding member-copy rows at convergence (must be
     /// 0; fails a `strict_durability` run).
     pub member_copy_rows_left: usize,
@@ -5604,6 +5608,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         .load(std::sync::atomic::Ordering::Relaxed) as usize;
     report.identity_copies = found.i2.len();
     report.identity_copies_ungated = found.i2_ungated.len();
+    report.identity_foreign_gated = found.i2_foreign_gated.len();
     report.non_verbatim = found.i2c.len();
     report.late_landings = found.i4.len();
     report.settled_landings = found.i4.iter().filter(|m| m.starts_with("I4: rid")).count();
