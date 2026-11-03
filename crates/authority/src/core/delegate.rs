@@ -596,6 +596,23 @@ impl DelegationState {
     }
 }
 
+/// How much of the root's work this node can do now, as far as the
+/// generations its table names go ([`Core::root_deleg_level`]): ordered,
+/// so a resync is due when the level rises.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RootSync {
+    /// Not a root that serves generations (no lease, a gate whose journal
+    /// work is not done, a release in its final section).
+    #[default]
+    None,
+    /// Plan 46 M0.3 (S5, ADR-42): a takeover gate whose journal work is
+    /// done (`PendingGate::shippable`). The generations of other nodes
+    /// are taken on and served; none is recalled, sealed or reclaimed.
+    Gated,
+    /// The lease is usable: every root duty.
+    Usable,
+}
+
 /// How long a recall answered for a generation this node's table has
 /// not named yet is remembered ([`DelegationState::handed_back`]).
 const HANDED_BACK_UNSEEN_MS: i64 = 60_000;
@@ -631,7 +648,7 @@ pub(crate) struct DelegationState {
     forgot: bool,
     /// Plan 41 R2: the generations this tenure sent a granting answer for,
     /// and the lock floor the latest carried (`Core::deleg_settled`).
-    answered_granting: BTreeSet<u64>,
+    pub(crate) answered_granting: BTreeSet<u64>,
     floor_sent: BTreeMap<u64, Position>,
     /// Designations not journaled yet because this root's read
     /// delegations under the directory were live (`Core::delegate_dir`):
@@ -684,9 +701,10 @@ pub(crate) struct DelegationState {
     /// When a delegate that knows no root may read the lease for it again
     /// ([`Core::deleg_learn_root`]): once a stream tick.
     root_read_after: Option<WaitMs>,
-    /// The last table sync found this node a usable root (and so learned
-    /// the generations the table names): see [`Core::deleg_root_sync_due`].
-    root_synced: bool,
+    /// What the last table sync found this node as a root (and so which
+    /// generations it learned from the table): see
+    /// [`Core::deleg_root_sync_due`].
+    pub(crate) root_synced: RootSync,
     /// Plan 30 §M10: an active continuation epoch — no delegation.
     pub(crate) epoch_active: bool,
     /// Generations this node's table still delegates to it whose recall
@@ -1035,6 +1053,51 @@ impl Core {
         self.lease.ship_epoch(now, &self.cfg).is_some() && !self.lease.fenced()
     }
 
+    /// Plan 46 M0.3 (S5, ADR-42): this node holds the lease in a takeover
+    /// gate whose journal work is done (`PendingGate::shippable`: the
+    /// marker landed, the predecessor's tail and this node's own rows are
+    /// journaled), and is not releasing. The gate waits only for the
+    /// read-delegation quarantine and the kernel drain, which protect
+    /// keys a previous tenure may have read-delegated; a live generation
+    /// of another node owns none of them. `journal_ship_epoch` also
+    /// covers `lost` and the lease's time.
+    pub(crate) fn root_gated_shippable(&self, now: Now) -> bool {
+        !self.lease.releasing
+            && self.lease.gate.as_ref().is_some_and(|g| g.shippable)
+            && self.lease.journal_ship_epoch(now, &self.cfg).is_some()
+    }
+
+    /// A shippable gate serves generation `gen` (ADR-42): one it took on
+    /// from the table (`GenState::inherited`; a generation of this tenure's
+    /// own, kept across a gate, is the usable root's to end), not ended and
+    /// not recalled.
+    pub(crate) fn gated_serves(&self, now: Now, gen: u64) -> bool {
+        self.root_gated_shippable(now)
+            && self
+                .dl
+                .gens
+                .get(&gen)
+                .is_some_and(|g| g.inherited && !g.ended && g.recall == RecallPhase::None)
+    }
+
+    /// What this node does as a root now, for the table's generations.
+    pub(crate) fn root_deleg_level(&self, now: Now) -> RootSync {
+        if self.root_usable(now) {
+            RootSync::Usable
+        } else if self.root_gated_shippable(now) {
+            RootSync::Gated
+        } else {
+            RootSync::None
+        }
+    }
+
+    /// This node takes the generations of other nodes as a root: usable,
+    /// or in a shippable gate (ADR-42). Only a usable root recalls, seals
+    /// or reclaims them.
+    pub(crate) fn root_serves_generations(&self, now: Now) -> bool {
+        self.root_deleg_level(now) != RootSync::None
+    }
+
     // ----------------------------------------------------- the table
 
     /// The table changed (a segment applied, a record journaled here, the
@@ -1231,11 +1294,20 @@ impl Core {
         // Plan 43 C2 (D4): the group each held generation's table records.
         self.deleg_group_refresh(replica);
         // The root side.
-        self.dl.root_synced = self.root_usable(now);
-        if self.dl.root_synced {
+        let level = self.root_deleg_level(now);
+        self.dl.root_synced = level;
+        if level != RootSync::None {
             let live: BTreeSet<u64> = table.iter().map(|d| d.gen).collect();
             for d in table.iter() {
                 if self.dl.gens.contains_key(&d.gen) {
+                    continue;
+                }
+                // Plan 46 M0.3 (S5, ADR-42): a gate whose journal work is
+                // done takes on the generations of other nodes. Its own
+                // are taken on and ended when the gate opens (the open
+                // syncs again as `Usable`), and its S1 answers their
+                // settles until then.
+                if level == RootSync::Gated && d.node == me {
                     continue;
                 }
                 // Its group unreadable: inherited at a later sync (an empty
@@ -1319,6 +1391,9 @@ impl Core {
                     },
                 );
                 self.stats.deleg_inherited += 1;
+                if level == RootSync::Gated {
+                    self.stats.deleg_gated_inherited += 1;
+                }
                 if d.node == me {
                     // A predecessor delegated this subtree to the node
                     // that is now the root: the root executes it itself.
@@ -1339,8 +1414,13 @@ impl Core {
                 // predecessor's, applied from the log).
                 self.mark_ended(now, gen, replica, out);
             }
-            if self.dl.epoch_active {
-                self.recall_all(now, out);
+            // The gate recalls and ends nothing (ADR-42); the open does what
+            // it kept: a recall drained while the gate was pending ends now.
+            if level == RootSync::Usable {
+                if self.dl.epoch_active {
+                    self.recall_all(now, out);
+                }
+                self.root_progress(now, replica, out);
             }
         } else if self.deleg_known() && (self.lease.held.is_none() || self.lease.lost) {
             // Only a lease that is gone ends this root's generations. One
@@ -2818,7 +2898,7 @@ impl Core {
             .filter(|(_, g)| !g.ended && g.last_batch.is_some() && g.cursor > g.committed_sent)
             .map(|(gen, _)| *gen)
             .collect();
-        if due.is_empty() || !self.root_usable(now) {
+        if due.is_empty() || !self.root_serves_generations(now) {
             return;
         }
         self.dl
@@ -3815,7 +3895,10 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        if self.cfg.delegation && !self.dl.root_synced && self.root_usable(now) {
+        // (A level that changed either way: a gate installed over a tenure
+        // that was usable syncs again at `Gated`, and the open at `Usable`.)
+        let level = self.root_deleg_level(now);
+        if self.cfg.delegation && level != RootSync::None && level != self.dl.root_synced {
             self.stats.deleg_root_resyncs += 1;
             self.delegation_sync(now, replica, out);
         }
@@ -5086,7 +5169,14 @@ impl Core {
         let mut ttl_ms = 0u64;
         let mut hold = None;
         let mut group_change: Option<(Ino, Vec<NodeId>)> = None;
-        if self.root_usable(now) && !self.dl.epoch_active {
+        // Plan 46 M0.3 (S5, ADR-42): a takeover gate whose journal work is
+        // done answers the renewals of a generation it has taken on
+        // (`delegation_sync` at `RootSync::Gated`): its keys are not among
+        // the ones the read quarantine protects. A first renewal waited for
+        // that quarantine above (`deleg_renew_waits_for_reads`) and is
+        // answered only after it.
+        let gated_serves = self.gated_serves(now, gen);
+        if (self.root_usable(now) || gated_serves) && !self.dl.epoch_active {
             // Plan 41 L0: as a lock renewal (`lock_renew_one`), the
             // root extends a delegation only as far as a fresh owner may:
             // under a tenure that can be taken over before its lease
@@ -5173,6 +5263,9 @@ impl Core {
             );
             if ttl_ms > 0 {
                 self.stats.deleg_renewals += 1;
+                if gated_serves {
+                    self.stats.deleg_renewals_gated += 1;
+                }
                 self.lease.touch(now);
                 self.arm_gen_expiry(now, gen, out);
                 // Capped by the lease below what the delegate needs to
@@ -5209,8 +5302,10 @@ impl Core {
             && !self.lease.releasing
             && self.lease.gate.is_some()
         {
-            // Plan 46 M0.3 (S2): the takeover gate is pending, and this node
-            // is the root as soon as it opens. A refusal (`ttl_ms` 0) stops
+            // Plan 46 M0.3 (S2): the takeover gate is pending (not yet
+            // shippable, or the generation is one it does not serve: ADR-42
+            // answers the others), and this node is the root as soon as it
+            // opens. A refusal (`ttl_ms` 0) stops
             // the generation at its delegate for good (`deleg_renewal_
             // refused`), and the gate then inherits it as live
             // (`delegation_sync`) and outwaits it for a TTL, the delegate's
@@ -6500,6 +6595,16 @@ impl Core {
                 (involved.iter().map(|d| d.gen).collect(), true)
             }
         };
+        // The gate never recalls (ADR-42): a generation it took on is the
+        // delegate's until the gate opens, and a recall sent inside it would
+        // end the generation (`RecallCut`) in a view that is closed.
+        if self.lease.gate.is_some()
+            && involved
+                .iter()
+                .any(|g| self.dl.gens.get(g).is_some_and(|s| !s.ended))
+        {
+            return RecallPlan::Gated;
+        }
         let designated = involved.iter().any(|g| {
             self.dl
                 .gens
@@ -6657,6 +6762,10 @@ impl Core {
     }
 
     pub(crate) fn start_recall(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
+        // Plan 46 M0.3 (S5, ADR-42): the takeover gate recalls nothing.
+        if self.lease.gate.is_some() {
+            return;
+        }
         let Some(g) = self.dl.gens.get_mut(&gen) else {
             return;
         };
@@ -7018,6 +7127,12 @@ impl Core {
 
     /// A drained recall whose stream caught up ends the generation.
     fn root_progress(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
+        // Plan 46 M0.3 (S5, ADR-42): the takeover gate ends no generation (a
+        // recall kept from a usable phase of this tenure is ended when the
+        // gate opens: `delegation_sync`).
+        if self.lease.gate.is_some() {
+            return;
+        }
         let done: Vec<u64> = self
             .dl
             .gens
@@ -7396,7 +7511,12 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let usable = self.root_ends_recall(now, gen) && self.cfg.delegation;
+        // Plan 46 M0.3 (S5, ADR-42): a takeover gate whose journal work is
+        // done takes its inherited delegates' batches. `root_ends_recall`
+        // stays as it was: it also gates `on_deleg_expiry`, and the gate
+        // reclaims and seals nothing.
+        let usable =
+            (self.root_ends_recall(now, gen) || self.gated_serves(now, gen)) && self.cfg.delegation;
         // A root back from a restart that the lease object still names, and
         // that holds nothing yet (a restart with nothing of its own to ship
         // does not acquire on its own), refuses its delegate's batches for as
@@ -7531,6 +7651,9 @@ impl Core {
         }
         if appended > 0 {
             self.stats.deleg_appended_txs += appended;
+            if self.root_gated_shippable(now) {
+                self.stats.deleg_appended_gated += appended;
+            }
             // The root's own ops forwarded to this delegate may await
             // the log for exactly these completions, or be parked on a
             // recall of it.
@@ -8251,6 +8374,11 @@ pub(crate) enum RecallPlan {
     Wait(BTreeSet<u64>),
     /// Refuse with this code (a designation is involved).
     Refuse(Code),
+    /// Plan 46 M0.3 (S5, ADR-42): the takeover gate is pending and a
+    /// generation the op falls under is one it took on: the gate recalls
+    /// nothing, so the op waits for the gate to open (a `Busy` retry, an
+    /// inbox batch left for the poll after it).
+    Gated,
 }
 
 /// Whether `dir` is `ancestor` or under it.

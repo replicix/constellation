@@ -194,7 +194,7 @@ impl Core {
         // is answered by the gate (below), not held for a grant that never
         // comes: the gate ends a generation delegated to this node itself.
         let gate_settle = if settle && req != OpId(0) {
-            self.gate_settle(&op, replica)
+            self.gate_settle(now, from, &op, replica)
         } else {
             None
         };
@@ -247,6 +247,28 @@ impl Core {
                     MutateOutcome::Held {
                         retry_ms: self.cfg.recall_hold_ms.max(50),
                     }
+                }
+                GateSettle::Redirect(holder) => {
+                    // Plan 46 M0.3 (S5, ADR-42): the key belongs to a live
+                    // generation of another node, which the gate keeps
+                    // renewed: its delegate answers the settle (as `Busy`
+                    // here sent the requester to the lease path, and the op
+                    // outlasted its settle window).
+                    self.stats.gate_settles_redirected += 1;
+                    out.push(Action::Send {
+                        to: from,
+                        msg: PeerMsg::MutateReply {
+                            req,
+                            outcome: MutateOutcome::NotHolder { holder },
+                            base: None,
+                            position: Position::ZERO,
+                            gen: 0,
+                            own_chunks: OwnChunks::None,
+                            own_rows: None,
+                            committed: false,
+                        },
+                    });
+                    return;
                 }
                 GateSettle::Answer(_) if took_effect_here(replica, rid) => {
                     // An acceptance may not leave before the quarantine (M8:
@@ -370,6 +392,25 @@ impl Core {
                 let wait = match self.deleg_recall_plan(now, &keys, replica, out) {
                     super::delegate::RecallPlan::None => Default::default(),
                     super::delegate::RecallPlan::Wait(w) => w,
+                    // The gate recalls nothing (ADR-42): the requester retries.
+                    super::delegate::RecallPlan::Gated => {
+                        if req != OpId(0) {
+                            out.push(Action::Send {
+                                to: from,
+                                msg: PeerMsg::MutateReply {
+                                    req,
+                                    outcome: MutateOutcome::Busy,
+                                    base: None,
+                                    position: Position::ZERO,
+                                    gen: 0,
+                                    own_chunks: OwnChunks::None,
+                                    own_rows: None,
+                                    committed: false,
+                                },
+                            });
+                        }
+                        return;
+                    }
                     super::delegate::RecallPlan::Refuse(code) => {
                         if req != OpId(0) {
                             // Plan 43 C2f review: nothing is journaled for
@@ -1239,6 +1280,10 @@ pub(crate) enum GateSettle {
     /// The journal work is done: answered under this epoch (the rid's
     /// outcome, or a settle refusal; never an acceptance).
     Answer(Epoch),
+    /// Plan 46 M0.3 (S5, ADR-42): the keys belong to a live generation of
+    /// this node it took on (`delegation_sync` at `RootSync::Gated`),
+    /// whose delegate this node reaches: the requester settles there.
+    Redirect(NodeId),
 }
 
 /// Whether `rid` took effect on this replica (a recorded outcome, or an
@@ -1268,12 +1313,25 @@ impl Core {
     /// owns: the root's (`Root`), and its own generations' (`Delegated` to
     /// this node, or a cross-subtree op whose every generation is this
     /// node's: the gate ends such a generation at the cursor with nothing to
-    /// wait for, `delegation_sync`). Another node's generation is not, until
-    /// the gate can recall it.
+    /// wait for, `delegation_sync`). Another node's generation is not
+    /// answered here (the gate recalls nothing); once the gate's journal
+    /// work is done it has taken the generation on and keeps it renewed
+    /// (ADR-42), so a settle from a node other than its delegate is
+    /// redirected to it, as an open root does for a live, reachable one
+    /// (S3). The delegate's own settle, an unreachable or ended or
+    /// recalled generation, one outwaited, and a cross-subtree op that
+    /// involves another node's generation (which needs a recall) are left
+    /// to the ordinary route (`Busy`).
     ///
     /// A usable lease the gate is not releasing: a lost or released one is
     /// no sequencer.
-    pub(crate) fn gate_settle(&self, op: &MutateOp, replica: &dyn Replica) -> Option<GateSettle> {
+    pub(crate) fn gate_settle(
+        &self,
+        now: Now,
+        from: NodeId,
+        op: &MutateOp,
+        replica: &dyn Replica,
+    ) -> Option<GateSettle> {
         let g = self.lease.gate.as_ref()?;
         if self.lease.held.is_none() || self.lease.lost || self.lease.releasing {
             return None;
@@ -1281,7 +1339,38 @@ impl Core {
         let me = self.cfg.node_id;
         let ours = match replica.resolve_ownership(&keys_of_op_in(op, replica)) {
             Ownership::Root => true,
-            Ownership::Delegated(d) => d.node == me,
+            Ownership::Delegated(d) => {
+                if d.node != me {
+                    // The live test of S3 (`on_forward`): known, not ended,
+                    // not recalled (a stopped delegate would send the settle
+                    // straight back), within its grant and reachable.
+                    let live = g.shippable
+                        && from != d.node
+                        && self.dl.gens.get(&d.gen).is_some_and(|s| {
+                            s.inherited
+                                && !s.ended
+                                && s.node == d.node
+                                && s.recall == RecallPhase::None
+                        })
+                        && now.wait < self.gen_until(d.gen)
+                        && self.links.get(&d.node).is_some_and(|l| l.connected);
+                    if !live {
+                        return None;
+                    }
+                    // Only a delegate this tenure has granted owns the
+                    // generation again: one that lapsed while the gate was
+                    // not shippable answers `NotHolder { root }` (its copy
+                    // is not honoured), and the two would send the settle
+                    // back and forth. Held, the requester retries until the
+                    // first renewal is granted.
+                    return Some(if self.dl.answered_granting.contains(&d.gen) {
+                        GateSettle::Redirect(d.node)
+                    } else {
+                        GateSettle::Held
+                    });
+                }
+                true
+            }
             Ownership::CrossSubtree { involved, .. } => involved.iter().all(|d| d.node == me),
         };
         ours.then_some(if g.shippable {

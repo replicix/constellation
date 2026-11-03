@@ -52525,25 +52525,571 @@ mod c2g_settle {
         assert_eq!(reply_to_3(&out, 7), Some(MutateOutcome::Busy), "{out:?}");
     }
 
-    /// S1 (a control until S5): a settle of a rid whose keys belong to
-    /// another node's generation is not this node's to answer in its gate:
-    /// still `Busy`, nothing journaled.
+    /// S1, and since S5 (ADR-42) the unreachable-delegate control: a settle of
+    /// a rid whose keys belong to another node's generation is redirected to
+    /// its delegate only when the gate can reach it
+    /// (`s5_a_shippable_gate_serves_another_nodes_generation`). The gate has
+    /// taken the generation on here, but node 4 is not connected: the
+    /// settle is still not this node's to answer, `Busy`, and nothing is
+    /// journaled.
     #[test]
     fn a_gated_root_still_bounces_a_settle_on_another_nodes_generation() {
         let mut h = gated_root(true);
+        h.core.cfg.delegation = true;
         let dir = delegated_to_me(&h.meta, 4);
+        let op = create_in(&h, dir, "o");
+        let out = h.step_archived(request(7, 1, op, true));
+        assert!(
+            h.core.dl.gens.contains_key(&7),
+            "the gate took the generation on: only the link is missing"
+        );
+        assert_eq!(reply_to_3(&out, 7), Some(MutateOutcome::Busy), "{out:?}");
+        assert_eq!(h.meta.completed_outcome(rid3(1)).unwrap(), None);
+        assert_eq!(h.core.stats.gate_settles_redirected, 0);
+    }
+
+    /// S1: a generation delegated to this node itself — the predecessor
+    /// delegated to the node that now takes over, and the gate ends the
+    /// generation at the cursor — is the gate's own to settle. Fails on the
+    /// parent: `Held` (the grant "is not installed yet").
+    #[test]
+    fn a_gated_root_settles_a_rid_on_a_generation_delegated_to_itself() {
+        let mut h = gated_root(true);
+        let dir = delegated_to_me(&h.meta, 1);
+        // (The takeover's strand stopped this node's own copy of the
+        // generation; since the gate syncs the table at `shippable` (S5) the
+        // copy is installed here, and a live one would take the settle as a
+        // delegate's.)
+        poke(&mut h);
+        if let Some(m) = h.core.dl.mine.get_mut(&7) {
+            m.lapsed = true;
+        }
         let ino = h.meta.allocate_ino(dir).unwrap();
         let op = MutateOp::Create {
             parent: dir,
-            name: "o".into(),
+            name: "g".into(),
             ino,
             mode: 0o644,
             uid: 0,
             gid: 0,
         };
         let out = h.step_archived(request(7, 1, op, true));
-        assert_eq!(reply_to_3(&out, 7), Some(MutateOutcome::Busy), "{out:?}");
+        assert_eq!(
+            answer(&out, 7).map(|a| a.0),
+            Some(MutateOutcome::Abandoned),
+            "{out:?}"
+        );
+        assert!(h.meta.lookup(dir, "g").unwrap().is_none());
+    }
+
+    // ---- plan 46 M0.3 (S5, ADR-42): a shippable gate serves the generations it inherits ----
+
+    fn rid4(seq: u64) -> Rid {
+        Rid {
+            node: 4,
+            incarnation: 1,
+            seq,
+        }
+    }
+
+    /// A create of `name` in `dir`.
+    fn create_in(h: &Harness, dir: constellation_fs_core::Ino, name: &str) -> MutateOp {
+        MutateOp::Create {
+            parent: dir,
+            name: name.into(),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        }
+    }
+
+    /// The directory table: node 4 connected, nodes 2 and 3 not.
+    fn connect_4(h: &mut Harness) -> Vec<Action> {
+        h.step(Event::Peers {
+            links: (2..=4)
+                .map(|node| crate::event::PeerLink {
+                    node,
+                    connected: node == 4,
+                    last_seen: None,
+                    rtt_ms: Some(5),
+                    since: Some(WaitMs(0)),
+                })
+                .collect(),
+            lapses: 0,
+        })
+    }
+
+    /// A root (node 1) in a takeover gate at epoch 2 (`shippable` or not),
+    /// whose table delegates `/d` to node 4 as generation 7 and which
+    /// reaches node 4: the first step after it syncs the table, and a
+    /// shippable gate takes the generation on.
+    fn gated_root_with_gen_at_4(shippable: bool) -> (Harness, constellation_fs_core::Ino) {
+        let mut h = gated_root(shippable);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let dir = delegated_to_me(&h.meta, 4);
+        connect_4(&mut h);
+        (h, dir)
+    }
+
+    /// Node 4's batch of one create at stream index `idx` of generation 7.
+    fn batch_from_4(h: &Harness, dir: constellation_fs_core::Ino, req: u64, idx: u64) -> Event {
+        let ino = h.meta.allocate_ino(dir).unwrap();
+        Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegateStream {
+                req: OpId(req),
+                gen: 7,
+                round: 1,
+                txs: vec![constellation_meta::DelegateTx {
+                    idx,
+                    rid: Some(rid4(idx)),
+                    records: vec![
+                        LogRecord::Create {
+                            parent: dir,
+                            name: format!("f{idx}"),
+                            ino,
+                            mode: 0o644,
+                            uid: 0,
+                            gid: 0,
+                            time_ns: 1,
+                        },
+                        LogRecord::Completed { rid: rid4(idx) },
+                    ],
+                    deps: Default::default(),
+                }],
+                leaving: Vec::new(),
+                leaving_barriers: Vec::new(),
+            },
+        }
+    }
+
+    /// The acknowledgements to node 4 in `out`: `(through, committed,
+    /// refused)`.
+    fn acks_to_4(out: &[Action]) -> Vec<(u64, u64, bool)> {
+        sends(out)
+            .into_iter()
+            .filter_map(|(to, m)| match m {
+                PeerMsg::DelegateStreamAck {
+                    through,
+                    committed,
+                    refused,
+                    ..
+                } if to == 4 => Some((*through, *committed, *refused)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Node 4's renewal of generation 7.
+    fn renew_4(req: u64, first: bool) -> Event {
+        Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegRenew {
+                req: OpId(req),
+                gen: 7,
+                round: 1,
+                backup: None,
+                stream_head: 0,
+                stream_head_at: 0,
+                first,
+            },
+        }
+    }
+
+    /// What the gate's journal has shipped, as the shipper's ack would say.
+    fn ship_all(h: &mut Harness) {
+        let batch = Replica::take_journal(&h.meta, 100).unwrap();
+        let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
+        Replica::ack_journal(&h.meta, &seqs, 1, None).unwrap();
+        h.core.note_shipped(&seqs, 0);
+    }
+
+    /// S5 (ADR-42), the fail-before test: a takeover gate whose journal work
+    /// is done takes on the generations of other nodes. Before, it learned
+    /// the table only when it opened, refused a delegate's batch at
+    /// `through=0`, left its renewal unanswered and bounced a settle on its
+    /// keys `Busy`: an op on another node's subtree outlasted its deadline
+    /// and the settle window (delegated-holder-cut seeds 9, 14, 20, 39,
+    /// `+unsettled`). Now (1) the batch is appended and acknowledged, with
+    /// `committed` as ADR-41 has it, and the push follows once the row
+    /// ships; (2) a renewal is granted; (3) a settle from another node is
+    /// redirected to the delegate. Fails on the parent at step 1: `refused:
+    /// true, through: 0`.
+    #[test]
+    fn s5_a_shippable_gate_serves_another_nodes_generation() {
+        let (mut h, dir) = gated_root_with_gen_at_4(true);
+        assert!(h.core.lease.gate.is_some());
+        // (1) A batch.
+        let out = h.step(batch_from_4(&h, dir, 10, 1));
+        let cap = 1.min(h.core.root_append_cap(7, &h.meta));
+        assert_eq!(acks_to_4(&out), vec![(1, cap, false)], "{out:?}");
+        assert!(h.meta.lookup(dir, "f1").unwrap().is_some(), "not appended");
+        ship_all(&mut h);
+        let mut seen = acks_to_4(&out);
+        seen.extend(acks_to_4(&poke(&mut h)));
+        assert_eq!(
+            seen.iter().map(|a| a.1).max(),
+            Some(1),
+            "the committed row was not pushed once it shipped: {seen:?}"
+        );
+        // (2) A renewal.
+        let out = h.step(renew_4(11, false));
+        let ttls = deleg_renewed_ttls(&out);
+        assert!(
+            matches!(ttls.as_slice(), [t] if *t > 0),
+            "{ttls:?}: {out:?}"
+        );
+        // (3) A settle from another node: node 4's op, node 4 answers it.
+        let op = create_in(&h, dir, "o");
+        let out = h.step_archived(request(12, 1, op, true));
+        assert_eq!(
+            reply_to_3(&out, 12),
+            Some(MutateOutcome::NotHolder { holder: 4 }),
+            "{out:?}"
+        );
         assert_eq!(h.meta.completed_outcome(rid3(1)).unwrap(), None);
+        assert!(h.core.lease.gate.is_some(), "the gate is still pending");
+    }
+
+    /// S5: what the gate counts of what it takes on.
+    #[test]
+    fn s5_the_gate_counts_what_it_takes_on() {
+        let (mut h, dir) = gated_root_with_gen_at_4(true);
+        assert_eq!(h.core.stats.deleg_gated_inherited, 1);
+        assert_eq!(h.core.stats.deleg_inherited, 1);
+        h.step(batch_from_4(&h, dir, 10, 1));
+        assert_eq!(h.core.stats.deleg_appended_gated, 1);
+        h.step(renew_4(11, false));
+        assert_eq!(h.core.stats.deleg_renewals_gated, 1);
+        h.step_archived(request(12, 1, create_in(&h, dir, "o"), true));
+        assert_eq!(h.core.stats.gate_settles_redirected, 1);
+        assert_eq!(h.core.stats.gate_settles_answered, 0);
+    }
+
+    /// S5, negative 1: a gate whose journal work is not done takes nothing
+    /// on: the batch is refused at `through=0`, the renewal left unanswered
+    /// (S2), and the settle `Busy`, as before S5.
+    #[test]
+    fn s5_a_gate_that_is_not_shippable_serves_nothing() {
+        let (mut h, dir) = gated_root_with_gen_at_4(false);
+        assert!(h.core.dl.gens.is_empty(), "learned a generation");
+        let out = h.step(batch_from_4(&h, dir, 10, 1));
+        assert_eq!(acks_to_4(&out), vec![(0, 0, true)], "{out:?}");
+        assert!(h.meta.lookup(dir, "f1").unwrap().is_none());
+        let out = h.step(renew_4(11, false));
+        assert!(deleg_renewed_ttls(&out).is_empty(), "{out:?}");
+        let out = h.step_archived(request(12, 1, create_in(&h, dir, "o"), true));
+        assert_eq!(reply_to_3(&out, 12), Some(MutateOutcome::Busy), "{out:?}");
+        let s = &h.core.stats;
+        assert_eq!(
+            (
+                s.deleg_gated_inherited,
+                s.deleg_renewals_gated,
+                s.deleg_appended_gated,
+                s.gate_settles_redirected
+            ),
+            (0, 0, 0, 0)
+        );
+    }
+
+    /// S5, negative 2: a gate that is releasing will never be the root: it
+    /// refuses the batch, refuses the renewal (`ttl_ms` 0, as
+    /// `a_releasing_gated_root_still_refuses_a_renewal`), and answers the
+    /// settle nothing.
+    #[test]
+    fn s5_a_releasing_shippable_gate_serves_nothing() {
+        let (mut h, dir) = gated_root_with_gen_at_4(true);
+        assert!(h.core.dl.gens.contains_key(&7));
+        h.core.lease.releasing = true;
+        let out = h.step(batch_from_4(&h, dir, 10, 1));
+        assert_eq!(acks_to_4(&out), vec![(0, 0, true)], "{out:?}");
+        assert!(h.meta.lookup(dir, "f1").unwrap().is_none());
+        let out = h.step(renew_4(11, false));
+        assert_eq!(deleg_renewed_ttls(&out), vec![0], "{out:?}");
+        let out = h.step_archived(request(12, 1, create_in(&h, dir, "o"), true));
+        assert_eq!(reply_to_3(&out, 12), Some(MutateOutcome::Busy), "{out:?}");
+        assert_eq!(h.core.stats.deleg_renewals_gated, 0);
+        assert_eq!(h.core.stats.deleg_appended_gated, 0);
+        assert_eq!(h.core.stats.gate_settles_redirected, 0);
+    }
+
+    /// S5, negative 3, the one exclusion the gate keeps: a first renewal
+    /// waits out the read-delegation quarantine (the delegate was granted
+    /// none yet, so grants of a previous tenure on its subtree are not
+    /// recalled by its writes). Parked inside the gate, it is answered by
+    /// the quarantine's timer while the gate is still pending.
+    #[test]
+    fn s5_a_first_renewal_waits_for_the_quarantine_inside_the_gate() {
+        let (mut h, _dir) = gated_root_with_gen_at_4(true);
+        let q = h.clk().wait.plus(5_000);
+        h.meta.read_delegations().set_quarantine(q);
+        let out = h.step(renew_4(11, true));
+        assert!(
+            deleg_renewed_ttls(&out).is_empty(),
+            "granted inside: {out:?}"
+        );
+        assert!(h.core.dl.gens[&7].renew_waiting.is_some());
+        assert_eq!(h.core.stats.deleg_renew_read_waits, 1);
+        let t = timers(&out, TimerKind::GrantQuarantine);
+        assert_eq!(t.len(), 1, "{out:?}");
+        // Not answered by anything else meanwhile.
+        h.advance(2_000);
+        let out = h.step(renew_4(12, false));
+        assert!(
+            matches!(deleg_renewed_ttls(&out).as_slice(), [t] if *t > 0),
+            "a later non-first renewal is granted: {out:?}"
+        );
+        h.advance(3_001);
+        let out = h.step(Event::Timer { id: t[0] });
+        let ttls = deleg_renewed_ttls(&out);
+        assert!(
+            matches!(ttls.as_slice(), [t] if *t > 0),
+            "the waiting renewal is answered once the quarantine passed: {out:?}"
+        );
+        assert!(h.core.lease.gate.is_some(), "the gate is still pending");
+        assert!(h.core.dl.gens[&7].renew_waiting.is_none());
+    }
+
+    /// S5, negative 4: the gate reclaims nothing. The expiry of an
+    /// inherited window inside the gate re-arms (`on_deleg_expiry`), ends no
+    /// generation and journals nothing; once the gate opens it outwaits as
+    /// it always did.
+    #[test]
+    fn s5_a_gate_does_not_reclaim_an_inherited_generation_at_its_expiry() {
+        let mut h = gated_root(true);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        delegated_to_me(&h.meta, 4);
+        let out = connect_4(&mut h);
+        let expiry = timers(&out, TimerKind::DelegExpiry);
+        assert_eq!(expiry.len(), 1, "{out:?}");
+        // The lease outlives the window.
+        h.set_lease_end(h.now.plus(120_000));
+        let until = h.core.gen_until(7);
+        h.advance(until.since(h.clk().wait) as u64 + 1_000);
+        let tip = h.meta.journal_tip().unwrap();
+        let out = h.step(Event::Timer { id: expiry[0] });
+        assert!(h.core.root_gated_shippable(h.clk()), "left the gate");
+        assert!(!h.core.dl.gens[&7].ended, "reclaimed inside the gate");
+        assert_eq!(h.core.stats.deleg_reclaimed, 0);
+        assert_eq!(h.meta.journal_tip().unwrap(), tip, "journaled: {out:?}");
+        let again = timers(&out, TimerKind::DelegExpiry);
+        assert_eq!(again.len(), 1, "no retry armed: {out:?}");
+        // Open: the retry outwaits the generation.
+        h.core.lease.gate = None;
+        h.advance(1_000);
+        h.step(Event::Timer { id: again[0] });
+        assert_eq!(h.core.stats.deleg_reclaimed, 1);
+    }
+
+    /// A second generation, number 8, of `/e`, delegated to `node`: the
+    /// table's next segment.
+    fn delegate_e_to(meta: &Meta, node: NodeId) -> constellation_fs_core::Ino {
+        let dir = meta.allocate_ino(ROOT_INO).unwrap();
+        crate::replica::Replica::apply_segment(
+            meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[
+                LogRecord::Mkdir {
+                    parent: ROOT_INO,
+                    name: "e".into(),
+                    ino: dir,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 1,
+                },
+                LogRecord::Delegate {
+                    dir,
+                    node,
+                    gen: 8,
+                    designated: false,
+                    range: (0, 0),
+                },
+            ],
+        )
+        .unwrap();
+        dir
+    }
+
+    /// S5, negative 5: the open does not take a generation on twice or
+    /// reset what the gate built (`cursor`, `last_batch`, `committed_sent`),
+    /// and a generation of the gate's own node is taken on and ended only
+    /// then (`delegation_sync` at `Gated` skips it, S1 answers its settles
+    /// meanwhile).
+    #[test]
+    fn s5_the_open_neither_inherits_twice_nor_resets_and_ends_an_own_generation() {
+        let mut h = gated_root(true);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let dir = delegated_to_me(&h.meta, 4);
+        delegate_e_to(&h.meta, 1);
+        connect_4(&mut h);
+        assert_eq!(h.core.stats.deleg_inherited, 1);
+        assert_eq!(h.core.stats.deleg_gated_inherited, 1);
+        assert!(h.core.dl.gens.contains_key(&7));
+        assert!(!h.core.dl.gens.contains_key(&8), "the gate took its own on");
+        h.step(batch_from_4(&h, dir, 10, 1));
+        ship_all(&mut h);
+        poke(&mut h);
+        let before = {
+            let g = &h.core.dl.gens[&7];
+            (
+                g.cursor,
+                g.last_batch,
+                g.committed_sent,
+                g.granted,
+                g.inherited,
+            )
+        };
+        assert_eq!((before.0, before.1.is_some(), before.2), (1, true, 1));
+        // The gate opens.
+        h.core.lease.gate = None;
+        poke(&mut h);
+        assert!(h.core.root_usable(h.clk()));
+        let g = &h.core.dl.gens[&7];
+        assert_eq!(
+            (
+                g.cursor,
+                g.last_batch,
+                g.committed_sent,
+                g.granted,
+                g.inherited
+            ),
+            before,
+            "the open reset the generation"
+        );
+        assert!(!g.ended);
+        assert_eq!(h.core.stats.deleg_inherited, 2, "7 once, 8 at the open");
+        assert_eq!(h.core.stats.deleg_gated_inherited, 1);
+        assert!(
+            h.core.dl.gens[&8].ended,
+            "an own generation is ended at the open"
+        );
+        assert!(h.core.stats.deleg_root_resyncs >= 2);
+    }
+
+    /// S5, negative 6: the gated root's own settle, with a table that names
+    /// a generation of another node (so the gate knows one,
+    /// `deleg_known`): on a key of the root it is answered `Abandoned` as in
+    /// S1 and trips no `debug_assert`; on a key of a generation of its own
+    /// it is answered too, not parked on that generation's wait until the
+    /// gate opens (`execute_local_outcome` plans no recall for a settle in a
+    /// gate: `start_recall` does not know the generation, and the plan
+    /// would wait on it). Fails without the guard: the second op parks.
+    #[test]
+    fn s5_a_gated_roots_own_settle_is_answered_on_every_key_it_owns() {
+        let mut h = Harness::new(1);
+        h.core.lease.cached_holder = Some(2);
+        // The table names generation 7 at node 4, and `/e` exists (from a
+        // segment: a local row would keep the ops off the forward path).
+        delegated_to_me(&h.meta, 4);
+        let e = h.meta.allocate_ino(ROOT_INO).unwrap();
+        crate::replica::Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::Mkdir {
+                parent: ROOT_INO,
+                name: "e".into(),
+                ino: e,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            }],
+        )
+        .unwrap();
+        let (on_root, on_own) = (h.rid(1), h.rid(2));
+        for (rid, op) in [(on_root, h.create("own")), (on_own, create_in(&h, e, "x"))] {
+            let out = h.step(Event::Submit {
+                policy: Policy::Client,
+                rid,
+                op,
+                tag: Default::default(),
+            });
+            assert!(
+                sends(&out).iter().any(|(to, _)| *to == 2),
+                "not forwarded: {out:?}"
+            );
+        }
+        // The ops are lost on the way. This node takes the lease over, its
+        // gate's journal work is done, and the table names generation 8
+        // (`/e`) at this node as well.
+        h.hold(
+            2,
+            Some(PendingGate {
+                epoch: 2,
+                takeover: true,
+                marker_shipped: true,
+                drained: false,
+                fast_prev: false,
+                backup_tail_epoch: None,
+                shippable: true,
+            }),
+        );
+        h.core.ack.peers.clear();
+        h.core.ack.candidate = None;
+        h.core.ack.eligible = Some(false);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        crate::replica::Replica::apply_segment(
+            &h.meta,
+            3,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::Delegate {
+                dir: e,
+                node: 1,
+                gen: 8,
+                designated: false,
+                range: (0, 0),
+            }],
+        )
+        .unwrap();
+        connect_4(&mut h);
+        assert!(h.core.dl.gens.contains_key(&7), "no generation known");
+        assert!(!h.core.dl.gens.contains_key(&8));
+        for rid in [on_root, on_own] {
+            // (This node was the delegate of generation 8 and is no more:
+            // the takeover's strand stopped its copy. A live one would take
+            // the settle as a delegate's.)
+            h.core.dl.mine.get_mut(&8).expect("installed").lapsed = true;
+            let deadline = h.core.clients[&rid].deadline;
+            h.step(Event::Timer { id: deadline });
+        }
+        assert!(abandoned_row(&h, on_root), "no refusal for the root's key");
+        assert!(
+            abandoned_row(&h, on_own),
+            "no refusal for the own generation's key"
+        );
+        assert!(!h.core.has_exec_parks(), "a settle parked on a recall");
+        assert!(h.core.lease.gate.is_some());
+        let out = h.archive_lands();
+        for rid in [on_root, on_own] {
+            assert!(
+                out.iter().any(|a| matches!(
+                    a,
+                    Action::Reply {
+                        rid: r,
+                        reply: ClientReply::Outcome(MutateOutcome::Abandoned),
+                        ..
+                    } if *r == rid
+                )),
+                "{rid:?}: {out:?}"
+            );
+        }
     }
 
     /// S5 (fable review MUST 1, ADR-42): an inode's keys belong to the owner
@@ -52590,18 +53136,7 @@ mod c2g_settle {
             ],
         )
         .unwrap();
-        h.step(Event::Peers {
-            links: (2..=4)
-                .map(|node| crate::event::PeerLink {
-                    node,
-                    connected: node == 4,
-                    last_seen: None,
-                    rtt_ms: Some(5),
-                    since: Some(WaitMs(0)),
-                })
-                .collect(),
-            lapses: 0,
-        });
+        connect_4(&mut h);
         assert!(h.core.dl.gens.contains_key(&7), "generation 7 not learned");
         // The name in the delegation leaving: X stays the root's.
         let rid = h.rid(1);
@@ -52653,18 +53188,7 @@ mod c2g_settle {
             ],
         )
         .unwrap();
-        h.step(Event::Peers {
-            links: (2..=4)
-                .map(|node| crate::event::PeerLink {
-                    node,
-                    connected: node == 4,
-                    last_seen: None,
-                    rtt_ms: Some(5),
-                    since: Some(WaitMs(0)),
-                })
-                .collect(),
-            lapses: 0,
-        });
+        connect_4(&mut h);
         let rid = h.rid(1);
         let out = h.step(Event::Submit {
             policy: Policy::Client,
@@ -52687,30 +53211,224 @@ mod c2g_settle {
         );
     }
 
-    /// S1: a generation delegated to this node itself — the predecessor
-    /// delegated to the node that now takes over, and the gate ends the
-    /// generation at the cursor — is the gate's own to settle. Fails on the
-    /// parent: `Held` (the grant "is not installed yet").
+    /// S5 (fable review MUST 2): the gate recalls nothing. With a
+    /// generation it took on known, an op the plan sends to a recall (a
+    /// deps park released by a gated batch, an execution kept from a usable
+    /// phase) would have sent `DelegRecall`, closed the generation's window
+    /// and, once the delegate drained it, ended it (`RecallCut`) in a view
+    /// that is closed. The plan answers `Gated`, `start_recall` sends
+    /// nothing. Fails on the parent: `Wait`, a `DelegRecall` to node 4.
     #[test]
-    fn a_gated_root_settles_a_rid_on_a_generation_delegated_to_itself() {
-        let mut h = gated_root(true);
-        let dir = delegated_to_me(&h.meta, 1);
-        let ino = h.meta.allocate_ino(dir).unwrap();
-        let op = MutateOp::Create {
-            parent: dir,
-            name: "g".into(),
-            ino,
-            mode: 0o644,
-            uid: 0,
-            gid: 0,
-        };
-        let out = h.step_archived(request(7, 1, op, true));
+    fn s5_the_gate_sends_no_recall_for_a_generation_it_took_on() {
+        let (mut h, dir) = gated_root_with_gen_at_4(true);
+        assert!(h.core.dl.gens.contains_key(&7));
+        let keys = crate::core::holder::keys_of_op_in(&create_in(&h, dir, "r"), &h.meta);
+        let mut out = Vec::new();
+        let plan = h.core.deleg_recall_plan(h.clk(), &keys, &h.meta, &mut out);
+        assert_eq!(plan, crate::core::delegate::RecallPlan::Gated, "{out:?}");
+        h.core.start_recall(h.clk(), 7, &mut out);
+        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(h.core.dl.gens[&7].recall, RecallPhase::None);
+        assert_eq!(h.core.stats.deleg_recalls_sent, 0);
+        // A rename across generations (cross-subtree) the same.
+        h.core.lease.gate = None;
+        let plan = h.core.deleg_recall_plan(h.clk(), &keys, &h.meta, &mut out);
+        assert!(
+            matches!(plan, crate::core::delegate::RecallPlan::Wait(_)),
+            "an open root recalls: {plan:?}"
+        );
+    }
+
+    /// S5 (fable review MUST 2): a recall drained while this tenure was
+    /// usable (its generation kept across a gate that `adopt_epoch_hold`
+    /// installs) is not ended inside the gate (`RecallCut`, `void_stream`),
+    /// but when the gate opens. Fails on the parent's `root_progress`: ended
+    /// at the delegate's answer.
+    #[test]
+    fn s5_a_drained_recall_is_not_ended_inside_the_gate() {
+        let (mut h, _dir) = gated_root_with_gen_at_4(true);
+        let g = h.core.dl.gens.get_mut(&7).unwrap();
+        g.recall = RecallPhase::Sent;
+        h.core
+            .dl
+            .by_req
+            .insert(OpId(77), (7, crate::core::delegate::ReqKind::Recall));
+        let tip = h.meta.journal_tip().unwrap();
+        let out = h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegRecalled {
+                req: OpId(77),
+                gen: 7,
+                through: 0,
+                locks: Default::default(),
+            },
+        });
         assert_eq!(
-            answer(&out, 7).map(|a| a.0),
-            Some(MutateOutcome::Abandoned),
+            h.core.dl.gens[&7].recall,
+            RecallPhase::Drained(0),
             "{out:?}"
         );
-        assert!(h.meta.lookup(dir, "g").unwrap().is_none());
+        assert!(!h.core.dl.gens[&7].ended, "ended inside the gate");
+        assert_eq!(h.core.stats.deleg_recalls_drained, 0);
+        assert_eq!(h.meta.journal_tip().unwrap(), tip, "journaled: {out:?}");
+        // A batch for a recalled generation is refused in the gate too.
+        let out = h.step(batch_from_4(&h, _dir, 10, 1));
+        assert_eq!(acks_to_4(&out), vec![(0, 0, true)], "{out:?}");
+        // The open ends it.
+        h.core.lease.gate = None;
+        poke(&mut h);
+        assert!(h.core.dl.gens[&7].ended, "not ended at the open");
+        assert_eq!(h.core.stats.deleg_recalls_drained, 1);
+    }
+
+    /// S5 (fable review): the gate serves only generations it took on from
+    /// the table: one this tenure granted and kept across a gate (not
+    /// `inherited`) is a usable root's to renew, take batches of and end.
+    #[test]
+    fn s5_the_gate_serves_only_a_generation_it_inherited() {
+        let (mut h, dir) = gated_root_with_gen_at_4(true);
+        h.core.dl.gens.get_mut(&7).unwrap().inherited = false;
+        let out = h.step(batch_from_4(&h, dir, 10, 1));
+        assert_eq!(acks_to_4(&out), vec![(0, 0, true)], "{out:?}");
+        let out = h.step(renew_4(11, false));
+        assert!(deleg_renewed_ttls(&out).is_empty(), "{out:?}");
+        let out = h.step_archived(request(12, 1, create_in(&h, dir, "o"), true));
+        assert_eq!(reply_to_3(&out, 12), Some(MutateOutcome::Busy), "{out:?}");
+    }
+
+    /// S5 (fable review): a gate installed over a tenure that was usable
+    /// syncs the table again at `Gated`, and the open at `Usable` (a level
+    /// below the stale one still syncs).
+    #[test]
+    fn s5_a_gate_over_a_usable_tenure_syncs_again() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        poke(&mut h);
+        assert_eq!(
+            h.core.dl.root_synced,
+            crate::core::delegate::RootSync::Usable
+        );
+        // The tenure's gate (an epoch hold's continuation) is installed.
+        let dir = delegated_to_me(&h.meta, 4);
+        let _ = dir;
+        h.hold(
+            2,
+            Some(PendingGate {
+                epoch: 2,
+                takeover: false,
+                marker_shipped: true,
+                drained: false,
+                fast_prev: false,
+                backup_tail_epoch: None,
+                shippable: true,
+            }),
+        );
+        let before = h.core.stats.deleg_root_resyncs;
+        poke(&mut h);
+        assert_eq!(
+            h.core.dl.root_synced,
+            crate::core::delegate::RootSync::Gated
+        );
+        assert!(h.core.stats.deleg_root_resyncs > before);
+        assert!(h.core.dl.gens.contains_key(&7), "the table's generation");
+    }
+
+    /// S5 (fable review): the lock content of a gated answer is the opened
+    /// root's: the same handoff, floor, cut and barrier (the mirror is
+    /// installed before the gate is shippable, and the lock quarantine's
+    /// grace is the same call).
+    #[test]
+    fn s5_a_gated_renewal_carries_the_lock_content_of_the_opened_roots() {
+        let content = |out: &[Action]| {
+            sends(out).into_iter().find_map(|(_, m)| match m {
+                PeerMsg::DelegRenewed {
+                    ttl_ms,
+                    locks,
+                    lock_floor,
+                    lock_cut_at,
+                    lock_cut,
+                    lock_barrier,
+                    lock_carry,
+                    ..
+                } if *ttl_ms > 0 => Some(format!(
+                    "{locks:?} {lock_floor:?} {lock_cut_at} {lock_cut:?} {lock_barrier} {lock_carry:?}"
+                )),
+                _ => None,
+            })
+        };
+        let (mut h, _dir) = gated_root_with_gen_at_4(true);
+        let gated = content(&h.step(renew_4(11, false))).expect("no grant in the gate");
+        h.core.lease.gate = None;
+        let opened = content(&h.step(renew_4(12, false))).expect("no grant once open");
+        assert_eq!(gated, opened);
+    }
+
+    /// S5: the redirect is S3's live test (`on_forward`), and only for a
+    /// delegate this tenure has granted (`Held` before): not the
+    /// delegate's own settle (its stopped copy sends it straight back), not
+    /// an ended or recalled generation, not one whose window ran out (a
+    /// silent delegate the open root recalls), not an unreachable delegate.
+    /// Each is `Busy`, as before.
+    #[test]
+    fn s5_the_gate_redirects_a_settle_only_to_a_live_reachable_delegate() {
+        let (mut h, dir) = gated_root_with_gen_at_4(true);
+        let settle = |h: &mut Harness, req: u64, seq: u64| {
+            let out = h.step_archived(request(req, seq, create_in(h, dir, "o"), true));
+            reply_to_3(&out, req)
+        };
+        let redirected = Some(MutateOutcome::NotHolder { holder: 4 });
+        // Not granted by this tenure yet (the delegate may have lapsed
+        // while the gate was not shippable and answers `NotHolder { root }`
+        // for it): held, the requester retries; never redirected, the two
+        // would send the settle back and forth.
+        assert!(
+            matches!(settle(&mut h, 19, 1), Some(MutateOutcome::Held { .. })),
+            "a delegate this tenure has not granted"
+        );
+        h.step(renew_4(18, false));
+        assert_eq!(settle(&mut h, 20, 1), redirected);
+        // The delegate's own settle, from node 4, goes no further.
+        let out = h.step_archived(Event::Peer {
+            from: 4,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(21),
+                rid: rid4(1),
+                op: create_in(&h, dir, "p"),
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+                settle: true,
+            },
+        });
+        assert!(
+            sends(&out).iter().all(|(to, m)| *to != 4
+                || !matches!(
+                    m,
+                    PeerMsg::MutateReply {
+                        outcome: MutateOutcome::NotHolder { .. },
+                        ..
+                    }
+                )),
+            "redirected to itself: {out:?}"
+        );
+        // A recall in flight, an ended generation.
+        h.core.dl.gens.get_mut(&7).unwrap().recall = RecallPhase::Sent;
+        assert_eq!(settle(&mut h, 22, 2), Some(MutateOutcome::Busy));
+        let g = h.core.dl.gens.get_mut(&7).unwrap();
+        g.recall = RecallPhase::None;
+        g.ended = true;
+        assert_eq!(settle(&mut h, 23, 3), Some(MutateOutcome::Busy));
+        h.core.dl.gens.get_mut(&7).unwrap().ended = false;
+        assert_eq!(settle(&mut h, 24, 4), redirected);
+        // Its window ran out.
+        let until = h.core.gen_until(7);
+        h.advance(until.since(h.clk().wait) as u64 + 1);
+        h.set_lease_end(h.now.plus(120_000));
+        assert_eq!(settle(&mut h, 25, 5), Some(MutateOutcome::Busy));
+        assert_eq!(h.core.stats.gate_settles_redirected, 2);
     }
 }
 

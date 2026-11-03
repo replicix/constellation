@@ -2461,7 +2461,13 @@ impl Core {
                 ownership = ?replica.resolve_ownership(&keys),
                 "root executes locally"
             );
-            let wait = if !self.deleg_known() {
+            // Plan 46 M0.3 (S5, ADR-42): a settle executes nothing, and the
+            // takeover gate ends its own generations without a recall
+            // (`delegation_sync` skips their rows until it opens): the plan
+            // would wait on a generation `start_recall` does not know until
+            // the gate opens. A gated root's settle is answered by
+            // `gate_settle` on keys no generation of another node owns.
+            let wait = if !self.deleg_known() || (settle && self.lease.gate.is_some()) {
                 Default::default()
             } else {
                 match self.deleg_recall_plan(now, &keys, replica, out) {
@@ -2470,6 +2476,8 @@ impl Core {
                     super::delegate::RecallPlan::Refuse(code) => {
                         return MutateOutcome::Errno(code);
                     }
+                    // The gate recalls nothing (ADR-42): retried once it opens.
+                    super::delegate::RecallPlan::Gated => return MutateOutcome::Busy,
                 }
             };
             let deps_wait = (!settle && !replica.reaches_streams(&deps)).then_some(deps);
@@ -3482,15 +3490,15 @@ impl Core {
         // routing it in a loop with this node as the holder. A rid that took
         // effect is not answered here before the quarantine: it goes on
         // retrying.
-        if let Some(super::holder::GateSettle::Answer(epoch)) = self.gate_settle(&op, replica) {
+        if let Some(super::holder::GateSettle::Answer(epoch)) =
+            self.gate_settle(now, self.cfg.node_id, &op, replica)
+        {
             if !super::holder::took_effect_here(replica, rid) {
                 // (The gate's keys are the root's and this node's own
-                // generations', which the gate ends: no generation of
-                // another node is known here to recall.)
-                debug_assert!(
-                    !self.deleg_known(),
-                    "a gated root knows a generation of its own tenure"
-                );
+                // generations', which the gate ends when it opens: a
+                // settle on them recalls nothing, whether or not the gate
+                // has taken on generations of other nodes, ADR-42; and
+                // `execute_local_outcome` plans no recall for it.)
                 self.stats.gate_settles_answered += 1;
                 let outcome = self.resolve_in_doubt_then_execute(now, rid, epoch, replica, out);
                 self.finish(now, rid, outcome, replica, out);

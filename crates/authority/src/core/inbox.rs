@@ -1586,6 +1586,10 @@ impl Core {
                             );
                             return Err(Halt::Recall);
                         }
+                        // The gate recalls nothing (ADR-42): left in the inbox
+                        // for the poll after it, as an op under a generation
+                        // the gate has not taken on is.
+                        super::delegate::RecallPlan::Gated => return Err(Halt::Recall),
                         super::delegate::RecallPlan::Refuse(code) => {
                             // Phase 2b: a designation is involved.
                             replica.journal_inbox_refusal(rid, code, ack, decoded.as_ref().ok())?;

@@ -1533,6 +1533,17 @@ pub struct Stats {
     pub gate_settles_answered: u64,
     pub gate_settles_held: u64,
     pub gate_settles_held_executed: u64,
+    /// Plan 46 M0.3 (S5, ADR-42): a takeover gate whose journal work is
+    /// done: generations of other nodes it took on at that point
+    /// (`deleg_gated_inherited`, also counted in `deleg_inherited`),
+    /// renewals it answered with a grant (`deleg_renewals_gated`),
+    /// transactions it appended from their delegates' batches
+    /// (`deleg_appended_gated`), and settles on their keys it redirected to
+    /// the live delegate (`gate_settles_redirected`).
+    pub deleg_gated_inherited: u64,
+    pub deleg_renewals_gated: u64,
+    pub deleg_appended_gated: u64,
+    pub gate_settles_redirected: u64,
     /// Plan 43 C2 (§5.3 item 5), as a requester: ops whose own attempts
     /// reached their deadline and that were settled — settles sent (one per
     /// op, however many attempts it takes), answered `Abandoned`, answered
