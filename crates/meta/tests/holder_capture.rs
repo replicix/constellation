@@ -2373,10 +2373,11 @@ fn a_rebuild_queues_no_gated_append_of_a_delegates_row() {
 /// next, so a row's `deps` on the delegates' rows ahead of it have to be
 /// read from the intact journal. The root's own replay still waits for the
 /// delegate's row it was ordered after, above all one the rebuild dropped,
-/// which no queue entry orders it behind any more
-/// (`long-delegated-late-answers` seed 2945's shape: a marker journaled
-/// after the root appended the data row it follows). Fails before: the own
-/// replays carry no deps.
+/// which no queue entry orders it behind any more (a marker journaled after
+/// the root appended the data row it follows). This is the deposed root's
+/// retention rebuild, which runs with no epoch strand before it; on
+/// `recover_deposed` the epoch strand already orders the captured own rows.
+/// Fails before: the own replays carry no deps.
 #[test]
 fn a_rebuild_keeps_the_stream_deps_of_the_roots_own_replays() {
     use constellation_meta::RowClass;

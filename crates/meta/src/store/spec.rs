@@ -3381,7 +3381,10 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
     // next is examined, so a pass that read them as it went would find
     // none; a root's own replay must still wait for the delegate rows it
     // was ordered after, above all the ones this pass drops
-    // (`Strand::rebuild`), which no queue entry orders it behind.
+    // (`Strand::rebuild`), which no queue entry orders it behind. The
+    // empty case is a deposed root's retention rebuild (no epoch strand
+    // before it) and the own rows the epoch strand leaves; on
+    // `recover_deposed` that strand already orders the captured own rows.
     let deps_of = stranded_deps_by_tx(&*tx, meta, &undone)?;
     for (first, row) in journal {
         let (key, before) = match row.spec_seq {

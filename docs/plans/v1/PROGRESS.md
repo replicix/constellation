@@ -65115,7 +65115,11 @@ delegate rows ahead of it (`stranded_local_deps`) came out empty. Before the dro
 later own replay on shared keys (the queue runs in order); with the row dropped nothing does. The shape: the root appends the
 delegate's data row, which moves an inode's keys to the root; the requester re-asks, so the row is `Archive`; the root journals its
 own marker on that inode; deposed and rebuilt, the row is dropped and the marker queued with no deps, and the successor could run it
-against a replica without the data row (`long-delegated-late-answers` 2945's shape). `reset_for_rebuilt_ns_tx` now reads every row's
+against a replica without the data row. Where the gap is: `recover_deposed` first runs the epoch strand (`strand_below_epoch`), which
+strands the root's captured own rows while the delegate rows are still in the journal, so those already carry their deps (the 2945
+shape is ordered there on the tree before this fix). The empty deps come on the rebuild that runs with no epoch strand before it: a
+deposed root's retention rebuild (`gap_check_due` for a lost lease, then `RebuildReplica`), and the own rows the epoch strand leaves
+(those without before-images). The meta test calls `replace_ns_from_rebuilt` directly, which is that path. `reset_for_rebuilt_ns_tx` now reads every row's
 deps from the intact journal once (`stranded_deps_by_tx`) and passes them through `Strand::deps_of`. A dep is `(generation, index)`: the
 successor holds the replay until the delegate's re-stream brings the stream there (`reaches_streams`), or until the generation is void
 (a recalled one is satisfied). The root's own replays now also carry deps on the queued `Lone` rows, as the epoch strand's do.
