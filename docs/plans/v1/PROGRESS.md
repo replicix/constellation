@@ -65033,8 +65033,11 @@ Gates (box 1, final tree, TMPDIR on a tmpfs): `cargo fmt --all --check` and `car
   "the same hole exists for a usable root" was wrong). Fail-before: `s5_a_deposed_root_that_is_the_backup_does_not_count_its_unshipped_appends` (`acked: 2`, the
   backup's store holds row 1).
 - **N2, cost of `root_log_floor`: open.** It reads `holder_appends(gen)` from index 0, which walks the deleted `journal_origin` keys of the generation's shipped
-  history on every backup append while unshipped appends exist (the cost plan 43 G1 removed from `root_append_cap`). No lower bound for the scan could be
-  shown safe from the state the core keeps: the backup's last acknowledgement (`dl.backing`) counts rows from the backup's own tail, above this node's first
+  history. The holder append tip only rises and a strand deletes journal rows without advancing the shipped watermark, so a recovered, deposed holder that stayed
+  a follower scanned on every backup append; the tip is now clamped to the journal's highest seq (`Replica::max_journal_seq`, the meta counter `holder_scans`;
+  `s5_a_recovered_deposed_root_that_is_the_backup_does_not_scan_for_its_appends` fails before: one scan). The full scan runs only while this node holds
+  unshipped holder appends, mainly a backup that became the root at a takeover, and never in `root_append_cap` (plan 43 G1). No lower bound for the scan could
+  be shown safe from the state the core keeps: the backup's last acknowledgement (`dl.backing`) counts rows from the backup's own tail, above this node's first
   unshipped append, and `committed_sent` counts rows that are committed but still unshipped, which the floor must stay below. A bound needs new tracking of
   the generation's first unshipped append (or a cache of the unshipped appends refreshed from the journal's rows past the previous tip). Not done.
 - **S1, the answer after the ship.** `ship_landed` called only `answer_shipped_barriers`, so an op skipped by the fix A guard was answered by the next

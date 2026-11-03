@@ -2683,12 +2683,17 @@ or is releasing is unchanged. A settle of the gated root's own plans no recall
     `GenState`, which left the deposed root open; the usable root was never
     open. Cost, open: the floor reads the generation's unshipped holder
     appends from index 0 (`holder_appends`), which walks the deleted
-    `journal_origin` keys of the generation's shipped history on every backup
-    append while unshipped appends exist, the cost plan 43 G1 removed from
-    `root_append_cap`. No lower bound for the scan could be shown safe from the
-    state the core keeps (the backup's last acknowledgement and `committed_sent`
-    both count rows that are still unshipped), so a bound needs new tracking of
-    the generation's first unshipped append.
+    `journal_origin` keys of the generation's shipped history. The holder
+    append tip only rises and a strand deletes journal rows without advancing
+    the shipped watermark, so the tip is clamped to the journal's highest seq
+    (every unshipped append has its last row in the journal above the
+    watermark): the full scan runs only while this node holds unshipped holder
+    appends, mainly a backup that became the root at a takeover, and not on a
+    recovered, deposed holder that stays a follower. It never runs in
+    `root_append_cap` (plan 43 G1). No lower bound for the scan could be shown
+    safe from the state the core keeps (the backup's last acknowledgement and
+    `committed_sent` both count rows that are still unshipped), so a bound
+    needs new tracking of the generation's first unshipped append.
 - What the gate still cannot answer, as before and by this decision: an op that
   needs a generation recalled or ended (a cross-subtree op, a generation whose
   delegate rebooted and is stopped), and a delegate that restarted in the gate
