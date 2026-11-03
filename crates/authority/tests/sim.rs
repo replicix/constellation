@@ -7509,6 +7509,10 @@ struct OracleTotals {
     /// seeds with a violation.
     unsettled_class: [u64; 4],
     unsettled_seeds: u64,
+    /// Plan 46 M0.3 S5 (ADR-42), `SWEEP-S5-GATE`: generations a shippable
+    /// takeover gate took on, renewals it granted, transactions it appended,
+    /// settles it redirected.
+    s5_gate: [u64; 4],
     unsettled_causes: std::collections::BTreeMap<String, u64>,
 }
 
@@ -7612,6 +7616,16 @@ impl OracleTotals {
         self.unsettled_class[2] += r.unsettled_no_sequencer_in_time as u64;
         self.unsettled_class[3] += r.unsettled_generation_tail_unreachable as u64;
         self.unsettled_seeds += u64::from(r.unsettled_violations > 0);
+        for st in r.stats.values() {
+            for (c, n) in self.s5_gate.iter_mut().zip([
+                st.deleg_gated_inherited,
+                st.deleg_renewals_gated,
+                st.deleg_appended_gated,
+                st.gate_settles_redirected,
+            ]) {
+                *c += n;
+            }
+        }
         for (k, n) in &r.unsettled_causes {
             *self.unsettled_causes.entry(k.clone()).or_default() += *n as u64;
         }
@@ -7805,6 +7819,11 @@ impl OracleTotals {
             self.xgen[15],
             self.xgen[16],
             self.xgen[17]
+        );
+        eprintln!(
+            "SWEEP-S5-GATE {label} seeds {}/{seeds}: generations taken on by a shippable gate {}, \
+             renewals it granted {}, transactions it appended {}, settles it redirected {}",
+            self.seeds, self.s5_gate[0], self.s5_gate[1], self.s5_gate[2], self.s5_gate[3]
         );
         eprintln!(
             "SWEEP-PARKED-TOTALS {label} seeds {}/{seeds}: parked delegate acks released {}, by the \
@@ -15492,7 +15511,9 @@ fn backup_two_config_runs() {
 /// recovery never finished; with the real rebuild it does, and every
 /// existing check still holds. The seeds are the paused configurations of
 /// `long-delegated-late-answers` that were fixed on main (9287, 2945; 2924
-/// since plan 43 C2, 3036 since plan 43 Q16's interim rule).
+/// since plan 43 C2, 3036 since plan 43 Q16's interim rule); re-pinned to 270
+/// and 2822 (the unclocked runs where a rebuild runs and the stub keeps
+/// failing) after plan 46 M0.3 S5 moved the schedules of 9287 and 3036.
 #[test]
 fn c0_the_real_rebuild_recovers_a_deposed_root() {
     use pinned::c0_run;
@@ -15735,20 +15756,22 @@ fn c2_delegated_long_delegation_prod_settles_every_eio() {
 /// `EIO` at t=17119 ms although root 2 was reachable for the whole window, in
 /// its takeover gate: counted as a violation always, a failure under
 /// `+unsettled`. (The seed this test first used, 8, is closed by the settle
-/// fixes, which landed after the classifier; seed 1 is one of the violations
-/// they leave, S4 and S5's open cases.) Fails on any build before the
+/// fixes, which landed after the classifier; seed 1, its replacement, by S5
+/// (ADR-42: the gate serves the live delegate's generation); seed 2 is one of
+/// the violations that stay: the gated root's own op on a generation it must
+/// recall, which the gate does not do.) Fails on any build before the
 /// classification: no counter.
 #[test]
 fn m03_a_reachable_sequencers_requester_is_not_isolated() {
     let cfg = long_delegated_late_answers_config;
-    let r = run_seed(1, cfg()).unwrap_or_else(|e| panic!("seed 1: {e}"));
+    let r = run_seed(2, cfg()).unwrap_or_else(|e| panic!("seed 2: {e}"));
     assert!(
         r.unsettled_violations > 0,
-        "seed 1 no longer tells a client EIO with a sequencer reachable: {:?}",
+        "seed 2 no longer tells a client EIO with a sequencer reachable: {:?}",
         r.unsettled_causes
     );
     assert_eq!(r.unsettled_examples.len(), r.unsettled_violations.min(5));
-    let err = run_seed(1, strict(cfg(), "unsettled")).expect_err("+unsettled must fail");
+    let err = run_seed(2, strict(cfg(), "unsettled")).expect_err("+unsettled must fail");
     assert!(
         err.contains("although a sequencer was reachable"),
         "unexpected failure: {err}"
@@ -15812,8 +15835,11 @@ fn m03_the_configurations_without_an_unsettled_eio_run_strict() {
 #[test]
 fn m03_the_configurations_at_zero_violations_stay_there() {
     type Config = fn() -> SimConfig;
-    let strict_configs: [(&str, Config); 15] = [
+    let strict_configs: [(&str, Config); 16] = [
         ("delegated-crash", delegated_crash_config),
+        // (0 of 2,000 seeds `+unsettled` after S5, ADR-42; 1 violation in
+        // seeds 0..100 before.)
+        ("delegated-root-crash", delegated_root_crash_config),
         (
             "delegated-delegate-restart",
             delegated_delegate_restart_config,
@@ -15837,7 +15863,7 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
     ];
     // (label, config, violations, allowed unsettled EIOs in seeds 0..100 when
     // the list was set)
-    let ceilings: [(&str, Config, usize, usize); 17] = [
+    let ceilings: [(&str, Config, usize, usize); 16] = [
         ("backup-crash", backup_crash_config, 1, 0),
         ("backup-strict", backup_strict_config, 0, 0),
         ("backup-two", backup_two_config, 0, 0),
@@ -15853,14 +15879,14 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
             0,
             0,
         ),
-        ("delegated-backup", delegated_backup_config, 4, 0),
+        ("delegated-backup", delegated_backup_config, 1, 0),
         (
             "delegated-group-switch",
             delegated_group_switch_config,
             3,
             2,
         ),
-        ("delegated-holder-cut", delegated_holder_cut_config, 24, 2),
+        ("delegated-holder-cut", delegated_holder_cut_config, 12, 2),
         (
             "delegated-long-delegation",
             delegated_long_delegation_config,
@@ -15870,21 +15896,20 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
         (
             "delegated-no-backup-root-near",
             delegated_no_backup_root_near_config,
-            4,
+            0,
             0,
         ),
-        ("delegated-root-crash", delegated_root_crash_config, 1, 0),
         ("flex-crash", flex_crash_config, 125, 9),
         ("long-backup", long_backup_config, 0, 0),
         ("long-delegated", long_delegated_config, 0, 0),
-        ("long-delegated-backup", long_delegated_backup_config, 23, 6),
+        ("long-delegated-backup", long_delegated_backup_config, 5, 6),
         (
             "long-delegated-late-answers",
             long_delegated_late_answers_config,
-            25,
+            9,
             4,
         ),
-        ("placement-hot", placement_hot_config, 4, 0),
+        ("placement-hot", placement_hot_config, 0, 0),
     ];
     const SEEDS: u64 = 100;
     // (label, config, the ceilings on violations and on allowed ones)
@@ -16021,6 +16046,42 @@ fn m03_the_settle_causes_s1_to_s3_leave_no_unsettled_eio_in_these_seeds() {
     }
 }
 
+/// Plan 46 M0.3 S5 (ADR-42), under the strict form (`+unsettled`): a takeover
+/// gate whose journal work is done takes on the generations of other nodes. It
+/// appends and acknowledges their batches, answers their renewals and
+/// redirects a settle on their keys to the live delegate, so an op on another
+/// node's subtree is no longer left to outlast its deadline and the settle
+/// window while the gate waits out the read quarantine (the delegate's own op
+/// held, the requester's settle bounced `Busy`): `placement-hot` 2 and 28,
+/// `delegated-backup` 11 and `delegated-holder-cut` 14 and 20 each tell an
+/// unsettled `EIO` with a sequencer reachable on the parent (d0884c75: I4)
+/// and none now. (`delegated-holder-cut` 9 and 39, and `delegated-no-backup-
+/// root-near` 297, the spec's other candidates, are not here: 9 and 39 are a
+/// delegate that restarted in the gate, whose first renewal waits for the
+/// quarantine as it did, and 297 does not fail on the parent.)
+#[test]
+fn s5_a_gated_root_serves_another_nodes_generation() {
+    let cases: Vec<(&str, SimConfig, Vec<u64>)> = vec![
+        ("placement-hot", placement_hot_config(), vec![2, 28]),
+        ("delegated-backup", delegated_backup_config(), vec![11]),
+        (
+            "delegated-holder-cut",
+            delegated_holder_cut_config(),
+            vec![14, 20],
+        ),
+    ];
+    for (label, cfg, seeds) in cases {
+        for seed in seeds {
+            run_seed(seed, strict(cfg.clone(), "unsettled")).unwrap_or_else(|e| {
+                panic!(
+                    "{label}+unsettled seed {seed}: {e}\n  replay with \
+                     AUTHORITY_SIM_CONFIG={label}+unsettled"
+                )
+            });
+        }
+    }
+}
+
 /// I5: under `backup` an acknowledged op is rolled back (the transient
 /// shadow rollbacks `backup_no_acked_op_lost`'s comment described) and its
 /// answer was not Lone. Plan 43 C1-4: there are none (a committed requester
@@ -16124,7 +16185,7 @@ const I5_BACKUP: &[u64] = &[746, 819, 931, 935];
 /// 2924 did. The root's acknowledgement of a delegate's batch carries only
 /// what its own tenure committed (plan 43 Q16, ADR-41), which moved 2924's
 /// trajectory too, to no rebuild; 3036 rebuilds, and the stub fails it.)
-const REBUILD_SEEDS: [u64; 2] = [9287, 3036];
+const REBUILD_SEEDS: [u64; 2] = [270, 2822];
 type I4Seeds = (&'static str, fn() -> SimConfig, &'static [u64]);
 /// `long-delegated-late-answers`: `late_landings`.
 const I4_SEEDS: &[I4Seeds] = &[(
