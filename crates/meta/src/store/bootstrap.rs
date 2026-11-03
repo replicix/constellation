@@ -303,7 +303,8 @@ impl Meta {
     /// — and queue every outstanding shadow and every one of this node's
     /// unshipped transactions for replay by rid, except a gated append of a
     /// delegate's row, which its generation re-delivers
-    /// (`store::spec::Strand::rebuild`), in one transaction.
+    /// (`store::spec::Strand::rebuild`: also for the retention rebuild, a
+    /// replica the log was pruned past), in one transaction.
     ///
     /// Without before-images there is nothing to roll the deposed journal
     /// back with, so this is the only way to a log-prefix replica; the

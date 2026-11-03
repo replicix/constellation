@@ -715,8 +715,12 @@ struct Strand<'a> {
     /// row was answered on the delegate's disk alone and is replayed as
     /// before.
     recall: bool,
-    /// L2: the pass is a deposed node's rebuild (`reset_for_rebuilt_ns_tx`).
-    /// A root's append of a delegate's row (`gen` != 0,
+    /// L2: the pass is a rebuild of the namespace from the log
+    /// (`reset_for_rebuilt_ns_tx`): a deposed node's (`recover_deposed`)
+    /// and a replica the log was pruned past (the retention rebuild, jobs.rs
+    /// `after_gap_check`: a node behind the log's retained tail is no
+    /// current root, so what it still journals is a past tenure's, as in a
+    /// deposition). A root's append of a delegate's row (`gen` != 0,
     /// journaled under the root's lease epoch) of a gated class is dropped,
     /// not queued. The class is not the append's ADR-41 commit: a root
     /// journals such an append `Lone`, and it turns gated only when another
