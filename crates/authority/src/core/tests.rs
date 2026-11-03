@@ -53454,8 +53454,10 @@ mod c2g_settle {
     /// a takeover gate the replica's `completed` holds what the gate
     /// re-appended to its journal (the predecessor's tail): an op of this
     /// node awaiting the log is not answered from it before it ships (a
-    /// delegate's batch appended in the gate ran `answer_awaiting_log`).
-    /// Fails on the parent of the guard: answered at once.
+    /// delegate's batch appended in the gate ran `answer_awaiting_log`), and
+    /// is answered when the node's own ship of the row lands. Fails on the
+    /// parent of the guard: answered at once; and on the parent of the call
+    /// in `ship_landed`: not answered by the ship.
     #[test]
     fn s5_a_gated_root_does_not_answer_an_op_awaiting_the_log_from_its_unshipped_journal() {
         let mut h = Harness::new(1);
@@ -53489,11 +53491,70 @@ mod c2g_settle {
             replies(&out).is_empty(),
             "answered from the journal: {out:?}"
         );
-        // Shipped, it is the log's.
-        ship_all(&mut h);
+        // The node's own ship lands: the row is the log's, and the ship
+        // itself answers the op (review of S5: nothing else did until the
+        // next appended batch, applied segment or inbox recheck). Fails
+        // without the call in `ship_landed`: no reply.
+        // The gate still waits for the read-delegation quarantine while
+        // its journal ships.
+        h.meta
+            .read_delegations()
+            .set_quarantine(h.clk().wait.plus(3_000));
         let mut out = Vec::new();
-        h.core.answer_awaiting_log(h.clk(), &h.meta, &mut out);
-        assert_eq!(replies(&out).len(), 1, "{out:?}");
+        h.core.start(h.clk(), &h.meta, &mut out);
+        let poll = timers(&out, TimerKind::Poll)[0];
+        let mut acts = h.step(Event::Timer { id: poll });
+        let mut answered = Vec::new();
+        let mut at_landing: Vec<Rid> = Vec::new();
+        let mut landing = false;
+        let mut puts = 0;
+        for _ in 0..32 {
+            answered.extend(
+                replies(&acts)
+                    .into_iter()
+                    .map(|(r, _)| r)
+                    .collect::<Vec<_>>(),
+            );
+            if let Some(upload) = acts.iter().find_map(|a| match a {
+                Action::UploadDirtyChunks { op, .. } => Some(*op),
+                _ => None,
+            }) {
+                acts = h.step(Event::UploadsDone {
+                    op: upload,
+                    result: UploadResult::Done { held: 0 },
+                });
+                continue;
+            }
+            let Some((op, req)) = s3_ops(&acts)
+                .into_iter()
+                .find(|(_, r)| !matches!(r, S3Op::HeartbeatRead))
+                .map(|(op, r)| (op, r.clone()))
+            else {
+                break;
+            };
+            let result = match req {
+                S3Op::SegmentPut { .. } => {
+                    puts += 1;
+                    landing = true;
+                    S3Result::SegmentPut(Ok(()))
+                }
+                S3Op::LeaseSwap { .. } => S3Result::LeasePut(Ok(tag())),
+                S3Op::InboxRun { .. } => S3Result::InboxRun(Ok(Vec::new())),
+                S3Op::InboxDrain { .. } => S3Result::InboxDrain(Ok(Vec::new())),
+                S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+                other => panic!("unexpected request in the round: {other:?}"),
+            };
+            acts = h.step(Event::S3 { op, result });
+            if landing {
+                // The step that lands the segment answers the op.
+                landing = false;
+                at_landing = replies(&acts).into_iter().map(|(r, _)| r).collect();
+            }
+        }
+        assert!(puts > 0, "the journal was not shipped");
+        assert!(h.core.lease.gate.is_some(), "the gate opened before the ship");
+        assert_eq!(at_landing, vec![rid], "{answered:?}");
     }
 
     /// S5: the redirect is S3's live test (`on_forward`), and only for a

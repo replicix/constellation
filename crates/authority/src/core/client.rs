@@ -3000,8 +3000,9 @@ impl Core {
         // `completed` also holds what the gate re-appended to its journal
         // (the predecessor's tail, a delegate's rows): the journal's, not
         // the log's yet (I1: an inbox op answered from the re-shipped tail
-        // before it shipped). The ship, or the open (`resolve_moot_waits`),
-        // answers it.
+        // before it shipped). The node's own ship answers it (`ship_landed`
+        // calls this once rows are in the log), or the open
+        // (`resolve_moot_waits`).
         let gated_journal: Option<std::collections::BTreeSet<Rid>> =
             (self.lease.gate.is_some() && !waiting.is_empty()).then(|| {
                 replica

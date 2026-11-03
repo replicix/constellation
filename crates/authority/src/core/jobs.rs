@@ -1154,6 +1154,15 @@ impl Core {
         self.note_shipped(seqs, through);
         if !seqs.is_empty() {
             self.answer_shipped_barriers(replica, out);
+            // Plan 46 M0.3 (S5, ADR-42): inside a takeover gate
+            // `answer_awaiting_log` leaves an op whose outcome is still a
+            // row of the unshipped journal (the predecessor's tail the gate
+            // re-appended, a delegate's batch): these rows are the log's now,
+            // and nothing else would answer the op before the next segment,
+            // appended batch or inbox recheck.
+            if self.lease.gate.is_some() {
+                self.answer_awaiting_log(now, replica, out);
+            }
         }
         tracing::debug!(
             target: "constellation_authority::stream",
