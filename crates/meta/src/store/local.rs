@@ -1322,12 +1322,19 @@ impl Meta {
     /// `gen` journaled as a lease holder, as `(idx, last journal seq)` in
     /// index order: one range read over `journal_origin`, a head per row.
     pub fn holder_appends(&self, gen: u64) -> Result<Vec<(u64, u64)>, MetaError> {
+        self.holder_appends_from(gen, 0)
+    }
+
+    /// [`Self::holder_appends`] from stream index `from` on: one seek past
+    /// the rows below it (the generation's shipped history, whose deleted
+    /// `journal_origin` keys a scan from 0 walks).
+    pub fn holder_appends_from(&self, gen: u64, from: u64) -> Result<Vec<(u64, u64)>, MetaError> {
         if gen == 0 {
             return Ok(Vec::new());
         }
         let r = self.db.read_tx();
         let mut out = Vec::new();
-        for found in journal_origins_from(&r, self, gen, 0)? {
+        for found in journal_origins_from(&r, self, gen, from)? {
             let (idx, first) = found?;
             if let Some(head) = get_journal_tx_head(&r, self, first)? {
                 if head.epoch != 0 {

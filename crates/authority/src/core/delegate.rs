@@ -164,7 +164,10 @@ pub(crate) struct GenState {
     pub last_batch: Option<(u64, OpId)>,
     /// The `committed` of the last acknowledgement sent for this
     /// generation (plan 43 Q16, ADR-41): the push goes out only when the
-    /// root's committed prefix rises above it.
+    /// root's committed prefix rises above it. Also where
+    /// [`Core::root_append_cap`]'s scan starts (past it: every row through it
+    /// was committed when it was sent); a new round of the stream resets it
+    /// to 0.
     pub committed_sent: u64,
     // The window (`until`: the root outwaits the delegate once its **wait**
     // clock reaches it; plan 43 C7-H1) lives in `Core::dw`, the root's
@@ -635,8 +638,8 @@ pub(crate) struct DelegationState {
     /// Plan 43 Q16 (ADR-41): the same for [`Core::root_append_cap`], the
     /// root's own committed prefix of its appends of a delegate's stream
     /// (kept apart: `holder_append_cap` excludes a lone tenure's appends,
-    /// this one counts them).
-    pub root_caps: BTreeMap<u64, (HolderCapStamp, u64)>,
+    /// this one counts them): `(stamp, scan start, cap)`.
+    pub root_caps: BTreeMap<u64, (HolderCapStamp, u64, u64)>,
     /// Plan 43 C2d: what [`Core::report_deleg_durable`] last told the
     /// replica's session, per generation.
     pub reported: BTreeMap<u64, constellation_meta::DelegDurable>,
@@ -991,6 +994,8 @@ impl Core {
                 continue;
             }
             self.dl.gens.remove(&gen);
+            self.dl.root_caps.remove(&gen);
+            self.dl.holder_caps.remove(&gen);
             self.dw.remove(gen);
             self.lock_forget_generation(gen);
             self.dl.forgot = true;
@@ -2705,7 +2710,8 @@ impl Core {
     /// is a backup, or has sealed one, and holds the row. Unlike
     /// [`Self::holder_append_cap`] (whose use answers `Lone` and so excludes
     /// a lone tenure) this one counts a lone tenure's journal. Cached like
-    /// it, in `dl.root_caps`; a store error caps at 0, uncached.
+    /// it, in `dl.root_caps` (keyed also by where the scan starts, the
+    /// committed prefix last sent); a store error caps at 0, uncached.
     pub(crate) fn root_append_cap(&mut self, gen: u64, replica: &dyn Replica) -> u64 {
         let tip = replica.holder_append_tip();
         if tip == 0 {
@@ -2728,12 +2734,37 @@ impl Core {
             durable,
             holds,
         };
-        if let Some((s, cap)) = self.dl.root_caps.get(&gen) {
-            if *s == stamp {
+        // The scan starts past the committed prefix last sent (G1 follow-up:
+        // one seek, where a walk from 0 read every deleted `journal_origin`
+        // key of the generation's shipped history, a cost that grew with its
+        // length on both of the delegate's critical-path calls). It rests on
+        // two things. (a) `committed_sent` lives within one root tenure:
+        // `GenState` goes with the tenure (`deleg_on_lease_gone`), and a new
+        // round of the stream starts it again at 0 (`on_delegate_stream`),
+        // so the prefix this tenure sent is never one the delegate has since
+        // reset (it resets `root_committed` when its root changes). (b) A row
+        // this tenure committed stays committed: it is shipped, or on every
+        // backup this tenure gated on, which a successor holds or has
+        // sealed. A full scan lowers the cap after a send only through
+        // `durable_jseq` falling while the lease is held (a backup newly
+        // listed with nothing counted, a listing out or in doubt, an
+        // `AckPolicy` change); the narrowed scan never claims less than the
+        // prefix already sent there, which (b) justifies, and the cap is the
+        // full scan's wherever that is not below it. `committed_sent` is
+        // assigned, not raised, by a batch's acknowledgement: it may go back,
+        // which only widens the scan.
+        let from = self
+            .dl
+            .gens
+            .get(&gen)
+            .map_or(0, |g| g.committed_sent)
+            .saturating_add(1);
+        if let Some((s, f, cap)) = self.dl.root_caps.get(&gen) {
+            if *s == stamp && *f == from {
                 return *cap;
             }
         }
-        let Ok(appends) = replica.holder_appends(gen) else {
+        let Ok(appends) = replica.holder_appends_from(gen, from) else {
             return 0;
         };
         let cap = appends
@@ -2743,7 +2774,7 @@ impl Core {
                     || holds && (self.ack.shipped_rows.contains(last) || *last <= durable))
             })
             .map_or(u64::MAX, |(idx, _)| idx.saturating_sub(1));
-        self.dl.root_caps.insert(gen, (stamp, cap));
+        self.dl.root_caps.insert(gen, (stamp, from, cap));
         cap
     }
 
@@ -7278,6 +7309,14 @@ impl Core {
         // `committed` what its own tenure has committed of that, the root's
         // copy for the delegate's group (ADR-41). The rest follows by a
         // push when the commit rises (`root_stream_push`).
+        // A new round (a new root of the delegate, a restarted stream) counts
+        // from nothing: the delegate has reset what it counted of this
+        // tenure's commit, and the cap scans the generation in full, once.
+        if let Some(g) = self.dl.gens.get_mut(&gen) {
+            if g.last_batch.is_none_or(|(r, _)| r != round) {
+                g.committed_sent = 0;
+            }
+        }
         let committed = cursor.min(self.root_append_cap(gen, replica));
         if let Some(g) = self.dl.gens.get_mut(&gen) {
             g.last_batch = Some((round, req));
@@ -7949,6 +7988,8 @@ impl Core {
         self.dl.cert_set = false;
         self.dl.forget_at.clear();
         self.dl.forgot = false;
+        self.dl.root_caps.clear();
+        self.dl.holder_caps.clear();
         for (_, g) in std::mem::take(&mut self.dl.gens) {
             if let Some(t) = g.expiry {
                 self.cancel_timer(t, out);

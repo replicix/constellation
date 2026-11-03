@@ -2126,3 +2126,111 @@ fn a_reused_generation_number_drops_the_void_a_deposed_roots_unshipped_end_left(
         "the next write depends on this node's own row of the new generation"
     );
 }
+
+/// G1 follow-up (ADR-41): `holder_appends_from(gen, from)` is the
+/// generation's `holder_appends(gen)` from stream index `from` on, as a
+/// root's cap reads it past the committed prefix it sent: every `from`
+/// below, at and past the rows, with the origin's other generations, a
+/// delegate's own rows (not a holder's appends) and the shipped rows left
+/// out the way the full read leaves them.
+#[test]
+fn holder_appends_from_is_the_full_read_from_the_index_on() {
+    let meta = Meta::open_in_memory().unwrap();
+    let (gen, other) = (4, 5);
+    let append = |gen: u64, idx: u64| {
+        let r = Rid {
+            node: 2,
+            incarnation: 1,
+            seq: gen * 100 + idx,
+        };
+        let create = LogRecord::Create {
+            parent: ROOT_INO,
+            name: format!("g{gen}i{idx}"),
+            ino: (2 << 40) | (gen * 100 + idx),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            time_ns: 5,
+        };
+        assert!(meta
+            .apply_delegate_tx(
+                &[create],
+                Some(r),
+                gen,
+                idx,
+                constellation_meta::Position::ZERO
+            )
+            .unwrap());
+    };
+    let check = |meta: &Meta, gen: u64, top: u64| {
+        let full = meta.holder_appends(gen).unwrap();
+        for from in (0..=top + 2).chain([u64::MAX]) {
+            let want: Vec<(u64, u64)> = full.iter().filter(|(i, _)| *i >= from).copied().collect();
+            assert_eq!(
+                meta.holder_appends_from(gen, from).unwrap(),
+                want,
+                "gen {gen} from {from}"
+            );
+        }
+        full
+    };
+    // The holder's appends: indexes 1 to 6 of `gen`, 1 to 2 of `other`.
+    meta.set_holder_epoch(1);
+    for idx in 1..=6 {
+        append(gen, idx);
+        if idx <= 2 {
+            append(other, idx);
+        }
+    }
+    let full = check(&meta, gen, 6);
+    assert_eq!(
+        full.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+        (1..=6).collect::<Vec<_>>()
+    );
+    assert_eq!(meta.holder_appends_from(gen, 4).unwrap().len(), 3);
+    assert!(meta.holder_appends_from(gen, 7).unwrap().is_empty());
+    assert!(meta.holder_appends_from(gen, u64::MAX).unwrap().is_empty());
+    assert_eq!(check(&meta, other, 2).len(), 2);
+    // A generation 0 holds none; nor does one nothing was appended in.
+    assert!(meta.holder_appends_from(0, 0).unwrap().is_empty());
+    assert!(meta.holder_appends_from(99, 0).unwrap().is_empty());
+    // A delegate's own rows (no holder epoch) are not a holder's appends.
+    meta.set_holder_epoch(0);
+    let d = (2 << 40) | 1;
+    meta.apply_segment(1, 1, &mkdirs(&[("d", d)]), &TouchSet::default())
+        .unwrap();
+    for i in 1..=3 {
+        delegate_create(
+            &meta,
+            8,
+            50 + i,
+            d,
+            &format!("own{i}"),
+            (2 << 40) | (700 + i),
+        );
+    }
+    assert!(check(&meta, 8, 3).is_empty());
+    // The first three of `gen` ship, in the journal's order: what is left
+    // is the rest, read from any index.
+    let through = full[2].1;
+    let seqs: Vec<u64> = meta
+        .take_journal(usize::MAX)
+        .unwrap()
+        .into_iter()
+        .map(|(s, _)| s)
+        .take_while(|s| *s <= through)
+        .collect();
+    meta.ack_journal_rows_at(&seqs, 2).unwrap();
+    let left = check(&meta, gen, 6);
+    assert_eq!(
+        left.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+        vec![4, 5, 6]
+    );
+    assert_eq!(meta.holder_appends_from(gen, 0).unwrap(), left);
+    assert_eq!(
+        meta.holder_appends_from(gen, 5).unwrap(),
+        left[1..].to_vec()
+    );
+    // (`other`'s two rows came before them in the journal: shipped too.)
+    assert!(check(&meta, other, 2).is_empty());
+}

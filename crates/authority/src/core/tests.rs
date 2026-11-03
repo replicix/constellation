@@ -44615,6 +44615,376 @@ mod deleg_group {
         );
     }
 
+    /// Node 3's batch of one create at stream index `idx` of generation 7,
+    /// taken by the root `h` after [`root_takes_a_delegates_batch`] (index 1).
+    fn root_takes_batch_at(h: &mut Harness, idx: u64) -> Vec<Action> {
+        root_takes_batch_of_round(h, idx, 1)
+    }
+
+    /// [`root_takes_batch_at`] in stream round `round`.
+    fn root_takes_batch_of_round(h: &mut Harness, idx: u64, round: u64) -> Vec<Action> {
+        let dir = h.meta.lookup(ROOT_INO, "d").unwrap().expect("/d").ino;
+        let rid = rid_of(3, idx);
+        let ino = h.meta.allocate_ino(dir).unwrap();
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegateStream {
+                req: OpId(10 + idx),
+                gen: 7,
+                round,
+                txs: vec![constellation_meta::DelegateTx {
+                    idx,
+                    rid: Some(rid),
+                    records: vec![
+                        LogRecord::Create {
+                            parent: dir,
+                            name: format!("f{idx}"),
+                            ino,
+                            mode: 0o644,
+                            uid: 0,
+                            gid: 0,
+                            time_ns: 1,
+                        },
+                        LogRecord::Completed { rid },
+                    ],
+                    deps: Default::default(),
+                }],
+                leaving: Vec::new(),
+                leaving_barriers: Vec::new(),
+            },
+        })
+    }
+
+    /// `root_append_cap` by the rule alone: a scan of every append of the
+    /// generation from index 0, the one `root_append_cap` made before it
+    /// started past the committed prefix last sent.
+    fn full_scan_cap(h: &Harness, gen: u64) -> u64 {
+        let tip = h.meta.holder_append_tip();
+        let shipped = Replica::journal_acked_seq(&h.meta).unwrap();
+        if tip == 0 || tip <= shipped {
+            return u64::MAX;
+        }
+        let holds = h.core.lease.held.is_some() && !h.core.lease.lost;
+        let durable = h.core.durable_jseq();
+        h.meta
+            .holder_appends(gen)
+            .unwrap()
+            .iter()
+            .find(|(_, last)| {
+                !(*last <= shipped
+                    || holds && (h.core.ack.shipped_rows.contains(last) || *last <= durable))
+            })
+            .map_or(u64::MAX, |(idx, _)| idx.saturating_sub(1))
+    }
+
+    /// The `committed` of every acknowledgement to node 3 in `out`, appended
+    /// to `sent`, each checked against the rule alone: no higher than the
+    /// highest sent before it or the full scan's cap (to the cursor) in the
+    /// state `h` is in after the step. Not against `committed_sent`, which is
+    /// what the narrowed scan starts from.
+    fn record_sent(h: &Harness, out: &[Action], sent: &mut Vec<u64>) {
+        let (cursor, full) = (h.core.dl.gens[&7].cursor, full_scan_cap(h, 7));
+        for (_, _, _, committed, _) in stream_acks_to_3(out) {
+            let before = sent.iter().copied().max().unwrap_or(0);
+            assert!(
+                committed <= before.max(cursor.min(full)),
+                "committed {committed} sent: before {before}, cursor {cursor}, full scan {full}"
+            );
+            sent.push(committed);
+        }
+    }
+
+    /// Node 2 acknowledges, one send at a time, what the root's `out` sends it
+    /// of its journal, through its tip; what the acknowledgements to node 3
+    /// those steps carry is recorded in `sent` (not `out`'s own).
+    fn backup_holds_what_is_sent(h: &mut Harness, mut out: Vec<Action>, sent: &mut Vec<u64>) {
+        for _ in 0..4 {
+            let Some((req, tip)) = sends(&out).into_iter().find_map(|(to, m)| match m {
+                PeerMsg::BackupAppend { req, txs, .. } if to == 2 => {
+                    Some((*req, txs.last().map_or(0, |t| t.last)))
+                }
+                _ => None,
+            }) else {
+                break;
+            };
+            out = h.step(Event::Peer {
+                from: 2,
+                msg: PeerMsg::BackupAck {
+                    req,
+                    epoch: 1,
+                    acked: tip,
+                    sealed: false,
+                    fresh: false,
+                },
+            });
+            record_sent(h, &out, sent);
+        }
+    }
+
+    /// The backup `counted` rows of the journal hold, as node 2's is in
+    /// [`root_backed_by_node_2`].
+    fn backup_peer(h: &Harness, counted: u64) -> crate::core::backup::BackupPeer {
+        let now = w(h.now);
+        crate::core::backup::BackupPeer {
+            candidacy: 0,
+            alive_at: now,
+            short_since_progress: false,
+            short_since: now,
+            unreachable: false,
+            answered: true,
+            acked: counted,
+            listed_at: Some(0),
+            counted,
+            sent_through: counted,
+            inflight: Default::default(),
+            last_sent: WaitMs(0),
+            last_progress: now,
+            committed: true,
+        }
+    }
+
+    /// The held lease lists node 4 beside node 2 (config version 3): an
+    /// acknowledgement now rests on both, and node 4 has counted nothing, so
+    /// `durable_jseq` falls while the lease is held, the one way the full
+    /// scan's cap goes down after a send.
+    fn list_a_second_backup(h: &mut Harness) {
+        let before = h.core.durable_jseq();
+        let lease = Lease {
+            ack_policy: constellation_store_s3::AckPolicy::Backup,
+            backups: vec![2, 4],
+            config_version: 3,
+            ..lease_of(1, 1, h.now.plus(10_000).0)
+        };
+        h.core.lease.adopt(h.clk(), lease, tag(), None);
+        assert!(h.core.durable_jseq() < before, "durable_jseq did not fall");
+    }
+
+    /// Both backups hold the whole journal.
+    fn both_backups_hold(h: &mut Harness) {
+        let tip = h.meta.journal_tip().unwrap();
+        for node in [2, 4] {
+            let peer = backup_peer(h, tip);
+            h.core.ack.peers.insert(node, peer);
+        }
+        assert_eq!(h.core.durable_jseq(), tip);
+    }
+
+    /// The pushes `root_stream_push` makes now.
+    fn pushes(h: &mut Harness) -> Vec<Action> {
+        let mut out = Vec::new();
+        h.core.root_stream_push(h.clk(), &h.meta, &mut out);
+        out
+    }
+
+    /// The cap `root_append_cap` answers, against the full scan's and the
+    /// committed prefix last sent: the same wherever the full scan's is not
+    /// below the prefix, never below the prefix where it is.
+    fn assert_cap_is_the_full_scans_above_the_sent_prefix(h: &mut Harness, stage: &str) {
+        let sent = h.core.dl.gens[&7].committed_sent;
+        let full = full_scan_cap(h, 7);
+        let cap = h.core.root_append_cap(7, &h.meta);
+        if full >= sent {
+            assert_eq!(cap, full, "{stage}: sent {sent}");
+        } else {
+            assert!(
+                cap >= sent,
+                "{stage}: cap {cap} below sent {sent} (full {full})"
+            );
+        }
+    }
+
+    /// Plan 43 Q16 (ADR-41, G1 follow-up): `root_append_cap` scans the
+    /// generation's appends from the committed prefix last sent, not from 0
+    /// (the scan over the shipped history's deleted `journal_origin` keys
+    /// cost a delegate's ack its generation's length). Through a root's
+    /// appends, its backup's acknowledgements, a ship (out of order, then
+    /// whole) and a second backup listed (`durable_jseq` falls under the
+    /// held lease, the one way a full scan's cap falls after a send), the
+    /// cap is the full scan's wherever that is not below the prefix sent, and
+    /// every `committed` sent is at most the highest sent before it or the
+    /// full scan's (`record_sent`, which does not look at `committed_sent`).
+    #[test]
+    fn a_roots_cap_from_the_committed_prefix_is_the_full_scans_above_it() {
+        let mut h = root_backed_by_node_2();
+        let mut sent = Vec::new();
+        let out = root_takes_a_delegates_batch(&mut h);
+        assert_cap_is_the_full_scans_above_the_sent_prefix(&mut h, "batch 1");
+        record_sent(&h, &out, &mut sent);
+        backup_holds_what_is_sent(&mut h, out, &mut sent);
+        assert_cap_is_the_full_scans_above_the_sent_prefix(&mut h, "batch 1 held");
+        // Two batches the backup does not acknowledge yet.
+        let mut unheld = Vec::new();
+        for idx in 2..=3 {
+            let out = root_takes_batch_at(&mut h, idx);
+            record_sent(&h, &out, &mut sent);
+            assert_cap_is_the_full_scans_above_the_sent_prefix(&mut h, "unheld batch");
+            unheld.push(out);
+        }
+        // The backup holds them.
+        for out in unheld {
+            backup_holds_what_is_sent(&mut h, out, &mut sent);
+        }
+        assert_cap_is_the_full_scans_above_the_sent_prefix(&mut h, "batches 2, 3 held");
+        // The journal ships out of order: its second row, then the rest.
+        let batch = Replica::take_journal(&h.meta, 100).unwrap();
+        let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
+        assert!(seqs.len() > 2, "{seqs:?}");
+        Replica::ack_journal(&h.meta, &seqs[1..2], 1, None).unwrap();
+        h.core.note_shipped(&seqs[1..2], 0);
+        assert_cap_is_the_full_scans_above_the_sent_prefix(&mut h, "one row shipped");
+        Replica::ack_journal(&h.meta, &seqs, 1, None).unwrap();
+        h.core.note_shipped(&seqs, *seqs.last().unwrap());
+        assert_cap_is_the_full_scans_above_the_sent_prefix(&mut h, "all shipped");
+        // Two more batches, held by the backup.
+        let mut unheld = Vec::new();
+        for idx in 4..=5 {
+            let out = root_takes_batch_at(&mut h, idx);
+            record_sent(&h, &out, &mut sent);
+            assert_cap_is_the_full_scans_above_the_sent_prefix(&mut h, "batch after a ship");
+            unheld.push(out);
+        }
+        for out in unheld {
+            backup_holds_what_is_sent(&mut h, out, &mut sent);
+        }
+        assert_eq!(h.core.dl.gens[&7].committed_sent, 5);
+        // A second backup is listed: rows 4 and 5 are no longer durable.
+        list_a_second_backup(&mut h);
+        assert!(full_scan_cap(&h, 7) < 5, "the lowered case is not reached");
+        assert_cap_is_the_full_scans_above_the_sent_prefix(&mut h, "second backup listed");
+        let out = pushes(&mut h);
+        assert!(stream_acks_to_3(&out).is_empty(), "{out:?}");
+        let out = root_takes_batch_at(&mut h, 6);
+        record_sent(&h, &out, &mut sent);
+        assert_cap_is_the_full_scans_above_the_sent_prefix(&mut h, "batch 6");
+        // Both backups hold the journal: the commit rises through row 6.
+        both_backups_hold(&mut h);
+        let out = pushes(&mut h);
+        record_sent(&h, &out, &mut sent);
+        assert_cap_is_the_full_scans_above_the_sent_prefix(&mut h, "both hold");
+        assert_eq!(sent.last().copied(), Some(6), "{sent:?}");
+        assert_eq!(h.core.dl.gens[&7].committed_sent, 6);
+    }
+
+    /// A row of the prefix last sent that the full scan no longer counts
+    /// (a second backup listed since the send: `durable_jseq` fell under the
+    /// held lease) is not rescanned: the cap stays at the prefix, and the
+    /// push that lowered state allows is none. The rows through the prefix
+    /// were committed when it was sent, and a committed row stays committed.
+    /// The cache is keyed by where the scan starts: the prefix moving back
+    /// recomputes the cap, over the row the full scan would stop at. The
+    /// push goes out, with the exact value, once both backups hold the rows;
+    /// a lost lease (`deleg_on_lease_gone`) drops the generation, and the
+    /// caches with it.
+    /// Fails before: the cap fell to 0 (row 1 not counted), below the prefix.
+    #[test]
+    fn a_roots_cap_does_not_fall_below_the_committed_prefix_it_sent_when_durability_falls() {
+        let mut h = root_backed_by_node_2();
+        let out = root_takes_a_delegates_batch(&mut h);
+        let mut sent = Vec::new();
+        backup_holds_what_is_sent(&mut h, out, &mut sent);
+        assert_eq!(sent, vec![1]);
+        assert_eq!(h.core.dl.gens[&7].committed_sent, 1);
+        // Row 2 appended, not held by the backup.
+        let out = root_takes_batch_at(&mut h, 2);
+        assert_eq!(stream_acks_to_3(&out), vec![(OpId(12), 1, 2, 1, false)]);
+        assert_eq!(h.core.root_append_cap(7, &h.meta), 1);
+        let pushed = h.core.stats.deleg_stream_acks_pushed;
+        // A second backup is listed: row 1 is no longer counted by a full scan.
+        list_a_second_backup(&mut h);
+        assert_eq!(full_scan_cap(&h, 7), 0);
+        assert_eq!(
+            h.core.root_append_cap(7, &h.meta),
+            1,
+            "below the prefix sent"
+        );
+        let out = pushes(&mut h);
+        assert!(stream_acks_to_3(&out).is_empty(), "{out:?}");
+        assert_eq!(h.core.stats.deleg_stream_acks_pushed, pushed);
+        // The cache holds only for the scan it was made for.
+        h.core.dl.gens.get_mut(&7).unwrap().committed_sent = 0;
+        assert_eq!(
+            h.core.root_append_cap(7, &h.meta),
+            0,
+            "the cap of a scan from 2 answered for one from 1"
+        );
+        h.core.dl.gens.get_mut(&7).unwrap().committed_sent = 1;
+        assert_eq!(h.core.root_append_cap(7, &h.meta), 1);
+        // Both backups hold the rows: the push carries the exact value.
+        both_backups_hold(&mut h);
+        let out = pushes(&mut h);
+        assert_eq!(stream_acks_to_3(&out), vec![(OpId(12), 1, 2, 2, false)]);
+        assert_eq!(h.core.stats.deleg_stream_acks_pushed, pushed + 1);
+        assert_eq!(h.core.root_append_cap(7, &h.meta), u64::MAX);
+        // The lease is lost: the generation, `committed_sent` and the caches go.
+        h.core.lease.mark_lost(2, 2, 1);
+        let mut out = Vec::new();
+        h.core.deleg_on_lease_gone(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.gens.is_empty());
+        assert!(h.core.dl.root_caps.is_empty() && h.core.dl.holder_caps.is_empty());
+        assert!(stream_acks_to_3(&pushes(&mut h)).is_empty());
+    }
+
+    /// A new round of the delegate's stream (a new root of its own, a
+    /// restarted stream) counts from nothing: the delegate has reset what it
+    /// counted of this tenure's commit, and the root does not assert the old
+    /// round's prefix again but scans the generation in full, once. With the
+    /// prefix 1 sent and `durable_jseq` fallen since, the same round's next
+    /// batch keeps `committed` at 1; the new round's first is the full
+    /// scan's, 0.
+    /// Fails before: `committed_sent` carried over (the ack said 1).
+    #[test]
+    fn a_new_stream_round_counts_from_nothing_and_scans_the_generation_in_full() {
+        let mut h = root_backed_by_node_2();
+        let out = root_takes_a_delegates_batch(&mut h);
+        backup_holds_what_is_sent(&mut h, out, &mut Vec::new());
+        assert_eq!(h.core.dl.gens[&7].committed_sent, 1);
+        root_takes_batch_at(&mut h, 2);
+        list_a_second_backup(&mut h);
+        assert_eq!(full_scan_cap(&h, 7), 0);
+        let out = root_takes_batch_at(&mut h, 3);
+        assert_eq!(
+            stream_acks_to_3(&out),
+            vec![(OpId(13), 1, 3, 1, false)],
+            "the same round keeps the prefix sent"
+        );
+        let out = root_takes_batch_of_round(&mut h, 4, 2);
+        assert_eq!(
+            stream_acks_to_3(&out),
+            vec![(OpId(14), 2, 4, 0, false)],
+            "the new round counted from the old round's prefix"
+        );
+        assert_eq!(h.core.dl.gens[&7].committed_sent, 0);
+    }
+
+    /// The scan's range: a root whose backup holds twenty appended rows (none
+    /// shipped yet, all committed and acknowledged as such) reads the rows
+    /// past the prefix it sent, not the twenty again, for the cap of its
+    /// twenty-first. `local_rows_read` counts the live keys a scan yields,
+    /// so this pins where the range starts, not the tombstones of shipped
+    /// rows a scan from 0 also walks.
+    /// Fails before: 21 rows read.
+    #[test]
+    fn a_roots_cap_reads_only_the_rows_past_the_committed_prefix_it_sent() {
+        let mut h = root_backed_by_node_2();
+        let out = root_takes_a_delegates_batch(&mut h);
+        backup_holds_what_is_sent(&mut h, out, &mut Vec::new());
+        for idx in 2..=20 {
+            let out = root_takes_batch_at(&mut h, idx);
+            backup_holds_what_is_sent(&mut h, out, &mut Vec::new());
+        }
+        assert_eq!(h.core.dl.gens[&7].committed_sent, 20);
+        root_takes_batch_at(&mut h, 21);
+        assert_eq!(h.meta.holder_appends(7).unwrap().len(), 21);
+        h.core.dl.root_caps.remove(&7);
+        let before = h.meta.local_rows_read();
+        assert_eq!(h.core.root_append_cap(7, &h.meta), 20);
+        let read = h.meta.local_rows_read() - before;
+        assert!(
+            read <= 1,
+            "the cap of the 21st row read {read} rows of the generation's appends"
+        );
+    }
+
     /// A delegate without a recorded backup counts the root's copy only
     /// through `committed`: an acknowledgement through the appended cursor
     /// that commits nothing keeps its answer parked, the root's push (the

@@ -422,6 +422,9 @@ pub trait Replica {
     /// Plan 43 C3: this node's unshipped holder appends of generation `gen`,
     /// `(idx, last journal seq)` in index order (`Meta::holder_appends`).
     fn holder_appends(&self, gen: u64) -> Result<Vec<(u64, u64)>, MetaError>;
+    /// [`Self::holder_appends`] from stream index `from` on
+    /// (`Meta::holder_appends_from`).
+    fn holder_appends_from(&self, gen: u64, from: u64) -> Result<Vec<(u64, u64)>, MetaError>;
     /// Phase 2b: a delegate's backup persists its transactions; returns
     /// the highest index through which every transaction is in the log
     /// as this replica holds it or held here, contiguously above that
@@ -1309,6 +1312,9 @@ impl Replica for Meta {
 
     fn holder_appends(&self, gen: u64) -> Result<Vec<(u64, u64)>, MetaError> {
         Meta::holder_appends(self, gen)
+    }
+    fn holder_appends_from(&self, gen: u64, from: u64) -> Result<Vec<(u64, u64)>, MetaError> {
+        Meta::holder_appends_from(self, gen, from)
     }
 
     fn deleg_backup_append(&self, gen: u64, txs: &[DelegateTx]) -> Option<u64> {
