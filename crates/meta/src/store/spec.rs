@@ -723,6 +723,13 @@ struct Strand<'a> {
     /// every backup) is in the successor's tail. A queued copy would be a
     /// second executable copy of a rid its requester still holds (I2).
     rebuild: bool,
+    /// Each stranded transaction's `deps` (by journal seq), taken from the
+    /// intact journal before the pass strands anything: a pass that
+    /// strands every row, oldest first, has deleted the rows ahead of a
+    /// transaction by the time it is examined, and
+    /// [`stranded_local_deps`] would find none. `None`: read the journal
+    /// as it stands.
+    deps_of: Option<&'a HashMap<u64, Streams>>,
 }
 
 impl Strand<'static> {
@@ -732,6 +739,7 @@ impl Strand<'static> {
         quiet: None,
         recall: false,
         rebuild: false,
+        deps_of: None,
     };
 }
 
@@ -1396,7 +1404,10 @@ fn strand_local_tx(
     let Some(row) = local::get_journal_tx(&*tx, meta, first)? else {
         return Ok(Stranding::Queued);
     };
-    let deps = stranded_local_deps(&*tx, meta, first, undone)?;
+    let deps = match strand.deps_of.and_then(|m| m.get(&first)) {
+        Some(deps) => *deps,
+        None => stranded_local_deps(&*tx, meta, first, undone)?,
+    };
     let rows = local::journal_records(&*tx, meta, first, row.last)?;
     // A delegate's row this root appended raised the generation's log
     // index (`apply_delegate_tx`, `apply_adopted_records_from`; the
@@ -1600,11 +1611,36 @@ fn stranded_local_deps(
             *e = (*e).max(head.idx);
         }
     }
-    let mut deps = Streams::NONE;
-    for (gen, idx) in highest.into_iter().rev().take(crate::session::STREAMS_CAP) {
-        deps.raise(gen, idx);
+    Ok(streams_of(&highest))
+}
+
+/// [`stranded_local_deps`] of every journal transaction, by its first
+/// journal seq, in one pass over the journal as it stands.
+fn stranded_deps_by_tx(
+    r: &impl Readable,
+    meta: &Meta,
+    undone: &HashSet<u64>,
+) -> Result<HashMap<u64, Streams>, MetaError> {
+    let mut highest: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+    let mut out = HashMap::new();
+    for (start, head) in local::read_journal_tx_heads(r, meta)? {
+        out.insert(start, streams_of(&highest));
+        if head.gen != 0 && !undone.contains(&head.gen) {
+            let e = highest.entry(head.gen).or_insert(0);
+            *e = (*e).max(head.idx);
+        }
     }
-    Ok(deps)
+    Ok(out)
+}
+
+/// The dependency table for the highest stream index per generation (the
+/// highest generations when it does not fit).
+fn streams_of(highest: &std::collections::BTreeMap<u64, u64>) -> Streams {
+    let mut deps = Streams::NONE;
+    for (gen, idx) in highest.iter().rev().take(crate::session::STREAMS_CAP) {
+        deps.raise(*gen, *idx);
+    }
+    deps
 }
 
 /// The delegation generations whose `Delegate` record sits in the journal
@@ -2845,6 +2881,7 @@ fn strand_tx(
         quiet: Some(&quiet),
         recall,
         rebuild: false,
+        deps_of: None,
     };
     Ok(rewind_tx(tx, meta, staged, &live, &stranded, cutoff, strand, None)?.0)
 }
@@ -3317,6 +3354,13 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
     counter_set_tx(tx, &meta.local, KV_SPEC_LIVE_COUNT, kept.len() as u64);
     let journal = local::read_journal_txs(&*tx, meta)?;
     let undone = undone_grants(&*tx, meta, journal.iter().map(|(first, _)| *first))?;
+    // M2: every transaction's `deps` on the delegates' rows ahead of it,
+    // from the whole journal. The loop below takes each row out before the
+    // next is examined, so a pass that read them as it went would find
+    // none; a root's own replay must still wait for the delegate rows it
+    // was ordered after, above all the ones this pass drops
+    // (`Strand::rebuild`), which no queue entry orders it behind.
+    let deps_of = stranded_deps_by_tx(&*tx, meta, &undone)?;
     for (first, row) in journal {
         let (key, before) = match row.spec_seq {
             Some(seq) => match tx.get(&meta.spec, seq_key(seq))? {
@@ -3340,6 +3384,7 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
                 quiet: None,
                 recall: false,
                 rebuild: true,
+                deps_of: Some(&deps_of),
             },
         )?;
     }

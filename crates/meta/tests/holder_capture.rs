@@ -2327,3 +2327,108 @@ fn a_rebuild_queues_no_gated_append_of_a_delegates_row() {
     // Unchanged: the root's own gated row is in its epoch's member copy.
     assert!(meta.member_copy_carries(rid(9)).unwrap());
 }
+
+/// The delegate's rid for stream index `seq` (L2 tests).
+fn delegate_rid(seq: u64) -> Rid {
+    Rid {
+        node: 2,
+        incarnation: 1,
+        seq,
+    }
+}
+
+fn create_rec(name: &str, ino: u64) -> LogRecord {
+    LogRecord::Create {
+        parent: ROOT_INO,
+        name: name.into(),
+        ino,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        time_ns: 5,
+    }
+}
+
+/// The root appends the delegate's row `idx` of generation `gen`, as
+/// `on_delegate_stream` does: no class set, so it is journaled `Lone`.
+fn root_appends(meta: &Meta, gen: u64, idx: u64, name: &str) {
+    assert!(meta
+        .apply_delegate_tx(
+            &[create_rec(name, (2 << 40) | idx)],
+            Some(delegate_rid(idx)),
+            gen,
+            idx,
+            constellation_meta::Position::ZERO,
+        )
+        .unwrap());
+    meta.session().note_stream(gen, idx);
+}
+
+/// The journal seq of the newest row.
+fn last_seq(meta: &Meta) -> u64 {
+    meta.take_journal(usize::MAX).unwrap().last().unwrap().0
+}
+
+/// The root's own row (generation 0), journaled `Lone`: a lone root's op.
+fn root_own_lone(meta: &Meta, name: &str, ino: u64, seq: u64) {
+    use constellation_meta::{PendingClass, RowClass};
+    let _class = PendingClass::set(RowClass::Lone);
+    let op = MutateOp::Create {
+        parent: ROOT_INO,
+        name: name.into(),
+        ino,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    execute_mutate(meta, &op, Some(rid(seq))).unwrap();
+}
+
+/// L2 (M2): the rebuild takes each journal row out before it examines the
+/// next, so a row's `deps` on the delegates' rows ahead of it have to be
+/// read from the intact journal. The root's own replay still waits for the
+/// delegate's row it was ordered after, above all one the rebuild dropped,
+/// which no queue entry orders it behind any more
+/// (`long-delegated-late-answers` seed 2945's shape: a marker journaled
+/// after the root appended the data row it follows). Fails before: the own
+/// replays carry no deps.
+#[test]
+fn a_rebuild_keeps_the_stream_deps_of_the_roots_own_replays() {
+    use constellation_meta::RowClass;
+    let gen = 5;
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    // Idx 1: re-asked, so gated: dropped by the rebuild.
+    root_appends(&meta, gen, 1, "a");
+    meta.reclass_journal_tx(last_seq(&meta), RowClass::Archive)
+        .unwrap();
+    root_own_lone(&meta, "m1", (3 << 40) | 1, 8);
+    // Idx 2: still `Lone`: queued.
+    root_appends(&meta, gen, 2, "b");
+    root_own_lone(&meta, "m2", (3 << 40) | 2, 9);
+    meta.set_holder_epoch(0);
+    meta.replace_ns_from_rebuilt(&Meta::open_in_memory().unwrap(), &Default::default())
+        .unwrap();
+    let deps = |rid: Rid| {
+        meta.pending_replays()
+            .unwrap()
+            .into_iter()
+            .find(|q| q.rid == rid)
+            .unwrap_or_else(|| panic!("{rid:?} is not queued"))
+            .deps
+    };
+    assert!(
+        meta.pending_replays()
+            .unwrap()
+            .iter()
+            .all(|q| q.rid != delegate_rid(1)),
+        "the dropped append is not queued"
+    );
+    assert_eq!(
+        deps(rid(8)).get(gen),
+        Some(1),
+        "the first marker waits for the dropped row to reach the log"
+    );
+    assert_eq!(deps(delegate_rid(2)).get(gen), Some(1));
+    assert_eq!(deps(rid(9)).get(gen), Some(2));
+}
