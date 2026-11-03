@@ -3512,11 +3512,12 @@ impl Core {
     /// backup's tail holds, and an acknowledgement of an earlier append
     /// that claimed it let the delegate answer before the backup's own
     /// append of it arrived (I1, `delegated-holder-cut` seed 802 inside a
-    /// takeover gate, plan 46 M0.3 S5).
+    /// takeover gate, plan 46 M0.3 S5). Not only while this node is the
+    /// generation's root: a deposed root (its `GenState` dropped by
+    /// `deleg_on_lease_gone`) keeps its unshipped appends in the journal,
+    /// and in `log_stream_idx`, until its recovery strands them, and the
+    /// delegate may still send it the backup appends above them.
     fn root_log_floor(&self, gen: u64, replica: &dyn Replica) -> u64 {
-        if !self.dl.gens.get(&gen).is_some_and(|g| !g.ended) {
-            return u64::MAX;
-        }
         let tip = replica.holder_append_tip();
         let shipped = replica.journal_acked_seq().unwrap_or(0);
         if tip == 0 || tip <= shipped {

@@ -53412,6 +53412,44 @@ mod c2g_settle {
         assert_eq!(acked(&out), Some(2), "{out:?}");
     }
 
+    /// Review of S5: `root_log_floor` held only while this node had the
+    /// generation's `GenState`. A deposed root drops it
+    /// (`deleg_on_lease_gone`) but keeps its unshipped appends in the
+    /// journal, and in `log_stream_idx`, until its recovery strands them:
+    /// the delegate's next backup append was acknowledged through them
+    /// (`acked` 2), rows only the delegate then held. Fails on the parent:
+    /// `acked` 2.
+    #[test]
+    fn s5_a_deposed_root_that_is_the_backup_does_not_count_its_unshipped_appends() {
+        let (mut h, dir) = gated_root_with_gen_at_4(true);
+        h.step(batch_from_4(&h, dir, 10, 1));
+        h.step(batch_from_4(&h, dir, 11, 2));
+        assert_eq!(h.core.dl.gens[&7].cursor, 2);
+        // Deposed: the generation state goes, the journal stays.
+        h.core.lease.lost = true;
+        let mut out = Vec::new();
+        h.core.deleg_on_lease_gone(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.gens.is_empty());
+        let out = h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegBackupAppend {
+                req: OpId(40),
+                gen: 7,
+                txs: vec![constellation_meta::DelegateTx {
+                    idx: 1,
+                    rid: Some(rid4(1)),
+                    records: vec![LogRecord::Completed { rid: rid4(1) }],
+                    deps: Default::default(),
+                }],
+            },
+        });
+        let acked = sends(&out).into_iter().find_map(|(_, m)| match m {
+            PeerMsg::DelegBackupAck { acked, .. } => Some(*acked),
+            _ => None,
+        });
+        assert_eq!(acked, Some(1), "{out:?}");
+    }
+
     /// S5 (new I1 of the `+commit` sweeps, `delegated-holder-cut` 553): inside
     /// a takeover gate the replica's `completed` holds what the gate
     /// re-appended to its journal (the predecessor's tail): an op of this
