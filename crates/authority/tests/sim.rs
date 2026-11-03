@@ -7460,6 +7460,11 @@ struct OracleTotals {
     /// counters (installs put off, generations stopped, rows the root
     /// refused, answers that took nothing).
     xgen: [u64; 18],
+    /// Parked acknowledgements of a delegate's stream (ADR-41): [released,
+    /// released by the log while the group's commit was not heard (not by the
+    /// commit), waited a second or more, longest wait ms, empty batches that
+    /// asked the root for its commit].
+    parked: [u64; 5],
     /// Plan 43 C1-3: attempts to fetch a group's tail, fetches completed (of
     /// them, of an inherited tail), claims that carried no tail (must be 0
     /// outside an abandon), groups abandoned, runs that ended waiting.
@@ -7534,6 +7539,11 @@ impl OracleTotals {
             self.xgen[15] += st.deleg_caps_walked;
             self.xgen[16] += st.deleg_xdeps_log_reads;
             self.xgen[17] += st.deleg_xdeps_own_checks;
+            self.parked[0] += st.deleg_stream_acks_released;
+            self.parked[1] += st.deleg_stream_acks_by_log;
+            self.parked[2] += st.deleg_stream_acks_slow;
+            self.parked[3] = self.parked[3].max(st.deleg_stream_ack_wait_max_ms);
+            self.parked[4] += st.deleg_root_pokes;
         }
         for st in r.stats.values() {
             self.downgraded_lone += st.acks_downgraded_lone;
@@ -7775,6 +7785,17 @@ impl OracleTotals {
             self.xgen[15],
             self.xgen[16],
             self.xgen[17]
+        );
+        eprintln!(
+            "SWEEP-PARKED-TOTALS {label} seeds {}/{seeds}: parked delegate acks released {}, by the \
+             log and not the group's commit {}, waited 1 s or more {}, longest wait {} ms; empty \
+             batches asking the root for its commit {}",
+            self.seeds,
+            self.parked[0],
+            self.parked[1],
+            self.parked[2],
+            self.parked[3],
+            self.parked[4]
         );
         eprintln!(
             "SWEEP-CLAIM-TOTALS {label} seeds {}/{seeds}: class-claim-mismatch={} in {} seeds, \

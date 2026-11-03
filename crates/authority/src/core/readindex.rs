@@ -85,6 +85,10 @@ use constellation_meta::{
 use constellation_types::Code;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// A parked acknowledgement of a delegate's stream that waited this long
+/// counts as slow (`Stats::deleg_stream_acks_slow`).
+const SLOW_ACK_MS: u64 = 1_000;
+
 /// A strict read waiting for its answer.
 #[derive(Debug)]
 struct ReadReq {
@@ -737,6 +741,27 @@ impl Core {
             .filter(|(_, p)| p.stream_need.is_some_and(|(g, i)| g == gen && i > through))
             .map(|(id, _)| *id)
             .collect()
+    }
+
+    /// Plan 43 Q16 (ADR-41): since when the oldest park waiting on a row of
+    /// generation `gen` above `above` and at most `through` has waited: rows
+    /// the root holds (`through`) that its own tenure has not told this
+    /// delegate it committed (`above`).
+    pub(crate) fn oldest_stream_park_between(
+        &self,
+        gen: u64,
+        above: u64,
+        through: u64,
+    ) -> Option<WaitMs> {
+        self.rd
+            .parked
+            .values()
+            .filter(|p| {
+                p.stream_need
+                    .is_some_and(|(g, i)| g == gen && i > above && i <= through)
+            })
+            .map(|p| p.since)
+            .min()
     }
 
     pub(crate) fn has_stream_parks(&self) -> bool {
@@ -1949,9 +1974,22 @@ impl Core {
                 }
             }
             let waited = now.wait.since(p.since).max(0) as u64;
-            if p.stream_need.is_some() {
+            if let Some((g, i)) = p.stream_need {
                 self.stats.deleg_stream_acks_released += 1;
                 self.stats.deleg_stream_ack_wait_ms += waited;
+                self.stats.deleg_stream_ack_wait_max_ms =
+                    self.stats.deleg_stream_ack_wait_max_ms.max(waited);
+                self.stats.deleg_stream_acks_slow += u64::from(waited >= SLOW_ACK_MS);
+                // Released by the log, not by the group's commit: the row
+                // reached the log while the root's committed prefix (or the
+                // backup's acknowledgement) had not been heard (ADR-41).
+                let by_log = !self.cfg.ack_s3
+                    && self
+                        .dl
+                        .mine
+                        .get(&g)
+                        .is_some_and(|d| Core::deleg_group_through(d) < i);
+                self.stats.deleg_stream_acks_by_log += u64::from(by_log);
             }
             // Plan 43 C1-2 (D4): a gated answer released because the gate
             // went off (the group is gone and no peer is eligible, or an

@@ -35452,6 +35452,13 @@ fn delegated_to_me(meta: &Meta, me: NodeId) -> constellation_fs_core::Ino {
 /// (`(0, 0)`: the whole directory).
 fn delegated_range_to_me(meta: &Meta, me: NodeId, range: (u8, u32)) -> constellation_fs_core::Ino {
     let dir = meta.allocate_ino(ROOT_INO).unwrap();
+    delegated_dir_to(meta, me, range, dir);
+    dir
+}
+
+/// [`delegated_range_to_me`] for the directory `dir` (another node's
+/// allocation of the same directory: two cores that exchange rows).
+fn delegated_dir_to(meta: &Meta, me: NodeId, range: (u8, u32), dir: constellation_fs_core::Ino) {
     crate::replica::Replica::apply_segment(
         meta,
         1,
@@ -35479,7 +35486,6 @@ fn delegated_range_to_me(meta: &Meta, me: NodeId, range: (u8, u32)) -> constella
         ],
     )
     .unwrap();
-    dir
 }
 
 fn renew_req(out: &[Action], gen: u64) -> Option<OpId> {
@@ -45014,6 +45020,261 @@ mod deleg_group {
         assert_eq!(
             h.core.dl.mine[&7].root_committed, last,
             "counted past what the root appended"
+        );
+    }
+
+    /// A delegate (node 3, [`delegate_renewed_once`]) and its root (node 1,
+    /// backed by node 2, [`root_backed_by_node_2`]) as two cores that hand
+    /// each other what they send. Node 2's create (request 500) is executed
+    /// by the delegate, streamed, appended by the root and acknowledged as
+    /// appended and not committed (the backup holds nothing yet), and the
+    /// delegate parks the answer: `(delegate, root, the backup's append
+    /// request, its tip, the stream index of the row, the directory)`. The
+    /// backup's acknowledgement is the root's commit.
+    fn parked_pair() -> (Harness, Harness, OpId, u64, u64, Ino) {
+        let (mut d, dir, _, _) = delegate_renewed_once();
+        let mut r = root_backed_by_node_2();
+        delegated_dir_to(&r.meta, 3, (0, 0), dir);
+        let mut out = Vec::new();
+        r.core.delegation_sync(r.clk(), &r.meta, &mut out);
+        let round = round_of(&d, 7);
+        r.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRenew {
+                req: OpId(1),
+                gen: 7,
+                round,
+                backup: None,
+                stream_head: 0,
+                stream_head_at: 0,
+                first: false,
+            },
+        });
+        let out = forward_create(&mut d, dir, 1, 500);
+        assert_eq!(answer_to_2(&out, 500), None, "answered alone: {out:?}");
+        let (req, round, last) = batch(&out).expect("sent to the root");
+        let rout = deliver(&mut r, 3, &out);
+        assert_eq!(
+            stream_acks_to_3(&rout),
+            vec![(req, round, last, 0, false)],
+            "appended, not committed: {rout:?}"
+        );
+        let (breq, tip) = sends(&rout)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::BackupAppend { req, txs, .. } if to == 2 => {
+                    Some((*req, txs.last().map_or(0, |t| t.last)))
+                }
+                _ => None,
+            })
+            .expect("the append is not sent to the backup");
+        let dout = deliver(&mut d, 1, &rout);
+        assert_eq!(answer_to_2(&dout, 500), None, "{dout:?}");
+        (d, r, breq, tip, last, dir)
+    }
+
+    /// What `from` sent to node `to`'s core in `out`, delivered to it; what
+    /// that sent in turn.
+    fn deliver(to: &mut Harness, from: NodeId, out: &[Action]) -> Vec<Action> {
+        let mut sent = Vec::new();
+        for (dst, msg) in sends(out) {
+            if dst == to.core.node_id() {
+                sent.extend(to.step(Event::Peer {
+                    from,
+                    msg: msg.clone(),
+                }));
+            }
+        }
+        sent
+    }
+
+    /// The root's backup (node 2) holds the root's journal through `tip`.
+    fn the_backup_holds(r: &mut Harness, breq: OpId, tip: u64) -> Vec<Action> {
+        r.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::BackupAck {
+                req: breq,
+                epoch: 1,
+                acked: tip,
+                sealed: false,
+                fresh: false,
+            },
+        })
+    }
+
+    /// One stream tick later, both nodes: the delegate's tick fires.
+    fn stream_tick(d: &mut Harness, r: &mut Harness) -> Vec<Action> {
+        let tick = d.core.cfg.delegation_stream_tick_ms;
+        d.advance(tick);
+        r.advance(tick);
+        // (No tick is armed when nothing waits on one.)
+        match d.core.dl.stream_timer {
+            Some(id) => d.step(Event::Timer { id }),
+            None => poke(d),
+        }
+    }
+
+    /// The empty batch to the root in `out`: `(req, round)`.
+    fn root_ask(out: &[Action]) -> Option<(OpId, u64)> {
+        sends(out).into_iter().find_map(|(to, m)| match m {
+            PeerMsg::DelegateStream {
+                req,
+                gen: 7,
+                round,
+                txs,
+                ..
+            } if to == 1 && txs.is_empty() => Some((*req, *round)),
+            _ => None,
+        })
+    }
+
+    /// The commit rose at the root and its push never came (`how` names
+    /// which of the three cases below): one stream tick later the delegate asks the root
+    /// with an empty batch, the root answers with its commit, and the parked
+    /// answer leaves, within that tick of the commit.
+    fn the_parked_answer_is_released_within_a_tick_of_the_commit(
+        d: &mut Harness,
+        r: &mut Harness,
+        last: u64,
+        how: &str,
+    ) {
+        let committed_at = d.clk().wait;
+        assert_eq!(
+            root_ask(&poke(d)),
+            None,
+            "{how}: asked for the commit before the answer had waited a tick"
+        );
+        let out = stream_tick(d, r);
+        let (req, round) =
+            root_ask(&out).unwrap_or_else(|| panic!("{how}: no ask for the commit: {out:?}"));
+        assert_eq!(answer_to_2(&out, 500), None, "{how}");
+        let rout = deliver(r, 3, &out);
+        assert_eq!(
+            stream_acks_to_3(&rout),
+            vec![(req, round, last, last, false)],
+            "{how}: the root's answer to the ask: {rout:?}"
+        );
+        let dout = deliver(d, 1, &rout);
+        let (outcome, committed) =
+            answer_to_2(&dout, 500).unwrap_or_else(|| panic!("{how}: not released: {dout:?}"));
+        assert!(matches!(outcome, MutateOutcome::Accepted { .. }));
+        assert!(committed);
+        let tick = d.core.cfg.delegation_stream_tick_ms as i64;
+        assert!(
+            d.clk().wait.since(committed_at) <= tick,
+            "{how}: released later than a tick after the commit"
+        );
+        assert_eq!(d.core.stats.deleg_root_pokes, 1, "{how}");
+        assert!(!d.core.has_stream_parks(), "{how}");
+        // Nothing waits: nothing more is asked.
+        assert_eq!(root_ask(&stream_tick(d, r)), None, "{how}");
+    }
+
+    /// ADR-41 liveness, case 1 (a lost push; fable review S1): the root's
+    /// unsolicited acknowledgement of the commit is one-way, and one dropped
+    /// on a link blip is never sent again: the delegate had nothing to send
+    /// (its stream was quiet) and the answer waited for its op's deadline and
+    /// the settle. It now asks the root with an empty batch on the stream
+    /// tick while an answer waits on the root's commit. Fails before: no ask,
+    /// the answer stays parked.
+    #[test]
+    fn a_delegate_asks_the_root_for_its_commit_when_the_push_is_lost() {
+        let (mut d, mut r, breq, tip, last, _) = parked_pair();
+        let rout = the_backup_holds(&mut r, breq, tip);
+        assert_eq!(
+            stream_acks_to_3(&rout).len(),
+            1,
+            "the root did not push: {rout:?}"
+        );
+        // (The push is lost: it is not delivered.)
+        the_parked_answer_is_released_within_a_tick_of_the_commit(&mut d, &mut r, last, "lost");
+    }
+
+    /// ADR-41 liveness, case 2 (a root restarted, or re-adopted, between the
+    /// acknowledgement of the batch and the commit): a generation the new
+    /// incarnation builds from its journal has the cursor and no last batch
+    /// (`last_batch: None`), and the push needs one: the root sent nothing
+    /// when its backup held the row, and nothing changed the delegate's
+    /// round, as the root is the same node. The ask is answered by the new
+    /// incarnation, which then pushes as before.
+    #[test]
+    fn a_delegate_asks_a_root_that_restarted_between_the_ack_and_the_commit() {
+        let (mut d, mut r, breq, tip, last, _) = parked_pair();
+        let g = r.core.dl.gens.get_mut(&7).expect("the generation");
+        g.last_batch = None;
+        g.committed_sent = 0;
+        let rout = the_backup_holds(&mut r, breq, tip);
+        assert!(
+            stream_acks_to_3(&rout).is_empty(),
+            "pushed with no batch to answer: {rout:?}"
+        );
+        the_parked_answer_is_released_within_a_tick_of_the_commit(&mut d, &mut r, last, "restart");
+        assert!(r.core.dl.gens[&7].last_batch.is_some());
+    }
+
+    /// ADR-41 liveness, case 3 (a round change of the delegate's, the root
+    /// the same: a root lost from view and found again): the root's push
+    /// carries the round of the batch it answers, which is not the delegate's
+    /// any more, and is dropped as stale. The ask carries the new round.
+    #[test]
+    fn a_delegate_asks_the_root_again_in_its_new_round_after_a_round_change() {
+        let (mut d, mut r, breq, tip, last, _) = parked_pair();
+        let old = round_of(&d, 7);
+        d.core.dl.mine.get_mut(&7).unwrap().last_root = None;
+        poke(&mut d);
+        assert_ne!(round_of(&d, 7), old, "no round change");
+        assert_eq!(d.core.dl.mine[&7].root_committed, 0);
+        let stale = d.core.stats.deleg_stream_acks_stale;
+        let rout = the_backup_holds(&mut r, breq, tip);
+        assert_eq!(stream_acks_to_3(&rout).len(), 1, "{rout:?}");
+        let dout = deliver(&mut d, 1, &rout);
+        assert_eq!(answer_to_2(&dout, 500), None, "{dout:?}");
+        assert_eq!(
+            d.core.stats.deleg_stream_acks_stale,
+            stale + 1,
+            "the push was not dropped as stale"
+        );
+        the_parked_answer_is_released_within_a_tick_of_the_commit(&mut d, &mut r, last, "round");
+    }
+
+    /// The ask costs nothing when the push arrives (the healthy path): the
+    /// answer leaves on the push and the tick that follows asks nothing.
+    #[test]
+    fn a_pushed_commit_is_not_asked_for() {
+        let (mut d, mut r, breq, tip, _, _) = parked_pair();
+        let rout = the_backup_holds(&mut r, breq, tip);
+        let dout = deliver(&mut d, 1, &rout);
+        assert!(answer_to_2(&dout, 500).is_some(), "{dout:?}");
+        assert_eq!(root_ask(&stream_tick(&mut d, &mut r)), None);
+        assert_eq!(root_ask(&stream_tick(&mut d, &mut r)), None);
+        assert_eq!(d.core.stats.deleg_root_pokes, 0);
+    }
+
+    /// An ask that finds nothing committed is asked again on the next tick,
+    /// no more often, and holds back nothing: its answer is not a refusal
+    /// or a batch that took nothing, so no back-off delays the next row.
+    #[test]
+    fn an_ask_that_finds_nothing_committed_holds_back_no_row() {
+        let (mut d, mut r, _, _, last, dir) = parked_pair();
+        let out = stream_tick(&mut d, &mut r);
+        let (req, round) = root_ask(&out).expect("no ask for the commit");
+        // Asked again once per tick, never per event.
+        assert_eq!(root_ask(&poke(&mut d)), None);
+        let rout = deliver(&mut r, 3, &out);
+        assert_eq!(stream_acks_to_3(&rout), vec![(req, round, last, 0, false)]);
+        let dout = deliver(&mut d, 1, &rout);
+        assert_eq!(answer_to_2(&dout, 500), None);
+        let s = &d.core.dl.mine[&7];
+        assert_eq!(
+            (s.stream_after, s.inflight, s.root_committed),
+            (None, None, 0)
+        );
+        assert_eq!(d.core.stats.deleg_stream_no_progress, 0);
+        // The next row goes at once.
+        let out = forward_create(&mut d, dir, 2, 501);
+        assert!(
+            batch(&out).is_some_and(|(_, _, l)| l == last + 1),
+            "the next row was held back: {out:?}"
         );
     }
 

@@ -356,6 +356,9 @@ pub(crate) struct DelegateState {
     /// at most `streamed_through`): the root's copy a delegate without a
     /// recorded backup counts for its group (plan 43 Q16, ADR-41).
     pub root_committed: u64,
+    /// The next time this delegate may ask the root for its commit with an
+    /// empty batch (`deleg_poke_root`): one stream tick after the last ask.
+    pub poke_after: Option<WaitMs>,
     /// The batch in flight: its request id and last index.
     pub inflight: Option<(OpId, u64)>,
     /// A renewal in flight: its request id and this node's honour clock
@@ -1150,6 +1153,7 @@ impl Core {
                     refused: false,
                     streamed_through: replica.log_stream_idx(d.gen),
                     root_committed: replica.log_stream_idx(d.gen),
+                    poke_after: None,
                     inflight: None,
                     renew: None,
                     renew_sent_wait: WaitMs(0),
@@ -2896,7 +2900,7 @@ impl Core {
     /// (`root_committed`: shipped, or held by its backups; the appended
     /// cursor `streamed_through` drives the flow control and is no second
     /// copy, plan 43 Q16, ADR-41). What the log carries is not counted here.
-    fn deleg_group_through(d: &DelegateState) -> u64 {
+    pub(crate) fn deleg_group_through(d: &DelegateState) -> u64 {
         let held = |members: &[NodeId]| {
             members
                 .iter()
@@ -3002,10 +3006,11 @@ impl Core {
             // before the delegate turned lone is, whatever the class is
             // now — so `deleg_group_maintain` lets go of none of them
             // before the group that is left holds it (`acked_max`).
-            // For a lone delegate `through` is at most the root's cursor
-            // or the log's index, so the raise holds back an added backup
-            // only until it has caught up with what is streamed and never
-            // blocks a removal (`acked_max <= streamed.max(logged)`).
+            // For a lone delegate `through` is at most the root's committed
+            // prefix (`root_committed`) or the log's index, so the raise holds
+            // back an added backup only until it has caught up with what the
+            // root has committed and never blocks a removal
+            // (`acked_max <= root_committed.max(logged)`, ADR-41).
             if through > d.acked_max {
                 raised.push((d.gen, through));
             }
@@ -4251,6 +4256,82 @@ impl Core {
         Some(idx)
     }
 
+    /// Plan 43 Q16 (ADR-41): since when the oldest answer of `gen` has waited
+    /// on the root's commit alone: a row the root holds (`streamed_through`)
+    /// and has not told this delegate its own tenure committed
+    /// (`root_committed`), in a group that counts the root's copy (no backup
+    /// recorded, or none in the applied or the requested version). `None`:
+    /// nothing waits on it.
+    fn deleg_awaits_root_commit(&self, gen: u64) -> Option<WaitMs> {
+        let d = self.dl.mine.get(&gen)?;
+        // (A stopped or lapsed delegate is not honoured: what it holds is
+        // the holder's to settle, and it asks nothing of the root.)
+        if d.stopped
+            || d.lapsed
+            || d.root_committed >= d.streamed_through
+            || !(d.group_backups.is_empty()
+                || d.group_requested
+                    .as_deref()
+                    .is_some_and(<[NodeId]>::is_empty))
+        {
+            return None;
+        }
+        self.oldest_stream_park_between(gen, d.root_committed, d.streamed_through)
+    }
+
+    /// Plan 43 Q16 (ADR-41): ask the root for its commit of `gen`'s stream
+    /// with an empty batch, once an answer has waited on it for a stream
+    /// tick, and again every tick while it waits. The root's own push
+    /// (`root_stream_push`) comes first on every healthy path (one round trip
+    /// after the batch's acknowledgement), and is the only word the root
+    /// sends unasked: a push that was lost, one a root restarted since the
+    /// batch (its generation's `last_batch` is empty) never sent, and one on
+    /// the round before a change of this delegate's (dropped as stale) leave
+    /// a quiet delegate with nothing else to send, and its answer parked
+    /// until its deadline and the settle. The root answers an empty batch
+    /// with its cursor and its commit (`on_delegate_stream`), on this
+    /// delegate's round, and counts the generation's last batch from it, so
+    /// its pushes go on. Nothing is sent while no answer waits on the root.
+    fn deleg_poke_root(&mut self, now: Now, gen: u64, root: NodeId, out: &mut Vec<Action>) {
+        let Some(since) = self.deleg_awaits_root_commit(gen) else {
+            return;
+        };
+        let tick = self.cfg.delegation_stream_tick_ms.max(1);
+        let d = self.dl.mine.get_mut(&gen).expect("present");
+        if now.wait.since(since) < tick as i64 || d.poke_after.is_some_and(|t| now.wait < t) {
+            return;
+        }
+        d.poke_after = Some(now.wait.plus(tick));
+        let req = self.op_id();
+        self.dl.by_req.insert(req, (gen, ReqKind::Stream));
+        self.stats.deleg_root_pokes += 1;
+        let d = self.dl.mine.get_mut(&gen).expect("present");
+        // (An empty batch is in flight as one that ends at what is
+        // acknowledged: `on_delegate_stream_ack` knows it by that.)
+        d.inflight = Some((req, d.streamed_through));
+        d.inflight_at = now.wait;
+        let round = d.stream_round;
+        out.push(Action::Send {
+            to: root,
+            msg: PeerMsg::DelegateStream {
+                req,
+                gen,
+                round,
+                txs: Vec::new(),
+                leaving: Vec::new(),
+                leaving_barriers: Vec::new(),
+            },
+        });
+    }
+
+    /// Whether `req` is the empty batch of [`Self::deleg_poke_root`] in
+    /// flight for `d`: it ends at what is already acknowledged, as no batch
+    /// of rows does (the acknowledgement that covers a batch clears it).
+    fn is_root_poke(d: &DelegateState, req: OpId) -> bool {
+        d.inflight
+            .is_some_and(|(r, last)| r == req && last <= d.streamed_through)
+    }
+
     /// Send the next batch of every generation without one in flight.
     fn deleg_stream(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         if self.dl.mine.is_empty() {
@@ -4317,6 +4398,7 @@ impl Core {
             }
             let d = self.dl.mine.get(&gen).expect("present");
             if txs.is_empty() {
+                self.deleg_poke_root(now, gen, root, out);
                 continue;
             }
             let mut last = txs.last().map(|t| t.idx).unwrap_or(from);
@@ -4388,11 +4470,14 @@ impl Core {
         // be sent, a generation (or its backup append) backing off, or
         // rows held back behind another generation's acknowledgement:
         // the tick retries.
+        // An answer parked on the root's word (`deleg_poke_root`) is asked
+        // for on the tick too.
         if self.dl.mine.values().any(|d| {
             d.inflight.is_some()
                 || d.stream_after.is_some_and(|t| now.wait < t)
                 || d.backup_after.is_some_and(|t| now.wait < t)
                 || (!d.stopped && replica.delegate_idx(d.gen) > d.streamed_through)
+                || self.deleg_awaits_root_commit(d.gen).is_some()
         }) {
             self.arm_stream_tick(now, out);
         }
@@ -4450,6 +4535,7 @@ impl Core {
             return;
         }
         let answers_inflight = d.inflight.is_some_and(|(r, _)| r == req);
+        let poke = Self::is_root_poke(d, req);
         // An acknowledgement through the in-flight batch's last row (one
         // for a given-up batch overtaken by its re-send) answers that
         // batch too: the next one goes out now, not after the re-send's
@@ -4462,7 +4548,9 @@ impl Core {
         }
         let d = self.dl.mine.get_mut(&gen).expect("present");
         if refused {
-            if !answers_inflight {
+            if !answers_inflight || poke {
+                // (A refused ask for the commit asks again on the tick:
+                // it holds back no batch of rows.)
                 return;
             }
             // The generation is ending, or the root has not learned it
@@ -4495,6 +4583,11 @@ impl Core {
         };
         let progressed = through > d.streamed_through;
         if !progressed && !answers_inflight {
+            return;
+        }
+        if !progressed && poke {
+            // The answer to an empty batch: the commit it carried is all it
+            // was for.
             return;
         }
         if !progressed {
@@ -4557,12 +4650,17 @@ impl Core {
             ReqKind::Stream => {
                 let tick = self.cfg.delegation_stream_tick_ms.max(1);
                 if let Some(d) = self.dl.mine.get_mut(&gen) {
+                    let poke = Self::is_root_poke(d, req);
                     d.inflight = None;
                     // Back off: the root is unreachable or slow, and the
                     // stream is retried on the tick, not per event
                     // (harness `delegate-partition`: 440k sends in a cut).
-                    d.stream_backoff_ms = (d.stream_backoff_ms * 2).clamp(tick * 4, 2_000);
-                    d.stream_after = Some(now.wait.plus(d.stream_backoff_ms));
+                    // (Not for an ask for the commit: it goes again on the
+                    // tick, and holds back no row.)
+                    if !poke {
+                        d.stream_backoff_ms = (d.stream_backoff_ms * 2).clamp(tick * 4, 2_000);
+                        d.stream_after = Some(now.wait.plus(d.stream_backoff_ms));
+                    }
                 }
                 self.arm_stream_tick(now, out);
             }

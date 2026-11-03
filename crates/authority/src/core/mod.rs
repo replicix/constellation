@@ -1194,6 +1194,16 @@ pub struct Stats {
     pub deleg_stream_acks_pushed: u64,
     /// Delegate: acknowledgements that raised the root's committed prefix.
     pub deleg_root_committed_raised: u64,
+    /// Delegate: parked acknowledgements (of a stream's rows) that waited
+    /// for the longest time, ones that waited a second or more, and ones
+    /// released by the log while their group's commit was not heard (not by
+    /// the commit): what a lost push leaves (ADR-41).
+    pub deleg_stream_ack_wait_max_ms: u64,
+    pub deleg_stream_acks_slow: u64,
+    pub deleg_stream_acks_by_log: u64,
+    /// Delegate: empty batches sent to ask the root for its commit while an
+    /// answer waited on it (`deleg_poke_root`, ADR-41).
+    pub deleg_root_pokes: u64,
     /// Delegate: renewal answers dropped as another root's or round's, or
     /// for a generation no longer this node's.
     pub deleg_renewed_stale: u64,
