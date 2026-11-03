@@ -64890,7 +64890,16 @@ No knob (the 8 sweeps of the first version re-run on the final code, fix only; b
 delegated-backup 7 / 27 (k0 / k1; base 7 / 27), placement-hot 6 / 18 (6 / 18), long-delegated-backup 82 / 99 (86 / 107), delegated-no-backup-root-near 248 / 316
 (247 / 322); asks 39 / 105, 20 / 22, 118 / 161, 448 / 829.
 
+Re-review round: `deleg_awaited_commits` (it runs on every event) reads the log's index at most once per generation per call and only when the cheap
+in-memory tests leave the dependency or the removal open, where it read the store per dependency row per park (a per-event read once took 73 % of a loaded
+delegate's core thread; no store-read counter covers `log_stream_idx`, so this is argued by structure, not counted); with no generation holding appended rows
+uncommitted it returns before the parks are scanned. The ask of a generation the log ends leaves `by_req` (`a_generation_that_ends_leaves_no_ask_registered`);
+a round change resets the ask's back-off (`a_round_change_resets_the_asks_back_off`); `deleg_stream_acks_pushed` counts the pushes sent, the dropped ones are
+`deleg_stream_acks_push_dropped`; ADR-41 says what the sweeps show and the bound after a lost or refused ask. The sweeps were not re-run: nothing else changed
+behaviour.
+
 Gates (box 1, rebased on 43dc55d2, final tree; TMPDIR on a tmpfs, the disk made the suites fsync-bound): `cargo fmt --all --check` and `cargo clippy
---workspace --all-targets -- -D warnings` clean; authority lib and `meta_repro` 987 passed, net 137, control 146, harness lib 165, meta 564, engine 958, all 0
-failed; sim suite (release) 357 passed, 0 failed, 13 ignored, including the M0.3 ratchet `m03_the_configurations_at_zero_violations_stay_there` and the item-A pins
-(the ratchet prints no counts, so a change under its ceilings is not visible; nothing was raised).
+--workspace --all-targets -- -D warnings` clean; authority lib and `meta_repro` 989 passed, harness lib 165, engine 958 (meta 564, net 137, control 146 on the
+tree before this round), all 0 failed; sim suite (release) 357 passed, 0 failed, 13 ignored, including the M0.3 ratchet
+`m03_the_configurations_at_zero_violations_stay_there` and the item-A pins (the ratchet prints no counts, so a change under its ceilings is not visible;
+nothing was raised).
