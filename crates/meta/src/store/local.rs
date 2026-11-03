@@ -1332,6 +1332,8 @@ impl Meta {
         if gen == 0 {
             return Ok(Vec::new());
         }
+        self.holder_scans
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let r = self.db.read_tx();
         let mut out = Vec::new();
         for found in journal_origins_from(&r, self, gen, from)? {

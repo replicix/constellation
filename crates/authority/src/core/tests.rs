@@ -53450,6 +53450,60 @@ mod c2g_settle {
         assert_eq!(acked, Some(1), "{out:?}");
     }
 
+    /// Review of S5 (48e5cea4): the holder-append tip only rises, and a
+    /// strand deletes journal rows without advancing the shipped watermark.
+    /// A deposed holder that recovered (its unshipped appends stranded) and
+    /// stays a follower is a generation's backup from then on: it answers a
+    /// `DelegBackupAppend` without scanning the generation's appends from
+    /// index 0 (`journal_origin` keys of a stranded generation) for good; a
+    /// scan of a stranded generation yields no live row, so it is counted
+    /// by `Meta::holder_scans`, not by `local_rows_read`.
+    /// Fails before the clamp of the tip to the journal's highest seq: the
+    /// scan runs on every append.
+    #[test]
+    fn s5_a_recovered_deposed_root_that_is_the_backup_does_not_scan_for_its_appends() {
+        let (mut h, dir) = gated_root_with_gen_at_4(true);
+        h.step(batch_from_4(&h, dir, 10, 1));
+        h.step(batch_from_4(&h, dir, 11, 2));
+        h.core.lease.lost = true;
+        let mut out = Vec::new();
+        h.core.deleg_on_lease_gone(h.clk(), &h.meta, &mut out);
+        // Recovery: the namespace is rebuilt from the log, and every
+        // unshipped transaction of this node strands.
+        let side = constellation_meta::Meta::open_in_memory().unwrap();
+        h.meta
+            .replace_ns_from_rebuilt(&side, &Default::default())
+            .unwrap();
+        assert!(h.meta.holder_appends(7).unwrap().is_empty());
+        assert_eq!(Replica::max_journal_seq(&h.meta), Some(0));
+        assert!(
+            h.meta.holder_append_tip() > Replica::journal_acked_seq(&h.meta).unwrap(),
+            "the tip stays above the watermark"
+        );
+        let append = |req: u64| Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegBackupAppend {
+                req: OpId(req),
+                gen: 7,
+                txs: vec![constellation_meta::DelegateTx {
+                    idx: 1,
+                    rid: Some(rid4(1)),
+                    records: vec![LogRecord::Completed { rid: rid4(1) }],
+                    deps: Default::default(),
+                }],
+            },
+        };
+        let before = h.meta.holder_scans();
+        let out = h.step(append(40));
+        let acked = sends(&out).into_iter().find_map(|(_, m)| match m {
+            PeerMsg::DelegBackupAck { acked, .. } => Some(*acked),
+            _ => None,
+        });
+        assert_eq!(acked, Some(1), "{out:?}");
+        let scans = h.meta.holder_scans() - before;
+        assert_eq!(scans, 0, "the backup append scanned the appends {scans}x");
+    }
+
     /// S5 (new I1 of the `+commit` sweeps, `delegated-holder-cut` 553): inside
     /// a takeover gate the replica's `completed` holds what the gate
     /// re-appended to its journal (the predecessor's tail): an op of this

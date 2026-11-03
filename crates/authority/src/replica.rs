@@ -424,6 +424,9 @@ pub trait Replica {
     /// Plan 43 C3: an upper bound of the journal seqs of this node's holder
     /// appends of delegation rows, 0 for none (`Meta::holder_append_tip`).
     fn holder_append_tip(&self) -> u64;
+    /// The highest journal seq of this node's unshipped journal, 0 for
+    /// none (`Meta::max_journal_seq`); `None` when it cannot be read.
+    fn max_journal_seq(&self) -> Option<u64>;
     /// Plan 43 C3: this node's unshipped holder appends of generation `gen`,
     /// `(idx, last journal seq)` in index order (`Meta::holder_appends`).
     fn holder_appends(&self, gen: u64) -> Result<Vec<(u64, u64)>, MetaError>;
@@ -1317,6 +1320,10 @@ impl Replica for Meta {
 
     fn holder_append_tip(&self) -> u64 {
         Meta::holder_append_tip(self)
+    }
+
+    fn max_journal_seq(&self) -> Option<u64> {
+        Meta::max_journal_seq(self).ok()
     }
 
     fn holder_appends(&self, gen: u64) -> Result<Vec<(u64, u64)>, MetaError> {

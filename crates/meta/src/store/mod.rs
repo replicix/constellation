@@ -747,6 +747,9 @@ pub struct Meta {
     local_rows_read: AtomicU64,
     /// Probes of the `dirty` keyspace for any entry ([`Meta::dirty_probes`]).
     dirty_probes: AtomicU64,
+    /// Scans of a generation's unshipped holder appends
+    /// ([`Meta::holder_scans`]).
+    holder_scans: AtomicU64,
     /// Plan 40: dentries decoded by the directory reads (`readdir`,
     /// `readdir_after` and their scratch twins) — what a page costs
     /// ([`Meta::dentries_read`]).
@@ -1010,6 +1013,14 @@ impl Meta {
         self.dirty_probes.load(Ordering::Relaxed)
     }
 
+    /// How many times a generation's unshipped holder appends were scanned
+    /// ([`Self::holder_appends_from`]): a scan of a stranded generation
+    /// yields no live row ([`Self::local_rows_read`] does not count it) but
+    /// walks the tombstones of its `journal_origin` keys.
+    pub fn holder_scans(&self) -> u64 {
+        self.holder_scans.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn note_local_rows_read(&self, n: usize) {
         self.local_rows_read.fetch_add(n as u64, Ordering::Relaxed);
     }
@@ -1239,6 +1250,7 @@ impl Meta {
             inode_reads: AtomicU64::new(0),
             local_rows_read: AtomicU64::new(0),
             dirty_probes: AtomicU64::new(0),
+            holder_scans: AtomicU64::new(0),
             dentries_read: AtomicU64::new(0),
             snapshot_gen: AtomicU64::new(0),
             snapshot_hook: std::sync::RwLock::new(None),

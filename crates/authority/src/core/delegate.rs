@@ -3518,7 +3518,15 @@ impl Core {
     /// and in `log_stream_idx`, until its recovery strands them, and the
     /// delegate may still send it the backup appends above them.
     fn root_log_floor(&self, gen: u64, replica: &dyn Replica) -> u64 {
-        let tip = replica.holder_append_tip();
+        // The tip only rises, and a strand deletes journal rows without
+        // advancing the watermark: a recovered, deposed holder would scan on
+        // every backup append for good. Every unshipped append has its last
+        // row in the journal above the watermark, so the journal's highest
+        // seq bounds the tip exactly. A journal that cannot be read bounds
+        // nothing.
+        let tip = replica
+            .holder_append_tip()
+            .min(replica.max_journal_seq().unwrap_or(u64::MAX));
         let shipped = replica.journal_acked_seq().unwrap_or(0);
         if tip == 0 || tip <= shipped {
             return u64::MAX;
