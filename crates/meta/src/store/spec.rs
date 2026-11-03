@@ -715,6 +715,14 @@ struct Strand<'a> {
     /// row was answered on the delegate's disk alone and is replayed as
     /// before.
     recall: bool,
+    /// L2: the pass is a deposed node's rebuild (`reset_for_rebuilt_ns_tx`).
+    /// A root's append of a delegate's row (`gen` != 0, journaled under the
+    /// root's lease epoch) of a gated class is dropped, not queued: it
+    /// belongs to its generation, whose delegate re-streams it to the
+    /// successor root, and a committed one (ADR-41: shipped or held by
+    /// every backup) is in the successor's tail. A queued copy would be a
+    /// second executable copy of a rid its requester still holds (I2).
+    rebuild: bool,
 }
 
 impl Strand<'static> {
@@ -723,6 +731,7 @@ impl Strand<'static> {
         member: false,
         quiet: None,
         recall: false,
+        rebuild: false,
     };
 }
 
@@ -1512,6 +1521,19 @@ fn strand_local_tx(
     // (A row with a lease epoch is a root's append of a delegate's row, not
     // this node's own execution as the delegate: it keeps today's rule.)
     if recall && row.class.gated() && row.gen != 0 && row.epoch == 0 {
+        return Ok(Stranding::Dropped);
+    }
+    // L2: a deposed root's rebuild strands its appends of a delegate's rows
+    // (`gen` != 0, `epoch` > 0): see `Strand::rebuild`. They are rolled back
+    // above (journal rows, `completed`, the generation's log index); a gated
+    // one is not queued. Safe by ADR-41: a gated root class is
+    // acknowledged to the delegate only once the append is committed
+    // (`root_ack_class`), and a committed one is in the successor's tail.
+    // An uncommitted one was never counted for the requester, who retries
+    // by rid, and the delegate re-streams its generation's rows. (A change
+    // to `root_append_cap` that counts an uncommitted append would make
+    // this drop lose a row.) A `Lone` append keeps today's rule.
+    if strand.rebuild && row.class.gated() && row.gen != 0 && row.epoch > 0 {
         return Ok(Stranding::Dropped);
     }
     // (A gated row of this node's own tenure that a deposition queues for
@@ -2822,6 +2844,7 @@ fn strand_tx(
         member,
         quiet: Some(&quiet),
         recall,
+        rebuild: false,
     };
     Ok(rewind_tx(tx, meta, staged, &live, &stranded, cutoff, strand, None)?.0)
 }
@@ -3230,8 +3253,9 @@ pub(crate) fn local_before_images_from(
 /// 30 §M3b): every before-image here is meaningless against it. Queue the
 /// outstanding shadows and every one of this node's unshipped
 /// transactions for replay by rid (their effects are not in the log-built
-/// namespace; M2 dedup makes a replay of one that did land harmless) and
-/// drop everything else.
+/// namespace; M2 dedup makes a replay of one that did land harmless),
+/// except a gated append of a delegate's row, which its generation
+/// re-delivers (`Strand::rebuild`), and drop everything else.
 pub(crate) fn reset_for_rebuilt_ns_tx(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
@@ -3315,6 +3339,7 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
                 member: true,
                 quiet: None,
                 recall: false,
+                rebuild: true,
             },
         )?;
     }

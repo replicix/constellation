@@ -2234,3 +2234,96 @@ fn holder_appends_from_is_the_full_read_from_the_index_on() {
     // (`other`'s two rows came before them in the journal: shipped too.)
     assert!(check(&meta, other, 2).is_empty());
 }
+
+/// L2 (`placement-hot` seed 8557 under slow lease reads, on the tree before
+/// the settle fixes; `delegated-no-backup-root-near` seed 1680 likewise on
+/// main): a deposed root whose journal holds its unshipped appends of a
+/// delegate's rows is rebuilt from the log. An append of a gated class is
+/// the generation's row, not the root's: the delegate re-streams it to the
+/// successor, and a committed one is in the successor's tail. The rebuild
+/// rolls it back and queues nothing for it, so the deposed root holds no
+/// executable copy of a rid whose requester still retries it (I2). An
+/// append journaled `Lone` keeps today's rule (queued), as does the root's
+/// own gated row (to the member copy of its epoch). Fails before the fix:
+/// the two gated appends are queued, with their gated class.
+#[test]
+fn a_rebuild_queues_no_gated_append_of_a_delegates_row() {
+    use constellation_meta::{PendingClass, RowClass};
+    let gen = 5;
+    let delegate_rid = |seq| Rid {
+        node: 2,
+        incarnation: 1,
+        seq,
+    };
+    let create = |name: &str, ino: u64| LogRecord::Create {
+        parent: ROOT_INO,
+        name: name.into(),
+        ino,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        time_ns: 5,
+    };
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    // The root's appends of three rows of the delegate's stream, each under
+    // the class the root journals it with.
+    for (idx, class, name) in [
+        (1u64, RowClass::RootGroup, "g"),
+        (2, RowClass::Archive, "a"),
+        (3, RowClass::Lone, "l"),
+    ] {
+        let _class = PendingClass::set(class);
+        assert!(meta
+            .apply_delegate_tx(
+                &[create(name, (2 << 40) | idx)],
+                Some(delegate_rid(idx)),
+                gen,
+                idx,
+                constellation_meta::Position::ZERO,
+            )
+            .unwrap());
+        meta.session().note_stream(gen, idx);
+    }
+    // And the root's own committed row (generation 0).
+    {
+        let _class = PendingClass::set(RowClass::RootGroup);
+        let op = MutateOp::Create {
+            parent: ROOT_INO,
+            name: "own".into(),
+            ino: (3 << 40) | 1,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        execute_mutate(&meta, &op, Some(rid(9))).unwrap();
+    }
+    // Deposed: the rebuild from the log (which carries none of them).
+    meta.set_holder_epoch(0);
+    meta.replace_ns_from_rebuilt(&Meta::open_in_memory().unwrap(), &Default::default())
+        .unwrap();
+    assert_eq!(meta.journal_len().unwrap(), 0);
+    let queued: Vec<(Rid, RowClass)> = meta
+        .pending_replays()
+        .unwrap()
+        .into_iter()
+        .map(|q| (q.rid, q.class))
+        .collect();
+    assert_eq!(
+        queued,
+        vec![(delegate_rid(3), RowClass::Lone)],
+        "only the lone append is queued; the gated appends are their generation's"
+    );
+    for seq in [1, 2] {
+        assert_eq!(
+            meta.completed_position(delegate_rid(seq)).unwrap(),
+            None,
+            "the dropped append's completion goes with it"
+        );
+    }
+    // Unchanged: the generation's log index is taken back below the appends.
+    assert_eq!(meta.log_stream_idx(gen).unwrap(), 0);
+    assert_eq!(meta.session().stream_applied(gen), 0);
+    // Unchanged: the root's own gated row is in its epoch's member copy.
+    assert!(meta.member_copy_carries(rid(9)).unwrap());
+}

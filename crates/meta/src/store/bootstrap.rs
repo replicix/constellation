@@ -301,7 +301,9 @@ impl Meta {
     /// this replica's namespace wholesale with `side`'s — a replica
     /// bootstrapped from the shared log, i.e. exactly the log-prefix state
     /// — and queue every outstanding shadow and every one of this node's
-    /// unshipped transactions for replay by rid, in one transaction.
+    /// unshipped transactions for replay by rid, except a gated append of a
+    /// delegate's row, which its generation re-delivers
+    /// (`store::spec::Strand::rebuild`), in one transaction.
     ///
     /// Without before-images there is nothing to roll the deposed journal
     /// back with, so this is the only way to a log-prefix replica; the
