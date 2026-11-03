@@ -45471,6 +45471,39 @@ mod deleg_group {
         assert_eq!(d.core.dl.mine[&7].stream_after, None);
     }
 
+    /// A generation the log ends takes its ask in flight with it: no request
+    /// of it is left in `by_req` (as for the batch and the renewal).
+    #[test]
+    fn a_generation_that_ends_leaves_no_ask_registered() {
+        let (mut d, mut r, _, _, _, _) = parked_pair();
+        let out = armed_tick(&mut d, &mut r);
+        let (ask, _) = root_ask(&out).expect("no ask for the commit");
+        assert!(d.core.dl.by_req.contains_key(&ask));
+        let mut out = Vec::new();
+        let now = d.clk();
+        d.core.drop_delegate_state(now, 7, &d.meta, &mut out);
+        assert!(
+            !d.core.dl.by_req.contains_key(&ask),
+            "the ask of an ended generation is still registered"
+        );
+    }
+
+    /// A round change forgets the ask's back-off: the new round's ask is not
+    /// held by what the old root's refusals counted.
+    #[test]
+    fn a_round_change_resets_the_asks_back_off() {
+        let (mut d, mut r, _, _, last, _) = parked_pair();
+        let out = armed_tick(&mut d, &mut r);
+        let (req, round) = root_ask(&out).expect("no ask for the commit");
+        d.step(root_refuses(req, round, last));
+        assert!(d.core.dl.mine[&7].poke_after.is_some());
+        d.core.dl.mine.get_mut(&7).unwrap().last_root = None;
+        let out = poke(&mut d);
+        assert_eq!(d.core.dl.mine[&7].poke_backoff_ms, 0);
+        let (_, round) = root_ask(&out).expect("the new round's ask waited out the old back-off");
+        assert_eq!(round, round_of(&d, 7));
+    }
+
     /// The tick is armed while an answer waits on the root, also on a tick that
     /// finds the answer too young to ask about: the timer itself, not a poke,
     /// brings the ask.

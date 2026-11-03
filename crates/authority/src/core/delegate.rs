@@ -1462,6 +1462,9 @@ impl Core {
         if let Some((req, _)) = d.renew {
             self.dl.by_req.remove(&req);
         }
+        if let Some((req, _)) = d.ask {
+            self.dl.by_req.remove(&req);
+        }
         let root = self.root_node().unwrap_or(0);
         for p in d.parked {
             self.answer_not_owner(now, p, root, replica, out);
@@ -2833,13 +2836,16 @@ impl Core {
             };
             g.committed_sent = committed;
             let (to, through) = (g.node, g.cursor);
-            self.stats.deleg_stream_acks_pushed += 1;
             let every = self.cfg.delegation_push_drop_every;
-            if every > 0 && self.stats.deleg_stream_acks_pushed.is_multiple_of(every) {
-                // (A push lost on the way: the root has counted it sent.)
+            let nth =
+                self.stats.deleg_stream_acks_pushed + self.stats.deleg_stream_acks_push_dropped + 1;
+            if every > 0 && nth.is_multiple_of(every) {
+                // (A push lost on the way: `committed_sent` has risen, and it
+                // is counted apart from the pushes sent.)
                 self.stats.deleg_stream_acks_push_dropped += 1;
                 continue;
             }
+            self.stats.deleg_stream_acks_pushed += 1;
             out.push(Action::Send {
                 to,
                 msg: PeerMsg::DelegateStreamAck {
@@ -3912,6 +3918,8 @@ impl Core {
                 if let Some((req, _)) = d.ask.take() {
                     stale_reqs.push(req);
                 }
+                d.poke_backoff_ms = 0;
+                d.poke_after = None;
                 if d.last_root.is_some() && root.is_some() {
                     d.streamed_through = replica.log_stream_idx(d.gen);
                     d.root_committed = d.streamed_through;
@@ -4327,6 +4335,12 @@ impl Core {
             let e = awaited.entry(gen).or_insert(since);
             *e = (*e).min(since);
         };
+        // The log's index of a generation, read from the store at most once
+        // per call, and only when the cheap tests in memory leave it open
+        // (this runs on every event: a read per dependency row per park cost
+        // a loaded delegate most of its core thread once, `StreamCache`).
+        let mut logs: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut log_of = |g: u64| *logs.entry(g).or_insert_with(|| replica.log_stream_idx(g));
         for (gen, idx, since) in self.stream_parks() {
             let Some(d) = self.dl.mine.get(&gen) else {
                 continue;
@@ -4340,7 +4354,7 @@ impl Core {
                     && d.backup.is_none()
                     && !d.group_backups.is_empty()
                     && d.acked_max > d.root_committed
-                    && replica.log_stream_idx(gen) < d.acked_max
+                    && log_of(gen) < d.acked_max
                 {
                     note(gen, since);
                 }
@@ -4351,12 +4365,11 @@ impl Core {
                     let Some(dh) = self.dl.mine.get(h) else {
                         continue;
                     };
-                    if open(dh)
-                        && Self::deleg_counts_root(dh)
-                        && rows.range(..=idx).any(|(_, dep)| {
-                            *dep > dh.root_committed.max(replica.log_stream_idx(*h))
-                        })
-                    {
+                    if !(open(dh) && Self::deleg_counts_root(dh)) {
+                        continue;
+                    }
+                    let dep = rows.range(..=idx).map(|(_, dep)| *dep).max().unwrap_or(0);
+                    if dep > dh.root_committed && dep > log_of(*h) {
                         note(*h, since);
                     }
                 }
@@ -4640,6 +4653,10 @@ impl Core {
         let answers_inflight = d.inflight.is_some_and(|(r, _)| r == req);
         // The answer to an ask for the commit (`deleg_poke_root`), apart from
         // any batch of rows in flight: it is no answer to that.
+        // (Its answer is cumulative like any: through the end of a batch of rows
+        // sent after it, it covers that batch, and the batch's own answer then
+        // counts as no progress and backs the rows off once, as a duplicate
+        // answer does.)
         let is_ask = d.ask.is_some_and(|(r, _)| r == req);
         if is_ask {
             d.ask = None;
