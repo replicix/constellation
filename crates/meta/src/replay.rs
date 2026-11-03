@@ -385,7 +385,8 @@ impl TouchSet {
         // it to the third name, so each primary change is judged against the
         // names the earlier steps left (`orig` is what the inode had before
         // the op: a name the op adds is held as the op's own dentry).
-        let mut seen: std::collections::HashMap<u64, (Vec<(u64, String)>, Vec<(u64, String)>)> =
+        type Names = Vec<(u64, String)>;
+        let mut seen: std::collections::HashMap<u64, (Names, Names)> =
             std::collections::HashMap::new();
         for (ino, gone, arrives) in moves {
             let (orig, now) = seen.entry(ino).or_insert_with(|| {

@@ -53553,7 +53553,10 @@ mod c2g_settle {
             }
         }
         assert!(puts > 0, "the journal was not shipped");
-        assert!(h.core.lease.gate.is_some(), "the gate opened before the ship");
+        assert!(
+            h.core.lease.gate.is_some(),
+            "the gate opened before the ship"
+        );
         assert_eq!(at_landing, vec![rid], "{answered:?}");
     }
 
